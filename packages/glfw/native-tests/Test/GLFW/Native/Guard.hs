@@ -354,22 +354,41 @@ spec = describe "the native opt-in" $ do
       inspectPresence reaped `shouldReturn` Absent
 
     it "reads only ps's own answers as a presence, and fails the inspection on anything else" $ do
-      let answered code = presenceFrom (Private.ChildExited code)
-      answered ExitSuccess "Z   \n" "" `shouldBe` Right Zombie
-      answered ExitSuccess "Z+\n" "" `shouldBe` Right Zombie
-      answered ExitSuccess "Ss  \n" "" `shouldBe` Right (Running "Ss")
-      answered ExitSuccess "R+\n" "" `shouldBe` Right (Running "R+")
-      answered (ExitFailure 1) "" "" `shouldBe` Right Absent
+      let linux code = presenceFrom "linux" (Private.ChildExited code)
+          darwin code = presenceFrom "darwin" (Private.ChildExited code)
+      darwin ExitSuccess "Z   \n" "" `shouldBe` Right Zombie
+      linux ExitSuccess "Z\n" "" `shouldBe` Right Zombie
+      linux ExitSuccess "Z+\n" "" `shouldBe` Right Zombie
+      darwin ExitSuccess "Ss  \n" "" `shouldBe` Right (Running "Ss")
+      darwin ExitSuccess "R+\n" "" `shouldBe` Right (Running "R+")
+      linux ExitSuccess "Ssl+\n" "" `shouldBe` Right (Running "Ssl+")
+      linux ExitSuccess "D<N\n" "" `shouldBe` Right (Running "D<N")
+      darwin ExitSuccess "UEW\n" "" `shouldBe` Right (Running "UEW")
+      linux (ExitFailure 1) "" "" `shouldBe` Right Absent
+      darwin (ExitFailure 1) "" "" `shouldBe` Right Absent
       mapM_
         (`shouldSatisfy` isLeft)
-        [ presenceFrom (Private.ChildExpired 10 (ExitFailure (-15))) "" ""
-        , answered ExitSuccess "" ""
-        , answered ExitSuccess "Z\nZ\n" ""
-        , answered ExitSuccess "1234\n" ""
-        , answered ExitSuccess "S\n" "ps: warning\n"
-        , answered (ExitFailure 1) "Z\n" ""
-        , answered (ExitFailure 1) "" "ps: process id too large: 999999\n"
-        , answered (ExitFailure 2) "" ""
+        [ presenceFrom "linux" (Private.ChildExpired 10 (ExitFailure (-15))) "" ""
+        , linux ExitSuccess "" ""
+        , linux ExitSuccess "Z\nZ\n" ""
+        , linux ExitSuccess "1234\n" ""
+        , darwin ExitSuccess "S\n" "ps: warning\n"
+        , linux (ExitFailure 1) "Z\n" ""
+        , darwin (ExitFailure 1) "" "ps: process id too large: 999999\n"
+        , linux (ExitFailure 2) "" ""
+        , -- A Z-led word that is not a state, or a state with a modifier its
+          -- platform's ps does not document, is malformed, never a zombie.
+          linux ExitSuccess "Zgarbage\n" ""
+        , darwin ExitSuccess "Zgarbage\n" ""
+        , darwin ExitSuccess "Z!\n" ""
+        , -- Each platform's letters are its own: D and t are Linux's, U and E
+          -- macOS's.
+          darwin ExitSuccess "D\n" ""
+        , darwin ExitSuccess "t\n" ""
+        , linux ExitSuccess "U\n" ""
+        , linux ExitSuccess "SE\n" ""
+        , presenceFrom "freebsd" (Private.ChildExited ExitSuccess) "Z\n" ""
+        , presenceFrom "freebsd" (Private.ChildExited (ExitFailure 1)) "" ""
         ]
       -- A ps that cannot even be started is a failed inspection, not a gone
       -- process.

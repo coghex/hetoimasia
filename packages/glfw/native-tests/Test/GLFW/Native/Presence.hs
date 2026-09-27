@@ -13,10 +13,12 @@
 --
 -- 'inspectPresence' asks @ps -o stat= -p <pid>@ instead, bounded by the
 -- launcher's own deadline. A process @ps@ does not list is 'Absent', one whose
--- state starts with @Z@ is a 'Zombie', and both are 'gone'; any other state is
--- 'Running'. A @ps@ that cannot be started, misses its deadline, or answers
--- anything else fails the inspection with what it did answer, and is never read
--- as gone.
+-- state is @Z@ is a 'Zombie', and both are 'gone'; any other state is
+-- 'Running'. A state is read only as this platform's @ps@ documents it — one
+-- run-state letter followed by its own modifiers — so a @ps@ that cannot be
+-- started, misses its deadline, or answers anything else, a malformed state
+-- included, fails the inspection with what it did answer, and is never read as
+-- gone.
 module Test.GLFW.Native.Presence
   ( Presence (..)
   , gone
@@ -28,10 +30,11 @@ module Test.GLFW.Native.Presence
 
 import Control.Exception (IOException, displayException, finally, try)
 import Control.Monad (unless)
-import Data.Char (isAsciiUpper, isSpace)
+import Data.Char (isSpace)
 import Foreign.C.Error (Errno (..), errnoToIOError)
 import Foreign.C.Types (CInt (..))
 import System.Exit (ExitCode (..))
+import System.Info (os)
 import System.Posix.Types (CPid (..), ProcessID)
 import System.Process (createProcess, getPid, proc, waitForProcess)
 import Test.GLFW.Native.Child (ChildEnd (..), Launched (..), launchCommand)
@@ -53,16 +56,22 @@ gone = \case
   Zombie → True
   Absent → True
 
--- | Read how @ps -o stat= -p <pid>@ ended and what it wrote. It lists a process
--- it finds as one state word and exits 0, and exits 1 writing nothing when it
--- finds none, on Linux's procps and on macOS alike; every other answer is a
--- failed inspection, described.
-presenceFrom ∷ ChildEnd → String → String → Either String Presence
-presenceFrom end out err = case end of
+-- | Read how @ps -o stat= -p <pid>@ ended and what it wrote, on the named
+-- platform, as 'System.Info.os' names it. It lists a process it finds as one
+-- state word and exits 0, and exits 1 writing nothing when it finds none, on
+-- Linux's procps and on macOS alike; every other answer, a state word that
+-- platform's @ps@ does not document included, is a failed inspection,
+-- described.
+presenceFrom ∷ String → ChildEnd → String → String → Either String Presence
+presenceFrom platform end out err = case end of
   ChildExpired seconds _ → Left ("did not answer within its " <> show seconds <> "-second deadline")
+  ChildExited _
+    | Nothing ← states → Left ("has no known state codes on platform " <> show platform)
   ChildExited ExitSuccess
-    | [state@(first : _)] ← words out
-    , isAsciiUpper first
+    | [state@(first : modifiers)] ← words out
+    , Just (runStates, modifierCodes) ← states
+    , first `elem` runStates
+    , all (`elem` modifierCodes) modifiers
     , blank err →
         Right (if first == 'Z' then Zombie else Running state)
   ChildExited (ExitFailure 1)
@@ -73,6 +82,10 @@ presenceFrom end out err = case end of
     Left ("ended " <> show code <> ", writing " <> show out <> " and on stderr " <> show err)
   where
     blank = all isSpace
+    -- The run states and the modifiers that may follow one, as procps's ps(1)
+    -- and macOS's ps(1) list them for the stat keyword.
+    states ∷ Maybe (String, String)
+    states = lookup platform [("linux", ("DIRSTtWXZ", "<NLsl+")), ("darwin", ("IRSTUZ", "+<>AELNSsVWX"))]
 
 -- | Ask @ps@ about a process, failing the inspection unless it answers.
 inspectPresence ∷ ProcessID → IO Presence
@@ -84,7 +97,7 @@ inspectPresenceUsing command pid = do
   asked ← try (launchCommand inspectionDeadline command ["-o", "stat=", "-p", show pid])
   either failure pure $ case asked of
     Left (problem ∷ IOException) → Left ("could not be started: " <> displayException problem)
-    Right answer → presenceFrom (launchedEnd answer) (launchedOut answer) (launchedErr answer)
+    Right answer → presenceFrom os (launchedEnd answer) (launchedOut answer) (launchedErr answer)
   where
     failure reason =
       ioError (userError ("could not tell whether process " <> show pid <> " is running: " <> command <> " " <> reason))

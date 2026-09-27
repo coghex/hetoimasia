@@ -5530,9 +5530,11 @@ The native examples cover:
   one-second deadline, reports the child expired, and the `sleep` is no longer
   running. The launcher kills it but does not reap it, and a zombie still
   accepts signal 0, so the example reads its state with `ps -o stat= -p`:
-  unlisted or a zombie (`Z`) is gone, any other state fails, and a `ps` that
-  cannot be started, misses a ten-second deadline, or answers anything else
-  fails the example rather than counting as gone. That check is proven against
+  unlisted or a zombie (`Z`) is gone, and any other state fails. A state is
+  read only as the platform's own `ps` documents it, one run-state letter and
+  that platform's modifiers, so a malformed state, like a `ps` that cannot be
+  started, misses a ten-second deadline, or answers anything else, fails the
+  example rather than counting as gone. That check is proven against
   this process (running), a child held unreaped after its exit (a zombie), and
   the same child once reaped (unlisted), and its reading of `ps`'s answers
   against each outcome it accepts or refuses;
