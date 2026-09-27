@@ -165,6 +165,11 @@ are refused. See [docs/logging.md](../../docs/logging.md#module-structure) and
 [docs/failures.md](../../docs/failures.md#module-structure) for their dependency
 direction.
 
+Recovery has one public module, `Recovery`, which keeps both recovery boundaries
+and re-exports its types from the hidden `Recovery.Types` of the main library.
+That module takes `Operation` from `Failure.Base` alone. See
+[docs/recovery.md](../../docs/recovery.md#module-structure).
+
 The resource family has two public modules. Their implementation lives in the
 private `internal` sublibrary, which exposes only the package-private facade
 `Resource.Internal` (and the worker group's `Worker.Internal`); the rest of the
@@ -194,6 +199,8 @@ for the module that owns and writes each piece of state.
 | `Hetoimasia.Foundation.Failure` | `src/Hetoimasia/Foundation/Failure.hs` | main library | exposed | Public failure facade; raising, operation boundaries, and inspection |
 | `Hetoimasia.Foundation.Failure.Base` | `src/Hetoimasia/Foundation/Failure/Base.hs` | main library | hidden | The abstract `Operation` and its naming operations |
 | `Hetoimasia.Foundation.Failure.Types` | `src/Hetoimasia/Foundation/Failure/Types.hs` | main library | hidden | Origin, context, site, cause, and evidence records, and the private failure annotation |
+| `Hetoimasia.Foundation.Recovery` | `src/Hetoimasia/Foundation/Recovery.hs` | main library | exposed | Public recovery module; both recovery boundaries, policy validation, and history inspection |
+| `Hetoimasia.Foundation.Recovery.Types` | `src/Hetoimasia/Foundation/Recovery/Types.hs` | main library | hidden | Policy, strategy, outcome, attempt, and history types, and the private history annotation with its rendering |
 | `Hetoimasia.Foundation.Resource` | `src/Hetoimasia/Foundation/Resource.hs` | main library | exposed | Public resource facade; resource and composite scopes, the continuation facade, and evidence inspection |
 | `Hetoimasia.Foundation.Resource.Collection` | `src/Hetoimasia/Foundation/Resource/Collection.hs` | main library | exposed | Scoped collections of independently retired members; every collection operation |
 | `Hetoimasia.Foundation.Resource.Collection.Types` | `src/Hetoimasia/Foundation/Resource/Collection/Types.hs` | main library | hidden | Collection, member state and token, and the result and rejection types |

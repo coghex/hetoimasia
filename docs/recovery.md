@@ -24,6 +24,30 @@ logging module. It reads cleanup evidence through
 [the resource contract](resources.md) and names operations with the `Operation`
 type from [failures.md](failures.md); it changes neither.
 
+## Module structure
+
+`Hetoimasia.Foundation.Recovery` is the only recovery module a client imports.
+It defines both boundaries — `recover` and `allocComponent` — policy validation,
+the helpers the two share, and history inspection, and re-exports the rest from
+one hidden module of the foundation's main library:
+
+| Module | Owns |
+| --- | --- |
+| `Recovery.Types` | `Disposition`, `Strategy`, `RecoveryPolicy`, `InvalidRecoveryPolicy` and its `Exception` instance, `AttemptKind`, `AttemptFailure`, `Recovered`, `Unavailability`, `Outcome`, `RecoveryHistory`, and the private annotation that carries a history on an exception's context, with its `ExceptionAnnotation` instance and the rendering that instance needs |
+| `Recovery` | `recover`, `allocComponent`, the private validated policy and its validation, the shared helpers that deliver a pending cancellation, evaluate a strategy, guard the policy's own steps, and attach history, and `recoveryHistory` and `recoveryHistoryInContext` |
+
+`Recovery.Types` takes `Operation` from the failure family's hidden
+`Failure.Base` directly, never from the failure facade or `Failure.Types`, and
+imports nothing from `Recovery`, so the types depend on neither failure
+annotations nor the recovery loop. `Recovery` imports `Recovery.Types` and
+reaches the resource implementation through the package-private
+`Resource.Internal` facade across the component boundary. The graph needs no
+`.hs-boot` file. The two recovery paths stay together: this is not a general
+retry framework.
+
+The annotation type is shared between `Recovery.Types` and `Recovery`, and
+`Recovery` does not export it, so no client can build or read one directly.
+
 ## Public interface
 
 ```haskell
@@ -178,8 +202,10 @@ case outcome of
 ```
 
 `recoveryHistoryInContext` lists histories innermost boundary first, when one
-`recover` runs inside another. History is attached only by `recover`; its
-annotation type is not exported. The rendered annotation is one line naming the
+boundary runs inside another. History is attached only by the two recovery
+boundaries, `recover` and `allocComponent`, and `recoveryHistory` reports what
+either attached; the annotation type is private to the foundation package and
+not exported. The rendered annotation is one line naming the
 operation and each attempt's number and kind, with no exception text.
 
 ## Failures of the policy itself
@@ -209,7 +235,8 @@ idempotent.
 ## Verification
 
 `cabal test hetoimasia-foundation:foundation-tests --test-show-details=direct --test-options='--match /Recovery/'`
-runs the `Recovery` examples from `packages/foundation/test/Test/Foundation/Recovery/Spec.hs`. They use
+runs the `Recovery` examples from `packages/foundation/test/Test/Foundation/Recovery/Spec.hs`
+and the visibility examples beside them. The behavior examples use
 injected typed failures, real CPU scopes, an ordered trace, and `MVar`
 coordination with no sleeps, and cover:
 
@@ -231,6 +258,14 @@ coordination with no sleeps, and cover:
   cleanup failure, or a cancellation;
 - cancellation during work, classification, the wait, and a fallback escaping
   with its own context and cleanup evidence.
+
+`Test/Foundation/Recovery/Visibility.hs` compiles separate external clients
+with the shared harness in `Test.Support.ExternalClient`. One client importing
+every public name, constructor, and field by name must compile; a client
+importing `Recovery.Types` must be refused as a hidden module of the main
+library, and a client asking `Recovery` for the history annotation must be
+refused because the module does not export it. Run them alone with
+`--test-options='--match "Recovery module visibility across the package boundary"'`.
 
 The validation catalog covers them through the floor group `test.foundation`; see
 [validation.md](validation.md).

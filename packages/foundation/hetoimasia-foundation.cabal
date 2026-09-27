@@ -47,9 +47,9 @@ library
         Hetoimasia.Foundation.Resource.Collection
         Hetoimasia.Foundation.Time
         Hetoimasia.Foundation.Worker
-    -- Hidden modules of this library: the public Log and Failure modules
-    -- re-export what clients may use from them, and a client importing one
-    -- directly is refused. Unlike the internal sublibrary below, which other
+    -- Hidden modules of this library: the public Log, Failure, Recovery and
+    -- Resource.Collection modules re-export what clients may use from them,
+    -- and a client importing one directly is refused. Unlike the internal sublibrary below, which other
     -- components of this package share, these serve this library alone.
     --   Log.Base: levels, source locations and small options, below every other
     --     logging module and imported by failure attribution.
@@ -64,6 +64,10 @@ library
     --   Failure.Base: Operation, private so its constructor stays unexported.
     --   Failure.Types: the evidence records and the failure annotation, private
     --     so the annotation stays unexported and only the facade attaches it.
+    --   Recovery.Types: the policy, outcome and history types, and the history
+    --     annotation with its rendering, private so the annotation stays
+    --     unexported and only the two recovery boundaries attach it. It imports
+    --     Failure.Base for Operation, never Failure or Recovery.
     --   Resource.Collection.Types: the collection, member state and token, and
     --     the result and rejection types, private so Collection and Member keep
     --     their constructors unexported; Resource.Collection re-exports them.
@@ -76,6 +80,7 @@ library
         Hetoimasia.Foundation.Log.Format
         Hetoimasia.Foundation.Log.Sink
         Hetoimasia.Foundation.Log.Types
+        Hetoimasia.Foundation.Recovery.Types
         Hetoimasia.Foundation.Resource.Collection.Types
     hs-source-dirs: src
     default-language: GHC2024
@@ -194,6 +199,7 @@ test-suite foundation-tests
         Test.Foundation.Messaging.Support
         Test.Foundation.Messaging.Turns
         Test.Foundation.Recovery.Spec
+        Test.Foundation.Recovery.Visibility
         Test.Foundation.Resources.Buffer
         Test.Foundation.Resources.Collection
         Test.Foundation.Resources.Construction
