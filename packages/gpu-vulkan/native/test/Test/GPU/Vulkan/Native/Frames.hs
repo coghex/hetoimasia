@@ -92,6 +92,10 @@ spec = describe "Frames" $ do
       syncAcquireState (viewSlotSync slot) `shouldBe` SemaphoreUnsignalled
       atomically (readFrameStandings (rigFrames rig)) `shouldReturn` []
       imagesOwned (rigStandIn rig) `shouldReturn` []
+      -- Each pool record went back with its reservation, untouched: one record
+      -- served both, nothing is held, and the target's frames retire.
+      map (\(PoolView _ _ sync) → poolHolder sync) <$> atomically (readPool (rigFrames rig)) `shouldReturn` [PoolFree]
+      retireTargetFrames (rigFrames rig) (rigTarget rig)
       clean rig
 
     it "keeps a suboptimal acquisition's index and requests a replacement beside it" $ do

@@ -90,7 +90,7 @@ import Hetoimasia.GPU.Model
 import Hetoimasia.GPU.Model.Identity (AllocationId, GenerationId, HoldSubject)
 import Hetoimasia.GPU.Vulkan.Native.Roots
   ( GraphicsDeviceLost
-  , NativeFailure (FailedOutOfMemory)
+  , NativeFailure (..)
   , Roots
   , SubjectDisposer (..)
   , failRootsSession
@@ -212,16 +212,20 @@ recoverAllocation roots operation attempt retired original retry = do
       Admitted next → ((), next)
       _ → ((), model)
 
--- | A construction's retry: any synchronous failure it raises ends the
--- recovery, with what it displayed — a second failure is never retried — but
--- device loss and a cancellation are re-raised, since neither is a failed
--- retry.
-failingAgain ∷ IO a → IO (Either Text a)
-failingAgain retry =
+-- | A construction's retry: a synchronous failure it raises ends the
+-- recovery, with what it displayed — a second failure is never retried. What
+-- means more than a failed retry is re-raised as itself: device loss, a
+-- cancellation, and any other result the roots' layer classifies — a lost
+-- surface, a window still in use — so whoever made the construction acts on it
+-- as on a first failure. The retry must be guarded ('rootsCall'), so a loss
+-- it raises is latched.
+failingAgain ∷ Roots q inst msgr phys dev → IO a → IO (Either Text a)
+failingAgain roots retry =
   tryWithContext retry >>= \case
     Right value → pure (Right value)
     Left failure@(ExceptionWithContext _ exception)
       | isAsynchronous exception || isJust (fromException exception ∷ Maybe GraphicsDeviceLost) → rethrowIO failure
+      | Just result ← rootsNativeFailure roots exception, result /= FailedOutOfMemory → rethrowIO failure
       | otherwise → pure (Left (Text.pack (displayException exception)))
 
 -- | Account one allocation attempt for an operation that reserves none of its
@@ -245,7 +249,8 @@ withAllocationAttempt roots use = mask $ \restore → do
         _ → ((), model)
       either (\(failure ∷ ExceptionWithContext SomeException) → rethrowIO failure) (pure . Right) answered
 
--- | Run one native creation call, recovering an out-of-memory failure. A
+-- | Run one native creation call — guarded by the caller with 'rootsCall', so
+-- every attempt latches device loss — recovering an out-of-memory failure. A
 -- creation call that raised created nothing, which is the proven rollback
 -- allocation recovery needs: one reclamation pass, and the call once more only
 -- if the model permits the attempt's retry — never when the call handed the
@@ -260,7 +265,7 @@ recoveringCreation roots name retired call =
     Left failure@(ExceptionWithContext _ exception)
       | not (isAsynchronous exception)
       , rootsNativeFailure roots exception == Just FailedOutOfMemory →
-          withAllocationAttempt roots (\attempt → recoverAllocation roots name attempt retired (Text.pack (displayException exception)) (failingAgain call)) >>= \case
+          withAllocationAttempt roots (\attempt → recoverAllocation roots name attempt retired (Text.pack (displayException exception)) (failingAgain roots call)) >>= \case
             Right (Right value) → pure value
             Right (Left notRecovered) → throwIO notRecovered
             Left _ → rethrowIO failure

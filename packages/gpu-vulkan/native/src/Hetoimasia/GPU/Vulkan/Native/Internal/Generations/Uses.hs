@@ -37,8 +37,15 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Generations.State
   )
 
 -- | Report what a swapchain call on a generation answered. Only the target's
--- active generation is replaced for it; a report about any other answers
--- 'False' and changes nothing.
+-- active generation is replaced for an out-of-date or suboptimal result; one
+-- about any other generation answers 'False' and changes nothing.
+--
+-- A lost surface is the surface's, not the generation's: a presentation made
+-- on a generation already retired, or an acquisition from it, reports it as
+-- truly as the active generation's would. So 'SwapchainSurfaceLost' is taken
+-- from any generation the target still tracks — all of them on the surface it
+-- holds — unless the surface is already being recovered, when a late report
+-- about the lost one says nothing new and must not reach the replacement.
 --
 -- It is the owner's: the acquisitions and presentations that produce these
 -- results run on the graphics owner's thread. A report asks for a step at
@@ -50,7 +57,8 @@ noteSwapchainResult generations generation result = do
   records ← readTVar (generationsTargets generations)
   case Map.lookup (generationTarget generation) records of
     Just record
-      | recordActive record == Just generation → do
+      | result == SwapchainSurfaceLost, recordSurfaceLost record → pure (Map.member generation (recordGenerations record))
+      | recordActive record == Just generation || (result == SwapchainSurfaceLost && Map.member generation (recordGenerations record)) → do
           writeTVar
             (generationsTargets generations)
             (Map.insert (generationTarget generation) record {recordResult = Just (strongest (recordResult record) result), recordResultUnseen = True} records)

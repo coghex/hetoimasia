@@ -259,7 +259,7 @@ construct recording bytes objects name create replacing =
                   Left (ExceptionWithContext _ exception)
                     | not (isAsynchronous exception)
                     , rootsNativeFailure roots exception == Just FailedOutOfMemory →
-                        recoverAllocation roots name allocation Nothing (Text.pack (displayException exception)) (failingAgain creation) >>= \case
+                        recoverAllocation roots name allocation Nothing (Text.pack (displayException exception)) (failingAgain roots creation) >>= \case
                           Right native → pure native
                           Left notRecovered → abandoned >> throwIO notRecovered
                   Left failure → abandoned >> rethrowIO failure

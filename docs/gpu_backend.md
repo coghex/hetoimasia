@@ -962,7 +962,7 @@ surface answers `AcquisitionUnavailable`.
 | --- | --- | --- |
 | `VK_SUCCESS` | The frame owns the image | `AcquisitionOwned` |
 | `VK_SUBOPTIMAL_KHR` | The frame owns the image, and the target counts a replacement request | `AcquisitionOwned`, suboptimal; the generations are told (`SwapchainSuboptimal`), so the owner's next step reconciles |
-| `VK_NOT_READY`, `VK_TIMEOUT` | The reservation goes back whole, with no synchronization obligation | `AcquisitionPending PendingNoImage` |
+| `VK_NOT_READY`, `VK_TIMEOUT` | The reservation goes back whole, its pool record freed untouched, with no synchronization obligation | `AcquisitionPending PendingNoImage` |
 | `VK_ERROR_OUT_OF_DATE_KHR` | The reservation goes back, its pool record freed untouched, and a replacement is requested | `AcquisitionPending PendingReplacement`; the generations are told (`SwapchainOutOfDate`) |
 | `VK_ERROR_SURFACE_LOST_KHR` | The reservation goes back, its pool record freed untouched, and a replacement is requested | `AcquisitionPending PendingSurfaceLost`; the generations are told (`SwapchainSurfaceLost`), and the surface is [replaced](#replacing-a-lost-surface) |
 | It raised | The reservation goes back: an error result has no effect | The failure is re-raised; device loss latches as always |
@@ -1322,7 +1322,10 @@ answers `VK_ERROR_SURFACE_LOST_KHR` — an acquisition, which gives its
 reservation back, pool record included, or a presentation, which was enqueued
 all the same — reported as `SwapchainSurfaceLost`, which outranks every other
 result; or when the surface's capability query or a swapchain's creation
-raises it. Then, on the owner's thread:
+raises it. The loss is the surface's, so it is taken from any generation the
+target still tracks — a late presentation on a generation already retired
+included — and, once the surface is being recovered, a late report about it
+changes nothing and never reaches the replacement. Then, on the owner's thread:
 
 1. **Admission stops.** The reconciliation retires the active generation there
    and then, and builds nothing on the surface again. Acquisition answers
@@ -1463,8 +1466,12 @@ No progress, a failed disposal, a refused retry or a second failure ends the
 recovery and reports the original failure with the pass's evidence — what it
 examined, disposed of and failed to dispose of, and how it ended: as
 `AllocationNotRecovered` from a construction, and in `SubmittedNothing` or
-`PresentedNothing` from a submission or a presentation. Device loss and a
-cancellation during the retry are re-raised as themselves.
+`PresentedNothing` from a submission or a presentation. Every attempt, the
+retry included, runs through the roots' guard, so device loss latches wherever
+it is raised; and what the retry raised that means more than a failed retry —
+device loss, a cancellation, a lost surface, a window still in use — is
+re-raised as itself, so the construction acts on it as it would on a first
+failure.
 
 ### What recovery never does
 
@@ -1748,7 +1755,11 @@ through the episode; exhaustion and an unsupported replacement each making an
 optional target unavailable while another keeps building, and failing the
 session for a required one, with no second device; and an ordinary resize
 spending nothing while a repeated failure at unchanged geometry spends the
-episode. `Allocation recovery`, over the frames' rig, covers: a creation that
+episode; a lost surface taken from a generation already retired, and a late
+report about it never reaching the replacement; and a creation's retry that
+raised device loss, latched and raised, or a lost surface, replaced, rather
+than either being read as a failed retry. `Allocation recovery`, over the
+frames' rig, covers: a creation that
 ran out of memory made once more after one pass reclaimed a retired
 generation; no retry without progress, the original failure reported with the
 pass's evidence and its accounting given back; a second failure ending the
@@ -1765,7 +1776,8 @@ lost surface as the frames report it — an acquisition's reservation given back
 its pool record freed and the target's frames retirable, nothing acquired until
 the surface is replaced, and a surface-lost presentation enqueued and holding
 its generation until its present fence retires. `Frames`' out-of-date
-acquisition now also frees its pool record. The model's suite adds
+acquisition, and a not-ready or timed-out one, now also free their pool
+record, and the target's frames retire after them. The model's suite adds
 `declareTargetUnrecoverable`'s examples. `Vulkan controller`'s group
 `recovering a lost surface (VK-14)` runs whole hosts: a lost surface replaced on
 the main thread under the same attachment, after its generation and then the

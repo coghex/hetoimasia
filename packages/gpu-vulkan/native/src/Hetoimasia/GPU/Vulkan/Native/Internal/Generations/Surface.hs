@@ -160,6 +160,7 @@ offerReplacementSurface generations now target surface = do
                       -- and the owner is asked for the step that builds it.
                       recordConstructions = 0
                     , recordResultUnseen = True
+                    , recordResult = Nothing
                     }
               pure ReplacementInstalled
             Left (TargetSurfaceUnsupported family) → do

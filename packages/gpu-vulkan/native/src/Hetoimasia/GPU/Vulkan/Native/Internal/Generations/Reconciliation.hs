@@ -335,9 +335,13 @@ reconcile generations now target geometry = do
           -- inside a call that blocks interruptibly. The settlement below, which
           -- records how the construction ended, runs before it is re-raised.
           inCreation ← newIORef Nothing
-          let creating name call record = do
+          -- The call is guarded and recovered: each native attempt, a retry
+          -- included, runs through 'rootsCall', so device loss is latched
+          -- wherever it is raised. @retired@ is the generation the call hands
+          -- over as @oldSwapchain@, if any, which forbids its retry.
+          let creating name retired call record = do
                 writeIORef inCreation (Just name)
-                created ← rootsCall roots name call
+                created ← recoveringCreation roots name retired (rootsCall roots name call)
                 atomically (record created)
                 writeIORef inCreation Nothing
                 pure created
@@ -356,7 +360,7 @@ reconcile generations now target geometry = do
             for_ handing $ \(previous, _) →
               atomically (editGeneration generations previous (\entry → entry {genHandedOver = True}))
             swapchain ←
-              creating "vkCreateSwapchainKHR" (recoveringCreation roots "vkCreateSwapchainKHR" (fst <$> handing) (opsCreateSwapchain ops device request)) $ \created →
+              creating "vkCreateSwapchainKHR" (fst <$> handing) (opsCreateSwapchain ops device request) $ \created →
                 editGeneration generations candidate (\entry → entry {genSwapchain = Just created})
             name ObjectSwapchain swapchain (swapchainName candidate)
             allowInterrupt
@@ -370,7 +374,7 @@ reconcile generations now target geometry = do
                 forM_ (zip [0 ..] images) $ \(index, image) → do
                   name ObjectImage image (swapchainImageName candidate index)
                   view ←
-                    creating "vkCreateImageView" (recoveringCreation roots "vkCreateImageView" Nothing (opsCreateImageView ops device image (surfaceFormat (planFormat planned)))) $ \created →
+                    creating "vkCreateImageView" Nothing (opsCreateImageView ops device image (surfaceFormat (planFormat planned))) $ \created →
                       editGeneration generations candidate (\entry → entry {genViews = genViews entry <> [created]})
                   name ObjectImageView view (imageViewName candidate index)
                   allowInterrupt

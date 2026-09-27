@@ -158,6 +158,9 @@ data Scripted
     -- ^ The same, once; the step then succeeds again.
   | AnswersOnceAfter !Int !NativeFailure
     -- ^ Succeeds this many more times, then behaves as 'AnswersOnce'.
+  | AnswersOnceThen !NativeFailure !Scripted
+    -- ^ Answers this result once, and then behaves as the script given: a
+    -- retry that then fails otherwise.
 
 newtype StandInFailure = StandInFailure Step
   deriving (Eq, Show)
@@ -315,6 +318,7 @@ step standIn at call = do
         | remaining > 0 → Nothing <$ modifyTVar' (standScript standIn) (Map.insert at (SucceedsThenFails (remaining - 1)))
         | otherwise → pure (Just Fails)
       Just (AnswersOnce result) → Just (Answers result) <$ modifyTVar' (standScript standIn) (Map.delete at)
+      Just (AnswersOnceThen result next) → Just (Answers result) <$ modifyTVar' (standScript standIn) (Map.insert at next)
       Just (AnswersOnceAfter remaining result)
         | remaining > 0 → Nothing <$ modifyTVar' (standScript standIn) (Map.insert at (AnswersOnceAfter (remaining - 1) result))
         | otherwise → Just (Answers result) <$ modifyTVar' (standScript standIn) (Map.delete at)
@@ -331,6 +335,7 @@ step standIn at call = do
     Just (Answers result) → throwIO (StandInResult (Text.pack (show at)) result)
     Just (AnswersOnce result) → throwIO (StandInResult (Text.pack (show at)) result)
     Just (AnswersOnceAfter _ result) → throwIO (StandInResult (Text.pack (show at)) result)
+    Just (AnswersOnceThen result _) → throwIO (StandInResult (Text.pack (show at)) result)
 
 -- | The stand-in's native layer. Handles are numbers: the instance is 1, the
 -- messenger 2 and the device 3; a surface is whatever number it was made with.

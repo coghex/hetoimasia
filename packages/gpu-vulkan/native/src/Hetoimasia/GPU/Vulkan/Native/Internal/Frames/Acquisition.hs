@@ -189,7 +189,10 @@ tryAcquireFrame frames target =
               editSlot frames (slotOf frame) (\sync → sync {syncAcquireState = SemaphoreSignalOwed})
               when suboptimal (void (noteSwapchainResult generations generation SwapchainSuboptimal))
               pure (Right (AcquisitionOwned (OwnedFrame frame image suboptimal)))
-        Right ReservationReturned → pure (Right (AcquisitionPending PendingNoImage))
+        -- Given back whole, its pool record freed untouched with it.
+        Right ReservationReturned → do
+          freePoolOf frames frame
+          pure (Right (AcquisitionPending PendingNoImage))
         -- The model gave the reservation back, its pool record with it; the
         -- native record it was bound to is freed untouched too, as any given-
         -- back reservation's is, or it would stay bound to a frame that no

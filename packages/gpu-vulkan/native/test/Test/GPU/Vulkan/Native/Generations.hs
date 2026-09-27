@@ -917,6 +917,48 @@ spec = describe "Generations" $ do
         sessionState <$> atomically (readRootsModel (rigRoots rig)) `shouldReturn` SessionFailed RequiredTargetUnrecoverable
         length . filter isDeviceCreated <$> calls (rigStandIn rig) `shouldReturn` 1
 
+    it "takes a lost surface reported from a generation already retired, and no late report about it reaches the replacement" $ do
+      rig ← newRig
+      stepAt rig 0 (seen 640 480)
+      [first] ← activeGenerations rig
+      use ← held rig first
+      resize rig 10 800 600
+      viewActive <$> generationsOf rig >>= (`shouldSatisfy` (/= Just first))
+      -- A presentation made on the retired generation answers the surface
+      -- lost: the target's surface is lost, whichever generation said so.
+      atomically (noteSwapchainResult (rigGenerations rig) first SwapchainOutOfDate) `shouldReturn` False
+      atomically (noteSwapchainResult (rigGenerations rig) first SwapchainSurfaceLost) `shouldReturn` True
+      stepAt rig 30 (seen 800 600)
+      viewCondition <$> generationsOf rig `shouldReturn` SurfaceLost
+      viewActive <$> generationsOf rig `shouldReturn` Nothing
+      -- Another report about the lost surface, while it is being recovered,
+      -- changes nothing.
+      atomically (noteSwapchainResult (rigGenerations rig) first SwapchainSurfaceLost) `shouldReturn` True
+      atomically (endGenerationUse (rigGenerations rig) use)
+      _ ← wantedAt rig 40
+      _ ← wantedAt rig 41
+      viewCondition <$> generationsOf rig `shouldReturn` SurfaceReplacing
+      offerReplacementSurface (rigGenerations rig) (at 42) (rigTarget rig) (surfaceNumbered (rigStandIn rig) 20) `shouldReturn` ReplacementInstalled
+      stepAt rig 42 (seen 800 600)
+      stepAt rig 43 (seen 800 600)
+      viewCondition <$> generationsOf rig `shouldReturn` Presenting
+      recoveryAttempts rig `shouldReturn` 1
+
+    describe "reads what a creation's retry raised as itself, not as a failed retry" $ do
+      it "latching device loss" $ do
+        rig ← retryingRig (AnswersOnceThen FailedOutOfMemory Loses)
+        stepAt rig 30 (seen 800 600) `raises` \(GraphicsDeviceLost {}) → True
+        viewLoss <$> atomically (readRootsView (rigRoots rig)) >>= (`shouldSatisfy` isJust)
+        -- The retry was made: the reclamation pass destroyed the generation a
+        -- hold had kept until the construction began.
+        destroyed rig >>= (`shouldSatisfy` elem (DestroyedSwapchain 100))
+
+      it "replacing a lost surface" $ do
+        rig ← retryingRig (AnswersOnceThen FailedOutOfMemory (AnswersOnce FailedSurfaceLost))
+        stepAt rig 30 (seen 800 600)
+        viewCondition <$> generationsOf rig `shouldReturn` SurfaceLost
+        destroyed rig >>= (`shouldSatisfy` elem (DestroyedSwapchain 100))
+
     it "tells an ordinary resize, which spends nothing, from a repeated failure at unchanged geometry, which spends the episode" $ do
       rig ← newRig
       stepAt rig 0 (seen 640 480)
@@ -1134,6 +1176,25 @@ raises action expected =
   try action >>= \case
     Left failure → expected failure `shouldBe` True
     Right _ → expectationFailure "expected a failure, but the action returned"
+
+-- | A rig whose first generation is retired but held, and whose active one
+-- has an out-of-date result, so the step at 30 rebuilds it. The hold ends
+-- right after that construction's admission, making the retired generation
+-- something a reclamation pass can dispose of; the construction's first view
+-- creation then runs out of memory, and its retry does as scripted.
+retryingRig ∷ Scripted → IO Rig
+retryingRig retry = do
+  -- Room for three generations, so the rebuild is not held back by the
+  -- retired one's hold.
+  rig ← newRigWith defaultBudgetRequest {requestedGenerations = 3}
+  stepAt rig 0 (seen 640 480)
+  [first] ← activeGenerations rig
+  use ← held rig first
+  resize rig 10 800 600
+  noteActive rig SwapchainOutOfDate
+  atomically (writeTVar (rigAfterAdmission rig) (\_ → atomically (endGenerationUse (rigGenerations rig) use)))
+  script (rigStandIn rig) AtCreateView retry
+  pure rig
 
 -- | Step once, and answer the targets the step asked a replacement surface
 -- for.
