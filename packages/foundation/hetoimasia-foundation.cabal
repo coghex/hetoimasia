@@ -47,10 +47,11 @@ library
         Hetoimasia.Foundation.Resource.Collection
         Hetoimasia.Foundation.Time
         Hetoimasia.Foundation.Worker
-    -- Hidden modules of this library: the public Log, Failure, Recovery and
-    -- Resource.Collection modules re-export what clients may use from them,
-    -- and a client importing one directly is refused. Unlike the internal sublibrary below, which other
-    -- components of this package share, these serve this library alone.
+    -- Hidden modules of this library: the public Log, Failure, Recovery,
+    -- Resource.Collection and Time modules re-export what clients may use
+    -- from them, and a client importing one directly is refused. Unlike the
+    -- internal sublibrary below, which other components of this package share,
+    -- these serve this library alone.
     --   Log.Base: levels, source locations and small options, below every other
     --     logging module and imported by failure attribution.
     --   Log.Component: the validated Component, private so its constructor
@@ -71,6 +72,14 @@ library
     --   Resource.Collection.Types: the collection, member state and token, and
     --     the result and rejection types, private so Collection and Member keep
     --     their constructors unexported; Resource.Collection re-exports them.
+    --   Time.Types: instants, durations, requirements, rejections, conversion
+    --     results, overflow, sources and baselines with their instances,
+    --     private so Duration, Instant, MonotonicSource and ElapsedBaseline keep
+    --     their constructors unexported. It imports only base.
+    --   Time.Arithmetic: validated conversions, constants, non-wrapping
+    --     arithmetic and the pure baseline rule, private because it works on
+    --     those constructors directly. It imports only Time.Types and base, no
+    --     clock, logging or failure module; Time keeps the clock effects.
     other-modules:
         Hetoimasia.Foundation.Failure.Base
         Hetoimasia.Foundation.Failure.Types
@@ -82,6 +91,8 @@ library
         Hetoimasia.Foundation.Log.Types
         Hetoimasia.Foundation.Recovery.Types
         Hetoimasia.Foundation.Resource.Collection.Types
+        Hetoimasia.Foundation.Time.Arithmetic
+        Hetoimasia.Foundation.Time.Types
     hs-source-dirs: src
     default-language: GHC2024
     default-extensions: UnicodeSyntax OverloadedStrings
@@ -210,6 +221,7 @@ test-suite foundation-tests
         Test.Foundation.Resources.Visibility
         Test.Foundation.Time.Opacity
         Test.Foundation.Time.Spec
+        Test.Foundation.Time.Visibility
         Test.Foundation.Workers.Opacity
         Test.Foundation.Workers.Spec
         Test.Foundation.Workers.Visibility

@@ -22,6 +22,28 @@ chooses no simulation rate. It takes the validated `Component` from
 [the logging module](logging.md) and reports failures through
 [the failure module](failures.md); it needs no logger.
 
+## Module structure
+
+`Hetoimasia.Foundation.Time` is the only time module a client imports. It
+defines reading a clock and sampling, and re-exports the rest from two hidden
+modules of the foundation's main library:
+
+| Module | Owns |
+| --- | --- |
+| `Time.Types` | `Duration` and `Instant` with their `Show` renderings, `DurationRequirement`, `DurationRejected`, `SecondsConversion`, `TimeOverflow`, `MonotonicSource`, and `ElapsedBaseline`, with their instances |
+| `Time.Arithmetic` | `durationNanoseconds`, the duration constants, `durationFromNanoseconds` and `durationFromSeconds`, `scriptedInstant`, the non-wrapping arithmetic and deadline comparison, and the pure baseline operations `noBaseline`, `baselineInstant`, and `advanceBaseline` |
+| `Time` | `monotonicSource`, `scriptedSource`, `readInstant`, `sampleElapsed`, `timeComponent`, and `readClockOperation` |
+
+Dependencies run one way: `Time.Types` ← `Time.Arithmetic` ← `Time`.
+`Time.Types` imports only `base`. `Time.Arithmetic` imports only `Time.Types`
+and `base`, so the arithmetic is pure and reads no clock. Only `Time` imports
+`GHC.Clock` and the public failure and logging modules. The graph needs no
+`.hs-boot` file, and every instance stays with its type.
+
+`Time` re-exports `Duration`, `Instant`, `MonotonicSource`, and
+`ElapsedBaseline` without their constructors, and a client importing either
+hidden module is refused, so the values stay abstract outside the package.
+
 ## Ownership
 
 | Owner      | Owns                                                                                   |
@@ -197,4 +219,13 @@ each rejection reason; seconds rounding and its range boundaries; native and
 already-annotated source failures; and cancellation. Its opacity examples reject
 naming each constructor, coercing a nanosecond count or a C `time_t` into a
 value, and a numeric literal, and link and run a client that uses the public
-API. The group initializes no GLFW and needs no display.
+API. Its visibility examples accept a client that imports, by name, every name
+`Time` exports, and refuse a client importing `Time.Types` and another importing
+`Time.Arithmetic`, each as a hidden module of the main library. The group
+initializes no GLFW and needs no display. Run the visibility examples alone
+with:
+
+```bash
+cabal test hetoimasia-foundation:foundation-tests --test-show-details=direct \
+  --test-options='--match "Time module visibility across the package boundary"'
+```

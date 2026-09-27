@@ -1072,6 +1072,10 @@ hidden `Recovery.Types`, are retained as
 [`docs/vulkan/macos-recovery-split.md`](vulkan/macos-recovery-split.md), with
 that run's `test.glfw-native` receipt beside them; their Linux execution is
 CI's.
+#274's, taken again over time's split into its public module and the hidden
+`Time.Types` and `Time.Arithmetic`, are retained as
+[`docs/vulkan/macos-time-split.md`](vulkan/macos-time-split.md), with that
+run's `test.glfw-native` receipt beside them; their Linux execution is CI's.
 
 ## The native suite
 
