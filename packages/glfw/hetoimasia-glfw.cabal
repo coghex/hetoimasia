@@ -342,7 +342,12 @@ test-suite glfw-native-tests
         Test.GLFW.Native.Wake
         Test.GLFW.Native.Wayland
         Test.GLFW.Native.WaylandScenarios
+        Test.GLFW.Native.WaylandSync
         Test.GLFW.Native.Window
+    -- The Wayland synchronization the native examples need and the production
+    -- shim may not perform (D-13): test-only, and compiled into this suite alone.
+    c-sources: native-tests/cbits/hetoimasia_glfw_test.c
+    include-dirs: native-tests/cbits
     ghc-options: -threaded
     build-depends:
         base >=4.22 && <4.23,

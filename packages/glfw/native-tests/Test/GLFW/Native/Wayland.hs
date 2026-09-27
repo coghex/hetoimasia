@@ -27,16 +27,27 @@
 module Test.GLFW.Native.Wayland (spec) where
 
 import Control.Monad (void)
+import GHC.Clock (getMonotonicTime)
 import Hetoimasia.GLFW.Command
-import Hetoimasia.GLFW.Internal.Native (requestCloseForCheck, sizeLimitsForCheck, windowSizeForCheck, windowTitleForCheck)
-import Hetoimasia.GLFW.Internal.Window (windowNativeHandle)
+import Hetoimasia.GLFW.Internal.Native
+  ( requestCloseForCheck
+  , sizeLimitsForCheck
+  , takeLastWaitForCheck
+  , takeWaitNotedForCheck
+  , wakeCountsForCheck
+  , windowSizeForCheck
+  , windowTitleForCheck
+  )
+import Hetoimasia.GLFW.Internal.Window (EventProcessing (AwaitEventsFor), processWindowEvents, windowNativeHandle)
 import Hetoimasia.GLFW.Session
   ( Backend (Wayland)
+  , Session
   , reportedErrors
   , sessionBackend
   , takeAsynchronousReports
   )
 import Hetoimasia.GLFW.Window
+import Numeric.Natural (Natural)
 import System.Directory (doesFileExist, getCurrentDirectory)
 import System.Environment (getExecutablePath, lookupEnv)
 import System.FilePath (takeDirectory, (</>))
@@ -54,6 +65,7 @@ import Test.GLFW.Native.Private
   )
 import Test.GLFW.Native.Support (Gate, Shared (..), acquisitions, currentObservation, failed, gateConsent, owned)
 import qualified Test.GLFW.Native.Wake as Wake
+import Test.GLFW.Native.WaylandSync (flushAndAwaitReply)
 import Test.Hspec (Spec, SpecWith, before_, describe, it, pendingWith, shouldBe, shouldReturn, shouldSatisfy)
 
 spec ∷ Shared → Spec
@@ -164,6 +176,42 @@ spec shared = describe "on an isolated Wayland session" . onlyWayland gate $ do
   describe "explicit unsupported outcomes" $
     it "answers placement, focus, and borderless requests unsupported and placement and iconified observations unavailable, invoking none of their native operations or getters" $
       privateScenarioReporting gate "wayland-unsupported"
+
+  -- The wake examples below begin from a settled connection. These two show
+  -- what settling must absorb on Wayland: the answers to an earlier example's
+  -- released windows, which arrive after a pending-events poll has returned.
+  describe "settling before a wait" $ do
+    it "settles a released window's cleanup, so the next production wait nothing wakes reaches its bound" $ do
+      evidence ← owned shared $ \session → do
+        withWindow session (hiddenTestWindowConfig "settled cleanup" 64 48) (\_ → pure ())
+        beforeSettle ← wakeCountsForCheck
+        Wake.settle session
+        afterSettle ← wakeCountsForCheck
+        unwokenWait session beforeSettle afterSettle
+      unwokenLine "settled cleanup" evidence
+      unwokenWakeCounts evidence `shouldSatisfy` allEqual
+      unwokenReturned evidence `shouldSatisfy` (> unwokenFloor evidence)
+      unwokenWoken evidence `shouldBe` False
+      unwokenNoted evidence `shouldBe` False
+      unwokenSeconds evidence `shouldSatisfy` (>= unwokenBound)
+
+    -- The coordinated control: the reply is established as waiting unread
+    -- before the wait begins, so this is what a settle that only processed
+    -- pending events leaves whenever the compositor answers after that poll.
+    it "shows a cleanup reply left unread ending the next production wait early and unwoken" $ do
+      evidence ← owned shared $ \session → do
+        Wake.settle session
+        beforeRelease ← wakeCountsForCheck
+        withWindow session (hiddenTestWindowConfig "unread cleanup" 64 48) (\_ → pure ())
+        flushAndAwaitReply replyBound
+        afterReply ← wakeCountsForCheck
+        unwokenWait session beforeRelease afterReply
+      unwokenLine "unread cleanup" evidence
+      unwokenWakeCounts evidence `shouldSatisfy` allEqual
+      unwokenReturned evidence `shouldSatisfy` (> unwokenFloor evidence)
+      unwokenWoken evidence `shouldBe` False
+      unwokenNoted evidence `shouldBe` False
+      unwokenSeconds evidence `shouldSatisfy` (< unwokenBound)
 
   Wake.spec shared
 
@@ -277,3 +325,74 @@ describeSample observation =
     <> show (observedFramebufferExtent observation)
     <> ", content scale "
     <> show (observedContentScale observation)
+
+-- | One production wait that nothing in the example wakes.
+data UnwokenWait = UnwokenWait
+  { unwokenFloor ∷ Natural
+    -- ^ The sequence number of the last wait recorded before this one.
+  , unwokenReturned ∷ Natural
+    -- ^ The sequence number of the wait that returned.
+  , unwokenWoken ∷ Bool
+  , unwokenNoted ∷ Bool
+  , unwokenSeconds ∷ Double
+    -- ^ How long the waiting owner operation took, against 'unwokenBound'.
+  , unwokenWakeCounts ∷ [(Natural, Natural)]
+    -- ^ The production wake counts before the example's settling or release,
+    -- once that was done, and after the wait.
+  }
+
+-- | Make one production wait bounded by 'unwokenBound' on the owner thread,
+-- with nothing posted to wake it, and read back its record.
+unwokenWait ∷ Session → (Natural, Natural) → (Natural, Natural) → IO UnwokenWait
+unwokenWait session before settled = do
+  (floor', _) ← takeLastWaitForCheck
+  started ← getMonotonicTime
+  processWindowEvents session (AwaitEventsFor unwokenBound)
+  seconds ← subtract started <$> getMonotonicTime
+  (returned, woken) ← takeLastWaitForCheck
+  noted ← takeWaitNotedForCheck
+  after ← wakeCountsForCheck
+  pure
+    UnwokenWait
+      { unwokenFloor = floor'
+      , unwokenReturned = returned
+      , unwokenWoken = woken
+      , unwokenNoted = noted
+      , unwokenSeconds = seconds
+      , unwokenWakeCounts = [before, settled, after]
+      }
+
+-- | The bound on an unwoken wait: long beside a compositor's answer on the same
+-- machine, which arrives within milliseconds, and short enough that reaching it
+-- costs the run little.
+unwokenBound ∷ Double
+unwokenBound = 0.5
+
+-- | How long the coordinated control waits for the compositor's answer to
+-- arrive; not arriving in that time fails the example.
+replyBound ∷ Double
+replyBound = 5
+
+allEqual ∷ Eq a ⇒ [a] → Bool
+allEqual values = and (zipWith (==) values (drop 1 values))
+
+unwokenLine ∷ String → UnwokenWait → IO ()
+unwokenLine label evidence = do
+  putStrLn
+    ( "glfw-native-tests settle evidence: "
+        <> label
+        <> ": wait "
+        <> show (unwokenReturned evidence)
+        <> " after wait "
+        <> show (unwokenFloor evidence)
+        <> " returned "
+        <> (if unwokenWoken evidence then "woken" else "unwoken")
+        <> (if unwokenNoted evidence then " and noted" else "")
+        <> " in "
+        <> show (unwokenSeconds evidence)
+        <> "s of a "
+        <> show unwokenBound
+        <> "s bound; production wake counts "
+        <> show (unwokenWakeCounts evidence)
+    )
+  hFlush stdout

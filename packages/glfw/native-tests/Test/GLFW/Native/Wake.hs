@@ -15,7 +15,7 @@
 -- wake's latency; a wait that returned without reaching it returned on an
 -- event, and one that reached it fails the example rather than passing. Each
 -- example prints one evidence line.
-module Test.GLFW.Native.Wake (spec) where
+module Test.GLFW.Native.Wake (spec, settle) where
 
 import Control.Concurrent (ThreadId, forkIO, forkOS, yield)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
