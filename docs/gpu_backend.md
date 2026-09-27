@@ -1058,6 +1058,10 @@ are retained as
 [`docs/vulkan/macos-wayland-settle.md`](vulkan/macos-wayland-settle.md), with
 that run's `test.glfw-native` receipt beside them; their Linux execution is
 CI's.
+#272's, taken again over the worker group's split into owning modules behind
+its package-private facade, are retained as
+[`docs/vulkan/macos-worker-split.md`](vulkan/macos-worker-split.md), with that
+run's `test.glfw-native` receipt beside them; their Linux execution is CI's.
 
 ## The native suite
 
