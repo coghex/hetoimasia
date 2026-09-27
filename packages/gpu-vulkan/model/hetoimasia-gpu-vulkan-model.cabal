@@ -73,6 +73,7 @@ test-suite gpu-model-tests
     hs-source-dirs: test
     other-modules:
         Test.GPU.Model.Budgets
+        Test.GPU.Model.DeviceLoss
         Test.GPU.Model.Frames
         Test.GPU.Model.Holds
         Test.GPU.Model.Identities

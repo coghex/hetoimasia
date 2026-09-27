@@ -7,6 +7,7 @@
 module Test.GPU.Model.Spec (spec) where
 
 import qualified Test.GPU.Model.Budgets as Budgets
+import qualified Test.GPU.Model.DeviceLoss as DeviceLoss
 import qualified Test.GPU.Model.Frames as Frames
 import qualified Test.GPU.Model.Holds as Holds
 import qualified Test.GPU.Model.Identities as Identities
@@ -21,6 +22,7 @@ spec = describe "GPU model" $ do
   Identities.spec
   Holds.spec
   Frames.spec
+  DeviceLoss.spec
   Budgets.spec
   Opacity.spec
   Recovery.spec

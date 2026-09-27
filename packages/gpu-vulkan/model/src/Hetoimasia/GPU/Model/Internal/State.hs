@@ -29,6 +29,10 @@ module Hetoimasia.GPU.Model.Internal.State
   , escalationsDropped
   , takeEscalations
   , escalateSession
+  , noteDeviceLoss
+  , deviceLossObserved
+  , DeviceLossRelease (..)
+  , releaseToDeviceLoss
 
     -- * Targets
   , TargetPhase (..)
@@ -245,6 +249,9 @@ data SessionFailureCause
   | UnknownSubmissionEffect
   | CleanupFailed
   | RequiredTargetUnrecoverable
+  | DiagnosticSinkFailed
+    -- ^ The diagnostic consumer's sink failed: a separate terminal status that
+    -- stops admission like the others and never replaces an earlier cause.
   deriving (Eq, Ord, Show)
 
 data SessionState
@@ -461,6 +468,11 @@ data GpuModel = GpuModel
     -- ^ Newest first, and bounded: see 'note'.
   , gpuEscalationsDropped ∷ !Natural
   , gpuState ∷ !SessionState
+  , gpuDeviceLost ∷ !Bool
+    -- ^ Whether the boundary observed the device's loss. It is kept apart from
+    -- the session's first cause: a session that another cause failed first
+    -- keeps that cause, while its teardown still switches to the device-loss
+    -- rules once the loss is observed.
   }
   deriving (Eq, Show)
 
@@ -496,6 +508,7 @@ newGpuModel session budgets = (model, device)
         , gpuEscalations = []
         , gpuEscalationsDropped = 0
         , gpuState = SessionRunning
+        , gpuDeviceLost = False
         }
 
 modelSessionIdentity ∷ GpuModel → SessionIdentity
@@ -535,6 +548,136 @@ escalateSession ∷ SessionFailureCause → GpuModel → GpuModel
 escalateSession cause model = case gpuState model of
   SessionFailed _ → model
   SessionRunning → (note (SessionEscalated cause) model) {gpuState = SessionFailed cause}
+
+-- | Record that the device was lost. The session fails with 'DeviceLost' if
+-- nothing failed it first; if something did, that first cause is kept and only
+-- the loss itself is recorded, which is what lets a later teardown use the
+-- device-loss rules without rewriting why the session ended.
+noteDeviceLoss ∷ GpuModel → GpuModel
+noteDeviceLoss model = (escalateSession DeviceLost model) {gpuDeviceLost = True}
+
+-- | Whether the boundary has recorded the device's loss, whatever the
+-- session's first cause was.
+deviceLossObserved ∷ GpuModel → Bool
+deviceLossObserved = gpuDeviceLost
+
+-- | What 'releaseToDeviceLoss' let go of.
+data DeviceLossRelease = DeviceLossRelease
+  { releasedSubmissions ∷ ![SubmissionId]
+    -- ^ Every outstanding submission, certain or uncertain. None of them is
+    -- recorded as completed.
+  , releasedPresentations ∷ ![PresentationId]
+    -- ^ Every enqueued presentation, and every record awaiting an unpresented
+    -- frame's settlement. None of them is recorded as retired.
+  , releasedFrames ∷ ![FrameSlotId]
+    -- ^ Every frame that had left acquisition: submitted, enqueued, retiring or
+    -- in the uncertain-effect state.
+  , releaseRemaining ∷ ![FrameSlotId]
+    -- ^ Frames still reserved or acquired, which the boundary must skip before
+    -- anything of theirs can be let go.
+  }
+  deriving (Eq, Show)
+
+-- | Let go of every obligation that only the lost device could have
+-- discharged: submitted uses, presentation obligations, and the frames that
+-- owed nothing else.
+--
+-- This is the specification's device-loss rule — a lost device's objects may
+-- be destroyed without waiting for their pending work, because that work may
+-- never complete — and nothing more. It is not completion: no submission is
+-- recorded as completed, no presentation as retired, no cycle is credited and
+-- no recovery episode sees healthy progress, so nothing here can be read as a
+-- fence having signalled. It discharges the uncertain-effect records too,
+-- since what was unknown about them is whether the device ran their work, and
+-- the rule makes that irrelevant to destroying what they retained. What stays
+-- is everything the device's loss says nothing about: a frame still reserved
+-- or acquired, whose unsubmitted recording the boundary must invalidate and
+-- skip first; recorded references, logical release and CPU use; and every
+-- disposal that already failed.
+--
+-- It is refused as 'WrongPhase' of the device unless the loss was recorded
+-- with 'noteDeviceLoss'. Releasing twice releases nothing the second time.
+releaseToDeviceLoss ∷ GpuModel → Outcome (GpuModel, DeviceLossRelease)
+releaseToDeviceLoss model
+  | not (gpuDeviceLost model) = Rejected (WrongPhase DeviceIdentity)
+  | otherwise = Admitted (settleSchedule True model released, report)
+  where
+    releasing phase = phase `elem` [FrameSubmitted, FramePresentationEnqueued, FrameRetiring, FrameUncertainEffect]
+    frames =
+      [ (number, target, slot, frame)
+      | (number, target) ← Map.toList (gpuTargets model)
+      , (slot, frame) ← Map.toList (targetFrames target)
+      ]
+    leaving = [(number, slot, frame) | (number, _, slot, frame) ← frames, releasing (framePhase frame)]
+    remaining = [identityOf number target slot frame | (number, target, slot, frame) ← frames, not (releasing (framePhase frame))]
+    identityOf number target slot frame = FrameSlotId (targetIdOf model number target) slot (frameUseNumber frame)
+    -- A record is released when a presentation or a settlement owns it, or
+    -- when the frame bound to it is released.
+    bound = Set.fromList [(number, record) | (number, _, frame) ← leaving, Just record ← [framePoolRecord frame]]
+    pools =
+      [ (number, target, record, entry)
+      | (number, target) ← Map.toList (gpuTargets model)
+      , (record, entry) ← Map.toList (targetPool target)
+      , poolState entry /= PoolReserved || (number, record) `Set.member` bound
+      ]
+    submissions = Map.toList (gpuSubmissions model)
+    withoutSubmissions =
+      foldl'
+        ( \current (number, submission) →
+            releaseObjects
+              1
+              ( foldl'
+                  (\inner key → editHolds key (dischargeSubmitted number) inner)
+                  current
+                  (Set.toList (submissionSubjects submission))
+              )
+              {gpuSubmissions = Map.delete number (gpuSubmissions current)}
+        )
+        model
+        submissions
+    withoutPools =
+      foldl'
+        ( \current (number, _, record, entry) →
+            let discharged = case poolGeneration entry of
+                  Nothing → current
+                  Just generation → editHolds (GenerationKey number generation) (dischargePresentation record) current
+             in editTarget
+                  number
+                  ( \target →
+                      target
+                        { targetPool = Map.delete record (targetPool target)
+                        , -- The cycle this record identified can never complete,
+                          -- and is dropped uncredited.
+                          targetCycles = Map.delete record (targetCycles target)
+                        }
+                  )
+                  (releaseObjects 1 discharged)
+        )
+        withoutSubmissions
+        pools
+    released =
+      foldl'
+        ( \current (number, slot, frame) →
+            releaseObjects
+              (reservedSubmission frame)
+              (editTarget number (\target → target {targetFrames = Map.delete slot (targetFrames target)}) current)
+        )
+        withoutPools
+        leaving
+    report =
+      DeviceLossRelease
+        { releasedSubmissions = [SubmissionId (gpuSession model) number | (number, _) ← submissions]
+        , releasedPresentations =
+            [ PresentationId (targetIdOf model number target) record
+            | (number, target, record, _) ← pools
+            ]
+        , releasedFrames =
+            [ identityOf number target slot frame
+            | (number, target, slot, frame) ← frames
+            , releasing (framePhase frame)
+            ]
+        , releaseRemaining = remaining
+        }
 
 -- | Retain one escalation notice, keeping the session's notice window finite.
 --
@@ -1434,7 +1577,11 @@ data AcquireAnswer
 acquireImage ∷ FrameSlotId → AcquireOutcome → GpuModel → Outcome (GpuModel, AcquireAnswer)
 acquireImage identity outcome model =
   scheduling model $
-  resolved (running model) $ \() →
+  -- Only an acquisition that owns an image is new work. One that owned
+  -- nothing returns a reservation that was admitted while the session ran,
+  -- and it is recorded even when the call's own failure — a device loss —
+  -- ended the session: that is the accounting the call's outcome owes.
+  resolved (if owning then running model else Right ()) $ \() →
     resolved (resolveFrame model identity) $ \(number, slot, frame) →
       if framePhase frame /= FrameReserved
         then Rejected (WrongPhase FrameIdentity)
@@ -1447,6 +1594,10 @@ acquireImage identity outcome model =
             AcquiredImage index → own number slot frame target index False
             AcquiredSuboptimalImage index → own number slot frame target index True
   where
+    owning = case outcome of
+      AcquiredImage _ → True
+      AcquiredSuboptimalImage _ → True
+      _ → False
     own number slot frame target index suboptimal =
       case targetActiveGeneration target >>= \generation →
         (,) generation <$> Map.lookup generation (targetGenerations target) of
@@ -1702,7 +1853,12 @@ submitFrames identities outcome model
   | null identities = Rejected EmptySubmission
   | otherwise =
       scheduling model $
-      resolved (running model) $ \() →
+      -- Only an accepted submission is new work. A call that failed — with no
+      -- effect, or with an effect nobody can know — is the outcome of a
+      -- submission admitted while the session ran, and it is recorded even
+      -- when that same call's failure ended the session, so an uncertain
+      -- effect still retains what it concerns.
+      resolved (if outcome == SubmissionAccepted then running model else Right ()) $ \() →
         resolved (traverse (resolveFrame model) identities) $ \frames →
           let keys = [(number, slot) | (number, slot, _) ← frames]
            in if length (Set.toList (Set.fromList keys)) /= length keys

@@ -118,6 +118,7 @@ module Hetoimasia.GPU.Vulkan.Diagnostics
   , CaptureCounters (..)
   , captureStatus
   , deliveredCount
+  , captureSinkFailure
 
     -- * The verdict
   , DiagnosticVerdict (..)
@@ -152,7 +153,7 @@ import Control.Concurrent.STM
   , writeTVar
   )
 import Control.Exception
-  ( Exception
+  ( Exception (displayException)
   , ExceptionWithContext (ExceptionWithContext)
   , SomeAsyncException
   , SomeException
@@ -330,6 +331,8 @@ data DiagnosticCapture = DiagnosticCapture
   , handleQuiesced ∷ !(TVar Bool)
     -- ^ Set by 'afterLastCallback' once the owner's last callback-producing
     -- destruction has returned.
+  , handleSinkFailure ∷ !(TVar (Maybe Text))
+    -- ^ Set by the worker, once, when its sink first fails; never cleared.
   }
 
 -- | Evidence, for one capture, that the last Vulkan call that could invoke its
@@ -380,6 +383,15 @@ capturePhase = readTVar . handlePhase
 -- | How many records the worker has handed to the logger so far.
 deliveredCount ∷ DiagnosticCapture → STM Word64
 deliveredCount = readTVar . handleDelivered
+
+-- | The failure that stopped delivery, described, from the moment the worker
+-- met it rather than only once the verdict is reached: a sink failure is a
+-- terminal status an owner can observe at its checkpoints while the lifetime
+-- still runs. It is set once and never cleared, and it says nothing about the
+-- latches: an error reported after the sink failed still latches, and the
+-- verdict still carries the failure itself as 'ConsumerSinkFailed'.
+captureSinkFailure ∷ DiagnosticCapture → STM (Maybe Text)
+captureSinkFailure = readTVar . handleSinkFailure
 
 -- | Run a body that owns a diagnostic capture, and finalize it on every exit.
 --
@@ -479,6 +491,7 @@ newCapture storage =
     <*> newTVarIO False
     <*> newTVarIO False
     <*> newTVarIO False
+    <*> newTVarIO Nothing
 
 -- | What steps 1 and 2 leave for the rest of the lifetime.
 data Finished a = Finished
@@ -807,7 +820,11 @@ drainWorker config logger storage capture =
                       Right () → pure ()
                       Left failure@(ExceptionWithContext _ exception)
                         | isJust (fromException exception ∷ Maybe SomeAsyncException) → rethrowIO failure
-                        | otherwise → writeIORef state (DrainReport (Just failure))
+                        | otherwise → mask_ $ do
+                            writeIORef state (DrainReport (Just failure))
+                            -- Published as soon as it is known, so an owner's
+                            -- checkpoint sees it while the lifetime runs.
+                            atomically (writeTVar (handleSinkFailure capture) (Just (Text.pack (displayException exception))))
                 pass
           loop = do
             final ← readTVarIO (handleFinal capture)

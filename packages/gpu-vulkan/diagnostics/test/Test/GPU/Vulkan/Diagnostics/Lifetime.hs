@@ -14,7 +14,7 @@ import Control.Concurrent (forkIO, killThread, throwTo, yield)
 import Control.Monad (forM_, replicateM_, when)
 import Data.Word (Word64)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar)
-import Control.Concurrent.STM (atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
+import Control.Concurrent.STM (atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import Control.Exception
   ( AsyncException (ThreadKilled, UserInterrupt)
   , Exception
@@ -59,6 +59,7 @@ import Hetoimasia.GPU.Vulkan.Diagnostics
   , DiagnosticVerdict (..)
   , FinalizationEvidence (..)
   , VerdictIssue (..)
+  , captureSinkFailure
   , captureStatus
   , capturePhase
   , captureUserData
@@ -67,6 +68,7 @@ import Hetoimasia.GPU.Vulkan.Diagnostics
   , diagnosticsComponent
   , finalizationEvidence
   , afterLastCallback
+  , requestDrain
   , retainStorage
   , verdictClean
   , verdictIssues
@@ -261,6 +263,21 @@ spec = describe "Lifetime" $ do
       verdictIssues verdict `shouldBe` [RecordsUndelivered 3, ConsumerUnsuccessful]
       -- One write reached the sink and failed; nothing was written about it.
       readTVarIO attempts `shouldReturn` 1
+
+    it "is observable while the lifetime still captures, from the moment the worker meets it" $ do
+      (logger, _) ← failingLogger
+      ((before, during, phase), verdict) ←
+        capturing logger $ \capture → do
+          before ← atomically (captureSinkFailure capture)
+          offerTo capture (plainOffer SeverityWarning "the first report")
+          requestDrain capture
+          during ← bounded (atomically (captureSinkFailure capture >>= maybe retry pure))
+          phase ← atomically (capturePhase capture)
+          pure (before, during, phase)
+      before `shouldBe` Nothing
+      during `shouldSatisfy` (not . Text.null)
+      phase `shouldBe` PhaseCapturing
+      consumerName (verdictConsumer verdict) `shouldBe` "sink failed"
 
     it "stands beside the body's failure, which is rethrown unchanged with the verdict on it" $ do
       (logger, _) ← failingLogger
