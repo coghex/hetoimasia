@@ -16,8 +16,9 @@
 -- "Test.GLFW.Native.WaylandScenarios"): the default request with no X11
 -- display, the Wayland request in an X11-only environment (under
 -- @tools/display/x11.sh@ itself), the traced unsupported operations, shutdown,
--- failure cleanup, and every connection-loss situation, each of which ends a
--- compositor of the child's own and never the one this run's consent names.
+-- failure cleanup, every connection-loss situation, each of which ends a
+-- compositor of the child's own and never the one this run's consent names,
+-- and the settle against a compositor of the child's own that it pauses.
 -- The compiled-support rejection has no native form here: a prefix built with
 -- Wayland cannot be asked to lack it, so the seam proves it in @glfw-tests@.
 --
@@ -26,7 +27,7 @@
 -- neither counts as Wayland pass evidence.
 module Test.GLFW.Native.Wayland (spec) where
 
-import Control.Monad (void, when)
+import Control.Monad (void)
 import GHC.Clock (getMonotonicTime)
 import Hetoimasia.GLFW.Command
 import Hetoimasia.GLFW.Internal.Native
@@ -53,7 +54,7 @@ import System.Environment (getExecutablePath, lookupEnv)
 import System.FilePath (takeDirectory, (</>))
 import System.IO (hFlush, stdout)
 import Test.GLFW.Native.Consent (Consent (IsolatedWayland), waylandValue)
-import Test.GLFW.Native.Control (converge, returnedWithRevision, withTwo)
+import Test.GLFW.Native.Control (converge, returnedWithRevision, showAndRelease, withTwo)
 import Test.GLFW.Native.Host (testCloseOrder)
 import Test.GLFW.Native.Private
   ( Launched (..)
@@ -65,7 +66,6 @@ import Test.GLFW.Native.Private
   )
 import Test.GLFW.Native.Support (Gate, Shared (..), acquisitions, currentObservation, failed, gateConsent, owned)
 import qualified Test.GLFW.Native.Wake as Wake
-import Test.GLFW.Native.WaylandSync (flushAndAwaitReply)
 import Test.Hspec (Spec, SpecWith, before_, describe, it, pendingWith, shouldBe, shouldReturn, shouldSatisfy)
 
 spec ∷ Shared → Spec
@@ -178,13 +178,13 @@ spec shared = describe "on an isolated Wayland session" . onlyWayland gate $ do
       privateScenarioReporting gate "wayland-unsupported"
 
   -- The wake examples below begin from a settled connection. These two show
-  -- what settling must absorb on Wayland: the compositor's answers to an
-  -- earlier example's shown and released window, which GLFW queues and sends
-  -- only at the next event processing, and which arrive after a pending-events
-  -- poll has returned. Showing matters: releasing a window that was shown
-  -- detaches the buffer its fallback decorations held, and the compositor
-  -- posts that buffer's release, carrying the delete_id it queued for every
-  -- destroyed object. Releasing a window that was never shown posts nothing.
+  -- what settling must absorb on Wayland: the compositor's answer to an earlier
+  -- example's shown and released window, which GLFW queues and sends only at
+  -- the next event processing, and which can arrive after a pending-events poll
+  -- has returned. Showing matters: releasing a window that was shown detaches
+  -- the buffer its fallback decorations held, and the compositor posts that
+  -- buffer's release, carrying the delete_id it queued for every destroyed
+  -- object. Releasing a window that was never shown posts nothing.
   describe "settling before a wait" $ do
     it "settles a shown and released window's cleanup, so the next production wait nothing wakes reaches its bound" $ do
       evidence ← owned shared $ \session → do
@@ -200,24 +200,14 @@ spec shared = describe "on an isolated Wayland session" . onlyWayland gate $ do
       unwokenNoted evidence `shouldBe` False
       unwokenSeconds evidence `shouldSatisfy` (>= unwokenBound)
 
-    -- The coordinated control: the compositor's answer is established as
-    -- waiting unread before the wait begins, so this is what a settle that
-    -- only processed pending events leaves whenever the compositor answers
-    -- after that poll.
-    it "shows the cleanup answer left unread ending the next production wait early and unwoken" $ do
-      evidence ← owned shared $ \session → do
-        Wake.settle session
-        showAndRelease session
-        beforeReply ← wakeCountsForCheck
-        flushAndAwaitReply replyBound
-        afterReply ← wakeCountsForCheck
-        unwokenWait session beforeReply afterReply
-      unwokenLine "unread cleanup" evidence
-      unwokenWakeCounts evidence `shouldSatisfy` allEqual
-      unwokenReturned evidence `shouldSatisfy` (> unwokenFloor evidence)
-      unwokenWoken evidence `shouldBe` False
-      unwokenNoted evidence `shouldBe` False
-      unwokenSeconds evidence `shouldSatisfy` (< unwokenBound)
+    -- Whether the compositor answers before or after the pending-events poll
+    -- is a race in the example above. Here it is not: a child pauses a
+    -- compositor of its own before settling, and resumes it only once it has
+    -- observed the owner blocked, so the answer cannot arrive before the
+    -- settle blocks. A settle that only processed pending events would block
+    -- first in the unwoken wait, and the answer would end that wait.
+    it "settles that cleanup against a compositor that answers only once the owner has blocked, in a private child" $
+      privateScenarioReporting gate "wayland-settle"
 
   Wake.spec shared
 
@@ -332,17 +322,6 @@ describeSample observation =
     <> ", content scale "
     <> show (observedContentScale observation)
 
--- | Show a hidden window, observe it shown, and release it and its companion,
--- leaving the release's requests queued and unsent, as the visibility example
--- leaves them for whatever runs next.
-showAndRelease ∷ Session → IO ()
-showAndRelease session =
-  withTwo session $ \perform window _ → do
-    void (perform (showWindowCommand (windowIdentity window)))
-    shown ← converge window (\observation → pure (observedVisible observation == Observed True, observedVisible observation))
-    when (shown /= Observed True) $
-      failed ("the window to release was never observed shown: " <> show shown)
-
 -- | One production wait that nothing in the example wakes.
 data UnwokenWait = UnwokenWait
   { unwokenFloor ∷ Natural
@@ -384,11 +363,6 @@ unwokenWait session before settled = do
 -- costs the run little.
 unwokenBound ∷ Double
 unwokenBound = 0.5
-
--- | How long the coordinated control waits for the compositor's answer to
--- arrive; not arriving in that time fails the example.
-replyBound ∷ Double
-replyBound = 5
 
 allEqual ∷ Eq a ⇒ [a] → Bool
 allEqual values = and (zipWith (==) values (drop 1 values))

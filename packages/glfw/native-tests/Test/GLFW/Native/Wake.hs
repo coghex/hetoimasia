@@ -187,7 +187,9 @@ wokenWaitBy fork session after act = do
 -- everything, and processes pending events again: every request sent before
 -- the boundary has then been processed by the compositor, and every event it
 -- caused has been dispatched. This posts no production wake and changes none
--- of the counts or records the examples read. It does not make the connection
+-- of the counts or records the examples read. The Wayland tree's
+-- @wayland-settle@ child holds this settle to that ordering against a
+-- compositor it pauses, beside a pending-only settle that must fail there. It does not make the connection
 -- silent: an event the compositor sends later on its own account can still end
 -- a wait, which is why every example here still bounds its spurious returns.
 settle ∷ Session → IO ()

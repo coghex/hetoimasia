@@ -22,9 +22,7 @@
 #define HETOIMASIA_TEST_NOT_WAYLAND 3
 #define HETOIMASIA_TEST_NO_DISPLAY 4
 #define HETOIMASIA_TEST_FAILED 5
-#define HETOIMASIA_TEST_TIMED_OUT 6
-#define HETOIMASIA_TEST_HANGUP 7
-#define HETOIMASIA_TEST_UNSUPPORTED_PLATFORM 8
+#define HETOIMASIA_TEST_UNSUPPORTED_PLATFORM 6
 
 /* A synchronization boundary with the compositor: flush everything the client
  * has sent, then block until the compositor has answered a sync request sent
@@ -38,11 +36,11 @@
  * the errno libwayland left. */
 int hetoimasia_glfw_test_wayland_barrier(int* error);
 
-/* Flush everything the client has sent, then block up to timeout_ms until the
- * compositor's socket has something to read, reading nothing. The native
- * examples use it to establish that an answer is waiting unread, without
- * sleeping. HETOIMASIA_TEST_TIMED_OUT when nothing arrived in time,
- * HETOIMASIA_TEST_HANGUP when the peer closed instead. */
-int hetoimasia_glfw_test_wayland_flush_and_await_reply(int timeout_ms, int* error);
+/* The odd sequence number of the barrier in progress, if the thread running it
+ * is blocked in the kernel, and zero otherwise; the same number is read on both
+ * sides of observing that thread, as the production shim observes a blocked
+ * wait. It observes and posts nothing. The examples resume a paused compositor
+ * only once they have seen the owner blocked. */
+unsigned long hetoimasia_glfw_test_blocked_barrier(void);
 
 #endif

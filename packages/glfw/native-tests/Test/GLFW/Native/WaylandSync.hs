@@ -3,27 +3,30 @@
 -- | Test-only synchronization with the Wayland compositor, for the native
 -- examples alone.
 --
--- Both operations do what the Wayland qualification design's D-13 forbids the
--- production shim, which may only read the connection's status: they flush
--- GLFW's connection, and the barrier also reads and dispatches protocol
--- messages. So they are bound here, in the test suite's own C source
+-- The barrier does what the Wayland qualification design's D-13 forbids the
+-- production shim, which may only read the connection's status: it flushes
+-- GLFW's connection, and reads and dispatches protocol messages. So it and its
+-- observation are bound here, in the test suite's own C source
 -- (@native-tests/cbits/hetoimasia_glfw_test.c@), and no library reaches them.
--- Each is a @safe@ call, because each can block on the compositor, and each
--- must run on the live Wayland session's owner thread, through the shared
--- fixture's 'Test.GLFW.Native.Support.owned'. Neither hands back a native
--- pointer or descriptor, and neither posts a GLFW empty event or touches the
--- production wait's records. A helper that cannot do its work fails the
--- example; neither falls back to anything weaker.
+-- The barrier is a @safe@ call, because it blocks on the compositor, and must
+-- run on the live Wayland session's owner thread — through the shared
+-- fixture's 'Test.GLFW.Native.Support.owned', or in a private child on the
+-- thread that entered its session. It hands back no native pointer or
+-- descriptor, posts no GLFW empty event, and touches none of the production
+-- wait's records; if it cannot do its work it fails the example, never falling
+-- back to anything weaker. Its blocked observation reads only the barrier's own
+-- sequence and the kernel's report of the thread running it.
 module Test.GLFW.Native.WaylandSync
   ( awaitCompositor
-  , flushAndAwaitReply
+  , blockedBarrierForCheck
   ) where
 
 import Data.Maybe (fromMaybe)
-import Foreign.C.Types (CInt (..))
+import Foreign.C.Types (CInt (..), CULong (..))
 import Foreign.Marshal.Alloc (alloca)
 import Foreign.Ptr (Ptr)
 import Foreign.Storable (peek)
+import Numeric.Natural (Natural)
 import Test.GLFW.Native.Support (failed)
 
 -- | Block until the compositor has processed every request the client sent
@@ -34,13 +37,14 @@ import Test.GLFW.Native.Support (failed)
 awaitCompositor ∷ IO ()
 awaitCompositor = helper "the compositor barrier" c_barrier
 
--- | Send everything the client has queued, then block for at most @seconds@
--- until the compositor's socket has something to read, reading nothing. It
--- establishes that an answer is waiting unread, without a sleep; one that has
--- not arrived in time fails the example.
-flushAndAwaitReply ∷ Double → IO ()
-flushAndAwaitReply seconds =
-  helper "waiting for the compositor's reply" (c_flushAndAwaitReply (round (seconds * 1000)))
+-- | The odd sequence number of the barrier in progress, if the thread running
+-- it is blocked in the kernel, observed as the production shim observes a
+-- blocked wait. It observes and posts nothing, and may be called from any
+-- thread.
+blockedBarrierForCheck ∷ IO (Maybe Natural)
+blockedBarrierForCheck = do
+  sequenceNumber ← c_blockedBarrier
+  pure (if sequenceNumber == 0 then Nothing else Just (fromIntegral sequenceNumber))
 
 helper ∷ String → (Ptr CInt → IO CInt) → IO ()
 helper name call =
@@ -63,16 +67,14 @@ describe status =
       , (testNotWayland, "ran on a session that did not select Wayland")
       , (testNoDisplay, "found no Wayland display")
       , (testFailed, "failed")
-      , (testTimedOut, "timed out")
-      , (testHangup, "found the compositor's socket closed")
       , (testUnsupportedPlatform, "is unavailable on a platform with no Wayland backend")
       ]
 
 foreign import capi safe "hetoimasia_glfw_test.h hetoimasia_glfw_test_wayland_barrier"
   c_barrier ∷ Ptr CInt → IO CInt
 
-foreign import capi safe "hetoimasia_glfw_test.h hetoimasia_glfw_test_wayland_flush_and_await_reply"
-  c_flushAndAwaitReply ∷ CInt → Ptr CInt → IO CInt
+foreign import capi unsafe "hetoimasia_glfw_test.h hetoimasia_glfw_test_blocked_barrier"
+  c_blockedBarrier ∷ IO CULong
 
 foreign import capi "hetoimasia_glfw_test.h value HETOIMASIA_TEST_READY" testReady ∷ CInt
 foreign import capi "hetoimasia_glfw_test.h value HETOIMASIA_TEST_NO_LIBRARY" testNoLibrary ∷ CInt
@@ -80,6 +82,4 @@ foreign import capi "hetoimasia_glfw_test.h value HETOIMASIA_TEST_NO_SYMBOL" tes
 foreign import capi "hetoimasia_glfw_test.h value HETOIMASIA_TEST_NOT_WAYLAND" testNotWayland ∷ CInt
 foreign import capi "hetoimasia_glfw_test.h value HETOIMASIA_TEST_NO_DISPLAY" testNoDisplay ∷ CInt
 foreign import capi "hetoimasia_glfw_test.h value HETOIMASIA_TEST_FAILED" testFailed ∷ CInt
-foreign import capi "hetoimasia_glfw_test.h value HETOIMASIA_TEST_TIMED_OUT" testTimedOut ∷ CInt
-foreign import capi "hetoimasia_glfw_test.h value HETOIMASIA_TEST_HANGUP" testHangup ∷ CInt
 foreign import capi "hetoimasia_glfw_test.h value HETOIMASIA_TEST_UNSUPPORTED_PLATFORM" testUnsupportedPlatform ∷ CInt

@@ -3,13 +3,14 @@
 -- Each is a list of checks "Test.GLFW.Native.Private" runs in a child of its
 -- own, because each needs a session the shared fixture cannot host: one entered
 -- in an environment it must not reach, one over a traced native table, or one
--- whose compositor the child deliberately ends. They are written for the
+-- whose compositor the child deliberately ends or pauses. They are written for the
 -- isolated Wayland consent @tools/display/wayland.sh@ supplies, except
 -- @wayland-without-compositor@, which runs under @tools/display/x11.sh@.
 --
--- = The connection-loss children
+-- = The connection-loss and settling children
 --
--- A connection-loss child never touches the compositor its consent names. It
+-- A connection-loss child, and the settling child, never touch the compositor
+-- their consent names. It
 -- starts a compositor of its own ('withPrivateCompositor'): packaged Weston,
 -- headless, on a socket of its own in a runtime directory created for it with
 -- mode 0700, with no configuration file, and with @WAYLAND_DISPLAY@,
@@ -74,6 +75,8 @@ import Hetoimasia.GLFW.Internal.Native
   , productionNative
   , takeInputCallbacksClearedForCheck
   , takeLastWaitForCheck
+  , takeWaitNotedForCheck
+  , wakeCountsForCheck
   )
 import Hetoimasia.GLFW.Internal.Session (Native (..), WindowAttribute (IconifiedAttribute), sessionAssembly)
 import Hetoimasia.GLFW.Internal.Window (EventProcessing (..), processWindowEvents, rejectCloseRequest, windowNativeHandle)
@@ -87,6 +90,8 @@ import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
 import System.IO (IOMode (WriteMode), openFile)
 import System.Posix.Process (getProcessID)
+import System.Posix.Signals (signalProcess, sigCONT, sigSTOP)
+import System.Posix.Types (ProcessID)
 import System.Posix.Temp (mkdtemp)
 import Numeric.Natural (Natural)
 import System.Process
@@ -94,6 +99,7 @@ import System.Process
   , ProcessHandle
   , StdStream (NoStream, UseHandle)
   , createProcess
+  , getPid
   , getProcessExitCode
   , proc
   , terminateProcess
@@ -101,7 +107,10 @@ import System.Process
   )
 import Test.GLFW.Native.Child (ChildEnd (..), Launched (..), launchCommandIn)
 import Test.GLFW.Native.Consent (Consent)
+import Test.GLFW.Native.Control (showAndRelease)
 import Test.GLFW.Native.Support (consentBackend, consentSessionConfig)
+import qualified Test.GLFW.Native.Wake as Wake
+import Test.GLFW.Native.WaylandSync (blockedBarrierForCheck)
 
 -- | The Wayland scenarios, for a child running under this consent.
 scenarios ∷ Consent → [(String, [(String, IO String)])]
@@ -144,6 +153,15 @@ scenarios consent =
     )
   , ( "connection-healthy-close"
     , [("does not mistake an injected close request on a healthy connection for loss, and the session stays live", healthyCloseRequest)]
+    )
+  , ( "wayland-settle"
+    , [ ( "settles a shown and released window's cleanup against a compositor that answers only once the owner has blocked, so the next production wait reaches its bound"
+        , settleAgainstPausedCompositor
+        )
+      , ( "shows a settle that only processes pending events leaving that answer to end the next production wait early and unwoken"
+        , pendingOnlyAgainstPausedCompositor
+        )
+      ]
     )
   ]
 
@@ -667,6 +685,148 @@ endWhenBlocked ownerDone floor' compositor = loop
               ended ← endCompositor compositor
               pure (Just (blocked, ended))
             _ → yield >> loop
+
+-- ---------------------------------------------------------------------------
+-- Settling against a paused compositor
+
+-- | The wake examples' settle, tied to the ordering that made it fail.
+--
+-- A shown window is released, so its teardown is queued and unsent, and the
+-- child's own compositor is paused with @SIGSTOP@ before the settle runs: its
+-- answer cannot arrive before the settle has sent the teardown and polled for
+-- pending events. A worker resumes the compositor with @SIGCONT@ only once it
+-- observes the owner blocked — inside the settle's synchronization boundary, or
+-- inside the production wait that follows — so the answer arrives exactly while
+-- the owner waits for something. A settle that is a barrier blocks first, and
+-- absorbs the answer before the wait begins, which then reaches its bound.
+settleAgainstPausedCompositor ∷ IO String
+settleAgainstPausedCompositor = do
+  paused ← againstPausedCompositor Wake.settle
+  when (pausedSeconds paused < settleWaitBound) $
+    failCheck ("the settle left the compositor's answer to the released window for the wait: " <> describePaused paused)
+  pure (describePaused paused)
+
+-- | The coordinated control: the same arrangement with a settle that only
+-- processes pending events and clears the last wait's record, which is what
+-- the wake examples' settle was before it became a barrier. It never blocks,
+-- so the compositor is resumed inside the unwoken wait, and its answer ends
+-- that wait early. That it must, every time, is what makes the check above a
+-- regression test for the pending-only settle rather than a race.
+pendingOnlyAgainstPausedCompositor ∷ IO String
+pendingOnlyAgainstPausedCompositor = do
+  paused ← againstPausedCompositor $ \session → do
+    processWindowEvents session ProcessPending
+    () <$ takeLastWaitForCheck
+  unless (pausedSeconds paused < settleWaitBound) $
+    failCheck ("the compositor's answer did not end the wait: " <> describePaused paused)
+  pure (describePaused paused)
+
+-- | What one settle and the unwoken production wait after it showed.
+data Paused = Paused
+  { pausedVersion ∷ String
+  , pausedResumed ∷ String
+    -- ^ Where the owner was observed blocked when the compositor was resumed.
+  , pausedFloor ∷ Natural
+  , pausedReturned ∷ Natural
+  , pausedSeconds ∷ Double
+  , pausedCounts ∷ [(Natural, Natural)]
+  }
+
+-- | Release a shown window on a private compositor, pause the compositor, run
+-- @settleWith@ and then one production wait that nothing wakes, resuming the
+-- compositor only once the owner is observed blocked, and on every exit path.
+-- The wait must be a new one, unwoken and carrying no progress note, with the
+-- production wake counts unchanged; how long it took is the caller's to judge.
+againstPausedCompositor ∷ (Session → IO ()) → IO Paused
+againstPausedCompositor settleWith =
+  withPrivateCompositor $ \compositor → do
+    process ←
+      getPid (compositorProcess compositor)
+        >>= maybe (failCheck "the private compositor has no process id") pure
+    enterPrivate compositor
+    withSession waylandConfig $ \session → do
+      requireWayland session
+      showAndRelease session
+      (floor', _) ← takeLastWaitForCheck
+      ownerDone ← newTVarIO False
+      worker ← newEmptyMVar
+      (seconds, returned, woken, noted, counts) ←
+        ( do
+            signalProcess sigSTOP process
+            _ ← forkIO (try (resumeWhenBlocked ownerDone floor' process) >>= putMVar worker)
+            before ← wakeCountsForCheck
+            settleWith session
+            settled ← wakeCountsForCheck
+            started ← getMonotonicTime
+            processWindowEvents session (AwaitEventsFor settleWaitBound)
+            seconds ← subtract started <$> getMonotonicTime
+            (returned, woken) ← takeLastWaitForCheck
+            noted ← takeWaitNotedForCheck
+            after ← wakeCountsForCheck
+            pure (seconds, returned, woken, noted, [before, settled, after])
+        )
+          `finally` (atomically (writeTVar ownerDone True) >> signalProcess sigCONT process)
+      resumedAt ←
+        takeMVar worker >>= \case
+          Left thrown → failCheck ("the worker failed: " <> displayException (thrown ∷ SomeException))
+          Right Nothing → failCheck "the worker never observed the owner blocked, so the compositor was never resumed"
+          Right (Just place) → pure place
+      unless (and (zipWith (==) counts (drop 1 counts))) $
+        failCheck ("the production wake counts changed: " <> show counts)
+      unless (returned > floor') $
+        failCheck ("no production wait was recorded after wait " <> show floor')
+      when woken $ failCheck ("wait " <> show returned <> " was woken, and nothing in this check wakes it")
+      when noted $ failCheck ("wait " <> show returned <> " carried a progress note")
+      pure
+        Paused
+          { pausedVersion = compositorVersion compositor
+          , pausedResumed = resumedAt
+          , pausedFloor = floor'
+          , pausedReturned = returned
+          , pausedSeconds = seconds
+          , pausedCounts = counts
+          }
+
+describePaused ∷ Paused → String
+describePaused paused =
+  "compositor "
+    <> pausedVersion paused
+    <> " paused before the settle and resumed "
+    <> pausedResumed paused
+    <> "; wait "
+    <> show (pausedReturned paused)
+    <> " after wait "
+    <> show (pausedFloor paused)
+    <> " returned unwoken, with no progress note, after "
+    <> show (pausedSeconds paused)
+    <> "s of a "
+    <> show settleWaitBound
+    <> "s bound; production wake counts "
+    <> show (pausedCounts paused)
+
+-- | Resume the paused compositor once the owner is observed blocked inside the
+-- settle's barrier, or inside a production wait later than @floor'@, answering
+-- where; or give up, resuming nothing, once the owner has finished.
+resumeWhenBlocked ∷ TVar Bool → Natural → ProcessID → IO (Maybe String)
+resumeWhenBlocked ownerDone floor' process = loop
+  where
+    loop = do
+      done ← readTVarIO ownerDone
+      if done
+        then pure Nothing
+        else do
+          barrier ← blockedBarrierForCheck
+          waiting ← blockedWaitForCheck
+          case (barrier, waiting) of
+            (Just blocked, _) → resumed ("inside the settle's barrier " <> show blocked)
+            (_, Just blocked) | blocked > floor' → resumed ("inside production wait " <> show blocked)
+            _ → yield >> loop
+    resumed place = Just place <$ signalProcess sigCONT process
+
+-- | The bound on the unwoken wait: long beside a compositor's answer on the
+-- same machine, which arrives within milliseconds of its resumption.
+settleWaitBound ∷ Double
+settleWaitBound = 0.5
 
 -- ---------------------------------------------------------------------------
 -- The private compositor

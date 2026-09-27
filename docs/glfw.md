@@ -5335,27 +5335,33 @@ The native examples cover:
     borderless-over-monitor requests settle unsupported with reasons, placement
     and iconified observations are `Unavailable`, and none of those calls is
     made;
-  - **settling before a wait:** a hidden window shown, observed shown, and
-    released with its companion, the connection settled, and one production
-    wait that nothing wakes, bounded at 0.5 s, reaching its bound unwoken with
-    no progress note and the production wake counts unchanged across the
-    settling and the wait; and its coordinated control, the same window shown
-    and released and the compositor's answer established as waiting unread —
-    the socket flushed and polled until readable, reading nothing — before the
-    same wait, which then returns early and unwoken. On Wayland the settle
-    that begins every wake example crosses a synchronization boundary with the
-    compositor after processing pending events. Releasing a window that was
-    shown leaves requests GLFW has not sent, and the compositor answers them
-    by posting the release of the buffer the window's fallback decorations
-    held, which carries the `delete_id` it queued for every destroyed object;
-    arriving after a pending-events poll, that answer ends the next wait.
-    Releasing a window that was never shown posts nothing. The boundary and
-    the control's flush are test-only native helpers compiled into
+  - **settling before a wait:** in the shared session, a hidden window shown,
+    observed shown, and released with its companion, the connection settled,
+    and one production wait that nothing wakes, bounded at 0.5 s, reaching its
+    bound unwoken with no progress note and the production wake counts
+    unchanged across the settling and the wait. Then the same, in the
+    `wayland-settle` child, against a compositor of the child's own that it
+    pauses with `SIGSTOP` before the settle and resumes with `SIGCONT` only
+    once a worker observes the owner blocked — inside the settle's
+    synchronization boundary or inside the production wait — so the
+    compositor's answer cannot arrive before the settle has polled. The
+    wake examples' settle reaches the wait's bound there; its coordinated
+    control, a settle that only processes pending events, never blocks, is
+    resumed inside the wait, and must see that wait end early and unwoken.
+    On Wayland the settle that begins every wake example crosses a
+    synchronization boundary with the compositor after processing pending
+    events. Releasing a window that was shown leaves requests GLFW has not
+    sent, and the compositor answers them by posting the release of the
+    buffer the window's fallback decorations held, which carries the
+    `delete_id` it queued for every destroyed object; arriving after a
+    pending-events poll, that answer ends the next wait. Releasing a window
+    that was never shown posts nothing. The boundary and its blocked
+    observation are test-only native helpers compiled into
     `glfw-native-tests` alone (`native-tests/cbits/hetoimasia_glfw_test.c`),
     since the production shim's only Wayland access is the read-only status
-    probe of the Wayland qualification design's D-13. Each example prints an
-    evidence line with the wait's sequence number, whether it was woken, its
-    time against the bound, and the wake counts;
+    probe of the Wayland qualification design's D-13. Each check reports the
+    wait's sequence number, its time against the bound, where the compositor
+    was resumed, and the wake counts;
   - **wake:** the session wake examples above, run again on Wayland, each
     beginning from that settled connection;
   - **shutdown:** the `session-lifecycle` child entering, leaving, and
