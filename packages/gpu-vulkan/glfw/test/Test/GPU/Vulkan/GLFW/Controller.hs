@@ -124,6 +124,7 @@ spec = describe "Vulkan controller" $ do
     it "keeps the dependency order and the loss when cancellation is delivered repeatedly during the drain that follows it" (bounded testCancelledAfterLoss)
     it "latches the failed destruction of a surface created while the lease closed, beside the earlier primary, and retains the instance" (bounded testLateSurfaceFails)
     it "latches each surface destruction that fails in one pass as a cleanup failure of its own, naming its surface" (bounded testSeveralDischargesFail)
+    it "latches the failed destructions of two distinct surfaces that share a handle, each with its own attachment" (bounded testReusedHandleFails)
 
   describe "progress" $
     it "reports no work and no deadline while nothing is deferred, since nothing is recorded or submitted" (bounded testNoDemand)
@@ -1137,6 +1138,51 @@ testSeveralDischargesFail = do
   (naming "0x66" <> naming "0x67") `shouldSatisfy` all (Data.Text.isInfixOf "scripted")
   events ← journal rig
   [length [() | SurfaceDestroyed n ← events, n == handle] | handle ← [102, 103]] `shouldBe` [1, 1]
+  [e | e ← events, e `elem` [MessengerDestroyed, InstanceDestroyed]] `shouldBe` []
+
+testReusedHandleFails ∷ IO ()
+testReusedHandleFails = do
+  base ← newRigOf 4
+  let rig = base {rigPortCapacity = Just 1}
+  -- The fourth window's surface reuses the third's handle, and both
+  -- destructions fail: two distinct obligations, one handle.
+  scriptSurface rig 102 DestroyFails
+  scriptSurface rig 103 (CreateReusing 102)
+  scriptSurface rig 103 DestroyFails
+  controllerOf ← newTVarIO Nothing
+  _ ← runRigCaught rig $ \host _ → do
+    let owner = vulkanGraphicsOwner host
+        windows = vulkanWindowHost host
+    atomically (writeTVar controllerOf (Just (vulkanController host)))
+    -- The owner holds inside the first construction while the second
+    -- attachment fills its port, so the third and fourth are deferred.
+    gate ← newTVarIO False
+    scriptNative rig AtQueryDevices (HoldsUntil gate)
+    [first, second, third, fourth] ← windowsOf host
+    one ← handedOver host first RequiredTarget
+    atomically (custodyOf owner (graphicsAttachment one) >>= check . (== Just CustodyOwned))
+    _ ← handedOver host second RequiredTarget
+    forM_ [third, fourth] $ \window →
+      handOverVulkanTarget (vulkanController host) windows owner window RequiredTarget >>= \case
+        VulkanAnnouncementDeferred _ → pure ()
+        other → failWith ("a window was not deferred: " <> show other)
+    atomically (writeTVar gate True)
+    -- Neither failed surface lets the instance go: independent evidence of
+    -- the owner's destruction ends the exit, once no attachment is pending.
+    void . forkIO $ do
+      atomically (check . null =<< hostPendingAttachments windows)
+      publishOwnerDestruction owner (ownerDestroyed "published independently by the example")
+  Just controller ← atomically (readTVar controllerOf)
+  report ← atomically (readVulkanTerminal controller)
+  let cleanups = [reason | Just (TerminalCleanupFailed reason) ← [reportPrimary report]] <> [reason | LaterFailure (TerminalCleanupFailed reason) ← reportEvidence report]
+      naming handle = filter (Data.Text.isInfixOf ("surface " <> handle <> " ")) cleanups
+      of' window = filter (Data.Text.isInfixOf ("(WindowId " <> window <> ")")) (naming "0x66")
+  -- One cleanup failure for each obligation, each naming the shared handle,
+  -- its own attachment and what its own destruction raised.
+  (length (naming "0x66"), length (of' "3"), length (of' "4")) `shouldBe` (2, 1, 1)
+  naming "0x66" `shouldSatisfy` all (Data.Text.isInfixOf "scripted")
+  events ← journal rig
+  length [() | SurfaceDestroyed 102 ← events] `shouldBe` 2
   [e | e ← events, e `elem` [MessengerDestroyed, InstanceDestroyed]] `shouldBe` []
 
 -- | Publish, from another thread, the evidence the owner could not produce:

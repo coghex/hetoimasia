@@ -478,6 +478,9 @@ data SurfaceScript
     -- ^ Its destruction raises.
   | DestroyHolds !(TVar Bool)
     -- ^ Its destruction holds until released.
+  | CreateReusing !Word64
+    -- ^ Created with the handle an earlier surface had, as a driver may reuse
+    -- one: a distinct obligation under the same handle.
 
 data Lease = Lease
   { leaseAdmitting ∷ !(TVar Bool)
@@ -486,7 +489,10 @@ data Lease = Lease
   }
 
 data Obligation = Obligation
-  { obligationSurface ∷ !Word64
+  { obligationKey ∷ !Word64
+    -- ^ Its number in creation order, which scripts it; unique.
+  , obligationSurface ∷ !Word64
+    -- ^ Its handle.
   , obligationTarget ∷ !AttachmentId
   , obligationState ∷ !(TVar ObligationState)
   }
@@ -550,6 +556,7 @@ surfaceBridge events bridge =
     , bridgeObligations = \lease → Map.elems <$> readTVar (leaseOwed lease)
     , bridgeObligationAttachment = obligationTarget
     , bridgeObligationHandle = obligationSurface
+    , bridgeSameObligation = \left right → obligationKey left == obligationKey right
     , bridgeDischarge = discharge
     , bridgeRelease = \lease → writeTVar (leaseAdmitting lease) False >> standing lease
     }
@@ -575,8 +582,9 @@ surfaceBridge events bridge =
                 atomically (modifyTVar' (leaseInFlight lease) (subtract 1))
                 pure (CreationFailed "scripted")
               else do
-                record events (SurfaceCreated surface)
-                obligation ← Obligation surface attachment <$> newTVarIO Owed
+                let handle = last (surface : [reused | CreateReusing reused ← scripted])
+                record events (SurfaceCreated handle)
+                obligation ← Obligation surface handle attachment <$> newTVarIO Owed
                 atomically $ do
                   modifyTVar' (leaseOwed lease) (Map.insert surface obligation)
                   modifyTVar' (leaseInFlight lease) (subtract 1)
@@ -593,9 +601,9 @@ surfaceBridge events bridge =
       if not claimed
         then case stateNow of
           Gone → pure DischargeDone
-          _ → uncertain "an earlier destruction did not complete"
+          _ → either DischargeStillUncertain (\() → DischargeDone) <$> tryWithContext (throwIO (StandInFailure "an earlier destruction did not complete"))
         else do
-          scripted ← scriptsFor (obligationSurface obligation)
+          scripted ← scriptsFor (obligationKey obligation)
           sequence_
             [ record events (SurfaceDestroyStarted (obligationSurface obligation)) >> atomically (readTVar gate >>= check)
             | DestroyHolds gate ← scripted
@@ -609,7 +617,7 @@ surfaceBridge events bridge =
               atomically $ do
                 writeTVar (obligationState obligation) Gone
                 leases ← readTVar (bridgeLeases bridge)
-                mapM_ (\lease → modifyTVar' (leaseOwed lease) (Map.delete (obligationSurface obligation))) leases
+                mapM_ (\lease → modifyTVar' (leaseOwed lease) (Map.delete (obligationKey obligation))) leases
               pure DischargeDone
     uncertain reason = either DischargeUncertain (\() → DischargeDone) <$> tryWithContext (throwIO (StandInFailure reason))
     isCreateFails = \case

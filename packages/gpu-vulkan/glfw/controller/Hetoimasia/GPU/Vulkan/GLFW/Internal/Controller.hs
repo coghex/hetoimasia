@@ -144,14 +144,11 @@ import Data.Foldable (for_)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Maybe (isJust)
 import Data.List (nubBy)
-import Data.Function (on)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as Text
-import Data.Set (Set)
-import qualified Data.Set as Set
-import Data.Word (Word32, Word64)
+import Data.Word (Word32)
 import Foreign.Ptr (Ptr)
 import Numeric (showHex)
 import Hetoimasia.Foundation.Log (Logger)
@@ -326,9 +323,6 @@ data State inst msgr phys dev lease obligation = State
   , stateDiagnosticPending ∷ !(TVar Bool)
     -- ^ Whether the owner's last step found a diagnostic failure pending, so
     -- it looks again within its poll. The owner thread's alone.
-  , stateUncertainSurfaces ∷ !(TVar (Set Word64))
-    -- ^ The surfaces whose destruction did not complete and was latched, so
-    -- a later pass the bridge refuses latches none of them again.
   , stateClock ∷ !MonotonicSource
   , statePoll ∷ !Duration
     -- ^ How soon the owner looks at them again, while any exist.
@@ -405,7 +399,6 @@ newVulkanControllerWith hooks ops pointer bridge layers validation budgets clock
       <*> newTVarIO Map.empty
       <*> newTVarIO Map.empty
       <*> newTVarIO False
-      <*> newTVarIO Set.empty
       <*> pure clock
       <*> pure poll
       <*> pure hooks
@@ -570,11 +563,11 @@ settleUnannounced state = do
               Just (Deposit _ (CreatedLive obligation)) → [obligation]
               Just (Deposit _ (CreatedUnusable obligation _)) → [obligation]
               _ → []
-        let obligations = nubBy ((==) `on` bridgeObligationHandle bridge) (deposited <> listed)
+        let obligations = nubBy (bridgeSameObligation bridge) (deposited <> listed)
         outcomes ← mapM (bridgeDischarge bridge) obligations
         atomically (modifyTVar' (stateUnannounced state) (Map.delete attachment))
         atomically (latchDischarges state "an unannounced attachment's" (zip obligations outcomes))
-        case [failure | DischargeUncertain (ExceptionWithContext _ failure) ← outcomes] of
+        case [failure | Just (ExceptionWithContext _ failure) ← map dischargeFailure outcomes] of
           failure : _ → throwIO (UnannouncedSurfaceUncertain attachment (Text.pack (displayException failure)))
           [] → pure True
   pure (or settled)
@@ -699,7 +692,7 @@ constructTarget state start = do
     bridge = stateBridge state
     attachment = startingTarget start
     handleOf = bridgeObligationHandle bridge
-    distinct = nubBy ((==) `on` handleOf)
+    distinct = nubBy (bridgeSameObligation bridge)
 
 -- | Destroy everything an attachment left and settle it as a verified
 -- rollback — or, if a destruction was uncertain, as a partial construction the
@@ -715,7 +708,7 @@ reject state attachment reason obligations = do
   atomically $ do
     retainRejection state attachment reason
     latchDischarges state "a rejected target's" (zip obligations outcomes)
-  let uncertain = length [() | DischargeUncertain _ ← outcomes]
+  let uncertain = length [() | Just _ ← map dischargeFailure outcomes]
       destroyed = length obligations - uncertain
   pure $
     if uncertain == 0
@@ -749,7 +742,7 @@ retireTarget state retiring = do
       left ← atomically (obligationsOf (stateBridge state) lease attachment)
       outcomes ← mapM (bridgeDischarge (stateBridge state)) left
       atomically (latchDischarges state "a retired target's" (zip left outcomes))
-      case [failure | DischargeUncertain failure ← outcomes] of
+      case [failure | Just failure ← map dischargeFailure outcomes] of
         failure : _ → rethrowIO failure
         [] → pure (length left)
     _ → pure 0
@@ -773,7 +766,7 @@ retireOwner state retiring = do
           orphans = [obligation | obligation ← listed, bridgeObligationAttachment bridge obligation `notElem` exempt]
       outcomes ← mapM (bridgeDischarge bridge) orphans
       atomically (latchDischarges state "an orphaned" (zip orphans outcomes))
-      let uncertain = length [() | DischargeUncertain _ ← outcomes]
+      let uncertain = length [() | Just _ ← map dischargeFailure outcomes]
       when (uncertain > 0) (throwIO (OrphanSurfacesUncertain uncertain))
       pure (length orphans)
     _ → pure 0
@@ -818,19 +811,17 @@ destroyOwner state = do
 
 -- | Latch every surface destruction that did not complete as a cleanup
 -- failure of its own, naming the surface, its attachment and what raised:
--- several in one pass are each accounted for. A surface already latched is
--- not latched again when a later pass finds it still owed.
+-- several in one pass are each accounted for. An obligation whose earlier
+-- destruction already raised answers 'DischargeStillUncertain' when a later
+-- pass finds it still owed, and is not latched again: what is recognised is
+-- the obligation, never a handle a later surface may reuse.
 latchDischarges ∷ State inst msgr phys dev lease obligation → Text → [(obligation, Discharged)] → STM ()
 latchDischarges state what outcomes =
-  for_ [(obligation, failure) | (obligation, DischargeUncertain (ExceptionWithContext _ failure)) ← outcomes] $ \(obligation, failure) → do
-    let handle = bridgeObligationHandle bridge obligation
-    latched ← Set.member handle <$> readTVar (stateUncertainSurfaces state)
-    unless latched $ do
-      modifyTVar' (stateUncertainSurfaces state) (Set.insert handle)
-      latchTerminal (stateRoots state) . TerminalCleanupFailed $
-        "destroying " <> what <> " surface " <> hex handle
-          <> " of " <> tshow (bridgeObligationAttachment bridge obligation)
-          <> ": " <> Text.pack (displayException failure)
+  for_ [(obligation, failure) | (obligation, DischargeUncertain (ExceptionWithContext _ failure)) ← outcomes] $ \(obligation, failure) →
+    latchTerminal (stateRoots state) . TerminalCleanupFailed $
+      "destroying " <> what <> " surface " <> hex (bridgeObligationHandle bridge obligation)
+        <> " of " <> tshow (bridgeObligationAttachment bridge obligation)
+        <> ": " <> Text.pack (displayException failure)
   where
     bridge = stateBridge state
 
@@ -844,6 +835,7 @@ destruction bridge obligation =
   bridgeDischarge bridge obligation >>= \case
     DischargeDone → pure SurfaceDestroyed
     DischargeUncertain failure → pure (SurfaceDestructionUncertain failure)
+    DischargeStillUncertain failure → pure (SurfaceDestructionUncertain failure)
 
 -- ---------------------------------------------------------------------------
 -- Handing targets over

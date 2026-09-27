@@ -1325,9 +1325,12 @@ the surface, root, generation, frame, slot, pool record, batch or resource —
 so several failures of one pass are each accounted for rather than collapsed
 into one. The controller's surface discharges — an unannounced or rejected
 attachment's, a retired target's remaining ones, the orphans the owner's
-retirement finds and the late ones its destruction finds — latch each surface
-whose destruction did not complete by its handle and attachment, once: a later
-pass that finds it still owed latches it again under no name. A failure after it never displaces it: it joins the latch's evidence
+retirement finds and the late ones its destruction finds — latch each
+destruction that raised by its surface's handle and attachment. A later pass
+that finds the same obligation still owed is refused by the bridge as
+`DischargeStillUncertain`, which is not latched again; what is recognised is
+the obligation's own identity, never the handle, which a later surface may
+reuse. A failure after it never displaces it: it joins the latch's evidence
 as `LaterFailure`, oldest first, the first 64 kept and the rest counted. A
 failure the model recorded by itself before anything was latched is the primary
 it stands for, and one that describes the same failure as the model's cause —
@@ -1710,7 +1713,9 @@ primary and what it retained beside it; a surface still in its native call when
 the drain closed the lease, whose destruction then failed, latched as a cleanup
 failure beside the earlier primary with the instance retained; two deferred
 surfaces whose destruction both failed in the owner's orphan pass, each latched
-once by its handle with what its own destruction raised; and cancellation
+once by its handle with what its own destruction raised; two distinct
+surfaces that share a handle, both failing, each latched with its own
+attachment; and cancellation
 delivered three times
 while the drain that follows a loss holds, leaving the destruction order and the
 loss as they were. The diagnostics suite adds the sink failure observable while
