@@ -5,7 +5,9 @@
 -- the roots' native layer and the surface bridge — so these stand-ins drive
 -- the real controller, the real graphics owner and the real protected host
 -- exactly as a native run does, and can be told to fail, report device loss,
--- or hold at any step, which a native run cannot be asked to do on demand.
+-- hold, or report a validation message into the session's real capture from
+-- inside the call, as a layer does, at any step — which a native run cannot be
+-- asked to do on demand.
 -- Every call is journalled with the thread that made it, and the seam's own
 -- window and session releases are journalled into the same place, so an
 -- example can read one order across all of them.
@@ -25,6 +27,7 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , declareUnsupported
   , StandInFailure (..)
   , StandInLoss (..)
+  , injectedMessageId
 
     -- * The surface bridge
   , Bridge
@@ -44,6 +47,8 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , publishObservation
   , offerExtent
   , twoWindows
+  , failingSink
+  , sinkHasFailed
   , creationsBegun
   , runRig
   , runRigCaught
@@ -70,8 +75,15 @@ import Control.Concurrent.STM
   , stateTVar
   , writeTVar
   )
-import Control.Exception (Exception, SomeException, fromException, throwIO, try, tryWithContext, uninterruptibleMask_)
-import Control.Monad (void)
+import Control.Exception (Exception, ExceptionWithContext (ExceptionWithContext), SomeException, fromException, rethrowIO, throwIO, try, tryWithContext, uninterruptibleMask_)
+import Control.Monad (void, when)
+import Data.ByteString (ByteString)
+import qualified Data.Vector as Vector
+import Foreign.Ptr (FunPtr, castFunPtr, castPtr)
+import Vulkan.CStruct (withCStruct)
+import Vulkan.Extensions.VK_EXT_debug_utils (DebugUtilsMessengerCallbackDataEXT (..))
+import Vulkan.Zero (zero)
+import Hetoimasia.GPU.Vulkan.Native.Diagnostics (captureMessengerCallback)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -103,7 +115,7 @@ import Hetoimasia.GLFW.Command (WaitedSubmission (..), awaitSubmitWindowCommand,
 import Hetoimasia.GLFW.Window (Extent (Extent), WindowConfig, WindowId, hiddenTestWindowConfig, observedRevision)
 import Hetoimasia.GPU.Model.Budget (defaultBudgetRequest, validateBudgets)
 import Hetoimasia.GPU.Model.Identity (TargetClass)
-import Hetoimasia.GPU.Vulkan.Diagnostics (DiagnosticCapture, DiagnosticVerdict, Quiesced, afterLastCallback, defaultCaptureConfig)
+import Hetoimasia.GPU.Vulkan.Diagnostics (DiagnosticCapture, DiagnosticVerdict, Quiesced, afterLastCallback, captureUserData, defaultCaptureConfig, diagnosticVerdictInContext)
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Bridge (Created (..), Discharged (..), LeaseAnswer (..), SurfaceBridge (..))
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   ( VulkanHandover (..)
@@ -243,6 +255,12 @@ data Scripted
     -- ^ Raises 'StandInLoss', which this layer classifies as device loss.
   | HoldsUntil !(TVar Bool)
     -- ^ Holds, uninterruptibly as a native call does, until released.
+  | ReportsError !ByteString
+    -- ^ Reports one error-severity validation message with this text into the
+    -- session's capture from inside the call, as a layer does, then succeeds.
+  | ReportsWarning !ByteString
+    -- ^ The same at warning severity, which is a diagnostic and never a
+    -- failure.
 
 newtype StandInFailure = StandInFailure Text
   deriving (Eq, Show)
@@ -276,17 +294,52 @@ scriptNative rig at scripted = atomically (modifyTVar' (nativeScript (rigNative 
 declareUnsupported ∷ Rig → Word64 → IO ()
 declareUnsupported rig surface = atomically (modifyTVar' (nativeUnsupported (rigNative rig)) (Set.insert surface))
 
-step ∷ Journal → Native → Step → Event → IO ()
-step events native at event = do
+stepWith ∷ DiagnosticCapture → Journal → Native → Step → Event → IO ()
+stepWith capture events native at event = do
   scripted ← Map.lookup at <$> readTVarIO (nativeScript native)
   case scripted of
     Just (HoldsUntil gate) → uninterruptibleMask_ (atomically (readTVar gate >>= check))
+    Just (ReportsError text) → report capture severityError text
+    Just (ReportsWarning text) → report capture severityWarning text
     _ → pure ()
   record events event
   case scripted of
     Just Fails → throwIO (StandInFailure (Text.pack (show at)))
     Just Loses → throwIO (StandInLoss (Text.pack (show at)))
     _ → pure ()
+
+-- | The message identifier every report the stand-in injects carries, so an
+-- example can tell it from anything else the capture received.
+injectedMessageId ∷ ByteString
+injectedMessageId = "VUID-hetoimasia-stand-in-injected"
+
+severityError, severityWarning ∷ Word32
+severityError = 0x1000
+severityWarning = 0x100
+
+foreign import ccall "dynamic"
+  callMessenger ∷ FunPtr (Word32 → Word32 → Ptr () → Ptr () → IO Word32) → Word32 → Word32 → Ptr () → Ptr () → IO Word32
+
+-- | Report one validation message into the capture through the production C
+-- callback, as the validation layer does from inside a Vulkan call: the
+-- record is copied, and an error latched, exactly as a native report is.
+report ∷ DiagnosticCapture → Word32 → ByteString → IO ()
+report capture severity text =
+  withCStruct payload $ \pointer →
+    void (callMessenger (castFunPtr captureMessengerCallback) severity 0x2 (castPtr pointer) (captureUserData capture))
+  where
+    payload =
+      DebugUtilsMessengerCallbackDataEXT
+        { next = ()
+        , flags = zero
+        , messageIdName = Just injectedMessageId
+        , messageIdNumber = 0
+        , message = Just text
+        , queueLabels = Vector.empty
+        , cmdBufLabels = Vector.empty
+        , objects = Vector.empty
+        }
+        ∷ DebugUtilsMessengerCallbackDataEXT '[]
 
 -- | The stand-in native layer. The instance is 1, the messenger 2 and the
 -- device 3; one device, one queue family, presenting to every surface but the
@@ -369,6 +422,7 @@ nativeLayer events native capture =
     }
   where
     fresh = atomically (stateTVar (nativeHandles native) (\next → (next, next + 1)))
+    step = stepWith capture
 
 -- ---------------------------------------------------------------------------
 -- The surface bridge
@@ -551,7 +605,19 @@ data Rig = Rig
     -- refuses a handover's announcement.
   , rigFramebuffer ∷ !(TVar (Int, Int))
     -- ^ What every window's framebuffer size query answers.
+  , rigSinkFailing ∷ !(TVar Bool)
+    -- ^ Whether the capture's sink raises on the records it is given.
+  , rigSinkFailed ∷ !(TVar Bool)
+    -- ^ Whether it has raised.
   }
+
+-- | Make the capture's sink raise on every record it is given from now on.
+failingSink ∷ Rig → IO ()
+failingSink rig = atomically (writeTVar (rigSinkFailing rig) True)
+
+-- | Whether the capture's sink has raised.
+sinkHasFailed ∷ Rig → STM Bool
+sinkHasFailed = readTVar . rigSinkFailed
 
 -- | A rig over one hidden window.
 newRig ∷ IO Rig
@@ -634,6 +700,8 @@ newRigVisible visible windows = do
   bridge ← Bridge <$> newTVarIO Map.empty <*> newTVarIO Nothing <*> newTVarIO 100 <*> newTVarIO []
   verdict ← newTVarIO Nothing
   refusalHook ← newTVarIO (\_ → pure ())
+  sinkFailing ← newTVarIO False
+  sinkFailed ← newTVarIO False
   pure
     Rig
       { rigSeam = seam
@@ -646,6 +714,8 @@ newRigVisible visible windows = do
       , rigPortCapacity = Nothing
       , rigAfterRefusal = refusalHook
       , rigFramebuffer = framebuffer
+      , rigSinkFailing = sinkFailing
+      , rigSinkFailed = sinkFailed
       }
 
 -- | Run a whole Vulkan graphics host under the application runner, on a bound
@@ -667,10 +737,12 @@ runRigHere rig body = do
     (withLoggingLifetime quietLogger)
     "vulkan-controller-example"
     ( \_ use → do
-        (result, verdict) ←
+        -- The verdict is kept whichever way the host ends: a failed one
+        -- carries it on its failure.
+        (result, verdict) ← keepVerdict $
           withVulkanOwnerHostHooked
             (ControllerHooks (\attachment → readTVarIO (rigAfterRefusal rig) >>= ($ attachment)))
-            quietLogger
+            (captureLogger rig)
             (nativeLayer (rigJournal rig) (rigNative rig))
             instanceAddress
             (surfaceBridge (rigJournal rig) (rigBridge rig))
@@ -684,6 +756,14 @@ runRigHere rig body = do
     vulkanWindowHost
     (\host _ → pure host)
     body
+  where
+    keepVerdict ∷ IO (b, DiagnosticVerdict) → IO (b, DiagnosticVerdict)
+    keepVerdict action =
+      tryWithContext action >>= \case
+        Right answer → pure answer
+        Left failure@(ExceptionWithContext context _) → do
+          atomically (writeTVar (rigVerdict rig) (diagnosticVerdictInContext context))
+          rethrowIO (failure ∷ ExceptionWithContext SomeException)
 
 -- | The stand-in instance's "handle", a pointer the stand-in bridge never
 -- dereferences.
@@ -692,6 +772,15 @@ instanceAddress handle = nullPtr `plusPtr` handle
 
 quietLogger ∷ Logger
 quietLogger = mkLoggerWith defaultLogFilter systemMetadata (callbackSink (\_ → pure ()))
+
+-- | The capture's logger: quiet, until the example makes its sink fail.
+captureLogger ∷ Rig → Logger
+captureLogger rig =
+  mkLoggerWith defaultLogFilter systemMetadata . callbackSink $ \_ → do
+    failing ← readTVarIO (rigSinkFailing rig)
+    when failing $ do
+      atomically (writeTVar (rigSinkFailed rig) True)
+      throwIO (StandInFailure "the diagnostic sink failed")
 
 -- | Run owner turns on the main thread until the condition holds: an
 -- attachment retires on a turn, when the main thread folds what the owner

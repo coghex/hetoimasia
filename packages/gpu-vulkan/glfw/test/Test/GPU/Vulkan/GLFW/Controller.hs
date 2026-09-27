@@ -25,16 +25,16 @@ import qualified Data.Text
 import System.Timeout (timeout)
 import Hetoimasia.GPU.Model (SessionFailureCause (DeviceLost), SessionState (..), sessionState)
 import Hetoimasia.GPU.Model.Identity (TargetClass (..))
-import Hetoimasia.GPU.Vulkan.Diagnostics (DiagnosticVerdict (..))
+import Hetoimasia.GPU.Vulkan.Diagnostics (DiagnosticVerdict (..), VerdictIssue (..), verdictIssues)
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
-import Hetoimasia.Foundation.Messaging.Payload (preparedValue)
+import Hetoimasia.Foundation.Messaging.Payload (prepare, preparedValue)
 import Hetoimasia.Foundation.Messaging.Snapshot (observedValue, readSnapshot)
 import Hetoimasia.GLFW.Command (clientObservations)
 import Hetoimasia.GLFW.Window (Attribute (Observed), Extent (..), WindowId, observedFramebufferExtent)
 import Hetoimasia.GPU.Vulkan.Native.Generations (TargetCondition (..), TargetGenerationsView (..))
 import Hetoimasia.GPU.Vulkan.Native.Presentation (Suspension (..))
 import Hetoimasia.GPU.Vulkan.Native.Profile (NoCompatibleDevice (..), TargetRejection (..))
-import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost (..), RootStanding (..), RootTargetView (..), RootsView (..), SurfaceDestructionFailed (..))
+import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost (..), GraphicsSessionFailed (..), RootStanding (..), RootTargetView (..), RootsView (..), SurfaceDestructionFailed (..), TeardownEvidence (..), TerminalCause (..), TerminalReport (..))
 import Hetoimasia.Runtime.GLFW
   ( CloseStart (..)
   , EventAdmission (..)
@@ -47,6 +47,8 @@ import Hetoimasia.Runtime.GLFW
   , allRetirementFacts
   , awaitOwnerRound
   , readOwnerStatusNow
+  , ownerHandoff
+  , publishOwnerScene
   , closeHostWindow
   , completionNotice
   , custodyOf
@@ -111,6 +113,12 @@ spec = describe "Vulkan controller" $ do
     it "closes admission at once and reaches an application checkpoint while retirement is still pending" (bounded testLossReachesCheckpoint)
     it "keeps the loss primary, never retries a failed destruction, and retains its parents without certifying the attachment" (bounded testLossWithFailedCleanup)
     it "treats an unknown outcome as neither device loss nor destruction" (bounded testUnknownOutcome)
+
+  describe "terminal failure" $ do
+    it "latches a validation error reported inside a native call as the primary at the owner's next checkpoint, refusing every later handover naming it" (bounded testValidationStops)
+    it "latches a sink failure as a terminal status of its own, with the capture's verdict saying so" (bounded testSinkFailure)
+    it "reports what an exit could not verify as retained, beside the cleanup failure that is its primary" (bounded testRetentionReported)
+    it "keeps the dependency order and the loss when cancellation is delivered repeatedly during the drain that follows it" (bounded testCancelledAfterLoss)
 
   describe "progress" $
     it "reports no work and no deadline while nothing is deferred, since nothing is recorded or submitted" (bounded testNoDemand)
@@ -711,7 +719,7 @@ testLossReachesCheckpoint = do
       -- The owner's drain is holding inside the first surface's destruction,
       -- so retirement is still pending when the checkpoint raises.
       awaitEvent rig (SurfaceDestroyStarted 100)
-      atomically (writeTVar observed (Just (viewAdmitting roots, isJust (viewLoss roots), closedAnswer answer, sessionState model)))
+      atomically (writeTVar observed (Just (viewAdmitting roots, isJust (viewLoss roots), refusedNamingLoss answer, sessionState model)))
       checkRuntime control
   loss ← raisedAs @GraphicsDeviceLost outcome
   lostDuring loss `shouldBe` "vkGetPhysicalDeviceSurfaceSupportKHR"
@@ -721,8 +729,10 @@ testLossReachesCheckpoint = do
   length [() | DeviceCreated ← events] `shouldBe` 1
   events `shouldSatisfy` isSubsequenceOf [SurfaceDestroyed 100, DeviceDestroyed, MessengerDestroyed, InstanceDestroyed, WindowGone True]
   where
-    closedAnswer = \case
-      VulkanOwnerClosed _ → True
+    -- Refused before anything is attached, naming the loss that failed the
+    -- session.
+    refusedNamingLoss = \case
+      VulkanSessionFailed (TerminalDeviceLost loss) → lostDuring loss == "vkGetPhysicalDeviceSurfaceSupportKHR"
       _ → False
 
 testLossWithFailedCleanup ∷ IO ()
@@ -775,6 +785,154 @@ testLossWithFailedCleanup = do
       | isJust (fromException failure ∷ Maybe GraphicsDeviceLost) = "loss" ∷ String
       | isJust (fromException failure ∷ Maybe SurfaceDestructionFailed) = "surface destruction failed"
       | otherwise = show failure
+
+-- ---------------------------------------------------------------------------
+-- Terminal failure
+
+testValidationStops ∷ IO ()
+testValidationStops = do
+  rig ← newRigOf 3
+  observed ← newTVarIO Nothing
+  outcome ← runRigCaught rig $ \host control → do
+    [first, second, third] ← windowsOf host
+    let owner = vulkanGraphicsOwner host
+        controller = vulkanController host
+    _ ← superviseGraphicsOwner control owner
+    one ← handedOver host first RequiredTarget
+    TargetUsable ← awaitStanding host one
+    -- The layer reports an error from inside the later target's support
+    -- query, which itself returns normally.
+    scriptNative rig AtSupport (ReportsError "an injected validation error")
+    _ ← handedOver host second OptionalTarget
+    -- The owner's next checkpoint latches it and ends its run.
+    atomically (readOwnerFailure owner >>= check . isJust)
+    answer ← handOverVulkanTarget controller (vulkanWindowHost host) owner third RequiredTarget
+    report ← atomically (readVulkanTerminal controller)
+    atomically (writeTVar observed (Just (refused answer, reportPrimary report, reportDeviceLost report)))
+    checkRuntime control
+  failure ← raisedAs @GraphicsSessionFailed outcome
+  failure `shouldBe` GraphicsSessionFailed TerminalValidationError
+  atomically (readTVar observed) >>= (`shouldBe` Just (True, Just TerminalValidationError, Nothing))
+  -- Teardown followed the ordinary rules, child before parent.
+  events ← journal rig
+  events `shouldSatisfy` isSubsequenceOf [SurfaceDestroyed 100, SurfaceDestroyed 101, DeviceDestroyed, MessengerDestroyed, InstanceDestroyed, WindowGone True]
+  -- The final verdict, after the last callback, carries the error.
+  Just verdict ← atomically (readTVar (rigVerdict rig))
+  verdictIssues verdict `shouldSatisfy` elem ErrorLatched
+  where
+    refused = \case
+      VulkanSessionFailed TerminalValidationError → True
+      _ → False
+
+testSinkFailure ∷ IO ()
+testSinkFailure = do
+  rig ← twoWindows
+  outcome ← runRigCaught rig $ \host control → do
+    [first, second] ← windowsOf host
+    let owner = vulkanGraphicsOwner host
+    _ ← superviseGraphicsOwner control owner
+    failingSink rig
+    one ← handedOver host first RequiredTarget
+    TargetUsable ← awaitStanding host one
+    -- A warning is a diagnostic, not a failure; the sink that cannot take it
+    -- is.
+    scriptNative rig AtSupport (ReportsWarning "a warning the sink cannot take")
+    two ← handedOver host second OptionalTarget
+    TargetUsable ← awaitStanding host two
+    atomically (sinkHasFailed rig >>= check)
+    -- An idle owner learns of it at its next round, which a published scene
+    -- gives it; nothing here waits on a clock.
+    scene ← prepare ()
+    let poke remaining = do
+          seen ← statusRounds <$> atomically (readOwnerStatusNow owner)
+          _ ← atomically (publishOwnerScene (ownerHandoff owner) scene)
+          _ ← atomically (awaitOwnerRound owner seen)
+          failed ← atomically (isJust <$> readOwnerFailure owner)
+          if failed || remaining <= (0 ∷ Int) then pure () else poke (remaining - 1)
+    poke 1000
+    checkRuntime control
+  failure ← raisedAs @GraphicsSessionFailed outcome
+  failure `shouldSatisfy` \case
+    GraphicsSessionFailed (TerminalSinkFailed _) → True
+    _ → False
+  Just verdict ← atomically (readTVar (rigVerdict rig))
+  -- The consumer's own terminal status, not a validation error.
+  verdictIssues verdict `shouldSatisfy` elem ConsumerUnsuccessful
+  verdictIssues verdict `shouldSatisfy` notElem ErrorLatched
+
+testRetentionReported ∷ IO ()
+testRetentionReported = do
+  rig ← twoWindows
+  scriptSurface rig 100 DestroyFails
+  controllerOf ← newTVarIO Nothing
+  _ ← runRigCaught rig $ \host _ → do
+    [first, _] ← windowsOf host
+    atomically (writeTVar controllerOf (Just (vulkanController host)))
+    one ← handedOver host first RequiredTarget
+    TargetUsable ← awaitStanding host one
+    -- The exit cannot destroy this surface; only independent evidence lets it
+    -- finish, and it is supplied from another thread.
+    independently host one
+  Just controller ← atomically (readTVar controllerOf)
+  report ← atomically (readVulkanTerminal controller)
+  reportPrimary report `shouldSatisfy` \case
+    Just (TerminalCleanupFailed _) → True
+    _ → False
+  -- The surface, and everything above it, retained and said to be.
+  length [() | RetainedUnverified _ ← reportEvidence report] `shouldSatisfy` (>= 2)
+  events ← journal rig
+  [e | e ← events, e `elem` [DeviceDestroyed, MessengerDestroyed, InstanceDestroyed]] `shouldBe` []
+
+testCancelledAfterLoss ∷ IO ()
+testCancelledAfterLoss = do
+  rig ← twoWindows
+  gate ← newTVarIO False
+  scriptSurface rig 100 (DestroyHolds gate)
+  returned ← newTVarIO False
+  controllerOf ← newTVarIO Nothing
+  outcome ← runRigCaught rig $ \host _ → do
+    [first, second] ← windowsOf host
+    let owner = vulkanGraphicsOwner host
+    atomically (writeTVar controllerOf (Just (vulkanController host)))
+    one ← handedOver host first RequiredTarget
+    TargetUsable ← awaitStanding host one
+    scriptNative rig AtSupport Loses
+    _ ← handedOver host second RequiredTarget
+    atomically (readOwnerFailure owner >>= check . isJust)
+    -- The owner's drain is holding inside the first surface's destruction.
+    awaitEvent rig (SurfaceDestroyStarted 100)
+    main ← myThreadId
+    -- Once the body has returned and the main thread is waiting for the
+    -- owner, three cancellations are aimed at it before the drain goes on.
+    void . forkIO $ do
+      atomically (readTVar returned >>= check)
+      awaitBlocked main
+      replicateM_ 3 (throwTo main Cancelled)
+      atomically (writeTVar gate True)
+    atomically (writeTVar returned True)
+  _ ← either pure (\_ → failWith "the run returned although it was cancelled and its owner failed") outcome
+  events ← journal rig
+  dropWhile (not . destruction) events
+    `shouldBe` [ SurfaceDestroyed 100
+               , SurfaceDestroyed 101
+               , DeviceDestroyed
+               , MessengerDestroyed
+               , InstanceDestroyed
+               , WindowGone True
+               , WindowGone True
+               , SessionEnded
+               ]
+  Just controller ← atomically (readTVar controllerOf)
+  report ← atomically (readVulkanTerminal controller)
+  reportPrimary report `shouldSatisfy` \case
+    Just (TerminalDeviceLost _) → True
+    _ → False
+  where
+    awaitBlocked thread =
+      threadStatus thread >>= \case
+        ThreadBlocked _ → pure ()
+        ThreadFinished → pure ()
+        _ → yield >> awaitBlocked thread
 
 -- | Publish, from another thread, the evidence the owner could not produce:
 -- this attachment's facts once it is retiring, and the owner's destruction

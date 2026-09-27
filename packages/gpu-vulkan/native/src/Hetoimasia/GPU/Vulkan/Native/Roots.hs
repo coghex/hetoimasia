@@ -676,8 +676,11 @@ retireRootTarget roots target =
   where
     settleUncertain failure@(ExceptionWithContext _ exception) = do
       let reason = Text.pack (displayException exception)
-      atomically $
+      atomically $ do
         modifyTVar' (rootsTargets roots) (Map.adjust (\held → held {recordUncertain = Just reason}) target)
+        -- A failed cleanup is a terminal failure of its own, or evidence
+        -- beside an earlier one.
+        latchTerminal roots (TerminalCleanupFailed ("destroying the surface of " <> Text.pack (show target) <> ": " <> reason))
       if isAsynchronous exception
         then rethrowIO failure
         else throwIO (SurfaceDestructionFailed target reason)
@@ -932,7 +935,7 @@ retireRoots roots = do
     Destroyed → pure "the device was already destroyed"
     Uncertain reason → throwIO (DeviceRemains (RootUncertain reason))
     Live selected → do
-      destroying (rootsDevice roots) "device" (opsDestroyDevice (rootsOps roots) (selectedDevice selected))
+      destroying roots (rootsDevice roots) "device" (opsDestroyDevice (rootsOps roots) (selectedDevice selected))
       pure ("destroyed the device " <> planDeviceName (selectedPlan selected) <> if lost then " after its loss" else "")
 
 -- | Destroy the explicit messenger and then the instance, once the device has
@@ -955,7 +958,7 @@ destroyRoots roots = do
     Uncertain reason → throwIO (InstanceUncertain reason)
     Live created → do
       readTVarIO (rootsMessenger roots) >>= \case
-        Live messenger → destroying (rootsMessenger roots) "explicit messenger" (opsDestroyMessenger ops created messenger)
+        Live messenger → destroying roots (rootsMessenger roots) "explicit messenger" (opsDestroyMessenger ops created messenger)
         Uncertain reason → throwIO (MessengerUncertain reason)
         _ → pure ()
       proved ← mask_ $
@@ -965,7 +968,7 @@ destroyRoots roots = do
               writeTVar (rootsInstance roots) Destroyed
               writeTVar (rootsQuiesced roots) (Just proved)
             pure proved
-          Left failure → uncertainly (rootsInstance roots) "instance" failure
+          Left failure → uncertainly roots (rootsInstance roots) "instance" failure
       pure (Just proved)
   where
     ops = rootsOps roots
@@ -975,23 +978,27 @@ destroyRoots roots = do
 
 -- | Run one root's destruction, which only a live root reaches, and record
 -- what it did in the same masked step.
-destroying ∷ TVar (Root a) → Text → IO () → IO ()
-destroying slot name destroy = mask_ $
+destroying ∷ Roots q inst msgr phys dev → TVar (Root a) → Text → IO () → IO ()
+destroying roots slot name destroy = mask_ $
   tryWithContext destroy >>= \case
     Right () → atomically (writeTVar slot Destroyed)
-    Left failure → uncertainly slot name failure
+    Left failure → uncertainly roots slot name failure
 
-uncertainly ∷ TVar (Root a) → Text → ExceptionWithContext SomeException → IO b
-uncertainly slot name failure@(ExceptionWithContext _ exception)
+uncertainly ∷ Roots q inst msgr phys dev → TVar (Root a) → Text → ExceptionWithContext SomeException → IO b
+uncertainly roots slot name failure@(ExceptionWithContext _ exception)
   | isAsynchronous exception = do
       -- A cancellation cannot land inside the masked call, so one here was
       -- raised by the call itself; its outcome is no better known for that.
-      atomically (writeTVar slot (Uncertain (Text.pack (displayException exception))))
+      atomically (settle (Text.pack (displayException exception)))
       rethrowIO failure
   | otherwise = do
       let reason = Text.pack (displayException exception)
-      atomically (writeTVar slot (Uncertain reason))
+      atomically (settle reason)
       throwIO (RootDestructionFailed name reason)
+  where
+    settle reason = do
+      writeTVar slot (Uncertain reason)
+      latchTerminal roots (TerminalCleanupFailed ("destroying the " <> name <> ": " <> reason))
 
 -- ---------------------------------------------------------------------------
 -- Observation

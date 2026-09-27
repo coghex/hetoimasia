@@ -95,6 +95,7 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , readVulkanTargets
   , readVulkanRoots
   , readVulkanModel
+  , readVulkanTerminal
 
     -- * Swapchain generations
   , readVulkanGenerations
@@ -174,10 +175,13 @@ import Hetoimasia.GPU.Model.Budget (Budgets)
 import Hetoimasia.GPU.Model.Identity (GenerationId, TargetClass (..), TargetId)
 import Hetoimasia.GPU.Vulkan.Diagnostics
   ( CaptureConfig
+  , CaptureStatus (statusErrorLatched)
   , DiagnosticCapture
   , DiagnosticVerdict
   , Quiesced
   , afterLastCallback
+  , captureSinkFailure
+  , captureStatus
   , retainStorage
   , withDiagnosticCapture
   )
@@ -204,7 +208,8 @@ import Hetoimasia.GPU.Vulkan.Native.Presentation (SurfaceExtent (..))
 import qualified Hetoimasia.GPU.Vulkan.Native.Presentation as Presentation
 import Hetoimasia.GPU.Vulkan.Native.Profile (InstancePlan (..), InstanceRequest (..), TargetRejection (..), ValidationFeature)
 import Hetoimasia.GPU.Vulkan.Native.Roots
-  ( GenerationOps (..)
+  ( DiagnosticAlarm (..)
+  , GenerationOps (..)
   , RootOps (..)
   , RootStanding (..)
   , RootTargetView (..)
@@ -213,8 +218,16 @@ import Hetoimasia.GPU.Vulkan.Native.Roots
   , RootsView (..)
   , SurfaceDestruction (..)
   , TargetSurface (..)
+  , TeardownEvidence (..)
+  , TerminalCause (..)
+  , TerminalReport (..)
   , admitRootTarget
   , checkRoots
+  , checkpointRoots
+  , latchTerminal
+  , noteTeardownEvidence
+  , readRootsTerminal
+  , watchRootsDiagnostics
   , destroyRoots
   , newRoots
   , readRootTargets
@@ -485,10 +498,25 @@ controllerOperations (VulkanController state) =
         summary ← stepGenerations (stateGenerations state) (stepNow step) geometries
         pure (if settled || summaryAdvanced summary then noStepWork {stepAdvanced = True} else noStepWork)
     , graphicsNextDeadline = ownerDeadline state
-    , graphicsRetireTarget = retireTarget state
-    , graphicsRetireOwner = retireOwner state
-    , graphicsDestroyOwner = \_ → destroyOwner state
+    , graphicsRetireTarget = \retiring → retaining state (retireTarget state retiring)
+    , graphicsRetireOwner = retaining state . retireOwner state
+    , graphicsDestroyOwner = \_ → retaining state (destroyOwner state)
     }
+
+-- | Run a retirement, and if it could not verify what it owns, keep that in
+-- the terminal report as retained before the failure goes on to the owner,
+-- which retains its evidence and manufactures no acknowledgement. The report
+-- says what was retained; it releases nothing. A cancellation is not a
+-- retention and is left as it is.
+retaining ∷ State inst msgr phys dev lease obligation → IO a → IO a
+retaining state action =
+  tryWithContext action >>= \case
+    Right value → pure value
+    Left failure@(ExceptionWithContext _ exception)
+      | isAsynchronous exception → rethrowIO failure
+      | otherwise → do
+          atomically (noteTeardownEvidence (stateRoots state) (RetainedUnverified (Text.pack (displayException exception))))
+          rethrowIO (failure ∷ ExceptionWithContextSome)
 
 
 -- | Destroy, on the owner's thread, the surface of every attachment the owner
@@ -526,7 +554,10 @@ settleUnannounced state = do
         outcomes ← mapM (bridgeDischarge bridge) (nubBy ((==) `on` bridgeObligationHandle bridge) (deposited <> listed))
         atomically (modifyTVar' (stateUnannounced state) (Map.delete attachment))
         case [failure | DischargeUncertain (ExceptionWithContext _ failure) ← outcomes] of
-          failure : _ → throwIO (UnannouncedSurfaceUncertain attachment (Text.pack (displayException failure)))
+          failure : _ → do
+            let reason = Text.pack (displayException failure)
+            atomically (latchTerminal (stateRoots state) (TerminalCleanupFailed ("destroying the surface of the unannounced attachment " <> tshow attachment <> ": " <> reason)))
+            throwIO (UnannouncedSurfaceUncertain attachment reason)
           [] → pure True
   pure (or settled)
   where
@@ -632,7 +663,14 @@ constructTarget state start = do
                   <> hex (handleOf obligation)
                   <> maybe "" (" of device " <>) (viewDeviceName view)
                   <> maybe "" ((", queue family " <>) . tshow) (viewQueueFamily view)
-            Left refused → reject state attachment (RejectedByRoots refused) (distinct (obligation : listed))
+            Left refused → do
+              -- Admission closed because the session failed: the rejection
+              -- names the failure.
+              primary ← reportPrimary <$> atomically (readRootsTerminal (stateRoots state))
+              let reason = case (refused, primary) of
+                    (TargetAdmissionClosed, Just cause) → RejectedSessionFailed cause
+                    _ → RejectedByRoots refused
+              reject state attachment reason (distinct (obligation : listed))
         Just (Deposit _ (CreatedUnusable obligation reason)) → reject state attachment (SurfaceUnusable reason) (distinct (obligation : listed))
         Just (Deposit _ (CreationFailed reason)) → reject state attachment (SurfaceNotCreated reason) listed
         Nothing → reject state attachment SurfaceNotHandedOver listed
@@ -658,6 +696,8 @@ reject state attachment reason obligations = do
   atomically (retainRejection state attachment reason)
   let uncertain = length [() | DischargeUncertain _ ← outcomes]
       destroyed = length obligations - uncertain
+  when (uncertain > 0) $
+    atomically (latchTerminal (stateRoots state) (TerminalCleanupFailed (describeRejection reason <> "; destroying " <> plural uncertain "surface" <> " did not complete")))
   pure $
     if uncertain == 0
       then TargetRolledBack (rollbackEvidence (describeRejection reason <> "; destroyed " <> plural destroyed "surface"))
@@ -690,7 +730,9 @@ retireTarget state retiring = do
       left ← atomically (obligationsOf (stateBridge state) lease attachment)
       outcomes ← mapM (bridgeDischarge (stateBridge state)) left
       case [failure | DischargeUncertain failure ← outcomes] of
-        failure : _ → rethrowIO failure
+        failure@(ExceptionWithContext _ exception) : _ → do
+          atomically (latchTerminal (stateRoots state) (TerminalCleanupFailed ("destroying a surface of " <> tshow attachment <> ": " <> Text.pack (displayException exception))))
+          rethrowIO failure
         [] → pure (length left)
     _ → pure 0
   pure . targetRetired $
@@ -713,7 +755,9 @@ retireOwner state retiring = do
           orphans = [obligation | obligation ← listed, bridgeObligationAttachment bridge obligation `notElem` exempt]
       outcomes ← mapM (bridgeDischarge bridge) orphans
       let uncertain = length [() | DischargeUncertain _ ← outcomes]
-      when (uncertain > 0) (throwIO (OrphanSurfacesUncertain uncertain))
+      when (uncertain > 0) $ do
+        atomically (latchTerminal (stateRoots state) (TerminalCleanupFailed ("destroying " <> plural uncertain "surface" <> " no target held did not complete")))
+        throwIO (OrphanSurfacesUncertain uncertain)
       pure (length orphans)
     _ → pure 0
   atomically $ do
@@ -792,6 +836,9 @@ data VulkanHandover
   | VulkanHandoverUnavailable !Text
     -- ^ The host cannot attach at all — it is unprotected, or the protocol's
     -- declarations were rejected.
+  | VulkanSessionFailed !TerminalCause
+    -- ^ The graphics session has failed, with this primary failure. Nothing
+    -- was attached: a failed session admits no target.
   deriving (Show)
 
 -- | Create one window's surface on the main thread, under its attachment, and
@@ -811,7 +858,12 @@ handOverVulkanTarget
   ∷ VulkanController → WindowHost → GraphicsOwner scene → WindowId → TargetClass → IO VulkanHandover
 handOverVulkanTarget (VulkanController state) host owner window classification =
   mask $ \restore →
-    readTVarIO (stateLease state) >>= \case
+    checkpointRoots (stateRoots state) >>= \case
+      Just primary → pure (VulkanSessionFailed primary)
+      Nothing → handOver restore
+  where
+    handOver restore =
+     readTVarIO (stateLease state) >>= \case
       LeaseReady lease → do
         open ← atomically (targetEventsOpen (ownerHandoff owner))
         if not open
@@ -834,7 +886,6 @@ handOverVulkanTarget (VulkanController state) host owner window classification =
             readIORef deferred >>= maybe (pure answer) rethrowIO
       LeasePending → pure (VulkanRootsNotReady RootsPending)
       LeaseFailed reason → pure (VulkanRootsNotReady (RootsFailed reason))
-  where
     base = graphicsTargetProtocol host owner
     protocol deferred lease create =
       base
@@ -932,6 +983,9 @@ data VulkanRejection
   | SurfaceNotHandedOver
     -- ^ The construction step's answer never arrived; whatever the lease
     -- listed for the attachment was destroyed.
+  | RejectedSessionFailed !TerminalCause
+    -- ^ The session had failed, with this primary failure, before the target
+    -- could be admitted.
   deriving (Eq, Show)
 
 describeRejection ∷ VulkanRejection → Text
@@ -943,6 +997,7 @@ describeRejection = \case
   SurfaceUnusable reason → "rejected: the surface could not be published (" <> reason <> ")"
   SurfaceNotCreated reason → "rejected: no surface was created (" <> reason <> ")"
   SurfaceNotHandedOver → "rejected: the construction step's answer never arrived"
+  RejectedSessionFailed cause → "rejected: the graphics session has failed (" <> tshow cause <> ")"
 
 -- | How many rejections are kept, newest attachments first to stay.
 rejectionsRetained ∷ Int
@@ -977,6 +1032,22 @@ readVulkanRoots (VulkanController state) = readRootsView (stateRoots state)
 -- | The model the roots keep their identities in.
 readVulkanModel ∷ VulkanController → STM GpuModel
 readVulkanModel (VulkanController state) = readRootsModel (stateRoots state)
+
+-- | The session's terminal latch: its primary failure, if it has failed; the
+-- device's loss, if that was observed, which may be later than the primary;
+-- and what teardown found beside the primary — later failures, and what it
+-- retained because it could not be verified.
+readVulkanTerminal ∷ VulkanController → STM TerminalReport
+readVulkanTerminal (VulkanController state) = readRootsTerminal (stateRoots state)
+
+-- | What a checkpoint learns from the capture: its error latch, set by any
+-- error-severity report whatever became of the report's detail, and its
+-- sink's failure.
+captureAlarms ∷ DiagnosticCapture → IO [DiagnosticAlarm]
+captureAlarms capture = do
+  latched ← statusErrorLatched <$> captureStatus capture
+  sink ← atomically (captureSinkFailure capture)
+  pure ([AlarmValidationError | latched] <> [AlarmSinkFailed reason | Just reason ← [sink]])
 
 -- | The swapchain generations of the target this attachment is, while the
 -- owner holds it.
@@ -1143,6 +1214,9 @@ withVulkanOwnerHostHooked hooks logger layer pointer bridge enter extensions con
         (vulkanBudgets config)
         (hostClock host)
         (either (const fallbackPoll) convertedDuration (durationFromSeconds RequirePositive (hostIdleWait host)))
+    -- Every checkpoint of the owner's asks the capture for its latches, so a
+    -- validation error or a sink failure stops the session at the next one.
+    atomically (watchRootsDiagnostics (stateRoots state) (captureAlarms capture))
     let session = do
           entered ← enter (hostSessionConfig host)
           copied ← liftIO (extensions entered)

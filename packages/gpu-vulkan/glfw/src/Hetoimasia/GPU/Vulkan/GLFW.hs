@@ -13,6 +13,14 @@
 -- Nothing is recorded, submitted or presented yet: there is no swapchain, and
 -- the owner's progress step reports no render demand. Those are later
 -- slices'.
+--
+-- A terminal failure — the device's loss, a validation error or a sink failure
+-- the capture reports, an uncertain effect, a failed cleanup, a required
+-- target's exhausted recovery — is latched as the session's primary failure
+-- at the owner's next checkpoint, ends the owner's run, reaches the
+-- application's checkpoints through the owner's supervision, and refuses every
+-- later handover naming it ('VulkanSessionFailed'); 'readVulkanTerminal'
+-- reads it with what teardown found beside it.
 module Hetoimasia.GPU.Vulkan.GLFW
   ( -- * The composition
     withVulkanOwnerHost
@@ -38,6 +46,13 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , readVulkanTargets
   , readVulkanRoots
   , readVulkanModel
+
+    -- * Terminal failure
+  , readVulkanTerminal
+  , TerminalReport (..)
+  , TerminalCause (..)
+  , TeardownEvidence (..)
+  , GraphicsSessionFailed (..)
 
     -- * Swapchain generations
   , readVulkanGenerations
@@ -79,6 +94,7 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , readVulkanModel
   , readVulkanRoots
   , readVulkanTargets
+  , readVulkanTerminal
   , noObserver
   , useVulkanGeneration
   , rejectionsRetained
@@ -87,6 +103,7 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   )
 import qualified Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller as Controller
 import Hetoimasia.GPU.Vulkan.Native.Profile (ValidationFeature (..))
+import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsSessionFailed (..), TeardownEvidence (..), TerminalCause (..), TerminalReport (..))
 import Hetoimasia.GPU.Vulkan.Native.Roots.Vulkan (instancePointer, vulkanRootOps)
 
 -- | Run a Vulkan graphics host over this loader capability, and answer the
