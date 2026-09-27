@@ -34,7 +34,6 @@ import System.Directory
   , setOwnerExecutable
   , setPermissions
   )
-import System.Environment (lookupEnv)
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
@@ -1045,10 +1044,6 @@ spec = describe "Validation execution" $ do
       forM_ workers $ \worker → do
         filter (== named worker) workflow `shouldBe` [named worker]
         upload worker `shouldContain` ["          overwrite: true"]
-
-    it "fails on attempts 1 and 2 of a run (temporary #285 proof, reverted before merge)" $ do
-      attempt ← lookupEnv "GITHUB_RUN_ATTEMPT"
-      (attempt `elem` [Just "1", Just "2"]) `shouldBe` False
 
   describe "platform applicability" $ do
     it "refuses to execute a group this platform does not build and writes no receipt" $

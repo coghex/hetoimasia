@@ -947,10 +947,6 @@ jobs:
           path: dist-newstyle
           key: ${{ steps.tree.outputs.cache-primary-key }}
 
-      - name: Fail the first attempt (temporary #285 proof, reverted before merge)
-        if: github.run_attempt == '1'
-        run: exit 1
-
       - name: Upload the receipts
         # `overwrite` makes a re-run replace the earlier attempt's artifact
         # rather than add a second of the same name, of which `build-test`'s
