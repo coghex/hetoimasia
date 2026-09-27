@@ -1,5 +1,3 @@
-{-# LANGUAGE RoleAnnotations #-}
-
 -- | Bounded FIFO channels of prepared payloads, with a terminal state and
 -- atomic counters.
 --
@@ -9,6 +7,15 @@
 -- only receive. Neither can close or abort the channel, and neither can reach
 -- the other's operations. Every endpoint is abstract and every operation is an
 -- ordinary function; no queue, 'TVar', or other private state escapes.
+--
+-- __Module structure.__ This is the only channel module a client imports.
+-- Inside the foundation, the channel representation, its phases, the endpoints
+-- with their nominal roles, 'ChannelCapacityRejected', and the result and
+-- statistics types are defined in "Hetoimasia.Foundation.Messaging.Channel.Types",
+-- and 'messagingComponent' in "Hetoimasia.Foundation.Messaging.Component"; both
+-- are hidden modules of the main library, and this module re-exports what
+-- clients may use from them without the endpoints' constructors. This module
+-- itself defines every channel operation.
 --
 -- __Capacity and admission.__ The owner chooses the capacity. A capacity that
 -- is not positive, or is above 'maximumCapacity', raises a typed
@@ -121,64 +128,15 @@ module Hetoimasia.Foundation.Messaging.Channel
   , channelStatistics
   ) where
 
-import Control.Concurrent.STM (STM, TVar, modifyTVar', newTVarIO, readTVar, retry, writeTVar)
-import Control.Exception (Exception)
+import Control.Concurrent.STM (STM, modifyTVar', newTVarIO, readTVar, retry, writeTVar)
 import Control.Monad (when)
 import Data.Text (pack)
 import GHC.Stack (HasCallStack)
 import Hetoimasia.Foundation.Failure (Operation, operation, throwFailure)
-import Hetoimasia.Foundation.Log (Component, unsafeComponent)
+import Hetoimasia.Foundation.Messaging.Channel.Types
+import Hetoimasia.Foundation.Messaging.Component (messagingComponent)
 import Hetoimasia.Foundation.Messaging.Payload (Prepared)
 import Numeric.Natural (Natural)
-
--- | The shared representation behind all three endpoints.
-data Channel a = Channel
-  { channelCapacity ∷ !Int
-  , channelFront ∷ !(TVar [Prepared a])
-    -- ^ The oldest entries, in receive order.
-  , channelBack ∷ !(TVar [Prepared a])
-    -- ^ The newest entries, most recent first.
-  , channelPhase ∷ !(TVar Phase)
-  , channelDepth ∷ !(TVar Int)
-  , channelHighWater ∷ !(TVar Int)
-  , channelAccepted ∷ !(TVar Natural)
-  , channelDequeued ∷ !(TVar Natural)
-  , channelDiscarded ∷ !(TVar Natural)
-  }
-
-data Phase = Open | ClosedPhase | AbortedPhase
-  deriving (Eq)
-
--- | The owner-control endpoint: it closes and aborts the channel, reads its
--- statistics, and hands out the send and receive endpoints.
---
--- The role is nominal, as for 'Prepared', so no endpoint can be coerced to a
--- different payload type.
-type role ChannelControl nominal
-
-newtype ChannelControl a = ChannelControl (Channel a)
-
--- | An endpoint that can only send.
-type role Sender nominal
-
-newtype Sender a = Sender (Channel a)
-
--- | An endpoint that can only receive.
-type role Receiver nominal
-
-newtype Receiver a = Receiver (Channel a)
-
--- | Why 'newChannel' refused a capacity.
-data ChannelCapacityRejected
-  = CapacityNotPositive !Integer
-  | CapacityAboveMaximum !Integer
-  deriving (Eq, Show)
-
-instance Exception ChannelCapacityRejected
-
--- | The component a construction failure names as its origin.
-messagingComponent ∷ Component
-messagingComponent = unsafeComponent "foundation.messaging"
 
 -- | The operation a construction failure names as its origin.
 newChannelOperation ∷ Operation
@@ -225,25 +183,6 @@ channelReceiver (ChannelControl channel) = Receiver channel
 
 -- Sending ----------------------------------------------------------------------
 
--- | What an immediate send did.
-data SendResult
-  = Accepted
-    -- ^ The payload was admitted.
-  | Full
-    -- ^ The channel is open and holds capacity entries. Nothing changed.
-  | Closed
-    -- ^ Admission has ended, by close or abort. Nothing changed.
-  deriving (Eq, Show)
-
--- | What a waiting send did.
-data Admission
-  = Admitted
-    -- ^ The payload was admitted.
-  | AdmissionClosed
-    -- ^ Admission ended, by close or abort, before capacity was available.
-    -- Nothing changed.
-  deriving (Eq, Show)
-
 -- | Send without waiting.
 send ∷ Sender a → Prepared a → STM SendResult
 send (Sender channel) payload = do
@@ -277,26 +216,6 @@ admit channel depth payload = do
   modifyTVar' (channelAccepted channel) (+ 1)
 
 -- Receiving --------------------------------------------------------------------
-
--- | Why a channel will deliver nothing more.
-data Termination
-  = Drained
-    -- ^ It was closed, and every accepted entry has been received.
-  | Aborted
-    -- ^ It was aborted.
-  deriving (Eq, Show)
-
--- | What an immediate receive found.
-data Receipt a
-  = Received (Prepared a)
-  | Empty
-    -- ^ The channel is open and holds no entries.
-  | Terminated !Termination
-
--- | What a waiting receive found.
-data Delivery a
-  = Delivered (Prepared a)
-  | Ended !Termination
 
 -- | Receive without waiting.
 receive ∷ Receiver a → STM (Receipt a)
@@ -358,22 +277,6 @@ abortChannel (ChannelControl channel) = do
       pure discarded
 
 -- Statistics -------------------------------------------------------------------
-
--- | One coherent observation of a channel's counters. It holds no payload.
-data ChannelStatistics = ChannelStatistics
-  { statisticsCapacity ∷ !Natural
-  , statisticsDepth ∷ !Natural
-    -- ^ Entries accepted and neither received nor discarded.
-  , statisticsHighWater ∷ !Natural
-    -- ^ The largest depth the channel has held.
-  , statisticsAccepted ∷ !Natural
-    -- ^ Payloads admitted by a committed send.
-  , statisticsDequeued ∷ !Natural
-    -- ^ Entries returned by a committed receive.
-  , statisticsDiscarded ∷ !Natural
-    -- ^ Entries dropped by abort.
-  }
-  deriving (Eq, Show)
 
 -- | Read every statistic in one transaction.
 channelStatistics ∷ ChannelControl a → STM ChannelStatistics

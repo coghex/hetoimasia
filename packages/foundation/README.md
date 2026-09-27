@@ -170,6 +170,13 @@ and re-exports its types from the hidden `Recovery.Types` of the main library.
 That module takes `Operation` from `Failure.Base` alone. See
 [docs/recovery.md](../../docs/recovery.md#module-structure).
 
+Messaging has three public modules: `Messaging.Payload`, `Messaging.Channel`,
+and `Messaging.Snapshot`. Channel and snapshot each keep their operations and
+re-export their types from their own hidden `Types` module of the main library,
+and both re-export the one `messagingComponent` from the hidden
+`Messaging.Component`. Snapshot imports nothing from the channel modules. See
+[docs/messaging.md](../../docs/messaging.md#module-structure).
+
 Time has one public module, `Time`, which keeps reading a clock and sampling
 and re-exports its values from the hidden `Time.Types` and its validated
 conversions and arithmetic from the hidden `Time.Arithmetic`. Neither imports a
@@ -205,6 +212,12 @@ for the module that owns and writes each piece of state.
 | `Hetoimasia.Foundation.Failure` | `src/Hetoimasia/Foundation/Failure.hs` | main library | exposed | Public failure facade; raising, operation boundaries, and inspection |
 | `Hetoimasia.Foundation.Failure.Base` | `src/Hetoimasia/Foundation/Failure/Base.hs` | main library | hidden | The abstract `Operation` and its naming operations |
 | `Hetoimasia.Foundation.Failure.Types` | `src/Hetoimasia/Foundation/Failure/Types.hs` | main library | hidden | Origin, context, site, cause, and evidence records, and the private failure annotation |
+| `Hetoimasia.Foundation.Messaging.Payload` | `src/Hetoimasia/Foundation/Messaging/Payload.hs` | main library | exposed | The prepared payload boundary: `Prepared`, preparation, and reading |
+| `Hetoimasia.Foundation.Messaging.Component` | `src/Hetoimasia/Foundation/Messaging/Component.hs` | main library | hidden | The one definition of `messagingComponent`, shared by channels and snapshots |
+| `Hetoimasia.Foundation.Messaging.Channel` | `src/Hetoimasia/Foundation/Messaging/Channel.hs` | main library | exposed | Public channel module; construction, endpoints, sending, receiving, close and abort, and statistics |
+| `Hetoimasia.Foundation.Messaging.Channel.Types` | `src/Hetoimasia/Foundation/Messaging/Channel/Types.hs` | main library | hidden | The channel representation and phases, the endpoints with their nominal roles, the capacity error, and the send, admission, termination, receipt, delivery, and statistics types |
+| `Hetoimasia.Foundation.Messaging.Snapshot` | `src/Hetoimasia/Foundation/Messaging/Snapshot.hs` | main library | exposed | Public snapshot module; construction, publishing, close, reading, waiting, and the cursor-mismatch check |
+| `Hetoimasia.Foundation.Messaging.Snapshot.Types` | `src/Hetoimasia/Foundation/Messaging/Snapshot/Types.hs` | main library | hidden | The snapshot representation and state, the endpoints, cursor, and observation with their nominal roles, the foreign-cursor error, and the publication and update types |
 | `Hetoimasia.Foundation.Recovery` | `src/Hetoimasia/Foundation/Recovery.hs` | main library | exposed | Public recovery module; both recovery boundaries, policy validation, and history inspection |
 | `Hetoimasia.Foundation.Recovery.Types` | `src/Hetoimasia/Foundation/Recovery/Types.hs` | main library | hidden | Policy, strategy, outcome, attempt, and history types, and the private history annotation with its rendering |
 | `Hetoimasia.Foundation.Resource` | `src/Hetoimasia/Foundation/Resource.hs` | main library | exposed | Public resource facade; resource and composite scopes, the continuation facade, and evidence inspection |

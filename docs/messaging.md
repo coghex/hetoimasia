@@ -704,6 +704,39 @@ Under traffic that keeps every input ready — commands alone could fill every
 turn — each turn still serves every input, and the channel counters show
 exactly one dequeue per spent opportunity.
 
+## Module structure
+
+Messaging has three public modules, which are the only ones a client imports,
+and three hidden modules of the foundation's main library, which a client
+importing them is refused:
+
+| Module | Visibility | Owns |
+|---|---|---|
+| `Messaging.Payload` | exposed | `Prepared`, `prepare`, and `preparedValue` |
+| `Messaging.Component` | hidden | The one definition of `messagingComponent`, `foundation.messaging` |
+| `Messaging.Channel.Types` | hidden | The channel representation and phases; `ChannelControl`, `Sender`, and `Receiver` with their nominal roles; `ChannelCapacityRejected` and its `Exception` instance; and `SendResult`, `Admission`, `Termination`, `Receipt`, `Delivery`, and `ChannelStatistics` |
+| `Messaging.Channel` | exposed | Every channel operation, `maximumCapacity`, and `newChannelOperation` |
+| `Messaging.Snapshot.Types` | hidden | The snapshot representation and its state; `SnapshotPublisher`, `SnapshotReader`, `SnapshotCursor`, and `Observation` with their nominal roles; `ForeignSnapshotCursor` and its `Exception` instance; and `Publication` and `Update` |
+| `Messaging.Snapshot` | exposed | Every snapshot operation, the observation and cursor readers, and `awaitSnapshotOperation` |
+
+Dependencies run one way. `Messaging.Component` imports only the private
+component contract, `Log.Component`. Each `Types` module imports `Payload` for
+the `Prepared` values it holds and nothing from the other implementation.
+`Channel` imports `Channel.Types`, `Snapshot` imports `Snapshot.Types`, and both
+import `Messaging.Component` and the public failure module; `Snapshot` imports
+nothing from the channel modules. The graph needs no `.hs-boot` file, and every
+instance and role annotation stays with its type.
+
+`Channel` and `Snapshot` each re-export `messagingComponent`, and it is one
+value defined once, so a rejected capacity and a foreign cursor name the same
+component, and a client importing both modules sees one name. Each public module
+re-exports its endpoints, cursors, and observations without their
+constructors, so they stay abstract outside the package.
+
+The `Types` modules define the channel's and the snapshot's state but create and
+change none of it: only the operations in `Channel` and `Snapshot` allocate,
+read, and write the rows below. `Messaging.Component` owns no state.
+
 ## State
 
 | State | Owner | Readers and writers | Thread | Lifetime and reset |
@@ -725,6 +758,9 @@ The payload module owns no other state and no STM operation. Each channel owns
 only its own three rows; nothing is shared between channels, and there is no
 disposal step. Each snapshot owns its value, revision, and terminal flag, and
 each reader owns its own last revision; nothing is shared between snapshots.
+The channel and snapshot rows are written only by the operations in `Channel`
+and `Snapshot`; the hidden `Types` modules that define them own nothing (see
+[Module structure](#module-structure)).
 
 ## Module authoring
 
@@ -737,14 +773,16 @@ handle, and documents its one state row above.
 The channel module follows the same guide. It takes no logger: `Full`,
 `Closed`, `Empty`, and a termination are results the caller handles, not
 diagnostics, and its one failure, a rejected capacity, propagates to the owner
-with its engine origin. Its representation stays behind three abstract
-endpoints, and its state rows are documented above.
+with its engine origin. Its representation, defined in the hidden
+`Channel.Types`, stays behind three abstract endpoints, and its state rows are
+documented above.
 
 The snapshot module follows the same guide. It takes no logger:
 `PublicationClosed` and `EndOfStream` are results the caller handles, and its
 one failure, a cursor mismatch, propagates to the misusing caller with its
-engine origin. Its representation stays behind abstract endpoints,
-observations, and cursors, and its state rows are documented above.
+engine origin. Its representation, defined in the hidden `Snapshot.Types`,
+stays behind abstract endpoints, observations, and cursors, and its state rows
+are documented above.
 
 The inbox adapter follows the same guide. It takes no logger: optional
 unavailability is warned about once by supervision, and its one failure of its
@@ -853,6 +891,25 @@ select. They cover:
   `SnapshotReader` each rejected for its named cause, and a linked client using
   every publish, read, wait, and close operation, the observation readers, and
   the cursor-mismatch failure.
+
+The module-structure examples live in
+`packages/foundation/test/Test/Foundation/Messaging/Visibility.hs`, under
+`Messaging`;
+`--match 'Messaging module visibility across the package boundary'` selects
+only them. Each compiles its own external client, and they cover:
+
+- an accepted client importing, by name, every name `Channel`, `Snapshot`, and
+  `Payload` export, with every exported constructor and record selector and the
+  abstract types without theirs, and naming `messagingComponent`, imported from
+  both `Channel` and `Snapshot`, unqualified, which compiles only while it is
+  one definition;
+- a client importing each of `Messaging.Component`, `Messaging.Channel.Types`,
+  and `Messaging.Snapshot.Types` refused as a hidden module of the main library,
+  with `GHC-87110` and the unit `hetoimasia-foundation-0.1.0.0`;
+- `coerce` re-typing each of `ChannelControl`, `Sender`, `Receiver`,
+  `SnapshotPublisher`, `SnapshotReader`, `SnapshotCursor`, and `Observation`
+  between two client newtypes over the same representation refused at that
+  line, beside an accepted control coercion between the newtypes themselves.
 
 The supervised waits on channels and snapshots exercise the runtime's
 supervision, so the runtime package's suite registers them under `Runtime`, in

@@ -1,5 +1,3 @@
-{-# LANGUAGE RoleAnnotations #-}
-
 -- | Latest-value snapshots of prepared payloads, read through checked cursors.
 --
 -- A snapshot is created in 'IO' by its publisher with 'newSnapshot', from a
@@ -8,6 +6,17 @@
 -- 'SnapshotReader', with 'snapshotReader'. A reader can read and wait; it cannot
 -- publish or close. Every endpoint is abstract and every operation is an
 -- ordinary function; no 'TVar' or other private state escapes.
+--
+-- __Module structure.__ This is the only snapshot module a client imports.
+-- Inside the foundation, the snapshot representation and state, the endpoints,
+-- cursors and observations with their nominal roles, 'ForeignSnapshotCursor',
+-- and the publication and update types are defined in
+-- "Hetoimasia.Foundation.Messaging.Snapshot.Types", and 'messagingComponent' in
+-- "Hetoimasia.Foundation.Messaging.Component"; both are hidden modules of the
+-- main library, and this module re-exports what clients may use from them
+-- without the endpoints', cursors', and observations' constructors. This module
+-- itself defines every snapshot operation, and imports nothing from the channel
+-- modules.
 --
 -- __Identity.__ Every 'newSnapshot' call creates a snapshot with a fresh
 -- identity. A new lifetime is always a new snapshot: there is no way to reset
@@ -116,58 +125,15 @@ module Hetoimasia.Foundation.Messaging.Snapshot
   , awaitSnapshotOperation
   ) where
 
-import Control.Concurrent.STM (STM, TVar, newTVarIO, readTVar, retry, writeTVar)
-import Control.Exception (Exception)
+import Control.Concurrent.STM (STM, newTVarIO, readTVar, retry, writeTVar)
 import Data.Text (pack)
-import Data.Unique (Unique, newUnique)
+import Data.Unique (newUnique)
 import GHC.Stack (HasCallStack)
 import Hetoimasia.Foundation.Failure (Operation, operation, throwFailureSTM)
-import Hetoimasia.Foundation.Messaging.Channel (messagingComponent)
+import Hetoimasia.Foundation.Messaging.Component (messagingComponent)
 import Hetoimasia.Foundation.Messaging.Payload (Prepared)
+import Hetoimasia.Foundation.Messaging.Snapshot.Types
 import Numeric.Natural (Natural)
-
--- | The shared representation behind both endpoints.
-data Snapshot a = Snapshot
-  { snapshotIdentity ∷ !Unique
-  , snapshotState ∷ !(TVar (State a))
-  }
-
--- | Everything a transaction reads together, written as one value so the
--- payload and its revision can never be observed apart. The payload field is
--- lazy: storing a handle never forces it.
-data State a = State
-  { stateValue ∷ Prepared a
-  , stateRevision ∷ !Natural
-  , stateClosed ∷ !Bool
-  }
-
--- | The publisher endpoint: it publishes, closes, and hands out the read
--- endpoint.
---
--- The role is nominal, as for 'Prepared', so no endpoint can be coerced to a
--- different payload type.
-type role SnapshotPublisher nominal
-
-newtype SnapshotPublisher a = SnapshotPublisher (Snapshot a)
-
--- | An endpoint that can only read and wait.
-type role SnapshotReader nominal
-
-newtype SnapshotReader a = SnapshotReader (Snapshot a)
-
--- | A position in one snapshot's publications: the snapshot's identity and the
--- revision observed. It holds no payload and no reference to the snapshot's
--- state.
-type role SnapshotCursor nominal
-
-data SnapshotCursor a = SnapshotCursor !Unique !Natural
-  deriving (Eq)
-
--- | One coherent read: a payload and the cursor of the publication it came
--- from.
-type role Observation nominal
-
-data Observation a = Observation (Prepared a) !(SnapshotCursor a)
 
 -- | The observed payload, the very handle that was published.
 observedValue ∷ Observation a → Prepared a
@@ -181,15 +147,6 @@ observedCursor (Observation _ cursor) = cursor
 -- for each publication after it.
 cursorRevision ∷ SnapshotCursor a → Natural
 cursorRevision (SnapshotCursor _ revision) = revision
-
--- | A cursor from a different snapshot was passed to 'awaitSnapshot'.
---
--- The cursor's revision is kept for diagnosis; its identity is not
--- displayable.
-newtype ForeignSnapshotCursor = ForeignSnapshotCursor Natural
-  deriving (Eq, Show)
-
-instance Exception ForeignSnapshotCursor
 
 -- | The operation a cursor mismatch names as its origin.
 awaitSnapshotOperation ∷ Operation
@@ -207,14 +164,6 @@ snapshotReader ∷ SnapshotPublisher a → SnapshotReader a
 snapshotReader (SnapshotPublisher snapshot) = SnapshotReader snapshot
 
 -- Publishing -------------------------------------------------------------------
-
--- | What a publication did.
-data Publication
-  = Published
-    -- ^ The value was replaced and the revision advanced.
-  | PublicationClosed
-    -- ^ The snapshot is closed. Nothing changed.
-  deriving (Eq, Show)
 
 -- | Replace the value and advance the revision, unless the snapshot is closed.
 -- Never waits, and never compares or forces the payload.
@@ -241,13 +190,6 @@ closeSnapshot (SnapshotPublisher snapshot) = do
 -- | Read the current value and its cursor. Never waits, and changes nothing.
 readSnapshot ∷ SnapshotReader a → STM (Observation a)
 readSnapshot (SnapshotReader snapshot) = observe snapshot <$> readTVar (snapshotState snapshot)
-
--- | What a waiting read found.
-data Update a
-  = Updated (Observation a)
-    -- ^ The newest publication after the cursor's revision.
-  | EndOfStream
-    -- ^ The snapshot is closed and holds nothing newer than the cursor.
 
 -- | Wait for a publication newer than the cursor.
 --
