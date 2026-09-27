@@ -6,8 +6,9 @@
 -- stops an example that has already hung. The one example over the process's
 -- monotonic clock asserts ordering alone, never an amount of elapsed time.
 --
--- The external-client examples live in "Test.Foundation.Time.Opacity" and are
--- composed into this group, so @--match Time@ selects all of them.
+-- The external-client examples live in "Test.Foundation.Time.Opacity" and
+-- "Test.Foundation.Time.Visibility" and are composed into this group, so
+-- @--match Time@ selects all of them.
 module Test.Foundation.Time.Spec (spec) where
 
 import Control.Concurrent (forkIO, killThread)
@@ -39,6 +40,7 @@ import Hetoimasia.Foundation.Failure
 import Hetoimasia.Foundation.Log (Component, unsafeComponent)
 import Hetoimasia.Foundation.Time
 import qualified Test.Foundation.Time.Opacity as Opacity
+import qualified Test.Foundation.Time.Visibility as Visibility
 import Test.Hspec (Expectation, Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
 import Test.Support.Bounded (bounded)
 
@@ -93,6 +95,7 @@ spec = describe "Time" $ do
       testDeliveredCancellation
 
   Opacity.spec
+  Visibility.spec
 
 -- Fixtures -------------------------------------------------------------------
 

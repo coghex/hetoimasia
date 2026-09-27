@@ -170,6 +170,12 @@ and re-exports its types from the hidden `Recovery.Types` of the main library.
 That module takes `Operation` from `Failure.Base` alone. See
 [docs/recovery.md](../../docs/recovery.md#module-structure).
 
+Time has one public module, `Time`, which keeps reading a clock and sampling
+and re-exports its values from the hidden `Time.Types` and its validated
+conversions and arithmetic from the hidden `Time.Arithmetic`. Neither imports a
+clock, logging, or failure module. See
+[docs/time.md](../../docs/time.md#module-structure).
+
 The resource family has two public modules. Their implementation lives in the
 private `internal` sublibrary, which exposes only the package-private facade
 `Resource.Internal` (and the worker group's `Worker.Internal`); the rest of the
@@ -209,6 +215,9 @@ for the module that owns and writes each piece of state.
 | `Hetoimasia.Foundation.Resource.Types` | `internal/Hetoimasia/Foundation/Resource/Types.hs` | `internal` sublibrary | hidden | Release ranks and the assembly representation: parts, `Assembly`, and the ledger |
 | `Hetoimasia.Foundation.Resource.Assembly` | `internal/Hetoimasia/Foundation/Resource/Assembly.hs` | `internal` sublibrary | hidden | Staged acquisition, rollback, and lending over the assembly representation |
 | `Hetoimasia.Foundation.Resource.Scoped` | `internal/Hetoimasia/Foundation/Resource/Scoped.hs` | `internal` sublibrary | hidden | The `Scoped` continuation type, its instances, and its runner |
+| `Hetoimasia.Foundation.Time` | `src/Hetoimasia/Foundation/Time.hs` | main library | exposed | Public time module; the monotonic and scripted sources, clock reading and its failure attribution, and elapsed sampling |
+| `Hetoimasia.Foundation.Time.Types` | `src/Hetoimasia/Foundation/Time/Types.hs` | main library | hidden | Instants, durations, requirements, rejections, conversion results, overflow, sources, and baselines, with their instances |
+| `Hetoimasia.Foundation.Time.Arithmetic` | `src/Hetoimasia/Foundation/Time/Arithmetic.hs` | main library | hidden | Validated conversions, duration constants, non-wrapping arithmetic, deadline comparison, and the pure baseline rule |
 | `Hetoimasia.Foundation.Worker` | `src/Hetoimasia/Foundation/Worker.hs` | main library | exposed | Public worker facade; group lifetime, drain status, definitions, starting, requests, observation, outcomes, and evidence, without the coordination probe |
 | `Hetoimasia.Foundation.Worker.Internal` | `internal/Hetoimasia/Foundation/Worker/Internal.hs` | `internal` sublibrary | package-private (exposed to this package only) | Facade re-exporting the worker implementation, including the coordination probe, to the rest of the package |
 | `Hetoimasia.Foundation.Worker.Base` | `internal/Hetoimasia/Foundation/Worker/Base.hs` | `internal` sublibrary | hidden | Worker identity, the request record, the stop token, `WorkerCancelled`, and the group phase |
