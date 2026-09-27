@@ -4,19 +4,21 @@
 -- what Vulkan itself would hold the application to.
 --
 -- That model is the point of the stand-in. It tracks each fence — unsignalled,
--- pending on a submission, or signalled — and each binary semaphore —
--- unsignalled, owed a signal, or waited on by a pending submission — and each
--- swapchain image the application owns, and it records a violation, instead of
--- failing, whenever a call breaks a rule: asking a fence no submission made
--- pending whether it signalled, resetting or destroying a pending fence,
--- acquiring into or signalling a semaphore that is not unsignalled, waiting on
--- one nothing will signal, destroying one a submission still uses, or
--- releasing an image whose acquisition signal was never waited on to
--- completion. Every example ends by requiring there were none.
+-- pending on a submission or a presentation, or signalled — and each binary
+-- semaphore — unsignalled, owed a signal, or waited on by a pending submission
+-- or presentation — and each swapchain image the application owns, and it
+-- records a violation, instead of failing, whenever a call breaks a rule:
+-- asking or waiting on a fence no queue operation made pending, resetting or
+-- destroying a pending fence, acquiring into or signalling a semaphore that is
+-- not unsignalled, waiting on one nothing will signal, destroying one a
+-- submission or a presentation still uses, presenting an image the application
+-- does not own, or releasing an image whose acquisition signal was never waited
+-- on to completion. Every example ends by requiring there were none.
 --
--- A fence signals only when an example says its submission completed
--- ('completeFence', 'completeAll'), which is the injected completion a native
--- run gets from the device.
+-- A fence signals only when an example says its submission or presentation
+-- completed ('completeFence', 'completeAll'), which is the injected completion
+-- a native run gets from the device. A presentation's answer is scripted
+-- ('scriptPresent'); by default it succeeds.
 module Test.GPU.Vulkan.Native.FramesStandIn
   ( FramesStandIn (..)
   , newFramesStandIn
@@ -28,18 +30,23 @@ module Test.GPU.Vulkan.Native.FramesStandIn
   , clearFrameStep
   , duringFrameCall
   , scriptAcquire
+  , PresentScript (..)
+  , scriptPresent
+  , StandInOutOfMemory (..)
   , completeFence
   , completeAll
   , pendingFences
   , violations
   , FrameStepFailed (..)
   , imagesOwned
+  , fenceStandings
   ) where
 
 import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
-import Control.Exception (Exception, fromException, throwIO)
+import Control.Exception (Exception, SomeException, fromException, throwIO)
 import Control.Monad (unless, when)
 import Data.Foldable (for_)
+import Data.IORef (writeIORef)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
@@ -48,7 +55,7 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word32, Word64)
 
-import Hetoimasia.GPU.Vulkan.Native.Frames (AcquireResult (..), FrameOps (..), SubmitBatch (..), WaitStage)
+import Hetoimasia.GPU.Vulkan.Native.Frames (AcquireResult (..), FrameOps (..), PresentRequest (..), PresentStatus (..), SubmitBatch (..), WaitStage)
 
 -- | One native call the frames made, in the order it made it. A command buffer
 -- is its number, as the recording's stand-in makes it.
@@ -65,6 +72,10 @@ data FrameCall
     -- ^ Each batch's waits, their stage, its command buffers and its signals;
     -- and the fence.
   | Released !Word64 ![Word32]
+  | Presented !PresentRequest !PresentStatus
+    -- ^ What was presented, and the swapchain's entry the call wrote.
+  | WaitedFence !Word64 !Word64 !Bool
+    -- ^ The fence, the timeout in nanoseconds, and whether it signalled.
   deriving (Eq, Show)
 
 -- | A step the stand-in can be made to fail at.
@@ -83,7 +94,24 @@ data FrameStep
     -- ^ Fail only a submission that runs no command.
   | AtRelease
   | AtDestroy
+  | AtWait
   deriving (Eq, Ord, Show)
+
+-- | How the next presentation answers.
+data PresentScript
+  = PresentReturning !PresentStatus
+    -- ^ The call returns, writing this entry.
+  | PresentRaising !PresentStatus !SomeException
+    -- ^ The call writes this entry, then raises this failure.
+  | PresentRaisingUnwritten !SomeException
+    -- ^ The call raises without writing its entry.
+
+-- | The out-of-memory failure a presentation or a submission raises, which the
+-- stand-in's 'opsNoEffect' recognizes as the specified no-effect one.
+data StandInOutOfMemory = StandInOutOfMemory
+  deriving (Eq, Show)
+
+instance Exception StandInOutOfMemory
 
 -- | What a failing step raises, after recording the call.
 newtype FrameStepFailed = FrameStepFailed FrameStep
@@ -111,6 +139,8 @@ data FramesStandIn = FramesStandIn
     -- signals.
   , standScript ∷ !(TVar [AcquireResult])
     -- ^ Answers for the next acquisitions, before the default.
+  , standPresents ∷ !(TVar [PresentScript])
+    -- ^ Answers for the next presentations, before the default success.
   , standImages ∷ !Word32
     -- ^ How many images each swapchain has.
   , standViolations ∷ !(TVar [Text])
@@ -127,6 +157,7 @@ newFramesStandIn =
     <*> newTVarIO Map.empty
     <*> newTVarIO Map.empty
     <*> newTVarIO Map.empty
+    <*> newTVarIO []
     <*> newTVarIO []
     <*> pure 3
     <*> newTVarIO []
@@ -150,8 +181,16 @@ duringFrameCall standIn action = atomically (writeTVar (standDuring standIn) act
 scriptAcquire ∷ FramesStandIn → [AcquireResult] → IO ()
 scriptAcquire standIn answers = atomically (modifyTVar' (standScript standIn) (<> answers))
 
--- | The submission pending on this fence completed: the fence signals, and
--- every semaphore it waited on is unsignalled again.
+-- | Answer the next presentations with these, in order.
+scriptPresent ∷ FramesStandIn → [PresentScript] → IO ()
+scriptPresent standIn answers = atomically (modifyTVar' (standPresents standIn) (<> answers))
+
+-- | Where every fence stands: unsignalled, pending or signalled.
+fenceStandings ∷ FramesStandIn → IO [(Word64, Text)]
+fenceStandings standIn = map (fmap shown) . Map.toList <$> readTVarIO (standFences standIn)
+
+-- | The submission or presentation pending on this fence completed: the fence
+-- signals, and every semaphore it waited on is unsignalled again.
 completeFence ∷ FramesStandIn → Word64 → IO ()
 completeFence standIn fence = atomically (complete standIn fence)
 
@@ -285,7 +324,8 @@ framesStandInOps standIn =
             modifyTVar' (standSemaphores standIn) (Map.insert semaphore SignalOwed)
           modifyTVar' (standFences standIn) (Map.insert fence Pending)
           modifyTVar' (standPending standIn) (Map.insert fence waits)
-    , opsNoEffect = \failure → fromException failure == Just (FrameStepFailed AtSubmitNoEffect)
+    , opsNoEffect = \failure →
+        fromException failure == Just (FrameStepFailed AtSubmitNoEffect) || fromException failure == Just StandInOutOfMemory
     , opsReleaseImages = \_ swapchain indices → do
         step standIn [AtRelease] (Released swapchain indices)
         atomically $ for_ indices $ \index →
@@ -297,4 +337,48 @@ framesStandInOps standIn =
               -- wait completed: the semaphore is idle again.
               unless (state == Just Idle) $ violate standIn ("released image " <> shown index <> " while its acquisition semaphore is " <> shown state)
               modifyTVar' (standOwned standIn) (Map.delete (swapchain, index))
+    , opsPresent = \_ _ request status → do
+        answer ← atomically $ do
+          script ← readTVar (standPresents standIn)
+          case script of
+            next : rest → Just next <$ writeTVar (standPresents standIn) rest
+            [] → pure Nothing
+        let (written, raised) = case answer of
+              Nothing → (PresentStatusSuccess, Nothing)
+              Just (PresentReturning entry) → (entry, Nothing)
+              Just (PresentRaising entry failure) → (entry, Just failure)
+              Just (PresentRaisingUnwritten failure) → (PresentStatusUnwritten, Just failure)
+            fence = presentFence request
+            semaphore = presentWait request
+            image = (presentSwapchain request, presentIndex request)
+            enqueued = written `elem` [PresentStatusSuccess, PresentStatusSuboptimal, PresentStatusOutOfDate, PresentStatusSurfaceLost]
+        atomically (modifyTVar' (standJournal standIn) (Presented request written :))
+        action ← readTVarIO (standDuring standIn)
+        -- A presentation that was enqueued has its effect, whatever it answers:
+        -- the semaphore wait is the presentation engine's, the fence is
+        -- pending, and the image is the presentation engine's again.
+        when enqueued $ atomically $ do
+          fenceState ← Map.lookup fence <$> readTVar (standFences standIn)
+          unless (fenceState == Just Unsignalled) $ violate standIn ("presented with fence " <> shown fence <> " while " <> shown fenceState)
+          state ← Map.lookup semaphore <$> readTVar (standSemaphores standIn)
+          unless (state == Just SignalOwed) $ violate standIn ("presented waiting on semaphore " <> shown semaphore <> " while " <> shown state)
+          owned ← Map.member image <$> readTVar (standOwned standIn)
+          unless owned $ violate standIn ("presented image " <> shown image <> ", which the application does not own")
+          modifyTVar' (standSemaphores standIn) (Map.insert semaphore (WaitedBy fence))
+          modifyTVar' (standFences standIn) (Map.insert fence Pending)
+          modifyTVar' (standPending standIn) (Map.insert fence [semaphore])
+          modifyTVar' (standOwned standIn) (Map.delete image)
+        writeIORef status written
+        action (Presented request written)
+        for_ raised throwIO
+    , opsWaitFence = \_ fence timeout → do
+        signalled ← atomically $
+          (Map.lookup fence <$> readTVar (standFences standIn)) >>= \case
+            Just Pending → pure False
+            Just Signalled → pure True
+            other → do
+              violate standIn ("waited on fence " <> shown fence <> ", which no queue operation made pending: " <> shown other)
+              pure False
+        step standIn [AtWait] (WaitedFence fence timeout signalled)
+        pure signalled
     }

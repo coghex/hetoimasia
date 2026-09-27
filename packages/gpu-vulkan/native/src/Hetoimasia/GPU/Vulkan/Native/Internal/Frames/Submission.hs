@@ -5,8 +5,9 @@
 -- completion obligation shared by every frame of the request — in the same
 -- masked step.
 --
--- This module advances frame records, slot synchronization and inserts
--- submission records in the frames' state
+-- This module advances frame records, slot synchronization and the
+-- render-finished semaphores of presentation-pool records, and inserts
+-- submission records, in the frames' state
 -- ("Hetoimasia.GPU.Vulkan.Native.Internal.Frames.State"), and records each
 -- batch as submitted with the recording
 -- ("Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Batches"). It owns no
@@ -24,6 +25,8 @@ import Data.List.NonEmpty (NonEmpty)
 import qualified Data.List.NonEmpty as NonEmpty
 import qualified Data.Map.Strict as Map
 import qualified Data.Text as Text
+import Data.Word (Word64)
+import Numeric.Natural (Natural)
 
 import Hetoimasia.GPU.Model
   ( FramePhase (FrameAcquired)
@@ -42,6 +45,7 @@ import Hetoimasia.GPU.Model.Identity
   , FrameSlotId
   , IdentityKind (..)
   , Misuse (..)
+  , TargetId
   , batchTarget
   , targetSession
   )
@@ -66,6 +70,10 @@ data Member cmd = Member
   , memberFrame ∷ !FrameSlotId
   , memberCommands ∷ !cmd
   , memberSync ∷ !SlotSync
+  , memberPool ∷ !(TargetId, Natural)
+    -- ^ The presentation-pool record the frame holds, whose render-finished
+    -- semaphore its batch signals.
+  , memberRendered ∷ !Word64
   }
 
 -- | Submit sealed batches, each of its own acquired frame, as one native
@@ -74,15 +82,15 @@ data Member cmd = Member
 -- The whole request is validated before any native call: the calling thread,
 -- each batch — this session's, sealed, still held by the model and never
 -- submitted, and no batch or frame named twice — each frame — acquired by this
--- owner, with its acquisition semaphore owed a signal and its render-finished
--- semaphore idle — and the model's acceptance of the whole submission, asked
+-- owner, with its acquisition semaphore owed a signal and the render-finished
+-- semaphore of the pool record it holds idle — and the model's acceptance of the whole submission, asked
 -- without changing it. A refusal makes no native call.
 --
 -- Then, in one masked step: the model notes each frame's fence reset, the
 -- first frame's slot fence is reset — only now, immediately before the
 -- submission it will be passed to — the batches are submitted, each waiting on
--- its frame's acquisition semaphore and signalling its render-finished one,
--- and what the call did is recorded:
+-- its frame's acquisition semaphore and signalling the render-finished
+-- semaphore of its frame's pool record, and what the call did is recorded:
 --
 -- * it returned: one submission record in the model that every frame shares,
 --   every batch recorded as submitted by it, and the fence pending;
@@ -117,6 +125,7 @@ submitFrames frames request =
           managed ← readTVar (recordingManaged recording)
           live ← readTVar (framesLive frames)
           slots ← readTVar (framesSlots frames)
+          pool ← readTVar (framesPool frames)
           model ← readModel frames
           device ← deviceOf frames
           members ← forM batches $ \batch → do
@@ -129,8 +138,8 @@ submitFrames frames request =
                   | not held → Left (RefusedMisuse (AlreadyConsumed BatchIdentity))
                   | otherwise → do
                       let frame = batchFrame record
-                      case recordStage <$> Map.lookup frame live of
-                        Just StageAcquired → Right ()
+                      frameRecord ← case Map.lookup frame live of
+                        Just acquired@FrameRecord {recordStage = StageAcquired} → Right acquired
                         Just _ → Left (RefusedMisuse (WrongPhase FrameIdentity))
                         Nothing → Left (RefusedMisuse (UnknownIdentity FrameIdentity))
                       case viewFramePhase <$> frameView frame model of
@@ -140,9 +149,13 @@ submitFrames frames request =
                         Just (NativeStorage _ _ _ buffer) → Right buffer
                         _ → Left RefusedNoStorage
                       sync ← maybe (Left (RefusedIllegal "the frame's slot has no synchronization")) Right (Map.lookup (slotOf frame) slots)
-                      unless (syncAcquireState sync == SemaphoreSignalOwed && syncRenderedState sync == SemaphoreUnsignalled) $
+                      unless (syncAcquireState sync == SemaphoreSignalOwed) $
                         Left (RefusedIllegal ("the frame's synchronization is not ready to submit: " <> Text.pack (show sync)))
-                      pure (Member batch frame commands sync)
+                      let key = poolOf frame frameRecord
+                      record' ← maybe (Left (RefusedIllegal "the frame holds no presentation-pool record")) Right (Map.lookup key pool)
+                      unless (poolHolder record' == PoolHeldByFrame frame && poolRenderedState record' == SemaphoreUnsignalled) $
+                        Left (RefusedIllegal ("the frame's presentation-pool record is not ready to submit: " <> Text.pack (show record')))
+                      pure (Member batch frame commands sync key (poolRendered record'))
                 _ → Left (RefusedMisuse (WrongPhase BatchIdentity))
           pure $ do
             resolved ← sequence members
@@ -172,7 +185,7 @@ submitFrames frames request =
                 { submitWaits = [syncAcquire (memberSync member)]
                 , submitWaitStage = WaitAtColorOutput
                 , submitCommands = [memberCommands member]
-                , submitSignals = [syncRendered (memberSync member)]
+                , submitSignals = [memberRendered member]
                 }
             | member ← members
             ]
@@ -204,8 +217,9 @@ submitFrames frames request =
                     answered Model.submitFrames framesOf SubmissionEffectUncertain
                     uncertain frames UnknownSubmissionEffect framesOf reason
                     editSlot frames key (\sync → sync {syncFenceState = FenceUncertain reason})
-                    for_ members $ \member → editSlot frames (slotOf (memberFrame member)) $ \sync →
-                      sync {syncAcquireState = SemaphoreUncertain reason, syncRenderedState = SemaphoreUncertain reason}
+                    for_ members $ \member → do
+                      editSlot frames (slotOf (memberFrame member)) (\sync → sync {syncAcquireState = SemaphoreUncertain reason})
+                      editPool frames (memberPool member) (\held → held {poolRenderedState = SemaphoreUncertain reason})
                   case fromException exception ∷ Maybe GraphicsDeviceLost of
                     Just _ → rethrowIO failure
                     Nothing → throwIO (FrameEffectUncertain framesOf reason)
@@ -229,8 +243,8 @@ submitFrames frames request =
           Just submission → do
             for_ members $ \member → do
               editFrame frames (memberFrame member) (\record → record {recordStage = StageSubmitted submission})
-              editSlot frames (slotOf (memberFrame member)) $ \sync →
-                sync {syncAcquireState = SemaphoreWaitOwed, syncRenderedState = SemaphoreSignalOwed}
+              editSlot frames (slotOf (memberFrame member)) (\sync → sync {syncAcquireState = SemaphoreWaitOwed})
+              editPool frames (memberPool member) (\held → held {poolRenderedState = SemaphoreSignalOwed})
             editSlot frames key (\sync → sync {syncFenceState = FencePending})
             modifyTVar' (framesSubmissions frames) (Map.insert submission (SubmissionRecord key framesOf))
             pure (Right submission)

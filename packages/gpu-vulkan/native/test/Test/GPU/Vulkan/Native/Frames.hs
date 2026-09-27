@@ -14,71 +14,48 @@
 -- and nothing waits on a clock.
 module Test.GPU.Vulkan.Native.Frames (spec) where
 
-import Control.Concurrent (ThreadId, forkIO, killThread, myThreadId, yield)
+import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (atomically)
-import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall), Exception, SomeException, fromException, throwIO, try)
-import Control.Monad (unless, when)
-import Data.IORef (atomicModifyIORef', modifyIORef', newIORef, readIORef)
+import Control.Exception (ErrorCall (ErrorCall), throwIO, try)
+import Data.IORef (modifyIORef', newIORef, readIORef)
 import Data.List.NonEmpty (NonEmpty ((:|)))
-import qualified Data.Map.Strict as Map
-import Data.Text (Text)
-import Data.Word (Word64)
-import GHC.Conc (ThreadStatus (..), BlockReason (..), threadStatus)
-import Numeric.Natural (Natural)
-import Test.Hspec (Expectation, Spec, describe, expectationFailure, it, shouldBe, shouldReturn, shouldSatisfy)
+import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldReturn, shouldSatisfy)
 
-import Hetoimasia.Foundation.Time (DurationRequirement (AllowZero), Instant, durationFromNanoseconds, scriptedInstant)
 import Hetoimasia.GPU.Model
   ( FramePhase (..)
   , FrameView (..)
-  , GpuModel
-  , HoldView (..)
-  , Outcome (..)
   , SessionFailureCause (..)
   , SessionState (..)
   , TargetPhase (..)
   , TargetView (..)
-  , beginAllocation
   , closeTarget
-  , frameView
-  , holdView
-  , modelBudgets
   , sessionState
   , suspendTarget
-  , targetView
   , usage
   , usageFrames
   , usageObjects
   )
-import Hetoimasia.GPU.Model.Budget (BudgetKind (..), BudgetRequest (..), defaultBudgetRequest, objectLimit, validateBudgets)
+import Hetoimasia.GPU.Model.Budget (BudgetKind (..))
 import Hetoimasia.GPU.Model.Identity
-  ( BatchId
-  , FrameSlotId
-  , GenerationId
-  , HoldSubject (..)
+  ( HoldSubject (..)
   , IdentityKind (..)
   , Misuse (..)
-  , SubmissionId
-  , TargetClass (..)
-  , TargetId
   , frameSlotNumber
   , imageGeneration
   , imageIndex
   )
 import Hetoimasia.GPU.Vulkan.Native.Frames
 import Hetoimasia.GPU.Vulkan.Native.Generations
-import Hetoimasia.GPU.Vulkan.Native.Presentation
 import Hetoimasia.GPU.Vulkan.Native.Recording
 import Hetoimasia.GPU.Vulkan.Native.Roots
+import Test.GPU.Vulkan.Native.FramesRig
 import Test.GPU.Vulkan.Native.FramesStandIn
-import Test.GPU.Vulkan.Native.RecordingStandIn (newRecordingStandIn, recordingStandInOps)
-import Test.GPU.Vulkan.Native.StandIn (StandInRoots, newStandIn, newStandInRoots, standardRequest, surfaceNumbered)
 
 spec ∷ Spec
 spec = describe "Frames" $ do
   describe "acquisition" $ do
-    it "reserves in the model before acquiring, makes the slot's synchronization first, and owns the exact generation and image" $ do
+    it "reserves in the model before acquiring, makes the slot's synchronization and a pool record first, and owns the exact generation and image" $ do
       rig ← newRig
       seen ← newIORef Nothing
       duringFrameCall (rigStandIn rig) $ \case
@@ -93,7 +70,11 @@ spec = describe "Frames" $ do
       imageIndex (ownedImage frame) `shouldBe` 0
       ownedSuboptimal frame `shouldBe` False
       calls ← frameCalls (rigStandIn rig)
-      map kind calls `shouldBe` ["semaphore", "semaphore", "fence", "fence", "acquire"]
+      -- The slot's acquisition semaphore and two fences, then the pool
+      -- record's render-finished semaphore and present fence.
+      map kind calls `shouldBe` ["semaphore", "fence", "fence", "semaphore", "fence", "acquire"]
+      [PoolView _ _ pool] ← atomically (readPool (rigFrames rig))
+      poolHolder pool `shouldBe` PoolHeldByFrame (ownedFrame frame)
       phaseOf rig (ownedFrame frame) `shouldReturn` Just FrameAcquired
       acquisitionState rig (ownedFrame frame) `shouldReturn` Just SemaphoreSignalOwed
       clean rig
@@ -173,18 +154,19 @@ spec = describe "Frames" $ do
       clean rig
 
   describe "submission" $ do
-    it "submits a sealed batch waiting on the acquisition and signalling the render-finished semaphore, resetting the fence just before" $ do
+    it "submits a sealed batch waiting on the acquisition and signalling its pool record's render-finished semaphore, resetting the fence just before" $ do
       rig ← newRig
       frame ← owned rig
       batch ← sealed rig frame
       submission ← submitted rig (batch :| [])
       [SlotView _ _ sync] ← atomically (readSlots (rigFrames rig))
-      calls ← drop 5 <$> frameCalls (rigStandIn rig)
+      [PoolView _ _ pool] ← atomically (readPool (rigFrames rig))
+      calls ← drop 6 <$> frameCalls (rigStandIn rig)
       calls
         `shouldBe` [ ResetFence (syncFence sync)
-                   , Submitted [([syncAcquire sync], WaitAtColorOutput, [commandsOf rig 0], [syncRendered sync])] (syncFence sync)
+                   , Submitted [([syncAcquire sync], WaitAtColorOutput, [commandsOf rig 0], [poolRendered pool])] (syncFence sync)
                    ]
-      (syncFenceState sync, syncAcquireState sync, syncRenderedState sync) `shouldBe` (FencePending, SemaphoreWaitOwed, SemaphoreSignalOwed)
+      (syncFenceState sync, syncAcquireState sync, poolRenderedState pool) `shouldBe` (FencePending, SemaphoreWaitOwed, SemaphoreSignalOwed)
       fmap viewFrameSubmission <$> frameOf rig (ownedFrame frame) `shouldReturn` Just (Just submission)
       standingOf rig (ownedFrame frame) `shouldReturn` Just (StageSubmitted submission)
       fmap viewBatchStanding <$> atomically (readBatch (rigRecording rig) batch) `shouldReturn` Just (BatchSubmitted submission)
@@ -278,7 +260,7 @@ spec = describe "Frames" $ do
       skipFrame (rigFrames rig) (ownedFrame frame) `shouldReturn` Left (RefusedMisuse (WrongPhase FrameIdentity))
       _ ← progress rig
       filter isQuery <$> frameCalls (rigStandIn rig) `shouldReturn` []
-      retireTargetFrames (rigFrames rig) (rigTarget rig) `raises` \(FramesRetained _ frames _) → frames == [ownedFrame frame]
+      retireTargetFrames (rigFrames rig) (rigTarget rig) `raises` \(FramesRetained _ frames _ _ _) → frames == [ownedFrame frame]
 
     it "retains a fence whose reset raised, stops admission and fails the session, submitting nothing" $ do
       rig ← newRig
@@ -300,7 +282,7 @@ spec = describe "Frames" $ do
       clearFrameStep (rigStandIn rig) AtResetFence
       ok (skipFrame (rigFrames rig) (ownedFrame frame))
       settleAll rig
-      retireTargetFrames (rigFrames rig) (rigTarget rig) `raises` \(FramesRetained _ frames slots) → null frames && slots == [0]
+      retireTargetFrames (rigFrames rig) (rigTarget rig) `raises` \(FramesRetained _ frames slots _ _) → null frames && slots == [0]
       clean rig
 
   describe "abandonment" $ do
@@ -346,15 +328,17 @@ spec = describe "Frames" $ do
       completeAll (rigStandIn rig)
       progress rig `shouldReturn'` \report → (progressCompleted report, progressCleanups report) `shouldBe` ([submission], [ownedFrame frame])
       [SlotView _ _ sync] ← atomically (readSlots (rigFrames rig))
+      [PoolView _ _ pool] ← atomically (readPool (rigFrames rig))
       -- The same step then asks the cleanup fence, which has not signalled.
-      last . filter isSubmission <$> frameCalls (rigStandIn rig) `shouldReturn` Submitted [([syncRendered sync], WaitAtAllCommands, [], [])] (syncCleanup sync)
+      last . filter isSubmission <$> frameCalls (rigStandIn rig) `shouldReturn` Submitted [([poolRendered pool], WaitAtAllCommands, [], [])] (syncCleanup sync)
       imagesOwned (rigStandIn rig) `shouldReturn'` (`shouldSatisfy` (not . null))
       completeAll (rigStandIn rig)
       progress rig `shouldReturn'` \report → progressSettled report `shouldBe` [ownedFrame frame]
       imagesOwned (rigStandIn rig) `shouldReturn` []
       phaseOf rig (ownedFrame frame) `shouldReturn` Nothing
       [SlotView _ _ settled] ← atomically (readSlots (rigFrames rig))
-      (syncAcquireState settled, syncRenderedState settled) `shouldBe` (SemaphoreUnsignalled, SemaphoreUnsignalled)
+      [PoolView _ _ freed] ← atomically (readPool (rigFrames rig))
+      (syncAcquireState settled, poolRenderedState freed, poolHolder freed) `shouldBe` (SemaphoreUnsignalled, SemaphoreUnsignalled, PoolFree)
       clean rig
 
     it "abandons a closing target's frames, settles them while it closes, and then retires its slots" $ do
@@ -366,12 +350,14 @@ spec = describe "Frames" $ do
       acquired rig `shouldReturn` AcquisitionClosing
       answers ← closeTargetFrames (rigFrames rig) (rigTarget rig)
       answers `shouldBe` [(ownedFrame first, Right ()), (ownedFrame second, Right ())]
-      retireTargetFrames (rigFrames rig) (rigTarget rig) `raises` \(FramesRetained _ frames _) → length frames == 2
+      retireTargetFrames (rigFrames rig) (rigTarget rig) `raises` \(FramesRetained _ frames _ _ _) → length frames == 2
       settleAll rig
       atomically (readFrameStandings (rigFrames rig)) `shouldReturn` []
       retireTargetFrames (rigFrames rig) (rigTarget rig)
       atomically (readSlots (rigFrames rig)) `shouldReturn` []
-      length . filter isDestruction <$> frameCalls (rigStandIn rig) `shouldReturn` 8
+      -- Two slots of three objects, and two pool records of two.
+      length . filter isDestruction <$> frameCalls (rigStandIn rig) `shouldReturn` 10
+      atomically (readPool (rigFrames rig)) `shouldReturn` []
       clean rig
 
     it "abandons a frame once ordinary admission is exhausted, holding its slot and pool record until the evidence arrives" $ do
@@ -400,7 +386,7 @@ spec = describe "Frames" $ do
       _ ← progress rig
       phaseOf rig (ownedFrame frame) `shouldReturn` Just FrameRetiring
       imagesOwned (rigStandIn rig) `shouldReturn'` (`shouldSatisfy` (not . null))
-      retireTargetFrames (rigFrames rig) (rigTarget rig) `raises` \(FramesRetained _ frames _) → frames == [ownedFrame frame]
+      retireTargetFrames (rigFrames rig) (rigTarget rig) `raises` \(FramesRetained _ frames _ _ _) → frames == [ownedFrame frame]
       clean rig
 
     it "retains a frame whose release raised, never fabricating a reusable image, and keeps its slot" $ do
@@ -416,7 +402,7 @@ spec = describe "Frames" $ do
       clearFrameStep (rigStandIn rig) AtRelease
       _ ← progress rig
       length . filter isRelease <$> frameCalls (rigStandIn rig) `shouldReturn` 1
-      retireTargetFrames (rigFrames rig) (rigTarget rig) `raises` \(FramesRetained _ frames _) → frames == [ownedFrame frame]
+      retireTargetFrames (rigFrames rig) (rigTarget rig) `raises` \(FramesRetained _ frames _ _ _) → frames == [ownedFrame frame]
       clean rig
 
     it "preserves a frame whose consumer raised, runs that consumer once, and skips it safely" $ do
@@ -543,220 +529,3 @@ spec = describe "Frames" $ do
       phaseOf rig (ownedFrame frame) `shouldReturn` Nothing
       imagesOwned (rigStandIn rig) `shouldReturn` []
       clean rig
-
--- ---------------------------------------------------------------------------
--- The rig
-
-data Rig = Rig
-  { rigStandIn ∷ !FramesStandIn
-  , rigRoots ∷ !StandInRoots
-  , rigGenerations ∷ !(Generations () Int Int Text Int)
-  , rigRecording ∷ !(Recording () Int Int Text Int Word64)
-  , rigFrames ∷ !(Frames () Int Int Text Int Word64)
-  , rigTarget ∷ !TargetId
-  , rigStorages ∷ ![FrameStorage]
-  , rigCommands ∷ ![Word64]
-  }
-
--- | Started roots over the stand-in, one target on surface 10 with a 640 by
--- 480 generation of three images, a recording, the frames, and a storage for
--- each of the target's two frame slots.
-newRig ∷ IO Rig
-newRig = newRigWith 2
-
-newRigWith ∷ Integer → IO Rig
-newRigWith slots = newRigWithActions slots 32
-
--- | 'newRigWith' with this many progress actions a step.
-newRigWithActions ∷ Integer → Integer → IO Rig
-newRigWithActions slots actions = do
-  rootsStandIn ← newStandIn
-  roots ← newStandInRoots rootsStandIn (either (error . show) id (validateBudgets defaultBudgetRequest {requestedFrameSlots = slots, requestedProgressActions = actions}))
-  _ ← startRoots roots standardRequest
-  target ← admitRootTarget roots OptionalTarget (surfaceNumbered rootsStandIn 10) >>= either (fail . show) pure
-  generations ← newGenerations roots
-  atomically (trackTarget generations target OptionalTarget 10)
-  _ ← stepGenerations generations (at 0) (Map.singleton target (TargetGeometry (Right ()) (Just (SurfaceExtent 640 480)) Nothing 1))
-  recordingStandIn ← newRecordingStandIn
-  recording ← newRecording (recordingStandInOps recordingStandIn) roots generations
-  standIn ← newFramesStandIn
-  frames ← newFrames (framesStandInOps standIn) recording
-  storages ← mapM (\slot → createFrameStorage recording target slot >>= either (fail . show) pure) [0 .. fromIntegral slots - 1]
-  views ← atomically (readManaged recording)
-  let commands = [handle | ManagedView _ _ "frame storage" [handle] ← views]
-  pure (Rig standIn roots generations recording frames target storages commands)
-
--- | The command buffer of a slot's storage: the stand-in allocates it right
--- after the pool, so it is the pool's number plus one.
-commandsOf ∷ Rig → Natural → Word64
-commandsOf rig slot = (rigCommands rig !! fromIntegral slot) + 1
-
-acquired ∷ Rig → IO Acquisition
-acquired rig = tryAcquireFrame (rigFrames rig) (rigTarget rig) >>= either (fail . ("the acquisition was refused: " <>) . show) pure
-
-owned ∷ Rig → IO OwnedFrame
-owned rig =
-  acquired rig >>= \case
-    AcquisitionOwned frame → pure frame
-    other → fail ("no frame was acquired: " <> show other)
-
--- | An empty batch, sealed, for the frame.
-sealed ∷ Rig → OwnedFrame → IO BatchId
-sealed rig frame = fst <$> (recordFrame (rigRecording rig) (ownedFrame frame) (\_ → pure ()) >>= either (fail . ("the recording was refused: " <>) . show) pure)
-
-submitted ∷ Rig → NonEmpty BatchId → IO SubmissionId
-submitted rig batches =
-  submitFrames (rigFrames rig) batches >>= \case
-    Right (SubmittedAs submission) → pure submission
-    other → fail ("the submission answered " <> show other)
-
-progress ∷ Rig → IO Progress
-progress rig = progressFrames (rigFrames rig) (at 1)
-
--- | Complete everything pending and step, until no frame is being abandoned
--- and nothing is pending.
-settleAll ∷ Rig → IO ()
-settleAll rig = go (8 ∷ Int)
-  where
-    go 0 = expectationFailure "the frames did not settle in eight steps"
-    go remaining = do
-      completeAll (rigStandIn rig)
-      report ← progress rig
-      abandoning ← filter (abandoningStage . standingStage) <$> atomically (readFrameStandings (rigFrames rig))
-      pending ← pendingFences (rigStandIn rig)
-      when (not (null abandoning) || not (null pending) || progressOutstanding report > 0) (go (remaining - 1))
-    abandoningStage = \case
-      StageSkipping → True
-      StageClosing _ → True
-      StageSettling → True
-      _ → False
-
-ok ∷ Show refusal ⇒ IO (Either refusal ()) → IO ()
-ok action = action >>= either (fail . ("refused: " <>) . show) pure
-
--- | Require that no call broke a rule the stand-in holds the frames to.
-clean ∷ Rig → Expectation
-clean rig = violations (rigStandIn rig) `shouldReturn` []
-
--- | Run the action on this, the owner's, thread, with a cancellation aimed at
--- it from inside the first call the predicate selects: it can be delivered
--- only once the handoff that call is part of has recorded its result.
-cancelled ∷ Show a ⇒ Rig → (FrameCall → Bool) → IO a → IO ()
-cancelled rig selected action = do
-  owner ← myThreadId
-  armed ← newIORef True
-  duringFrameCall (rigStandIn rig) $ \call → when (selected call) $ do
-    first ← atomicModifyIORef' armed (\armed' → (False, armed'))
-    when first $ do
-      killer ← forkIO (killThread owner)
-      awaitThrowing killer
-  outcome ← try @SomeException action
-  duringFrameCall (rigStandIn rig) (\_ → pure ())
-  case outcome of
-    Left failure → fromException failure `shouldBe` Just ThreadKilled
-    Right value → expectationFailure ("the cancellation was not delivered: " <> show value)
-
-awaitThrowing ∷ ThreadId → IO ()
-awaitThrowing thread =
-  threadStatus thread >>= \case
-    ThreadBlocked BlockedOnException → pure ()
-    ThreadFinished → pure ()
-    _ → yield >> awaitThrowing thread
-
-inModel ∷ Rig → (GpuModel → Outcome GpuModel) → IO ()
-inModel rig operation = atomically $ stateRootsModel (rigRoots rig) $ \model → case operation model of
-  Admitted next → ((), next)
-  _ → error "the model refused the operation"
-
--- | Fill the object budget, so nothing more can be admitted.
-exhaust ∷ Rig → IO ()
-exhaust rig = atomically $ stateRootsModel (rigRoots rig) $ \model →
-  let remaining = objectLimit (modelBudgets model) - usageObjects (usage model)
-   in case beginAllocation 0 remaining model of
-        Admitted (next, _) → ((), next)
-        _ → error "the budget could not be filled"
-
-modelOf ∷ Rig → IO GpuModel
-modelOf rig = atomically (readRootsModel (rigRoots rig))
-
-frameOf ∷ Rig → FrameSlotId → IO (Maybe FrameView)
-frameOf rig frame = frameView frame <$> modelOf rig
-
-phaseOf ∷ Rig → FrameSlotId → IO (Maybe FramePhase)
-phaseOf rig frame = fmap viewFramePhase <$> frameOf rig frame
-
-targetOf ∷ Rig → IO TargetView
-targetOf rig = modelOf rig >>= maybe (fail "the target is not the model's") pure . targetView (rigTarget rig)
-
-generationsOf ∷ Rig → IO TargetGenerationsView
-generationsOf rig = atomically (readTargetGenerations (rigGenerations rig) (rigTarget rig)) >>= maybe (fail "the target is not tracked") pure
-
-activeGeneration ∷ Rig → IO GenerationId
-activeGeneration rig = generationsOf rig >>= maybe (fail "the target has no active generation") pure . viewActive
-
-submittedOn ∷ Rig → HoldSubject → IO [SubmissionId]
-submittedOn rig subject = maybe [] viewSubmitted . holdView subject <$> modelOf rig
-
-standingOf ∷ Rig → FrameSlotId → IO (Maybe FrameStage)
-standingOf rig frame = lookup frame . map (\standing → (standingFrame standing, standingStage standing)) <$> atomically (readFrameStandings (rigFrames rig))
-
-acquisitionState ∷ Rig → FrameSlotId → IO (Maybe SemaphoreState)
-acquisitionState rig frame =
-  lookup (frameSlotNumber frame) . map (\view → (viewSlotNumber view, syncAcquireState (viewSlotSync view))) <$> atomically (readSlots (rigFrames rig))
-
-raises ∷ ∀ e a. (Exception e, Show a) ⇒ IO a → (e → Bool) → Expectation
-raises action expected =
-  try @e action >>= \case
-    Left failure → unless (expected failure) (expectationFailure ("an unexpected failure: " <> show failure))
-    Right value → expectationFailure ("nothing was raised: " <> show value)
-
-shouldReturn' ∷ IO a → (a → IO ()) → IO ()
-shouldReturn' action assertion = action >>= assertion
-
-partialStanding ∷ BatchStanding → Bool
-partialStanding = \case
-  BatchPartial _ → True
-  _ → False
-
-uncertainStage, failedStage, submittedStage ∷ FrameStage → Bool
-uncertainStage = \case
-  StageUncertain _ → True
-  _ → False
-failedStage = \case
-  StageFailed _ → True
-  _ → False
-submittedStage = \case
-  StageSubmitted _ → True
-  _ → False
-
-kind ∷ FrameCall → Text
-kind = \case
-  CreatedSemaphore _ → "semaphore"
-  CreatedFence _ → "fence"
-  Acquired {} → "acquire"
-  _ → "other"
-
-isSubmission, isQuery, isRelease, isAcquisition, isCleanup, isDestruction ∷ FrameCall → Bool
-isSubmission = \case
-  Submitted {} → True
-  _ → False
-isQuery = \case
-  QueriedFence _ → True
-  _ → False
-isRelease = \case
-  Released {} → True
-  _ → False
-isAcquisition = \case
-  Acquired {} → True
-  _ → False
-isCleanup = \case
-  Submitted batches _ → all (\(_, _, commands, _) → null commands) batches
-  _ → False
-isDestruction = \case
-  DestroyedSemaphore _ → True
-  DestroyedFence _ → True
-  _ → False
-
--- | The instant this many milliseconds after the scripted clock's origin.
-at ∷ Integer → Instant
-at milliseconds = scriptedInstant (either (error . show) id (durationFromNanoseconds AllowZero (milliseconds * 1000000)))

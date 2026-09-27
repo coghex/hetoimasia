@@ -253,6 +253,14 @@ createReadback' memory atom device bytes = do
 -- color-attachment stage, which is where an acquisition's semaphore wait is
 -- made; leaving it makes the attachment writes available to the copy or to
 -- presentation.
+--
+-- A transition to presentation names every stage as its destination, with no
+-- access: the presentation engine's read needs no visibility operation, but
+-- the layout transition itself must happen before the render-finished
+-- semaphore's signal, which the frames make at every stage. A destination of
+-- no stage would chain the transition into nothing that follows it, and
+-- synchronization validation reports the presentation's read as a hazard
+-- (@SYNC-HAZARD-PRESENT-AFTER-WRITE@).
 transitionScopes ∷ ImageLayout → ImageLayout → Maybe ((PipelineStageFlags2, AccessFlags2), (PipelineStageFlags2, AccessFlags2))
 transitionScopes from to = case (from, to) of
   (LayoutUndefined, LayoutColorAttachment) →
@@ -260,9 +268,9 @@ transitionScopes from to = case (from, to) of
   (LayoutColorAttachment, LayoutTransferSource) →
     Just ((PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT), (PIPELINE_STAGE_2_COPY_BIT, ACCESS_2_TRANSFER_READ_BIT))
   (LayoutColorAttachment, LayoutPresentSource) →
-    Just ((PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT), (PIPELINE_STAGE_2_NONE, ACCESS_2_NONE))
+    Just ((PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT), (PIPELINE_STAGE_2_ALL_COMMANDS_BIT, ACCESS_2_NONE))
   (LayoutTransferSource, LayoutPresentSource) →
-    Just ((PIPELINE_STAGE_2_COPY_BIT, ACCESS_2_NONE), (PIPELINE_STAGE_2_NONE, ACCESS_2_NONE))
+    Just ((PIPELINE_STAGE_2_COPY_BIT, ACCESS_2_NONE), (PIPELINE_STAGE_2_ALL_COMMANDS_BIT, ACCESS_2_NONE))
   _ → Nothing
 
 nativeLayout ∷ ImageLayout → Core10.ImageLayout

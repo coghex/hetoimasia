@@ -24,6 +24,8 @@ module Test.Vulkan.Proof.Interop
   , createProofWindow
   , destroyProofWindow
   , pollEvents
+  , setWindowSize
+  , framebufferSize
   , createWindowSurface
   , lastGlfwError
 
@@ -76,6 +78,12 @@ foreign import ccall safe "hetoimasia_proof_destroy_window"
 
 foreign import ccall safe "hetoimasia_proof_poll_events"
   c_pollEvents ∷ IO ()
+
+foreign import ccall safe "hetoimasia_proof_set_window_size"
+  c_setWindowSize ∷ Ptr ProofWindow → CInt → CInt → IO ()
+
+foreign import ccall safe "hetoimasia_proof_framebuffer_size"
+  c_framebufferSize ∷ Ptr ProofWindow → Ptr CInt → Ptr CInt → IO ()
 
 foreign import ccall safe "hetoimasia_proof_create_window_surface"
   c_createWindowSurface ∷ Ptr () → Ptr ProofWindow → Ptr Word64 → IO CInt
@@ -136,6 +144,18 @@ destroyProofWindow = c_destroyWindow
 
 pollEvents ∷ IO ()
 pollEvents = c_pollEvents
+
+-- | Ask the platform to resize the window, in screen coordinates. The new
+-- size is the platform's to apply, and may arrive only with later events.
+setWindowSize ∷ Ptr ProofWindow → Int → Int → IO ()
+setWindowSize window width height = c_setWindowSize window (fromIntegral width) (fromIntegral height)
+
+-- | The window's framebuffer, in pixels.
+framebufferSize ∷ Ptr ProofWindow → IO (Int, Int)
+framebufferSize window =
+  with 0 $ \width → with 0 $ \height → do
+    c_framebufferSize window width height
+    (,) <$> (fromIntegral <$> peek width) <*> (fromIntegral <$> peek height)
 
 -- | @glfwCreateWindowSurface@. The @Int@ is the @VkResult@ the platform
 -- returned; the @Word64@ is the surface handle, meaningful only on success.

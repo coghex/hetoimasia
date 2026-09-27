@@ -49,6 +49,13 @@ hetoimasia_proof_window *hetoimasia_proof_create_window(int width, int height, c
 void hetoimasia_proof_destroy_window(hetoimasia_proof_window *window);
 void hetoimasia_proof_poll_events(void);
 
+/* `glfwSetWindowSize`, in screen coordinates: the resize VK-13's native case
+ * makes, whatever the window's resizable hint says about the user. */
+void hetoimasia_proof_set_window_size(hetoimasia_proof_window *window, int width, int height);
+
+/* `glfwGetFramebufferSize`, in pixels. */
+void hetoimasia_proof_framebuffer_size(hetoimasia_proof_window *window, int *width, int *height);
+
 /* `glfwCreateWindowSurface`. `surface` receives the non-dispatchable handle as
  * the 64-bit value every 64-bit Vulkan ABI gives it. Returns the `VkResult`. */
 int hetoimasia_proof_create_window_surface(void *instance,

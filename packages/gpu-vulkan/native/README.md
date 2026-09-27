@@ -4,8 +4,8 @@ Buildable package: `hetoimasia-gpu-vulkan-native`, in `packages/gpu-vulkan/nativ
 
 The package that owns the Vulkan binding, the handles and the calls: VK-6's
 diagnostic messengers, VK-9's shader adapter, VK-7's roots, VK-10's
-swapchain generations, VK-11's managed resources and recorder, and VK-12's
-frames. It depends on no window system: a surface reaches it as a 64-bit handle and the action that
+swapchain generations, VK-11's managed resources and recorder, and VK-12's and
+VK-13's frames. It depends on no window system: a surface reaches it as a 64-bit handle and the action that
 destroys it.
 
 - `Hetoimasia.GPU.Vulkan.Native.Profile` is the runtime profile as pure
@@ -73,24 +73,33 @@ destroys it.
   module writes which part of it (see
   [the backend contract](../../../docs/gpu_backend.md#how-the-recording-is-built)).
 - `Hetoimasia.GPU.Vulkan.Native.Frames` is VK-12's acquisition, submission and
-  safe abandonment over the recording and an open native layer (`FrameOps`):
+  safe abandonment and VK-13's presentation over the recording and an open
+  native layer (`FrameOps`):
   `tryAcquireFrame` reserves in the model before a zero-timeout acquisition and
   answers an owned frame or a typed pending, suspended, closing or unavailable
   outcome; `submitFrames` validates a whole request before resetting one fence
   and submitting its sealed batches as one native submission every frame
   shares; `skipFrame` invalidates an unsubmitted frame's recording and makes a
   cleanup submission waiting on its acquisition semaphore;
-  `closeUnpresentedFrame` closes a submitted frame never presented; and
-  `progressFrames`, the owner's bounded step, observes only pending fences,
-  settles a closed frame's render-finished semaphore through a cleanup
+  `presentFrame` presents a submitted frame's image waiting on its
+  render-finished semaphore, with a present fence chained through
+  `VK_EXT_swapchain_maintenance1`, and reads what was enqueued from the
+  swapchain's own entry of `pResults`; `closeUnpresentedFrame` closes a
+  submitted frame never presented; `progressFrames`, the owner's bounded step,
+  observes only pending fences, retires a presentation only on its own present
+  fence, settles a closed frame's render-finished semaphore through a cleanup
   submission once its rendering completed, and returns images through
-  `vkReleaseSwapchainImagesEXT`. Each frame slot's two semaphores and two fences
-  are made before its first acquisition. Every native effect and its
-  bookkeeping are one masked step, and an unknown effect is retained for ever
-  with admission stopped. It is the entry point only: its code lives in private
-  modules under `Hetoimasia.GPU.Vulkan.Native.Internal.Frames` — `Layer`,
-  `State`, `Acquisition`, `Submission` and `Abandonment` — which it re-exports
-  unchanged (see
+  `vkReleaseSwapchainImagesEXT`; and `awaitFrames` is that step after a finite
+  drain wait of at most 10 ms, which is never evidence. Each frame slot's
+  acquisition semaphore and two fences are made before its first acquisition,
+  and each target's presentation pool — a render-finished semaphore and a
+  present fence per record, bounded by the model's derived pool capacity —
+  binds a record to every frame at its reservation. Every native effect and
+  its bookkeeping are one masked step, and an unknown effect is retained for
+  ever with admission stopped. It is the entry point only: its code lives in
+  private modules under `Hetoimasia.GPU.Vulkan.Native.Internal.Frames` —
+  `Layer`, `State`, `Acquisition`, `Submission`, `Presentation`,
+  `Abandonment` and `Progress` — which it re-exports unchanged (see
   [the backend contract](../../../docs/gpu_backend.md#frames-acquisition-submission-and-abandonment)).
   `Hetoimasia.GPU.Vulkan.Native.Frames.Vulkan` is its production layer, the
   binding's own `safe` calls.
@@ -129,7 +138,8 @@ destroys it.
   binding-wide flags `cabal.project.vulkan` constrains, the C-only capture
   callback, no Haskell callbacks, and the audited recording subset — the only
   genuine `unsafe` imports, which the headless suite holds to the package's
-  import declarations. Nothing here presents yet.
+  import declarations. Presentation is the frames' own `safe` call, not
+  recording, so it adds nothing to that subset.
 
 It is listed only in `cabal.project.vulkan`, beside its local dependency closure
 — the diagnostics package, `hetoimasia-gpu-vulkan-model`, the foundation, and

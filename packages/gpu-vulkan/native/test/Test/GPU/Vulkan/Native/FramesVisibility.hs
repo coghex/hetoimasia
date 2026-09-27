@@ -58,7 +58,7 @@ implementationModules ∷ [String]
 implementationModules =
   map
     ("Hetoimasia.GPU.Vulkan.Native.Internal.Frames." <>)
-    ["Abandonment", "Acquisition", "Layer", "State", "Submission"]
+    ["Abandonment", "Acquisition", "Layer", "Presentation", "Progress", "State", "Submission"]
 
 supportedClient ∷ String
 supportedClient =
@@ -78,6 +78,8 @@ supportedClient =
       , "AcquireResult (..)"
       , "WaitStage (..)"
       , "SubmitBatch (..)"
+      , "PresentRequest (..)"
+      , "PresentStatus (..)"
       , "Frames"
       , "newFrames"
       , "tryAcquireFrame"
@@ -86,10 +88,16 @@ supportedClient =
       , "PendingReason (..)"
       , "submitFrames"
       , "Submitted (..)"
+      , "presentFrame"
+      , "Presented (..)"
+      , "PresentReading (..)"
+      , "classifyPresent"
       , "skipFrame"
       , "closeUnpresentedFrame"
       , "closeTargetFrames"
       , "progressFrames"
+      , "awaitFrames"
+      , "drainWaitLimit"
       , "Progress (..)"
       , "retireTargetFrames"
       , "FrameStage (..)"
@@ -101,9 +109,17 @@ supportedClient =
       , "SlotView (..)"
       , "readSlots"
       , "readOutstandingSubmissions"
+      , "PoolHolder (..)"
+      , "PoolSync (..)"
+      , "PoolView (..)"
+      , "readPool"
+      , "PresentStanding (..)"
+      , "PresentationStanding (..)"
+      , "readPresentations"
       , "FrameEffectUncertain (..)"
       , "FrameCleanupFailed (..)"
       , "FramesRetained (..)"
+      , "PresentationUncertain (..)"
       ]
 
 importing ∷ String → String

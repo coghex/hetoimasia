@@ -94,13 +94,15 @@ library
     -- expose steps, such as retiring completed batches, that only another
     -- stage may take. See packages/gpu-vulkan/native/README.md.
     --
-    -- Internal.Frames.* is VK-12's acquisition, submission and abandonment,
-    -- split by responsibility as the recording is; Frames re-exports its
-    -- public names. Each is private because it exports what clients must never
-    -- reach: Layer is the native layer's shape, re-exported whole; State holds
-    -- the slot, frame and submission records and the constructor of Frames,
-    -- which Frames exports only abstractly; Acquisition, Submission and
-    -- Abandonment each own one stage of a frame's life.
+    -- Internal.Frames.* is VK-12's acquisition, submission and abandonment
+    -- and VK-13's presentation, split by responsibility as the recording is;
+    -- Frames re-exports its public names. Each is private because it exports
+    -- what clients must never reach: Layer is the native layer's shape,
+    -- re-exported whole; State holds the slot, pool, frame, submission and
+    -- presentation records and the constructor of Frames, which Frames exports
+    -- only abstractly; Acquisition, Submission, Presentation, Abandonment and
+    -- Progress each own one stage of a frame's life, and Abandonment exposes
+    -- the cleanup submission only Progress may also make.
     --
     -- Internal.Generations.* is the swapchain generations' implementation,
     -- split by responsibility (#266); Generations re-exports its public names
@@ -117,6 +119,8 @@ library
         Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Abandonment
         Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Acquisition
         Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Layer
+        Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Presentation
+        Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Progress
         Hetoimasia.GPU.Vulkan.Native.Internal.Frames.State
         Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Submission
         Hetoimasia.GPU.Vulkan.Native.Internal.Generations.Disposal
@@ -238,6 +242,8 @@ test-suite native-tests
     hs-source-dirs: test
     other-modules:
         Test.GPU.Vulkan.Native.Frames
+        Test.GPU.Vulkan.Native.FramesPresentation
+        Test.GPU.Vulkan.Native.FramesRig
         Test.GPU.Vulkan.Native.FramesStandIn
         Test.GPU.Vulkan.Native.FramesVisibility
         Test.GPU.Vulkan.Native.Generations
