@@ -1350,20 +1350,27 @@ with a compare-and-swap before either sets its own latch, so a sink failure
 followed by a validation error before the next checkpoint stays the primary
 with the error beside it, and the other way round, whichever thread got there
 first. A checkpoint that looks after the first failure claimed the cell but
-before it set its own alarm latches nothing and lets the next checkpoint latch
-both in order, rather than latching the later one first. It raises nothing, calls nothing native and waits
-for nothing. The owner's ordinary operations pass through one:
+before it set its own alarm is told only that a failure is pending
+(`CaptureAlarmPending`, `AlarmPending`): it answers `CheckpointPending`,
+latches nothing — neither the capture's alarms nor a failure the model recorded
+by itself, which might otherwise be taken ahead of the diagnostic failure that
+came first — and refuses new work, so the next checkpoint latches them in order
+and admission never reopens in between. It raises nothing, calls nothing native
+and waits for nothing. The owner's ordinary operations pass through one:
 
 - the controller's progress step raises the primary — the loss as
   `GraphicsDeviceLost`, anything else as `GraphicsSessionFailed` — which ends
   the owner's run: the owner machinery latches it, closes its admission, and
   `superviseGraphicsOwner` raises it at the application's checkpoint while
-  retirement is still running;
+  retirement is still running; while a failure is pending it does nothing new
+  that round and asks for another within the controller's poll;
 - `recordFrame`, `tryAcquireFrame`, `submitFrames` and `presentFrame` refuse
-  with `RefusedSessionFailed` naming the primary before anything native;
-- `handOverVulkanTarget` answers `VulkanSessionFailed` naming the primary and
-  attaches nothing, and a construction the owner had already taken is rejected
-  with `RejectedSessionFailed`.
+  with `RefusedSessionFailed` naming the primary before anything native, or
+  with `RefusedDiagnosticPending` while a failure is pending;
+- `handOverVulkanTarget` answers `VulkanSessionFailed` naming the primary, or
+  `VulkanDiagnosticPending` while a failure is pending, and attaches nothing;
+  a construction the owner had already taken is rejected with
+  `RejectedSessionFailed`.
 
 Retirement never passes through one. Closing and skipping frames, the
 progress step's observations, the finite drain wait, and every target's,
@@ -1671,8 +1678,11 @@ the loss still raised; an uncertain effect with no loss retaining its
 frame, its generation, the surface and the roots through the whole teardown; a
 validation error from the capture's watch refusing the next rendering and
 acquisition with no native call, then settling what was owned under the
-ordinary rules; a sink failure latched as a status of its own, authorizing no
-release, and a sink failure and a validation error after a loss joining the
+ordinary rules; a pending diagnostic failure refusing rendering and
+acquisition with `RefusedDiagnosticPending`, latching nothing and leaving the
+model running, until the capture's alarms name the sink failure as the primary
+with the error beside it; a sink failure latched as a status of its own,
+authorizing no release, and a sink failure and a validation error after a loss joining the
 evidence behind it; and a required target's exhausted recovery failing the
 session and refusing the other target, while an optional target's leaves the
 other rendering. The model's own suite adds `Device loss`: the loss kept beside
@@ -1690,7 +1700,11 @@ although a full capture dropped its record, since the latch is set before the
 record is admitted; a sink failure latched as
 its own status, with the verdict's consumer unsuccessful and no error latched;
 a sink failure that came before a validation error, both pending at one
-checkpoint, kept as the primary with the error beside it;
+checkpoint, kept as the primary with the error beside it; a handover while the
+capture's sink had claimed the order but not published its failure, with an
+error latched after it, refused as `VulkanDiagnosticPending` with nothing
+latched or attached, and the next handover, once the failure is published,
+refused naming the sink failure with the error beside it;
 an exit whose surface destruction failed, reporting the cleanup failure as its
 primary and what it retained beside it; a surface still in its native call when
 the drain closed the lease, whose destruction then failed, latched as a cleanup
@@ -1701,9 +1715,9 @@ delivered three times
 while the drain that follows a loss holds, leaving the destruction order and the
 loss as they were. The diagnostics suite adds the sink failure observable while
 the lifetime still captures, `captureAlarms` answering a sink failure and an
-error in the order they happened, either way round, and answering nothing while
-a sink that claimed the order has not yet published its failure and an error
-has latched after it.
+error in the order they happened, either way round, and answering only
+`CaptureAlarmPending` while a sink that claimed the order has not yet published
+its failure and an error has latched after it.
 
 #266's examples, `Generations visibility across the package boundary`, compile
 external clients the same way: one that imports every name the public

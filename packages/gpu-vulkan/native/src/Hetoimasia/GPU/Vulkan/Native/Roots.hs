@@ -155,6 +155,7 @@ module Hetoimasia.GPU.Vulkan.Native.Roots
   , TerminalReport (..)
   , GraphicsSessionFailed (..)
   , DiagnosticAlarm (..)
+  , Checkpoint (..)
   , terminalEvidenceLimit
   , latchTerminal
   , noteTeardownEvidence
@@ -735,9 +736,13 @@ latchDeviceLoss roots loss = atomically (latchTerminal roots (TerminalDeviceLost
 -- | A checkpoint that raises: the latched primary failure, if there is one —
 -- the loss as itself, anything else as 'GraphicsSessionFailed'. It is what a
 -- progress step calls, so an owner whose failure was latched outside a call
--- it made still ends its run with that failure.
+-- it made still ends its run with that failure. A pending diagnostic failure
+-- raises nothing here; the checkpoint that can latch it raises it.
 checkRoots ∷ Roots q inst msgr phys dev → IO ()
-checkRoots roots = checkpointRoots roots >>= maybe (pure ()) (throwIO . terminalFailure)
+checkRoots roots =
+  checkpointRoots roots >>= \case
+    CheckpointFailed primary → throwIO (terminalFailure primary)
+    _ → pure ()
 
 -- ---------------------------------------------------------------------------
 -- The terminal latch
@@ -819,6 +824,22 @@ data DiagnosticAlarm
     -- ^ The capture's error latch is set.
   | AlarmSinkFailed !Text
     -- ^ The capture's consumer met a sink failure.
+  | AlarmPending
+    -- ^ A diagnostic failure has happened, but the capture cannot yet say
+    -- which came first: admission stays closed, and nothing is latched until
+    -- it can.
+  deriving (Eq, Show)
+
+-- | What a checkpoint answers.
+data Checkpoint
+  = CheckpointClear
+    -- ^ No failure is known: new work may proceed.
+  | CheckpointFailed !TerminalCause
+    -- ^ The session has failed, with this primary.
+  | CheckpointPending
+    -- ^ A diagnostic failure has happened whose order is not yet readable:
+    -- new work is refused, nothing is latched, and a later checkpoint latches
+    -- it in order.
   deriving (Eq, Show)
 
 -- | The model's cause, for a terminal cause.
@@ -902,29 +923,39 @@ watchRootsDiagnostics roots = writeTVar (rootsWatch roots)
 -- itself as the primary if nothing was latched before it, and answer the
 -- primary. It raises nothing, calls nothing native, and waits for nothing.
 --
+-- While the capture says a failure is pending ('AlarmPending'), it latches
+-- nothing — neither the capture's alarms nor the model's own failure, which
+-- might otherwise be taken ahead of the diagnostic failure that came first —
+-- and answers an earlier primary if there is one, 'CheckpointPending'
+-- otherwise, so admission stays closed until a later checkpoint can latch
+-- them in order.
+--
 -- Only the owner's ordinary operations checkpoint. Retirement does not: it
 -- runs because the session has failed, and a checkpoint there would only
 -- rethrow that.
-checkpointRoots ∷ Roots q inst msgr phys dev → IO (Maybe TerminalCause)
+checkpointRoots ∷ Roots q inst msgr phys dev → IO Checkpoint
 checkpointRoots roots = do
   alarms ← join (readTVarIO (rootsWatch roots))
-  atomically $ do
-    mapM_
-      ( latchTerminal roots . \case
-          AlarmValidationError → TerminalValidationError
-          AlarmSinkFailed reason → TerminalSinkFailed reason
-      )
-      alarms
-    report ← readTVar (rootsTerminal roots)
-    case reportPrimary report of
-      Just primary → pure (Just primary)
-      Nothing → do
-        model ← readTVar (rootsModel roots)
-        case fromModel model of
-          Nothing → pure Nothing
-          Just first → do
-            latchTerminal roots first
-            pure (Just first)
+  atomically $
+    if AlarmPending `elem` alarms
+      then maybe CheckpointPending CheckpointFailed . reportPrimary <$> readTVar (rootsTerminal roots)
+      else do
+        mapM_ (latchTerminal roots) [cause | Just cause ← map alarmCause alarms]
+        report ← readTVar (rootsTerminal roots)
+        case reportPrimary report of
+          Just primary → pure (CheckpointFailed primary)
+          Nothing → do
+            model ← readTVar (rootsModel roots)
+            case fromModel model of
+              Nothing → pure CheckpointClear
+              Just first → do
+                latchTerminal roots first
+                pure (CheckpointFailed first)
+  where
+    alarmCause = \case
+      AlarmValidationError → Just TerminalValidationError
+      AlarmSinkFailed reason → Just (TerminalSinkFailed reason)
+      AlarmPending → Nothing
 
 -- | The terminal latch, as any thread may read it. A failure the model
 -- recorded by itself and no checkpoint has latched yet is answered as the

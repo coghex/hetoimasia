@@ -222,9 +222,10 @@ import Hetoimasia.GPU.Vulkan.Native.Roots
   , TeardownEvidence (..)
   , TerminalCause (..)
   , TerminalReport (..)
+  , Checkpoint (..)
   , admitRootTarget
-  , checkRoots
   , checkpointRoots
+  , terminalFailure
   , latchTerminal
   , noteTeardownEvidence
   , readRootsTerminal
@@ -322,6 +323,9 @@ data State inst msgr phys dev lease obligation = State
     -- announcement the owner's full port refused. Written by the main
     -- thread's handover; the owner's step settles each once its slot has
     -- begun retiring.
+  , stateDiagnosticPending ∷ !(TVar Bool)
+    -- ^ Whether the owner's last step found a diagnostic failure pending, so
+    -- it looks again within its poll. The owner thread's alone.
   , stateUncertainSurfaces ∷ !(TVar (Set Word64))
     -- ^ The surfaces whose destruction did not complete and was latched, so
     -- a later pass the bridge refuses latches none of them again.
@@ -400,6 +404,7 @@ newVulkanControllerWith hooks ops pointer bridge layers validation budgets clock
       <*> newTVarIO Map.empty
       <*> newTVarIO Map.empty
       <*> newTVarIO Map.empty
+      <*> newTVarIO False
       <*> newTVarIO Set.empty
       <*> pure clock
       <*> pure poll
@@ -489,8 +494,22 @@ controllerOperations (VulkanController state) =
   GraphicsOperations
     { graphicsStartOwner = \_ → startOwner state
     , graphicsConstructTarget = constructTarget state
-    , graphicsStep = \step → do
-        checkRoots (stateRoots state)
+    , graphicsStep = \step →
+        checkpointRoots (stateRoots state) >>= \case
+          CheckpointFailed primary → throwIO (terminalFailure primary)
+          -- A diagnostic failure whose order is not yet readable: this round
+          -- does nothing new, and the owner looks again within its poll.
+          CheckpointPending → noStepWork <$ atomically (writeTVar (stateDiagnosticPending state) True)
+          CheckpointClear → do
+            atomically (writeTVar (stateDiagnosticPending state) False)
+            progress step
+    , graphicsNextDeadline = ownerDeadline state
+    , graphicsRetireTarget = \retiring → retaining state (retireTarget state retiring)
+    , graphicsRetireOwner = retaining state . retireOwner state
+    , graphicsDestroyOwner = \_ → retaining state (destroyOwner state)
+    }
+  where
+    progress step = do
         settled ← settleUnannounced state
         mapped ← readTVarIO (stateTargets state)
         let geometries =
@@ -502,11 +521,6 @@ controllerOperations (VulkanController state) =
                 ]
         summary ← stepGenerations (stateGenerations state) (stepNow step) geometries
         pure (if settled || summaryAdvanced summary then noStepWork {stepAdvanced = True} else noStepWork)
-    , graphicsNextDeadline = ownerDeadline state
-    , graphicsRetireTarget = \retiring → retaining state (retireTarget state retiring)
-    , graphicsRetireOwner = retaining state . retireOwner state
-    , graphicsDestroyOwner = \_ → retaining state (destroyOwner state)
-    }
 
 -- | Run a retirement, and if it could not verify what it owns, keep that in
 -- the terminal report as retained before the failure goes on to the owner,
@@ -602,12 +616,13 @@ targetGeometry view =
     physical extent = SurfaceExtent (dimension (Window.extentWidth extent)) (dimension (Window.extentHeight extent))
     dimension = fromIntegral . max 0 . min (fromIntegral (maxBound ∷ Word32))
 
--- | A round soon, while an unannounced attachment is being watched; otherwise
--- none.
+-- | A round soon, while an unannounced attachment is being watched or a
+-- diagnostic failure is pending; otherwise none.
 unannouncedDeadline ∷ State inst msgr phys dev lease obligation → IO NextDeadline
 unannouncedDeadline state = do
-  watching ← not . Map.null <$> readTVarIO (stateUnannounced state)
-  if not watching
+  unannounced ← not . Map.null <$> readTVarIO (stateUnannounced state)
+  pending ← readTVarIO (stateDiagnosticPending state)
+  if not (unannounced || pending)
     then pure NoOwnerDemand
     else do
       now ← readInstant (stateClock state)
@@ -863,6 +878,9 @@ data VulkanHandover
   | VulkanSessionFailed !TerminalCause
     -- ^ The graphics session has failed, with this primary failure. Nothing
     -- was attached: a failed session admits no target.
+  | VulkanDiagnosticPending
+    -- ^ A diagnostic failure has happened whose order the capture cannot yet
+    -- say. Nothing was attached; a later handover names the primary.
   deriving (Show)
 
 -- | Create one window's surface on the main thread, under its attachment, and
@@ -883,8 +901,9 @@ handOverVulkanTarget
 handOverVulkanTarget (VulkanController state) host owner window classification =
   mask $ \restore →
     checkpointRoots (stateRoots state) >>= \case
-      Just primary → pure (VulkanSessionFailed primary)
-      Nothing → handOver restore
+      CheckpointFailed primary → pure (VulkanSessionFailed primary)
+      CheckpointPending → pure VulkanDiagnosticPending
+      CheckpointClear → handOver restore
   where
     handOver restore =
      readTVarIO (stateLease state) >>= \case
@@ -1074,6 +1093,7 @@ diagnosticAlarms capture =
     ( \case
         CaptureErrorLatched → AlarmValidationError
         CaptureSinkFailed reason → AlarmSinkFailed reason
+        CaptureAlarmPending → AlarmPending
     )
     <$> captureAlarms capture
 

@@ -31,6 +31,7 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , reportErrorNow
   , reportWarningNow
   , awaitSinkRecorded
+  , claimSinkFirst
 
     -- * The surface bridge
   , Bridge
@@ -96,6 +97,7 @@ import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word32, Word64)
+import Foreign.C.Types (CInt (..))
 import Foreign.Ptr (Ptr, nullPtr, plusPtr)
 import Hetoimasia.Foundation.Log (Logger, callbackSink, defaultLogFilter, mkLoggerWith, systemMetadata)
 import Hetoimasia.Foundation.Messaging.Payload (prepare)
@@ -296,6 +298,17 @@ reportErrorNow rig text = sessionCapture rig >>= \capture → report capture sev
 -- | The same at warning severity; the worker is asked to drain at once.
 reportWarningNow ∷ Rig → ByteString → IO ()
 reportWarningNow rig text = sessionCapture rig >>= \capture → report capture severityWarning text >> requestDrain capture
+
+-- | Claim the capture's first-failure cell for its sink, as the worker does the
+-- moment a delivery's failure returns to it, and publish nothing: the capture
+-- is left where a worker paused between its claim and its publication.
+claimSinkFirst ∷ Rig → IO ()
+claimSinkFirst rig = sessionCapture rig >>= \capture → void (noteSinkFailure (captureUserData capture))
+
+-- The storage's own entry, which the capture's worker calls; linked in with the
+-- diagnostics package's C sources.
+foreign import ccall unsafe "hetoimasia_capture_note_sink_failure"
+  noteSinkFailure ∷ Ptr () → IO CInt
 
 -- | Wait until the capture has recorded its sink's failure.
 awaitSinkRecorded ∷ Rig → IO ()

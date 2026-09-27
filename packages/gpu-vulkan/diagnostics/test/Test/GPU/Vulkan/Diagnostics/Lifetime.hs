@@ -101,6 +101,7 @@ alarmKind ∷ CaptureAlarm → String
 alarmKind = \case
   CaptureErrorLatched → "error"
   CaptureSinkFailed _ → "sink"
+  CaptureAlarmPending → "pending"
 
 consumerName ∷ ConsumerOutcome → String
 consumerName = \case
@@ -309,7 +310,7 @@ spec = describe "Lifetime" $ do
           captureAlarms capture
       map alarmKind alarms `shouldBe` ["error", "sink"]
 
-    it "answers nothing while the failure that came first has claimed the order but not yet published its alarm" $ do
+    it "answers only that a failure is pending while the failure that came first has claimed the order but not yet published its alarm" $ do
       (logger, failing) ← switchedLogger
       (answers, _) ←
         capturing logger $ \capture → do
@@ -326,7 +327,7 @@ spec = describe "Lifetime" $ do
           _ ← bounded (atomically (captureSinkFailure capture >>= maybe retry pure))
           after ← captureAlarms capture
           pure (map alarmKind before, map alarmKind after)
-      answers `shouldBe` ([], ["sink", "error"])
+      answers `shouldBe` (["pending"], ["sink", "error"])
 
     it "stands beside the body's failure, which is rethrown unchanged with the verdict on it" $ do
       (logger, _) ← failingLogger

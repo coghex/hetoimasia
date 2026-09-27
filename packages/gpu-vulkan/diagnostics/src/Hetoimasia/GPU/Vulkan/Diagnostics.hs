@@ -413,6 +413,10 @@ newtype SinkFailure = SinkFailure
 data CaptureAlarm
   = CaptureErrorLatched
   | CaptureSinkFailed !Text
+  | CaptureAlarmPending
+    -- ^ A failure has claimed the order but has not yet published its own
+    -- alarm: something failed, and which failure came first is not yet
+    -- readable.
   deriving (Eq, Show)
 
 -- | The capture's terminal failures, in the order they happened.
@@ -428,11 +432,11 @@ data CaptureAlarm
 -- error reported while that delivery was still running came first.
 --
 -- A failure that has claimed the order but not yet published its own alarm is
--- one this cannot answer yet: the claim is taken first and the alarm set just
+-- one this cannot name yet: the claim is taken first and the alarm set just
 -- after it, so for that moment the only alarm readable may be a later one.
--- Then this answers nothing at all, and the next reading, once the first
--- alarm is published, answers both in order. It never answers a later
--- failure first.
+-- Then this answers 'CaptureAlarmPending' alone — a failure has happened, and
+-- admission should stay closed — and the next reading, once the first alarm is
+-- published, answers them in order. It never answers a later failure first.
 captureAlarms ∷ DiagnosticCapture → IO [CaptureAlarm]
 captureAlarms capture = do
   latched ← statusErrorLatched <$> captureStatus capture
@@ -442,10 +446,10 @@ captureAlarms capture = do
       sinks = [CaptureSinkFailed (sinkFailureReason failure) | Just failure ← [sink]]
   pure $ case first of
     Just FirstSink
-      | null sinks → []
+      | null sinks → [CaptureAlarmPending]
       | otherwise → sinks <> errors
     Just FirstError
-      | null errors → []
+      | null errors → [CaptureAlarmPending]
     _ → errors <> sinks
 
 -- | Run a body that owns a diagnostic capture, and finalize it on every exit.

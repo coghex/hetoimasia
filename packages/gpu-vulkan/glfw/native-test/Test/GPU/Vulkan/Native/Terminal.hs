@@ -218,6 +218,7 @@ alarms capture =
     ( \case
         CaptureErrorLatched → AlarmValidationError
         CaptureSinkFailed reason → AlarmSinkFailed reason
+        CaptureAlarmPending → AlarmPending
     )
     <$> captureAlarms capture
 

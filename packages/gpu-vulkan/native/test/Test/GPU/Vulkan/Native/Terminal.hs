@@ -239,6 +239,27 @@ spec = describe "Terminal failure" $ do
       retireTargetFrames (rigFrames rig) (rigTarget rig)
       clean rig
 
+    it "refuses new work while a diagnostic failure is pending, latching nothing until a checkpoint can latch it in order" $ do
+      rig ← newRig
+      frame ← owned rig
+      alarms ← newTVarIO [AlarmPending]
+      atomically (watchRootsDiagnostics (rigRoots rig) (readTVarIO alarms))
+      before ← length <$> frameCalls (rigStandIn rig)
+      recordFrame (rigRecording rig) (ownedFrame frame) (\_ → pure ()) `shouldReturn'` (`shouldBe` Left RefusedDiagnosticPending)
+      tryAcquireFrame (rigFrames rig) (rigTarget rig) `shouldReturn` Left RefusedDiagnosticPending
+      length <$> frameCalls (rigStandIn rig) `shouldReturn` before
+      -- Nothing latched, and the model's session is still running.
+      reportPrimary <$> atomically (readRootsTerminal (rigRoots rig)) `shouldReturn` Nothing
+      sessionState <$> modelOf rig `shouldReturn` SessionRunning
+      -- Once the capture can say, the failure that came first is the primary.
+      atomically (writeTVar alarms [AlarmSinkFailed "the sink is gone", AlarmValidationError])
+      tryAcquireFrame (rigFrames rig) (rigTarget rig) `shouldReturn` Left (RefusedSessionFailed (TerminalSinkFailed "the sink is gone"))
+      evidenceOf rig `shouldReturn` [LaterFailure TerminalValidationError]
+      ok (skipFrame (rigFrames rig) (ownedFrame frame))
+      settleAll rig
+      retireTargetFrames (rigFrames rig) (rigTarget rig)
+      clean rig
+
     it "latches a sink failure as a terminal status of its own, which authorizes no release" $ do
       rig ← newRig
       _ ← pendingPresentation rig

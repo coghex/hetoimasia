@@ -119,6 +119,7 @@ spec = describe "Vulkan controller" $ do
     it "latches an error whose record a full capture dropped, since the latch is set before the record is admitted" (bounded testDroppedErrorStops)
     it "latches a sink failure as a terminal status of its own, with the capture's verdict saying so" (bounded testSinkFailure)
     it "keeps a sink failure that came first as the primary when a validation error arrives before the next checkpoint" (bounded testSinkThenError)
+    it "refuses a handover while a sink failure has claimed the order but not yet published, latching nothing until it has" (bounded testClaimedSinkPending)
     it "reports what an exit could not verify as retained, beside the cleanup failure that is its primary" (bounded testRetentionReported)
     it "keeps the dependency order and the loss when cancellation is delivered repeatedly during the drain that follows it" (bounded testCancelledAfterLoss)
     it "latches the failed destruction of a surface created while the lease closed, beside the earlier primary, and retains the instance" (bounded testLateSurfaceFails)
@@ -924,6 +925,49 @@ testSinkThenError = do
     Just (TerminalSinkFailed _) → True
     _ → False
   reportEvidence report `shouldBe` [LaterFailure TerminalValidationError]
+
+testClaimedSinkPending ∷ IO ()
+testClaimedSinkPending = do
+  rig ← twoWindows
+  observed ← newTVarIO Nothing
+  outcome ← runRigCaught rig $ \host control → do
+    [first, second] ← windowsOf host
+    let owner = vulkanGraphicsOwner host
+        controller = vulkanController host
+    _ ← superviseGraphicsOwner control owner
+    one ← handedOver host first RequiredTarget
+    TargetUsable ← awaitStanding host one
+    -- The worker's sink has claimed the order and not yet published its
+    -- failure when an error arrives: which came first is not yet readable.
+    claimSinkFirst rig
+    reportErrorNow rig "an error after the sink claimed the order"
+    during ← handOverVulkanTarget controller (vulkanWindowHost host) owner second RequiredTarget
+    pending ← atomically (readVulkanTerminal controller)
+    -- The sink's failure is then published: the next handover names it as
+    -- the primary, with the error beside it.
+    failingSink rig
+    reportWarningNow rig "a warning the sink cannot take"
+    awaitSinkRecorded rig
+    after ← handOverVulkanTarget controller (vulkanWindowHost host) owner second RequiredTarget
+    settled ← atomically (readVulkanTerminal controller)
+    atomically (writeTVar observed (Just (handoverKind during, reportPrimary pending, handoverKind after, reportPrimary settled, reportEvidence settled)))
+    checkRuntime control
+  _ ← raisedAs @GraphicsSessionFailed outcome
+  Just (during, pendingPrimary, after, primary, evidence) ← atomically (readTVar observed)
+  (during, pendingPrimary) `shouldBe` ("pending", Nothing)
+  after `shouldBe` "sink failed"
+  primary `shouldSatisfy` \case
+    Just (TerminalSinkFailed _) → True
+    _ → False
+  evidence `shouldBe` [LaterFailure TerminalValidationError]
+  -- Nothing was attached for the second window.
+  events ← journal rig
+  length [() | SurfaceCreated 101 ← events] `shouldBe` 0
+  where
+    handoverKind = \case
+      VulkanDiagnosticPending → "pending" ∷ String
+      VulkanSessionFailed (TerminalSinkFailed _) → "sink failed"
+      other → show other
 
 testRetentionReported ∷ IO ()
 testRetentionReported = do

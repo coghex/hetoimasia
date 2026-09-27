@@ -388,8 +388,9 @@ owns the cell, and a later one changes nothing, so an owner that learns of
 both at one checkpoint reads which came first from the cell rather than from
 the moment it looked. A failure that has claimed the cell but not yet set its
 own alarm leaves, for that moment, only a later alarm readable; then
-`captureAlarms` answers nothing, and the next reading answers both in order,
-so it never answers a later failure first. The controller installs it as the roots' diagnostic
+`captureAlarms` answers `CaptureAlarmPending` alone — something failed, which
+came first is not yet readable, and admission should stay closed — and the next
+reading answers them in order, so it never answers a later failure first. The controller installs it as the roots' diagnostic
 watch, so a failed sink is a terminal status of its own at the owner's next
 checkpoint — never a replacement for an earlier failure, and never permission
 to release anything.
