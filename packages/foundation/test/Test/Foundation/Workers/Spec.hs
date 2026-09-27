@@ -116,6 +116,7 @@ import Hetoimasia.Foundation.Worker
 import Hetoimasia.Foundation.Worker.Internal (GroupProbe (..), withWorkerGroupProbed)
 import System.Timeout (timeout)
 import qualified Test.Foundation.Workers.Opacity as Opacity
+import qualified Test.Foundation.Workers.Visibility as Visibility
 import Test.Hspec
   ( Expectation
   , Spec
@@ -196,6 +197,10 @@ spec = describe "Workers" $ do
       (boundedExample testStatusDeliveryPersists)
 
   Opacity.spec
+
+  -- Which of the worker modules a client can import at all, and which
+  -- constructors the public module keeps closed, are asserted the same way.
+  Visibility.spec
 
 -- Fixtures -------------------------------------------------------------------
 

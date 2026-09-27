@@ -49,10 +49,12 @@
 -- belong to the application that reads it.
 --
 -- The module takes no logger. 'allocWorkerGroup' builds its 'Scoped' value
--- through the foundation package's private implementation seam, so the 'Scoped'
+-- inside the foundation package's private implementation seam, so the 'Scoped'
 -- constructor stays unexported and no catch instance is added to it. The
--- implementation lives in that seam too; this module re-exports it without the
--- coordination probe the foundation's own tests use.
+-- implementation lives in that seam too, split across hidden modules that each
+-- own one responsibility behind the package-private facade
+-- @Hetoimasia.Foundation.Worker.Internal@; this module re-exports that facade
+-- without the coordination probe the foundation's own tests use.
 --
 -- See @docs/workers.md@ for the same contract in prose, including every piece
 -- of state, its owner, readers and writers, thread, lifetime, and reset.

@@ -326,13 +326,17 @@ forced release, or process exit.
 
 ## The coordination probe
 
-The worker group's implementation is `Hetoimasia.Foundation.Worker.Internal`,
-in the foundation package's private `internal` sublibrary beside the resource
-seam. `Hetoimasia.Foundation.Worker` re-exports all of it except the
-coordination probe: `GroupProbe`, `noProbe`, and `withWorkerGroupProbed`.
-`withWorkerGroup` is `withWorkerGroupProbed noProbe`, so there is one
-implementation, and a probe is installed per group rather than through any
-global switch.
+The worker group's implementation lives in the foundation package's private
+`internal` sublibrary beside the resource seam, behind the package-private
+facade `Hetoimasia.Foundation.Worker.Internal`. `Hetoimasia.Foundation.Worker`
+re-exports all of that facade except the coordination probe: `GroupProbe`,
+`noProbe`, and `withWorkerGroupProbed`. `withWorkerGroup` is
+`withWorkerGroupProbed noProbe`, so there is one implementation, and a probe is
+installed per group rather than through any global switch. The probe's type
+and `noProbe` live in `Worker.Types`, beside the group that holds it;
+`Worker.Group` installs it when it creates a group, and `Worker.Requests` runs
+it on each cancellation helper. The foundation's own tests import it from the
+facade.
 
 The probe's one point runs on a cancellation helper after its delivery attempt
 has ended and before the helper records it and deregisters. A terminal worker
@@ -343,23 +347,60 @@ explicit coordination. A production group's probe does nothing, and no client
 can install one: a private sublibrary is visible only to the package's own
 components.
 
+## Module structure
+
+The facade defines nothing. It re-exports, with its export list unchanged,
+from eight modules the sublibrary does not expose, each owning one
+responsibility:
+
+| Module | Owns |
+| --- | --- |
+| `Worker.Base` | `WorkerId`, `Requested`, `StopToken` with `stopRequested` and `awaitStopRequest`, `WorkerCancelled` and its instance, `GroupPhase`, and the group's internal `Phase` |
+| `Worker.Outcome` | `RunEnd`, `RunExit`, `Result`, `Completion`, `WorkerSummary`, `Startup`, `StartRejection`, `GroupReport` and `reportCleanup`, and the shared helpers `trySome`, `failureResult`, `resultCleanup`, and `succeeded` |
+| `Worker.Types` | The state representation: `Outstanding`, `OutstandingWorker`, `GroupStatus`, `Entry`, `ClosingSnapshot`, `WorkerGroup`, `GroupProbe` and `noProbe`, `Worker` with `workerId` and `workerLabel`, `WorkerDefinition` and `workerDefinition`, and `StartOutcome` |
+| `Worker.Evidence` | `WorkerEvidence`, the private `EvidenceEntry` annotation and its renderer, `workerEvidence`, `workerEvidenceInContext`, and `attachEvidence` |
+| `Worker.Observation` | `groupStatus`, `activeWorkerCount`, `awaitStartup`, `awaitCompletion`, `pollCompletion`, `observeCompletion`, and the settled operations `retireIfSettled` and `settledSummary` |
+| `Worker.Requests` | `requestStop`, `requestCancel`, `requestCancelEntry`, the helper `deliverCancellation`, and a failing starter's `drainWorker` |
+| `Worker.Startup` | `startWorker`, `startWorkerWith`, `register`, the child thread `runChild`, and terminal `publish` |
+| `Worker.Group` | `withWorkerGroup`, `withWorkerGroupProbed`, `allocWorkerGroup`, `closeWorkerGroup`, `newWorkerGroup`, `beginClosing`, `awaitReport`, the protected `drainGroup`, and `escalate` |
+
+Dependencies run one way. `Worker.Base` imports no other worker module;
+`Worker.Outcome` imports `Base`; `Worker.Types` and `Worker.Evidence` import
+`Base` and `Outcome`; `Worker.Observation` adds `Types`, and
+`Worker.Requests` adds `Observation`. `Worker.Startup` and `Worker.Group` may
+import every module below them and never import each other: a start reaches
+the group, and the group a started worker, only through the state in
+`Worker.Types`. An operation two of them share lives below both —
+`settledSummary` and `retireIfSettled` in `Observation`, `drainWorker` and
+`requestCancelEntry` in `Requests`, and the failure helpers in `Outcome`. The
+modules import the resource family's `Resource.Scoped` and `Resource.Cleanup`
+directly, never `Resource.Internal` or this facade, and nothing from the main
+library; the graph needs no `.hs-boot` file. Code outside the sublibrary — the
+public module and the foundation's worker examples — imports only the facade.
+
 ## State
 
-| State | Owner | Readers and writers | Thread | Lifetime and reset |
-|---|---|---|---|---|
-| Group phase (open, closing, closed) | The group | Registration and `groupStatus` read; closing and the final report write | Any thread holding the group, in STM | One `withWorkerGroup` invocation; closes once, never reopens |
-| Registration order and active set | The group | Registration inserts; retirement deletes; closing, the report, and `groupStatus` read | Starter, owner, helpers, observers, in STM | One invocation; emptied when the group closes |
-| Retained observed failures | The group | Retirement inserts; closing reads | Observer and helpers, in STM | One invocation; emptied when the group closes |
-| Closing snapshot and report | The group | Closing writes the snapshot; the drain writes the report once | Owner or `closeWorkerGroup` caller | Written once; the report never changes |
-| Worker thread identity | The group | Starter writes after the fork; helpers read | Starter, helpers | One worker; set once |
-| Stop and cancellation request | The worker's entry | `requestStop`, `requestCancel`, and closing write; the worker reads through its stop token; the run-exit record reads | Any thread, in STM | One worker; only strengthens, never reset to running |
-| Start gate | The worker's entry | Starter opens it; child reads | Starter, child | One worker; opened at most once |
-| Startup acknowledgement | The worker | Child writes inside its startup scope; starter and observers read | Child, in STM | One startup; set once; independent of completion |
-| Run-exit record | The worker | Child writes before cleanup, reading the requests in the same transaction; publication reads | Child | One worker; written at most once |
-| Terminal completion and evidence | The worker | Child publishes once; any number of readers | Child, in STM | Never taken, never reset; kept by every retained handle |
-| Observed flag, helper count, helper sent flag | The worker's entry | `observeCompletion`, `requestCancel`, and helpers write; retirement, the drain, and `groupStatus` read | Owner, helpers, in STM | One worker; the helper count returns to zero when its helper finishes |
-| Cancellation delivered flag | The worker's entry | The helper writes it when its `throwTo` returned, in the transaction that deregisters it; `groupStatus` reads | Helper, in STM; any reader | One worker; set at most once, never cleared |
-| Coordination probe | The group | Fixed when the group is created; helpers run it | Helpers | One invocation; `noProbe` in every production group |
+Every variable below is a field of `WorkerGroup`, `Entry`, or `Worker`,
+declared in `Worker.Types`; no module keeps worker state of its own, and
+`Worker.Types` itself writes none of it. The owning module column names where
+the variable is declared; the writing modules are the only ones that mutate it.
+
+| State | Owner | Owning module | Written by | Readers and writers | Thread | Lifetime and reset |
+|---|---|---|---|---|---|---|
+| Group phase (open, closing, closed) | The group | `Worker.Types` (`groupPhase`; `Phase` from `Worker.Base`) | `Worker.Group` (`newWorkerGroup`, `beginClosing`, `awaitReport`) | Registration (`Worker.Startup`), retirement and `groupStatus` (`Worker.Observation`) read; closing and the final report write | Any thread holding the group, in STM | One `withWorkerGroup` invocation; closes once, never reopens |
+| Registration order and active set | The group | `Worker.Types` (`groupNextId`, `groupActive`) | `Worker.Startup` (`register` inserts), `Worker.Observation` (`retireIfSettled` deletes), `Worker.Group` (the report empties it) | Registration inserts; retirement deletes; closing, escalation, the report, `activeWorkerCount`, and `groupStatus` read | Starter, owner, helpers, observers, in STM | One invocation; emptied when the group closes |
+| Retained observed failures | The group | `Worker.Types` (`groupRetained`) | `Worker.Observation` (`retireIfSettled` inserts), `Worker.Group` (the report empties it) | Retirement inserts; closing reads | Observer and helpers, in STM | One invocation; emptied when the group closes |
+| Closing snapshot and report | The group | `Worker.Types` (`groupClosing`, `groupReport`) | `Worker.Group` (`beginClosing`, `awaitReport`) | Closing writes the snapshot; the drain writes the report once | Owner or `closeWorkerGroup` caller | Written once; the report never changes |
+| Worker thread identity | The group | `Worker.Types` (`entryThread`) | `Worker.Startup` (`startWorkerWith`) | Starter writes after the fork; helpers (`Worker.Requests`) read | Starter, helpers | One worker; set once |
+| Stop and cancellation request | The worker's entry | `Worker.Types` (`entryRequests`; `Requested` and `StopToken` from `Worker.Base`) | `Worker.Requests` (`requestStop`, `requestCancelEntry`), `Worker.Group` (`beginClosing`) | `requestStop`, `requestCancel`, and closing write; the worker reads through its stop token; the run-exit record (`Worker.Startup`) and `groupStatus` read | Any thread, in STM | One worker; only strengthens, never reset to running |
+| Start gate | The worker's entry | `Worker.Types` (`entryGate`) | `Worker.Startup` (`startWorkerWith`) | Starter opens it; child (`runChild`) reads | Starter, child | One worker; opened at most once |
+| Startup acknowledgement | The worker | `Worker.Types` (`entryAcknowledged`) | `Worker.Startup` (`runChild`) | Child writes inside its startup scope; starter, `awaitStartup`, and `groupStatus` read | Child, in STM | One startup; set once; independent of completion |
+| Run-exit record | The worker | `Worker.Types` (`entryExit`) | `Worker.Startup` (`runChild`) | Child writes before cleanup, reading the requests in the same transaction; publication reads | Child | One worker; written at most once |
+| Terminal completion and evidence | The worker | `Worker.Types` (`workerCompletion`, `entrySummary`) | `Worker.Startup` (`publish`) | Child publishes once; any number of readers, including observation, requests, and the drain | Child, in STM | Never taken, never reset; kept by every retained handle |
+| Observed flag | The worker's entry | `Worker.Types` (`entryObserved`) | `Worker.Observation` (`observeCompletion`) | `observeCompletion` writes; retirement and closing read | Owner, in STM | One worker; never cleared |
+| Helper count and helper sent flag | The worker's entry | `Worker.Types` (`entryHelpers`, `entryCancelSent`) | `Worker.Requests` (`requestCancelEntry`, `deliverCancellation`) | `requestCancel` and helpers write; retirement, the drain, and `groupStatus` read | Requester, helpers, in STM | One worker; the helper count returns to zero when its helper finishes |
+| Cancellation delivered flag | The worker's entry | `Worker.Types` (`entryCancelDelivered`) | `Worker.Requests` (`deliverCancellation`) | The helper writes it when its `throwTo` returned, in the transaction that deregisters it; `groupStatus` reads | Helper, in STM; any reader | One worker; set at most once, never cleared |
+| Coordination probe | The group | `Worker.Types` (`groupProbe`, `GroupProbe`) | `Worker.Group` (`newWorkerGroup` fixes it) | Fixed when the group is created; helpers (`Worker.Requests`) run it | Helpers | One invocation; `noProbe` in every production group |
 
 ## What the contract does not promise
 
@@ -458,6 +499,17 @@ opacity examples do: one importing the probe from the public module, rejected
 with `does not export`; one importing it from the implementation module,
 rejected with `GHC-87110` naming the hidden `internal` unit; and one that must
 build and run, reading `groupStatus` through the public module alone.
+
+`packages/foundation/test/Test/Foundation/Workers/Visibility.hs`, in the same
+group and selectable alone with
+`--test-options='--match "Worker module visibility across the package boundary"'`,
+compiles one client per question with the same harness: a client importing
+each of the eight private worker modules is refused with `GHC-87110` naming the
+`internal` unit, never `cannot satisfy` or `Could not find module`; a client
+asking the public module for the constructor of `WorkerGroup`,
+`WorkerDefinition`, `StopToken`, `Worker`, or `WorkerId` is refused with
+`GHC-10237`; and one client importing, by name, every name the public module
+exports, with its exported constructors and fields, is accepted.
 
 The validation catalog covers them through the floor group `test.foundation`; see
 [validation.md](validation.md).

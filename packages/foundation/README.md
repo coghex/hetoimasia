@@ -173,6 +173,15 @@ directly. The collection's representations are a hidden module of the main
 library. See [docs/resources.md](../../docs/resources.md#the-implementation-seam)
 for their dependency direction and state ownership.
 
+The worker group has one public module, `Worker`, which re-exports the
+package-private facade `Worker.Internal` without its coordination probe. Behind
+that facade, eight hidden modules of the same sublibrary each own one
+responsibility; they import one another and the resource family's `Scoped` and
+`Cleanup` modules directly, and `Worker.Startup` and `Worker.Group` never import
+each other. See [docs/workers.md](../../docs/workers.md#module-structure) for
+their dependency direction and [its state table](../../docs/workers.md#state)
+for the module that owns and writes each piece of state.
+
 | Logical module | Source path | Cabal component | Visibility | Purpose |
 | --- | --- | --- | --- | --- |
 | `Hetoimasia.Foundation.Log` | `src/Hetoimasia/Foundation/Log.hs` | main library | exposed | Public logging facade; logger construction, scoped context, flushing, emission, and call-site extraction |
@@ -193,6 +202,16 @@ for their dependency direction and state ownership.
 | `Hetoimasia.Foundation.Resource.Types` | `internal/Hetoimasia/Foundation/Resource/Types.hs` | `internal` sublibrary | hidden | Release ranks and the assembly representation: parts, `Assembly`, and the ledger |
 | `Hetoimasia.Foundation.Resource.Assembly` | `internal/Hetoimasia/Foundation/Resource/Assembly.hs` | `internal` sublibrary | hidden | Staged acquisition, rollback, and lending over the assembly representation |
 | `Hetoimasia.Foundation.Resource.Scoped` | `internal/Hetoimasia/Foundation/Resource/Scoped.hs` | `internal` sublibrary | hidden | The `Scoped` continuation type, its instances, and its runner |
+| `Hetoimasia.Foundation.Worker` | `src/Hetoimasia/Foundation/Worker.hs` | main library | exposed | Public worker facade; group lifetime, drain status, definitions, starting, requests, observation, outcomes, and evidence, without the coordination probe |
+| `Hetoimasia.Foundation.Worker.Internal` | `internal/Hetoimasia/Foundation/Worker/Internal.hs` | `internal` sublibrary | package-private (exposed to this package only) | Facade re-exporting the worker implementation, including the coordination probe, to the rest of the package |
+| `Hetoimasia.Foundation.Worker.Base` | `internal/Hetoimasia/Foundation/Worker/Base.hs` | `internal` sublibrary | hidden | Worker identity, the request record, the stop token, `WorkerCancelled`, and the group phase |
+| `Hetoimasia.Foundation.Worker.Outcome` | `internal/Hetoimasia/Foundation/Worker/Outcome.hs` | `internal` sublibrary | hidden | Run exits, results, completions, the startup and group reports, and the failure-classification helpers |
+| `Hetoimasia.Foundation.Worker.Types` | `internal/Hetoimasia/Foundation/Worker/Types.hs` | `internal` sublibrary | hidden | The group, entry, closing snapshot, drain-status records, coordination probe, handle, and definition |
+| `Hetoimasia.Foundation.Worker.Evidence` | `internal/Hetoimasia/Foundation/Worker/Evidence.hs` | `internal` sublibrary | hidden | Evidence attached to a propagated failure, its rendering, and its readers |
+| `Hetoimasia.Foundation.Worker.Observation` | `internal/Hetoimasia/Foundation/Worker/Observation.hs` | `internal` sublibrary | hidden | Drain status, startup and completion reads, committed observation, and settled retirement |
+| `Hetoimasia.Foundation.Worker.Requests` | `internal/Hetoimasia/Foundation/Worker/Requests.hs` | `internal` sublibrary | hidden | Stop and cancellation requests, the cancellation helper, and a failing starter's drain |
+| `Hetoimasia.Foundation.Worker.Startup` | `internal/Hetoimasia/Foundation/Worker/Startup.hs` | `internal` sublibrary | hidden | Registration, the fork and startup handoff, the child thread, and terminal publication |
+| `Hetoimasia.Foundation.Worker.Group` | `internal/Hetoimasia/Foundation/Worker/Group.hs` | `internal` sublibrary | hidden | The group lifetime boundary, closing, the report, and the protected drain |
 
 ## Tests
 
