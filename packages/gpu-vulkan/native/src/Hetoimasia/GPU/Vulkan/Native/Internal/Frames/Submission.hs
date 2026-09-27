@@ -29,7 +29,7 @@ import Hetoimasia.GPU.Model
   ( FramePhase (FrameAcquired)
   , FrameView (..)
   , Outcome (..)
-  , SessionFailureCause (UnknownSubmissionEffect)
+  , SessionFailureCause (CleanupFailed, UnknownSubmissionEffect)
   , SubmitAnswer (..)
   , SubmitOutcome (..)
   , frameView
@@ -58,7 +58,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , batchHeld
   , owned
   )
-import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost, rootsCall, rootsSessionIdentity, stateRootsModel)
+import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost, failRootsSession, rootsCall, rootsSessionIdentity, stateRootsModel)
 
 -- | One frame of a validated request.
 data Member cmd = Member
@@ -86,6 +86,9 @@ data Member cmd = Member
 --
 -- * it returned: one submission record in the model that every frame shares,
 --   every batch recorded as submitted by it, and the fence pending;
+-- * the fence reset raised: nothing was submitted and every frame is still
+--   acquired, but the fence is retained for ever as uncertain, admission
+--   closes and the session fails, and the failure is re-raised;
 -- * it raised a specified no-effect failure: nothing is pending, the fence was
 --   reset and is not waited on, and every frame is still acquired with its
 --   batch sealed — 'SubmittedNothing';
@@ -178,10 +181,14 @@ submitFrames frames request =
         _ → ((), model)
       tryWithContext @SomeException (rootsCall roots "vkResetFences" (opsResetFence ops device fence)) >>= \case
         Left failure@(ExceptionWithContext _ exception) → do
-          -- Nothing was submitted; the fence itself is now in doubt.
+          -- Nothing was submitted, and every frame is still acquired; but the
+          -- fence itself is now in doubt, so it is retained for ever, and
+          -- native synchronization safety being unknown, admission stops and
+          -- the session fails.
           atomically $ do
             answered Model.submitFrames framesOf SubmissionFailedWithoutEffect
             editSlot frames key (\sync → sync {syncFenceState = FenceUncertain (Text.pack (displayException exception))})
+            failRootsSession roots CleanupFailed
           rethrowIO failure
         Right () → do
           atomically (editSlot frames key (\sync → sync {syncFenceState = FenceIdle}))

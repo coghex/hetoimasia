@@ -280,6 +280,29 @@ spec = describe "Frames" $ do
       filter isQuery <$> frameCalls (rigStandIn rig) `shouldReturn` []
       retireTargetFrames (rigFrames rig) (rigTarget rig) `raises` \(FramesRetained _ frames _) → frames == [ownedFrame frame]
 
+    it "retains a fence whose reset raised, stops admission and fails the session, submitting nothing" $ do
+      rig ← newRig
+      frame ← owned rig
+      batch ← sealed rig frame
+      failFrameStep (rigStandIn rig) AtResetFence
+      outcome ← try @FrameStepFailed (submitFrames (rigFrames rig) (batch :| []))
+      fmap (const ()) outcome `shouldBe` Left (FrameStepFailed AtResetFence)
+      filter isSubmission <$> frameCalls (rigStandIn rig) `shouldReturn` []
+      sessionState <$> modelOf rig `shouldReturn` SessionFailed CleanupFailed
+      phaseOf rig (ownedFrame frame) `shouldReturn` Just FrameAcquired
+      [SlotView _ _ sync] ← atomically (readSlots (rigFrames rig))
+      syncFenceState sync `shouldSatisfy` \case
+        FenceUncertain _ → True
+        _ → False
+      acquired rig `shouldReturn` AcquisitionUnavailable
+      -- The frame, never submitted, is still abandoned safely, but the slot
+      -- keeps its doubtful fence.
+      clearFrameStep (rigStandIn rig) AtResetFence
+      ok (skipFrame (rigFrames rig) (ownedFrame frame))
+      settleAll rig
+      retireTargetFrames (rigFrames rig) (rigTarget rig) `raises` \(FramesRetained _ frames slots) → null frames && slots == [0]
+      clean rig
+
   describe "abandonment" $ do
     it "skips an acquired frame through a cleanup submission and returns its image once that has completed, rebuilding nothing" $ do
       rig ← newRig
@@ -446,6 +469,29 @@ spec = describe "Frames" $ do
       settleAll rig
       clean rig
 
+    it "rotates a one-action step's work, so a later submission completing first is observed, cleaned up and released" $ do
+      rig ← newRigWithActions 2 1
+      first ← owned rig
+      second ← owned rig
+      early ← sealed rig first >>= \batch → submitted rig (batch :| [])
+      late ← sealed rig second >>= \batch → submitted rig (batch :| [])
+      mapM_ (ok . closeUnpresentedFrame (rigFrames rig) . ownedFrame) [first, second]
+      [earlyFence, lateFence] ← map (syncFence . viewSlotSync) <$> atomically (readSlots (rigFrames rig))
+      -- Only the later submission ever completes.
+      completeFence (rigStandIn rig) lateFence
+      let step' = do
+            report ← progress rig
+            -- Complete every cleanup made so far, never the early submission.
+            pending ← pendingFences (rigStandIn rig)
+            mapM_ (completeFence (rigStandIn rig)) (filter (/= earlyFence) pending)
+            pure report
+      reports ← mapM (const step') [1 .. 8 ∷ Int]
+      concatMap progressCompleted reports `shouldBe` [late]
+      concatMap progressCleanups reports `shouldBe` [ownedFrame second]
+      concatMap progressSettled reports `shouldBe` [ownedFrame second]
+      standingOf rig (ownedFrame first) `shouldReturn` Just (StageClosing early)
+      clean rig
+
   describe "cancellation at each native handoff" $ do
     it "records an acquisition a cancellation reached, then delivers it" $ do
       rig ← newRig
@@ -519,9 +565,13 @@ newRig ∷ IO Rig
 newRig = newRigWith 2
 
 newRigWith ∷ Integer → IO Rig
-newRigWith slots = do
+newRigWith slots = newRigWithActions slots 32
+
+-- | 'newRigWith' with this many progress actions a step.
+newRigWithActions ∷ Integer → Integer → IO Rig
+newRigWithActions slots actions = do
   rootsStandIn ← newStandIn
-  roots ← newStandInRoots rootsStandIn (either (error . show) id (validateBudgets defaultBudgetRequest {requestedFrameSlots = slots}))
+  roots ← newStandInRoots rootsStandIn (either (error . show) id (validateBudgets defaultBudgetRequest {requestedFrameSlots = slots, requestedProgressActions = actions}))
   _ ← startRoots roots standardRequest
   target ← admitRootTarget roots OptionalTarget (surfaceNumbered rootsStandIn 10) >>= either (fail . show) pure
   generations ← newGenerations roots

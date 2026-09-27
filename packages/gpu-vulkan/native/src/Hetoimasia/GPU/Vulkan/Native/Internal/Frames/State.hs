@@ -171,12 +171,15 @@ data Frames q inst msgr phys dev cmd = Frames
   , framesSlots ∷ !(TVar (Map (TargetId, Natural) SlotSync))
   , framesLive ∷ !(TVar (Map FrameSlotId FrameRecord))
   , framesSubmissions ∷ !(TVar (Map SubmissionId SubmissionRecord))
+  , framesCursor ∷ !(TVar Natural)
+    -- ^ Where the owner's next progress step starts in its work, so a small
+    -- action budget reaches every piece of work in turn.
   }
 
 -- | The frames over this recording, owned by the thread that owns it — the
 -- graphics owner's.
 newFrames ∷ FrameOps dev cmd → Recording q inst msgr phys dev cmd → IO (Frames q inst msgr phys dev cmd)
-newFrames ops recording = Frames ops recording <$> newTVarIO Map.empty <*> newTVarIO Map.empty <*> newTVarIO Map.empty
+newFrames ops recording = Frames ops recording <$> newTVarIO Map.empty <*> newTVarIO Map.empty <*> newTVarIO Map.empty <*> newTVarIO 0
 
 framesRoots ∷ Frames q inst msgr phys dev cmd → Roots q inst msgr phys dev
 framesRoots = recordingRoots . framesRecording

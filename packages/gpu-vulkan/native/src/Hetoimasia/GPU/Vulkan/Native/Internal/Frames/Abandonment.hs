@@ -29,7 +29,7 @@ import Control.Exception
   , toException
   , tryWithContext
   )
-import Control.Monad (forM, unless, when)
+import Control.Monad (forM, unless)
 import Data.Foldable (for_)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import qualified Data.Map.Strict as Map
@@ -50,7 +50,7 @@ import Hetoimasia.GPU.Model
   , skipUnsubmittedFrame
   )
 import Hetoimasia.GPU.Model.Budget (progressActionLimit)
-import Hetoimasia.GPU.Model.Identity (FrameSlotId, IdentityKind (..), Misuse (..), TargetId, frameTarget, imageIndex)
+import Hetoimasia.GPU.Model.Identity (FrameSlotId, IdentityKind (..), Misuse (..), SubmissionId, TargetId, frameTarget, imageIndex)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Layer (FrameOps (..), SubmitBatch (..), WaitStage (..))
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.State
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Batches (resetFrameRecorder)
@@ -151,16 +151,21 @@ closeTargetFrames frames target = do
 -- | One bounded owner step: at most the model's progress-action limit of native
 -- calls, each recorded in the same masked step that made it.
 --
--- 1. Each outstanding submission's fence — and only a fence a submission made
---    pending — is asked, without waiting, whether it has signalled; one that
---    has is recorded as that submission's completion in the model, which
---    discharges every hold it carried and frees each frame slot that owed
---    nothing else.
--- 2. Each closed frame whose rendering has completed gets its cleanup
---    submission, waiting on its render-finished semaphore.
--- 3. Each skipped or closed frame whose cleanup fence has signalled has its
---    image returned through @vkReleaseSwapchainImagesEXT@, and its settlement
---    recorded in the model.
+-- * Each outstanding submission's fence — and only a fence a submission made
+--   pending — is asked, without waiting, whether it has signalled; one that
+--   has is recorded as that submission's completion in the model, which
+--   discharges every hold it carried and frees each frame slot that owed
+--   nothing else.
+-- * Each closed frame whose rendering has completed gets its cleanup
+--   submission, waiting on its render-finished semaphore.
+-- * Each skipped or closed frame whose cleanup fence has signalled has its
+--   image returned through @vkReleaseSwapchainImagesEXT@, and its settlement
+--   recorded in the model.
+--
+-- The work is one list, and each step starts one place further along it
+-- than the last, so a budget smaller than the work still reaches every piece
+-- of it in turn: a submission whose fence never signals cannot keep a later
+-- one's completion, cleanup or release from being observed.
 --
 -- It runs on the graphics owner's thread whatever the target's phase, closing
 -- included. A failure is raised only once the whole step has recorded
@@ -169,74 +174,85 @@ closeTargetFrames frames target = do
 progressFrames ∷ Frames q inst msgr phys dev cmd → Instant → IO Progress
 progressFrames frames now = owner recording $ do
   limit ← progressActionLimit . modelBudgets <$> atomically (readModel frames)
-  spent ← newIORef (0 ∷ Natural)
   failures ← newIORef []
   completed ← newIORef []
   cleanups ← newIORef []
   settled ← newIORef []
   device ← atomically (deviceOf frames)
   for_ device $ \(handle, family) → do
-    let spend action = do
-          used ← readIORef spent
-          when (used < limit) $ do
-            modifyIORef' spent (+ 1)
-            action
-    -- 1. Outstanding submissions.
-    outstanding ← Map.toAscList <$> readTVarIO (framesSubmissions frames)
-    for_ outstanding $ \(submission, record) → spend $ do
-      fence ← fmap syncFence . Map.lookup (submissionSlot record) <$> readTVarIO (framesSlots frames)
-      for_ fence $ \native →
-        observe handle native >>= \case
-          Left failure → do
-            let reason = "vkGetFenceStatus raised: " <> describe failure
-            atomically $ do
-              uncertain frames CleanupFailed (submissionFrames record) reason
-              editSlot frames (submissionSlot record) (\sync → sync {syncFenceState = FenceUncertain reason})
-              modifyTVar' (framesSubmissions frames) (Map.delete submission)
-            note failures (unlessLoss failure (FrameEffectUncertain (submissionFrames record) reason))
-          Right False → pure ()
-          Right True → do
-            recorded ← atomically (complete submission record)
-            if recorded
-              then modifyIORef' completed (submission :)
-              else note failures (toException (FrameEffectUncertain (submissionFrames record) "the model refused a completion its fence proved"))
-    -- 2. Closed frames whose rendering has completed.
-    submissions ← readTVarIO (framesSubmissions frames)
-    closing ← Map.toAscList . Map.mapMaybe (\record → case recordStage record of
-      StageClosing submission | not (Map.member submission submissions) → Just record
-      _ → Nothing) <$> readTVarIO (framesLive frames)
-    for_ closing $ \(frame, _) → spend $ do
-      sync ← Map.lookup (slotOf frame) <$> readTVarIO (framesSlots frames)
-      for_ sync $ \held → mask_ $
-        cleanupSubmission frames handle family frame (syncRendered held) StageSettling (\entry → entry {syncRenderedState = SemaphoreWaitOwed}) >>= \case
-          Nothing → modifyIORef' cleanups (frame :)
-          Just (ExceptionWithContext _ exception) → note failures exception
-    -- 3. Cleanup fences.
-    abandoning ← Map.toAscList . Map.filter (abandoningStage . recordStage) <$> readTVarIO (framesLive frames)
-    for_ abandoning $ \(frame, record) → spend $ do
-      sync ← Map.lookup (slotOf frame) <$> readTVarIO (framesSlots frames)
-      let released' =
-            release handle frame record >>= \case
-              Left failure → note failures failure
-              Right () → modifyIORef' settled (frame :)
-      for_ sync $ \held → case syncCleanupState held of
-        FencePending →
-          observe handle (syncCleanup held) >>= \case
-            Left failure → do
-              let reason = "vkGetFenceStatus raised: " <> describe failure
-              atomically $ do
-                editFrame frames frame (\entry → entry {recordStage = StageFailed reason})
-                editSlot frames (slotOf frame) (\entry → entry {syncCleanupState = FenceUncertain reason})
-                failRootsSession roots CleanupFailed
-              note failures (unlessLoss failure (FrameCleanupFailed frame reason))
-            Right False → pure ()
-            Right True → do
-              atomically (editSlot frames (slotOf frame) (\entry → entry {syncCleanupState = FenceSignalled}))
-              released'
-        -- Signalled at an earlier step, whose release a cancellation kept it
-        -- from reaching.
-        FenceSignalled → released'
-        _ → pure ()
+    -- The step's work, as one list rotated to start one place further on
+    -- each step: a budget smaller than the work still reaches every piece of
+    -- it in turn, so no pending fence can hold back a later one. Work the
+    -- step itself creates — a cleanup owed once a submission completed — is
+    -- taken by a further pass while the budget lasts, never repeating a piece
+    -- already done this step.
+    cursor ← atomically (readTVar (framesCursor frames) <* modifyTVar' (framesCursor frames) (+ 1))
+    let pending done = atomically $ do
+          submissions ← readTVar (framesSubmissions frames)
+          live ← readTVar (framesLive frames)
+          let items =
+                [ObserveSubmission submission record | (submission, record) ← Map.toAscList submissions]
+                  <> [ MakeCleanup frame
+                     | (frame, record) ← Map.toAscList live
+                     , StageClosing submission ← [recordStage record]
+                     , not (Map.member submission submissions)
+                     ]
+                  <> [ObserveCleanup frame record | (frame, record) ← Map.toAscList live, abandoningStage (recordStage record)]
+          pure (filter ((`notElem` done) . workKey) (rotated cursor items))
+        passes done used = do
+          work ← take (fromIntegral (limit - used)) <$> pending done
+          unless (null work) $ do
+            mapM_ perform work
+            passes (map workKey work <> done) (used + fromIntegral (length work))
+        perform = \case
+          ObserveSubmission submission record → do
+            fence ← fmap syncFence . Map.lookup (submissionSlot record) <$> readTVarIO (framesSlots frames)
+            for_ fence $ \native →
+              observe handle native >>= \case
+                Left failure → do
+                  let reason = "vkGetFenceStatus raised: " <> describe failure
+                  atomically $ do
+                    uncertain frames CleanupFailed (submissionFrames record) reason
+                    editSlot frames (submissionSlot record) (\sync → sync {syncFenceState = FenceUncertain reason})
+                    modifyTVar' (framesSubmissions frames) (Map.delete submission)
+                  note failures (unlessLoss failure (FrameEffectUncertain (submissionFrames record) reason))
+                Right False → pure ()
+                Right True → do
+                  recorded ← atomically (complete submission record)
+                  if recorded
+                    then modifyIORef' completed (submission :)
+                    else note failures (toException (FrameEffectUncertain (submissionFrames record) "the model refused a completion its fence proved"))
+          MakeCleanup frame → do
+            sync ← Map.lookup (slotOf frame) <$> readTVarIO (framesSlots frames)
+            for_ sync $ \held → mask_ $
+              cleanupSubmission frames handle family frame (syncRendered held) StageSettling (\entry → entry {syncRenderedState = SemaphoreWaitOwed}) >>= \case
+                Nothing → modifyIORef' cleanups (frame :)
+                Just (ExceptionWithContext _ exception) → note failures exception
+          ObserveCleanup frame record → do
+            sync ← Map.lookup (slotOf frame) <$> readTVarIO (framesSlots frames)
+            let released' =
+                  release handle frame record >>= \case
+                    Left failure → note failures failure
+                    Right () → modifyIORef' settled (frame :)
+            for_ sync $ \held → case syncCleanupState held of
+              FencePending →
+                observe handle (syncCleanup held) >>= \case
+                  Left failure → do
+                    let reason = "vkGetFenceStatus raised: " <> describe failure
+                    atomically $ do
+                      editFrame frames frame (\entry → entry {recordStage = StageFailed reason})
+                      editSlot frames (slotOf frame) (\entry → entry {syncCleanupState = FenceUncertain reason})
+                      failRootsSession roots CleanupFailed
+                    note failures (unlessLoss failure (FrameCleanupFailed frame reason))
+                  Right False → pure ()
+                  Right True → do
+                    atomically (editSlot frames (slotOf frame) (\entry → entry {syncCleanupState = FenceSignalled}))
+                    released'
+              -- Signalled at an earlier step, whose release a cancellation kept it
+              -- from reaching.
+              FenceSignalled → released'
+              _ → pure ()
+    passes [] 0
   -- Whatever was not reached this step still has its fences pending.
   pending ← length . filter pendingFence . concatMap (\sync → [syncFenceState sync, syncCleanupState sync]) . Map.elems <$> readTVarIO (framesSlots frames)
   released ← readIORef settled
@@ -385,6 +401,26 @@ retireTargetFrames frames target = owner (framesRecording frames) $ do
         && syncRenderedState sync == SemaphoreUnsignalled
         && syncFenceState sync `elem` [FenceIdle, FenceSignalled]
         && syncCleanupState sync `elem` [FenceIdle, FenceSignalled]
+
+-- | One piece of a progress step's work.
+data Work
+  = ObserveSubmission !SubmissionId !SubmissionRecord
+  | MakeCleanup !FrameSlotId
+  | ObserveCleanup !FrameSlotId !FrameRecord
+
+-- | What identifies a piece of work within one step.
+workKey ∷ Work → Either SubmissionId (FrameSlotId, Bool)
+workKey = \case
+  ObserveSubmission submission _ → Left submission
+  MakeCleanup frame → Right (frame, False)
+  ObserveCleanup frame _ → Right (frame, True)
+
+-- | The list starting at the cursor's place in it.
+rotated ∷ Natural → [a] → [a]
+rotated _ [] = []
+rotated cursor items = drop offset items <> take offset items
+  where
+    offset = fromIntegral (cursor `mod` fromIntegral (length items))
 
 -- | The model's own classification of a frame this owner holds no record of:
 -- asking it to perform the operation, and keeping only the refusal, changes

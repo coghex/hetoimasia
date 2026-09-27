@@ -963,6 +963,12 @@ recorded before the step ends:
   its fence-reset bookkeeping, and the native fence, reset and unsubmitted, is
   never waited on. Every frame is still acquired with its batch sealed, and can
   be submitted again or skipped. `SubmittedNothing` is answered.
+- **The fence reset raised.** Nothing was submitted and every frame is still
+  acquired, with its batch sealed; but the fence is now in doubt, so it is
+  marked uncertain and retained for ever with its slot, and since native
+  synchronization safety is unknown, admission closes and the session fails
+  with `CleanupFailed` before the failure is re-raised. The frames can still be
+  skipped: a skip uses the slot's cleanup fence.
 - **Anything else raised.** Whether anything was submitted is unknown. Each frame
   enters the model's uncertain-effect state, which retains every parent for
   ever and stops admission; the fence and both semaphores of each frame are
@@ -1014,8 +1020,13 @@ unsignals the acquisition semaphores it waited on, and frees each slot that
 owes nothing else. A signalled cleanup fence, followed by a release that
 returned, is the `UnpresentedFrameSettled` fact. Nothing else — elapsed time, a
 returned call, a cancellation, a reset fence — ever becomes either. A step makes
-at most the model's progress-action limit of native calls, runs whatever the
-target's phase — closing included — and raises only once it has recorded
+at most the model's progress-action limit of native calls. Its work — each
+outstanding submission's fence, each cleanup owed, each cleanup fence — is one
+list that each step starts one place further along, so a budget smaller than
+the work still reaches every piece in turn and a fence that never signals
+cannot hold a later submission's completion, cleanup or release back; work the
+step itself creates is taken by a further pass while the budget lasts. A step
+runs whatever the target's phase — closing included — and raises only once it has recorded
 everything that returned: device loss first, then the first cleanup failure or
 uncertain effect. The native case polls it a millisecond apart; composing it
 into the owner's loop and the model's schedule is VK-16's.
@@ -1234,7 +1245,8 @@ sharing one submission and retaining both frames' generation and storages until
 it completes, and two separate submissions settling independently; a duplicate,
 consumed, discarded and partial batch refused before any native call; a
 no-effect failure leaving no pending fence, never asked, and the frame
-resubmitted; an uncertain submission retained for ever with admission stopped;
+resubmitted; a fence reset that raised retaining the fence, stopping admission
+and failing the session while the frame is still skipped safely; an uncertain submission retained for ever with admission stopped;
 a skip returning its image only after its cleanup completed, with nothing
 rebuilt; a skip after submission refused; a closed, never-presented frame
 settled only after its rendering and then its render-finished semaphore's
@@ -1244,7 +1256,9 @@ holding the slot and pool record until the evidence; a cleanup submission and a
 release that raised each retaining the frame and its image, failing the session
 and never settling; a consumer that raised run once and its frame skipped; the
 one-slot schedule through acquire, record, submit, close, settle and the slot's
-reuse, and the two-slot schedule with two frames in flight; and a cancellation
+reuse, and the two-slot schedule with two frames in flight; a one-action step
+observing, cleaning up and releasing a later submission that completed first
+while an earlier one never does; and a cancellation
 at each native handoff — the acquisition, the submission, a skip's cleanup, a
 closed frame's cleanup and the release — each recorded before it is delivered.
 `Frames visibility across the package boundary` compiles external clients as
