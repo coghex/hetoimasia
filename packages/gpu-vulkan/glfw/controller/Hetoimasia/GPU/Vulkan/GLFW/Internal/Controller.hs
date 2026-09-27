@@ -783,7 +783,12 @@ destroyOwner state = do
       held ← atomically (Map.keys <$> readTVar (stateTargets state))
       listed ← atomically (bridgeObligations bridge lease)
       let late = [obligation | obligation ← listed, bridgeObligationAttachment bridge obligation `notElem` held]
-      _ ← mapM (bridgeDischarge bridge) late
+      outcomes ← mapM (bridgeDischarge bridge) late
+      -- A late surface whose destruction did not complete is a failed
+      -- cleanup, whatever else failed first; the lease then still owes it,
+      -- which retains the instance below.
+      for_ [failure | DischargeUncertain (ExceptionWithContext _ failure) ← outcomes] $ \failure →
+        atomically (latchTerminal (stateRoots state) (TerminalCleanupFailed ("destroying a surface created while the lease closed: " <> Text.pack (displayException failure))))
       answer ← atomically (bridgeRelease bridge lease)
       unless (answer == LeaseReleasable) (throwIO (LeaseRetained answer))
       pure (length late)

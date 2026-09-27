@@ -19,7 +19,7 @@
 module Test.GPU.Vulkan.Native.Terminal (spec) where
 
 import Control.Concurrent.STM (atomically, newTVarIO, readTVarIO, writeTVar)
-import Control.Exception (toException)
+import Control.Exception (SomeException, throwIO, toException)
 import Control.Monad (forM_, void)
 import Data.List.NonEmpty (NonEmpty ((:|)))
 import Test.Hspec (Expectation, Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy)
@@ -65,6 +65,7 @@ import Hetoimasia.GPU.Vulkan.Native.Roots
   )
 import Test.GPU.Vulkan.Native.FramesRig
 import Test.GPU.Vulkan.Native.FramesStandIn
+import Test.GPU.Vulkan.Native.RecordingStandIn (RecordingCall (..), duringReset, recordingCalls)
 import Test.GPU.Vulkan.Native.StandIn (StandInLoss (..), Step (AtFrameCall))
 
 spec ∷ Spec
@@ -104,6 +105,22 @@ spec = describe "Terminal failure" $ do
       primaryIs rig lostLoss
       presentFrame (rigFrames rig) (ownedFrame frame) `shouldReturn'` (`shouldSatisfy` sessionRefused lostLoss)
       tornDownUnderLoss rig
+
+    it "with an unsubmitted recording whose pool reset reported the loss: the release lets it go without another reset" $ do
+      rig ← newRig
+      frame ← owned rig
+      _ ← sealed rig frame
+      -- The skip's reset of the frame's storage is what reports the loss.
+      duringReset (rigRecordingStandIn rig) (markDeviceLost (rigStandIn rig) >> throwIO (StandInLoss AtFrameCall))
+      skipFrame (rigFrames rig) (ownedFrame frame) `raises` \(_ ∷ SomeException) → True
+      duringReset (rigRecordingStandIn rig) (pure ())
+      primaryIs rig lostLoss
+      resets ← length . filter isReset <$> recordingCalls (rigRecordingStandIn rig)
+      -- The batch the reset left uncertain holds nothing back: nothing is
+      -- reset against the lost device again, and the frame, its generation and
+      -- the roots are released and destroyed.
+      tornDownUnderLoss rig
+      length . filter isReset <$> recordingCalls (rigRecordingStandIn rig) `shouldReturn` resets
 
     it "during idle progress: no fence is asked or waited on again, and none is recorded as signalled" $ do
       rig ← newRig
@@ -319,6 +336,11 @@ primaryIs rig expected = atomically (readRootsTerminal (rigRoots rig)) `shouldRe
 
 evidenceOf ∷ Rig → IO [TeardownEvidence]
 evidenceOf rig = reportEvidence <$> atomically (readRootsTerminal (rigRoots rig))
+
+isReset ∷ RecordingCall → Bool
+isReset = \case
+  ResetStorage _ → True
+  _ → False
 
 lostLoss ∷ TerminalCause → Bool
 lostLoss = \case

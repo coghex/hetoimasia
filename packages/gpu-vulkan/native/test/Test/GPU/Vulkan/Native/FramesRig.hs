@@ -111,7 +111,7 @@ import Hetoimasia.GPU.Vulkan.Native.Presentation
 import Hetoimasia.GPU.Vulkan.Native.Recording
 import Hetoimasia.GPU.Vulkan.Native.Roots
 import Test.GPU.Vulkan.Native.FramesStandIn
-import Test.GPU.Vulkan.Native.RecordingStandIn (newRecordingStandIn, recordingStandInOps)
+import Test.GPU.Vulkan.Native.RecordingStandIn (RecordingStandIn, newRecordingStandIn, recordingStandInOps)
 import Test.GPU.Vulkan.Native.StandIn (StandIn, StandInRoots, newStandIn, newStandInRoots, standardRequest, surfaceNumbered)
 
 data Rig = Rig
@@ -125,6 +125,7 @@ data Rig = Rig
     -- ^ The first target.
   , rigTargets ∷ ![TargetId]
     -- ^ Every target, in the order they were admitted.
+  , rigRecordingStandIn ∷ !RecordingStandIn
   , rigStorages ∷ ![FrameStorage]
   , rigCommands ∷ ![Word64]
   }
@@ -171,7 +172,7 @@ newRigClassed classes request = do
   views ← atomically (readManaged recording)
   let commands = [handle | ManagedView _ _ "frame storage" [handle] ← views]
   case targets of
-    first : _ → pure (Rig standIn rootsStandIn roots generations recording frames first targets storages commands)
+    first : _ → pure (Rig standIn rootsStandIn roots generations recording frames first targets recordingStandIn storages commands)
     [] → fail "a rig needs a target"
 
 -- | Every target at this extent, as its owner would publish it.

@@ -40,7 +40,7 @@ import Hetoimasia.GPU.Model
 import Hetoimasia.GPU.Model.Identity (FrameSlotId, IdentityKind (..), Misuse (..), TargetId, frameTarget)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Layer (FrameOps (..), SubmitBatch (..), WaitStage (..))
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.State
-import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Batches (resetFrameRecorder)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Batches (forgetUnsubmittedBatches, resetFrameRecorder)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   ( BatchRecord (..)
   , BatchStanding (..)
@@ -71,8 +71,10 @@ import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost, failRootsSession,
 -- raises 'FrameCleanupFailed'.
 --
 -- After the device's loss no cleanup submission is made — the lost device
--- would never complete one — and the frame waits, skipped ('StageLost'), for
--- the device-loss release to let it go.
+-- would never complete one — and no storage is reset against it: the model's
+-- skip lets go of the unsubmitted recording, whose batch records go with it,
+-- uncertain ones included, and the frame waits, skipped ('StageLost'), for the
+-- device-loss release to let it go.
 skipFrame ∷ Frames q inst msgr phys dev cmd → FrameSlotId → IO (Either Refusal ())
 skipFrame frames frame =
   owned recording $
@@ -81,7 +83,10 @@ skipFrame frames frame =
       Right (sync, device, family) → do
         batches ← Map.elems <$> readTVarIO (recordingBatches recording)
         let unsubmitted = [() | record ← batches, batchFrame record == frame, not (submitted (batchStanding record))]
-        reset ← if null unsubmitted then pure (Right ()) else resetFrameRecorder recording frame
+        -- After the device's loss nothing is reset against it: the model's
+        -- skip lets go of the unsubmitted recording, whose records go with it.
+        lost ← atomically (lossObserved frames)
+        reset ← if null unsubmitted || lost then pure (Right ()) else resetFrameRecorder recording frame
         case reset of
           Left refusal → pure (Left refusal)
           Right () → mask_ $
@@ -101,7 +106,9 @@ skipFrame frames frame =
       answer ← modelAnswer roots (fmap (\model → (model, ())) . skipUnsubmittedFrame frame)
       lost ← lossObserved frames
       case answer of
-        Right () | lost → Right True <$ editFrame frames frame (\record → record {recordStage = StageLost})
+        Right () | lost → do
+          forgetUnsubmittedBatches recording frame
+          Right True <$ editFrame frames frame (\record → record {recordStage = StageLost})
         _ → pure (False <$ answer)
     checked = do
       live ← Map.lookup frame <$> readTVar (framesLive frames)

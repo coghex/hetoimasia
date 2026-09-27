@@ -15,7 +15,7 @@ module Test.GPU.Vulkan.GLFW.Controller (spec) where
 
 import Control.Concurrent (ThreadId, forkIO, myThreadId, throwTo, yield)
 import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (..), threadStatus)
-import Control.Concurrent.STM (TVar, atomically, check, newTVarIO, readTVar, writeTVar)
+import Control.Concurrent.STM (TVar, atomically, check, newTVarIO, orElse, readTVar, registerDelay, writeTVar)
 import Control.Exception (Exception (..), ExceptionWithContext (ExceptionWithContext), SomeException, asyncExceptionFromException, asyncExceptionToException, finally, throwIO, try)
 import Control.Monad (forM_, replicateM_, void)
 import Data.List (isSubsequenceOf, nub)
@@ -120,6 +120,7 @@ spec = describe "Vulkan controller" $ do
     it "latches a sink failure as a terminal status of its own, with the capture's verdict saying so" (bounded testSinkFailure)
     it "reports what an exit could not verify as retained, beside the cleanup failure that is its primary" (bounded testRetentionReported)
     it "keeps the dependency order and the loss when cancellation is delivered repeatedly during the drain that follows it" (bounded testCancelledAfterLoss)
+    it "latches the failed destruction of a surface created while the lease closed, beside the earlier primary, and retains the instance" (bounded testLateSurfaceFails)
 
   describe "progress" $
     it "reports no work and no deadline while nothing is deferred, since nothing is recorded or submitted" (bounded testNoDemand)
@@ -958,6 +959,60 @@ testCancelledAfterLoss = do
         ThreadBlocked _ → pure ()
         ThreadFinished → pure ()
         _ → yield >> awaitBlocked thread
+
+testLateSurfaceFails ∷ IO ()
+testLateSurfaceFails = do
+  rig ← twoWindows
+  gate ← newTVarIO False
+  -- The second window's surface is still in its native call when the owner's
+  -- drain closes the lease, and its destruction then fails.
+  scriptSurface rig 101 (CreateHolds gate)
+  scriptSurface rig 101 DestroyFails
+  controllerOf ← newTVarIO Nothing
+  _ ← runRigCaught rig $ \host _ → do
+    [first, second] ← windowsOf host
+    let owner = vulkanGraphicsOwner host
+    atomically (writeTVar controllerOf (Just (vulkanController host)))
+    one ← handedOver host first RequiredTarget
+    TargetUsable ← awaitStanding host one
+    scene ← prepare ()
+    -- While the main thread is inside the second surface's creation, a layer
+    -- reports an error; the owner learns of it at its next round and its
+    -- drain retires the first target and the device, then waits for the
+    -- creation still in flight before it destroys what it left.
+    void . forkIO $ do
+      atomically (creationsBegun rig >>= check . (>= 2))
+      reportErrorNow rig "an error while a surface is being created"
+      -- A newer scene wakes the owner; one publication that lands just as
+      -- the owner settles into its wait may not, so the example publishes
+      -- again, a bounded number of times, until the failure is latched. The
+      -- short wait between publications only paces them: whether the owner
+      -- failed is read from its latch.
+      let poke remaining = do
+            _ ← atomically (publishOwnerScene (ownerHandoff owner) scene)
+            paced ← registerDelay 20000
+            failed ← atomically $
+              (readOwnerFailure owner >>= check . isJust >> pure True)
+                `orElse` (readTVar paced >>= check >> pure False)
+            if failed || remaining <= (0 ∷ Int) then pure () else poke (remaining - 1)
+      poke 500
+      awaitEvent rig DeviceDestroyed
+      atomically (writeTVar gate True)
+    -- The owner's port has closed by the time the creation returns, so the
+    -- main thread settles this attachment itself. Nothing the owner produced
+    -- lets the instance go: independent evidence of the owner's destruction
+    -- ends the exit, once no attachment is pending.
+    _ ← handOverVulkanTarget (vulkanController host) (vulkanWindowHost host) owner second RequiredTarget
+    void . forkIO $ do
+      atomically (check . null =<< hostPendingAttachments (vulkanWindowHost host))
+      publishOwnerDestruction owner (ownerDestroyed "published independently by the example")
+  Just controller ← atomically (readTVar controllerOf)
+  report ← atomically (readVulkanTerminal controller)
+  reportPrimary report `shouldBe` Just TerminalValidationError
+  reportEvidence report `shouldSatisfy` any (\case LaterFailure (TerminalCleanupFailed _) → True; _ → False)
+  events ← journal rig
+  length [() | SurfaceDestroyed 101 ← events] `shouldBe` 1
+  [e | e ← events, e `elem` [MessengerDestroyed, InstanceDestroyed]] `shouldBe` []
 
 -- | Publish, from another thread, the evidence the owner could not produce:
 -- this attachment's facts once it is retiring, and the owner's destruction

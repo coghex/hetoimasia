@@ -1315,7 +1315,7 @@ sources, is the session's **primary**:
 | An error-severity validation report | At the next checkpoint, which asks the capture's error latch — set before the report's detail is admitted, whatever the queue, the logger's filter or the sink did | `TerminalValidationError` |
 | The diagnostic sink failed | At the next checkpoint, which asks `captureSinkFailure` | `TerminalSinkFailed`, a terminal status of its own |
 | A native effect whose outcome is unknown | By the step that observed it: a submission, a presentation, a bookkeeping refusal | `TerminalUncertainEffect` |
-| A cleanup that raised | By the destruction or cleanup that raised: a surface, a root, a generation, a frame's cleanup submission or release, a slot's or pool record's objects, a managed resource | `TerminalCleanupFailed` |
+| A cleanup that raised | By the destruction or cleanup that raised: a surface — one created while the lease closed included — a root, a generation, a frame's cleanup submission or release, a slot's or pool record's objects, a managed resource | `TerminalCleanupFailed` |
 | A required target's recovery exhausted | The model escalates it; the next checkpoint, or any read of the latch, takes it | `TerminalRequiredTarget` |
 
 Latching the primary is one transaction: it closes the roots' admission and
@@ -1380,7 +1380,11 @@ waiting for work that may never complete — and nothing else:
 - no fence is asked or waited on again: `progressFrames` makes no call, and a
   step whose own query lost the device asks nothing further; `awaitFrames`
   waits for nothing;
-- a skipped frame makes no cleanup submission (`StageLost`);
+- a skipped frame makes no cleanup submission (`StageLost`), and no storage is
+  reset against the lost device: the unsubmitted recording's commands can
+  never execute, so its batch records go with the model's skip — one an
+  earlier reset left uncertain included — and the storage's destruction frees
+  them;
 - `releaseFramesToDeviceLoss` skips every frame still acquired, then has the
   model release every submission, certain or uncertain, every enqueued
   presentation, and every frame that had left acquisition
@@ -1643,8 +1647,9 @@ the generation, the surface and the device after it; a validation error
 latched as the primary and a teardown wait that then reports the loss, keeping
 the validation error and switching that teardown to the device-loss rules; the
 loss surviving a cleanup failure during teardown, which joins the evidence and
-is never retried; an uncertain effect with no loss retaining its frame, its
-generation, the surface and the roots through the whole teardown; a
+is never retried; an unsubmitted recording whose pool reset reported the loss
+released without another reset; an uncertain effect with no loss retaining its
+frame, its generation, the surface and the roots through the whole teardown; a
 validation error from the capture's watch refusing the next rendering and
 acquisition with no native call, then settling what was owned under the
 ordinary rules; a sink failure latched as a status of its own, authorizing no
@@ -1666,7 +1671,10 @@ although a full capture dropped its record, since the latch is set before the
 record is admitted; a sink failure latched as
 its own status, with the verdict's consumer unsuccessful and no error latched;
 an exit whose surface destruction failed, reporting the cleanup failure as its
-primary and what it retained beside it; and cancellation delivered three times
+primary and what it retained beside it; a surface still in its native call when
+the drain closed the lease, whose destruction then failed, latched as a cleanup
+failure beside the earlier primary with the instance retained; and cancellation
+delivered three times
 while the drain that follows a loss holds, leaving the destruction order and the
 loss as they were. The diagnostics suite adds the sink failure observable while
 the lifetime still captures.

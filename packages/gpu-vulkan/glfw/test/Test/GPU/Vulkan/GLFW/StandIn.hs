@@ -28,6 +28,7 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , StandInFailure (..)
   , StandInLoss (..)
   , injectedMessageId
+  , reportErrorNow
 
     -- * The surface bridge
   , Bridge
@@ -280,7 +281,18 @@ data Native = Native
   , nativeCurrentExtent ∷ !(TVar (Maybe SurfaceExtent))
     -- ^ The concrete current extent every surface reports, or 'Nothing' for
     -- the application to choose.
+  , nativeCapture ∷ !(TVar (Maybe DiagnosticCapture))
+    -- ^ The session's capture, once the owner's startup has asked the layer
+    -- anything.
   }
+
+-- | Report one error-severity message into the session's capture now, from
+-- the calling thread, as a layer reporting from inside some other call would.
+reportErrorNow ∷ Rig → ByteString → IO ()
+reportErrorNow rig text =
+  readTVarIO (nativeCapture (rigNative rig)) >>= \case
+    Just capture → report capture severityError text
+    Nothing → throwIO (StandInFailure "the session has no capture yet")
 
 -- | Have every surface report this concrete current extent from now on, or
 -- leave the extent to the application.
@@ -347,7 +359,8 @@ report capture severity text =
 nativeLayer ∷ Journal → Native → DiagnosticCapture → RootOps Quiesced Int Int Text Int
 nativeLayer events native capture =
   RootOps
-    { opsInstanceOffer =
+    { opsInstanceOffer = do
+        atomically (writeTVar (nativeCapture native) (Just capture))
         pure
           InstanceOffer
             { offerLoaderVersion = packApiVersion 1 3 296
@@ -698,7 +711,7 @@ newRigVisible visible windows = do
         , scriptFramebufferSize = \_ → readTVarIO framebuffer
         , scriptWindowAttribute = \attribute _ → pure (visible && attribute == VisibleAttribute)
         }
-  native ← Native <$> newTVarIO Map.empty <*> newTVarIO Set.empty <*> newTVarIO 500 <*> newTVarIO Nothing
+  native ← Native <$> newTVarIO Map.empty <*> newTVarIO Set.empty <*> newTVarIO 500 <*> newTVarIO Nothing <*> newTVarIO Nothing
   bridge ← Bridge <$> newTVarIO Map.empty <*> newTVarIO Nothing <*> newTVarIO 100 <*> newTVarIO []
   verdict ← newTVarIO Nothing
   refusalHook ← newTVarIO (\_ → pure ())
