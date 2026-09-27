@@ -1313,7 +1313,7 @@ sources, is the session's **primary**:
 | --- | --- | --- |
 | A queue or device call answered `VK_ERROR_DEVICE_LOST` | By the call's own guard, before the failure propagates | `TerminalDeviceLost`, naming the call |
 | An error-severity validation report | At the next checkpoint, which asks the capture's error latch — set before the report's detail is admitted, whatever the queue, the logger's filter or the sink did | `TerminalValidationError` |
-| The diagnostic sink failed | At the next checkpoint, which asks `captureSinkFailure` | `TerminalSinkFailed`, a terminal status of its own |
+| The diagnostic sink failed | At the next checkpoint, which asks `captureAlarms` | `TerminalSinkFailed`, a terminal status of its own |
 | A native effect whose outcome is unknown | By the step that observed it: a submission, a presentation, a bookkeeping refusal | `TerminalUncertainEffect` |
 | A cleanup that raised | By the destruction or cleanup that raised: a surface — one created while the lease closed included — a root, a generation, a frame's cleanup submission or release, a slot's or pool record's objects, a managed resource | `TerminalCleanupFailed` |
 | A required target's recovery exhausted | The model escalates it; the next checkpoint, or any read of the latch, takes it | `TerminalRequiredTarget` |
@@ -1323,7 +1323,11 @@ fails the model's session with the matching cause (`DiagnosticSinkFailed` for
 a sink). Every cleanup failure is latched with its subject and what raised —
 the surface, root, generation, frame, slot, pool record, batch or resource —
 so several failures of one pass are each accounted for rather than collapsed
-into one. A failure after it never displaces it: it joins the latch's evidence
+into one. The controller's surface discharges — an unannounced or rejected
+attachment's, a retired target's remaining ones, the orphans the owner's
+retirement finds and the late ones its destruction finds — latch each surface
+whose destruction did not complete by its handle and attachment, once: a later
+pass that finds it still owed latches it again under no name. A failure after it never displaces it: it joins the latch's evidence
 as `LaterFailure`, oldest first, the first 64 kept and the rest counted. A
 failure the model recorded by itself before anything was latched is the primary
 it stands for, and one that describes the same failure as the model's cause —
@@ -1338,12 +1342,14 @@ thread.
 
 ### Checkpoints and refusals
 
-A checkpoint asks the capture for its alarms — the controller installs the
-capture's error latch and sink failure as the roots' diagnostic watch — latches
-them in the order they happened, and answers the primary. The capture records,
-when its sink fails, whether the error latch was already set, so a sink failure
+A checkpoint asks the capture for its alarms — the controller installs
+`captureAlarms`, the capture's error latch and sink failure, as the roots'
+diagnostic watch — latches them in the order they happened, and answers the
+primary. The capture's C callback and its worker claim one first-failure cell
+with a compare-and-swap before either sets its own latch, so a sink failure
 followed by a validation error before the next checkpoint stays the primary
-with the error beside it, and the other way round. It raises nothing, calls nothing native and waits
+with the error beside it, and the other way round, whichever thread got there
+first. It raises nothing, calls nothing native and waits
 for nothing. The owner's ordinary operations pass through one:
 
 - the controller's progress step raises the primary — the loss as
@@ -1686,11 +1692,14 @@ checkpoint, kept as the primary with the error beside it;
 an exit whose surface destruction failed, reporting the cleanup failure as its
 primary and what it retained beside it; a surface still in its native call when
 the drain closed the lease, whose destruction then failed, latched as a cleanup
-failure beside the earlier primary with the instance retained; and cancellation
+failure beside the earlier primary with the instance retained; two deferred
+surfaces whose destruction both failed in the owner's orphan pass, each latched
+once by its handle with what its own destruction raised; and cancellation
 delivered three times
 while the drain that follows a loss holds, leaving the destruction order and the
 loss as they were. The diagnostics suite adds the sink failure observable while
-the lifetime still captures.
+the lifetime still captures, and `captureAlarms` answering a sink failure and
+an error in the order they happened, either way round.
 
 #266's examples, `Generations visibility across the package boundary`, compile
 external clients the same way: one that imports every name the public

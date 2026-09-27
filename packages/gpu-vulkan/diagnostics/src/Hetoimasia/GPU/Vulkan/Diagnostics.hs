@@ -123,6 +123,8 @@ module Hetoimasia.GPU.Vulkan.Diagnostics
   , deliveredCount
   , SinkFailure (..)
   , captureSinkFailure
+  , CaptureAlarm (..)
+  , captureAlarms
 
     -- * The verdict
   , DiagnosticVerdict (..)
@@ -216,6 +218,7 @@ import Hetoimasia.GPU.Vulkan.Diagnostics.Internal.Capture
   , CapturedObject (..)
   , CapturedRecord (..)
   , Counter (..)
+  , FirstFailure (..)
   , Latch (..)
   , LimitError (..)
   , Limits (..)
@@ -226,7 +229,9 @@ import Hetoimasia.GPU.Vulkan.Diagnostics.Internal.Capture
   , closeStorage
   , SlotStatus (..)
   , createStorage
+  , firstFailure
   , freeStorage
+  , noteSinkFailure
   , slotStatus
   , storageUserData
   , takeRecord
@@ -397,14 +402,38 @@ deliveredCount = readTVar . handleDelivered
 captureSinkFailure ∷ DiagnosticCapture → STM (Maybe SinkFailure)
 captureSinkFailure = readTVar . handleSinkFailure
 
--- | A sink failure as the worker met it: what failed, and whether the error
--- latch was already set at that moment — so an owner that learns of both at
--- one checkpoint can tell which came first.
-data SinkFailure = SinkFailure
-  { sinkFailureReason ∷ !Text
-  , sinkFailureAfterError ∷ !Bool
+-- | A sink failure as the worker met it.
+newtype SinkFailure = SinkFailure
+  { sinkFailureReason ∷ Text
   }
   deriving (Eq, Show)
+
+-- | A terminal failure the capture holds: its error latch, or its sink's
+-- failure.
+data CaptureAlarm
+  = CaptureErrorLatched
+  | CaptureSinkFailed !Text
+  deriving (Eq, Show)
+
+-- | The capture's terminal failures, in the order they happened.
+--
+-- The order is one fact the storage's slot records, claimed once by whichever
+-- failure gets there first: an error-severity report claims it before it sets
+-- the error latch, and the worker claims it for its sink the moment a
+-- delivery's failure returns to it, before publishing that failure. The
+-- alarms are read first and the order after, so any alarm read here had
+-- already claimed or lost it: two failures that arrive between two
+-- checkpoints are answered in the order they happened, however close
+-- together. A sink failure happens when its delivery's failure returns, so an
+-- error reported while that delivery was still running came first.
+captureAlarms ∷ DiagnosticCapture → IO [CaptureAlarm]
+captureAlarms capture = do
+  latched ← statusErrorLatched <$> captureStatus capture
+  sink ← atomically (captureSinkFailure capture)
+  first ← firstFailure (handleUserData capture)
+  let errors = [CaptureErrorLatched | latched]
+      sinks = [CaptureSinkFailed (sinkFailureReason failure) | Just failure ← [sink]]
+  pure (if first == Just FirstSink then sinks <> errors else errors <> sinks)
 
 -- | Run a body that owns a diagnostic capture, and finalize it on every exit.
 --
@@ -835,11 +864,11 @@ drainWorker config logger storage capture =
                         | isJust (fromException exception ∷ Maybe SomeAsyncException) → rethrowIO failure
                         | otherwise → mask_ $ do
                             writeIORef state (DrainReport (Just failure))
-                            -- Published as soon as it is known, so an owner's
-                            -- checkpoint sees it while the lifetime runs, with
-                            -- whether the error latch was set before it.
-                            latched ← maybe False statusErrorLatched <$> readStatus (handleUserData capture)
-                            atomically (writeTVar (handleSinkFailure capture) (Just (SinkFailure (Text.pack (displayException exception)) latched)))
+                            -- The order is claimed the moment the failure is
+                            -- known; then it is published, so an owner's
+                            -- checkpoint sees it while the lifetime runs.
+                            noteSinkFailure (handleUserData capture)
+                            atomically (writeTVar (handleSinkFailure capture) (Just (SinkFailure (Text.pack (displayException exception)))))
                 pass
           loop = do
             final ← readTVarIO (handleFinal capture)

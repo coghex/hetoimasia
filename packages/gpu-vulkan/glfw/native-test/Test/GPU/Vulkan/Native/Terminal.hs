@@ -96,10 +96,10 @@ import Hetoimasia.GPU.Vulkan.Diagnostics
   , ConsumerOutcome (..)
   , DiagnosticCapture
   , DiagnosticVerdict (..)
+  , CaptureAlarm (..)
   , Quiesced
-  , SinkFailure (..)
   , VerdictIssue (..)
-  , captureSinkFailure
+  , captureAlarms
   , captureStatus
   , defaultCaptureConfig
   , diagnosticVerdict
@@ -213,10 +213,13 @@ data Step = Step
 -- | What the capture's latches say, as a checkpoint asks them: the error latch
 -- and the sink's failure. The controller installs the same watch.
 alarms ∷ DiagnosticCapture → IO [DiagnosticAlarm]
-alarms capture = do
-  latched ← statusErrorLatched <$> captureStatus capture
-  sink ← atomically (captureSinkFailure capture)
-  pure ([AlarmValidationError | latched] <> [AlarmSinkFailed (sinkFailureReason failure) | Just failure ← [sink]])
+alarms capture =
+  map
+    ( \case
+        CaptureErrorLatched → AlarmValidationError
+        CaptureSinkFailed reason → AlarmSinkFailed reason
+    )
+    <$> captureAlarms capture
 
 -- ---------------------------------------------------------------------------
 -- A validation error during rendering

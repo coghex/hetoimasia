@@ -59,7 +59,9 @@ import Hetoimasia.GPU.Vulkan.Diagnostics
   , DiagnosticVerdict (..)
   , FinalizationEvidence (..)
   , VerdictIssue (..)
+  , CaptureAlarm (..)
   , SinkFailure (..)
+  , captureAlarms
   , captureSinkFailure
   , captureStatus
   , capturePhase
@@ -93,6 +95,11 @@ data PrimaryFailure = PrimaryFailure
   deriving (Eq, Show)
 
 instance Exception PrimaryFailure
+
+alarmKind ∷ CaptureAlarm → String
+alarmKind = \case
+  CaptureErrorLatched → "error"
+  CaptureSinkFailed _ → "sink"
 
 consumerName ∷ ConsumerOutcome → String
 consumerName = \case
@@ -277,19 +284,29 @@ spec = describe "Lifetime" $ do
           pure (before, during, phase)
       before `shouldBe` Nothing
       sinkFailureReason during `shouldSatisfy` (not . Text.null)
-      -- Nothing had latched an error when the sink failed.
-      sinkFailureAfterError during `shouldBe` False
       phase `shouldBe` PhaseCapturing
       consumerName (verdictConsumer verdict) `shouldBe` "sink failed"
 
-    it "records that it followed an error the capture had already latched" $ do
+    it "answers a sink failure and an error that followed it in the order they happened" $ do
       (logger, _) ← failingLogger
-      (failure, _) ←
+      (alarms, _) ←
+        capturing logger $ \capture → do
+          offerTo capture (plainOffer SeverityWarning "a warning the sink cannot take")
+          requestDrain capture
+          _ ← bounded (atomically (captureSinkFailure capture >>= maybe retry pure))
+          offerTo capture (plainOffer SeverityError "an error after the sink failed")
+          captureAlarms capture
+      map alarmKind alarms `shouldBe` ["sink", "error"]
+
+    it "answers an error and a sink failure that followed it in the order they happened" $ do
+      (logger, _) ← failingLogger
+      (alarms, _) ←
         capturing logger $ \capture → do
           offerTo capture (plainOffer SeverityError "the error the sink cannot take")
           requestDrain capture
-          bounded (atomically (captureSinkFailure capture >>= maybe retry pure))
-      sinkFailureAfterError failure `shouldBe` True
+          _ ← bounded (atomically (captureSinkFailure capture >>= maybe retry pure))
+          captureAlarms capture
+      map alarmKind alarms `shouldBe` ["error", "sink"]
 
     it "stands beside the body's failure, which is rethrown unchanged with the verdict on it" $ do
       (logger, _) ← failingLogger

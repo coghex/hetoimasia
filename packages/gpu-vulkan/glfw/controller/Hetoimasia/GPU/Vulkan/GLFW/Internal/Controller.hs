@@ -149,7 +149,9 @@ import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as Text
-import Data.Word (Word32)
+import Data.Set (Set)
+import qualified Data.Set as Set
+import Data.Word (Word32, Word64)
 import Foreign.Ptr (Ptr)
 import Numeric (showHex)
 import Hetoimasia.Foundation.Log (Logger)
@@ -174,15 +176,13 @@ import Hetoimasia.GPU.Model (GpuModel)
 import Hetoimasia.GPU.Model.Budget (Budgets)
 import Hetoimasia.GPU.Model.Identity (GenerationId, TargetClass (..), TargetId)
 import Hetoimasia.GPU.Vulkan.Diagnostics
-  ( CaptureConfig
-  , CaptureStatus (statusErrorLatched)
+  ( CaptureAlarm (..)
+  , CaptureConfig
   , DiagnosticCapture
   , DiagnosticVerdict
   , Quiesced
-  , SinkFailure (..)
   , afterLastCallback
-  , captureSinkFailure
-  , captureStatus
+  , captureAlarms
   , retainStorage
   , withDiagnosticCapture
   )
@@ -322,6 +322,9 @@ data State inst msgr phys dev lease obligation = State
     -- announcement the owner's full port refused. Written by the main
     -- thread's handover; the owner's step settles each once its slot has
     -- begun retiring.
+  , stateUncertainSurfaces ∷ !(TVar (Set Word64))
+    -- ^ The surfaces whose destruction did not complete and was latched, so
+    -- a later pass the bridge refuses latches none of them again.
   , stateClock ∷ !MonotonicSource
   , statePoll ∷ !Duration
     -- ^ How soon the owner looks at them again, while any exist.
@@ -397,6 +400,7 @@ newVulkanControllerWith hooks ops pointer bridge layers validation budgets clock
       <*> newTVarIO Map.empty
       <*> newTVarIO Map.empty
       <*> newTVarIO Map.empty
+      <*> newTVarIO Set.empty
       <*> pure clock
       <*> pure poll
       <*> pure hooks
@@ -552,13 +556,12 @@ settleUnannounced state = do
               Just (Deposit _ (CreatedLive obligation)) → [obligation]
               Just (Deposit _ (CreatedUnusable obligation _)) → [obligation]
               _ → []
-        outcomes ← mapM (bridgeDischarge bridge) (nubBy ((==) `on` bridgeObligationHandle bridge) (deposited <> listed))
+        let obligations = nubBy ((==) `on` bridgeObligationHandle bridge) (deposited <> listed)
+        outcomes ← mapM (bridgeDischarge bridge) obligations
         atomically (modifyTVar' (stateUnannounced state) (Map.delete attachment))
+        atomically (latchDischarges state "an unannounced attachment's" (zip obligations outcomes))
         case [failure | DischargeUncertain (ExceptionWithContext _ failure) ← outcomes] of
-          failure : _ → do
-            let reason = Text.pack (displayException failure)
-            atomically (latchTerminal (stateRoots state) (TerminalCleanupFailed ("destroying the surface of the unannounced attachment " <> tshow attachment <> ": " <> reason)))
-            throwIO (UnannouncedSurfaceUncertain attachment reason)
+          failure : _ → throwIO (UnannouncedSurfaceUncertain attachment (Text.pack (displayException failure)))
           [] → pure True
   pure (or settled)
   where
@@ -694,11 +697,11 @@ reject
   → IO TargetHandoff
 reject state attachment reason obligations = do
   outcomes ← mapM (bridgeDischarge (stateBridge state)) obligations
-  atomically (retainRejection state attachment reason)
+  atomically $ do
+    retainRejection state attachment reason
+    latchDischarges state "a rejected target's" (zip obligations outcomes)
   let uncertain = length [() | DischargeUncertain _ ← outcomes]
       destroyed = length obligations - uncertain
-  when (uncertain > 0) $
-    atomically (latchTerminal (stateRoots state) (TerminalCleanupFailed (describeRejection reason <> "; destroying " <> plural uncertain "surface" <> " did not complete")))
   pure $
     if uncertain == 0
       then TargetRolledBack (rollbackEvidence (describeRejection reason <> "; destroyed " <> plural destroyed "surface"))
@@ -730,10 +733,9 @@ retireTarget state retiring = do
     LeaseReady lease → do
       left ← atomically (obligationsOf (stateBridge state) lease attachment)
       outcomes ← mapM (bridgeDischarge (stateBridge state)) left
+      atomically (latchDischarges state "a retired target's" (zip left outcomes))
       case [failure | DischargeUncertain failure ← outcomes] of
-        failure@(ExceptionWithContext _ exception) : _ → do
-          atomically (latchTerminal (stateRoots state) (TerminalCleanupFailed ("destroying a surface of " <> tshow attachment <> ": " <> Text.pack (displayException exception))))
-          rethrowIO failure
+        failure : _ → rethrowIO failure
         [] → pure (length left)
     _ → pure 0
   pure . targetRetired $
@@ -755,10 +757,9 @@ retireOwner state retiring = do
       let exempt = held <> retiringUnverified retiring
           orphans = [obligation | obligation ← listed, bridgeObligationAttachment bridge obligation `notElem` exempt]
       outcomes ← mapM (bridgeDischarge bridge) orphans
+      atomically (latchDischarges state "an orphaned" (zip orphans outcomes))
       let uncertain = length [() | DischargeUncertain _ ← outcomes]
-      when (uncertain > 0) $ do
-        atomically (latchTerminal (stateRoots state) (TerminalCleanupFailed ("destroying " <> plural uncertain "surface" <> " no target held did not complete")))
-        throwIO (OrphanSurfacesUncertain uncertain)
+      when (uncertain > 0) (throwIO (OrphanSurfacesUncertain uncertain))
       pure (length orphans)
     _ → pure 0
   atomically $ do
@@ -788,8 +789,7 @@ destroyOwner state = do
       -- A late surface whose destruction did not complete is a failed
       -- cleanup, whatever else failed first; the lease then still owes it,
       -- which retains the instance below.
-      for_ [failure | DischargeUncertain (ExceptionWithContext _ failure) ← outcomes] $ \failure →
-        atomically (latchTerminal (stateRoots state) (TerminalCleanupFailed ("destroying a surface created while the lease closed: " <> Text.pack (displayException failure))))
+      atomically (latchDischarges state "a late" (zip late outcomes))
       answer ← atomically (bridgeRelease bridge lease)
       unless (answer == LeaseReleasable) (throwIO (LeaseRetained answer))
       pure (length late)
@@ -798,6 +798,24 @@ destroyOwner state = do
   pure . ownerDestroyed $
     (if late > 0 then "destroyed " <> plural late "late surface" <> "; " else "")
       <> maybe "no instance was created" (const "destroyed the explicit messenger and then the instance") proved
+  where
+    bridge = stateBridge state
+
+-- | Latch every surface destruction that did not complete as a cleanup
+-- failure of its own, naming the surface, its attachment and what raised:
+-- several in one pass are each accounted for. A surface already latched is
+-- not latched again when a later pass finds it still owed.
+latchDischarges ∷ State inst msgr phys dev lease obligation → Text → [(obligation, Discharged)] → STM ()
+latchDischarges state what outcomes =
+  for_ [(obligation, failure) | (obligation, DischargeUncertain (ExceptionWithContext _ failure)) ← outcomes] $ \(obligation, failure) → do
+    let handle = bridgeObligationHandle bridge obligation
+    latched ← Set.member handle <$> readTVar (stateUncertainSurfaces state)
+    unless latched $ do
+      modifyTVar' (stateUncertainSurfaces state) (Set.insert handle)
+      latchTerminal (stateRoots state) . TerminalCleanupFailed $
+        "destroying " <> what <> " surface " <> hex handle
+          <> " of " <> tshow (bridgeObligationAttachment bridge obligation)
+          <> ": " <> Text.pack (displayException failure)
   where
     bridge = stateBridge state
 
@@ -1050,16 +1068,14 @@ readVulkanTerminal (VulkanController state) = readRootsTerminal (stateRoots stat
 -- error-severity report whatever became of the report's detail, and its
 -- sink's failure — in the order they happened, so a checkpoint that learns of
 -- both latches the first as the primary.
-captureAlarms ∷ DiagnosticCapture → IO [DiagnosticAlarm]
-captureAlarms capture = do
-  latched ← statusErrorLatched <$> captureStatus capture
-  sink ← atomically (captureSinkFailure capture)
-  let validation = [AlarmValidationError | latched]
-  pure $ case sink of
-    Nothing → validation
-    Just failure
-      | sinkFailureAfterError failure → validation <> [AlarmSinkFailed (sinkFailureReason failure)]
-      | otherwise → AlarmSinkFailed (sinkFailureReason failure) : validation
+diagnosticAlarms ∷ DiagnosticCapture → IO [DiagnosticAlarm]
+diagnosticAlarms capture =
+  map
+    ( \case
+        CaptureErrorLatched → AlarmValidationError
+        CaptureSinkFailed reason → AlarmSinkFailed reason
+    )
+    <$> captureAlarms capture
 
 -- | The swapchain generations of the target this attachment is, while the
 -- owner holds it.
@@ -1228,7 +1244,7 @@ withVulkanOwnerHostHooked hooks logger layer pointer bridge enter extensions con
         (either (const fallbackPoll) convertedDuration (durationFromSeconds RequirePositive (hostIdleWait host)))
     -- Every checkpoint of the owner's asks the capture for its latches, so a
     -- validation error or a sink failure stops the session at the next one.
-    atomically (watchRootsDiagnostics (stateRoots state) (captureAlarms capture))
+    atomically (watchRootsDiagnostics (stateRoots state) (diagnosticAlarms capture))
     let session = do
           entered ← enter (hostSessionConfig host)
           copied ← liftIO (extensions entered)

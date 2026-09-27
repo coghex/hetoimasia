@@ -46,6 +46,9 @@ module Hetoimasia.GPU.Vulkan.Diagnostics.Internal.Capture
   , Latch (..)
   , SlotStatus (..)
   , slotStatus
+  , FirstFailure (..)
+  , noteSinkFailure
+  , firstFailure
   , counterValue
   , latchSet
 
@@ -63,6 +66,7 @@ module Hetoimasia.GPU.Vulkan.Diagnostics.Internal.Capture
   , presetCounter
   ) where
 
+import Data.Functor ((<&>))
 import Control.Exception (Exception, throwIO)
 import Data.Bits ((.&.))
 import Data.ByteString (ByteString)
@@ -426,6 +430,30 @@ slotStatus userData =
   where
     countersLength = fromEnum (maxBound ∷ Counter) + 1
 
+-- | Which terminal failure reached the storage's slot first.
+data FirstFailure
+  = FirstNone
+  | FirstError
+    -- ^ An error-severity report, which claims this before it latches.
+  | FirstSink
+    -- ^ The consumer's sink, which claims this when its failure is known and
+    -- before it is published.
+  deriving (Eq, Show)
+
+-- | Record that the consumer's sink failed, claiming 'FirstSink' unless an
+-- error came first.
+noteSinkFailure ∷ Ptr () → IO ()
+noteSinkFailure userData = () <$ hetoimasia_capture_note_sink_failure userData
+
+-- | Which failure came first, or 'Nothing' once the slot serves another.
+firstFailure ∷ Ptr () → IO (Maybe FirstFailure)
+firstFailure userData =
+  hetoimasia_capture_first_failure userData <&> \case
+    1 → Just FirstError
+    2 → Just FirstSink
+    0 → Just FirstNone
+    _ → Nothing
+
 -- | One counter, for the package's own examples, which never outlive their
 -- storage's slot.
 counterValue ∷ Storage → Counter → IO Word64
@@ -608,6 +636,12 @@ foreign import ccall safe "hetoimasia_vulkan_capture.h hetoimasia_capture_free"
 
 foreign import ccall unsafe "hetoimasia_vulkan_capture.h hetoimasia_capture_user_data"
   hetoimasia_capture_user_data ∷ Ptr StorageT → Ptr ()
+
+foreign import ccall unsafe "hetoimasia_vulkan_capture.h hetoimasia_capture_note_sink_failure"
+  hetoimasia_capture_note_sink_failure ∷ Ptr () → IO CInt
+
+foreign import ccall unsafe "hetoimasia_vulkan_capture.h hetoimasia_capture_first_failure"
+  hetoimasia_capture_first_failure ∷ Ptr () → IO CInt
 
 foreign import ccall unsafe "hetoimasia_vulkan_capture.h hetoimasia_capture_status"
   hetoimasia_capture_status ∷ Ptr () → Ptr Word64 → Ptr CInt → IO CInt
