@@ -115,7 +115,7 @@ import Hetoimasia.GLFW.Command (WaitedSubmission (..), awaitSubmitWindowCommand,
 import Hetoimasia.GLFW.Window (Extent (Extent), WindowConfig, WindowId, hiddenTestWindowConfig, observedRevision)
 import Hetoimasia.GPU.Model.Budget (defaultBudgetRequest, validateBudgets)
 import Hetoimasia.GPU.Model.Identity (TargetClass)
-import Hetoimasia.GPU.Vulkan.Diagnostics (DiagnosticCapture, DiagnosticVerdict, Quiesced, afterLastCallback, captureUserData, defaultCaptureConfig, diagnosticVerdictInContext)
+import Hetoimasia.GPU.Vulkan.Diagnostics (CaptureConfig, DiagnosticCapture, DiagnosticVerdict, Quiesced, afterLastCallback, captureUserData, defaultCaptureConfig, diagnosticVerdictInContext)
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Bridge (Created (..), Discharged (..), LeaseAnswer (..), SurfaceBridge (..))
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   ( VulkanHandover (..)
@@ -605,6 +605,8 @@ data Rig = Rig
     -- refuses a handover's announcement.
   , rigFramebuffer ∷ !(TVar (Int, Int))
     -- ^ What every window's framebuffer size query answers.
+  , rigCapture ∷ !CaptureConfig
+    -- ^ The session's capture limits, when an example narrows them.
   , rigSinkFailing ∷ !(TVar Bool)
     -- ^ Whether the capture's sink raises on the records it is given.
   , rigSinkFailed ∷ !(TVar Bool)
@@ -714,6 +716,7 @@ newRigVisible visible windows = do
       , rigPortCapacity = Nothing
       , rigAfterRefusal = refusalHook
       , rigFramebuffer = framebuffer
+      , rigCapture = defaultCaptureConfig
       , rigSinkFailing = sinkFailing
       , rigSinkFailed = sinkFailed
       }
@@ -732,7 +735,7 @@ runRigHere rig body = do
   integration ← seamIntegration (rigSeam rig) defaultIntegrationScript
   scene ← prepare ()
   budgets ← either (throwIO . StandInFailure . Text.pack . show) pure (validateBudgets defaultBudgetRequest)
-  let config = vulkanHostConfig (rigHostConfig rig) defaultCaptureConfig budgets scene
+  let config = vulkanHostConfig (rigHostConfig rig) (rigCapture rig) budgets scene
   runGraphicsOwnerApplication
     (withLoggingLifetime quietLogger)
     "vulkan-controller-example"

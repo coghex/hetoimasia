@@ -1661,7 +1661,9 @@ refused. `integration-tests` adds `terminal failure`: a validation error a
 stand-in call reports into the session's real capture, through the production C
 callback, latched at the owner's next checkpoint and reaching the application's
 as `GraphicsSessionFailed`, with a later handover refused naming it, the
-teardown in order and the verdict carrying the error; a sink failure latched as
+teardown in order and the verdict carrying the error; the same error latched
+although a full capture dropped its record, since the latch is set before the
+record is admitted; a sink failure latched as
 its own status, with the verdict's consumer unsuccessful and no error latched;
 an exit whose surface destruction failed, reporting the cleanup failure as its
 primary and what it retained beside it; and cancellation delivered three times

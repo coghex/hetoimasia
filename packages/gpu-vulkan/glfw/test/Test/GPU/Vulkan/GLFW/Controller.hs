@@ -25,7 +25,7 @@ import qualified Data.Text
 import System.Timeout (timeout)
 import Hetoimasia.GPU.Model (SessionFailureCause (DeviceLost), SessionState (..), sessionState)
 import Hetoimasia.GPU.Model.Identity (TargetClass (..))
-import Hetoimasia.GPU.Vulkan.Diagnostics (DiagnosticVerdict (..), VerdictIssue (..), verdictIssues)
+import Hetoimasia.GPU.Vulkan.Diagnostics (CaptureConfig (..), CaptureCounters (..), CaptureStatus (..), DiagnosticVerdict (..), VerdictIssue (..), defaultCaptureConfig, verdictIssues)
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
 import Hetoimasia.Foundation.Messaging.Payload (prepare, preparedValue)
 import Hetoimasia.Foundation.Messaging.Snapshot (observedValue, readSnapshot)
@@ -116,6 +116,7 @@ spec = describe "Vulkan controller" $ do
 
   describe "terminal failure" $ do
     it "latches a validation error reported inside a native call as the primary at the owner's next checkpoint, refusing every later handover naming it" (bounded testValidationStops)
+    it "latches an error whose record a full capture dropped, since the latch is set before the record is admitted" (bounded testDroppedErrorStops)
     it "latches a sink failure as a terminal status of its own, with the capture's verdict saying so" (bounded testSinkFailure)
     it "reports what an exit could not verify as retained, beside the cleanup failure that is its primary" (bounded testRetentionReported)
     it "keeps the dependency order and the loss when cancellation is delivered repeatedly during the drain that follows it" (bounded testCancelledAfterLoss)
@@ -823,6 +824,30 @@ testValidationStops = do
     refused = \case
       VulkanSessionFailed TerminalValidationError → True
       _ → False
+
+testDroppedErrorStops ∷ IO ()
+testDroppedErrorStops = do
+  base ← twoWindows
+  -- One record of room, and a worker that drains only when the lifetime asks
+  -- it to: the warning fills the queue and the error finds it full.
+  let rig = base {rigCapture = defaultCaptureConfig {captureQueueCapacity = 1, capturePollInterval = 60000000}}
+  outcome ← runRigCaught rig $ \host control → do
+    [first, second] ← windowsOf host
+    let owner = vulkanGraphicsOwner host
+    _ ← superviseGraphicsOwner control owner
+    scriptNative rig AtQueryDevices (ReportsWarning "a warning that fills the capture's one place")
+    one ← handedOver host first RequiredTarget
+    TargetUsable ← awaitStanding host one
+    scriptNative rig AtSupport (ReportsError "an error whose record finds no room")
+    _ ← handedOver host second OptionalTarget
+    atomically (readOwnerFailure owner >>= check . isJust)
+    checkRuntime control
+  failure ← raisedAs @GraphicsSessionFailed outcome
+  failure `shouldBe` GraphicsSessionFailed TerminalValidationError
+  Just verdict ← atomically (readTVar (rigVerdict rig))
+  let counters = statusCounters (verdictStatus verdict)
+  (countErrors counters, countDropped counters, countAdmitted counters) `shouldBe` (1, 1, 1)
+  verdictIssues verdict `shouldSatisfy` \issues → ErrorLatched `elem` issues && RecordsDropped 1 `elem` issues
 
 testSinkFailure ∷ IO ()
 testSinkFailure = do
