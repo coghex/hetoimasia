@@ -99,9 +99,10 @@ library
 -- private, it is visible to this package's components and to no client.
 --
 -- Only the two facades are exposed, so the rest of the package reaches the
--- resource modules below through Resource.Internal alone. Those hidden modules
--- import one another directly, never the facade, and nothing from the main
--- library:
+-- modules below through Resource.Internal and Worker.Internal alone. Those
+-- hidden modules import one another directly, never either facade, and nothing
+-- from the main library; the worker modules import Resource.Scoped and
+-- Resource.Cleanup directly. The resource modules:
 --   Resource.Cleanup: the single owner of cleanup identity and evidence; the
 --     CleanupFailureId and CleanupFailure representations, the counter that
 --     issues identities, inspection, and the release and retention primitives.
@@ -114,6 +115,30 @@ library
 --     mask discipline.
 --   Resource.Scoped: the Scoped continuation type and its runner, private so
 --     no client can build or rewrite a scope.
+-- The worker modules, in dependency order; Worker.Startup and Worker.Group
+-- import every module above them and never each other:
+--   Worker.Base: worker identity, the request record, the stop token, the
+--     cancellation exception and the group phase, private so WorkerId and
+--     StopToken keep their constructors unexported.
+--   Worker.Outcome: run exits, results, completions, the startup and group
+--     reports, and the helpers that classify a caught failure, private
+--     because those helpers are not part of the contract.
+--   Worker.Types: the group, entry, closing snapshot, drain-status records,
+--     coordination probe, handle and definition, private so WorkerGroup,
+--     Worker and WorkerDefinition keep their constructors and fields
+--     unexported and no client can name an entry.
+--   Worker.Evidence: the evidence attached to a propagated failure and its
+--     readers, private so only this implementation attaches it.
+--   Worker.Observation: the drain status, startup and completion reads, the
+--     committed observation and settled retirement, private because
+--     retirement writes group state.
+--   Worker.Requests: stop and cancellation requests, the cancellation helper
+--     and a failing starter's drain, private because they act on entries.
+--   Worker.Startup: registration, the fork and handoff, the child thread and
+--     terminal publication, private because they write group state.
+--   Worker.Group: the lifetime boundary, closing, the report and the
+--     protected drain, private because they write group state and install the
+--     coordination probe.
 library internal
     visibility: private
     exposed-modules:
@@ -124,6 +149,14 @@ library internal
         Hetoimasia.Foundation.Resource.Cleanup
         Hetoimasia.Foundation.Resource.Scoped
         Hetoimasia.Foundation.Resource.Types
+        Hetoimasia.Foundation.Worker.Base
+        Hetoimasia.Foundation.Worker.Evidence
+        Hetoimasia.Foundation.Worker.Group
+        Hetoimasia.Foundation.Worker.Observation
+        Hetoimasia.Foundation.Worker.Outcome
+        Hetoimasia.Foundation.Worker.Requests
+        Hetoimasia.Foundation.Worker.Startup
+        Hetoimasia.Foundation.Worker.Types
     hs-source-dirs: internal
     default-language: GHC2024
     default-extensions: UnicodeSyntax OverloadedStrings
@@ -173,6 +206,7 @@ test-suite foundation-tests
         Test.Foundation.Time.Spec
         Test.Foundation.Workers.Opacity
         Test.Foundation.Workers.Spec
+        Test.Foundation.Workers.Visibility
     default-language: GHC2024
     default-extensions: UnicodeSyntax OverloadedStrings
     -- -T keeps the runtime's allocation statistics available, which the

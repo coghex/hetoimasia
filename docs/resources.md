@@ -812,11 +812,12 @@ responsibility:
 Dependencies run one way. `Resource.Assembly` imports `Resource.Types` and
 `Resource.Cleanup`; those two and `Resource.Scoped` import no other resource
 module; the facade composes all four. Inside the sublibrary the modules import
-one another directly, never the facade, and nothing from the main library.
+one another directly, never the facade, and nothing from the main library; the
+worker group's modules, which share the sublibrary, likewise import
+`Resource.Scoped` and `Resource.Cleanup` directly and never the facade.
 Outside it — `Hetoimasia.Foundation.Resource`,
 `Hetoimasia.Foundation.Resource.Collection`, `Hetoimasia.Foundation.Recovery`,
-the worker group's `Hetoimasia.Foundation.Worker.Internal`, and any test that
-needs the private seam — code imports only the facade.
+and any test that needs the private seam — code imports only the facade.
 
 `Resource.Cleanup` is the single owner of cleanup identity. It alone defines
 `CleanupFailureId`, `CleanupFailure`, and the counter, and its release attempt
@@ -836,7 +837,8 @@ defines rather than consequences of how `base` stores annotations.
 operations over them, and `allocComponent` builds its scope through the private
 facade from inside the same package. The worker group's implementation lives in
 the same sublibrary, because its types carry `Scoped` and `CleanupFailure`; see
-[workers.md](workers.md#the-coordination-probe). A private sublibrary is
+[workers.md](workers.md#module-structure) for its modules and
+[the coordination probe](workers.md#the-coordination-probe). A private sublibrary is
 visible to the package's own components and to no client, so no client can
 import any of these modules, and the opacity described under
 [The continuation facade](#the-continuation-facade) and
