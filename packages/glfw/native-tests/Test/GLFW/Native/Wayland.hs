@@ -16,8 +16,9 @@
 -- "Test.GLFW.Native.WaylandScenarios"): the default request with no X11
 -- display, the Wayland request in an X11-only environment (under
 -- @tools/display/x11.sh@ itself), the traced unsupported operations, shutdown,
--- failure cleanup, and every connection-loss situation, each of which ends a
--- compositor of the child's own and never the one this run's consent names.
+-- failure cleanup, every connection-loss situation, each of which ends a
+-- compositor of the child's own and never the one this run's consent names,
+-- and the settle against a compositor of the child's own that it pauses.
 -- The compiled-support rejection has no native form here: a prefix built with
 -- Wayland cannot be asked to lack it, so the seam proves it in @glfw-tests@.
 --
@@ -27,22 +28,33 @@
 module Test.GLFW.Native.Wayland (spec) where
 
 import Control.Monad (void)
+import GHC.Clock (getMonotonicTime)
 import Hetoimasia.GLFW.Command
-import Hetoimasia.GLFW.Internal.Native (requestCloseForCheck, sizeLimitsForCheck, windowSizeForCheck, windowTitleForCheck)
-import Hetoimasia.GLFW.Internal.Window (windowNativeHandle)
+import Hetoimasia.GLFW.Internal.Native
+  ( requestCloseForCheck
+  , sizeLimitsForCheck
+  , takeLastWaitForCheck
+  , takeWaitNotedForCheck
+  , wakeCountsForCheck
+  , windowSizeForCheck
+  , windowTitleForCheck
+  )
+import Hetoimasia.GLFW.Internal.Window (EventProcessing (AwaitEventsFor), processWindowEvents, windowNativeHandle)
 import Hetoimasia.GLFW.Session
   ( Backend (Wayland)
+  , Session
   , reportedErrors
   , sessionBackend
   , takeAsynchronousReports
   )
 import Hetoimasia.GLFW.Window
+import Numeric.Natural (Natural)
 import System.Directory (doesFileExist, getCurrentDirectory)
 import System.Environment (getExecutablePath, lookupEnv)
 import System.FilePath (takeDirectory, (</>))
 import System.IO (hFlush, stdout)
 import Test.GLFW.Native.Consent (Consent (IsolatedWayland), waylandValue)
-import Test.GLFW.Native.Control (converge, returnedWithRevision, withTwo)
+import Test.GLFW.Native.Control (converge, returnedWithRevision, showAndRelease, withTwo)
 import Test.GLFW.Native.Host (testCloseOrder)
 import Test.GLFW.Native.Private
   ( Launched (..)
@@ -165,6 +177,38 @@ spec shared = describe "on an isolated Wayland session" . onlyWayland gate $ do
     it "answers placement, focus, and borderless requests unsupported and placement and iconified observations unavailable, invoking none of their native operations or getters" $
       privateScenarioReporting gate "wayland-unsupported"
 
+  -- The wake examples below begin from a settled connection. These two show
+  -- what settling must absorb on Wayland: the compositor's answer to an earlier
+  -- example's shown and released window, which GLFW queues and sends only at
+  -- the next event processing, and which can arrive after a pending-events poll
+  -- has returned. Showing matters: releasing a window that was shown detaches
+  -- the buffer its fallback decorations held, and the compositor posts that
+  -- buffer's release, carrying the delete_id it queued for every destroyed
+  -- object. Releasing a window that was never shown posts nothing.
+  describe "settling before a wait" $ do
+    it "settles a shown and released window's cleanup, so the next production wait nothing wakes reaches its bound" $ do
+      evidence ← owned shared $ \session → do
+        showAndRelease session
+        beforeSettle ← wakeCountsForCheck
+        Wake.settle session
+        afterSettle ← wakeCountsForCheck
+        unwokenWait session beforeSettle afterSettle
+      unwokenLine "settled cleanup" evidence
+      unwokenWakeCounts evidence `shouldSatisfy` allEqual
+      unwokenReturned evidence `shouldSatisfy` (> unwokenFloor evidence)
+      unwokenWoken evidence `shouldBe` False
+      unwokenNoted evidence `shouldBe` False
+      unwokenSeconds evidence `shouldSatisfy` (>= unwokenBound)
+
+    -- Whether the compositor answers before or after the pending-events poll
+    -- is a race in the example above. Here it is not: a child pauses a
+    -- compositor of its own before settling, and resumes it only once it has
+    -- observed the owner blocked, so the answer cannot arrive before the
+    -- settle blocks. A settle that only processed pending events would block
+    -- first in the unwoken wait, and the answer would end that wait.
+    it "settles that cleanup against a compositor that answers only once the owner has blocked, in a private child" $
+      privateScenarioReporting gate "wayland-settle"
+
   Wake.spec shared
 
   describe "shutdown" $
@@ -277,3 +321,69 @@ describeSample observation =
     <> show (observedFramebufferExtent observation)
     <> ", content scale "
     <> show (observedContentScale observation)
+
+-- | One production wait that nothing in the example wakes.
+data UnwokenWait = UnwokenWait
+  { unwokenFloor ∷ Natural
+    -- ^ The sequence number of the last wait recorded before this one.
+  , unwokenReturned ∷ Natural
+    -- ^ The sequence number of the wait that returned.
+  , unwokenWoken ∷ Bool
+  , unwokenNoted ∷ Bool
+  , unwokenSeconds ∷ Double
+    -- ^ How long the waiting owner operation took, against 'unwokenBound'.
+  , unwokenWakeCounts ∷ [(Natural, Natural)]
+    -- ^ The production wake counts before the example's settling or release,
+    -- once that was done, and after the wait.
+  }
+
+-- | Make one production wait bounded by 'unwokenBound' on the owner thread,
+-- with nothing posted to wake it, and read back its record.
+unwokenWait ∷ Session → (Natural, Natural) → (Natural, Natural) → IO UnwokenWait
+unwokenWait session before settled = do
+  (floor', _) ← takeLastWaitForCheck
+  started ← getMonotonicTime
+  processWindowEvents session (AwaitEventsFor unwokenBound)
+  seconds ← subtract started <$> getMonotonicTime
+  (returned, woken) ← takeLastWaitForCheck
+  noted ← takeWaitNotedForCheck
+  after ← wakeCountsForCheck
+  pure
+    UnwokenWait
+      { unwokenFloor = floor'
+      , unwokenReturned = returned
+      , unwokenWoken = woken
+      , unwokenNoted = noted
+      , unwokenSeconds = seconds
+      , unwokenWakeCounts = [before, settled, after]
+      }
+
+-- | The bound on an unwoken wait: long beside a compositor's answer on the same
+-- machine, which arrives within milliseconds, and short enough that reaching it
+-- costs the run little.
+unwokenBound ∷ Double
+unwokenBound = 0.5
+
+allEqual ∷ Eq a ⇒ [a] → Bool
+allEqual values = and (zipWith (==) values (drop 1 values))
+
+unwokenLine ∷ String → UnwokenWait → IO ()
+unwokenLine label evidence = do
+  putStrLn
+    ( "glfw-native-tests settle evidence: "
+        <> label
+        <> ": wait "
+        <> show (unwokenReturned evidence)
+        <> " after wait "
+        <> show (unwokenFloor evidence)
+        <> " returned "
+        <> (if unwokenWoken evidence then "woken" else "unwoken")
+        <> (if unwokenNoted evidence then " and noted" else "")
+        <> " in "
+        <> show (unwokenSeconds evidence)
+        <> "s of a "
+        <> show unwokenBound
+        <> "s bound; production wake counts "
+        <> show (unwokenWakeCounts evidence)
+    )
+  hFlush stdout

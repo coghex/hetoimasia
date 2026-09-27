@@ -15,7 +15,7 @@
 -- wake's latency; a wait that returned without reaching it returned on an
 -- event, and one that reached it fails the example rather than passing. Each
 -- example prints one evidence line.
-module Test.GLFW.Native.Wake (spec) where
+module Test.GLFW.Native.Wake (spec, settle) where
 
 import Control.Concurrent (ThreadId, forkIO, forkOS, yield)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
@@ -35,11 +35,12 @@ import Hetoimasia.GLFW.Command
   )
 import Hetoimasia.GLFW.Internal.Native (blockedWaitForCheck, takeLastWaitForCheck)
 import Hetoimasia.GLFW.Internal.Window (EventProcessing (..), processWindowEvents)
-import Hetoimasia.GLFW.Session (Session, SessionWake, WakeOutcome (..), sessionWake, wakeSession)
+import Hetoimasia.GLFW.Session (Backend (Wayland), Session, SessionWake, WakeOutcome (..), sessionBackend, sessionWake, wakeSession)
 import Hetoimasia.GLFW.Window (hiddenTestWindowConfig)
 import Numeric.Natural (Natural)
 import System.IO (hFlush, stdout)
 import Test.GLFW.Native.Support (Shared, failed, owned)
+import Test.GLFW.Native.WaylandSync (awaitCompositor)
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 
 spec ∷ Shared → Spec
@@ -170,10 +171,33 @@ wokenWaitBy fork session after act = do
             _ → yield >> observeAndWake ownerDone
 
 -- | Process whatever an earlier example left pending, so the next wait can only
--- return on this example's wakes, and clear the last wait's record.
+-- return on this example's wakes, and clear the last wait's record: the woken
+-- flag is consumed, and the production wait's sequence carries on unchanged.
+--
+-- On X11 and Cocoa, processing the pending events is all it takes. On Wayland
+-- it is not. An earlier example that showed a window and released it leaves
+-- requests GLFW has queued but not sent — the decorations' surfaces and the
+-- buffer they held destroyed, the window's own surface detached and destroyed
+-- — and the pending processing sends them and returns before the compositor
+-- answers. Its answer, the release of that buffer, carrying the @delete_id@
+-- queued for every destroyed object, then arrives inside the next wait and
+-- ends it unwoken.
+-- So on Wayland settle also crosses a synchronization boundary with the
+-- compositor ('awaitCompositor') once the pending processing has sent
+-- everything, and processes pending events again: every request sent before
+-- the boundary has then been processed by the compositor, and every event it
+-- caused has been dispatched. This posts no production wake and changes none
+-- of the counts or records the examples read. The Wayland tree's
+-- @wayland-settle@ child holds this settle to that ordering against a
+-- compositor it pauses, beside a pending-only settle that must fail there. It does not make the connection
+-- silent: an event the compositor sends later on its own account can still end
+-- a wait, which is why every example here still bounds its spurious returns.
 settle ∷ Session → IO ()
 settle session = do
   processWindowEvents session ProcessPending
+  when (sessionBackend session == Wayland) $ do
+    awaitCompositor
+    processWindowEvents session ProcessPending
   _ ← takeLastWaitForCheck
   pure ()
 

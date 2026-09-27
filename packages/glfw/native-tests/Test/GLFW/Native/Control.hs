@@ -16,9 +16,9 @@
 -- events between observations, within a bound of turns, and compares the
 -- observation with what the platform reports rather than with the request
 -- wherever the platform decides the result.
-module Test.GLFW.Native.Control (spec, withTwo, converge, returnedWithRevision) where
+module Test.GLFW.Native.Control (spec, withTwo, showAndRelease, converge, returnedWithRevision) where
 
-import Control.Monad (void)
+import Control.Monad (void, when)
 import Data.Text (Text)
 import Hetoimasia.GLFW.Command
 import Hetoimasia.GLFW.Internal.Native
@@ -168,6 +168,18 @@ withTwo session body =
     withWindow session (hiddenTestWindowConfig "untouched" 240 160) $ \untouched → do
       host ← newWindowCommandHost session 8
       body (performWindowCommand host [addressed, untouched]) addressed untouched
+
+-- | Show a hidden window, observe it shown, and release it and its companion.
+-- On Wayland the release's requests are left queued and unsent, as the
+-- visibility example leaves them for whatever runs next, and a window that was
+-- shown is one whose release the compositor answers.
+showAndRelease ∷ Session → IO ()
+showAndRelease session =
+  withTwo session $ \perform window _ → do
+    void (perform (showWindowCommand (windowIdentity window)))
+    shown ← converge window (\observation → pure (observedVisible observation == Observed True, observedVisible observation))
+    when (shown /= Observed True) $
+      failed ("the window to release was never observed shown: " <> show shown)
 
 -- | What the platform reports of a window's title, size, and position.
 nativeFacts ∷ Window → IO (Maybe Text, (Int, Int), (Int, Int))
