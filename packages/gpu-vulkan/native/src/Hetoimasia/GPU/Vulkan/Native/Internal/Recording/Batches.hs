@@ -201,8 +201,8 @@ invalidate recording storage batches discharge =
 -- consumed exactly this batch ('submissionCarries') — so a batch reset or
 -- skipped in the model, whose frame was then submitted without it, is refused.
 -- It is the positive submission evidence 'readReadback' needs, and VK-12's
--- submission path supplies it once the model has accepted a submission and
--- before that submission completes. Nothing native happens, and the batch is
+-- 'Hetoimasia.GPU.Vulkan.Native.Frames.submitFrames' supplies it once the
+-- model has accepted a submission and before that submission completes. Nothing native happens, and the batch is
 -- never reset or discarded by the recording again.
 noteBatchSubmitted ∷ Recording q inst msgr phys dev cmd → BatchId → SubmissionId → IO (Either Refusal ())
 noteBatchSubmitted recording batch submission =

@@ -21,6 +21,15 @@ batches that can be discarded, readback memory, and the audited `unsafe`
 recording subset — D-15, D-26 and D-28, P-1's renderer-facing boundary and
 P-8. See [Recording through managed resources](#recording-through-managed-resources).
 
+VK-12 ([#225](https://github.com/coghex/hetoimasia/issues/225)) adds **frames**:
+non-blocking acquisition, submission of sealed batches with one completion
+obligation per native submission, and safe abandonment — a skipped
+unsubmitted frame and a submitted frame never presented each returned through a
+tracked cleanup submission and maintenance release — with every native effect
+recorded in the same masked step as its bookkeeping. D-15–D-17, D-23 and D-26,
+P-1's scheduling vocabulary and P-2. See
+[Frames: acquisition, submission and abandonment](#frames-acquisition-submission-and-abandonment).
+
 [#250](https://github.com/coghex/hetoimasia/issues/250) (VKR-2) adds **debug
 names and recording labels**: every native object the backend creates is named
 from identities it already holds — the debug messenger excepted — and every
@@ -28,15 +37,14 @@ batch and every dynamic-rendering pass is bracketed in balanced command-buffer
 labels, which [the diagnostic capture](vulkan_diagnostics.md) now copies. See
 [Names and labels](#names-and-labels).
 
-Nothing is submitted or presented yet: there is no acquisition and no queue
-submission, a recorded batch can only be discarded, and the owner's progress
-step reports no render demand. The controller wires no recording in either:
-the recorder exists in the native package, and its native case drives it on
-private roots. Its deadlines are the brief self-scheduled watch over an
+Nothing is presented yet. Frames are acquired, submitted and abandoned by the
+native package's frames module, and its native case drives them on private
+roots; the controller wires neither the recording nor the frames in, and the
+owner's progress step reports no render demand. Its deadlines are the brief self-scheduled watch over an
 attachment whose announcement a full port deferred, described below, and the
 generations' own: a settling resize, a deferred recovery attempt, and the
-model's schedule for a retired generation still held. Acquisition, submission
-and presentation are VK-12 and VK-13's. Acting on a target
+model's schedule for a retired generation still held. Presentation is VK-13's,
+and composing the frames into the owner's loop VK-16's. Acting on a target
 policy's exhaustion is VK-14's, and completing device-loss teardown across
 submitted work is VK-15's.
 
@@ -67,7 +75,9 @@ the generations above the roots; and VK-11's `Hetoimasia.GPU.Vulkan.Native.Recor
 — managed resources and the recorder over an open native layer —
 `Hetoimasia.GPU.Vulkan.Native.Recording.Vulkan`, its production layer, and
 `Hetoimasia.GPU.Vulkan.Native.Recording.Shaders`, the verification pipeline's
-embedded shaders. The package's private modules, which no client can import,
+embedded shaders; and VK-12's `Hetoimasia.GPU.Vulkan.Native.Frames` —
+acquisition, submission and abandonment over an open native layer — and
+`Hetoimasia.GPU.Vulkan.Native.Frames.Vulkan`, its production layer. The package's private modules, which no client can import,
 are the audited `unsafe` subset, `Hetoimasia.GPU.Vulkan.Native.Internal.Commands`;
 the generations' implementation under
 `Hetoimasia.GPU.Vulkan.Native.Internal.Generations`: `State`, `Uses`,
@@ -78,7 +88,10 @@ recording's implementation under
 `Hetoimasia.GPU.Vulkan.Native.Internal.Recording`: `Layer`, `State`,
 `Construction`, `Recorder`, `Batches`, `Readback` and `Disposal`, which the
 public recording module re-exports as it always exported them (see
-[How the recording is built](#how-the-recording-is-built)).
+[How the recording is built](#how-the-recording-is-built)); and the frames'
+implementation under `Hetoimasia.GPU.Vulkan.Native.Internal.Frames`: `Layer`,
+`State`, `Acquisition`, `Submission` and `Abandonment` (see
+[How the frames are built](#how-the-frames-are-built)).
 
 ## The ownership graph
 
@@ -512,7 +525,7 @@ only home of the `unsafe` subset.
 | Managed rendering resources | `createPipelineLayout`; `createPipeline` over a layout, VK-9's embedded shaders and a color format; `replacePipeline`; `createFrameStorage` for a target's frame slot; `createReadback` of a byte size; `releaseManaged` | The native objects, their accounting reserved with `beginAllocation` before each creation, and the exact generation each handle names |
 | Checked frame | `recordFrame` takes a `FrameSlotId` the model holds acquired, and resolves its image, view, extent and format through the generation that owns them | The frame's generation, retained by the batch |
 | Scoped recorder | `transitionImage`, `beginRendering`, `bindPipeline`, `setViewport`, `setScissor`, `draw`, `endRendering`, `copyToReadback` | The slot's command storage and the batch's recorded references |
-| Recorded batch | `discardBatch`; `resetFrameRecorder`; `noteBatchSubmitted`, for VK-12's submission path | Sealed commands and references, whether or not the caller keeps the `BatchId` |
+| Recorded batch | `discardBatch`; `resetFrameRecorder`; `noteBatchSubmitted`, which VK-12's `submitFrames` calls | Sealed commands and references, whether or not the caller keeps the `BatchId` |
 | Readback | `readReadback`, `fillReadback` | The mapped memory and what last wrote it |
 | Disposal | `disposeResources`, `retireRecording` | Destruction on the owner, only once the model reports every hold ended |
 
@@ -618,8 +631,8 @@ only a live storage is ever reset. A completed batch's record also goes when
 its storage is destroyed, since a storage is disposable only once nothing holds
 it.
 
-`skipUnsubmittedFrame` in the model also discharges a frame's batches. VK-12's
-skip must therefore reset the frame's recorder through this module first, so the
+`skipUnsubmittedFrame` in the model also discharges a frame's batches, so
+VK-12's `skipFrame` resets the frame's recorder through this module first: the
 native invalidation always precedes the discharge.
 
 ### Names and labels
@@ -698,8 +711,9 @@ is still the one raised. Label commands go through the native layer's
 ### The checked frame
 
 `recordFrame` requires the frame to be acquired in the model, with its image's
-generation still recordable. Public acquisition is VK-12's; the backend offers
-no way to fake one. The native case supplies its frame privately — it reserves a
+generation still recordable. Public acquisition is VK-12's `tryAcquireFrame`
+([below](#frames-acquisition-submission-and-abandonment)); the backend offers
+no way to fake one. VK-11's native case, which predates it, supplies its frame privately — it reserves a
 frame and records the acquisition of image 0 in the model alone, through the
 roots' model, making no native acquisition — and after the discard skips the
 frame and supplies its unpresented-frame settlement, which is everything that
@@ -741,7 +755,7 @@ cached where the device offers it — bound, and mapped whole for its lifetime.
   renderer's explicit commands.
 - **Completion before exposure.** `readReadback` answers bytes only with
   positive completion evidence: the batch that recorded the copy was recorded
-  as submitted — `noteBatchSubmitted`, which VK-12's submission path calls once
+  as submitted — `noteBatchSubmitted`, which VK-12's `submitFrames` calls once
   the model has accepted the submission and before it completes, and which
   requires the model's word that the outstanding submission consumed exactly
   that batch (`submissionCarries`), so a batch reset in the model whose frame
@@ -835,6 +849,213 @@ suite reads the package's own import declarations and requires exactly those
 twelve `dynamic` imports and, besides them, only the capture callback's address
 import.
 
+## Frames: acquisition, submission and abandonment
+
+`Hetoimasia.GPU.Vulkan.Native.Frames` is VK-12
+([#225](https://github.com/coghex/hetoimasia/issues/225)): P-1's scheduling
+vocabulary — try to acquire, submit, skip, advance — over P-2's frame ownership
+table, with D-23's safe abandonment of unsubmitted frames and D-15–D-17's
+composable, finite, terminal-on-unknown contract. It sits above the recording: a
+`Frames` is made over a `Recording`, and so over its generations and roots, and
+every native call goes through an open native layer, `FrameOps`, whose
+production form is `Hetoimasia.GPU.Vulkan.Native.Frames.Vulkan`; the headless
+examples supply a stand-in. Every operation belongs to the graphics owner — the
+thread that owns the recording — and any other is refused with
+`RefusedNotOwner`. Refusals are the recording's `Refusal`.
+
+The model decides what every frame owes; this module makes the native calls
+and supplies the model the facts it observed, and nothing else. The GPU model's
+public surface is unchanged: every transition used here — `reserveFrame`,
+`acquireImage`, `resetSubmissionFence`, `submitFrames`, `skipUnsubmittedFrame`,
+`closeSubmittedFrame` and `recordCompletion` — was already
+[its contract](gpu_model.md#frame-ownership).
+
+### The operations
+
+| Operation | What it does | What it answers |
+| --- | --- | --- |
+| `tryAcquireFrame target` | Reserves the frame in the model — its slot, the presentation-pool record and the submission record it may need — makes the slot's synchronization if it has none, and acquires one image with a zero timeout, recording the result in the same masked step | `AcquisitionOwned` an `OwnedFrame`, carrying its `FrameSlotId` and the exact `ImageId` and whether it was suboptimal; `AcquisitionPending` a reason; `AcquisitionSuspended`; `AcquisitionClosing`; `AcquisitionUnavailable`; or a misuse refusal |
+| `recordFrame` (the recording's) | Runs the consumer once and seals one batch for the frame | A `BatchId` |
+| `submitFrames batches` | Validates the whole non-empty request, then resets one fence, submits every batch in the caller's order as one `vkQueueSubmit2` on the session's one graphics queue, and records the result in the same masked step | `SubmittedAs` the one `SubmissionId` every frame of the request shares; `SubmittedNothing` for the specified no-effect failure; or a refusal before any native call |
+| `skipFrame frame` | Consumes an acquired, unsubmitted frame: invalidates its recording, skips it in the model, and makes a cleanup submission waiting on its acquisition semaphore | Acknowledgement of its admission to retirement, not its completion |
+| `closeUnpresentedFrame frame` | Closes a submitted frame that will never be presented, in the model alone | Acknowledgement; its settlement follows its actual rendering completion |
+| `closeTargetFrames target` | Skips every acquired frame of a target and closes every submitted one | What each frame answered |
+| `progressFrames now` | The owner's bounded step: observes pending fences, makes the cleanup submissions closed frames owe, and returns images | A `Progress`: completed submissions, settled frames, cleanups made, fences still pending |
+| `retireTargetFrames target` | Destroys a target's slot synchronization once nothing of it is live or pending | Returns, or raises `FramesRetained` naming what remains |
+
+Frame capacity is the model's: two slots per target by default, one supported
+(D-16). An acquisition refused for want of a slot, a pool record or accounting
+answers `AcquisitionPending (PendingBackpressure kind)` before any native call.
+
+### Slot synchronization
+
+Each frame slot owns four synchronization objects: an **acquisition
+semaphore**, the **render-finished semaphore** its submissions signal, the
+**submission fence** of a native submission it leads, and a **cleanup fence**.
+They are made together, named from the target and slot when the device offers
+naming (`slotObjectName`), the first time the slot is reserved and before its
+first acquisition; a creation or naming that raised destroys what was made
+before it and gives the reservation back. So an acquired frame always has the
+synchronization its abandonment needs, whatever the budgets say by then: the
+cleanup submission charges nothing, and the model reserved its bookkeeping with
+the frame. A slot is reused only once the model has freed it, and the
+acquisition checks its objects are idle — no semaphore owed a signal or waited
+on, no fence pending — and refuses otherwise.
+
+Until VK-13 brings presentation, nothing waits on a render-finished semaphore
+but a cleanup submission, so the slot keeps it. VK-13's per-target presentation
+pool (P-2) takes it over, since a presented frame's semaphore must outlive its
+slot's reuse.
+
+### Acquisition
+
+The target must be this session's (`ForeignIdentity`, `StaleIdentity` or
+`UnknownIdentity` otherwise — misuse, never pending), and admitted: a suspended
+target answers `AcquisitionSuspended`, a retiring one `AcquisitionClosing`, and
+an unavailable one or a failed session `AcquisitionUnavailable`. Its generations
+must be presenting from an active generation: a target still constructing,
+settling a resize, backpressured or waiting to recover answers
+`AcquisitionPending PendingGeneration`; a spent recovery or an unsupported
+surface answers `AcquisitionUnavailable`.
+
+| The call answered | The model | The answer |
+| --- | --- | --- |
+| `VK_SUCCESS` | The frame owns the image | `AcquisitionOwned` |
+| `VK_SUBOPTIMAL_KHR` | The frame owns the image, and the target counts a replacement request | `AcquisitionOwned`, suboptimal; the generations are told (`SwapchainSuboptimal`), so the owner's next step reconciles |
+| `VK_NOT_READY`, `VK_TIMEOUT` | The reservation goes back whole, with no synchronization obligation | `AcquisitionPending PendingNoImage` |
+| `VK_ERROR_OUT_OF_DATE_KHR` | The reservation goes back, and a replacement is requested | `AcquisitionPending PendingReplacement`; the generations are told (`SwapchainOutOfDate`) |
+| `VK_ERROR_SURFACE_LOST_KHR` | The reservation goes back, and a replacement is requested | `AcquisitionPending PendingSurfaceLost`; recovering a lost surface is VK-14's |
+| It raised | The reservation goes back: an error result has no effect | The failure is re-raised; device loss latches as always |
+
+A successful acquisition whose result the model then refused to record — the
+native image is owned and nothing can settle it — is an uncertain effect: the
+slot is retained for ever, admission closes, the session fails with
+`CleanupFailed`, and `FrameEffectUncertain` is raised.
+
+### Submission
+
+`submitFrames` refuses before any native call: a batch of another session; a
+batch named twice (`DuplicateSubject BatchIdentity`); one already submitted,
+discarded or reset (`AlreadyConsumed BatchIdentity`); one still recording,
+partial or uncertain (`WrongPhase BatchIdentity`); a batch whose frame this
+owner did not acquire, or that is no longer acquired; two batches of one frame;
+synchronization that is not ready; and anything the model would refuse, which is
+asked of a copy it then discards. So the whole request is validated and its one
+submission record reserved — the frame reserved it — before any native effect.
+
+Then, in one masked step, the model notes each frame's fence reset, and the
+first frame's slot fence is reset, only now, immediately before the one
+submission it is passed to. Each batch waits on its frame's acquisition
+semaphore at the color-attachment-output stage — where the recorder's
+transition into rendering first touches the image — executes its command
+buffer, and signals its frame's render-finished semaphore. What the call did is
+recorded before the step ends:
+
+- **It returned.** The model records one submission every frame of the request
+  shares, which retains every subject each batch recorded and every frame's
+  swapchain generation until it completes; each batch is recorded as submitted
+  with the recording (`noteBatchSubmitted`), which is the evidence its
+  readback needs; and the fence is pending. Separate calls are separate
+  submissions and settle independently; an explicitly shared request is never
+  split, and unrelated targets are never combined behind the caller's back.
+- **A specified no-effect failure** — out of host or device memory, which the
+  native layer identifies (`opsNoEffect`). Nothing is pending; the model clears
+  its fence-reset bookkeeping, and the native fence, reset and unsubmitted, is
+  never waited on. Every frame is still acquired with its batch sealed, and can
+  be submitted again or skipped. `SubmittedNothing` is answered.
+- **Anything else raised.** Whether anything was submitted is unknown. Each frame
+  enters the model's uncertain-effect state, which retains every parent for
+  ever and stops admission; the fence and both semaphores of each frame are
+  marked uncertain, the session fails, and `FrameEffectUncertain` is raised — or
+  the device loss itself, when that is what it was, so the loss is what the
+  caller sees first. Nothing is rolled back.
+
+### Abandonment
+
+**A skipped frame.** `skipFrame` is legal only for an acquired frame nothing of
+which has been submitted — a skip after any submission is `WrongPhase` — and is
+an ordinary outcome, not a failure. Its unsubmitted recording is invalidated
+natively through the recording's `resetFrameRecorder` and only then discharged;
+the model skips the frame, which consumes its capability; and a cleanup
+submission that runs no command and waits on the acquisition semaphore is made
+with the slot's cleanup fence. Once that fence has signalled, `progressFrames`
+returns the image through `vkReleaseSwapchainImagesEXT` and supplies the model
+the frame's settlement, which frees its slot and its pool record. The swapchain
+is not rebuilt, the target stays available, and later frames are admitted within
+the capacity that remains. Outstanding abandonment still holds its slot and its
+pool record until the evidence arrives.
+
+**A submitted frame never presented.** Close, cancellation or a refused
+presentation can leave a submitted frame unpresented; `closeUnpresentedFrame`
+marks it so in the model, keeping its submission and its image. It is never
+treated as an unsubmitted skip. `progressFrames` first waits for its actual
+rendering completion — its submission's fence — then settles the render-finished
+semaphore, whose signal has no other consumer, through a tracked cleanup
+submission that waits on it, and only once that cleanup's fence has signalled
+returns the image and supplies the settlement. The semaphore is then unsignalled
+with no wait outstanding, and the slot may be reused.
+
+A cleanup submission or a release that raised retains the frame, its image and
+its synchronization for ever — never retried, never fabricated as reusable —
+fails the session with `CleanupFailed`, and raises `FrameCleanupFailed`. This
+follows the precedent every other cleanup failure in the backend sets; isolating
+an optional target from it is VK-14's recovery policy. Both paths were proved on
+both drivers by VK-2 ([macOS](vulkan/macos.md#safe-abandonment),
+[Linux](vulkan/linux.md#safe-abandonment)); the KHR spelling of the release
+entry point resolves on neither, and the binding's call dispatches the EXT one.
+
+### Completion and the owner's step
+
+Only a fence a native submission made pending is ever asked whether it has
+signalled, and only without waiting (`vkGetFenceStatus`), inside
+`progressFrames`. A signalled submission fence is the model's
+`SubmissionCompleted` fact: it discharges every hold the submission carried,
+unsignals the acquisition semaphores it waited on, and frees each slot that
+owes nothing else. A signalled cleanup fence, followed by a release that
+returned, is the `UnpresentedFrameSettled` fact. Nothing else — elapsed time, a
+returned call, a cancellation, a reset fence — ever becomes either. A step makes
+at most the model's progress-action limit of native calls, runs whatever the
+target's phase — closing included — and raises only once it has recorded
+everything that returned: device loss first, then the first cleanup failure or
+uncertain effect. The native case polls it a millisecond apart; composing it
+into the owner's loop and the model's schedule is VK-16's.
+
+### The protected handoff
+
+Each native effect and the bookkeeping of its result are one masked step:
+acquisition, the fence reset and the submission, each cleanup submission, each
+fence observation, and each release. A cancellation is delivered only before the
+call or after its result is recorded, in the model and here, and it is then
+re-raised unchanged; it never undoes an effect or turns a pending fence into
+completion. No consumer code runs inside a handoff, and none is run again:
+recording is `recordFrame`'s, which runs its consumer exactly once, and a
+consumer that raised leaves its frame acquired and its batch partial, to be
+skipped. A step whose bookkeeping cannot commit enters the uncertain state and
+is never rolled back.
+
+### How the frames are built
+
+`Hetoimasia.GPU.Vulkan.Native.Frames` is the entry point and holds no code of
+its own: it re-exports what five private modules under
+`Hetoimasia.GPU.Vulkan.Native.Internal.Frames` implement, as the recording's
+entry point does.
+
+| Module | Responsibility | Depends on |
+| --- | --- | --- |
+| `Layer` | The native layer's shape: `FrameOps`, what an acquisition answers, and a submission's batches. No state, no call. | — |
+| `State` | The `Frames` and the three maps it holds; the answers, failures and views; and the uncertain-state step. | `Layer`, the recording's `State` |
+| `Acquisition` | `tryAcquireFrame` and the slot's synchronization. | `Layer`, `State` |
+| `Submission` | `submitFrames`. | `Layer`, `State`, the recording's `Batches` |
+| `Abandonment` | `skipFrame`, `closeUnpresentedFrame`, `closeTargetFrames`, `progressFrames` and `retireTargetFrames`. | `Layer`, `State`, the recording's `Batches` |
+
+`Frames.Vulkan` imports the public module. Every call it makes is the binding's
+own and `safe`: submission, acquisition, a fence's status and an image's release
+are driver-bound calls, not recording, so the audited `unsafe` subset is
+unchanged. The controller constructs no recording, and so no frames either:
+this module, like the recording, is driven on private roots by its native case,
+and the loop adapter that composes both into the controller's owner step is
+VK-16's.
+
 ## Destruction order
 
 | Exit | What is destroyed, in order, on the owner's thread |
@@ -865,9 +1086,11 @@ model's session with `DeviceLost`, all in one transaction, and raises
 it is the owner's first latched failure, which closes the owner's admission at
 once and reaches the application's checkpoints through `superviseGraphicsOwner`
 while retirement is still running; a later progress step raises it too. The
-retirement that follows is the ordinary child-before-parent one — nothing has
-been submitted, and Vulkan permits destroying a lost device's objects without
-waiting for work — and nothing is recreated or replayed. A cleanup failure
+retirement that follows is the ordinary child-before-parent one — the
+controller submits nothing, and Vulkan permits destroying a lost device's
+objects without waiting for work — and nothing is recreated or replayed. The
+frames treat a loss raised by a submission as an unknown effect, which retains
+what it concerns; completing teardown across submitted work is VK-15's. A cleanup failure
 during it stays behind the loss. An outcome that is unknown rather than lost is
 not loss: it is an ordinary failure, and a destruction whose outcome is unknown
 retains its parents.
@@ -892,6 +1115,9 @@ retains its parents.
 | Frame storages | The recording | Construction inserts one per target frame slot; disposal removes it | The owner | As its managed record | As its managed record |
 | Batch records | The recording | `recordFrame` inserts; a discard or reset removes one after the invalidation returned | The owner | From admission until invalidated | Kept, explicitly uncertain, when an invalidation raised; never retried |
 | A recorder | Its `recordFrame` | The consumer action | The owner | One consumer action | Closed when the action returns or raises |
+| Slot synchronization | The frames | `Acquisition` creates a slot's four objects and marks its acquisition; `Submission` and `Abandonment` advance each object's state; `Abandonment` destroys them | The owner | From the slot's first reservation until the target's frames retire | Destroyed once idle; kept, explicitly uncertain, when a call on them raised |
+| Frame records | The frames | `Acquisition` inserts; `Submission` and `Abandonment` advance; `Abandonment` removes on settlement | The owner | From acquisition until the model records the settlement | Kept, failed or uncertain, when a cleanup or its bookkeeping did not complete |
+| Submission records | The frames | `Submission` inserts; `Abandonment` removes once the fence signalled | The owner | From the native submission until its fence signalled | Removed with the model's completion fact |
 
 ## Evidence
 
@@ -987,6 +1213,45 @@ batch's record with it; invalid viewports and scissors refused; and the FFI audi
 declarations. The model's own suite adds `extendBatch`'s examples. The
 presentation examples add the capture usage, taken only where offered.
 
+VK-12's examples are in `native-tests` too, over a stand-in frames layer that
+models what Vulkan holds the application to — each fence unsignalled, pending
+or signalled, each binary semaphore idle, owed a signal or waited on, and each
+owned image — and records a violation whenever a call breaks a rule: asking a
+fence no submission made pending, resetting or destroying a pending fence,
+acquiring into or signalling a busy semaphore, waiting on one nothing will
+signal, or releasing an image whose acquisition was never waited on to
+completion. Every example requires there were none. They cover: reservation
+before the acquisition, the slot's synchronization made first, and the exact
+generation and image owned; not ready and a timeout giving the reservation back
+whole with no signal owed; a suboptimal acquisition keeping its index beside a
+replacement request; an out-of-date one giving the reservation back and asking
+for the target's replacement; a foreign target as misuse, a stranger's thread,
+a suspended, a closing and a failed target; an exhausted frame budget answered
+before any native call; an acquisition that raised giving the reservation back;
+the submitted batch waiting on the acquisition and signalling the
+render-finished semaphore with its fence reset just before; a two-frame request
+sharing one submission and retaining both frames' generation and storages until
+it completes, and two separate submissions settling independently; a duplicate,
+consumed, discarded and partial batch refused before any native call; a
+no-effect failure leaving no pending fence, never asked, and the frame
+resubmitted; an uncertain submission retained for ever with admission stopped;
+a skip returning its image only after its cleanup completed, with nothing
+rebuilt; a skip after submission refused; a closed, never-presented frame
+settled only after its rendering and then its render-finished semaphore's
+cleanup completed; a closing target's frames abandoned, settled while it closes
+and its slots retired; abandonment after ordinary admission was exhausted,
+holding the slot and pool record until the evidence; a cleanup submission and a
+release that raised each retaining the frame and its image, failing the session
+and never settling; a consumer that raised run once and its frame skipped; the
+one-slot schedule through acquire, record, submit, close, settle and the slot's
+reuse, and the two-slot schedule with two frames in flight; and a cancellation
+at each native handoff — the acquisition, the submission, a skip's cleanup, a
+closed frame's cleanup and the release — each recorded before it is delivered.
+`Frames visibility across the package boundary` compiles external clients as
+the recording's does: every public frames name must compile, each
+`Internal.Frames` module must be refused as hidden, and the `Frames`
+constructor must be refused.
+
 #266's examples, `Generations visibility across the package boundary`, compile
 external clients the same way: one that imports every name the public
 generations module exports, with the constructors it exports, must compile;
@@ -1031,7 +1296,9 @@ they name. VK-10's native cases are retained as
 [`docs/vulkan/macos-vk10.md`](vulkan/macos-vk10.md), from the local Cocoa run,
 and [`docs/vulkan/linux-vk10.md`](vulkan/linux-vk10.md), from the Linux display
 worker. VK-11's are retained as [`docs/vulkan/macos-vk11.md`](vulkan/macos-vk11.md)
-and [`docs/vulkan/linux-vk11.md`](vulkan/linux-vk11.md). #250's are retained as
+and [`docs/vulkan/linux-vk11.md`](vulkan/linux-vk11.md). VK-12's are retained as
+[`docs/vulkan/macos-vk12.md`](vulkan/macos-vk12.md) and
+[`docs/vulkan/linux-vk12.md`](vulkan/linux-vk12.md). #250's are retained as
 [`docs/vulkan/macos-vkr2.md`](vulkan/macos-vkr2.md) and
 [`docs/vulkan/linux-vkr2.md`](vulkan/linux-vkr2.md). #265's, taken again over
 the recording's split into private modules, are retained as
@@ -1096,7 +1363,7 @@ companions — and adds the Vulkan owner's:
 | Main thread | Hspec runs on a thread of its own; the process main thread owns one shared production graphics session: `withLoaderIntegration`, then `runGraphicsOwnerApplication` over `withVulkanOwnerHost`, with the production native layer and surface bridge. An example that needs the main thread — to hand a window's surface over, which GLFW creates there, or to close a window — submits an operation (`onMain`); the main thread runs it between two turns of the host's owner loop and returns its result or rethrows its failure. Windows are created through the host's command port from the example's own thread, which the owner loop executes, as an application's worker would. |
 | Identities | Every dispatched operation is checked, before it runs, to be on the bound process main thread that entered the session — the Haskell thread, the bound flag, and the OS thread read through `pthread_self` — and a failed check fails the operation and the run. Every native call the session makes is recorded where it runs by a `NativeObserver`, so an example shows from the calls themselves that the instance, its messenger, the device and every surface's destruction ran on the graphics owner's thread and every surface's creation on the main thread — never from the name of an Hspec hook. |
 | Sharing | The roots — the instance, its explicit messenger, and the one device — are acquired lazily, by the first dispatched operation, at most once, and shared by every later example. Each example's windows and targets are its own and are closed inside it. |
-| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, `synchronization-hazard`, and `debug-names`. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. |
+| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, `vk12-frames`, `synchronization-hazard`, and `debug-names`. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. |
 | Selection | Building, listing and filtering the tree, a `--dry-run`, and a selection that dispatches nothing acquire nothing and start no child. A selection matching no example fails. `--complete`, which the catalog group passes, runs the whole tree with Hspec's configuration reading left out and then fails unless the shared session was acquired once and every private scenario ran and passed, so no ambient setting can turn the group's receipt into a pass for a subset. The consent rules and the migrated proof's pure release, construction, publication and loader-selection examples need no session and run without consent. |
 | Consent | Read once, at startup, from `HETOIMASIA_NATIVE_SESSION`, with the GLFW suite's rules for `desktop` and `isolated-x11:<display>`; this suite has no Wayland session. Without it every native example is refused before its body, the session is never acquired, and the run ends with the refusal on stderr and a non-zero exit. |
 | Environment | Before any Vulkan call, the suite clears every ambient discovery override and every validation-layer setting it finds and records which, disables implicit layers, and points the layer's settings file at an empty one; a child inherits and re-establishes the same environment. |
@@ -1146,6 +1413,26 @@ the generation, the surface, the device, the messenger and the instance. It
 passes only if no step received a validation error and the capture's verdict
 after the last teardown callback is clean. Its record prints the package's FFI
 configuration. No safe-versus-unsafe timing is measured, and none is asserted.
+
+VK-12's case, `vk12-frames`, runs on private roots for the same reason, over
+VK-11's roots, capture generation and resources, with the production frames
+layer. It acquires a frame through `tryAcquireFrame`; records the triangle and
+the copy of its image into a readback buffer the host filled with a sentinel;
+submits that batch through `submitFrames`; and steps `progressFrames` until the
+submission's fence has signalled — the readback refusing its bytes before that,
+and exposing bytes that are no longer the sentinel after. It then closes that
+never-presented frame and steps until its render-finished semaphore's cleanup
+submission has completed and its image has gone back through
+`vkReleaseSwapchainImagesEXT`; acquires and skips a second frame, stepping until
+its acquisition semaphore's cleanup has completed and its image has gone back;
+and acquires again, skipping each, until an image returned earlier is acquired
+once more, with the swapchain never rebuilt. Nothing is presented. It passes
+only if every frame settled, the rendered image went back only after its
+rendering and its cleanup completed, no step received a validation error — with
+synchronization validation on — and the capture's verdict after the last
+teardown callback is clean. Its record lists every native call the frames made,
+fence status queries aside. It asserts no pixel value: the triangle consumer's
+pixels are VK-17's.
 
 #250's case, `debug-names`, is VK-11's on private roots of its own, with one
 destructive seam only the fixture holds: it wraps the production recording

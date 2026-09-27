@@ -9,6 +9,8 @@
 -- the validation group @test.vulkan-headless@.
 module Main (main) where
 
+import qualified Test.GPU.Vulkan.Native.Frames as Frames
+import qualified Test.GPU.Vulkan.Native.FramesVisibility as FramesVisibility
 import qualified Test.GPU.Vulkan.Native.Generations as Generations
 import qualified Test.GPU.Vulkan.Native.GenerationsVisibility as GenerationsVisibility
 import qualified Test.GPU.Vulkan.Native.Presentation as Presentation
@@ -30,3 +32,5 @@ main =
       GenerationsVisibility.spec
       Recording.spec
       RecordingVisibility.spec
+      Frames.spec
+      FramesVisibility.spec

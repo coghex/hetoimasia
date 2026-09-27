@@ -101,9 +101,12 @@ Guide is advisory and does not replace Kanban approval or project-review records
   surfaces) and the `hetoimasia-gpu-vulkan-glfw` integration that runs them
   under the graphics owner ([contract](docs/gpu_backend.md)). #222 adds
   swapchain generations, and #223 managed resources, a scoped recorder with
-  exact retention, and the audited `unsafe` recording subset; a batch can be
-  recorded and discarded, and nothing is submitted yet. Fonts and renderers
-  remain plans.
+  exact retention, and the audited `unsafe` recording subset. #225 adds
+  frames: non-blocking acquisition, submission of sealed batches, and safe
+  abandonment of skipped and never-presented frames through cleanup
+  submissions and maintenance release, driven on private roots by its native
+  case; nothing is presented yet, and the controller wires in neither the
+  recording nor the frames (VK-16). Fonts and renderers remain plans.
 - GLFW #87–#100 merged through PRs #101–#114. Repairs #115–#118 merged through
   #119–#122; monitor follow-up #123 merged in #126; native consent #124 merged
   in #128. Epic #86 is closed after checklist reconciliation on 2026-09-17.
