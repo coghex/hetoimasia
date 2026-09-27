@@ -1450,8 +1450,10 @@ call, and starts no recovery. For each failure:
 1. **The attempt.** The operation's model allocation attempt — the managed
    resource's own, or one accounted for the recovery's duration — records the
    failure, and notes a generation the construction already retired as
-   `oldSwapchain`. One that cannot be accounted for is no recovery: the failure
-   stands as it was.
+   `oldSwapchain`. When the object budget is full — exactly when reclaiming
+   matters — the recovery runs with no attempt to account, and its one retry
+   is judged by the same rules the model's attempt applies; a session that has
+   failed admits no recovery at all.
 2. **One pass.** The model's `reclaimPass` decides the window: at most the
    configured number of generation and managed-resource records, ineligible
    ones included, from a cursor it carries from pass to pass. The subjects
@@ -1778,7 +1780,8 @@ pass's evidence and its accounting given back; a second failure ending the
 recovery; a disposal that failed escalating the session and permitting no
 retry despite what else the pass reclaimed; a bounded window that reaches an
 eligible generation beyond it only at a later pass, through the carried cursor;
-configured-capacity exhaustion as backpressure with no native call; a fresh
+configured-capacity exhaustion as backpressure with no native call; a no-effect
+submission still reclaimed and submitted once more with the object budget full; a fresh
 swapchain creation retried after reclamation and one that handed a generation
 over never retried; a frame slot's synchronization recovered, and its
 reservation given back when nothing was; a no-effect submission submitted once

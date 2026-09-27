@@ -79,6 +79,8 @@ import Hetoimasia.GPU.Model
   , ReclaimReport (..)
   , RetryVerdict (..)
   , SessionFailureCause (CleanupFailed)
+  , SessionState (SessionRunning)
+  , sessionState
   , abandonAllocation
   , beginAllocation
   , noteOldSwapchainRetired
@@ -185,20 +187,31 @@ instance Exception AllocationNotRecovered where
 recoverAllocation
   ∷ Roots q inst msgr phys dev
   → Text
-  → AllocationId
+  → Maybe AllocationId
   → Maybe GenerationId
   → Text
   → IO (Either Text a)
   → IO (Either AllocationNotRecovered a)
 recoverAllocation roots operation attempt retired original retry = do
-  atomically $ do
-    edit (recordAllocationFailure attempt)
-    for_ retired (edit . noteOldSwapchainRetired attempt)
+  atomically $ for_ attempt $ \held → do
+    edit (recordAllocationFailure held)
+    for_ retired (edit . noteOldSwapchainRetired held)
   report ← reclaimOnce roots
-  verdict ← atomically $ stateRootsModel roots $ \model → case retryAllocation attempt model of
-    Admitted (next, answer) → (Right answer, next)
-    Rejected misuse → (Left (Text.pack (show misuse)), model)
-    Backpressure kind → (Left (Text.pack (show kind)), model)
+  verdict ← atomically $ stateRootsModel roots $ \model → case attempt of
+    Just held → case retryAllocation held model of
+      Admitted (next, answer) → (Right answer, next)
+      Rejected misuse → (Left (Text.pack (show misuse)), model)
+      Backpressure kind → (Left (Text.pack (show kind)), model)
+    -- No attempt could be accounted for — the object budget was full — so
+    -- the one retry is judged here, by the rules the model's attempt would
+    -- apply to it: never after an @oldSwapchain@ retirement, never in a
+    -- failed session, and only after this pass disposed of something. Its one
+    -- retry is spent by being made.
+    Nothing
+      | isJust retired → (Right RetryAfterOldSwapchainRetirement, model)
+      | sessionState model /= SessionRunning → (Left (Text.pack (show (sessionState model))), model)
+      | null (reclaimDisposed report) → (Right RetryWithoutReclamation, model)
+      | otherwise → (Right RetryPermitted, model)
   let notRecovered = Left . AllocationNotRecovered operation original (reclaimExamined report) (reclaimDisposed report) (reclaimFailures report)
   case verdict of
     Left why → pure (notRecovered (RetryUnadmitted why))
@@ -230,21 +243,22 @@ failingAgain roots retry =
 
 -- | Account one allocation attempt for an operation that reserves none of its
 -- own — a swapchain or view creation, a submission, a presentation — for as
--- long as its recovery runs, and give the accounting back however it ends. An
--- attempt that cannot be accounted for — the session has failed, or the
--- object budget is exhausted, which is backpressure — is 'Left', and there is
--- no recovery.
-withAllocationAttempt ∷ Roots q inst msgr phys dev → (AllocationId → IO a) → IO (Either Text a)
+-- long as its recovery runs, and give the accounting back however it ends.
+-- When the object budget is full, which is exactly when reclaiming matters,
+-- the recovery runs with no attempt ('Nothing') rather than not at all, and
+-- 'recoverAllocation' judges its one retry itself. A session that refuses the
+-- attempt — it has failed — is 'Left', and there is no recovery.
+withAllocationAttempt ∷ Roots q inst msgr phys dev → (Maybe AllocationId → IO a) → IO (Either Text a)
 withAllocationAttempt roots use = mask $ \restore → do
   begun ← atomically $ stateRootsModel roots $ \model → case beginAllocation 0 1 model of
-    Admitted (next, attempt) → (Right attempt, next)
+    Admitted (next, attempt) → (Right (Just attempt), next)
+    Backpressure _ → (Right Nothing, model)
     Rejected misuse → (Left (Text.pack (show misuse)), model)
-    Backpressure kind → (Left (Text.pack (show kind)), model)
   case begun of
     Left why → pure (Left why)
     Right attempt → do
       answered ← tryWithContext (restore (use attempt))
-      atomically $ stateRootsModel roots $ \model → case abandonAllocation attempt model of
+      atomically $ for_ attempt $ \held → stateRootsModel roots $ \model → case abandonAllocation held model of
         Admitted next → ((), next)
         _ → ((), model)
       either (\(failure ∷ ExceptionWithContext SomeException) → rethrowIO failure) (pure . Right) answered

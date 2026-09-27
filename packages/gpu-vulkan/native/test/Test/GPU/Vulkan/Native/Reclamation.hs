@@ -211,6 +211,21 @@ spec = describe "Allocation recovery" $ do
       readIORef runs `shouldReturn` 1
       clean rig
 
+    it "still reclaims and is submitted once more when the object budget is full, with no attempt to account" $ do
+      (rig, _) ← rigWithRecording 2
+      [first, second] ← pure (rigTargets rig)
+      frame ← ownedOn rig first
+      batch ← sealed rig frame
+      _ ← retiredEligible rig second
+      exhaust rig
+      failOnce rig AtSubmitNoEffect isSubmission
+      submitFrames (rigFrames rig) (batch :| []) >>= \case
+        Right (SubmittedAs _) → pure ()
+        other → expectationFailure ("the submission answered " <> show other)
+      length . filter isSubmission <$> frameCalls (rigStandIn rig) `shouldReturn` 2
+      destroyedSwapchains rig >>= (`shouldSatisfy` (not . null))
+      clean rig
+
     it "answers nothing submitted, naming the pass, when nothing was reclaimed, and is submitted once" $ do
       (rig, _) ← rigWithRecording 1
       frame ← owned rig
