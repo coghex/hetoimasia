@@ -4,8 +4,8 @@ Buildable package: `hetoimasia-gpu-vulkan-native`, in `packages/gpu-vulkan/nativ
 
 The package that owns the Vulkan binding, the handles and the calls: VK-6's
 diagnostic messengers, VK-9's shader adapter, VK-7's roots, VK-10's
-swapchain generations, VK-11's managed resources and recorder, and VK-12's and
-VK-13's frames. It depends on no window system: a surface reaches it as a 64-bit handle and the action that
+swapchain generations, VK-11's managed resources and recorder, VK-12's and
+VK-13's frames, and VK-14's recovery. It depends on no window system: a surface reaches it as a 64-bit handle and the action that
 destroys it.
 
 - `Hetoimasia.GPU.Vulkan.Native.Profile` is the runtime profile as pure
@@ -18,8 +18,12 @@ destroys it.
   messenger, shared device and per-target surface records, keyed by the GPU
   model's `TargetId`, over an open native layer (`RootOps`). It creates parent
   before child, destroys child before parent and refuses rather than reorders,
-  never retries an uncertain destruction, and latches device loss. It makes no
-  native call of its own.
+  never retries an uncertain destruction, and latches device loss. For VK-14 it
+  destroys a target's lost surface while keeping the target
+  (`releaseRootSurface`), installs a replacement once the session's one queue
+  family can present to it (`installRootSurface`), classifies the native
+  results recovery acts on (`NativeFailure`), and holds the disposer each layer
+  above registers for a reclamation pass. It makes no native call of its own.
 - `Hetoimasia.GPU.Vulkan.Native.Roots.Vulkan` is the production native layer:
   the binding's own calls, reporting into a diagnostic capture.
 - `Hetoimasia.GPU.Vulkan.Native.Presentation` is VK-10's first presentation
@@ -30,8 +34,9 @@ destroys it.
   swapchain generations above the roots, keyed by the model's `GenerationId`:
   planning, construction with the returned image count checked before any view,
   coalesced replacement through the irreversible `oldSwapchain` transition,
-  bounded live generations, recovery attempts through the model's episode, and
-  destruction child before parent once every hold has ended. Its calls are the
+  bounded live generations, recovery attempts through the model's episode, a
+  lost surface replaced on the same target (VK-14), and destruction child
+  before parent once every hold has ended. Its calls are the
   roots' `GenerationOps`. `newGenerationsCapturing` also makes a generation's
   images transfer sources where the surface offers it, for a verification
   capture; no normal target is built that way. It is the entry point only: its
@@ -40,12 +45,15 @@ destroys it.
   unchanged and no client can import. `State` holds the `Generations`, its
   target and generation records, the conditions, standings and failures, and
   the helpers every other module shares; `Uses` notes swapchain results and
-  holds and ends CPU uses in `STM`; `Disposal` destroys generations whose holds
+  holds and ends CPU uses in `STM`; `Disposal` makes the generations,
+  registering their disposer with the roots, destroys generations whose holds
   ended, child before parent, and runs the model's progress turn;
   `Reconciliation` brings one target to its latest geometry — planning,
   settling, recovery, capacity, construction and publication; `Step` owns the
-  owner's step and its deadline; `Retirement` retires a target's generations
-  before its surface; and `Observation` reads a target's view. Only `State`
+  owner's step and its deadline; `Surface` releases a lost surface once its
+  generations are gone and takes or refuses its replacement; `Retirement`
+  retires a target's generations before its surface; and `Observation` reads a
+  target's view. Only `State`
   creates state, and the public module's Haddock tables which module writes
   which part of it (see
   [the backend contract](../../../docs/gpu_backend.md#how-the-generations-are-built)).
@@ -68,7 +76,10 @@ destroys it.
   resources; `Recorder` owns `recordFrame` and each lent recorder; `Batches`
   discards, resets and records the submission of batches, invalidating
   natively before discharging; `Readback` gates host reads on completion
-  evidence; and `Disposal` destroys released generations child before parent.
+  evidence; and `Disposal` makes the recording, registering its disposer with
+  the roots, and destroys released generations child before parent. A
+  construction that ran out of memory created nothing and is recovered once
+  (VK-14).
   Only `State` creates state, and the public module's Haddock tables which
   module writes which part of it (see
   [the backend contract](../../../docs/gpu_backend.md#how-the-recording-is-built)).
@@ -94,7 +105,9 @@ destroys it.
   acquisition semaphore and two fences are made before its first acquisition,
   and each target's presentation pool — a render-finished semaphore and a
   present fence per record, bounded by the model's derived pool capacity —
-  binds a record to every frame at its reservation. Every native effect and
+  binds a record to every frame at its reservation. A submission or a
+  presentation that ran out of memory had no effect, and is recovered once
+  (VK-14). Every native effect and
   its bookkeeping are one masked step, and an unknown effect is retained for
   ever with admission stopped. It is the entry point only: its code lives in
   private modules under `Hetoimasia.GPU.Vulkan.Native.Internal.Frames` —
@@ -103,6 +116,15 @@ destroys it.
   [the backend contract](../../../docs/gpu_backend.md#frames-acquisition-submission-and-abandonment)).
   `Hetoimasia.GPU.Vulkan.Native.Frames.Vulkan` is its production layer, the
   binding's own `safe` calls.
+- The private `Hetoimasia.GPU.Vulkan.Native.Internal.Reclamation` is VK-14's
+  allocation recovery: after a native allocation failure with a specified
+  no-effect result, or a creation that raised and so created nothing, one
+  reclamation pass over the model's bounded window of subjects already
+  eligible for disposal, each destroyed by the layer that owns it, and the
+  failed operation once more only if the model's allocation attempt permits
+  its one retry. What it could not recover is reported as
+  `AllocationNotRecovered`, with the pass's evidence (see
+  [the backend contract](../../../docs/gpu_backend.md#allocation-recovery)).
 - `Hetoimasia.GPU.Vulkan.Native.Naming` is #250's naming scheme as pure
   decisions: every debug name and recording label derived from identities the
   backend already holds, bounded at 64 bytes, and the object types they name.

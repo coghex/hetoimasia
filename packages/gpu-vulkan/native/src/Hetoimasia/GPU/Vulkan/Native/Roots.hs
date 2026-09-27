@@ -87,12 +87,18 @@
 -- |                  |           |                             | thread     |                  | uncertain                 |
 -- +------------------+-----------+-----------------------------+------------+------------------+---------------------------+
 -- | Target records   | The roots | Admission inserts;          | As above   | Admission until  | Removed only by a         |
--- |                  |           | retirement removes          |            | destroyed        | destruction that returned |
+-- |                  |           | retirement removes; recovery|            | destroyed        | destruction that returned |
+-- |                  |           | releases and replaces a lost|            |                  |                           |
+-- |                  |           | surface in place            |            |                  |                           |
 -- +------------------+-----------+-----------------------------+------------+------------------+---------------------------+
 -- | The model        | The roots | Admission, retirement and   | As above   | The session      | Never reset               |
 -- |                  |           | loss                        |            |                  |                           |
 -- +------------------+-----------+-----------------------------+------------+------------------+---------------------------+
 -- | The loss latch   | The roots | Set once; any thread reads  | Any        | The session      | Never cleared             |
+-- +------------------+-----------+-----------------------------+------------+------------------+---------------------------+
+-- | Disposers        | The roots | Each layer above registers  | The owner  | The session      | Never removed             |
+-- |                  |           | its own as it is made; a    |            |                  |                           |
+-- |                  |           | reclamation pass reads them |            |                  |                           |
 -- +------------------+-----------+-----------------------------+------------+------------------+---------------------------+
 --
 -- Every mutating operation is meant for one serialized owner — the graphics

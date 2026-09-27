@@ -412,6 +412,16 @@ for a required target it fails the graphics session. Device loss, a validation
 error, an unknown submission effect and a failed cleanup escalate to the session
 rather than to a target, whatever the target's classification says.
 
+A target can also be **declared unrecoverable** with attempts to spare
+(`declareTargetUnrecoverable`), when the boundary knows no attempt can help —
+the session's one device can no longer present to what the target would be
+rebuilt on, and no second device is ever made (VK-14). It is disposed of exactly
+as exhaustion disposes of it, through the same designation, and answers the
+escalation; it answers none when close already won, the target is already
+unavailable, or the session has already failed, since then there is nothing
+left for it to decide. It settles no attempt: one still outstanding is reported
+first, and its failure may already have exhausted the target.
+
 Close wins. A target that is closing admits no retry, and a construction that
 succeeds after the close was observed is retired rather than published back into
 active rendering.
@@ -607,7 +617,9 @@ submitted-unpresented paths settling only their own obligations; a no-effect
 submission failure against the uncertain-effect state; duplicate, stale and
 foreign identities rejected before effects; every budget's exhaustion as
 backpressure; recovery episodes surviving nested helpers and turns without
-replenishment; `oldSwapchain` retirement surviving failed construction; close
+replenishment; a target declared unrecoverable with attempts to spare,
+optional and required, and close winning over the declaration;
+`oldSwapchain` retirement surviving failed construction; close
 defeating late publication; the backoff schedule and its resets under a scripted
 clock; bounded round-robin progress across several targets; suspended targets
 retaining retirement demand; disposal failure retaining ownership and accounting

@@ -15,7 +15,11 @@ loop adapter here.
   graphics owner, whose operations are this package's controller.
   `handOverVulkanTarget` creates one window's surface through GLFW on the main
   thread, inside that window's attachment, and hands it to the owner as a
-  required or optional target.
+  required or optional target. `replaceVulkanSurfaces` creates, on the main
+  thread, the replacement surface the owner asked for to recover a lost one,
+  under the same attachment (VK-14); `readVulkanUnavailability` reports an
+  optional target that could not be recovered, and a required one fails the
+  session with `VulkanRequiredTargetFailed`.
 - The private `controller` sublibrary holds the controller —
   `GraphicsOperations` over the native roots — and the record through which it
   reaches the surface bridge, which the package's own examples replace with a
@@ -24,8 +28,8 @@ loop adapter here.
 Every Vulkan object is created and destroyed on the graphics owner's thread;
 the controller makes no GLFW call. [`docs/gpu_backend.md`](../../../docs/gpu_backend.md)
 is the contract: the ownership graph, the composition order, how a later
-window's surface is checked against the session's device, and the destruction
-order.
+window's surface is checked against the session's device, how a lost surface
+is recovered, and the destruction order.
 
 Its headless examples (`integration-tests`) run whole graphics hosts over the
 GLFW package's scripted seam with a stand-in native layer and surface bridge;
