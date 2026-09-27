@@ -13,6 +13,7 @@ module Test.GPU.Vulkan.Diagnostics.Support
   , awaitEntered
   , gatedLogger
   , failingLogger
+  , switchedLogger
   , SinkFailure (..)
 
     -- * Failures
@@ -151,6 +152,15 @@ failingLogger = do
         atomically (modifyTVar' attempts (+ 1))
         throwIO SinkFailure
   pure (mkLoggerWith everythingFilter fixedMetadata sink, attempts)
+
+-- | A sink that delivers until its switch is set, and fails every write after.
+switchedLogger ∷ IO (Logger, TVar Bool)
+switchedLogger = do
+  failing ← newTVarIO False
+  let sink = callbackSink $ \_ → readTVarIO failing >>= \case
+        True → throwIO SinkFailure
+        False → pure ()
+  pure (mkLoggerWith everythingFilter fixedMetadata sink, failing)
 
 -- | A body failure whose payload an example can identify.
 newtype TaggedFailure = TaggedFailure Int

@@ -82,6 +82,7 @@ import Hetoimasia.GPU.Vulkan.Diagnostics.Internal.Capture
   , Severity (..)
   , holdArrived
   , newHold
+  , noteSinkFailure
   , offerAnnounced
   , offerHeld
   , offerMissingData
@@ -307,6 +308,25 @@ spec = describe "Lifetime" $ do
           _ ← bounded (atomically (captureSinkFailure capture >>= maybe retry pure))
           captureAlarms capture
       map alarmKind alarms `shouldBe` ["error", "sink"]
+
+    it "answers nothing while the failure that came first has claimed the order but not yet published its alarm" $ do
+      (logger, failing) ← switchedLogger
+      (answers, _) ←
+        capturing logger $ \capture → do
+          -- The worker's sink claims the order and pauses before it publishes
+          -- its failure; an error then latches.
+          noteSinkFailure (captureUserData capture)
+          offerTo capture (plainOffer SeverityError "an error after the sink claimed the order")
+          before ← captureAlarms capture
+          -- The sink's failure is then published: both are answered, the sink
+          -- first.
+          atomically (writeTVar failing True)
+          offerTo capture (plainOffer SeverityWarning "a warning the sink cannot take")
+          requestDrain capture
+          _ ← bounded (atomically (captureSinkFailure capture >>= maybe retry pure))
+          after ← captureAlarms capture
+          pure (map alarmKind before, map alarmKind after)
+      answers `shouldBe` ([], ["sink", "error"])
 
     it "stands beside the body's failure, which is rethrown unchanged with the verdict on it" $ do
       (logger, _) ← failingLogger

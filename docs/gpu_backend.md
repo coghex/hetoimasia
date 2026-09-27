@@ -1349,7 +1349,9 @@ primary. The capture's C callback and its worker claim one first-failure cell
 with a compare-and-swap before either sets its own latch, so a sink failure
 followed by a validation error before the next checkpoint stays the primary
 with the error beside it, and the other way round, whichever thread got there
-first. It raises nothing, calls nothing native and waits
+first. A checkpoint that looks after the first failure claimed the cell but
+before it set its own alarm latches nothing and lets the next checkpoint latch
+both in order, rather than latching the later one first. It raises nothing, calls nothing native and waits
 for nothing. The owner's ordinary operations pass through one:
 
 - the controller's progress step raises the primary — the loss as
@@ -1698,8 +1700,10 @@ once by its handle with what its own destruction raised; and cancellation
 delivered three times
 while the drain that follows a loss holds, leaving the destruction order and the
 loss as they were. The diagnostics suite adds the sink failure observable while
-the lifetime still captures, and `captureAlarms` answering a sink failure and
-an error in the order they happened, either way round.
+the lifetime still captures, `captureAlarms` answering a sink failure and an
+error in the order they happened, either way round, and answering nothing while
+a sink that claimed the order has not yet published its failure and an error
+has latched after it.
 
 #266's examples, `Generations visibility across the package boundary`, compile
 external clients the same way: one that imports every name the public

@@ -426,6 +426,13 @@ data CaptureAlarm
 -- checkpoints are answered in the order they happened, however close
 -- together. A sink failure happens when its delivery's failure returns, so an
 -- error reported while that delivery was still running came first.
+--
+-- A failure that has claimed the order but not yet published its own alarm is
+-- one this cannot answer yet: the claim is taken first and the alarm set just
+-- after it, so for that moment the only alarm readable may be a later one.
+-- Then this answers nothing at all, and the next reading, once the first
+-- alarm is published, answers both in order. It never answers a later
+-- failure first.
 captureAlarms ∷ DiagnosticCapture → IO [CaptureAlarm]
 captureAlarms capture = do
   latched ← statusErrorLatched <$> captureStatus capture
@@ -433,7 +440,13 @@ captureAlarms capture = do
   first ← firstFailure (handleUserData capture)
   let errors = [CaptureErrorLatched | latched]
       sinks = [CaptureSinkFailed (sinkFailureReason failure) | Just failure ← [sink]]
-  pure (if first == Just FirstSink then sinks <> errors else errors <> sinks)
+  pure $ case first of
+    Just FirstSink
+      | null sinks → []
+      | otherwise → sinks <> errors
+    Just FirstError
+      | null errors → []
+    _ → errors <> sinks
 
 -- | Run a body that owns a diagnostic capture, and finalize it on every exit.
 --
