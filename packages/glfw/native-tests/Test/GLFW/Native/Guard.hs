@@ -10,19 +10,22 @@
 -- empty selection still acquire nothing with consent absent; that an approved
 -- run is served; that the interaction probe is inactive without its own
 -- activation variable and is refused before its body either way when the run
--- carries no consent; and that the private-session parent starts no child
+-- carries no consent; that the private-session parent starts no child
 -- without consent while a directly invoked child refuses before its scenario is
--- even looked up.
+-- even looked up; and that the launcher's deadline holds against a descendant
+-- that keeps the child's output open, with the check that the descendant has
+-- ended proven against a running process, a zombie, and an absent one.
 module Test.GLFW.Native.Guard (spec) where
 
 import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar)
-import Control.Exception (SomeException, fromException, throwIO, try)
+import Control.Exception (IOException, SomeException, displayException, fromException, throwIO, try)
 import Control.Monad (void)
+import Data.Either (isLeft)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Hetoimasia.Foundation.Resource (allocResource)
 import GHC.Clock (getMonotonicTime)
 import System.Exit (ExitCode (..))
-import System.Posix.Signals (nullSignal, signalProcess)
+import System.Posix.Process (getProcessID)
 import Text.Read (readMaybe)
 import Test.GLFW.Native.Consent
   ( Consent (..)
@@ -44,6 +47,7 @@ import Test.GLFW.Native.Interaction
   , probePhases
   , probeVariable
   )
+import Test.GLFW.Native.Presence (Presence (..), gone, inspectPresence, inspectPresenceUsing, presenceFrom, withZombie)
 import qualified Test.GLFW.Native.Private as Private
 import Test.GLFW.Native.Support
   ( ThreadCheck (..)
@@ -333,8 +337,45 @@ spec = describe "the native opt-in" $ do
       descendant ←
         maybe (fail ("the shell printed no descendant: " <> show (Private.launchedOut launched))) pure $
           readMaybe (takeWhile (/= '\n') (Private.launchedOut launched))
-      gone ← try (signalProcess nullSignal (fromInteger descendant))
-      either (\(_ ∷ SomeException) → True) (const False) gone `shouldBe` True
+      -- Killed, but not necessarily reaped: its shell exited at once, so the
+      -- sleep was orphaned to whatever adopts orphans — init, tini under the
+      -- CI containers' --init, launchd — and the launcher, which waits only
+      -- for its own child, does not wait for it. Until that reaper runs it is
+      -- a zombie, which still accepts signal 0, so ps's state is read instead:
+      -- a zombie or an unlisted process has ended, a running one fails the
+      -- example, and a ps that cannot answer fails it too.
+      inspectPresence (fromInteger descendant) >>= (`shouldSatisfy` gone)
+
+    it "reads a running process as present, and an exited one as gone whether or not it has been reaped" $ do
+      getProcessID >>= inspectPresence >>= (`shouldSatisfy` \case Running _ → True; _ → False)
+      reaped ← withZombie $ \zombie → do
+        inspectPresence zombie `shouldReturn` Zombie
+        pure zombie
+      inspectPresence reaped `shouldReturn` Absent
+
+    it "reads only ps's own answers as a presence, and fails the inspection on anything else" $ do
+      let answered code = presenceFrom (Private.ChildExited code)
+      answered ExitSuccess "Z   \n" "" `shouldBe` Right Zombie
+      answered ExitSuccess "Z+\n" "" `shouldBe` Right Zombie
+      answered ExitSuccess "Ss  \n" "" `shouldBe` Right (Running "Ss")
+      answered ExitSuccess "R+\n" "" `shouldBe` Right (Running "R+")
+      answered (ExitFailure 1) "" "" `shouldBe` Right Absent
+      mapM_
+        (`shouldSatisfy` isLeft)
+        [ presenceFrom (Private.ChildExpired 10 (ExitFailure (-15))) "" ""
+        , answered ExitSuccess "" ""
+        , answered ExitSuccess "Z\nZ\n" ""
+        , answered ExitSuccess "1234\n" ""
+        , answered ExitSuccess "S\n" "ps: warning\n"
+        , answered (ExitFailure 1) "Z\n" ""
+        , answered (ExitFailure 1) "" "ps: process id too large: 999999\n"
+        , answered (ExitFailure 2) "" ""
+        ]
+      -- A ps that cannot even be started is a failed inspection, not a gone
+      -- process.
+      missing ← getProcessID >>= try . inspectPresenceUsing "/nonexistent/hetoimasia-ps"
+      either (\(problem ∷ IOException) → displayException problem) (const "") missing
+        `shouldContain` "could not tell whether process"
 
     it "refuses a directly invoked child before looking up its scenario, and keeps the unknown-scenario exit for an approved one" $ do
       let plan consent name = either (\(code, message) → Left (code, message)) (Right . map fst) (Private.childPlan consent name)
