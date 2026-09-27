@@ -45,6 +45,8 @@ module Hetoimasia.GPU.Vulkan.Native.Naming
   , readbackMemoryName
   , SlotObject (..)
   , slotObjectName
+  , PoolObject (..)
+  , poolObjectName
 
     -- * Recording labels
   , batchLabel
@@ -195,7 +197,6 @@ readbackMemoryName resource = boundedName (resourceText resource <> " readback m
 -- | One of the synchronization objects a frame slot owns (VK-12).
 data SlotObject
   = AcquisitionSemaphore
-  | RenderFinishedSemaphore
   | SubmissionFence
   | CleanupFence
   deriving (Eq, Ord, Show, Enum, Bounded)
@@ -207,9 +208,25 @@ slotObjectName target slot object =
   boundedName
     ( targetText target <> " slot " <> shown slot <> case object of
         AcquisitionSemaphore → " acquisition semaphore"
-        RenderFinishedSemaphore → " render-finished semaphore"
         SubmissionFence → " submission fence"
         CleanupFence → " cleanup fence"
+    )
+
+-- | One of the synchronization objects a presentation-pool record owns
+-- (VK-13).
+data PoolObject
+  = RenderFinishedSemaphore
+  | PresentFence
+  deriving (Eq, Ord, Show, Enum, Bounded)
+
+-- | A presentation-pool record's synchronization object: the target and
+-- record it serves, and which of the record's objects it is.
+poolObjectName ∷ TargetId → Natural → PoolObject → ByteString
+poolObjectName target record object =
+  boundedName
+    ( targetText target <> " presentation record " <> shown record <> case object of
+        RenderFinishedSemaphore → " render-finished semaphore"
+        PresentFence → " present fence"
     )
 
 -- ---------------------------------------------------------------------------

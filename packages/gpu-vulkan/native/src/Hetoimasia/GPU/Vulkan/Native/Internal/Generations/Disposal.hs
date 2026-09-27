@@ -24,6 +24,7 @@ import Control.Exception
   , tryWithContext
   )
 import Control.Monad (forM, when)
+import Data.List (transpose)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -35,9 +36,11 @@ import Hetoimasia.GPU.Model
   , SessionFailureCause (CleanupFailed)
   , TurnReport (..)
   , disposalEligible
+  , modelBudgets
   , runProgressTurn
   , silentEvidence
   )
+import Hetoimasia.GPU.Model.Budget (progressActionLimit)
 import Hetoimasia.GPU.Model.Identity (GenerationId, HoldSubject (..), TargetId)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Generations.State
   ( GenerationDestructionFailed (..)
@@ -58,7 +61,16 @@ import Hetoimasia.GPU.Vulkan.Native.Roots
   )
 
 -- | Destroy every retired generation whose holds have all ended — of one
--- target, or of all of them — and record the disposals with the model.
+-- target, or, in the owner's step, of all of them — and record the disposals
+-- with the model.
+--
+-- The owner's step destroys at most the model's progress-action limit of
+-- generations, taken round-robin across the targets — one of each target's in
+-- turn — starting one target further along each step, so a target with many
+-- retired generations cannot hold every other's back and a small limit still
+-- reaches every target. Whatever it did not reach waits for a later step, and
+-- the model's own schedule keeps the owner stepping while it waits. A target's
+-- own retirement or capacity path destroys all of that target's that it can.
 --
 -- The native destruction comes first and the model is told only what actually
 -- happened: a completed destruction is reported completed, and one that raised
@@ -73,14 +85,23 @@ disposeEligible generations now only = do
   candidates ← atomically $ do
     records ← readTVar (generationsTargets generations)
     model ← stateRootsModel roots (\model → (model, model))
-    pure
-      [ (generation, native)
-      | (target, record) ← Map.toList records
-      , maybe True (== target) only
-      , (generation, native) ← Map.toList (recordGenerations record)
-      , genStanding native == GenerationRetiredHeld
-      , disposalEligible (GenerationSubject generation) model
-      ]
+    let eligible =
+          [ [ (generation, native)
+            | (generation, native) ← Map.toList (recordGenerations record)
+            , genStanding native == GenerationRetiredHeld
+            , disposalEligible (GenerationSubject generation) model
+            ]
+          | (target, record) ← Map.toList records
+          , maybe True (== target) only
+          ]
+    case only of
+      Just _ → pure (concat eligible)
+      Nothing → do
+        cursor ← readTVar (generationsCursor generations)
+        modifyTVar' (generationsCursor generations) (+ 1)
+        let offset = if null eligible then 0 else fromIntegral (cursor `mod` fromIntegral (length eligible))
+            turns = drop offset eligible <> take offset eligible
+        pure (take (fromIntegral (progressActionLimit (modelBudgets model))) (concat (transpose turns)))
   device ← atomically (readRootsDevice roots)
   results ← case device of
     Nothing → pure []

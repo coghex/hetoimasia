@@ -1,6 +1,6 @@
--- | The native layer of frame acquisition, submission and abandonment
--- ("Hetoimasia.GPU.Vulkan.Native.Frames"): every native call it makes, as the
--- open record 'FrameOps', and what those calls answer.
+-- | The native layer of frame acquisition, submission, presentation and
+-- abandonment ("Hetoimasia.GPU.Vulkan.Native.Frames"): every native call it
+-- makes, as the open record 'FrameOps', and what those calls answer.
 --
 -- This module holds no state and makes no call: it is the shape of the layer,
 -- which "Hetoimasia.GPU.Vulkan.Native.Frames.Vulkan" implements over the real
@@ -12,9 +12,13 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Layer
   , AcquireResult (..)
   , WaitStage (..)
   , SubmitBatch (..)
+  , PresentRequest (..)
+  , PresentStatus (..)
   ) where
 
 import Control.Exception (SomeException)
+import Data.Int (Int32)
+import Data.IORef (IORef)
 import Data.Word (Word32, Word64)
 
 -- | What one non-blocking acquisition answered.
@@ -53,6 +57,37 @@ data SubmitBatch cmd = SubmitBatch
   , submitSignals ∷ ![Word64]
   }
 
+-- | One presentation: one image of one swapchain, waiting on one binary
+-- semaphore, with one present fence chained through
+-- @VkSwapchainPresentFenceInfoEXT@.
+data PresentRequest = PresentRequest
+  { presentSwapchain ∷ !Word64
+  , presentIndex ∷ !Word32
+  , presentWait ∷ !Word64
+    -- ^ The render-finished semaphore the presentation waits on.
+  , presentFence ∷ !Word64
+    -- ^ The present fence, unsignalled, which signals once the presentation
+    -- engine has finished with the semaphore and the image's presentation
+    -- resources.
+  }
+  deriving (Eq, Show)
+
+-- | The swapchain's own entry of @pResults@: the only per-swapchain truth a
+-- presentation answers.
+data PresentStatus
+  = PresentStatusSuccess
+  | PresentStatusSuboptimal
+  | PresentStatusOutOfDate
+  | PresentStatusSurfaceLost
+  | PresentStatusOutOfMemory
+    -- ^ @VK_ERROR_OUT_OF_HOST_MEMORY@ or @VK_ERROR_OUT_OF_DEVICE_MEMORY@.
+  | PresentStatusOther !Int32
+    -- ^ Any other result, device loss included, as its numeric value.
+  | PresentStatusUnwritten
+    -- ^ The call never wrote the entry: nothing about the swapchain can be
+    -- read from it.
+  deriving (Eq, Show)
+
 -- | Every native call the frames make, over an open device type @dev@ and an
 -- open command-buffer type @cmd@. Semaphores and fences are 64-bit handles, as
 -- every non-dispatchable handle is.
@@ -81,4 +116,15 @@ data FrameOps dev cmd = FrameOps
   , opsReleaseImages ∷ dev → Word64 → [Word32] → IO ()
     -- ^ @vkReleaseSwapchainImagesEXT@: return acquired, unpresented images of
     -- the swapchain whose acquisition signals have all been waited on.
+  , opsPresent ∷ dev → Word32 → PresentRequest → IORef PresentStatus → IO ()
+    -- ^ @vkQueuePresentKHR@ of the one image on the first queue of the queue
+    -- family. The swapchain's entry of @pResults@ is written to the reference
+    -- whatever the call answered — before it returns, and before it raises —
+    -- and the reference is left as it was, 'PresentStatusUnwritten', when the
+    -- call never wrote that entry. An error result raises, as every call of
+    -- the layer does; the reference is still written first.
+  , opsWaitFence ∷ dev → Word64 → Word64 → IO Bool
+    -- ^ @vkWaitForFences@ on one fence a queue operation made pending, for at
+    -- most this many nanoseconds: whether it signalled, or 'False' when the
+    -- wait timed out. A wait has no effect on the fence.
   }

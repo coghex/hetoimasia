@@ -188,6 +188,10 @@ data Generations q inst msgr phys dev = Generations
     -- ^ The examples' seam: runs right after the model admitted a candidate,
     -- inside the construction's masked settlement. Production runs nothing.
   , generationsCapture ∷ !CaptureUsage
+  , generationsCursor ∷ !(TVar Natural)
+    -- ^ Where the owner's next step starts among the targets when it destroys
+    -- retired generations, so a step's bounded disposal reaches every target
+    -- in turn.
   }
 
 newGenerations ∷ Roots q inst msgr phys dev → IO (Generations q inst msgr phys dev)
@@ -197,12 +201,12 @@ newGenerations = newGenerationsHooked (\_ → pure ())
 -- where the surface offers it ('CaptureWhenOffered'), so a verification can
 -- read its images back. No normal target is built this way.
 newGenerationsCapturing ∷ Roots q inst msgr phys dev → IO (Generations q inst msgr phys dev)
-newGenerationsCapturing roots = (\targets → Generations roots targets (\_ → pure ()) CaptureWhenOffered) <$> newTVarIO Map.empty
+newGenerationsCapturing roots = (\targets → Generations roots targets (\_ → pure ()) CaptureWhenOffered) <$> newTVarIO Map.empty <*> newTVarIO 0
 
 -- | 'newGenerations' with the examples' seam, which runs right after the model
 -- admits each candidate. Nothing in production sets it.
 newGenerationsHooked ∷ (GenerationId → IO ()) → Roots q inst msgr phys dev → IO (Generations q inst msgr phys dev)
-newGenerationsHooked hook roots = (\targets → Generations roots targets hook WithoutCapture) <$> newTVarIO Map.empty
+newGenerationsHooked hook roots = (\targets → Generations roots targets hook WithoutCapture) <$> newTVarIO Map.empty <*> newTVarIO 0
 
 -- | How long the geometry a replacement would be built from must stay the
 -- same before it is built: 16 ms.

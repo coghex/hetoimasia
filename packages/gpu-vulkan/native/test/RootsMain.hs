@@ -10,6 +10,7 @@
 module Main (main) where
 
 import qualified Test.GPU.Vulkan.Native.Frames as Frames
+import qualified Test.GPU.Vulkan.Native.FramesPresentation as FramesPresentation
 import qualified Test.GPU.Vulkan.Native.FramesVisibility as FramesVisibility
 import qualified Test.GPU.Vulkan.Native.Generations as Generations
 import qualified Test.GPU.Vulkan.Native.GenerationsVisibility as GenerationsVisibility
@@ -33,4 +34,5 @@ main =
       Recording.spec
       RecordingVisibility.spec
       Frames.spec
+      FramesPresentation.spec
       FramesVisibility.spec
