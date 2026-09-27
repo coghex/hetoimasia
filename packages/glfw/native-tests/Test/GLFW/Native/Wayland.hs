@@ -51,7 +51,7 @@ import Numeric.Natural (Natural)
 import System.Directory (doesFileExist, getCurrentDirectory)
 import System.Environment (getExecutablePath, lookupEnv)
 import System.FilePath (takeDirectory, (</>))
-import System.IO (hFlush, hPutStrLn, stderr, stdout)
+import System.IO (hFlush, stdout)
 import Test.GLFW.Native.Consent (Consent (IsolatedWayland), waylandValue)
 import Test.GLFW.Native.Control (converge, returnedWithRevision, withTwo)
 import Test.GLFW.Native.Host (testCloseOrder)
@@ -183,12 +183,9 @@ spec shared = describe "on an isolated Wayland session" . onlyWayland gate $ do
   describe "settling before a wait" $ do
     it "settles a released window's cleanup, so the next production wait nothing wakes reaches its bound" $ do
       evidence ← owned shared $ \session → do
-        hPutStrLn stderr "DIAGNOSTIC #280: settled cleanup: creating and releasing its window" >> hFlush stderr
         withWindow session (hiddenTestWindowConfig "settled cleanup" 64 48) (\_ → pure ())
         beforeSettle ← wakeCountsForCheck
-        hPutStrLn stderr "DIAGNOSTIC #280: settled cleanup: settling" >> hFlush stderr
         Wake.settle session
-        hPutStrLn stderr "DIAGNOSTIC #280: settled cleanup: settled; entering the unwoken wait" >> hFlush stderr
         afterSettle ← wakeCountsForCheck
         unwokenWait session beforeSettle afterSettle
       unwokenLine "settled cleanup" evidence
