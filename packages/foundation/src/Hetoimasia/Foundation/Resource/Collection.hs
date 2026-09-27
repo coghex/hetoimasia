@@ -1,5 +1,3 @@
-{-# LANGUAGE RoleAnnotations #-}
-
 -- | A scoped collection of independent resources owned by one thread, each of
 -- which can be retired before the scope ends.
 --
@@ -126,10 +124,17 @@
 -- None of this is application state. Owner-side bookkeeping is proportional to
 -- the live members, not to the number ever acquired.
 --
+-- The representations of that state — the collection, its phase, member
+-- identities and states, and the token — are defined, with the result and
+-- rejection types, in the library's hidden
+-- "Hetoimasia.Foundation.Resource.Collection.Types"; this module owns every
+-- operation that creates, reads, or writes them, and re-exports the types.
+--
 -- This module takes no logger and imports no logging, runtime, messaging, or
--- native windowing module. It is built through the foundation library's hidden
--- implementation seam, so neither 'Scoped' nor a composite's release is
--- exposed, and every type is exported closed.
+-- native windowing module. It is built through the foundation's package-private
+-- resource facade, "Hetoimasia.Foundation.Resource.Internal", so neither
+-- 'Scoped' nor a composite's release is exposed, and every type is exported
+-- closed.
 --
 -- See @docs/resources.md@, "Scoped resource collections", for the same
 -- contract in prose.
@@ -154,10 +159,9 @@ module Hetoimasia.Foundation.Resource.Collection
   , Activity (..)
   ) where
 
-import Control.Concurrent (ThreadId, myThreadId)
+import Control.Concurrent (myThreadId)
 import Control.Exception
-  ( Exception
-  , ExceptionWithContext
+  ( ExceptionWithContext
   , SomeException
   , mask
   , mask_
@@ -166,14 +170,23 @@ import Control.Exception
   )
 import Control.Monad (unless, when)
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
-import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Unique (Unique, newUnique)
-import Data.Word (Word64)
+import Data.Unique (newUnique)
+import Hetoimasia.Foundation.Resource.Collection.Types
+  ( Activity (..)
+  , Collection (..)
+  , CollectionError (..)
+  , LiveMember (..)
+  , Member (..)
+  , MemberId (..)
+  , MemberState (..)
+  , MemberStatus (..)
+  , Phase (..)
+  , Retirement (..)
+  )
 import Hetoimasia.Foundation.Resource.Internal
   ( Assembly
   , CleanupFailure
-  , Ledger
   , Scoped (Scoped)
   , assembleSeparately
   , cleanupFailureException
@@ -181,108 +194,6 @@ import Hetoimasia.Foundation.Resource.Internal
   , retainCleanupFailures
   , tryScope
   )
-
--- | A scoped owner of independently retired members.
---
--- The type is exported without its constructor. A collection is obtained only
--- from 'allocCollection' and is valid only inside the continuation that
--- allocated it.
-data Collection = Collection
-  { collectionIdentity ∷ !Unique
-  , collectionOwner ∷ !ThreadId
-  , collectionLimit ∷ !Int
-  , collectionPhase ∷ !(IORef Phase)
-  , collectionBorrows ∷ !(IORef Int)
-  , collectionNextMember ∷ !(IORef Word64)
-  , collectionLive ∷ !(IORef (Map MemberId LiveMember))
-  , collectionLatched ∷ !(IORef [CleanupFailure])
-    -- ^ Newest first.
-  }
-
--- | What the collection is doing on its owner thread. Borrowing is tracked
--- separately, because a borrow does not exclude another borrow.
-data Phase
-  = PhaseOpen
-  | PhaseBusy !Activity
-  | PhaseClosed
-
--- | Identity of one member within its collection, in registration order.
-newtype MemberId = MemberId Word64
-  deriving (Eq, Ord)
-
--- | The collection's reference to a live member's state, whatever its type.
-data LiveMember = ∀ a. LiveMember !(IORef (MemberState a))
-
--- | One member's state. The value is deliberately lazy: forcing it during
--- registration could throw after construction succeeded and before its
--- release was registered.
-data MemberState a
-  = MemberHeld a !Ledger !Int
-  | MemberReleased
-  | MemberReleaseFailed !(ExceptionWithContext SomeException)
-
--- | An opaque token for one member of one collection.
---
--- It carries the issuing collection's identity, the member's identity, and a
--- reference to that member's state, and nothing else: not the collection, and
--- once the member is terminal, not its value or its release. The type is
--- exported without its constructor, and its parameter is nominal, so a token
--- cannot be coerced into a token for a different type sharing a
--- representation.
-data Member a = Member !Unique !MemberId !(IORef (MemberState a))
-
-type role Member nominal
-
--- | What one call to 'retireMember' did.
-data Retirement
-  = -- | The release was attempted now and succeeded.
-    Retired
-  | -- | The member was already retired successfully; nothing ran.
-    AlreadyRetired
-  | -- | The member is borrowed by a callback still running; nothing ran.
-    RetirementInUse
-  deriving (Eq, Show)
-
--- | A member's state as seen through its token.
-data MemberStatus
-  = MemberLive
-  | -- | Released successfully, early or at the collection's exit.
-    MemberRetired
-  | -- | Its release was attempted and failed, early or at the collection's
-    -- exit. The exception is the one that retirement propagated or retained,
-    -- with its context and cleanup evidence.
-    MemberRetirementFailed (ExceptionWithContext SomeException)
-
--- | A rejected collection operation. Every rejection is raised before the
--- operation has any acquisition, borrowing, or release effect.
-data CollectionError
-  = -- | 'allocCollection' was given a limit below one.
-    InvalidMemberLimit !Int
-  | -- | The calling thread is not the thread that entered the collection's scope.
-    NotOwnerThread
-  | -- | The token was issued by a different collection.
-    ForeignMember
-  | -- | The collection was already doing this when the call re-entered it.
-    CollectionReentered !Activity
-  | -- | The collection's scope has exited.
-    CollectionClosed
-  | -- | An acquisition would exceed the live-member limit, which is carried.
-    MemberLimitReached !Int
-  | -- | A release failure has poisoned further acquisition.
-    CollectionPoisoned
-  | -- | The member has been retired, so it cannot be borrowed.
-    MemberNotLive
-  deriving (Eq, Show)
-
-instance Exception CollectionError
-
--- | What a collection was doing when an operation re-entered it.
-data Activity
-  = Acquiring
-  | Borrowing
-  | Retiring
-  | Closing
-  deriving (Eq, Show)
 
 -- | Allocate a collection holding at most @limit@ live members for the rest of
 -- the enclosing scope.

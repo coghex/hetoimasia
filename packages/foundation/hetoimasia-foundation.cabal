@@ -64,6 +64,9 @@ library
     --   Failure.Base: Operation, private so its constructor stays unexported.
     --   Failure.Types: the evidence records and the failure annotation, private
     --     so the annotation stays unexported and only the facade attaches it.
+    --   Resource.Collection.Types: the collection, member state and token, and
+    --     the result and rejection types, private so Collection and Member keep
+    --     their constructors unexported; Resource.Collection re-exports them.
     other-modules:
         Hetoimasia.Foundation.Failure.Base
         Hetoimasia.Foundation.Failure.Types
@@ -73,6 +76,7 @@ library
         Hetoimasia.Foundation.Log.Format
         Hetoimasia.Foundation.Log.Sink
         Hetoimasia.Foundation.Log.Types
+        Hetoimasia.Foundation.Resource.Collection.Types
     hs-source-dirs: src
     default-language: GHC2024
     default-extensions: UnicodeSyntax OverloadedStrings
@@ -93,11 +97,33 @@ library
 -- clients, and the worker group, whose public module re-exports everything but
 -- the coordination probe the foundation's own tests hold helpers with. Being
 -- private, it is visible to this package's components and to no client.
+--
+-- Only the two facades are exposed, so the rest of the package reaches the
+-- resource modules below through Resource.Internal alone. Those hidden modules
+-- import one another directly, never the facade, and nothing from the main
+-- library:
+--   Resource.Cleanup: the single owner of cleanup identity and evidence; the
+--     CleanupFailureId and CleanupFailure representations, the counter that
+--     issues identities, inspection, and the release and retention primitives.
+--     Private so no client can build or rewrite an evidence entry.
+--   Resource.Types: release ranks and the assembly representation (Part,
+--     Assembling, Assembly, Ledger), private so no client can run an assembly
+--     or reach a ledger.
+--   Resource.Assembly: staged acquisition, rollback and lending over those
+--     types, private because each operation trusts its caller to keep the
+--     mask discipline.
+--   Resource.Scoped: the Scoped continuation type and its runner, private so
+--     no client can build or rewrite a scope.
 library internal
     visibility: private
     exposed-modules:
         Hetoimasia.Foundation.Resource.Internal
         Hetoimasia.Foundation.Worker.Internal
+    other-modules:
+        Hetoimasia.Foundation.Resource.Assembly
+        Hetoimasia.Foundation.Resource.Cleanup
+        Hetoimasia.Foundation.Resource.Scoped
+        Hetoimasia.Foundation.Resource.Types
     hs-source-dirs: internal
     default-language: GHC2024
     default-extensions: UnicodeSyntax OverloadedStrings
@@ -142,6 +168,7 @@ test-suite foundation-tests
         Test.Foundation.Resources.Journal
         Test.Foundation.Resources.Opacity
         Test.Foundation.Resources.Spec
+        Test.Foundation.Resources.Visibility
         Test.Foundation.Time.Opacity
         Test.Foundation.Time.Spec
         Test.Foundation.Workers.Opacity

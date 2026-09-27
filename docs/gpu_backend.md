@@ -1048,6 +1048,11 @@ its Linux execution is CI's.
 facades over hidden modules, are retained as
 [`docs/vulkan/macos-log-failure-split.md`](vulkan/macos-log-failure-split.md);
 their Linux execution is CI's.
+#271's, taken again over the resource family's split into owning modules
+behind its package-private facade, are retained as
+[`docs/vulkan/macos-resource-split.md`](vulkan/macos-resource-split.md),
+with that run's `test.glfw-native` receipt beside them; their Linux execution
+is CI's.
 #280's, taken again over the native wake examples' Wayland settling barrier,
 are retained as
 [`docs/vulkan/macos-wayland-settle.md`](vulkan/macos-wayland-settle.md), with
