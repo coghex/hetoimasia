@@ -30,6 +30,16 @@ recorded in the same masked step as its bookkeeping. D-15–D-17, D-23 and D-26,
 P-1's scheduling vocabulary and P-2. See
 [Frames: acquisition, submission and abandonment](#frames-acquisition-submission-and-abandonment).
 
+VK-13 ([#227](https://github.com/coghex/hetoimasia/issues/227)) adds
+**presentation**: each target presents independently through a bounded
+presentation pool of render-finished semaphores and present fences, reserved
+with the frame; what was enqueued is read per swapchain from `pResults`; a
+presentation retires, and its generation's presentation hold ends, only when
+its own present fence is observed signalled; and retired generations and
+closing windows retire incrementally from that evidence, with no device-wide
+idle. D-9, D-15, D-18 and D-23, P-2, P-8, P-14 and P-15. See
+[Presentation and retirement](#presentation-and-retirement).
+
 [#250](https://github.com/coghex/hetoimasia/issues/250) (VKR-2) adds **debug
 names and recording labels**: every native object the backend creates is named
 from identities it already holds — the debug messenger excepted — and every
@@ -37,16 +47,17 @@ batch and every dynamic-rendering pass is bracketed in balanced command-buffer
 labels, which [the diagnostic capture](vulkan_diagnostics.md) now copies. See
 [Names and labels](#names-and-labels).
 
-Nothing is presented yet. Frames are acquired, submitted and abandoned by the
-native package's frames module, and its native case drives them on private
-roots; the controller wires neither the recording nor the frames in, and the
-owner's progress step reports no render demand. Its deadlines are the brief self-scheduled watch over an
-attachment whose announcement a full port deferred, described below, and the
-generations' own: a settling resize, a deferred recovery attempt, and the
-model's schedule for a retired generation still held. Presentation is VK-13's,
-and composing the frames into the owner's loop VK-16's. Acting on a target
-policy's exhaustion is VK-14's, and completing device-loss teardown across
-submitted work is VK-15's.
+Frames are acquired, submitted, presented and abandoned by the native
+package's frames module, and its native cases drive them on private roots; the
+controller wires neither the recording nor the frames in, and the owner's
+progress step reports no render demand. Its deadlines are the brief
+self-scheduled watch over an attachment whose announcement a full port
+deferred, described below, and the generations' own: a settling resize, a
+deferred recovery attempt, and the model's schedule for a retired generation
+still held. Composing the frames into the owner's loop is VK-16's. Acting on a
+target policy's exhaustion, or on an out-of-date or surface-lost result, is
+VK-14's, and completing device-loss teardown across submitted work and pending
+presentations is VK-15's.
 
 ## Packages
 
@@ -307,9 +318,12 @@ made it.
 | Constructing | `beginGeneration` reserves the candidate's image accounting at the tracking limit and, for a replacement, retires the active generation there and then. The swapchain is created; its images are enumerated, and their count is checked against the tracking limit **before** any view is built; a view is created for each image. |
 | Active | `publishGeneration` records the count the driver actually returned. The target is `Presenting`. |
 | Retired | Handed over as `oldSwapchain`, retired on its own, refused, failed or superseded. Nothing is acquired from it again, and no CPU use of it can begin. |
-| Destroyed | Once the model reports every hold on it ended: its views, newest first, then its swapchain, whose images go with it. Then the model records the disposal. |
+| Destroyed | Once the model reports every hold on it ended — presentation retirement included — its views, newest first, then its swapchain, whose images go with it. Then the model records the disposal. The owner's step destroys at most the model's progress-action limit of generations, one of each target's in turn, starting one target further along each step; a target's own retirement or capacity path destroys all of that target's it can. |
 
-The per-target presentation pool is not a generation's and is untouched.
+The per-target presentation pool is not a generation's: a retired generation's
+pending presentations keep their pool records, counted against the same target
+capacity a new generation draws on (see
+[The presentation pool](#the-presentation-pool)).
 
 ### The extent
 
@@ -418,8 +432,8 @@ any thread, and `endVulkanGenerationUse` ends it. While one is held the
 generation is retired but not destroyed; the model's schedule keeps the owner
 polling it, and the owner destroys it at the first step after the use ends.
 A recorded batch holds the generation it records into as a recorded reference
-([Retention](#retention)); submission and presentation add their own holds in
-VK-12 and VK-13.
+([Retention](#retention)); a submission holds it until its fence signals
+(VK-12), and a presentation until its present fence signals (VK-13).
 
 ### Failure and close
 
@@ -879,20 +893,22 @@ public surface is unchanged: every transition used here — `reserveFrame`,
 | `submitFrames batches` | Validates the whole non-empty request, then resets one fence, submits every batch in the caller's order as one `vkQueueSubmit2` on the session's one graphics queue, and records the result in the same masked step | `SubmittedAs` the one `SubmissionId` every frame of the request shares; `SubmittedNothing` for the specified no-effect failure; or a refusal before any native call |
 | `skipFrame frame` | Consumes an acquired, unsubmitted frame: invalidates its recording, skips it in the model, and makes a cleanup submission waiting on its acquisition semaphore | Acknowledgement of its admission to retirement, not its completion |
 | `closeUnpresentedFrame frame` | Closes a submitted frame that will never be presented, in the model alone | Acknowledgement; its settlement follows its actual rendering completion |
+| `presentFrame frame` | Validates a submitted frame, then resets its pool record's present fence and presents its image waiting on the record's render-finished semaphore, recording what the swapchain answered in the same masked step ([Presentation and retirement](#presentation-and-retirement)) | `PresentedAs` the `PresentationId` and what was enqueued; `PresentedNothing` for out of memory; or a refusal before any native call |
 | `closeTargetFrames target` | Skips every acquired frame of a target and closes every submitted one | What each frame answered |
-| `progressFrames now` | The owner's bounded step: observes pending fences, makes the cleanup submissions closed frames owe, and returns images | A `Progress`: completed submissions, settled frames, cleanups made, fences still pending |
-| `retireTargetFrames target` | Destroys a target's slot synchronization once nothing of it is live or pending | Returns, or raises `FramesRetained` naming what remains |
+| `progressFrames now` | The owner's bounded step: observes pending fences — submission, present and cleanup — makes the cleanup submissions closed frames owe, and returns images | A `Progress`: completed submissions, retired presentations, settled frames, cleanups made, fences still pending |
+| `awaitFrames now timeout` | A finite protected-drain wait — at most `drainWaitLimit`, 10 ms — on one pending fence, then `progressFrames` | The step's `Progress`; the wait itself is never evidence |
+| `retireTargetFrames target` | Destroys a target's slot synchronization and presentation pool once nothing of it is live, presented and unretired, or pending | Returns, or raises `FramesRetained` naming what remains |
 
 Frame capacity is the model's: two slots per target by default, one supported
-(D-16). An acquisition refused for want of a slot, a pool record or accounting
-answers `AcquisitionPending (PendingBackpressure kind)` before any native call.
+(D-16). An acquisition refused for want of a slot, a presentation-pool record
+or accounting answers `AcquisitionPending (PendingBackpressure kind)` before any
+native call.
 
 ### Slot synchronization
 
-Each frame slot owns four synchronization objects: an **acquisition
-semaphore**, the **render-finished semaphore** its submissions signal, the
-**submission fence** of a native submission it leads, and a **cleanup fence**.
-They are made together, named from the target and slot when the device offers
+Each frame slot owns three synchronization objects: an **acquisition
+semaphore**, the **submission fence** of a native submission it leads, and a
+**cleanup fence**. They are made together, named from the target and slot when the device offers
 naming (`slotObjectName`), the first time the slot is reserved and before its
 first acquisition; a creation or naming that raised destroys what was made
 before it and gives the reservation back. So an acquired frame always has the
@@ -902,10 +918,12 @@ the frame. A slot is reused only once the model has freed it, and the
 acquisition checks its objects are idle — no semaphore owed a signal or waited
 on, no fence pending — and refuses otherwise.
 
-Until VK-13 brings presentation, nothing waits on a render-finished semaphore
-but a cleanup submission, so the slot keeps it. VK-13's per-target presentation
-pool (P-2) takes it over, since a presented frame's semaphore must outlive its
-slot's reuse.
+The **render-finished semaphore** a frame's rendering signals is not the
+slot's: a presentation waits on it for longer than the slot is held, so it
+belongs to the record of the target's presentation pool bound to the frame at
+its reservation ([The presentation pool](#the-presentation-pool)). The frame's
+submission signals it; its presentation, or the cleanup of a frame never
+presented, waits on it.
 
 ### Acquisition
 
@@ -948,7 +966,7 @@ first frame's slot fence is reset, only now, immediately before the one
 submission it is passed to. Each batch waits on its frame's acquisition
 semaphore at the color-attachment-output stage — where the recorder's
 transition into rendering first touches the image — executes its command
-buffer, and signals its frame's render-finished semaphore. What the call did is
+buffer, and signals the render-finished semaphore of its frame's pool record. What the call did is
 recorded before the step ends:
 
 - **It returned.** The model records one submission every frame of the request
@@ -986,7 +1004,8 @@ the model skips the frame, which consumes its capability; and a cleanup
 submission that runs no command and waits on the acquisition semaphore is made
 with the slot's cleanup fence. Once that fence has signalled, `progressFrames`
 returns the image through `vkReleaseSwapchainImagesEXT` and supplies the model
-the frame's settlement, which frees its slot and its pool record. The swapchain
+the frame's settlement, which frees its slot and its pool record — the native
+record included, since nothing signalled its semaphore. The swapchain
 is not rebuilt, the target stays available, and later frames are admitted within
 the capacity that remains. Outstanding abandonment still holds its slot and its
 pool record until the evidence arrives.
@@ -996,10 +1015,12 @@ presentation can leave a submitted frame unpresented; `closeUnpresentedFrame`
 marks it so in the model, keeping its submission and its image. It is never
 treated as an unsubmitted skip. `progressFrames` first waits for its actual
 rendering completion — its submission's fence — then settles the render-finished
-semaphore, whose signal has no other consumer, through a tracked cleanup
-submission that waits on it, and only once that cleanup's fence has signalled
-returns the image and supplies the settlement. The semaphore is then unsignalled
-with no wait outstanding, and the slot may be reused.
+semaphore of its pool record, whose signal has no other consumer, through a
+tracked cleanup submission that waits on it, and only once that cleanup's fence
+has signalled returns the image and supplies the settlement. The semaphore is
+then unsignalled with no wait outstanding, the pool record is free, and the
+slot may be reused. A presentation that enqueued nothing leaves its frame
+submitted, and this is its exit too.
 
 A cleanup submission or a release that raised retains the frame, its image and
 its synchronization for ever — never retried, never fabricated as reusable —
@@ -1012,14 +1033,17 @@ entry point resolves on neither, and the binding's call dispatches the EXT one.
 
 ### Completion and the owner's step
 
-Only a fence a native submission made pending is ever asked whether it has
+Only a fence a queue operation made pending is ever asked whether it has
 signalled, and only without waiting (`vkGetFenceStatus`), inside
 `progressFrames`. A signalled submission fence is the model's
 `SubmissionCompleted` fact: it discharges every hold the submission carried,
 unsignals the acquisition semaphores it waited on, and frees each slot that
-owes nothing else. A signalled cleanup fence, followed by a release that
-returned, is the `UnpresentedFrameSettled` fact. Nothing else — elapsed time, a
-returned call, a cancellation, a reset fence — ever becomes either. A step makes
+owes nothing else — but no presentation-pool record. A signalled present fence
+is the `PresentationRetired` fact ([Retirement
+evidence](#retirement-evidence)). A signalled cleanup fence, followed by a
+release that returned, is the `UnpresentedFrameSettled` fact. Nothing else —
+elapsed time, a returned call, a cancellation, a reset fence — ever becomes any
+of them. A step makes
 at most the model's progress-action limit of native calls. Its work — each
 outstanding submission's fence, each cleanup owed, each cleanup fence — is one
 list that each step starts one place further along, so a budget smaller than
@@ -1028,14 +1052,16 @@ cannot hold a later submission's completion, cleanup or release back; work the
 step itself creates is taken by a further pass while the budget lasts. A step
 runs whatever the target's phase — closing included — and raises only once it has recorded
 everything that returned: device loss first, then the first cleanup failure or
-uncertain effect. The native case polls it a millisecond apart; composing it
-into the owner's loop and the model's schedule is VK-16's.
+uncertain effect. VK-12's native case polls it a millisecond apart and
+VK-13's drains through `awaitFrames`; composing it into the owner's loop and
+the model's schedule is VK-16's.
 
 ### The protected handoff
 
 Each native effect and the bookkeeping of its result are one masked step:
-acquisition, the fence reset and the submission, each cleanup submission, each
-fence observation, and each release. A cancellation is delivered only before the
+acquisition, the fence reset and the submission, the present fence's reset and
+the presentation, each cleanup submission, each fence observation, and each
+release. A cancellation is delivered only before the
 call or after its result is recorded, in the model and here, and it is then
 re-raised unchanged; it never undoes an effect or turns a pending fence into
 completion. No consumer code runs inside a handoff, and none is run again:
@@ -1047,25 +1073,182 @@ is never rolled back.
 ### How the frames are built
 
 `Hetoimasia.GPU.Vulkan.Native.Frames` is the entry point and holds no code of
-its own: it re-exports what five private modules under
+its own: it re-exports what seven private modules under
 `Hetoimasia.GPU.Vulkan.Native.Internal.Frames` implement, as the recording's
 entry point does.
 
 | Module | Responsibility | Depends on |
 | --- | --- | --- |
-| `Layer` | The native layer's shape: `FrameOps`, what an acquisition answers, and a submission's batches. No state, no call. | — |
-| `State` | The `Frames` and the three maps it holds; the answers, failures and views; and the uncertain-state step. | `Layer`, the recording's `State` |
-| `Acquisition` | `tryAcquireFrame` and the slot's synchronization. | `Layer`, `State` |
+| `Layer` | The native layer's shape: `FrameOps`, what an acquisition and a presentation answer, a submission's batches and a presentation's request. No state, no call. | — |
+| `State` | The `Frames` and the five maps it holds; the answers, failures and views; and the uncertain-state step. | `Layer`, the recording's `State` |
+| `Acquisition` | `tryAcquireFrame`, the slot's synchronization, and binding the frame its presentation-pool record. | `Layer`, `State` |
 | `Submission` | `submitFrames`. | `Layer`, `State`, the recording's `Batches` |
-| `Abandonment` | `skipFrame`, `closeUnpresentedFrame`, `closeTargetFrames`, `progressFrames` and `retireTargetFrames`. | `Layer`, `State`, the recording's `Batches` |
+| `Presentation` | `presentFrame` and `classifyPresent`. | `Layer`, `State` |
+| `Abandonment` | `skipFrame`, `closeUnpresentedFrame`, `closeTargetFrames`, and the cleanup submission `Progress` also makes. | `Layer`, `State`, the recording's `Batches` |
+| `Progress` | `progressFrames`, `awaitFrames` and `retireTargetFrames`. | `Layer`, `State`, `Abandonment` |
 
 `Frames.Vulkan` imports the public module. Every call it makes is the binding's
-own and `safe`: submission, acquisition, a fence's status and an image's release
-are driver-bound calls, not recording, so the audited `unsafe` subset is
-unchanged. The controller constructs no recording, and so no frames either:
+own and `safe`: submission, acquisition, presentation, a fence's status, a
+finite fence wait and an image's release are driver-bound calls, not recording,
+so the audited `unsafe` subset is unchanged. The controller constructs no recording, and so no frames either:
 this module, like the recording, is driven on private roots by its native case,
 and the loop adapter that composes both into the controller's owner step is
 VK-16's.
+
+## Presentation and retirement
+
+VK-13 ([#227](https://github.com/coghex/hetoimasia/issues/227)) is
+presentation over the frames, and the retirement that follows from it: D-9's
+verified presentation-fence completion, D-15's bounded central lifetime
+enforcement, D-18's overlapping generations and D-23's separately settled
+abandonment, over P-2's frame ownership table, P-8's retirement beneath the
+attachment, P-14's classification by actual effect and P-15's budgets. The GPU
+model's public surface is unchanged: `enqueuePresentation`, its
+`PresentOutcome`s, the `PresentationRetired` fact and the derived pool capacity
+were already [its contract](gpu_model.md#frame-ownership), and this backend
+supplies the native evidence.
+
+### Presentation
+
+`presentFrame frame` presents one submitted frame's image, one target image per
+native request, to the swapchain it was acquired from, on the session's one
+graphics queue. It refuses before any native call: another thread; a failed
+session, which makes no new native effect — the frame's exit is its close; a
+frame this owner did not acquire, or that is not submitted, already presented
+or being abandoned (`WrongPhase FrameIdentity`); anything the model's
+`enqueuePresentation` would refuse, asked of a copy it then discards; and a pool
+record not bound to the frame, whose render-finished semaphore is not owed the
+submission's signal or whose present fence is pending. Nothing is made,
+reserved or waited for here: the pool record was reserved and bound with the
+frame, so presenting is never refused for capacity. The frame's rendering need
+not have completed — the presentation waits on the render-finished semaphore on
+the device, never on the host.
+
+Then, in one masked step, the pool record's present fence is reset — only now,
+immediately before the one presentation it is passed to — and
+`vkQueuePresentKHR` presents the image waiting on the record's render-finished
+semaphore, with that fence chained through `VkSwapchainPresentFenceInfoEXT`
+(`VK_EXT_swapchain_maintenance1`), and what the call did is read and recorded
+before the step ends. A cancellation aimed at the owner is delivered only after
+that record exists. The call may block in the driver: the handoff promises a
+recorded outcome, never a prompt return, and it never interrupts the call
+(GUIDE-2, #211). Targets present independently: nothing about one target's
+presentation waits for, orders or refuses another's, and a presentation that is
+delayed — or never made — keeps its frame's obligations and pool record, and
+nothing else.
+
+### What was enqueued
+
+The swapchain's own entry of `pResults` is the truth for the swapchain; the
+production layer starts it as `VK_RESULT_MAX_ENUM`, which no call writes, and
+reads it back — before re-raising anything the call raised — so an entry the
+call never wrote is read as unwritten, never as success. `classifyPresent`
+reads it with whether the call raised, and they must agree: a call that
+returned answers success or suboptimal for its one swapchain, and one that
+raised answers the error it raised with.
+
+| The call | The swapchain's entry | What it means | What is recorded |
+| --- | --- | --- | --- |
+| Returned | `VK_SUCCESS` | Enqueued | The model's presentation, `PresentationEnqueued`; the fence pending; the semaphore the presentation engine's |
+| Returned | `VK_SUBOPTIMAL_KHR` | Enqueued | The same, `PresentationEnqueuedSuboptimal`; a replacement coalesced in the model and reported to the generations (`SwapchainSuboptimal`), with none of the frame's synchronization reset |
+| Raised | `VK_ERROR_OUT_OF_DATE_KHR` | Enqueued: the specification keeps a rejected presentation's queue operations, and its semaphore waits happen | The same, `PresentationEnqueuedOutOfDate`; a replacement requested, reported as `SwapchainOutOfDate`; recovery is VK-14's |
+| Raised | `VK_ERROR_SURFACE_LOST_KHR` | Enqueued, likewise | The same, `PresentationEnqueuedSurfaceLost`; a replacement requested in the model; recovering the surface is VK-14's |
+| Raised out of memory | Out of memory, or unwritten | The specified no-effect case: nothing enqueued, and no present fence | Nothing but the fence, reset and never pending, and never waited on. The frame is still submitted, owning its image, semaphore and record, and can be presented again or closed. `PresentedNothing` |
+| Anything else | Unwritten, contradictory, device loss, or a result the profile does not classify | Unknown | The frame enters the uncertain state — retained for ever with its image, record and parents — admission stops, the session fails with `UnknownSubmissionEffect`, and `FrameEffectUncertain` is raised, or the device loss itself |
+
+A present fence whose reset raised presents nothing, but the fence is in doubt:
+it is retained for ever with its record, admission stops, the session fails with
+`CleanupFailed`, and the failure is re-raised; the frame can still be closed.
+The rows other than success and suboptimal are specification obligations, not
+behaviour VK-2 observed on both profiles — its record names them as
+specification rows — and the headless examples inject each one.
+
+### The presentation pool
+
+Each target owns a presentation pool (P-2): records of a **render-finished
+semaphore** and a **present fence**, made together the first time the pool
+needs another record, named from the target and record (`poolObjectName`) when
+the device offers naming, and bound to a frame at its reservation — before its
+acquisition — so its rendering has a semaphore to signal and its presentation a
+fence to chain whatever the budgets say later. A record serves one owner at a
+time (`PoolHolder`): free, the frame reserved with it, and then the presentation
+enqueued with it. It is bound only while its semaphore is unsignalled with no
+wait outstanding and its fence is not pending, and it is freed only when the
+model lets go of the pool record it served: when its present fence signalled,
+or at the explicit settlement of a frame that was never presented — a skipped
+one, a closed one, or one whose presentation enqueued nothing — never because
+the frame's rendering completed, never by a timeout, and never because its image
+was acquired again. A reservation given back — not ready, a timeout, out of date
+— frees it untouched.
+
+The pool's capacity is the model's derived `presentationPoolCapacity`, the
+overflow-checked sum of the image tracking limit and the frame-slot count — 18
+by default — validated with P-15's other budgets before a model exists. A
+target's retired generations' pending records count against the same capacity
+as its active generation's; no generation receives a pool of its own. An
+acquisition the pool cannot serve answers
+`AcquisitionPending (PendingBackpressure PresentationPoolBudget)` before any
+native call, and a retirement makes room without the pool growing. Cleanup
+never needs a record: a frame's abandonment uses the record it already holds.
+
+A new acquisition of an image whose older presentation is still pending takes a
+free record, with no host wait on the older present fence; the older record is
+neither retired, recycled nor discharged by it, and still names its own image.
+The new acquisition's own semaphore still orders the image's use on the device.
+
+### Retirement evidence
+
+A presentation retires only when its own present fence is observed signalled:
+by a non-blocking `vkGetFenceStatus` in `progressFrames`, or after
+`awaitFrames`' finite drain wait, whose wait is not itself the evidence. That
+observation — and nothing else — is the model's `PresentationRetired` fact: it
+discharges the generation's presentation hold, frees the pool record, whose
+semaphore the presentation engine has finished with, and completes the
+presentation half of the target's retirement cycle, matched to it by identity.
+A status query that answers not ready is simply pending: what a fence answered
+before is never read into it, and no status is assumed, before or after a wait.
+A signalled render fence completes the submission and frees the frame's slot,
+and frees no presentation object. A present fence only proves the
+presentation's resource-retirement condition; it says nothing about when the
+image reached the screen.
+
+A status query that raised retains the presentation for ever — its record, its
+pool record and its generation's hold — fails the session with `CleanupFailed`,
+and raises `PresentationUncertain` once the step has recorded everything else;
+the presentation is never asked again.
+
+`awaitFrames now timeout` waits at most the timeout, and never longer than
+`drainWaitLimit` — P-15's 10 ms — for the first pending fence of the step's work
+(`vkWaitForFences` on that one fence), then runs `progressFrames`. It waits on
+nothing when nothing is pending, and a wait on a fence has no effect on it. A
+wait that timed out leaves every obligation, pool record and retirement exactly
+as it was: a timeout is a scheduling outcome. The owner may call it where a
+protected drain would otherwise spin.
+
+### Incremental retirement
+
+Retired generations retire incrementally, from verified fences alone. Once the
+model reports every hold on a retired generation ended — its presentations'
+among them — the owner's next generations step destroys its views and
+swapchain, bounded to the model's progress-action limit of generations a step
+and taken one of each target's in turn, starting one target further along each
+step, so no target's backlog delays another's. Nothing waits for the device to
+go idle.
+
+A closing window retires the same way. Its frames are closed
+(`closeTargetFrames`) — acquired ones skipped, submitted ones closed unpresented
+— and its presentations stay until their own present fences are observed.
+`retireTargetFrames` then destroys its slots' and its pool's synchronization,
+and raises `FramesRetained`, naming the frames, presentations and records that
+remain, until then; `retireTargetGenerations` raises `GenerationsRetained` while
+any generation's hold remains, which keeps the surface, and so the attachment's
+terminal retirement fact, withheld from the protected host through #219's
+controller path. Closing the first-created target retires only its own frames,
+presentations, generations and surface: the shared device, the instance and
+every other target stay live, and another target keeps presenting throughout.
+The controller constructs no frames until VK-16 wires them in, so the
+controller's own retirement meets no presentation obligation yet; the order and
+the withheld evidence it will meet are the ones above, proved on private roots.
 
 ## Destruction order
 
@@ -1100,8 +1283,9 @@ while retirement is still running; a later progress step raises it too. The
 retirement that follows is the ordinary child-before-parent one — the
 controller submits nothing, and Vulkan permits destroying a lost device's
 objects without waiting for work — and nothing is recreated or replayed. The
-frames treat a loss raised by a submission as an unknown effect, which retains
-what it concerns; completing teardown across submitted work is VK-15's. A cleanup failure
+frames treat a loss raised by a submission or a presentation as an unknown
+effect, which retains what it concerns; completing teardown across submitted
+work and pending presentations is VK-15's. A cleanup failure
 during it stays behind the loss. An outcome that is unknown rather than lost is
 not loss: it is an ordinary failure, and a destruction whose outcome is unknown
 retains its parents.
@@ -1126,9 +1310,11 @@ retains its parents.
 | Frame storages | The recording | Construction inserts one per target frame slot; disposal removes it | The owner | As its managed record | As its managed record |
 | Batch records | The recording | `recordFrame` inserts; a discard or reset removes one after the invalidation returned | The owner | From admission until invalidated | Kept, explicitly uncertain, when an invalidation raised; never retried |
 | A recorder | Its `recordFrame` | The consumer action | The owner | One consumer action | Closed when the action returns or raises |
-| Slot synchronization | The frames | `Acquisition` creates a slot's four objects and marks its acquisition; `Submission` and `Abandonment` advance each object's state; `Abandonment` destroys them | The owner | From the slot's first reservation until the target's frames retire | Destroyed once idle; kept, explicitly uncertain, when a call on them raised |
-| Frame records | The frames | `Acquisition` inserts; `Submission` and `Abandonment` advance; `Abandonment` removes on settlement | The owner | From acquisition until the model records the settlement | Kept, failed or uncertain, when a cleanup or its bookkeeping did not complete |
-| Submission records | The frames | `Submission` inserts; `Abandonment` removes once the fence signalled | The owner | From the native submission until its fence signalled | Removed with the model's completion fact |
+| Slot synchronization | The frames | `Acquisition` creates a slot's three objects and marks its acquisition; `Submission`, `Abandonment` and `Progress` advance each object's state; `Progress` destroys them | The owner | From the slot's first reservation until the target's frames retire | Destroyed once idle; kept, explicitly uncertain, when a call on them raised |
+| Presentation pool | The frames | `Acquisition` creates a record and binds it to a frame; `Submission`, `Presentation`, `Abandonment` and `Progress` advance its semaphore and fence; `Presentation` rebinds it to its presentation; `Progress` frees and destroys it | The owner | From the first reservation that needs it until the target's frames retire | Freed by the retirement or settlement the model recorded; destroyed once free and idle; kept, explicitly uncertain, when a call on it raised |
+| Frame records | The frames | `Acquisition` inserts; `Submission`, `Abandonment` and `Progress` advance; `Presentation` removes on presentation and `Progress` on settlement | The owner | From acquisition until presented or until the model records the settlement | Kept, failed or uncertain, when a cleanup, a presentation or its bookkeeping did not complete |
+| Submission records | The frames | `Submission` inserts; `Progress` removes once the fence signalled | The owner | From the native submission until its fence signalled | Removed with the model's completion fact |
+| Presentation records | The frames | `Presentation` inserts; `Progress` removes once the present fence signalled | The owner | From the enqueued presentation until its present fence signalled | Removed with the model's retirement fact; kept, uncertain, when asking the fence raised |
 
 ## Evidence
 
@@ -1266,6 +1452,41 @@ the recording's does: every public frames name must compile, each
 `Internal.Frames` module must be refused as hidden, and the `Frames`
 constructor must be refused.
 
+VK-13's examples, `Frames presentation`, are in `native-tests` over the same
+stand-in, extended to model presentation: a presentation's semaphore wait, its
+present fence pending until the example completes it, and its image returned to
+the presentation engine, with a violation recorded for presenting an image the
+application does not own, waiting on a semaphore nothing will signal, or asking
+or waiting on a fence no queue operation made pending. They cover: the image
+presented to its swapchain, waiting on its pool record's semaphore, with the
+record's present fence reset immediately before; a presentation made before the
+rendering completed, whose signalled render fence frees the slot and no
+presentation object, retiring only on its own present fence; a present fence
+that has not signalled answering pending however often it is asked; an image
+reacquired while its older presentation is pending, through a second record,
+with no fence waited on or asked; a delayed presentation keeping its frame, its
+image, its slot and its record until it is presented; refusals before any native
+call; each per-swapchain answer by its effect — suboptimal and out of date
+reported to the generations with no synchronization reset, out of date and
+surface lost enqueued although the call raised, out of memory (written or not)
+enqueuing nothing and never asked, and an unwritten answer retained for ever
+with the session failed — and the classification's whole table, contradictions
+included; a cancellation at the presentation handoff, including an out-of-date
+error return with enqueued obligations, recorded before it is delivered; a
+present fence whose reset raised, and one whose status query raised; the finite
+drain wait capped at 10 ms, whose timeout keeps the record, the hold and the
+target's retirement — frames, generations and surface — withheld until the
+evidence arrives; skipped and never-presented frames settling through their own
+cleanup and freeing their records only then; the derived default pool of 18;
+pool exhaustion as backpressure before any native call, and a retirement making
+room without growth; a retired generation's pending records counted against the
+new generation's capacity; a resized target's old generation destroyed only
+after its presentation's retirement was observed; generations retired one a
+step, round-robin across two targets; and the first of two targets closed from
+verified fences — withheld while its presentation was pending — its surface
+destroyed and the device kept, while the second keeps presenting before and
+after, and the session then retired with every fence observed.
+
 #266's examples, `Generations visibility across the package boundary`, compile
 external clients the same way: one that imports every name the public
 generations module exports, with the constructors it exports, must compile;
@@ -1312,7 +1533,9 @@ and [`docs/vulkan/linux-vk10.md`](vulkan/linux-vk10.md), from the Linux display
 worker. VK-11's are retained as [`docs/vulkan/macos-vk11.md`](vulkan/macos-vk11.md)
 and [`docs/vulkan/linux-vk11.md`](vulkan/linux-vk11.md). VK-12's are retained as
 [`docs/vulkan/macos-vk12.md`](vulkan/macos-vk12.md) and
-[`docs/vulkan/linux-vk12.md`](vulkan/linux-vk12.md). #250's are retained as
+[`docs/vulkan/linux-vk12.md`](vulkan/linux-vk12.md). VK-13's are retained as
+[`docs/vulkan/macos-vk13.md`](vulkan/macos-vk13.md) and
+[`docs/vulkan/linux-vk13.md`](vulkan/linux-vk13.md). #250's are retained as
 [`docs/vulkan/macos-vkr2.md`](vulkan/macos-vkr2.md) and
 [`docs/vulkan/linux-vkr2.md`](vulkan/linux-vkr2.md). #265's, taken again over
 the recording's split into private modules, are retained as
@@ -1377,7 +1600,7 @@ companions — and adds the Vulkan owner's:
 | Main thread | Hspec runs on a thread of its own; the process main thread owns one shared production graphics session: `withLoaderIntegration`, then `runGraphicsOwnerApplication` over `withVulkanOwnerHost`, with the production native layer and surface bridge. An example that needs the main thread — to hand a window's surface over, which GLFW creates there, or to close a window — submits an operation (`onMain`); the main thread runs it between two turns of the host's owner loop and returns its result or rethrows its failure. Windows are created through the host's command port from the example's own thread, which the owner loop executes, as an application's worker would. |
 | Identities | Every dispatched operation is checked, before it runs, to be on the bound process main thread that entered the session — the Haskell thread, the bound flag, and the OS thread read through `pthread_self` — and a failed check fails the operation and the run. Every native call the session makes is recorded where it runs by a `NativeObserver`, so an example shows from the calls themselves that the instance, its messenger, the device and every surface's destruction ran on the graphics owner's thread and every surface's creation on the main thread — never from the name of an Hspec hook. |
 | Sharing | The roots — the instance, its explicit messenger, and the one device — are acquired lazily, by the first dispatched operation, at most once, and shared by every later example. Each example's windows and targets are its own and are closed inside it. |
-| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, `vk12-frames`, `synchronization-hazard`, and `debug-names`. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. |
+| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, `vk12-frames`, `vk13-presentation`, `synchronization-hazard`, and `debug-names`. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. |
 | Selection | Building, listing and filtering the tree, a `--dry-run`, and a selection that dispatches nothing acquire nothing and start no child. A selection matching no example fails. `--complete`, which the catalog group passes, runs the whole tree with Hspec's configuration reading left out and then fails unless the shared session was acquired once and every private scenario ran and passed, so no ambient setting can turn the group's receipt into a pass for a subset. The consent rules and the migrated proof's pure release, construction, publication and loader-selection examples need no session and run without consent. |
 | Consent | Read once, at startup, from `HETOIMASIA_NATIVE_SESSION`, with the GLFW suite's rules for `desktop` and `isolated-x11:<display>`; this suite has no Wayland session. Without it every native example is refused before its body, the session is never acquired, and the run ends with the refusal on stderr and a non-zero exit. |
 | Environment | Before any Vulkan call, the suite clears every ambient discovery override and every validation-layer setting it finds and records which, disables implicit layers, and points the layer's settings file at an empty one; a child inherits and re-establishes the same environment. |
@@ -1447,6 +1670,33 @@ synchronization validation on — and the capture's verdict after the last
 teardown callback is clean. Its record lists every native call the frames made,
 fence status queries aside. It asserts no pixel value: the triangle consumer's
 pixels are VK-17's.
+
+VK-13's case, `vk13-presentation`, runs on private roots too, over two windows'
+surfaces, each with a generation of its own, VK-11's resources and the
+production frames layer. It presents three triangle frames to each window back
+to back — each acquired, recorded, submitted and presented with its pool
+record's present fence — and drains through `awaitFrames` until every
+presentation's retirement has been observed through its own present fence. It
+then presents a frame to the first window and resizes that window through GLFW
+before any progress step has asked that fence, and steps the generations until
+the replacement is active: the old generation is retired and held by that one
+presentation, and three further generation steps leave it in place. Only once
+the present fence's retirement is observed does the next generation step
+destroy it, and the first window then presents twice on its new generation.
+Next it presents to the first window, leaves a second frame of it acquired, and
+closes that target's frames: its retirement is attempted while the second window
+presents, and withheld — naming the pending presentation, the skipped frame and
+the records — until the evidence arrives; its frames, generations and surface
+are then destroyed, and the second window presents three more frames on the same
+device. It drains until nothing is outstanding before the second target, the
+recording and the roots retire. It passes only if every presentation reset its
+fence immediately before, every retirement was observed, the old generation was
+held until its presentation's and destroyed at once after, the first window's
+retirement was withheld while the second presented, nothing was left
+unsettled, no step received a validation error — with synchronization
+validation on — and the capture's verdict after the last teardown callback is
+clean. Its record lists every native call the frames made, fence status queries
+and drain waits aside. It asserts no pixel value.
 
 #250's case, `debug-names`, is VK-11's on private roots of its own, with one
 destructive seam only the fixture holds: it wraps the production recording

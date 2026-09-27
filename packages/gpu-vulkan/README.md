@@ -33,8 +33,9 @@ permanent rather than a staging step:
   decisions, and the instance, the explicit messenger, the one shared device
   and a record per target surface, over an open native layer — VK-10's
   swapchain generations above them, VK-11's managed resources, scoped
-  recorder and audited `unsafe` recording subset above those, and VK-12's
-  frames — acquisition, submission and safe abandonment — above the recording. It is listed
+  recorder and audited `unsafe` recording subset above those, and VK-12's and
+  VK-13's frames — acquisition, submission, presentation and safe abandonment,
+  with presentation retired on its present fences — above the recording. It is listed
   only in `cabal.project.vulkan`, with its local dependency closure, so
   CPU-only and ordinary project selection both exclude it, and only
   [`tools/vulkan/run.sh`](../../tools/vulkan/run.sh) builds it. Neither the model nor the
