@@ -9,8 +9,8 @@
 module Execution (spec) where
 
 import Control.Concurrent (threadDelay)
-import Control.Monad (void)
-import Data.List (intercalate)
+import Control.Monad (forM_, void)
+import Data.List (intercalate, isPrefixOf, stripPrefix)
 import Data.Maybe (isNothing)
 import Json (Json (..), asArray, asBool, asString, entryFor, field, parseJson)
 import Sandbox
@@ -1023,6 +1023,27 @@ spec = describe "Validation execution" $ do
             , "extra=skipped"
             ]
         result `shouldBe` ExitSuccess
+
+    it "reads each worker's receipts from the attempt that last ran it" $ do
+      -- The artifact store is hosted, so this reads the shipped workflow. Every
+      -- worker `build-test` names uploads its receipts under a name of its own,
+      -- and overwrites the artifact an earlier attempt left there: beside it,
+      -- the download could pick the earlier attempt's receipts (#285).
+      here ← getCurrentDirectory
+      workflow ← lines <$> readFile (here </> ".github/workflows/validation.yml")
+      let job name = takeWhile (not . jobHeader) (drop 1 (dropWhile (/= "  " ++ name ++ ":") workflow))
+          jobHeader line = "  " `isPrefixOf` line && not ("   " `isPrefixOf` line)
+          workers =
+            [ takeWhile (/= '=') rest
+            | line ← job "build-test"
+            , Just rest ← [stripPrefix "arguments+=(--worker \"" (dropWhile (== ' ') line)]
+            ]
+          named worker = "          name: validation-receipts-" ++ worker
+          upload worker = takeWhile ("          " `isPrefixOf`) (drop 1 (dropWhile (/= named worker) (job worker)))
+      workers `shouldBe` ["haskell-engine", "haskell-workflow", "glfw-native", "vulkan"]
+      forM_ workers $ \worker → do
+        filter (== named worker) workflow `shouldBe` [named worker]
+        upload worker `shouldContain` ["          overwrite: true"]
 
   describe "platform applicability" $ do
     it "refuses to execute a group this platform does not build and writes no receipt" $
