@@ -31,7 +31,7 @@ import Control.Exception (displayException, fromException)
 import Control.Monad (unless)
 import Data.List (intercalate)
 import Data.Maybe (isNothing)
-import System.Environment (getArgs)
+import System.Environment (getArgs, setEnv)
 import System.Exit (ExitCode, exitFailure, exitWith)
 import System.IO (BufferMode (LineBuffering), hFlush, hPutStrLn, hSetBuffering, stderr, stdout)
 import Test.GLFW.Native.Consent (Consent, Refusal, readConsent, refusalMessage)
@@ -53,6 +53,8 @@ import Test.Hspec.Runner (Config (configFailOnEmpty), defaultConfig, hspecWithRe
 
 main ∷ IO ()
 main = do
+  -- DIAGNOSTIC for #280, reverted in the next commit: trace the Wayland protocol.
+  setEnv "WAYLAND_DEBUG" "client"
   -- A native run's own output is its evidence, and this process enters a real
   -- GLFW session on the thread that would take the whole program down with it.
   -- Piped into a runner, stdout would otherwise be block-buffered and flushed
