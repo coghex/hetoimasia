@@ -73,6 +73,15 @@
 -- 'RecoveryHistory' carry what a reporting adapter needs to explain what
 -- happened.
 --
+-- This module owns no state. It defines both recovery boundaries, policy
+-- validation, the helpers they share, and history inspection, and re-exports
+-- the policy, outcome and history types from
+-- @Hetoimasia.Foundation.Recovery.Types@, a private module of the foundation
+-- package that also holds the unexported annotation carrying a history and its
+-- rendering. That module takes 'Operation' from the failure family's private
+-- @Failure.Base@, so the types depend on neither failure annotations nor the
+-- recovery loop.
+--
 -- See @docs/recovery.md@ for the same contract in prose.
 module Hetoimasia.Foundation.Recovery
   ( -- * Boundary
@@ -101,8 +110,7 @@ module Hetoimasia.Foundation.Recovery
   ) where
 
 import Control.Exception
-  ( Exception
-  , ExceptionWithContext (ExceptionWithContext)
+  ( ExceptionWithContext (ExceptionWithContext)
   , SomeAsyncException
   , SomeException
   , WhileHandling (WhileHandling)
@@ -115,16 +123,16 @@ import Control.Exception
   , toException
   , tryWithContext
   )
-import Control.Exception.Annotation (ExceptionAnnotation (displayExceptionAnnotation))
 import Control.Exception.Context
   ( ExceptionContext
   , addExceptionAnnotation
   , getExceptionAnnotations
   )
 import Control.Monad (join, when)
-import Data.List (intercalate, sortOn)
+import Data.List (sortOn)
 import Data.Maybe (isJust)
 import Hetoimasia.Foundation.Failure (Operation, operationText)
+import Hetoimasia.Foundation.Recovery.Types
 import Hetoimasia.Foundation.Resource (Assembly, cleanupFailuresInContext)
 import Hetoimasia.Foundation.Resource.Internal
   ( Scoped (Scoped)
@@ -133,125 +141,6 @@ import Hetoimasia.Foundation.Resource.Internal
   , restoredStep
   , retainCleanupFailures
   )
-
--- | Whether the caller can continue without the operation's result.
---
--- This is the caller's decision for one named operation, never a severity
--- attached to an exception type.
-data Disposition
-  = Required
-    -- ^ Exhaustion propagates the latest failure.
-  | Optional
-    -- ^ Exhaustion of a recognized failure returns 'Unavailable'.
-  deriving (Eq, Show)
-
--- | What to run next after a recognized failure.
-data Strategy a
-  = Retry
-    -- ^ Run the operation given to 'recover' again, even after a fallback.
-  | Fallback !Operation (IO a)
-    -- ^ Run the named alternative operation.
-
--- | Which operation an attempt ran.
-data AttemptKind
-  = InitialAttempt
-  | RetryAttempt
-  | FallbackAttempt !Operation
-  deriving (Eq, Show)
-
--- | One attempt that failed synchronously after its cleanup finished.
-data AttemptFailure = AttemptFailure
-  { attemptNumber ∷ !Int
-    -- ^ One for the initial attempt, counting every retry and fallback.
-  , attemptKind ∷ !AttemptKind
-  , attemptException ∷ !(ExceptionWithContext SomeException)
-    -- ^ The failure with the context it propagated with, so its origin and
-    -- cleanup evidence stay inspectable.
-  }
-  deriving (Show)
-
--- | The explicit recovery policy for one named operation.
---
--- There is no default: a caller states which failures its component can
--- handle, how, how many attempts in total are allowed, and whether the work is
--- required.
-data RecoveryPolicy a = RecoveryPolicy
-  { policyDisposition ∷ Disposition
-  , policyBudget ∷ Int
-    -- ^ The total number of attempts, the initial one included. Must be
-    -- positive.
-  , policyClassifier ∷ AttemptFailure → IO (Maybe (Strategy a))
-    -- ^ Supplied by the component that knows its failures. 'Nothing' means the
-    -- failure is not recognized and propagates. It sees only synchronous
-    -- failures whose attempt retained no cleanup evidence, and it is consulted
-    -- for the last attempt too, so an unrecognized failure is never downgraded
-    -- to 'Unavailable'.
-  , policyWait ∷ Int → IO ()
-    -- ^ Runs before each later attempt, given that attempt's number, after the
-    -- failed attempt's cleanup and outside every release. It runs with the
-    -- caller's masking state, so a blocking wait stays cancellable.
-  }
-
--- | A policy 'recover' refuses before running anything.
-newtype InvalidRecoveryPolicy = NonPositiveBudget Int
-  deriving (Eq, Show)
-
-instance Exception InvalidRecoveryPolicy
-
--- | A successful attempt's result.
-data Recovered a = Recovered
-  { recoveredValue ∷ a
-  , recoveredBy ∷ !AttemptKind
-    -- ^ 'InitialAttempt' when no recovery was needed.
-  , recoveredFailures ∷ ![AttemptFailure]
-    -- ^ Every failed attempt before the successful one, oldest first.
-  }
-
--- | Why optional work is unavailable.
-data Unavailability = Unavailability
-  { unavailableOperation ∷ !Operation
-  , unavailableReason ∷ !AttemptFailure
-    -- ^ The last attempt, which the classifier recognized with no budget left.
-  , unavailableEarlier ∷ ![AttemptFailure]
-    -- ^ Every attempt before it, oldest first.
-  }
-  deriving (Show)
-
--- | What 'recover' returns.
-data Outcome a
-  = Available !(Recovered a)
-  | Unavailable !Unavailability
-    -- ^ Only for an 'Optional' policy.
-
--- | The earlier failed attempts of one recovery, attached to the failure that
--- ended it.
-data RecoveryHistory = RecoveryHistory
-  { historyOperation ∷ !Operation
-  , historyAttempts ∷ ![AttemptFailure]
-    -- ^ Oldest first; the propagated failure itself is not repeated here.
-  }
-  deriving (Show)
-
--- | The annotation this module attaches. It is not exported, so history is only
--- attached by 'recover'. The position orders entries by attachment, as
--- "Hetoimasia.Foundation.Failure" does for its own evidence.
-data HistoryEntry = HistoryEntry !Int !RecoveryHistory
-
-instance ExceptionAnnotation HistoryEntry where
-  displayExceptionAnnotation (HistoryEntry _ history) =
-    "after failed recovery attempts of "
-      <> show (operationText (historyOperation history))
-      <> ": "
-      <> intercalate ", " (map describeAttempt (historyAttempts history))
-
--- | One attempt on one line. Operation names are rendered with 'show', which
--- escapes quotes and control characters, and no exception text is rendered.
-describeAttempt ∷ AttemptFailure → String
-describeAttempt failure =
-  "#" <> show (attemptNumber failure) <> " " <> case attemptKind failure of
-    InitialAttempt → "initial"
-    RetryAttempt → "retry"
-    FallbackAttempt name → "fallback " <> show (operationText name)
 
 -- | Run one complete owned operation under a recovery policy.
 --
@@ -494,8 +383,9 @@ withHistory name earlier (ExceptionWithContext context exception) =
     entry = HistoryEntry position (RecoveryHistory name (reverse earlier))
 
 -- | The recovery histories attached to a failure a caller caught, innermost
--- boundary first. Empty when the failure ended its recovery on its first
--- attempt or never passed through 'recover'.
+-- boundary first, whether 'recover' or 'allocComponent' attached them. Empty
+-- when the failure ended its recovery on its first attempt or never passed
+-- through either boundary.
 --
 -- History attached to a failure nested inside a 'WhileHandling' annotation is
 -- read from that nested exception, not from this one.

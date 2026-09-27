@@ -66,6 +66,7 @@ import Hetoimasia.Foundation.Resource
   , withScoped
   )
 import System.Timeout (timeout)
+import qualified Test.Foundation.Recovery.Visibility as Visibility
 import Test.Hspec
   ( Expectation
   , Spec
@@ -135,6 +136,9 @@ spec = describe "Recovery" $ do
       (boundedExample testCancelDuringWait)
     it "escapes cancellation during a fallback"
       (boundedExample testCancelDuringFallback)
+
+  -- Which recovery modules and names a client can import at all.
+  Visibility.spec
 
 -- Fixtures -------------------------------------------------------------------
 
