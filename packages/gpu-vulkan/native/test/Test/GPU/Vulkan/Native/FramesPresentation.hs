@@ -176,7 +176,11 @@ spec = describe "Frames presentation" $ do
       _ ← sealed rig frame >>= \batch → submitted rig (batch :| [])
       _ ← presentedAs rig frame PresentationEnqueued
       calls ← length <$> frameCalls (rigStandIn rig)
-      presentFrame (rigFrames rig) (ownedFrame frame) `shouldReturn'` (`shouldSatisfy` either (const True) (const False))
+      -- Presented, the frame is the presentation's: in the wrong phase for a
+      -- second presentation, a skip or a close.
+      presentFrame (rigFrames rig) (ownedFrame frame) `shouldReturn` Left (RefusedMisuse (WrongPhase FrameIdentity))
+      skipFrame (rigFrames rig) (ownedFrame frame) `shouldReturn` Left (RefusedMisuse (WrongPhase FrameIdentity))
+      closeUnpresentedFrame (rigFrames rig) (ownedFrame frame) `shouldReturn` Left (RefusedMisuse (WrongPhase FrameIdentity))
       second ← owned rig
       _ ← sealed rig second >>= \batch → submitted rig (batch :| [])
       answer ← onOtherThread (presentFrame (rigFrames rig) (ownedFrame second))

@@ -492,13 +492,20 @@ uncertain frames cause members reason = do
   mapM_ (\frame → editFrame frames frame (\record → record {recordStage = StageUncertain reason})) members
   failRootsSession (framesRoots frames) cause
 
--- | The model's own classification of a frame this owner holds no record of:
--- asking it to perform the operation, and keeping only the refusal, changes
--- nothing. A frame the model holds that this owner never acquired, or no
--- longer holds a record of, is unknown to it.
-frameMisuse ∷ GpuModel → FrameSlotId → (FrameSlotId → GpuModel → Outcome a) → Misuse
-frameMisuse model frame operation = case frameView frame model of
-  Nothing → case operation frame model of
-    Rejected misuse → misuse
-    _ → UnknownIdentity FrameIdentity
-  Just _ → UnknownIdentity FrameIdentity
+-- | The classification of a frame this owner holds no frame record of. One it
+-- presented is the presentation's now, and in the wrong phase for anything
+-- else. Otherwise the model classifies it: asking it to perform the
+-- operation, and keeping only the refusal, changes nothing. A frame the model
+-- holds that this owner never acquired, or no longer holds a record of, is
+-- unknown to it.
+frameMisuse ∷ Frames q inst msgr phys dev cmd → GpuModel → FrameSlotId → (FrameSlotId → GpuModel → Outcome a) → STM Misuse
+frameMisuse frames model frame operation = do
+  presented ← any ((== frame) . presentedFrame) <$> readTVar (framesPresentations frames)
+  pure $
+    if presented
+      then WrongPhase FrameIdentity
+      else case frameView frame model of
+        Nothing → case operation frame model of
+          Rejected misuse → misuse
+          _ → UnknownIdentity FrameIdentity
+        Just _ → UnknownIdentity FrameIdentity

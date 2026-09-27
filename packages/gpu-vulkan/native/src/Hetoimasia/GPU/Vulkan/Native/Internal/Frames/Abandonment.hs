@@ -94,8 +94,9 @@ skipFrame frames frame =
       slots ← readTVar (framesSlots frames)
       model ← readModel frames
       device ← deviceOf frames
+      misuse ← frameMisuse frames model frame skipUnsubmittedFrame
       pure $ case recordStage <$> live of
-        Nothing → Left (RefusedMisuse (frameMisuse model frame skipUnsubmittedFrame))
+        Nothing → Left (RefusedMisuse misuse)
         Just StageAcquired → case (Map.lookup (slotOf frame) slots, device) of
           (_, Nothing) → Left RefusedDeviceAbsent
           (Nothing, _) → Left (RefusedIllegal "the frame's slot has no synchronization")
@@ -121,7 +122,7 @@ closeUnpresentedFrame frames frame =
     live ← Map.lookup frame <$> readTVar (framesLive frames)
     model ← readModel frames
     case recordStage <$> live of
-      Nothing → pure (Left (RefusedMisuse (frameMisuse model frame closeSubmittedFrame)))
+      Nothing → Left . RefusedMisuse <$> frameMisuse frames model frame closeSubmittedFrame
       Just (StageSubmitted submission) → do
         closed ← modelAnswer (framesRoots frames) (fmap (\next → (next, ())) . closeSubmittedFrame frame)
         case closed of

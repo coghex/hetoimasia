@@ -162,8 +162,9 @@ presentFrame frames frame =
       pool ← readTVar (framesPool frames)
       model ← readModel frames
       device ← deviceOf frames
+      unknown ← frameMisuse frames model frame (\identity → enqueuePresentation identity PresentationEnqueued)
       pure $ case live of
-        Nothing → Left (RefusedMisuse (frameMisuse model frame (\identity → enqueuePresentation identity PresentationEnqueued)))
+        Nothing → Left (RefusedMisuse unknown)
         Just record → case recordStage record of
           StageSubmitted _ → do
             -- A failed session makes no new native effect: the frame's exit
