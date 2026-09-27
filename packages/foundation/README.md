@@ -165,6 +165,14 @@ are refused. See [docs/logging.md](../../docs/logging.md#module-structure) and
 [docs/failures.md](../../docs/failures.md#module-structure) for their dependency
 direction.
 
+The resource family has two public modules. Their implementation lives in the
+private `internal` sublibrary, which exposes only the package-private facade
+`Resource.Internal` (and the worker group's `Worker.Internal`); the rest of the
+package imports that facade, and the modules behind it import one another
+directly. The collection's representations are a hidden module of the main
+library. See [docs/resources.md](../../docs/resources.md#the-implementation-seam)
+for their dependency direction and state ownership.
+
 | Logical module | Source path | Cabal component | Visibility | Purpose |
 | --- | --- | --- | --- | --- |
 | `Hetoimasia.Foundation.Log` | `src/Hetoimasia/Foundation/Log.hs` | main library | exposed | Public logging facade; logger construction, scoped context, flushing, emission, and call-site extraction |
@@ -177,6 +185,14 @@ direction.
 | `Hetoimasia.Foundation.Failure` | `src/Hetoimasia/Foundation/Failure.hs` | main library | exposed | Public failure facade; raising, operation boundaries, and inspection |
 | `Hetoimasia.Foundation.Failure.Base` | `src/Hetoimasia/Foundation/Failure/Base.hs` | main library | hidden | The abstract `Operation` and its naming operations |
 | `Hetoimasia.Foundation.Failure.Types` | `src/Hetoimasia/Foundation/Failure/Types.hs` | main library | hidden | Origin, context, site, cause, and evidence records, and the private failure annotation |
+| `Hetoimasia.Foundation.Resource` | `src/Hetoimasia/Foundation/Resource.hs` | main library | exposed | Public resource facade; resource and composite scopes, the continuation facade, and evidence inspection |
+| `Hetoimasia.Foundation.Resource.Collection` | `src/Hetoimasia/Foundation/Resource/Collection.hs` | main library | exposed | Scoped collections of independently retired members; every collection operation |
+| `Hetoimasia.Foundation.Resource.Collection.Types` | `src/Hetoimasia/Foundation/Resource/Collection/Types.hs` | main library | hidden | Collection, member state and token, and the result and rejection types |
+| `Hetoimasia.Foundation.Resource.Internal` | `internal/Hetoimasia/Foundation/Resource/Internal.hs` | `internal` sublibrary | package-private (exposed to this package only) | Facade re-exporting the resource implementation to the rest of the package |
+| `Hetoimasia.Foundation.Resource.Cleanup` | `internal/Hetoimasia/Foundation/Resource/Cleanup.hs` | `internal` sublibrary | hidden | Cleanup identity and evidence: identities, the counter issuing them, inspection, release attempts, and retention |
+| `Hetoimasia.Foundation.Resource.Types` | `internal/Hetoimasia/Foundation/Resource/Types.hs` | `internal` sublibrary | hidden | Release ranks and the assembly representation: parts, `Assembly`, and the ledger |
+| `Hetoimasia.Foundation.Resource.Assembly` | `internal/Hetoimasia/Foundation/Resource/Assembly.hs` | `internal` sublibrary | hidden | Staged acquisition, rollback, and lending over the assembly representation |
+| `Hetoimasia.Foundation.Resource.Scoped` | `internal/Hetoimasia/Foundation/Resource/Scoped.hs` | `internal` sublibrary | hidden | The `Scoped` continuation type, its instances, and its runner |
 
 ## Tests
 

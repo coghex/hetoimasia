@@ -795,20 +795,64 @@ A component that owns resources follows these conventions. They are
 ### The implementation seam
 
 `Scoped`, the composite ledger, the cleanup-failure primitives, and the
-evidence traversal behind `cleanupFailuresInContext` are defined in
-`Hetoimasia.Foundation.Resource.Internal`, which lives in the foundation
+evidence traversal behind `cleanupFailuresInContext` live in the foundation
 package's private `internal` sublibrary (`packages/foundation/internal/`).
+`Hetoimasia.Foundation.Resource.Internal` is its package-private resource
+facade: it defines nothing and re-exports what the rest of the package uses
+from four modules the sublibrary does not expose, each owning one
+responsibility:
+
+| Module | Owns |
+| --- | --- |
+| `Resource.Cleanup` | Cleanup identity and evidence: `CleanupFailureId`, `CleanupFailure` and its annotation instance, the counter that issues identities, the readers, rendering, and inspection, and the release and retention primitives |
+| `Resource.Types` | Release ranks and the assembly representation: `ReleaseRank`, `Part`, `Assembling`, `Assembly` with its instances and eliminator, and `Ledger` |
+| `Resource.Assembly` | Staged acquisition, rollback, and lending over those types: `acquirePart`, `restoredStep`, `assemble`, `assembleSeparately`, `lendAssembled`, `releaseAcquired`, and `declaredOrder` |
+| `Resource.Scoped` | The `Scoped` continuation type, its instances, and `withScoped` |
+
+Dependencies run one way. `Resource.Assembly` imports `Resource.Types` and
+`Resource.Cleanup`; those two and `Resource.Scoped` import no other resource
+module; the facade composes all four. Inside the sublibrary the modules import
+one another directly, never the facade, and nothing from the main library.
+Outside it — `Hetoimasia.Foundation.Resource`,
+`Hetoimasia.Foundation.Resource.Collection`, `Hetoimasia.Foundation.Recovery`,
+the worker group's `Hetoimasia.Foundation.Worker.Internal`, and any test that
+needs the private seam — code imports only the facade.
+
+`Resource.Cleanup` is the single owner of cleanup identity. It alone defines
+`CleanupFailureId`, `CleanupFailure`, and the counter, and its release attempt
+is the only place an entry is created, which is what
+[The evidence boundary](#the-evidence-boundary) rests on. The counter is the
+one piece of state the resource family holds outside a scope:
+
+| State | Owner | Readers and writers | Thread | Lifetime | Reset or disposal |
+|---|---|---|---|---|---|
+| Cleanup-failure identity counter | `Resource.Cleanup` | Written atomically by each failed release attempt, which reads it only to issue the next identity | Any thread releasing a resource | The process | Never reset; identities are never reused |
+
+It carries no resource and is never read as application state; it exists so
+that an entry's identity and observation order are properties the foundation
+defines rather than consequences of how `base` stores annotations.
+
 `Hetoimasia.Foundation.Resource` re-exports only the closed types and the
 operations over them, and `allocComponent` builds its scope through the private
-module from inside the same package. The worker group's implementation lives in
+facade from inside the same package. The worker group's implementation lives in
 the same sublibrary, because its types carry `Scoped` and `CleanupFailure`; see
 [workers.md](workers.md#the-coordination-probe). A private sublibrary is
 visible to the package's own components and to no client, so no client can
-import either module, and the opacity described under
+import any of these modules, and the opacity described under
 [The continuation facade](#the-continuation-facade) and
 [The evidence boundary](#the-evidence-boundary) is unchanged. A client that
 tries is refused with `GHC-87110`, naming the hidden
 `hetoimasia-foundation-0.1.0.0:internal` unit.
+
+The collection's representations — the collection and its phase, member
+identities and state, the `Member` token with its nominal role, and the
+`Retirement`, `MemberStatus`, `CollectionError`, and `Activity` types — live in
+`Hetoimasia.Foundation.Resource.Collection.Types`, a hidden module of the main
+library. `Hetoimasia.Foundation.Resource.Collection` keeps every operation, and
+so every write to [the state the collection holds](#state-the-collection-holds),
+and re-exports the types with the same constructor visibility as before. A
+client importing the types module directly is refused with `GHC-87110`, naming
+the main library's `hetoimasia-foundation-0.1.0.0` unit.
 
 ## Inspecting secondary failures
 
@@ -1618,6 +1662,19 @@ the package's private sublibrary hides. One must be accepted, linked, and run: i
 public operations to acquire three members, borrow two together, observe
 `RetirementInUse`, `Retired`, and `AlreadyRetired`, release the rest at exit in
 reverse order, and read both retained tokens' terminal states afterwards.
+
+The `Resource module visibility across the package boundary` group in
+`packages/foundation/test/Test/Foundation/Resources/Visibility.hs`, selected by
+`--test-options='--match "Resource module visibility"'`, covers
+[The implementation seam](#the-implementation-seam) with the same harness and
+six more clients. One must be accepted: it imports, by name, every name
+`Hetoimasia.Foundation.Resource` and `Hetoimasia.Foundation.Resource.Collection`
+export, with exactly the constructors each exports. Five must be rejected with
+`GHC-87110` and neither `cannot satisfy` nor `Could not find module`: one
+importing each of `Resource.Types`, `Resource.Scoped`, `Resource.Cleanup`, and
+`Resource.Assembly`, naming the `hetoimasia-foundation-0.1.0.0:internal` unit,
+and one importing `Resource.Collection.Types`, naming the main library's unit
+and not the private one.
 
 The `Resource evidence inspection cost` examples in
 `packages/foundation/test/Test/Foundation/Resources/Cost.hs` cover
