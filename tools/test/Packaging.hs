@@ -64,7 +64,7 @@ consumed =
   , ("tools/validation/timings.py", "Timings.hs and TimingStep.hs run it")
   , (".github/workflows/review-gate.yml", "DismissalStep.hs extracts its dismissal step")
   , ("tools/validation/catalog.json", "Reuse.hs routes its groups through the workflow's worker declarations")
-  , (".github/workflows/validation.yml", "TimingStep.hs and CiImage.hs extract its steps, and Reuse.hs reads its worker declarations")
+  , (".github/workflows/validation.yml", "TimingStep.hs and CiImage.hs extract its steps, Reuse.hs reads its worker declarations, and Execution.hs reads its receipt uploads")
   , ("cabal.project.vulkan", "VulkanProof.hs reads the packages and constraints it declares")
   , ("tools/toolchain/binding.pin", "VulkanProof.hs reads the binding flags it pins")
   , ("tools/vulkan/run.sh", "VulkanProof.hs reads it to check its discovery, its modes, and that it supplies no native-session consent")

@@ -1461,8 +1461,10 @@ comparison here.
 `build-test` runs after the plan and every worker with `if: always()`, so the
 required check reaches a conclusion whatever happened upstream — a skipped
 required workflow is not a verdict, and a documentation candidate gets its
-status through exactly this path. It downloads the artifacts, writes per-job
-queue, setup, and execution timings to the job summary, and decides the verdict:
+status through exactly this path. It downloads the artifacts — each worker's
+receipts as the latest attempt that ran that worker left them, as
+[re-runs](#re-runs) explains — writes per-job queue, setup, and execution
+timings to the job summary, and decides the verdict:
 
 ```bash
 python3 tools/validation/aggregate.py --plan plan.json --receipts <dir>
@@ -1558,6 +1560,38 @@ an older request on the same commit, fails rather than satisfying the newer one.
 The aggregate prints one line per group with its reason and outcome, and exits
 `0` for a passing verdict, `1` for a failing one, and `2` for a diagnostic that
 prevented a verdict at all.
+
+#### Re-runs
+
+Re-running a failed worker, or `build-test` alone, must be able to change the
+verdict of the run it belongs to, and must never let an earlier attempt decide
+it. Each worker uploads its receipts as one artifact,
+`validation-receipts-<worker>`, with `overwrite: true`. A re-run attempt uploads
+under the same name, so the upload deletes the artifact the earlier attempt left
+and puts the new one in its place. Without it the run keeps both, and the
+download in `build-test`, which takes one artifact per name, chooses between
+them by artifact id rather than by attempt: ids are not issued in upload order,
+so it can read the older, failed receipts and repeat a failure the re-run
+already cleared. That is what kept pull request #283's `build-test` red through
+two re-runs (#285).
+
+What each worker's receipts then describe:
+
+- A worker the re-run did not include keeps the artifact and the job result of
+  the attempt that last ran it. A failure it had stays a failure; a receipt a
+  later attempt wrote for another worker cannot stand in for it, because each
+  worker's receipts arrive under its own name and each group is held to the
+  worker the plan routes it to.
+- A re-run worker's artifact is replaced whole, never merged with the one
+  before it, so a group its new attempt left without a receipt stays missing
+  rather than inheriting the earlier attempt's result.
+- A re-run worker that fails or is cancelled before it uploads leaves the
+  earlier attempt's artifact in place, but its job result is no longer
+  `success`, and a worker that did not succeed fails the verdict whatever its
+  receipts say.
+
+Nothing else about the verdict changes: an absent receipt, a stale plan, and a
+head that has moved since the plan still fail exactly as described above.
 
 ## The Linux CI image
 

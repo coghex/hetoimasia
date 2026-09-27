@@ -465,12 +465,18 @@ jobs:
           key: ${{ steps.tree.outputs.cache-primary-key }}
 
       - name: Upload the receipts
+        # `overwrite` makes a re-run replace the earlier attempt's artifact
+        # rather than add a second of the same name, of which `build-test`'s
+        # download keeps one by artifact id, not by attempt, and so could read
+        # a failure the re-run already cleared. The replacement is whole, so no
+        # earlier receipt fills a gap in it. See docs/validation.md, "Re-runs".
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: validation-receipts-haskell-engine
           path: receipts/
           if-no-files-found: warn
+          overwrite: true
 
       - name: Publish the build.all receipt as reusable evidence
         # Named by the candidate's input identity, so a later run asks for
@@ -752,12 +758,18 @@ jobs:
           key: ${{ steps.tree.outputs.cache-primary-key }}
 
       - name: Upload the receipts
+        # `overwrite` makes a re-run replace the earlier attempt's artifact
+        # rather than add a second of the same name, of which `build-test`'s
+        # download keeps one by artifact id, not by attempt, and so could read
+        # a failure the re-run already cleared. The replacement is whole, so no
+        # earlier receipt fills a gap in it. See docs/validation.md, "Re-runs".
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: validation-receipts-haskell-workflow
           path: receipts/
           if-no-files-found: warn
+          overwrite: true
 
       - name: Publish the test.workflow receipt as reusable evidence
         # Named by the candidate's input identity, so a later run asks for
@@ -936,12 +948,18 @@ jobs:
           key: ${{ steps.tree.outputs.cache-primary-key }}
 
       - name: Upload the receipts
+        # `overwrite` makes a re-run replace the earlier attempt's artifact
+        # rather than add a second of the same name, of which `build-test`'s
+        # download keeps one by artifact id, not by attempt, and so could read
+        # a failure the re-run already cleared. The replacement is whole, so no
+        # earlier receipt fills a gap in it. See docs/validation.md, "Re-runs".
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: validation-receipts-glfw-native
           path: receipts/
           if-no-files-found: warn
+          overwrite: true
 
       - name: Publish the test.glfw-native receipt as reusable evidence
         # Named by the candidate's input identity, so a later run asks for
@@ -1135,6 +1153,12 @@ jobs:
           key: ${{ steps.tree.outputs.cache-primary-key }}
 
       - name: Upload the receipts
+        # `overwrite` makes a re-run replace the earlier attempt's artifact
+        # rather than add a second of the same name, of which `build-test`'s
+        # download keeps one by artifact id, not by attempt, and so could read
+        # a failure the re-run already cleared. The replacement is whole, so no
+        # earlier receipt fills a gap in it. See docs/validation.md, "Re-runs".
+        #
         # The receipts directory also holds each group's evidence: the native
         # suite's per-scenario records and child output, and the isolated
         # display's logs, kept by its own cleanup on every exit.
@@ -1144,6 +1168,7 @@ jobs:
           name: validation-receipts-vulkan
           path: receipts/
           if-no-files-found: warn
+          overwrite: true
 
       - name: Publish the test.vulkan-headless receipt as reusable evidence
         if: always() && hashFiles('receipts/test.vulkan-headless.json') != ''

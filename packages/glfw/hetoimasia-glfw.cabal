@@ -335,6 +335,7 @@ test-suite glfw-native-tests
         Test.GLFW.Native.Interaction
         Test.GLFW.Native.Mode
         Test.GLFW.Native.Monitor
+        Test.GLFW.Native.Presence
         Test.GLFW.Native.Private
         Test.GLFW.Native.Session
         Test.GLFW.Native.Spec
@@ -345,8 +346,11 @@ test-suite glfw-native-tests
         Test.GLFW.Native.WaylandSync
         Test.GLFW.Native.Window
     -- The Wayland synchronization the native examples need and the production
-    -- shim may not perform (D-13): test-only, and compiled into this suite alone.
-    c-sources: native-tests/cbits/hetoimasia_glfw_test.c
+    -- shim may not perform (D-13), and the unreaped-exit wait the descendant
+    -- check's own examples need: test-only, and compiled into this suite alone.
+    c-sources:
+        native-tests/cbits/hetoimasia_glfw_test.c
+        native-tests/cbits/hetoimasia_glfw_test_process.c
     include-dirs: native-tests/cbits
     ghc-options: -threaded
     build-depends:

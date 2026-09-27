@@ -7,10 +7,13 @@
 -- not finished. One unfinished at the deadline is sent @SIGTERM@ with its whole
 -- group, then @SIGKILL@ after 'terminationGrace' seconds, and is reaped either
 -- way; output still held open from outside the group after that is given up on,
--- keeping what was read. Whatever the child left running in its group is
--- killed once it is done, so neither a hung child nor anything it started
--- outlives the example that launched it. A failure of the waiting itself, an
--- interruption included, kills the group before it propagates.
+-- keeping what was read. Once the child is done, its group is sent @SIGKILL@,
+-- so nothing it left running there keeps running, but only the child itself is
+-- waited for. A descendant is reaped by its own parent, which for one the child
+-- orphaned is whatever adopts orphans — init, a container's init, or launchd —
+-- so it may still be a zombie, ended but listed, when this returns. A failure
+-- of the waiting itself, an interruption included, kills the group before it
+-- propagates.
 --
 -- The deadline is enforced from outside the child and reported as
 -- 'ChildExpired'. Nothing here decides what an expiry means; a caller that
@@ -117,7 +120,8 @@ launchCommandIn environment deadline command arguments = do
               ChildExpired deadline <$> atomically reaped
     )
       `onException` killGroup
-  -- Anything the child started in its group and left running goes with it.
+  -- Anything the child started in its group and left running is killed with
+  -- it. That is not waited for: the child is the only process reaped here.
   signalGroup sigKILL pid
   Launched end <$> decoded outBytes <*> decoded errBytes <*> pure pid
   where
