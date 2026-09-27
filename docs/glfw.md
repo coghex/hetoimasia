@@ -65,7 +65,7 @@ There is no default close policy or rendering operation.
 | `hetoimasia-glfw:seam` | public, test-only | `Hetoimasia.GLFW.Seam`: the real models over a scripted native library, for CPU examples. Links no GLFW. Exports no window driver. |
 | `hetoimasia-glfw:seam-core` | private | `Hetoimasia.GLFW.Internal.Seam`: the seam's implementation, including the window drivers that deliver scripted callbacks, queue them for the next poll or wait, and change close intent, the monitor drivers that change the scripted monitors and deliver or queue monitor callbacks, and the private window command executor |
 | `glfw-tests` | test suite | The headless suite: the session, session wake, and admission-wake and demand examples over the seam, the window model, window command, window control, window host, dynamic window, monitor inventory, input feed, and window mode examples that use those drivers, that executor, the private input producer, and scripted input callbacks, the scheduled owner turn and render demand examples over a scripted clock, the window attachment model examples, the supervised graphics owner examples over injected fake backend operations, the link-declaration check, and the external-client opacity examples, over the fixtures every component spec shares through the suite's own non-spec `Test.GLFW.Support`. Initializes no GLFW and needs no display. |
-| `glfw-native-tests` | test suite | The shared native fixture, and real session, thread, monitor inventory, window, window control, window host, and native input-callback examples on the platform it runs on |
+| `glfw-native-tests` | test suite | The shared native fixture, and real session, thread, monitor inventory, window, window control, window host, and native input-callback examples on the platform it runs on, with the test-only Wayland synchronization helpers its own C source carries |
 
 The main library and the `model`, `native`, `seam`, and `seam-core`
 sublibraries depend on `hetoimasia-foundation` and not on `hetoimasia-runtime`.
@@ -5335,7 +5335,29 @@ The native examples cover:
     borderless-over-monitor requests settle unsupported with reasons, placement
     and iconified observations are `Unavailable`, and none of those calls is
     made;
-  - **wake:** the session wake examples above, run again on Wayland;
+  - **settling before a wait:** a hidden window shown, observed shown, and
+    released with its companion, the connection settled, and one production
+    wait that nothing wakes, bounded at 0.5 s, reaching its bound unwoken with
+    no progress note and the production wake counts unchanged across the
+    settling and the wait; and its coordinated control, the same window shown
+    and released and the compositor's answer established as waiting unread —
+    the socket flushed and polled until readable, reading nothing — before the
+    same wait, which then returns early and unwoken. On Wayland the settle
+    that begins every wake example crosses a synchronization boundary with the
+    compositor after processing pending events. Releasing a window that was
+    shown leaves requests GLFW has not sent, and the compositor answers them
+    by posting the release of the buffer the window's fallback decorations
+    held, which carries the `delete_id` it queued for every destroyed object;
+    arriving after a pending-events poll, that answer ends the next wait.
+    Releasing a window that was never shown posts nothing. The boundary and
+    the control's flush are test-only native helpers compiled into
+    `glfw-native-tests` alone (`native-tests/cbits/hetoimasia_glfw_test.c`),
+    since the production shim's only Wayland access is the read-only status
+    probe of the Wayland qualification design's D-13. Each example prints an
+    evidence line with the wait's sequence number, whether it was woken, its
+    time against the bound, and the wake counts;
+  - **wake:** the session wake examples above, run again on Wayland, each
+    beginning from that settled connection;
   - **shutdown:** the `session-lifecycle` child entering, leaving, and
     re-entering Wayland sessions, after which the parent's shared session
     still serves with one acquisition;
