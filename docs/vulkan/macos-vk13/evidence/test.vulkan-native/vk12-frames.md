@@ -7,7 +7,7 @@ Verdict: **pass**.
 - device: Apple M3 Max
 - generation: 320x240, format 50, 3 images
 - rendered, never presented: FrameSlotId (TargetId 0 1) 0 1, image 0, acquired at attempt 1, settled after 2 steps
-- its submission: SubmissionId 0, completed after 13 steps
+- its submission: SubmissionId 0, completed after 14 steps
 - the readback before the completion: RefusedNotWritten "a batch or a submission still holds the buffer"
 - the readback's first pixel after it: Right [89,89,89,255]
 - every byte still the sentinel: False

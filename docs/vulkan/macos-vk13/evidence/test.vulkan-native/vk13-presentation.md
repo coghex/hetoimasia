@@ -8,24 +8,24 @@ Verdict: **pass**.
 - format 50, first generations 320x240 and 320x240
 - presented to both windows:
   - first: PresentationId (TargetId 0 1) 0, image 0, PresentationEnqueued, retired after 0 drain steps
-  - first: PresentationId (TargetId 0 1) 1, image 1, PresentationEnqueued, retired after 0 drain steps
-  - first: PresentationId (TargetId 0 1) 2, image 2, PresentationEnqueued, retired after 1 drain steps
+  - first: PresentationId (TargetId 0 1) 1, image 1, PresentationEnqueued, retired after 1 drain steps
+  - first: PresentationId (TargetId 0 1) 2, image 2, PresentationEnqueued, retired after 0 drain steps
   - second: PresentationId (TargetId 1 1) 3, image 0, PresentationEnqueued, retired after 0 drain steps
-  - second: PresentationId (TargetId 1 1) 4, image 1, PresentationEnqueued, retired after 0 drain steps
-  - second: PresentationId (TargetId 1 1) 5, image 2, PresentationEnqueued, retired after 1 drain steps
+  - second: PresentationId (TargetId 1 1) 4, image 1, PresentationEnqueued, retired after 1 drain steps
+  - second: PresentationId (TargetId 1 1) 5, image 2, PresentationEnqueued, retired after 0 drain steps
 - resized the first window from 320x240 to 400x300: GenerationId (TargetId 0 1) 0 replaced by GenerationId (TargetId 0 1) 1
 - the old generation, once replaced, was held by [PresentationId (TargetId 0 1) 6] through 3 more generation steps
 - destroyed by the first generation step after its presentation's retirement was observed: True
 - presented to the resized window:
   - first: PresentationId (TargetId 0 1) 7, image 0, PresentationEnqueued, retired after 1 drain steps
-  - first: PresentationId (TargetId 0 1) 8, image 1, PresentationEnqueued, retired after 1 drain steps
+  - first: PresentationId (TargetId 0 1) 8, image 1, PresentationEnqueued, retired after 0 drain steps
 - the first window's retirement was withheld 1 times; first: the frames of TargetId 0 1 are retained: frames [FrameSlotId (TargetId 0 1) 1 3], slots [0,1], presentations [PresentationId (TargetId 0 1) 9], pool records [0,1]
 - the second window presented 1 frames while the first was retiring
 - presented to the second window after the first's surface was destroyed:
   - second: PresentationId (TargetId 1 1) 12, image 1, PresentationEnqueued, retired after 0 drain steps
   - second: PresentationId (TargetId 1 1) 13, image 2, PresentationEnqueued, retired after 0 drain steps
   - second: PresentationId (TargetId 1 1) 14, image 0, PresentationEnqueued, retired after 1 drain steps
-- drain waits: 11
+- drain waits: 9
 - left before retirement: ([],[],[])
 
 Native calls the frames made, status queries and drain waits left out:
