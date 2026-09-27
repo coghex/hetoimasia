@@ -235,7 +235,8 @@ import Hetoimasia.GPU.Vulkan.Native.Generations
   , ReplacementAnswer (..)
   , StepSummary (..)
   , SwapchainResult
-  , TargetGenerationsView
+  , TargetCondition (PresentationUnsupported)
+  , TargetGenerationsView (viewCondition)
   , UseRefusal
   , endGenerationUse
   , generationsDeadline
@@ -733,13 +734,14 @@ noticeUnavailable state = atomically $ do
   -- once it is unavailable is forgotten by the model's next progress turn.
   let unavailable = [target | OptionalTargetUnavailable target ← escalations model]
   for_ mapped $ \(attachment, target) →
-    when (target `elem` unavailable && Map.notMember attachment noticed) $
+    when (target `elem` unavailable && Map.notMember attachment noticed) $ do
+      condition ← fmap viewCondition <$> readTargetGenerations (stateGenerations state) target
+      let because = case (Map.lookup attachment unsupported, condition) of
+            (Just family, _) → UnavailableSurfaceUnsupported family
+            (_, Just (PresentationUnsupported gaps)) → UnavailablePresentationUnsupported gaps
+            _ → UnavailableRecoverySpent
       modifyTVar' (stateUnavailable state) $ \held →
-        let grown =
-              Map.insert
-                attachment
-                (VulkanUnavailability target (maybe UnavailableRecoverySpent UnavailableSurfaceUnsupported (Map.lookup attachment unsupported)))
-                held
+        let grown = Map.insert attachment (VulkanUnavailability target because) held
          in if Map.size grown > unavailabilitiesRetained then Map.deleteMin grown else grown
 
 -- | Raise 'VulkanRequiredTargetFailed' once a required target's exhaustion has
@@ -1205,6 +1207,9 @@ data UnavailableBecause
     -- ^ The session's device, through this queue family, cannot present to
     -- the replacement surface recovery made on its window; no other device is
     -- used.
+  | UnavailablePresentationUnsupported ![Presentation.PresentationGap]
+    -- ^ The replacement surface recovery made cannot serve the presentation
+    -- profile, naming every gap.
   deriving (Eq, Show)
 
 -- | An optional target the model marked unavailable (D-22). Its generations

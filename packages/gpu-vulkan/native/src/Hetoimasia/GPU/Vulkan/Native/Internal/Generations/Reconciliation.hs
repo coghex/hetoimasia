@@ -63,6 +63,7 @@ import Hetoimasia.GPU.Model
   , TargetView (..)
   , beginGeneration
   , beginTargetRecovery
+  , declareTargetUnrecoverable
   , failGenerationConstruction
   , modelBudgets
   , publishGeneration
@@ -168,7 +169,18 @@ reconcile generations now target geometry = do
               case planGenerationWith (generationsCapture generations) limit geometry offer of
                 PlanSuspended suspension → Nothing <$ suspend suspension
                 PlanUnsupported gaps → do
-                  atomically (modelEdit_ (suspendTarget target))
+                  atomically $ do
+                    modelEdit_ (suspendTarget target)
+                    -- A replacement surface that cannot serve the profile is
+                    -- one no attempt can build on: the attempt in flight
+                    -- fails, and the target is disposed of through its
+                    -- designation, as one the device cannot present to is.
+                    when (recordRecovering record) $ do
+                      modelEdit_ (recordRecoveryFailure now target)
+                      _ ← stateRootsModel roots $ \model → case declareTargetUnrecoverable target model of
+                        Admitted (next, _) → ((), next)
+                        _ → ((), model)
+                      modifyRecord (\entry → entry {recordRecovering = False})
                   Nothing <$ setCondition (PresentationUnsupported gaps)
                 Planned planned → classify record active reported planned
     classify record active reported planned

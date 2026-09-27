@@ -1365,6 +1365,7 @@ changes nothing and never reaches the replacement. Then, on the owner's thread:
 | --- | --- |
 | Installed | `ReplacementInstalled`; the surface is the roots', and a step is owed at once |
 | The device's queue family cannot present to it | `ReplacementUnsupported`; the surface is destroyed on the owner's thread, the attempt fails, and the target is declared unrecoverable: [disposed of through its designation](#required-and-optional-dispositions). No second device or queue is made, and nothing migrates |
+| Installed, but it cannot serve the presentation profile | `PresentationUnsupported`, naming every gap; the attempt fails and the target is declared unrecoverable, disposed of through its designation, as one the device cannot present to is |
 | Created unusable, or not created | The attempt fails, the unusable surface is destroyed, and the episode schedules the next |
 | The bridge refused it | The window is closing, the attachment retiring or the lease releasing: close is coming, and the attempt is left for the target's retirement to settle. If the owner's view shows the target still eligible, the attempt fails instead, rather than waiting for a close that is not coming |
 | Its support query or naming raised | The surface is destroyed and the attempt fails; device loss and a cancellation stay the owner's |
@@ -1402,14 +1403,15 @@ inject them.
 ### Required and optional dispositions
 
 A target whose episode is spent (`RecoverySpent`), or whose replacement surface
-the device cannot present to, is disposed of through the designation the
+the device cannot present to or that cannot serve the profile, is disposed of through the designation the
 application gave it (D-22):
 
 - **Optional** — the model marks it unavailable and the session continues. Its
   generations retire as their holds end, and every other target keeps
   presenting on the same device. The controller reports it once, by
   attachment: `readVulkanUnavailability` answers the target and why —
-  `UnavailableRecoverySpent` or `UnavailableSurfaceUnsupported` — and an
+  `UnavailableRecoverySpent`, `UnavailableSurfaceUnsupported` or
+  `UnavailablePresentationUnsupported` — and an
   application waits on it in `STM`; the most recent 64 are kept. The native
   window is not closed and its destruction is not authorized: the attachment
   stays until the application releases it and its retirement is safe. A target
@@ -1766,7 +1768,9 @@ than either being read as a failed retry; an attempt in flight failed when the
 replacement surface's own query reports it lost, the next admitted after its
 delay; and a fresh construction kept waiting, charging nothing, while the chain
 a failed replacement handed over is still held, then created only after that
-chain's destruction. `Allocation recovery`, over the
+chain's destruction; and a replacement that cannot serve the profile failing its
+attempt and making an optional target unavailable, or failing the session for a
+required one. `Allocation recovery`, over the
 frames' rig, covers: a creation that
 ran out of memory made once more after one pass reclaimed a retired
 generation; no retry without progress, the original failure reported with the

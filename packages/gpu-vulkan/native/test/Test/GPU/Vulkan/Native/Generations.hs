@@ -998,6 +998,29 @@ spec = describe "Generations" $ do
                    ]
       viewCondition <$> generationsOf rig `shouldReturn` Presenting
 
+    describe "a replacement that cannot serve the profile fails its attempt and is disposed of through the designation" $ do
+      it "an optional target becomes unavailable" $ do
+        rig ← lostAndReleased
+        offerReplacementSurface (rigGenerations rig) (at 4) (rigTarget rig) (surfaceNumbered (rigStandIn rig) 20) `shouldReturn` ReplacementInstalled
+        offerSurface (rigStandIn rig) (\offer → offer {offerPresentModes = [0]})
+        stepAt rig 4 (seen 640 480)
+        viewCondition <$> generationsOf rig >>= (`shouldSatisfy` \case
+          PresentationUnsupported _ → True
+          _ → False)
+        model ← atomically (readRootsModel (rigRoots rig))
+        escalations model `shouldBe` [OptionalTargetUnavailable (rigTarget rig)]
+        sessionState model `shouldBe` SessionRunning
+        -- Nothing more is asked or built, however long it runs.
+        forM_ [200, 800, 5000] $ \instant → wantedAt rig instant `shouldReturn` []
+        length . filter isCreated <$> swapchainCalls rig `shouldReturn` 1
+
+      it "a required target fails the session" $ do
+        rig ← lostAndReleasedOf RequiredTarget
+        offerReplacementSurface (rigGenerations rig) (at 4) (rigTarget rig) (surfaceNumbered (rigStandIn rig) 20) `shouldReturn` ReplacementInstalled
+        offerSurface (rigStandIn rig) (\offer → offer {offerPresentModes = [0]})
+        stepAt rig 4 (seen 640 480)
+        sessionState <$> atomically (readRootsModel (rigRoots rig)) `shouldReturn` SessionFailed RequiredTargetUnrecoverable
+
     it "tells an ordinary resize, which spends nothing, from a repeated failure at unchanged geometry, which spends the episode" $ do
       rig ← newRig
       stepAt rig 0 (seen 640 480)
