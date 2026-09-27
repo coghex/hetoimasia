@@ -4,8 +4,8 @@ Buildable package: `hetoimasia-gpu-vulkan-native`, in `packages/gpu-vulkan/nativ
 
 The package that owns the Vulkan binding, the handles and the calls: VK-6's
 diagnostic messengers, VK-9's shader adapter, VK-7's roots, VK-10's
-swapchain generations, and VK-11's managed resources and recorder. It depends on no
-window system: a surface reaches it as a 64-bit handle and the action that
+swapchain generations, VK-11's managed resources and recorder, and VK-12's
+frames. It depends on no window system: a surface reaches it as a 64-bit handle and the action that
 destroys it.
 
 - `Hetoimasia.GPU.Vulkan.Native.Profile` is the runtime profile as pure
@@ -72,6 +72,28 @@ destroys it.
   Only `State` creates state, and the public module's Haddock tables which
   module writes which part of it (see
   [the backend contract](../../../docs/gpu_backend.md#how-the-recording-is-built)).
+- `Hetoimasia.GPU.Vulkan.Native.Frames` is VK-12's acquisition, submission and
+  safe abandonment over the recording and an open native layer (`FrameOps`):
+  `tryAcquireFrame` reserves in the model before a zero-timeout acquisition and
+  answers an owned frame or a typed pending, suspended, closing or unavailable
+  outcome; `submitFrames` validates a whole request before resetting one fence
+  and submitting its sealed batches as one native submission every frame
+  shares; `skipFrame` invalidates an unsubmitted frame's recording and makes a
+  cleanup submission waiting on its acquisition semaphore;
+  `closeUnpresentedFrame` closes a submitted frame never presented; and
+  `progressFrames`, the owner's bounded step, observes only pending fences,
+  settles a closed frame's render-finished semaphore through a cleanup
+  submission once its rendering completed, and returns images through
+  `vkReleaseSwapchainImagesEXT`. Each frame slot's two semaphores and two fences
+  are made before its first acquisition. Every native effect and its
+  bookkeeping are one masked step, and an unknown effect is retained for ever
+  with admission stopped. It is the entry point only: its code lives in private
+  modules under `Hetoimasia.GPU.Vulkan.Native.Internal.Frames` — `Layer`,
+  `State`, `Acquisition`, `Submission` and `Abandonment` — which it re-exports
+  unchanged (see
+  [the backend contract](../../../docs/gpu_backend.md#frames-acquisition-submission-and-abandonment)).
+  `Hetoimasia.GPU.Vulkan.Native.Frames.Vulkan` is its production layer, the
+  binding's own `safe` calls.
 - `Hetoimasia.GPU.Vulkan.Native.Naming` is #250's naming scheme as pure
   decisions: every debug name and recording label derived from identities the
   backend already holds, bounded at 64 bytes, and the object types they name.
@@ -107,7 +129,7 @@ destroys it.
   binding-wide flags `cabal.project.vulkan` constrains, the C-only capture
   callback, no Haskell callbacks, and the audited recording subset — the only
   genuine `unsafe` imports, which the headless suite holds to the package's
-  import declarations. Nothing here submits or presents yet.
+  import declarations. Nothing here presents yet.
 
 It is listed only in `cabal.project.vulkan`, beside its local dependency closure
 — the diagnostics package, `hetoimasia-gpu-vulkan-model`, the foundation, and
@@ -116,9 +138,10 @@ project resolves the binding, the Vulkan headers or a loader. The only thing
 that builds it is [`tools/vulkan/run.sh`](../../../tools/vulkan/run.sh), which
 points Cabal at the provisioned loader and headers. Its headless suite,
 `native-tests` (`test/RootsMain.hs`), runs the profile's, the roots', the
-presentation planner's, the generations' and the recording's examples over
-stand-in native layers, and external clients proving the generations' and the
-recording's implementation modules hidden and their public imports intact; the
+presentation planner's, the generations', the recording's and the frames'
+examples over stand-in native layers, and external clients proving the
+generations', the recording's and the frames' implementation modules hidden
+and their public imports intact; the
 shader suite runs beside it, both in the validation group `test.vulkan-headless`; its native cases run in
 the window integration's native suite, `test.vulkan-native` — see
 [the Vulkan native suite](../../../docs/gpu_backend.md#the-native-suite).
@@ -256,4 +279,5 @@ named, is retained as [docs/vulkan/linux-vk9.md](../../../docs/vulkan/linux-vk9.
 
 [`docs/vulkan_diagnostics.md`](../../../docs/vulkan_diagnostics.md) is the
 messengers' contract in prose, and [`docs/gpu_backend.md`](../../../docs/gpu_backend.md)
-the roots', the generations' and the recording's, with the FFI audit.
+the roots', the generations', the recording's and the frames', with the FFI
+audit.

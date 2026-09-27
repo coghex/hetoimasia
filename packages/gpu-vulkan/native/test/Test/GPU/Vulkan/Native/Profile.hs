@@ -45,6 +45,8 @@ spec = describe "Profile" $ do
                        , (ObjectShaderModule, OBJECT_TYPE_SHADER_MODULE)
                        , (ObjectBuffer, OBJECT_TYPE_BUFFER)
                        , (ObjectDeviceMemory, OBJECT_TYPE_DEVICE_MEMORY)
+                       , (ObjectSemaphore, OBJECT_TYPE_SEMAPHORE)
+                       , (ObjectFence, OBJECT_TYPE_FENCE)
                        ]
                    ]
 

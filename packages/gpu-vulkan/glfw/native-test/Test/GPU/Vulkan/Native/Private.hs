@@ -17,6 +17,9 @@
 --   including the destruction order at the host's exit (#219);
 -- * @vk11-recording@ — VK-11's managed resources and a recorded, discarded
 --   triangle batch against a swapchain generation's image (#223);
+-- * @vk12-frames@ — VK-12's frames: acquired, a triangle batch with its
+--   capture submitted and awaited, and images returned through cleanup
+--   submissions and maintenance release without presenting (#225);
 -- * @synchronization-hazard@ — the negative control that proves
 --   synchronization validation active ("Test.GPU.Vulkan.Native.Hazard");
 -- * @debug-names@ — #250's provoked validation report on a named managed
@@ -60,6 +63,7 @@ import Test.Hspec.Runner (Config (configFailOnEmpty), defaultConfig, evalSpec, r
 import Test.GPU.Vulkan.Native.Consent (Consent, Refusal, refusalMessage)
 import Test.GPU.Vulkan.Native.Environment (checkValidationFeatures)
 import Test.GPU.Vulkan.Native.Gate (Gate, admit)
+import qualified Test.GPU.Vulkan.Native.Frames as Frames
 import qualified Test.GPU.Vulkan.Native.Hazard as Hazard
 import qualified Test.GPU.Vulkan.Native.Naming as Naming
 import qualified Test.GPU.Vulkan.Native.Recording as Recording
@@ -119,6 +123,12 @@ scenarios =
       $ \_ journal → do
         outcome ← Recording.runRecording journal
         pure (Recording.spec outcome, section "The VK-11 managed recording record" (Recording.recordingSection outcome))
+  , Scenario
+      "vk12-frames"
+      "acquires, submits and awaits a triangle batch with its capture, and returns images without presenting, with validation reporting nothing"
+      $ \_ journal → do
+        outcome ← Frames.runFrames journal
+        pure (Frames.spec outcome, section "The VK-12 frames record" (Frames.framesSection outcome))
   , Scenario
       "synchronization-hazard"
       "observes a deliberate synchronization hazard, proving synchronization validation active"

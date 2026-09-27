@@ -43,6 +43,8 @@ module Hetoimasia.GPU.Vulkan.Native.Naming
   , commandBufferName
   , readbackBufferName
   , readbackMemoryName
+  , SlotObject (..)
+  , slotObjectName
 
     -- * Recording labels
   , batchLabel
@@ -97,6 +99,8 @@ data NativeObjectKind
   | ObjectShaderModule
   | ObjectBuffer
   | ObjectDeviceMemory
+  | ObjectSemaphore
+  | ObjectFence
   deriving (Eq, Ord, Show, Enum, Bounded)
 
 -- | The kind's @VkObjectType@ value.
@@ -104,7 +108,9 @@ objectTypeCode ∷ NativeObjectKind → Int32
 objectTypeCode = \case
   ObjectDevice → 3
   ObjectQueue → 4
+  ObjectSemaphore → 5
   ObjectCommandBuffer → 6
+  ObjectFence → 7
   ObjectDeviceMemory → 8
   ObjectBuffer → 9
   ObjectImage → 10
@@ -185,6 +191,26 @@ readbackBufferName resource = boundedName (resourceText resource <> " readback b
 
 readbackMemoryName ∷ ResourceId → ByteString
 readbackMemoryName resource = boundedName (resourceText resource <> " readback memory")
+
+-- | One of the synchronization objects a frame slot owns (VK-12).
+data SlotObject
+  = AcquisitionSemaphore
+  | RenderFinishedSemaphore
+  | SubmissionFence
+  | CleanupFence
+  deriving (Eq, Ord, Show, Enum, Bounded)
+
+-- | A frame slot's synchronization object: the target and slot it serves, and
+-- which of the slot's objects it is.
+slotObjectName ∷ TargetId → Natural → SlotObject → ByteString
+slotObjectName target slot object =
+  boundedName
+    ( targetText target <> " slot " <> shown slot <> case object of
+        AcquisitionSemaphore → " acquisition semaphore"
+        RenderFinishedSemaphore → " render-finished semaphore"
+        SubmissionFence → " submission fence"
+        CleanupFence → " cleanup fence"
+    )
 
 -- ---------------------------------------------------------------------------
 -- Recording labels

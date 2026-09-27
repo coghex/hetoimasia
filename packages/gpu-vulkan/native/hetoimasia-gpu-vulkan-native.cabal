@@ -18,7 +18,10 @@ description:
     renderer-facing boundary above them: managed resources keyed by the
     model's identities, a scoped recorder that retains every generation a
     command references before recording it, sealed single-use batches, readback
-    memory, and the audited unsafe recording subset. It depends on no window
+    memory, and the audited unsafe recording subset — and VK-12's frames above
+    the recording: non-blocking acquisition, submission with one completion
+    obligation per native submission, and safe abandonment through cleanup
+    submissions and maintenance release. It depends on no window
     system: a surface arrives as its handle and the action that destroys it.
     .
     It is selected only by `cabal.project.vulkan`, so neither `cabal.project`
@@ -64,6 +67,8 @@ library
     hs-source-dirs: src
     exposed-modules:
         Hetoimasia.GPU.Vulkan.Native.Diagnostics
+        Hetoimasia.GPU.Vulkan.Native.Frames
+        Hetoimasia.GPU.Vulkan.Native.Frames.Vulkan
         Hetoimasia.GPU.Vulkan.Native.Generations
         Hetoimasia.GPU.Vulkan.Native.Naming
         Hetoimasia.GPU.Vulkan.Native.Presentation
@@ -89,6 +94,14 @@ library
     -- expose steps, such as retiring completed batches, that only another
     -- stage may take. See packages/gpu-vulkan/native/README.md.
     --
+    -- Internal.Frames.* is VK-12's acquisition, submission and abandonment,
+    -- split by responsibility as the recording is; Frames re-exports its
+    -- public names. Each is private because it exports what clients must never
+    -- reach: Layer is the native layer's shape, re-exported whole; State holds
+    -- the slot, frame and submission records and the constructor of Frames,
+    -- which Frames exports only abstractly; Acquisition, Submission and
+    -- Abandonment each own one stage of a frame's life.
+    --
     -- Internal.Generations.* is the swapchain generations' implementation,
     -- split by responsibility (#266); Generations re-exports its public names
     -- unchanged. Each is private because it exports what clients must never
@@ -101,6 +114,11 @@ library
     -- take.
     other-modules:
         Hetoimasia.GPU.Vulkan.Native.Internal.Commands
+        Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Abandonment
+        Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Acquisition
+        Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Layer
+        Hetoimasia.GPU.Vulkan.Native.Internal.Frames.State
+        Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Submission
         Hetoimasia.GPU.Vulkan.Native.Internal.Generations.Disposal
         Hetoimasia.GPU.Vulkan.Native.Internal.Generations.Observation
         Hetoimasia.GPU.Vulkan.Native.Internal.Generations.Reconciliation
@@ -219,6 +237,9 @@ test-suite native-tests
     main-is: RootsMain.hs
     hs-source-dirs: test
     other-modules:
+        Test.GPU.Vulkan.Native.Frames
+        Test.GPU.Vulkan.Native.FramesStandIn
+        Test.GPU.Vulkan.Native.FramesVisibility
         Test.GPU.Vulkan.Native.Generations
         Test.GPU.Vulkan.Native.GenerationsVisibility
         Test.GPU.Vulkan.Native.Presentation
