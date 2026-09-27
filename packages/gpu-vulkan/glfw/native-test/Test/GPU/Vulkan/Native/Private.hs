@@ -20,6 +20,10 @@
 -- * @vk12-frames@ — VK-12's frames: acquired, a triangle batch with its
 --   capture submitted and awaited, and images returned through cleanup
 --   submissions and maintenance release without presenting (#225);
+-- * @vk13-presentation@ — VK-13's presentation to two windows with verified
+--   present fences, a resized window's old generation retired only on that
+--   evidence, the first window closed while the second keeps presenting, and
+--   the session retired with every fence observed (#227);
 -- * @synchronization-hazard@ — the negative control that proves
 --   synchronization validation active ("Test.GPU.Vulkan.Native.Hazard");
 -- * @debug-names@ — #250's provoked validation report on a named managed
@@ -66,6 +70,7 @@ import Test.GPU.Vulkan.Native.Gate (Gate, admit)
 import qualified Test.GPU.Vulkan.Native.Frames as Frames
 import qualified Test.GPU.Vulkan.Native.Hazard as Hazard
 import qualified Test.GPU.Vulkan.Native.Naming as Naming
+import qualified Test.GPU.Vulkan.Native.Presentation as Presentation
 import qualified Test.GPU.Vulkan.Native.Recording as Recording
 import qualified Test.Vulkan.Proof.Bridge as Bridge
 import qualified Test.Vulkan.Proof.BridgeSpec as BridgeSpec
@@ -129,6 +134,12 @@ scenarios =
       $ \_ journal → do
         outcome ← Frames.runFrames journal
         pure (Frames.spec outcome, section "The VK-12 frames record" (Frames.framesSection outcome))
+  , Scenario
+      "vk13-presentation"
+      "presents to two windows on verified present fences, retires a resized generation and the first window on that evidence, with validation reporting nothing"
+      $ \_ journal → do
+        outcome ← Presentation.runPresentation journal
+        pure (Presentation.spec outcome, section "The VK-13 presentation record" (Presentation.presentationSection outcome))
   , Scenario
       "synchronization-hazard"
       "observes a deliberate synchronization hazard, proving synchronization validation active"

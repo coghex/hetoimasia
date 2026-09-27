@@ -126,6 +126,16 @@ void hetoimasia_proof_poll_events(void)
   glfwPollEvents();
 }
 
+void hetoimasia_proof_set_window_size(hetoimasia_proof_window *window, int width, int height)
+{
+  glfwSetWindowSize((GLFWwindow *) window, width, height);
+}
+
+void hetoimasia_proof_framebuffer_size(hetoimasia_proof_window *window, int *width, int *height)
+{
+  glfwGetFramebufferSize((GLFWwindow *) window, width, height);
+}
+
 int hetoimasia_proof_create_window_surface(void *instance,
                                            hetoimasia_proof_window *window,
                                            uint64_t *surface)

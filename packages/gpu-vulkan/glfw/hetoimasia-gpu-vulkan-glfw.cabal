@@ -134,6 +134,7 @@ test-suite vulkan-native-tests
         Test.GPU.Vulkan.Native.Environment
         Test.GPU.Vulkan.Native.Fixture
         Test.GPU.Vulkan.Native.Frames
+        Test.GPU.Vulkan.Native.Presentation
         Test.GPU.Vulkan.Native.Gate
         Test.GPU.Vulkan.Native.Hazard
         Test.GPU.Vulkan.Native.Naming
