@@ -1062,6 +1062,11 @@ CI's.
 its package-private facade, are retained as
 [`docs/vulkan/macos-worker-split.md`](vulkan/macos-worker-split.md), with that
 run's `test.glfw-native` receipt beside them; their Linux execution is CI's.
+#273's, taken again over recovery's split into its public module and the
+hidden `Recovery.Types`, are retained as
+[`docs/vulkan/macos-recovery-split.md`](vulkan/macos-recovery-split.md), with
+that run's `test.glfw-native` receipt beside them; their Linux execution is
+CI's.
 
 ## The native suite
 
