@@ -8,7 +8,8 @@
 -- The channel examples live in "Test.Foundation.Messaging.Channel", the snapshot
 -- examples in "Test.Foundation.Messaging.Snapshot", the bounded-turn example in
 -- "Test.Foundation.Messaging.Turns", and the external-client examples
--- in "Test.Foundation.Messaging.Opacity". All are composed into this group, so @--match Messaging@ selects all of them.
+-- in "Test.Foundation.Messaging.Opacity" and
+-- "Test.Foundation.Messaging.Visibility". All are composed into this group, so @--match Messaging@ selects all of them.
 module Test.Foundation.Messaging.Spec (spec) where
 
 import Control.Concurrent (forkIO, killThread)
@@ -49,6 +50,7 @@ import qualified Test.Foundation.Messaging.Channel as Channel
 import qualified Test.Foundation.Messaging.Opacity as Opacity
 import qualified Test.Foundation.Messaging.Snapshot as Snapshot
 import qualified Test.Foundation.Messaging.Turns as Turns
+import qualified Test.Foundation.Messaging.Visibility as Visibility
 import Test.Hspec
   ( Expectation
   , Spec
@@ -79,6 +81,7 @@ spec = describe "Messaging" $ do
   Snapshot.spec
   Turns.spec
   Opacity.spec
+  Visibility.spec
 
 -- Fixtures -------------------------------------------------------------------
 

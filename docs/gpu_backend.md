@@ -1076,6 +1076,12 @@ CI's.
 `Time.Types` and `Time.Arithmetic`, are retained as
 [`docs/vulkan/macos-time-split.md`](vulkan/macos-time-split.md), with that
 run's `test.glfw-native` receipt beside them; their Linux execution is CI's.
+#275's, taken again over messaging's split into its public channel and
+snapshot modules and the hidden `Messaging.Channel.Types`,
+`Messaging.Snapshot.Types` and `Messaging.Component`, are retained as
+[`docs/vulkan/macos-messaging-split.md`](vulkan/macos-messaging-split.md), with
+that run's `test.glfw-native` receipt beside them; their Linux execution is
+CI's.
 
 ## The native suite
 
