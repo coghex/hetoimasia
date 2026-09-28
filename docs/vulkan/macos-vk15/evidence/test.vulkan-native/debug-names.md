@@ -27,7 +27,7 @@ Verdict: **pass**.
 | the device | 1 | 0 |
 | the messenger and the instance | 3 | 0 |
 
-- error VUID-vkCmdCopyImageToBuffer-pRegions-00183, objects [("6:0xbaee0aa18",Just "resource 2.1 command buffer target 0.1 slot 0"),("9:0xe7e6d0000000000f",Just "resource 3.1 readback buffer")]
+- error VUID-vkCmdCopyImageToBuffer-pRegions-00183, objects [("6:0x860d5a418",Just "resource 2.1 command buffer target 0.1 slot 0"),("9:0xe7e6d0000000000f",Just "resource 3.1 readback buffer")]
   - queue labels reported: 0, copied []
   - command-buffer labels reported: 2, copied ["batch 0 target 0.1 generation 0","batch 0 target 0.1 generation 0"]
 - records delivered: 66
@@ -41,7 +41,7 @@ Verdict: **pass**.
 the device Apple M3 Max offers debug-utils naming
 the readback buffer 0xe7e6d0000000000f is named resource 3.1 readback buffer
 recorded BatchId (TargetId 0 1) 0, labelled batch 0 target 0.1 generation 0: Just (BatchView {viewBatch = BatchId (TargetId 0 1) 0, viewBatchFrame = FrameSlotId (TargetId 0 1) 0 1, viewBatchStanding = BatchSealed, viewBatchCommands = 15})
-error VUID-vkCmdCopyImageToBuffer-pRegions-00183: objects [("6:0xbaee0aa18",Just "resource 2.1 command buffer target 0.1 slot 0"),("9:0xe7e6d0000000000f",Just "resource 3.1 readback buffer")]
+error VUID-vkCmdCopyImageToBuffer-pRegions-00183: objects [("6:0x860d5a418",Just "resource 2.1 command buffer target 0.1 slot 0"),("9:0xe7e6d0000000000f",Just "resource 3.1 readback buffer")]
   queue labels reported: none, []
   command-buffer labels reported: 2, ["batch 0 target 0.1 generation 0","batch 0 target 0.1 generation 0"]
 the lifetime delivered 66 records
