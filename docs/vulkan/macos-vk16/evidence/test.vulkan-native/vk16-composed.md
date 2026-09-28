@@ -12,7 +12,7 @@ Verdict: **pass**.
 - Vulkan calls: 280, on 1 thread(s)
 - verdict issues: []
 - error reports: 0
-- seconds, from the loader integration to the verdict: 0.210706
+- seconds, from the loader integration to the verdict: 0.2161
 
 ## Transcript
 
