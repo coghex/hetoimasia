@@ -6,8 +6,8 @@ The one package that depends on both the native Vulkan backend
 ([`../native`](../native/README.md)) and the GLFW package. It composes three
 delivered contracts and replaces none of them: the native backend's roots, the
 GLFW package's supervised graphics owner (VK-18), and its surface bridge
-(VK-5). Neither of those packages depends on this one. VK-16 later adds the
-loop adapter here.
+(VK-5). Neither of those packages depends on this one. VK-16 adds the loop
+adapter and the owner's rendering here.
 
 - `Hetoimasia.GPU.Vulkan.GLFW` is the public interface. `withVulkanOwnerHost`
   composes, in the order the backend design's P-5 fixes, the diagnostic
@@ -22,11 +22,18 @@ loop adapter here.
   thread, the replacement surface the owner asked for to recover a lost one,
   under the same attachment (VK-14); `readVulkanUnavailability` reports an
   optional target that could not be recovered, and a required one fails the
-  session with `VulkanRequiredTargetFailed`.
+  session with `VulkanRequiredTargetFailed`. `runVulkanOwnerLoop` is the main
+  thread's scheduled owner loop with the graphics owner composed in: every turn
+  it publishes the windows' observations, their captured render demand and the
+  replacement surfaces the owner asked for, and bounds its wait by the owner's
+  deadline; `publishVulkanScene` publishes the scene the owner renders, from
+  any application thread, with the configuration's `VulkanRenderer`.
 - The private `controller` sublibrary holds the controller —
-  `GraphicsOperations` over the native roots — and the record through which it
-  reaches the surface bridge, which the package's own examples replace with a
-  stand-in.
+  `GraphicsOperations` over the native roots, with the recording and the frames
+  composed into its step (`Internal.Rendering`) — the loop adapter
+  (`Internal.Loop`), and the record through which it reaches the surface
+  bridge, which the package's own examples replace with a stand-in, as they
+  replace the recording's and the frames' native layers.
 
 Every Vulkan object is created and destroyed on the graphics owner's thread;
 the controller makes no GLFW call. [`docs/gpu_backend.md`](../../../docs/gpu_backend.md)

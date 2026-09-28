@@ -1645,7 +1645,8 @@ loseSurfaceOf rig host service window = do
   nudgeOwner rig host service window
 
 -- | 'pumpUntil', creating on each turn any replacement surface the owner asked
--- for, as an application's loop does until VK-16's adapter does it.
+-- for, as an application that drives its own loop does; the composed loop
+-- does it every turn.
 pumpReplacing ∷ VulkanHost Scene → RuntimeControl → String → IO Bool → IO ()
 pumpReplacing host control what ready =
   pumpUntil host control what (replaceVulkanSurfaces (vulkanController host) (vulkanWindowHost host) (vulkanGraphicsOwner host) >> ready)

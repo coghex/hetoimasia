@@ -520,6 +520,17 @@ The turn answers the absolute instant of the next one:
   has started would complete and reset its episode;
 - with nothing pending and nothing scheduled there is no turn to schedule.
 
+`progressDeadline` is the same answer with the first case left out: the
+obligations' own schedule, without render demand. It is what an owner that
+paces its own rendering reads (VK-16's controller,
+[gpu_backend.md](gpu_backend.md#polling-completion)): render demand says a
+frame is wanted now, not that one can be acquired now — every image may be in
+the presentation engine's hands — so an owner that retries an acquisition later
+takes everything else from `progressDeadline`, and would otherwise be told to
+take a turn now for as long as the frame it cannot acquire yet is wanted. New
+demand still restarts the backoff, so the answer after a `requestRender` is
+now until a turn anchors the next poll.
+
 ### One scheduling rule
 
 Requirement 7 names four things that restart the schedule: new demand, a new

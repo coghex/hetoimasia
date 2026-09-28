@@ -74,8 +74,9 @@
 -- owner's next step offers it to the generations, which recheck the session's
 -- one device's support and install it, or refuse it — and a surface the
 -- device cannot present to is destroyed on the owner's thread while the target
--- is disposed of through its designation. Until VK-16's loop adapter services
--- replacements on every turn, the application does it, as it publishes
+-- is disposed of through its designation. The loop adapter
+-- ("Hetoimasia.GPU.Vulkan.GLFW.Internal.Loop") services replacements on every
+-- turn; an application that drives its own loop does it, as it publishes
 -- observations. Close wins: a replacement deposited for a target that has
 -- begun retiring is destroyed, never installed.
 --
@@ -621,18 +622,24 @@ readReadiness (VulkanController state) =
 -- ---------------------------------------------------------------------------
 -- The owner's operations
 
--- | The operations the graphics owner runs, on its own thread.
+-- | The operations the graphics owner runs, on its own thread, rendering the
+-- scene it holds with this renderer.
 --
--- The progress step raises a latched device loss; destroys the surface of any
+-- The progress step raises a latched failure; destroys the surface of any
 -- attachment whose announcement the port refused and whose slot has since
--- begun retiring; and reconciles every admitted target's swapchain generations
--- with the geometry the owner folded for it this round — its eligibility, its
--- last coherent framebuffer observation and the bounds the platform published
--- ('targetGeometry') — building, replacing and destroying generations as
--- "Hetoimasia.GPU.Vulkan.Native.Generations" decides. Nothing is recorded,
--- submitted or presented. It asks for a round while an unannounced attachment
--- is watched, and when the generations name a deadline: a settling resize, a
--- deferred recovery attempt, or the model's own schedule.
+-- begun retiring; folds the step's demand and scene into render requests and,
+-- when a poll is due or a frame is to be attempted, asks the fences
+-- ("Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering"); reconciles every admitted
+-- target's swapchain generations with the geometry the owner folded for it —
+-- its eligibility, its last coherent framebuffer observation and the bounds
+-- the platform published ('targetGeometry') — whenever an observation moved,
+-- the generations' own deadline came, or a frame is to be attempted; and then
+-- offers each target that wants a frame one attempt. It asks for a round while
+-- an unannounced attachment is watched, when the generations name a deadline —
+-- a settling resize, a deferred recovery attempt, the model's poll — and when
+-- rendering does: a frame wanted now, an acquisition's retry, a demand deadline
+-- ahead. A target's retirement is owed until its frames and presentations have
+-- gone on their own evidence.
 controllerOperations ∷ VulkanController → VulkanRenderer scene → GraphicsOperations scene
 controllerOperations (VulkanController state) renderer =
   GraphicsOperations
@@ -1373,9 +1380,9 @@ handOverVulkanTarget (VulkanController state) host owner window classification =
 -- step. Answers how many it created or tried to. The attachment is never
 -- released or reattached.
 --
--- It must run on the main thread, which the owner wakes when it asks. Until
--- VK-16's loop adapter runs it every turn, the application runs it, as it
--- publishes observations. Each replacement and its deposit are one masked
+-- It must run on the main thread, which the owner wakes when it asks. The
+-- loop adapter runs it every turn; an application that drives its own loop
+-- runs it, as it publishes observations. Each replacement and its deposit are one masked
 -- step; a cancellation that nonetheless takes a creation's answer leaves the
 -- surface on the lease, where the owner's next step finds and destroys it.
 replaceVulkanSurfaces ∷ VulkanController → WindowHost → GraphicsOwner scene → IO Int

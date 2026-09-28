@@ -1037,8 +1037,8 @@ resizeFramebuffer rig host window (width, height) = do
     WaitClosed → throwIO (StandInFailure "the host's command port closed")
 
 -- | Publish the window's latest observation for its target to the owner, as
--- the main thread's loop does for an application — which, until VK-16's loop
--- adapter publishes one every turn, is the application itself.
+-- an application that drives its own loop does; 'runVulkanOwnerLoop' does it
+-- every turn for one that runs the composed loop.
 publishObservation ∷ VulkanHost Scene → GraphicsService → WindowId → IO ()
 publishObservation host service window = do
   client ← atomically (hostWindowClient (vulkanWindowHost host) window) >>= maybe (throwIO (StandInFailure "the window has no client")) pure
