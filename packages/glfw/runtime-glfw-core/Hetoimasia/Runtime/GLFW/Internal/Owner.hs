@@ -476,7 +476,7 @@ data RetirementReadiness
   | RetirementOwed !Text
     -- ^ Not yet, and why. The owner asks again at a later round — at the
     -- backend's own next deadline, or when its wake asks — and, in its exit
-    -- drain, waits for those between asking.
+    -- drain, waits for that deadline between asking.
   deriving (Eq, Show)
 
 -- | What the owner tells its backend when it retires itself.
@@ -1696,7 +1696,7 @@ ownerDrain owner restore started = do
         <$> tryWithContext (forgetValidatedTargets owner)
     -- A target whose retirement the backend cannot perform yet — its
     -- obligations wait on evidence still to arrive — is asked again, between
-    -- waits for the backend's own next deadline or its wake, until it has been
+    -- waits for the backend's own next deadline, until it has been
     -- retired or its retirement has failed. The waits are the backend's, so
     -- nothing spins, and no timeout ends them: a timeout is not evidence. A
     -- cancellation does end them, as it ends no retirement: what is still owed
@@ -1712,10 +1712,11 @@ ownerDrain owner restore started = do
             then pure waited
             else drainOwed =<< drainTargets waited
 
--- | Wait, in the exit drain, until the backend's own next deadline has come or
--- its wake asks, with no round in between: the drain is the owner's last work,
--- and nothing else it could do is owed. A backend that names no deadline is
--- asked again after 'owedRetirementFallback'.
+-- | Wait, in the exit drain, until the backend's own next deadline has come,
+-- with no round in between: the drain is the owner's last work, and nothing
+-- else it could do is owed. A backend that names no deadline is asked again
+-- after 'owedRetirementFallback'. The backend's wake is not read here: it asks
+-- for a round, and the drain takes none.
 awaitOwedRetirement ∷ GraphicsOwner scene → IO ()
 awaitOwedRetirement owner = do
   deadline ← graphicsNextDeadline operations >>= evaluate
@@ -1725,10 +1726,7 @@ awaitOwedRetirement owner = do
       | deadlineReached now due → pure (pure True)
       | otherwise → arm (remainingUntil now due)
     NoOwnerDemand → arm owedRetirementFallback
-  atomically $ do
-    woken ← graphicsWake operations
-    elapsed ← expired
-    check (woken || elapsed)
+  atomically (expired >>= check)
   where
     operations = ownerOperations (ownerSettings owner)
     OwnerTimer arm = ownerClockTimer (ownerSettings owner)

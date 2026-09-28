@@ -1001,6 +1001,9 @@ testClaimedSinkPending = do
     after ← handOverVulkanTarget controller (vulkanWindowHost host) owner second RequiredTarget
     settled ← atomically (readVulkanTerminal controller)
     atomically (writeTVar observed (Just (handoverKind during, reportPrimary pending, handoverKind after, reportPrimary settled, reportEvidence settled)))
+    -- The owner's own step takes the failure the handover latched, on the
+    -- round its wake asks for; the application's checkpoint then raises it.
+    atomically (readOwnerFailure owner >>= check . isJust)
     checkRuntime control
   _ ← raisedAs @GraphicsSessionFailed outcome
   Just (during, pendingPrimary, after, primary, evidence) ← atomically (readTVar observed)

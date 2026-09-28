@@ -416,7 +416,9 @@ data State inst msgr phys dev cmd lease obligation = State
     -- alone.
   , stateWake ∷ !(TVar (STM Bool))
     -- ^ What wakes an idle owner: the capture's sink failure, until it is
-    -- latched. Installed with the capture's watch.
+    -- latched, and a primary failure latched on another thread that the
+    -- owner's own checkpoint has not yet taken. Installed with the capture's
+    -- watch.
   , stateDiagnosticPending ∷ !(TVar Bool)
     -- ^ Whether the owner's last step found a diagnostic failure pending, so
     -- it looks again within its poll. The owner thread's alone.
@@ -427,6 +429,9 @@ data State inst msgr phys dev cmd lease obligation = State
   , stateSeen ∷ !(TVar (Map TargetId (Natural, RenderEligibility)))
     -- ^ The observation revision and eligibility each target's generations
     -- were last reconciled with. The owner thread's alone.
+  , stateFailureTaken ∷ !(TVar Bool)
+    -- ^ Whether the owner's own step has found the session failed. Written by
+    -- the owner's step; read by its wake.
   }
 
 -- | Instants the package's own examples must reach and nothing else can: a
@@ -525,6 +530,7 @@ newVulkanControllerWith hooks ops rendering observer pointer bridge layers valid
       <*> pure poll
       <*> pure hooks
       <*> newTVarIO Map.empty
+      <*> newTVarIO False
 
 -- | Supply the instance extensions the window system requires, copied from
 -- the loader-aware session on the main thread. The owner's startup reads
@@ -634,7 +640,9 @@ controllerOperations (VulkanController state) renderer =
     , graphicsConstructTarget = constructTarget state
     , graphicsStep = \step →
         checkpointRoots (stateRoots state) >>= \case
-          CheckpointFailed primary → throwIO (terminalFailure primary)
+          CheckpointFailed primary → do
+            atomically (writeTVar (stateFailureTaken state) True)
+            throwIO (terminalFailure primary)
           -- A diagnostic failure whose order is not yet readable: this round
           -- does nothing new, and the owner looks again within its poll.
           CheckpointPending → noStepWork <$ atomically (writeTVar (stateDiagnosticPending state) True)
@@ -1541,14 +1549,20 @@ diagnosticOrder capture =
     ErrorLatchedFirst → pure ValidationFirst
     SinkFailedFirst → pure (SinkFirst (fmap sinkFailureReason <$> captureSinkFailure capture))
 
--- | Whether the capture's sink has failed and nothing is latched yet: the one
--- diagnostic failure that arrives on a thread of its own rather than inside
--- a call the owner made, so the owner may be idle when it does.
-sinkUnlatched ∷ State inst msgr phys dev cmd lease obligation → DiagnosticCapture → STM Bool
-sinkUnlatched state capture = do
+-- | Whether a failure the owner has not acted on asks for a round: the
+-- capture's sink has failed and nothing is latched yet — the one diagnostic
+-- failure that arrives on a thread of its own rather than inside a call the
+-- owner made, so the owner may be idle when it does — or a primary failure
+-- has been latched by a checkpoint on another thread, a handover's on the
+-- main thread, before the owner's own step took it. The owner's next step
+-- then finds it and ends the run; a wake that stayed with the sink alone
+-- would miss the second, and leave an idle owner running on a failed session.
+failureOwed ∷ State inst msgr phys dev cmd lease obligation → DiagnosticCapture → STM Bool
+failureOwed state capture = do
   failed ← isJust <$> captureSinkFailure capture
   latched ← isJust . reportPrimary <$> readRootsTerminal (stateRoots state)
-  pure (failed && not latched)
+  taken ← readTVar (stateFailureTaken state)
+  pure ((failed && not latched) || (latched && not taken))
 
 diagnosticAlarms ∷ DiagnosticCapture → IO [DiagnosticAlarm]
 diagnosticAlarms capture =
@@ -1781,7 +1795,7 @@ withVulkanOwnerHostHooked hooks logger layer rendering pointer bridge enter exte
     -- it for that checkpoint.
     atomically $ do
       watchRootsDiagnosticsOrdered (stateRoots state) (DiagnosticWatch (diagnosticAlarms capture) (diagnosticOrder capture))
-      writeTVar (stateWake state) (sinkUnlatched state capture)
+      writeTVar (stateWake state) (failureOwed state capture)
     let session = do
           entered ← enter (hostSessionConfig host)
           copied ← liftIO (extensions entered)

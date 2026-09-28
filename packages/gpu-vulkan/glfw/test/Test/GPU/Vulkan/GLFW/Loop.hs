@@ -150,7 +150,7 @@ testDeadlineFolded = do
     _ ← firstFrame rig host control window
     -- A presentation is pending, so the owner holds a finite poll deadline;
     -- the clock is still, so the deadline is too.
-    due ← awaitDeadline rig host
+    due ← awaitAnchoredAfterPresent rig host
     now ← clockNow rig
     adapter ← newLoopAdapter host
     let later = either (error . show) id (addDuration due (millis 3600000))
@@ -225,7 +225,7 @@ testBackoffSchedule = do
     -- From the presenting step's instant, each poll at its deadline: nothing
     -- has progressed and nothing is wanted.
     start ← clockNow rig
-    first ← awaitDeadline rig host
+    first ← awaitAnchoredAfterPresent rig host
     walked ← (elapsedBetween start first :) <$> walk rig host first 6
     -- An unrelated event: a publication of no demand at all, a millisecond
     -- before the next poll is due. It takes a round, and resets nothing.
@@ -242,14 +242,14 @@ testBackoffSchedule = do
     demandedAt ← clockNow rig
     demandFrame host window
     composedUntil rig host control "the demanded frame" (\_ → pure ()) ((>= 2) <$> presentsOf rig (graphicsAttachment service))
-    restarted ← awaitDeadlineAfter host demandedAt
+    restarted ← awaitAnchoredAfterPresent rig host
     afterDemand ← (elapsedBetween demandedAt restarted :) <$> walk rig host restarted 1
     -- An observed completion: one pending presentation retires at a poll
     -- well into the schedule, which restarts it rather than continuing it.
     -- The others stay pending, so there is still something to poll.
     demandFrame host window
     composedUntil rig host control "a third frame" (\_ → pure ()) ((>= 3) <$> presentsOf rig (graphicsAttachment service))
-    anchored ← awaitDeadline rig host
+    anchored ← awaitAnchoredAfterPresent rig host
     _ ← walk rig host anchored 2
     completionDue ← awaitDeadline rig host
     retireNextPresentations rig (Just 1)
@@ -282,7 +282,7 @@ testEarlyWakeAndWorkDuration = do
     [window] ← windowsOf host
     _ ← firstFrame rig host control window
     let owner = vulkanGraphicsOwner host
-    first ← awaitDeadline rig host
+    first ← awaitAnchoredAfterPresent rig host
     [second] ← walk rig host first 1
     let due = either (error . show) id (addDuration first second)
     -- An early wake: a millisecond after the last poll, something unrelated
@@ -371,15 +371,33 @@ testBusyTargetFairness = do
     swapchain ← case [handle | generation ← viewGenerations view, viewGeneration generation == active, Just handle ← [viewSwapchain generation]] of
       handle : _ → pure handle
       [] → failWith "the first target's generation has no swapchain"
+    pendingBefore ← length . filter (pendingFor (graphicsAttachment one)) <$> frameEvents rig
     stallSwapchain rig swapchain
+    -- A frame of the first target acquired before the stall is presented in
+    -- the step that acquired it; once one of its acquisitions has answered
+    -- not ready since, none is in flight, and the count is its last.
+    -- One request is enough: a frame the swapchain cannot answer stays
+    -- wanted, and the owner retries it on its own pacing.
+    demandFrame host first
+    composedUntil rig host control "the stalled target's first unanswered acquisition" (\_ → pure ()) $
+      (> pendingBefore) . length . filter (pendingFor (graphicsAttachment one)) <$> frameEvents rig
     busyBefore ← presentsOf rig (graphicsAttachment one)
     otherBefore ← presentsOf rig (graphicsAttachment two)
+    -- The second window is asked for a frame as soon as its last one was
+    -- presented.
+    asked ← newTVarIO otherBefore
     composedUntil
       rig
       host
       control
       "five more frames on the second target"
-      (\_ → demandFrame host first >> demandFrame host second)
+      ( \_ → do
+          presented ← presentsOf rig (graphicsAttachment two)
+          wanted ← readTVarIO asked
+          when (presented >= wanted) $ do
+            demandFrame host second
+            atomically (writeTVar asked (presented + 1))
+      )
       ((>= otherBefore + 5) <$> presentsOf rig (graphicsAttachment two))
     busyAfter ← presentsOf rig (graphicsAttachment one)
     pending ← length . filter (pendingFor (graphicsAttachment one)) <$> frameEvents rig
@@ -587,6 +605,23 @@ letExitFinish rig = do
 -- about to take.
 awaitDeadline ∷ Rig → VulkanHost Scene → IO Instant
 awaitDeadline rig host = clockNow rig >>= awaitDeadlineAfter host
+
+-- | The deadline the owner anchored once its latest presentation was made:
+-- the round after the one that presented it polls, and anchors the next
+-- poll, beyond the scripted clock.
+awaitAnchoredAfterPresent ∷ Rig → VulkanHost Scene → IO Instant
+awaitAnchoredAfterPresent rig host = do
+  rounds ← presentRounds rig
+  let presentedIn = maybe 0 (+ 1) (lastMaybe rounds)
+  now ← clockNow rig
+  atomically $
+    readOwnerStatusNow (vulkanGraphicsOwner host) >>= \status → case statusNextDeadline status of
+      Just due | statusRounds status > presentedIn && due > now → pure due
+      _ → retry
+  where
+    lastMaybe = \case
+      [] → Nothing
+      held → Just (last held)
 
 -- | The owner's published deadline, once it is later than this instant.
 awaitDeadlineAfter ∷ VulkanHost Scene → Instant → IO Instant

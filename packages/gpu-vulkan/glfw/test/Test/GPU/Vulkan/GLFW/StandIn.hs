@@ -56,6 +56,7 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , frameEvents
   , fenceQueries
   , presentsOf
+  , presentRounds
   , awaitPresents
   , retireNextPresentations
 
@@ -204,6 +205,8 @@ import Hetoimasia.Runtime.GLFW
   , HostConfig (..)
   , LoopHooks (..)
   , TargetStanding (..)
+  , OwnerStatus (..)
+  , readOwnerStatusNow
   , TerminalRecord
   , Turn (..)
   , TurnStep (..)
@@ -818,6 +821,10 @@ fenceQueries rig = length . filter isQuery <$> journal rig
 presentsOf ∷ Rig → AttachmentId → IO Int
 presentsOf rig = atomically . presentsNow rig
 
+-- | The owner's completed rounds at each presentation, oldest first.
+presentRounds ∷ Rig → IO [Natural]
+presentRounds = readTVarIO . rigPresentRounds
+
 -- | Wait until this attachment's target has had this many presentations.
 awaitPresents ∷ Rig → AttachmentId → Int → IO ()
 awaitPresents rig attachment count = atomically (presentsNow rig attachment >>= check . (>= count))
@@ -966,6 +973,9 @@ data Rig = Rig
     -- ^ Whether it has raised.
   , rigRendering ∷ !Rendering
   , rigFrameEvents ∷ !(TVar [FrameEvent])
+  , rigPresentRounds ∷ !(TVar [Natural])
+    -- ^ For every presentation, oldest first, the owner's completed rounds at
+    -- the instant it was reported: the round that made it is the next one.
   , rigClock ∷ !(Maybe (TVar Instant))
     -- ^ The scripted clock the host and the owner read, when the example
     -- scripts one: it moves only when the example moves it, and the owner's
@@ -1150,6 +1160,7 @@ newRigClocked visible windows clock = do
   sinkFailed ← newTVarIO False
   rendering ← newRendering
   frameLog ← newTVarIO []
+  presentRounds' ← newTVarIO []
   armings ← newTVarIO []
   let defaults = (defaultHostConfig windows) {hostIdleWait = 0.005}
   pure
@@ -1170,6 +1181,7 @@ newRigClocked visible windows clock = do
       , rigSinkFailed = sinkFailed
       , rigRendering = rendering
       , rigFrameEvents = frameLog
+      , rigPresentRounds = presentRounds'
       , rigClock = clock
       , rigArmings = armings
       , rigPumpHold = pumpHold
@@ -1193,7 +1205,14 @@ runRigHere rig body = do
   budgets ← either (throwIO . StandInFailure . Text.pack . show) pure (validateBudgets defaultBudgetRequest)
   let config =
         (vulkanHostConfig (rigHostConfig rig) (rigCapture rig) budgets scene)
-          { vulkanFrameObserver = \event → atomically (modifyTVar' (rigFrameEvents rig) (<> [event]))
+          { vulkanFrameObserver = \event → atomically $ do
+              modifyTVar' (rigFrameEvents rig) (<> [event])
+              case event of
+                FramePresented {} → do
+                  owner ← readTVar (rigOwner rig)
+                  rounds ← maybe (pure 0) (fmap statusRounds . readOwnerStatusNow) owner
+                  modifyTVar' (rigPresentRounds rig) (<> [rounds])
+                _ → pure ()
           }
       timed owner = case rigClock rig of
         Nothing → owner
