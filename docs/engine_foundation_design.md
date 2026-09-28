@@ -16,8 +16,8 @@ preserves its bootstrap evidence, original ledger and proposed sequence.
 
 ## Current implementation
 
-Checked against code `master@da81087bb2c81e844588a0fc30197bd99201c6b9` on
-2026-09-22, using the docs worktree at the same committed baseline. This is
+Checked against code `master@141c1ab8ae5501a40d59294f23b11b97fea15bfe` on
+2026-09-28, using the docs worktree at the same committed baseline. This is
 a source inventory; no builds or native experiments were rerun for this update.
 Unmerged implementation branches are not included as delivered capabilities.
 
@@ -26,17 +26,19 @@ Unmerged implementation branches are not included as delivered capabilities.
 | Foundation | [Logging](logging.md), [CPU resources](resources.md), structured failures, bounded recovery, owned workers, bounded channels, coherent snapshots and monotonic time | Worker drain retains borrowed dependencies until termination; it supplies no forced safe teardown or OS-thread affinity |
 | Runtime | Scoped application composition, supervision, inbox services, reporting/logging lifetimes and the optional [asynchronous log adapter](../packages/runtime/src/Hetoimasia/Runtime/AsyncLog.hs) | No general short-job pool, content-loading service or application-owned game simulation is supplied by these services |
 | Scheduling | [Fixed-step policy](../packages/runtime/src/Hetoimasia/Runtime/UpdatePolicy.hs), scheduled GLFW owner turns, native wake/fallback and per-window render-demand scheduling | These compose timing and demand; they do not implement a game loop or submit graphics work |
-| Windowing and input | [GLFW](glfw.md) sessions, dynamic windows, controls, monitors and keyboard/text/mouse feeds; Cocoa on macOS, X11 by default on Linux and explicit Wayland selection | Full Wayland qualification/connection-loss work remains in #207; broader cursor/gamepad input remains a separate future arc |
+| Windowing and input | [GLFW](glfw.md) sessions, dynamic windows, controls, monitors and keyboard/text/mouse feeds; Cocoa on macOS, X11 by default on Linux and explicit Wayland selection | Wayland rendering evidence (WL-4) remains under epic #202, deferred behind the Vulkan epic; broader cursor/gamepad input remains a separate future arc |
 | Graphics ownership | [Supervised owner and handoff implementation](../packages/glfw/runtime-glfw-core/Hetoimasia/Runtime/GLFW/Internal/Owner.hs), exclusive window attachments and protected retirement | Uses injected backend operations and evidence; it does not create production Vulkan roots or establish native rendering progress |
 | GPU bookkeeping | [Pure GPU model](gpu_model.md): resource/generation holds, frame ownership, admission budgets and recovery accounting | Performs no Vulkan calls and cannot establish native completion; an owning backend must supply that evidence |
-| Vulkan qualification | The [Vulkan native suite](gpu_backend.md#the-native-suite), which carries the retired proof harness's cases, and retained [compatibility results](vulkan_compatibility_record.md) | A separate test harness, not a reusable backend or production triangle application; production surface/root/recording/submission work remains in #155 |
+| Vulkan qualification | The [Vulkan native suite](gpu_backend.md#the-native-suite), which carries the retired proof harness's cases, and retained [compatibility results](vulkan_compatibility_record.md) | Qualifies the [production backend](gpu_backend.md) delivered through #219–#232 rather than a separate harness; the multi-window triangle consumer and its final evidence remain in #233 |
 | Lua | [Private bridge behind an opaque public API](../packages/scripting-lua/README.md) for VM construction, chunks, calls and close, plus the pure task/protocol model | Public application capability registration, protected VM ownership and runtime scheduling/IPC are later slices; Linux and macOS confinement verdicts remain inconclusive |
 | Rendering contracts, 2D and 3D | Reserved component directories and ownership notes | No Cabal libraries or renderer implementations yet; see the [renderer findings](renderer_foundation_findings.md) |
 | Application | [Console entry point](../app/Main.hs) with logging and resource smoke paths | No graphical application or concrete game integration |
 
 The main [Cabal project](../cabal.project) includes the root package, foundation,
-runtime, GLFW, Lua host, GPU model and test-support package. The native Vulkan
-proof is selected separately by [cabal.project.vulkan](../cabal.project.vulkan).
+runtime, GLFW, Lua host, GPU model, Vulkan diagnostics and test-support
+package. The native Vulkan backend and its window integration are selected
+separately by [cabal.project.vulkan](../cabal.project.vulkan), through
+`tools/vulkan/run.sh`.
 The reserved [render API](../packages/render-api/README.md),
 [2D](../packages/render-2d/README.md) and
 [3D](../packages/render-3d/README.md) directories are proposals, not buildable
@@ -70,7 +72,7 @@ own source directory and declared dependencies.
 | GLFW | main-thread session, windows, monitors, callbacks and input | command ports and coherent observations |
 | Graphics owner | supervised graphics work and window retirement cooperation | explicit target controls and presentation data |
 | Game session (application responsibility) | world, rules, simulation and save schema | presentation snapshots and explicit commands; no game is implemented here |
-| Native Vulkan backend (planned) | device, GPU allocations, completion and disposal | opaque resources and managed submission; production work remains in #155 |
+| Native Vulkan backend | device, GPU allocations, completion and disposal | opaque resources and managed submission, [delivered](gpu_backend.md) through #219–#232; the triangle consumer remains in #233 |
 | 2D and 3D modules (planned) | independent rendering consumers | shared backend infrastructure, no concrete game dependency |
 | Lua runtime (partly implemented) | bridge/model exist; protected VM owners and confined mod/domain processes are planned | application-owned capabilities and bounded transport remain design contracts |
 

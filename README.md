@@ -8,8 +8,11 @@ recovery, monotonic scheduling, application composition, supervised workers,
 bounded messaging, and GLFW with dynamic windows, controls, monitor-aware modes,
 input feeds, native wake, and protected graphics-owner attachment lifetimes.
 The Lua binding and pure task/protocol model are buildable, as is the pure GPU
-retention and frame-ownership model. The production Lua scheduler, mod-process
-host, native Vulkan backend, fonts, and rendering modules remain planned.
+retention and frame-ownership model. The native Vulkan backend and its window
+integration are delivered: roots, swapchain generations, managed recording,
+frames, presentation, recovery and terminal failure (#219–#231), composed into
+the scheduled owner loop by #232. The production Lua scheduler, mod-process
+host, fonts, and rendering modules remain planned.
 
 The original GLFW arc and its completion repairs (#115–#118 and #123) are
 merged and reviewed; epic #86 is complete. Native desktop tests require an
@@ -26,9 +29,10 @@ Shared toolchain qualification #157 is complete, and the [Vulkan compatibility
 proof](docs/vulkan_compatibility_record.md) #158 records the selected profiles. The
 [Vulkan design](docs/vulkan_backend_design.md) (#155) has all delivery slices
 filed. The reviewed model/proof repairs #181–#184 and #189–#190 are merged,
-as is the reusable supervised graphics owner #218. Production native backend
-implementation remains outstanding in the filed slices; the proof and pure
-model are not that backend. The
+as is the reusable supervised graphics owner #218. The production native
+backend has since merged through #219–#232, with its contract in
+[docs/gpu_backend.md](docs/gpu_backend.md); the multi-window triangle consumer
+and its final evidence (#233) remain. The
 [Lua design](docs/lua_runtime_design.md) (#145) has returned to exploring: both platform confinement verdicts are inconclusive, so
 production mod-process work needs the deployment decision required by D-11.
 
@@ -46,6 +50,7 @@ production mod-process work needs the deployment decision required by D-11.
 - [GLFW contract and native tests](docs/glfw.md)
 - [Validation and evidence reuse](docs/validation.md)
 - [Vulkan backend design — staged qualification](docs/vulkan_backend_design.md)
+- [Vulkan backend and window integration contract](docs/gpu_backend.md)
 - [Kanban development workflow](docs/workflow.md)
 
 ## Build and run
@@ -79,6 +84,21 @@ and refuses to enter a session without the per-run consent
 [docs/glfw.md](docs/glfw.md#the-native-suite) describes — on the owner's
 desktop, the opt-in on that command, given under the owner's standing approval
 for runs an issue or pull request needs.
+
+The native Vulkan backend and its window integration build only through
+`cabal.project.vulkan`, which `cabal build all` never reads;
+`tools/vulkan/run.sh` is the one command that selects it, against the loader,
+driver, validation layer and shader compiler the
+[native prerequisites](docs/validation.md#developer-prerequisites-and-macos)
+provision into the private native prefix. Its headless suites, the validation
+group `test.vulkan-headless`, open no window and need no consent:
+
+```sh
+bash tools/vulkan/run.sh test hetoimasia-gpu-vulkan-native:test:native-tests hetoimasia-gpu-vulkan-native:test:shader-tests hetoimasia-gpu-vulkan-glfw:test:integration-tests
+```
+
+Its native suite, `vulkan-native-tests`, presents windows and takes the same
+desktop opt-in; see [docs/gpu_backend.md](docs/gpu_backend.md#the-native-suite).
 
 Expected smoke output on stderr — three `INFO` records in the
 [logging record layout](docs/logging.md#record-layout), with the timestamp,
@@ -141,7 +161,10 @@ uses, and releases both resources and still exits 0 — it just says nothing.
 | `packages/runtime/` | Application composition, reporting, supervision and inbox services | Buildable |
 | `packages/glfw/` | Private binding, windows, monitors, input and separate runtime adapter components | Buildable; original arc and repairs complete |
 | `packages/render-api/` | Backend-independent rendering contracts | Planned |
-| `packages/gpu-vulkan/` | GPU retention/frame model and planned native backend | Model buildable without a Vulkan SDK |
+| `packages/gpu-vulkan/model/` | Pure GPU retention, frame-ownership and recovery model | Buildable without a Vulkan SDK |
+| `packages/gpu-vulkan/diagnostics/` | Header-free validation capture and its diagnostic lifetime | Buildable without a Vulkan SDK |
+| `packages/gpu-vulkan/native/` | Native Vulkan backend: roots, swapchain generations, managed recording, frames, presentation, recovery and terminal failure | Buildable only through `cabal.project.vulkan` |
+| `packages/gpu-vulkan/glfw/` | Window integration: session controller, surface handover and the scheduled owner loop | Buildable only through `cabal.project.vulkan` |
 | `packages/render-2d/`, `packages/render-3d/` | Dedicated rendering paths | Planned |
 | `packages/scripting-lua/` | Lua binding, protocol model, and confinement experiments | Binding/model buildable; production runtime planned |
 | `samples/` | Future independent rendering consumers | Planned |
