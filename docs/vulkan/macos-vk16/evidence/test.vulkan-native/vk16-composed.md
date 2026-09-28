@@ -8,15 +8,15 @@ Verdict: **pass**.
 - the hidden window's target was suspended: True
 - frames while it was hidden (first, second): (0,3)
 - frames the first presented once shown again: 1
-- presentations made: 13; retired on their present fences: 13
-- Vulkan calls: 280, on 1 thread(s)
+- presentations made: 17; retired on their present fences: 17
+- Vulkan calls: 328, on 1 thread(s)
 - verdict issues: []
 - error reports: 0
-- seconds, from the loader integration to the verdict: 0.220725
+- seconds, from the loader integration to the verdict: 0.254492
 
 ## Transcript
 
 ```
 ## VK-16: two targets rendered through the composed loop, one suspended and resumed while the other presents
-presented 13 frames; 13 presentations retired on their present fences
+presented 17 frames; 17 presentations retired on their present fences
 ```
