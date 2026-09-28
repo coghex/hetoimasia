@@ -374,6 +374,25 @@ spec = describe "Frames" $ do
       atomically (readPool (rigFrames rig)) `shouldReturn` []
       clean rig
 
+    it "finishes a closing pass a cancellation interrupted when the target's frames are closed again, and then retires its slots" $ do
+      rig ← newRig
+      first ← owned rig
+      second ← owned rig
+      inModel rig (closeTarget (rigTarget rig))
+      -- Cancelled from inside the first frame's cleanup submission: that skip
+      -- is recorded, and the cancellation is delivered before the second.
+      cancelled rig isSubmission (closeTargetFrames (rigFrames rig) (rigTarget rig))
+      standingOf rig (ownedFrame first) `shouldReturn` Just StageSkipping
+      standingOf rig (ownedFrame second) `shouldReturn` Just StageAcquired
+      -- Closing again finishes the pass, and once it has, finds nothing.
+      closeTargetFrames (rigFrames rig) (rigTarget rig) `shouldReturn` [(ownedFrame second, Right ())]
+      closeTargetFrames (rigFrames rig) (rigTarget rig) `shouldReturn` []
+      settleAll rig
+      atomically (readFrameStandings (rigFrames rig)) `shouldReturn` []
+      retireTargetFrames (rigFrames rig) (rigTarget rig)
+      atomically (readSlots (rigFrames rig)) `shouldReturn` []
+      clean rig
+
     it "abandons a frame once ordinary admission is exhausted, holding its slot and pool record until the evidence arrives" $ do
       rig ← newRig
       frame ← owned rig

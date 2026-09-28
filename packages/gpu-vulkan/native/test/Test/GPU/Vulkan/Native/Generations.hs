@@ -21,6 +21,7 @@ import Hetoimasia.Foundation.Time (DurationRequirement (AllowZero), Instant, dur
 import Data.Foldable (for_)
 import Hetoimasia.GPU.Model
   ( Escalation (..)
+  , NextTurn (..)
   , Outcome (..)
   , SessionFailureCause (..)
   , SessionState (..)
@@ -28,6 +29,7 @@ import Hetoimasia.GPU.Model
   , TargetView (..)
   , closeTarget
   , escalations
+  , progressDeadline
   , sessionState
   , targetView
   )
@@ -104,7 +106,7 @@ spec = describe "Generations" $ do
       created rig `shouldReturn` [(640, 480)]
 
   describe "replacement" $ do
-    it "coalesces a resize until its geometry has been quiet for 16 ms, and builds once, from the newest" $ do
+    it "coalesces a resize for 16 ms from when it was first seen, and builds once, from the newest" $ do
       rig ← newRig
       stepAt rig 0 (seen 640 480)
       resizeSurface rig 800 600
@@ -112,12 +114,24 @@ spec = describe "Generations" $ do
       viewCondition <$> generationsOf rig `shouldReturn` Settling (at 116)
       resizeSurface rig 1024 768
       stepAt rig 110 (seen 1024 768)
-      viewCondition <$> generationsOf rig `shouldReturn` Settling (at 126)
-      stepAt rig 120 (seen 1024 768)
+      viewCondition <$> generationsOf rig `shouldReturn` Settling (at 116)
       created rig `shouldReturn` [(640, 480)]
-      stepAt rig 126 (seen 1024 768)
+      stepAt rig 116 (seen 1024 768)
       created rig `shouldReturn` [(640, 480), (1024, 768)]
       viewCondition <$> generationsOf rig `shouldReturn` Presenting
+
+    it "rebuilds a resize that never pauses once a period, rather than waiting for it to end" $ do
+      rig ← newRig
+      stepAt rig 0 (seen 640 480)
+      -- A Cocoa live resize: a new extent about every 8 ms, for as long as the
+      -- drag lasts.
+      forM_ (zip [100, 108 .. 196] [700, 710 ..]) $ \(instant, width) → do
+        resizeSurface rig width 480
+        stepAt rig instant (seen width 480)
+      -- Each move is first seen one step after the last build, and built,
+      -- from the newest extent, at the first step its period has passed.
+      created rig `shouldReturn` [(640, 480), (720, 480), (750, 480), (780, 480), (810, 480)]
+      viewCondition <$> generationsOf rig `shouldReturn` Settling (at 212)
 
     it "waits out a move whose surface has not caught up yet, and rebuilds once it has" $ do
       rig ← newRig
@@ -144,16 +158,16 @@ spec = describe "Generations" $ do
       stepAt rig 46 (seen 800 600)
       created rig `shouldReturn` [(640, 480), (800, 600)]
 
-    it "restarts the quiet period for a newer observation while the surface still reports the extent it planned" $ do
+    it "joins a newer observation to the move being coalesced, while the surface still reports the extent it planned" $ do
       rig ← newRig
       stepAt rig 0 (seen 640 480)
       resizeSurface rig 800 600
       stepAt rig 10 (seen 800 600)
       stepAt rig 15 (seen 900 600)
-      viewCondition <$> generationsOf rig `shouldReturn` Settling (at 31)
-      stepAt rig 26 (seen 900 600)
+      viewCondition <$> generationsOf rig `shouldReturn` Settling (at 26)
+      stepAt rig 20 (seen 900 600)
       created rig `shouldReturn` [(640, 480)]
-      stepAt rig 31 (seen 900 600)
+      stepAt rig 26 (seen 900 600)
       created rig `shouldReturn` [(640, 480), (800, 600)]
 
     it "adopts a settled move that leaves the extent unchanged, without a rebuild" $ do
@@ -239,6 +253,49 @@ spec = describe "Generations" $ do
       atomically (generationsDeadline (rigGenerations rig)) >>= (`shouldSatisfy` not . immediate)
       length <$> created rig `shouldReturn` 2
 
+    it "owes a closing target's settling replacement and unseen result no step, leaving its deadline to the model's own schedule" $ do
+      rig ← newRig
+      stepAt rig 0 (seen 640 480)
+      [first] ← activeGenerations rig
+      _ ← held rig first
+      resizeSurface rig 800 600
+      stepAt rig 10 (seen 800 600)
+      viewCondition <$> generationsOf rig `shouldReturn` Settling (at 26)
+      noteActive rig SwapchainSuboptimal
+      atomically (generationsDeadline (rigGenerations rig)) >>= (`shouldSatisfy` immediate)
+      atomically (void (stateRootsModel (rigRoots rig) (\model → case closeTarget (rigTarget rig) model of
+        Admitted next → ((), next)
+        _ → ((), model))))
+      -- The exit drain's step: no geometry, so nothing is reconciled.
+      void (stepGenerations (rigGenerations rig) (at 12) Map.empty)
+      model ← atomically (readRootsModel (rigRoots rig))
+      let schedule = case progressDeadline model of
+            TurnNow → Just (Left ())
+            TurnAt due → Just (Right due)
+            _ → Nothing
+      deadline ← atomically (generationsDeadline (rigGenerations rig))
+      deadline `shouldSatisfy` not . immediate
+      deadline `shouldBe` schedule
+      -- Past the settling instant, nothing more is owed than that schedule.
+      void (stepGenerations (rigGenerations rig) (at 30) Map.empty)
+      atomically (generationsDeadline (rigGenerations rig)) >>= (`shouldSatisfy` not . immediate)
+
+    it "moves the model's idle backoff on once per step while a retired generation stays held" $ do
+      rig ← newRig
+      stepAt rig 0 (seen 640 480)
+      [first] ← activeGenerations rig
+      _ ← held rig first
+      -- The replacement at 36 is new work: the schedule starts again there.
+      resize rig 20 800 600
+      created rig `shouldReturn` [(640, 480), (800, 600)]
+      standingOf rig first `shouldReturn` Just GenerationRetiredHeld
+      atomically (generationsDeadline (rigGenerations rig)) `shouldReturn` Just (Right (at 41))
+      -- Each step at its deadline is one poll: 5, 10, 20 ms, not 5, 20, 80.
+      stepAt rig 41 (seen 800 600)
+      atomically (generationsDeadline (rigGenerations rig)) `shouldReturn` Just (Right (at 51))
+      stepAt rig 51 (seen 800 600)
+      atomically (generationsDeadline (rigGenerations rig)) `shouldReturn` Just (Right (at 71))
+
     it "settles a moved observation before an out-of-date result's recovery rebuild, and builds the newest extent as a resize" $ do
       rig ← newRig
       stepAt rig 0 (seen 640 480)
@@ -262,7 +319,7 @@ spec = describe "Generations" $ do
       recoveryAttempts rig `shouldReturn` 0
 
   describe "bounds" $ do
-    it "at capacity retires and destroys the oldest disposable generation first, pauses while none is, and builds the newest geometry" $ do
+    it "at capacity retires and destroys the oldest disposable generation first, keeps the active one presenting while none is, and builds the newest geometry" $ do
       rig ← newRig
       stepAt rig 0 (seen 640 480)
       [first] ← activeGenerations rig
@@ -272,7 +329,9 @@ spec = describe "Generations" $ do
       stepAt rig 40 (seen 1024 768)
       stepAt rig 56 (seen 1024 768)
       viewCondition <$> generationsOf rig `shouldReturn` Backpressured GenerationBudget
-      viewTargetPhase <$> modelTarget rig `shouldReturn` TargetSuspended
+      -- Only the generation count is in the way, and the active generation
+      -- remains: the target is not suspended, and keeps presenting from it.
+      viewTargetPhase <$> modelTarget rig `shouldReturn` TargetAdmitted
       resizeSurface rig 1280 960
       stepAt rig 60 (seen 1280 960)
       stepAt rig 76 (seen 1280 960)
@@ -301,7 +360,7 @@ spec = describe "Generations" $ do
       let order = [call | call ← later, isDestroyedSwapchain call || isCreated call]
       order `shouldBe` [CreatedSwapchain 100 10 (640, 480) Nothing, DestroyedSwapchain 100, CreatedSwapchain 104 10 (800, 600) Nothing]
 
-    it "with one live generation, waits the quiet period for a newer resize that arrived while its only generation was held" $ do
+    it "with one live generation, builds a newer resize that arrived while its only generation was held, from the newest, once that generation is gone" $ do
       rig ← newRigWith defaultBudgetRequest {requestedGenerations = 1}
       stepAt rig 0 (seen 640 480)
       [first] ← activeGenerations rig
@@ -310,12 +369,13 @@ spec = describe "Generations" $ do
       viewCondition <$> generationsOf rig `shouldReturn` Backpressured GenerationBudget
       resizeSurface rig 1024 768
       stepAt rig 50 (seen 1024 768)
+      created rig `shouldReturn` [(640, 480)]
+      -- The move was first seen at 20 and has waited its period: the newer
+      -- extent joined it, and is built as soon as there is room.
       atomically (endGenerationUse (rigGenerations rig) use)
       stepAt rig 55 (seen 1024 768)
-      created rig `shouldReturn` [(640, 480)]
-      viewCondition <$> generationsOf rig `shouldReturn` Settling (at 66)
-      stepAt rig 66 (seen 1024 768)
       created rig `shouldReturn` [(640, 480), (1024, 768)]
+      viewCondition <$> generationsOf rig `shouldReturn` Presenting
 
     it "never lets one target's backpressure stop another, or take its reservations" $ do
       rig ← newRig

@@ -138,6 +138,7 @@ library runtime-glfw
     hs-source-dirs: runtime-glfw
     exposed-modules:
         Hetoimasia.Runtime.GLFW
+        Hetoimasia.Runtime.GLFW.Trace
     build-depends:
         base >=4.22 && <4.23,
         hetoimasia-glfw:runtime-glfw-core
@@ -157,6 +158,7 @@ library runtime-glfw-core
     exposed-modules:
         Hetoimasia.Runtime.GLFW.Internal
         Hetoimasia.Runtime.GLFW.Internal.Graphics
+        Hetoimasia.Runtime.GLFW.Internal.Measurement
         Hetoimasia.Runtime.GLFW.Internal.Owner
         Hetoimasia.Runtime.GLFW.Internal.Owner.Handoff
         Hetoimasia.Runtime.GLFW.Internal.RenderDemand

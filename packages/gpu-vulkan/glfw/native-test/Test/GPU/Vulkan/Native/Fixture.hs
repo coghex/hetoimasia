@@ -418,8 +418,9 @@ readObservation fixture window = do
 
 -- | Publish the window's latest observation for its target to the graphics
 -- owner, on the main thread, with the eligibility the main thread classifies
--- it as. An application's loop does this; until VK-16's loop adapter does it
--- every turn, the application does it itself. The attachment's revisions
+-- it as, as an application that drives its own loop does: the fixture's loop
+-- is the unscheduled owner loop, which publishes nothing, whereas
+-- 'runVulkanOwnerLoop' would publish it every turn. The attachment's revisions
 -- start after the slot's initial zero and rise with the window's own.
 publishObservation ∷ Fixture → GraphicsService → WindowId → IO ObservationPublication
 publishObservation fixture service window = do

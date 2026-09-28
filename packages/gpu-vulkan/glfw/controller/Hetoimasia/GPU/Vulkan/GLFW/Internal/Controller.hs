@@ -74,8 +74,9 @@
 -- owner's next step offers it to the generations, which recheck the session's
 -- one device's support and install it, or refuse it — and a surface the
 -- device cannot present to is destroyed on the owner's thread while the target
--- is disposed of through its designation. Until VK-16's loop adapter services
--- replacements on every turn, the application does it, as it publishes
+-- is disposed of through its designation. The loop adapter
+-- ("Hetoimasia.GPU.Vulkan.GLFW.Internal.Loop") services replacements on every
+-- turn; an application that drives its own loop does it, as it publishes
 -- observations. Close wins: a replacement deposited for a target that has
 -- begun retiring is destroyed, never installed.
 --
@@ -141,6 +142,16 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , noteVulkanSwapchainResult
   , targetGeometry
 
+    -- * Rendering (VK-16)
+  , RenderingOps (..)
+  , VulkanRenderer (..)
+  , FrameRequest (..)
+  , clearRenderer
+  , FrameEvent (..)
+  , FrameObserver
+  , noFrameObserver
+  , FrameStorageRefused (..)
+
     -- * The composition
   , VulkanHostConfig (..)
   , vulkanHostConfig
@@ -180,6 +191,7 @@ import Control.Monad.IO.Class (liftIO)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as Char8
 import Data.Foldable (for_)
+import Data.Functor ((<&>))
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Maybe (isJust)
 import Data.List (nubBy)
@@ -191,6 +203,7 @@ import Data.Word (Word32)
 import Hetoimasia.Foundation.Time (Instant)
 import Foreign.Ptr (Ptr)
 import Numeric (showHex)
+import Numeric.Natural (Natural)
 import Hetoimasia.Foundation.Log (Logger)
 import Hetoimasia.Foundation.Messaging.Payload (Prepared)
 import Hetoimasia.Foundation.Resource (Scoped)
@@ -200,6 +213,7 @@ import Hetoimasia.Foundation.Time
   , MonotonicSource
   , SecondsConversion (convertedDuration)
   , addDuration
+  , deadlineReached
   , durationFromNanoseconds
   , durationFromSeconds
   , minimumPositiveDuration
@@ -235,6 +249,9 @@ import Hetoimasia.GPU.Vulkan.Diagnostics
   , withDiagnosticCapture
   )
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Bridge
+import Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
+import Hetoimasia.GPU.Vulkan.Native.Frames (FrameOps (..))
+import Hetoimasia.GPU.Vulkan.Native.Recording (ClearColor (..), RecordingOps (..))
 import Hetoimasia.GPU.Vulkan.Native.Generations
   ( GenerationUse
   , Generations
@@ -316,6 +333,7 @@ import Hetoimasia.Runtime.GLFW
   , OwnerRetired
   , OwnerStep (..)
   , RenderEligibility (..)
+  , RetirementReadiness (..)
   , RolledBack
   , SlotState (SlotAttached)
   , StepReport (..)
@@ -357,12 +375,15 @@ import Hetoimasia.Runtime.GLFW
 --
 -- Its native handle types and the bridge's are hidden, so production and the
 -- headless examples drive the same value through the same functions.
-data VulkanController = ∀ inst msgr phys dev lease obligation. VulkanController !(State inst msgr phys dev lease obligation)
+data VulkanController = ∀ inst msgr phys dev cmd lease obligation. VulkanController !(State inst msgr phys dev cmd lease obligation)
 
-data State inst msgr phys dev lease obligation = State
+data State inst msgr phys dev cmd lease obligation = State
   { stateRoots ∷ !(Roots Quiesced inst msgr phys dev)
   , stateGenerations ∷ !(Generations Quiesced inst msgr phys dev)
     -- ^ Every admitted target's swapchain generations, above the roots.
+  , stateRendering ∷ !(Rendering Quiesced inst msgr phys dev cmd)
+    -- ^ The recording and the frames above the generations, and what each
+    -- target's rendering holds (VK-16).
   , statePointer ∷ !(inst → Ptr ())
   , stateBridge ∷ !(SurfaceBridge lease obligation)
   , stateLayers ∷ ![ByteString]
@@ -396,7 +417,9 @@ data State inst msgr phys dev lease obligation = State
     -- alone.
   , stateWake ∷ !(TVar (STM Bool))
     -- ^ What wakes an idle owner: the capture's sink failure, until it is
-    -- latched. Installed with the capture's watch.
+    -- latched, and a primary failure latched on another thread that the
+    -- owner's own checkpoint has not yet taken. Installed with the capture's
+    -- watch.
   , stateDiagnosticPending ∷ !(TVar Bool)
     -- ^ Whether the owner's last step found a diagnostic failure pending, so
     -- it looks again within its poll. The owner thread's alone.
@@ -404,6 +427,12 @@ data State inst msgr phys dev lease obligation = State
   , statePoll ∷ !Duration
     -- ^ How soon the owner looks at them again, while any exist.
   , stateHooks ∷ !ControllerHooks
+  , stateSeen ∷ !(TVar (Map TargetId (Natural, RenderEligibility)))
+    -- ^ The observation revision and eligibility each target's generations
+    -- were last reconciled with. The owner thread's alone.
+  , stateFailureTaken ∷ !(TVar Bool)
+    -- ^ Whether the owner's own step has found the session failed. Written by
+    -- the owner's step; read by its wake.
   }
 
 -- | Instants the package's own examples must reach and nothing else can: a
@@ -454,6 +483,8 @@ data Replacement obligation
 -- looks again at an attachment whose announcement its port refused.
 newVulkanController
   ∷ RootOps Quiesced inst msgr phys dev
+  → RenderingOps phys dev cmd
+  → FrameObserver
   → (inst → Ptr ())
   → SurfaceBridge lease obligation
   → [ByteString]
@@ -468,6 +499,8 @@ newVulkanController = newVulkanControllerWith noControllerHooks
 newVulkanControllerWith
   ∷ ControllerHooks
   → RootOps Quiesced inst msgr phys dev
+  → RenderingOps phys dev cmd
+  → FrameObserver
   → (inst → Ptr ())
   → SurfaceBridge lease obligation
   → [ByteString]
@@ -476,11 +509,12 @@ newVulkanControllerWith
   → MonotonicSource
   → Duration
   → IO VulkanController
-newVulkanControllerWith hooks ops pointer bridge layers validation budgets clock poll = do
+newVulkanControllerWith hooks ops rendering observer pointer bridge layers validation budgets clock poll = do
   roots ← newRoots ops budgets clock
   generations ← newGenerations roots
+  rendered ← newRendering roots generations rendering observer
   fmap VulkanController $
-    State roots generations pointer bridge layers validation
+    State roots generations rendered pointer bridge layers validation
       <$> newTVarIO Nothing
       <*> newTVarIO LeasePending
       <*> newTVarIO Map.empty
@@ -496,6 +530,8 @@ newVulkanControllerWith hooks ops pointer bridge layers validation budgets clock
       <*> pure clock
       <*> pure poll
       <*> pure hooks
+      <*> newTVarIO Map.empty
+      <*> newTVarIO False
 
 -- | Supply the instance extensions the window system requires, copied from
 -- the loader-aware session on the main thread. The owner's startup reads
@@ -586,26 +622,34 @@ readReadiness (VulkanController state) =
 -- ---------------------------------------------------------------------------
 -- The owner's operations
 
--- | The operations the graphics owner runs, on its own thread.
+-- | The operations the graphics owner runs, on its own thread, rendering the
+-- scene it holds with this renderer.
 --
--- The progress step raises a latched device loss; destroys the surface of any
+-- The progress step raises a latched failure; destroys the surface of any
 -- attachment whose announcement the port refused and whose slot has since
--- begun retiring; and reconciles every admitted target's swapchain generations
--- with the geometry the owner folded for it this round — its eligibility, its
--- last coherent framebuffer observation and the bounds the platform published
--- ('targetGeometry') — building, replacing and destroying generations as
--- "Hetoimasia.GPU.Vulkan.Native.Generations" decides. Nothing is recorded,
--- submitted or presented. It asks for a round while an unannounced attachment
--- is watched, and when the generations name a deadline: a settling resize, a
--- deferred recovery attempt, or the model's own schedule.
-controllerOperations ∷ VulkanController → GraphicsOperations scene
-controllerOperations (VulkanController state) =
+-- begun retiring; folds the step's demand and scene into render requests and,
+-- when a poll is due or a frame is to be attempted, asks the fences
+-- ("Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering"); reconciles every admitted
+-- target's swapchain generations with the geometry the owner folded for it —
+-- its eligibility, its last coherent framebuffer observation and the bounds
+-- the platform published ('targetGeometry') — whenever an observation moved,
+-- the generations' own deadline came, or a frame is to be attempted; and then
+-- offers each target that wants a frame one attempt. It asks for a round while
+-- an unannounced attachment is watched, when the generations name a deadline —
+-- a settling resize, a deferred recovery attempt, the model's poll — and when
+-- rendering does: a frame wanted now, an acquisition's retry, a demand deadline
+-- ahead. A target's retirement is owed until its frames and presentations have
+-- gone on their own evidence.
+controllerOperations ∷ VulkanController → VulkanRenderer scene → GraphicsOperations scene
+controllerOperations (VulkanController state) renderer =
   GraphicsOperations
     { graphicsStartOwner = \_ → startOwner state
     , graphicsConstructTarget = constructTarget state
     , graphicsStep = \step →
         checkpointRoots (stateRoots state) >>= \case
-          CheckpointFailed primary → throwIO (terminalFailure primary)
+          CheckpointFailed primary → do
+            atomically (writeTVar (stateFailureTaken state) True)
+            throwIO (terminalFailure primary)
           -- A diagnostic failure whose order is not yet readable: this round
           -- does nothing new, and the owner looks again within its poll.
           CheckpointPending → noStepWork <$ atomically (writeTVar (stateDiagnosticPending state) True)
@@ -614,6 +658,7 @@ controllerOperations (VulkanController state) =
             progress step
     , graphicsNextDeadline = ownerDeadline state
     , graphicsWake = join (readTVar (stateWake state))
+    , graphicsPrepareRetirement = \retiring → retaining state (prepareRetirement state retiring)
     , graphicsRetireTarget = \retiring → retaining state (retireTarget state retiring)
     , graphicsRetireOwner = retaining state . retireOwner state
     , graphicsDestroyOwner = \_ → retaining state (destroyOwner state)
@@ -622,26 +667,57 @@ controllerOperations (VulkanController state) =
     progress step = do
         settled ← settleUnannounced state
         mapped ← readTVarIO (stateTargets state)
-        let geometries =
-              Map.fromList
-                [ (target, targetGeometry view)
-                | view ← stepTargets step
-                , viewConstructed view
-                , Just target ← [Map.lookup (viewTarget view) mapped]
-                ]
-        summary ← stepGenerations (stateGenerations state) (stepNow step) geometries
+        let now = stepNow step
+            constructed =
+              [ (target, view)
+              | view ← stepTargets step
+              , viewConstructed view
+              , Just target ← [Map.lookup (viewTarget view) mapped]
+              ]
+            geometries = Map.fromList [(target, targetGeometry view) | (target, view) ← constructed]
+            observed = Map.fromList [(target, (viewRevision view, viewEligibility view)) | (target, view) ← constructed]
+        -- The generations are stepped when there is something for them to do:
+        -- a target's observation moved, their own deadline — a settling
+        -- resize, a recovery attempt, a result to reconcile, the model's poll
+        -- — has come, or a frame is to be attempted. A round something
+        -- unrelated woke takes no model turn, so it neither polls early nor
+        -- moves the backoff on.
+        seen ← readTVarIO (stateSeen state)
+        let moved = any (\(target, current) → Map.lookup target seen /= Just current) (Map.toList observed)
+        owed ← generationsOwed state now
+        let targets = [(target, viewTarget view, viewEligibility view == RenderEligible) | (target, view) ← constructed]
+        plan ←
+          planStep
+            (stateRendering state)
+            StepInputs
+              { inputsNow = now
+              , inputsSceneRevision = stepSceneRevision step
+              , inputsDemand = stepDemand step
+              , inputsDemandRevision = stepDemandRevision step
+              , inputsTargets = targets
+              }
+        summary ←
+          if moved || owed || planPolled plan || not (null (planDue plan))
+            then do
+              atomically (writeTVar (stateSeen state) observed)
+              stepGenerations (stateGenerations state) now geometries
+            else pure (StepSummary [] [] False [])
+        -- A replacement the generations' step just published is asked for a
+        -- frame in this step, not left for a later publication to notice.
+        published ← requestPublished (stateRendering state) targets (planDue plan)
+        presented ← renderDue (stateRendering state) renderer now (stepScene step) (stepSceneRevision step) (planDue plan <> published)
         asked ← askReplacements state (summarySurfacesWanted summary)
-        replaced ← settleReplacements state (stepNow step) (stepTargets step)
+        replaced ← settleReplacements state now (stepTargets step)
         noticeUnavailable state
         failRequired state
-        pure (if settled || summaryAdvanced summary || asked || replaced then noStepWork {stepAdvanced = True} else noStepWork)
+        pure (if settled || summaryAdvanced summary || asked || replaced || presented then noStepWork {stepAdvanced = True} else noStepWork)
 
 -- | Run a retirement, and if it could not verify what it owns, keep that in
 -- the terminal report as retained before the failure goes on to the owner,
 -- which retains its evidence and manufactures no acknowledgement. The report
 -- says what was retained; it releases nothing. A cancellation is not a
 -- retention and is left as it is.
-retaining ∷ State inst msgr phys dev lease obligation → IO a → IO a
+retaining ∷ State inst msgr phys dev cmd lease obligation → IO a → IO a
 retaining state action =
   tryWithContext action >>= \case
     Right value → pure value
@@ -652,6 +728,26 @@ retaining state action =
           rethrowIO (failure ∷ ExceptionWithContextSome)
 
 
+-- | Whether the generations' own deadline has come: a result to reconcile, a
+-- settling resize, a recovery attempt or the model's poll.
+generationsOwed ∷ State inst msgr phys dev cmd lease obligation → Instant → IO Bool
+generationsOwed state now =
+  atomically (generationsDeadline (stateGenerations state)) <&> \case
+    Nothing → False
+    Just (Left ()) → True
+    Just (Right due) → deadlineReached now due
+
+-- | Whether one target's retirement can be performed now: once its frames and
+-- presentations have all gone on their own evidence. A target the roots never
+-- admitted holds none.
+prepareRetirement ∷ State inst msgr phys dev cmd lease obligation → TargetRetire → IO RetirementReadiness
+prepareRetirement state retiring =
+  atomically (Map.lookup (retiringTarget retiring) <$> readTVar (stateTargets state)) >>= \case
+    Nothing → pure RetirementReady
+    Just target → do
+      now ← readInstant (stateClock state)
+      maybe RetirementReady RetirementOwed <$> prepareTargetRetirement (stateRendering state) now target
+
 -- | Destroy, on the owner's thread, the surface of every attachment the owner
 -- was never told about whose slot has begun retiring — released, or its window
 -- closing — and forget it. An attachment still attached may yet be announced,
@@ -661,7 +757,7 @@ retaining state action =
 -- retains the attachment and the instance, it is never offered again, and
 -- 'UnannouncedSurfaceUncertain' is raised, which ends the owner's run and
 -- reaches the application's checkpoints like any other owner failure.
-settleUnannounced ∷ State inst msgr phys dev lease obligation → IO Bool
+settleUnannounced ∷ State inst msgr phys dev cmd lease obligation → IO Bool
 settleUnannounced state = do
   entries ← Map.toList <$> readTVarIO (stateUnannounced state)
   settled ← forM entries $ \(attachment, entry) → do
@@ -698,7 +794,7 @@ settleUnannounced state = do
 -- | Ask the main thread for a replacement surface for each target whose
 -- attempt the generations just admitted, and wake it. Answers whether it
 -- asked for any.
-askReplacements ∷ State inst msgr phys dev lease obligation → [TargetId] → IO Bool
+askReplacements ∷ State inst msgr phys dev cmd lease obligation → [TargetId] → IO Bool
 askReplacements state wanted = do
   asked ← atomically $ do
     mapped ← Map.toList <$> readTVar (stateTargets state)
@@ -723,7 +819,7 @@ askReplacements state wanted = do
 -- replacement — a creation whose answer a cancellation took from the main
 -- thread — is destroyed too: the roots hold no surface for that target then,
 -- so nothing on the lease for it is in use.
-settleReplacements ∷ State inst msgr phys dev lease obligation → Instant → [TargetStepView] → IO Bool
+settleReplacements ∷ State inst msgr phys dev cmd lease obligation → Instant → [TargetStepView] → IO Bool
 settleReplacements state now views = do
   deposited ← atomically $ do
     held ← readTVar (stateReplacements state)
@@ -778,7 +874,7 @@ settleReplacements state now views = do
 
 -- | Report, once, every target that became unavailable: its episode spent, or
 -- its replacement surface one the device cannot present to.
-noticeUnavailable ∷ State inst msgr phys dev lease obligation → IO ()
+noticeUnavailable ∷ State inst msgr phys dev cmd lease obligation → IO ()
 noticeUnavailable state = atomically $ do
   mapped ← Map.toList <$> readTVar (stateTargets state)
   model ← readRootsModel (stateRoots state)
@@ -803,7 +899,7 @@ noticeUnavailable state = atomically $ do
 -- first, so a diagnostic failure that happened before it stays the primary and
 -- is what is raised instead; one whose order is not yet readable leaves it to
 -- the next step's checkpoint.
-failRequired ∷ State inst msgr phys dev lease obligation → IO ()
+failRequired ∷ State inst msgr phys dev cmd lease obligation → IO ()
 failRequired state = do
   model ← atomically (readRootsModel (stateRoots state))
   when (sessionState model == SessionFailed RequiredTargetUnrecoverable) $
@@ -816,17 +912,21 @@ failRequired state = do
       _ → pure ()
 
 -- | The earliest of the unannounced watch, a replacement the owner is waiting
--- on, and the generations' own deadline.
-ownerDeadline ∷ State inst msgr phys dev lease obligation → IO NextDeadline
+-- on, the generations' own deadline, and rendering's: a frame wanted now, an
+-- acquisition's retry, or a demand deadline still ahead.
+ownerDeadline ∷ State inst msgr phys dev cmd lease obligation → IO NextDeadline
 ownerDeadline state = do
   watch ← unannouncedDeadline state
   replacing ← replacementDeadline state
   owed ← atomically (generationsDeadline (stateGenerations state))
-  generation ← case owed of
-    Nothing → pure NoOwnerDemand
-    Just (Right due) → pure (OwnerDeadline due)
-    Just (Left ()) → OwnerDeadline <$> readInstant (stateClock state)
-  pure (earliest watch (earliest replacing generation))
+  now ← readInstant (stateClock state)
+  let generation = case owed of
+        Nothing → NoOwnerDemand
+        Just (Right due) → OwnerDeadline due
+        Just (Left ()) → OwnerDeadline now
+  targets ← Map.elems <$> readTVarIO (stateTargets state)
+  rendering ← maybe NoOwnerDemand OwnerDeadline <$> renderingDeadline (stateRendering state) now targets
+  pure (earliest watch (earliest replacing (earliest generation rendering)))
   where
     earliest NoOwnerDemand other = other
     earliest other NoOwnerDemand = other
@@ -835,7 +935,7 @@ ownerDeadline state = do
 -- | A round now while a deposited replacement waits to be settled, and one
 -- host idle bound ahead while one is still being created: the main thread's
 -- deposit wakes nothing on the owner, so it looks again.
-replacementDeadline ∷ State inst msgr phys dev lease obligation → IO NextDeadline
+replacementDeadline ∷ State inst msgr phys dev cmd lease obligation → IO NextDeadline
 replacementDeadline state = do
   held ← Map.elems <$> readTVarIO (stateReplacements state)
   now ← readInstant (stateClock state)
@@ -874,7 +974,7 @@ targetGeometry view =
 
 -- | A round soon, while an unannounced attachment is being watched or a
 -- diagnostic failure is pending; otherwise none.
-unannouncedDeadline ∷ State inst msgr phys dev lease obligation → IO NextDeadline
+unannouncedDeadline ∷ State inst msgr phys dev cmd lease obligation → IO NextDeadline
 unannouncedDeadline state = do
   unannounced ← not . Map.null <$> readTVarIO (stateUnannounced state)
   pending ← readTVarIO (stateDiagnosticPending state)
@@ -884,7 +984,7 @@ unannouncedDeadline state = do
       now ← readInstant (stateClock state)
       pure (either (const NoOwnerDemand) OwnerDeadline (addDuration now (statePoll state)))
 
-startOwner ∷ State inst msgr phys dev lease obligation → IO OwnerReady
+startOwner ∷ State inst msgr phys dev cmd lease obligation → IO OwnerReady
 startOwner state = do
   attempted ← tryWithContext $ do
     request ← readTVarIO (stateRequest state) >>= maybe (throwIO InstanceExtensionsMissing) pure
@@ -908,7 +1008,7 @@ startOwner state = do
 
 -- | Take one attachment's surface from the main thread's deposit, and settle
 -- its handoff: admitted, or destroyed and rolled back.
-constructTarget ∷ State inst msgr phys dev lease obligation → TargetStart → IO TargetHandoff
+constructTarget ∷ State inst msgr phys dev cmd lease obligation → TargetStart → IO TargetHandoff
 constructTarget state start = do
   deposit ← atomically (stateTVar (stateDeposits state) (\held → (Map.lookup attachment held, Map.delete attachment held)))
   readTVarIO (stateLease state) >>= \case
@@ -976,7 +1076,7 @@ constructTarget state start = do
 -- rollback — or, if a destruction was uncertain, as a partial construction the
 -- owner keeps and retires.
 reject
-  ∷ State inst msgr phys dev lease obligation
+  ∷ State inst msgr phys dev cmd lease obligation
   → AttachmentId
   → VulkanRejection
   → [obligation]
@@ -997,7 +1097,7 @@ reject state attachment reason obligations = do
 
 -- | Retire one target: destroy its surface, through the roots when they
 -- admitted it, and whatever else the lease still lists for its attachment.
-retireTarget ∷ State inst msgr phys dev lease obligation → TargetRetire → IO TargetRetired
+retireTarget ∷ State inst msgr phys dev cmd lease obligation → TargetRetire → IO TargetRetired
 retireTarget state retiring = do
   mapped ← atomically (Map.lookup attachment <$> readTVar (stateTargets state))
   retiredRoot ← case mapped of
@@ -1006,6 +1106,10 @@ retireTarget state retiring = do
       -- Raises, and keeps them, the surface and this mapping, if any could not
       -- be destroyed.
       now ← readInstant (stateClock state)
+      -- Its frames' synchronization and its frame storages go before its
+      -- generations, whose holds its presentations were: preparation waited
+      -- for every one of them to end.
+      retireTargetRendering (stateRendering state) now target
       retireTargetGenerations (stateGenerations state) now target
       -- Raises, and keeps the record and this mapping, if the destruction was
       -- uncertain: the owner then never offers this again.
@@ -1040,7 +1144,7 @@ retireTarget state retiring = do
 
 -- | Retire the owner: close the lease, destroy every surface no target held,
 -- and destroy the device.
-retireOwner ∷ State inst msgr phys dev lease obligation → OwnerRetire → IO OwnerRetired
+retireOwner ∷ State inst msgr phys dev cmd lease obligation → OwnerRetire → IO OwnerRetired
 retireOwner state retiring = do
   orphaned ← readTVarIO (stateLease state) >>= \case
     LeaseReady lease → do
@@ -1060,6 +1164,9 @@ retireOwner state retiring = do
   atomically $ do
     writeTVar (stateDeposits state) Map.empty
     writeTVar (stateUnannounced state) Map.empty
+  -- The recording's managed resources are the device's children.
+  now ← readInstant (stateClock state)
+  retireRendering (stateRendering state) now
   device ← retireRoots (stateRoots state)
   pure . ownerRetired $
     (if orphaned > 0 then "destroyed " <> plural orphaned "surface" <> " no target held; " else "") <> device
@@ -1068,7 +1175,7 @@ retireOwner state retiring = do
 
 -- | Destroy the owner's shared state: settle the lease, then destroy the
 -- explicit messenger and the instance.
-destroyOwner ∷ State inst msgr phys dev lease obligation → IO OwnerDestroyed
+destroyOwner ∷ State inst msgr phys dev cmd lease obligation → IO OwnerDestroyed
 destroyOwner state = do
   late ← readTVarIO (stateLease state) >>= \case
     LeaseReady lease → do
@@ -1102,7 +1209,7 @@ destroyOwner state = do
 -- destruction already raised answers 'DischargeStillUncertain' when a later
 -- pass finds it still owed, and is not latched again: what is recognised is
 -- the obligation, never a handle a later surface may reuse.
-latchDischarges ∷ State inst msgr phys dev lease obligation → Text → [(obligation, Discharged)] → STM ()
+latchDischarges ∷ State inst msgr phys dev cmd lease obligation → Text → [(obligation, Discharged)] → STM ()
 latchDischarges state what outcomes =
   for_ [(obligation, failure) | (obligation, DischargeUncertain (ExceptionWithContext _ failure)) ← outcomes] $ \(obligation, failure) →
     latchTerminal (stateRoots state) . TerminalCleanupFailed $
@@ -1278,9 +1385,9 @@ handOverVulkanTarget (VulkanController state) host owner window classification =
 -- step. Answers how many it created or tried to. The attachment is never
 -- released or reattached.
 --
--- It must run on the main thread, which the owner wakes when it asks. Until
--- VK-16's loop adapter runs it every turn, the application runs it, as it
--- publishes observations. Each replacement and its deposit are one masked
+-- It must run on the main thread, which the owner wakes when it asks. The
+-- loop adapter runs it every turn; an application that drives its own loop
+-- runs it, as it publishes observations. Each replacement and its deposit are one masked
 -- step; a cancellation that nonetheless takes a creation's answer leaves the
 -- surface on the lease, where the owner's next step finds and destroys it.
 replaceVulkanSurfaces ∷ VulkanController → WindowHost → GraphicsOwner scene → IO Int
@@ -1404,7 +1511,7 @@ describeRejection = \case
 rejectionsRetained ∷ Int
 rejectionsRetained = 64
 
-retainRejection ∷ State inst msgr phys dev lease obligation → AttachmentId → VulkanRejection → STM ()
+retainRejection ∷ State inst msgr phys dev cmd lease obligation → AttachmentId → VulkanRejection → STM ()
 retainRejection state attachment reason =
   modifyTVar' (stateRejections state) $ \held →
     let grown = Map.insert attachment reason held
@@ -1454,14 +1561,20 @@ diagnosticOrder capture =
     ErrorLatchedFirst → pure ValidationFirst
     SinkFailedFirst → pure (SinkFirst (fmap sinkFailureReason <$> captureSinkFailure capture))
 
--- | Whether the capture's sink has failed and nothing is latched yet: the one
--- diagnostic failure that arrives on a thread of its own rather than inside
--- a call the owner made, so the owner may be idle when it does.
-sinkUnlatched ∷ State inst msgr phys dev lease obligation → DiagnosticCapture → STM Bool
-sinkUnlatched state capture = do
+-- | Whether a failure the owner has not acted on asks for a round: the
+-- capture's sink has failed and nothing is latched yet — the one diagnostic
+-- failure that arrives on a thread of its own rather than inside a call the
+-- owner made, so the owner may be idle when it does — or a primary failure
+-- has been latched by a checkpoint on another thread, a handover's on the
+-- main thread, before the owner's own step took it. The owner's next step
+-- then finds it and ends the run; a wake that stayed with the sink alone
+-- would miss the second, and leave an idle owner running on a failed session.
+failureOwed ∷ State inst msgr phys dev cmd lease obligation → DiagnosticCapture → STM Bool
+failureOwed state capture = do
   failed ← isJust <$> captureSinkFailure capture
   latched ← isJust . reportPrimary <$> readRootsTerminal (stateRoots state)
-  pure (failed && not latched)
+  taken ← readTVar (stateFailureTaken state)
+  pure ((failed && not latched) || (latched && not taken))
 
 diagnosticAlarms ∷ DiagnosticCapture → IO [DiagnosticAlarm]
 diagnosticAlarms capture =
@@ -1554,6 +1667,42 @@ observeBridge (NativeObserver observe) bridge =
     , bridgeDischarge = observe "vkDestroySurfaceKHR" . bridgeDischarge bridge
     }
 
+-- | The recording's and the frames' native layers, with every call observed
+-- under its Vulkan name.
+observeRendering ∷ NativeObserver → RenderingOps phys dev cmd → RenderingOps phys dev cmd
+observeRendering (NativeObserver observe) ops =
+  RenderingOps
+    { renderingRecordingOps = \physical → recording <$> renderingRecordingOps ops physical
+    , renderingFrameOps = frames (renderingFrameOps ops)
+    }
+  where
+    recording layer =
+      layer
+        { opsCreatePipelineLayout = observe "vkCreatePipelineLayout" . opsCreatePipelineLayout layer
+        , opsDestroyPipelineLayout = \device handle → observe "vkDestroyPipelineLayout" (opsDestroyPipelineLayout layer device handle)
+        , opsCreatePipeline = \device request name → observe "vkCreateGraphicsPipelines" (opsCreatePipeline layer device request name)
+        , opsDestroyPipeline = \device handle → observe "vkDestroyPipeline" (opsDestroyPipeline layer device handle)
+        , opsCreateStorage = \device family → observe "vkCreateCommandPool" (opsCreateStorage layer device family)
+        , opsResetStorage = \device pool → observe "vkResetCommandPool" (opsResetStorage layer device pool)
+        , opsDestroyStorage = \device pool → observe "vkDestroyCommandPool" (opsDestroyStorage layer device pool)
+        , opsBeginCommands = observe "vkBeginCommandBuffer" . opsBeginCommands layer
+        , opsEndCommands = observe "vkEndCommandBuffer" . opsEndCommands layer
+        }
+    frames layer =
+      layer
+        { opsCreateSemaphore = observe "vkCreateSemaphore" . opsCreateSemaphore layer
+        , opsDestroySemaphore = \device handle → observe "vkDestroySemaphore" (opsDestroySemaphore layer device handle)
+        , opsCreateFence = observe "vkCreateFence" . opsCreateFence layer
+        , opsDestroyFence = \device handle → observe "vkDestroyFence" (opsDestroyFence layer device handle)
+        , opsResetFence = \device handle → observe "vkResetFences" (opsResetFence layer device handle)
+        , opsFenceSignalled = \device handle → observe "vkGetFenceStatus" (opsFenceSignalled layer device handle)
+        , opsAcquireImage = \device swapchain semaphore → observe "vkAcquireNextImageKHR" (opsAcquireImage layer device swapchain semaphore)
+        , opsSubmit = \device family batches fence → observe "vkQueueSubmit2" (opsSubmit layer device family batches fence)
+        , opsReleaseImages = \device swapchain indices → observe "vkReleaseSwapchainImagesEXT" (opsReleaseImages layer device swapchain indices)
+        , opsPresent = \device family request status → observe "vkQueuePresentKHR" (opsPresent layer device family request status)
+        , opsWaitFence = \device fence timeout → observe "vkWaitForFences" (opsWaitFence layer device fence timeout)
+        }
+
 -- | What one Vulkan graphics host is built from.
 data VulkanHostConfig scene = VulkanHostConfig
   { vulkanHost ∷ !HostConfig
@@ -1572,12 +1721,19 @@ data VulkanHostConfig scene = VulkanHostConfig
     -- ^ Adjusts the owner's configuration: its label, its port, its timer.
   , vulkanObserver ∷ DiagnosticCapture → NativeObserver
     -- ^ What observes each native call, given the session's capture.
+  , vulkanRenderer ∷ VulkanRenderer scene
+    -- ^ How the owner records a frame of the scene it holds.
+  , vulkanFrameObserver ∷ FrameObserver
+    -- ^ What the owner reports each frame's acquisition, submission,
+    -- presentation and observed completion to, on its own thread.
   }
 
 -- | A configuration with the given capture configuration and budgets, no
--- layers or validation features, the owner's defaults, and no observer.
+-- layers or validation features, the owner's defaults, no observer, and a
+-- renderer that clears every frame to opaque black.
 vulkanHostConfig ∷ HostConfig → CaptureConfig → Budgets → Prepared scene → VulkanHostConfig scene
-vulkanHostConfig host capture budgets scene = VulkanHostConfig host capture [] [] budgets scene id (const noObserver)
+vulkanHostConfig host capture budgets scene =
+  VulkanHostConfig host capture [] [] budgets scene id (const noObserver) (clearRenderer (\_ _ → ClearColor 0 0 0 1)) noFrameObserver
 
 -- | A running Vulkan graphics host.
 data VulkanHost scene = VulkanHost
@@ -1604,6 +1760,7 @@ data VulkanHost scene = VulkanHost
 withVulkanOwnerHostOver
   ∷ Logger
   → (DiagnosticCapture → RootOps Quiesced inst msgr phys dev)
+  → RenderingOps phys dev cmd
   → (inst → Ptr ())
   → SurfaceBridge lease obligation
   → (SessionConfig → Scoped Session)
@@ -1619,6 +1776,7 @@ withVulkanOwnerHostHooked
   ∷ ControllerHooks
   → Logger
   → (DiagnosticCapture → RootOps Quiesced inst msgr phys dev)
+  → RenderingOps phys dev cmd
   → (inst → Ptr ())
   → SurfaceBridge lease obligation
   → (SessionConfig → Scoped Session)
@@ -1626,13 +1784,15 @@ withVulkanOwnerHostHooked
   → VulkanHostConfig scene
   → (VulkanHost scene → IO r)
   → IO (r, DiagnosticVerdict)
-withVulkanOwnerHostHooked hooks logger layer pointer bridge enter extensions config use =
+withVulkanOwnerHostHooked hooks logger layer rendering pointer bridge enter extensions config use =
   withDiagnosticCapture (vulkanCapture config) logger $ \capture → do
     let observer = vulkanObserver config capture
     controller@(VulkanController state) ←
       newVulkanControllerWith
         hooks
         (observeRoots observer (layer capture))
+        (observeRendering observer rendering)
+        (vulkanFrameObserver config)
         pointer
         (observeBridge observer bridge)
         (vulkanLayers config)
@@ -1647,13 +1807,13 @@ withVulkanOwnerHostHooked hooks logger layer pointer bridge enter extensions con
     -- it for that checkpoint.
     atomically $ do
       watchRootsDiagnosticsOrdered (stateRoots state) (DiagnosticWatch (diagnosticAlarms capture) (diagnosticOrder capture))
-      writeTVar (stateWake state) (sinkUnlatched state capture)
+      writeTVar (stateWake state) (failureOwed state capture)
     let session = do
           entered ← enter (hostSessionConfig host)
           copied ← liftIO (extensions entered)
           liftIO (atomically (supplyInstanceExtensions controller copied))
           pure entered
-        owner = vulkanOwner config (graphicsOwnerConfig (controllerOperations controller) (vulkanScene config))
+        owner = vulkanOwner config (graphicsOwnerConfig (controllerOperations controller (vulkanRenderer config)) (vulkanScene config))
     outcome ←
       tryWithContext $
         withGraphicsOwnerHostIn logger session host owner $ \windows graphics → do
