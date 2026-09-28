@@ -1593,6 +1593,18 @@ edited, and Synarchy's installation is untouched. See
 [the loader's explicit driver selection](https://github.com/KhronosGroup/Vulkan-Loader/blob/main/docs/LoaderDriverInterface.md#overriding-the-default-driver-discovery)
 and [the compatibility record](vulkan_compatibility_record.md).
 
+VK-16 moved the pinned driver to Homebrew's MoltenVK **1.4.2**
+(`/opt/homebrew/Cellar/molten-vk/1.4.2`, installed beside 1.4.0), through
+`tools/native/vulkan.pin`, as an explicit requalification. MoltenVK 1.4.0 set the
+Metal layer's drawable size to 1×1 whenever a swapchain was created over an old
+one that still had a presentation in flight, as a workaround for a Metal
+completion regression. The new swapchain then answered suboptimal at the
+surface's own extent, and a live resize that keeps presenting while it rebuilds
+spent the target's recovery episode on it. 1.4.2 fixes it ("Fix swapchain
+recreation giving 1x1 drawables"). Its manifest is byte-identical to 1.4.0's and
+still declares API 1.4.0, which is the version the recorded driver identity
+prints beside the library digest; only the library differs.
+
 [MoltenVK 1.4.0's release](https://github.com/KhronosGroup/MoltenVK/releases/tag/v1.4.0)
 supports Vulkan 1.4; its tagged runtime guide lists dynamic rendering,
 synchronization2 and EXT swapchain maintenance. That made the proposed 1.3
