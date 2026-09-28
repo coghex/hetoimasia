@@ -45,6 +45,8 @@ library controller
     exposed-modules:
         Hetoimasia.GPU.Vulkan.GLFW.Internal.Bridge
         Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
+        Hetoimasia.GPU.Vulkan.GLFW.Internal.Loop
+        Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
     build-depends:
         base >=4.22 && <4.23,
         bytestring >=0.12 && <0.13,
@@ -52,6 +54,7 @@ library controller
         stm >=2.5.3 && <2.6,
         text >=2.1 && <2.2,
         hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-runtime ==0.1.0.0,
         hetoimasia-glfw ==0.1.0.0,
         hetoimasia-glfw:runtime-glfw ==0.1.0.0,
         hetoimasia-glfw:vulkan-interop ==0.1.0.0,
@@ -66,7 +69,9 @@ library
         Hetoimasia.GPU.Vulkan.GLFW
     build-depends:
         base >=4.22 && <4.23,
+        stm >=2.5.3 && <2.6,
         hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-runtime ==0.1.0.0,
         hetoimasia-glfw ==0.1.0.0,
         hetoimasia-glfw:runtime-glfw ==0.1.0.0,
         hetoimasia-glfw:vulkan-interop ==0.1.0.0,

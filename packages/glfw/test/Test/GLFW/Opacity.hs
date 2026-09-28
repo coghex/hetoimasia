@@ -1146,6 +1146,7 @@ graphicsOwnerClient =
     , "    , graphicsStep = \\_ → pure noStepWork"
     , "    , graphicsNextDeadline = pure NoOwnerDemand"
     , "    , graphicsWake = pure False"
+    , "    , graphicsPrepareRetirement = \\_ → pure RetirementReady"
     , "    , graphicsRetireTarget = \\_ → pure (targetRetired (Text.pack \"retired\"))"
     , "    , graphicsRetireOwner = \\_ → pure (ownerRetired (Text.pack \"retired\"))"
     , "    , graphicsDestroyOwner = \\_ → pure (ownerDestroyed (Text.pack \"destroyed\"))"

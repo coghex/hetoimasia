@@ -12,13 +12,22 @@
 --
 -- The owner builds, replaces and destroys each target's swapchain generations
 -- from the geometry it folded, and recovers a lost surface on the same live
--- window: the main thread creates the replacement with
--- 'replaceVulkanSurfaces' when the owner asks, and a target that cannot be
--- recovered is reported unavailable ('readVulkanUnavailability') or, when it
--- is required, fails the session ('VulkanRequiredTargetFailed'). Nothing is
--- recorded, submitted or presented through the controller yet, and the
--- owner's progress step reports no render demand: composing the frames in is
--- a later slice's.
+-- window: the main thread creates the replacement when the owner asks, and a
+-- target that cannot be recovered is reported unavailable
+-- ('readVulkanUnavailability') or, when it is required, fails the session
+-- ('VulkanRequiredTargetFailed').
+--
+-- 'runVulkanOwnerLoop' is the main thread's scheduled owner loop with the
+-- graphics owner composed in (VK-16): every turn it publishes each attached
+-- window's observation and eligibility and the windows' captured render
+-- demand to the owner, creates the replacement surfaces the owner asked for,
+-- and bounds its own wait by the owner's published deadline. The owner renders
+-- the scene it holds — the latest any application thread published through
+-- 'publishVulkanScene' — with the configuration's renderer, when demand or a
+-- newer scene asks for a frame, paces its own acquisitions and completion
+-- polls, and retires a target only once its frames and presentations have gone
+-- on their own evidence. A main-thread stall delays what the main thread
+-- publishes and nothing the owner already holds.
 --
 -- A terminal failure — the device's loss, a validation error or a sink failure
 -- the capture reports, an uncertain effect, a failed cleanup, a required
@@ -36,6 +45,19 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , VulkanHost (..)
   , NativeObserver (..)
   , noObserver
+
+    -- * The loop (VK-16)
+  , runVulkanOwnerLoop
+  , publishVulkanScene
+
+    -- * Rendering
+  , VulkanRenderer (..)
+  , FrameRequest (..)
+  , clearRenderer
+  , ClearColor (..)
+  , FrameEvent (..)
+  , FrameObserver
+  , noFrameObserver
 
     -- * Handing targets over
   , handOverVulkanTarget
@@ -80,12 +102,15 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , RootsOutlivedHost (..)
   , ReplacementSurfaceUncertain (..)
   , VulkanRequiredTargetFailed (..)
+  , FrameStorageRefused (..)
   ) where
 
+import Control.Concurrent.STM (atomically)
 import Hetoimasia.Foundation.Log (Logger)
+import Hetoimasia.Foundation.Messaging.Payload (Prepared)
 import Hetoimasia.GLFW.Vulkan (LoaderIntegration, allocLoaderSession, requiredInstanceExtensions)
 import Hetoimasia.GLFW.Window (WindowId)
-import Hetoimasia.Runtime.GLFW (EventAdmission, GraphicsService)
+import Hetoimasia.Runtime.GLFW (EventAdmission, GraphicsService, ScenePublication, ownerHandoff, publishOwnerScene)
 import Hetoimasia.GPU.Model.Identity (TargetClass)
 import Hetoimasia.GPU.Vulkan.Diagnostics (DiagnosticVerdict)
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Bridge (vulkanSurfaceBridge)
@@ -106,6 +131,14 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , VulkanRejection (..)
   , VulkanRequiredTargetFailed (..)
   , VulkanUnavailability (..)
+  , RenderingOps (..)
+  , VulkanRenderer (..)
+  , FrameRequest (..)
+  , clearRenderer
+  , FrameEvent (..)
+  , FrameObserver
+  , noFrameObserver
+  , FrameStorageRefused (..)
   , readReadiness
   , readVulkanUnavailability
   , unavailabilitiesRetained
@@ -123,6 +156,10 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , withVulkanOwnerHostOver
   )
 import qualified Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller as Controller
+import Hetoimasia.GPU.Vulkan.GLFW.Internal.Loop (runVulkanOwnerLoop)
+import Hetoimasia.GPU.Vulkan.Native.Frames.Vulkan (vulkanFrameOps)
+import Hetoimasia.GPU.Vulkan.Native.Recording (ClearColor (..))
+import Hetoimasia.GPU.Vulkan.Native.Recording.Vulkan (vulkanRecordingOps)
 import Hetoimasia.GPU.Vulkan.Native.Profile (ValidationFeature (..))
 import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsSessionFailed (..), TeardownEvidence (..), TerminalCause (..), TerminalReport (..))
 import Hetoimasia.GPU.Vulkan.Native.Roots.Vulkan (instancePointer, vulkanRootOps)
@@ -138,6 +175,7 @@ withVulkanOwnerHost logger integration =
   withVulkanOwnerHostOver
     logger
     vulkanRootOps
+    (RenderingOps vulkanRecordingOps vulkanFrameOps)
     instancePointer
     (vulkanSurfaceBridge integration)
     (allocLoaderSession integration)
@@ -151,9 +189,9 @@ handOverVulkanTarget host =
 
 -- | Create, on the main thread, every replacement surface this host's owner
 -- asked for to recover a lost surface, each under its target's existing
--- attachment (VK-14). The owner wakes the main thread when it asks; until
--- VK-16's loop adapter runs this every turn, the application runs it, as it
--- publishes observations. Answers how many it created or tried to.
+-- attachment (VK-14). The owner wakes the main thread when it asks, and
+-- 'runVulkanOwnerLoop' runs this every turn; an application that drives its
+-- own loop runs it itself. Answers how many it created or tried to.
 replaceVulkanSurfaces ∷ VulkanHost scene → IO Int
 replaceVulkanSurfaces host = Controller.replaceVulkanSurfaces (vulkanController host) (vulkanWindowHost host) (vulkanGraphicsOwner host)
 
@@ -161,3 +199,11 @@ replaceVulkanSurfaces host = Controller.replaceVulkanSurfaces (vulkanController 
 -- deferred, now that it may have room.
 announceVulkanTarget ∷ VulkanHost scene → GraphicsService → IO EventAdmission
 announceVulkanTarget host = Controller.announceVulkanTarget (vulkanController host) (vulkanGraphicsOwner host)
+
+-- | Publish the scene this host's owner renders, from any application thread.
+-- It is a latest-value snapshot: a newer publication replaces one the owner
+-- has not rendered, a publisher never waits, and a main thread stalled in a
+-- platform modal loop keeps no other thread from publishing. A newer scene is
+-- rendered to every eligible target.
+publishVulkanScene ∷ VulkanHost scene → Prepared scene → IO ScenePublication
+publishVulkanScene host scene = atomically (publishOwnerScene (ownerHandoff (vulkanGraphicsOwner host)) scene)
