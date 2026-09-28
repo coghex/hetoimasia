@@ -593,8 +593,10 @@ renderingDeadline rendering now = atomically $ do
 -- | Begin retiring one target, and say whether its retirement can be
 -- performed now.
 --
--- The first call closes the target in the model and closes its frames. Every
--- call asks the fences when a poll is due — the close itself makes one due —
+-- The first call closes the target in the model. Every call closes whatever
+-- frame of the target is still acquired or submitted — a pass a cancellation
+-- interrupted is finished by the next call, and a finished one finds nothing
+-- — then asks the fences when a poll is due — the close itself makes one due —
 -- and anchors the model's schedule with one generation step, and answers
 -- 'Nothing' — ready — once no frame and no presentation of the target
 -- remains, or once the device has been lost; otherwise the reason it is still
@@ -604,15 +606,14 @@ prepareTargetRetirement rendering now target =
   readTVarIO (renderingLive rendering) >>= \case
     Nothing → pure Nothing
     Just made → do
-      first ← atomically $ do
+      atomically $ do
         record ← Map.findWithDefault freshTarget target <$> readTVar (renderingTargets rendering)
         unless (targetClosing record) $ do
           editTarget rendering target (\held → held {targetClosing = True})
           stateRootsModel (renderingRoots rendering) $ \model → case closeTarget target model of
             Admitted next → ((), next)
             _ → ((), model)
-        pure (not (targetClosing record))
-      when first (void (closeTargetFrames (liveFrames made) target))
+      void (closeTargetFrames (liveFrames made) target)
       model ← atomically (readRootsModel (renderingRoots rendering))
       if deviceLossObserved model
         then pure Nothing
