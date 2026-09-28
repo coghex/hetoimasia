@@ -87,6 +87,7 @@ spec = describe "Vulkan loop adapter" $ do
     it "lets a fresh request supersede a retry still pending, rendering at once" (bounded testFreshRequestSupersedesRetry)
     it "asks a frame of a generation a target moved to once, so an unrelated wake does not retry it early" (bounded testGenerationAskedOnce)
     it "renders a quiet target's replacement published in the step that disposed of its only generation, with nothing published" (bounded testQuietReplacementRendered)
+    it "records the replacement a due target is offered as asked, so an unrelated wake does not retry its refused frame early" (bounded testDueTargetReplacementAsked)
 
   describe "a stalled main thread" $ do
     it "keeps the owner rendering while the native event call is held, and serves a window command once it returns" (bounded testStalledMainThread)
@@ -864,6 +865,73 @@ testGenerationAskedOnce = do
     refuseFrames rig False
     letExitFinish rig
     pure (before, early, retried)
+  early `shouldBe` before
+  retried `shouldBe` before + 1
+  where
+    abandoned = \case
+      FrameAbandoned {} → True
+      _ → False
+
+-- | One step with a target already due — a demand deadline that comes at the
+-- instant a resize's replacement is due — that also publishes the replacement.
+-- The frame is offered on the replacement and refused, leaving a retry at the
+-- backoff's first interval: an unrelated early wake, with the scripted clock
+-- still, makes no second attempt, and the retry comes when the clock reaches
+-- it.
+testDueTargetReplacementAsked ∷ IO ()
+testDueTargetReplacementAsked = do
+  rig ← scriptedRigOf 1
+  (start, before, early, retried) ← runRig rig $ \host control → do
+    [window] ← windowsOf host
+    service ← firstFrame rig host control window
+    let owner = vulkanGraphicsOwner host
+        settling = do
+          view ← atomically (readVulkanGenerations (vulkanController host) (graphicsAttachment service))
+          pure $ case viewCondition <$> view of
+            Just (Settling at) → Just at
+            _ → Nothing
+    built ← swapchainsCreated rig
+    resizeFramebuffer rig host window (800, 600)
+    composedUntil rig host control "the resize settling" (\_ → pure ()) (isJust <$> settling)
+    due ← settling >>= maybe (failWith "the resize is not settling") pure
+    -- A demand deadline at that same instant, taken by the owner and held.
+    client ← atomically (hostWindowClient (vulkanWindowHost host) window) >>= maybe (failWith "no client") pure
+    _ ← publishDemand (clientDemandPublisher client) (deadlineDemand due)
+    turns ← newTVarIO (0 ∷ Int)
+    composedUntil
+      rig
+      host
+      control
+      "the owner taking the demand deadline"
+      (\_ → atomically (modifyTVar' turns (+ 1)))
+      (atomically ((&&) . (>= 2) <$> readTVar turns <*> readOwnerDemandTaken owner))
+    refuseFrames rig True
+    start ← framesAbandoned rig
+    setClock rig due
+    composedUntil
+      rig
+      host
+      control
+      "the replacement's refused frame"
+      (\_ → pure ())
+      ((&&) . (> built) <$> swapchainsCreated rig <*> ((>= 1) <$> framesAbandoned rig))
+    before ← framesAbandoned rig
+    settled ← clockNow rig >>= timeout (5 * 1000 * 1000) . awaitDeadlineAfter host
+    when (isNothing settled) (failWith "the owner never settled on a deadline ahead of the clock")
+    status ← atomically (readOwnerStatusNow owner)
+    nothing ← prepare (OwnerDemand False Nothing)
+    _ ← atomically (publishOwnerDemand (ownerHandoff owner) nothing)
+    _ ← atomically (awaitOwnerRound owner (statusRounds status))
+    early ← framesAbandoned rig
+    advanceClock rig 5
+    atomically (length . filter abandoned <$> readTVar (rigFrameEvents rig) >>= check . (> early))
+    retried ← framesAbandoned rig
+    refuseFrames rig False
+    letExitFinish rig
+    pure (start, before, early, retried)
+  -- One refusal until the owner settles on the retry, none on an unrelated
+  -- wake, and one at the retry.
+  before `shouldBe` start + 1
   early `shouldBe` before
   retried `shouldBe` before + 1
   where

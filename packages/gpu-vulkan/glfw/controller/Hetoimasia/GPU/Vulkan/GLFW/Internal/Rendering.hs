@@ -489,7 +489,10 @@ planStep rendering inputs = do
 -- those already due, and answer them to be offered one this same step. A
 -- quiet target's replacement — the old generation disposed of and the new one
 -- published in one step, with nothing left owed — would otherwise wait for an
--- unrelated publication, since the plan was made before the step.
+-- unrelated publication, since the plan was made before the step. A target
+-- already due is asked nothing more, but the generation it will now be
+-- offered a frame of is recorded as asked, so a later round does not take it
+-- for a fresh request and cut short the retry of a frame refused on it.
 requestPublished
   ∷ Rendering q inst msgr phys dev cmd
   → [(TargetId, AttachmentId, Bool)]
@@ -499,7 +502,8 @@ requestPublished rendering targets due = do
   views ← atomically (mapM (\(target, _, _) → (,) target <$> readTargetGenerations (renderingGenerations rendering) target) targets)
   atomically $ do
     held ← readTVar (renderingTargets rendering)
-    let moved =
+    let active target = (lookup target views >>= id) >>= viewActive
+        moved =
           [ (target, attachment)
           | (target, attachment, eligible) ← targets
           , target `notElem` map fst due
@@ -514,7 +518,10 @@ requestPublished rendering targets due = do
         Admitted next → ((), next)
         _ → ((), model)
       editTarget rendering target $ \record →
-        record {targetRetryAt = Nothing, targetAsked = (lookup target views >>= id) >>= viewActive}
+        record {targetRetryAt = Nothing, targetAsked = active target}
+    for_ due $ \(target, _) →
+      for_ (active target) $ \generation →
+        editTarget rendering target (\record → record {targetAsked = Just generation})
     pure moved
 
 -- | Whether the model's own schedule says a completion poll is due now.

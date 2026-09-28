@@ -1630,7 +1630,9 @@ for it — when
   the step plans its frames before the generations' step, a replacement that
   step publishes — a quiet target's, whose one allowed generation was disposed
   of in that same step with nothing left owed — is asked for then and offered a
-  frame in the same step.
+  frame in the same step. A target already due in that step is offered its
+  frame on the replacement, and the replacement is recorded as asked for it
+  too.
 
 Nothing else asks. A target nobody asked a frame of is never rendered to,
 however its generations change, so a host whose application publishes neither
@@ -2153,9 +2155,11 @@ a renderer refusing every frame, with the owner's deadline one backoff interval
 ahead of a still clock and no second attempt until the clock reaches it; a
 fresh request, made while such a retry is pending, rendered at once with the
 clock still; a frame of a new generation refused after a resize, with an
-unrelated wake making no second attempt before the retry's interval; and, with
+unrelated wake making no second attempt before the retry's interval; with
 one live generation, a quiet target's resize whose replacement is rendered with
-nothing published;
+nothing published; and a demand deadline coming at the instant a resize's
+replacement is due, whose frame on the replacement is refused once, with no
+second attempt before the retry's interval, an unrelated wake included;
 the owner presenting a scene published from another thread while the main
 thread is held inside its native event call, and a window command submitted
 then served only once the call returns; a live resize under the same held call,
