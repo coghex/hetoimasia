@@ -132,7 +132,7 @@ spec = describe "Vulkan controller" $ do
     it "latches the failed destructions of two distinct surfaces that share a handle, each with its own attachment" (bounded testReusedHandleFails)
 
   describe "progress" $
-    it "reports no work and no deadline while nothing is deferred, since nothing is recorded or submitted" (bounded testNoDemand)
+    it "reports no work and no deadline while nothing is deferred and no frame is wanted" (bounded testNoDemand)
 
   describe "recovering a lost surface (VK-14)" $ do
     it "replaces it on the main thread under the same attachment, after its generation and then the lost surface went on the owner's thread, and leaves the other target alone" (bounded testSurfaceReplaced)
@@ -1323,9 +1323,16 @@ testNoDemand = do
     [window] ← windowsOf host
     service ← handedOver host window RequiredTarget
     TargetUsable ← awaitStanding host service
-    -- The round that constructed the target has completed, and an idle owner
-    -- takes no other: nothing it holds wants one.
-    atomically (awaitOwnerRound (vulkanGraphicsOwner host) 0)
+    -- Once the round that constructed the target has completed, the owner
+    -- names no deadline of its own. A round that ran while the handover's
+    -- announcement was being watched names the watch's brief poll, and the
+    -- round that poll takes clears it; nothing the owner holds wants another.
+    let settle seen remaining = do
+          status ← atomically (awaitOwnerRound (vulkanGraphicsOwner host) seen)
+          if isNothing (statusNextDeadline status) || remaining <= (0 ∷ Int)
+            then pure status
+            else settle (statusRounds status) (remaining - 1)
+    settle 0 5
   statusNextDeadline status `shouldBe` Nothing
   statusAdvanced status `shouldBe` 0
   statusImmediate status `shouldBe` False
@@ -1412,8 +1419,12 @@ testHiddenSuspended = do
     [window] ← windowsOf host
     service ← handedOver host window RequiredTarget
     TargetUsable ← awaitStanding host service
-    _ ← atomically (awaitOwnerRound (vulkanGraphicsOwner host) 0)
-    atomically (readVulkanGenerations (vulkanController host) (graphicsAttachment service))
+    -- The target is usable once its construction settled, and its
+    -- generations are reconciled in that round's step, which follows it.
+    atomically $
+      readVulkanGenerations (vulkanController host) (graphicsAttachment service) >>= \case
+        Just generations | viewCondition generations /= AwaitingGeneration → pure (Just generations)
+        _ → retry
   fmap viewCondition view `shouldSatisfy` \case
     Just (Suspended (SuspendedIneligible _)) → True
     _ → False
