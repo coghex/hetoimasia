@@ -139,6 +139,7 @@ test-suite vulkan-native-tests
     default-extensions: PatternSynonyms
     ghc-options: -threaded -rtsopts
     other-modules:
+        Test.GPU.Vulkan.Native.Composed
         Test.GPU.Vulkan.Native.Consent
         Test.GPU.Vulkan.Native.Environment
         Test.GPU.Vulkan.Native.Fixture
