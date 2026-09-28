@@ -1353,7 +1353,12 @@ transition that would have failed the session is taken on the failed session
 instead, so a required target's recovery goes no further. A sink failure whose
 reason its worker has not yet published leaves the transaction waiting, and the
 worker's publication, which follows its claim at once, wakes it. The claim
-answers the same however often a transaction runs it. Roots given only a list
+answers the same however often a transaction runs it. Between the owner's
+claim and the commit of the transaction that records its failure, a
+checkpoint on another thread — a handover's, say — sees the claim
+(`CaptureOwnerClaimed`, `AlarmOwnerClaimed`) with nothing latched and answers
+`CheckpointPending`, latching nothing, so a later diagnostic failure cannot
+take the owner's place. Roots given only a list
 of alarms (`watchRootsDiagnostics`, as headless examples use) latch them at
 checkpoints and order nothing; the controller installs the capture's order
 (`watchRootsDiagnosticsOrdered`). The
@@ -1722,7 +1727,9 @@ and one that follows the exhaustion kept behind it; a validation error only
 the capture's order knows of, and a sink failure whose reason its worker
 publishes late, each kept as the primary ahead of the exhaustion it preceded;
 a validation error reported during a call that then returns the device's loss
-kept as the primary with the loss beside it; and a validation error
+kept as the primary with the loss beside it; a checkpoint that finds the
+owner's claim unrecorded refusing as pending with nothing latched, and the
+owner's loss then kept as the primary ahead of the later error; and a validation error
 reported inside a submission that then raised with an unknown effect kept as
 the primary, with the uncertain effect beside it. The model's own suite adds `Device loss`: the loss kept beside
 an earlier cause, the release refused before the loss, a submission and a

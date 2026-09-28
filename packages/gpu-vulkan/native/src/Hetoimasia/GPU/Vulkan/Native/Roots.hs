@@ -835,6 +835,10 @@ data DiagnosticAlarm
     -- ^ A diagnostic failure has happened, but the capture cannot yet say
     -- which came first: admission stays closed, and nothing is latched until
     -- it can.
+  | AlarmOwnerClaimed
+    -- ^ A failure of the owner's own claimed first place in the capture's
+    -- order: until its transaction has recorded it, admission stays closed
+    -- and nothing is latched ahead of it.
   deriving (Eq, Show)
 
 -- | What a checkpoint answers.
@@ -989,8 +993,9 @@ watchRootsDiagnosticsOrdered roots = writeTVar (rootsWatch roots)
 -- itself as the primary if nothing was latched before it, and answer the
 -- primary. It raises nothing, calls nothing native, and waits for nothing.
 --
--- While the capture says a failure is pending ('AlarmPending'), it latches
--- nothing — neither the capture's alarms nor the model's own failure, which
+-- While the capture says a failure is pending ('AlarmPending'), or that a
+-- failure of the owner's own holds first place and nothing has recorded it
+-- yet ('AlarmOwnerClaimed'), it latches nothing — neither the capture's alarms nor the model's own failure, which
 -- might otherwise be taken ahead of the diagnostic failure that came first —
 -- and answers an earlier primary if there is one, 'CheckpointPending'
 -- otherwise, so admission stays closed until a later checkpoint can latch
@@ -1002,9 +1007,14 @@ watchRootsDiagnosticsOrdered roots = writeTVar (rootsWatch roots)
 checkpointRoots ∷ Roots q inst msgr phys dev → IO Checkpoint
 checkpointRoots roots = do
   alarms ← watchAlarms =<< readTVarIO (rootsWatch roots)
-  atomically $
-    if AlarmPending `elem` alarms
-      then maybe CheckpointPending CheckpointFailed . reportPrimary <$> readTVar (rootsTerminal roots)
+  atomically $ do
+    latched ← reportPrimary <$> readTVar (rootsTerminal roots)
+    modelled ← fromModel <$> readTVar (rootsModel roots)
+    -- The owner's own failure claimed first place but its transaction has not
+    -- recorded it yet: an alarm latched now would take a place that is its.
+    let ownerInFlight = AlarmOwnerClaimed `elem` alarms && isNothing latched && isNothing modelled
+    if AlarmPending `elem` alarms || ownerInFlight
+      then pure (maybe CheckpointPending CheckpointFailed latched)
       else do
         latchAlarms roots alarms
         report ← readTVar (rootsTerminal roots)
@@ -1051,14 +1061,18 @@ syncYields = 10000
 syncPause = 100
 
 -- | A checkpoint for the owner's own admission of new work, which may wait: it
--- first latches what the capture holds ('syncRootsDiagnostics'), so it never
--- answers 'CheckpointPending'.
+-- latches what the capture holds ('syncRootsDiagnostics') and waits out a
+-- pending answer — an alarm under publication, or a failure of the owner's
+-- own whose transaction has not recorded it yet — so it never answers
+-- 'CheckpointPending'.
 checkpointRootsSettled ∷ Roots q inst msgr phys dev → IO Checkpoint
-checkpointRootsSettled roots = do
-  syncRootsDiagnostics roots
-  checkpointRoots roots >>= \case
-    CheckpointPending → checkpointRootsSettled roots
-    settled → pure settled
+checkpointRootsSettled roots = go (0 ∷ Int)
+  where
+    go looked = do
+      syncRootsDiagnostics roots
+      checkpointRoots roots >>= \case
+        CheckpointPending → (if looked < syncYields then yield else threadDelay syncPause) >> go (looked + 1)
+        settled → pure settled
 
 -- | Latch each alarm the capture named, in its order.
 latchAlarms ∷ Roots q inst msgr phys dev → [DiagnosticAlarm] → STM ()
@@ -1068,6 +1082,7 @@ latchAlarms roots alarms = mapM_ (latchCause roots) [cause | Just cause ← map 
       AlarmValidationError → Just TerminalValidationError
       AlarmSinkFailed reason → Just (TerminalSinkFailed reason)
       AlarmPending → Nothing
+      AlarmOwnerClaimed → Nothing
 
 -- | The terminal latch, as any thread may read it. A failure the model
 -- recorded by itself and no checkpoint has latched yet is answered as the

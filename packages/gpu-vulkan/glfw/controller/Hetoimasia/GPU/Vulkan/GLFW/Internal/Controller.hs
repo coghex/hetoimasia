@@ -1131,6 +1131,7 @@ diagnosticAlarms capture =
         CaptureErrorLatched → AlarmValidationError
         CaptureSinkFailed reason → AlarmSinkFailed reason
         CaptureAlarmPending → AlarmPending
+        CaptureOwnerClaimed → AlarmOwnerClaimed
     )
     <$> captureAlarms capture
 

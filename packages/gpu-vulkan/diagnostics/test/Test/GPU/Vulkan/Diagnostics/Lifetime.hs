@@ -104,6 +104,7 @@ alarmKind = \case
   CaptureErrorLatched → "error"
   CaptureSinkFailed _ → "sink"
   CaptureAlarmPending → "pending"
+  CaptureOwnerClaimed → "owner"
 
 consumerName ∷ ConsumerOutcome → String
 consumerName = \case
@@ -332,6 +333,15 @@ spec = describe "Lifetime" $ do
           noteSinkFailure (captureUserData capture)
           claimCaptureOrder capture
       sinkFirst `shouldBe` SinkFailedFirst
+
+    it "answers the owner's claim ahead of the alarms that came after it" $ do
+      (logger, _) ← switchedLogger
+      (alarms, _) ←
+        capturing logger $ \capture → do
+          _ ← claimCaptureOrder capture
+          offerTo capture (plainOffer SeverityError "an error after the owner's failure")
+          captureAlarms capture
+      map alarmKind alarms `shouldBe` ["owner", "error"]
 
     it "answers only that a failure is pending while the failure that came first has claimed the order but not yet published its alarm" $ do
       (logger, failing) ← switchedLogger

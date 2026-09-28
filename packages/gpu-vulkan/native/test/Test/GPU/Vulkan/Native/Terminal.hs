@@ -155,6 +155,23 @@ spec = describe "Terminal failure" $ do
       tornDownUnderLoss rig
 
   describe "the primary failure" $ do
+    it "stays pending while a failure of the owner's own holds first place unrecorded, then keeps it as the primary ahead of a later validation error" $ do
+      rig ← newRig
+      _ ← pendingPresentation rig
+      -- The owner has claimed first place for its loss and its transaction
+      -- has not committed; an error reached the capture after the claim.
+      atomically (watchRootsDiagnosticsOrdered (rigRoots rig) (DiagnosticWatch (pure [AlarmOwnerClaimed, AlarmValidationError]) (pure OwnerFirst)))
+      -- A checkpoint in that moment latches nothing and refuses.
+      tryAcquireFrame (rigFrames rig) (rigTarget rig) `shouldReturn` Left RefusedDiagnosticPending
+      reportPrimary <$> atomically (readRootsTerminal (rigRoots rig)) `shouldReturn` Nothing
+      -- The owner's transaction records its loss.
+      loseFrameStep (rigStandIn rig) AtQueryFence
+      progress rig `raises` \loss → lostDuring loss == "vkGetFenceStatus"
+      tryAcquireFrame (rigFrames rig) (rigTarget rig) `shouldReturn'` (`shouldSatisfy` sessionRefused lostLoss)
+      primaryIs rig lostLoss
+      evidenceOf rig `shouldReturn'` (`shouldSatisfy` elem (LaterFailure TerminalValidationError))
+      tornDownUnderLoss rig
+
     it "keeps a validation error reported during a call as the primary when that call then returns the device's loss" $ do
       rig ← newRig
       atomically (watchRootsDiagnosticsOrdered (rigRoots rig) (DiagnosticWatch (pure []) (pure ValidationFirst)))

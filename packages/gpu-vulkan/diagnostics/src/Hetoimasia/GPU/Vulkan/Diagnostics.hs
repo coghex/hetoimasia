@@ -420,6 +420,10 @@ data CaptureAlarm
     -- ^ A failure has claimed the order but has not yet published its own
     -- alarm: something failed, and which failure came first is not yet
     -- readable.
+  | CaptureOwnerClaimed
+    -- ^ The capture's owner claimed first place for a failure of its own
+    -- ('claimCaptureOrder'): that failure came before every alarm answered
+    -- beside this, and recording it is the owner's.
   deriving (Eq, Show)
 
 -- | The capture's terminal failures, in the order they happened.
@@ -480,6 +484,7 @@ captureAlarms capture = do
       | otherwise → sinks <> errors
     Just FirstError
       | null errors → [CaptureAlarmPending]
+    Just FirstOwner → CaptureOwnerClaimed : errors <> sinks
     _ → errors <> sinks
 
 -- | Run a body that owns a diagnostic capture, and finalize it on every exit.
