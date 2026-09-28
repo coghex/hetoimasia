@@ -93,6 +93,7 @@ test-suite integration-tests
     hs-source-dirs: test
     other-modules:
         Test.GPU.Vulkan.GLFW.Controller
+        Test.GPU.Vulkan.GLFW.Loop
         Test.GPU.Vulkan.GLFW.StandIn
     ghc-options: -threaded -rtsopts
     build-depends:

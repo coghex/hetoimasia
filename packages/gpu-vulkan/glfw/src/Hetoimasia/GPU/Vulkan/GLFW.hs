@@ -105,12 +105,10 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , FrameStorageRefused (..)
   ) where
 
-import Control.Concurrent.STM (atomically)
 import Hetoimasia.Foundation.Log (Logger)
-import Hetoimasia.Foundation.Messaging.Payload (Prepared)
 import Hetoimasia.GLFW.Vulkan (LoaderIntegration, allocLoaderSession, requiredInstanceExtensions)
 import Hetoimasia.GLFW.Window (WindowId)
-import Hetoimasia.Runtime.GLFW (EventAdmission, GraphicsService, ScenePublication, ownerHandoff, publishOwnerScene)
+import Hetoimasia.Runtime.GLFW (EventAdmission, GraphicsService)
 import Hetoimasia.GPU.Model.Identity (TargetClass)
 import Hetoimasia.GPU.Vulkan.Diagnostics (DiagnosticVerdict)
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Bridge (vulkanSurfaceBridge)
@@ -156,7 +154,7 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , withVulkanOwnerHostOver
   )
 import qualified Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller as Controller
-import Hetoimasia.GPU.Vulkan.GLFW.Internal.Loop (runVulkanOwnerLoop)
+import Hetoimasia.GPU.Vulkan.GLFW.Internal.Loop (publishVulkanScene, runVulkanOwnerLoop)
 import Hetoimasia.GPU.Vulkan.Native.Frames.Vulkan (vulkanFrameOps)
 import Hetoimasia.GPU.Vulkan.Native.Recording (ClearColor (..))
 import Hetoimasia.GPU.Vulkan.Native.Recording.Vulkan (vulkanRecordingOps)
@@ -200,10 +198,3 @@ replaceVulkanSurfaces host = Controller.replaceVulkanSurfaces (vulkanController 
 announceVulkanTarget ∷ VulkanHost scene → GraphicsService → IO EventAdmission
 announceVulkanTarget host = Controller.announceVulkanTarget (vulkanController host) (vulkanGraphicsOwner host)
 
--- | Publish the scene this host's owner renders, from any application thread.
--- It is a latest-value snapshot: a newer publication replaces one the owner
--- has not rendered, a publisher never waits, and a main thread stalled in a
--- platform modal loop keeps no other thread from publishing. A newer scene is
--- rendered to every eligible target.
-publishVulkanScene ∷ VulkanHost scene → Prepared scene → IO ScenePublication
-publishVulkanScene host scene = atomically (publishOwnerScene (ownerHandoff (vulkanGraphicsOwner host)) scene)

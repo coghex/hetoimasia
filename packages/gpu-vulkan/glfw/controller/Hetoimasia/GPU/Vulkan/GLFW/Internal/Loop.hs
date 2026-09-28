@@ -50,6 +50,7 @@
 -- slot the application captured itself would never reach the owner.
 module Hetoimasia.GPU.Vulkan.GLFW.Internal.Loop
   ( runVulkanOwnerLoop
+  , publishVulkanScene
   , vulkanLoopHooks
   , LoopAdapter
   , newLoopAdapter
@@ -64,7 +65,7 @@ import qualified Data.Map.Strict as Map
 import Data.Maybe (catMaybes)
 import Numeric.Natural (Natural)
 
-import Hetoimasia.Foundation.Messaging.Payload (prepare, preparedValue)
+import Hetoimasia.Foundation.Messaging.Payload (Prepared, prepare, preparedValue)
 import Hetoimasia.Foundation.Messaging.Snapshot (Publication (..), observedValue, readSnapshot)
 import Hetoimasia.Foundation.Time (Instant, deadlineReached)
 import Hetoimasia.GLFW.Command (clientObservations)
@@ -75,6 +76,7 @@ import Hetoimasia.Runtime.GLFW
   ( AttachmentId
   , OwnerDemand (..)
   , OwnerStatus (..)
+  , ScenePublication
   , ScheduledHooks (..)
   , ScheduledStep (..)
   , ScheduledTurn (..)
@@ -86,6 +88,7 @@ import Hetoimasia.Runtime.GLFW
   , ownerHandoff
   , publishGraphicsObservation
   , publishOwnerDemand
+  , publishOwnerScene
   , readOwnerDemandTaken
   , readOwnerStatusNow
   , runScheduledOwnerLoop
@@ -183,3 +186,11 @@ foldOwnerDeadline adapter now schedule = do
       UpdateBy at → UpdateBy (min at due)
       NoUpdateDemand → UpdateBy due
     _ → schedule
+
+-- | Publish the scene this host's owner renders, from any application thread.
+-- It is a latest-value snapshot: a newer publication replaces one the owner
+-- has not rendered, a publisher never waits, and a main thread stalled in a
+-- platform modal loop keeps no other thread from publishing. A newer scene is
+-- rendered to every eligible target.
+publishVulkanScene ∷ VulkanHost scene → Prepared scene → IO ScenePublication
+publishVulkanScene host scene = atomically (publishOwnerScene (ownerHandoff (vulkanGraphicsOwner host)) scene)

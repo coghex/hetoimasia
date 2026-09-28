@@ -49,10 +49,15 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , submissionsComplete
   , presentationsRetire
   , scriptPresentStatus
-  , advanceDuringPresent
+  , slowNativeCalls
+  , holdAcquisitions
+  , stallSwapchain
+  , raiseOnPresent
   , frameEvents
   , fenceQueries
   , presentsOf
+  , awaitPresents
+  , retireNextPresentations
 
     -- * The rig
   , Rig (..)
@@ -63,7 +68,11 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , visibleRigOf
   , scriptedRigOf
   , advanceClock
+  , setClock
   , clockNow
+  , holdPump
+  , pumpHeld
+  , setVisible
   , resizeFramebuffer
   , publishObservation
   , nudgeOwner
@@ -74,6 +83,7 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , creationsBegun
   , runRig
   , runRigCaught
+  , quietLogger
   , pumpUntil
   , handedOver
   , windowsOf
@@ -135,7 +145,7 @@ import Hetoimasia.GLFW.Seam
 import Hetoimasia.GLFW.Vulkan (Replacement (..), replaceWindowSurface, requiredInstanceExtensions)
 import Hetoimasia.Foundation.Messaging.Payload (preparedValue)
 import Hetoimasia.Foundation.Messaging.Snapshot (observedValue, readSnapshot)
-import Hetoimasia.GLFW.Command (WaitedSubmission (..), awaitSubmitWindowCommand, clientObservations, setWindowSizeCommand)
+import Hetoimasia.GLFW.Command (WaitedSubmission (..), awaitSubmitWindowCommand, clientObservations, hideWindowCommand, setWindowSizeCommand, showWindowCommand)
 import Hetoimasia.GLFW.Window (Extent (Extent), WindowConfig, WindowId, hiddenTestWindowConfig, observedRevision)
 import Numeric.Natural (Natural)
 import Hetoimasia.GPU.Model.Budget (defaultBudgetRequest, validateBudgets)
@@ -251,6 +261,8 @@ data Event
   | ImagePresented !Word64 !Word32
     -- ^ A swapchain's image was presented.
   | ImageReleased !Word64 ![Word32]
+  | OwnerTimerArmed
+    -- ^ The owner armed its timer, with a scripted clock.
   deriving (Eq, Show)
 
 -- | Every event, newest first, with the thread that caused it.
@@ -724,8 +736,18 @@ data Rendering = Rendering
   , renderingPresentations ∷ !(TVar Bool)
   , renderingStatus ∷ !(TVar PresentStatus)
   , renderingAdvance ∷ !(TVar (Maybe Integer))
-    -- ^ Milliseconds every presentation moves the scripted clock on, as a
-    -- slow native call would.
+    -- ^ Milliseconds every presentation and every fence query moves the
+    -- scripted clock on, as a slow native call would.
+  , renderingHold ∷ !(TVar (Maybe (TVar Bool)))
+    -- ^ When set, every acquisition holds until the gate opens.
+  , renderingHolding ∷ !(TVar Bool)
+    -- ^ Whether an acquisition is holding now.
+  , renderingStalled ∷ !(TVar (Set Word64))
+    -- ^ Swapchains whose acquisitions always answer not ready.
+  , renderingRaise ∷ !(TVar (Maybe SomeException))
+    -- ^ Raised, once, by the next presentation, after its entry is written.
+  , renderingRetireCount ∷ !(TVar (Maybe Int))
+    -- ^ When set, how many more present fences may answer signalled.
   }
 
 data FenceKind = FenceIdle | FenceSubmission | FencePresent | FenceDone
@@ -742,6 +764,11 @@ newRendering =
     <*> newTVarIO True
     <*> newTVarIO PresentStatusSuccess
     <*> newTVarIO Nothing
+    <*> newTVarIO Nothing
+    <*> newTVarIO False
+    <*> newTVarIO Set.empty
+    <*> newTVarIO Nothing
+    <*> newTVarIO Nothing
 
 -- | Whether a submission's fence answers signalled when it is next asked.
 submissionsComplete ∷ Rig → Bool → IO ()
@@ -755,10 +782,25 @@ presentationsRetire rig = atomically . writeTVar (renderingPresentations (rigRen
 scriptPresentStatus ∷ Rig → PresentStatus → IO ()
 scriptPresentStatus rig = atomically . writeTVar (renderingStatus (rigRendering rig))
 
--- | Have every later presentation move the scripted clock on by this many
--- milliseconds, as a slow call would, or stop doing so.
-advanceDuringPresent ∷ Rig → Maybe Integer → IO ()
-advanceDuringPresent rig = atomically . writeTVar (renderingAdvance (rigRendering rig))
+-- | Have every later presentation and fence query move the scripted clock on
+-- by this many milliseconds, as a slow call would, or stop doing so.
+slowNativeCalls ∷ Rig → Maybe Integer → IO ()
+slowNativeCalls rig = atomically . writeTVar (renderingAdvance (rigRendering rig))
+
+-- | Hold every later acquisition until the gate opens, and answer a
+-- transaction that says whether one is holding now.
+holdAcquisitions ∷ Rig → TVar Bool → IO (STM Bool)
+holdAcquisitions rig gate = do
+  atomically (writeTVar (renderingHold (rigRendering rig)) (Just gate))
+  pure (readTVar (renderingHolding (rigRendering rig)))
+
+-- | Answer not ready to every later acquisition from this swapchain.
+stallSwapchain ∷ Rig → Word64 → IO ()
+stallSwapchain rig swapchain = atomically (modifyTVar' (renderingStalled (rigRendering rig)) (Set.insert swapchain))
+
+-- | Have the next presentation raise this, once, after writing its entry.
+raiseOnPresent ∷ Rig → SomeException → IO ()
+raiseOnPresent rig failure = atomically (writeTVar (renderingRaise (rigRendering rig)) (Just failure))
 
 -- | Every frame event the owner reported, oldest first.
 frameEvents ∷ Rig → IO [FrameEvent]
@@ -772,14 +814,26 @@ fenceQueries rig = length . filter isQuery <$> journal rig
       FenceQueried _ → True
       _ → False
 
--- | How many presentations have been made to targets, by the attachment each
--- frame event names.
+-- | How many presentations have been made to this attachment's target.
 presentsOf ∷ Rig → AttachmentId → IO Int
-presentsOf rig attachment = length . filter presented <$> frameEvents rig
+presentsOf rig = atomically . presentsNow rig
+
+-- | Wait until this attachment's target has had this many presentations.
+awaitPresents ∷ Rig → AttachmentId → Int → IO ()
+awaitPresents rig attachment count = atomically (presentsNow rig attachment >>= check . (>= count))
+
+presentsNow ∷ Rig → AttachmentId → STM Int
+presentsNow rig attachment = length . filter presented <$> readTVar (rigFrameEvents rig)
   where
     presented = \case
       FramePresented at _ _ _ → at == attachment
       _ → False
+
+-- | Let only the next this many present fences asked answer signalled, and no
+-- later one, whatever 'presentationsRetire' says; or, given 'Nothing', every
+-- one 'presentationsRetire' allows.
+retireNextPresentations ∷ Rig → Maybe Int → IO ()
+retireNextPresentations rig = atomically . writeTVar (renderingRetireCount (rigRendering rig))
 
 renderingLayers ∷ Journal → Rendering → Maybe (TVar Instant) → RenderingOps Text Int Word64
 renderingLayers events rendering clock =
@@ -821,14 +875,17 @@ renderingLayers events rendering clock =
         , opsResetFence = \_ handle → fence handle FenceIdle
         , opsFenceSignalled = \_ handle → do
             record events (FenceQueried handle)
+            slow
             atomically $ do
               kind ← Map.lookup handle <$> readTVar (renderingFences rendering)
               submissions ← readTVar (renderingSubmissions rendering)
               presentations ← readTVar (renderingPresentations rendering)
+              counted ← readTVar (renderingRetireCount rendering)
               case kind of
                 Just FenceDone → pure True
                 Just FenceSubmission | submissions → True <$ modifyTVar' (renderingFences rendering) (Map.insert handle FenceDone)
-                Just FencePresent | presentations → do
+                Just FencePresent | presentations && maybe True (> 0) counted → do
+                  writeTVar (renderingRetireCount rendering) (subtract 1 <$> counted)
                   modifyTVar' (renderingFences rendering) (Map.insert handle FenceDone)
                   held ← Map.lookup handle <$> readTVar (renderingPresented rendering)
                   for_ held $ \(swapchain, index) → do
@@ -837,9 +894,16 @@ renderingLayers events rendering clock =
                   pure True
                 _ → pure False
         , opsAcquireImage = \_ swapchain _ → do
+            readTVarIO (renderingHold rendering) >>= \case
+              Nothing → pure ()
+              Just gate → uninterruptibleMask_ $ do
+                atomically (writeTVar (renderingHolding rendering) True)
+                atomically (readTVar gate >>= check)
+                atomically (writeTVar (renderingHolding rendering) False)
             taken ← atomically $ do
               busy ← Map.findWithDefault Set.empty swapchain <$> readTVar (renderingBusy rendering)
-              case [index | index ← [0 .. 2], Set.notMember index busy] of
+              stalled ← Set.member swapchain <$> readTVar (renderingStalled rendering)
+              case [index | not stalled, index ← [0 .. 2], Set.notMember index busy] of
                 index : _ → Just index <$ modifyTVar' (renderingBusy rendering) (Map.insert swapchain (Set.insert index busy))
                 [] → pure Nothing
             case taken of
@@ -858,11 +922,15 @@ renderingLayers events rendering clock =
             fence (presentFence request) FencePresent
             atomically (modifyTVar' (renderingPresented rendering) (Map.insert (presentFence request) (presentSwapchain request, presentIndex request)))
             record events (ImagePresented (presentSwapchain request) (presentIndex request))
-            advance ← readTVarIO (renderingAdvance rendering)
-            for_ ((,) <$> advance <*> clock) $ \(milliseconds, cell) →
-              atomically (modifyTVar' cell (\now → either (const now) id (addDuration now (millisecondsOf milliseconds))))
+            slow
+            atomically (stateTVar (renderingRaise rendering) (\pending → (pending, Nothing))) >>= maybe (pure ()) throwIO
         , opsWaitFence = \_ handle _ → atomically ((== Just FenceDone) . Map.lookup handle <$> readTVar (renderingFences rendering))
         }
+
+    slow = do
+      advance ← readTVarIO (renderingAdvance rendering)
+      for_ ((,) <$> advance <*> clock) $ \(milliseconds, cell) →
+        atomically (modifyTVar' cell (\now → either (const now) id (addDuration now (millisecondsOf milliseconds))))
 
 millisecondsOf ∷ Integer → Duration
 millisecondsOf milliseconds = either (error . show) id (durationFromNanoseconds AllowZero (milliseconds * 1000000))
@@ -904,6 +972,13 @@ data Rig = Rig
     -- timer expires only when it has passed the instant it was armed for.
   , rigArmings ∷ !(TVar [Duration])
     -- ^ Every duration the owner armed its timer for, with a scripted clock.
+  , rigPumpHold ∷ !(TVar Bool)
+    -- ^ While set, the native event wait holds, whatever wakes it, as a
+    -- platform modal loop inside it does.
+  , rigPumpHeld ∷ !(TVar Bool)
+    -- ^ Whether the wait is holding now.
+  , rigVisible ∷ !(TVar Bool)
+    -- ^ What every window's visibility query answers.
   }
 
 -- | Make the capture's sink raise on every record it is given from now on.
@@ -993,12 +1068,44 @@ advanceClock rig milliseconds = case rigClock rig of
   Nothing → throwIO (StandInFailure "the rig has no scripted clock")
   Just cell → atomically (modifyTVar' cell (\now → either (const now) id (addDuration now (millisecondsOf milliseconds))))
 
+-- | Set the scripted clock to this instant, which must not be earlier.
+setClock ∷ Rig → Instant → IO ()
+setClock rig instant = case rigClock rig of
+  Nothing → throwIO (StandInFailure "the rig has no scripted clock")
+  Just cell → atomically (modifyTVar' cell (max instant))
+
 -- | The scripted clock's instant.
 clockNow ∷ Rig → IO Instant
 clockNow rig = maybe (throwIO (StandInFailure "the rig has no scripted clock")) readTVarIO (rigClock rig)
 
+-- | Hold the main thread's next native event wait until 'holdPump' is given
+-- 'False', as a platform modal loop inside the call would; or release it.
+holdPump ∷ Rig → Bool → IO ()
+holdPump rig = atomically . writeTVar (rigPumpHold rig)
+
+-- | Whether the main thread is inside a held wait now.
+pumpHeld ∷ Rig → STM Bool
+pumpHeld = readTVar . rigPumpHeld
+
+-- | Make every window report itself shown or hidden, and show or hide this
+-- one through the host's command port so the owner loop samples it again.
+-- The loop must be turning.
+setVisible ∷ Rig → VulkanHost Scene → WindowId → Bool → IO ()
+setVisible rig host window shown = do
+  atomically (writeTVar (rigVisible rig) shown)
+  awaitSubmitWindowCommand
+    (hostCommandPort (vulkanWindowHost host))
+    [("client", "integration-tests")]
+    ((if shown then showWindowCommand else hideWindowCommand) window)
+    >>= \case
+      WaitAccepted _ → pure ()
+      WaitClosed → throwIO (StandInFailure "the host's command port closed")
+
 newRigClocked ∷ Bool → [WindowConfig] → Maybe (TVar Instant) → IO Rig
 newRigClocked visible windows clock = do
+  pumpHold ← newTVarIO False
+  heldNow ← newTVarIO False
+  visibility ← newTVarIO visible
   framebuffer ← newTVarIO (640, 480)
   nudges ← newTVarIO 0
   events ← newTVarIO []
@@ -1012,6 +1119,12 @@ newRigClocked visible windows clock = do
           -- wait returned at once would keep the main thread spinning through
           -- every wait, which no native session does.
           scriptWaitEvents = \bound _ → do
+            -- A held pump is a modal loop: nothing ends it but the example.
+            held ← readTVarIO pumpHold
+            when held $ do
+              atomically (writeTVar heldNow True)
+              atomically (readTVar pumpHold >>= check . not)
+              atomically (writeTVar heldNow False)
             expired ← registerDelay (max 1 (round (bound * 1e6)))
             atomically $
               (readTVar posts >>= \pending → if pending <= 0 then retry else writeTVar posts (pending - 1))
@@ -1027,7 +1140,7 @@ newRigClocked visible windows clock = do
             record events (WindowGone joined)
         , scriptTerminate = \_ → record events SessionEnded
         , scriptFramebufferSize = \_ → readTVarIO framebuffer
-        , scriptWindowAttribute = \attribute _ → pure (visible && attribute == VisibleAttribute)
+        , scriptWindowAttribute = \attribute _ → (&& attribute == VisibleAttribute) <$> readTVarIO visibility
         }
   native ← Native <$> newTVarIO Map.empty <*> newTVarIO Set.empty <*> newTVarIO 500 <*> newTVarIO Nothing <*> newTVarIO Nothing <*> newTVarIO Set.empty
   bridge ← Bridge <$> newTVarIO Map.empty <*> newTVarIO Nothing <*> newTVarIO 100 <*> newTVarIO []
@@ -1059,6 +1172,9 @@ newRigClocked visible windows clock = do
       , rigFrameEvents = frameLog
       , rigClock = clock
       , rigArmings = armings
+      , rigPumpHold = pumpHold
+      , rigPumpHeld = heldNow
+      , rigVisible = visibility
       }
 
 -- | Run a whole Vulkan graphics host under the application runner, on a bound
@@ -1085,6 +1201,7 @@ runRigHere rig body = do
           owner
             { ownerClockTimer = ownerTimer $ \duration → do
                 atomically (modifyTVar' (rigArmings rig) (<> [duration]))
+                record (rigJournal rig) OwnerTimerArmed
                 start ← readTVarIO cell
                 pure $ case addDuration start duration of
                   Left _ → pure False
