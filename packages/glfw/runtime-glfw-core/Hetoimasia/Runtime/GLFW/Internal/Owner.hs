@@ -1436,6 +1436,11 @@ retireOneTarget owner target state = case targetConstruction state of
   -- a later round, and nothing is recorded meanwhile.
   _ →
     tryWithContext (graphicsPrepareRetirement (ownerOperations (ownerSettings owner)) retiring >>= evaluate) >>= \case
+      -- A cancellation during the preparation is not a failed retirement: the
+      -- preparation disposes of nothing the owner records, so the target
+      -- stays owed and the drain asks again.
+      Left failure@(ExceptionWithContext _ exception)
+        | isAsynchronous exception → rethrowIO failure
       Left failure → do
         atomically
           ( modifyTVar'

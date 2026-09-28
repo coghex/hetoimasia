@@ -173,6 +173,8 @@ spec = describe "GLFW graphics owner" $ do
       (boundedExample testOwedRetirementRetried)
     it "waits in its exit drain for a retirement still owed, and retires the target before the owner"
       (boundedExample testOwedRetirementDrained)
+    it "leaves a retirement owed, not failed, when a cancellation lands in its preparation, and retires it in the drain"
+      (boundedExample testPreparationCancelled)
     it "retires the target of a window closed through its own port, with no detach at all"
       (boundedExample testWindowCloseRetiresTarget)
     it "strands nothing when the host's admission closes during a handover"
@@ -1721,11 +1723,18 @@ testOwedRetirementDrained ∷ IO ()
 testOwedRetirementDrained = do
   rig ← newRig
   asked ← newTVarIO (0 ∷ Int)
+  ownerCell ← newTVarIO Nothing
+  -- Owed while the owner is running — the host's quiescence may begin the
+  -- attachment's retirement while rounds are still being taken — and ready
+  -- only at the drain's second ask, so the drain itself has to wait.
   script (fakePrepare (rigFake rig)) $ \_ → atomically $ do
-    modifyTVar' asked (+ 1)
+    phase ← readTVar ownerCell >>= traverse (fmap statusPhase . readOwnerStatusNow)
+    let draining = phase == Just OwnerRetiring
+    when draining (modifyTVar' asked (+ 1))
     count ← readTVar asked
-    pure (if count > 1 then RetirementReady else RetirementOwed (Text.pack "a present fence is pending"))
+    pure (if draining && count > 1 then RetirementReady else RetirementOwed (Text.pack "a present fence is pending"))
   ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control → do
+    atomically (writeTVar ownerCell (Just owner))
     window ← theWindow host
     _ ← handedOver host owner window
     awaitConstructed rig (Text.pack (show window))
@@ -1748,6 +1757,29 @@ testOwedRetirementDrained = do
   readTVarIO asked `shouldReturn` 2
   armings ← readTVarIO (timerArmings (rigTimer rig))
   armings `shouldSatisfy` (not . null)
+
+-- | A cancellation delivered inside a retirement's preparation ends the
+-- owner's run as any cancellation does, but it is not a failed retirement:
+-- the preparation disposed of nothing, so the drain asks again and retires the
+-- target, once.
+testPreparationCancelled ∷ IO ()
+testPreparationCancelled = do
+  rig ← newRig
+  asked ← newTVarIO (0 ∷ Int)
+  script (fakePrepare (rigFake rig)) $ \_ → do
+    count ← atomically (modifyTVar' asked (+ 1) >> readTVar asked)
+    if count == 1 then throwIO ThreadKilled else pure RetirementReady
+  outcome ← ownedHostCaught (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control → do
+    window ← theWindow host
+    service ← handedOver host owner window
+    awaitStanding owner service `shouldReturn` TargetUsable
+    _ ← releaseGraphicsTarget host owner service
+    atomically (readOwnerTerminalNow owner >>= check . ownerRunEnded)
+  _ ← raisedBy outcome
+  retirements ← readTVarIO (fakeRetirements (rigFake rig))
+  length retirements `shouldBe` 1
+  notes ← journalled (rigJournal rig)
+  ordered notes [TargetRetirement (Text.pack "WindowId 1"), OwnerRetirement, OwnerDestruction]
 
 -- | Wait until the owner has settled into a round it will not leave by itself.
 --

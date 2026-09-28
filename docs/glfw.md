@@ -3986,7 +3986,8 @@ A released target's retirement is performed only once the backend's
 preparation answers ready. Until then it is asked again on each later round —
 at the backend's own next deadline, or when its wake asks — and nothing is
 recorded; a preparation that raised is a failed retirement, and is never
-offered again. The exit drain asks every owed retirement again between waits
+offered again — except a cancellation, which the preparation's answer never
+reached: that ends the run like any other, and the drain asks again. The exit drain asks every owed retirement again between waits
 for the backend's own next deadline — no round runs then, and the backend's
 wake is not read — until each is retired or has failed. No timeout ends that
 wait, because a timeout is not evidence; a cancellation ends it, leaving what
@@ -4285,8 +4286,9 @@ repeated cancellation absorbed by the drain with the target, the owner, its
 destruction, the window and the session still in that order; the D-33 exit
 order; one released target acknowledged while the owner and a second target
 stay live; a released target whose retirement is owed asked again on a later
-round with nothing retired or certified meanwhile, and one still owed at the
-exit asked again in the drain after its deadline, retired before the owner;
+round with nothing retired or certified meanwhile, one still owed at the
+exit asked again in the drain after its deadline, retired before the owner, and
+one whose preparation a cancellation interrupted retired by the drain, once;
 each step handed the demand's and the scene's revisions, two equal demands as
 two, and the demand's publisher told when the owner took it; the main thread's
 bounded housekeeping during the wait, made on the
