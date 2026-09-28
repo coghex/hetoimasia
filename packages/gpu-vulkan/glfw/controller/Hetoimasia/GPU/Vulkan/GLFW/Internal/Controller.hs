@@ -685,6 +685,7 @@ controllerOperations (VulkanController state) renderer =
         seen ← readTVarIO (stateSeen state)
         let moved = any (\(target, current) → Map.lookup target seen /= Just current) (Map.toList observed)
         owed ← generationsOwed state now
+        let targets = [(target, viewTarget view, viewEligibility view == RenderEligible) | (target, view) ← constructed]
         plan ←
           planStep
             (stateRendering state)
@@ -693,7 +694,7 @@ controllerOperations (VulkanController state) renderer =
               , inputsSceneRevision = stepSceneRevision step
               , inputsDemand = stepDemand step
               , inputsDemandRevision = stepDemandRevision step
-              , inputsTargets = [(target, viewTarget view, viewEligibility view == RenderEligible) | (target, view) ← constructed]
+              , inputsTargets = targets
               }
         summary ←
           if moved || owed || planPolled plan || not (null (planDue plan))
@@ -701,7 +702,10 @@ controllerOperations (VulkanController state) renderer =
               atomically (writeTVar (stateSeen state) observed)
               stepGenerations (stateGenerations state) now geometries
             else pure (StepSummary [] [] False [])
-        presented ← renderDue (stateRendering state) renderer now (stepScene step) (stepSceneRevision step) (planDue plan)
+        -- A replacement the generations' step just published is asked for a
+        -- frame in this step, not left for a later publication to notice.
+        published ← requestPublished (stateRendering state) targets (planDue plan)
+        presented ← renderDue (stateRendering state) renderer now (stepScene step) (stepSceneRevision step) (planDue plan <> published)
         asked ← askReplacements state (summarySurfacesWanted summary)
         replaced ← settleReplacements state now (stepTargets step)
         noticeUnavailable state

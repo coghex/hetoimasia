@@ -18,7 +18,7 @@ import Control.Exception (Exception (..), SomeException, throwIO, toException)
 import Control.Monad (forM_, unless, void, when)
 import Data.List (isSubsequenceOf)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (isJust)
+import Data.Maybe (isJust, isNothing)
 import Data.Word (Word32)
 import qualified Data.Text as Text
 import System.Timeout (timeout)
@@ -29,6 +29,7 @@ import Hetoimasia.GLFW.Command (WaitedSubmission (..), awaitCompletion, awaitSub
 import Hetoimasia.GLFW.Demand (deadlineDemand, immediateDemand, publishDemand)
 import Hetoimasia.GLFW.Window (Extent (..), WindowId)
 import Hetoimasia.GPU.Model (TargetPhase (..), TargetView (..), targetView)
+import Hetoimasia.GPU.Model.Budget (BudgetRequest (..), defaultBudgetRequest)
 import Hetoimasia.GPU.Model.Identity (TargetClass (..))
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Loop (foldOwnerDeadline, newLoopAdapter, publishVulkanScene, runVulkanOwnerLoop)
@@ -84,6 +85,8 @@ spec = describe "Vulkan loop adapter" $ do
     it "keeps presenting to one target while another's acquisitions cannot be answered" (bounded testBusyTargetFairness)
     it "tries a frame the renderer refused again at the backoff's first interval, not on every round" (bounded testRefusedFramePaced)
     it "lets a fresh request supersede a retry still pending, rendering at once" (bounded testFreshRequestSupersedesRetry)
+    it "asks a frame of a generation a target moved to once, so an unrelated wake does not retry it early" (bounded testGenerationAskedOnce)
+    it "renders a quiet target's replacement published in the step that disposed of its only generation, with nothing published" (bounded testQuietReplacementRendered)
 
   describe "a stalled main thread" $ do
     it "keeps the owner rendering while the native event call is held, and serves a window command once it returns" (bounded testStalledMainThread)
@@ -818,6 +821,83 @@ testFreshRequestSupersedesRetry = do
     after ← presentsOf rig (graphicsAttachment service)
     letExitFinish rig
     pure (before, after)
+  after `shouldBe` before + 1
+
+-- | A resize moves a target that has presented to a new generation, and it
+-- is asked a frame of it once. The renderer refuses that frame, leaving a
+-- retry at the backoff's first interval: an unrelated early wake, with the
+-- scripted clock still, makes no second attempt, and the retry comes when the
+-- clock reaches it.
+testGenerationAskedOnce ∷ IO ()
+testGenerationAskedOnce = do
+  rig ← scriptedRigOf 1
+  (before, early, retried) ← runRig rig $ \host control → do
+    [window] ← windowsOf host
+    _ ← firstFrame rig host control window
+    let owner = vulkanGraphicsOwner host
+    built ← swapchainsCreated rig
+    refuseFrames rig True
+    resizeFramebuffer rig host window (800, 600)
+    -- The move is coalesced for its period: the clock moves a millisecond a
+    -- turn until the replacement is built and its frame refused.
+    composedUntil
+      rig
+      host
+      control
+      "the new generation's refused frame"
+      (\_ → advanceClock rig 1)
+      ((&&) . (> built) <$> swapchainsCreated rig <*> ((>= 1) <$> framesAbandoned rig))
+    before ← framesAbandoned rig
+    -- The owner settles on a deadline ahead of the still clock: its retry. One
+    -- that asked again every round would never settle, so this is bounded.
+    settled ← clockNow rig >>= timeout (5 * 1000 * 1000) . awaitDeadlineAfter host
+    when (isNothing settled) (failWith "the owner never settled on a deadline ahead of the clock")
+    status ← atomically (readOwnerStatusNow owner)
+    -- An unrelated wake: a publication of no demand at all.
+    nothing ← prepare (OwnerDemand False Nothing)
+    _ ← atomically (publishOwnerDemand (ownerHandoff owner) nothing)
+    _ ← atomically (awaitOwnerRound owner (statusRounds status))
+    early ← framesAbandoned rig
+    advanceClock rig 5
+    atomically (length . filter abandoned <$> readTVar (rigFrameEvents rig) >>= check . (> early))
+    retried ← framesAbandoned rig
+    refuseFrames rig False
+    letExitFinish rig
+    pure (before, early, retried)
+  early `shouldBe` before
+  retried `shouldBe` before + 1
+  where
+    abandoned = \case
+      FrameAbandoned {} → True
+      _ → False
+
+-- | With one live generation, a quiet target's resize retires its only
+-- generation on its own, and the replacement is built and published in a step
+-- that leaves nothing owed. The owner asks a frame of it in that same step:
+-- the replacement is rendered with nothing published at all.
+testQuietReplacementRendered ∷ IO ()
+testQuietReplacementRendered = do
+  base ← scriptedRigOf 1
+  let rig = base {rigBudgets = defaultBudgetRequest {requestedGenerations = 1}}
+  (builtBefore, builtAfter, before, after) ← runRig rig $ \host control → do
+    [window] ← windowsOf host
+    service ← firstFrame rig host control window
+    builtBefore ← swapchainsCreated rig
+    before ← presentsOf rig (graphicsAttachment service)
+    resizeFramebuffer rig host window (800, 600)
+    turns ← newTVarIO (0 ∷ Int)
+    composedUntil
+      rig
+      host
+      control
+      "the replacement's frame"
+      (\_ → advanceClock rig 1 >> atomically (modifyTVar' turns (+ 1)))
+      ((||) . (> before) <$> presentsOf rig (graphicsAttachment service) <*> ((>= 400) <$> readTVarIO turns))
+    builtAfter ← swapchainsCreated rig
+    after ← presentsOf rig (graphicsAttachment service)
+    letExitFinish rig
+    pure (builtBefore, builtAfter, before, after)
+  builtAfter `shouldBe` builtBefore + 1
   after `shouldBe` before + 1
 
 testCloseWhileSaturated ∷ IO ()

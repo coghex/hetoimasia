@@ -1624,7 +1624,13 @@ for it — when
   the latest scene, whichever application thread published it (D-31); or
 - a target that has presented before can no longer be showing the latest
   scene: its active generation is not the one its last presentation went to,
-  or it has become eligible again after a suspension.
+  or it has become eligible again after a suspension. A generation it moved to
+  is asked for once, however many rounds pass before a frame of it is
+  presented, so a frame refused meanwhile keeps its retry's pacing. And since
+  the step plans its frames before the generations' step, a replacement that
+  step publishes — a quiet target's, whose one allowed generation was disposed
+  of in that same step with nothing left owed — is asked for then and offered a
+  frame in the same step.
 
 Nothing else asks. A target nobody asked a frame of is never rendered to,
 however its generations change, so a host whose application publishes neither
@@ -2146,7 +2152,10 @@ presenting five more frames while another's acquisitions all answer not ready;
 a renderer refusing every frame, with the owner's deadline one backoff interval
 ahead of a still clock and no second attempt until the clock reaches it; a
 fresh request, made while such a retry is pending, rendered at once with the
-clock still;
+clock still; a frame of a new generation refused after a resize, with an
+unrelated wake making no second attempt before the retry's interval; and, with
+one live generation, a quiet target's resize whose replacement is rendered with
+nothing published;
 the owner presenting a scene published from another thread while the main
 thread is held inside its native event call, and a window command submitted
 then served only once the call returns; a live resize under the same held call,

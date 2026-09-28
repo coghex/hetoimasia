@@ -153,7 +153,7 @@ import Hetoimasia.Foundation.Messaging.Snapshot (observedValue, readSnapshot)
 import Hetoimasia.GLFW.Command (WaitedSubmission (..), awaitSubmitWindowCommand, clientObservations, hideWindowCommand, setWindowSizeCommand, showWindowCommand)
 import Hetoimasia.GLFW.Window (Extent (Extent), WindowConfig, WindowId, hiddenTestWindowConfig, observedRevision)
 import Numeric.Natural (Natural)
-import Hetoimasia.GPU.Model.Budget (defaultBudgetRequest, validateBudgets)
+import Hetoimasia.GPU.Model.Budget (BudgetRequest (..), defaultBudgetRequest, validateBudgets)
 import Hetoimasia.GPU.Model.Identity (TargetClass)
 import Hetoimasia.GPU.Vulkan.Diagnostics (CaptureConfig, DiagnosticCapture, DiagnosticVerdict, Quiesced, afterLastCallback, captureSinkFailure, captureUserData, defaultCaptureConfig, diagnosticVerdictInContext, requestDrain)
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Bridge (Created (..), Discharged (..), LeaseAnswer (..), SurfaceBridge (..))
@@ -1037,6 +1037,8 @@ data Rig = Rig
     -- ^ Whether the wait is holding now.
   , rigVisible ∷ !(TVar Bool)
     -- ^ What every window's visibility query answers.
+  , rigBudgets ∷ !BudgetRequest
+    -- ^ The model's budgets, when an example narrows them.
   }
 
 -- | Make the capture's sink raise on every record it is given from now on.
@@ -1235,6 +1237,7 @@ newRigClocked visible windows clock = do
       , rigPumpHold = pumpHold
       , rigPumpHeld = heldNow
       , rigVisible = visibility
+      , rigBudgets = defaultBudgetRequest
       }
 
 -- | Run a whole Vulkan graphics host under the application runner, on a bound
@@ -1250,7 +1253,7 @@ runRigHere ∷ Rig → (VulkanHost Scene → RuntimeControl → IO a) → IO a
 runRigHere rig body = do
   integration ← seamIntegration (rigSeam rig) defaultIntegrationScript
   scene ← prepare ()
-  budgets ← either (throwIO . StandInFailure . Text.pack . show) pure (validateBudgets defaultBudgetRequest)
+  budgets ← either (throwIO . StandInFailure . Text.pack . show) pure (validateBudgets (rigBudgets rig))
   let base = vulkanHostConfig (rigHostConfig rig) (rigCapture rig) budgets scene
       config =
         base

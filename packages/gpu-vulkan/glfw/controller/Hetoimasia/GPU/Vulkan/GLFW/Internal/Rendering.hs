@@ -97,6 +97,7 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
   , StepInputs (..)
   , StepPlan (..)
   , planStep
+  , requestPublished
   , renderDue
   , renderingDeadline
   , pollDue
@@ -297,10 +298,21 @@ data TargetRendering = TargetRendering
     -- ^ The latest demand publication a step has considered for it.
   , targetSceneSeen ∷ !Natural
     -- ^ The latest scene publication a step has considered for it.
+  , targetAsked ∷ !(Maybe GenerationId)
+    -- ^ The active generation when it was last asked for a frame: a
+    -- generation it moved to is one request, however many rounds pass before
+    -- a frame of it is presented.
   }
 
 freshTarget ∷ TargetRendering
-freshTarget = TargetRendering [] Nothing Nothing False False 0 0
+freshTarget = TargetRendering [] Nothing Nothing False False 0 0 Nothing
+
+-- | Whether a target that has presented before now has an active generation
+-- it neither presented to nor was asked a frame of since.
+movedTo ∷ TargetRendering → Maybe TargetGenerationsView → Bool
+movedTo record view = case view >>= viewActive of
+  Nothing → False
+  active → active /= targetShown record && active /= targetAsked record
 
 -- | The rendering of one graphics session.
 data Rendering q inst msgr phys dev cmd = Rendering
@@ -405,9 +417,7 @@ planStep rendering inputs = do
               || inputsSceneRevision inputs > targetSceneSeen record
               || ( isJust (targetShown record)
                      && eligible
-                     && ( not (targetEligible record)
-                            || maybe False (\view → viewActive view /= targetShown record && isJust (viewActive view)) (lookup target views >>= id)
-                        )
+                     && (not (targetEligible record) || movedTo record (lookup target views >>= id))
                  )
           ]
     for_ wanted $ \target →
@@ -427,6 +437,7 @@ planStep rendering inputs = do
                           , targetDemandSeen = inputsDemandRevision inputs
                           , targetSceneSeen = inputsSceneRevision inputs
                           , targetRetryAt = if target `elem` wanted then Nothing else targetRetryAt record
+                          , targetAsked = if target `elem` wanted then (lookup target views >>= id) >>= viewActive else targetAsked record
                           }
                     )
                   . maybe freshTarget id
@@ -472,6 +483,39 @@ planStep rendering inputs = do
       case ahead of
         Just at | deadlineReached now at, not (null (inputsTargets inputs)) → True <$ writeTVar (renderingDemandAt rendering) Nothing
         _ → pure False
+
+-- | After the generations' step: ask a frame of every target that has
+-- presented before and whose active generation that step published, beyond
+-- those already due, and answer them to be offered one this same step. A
+-- quiet target's replacement — the old generation disposed of and the new one
+-- published in one step, with nothing left owed — would otherwise wait for an
+-- unrelated publication, since the plan was made before the step.
+requestPublished
+  ∷ Rendering q inst msgr phys dev cmd
+  → [(TargetId, AttachmentId, Bool)]
+  → [(TargetId, AttachmentId)]
+  → IO [(TargetId, AttachmentId)]
+requestPublished rendering targets due = do
+  views ← atomically (mapM (\(target, _, _) → (,) target <$> readTargetGenerations (renderingGenerations rendering) target) targets)
+  atomically $ do
+    held ← readTVar (renderingTargets rendering)
+    let moved =
+          [ (target, attachment)
+          | (target, attachment, eligible) ← targets
+          , target `notElem` map fst due
+          , let record = Map.findWithDefault freshTarget target held
+          , not (targetClosing record)
+          , isJust (targetShown record)
+          , eligible
+          , movedTo record (lookup target views >>= id)
+          ]
+    for_ moved $ \(target, _) → do
+      stateRootsModel (renderingRoots rendering) $ \model → case requestRender target model of
+        Admitted next → ((), next)
+        _ → ((), model)
+      editTarget rendering target $ \record →
+        record {targetRetryAt = Nothing, targetAsked = (lookup target views >>= id) >>= viewActive}
+    pure moved
 
 -- | Whether the model's own schedule says a completion poll is due now.
 pollDue ∷ Instant → GpuModel → Bool
