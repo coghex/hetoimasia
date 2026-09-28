@@ -321,15 +321,20 @@ Guide is advisory and does not replace Kanban approval or project-review records
   [glfw.md](docs/glfw.md#the-supervised-graphics-owner)), with its backend
   operations injected and proved through fakes; VK-7/#219 supplies the Vulkan
   ones. VK-16/#232 measured the Cocoa progress
-  ([verdict](docs/graphics_owner_interaction_verdict.md), 2026-09-28): during a
-  13.03 s menu block the owner presented and observed 776 present fences at
-  display rate, but during a 23.62 s live resize it rendered nothing for
-  15.44 s, because P-15's 16 ms settling period outlasts Cocoa's ~8.5 ms
-  framebuffer changes and the frames layer acquires nothing from a settling
-  target. That D-29 gap is returned to the owner (keep presenting the
-  suboptimal generation, rebuild unsettled, adapt the period, or accept it); the
-  capabilities extent path was not shown insufficient. The owner removes the
-  stale or stretched surface — during a menu, not yet during a live resize —
+  ([verdict](docs/graphics_owner_interaction_verdict.md), 2026-09-28). Its
+  first session found a live resize starving the owner for 15.44 s: P-15's
+  16 ms quiet period outlasted Cocoa's ~8.5 ms framebuffer changes, and the
+  frames acquired nothing from a settling target. The owner then chose the
+  surveyed engines' approach: a move is coalesced for 16 ms from its first
+  sighting and built from the newest extent, and the active generation keeps
+  presenting while a replacement waits (P-15 amended). That needed MoltenVK
+  1.4.2, since 1.4.0 sets the drawable to 1x1 when a swapchain is recreated
+  over an in-flight presentation, which spent the required target's recovery.
+  The pin moved, a CI-image requalification. Under both, the owner presented
+  at display rate through a 14.55 s live resize (506 generations, longest gap
+  19 ms) and a 23.47 s menu block. The owner removes the
+  stale or stretched surface during both modal loops (visibility is
+  testimony, not evidence), but
   not the stall: window commands and observations
   still wait for the pump, and a rendered latest snapshot does not mean
   gameplay or input continued. The [verdict](docs/owner_loop_interaction_verdict.md) is historical

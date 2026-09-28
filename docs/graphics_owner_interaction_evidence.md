@@ -1,11 +1,14 @@
-# Graphics-owner interaction probe: the retained records
+# Graphics-owner interaction probe: the first session's records
 
-This is the timestamped evidence behind
-[the graphics-owner interaction verdict](graphics_owner_interaction_verdict.md).
-Every number that verdict states about a block of the main thread's native
-event call, the callbacks delivered inside it, and the present requests,
-returns and present-fence completions the graphics owner made meanwhile is
-checkable here, against the records the probe actually produced.
+This is the timestamped evidence behind the first session in
+[the graphics-owner interaction verdict](graphics_owner_interaction_verdict.md#the-first-session):
+the one run under P-15's original settling rule, whose live resize starved the
+graphics owner for 15.44 s. The verdict's current measurement is in
+[the live-resize records](graphics_owner_interaction_evidence_resize.md). Every
+number the verdict states about this session's blocks of the main thread's
+native event call, the callbacks delivered inside them, and the present
+requests, returns and present-fence completions the graphics owner made
+meanwhile is checkable here, against the records the probe actually produced.
 
 It is Markdown, and the records are inside fenced blocks, for the reason
 [RR-4's records](owner_loop_interaction_evidence.md) are: a tracked
