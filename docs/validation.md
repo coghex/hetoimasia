@@ -44,7 +44,9 @@ python3 tools/validation/plan.py --catalog-check
 `--head`; see [Running validation on GitHub](#running-validation-on-github).
 
 Every planner run validates the catalog first and exits non-zero with a specific
-diagnostic naming the offending group before producing any plan.
+diagnostic naming the offending group before producing any plan. Only
+[the MEMORY.md rule](#the-memorymd-rule) is decided earlier, from the event and
+the range alone.
 
 The catalog is read from the **head revision** when planning, so a plan never
 depends on uncommitted working-tree contents. `--catalog-check` has no revision
