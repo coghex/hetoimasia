@@ -58,6 +58,7 @@ import Test.GPU.Vulkan.Native.Consent (Consent, Refusal, readConsent, refusalMes
 import Test.GPU.Vulkan.Native.Environment (establishEnvironment)
 import Test.GPU.Vulkan.Native.Fixture (SharedReport (..), ThreadCheck (..), runShared)
 import Test.GPU.Vulkan.Native.Gate (newGate, refusals)
+import Test.GPU.Vulkan.Native.Interaction (interactionProbeFlag, runInteractionProbe)
 import Test.GPU.Vulkan.Native.Private (ChildRun (..), privateRootsFlag, runScenario, scenarioNames)
 import qualified Test.GPU.Vulkan.Native.Spec as Native
 import Test.Vulkan.Proof.Roots (NativeCall (..))
@@ -70,6 +71,7 @@ main = do
   consent ← readConsent
   getArgs >>= \case
     [flag, scenario] | flag == privateRootsFlag → runScenario consent scenario
+    [flag] | flag == interactionProbeFlag → runInteractionProbe consent
     arguments
       | completeFlag `elem` arguments && arguments /= [completeFlag] → do
           hPutStrLn stderr ("vulkan-native-tests: " <> completeFlag <> " runs the whole profile and takes no other argument")

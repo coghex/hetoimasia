@@ -3,9 +3,10 @@
 -- The first two groups need no consent and enter no session: the consent
 -- rules themselves, and the migrated proof's release, construction,
 -- publication and loader-selection decisions over stand-in native layers.
--- The last two are native: the shared roots, and the cases that need roots of
--- their own in a child process. Each native example asks the consent gate
--- before its body runs.
+-- The next two are native: the shared roots, and the cases that need roots of
+-- their own in a child process. The last is VK-16's graphics-owner interaction
+-- probe, pending unless it is activated. Each native example asks the consent
+-- gate before its body runs.
 module Test.GPU.Vulkan.Native.Spec (spec) where
 
 import Data.IORef (IORef)
@@ -14,6 +15,7 @@ import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.GPU.Vulkan.Native.Consent (Consent (..), Refusal (..), consentFrom)
 import Test.GPU.Vulkan.Native.Fixture (Fixture)
 import Test.GPU.Vulkan.Native.Gate (Gate)
+import qualified Test.GPU.Vulkan.Native.Interaction as Interaction
 import Test.GPU.Vulkan.Native.Private (ChildRun)
 import qualified Test.GPU.Vulkan.Native.Private as Private
 import qualified Test.GPU.Vulkan.Native.Shared as Shared
@@ -32,6 +34,7 @@ spec gate fixture timings = describe "Vulkan native" $ do
     Loader.spec
   Shared.spec fixture
   Private.spec gate timings
+  Interaction.spec gate
 
 -- | The consent rules, read from a given environment rather than this
 -- process's, so they are checked without a session.
