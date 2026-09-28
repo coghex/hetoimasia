@@ -239,6 +239,22 @@ spec = describe "Generations" $ do
       atomically (generationsDeadline (rigGenerations rig)) >>= (`shouldSatisfy` not . immediate)
       length <$> created rig `shouldReturn` 2
 
+    it "moves the model's idle backoff on once per step while a retired generation stays held" $ do
+      rig ← newRig
+      stepAt rig 0 (seen 640 480)
+      [first] ← activeGenerations rig
+      _ ← held rig first
+      -- The replacement at 36 is new work: the schedule starts again there.
+      resize rig 20 800 600
+      created rig `shouldReturn` [(640, 480), (800, 600)]
+      standingOf rig first `shouldReturn` Just GenerationRetiredHeld
+      atomically (generationsDeadline (rigGenerations rig)) `shouldReturn` Just (Right (at 41))
+      -- Each step at its deadline is one poll: 5, 10, 20 ms, not 5, 20, 80.
+      stepAt rig 41 (seen 800 600)
+      atomically (generationsDeadline (rigGenerations rig)) `shouldReturn` Just (Right (at 51))
+      stepAt rig 51 (seen 800 600)
+      atomically (generationsDeadline (rigGenerations rig)) `shouldReturn` Just (Right (at 71))
+
     it "settles a moved observation before an out-of-date result's recovery rebuild, and builds the newest extent as a resize" $ do
       rig ← newRig
       stepAt rig 0 (seen 640 480)

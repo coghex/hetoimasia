@@ -91,6 +91,27 @@ spec = describe "owner progress" $ do
     let (served, _) = runProgressTurn silentEvidence (atMilliseconds 0) demanded
     nextDeadline served `shouldBe` TurnNow
 
+  it "answers the obligations' own deadline apart from render demand" $ do
+    model ← freshModelWith defaultBudgetRequest {requestedFrameSlots = 2}
+    (active, target, _) ← activeTarget 2 model
+    (loaded, _) ← enqueueFrames target 1 active
+    let (polled, _) = runProgressTurn silentEvidence (atMilliseconds 0) loaded
+    demanded ← admitted_ "requesting a render" (requestRender target polled)
+
+    -- New demand restarts the schedule, so the pending presentation is polled
+    -- now too. Once a turn has anchored the next poll, render demand still
+    -- makes a turn owed now, and it is no part of the obligations' answer.
+    progressDeadline demanded `shouldBe` TurnNow
+    let (served, _) = runProgressTurn silentEvidence (atMilliseconds 1) demanded
+    nextDeadline served `shouldBe` TurnNow
+    progressDeadline served `shouldBe` TurnAt (atMilliseconds 6)
+
+    -- With nothing pending there is nothing to poll, whatever is wanted.
+    (quiet, other, _) ← activeTarget 2 model
+    wanted ← admitted_ "requesting a render" (requestRender other quiet)
+    nextDeadline wanted `shouldBe` TurnNow
+    progressDeadline wanted `shouldBe` NoTurnNeeded
+
   it "restarts the whole schedule after a turn that made progress, not just its first step" $ do
     model ← freshModelWith defaultBudgetRequest {requestedFrameSlots = 4}
     (active, target, _) ← activeTarget 4 model

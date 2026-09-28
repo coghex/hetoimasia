@@ -90,6 +90,7 @@ module Hetoimasia.GPU.Model.Internal.State
   , NextTurn (..)
   , runProgressTurn
   , nextDeadline
+  , progressDeadline
 
     -- * Recovery
   , RecoveryAnswer (..)
@@ -2565,14 +2566,28 @@ data NextTurn
 -- away each time it happened.
 --
 -- A target with render demand that is not suspended asks for an opportunity now.
--- Otherwise it is the earliest of the instants the model is committed to: the
--- poll the last turn anchored, if any obligation is pending — a suspended target
--- keeps its retirement demand here even though it contributes no render deadline
--- — and every absolute recovery deadline. With nothing pending and nothing
--- scheduled there is nothing to wait for.
+-- Otherwise it is 'progressDeadline'.
 nextDeadline ∷ GpuModel → NextTurn
 nextDeadline model
-  | renderDemand = TurnNow
+  | workRenderDemand (work model) > 0 = TurnNow
+  | otherwise = progressDeadline model
+
+-- | When the next owner turn is due for the obligations alone, leaving render
+-- demand out: the earliest of the instants the model is committed to — the
+-- poll the last turn anchored, if any obligation is pending, and every absolute
+-- recovery deadline — or now, when something scheduled since the last turn
+-- carried no clock reading. A suspended target keeps its retirement demand here
+-- even though it contributes no render deadline. With nothing pending and
+-- nothing scheduled there is nothing to wait for.
+--
+-- It is the answer an owner that paces its own rendering reads. Render demand
+-- in 'nextDeadline' says a frame is wanted now; it does not say one can be made
+-- now — every image of the swapchain may be in the presentation engine's hands
+-- — so an owner that retries an acquisition later asks this for everything
+-- else, and would otherwise be told to take a turn now for as long as the frame
+-- it cannot yet acquire is wanted. Like 'nextDeadline', it takes no instant.
+progressDeadline ∷ GpuModel → NextTurn
+progressDeadline model
   | immediate = TurnNow
   -- The earliest representable instant wins. An overflow is reported only when
   -- there is no representable instant at all, because a deadline that is both
@@ -2582,7 +2597,6 @@ nextDeadline model
   | any isLeft results = TurnUnschedulable
   | otherwise = NoTurnNeeded
   where
-    renderDemand = workRenderDemand summary > 0
     summary = work model
     pollable = pollableWork summary
     immediate = pollable > 0 && backoffDueAt (gpuBackoff model) == DueImmediately
@@ -2594,7 +2608,6 @@ nextDeadline model
           DueImmediately → []
           DueAt at → [Right at]
           DueUnschedulable → [Left TimeOverflow]
-
 
 -- | Every absolute instant a target's recovery accounting has committed to: when
 -- its next construction attempt may begin, and when a healthy period that has
