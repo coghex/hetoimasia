@@ -13,6 +13,7 @@ import qualified DismissalStep
 import qualified Execution
 import qualified FlakeLab
 import qualified Packaging
+import qualified PlanStep
 import qualified Reuse
 import qualified ReviewGate
 import qualified ReviewReplay
@@ -75,6 +76,7 @@ main = hspec $ do
         repoGit repo (primary repo) ["rev-parse", "origin/master"] `shouldReturn` before
 
   Validation.spec
+  PlanStep.spec
   Execution.spec
   FlakeLab.spec
   Reuse.spec

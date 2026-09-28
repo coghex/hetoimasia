@@ -131,6 +131,9 @@ jobs:
       - name: Resolve the plan
         id: resolve
         env:
+          # Through the environment rather than interpolated, so this body runs
+          # as plain Bash wherever an example extracts it.
+          EVENT_NAME: ${{ github.event_name }}
           BASE: ${{ steps.range.outputs.base }}
           HEAD: ${{ steps.range.outputs.head }}
           CANDIDATE: ${{ github.sha }}
@@ -145,6 +148,10 @@ jobs:
           # planner reads the candidate's image descriptor without pulling the
           # image, and refuses one that no longer describes the candidate.
           arguments=(--base "$BASE" --head "$HEAD" --candidate "$CANDIDATE" --json)
+          # The event decides whether the contribution rules apply: a pull
+          # request's fork-point range is held to them whatever its request
+          # says, and a push, which has already landed, never is.
+          arguments+=(--event "$EVENT_NAME")
           arguments+=(--toolchain "ghc=$GHC_VERSION" --toolchain "cabal=$CABAL_VERSION")
           arguments+=(--runner-os "$WORKER_OS")
           # Every worker, the runner classes it provides, and the groups it owns,
@@ -155,7 +162,7 @@ jobs:
           arguments+=(--worker "haskell-workflow=cpu:test.workflow")
           arguments+=(--worker "glfw-native=display:test.glfw-native,test.glfw-wayland")
           arguments+=(--worker "vulkan=cpu+display:test.vulkan-headless,test.vulkan-native")
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
+          if [ "$EVENT_NAME" = "pull_request" ]; then
             # A push carries no pull-request body, so it carries no request.
             arguments+=(--request-file request.txt)
           fi

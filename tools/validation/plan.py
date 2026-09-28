@@ -975,6 +975,40 @@ def changed_paths(root: str, base: GitTree, head: GitTree) -> list[dict]:
 
 
 # --------------------------------------------------------------------------
+# Contribution rules
+#
+# Selection never refuses a change for what it touches; these rules do, and
+# only for a pull request. A push has already landed — a documentation landing
+# through `tools/docs_land.sh`, or a pull request's merge commit — so failing it
+# would report a verdict nobody can act on. The rules have no override: no
+# request entry, label, or environment variable reaches them.
+
+MEMORY_FILE = "MEMORY.md"
+
+
+def memory_rule(changes: list[dict]) -> str | None:
+    """Refuse a pull request that changes the root MEMORY.md beside anything but Markdown.
+
+    Both endpoints of a rename are in ``changes``, so renaming MEMORY.md away,
+    renaming another file onto it, and renaming it to a path that is not
+    Markdown all count as changing it.
+    """
+    paths = [change["path"] for change in changes]
+    if MEMORY_FILE not in paths:
+        return None
+    others = [path for path in paths if not path.endswith(".md")]
+    if not others:
+        return None
+    return (
+        f"the MEMORY.md rule refuses this pull request: it changes {MEMORY_FILE} together with "
+        f"non-Markdown files ({', '.join(others)}). Implementation pull requests do not edit "
+        f"{MEMORY_FILE}. Drop the {MEMORY_FILE} edit, and record status in the pull request body "
+        f"and the owning subsystem document instead; an owner-requested {MEMORY_FILE} change "
+        "belongs in a standalone Markdown-only change"
+    )
+
+
+# --------------------------------------------------------------------------
 # Identity
 #
 # Selection answers "what does this contribution touch?" from a two-endpoint
@@ -1504,6 +1538,12 @@ def main(argv: list[str]) -> int:
         help="a worker, the runner classes it declares, and the groups it owns; repeatable. "
         "Without any, the plan describes selection only and cannot be executed",
     )
+    parser.add_argument(
+        "--event",
+        choices=("pull_request", "push"),
+        help="the event the range belongs to; a pull_request range, which must start at its fork "
+        "point, is held to the contribution rules. Without it, no contribution rule applies",
+    )
     parser.add_argument("--request-file", help="file holding a PR body with a validation-request block")
     parser.add_argument("--catalog", help="fixture catalog path, read from the filesystem")
     parser.add_argument("--repo-root", help="repository to plan for (default: the enclosing checkout)")
@@ -1514,7 +1554,7 @@ def main(argv: list[str]) -> int:
     root = repository_root(arguments.repo_root)
 
     if arguments.catalog_check:
-        for name in ("base", "head", "candidate", "request_file", "worker"):
+        for name in ("base", "head", "candidate", "event", "request_file", "worker"):
             if getattr(arguments, name):
                 raise PlannerError(f"--catalog-check takes no --{name.replace('_', '-')}")
         tree = WorkTree(root)
@@ -1533,6 +1573,13 @@ def main(argv: list[str]) -> int:
 
     base = GitTree(root, arguments.base)
     head = GitTree(root, arguments.head)
+
+    # Decided from the event and the range alone, before the catalog or the
+    # request is read, so nothing a candidate carries can change the answer.
+    if arguments.event == "pull_request":
+        refusal = memory_rule(changed_paths(root, base, head))
+        if refusal:
+            raise PlannerError(refusal)
 
     document, catalog_source = read_catalog(head, arguments.catalog, root)
     head_packages = load_packages(head, required=True)

@@ -32,6 +32,7 @@ python3 tools/validation/plan.py --catalog-check
 | `--candidate` | The integration revision the workers execute. Defaults to the head; CI supplies the commit GitHub resolved for the event, which on a pull request is neither endpoint. |
 | `--toolchain NAME=VERSION` | A pinned toolchain version the candidate's identity covers. Repeatable. |
 | `--runner-os` | The operating system the workers execute on. Defaults to `RUNNER_OS`, then this machine's. |
+| `--event` | `pull_request` or `push`: the event the range belongs to. A `pull_request` range, which must start at the pull request's fork point, is held to [the MEMORY.md rule](#the-memorymd-rule); a `push` range, and a plan given no event, is not. |
 | `--request-file` | A file holding a pull-request body; its `validation-request` block is read from there. |
 | `--catalog` | A catalog path read from the filesystem instead of the default. Fixture catalogs use this, with planning and with `--catalog-check` alike. |
 | `--repo-root` | The repository to plan for. Defaults to the enclosing checkout. |
@@ -43,7 +44,9 @@ python3 tools/validation/plan.py --catalog-check
 `--head`; see [Running validation on GitHub](#running-validation-on-github).
 
 Every planner run validates the catalog first and exits non-zero with a specific
-diagnostic naming the offending group before producing any plan.
+diagnostic naming the offending group before producing any plan. Only
+[the MEMORY.md rule](#the-memorymd-rule) is decided earlier, from the event and
+the range alone.
 
 The catalog is read from the **head revision** when planning, so a plan never
 depends on uncommitted working-tree contents. `--catalog-check` has no revision
@@ -714,7 +717,9 @@ class its worker does not declare, and a selected group no worker owns. A
 an execution that later fails or silently runs somewhere it cannot. The
 validated assignment is recorded in the plan's `workers` and is part of its
 [plan identity](#receipts), so the same selection routed differently is a
-different plan.
+different plan. Given `--event pull_request`, it also refuses a range that
+breaks [the MEMORY.md rule](#the-memorymd-rule), before it reads the catalog or
+the request.
 
 A plan resolved without any `--worker` still explains selection, and the prose
 output says so, but it names nobody who could run what it selected: `run.py`,
@@ -740,6 +745,49 @@ keeping a copy of its own:
 `reuse.py` and `aggregate.py` still accept a worker's group list beside its name,
 but only as a restatement: a name the plan does not declare, or a list that is
 not exactly the plan's assignment, is a conflicting route and exits `2`.
+
+## The MEMORY.md rule
+
+`MEMORY.md` holds orientation and owner decisions, not a changelog.
+Implementation pull requests do not edit it: status belongs in the pull request
+body and the owning subsystem document, and an owner-requested `MEMORY.md`
+change belongs in a standalone Markdown-only change. The planner enforces this.
+Given `--event pull_request`, it refuses a range that does both of these:
+
+- adds, modifies, deletes, or renames the root `MEMORY.md`. A rename counts from
+  either endpoint, so moving `MEMORY.md` away, moving another file onto it, and
+  renaming it to a path that is not Markdown all qualify;
+- changes at least one path that does not end in `.md`.
+
+The diagnostic names the rule, `MEMORY.md`, every non-Markdown path that
+triggered it, and the fix: drop the `MEMORY.md` edit, and record status in the
+pull request body and the owning subsystem document. It exits `2` like every
+other planner refusal. That fails the [`plan` job](#plan), whose summary
+carries the diagnostic, and so fails `build-test`.
+
+The rule does not refuse:
+
+- a pull request that changes `MEMORY.md` and only `.md` files. An
+  owner-requested `MEMORY.md` change lands this way, as its own change;
+- a pull request that does not change `MEMORY.md`, even when its branch merged
+  in master commits that did. CI plans a pull request from its fork point, the
+  merge base of its base-branch tip and its head (see [`plan`](#plan)). That
+  range excludes upstream commits the branch did not author, including ones it
+  merged in;
+- a push. Every push to `master` is planned with `--event push` and is never
+  refused, including a documentation landing through `tools/docs_land.sh` and a
+  pull request's merge commit: that change has already landed;
+- a `MEMORY.md` anywhere but the repository root.
+
+The rule has no override. No request entry, label, or environment variable
+reaches it: the event and the changed paths alone decide it. A plan resolved
+without `--event`, as a local plan usually is, applies no contribution rule,
+because `--base origin/master` is not a fork point once `master` has moved on.
+To check a branch locally as CI will, plan from its fork point:
+
+```bash
+python3 tools/validation/plan.py --base "$(git merge-base origin/master HEAD)" --head HEAD --event pull_request
+```
 
 ## Running validation on GitHub
 
@@ -794,6 +842,11 @@ The pull-request body reaches the planner through a file written from the event
 payload's environment variable, never through shell interpolation: it is
 contributor-authored text, and the planner's grammar is the only thing that may
 interpret it. A push carries no body and therefore no request.
+
+The `Resolve the plan` step passes the event to the planner as `--event`,
+through the step's environment rather than interpolated into its shell. A pull
+request is therefore held to [the MEMORY.md rule](#the-memorymd-rule) whatever
+its body requests, including nothing, and a push never is.
 
 The job then runs [the reuse lookup](#reusing-an-earlier-execution), which needs
 the `actions: read` permission and nothing else, and uploads `plan.json` and
@@ -2682,6 +2735,21 @@ changes, request validation, nested and malformed request fences, `all-hspec`,
 the empty Hspec match, malformed, missing, and non-UTF-8 catalogs and package
 metadata, unresolvable revisions, and the explained omissions in the prose
 output.
+
+The MEMORY.md rule has its own examples. They refuse a mixed pull request that
+modifies, deletes, adds, renames away, or renames onto the root `MEMORY.md`, and
+one that only renames it to a path that is not Markdown. They check that the
+diagnostic names the rule, the triggering paths, and the fix but not the
+Markdown beside them, and that a request block does not change the answer. They
+accept a Markdown-only change to it and a non-root `MEMORY.md` beside code. Two
+examples resolve their base through `range.py`: a branch whose fork point
+excludes a later master edit to `MEMORY.md`, and a branch that merged one in.
+Each is refused when planned from the wrong base, so the fork point is what
+admits it. A push range that changes `MEMORY.md` beside code is never refused,
+and neither is a plan given no event. Two more examples run the workflow's own
+`Resolve the plan` step against the checked-in catalog and worker declarations.
+As a pull request whose body requests nothing, it fails with the rule in the job
+summary; as a push of the same change, it plans.
 
 Platform applicability has its own examples, all of which plan one candidate
 twice, for a `runner_os` that builds the group and one that does not: an
