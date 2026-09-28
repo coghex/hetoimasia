@@ -55,6 +55,8 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , raiseOnPresent
   , suboptimalWhileStale
   , swapchainsCreated
+  , refuseFrames
+  , framesAbandoned
   , frameEvents
   , fenceQueries
   , presentsOf
@@ -157,7 +159,8 @@ import Hetoimasia.GPU.Vulkan.Diagnostics (CaptureConfig, DiagnosticCapture, Diag
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Bridge (Created (..), Discharged (..), LeaseAnswer (..), SurfaceBridge (..))
 import Hetoimasia.Foundation.Time (Duration, DurationRequirement (AllowZero), Instant, addDuration, deadlineReached, durationFromNanoseconds, scriptedInstant, scriptedSource, zeroDuration)
 import Hetoimasia.GPU.Vulkan.Native.Frames (AcquireResult (..), FrameOps (..), PresentRequest (..), PresentStatus (..))
-import Hetoimasia.GPU.Vulkan.Native.Recording (RecordingOps (..))
+import Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering (VulkanRenderer (..))
+import Hetoimasia.GPU.Vulkan.Native.Recording (RecordingOps (..), Refusal (..))
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   ( FrameEvent (..)
   , RenderingOps (..)
@@ -756,6 +759,8 @@ data Rendering = Rendering
   , renderingStale ∷ !(TVar (Maybe (TVar (Maybe SurfaceExtent))))
     -- ^ When set, the extent the surfaces report: a presentation to a
     -- swapchain built at another extent answers suboptimal.
+  , renderingRefusing ∷ !(TVar Bool)
+    -- ^ Whether the renderer refuses every frame it is asked for.
   }
 
 data FenceKind = FenceIdle | FenceSubmission | FencePresent | FenceDone
@@ -778,6 +783,7 @@ newRendering =
     <*> newTVarIO Nothing
     <*> newTVarIO Nothing
     <*> newTVarIO Nothing
+    <*> newTVarIO False
 
 -- | Whether a submission's fence answers signalled when it is next asked.
 submissionsComplete ∷ Rig → Bool → IO ()
@@ -816,6 +822,19 @@ raiseOnPresent rig failure = atomically (writeTVar (renderingRaise (rigRendering
 -- a window is resized, and what 'scriptPresentStatus' says otherwise.
 suboptimalWhileStale ∷ Rig → IO ()
 suboptimalWhileStale rig = atomically (writeTVar (renderingStale (rigRendering rig)) (Just (nativeCurrentExtent (rigNative rig))))
+
+-- | Whether the renderer refuses every frame from now on, as one whose scene
+-- it cannot record would.
+refuseFrames ∷ Rig → Bool → IO ()
+refuseFrames rig = atomically . writeTVar (renderingRefusing (rigRendering rig))
+
+-- | How many frames the owner gave up after acquiring them.
+framesAbandoned ∷ Rig → IO Int
+framesAbandoned rig = length . filter abandoned <$> readTVarIO (rigFrameEvents rig)
+  where
+    abandoned = \case
+      FrameAbandoned {} → True
+      _ → False
 
 -- | How many swapchains have been created.
 swapchainsCreated ∷ Rig → IO Int
@@ -1232,9 +1251,14 @@ runRigHere rig body = do
   integration ← seamIntegration (rigSeam rig) defaultIntegrationScript
   scene ← prepare ()
   budgets ← either (throwIO . StandInFailure . Text.pack . show) pure (validateBudgets defaultBudgetRequest)
-  let config =
-        (vulkanHostConfig (rigHostConfig rig) (rigCapture rig) budgets scene)
-          { vulkanFrameObserver = \event → atomically $ do
+  let base = vulkanHostConfig (rigHostConfig rig) (rigCapture rig) budgets scene
+      config =
+        base
+          { vulkanRenderer = VulkanRenderer $ \current request recorder →
+              readTVarIO (renderingRefusing (rigRendering rig)) >>= \case
+                True → pure (Left (RefusedIllegal (Text.pack "the stand-in renderer refuses this frame")))
+                False → renderScene (vulkanRenderer base) current request recorder
+          , vulkanFrameObserver = \event → atomically $ do
               modifyTVar' (rigFrameEvents rig) (<> [event])
               case event of
                 FramePresented {} → do

@@ -56,6 +56,7 @@ import Hetoimasia.Runtime.GLFW
   , hostWindowIdentities
   , ownerHandoff
   , publishOwnerDemand
+  , readOwnerDemandTaken
   , readOwnerStatusNow
   , readTargetTerminalsNow
   , releaseGraphicsTarget
@@ -63,7 +64,7 @@ import Hetoimasia.Runtime.GLFW
   )
 import Hetoimasia.Runtime.Supervision (RuntimeControl)
 import Test.GPU.Vulkan.GLFW.StandIn
-import Test.Hspec (Expectation, Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
+import Test.Hspec (Expectation, Spec, describe, expectationFailure, it, shouldBe, shouldReturn, shouldSatisfy)
 
 spec ∷ Spec
 spec = describe "Vulkan loop adapter" $ do
@@ -79,6 +80,7 @@ spec = describe "Vulkan loop adapter" $ do
     it "polls no fence on an unrelated early wake, and takes a round whose deadline its work consumed without sleeping again" (bounded testEarlyWakeAndWorkDuration)
     it "keeps a finite progress deadline for a suspended target, without spinning" (bounded testSuspendedTarget)
     it "keeps presenting to one target while another's acquisitions cannot be answered" (bounded testBusyTargetFairness)
+    it "tries a frame the renderer refused again at the backoff's first interval, not on every round" (bounded testRefusedFramePaced)
 
   describe "a stalled main thread" $ do
     it "keeps the owner rendering while the native event call is held, and serves a window command once it returns" (bounded testStalledMainThread)
@@ -87,6 +89,7 @@ spec = describe "Vulkan loop adapter" $ do
   describe "status and exit" $ do
     it "brings a presentation's device loss to the application's next checkpoint" (bounded testLossAtCheckpoint)
     it "waits for owed presentations in the exit drain, retires in dependency order, and leaves no worker awaiting the ended loop" (bounded testExitWithOwedPresentations)
+    it "keeps the exit drain waiting on its own deadlines once a demand deadline no frame can serve has passed" (bounded testDrainPastDemand)
 
 -- ---------------------------------------------------------------------------
 -- The composed loop
@@ -553,6 +556,81 @@ testExitWithOwedPresentations = do
     accepted = \case
       WaitAccepted _ → True
       WaitClosed → False
+
+-- | The exit drain, with a presentation still owed and a demand deadline the
+-- owner took but no step served. Every target is closing, so no frame can
+-- serve that deadline: once it passes, the drain keeps waiting on its own
+-- poll deadlines — arming its timer each time the clock moves — rather than
+-- asking again at once, for ever, about a deadline that has come.
+testDrainPastDemand ∷ IO ()
+testDrainPastDemand = do
+  rig ← scriptedRigOf 1
+  presentationsRetire rig False
+  paced ← newTVarIO False
+  runRig rig $ \host control → do
+    [window] ← windowsOf host
+    _ ← firstFrame rig host control window
+    let owner = vulkanGraphicsOwner host
+    soon ← either (error . show) id . (`addDuration` millis 250) <$> clockNow rig
+    client ← atomically (hostWindowClient (vulkanWindowHost host) window) >>= maybe (failWith "no client") pure
+    _ ← publishDemand (clientDemandPublisher client) (deadlineDemand soon)
+    -- The adapter publishes it at the end of the first turn, so the owner's
+    -- answer is read from the second on.
+    turns ← newTVarIO (0 ∷ Int)
+    composedUntil
+      rig
+      host
+      control
+      "the owner taking the demand deadline"
+      (\_ → atomically (modifyTVar' turns (+ 1)))
+      (atomically ((&&) . (>= 2) <$> readTVar turns <*> readOwnerDemandTaken owner))
+    _ ← forkIO $ do
+      atomically (readOwnerStatusNow owner >>= check . (== OwnerRetiring) . statusPhase)
+      -- Past the demand deadline and well beyond, a tenth of a second at a
+      -- time: the drain arms its timer again after every move.
+      forM_ [1 .. 6 ∷ Int] $ \_ → do
+        armed ← length <$> readTVarIO (rigArmings rig)
+        advanceClock rig 100
+        atomically (readTVar (rigArmings rig) >>= check . (> armed) . length)
+      atomically (writeTVar paced True)
+      letExitFinish rig
+    pure ()
+  readTVarIO paced `shouldReturn` True
+
+-- | A renderer that refuses every frame leaves the target's render demand
+-- standing. The owner tries the frame again at the backoff's first interval:
+-- with the scripted clock still, its deadline stays ahead of the clock and it
+-- makes no second attempt, and once the clock reaches the interval it makes
+-- one.
+testRefusedFramePaced ∷ IO ()
+testRefusedFramePaced = do
+  rig ← scriptedRigOf 1
+  (interval, before, after, presented) ← runRig rig $ \host control → do
+    [window] ← windowsOf host
+    service ← firstFrame rig host control window
+    refuseFrames rig True
+    demandFrame host window
+    composedUntil rig host control "a refused frame" (\_ → pure ()) ((>= 1) <$> framesAbandoned rig)
+    now ← clockNow rig
+    due ← awaitDeadlineAfter host now
+    before ← framesAbandoned rig
+    setClock rig due
+    atomically (framesAbandonedNow rig >>= check . (> before))
+    after ← framesAbandoned rig
+    refuseFrames rig False
+    advanceClock rig 5
+    composedUntil rig host control "a frame once the renderer accepts" (\_ → pure ()) ((>= 2) <$> presentsOf rig (graphicsAttachment service))
+    letExitFinish rig
+    (,,,) (elapsedBetween now due) before after <$> presentsOf rig (graphicsAttachment service)
+  interval `shouldSatisfy` (<= millis 5)
+  before `shouldBe` 1
+  after `shouldBe` 2
+  presented `shouldSatisfy` (>= 2)
+  where
+    framesAbandonedNow rig = length . filter abandoned <$> readTVar (rigFrameEvents rig)
+    abandoned = \case
+      FrameAbandoned {} → True
+      _ → False
 
 testDemandKeptUntilTaken ∷ IO ()
 testDemandKeptUntilTaken = do

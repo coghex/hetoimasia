@@ -1641,7 +1641,10 @@ frame slot of the model's budget — the first time that target is.
 - A frame the renderer refused, whose recording was refused, or whose
   submission had no effect is skipped (`skipFrame`); one whose presentation
   enqueued nothing is closed unpresented (`closeUnpresentedFrame`). Each is
-  abandoned safely under VK-12's rules, never replayed.
+  abandoned safely under VK-12's rules, never replayed. The target's render
+  demand stands, so its next frame is tried at the same first interval, as an
+  acquisition that could not be answered is: a renderer that refuses every
+  frame costs one attempt an interval, never one every owner round.
 - Enqueuing the presentation clears the model's render demand.
 
 The renderer is `∀`-typed over the native handles, so it records through the
@@ -1732,7 +1735,11 @@ retires each target, then itself, then destroys itself; the main thread
 services bounded housekeeping and joins the owner before any window is
 released. A target whose retirement is still owed when the owner begins its
 exit drain is asked again between waits for the owner's own next deadline —
-the model's poll schedule — until it is retired or its retirement fails; no
+the model's poll schedule — until it is retired or its retirement fails. A
+demand deadline counts toward that schedule only while an admitted target that
+is not closing could serve it: the drain takes no step, so no frame can, and a
+deadline left standing once it passed would be asked about again at once, for
+ever. No
 timeout ends that wait, because a timeout is not evidence, and a cancellation
 ends it by leaving what is still owed with the owner, unverified, and naming it
 to whole-owner retirement. Nothing waits for a command from the ended loop: a
@@ -2118,6 +2125,8 @@ next interval followed by the next poll with no timer armed between them; a
 suspended target keeping a finite deadline with its presentation pending, not
 spinning while the clock stands still, and polling when it comes; one target
 presenting five more frames while another's acquisitions all answer not ready;
+a renderer refusing every frame, with the owner's deadline one backoff interval
+ahead of a still clock and no second attempt until the clock reaches it;
 the owner presenting a scene published from another thread while the main
 thread is held inside its native event call, and a window command submitted
 then served only once the call returns; a live resize under the same held call,
@@ -2128,7 +2137,12 @@ under a rule that waits for quiet geometry; a presentation's device loss reachin
 the composed loop's checkpoint; and the exit drain waiting for owed
 presentations before retiring the target, the device, the messenger and the
 instance, with a window command submitted after the loop ended answered rather
-than left waiting. The `terminal failure` group's sink example now waits for
+than left waiting; and that drain, with a presentation still owed and a demand
+deadline the owner took but never served, arming its timer again each time the
+clock moves past that deadline rather than asking at once, for ever. In
+`native-tests`' `Frames`, a closing pass cancelled from inside its first frame's
+cleanup submission leaves the second frame acquired; closing the target's frames
+again finishes the pass, a third finds nothing, and the target's slots retire. The `terminal failure` group's sink example now waits for
 the owner's own failure before its checkpoint, which the owner's wake for a
 failure latched on the main thread makes certain.
 

@@ -129,6 +129,7 @@ import Hetoimasia.GPU.Model
   , NextTurn (..)
   , Outcome (..)
   , PresentOutcome
+  , TargetPhase (..)
   , TargetView (..)
   , closeTarget
   , deviceLossObserved
@@ -557,33 +558,54 @@ renderDue rendering renderer now scene revision due =
           pure True
         Right (PresentedNothing reason) → do
           _ ← closeUnpresentedFrame (liveFrames made) (ownedFrame owned)
-          False <$ observe (FrameAbandoned attachment (ownedFrame owned) ("its presentation enqueued nothing: " <> reason))
+          observe (FrameAbandoned attachment (ownedFrame owned) ("its presentation enqueued nothing: " <> reason))
+          False <$ retryAfterPending target
         Left refusal → do
           _ ← closeUnpresentedFrame (liveFrames made) (ownedFrame owned)
-          False <$ observe (FrameAbandoned attachment (ownedFrame owned) ("its presentation was refused: " <> tshow refusal))
+          observe (FrameAbandoned attachment (ownedFrame owned) ("its presentation was refused: " <> tshow refusal))
+          False <$ retryAfterPending target
+    -- A frame given up after its acquisition leaves the target's render
+    -- demand standing: the frame is tried again at the backoff's first
+    -- interval, as a pending acquisition is, never on every round.
     abandon made attachment owned reason = do
       _ ← skipFrame (liveFrames made) (ownedFrame owned)
       observe (FrameAbandoned attachment (ownedFrame owned) reason)
+      retryAfterPending (frameTarget (ownedFrame owned))
 
 editTarget ∷ Rendering q inst msgr phys dev cmd → TargetId → (TargetRendering → TargetRendering) → STM ()
 editTarget rendering target edit = modifyTVar' (renderingTargets rendering) (Map.alter (Just . edit . maybe freshTarget id) target)
 
--- | The earliest instant rendering owes the owner a round: a demand deadline
--- still ahead, and, for every target the model says wants a frame, the retry
--- of an acquisition that could not be answered, or now.
-renderingDeadline ∷ Rendering q inst msgr phys dev cmd → Instant → IO (Maybe Instant)
-renderingDeadline rendering now = atomically $ do
+-- | The earliest instant rendering owes the owner a round, given the owner's
+-- targets: a demand deadline, while one of them could still render it, and,
+-- for every target the model says wants a frame, the retry of a frame that
+-- could not be made, or now.
+--
+-- A demand deadline is cleared only by the step that serves it. Once every
+-- target is closing — the exit drain, which takes no step — no frame can
+-- serve it, so it is no longer owed; left in, it would be a passed deadline
+-- the drain asks again at once, for ever.
+renderingDeadline ∷ Rendering q inst msgr phys dev cmd → Instant → [TargetId] → IO (Maybe Instant)
+renderingDeadline rendering now targets = atomically $ do
   ahead ← readTVar (renderingDemandAt rendering)
   held ← readTVar (renderingTargets rendering)
   model ← readRootsModel (renderingRoots rendering)
-  let wanting =
+  let renderable =
+        or
+          [ True
+          | target ← targets
+          , not (maybe False targetClosing (Map.lookup target held))
+          , Just view ← [targetView target model]
+          , viewTargetPhase view == TargetAdmitted
+          ]
+      owed = if renderable then maybe [] pure ahead else []
+      wanting =
         [ maybe now id (targetRetryAt record)
         | (target, record) ← Map.toList held
         , not (targetClosing record)
         , Just view ← [targetView target model]
         , viewTargetRenderDemand view
         ]
-  pure $ case maybe [] pure ahead <> wanting of
+  pure $ case owed <> wanting of
     [] → Nothing
     candidates → Just (minimum candidates)
 

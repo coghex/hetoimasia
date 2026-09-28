@@ -920,7 +920,8 @@ ownerDeadline state = do
         Nothing → NoOwnerDemand
         Just (Right due) → OwnerDeadline due
         Just (Left ()) → OwnerDeadline now
-  rendering ← maybe NoOwnerDemand OwnerDeadline <$> renderingDeadline (stateRendering state) now
+  targets ← Map.elems <$> readTVarIO (stateTargets state)
+  rendering ← maybe NoOwnerDemand OwnerDeadline <$> renderingDeadline (stateRendering state) now targets
   pure (earliest watch (earliest replacing (earliest generation rendering)))
   where
     earliest NoOwnerDemand other = other
