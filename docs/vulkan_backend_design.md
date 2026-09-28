@@ -1593,6 +1593,18 @@ edited, and Synarchy's installation is untouched. See
 [the loader's explicit driver selection](https://github.com/KhronosGroup/Vulkan-Loader/blob/main/docs/LoaderDriverInterface.md#overriding-the-default-driver-discovery)
 and [the compatibility record](vulkan_compatibility_record.md).
 
+VK-16 moved the pinned driver to Homebrew's MoltenVK **1.4.2**
+(`/opt/homebrew/Cellar/molten-vk/1.4.2`, installed beside 1.4.0), through
+`tools/native/vulkan.pin`, as an explicit requalification. MoltenVK 1.4.0 set the
+Metal layer's drawable size to 1×1 whenever a swapchain was created over an old
+one that still had a presentation in flight, as a workaround for a Metal
+completion regression. The new swapchain then answered suboptimal at the
+surface's own extent, and a live resize that keeps presenting while it rebuilds
+spent the target's recovery episode on it. 1.4.2 fixes it ("Fix swapchain
+recreation giving 1x1 drawables"). Its manifest is byte-identical to 1.4.0's and
+still declares API 1.4.0, which is the version the recorded driver identity
+prints beside the library digest; only the library differs.
+
 [MoltenVK 1.4.0's release](https://github.com/KhronosGroup/MoltenVK/releases/tag/v1.4.0)
 supports Vulkan 1.4; its tagged runtime guide lists dynamic rendering,
 synchronization2 and EXT swapchain maintenance. That made the proposed 1.3
@@ -1921,10 +1933,25 @@ explicit reattachment can begin a new episode after safe retirement; do not
 silently loop through detach/reattach internally.
 
 Ordinary resize invalidation is not a failed construction: coalesce observations
-and wait until the latest geometry has been quiet for 16 ms before rebuilding,
-while continuing safe work on other targets. Repeated out-of-date results with
-unchanged observed geometry do consume the recovery budget. Continually changing
-geometry can remain pending without warning or growing retirement storage.
+for 16 ms from when the move was first seen, then rebuild from the newest
+geometry, while continuing safe work on other targets. The active generation
+keeps presenting while its replacement is coalesced, and while the replacement
+waits only for the generation count to have room: a swapchain that answered
+suboptimal still presents. Repeated out-of-date results with unchanged observed
+geometry do consume the recovery budget. Continually changing geometry is
+rebuilt at most once a period, bounded by the generation limit, without warning
+or growing retirement storage.
+
+The owner amended this on 2026-09-28 for VK-16. The original rule waited until
+the geometry had been quiet for 16 ms, and the frames acquired nothing
+meanwhile. [The Cocoa measurement](graphics_owner_interaction_verdict.md) showed
+a live resize changing the framebuffer about every 8.5 ms, so the replacement
+never settled and the graphics owner presented nothing for 15.44 s. The
+reference implementations surveyed (Khronos's `swapchain_recreation` sample,
+Sascha Willems's examples, Dear ImGui's GLFW/Vulkan example, wgpu, and Apple's
+custom Metal view sample) rebuild as soon as the extent differs, and MoltenVK
+answers suboptimal, never out of date, while a window resizes, with images that
+still present scaled to the layer.
 Zero-area suspension creates no failed attempt. Close takes precedence over
 retry admission and over publishing a completed replacement.
 

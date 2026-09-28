@@ -45,6 +45,8 @@ library controller
     exposed-modules:
         Hetoimasia.GPU.Vulkan.GLFW.Internal.Bridge
         Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
+        Hetoimasia.GPU.Vulkan.GLFW.Internal.Loop
+        Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
     build-depends:
         base >=4.22 && <4.23,
         bytestring >=0.12 && <0.13,
@@ -52,6 +54,7 @@ library controller
         stm >=2.5.3 && <2.6,
         text >=2.1 && <2.2,
         hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-runtime ==0.1.0.0,
         hetoimasia-glfw ==0.1.0.0,
         hetoimasia-glfw:runtime-glfw ==0.1.0.0,
         hetoimasia-glfw:vulkan-interop ==0.1.0.0,
@@ -66,7 +69,9 @@ library
         Hetoimasia.GPU.Vulkan.GLFW
     build-depends:
         base >=4.22 && <4.23,
+        stm >=2.5.3 && <2.6,
         hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-runtime ==0.1.0.0,
         hetoimasia-glfw ==0.1.0.0,
         hetoimasia-glfw:runtime-glfw ==0.1.0.0,
         hetoimasia-glfw:vulkan-interop ==0.1.0.0,
@@ -88,6 +93,7 @@ test-suite integration-tests
     hs-source-dirs: test
     other-modules:
         Test.GPU.Vulkan.GLFW.Controller
+        Test.GPU.Vulkan.GLFW.Loop
         Test.GPU.Vulkan.GLFW.StandIn
     ghc-options: -threaded -rtsopts
     build-depends:
@@ -133,6 +139,7 @@ test-suite vulkan-native-tests
     default-extensions: PatternSynonyms
     ghc-options: -threaded -rtsopts
     other-modules:
+        Test.GPU.Vulkan.Native.Composed
         Test.GPU.Vulkan.Native.Consent
         Test.GPU.Vulkan.Native.Environment
         Test.GPU.Vulkan.Native.Fixture
@@ -141,6 +148,7 @@ test-suite vulkan-native-tests
         Test.GPU.Vulkan.Native.Recovery
         Test.GPU.Vulkan.Native.Gate
         Test.GPU.Vulkan.Native.Hazard
+        Test.GPU.Vulkan.Native.Interaction
         Test.GPU.Vulkan.Native.Naming
         Test.GPU.Vulkan.Native.Private
         Test.GPU.Vulkan.Native.Recording

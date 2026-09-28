@@ -44,6 +44,26 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , afterRefusal
   , bridgeLeaseAnswer
 
+    -- * The rendering layers
+  , Rendering
+  , submissionsComplete
+  , presentationsRetire
+  , scriptPresentStatus
+  , slowNativeCalls
+  , holdAcquisitions
+  , stallSwapchain
+  , raiseOnPresent
+  , suboptimalWhileStale
+  , swapchainsCreated
+  , refuseFrames
+  , framesAbandoned
+  , frameEvents
+  , fenceQueries
+  , presentsOf
+  , presentRounds
+  , awaitPresents
+  , retireNextPresentations
+
     -- * The rig
   , Rig (..)
   , Scene
@@ -51,6 +71,13 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , newRigOf
   , visibleRig
   , visibleRigOf
+  , scriptedRigOf
+  , advanceClock
+  , setClock
+  , clockNow
+  , holdPump
+  , pumpHeld
+  , setVisible
   , resizeFramebuffer
   , publishObservation
   , nudgeOwner
@@ -61,6 +88,7 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , creationsBegun
   , runRig
   , runRigCaught
+  , quietLogger
   , pumpUntil
   , handedOver
   , windowsOf
@@ -93,6 +121,7 @@ import Vulkan.CStruct (withCStruct)
 import Vulkan.Extensions.VK_EXT_debug_utils (DebugUtilsMessengerCallbackDataEXT (..))
 import Vulkan.Zero (zero)
 import Hetoimasia.GPU.Vulkan.Native.Diagnostics (captureMessengerCallback)
+import Data.Foldable (for_)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -121,15 +150,21 @@ import Hetoimasia.GLFW.Seam
 import Hetoimasia.GLFW.Vulkan (Replacement (..), replaceWindowSurface, requiredInstanceExtensions)
 import Hetoimasia.Foundation.Messaging.Payload (preparedValue)
 import Hetoimasia.Foundation.Messaging.Snapshot (observedValue, readSnapshot)
-import Hetoimasia.GLFW.Command (WaitedSubmission (..), awaitSubmitWindowCommand, clientObservations, setWindowSizeCommand)
+import Hetoimasia.GLFW.Command (WaitedSubmission (..), awaitSubmitWindowCommand, clientObservations, hideWindowCommand, setWindowSizeCommand, showWindowCommand)
 import Hetoimasia.GLFW.Window (Extent (Extent), WindowConfig, WindowId, hiddenTestWindowConfig, observedRevision)
 import Numeric.Natural (Natural)
-import Hetoimasia.GPU.Model.Budget (defaultBudgetRequest, validateBudgets)
+import Hetoimasia.GPU.Model.Budget (BudgetRequest (..), defaultBudgetRequest, validateBudgets)
 import Hetoimasia.GPU.Model.Identity (TargetClass)
 import Hetoimasia.GPU.Vulkan.Diagnostics (CaptureConfig, DiagnosticCapture, DiagnosticVerdict, Quiesced, afterLastCallback, captureSinkFailure, captureUserData, defaultCaptureConfig, diagnosticVerdictInContext, requestDrain)
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Bridge (Created (..), Discharged (..), LeaseAnswer (..), SurfaceBridge (..))
+import Hetoimasia.Foundation.Time (Duration, DurationRequirement (AllowZero), Instant, addDuration, deadlineReached, durationFromNanoseconds, scriptedInstant, scriptedSource, zeroDuration)
+import Hetoimasia.GPU.Vulkan.Native.Frames (AcquireResult (..), FrameOps (..), PresentRequest (..), PresentStatus (..))
+import Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering (VulkanRenderer (..))
+import Hetoimasia.GPU.Vulkan.Native.Recording (RecordingOps (..), Refusal (..))
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
-  ( VulkanHandover (..)
+  ( FrameEvent (..)
+  , RenderingOps (..)
+  , VulkanHandover (..)
   , VulkanHost (..)
   , VulkanHostConfig (..)
   , Readiness (..)
@@ -170,10 +205,13 @@ import Hetoimasia.Runtime.GLFW
   , AttachmentProtocol (..)
   , GraphicsOwner
   , GraphicsOwnerConfig (..)
+  , ownerTimer
   , GraphicsService
   , HostConfig (..)
   , LoopHooks (..)
   , TargetStanding (..)
+  , OwnerStatus (..)
+  , readOwnerStatusNow
   , TerminalRecord
   , Turn (..)
   , TurnStep (..)
@@ -222,6 +260,17 @@ data Event
     -- ^ The seam destroyed a window; whether the graphics owner's worker had
     -- already completed by then.
   | SessionEnded
+  | FenceQueried !Word64
+    -- ^ A fence's status was asked, without waiting.
+  | ImageAcquired !Word64 !Word32
+    -- ^ A swapchain's image was acquired.
+  | QueueSubmitted !Word64
+    -- ^ A submission was made, with this fence.
+  | ImagePresented !Word64 !Word32
+    -- ^ A swapchain's image was presented.
+  | ImageReleased !Word64 ![Word32]
+  | OwnerTimerArmed
+    -- ^ The owner armed its timer, with a scripted clock.
   deriving (Eq, Show)
 
 -- | Every event, newest first, with the thread that caused it.
@@ -669,6 +718,278 @@ surfaceBridge events bridge =
       DestroyFails → True
       _ → False
 
+
+-- ---------------------------------------------------------------------------
+-- The rendering layers
+
+-- | The stand-in frames' and recording's native layers.
+--
+-- Every swapchain has three images. An acquisition takes the lowest one the
+-- application does not own and the presentation engine does not hold, and
+-- answers not ready when there is none. A submission's fence and a present
+-- fence are pending until asked: each then answers signalled if the example
+-- lets that kind complete ('submissionsComplete', 'presentationsRetire'),
+-- which both do by default, and a present fence that signalled gives its image
+-- back to the swapchain. Each call is journalled with the thread that made it.
+data Rendering = Rendering
+  { renderingHandles ∷ !(TVar Word64)
+    -- ^ The next fence, semaphore, pool or command buffer, from 9000.
+  , renderingFences ∷ !(TVar (Map Word64 FenceKind))
+  , renderingBusy ∷ !(TVar (Map Word64 (Set Word32)))
+    -- ^ Per swapchain, the images the application owns or the presentation
+    -- engine holds.
+  , renderingPresented ∷ !(TVar (Map Word64 (Word64, Word32)))
+    -- ^ Each pending present fence's swapchain and image.
+  , renderingSubmissions ∷ !(TVar Bool)
+  , renderingPresentations ∷ !(TVar Bool)
+  , renderingStatus ∷ !(TVar PresentStatus)
+  , renderingAdvance ∷ !(TVar (Maybe Integer))
+    -- ^ Milliseconds every presentation and every fence query moves the
+    -- scripted clock on, as a slow native call would.
+  , renderingHold ∷ !(TVar (Maybe (TVar Bool)))
+    -- ^ When set, every acquisition holds until the gate opens.
+  , renderingHolding ∷ !(TVar Bool)
+    -- ^ Whether an acquisition is holding now.
+  , renderingStalled ∷ !(TVar (Set Word64))
+    -- ^ Swapchains whose acquisitions always answer not ready.
+  , renderingRaise ∷ !(TVar (Maybe SomeException))
+    -- ^ Raised, once, by the next presentation, after its entry is written.
+  , renderingRetireCount ∷ !(TVar (Maybe Int))
+    -- ^ When set, how many more present fences may answer signalled.
+  , renderingStale ∷ !(TVar (Maybe (TVar (Maybe SurfaceExtent))))
+    -- ^ When set, the extent the surfaces report: a presentation to a
+    -- swapchain built at another extent answers suboptimal.
+  , renderingRefusing ∷ !(TVar Bool)
+    -- ^ Whether the renderer refuses every frame it is asked for.
+  }
+
+data FenceKind = FenceIdle | FenceSubmission | FencePresent | FenceDone
+  deriving (Eq, Show)
+
+newRendering ∷ IO Rendering
+newRendering =
+  Rendering
+    <$> newTVarIO 9000
+    <*> newTVarIO Map.empty
+    <*> newTVarIO Map.empty
+    <*> newTVarIO Map.empty
+    <*> newTVarIO True
+    <*> newTVarIO True
+    <*> newTVarIO PresentStatusSuccess
+    <*> newTVarIO Nothing
+    <*> newTVarIO Nothing
+    <*> newTVarIO False
+    <*> newTVarIO Set.empty
+    <*> newTVarIO Nothing
+    <*> newTVarIO Nothing
+    <*> newTVarIO Nothing
+    <*> newTVarIO False
+
+-- | Whether a submission's fence answers signalled when it is next asked.
+submissionsComplete ∷ Rig → Bool → IO ()
+submissionsComplete rig = atomically . writeTVar (renderingSubmissions (rigRendering rig))
+
+-- | Whether a present fence answers signalled when it is next asked.
+presentationsRetire ∷ Rig → Bool → IO ()
+presentationsRetire rig = atomically . writeTVar (renderingPresentations (rigRendering rig))
+
+-- | What every later presentation writes for its swapchain.
+scriptPresentStatus ∷ Rig → PresentStatus → IO ()
+scriptPresentStatus rig = atomically . writeTVar (renderingStatus (rigRendering rig))
+
+-- | Have every later presentation and fence query move the scripted clock on
+-- by this many milliseconds, as a slow call would, or stop doing so.
+slowNativeCalls ∷ Rig → Maybe Integer → IO ()
+slowNativeCalls rig = atomically . writeTVar (renderingAdvance (rigRendering rig))
+
+-- | Hold every later acquisition until the gate opens, and answer a
+-- transaction that says whether one is holding now.
+holdAcquisitions ∷ Rig → TVar Bool → IO (STM Bool)
+holdAcquisitions rig gate = do
+  atomically (writeTVar (renderingHold (rigRendering rig)) (Just gate))
+  pure (readTVar (renderingHolding (rigRendering rig)))
+
+-- | Answer not ready to every later acquisition from this swapchain.
+stallSwapchain ∷ Rig → Word64 → IO ()
+stallSwapchain rig swapchain = atomically (modifyTVar' (renderingStalled (rigRendering rig)) (Set.insert swapchain))
+
+-- | Have the next presentation raise this, once, after writing its entry.
+raiseOnPresent ∷ Rig → SomeException → IO ()
+raiseOnPresent rig failure = atomically (writeTVar (renderingRaise (rigRendering rig)) (Just failure))
+
+-- | Have every later presentation answer suboptimal while its swapchain was
+-- built at another extent than the surfaces report now, as MoltenVK's do while
+-- a window is resized, and what 'scriptPresentStatus' says otherwise.
+suboptimalWhileStale ∷ Rig → IO ()
+suboptimalWhileStale rig = atomically (writeTVar (renderingStale (rigRendering rig)) (Just (nativeCurrentExtent (rigNative rig))))
+
+-- | Whether the renderer refuses every frame from now on, as one whose scene
+-- it cannot record would.
+refuseFrames ∷ Rig → Bool → IO ()
+refuseFrames rig = atomically . writeTVar (renderingRefusing (rigRendering rig))
+
+-- | How many frames the owner gave up after acquiring them.
+framesAbandoned ∷ Rig → IO Int
+framesAbandoned rig = length . filter abandoned <$> readTVarIO (rigFrameEvents rig)
+  where
+    abandoned = \case
+      FrameAbandoned {} → True
+      _ → False
+
+-- | How many swapchains have been created.
+swapchainsCreated ∷ Rig → IO Int
+swapchainsCreated rig = length . filter created <$> journal rig
+  where
+    created = \case
+      SwapchainCreated {} → True
+      _ → False
+
+-- | Every frame event the owner reported, oldest first.
+frameEvents ∷ Rig → IO [FrameEvent]
+frameEvents rig = readTVarIO (rigFrameEvents rig)
+
+-- | How many fence queries the frames have made.
+fenceQueries ∷ Rig → IO Int
+fenceQueries rig = length . filter isQuery <$> journal rig
+  where
+    isQuery = \case
+      FenceQueried _ → True
+      _ → False
+
+-- | How many presentations have been made to this attachment's target.
+presentsOf ∷ Rig → AttachmentId → IO Int
+presentsOf rig = atomically . presentsNow rig
+
+-- | The owner's completed rounds at each presentation, oldest first.
+presentRounds ∷ Rig → IO [Natural]
+presentRounds = readTVarIO . rigPresentRounds
+
+-- | Wait until this attachment's target has had this many presentations.
+awaitPresents ∷ Rig → AttachmentId → Int → IO ()
+awaitPresents rig attachment count = atomically (presentsNow rig attachment >>= check . (>= count))
+
+presentsNow ∷ Rig → AttachmentId → STM Int
+presentsNow rig attachment = length . filter presented <$> readTVar (rigFrameEvents rig)
+  where
+    presented = \case
+      FramePresented at _ _ _ → at == attachment
+      _ → False
+
+-- | Let only the next this many present fences asked answer signalled, and no
+-- later one, whatever 'presentationsRetire' says; or, given 'Nothing', every
+-- one 'presentationsRetire' allows.
+retireNextPresentations ∷ Rig → Maybe Int → IO ()
+retireNextPresentations rig = atomically . writeTVar (renderingRetireCount (rigRendering rig))
+
+renderingLayers ∷ Journal → Rendering → Maybe (TVar Instant) → RenderingOps Text Int Word64
+renderingLayers events rendering clock =
+  RenderingOps
+    { renderingRecordingOps = \_ → pure recordingLayer
+    , renderingFrameOps = frameLayer
+    }
+  where
+    fresh = atomically (stateTVar (renderingHandles rendering) (\next → (next, next + 1)))
+    fence handle kind = atomically (modifyTVar' (renderingFences rendering) (Map.insert handle kind))
+    recordingLayer =
+      RecordingOps
+        { opsCreatePipelineLayout = \_ → fresh
+        , opsDestroyPipelineLayout = \_ _ → pure ()
+        , opsCreatePipeline = \_ _ _ → fresh
+        , opsDestroyPipeline = \_ _ → pure ()
+        , opsCreateStorage = \_ _ → (,) <$> fresh <*> fresh
+        , opsResetStorage = \_ _ → pure ()
+        , opsDestroyStorage = \_ _ → pure ()
+        , opsCreateReadback = \_ _ → throwIO (StandInFailure "the stand-in makes no readback")
+        , opsDestroyReadback = \_ _ → pure ()
+        , opsInvalidate = \_ _ _ → pure ()
+        , opsFlush = \_ _ _ → pure ()
+        , opsReadMapped = \_ _ _ → pure mempty
+        , opsWriteMapped = \_ _ _ → pure ()
+        , opsBeginCommands = \_ → pure ()
+        , opsEndCommands = \_ → pure ()
+        , opsRecord = \_ _ → pure ()
+        , opsCommandBufferHandle = id
+        }
+    frameLayer =
+      FrameOps
+        { opsCreateSemaphore = \_ → fresh
+        , opsDestroySemaphore = \_ _ → pure ()
+        , opsCreateFence = \_ → do
+            handle ← fresh
+            handle <$ fence handle FenceIdle
+        , opsDestroyFence = \_ handle → atomically (modifyTVar' (renderingFences rendering) (Map.delete handle))
+        , opsResetFence = \_ handle → fence handle FenceIdle
+        , opsFenceSignalled = \_ handle → do
+            record events (FenceQueried handle)
+            slow
+            atomically $ do
+              kind ← Map.lookup handle <$> readTVar (renderingFences rendering)
+              submissions ← readTVar (renderingSubmissions rendering)
+              presentations ← readTVar (renderingPresentations rendering)
+              counted ← readTVar (renderingRetireCount rendering)
+              case kind of
+                Just FenceDone → pure True
+                Just FenceSubmission | submissions → True <$ modifyTVar' (renderingFences rendering) (Map.insert handle FenceDone)
+                Just FencePresent | presentations && maybe True (> 0) counted → do
+                  writeTVar (renderingRetireCount rendering) (subtract 1 <$> counted)
+                  modifyTVar' (renderingFences rendering) (Map.insert handle FenceDone)
+                  held ← Map.lookup handle <$> readTVar (renderingPresented rendering)
+                  for_ held $ \(swapchain, index) → do
+                    modifyTVar' (renderingPresented rendering) (Map.delete handle)
+                    modifyTVar' (renderingBusy rendering) (Map.adjust (Set.delete index) swapchain)
+                  pure True
+                _ → pure False
+        , opsAcquireImage = \_ swapchain _ → do
+            readTVarIO (renderingHold rendering) >>= \case
+              Nothing → pure ()
+              Just gate → uninterruptibleMask_ $ do
+                atomically (writeTVar (renderingHolding rendering) True)
+                atomically (readTVar gate >>= check)
+                atomically (writeTVar (renderingHolding rendering) False)
+            taken ← atomically $ do
+              busy ← Map.findWithDefault Set.empty swapchain <$> readTVar (renderingBusy rendering)
+              stalled ← Set.member swapchain <$> readTVar (renderingStalled rendering)
+              case [index | not stalled, index ← [0 .. 2], Set.notMember index busy] of
+                index : _ → Just index <$ modifyTVar' (renderingBusy rendering) (Map.insert swapchain (Set.insert index busy))
+                [] → pure Nothing
+            case taken of
+              Just index → AcquiredIndex index <$ record events (ImageAcquired swapchain index)
+              Nothing → pure AcquiringNotReady
+        , opsSubmit = \_ _ _ handle → do
+            fence handle FenceSubmission
+            record events (QueueSubmitted handle)
+        , opsNoEffect = const False
+        , opsReleaseImages = \_ swapchain indices → do
+            atomically (modifyTVar' (renderingBusy rendering) (Map.adjust (\held → foldr Set.delete held indices) swapchain))
+            record events (ImageReleased swapchain indices)
+        , opsPresent = \_ _ request status → do
+            answer ← stale (presentSwapchain request) >>= maybe (readTVarIO (renderingStatus rendering)) pure
+            writeIORef status answer
+            fence (presentFence request) FencePresent
+            atomically (modifyTVar' (renderingPresented rendering) (Map.insert (presentFence request) (presentSwapchain request, presentIndex request)))
+            record events (ImagePresented (presentSwapchain request) (presentIndex request))
+            slow
+            atomically (stateTVar (renderingRaise rendering) (\pending → (pending, Nothing))) >>= maybe (pure ()) throwIO
+        , opsWaitFence = \_ handle _ → atomically ((== Just FenceDone) . Map.lookup handle <$> readTVar (renderingFences rendering))
+        }
+
+    stale swapchain =
+      readTVarIO (renderingStale rendering) >>= \case
+        Nothing → pure Nothing
+        Just current → do
+          reported ← readTVarIO current
+          built ← readTVarIO events
+          pure $ case (reported, [size | (_, SwapchainCreated handle size _) ← built, handle == swapchain]) of
+            (Just (SurfaceExtent width height), size : _) | size /= (width, height) → Just PresentStatusSuboptimal
+            _ → Nothing
+    slow = do
+      advance ← readTVarIO (renderingAdvance rendering)
+      for_ ((,) <$> advance <*> clock) $ \(milliseconds, cell) →
+        atomically (modifyTVar' cell (\now → either (const now) id (addDuration now (millisecondsOf milliseconds))))
+
+millisecondsOf ∷ Integer → Duration
+millisecondsOf milliseconds = either (error . show) id (durationFromNanoseconds AllowZero (milliseconds * 1000000))
+
 -- ---------------------------------------------------------------------------
 -- The rig
 
@@ -698,6 +1019,26 @@ data Rig = Rig
     -- ^ Whether the capture's sink raises on the records it is given.
   , rigSinkFailed ∷ !(TVar Bool)
     -- ^ Whether it has raised.
+  , rigRendering ∷ !Rendering
+  , rigFrameEvents ∷ !(TVar [FrameEvent])
+  , rigPresentRounds ∷ !(TVar [Natural])
+    -- ^ For every presentation, oldest first, the owner's completed rounds at
+    -- the instant it was reported: the round that made it is the next one.
+  , rigClock ∷ !(Maybe (TVar Instant))
+    -- ^ The scripted clock the host and the owner read, when the example
+    -- scripts one: it moves only when the example moves it, and the owner's
+    -- timer expires only when it has passed the instant it was armed for.
+  , rigArmings ∷ !(TVar [Duration])
+    -- ^ Every duration the owner armed its timer for, with a scripted clock.
+  , rigPumpHold ∷ !(TVar Bool)
+    -- ^ While set, the native event wait holds, whatever wakes it, as a
+    -- platform modal loop inside it does.
+  , rigPumpHeld ∷ !(TVar Bool)
+    -- ^ Whether the wait is holding now.
+  , rigVisible ∷ !(TVar Bool)
+    -- ^ What every window's visibility query answers.
+  , rigBudgets ∷ !BudgetRequest
+    -- ^ The model's budgets, when an example narrows them.
   }
 
 -- | Make the capture's sink raise on every record it is given from now on.
@@ -746,8 +1087,8 @@ resizeFramebuffer rig host window (width, height) = do
     WaitClosed → throwIO (StandInFailure "the host's command port closed")
 
 -- | Publish the window's latest observation for its target to the owner, as
--- the main thread's loop does for an application — which, until VK-16's loop
--- adapter publishes one every turn, is the application itself.
+-- an application that drives its own loop does; 'runVulkanOwnerLoop' does it
+-- every turn for one that runs the composed loop.
 publishObservation ∷ VulkanHost Scene → GraphicsService → WindowId → IO ()
 publishObservation host service window = do
   client ← atomically (hostWindowClient (vulkanWindowHost host) window) >>= maybe (throwIO (StandInFailure "the window has no client")) pure
@@ -772,7 +1113,59 @@ newRigWith ∷ [WindowConfig] → IO Rig
 newRigWith = newRigVisible False
 
 newRigVisible ∷ Bool → [WindowConfig] → IO Rig
-newRigVisible visible windows = do
+newRigVisible visible windows = newRigClocked visible windows Nothing
+
+-- | A rig over this many visible windows whose host and owner read a scripted
+-- clock, starting at zero.
+scriptedRigOf ∷ Int → IO Rig
+scriptedRigOf count = do
+  clock ← newTVarIO (scriptedInstant zeroDuration)
+  newRigClocked True [hiddenTestWindowConfig (Text.pack ("scripted " <> show number)) 64 48 | number ← [1 .. count]] (Just clock)
+
+-- | Move the scripted clock on by this many milliseconds.
+advanceClock ∷ Rig → Integer → IO ()
+advanceClock rig milliseconds = case rigClock rig of
+  Nothing → throwIO (StandInFailure "the rig has no scripted clock")
+  Just cell → atomically (modifyTVar' cell (\now → either (const now) id (addDuration now (millisecondsOf milliseconds))))
+
+-- | Set the scripted clock to this instant, which must not be earlier.
+setClock ∷ Rig → Instant → IO ()
+setClock rig instant = case rigClock rig of
+  Nothing → throwIO (StandInFailure "the rig has no scripted clock")
+  Just cell → atomically (modifyTVar' cell (max instant))
+
+-- | The scripted clock's instant.
+clockNow ∷ Rig → IO Instant
+clockNow rig = maybe (throwIO (StandInFailure "the rig has no scripted clock")) readTVarIO (rigClock rig)
+
+-- | Hold the main thread's next native event wait until 'holdPump' is given
+-- 'False', as a platform modal loop inside the call would; or release it.
+holdPump ∷ Rig → Bool → IO ()
+holdPump rig = atomically . writeTVar (rigPumpHold rig)
+
+-- | Whether the main thread is inside a held wait now.
+pumpHeld ∷ Rig → STM Bool
+pumpHeld = readTVar . rigPumpHeld
+
+-- | Make every window report itself shown or hidden, and show or hide this
+-- one through the host's command port so the owner loop samples it again.
+-- The loop must be turning.
+setVisible ∷ Rig → VulkanHost Scene → WindowId → Bool → IO ()
+setVisible rig host window shown = do
+  atomically (writeTVar (rigVisible rig) shown)
+  awaitSubmitWindowCommand
+    (hostCommandPort (vulkanWindowHost host))
+    [("client", "integration-tests")]
+    ((if shown then showWindowCommand else hideWindowCommand) window)
+    >>= \case
+      WaitAccepted _ → pure ()
+      WaitClosed → throwIO (StandInFailure "the host's command port closed")
+
+newRigClocked ∷ Bool → [WindowConfig] → Maybe (TVar Instant) → IO Rig
+newRigClocked visible windows clock = do
+  pumpHold ← newTVarIO False
+  heldNow ← newTVarIO False
+  visibility ← newTVarIO visible
   framebuffer ← newTVarIO (640, 480)
   nudges ← newTVarIO 0
   events ← newTVarIO []
@@ -786,6 +1179,12 @@ newRigVisible visible windows = do
           -- wait returned at once would keep the main thread spinning through
           -- every wait, which no native session does.
           scriptWaitEvents = \bound _ → do
+            -- A held pump is a modal loop: nothing ends it but the example.
+            held ← readTVarIO pumpHold
+            when held $ do
+              atomically (writeTVar heldNow True)
+              atomically (readTVar pumpHold >>= check . not)
+              atomically (writeTVar heldNow False)
             expired ← registerDelay (max 1 (round (bound * 1e6)))
             atomically $
               (readTVar posts >>= \pending → if pending <= 0 then retry else writeTVar posts (pending - 1))
@@ -801,7 +1200,7 @@ newRigVisible visible windows = do
             record events (WindowGone joined)
         , scriptTerminate = \_ → record events SessionEnded
         , scriptFramebufferSize = \_ → readTVarIO framebuffer
-        , scriptWindowAttribute = \attribute _ → pure (visible && attribute == VisibleAttribute)
+        , scriptWindowAttribute = \attribute _ → (&& attribute == VisibleAttribute) <$> readTVarIO visibility
         }
   native ← Native <$> newTVarIO Map.empty <*> newTVarIO Set.empty <*> newTVarIO 500 <*> newTVarIO Nothing <*> newTVarIO Nothing <*> newTVarIO Set.empty
   bridge ← Bridge <$> newTVarIO Map.empty <*> newTVarIO Nothing <*> newTVarIO 100 <*> newTVarIO []
@@ -809,13 +1208,18 @@ newRigVisible visible windows = do
   refusalHook ← newTVarIO (\_ → pure ())
   sinkFailing ← newTVarIO False
   sinkFailed ← newTVarIO False
+  rendering ← newRendering
+  frameLog ← newTVarIO []
+  presentRounds' ← newTVarIO []
+  armings ← newTVarIO []
+  let defaults = (defaultHostConfig windows) {hostIdleWait = 0.005}
   pure
     Rig
       { rigSeam = seam
       , rigJournal = events
       , rigNative = native
       , rigBridge = bridge
-      , rigHostConfig = (defaultHostConfig windows) {hostIdleWait = 0.005}
+      , rigHostConfig = maybe defaults (\cell → defaults {hostClock = scriptedSource (readTVarIO cell)}) clock
       , rigOwner = owner
       , rigVerdict = verdict
       , rigPortCapacity = Nothing
@@ -825,6 +1229,15 @@ newRigVisible visible windows = do
       , rigCapture = defaultCaptureConfig
       , rigSinkFailing = sinkFailing
       , rigSinkFailed = sinkFailed
+      , rigRendering = rendering
+      , rigFrameEvents = frameLog
+      , rigPresentRounds = presentRounds'
+      , rigClock = clock
+      , rigArmings = armings
+      , rigPumpHold = pumpHold
+      , rigPumpHeld = heldNow
+      , rigVisible = visibility
+      , rigBudgets = defaultBudgetRequest
       }
 
 -- | Run a whole Vulkan graphics host under the application runner, on a bound
@@ -840,8 +1253,35 @@ runRigHere ∷ Rig → (VulkanHost Scene → RuntimeControl → IO a) → IO a
 runRigHere rig body = do
   integration ← seamIntegration (rigSeam rig) defaultIntegrationScript
   scene ← prepare ()
-  budgets ← either (throwIO . StandInFailure . Text.pack . show) pure (validateBudgets defaultBudgetRequest)
-  let config = vulkanHostConfig (rigHostConfig rig) (rigCapture rig) budgets scene
+  budgets ← either (throwIO . StandInFailure . Text.pack . show) pure (validateBudgets (rigBudgets rig))
+  let base = vulkanHostConfig (rigHostConfig rig) (rigCapture rig) budgets scene
+      config =
+        base
+          { vulkanRenderer = VulkanRenderer $ \current request recorder →
+              readTVarIO (renderingRefusing (rigRendering rig)) >>= \case
+                True → pure (Left (RefusedIllegal (Text.pack "the stand-in renderer refuses this frame")))
+                False → renderScene (vulkanRenderer base) current request recorder
+          , vulkanFrameObserver = \event → atomically $ do
+              modifyTVar' (rigFrameEvents rig) (<> [event])
+              case event of
+                FramePresented {} → do
+                  owner ← readTVar (rigOwner rig)
+                  rounds ← maybe (pure 0) (fmap statusRounds . readOwnerStatusNow) owner
+                  modifyTVar' (rigPresentRounds rig) (<> [rounds])
+                _ → pure ()
+          }
+      timed owner = case rigClock rig of
+        Nothing → owner
+        Just cell →
+          owner
+            { ownerClockTimer = ownerTimer $ \duration → do
+                atomically (modifyTVar' (rigArmings rig) (<> [duration]))
+                record (rigJournal rig) OwnerTimerArmed
+                start ← readTVarIO cell
+                pure $ case addDuration start duration of
+                  Left _ → pure False
+                  Right due → (`deadlineReached` due) <$> readTVar cell
+            }
   runGraphicsOwnerApplication
     (withLoggingLifetime quietLogger)
     "vulkan-controller-example"
@@ -853,11 +1293,12 @@ runRigHere rig body = do
             (ControllerHooks (\attachment → readTVarIO (rigAfterRefusal rig) >>= ($ attachment)))
             (captureLogger rig)
             (nativeLayer (rigJournal rig) (rigNative rig))
+            (renderingLayers (rigJournal rig) (rigRendering rig) (rigClock rig))
             instanceAddress
             (surfaceBridge (rigJournal rig) (rigBridge rig))
             (seamIntegratedSession (rigSeam rig) integration)
             requiredInstanceExtensions
-            config {vulkanOwner = \owner → maybe owner (\capacity → owner {ownerEventCapacity = capacity}) (rigPortCapacity rig)}
+            config {vulkanOwner = \owner → timed (maybe owner (\capacity → owner {ownerEventCapacity = capacity}) (rigPortCapacity rig))}
             (\host → atomically (writeTVar (rigOwner rig) (Just (vulkanGraphicsOwner host))) >> use host)
         atomically (writeTVar (rigVerdict rig) (Just verdict))
         pure result

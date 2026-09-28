@@ -97,6 +97,7 @@ module Hetoimasia.Runtime.GLFW.Internal.Owner
   , noStepWork
   , NextDeadline (..)
   , TargetRetire (..)
+  , RetirementReadiness (..)
   , TargetRetired
   , targetRetired
   , OwnerRetire (..)
@@ -135,6 +136,7 @@ module Hetoimasia.Runtime.GLFW.Internal.Owner
   , readTargetStanding
   , ownerTargetAcknowledgement
   , awaitOwnerRound
+  , readOwnerDemandTaken
   , wakeGraphicsHost
 
     -- * The additive protected-host constructor
@@ -206,7 +208,9 @@ import Hetoimasia.Foundation.Time
   ( Duration
   , Instant
   , MonotonicSource
+  , DurationRequirement (RequirePositive)
   , deadlineReached
+  , durationFromNanoseconds
   , durationNanoseconds
   , readInstant
   , remainingUntil
@@ -411,7 +415,15 @@ data OwnerStep scene = OwnerStep
     -- ^ The latest scene any application thread published. It is a
     -- latest-value snapshot, so a stalled publisher leaves the owner the last
     -- coherent one rather than nothing.
+  , stepSceneRevision ∷ !Natural
+    -- ^ The revision of that scene's publication, so a backend can tell a
+    -- newly published scene from the one it last rendered. Zero until an
+    -- application thread has published one.
   , stepDemand ∷ !OwnerDemand
+  , stepDemandRevision ∷ !Natural
+    -- ^ The revision of the demand's publication: two publications of equal
+    -- demand are two requests, which only the revision tells apart. Zero
+    -- until the main thread has published any.
   , stepTargets ∷ ![TargetStepView]
   }
 
@@ -448,6 +460,23 @@ data TargetRetire = TargetRetire
     -- ^ Whether the backend's construction had accepted it. A partial or
     -- unverified target is retired too, and is told so here.
   }
+  deriving (Eq, Show)
+
+-- | Whether one target's retirement can be performed now.
+--
+-- A backend whose target holds obligations only later evidence can end — a
+-- presentation whose present fence has not been observed yet — begins its
+-- retirement by closing what it can, and answers 'RetirementOwed' until that
+-- evidence has arrived: its retirement is then performed on a later round, and
+-- nothing is certified meanwhile. It is scheduling, never evidence: an answer
+-- of either kind retires nothing and certifies nothing, and only the
+-- retirement operation's own record does.
+data RetirementReadiness
+  = RetirementReady
+  | RetirementOwed !Text
+    -- ^ Not yet, and why. The owner asks again at a later round — at the
+    -- backend's own next deadline, or when its wake asks — and, in its exit
+    -- drain, waits for that deadline between asking.
   deriving (Eq, Show)
 
 -- | What the owner tells its backend when it retires itself.
@@ -493,6 +522,11 @@ data GraphicsOperations scene = GraphicsOperations
     -- round now — a failure its own worker recorded while the owner had no
     -- deadline, say. The waiting owner rereads it; it must stay 'False' once
     -- the round it asked for has answered it.
+  , graphicsPrepareRetirement ∷ TargetRetire → IO RetirementReadiness
+    -- ^ Begin retiring one target, and say whether its retirement can be
+    -- performed now. The owner asks before every attempt, on every round until
+    -- the answer is 'RetirementReady', and then retires the target once. It
+    -- must return finitely. Raising is a failed retirement.
   , graphicsRetireTarget ∷ TargetRetire → IO TargetRetired
     -- ^ Retire one target. Returning is the evidence; raising is not.
   , graphicsRetireOwner ∷ OwnerRetire → IO OwnerRetired
@@ -927,6 +961,21 @@ awaitOwnerRound owner seen = do
   check (statusRounds status > seen || finished)
   pure status
 
+-- | Whether the owner has taken the latest published render demand into a
+-- step.
+--
+-- A publisher that accumulates demand until it has been taken reads this to
+-- know when it may stop republishing what it already published: the demand is
+-- a latest-value snapshot, so a newer publication replaces an older one the
+-- owner never read, and only a publisher that keeps what was not yet taken in
+-- every later publication loses nothing. Coordination only; the owner never
+-- waits for anybody to read it.
+readOwnerDemandTaken ∷ GraphicsOwner scene → STM Bool
+readOwnerDemandTaken owner = do
+  (_, published) ← readOwnerDemandAt (ownerHandoff' owner)
+  (seen, _) ← readTVar (ownerSeenInputs owner)
+  pure (seen >= published)
+
 -- | Wake the host's main thread, exactly as an admitted completion notice
 -- does.
 --
@@ -1202,7 +1251,7 @@ deadlineInstant = \case
 offerStep ∷ GraphicsOwner scene → IO (StepReport, NextDeadline)
 offerStep owner = do
   now ← readInstant (ownerClock owner)
-  (scene, demand, views) ← atomically $ do
+  (scene, sceneRevision, demand, demandRevision, views) ← atomically $ do
     (scene, sceneRevision) ← readOwnerSceneAt handoff
     (demand, demandRevision) ← readOwnerDemandAt handoff
     states ← readTVar (ownerTargets owner)
@@ -1211,8 +1260,8 @@ offerStep owner = do
     -- wait below can never conclude that a publication this step did not see
     -- has already been folded.
     writeTVar (ownerSeenInputs owner) (demandRevision, sceneRevision)
-    pure (scene, demand, map (stepView geometry) (Map.toAscList states))
-  report ← graphicsStep operations (OwnerStep now scene demand views) >>= evaluate
+    pure (scene, sceneRevision, demand, demandRevision, map (stepView geometry) (Map.toAscList states))
+  report ← graphicsStep operations (OwnerStep now scene sceneRevision demand demandRevision views) >>= evaluate
   deadline ← graphicsNextDeadline operations >>= evaluate
   pure (report, deadline)
   where
@@ -1381,31 +1430,50 @@ retireOneTarget owner target state = case targetConstruction state of
   -- unrecorded, and the drain would offer the operation again — disposing a
   -- second time what the backend has already disposed, which is exactly the
   -- blind retry this design admits nowhere.
+  --
+  -- It is attempted only once the backend says it can be performed now: a
+  -- target whose obligations wait on evidence yet to arrive is asked again at
+  -- a later round, and nothing is recorded meanwhile.
   _ →
-    mask $ \restore →
-      tryWithContext
-        ( restore
-            ( graphicsRetireTarget
-                (ownerOperations (ownerSettings owner))
-                (TargetRetire target (attachmentWindow target) (constructed (targetConstruction state)))
-                >>= evaluate
-            )
-        )
-        >>= \case
-          -- A failed retirement preserves its evidence and manufactures no
-          -- acknowledgement: no record is written, so nothing downstream can
-          -- mistake the attempt for the fact, the target stays in the owner's
-          -- table, and it is marked so that nothing offers the operation
-          -- again.
-          Left failure → do
-            atomically
-              ( modifyTVar'
-                  (ownerTargets owner)
-                  (Map.adjust (\held → held {targetRetirementFailed = True}) target)
-              )
-            retainFailure owner failure
-          Right retired → ownerSettled owner >> settle (evidenceDetail retired)
+    tryWithContext (graphicsPrepareRetirement (ownerOperations (ownerSettings owner)) retiring >>= evaluate) >>= \case
+      -- A cancellation during the preparation is not a failed retirement: the
+      -- preparation disposes of nothing the owner records, so the target
+      -- stays owed and the drain asks again.
+      Left failure@(ExceptionWithContext _ exception)
+        | isAsynchronous exception → rethrowIO failure
+      Left failure → do
+        atomically
+          ( modifyTVar'
+              (ownerTargets owner)
+              (Map.adjust (\held → held {targetRetirementFailed = True}) target)
+          )
+        retainFailure owner failure
+      Right (RetirementOwed _) → pure ()
+      Right RetirementReady → retireNow
   where
+    retiring = TargetRetire target (attachmentWindow target) (constructed (targetConstruction state))
+    retireNow =
+      mask $ \restore →
+        tryWithContext
+          ( restore
+              ( graphicsRetireTarget (ownerOperations (ownerSettings owner)) retiring
+                  >>= evaluate
+              )
+          )
+          >>= \case
+            -- A failed retirement preserves its evidence and manufactures no
+            -- acknowledgement: no record is written, so nothing downstream can
+            -- mistake the attempt for the fact, the target stays in the owner's
+            -- table, and it is marked so that nothing offers the operation
+            -- again.
+            Left failure → do
+              atomically
+                ( modifyTVar'
+                    (ownerTargets owner)
+                    (Map.adjust (\held → held {targetRetirementFailed = True}) target)
+                )
+              retainFailure owner failure
+            Right retired → ownerSettled owner >> settle (evidenceDetail retired)
     settle evidence = do
       atomically $ do
         recordTargetTerminal (ownerHandoff' owner) target evidence allRetirementFacts
@@ -1590,7 +1658,7 @@ ownerDrain owner restore started = do
   -- window for, and an owner that never took the event would leave it with no
   -- evidence to validate and no path to one.
   takeLifetimeEvents owner
-  afterTargets ← drainTargets noOwnerDrain
+  afterTargets ← drainOwed =<< drainTargets noOwnerDrain
   unverified ← Map.keys <$> readTVarIO (ownerTargets owner)
   (retiredEvidence, afterRetire) ←
     absorbing afterTargets (graphicsRetireOwner operations (OwnerRetire started unverified) >>= evaluate)
@@ -1631,6 +1699,47 @@ ownerDrain owner restore started = do
           <$> tryWithContext (restore (publishOwed owner))
       either (`absorbOwnerFailure` published) (const published)
         <$> tryWithContext (forgetValidatedTargets owner)
+    -- A target whose retirement the backend cannot perform yet — its
+    -- obligations wait on evidence still to arrive — is asked again, between
+    -- waits for the backend's own next deadline, until it has been
+    -- retired or its retirement has failed. The waits are the backend's, so
+    -- nothing spins, and no timeout ends them: a timeout is not evidence. A
+    -- cancellation does end them, as it ends no retirement: what is still owed
+    -- then stays with the owner, unverified, and whole-owner retirement is told
+    -- so by name.
+    drainOwed accumulated = do
+      owed ← Map.keys . Map.filter (not . targetRetirementFailed) <$> readTVarIO (ownerTargets owner)
+      if null owed || isJust (drainCancellation accumulated)
+        then pure accumulated
+        else do
+          (_, waited) ← absorbing accumulated (awaitOwedRetirement owner)
+          if isJust (drainCancellation waited)
+            then pure waited
+            else drainOwed =<< drainTargets waited
+
+-- | Wait, in the exit drain, until the backend's own next deadline has come,
+-- with no round in between: the drain is the owner's last work, and nothing
+-- else it could do is owed. A backend that names no deadline is asked again
+-- after 'owedRetirementFallback'. The backend's wake is not read here: it asks
+-- for a round, and the drain takes none.
+awaitOwedRetirement ∷ GraphicsOwner scene → IO ()
+awaitOwedRetirement owner = do
+  deadline ← graphicsNextDeadline operations >>= evaluate
+  now ← readInstant (ownerClock owner)
+  expired ← case deadline of
+    OwnerDeadline due
+      | deadlineReached now due → pure (pure True)
+      | otherwise → arm (remainingUntil now due)
+    NoOwnerDemand → arm owedRetirementFallback
+  atomically (expired >>= check)
+  where
+    operations = ownerOperations (ownerSettings owner)
+    OwnerTimer arm = ownerClockTimer (ownerSettings owner)
+
+-- | How long the exit drain waits before asking again about a retirement the
+-- backend could not perform yet and named no deadline for: P-15's idle bound.
+owedRetirementFallback ∷ Duration
+owedRetirementFallback = either (error . show) id (durationFromNanoseconds RequirePositive 100000000)
 
 -- | Keep a synchronous failure; defer the first cancellation and absorb the
 -- rest, so repeated cancellation cannot cut the drain short.

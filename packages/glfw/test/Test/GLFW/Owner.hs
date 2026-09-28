@@ -46,6 +46,7 @@ import Control.Exception
   )
 import Control.Exception (finally)
 import Control.Monad (forM, forM_, unless, void, when)
+import Data.List (isSubsequenceOf, nub)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust, isNothing)
@@ -150,6 +151,8 @@ spec = describe "GLFW graphics owner" $ do
       (boundedExample testOwnDeadline)
     it "wakes an idle owner for newly published demand and a newer scene"
       (boundedExample testPublicationWakesIdleOwner)
+    it "hands its step each publication's revision, so equal publications stay distinct, and says when demand was taken"
+      (boundedExample testStepRevisions)
 
   describe "the bounded lifetime port" $ do
     it "reports a full port as backpressure, having reserved and attached nothing"
@@ -166,6 +169,12 @@ spec = describe "GLFW graphics owner" $ do
       (boundedExample testExitOrder)
     it "acknowledges one released target while the owner and a second target stay live"
       (boundedExample testIndividualRelease)
+    it "asks again on a later round for a released target whose retirement is owed, certifying nothing meanwhile"
+      (boundedExample testOwedRetirementRetried)
+    it "waits in its exit drain for a retirement still owed, and retires the target before the owner"
+      (boundedExample testOwedRetirementDrained)
+    it "leaves a retirement owed, not failed, when a cancellation lands in its preparation, and retires it in the drain"
+      (boundedExample testPreparationCancelled)
     it "retires the target of a window closed through its own port, with no detach at all"
       (boundedExample testWindowCloseRetiresTarget)
     it "strands nothing when the host's admission closes during a handover"
@@ -303,6 +312,7 @@ data Fake = Fake
   , fakeConstruct ∷ !(TVar (TargetStart → IO TargetHandoff))
   , fakeStep ∷ !(TVar (OwnerStep Scene → IO StepReport))
   , fakeDeadline ∷ !(TVar (IO NextDeadline))
+  , fakePrepare ∷ !(TVar (TargetRetire → IO RetirementReadiness))
   , fakeRetireTarget ∷ !(TVar (TargetRetire → IO TargetRetired))
   , fakeRetireOwner ∷ !(TVar (OwnerRetire → IO OwnerRetired))
   , fakeDestroy ∷ !(TVar (OwnerDestroy → IO OwnerDestroyed))
@@ -323,6 +333,7 @@ newFake journal =
     <*> newTVarIO (\start → pure (TargetConstructed (targetEvidence (describeTarget start))))
     <*> newTVarIO (\_ → pure noStepWork)
     <*> newTVarIO (pure NoOwnerDemand)
+    <*> newTVarIO (\_ → pure RetirementReady)
     <*> newTVarIO (\retire → pure (targetRetired (Text.pack (show (retiringWindow retire)))))
     <*> newTVarIO (\_ → pure (ownerRetired "retired"))
     <*> newTVarIO (\_ → pure (ownerDestroyed "destroyed"))
@@ -357,6 +368,9 @@ fakeOperations fake =
         readTVarIO (fakeStep fake) >>= ($ step)
     , graphicsNextDeadline = mark >> readTVarIO (fakeDeadline fake) >>= id
     , graphicsWake = pure False
+    , graphicsPrepareRetirement = \retire → do
+        mark
+        readTVarIO (fakePrepare fake) >>= ($ retire)
     , graphicsRetireTarget = \retire → do
         mark
         atomically (modifyTVar' (fakeRetirements fake) (<> [retire]))
@@ -1627,6 +1641,145 @@ testPublicationWakesIdleOwner = do
   afterScene `shouldSatisfy` (> afterDemand)
   -- The scene the owner stepped with is the one that was published.
   last scenes `shouldBe` Scene 7
+
+-- | Every step is handed the revision of the demand and of the scene it was
+-- given, so two publications of the same demand are two requests; and the
+-- demand's publisher can tell when the owner has taken its latest one.
+testStepRevisions ∷ IO ()
+testStepRevisions = do
+  rig ← newRig
+  revisions ← newTVarIO []
+  script (fakeStep (rigFake rig)) $ \step → do
+    atomically (modifyTVar' revisions (<> [(stepDemandRevision step, stepSceneRevision step)]))
+    pure noStepWork
+  (untakenAtPublication, taken, seen) ← ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \_ owner _control → do
+    first ← awaitIdle owner
+    demand ← prepare (OwnerDemand True Nothing)
+    -- Read in the transaction that published it, the demand cannot have been
+    -- taken yet.
+    untaken ← atomically $ do
+      _ ← publishOwnerDemand (ownerHandoff owner) demand
+      not <$> readOwnerDemandTaken owner
+    afterFirst ← atomically (awaitOwnerRound owner (statusRounds first))
+    second ← awaitIdle owner
+    _ ← atomically (publishOwnerDemand (ownerHandoff owner) demand)
+    _ ← atomically (awaitOwnerRound owner (statusRounds second))
+    third ← awaitIdle owner
+    scene ← prepare (Scene 3)
+    _ ← atomically (publishOwnerScene (ownerHandoff owner) scene)
+    _ ← atomically (awaitOwnerRound owner (statusRounds third))
+    _ ← awaitIdle owner
+    taken ← atomically (readOwnerDemandTaken owner)
+    seen ← readTVarIO revisions
+    statusRounds afterFirst `shouldSatisfy` (> 0)
+    pure (untaken, taken, seen)
+  untakenAtPublication `shouldBe` True
+  taken `shouldBe` True
+  -- Two equal demands, two revisions, and the scene's own beside them.
+  let demands = nub (map fst seen)
+      scenes = nub (map snd seen)
+  demands `shouldSatisfy` (\held → [1, 2] `isSubsequenceOf` held)
+  scenes `shouldSatisfy` (\held → maximum held > minimum held)
+
+-- | A released target whose backend says its retirement cannot be performed
+-- yet is asked again on a later round, and nothing is retired or certified
+-- until it can be.
+testOwedRetirementRetried ∷ IO ()
+testOwedRetirementRetried = do
+  rig ← newRig
+  asked ← newTVarIO (0 ∷ Int)
+  ready ← newTVarIO False
+  script (fakePrepare (rigFake rig)) $ \_ → atomically $ do
+    modifyTVar' asked (+ 1)
+    open ← readTVar ready
+    pure (if open then RetirementReady else RetirementOwed (Text.pack "a present fence is pending"))
+  (whileOwed, certifiedWhileOwed, askedInAll, retiredOnce) ←
+    ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control → do
+      window ← theWindow host
+      service ← handedOver host owner window
+      awaitConstructed rig (Text.pack (show window))
+      _ ← releaseGraphicsTarget host owner service
+      atomically (readTVar asked >>= check . (>= 1))
+      _ ← awaitIdle owner
+      whileOwed ← readTVarIO (fakeRetirements (rigFake rig))
+      certified ← Map.member (graphicsAttachment service) <$> atomically (readTargetTerminalsNow owner)
+      atomically (writeTVar ready True)
+      -- Whatever takes the owner's next round asks again: here, a publication.
+      demand ← prepare (OwnerDemand False Nothing)
+      _ ← atomically (publishOwnerDemand (ownerHandoff owner) demand)
+      _ ← awaitTerminal owner service
+      total ← readTVarIO asked
+      retirements ← readTVarIO (fakeRetirements (rigFake rig))
+      pure (whileOwed, certified, total, length retirements)
+  whileOwed `shouldBe` []
+  certifiedWhileOwed `shouldBe` False
+  askedInAll `shouldSatisfy` (>= 2)
+  retiredOnce `shouldBe` 1
+
+-- | A retirement still owed when the owner exits is asked again in its drain,
+-- between waits for the backend's own deadline, and the target is retired
+-- before the owner is.
+testOwedRetirementDrained ∷ IO ()
+testOwedRetirementDrained = do
+  rig ← newRig
+  asked ← newTVarIO (0 ∷ Int)
+  ownerCell ← newTVarIO Nothing
+  -- Owed while the owner is running — the host's quiescence may begin the
+  -- attachment's retirement while rounds are still being taken — and ready
+  -- only at the drain's second ask, so the drain itself has to wait.
+  script (fakePrepare (rigFake rig)) $ \_ → atomically $ do
+    phase ← readTVar ownerCell >>= traverse (fmap statusPhase . readOwnerStatusNow)
+    let draining = phase == Just OwnerRetiring
+    when draining (modifyTVar' asked (+ 1))
+    count ← readTVar asked
+    pure (if draining && count > 1 then RetirementReady else RetirementOwed (Text.pack "a present fence is pending"))
+  ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control → do
+    atomically (writeTVar ownerCell (Just owner))
+    window ← theWindow host
+    _ ← handedOver host owner window
+    awaitConstructed rig (Text.pack (show window))
+    -- The drain's wait is the backend's: this one names no deadline, so the
+    -- drain arms its fallback, and this fires it once it has.
+    _ ← forkIO $ do
+      atomically (readTVar (timerArmings (rigTimer rig)) >>= check . not . null)
+      fireTimer (rigTimer rig)
+    pure ()
+  notes ← journalled (rigJournal rig)
+  ordered
+    notes
+    [ OwnerStartup
+    , Constructed (Text.pack "WindowId 1")
+    , TargetRetirement (Text.pack "WindowId 1")
+    , OwnerRetirement
+    , OwnerDestruction
+    , WindowGone 1
+    ]
+  readTVarIO asked `shouldReturn` 2
+  armings ← readTVarIO (timerArmings (rigTimer rig))
+  armings `shouldSatisfy` (not . null)
+
+-- | A cancellation delivered inside a retirement's preparation ends the
+-- owner's run as any cancellation does, but it is not a failed retirement:
+-- the preparation disposed of nothing, so the drain asks again and retires the
+-- target, once.
+testPreparationCancelled ∷ IO ()
+testPreparationCancelled = do
+  rig ← newRig
+  asked ← newTVarIO (0 ∷ Int)
+  script (fakePrepare (rigFake rig)) $ \_ → do
+    count ← atomically (modifyTVar' asked (+ 1) >> readTVar asked)
+    if count == 1 then throwIO ThreadKilled else pure RetirementReady
+  outcome ← ownedHostCaught (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control → do
+    window ← theWindow host
+    service ← handedOver host owner window
+    awaitStanding owner service `shouldReturn` TargetUsable
+    _ ← releaseGraphicsTarget host owner service
+    atomically (readOwnerTerminalNow owner >>= check . ownerRunEnded)
+  _ ← raisedBy outcome
+  retirements ← readTVarIO (fakeRetirements (rigFake rig))
+  length retirements `shouldBe` 1
+  notes ← journalled (rigJournal rig)
+  ordered notes [TargetRetirement (Text.pack "WindowId 1"), OwnerRetirement, OwnerDestruction]
 
 -- | Wait until the owner has settled into a round it will not leave by itself.
 --

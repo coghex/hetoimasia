@@ -3716,7 +3716,10 @@ owner turn's native event call for 68.92 s and a menu interaction for 13.30 s,
 with no owner turn in either. Rendering from the owner turn therefore means a
 stale or stretched surface for the whole interaction. The owner is the
 [Vulkan design](vulkan_backend_design.md)'s D-29 answer, and this section is
-its delivered contract; D-32 is why the backend operations are injected rather
+its delivered contract. The Vulkan integration's `runVulkanOwnerLoop` composes
+it with the scheduled owner turn — observations, captured render demand and
+the owner's deadline crossing every turn — which is VK-16's, in
+[gpu_backend.md](gpu_backend.md#the-composed-loop); D-32 is why the backend operations are injected rather
 than built in, and D-33 is the exit order below.
 
 #### What the owner may and may not do
@@ -3746,7 +3749,8 @@ and nothing else.
 | `graphicsStep` | One bounded progress step, which must return finitely, reporting whether further work is owed at once. |
 | `graphicsNextDeadline` | The earliest absolute instant the backend next wants a round, or no demand. |
 | `graphicsWake` | Whether something the backend watches on another thread asks for a round now; the waiting owner rereads it, and it must stay false once the round it asked for has answered it. |
-| `graphicsRetireTarget` | Retire one target. |
+| `graphicsPrepareRetirement` | Begin retiring one target and say whether its retirement can be performed now (`RetirementReady`), or is owed until evidence the backend is waiting for arrives (`RetirementOwed`, with why). It is scheduling, never evidence, and must return finitely. |
+| `graphicsRetireTarget` | Retire one target, once its preparation answered ready. |
 | `graphicsRetireOwner` | Retire the owner itself, told whether startup ever returned and which targets could not be accounted for. |
 | `graphicsDestroyOwner` | Release the owner's shared state. |
 
@@ -3969,6 +3973,26 @@ only independent evidence revives it.
 
 #### The owner's own scheduling
 
+Each step is handed the latest demand and scene beside the revision of each
+one's publication (`stepDemandRevision`, `stepSceneRevision`): two
+publications of equal demand are two requests, which only the revision tells
+apart, and a backend acts on each once. `readOwnerDemandTaken` tells the
+demand's publisher, on any thread, whether the owner has taken its latest
+publication into a step — which is what lets a publisher that accumulates
+demand stop republishing what the owner has already seen, since a newer
+publication replaces an older one it never read.
+
+A released target's retirement is performed only once the backend's
+preparation answers ready. Until then it is asked again on each later round —
+at the backend's own next deadline, or when its wake asks — and nothing is
+recorded; a preparation that raised is a failed retirement, and is never
+offered again — except a cancellation, which the preparation's answer never
+reached: that ends the run like any other, and the drain asks again. The exit drain asks every owed retirement again between waits
+for the backend's own next deadline — no round runs then, and the backend's
+wake is not read — until each is retired or has failed. No timeout ends that
+wait, because a timeout is not evidence; a cancellation ends it, leaving what
+is still owed with the owner, unverified, and named to whole-owner retirement.
+
 The owner schedules its own waits from its own deadlines and its own demand, on
 the host's injected `hostClock` and an injected `OwnerTimer`. It wakes for a
 stop, a latched terminal failure, a lifetime event, a fresher observation, a
@@ -3995,6 +4019,16 @@ the stall lasts. A rendered latest snapshot does not mean gameplay or input
 continued either; simulation is application-owned and thread-agnostic, and an
 application that drives it from the main loop is stalled with it. What the
 owner removes is the stale or stretched surface, not the stall.
+
+**The stated limit.** That the owner *keeps rendering* is a claim about its
+own thread: it keeps making requests and observing their completion while the
+main thread is blocked. Whether a frame it presents during a platform modal
+loop becomes visible is the platform's, and no headless example and no
+present call's return can show it; the Vulkan integration's
+[graphics-owner interaction probe](gpu_backend.md#the-native-suite) measures
+what happens on Cocoa, and
+[its verdict](graphics_owner_interaction_verdict.md) says what was and was not
+established.
 
 #### The extent seam
 
@@ -4251,7 +4285,13 @@ and a full one preventing neither the stop, nor terminal evidence, nor the exit;
 repeated cancellation absorbed by the drain with the target, the owner, its
 destruction, the window and the session still in that order; the D-33 exit
 order; one released target acknowledged while the owner and a second target
-stay live; the main thread's bounded housekeeping during the wait, made on the
+stay live; a released target whose retirement is owed asked again on a later
+round with nothing retired or certified meanwhile, one still owed at the
+exit asked again in the drain after its deadline, retired before the owner, and
+one whose preparation a cancellation interrupted retired by the drain, once;
+each step handed the demand's and the scene's revisions, two equal demands as
+two, and the demand's publisher told when the owner took it; the main thread's
+bounded housekeeping during the wait, made on the
 main thread; whole-owner retirement with no target ever attached and after the
 last one detached; a failed startup drained through the same retirement and
 told that startup never returned; a failure raised before application
@@ -5623,7 +5663,12 @@ native call's entry and exit with whether it polled or waited and the seconds it
 asked for, each window callback as it is delivered, and the update hook's entry
 and exit — is stamped from one monotonic clock, so a callback delivered from
 inside a blocked pump is ordered between that pump's entry and its exit. The
-trace is record-only and bounded: it keeps the first `defaultTraceCapacity`
+trace is record-only and bounded, and reachable outside this package only
+through the public `Hetoimasia.Runtime.GLFW.Trace` — a host's `hostTrace`, the
+operations to start, take and stop it, and `recordTrace` with `Marked` for a
+probe's own records from any thread — which is how the Vulkan integration's
+[graphics-owner probe](gpu_backend.md#the-native-suite) extends this
+measurement. It keeps the first `defaultTraceCapacity`
 records, numbers the ones it drops so a gap is visible, counts a recording that
 could not be made as a fault rather than raising it inside a C frame, and marks
 evidence with either count above zero as incomplete. Every session owns one and

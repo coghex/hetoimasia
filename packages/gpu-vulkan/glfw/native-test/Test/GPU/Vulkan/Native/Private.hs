@@ -34,6 +34,9 @@
 -- * @vk15-retention@ — VK-15's retained unverified resource, reported rather
 --   than released, ending by process termination rather than orderly cleanup
 --   (#231);
+-- * @vk16-composed@ — VK-16's two targets rendered through the composed loop,
+--   one suspended and resumed while the other keeps presenting, and the host's
+--   exit through D-33 ("Test.GPU.Vulkan.Native.Composed", #232);
 -- * @synchronization-hazard@ — the negative control that proves
 --   synchronization validation active ("Test.GPU.Vulkan.Native.Hazard");
 -- * @debug-names@ — #250's provoked validation report on a named managed
@@ -78,6 +81,7 @@ import Test.Hspec.Runner (Config (configFailOnEmpty), defaultConfig, evalSpec, r
 import Test.GPU.Vulkan.Native.Consent (Consent, Refusal, refusalMessage)
 import Test.GPU.Vulkan.Native.Environment (checkValidationFeatures)
 import Test.GPU.Vulkan.Native.Gate (Gate, admit)
+import qualified Test.GPU.Vulkan.Native.Composed as Composed
 import qualified Test.GPU.Vulkan.Native.Frames as Frames
 import qualified Test.GPU.Vulkan.Native.Hazard as Hazard
 import qualified Test.GPU.Vulkan.Native.Naming as Naming
@@ -178,6 +182,12 @@ scenarios =
       $ \_ journal conclude →
         Terminal.runRetention journal $ \outcome →
           conclude (Terminal.retentionSpec outcome, section "The VK-15 retention record" (Terminal.retentionSection outcome))
+  , Scenario
+      "vk16-composed"
+      "renders two targets through the composed loop, suspending and resuming one while the other presents, and exits through D-33 with validation reporting nothing"
+      $ \_ journal _ → do
+        outcome ← Composed.runComposed journal
+        pure (Composed.spec outcome, section "The VK-16 composed loop record" (Composed.composedSection outcome))
   , Scenario
       "synchronization-hazard"
       "observes a deliberate synchronization hazard, proving synchronization validation active"

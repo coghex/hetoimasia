@@ -118,13 +118,19 @@ Guide is advisory and does not replace Kanban approval or project-review records
   device's loss is kept apart from the primary (model `noteDeviceLoss`). After
   a loss the frames ask and wait on no fence and release what only the lost
   device could discharge (`releaseToDeviceLoss`), never as completion. No
-  device loss is induced natively. All of it is driven on private roots by
-  native cases; the controller wires in neither the recording nor the frames
-  (VK-16). #229 (VK-14) adds recovery: a
+  device loss is induced natively. #232 (VK-16) wires the recording and the
+  frames into the controller's step — demand, a newer scene, a changed
+  generation or a resumption asks a target for a frame; acquisitions and fence
+  polls are paced on the owner's deadlines and the model's `progressDeadline`
+  (render demand left out); a target's retirement is `RetirementOwed` until its
+  frames and presentations have gone on their own evidence — and adds
+  `runVulkanOwnerLoop`, which publishes observations, captured window demand
+  and replacement surfaces every turn and folds the owner's deadline into the
+  main loop's wait. #229 (VK-14) adds recovery: a
   lost surface's generations go, then the surface, and the episode admits an
   attempt; the controller asks the main thread for a replacement through
   #216's `replaceWindowSurface` under the same attachment
-  (`replaceVulkanSurfaces`, which the application runs until VK-16), rechecks
+  (`replaceVulkanSurfaces`, which `runVulkanOwnerLoop` runs every turn), rechecks
   the one device's support and builds a fresh generation. An unrecoverable
   optional target is reported unavailable (`readVulkanUnavailability`, read
   from the model's escalation, since the model forgets an unavailable target
@@ -314,8 +320,22 @@ Guide is advisory and does not replace Kanban approval or project-review records
   (`Hetoimasia.Runtime.GLFW.Internal.Owner`, contract in
   [glfw.md](docs/glfw.md#the-supervised-graphics-owner)), with its backend
   operations injected and proved through fakes; VK-7/#219 supplies the Vulkan
-  ones and VK-16/#232 owes the Cocoa progress evidence. The owner removes the
-  stale or stretched surface, not the stall: window commands and observations
+  ones. VK-16/#232 measured the Cocoa progress
+  ([verdict](docs/graphics_owner_interaction_verdict.md), 2026-09-28). Its
+  first session found a live resize starving the owner for 15.44 s: P-15's
+  16 ms quiet period outlasted Cocoa's ~8.5 ms framebuffer changes, and the
+  frames acquired nothing from a settling target. The owner then chose the
+  surveyed engines' approach: a move is coalesced for 16 ms from its first
+  sighting and built from the newest extent, and the active generation keeps
+  presenting while a replacement waits (P-15 amended). That needed MoltenVK
+  1.4.2, since 1.4.0 sets the drawable to 1x1 when a swapchain is recreated
+  over an in-flight presentation, which spent the required target's recovery.
+  The pin moved, a CI-image requalification. Under both, the owner presented
+  at display rate through a 14.55 s live resize (506 generations, longest gap
+  19 ms) and a 23.47 s menu block. The owner removes the
+  stale or stretched surface during both modal loops (visibility is
+  testimony, not evidence), but
+  not the stall: window commands and observations
   still wait for the pump, and a rendered latest snapshot does not mean
   gameplay or input continued. The [verdict](docs/owner_loop_interaction_verdict.md) is historical
   measurement, not a later policy decision. Its probe stays selectable, never

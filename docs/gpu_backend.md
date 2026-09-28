@@ -67,14 +67,20 @@ batch and every dynamic-rendering pass is bracketed in balanced command-buffer
 labels, which [the diagnostic capture](vulkan_diagnostics.md) now copies. See
 [Names and labels](#names-and-labels).
 
-Frames are acquired, submitted, presented and abandoned by the native
-package's frames module, and its native cases drive them on private roots; the
-controller wires neither the recording nor the frames in, and the owner's
-progress step reports no render demand. Its deadlines are the brief
-self-scheduled watch over an attachment whose announcement a full port
-deferred, described below, and the generations' own: a settling resize, a
-deferred recovery attempt, and the model's schedule for a retired generation
-still held. Composing the frames into the owner's loop is VK-16's. A required
+VK-16 ([#232](https://github.com/coghex/hetoimasia/issues/232)) composes
+**rendering** into the graphics owner and the owner into the main thread's
+loop. The controller constructs the recording and the frames on the owner's
+thread and renders the scene the owner holds when render demand, a newer scene,
+a changed generation or a resumption asks a target for a frame; it paces its
+own acquisition retries and completion polls on the owner's deadlines and the
+model's idle backoff; and a retiring target's retirement is owed until every
+frame and presentation of it has gone on its own evidence.
+`runVulkanOwnerLoop` is the main thread's scheduled owner loop with the owner
+composed in: each turn it publishes the windows' observations, their captured
+render demand and the replacement surfaces the owner asked for, and bounds its
+own wait by the owner's published deadline, with no second engine loop and no
+GPU work on the main thread. D-5, D-15, D-18, D-22 and D-29–D-31, D-33, P-5,
+P-6, P-12 and P-15. See [The composed loop](#the-composed-loop). A required
 target's exhaustion fails the session through the terminal latch, and
 device-loss teardown across submitted work and pending presentations is the
 frames' own ([Terminal failure](#terminal-failure)).
@@ -205,9 +211,17 @@ freed under a messenger that may still name it.
 `VulkanHostConfig` names the host configuration, the capture configuration,
 the instance layers to enable (each must be offered by the loader), the model's
 budgets, the owner's initial scene, an adjustment to the owner's configuration,
-and a `NativeObserver`: something that wraps every native call the controller
-makes, for evidence. It must run each call once and answer what it answered; it
-decides nothing, and the default observes nothing.
+a `NativeObserver`: something that wraps every native call the controller
+makes — the recording's and the frames' included — for evidence, a
+`VulkanRenderer`, and a `FrameObserver`. The observer must run each call once
+and answer what it answered; it decides nothing, and the default observes
+nothing. The renderer records one frame of the scene between the controller's
+transitions into rendering and to presentation (`clearRenderer`, the default,
+clears it to opaque black); the frame observer is told each acquisition,
+submission, present request, present return and observed completion, on the
+owner's thread, and the default is told nothing.
+`withVulkanOwnerHostOver` also takes the recording's and the frames' native
+layers (`RenderingOps`); `withVulkanOwnerHost` supplies the production ones.
 
 ## Threads
 
@@ -216,11 +230,13 @@ decides nothing, and the default observes nothing.
 | Loader-aware session, extension copy, window creation, each surface's creation through GLFW | The process main thread |
 | Instance and messenger creation and destruction, device selection and creation, the later-target check, every surface's destruction, device destruction | The graphics owner |
 | Every surface query, swapchain and image view creation and destruction | The graphics owner |
-| Publishing a target's observation (`publishGraphicsObservation`) | The main thread; until VK-16's loop adapter does it every turn, the application does it |
+| Publishing a target's observation (`publishGraphicsObservation`) and capturing its window's render demand | The main thread: `runVulkanOwnerLoop` does both every turn |
+| Publishing the scene (`publishVulkanScene`) | Any application thread |
+| Recording, acquiring, submitting, presenting, abandoning, asking a fence, and destroying frame synchronization and frame storages | The graphics owner |
 | Holding and ending a generation's CPU use | Any thread, in `STM` |
 | Reporting a swapchain call's out-of-date, suboptimal or surface-lost result | The graphics owner, whose acquisitions and presentations produce it |
 | Destroying a lost surface, rechecking a replacement's support, a reclamation pass | The graphics owner |
-| Creating a replacement surface under a target's existing attachment (`replaceVulkanSurfaces`) | The main thread; until VK-16's loop adapter does it every turn, the application does it |
+| Creating a replacement surface under a target's existing attachment (`replaceVulkanSurfaces`) | The main thread: `runVulkanOwnerLoop` does it every turn |
 
 The controller makes no GLFW call. A surface is destroyed through the loader
 capability's `vkDestroySurfaceKHR`, a Vulkan call, by the thread that holds its
@@ -372,9 +388,10 @@ framebuffer's size in physical pixels, never the window's: on a Retina display
 it is twice the window size.
 
 The observation reaches the owner through `publishGraphicsObservation` on the
-main thread. VK-16's loop adapter will publish one every turn; until then an
-application publishes it itself, after a handover and after anything that
-changes its window.
+main thread, which `runVulkanOwnerLoop` does every turn whenever the window's
+observation is newer than the one it last published. An application that
+drives its own loop publishes it itself, after a handover and after anything
+that changes its window.
 
 ### The profile
 
@@ -396,14 +413,19 @@ immediate, so the owner that reported a result takes the round that
 reconciles it rather than going idle. A report from another thread wakes
 nothing, and the package's public module does not offer one.
 
-- **Ordinary resize** is not a failed construction. The extent a replacement
-  would be built at is watched, with the observed geometry it was planned
-  from, and the generation is rebuilt only once both have been the same for
-  16 ms on the owner's monotonic clock (`Settling`); a newer observation
-  restarts the wait even while the surface still reports the old extent, so
-  only the newest geometry is built. A move that settles at the extent the
+- **Ordinary resize** is not a failed construction. A move is coalesced for
+  16 ms on the owner's monotonic clock from when it was first seen
+  (`Settling`), and then built from the newest extent and observed geometry. A
+  later change within the period joins the move rather than restarting its
+  wait, so a resize that never pauses — a Cocoa live resize changes the
+  framebuffer about every 8.5 ms — is rebuilt once a period rather than never.
+  Meanwhile the active generation keeps presenting
+  ([Acquisition](#acquisition)): a swapchain that answered suboptimal still
+  presents, scaled to the surface. A move that settles at the extent the
   active generation already has is adopted without a rebuild, and a move that
-  returns to the active generation's geometry is cancelled.
+  returns to the active generation's geometry is cancelled. A surface that
+  reports its new extent later than the period is reported by the active
+  generation's next suboptimal or out-of-date answer, as any resize is.
 - **Reconciliation without a fresh observation.** With a concrete surface
   extent, an out-of-date or suboptimal result is enough to rebuild at the
   surface's new extent: a main thread stalled in a platform modal loop does not
@@ -447,12 +469,16 @@ nothing, and the package's public module does not offer one.
 A target holds at most the model's generation limit, two by default, counting
 active, constructing and retired together. At capacity, every retired generation
 whose holds have ended is destroyed first; if the replacement still cannot fit,
-the target is `Backpressured` — suspended in the model — until a hold ends, and
-every other target and the owner carry on. With a limit of one, the active
+the target is `Backpressured` until a hold ends, and every other target and the
+owner carry on. When only the generation count is in the way and an active
+generation remains, the target keeps presenting from it: those frames spend
+nothing the replacement waits for, since the retired generation's holds end on
+their own present fences. Any other budget suspends the target in the model
+while it waits. With a limit of one, the active
 generation is the only thing in the way: it is retired on its own, awaited, and
-destroyed, and a fresh generation is built without it once its geometry has
-settled — every construction after a target's first is a replacement, and
-waits the same quiet period. No target reserves or
+destroyed, and a fresh generation is built without it once its move's period
+has passed — every construction after a target's first is a replacement, and
+is coalesced the same way. No target reserves or
 releases anything of another's.
 
 ### Holds
@@ -973,9 +999,12 @@ refusals](#checkpoints-and-refusals)). The target must be this session's
 (`ForeignIdentity`, `StaleIdentity` or `UnknownIdentity` otherwise — misuse,
 never pending), and admitted: a suspended target answers
 `AcquisitionSuspended`, a retiring one `AcquisitionClosing`, and an unavailable
-one `AcquisitionUnavailable`. Its generations
-must be presenting from an active generation: a target still constructing,
-settling a resize, backpressured or waiting to recover answers
+one `AcquisitionUnavailable`. It acquires from the
+active generation while its generations are presenting, and also while a
+replacement is settling or backpressured, so a live resize keeps rendering
+(on MoltenVK the image is scaled to the layer until the replacement is built).
+A target with no active generation — still constructing, or after a failed
+construction — or waiting to recover answers
 `AcquisitionPending PendingGeneration`; a spent recovery or an unsupported
 surface answers `AcquisitionUnavailable`.
 
@@ -1102,8 +1131,9 @@ step itself creates is taken by a further pass while the budget lasts. A step
 runs whatever the target's phase — closing included — and raises only once it has recorded
 everything that returned: device loss first, then the first cleanup failure or
 uncertain effect. VK-12's native case polls it a millisecond apart and
-VK-13's drains through `awaitFrames`; composing it into the owner's loop and
-the model's schedule is VK-16's.
+VK-13's drains through `awaitFrames`; the controller asks it only when the
+model's schedule says a poll is due or a frame is to be attempted
+([Polling completion](#polling-completion)).
 
 ### The protected handoff
 
@@ -1297,9 +1327,9 @@ terminal retirement fact, withheld from the protected host through #219's
 controller path. Closing the first-created target retires only its own frames,
 presentations, generations and surface: the shared device, the instance and
 every other target stay live, and another target keeps presenting throughout.
-The controller constructs no frames until VK-16 wires them in, so the
-controller's own retirement meets no presentation obligation yet; the order and
-the withheld evidence it will meet are the ones above, proved on private roots.
+The controller meets exactly this order: its retirement of a target is owed
+until the evidence has arrived ([Retiring a target](#retiring-a-target)), so
+it withholds nothing by raising and retries nothing.
 
 ## Recovery
 
@@ -1325,7 +1355,7 @@ due in and never polls or loops hot.
 
 | What happens | Is it an attempt? |
 | --- | --- |
-| An ordinary resize, however often the geometry moves | No: it settles for 16 ms and is built as a replacement ([Replacement](#replacement)) |
+| An ordinary resize, however often the geometry moves | No: it is coalesced for 16 ms and built as a replacement ([Replacement](#replacement)) |
 | An out-of-date or suboptimal result with unchanged geometry | Yes, each rebuild |
 | A construction after one that failed, a window still in use (`VK_ERROR_NATIVE_WINDOW_IN_USE_KHR`) included | Yes: the next attempt of the same episode, never a new one |
 | A lost surface's replacement, from asking for the surface to publishing a generation on it | Yes, one attempt; a construction on the new surface that fails spends the next |
@@ -1370,9 +1400,9 @@ changes nothing and never reaches the replacement. Then, on the owner's thread:
    main thread for each and wakes it. `replaceVulkanSurfaces`, on the main
    thread, creates the surface through the bridge's admitted replacement
    (`replaceWindowSurface`, [#216](https://github.com/coghex/hetoimasia/issues/216))
-   under that same attachment, and deposits what it created. Until VK-16's loop
-   adapter runs it every turn, the application runs it, as it publishes
-   observations.
+   under that same attachment, and deposits what it created.
+   `runVulkanOwnerLoop` runs it every turn; an application that drives its own
+   loop runs it, as it publishes observations.
 5. **Support is rechecked, then a fresh generation is built.** The owner's next
    step offers the surface to the generations (`offerReplacementSurface`). The
    roots ask `vkGetPhysicalDeviceSurfaceSupportKHR` of the session's one queue
@@ -1524,6 +1554,250 @@ and never releases or reattaches an attachment to reach the bridge.
 | `Internal.Reclamation` | `reclaimOnce`, `recoverAllocation` and `recoveringCreation`, over the roots' disposers and the model's allocation attempt |
 | `Roots` | `releaseRootSurface`, `installRootSurface`, the `NativeFailure` classifier and the disposer registry |
 | The controller | Asking for and settling replacements, `replaceVulkanSurfaces` on the main thread, the unavailability report and `VulkanRequiredTargetFailed` |
+
+## The composed loop
+
+VK-16 ([#232](https://github.com/coghex/hetoimasia/issues/232)) composes the
+graphics owner's rendering with the main thread's scheduled owner loop, TIME's
+deadlines and LIFE's retirement. There is still one engine loop: the main
+thread runs the GLFW package's `runScheduledOwnerLoop`, and the graphics owner
+is the supervised worker [VK-18](glfw.md#the-supervised-graphics-owner) already
+runs. What VK-16 adds is what crosses between them every turn, and what the
+owner's step does with it.
+
+### The loop adapter
+
+`runVulkanOwnerLoop` is `runScheduledOwnerLoop` over the host's window host
+with the application's own `ScheduledHooks`, and one addition to every turn.
+Once the application's update opportunity has returned, the main thread:
+
+1. **publishes observations** — for every window with an attachment, the
+   window's latest `WindowObservation` and the render eligibility the main
+   thread classified it as (`windowRenderEligibility`), whenever it is newer
+   than the one last published for that attachment;
+2. **publishes render demand** — it captures every such window's demand slot,
+   which is the acknowledgement the slot's publisher is owed, combines the
+   requests, and publishes them to the owner's demand snapshot. The snapshot
+   keeps only its latest value, so what was published and not yet taken into
+   an owner step (`readOwnerDemandTaken`) is kept and published again with
+   anything newer: a newer publication never replaces demand the owner has not
+   seen. Once taken, it is forgotten. A closed snapshot — the owner's admission
+   has ended — settles it, since nothing will render it;
+3. **creates replacement surfaces** the owner asked for
+   (`replaceVulkanSurfaces`, [Recovery](#recovery));
+4. **folds the owner's deadline** into the schedule the application's update
+   answered: the earliest absolute instant the owner last published, when it
+   is still ahead, bounds the turn's wait. It can shorten the main loop's wait
+   and never lengthen it: `NoUpdateDemand` becomes `UpdateBy` it, an earlier
+   `UpdateBy` stays, and `UpdateImmediately` stays. A deadline that has already
+   passed is left out: the owner schedules its own rounds, wakes the host after
+   each, and needs none of this to be read.
+
+None of it waits: every handoff is a latest-value snapshot or a non-blocking
+capture, and the main thread performs no GPU work. An application that runs
+this loop leaves observation publication and window demand capture to it — an
+observation published by hand at a higher revision would make the adapter's
+stale, and a slot the application captured itself would never reach the
+owner. A scene may be published from any application thread with
+`publishVulkanScene`.
+
+### What asks for a frame
+
+The owner's step is handed the latest demand and scene with the revisions of
+their publications (`stepDemandRevision`, `stepSceneRevision`), so two equal
+publications are two requests. Each constructed target records the latest
+revisions a step has considered for it, so a publication made before a target
+could take it — a first redraw arriving with its handover, taken by a round
+that had no target constructed yet — is still its request once it is
+constructed. A target is asked for a frame — the model's `requestRender`, which
+is also what restarts the idle backoff, and which supersedes any retry pending
+for it — when
+
+- a demand publication the owner has not acted on is due: immediate, or with a
+  deadline that has come; one still ahead is kept and asked for when it comes,
+  and the owner's deadline includes it. One publication can carry both parts —
+  two windows captured in one turn, one asking now and one by a later
+  deadline — and both are kept: the request now is served at once, and the
+  deadline when it comes. A held deadline that comes while no target is
+  constructed stays held until one is;
+- a scene publication the owner has not rendered arrives: the renderer renders
+  the latest scene, whichever application thread published it (D-31); or
+- a target that has presented before can no longer be showing the latest
+  scene: its active generation is not the one its last presentation went to,
+  or it has become eligible again after a suspension. A generation it moved to
+  is asked for once, however many rounds pass before a frame of it is
+  presented, so a frame refused meanwhile keeps its retry's pacing. And since
+  the step plans its frames before the generations' step, a replacement that
+  step publishes — a quiet target's, whose one allowed generation was disposed
+  of in that same step with nothing left owed — is asked for then and offered a
+  frame in the same step. A target already due in that step is offered its
+  frame on the replacement, and the replacement is recorded as asked for it
+  too.
+
+Nothing else asks. A target nobody asked a frame of is never rendered to,
+however its generations change, so a host whose application publishes neither
+demand nor a scene presents nothing, exactly as before VK-16.
+
+### Rendering a frame
+
+A target the model says wants a frame — render demand, admitted, and not
+suspended or closing — is offered **one** attempt per step, and the targets
+are served in an order whose lead rotates each step, so none waits behind a
+neighbour. The attempt is `tryAcquireFrame` with a zero timeout; the recording
+of the frame, inside `recordFrame`, as the transition into the
+color-attachment layout, the configuration's `VulkanRenderer`, and the
+transition to presentation; one `submitFrames`; and one `presentFrame`. The
+recording and the frames are made on the owner's thread the first time a frame
+is attempted once the device exists, and each target's frame storages — one per
+frame slot of the model's budget — the first time that target is.
+
+- An acquisition the swapchain cannot answer yet — not ready, out of date, no
+  generation, backpressure — is retried at the first interval of the model's
+  backoff schedule (5 ms by default), anchored at the step's own instant, so
+  work the step did counts against it and nothing sleeps after it.
+- A frame the renderer refused, whose recording was refused, or whose
+  submission had no effect is skipped (`skipFrame`); one whose presentation
+  enqueued nothing is closed unpresented (`closeUnpresentedFrame`). Each is
+  abandoned safely under VK-12's rules, never replayed. The target's render
+  demand stands, so its next frame is tried at the same first interval, as an
+  acquisition that could not be answered is: a renderer that refuses every
+  frame costs one attempt an interval, never one every owner round. A fresh
+  request for the target is an opportunity now, and supersedes that retry.
+- Enqueuing the presentation clears the model's render demand.
+
+The renderer is `∀`-typed over the native handles, so it records through the
+managed boundary alone; `clearRenderer` clears the frame to the colour it
+computes from the scene and the `FrameRequest` — the attachment, target,
+frame, image, extent and scene revision.
+
+### Polling completion
+
+A fence is asked only when the model's own schedule says a poll is due, or
+when a frame is to be attempted this step and the slots it needs may be
+waiting on one. The schedule is the model's `progressDeadline`
+([GPU model](gpu_model.md#owner-progress)): the idle backoff over pending
+obligations and every recovery deadline, with render demand left out, because
+render demand says a frame is wanted, not that one can be acquired now. The
+generations are stepped — which is where the model's progress turn, and so the
+backoff's anchor, happens — when a target's observation moved, when their own
+deadline has come (a result to reconcile, a settling resize, a recovery
+attempt, the poll), or when a frame is to be attempted. A round something
+unrelated woke asks no fence and takes no model turn: it neither polls early
+nor moves the schedule on.
+
+Each generation step takes one model turn, and a second only when its
+reconciliation rescheduled an opportunity now: the backoff moves on once per
+poll, 5, 10, 20, 40, 80 and then 100 ms under unchanged conditions. New
+demand, a new obligation — a presentation enqueued — an observed completion or
+a close transition restarts it at once; an unrelated event changes none of
+those and restarts nothing.
+
+### Pacing, suspension and fairness
+
+The owner's `graphicsNextDeadline` is the earliest of the unannounced watch, a
+replacement it is waiting on, the generations' own deadline, and rendering's:
+a frame wanted now, an acquisition's retry, or a demand deadline still ahead.
+So a quiet scene rendered continuously — demand, or a new scene, each time the
+last frame was presented — keeps the owner on the first pending-work interval
+and never lets its schedule fall into the idle backoff; and a target with no
+demand and no progress backs off on absolute deadlines.
+
+A hidden, iconified, zero-area or closing target is **suspended**: its
+generations' reconciliation suspends it in the model from the main thread's
+classification of its window, it is offered no frame, and its render demand
+contributes no deadline. Its outstanding obligations — a presentation whose
+present fence has not been observed — keep a finite poll deadline on the
+backoff, so the owner neither forgets them nor spins on them. One suspended
+target, or one whose acquisitions cannot be answered, never pauses another:
+each is offered its own attempt, and a pending acquisition only reschedules
+that target's retry.
+
+### Retiring a target
+
+A target's retirement is owed (`RetirementOwed`) until it can be performed.
+The first time the owner asks (`graphicsPrepareRetirement`), the controller
+closes the target in the model — which drops its render demand and restarts
+the schedule — and closes its frames (`closeTargetFrames`): acquired ones
+skipped, submitted ones closed unpresented. Each time it asks it polls when a
+poll is due, anchoring the schedule with one generation step, and answers
+ready once no frame and no presentation of the target remains, or once the
+device has been lost. Only then does the owner retire the target, once:
+`retireTargetFrames` destroys its slots' and pool's synchronization, its frame
+storages are released and destroyed, then its generations, then its surface.
+An owed retirement certifies nothing; the attachment's terminal record is
+written only by the retirement's own return, exactly as before.
+
+Whole-owner retirement retires the recording — releasing and destroying every
+managed resource still live — before the device is destroyed.
+
+### Status
+
+Status reaches application services through the runtime's checkpoints and the
+attachment's observation, as it did: a latched terminal failure (VK-15) ends
+the owner's run at its next step and is raised by the application's next
+checkpoint through `superviseGraphicsOwner`; target unavailability (VK-14) is
+read with `readVulkanUnavailability`; retirement facts reach the attachment's
+observation through the host's completion publisher, with terminal records
+retaining what a full inbox could not carry. The owner's wake
+(`graphicsWake`) asks for a round while the capture's sink has failed and
+nothing is latched, **and** while a primary failure latched on another thread —
+a handover's checkpoint on the main thread — has not yet been taken by the
+owner's own step; without the second an idle owner kept running on a session
+the main thread already knew had failed.
+
+### Stop and quiescence
+
+Stop follows D-33 through VK-18's machinery, unchanged: quiescence closes
+admission and the owner's publications; ordinary workers drain; the owner
+retires each target, then itself, then destroys itself; the main thread
+services bounded housekeeping and joins the owner before any window is
+released. A target whose retirement is still owed when the owner begins its
+exit drain is asked again between waits for the owner's own next deadline —
+the model's poll schedule — until it is retired or its retirement fails. A
+demand deadline counts toward that schedule only while an admitted target that
+is not closing could serve it: the drain takes no step, so no frame can, and a
+deadline left standing once it passed would be asked about again at once, for
+ever. For the same reason a target the model is retiring owes its generations'
+reconciliation nothing — a settling replacement, an unseen swapchain result or
+a deferred recovery attempt — since no step reconciles it again; its
+obligations keep the model's poll schedule. No
+timeout ends that wait, because a timeout is not evidence, and a cancellation
+ends it by leaving what is still owed with the owner, unverified, and naming it
+to whole-owner retirement. Nothing waits for a command from the ended loop: a
+window command submitted once the loop has ended is answered by the host's
+quiescence, never left waiting.
+
+### During a main-thread stall
+
+A platform modal loop inside the native event call stalls every step of the
+adapter: no observation, no demand and no replacement surface is published
+until the call returns, and window commands wait for the pump as they always
+did. The owner is not stalled by it. It keeps rendering what it holds — the
+latest scene any other thread published, the last coherent observation, and
+the extent the surface's capabilities supply (D-30), with acquisition
+suspended for unusable dimensions and replacement bounded by VK-10's budget —
+on its own deadlines. A live resize, which changes the surface faster than a
+replacement's period, keeps presenting from the active generation and is
+rebuilt from the newest extent once a period
+([Replacement](#replacement)); a headless example holds the native call while
+the stand-in surface changes every 8 ms and requires both.
+
+**What that does not mean.** A frame the owner presents during a stall proves
+that the request was admitted; its present fence, observed signalled, proves
+that the presentation engine finished with the image. Neither proves the frame
+became visible. Whether frames visibly advance during a Cocoa live resize or
+menu interaction is a native measurement: the graphics-owner interaction probe
+([The native suite](#the-native-suite)) records it, and
+[the graphics-owner interaction verdict](graphics_owner_interaction_verdict.md)
+states what was measured and what was not.
+
+### How it is built
+
+| Module | Responsibility |
+| --- | --- |
+| `Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering` | The recording and the frames above the generations, what asks a target for a frame, one frame's attempt, completion polls, the rendering deadline, and a target's retirement readiness and rendering retirement |
+| `Hetoimasia.GPU.Vulkan.GLFW.Internal.Loop` | The adapter: one turn's handoffs, the deadline fold, and `runVulkanOwnerLoop` |
+| `Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller` | Wires both into the owner's step, its deadline, its wake and its retirements |
 
 ## Destruction order
 
@@ -1765,6 +2039,11 @@ VK-18's D-33 order and releases nothing early.
 | Generation records | The generations' `Internal.Generations.State`, which defines them | `Reconciliation` builds and replaces, `Retirement` retires the active one, and `Disposal` destroys and removes, on the owner's step; any thread holds and ends a CPU use through `Uses`, in `STM` | The owner (uses: any) | From the construction that begins one until its destruction returned | Kept, explicitly uncertain, when a destruction raised; never retried |
 | Swapchain results | The generations' `Internal.Generations.State`, which defines them | The owner reports through `Uses`; `Reconciliation` consumes on its step | The owner | Until the active generation is replaced | Cleared by the publication that replaces it, or by the surface's loss |
 | A target's lost surface and outstanding attempt | The generations' `Internal.Generations.State`, which defines them | `Reconciliation` marks the loss; `Surface` releases, asks and installs; `Retirement` settles an attempt still outstanding | The owner | From the loss until a replacement is installed, or the target retires | Cleared by the installation, or by retirement |
+| Rendering: the recording and the frames | The controller's rendering | Made by the first frame attempted once the device exists; read by every step and retirement | The owner | From then until whole-owner retirement | Retired before the device is destroyed |
+| Rendering: per-target records (frame storages, acquisition retry, last generation shown, eligibility, closing) | The controller's rendering | The owner's step, retirement readiness and retirement | The owner | From a target's first render request until its retirement | Removed by the target's retirement |
+| Rendering: the demand and scene revisions acted on, and a demand deadline ahead | The controller's rendering | The owner's step | The owner | The owner's run | Only rise |
+| Observations reconciled | The controller | The owner's step: each target's observation revision and eligibility the generations were last stepped with | The owner | The owner's run | Replaced every step that reconciles |
+| The adapter's published revisions and untaken demand | `runVulkanOwnerLoop` | The main thread, every turn | Main | The loop's run | Bounded by the windows the host holds; untaken demand forgotten once the owner took it |
 | Deferred attachments | The controller | Written by a handover whose announcement the port refused; removed by `announceVulkanTarget` once admitted, or by the owner once it has destroyed the surface | Main, owner | Until announced or settled | Cleared by whole-owner retirement |
 | Managed records | The recording | Construction inserts; release, replacement and disposal advance each one's standing | The owner | From construction until the model records the disposal | Removed once the model records it; kept, explicitly uncertain, when a destruction raised; never retried |
 | Frame storages | The recording | Construction inserts one per target frame slot; disposal removes it | The owner | As its managed record | As its managed record |
@@ -1799,20 +2078,22 @@ VK-18's D-33 order and releases nothing early.
   image counts within the surface's limits and the tracking limit; and the
   swapchain generations over the stand-in: construction from the surface's
   extent and format, a stale observation, zero area suspending without an
-  attempt, coalesced resize waiting 16 ms for the newest geometry, a move the
+  attempt, a resize coalesced for 16 ms from its first move and built from the
+  newest geometry, a resize that never pauses rebuilt once a period, a move the
   surface has not caught up with yet, a cancelled move not shortening a later
-  one's quiet period, a newer observation restarting it at an unchanged
-  surface extent, a newer resize waiting it out under the one-generation
-  limit, capacity retiring and destroying first
-  and pausing otherwise, the one-generation configuration, per-target
+  one's period, a newer observation joining the move at an unchanged surface
+  extent, a newer resize built from the newest extent under the one-generation
+  limit once there is room, capacity retiring and destroying first
+  and keeping the active generation presenting otherwise, the one-generation configuration, per-target
   reservation isolation, an oversized and a zero returned image count refused
   before any view, a failed replacement unable to reacquire from or hand over
   the retired handle, a newer resize surviving an in-flight replacement,
   repeated out-of-date and suboptimal results bounded by the recovery episode
   without a hot loop, a reported result asking for a step at once until it is
-  reconciled, a moved observation and a resize after a failed construction
+  reconciled, a closing target's settling replacement and unseen result owing
+  no step, its deadline left to the model's own schedule, a moved observation and a resize after a failed construction
   each settling before the recovery rebuild, and a move cancelled while
-  recovery waits leaving a later move its full quiet period, failures after the swapchain destroying exactly what they
+  recovery waits leaving a later move its full period, failures after the swapchain destroying exactly what they
   left child before parent, a failed cleanup retained without a retry and
   retaining the surface, a replacement cancelled before its creation never
   handing the old swapchain over, a cancellation right after a candidate's
@@ -1841,6 +2122,64 @@ VK-18's D-33 order and releases nothing early.
   with the old one handed over and destroyed only once its hold ended, none for a
   hidden target, and a closing window's views and swapchain destroyed before its
   surface.
+
+VK-16's examples are in `integration-tests`, under `Vulkan loop adapter`, over
+stand-in frame and recording layers — every swapchain three images, a
+submission's fence and a present fence pending until asked and then signalled
+if the example allows it, a present fence's image given back when it signals —
+and, where a schedule is asserted, a scripted clock the host and the owner
+share, whose owner timer expires only once the clock passes the instant it was
+armed for. They cover: the adapter publishing each window's observation and
+captured demand with nothing published by hand, and the owner presenting a
+frame of its own; the owner's deadline folded into the main loop's schedule —
+`NoUpdateDemand` and a later `UpdateBy` become it, an earlier one and
+`UpdateImmediately` stay, one already passed is left out — and the composed
+loop then waiting for it rather than for a five-second fallback; demand
+captured before the owner took it kept across a newer publication while the
+owner's step was held inside an acquisition, and a window closed meanwhile
+still retiring; two windows' demand captured in one turn — one now, one by a
+later deadline — served as two frames now, none while a still clock stays short
+of the deadline, and two more once it comes; a redraw the owner took while no
+target was constructed rendered once the window handed over afterwards is,
+with nothing published since; a quiet scene rendered continuously never arming the owner's
+timer beyond the first pending-work interval; the backoff through 5, 10, 20,
+40, 80, 100 and 100 ms from a presentation, an unrelated publication a
+millisecond before a poll moving neither the fence queries nor the deadline,
+and new demand, an observed completion and a close each restarting it at 5 ms;
+no fence asked on an unrelated early wake, and a poll whose work consumed the
+next interval followed by the next poll with no timer armed between them; a
+suspended target keeping a finite deadline with its presentation pending, not
+spinning while the clock stands still, and polling when it comes; one target
+presenting five more frames while another's acquisitions all answer not ready;
+a renderer refusing every frame, with the owner's deadline one backoff interval
+ahead of a still clock and no second attempt until the clock reaches it; a
+fresh request, made while such a retry is pending, rendered at once with the
+clock still; a frame of a new generation refused after a resize, with an
+unrelated wake making no second attempt before the retry's interval; with
+one live generation, a quiet target's resize whose replacement is rendered with
+nothing published; and a demand deadline coming at the instant a resize's
+replacement is due, whose frame on the replacement is refused once, with no
+second attempt before the retry's interval, an unrelated wake included;
+the owner presenting a scene published from another thread while the main
+thread is held inside its native event call, and a window command submitted
+then served only once the call returns; a live resize under the same held call,
+the stand-in surface changing every 8 ms and every swapchain built at another
+extent answering suboptimal, with the owner presenting throughout and building
+at least three replacements — the same example presents once and builds none
+under a rule that waits for quiet geometry; a presentation's device loss reaching
+the composed loop's checkpoint; and the exit drain waiting for owed
+presentations before retiring the target, the device, the messenger and the
+instance, with a window command submitted after the loop ended answered rather
+than left waiting; and that drain, with a presentation still owed and a demand
+deadline the owner took but never served, arming its timer again each time the
+clock moves past that deadline rather than asking at once, for ever, and the
+same once a resize has left the closing target's replacement settling past
+its instant. In
+`native-tests`' `Frames`, a closing pass cancelled from inside its first frame's
+cleanup submission leaves the second frame acquired; closing the target's frames
+again finishes the pass, a third finds nothing, and the target's slots retire. The `terminal failure` group's sink example now waits for
+the owner's own failure before its checkpoint, which the owner's wake for a
+failure latched on the main thread makes certain.
 
 VK-11's examples are in `native-tests` too, over a stand-in recording layer
 that journals every call and fails at a chosen step: a sealed batch retaining
@@ -1945,7 +2284,11 @@ after its presentation's retirement was observed; generations retired one a
 step, round-robin across two targets; and the first of two targets closed from
 verified fences — withheld while its presentation was pending — its surface
 destroyed and the device kept, while the second keeps presenting before and
-after, and the session then retired with every fence observed.
+after, and the session then retired with every fence observed. VK-16 adds, under
+`while a replacement waits`, a frame acquired from and presented to the active
+generation while its replacement settles — the replacement then built and the
+old generation held by that presentation — and one acquired from it while the
+replacement waits for the generation count to have room.
 
 VK-14's examples are in `native-tests` and `integration-tests`, over the same
 stand-ins, extended to answer a native result recovery acts on
@@ -2212,7 +2555,7 @@ companions — and adds the Vulkan owner's:
 | Main thread | Hspec runs on a thread of its own; the process main thread owns one shared production graphics session: `withLoaderIntegration`, then `runGraphicsOwnerApplication` over `withVulkanOwnerHost`, with the production native layer and surface bridge. An example that needs the main thread — to hand a window's surface over, which GLFW creates there, or to close a window — submits an operation (`onMain`); the main thread runs it between two turns of the host's owner loop and returns its result or rethrows its failure. Windows are created through the host's command port from the example's own thread, which the owner loop executes, as an application's worker would. |
 | Identities | Every dispatched operation is checked, before it runs, to be on the bound process main thread that entered the session — the Haskell thread, the bound flag, and the OS thread read through `pthread_self` — and a failed check fails the operation and the run. Every native call the session makes is recorded where it runs by a `NativeObserver`, so an example shows from the calls themselves that the instance, its messenger, the device and every surface's destruction ran on the graphics owner's thread and every surface's creation on the main thread — never from the name of an Hspec hook. |
 | Sharing | The roots — the instance, its explicit messenger, and the one device — are acquired lazily, by the first dispatched operation, at most once, and shared by every later example. Each example's windows and targets are its own and are closed inside it. |
-| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, `vk12-frames`, `vk13-presentation`, `vk14-recovery`, `vk15-validation-stop`, `vk15-retention`, `synchronization-hazard`, and `debug-names`. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. |
+| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, `vk12-frames`, `vk13-presentation`, `vk14-recovery`, `vk15-validation-stop`, `vk15-retention`, `vk16-composed`, `synchronization-hazard`, and `debug-names`. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. |
 | Selection | Building, listing and filtering the tree, a `--dry-run`, and a selection that dispatches nothing acquire nothing and start no child. A selection matching no example fails. `--complete`, which the catalog group passes, runs the whole tree with Hspec's configuration reading left out and then fails unless the shared session was acquired once and every private scenario ran and passed, so no ambient setting can turn the group's receipt into a pass for a subset. The consent rules and the migrated proof's pure release, construction, publication and loader-selection examples need no session and run without consent. |
 | Consent | Read once, at startup, from `HETOIMASIA_NATIVE_SESSION`, with the GLFW suite's rules for `desktop` and `isolated-x11:<display>`; this suite has no Wayland session. Without it every native example is refused before its body, the session is never acquired, and the run ends with the refusal on stderr and a non-zero exit. |
 | Environment | Before any Vulkan call, the suite clears every ambient discovery override and every validation-layer setting it finds and records which, disables implicit layers, and points the layer's settings file at an empty one; a child inherits and re-establishes the same environment. |
@@ -2379,6 +2722,22 @@ lifetime design leaves for what cannot be verified — and the record says so:
 the operating system, not the session, reclaims what was retained, and no
 diagnostic verdict follows, because the last callback was never reached.
 
+VK-16's case, `vk16-composed`, runs the production composition over two
+visible windows, driven by `runVulkanOwnerLoop` with nothing published by hand:
+the adapter publishes each window's observation and captured demand, and the
+application asks each window for a frame as soon as its last one was
+presented. Once each target has presented three frames, the first window is
+hidden through its command port; when its target is suspended in the model the
+second presents three more while the first presents none; the first is shown
+again and presents again; and the loop finishes, so the host exits through
+D-33. It passes only if every Vulkan call ran on one thread, the graphics
+owner's, and every surface was created on the main thread; if every
+presentation's retirement was observed through its own present fence, no
+presentation was made after the device's destruction began, and both surfaces,
+the device, the messenger and the instance were destroyed in that order; and
+if the verdict after the last teardown callback has no issue and no error was
+reported.
+
 #250's case, `debug-names`, is VK-11's on private roots of its own, with one
 destructive seam only the fixture holds: it wraps the production recording
 layer so the batch's copy into the readback buffer is recorded, through the
@@ -2398,7 +2757,45 @@ nothing else, with nothing dropped, cut, refused or undelivered. The shared
 session also requires every naming call it made to have run on the owner's
 thread and returned.
 
-Run it as the group does:
+The **graphics-owner interaction probe** is the suite's last example, and
+the only one no routine run executes. It extends
+[RR-4's probe](glfw.md#the-interaction-probe) with the graphics owner and is
+gated exactly as that one is: it needs the run's native consent, and it is
+pending — opening no window — unless `HETOIMASIA_INTERACTION_PROBE_SECONDS`
+names the seconds each phase lasts. No validation group names it, so
+`test.vulkan-native` reports it pending on both platforms. Activated, it runs
+in a child of the suite with the parent's terminal, so the person sees each
+phase's instruction as it begins: the production composition over one
+640×480 window, with the validation layer, driven by `runVulkanOwnerLoop`,
+while a thread other than the main one publishes a new scene every 16 ms and
+the owner clears each frame to a colour that moves with the scene. The
+session's trace records the main thread's owner turns, the native event call's
+entry and exit and every callback delivered inside it; the frame observer
+records every acquisition, present request, present return and present fence
+observed signalled into the same trace from the owner's thread, in the same
+monotonic time domain. Through RR-4's four phases — an idle baseline, a window
+move, a live resize and a menu-bar interaction — it reports, per phase, the
+owner turns, the pumps, and the present requests, returns and completions
+overall and inside each pump that blocked for a quarter of a second or more;
+with `HETOIMASIA_INTERACTION_PROBE_OUTPUT` it writes every record with the
+platform, compiler, device, loader, driver and layer identities. It asserts
+that every phase measured something, lost nothing and faulted nothing, and
+that validation reported nothing — never whether a stall happened, and never
+that frames visibly advanced, which a present return and a present fence do not
+prove. [The graphics-owner interaction verdict](graphics_owner_interaction_verdict.md)
+records its measurement.
+
+```bash
+HETOIMASIA_NATIVE_SESSION=desktop HETOIMASIA_INTERACTION_PROBE_SECONDS=15 \
+  HETOIMASIA_INTERACTION_PROBE_OUTPUT=/tmp/graphics-owner-probe.tsv \
+  bash tools/vulkan/run.sh native hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests -- --interaction-probe
+```
+
+The owner's standing approval for native runs does not reach it: it is
+interactive, no planner selects it, and a person must perform the interactions,
+so it runs when the owner asks for it, as RR-4's did.
+
+Run the suite as the group does:
 
 ```bash
 bash tools/vulkan/run.sh build hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests

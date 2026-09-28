@@ -127,6 +127,7 @@ module Hetoimasia.GPU.Model
   , NextTurn (..)
   , runProgressTurn
   , nextDeadline
+  , progressDeadline
   , pendingObligations
 
     -- * Recovery

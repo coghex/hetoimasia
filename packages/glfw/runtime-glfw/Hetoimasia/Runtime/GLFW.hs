@@ -655,6 +655,7 @@ module Hetoimasia.Runtime.GLFW
   , noStepWork
   , NextDeadline (..)
   , TargetRetire (..)
+  , RetirementReadiness (..)
   , TargetRetired
   , targetRetired
   , OwnerRetire (..)
@@ -710,6 +711,7 @@ module Hetoimasia.Runtime.GLFW
   , OwnerPhase (..)
   , readOwnerStatusNow
   , awaitOwnerRound
+  , readOwnerDemandTaken
   , TerminalRecord (..)
   , readTargetTerminalsNow
   , ownerDestructionVerified

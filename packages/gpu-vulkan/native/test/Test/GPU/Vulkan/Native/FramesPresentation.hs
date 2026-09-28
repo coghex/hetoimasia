@@ -462,6 +462,40 @@ spec = describe "Frames presentation" $ do
       settleAll rig
       clean rig
 
+  describe "while a replacement waits" $ do
+    it "keeps acquiring and presenting from the active generation while its replacement settles, as a live resize needs" $ do
+      rig ← newRig
+      old ← activeGeneration rig
+      resizeSurfaces rig 800 600
+      stepAll rig 100 (SurfaceExtent 800 600)
+      viewCondition <$> generationsOf rig `shouldReturn` Settling (at 116)
+      frame ← owned rig
+      imageGeneration (ownedImage frame) `shouldBe` old
+      _ ← sealed rig frame >>= \batch → submitted rig (batch :| [])
+      presentation ← presentedAs rig frame PresentationEnqueued
+      -- The replacement is built once the move's period has passed, and the
+      -- frame presented meanwhile holds the generation it replaced.
+      stepAll rig 116 (SurfaceExtent 800 600)
+      activeGeneration rig `shouldReturn'` (`shouldNotBe` old)
+      fmap viewPresentations <$> holdOf rig (GenerationSubject old) `shouldReturn` Just [presentation]
+      settleAll rig
+      clean rig
+
+    it "keeps acquiring from the active generation while its replacement waits for room in the generation budget" $ do
+      rig ← newRig
+      _ ← presentOne rig
+      resize rig 100 800 600
+      active ← activeGeneration rig
+      resizeSurfaces rig 1024 768
+      stepAll rig 140 (SurfaceExtent 1024 768)
+      stepAll rig 156 (SurfaceExtent 1024 768)
+      viewCondition <$> generationsOf rig `shouldReturn` Backpressured GenerationBudget
+      frame ← owned rig
+      imageGeneration (ownedImage frame) `shouldBe` active
+      ok (skipFrame (rigFrames rig) (ownedFrame frame))
+      settleAll rig
+      clean rig
+
   describe "retirement" $ do
     it "destroys a resized target's old generation only once its presentation's present fence was observed" $ do
       rig ← newRig
