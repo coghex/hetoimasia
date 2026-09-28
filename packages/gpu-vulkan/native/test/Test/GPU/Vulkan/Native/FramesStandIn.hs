@@ -35,6 +35,7 @@ module Test.GPU.Vulkan.Native.FramesStandIn
   , frameCalls
   , FrameStep (..)
   , failFrameStep
+  , outOfMemoryAtFrame
   , clearFrameStep
   , loseFrameStep
   , markDeviceLost
@@ -67,7 +68,8 @@ import qualified Data.Text as Text
 import Data.Word (Word32, Word64)
 
 import Hetoimasia.GPU.Vulkan.Native.Frames (AcquireResult (..), FrameOps (..), PresentRequest (..), PresentStatus (..), SubmitBatch (..), WaitStage)
-import Test.GPU.Vulkan.Native.StandIn (StandInLoss (..), Step (AtFrameCall))
+import Hetoimasia.GPU.Vulkan.Native.Roots (NativeFailure (FailedOutOfMemory))
+import Test.GPU.Vulkan.Native.StandIn (StandInLoss (..), StandInResult (..), Step (AtFrameCall))
 
 -- | One native call the frames made, in the order it made it. A command buffer
 -- is its number, as the recording's stand-in makes it.
@@ -157,6 +159,9 @@ data FramesStandIn = FramesStandIn
     -- ^ How many images each swapchain has.
   , standViolations ∷ !(TVar [Text])
   , standDuring ∷ !(TVar (FrameCall → IO ()))
+  , standOutOfMemory ∷ !(TVar (Map FrameStep Int))
+    -- ^ How many more calls at each step answer out of memory, as the roots'
+    -- stand-in classifies it (VK-14).
   , standLosing ∷ !(TVar (Set FrameStep))
     -- ^ Steps that lose the device.
   , standLost ∷ !(TVar Bool)
@@ -178,12 +183,18 @@ newFramesStandIn =
     <*> pure 3
     <*> newTVarIO []
     <*> newTVarIO (\_ → pure ())
+    <*> newTVarIO Map.empty
     <*> newTVarIO Set.empty
     <*> newTVarIO False
 
 -- | Every call so far, oldest first.
 frameCalls ∷ FramesStandIn → IO [FrameCall]
 frameCalls standIn = reverse <$> readTVarIO (standJournal standIn)
+
+-- | Have the next this many calls at the step answer out of memory — having
+-- made nothing — as the roots' stand-in classifies it.
+outOfMemoryAtFrame ∷ FramesStandIn → FrameStep → Int → IO ()
+outOfMemoryAtFrame standIn at times = atomically (modifyTVar' (standOutOfMemory standIn) (Map.insert at times))
 
 failFrameStep ∷ FramesStandIn → FrameStep → IO ()
 failFrameStep standIn at = atomically (modifyTVar' (standFailing standIn) (Set.insert at))
@@ -263,6 +274,13 @@ step standIn at call = do
     throwIO (StandInLoss AtFrameCall)
   failing ← readTVarIO (standFailing standIn)
   for_ at $ \each → when (Set.member each failing) (throwIO (FrameStepFailed each))
+  for_ at $ \each → do
+    exhausted ← atomically $ do
+      remaining ← Map.findWithDefault 0 each <$> readTVar (standOutOfMemory standIn)
+      if remaining > 0
+        then True <$ modifyTVar' (standOutOfMemory standIn) (Map.insert each (remaining - 1))
+        else pure False
+    when exhausted (throwIO (StandInResult (Text.pack (show each)) FailedOutOfMemory))
   where
     phantom = \case
       QueriedFence _ → True

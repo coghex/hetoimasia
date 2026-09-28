@@ -60,6 +60,36 @@
 -- owner's thread. The observation reaches the owner through
 -- 'Hetoimasia.Runtime.GLFW.publishGraphicsObservation' on the main thread.
 --
+-- = Recovering a lost surface
+--
+-- A target whose surface is lost (VK-14) is recovered on its same live window,
+-- with its attachment kept throughout. The generations retire what was built
+-- on the lost surface, destroy it once nothing of it remains, and ask the
+-- target's episode for an attempt ("Hetoimasia.GPU.Vulkan.Native.Generations").
+-- For each attempt admitted, the owner's step asks the main thread for a
+-- replacement surface — the one thing it cannot make itself, since GLFW
+-- creates surfaces there — and wakes it. The main thread creates it through
+-- the surface bridge's admitted replacement, under the target's existing
+-- attachment ('replaceVulkanSurfaces'), and deposits what it created; the
+-- owner's next step offers it to the generations, which recheck the session's
+-- one device's support and install it, or refuse it — and a surface the
+-- device cannot present to is destroyed on the owner's thread while the target
+-- is disposed of through its designation. Until VK-16's loop adapter services
+-- replacements on every turn, the application does it, as it publishes
+-- observations. Close wins: a replacement deposited for a target that has
+-- begun retiring is destroyed, never installed.
+--
+-- = Unavailability and failure
+--
+-- A target the model marked unavailable — its episode spent, or its
+-- replacement surface one the device cannot present to — is reported once, by
+-- attachment ('readVulkanUnavailability'); its generations still retire as
+-- their holds end, and its attachment and window stay until the application
+-- releases them. A required target's exhaustion has failed the session, and
+-- the owner's step then raises 'VulkanRequiredTargetFailed', which ends the
+-- owner's run and reaches the application's checkpoints like any other owner
+-- failure.
+--
 -- = Destruction
 --
 -- A target's retirement destroys its swapchain generations and then its
@@ -97,6 +127,13 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , readVulkanModel
   , readVulkanTerminal
 
+    -- * Recovery (VK-14)
+  , replaceVulkanSurfaces
+  , VulkanUnavailability (..)
+  , UnavailableBecause (..)
+  , readVulkanUnavailability
+  , unavailabilitiesRetained
+
     -- * Swapchain generations
   , readVulkanGenerations
   , useVulkanGeneration
@@ -121,6 +158,8 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , UnannouncedSurfaceUncertain (..)
   , LeaseRetained (..)
   , RootsOutlivedHost (..)
+  , ReplacementSurfaceUncertain (..)
+  , VulkanRequiredTargetFailed (..)
   ) where
 
 import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, stateTVar, writeTVar)
@@ -136,7 +175,7 @@ import Control.Exception
   , throwIO
   , tryWithContext
   )
-import Control.Monad (forM, join, unless, void, when)
+import Control.Monad (forM, forM_, join, unless, void, when)
 import Control.Monad.IO.Class (liftIO)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as Char8
@@ -149,6 +188,7 @@ import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word32)
+import Hetoimasia.Foundation.Time (Instant)
 import Foreign.Ptr (Ptr)
 import Numeric (showHex)
 import Hetoimasia.Foundation.Log (Logger)
@@ -169,7 +209,14 @@ import Hetoimasia.GLFW.Session (Session, SessionConfig)
 import Hetoimasia.GLFW.Window (WindowId)
 import Hetoimasia.GLFW.Window (Extent)
 import qualified Hetoimasia.GLFW.Window as Window
-import Hetoimasia.GPU.Model (GpuModel)
+import Hetoimasia.GPU.Model
+  ( Escalation (OptionalTargetUnavailable, RequiredTargetFailedSession)
+  , GpuModel
+  , SessionFailureCause (RequiredTargetUnrecoverable)
+  , SessionState (SessionFailed)
+  , escalations
+  , sessionState
+  )
 import Hetoimasia.GPU.Model.Budget (Budgets)
 import Hetoimasia.GPU.Model.Identity (GenerationId, TargetClass (..), TargetId)
 import Hetoimasia.GPU.Vulkan.Diagnostics
@@ -191,15 +238,19 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Bridge
 import Hetoimasia.GPU.Vulkan.Native.Generations
   ( GenerationUse
   , Generations
+  , ReplacementAnswer (..)
   , StepSummary (..)
   , SwapchainResult
-  , TargetGenerationsView
+  , TargetCondition (PresentationUnsupported)
+  , TargetGenerationsView (viewCondition)
   , UseRefusal
   , endGenerationUse
   , generationsDeadline
   , newGenerations
   , noteSwapchainResult
+  , offerReplacementSurface
   , readTargetGenerations
+  , replacementSurfaceFailed
   , retireTargetGenerations
   , stepGenerations
   , trackTarget
@@ -213,6 +264,7 @@ import Hetoimasia.GPU.Vulkan.Native.Roots
   ( DiagnosticAlarm (..)
   , GenerationOps (..)
   , RootOps (..)
+  , GraphicsDeviceLost
   , RootStanding (..)
   , RootTargetView (..)
   , Roots
@@ -276,6 +328,8 @@ import Hetoimasia.Runtime.GLFW
   , TargetStepView (..)
   , WindowHost
   , announceGraphicsTarget
+  , ownerTargetAcknowledgement
+  , wakeGraphicsHost
   , custodyOf
   , graphicsAttachment
   , graphicsOwnerConfig
@@ -327,6 +381,19 @@ data State inst msgr phys dev lease obligation = State
     -- announcement the owner's full port refused. Written by the main
     -- thread's handover; the owner's step settles each once its slot has
     -- begun retiring.
+  , stateReplacements ∷ !(TVar (Map AttachmentId (Replacement obligation)))
+    -- ^ Replacement surfaces the owner asked for: written by the owner's step,
+    -- answered by the main thread's 'replaceVulkanSurfaces', and taken by the
+    -- owner's step, or by the attachment's retirement.
+  , stateHostWake ∷ !(TVar (IO ()))
+    -- ^ Wakes the main thread when the owner asks for a replacement; the
+    -- composition sets it once the owner exists.
+  , stateUnavailable ∷ !(TVar (Map AttachmentId VulkanUnavailability))
+    -- ^ Targets reported unavailable, the most recent 'unavailabilitiesRetained'.
+  , stateUnsupported ∷ !(TVar (Map AttachmentId Word32))
+    -- ^ Why a target became unavailable, when it was a replacement surface the
+    -- device could not present to rather than a spent episode; the owner's
+    -- alone.
   , stateWake ∷ !(TVar (STM Bool))
     -- ^ What wakes an idle owner: the capture's sink failure, until it is
     -- latched. Installed with the capture's watch.
@@ -365,6 +432,18 @@ data Lease lease
 -- | What a construction step created, and the designation the application
 -- gave the target.
 data Deposit obligation = Deposit !TargetClass !(Created obligation)
+
+-- | One replacement surface the owner asked the main thread for.
+data Replacement obligation
+  = ReplacementAsked
+    -- ^ Not yet created.
+  | ReplacementCreating
+    -- ^ The main thread is creating it now. Its native call is finite, and the
+    -- attachment's retirement waits for its answer rather than sweeping the
+    -- lease before the surface is on it.
+  | ReplacementDeposited !(Either Text (Created obligation))
+    -- ^ What the main thread's replacement answered: the bridge's refusal,
+    -- or what it created.
 
 -- | A controller over a native layer and a surface bridge.
 --
@@ -408,6 +487,10 @@ newVulkanControllerWith hooks ops pointer bridge layers validation budgets clock
       <*> newTVarIO Map.empty
       <*> newTVarIO Map.empty
       <*> newTVarIO Map.empty
+      <*> newTVarIO Map.empty
+      <*> newTVarIO (pure ())
+      <*> newTVarIO Map.empty
+      <*> newTVarIO Map.empty
       <*> newTVarIO (pure False)
       <*> newTVarIO False
       <*> pure clock
@@ -444,6 +527,28 @@ data UnannouncedSurfaceUncertain = UnannouncedSurfaceUncertain !AttachmentId !Te
 instance Exception UnannouncedSurfaceUncertain where
   displayException (UnannouncedSurfaceUncertain attachment reason) =
     "destroying the surface of the unannounced attachment " <> show attachment <> " did not complete: " <> Text.unpack reason
+
+-- | A replacement surface the owner could not use — its target had begun
+-- retiring, the device cannot present to it, or it was created unusable — was
+-- not verifiably destroyed. It is retained on the lease with its attachment
+-- and the instance, and its destruction is not attempted again.
+data ReplacementSurfaceUncertain = ReplacementSurfaceUncertain !AttachmentId !Text
+  deriving (Eq, Show)
+
+instance Exception ReplacementSurfaceUncertain where
+  displayException (ReplacementSurfaceUncertain attachment reason) =
+    "destroying a replacement surface of " <> show attachment <> " did not complete: " <> Text.unpack reason
+
+-- | A required target could not be recovered, so the graphics session has
+-- failed (D-22): its episode was spent, or the session's device cannot present
+-- to its replacement surface. Raised by the owner's step, it ends the owner's
+-- run and reaches the application's checkpoints.
+data VulkanRequiredTargetFailed = VulkanRequiredTargetFailed ![(AttachmentId, TargetId)]
+  deriving (Eq, Show)
+
+instance Exception VulkanRequiredTargetFailed where
+  displayException (VulkanRequiredTargetFailed targets) =
+    "the graphics session failed: a required target could not be recovered (" <> show targets <> ")"
 
 -- | The instance's lease still owes a surface, so the instance is retained.
 newtype LeaseRetained = LeaseRetained LeaseAnswer
@@ -525,7 +630,11 @@ controllerOperations (VulkanController state) =
                 , Just target ← [Map.lookup (viewTarget view) mapped]
                 ]
         summary ← stepGenerations (stateGenerations state) (stepNow step) geometries
-        pure (if settled || summaryAdvanced summary then noStepWork {stepAdvanced = True} else noStepWork)
+        asked ← askReplacements state (summarySurfacesWanted summary)
+        replaced ← settleReplacements state (stepNow step) (stepTargets step)
+        noticeUnavailable state
+        failRequired state
+        pure (if settled || summaryAdvanced summary || asked || replaced then noStepWork {stepAdvanced = True} else noStepWork)
 
 -- | Run a retirement, and if it could not verify what it owns, keep that in
 -- the terminal report as retained before the failure goes on to the owner,
@@ -586,19 +695,161 @@ settleUnannounced state = do
   where
     bridge = stateBridge state
 
--- | The earliest of the unannounced watch and the generations' own deadline.
+-- | Ask the main thread for a replacement surface for each target whose
+-- attempt the generations just admitted, and wake it. Answers whether it
+-- asked for any.
+askReplacements ∷ State inst msgr phys dev lease obligation → [TargetId] → IO Bool
+askReplacements state wanted = do
+  asked ← atomically $ do
+    mapped ← Map.toList <$> readTVar (stateTargets state)
+    let attachments = [attachment | (attachment, target) ← mapped, target `elem` wanted]
+    for_ attachments $ \attachment → modifyTVar' (stateReplacements state) (Map.insert attachment ReplacementAsked)
+    pure (not (null attachments))
+  when asked (join (readTVarIO (stateHostWake state)))
+  pure asked
+
+-- | Take every replacement the main thread deposited and settle it with the
+-- generations: a live surface is offered, and one they refuse — its target
+-- retiring, or a surface the session's device cannot present to — is destroyed
+-- here, on the owner's thread, as is one that was created unusable. A failed
+-- or unusable creation fails the attempt, and the episode schedules the next.
+-- A refusal by the bridge is the window closing, the attachment retiring or
+-- the lease releasing: the attempt is left for the target's retirement to
+-- settle, unless the owner's view shows the target still eligible, when it
+-- fails too rather than waiting for a close that is not coming. Answers
+-- whether it settled any.
+--
+-- A surface the attachment's lease still lists while its target waits for a
+-- replacement — a creation whose answer a cancellation took from the main
+-- thread — is destroyed too: the roots hold no surface for that target then,
+-- so nothing on the lease for it is in use.
+settleReplacements ∷ State inst msgr phys dev lease obligation → Instant → [TargetStepView] → IO Bool
+settleReplacements state now views = do
+  deposited ← atomically $ do
+    held ← readTVar (stateReplacements state)
+    let answered = [(attachment, answer) | (attachment, ReplacementDeposited answer) ← Map.toList held]
+    writeTVar (stateReplacements state) (foldr (Map.delete . fst) held answered)
+    mapped ← readTVar (stateTargets state)
+    pure [(attachment, target, answer) | (attachment, answer) ← answered, Just target ← [Map.lookup attachment mapped]]
+  forM_ deposited $ \(attachment, target, answer) → mask_ $ case answer of
+    Right (CreatedLive obligation) →
+      tryWithContext (offerReplacementSurface generations now target (TargetSurface (handleOf obligation) (destruction bridge obligation))) >>= \case
+        Right ReplacementInstalled → pure ()
+        Right (ReplacementUnsupported family) → do
+          atomically (modifyTVar' (stateUnsupported state) (Map.insert attachment family))
+          discharge attachment [obligation]
+        Right ReplacementNotWanted → discharge attachment [obligation]
+        -- Its support query or its naming raised: the surface is still this
+        -- step's, so it is destroyed, and the attempt failed. Device loss,
+        -- latched by the call, and a cancellation are the owner's.
+        Left failure@(ExceptionWithContext _ exception)
+          | isAsynchronous exception || isJust (fromException exception ∷ Maybe GraphicsDeviceLost) → do
+              discharge attachment [obligation]
+              rethrowIO (failure ∷ ExceptionWithContextSome)
+          | otherwise → do
+              discharge attachment [obligation]
+              replacementSurfaceFailed generations now target ("the replacement surface could not be installed: " <> Text.pack (displayException exception))
+    Right (CreatedUnusable obligation reason) → do
+      discharge attachment [obligation]
+      replacementSurfaceFailed generations now target ("the replacement surface could not be used: " <> reason)
+    Right (CreationFailed reason) → do
+      discharge attachment =<< strays attachment
+      replacementSurfaceFailed generations now target ("no replacement surface was created: " <> reason)
+    Left refusal → do
+      discharge attachment =<< strays attachment
+      let closing = case [view | view ← views, viewTarget view == attachment] of
+            view : _ → viewEligibility view == RenderExcluded
+            [] → True
+      unless closing (replacementSurfaceFailed generations now target ("the replacement was refused: " <> refusal))
+  pure (not (null deposited))
+  where
+    generations = stateGenerations state
+    bridge = stateBridge state
+    handleOf = bridgeObligationHandle bridge
+    strays attachment =
+      readTVarIO (stateLease state) >>= \case
+        LeaseReady lease → atomically (obligationsOf bridge lease attachment)
+        _ → pure []
+    discharge attachment obligations = do
+      outcomes ← mapM (bridgeDischarge bridge) obligations
+      case [failure | DischargeUncertain (ExceptionWithContext _ failure) ← outcomes] of
+        failure : _ → throwIO (ReplacementSurfaceUncertain attachment (Text.pack (displayException failure)))
+        [] → pure ()
+
+-- | Report, once, every target that became unavailable: its episode spent, or
+-- its replacement surface one the device cannot present to.
+noticeUnavailable ∷ State inst msgr phys dev lease obligation → IO ()
+noticeUnavailable state = atomically $ do
+  mapped ← Map.toList <$> readTVar (stateTargets state)
+  model ← readRootsModel (stateRoots state)
+  noticed ← readTVar (stateUnavailable state)
+  unsupported ← readTVar (stateUnsupported state)
+  -- The escalation, not the target's phase: a target that holds nothing more
+  -- once it is unavailable is forgotten by the model's next progress turn.
+  let unavailable = [target | OptionalTargetUnavailable target ← escalations model]
+  for_ mapped $ \(attachment, target) →
+    when (target `elem` unavailable && Map.notMember attachment noticed) $ do
+      condition ← fmap viewCondition <$> readTargetGenerations (stateGenerations state) target
+      let because = case (Map.lookup attachment unsupported, condition) of
+            (Just family, _) → UnavailableSurfaceUnsupported family
+            (_, Just (PresentationUnsupported gaps)) → UnavailablePresentationUnsupported gaps
+            _ → UnavailableRecoverySpent
+      modifyTVar' (stateUnavailable state) $ \held →
+        let grown = Map.insert attachment (VulkanUnavailability target because) held
+         in if Map.size grown > unavailabilitiesRetained then Map.deleteMin grown else grown
+
+-- | Raise 'VulkanRequiredTargetFailed' once a required target's exhaustion has
+-- failed the session. The roots' checkpoint latches it in the terminal report
+-- first, so a diagnostic failure that happened before it stays the primary and
+-- is what is raised instead; one whose order is not yet readable leaves it to
+-- the next step's checkpoint.
+failRequired ∷ State inst msgr phys dev lease obligation → IO ()
+failRequired state = do
+  model ← atomically (readRootsModel (stateRoots state))
+  when (sessionState model == SessionFailed RequiredTargetUnrecoverable) $
+    checkpointRoots (stateRoots state) >>= \case
+      CheckpointFailed (TerminalRequiredTarget _) → do
+        mapped ← readTVarIO (stateTargets state)
+        let failed = [target | RequiredTargetFailedSession target ← escalations model]
+        throwIO (VulkanRequiredTargetFailed [(attachment, target) | (attachment, target) ← Map.toList mapped, target `elem` failed])
+      CheckpointFailed primary → throwIO (terminalFailure primary)
+      _ → pure ()
+
+-- | The earliest of the unannounced watch, a replacement the owner is waiting
+-- on, and the generations' own deadline.
 ownerDeadline ∷ State inst msgr phys dev lease obligation → IO NextDeadline
 ownerDeadline state = do
   watch ← unannouncedDeadline state
+  replacing ← replacementDeadline state
   owed ← atomically (generationsDeadline (stateGenerations state))
   generation ← case owed of
     Nothing → pure NoOwnerDemand
     Just (Right due) → pure (OwnerDeadline due)
     Just (Left ()) → OwnerDeadline <$> readInstant (stateClock state)
-  pure $ case (watch, generation) of
-    (NoOwnerDemand, other) → other
-    (other, NoOwnerDemand) → other
-    (OwnerDeadline first, OwnerDeadline second) → OwnerDeadline (min first second)
+  pure (earliest watch (earliest replacing generation))
+  where
+    earliest NoOwnerDemand other = other
+    earliest other NoOwnerDemand = other
+    earliest (OwnerDeadline first) (OwnerDeadline second) = OwnerDeadline (min first second)
+
+-- | A round now while a deposited replacement waits to be settled, and one
+-- host idle bound ahead while one is still being created: the main thread's
+-- deposit wakes nothing on the owner, so it looks again.
+replacementDeadline ∷ State inst msgr phys dev lease obligation → IO NextDeadline
+replacementDeadline state = do
+  held ← Map.elems <$> readTVarIO (stateReplacements state)
+  now ← readInstant (stateClock state)
+  pure $
+    if any deposited held
+      then OwnerDeadline now
+      else
+        if null held
+          then NoOwnerDemand
+          else either (const NoOwnerDemand) OwnerDeadline (addDuration now (statePoll state))
+  where
+    deposited = \case
+      ReplacementDeposited _ → True
+      _ → False
 
 -- | The geometry one target's view carries, in the native backend's terms: its
 -- eligibility, the last coherent framebuffer observation and the bounds the
@@ -762,8 +1013,17 @@ retireTarget state retiring = do
       atomically (modifyTVar' (stateTargets state) (Map.delete attachment))
       pure ("destroyed the surface of " <> tshow target)
     Nothing → pure "the roots held no target for it"
-  -- A deposit the owner never took, and any obligation whose answer was lost.
-  _ ← atomically (stateTVar (stateDeposits state) (\held → (Map.lookup attachment held, Map.delete attachment held)))
+  -- A deposit the owner never took, a replacement it never settled, and any
+  -- obligation whose answer was lost: whatever was created is on the lease.
+  -- A replacement the main thread is creating right now is waited for — its
+  -- native call is finite and owes the owner nothing — so its surface is on the
+  -- lease before the lease is swept.
+  _ ← atomically $ do
+    Map.lookup attachment <$> readTVar (stateReplacements state) >>= \case
+      Just ReplacementCreating → retry
+      _ → modifyTVar' (stateReplacements state) (Map.delete attachment)
+    modifyTVar' (stateUnsupported state) (Map.delete attachment)
+    stateTVar (stateDeposits state) (\held → (Map.lookup attachment held, Map.delete attachment held))
   swept ← readTVarIO (stateLease state) >>= \case
     LeaseReady lease → do
       left ← atomically (obligationsOf (stateBridge state) lease attachment)
@@ -1012,6 +1272,85 @@ handOverVulkanTarget (VulkanController state) host owner window classification =
         stage ← atomically (custodyOf owner (graphicsAttachment service))
         when (stage == Just CustodyRegistered) (void (announceOrWatch service))
 
+-- | Create, on the main thread, every replacement surface the owner asked for,
+-- each under its target's existing attachment through the surface bridge's
+-- admitted replacement, and deposit what each created for the owner's next
+-- step. Answers how many it created or tried to. The attachment is never
+-- released or reattached.
+--
+-- It must run on the main thread, which the owner wakes when it asks. Until
+-- VK-16's loop adapter runs it every turn, the application runs it, as it
+-- publishes observations. Each replacement and its deposit are one masked
+-- step; a cancellation that nonetheless takes a creation's answer leaves the
+-- surface on the lease, where the owner's next step finds and destroys it.
+replaceVulkanSurfaces ∷ VulkanController → WindowHost → GraphicsOwner scene → IO Int
+replaceVulkanSurfaces (VulkanController state) host owner = do
+  asked ← atomically $ (\held → [attachment | (attachment, ReplacementAsked) ← Map.toList held]) <$> readTVar (stateReplacements state)
+  lease ← readTVarIO (stateLease state)
+  for_ asked $ \attachment → mask_ $ do
+    -- Only one still asked for is created: one the attachment's retirement
+    -- took meanwhile is not.
+    (claimed, acknowledgement) ← atomically $ do
+      held ← Map.lookup attachment <$> readTVar (stateReplacements state)
+      case held of
+        Just ReplacementAsked → do
+          modifyTVar' (stateReplacements state) (Map.insert attachment ReplacementCreating)
+          (,) True <$> ownerTargetAcknowledgement owner attachment
+        _ → pure (False, Nothing)
+    when claimed $ create attachment lease acknowledgement
+  pure (length asked)
+  where
+    create attachment lease acknowledgement =
+      deposit attachment =<< case (lease, acknowledgement) of
+        (LeaseReady leased, Just acknowledged) →
+          tryWithContext (bridgeReplace (stateBridge state) host acknowledged leased) >>= \case
+            Right answered → pure answered
+            Left failure@(ExceptionWithContext _ exception)
+              -- A cancellation that took the answer: whatever the bridge
+              -- created is on the lease, where the owner's settlement finds
+              -- it, and the deposit says only that nothing came back.
+              | isAsynchronous exception → do
+                  deposit attachment (Right (CreationFailed "a cancellation took the replacement's answer"))
+                  rethrowIO (failure ∷ ExceptionWithContextSome)
+              | otherwise → pure (Right (CreationFailed (Text.pack (displayException exception))))
+        (LeaseReady _, Nothing) → pure (Left "the owner holds no acknowledgement for the attachment")
+        _ → pure (Left "no instance is leased to the surface bridge")
+    deposit attachment answer =
+      atomically $
+        modifyTVar' (stateReplacements state) $
+          Map.adjust (\case ReplacementCreating → ReplacementDeposited answer; other → other) attachment
+
+-- | Why a target became unavailable.
+data UnavailableBecause
+  = UnavailableRecoverySpent
+    -- ^ Its recovery episode was spent.
+  | UnavailableSurfaceUnsupported !Word32
+    -- ^ The session's device, through this queue family, cannot present to
+    -- the replacement surface recovery made on its window; no other device is
+    -- used.
+  | UnavailablePresentationUnsupported ![Presentation.PresentationGap]
+    -- ^ The replacement surface recovery made cannot serve the presentation
+    -- profile, naming every gap.
+  deriving (Eq, Show)
+
+-- | An optional target the model marked unavailable (D-22). Its generations
+-- retire as their holds end, while every other target continues; its window
+-- and attachment stay until the application releases them.
+data VulkanUnavailability = VulkanUnavailability
+  { unavailableTarget ∷ !TargetId
+  , unavailableBecause ∷ !UnavailableBecause
+  }
+  deriving (Eq, Show)
+
+-- | How many unavailability reports are kept, newest attachments first to stay.
+unavailabilitiesRetained ∷ Int
+unavailabilitiesRetained = 64
+
+-- | Whether this attachment's target became unavailable, and why, while the
+-- report is retained. An application waits on it in 'STM'.
+readVulkanUnavailability ∷ VulkanController → AttachmentId → STM (Maybe VulkanUnavailability)
+readVulkanUnavailability (VulkanController state) attachment = Map.lookup attachment <$> readTVar (stateUnavailable state)
+
 -- | Announce an attachment whose handover answered
 -- 'VulkanAnnouncementDeferred' again, now that the owner's port may have room.
 -- Once admitted, the owner constructs it as any other target; until then the
@@ -1211,6 +1550,7 @@ observeBridge (NativeObserver observe) bridge =
   bridge
     { bridgeAttach = \host window build →
         bridgeAttach bridge host window (\create → build (observe "glfwCreateWindowSurface" . create))
+    , bridgeReplace = \host acknowledgement lease → observe "glfwCreateWindowSurface" (bridgeReplace bridge host acknowledgement lease)
     , bridgeDischarge = observe "vkDestroySurfaceKHR" . bridgeDischarge bridge
     }
 
@@ -1314,7 +1654,13 @@ withVulkanOwnerHostHooked hooks logger layer pointer bridge enter extensions con
           liftIO (atomically (supplyInstanceExtensions controller copied))
           pure entered
         owner = vulkanOwner config (graphicsOwnerConfig (controllerOperations controller) (vulkanScene config))
-    outcome ← tryWithContext (withGraphicsOwnerHostIn logger session host owner (\windows graphics → use (VulkanHost windows graphics controller)))
+    outcome ←
+      tryWithContext $
+        withGraphicsOwnerHostIn logger session host owner $ \windows graphics → do
+          -- From now on the owner can wake the main thread when it asks for a
+          -- replacement surface.
+          atomically (writeTVar (stateHostWake state) (wakeGraphicsHost graphics))
+          use (VulkanHost windows graphics controller)
     -- However the host ended, an instance it did not destroy may still have
     -- a messenger naming the capture, so the capture's storage is kept rather
     -- than freed under it. Only an independent publication of the owner's

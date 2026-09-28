@@ -17,7 +17,8 @@ import Data.Text (Text)
 import Data.Word (Word32, Word64)
 import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (ThreadBlocked), threadStatus)
 import Numeric.Natural (Natural)
-import Hetoimasia.Foundation.Time (DurationRequirement (AllowZero), Instant, durationFromNanoseconds, scriptedInstant)
+import Hetoimasia.Foundation.Time (DurationRequirement (AllowZero), Instant, durationFromNanoseconds, maximumDuration, scriptedInstant)
+import Data.Foldable (for_)
 import Hetoimasia.GPU.Model
   ( Escalation (..)
   , Outcome (..)
@@ -492,6 +493,21 @@ spec = describe "Generations" $ do
       model ← atomically (readRootsModel (rigRoots rig))
       sessionState model `shouldBe` SessionFailed RequiredTargetUnrecoverable
 
+    it "stops retrying a failed construction once the clock cannot express its next delay, owing no step for it" $ do
+      rig ← newRig
+      script (rigStandIn rig) AtCreateSwapchain Fails
+      stepAt rig 0 (seen 640 480)
+      -- The first attempt fails at the very end of the clock's range, where
+      -- the next one's delay cannot be added.
+      _ ← wantedLast rig
+      recoveryAttempts rig `shouldReturn` 1
+      _ ← wantedLast rig
+      viewCondition <$> generationsOf rig `shouldReturn` RecoveryUnscheduled
+      atomically (generationsDeadline (rigGenerations rig)) >>= (`shouldSatisfy` not . immediate)
+      _ ← wantedLast rig
+      length <$> created rig `shouldReturn` 2
+      recoveryAttempts rig `shouldReturn` 1
+
     it "destroys exactly what a construction failing after the swapchain left, child before parent, and never replays it" $ do
       forM_ [(AtSwapchainImages, 0, [DestroyedSwapchain 100]), (AtCreateView, 1, [DestroyedView 101, DestroyedSwapchain 100])] $ \(failing, succeeding, expected) → do
         rig ← newRig
@@ -663,6 +679,393 @@ spec = describe "Generations" $ do
       model ← atomically (readRootsModel (rigRoots rig))
       sessionState model `shouldBe` SessionFailed DeviceLost
       viewActive <$> generationsOf rig `shouldReturn` Nothing
+
+  describe "surface recovery (VK-14)" $ do
+    it "retires a lost surface's generation, destroys the surface only once every generation of it has gone, and replaces it on the same target as an attempt" $ do
+      rig ← newRig
+      stepAt rig 0 (seen 640 480)
+      [first] ← activeGenerations rig
+      use ← held rig first
+      noteActive rig SwapchainSurfaceLost
+      wantedAt rig 1 `shouldReturn` []
+      viewCondition <$> generationsOf rig `shouldReturn` SurfaceLost
+      viewActive <$> generationsOf rig `shouldReturn` Nothing
+      standingOf rig first `shouldReturn` Just GenerationRetiredHeld
+      -- Held: nothing of it goes, the surface stays, and no attempt begins.
+      wantedAt rig 2 `shouldReturn` []
+      surfacesDestroyed rig `shouldReturn` []
+      recoveryAttempts rig `shouldReturn` 0
+      atomically (endGenerationUse (rigGenerations rig) use)
+      wantedAt rig 3 `shouldReturn` [rigTarget rig]
+      viewCondition <$> generationsOf rig `shouldReturn` SurfaceReplacing
+      recoveryAttempts rig `shouldReturn` 1
+      offerReplacementSurface (rigGenerations rig) (at 4) (rigTarget rig) (surfaceNumbered (rigStandIn rig) 20) `shouldReturn` ReplacementInstalled
+      stepAt rig 4 (seen 640 480)
+      viewCondition <$> generationsOf rig `shouldReturn` Presenting
+      recovered ← calls (rigStandIn rig)
+      -- Child before parent: the views, the swapchain, the lost surface, and
+      -- only then the new surface's support and a fresh swapchain on it,
+      -- handed nothing.
+      [call | call ← recovered, isRecoveryCall call]
+        `shouldBe` [ QueriedSurface 10
+                   , CreatedSwapchain 100 10 (640, 480) Nothing
+                   , DestroyedView 103
+                   , DestroyedView 102
+                   , DestroyedView 101
+                   , DestroyedSwapchain 100
+                   , DestroyedSurface 10
+                   , QueriedSupport 20
+                   , QueriedSurface 20
+                   , CreatedSwapchain 104 20 (640, 480) Nothing
+                   ]
+      -- The same target, its attempt settled and not given back.
+      modelled ← modelTarget rig
+      viewTargetPhase modelled `shouldBe` TargetAdmitted
+      viewTargetRecoveryAttempts modelled `shouldBe` 1
+      map targetViewSurface <$> atomically (readRootTargets (rigRoots rig)) `shouldReturn` [20]
+
+    it "reads a surface lost by its query or by a swapchain's creation as a lost surface too" $ do
+      forM_ [AtSurfaceOffer, AtCreateSwapchain] $ \failing → do
+        rig ← newRig
+        stepAt rig 0 (seen 640 480)
+        script (rigStandIn rig) failing (AnswersOnce FailedSurfaceLost)
+        resizeSurface rig 800 600
+        -- The query answers at once; a creation only once the move settled.
+        stepAt rig 10 (seen 800 600)
+        stepAt rig 26 (seen 800 600)
+        viewCondition <$> generationsOf rig >>= (`shouldSatisfy` (`elem` [SurfaceLost, SurfaceReplacing]))
+        viewActive <$> generationsOf rig `shouldReturn` Nothing
+        length . filter isCreated <$> swapchainCalls rig `shouldReturn` (if failing == AtCreateSwapchain then 2 else 1)
+        _ ← wantedAt rig 40
+        viewCondition <$> generationsOf rig `shouldReturn` SurfaceReplacing
+        surfacesDestroyed rig `shouldReturn` [DestroyedSurface 10]
+
+    it "keeps asking nothing more while an attempt waits for its surface, and never hot" $ do
+      rig ← lostAndReleased
+      forM_ [4, 5, 6] $ \instant → wantedAt rig instant `shouldReturn` []
+      atomically (generationsDeadline (rigGenerations rig)) >>= (`shouldSatisfy` not . immediate)
+      recoveryAttempts rig `shouldReturn` 1
+
+    it "stops asking for a replacement once the clock cannot express the next attempt's delay, owing no step for it" $ do
+      rig ← lostAndReleased
+      -- The replacement's surface is lost as its first swapchain is made, at
+      -- the very end of the clock's range: the attempt fails there, and the
+      -- next one's delay cannot be added.
+      script (rigStandIn rig) AtCreateSwapchain (AnswersOnce FailedSurfaceLost)
+      offerReplacementSurface (rigGenerations rig) lastInstant (rigTarget rig) (surfaceNumbered (rigStandIn rig) 20) `shouldReturn` ReplacementInstalled
+      wantedLast rig `shouldReturn` []
+      -- Lost, with nothing of it left: releasing it is owed at once.
+      viewCondition <$> generationsOf rig `shouldReturn` SurfaceLost
+      atomically (generationsDeadline (rigGenerations rig)) >>= (`shouldSatisfy` immediate)
+      wantedLast rig `shouldReturn` []
+      surfacesDestroyed rig `shouldReturn` [DestroyedSurface 10, DestroyedSurface 20]
+      viewCondition <$> generationsOf rig `shouldReturn` RecoveryUnscheduled
+      -- Not releasable again at every step: nothing is owed now.
+      atomically (generationsDeadline (rigGenerations rig)) >>= (`shouldSatisfy` not . immediate)
+      wantedLast rig `shouldReturn` []
+      recoveryAttempts rig `shouldReturn` 1
+
+    it "spends one episode across repeated loss: three replacements and then the target is spent, with nothing replenished" $ do
+      rig ← newRig
+      stepAt rig 0 (seen 640 480)
+      forM_ (zip [1 ..] [20, 21, 22]) $ \(round', surface) → do
+        noteActive rig SwapchainSurfaceLost
+        _ ← wantedAt rig (round' * 10)
+        wantedAt rig (round' * 10 + 1) `shouldReturn` [rigTarget rig]
+        offerReplacementSurface (rigGenerations rig) (at (round' * 10 + 2)) (rigTarget rig) (surfaceNumbered (rigStandIn rig) surface) `shouldReturn` ReplacementInstalled
+        stepAt rig (round' * 10 + 2) (seen 640 480)
+        viewCondition <$> generationsOf rig `shouldReturn` Presenting
+        recoveryAttempts rig `shouldReturn` fromIntegral round'
+      noteActive rig SwapchainSurfaceLost
+      _ ← wantedAt rig 40
+      wantedAt rig 41 `shouldReturn` []
+      viewCondition <$> generationsOf rig `shouldReturn` RecoverySpent
+      -- Unavailable, and — holding nothing more — forgotten by the model at the
+      -- step's own progress turn; the escalation is what remains.
+      model ← atomically (readRootsModel (rigRoots rig))
+      fmap viewTargetPhase (targetView (rigTarget rig) model) `shouldSatisfy` (`elem` [Nothing, Just TargetUnavailable])
+      escalations model `shouldBe` [OptionalTargetUnavailable (rigTarget rig)]
+
+    it "carries one episode across a failed replacement, a changed geometry and the construction's own retries, never resetting it" $ do
+      rig ← lostAndReleased
+      -- The replacement's first construction fails: the attempt it belonged
+      -- to fails with it.
+      script (rigStandIn rig) AtCreateSwapchain (AnswersOnce FailedNativeWindowInUse)
+      offerReplacementSurface (rigGenerations rig) (at 4) (rigTarget rig) (surfaceNumbered (rigStandIn rig) 20) `shouldReturn` ReplacementInstalled
+      stepAt rig 4 (seen 640 480)
+      viewCondition <$> generationsOf rig `shouldReturn` ConstructionFailed "StandInResult \"AtCreateSwapchain\" FailedNativeWindowInUse"
+      recoveryAttempts rig `shouldReturn` 1
+      -- The window moves meanwhile; the next attempt still waits its delay
+      -- and then its geometry's quiet period, and counts on from the first.
+      resizeSurface rig 800 600
+      stepAt rig 50 (seen 800 600)
+      viewCondition <$> generationsOf rig `shouldReturn` Settling (at 66)
+      stepAt rig 66 (seen 800 600)
+      viewCondition <$> generationsOf rig `shouldReturn` RecoveryWaiting (at 104)
+      stepAt rig 104 (seen 800 600)
+      viewCondition <$> generationsOf rig `shouldReturn` Presenting
+      recoveryAttempts rig `shouldReturn` 2
+      created rig `shouldReturn` [(640, 480), (640, 480), (800, 600)]
+
+    it "retries a replacement whose partial construction was rolled back, freshly and only after its rollback was proven" $ do
+      rig ← lostAndReleased
+      script (rigStandIn rig) AtCreateView (SucceedsThenFails 1)
+      offerReplacementSurface (rigGenerations rig) (at 4) (rigTarget rig) (surfaceNumbered (rigStandIn rig) 20) `shouldReturn` ReplacementInstalled
+      stepAt rig 4 (seen 640 480)
+      clearScript rig AtCreateView
+      stepAt rig 104 (seen 640 480)
+      viewCondition <$> generationsOf rig `shouldReturn` Presenting
+      recovered ← calls (rigStandIn rig)
+      [call | call ← recovered, isRecoveryCall call, touches20 call]
+        `shouldBe` [ QueriedSupport 20
+                   , QueriedSurface 20
+                   , CreatedSwapchain 104 20 (640, 480) Nothing
+                   , DestroyedView 105
+                   , DestroyedSwapchain 104
+                   , QueriedSurface 20
+                   , CreatedSwapchain 107 20 (640, 480) Nothing
+                   ]
+      recoveryAttempts rig `shouldReturn` 2
+
+    it "forbids any further attempt when a partial replacement's rollback is unproven, failing the session and keeping the surface" $ do
+      rig ← lostAndReleased
+      script (rigStandIn rig) AtCreateView (SucceedsThenFails 0)
+      script (rigStandIn rig) AtDestroySwapchain Fails
+      offerReplacementSurface (rigGenerations rig) (at 4) (rigTarget rig) (surfaceNumbered (rigStandIn rig) 20) `shouldReturn` ReplacementInstalled
+      stepAt rig 4 (seen 640 480)
+      stepAt rig 104 (seen 640 480) `raises` \(GenerationDestructionFailed _ _) → True
+      clearScript rig AtCreateView
+      forM_ [200, 800, 2000] $ \instant → void (stepGenerations (rigGenerations rig) (at instant) (Map.singleton (rigTarget rig) (seen 640 480)))
+      created rig `shouldReturn` [(640, 480), (640, 480)]
+      sessionState <$> atomically (readRootsModel (rigRoots rig)) `shouldReturn` SessionFailed CleanupFailed
+      retireTargetGenerations (rigGenerations rig) (at 3000) (rigTarget rig) `raises` \(GenerationsRetained _ _) → True
+      retireRootTarget (rigRoots rig) (rigTarget rig) `raises` \(TargetGenerationsRemain _ _) → True
+      filter (== DestroyedSurface 20) <$> calls (rigStandIn rig) `shouldReturn` []
+
+    it "forbids any attempt when the lost surface's own destruction is unproven, failing the session" $ do
+      standIn ← newStandIn
+      roots ← newStandInRoots standIn (budgetsOf defaultBudgetRequest)
+      _ ← startRoots roots standardRequest
+      target ← admitRootTarget roots OptionalTarget (surfaceFailing standIn 10) >>= either (fail . show) pure
+      generations ← newGenerations roots
+      atomically (trackTarget generations target OptionalTarget 10)
+      let stepOnce instant = stepGenerations generations (at instant) (Map.singleton target (seen 640 480))
+      _ ← stepOnce 0
+      active ← viewActive <$> (atomically (readTargetGenerations generations target) >>= maybe (fail "untracked") pure)
+      for_ active $ \generation → atomically (noteSwapchainResult generations generation SwapchainSurfaceLost)
+      _ ← stepOnce 1
+      stepOnce 2 `raises` \(SurfaceDestructionFailed _ _) → True
+      -- Reported once; never attempted again, and nothing asked for.
+      summarySurfacesWanted <$> stepOnce 200 `shouldReturn` []
+      model ← atomically (readRootsModel roots)
+      sessionState model `shouldBe` SessionFailed CleanupFailed
+      fmap viewTargetRecoveryAttempts (targetView target model) `shouldBe` Just 0
+      length . filter (== DestroyedSurface 10) <$> calls standIn `shouldReturn` 1
+
+    it "orders a failed replacement's retired chain: destroyed before any fresh creation, and a window still in use charged to the same episode" $ do
+      rig ← newRig
+      stepAt rig 0 (seen 640 480)
+      -- The replacement hands the active generation over, and its creation
+      -- answers the window still in use: the old chain is retired all the
+      -- same, and never named again.
+      script (rigStandIn rig) AtCreateSwapchain (AnswersOnce FailedNativeWindowInUse)
+      resize rig 10 800 600
+      viewActive <$> generationsOf rig `shouldReturn` Nothing
+      -- The fresh construction waits for the retired chain's destruction,
+      -- and is refused again with the window still in use: the episode's
+      -- first attempt, failed, and the second 100 ms on.
+      script (rigStandIn rig) AtCreateSwapchain (AnswersOnce FailedNativeWindowInUse)
+      stepAt rig 40 (seen 800 600)
+      viewCondition <$> generationsOf rig `shouldReturn` ConstructionFailed "StandInResult \"AtCreateSwapchain\" FailedNativeWindowInUse"
+      stepAt rig 139 (seen 800 600)
+      viewCondition <$> generationsOf rig `shouldReturn` RecoveryWaiting (at 140)
+      stepAt rig 140 (seen 800 600)
+      viewCondition <$> generationsOf rig `shouldReturn` Presenting
+      later ← swapchainCalls rig
+      [call | call ← later, isDestroyedSwapchain call || isCreated call]
+        `shouldBe` [ CreatedSwapchain 100 10 (640, 480) Nothing
+                   , CreatedSwapchain 104 10 (800, 600) (Just 100)
+                   , DestroyedSwapchain 100
+                   , CreatedSwapchain 105 10 (800, 600) Nothing
+                   , CreatedSwapchain 106 10 (800, 600) Nothing
+                   ]
+      recoveryAttempts rig `shouldReturn` 2
+
+    it "lets close defeat a replacement that arrives after it: the surface stays its creator's, and the attempt settles" $ do
+      rig ← lostAndReleased
+      retireTargetGenerations (rigGenerations rig) (at 4) (rigTarget rig)
+      offerReplacementSurface (rigGenerations rig) (at 5) (rigTarget rig) (surfaceNumbered (rigStandIn rig) 20) `shouldReturn` ReplacementNotWanted
+      filter (== QueriedSupport 20) <$> calls (rigStandIn rig) `shouldReturn` []
+      -- Nothing of it remains to destroy, and the model forgets the target.
+      retireRootTarget (rigRoots rig) (rigTarget rig)
+      model ← atomically (readRootsModel (rigRoots rig))
+      targetView (rigTarget rig) model `shouldBe` Nothing
+      length . filter isCreated <$> swapchainCalls rig `shouldReturn` 1
+
+    it "fails an attempt whose replacement was not made, and schedules the next through the episode" $ do
+      rig ← lostAndReleased
+      replacementSurfaceFailed (rigGenerations rig) (at 4) (rigTarget rig) "scripted"
+      viewCondition <$> generationsOf rig `shouldReturn` SurfaceLost
+      wantedAt rig 50 `shouldReturn` []
+      viewCondition <$> generationsOf rig `shouldReturn` RecoveryWaiting (at 104)
+      wantedAt rig 104 `shouldReturn` [rigTarget rig]
+      recoveryAttempts rig `shouldReturn` 2
+
+    describe "exhaustion follows the designation" $ do
+      it "an optional target becomes unavailable while another keeps building" $ do
+        rig ← lostAndReleased
+        other ← admitAnother rig 11
+        spendReplacements rig
+        viewCondition <$> generationsOf rig `shouldReturn` RecoverySpent
+        viewTargetPhase <$> modelTarget rig `shouldReturn` TargetUnavailable
+        model ← atomically (readRootsModel (rigRoots rig))
+        sessionState model `shouldBe` SessionRunning
+        void (stepGenerations (rigGenerations rig) (at 5000) (Map.fromList [(rigTarget rig, seen 640 480), (other, seen 640 480)]))
+        viewCondition <$> otherGenerations rig other `shouldReturn` Presenting
+
+      it "a required target fails the session" $ do
+        rig ← lostAndReleasedOf RequiredTarget
+        spendReplacements rig
+        viewCondition <$> generationsOf rig `shouldReturn` RecoverySpent
+        model ← atomically (readRootsModel (rigRoots rig))
+        sessionState model `shouldBe` SessionFailed RequiredTargetUnrecoverable
+        escalations model `shouldSatisfy` elem (RequiredTargetFailedSession (rigTarget rig))
+
+    describe "a replacement the device cannot present to is disposed of through the designation, with no second device" $ do
+      it "an optional target becomes unavailable while another keeps building" $ do
+        rig ← lostAndReleased
+        other ← admitAnother rig 11
+        offerReplacementSurface (rigGenerations rig) (at 4) (rigTarget rig) (surfaceNumbered (rigStandIn rig) unsupportedSurface) `shouldReturn` ReplacementUnsupported 0
+        viewCondition <$> generationsOf rig `shouldReturn` RecoverySpent
+        viewTargetPhase <$> modelTarget rig `shouldReturn` TargetUnavailable
+        sessionState <$> atomically (readRootsModel (rigRoots rig)) `shouldReturn` SessionRunning
+        void (stepGenerations (rigGenerations rig) (at 5) (Map.fromList [(rigTarget rig, seen 640 480), (other, seen 640 480)]))
+        viewCondition <$> otherGenerations rig other `shouldReturn` Presenting
+        -- The surface stays its creator's; the device is the one there was.
+        filter (== DestroyedSurface unsupportedSurface) <$> calls (rigStandIn rig) `shouldReturn` []
+        length . filter isDeviceCreated <$> calls (rigStandIn rig) `shouldReturn` 1
+
+      it "a required target fails the session" $ do
+        rig ← lostAndReleasedOf RequiredTarget
+        offerReplacementSurface (rigGenerations rig) (at 4) (rigTarget rig) (surfaceNumbered (rigStandIn rig) unsupportedSurface) `shouldReturn` ReplacementUnsupported 0
+        sessionState <$> atomically (readRootsModel (rigRoots rig)) `shouldReturn` SessionFailed RequiredTargetUnrecoverable
+        length . filter isDeviceCreated <$> calls (rigStandIn rig) `shouldReturn` 1
+
+    it "takes a lost surface reported from a generation already retired, and no late report about it reaches the replacement" $ do
+      rig ← newRig
+      stepAt rig 0 (seen 640 480)
+      [first] ← activeGenerations rig
+      use ← held rig first
+      resize rig 10 800 600
+      viewActive <$> generationsOf rig >>= (`shouldSatisfy` (/= Just first))
+      -- A presentation made on the retired generation answers the surface
+      -- lost: the target's surface is lost, whichever generation said so.
+      atomically (noteSwapchainResult (rigGenerations rig) first SwapchainOutOfDate) `shouldReturn` False
+      atomically (noteSwapchainResult (rigGenerations rig) first SwapchainSurfaceLost) `shouldReturn` True
+      stepAt rig 30 (seen 800 600)
+      viewCondition <$> generationsOf rig `shouldReturn` SurfaceLost
+      viewActive <$> generationsOf rig `shouldReturn` Nothing
+      -- Another report about the lost surface, while it is being recovered,
+      -- changes nothing.
+      atomically (noteSwapchainResult (rigGenerations rig) first SwapchainSurfaceLost) `shouldReturn` True
+      atomically (endGenerationUse (rigGenerations rig) use)
+      _ ← wantedAt rig 40
+      _ ← wantedAt rig 41
+      viewCondition <$> generationsOf rig `shouldReturn` SurfaceReplacing
+      offerReplacementSurface (rigGenerations rig) (at 42) (rigTarget rig) (surfaceNumbered (rigStandIn rig) 20) `shouldReturn` ReplacementInstalled
+      stepAt rig 42 (seen 800 600)
+      stepAt rig 43 (seen 800 600)
+      viewCondition <$> generationsOf rig `shouldReturn` Presenting
+      recoveryAttempts rig `shouldReturn` 1
+
+    describe "reads what a creation's retry raised as itself, not as a failed retry" $ do
+      it "latching device loss" $ do
+        rig ← retryingRig (AnswersOnceThen FailedOutOfMemory Loses)
+        stepAt rig 30 (seen 800 600) `raises` \(GraphicsDeviceLost {}) → True
+        viewLoss <$> atomically (readRootsView (rigRoots rig)) >>= (`shouldSatisfy` isJust)
+        -- The retry was made: the reclamation pass destroyed the generation a
+        -- hold had kept until the construction began.
+        destroyed rig >>= (`shouldSatisfy` elem (DestroyedSwapchain 100))
+
+      it "replacing a lost surface" $ do
+        rig ← retryingRig (AnswersOnceThen FailedOutOfMemory (AnswersOnce FailedSurfaceLost))
+        stepAt rig 30 (seen 800 600)
+        viewCondition <$> generationsOf rig `shouldReturn` SurfaceLost
+        destroyed rig >>= (`shouldSatisfy` elem (DestroyedSwapchain 100))
+
+    it "fails the attempt in flight when the replacement surface's own query reports it lost, and admits the next through the episode" $ do
+      rig ← lostAndReleased
+      offerReplacementSurface (rigGenerations rig) (at 4) (rigTarget rig) (surfaceNumbered (rigStandIn rig) 20) `shouldReturn` ReplacementInstalled
+      script (rigStandIn rig) AtSurfaceOffer (AnswersOnce FailedSurfaceLost)
+      -- Nothing was built on it, so the same step lets the lost replacement
+      -- go, and the next attempt waits its delay rather than being refused as
+      -- outstanding, asking for no step now.
+      wantedAt rig 4 `shouldReturn` []
+      wantedAt rig 5 `shouldReturn` []
+      viewCondition <$> generationsOf rig `shouldReturn` RecoveryWaiting (at 104)
+      atomically (generationsDeadline (rigGenerations rig)) >>= (`shouldSatisfy` not . immediate)
+      surfacesDestroyed rig `shouldReturn` [DestroyedSurface 10, DestroyedSurface 20]
+      wantedAt rig 104 `shouldReturn` [rigTarget rig]
+      recoveryAttempts rig `shouldReturn` 2
+
+    it "keeps a fresh construction waiting while the chain a failed replacement handed over is still held, and destroys it first" $ do
+      rig ← newRig
+      stepAt rig 0 (seen 640 480)
+      [first] ← activeGenerations rig
+      use ← held rig first
+      script (rigStandIn rig) AtCreateSwapchain (AnswersOnce FailedNativeWindowInUse)
+      resize rig 10 800 600
+      viewActive <$> generationsOf rig `shouldReturn` Nothing
+      -- Held, the retired chain stays, and nothing fresh is created or
+      -- charged, however long the episode's delays run.
+      forM_ [40, 200, 700, 2000] $ \instant → stepAt rig instant (seen 800 600)
+      length . filter isCreated <$> swapchainCalls rig `shouldReturn` 2
+      recoveryAttempts rig `shouldReturn` 0
+      atomically (endGenerationUse (rigGenerations rig) use)
+      stepAt rig 2100 (seen 800 600)
+      later ← swapchainCalls rig
+      [call | call ← later, isDestroyedSwapchain call || isCreated call]
+        `shouldBe` [ CreatedSwapchain 100 10 (640, 480) Nothing
+                   , CreatedSwapchain 104 10 (800, 600) (Just 100)
+                   , DestroyedSwapchain 100
+                   , CreatedSwapchain 105 10 (800, 600) Nothing
+                   ]
+      viewCondition <$> generationsOf rig `shouldReturn` Presenting
+
+    describe "a replacement that cannot serve the profile fails its attempt and is disposed of through the designation" $ do
+      it "an optional target becomes unavailable" $ do
+        rig ← lostAndReleased
+        offerReplacementSurface (rigGenerations rig) (at 4) (rigTarget rig) (surfaceNumbered (rigStandIn rig) 20) `shouldReturn` ReplacementInstalled
+        offerSurface (rigStandIn rig) (\offer → offer {offerPresentModes = [0]})
+        stepAt rig 4 (seen 640 480)
+        viewCondition <$> generationsOf rig >>= (`shouldSatisfy` \case
+          PresentationUnsupported _ → True
+          _ → False)
+        model ← atomically (readRootsModel (rigRoots rig))
+        escalations model `shouldBe` [OptionalTargetUnavailable (rigTarget rig)]
+        sessionState model `shouldBe` SessionRunning
+        -- Nothing more is asked or built, however long it runs.
+        forM_ [200, 800, 5000] $ \instant → wantedAt rig instant `shouldReturn` []
+        length . filter isCreated <$> swapchainCalls rig `shouldReturn` 1
+
+      it "a required target fails the session" $ do
+        rig ← lostAndReleasedOf RequiredTarget
+        offerReplacementSurface (rigGenerations rig) (at 4) (rigTarget rig) (surfaceNumbered (rigStandIn rig) 20) `shouldReturn` ReplacementInstalled
+        offerSurface (rigStandIn rig) (\offer → offer {offerPresentModes = [0]})
+        stepAt rig 4 (seen 640 480)
+        sessionState <$> atomically (readRootsModel (rigRoots rig)) `shouldReturn` SessionFailed RequiredTargetUnrecoverable
+
+    it "tells an ordinary resize, which spends nothing, from a repeated failure at unchanged geometry, which spends the episode" $ do
+      rig ← newRig
+      stepAt rig 0 (seen 640 480)
+      forM_ (zip [10, 40, 70] [(800, 600), (1024, 768), (640, 480)]) $ \(instant, (width, height)) → resize rig instant width height
+      recoveryAttempts rig `shouldReturn` 0
+      noteActive rig SwapchainOutOfDate
+      stepAt rig 100 (seen 640 480)
+      noteActive rig SwapchainOutOfDate
+      stepAt rig 101 (seen 640 480)
+      recoveryAttempts rig `shouldReturn` 2
+      length <$> created rig `shouldReturn` 6
 
   describe "close" $ do
     it "retires a construction the target closed during, rather than publishing it" $ do
@@ -869,6 +1272,99 @@ raises action expected =
   try action >>= \case
     Left failure → expected failure `shouldBe` True
     Right _ → expectationFailure "expected a failure, but the action returned"
+
+-- | A rig whose first generation is retired but held, and whose active one
+-- has an out-of-date result, so the step at 30 rebuilds it. The hold ends
+-- right after that construction's admission, making the retired generation
+-- something a reclamation pass can dispose of; the construction's first view
+-- creation then runs out of memory, and its retry does as scripted.
+retryingRig ∷ Scripted → IO Rig
+retryingRig retry = do
+  -- Room for three generations, so the rebuild is not held back by the
+  -- retired one's hold.
+  rig ← newRigWith defaultBudgetRequest {requestedGenerations = 3}
+  stepAt rig 0 (seen 640 480)
+  [first] ← activeGenerations rig
+  use ← held rig first
+  resize rig 10 800 600
+  noteActive rig SwapchainOutOfDate
+  atomically (writeTVar (rigAfterAdmission rig) (\_ → atomically (endGenerationUse (rigGenerations rig) use)))
+  script (rigStandIn rig) AtCreateView retry
+  pure rig
+
+-- | Step once, and answer the targets the step asked a replacement surface
+-- for.
+wantedAt ∷ Rig → Integer → IO [TargetId]
+wantedAt rig instant = summarySurfacesWanted <$> stepGenerations (rigGenerations rig) (at instant) (Map.singleton (rigTarget rig) (seen 640 480))
+
+-- | The very end of the clock's range, where no delay can be added.
+lastInstant ∷ Instant
+lastInstant = scriptedInstant maximumDuration
+
+-- | 'wantedAt' at 'lastInstant'.
+wantedLast ∷ Rig → IO [TargetId]
+wantedLast rig = summarySurfacesWanted <$> stepGenerations (rigGenerations rig) lastInstant (Map.singleton (rigTarget rig) (seen 640 480))
+
+-- | A rig whose target's surface was lost, its generation destroyed, the
+-- surface released, and one attempt admitted and waiting for a replacement.
+lostAndReleased ∷ IO Rig
+lostAndReleased = lostAndReleasedOf OptionalTarget
+
+lostAndReleasedOf ∷ TargetClass → IO Rig
+lostAndReleasedOf classification = do
+  rig ← newRigOf classification defaultBudgetRequest
+  stepAt rig 0 (seen 640 480)
+  noteActive rig SwapchainSurfaceLost
+  _ ← wantedAt rig 1
+  _ ← wantedAt rig 2
+  viewCondition <$> generationsOf rig >>= (`shouldBe` SurfaceReplacing)
+  pure rig
+
+-- | Fail the outstanding attempt's replacement and every later one the
+-- episode admits, until it is spent.
+spendReplacements ∷ Rig → IO ()
+spendReplacements rig = do
+  replacementSurfaceFailed (rigGenerations rig) (at 4) (rigTarget rig) "scripted"
+  wantedAt rig 104 >>= (`shouldBe` [rigTarget rig])
+  replacementSurfaceFailed (rigGenerations rig) (at 104) (rigTarget rig) "scripted"
+  wantedAt rig 604 >>= (`shouldBe` [rigTarget rig])
+  replacementSurfaceFailed (rigGenerations rig) (at 604) (rigTarget rig) "scripted"
+  recoveryAttempts rig >>= (`shouldBe` 3)
+
+otherGenerations ∷ Rig → TargetId → IO TargetGenerationsView
+otherGenerations rig target = atomically (readTargetGenerations (rigGenerations rig) target) >>= maybe (fail "the other target is not tracked") pure
+
+-- | Every surface destruction, oldest first.
+surfacesDestroyed ∷ Rig → IO [Call]
+surfacesDestroyed rig = filter (\case DestroyedSurface _ → True; _ → False) <$> calls (rigStandIn rig)
+
+-- | The calls a surface's recovery orders: generation creation and
+-- destruction, the surface's destruction, and the support and capability
+-- queries.
+isRecoveryCall ∷ Call → Bool
+isRecoveryCall = \case
+  CreatedSwapchain {} → True
+  DestroyedView _ → True
+  DestroyedSwapchain _ → True
+  DestroyedSurface _ → True
+  QueriedSupport _ → True
+  QueriedSurface _ → True
+  _ → False
+
+-- | Whether a call concerns surface 20 or a swapchain or view built on it.
+touches20 ∷ Call → Bool
+touches20 = \case
+  CreatedSwapchain _ 20 _ _ → True
+  QueriedSupport 20 → True
+  QueriedSurface 20 → True
+  DestroyedView view → view >= 104
+  DestroyedSwapchain swapchain → swapchain >= 104
+  _ → False
+
+isDeviceCreated ∷ Call → Bool
+isDeviceCreated = \case
+  CreatedDevice _ _ → True
+  _ → False
 
 -- | Whether a deadline asks for a step now.
 immediate ∷ Maybe (Either () Instant) → Bool

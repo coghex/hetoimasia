@@ -29,6 +29,7 @@ module Hetoimasia.GPU.Vulkan.Native.Roots.Vulkan
   , validationFeaturesInfo
   , instancePointer
   , isDeviceLoss
+  , nativeFailureOf
   , vulkanInstrumentation
   ) where
 
@@ -98,7 +99,7 @@ import Hetoimasia.GPU.Vulkan.Native.Presentation
   , SurfaceOffer (..)
   , undefinedExtentDimension
   )
-import Hetoimasia.GPU.Vulkan.Native.Roots (GenerationOps (..), RootOps (..), SwapchainRequest (..))
+import Hetoimasia.GPU.Vulkan.Native.Roots (GenerationOps (..), NativeFailure (..), RootOps (..), SwapchainRequest (..))
 
 -- | The production layer's handle types.
 type VulkanRootOps = RootOps Quiesced Instance DebugUtilsMessengerEXT PhysicalDevice Device
@@ -143,6 +144,7 @@ vulkanRootOps capture =
     , opsSurfaceSupport = \_ physical family surface →
         getPhysicalDeviceSurfaceSupportKHR physical family (SurfaceKHR surface)
     , opsDeviceLoss = isDeviceLoss
+    , opsNativeFailure = nativeFailureOf
     , opsDeviceHandle = dispatchable . deviceHandle
     , opsDeviceQueue = \device family → dispatchable . queueHandle <$> getDeviceQueue device family 0
     , opsInstrumentation = pure . vulkanInstrumentation
@@ -369,3 +371,14 @@ isDeviceLoss ∷ SomeException → Bool
 isDeviceLoss exception = case fromException exception of
   Just (VulkanException result) → result == ERROR_DEVICE_LOST
   Nothing → False
+
+-- | The results recovery acts on (VK-14), from a call the binding raised for.
+-- Anything else — device loss included, which is 'isDeviceLoss''s — is not
+-- one of them.
+nativeFailureOf ∷ SomeException → Maybe NativeFailure
+nativeFailureOf exception = case fromException exception of
+  Just (VulkanException result)
+    | result `elem` [ERROR_OUT_OF_HOST_MEMORY, ERROR_OUT_OF_DEVICE_MEMORY] → Just FailedOutOfMemory
+    | result == ERROR_SURFACE_LOST_KHR → Just FailedSurfaceLost
+    | result == ERROR_NATIVE_WINDOW_IN_USE_KHR → Just FailedNativeWindowInUse
+  _ → Nothing

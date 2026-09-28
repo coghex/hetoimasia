@@ -24,6 +24,10 @@
 --   present fences, a resized window's old generation retired only on that
 --   evidence, the first window closed while the second keeps presenting, and
 --   the session retired with every fence observed (#227);
+-- * @vk14-recovery@ — VK-14's recovery: a lost surface and its swapchain
+--   replaced on the same live window while a second window keeps presenting,
+--   and an allocation that ran out of memory recovered by reclaiming a
+--   retired generation (#229);
 -- * @vk15-validation-stop@ — VK-15's validation error during rendering,
 --   stopping the session at the next checkpoint and tearing it down with the
 --   error as its primary failure (#231);
@@ -78,6 +82,7 @@ import qualified Test.GPU.Vulkan.Native.Frames as Frames
 import qualified Test.GPU.Vulkan.Native.Hazard as Hazard
 import qualified Test.GPU.Vulkan.Native.Naming as Naming
 import qualified Test.GPU.Vulkan.Native.Presentation as Presentation
+import qualified Test.GPU.Vulkan.Native.Recovery as Recovery
 import qualified Test.GPU.Vulkan.Native.Recording as Recording
 import qualified Test.GPU.Vulkan.Native.Terminal as Terminal
 import qualified Test.Vulkan.Proof.Bridge as Bridge
@@ -155,6 +160,12 @@ scenarios =
       $ \_ journal _ → do
         outcome ← Presentation.runPresentation journal
         pure (Presentation.spec outcome, section "The VK-13 presentation record" (Presentation.presentationSection outcome))
+  , Scenario
+      "vk14-recovery"
+      "replaces a lost surface on its live window while another presents, and recovers an allocation by reclaiming a retired generation, with validation reporting nothing"
+      $ \_ journal _ → do
+        outcome ← Recovery.runRecovery journal
+        pure (Recovery.spec outcome, section "The VK-14 recovery record" (Recovery.recoverySection outcome))
   , Scenario
       "vk15-validation-stop"
       "stops rendering at the checkpoint after an injected validation error, tearing down under the ordinary rules with the error as the primary and the final callbacks in the verdict"

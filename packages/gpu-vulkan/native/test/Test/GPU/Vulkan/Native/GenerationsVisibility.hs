@@ -73,12 +73,14 @@ spec = describe "Generations visibility across the package boundary" $ do
 withClient ∷ String → ((Mode → IO Client) → IO ()) → IO ()
 withClient = withStorePackageClient ["base", "hetoimasia-gpu-vulkan-native-0.1.0.0-inplace"] "Client.hs"
 
--- | The modules the public generations module is implemented by.
+-- | The modules the public generations module is implemented by, and the
+-- allocation recovery (VK-14) its constructions and the recording's share.
 implementationModules ∷ [String]
 implementationModules =
   map
     ("Hetoimasia.GPU.Vulkan.Native.Internal.Generations." <>)
-    ["Disposal", "Observation", "Reconciliation", "Retirement", "State", "Step", "Uses"]
+    ["Disposal", "Observation", "Reconciliation", "Retirement", "State", "Step", "Surface", "Uses"]
+    <> ["Hetoimasia.GPU.Vulkan.Native.Internal.Reclamation"]
 
 -- | The types the public generations module exports without their
 -- constructors, each of which has one of its own name.
@@ -113,6 +115,9 @@ supportedClient =
       , "UseRefusal (..)"
       , "useGeneration"
       , "endGenerationUse"
+      , "ReplacementAnswer (..)"
+      , "offerReplacementSurface"
+      , "replacementSurfaceFailed"
       , "retireTargetGenerations"
       , "TargetCondition (..)"
       , "GenerationStanding (..)"
@@ -122,6 +127,8 @@ supportedClient =
       , "GenerationDestructionFailed (..)"
       , "GenerationEffectUncertain (..)"
       , "GenerationsRetained (..)"
+      , "AllocationNotRecovered (..)"
+      , "RecoveryEnd (..)"
       ]
 
 importing ∷ String → String

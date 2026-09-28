@@ -138,6 +138,7 @@ test-suite vulkan-native-tests
         Test.GPU.Vulkan.Native.Fixture
         Test.GPU.Vulkan.Native.Frames
         Test.GPU.Vulkan.Native.Presentation
+        Test.GPU.Vulkan.Native.Recovery
         Test.GPU.Vulkan.Native.Gate
         Test.GPU.Vulkan.Native.Hazard
         Test.GPU.Vulkan.Native.Naming
@@ -201,4 +202,7 @@ test-suite vulkan-native-tests
         hetoimasia-gpu-vulkan-diagnostics ==0.1.0.0,
         hetoimasia-gpu-vulkan-model ==0.1.0.0,
         hetoimasia-gpu-vulkan-native ==0.1.0.0,
-        hetoimasia-gpu-vulkan-glfw
+        hetoimasia-gpu-vulkan-glfw,
+        -- The controller's report of a swapchain result, which VK-14's shared
+        -- example makes as an acquisition on the owner's thread would.
+        hetoimasia-gpu-vulkan-glfw:controller

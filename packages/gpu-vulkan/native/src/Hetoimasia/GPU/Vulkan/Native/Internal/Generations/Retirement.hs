@@ -21,7 +21,7 @@ import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust)
 
 import Hetoimasia.Foundation.Time (Instant)
-import Hetoimasia.GPU.Model (Outcome (..), closeTarget, retireGeneration)
+import Hetoimasia.GPU.Model (Outcome (..), closeTarget, recordRecoveryFailure, retireGeneration)
 import Hetoimasia.GPU.Model.Identity (TargetId)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Generations.Disposal (disposeEligible)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Generations.State
@@ -59,8 +59,16 @@ retireTargetGenerations generations now target = do
         lookupGeneration generations generation >>= \case
           Just native | genUses native == 0 → endCpuUse generations generation
           _ → pure ()
+      -- An attempt still outstanding — a replacement surface asked for and
+      -- never offered — is settled now that close has won: its failure
+      -- decides nothing for a retiring target, and settling it is what lets
+      -- the model forget the target once nothing else remains.
+      when (recordRecovering entry) $
+        stateRootsModel roots $ \model → case recordRecoveryFailure now target model of
+          Admitted next → ((), next)
+          _ → ((), model)
       modifyTVar' (generationsTargets generations) $
-        Map.adjust (\held → held {recordActive = Nothing, recordCondition = Closing}) target
+        Map.adjust (\held → held {recordActive = Nothing, recordCondition = Closing, recordRecovering = False}) target
     pure (isJust record)
   when tracked $ do
     (_, failure) ← disposeEligible generations now (Just target)

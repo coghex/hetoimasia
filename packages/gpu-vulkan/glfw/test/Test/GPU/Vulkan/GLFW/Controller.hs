@@ -23,7 +23,7 @@ import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust, isNothing)
 import qualified Data.Text
 import System.Timeout (timeout)
-import Hetoimasia.GPU.Model (SessionFailureCause (DeviceLost), SessionState (..), sessionState)
+import Hetoimasia.GPU.Model (SessionFailureCause (DeviceLost), SessionState (..), TargetView (..), sessionState, targetView)
 import Hetoimasia.GPU.Model.Identity (TargetClass (..))
 import Hetoimasia.GPU.Vulkan.Diagnostics (CaptureConfig (..), CaptureCounters (..), CaptureStatus (..), DiagnosticVerdict (..), VerdictIssue (..), defaultCaptureConfig, verdictIssues)
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
@@ -31,7 +31,10 @@ import Hetoimasia.Foundation.Messaging.Payload (prepare, preparedValue)
 import Hetoimasia.Foundation.Messaging.Snapshot (observedValue, readSnapshot)
 import Hetoimasia.GLFW.Command (clientObservations)
 import Hetoimasia.GLFW.Window (Attribute (Observed), Extent (..), WindowId, observedFramebufferExtent)
-import Hetoimasia.GPU.Vulkan.Native.Generations (TargetCondition (..), TargetGenerationsView (..))
+import Hetoimasia.GPU.Vulkan.Native.Generations (GenerationView (..), SwapchainResult (..), TargetCondition (..), TargetGenerationsView (..))
+import Data.Word (Word64)
+import Numeric.Natural (Natural)
+import Hetoimasia.Runtime.Supervision (RuntimeControl)
 import Hetoimasia.GPU.Vulkan.Native.Presentation (Suspension (..))
 import Hetoimasia.GPU.Vulkan.Native.Profile (NoCompatibleDevice (..), TargetRejection (..))
 import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost (..), GraphicsSessionFailed (..), RootStanding (..), RootTargetView (..), RootsView (..), SurfaceDestructionFailed (..), TeardownEvidence (..), TerminalCause (..), TerminalReport (..))
@@ -130,6 +133,15 @@ spec = describe "Vulkan controller" $ do
 
   describe "progress" $
     it "reports no work and no deadline while nothing is deferred, since nothing is recorded or submitted" (bounded testNoDemand)
+
+  describe "recovering a lost surface (VK-14)" $ do
+    it "replaces it on the main thread under the same attachment, after its generation and then the lost surface went on the owner's thread, and leaves the other target alone" (bounded testSurfaceReplaced)
+    it "lets a close defeat a replacement still asked for: nothing is created, and the target retires" (bounded testReplacementAfterClose)
+    it "reports an optional target whose episode was spent unavailable, while the other target keeps its generation" (bounded testOptionalSpent)
+    it "fails the session at a checkpoint when a required target's episode is spent" (bounded testRequiredSpent)
+    it "disposes of an optional target whose replacement the device cannot present to, destroying that surface on the owner's thread, with no second device" (bounded testUnsupportedOptional)
+    it "fails the session when a required target's replacement cannot be presented to" (bounded testUnsupportedRequired)
+    it "spends no attempt for an ordinary resize, and one for each out-of-date result at unchanged geometry" (bounded testResizeVersusFailure)
 
   describe "swapchain generations" $ do
     it "builds a visible target's generation on the owner's thread, from the framebuffer the owner last observed, and the exit destroys it" (bounded testGenerationBuilt)
@@ -1425,6 +1437,233 @@ testGenerationClosed = do
     closing = \case
       ViewDestroyed _ → True
       _ → False
+
+testSurfaceReplaced ∷ IO ()
+testSurfaceReplaced = do
+  rig ← visibleRigOf 2
+  mainThread ← newTVarIO Nothing
+  (before, after, secondSwapchain, attempts) ← runRig rig $ \host control → do
+    myThreadId >>= atomically . writeTVar mainThread . Just
+    let controller = vulkanController host
+    [first, second] ← windowsOf host
+    one ← handedOver host first RequiredTarget
+    two ← handedOver host second RequiredTarget
+    TargetUsable ← awaitStanding host one
+    TargetUsable ← awaitStanding host two
+    publishObservation host one first
+    publishObservation host two second
+    pumpUntil host control "both generations" ((&&) <$> presenting host one <*> presenting host two)
+    before ← atomically (readVulkanTargets controller)
+    secondSwapchain ← activeSwapchain host two
+    loseSurfaceOf rig host one first
+    pumpReplacing host control "the replacement's generation" $ do
+      targets ← atomically (readVulkanTargets controller)
+      ready ← presenting host one
+      pure (ready && surfaceOf one targets == [102])
+    after ← atomically (readVulkanTargets controller)
+    model ← atomically (readVulkanModel controller)
+    let attempts = [viewTargetRecoveryAttempts view | (attachment, target) ← after, attachment == graphicsAttachment one, Just view ← [targetView (targetViewIdentity target) model]]
+    pure (before, after, secondSwapchain, attempts)
+  -- The same attachments and the same targets, one on its new surface.
+  map identities after `shouldBe` map identities before
+  map (targetViewSurface . snd) before `shouldBe` [100, 101]
+  map (targetViewSurface . snd) after `shouldBe` [102, 101]
+  attempts `shouldBe` [1]
+  events ← journal rig
+  let recovery = dropWhile (/= SurfaceDestroyed 100) events
+  -- The lost surface went only after its generation, and the replacement was
+  -- created, checked against the one device and built on, in that order.
+  takeWhile (/= SurfaceDestroyed 100) events `shouldSatisfy` any isSwapchainDestroyed
+  recovery `shouldSatisfy` isSubsequenceOf [SurfaceDestroyed 100, SurfaceCreated 102, SupportQueried 102]
+  [() | SwapchainCreated _ _ Nothing ← dropWhile (/= SupportQueried 102) recovery] `shouldSatisfy` (not . null)
+  -- Until the replacement was built, the other target's generation was left
+  -- alone and no window went.
+  let untilRebuilt = takeWhile (\case SwapchainCreated _ _ Nothing → False; _ → True) (dropWhile (/= SupportQueried 102) recovery)
+  takeWhile (/= SupportQueried 102) recovery <> untilRebuilt `shouldSatisfy` all (\event → event /= SwapchainDestroyed secondSwapchain && not (isWindowGone event))
+  length [() | DeviceCreated ← events] `shouldBe` 1
+  Just main ← atomically (readTVar mainThread)
+  owners ← threadsOf rig (== InstanceCreated)
+  threadsOf rig (== SurfaceCreated 102) >>= (`shouldBe` [main])
+  threadsOf rig (`elem` [SurfaceDestroyed 100, SupportQueried 102]) >>= (`shouldSatisfy` all (`elem` owners))
+  where
+    identities (attachment, view) = (attachment, targetViewIdentity view)
+    surfaceOf service targets = [targetViewSurface view | (attachment, view) ← targets, attachment == graphicsAttachment service]
+
+testReplacementAfterClose ∷ IO ()
+testReplacementAfterClose = do
+  rig ← visibleRig
+  _ ← runRig rig $ \host control → do
+    [window] ← windowsOf host
+    service ← handedOver host window RequiredTarget
+    TargetUsable ← awaitStanding host service
+    publishObservation host service window
+    pumpUntil host control "the first generation" (presenting host service)
+    loseSurfaceOf rig host service window
+    -- The owner asks, and the main thread closes the window before it
+    -- creates anything.
+    pumpUntil host control "the request" (conditionOf host service (== Just SurfaceReplacing))
+    CloseStarted ← closeHostWindow (vulkanWindowHost host) window
+    pumpReplacing host control "the window's release" (elem (WindowGone False) <$> journal rig)
+  events ← journal rig
+  [surface | SurfaceCreated surface ← events] `shouldBe` [100]
+  [surface | SurfaceDestroyed surface ← events] `shouldBe` [100]
+
+testOptionalSpent ∷ IO ()
+testOptionalSpent = do
+  rig ← visibleRigOf 2
+  forM_ [102, 103, 104] $ \surface → scriptSurface rig surface CreateFails
+  (unavailable, stillPresenting, failure) ← runRig rig $ \host control → do
+    [first, second] ← windowsOf host
+    one ← handedOver host first OptionalTarget
+    two ← handedOver host second RequiredTarget
+    TargetUsable ← awaitStanding host one
+    TargetUsable ← awaitStanding host two
+    publishObservation host one first
+    publishObservation host two second
+    pumpUntil host control "both generations" ((&&) <$> presenting host one <*> presenting host two)
+    loseSurfaceOf rig host one first
+    pumpReplacing host control "the report" (isJust <$> atomically (readVulkanUnavailability (vulkanController host) (graphicsAttachment one)))
+    (,,)
+      <$> atomically (readVulkanUnavailability (vulkanController host) (graphicsAttachment one))
+      <*> presenting host two
+      <*> atomically (readOwnerFailure (vulkanGraphicsOwner host))
+  fmap unavailableBecause unavailable `shouldBe` Just UnavailableRecoverySpent
+  stillPresenting `shouldBe` True
+  isNothing failure `shouldBe` True
+  events ← journal rig
+  -- Three replacements were asked for, and none was created.
+  [surface | SurfaceCreated surface ← events] `shouldBe` [100, 101]
+
+testRequiredSpent ∷ IO ()
+testRequiredSpent = do
+  rig ← visibleRig
+  forM_ [101, 102, 103] $ \surface → scriptSurface rig surface CreateFails
+  outcome ← runRigCaught rig $ \host control → do
+    [window] ← windowsOf host
+    _ ← superviseGraphicsOwner control (vulkanGraphicsOwner host)
+    service ← handedOver host window RequiredTarget
+    TargetUsable ← awaitStanding host service
+    publishObservation host service window
+    pumpUntil host control "the first generation" (presenting host service)
+    loseSurfaceOf rig host service window
+    pumpReplacing host control "the owner's failure" (isJust <$> atomically (readOwnerFailure (vulkanGraphicsOwner host)))
+    checkRuntime control
+  VulkanRequiredTargetFailed failed ← raisedAs @VulkanRequiredTargetFailed outcome
+  length failed `shouldBe` 1
+
+testUnsupportedOptional ∷ IO ()
+testUnsupportedOptional = do
+  rig ← visibleRigOf 2
+  declareUnsupported rig 102
+  (unavailable, stillPresenting) ← runRig rig $ \host control → do
+    [first, second] ← windowsOf host
+    one ← handedOver host first OptionalTarget
+    two ← handedOver host second RequiredTarget
+    TargetUsable ← awaitStanding host one
+    TargetUsable ← awaitStanding host two
+    publishObservation host one first
+    publishObservation host two second
+    pumpUntil host control "both generations" ((&&) <$> presenting host one <*> presenting host two)
+    loseSurfaceOf rig host one first
+    pumpReplacing host control "the report" (isJust <$> atomically (readVulkanUnavailability (vulkanController host) (graphicsAttachment one)))
+    (,) <$> atomically (readVulkanUnavailability (vulkanController host) (graphicsAttachment one)) <*> presenting host two
+  fmap unavailableBecause unavailable `shouldBe` Just (UnavailableSurfaceUnsupported 0)
+  stillPresenting `shouldBe` True
+  events ← journal rig
+  length [() | DeviceCreated ← events] `shouldBe` 1
+  -- The surface the device cannot present to was destroyed at once, on the
+  -- owner's thread, and never installed; the window stayed until the exit.
+  dropWhile (/= SupportQueried 102) events `shouldSatisfy` isSubsequenceOf [SupportQueried 102, SurfaceDestroyed 102]
+  owners ← threadsOf rig (== InstanceCreated)
+  threadsOf rig (== SurfaceDestroyed 102) >>= (`shouldSatisfy` all (`elem` owners))
+  takeWhile (/= SurfaceDestroyed 102) events `shouldSatisfy` (not . any isWindowGone)
+
+testUnsupportedRequired ∷ IO ()
+testUnsupportedRequired = do
+  rig ← visibleRig
+  declareUnsupported rig 101
+  outcome ← runRigCaught rig $ \host control → do
+    [window] ← windowsOf host
+    _ ← superviseGraphicsOwner control (vulkanGraphicsOwner host)
+    service ← handedOver host window RequiredTarget
+    TargetUsable ← awaitStanding host service
+    publishObservation host service window
+    pumpUntil host control "the first generation" (presenting host service)
+    loseSurfaceOf rig host service window
+    pumpReplacing host control "the owner's failure" (isJust <$> atomically (readOwnerFailure (vulkanGraphicsOwner host)))
+    checkRuntime control
+  _ ← raisedAs @VulkanRequiredTargetFailed outcome
+  events ← journal rig
+  length [() | DeviceCreated ← events] `shouldBe` 1
+
+testResizeVersusFailure ∷ IO ()
+testResizeVersusFailure = do
+  rig ← visibleRig
+  (afterResize, afterFailures) ← runRig rig $ \host control → do
+    let controller = vulkanController host
+    [window] ← windowsOf host
+    service ← handedOver host window RequiredTarget
+    TargetUsable ← awaitStanding host service
+    publishObservation host service window
+    pumpUntil host control "the first generation" (presenting host service)
+    resizeFramebuffer rig host window (800, 600)
+    pumpUntil host control "the resize's observation" (observedFramebuffer host window (800, 600))
+    publishObservation host service window
+    pumpUntil host control "the replacement" (elem (SwapchainCreated 504 (800, 600) (Just 500)) <$> journal rig)
+    resized ← attemptsOf host service
+    forM_ [508, 512] $ \expected → do
+      Just active ← (>>= viewActive) <$> atomically (readVulkanGenerations controller (graphicsAttachment service))
+      _ ← atomically (noteVulkanSwapchainResult controller active SwapchainOutOfDate)
+      nudgeOwner rig host service window
+      pumpUntil host control "the recovery rebuild" (any (\case SwapchainCreated handle _ _ → handle == expected; _ → False) <$> journal rig)
+    (,) resized <$> attemptsOf host service
+  afterResize `shouldBe` Just 0
+  afterFailures `shouldBe` Just 2
+
+-- | Report the target's active generation's surface lost, as an acquisition
+-- or a presentation on the owner's thread would, and take the owner a round.
+loseSurfaceOf ∷ Rig → VulkanHost Scene → GraphicsService → WindowId → IO ()
+loseSurfaceOf rig host service window = do
+  Just active ← (>>= viewActive) <$> atomically (readVulkanGenerations (vulkanController host) (graphicsAttachment service))
+  atomically (noteVulkanSwapchainResult (vulkanController host) active SwapchainSurfaceLost) >>= \case
+    True → pure ()
+    False → failWith "the loss was not recorded against the active generation"
+  nudgeOwner rig host service window
+
+-- | 'pumpUntil', creating on each turn any replacement surface the owner asked
+-- for, as an application's loop does until VK-16's adapter does it.
+pumpReplacing ∷ VulkanHost Scene → RuntimeControl → String → IO Bool → IO ()
+pumpReplacing host control what ready =
+  pumpUntil host control what (replaceVulkanSurfaces (vulkanController host) (vulkanWindowHost host) (vulkanGraphicsOwner host) >> ready)
+
+conditionOf ∷ VulkanHost Scene → GraphicsService → (Maybe TargetCondition → Bool) → IO Bool
+conditionOf host service wanted =
+  wanted . fmap viewCondition <$> atomically (readVulkanGenerations (vulkanController host) (graphicsAttachment service))
+
+activeSwapchain ∷ VulkanHost Scene → GraphicsService → IO Word64
+activeSwapchain host service = do
+  Just view ← atomically (readVulkanGenerations (vulkanController host) (graphicsAttachment service))
+  case [swapchain | generation ← viewGenerations view, Just (viewGeneration generation) == viewActive view, Just swapchain ← [viewSwapchain generation]] of
+    swapchain : _ → pure swapchain
+    [] → failWith "the target has no active swapchain"
+
+attemptsOf ∷ VulkanHost Scene → GraphicsService → IO (Maybe Natural)
+attemptsOf host service = atomically $ do
+  targets ← readVulkanTargets (vulkanController host)
+  model ← readVulkanModel (vulkanController host)
+  pure $ case [targetViewIdentity view | (attachment, view) ← targets, attachment == graphicsAttachment service] of
+    target : _ → viewTargetRecoveryAttempts <$> targetView target model
+    [] → Nothing
+
+isSwapchainDestroyed ∷ Event → Bool
+isSwapchainDestroyed = \case
+  SwapchainDestroyed _ → True
+  _ → False
+
+isWindowGone ∷ Event → Bool
+isWindowGone = \case
+  WindowGone _ → True
+  _ → False
 
 -- | Whether the window's latest observation reports this framebuffer.
 observedFramebuffer ∷ VulkanHost Scene → WindowId → (Int, Int) → IO Bool

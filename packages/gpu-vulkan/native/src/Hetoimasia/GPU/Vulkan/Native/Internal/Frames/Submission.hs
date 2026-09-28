@@ -51,6 +51,7 @@ import Hetoimasia.GPU.Model.Identity
   )
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Layer (FrameOps (..), SubmitBatch (..), WaitStage (..))
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.State
+import Hetoimasia.GPU.Vulkan.Native.Internal.Reclamation (recoverAllocation, withAllocationAttempt)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Batches (noteBatchSubmitted)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   ( BatchRecord (..)
@@ -100,7 +101,11 @@ data Member cmd = Member
 --   closes and the session fails, and the failure is re-raised;
 -- * it raised a specified no-effect failure: nothing is pending, the fence was
 --   reset and is not waited on, and every frame is still acquired with its
---   batch sealed — 'SubmittedNothing';
+--   batch sealed. That is an allocation failure with no effect (VK-14): one
+--   reclamation pass runs, and only if it disposed of something is the same
+--   request — the same sealed batches, no consumer run again — validated and
+--   submitted once more. A second no-effect failure, or none reclaimed, is
+--   'SubmittedNothing', naming the original failure and the pass's evidence;
 -- * it raised anything else: the effect is unknown. Every frame enters the
 --   model's uncertain-effect state, which retains all its parents and stops
 --   admission, the session fails, and 'FrameEffectUncertain' is raised — or
@@ -109,10 +114,27 @@ data Member cmd = Member
 submitFrames ∷ Frames q inst msgr phys dev cmd → NonEmpty BatchId → IO (Either Refusal Submitted)
 submitFrames frames request =
   owned recording . checkpointed recording $
-    atomically validate >>= \case
-      Left refusal → pure (Left refusal)
-      Right (members, device, family) → submit members device family
+    attempt >>= \case
+      Right (SubmittedNothing reason) → recoverNoEffect reason
+      other → pure other
   where
+    attempt =
+      atomically validate >>= \case
+        Left refusal → pure (Left refusal)
+        Right (members, device, family) → submit members device family
+    recoverNoEffect reason =
+      withAllocationAttempt roots (\allocation → recoverAllocation roots "vkQueueSubmit2" allocation Nothing reason again) >>= \case
+        Right (Right submitted) → pure (Right submitted)
+        Right (Left notRecovered) → pure (Right (SubmittedNothing (Text.pack (displayException notRecovered))))
+        Left _ → pure (Right (SubmittedNothing reason))
+    -- The retry is the same request, validated again: a refusal or a second
+    -- no-effect failure ends the recovery, and anything it raises — an
+    -- unknown effect, device loss — is the caller's as it would have been.
+    again =
+      attempt >>= \case
+        Right (SubmittedAs submission) → pure (Right (SubmittedAs submission))
+        Right (SubmittedNothing reason) → pure (Left reason)
+        Left refusal → pure (Left ("refused on the retry: " <> Text.pack (show refusal)))
     recording = framesRecording frames
     roots = framesRoots frames
     ops = framesOps frames

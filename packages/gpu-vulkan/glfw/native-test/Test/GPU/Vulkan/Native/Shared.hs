@@ -25,9 +25,11 @@ import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldNotBe
 import Hetoimasia.GLFW.Command (setWindowSizeCommand, showWindowCommand)
 import Hetoimasia.GLFW.Window (Attribute (Observed), ContentScale (..), observedContentScale, observedFramebufferExtent, observedLogicalExtent)
 import qualified Hetoimasia.GLFW.Window as Window
+import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller (noteVulkanSwapchainResult)
 import Hetoimasia.GPU.Vulkan.Native.Generations
   ( GenerationStanding (..)
   , GenerationView (..)
+  , SwapchainResult (..)
   , TargetCondition (..)
   , TargetGenerationsView (..)
   )
@@ -48,6 +50,7 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , VulkanHandover (..)
   , VulkanHost (..)
   , endVulkanGenerationUse
+  , replaceVulkanSurfaces
   , handOverVulkanTarget
   , readReadiness
   , readVulkanGenerations
@@ -55,8 +58,9 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , readVulkanTargets
   , useVulkanGeneration
   )
-import Hetoimasia.GPU.Vulkan.Native.Roots (RootStanding (..), RootsView (..))
-import Hetoimasia.Runtime.GLFW (GraphicsService, TargetStanding (..), graphicsAttachment, readTargetStanding)
+import Hetoimasia.GPU.Vulkan.Native.Roots (RootStanding (..), RootTargetView (..), RootsView (..))
+import Hetoimasia.GLFW.Window (observedRevision)
+import Hetoimasia.Runtime.GLFW (GraphicsService, TargetStanding (..), graphicsAttachment, publishGraphicsObservation, readTargetStanding, windowRenderEligibility)
 import Test.GPU.Vulkan.Native.Fixture
 import Test.Vulkan.Proof.Interop (osThread)
 import Test.Vulkan.Proof.Roots (NativeCall (..))
@@ -209,6 +213,64 @@ spec fixture = describe "the shared roots" $ do
     ownerThreads calls [call | call ← calls, call.callName `elem` ["vkCreateSwapchainKHR", "vkDestroySwapchainKHR", "vkDestroyImageView"]]
     closeWindow fixture window
 
+  it "replaces a lost surface through the bridge on the main thread under the same attachment, leaving another window's target presenting" $ do
+    vulkan ← sharedHost fixture
+    let controller = vulkanController vulkan
+    first ← createWindow fixture "hetoimasia VK-14 lost"
+    second ← createWindow fixture "hetoimasia VK-14 healthy"
+    commandWindow fixture "showing the first window" (showWindowCommand first)
+    commandWindow fixture "showing the second window" (showWindowCommand second)
+    lost ← handOver fixture vulkan first
+    healthy ← handOver fixture vulkan second
+    _ ← publishObservation fixture lost first
+    _ ← publishObservation fixture healthy second
+    before ← awaitGeneration vulkan lost (const True)
+    healthyBefore ← awaitGeneration vulkan healthy (const True)
+    targetsBefore ← atomically (readVulkanTargets controller)
+    Just old ← pure (activeOf before)
+    callsBefore ← length <$> nativeCalls fixture
+    -- An acquisition on the owner's thread would report this; the report
+    -- wakes nothing from here, so the owner is taken a round.
+    atomically (noteVulkanSwapchainResult controller (viewGeneration old) SwapchainSurfaceLost) >>= (`shouldBe` True)
+    _ ← nudge first lost
+    _ ← awaitWithin 10 "the replacement request" $
+      readVulkanGenerations controller (graphicsAttachment lost) >>= \case
+        Just view | viewCondition view == SurfaceReplacing → pure (Just ())
+        _ → pure Nothing
+    created ← onMain fixture replaceVulkanSurfaces
+    created `shouldBe` 1
+    after ← awaitGeneration vulkan lost (\view → viewActive view /= Just (viewGeneration old))
+    Just new ← pure (activeOf after)
+    viewHandedOver new `shouldBe` False
+    targetsAfter ← atomically (readVulkanTargets controller)
+    -- The same attachment is the same target, on a new surface; the other is
+    -- untouched.
+    let targetOf service targets = [(targetViewIdentity view, targetViewSurface view) | (attachment, view) ← targets, attachment == graphicsAttachment service]
+    map fst (targetOf lost targetsAfter) `shouldBe` map fst (targetOf lost targetsBefore)
+    map snd (targetOf lost targetsAfter) `shouldSatisfy` (/= map snd (targetOf lost targetsBefore))
+    targetOf healthy targetsAfter `shouldBe` targetOf healthy targetsBefore
+    healthyAfter ← awaitGeneration vulkan healthy (const True)
+    viewActive healthyAfter `shouldBe` viewActive healthyBefore
+    standing vulkan healthy `shouldReturnJust` TargetUsable
+    -- The lost surface went on the owner's thread before the replacement was
+    -- created on the main one, which the owner then checked and built on.
+    full ← nativeCalls fixture
+    let calls = drop callsBefore full
+        named = map (.callName) calls
+        -- Absent is after everything, which fails every comparison below.
+        firstIndex name = case [index | (index, called) ← zip [0 ∷ Int ..] named, called == name] of
+          index : _ → index
+          [] → maxBound
+    firstIndex "vkDestroySwapchainKHR" `shouldSatisfy` (< firstIndex "vkDestroySurfaceKHR")
+    firstIndex "vkDestroySurfaceKHR" `shouldSatisfy` (< firstIndex "glfwCreateWindowSurface")
+    firstIndex "glfwCreateWindowSurface" `shouldSatisfy` (< firstIndex "vkGetPhysicalDeviceSurfaceSupportKHR")
+    firstIndex "vkGetPhysicalDeviceSurfaceSupportKHR" `shouldSatisfy` (< firstIndex "vkCreateSwapchainKHR")
+    [call.callOsThread | call ← calls, call.callName == "glfwCreateWindowSurface"] `shouldSatisfy` all (== mainOsThread fixture)
+    ownerThreads full [call | call ← calls, call.callName `elem` ["vkDestroySurfaceKHR", "vkGetPhysicalDeviceSurfaceSupportKHR", "vkCreateSwapchainKHR"]]
+    [call.callRaised | call ← calls] `shouldSatisfy` all (== Nothing)
+    closeWindow fixture first
+    closeWindow fixture second
+
   it "serves a later example's target from the same device" $ do
     vulkan ← sharedHost fixture
     window ← createWindow fixture "hetoimasia VK-8 later"
@@ -226,6 +288,12 @@ spec fixture = describe "the shared roots" $ do
     -- the main OS thread. The owner is one serialized Haskell thread, not a
     -- promise of OS-thread affinity, so only the main thread is excluded.
     destroyedSwapchains = length . filter ((== "vkDestroySwapchainKHR") . (.callName)) <$> nativeCalls fixture
+    -- Republish a window's unchanged observation at a revision above any
+    -- published, which takes the owner a round.
+    nudge window service = do
+      observation ← readObservation fixture window
+      onMain fixture $ \host →
+        publishGraphicsObservation (vulkanGraphicsOwner host) service (observedRevision observation + 1000) observation (windowRenderEligibility observation) Nothing
     shouldReturn' action expected = action >>= (`shouldBe` expected)
     ownerThreads all' calls = do
       let owner = [call.callHaskellThread | call ← all', call.callName == "vkCreateInstance"]

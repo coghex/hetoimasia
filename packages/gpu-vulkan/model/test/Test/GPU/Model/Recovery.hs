@@ -288,6 +288,36 @@ spec = describe "recovery" $ do
     sessionState failedModel `shouldBe` SessionFailed RequiredTargetUnrecoverable
     escalations failedModel `shouldSatisfy` elem (RequiredTargetFailedSession requiredTarget)
 
+  it "disposes of a target declared unrecoverable by its designation, with attempts to spare, and never twice" $ do
+    optionalModel ← freshModel
+    (optionalActive, optionalTarget, _) ← activeTarget 2 optionalModel
+    (begun, _) ← admitted "an attempt" (beginTargetRecovery (atMilliseconds 0) optionalTarget optionalActive)
+    -- The attempt is settled first, and it is only the first: the episode
+    -- still has two to spare when the target is declared unrecoverable.
+    failed ← admitted_ "failing the attempt" (recordRecoveryFailure (atMilliseconds 0) optionalTarget begun)
+    (declared, escalation) ← admitted "declaring it unrecoverable" (declareTargetUnrecoverable optionalTarget failed)
+    escalation `shouldBe` Just (OptionalTargetUnavailable optionalTarget)
+    fmap viewTargetPhase (targetView optionalTarget declared) `shouldBe` Just TargetUnavailable
+    sessionState declared `shouldBe` SessionRunning
+    (_, again) ← admitted "declaring it again" (declareTargetUnrecoverable optionalTarget declared)
+    again `shouldBe` Nothing
+    (_, afterwards) ← admitted "asking for another attempt" (beginTargetRecovery (atMilliseconds 1000) optionalTarget declared)
+    afterwards `shouldBe` RecoveryClosed
+
+    requiredModel ← freshModel
+    (requiredActive, requiredTarget, _) ← activeTargetWith RequiredTarget 2 requiredModel
+    (failedSession, requiredEscalation) ← admitted "declaring a required target unrecoverable" (declareTargetUnrecoverable requiredTarget requiredActive)
+    requiredEscalation `shouldBe` Just (RequiredTargetFailedSession requiredTarget)
+    sessionState failedSession `shouldBe` SessionFailed RequiredTargetUnrecoverable
+
+    -- Close wins: a retiring target is not one that can be declared anything.
+    closingModel ← freshModel
+    (closingActive, closingTarget, _) ← activeTargetWith RequiredTarget 2 closingModel
+    closed ← admitted_ "closing it" (closeTarget closingTarget closingActive)
+    (unchanged, closedAnswer) ← admitted "declaring the closed target unrecoverable" (declareTargetUnrecoverable closingTarget closed)
+    closedAnswer `shouldBe` Nothing
+    sessionState unchanged `shouldBe` SessionRunning
+
   it "admits one attempt at a time, and only a settled one lets the next begin" $ do
     model ← freshModel
     (active, target, _) ← activeTarget 2 model

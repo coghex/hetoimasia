@@ -120,7 +120,21 @@ Guide is advisory and does not replace Kanban approval or project-review records
   device could discharge (`releaseToDeviceLoss`), never as completion. No
   device loss is induced natively. All of it is driven on private roots by
   native cases; the controller wires in neither the recording nor the frames
-  (VK-16). Fonts and renderers remain plans.
+  (VK-16). #229 (VK-14) adds recovery: a
+  lost surface's generations go, then the surface, and the episode admits an
+  attempt; the controller asks the main thread for a replacement through
+  #216's `replaceWindowSurface` under the same attachment
+  (`replaceVulkanSurfaces`, which the application runs until VK-16), rechecks
+  the one device's support and builds a fresh generation. An unrecoverable
+  optional target is reported unavailable (`readVulkanUnavailability`, read
+  from the model's escalation, since the model forgets an unavailable target
+  holding nothing); a required one is latched as the terminal primary and
+  raises `VulkanRequiredTargetFailed`. A
+  no-effect submission or presentation, or a creation that raised, gets one
+  reclamation pass through disposers each layer registers with the roots and
+  at most one retry through the model's allocation attempt. A report from
+  another thread wakes no owner, and neither does republishing an unchanged
+  observation at the same revision. Fonts and renderers remain plans.
 - GLFW #87–#100 merged through PRs #101–#114. Repairs #115–#118 merged through
   #119–#122; monitor follow-up #123 merged in #126; native consent #124 merged
   in #128. Epic #86 is closed after checklist reconciliation on 2026-09-17.

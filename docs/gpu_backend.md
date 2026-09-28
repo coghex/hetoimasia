@@ -40,6 +40,15 @@ closing windows retire incrementally from that evidence, with no device-wide
 idle. D-9, D-15, D-18 and D-23, P-2, P-8, P-14 and P-15. See
 [Presentation and retirement](#presentation-and-retirement).
 
+VK-14 ([#229](https://github.com/coghex/hetoimasia/issues/229)) adds
+**recovery**: a lost surface is replaced on the same live window, its
+attachment kept throughout, within the target's bounded recovery episode; a
+target that cannot be recovered is disposed of through its designation — an
+optional one unavailable while every other continues, a required one failing
+the session; and a native allocation failure with no effect gets one bounded
+reclamation pass and at most one retry. D-18, D-22, D-24 and D-25, P-14 and
+P-15. See [Recovery](#recovery).
+
 VK-15 ([#231](https://github.com/coghex/hetoimasia/issues/231)) adds
 **terminal failure**: one latch whose first failure — a device loss, a
 validation error or sink failure the capture reports at a checkpoint, an
@@ -65,11 +74,10 @@ progress step reports no render demand. Its deadlines are the brief
 self-scheduled watch over an attachment whose announcement a full port
 deferred, described below, and the generations' own: a settling resize, a
 deferred recovery attempt, and the model's schedule for a retired generation
-still held. Composing the frames into the owner's loop is VK-16's. Acting on a
-target policy's exhaustion, or on an out-of-date or surface-lost result, is
-VK-14's. A required target's exhaustion fails the session through the terminal
-latch, and device-loss teardown across submitted work and pending
-presentations is the frames' own ([Terminal failure](#terminal-failure)).
+still held. Composing the frames into the owner's loop is VK-16's. A required
+target's exhaustion fails the session through the terminal latch, and
+device-loss teardown across submitted work and pending presentations is the
+frames' own ([Terminal failure](#terminal-failure)).
 
 ## Packages
 
@@ -114,7 +122,10 @@ public recording module re-exports as it always exported them (see
 [How the recording is built](#how-the-recording-is-built)); and the frames'
 implementation under `Hetoimasia.GPU.Vulkan.Native.Internal.Frames`: `Layer`,
 `State`, `Acquisition`, `Submission`, `Presentation`, `Abandonment`, `Loss`
-and `Progress` (see [How the frames are built](#how-the-frames-are-built)).
+and `Progress` (see [How the frames are built](#how-the-frames-are-built)); and
+VK-14's allocation recovery, `Hetoimasia.GPU.Vulkan.Native.Internal.Reclamation`,
+and its surface recovery, the generations' `Surface` (see
+[How recovery is built](#how-recovery-is-built)).
 
 ## The ownership graph
 
@@ -207,7 +218,9 @@ decides nothing, and the default observes nothing.
 | Every surface query, swapchain and image view creation and destruction | The graphics owner |
 | Publishing a target's observation (`publishGraphicsObservation`) | The main thread; until VK-16's loop adapter does it every turn, the application does it |
 | Holding and ending a generation's CPU use | Any thread, in `STM` |
-| Reporting a swapchain call's out-of-date or suboptimal result | The graphics owner, whose acquisitions and presentations produce it |
+| Reporting a swapchain call's out-of-date, suboptimal or surface-lost result | The graphics owner, whose acquisitions and presentations produce it |
+| Destroying a lost surface, rechecking a replacement's support, a reclamation pass | The graphics owner |
+| Creating a replacement surface under a target's existing attachment (`replaceVulkanSurfaces`) | The main thread; until VK-16's loop adapter does it every turn, the application does it |
 
 The controller makes no GLFW call. A surface is destroyed through the loader
 capability's `vkDestroySurfaceKHR`, a Vulkan call, by the thread that holds its
@@ -400,8 +413,12 @@ nothing, and the package's public module does not offer one.
   a recovery attempt, admitted by the model's episode: at most three, 100 ms and
   then 500 ms apart after failures (`RecoveryWaiting`), and exhausting it is
   escalated through the target's designation — an optional target unavailable,
-  a required one failing the session — and reported as `RecoverySpent` for VK-14
-  to act on. Nothing retries hot. A recovery rebuild whose observed geometry
+  a required one failing the session — and reported as `RecoverySpent`, which
+  [Recovery](#required-and-optional-dispositions) acts on. Nothing retries
+  hot. A next attempt whose delay the clock cannot express — one failing at the
+  very end of its range — is never admitted early: the target is reported as
+  `RecoveryUnscheduled`, builds nothing and asks for no step, whether its
+  surface was lost or a construction failed. A recovery rebuild whose observed geometry
   has moved — since the active generation, or since the failed construction
   was planned — first waits for that move to settle, as any resize does; one
   whose geometry has come back cancels the move it had begun to settle, so a
@@ -416,7 +433,9 @@ nothing, and the package's public module does not offer one.
   `ConstructionFailed`. The next construction is a fresh one — never passed the
   retired handle, never replaying the failed call — and a recovery attempt. It
   begins only once every swapchain of the target that Vulkan still counts as
-  unretired has been destroyed, so a failed candidate that was created goes
+  unretired has been destroyed, and, since it hands nothing over, every
+  retired chain still standing too — the one the failed replacement handed over
+  included, however long its holds keep it (VK-14), so a failed candidate that was created goes
   first, and so does an old generation a cancelled replacement never handed
   over; a retry that must wait for one spends no recovery attempt.
 - **A newer resize during a replacement** is not lost: the replacement publishes
@@ -480,17 +499,19 @@ A recorded batch holds the generation it records into as a recorded reference
 
 `Hetoimasia.GPU.Vulkan.Native.Generations` is the entry point and holds no code
 of its own: it re-exports, with unchanged names, signatures and constructor
-visibility, what seven private modules under
+visibility, what eight private modules under
 `Hetoimasia.GPU.Vulkan.Native.Internal.Generations` implement. The split (#266)
-moved code and changed no behaviour; each module's Haddock states what it owns.
+moved code and changed no behaviour, and VK-14 added `Surface`; each module's
+Haddock states what it owns.
 
 | Module | Responsibility | Depends on |
 | --- | --- | --- |
 | `State` | The `Generations` and its one map of target records, each with its generation records; the conditions, standings and swapchain results; the constructors and `trackTarget`; the three failures; and the lookup, edit, ended-CPU-use and asynchrony helpers every other module shares. | — |
 | `Uses` | `noteSwapchainResult`, and holding and ending a CPU use of the active generation, in `STM` on any thread. | `State` |
-| `Disposal` | Destroying every retired generation whose holds ended, views newest first and then the swapchain, each in one masked step; and the model's progress turn that records the disposals. | `State` |
+| `Disposal` | Making the generations and registering their disposer with the roots; destroying every retired generation whose holds ended, views newest first and then the swapchain, each in one masked step; and the model's progress turn that records the disposals. | `State` |
 | `Reconciliation` | One target brought to its latest geometry: eligibility and suspension, planning, settling, recovery through the model's episode, capacity and the one-generation path, and the masked construction, naming and publication of a candidate with its `oldSwapchain` handover. | `State`, `Disposal` |
-| `Step` | `stepGenerations` — disposal, then each named target's reconciliation, then one progress turn — and `generationsDeadline`. | `State`, `Disposal`, `Reconciliation` |
+| `Step` | `stepGenerations` — disposal, then each named target's reconciliation, then the lost surfaces' release, then one progress turn — and `generationsDeadline`. | `State`, `Disposal`, `Reconciliation`, `Surface` |
+| `Surface` | A lost surface released once its generations have gone, an attempt asked for, and its replacement taken or refused (VK-14). | `State` |
 | `Retirement` | `retireTargetGenerations`: close, retire the active generation, dispose, and forget the target only once none remains. | `State`, `Disposal` |
 | `Observation` | `readTargetGenerations` and its views. | `State` |
 
@@ -962,9 +983,9 @@ surface answers `AcquisitionUnavailable`.
 | --- | --- | --- |
 | `VK_SUCCESS` | The frame owns the image | `AcquisitionOwned` |
 | `VK_SUBOPTIMAL_KHR` | The frame owns the image, and the target counts a replacement request | `AcquisitionOwned`, suboptimal; the generations are told (`SwapchainSuboptimal`), so the owner's next step reconciles |
-| `VK_NOT_READY`, `VK_TIMEOUT` | The reservation goes back whole, with no synchronization obligation | `AcquisitionPending PendingNoImage` |
-| `VK_ERROR_OUT_OF_DATE_KHR` | The reservation goes back, and a replacement is requested | `AcquisitionPending PendingReplacement`; the generations are told (`SwapchainOutOfDate`) |
-| `VK_ERROR_SURFACE_LOST_KHR` | The reservation goes back, and a replacement is requested | `AcquisitionPending PendingSurfaceLost`; recovering a lost surface is VK-14's |
+| `VK_NOT_READY`, `VK_TIMEOUT` | The reservation goes back whole, its pool record freed untouched, with no synchronization obligation | `AcquisitionPending PendingNoImage` |
+| `VK_ERROR_OUT_OF_DATE_KHR` | The reservation goes back, its pool record freed untouched, and a replacement is requested | `AcquisitionPending PendingReplacement`; the generations are told (`SwapchainOutOfDate`) |
+| `VK_ERROR_SURFACE_LOST_KHR` | The reservation goes back, its pool record freed untouched, and a replacement is requested | `AcquisitionPending PendingSurfaceLost`; the generations are told (`SwapchainSurfaceLost`), and the surface is [replaced](#replacing-a-lost-surface) |
 | It raised | The reservation goes back: an error result has no effect | The failure is re-raised; device loss latches as always |
 
 A successful acquisition whose result the model then refused to record — the
@@ -1001,8 +1022,13 @@ recorded before the step ends:
 - **A specified no-effect failure** — out of host or device memory, which the
   native layer identifies (`opsNoEffect`). Nothing is pending; the model clears
   its fence-reset bookkeeping, and the native fence, reset and unsubmitted, is
-  never waited on. Every frame is still acquired with its batch sealed, and can
-  be submitted again or skipped. `SubmittedNothing` is answered.
+  never waited on. Every frame is still acquired with its batch sealed. That is
+  an allocation failure with no effect, [recovered once](#allocation-recovery):
+  a reclamation pass, and the same request — its batches sealed as they were,
+  no consumer run again — validated and submitted once more only if the pass
+  disposed of something. Otherwise, or when that fails again,
+  `SubmittedNothing` is answered, naming the original failure and the pass's
+  evidence, and every frame can still be submitted again or skipped.
 - **The fence reset raised.** Nothing was submitted and every frame is still
   acquired, with its batch sealed; but the fence is now in doubt, so it is
   marked uncertain and retained for ever with its slot, and since native
@@ -1048,7 +1074,8 @@ A cleanup submission or a release that raised retains the frame, its image and
 its synchronization for ever — never retried, never fabricated as reusable —
 fails the session with `CleanupFailed`, and raises `FrameCleanupFailed`. This
 follows the precedent every other cleanup failure in the backend sets; isolating
-an optional target from it is VK-14's recovery policy. Both paths were proved on
+an optional target from it is not recovery's to do: a failed cleanup is never
+recoverable pressure, whatever the target's designation (P-14, VK-14). Both paths were proved on
 both drivers by VK-2 ([macOS](vulkan/macos.md#safe-abandonment),
 [Linux](vulkan/linux.md#safe-abandonment)); the KHR spelling of the release
 entry point resolves on neither, and the binding's call dispatches the EXT one.
@@ -1175,9 +1202,9 @@ raised answers the error it raised with.
 | --- | --- | --- | --- |
 | Returned | `VK_SUCCESS` | Enqueued | The model's presentation, `PresentationEnqueued`; the fence pending; the semaphore the presentation engine's |
 | Returned | `VK_SUBOPTIMAL_KHR` | Enqueued | The same, `PresentationEnqueuedSuboptimal`; a replacement coalesced in the model and reported to the generations (`SwapchainSuboptimal`), with none of the frame's synchronization reset |
-| Raised | `VK_ERROR_OUT_OF_DATE_KHR` | Enqueued: the specification keeps a rejected presentation's queue operations, and its semaphore waits happen | The same, `PresentationEnqueuedOutOfDate`; a replacement requested, reported as `SwapchainOutOfDate`; recovery is VK-14's |
-| Raised | `VK_ERROR_SURFACE_LOST_KHR` | Enqueued, likewise | The same, `PresentationEnqueuedSurfaceLost`; a replacement requested in the model; recovering the surface is VK-14's |
-| Raised out of memory | Out of memory, or unwritten | The specified no-effect case: nothing enqueued, and no present fence | Nothing but the fence, reset and never pending, and never waited on. The frame is still submitted, owning its image, semaphore and record, and can be presented again or closed. `PresentedNothing` |
+| Raised | `VK_ERROR_OUT_OF_DATE_KHR` | Enqueued: the specification keeps a rejected presentation's queue operations, and its semaphore waits happen | The same, `PresentationEnqueuedOutOfDate`; a replacement requested, reported as `SwapchainOutOfDate`, and rebuilt as [Replacement](#replacement) describes |
+| Raised | `VK_ERROR_SURFACE_LOST_KHR` | Enqueued, likewise | The same, `PresentationEnqueuedSurfaceLost`; a replacement requested in the model, reported as `SwapchainSurfaceLost`, and the surface [replaced](#replacing-a-lost-surface) once this presentation, and every other hold on its generation, has retired |
+| Raised out of memory | Out of memory, or unwritten | The specified no-effect case: nothing enqueued, and no present fence | Nothing but the fence, reset and never pending, and never waited on. The frame is still submitted, owning its image, semaphore and record. [Recovered once](#allocation-recovery): a reclamation pass, and the same frame presented once more only if the pass disposed of something; otherwise `PresentedNothing`, naming the original failure and the pass's evidence, and the frame can be presented again or closed |
 | Anything else | Unwritten, contradictory, device loss, or a result the profile does not classify | Unknown | The frame enters the uncertain state — retained for ever with its image, record and parents — admission stops, the session fails with `UnknownSubmissionEffect`, and `FrameEffectUncertain` is raised, or the device loss itself |
 
 A present fence whose reset raised presents nothing, but the fence is in doubt:
@@ -1273,6 +1300,230 @@ every other target stay live, and another target keeps presenting throughout.
 The controller constructs no frames until VK-16 wires them in, so the
 controller's own retirement meets no presentation obligation yet; the order and
 the withheld evidence it will meet are the ones above, proved on private roots.
+
+## Recovery
+
+VK-14 ([#229](https://github.com/coghex/hetoimasia/issues/229)) acts on what the
+earlier slices only reported: a lost surface, an episode spent, and a native
+allocation that ran out of memory. It is D-18, D-22, D-24 and D-25 over P-14's
+operation table and P-15's budgets. Allocation reclamation and swapchain
+replacement live in the native package; surface replacement on the live
+window, which needs the main thread, is orchestrated by the controller. The GPU
+model's public surface gains one transition, `declareTargetUnrecoverable`
+([its contract](gpu_model.md#recovery)); everything else was already the
+model's.
+
+### The episode as delivered
+
+Every recovery a target makes spends its one episode, which the model owns
+([Recovery](gpu_model.md#recovery)): at most three construction attempts, the
+second 100 ms after the first failure and the third 500 ms after the second, on
+the owner's monotonic clock, with one attempt in flight at a time and
+exhaustion decided at the last failure. A deferred attempt is a deadline the
+generations name (`RecoveryWaiting`), so the owner takes the round it falls
+due in and never polls or loops hot.
+
+| What happens | Is it an attempt? |
+| --- | --- |
+| An ordinary resize, however often the geometry moves | No: it settles for 16 ms and is built as a replacement ([Replacement](#replacement)) |
+| An out-of-date or suboptimal result with unchanged geometry | Yes, each rebuild |
+| A construction after one that failed, a window still in use (`VK_ERROR_NATIVE_WINDOW_IN_USE_KHR`) included | Yes: the next attempt of the same episode, never a new one |
+| A lost surface's replacement, from asking for the surface to publishing a generation on it | Yes, one attempt; a construction on the new surface that fails spends the next |
+| Waiting for an unretired swapchain or a lost surface's generations to go | No: nothing is admitted until they have gone |
+| A zero-area or ineligible target | No: suspended |
+| An allocation's own retry after reclamation | No: it is inside the attempt that made the allocation, and reaches no episode accounting |
+
+Nothing replenishes the budget but what the model counts: a completed
+presentation-retirement cycle after a successful recovery, and a healthy second
+after that. A changed framebuffer observation, a nested retry, repeated loss,
+and an allocation's retry all count on from where the episode stands.
+
+### Replacing a lost surface
+
+A surface is lost when a swapchain call on the target's active generation
+answers `VK_ERROR_SURFACE_LOST_KHR` — an acquisition, which gives its
+reservation back, pool record included, or a presentation, which was enqueued
+all the same — reported as `SwapchainSurfaceLost`, which outranks every other
+result; or when the surface's capability query or a swapchain's creation
+raises it. The loss is the surface's, so it is taken from any generation the
+target still tracks — a late presentation on a generation already retired
+included — and, once the surface is being recovered, a late report about it
+changes nothing and never reaches the replacement. Then, on the owner's thread:
+
+1. **Admission stops.** The reconciliation retires the active generation there
+   and then, and builds nothing on the surface again. Acquisition answers
+   `AcquisitionPending PendingSurfaceLost` without a native call; the target
+   stays admitted, and every other target, the device and the instance are
+   untouched.
+2. **Old dependents retire on their own evidence.** Acquired and submitted
+   frames settle and presentations retire through the frames, and the retired
+   generation is destroyed once its holds end, as any retired generation is.
+   Nothing is waited on and nothing is replayed.
+3. **The lost surface goes, then an attempt begins.** Once no generation of the
+   target remains, the roots destroy the lost surface and keep the target
+   (`releaseRootSurface`) — its identity, its designation and, above it, the
+   window's attachment, which is never released or reattached. Only then does
+   the episode admit an attempt (`SurfaceReplacing`); a deferred one waits for
+   its deadline, and a spent one is disposed of through the designation.
+4. **The main thread creates the replacement.** The step answers the targets
+   that now want a surface (`summarySurfacesWanted`); the controller asks the
+   main thread for each and wakes it. `replaceVulkanSurfaces`, on the main
+   thread, creates the surface through the bridge's admitted replacement
+   (`replaceWindowSurface`, [#216](https://github.com/coghex/hetoimasia/issues/216))
+   under that same attachment, and deposits what it created. Until VK-16's loop
+   adapter runs it every turn, the application runs it, as it publishes
+   observations.
+5. **Support is rechecked, then a fresh generation is built.** The owner's next
+   step offers the surface to the generations (`offerReplacementSurface`). The
+   roots ask `vkGetPhysicalDeviceSurfaceSupportKHR` of the session's one queue
+   family and install it (`installRootSurface`), and the next step builds a
+   fresh generation on it — handing nothing over — whose publication settles
+   the attempt as a success, or whose failure spends the next. A loss the
+   replacement's own query reports before then fails that attempt with it, so
+   the episode admits the next, or is spent.
+
+| What the replacement came to | What happens |
+| --- | --- |
+| Installed | `ReplacementInstalled`; the surface is the roots', and a step is owed at once |
+| The device's queue family cannot present to it | `ReplacementUnsupported`; the surface is destroyed on the owner's thread, the attempt fails, and the target is declared unrecoverable: [disposed of through its designation](#required-and-optional-dispositions). No second device or queue is made, and nothing migrates |
+| Installed, but it cannot serve the presentation profile | `PresentationUnsupported`, naming every gap; the attempt fails and the target is declared unrecoverable, disposed of through its designation, as one the device cannot present to is |
+| Created unusable, or not created | The attempt fails, the unusable surface is destroyed, and the episode schedules the next |
+| The bridge refused it | The window is closing, the attachment retiring or the lease releasing: close is coming, and the attempt is left for the target's retirement to settle. If the owner's view shows the target still eligible, the attempt fails instead, rather than waiting for a close that is not coming |
+| Its support query or naming raised | The surface is destroyed and the attempt fails; device loss and a cancellation stay the owner's |
+
+**Close wins.** A target that has begun retiring asks for nothing and is offered
+nothing: a replacement that arrives after the close stays its creator's and is
+destroyed (`ReplacementNotWanted`), and the target's retirement settles an
+attempt still outstanding, whose failure then decides nothing. A replacement the
+main thread is creating at the moment the attachment retires is waited for —
+its native call is finite and owes the owner nothing — so its surface is on the
+lease before the retirement sweeps it. A construction completed after the close
+is retired rather than published, as [before](#failure-and-close).
+
+**Unproven rollback forbids the next attempt.** A lost surface whose
+destruction did not complete is retained, never attempted again, fails the
+session with `CleanupFailed`, and raises `SurfaceDestructionFailed`; so does a
+partial replacement whose candidate could not be destroyed
+(`GenerationDestructionFailed`). Either retains the target's parents, and no
+attempt is admitted in a failed session.
+
+### The retired chain
+
+A replacement that handed the active generation over as `oldSwapchain` retired
+it whatever the creation answered — `VK_ERROR_NATIVE_WINDOW_IN_USE_KHR` and out
+of memory included — and it is never named again. The next construction is a
+fresh one, with a null `oldSwapchain`, and it begins only once every swapchain
+of the target Vulkan still counts as unretired has been destroyed: the retired
+chain's images are finished or abandoned, it is destroyed, and only then is the
+fresh creation made. A window still in use at that fresh creation is an
+ordinary failed attempt of the same episode, never a reason to create before
+the destruction. The native rules are the proof record's
+([macOS](vulkan/macos.md), [Linux](vulkan/linux.md)); the headless examples
+inject them.
+
+### Required and optional dispositions
+
+A target whose episode is spent (`RecoverySpent`), or whose replacement surface
+the device cannot present to or that cannot serve the profile, is disposed of through the designation the
+application gave it (D-22):
+
+- **Optional** — the model marks it unavailable and the session continues. Its
+  generations retire as their holds end, and every other target keeps
+  presenting on the same device. The controller reports it once, by
+  attachment: `readVulkanUnavailability` answers the target and why —
+  `UnavailableRecoverySpent`, `UnavailableSurfaceUnsupported` or
+  `UnavailablePresentationUnsupported` — and an
+  application waits on it in `STM`; the most recent 64 are kept. The native
+  window is not closed and its destruction is not authorized: the attachment
+  stays until the application releases it and its retirement is safe. A target
+  that holds nothing more once it is unavailable is forgotten by the model's
+  next progress turn, which is why the report is read from the model's
+  escalation and not from the target's phase.
+- **Required** — the model fails the graphics session
+  (`RequiredTargetUnrecoverable`), and the owner's step checkpoints the roots,
+  which latch it in the terminal report ([Terminal failure](#terminal-failure)).
+  When it is the primary, the step raises `VulkanRequiredTargetFailed` naming
+  each such target; when a diagnostic failure came first, that primary is
+  raised instead and the exhaustion joins the evidence behind it. Either ends
+  the owner's run and reaches the application's checkpoints like any other
+  owner failure ([VK-18](glfw.md#the-supervised-graphics-owner)). The ordinary
+  all-exit retirement follows.
+
+Device loss, a validation error, an unknown effect and a failed cleanup are
+never recoverable pressure: they escalate to the session whatever the target's
+designation, as they always have.
+
+### Allocation recovery
+
+D-25's one bounded reclamation pass and at most one retry, only where retrying
+is proven safe — the operation-specific no-effect results, and constructions
+whose rollback is complete — and nowhere else:
+
+| Operation that ran out of memory | Why a retry is safe | What is retried |
+| --- | --- | --- |
+| `vkQueueSubmit2` | The specified no-effect result | The same request, its batches as sealed |
+| `vkQueuePresentKHR` | The specified no-effect result, read from the swapchain's entry | The same frame's presentation |
+| A managed resource's creation | A creation that raised created nothing; a composite one destroyed what it made before raising | The same creation, for the same allocation attempt |
+| A swapchain's creation that handed nothing over, or an image view's | A creation call that raised created nothing | That call |
+| A frame slot's or a pool record's semaphore or fence | A creation call that raised created nothing; if its recovery does not succeed, the objects made before it are destroyed before the failure is raised | That call |
+| A swapchain's creation that handed a generation over | Never: that call retired the generation whatever it answered | Nothing; the construction fails into the episode's fresh construction |
+
+Configured-capacity exhaustion is backpressure, answered before any native
+call, and starts no recovery. For each failure:
+
+1. **The attempt.** The operation's model allocation attempt — the managed
+   resource's own, or one accounted for the recovery's duration — records the
+   failure, and notes a generation the construction already retired as
+   `oldSwapchain`. When the object budget is full — exactly when reclaiming
+   matters — the recovery runs with no attempt to account, and its one retry
+   is judged by the same rules the model's attempt applies; a session that has
+   failed admits no recovery at all.
+2. **One pass.** The model's `reclaimPass` decides the window: at most the
+   configured number of generation and managed-resource records, ineligible
+   ones included, from a cursor it carries from pass to pass. The subjects
+   eligible in that window are offered to the layer that owns each — the
+   generations and the recording each register a disposer with the roots when
+   they are made — which destroys it natively, child before parent, each
+   destruction recorded in its own masked step, or declines when something
+   above it still stands. Then the pass records what each destruction did.
+   Nothing waits for unfinished work, and nothing but a destruction that
+   returned is progress.
+3. **At most one retry.** `retryAllocation` permits the attempt's one retry
+   only after a disposal completed since the failure, never after the
+   construction retired a generation as `oldSwapchain`, and never in a failed
+   session — so a disposal that failed, which escalates the session, forbids it
+   however much else the pass reclaimed. Each failed disposal is latched once,
+   as a cleanup failure naming its subject.
+
+No progress, a failed disposal, a refused retry or a second failure ends the
+recovery and reports the original failure with the pass's evidence — what it
+examined, disposed of and failed to dispose of, and how it ended: as
+`AllocationNotRecovered` from a construction, and in `SubmittedNothing` or
+`PresentedNothing` from a submission or a presentation. Every attempt, the
+retry included, runs through the roots' guard, so device loss latches wherever
+it is raised; and what the retry raised that means more than a failed retry —
+device loss, a cancellation, a lost surface, a window still in use — is
+re-raised as itself, so the construction acts on it as it would on a first
+failure.
+
+### What recovery never does
+
+It never replays a consumer callback or submitted work, evicts a live
+generation, takes another target's reservations or budget, retries a failed
+cleanup, recreates the device, migrates a target to another device, or changes
+resolution, quality or frame capacity. It never closes or destroys a window,
+and never releases or reattaches an attachment to reach the bridge.
+
+### How recovery is built
+
+| Module | Responsibility |
+| --- | --- |
+| `Internal.Generations.Reconciliation` | Reads a surface-lost result, and the surface loss the capability query or a creation raises, retiring the active generation; recovers a swapchain's and a view's creation that ran out of memory |
+| `Internal.Generations.Surface` | `releaseLostSurfaces`, run by `stepGenerations` after reconciliation; `offerReplacementSurface` and `replacementSurfaceFailed` |
+| `Internal.Generations.Disposal`, `Internal.Recording.Disposal` | Make the generations and the recording, registering each one's disposer with the roots |
+| `Internal.Reclamation` | `reclaimOnce`, `recoverAllocation` and `recoveringCreation`, over the roots' disposers and the model's allocation attempt |
+| `Roots` | `releaseRootSurface`, `installRootSurface`, the `NativeFailure` classifier and the disposer registry |
+| The controller | Asking for and settling replacements, `replaceVulkanSurfaces` on the main thread, the unavailability report and `VulkanRequiredTargetFailed` |
 
 ## Destruction order
 
@@ -1498,7 +1749,8 @@ VK-18's D-33 order and releases nothing early.
 | State | Owner | Readers and writers | Thread | Lifetime | Reset or disposal |
 | --- | --- | --- | --- | --- | --- |
 | Each root's slot (instance, messenger, device) | The roots | Written by startup, admission and retirement; any thread reads | The owner | The session | Only advances: absent, live, then destroyed or uncertain |
-| Target records | The roots | Admission inserts, retirement removes | The owner | Admission until destroyed | Removed only by a destruction that returned |
+| Target records | The roots | Admission inserts, retirement removes; recovery releases a lost surface and installs its replacement in place | The owner | Admission until destroyed | Removed only by a destruction that returned; a surface released by recovery leaves the record with none until a replacement is installed |
+| Disposers | The roots | The generations and the recording each register one when made; a reclamation pass reads them | The owner | The session | Never removed |
 | The GPU model | The roots | Admission, retirement, loss | The owner | The session | Never reset |
 | The loss latch | The roots | Set once; any thread reads | Any | The session | Never cleared |
 | The terminal latch | The roots | `latchTerminal` sets the primary once and appends evidence; any thread reads through `readRootsTerminal` | Any, in `STM` | The session | Never cleared; evidence bounded at 64 with the rest counted |
@@ -1508,8 +1760,11 @@ VK-18's D-33 order and releases nothing early.
 | Deposits | The controller | Written by a construction step; taken by the owner's construction or retirement | Main, owner | Attachment until its construction or retirement | Cleared by whole-owner retirement |
 | Attachment to target | The controller | The owner alone | The owner | Admission until the target's surface is destroyed | Kept on an uncertain destruction |
 | Rejections | The controller | Written by the owner; any thread reads | Owner | The most recent 64 | Oldest dropped |
+| Replacements | The controller | The owner's step asks; `replaceVulkanSurfaces` on the main thread claims, creates and deposits; the owner's step, or the attachment's retirement, takes each | Owner, main | From an admitted attempt's request until its deposit is settled | Taken by the attachment's retirement, which waits for one being created |
+| Unavailability reports | The controller | Written by the owner's step; any thread reads | Owner | The most recent 64 | Oldest dropped |
 | Generation records | The generations' `Internal.Generations.State`, which defines them | `Reconciliation` builds and replaces, `Retirement` retires the active one, and `Disposal` destroys and removes, on the owner's step; any thread holds and ends a CPU use through `Uses`, in `STM` | The owner (uses: any) | From the construction that begins one until its destruction returned | Kept, explicitly uncertain, when a destruction raised; never retried |
-| Swapchain results | The generations' `Internal.Generations.State`, which defines them | The owner reports through `Uses`; `Reconciliation` consumes on its step | The owner | Until the active generation is replaced | Cleared by the publication that replaces it |
+| Swapchain results | The generations' `Internal.Generations.State`, which defines them | The owner reports through `Uses`; `Reconciliation` consumes on its step | The owner | Until the active generation is replaced | Cleared by the publication that replaces it, or by the surface's loss |
+| A target's lost surface and outstanding attempt | The generations' `Internal.Generations.State`, which defines them | `Reconciliation` marks the loss; `Surface` releases, asks and installs; `Retirement` settles an attempt still outstanding | The owner | From the loss until a replacement is installed, or the target retires | Cleared by the installation, or by retirement |
 | Deferred attachments | The controller | Written by a handover whose announcement the port refused; removed by `announceVulkanTarget` once admitted, or by the owner once it has destroyed the surface | Main, owner | Until announced or settled | Cleared by whole-owner retirement |
 | Managed records | The recording | Construction inserts; release, replacement and disposal advance each one's standing | The owner | From construction until the model records the disposal | Removed once the model records it; kept, explicitly uncertain, when a destruction raised; never retried |
 | Frame storages | The recording | Construction inserts one per target frame slot; disposal removes it | The owner | As its managed record | As its managed record |
@@ -1692,6 +1947,73 @@ verified fences — withheld while its presentation was pending — its surface
 destroyed and the device kept, while the second keeps presenting before and
 after, and the session then retired with every fence observed.
 
+VK-14's examples are in `native-tests` and `integration-tests`, over the same
+stand-ins, extended to answer a native result recovery acts on
+(`NativeFailure`) at a chosen step, once or after a number of successes, and to
+run out of memory at a recording or frames step. `Generations`' group
+`surface recovery (VK-14)` covers: a lost surface's generation retired and held
+while a CPU use is, the surface destroyed only once every generation of it has
+gone, and a replacement installed on the same target — its support queried, a
+fresh generation handed nothing — as one attempt that is not given back; a loss
+raised by the capability query and by a swapchain's creation; nothing more
+asked, and no step owed, while an attempt waits for its surface; repeated loss
+spending one episode, three replacements and then the target spent; one
+episode carried across a failed replacement, a changed geometry and the
+construction's own retries; a partial replacement retried freshly only after
+its rollback was proven, and one whose rollback is unproven — its candidate or
+the lost surface itself not destroyed — forbidding every further attempt and
+failing the session; the retired chain destroyed before any fresh creation,
+with a window still in use charged to the same episode; close defeating a late
+replacement and settling its attempt; a failed replacement scheduling the next
+through the episode; exhaustion and an unsupported replacement each making an
+optional target unavailable while another keeps building, and failing the
+session for a required one, with no second device; and an ordinary resize
+spending nothing while a repeated failure at unchanged geometry spends the
+episode; a lost surface whose next attempt's delay the clock cannot express,
+at the very end of its range, released once and then left
+`RecoveryUnscheduled`, owing no step, and a failed construction at that same
+instant left the same way; a lost surface taken from a generation already retired, and a late
+report about it never reaching the replacement; and a creation's retry that
+raised device loss, latched and raised, or a lost surface, replaced, rather
+than either being read as a failed retry; an attempt in flight failed when the
+replacement surface's own query reports it lost, the next admitted after its
+delay; and a fresh construction kept waiting, charging nothing, while the chain
+a failed replacement handed over is still held, then created only after that
+chain's destruction; and a replacement that cannot serve the profile failing its
+attempt and making an optional target unavailable, or failing the session for a
+required one. `Allocation recovery`, over the
+frames' rig, covers: a creation that
+ran out of memory made once more after one pass reclaimed a retired
+generation; no retry without progress, the original failure reported with the
+pass's evidence and its accounting given back; a second failure ending the
+recovery; a disposal that failed escalating the session and permitting no
+retry despite what else the pass reclaimed; a bounded window that reaches an
+eligible generation beyond it only at a later pass, through the carried cursor;
+configured-capacity exhaustion as backpressure with no native call; a no-effect
+submission still reclaimed and submitted once more with the object budget full; a fresh
+swapchain creation retried after reclamation and one that handed a generation
+over never retried; a frame slot's synchronization recovered, and its
+reservation given back when nothing was; a no-effect submission submitted once
+more with its batch recorded once, and answered nothing, naming the pass, when
+nothing was reclaimed; a no-effect presentation presented once more; and a
+lost surface as the frames report it — an acquisition's reservation given back,
+its pool record freed and the target's frames retirable, nothing acquired until
+the surface is replaced, and a surface-lost presentation enqueued and holding
+its generation until its present fence retires. `Frames`' out-of-date
+acquisition, and a not-ready or timed-out one, now also free their pool
+record, and the target's frames retire after them. The model's suite adds
+`declareTargetUnrecoverable`'s examples. `Vulkan controller`'s group
+`recovering a lost surface (VK-14)` runs whole hosts: a lost surface replaced on
+the main thread under the same attachment, after its generation and then the
+lost surface went on the owner's thread, with the other target left alone; a
+close defeating a replacement still asked for; an optional target's spent
+episode reported unavailable while the other keeps its generation, and a
+required one's failing the session at a checkpoint; an unsupported replacement
+destroyed on the owner's thread with no second device, making an optional target
+unavailable and failing the session for a required one; and an ordinary resize
+spending no attempt while each out-of-date result at unchanged geometry spends
+one.
+
 VK-15's examples, `Terminal failure`, are in `native-tests` over the same
 stand-ins. The frames' stand-in can lose the device at any of its steps, and
 from then on holds the frames to the device-loss rules: destroying a fence or a
@@ -1821,7 +2143,9 @@ and [`docs/vulkan/linux-vk11.md`](vulkan/linux-vk11.md). VK-12's are retained as
 [`docs/vulkan/macos-vk12.md`](vulkan/macos-vk12.md) and
 [`docs/vulkan/linux-vk12.md`](vulkan/linux-vk12.md). VK-13's are retained as
 [`docs/vulkan/macos-vk13.md`](vulkan/macos-vk13.md) and
-[`docs/vulkan/linux-vk13.md`](vulkan/linux-vk13.md). VK-15's are retained as
+[`docs/vulkan/linux-vk13.md`](vulkan/linux-vk13.md). VK-14's are retained as
+[`docs/vulkan/macos-vk14.md`](vulkan/macos-vk14.md) and
+[`docs/vulkan/linux-vk14.md`](vulkan/linux-vk14.md). VK-15's are retained as
 [`docs/vulkan/macos-vk15.md`](vulkan/macos-vk15.md) and
 [`docs/vulkan/linux-vk15.md`](vulkan/linux-vk15.md). #250's are retained as
 [`docs/vulkan/macos-vkr2.md`](vulkan/macos-vkr2.md) and
@@ -1888,7 +2212,7 @@ companions — and adds the Vulkan owner's:
 | Main thread | Hspec runs on a thread of its own; the process main thread owns one shared production graphics session: `withLoaderIntegration`, then `runGraphicsOwnerApplication` over `withVulkanOwnerHost`, with the production native layer and surface bridge. An example that needs the main thread — to hand a window's surface over, which GLFW creates there, or to close a window — submits an operation (`onMain`); the main thread runs it between two turns of the host's owner loop and returns its result or rethrows its failure. Windows are created through the host's command port from the example's own thread, which the owner loop executes, as an application's worker would. |
 | Identities | Every dispatched operation is checked, before it runs, to be on the bound process main thread that entered the session — the Haskell thread, the bound flag, and the OS thread read through `pthread_self` — and a failed check fails the operation and the run. Every native call the session makes is recorded where it runs by a `NativeObserver`, so an example shows from the calls themselves that the instance, its messenger, the device and every surface's destruction ran on the graphics owner's thread and every surface's creation on the main thread — never from the name of an Hspec hook. |
 | Sharing | The roots — the instance, its explicit messenger, and the one device — are acquired lazily, by the first dispatched operation, at most once, and shared by every later example. Each example's windows and targets are its own and are closed inside it. |
-| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, `vk12-frames`, `vk13-presentation`, `vk15-validation-stop`, `vk15-retention`, `synchronization-hazard`, and `debug-names`. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. |
+| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, `vk12-frames`, `vk13-presentation`, `vk14-recovery`, `vk15-validation-stop`, `vk15-retention`, `synchronization-hazard`, and `debug-names`. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. |
 | Selection | Building, listing and filtering the tree, a `--dry-run`, and a selection that dispatches nothing acquire nothing and start no child. A selection matching no example fails. `--complete`, which the catalog group passes, runs the whole tree with Hspec's configuration reading left out and then fails unless the shared session was acquired once and every private scenario ran and passed, so no ambient setting can turn the group's receipt into a pass for a subset. The consent rules and the migrated proof's pure release, construction, publication and loader-selection examples need no session and run without consent. |
 | Consent | Read once, at startup, from `HETOIMASIA_NATIVE_SESSION`, with the GLFW suite's rules for `desktop` and `isolated-x11:<display>`; this suite has no Wayland session. Without it every native example is refused before its body, the session is never acquired, and the run ends with the refusal on stderr and a non-zero exit. |
 | Environment | Before any Vulkan call, the suite clears every ambient discovery override and every validation-layer setting it finds and records which, disables implicit layers, and points the layer's settings file at an empty one; a child inherits and re-establishes the same environment. |
@@ -1985,6 +2309,39 @@ unsettled, no step received a validation error — with synchronization
 validation on — and the capture's verdict after the last teardown callback is
 clean. Its record lists every native call the frames made, fence status queries
 and drain waits aside. It asserts no pixel value.
+
+VK-14's case, `vk14-recovery`, runs on private roots too, over two windows'
+surfaces and generations, VK-11's resources and the production frames layer,
+with two narrow injections and nothing else: the first window's next
+acquisition answers `VK_ERROR_SURFACE_LOST_KHR` without the call being made,
+and one readback buffer's creation raises `VK_ERROR_OUT_OF_DEVICE_MEMORY`
+without it. It presents three triangle frames to each window and drains every
+present fence; then injects the loss, whose acquisition gives its reservation
+back, and while the second window presents a frame on every step, the
+generations retire and destroy the first window's generation, then its lost
+surface, and the episode admits an attempt. A replacement surface is created on
+that same window, offered, checked against the one device and installed, and a
+fresh generation — handed nothing — is built on it, after which the first
+window presents three frames. It then resizes the second window and waits for
+the old generation's presentations to retire without a generation step, so the
+generation is eligible and nothing else destroys it; the readback's creation
+runs out of memory, one reclamation pass destroys that generation, and the
+creation is made once more and succeeds. It passes only if the loss was
+answered pending, the replacement was installed on the same target as one
+attempt, the lost surface's generation and then the lost surface went before
+the replacement's support query and a fresh creation on it, nothing was built
+on the lost surface again, the second window presented throughout, the
+allocation was recovered with exactly one retry and one generation destroyed,
+nothing was left unsettled, no step received a validation error — with
+synchronization validation on — and the capture's verdict after the last
+teardown callback is clean. The shared roots add the same replacement through
+the controller and the production bridge: two shown windows handed over, the
+first's loss reported as an acquisition on the owner's thread would, the
+replacement created by `replaceVulkanSurfaces` through `replaceWindowSurface`
+on the main thread under the same attachment and target, the lost surface
+destroyed on the owner's thread before it and the new surface's support
+checked and a swapchain built after it, there, while the second window's target
+and generation are untouched.
 
 VK-15's two cases run on private roots too. No device loss is induced
 natively: its teardown is the headless examples', and the specification's rows

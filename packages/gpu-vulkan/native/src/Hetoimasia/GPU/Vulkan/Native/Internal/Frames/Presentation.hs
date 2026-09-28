@@ -47,6 +47,7 @@ import Hetoimasia.GPU.Model
   )
 import Hetoimasia.GPU.Model.Identity (FrameSlotId, IdentityKind (..), Misuse (..), imageGeneration, imageIndex)
 import Hetoimasia.GPU.Vulkan.Native.Generations (SwapchainResult (..), noteSwapchainResult)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Reclamation (recoverAllocation, withAllocationAttempt)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Layer (FrameOps (..), PresentRequest (..), PresentStatus (..))
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.State
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State (Refusal (..), checkpointed, owned)
@@ -129,12 +130,16 @@ classifyPresent noEffect raised status = case raised of
 --   The frame's record here gives way to the presentation's; the semaphore is
 --   the presentation engine's; the fence is pending. A suboptimal, out-of-date
 --   or surface-lost answer has requested the target's replacement from the
---   model, and a suboptimal or out-of-date one is reported to the generations
---   so the owner's next step reconciles; the frame's synchronization is not
---   reset. 'PresentedAs' is answered.
+--   model, and each is reported to the generations so the owner's next step
+--   reconciles — a lost surface is replaced (VK-14); the frame's
+--   synchronization is not reset. 'PresentedAs' is answered.
 -- * not enqueued: nothing changes but the fence, reset and never pending, and
---   never waited on. The frame is still submitted, and can be presented again
---   or closed. 'PresentedNothing' is answered.
+--   never waited on. The frame is still submitted. That is an allocation
+--   failure with no effect (VK-14): one reclamation pass runs, and only if it
+--   disposed of something is the same frame presented once more. A second
+--   failure to enqueue, or none reclaimed, answers 'PresentedNothing', naming
+--   the original failure and the pass's evidence; the frame can be presented
+--   again or closed.
 -- * the fence reset raised: nothing was presented, but the fence is in doubt,
 --   so it is retained for ever with its record, admission closes and the
 --   session fails, and the failure is re-raised. The frame can still be
@@ -149,10 +154,27 @@ classifyPresent noEffect raised status = case raised of
 presentFrame ∷ Frames q inst msgr phys dev cmd → FrameSlotId → IO (Either Refusal Presented)
 presentFrame frames frame =
   owned recording . checkpointed recording $
-    atomically validate >>= \case
-      Left refusal → pure (Left refusal)
-      Right (record, held, device, family) → present record held device family
+    attempt >>= \case
+      Right (PresentedNothing reason) → recoverNoEffect reason
+      other → pure other
   where
+    attempt =
+      atomically validate >>= \case
+        Left refusal → pure (Left refusal)
+        Right (record, held, device, family) → present record held device family
+    recoverNoEffect reason =
+      withAllocationAttempt roots (\allocation → recoverAllocation roots "vkQueuePresentKHR" allocation Nothing reason again) >>= \case
+        Right (Right presented) → pure (Right presented)
+        Right (Left notRecovered) → pure (Right (PresentedNothing (Text.pack (displayException notRecovered))))
+        Left _ → pure (Right (PresentedNothing reason))
+    -- The retry is the same frame's presentation, validated again: a refusal
+    -- or a second failure to enqueue ends the recovery, and anything it raises
+    -- is the caller's as it would have been.
+    again =
+      attempt >>= \case
+        Right (PresentedAs presentation outcome) → pure (Right (PresentedAs presentation outcome))
+        Right (PresentedNothing reason) → pure (Left reason)
+        Left refusal → pure (Left ("refused on the retry: " <> Text.pack (show refusal)))
     recording = framesRecording frames
     roots = framesRoots frames
     ops = framesOps frames
@@ -266,6 +288,7 @@ presentFrame frames frame =
             case outcome of
               PresentationEnqueuedSuboptimal → void (noteSwapchainResult (framesGenerations frames) generation SwapchainSuboptimal)
               PresentationEnqueuedOutOfDate → void (noteSwapchainResult (framesGenerations frames) generation SwapchainOutOfDate)
+              PresentationEnqueuedSurfaceLost → void (noteSwapchainResult (framesGenerations frames) generation SwapchainSurfaceLost)
               _ → pure ()
             pure (Right presentation)
       case committed of

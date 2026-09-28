@@ -92,6 +92,10 @@ spec = describe "Frames" $ do
       syncAcquireState (viewSlotSync slot) `shouldBe` SemaphoreUnsignalled
       atomically (readFrameStandings (rigFrames rig)) `shouldReturn` []
       imagesOwned (rigStandIn rig) `shouldReturn` []
+      -- Each pool record went back with its reservation, untouched: one record
+      -- served both, nothing is held, and the target's frames retire.
+      map (\(PoolView _ _ sync) → poolHolder sync) <$> atomically (readPool (rigFrames rig)) `shouldReturn` [PoolFree]
+      retireTargetFrames (rigFrames rig) (rigTarget rig)
       clean rig
 
     it "keeps a suboptimal acquisition's index and requests a replacement beside it" $ do
@@ -111,6 +115,10 @@ spec = describe "Frames" $ do
       usageFrames . usage <$> modelOf rig `shouldReturn` 0
       viewPendingResult <$> generationsOf rig `shouldReturn` Just SwapchainOutOfDate
       imagesOwned (rigStandIn rig) `shouldReturn` []
+      -- Its pool record went back with the reservation: nothing of the
+      -- target's frames is held, and they retire.
+      map (\(PoolView _ _ sync) → poolHolder sync) <$> atomically (readPool (rigFrames rig)) `shouldReturn` [PoolFree]
+      retireTargetFrames (rigFrames rig) (rigTarget rig)
       clean rig
 
     it "refuses a foreign target as misuse, never pending, and another thread as not the owner, with no native call" $ do

@@ -83,6 +83,23 @@
 -- anything is unknown, so its candidate is retained, never destroyed, and the
 -- cancellation is delivered after the session has failed.
 --
+-- = A lost surface
+--
+-- A swapchain call that reported the surface lost ('SwapchainSurfaceLost'), or
+-- a capability query or a swapchain's creation that raised it, retires the
+-- active generation; nothing is built on the surface again ('SurfaceLost').
+-- Once every generation of the target has been destroyed, the step destroys the
+-- lost surface through the roots, keeping the target, and asks the model's
+-- episode for an attempt: an admitted one leaves the target
+-- 'SurfaceReplacing' and is answered by 'stepGenerations'
+-- ('summarySurfacesWanted'). A replacement created on the same window is
+-- offered with 'offerReplacementSurface': installed once the session's one
+-- queue family can present to it, when a fresh generation is built on it, or
+-- refused — a surface the device cannot present to disposes of the target
+-- through its designation. 'replacementSurfaceFailed' reports one that was not
+-- made. A swapchain or view creation that ran out of memory created nothing,
+-- and is recovered once, as an allocation (VK-14).
+--
 -- = Close
 --
 -- Close wins: a target the model has closed begins no construction, admits no
@@ -94,9 +111,9 @@
 -- = Implementation
 --
 -- This module is the entry point and holds no code of its own: it re-exports,
--- with unchanged names, signatures and constructor visibility, what seven
+-- with unchanged names, signatures and constructor visibility, what eight
 -- private modules under @Hetoimasia.GPU.Vulkan.Native.Internal.Generations@
--- implement (#266). Clients cannot import them; each one's Haddock states its
+-- implement (#266, and VK-14's @Surface@). Clients cannot import them; each one's Haddock states its
 -- responsibility and what state it owns.
 --
 -- +------------------+------------------------------------------------+------------------------------------+
@@ -109,14 +126,18 @@
 -- +------------------+------------------------------------------------+------------------------------------+
 -- | @Uses@           | 'noteSwapchainResult' and CPU uses, in 'STM'   | @State@                            |
 -- +------------------+------------------------------------------------+------------------------------------+
--- | @Disposal@       | Destroying generations whose holds ended, child| @State@                            |
+-- | @Disposal@       | Making the generations, with their disposer;   | @State@                            |
+-- |                  | destroying generations whose holds ended, child|                                    |
 -- |                  | before parent, and the model's progress turn   |                                    |
 -- +------------------+------------------------------------------------+------------------------------------+
 -- | @Reconciliation@ | One target's planning, settling, recovery,     | @State@, @Disposal@                |
 -- |                  | capacity, construction and publication         |                                    |
 -- +------------------+------------------------------------------------+------------------------------------+
 -- | @Step@           | 'stepGenerations' and 'generationsDeadline'    | @State@, @Disposal@,               |
--- |                  |                                                | @Reconciliation@                   |
+-- |                  |                                                | @Reconciliation@, @Surface@        |
+-- +------------------+------------------------------------------------+------------------------------------+
+-- | @Surface@        | Releasing a lost surface and asking for, taking| @State@                            |
+-- |                  | or refusing its replacement                    |                                    |
 -- +------------------+------------------------------------------------+------------------------------------+
 -- | @Retirement@     | 'retireTargetGenerations'                      | @State@, @Disposal@                |
 -- +------------------+------------------------------------------------+------------------------------------+
@@ -177,6 +198,11 @@ module Hetoimasia.GPU.Vulkan.Native.Generations
   , useGeneration
   , endGenerationUse
 
+    -- * Recovering a lost surface (VK-14)
+  , ReplacementAnswer (..)
+  , offerReplacementSurface
+  , replacementSurfaceFailed
+
     -- * Retirement
   , retireTargetGenerations
 
@@ -191,8 +217,11 @@ module Hetoimasia.GPU.Vulkan.Native.Generations
   , GenerationDestructionFailed (..)
   , GenerationEffectUncertain (..)
   , GenerationsRetained (..)
+  , AllocationNotRecovered (..)
+  , RecoveryEnd (..)
   ) where
 
+import Hetoimasia.GPU.Vulkan.Native.Internal.Reclamation (AllocationNotRecovered (..), RecoveryEnd (..))
 import Hetoimasia.GPU.Vulkan.Native.Internal.Generations.Observation
   ( GenerationView (..)
   , TargetGenerationsView (..)
@@ -207,11 +236,18 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Generations.State
   , GenerationsRetained (..)
   , SwapchainResult (..)
   , TargetCondition (..)
-  , newGenerations
-  , newGenerationsCapturing
-  , newGenerationsHooked
   , settlingPeriod
   , trackTarget
+  )
+import Hetoimasia.GPU.Vulkan.Native.Internal.Generations.Disposal
+  ( newGenerations
+  , newGenerationsCapturing
+  , newGenerationsHooked
+  )
+import Hetoimasia.GPU.Vulkan.Native.Internal.Generations.Surface
+  ( ReplacementAnswer (..)
+  , offerReplacementSurface
+  , replacementSurfaceFailed
   )
 import Hetoimasia.GPU.Vulkan.Native.Internal.Generations.Step
   ( StepSummary (..)

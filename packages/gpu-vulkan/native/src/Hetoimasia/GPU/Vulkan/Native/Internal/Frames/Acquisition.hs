@@ -59,6 +59,7 @@ import Hetoimasia.GPU.Vulkan.Native.Generations
   )
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Layer (AcquireResult (..), FrameOps (..))
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.State
+import Hetoimasia.GPU.Vulkan.Native.Internal.Reclamation (recoveringCreation)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State (Refusal (..), checkpointed, modelAnswer, modelEdit, owned)
 import Hetoimasia.GPU.Vulkan.Native.Naming (NativeObjectKind (..), PoolObject (..), SlotObject (..), poolObjectName, slotObjectName)
 import Hetoimasia.GPU.Vulkan.Native.Roots
@@ -122,6 +123,8 @@ tryAcquireFrame frames target =
                 Just (Suspended _) → Right (Left AcquisitionSuspended)
                 Just Closing → Right (Left AcquisitionClosing)
                 Just RecoverySpent → Right (Left AcquisitionUnavailable)
+                Just SurfaceLost → Right (Left (AcquisitionPending PendingSurfaceLost))
+                Just SurfaceReplacing → Right (Left (AcquisitionPending PendingSurfaceLost))
                 Just (PresentationUnsupported _) → Right (Left AcquisitionUnavailable)
                 _ → Right (Left (AcquisitionPending PendingGeneration))
     active view = do
@@ -186,12 +189,23 @@ tryAcquireFrame frames target =
               editSlot frames (slotOf frame) (\sync → sync {syncAcquireState = SemaphoreSignalOwed})
               when suboptimal (void (noteSwapchainResult generations generation SwapchainSuboptimal))
               pure (Right (AcquisitionOwned (OwnedFrame frame image suboptimal)))
-        Right ReservationReturned → pure (Right (AcquisitionPending PendingNoImage))
-        Right ReplacementRequested → case result of
+        -- Given back whole, its pool record freed untouched with it.
+        Right ReservationReturned → do
+          freePoolOf frames frame
+          pure (Right (AcquisitionPending PendingNoImage))
+        -- The model gave the reservation back, its pool record with it; the
+        -- native record it was bound to is freed untouched too, as any given-
+        -- back reservation's is, or it would stay bound to a frame that no
+        -- longer exists and hold the target's retirement back for ever.
+        Right ReplacementRequested → freePoolOf frames frame >> case result of
           AcquiringOutOfDate → do
             void (noteSwapchainResult generations generation SwapchainOutOfDate)
             pure (Right (AcquisitionPending PendingReplacement))
-          _ → pure (Right (AcquisitionPending PendingSurfaceLost))
+          _ → do
+            -- The surface itself must be replaced (VK-14): the generations are
+            -- told, and their next step retires this generation.
+            void (noteSwapchainResult generations generation SwapchainSurfaceLost)
+            pure (Right (AcquisitionPending PendingSurfaceLost))
         Left reason
           | acquiredSomething result → do
               -- The image is owned natively and the model refused to record it:
@@ -227,7 +241,9 @@ acquiredSomething = \case
 -- | The slot's synchronization, made now if the slot has none: a binary
 -- semaphore and two fences, each unsignalled, named when the device offers
 -- naming. A creation or a naming that raised destroys what was made before it
--- raises, so the slot is either complete or absent. An existing slot must be
+-- raises, so the slot is either complete or absent; a creation that ran out of
+-- memory created nothing, and is recovered as an allocation, once (VK-14). An
+-- existing slot must be
 -- idle: the model frees a slot only once its own obligations have ended, so
 -- anything else is refused.
 prepareSlot ∷ Frames q inst msgr phys dev cmd → dev → FrameSlotId → IO (Either Refusal SlotSync)
@@ -250,7 +266,7 @@ prepareSlot frames device frame =
     ops = framesOps frames
     roots = framesRoots frames
     create ∷ Text → IO Word64 → IO Word64
-    create = rootsCall roots
+    create called call = recoveringCreation roots called Nothing (rootsCall roots called call)
     semaphore = create "vkCreateSemaphore" (opsCreateSemaphore ops device)
     destroySemaphore handle = rootsCall roots "vkDestroySemaphore" (opsDestroySemaphore ops device handle)
     destroyFence handle = rootsCall roots "vkDestroyFence" (opsDestroyFence ops device handle)
@@ -272,7 +288,8 @@ prepareSlot frames device frame =
 -- and binds no more records than that capacity, so a target with no record to
 -- bind is refused as illegal rather than grown. A creation or a naming that
 -- raised destroys what was made before it raises, so a record is either
--- complete or absent.
+-- complete or absent; a creation that ran out of memory created nothing, and
+-- is recovered as an allocation, once (VK-14).
 preparePool ∷ Frames q inst msgr phys dev cmd → dev → FrameSlotId → IO (Either Refusal Natural)
 preparePool frames device frame = do
   (held, capacity) ← atomically $ do
@@ -303,7 +320,7 @@ preparePool frames device frame = do
     bind number = editPool frames (target, number) (\sync → sync {poolHolder = PoolHeldByFrame frame})
     idle sync = poolRenderedState sync == SemaphoreUnsignalled && poolFenceState sync `elem` [FenceIdle, FenceSignalled]
     create ∷ Text → IO Word64 → IO Word64
-    create = rootsCall roots
+    create called call = recoveringCreation roots called Nothing (rootsCall roots called call)
     destroySemaphore handle = rootsCall roots "vkDestroySemaphore" (opsDestroySemaphore ops device handle)
     destroyFence handle = rootsCall roots "vkDestroyFence" (opsDestroyFence ops device handle)
     name number objects =

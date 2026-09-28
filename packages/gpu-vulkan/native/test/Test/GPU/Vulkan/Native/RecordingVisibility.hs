@@ -151,6 +151,8 @@ supportedClient =
       , "BatchInvalidationFailed (..)"
       , "ResourceDestructionFailed (..)"
       , "ResourcesRetained (..)"
+      , "AllocationNotRecovered (..)"
+      , "RecoveryEnd (..)"
       ]
 
 importing ∷ String → String
