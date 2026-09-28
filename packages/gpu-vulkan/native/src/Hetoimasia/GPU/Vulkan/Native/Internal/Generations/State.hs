@@ -142,6 +142,11 @@ data TargetCondition
     -- and the next construction is a fresh one and a recovery attempt.
   | RecoveryWaiting !Instant
     -- ^ The model's episode admits the next attempt at this instant.
+  | RecoveryUnscheduled
+    -- ^ The delay the episode owes before its next attempt does not fit the
+    -- clock's representation, so no attempt can be admitted without shortening
+    -- it. Nothing is built and no step is asked for; the target waits,
+    -- unscheduled, until it is closed.
   | RecoverySpent
     -- ^ The episode is spent, or the session's device cannot present to the
     -- surface recovery replaced; the model escalated through the target's

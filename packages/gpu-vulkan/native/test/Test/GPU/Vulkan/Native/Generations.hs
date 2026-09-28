@@ -17,7 +17,7 @@ import Data.Text (Text)
 import Data.Word (Word32, Word64)
 import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (ThreadBlocked), threadStatus)
 import Numeric.Natural (Natural)
-import Hetoimasia.Foundation.Time (DurationRequirement (AllowZero), Instant, durationFromNanoseconds, scriptedInstant)
+import Hetoimasia.Foundation.Time (DurationRequirement (AllowZero), Instant, durationFromNanoseconds, maximumDuration, scriptedInstant)
 import Data.Foldable (for_)
 import Hetoimasia.GPU.Model
   ( Escalation (..)
@@ -493,6 +493,21 @@ spec = describe "Generations" $ do
       model ← atomically (readRootsModel (rigRoots rig))
       sessionState model `shouldBe` SessionFailed RequiredTargetUnrecoverable
 
+    it "stops retrying a failed construction once the clock cannot express its next delay, owing no step for it" $ do
+      rig ← newRig
+      script (rigStandIn rig) AtCreateSwapchain Fails
+      stepAt rig 0 (seen 640 480)
+      -- The first attempt fails at the very end of the clock's range, where
+      -- the next one's delay cannot be added.
+      _ ← wantedLast rig
+      recoveryAttempts rig `shouldReturn` 1
+      _ ← wantedLast rig
+      viewCondition <$> generationsOf rig `shouldReturn` RecoveryUnscheduled
+      atomically (generationsDeadline (rigGenerations rig)) >>= (`shouldSatisfy` not . immediate)
+      _ ← wantedLast rig
+      length <$> created rig `shouldReturn` 2
+      recoveryAttempts rig `shouldReturn` 1
+
     it "destroys exactly what a construction failing after the swapchain left, child before parent, and never replays it" $ do
       forM_ [(AtSwapchainImages, 0, [DestroyedSwapchain 100]), (AtCreateView, 1, [DestroyedView 101, DestroyedSwapchain 100])] $ \(failing, succeeding, expected) → do
         rig ← newRig
@@ -729,6 +744,25 @@ spec = describe "Generations" $ do
       rig ← lostAndReleased
       forM_ [4, 5, 6] $ \instant → wantedAt rig instant `shouldReturn` []
       atomically (generationsDeadline (rigGenerations rig)) >>= (`shouldSatisfy` not . immediate)
+      recoveryAttempts rig `shouldReturn` 1
+
+    it "stops asking for a replacement once the clock cannot express the next attempt's delay, owing no step for it" $ do
+      rig ← lostAndReleased
+      -- The replacement's surface is lost as its first swapchain is made, at
+      -- the very end of the clock's range: the attempt fails there, and the
+      -- next one's delay cannot be added.
+      script (rigStandIn rig) AtCreateSwapchain (AnswersOnce FailedSurfaceLost)
+      offerReplacementSurface (rigGenerations rig) lastInstant (rigTarget rig) (surfaceNumbered (rigStandIn rig) 20) `shouldReturn` ReplacementInstalled
+      wantedLast rig `shouldReturn` []
+      -- Lost, with nothing of it left: releasing it is owed at once.
+      viewCondition <$> generationsOf rig `shouldReturn` SurfaceLost
+      atomically (generationsDeadline (rigGenerations rig)) >>= (`shouldSatisfy` immediate)
+      wantedLast rig `shouldReturn` []
+      surfacesDestroyed rig `shouldReturn` [DestroyedSurface 10, DestroyedSurface 20]
+      viewCondition <$> generationsOf rig `shouldReturn` RecoveryUnscheduled
+      -- Not releasable again at every step: nothing is owed now.
+      atomically (generationsDeadline (rigGenerations rig)) >>= (`shouldSatisfy` not . immediate)
+      wantedLast rig `shouldReturn` []
       recoveryAttempts rig `shouldReturn` 1
 
     it "spends one episode across repeated loss: three replacements and then the target is spent, with nothing replenished" $ do
@@ -1262,6 +1296,14 @@ retryingRig retry = do
 -- for.
 wantedAt ∷ Rig → Integer → IO [TargetId]
 wantedAt rig instant = summarySurfacesWanted <$> stepGenerations (rigGenerations rig) (at instant) (Map.singleton (rigTarget rig) (seen 640 480))
+
+-- | The very end of the clock's range, where no delay can be added.
+lastInstant ∷ Instant
+lastInstant = scriptedInstant maximumDuration
+
+-- | 'wantedAt' at 'lastInstant'.
+wantedLast ∷ Rig → IO [TargetId]
+wantedLast rig = summarySurfacesWanted <$> stepGenerations (rigGenerations rig) lastInstant (Map.singleton (rigTarget rig) (seen 640 480))
 
 -- | A rig whose target's surface was lost, its generation destroyed, the
 -- surface released, and one attempt admitted and waiting for a replacement.

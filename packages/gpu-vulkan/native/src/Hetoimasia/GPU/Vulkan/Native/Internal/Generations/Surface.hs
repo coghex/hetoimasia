@@ -113,12 +113,17 @@ releaseLostSurfaces generations now = do
             Just (RecoveryAttempt _) → [target] <$ edit generations target (\entry → entry {recordRecovering = True, recordCondition = SurfaceReplacing})
             Just (RecoveryDeferred at) → [] <$ edit generations target (\entry → entry {recordCondition = RecoveryWaiting at})
             Just (RecoveryExhausted _) → [] <$ edit generations target (\entry → entry {recordCondition = RecoverySpent})
+            -- No instant can be named for the next attempt: the target stops
+            -- asking for one, and so stops owing a step, rather than being
+            -- found releasable again at every step.
+            Just RecoveryUnschedulable → [] <$ edit generations target (\entry → entry {recordCondition = RecoveryUnscheduled})
             _ → pure []
     -- An attempt already outstanding, or an episode already spent, asks for
     -- nothing more.
     waiting = \case
       SurfaceReplacing → True
       RecoverySpent → True
+      RecoveryUnscheduled → True
       _ → False
 
 -- | What an offered replacement surface became.

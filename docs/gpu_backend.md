@@ -415,7 +415,10 @@ nothing, and the package's public module does not offer one.
   escalated through the target's designation — an optional target unavailable,
   a required one failing the session — and reported as `RecoverySpent`, which
   [Recovery](#required-and-optional-dispositions) acts on. Nothing retries
-  hot. A recovery rebuild whose observed geometry
+  hot. A next attempt whose delay the clock cannot express — one failing at the
+  very end of its range — is never admitted early: the target is reported as
+  `RecoveryUnscheduled`, builds nothing and asks for no step, whether its
+  surface was lost or a construction failed. A recovery rebuild whose observed geometry
   has moved — since the active generation, or since the failed construction
   was planned — first waits for that move to settle, as any resize does; one
   whose geometry has come back cancels the move it had begun to settle, so a
@@ -1966,7 +1969,10 @@ through the episode; exhaustion and an unsupported replacement each making an
 optional target unavailable while another keeps building, and failing the
 session for a required one, with no second device; and an ordinary resize
 spending nothing while a repeated failure at unchanged geometry spends the
-episode; a lost surface taken from a generation already retired, and a late
+episode; a lost surface whose next attempt's delay the clock cannot express,
+at the very end of its range, released once and then left
+`RecoveryUnscheduled`, owing no step, and a failed construction at that same
+instant left the same way; a lost surface taken from a generation already retired, and a late
 report about it never reaching the replacement; and a creation's retry that
 raised device loss, latched and raised, or a lost surface, replaced, rather
 than either being read as a failed retry; an attempt in flight failed when the

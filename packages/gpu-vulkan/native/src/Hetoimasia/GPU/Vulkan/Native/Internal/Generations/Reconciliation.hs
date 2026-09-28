@@ -130,6 +130,7 @@ reconcile generations now target geometry = do
       | recordResult record == Just SwapchainSurfaceLost → Nothing <$ loseSurface
       | otherwise → case recordCondition record of
           RecoverySpent → pure Nothing
+          RecoveryUnscheduled → pure Nothing
           PresentationUnsupported _ → pure Nothing
           Closing → pure Nothing
           _ → decide record view
@@ -254,6 +255,7 @@ reconcile generations now target geometry = do
                   construct planned
                 Just (RecoveryDeferred at) → Nothing <$ setCondition (RecoveryWaiting at)
                 Just (RecoveryExhausted _) → Nothing <$ setCondition RecoverySpent
+                Just RecoveryUnschedulable → Nothing <$ setCondition RecoveryUnscheduled
                 -- An attempt is outstanding only between its admission and its
                 -- settlement in this same step, so there is nothing to begin.
                 _ → pure Nothing
