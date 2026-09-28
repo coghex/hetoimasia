@@ -72,6 +72,7 @@ spec = describe "Vulkan loop adapter" $ do
     it "publishes each attached window's observation and captured demand, and the owner presents a frame of its own" (bounded testComposedPresent)
     it "folds the owner's deadline into the main loop's wait, shortening it and never lengthening it" (bounded testDeadlineFolded)
     it "keeps demand captured before the owner took it, whatever newer demand is published over it" (bounded testDemandKeptUntilTaken)
+    it "serves both parts of demand captured in one turn: one window's now, and another's later deadline once it comes" (bounded testCombinedDemand)
     it "keeps a closed window's retirement observable while the owner's step is held and demand waits" (bounded testCloseWhileSaturated)
 
   describe "the owner's pacing" $ do
@@ -667,6 +668,60 @@ testDemandKeptUntilTaken = do
       ((>= 3) <$> presentsOf rig (graphicsAttachment service))
     presentsOf rig (graphicsAttachment service)
   presents `shouldSatisfy` (>= 3)
+
+-- | Two windows publish in one turn — one asking now, the other by a later
+-- deadline — so the owner receives one publication carrying both. It renders
+-- now, and holds the deadline: with the scripted clock still, nothing more is
+-- rendered, and once the clock reaches the deadline the owner renders again.
+testCombinedDemand ∷ IO ()
+testCombinedDemand = do
+  rig ← scriptedRigOf 2
+  (early, still, late) ← runRig rig $ \host control → do
+    [first, second] ← windowsOf host
+    one ← firstFrame rig host control first
+    two ← firstFrame rig host control second
+    let total = (+) <$> presentsOf rig (graphicsAttachment one) <*> presentsOf rig (graphicsAttachment two)
+        client window = atomically (hostWindowClient (vulkanWindowHost host) window) >>= maybe (failWith "no client") pure
+    base ← total
+    soon ← either (error . show) id . (`addDuration` millis 50) <$> clockNow rig
+    now' ← client first
+    later ← client second
+    published ← newTVarIO False
+    composedUntil
+      rig
+      host
+      control
+      "the request made now"
+      ( \_ → do
+          done ← readTVarIO published
+          unless done $ do
+            _ ← publishDemand (clientDemandPublisher now') immediateDemand
+            _ ← publishDemand (clientDemandPublisher later) (deadlineDemand soon)
+            atomically (writeTVar published True)
+      )
+      ((>= base + 2) <$> total)
+    early ← total
+    -- The clock is still, short of the deadline: the owner settles on a
+    -- deadline of its own, no later than the one it holds, and renders
+    -- nothing meanwhile.
+    due ← clockNow rig >>= awaitDeadlineAfter host
+    when (due > soon) (failWith "the owner's deadline passed the demand it holds")
+    still ← total
+    setClock rig soon
+    turns ← newTVarIO (0 ∷ Int)
+    composedUntil
+      rig
+      host
+      control
+      "the request by the deadline"
+      (\_ → atomically (modifyTVar' turns (+ 1)))
+      ((||) . (> still) <$> total <*> ((>= 400) <$> readTVarIO turns))
+    late ← total
+    letExitFinish rig
+    pure (early - base, still - early, late - still)
+  early `shouldBe` 2
+  still `shouldBe` 0
+  late `shouldBe` 2
 
 testCloseWhileSaturated ∷ IO ()
 testCloseWhileSaturated = do

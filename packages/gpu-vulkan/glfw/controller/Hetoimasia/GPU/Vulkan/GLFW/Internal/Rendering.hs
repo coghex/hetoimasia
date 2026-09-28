@@ -433,12 +433,15 @@ planStep rendering inputs = do
         if inputsDemandRevision inputs > seenDemand
           then do
             writeTVar (renderingDemandSeen rendering) (inputsDemandRevision inputs)
-            case ownerDemandDeadline demand of
-              Just at
-                | not (ownerDemandImmediate demand) && not (deadlineReached now at) → do
-                    modifyTVar' (renderingDemandAt rendering) (Just . maybe at (min at))
-                    pure False
-              _ → pure (ownerDemandImmediate demand || isJust (ownerDemandDeadline demand))
+            -- One publication can carry both parts — two windows, one asking
+            -- now and one by a later deadline — and each is kept: the request
+            -- now is served by this step, and a deadline still ahead is held
+            -- for the step it comes at. A deadline already come is served now.
+            let ahead = case ownerDemandDeadline demand of
+                  Just at | not (deadlineReached now at) → Just at
+                  _ → Nothing
+            for_ ahead $ \at → modifyTVar' (renderingDemandAt rendering) (Just . maybe at (min at))
+            pure (ownerDemandImmediate demand || (isJust (ownerDemandDeadline demand) && not (isJust ahead)))
           else pure False
       ahead ← readTVar (renderingDemandAt rendering)
       came ← case ahead of

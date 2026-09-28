@@ -1610,7 +1610,10 @@ publications are two requests. A target is asked for a frame — the model's
 
 - a demand publication the owner has not acted on is due: immediate, or with a
   deadline that has come; one still ahead is kept and asked for when it comes,
-  and the owner's deadline includes it;
+  and the owner's deadline includes it. One publication can carry both parts —
+  two windows captured in one turn, one asking now and one by a later
+  deadline — and both are kept: the request now is served at once, and the
+  deadline when it comes;
 - a scene publication the owner has not rendered arrives: the renderer renders
   the latest scene, whichever application thread published it (D-31); or
 - a target that has presented before can no longer be showing the latest
@@ -2115,7 +2118,9 @@ frame of its own; the owner's deadline folded into the main loop's schedule —
 loop then waiting for it rather than for a five-second fallback; demand
 captured before the owner took it kept across a newer publication while the
 owner's step was held inside an acquisition, and a window closed meanwhile
-still retiring; a quiet scene rendered continuously never arming the owner's
+still retiring; two windows' demand captured in one turn — one now, one by a
+later deadline — served as two frames now, none while a still clock stays short
+of the deadline, and two more once it comes; a quiet scene rendered continuously never arming the owner's
 timer beyond the first pending-work interval; the backoff through 5, 10, 20,
 40, 80, 100 and 100 ms from a presentation, an unrelated publication a
 millisecond before a poll moving neither the fence queries nor the deadline,
