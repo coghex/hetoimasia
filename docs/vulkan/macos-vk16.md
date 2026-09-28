@@ -45,8 +45,8 @@ by a later deadline kept. They replace the receipts taken at `e6a4e93`, `31dfb7c
 The graphics-owner interaction verdict was measured at `4311ebc`, over the same
 native inputs. Of what changed since, the retry pacing acts only on an
 abandoned frame, of which that session recorded none, and the demand rule only
-on a deadline published with other demand, which that session's scene
-publications never carried.
+on a demand deadline, where that session published scenes and no window
+demand.
 
 VK-16's case, `vk16-composed`, ran on private roots in its own child process,
 on the Apple M3 Max, over the production composition and two visible 160×120
