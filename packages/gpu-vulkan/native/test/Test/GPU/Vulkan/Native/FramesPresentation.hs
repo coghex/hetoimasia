@@ -44,7 +44,7 @@ import Hetoimasia.GPU.Vulkan.Native.Frames
 import Hetoimasia.GPU.Vulkan.Native.Generations
 import Hetoimasia.GPU.Vulkan.Native.Recording (Refusal (..))
 import Hetoimasia.GPU.Vulkan.Native.Presentation (SurfaceCapabilities (..), SurfaceExtent (..), SurfaceOffer (..))
-import Hetoimasia.GPU.Vulkan.Native.Roots (failRootsSession, retireRootTarget, retireRoots)
+import Hetoimasia.GPU.Vulkan.Native.Roots (TerminalCause (..), failRootsSession, retireRootTarget, retireRoots)
 import Test.GPU.Vulkan.Native.FramesRig
 import Test.GPU.Vulkan.Native.FramesStandIn
 import qualified Test.GPU.Vulkan.Native.StandIn as Roots
@@ -186,7 +186,7 @@ spec = describe "Frames presentation" $ do
       answer ← onOtherThread (presentFrame (rigFrames rig) (ownedFrame second))
       answer `shouldBe` Left RefusedNotOwner
       atomically (failRootsSessionOf rig)
-      presentFrame (rigFrames rig) (ownedFrame second) `shouldReturn` Left (RefusedMisuse SessionAlreadyFailed)
+      presentFrame (rigFrames rig) (ownedFrame second) `shouldReturn` Left (RefusedSessionFailed (TerminalCleanupFailed "CleanupFailed"))
       length . filter isPresentation . drop calls <$> frameCalls (rigStandIn rig) `shouldReturn` 0
       clean rig
 
@@ -278,7 +278,9 @@ spec = describe "Frames presentation" $ do
       poolFenceState pool `shouldSatisfy` \case
         FenceUncertain _ → True
         _ → False
-      acquired rig `shouldReturn` AcquisitionUnavailable
+      refusedPrimary rig `shouldReturn'` (`shouldSatisfy` \case
+        Just (TerminalUncertainEffect _) → True
+        _ → False)
       settleAll rig
       retireTargetFrames (rigFrames rig) (rigTarget rig) `raises` \(FramesRetained _ frames' _ _ pools) → frames' == [ownedFrame frame] && pools == [number]
       clean rig

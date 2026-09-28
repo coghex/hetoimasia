@@ -1145,6 +1145,7 @@ graphicsOwnerClient =
     , "    , graphicsConstructTarget = \\_ → pure (TargetConstructed (targetEvidence (Text.pack \"built\")))"
     , "    , graphicsStep = \\_ → pure noStepWork"
     , "    , graphicsNextDeadline = pure NoOwnerDemand"
+    , "    , graphicsWake = pure False"
     , "    , graphicsRetireTarget = \\_ → pure (targetRetired (Text.pack \"retired\"))"
     , "    , graphicsRetireOwner = \\_ → pure (ownerRetired (Text.pack \"retired\"))"
     , "    , graphicsDestroyOwner = \\_ → pure (ownerDestroyed (Text.pack \"destroyed\"))"

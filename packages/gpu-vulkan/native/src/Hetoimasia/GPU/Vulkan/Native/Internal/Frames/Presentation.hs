@@ -49,8 +49,8 @@ import Hetoimasia.GPU.Model.Identity (FrameSlotId, IdentityKind (..), Misuse (..
 import Hetoimasia.GPU.Vulkan.Native.Generations (SwapchainResult (..), noteSwapchainResult)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Layer (FrameOps (..), PresentRequest (..), PresentStatus (..))
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.State
-import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State (Refusal (..), owned)
-import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost, failRootsSession, rootsCall, stateRootsModel)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State (Refusal (..), checkpointed, owned)
+import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost, failRootsSessionBecause, rootsCall, stateRootsModel)
 
 -- | What a presentation's answer establishes about its effect.
 data PresentReading
@@ -148,7 +148,7 @@ classifyPresent noEffect raised status = case raised of
 -- recorded outcome, not a prompt return, and it never interrupts the call.
 presentFrame ∷ Frames q inst msgr phys dev cmd → FrameSlotId → IO (Either Refusal Presented)
 presentFrame frames frame =
-  owned recording $
+  owned recording . checkpointed recording $
     atomically validate >>= \case
       Left refusal → pure (Left refusal)
       Right (record, held, device, family) → present record held device family
@@ -206,7 +206,7 @@ presentFrame frames frame =
           -- record, and admission stops.
           atomically $ do
             editPool frames key (\entry → entry {poolFenceState = FenceUncertain (Text.pack (displayException exception))})
-            failRootsSession roots CleanupFailed
+            failRootsSessionBecause roots CleanupFailed ("resetting the present fence of " <> Text.pack (show key) <> " raised: " <> Text.pack (displayException exception))
           rethrowIO failure
         Right () → do
           atomically (editPool frames key (\entry → entry {poolFenceState = FenceIdle}))
@@ -215,7 +215,14 @@ presentFrame frames frame =
           written ← readIORef status
           let failure = either (\(ExceptionWithContext _ exception) → Just exception) (const Nothing) raised
           case classifyPresent (opsNoEffect ops) failure written of
-            ReadEnqueued outcome → enqueued record key outcome
+            ReadEnqueued outcome → do
+              -- What was enqueued is recorded first; then a call that lost the
+              -- device still fails with the loss, which is what its caller
+              -- must see.
+              answer ← enqueued record key outcome
+              case raised of
+                Left loss@(ExceptionWithContext _ exception) | isLoss exception → rethrowIO loss
+                _ → pure answer
             ReadNotEnqueued reason → pure (Right (PresentedNothing reason))
             ReadUnknown reason → do
               let why = "whether vkQueuePresentKHR enqueued the presentation is unknown: " <> reason

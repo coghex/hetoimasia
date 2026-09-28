@@ -5,7 +5,9 @@
 -- the roots' native layer and the surface bridge — so these stand-ins drive
 -- the real controller, the real graphics owner and the real protected host
 -- exactly as a native run does, and can be told to fail, report device loss,
--- or hold at any step, which a native run cannot be asked to do on demand.
+-- hold, or report a validation message into the session's real capture from
+-- inside the call, as a layer does, at any step — which a native run cannot be
+-- asked to do on demand.
 -- Every call is journalled with the thread that made it, and the seam's own
 -- window and session releases are journalled into the same place, so an
 -- example can read one order across all of them.
@@ -16,6 +18,7 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , journal
   , threadsOf
   , awaitEvent
+  , journalHas
 
     -- * The native layer
   , Native
@@ -25,6 +28,12 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , declareUnsupported
   , StandInFailure (..)
   , StandInLoss (..)
+  , injectedMessageId
+  , reportErrorNow
+  , reportWarningNow
+  , awaitSinkRecorded
+  , claimSinkFirst
+  , awaitHeld
 
     -- * The surface bridge
   , Bridge
@@ -44,6 +53,8 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , publishObservation
   , offerExtent
   , twoWindows
+  , failingSink
+  , sinkHasFailed
   , creationsBegun
   , runRig
   , runRigCaught
@@ -70,8 +81,15 @@ import Control.Concurrent.STM
   , stateTVar
   , writeTVar
   )
-import Control.Exception (Exception, SomeException, fromException, throwIO, try, tryWithContext, uninterruptibleMask_)
-import Control.Monad (void)
+import Control.Exception (Exception, ExceptionWithContext (ExceptionWithContext), SomeException, fromException, rethrowIO, throwIO, try, tryWithContext, uninterruptibleMask_)
+import Control.Monad (void, when)
+import Data.ByteString (ByteString)
+import qualified Data.Vector as Vector
+import Foreign.Ptr (FunPtr, castFunPtr, castPtr)
+import Vulkan.CStruct (withCStruct)
+import Vulkan.Extensions.VK_EXT_debug_utils (DebugUtilsMessengerCallbackDataEXT (..))
+import Vulkan.Zero (zero)
+import Hetoimasia.GPU.Vulkan.Native.Diagnostics (captureMessengerCallback)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -81,6 +99,7 @@ import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word32, Word64)
+import Foreign.C.Types (CInt (..))
 import Foreign.Ptr (Ptr, nullPtr, plusPtr)
 import Hetoimasia.Foundation.Log (Logger, callbackSink, defaultLogFilter, mkLoggerWith, systemMetadata)
 import Hetoimasia.Foundation.Messaging.Payload (prepare)
@@ -103,7 +122,7 @@ import Hetoimasia.GLFW.Command (WaitedSubmission (..), awaitSubmitWindowCommand,
 import Hetoimasia.GLFW.Window (Extent (Extent), WindowConfig, WindowId, hiddenTestWindowConfig, observedRevision)
 import Hetoimasia.GPU.Model.Budget (defaultBudgetRequest, validateBudgets)
 import Hetoimasia.GPU.Model.Identity (TargetClass)
-import Hetoimasia.GPU.Vulkan.Diagnostics (DiagnosticCapture, DiagnosticVerdict, Quiesced, afterLastCallback, defaultCaptureConfig)
+import Hetoimasia.GPU.Vulkan.Diagnostics (CaptureConfig, DiagnosticCapture, DiagnosticVerdict, Quiesced, afterLastCallback, captureSinkFailure, captureUserData, defaultCaptureConfig, diagnosticVerdictInContext, requestDrain)
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Bridge (Created (..), Discharged (..), LeaseAnswer (..), SurfaceBridge (..))
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   ( VulkanHandover (..)
@@ -218,7 +237,11 @@ threadsOf rig wanted = map fst . filter (wanted . snd) . reverse <$> readTVarIO 
 
 -- | Wait until this event has happened.
 awaitEvent ∷ Rig → Event → IO ()
-awaitEvent rig event = atomically (readTVar (rigJournal rig) >>= check . elem event . map snd)
+awaitEvent rig event = atomically (journalHas rig event >>= check)
+
+-- | Whether this event has happened.
+journalHas ∷ Rig → Event → STM Bool
+journalHas rig event = elem event . map snd <$> readTVar (rigJournal rig)
 
 -- ---------------------------------------------------------------------------
 -- The native layer
@@ -243,6 +266,12 @@ data Scripted
     -- ^ Raises 'StandInLoss', which this layer classifies as device loss.
   | HoldsUntil !(TVar Bool)
     -- ^ Holds, uninterruptibly as a native call does, until released.
+  | ReportsError !ByteString
+    -- ^ Reports one error-severity validation message with this text into the
+    -- session's capture from inside the call, as a layer does, then succeeds.
+  | ReportsWarning !ByteString
+    -- ^ The same at warning severity, which is a diagnostic and never a
+    -- failure.
 
 newtype StandInFailure = StandInFailure Text
   deriving (Eq, Show)
@@ -262,7 +291,45 @@ data Native = Native
   , nativeCurrentExtent ∷ !(TVar (Maybe SurfaceExtent))
     -- ^ The concrete current extent every surface reports, or 'Nothing' for
     -- the application to choose.
+  , nativeCapture ∷ !(TVar (Maybe DiagnosticCapture))
+    -- ^ The session's capture, once the owner's startup has asked the layer
+    -- anything.
+  , nativeHeld ∷ !(TVar (Set Step))
+    -- ^ The steps a 'HoldsUntil' script is holding a call at now.
   }
+
+-- | Wait until a call is holding at this step.
+awaitHeld ∷ Rig → Step → IO ()
+awaitHeld rig at = atomically (readTVar (nativeHeld (rigNative rig)) >>= check . Set.member at)
+
+-- | Report one error-severity message into the session's capture now, from
+-- the calling thread, as a layer reporting from inside some other call would.
+reportErrorNow ∷ Rig → ByteString → IO ()
+reportErrorNow rig text = sessionCapture rig >>= \capture → report capture severityError text
+
+-- | The same at warning severity; the worker is asked to drain at once.
+reportWarningNow ∷ Rig → ByteString → IO ()
+reportWarningNow rig text = sessionCapture rig >>= \capture → report capture severityWarning text >> requestDrain capture
+
+-- | Claim the capture's first-failure cell for its sink, as the worker does the
+-- moment a delivery's failure returns to it, and publish nothing: the capture
+-- is left where a worker paused between its claim and its publication.
+claimSinkFirst ∷ Rig → IO ()
+claimSinkFirst rig = sessionCapture rig >>= \capture → void (noteSinkFailure (captureUserData capture))
+
+-- The storage's own entry, which the capture's worker calls; linked in with the
+-- diagnostics package's C sources.
+foreign import ccall unsafe "hetoimasia_capture_note_sink_failure"
+  noteSinkFailure ∷ Ptr () → IO CInt
+
+-- | Wait until the capture has recorded its sink's failure.
+awaitSinkRecorded ∷ Rig → IO ()
+awaitSinkRecorded rig = sessionCapture rig >>= \capture → atomically (captureSinkFailure capture >>= check . isJust)
+
+sessionCapture ∷ Rig → IO DiagnosticCapture
+sessionCapture rig =
+  readTVarIO (nativeCapture (rigNative rig))
+    >>= maybe (throwIO (StandInFailure "the session has no capture yet")) pure
 
 -- | Have every surface report this concrete current extent from now on, or
 -- leave the extent to the application.
@@ -276,11 +343,16 @@ scriptNative rig at scripted = atomically (modifyTVar' (nativeScript (rigNative 
 declareUnsupported ∷ Rig → Word64 → IO ()
 declareUnsupported rig surface = atomically (modifyTVar' (nativeUnsupported (rigNative rig)) (Set.insert surface))
 
-step ∷ Journal → Native → Step → Event → IO ()
-step events native at event = do
+stepWith ∷ DiagnosticCapture → Journal → Native → Step → Event → IO ()
+stepWith capture events native at event = do
   scripted ← Map.lookup at <$> readTVarIO (nativeScript native)
   case scripted of
-    Just (HoldsUntil gate) → uninterruptibleMask_ (atomically (readTVar gate >>= check))
+    Just (HoldsUntil gate) → uninterruptibleMask_ $ do
+      atomically (modifyTVar' (nativeHeld native) (Set.insert at))
+      atomically (readTVar gate >>= check)
+      atomically (modifyTVar' (nativeHeld native) (Set.delete at))
+    Just (ReportsError text) → report capture severityError text
+    Just (ReportsWarning text) → report capture severityWarning text
     _ → pure ()
   record events event
   case scripted of
@@ -288,13 +360,47 @@ step events native at event = do
     Just Loses → throwIO (StandInLoss (Text.pack (show at)))
     _ → pure ()
 
+-- | The message identifier every report the stand-in injects carries, so an
+-- example can tell it from anything else the capture received.
+injectedMessageId ∷ ByteString
+injectedMessageId = "VUID-hetoimasia-stand-in-injected"
+
+severityError, severityWarning ∷ Word32
+severityError = 0x1000
+severityWarning = 0x100
+
+foreign import ccall "dynamic"
+  callMessenger ∷ FunPtr (Word32 → Word32 → Ptr () → Ptr () → IO Word32) → Word32 → Word32 → Ptr () → Ptr () → IO Word32
+
+-- | Report one validation message into the capture through the production C
+-- callback, as the validation layer does from inside a Vulkan call: the
+-- record is copied, and an error latched, exactly as a native report is.
+report ∷ DiagnosticCapture → Word32 → ByteString → IO ()
+report capture severity text =
+  withCStruct payload $ \pointer →
+    void (callMessenger (castFunPtr captureMessengerCallback) severity 0x2 (castPtr pointer) (captureUserData capture))
+  where
+    payload =
+      DebugUtilsMessengerCallbackDataEXT
+        { next = ()
+        , flags = zero
+        , messageIdName = Just injectedMessageId
+        , messageIdNumber = 0
+        , message = Just text
+        , queueLabels = Vector.empty
+        , cmdBufLabels = Vector.empty
+        , objects = Vector.empty
+        }
+        ∷ DebugUtilsMessengerCallbackDataEXT '[]
+
 -- | The stand-in native layer. The instance is 1, the messenger 2 and the
 -- device 3; one device, one queue family, presenting to every surface but the
 -- ones declared unsupported.
 nativeLayer ∷ Journal → Native → DiagnosticCapture → RootOps Quiesced Int Int Text Int
 nativeLayer events native capture =
   RootOps
-    { opsInstanceOffer =
+    { opsInstanceOffer = do
+        atomically (writeTVar (nativeCapture native) (Just capture))
         pure
           InstanceOffer
             { offerLoaderVersion = packApiVersion 1 3 296
@@ -369,6 +475,7 @@ nativeLayer events native capture =
     }
   where
     fresh = atomically (stateTVar (nativeHandles native) (\next → (next, next + 1)))
+    step = stepWith capture
 
 -- ---------------------------------------------------------------------------
 -- The surface bridge
@@ -386,6 +493,9 @@ data SurfaceScript
     -- ^ Its destruction raises.
   | DestroyHolds !(TVar Bool)
     -- ^ Its destruction holds until released.
+  | CreateReusing !Word64
+    -- ^ Created with the handle an earlier surface had, as a driver may reuse
+    -- one: a distinct obligation under the same handle.
 
 data Lease = Lease
   { leaseAdmitting ∷ !(TVar Bool)
@@ -394,7 +504,10 @@ data Lease = Lease
   }
 
 data Obligation = Obligation
-  { obligationSurface ∷ !Word64
+  { obligationKey ∷ !Word64
+    -- ^ Its number in creation order, which scripts it; unique.
+  , obligationSurface ∷ !Word64
+    -- ^ Its handle.
   , obligationTarget ∷ !AttachmentId
   , obligationState ∷ !(TVar ObligationState)
   }
@@ -458,6 +571,7 @@ surfaceBridge events bridge =
     , bridgeObligations = \lease → Map.elems <$> readTVar (leaseOwed lease)
     , bridgeObligationAttachment = obligationTarget
     , bridgeObligationHandle = obligationSurface
+    , bridgeSameObligation = \left right → obligationKey left == obligationKey right
     , bridgeDischarge = discharge
     , bridgeRelease = \lease → writeTVar (leaseAdmitting lease) False >> standing lease
     }
@@ -483,8 +597,9 @@ surfaceBridge events bridge =
                 atomically (modifyTVar' (leaseInFlight lease) (subtract 1))
                 pure (CreationFailed "scripted")
               else do
-                record events (SurfaceCreated surface)
-                obligation ← Obligation surface attachment <$> newTVarIO Owed
+                let handle = last (surface : [reused | CreateReusing reused ← scripted])
+                record events (SurfaceCreated handle)
+                obligation ← Obligation surface handle attachment <$> newTVarIO Owed
                 atomically $ do
                   modifyTVar' (leaseOwed lease) (Map.insert surface obligation)
                   modifyTVar' (leaseInFlight lease) (subtract 1)
@@ -501,9 +616,9 @@ surfaceBridge events bridge =
       if not claimed
         then case stateNow of
           Gone → pure DischargeDone
-          _ → uncertain "an earlier destruction did not complete"
+          _ → either DischargeStillUncertain (\() → DischargeDone) <$> tryWithContext (throwIO (StandInFailure "an earlier destruction did not complete"))
         else do
-          scripted ← scriptsFor (obligationSurface obligation)
+          scripted ← scriptsFor (obligationKey obligation)
           sequence_
             [ record events (SurfaceDestroyStarted (obligationSurface obligation)) >> atomically (readTVar gate >>= check)
             | DestroyHolds gate ← scripted
@@ -517,7 +632,7 @@ surfaceBridge events bridge =
               atomically $ do
                 writeTVar (obligationState obligation) Gone
                 leases ← readTVar (bridgeLeases bridge)
-                mapM_ (\lease → modifyTVar' (leaseOwed lease) (Map.delete (obligationSurface obligation))) leases
+                mapM_ (\lease → modifyTVar' (leaseOwed lease) (Map.delete (obligationKey obligation))) leases
               pure DischargeDone
     uncertain reason = either DischargeUncertain (\() → DischargeDone) <$> tryWithContext (throwIO (StandInFailure reason))
     isCreateFails = \case
@@ -551,7 +666,21 @@ data Rig = Rig
     -- refuses a handover's announcement.
   , rigFramebuffer ∷ !(TVar (Int, Int))
     -- ^ What every window's framebuffer size query answers.
+  , rigCapture ∷ !CaptureConfig
+    -- ^ The session's capture limits, when an example narrows them.
+  , rigSinkFailing ∷ !(TVar Bool)
+    -- ^ Whether the capture's sink raises on the records it is given.
+  , rigSinkFailed ∷ !(TVar Bool)
+    -- ^ Whether it has raised.
   }
+
+-- | Make the capture's sink raise on every record it is given from now on.
+failingSink ∷ Rig → IO ()
+failingSink rig = atomically (writeTVar (rigSinkFailing rig) True)
+
+-- | Whether the capture's sink has raised.
+sinkHasFailed ∷ Rig → STM Bool
+sinkHasFailed = readTVar . rigSinkFailed
 
 -- | A rig over one hidden window.
 newRig ∷ IO Rig
@@ -630,10 +759,12 @@ newRigVisible visible windows = do
         , scriptFramebufferSize = \_ → readTVarIO framebuffer
         , scriptWindowAttribute = \attribute _ → pure (visible && attribute == VisibleAttribute)
         }
-  native ← Native <$> newTVarIO Map.empty <*> newTVarIO Set.empty <*> newTVarIO 500 <*> newTVarIO Nothing
+  native ← Native <$> newTVarIO Map.empty <*> newTVarIO Set.empty <*> newTVarIO 500 <*> newTVarIO Nothing <*> newTVarIO Nothing <*> newTVarIO Set.empty
   bridge ← Bridge <$> newTVarIO Map.empty <*> newTVarIO Nothing <*> newTVarIO 100 <*> newTVarIO []
   verdict ← newTVarIO Nothing
   refusalHook ← newTVarIO (\_ → pure ())
+  sinkFailing ← newTVarIO False
+  sinkFailed ← newTVarIO False
   pure
     Rig
       { rigSeam = seam
@@ -646,6 +777,9 @@ newRigVisible visible windows = do
       , rigPortCapacity = Nothing
       , rigAfterRefusal = refusalHook
       , rigFramebuffer = framebuffer
+      , rigCapture = defaultCaptureConfig
+      , rigSinkFailing = sinkFailing
+      , rigSinkFailed = sinkFailed
       }
 
 -- | Run a whole Vulkan graphics host under the application runner, on a bound
@@ -662,15 +796,17 @@ runRigHere rig body = do
   integration ← seamIntegration (rigSeam rig) defaultIntegrationScript
   scene ← prepare ()
   budgets ← either (throwIO . StandInFailure . Text.pack . show) pure (validateBudgets defaultBudgetRequest)
-  let config = vulkanHostConfig (rigHostConfig rig) defaultCaptureConfig budgets scene
+  let config = vulkanHostConfig (rigHostConfig rig) (rigCapture rig) budgets scene
   runGraphicsOwnerApplication
     (withLoggingLifetime quietLogger)
     "vulkan-controller-example"
     ( \_ use → do
-        (result, verdict) ←
+        -- The verdict is kept whichever way the host ends: a failed one
+        -- carries it on its failure.
+        (result, verdict) ← keepVerdict $
           withVulkanOwnerHostHooked
             (ControllerHooks (\attachment → readTVarIO (rigAfterRefusal rig) >>= ($ attachment)))
-            quietLogger
+            (captureLogger rig)
             (nativeLayer (rigJournal rig) (rigNative rig))
             instanceAddress
             (surfaceBridge (rigJournal rig) (rigBridge rig))
@@ -684,6 +820,14 @@ runRigHere rig body = do
     vulkanWindowHost
     (\host _ → pure host)
     body
+  where
+    keepVerdict ∷ IO (b, DiagnosticVerdict) → IO (b, DiagnosticVerdict)
+    keepVerdict action =
+      tryWithContext action >>= \case
+        Right answer → pure answer
+        Left failure@(ExceptionWithContext context _) → do
+          atomically (writeTVar (rigVerdict rig) (diagnosticVerdictInContext context))
+          rethrowIO (failure ∷ ExceptionWithContext SomeException)
 
 -- | The stand-in instance's "handle", a pointer the stand-in bridge never
 -- dereferences.
@@ -692,6 +836,15 @@ instanceAddress handle = nullPtr `plusPtr` handle
 
 quietLogger ∷ Logger
 quietLogger = mkLoggerWith defaultLogFilter systemMetadata (callbackSink (\_ → pure ()))
+
+-- | The capture's logger: quiet, until the example makes its sink fail.
+captureLogger ∷ Rig → Logger
+captureLogger rig =
+  mkLoggerWith defaultLogFilter systemMetadata . callbackSink $ \_ → do
+    failing ← readTVarIO (rigSinkFailing rig)
+    when failing $ do
+      atomically (writeTVar (rigSinkFailed rig) True)
+      throwIO (StandInFailure "the diagnostic sink failed")
 
 -- | Run owner turns on the main thread until the condition holds: an
 -- attachment retires on a turn, when the main thread folds what the owner

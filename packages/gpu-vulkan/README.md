@@ -35,7 +35,8 @@ permanent rather than a staging step:
   swapchain generations above them, VK-11's managed resources, scoped
   recorder and audited `unsafe` recording subset above those, and VK-12's and
   VK-13's frames — acquisition, submission, presentation and safe abandonment,
-  with presentation retired on its present fences — above the recording. It is listed
+  with presentation retired on its present fences — above the recording, and
+  VK-15's terminal latch and device-loss teardown across all of them. It is listed
   only in `cabal.project.vulkan`, with its local dependency closure, so
   CPU-only and ordinary project selection both exclude it, and only
   [`tools/vulkan/run.sh`](../../tools/vulkan/run.sh) builds it. Neither the model nor the

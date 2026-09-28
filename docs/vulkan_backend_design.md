@@ -1669,6 +1669,11 @@ be presented by an integration test as complete, clean validation evidence.
 D-20 requires error-severity reports to stop ordinary graphics work at safe
 owner boundaries; warnings remain diagnostics. Inspect the error latch during
 initialization, frame operations and teardown independently of the log worker.
+As delivered by VK-15 (#231), initialization and frame operations inspect it at
+the owner's checkpoints; teardown inspects it through the verdict that follows
+the last callback rather than through a checkpoint, because protected
+retirement must not re-enter a checkpoint that would only rethrow the latched
+failure ([gpu_backend.md](gpu_backend.md#terminal-failure)).
 [The Vulkan callback contract](https://docs.vulkan.org/refpages/latest/refpages/source/PFN_vkDebugUtilsMessengerCallbackEXT.html)
 forbids Vulkan calls from the callback.
 

@@ -24,6 +24,12 @@
 --   present fences, a resized window's old generation retired only on that
 --   evidence, the first window closed while the second keeps presenting, and
 --   the session retired with every fence observed (#227);
+-- * @vk15-validation-stop@ — VK-15's validation error during rendering,
+--   stopping the session at the next checkpoint and tearing it down with the
+--   error as its primary failure (#231);
+-- * @vk15-retention@ — VK-15's retained unverified resource, reported rather
+--   than released, ending by process termination rather than orderly cleanup
+--   (#231);
 -- * @synchronization-hazard@ — the negative control that proves
 --   synchronization validation active ("Test.GPU.Vulkan.Native.Hazard");
 -- * @debug-names@ — #250's provoked validation report on a named managed
@@ -59,7 +65,8 @@ import Data.Time.Clock (diffUTCTime, getCurrentTime)
 import System.Environment (getExecutablePath, lookupEnv)
 import System.Exit (ExitCode (..), exitWith)
 import System.FilePath ((</>))
-import System.IO (hPutStrLn, stderr)
+import Foreign.C.Types (CInt (..))
+import System.IO (hFlush, hPutStrLn, stderr, stdout)
 import System.Process (readProcessWithExitCode)
 import Test.Hspec (Spec, describe, expectationFailure, it)
 import Test.Hspec.Runner (Config (configFailOnEmpty), defaultConfig, evalSpec, runSpecForest, specResultSuccess)
@@ -72,6 +79,7 @@ import qualified Test.GPU.Vulkan.Native.Hazard as Hazard
 import qualified Test.GPU.Vulkan.Native.Naming as Naming
 import qualified Test.GPU.Vulkan.Native.Presentation as Presentation
 import qualified Test.GPU.Vulkan.Native.Recording as Recording
+import qualified Test.GPU.Vulkan.Native.Terminal as Terminal
 import qualified Test.Vulkan.Proof.Bridge as Bridge
 import qualified Test.Vulkan.Proof.BridgeSpec as BridgeSpec
 import qualified Test.Vulkan.Proof.Diagnostics as Diagnostics
@@ -99,57 +107,76 @@ data ChildRun = ChildRun
 data Scenario = Scenario
   { scenarioName ∷ String
   , scenarioTitle ∷ String
-  , scenarioRun ∷ Consent → Journal → IO (Spec, Bool → [Text] → Text)
+  , scenarioRun ∷ Consent → Journal → Conclude → IO (Spec, Bool → [Text] → Text)
     -- ^ The native procedure, run to completion and torn down before it
     -- returns; then the examples that assert over what it saw, and the record
-    -- that states their verdict.
+    -- that states their verdict. A procedure whose point is a lifetime that
+    -- cannot end hands those to the 'Conclude' instead, which never returns.
   }
+
+-- | Assert a scenario's examples, retain its record and end the process with
+-- the verdict, from any thread and without unwinding anything: #220's
+-- destructive boundary, for a case whose session deliberately retains what it
+-- could not verify and therefore never returns.
+type Conclude = (Spec, Bool → [Text] → Text) → IO ()
 
 scenarios ∷ [Scenario]
 scenarios =
   [ Scenario
       "vk2-compatibility"
       "proves the VK-2 compatibility profile, presentation completion, safe abandonment and capture"
-      $ \consent journal → do
+      $ \consent journal _ → do
         outcome ← runProof journal consent
         pure (Proof.spec outcome, \passed transcript → renderRecord "The VK-2 native Vulkan compatibility record" invocation transcript outcome passed)
-  , Scenario "vk6-capture" "proves VK-6's C-only validation capture on an instance of its own" $ \_ journal → do
+  , Scenario "vk6-capture" "proves VK-6's C-only validation capture on an instance of its own" $ \_ journal _ → do
       outcome ← Diagnostics.runDiagnostics journal
       pure (DiagnosticsSpec.spec outcome, section "The VK-6 validation capture record" (diagnosticsSection outcome))
-  , Scenario "vk5-bridge" "proves VK-5's loader-aware surface bridge in a session of its own" $ \_ journal → do
+  , Scenario "vk5-bridge" "proves VK-5's loader-aware surface bridge in a session of its own" $ \_ journal _ → do
       outcome ← Bridge.runBridge journal
       pure (BridgeSpec.spec outcome, section "The VK-5 surface bridge record" (bridgeSection outcome))
-  , Scenario "vk7-roots" "proves VK-7's roots under the graphics owner, through their destruction at the host's exit" $ \_ journal → do
+  , Scenario "vk7-roots" "proves VK-7's roots under the graphics owner, through their destruction at the host's exit" $ \_ journal _ → do
       outcome ← Roots.runRoots journal
       pure (RootsSpec.spec outcome, section "The VK-7 Vulkan roots record" (rootsSection outcome))
   , Scenario
       "vk11-recording"
       "records and discards a triangle batch through VK-11's managed resources, with validation reporting nothing"
-      $ \_ journal → do
+      $ \_ journal _ → do
         outcome ← Recording.runRecording journal
         pure (Recording.spec outcome, section "The VK-11 managed recording record" (Recording.recordingSection outcome))
   , Scenario
       "vk12-frames"
       "acquires, submits and awaits a triangle batch with its capture, and returns images without presenting, with validation reporting nothing"
-      $ \_ journal → do
+      $ \_ journal _ → do
         outcome ← Frames.runFrames journal
         pure (Frames.spec outcome, section "The VK-12 frames record" (Frames.framesSection outcome))
   , Scenario
       "vk13-presentation"
       "presents to two windows on verified present fences, retires a resized generation and the first window on that evidence, with validation reporting nothing"
-      $ \_ journal → do
+      $ \_ journal _ → do
         outcome ← Presentation.runPresentation journal
         pure (Presentation.spec outcome, section "The VK-13 presentation record" (Presentation.presentationSection outcome))
   , Scenario
+      "vk15-validation-stop"
+      "stops rendering at the checkpoint after an injected validation error, tearing down under the ordinary rules with the error as the primary and the final callbacks in the verdict"
+      $ \_ journal _ → do
+        outcome ← Terminal.runValidationStop journal
+        pure (Terminal.validationSpec outcome, section "The VK-15 validation stop record" (Terminal.validationSection outcome))
+  , Scenario
+      "vk15-retention"
+      "reports a deliberately retained unverified generation and its parents rather than releasing them, and ends by process termination"
+      $ \_ journal conclude →
+        Terminal.runRetention journal $ \outcome →
+          conclude (Terminal.retentionSpec outcome, section "The VK-15 retention record" (Terminal.retentionSection outcome))
+  , Scenario
       "synchronization-hazard"
       "observes a deliberate synchronization hazard, proving synchronization validation active"
-      $ \_ journal → do
+      $ \_ journal _ → do
         outcome ← Hazard.runHazard journal
         pure (Hazard.spec outcome, section "The synchronization validation control record" (Hazard.hazardSection outcome))
   , Scenario
       "debug-names"
       "carries a provoked validation report's named managed resource, and its batch's label, into the capture"
-      $ \_ journal → do
+      $ \_ journal _ → do
         outcome ← Naming.runNaming journal
         pure (Naming.spec outcome, section "The #250 debug names and labels record" (Naming.namingSection outcome))
   ]
@@ -194,15 +221,28 @@ runScenario refusedOrGranted name = case refusedOrGranted of
           hPutStrLn stderr ("vulkan-native-tests " <> name <> ": " <> Text.unpack reason)
           exitWith (ExitFailure 1)
       journal ← newJournal
-      (examples, record) ← scenarioRun scenario consent journal
-      passed ← runCompleteSpec examples
-      transcript ← entries journal
-      retain (name <> ".md") (record passed transcript)
-      if passed
-        then putStrLn ("vulkan-native-tests " <> name <> ": every check passed")
-        else do
-          putStrLn ("vulkan-native-tests " <> name <> ": a check failed")
-          exitWith (ExitFailure 1)
+      let finish (examples, record) = do
+            passed ← runCompleteSpec examples
+            transcript ← entries journal
+            retain (name <> ".md") (record passed transcript)
+            putStrLn ("vulkan-native-tests " <> name <> ": " <> if passed then "every check passed" else "a check failed")
+            pure passed
+          -- Nothing is unwound: the session this ends is one that cannot end
+          -- itself, and the operating system reclaims what it retained.
+          terminate outcome = do
+            passed ← finish outcome
+            hFlush stdout
+            hFlush stderr
+            terminateProcess (if passed then 0 else 1)
+      passed ← scenarioRun scenario consent journal terminate >>= finish
+      unless passed (exitWith (ExitFailure 1))
+
+-- | End the process at once with this status, running no finalizer and
+-- unwinding nothing.
+foreign import ccall unsafe "_exit" c_exit ∷ CInt → IO ()
+
+terminateProcess ∷ CInt → IO a
+terminateProcess status = c_exit status >> error "_exit returned"
 
 -- | Run the whole spec, and only ever the whole spec, as the proof did.
 --

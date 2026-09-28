@@ -40,6 +40,17 @@ closing windows retire incrementally from that evidence, with no device-wide
 idle. D-9, D-15, D-18 and D-23, P-2, P-8, P-14 and P-15. See
 [Presentation and retirement](#presentation-and-retirement).
 
+VK-15 ([#231](https://github.com/coghex/hetoimasia/issues/231)) adds
+**terminal failure**: one latch whose first failure — a device loss, a
+validation error or sink failure the capture reports at a checkpoint, an
+uncertain effect, a failed cleanup, or a required target's exhausted recovery
+— is the session's primary, refuses every later rendering, acquisition,
+submission, presentation and handover naming it, and is reported with what
+teardown found beside it; and teardown after device loss under the
+specification's device-loss rules, with no fence asked or waited on and none
+recorded as signalled. D-17, D-19, D-20, D-22 and D-33, P-2, P-5, P-11 and P-14.
+See [Terminal failure](#terminal-failure).
+
 [#250](https://github.com/coghex/hetoimasia/issues/250) (VKR-2) adds **debug
 names and recording labels**: every native object the backend creates is named
 from identities it already holds — the debug messenger excepted — and every
@@ -56,8 +67,9 @@ deferred, described below, and the generations' own: a settling resize, a
 deferred recovery attempt, and the model's schedule for a retired generation
 still held. Composing the frames into the owner's loop is VK-16's. Acting on a
 target policy's exhaustion, or on an out-of-date or surface-lost result, is
-VK-14's, and completing device-loss teardown across submitted work and pending
-presentations is VK-15's.
+VK-14's. A required target's exhaustion fails the session through the terminal
+latch, and device-loss teardown across submitted work and pending
+presentations is the frames' own ([Terminal failure](#terminal-failure)).
 
 ## Packages
 
@@ -101,8 +113,8 @@ recording's implementation under
 public recording module re-exports as it always exported them (see
 [How the recording is built](#how-the-recording-is-built)); and the frames'
 implementation under `Hetoimasia.GPU.Vulkan.Native.Internal.Frames`: `Layer`,
-`State`, `Acquisition`, `Submission` and `Abandonment` (see
-[How the frames are built](#how-the-frames-are-built)).
+`State`, `Acquisition`, `Submission`, `Presentation`, `Abandonment`, `Loss`
+and `Progress` (see [How the frames are built](#how-the-frames-are-built)).
 
 ## The ownership graph
 
@@ -903,7 +915,8 @@ public surface is unchanged: every transition used here — `reserveFrame`,
 | `closeTargetFrames target` | Skips every acquired frame of a target and closes every submitted one | What each frame answered |
 | `progressFrames now` | The owner's bounded step: observes pending fences — submission, present and cleanup — makes the cleanup submissions closed frames owe, and returns images | A `Progress`: completed submissions, retired presentations, settled frames, cleanups made, fences still pending |
 | `awaitFrames now timeout` | A finite protected-drain wait — at most `drainWaitLimit`, 10 ms — on one pending fence, then `progressFrames` | The step's `Progress`; the wait itself is never evidence |
-| `retireTargetFrames target` | Destroys a target's slot synchronization and presentation pool once nothing of it is live, presented and unretired, or pending | Returns, or raises `FramesRetained` naming what remains |
+| `retireTargetFrames target` | Destroys a target's slot synchronization and presentation pool once nothing of it is live, presented and unretired, or pending — after the device's loss, once the loss has released them, whatever they were owed | Returns, or raises `FramesRetained` naming what remains |
+| `releaseFramesToDeviceLoss` | After the device's loss: skips every acquired frame without a cleanup submission, and lets go of every submission, presentation and frame the lost device alone could have discharged ([Teardown after device loss](#teardown-after-device-loss)) | The model's `DeviceLossRelease`; `RefusedIllegal` before any loss |
 
 Frame capacity is the model's: two slots per target by default, one supported
 (D-16). An acquisition refused for want of a slot, a presentation-pool record
@@ -933,10 +946,13 @@ presented, waits on it.
 
 ### Acquisition
 
-The target must be this session's (`ForeignIdentity`, `StaleIdentity` or
-`UnknownIdentity` otherwise — misuse, never pending), and admitted: a suspended
-target answers `AcquisitionSuspended`, a retiring one `AcquisitionClosing`, and
-an unavailable one or a failed session `AcquisitionUnavailable`. Its generations
+A failed session refuses the acquisition before anything else, naming its
+primary failure (`RefusedSessionFailed`; [Checkpoints and
+refusals](#checkpoints-and-refusals)). The target must be this session's
+(`ForeignIdentity`, `StaleIdentity` or `UnknownIdentity` otherwise — misuse,
+never pending), and admitted: a suspended target answers
+`AcquisitionSuspended`, a retiring one `AcquisitionClosing`, and an unavailable
+one `AcquisitionUnavailable`. Its generations
 must be presenting from an active generation: a target still constructing,
 settling a resize, backpressured or waiting to recover answers
 `AcquisitionPending PendingGeneration`; a spent recovery or an unsupported
@@ -1079,7 +1095,7 @@ is never rolled back.
 ### How the frames are built
 
 `Hetoimasia.GPU.Vulkan.Native.Frames` is the entry point and holds no code of
-its own: it re-exports what seven private modules under
+its own: it re-exports what eight private modules under
 `Hetoimasia.GPU.Vulkan.Native.Internal.Frames` implement, as the recording's
 entry point does.
 
@@ -1091,7 +1107,8 @@ entry point does.
 | `Submission` | `submitFrames`. | `Layer`, `State`, the recording's `Batches` |
 | `Presentation` | `presentFrame` and `classifyPresent`. | `Layer`, `State` |
 | `Abandonment` | `skipFrame`, `closeUnpresentedFrame`, `closeTargetFrames`, and the cleanup submission `Progress` also makes. | `Layer`, `State`, the recording's `Batches` |
-| `Progress` | `progressFrames`, `awaitFrames` and `retireTargetFrames`. | `Layer`, `State`, `Abandonment` |
+| `Loss` | `releaseFramesToDeviceLoss`. | `State`, `Abandonment` |
+| `Progress` | `progressFrames`, `awaitFrames` and `retireTargetFrames`. | `Layer`, `State`, `Abandonment`, `Loss` |
 
 `Frames.Vulkan` imports the public module. Every call it makes is the binding's
 own and `safe`: submission, acquisition, presentation, a fence's status, a
@@ -1119,8 +1136,9 @@ supplies the native evidence.
 `presentFrame frame` presents one submitted frame's image, one target image per
 native request, to the swapchain it was acquired from, on the session's one
 graphics queue. It refuses before any native call: another thread; a failed
-session, which makes no new native effect — the frame's exit is its close; a
-frame this owner did not acquire, or that is not submitted, already presented
+session, naming its primary failure (`RefusedSessionFailed`), which makes no
+new native effect — the frame's exit is its close; a frame this owner did not
+acquire, or that is not submitted, already presented
 or being abandoned (`WrongPhase FrameIdentity`); anything the model's
 `enqueuePresentation` would refuse, asked of a copy it then discards; and a pool
 record not bound to the frame, whose render-finished semaphore is not owed the
@@ -1277,24 +1295,203 @@ only independent evidence ends that wait. The instance is destroyed only once
 the surface bridge's lease is releasable. No timeout, cancellation or cleanup
 failure is permission (D-33, LIFE D-4).
 
-## Device loss
+## Terminal failure
 
-A native call the layer classifies as device loss — `VK_ERROR_DEVICE_LOST`,
-and nothing else — latches the loss, closes the roots' admission and fails the
-model's session with `DeviceLost`, all in one transaction, and raises
-`GraphicsDeviceLost` in the call's place. Raised from the owner's construction
-it is the owner's first latched failure, which closes the owner's admission at
-once and reaches the application's checkpoints through `superviseGraphicsOwner`
-while retirement is still running; a later progress step raises it too. The
-retirement that follows is the ordinary child-before-parent one — the
-controller submits nothing, and Vulkan permits destroying a lost device's
-objects without waiting for work — and nothing is recreated or replayed. The
-frames treat a loss raised by a submission or a presentation as an unknown
-effect, which retains what it concerns; completing teardown across submitted
-work and pending presentations is VK-15's. A cleanup failure
-during it stays behind the loss. An outcome that is unknown rather than lost is
-not loss: it is an ordinary failure, and a destruction whose outcome is unknown
-retains its parents.
+VK-15 ([#231](https://github.com/coghex/hetoimasia/issues/231)) is the
+session's terminal failure and the teardown that follows it: D-17's device
+loss, D-19's and P-11's sink failure, D-20's validation error, D-22's required
+target, and D-33's all-exit drain, over P-2's ownership table and P-5's
+dependency order, with P-14's rule that a target's designation never supplies
+missing safety evidence.
+
+### The latch
+
+The roots keep one terminal latch. Its first failure, from any of these
+sources, is the session's **primary**:
+
+| Source | Latched | As |
+| --- | --- | --- |
+| A queue or device call answered `VK_ERROR_DEVICE_LOST` | By the call's own guard, before the failure propagates | `TerminalDeviceLost`, naming the call |
+| An error-severity validation report | At the next checkpoint, which asks the capture's error latch — set before the report's detail is admitted, whatever the queue, the logger's filter or the sink did | `TerminalValidationError` |
+| The diagnostic sink failed | At the next checkpoint, which asks `captureAlarms` | `TerminalSinkFailed`, a terminal status of its own |
+| A native effect whose outcome is unknown | By the step that observed it: a submission, a presentation, a bookkeeping refusal | `TerminalUncertainEffect` |
+| A cleanup that raised | By the destruction or cleanup that raised: a surface — one created while the lease closed included — a root, a generation, a frame's cleanup submission or release, a slot's or pool record's objects, a managed resource | `TerminalCleanupFailed` |
+| A required target's recovery exhausted | The model escalates it; the next checkpoint, or any read of the latch, takes it | `TerminalRequiredTarget` |
+
+Latching the primary is one transaction: it closes the roots' admission and
+fails the model's session with the matching cause (`DiagnosticSinkFailed` for
+a sink). Every cleanup failure is latched with its subject and what raised —
+the surface, root, generation, frame, slot, pool record, batch or resource —
+so several failures of one pass are each accounted for rather than collapsed
+into one. The controller's surface discharges — an unannounced or rejected
+attachment's, a retired target's remaining ones, the orphans the owner's
+retirement finds and the late ones its destruction finds — latch each
+destruction that raised by its surface's handle and attachment. A later pass
+that finds the same obligation still owed is refused by the bridge as
+`DischargeStillUncertain`, which is not latched again; what is recognised is
+the obligation's own identity, never the handle, which a later surface may
+reuse. A failure after it never displaces it: it joins the latch's evidence
+as `LaterFailure`, oldest first, the first 64 kept and the rest counted. A
+failure the model recorded by itself before anything was latched is the primary
+it stands for, and one that describes the same failure as the model's cause —
+an uncertain submission the model recorded and the step that says what it was —
+is one failure, with the step's detail.
+
+The first failure is first by one ordering point shared by every source: the
+diagnostic capture's first-failure cell. An error report claims it with a
+compare-and-swap before it sets the error latch, and the capture's worker
+claims it for its sink before it publishes the failure; a failure of the
+owner's own claims it too (`claimCaptureOrder`), inside the transaction that
+records it, wherever it comes from — a native call that answered the device's
+loss, a cleanup that failed, an effect whose outcome is unknown, and any
+transition the model makes that fails a running session by itself, such as a
+required target's exhausted recovery (`stateRootsModel` checks every transition
+for that before committing it, and only the owner changes the model). When a
+validation error or sink failure claimed the cell first, it is latched in that
+same transaction ahead of the owner's failure, which joins the evidence; a
+transition that would have failed the session is taken on the failed session
+instead, so a required target's recovery goes no further. A sink failure whose
+reason its worker has not yet published leaves the transaction waiting, and the
+worker's publication, which follows its claim at once, wakes it. The claim
+answers the same however often a transaction runs it. Between the owner's
+claim and the commit of the transaction that records its failure, a
+checkpoint on another thread — a handover's, say — sees the claim
+(`CaptureOwnerClaimed`, `AlarmOwnerClaimed`) with nothing latched and answers
+`CheckpointPending`, latching nothing, so a later diagnostic failure cannot
+take the owner's place. Roots given only a list
+of alarms (`watchRootsDiagnostics`, as headless examples use) latch them at
+checkpoints and order nothing; the controller installs the capture's order
+(`watchRootsDiagnosticsOrdered`). The
+device's loss is also kept apart
+from the primary (`reportDeviceLost`), whenever it is observed: a session that
+a validation error failed first and whose teardown then meets the loss keeps
+the validation error as its primary and switches that teardown to the
+device-loss rules. The model records the loss the same way, with `noteDeviceLoss`,
+beside its first cause. `readVulkanTerminal` reads the whole latch from any
+thread.
+
+### Checkpoints and refusals
+
+A checkpoint asks the capture for its alarms — the controller installs
+`captureAlarms`, the capture's error latch and sink failure, as the roots'
+diagnostic watch — latches them in the order they happened, and answers the
+primary. The capture's C callback and its worker claim one first-failure cell
+with a compare-and-swap before either sets its own latch, so a sink failure
+followed by a validation error before the next checkpoint stays the primary
+with the error beside it, and the other way round, whichever thread got there
+first. A checkpoint that looks after the first failure claimed the cell but
+before it set its own alarm is told only that a failure is pending
+(`CaptureAlarmPending`, `AlarmPending`): it answers `CheckpointPending`,
+latches nothing — neither the capture's alarms nor a failure the model recorded
+by itself, which might otherwise be taken ahead of the diagnostic failure that
+came first — and refuses new work, so the next checkpoint latches them in order
+and admission never reopens in between. It raises nothing, calls nothing native
+and waits for nothing. The owner's ordinary operations pass through one:
+
+- the controller's progress step raises the primary — the loss as
+  `GraphicsDeviceLost`, anything else as `GraphicsSessionFailed` — which ends
+  the owner's run: the owner machinery latches it, closes its admission, and
+  `superviseGraphicsOwner` raises it at the application's checkpoint while
+  retirement is still running; while a failure is pending it does nothing new
+  that round and asks for another within the controller's poll;
+- `recordFrame`, `tryAcquireFrame`, `submitFrames` and `presentFrame` refuse
+  with `RefusedSessionFailed` naming the primary before anything native, or
+  with `RefusedDiagnosticPending` while a failure is pending;
+- `handOverVulkanTarget` answers `VulkanSessionFailed` naming the primary, or
+  `VulkanDiagnosticPending` while a failure is pending, and attaches nothing;
+- the owner's construction of a handed-over target, which a round runs before
+  its step, checks again (`checkpointRootsSettled`: it latches what the
+  capture holds, waiting out a pending alarm) before anything native, and
+  rejects with `RejectedSessionFailed` a target whose session failed after its
+  handover; it checks once more when admission's native calls return, and a
+  target a layer reported against during them is answered as a partial
+  construction, which the owner owns and retires, never as a usable one.
+
+Retirement never passes through one. Closing and skipping frames, the
+progress step's observations, the finite drain wait, and every target's,
+generation's, root's and the owner's retirement keep running, because they run
+precisely because the session has failed. A validation error a layer reports
+from inside one of the owner's own calls is seen at that round's step. A sink
+failure arrives on the diagnostic worker's thread, so the controller asks the
+owner to wake for it (`graphicsWake`) while it is published and not yet
+latched: an owner with no round due takes one at once, and its step latches
+the failure.
+
+### The call that observed the failure
+
+The native effect a failing call had is recorded in the same masked step as
+the call, before anything propagates, even when the call's own device loss
+failed the session in between: an acquisition that raised gives its reservation
+back, a submission that raised is recorded as an uncertain effect — the model
+records a failed call's outcome whenever it happened, and refuses only new
+work — a presentation that raised keeps what the swapchain's `pResults` entry
+says it enqueued, and a presentation or submission that returned keeps its
+obligations. The loss is what the caller sees first: a presentation whose call
+raised the loss while its entry answered out of date or surface lost is
+recorded as enqueued, and then the loss is raised.
+
+### Teardown after device loss
+
+Once the loss is recorded, the specification's device-loss rule governs what
+the lost device could have discharged — its objects may be destroyed without
+waiting for work that may never complete — and nothing else:
+
+- no fence is asked or waited on again: `progressFrames` makes no call, and a
+  step whose own query lost the device asks nothing further; `awaitFrames`
+  waits for nothing;
+- a skipped frame makes no cleanup submission (`StageLost`), and no storage is
+  reset against the lost device: the unsubmitted recording's commands can
+  never execute, so its batch records go with the model's skip — one an
+  earlier reset left uncertain included — and the storage's destruction frees
+  them;
+- `releaseFramesToDeviceLoss` skips every frame still acquired, then has the
+  model release every submission, certain or uncertain, every enqueued
+  presentation, and every frame that had left acquisition
+  (`releaseToDeviceLoss`): their holds end, their pool records are free, each
+  pending fence becomes `FenceLost` and each owed semaphore `SemaphoreLost`.
+  None of it is recorded as completed or retired, no fence is marked signalled,
+  and no recovery cycle is credited;
+- `retireTargetFrames` releases first, then destroys every slot's and pool
+  record's objects whatever they were owed — except one whose destruction
+  already raised, which may already be gone and is destroyed under no rule;
+- the target's generations, whose holds the release ended, then its surface,
+  the device (`"… after its loss"`), the messenger and the instance go child
+  before parent. Nothing waits for the device to go idle, and nothing is
+  recreated or replayed.
+
+A fence wait, a status query or a device wait that answers the loss during
+teardown latches it — as the primary, or beside an earlier one — and settles
+nothing. Before any loss the release is refused: the frames answer
+`RefusedIllegal` and the model `WrongPhase` of the device.
+
+### Teardown under the ordinary rules
+
+After a validation error, a sink failure, a required target's exhaustion, an
+uncertain effect or a failed cleanup, obligations settle on their own evidence,
+as VK-12 and VK-13 settle them, within the drain's finite waits. What cannot be
+verified is retained: an uncertain effect keeps its frame, and with it its
+generation, surface, device and instance (`FramesRetained`,
+`GenerationsRetained`, `TargetGenerationsRemain`, `RootsRetained`); a
+destruction that raised is never attempted again. A gap in the proof's
+destruction evidence for a path blocks that path's release rather than
+authorizing it.
+
+### Evidence and retention
+
+The primary is never displaced. Cleanup failures and later failures join the
+latch's evidence beside it. Validation errors delivered during teardown —
+inside `vkDestroyInstance` too — join the capture's verdict, which follows the
+last callback: retirement asks the latch nothing, so they reach the final
+report through the verdict rather than the latch. A sink failure never
+authorizes a release.
+
+Every retirement the controller runs that could not verify what it owns records
+what it retained in the latch (`RetainedUnverified`) before its failure goes to
+the owner, which keeps its evidence and manufactures no acknowledgement. The
+host then keeps the window, the session and every parent, and waits for
+independent evidence; process termination is the escape, and it is never
+orderly cleanup. Cancellation during the drain, once or repeatedly, follows
+VK-18's D-33 order and releases nothing early.
 
 ## State
 
@@ -1304,6 +1501,8 @@ retains its parents.
 | Target records | The roots | Admission inserts, retirement removes | The owner | Admission until destroyed | Removed only by a destruction that returned |
 | The GPU model | The roots | Admission, retirement, loss | The owner | The session | Never reset |
 | The loss latch | The roots | Set once; any thread reads | Any | The session | Never cleared |
+| The terminal latch | The roots | `latchTerminal` sets the primary once and appends evidence; any thread reads through `readRootsTerminal` | Any, in `STM` | The session | Never cleared; evidence bounded at 64 with the rest counted |
+| The diagnostic watch | The roots | Installed once by the controller; read by every checkpoint | The owner | The session | — |
 | The requested extensions | The controller | Written once by the session's entry | Main | The host | — |
 | The lease | The controller | Written by startup; read by handovers | Owner, main | Startup until destruction | Released before the instance is destroyed |
 | Deposits | The controller | Written by a construction step; taken by the owner's construction or retirement | Main, owner | Attachment until its construction or retirement | Cleared by whole-owner retirement |
@@ -1316,8 +1515,8 @@ retains its parents.
 | Frame storages | The recording | Construction inserts one per target frame slot; disposal removes it | The owner | As its managed record | As its managed record |
 | Batch records | The recording | `recordFrame` inserts; a discard or reset removes one after the invalidation returned | The owner | From admission until invalidated | Kept, explicitly uncertain, when an invalidation raised; never retried |
 | A recorder | Its `recordFrame` | The consumer action | The owner | One consumer action | Closed when the action returns or raises |
-| Slot synchronization | The frames | `Acquisition` creates a slot's three objects and marks its acquisition; `Submission`, `Abandonment` and `Progress` advance each object's state; `Progress` destroys them | The owner | From the slot's first reservation until the target's frames retire | Destroyed once idle; kept, explicitly uncertain, when a call on them raised |
-| Presentation pool | The frames | `Acquisition` creates a record and binds it to a frame; `Submission`, `Presentation`, `Abandonment` and `Progress` advance its semaphore and fence; `Presentation` rebinds it to its presentation; `Progress` frees and destroys it | The owner | From the first reservation that needs it until the target's frames retire | Freed by the retirement or settlement the model recorded; destroyed once free and idle; kept, explicitly uncertain, when a call on it raised |
+| Slot synchronization | The frames | `Acquisition` creates a slot's three objects and marks its acquisition; `Submission`, `Abandonment` and `Progress` advance each object's state; `Loss` marks what was owed lost; `Progress` destroys them | The owner | From the slot's first reservation until the target's frames retire | Destroyed once idle, or after the device's loss whatever they were owed; kept, explicitly uncertain, when a call on them raised, and never destroyed again once a destruction raised |
+| Presentation pool | The frames | `Acquisition` creates a record and binds it to a frame; `Submission`, `Presentation`, `Abandonment` and `Progress` advance its semaphore and fence; `Presentation` rebinds it to its presentation; `Loss` frees what the loss released; `Progress` frees and destroys it | The owner | From the first reservation that needs it until the target's frames retire | Freed by the retirement or settlement the model recorded, or by the device-loss release; destroyed once free and idle; kept, explicitly uncertain, when a call on it raised |
 | Frame records | The frames | `Acquisition` inserts; `Submission`, `Abandonment` and `Progress` advance; `Presentation` removes on presentation and `Progress` on settlement | The owner | From acquisition until presented or until the model records the settlement | Kept, failed or uncertain, when a cleanup, a presentation or its bookkeeping did not complete |
 | Submission records | The frames | `Submission` inserts; `Progress` removes once the fence signalled | The owner | From the native submission until its fence signalled | Removed with the model's completion fact |
 | Presentation records | The frames | `Presentation` inserts; `Progress` removes once the present fence signalled | The owner | From the enqueued presentation until its present fence signalled | Removed with the model's retirement fact; kept, uncertain, when asking the fence raised |
@@ -1493,6 +1692,87 @@ verified fences — withheld while its presentation was pending — its surface
 destroyed and the device kept, while the second keeps presenting before and
 after, and the session then retired with every fence observed.
 
+VK-15's examples, `Terminal failure`, are in `native-tests` over the same
+stand-ins. The frames' stand-in can lose the device at any of its steps, and
+from then on holds the frames to the device-loss rules: destroying a fence or a
+semaphore whatever it was owed is no violation, and asking or waiting on a
+fence, resetting one, acquiring, submitting, presenting or releasing is. They
+cover device loss injected during acquisition — the reservation given back —
+during submission — the effect recorded uncertain — during presentation and
+during idle progress, each refusing further rendering naming the loss and each
+torn down with every pending fence released as lost rather than signalled,
+never asked or waited on again, and destroyed with every slot and pool object,
+the generation, the surface and the device after it; a validation error
+latched as the primary and a teardown wait that then reports the loss, keeping
+the validation error and switching that teardown to the device-loss rules; the
+loss surviving a cleanup failure during teardown, which joins the evidence and
+is never retried; each of two storage destructions that failed in one
+disposal pass named beside the loss; an unsubmitted recording whose pool reset
+reported the loss released without another reset; a presentation whose call
+raised the loss while its entry answered out of date, recorded as enqueued and
+the loss still raised; an uncertain effect with no loss retaining its
+frame, its generation, the surface and the roots through the whole teardown; a
+validation error from the capture's watch refusing the next rendering and
+acquisition with no native call, then settling what was owned under the
+ordinary rules; a pending diagnostic failure refusing rendering and
+acquisition with `RefusedDiagnosticPending`, latching nothing and leaving the
+model running, until the capture's alarms name the sink failure as the primary
+with the error beside it; a sink failure latched as a status of its own,
+authorizing no release, and a sink failure and a validation error after a loss joining the
+evidence behind it; a required target's exhausted recovery failing the
+session and refusing the other target, while an optional target's leaves the
+other rendering; a validation error in the capture before the step that would
+exhaust a required target kept as the primary, with recovery going no further,
+and one that follows the exhaustion kept behind it; a validation error only
+the capture's order knows of, and a sink failure whose reason its worker
+publishes late, each kept as the primary ahead of the exhaustion it preceded;
+a validation error reported during a call that then returns the device's loss
+kept as the primary with the loss beside it; a checkpoint that finds the
+owner's claim unrecorded refusing as pending with nothing latched, and the
+owner's loss then kept as the primary ahead of the later error; and a validation error
+reported inside a submission that then raised with an unknown effect kept as
+the primary, with the uncertain effect beside it. The model's own suite adds `Device loss`: the loss kept beside
+an earlier cause, the release refused before the loss, a submission and a
+presentation released without being completed or retired and their cycle
+dropped uncredited, an uncertain effect retained until the loss, an acquired
+frame left to be skipped first, a second release releasing nothing, and the
+outcome of the call that failed the session recorded while new work is
+refused. `integration-tests` adds `terminal failure`: a validation error a
+stand-in call reports into the session's real capture, through the production C
+callback, latched at the owner's next checkpoint and reaching the application's
+as `GraphicsSessionFailed`, the target it was reported against left unusable
+for the owner to retire, a later handover refused naming it, the
+teardown in order and the verdict carrying the error; the same error latched
+although a full capture dropped its record, since the latch is set before the
+record is admitted; a sink failure latched as
+its own status, with the verdict's consumer unsuccessful and no error latched;
+a sink failure latched although the owner was idle and nothing else was
+published, since its publication wakes the owner; a sink failure that came
+before a validation error, both arriving while the owner was inside a native
+call, kept as the primary with the error beside it; a handover while the
+capture's sink had claimed the order but not published its failure, with an
+error latched after it, refused as `VulkanDiagnosticPending` with nothing
+latched or attached, and the next handover, once the failure is published,
+refused naming the sink failure with the error beside it; a target whose
+surface was still being created when an error arrived, after its handover's
+checkpoint, rejected naming the error when its construction began, with no
+native call made for it;
+an exit whose surface destruction failed, reporting the cleanup failure as its
+primary and what it retained beside it; a surface still in its native call when
+the drain closed the lease, whose destruction then failed, latched as a cleanup
+failure beside the earlier primary with the instance retained; two deferred
+surfaces whose destruction both failed in the owner's orphan pass, each latched
+once by its handle with what its own destruction raised; two distinct
+surfaces that share a handle, both failing, each latched with its own
+attachment; and cancellation
+delivered three times
+while the drain that follows a loss holds, leaving the destruction order and the
+loss as they were. The diagnostics suite adds the sink failure observable while
+the lifetime still captures, `captureAlarms` answering a sink failure and an
+error in the order they happened, either way round, and answering only
+`CaptureAlarmPending` while a sink that claimed the order has not yet published
+its failure and an error has latched after it.
+
 #266's examples, `Generations visibility across the package boundary`, compile
 external clients the same way: one that imports every name the public
 generations module exports, with the constructors it exports, must compile;
@@ -1541,7 +1821,9 @@ and [`docs/vulkan/linux-vk11.md`](vulkan/linux-vk11.md). VK-12's are retained as
 [`docs/vulkan/macos-vk12.md`](vulkan/macos-vk12.md) and
 [`docs/vulkan/linux-vk12.md`](vulkan/linux-vk12.md). VK-13's are retained as
 [`docs/vulkan/macos-vk13.md`](vulkan/macos-vk13.md) and
-[`docs/vulkan/linux-vk13.md`](vulkan/linux-vk13.md). #250's are retained as
+[`docs/vulkan/linux-vk13.md`](vulkan/linux-vk13.md). VK-15's are retained as
+[`docs/vulkan/macos-vk15.md`](vulkan/macos-vk15.md) and
+[`docs/vulkan/linux-vk15.md`](vulkan/linux-vk15.md). #250's are retained as
 [`docs/vulkan/macos-vkr2.md`](vulkan/macos-vkr2.md) and
 [`docs/vulkan/linux-vkr2.md`](vulkan/linux-vkr2.md). #265's, taken again over
 the recording's split into private modules, are retained as
@@ -1606,7 +1888,7 @@ companions — and adds the Vulkan owner's:
 | Main thread | Hspec runs on a thread of its own; the process main thread owns one shared production graphics session: `withLoaderIntegration`, then `runGraphicsOwnerApplication` over `withVulkanOwnerHost`, with the production native layer and surface bridge. An example that needs the main thread — to hand a window's surface over, which GLFW creates there, or to close a window — submits an operation (`onMain`); the main thread runs it between two turns of the host's owner loop and returns its result or rethrows its failure. Windows are created through the host's command port from the example's own thread, which the owner loop executes, as an application's worker would. |
 | Identities | Every dispatched operation is checked, before it runs, to be on the bound process main thread that entered the session — the Haskell thread, the bound flag, and the OS thread read through `pthread_self` — and a failed check fails the operation and the run. Every native call the session makes is recorded where it runs by a `NativeObserver`, so an example shows from the calls themselves that the instance, its messenger, the device and every surface's destruction ran on the graphics owner's thread and every surface's creation on the main thread — never from the name of an Hspec hook. |
 | Sharing | The roots — the instance, its explicit messenger, and the one device — are acquired lazily, by the first dispatched operation, at most once, and shared by every later example. Each example's windows and targets are its own and are closed inside it. |
-| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, `vk12-frames`, `vk13-presentation`, `synchronization-hazard`, and `debug-names`. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. |
+| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, `vk12-frames`, `vk13-presentation`, `vk15-validation-stop`, `vk15-retention`, `synchronization-hazard`, and `debug-names`. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. |
 | Selection | Building, listing and filtering the tree, a `--dry-run`, and a selection that dispatches nothing acquire nothing and start no child. A selection matching no example fails. `--complete`, which the catalog group passes, runs the whole tree with Hspec's configuration reading left out and then fails unless the shared session was acquired once and every private scenario ran and passed, so no ambient setting can turn the group's receipt into a pass for a subset. The consent rules and the migrated proof's pure release, construction, publication and loader-selection examples need no session and run without consent. |
 | Consent | Read once, at startup, from `HETOIMASIA_NATIVE_SESSION`, with the GLFW suite's rules for `desktop` and `isolated-x11:<display>`; this suite has no Wayland session. Without it every native example is refused before its body, the session is never acquired, and the run ends with the refusal on stderr and a non-zero exit. |
 | Environment | Before any Vulkan call, the suite clears every ambient discovery override and every validation-layer setting it finds and records which, disables implicit layers, and points the layer's settings file at an empty one; a child inherits and re-establishes the same environment. |
@@ -1703,6 +1985,42 @@ unsettled, no step received a validation error — with synchronization
 validation on — and the capture's verdict after the last teardown callback is
 clean. Its record lists every native call the frames made, fence status queries
 and drain waits aside. It asserts no pixel value.
+
+VK-15's two cases run on private roots too. No device loss is induced
+natively: its teardown is the headless examples', and the specification's rows
+in the proof records.
+
+`vk15-validation-stop` is VK-13's arrangement over one window, with the roots
+watching the capture as the controller has them do. It presents two triangle
+frames and observes both present fences; acquires, records and submits a third;
+and then delivers one error-severity validation message through
+`vkSubmitDebugUtilsMessageEXT`, carrying the message identifier
+`VUID-hetoimasia-vk15-injected-validation-error`. The next checkpoint — the
+third frame's presentation — is refused naming `TerminalValidationError`, and
+so is a further acquisition, neither making a native call. The frame is closed
+unpresented and everything is torn down under the ordinary rules: the drain
+settles every obligation on its own evidence, and the frames, the generation,
+the surface, the resources, the device, the messenger and the instance retire
+without a failure. It passes only if the error is the session's primary with no
+device loss recorded; exactly one error reached the capture — the injected one,
+during its own step — and no other anywhere, with synchronization validation
+on; and the verdict after the last teardown callback fails for that latched
+error and nothing else, with nothing dropped, cut or undelivered and every
+report offered through `vkDestroyInstance` counted in it.
+
+`vk15-retention` runs the production composition, `withVulkanOwnerHost`, over
+one visible window whose target's generation it builds, holds a CPU use of
+that generation and never ends it, and lets the host exit. The owner's drain
+cannot verify the generation, so it retains it and every parent above it and
+records each retention in the latch; its run ends without destruction evidence
+and without the target's terminal record, so the host keeps the window and
+waits. The case passes only if the latch reports the retention with no primary
+failure and no loss, if no swapchain, surface, device, messenger or instance
+was destroyed, and if the host still holds the window. A watcher then writes the
+record and terminates the process — #220's destructive boundary, the escape the
+lifetime design leaves for what cannot be verified — and the record says so:
+the operating system, not the session, reclaims what was retained, and no
+diagnostic verdict follows, because the last callback was never reached.
 
 #250's case, `debug-names`, is VK-11's on private roots of its own, with one
 destructive seam only the fixture holds: it wraps the production recording

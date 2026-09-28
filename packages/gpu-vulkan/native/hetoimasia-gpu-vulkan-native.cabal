@@ -119,6 +119,7 @@ library
         Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Abandonment
         Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Acquisition
         Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Layer
+        Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Loss
         Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Presentation
         Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Progress
         Hetoimasia.GPU.Vulkan.Native.Internal.Frames.State
@@ -255,6 +256,7 @@ test-suite native-tests
         Test.GPU.Vulkan.Native.RecordingVisibility
         Test.GPU.Vulkan.Native.Roots
         Test.GPU.Vulkan.Native.StandIn
+        Test.GPU.Vulkan.Native.Terminal
     ghc-options: -threaded -rtsopts
     build-depends:
         base >=4.22 && <4.23,

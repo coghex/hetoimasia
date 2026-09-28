@@ -50,7 +50,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , modelEdit
   , owner
   )
-import Hetoimasia.GPU.Vulkan.Native.Roots (failRootsSession, readRootsDevice, stateRootsModel)
+import Hetoimasia.GPU.Vulkan.Native.Roots (failRootsSessionBecause, readRootsDevice, stateRootsModel)
 
 -- | Destroy every released generation whose holds the model reports ended,
 -- and record the disposals with the model. A pipeline layout waits for every
@@ -66,7 +66,9 @@ disposeResources recording now = owner recording (go [])
     -- everything that did return has been recorded.
     go recorded = do
       (destroyed, failures) ← pass
-      unless (null failures) (atomically (failRootsSession roots CleanupFailed))
+      -- Each failed destruction is its own cleanup failure, named.
+      for_ failures $ \(resource, reason) →
+        atomically (failRootsSessionBecause roots CleanupFailed ("destroying " <> Text.pack (show resource) <> " raised: " <> reason))
       settled ← settle []
       for_ failures $ \(resource, reason) → throwIO (ResourceDestructionFailed resource reason)
       if null destroyed then pure (recorded <> settled) else go (recorded <> settled)

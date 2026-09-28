@@ -96,6 +96,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , editManaged
   , isAsynchronous
   , liveNative
+  , checkpointed
   , modelAnswer
   , owned
   , tshow
@@ -156,7 +157,7 @@ recordFrame
   → (Recorder q inst msgr phys dev cmd → IO a)
   → IO (Either Refusal (BatchId, a))
 recordFrame recording frame consumer =
-  owned recording $
+  owned recording . checkpointed recording $
     -- The frame is checked before anything is done for its slot: a stale or
     -- foreign frame must fail before the slot's storage is touched.
     (atomically (frameAcquired recording frame) >>= \case

@@ -123,6 +123,10 @@ typedef struct capture_slot {
   _Atomic(hetoimasia_capture_storage *) storage;
   _Atomic int latches[2];
   _Atomic uint64_t counters[HETOIMASIA_CAPTURE_COUNTERS];
+  /* Which terminal failure came first: none, an error report, or the
+     consumer's sink. Claimed once, by compare-and-swap, by whichever gets
+     there first, and never changed again. */
+  _Atomic int first_failure;
 } capture_slot;
 
 /* Zero-initialized: every slot free, closed with no storage, generation 0. */
@@ -229,6 +233,7 @@ int hetoimasia_capture_create(
   for (int counter = 0; counter < HETOIMASIA_CAPTURE_COUNTERS; counter++) {
     atomic_store(&slot->counters[counter], 0);
   }
+  atomic_store(&slot->first_failure, HETOIMASIA_CAPTURE_FIRST_NONE);
 
   storage->slot = index;
   storage->generation = generation;
@@ -469,6 +474,10 @@ static uint32_t capture(
   /* Before anything else can fail or be dropped: a full queue, a closed
      storage and a missing payload must none of them hide an error. */
   if (severity & HETOIMASIA_CAPTURE_SEVERITY_ERROR) {
+    /* Claimed before the latch is set, so a reader that sees the latch sees
+       whether the error came first. */
+    int none = HETOIMASIA_CAPTURE_FIRST_NONE;
+    atomic_compare_exchange_strong(&slot->first_failure, &none, HETOIMASIA_CAPTURE_FIRST_ERROR);
     atomic_store(&slot->latches[HETOIMASIA_CAPTURE_ERROR_LATCH], 1);
     saturating_increment(&slot->counters[HETOIMASIA_CAPTURE_ERRORS]);
   }
@@ -679,6 +688,42 @@ int hetoimasia_capture_status(void *user_data, uint64_t *counters, int *latches)
     latches[latch] = atomic_load(&slot->latches[latch]);
   }
   return atomic_load(&slot->generation) == generation;
+}
+
+int hetoimasia_capture_note_sink_failure(void *user_data)
+{
+  uint64_t generation;
+  capture_slot *slot = decode_user_data(user_data, &generation);
+  if (slot == NULL || atomic_load(&slot->generation) != generation) {
+    return 0;
+  }
+  int none = HETOIMASIA_CAPTURE_FIRST_NONE;
+  atomic_compare_exchange_strong(&slot->first_failure, &none, HETOIMASIA_CAPTURE_FIRST_SINK);
+  return atomic_load(&slot->generation) == generation;
+}
+
+int hetoimasia_capture_claim_owner_failure(void *user_data)
+{
+  uint64_t generation;
+  capture_slot *slot = decode_user_data(user_data, &generation);
+  if (slot == NULL || atomic_load(&slot->generation) != generation) {
+    return -1;
+  }
+  int none = HETOIMASIA_CAPTURE_FIRST_NONE;
+  atomic_compare_exchange_strong(&slot->first_failure, &none, HETOIMASIA_CAPTURE_FIRST_OWNER);
+  int first = atomic_load(&slot->first_failure);
+  return atomic_load(&slot->generation) == generation ? first : -1;
+}
+
+int hetoimasia_capture_first_failure(void *user_data)
+{
+  uint64_t generation;
+  capture_slot *slot = decode_user_data(user_data, &generation);
+  if (slot == NULL || atomic_load(&slot->generation) != generation) {
+    return -1;
+  }
+  int first = atomic_load(&slot->first_failure);
+  return atomic_load(&slot->generation) == generation ? first : -1;
 }
 
 void hetoimasia_capture_preset_counter(hetoimasia_capture_storage *storage, int which, uint64_t value)
