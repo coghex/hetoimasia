@@ -7,7 +7,7 @@ Verdict: **pass**.
 - device: Apple M3 Max
 - generation: 320x240, format 50, 3 images
 - rendered, never presented: FrameSlotId (TargetId 0 1) 0 1, image 0, acquired at attempt 1, settled after 2 steps
-- its submission: SubmissionId 0, completed after 12 steps
+- its submission: SubmissionId 0, completed after 8 steps
 - the readback before the completion: RefusedNotWritten "a batch or a submission still holds the buffer"
 - the readback's first pixel after it: Right [89,89,89,255]
 - every byte still the sentinel: False
@@ -15,7 +15,7 @@ Verdict: **pass**.
 - acquiring a returned image again, then skipped: FrameSlotId (TargetId 0 1) 0 4, image 0, acquired at attempt 1, settled after 2 steps
 - images the first two frames returned: [0,1]
 - swapchain constructions: 1
-- left before retirement: ([],[SlotView {viewSlotTarget = TargetId 0 1, viewSlotNumber = 0, viewSlotSync = SlotSync {syncAcquire = 15909243860128104466, syncAcquireState = SemaphoreUnsignalled, syncFence = 15093167638295085075, syncFenceState = FenceSignalled, syncCleanup = 11519762544604479508, syncCleanupState = FenceSignalled}}],[])
+- left before retirement: ([],[SlotView {viewSlotTarget = TargetId 0 1, viewSlotNumber = 0, viewSlotSync = SlotSync {syncAcquire = 15909243860128104466, syncAcquireState = SemaphoreUnsignalled, syncFence = 15093167638295085075, syncFenceState = FenceSignalled, syncCleanup = 11519762544604479508, syncCleanupState = FenceSignalled, syncDestruction = Nothing}}],[])
 
 Native calls the frames made, status queries left out:
 
