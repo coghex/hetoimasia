@@ -33,6 +33,7 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , reportWarningNow
   , awaitSinkRecorded
   , claimSinkFirst
+  , awaitHeld
 
     -- * The surface bridge
   , Bridge
@@ -293,7 +294,13 @@ data Native = Native
   , nativeCapture ∷ !(TVar (Maybe DiagnosticCapture))
     -- ^ The session's capture, once the owner's startup has asked the layer
     -- anything.
+  , nativeHeld ∷ !(TVar (Set Step))
+    -- ^ The steps a 'HoldsUntil' script is holding a call at now.
   }
+
+-- | Wait until a call is holding at this step.
+awaitHeld ∷ Rig → Step → IO ()
+awaitHeld rig at = atomically (readTVar (nativeHeld (rigNative rig)) >>= check . Set.member at)
 
 -- | Report one error-severity message into the session's capture now, from
 -- the calling thread, as a layer reporting from inside some other call would.
@@ -340,7 +347,10 @@ stepWith ∷ DiagnosticCapture → Journal → Native → Step → Event → IO 
 stepWith capture events native at event = do
   scripted ← Map.lookup at <$> readTVarIO (nativeScript native)
   case scripted of
-    Just (HoldsUntil gate) → uninterruptibleMask_ (atomically (readTVar gate >>= check))
+    Just (HoldsUntil gate) → uninterruptibleMask_ $ do
+      atomically (modifyTVar' (nativeHeld native) (Set.insert at))
+      atomically (readTVar gate >>= check)
+      atomically (modifyTVar' (nativeHeld native) (Set.delete at))
     Just (ReportsError text) → report capture severityError text
     Just (ReportsWarning text) → report capture severityWarning text
     _ → pure ()
@@ -749,7 +759,7 @@ newRigVisible visible windows = do
         , scriptFramebufferSize = \_ → readTVarIO framebuffer
         , scriptWindowAttribute = \attribute _ → pure (visible && attribute == VisibleAttribute)
         }
-  native ← Native <$> newTVarIO Map.empty <*> newTVarIO Set.empty <*> newTVarIO 500 <*> newTVarIO Nothing <*> newTVarIO Nothing
+  native ← Native <$> newTVarIO Map.empty <*> newTVarIO Set.empty <*> newTVarIO 500 <*> newTVarIO Nothing <*> newTVarIO Nothing <*> newTVarIO Set.empty
   bridge ← Bridge <$> newTVarIO Map.empty <*> newTVarIO Nothing <*> newTVarIO 100 <*> newTVarIO []
   verdict ← newTVarIO Nothing
   refusalHook ← newTVarIO (\_ → pure ())

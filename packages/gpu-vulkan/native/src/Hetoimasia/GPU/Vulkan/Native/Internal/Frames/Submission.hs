@@ -63,7 +63,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , checkpointed
   , owned
   )
-import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost, failRootsSessionBecause, rootsCall, rootsSessionIdentity, stateRootsModel, syncRootsDiagnostics)
+import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost, failRootsSessionBecause, rootsCall, rootsSessionIdentity, stateRootsModel)
 
 -- | One frame of a validated request.
 data Member cmd = Member
@@ -214,10 +214,6 @@ submitFrames frames request =
                   pure (Right (SubmittedNothing (Text.pack (displayException exception))))
               | otherwise → do
                   let reason = "vkQueueSubmit2 raised, so whether it submitted is unknown: " <> Text.pack (displayException exception)
-                  -- The unknown effect fails the session: what the capture
-                  -- already holds, a report from inside this call included,
-                  -- is latched first.
-                  syncRootsDiagnostics roots
                   atomically $ do
                     answered Model.submitFrames framesOf SubmissionEffectUncertain
                     uncertain frames UnknownSubmissionEffect framesOf reason
@@ -250,11 +246,9 @@ submitFrames frames request =
             pure (Just submission)
       case committed of
         Nothing → do
-          -- The refusal left the model as it was, and only this thread
-          -- changes it: the unknown effect is recorded next, after what the
-          -- capture already holds is latched.
+          -- The refusal left the model as it was: the unknown effect is
+          -- recorded in a transaction of its own.
           let reason = "the model refused to record a submission the queue accepted"
-          syncRootsDiagnostics roots
           atomically $ do
             answered Model.submitFrames framesOf SubmissionEffectUncertain
             uncertain frames UnknownSubmissionEffect framesOf reason

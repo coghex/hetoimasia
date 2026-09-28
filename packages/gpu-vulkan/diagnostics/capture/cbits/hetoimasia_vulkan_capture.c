@@ -702,6 +702,19 @@ int hetoimasia_capture_note_sink_failure(void *user_data)
   return atomic_load(&slot->generation) == generation;
 }
 
+int hetoimasia_capture_claim_owner_failure(void *user_data)
+{
+  uint64_t generation;
+  capture_slot *slot = decode_user_data(user_data, &generation);
+  if (slot == NULL || atomic_load(&slot->generation) != generation) {
+    return -1;
+  }
+  int none = HETOIMASIA_CAPTURE_FIRST_NONE;
+  atomic_compare_exchange_strong(&slot->first_failure, &none, HETOIMASIA_CAPTURE_FIRST_OWNER);
+  int first = atomic_load(&slot->first_failure);
+  return atomic_load(&slot->generation) == generation ? first : -1;
+}
+
 int hetoimasia_capture_first_failure(void *user_data)
 {
   uint64_t generation;

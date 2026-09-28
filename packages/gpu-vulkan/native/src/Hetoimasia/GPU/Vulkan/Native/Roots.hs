@@ -160,6 +160,9 @@ module Hetoimasia.GPU.Vulkan.Native.Roots
   , latchTerminal
   , noteTeardownEvidence
   , watchRootsDiagnostics
+  , watchRootsDiagnosticsOrdered
+  , DiagnosticWatch (..)
+  , DiagnosticOrder (..)
   , checkpointRoots
   , syncRootsDiagnostics
   , checkpointRootsSettled
@@ -194,7 +197,8 @@ module Hetoimasia.GPU.Vulkan.Native.Roots
   ) where
 
 import Control.Concurrent (threadDelay, yield)
-import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, stateTVar, writeTVar)
+import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, writeTVar)
+import GHC.Conc (unsafeIOToSTM)
 import Control.Exception
   ( Exception (displayException)
   , ExceptionWithContext (ExceptionWithContext)
@@ -207,11 +211,11 @@ import Control.Exception
   , toException
   , tryWithContext
   )
-import Control.Monad (join, unless, when)
+import Control.Monad (unless, when)
 import Data.Foldable (for_)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (isJust)
+import Data.Maybe (isJust, isNothing)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Unique (newUnique)
@@ -404,7 +408,7 @@ data Roots q inst msgr phys dev = Roots
   , rootsTerminal ∷ !(TVar TerminalReport)
     -- ^ The terminal latch: the primary failure and what teardown found after
     -- it.
-  , rootsWatch ∷ !(TVar (IO [DiagnosticAlarm]))
+  , rootsWatch ∷ !(TVar DiagnosticWatch)
     -- ^ What a checkpoint asks of the diagnostic capture.
   , rootsDebugUtils ∷ !(TVar Bool)
     -- ^ Whether the instance was created with @VK_EXT_debug_utils@.
@@ -434,7 +438,7 @@ newRoots ops budgets clock = do
     <*> newTVarIO True
     <*> newTVarIO Nothing
     <*> newTVarIO (TerminalReport Nothing Nothing [] 0)
-    <*> newTVarIO (pure [])
+    <*> newTVarIO (DiagnosticWatch (pure []) (pure OwnerFirst))
     <*> newTVarIO False
     <*> newTVarIO False
     <*> pure session
@@ -882,8 +886,41 @@ fromModel model = case sessionState model of
 -- describes, which is then the primary with its detail: a transition that
 -- recorded an uncertain effect in the model and the latch that says what the
 -- effect was are one failure, not two.
+--
+-- A failure of the owner's own — a loss, a cleanup, an uncertain effect —
+-- that would be the primary first asks the diagnostic capture for the order
+-- ('orderBehindDiagnostics'): a validation error or sink failure that claimed
+-- first place before it is latched ahead of it.
 latchTerminal ∷ Roots q inst msgr phys dev → TerminalCause → STM ()
 latchTerminal roots cause = do
+  unless (diagnostic cause) (orderBehindDiagnostics roots)
+  latchCause roots cause
+  where
+    diagnostic = \case
+      TerminalValidationError → True
+      TerminalSinkFailed _ → True
+      _ → False
+
+-- | Before a failure of the owner's own takes first place — nothing latched,
+-- and the model has not failed by itself — claim the capture's order for it.
+-- A diagnostic failure that claimed first is latched here, ahead of it: a
+-- validation error at once, a sink failure once the worker has published its
+-- reason, which follows its claim at once and wakes this transaction. The
+-- claim is the capture's one compare-and-swap, which answers the same however
+-- often a transaction runs it.
+orderBehindDiagnostics ∷ Roots q inst msgr phys dev → STM ()
+orderBehindDiagnostics roots = do
+  report ← readTVar (rootsTerminal roots)
+  model ← readTVar (rootsModel roots)
+  when (isNothing (reportPrimary report) && isNothing (fromModel model)) $ do
+    watch ← readTVar (rootsWatch roots)
+    unsafeIOToSTM (watchOrder watch) >>= \case
+      OwnerFirst → pure ()
+      ValidationFirst → latchCause roots TerminalValidationError
+      SinkFirst published → published >>= maybe retry (latchCause roots . TerminalSinkFailed)
+
+latchCause ∷ Roots q inst msgr phys dev → TerminalCause → STM ()
+latchCause roots cause = do
   model ← readTVar (rootsModel roots)
   report ← readTVar (rootsTerminal roots)
   case reportPrimary report of
@@ -915,10 +952,36 @@ noteTeardownEvidence roots evidence =
           then report {reportEvidenceDropped = reportEvidenceDropped report + 1}
           else report {reportEvidence = reportEvidence report <> [evidence]}
 
--- | Install what a checkpoint asks of the diagnostic capture. Roots with none
--- installed hear no alarm.
+-- | Who holds first place in the diagnostic capture's order once a failure of
+-- the owner's own has claimed it.
+data DiagnosticOrder
+  = OwnerFirst
+    -- ^ No diagnostic failure came before it.
+  | ValidationFirst
+    -- ^ An error-severity report came first.
+  | SinkFirst !(STM (Maybe Text))
+    -- ^ The sink failed first; its reason, once the worker has published it.
+
+-- | What the roots ask of the diagnostic capture: its alarms, at a checkpoint,
+-- and the order, before a failure of the owner's own is latched or taken by
+-- the model. Claiming the order runs inside that transaction, so it must
+-- answer the same however often it runs and must run no transaction of its
+-- own.
+data DiagnosticWatch = DiagnosticWatch
+  { watchAlarms ∷ IO [DiagnosticAlarm]
+  , watchOrder ∷ IO DiagnosticOrder
+  }
+
+-- | Install what a checkpoint asks of a diagnostic capture that keeps no order
+-- of its own: its alarms are latched at checkpoints, and a failure of the
+-- owner's is never ordered behind them. Roots with none installed hear no
+-- alarm.
 watchRootsDiagnostics ∷ Roots q inst msgr phys dev → IO [DiagnosticAlarm] → STM ()
-watchRootsDiagnostics roots = writeTVar (rootsWatch roots)
+watchRootsDiagnostics roots alarms = writeTVar (rootsWatch roots) (DiagnosticWatch alarms (pure OwnerFirst))
+
+-- | Install a diagnostic capture that keeps the order itself.
+watchRootsDiagnosticsOrdered ∷ Roots q inst msgr phys dev → DiagnosticWatch → STM ()
+watchRootsDiagnosticsOrdered roots = writeTVar (rootsWatch roots)
 
 -- | A safe owner checkpoint: ask the diagnostic capture for its alarms and
 -- latch each — an error-severity report as 'TerminalValidationError', a sink
@@ -938,7 +1001,7 @@ watchRootsDiagnostics roots = writeTVar (rootsWatch roots)
 -- rethrow that.
 checkpointRoots ∷ Roots q inst msgr phys dev → IO Checkpoint
 checkpointRoots roots = do
-  alarms ← join (readTVarIO (rootsWatch roots))
+  alarms ← watchAlarms =<< readTVarIO (rootsWatch roots)
   atomically $
     if AlarmPending `elem` alarms
       then maybe CheckpointPending CheckpointFailed . reportPrimary <$> readTVar (rootsTerminal roots)
@@ -973,7 +1036,7 @@ syncRootsDiagnostics ∷ Roots q inst msgr phys dev → IO ()
 syncRootsDiagnostics roots = go (0 ∷ Int)
   where
     go looked = do
-      alarms ← join (readTVarIO (rootsWatch roots))
+      alarms ← watchAlarms =<< readTVarIO (rootsWatch roots)
       if AlarmPending `elem` alarms
         then pause looked >> go (looked + 1)
         else atomically (latchAlarms roots alarms)
@@ -999,7 +1062,7 @@ checkpointRootsSettled roots = do
 
 -- | Latch each alarm the capture named, in its order.
 latchAlarms ∷ Roots q inst msgr phys dev → [DiagnosticAlarm] → STM ()
-latchAlarms roots alarms = mapM_ (latchTerminal roots) [cause | Just cause ← map alarmCause alarms]
+latchAlarms roots alarms = mapM_ (latchCause roots) [cause | Just cause ← map alarmCause alarms]
   where
     alarmCause = \case
       AlarmValidationError → Just TerminalValidationError
@@ -1198,7 +1261,23 @@ rootsCall = guarded
 
 -- | Read and replace the roots' model in one transaction.
 stateRootsModel ∷ Roots q inst msgr phys dev → (GpuModel → (a, GpuModel)) → STM a
-stateRootsModel roots = stateTVar (rootsModel roots)
+--
+-- A transition that fails a running session by itself — a required target's
+-- exhausted recovery, a submission whose effect is unknown — is a failure of
+-- the owner's own, so it is ordered behind the diagnostic capture first
+-- ('orderBehindDiagnostics'): when a diagnostic failure came before it, that
+-- failure is latched and the transition is taken on the failed session
+-- instead, where it fails nothing further.
+stateRootsModel roots transition = do
+  before ← readTVar (rootsModel roots)
+  let (answer, after) = transition before
+  if sessionState before == SessionRunning && sessionState after /= SessionRunning
+    then do
+      orderBehindDiagnostics roots
+      current ← readTVar (rootsModel roots)
+      let (answer', after') = transition current
+      answer' <$ writeTVar (rootsModel roots) after'
+    else answer <$ writeTVar (rootsModel roots) after
 
 -- | Enter the session-level safety failure: an effect whose outcome is
 -- unknown, or a cleanup that failed. Admission closes and the model's session

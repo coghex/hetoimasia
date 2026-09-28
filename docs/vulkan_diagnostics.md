@@ -390,7 +390,16 @@ the moment it looked. A failure that has claimed the cell but not yet set its
 own alarm leaves, for that moment, only a later alarm readable; then
 `captureAlarms` answers `CaptureAlarmPending` alone — something failed, which
 came first is not yet readable, and admission should stay closed — and the next
-reading answers them in order, so it never answers a later failure first. The controller installs it as the roots' diagnostic
+reading answers them in order, so it never answers a later failure first.
+
+The capture's owner claims the same cell for a failure of its own
+(`claimCaptureOrder`) before it records it. The answer is who holds first
+place: `OwnerFailedFirst`, when no diagnostic failure came before it — and any
+that comes afterwards is later — or `ErrorLatchedFirst` or `SinkFailedFirst`,
+when one did. It is the one compare-and-swap, so claiming again changes
+nothing, and a capture whose slot serves another lifetime answers
+`OwnerFailedFirst`. `captureAlarms` answers alarms that came after the owner's
+failure in no particular order between themselves. The controller installs both as the roots' diagnostic
 watch, so a failed sink is a terminal status of its own at the owner's next
 checkpoint — never a replacement for an earlier failure, and never permission
 to release anything.

@@ -62,6 +62,8 @@ import Hetoimasia.GPU.Vulkan.Diagnostics
   , CaptureAlarm (..)
   , SinkFailure (..)
   , captureAlarms
+  , CaptureOrder (..)
+  , claimCaptureOrder
   , captureSinkFailure
   , captureStatus
   , capturePhase
@@ -309,6 +311,27 @@ spec = describe "Lifetime" $ do
           _ ← bounded (atomically (captureSinkFailure capture >>= maybe retry pure))
           captureAlarms capture
       map alarmKind alarms `shouldBe` ["error", "sink"]
+
+    it "gives first place to the owner's failure when it claims before any diagnostic failure, and to the diagnostic failure that claimed before it" $ do
+      (logger, _) ← switchedLogger
+      (orders, _) ←
+        capturing logger $ \capture → do
+          first ← claimCaptureOrder capture
+          -- Claiming again changes nothing, and an error after it is later.
+          offerTo capture (plainOffer SeverityError "an error after the owner's failure")
+          again ← claimCaptureOrder capture
+          pure (first, again)
+      orders `shouldBe` (OwnerFailedFirst, OwnerFailedFirst)
+      (errorFirst, _) ←
+        capturing logger $ \capture → do
+          offerTo capture (plainOffer SeverityError "an error before the owner's failure")
+          claimCaptureOrder capture
+      errorFirst `shouldBe` ErrorLatchedFirst
+      (sinkFirst, _) ←
+        capturing logger $ \capture → do
+          noteSinkFailure (captureUserData capture)
+          claimCaptureOrder capture
+      sinkFirst `shouldBe` SinkFailedFirst
 
     it "answers only that a failure is pending while the failure that came first has claimed the order but not yet published its alarm" $ do
       (logger, failing) ← switchedLogger

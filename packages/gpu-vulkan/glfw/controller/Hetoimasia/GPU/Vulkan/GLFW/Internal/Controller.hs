@@ -136,7 +136,7 @@ import Control.Exception
   , throwIO
   , tryWithContext
   )
-import Control.Monad (forM, unless, void, when)
+import Control.Monad (forM, join, unless, void, when)
 import Control.Monad.IO.Class (liftIO)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as Char8
@@ -175,11 +175,15 @@ import Hetoimasia.GPU.Model.Identity (GenerationId, TargetClass (..), TargetId)
 import Hetoimasia.GPU.Vulkan.Diagnostics
   ( CaptureAlarm (..)
   , CaptureConfig
+  , CaptureOrder (..)
   , DiagnosticCapture
   , DiagnosticVerdict
   , Quiesced
+  , SinkFailure (..)
   , afterLastCallback
   , captureAlarms
+  , captureSinkFailure
+  , claimCaptureOrder
   , retainStorage
   , withDiagnosticCapture
   )
@@ -227,7 +231,9 @@ import Hetoimasia.GPU.Vulkan.Native.Roots
   , latchTerminal
   , noteTeardownEvidence
   , readRootsTerminal
-  , watchRootsDiagnostics
+  , watchRootsDiagnosticsOrdered
+  , DiagnosticWatch (..)
+  , DiagnosticOrder (..)
   , destroyRoots
   , newRoots
   , readRootTargets
@@ -321,6 +327,9 @@ data State inst msgr phys dev lease obligation = State
     -- announcement the owner's full port refused. Written by the main
     -- thread's handover; the owner's step settles each once its slot has
     -- begun retiring.
+  , stateWake ∷ !(TVar (STM Bool))
+    -- ^ What wakes an idle owner: the capture's sink failure, until it is
+    -- latched. Installed with the capture's watch.
   , stateDiagnosticPending ∷ !(TVar Bool)
     -- ^ Whether the owner's last step found a diagnostic failure pending, so
     -- it looks again within its poll. The owner thread's alone.
@@ -399,6 +408,7 @@ newVulkanControllerWith hooks ops pointer bridge layers validation budgets clock
       <*> newTVarIO Map.empty
       <*> newTVarIO Map.empty
       <*> newTVarIO Map.empty
+      <*> newTVarIO (pure False)
       <*> newTVarIO False
       <*> pure clock
       <*> pure poll
@@ -498,6 +508,7 @@ controllerOperations (VulkanController state) =
             atomically (writeTVar (stateDiagnosticPending state) False)
             progress step
     , graphicsNextDeadline = ownerDeadline state
+    , graphicsWake = join (readTVar (stateWake state))
     , graphicsRetireTarget = \retiring → retaining state (retireTarget state retiring)
     , graphicsRetireOwner = retaining state . retireOwner state
     , graphicsDestroyOwner = \_ → retaining state (destroyOwner state)
@@ -1095,6 +1106,24 @@ readVulkanTerminal (VulkanController state) = readRootsTerminal (stateRoots stat
 -- error-severity report whatever became of the report's detail, and its
 -- sink's failure — in the order they happened, so a checkpoint that learns of
 -- both latches the first as the primary.
+-- | Claim the capture's order for a failure of the owner's own, and say who
+-- holds it: the owner, or the error report or sink failure that came first.
+diagnosticOrder ∷ DiagnosticCapture → IO DiagnosticOrder
+diagnosticOrder capture =
+  claimCaptureOrder capture >>= \case
+    OwnerFailedFirst → pure OwnerFirst
+    ErrorLatchedFirst → pure ValidationFirst
+    SinkFailedFirst → pure (SinkFirst (fmap sinkFailureReason <$> captureSinkFailure capture))
+
+-- | Whether the capture's sink has failed and nothing is latched yet: the one
+-- diagnostic failure that arrives on a thread of its own rather than inside
+-- a call the owner made, so the owner may be idle when it does.
+sinkUnlatched ∷ State inst msgr phys dev lease obligation → DiagnosticCapture → STM Bool
+sinkUnlatched state capture = do
+  failed ← isJust <$> captureSinkFailure capture
+  latched ← isJust . reportPrimary <$> readRootsTerminal (stateRoots state)
+  pure (failed && not latched)
+
 diagnosticAlarms ∷ DiagnosticCapture → IO [DiagnosticAlarm]
 diagnosticAlarms capture =
   map
@@ -1271,8 +1300,13 @@ withVulkanOwnerHostHooked hooks logger layer pointer bridge enter extensions con
         (hostClock host)
         (either (const fallbackPoll) convertedDuration (durationFromSeconds RequirePositive (hostIdleWait host)))
     -- Every checkpoint of the owner's asks the capture for its latches, so a
-    -- validation error or a sink failure stops the session at the next one.
-    atomically (watchRootsDiagnostics (stateRoots state) (diagnosticAlarms capture))
+    -- validation error or a sink failure stops the session at the next one;
+    -- every failure of the owner's own is ordered by the capture's first-failure
+    -- cell; and a sink failure the worker records while the owner is idle wakes
+    -- it for that checkpoint.
+    atomically $ do
+      watchRootsDiagnosticsOrdered (stateRoots state) (DiagnosticWatch (diagnosticAlarms capture) (diagnosticOrder capture))
+      writeTVar (stateWake state) (sinkUnlatched state capture)
     let session = do
           entered ← enter (hostSessionConfig host)
           copied ← liftIO (extensions entered)

@@ -18,10 +18,12 @@
 -- device is lost natively and nothing waits on a clock.
 module Test.GPU.Vulkan.Native.Terminal (spec) where
 
-import Control.Concurrent.STM (atomically, newTVarIO, readTVarIO, stateTVar, writeTVar)
+import Control.Concurrent (forkIO, threadDelay)
+import Control.Concurrent.STM (atomically, newTVarIO, readTVar, readTVarIO, stateTVar, writeTVar)
 import Control.Exception (SomeException, throwIO, toException)
 import Control.Monad (forM_, void, when)
 import Data.List (nub)
+import Data.Maybe (isJust)
 import Data.List.NonEmpty (NonEmpty ((:|)))
 import Test.Hspec (Expectation, Spec, describe, it, shouldBe, shouldNotReturn, shouldReturn, shouldSatisfy)
 
@@ -63,6 +65,9 @@ import Hetoimasia.GPU.Vulkan.Native.Roots
   , retireRootTarget
   , retireRoots
   , watchRootsDiagnostics
+  , watchRootsDiagnosticsOrdered
+  , DiagnosticWatch (..)
+  , DiagnosticOrder (..)
   )
 import Test.GPU.Vulkan.Native.FramesRig
 import Test.GPU.Vulkan.Native.FramesStandIn
@@ -150,6 +155,18 @@ spec = describe "Terminal failure" $ do
       tornDownUnderLoss rig
 
   describe "the primary failure" $ do
+    it "keeps a validation error reported during a call as the primary when that call then returns the device's loss" $ do
+      rig ← newRig
+      atomically (watchRootsDiagnosticsOrdered (rigRoots rig) (DiagnosticWatch (pure []) (pure ValidationFirst)))
+      loseFrameStep (rigStandIn rig) AtAcquire
+      tryAcquireFrame (rigFrames rig) (rigTarget rig) `raises` \(_ ∷ GraphicsDeviceLost) → True
+      report ← atomically (readRootsTerminal (rigRoots rig))
+      reportPrimary report `shouldBe` Just TerminalValidationError
+      reportDeviceLost report `shouldSatisfy` isJust
+      reportEvidence report `shouldSatisfy` any (\case LaterFailure (TerminalDeviceLost _) → True; _ → False)
+      deviceLossObserved <$> modelOf rig `shouldReturn` True
+      tornDownUnderLoss rig
+
     it "keeps an earlier validation error when a teardown wait reports the loss, and switches that teardown to the device-loss rules" $ do
       rig ← newRig
       _ ← pendingPresentation rig
@@ -230,9 +247,13 @@ spec = describe "Terminal failure" $ do
       -- cannot know.
       looks ← newTVarIO (0 ∷ Int)
       atomically $
-        watchRootsDiagnostics (rigRoots rig) $ do
-          seen ← atomically (stateTVar looks (\count → (count, count + 1)))
-          pure [AlarmValidationError | seen > 0]
+        watchRootsDiagnosticsOrdered (rigRoots rig) $
+          DiagnosticWatch
+            ( do
+                seen ← atomically (stateTVar looks (\count → (count, count + 1)))
+                pure [AlarmValidationError | seen > 0]
+            )
+            (pure ValidationFirst)
       failFrameStep (rigStandIn rig) AtSubmit
       submitFrames (rigFrames rig) (batch :| []) `raises` \(FrameEffectUncertain {}) → True
       primaryIs rig (== TerminalValidationError)
@@ -321,9 +342,8 @@ spec = describe "Terminal failure" $ do
       (required, healthy) ← twoTargets rig
       -- The error reaches the capture, and no checkpoint reads it, before the
       -- step that exhausts the required target.
-      alarms ← newTVarIO []
-      atomically (watchRootsDiagnostics (rigRoots rig) (readTVarIO alarms))
-      exhaustRecoveryAfter rig required (atomically (writeTVar alarms [AlarmValidationError]))
+      exhaustRecoveryAfter rig required $
+        atomically (watchRootsDiagnosticsOrdered (rigRoots rig) (DiagnosticWatch (pure [AlarmValidationError]) (pure ValidationFirst)))
       -- The error was latched before the attempt that would have spent the
       -- episode, so the session had failed and recovery went no further.
       primaryIs rig (== TerminalValidationError)
@@ -333,18 +353,32 @@ spec = describe "Terminal failure" $ do
       tryAcquireFrame (rigFrames rig) healthy `shouldReturn` Left (RefusedSessionFailed TerminalValidationError)
       clean rig
 
-    it "waits for a diagnostic failure that claimed the order however long its alarm takes to publish, before a required target's recovery can be exhausted" $ do
+    it "waits for a sink failure that claimed the order however long its reason takes to publish, before a required target's recovery can be exhausted" $ do
       rig ← newRigClassed [RequiredTarget, OptionalTarget] defaultBudgetRequest
       (required, _) ← twoTargets rig
-      -- The claimant is delayed well past the ten thousand looks the wait
-      -- once gave up after; only then is its error readable.
-      looks ← newTVarIO (0 ∷ Int)
-      let delayed = do
-            seen ← atomically (stateTVar looks (\count → (count, count + 1)))
-            pure (if seen < 10100 then [AlarmPending] else [AlarmValidationError])
-      exhaustRecoveryAfter rig required (atomically (watchRootsDiagnostics (rigRoots rig) delayed))
+      -- The sink claimed first place, and its worker is delayed before it
+      -- publishes why; no checkpoint could have read it.
+      published ← newTVarIO Nothing
+      _ ← forkIO $ do
+        threadDelay 50000
+        atomically (writeTVar published (Just "the sink is gone"))
+      exhaustRecoveryAfter rig required $
+        atomically (watchRootsDiagnosticsOrdered (rigRoots rig) (DiagnosticWatch (pure []) (pure (SinkFirst (readTVar published)))))
+      primaryIs rig (== TerminalSinkFailed "the sink is gone")
+      evidenceOf rig `shouldReturn` []
+      viewCondition <$> generationsOn rig required `shouldNotReturn` RecoverySpent
+      clean rig
+
+    it "orders a validation error that claimed first place ahead of the exhaustion it preceded, though no checkpoint could read it yet" $ do
+      rig ← newRigClassed [RequiredTarget, OptionalTarget] defaultBudgetRequest
+      (required, _) ← twoTargets rig
+      -- Only the capture's order knows of the error: the transition that
+      -- would exhaust the target is taken on the session it failed.
+      exhaustRecoveryAfter rig required $
+        atomically (watchRootsDiagnosticsOrdered (rigRoots rig) (DiagnosticWatch (pure []) (pure ValidationFirst)))
       primaryIs rig (== TerminalValidationError)
       evidenceOf rig `shouldReturn` []
+      sessionState <$> modelOf rig `shouldReturn` SessionFailed ValidationError
       viewCondition <$> generationsOn rig required `shouldNotReturn` RecoverySpent
       clean rig
 

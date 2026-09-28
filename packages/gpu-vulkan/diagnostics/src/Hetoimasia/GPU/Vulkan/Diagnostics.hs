@@ -125,6 +125,8 @@ module Hetoimasia.GPU.Vulkan.Diagnostics
   , captureSinkFailure
   , CaptureAlarm (..)
   , captureAlarms
+  , CaptureOrder (..)
+  , claimCaptureOrder
 
     -- * The verdict
   , DiagnosticVerdict (..)
@@ -230,6 +232,7 @@ import Hetoimasia.GPU.Vulkan.Diagnostics.Internal.Capture
   , SlotStatus (..)
   , createStorage
   , firstFailure
+  , claimOwnerFailure
   , freeStorage
   , noteSinkFailure
   , slotStatus
@@ -437,6 +440,33 @@ data CaptureAlarm
 -- Then this answers 'CaptureAlarmPending' alone — a failure has happened, and
 -- admission should stay closed — and the next reading, once the first alarm is
 -- published, answers them in order. It never answers a later failure first.
+-- | Which failure holds first place, once the capture's owner has claimed it
+-- for a failure of its own that it is about to record: its own, unless an
+-- error report or the sink claimed it before.
+data CaptureOrder
+  = OwnerFailedFirst
+    -- ^ No diagnostic failure came before the owner's: any that comes now
+    -- came after it.
+  | ErrorLatchedFirst
+    -- ^ An error-severity report came first; its latch is set or about to be.
+  | SinkFailedFirst
+    -- ^ The sink failed first; 'captureSinkFailure' answers its reason once
+    -- the worker publishes it, which follows its claim at once.
+  deriving (Eq, Show)
+
+-- | Claim first place for a failure the capture's owner is about to record,
+-- unless a diagnostic failure holds it, and answer which does. It is one
+-- atomic compare-and-swap in the storage's slot, the same cell an error report
+-- and the sink claim, so the order it answers is the order the three
+-- happened; claiming again changes nothing. A capture whose slot already
+-- serves another lifetime answers 'OwnerFailedFirst'.
+claimCaptureOrder ∷ DiagnosticCapture → IO CaptureOrder
+claimCaptureOrder capture =
+  claimOwnerFailure (handleUserData capture) >>= \case
+    Just FirstError → pure ErrorLatchedFirst
+    Just FirstSink → pure SinkFailedFirst
+    _ → pure OwnerFailedFirst
+
 captureAlarms ∷ DiagnosticCapture → IO [CaptureAlarm]
 captureAlarms capture = do
   latched ← statusErrorLatched <$> captureStatus capture

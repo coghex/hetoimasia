@@ -1335,19 +1335,28 @@ as `LaterFailure`, oldest first, the first 64 kept and the rest counted. A
 failure the model recorded by itself before anything was latched is the primary
 it stands for, and one that describes the same failure as the model's cause —
 an uncertain submission the model recorded and the step that says what it was —
-is one failure, with the step's detail. Because a validation report or a sink
-failure can reach the capture between two checkpoints, the owner latches what
-the capture already holds (`syncRootsDiagnostics`) immediately before it
-records a failure the model would take by itself — asking for or settling a
-recovery attempt that may exhaust a required target, and recording a
-submission whose effect is unknown — so a diagnostic failure that happened
-first stays the primary and the owner's failure joins the evidence; a
-required target's recovery then goes no further, since the session has
-already failed. A failure that has claimed the capture's order but not yet
-published its alarm is waited for there until it is readable, however long its
-thread is delayed — yielding at first, then sleeping briefly between looks —
-since the capture publishes right after it claims; this is not a checkpoint
-and refuses nothing. The
+is one failure, with the step's detail.
+
+The first failure is first by one ordering point shared by every source: the
+diagnostic capture's first-failure cell. An error report claims it with a
+compare-and-swap before it sets the error latch, and the capture's worker
+claims it for its sink before it publishes the failure; a failure of the
+owner's own claims it too (`claimCaptureOrder`), inside the transaction that
+records it, wherever it comes from — a native call that answered the device's
+loss, a cleanup that failed, an effect whose outcome is unknown, and any
+transition the model makes that fails a running session by itself, such as a
+required target's exhausted recovery (`stateRootsModel` checks every transition
+for that before committing it, and only the owner changes the model). When a
+validation error or sink failure claimed the cell first, it is latched in that
+same transaction ahead of the owner's failure, which joins the evidence; a
+transition that would have failed the session is taken on the failed session
+instead, so a required target's recovery goes no further. A sink failure whose
+reason its worker has not yet published leaves the transaction waiting, and the
+worker's publication, which follows its claim at once, wakes it. The claim
+answers the same however often a transaction runs it. Roots given only a list
+of alarms (`watchRootsDiagnostics`, as headless examples use) latch them at
+checkpoints and order nothing; the controller installs the capture's order
+(`watchRootsDiagnosticsOrdered`). The
 device's loss is also kept apart
 from the primary (`reportDeviceLost`), whenever it is observed: a session that
 a validation error failed first and whose teardown then meets the loss keeps
@@ -1398,9 +1407,10 @@ progress step's observations, the finite drain wait, and every target's,
 generation's, root's and the owner's retirement keep running, because they run
 precisely because the session has failed. A validation error a layer reports
 from inside one of the owner's own calls is seen at that round's step. A sink
-failure arrives on the diagnostic worker's thread, so an owner with no round
-due sees it at its next round; until VK-16 composes rendering into the owner's
-loop, an owner with no round due has no rendering to stop.
+failure arrives on the diagnostic worker's thread, so the controller asks the
+owner to wake for it (`graphicsWake`) while it is published and not yet
+latched: an owner with no round due takes one at once, and its step latches
+the failure.
 
 ### The call that observed the failure
 
@@ -1708,9 +1718,11 @@ evidence behind it; a required target's exhausted recovery failing the
 session and refusing the other target, while an optional target's leaves the
 other rendering; a validation error in the capture before the step that would
 exhaust a required target kept as the primary, with recovery going no further,
-and one that follows the exhaustion kept behind it; one whose alarm stays
-unpublished well past ten thousand looks, still waited for and kept as the
-primary; and a validation error
+and one that follows the exhaustion kept behind it; a validation error only
+the capture's order knows of, and a sink failure whose reason its worker
+publishes late, each kept as the primary ahead of the exhaustion it preceded;
+a validation error reported during a call that then returns the device's loss
+kept as the primary with the loss beside it; and a validation error
 reported inside a submission that then raised with an unknown effect kept as
 the primary, with the uncertain effect beside it. The model's own suite adds `Device loss`: the loss kept beside
 an earlier cause, the release refused before the loss, a submission and a
@@ -1727,8 +1739,10 @@ teardown in order and the verdict carrying the error; the same error latched
 although a full capture dropped its record, since the latch is set before the
 record is admitted; a sink failure latched as
 its own status, with the verdict's consumer unsuccessful and no error latched;
-a sink failure that came before a validation error, both pending at one
-checkpoint, kept as the primary with the error beside it; a handover while the
+a sink failure latched although the owner was idle and nothing else was
+published, since its publication wakes the owner; a sink failure that came
+before a validation error, both arriving while the owner was inside a native
+call, kept as the primary with the error beside it; a handover while the
 capture's sink had claimed the order but not published its failure, with an
 error latched after it, refused as `VulkanDiagnosticPending` with nothing
 latched or attached, and the next handover, once the failure is published,

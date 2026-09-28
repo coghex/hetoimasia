@@ -99,8 +99,12 @@ import Hetoimasia.GPU.Vulkan.Diagnostics
   , CaptureAlarm (..)
   , Quiesced
   , VerdictIssue (..)
+  , CaptureOrder (..)
+  , SinkFailure (..)
   , captureAlarms
+  , captureSinkFailure
   , captureStatus
+  , claimCaptureOrder
   , defaultCaptureConfig
   , diagnosticVerdict
   , verdictIssues
@@ -158,7 +162,9 @@ import Hetoimasia.GPU.Vulkan.Native.Roots
   , retireRootTarget
   , retireRoots
   , startRoots
-  , watchRootsDiagnostics
+  , watchRootsDiagnosticsOrdered
+  , DiagnosticWatch (..)
+  , DiagnosticOrder (..)
   )
 import Hetoimasia.GPU.Vulkan.Native.Roots.Vulkan (instancePointer, vulkanRootOps)
 import Hetoimasia.Runtime.GLFW
@@ -209,6 +215,15 @@ data Step = Step
   , stepErrors ∷ !Word64
   }
   deriving (Show)
+
+-- | Claim the capture's order for a failure of the owner's own, as the
+-- controller does.
+order ∷ DiagnosticCapture → IO DiagnosticOrder
+order capture =
+  claimCaptureOrder capture >>= \case
+    OwnerFailedFirst → pure OwnerFirst
+    ErrorLatchedFirst → pure ValidationFirst
+    SinkFailedFirst → pure (SinkFirst (fmap sinkFailureReason <$> captureSinkFailure capture))
 
 -- | What the capture's latches say, as a checkpoint asks them: the error latch
 -- and the sink's failure. The controller installs the same watch.
@@ -318,8 +333,9 @@ validationSession journal steps offeredAfter capture = do
   required ← requiredInstanceExtensions >>= maybe (stopWith "GLFW requires no surface extensions, so no surface can be made") pure
   budgets ← either (stopWith . tshow) pure (validateBudgets defaultBudgetRequest)
   roots ← newRoots (vulkanRootOps capture) budgets (scriptedSource (pure (scriptedInstant zeroDuration)))
-  -- The roots ask the capture at every checkpoint, as the controller has them.
-  atomically (watchRootsDiagnostics roots (alarms capture))
+  -- The roots ask the capture at every checkpoint, and order the owner's own
+  -- failures by its first-failure cell, as the controller has them.
+  atomically (watchRootsDiagnosticsOrdered roots (DiagnosticWatch (alarms capture) (order capture)))
   _ ← step "the instance and its messenger" (startRoots roots (InstanceRequest required ["VK_LAYER_KHRONOS_validation"] validationFeatures))
   proved ← newIORef Nothing
   let finish = do
