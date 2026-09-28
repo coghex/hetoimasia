@@ -20,6 +20,7 @@ import qualified Test.GPU.Vulkan.Native.Reclamation as Reclamation
 import qualified Test.GPU.Vulkan.Native.Recording as Recording
 import qualified Test.GPU.Vulkan.Native.RecordingVisibility as RecordingVisibility
 import qualified Test.GPU.Vulkan.Native.Roots as Roots
+import qualified Test.GPU.Vulkan.Native.Terminal as Terminal
 import Test.Hspec (describe)
 import Test.Hspec.Runner (Config (configFailOnEmpty), defaultConfig, hspecWith)
 
@@ -38,3 +39,4 @@ main =
       FramesPresentation.spec
       FramesVisibility.spec
       Reclamation.spec
+      Terminal.spec

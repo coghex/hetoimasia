@@ -105,7 +105,10 @@ test-suite integration-tests
         hetoimasia-gpu-vulkan-diagnostics ==0.1.0.0,
         hetoimasia-gpu-vulkan-model ==0.1.0.0,
         hetoimasia-gpu-vulkan-native ==0.1.0.0,
-        hetoimasia-gpu-vulkan-glfw:controller
+        hetoimasia-gpu-vulkan-glfw:controller,
+        bytestring >=0.12 && <0.13,
+        vector >=0.13 && <0.14,
+        vulkan >=3.27 && <3.28
 
 -- The native suite: the package-native Vulkan fixture and the native cases of
 -- VK-2 and VK-5 through VK-7 it took over from the retired proof harness. The
@@ -143,6 +146,7 @@ test-suite vulkan-native-tests
         Test.GPU.Vulkan.Native.Recording
         Test.GPU.Vulkan.Native.Shared
         Test.GPU.Vulkan.Native.Spec
+        Test.GPU.Vulkan.Native.Terminal
         Test.Vulkan.Proof.Bridge
         Test.Vulkan.Proof.BridgeSpec
         Test.Vulkan.Proof.Construction

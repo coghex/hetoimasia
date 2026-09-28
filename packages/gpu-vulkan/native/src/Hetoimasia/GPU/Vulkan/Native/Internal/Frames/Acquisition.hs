@@ -60,10 +60,10 @@ import Hetoimasia.GPU.Vulkan.Native.Generations
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Layer (AcquireResult (..), FrameOps (..))
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.State
 import Hetoimasia.GPU.Vulkan.Native.Internal.Reclamation (recoveringCreation)
-import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State (Refusal (..), modelAnswer, modelEdit, owned)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State (Refusal (..), checkpointed, modelAnswer, modelEdit, owned)
 import Hetoimasia.GPU.Vulkan.Native.Naming (NativeObjectKind (..), PoolObject (..), SlotObject (..), poolObjectName, slotObjectName)
 import Hetoimasia.GPU.Vulkan.Native.Roots
-  ( failRootsSession
+  ( failRootsSessionBecause
   , nameRootsObject
   , readRootsInstrumentation
   , rootsCall
@@ -93,7 +93,7 @@ import Hetoimasia.GPU.Vulkan.Native.Roots
 -- of the target. A call that raised acquired nothing and gives it back too.
 tryAcquireFrame ∷ Frames q inst msgr phys dev cmd → TargetId → IO (Either Refusal Acquisition)
 tryAcquireFrame frames target =
-  owned (framesRecording frames) $
+  owned (framesRecording frames) . checkpointed (framesRecording frames) $
     atomically gate >>= \case
       Left refusal → pure (Left refusal)
       Right (Left answer) → pure (Right answer)
@@ -182,7 +182,7 @@ tryAcquireFrame frames target =
               -- swapchain belongs to: which image is owned is unknown.
               modifyTVar' (framesLive frames) (Map.insert frame (FrameRecord image swapchain pool (StageUncertain mismatch)))
               editSlot frames (slotOf frame) (\sync → sync {syncAcquireState = SemaphoreUncertain mismatch})
-              failRootsSession roots CleanupFailed
+              failRootsSessionBecause roots CleanupFailed (Text.pack (show frame) <> ": " <> mismatch)
               pure (Left mismatch)
           | otherwise → do
               modifyTVar' (framesLive frames) (Map.insert frame (FrameRecord image swapchain pool StageAcquired))
@@ -212,7 +212,7 @@ tryAcquireFrame frames target =
               -- its semaphore's signal is owed and nothing can settle it.
               let why = "the model refused an acquisition the swapchain made: " <> reason
               editSlot frames (slotOf frame) (\sync → sync {syncAcquireState = SemaphoreUncertain why})
-              failRootsSession roots CleanupFailed
+              failRootsSessionBecause roots CleanupFailed (Text.pack (show frame) <> ": " <> why)
               pure (Left why)
           | otherwise → do
               giveBack frame
@@ -258,7 +258,7 @@ prepareSlot frames device frame =
       cleanup ← create "vkCreateFence" (opsCreateFence ops device) `onException` (destroyFence fence >> destroySemaphore acquisition)
       name [(ObjectSemaphore, acquisition, AcquisitionSemaphore), (ObjectFence, fence, SubmissionFence), (ObjectFence, cleanup, CleanupFence)]
         `onException` (destroyFence cleanup >> destroyFence fence >> destroySemaphore acquisition)
-      let sync = SlotSync acquisition SemaphoreUnsignalled fence FenceIdle cleanup FenceIdle
+      let sync = SlotSync acquisition SemaphoreUnsignalled fence FenceIdle cleanup FenceIdle Nothing
       atomically (modifyTVar' (framesSlots frames) (Map.insert key sync))
       pure (Right sync)
   where
@@ -311,7 +311,7 @@ preparePool frames device frame = do
           name number [(ObjectSemaphore, rendered, RenderFinishedSemaphore), (ObjectFence, fence, PresentFence)]
             `onException` (destroyFence fence >> destroySemaphore rendered)
           atomically $
-            modifyTVar' (framesPool frames) (Map.insert (target, number) (PoolSync rendered SemaphoreUnsignalled fence FenceIdle (PoolHeldByFrame frame)))
+            modifyTVar' (framesPool frames) (Map.insert (target, number) (PoolSync rendered SemaphoreUnsignalled fence FenceIdle (PoolHeldByFrame frame) Nothing))
           pure (Right number)
   where
     target = frameTarget frame

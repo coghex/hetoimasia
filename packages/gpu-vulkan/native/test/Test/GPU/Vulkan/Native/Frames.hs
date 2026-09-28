@@ -140,7 +140,9 @@ spec = describe "Frames" $ do
       acquired closing `shouldReturn` AcquisitionClosing
       failed ← newRig
       atomically (failRootsSession (rigRoots failed) CleanupFailed)
-      acquired failed `shouldReturn` AcquisitionUnavailable
+      -- Refused naming the session's primary failure, not answered as an
+      -- unavailable target.
+      refusedPrimary failed `shouldReturn` Just (TerminalCleanupFailed "CleanupFailed")
       mapM_ (\each → frameCalls (rigStandIn each) `shouldReturn` []) [rig, closing, failed]
 
     it "answers an exhausted frame budget as pending backpressure, before any native call" $ do
@@ -264,7 +266,9 @@ spec = describe "Frames" $ do
       sessionState <$> modelOf rig `shouldReturn` SessionFailed UnknownSubmissionEffect
       phaseOf rig (ownedFrame frame) `shouldReturn` Just FrameUncertainEffect
       standingOf rig (ownedFrame frame) `shouldReturn'` (`shouldSatisfy` maybe False uncertainStage)
-      acquired rig `shouldReturn` AcquisitionUnavailable
+      refusedPrimary rig `shouldReturn'` (`shouldSatisfy` \case
+        Just (TerminalUncertainEffect _) → True
+        _ → False)
       skipFrame (rigFrames rig) (ownedFrame frame) `shouldReturn` Left (RefusedMisuse (WrongPhase FrameIdentity))
       _ ← progress rig
       filter isQuery <$> frameCalls (rigStandIn rig) `shouldReturn` []
@@ -284,7 +288,9 @@ spec = describe "Frames" $ do
       syncFenceState sync `shouldSatisfy` \case
         FenceUncertain _ → True
         _ → False
-      acquired rig `shouldReturn` AcquisitionUnavailable
+      refusedPrimary rig `shouldReturn'` (`shouldSatisfy` \case
+        Just (TerminalCleanupFailed _) → True
+        _ → False)
       -- The frame, never submitted, is still abandoned safely, but the slot
       -- keeps its doubtful fence.
       clearFrameStep (rigStandIn rig) AtResetFence

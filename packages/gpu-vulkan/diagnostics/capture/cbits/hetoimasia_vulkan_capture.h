@@ -218,6 +218,36 @@ uint32_t hetoimasia_capture_record_label_name_length(const hetoimasia_capture_re
 #define HETOIMASIA_CAPTURE_ERROR_LATCH 0
 #define HETOIMASIA_CAPTURE_FAILURE_LATCH 1
 
+/* Which terminal failure came first. */
+#define HETOIMASIA_CAPTURE_FIRST_NONE 0
+#define HETOIMASIA_CAPTURE_FIRST_ERROR 1
+#define HETOIMASIA_CAPTURE_FIRST_SINK 2
+#define HETOIMASIA_CAPTURE_FIRST_OWNER 3
+
+/*
+** Record that the consumer's sink has failed, claiming "first" if no error
+** report claimed it before. Call it when the failure is known, before
+** publishing it. Answers 1 when the user data's storage still owns its slot.
+*/
+int hetoimasia_capture_note_sink_failure(void *user_data);
+
+/*
+** Claim "first" for a failure of the capture's owner — one it is about to
+** record, of its own — unless an error report or the sink claimed it before.
+** Answers which failure holds it afterwards, as
+** hetoimasia_capture_first_failure does; claiming again changes nothing.
+*/
+int hetoimasia_capture_claim_owner_failure(void *user_data);
+
+/*
+** Which failure came first — HETOIMASIA_CAPTURE_FIRST_NONE, _ERROR, _SINK or
+** _OWNER —
+** or -1 once the slot serves another storage. An error report claims it
+** before it sets the error latch, so a reader that has seen a latch or a
+** published sink failure and reads this afterwards reads the true order.
+*/
+int hetoimasia_capture_first_failure(void *user_data);
+
 /*
 ** Read the counters and latches of the storage this user data was issued for,
 ** into `counters[HETOIMASIA_CAPTURE_COUNTERS]` and `latches[2]`. Answers 1 when

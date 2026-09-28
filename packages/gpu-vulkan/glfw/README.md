@@ -15,7 +15,10 @@ loop adapter here.
   graphics owner, whose operations are this package's controller.
   `handOverVulkanTarget` creates one window's surface through GLFW on the main
   thread, inside that window's attachment, and hands it to the owner as a
-  required or optional target. `replaceVulkanSurfaces` creates, on the main
+  required or optional target — or, once the session has failed, refuses naming
+  its primary failure. `readVulkanTerminal` reads the session's terminal latch:
+  that primary, the device's loss if it was observed, and what teardown found
+  and retained beside it. `replaceVulkanSurfaces` creates, on the main
   thread, the replacement surface the owner asked for to recover a lost one,
   under the same attachment (VK-14); `readVulkanUnavailability` reports an
   optional target that could not be recovered, and a required one fails the

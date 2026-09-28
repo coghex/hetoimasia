@@ -488,6 +488,11 @@ data GraphicsOperations scene = GraphicsOperations
     -- ^ One bounded progress step. It must return finitely.
   , graphicsNextDeadline ∷ IO NextDeadline
     -- ^ The earliest absolute instant the backend next wants a round.
+  , graphicsWake ∷ STM Bool
+    -- ^ Whether something the backend watches, on another thread, asks for a
+    -- round now — a failure its own worker recorded while the owner had no
+    -- deadline, say. The waiting owner rereads it; it must stay 'False' once
+    -- the round it asked for has answered it.
   , graphicsRetireTarget ∷ TargetRetire → IO TargetRetired
     -- ^ Retire one target. Returning is the evidence; raising is not.
   , graphicsRetireOwner ∷ OwnerRetire → IO OwnerRetired
@@ -1521,8 +1526,11 @@ ownerWait owner token = do
     -- A window closed from the main thread begins its attachment's retirement
     -- without an event, so an idle owner has to wake for that too.
     closing ← retirementsBegun owner
+    -- Something the backend watches on another thread, which no event of the
+    -- owner's would otherwise report.
+    woken ← graphicsWake (ownerOperations (ownerSettings owner))
     elapsed ← expired
-    check (stopping || failing || queued || fresher || published || prunable || closing || elapsed)
+    check (stopping || failing || queued || fresher || published || prunable || closing || woken || elapsed)
   where
     handoff = ownerHandoff' owner
     OwnerTimer arm = ownerClockTimer (ownerSettings owner)

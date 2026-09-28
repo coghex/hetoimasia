@@ -356,6 +356,7 @@ fakeOperations fake =
         note (fakeJournal fake) Stepped
         readTVarIO (fakeStep fake) >>= ($ step)
     , graphicsNextDeadline = mark >> readTVarIO (fakeDeadline fake) >>= id
+    , graphicsWake = pure False
     , graphicsRetireTarget = \retire → do
         mark
         atomically (modifyTVar' (fakeRetirements fake) (<> [retire]))

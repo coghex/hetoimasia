@@ -58,7 +58,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   )
 import Hetoimasia.GPU.Vulkan.Native.Generations (Generations)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer (RecordingOps)
-import Hetoimasia.GPU.Vulkan.Native.Roots (Roots, SubjectDisposer (..), failRootsSession, readRootsDevice, registerRootsDisposer, stateRootsModel)
+import Hetoimasia.GPU.Vulkan.Native.Roots (Roots, SubjectDisposer (..), failRootsSessionBecause, readRootsDevice, registerRootsDisposer, stateRootsModel)
 
 -- | Destroy every released generation whose holds the model reports ended,
 -- and record the disposals with the model. A pipeline layout waits for every
@@ -74,7 +74,9 @@ disposeResources recording now = owner recording (go [])
     -- everything that did return has been recorded.
     go recorded = do
       (destroyed, failures) ← pass
-      unless (null failures) (atomically (failRootsSession roots CleanupFailed))
+      -- Each failed destruction is its own cleanup failure, named.
+      for_ failures $ \(resource, reason) →
+        atomically (failRootsSessionBecause roots CleanupFailed ("destroying " <> Text.pack (show resource) <> " raised: " <> reason))
       settled ← settle []
       for_ failures $ \(resource, reason) → throwIO (ResourceDestructionFailed resource reason)
       if null destroyed then pure (recorded <> settled) else go (recorded <> settled)
@@ -124,9 +126,7 @@ destroyOne recording device resource record = mask_ $
     Right () → Nothing <$ atomically (editManaged recording resource (\entry → entry {managedStanding = ManagedDestroyedPending}))
     Left failure@(ExceptionWithContext _ exception) → do
       let reason = Text.pack (displayException exception)
-      atomically $ do
-        editManaged recording resource (\entry → entry {managedStanding = ManagedUncertain reason})
-        failRootsSession (recordingRoots recording) CleanupFailed
+      atomically (editManaged recording resource (\entry → entry {managedStanding = ManagedUncertain reason}))
       if isAsynchronous exception then rethrowIO failure else pure (Just reason)
 
 -- | A recording over these roots and generations, owned by the calling

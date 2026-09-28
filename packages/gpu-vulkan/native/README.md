@@ -5,7 +5,7 @@ Buildable package: `hetoimasia-gpu-vulkan-native`, in `packages/gpu-vulkan/nativ
 The package that owns the Vulkan binding, the handles and the calls: VK-6's
 diagnostic messengers, VK-9's shader adapter, VK-7's roots, VK-10's
 swapchain generations, VK-11's managed resources and recorder, VK-12's and
-VK-13's frames, and VK-14's recovery. It depends on no window system: a surface reaches it as a 64-bit handle and the action that
+VK-13's frames, VK-14's recovery, and VK-15's terminal failure. It depends on no window system: a surface reaches it as a 64-bit handle and the action that
 destroys it.
 
 - `Hetoimasia.GPU.Vulkan.Native.Profile` is the runtime profile as pure
@@ -18,10 +18,14 @@ destroys it.
   messenger, shared device and per-target surface records, keyed by the GPU
   model's `TargetId`, over an open native layer (`RootOps`). It creates parent
   before child, destroys child before parent and refuses rather than reorders,
-  never retries an uncertain destruction, and latches device loss. For VK-14 it
-  destroys a target's lost surface while keeping the target
-  (`releaseRootSurface`), installs a replacement once the session's one queue
-  family can present to it (`installRootSurface`), classifies the native
+  never retries an uncertain destruction, and keeps the session's terminal
+  latch: the first failure — device loss, a validation error or sink failure
+  its checkpoint learns from the diagnostic watch, an uncertain effect, a failed
+  cleanup, a required target's exhausted recovery — as the primary, later ones
+  and what teardown retained as evidence beside it, and the device's loss apart
+  from both. For VK-14 it destroys a target's lost surface while keeping the
+  target (`releaseRootSurface`), installs a replacement once the session's one
+  queue family can present to it (`installRootSurface`), classifies the native
   results recovery acts on (`NativeFailure`), and holds the disposer each layer
   above registers for a reclamation pass. It makes no native call of its own.
 - `Hetoimasia.GPU.Vulkan.Native.Roots.Vulkan` is the production native layer:
@@ -109,10 +113,15 @@ destroys it.
   presentation that ran out of memory had no effect, and is recovered once
   (VK-14). Every native effect and
   its bookkeeping are one masked step, and an unknown effect is retained for
-  ever with admission stopped. It is the entry point only: its code lives in
-  private modules under `Hetoimasia.GPU.Vulkan.Native.Internal.Frames` —
-  `Layer`, `State`, `Acquisition`, `Submission`, `Presentation`,
-  `Abandonment` and `Progress` — which it re-exports unchanged (see
+  ever with admission stopped — unless the device is lost: rendering,
+  acquisition, submission and presentation are refused naming the session's
+  primary failure once it has one, and after the loss `releaseFramesToDeviceLoss`
+  lets go of what only the lost device could have discharged, asking and waiting
+  on no fence and marking none signalled, so a target's retirement destroys its
+  synchronization whatever it was owed. It is the entry point only: its code
+  lives in private modules under `Hetoimasia.GPU.Vulkan.Native.Internal.Frames`
+  — `Layer`, `State`, `Acquisition`, `Submission`, `Presentation`,
+  `Abandonment`, `Loss` and `Progress` — which it re-exports unchanged (see
   [the backend contract](../../../docs/gpu_backend.md#frames-acquisition-submission-and-abandonment)).
   `Hetoimasia.GPU.Vulkan.Native.Frames.Vulkan` is its production layer, the
   binding's own `safe` calls.

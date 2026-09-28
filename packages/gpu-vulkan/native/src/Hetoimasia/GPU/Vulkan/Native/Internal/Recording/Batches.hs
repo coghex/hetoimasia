@@ -15,11 +15,12 @@
 module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Batches
   ( discardBatch
   , resetFrameRecorder
+  , forgetUnsubmittedBatches
   , noteBatchSubmitted
   , retireCompleted
   ) where
 
-import Control.Concurrent.STM (atomically, modifyTVar', readTVar, readTVarIO)
+import Control.Concurrent.STM (STM, atomically, modifyTVar', readTVar, readTVarIO)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, displayException, mask_, rethrowIO, throwIO, tryWithContext)
 import Data.Foldable (for_)
 import qualified Data.Map.Strict as Map
@@ -64,7 +65,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , modelAnswer
   , owned
   )
-import Hetoimasia.GPU.Vulkan.Native.Roots (failRootsSession, readRootsDevice, rootsCall, stateRootsModel)
+import Hetoimasia.GPU.Vulkan.Native.Roots (failRootsSessionBecause, readRootsDevice, rootsCall, stateRootsModel)
 
 -- | Free the frame's slot of batches whose submission has completed. A
 -- submitted batch keeps its record, and its storage, until the submission
@@ -149,6 +150,22 @@ resetFrameRecorder recording frame =
       BatchUncertain _ → True
       _ → False
 
+-- | After the device's loss, forget every batch of this frame that was never
+-- submitted, with no native call: its commands can never execute, since
+-- nothing is admitted to the lost device again, so nothing needs invalidating
+-- before the model lets go of them, and the storage's destruction frees them
+-- under the device-loss rule. That includes a batch an earlier reset left
+-- uncertain: what was unknown is whether the pool was reset, and the pool is
+-- never reset again, only destroyed. The caller has the model skip the frame
+-- in the same transaction, which is what discharges the batches' references.
+forgetUnsubmittedBatches ∷ Recording q inst msgr phys dev cmd → FrameSlotId → STM ()
+forgetUnsubmittedBatches recording frame =
+  modifyTVar' (recordingBatches recording) (Map.filter (\record → batchFrame record /= frame || submitted (batchStanding record)))
+  where
+    submitted = \case
+      BatchSubmitted _ → True
+      _ → False
+
 -- | Reset a storage's pool, then discharge in the model. The two are one
 -- masked step. A reset that raised retains every batch named, fails the
 -- session and raises 'BatchInvalidationFailed'.
@@ -171,7 +188,7 @@ invalidate recording storage batches discharge =
               let reason = Text.pack (displayException exception)
               atomically $ do
                 for_ batches (\batch → editBatch recording batch (\entry → entry {batchStanding = BatchUncertain reason}))
-                failRootsSession roots CleanupFailed
+                failRootsSessionBecause roots CleanupFailed ("resetting the storage of " <> Text.pack (show batches) <> " raised: " <> reason)
               if isAsynchronous exception then rethrowIO failure else throwIO (BatchInvalidationFailed batches reason)
             Right () → atomically $ do
               -- The records go only with the model's discharge: a refused

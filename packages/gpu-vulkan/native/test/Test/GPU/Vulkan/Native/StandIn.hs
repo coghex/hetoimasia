@@ -135,6 +135,9 @@ data Step
   | AtCreateView
   | AtDestroyView
   | AtDestroySwapchain
+  | AtFrameCall
+    -- ^ Never scripted here: the frames' stand-in names a loss one of its own
+    -- calls raised with it.
   deriving (Eq, Ord, Show, Enum, Bounded)
 
 -- | What a scripted step does instead of succeeding.

@@ -14,7 +14,7 @@ import Control.Concurrent (forkIO, killThread, throwTo, yield)
 import Control.Monad (forM_, replicateM_, when)
 import Data.Word (Word64)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar)
-import Control.Concurrent.STM (atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
+import Control.Concurrent.STM (atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import Control.Exception
   ( AsyncException (ThreadKilled, UserInterrupt)
   , Exception
@@ -59,6 +59,12 @@ import Hetoimasia.GPU.Vulkan.Diagnostics
   , DiagnosticVerdict (..)
   , FinalizationEvidence (..)
   , VerdictIssue (..)
+  , CaptureAlarm (..)
+  , SinkFailure (..)
+  , captureAlarms
+  , CaptureOrder (..)
+  , claimCaptureOrder
+  , captureSinkFailure
   , captureStatus
   , capturePhase
   , captureUserData
@@ -67,6 +73,7 @@ import Hetoimasia.GPU.Vulkan.Diagnostics
   , diagnosticsComponent
   , finalizationEvidence
   , afterLastCallback
+  , requestDrain
   , retainStorage
   , verdictClean
   , verdictIssues
@@ -77,6 +84,7 @@ import Hetoimasia.GPU.Vulkan.Diagnostics.Internal.Capture
   , Severity (..)
   , holdArrived
   , newHold
+  , noteSinkFailure
   , offerAnnounced
   , offerHeld
   , offerMissingData
@@ -90,6 +98,13 @@ data PrimaryFailure = PrimaryFailure
   deriving (Eq, Show)
 
 instance Exception PrimaryFailure
+
+alarmKind ∷ CaptureAlarm → String
+alarmKind = \case
+  CaptureErrorLatched → "error"
+  CaptureSinkFailed _ → "sink"
+  CaptureAlarmPending → "pending"
+  CaptureOwnerClaimed → "owner"
 
 consumerName ∷ ConsumerOutcome → String
 consumerName = \case
@@ -261,6 +276,91 @@ spec = describe "Lifetime" $ do
       verdictIssues verdict `shouldBe` [RecordsUndelivered 3, ConsumerUnsuccessful]
       -- One write reached the sink and failed; nothing was written about it.
       readTVarIO attempts `shouldReturn` 1
+
+    it "is observable while the lifetime still captures, from the moment the worker meets it" $ do
+      (logger, _) ← failingLogger
+      ((before, during, phase), verdict) ←
+        capturing logger $ \capture → do
+          before ← atomically (captureSinkFailure capture)
+          offerTo capture (plainOffer SeverityWarning "the first report")
+          requestDrain capture
+          during ← bounded (atomically (captureSinkFailure capture >>= maybe retry pure))
+          phase ← atomically (capturePhase capture)
+          pure (before, during, phase)
+      before `shouldBe` Nothing
+      sinkFailureReason during `shouldSatisfy` (not . Text.null)
+      phase `shouldBe` PhaseCapturing
+      consumerName (verdictConsumer verdict) `shouldBe` "sink failed"
+
+    it "answers a sink failure and an error that followed it in the order they happened" $ do
+      (logger, _) ← failingLogger
+      (alarms, _) ←
+        capturing logger $ \capture → do
+          offerTo capture (plainOffer SeverityWarning "a warning the sink cannot take")
+          requestDrain capture
+          _ ← bounded (atomically (captureSinkFailure capture >>= maybe retry pure))
+          offerTo capture (plainOffer SeverityError "an error after the sink failed")
+          captureAlarms capture
+      map alarmKind alarms `shouldBe` ["sink", "error"]
+
+    it "answers an error and a sink failure that followed it in the order they happened" $ do
+      (logger, _) ← failingLogger
+      (alarms, _) ←
+        capturing logger $ \capture → do
+          offerTo capture (plainOffer SeverityError "the error the sink cannot take")
+          requestDrain capture
+          _ ← bounded (atomically (captureSinkFailure capture >>= maybe retry pure))
+          captureAlarms capture
+      map alarmKind alarms `shouldBe` ["error", "sink"]
+
+    it "gives first place to the owner's failure when it claims before any diagnostic failure, and to the diagnostic failure that claimed before it" $ do
+      (logger, _) ← switchedLogger
+      (orders, _) ←
+        capturing logger $ \capture → do
+          first ← claimCaptureOrder capture
+          -- Claiming again changes nothing, and an error after it is later.
+          offerTo capture (plainOffer SeverityError "an error after the owner's failure")
+          again ← claimCaptureOrder capture
+          pure (first, again)
+      orders `shouldBe` (OwnerFailedFirst, OwnerFailedFirst)
+      (errorFirst, _) ←
+        capturing logger $ \capture → do
+          offerTo capture (plainOffer SeverityError "an error before the owner's failure")
+          claimCaptureOrder capture
+      errorFirst `shouldBe` ErrorLatchedFirst
+      (sinkFirst, _) ←
+        capturing logger $ \capture → do
+          noteSinkFailure (captureUserData capture)
+          claimCaptureOrder capture
+      sinkFirst `shouldBe` SinkFailedFirst
+
+    it "answers the owner's claim ahead of the alarms that came after it" $ do
+      (logger, _) ← switchedLogger
+      (alarms, _) ←
+        capturing logger $ \capture → do
+          _ ← claimCaptureOrder capture
+          offerTo capture (plainOffer SeverityError "an error after the owner's failure")
+          captureAlarms capture
+      map alarmKind alarms `shouldBe` ["owner", "error"]
+
+    it "answers only that a failure is pending while the failure that came first has claimed the order but not yet published its alarm" $ do
+      (logger, failing) ← switchedLogger
+      (answers, _) ←
+        capturing logger $ \capture → do
+          -- The worker's sink claims the order and pauses before it publishes
+          -- its failure; an error then latches.
+          noteSinkFailure (captureUserData capture)
+          offerTo capture (plainOffer SeverityError "an error after the sink claimed the order")
+          before ← captureAlarms capture
+          -- The sink's failure is then published: both are answered, the sink
+          -- first.
+          atomically (writeTVar failing True)
+          offerTo capture (plainOffer SeverityWarning "a warning the sink cannot take")
+          requestDrain capture
+          _ ← bounded (atomically (captureSinkFailure capture >>= maybe retry pure))
+          after ← captureAlarms capture
+          pure (map alarmKind before, map alarmKind after)
+      answers `shouldBe` (["pending"], ["sink", "error"])
 
     it "stands beside the body's failure, which is rethrown unchanged with the verdict on it" $ do
       (logger, _) ← failingLogger

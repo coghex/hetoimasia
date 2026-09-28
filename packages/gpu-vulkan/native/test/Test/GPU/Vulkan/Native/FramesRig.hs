@@ -11,12 +11,14 @@ module Test.GPU.Vulkan.Native.FramesRig
   , newRigWith
   , newRigWithActions
   , newRigOver
+  , newRigClassed
   , geometries
   , commandsOf
 
     -- * Driving it
   , acquired
   , acquiredOn
+  , refusedPrimary
   , owned
   , ownedOn
   , sealed
@@ -66,6 +68,7 @@ import Control.Concurrent (ThreadId, forkIO, killThread, myThreadId, yield)
 import Control.Concurrent.STM (atomically)
 import Control.Exception (AsyncException (ThreadKilled), Exception, SomeException, fromException, try)
 import Control.Monad (unless, when)
+import Data.Functor ((<&>))
 import Data.IORef (atomicModifyIORef', newIORef)
 import Data.List.NonEmpty (NonEmpty)
 import qualified Data.Map.Strict as Map
@@ -117,12 +120,12 @@ data Rig = Rig
   , rigRoots ∷ !StandInRoots
   , rigGenerations ∷ !(Generations () Int Int Text Int)
   , rigRecording ∷ !(Recording () Int Int Text Int Word64)
-  , rigRecordingStandIn ∷ !RecordingStandIn
   , rigFrames ∷ !(Frames () Int Int Text Int Word64)
   , rigTarget ∷ !TargetId
     -- ^ The first target.
   , rigTargets ∷ ![TargetId]
     -- ^ Every target, in the order they were admitted.
+  , rigRecordingStandIn ∷ !RecordingStandIn
   , rigStorages ∷ ![FrameStorage]
   , rigCommands ∷ ![Word64]
   }
@@ -144,13 +147,17 @@ newRigWithActions slots actions = newRigOver 1 defaultBudgetRequest {requestedFr
 -- by 480 generation of three images and a storage for each of its frame
 -- slots — over these budgets. The storages are the first target's first.
 newRigOver ∷ Int → BudgetRequest → IO Rig
-newRigOver count request = do
+newRigOver count = newRigClassed (replicate count OptionalTarget)
+
+-- | 'newRigOver' with a target of each of these designations, in order.
+newRigClassed ∷ [TargetClass] → BudgetRequest → IO Rig
+newRigClassed classes request = do
   rootsStandIn ← newStandIn
   roots ← newStandInRoots rootsStandIn (either (error . show) id (validateBudgets request))
   _ ← startRoots roots standardRequest
-  targets ← mapM (\surface → admitRootTarget roots OptionalTarget (surfaceNumbered rootsStandIn surface) >>= either (fail . show) pure) (take count [10 ..])
+  targets ← mapM (\(classification, surface) → admitRootTarget roots classification (surfaceNumbered rootsStandIn surface) >>= either (fail . show) pure) (zip classes [10 ..])
   generations ← newGenerations roots
-  mapM_ (\(target, surface) → atomically (trackTarget generations target OptionalTarget surface)) (zip targets [10 ..])
+  mapM_ (\(classification, target, surface) → atomically (trackTarget generations target classification surface)) (zip3 classes targets [10 ..])
   _ ← stepGenerations generations (at 0) (geometries targets (SurfaceExtent 640 480))
   recordingStandIn ← newRecordingStandIn
   recording ← newRecording (recordingStandInOps recordingStandIn) roots generations
@@ -165,7 +172,7 @@ newRigOver count request = do
   views ← atomically (readManaged recording)
   let commands = [handle | ManagedView _ _ "frame storage" [handle] ← views]
   case targets of
-    first : _ → pure (Rig standIn rootsStandIn roots generations recording recordingStandIn frames first targets storages commands)
+    first : _ → pure (Rig standIn rootsStandIn roots generations recording frames first targets recordingStandIn storages commands)
     [] → fail "a rig needs a target"
 
 -- | Every target at this extent, as its owner would publish it.
@@ -179,6 +186,14 @@ commandsOf rig slot = (rigCommands rig !! fromIntegral slot) + 1
 
 acquired ∷ Rig → IO Acquisition
 acquired rig = acquiredOn rig (rigTarget rig)
+
+-- | The primary failure an acquisition of the rig's target was refused with,
+-- once its session has failed; 'Nothing' for any other answer.
+refusedPrimary ∷ Rig → IO (Maybe TerminalCause)
+refusedPrimary rig =
+  tryAcquireFrame (rigFrames rig) (rigTarget rig) <&> \case
+    Left (RefusedSessionFailed primary) → Just primary
+    _ → Nothing
 
 acquiredOn ∷ Rig → TargetId → IO Acquisition
 acquiredOn rig target = tryAcquireFrame (rigFrames rig) target >>= either (fail . ("the acquisition was refused: " <>) . show) pure

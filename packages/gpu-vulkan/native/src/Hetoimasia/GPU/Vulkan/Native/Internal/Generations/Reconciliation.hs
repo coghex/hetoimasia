@@ -101,7 +101,7 @@ import Hetoimasia.GPU.Vulkan.Native.Roots
   , GraphicsDeviceLost
   , NativeFailure (..)
   , SwapchainRequest (..)
-  , failRootsSession
+  , failRootsSessionBecause
   , nameRootsObject
   , readRootsDevice
   , readRootsInstrumentation
@@ -503,7 +503,7 @@ reconcile generations now target geometry = do
             }
     uncertain candidate reason = atomically $ do
       editGeneration generations candidate (\entry → entry {genStanding = GenerationUncertain reason})
-      failRootsSession roots CleanupFailed
+      failRootsSessionBecause roots CleanupFailed (Text.pack (show candidate) <> ": " <> reason)
     suspend suspension = do
       atomically $ do
         modelEdit_ (suspendTarget target)

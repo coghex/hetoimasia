@@ -66,6 +66,14 @@ A rejected call is never a partially applied one. Misuse is checked before
 anything is written, so the answer and the state can never disagree about whether
 something happened.
 
+A failed session admits no new work: every admission answers
+`SessionAlreadyFailed`. Recording what a native call already did is not new
+work, so a call whose own failure ended the session — a device loss it raised —
+still has its outcome recorded: an acquisition that owned nothing gives its
+reservation back, and a submission that failed with no effect, or with an effect
+nobody can know, is recorded as such. Only an acquisition that owns an image and
+an accepted submission are refused.
+
 ## Identities
 
 | Identity         | Names                                                                    |
@@ -409,8 +417,9 @@ not the target recovering, and treating it as such would erase that retry.
 
 Exhaustion marks an optional target unavailable and leaves the session running;
 for a required target it fails the graphics session. Device loss, a validation
-error, an unknown submission effect and a failed cleanup escalate to the session
-rather than to a target, whatever the target's classification says.
+error, an unknown submission effect, a failed cleanup and a failed diagnostic
+sink (`DiagnosticSinkFailed`) escalate to the session rather than to a target,
+whatever the target's classification says.
 
 A target can also be **declared unrecoverable** with attempts to spare
 (`declareTargetUnrecoverable`), when the boundary knows no attempt can help —
@@ -460,6 +469,37 @@ so a record beyond one window is reached by a later pass rather than never.
 A failed disposal retains the subject's ownership and its accounting, is never
 replayed, and escalates the session. A cleanup failure is never permission to
 proceed as though rollback succeeded.
+
+## Device loss
+
+The session's first cause and the device's loss are two facts. `noteDeviceLoss`
+records the loss and fails the session with `DeviceLost` — unless something
+failed it first, whose cause is then kept, with its one escalation notice, and
+the loss recorded beside it; `deviceLossObserved` answers whether it was. That is
+what lets a teardown that began for a validation error, say, switch to the
+device-loss rules when a later call reports the loss, without rewriting why the
+session ended.
+
+`releaseToDeviceLoss` is the specification's device-loss rule, and nothing
+more: a lost device's objects may be destroyed without waiting for work that may
+never complete. It lets go of every outstanding submission — certain or
+uncertain — every enqueued presentation and every record awaiting an
+unpresented frame's settlement, and every frame that had left acquisition:
+submitted, enqueued, retiring or in the uncertain-effect state. Their submitted
+uses and presentation obligations end, their records and accounting go, and the
+cycles they belonged to are dropped uncredited. It is not completion: no
+submission is recorded as completed, no presentation as retired, no recovery
+episode sees healthy progress, and the facts that would have said so are refused
+afterwards, because their records are gone. An uncertain effect is released
+because what was unknown about it — whether the device ran its work — is exactly
+what the rule makes irrelevant to destroying what it retained.
+
+What it does not release is everything the loss says nothing about: a frame
+still reserved or acquired, whose unsubmitted recording the boundary must
+invalidate and skip first, and which the answer (`DeviceLossRelease`) names;
+recorded references, logical release and ended CPU use; and every disposal that
+already failed. Before the loss is recorded it is refused as `WrongPhase` of the
+device, and a second release releases nothing.
 
 ## Owner progress
 
@@ -658,6 +698,17 @@ window staying finite under optional-target churn, with what it dropped counted
 and a draining boundary never reaching the bound; every compound identity
 reported by its own kind rather than its parent's; and one target's generation
 offered to another called a wrong parent rather than a foreigner.
+
+And device loss: the loss recorded as the session's first cause and notified
+once, or kept beside an earlier cause that stays the session's; the release
+refused before the loss; a submission and a presentation released without either
+being completed or retired, their cycle dropped uncredited and the facts that
+would have completed them refused; an uncertain effect retaining its generation
+until the loss and released under it; an acquired frame with a recorded batch
+left to be skipped first and released once it has been; a second release
+releasing nothing; and the outcome of the call that failed the session recorded
+— a returned reservation, an uncertain submission — while an owned image and an
+accepted submission are refused.
 
 And the arithmetic edges at the end of the clock's range: a retry delay that
 overflows refusing the next attempt rather than skipping the delay, and a

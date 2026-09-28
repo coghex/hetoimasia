@@ -65,7 +65,7 @@ import Control.Exception
   , throwIO
   , tryWithContext
   )
-import Control.Monad (forM, unless)
+import Control.Monad (forM)
 import Data.Foldable (for_)
 import Data.Maybe (isJust)
 import Data.Text (Text)
@@ -95,7 +95,7 @@ import Hetoimasia.GPU.Vulkan.Native.Roots
   , NativeFailure (..)
   , Roots
   , SubjectDisposer (..)
-  , failRootsSession
+  , failRootsSessionBecause
   , readRootsDisposers
   , rootsNativeFailure
   , stateRootsModel
@@ -104,7 +104,7 @@ import Hetoimasia.GPU.Vulkan.Native.Roots
 -- | Run one reclamation pass: offer the subjects the model's next bounded
 -- window holds eligible to the layers that own them, and record what each
 -- destruction did. A disposal that failed is retained, never offered again,
--- and fails the session with 'CleanupFailed'.
+-- and fails the session with 'CleanupFailed', naming it.
 reclaimOnce ∷ Roots q inst msgr phys dev → IO ReclaimReport
 reclaimOnce roots = do
   (offered, disposers) ← atomically $ do
@@ -119,7 +119,9 @@ reclaimOnce roots = do
       let (next, answered) = reclaimPass silentEvidence {disposalEvidence = evidenceFrom results} model
        in (answered, next)
     for_ disposers (\disposer → disposerForget disposer (reclaimDisposed report))
-    unless (null (reclaimFailures report)) (failRootsSession roots CleanupFailed)
+    -- Each failed disposal is its own cleanup failure, named.
+    for_ (reclaimFailures report) $ \subject →
+      failRootsSessionBecause roots CleanupFailed ("reclaiming " <> Text.pack (show subject) <> " did not complete")
     pure report
   where
     evidenceFrom results subject = maybe DisposalRefused id (lookup subject results >>= id)

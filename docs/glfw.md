@@ -3745,6 +3745,7 @@ and nothing else.
 | `graphicsConstructTarget` | Construct one attachment's target and settle its handoff. |
 | `graphicsStep` | One bounded progress step, which must return finitely, reporting whether further work is owed at once. |
 | `graphicsNextDeadline` | The earliest absolute instant the backend next wants a round, or no demand. |
+| `graphicsWake` | Whether something the backend watches on another thread asks for a round now; the waiting owner rereads it, and it must stay false once the round it asked for has answered it. |
 | `graphicsRetireTarget` | Retire one target. |
 | `graphicsRetireOwner` | Retire the owner itself, told whether startup ever returned and which targets could not be accounted for. |
 | `graphicsDestroyOwner` | Release the owner's shared state. |

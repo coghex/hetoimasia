@@ -61,9 +61,10 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , Recording (..)
   , Refusal (..)
   , batchHeld
+  , checkpointed
   , owned
   )
-import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost, failRootsSession, rootsCall, rootsSessionIdentity, stateRootsModel)
+import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost, failRootsSessionBecause, rootsCall, rootsSessionIdentity, stateRootsModel)
 
 -- | One frame of a validated request.
 data Member cmd = Member
@@ -112,7 +113,7 @@ data Member cmd = Member
 --   it was, so the loss is what the caller sees first.
 submitFrames ∷ Frames q inst msgr phys dev cmd → NonEmpty BatchId → IO (Either Refusal Submitted)
 submitFrames frames request =
-  owned recording $
+  owned recording . checkpointed recording $
     attempt >>= \case
       Right (SubmittedNothing reason) → recoverNoEffect reason
       other → pure other
@@ -223,7 +224,7 @@ submitFrames frames request =
           atomically $ do
             answered Model.submitFrames framesOf SubmissionFailedWithoutEffect
             editSlot frames key (\sync → sync {syncFenceState = FenceUncertain (Text.pack (displayException exception))})
-            failRootsSession roots CleanupFailed
+            failRootsSessionBecause roots CleanupFailed ("resetting the submission fence of slot " <> Text.pack (show key) <> " raised: " <> Text.pack (displayException exception))
           rethrowIO failure
         Right () → do
           atomically (editSlot frames key (\sync → sync {syncFenceState = FenceIdle}))
@@ -256,12 +257,7 @@ submitFrames frames request =
           Admitted (next, SubmissionRecorded submission) → (Just submission, next)
           _ → (Nothing, model)
         case answer of
-          Nothing → do
-            let reason = "the model refused to record a submission the queue accepted"
-            answered Model.submitFrames framesOf SubmissionEffectUncertain
-            uncertain frames UnknownSubmissionEffect framesOf reason
-            editSlot frames key (\sync → sync {syncFenceState = FenceUncertain reason})
-            pure (Left reason)
+          Nothing → pure Nothing
           Just submission → do
             for_ members $ \member → do
               editFrame frames (memberFrame member) (\record → record {recordStage = StageSubmitted submission})
@@ -269,10 +265,18 @@ submitFrames frames request =
               editPool frames (memberPool member) (\held → held {poolRenderedState = SemaphoreSignalOwed})
             editSlot frames key (\sync → sync {syncFenceState = FencePending})
             modifyTVar' (framesSubmissions frames) (Map.insert submission (SubmissionRecord key framesOf))
-            pure (Right submission)
+            pure (Just submission)
       case committed of
-        Left reason → throwIO (FrameEffectUncertain framesOf reason)
-        Right submission → do
+        Nothing → do
+          -- The refusal left the model as it was: the unknown effect is
+          -- recorded in a transaction of its own.
+          let reason = "the model refused to record a submission the queue accepted"
+          atomically $ do
+            answered Model.submitFrames framesOf SubmissionEffectUncertain
+            uncertain frames UnknownSubmissionEffect framesOf reason
+            editSlot frames key (\sync → sync {syncFenceState = FenceUncertain reason})
+          throwIO (FrameEffectUncertain framesOf reason)
+        Just submission → do
           -- The recording's own evidence that each batch's work was
           -- submitted, which its readback needs; the model has already
           -- consumed every batch, so none can be refused here.

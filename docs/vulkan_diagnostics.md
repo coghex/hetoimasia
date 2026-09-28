@@ -151,6 +151,8 @@ retainStorage   ∷ DiagnosticCapture → IO ()
 capturePhase    ∷ DiagnosticCapture → STM CapturePhase
 captureStatus   ∷ DiagnosticCapture → IO CaptureStatus
 deliveredCount  ∷ DiagnosticCapture → STM Word64
+captureSinkFailure ∷ DiagnosticCapture → STM (Maybe SinkFailure)
+captureAlarms   ∷ DiagnosticCapture → IO [CaptureAlarm]
 ```
 
 The lifetime is established before any messenger exists: it allocates the
@@ -366,10 +368,43 @@ exception that is itself the finalization cancellation or group-closing
 failure, which the verdict already accompanies.
 
 Stopping graphics admission when the error latch is set is the owner's, at its
-checkpoints: this package exposes the latch and does nothing about it. VK-7's
-controller does not read it yet — it records and submits nothing, so there is
-no graphics work to stop — and stopping on a strict validation error is in
-VK-15's (#231) scope.
+checkpoints: this package exposes the latch and does nothing about it. VK-15's
+controller (#231) installs the latch as the roots' diagnostic watch, so the
+owner's next checkpoint makes an error-severity report the session's primary
+failure ([gpu_backend.md](gpu_backend.md#terminal-failure)).
+
+`captureSinkFailure` answers the same way for the consumer: the failure that
+stopped delivery (`sinkFailureReason`), from the moment the worker met it
+rather than only once the verdict is reached. It is set once and never
+cleared, it never touches the error latch, and the verdict still carries the
+failure itself as `ConsumerSinkFailed`.
+
+`captureAlarms` answers both at once, in the order they happened:
+`CaptureErrorLatched` and `CaptureSinkFailed` with its reason. The storage
+keeps one first-failure cell per lifetime. The C callback claims it for an
+error with a compare-and-swap before it sets the error latch, and the worker
+claims it for its sink before it publishes the failure. Whichever comes first
+owns the cell, and a later one changes nothing, so an owner that learns of
+both at one checkpoint reads which came first from the cell rather than from
+the moment it looked. A failure that has claimed the cell but not yet set its
+own alarm leaves, for that moment, only a later alarm readable; then
+`captureAlarms` answers `CaptureAlarmPending` alone — something failed, which
+came first is not yet readable, and admission should stay closed — and the next
+reading answers them in order, so it never answers a later failure first.
+
+The capture's owner claims the same cell for a failure of its own
+(`claimCaptureOrder`) before it records it. The answer is who holds first
+place: `OwnerFailedFirst`, when no diagnostic failure came before it — and any
+that comes afterwards is later — or `ErrorLatchedFirst` or `SinkFailedFirst`,
+when one did. It is the one compare-and-swap, so claiming again changes
+nothing, and a capture whose slot serves another lifetime answers
+`OwnerFailedFirst`. Once the owner holds first place, `captureAlarms` answers
+`CaptureOwnerClaimed` ahead of the alarms that came after it, which it answers
+in no particular order between themselves: recording the owner's failure is
+the owner's, and until it has, nothing should be taken ahead of it. The controller installs both as the roots' diagnostic
+watch, so a failed sink is a terminal status of its own at the owner's next
+checkpoint — never a replacement for an earlier failure, and never permission
+to release anything.
 
 ## Messengers on real objects
 
@@ -407,11 +442,12 @@ proof checks the binding flags against the pin.
 | State | Owner | Writers | Readers | Thread | Lifetime and reset |
 | --- | --- | --- | --- | --- | --- |
 | C storage: queue, objects, labels, text | the lifetime | producers on any thread; the worker, consuming | the worker; the lifetime after it | any | allocated at entry, freed in step 4 unless retained |
-| C slot: announcements, close flag, generation, latches, counters | the lifetime, then its slot's next claimant | producers on any thread; the lifetime, closing | the lifetime; `captureStatus` | any | static; claimed at entry, reset only when claimed again |
+| C slot: announcements, close flag, generation, latches, first-failure cell, counters | the lifetime, then its slot's next claimant | producers on any thread; the worker, once, for its sink; the lifetime, closing | the lifetime; `captureStatus` | any | static; claimed at entry, reset only when claimed again |
 | Status snapshot | the lifetime | step 4, once, before the free | `captureStatus` once the slot serves another lifetime | the lifetime's | per lifetime |
 | Phase | the lifetime | the lifetime's thread | any thread | any | per lifetime; only advances |
 | Taken and delivered counts | the worker | the worker | any thread; the lifetime once the worker is terminal | the worker's | per lifetime; only grow |
 | Wake and final requests | the lifetime | `requestDrain`; the lifetime, once, for final | the worker | any | per lifetime |
+| Sink failure | the worker | the worker, once, when its sink first fails | any thread, through `captureSinkFailure` and `captureAlarms` | the worker's | per lifetime; never cleared |
 
 ## Testing
 
@@ -440,7 +476,8 @@ after closing and freeing, slot reclamation beyond the table's size, and a
 stale user data naming nothing.
 `Lifetime` drives the whole lifetime with injected sinks: delivery and its
 fields, a record's labels in its own scoped context and no other's, the worker's own group, the verdict's issues, sink failure beside a
-preserved primary failure, a record produced while draining, the final drain,
+preserved primary failure and observable while the lifetime still captures,
+with whether an error had latched before it, a record produced while draining, the final drain,
 a blocked sink holding the storage, cancellation during finalization — with the
 record in the worker's hands counted — and of the body, a failed body kept
 primary over a cancellation during finalization with that cancellation beside

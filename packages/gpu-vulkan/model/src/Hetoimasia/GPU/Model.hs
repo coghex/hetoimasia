@@ -64,6 +64,12 @@ module Hetoimasia.GPU.Model
   , escalationsDropped
   , takeEscalations
   , escalateSession
+  , noteDeviceLoss
+  , deviceLossObserved
+
+    -- * Device loss
+  , DeviceLossRelease (..)
+  , releaseToDeviceLoss
 
     -- * Targets
   , TargetPhase (..)

@@ -13,6 +13,7 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Bridge
   ( SurfaceBridge (..)
   , Created (..)
   , Discharged (..)
+  , dischargeFailure
   , LeaseAnswer (..)
   , vulkanSurfaceBridge
   , DischargeNotPerformed (..)
@@ -65,9 +66,20 @@ data Discharged
   = DischargeDone
     -- ^ The surface no longer exists.
   | DischargeUncertain !(ExceptionWithContext SomeException)
-    -- ^ The destruction raised, or was refused because an earlier one was
-    -- uncertain or is still running. The surface may exist, and its holds on
-    -- the attachment and the instance stay.
+    -- ^ The destruction raised, or was refused because an earlier one is
+    -- still running. The surface may exist, and its holds on the attachment
+    -- and the instance stay.
+  | DischargeStillUncertain !(ExceptionWithContext SomeException)
+    -- ^ Refused because this obligation's earlier destruction raised, which
+    -- is never retried: nothing new failed. The surface may exist, and its
+    -- holds stay.
+
+-- | Why a destruction did not complete, however it was learned.
+dischargeFailure ∷ Discharged → Maybe (ExceptionWithContext SomeException)
+dischargeFailure = \case
+  DischargeDone → Nothing
+  DischargeUncertain failure → Just failure
+  DischargeStillUncertain failure → Just failure
 
 -- | Every operation of the surface bridge the controller needs.
 data SurfaceBridge lease obligation = SurfaceBridge
@@ -91,6 +103,10 @@ data SurfaceBridge lease obligation = SurfaceBridge
     -- is how one whose creator lost its answer is found.
   , bridgeObligationAttachment ∷ obligation → AttachmentId
   , bridgeObligationHandle ∷ obligation → Word64
+    -- ^ The surface's handle, for evidence only: a later surface may reuse it.
+  , bridgeSameObligation ∷ obligation → obligation → Bool
+    -- ^ Whether two are one obligation, by its identity rather than its
+    -- handle.
   , bridgeDischarge ∷ obligation → IO Discharged
     -- ^ Destroy the surface through Vulkan, from the calling thread, once.
   , bridgeRelease ∷ lease → STM LeaseAnswer
@@ -130,12 +146,15 @@ vulkanSurfaceBridge integration =
     , bridgeObligations = leasedObligations
     , bridgeObligationAttachment = obligationAttachment
     , bridgeObligationHandle = obligationHandle
+    , bridgeSameObligation = (==)
     , bridgeDischarge = \obligation →
         dischargeSurfaceObligation obligation >>= \case
           SurfaceDestroyed → pure DischargeDone
           -- Only an earlier destruction that returned leaves this answer, so the
           -- surface is gone whoever destroyed it.
           DischargeRefused AlreadyDischarged → pure DischargeDone
+          DischargeRefused DestructionWasUncertain →
+            either DischargeStillUncertain (\() → DischargeDone) <$> tryWithContext (throwIO (DischargeNotPerformed (Text.pack (show DestructionWasUncertain))))
           DischargeRefused refusal → uncertain (DischargeNotPerformed (Text.pack (show refusal)))
           DestructionUncertain failure → pure (DischargeUncertain failure)
     , bridgeRelease = \lease →

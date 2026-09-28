@@ -92,6 +92,9 @@
 -- | wake and final     | this lifetime       | 'requestDrain'; the        | the worker                | per lifetime; final is set once |
 -- | requests           |                     | lifetime (final)           |                           |                                 |
 -- +--------------------+---------------------+----------------------------+---------------------------+---------------------------------+
+-- | sink failure       | the worker          | the worker, once, when its | any thread, through       | per lifetime; never cleared     |
+-- |                    |                     | sink first fails           | 'captureSinkFailure'      |                                 |
+-- +--------------------+---------------------+----------------------------+---------------------------+---------------------------------+
 module Hetoimasia.GPU.Vulkan.Diagnostics
   ( -- * Configuration
     CaptureConfig (..)
@@ -118,6 +121,12 @@ module Hetoimasia.GPU.Vulkan.Diagnostics
   , CaptureCounters (..)
   , captureStatus
   , deliveredCount
+  , SinkFailure (..)
+  , captureSinkFailure
+  , CaptureAlarm (..)
+  , captureAlarms
+  , CaptureOrder (..)
+  , claimCaptureOrder
 
     -- * The verdict
   , DiagnosticVerdict (..)
@@ -152,7 +161,7 @@ import Control.Concurrent.STM
   , writeTVar
   )
 import Control.Exception
-  ( Exception
+  ( Exception (displayException)
   , ExceptionWithContext (ExceptionWithContext)
   , SomeAsyncException
   , SomeException
@@ -211,6 +220,7 @@ import Hetoimasia.GPU.Vulkan.Diagnostics.Internal.Capture
   , CapturedObject (..)
   , CapturedRecord (..)
   , Counter (..)
+  , FirstFailure (..)
   , Latch (..)
   , LimitError (..)
   , Limits (..)
@@ -221,7 +231,10 @@ import Hetoimasia.GPU.Vulkan.Diagnostics.Internal.Capture
   , closeStorage
   , SlotStatus (..)
   , createStorage
+  , firstFailure
+  , claimOwnerFailure
   , freeStorage
+  , noteSinkFailure
   , slotStatus
   , storageUserData
   , takeRecord
@@ -330,6 +343,8 @@ data DiagnosticCapture = DiagnosticCapture
   , handleQuiesced ∷ !(TVar Bool)
     -- ^ Set by 'afterLastCallback' once the owner's last callback-producing
     -- destruction has returned.
+  , handleSinkFailure ∷ !(TVar (Maybe SinkFailure))
+    -- ^ Set by the worker, once, when its sink first fails; never cleared.
   }
 
 -- | Evidence, for one capture, that the last Vulkan call that could invoke its
@@ -380,6 +395,97 @@ capturePhase = readTVar . handlePhase
 -- | How many records the worker has handed to the logger so far.
 deliveredCount ∷ DiagnosticCapture → STM Word64
 deliveredCount = readTVar . handleDelivered
+
+-- | The failure that stopped delivery, from the moment the worker met it
+-- rather than only once the verdict is reached: a sink failure is a terminal
+-- status an owner can observe at its checkpoints while the lifetime still
+-- runs. It is set once and never cleared, and it says nothing about the
+-- latches: an error reported after the sink failed still latches, and the
+-- verdict still carries the failure itself as 'ConsumerSinkFailed'.
+captureSinkFailure ∷ DiagnosticCapture → STM (Maybe SinkFailure)
+captureSinkFailure = readTVar . handleSinkFailure
+
+-- | A sink failure as the worker met it.
+newtype SinkFailure = SinkFailure
+  { sinkFailureReason ∷ Text
+  }
+  deriving (Eq, Show)
+
+-- | A terminal failure the capture holds: its error latch, or its sink's
+-- failure.
+data CaptureAlarm
+  = CaptureErrorLatched
+  | CaptureSinkFailed !Text
+  | CaptureAlarmPending
+    -- ^ A failure has claimed the order but has not yet published its own
+    -- alarm: something failed, and which failure came first is not yet
+    -- readable.
+  | CaptureOwnerClaimed
+    -- ^ The capture's owner claimed first place for a failure of its own
+    -- ('claimCaptureOrder'): that failure came before every alarm answered
+    -- beside this, and recording it is the owner's.
+  deriving (Eq, Show)
+
+-- | The capture's terminal failures, in the order they happened.
+--
+-- The order is one fact the storage's slot records, claimed once by whichever
+-- failure gets there first: an error-severity report claims it before it sets
+-- the error latch, and the worker claims it for its sink the moment a
+-- delivery's failure returns to it, before publishing that failure. The
+-- alarms are read first and the order after, so any alarm read here had
+-- already claimed or lost it: two failures that arrive between two
+-- checkpoints are answered in the order they happened, however close
+-- together. A sink failure happens when its delivery's failure returns, so an
+-- error reported while that delivery was still running came first.
+--
+-- A failure that has claimed the order but not yet published its own alarm is
+-- one this cannot name yet: the claim is taken first and the alarm set just
+-- after it, so for that moment the only alarm readable may be a later one.
+-- Then this answers 'CaptureAlarmPending' alone — a failure has happened, and
+-- admission should stay closed — and the next reading, once the first alarm is
+-- published, answers them in order. It never answers a later failure first.
+-- | Which failure holds first place, once the capture's owner has claimed it
+-- for a failure of its own that it is about to record: its own, unless an
+-- error report or the sink claimed it before.
+data CaptureOrder
+  = OwnerFailedFirst
+    -- ^ No diagnostic failure came before the owner's: any that comes now
+    -- came after it.
+  | ErrorLatchedFirst
+    -- ^ An error-severity report came first; its latch is set or about to be.
+  | SinkFailedFirst
+    -- ^ The sink failed first; 'captureSinkFailure' answers its reason once
+    -- the worker publishes it, which follows its claim at once.
+  deriving (Eq, Show)
+
+-- | Claim first place for a failure the capture's owner is about to record,
+-- unless a diagnostic failure holds it, and answer which does. It is one
+-- atomic compare-and-swap in the storage's slot, the same cell an error report
+-- and the sink claim, so the order it answers is the order the three
+-- happened; claiming again changes nothing. A capture whose slot already
+-- serves another lifetime answers 'OwnerFailedFirst'.
+claimCaptureOrder ∷ DiagnosticCapture → IO CaptureOrder
+claimCaptureOrder capture =
+  claimOwnerFailure (handleUserData capture) >>= \case
+    Just FirstError → pure ErrorLatchedFirst
+    Just FirstSink → pure SinkFailedFirst
+    _ → pure OwnerFailedFirst
+
+captureAlarms ∷ DiagnosticCapture → IO [CaptureAlarm]
+captureAlarms capture = do
+  latched ← statusErrorLatched <$> captureStatus capture
+  sink ← atomically (captureSinkFailure capture)
+  first ← firstFailure (handleUserData capture)
+  let errors = [CaptureErrorLatched | latched]
+      sinks = [CaptureSinkFailed (sinkFailureReason failure) | Just failure ← [sink]]
+  pure $ case first of
+    Just FirstSink
+      | null sinks → [CaptureAlarmPending]
+      | otherwise → sinks <> errors
+    Just FirstError
+      | null errors → [CaptureAlarmPending]
+    Just FirstOwner → CaptureOwnerClaimed : errors <> sinks
+    _ → errors <> sinks
 
 -- | Run a body that owns a diagnostic capture, and finalize it on every exit.
 --
@@ -479,6 +585,7 @@ newCapture storage =
     <*> newTVarIO False
     <*> newTVarIO False
     <*> newTVarIO False
+    <*> newTVarIO Nothing
 
 -- | What steps 1 and 2 leave for the rest of the lifetime.
 data Finished a = Finished
@@ -807,7 +914,13 @@ drainWorker config logger storage capture =
                       Right () → pure ()
                       Left failure@(ExceptionWithContext _ exception)
                         | isJust (fromException exception ∷ Maybe SomeAsyncException) → rethrowIO failure
-                        | otherwise → writeIORef state (DrainReport (Just failure))
+                        | otherwise → mask_ $ do
+                            writeIORef state (DrainReport (Just failure))
+                            -- The order is claimed the moment the failure is
+                            -- known; then it is published, so an owner's
+                            -- checkpoint sees it while the lifetime runs.
+                            noteSinkFailure (handleUserData capture)
+                            atomically (writeTVar (handleSinkFailure capture) (Just (SinkFailure (Text.pack (displayException exception)))))
                 pass
           loop = do
             final ← readTVarIO (handleFinal capture)

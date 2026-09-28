@@ -40,7 +40,7 @@ import Hetoimasia.GPU.Model
 import Hetoimasia.GPU.Model.Identity (FrameSlotId, IdentityKind (..), Misuse (..), TargetId, frameTarget)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Layer (FrameOps (..), SubmitBatch (..), WaitStage (..))
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.State
-import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Batches (resetFrameRecorder)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Batches (forgetUnsubmittedBatches, resetFrameRecorder)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   ( BatchRecord (..)
   , BatchStanding (..)
@@ -49,7 +49,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , modelAnswer
   , owned
   )
-import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost, failRootsSession, rootsCall)
+import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost, failRootsSessionBecause, rootsCall)
 
 -- | Skip an acquired frame nothing of which has been submitted: an ordinary
 -- outcome, not a failure. The frame's capability is consumed at once — it
@@ -69,6 +69,12 @@ import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost, failRootsSession,
 -- 'closeUnpresentedFrame' is its exit. A cleanup submission that raised retains
 -- the frame, its image and its synchronization for ever, fails the session and
 -- raises 'FrameCleanupFailed'.
+--
+-- After the device's loss no cleanup submission is made — the lost device
+-- would never complete one — and no storage is reset against it: the model's
+-- skip lets go of the unsubmitted recording, whose batch records go with it,
+-- uncertain ones included, and the frame waits, skipped ('StageLost'), for the
+-- device-loss release to let it go.
 skipFrame ∷ Frames q inst msgr phys dev cmd → FrameSlotId → IO (Either Refusal ())
 skipFrame frames frame =
   owned recording $
@@ -77,18 +83,33 @@ skipFrame frames frame =
       Right (sync, device, family) → do
         batches ← Map.elems <$> readTVarIO (recordingBatches recording)
         let unsubmitted = [() | record ← batches, batchFrame record == frame, not (submitted (batchStanding record))]
-        reset ← if null unsubmitted then pure (Right ()) else resetFrameRecorder recording frame
+        -- After the device's loss nothing is reset against it: the model's
+        -- skip lets go of the unsubmitted recording, whose records go with it.
+        lost ← atomically (lossObserved frames)
+        reset ← if null unsubmitted || lost then pure (Right ()) else resetFrameRecorder recording frame
         case reset of
           Left refusal → pure (Left refusal)
           Right () → mask_ $
-            atomically (modelAnswer roots (fmap (\model → (model, ())) . skipUnsubmittedFrame frame)) >>= \case
+            atomically skipped >>= \case
               Left refusal → pure (Left refusal)
-              Right () →
+              Right True → pure (Right ())
+              Right False →
                 cleanupSubmission frames device family frame (syncAcquire sync) StageSkipping (editSlot frames (slotOf frame) (\entry → entry {syncAcquireState = SemaphoreWaitOwed}))
                   >>= maybe (pure (Right ())) rethrowIO
   where
     recording = framesRecording frames
     roots = framesRoots frames
+    -- The model skips the frame; after the device's loss nothing more is
+    -- owed here — a cleanup submission to the lost device would never
+    -- complete — and the device-loss release lets it go.
+    skipped = do
+      answer ← modelAnswer roots (fmap (\model → (model, ())) . skipUnsubmittedFrame frame)
+      lost ← lossObserved frames
+      case answer of
+        Right () | lost → do
+          forgetUnsubmittedBatches recording frame
+          Right True <$ editFrame frames frame (\record → record {recordStage = StageLost})
+        _ → pure (False <$ answer)
     checked = do
       live ← Map.lookup frame <$> readTVar (framesLive frames)
       slots ← readTVar (framesSlots frames)
@@ -179,7 +200,7 @@ cleanupSubmission frames device family frame semaphore stage waiting = do
           atomically $ do
             editFrame frames frame (\record → record {recordStage = StageFailed reason})
             editSlot frames key (\entry → entry {syncCleanupState = FenceUncertain reason})
-            failRootsSession roots CleanupFailed
+            failRootsSessionBecause roots CleanupFailed (Text.pack (show frame) <> ": " <> reason)
           pure $ Just $ case fromException exception ∷ Maybe GraphicsDeviceLost of
             Just _ → failure
             Nothing → ExceptionWithContext context (toException (FrameCleanupFailed frame reason))

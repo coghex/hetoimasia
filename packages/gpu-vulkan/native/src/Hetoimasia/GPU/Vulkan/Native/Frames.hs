@@ -110,6 +110,19 @@
 -- 'awaitFrames' may first wait a finite time for one pending fence; the wait
 -- is not evidence, and a timeout changes nothing.
 --
+-- = Terminal failure
+--
+-- Rendering, acquisition, submission and presentation each pass the roots'
+-- checkpoint first: once the session has failed they are refused with
+-- 'RefusedSessionFailed', naming its primary failure, before anything native.
+-- Abandonment, progress and retirement never do. Once the device has been
+-- lost, no fence is asked or waited on and no cleanup submission is made:
+-- 'releaseFramesToDeviceLoss' skips what is still acquired and lets go, under
+-- the specification's device-loss rule, of every submission, presentation and
+-- frame only the lost device could have discharged — completing none of them
+-- and marking no fence signalled — and 'retireTargetFrames' then destroys the
+-- target's synchronization whatever it was owed.
+--
 -- = State
 --
 -- The frames' state is five maps the 'Frames' holds. Module names are
@@ -189,6 +202,9 @@ module Hetoimasia.GPU.Vulkan.Native.Frames
   , Progress (..)
   , retireTargetFrames
 
+    -- * Device loss
+  , releaseFramesToDeviceLoss
+
     -- * Observation
   , FrameStage (..)
   , FrameStanding (..)
@@ -220,6 +236,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Abandonment
   , skipFrame
   )
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Acquisition (tryAcquireFrame)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Loss (releaseFramesToDeviceLoss)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Layer
   ( AcquireResult (..)
   , FrameOps (..)
