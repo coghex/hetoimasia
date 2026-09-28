@@ -32,7 +32,7 @@ import Hetoimasia.GPU.Model (TargetPhase (..), TargetView (..), targetView)
 import Hetoimasia.GPU.Model.Identity (TargetClass (..))
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Loop (foldOwnerDeadline, newLoopAdapter, publishVulkanScene, runVulkanOwnerLoop)
-import Hetoimasia.GPU.Vulkan.Native.Generations (GenerationView (..), TargetGenerationsView (..))
+import Hetoimasia.GPU.Vulkan.Native.Generations (GenerationView (..), TargetCondition (..), TargetGenerationsView (..))
 import Hetoimasia.GPU.Vulkan.Native.Presentation (SurfaceExtent (..))
 import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost (..), RootTargetView (..))
 import Hetoimasia.Runtime.GLFW
@@ -73,6 +73,7 @@ spec = describe "Vulkan loop adapter" $ do
     it "folds the owner's deadline into the main loop's wait, shortening it and never lengthening it" (bounded testDeadlineFolded)
     it "keeps demand captured before the owner took it, whatever newer demand is published over it" (bounded testDemandKeptUntilTaken)
     it "serves both parts of demand captured in one turn: one window's now, and another's later deadline once it comes" (bounded testCombinedDemand)
+    it "keeps a redraw the owner took before any target was constructed, and renders it once one is" (bounded testRedrawBeforeTarget)
     it "keeps a closed window's retirement observable while the owner's step is held and demand waits" (bounded testCloseWhileSaturated)
 
   describe "the owner's pacing" $ do
@@ -82,6 +83,7 @@ spec = describe "Vulkan loop adapter" $ do
     it "keeps a finite progress deadline for a suspended target, without spinning" (bounded testSuspendedTarget)
     it "keeps presenting to one target while another's acquisitions cannot be answered" (bounded testBusyTargetFairness)
     it "tries a frame the renderer refused again at the backoff's first interval, not on every round" (bounded testRefusedFramePaced)
+    it "lets a fresh request supersede a retry still pending, rendering at once" (bounded testFreshRequestSupersedesRetry)
 
   describe "a stalled main thread" $ do
     it "keeps the owner rendering while the native event call is held, and serves a window command once it returns" (bounded testStalledMainThread)
@@ -91,6 +93,7 @@ spec = describe "Vulkan loop adapter" $ do
     it "brings a presentation's device loss to the application's next checkpoint" (bounded testLossAtCheckpoint)
     it "waits for owed presentations in the exit drain, retires in dependency order, and leaves no worker awaiting the ended loop" (bounded testExitWithOwedPresentations)
     it "keeps the exit drain waiting on its own deadlines once a demand deadline no frame can serve has passed" (bounded testDrainPastDemand)
+    it "keeps the exit drain waiting on its own deadlines once a closing target's settling replacement is past due" (bounded testDrainPastSettling)
 
 -- ---------------------------------------------------------------------------
 -- The composed loop
@@ -598,6 +601,37 @@ testDrainPastDemand = do
     pure ()
   readTVarIO paced `shouldReturn` True
 
+-- | The exit drain, with a presentation still owed and the target's
+-- replacement settling from a resize. A closing target is never reconciled
+-- again, so its settling instant is owed nothing: once the clock passes it, the
+-- drain keeps waiting on the model's poll deadlines — arming its timer each
+-- time the clock moves — rather than asking again at once, for ever.
+testDrainPastSettling ∷ IO ()
+testDrainPastSettling = do
+  rig ← scriptedRigOf 1
+  presentationsRetire rig False
+  paced ← newTVarIO False
+  runRig rig $ \host control → do
+    [window] ← windowsOf host
+    service ← firstFrame rig host control window
+    let owner = vulkanGraphicsOwner host
+    resizeFramebuffer rig host window (800, 600)
+    composedUntil rig host control "the resize settling" (\_ → pure ()) $ do
+      view ← atomically (readVulkanGenerations (vulkanController host) (graphicsAttachment service))
+      pure $ case viewCondition <$> view of
+        Just (Settling _) → True
+        _ → False
+    _ ← forkIO $ do
+      atomically (readOwnerStatusNow owner >>= check . (== OwnerRetiring) . statusPhase)
+      forM_ [1 .. 6 ∷ Int] $ \_ → do
+        armed ← length <$> readTVarIO (rigArmings rig)
+        advanceClock rig 100
+        atomically (readTVar (rigArmings rig) >>= check . (> armed) . length)
+      atomically (writeTVar paced True)
+      letExitFinish rig
+    pure ()
+  readTVarIO paced `shouldReturn` True
+
 -- | A renderer that refuses every frame leaves the target's render demand
 -- standing. The owner tries the frame again at the backoff's first interval:
 -- with the scripted clock still, its deadline stays ahead of the clock and it
@@ -722,6 +756,69 @@ testCombinedDemand = do
   early `shouldBe` 2
   still `shouldBe` 0
   late `shouldBe` 2
+
+-- | A redraw published, and taken by the owner, while it had no target
+-- constructed to request a frame of. The target handed over afterwards is
+-- still asked for that frame once it is constructed, with nothing published
+-- since.
+testRedrawBeforeTarget ∷ IO ()
+testRedrawBeforeTarget = do
+  rig ← visibleRig
+  presented ← runRig rig $ \host control → do
+    [window] ← windowsOf host
+    let owner = vulkanGraphicsOwner host
+    now' ← prepare (OwnerDemand True Nothing)
+    _ ← atomically (publishOwnerDemand (ownerHandoff owner) now')
+    turns ← newTVarIO (0 ∷ Int)
+    composedUntil
+      rig
+      host
+      control
+      "the owner taking the redraw"
+      (\_ → atomically (modifyTVar' turns (+ 1)))
+      (atomically ((&&) . (>= 2) <$> readTVar turns <*> readOwnerDemandTaken owner))
+    service ← handedOver host window RequiredTarget
+    TargetUsable ← awaitStanding host service
+    atomically (writeTVar turns 0)
+    composedUntil
+      rig
+      host
+      control
+      "the redraw's frame"
+      (\_ → atomically (modifyTVar' turns (+ 1)))
+      ((||) . (>= 1) <$> presentsOf rig (graphicsAttachment service) <*> ((>= 400) <$> readTVarIO turns))
+    presentsOf rig (graphicsAttachment service)
+  presented `shouldSatisfy` (>= 1)
+
+-- | A frame the renderer refused leaves a retry pending at the backoff's
+-- first interval. A fresh request is an opportunity now: with the scripted
+-- clock still, short of that retry, the owner renders at once.
+testFreshRequestSupersedesRetry ∷ IO ()
+testFreshRequestSupersedesRetry = do
+  rig ← scriptedRigOf 1
+  (before, after) ← runRig rig $ \host control → do
+    [window] ← windowsOf host
+    service ← firstFrame rig host control window
+    refuseFrames rig True
+    demandFrame host window
+    composedUntil rig host control "a refused frame" (\_ → pure ()) ((>= 1) <$> framesAbandoned rig)
+    now ← clockNow rig
+    _ ← awaitDeadlineAfter host now
+    before ← presentsOf rig (graphicsAttachment service)
+    refuseFrames rig False
+    demandFrame host window
+    turns ← newTVarIO (0 ∷ Int)
+    composedUntil
+      rig
+      host
+      control
+      "the fresh request's frame"
+      (\_ → atomically (modifyTVar' turns (+ 1)))
+      ((||) . (> before) <$> presentsOf rig (graphicsAttachment service) <*> ((>= 400) <$> readTVarIO turns))
+    after ← presentsOf rig (graphicsAttachment service)
+    letExitFinish rig
+    pure (before, after)
+  after `shouldBe` before + 1
 
 testCloseWhileSaturated ∷ IO ()
 testCloseWhileSaturated = do

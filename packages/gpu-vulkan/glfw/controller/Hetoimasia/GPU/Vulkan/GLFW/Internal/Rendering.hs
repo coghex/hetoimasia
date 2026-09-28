@@ -285,17 +285,22 @@ data Live q inst msgr phys dev cmd = Live
 data TargetRendering = TargetRendering
   { targetStorages ∷ ![FrameStorage]
   , targetRetryAt ∷ !(Maybe Instant)
-    -- ^ When an acquisition the swapchain could not answer is tried again.
+    -- ^ When a frame that could not be made is tried again, unless a fresh
+    -- request comes first.
   , targetShown ∷ !(Maybe GenerationId)
     -- ^ The generation the target's last presentation went to, once it has
     -- presented one.
   , targetEligible ∷ !Bool
     -- ^ Whether it was eligible at the last step.
   , targetClosing ∷ !Bool
+  , targetDemandSeen ∷ !Natural
+    -- ^ The latest demand publication a step has considered for it.
+  , targetSceneSeen ∷ !Natural
+    -- ^ The latest scene publication a step has considered for it.
   }
 
 freshTarget ∷ TargetRendering
-freshTarget = TargetRendering [] Nothing Nothing False False
+freshTarget = TargetRendering [] Nothing Nothing False False 0 0
 
 -- | The rendering of one graphics session.
 data Rendering q inst msgr phys dev cmd = Rendering
@@ -305,7 +310,7 @@ data Rendering q inst msgr phys dev cmd = Rendering
   , renderingLive ∷ !(TVar (Maybe (Live q inst msgr phys dev cmd)))
   , renderingTargets ∷ !(TVar (Map TargetId TargetRendering))
   , renderingDemandSeen ∷ !(TVar Natural)
-  , renderingSceneSeen ∷ !(TVar Natural)
+    -- ^ The latest demand publication whose deadline has been held.
   , renderingDemandAt ∷ !(TVar (Maybe Instant))
   , renderingCursor ∷ !(TVar Natural)
   , renderingObserver ∷ !FrameObserver
@@ -321,7 +326,6 @@ newRendering roots generations ops observer =
   Rendering roots generations ops
     <$> newTVarIO Nothing
     <*> newTVarIO Map.empty
-    <*> newTVarIO 0
     <*> newTVarIO 0
     <*> newTVarIO Nothing
     <*> newTVarIO 0
@@ -383,14 +387,22 @@ planStep ∷ Rendering q inst msgr phys dev cmd → StepInputs → IO StepPlan
 planStep rendering inputs = do
   views ← atomically (mapM (\(target, _, _) → (,) target <$> readTargetGenerations (renderingGenerations rendering) target) (inputsTargets inputs))
   atomically $ do
-    wantAll ← foldPublications
+    came ← foldPublications
     held ← readTVar (renderingTargets rendering)
-    let wanted =
+    -- Each constructed target is asked for a frame by the publications it has
+    -- not yet considered, so one published before the target could take it —
+    -- a first redraw arriving with its handover — is still its request once
+    -- it is constructed, and a stored deadline that comes is kept until a
+    -- target exists to receive it.
+    let demandDue = ownerDemandImmediate demand || maybe False (deadlineReached now) (ownerDemandDeadline demand)
+        wanted =
           [ target
           | (target, _, eligible) ← inputsTargets inputs
           , let record = Map.findWithDefault freshTarget target held
           , not (targetClosing record)
-          , wantAll
+          , came
+              || (inputsDemandRevision inputs > targetDemandSeen record && demandDue)
+              || inputsSceneRevision inputs > targetSceneSeen record
               || ( isJust (targetShown record)
                      && eligible
                      && ( not (targetEligible record)
@@ -402,11 +414,28 @@ planStep rendering inputs = do
       stateRootsModel (renderingRoots rendering) $ \model → case requestRender target model of
         Admitted next → ((), next)
         _ → ((), model)
+    -- A fresh request is an opportunity now: it supersedes a retry pending
+    -- from a frame that could not be made.
     writeTVar (renderingTargets rendering) $
       foldl
-        (\records (target, _, eligible) → Map.alter (Just . (\record → record {targetEligible = eligible}) . maybe freshTarget id) target records)
+        ( \records (target, _, eligible) →
+            Map.alter
+              ( Just
+                  . ( \record →
+                        record
+                          { targetEligible = eligible
+                          , targetDemandSeen = inputsDemandRevision inputs
+                          , targetSceneSeen = inputsSceneRevision inputs
+                          , targetRetryAt = if target `elem` wanted then Nothing else targetRetryAt record
+                          }
+                    )
+                  . maybe freshTarget id
+              )
+              target
+              records
+        )
         held
-        [entry | entry@(target, _, _) ← inputsTargets inputs, target `elem` wanted || Map.member target held]
+        (inputsTargets inputs)
   model ← atomically (readRootsModel (renderingRoots rendering))
   held ← readTVarIO (renderingTargets rendering)
   cursor ← atomically (stateTVar (renderingCursor rendering) (\at → (at, at + 1)))
@@ -427,32 +456,22 @@ planStep rendering inputs = do
   where
     now = inputsNow inputs
     demand = inputsDemand inputs
+    -- Holds a demand deadline still ahead, once per publication, and answers
+    -- whether a held one has come. One publication can carry both parts — two
+    -- windows, one asking now and one by a later deadline — and each is kept:
+    -- the request now is due at once, and the deadline when it comes. A held
+    -- deadline that comes while no target is constructed stays held.
     foldPublications = do
       seenDemand ← readTVar (renderingDemandSeen rendering)
-      fresh ←
-        if inputsDemandRevision inputs > seenDemand
-          then do
-            writeTVar (renderingDemandSeen rendering) (inputsDemandRevision inputs)
-            -- One publication can carry both parts — two windows, one asking
-            -- now and one by a later deadline — and each is kept: the request
-            -- now is served by this step, and a deadline still ahead is held
-            -- for the step it comes at. A deadline already come is served now.
-            let ahead = case ownerDemandDeadline demand of
-                  Just at | not (deadlineReached now at) → Just at
-                  _ → Nothing
-            for_ ahead $ \at → modifyTVar' (renderingDemandAt rendering) (Just . maybe at (min at))
-            pure (ownerDemandImmediate demand || (isJust (ownerDemandDeadline demand) && not (isJust ahead)))
-          else pure False
+      when (inputsDemandRevision inputs > seenDemand) $ do
+        writeTVar (renderingDemandSeen rendering) (inputsDemandRevision inputs)
+        for_ (ownerDemandDeadline demand) $ \at →
+          unless (deadlineReached now at) $
+            modifyTVar' (renderingDemandAt rendering) (Just . maybe at (min at))
       ahead ← readTVar (renderingDemandAt rendering)
-      came ← case ahead of
-        Just at | deadlineReached now at → True <$ writeTVar (renderingDemandAt rendering) Nothing
+      case ahead of
+        Just at | deadlineReached now at, not (null (inputsTargets inputs)) → True <$ writeTVar (renderingDemandAt rendering) Nothing
         _ → pure False
-      seenScene ← readTVar (renderingSceneSeen rendering)
-      scened ←
-        if inputsSceneRevision inputs > seenScene
-          then True <$ writeTVar (renderingSceneSeen rendering) (inputsSceneRevision inputs)
-          else pure False
-      pure (fresh || came || scened)
 
 -- | Whether the model's own schedule says a completion poll is due now.
 pollDue ∷ Instant → GpuModel → Bool

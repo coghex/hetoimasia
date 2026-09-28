@@ -21,6 +21,7 @@ import Hetoimasia.Foundation.Time (DurationRequirement (AllowZero), Instant, dur
 import Data.Foldable (for_)
 import Hetoimasia.GPU.Model
   ( Escalation (..)
+  , NextTurn (..)
   , Outcome (..)
   , SessionFailureCause (..)
   , SessionState (..)
@@ -28,6 +29,7 @@ import Hetoimasia.GPU.Model
   , TargetView (..)
   , closeTarget
   , escalations
+  , progressDeadline
   , sessionState
   , targetView
   )
@@ -250,6 +252,33 @@ spec = describe "Generations" $ do
       stepAt rig 1 (seen 640 480)
       atomically (generationsDeadline (rigGenerations rig)) >>= (`shouldSatisfy` not . immediate)
       length <$> created rig `shouldReturn` 2
+
+    it "owes a closing target's settling replacement and unseen result no step, leaving its deadline to the model's own schedule" $ do
+      rig ← newRig
+      stepAt rig 0 (seen 640 480)
+      [first] ← activeGenerations rig
+      _ ← held rig first
+      resizeSurface rig 800 600
+      stepAt rig 10 (seen 800 600)
+      viewCondition <$> generationsOf rig `shouldReturn` Settling (at 26)
+      noteActive rig SwapchainSuboptimal
+      atomically (generationsDeadline (rigGenerations rig)) >>= (`shouldSatisfy` immediate)
+      atomically (void (stateRootsModel (rigRoots rig) (\model → case closeTarget (rigTarget rig) model of
+        Admitted next → ((), next)
+        _ → ((), model))))
+      -- The exit drain's step: no geometry, so nothing is reconciled.
+      void (stepGenerations (rigGenerations rig) (at 12) Map.empty)
+      model ← atomically (readRootsModel (rigRoots rig))
+      let schedule = case progressDeadline model of
+            TurnNow → Just (Left ())
+            TurnAt due → Just (Right due)
+            _ → Nothing
+      deadline ← atomically (generationsDeadline (rigGenerations rig))
+      deadline `shouldSatisfy` not . immediate
+      deadline `shouldBe` schedule
+      -- Past the settling instant, nothing more is owed than that schedule.
+      void (stepGenerations (rigGenerations rig) (at 30) Map.empty)
+      atomically (generationsDeadline (rigGenerations rig)) >>= (`shouldSatisfy` not . immediate)
 
     it "moves the model's idle backoff on once per step while a retired generation stays held" $ do
       rig ← newRig

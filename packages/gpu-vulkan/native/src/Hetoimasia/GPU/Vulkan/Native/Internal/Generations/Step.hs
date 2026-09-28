@@ -89,12 +89,23 @@ stepGenerations generations now geometries = do
 -- reconciled, a settling replacement, a deferred recovery attempt, a lost
 -- surface whose generations have all gone and which may now be released, or
 -- the model's own schedule. 'Left' means a step is owed now.
+--
+-- A target the model is retiring, or has made unavailable, is never
+-- reconciled again, so its unseen result, settling replacement or deferred
+-- attempt is owed nothing: counted, it would be a deadline no step can meet —
+-- one the exit drain, waiting on the owner's deadline for an owed
+-- presentation, would find passed and ask about at once, for ever. Its
+-- obligations are the model's schedule's.
 generationsDeadline ∷ Generations q inst msgr phys dev → STM (Maybe (Either () Instant))
 generationsDeadline generations = do
   records' ← readTVar (generationsTargets generations)
-  let records = Map.elems records'
   model ← stateRootsModel (generationsRoots generations) (\model → (model, model))
-  let unseen = any recordResultUnseen records || any (releasable model) (Map.toList records')
+  let open =
+        [ record
+        | (target, record) ← Map.toList records'
+        , maybe False ((`notElem` [TargetRetiring, TargetUnavailable]) . viewTargetPhase) (targetView target model)
+        ]
+      unseen = any recordResultUnseen open || any (releasable model) (Map.toList records')
       own =
         mapMaybe
           ( \record → case recordCondition record of
@@ -102,7 +113,7 @@ generationsDeadline generations = do
               RecoveryWaiting at → Just at
               _ → Nothing
           )
-          records
+          open
       -- The obligations' own schedule: render demand is the owner's to pace,
       -- as it retries an acquisition the swapchain cannot yet answer.
       modelled = case progressDeadline model of

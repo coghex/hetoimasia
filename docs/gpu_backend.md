@@ -1605,15 +1605,21 @@ owner. A scene may be published from any application thread with
 
 The owner's step is handed the latest demand and scene with the revisions of
 their publications (`stepDemandRevision`, `stepSceneRevision`), so two equal
-publications are two requests. A target is asked for a frame — the model's
-`requestRender`, which is also what restarts the idle backoff — when
+publications are two requests. Each constructed target records the latest
+revisions a step has considered for it, so a publication made before a target
+could take it — a first redraw arriving with its handover, taken by a round
+that had no target constructed yet — is still its request once it is
+constructed. A target is asked for a frame — the model's `requestRender`, which
+is also what restarts the idle backoff, and which supersedes any retry pending
+for it — when
 
 - a demand publication the owner has not acted on is due: immediate, or with a
   deadline that has come; one still ahead is kept and asked for when it comes,
   and the owner's deadline includes it. One publication can carry both parts —
   two windows captured in one turn, one asking now and one by a later
   deadline — and both are kept: the request now is served at once, and the
-  deadline when it comes;
+  deadline when it comes. A held deadline that comes while no target is
+  constructed stays held until one is;
 - a scene publication the owner has not rendered arrives: the renderer renders
   the latest scene, whichever application thread published it (D-31); or
 - a target that has presented before can no longer be showing the latest
@@ -1647,7 +1653,8 @@ frame slot of the model's budget — the first time that target is.
   abandoned safely under VK-12's rules, never replayed. The target's render
   demand stands, so its next frame is tried at the same first interval, as an
   acquisition that could not be answered is: a renderer that refuses every
-  frame costs one attempt an interval, never one every owner round.
+  frame costs one attempt an interval, never one every owner round. A fresh
+  request for the target is an opportunity now, and supersedes that retry.
 - Enqueuing the presentation clears the model's render demand.
 
 The renderer is `∀`-typed over the native handles, so it records through the
@@ -1742,7 +1749,10 @@ the model's poll schedule — until it is retired or its retirement fails. A
 demand deadline counts toward that schedule only while an admitted target that
 is not closing could serve it: the drain takes no step, so no frame can, and a
 deadline left standing once it passed would be asked about again at once, for
-ever. No
+ever. For the same reason a target the model is retiring owes its generations'
+reconciliation nothing — a settling replacement, an unseen swapchain result or
+a deferred recovery attempt — since no step reconciles it again; its
+obligations keep the model's poll schedule. No
 timeout ends that wait, because a timeout is not evidence, and a cancellation
 ends it by leaving what is still owed with the owner, unverified, and naming it
 to whole-owner retirement. Nothing waits for a command from the ended loop: a
@@ -2072,9 +2082,10 @@ VK-18's D-33 order and releases nothing early.
   the retired handle, a newer resize surviving an in-flight replacement,
   repeated out-of-date and suboptimal results bounded by the recovery episode
   without a hot loop, a reported result asking for a step at once until it is
-  reconciled, a moved observation and a resize after a failed construction
+  reconciled, a closing target's settling replacement and unseen result owing
+  no step, its deadline left to the model's own schedule, a moved observation and a resize after a failed construction
   each settling before the recovery rebuild, and a move cancelled while
-  recovery waits leaving a later move its full quiet period, failures after the swapchain destroying exactly what they
+  recovery waits leaving a later move its full period, failures after the swapchain destroying exactly what they
   left child before parent, a failed cleanup retained without a retry and
   retaining the surface, a replacement cancelled before its creation never
   handing the old swapchain over, a cancellation right after a candidate's
@@ -2120,7 +2131,9 @@ captured before the owner took it kept across a newer publication while the
 owner's step was held inside an acquisition, and a window closed meanwhile
 still retiring; two windows' demand captured in one turn — one now, one by a
 later deadline — served as two frames now, none while a still clock stays short
-of the deadline, and two more once it comes; a quiet scene rendered continuously never arming the owner's
+of the deadline, and two more once it comes; a redraw the owner took while no
+target was constructed rendered once the window handed over afterwards is,
+with nothing published since; a quiet scene rendered continuously never arming the owner's
 timer beyond the first pending-work interval; the backoff through 5, 10, 20,
 40, 80, 100 and 100 ms from a presentation, an unrelated publication a
 millisecond before a poll moving neither the fence queries nor the deadline,
@@ -2131,7 +2144,9 @@ suspended target keeping a finite deadline with its presentation pending, not
 spinning while the clock stands still, and polling when it comes; one target
 presenting five more frames while another's acquisitions all answer not ready;
 a renderer refusing every frame, with the owner's deadline one backoff interval
-ahead of a still clock and no second attempt until the clock reaches it;
+ahead of a still clock and no second attempt until the clock reaches it; a
+fresh request, made while such a retry is pending, rendered at once with the
+clock still;
 the owner presenting a scene published from another thread while the main
 thread is held inside its native event call, and a window command submitted
 then served only once the call returns; a live resize under the same held call,
@@ -2144,7 +2159,9 @@ presentations before retiring the target, the device, the messenger and the
 instance, with a window command submitted after the loop ended answered rather
 than left waiting; and that drain, with a presentation still owed and a demand
 deadline the owner took but never served, arming its timer again each time the
-clock moves past that deadline rather than asking at once, for ever. In
+clock moves past that deadline rather than asking at once, for ever, and the
+same once a resize has left the closing target's replacement settling past
+its instant. In
 `native-tests`' `Frames`, a closing pass cancelled from inside its first frame's
 cleanup submission leaves the second frame acquired; closing the target's frames
 again finishes the pass, a third finds nothing, and the target's slots retire. The `terminal failure` group's sink example now waits for
