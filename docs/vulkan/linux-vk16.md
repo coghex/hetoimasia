@@ -6,17 +6,17 @@
 > two receipts the validation runner wrote on the Linux worker, verbatim.
 
 This is the Linux evidence for issue #232: pull request #294's validation run
-[36449343671](https://github.com/coghex/hetoimasia/actions/runs/36449343671), on the
+[36461212808](https://github.com/coghex/hetoimasia/actions/runs/36461212808), on the
 `vulkan` worker, inside the published CI image the committed
 `tools/ci-image/descriptor.json` names — the image rebuilt for the MoltenVK
 1.4.2 pin, whose Linux Vulkan identity is unchanged — with Mesa's Lavapipe
 (lvp 1.4.318 9d69cae2004b) and the pinned validation layer
 (`VK_LAYER_KHRONOS_validation 1.3.275 1d486283e4ce +synchronization`). The runner executed the integration
-candidate `acd72d4305327482d1a2488967818edb9b473d2f`, the merge of the pull request's head
-`24a3f2e` into its base, with the catalog's `--complete` command; input identity
-`8c0ad8a2917ec539d2ad7bfdc13a2cea8b755eb8006943ef5d1a380b82633015`.
+candidate `6dd428bd10e73766a9d0d5cf8534934cd314bfa0`, the merge of the pull request's head
+`4f553b4` into its base, with the catalog's `--complete` command; input identity
+`5f5eb9340ce90e8e5c9f35f460999a343162b62c4d73de45629723d67a7686f3`.
 
-`test.vulkan-native`'s preparation built the suite in 11.499 s. Its
+`test.vulkan-native`'s preparation built the suite in 11.402 s. Its
 watched native execution — the isolated X11 display the command started for
 itself, the shared session and its roots, every example and child, retirement,
 the diagnostic verdict after the last teardown callback, and the display's own
@@ -24,12 +24,14 @@ teardown — took 3.22 s against the 30-second watchdog,
 over a non-empty selection of 118 examples, one of them pending: the
 graphics-owner interaction probe, which opened no window, as no run that does
 not activate it does. `test.vulkan-headless` passed too, with `native-tests`'
-311 examples and `integration-tests`' 68. The display helper's logs are in the
+311 examples and `integration-tests`' 70. The display helper's logs are in the
 worker's `validation-receipts-vulkan` artifact beside each scenario's output
 and record. The macOS evidence is [`macos-vk16.md`](macos-vk16.md). Every group
 of this run passed.
 
 This run replaces the evidence of runs
+[36449343671](https://github.com/coghex/hetoimasia/actions/runs/36449343671) at
+`24a3f2e`,
 [36445937393](https://github.com/coghex/hetoimasia/actions/runs/36445937393) at
 `0518ce8`,
 [36442134049](https://github.com/coghex/hetoimasia/actions/runs/36442134049) at
@@ -44,8 +46,9 @@ refused frame's retry paced at the backoff's first interval, a demand deadline
 no closing target can serve kept out of the exit drain, and both parts of a
 demand publication that asks now and by a later deadline kept, publications
 kept for targets constructed after them, a fresh request superseding a pending
-retry, and a closing target's reconciliation owed no step. The pull request's
-first run,
+retry, a closing target's reconciliation owed no step, a generation a target
+moved to asked for once, and a replacement the generations' step published
+asked for a frame in that step. The pull request's first run,
 [36421750976](https://github.com/coghex/hetoimasia/actions/runs/36421750976),
 passed its Vulkan groups and failed one `test.glfw` example of this pull
 request's own — the exit drain's owed retirement, which the running owner had
@@ -58,7 +61,7 @@ targets presented four and five frames before the first window was hidden;
 while its target was suspended the second presented three more and the first
 none; shown again, the first presented once more; and the host exited through
 D-33. All eighteen presentations had their present fences observed signalled,
-every one of the 289 Vulkan calls ran on the graphics owner's thread, both
+every one of the 284 Vulkan calls ran on the graphics owner's thread, both
 surfaces, the device, the messenger and the instance were destroyed in that
 order, and the verdict after the last teardown callback had no issue and no
 error.
@@ -68,27 +71,27 @@ error.
 ### The native suite's report
 
 ```
-vulkan	Run the groups this candidate still needs	2026-09-28T16:14:28.0910193Z vulkan-native-tests: implicit-layer policy: VK_LOADER_LAYERS_DISABLE=~implicit~, so no implicit layer joins the chain and the explicit layers below are all of it
-vulkan	Run the groups this candidate still needs	2026-09-28T16:14:28.0912562Z vulkan-native-tests: layer settings: VK_LAYER_SETTINGS_PATH=/dev/null, so no settings file decides what the layer validates
-vulkan	Run the groups this candidate still needs	2026-09-28T16:14:30.3543099Z 118 examples, 0 failures, 1 pending
-vulkan	Run the groups this candidate still needs	2026-09-28T16:14:30.3811997Z vulkan-native-tests: shared session acquisitions: 1
-vulkan	Run the groups this candidate still needs	2026-09-28T16:14:30.3812865Z vulkan-native-tests: shared session native calls: 169
-vulkan	Run the groups this candidate still needs	2026-09-28T16:14:30.3819809Z vulkan-native-tests: shared session destruction: vkDestroySurfaceKHR, vkDestroySurfaceKHR, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroySwapchainKHR, vkDestroySurfaceKHR, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroySwapchainKHR, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroySwapchainKHR, vkDestroySurfaceKHR, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroySwapchainKHR, vkDestroySurfaceKHR, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroySwapchainKHR, vkDestroySurfaceKHR, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroySwapchainKHR, vkDestroySurfaceKHR, vkDestroySurfaceKHR, vkDestroyDevice, vkDestroyDebugUtilsMessengerEXT, vkDestroyInstance
-vulkan	Run the groups this candidate still needs	2026-09-28T16:14:30.3826648Z vulkan-native-tests: shared session verdict: clean, 90 records delivered
-vulkan	Run the groups this candidate still needs	2026-09-28T16:14:30.3827424Z vulkan-native-tests: private debug-names: ExitSuccess in 0.122546233s
-vulkan	Run the groups this candidate still needs	2026-09-28T16:14:30.3828245Z vulkan-native-tests: private synchronization-hazard: ExitSuccess in 9.283184e-2s
-vulkan	Run the groups this candidate still needs	2026-09-28T16:14:30.3829065Z vulkan-native-tests: private vk11-recording: ExitSuccess in 0.123205596s
-vulkan	Run the groups this candidate still needs	2026-09-28T16:14:30.3829841Z vulkan-native-tests: private vk12-frames: ExitSuccess in 0.167422452s
-vulkan	Run the groups this candidate still needs	2026-09-28T16:14:30.3830867Z vulkan-native-tests: private vk13-presentation: ExitSuccess in 0.154185157s
-vulkan	Run the groups this candidate still needs	2026-09-28T16:14:30.3831694Z vulkan-native-tests: private vk14-recovery: ExitSuccess in 0.150438961s
-vulkan	Run the groups this candidate still needs	2026-09-28T16:14:30.3832457Z vulkan-native-tests: private vk15-retention: ExitSuccess in 0.115371069s
-vulkan	Run the groups this candidate still needs	2026-09-28T16:14:30.3833271Z vulkan-native-tests: private vk15-validation-stop: ExitSuccess in 0.129668402s
-vulkan	Run the groups this candidate still needs	2026-09-28T16:14:30.3834093Z vulkan-native-tests: private vk16-composed: ExitSuccess in 0.153359695s
-vulkan	Run the groups this candidate still needs	2026-09-28T16:14:30.3834880Z vulkan-native-tests: private vk2-compatibility: ExitSuccess in 0.13799934s
-vulkan	Run the groups this candidate still needs	2026-09-28T16:14:30.3835689Z vulkan-native-tests: private vk5-bridge: ExitSuccess in 4.8453035e-2s
-vulkan	Run the groups this candidate still needs	2026-09-28T16:14:30.3836452Z vulkan-native-tests: private vk6-capture: ExitSuccess in 9.1351324e-2s
-vulkan	Run the groups this candidate still needs	2026-09-28T16:14:30.3837209Z vulkan-native-tests: private vk7-roots: ExitSuccess in 0.133090519s
-vulkan	Run the groups this candidate still needs	2026-09-28T16:14:30.3838157Z vulkan-native-tests: the process ran for 2.290503773s, fixtures, examples and teardown included
+vulkan	Run the groups this candidate still needs	2026-09-28T17:54:36.2611660Z vulkan-native-tests: implicit-layer policy: VK_LOADER_LAYERS_DISABLE=~implicit~, so no implicit layer joins the chain and the explicit layers below are all of it
+vulkan	Run the groups this candidate still needs	2026-09-28T17:54:36.2613575Z vulkan-native-tests: layer settings: VK_LAYER_SETTINGS_PATH=/dev/null, so no settings file decides what the layer validates
+vulkan	Run the groups this candidate still needs	2026-09-28T17:54:38.5192252Z 118 examples, 0 failures, 1 pending
+vulkan	Run the groups this candidate still needs	2026-09-28T17:54:38.5473879Z vulkan-native-tests: shared session acquisitions: 1
+vulkan	Run the groups this candidate still needs	2026-09-28T17:54:38.5475223Z vulkan-native-tests: shared session native calls: 169
+vulkan	Run the groups this candidate still needs	2026-09-28T17:54:38.5484163Z vulkan-native-tests: shared session destruction: vkDestroySurfaceKHR, vkDestroySurfaceKHR, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroySwapchainKHR, vkDestroySurfaceKHR, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroySwapchainKHR, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroySwapchainKHR, vkDestroySurfaceKHR, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroySwapchainKHR, vkDestroySurfaceKHR, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroySwapchainKHR, vkDestroySurfaceKHR, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroySwapchainKHR, vkDestroySurfaceKHR, vkDestroySurfaceKHR, vkDestroyDevice, vkDestroyDebugUtilsMessengerEXT, vkDestroyInstance
+vulkan	Run the groups this candidate still needs	2026-09-28T17:54:38.5489468Z vulkan-native-tests: shared session verdict: clean, 90 records delivered
+vulkan	Run the groups this candidate still needs	2026-09-28T17:54:38.5490044Z vulkan-native-tests: private debug-names: ExitSuccess in 0.124698894s
+vulkan	Run the groups this candidate still needs	2026-09-28T17:54:38.5490630Z vulkan-native-tests: private synchronization-hazard: ExitSuccess in 9.20218e-2s
+vulkan	Run the groups this candidate still needs	2026-09-28T17:54:38.5491247Z vulkan-native-tests: private vk11-recording: ExitSuccess in 0.126745859s
+vulkan	Run the groups this candidate still needs	2026-09-28T17:54:38.5491802Z vulkan-native-tests: private vk12-frames: ExitSuccess in 0.172734357s
+vulkan	Run the groups this candidate still needs	2026-09-28T17:54:38.5492358Z vulkan-native-tests: private vk13-presentation: ExitSuccess in 0.151799751s
+vulkan	Run the groups this candidate still needs	2026-09-28T17:54:38.5492905Z vulkan-native-tests: private vk14-recovery: ExitSuccess in 0.151443619s
+vulkan	Run the groups this candidate still needs	2026-09-28T17:54:38.5493438Z vulkan-native-tests: private vk15-retention: ExitSuccess in 0.120504076s
+vulkan	Run the groups this candidate still needs	2026-09-28T17:54:38.5493992Z vulkan-native-tests: private vk15-validation-stop: ExitSuccess in 0.13266212s
+vulkan	Run the groups this candidate still needs	2026-09-28T17:54:38.5495064Z vulkan-native-tests: private vk16-composed: ExitSuccess in 0.155561402s
+vulkan	Run the groups this candidate still needs	2026-09-28T17:54:38.5495667Z vulkan-native-tests: private vk2-compatibility: ExitSuccess in 0.138870184s
+vulkan	Run the groups this candidate still needs	2026-09-28T17:54:38.5496230Z vulkan-native-tests: private vk5-bridge: ExitSuccess in 4.7329062e-2s
+vulkan	Run the groups this candidate still needs	2026-09-28T17:54:38.5496759Z vulkan-native-tests: private vk6-capture: ExitSuccess in 9.5398577e-2s
+vulkan	Run the groups this candidate still needs	2026-09-28T17:54:38.5497302Z vulkan-native-tests: private vk7-roots: ExitSuccess in 0.129857093s
+vulkan	Run the groups this candidate still needs	2026-09-28T17:54:38.5497923Z vulkan-native-tests: the process ran for 2.286683285s, fixtures, examples and teardown included
 ```
 
 ### The `vk16-composed` record
@@ -105,10 +108,10 @@ Verdict: **pass**.
 - frames while it was hidden (first, second): (0,3)
 - frames the first presented once shown again: 1
 - presentations made: 18; retired on their present fences: 18
-- Vulkan calls: 289, on 1 thread(s)
+- Vulkan calls: 284, on 1 thread(s)
 - verdict issues: []
 - error reports: 0
-- seconds, from the loader integration to the verdict: 0.135592625
+- seconds, from the loader integration to the verdict: 0.136639996
 
 ## Transcript
 
@@ -130,7 +133,7 @@ VK-16 composed loop
   observed every presentation's retirement through its present fence, and retired both targets and the roots in dependency order [[32m✔[0m]
   reached a verdict after the last callback with no issue and no error [[32m✔[0m]
 
-Finished in 0.0012 seconds
+Finished in 0.0011 seconds
 [32m6 examples, 0 failures[0m
 vulkan-native-tests vk16-composed: every check passed
 ```
@@ -148,7 +151,7 @@ vulkan-native-tests vk16-composed: every check passed
     "--complete"
   ],
   "duration_seconds": 3.221,
-  "ended_at": "2026-09-28T16:14:30.452Z",
+  "ended_at": "2026-09-28T17:54:38.620Z",
   "evidence": [
     "evidence/test.vulkan-native/debug-names.log",
     "evidence/test.vulkan-native/debug-names.md",
@@ -181,15 +184,15 @@ vulkan-native-tests vk16-composed: every check passed
     "evidence/test.vulkan-native/x11-server.txt"
   ],
   "executed": true,
-  "executed_commit": "acd72d4305327482d1a2488967818edb9b473d2f",
-  "executed_tree": "cffcec0a3d97c1f56adcf5d4441615a9b8bfb646",
+  "executed_commit": "6dd428bd10e73766a9d0d5cf8534934cd314bfa0",
+  "executed_tree": "b405cc45e284a84b0580ef796a047ba589147608",
   "exit_status": 0,
   "expiry": null,
   "group": "test.vulkan-native",
-  "head_commit": "24a3f2ec8a8175d7e8c2eddb294c3c7bb1a40cfb",
-  "input_identity": "8c0ad8a2917ec539d2ad7bfdc13a2cea8b755eb8006943ef5d1a380b82633015",
+  "head_commit": "4f553b41c1a6f296cd49600bce5bd3fa3153dc63",
+  "input_identity": "5f5eb9340ce90e8e5c9f35f460999a343162b62c4d73de45629723d67a7686f3",
   "outcome": "passed",
-  "plan_identity": "6f0aa38bdc6f6df58eaa53260a1324598cfd472e87ecf1ba4ecef46f5c26f3d2",
+  "plan_identity": "8d4ee2133610fc2c55888c30310521a85946fe7e9101e1d2a2a479370736bbd4",
   "policy_version": "aad24a40fa339228b695fbdd3f5d43904e8c4ea20cb490c87d407bb31580490f",
   "preparation": {
     "command": [
@@ -198,12 +201,12 @@ vulkan-native-tests vk16-composed: every check passed
       "build",
       "hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests"
     ],
-    "duration_seconds": 11.499,
-    "ended_at": "2026-09-28T16:14:27.231Z",
+    "duration_seconds": 11.402,
+    "ended_at": "2026-09-28T17:54:35.400Z",
     "exit_status": 0,
     "expiry": null,
     "outcome": "passed",
-    "started_at": "2026-09-28T16:14:15.732Z",
+    "started_at": "2026-09-28T17:54:23.998Z",
     "timeout_seconds": 3600
   },
   "runner_arch": "X64",
@@ -211,8 +214,8 @@ vulkan-native-tests vk16-composed: every check passed
   "runner_os": "Linux",
   "runner_python": "3.12.3",
   "schema_version": 4,
-  "source_run_url": "https://github.com/coghex/hetoimasia/actions/runs/36449343671/attempts/1",
-  "started_at": "2026-09-28T16:14:27.231Z",
+  "source_run_url": "https://github.com/coghex/hetoimasia/actions/runs/36461212808/attempts/1",
+  "started_at": "2026-09-28T17:54:35.400Z",
   "timeout_seconds": 30,
   "toolchain": {
     "cabal": "3.18.1.0",
@@ -242,19 +245,19 @@ vulkan-native-tests vk16-composed: every check passed
     "hetoimasia-gpu-vulkan-native:test:shader-tests",
     "hetoimasia-gpu-vulkan-glfw:test:integration-tests"
   ],
-  "duration_seconds": 30.447,
-  "ended_at": "2026-09-28T16:14:15.516Z",
+  "duration_seconds": 26.618,
+  "ended_at": "2026-09-28T17:54:23.778Z",
   "evidence": [],
   "executed": true,
-  "executed_commit": "acd72d4305327482d1a2488967818edb9b473d2f",
-  "executed_tree": "cffcec0a3d97c1f56adcf5d4441615a9b8bfb646",
+  "executed_commit": "6dd428bd10e73766a9d0d5cf8534934cd314bfa0",
+  "executed_tree": "b405cc45e284a84b0580ef796a047ba589147608",
   "exit_status": 0,
   "expiry": null,
   "group": "test.vulkan-headless",
-  "head_commit": "24a3f2ec8a8175d7e8c2eddb294c3c7bb1a40cfb",
-  "input_identity": "8c0ad8a2917ec539d2ad7bfdc13a2cea8b755eb8006943ef5d1a380b82633015",
+  "head_commit": "4f553b41c1a6f296cd49600bce5bd3fa3153dc63",
+  "input_identity": "5f5eb9340ce90e8e5c9f35f460999a343162b62c4d73de45629723d67a7686f3",
   "outcome": "passed",
-  "plan_identity": "6f0aa38bdc6f6df58eaa53260a1324598cfd472e87ecf1ba4ecef46f5c26f3d2",
+  "plan_identity": "8d4ee2133610fc2c55888c30310521a85946fe7e9101e1d2a2a479370736bbd4",
   "policy_version": "aad24a40fa339228b695fbdd3f5d43904e8c4ea20cb490c87d407bb31580490f",
   "preparation": null,
   "runner_arch": "X64",
@@ -262,8 +265,8 @@ vulkan-native-tests vk16-composed: every check passed
   "runner_os": "Linux",
   "runner_python": "3.12.3",
   "schema_version": 4,
-  "source_run_url": "https://github.com/coghex/hetoimasia/actions/runs/36449343671/attempts/1",
-  "started_at": "2026-09-28T16:13:45.069Z",
+  "source_run_url": "https://github.com/coghex/hetoimasia/actions/runs/36461212808/attempts/1",
+  "started_at": "2026-09-28T17:53:57.160Z",
   "timeout_seconds": 3600,
   "toolchain": {
     "cabal": "3.18.1.0",
