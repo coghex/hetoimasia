@@ -228,7 +228,11 @@ These instructions are also the authority for Claude sessions through CLAUDE.md.
   migrating game content; game save schemas remain game-owned.
 - Asset placeholders used for an explicit technical experiment must be labeled
   as such. Do not present them as approved production art.
-- MEMORY.md records durable context and open decisions. Implementation docs
+- Implementation pull requests do not edit MEMORY.md; owner-requested changes
+  belong in a standalone Markdown-only change. Status belongs in the PR body
+  and the owning subsystem document. CI refuses a pull request that changes
+  MEMORY.md together with non-Markdown files
+  ([the MEMORY.md rule](docs/validation.md#the-memorymd-rule)). Implementation docs
   describe current behavior; designs label proposals and unresolved choices.
   Update the relevant document with the change, without inventing completion.
 - Keep instructions short. Add subsystem contracts where the subsystem lives,

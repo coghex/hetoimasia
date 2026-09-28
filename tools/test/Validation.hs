@@ -6,7 +6,7 @@
 module Validation (spec) where
 
 import Control.Monad (void)
-import Data.List (isInfixOf)
+import Data.List (isInfixOf, isPrefixOf)
 import Json (asArray, asBool, asString, entryFor, field, parseJson)
 import Sandbox (git, run, sanitizedEnvironment, writeFixtureFile)
 import System.Directory (createDirectoryIfMissing, getCurrentDirectory, removeFile, renameFile)
@@ -14,7 +14,16 @@ import System.Exit (ExitCode (..))
 import System.FilePath (takeDirectory, (</>))
 import System.IO (IOMode (WriteMode), hClose, hPutStr, hSetEncoding, latin1, openFile)
 import System.IO.Temp (withSystemTempDirectory)
-import Test.Hspec (Spec, describe, it, shouldBe, shouldContain, shouldSatisfy)
+import Test.Hspec
+  ( Spec
+  , describe
+  , expectationFailure
+  , it
+  , shouldBe
+  , shouldContain
+  , shouldNotContain
+  , shouldSatisfy
+  )
 
 data Fixture = Fixture
   { root ∷ FilePath
@@ -523,6 +532,143 @@ spec = describe "Validation planner" $ do
         result `shouldBe` ExitFailure 2
         errors `shouldContain` "refs/heads/absent"
 
+  describe "the MEMORY.md rule" $ do
+    it "refuses a pull request that modifies MEMORY.md beside code, naming the rule, the paths, and the fix" $
+      withMemory $ \fixture base → do
+        writeFixtureFile (root fixture) "MEMORY.md" "a status paragraph for the merged change\n"
+        writeFixtureFile (root fixture) "packages/alpha/src/Alpha.hs" "module Alpha (alpha) where\nalpha :: Int\nalpha = 2\n"
+        writeFixtureFile (root fixture) "tools/shared.sh" "#!/bin/sh\necho revised\n"
+        writeFixtureFile (root fixture) "docs/prose.md" "revised prose\n"
+        commit fixture "Implement and record status"
+        (result, output, errors) ← pullRequest fixture base []
+        result `shouldBe` ExitFailure 2
+        output `shouldBe` ""
+        errors `shouldContain` "the MEMORY.md rule refuses this pull request"
+        errors `shouldContain` "changes MEMORY.md together with non-Markdown files"
+        errors `shouldContain` "(packages/alpha/src/Alpha.hs, tools/shared.sh)"
+        errors `shouldContain` "Drop the MEMORY.md edit"
+        errors `shouldContain` "record status in the pull request body and the owning subsystem document"
+        -- Markdown beside it is permitted, so it is not what triggered the rule.
+        errors `shouldNotContain` "docs/prose.md"
+
+    it "refuses a pull request that deletes MEMORY.md beside code" $
+      withMemory $ \fixture base → do
+        removeFile (root fixture </> "MEMORY.md")
+        writeFixtureFile (root fixture) "tools/shared.sh" "#!/bin/sh\necho revised\n"
+        commit fixture "Delete the memory"
+        refusedByMemoryRule fixture base ["tools/shared.sh"]
+
+    it "refuses a pull request that renames MEMORY.md away beside code" $
+      withMemory $ \fixture base → do
+        renameFile (root fixture </> "MEMORY.md") (root fixture </> "docs/memory.md")
+        writeFixtureFile (root fixture) "tools/shared.sh" "#!/bin/sh\necho revised\n"
+        commit fixture "Move the memory"
+        renamed fixture base "MEMORY.md" "docs/memory.md"
+        refusedByMemoryRule fixture base ["tools/shared.sh"]
+
+    it "refuses a pull request that renames MEMORY.md to a path that is not Markdown, with nothing else changed" $
+      withMemory $ \fixture base → do
+        renameFile (root fixture </> "MEMORY.md") (root fixture </> "MEMORY.txt")
+        commit fixture "Rename the memory"
+        renamed fixture base "MEMORY.md" "MEMORY.txt"
+        refusedByMemoryRule fixture base ["MEMORY.txt"]
+
+    it "refuses a pull request that adds a root MEMORY.md beside code" $
+      withFixture $ \fixture → do
+        writeFixtureFile (root fixture) "MEMORY.md" "new durable context\n"
+        writeFixtureFile (root fixture) "tools/shared.sh" "#!/bin/sh\necho revised\n"
+        commit fixture "Add a memory"
+        refusedByMemoryRule fixture (seeded fixture) ["tools/shared.sh"]
+
+    it "refuses a pull request that renames a document onto MEMORY.md beside code" $
+      withFixture $ \fixture → do
+        renameFile (root fixture </> "docs/prose.md") (root fixture </> "MEMORY.md")
+        writeFixtureFile (root fixture) "tools/shared.sh" "#!/bin/sh\necho revised\n"
+        commit fixture "Promote a document"
+        renamed fixture (seeded fixture) "docs/prose.md" "MEMORY.md"
+        refusedByMemoryRule fixture (seeded fixture) ["tools/shared.sh"]
+
+    it "holds a pull request to the rule whatever its request block asks for" $
+      withMemory $ \fixture base → do
+        writeFixtureFile (root fixture) "MEMORY.md" "a status paragraph\n"
+        writeFixtureFile (root fixture) "tools/shared.sh" "#!/bin/sh\necho revised\n"
+        commit fixture "Implement and record status"
+        writeFixtureFile (root fixture) "request.md" (requestBlock ["all-hspec"])
+        (result, _, errors) ← pullRequest fixture base ["--request-file", root fixture </> "request.md"]
+        result `shouldBe` ExitFailure 2
+        errors `shouldContain` "the MEMORY.md rule"
+
+    it "accepts a pull request that changes MEMORY.md and only Markdown" $
+      withMemory $ \fixture base → do
+        writeFixtureFile (root fixture) "MEMORY.md" "orientation and owner decisions only\n"
+        writeFixtureFile (root fixture) "docs/prose.md" "revised prose\n"
+        commit fixture "Shrink the memory"
+        acceptedByMemoryRule fixture base
+
+    it "accepts a pull request that changes a MEMORY.md outside the root beside code" $
+      withFixture $ \fixture → do
+        writeFixtureFile (root fixture) "docs/MEMORY.md" "a subsystem's own notes\n"
+        writeFixtureFile (root fixture) "tools/shared.sh" "#!/bin/sh\necho revised\n"
+        commit fixture "Add subsystem notes"
+        acceptedByMemoryRule fixture (seeded fixture)
+
+    it "accepts a branch whose fork point excludes a later master commit to MEMORY.md" $
+      withMemory $ \fixture base → do
+        branchGit fixture ["checkout", "-q", "-b", "feature"]
+        change fixture "tools/shared.sh" "#!/bin/sh\necho revised\n"
+        feature ← revision fixture "HEAD"
+        branchGit fixture ["checkout", "-q", "master"]
+        change fixture "MEMORY.md" "landed on master after the branch forked\n"
+        master ← revision fixture "HEAD"
+        forkPoint ← pullRequestRange fixture master feature
+        forkPoint `shouldBe` base
+        (result, _, errors) ← planRawBetween fixture forkPoint feature ["--event", "pull_request"]
+        (result, errors) `shouldBe` (ExitSuccess, "")
+        -- Compared against the base branch's tip instead, master's edit would
+        -- look like this branch's own, and the rule would refuse it.
+        (tip, _, refusal) ← planRawBetween fixture master feature ["--event", "pull_request"]
+        tip `shouldBe` ExitFailure 2
+        refusal `shouldContain` "the MEMORY.md rule"
+
+    it "accepts a branch that merged in a master commit to MEMORY.md" $
+      withMemory $ \fixture base → do
+        branchGit fixture ["checkout", "-q", "-b", "feature"]
+        change fixture "tools/shared.sh" "#!/bin/sh\necho revised\n"
+        branchGit fixture ["checkout", "-q", "master"]
+        change fixture "MEMORY.md" "landed on master after the branch forked\n"
+        master ← revision fixture "HEAD"
+        branchGit fixture ["checkout", "-q", "feature"]
+        branchGit fixture ["merge", "-q", "--no-edit", "master"]
+        feature ← revision fixture "HEAD"
+        forkPoint ← pullRequestRange fixture master feature
+        forkPoint `shouldBe` master
+        (result, _, errors) ← planRawBetween fixture forkPoint feature ["--event", "pull_request"]
+        (result, errors) `shouldBe` (ExitSuccess, "")
+        -- From the original fork point the merged edit would count.
+        (original, _, refusal) ← planRawBetween fixture base feature ["--event", "pull_request"]
+        original `shouldBe` ExitFailure 2
+        refusal `shouldContain` "the MEMORY.md rule"
+
+    it "never refuses a push, even one that changes MEMORY.md beside code" $
+      withMemory $ \fixture base → do
+        writeFixtureFile (root fixture) "MEMORY.md" "a status paragraph\n"
+        writeFixtureFile (root fixture) "tools/shared.sh" "#!/bin/sh\necho revised\n"
+        commit fixture "Merge a pull request"
+        after ← revision fixture "HEAD"
+        (resolved, range, rangeErrors) ←
+          run
+            (environment fixture)
+            (root fixture)
+            "python3"
+            [rangeTool fixture, "--repo-root", root fixture, "--event", "push", "--before", base, "--after", after]
+        (resolved, rangeErrors) `shouldBe` (ExitSuccess, "")
+        range `shouldContain` ("base=" ++ base)
+        (result, _, errors) ← planRawBetween fixture base after ["--event", "push"]
+        (result, errors) `shouldBe` (ExitSuccess, "")
+        -- A plan asked for no event applies no contribution rule either.
+        (local, _, localErrors) ← planRawBetween fixture base after []
+        (local, localErrors) `shouldBe` (ExitSuccess, "")
+
   describe "explanations" $
     it "explains every group in the default prose output" $
       withFixture $ \fixture → do
@@ -556,6 +702,61 @@ planJsonAt fixture base args = do
 
 planJson ∷ Fixture → [String] → IO String
 planJson fixture args = planJsonAt fixture (seeded fixture) args
+
+-- ---------------------------------------------------------------------------
+-- The MEMORY.md rule
+
+-- | A fixture whose root carries a MEMORY.md, and the commit that added it,
+-- which the example's pull request starts from.
+withMemory ∷ (Fixture → String → IO a) → IO a
+withMemory action = withFixture $ \fixture → do
+  change fixture "MEMORY.md" "durable context\n"
+  base ← revision fixture "HEAD"
+  action fixture base
+
+-- | Plan the fixture's head as CI plans a pull request's fork-point range.
+pullRequest ∷ Fixture → String → [String] → IO (ExitCode, String, String)
+pullRequest fixture base args = planRawBetween fixture base "HEAD" (["--event", "pull_request"] ++ args)
+
+refusedByMemoryRule ∷ Fixture → String → [FilePath] → IO ()
+refusedByMemoryRule fixture base triggering = do
+  (result, _, errors) ← pullRequest fixture base []
+  result `shouldBe` ExitFailure 2
+  errors `shouldContain` "the MEMORY.md rule"
+  errors `shouldContain` ("(" ++ intercalate ", " triggering ++ ")")
+
+acceptedByMemoryRule ∷ Fixture → String → IO ()
+acceptedByMemoryRule fixture base = do
+  (result, _, errors) ← pullRequest fixture base ["--json"]
+  (result, errors) `shouldBe` (ExitSuccess, "")
+
+-- | Require Git to have recorded the change as a rename, so the example
+-- exercises both of its endpoints rather than a deletion and an addition.
+renamed ∷ Fixture → String → FilePath → FilePath → IO ()
+renamed fixture base old new = do
+  statuses ← git (environment fixture) (root fixture) ["diff", "--name-status", "--find-renames", base, "HEAD"]
+  map words (lines statuses) `shouldSatisfy` any (\entry → drop 1 entry == [old, new] && take 1 (concat entry) == "R")
+
+branchGit ∷ Fixture → [String] → IO ()
+branchGit fixture = void . git (environment fixture) (root fixture)
+
+-- | The base a pull request from @head'@ into @tip@ is planned from, as
+-- @tools/validation/range.py@ resolves it for CI.
+pullRequestRange ∷ Fixture → String → String → IO String
+pullRequestRange fixture tip head' = do
+  (result, output, errors) ←
+    run
+      (environment fixture)
+      (root fixture)
+      "python3"
+      [rangeTool fixture, "--repo-root", root fixture, "--event", "pull_request", "--base-sha", tip, "--head-sha", head']
+  (result, errors) `shouldBe` (ExitSuccess, "")
+  case [drop 5 line | line ← lines output, "base=" `isPrefixOf` line] of
+    resolved : _ → pure resolved
+    [] → expectationFailure ("range.py reported no base: " ++ output) >> pure ""
+
+rangeTool ∷ Fixture → FilePath
+rangeTool fixture = takeDirectory (planner fixture) </> "range.py"
 
 -- | The same plan resolved for a named platform rather than this machine's, so
 -- an example can ask one candidate what it means on two operating systems.
