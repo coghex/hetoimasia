@@ -1344,8 +1344,10 @@ submission whose effect is unknown — so a diagnostic failure that happened
 first stays the primary and the owner's failure joins the evidence; a
 required target's recovery then goes no further, since the session has
 already failed. A failure that has claimed the capture's order but not yet
-published its alarm is waited for there, briefly, since its publication
-follows the claim at once; this is not a checkpoint and refuses nothing. The
+published its alarm is waited for there until it is readable, however long its
+thread is delayed — yielding at first, then sleeping briefly between looks —
+since the capture publishes right after it claims; this is not a checkpoint
+and refuses nothing. The
 device's loss is also kept apart
 from the primary (`reportDeviceLost`), whenever it is observed: a session that
 a validation error failed first and whose teardown then meets the loss keeps
@@ -1383,8 +1385,13 @@ and waits for nothing. The owner's ordinary operations pass through one:
   with `RefusedDiagnosticPending` while a failure is pending;
 - `handOverVulkanTarget` answers `VulkanSessionFailed` naming the primary, or
   `VulkanDiagnosticPending` while a failure is pending, and attaches nothing;
-  a construction the owner had already taken is rejected with
-  `RejectedSessionFailed`.
+- the owner's construction of a handed-over target, which a round runs before
+  its step, checks again (`checkpointRootsSettled`: it latches what the
+  capture holds, waiting out a pending alarm) before anything native, and
+  rejects with `RejectedSessionFailed` a target whose session failed after its
+  handover; it checks once more when admission's native calls return, and a
+  target a layer reported against during them is answered as a partial
+  construction, which the owner owns and retires, never as a usable one.
 
 Retirement never passes through one. Closing and skipping frames, the
 progress step's observations, the finite drain wait, and every target's,
@@ -1701,7 +1708,9 @@ evidence behind it; a required target's exhausted recovery failing the
 session and refusing the other target, while an optional target's leaves the
 other rendering; a validation error in the capture before the step that would
 exhaust a required target kept as the primary, with recovery going no further,
-and one that follows the exhaustion kept behind it; and a validation error
+and one that follows the exhaustion kept behind it; one whose alarm stays
+unpublished well past ten thousand looks, still waited for and kept as the
+primary; and a validation error
 reported inside a submission that then raised with an unknown effect kept as
 the primary, with the uncertain effect beside it. The model's own suite adds `Device loss`: the loss kept beside
 an earlier cause, the release refused before the loss, a submission and a
@@ -1712,7 +1721,8 @@ outcome of the call that failed the session recorded while new work is
 refused. `integration-tests` adds `terminal failure`: a validation error a
 stand-in call reports into the session's real capture, through the production C
 callback, latched at the owner's next checkpoint and reaching the application's
-as `GraphicsSessionFailed`, with a later handover refused naming it, the
+as `GraphicsSessionFailed`, the target it was reported against left unusable
+for the owner to retire, a later handover refused naming it, the
 teardown in order and the verdict carrying the error; the same error latched
 although a full capture dropped its record, since the latch is set before the
 record is admitted; a sink failure latched as
@@ -1722,7 +1732,10 @@ checkpoint, kept as the primary with the error beside it; a handover while the
 capture's sink had claimed the order but not published its failure, with an
 error latched after it, refused as `VulkanDiagnosticPending` with nothing
 latched or attached, and the next handover, once the failure is published,
-refused naming the sink failure with the error beside it;
+refused naming the sink failure with the error beside it; a target whose
+surface was still being created when an error arrived, after its handover's
+checkpoint, rejected naming the error when its construction began, with no
+native call made for it;
 an exit whose surface destruction failed, reporting the cleanup failure as its
 primary and what it retained beside it; a surface still in its native call when
 the drain closed the lease, whose destruction then failed, latched as a cleanup

@@ -333,6 +333,21 @@ spec = describe "Terminal failure" $ do
       tryAcquireFrame (rigFrames rig) healthy `shouldReturn` Left (RefusedSessionFailed TerminalValidationError)
       clean rig
 
+    it "waits for a diagnostic failure that claimed the order however long its alarm takes to publish, before a required target's recovery can be exhausted" $ do
+      rig ← newRigClassed [RequiredTarget, OptionalTarget] defaultBudgetRequest
+      (required, _) ← twoTargets rig
+      -- The claimant is delayed well past the ten thousand looks the wait
+      -- once gave up after; only then is its error readable.
+      looks ← newTVarIO (0 ∷ Int)
+      let delayed = do
+            seen ← atomically (stateTVar looks (\count → (count, count + 1)))
+            pure (if seen < 10100 then [AlarmPending] else [AlarmValidationError])
+      exhaustRecoveryAfter rig required (atomically (watchRootsDiagnostics (rigRoots rig) delayed))
+      primaryIs rig (== TerminalValidationError)
+      evidenceOf rig `shouldReturn` []
+      viewCondition <$> generationsOn rig required `shouldNotReturn` RecoverySpent
+      clean rig
+
     it "keeps a required target's exhausted recovery as the primary when a validation error follows it" $ do
       rig ← newRigClassed [RequiredTarget, OptionalTarget] defaultBudgetRequest
       (required, healthy) ← twoTargets rig

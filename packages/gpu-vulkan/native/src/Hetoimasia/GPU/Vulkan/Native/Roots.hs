@@ -162,6 +162,7 @@ module Hetoimasia.GPU.Vulkan.Native.Roots
   , watchRootsDiagnostics
   , checkpointRoots
   , syncRootsDiagnostics
+  , checkpointRootsSettled
   , readRootsTerminal
   , terminalFailure
 
@@ -192,7 +193,7 @@ module Hetoimasia.GPU.Vulkan.Native.Roots
   , failRootsSessionBecause
   ) where
 
-import Control.Concurrent (yield)
+import Control.Concurrent (threadDelay, yield)
 import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, stateTVar, writeTVar)
 import Control.Exception
   ( Exception (displayException)
@@ -961,23 +962,40 @@ checkpointRoots roots = do
 -- after it joins the evidence.
 --
 -- A failure that has claimed the capture's order but not yet published its
--- alarm happened first too; its publication follows the claim at once, masked,
--- so this yields until it is readable, a bounded number of times, and then
--- latches whatever is. It is not a checkpoint: it refuses nothing, and only the
--- owner's failure paths call it.
+-- alarm happened first too, so this waits until it is readable: the capture's
+-- worker publishes its sink failure right after its claim with asynchronous
+-- exceptions masked, and its callback sets the error latch right after its
+-- own, so the wait ends however long the claimant's thread is delayed. It
+-- yields at first and then sleeps briefly between looks. It is not a
+-- checkpoint: it refuses nothing, and only the owner's failure and admission
+-- paths call it.
 syncRootsDiagnostics ∷ Roots q inst msgr phys dev → IO ()
-syncRootsDiagnostics roots = go syncAttempts
+syncRootsDiagnostics roots = go (0 ∷ Int)
   where
-    go remaining = do
+    go looked = do
       alarms ← join (readTVarIO (rootsWatch roots))
-      if AlarmPending `elem` alarms && remaining > 0
-        then yield >> go (remaining - 1)
+      if AlarmPending `elem` alarms
+        then pause looked >> go (looked + 1)
         else atomically (latchAlarms roots alarms)
+    pause looked
+      | looked < syncYields = yield
+      | otherwise = threadDelay syncPause
 
--- | How many times 'syncRootsDiagnostics' looks again for an alarm whose
--- publication is under way.
-syncAttempts ∷ Int
-syncAttempts = 10000
+-- | How many times 'syncRootsDiagnostics' yields before it sleeps between
+-- looks, and for how long it then sleeps, in microseconds.
+syncYields, syncPause ∷ Int
+syncYields = 10000
+syncPause = 100
+
+-- | A checkpoint for the owner's own admission of new work, which may wait: it
+-- first latches what the capture holds ('syncRootsDiagnostics'), so it never
+-- answers 'CheckpointPending'.
+checkpointRootsSettled ∷ Roots q inst msgr phys dev → IO Checkpoint
+checkpointRootsSettled roots = do
+  syncRootsDiagnostics roots
+  checkpointRoots roots >>= \case
+    CheckpointPending → checkpointRootsSettled roots
+    settled → pure settled
 
 -- | Latch each alarm the capture named, in its order.
 latchAlarms ∷ Roots q inst msgr phys dev → [DiagnosticAlarm] → STM ()

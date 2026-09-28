@@ -18,6 +18,7 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , journal
   , threadsOf
   , awaitEvent
+  , journalHas
 
     -- * The native layer
   , Native
@@ -235,7 +236,11 @@ threadsOf rig wanted = map fst . filter (wanted . snd) . reverse <$> readTVarIO 
 
 -- | Wait until this event has happened.
 awaitEvent ∷ Rig → Event → IO ()
-awaitEvent rig event = atomically (readTVar (rigJournal rig) >>= check . elem event . map snd)
+awaitEvent rig event = atomically (journalHas rig event >>= check)
+
+-- | Whether this event has happened.
+journalHas ∷ Rig → Event → STM Bool
+journalHas rig event = elem event . map snd <$> readTVar (rigJournal rig)
 
 -- ---------------------------------------------------------------------------
 -- The native layer

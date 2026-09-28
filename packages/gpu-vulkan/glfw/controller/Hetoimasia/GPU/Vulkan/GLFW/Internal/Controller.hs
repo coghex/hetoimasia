@@ -222,6 +222,7 @@ import Hetoimasia.GPU.Vulkan.Native.Roots
   , Checkpoint (..)
   , admitRootTarget
   , checkpointRoots
+  , checkpointRootsSettled
   , terminalFailure
   , latchTerminal
   , noteTeardownEvidence
@@ -652,37 +653,13 @@ constructTarget state start = do
     LeaseReady lease → do
       listed ← atomically (obligationsOf bridge lease attachment)
       case deposit of
-        Just (Deposit classification (CreatedLive obligation)) → do
-          -- Admission and the record of which target it made are one masked
-          -- step: a cancellation between them would leave the roots owning a
-          -- surface no retirement could name. The native calls inside are
-          -- uninterruptible in any case.
-          admitted ← mask_ $ do
-            answer ← admitRootTarget (stateRoots state) classification (TargetSurface (handleOf obligation) (destruction bridge obligation))
-            for_ answer $ \target → atomically $ do
-              modifyTVar' (stateTargets state) (Map.insert attachment target)
-              trackTarget (stateGenerations state) target classification (handleOf obligation)
-            pure answer
-          case admitted of
-            Right target → do
-              view ← atomically (readRootsView (stateRoots state))
-              pure . TargetConstructed . targetEvidence $
-                "admitted "
-                  <> tshow target
-                  <> " ("
-                  <> describeClass classification
-                  <> ") on surface "
-                  <> hex (handleOf obligation)
-                  <> maybe "" (" of device " <>) (viewDeviceName view)
-                  <> maybe "" ((", queue family " <>) . tshow) (viewQueueFamily view)
-            Left refused → do
-              -- Admission closed because the session failed: the rejection
-              -- names the failure.
-              primary ← reportPrimary <$> atomically (readRootsTerminal (stateRoots state))
-              let reason = case (refused, primary) of
-                    (TargetAdmissionClosed, Just cause) → RejectedSessionFailed cause
-                    _ → RejectedByRoots refused
-              reject state attachment reason (distinct (obligation : listed))
+        -- A diagnostic failure may have arrived after the handover was
+        -- queued: the session's failure is taken before anything native is
+        -- done, and again once admission's native calls have returned.
+        Just (Deposit classification (CreatedLive obligation)) →
+          checkpointRootsSettled (stateRoots state) >>= \case
+            CheckpointFailed primary → reject state attachment (RejectedSessionFailed primary) (distinct (obligation : listed))
+            _ → admit classification obligation listed
         Just (Deposit _ (CreatedUnusable obligation reason)) → reject state attachment (SurfaceUnusable reason) (distinct (obligation : listed))
         Just (Deposit _ (CreationFailed reason)) → reject state attachment (SurfaceNotCreated reason) listed
         Nothing → reject state attachment SurfaceNotHandedOver listed
@@ -693,6 +670,45 @@ constructTarget state start = do
     attachment = startingTarget start
     handleOf = bridgeObligationHandle bridge
     distinct = nubBy (bridgeSameObligation bridge)
+    admit classification obligation listed = do
+      -- Admission and the record of which target it made are one masked
+      -- step: a cancellation between them would leave the roots owning a
+      -- surface no retirement could name. The native calls inside are
+      -- uninterruptible in any case.
+      admitted ← mask_ $ do
+        answer ← admitRootTarget (stateRoots state) classification (TargetSurface (handleOf obligation) (destruction bridge obligation))
+        for_ answer $ \target → atomically $ do
+          modifyTVar' (stateTargets state) (Map.insert attachment target)
+          trackTarget (stateGenerations state) target classification (handleOf obligation)
+        pure answer
+      case admitted of
+        Right target → do
+          view ← atomically (readRootsView (stateRoots state))
+          let admittedOn =
+                "admitted "
+                  <> tshow target
+                  <> " ("
+                  <> describeClass classification
+                  <> ") on surface "
+                  <> hex (handleOf obligation)
+                  <> maybe "" (" of device " <>) (viewDeviceName view)
+                  <> maybe "" ((", queue family " <>) . tshow) (viewQueueFamily view)
+          -- A layer may have reported from inside admission's own native
+          -- calls: a target admitted into a session that had failed by then is
+          -- the owner's to retire, never a usable one.
+          checkpointRootsSettled (stateRoots state) >>= \case
+            CheckpointFailed primary →
+              pure . TargetPartial . targetEvidence $
+                admittedOn <> ", but the session failed while it was admitted (" <> tshow primary <> "), so the owner retires it"
+            _ → pure (TargetConstructed (targetEvidence admittedOn))
+        Left refused → do
+          -- Admission closed because the session failed: the rejection
+          -- names the failure.
+          primary ← reportPrimary <$> atomically (readRootsTerminal (stateRoots state))
+          let reason = case (refused, primary) of
+                (TargetAdmissionClosed, Just cause) → RejectedSessionFailed cause
+                _ → RejectedByRoots refused
+          reject state attachment reason (distinct (obligation : listed))
 
 -- | Destroy everything an attachment left and settle it as a verified
 -- rollback — or, if a destruction was uncertain, as a partial construction the

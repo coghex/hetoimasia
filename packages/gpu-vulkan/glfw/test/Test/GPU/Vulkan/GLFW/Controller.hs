@@ -15,7 +15,7 @@ module Test.GPU.Vulkan.GLFW.Controller (spec) where
 
 import Control.Concurrent (ThreadId, forkIO, myThreadId, throwTo, yield)
 import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (..), threadStatus)
-import Control.Concurrent.STM (TVar, atomically, check, newTVarIO, orElse, readTVar, registerDelay, writeTVar)
+import Control.Concurrent.STM (TVar, atomically, check, newTVarIO, orElse, readTVar, registerDelay, retry, writeTVar)
 import Control.Exception (Exception (..), ExceptionWithContext (ExceptionWithContext), SomeException, asyncExceptionFromException, asyncExceptionToException, finally, throwIO, try)
 import Control.Monad (forM_, replicateM_, void)
 import Data.List (isSubsequenceOf, nub)
@@ -120,6 +120,7 @@ spec = describe "Vulkan controller" $ do
     it "latches a sink failure as a terminal status of its own, with the capture's verdict saying so" (bounded testSinkFailure)
     it "keeps a sink failure that came first as the primary when a validation error arrives before the next checkpoint" (bounded testSinkThenError)
     it "refuses a handover while a sink failure has claimed the order but not yet published, latching nothing until it has" (bounded testClaimedSinkPending)
+    it "admits no target whose construction begins after a validation error arrived, making no native call for it" (bounded testQueuedConstructionStops)
     it "reports what an exit could not verify as retained, beside the cleanup failure that is its primary" (bounded testRetentionReported)
     it "keeps the dependency order and the loss when cancellation is delivered repeatedly during the drain that follows it" (bounded testCancelledAfterLoss)
     it "latches the failed destruction of a surface created while the lease closed, beside the earlier primary, and retains the instance" (bounded testLateSurfaceFails)
@@ -799,6 +800,10 @@ testValidationStops ∷ IO ()
 testValidationStops = do
   rig ← newRigOf 3
   observed ← newTVarIO Nothing
+  -- The second target's retirement holds in its surface's destruction until
+  -- its standing has been read, so the drain cannot forget it first.
+  retiring ← newTVarIO False
+  scriptSurface rig 101 (DestroyHolds retiring)
   outcome ← runRigCaught rig $ \host control → do
     [first, second, third] ← windowsOf host
     let owner = vulkanGraphicsOwner host
@@ -809,16 +814,20 @@ testValidationStops = do
     -- The layer reports an error from inside the later target's support
     -- query, which itself returns normally.
     scriptNative rig AtSupport (ReportsError "an injected validation error")
-    _ ← handedOver host second OptionalTarget
+    two ← handedOver host second OptionalTarget
+    -- Admitted into a session that had failed by the time admission
+    -- returned: the owner owns it and retires it, and it is never usable.
+    standing ← awaitStanding host two
+    atomically (writeTVar retiring True)
     -- The owner's next checkpoint latches it and ends its run.
     atomically (readOwnerFailure owner >>= check . isJust)
     answer ← handOverVulkanTarget controller (vulkanWindowHost host) owner third RequiredTarget
     report ← atomically (readVulkanTerminal controller)
-    atomically (writeTVar observed (Just (refused answer, reportPrimary report, reportDeviceLost report)))
+    atomically (writeTVar observed (Just (standing, refused answer, reportPrimary report, reportDeviceLost report)))
     checkRuntime control
   failure ← raisedAs @GraphicsSessionFailed outcome
   failure `shouldBe` GraphicsSessionFailed TerminalValidationError
-  atomically (readTVar observed) >>= (`shouldBe` Just (True, Just TerminalValidationError, Nothing))
+  atomically (readTVar observed) >>= (`shouldBe` Just (TargetUnusable True, True, Just TerminalValidationError, Nothing))
   -- Teardown followed the ordinary rules, child before parent.
   events ← journal rig
   events `shouldSatisfy` isSubsequenceOf [SurfaceDestroyed 100, SurfaceDestroyed 101, DeviceDestroyed, MessengerDestroyed, InstanceDestroyed, WindowGone True]
@@ -969,6 +978,50 @@ testClaimedSinkPending = do
       VulkanDiagnosticPending → "pending" ∷ String
       VulkanSessionFailed (TerminalSinkFailed _) → "sink failed"
       other → show other
+
+testQueuedConstructionStops ∷ IO ()
+testQueuedConstructionStops = do
+  rig ← twoWindows
+  gate ← newTVarIO False
+  observed ← newTVarIO Nothing
+  -- The second window's surface is still being created on the main thread,
+  -- after its handover's own checkpoint found nothing, when a layer reports
+  -- an error; the owner is idle, so the handover's announcement is what wakes
+  -- it, and its round constructs before its step checks anything.
+  scriptSurface rig 101 (CreateHolds gate)
+  outcome ← runRigCaught rig $ \host control → do
+    [first, second] ← windowsOf host
+    let owner = vulkanGraphicsOwner host
+        controller = vulkanController host
+    _ ← superviseGraphicsOwner control owner
+    one ← handedOver host first RequiredTarget
+    TargetUsable ← awaitStanding host one
+    void . forkIO $ do
+      atomically (creationsBegun rig >>= check . (>= 2))
+      reportErrorNow rig "an error while a handover is under way"
+      atomically (writeTVar gate True)
+    two ← handedOver host second OptionalTarget
+    -- The owner forgets a verified rollback at once, so its rejection is read
+    -- from the controller; a target admitted instead makes its support query,
+    -- which answers too rather than being waited past.
+    settled ← atomically $
+      (Left <$> (readTargetRejection controller (graphicsAttachment two) >>= maybe retry pure))
+        `orElse` (Right () <$ (journalHas rig (SupportQueried 101) >>= check))
+    report ← atomically (readVulkanTerminal controller)
+    atomically (writeTVar observed (Just (either rejected (const False) settled, reportPrimary report)))
+    checkRuntime control
+  failure ← raisedAs @GraphicsSessionFailed outcome
+  failure `shouldBe` GraphicsSessionFailed TerminalValidationError
+  -- Never admitted: its surface destroyed and its rollback verified, with no
+  -- native call made for it.
+  atomically (readTVar observed) >>= (`shouldBe` Just (True, Just TerminalValidationError))
+  events ← journal rig
+  [e | e@(SupportQueried 101) ← events] `shouldBe` []
+  length [() | SurfaceDestroyed 101 ← events] `shouldBe` 1
+  where
+    rejected = \case
+      RejectedSessionFailed TerminalValidationError → True
+      _ → False
 
 testRetentionReported ∷ IO ()
 testRetentionReported = do
