@@ -74,7 +74,8 @@ import Hetoimasia.GPU.Vulkan.Native.Roots
 -- | Try to acquire one frame of the target, without waiting.
 --
 -- Before any native call the target must be this session's, admitted, and
--- presenting from an active generation, and the model must reserve a frame —
+-- have an active generation — presenting, or still presenting while its
+-- replacement settles or waits for room — and the model must reserve a frame —
 -- its slot, the presentation-pool record it may need and the submission record
 -- it may need. A target that is suspended, closing or unavailable answers so;
 -- one with nothing to acquire from, or whose frame or pool budget is
@@ -115,11 +116,15 @@ tryAcquireFrame frames target =
               TargetRetiring → Right (Left AcquisitionClosing)
               TargetUnavailable → Right (Left AcquisitionUnavailable)
               TargetAdmitted → case viewCondition <$> view of
-                Just Presenting → case view >>= active of
-                  Nothing → Right (Left (AcquisitionPending PendingGeneration))
-                  Just (generation, swapchain) → case device of
-                    Nothing → Left RefusedDeviceAbsent
-                    Just (handle, _) → Right (Right (generation, swapchain, handle))
+                Just Presenting → fromActive view device
+                -- A replacement that waits for its geometry to settle, or for
+                -- room in its budget, leaves the active generation presenting
+                -- until it is built: a swapchain that answered suboptimal
+                -- still presents, scaled to the surface, so a live resize
+                -- keeps rendering rather than freezing. One the surface has
+                -- made out of date answers so again, and is reported again.
+                Just (Settling _) → fromActive view device
+                Just (Backpressured _) → fromActive view device
                 Just (Suspended _) → Right (Left AcquisitionSuspended)
                 Just Closing → Right (Left AcquisitionClosing)
                 Just RecoverySpent → Right (Left AcquisitionUnavailable)
@@ -127,6 +132,11 @@ tryAcquireFrame frames target =
                 Just SurfaceReplacing → Right (Left (AcquisitionPending PendingSurfaceLost))
                 Just (PresentationUnsupported _) → Right (Left AcquisitionUnavailable)
                 _ → Right (Left (AcquisitionPending PendingGeneration))
+    fromActive view device = case view >>= active of
+      Nothing → Right (Left (AcquisitionPending PendingGeneration))
+      Just (generation, swapchain) → case device of
+        Nothing → Left RefusedDeviceAbsent
+        Just (handle, _) → Right (Right (generation, swapchain, handle))
     active view = do
       generation ← viewActive view
       native ← find ((== generation) . viewGeneration) (viewGenerations view)

@@ -132,10 +132,12 @@ data TargetCondition
   | Suspended !Suspension
     -- ^ No usable extent now. Acquisition is suspended; this is not a failure.
   | Settling !Instant
-    -- ^ The geometry moved; the replacement waits until it has been quiet
-    -- until this instant.
+    -- ^ The geometry moved; the replacement coalesces every later move until
+    -- this instant, and the active generation, if there is one, keeps
+    -- presenting meanwhile.
   | Backpressured !BudgetKind
-    -- ^ The replacement cannot fit its budget yet. Rendering is paused; every
+    -- ^ The replacement cannot fit its budget yet. The active generation, if
+    -- there is one, keeps presenting; without one rendering is paused. Every
     -- other target and the owner carry on.
   | ConstructionFailed !Text
     -- ^ The last construction failed. The target has no active generation,
@@ -180,8 +182,9 @@ data TargetRecord = TargetRecord
   , recordActive ∷ !(Maybe GenerationId)
   , recordCondition ∷ !TargetCondition
   , recordSettling ∷ !(Maybe (SurfaceExtent, TargetGeometry, Instant))
-    -- ^ The extent a replacement would be built at, the observed geometry it
-    -- was planned from, and since when both have been what they are.
+    -- ^ The newest extent a replacement would be built at, the observed
+    -- geometry it was planned from, and when the move they belong to was
+    -- first seen.
   , recordResult ∷ !(Maybe SwapchainResult)
   , recordResultUnseen ∷ !Bool
     -- ^ A result was reported, or a replacement surface installed, since the
@@ -218,8 +221,9 @@ data Generations q inst msgr phys dev = Generations
 makeGenerations ∷ (GenerationId → IO ()) → CaptureUsage → Roots q inst msgr phys dev → IO (Generations q inst msgr phys dev)
 makeGenerations hook capture roots = (\targets → Generations roots targets hook capture) <$> newTVarIO Map.empty <*> newTVarIO 0
 
--- | How long the geometry a replacement would be built from must stay the
--- same before it is built: 16 ms.
+-- | How long a move is coalesced, from when it was first seen, before its
+-- replacement is built from the newest geometry: 16 ms. It bounds how often a
+-- continuous resize rebuilds, not how long the geometry must stay quiet.
 settlingPeriod ∷ Duration
 settlingPeriod = either (const minimumPositiveDuration) id (durationFromNanoseconds RequirePositive 16000000)
 

@@ -413,14 +413,19 @@ immediate, so the owner that reported a result takes the round that
 reconciles it rather than going idle. A report from another thread wakes
 nothing, and the package's public module does not offer one.
 
-- **Ordinary resize** is not a failed construction. The extent a replacement
-  would be built at is watched, with the observed geometry it was planned
-  from, and the generation is rebuilt only once both have been the same for
-  16 ms on the owner's monotonic clock (`Settling`); a newer observation
-  restarts the wait even while the surface still reports the old extent, so
-  only the newest geometry is built. A move that settles at the extent the
+- **Ordinary resize** is not a failed construction. A move is coalesced for
+  16 ms on the owner's monotonic clock from when it was first seen
+  (`Settling`), and then built from the newest extent and observed geometry. A
+  later change within the period joins the move rather than restarting its
+  wait, so a resize that never pauses — a Cocoa live resize changes the
+  framebuffer about every 8.5 ms — is rebuilt once a period rather than never.
+  Meanwhile the active generation keeps presenting
+  ([Acquisition](#acquisition)): a swapchain that answered suboptimal still
+  presents, scaled to the surface. A move that settles at the extent the
   active generation already has is adopted without a rebuild, and a move that
-  returns to the active generation's geometry is cancelled.
+  returns to the active generation's geometry is cancelled. A surface that
+  reports its new extent later than the period is reported by the active
+  generation's next suboptimal or out-of-date answer, as any resize is.
 - **Reconciliation without a fresh observation.** With a concrete surface
   extent, an out-of-date or suboptimal result is enough to rebuild at the
   surface's new extent: a main thread stalled in a platform modal loop does not
@@ -464,12 +469,16 @@ nothing, and the package's public module does not offer one.
 A target holds at most the model's generation limit, two by default, counting
 active, constructing and retired together. At capacity, every retired generation
 whose holds have ended is destroyed first; if the replacement still cannot fit,
-the target is `Backpressured` — suspended in the model — until a hold ends, and
-every other target and the owner carry on. With a limit of one, the active
+the target is `Backpressured` until a hold ends, and every other target and the
+owner carry on. When only the generation count is in the way and an active
+generation remains, the target keeps presenting from it: those frames spend
+nothing the replacement waits for, since the retired generation's holds end on
+their own present fences. Any other budget suspends the target in the model
+while it waits. With a limit of one, the active
 generation is the only thing in the way: it is retired on its own, awaited, and
-destroyed, and a fresh generation is built without it once its geometry has
-settled — every construction after a target's first is a replacement, and
-waits the same quiet period. No target reserves or
+destroyed, and a fresh generation is built without it once its move's period
+has passed — every construction after a target's first is a replacement, and
+is coalesced the same way. No target reserves or
 releases anything of another's.
 
 ### Holds
@@ -990,9 +999,12 @@ refusals](#checkpoints-and-refusals)). The target must be this session's
 (`ForeignIdentity`, `StaleIdentity` or `UnknownIdentity` otherwise — misuse,
 never pending), and admitted: a suspended target answers
 `AcquisitionSuspended`, a retiring one `AcquisitionClosing`, and an unavailable
-one `AcquisitionUnavailable`. Its generations
-must be presenting from an active generation: a target still constructing,
-settling a resize, backpressured or waiting to recover answers
+one `AcquisitionUnavailable`. It acquires from the
+active generation while its generations are presenting, and also while a
+replacement is settling or backpressured, so a live resize keeps rendering
+(on MoltenVK the image is scaled to the layer until the replacement is built).
+A target with no active generation — still constructing, or after a failed
+construction — or waiting to recover answers
 `AcquisitionPending PendingGeneration`; a spent recovery or an unsupported
 surface answers `AcquisitionUnavailable`.
 
@@ -1343,7 +1355,7 @@ due in and never polls or loops hot.
 
 | What happens | Is it an attempt? |
 | --- | --- |
-| An ordinary resize, however often the geometry moves | No: it settles for 16 ms and is built as a replacement ([Replacement](#replacement)) |
+| An ordinary resize, however often the geometry moves | No: it is coalesced for 16 ms and built as a replacement ([Replacement](#replacement)) |
 | An out-of-date or suboptimal result with unchanged geometry | Yes, each rebuild |
 | A construction after one that failed, a window still in use (`VK_ERROR_NATIVE_WINDOW_IN_USE_KHR`) included | Yes: the next attempt of the same episode, never a new one |
 | A lost surface's replacement, from asking for the surface to publishing a generation on it | Yes, one attempt; a construction on the new surface that fails spends the next |
@@ -1736,7 +1748,11 @@ did. The owner is not stalled by it. It keeps rendering what it holds — the
 latest scene any other thread published, the last coherent observation, and
 the extent the surface's capabilities supply (D-30), with acquisition
 suspended for unusable dimensions and replacement bounded by VK-10's budget —
-on its own deadlines.
+on its own deadlines. A live resize, which changes the surface faster than a
+replacement's period, keeps presenting from the active generation and is
+rebuilt from the newest extent once a period
+([Replacement](#replacement)); a headless example holds the native call while
+the stand-in surface changes every 8 ms and requires both.
 
 **What that does not mean.** A frame the owner presents during a stall proves
 that the request was admitted; its present fence, observed signalled, proves
@@ -2034,12 +2050,13 @@ VK-18's D-33 order and releases nothing early.
   image counts within the surface's limits and the tracking limit; and the
   swapchain generations over the stand-in: construction from the surface's
   extent and format, a stale observation, zero area suspending without an
-  attempt, coalesced resize waiting 16 ms for the newest geometry, a move the
+  attempt, a resize coalesced for 16 ms from its first move and built from the
+  newest geometry, a resize that never pauses rebuilt once a period, a move the
   surface has not caught up with yet, a cancelled move not shortening a later
-  one's quiet period, a newer observation restarting it at an unchanged
-  surface extent, a newer resize waiting it out under the one-generation
-  limit, capacity retiring and destroying first
-  and pausing otherwise, the one-generation configuration, per-target
+  one's period, a newer observation joining the move at an unchanged surface
+  extent, a newer resize built from the newest extent under the one-generation
+  limit once there is room, capacity retiring and destroying first
+  and keeping the active generation presenting otherwise, the one-generation configuration, per-target
   reservation isolation, an oversized and a zero returned image count refused
   before any view, a failed replacement unable to reacquire from or hand over
   the retired handle, a newer resize surviving an in-flight replacement,
@@ -2103,7 +2120,11 @@ spinning while the clock stands still, and polling when it comes; one target
 presenting five more frames while another's acquisitions all answer not ready;
 the owner presenting a scene published from another thread while the main
 thread is held inside its native event call, and a window command submitted
-then served only once the call returns; a presentation's device loss reaching
+then served only once the call returns; a live resize under the same held call,
+the stand-in surface changing every 8 ms and every swapchain built at another
+extent answering suboptimal, with the owner presenting throughout and building
+at least three replacements — the same example presents once and builds none
+under a rule that waits for quiet geometry; a presentation's device loss reaching
 the composed loop's checkpoint; and the exit drain waiting for owed
 presentations before retiring the target, the device, the messenger and the
 instance, with a window command submitted after the loop ended answered rather
@@ -2214,7 +2235,11 @@ after its presentation's retirement was observed; generations retired one a
 step, round-robin across two targets; and the first of two targets closed from
 verified fences — withheld while its presentation was pending — its surface
 destroyed and the device kept, while the second keeps presenting before and
-after, and the session then retired with every fence observed.
+after, and the session then retired with every fence observed. VK-16 adds, under
+`while a replacement waits`, a frame acquired from and presented to the active
+generation while its replacement settles — the replacement then built and the
+old generation held by that presentation — and one acquired from it while the
+replacement waits for the generation count to have room.
 
 VK-14's examples are in `native-tests` and `integration-tests`, over the same
 stand-ins, extended to answer a native result recovery acts on

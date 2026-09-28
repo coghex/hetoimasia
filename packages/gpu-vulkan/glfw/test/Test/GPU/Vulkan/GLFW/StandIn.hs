@@ -53,6 +53,8 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , holdAcquisitions
   , stallSwapchain
   , raiseOnPresent
+  , suboptimalWhileStale
+  , swapchainsCreated
   , frameEvents
   , fenceQueries
   , presentsOf
@@ -751,6 +753,9 @@ data Rendering = Rendering
     -- ^ Raised, once, by the next presentation, after its entry is written.
   , renderingRetireCount ∷ !(TVar (Maybe Int))
     -- ^ When set, how many more present fences may answer signalled.
+  , renderingStale ∷ !(TVar (Maybe (TVar (Maybe SurfaceExtent))))
+    -- ^ When set, the extent the surfaces report: a presentation to a
+    -- swapchain built at another extent answers suboptimal.
   }
 
 data FenceKind = FenceIdle | FenceSubmission | FencePresent | FenceDone
@@ -770,6 +775,7 @@ newRendering =
     <*> newTVarIO Nothing
     <*> newTVarIO False
     <*> newTVarIO Set.empty
+    <*> newTVarIO Nothing
     <*> newTVarIO Nothing
     <*> newTVarIO Nothing
 
@@ -804,6 +810,20 @@ stallSwapchain rig swapchain = atomically (modifyTVar' (renderingStalled (rigRen
 -- | Have the next presentation raise this, once, after writing its entry.
 raiseOnPresent ∷ Rig → SomeException → IO ()
 raiseOnPresent rig failure = atomically (writeTVar (renderingRaise (rigRendering rig)) (Just failure))
+
+-- | Have every later presentation answer suboptimal while its swapchain was
+-- built at another extent than the surfaces report now, as MoltenVK's do while
+-- a window is resized, and what 'scriptPresentStatus' says otherwise.
+suboptimalWhileStale ∷ Rig → IO ()
+suboptimalWhileStale rig = atomically (writeTVar (renderingStale (rigRendering rig)) (Just (nativeCurrentExtent (rigNative rig))))
+
+-- | How many swapchains have been created.
+swapchainsCreated ∷ Rig → IO Int
+swapchainsCreated rig = length . filter created <$> journal rig
+  where
+    created = \case
+      SwapchainCreated {} → True
+      _ → False
 
 -- | Every frame event the owner reported, oldest first.
 frameEvents ∷ Rig → IO [FrameEvent]
@@ -924,7 +944,7 @@ renderingLayers events rendering clock =
             atomically (modifyTVar' (renderingBusy rendering) (Map.adjust (\held → foldr Set.delete held indices) swapchain))
             record events (ImageReleased swapchain indices)
         , opsPresent = \_ _ request status → do
-            answer ← readTVarIO (renderingStatus rendering)
+            answer ← stale (presentSwapchain request) >>= maybe (readTVarIO (renderingStatus rendering)) pure
             writeIORef status answer
             fence (presentFence request) FencePresent
             atomically (modifyTVar' (renderingPresented rendering) (Map.insert (presentFence request) (presentSwapchain request, presentIndex request)))
@@ -934,6 +954,15 @@ renderingLayers events rendering clock =
         , opsWaitFence = \_ handle _ → atomically ((== Just FenceDone) . Map.lookup handle <$> readTVar (renderingFences rendering))
         }
 
+    stale swapchain =
+      readTVarIO (renderingStale rendering) >>= \case
+        Nothing → pure Nothing
+        Just current → do
+          reported ← readTVarIO current
+          built ← readTVarIO events
+          pure $ case (reported, [size | (_, SwapchainCreated handle size _) ← built, handle == swapchain]) of
+            (Just (SurfaceExtent width height), size : _) | size /= (width, height) → Just PresentStatusSuboptimal
+            _ → Nothing
     slow = do
       advance ← readTVarIO (renderingAdvance rendering)
       for_ ((,) <$> advance <*> clock) $ \(milliseconds, cell) →

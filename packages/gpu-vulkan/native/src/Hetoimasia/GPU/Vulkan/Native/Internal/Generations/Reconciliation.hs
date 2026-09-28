@@ -42,7 +42,7 @@ import Control.Exception
   , throwIO
   , tryWithContext
   )
-import Control.Monad (forM_, when)
+import Control.Monad (forM_, unless, when)
 import Data.Foldable (for_)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import qualified Data.Map.Strict as Map
@@ -75,7 +75,7 @@ import Hetoimasia.GPU.Model
   , suspendTarget
   , targetView
   )
-import Hetoimasia.GPU.Model.Budget (imageTrackingLimit)
+import Hetoimasia.GPU.Model.Budget (BudgetKind (..), imageTrackingLimit)
 import Hetoimasia.GPU.Model.Identity (GenerationId, ImageId, TargetId)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Generations.Disposal (disposeEligible)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Reclamation (recoveringCreation)
@@ -214,21 +214,22 @@ reconcile generations now target geometry = do
                 modelEdit_ (resumeTarget target)
               Nothing <$ setCondition Presenting
             else construct planned
-    -- Wait until the extent a replacement would be built at, and the observed
-    -- geometry it was planned from, have both been the same for the settling
-    -- period, then continue. A surface that reports a new extent a moment
-    -- after the observation that moved is therefore still seen, rather than
-    -- the move being adopted at the old extent, and a newer observation
-    -- restarts the wait even while the surface still reports the old extent.
+    -- Coalesce a move for the settling period from when it was first seen,
+    -- then continue with the newest extent and geometry. A later change
+    -- within the period joins the move rather than restarting its wait, so a
+    -- resize that never pauses — a Cocoa live resize changes the framebuffer
+    -- about every 8.5 ms — is still rebuilt once a period, while the active
+    -- generation keeps presenting (the frames acquire from it while it
+    -- settles). A surface that reports a new extent a moment after the
+    -- observation that moved is still seen if it does so within the period;
+    -- one later than that is reported by the active generation's next
+    -- suboptimal or out-of-date answer, as any resize the surface makes is.
     settle planned continue = do
-        waiting ← atomically $ do
+        since ← atomically $ do
           record ← lookupRecord
-          case record >>= recordSettling of
-            Just (extent, observed, since) | extent == planExtent planned, sameGeometry observed geometry → pure (Right since)
-            _ → do
-              modifyRecord (\entry → entry {recordSettling = Just (planExtent planned, geometry, now)})
-              pure (Left now)
-        let since = either id id waiting
+          let began = maybe now (\(_, _, first) → first) (record >>= recordSettling)
+          modifyRecord (\entry → entry {recordSettling = Just (planExtent planned, geometry, began)})
+          pure began
         case addDuration since settlingPeriod of
           Left _ → continue
           Right due
@@ -324,6 +325,12 @@ reconcile generations now target geometry = do
     -- way is the active generation that needs replacing: retire it on its own
     -- and build afresh once it is gone. Otherwise wait for a retired
     -- generation's holds to end.
+    --
+    -- Rendering pauses while it waits, except where only the generation count
+    -- is in the way and an active generation remains: presenting from it
+    -- spends nothing the replacement waits for — the retired generation's
+    -- holds end on their own present fences — so a live resize keeps
+    -- rendering. Any other budget is one those frames would compete for.
     capacity planned kind = do
       retiredStandalone ← atomically $ do
         record ← lookupRecord
@@ -339,7 +346,9 @@ reconcile generations now target geometry = do
                     pure True
                   Nothing → pure False
           _ → pure False
-      atomically (modelEdit_ (suspendTarget target))
+      atomically $ do
+        presenting ← maybe False (isJust . recordActive) <$> lookupRecord
+        unless (kind == GenerationBudget && presenting) (modelEdit_ (suspendTarget target))
       _ ← setCondition (Backpressured kind)
       if retiredStandalone
         then do

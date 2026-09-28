@@ -12,13 +12,14 @@
 -- something /not/ to happen is labelled where it is made.
 module Test.GPU.Vulkan.GLFW.Loop (spec) where
 
-import Control.Concurrent (forkIO)
+import Control.Concurrent (forkIO, threadDelay)
 import Control.Concurrent.STM (atomically, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, registerDelay, retry, writeTVar)
 import Control.Exception (Exception (..), SomeException, throwIO, toException)
 import Control.Monad (forM_, unless, void, when)
 import Data.List (isSubsequenceOf)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust)
+import Data.Word (Word32)
 import qualified Data.Text as Text
 import System.Timeout (timeout)
 
@@ -32,6 +33,7 @@ import Hetoimasia.GPU.Model.Identity (TargetClass (..))
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Loop (foldOwnerDeadline, newLoopAdapter, publishVulkanScene, runVulkanOwnerLoop)
 import Hetoimasia.GPU.Vulkan.Native.Generations (GenerationView (..), TargetGenerationsView (..))
+import Hetoimasia.GPU.Vulkan.Native.Presentation (SurfaceExtent (..))
 import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost (..), RootTargetView (..))
 import Hetoimasia.Runtime.GLFW
   ( GraphicsService
@@ -78,8 +80,9 @@ spec = describe "Vulkan loop adapter" $ do
     it "keeps a finite progress deadline for a suspended target, without spinning" (bounded testSuspendedTarget)
     it "keeps presenting to one target while another's acquisitions cannot be answered" (bounded testBusyTargetFairness)
 
-  describe "a stalled main thread" $
+  describe "a stalled main thread" $ do
     it "keeps the owner rendering while the native event call is held, and serves a window command once it returns" (bounded testStalledMainThread)
+    it "keeps the owner rendering and rebuilding through a live resize that never pauses while the native event call is held" (bounded testStalledLiveResize)
 
   describe "status and exit" $ do
     it "brings a presentation's device loss to the application's next checkpoint" (bounded testLossAtCheckpoint)
@@ -449,6 +452,42 @@ testStalledMainThread = do
   duringStall `shouldSatisfy` (>= 3)
   servedDuringStall `shouldBe` Just False
   servedAfter `shouldBe` True
+
+-- | A Cocoa live resize: the main thread stays inside its native event call
+-- while the surface's extent changes about every 8 ms, faster than a
+-- replacement's settling period, and the swapchain answers suboptimal while it
+-- is stale. The owner keeps presenting from the active generation while each
+-- replacement settles, and builds one a period from the newest extent, rather
+-- than waiting for a pause that never comes.
+testStalledLiveResize ∷ IO ()
+testStalledLiveResize = do
+  rig ← visibleRig
+  (presented, built) ← runRig rig $ \host control → do
+    [window] ← windowsOf host
+    service ← firstFrame rig host control window
+    suboptimalWhileStale rig
+    result ← newTVarIO Nothing
+    _ ← forkIO $ do
+      atomically (pumpHeld rig >>= check)
+      presentedBefore ← presentsOf rig (graphicsAttachment service)
+      builtBefore ← swapchainsCreated rig
+      forM_ [1 .. 40 ∷ Word32] $ \step → do
+        offerExtent rig (Just (SurfaceExtent (640 + step * 4) 480))
+        scene ← prepare ()
+        _ ← publishVulkanScene host scene
+        threadDelay 8000
+      presentedAfter ← presentsOf rig (graphicsAttachment service)
+      builtAfter ← swapchainsCreated rig
+      atomically (writeTVar result (Just (presentedAfter - presentedBefore, builtAfter - builtBefore)))
+      holdPump rig False
+    holdPump rig True
+    composedUntil rig host control "the end of the live resize" (\_ → pure ()) (isJust <$> readTVarIO result)
+    readTVarIO result >>= maybe (throwIO (StandInFailure (Text.pack "the live resize reported nothing"))) pure
+  -- Forty scenes over about 320 ms: the owner presents throughout, where a
+  -- rule that waits for the geometry to be quiet would present almost none,
+  -- and builds several replacements, where it would build none.
+  presented `shouldSatisfy` (>= 10)
+  built `shouldSatisfy` (>= 3)
 
 testLossAtCheckpoint ∷ IO ()
 testLossAtCheckpoint = do
