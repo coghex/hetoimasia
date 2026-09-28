@@ -13,6 +13,10 @@ Mesa's Lavapipe (lvp 1.4.318 9d69cae2004b) and the pinned validation layer with
 `8a419da296ef83520bdf7841dbc294b7bbef6b36`, the merge of the pull request's head
 `8a8c235768895c6a6376ec40d429d225c1af53bd` into its base, with the catalog's `--complete`
 command; input identity `d913724d4e62cc491779763ba24dd0c1fb9017e8800ae6b5326b477f5a70a472`.
+That head is the pull request's last code revision, `240e0db`, with only the
+macOS evidence it retains on top — `240e0db` is its parent, and nothing but
+evidence records changed between them — and no code has changed since: the
+commits that retain this record and say so change this record alone.
 
 `test.vulkan-native`'s preparation built the suite in 25.653 s. Its watched native
 execution — the isolated X11 display the command started for itself, the shared
