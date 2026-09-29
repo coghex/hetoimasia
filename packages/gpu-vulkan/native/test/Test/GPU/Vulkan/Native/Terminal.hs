@@ -76,6 +76,7 @@ import Hetoimasia.GPU.Vulkan.Native.Roots
   , watchRootsDiagnosticsOrdered
   , DiagnosticWatch (..)
   , DiagnosticOrder (..)
+  , DiagnosticArrivals (..)
   )
 import Test.GPU.Vulkan.Native.FramesRig
 import Test.GPU.Vulkan.Native.FramesStandIn
@@ -250,6 +251,20 @@ spec = describe "Terminal failure" $ do
       atomically (failRootsSessionBecause (rigRoots rig) CleanupFailed "a later cleanup failed")
       primaryIs rig (== TerminalValidationError)
       evidenceOf rig `shouldReturn` [LaterFailure (TerminalCleanupFailed "a later cleanup failed")]
+      clean rig
+
+    it "keeps a failure of the owner's own that claims over an abandoned claim ahead of a validation error that arrives just after its claim" $ do
+      rig ← newRig
+      capture ← newFakeCapture
+      atomically (watchRootsDiagnosticsOrdered (rigRoots rig) (fakeWatch capture))
+      abandonClaim rig
+      -- The next failure of the owner's own claims over the void claim, and
+      -- the error arrives as that claim returns.
+      holdNextClaim capture (reportValidationError capture)
+      atomically (failRootsSessionBecause (rigRoots rig) CleanupFailed "a later cleanup failed")
+      primaryIs rig (== TerminalCleanupFailed "a later cleanup failed")
+      checkpointRoots (rigRoots rig) `shouldReturn` CheckpointFailed (TerminalCleanupFailed "a later cleanup failed")
+      evidenceOf rig `shouldReturn` [LaterFailure TerminalValidationError]
       clean rig
 
     it "records an uncertain presentation whole when a cancellation aimed at the owner arrives while a sink failure that claimed first place is unpublished" $ do
@@ -686,15 +701,16 @@ fakeWatch capture = DiagnosticWatch alarms order
       pure answer
     order = do
       first ← atomicModifyIORef' (fakeFirst capture) (\held → let first = fromMaybe FakeOwner held in (Just first, first))
+      arrived ← DiagnosticArrivals <$> readIORef (fakeErrorArrived capture) <*> readIORef (fakeSinkArrived capture)
       once (fakeAfterClaim capture)
       pure $ case first of
         FakeError → ValidationFirst
         FakeSink → SinkFirst (readIORef (fakeSinkReason capture))
-        FakeOwner → OwnerFirst
+        FakeOwner → OwnerFirst arrived
     once hook = join (atomicModifyIORef' hook (\after → (pure (), after)))
 
 -- | Run this once, inside the transaction of the owner's next claim, right
--- after it claims.
+-- after it claims and reads the arrivals: as the claim returns.
 holdNextClaim ∷ FakeCapture → IO () → IO ()
 holdNextClaim capture = writeIORef (fakeAfterClaim capture)
 

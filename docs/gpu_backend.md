@@ -2070,9 +2070,11 @@ capture also records each one's arrival before it tries to claim
 readable as `CaptureAlarmPending` beside the claim. A checkpoint therefore
 answers pending, never clear, while a sink failure behind a void claim is
 unpublished. A later failure of the owner's own, whose claim the void one still
-answers first, waits until every such failure is readable — bounded as the
-sink's publication is — and is ordered behind every diagnostic failure the
-capture has seen arrive.
+answers first, takes the capture's arrivals, read right after its claim
+(`captureArrivals`, carried in `OwnerFirst`), as its order point: each
+diagnostic failure that had arrived by then is latched ahead of it once
+readable — a wait bounded as the sink's publication is — and one that arrives
+after comes after it, as it would behind a claim of its own.
 
 Every record of a failure of the owner's own made inside a masked step — an
 uncertain or failed presentation, an uncertain submission, a progress step's

@@ -179,6 +179,8 @@ module Hetoimasia.GPU.Vulkan.Native.Roots
   , watchRootsDiagnosticsOrdered
   , DiagnosticWatch (..)
   , DiagnosticOrder (..)
+  , DiagnosticArrivals (..)
+  , noDiagnosticArrivals
   , checkpointRoots
   , syncRootsDiagnostics
   , checkpointRootsSettled
@@ -513,7 +515,7 @@ newRoots ops budgets clock = do
     <*> newTVarIO True
     <*> newTVarIO Nothing
     <*> newTVarIO (TerminalReport Nothing Nothing [] 0)
-    <*> newTVarIO (DiagnosticWatch (pure []) (pure OwnerFirst))
+    <*> newTVarIO (DiagnosticWatch (pure []) (pure (OwnerFirst noDiagnosticArrivals)))
     <*> newIORef (OwnerClaims False [])
     <*> newTVarIO Nothing
     <*> newTVarIO False
@@ -1097,14 +1099,15 @@ latchTerminal roots cause = do
 -- transaction to a cancellation). Its waits — for a sink failure that holds
 -- first place to publish its reason, and for a failure that arrived behind a
 -- void claim to become readable — are 'awaitPublication' and
--- 'readableAlarms', inside the transaction.
+-- 'awaitArrivals', inside the transaction.
 --
 -- A claim holds first place only for the transaction attempt that made it
 -- ('claimHeld'). A claim made before, that no attempt which could still
 -- commit holds, is void: it still holds the capture's slot, so the claim
--- made now answers 'OwnerFirst' however much came after it, and every
--- diagnostic failure the capture has seen arrive is latched ahead of this one
--- instead.
+-- made now answers 'OwnerFirst' however much came after it. Its order point
+-- is then the capture's arrivals, read right after its claim: each diagnostic
+-- failure that had arrived by then is latched ahead of it, once readable, and
+-- one that arrives after comes after it, as it would behind a claim of its own.
 orderBehindDiagnostics ∷ Roots q inst msgr phys dev → STM ()
 orderBehindDiagnostics roots = do
   report ← readTVar (rootsTerminal roots)
@@ -1121,8 +1124,8 @@ orderBehindDiagnostics roots = do
         (OwnerClaims True ((attempt, held) : claimAttempts claims), claimsMade claims)
       void ← if made then not <$> claimHeld roots (Just attempt) else pure False
       ahead ← watchOrder watch >>= \case
-        OwnerFirst
-          | void → readableAlarms watch
+        OwnerFirst arrived
+          | void → awaitArrivals watch arrived
           | otherwise → pure []
         ValidationFirst → pure [AlarmValidationError]
         SinkFirst published → (\reason → [AlarmSinkFailed reason]) <$> awaitPublication published
@@ -1145,14 +1148,20 @@ orderBehindDiagnostics roots = do
 awaitPublication ∷ IO (Maybe Text) → IO Text
 awaitPublication published = published >>= maybe (yield >> awaitPublication published) pure
 
--- | The capture's alarms once none is pending: a failure that arrived behind
--- a void claim sets its alarm right after recording its arrival — an error's
+-- | The alarms of the diagnostic failures that had arrived by a claim over a
+-- void one, once each is readable — the validation error, then the sink's
+-- failure, as the capture answers two that came after the owner's claim. A
+-- failure sets its alarm right after recording its arrival — an error's
 -- callback at its next step, the sink's worker in the masked step that noted
 -- it — so this is bounded as 'awaitPublication' is, and waits the same way.
-readableAlarms ∷ DiagnosticWatch → IO [DiagnosticAlarm]
-readableAlarms watch =
-  watchAlarms watch >>= \alarms →
-    if AlarmPending `elem` alarms then yield >> readableAlarms watch else pure alarms
+awaitArrivals ∷ DiagnosticWatch → DiagnosticArrivals → IO [DiagnosticAlarm]
+awaitArrivals watch arrived = do
+  alarms ← watchAlarms watch
+  let errors = [AlarmValidationError | validationArrived arrived, AlarmValidationError `elem` alarms]
+      sinks = take 1 [alarm | sinkArrived arrived, alarm@(AlarmSinkFailed _) ← alarms]
+  if (validationArrived arrived && null errors) || (sinkArrived arrived && null sinks)
+    then yield >> awaitArrivals watch arrived
+    else pure (errors <> sinks)
 
 -- | Whether a transaction attempt that claimed the capture's order — other
 -- than this one — may still commit.
@@ -1221,8 +1230,10 @@ noteTeardownEvidence roots evidence =
 -- | Who holds first place in the diagnostic capture's order once a failure of
 -- the owner's own has claimed it.
 data DiagnosticOrder
-  = OwnerFirst
-    -- ^ No diagnostic failure came before it.
+  = OwnerFirst !DiagnosticArrivals
+    -- ^ No diagnostic failure came before it; and which had arrived, read
+    -- right after the claim, which orders it behind them when the claim it
+    -- found was void ('orderBehindDiagnostics').
   | ValidationFirst
     -- ^ An error-severity report came first.
   | SinkFirst !(IO (Maybe Text))
@@ -1230,12 +1241,24 @@ data DiagnosticOrder
     -- It is read inside the owner's transaction, so it runs no transaction
     -- of its own.
 
+-- | Which diagnostic failures had arrived, whether or not they claimed first
+-- place: the capture records each arrival before its claim.
+data DiagnosticArrivals = DiagnosticArrivals
+  { validationArrived ∷ !Bool
+  , sinkArrived ∷ !Bool
+  }
+  deriving (Eq, Show)
+
+-- | No diagnostic failure has arrived.
+noDiagnosticArrivals ∷ DiagnosticArrivals
+noDiagnosticArrivals = DiagnosticArrivals False False
+
 -- | What the roots ask of the diagnostic capture: its alarms, at a checkpoint,
 -- and the order, before a failure of the owner's own is latched or taken by
 -- the model. Claiming the order runs inside that transaction, so it must
 -- answer the same however often it runs and must run no transaction of its
--- own. The alarms are read there too, once a claim has been made before, to
--- learn what a void claim held back ('orderBehindDiagnostics'); they must run
+-- own. The alarms are read there too, after a claim over a void one, to
+-- latch what had arrived ahead of it ('orderBehindDiagnostics'); they must run
 -- no transaction of their own either.
 data DiagnosticWatch = DiagnosticWatch
   { watchAlarms ∷ IO [DiagnosticAlarm]
@@ -1247,7 +1270,7 @@ data DiagnosticWatch = DiagnosticWatch
 -- owner's is never ordered behind them. Roots with none installed hear no
 -- alarm.
 watchRootsDiagnostics ∷ Roots q inst msgr phys dev → IO [DiagnosticAlarm] → STM ()
-watchRootsDiagnostics roots alarms = writeTVar (rootsWatch roots) (DiagnosticWatch alarms (pure OwnerFirst))
+watchRootsDiagnostics roots alarms = writeTVar (rootsWatch roots) (DiagnosticWatch alarms (pure (OwnerFirst noDiagnosticArrivals)))
 
 -- | Install a diagnostic capture that keeps the order itself.
 watchRootsDiagnosticsOrdered ∷ Roots q inst msgr phys dev → DiagnosticWatch → STM ()

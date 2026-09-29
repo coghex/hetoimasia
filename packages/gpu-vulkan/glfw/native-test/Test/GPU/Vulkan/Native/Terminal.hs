@@ -105,6 +105,8 @@ import Hetoimasia.GPU.Vulkan.Diagnostics
   , readCaptureSinkFailure
   , captureStatus
   , claimCaptureOrder
+  , CaptureArrivals (..)
+  , captureArrivals
   , defaultCaptureConfig
   , diagnosticVerdict
   , verdictIssues
@@ -164,6 +166,7 @@ import Hetoimasia.GPU.Vulkan.Native.Roots
   , startRoots
   , watchRootsDiagnosticsOrdered
   , DiagnosticWatch (..)
+  , DiagnosticArrivals (..)
   , DiagnosticOrder (..)
   )
 import Hetoimasia.GPU.Vulkan.Native.Roots.Vulkan (instancePointer, vulkanRootOps)
@@ -221,7 +224,7 @@ data Step = Step
 order ∷ DiagnosticCapture → IO DiagnosticOrder
 order capture =
   claimCaptureOrder capture >>= \case
-    OwnerFailedFirst → pure OwnerFirst
+    OwnerFailedFirst → (\arrived → OwnerFirst (DiagnosticArrivals (arrivedError arrived) (arrivedSink arrived))) <$> captureArrivals capture
     ErrorLatchedFirst → pure ValidationFirst
     SinkFailedFirst → pure (SinkFirst (fmap sinkFailureReason <$> readCaptureSinkFailure capture))
 

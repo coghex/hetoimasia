@@ -64,6 +64,8 @@ import Hetoimasia.GPU.Vulkan.Diagnostics
   , captureAlarms
   , CaptureOrder (..)
   , claimCaptureOrder
+  , CaptureArrivals (..)
+  , captureArrivals
   , captureSinkFailure
   , captureStatus
   , capturePhase
@@ -351,15 +353,17 @@ spec = describe "Lifetime" $ do
           _ ← claimCaptureOrder capture
           -- The worker's sink fails after the owner's claim and pauses before
           -- it publishes: its claim is lost, and its arrival is not.
+          claimed ← captureArrivals capture
           noteSinkFailure (captureUserData capture)
+          arrived ← captureArrivals capture
           before ← captureAlarms capture
           atomically (writeTVar failing True)
           offerTo capture (plainOffer SeverityWarning "a warning the sink cannot take")
           requestDrain capture
           _ ← bounded (atomically (captureSinkFailure capture >>= maybe retry pure))
           after ← captureAlarms capture
-          pure (map alarmKind before, map alarmKind after)
-      answers `shouldBe` (["owner", "pending"], ["owner", "sink"])
+          pure ((claimed, arrived), map alarmKind before, map alarmKind after)
+      answers `shouldBe` ((CaptureArrivals False False, CaptureArrivals False True), ["owner", "pending"], ["owner", "sink"])
 
     it "answers only that a failure is pending while the failure that came first has claimed the order but not yet published its alarm" $ do
       (logger, failing) ← switchedLogger

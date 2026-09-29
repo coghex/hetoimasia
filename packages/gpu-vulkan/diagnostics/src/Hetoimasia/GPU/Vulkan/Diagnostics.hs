@@ -128,6 +128,8 @@ module Hetoimasia.GPU.Vulkan.Diagnostics
   , captureAlarms
   , CaptureOrder (..)
   , claimCaptureOrder
+  , CaptureArrivals (..)
+  , captureArrivals
 
     -- * The verdict
   , DiagnosticVerdict (..)
@@ -182,7 +184,7 @@ import Data.Bits (testBit, (.&.))
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (intercalate)
 import Data.Either (isRight)
-import Data.Maybe (fromMaybe, isJust, listToMaybe)
+import Data.Maybe (isJust, listToMaybe)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Encoding
@@ -482,12 +484,29 @@ claimCaptureOrder capture =
     Just FirstSink → pure SinkFailedFirst
     _ → pure OwnerFailedFirst
 
+-- | Which diagnostic failures have arrived — an error-severity report, the
+-- sink's failure — whether or not they claimed first place: each is recorded
+-- before it tries to claim, so one that lost the claim to the owner is known
+-- before its own alarm is readable. Arrivals only accumulate, so one reading
+-- is a single point in the capture's order: whatever arrived after it is not
+-- in it. A capture whose slot already serves another lifetime answers none.
+data CaptureArrivals = CaptureArrivals
+  { arrivedError ∷ !Bool
+  , arrivedSink ∷ !Bool
+  }
+  deriving (Eq, Show)
+
+-- | Read which diagnostic failures have arrived, in one atomic load. It runs no
+-- transaction of its own, so an owner can read it inside one.
+captureArrivals ∷ DiagnosticCapture → IO CaptureArrivals
+captureArrivals capture = maybe (CaptureArrivals False False) (uncurry CaptureArrivals) <$> arrivedFailures (handleUserData capture)
+
 captureAlarms ∷ DiagnosticCapture → IO [CaptureAlarm]
 captureAlarms capture = do
   latched ← statusErrorLatched <$> captureStatus capture
   sink ← readCaptureSinkFailure capture
   first ← firstFailure (handleUserData capture)
-  (errorArrived, sinkArrived) ← fromMaybe (False, False) <$> arrivedFailures (handleUserData capture)
+  CaptureArrivals errorArrived sinkArrived ← captureArrivals capture
   let errors = [CaptureErrorLatched | latched]
       sinks = [CaptureSinkFailed (sinkFailureReason failure) | Just failure ← [sink]]
       -- A failure that arrived behind the owner's claim, and so could not
