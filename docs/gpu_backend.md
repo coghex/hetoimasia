@@ -1410,8 +1410,11 @@ changes nothing and never reaches the replacement. Then, on the owner's thread:
    its deadline, and a spent one is disposed of through the designation.
 4. **The main thread creates the replacement.** The step answers the targets
    that now want a surface (`summarySurfacesWanted`); the controller asks the
-   main thread for each and wakes it. `replaceVulkanSurfaces`, on the main
-   thread, creates the surface through the bridge's admitted replacement
+   main thread for each and wakes it. That holds for every step that can admit
+   an attempt: the owner's own, and the one another target's retirement runs
+   when its poll is due, which can release this target's lost surface too. An
+   attempt already outstanding asks nothing more. `replaceVulkanSurfaces`, on
+   the main thread, creates the surface through the bridge's admitted replacement
    (`replaceWindowSurface`, [#216](https://github.com/coghex/hetoimasia/issues/216))
    under that same attachment, and deposits what it created.
    `runVulkanOwnerLoop` runs it every turn; an application that drives its own

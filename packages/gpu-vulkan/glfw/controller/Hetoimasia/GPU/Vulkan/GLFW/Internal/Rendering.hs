@@ -207,6 +207,7 @@ import Hetoimasia.GPU.Vulkan.Native.Frames
 import Hetoimasia.GPU.Vulkan.Native.Generations
   ( GenerationView (..)
   , Generations
+  , StepSummary (..)
   , TargetGenerationsView (..)
   , readTargetGenerations
   , stepGenerations
@@ -1018,10 +1019,15 @@ renderingDeadline rendering now targets = atomically $ do
 -- 'Nothing' — ready — once no frame and no presentation of the target
 -- remains, or once the device has been lost; otherwise the reason it is still
 -- owed.
-prepareTargetRetirement ∷ Rendering q inst msgr phys dev cmd → Instant → TargetId → IO (Maybe Text)
+--
+-- It answers too the targets whose recovery attempt that step admitted: a
+-- step run for one target's retirement can release another target's lost
+-- surface, and that attempt is outstanding until the main thread is asked for
+-- its replacement, which the caller does.
+prepareTargetRetirement ∷ Rendering q inst msgr phys dev cmd → Instant → TargetId → IO (Maybe Text, [TargetId])
 prepareTargetRetirement rendering now target =
   readTVarIO (renderingLive rendering) >>= \case
-    Nothing → pure Nothing
+    Nothing → pure (Nothing, [])
     Just made → do
       atomically $ do
         record ← Map.findWithDefault freshTarget target <$> readTVar (renderingTargets rendering)
@@ -1033,25 +1039,30 @@ prepareTargetRetirement rendering now target =
       void (closeTargetFrames (liveFrames made) target)
       model ← atomically (readRootsModel (renderingRoots rendering))
       if deviceLossObserved model
-        then pure Nothing
+        then pure (Nothing, [])
         else do
-          when (pollDue now model) $ do
-            poll rendering now
-            void (stepGenerations (renderingGenerations rendering) now Map.empty)
+          wanted ←
+            if pollDue now model
+              then do
+                poll rendering now
+                summarySurfacesWanted <$> stepGenerations (renderingGenerations rendering) now Map.empty
+              else pure []
           frames ← atomically (filter ((== target) . frameTarget . standingFrame) <$> readFrameStandings (liveFrames made))
           presentations ← atomically (filter ((== target) . presentationTarget . standingPresentation) <$> readPresentations (liveFrames made))
-          pure $
-            if null frames && null presentations
-              then Nothing
-              else
-                Just
-                  ( tshow (length frames)
-                      <> " frames and "
-                      <> tshow (length presentations)
-                      <> " presentations of "
-                      <> tshow target
-                      <> " await their own evidence"
-                  )
+          pure
+            ( if null frames && null presentations
+                then Nothing
+                else
+                  Just
+                    ( tshow (length frames)
+                        <> " frames and "
+                        <> tshow (length presentations)
+                        <> " presentations of "
+                        <> tshow target
+                        <> " await their own evidence"
+                    )
+            , wanted
+            )
 
 -- | Destroy what rendering holds for one target: its slots' synchronization
 -- and its presentation pool, which raises, retaining them, if anything of the

@@ -66,9 +66,10 @@
 -- with its attachment kept throughout. The generations retire what was built
 -- on the lost surface, destroy it once nothing of it remains, and ask the
 -- target's episode for an attempt ("Hetoimasia.GPU.Vulkan.Native.Generations").
--- For each attempt admitted, the owner's step asks the main thread for a
--- replacement surface — the one thing it cannot make itself, since GLFW
--- creates surfaces there — and wakes it. The main thread creates it through
+-- For each attempt admitted, by the owner's step or by the step a target's
+-- retirement runs, the owner asks the main thread for a replacement surface —
+-- the one thing it cannot make itself, since GLFW creates surfaces there — and
+-- wakes it. The main thread creates it through
 -- the surface bridge's admitted replacement, under the target's existing
 -- attachment ('replaceVulkanSurfaces'), and deposits what it created; the
 -- owner's next step offers it to the generations, which recheck the session's
@@ -798,6 +799,10 @@ generationsOwed state now =
 -- | Whether one target's retirement can be performed now: once its frames and
 -- presentations have all gone on their own evidence. A target the roots never
 -- admitted holds none.
+--
+-- The generation step the preparation runs can admit another target's
+-- recovery attempt; the main thread is asked for that replacement here, as
+-- the owner's own step asks, since nothing else would ask for it.
 prepareRetirement ∷ State inst msgr phys dev cmd lease obligation → TargetRetire → IO RetirementReadiness
 prepareRetirement state retiring =
   atomically (Map.lookup (retiringTarget retiring) <$> readTVar (stateTargets state)) >>= \case
@@ -808,7 +813,9 @@ prepareRetirement state retiring =
       -- settlement.
       atomically (closeCaptures (stateCaptures state) (retiringTarget retiring))
       now ← readInstant (stateClock state)
-      maybe RetirementReady RetirementOwed <$> prepareTargetRetirement (stateRendering state) now target
+      (owed, wanted) ← prepareTargetRetirement (stateRendering state) now target
+      _ ← askReplacements state wanted
+      pure (maybe RetirementReady RetirementOwed owed)
 
 -- | Destroy, on the owner's thread, the surface of every attachment the owner
 -- was never told about whose slot has begun retiring — released, or its window

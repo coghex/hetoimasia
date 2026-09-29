@@ -17,13 +17,14 @@ import Control.Concurrent (ThreadId, forkIO, myThreadId, throwTo, yield)
 import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (..), threadStatus)
 import Control.Concurrent.STM (TVar, atomically, check, newTVarIO, orElse, readTVar, registerDelay, retry, writeTVar)
 import Control.Exception (Exception (..), ExceptionWithContext (ExceptionWithContext), SomeException, asyncExceptionFromException, asyncExceptionToException, finally, throwIO, try)
-import Control.Monad (forM_, replicateM_, void)
+import Control.Monad (forM_, replicateM_, unless, void, when)
 import Data.List (isSubsequenceOf, nub)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust, isNothing)
 import qualified Data.Text
 import System.Timeout (timeout)
-import Hetoimasia.GPU.Model (SessionFailureCause (DeviceLost), SessionState (..), TargetView (..), sessionState, targetView)
+import Hetoimasia.GPU.Model (SessionFailureCause (DeviceLost), SessionState (..), TargetPhase (..), TargetView (..), sessionState, targetView)
+import Hetoimasia.Foundation.Time (Instant)
 import Hetoimasia.GPU.Model.Identity (TargetClass (..))
 import Hetoimasia.GPU.Vulkan.Diagnostics (CaptureConfig (..), CaptureCounters (..), CaptureStatus (..), DiagnosticVerdict (..), VerdictIssue (..), defaultCaptureConfig, verdictIssues)
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
@@ -42,6 +43,7 @@ import Hetoimasia.Runtime.GLFW
   ( CloseStart (..)
   , EventAdmission (..)
   , GraphicsService
+  , OwnerDemand (..)
   , OwnerStatus (..)
   , ReleaseAnswer (..)
   , SlotState (..)
@@ -51,6 +53,7 @@ import Hetoimasia.Runtime.GLFW
   , awaitOwnerRound
   , readOwnerStatusNow
   , ownerHandoff
+  , publishOwnerDemand
   , publishOwnerScene
   , closeHostWindow
   , completionNotice
@@ -137,6 +140,7 @@ spec = describe "Vulkan controller" $ do
   describe "recovering a lost surface (VK-14)" $ do
     it "replaces it on the main thread under the same attachment, after its generation and then the lost surface went on the owner's thread, and leaves the other target alone" (bounded testSurfaceReplaced)
     it "lets a close defeat a replacement still asked for: nothing is created, and the target retires" (bounded testReplacementAfterClose)
+    it "asks the main thread once for a replacement whose attempt another target's retirement admitted, and settles it" (bounded testReplacementAdmittedByRetirement)
     it "reports an optional target whose episode was spent unavailable, while the other target keeps its generation" (bounded testOptionalSpent)
     it "fails the session at a checkpoint when a required target's episode is spent" (bounded testRequiredSpent)
     it "disposes of an optional target whose replacement the device cannot present to, destroying that surface on the owner's thread, with no second device" (bounded testUnsupportedOptional)
@@ -1522,6 +1526,84 @@ testReplacementAfterClose = do
   [surface | SurfaceCreated surface ← events] `shouldBe` [100]
   [surface | SurfaceDestroyed surface ← events] `shouldBe` [100]
 
+-- | Another target's close runs the generation step that admits a lost
+-- surface's attempt (#303). The scripted clock stands still and no
+-- presentation retires until the example lets it, so the lost surface cannot
+-- be released before the close; the first poll that can release it is then the
+-- one the closing target's retirement takes, since an owner round prepares
+-- its retirements before it offers the backend its step.
+testReplacementAdmittedByRetirement ∷ IO ()
+testReplacementAdmittedByRetirement = do
+  rig ← scriptedRigOf 2
+  presentationsRetire rig False
+  mainThread ← newTVarIO Nothing
+  (asked, after, attempts) ← runRig rig $ \host control → do
+    myThreadId >>= atomically . writeTVar mainThread . Just
+    let controller = vulkanController host
+        owner = vulkanGraphicsOwner host
+        rounds = statusRounds <$> atomically (readOwnerStatusNow owner)
+    [first, second] ← windowsOf host
+    one ← handedOver host first RequiredTarget
+    two ← handedOver host second RequiredTarget
+    TargetUsable ← awaitStanding host one
+    TargetUsable ← awaitStanding host two
+    publishObservation host one first
+    publishObservation host two second
+    -- One presentation to each, which holds each target's generation.
+    redraw ← prepare (OwnerDemand True Nothing)
+    _ ← atomically (publishOwnerDemand (ownerHandoff owner) redraw)
+    let presented service = (>= 1) <$> presentsOf rig (graphicsAttachment service)
+    pumpUntil host control "a presentation to each target" ((&&) <$> presented one <*> presented two)
+    [closing] ← viewsOf controller targetViewIdentity two
+    -- The loss retires the first target's generation, which its presentation
+    -- still holds, so its surface is not released.
+    loseSurfaceOf rig host one first
+    pumpUntil host control "the loss" (conditionOf host one (== Just SurfaceLost))
+    -- The close's own poll finds nothing retired, and leaves the second
+    -- target's retirement owed.
+    CloseStarted ← closeHostWindow (vulkanWindowHost host) second
+    pumpUntil host control "the close" ((== Just TargetRetiring) <$> phaseOf controller closing)
+    -- Every presentation retires at the next poll, which the retirement's
+    -- preparation takes: it releases the lost surface and admits its attempt.
+    presentationsRetire rig True
+    let untilAdmitted = do
+          admitted ← conditionOf host one (== Just SurfaceReplacing)
+          unless admitted $ do
+            seen ← rounds
+            clockNow rig >>= deadlineAfter host >>= setClock rig
+            _ ← atomically (awaitOwnerRound owner seen)
+            untilAdmitted
+    untilAdmitted
+    -- The round that admitted it has ended once one after it has: a request
+    -- it made is there for the main thread now.
+    seen ← rounds
+    nudgeOwner rig host one first
+    _ ← atomically (awaitOwnerRound owner seen)
+    asked ← replaceVulkanSurfaces controller (vulkanWindowHost host) owner
+    -- The replacement settles the attempt through its generation, the scripted
+    -- clock moving on meanwhile.
+    when (asked == 1) $
+      pumpReplacing host control "the replacement's generation" $ do
+        advanceClock rig 5
+        ready ← presenting host one
+        surfaces ← viewsOf controller targetViewSurface one
+        pure (ready && surfaces == [102])
+    settled ← (,) <$> viewsOf controller targetViewSurface one <*> attemptsOf host one
+    advanceClock rig 60000
+    pure (asked, fst settled, snd settled)
+  asked `shouldBe` 1
+  after `shouldBe` [102]
+  attempts `shouldBe` Just 1
+  events ← journal rig
+  -- Exactly one replacement was created, on the main thread.
+  [surface | SurfaceCreated surface ← events] `shouldBe` [100, 101, 102]
+  Just main ← atomically (readTVar mainThread)
+  threadsOf rig (== SurfaceCreated 102) >>= (`shouldBe` [main])
+  where
+    viewsOf controller field service =
+      (\targets → [field view | (attachment, view) ← targets, attachment == graphicsAttachment service]) <$> atomically (readVulkanTargets controller)
+    phaseOf controller target = fmap viewTargetPhase . targetView target <$> atomically (readVulkanModel controller)
+
 testOptionalSpent ∷ IO ()
 testOptionalSpent = do
   rig ← visibleRigOf 2
@@ -1643,6 +1725,14 @@ loseSurfaceOf rig host service window = do
     True → pure ()
     False → failWith "the loss was not recorded against the active generation"
   nudgeOwner rig host service window
+
+-- | The owner's published deadline, once it is later than this instant: the
+-- one it settled on after its latest round.
+deadlineAfter ∷ VulkanHost Scene → Instant → IO Instant
+deadlineAfter host instant = atomically $
+  readOwnerStatusNow (vulkanGraphicsOwner host) >>= \status → case statusNextDeadline status of
+    Just due | due > instant → pure due
+    _ → retry
 
 -- | 'pumpUntil', creating on each turn any replacement surface the owner asked
 -- for, as an application that drives its own loop does; the composed loop
