@@ -120,8 +120,12 @@ Local test and flake work runs through the external
 itself to it in [`.quruntul/adapter.py`](../.quruntul/adapter.py), which derives
 every suite from `tools/validation/catalog.json`: each Hspec test component a
 group runs is one suite, a probe when its group is optional, `category: probe`
-and routed to no CI worker, and a CI suite otherwise. The adapter builds each
-suite the way its group does. The `workflow-tests` examples under
+and routed to no CI worker, and a CI suite otherwise. A group that narrows a
+shared executable with `--match` is its own suite — `test.glfw-wayland` becomes
+`glfw-native-tests:glfw-wayland`, run with its selector under
+`tools/display/wayland.sh` as CI runs it, Linux only — and the executable's
+unnarrowed suite skips those examples, so each example is measured in exactly
+one profile. The adapter builds each suite the way its group does. The `workflow-tests` examples under
 `Quruntul adapter` check that it still agrees with the catalog.
 
 - **`$test`** runs one due probe: never run, changed since it last ran, or last

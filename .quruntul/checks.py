@@ -82,16 +82,29 @@ def load():
 CATALOG = json.loads((ROOT / "tools" / "validation" / "catalog.json").read_text())
 
 
-def hspec_components():
+def selectors(group):
+    options = [w.split("=", 1)[1] for w in group.get("command", []) if w.startswith("--test-option=")]
+    return [options[i + 1] for i, o in enumerate(options) if o in ("--match", "-m") and i + 1 < len(options)]
+
+
+def hspec_profiles():
+    """(suite id, component, selectors) -> the groups that run that profile."""
     found = {}
     for group in CATALOG["groups"]:
         if group.get("framework") != "hspec":
             continue
         names = [group["component"]] if ":test:" in (group.get("component") or "") else []
-        names += [w for w in group.get("command", []) if re.fullmatch(r"[\w-]+:test:[\w-]+", w)]
+        names += [w for w in group.get("command", []) if re.fullmatch(r"[\w-]+:test:[\w-]+", w) and w not in names]
+        chosen = selectors(group)
         for component in names:
-            found.setdefault(component, []).append(group)
+            suite = component.split(":")[2] + (f":{group['id'].removeprefix('test.')}" if chosen else "")
+            found.setdefault((suite, component, tuple(chosen)), []).append(group)
     return found
+
+
+def wayland_groups():
+    workflow = (ROOT / ".github" / "workflows" / "validation.yml").read_text()
+    return set(re.findall(r'if \[ "\$group" = "([\w.-]+)" \]; then\s+helper=tools/display/wayland\.sh', workflow))
 
 
 class AdapterChecks(unittest.TestCase):
@@ -100,25 +113,41 @@ class AdapterChecks(unittest.TestCase):
         cls.module = load()
         cls.suites = {s.id: s for s in cls.module.adapter().suites(Context())}
 
-    def test_every_catalog_hspec_component_is_exactly_one_suite(self):
-        expected = {component.split(":")[2]: component for component in hspec_components()}
-        self.assertEqual(sorted(self.suites), sorted(expected))
-        for name, component in expected.items():
-            self.assertEqual(self.suites[name].data["component"], component)
+    def test_every_catalog_hspec_profile_is_exactly_one_suite(self):
+        profiles = hspec_profiles()
+        self.assertEqual(sorted(self.suites), sorted(suite for suite, _, _ in profiles))
+        for suite, component, chosen in profiles:
+            self.assertEqual(self.suites[suite].data["component"], component)
+            if chosen:
+                self.assertEqual(self.suites[suite].data["options"], [x for s in chosen for x in ("--match", s)])
+
+    def test_an_unnarrowed_suite_skips_every_narrowed_profile_of_its_executable(self):
+        profiles = hspec_profiles()
+        for suite, component, chosen in profiles:
+            if chosen:
+                continue
+            narrowed = [s for _, c, sel in profiles if c == component for s in sel]
+            self.assertEqual(self.suites[suite].data["options"], [x for s in narrowed for x in ("--skip", s)], suite)
 
     def test_probes_are_exactly_the_local_only_optional_groups(self):
         workflow = (ROOT / ".github" / "workflows" / "validation.yml").read_text()
         routed = set()
         for declaration in re.findall(r'--worker "[^"$]+=[^"$]+:([^"$]+)"', workflow):
             routed.update(declaration.split(","))
-        for component, groups in hspec_components().items():
+        for (suite, _, _), groups in hspec_profiles().items():
             local = any(g.get("optional") and g.get("category") == "probe" and g["id"] not in routed for g in groups)
-            self.assertEqual(self.suites[component.split(":")[2]].kind, "probe" if local else "ci", component)
+            self.assertEqual(self.suites[suite].kind, "probe" if local else "ci", suite)
 
-    def test_desktop_suites_are_the_display_runner_groups(self):
-        for component, groups in hspec_components().items():
-            display = any(g.get("runner") == "display" for g in groups)
-            self.assertEqual(self.suites[component.split(":")[2]].desktop, display, component)
+    def test_display_helpers_follow_ci(self):
+        wayland = wayland_groups()
+        self.assertTrue(wayland, "validation.yml no longer names a Wayland group; update the adapter and this check")
+        for (suite, _, _), groups in hspec_profiles().items():
+            if any(g["id"] in wayland for g in groups):
+                self.assertEqual((self.suites[suite].data["display"], self.suites[suite].desktop,
+                                  self.suites[suite].platforms), ("wayland", False, ["Linux"]), suite)
+            else:
+                display = any(g.get("runner") == "display" for g in groups)
+                self.assertEqual(self.suites[suite].desktop, display, suite)
 
     def test_build_routes_follow_the_project_files(self):
         cpu = (ROOT / "cabal.project.cpu").read_text()
@@ -150,11 +179,16 @@ class AdapterChecks(unittest.TestCase):
         adapter._list_bin = lambda checkout, flags, component, environment: sys.executable
         adapter._tools = lambda checkout, component: []
         for platform, suite_id in (("Darwin", "glfw-native-tests"), ("Linux", "glfw-native-tests"),
+                                   ("Linux", "glfw-native-tests:glfw-wayland"),
                                    ("Darwin", "vulkan-native-tests"), ("Darwin", "foundation-tests")):
             ctx = Context(platform)
             prepared = adapter.prepare(ctx, self.suites[suite_id])
             desktop = self.suites[suite_id].desktop
-            if desktop and platform == "Darwin":
+            self.assertEqual(prepared.argv[1:], self.suites[suite_id].data["options"])
+            if self.suites[suite_id].data["display"] == "wayland":
+                self.assertNotIn("HETOIMASIA_NATIVE_SESSION", prepared.environment)
+                self.assertEqual(prepared.wrapper[-2:], [str(ROOT / "tools" / "display" / "wayland.sh"), "--"])
+            elif desktop and platform == "Darwin":
                 self.assertEqual(prepared.environment.get("HETOIMASIA_NATIVE_SESSION"), "desktop")
                 self.assertEqual(prepared.wrapper, [])
             elif desktop:

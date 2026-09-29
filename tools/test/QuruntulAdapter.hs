@@ -20,9 +20,10 @@ import Test.Hspec (Spec, describe, it, pendingWith, shouldBe)
 spec ∷ Spec
 spec = describe "Quruntul adapter" $
   forM_
-    [ "test_every_catalog_hspec_component_is_exactly_one_suite"
+    [ "test_every_catalog_hspec_profile_is_exactly_one_suite"
+    , "test_an_unnarrowed_suite_skips_every_narrowed_profile_of_its_executable"
     , "test_probes_are_exactly_the_local_only_optional_groups"
-    , "test_desktop_suites_are_the_display_runner_groups"
+    , "test_display_helpers_follow_ci"
     , "test_build_routes_follow_the_project_files"
     , "test_platform_bound_probes"
     , "test_identities_are_stable_and_distinct"

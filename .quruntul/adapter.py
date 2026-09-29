@@ -4,7 +4,11 @@ quruntul (https://github.com/coghex/quruntul) imports this file from the pinned
 checkout it measures. The validation catalog stays the single authority for
 what exists: every Hspec test component a catalog group runs is one suite, a
 CI suite unless its group is an optional local-only probe. This file only says
-how to build and start each one the way its group does. It imports nothing
+how to build and start each one the way its group does. A group that narrows a
+shared executable with `--match` (test.glfw-wayland) is its own suite, run with
+that selector under the display helper CI gives it, and the executable's
+unnarrowed suite skips those examples, so each example belongs to exactly one
+profile. It imports nothing
 from quruntul — the context supplies `Suite`, `Prepared` and `digest` — so
 `tools/test/QuruntulAdapter.hs` can check it without quruntul installed.
 
@@ -56,6 +60,24 @@ def _components(group: dict) -> list[str]:
     return found
 
 
+def _selectors(group: dict) -> list[str]:
+    """The Hspec `--match` patterns a group's command passes through `--test-option`."""
+    options = [w.split("=", 1)[1] for w in group.get("command", []) if w.startswith("--test-option=")]
+    found = []
+    for index, option in enumerate(options):
+        if option in ("--match", "-m") and index + 1 < len(options):
+            found.append(options[index + 1])
+        elif option.startswith("--match="):
+            found.append(option.split("=", 1)[1])
+    return found
+
+
+def _wayland_groups(checkout: Path) -> set[str]:
+    """Groups CI runs under the isolated Weston compositor rather than isolated X11."""
+    workflow = (checkout / ".github" / "workflows" / "validation.yml").read_text()
+    return set(re.findall(r'if \[ "\$group" = "([\w.-]+)" \]; then\s+helper=tools/display/wayland\.sh', workflow))
+
+
 def _routed(checkout: Path) -> set[str]:
     """Groups some CI worker runs; an optional group absent here is local-only."""
     workflow = (checkout / ".github" / "workflows" / "validation.yml").read_text()
@@ -78,21 +100,34 @@ class Hetoimasia:
         entries = plan.tree_entries(str(checkout), ctx.revision)
         catalog = json.loads((checkout / "tools" / "validation" / "catalog.json").read_text())
         routed = _routed(checkout)
+        wayland = _wayland_groups(checkout)
         adapter_hash = ctx.digest((checkout / ".quruntul" / "adapter.py").read_text())
+        hspec = [g for g in catalog["groups"] if g.get("framework") == "hspec"]
+        # Every selector some group narrows a component to; its unnarrowed suite skips them.
+        narrowed: dict[str, list[str]] = {}
+        for group in hspec:
+            for component in _components(group):
+                narrowed.setdefault(component, []).extend(_selectors(group))
         suites: dict[str, object] = {}
-        for group in catalog["groups"]:
-            if group.get("framework") != "hspec":
-                continue
+        for group in hspec:
+            selectors = _selectors(group)
             for component in _components(group):
                 package, _, suite_name = component.split(":")
+                if selectors:
+                    suite_name = f"{suite_name}:{group['id'].removeprefix('test.')}"
+                    options = [x for s in selectors for x in ("--match", s)]
+                else:
+                    options = [x for s in narrowed.get(component, []) for x in ("--skip", s)]
                 if suite_name in suites or not plan.resolve_component(packages, component):
                     continue
+                display = ("wayland" if group["id"] in wayland else
+                           "desktop" if group.get("runner") == "display" else None)
                 probe = bool(group.get("optional")) and group.get("category") == "probe" and group["id"] not in routed
                 inputs = set(plan.component_inputs(packages, component)) | set(group.get("inputs", []))
                 inputs |= {"cabal.project", "cabal.project.cpu", "cabal.project.common", "cabal.project.vulkan",
                            "tools/ci-image/toolchain.pin", "tools/toolchain/binding.pin"}
                 identity = ctx.digest(dict(
-                    adapter=adapter_hash, component=component,
+                    adapter=adapter_hash, component=component, options=options,
                     entries=[e for e in entries if any(plan.matches_input(e[0], x) for x in inputs)]))
                 route = "vulkan" if package in VULKAN_PACKAGES else "glfw" if package in GLFW_PACKAGES else "cpu"
                 suites[suite_name] = ctx.Suite(
@@ -101,14 +136,17 @@ class Hetoimasia:
                     framework="hspec",
                     description=group["description"],
                     area=group["id"].removeprefix("test."),
-                    platforms=list(group.get("platforms", _platforms(group["id"]))),
-                    desktop=group.get("runner") == "display",
+                    # The isolated compositor exists only on Linux; on Darwin every
+                    # Wayland case is pending (Test.GLFW.Native.Wayland.onlyWayland).
+                    platforms=["Linux"] if display == "wayland" else list(group.get("platforms", _platforms(group["id"]))),
+                    # A Wayland session is private to its run and opens nothing on the desktop.
+                    desktop=display == "desktop",
                     trial_seconds=max(60, min(int(group.get("timeout_seconds", 1800)), 3600)),
                     batch_seconds=14400,
                     identity=identity,
                     priority=10,
                     data=dict(component=component, package=package, route=route, group=group["id"],
-                              directory=packages[package].directory),
+                              directory=packages[package].directory, options=options, display=display),
                 )
         return list(suites.values())
 
@@ -137,13 +175,15 @@ class Hetoimasia:
         if tools:
             environment["PATH"] = os.pathsep.join([str(Path(t).parent) for t in tools] + [os.environ.get("PATH", "")])
         wrapper: list[str] = []
-        if suite.desktop:
+        if suite.data["display"] == "wayland":
+            wrapper = ["bash", str(checkout / "tools" / "display" / "wayland.sh"), "--"]
+        elif suite.data["display"] == "desktop":
             if ctx.platform == "Darwin":
                 environment["HETOIMASIA_NATIVE_SESSION"] = "desktop"
             else:
                 wrapper = ["bash", str(checkout / "tools" / "display" / "x11.sh"), "--"]
         return ctx.Prepared(
-            argv=[executable],
+            argv=[executable, *suite.data["options"]],
             cwd=str(checkout / suite.data["directory"]),
             environment=environment,
             wrapper=wrapper,
