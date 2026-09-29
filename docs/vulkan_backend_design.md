@@ -77,7 +77,9 @@ precondition is now satisfied; unchecked entries above remain unprocessed.
 VK-18/#218 is delivered. The supervised graphics owner's reusable machinery now
 exists in the GLFW package's runtime integration, in
 `Hetoimasia.Runtime.GLFW.Internal.Owner` and its `.Handoff` module, exported
-through `Hetoimasia.Runtime.GLFW`: the narrow injected `GraphicsOperations`
+through `Hetoimasia.Runtime.GLFW` (since #318, `Internal.Owner` composes the
+owner from private modules beneath it, listed in
+[glfw.md](glfw.md#package-layout)): the narrow injected `GraphicsOperations`
 record, the bounded lifetime port and latest-value snapshots in both
 directions, the owner's own timer and deadlines, the D-33 exit composed by
 `withGraphicsOwnerHost`, the supervision sentinel `superviseGraphicsOwner`, and

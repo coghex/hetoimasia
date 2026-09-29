@@ -86,6 +86,7 @@
 -- every other package hidden, answers what a package outside can reach.
 module Test.GLFW.Opacity (spec) where
 
+import Data.Foldable (for_)
 import System.Exit (ExitCode (ExitFailure, ExitSuccess))
 import System.FilePath ((</>))
 import System.Info (os)
@@ -495,6 +496,20 @@ spec = describe "GLFW session opacity across the package boundary" $ do
             ("the client compiled, so the owner's implementation is reachable:\n" <> clientOutput outcome)
       -- Found in the built package and refused as private, not missing.
       clientOutput outcome `shouldContain` "Hetoimasia.Runtime.GLFW.Internal.Owner"
+      clientOutput outcome `shouldContain` "hidden package"
+      clientOutput outcome `shouldContain` "runtime-glfw-core"
+      clientOutput outcome `shouldNotContain` "cannot satisfy"
+
+  it "rejects a client that reaches for the graphics owner's split implementation modules" $
+    withHostClient "Client.hs" ownerPartsClient $ \compile → do
+      outcome ← compile Typecheck
+      case clientStatus outcome of
+        ExitFailure _ → pure ()
+        ExitSuccess →
+          expectationFailure
+            ("the client compiled, so the owner's implementation modules are reachable:\n" <> clientOutput outcome)
+      -- Each is found in the built package and refused as private, not missing.
+      for_ ownerPartModules $ \name → clientOutput outcome `shouldContain` name
       clientOutput outcome `shouldContain` "hidden package"
       clientOutput outcome `shouldContain` "runtime-glfw-core"
       clientOutput outcome `shouldNotContain` "cannot satisfy"
@@ -1087,6 +1102,28 @@ ownerInternalsClient =
     , "handoff ∷ GraphicsOwner scene → OwnerHandoff scene"
     , "handoff = ownerHandoff"
     ]
+
+-- | A client importing the graphics owner's private parts directly: the owner
+-- handle's representation, worker progress, and the client-side handover.
+ownerPartsClient ∷ String
+ownerPartsClient =
+  unlines
+    [ "module Client (Parts) where"
+    , ""
+    , "import Hetoimasia.Runtime.GLFW.Internal.Owner.Handover (handOverGraphicsTarget)"
+    , "import Hetoimasia.Runtime.GLFW.Internal.Owner.State (GraphicsOwner (..))"
+    , "import Hetoimasia.Runtime.GLFW.Internal.Owner.Worker (runOwnerAction)"
+    , ""
+    , "data Parts = Parts"
+    ]
+
+-- | The modules 'ownerPartsClient' imports, each of which must be refused.
+ownerPartModules ∷ [String]
+ownerPartModules =
+  [ "Hetoimasia.Runtime.GLFW.Internal.Owner.Handover"
+  , "Hetoimasia.Runtime.GLFW.Internal.Owner.State"
+  , "Hetoimasia.Runtime.GLFW.Internal.Owner.Worker"
+  ]
 
 -- | A client naming the owner's data constructor and forging the evidence its
 -- injected destruction is supposed to be the only source of.

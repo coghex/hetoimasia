@@ -774,6 +774,6 @@ import Hetoimasia.Runtime.GLFW.Internal.RenderDemand
 -- explicit bounded handoffs in both directions, so the rendering backend is
 -- supplied to this machinery rather than built into it.
 --
--- See "Hetoimasia.Runtime.GLFW.Internal.Owner" for the exit order, which is
--- the Vulkan design's D-33, and @docs\/glfw.md@ for what an application sees
--- during a main-thread stall.
+-- See "Hetoimasia.Runtime.GLFW.Internal.Owner.Lifetime" for the exit order,
+-- which is the Vulkan design's D-33, and @docs\/glfw.md@ for what an
+-- application sees during a main-thread stall.

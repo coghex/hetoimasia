@@ -2016,8 +2016,8 @@ withProtectedWindowHostWith hooks = withProtectedHostOver hooks noProtectedExit
 -- It is the one extension point the protected exit has, and it is deliberately
 -- narrow: an interposed lifetime is given the host and the boundary's own
 -- @restore@, at exactly two points in an order it cannot change.
--- "Hetoimasia.Runtime.GLFW.Internal.Owner" is its only production caller, for
--- the supervised graphics owner D-33 keeps alive across the attachment drain.
+-- "Hetoimasia.Runtime.GLFW.Internal.Owner.Lifetime" is its only production
+-- caller, for the graphics owner D-33 keeps alive across the attachment drain.
 --
 -- A 'Nothing' session scope means the host enters the session its
 -- configuration names, exactly as 'withProtectedWindowHost' does.
