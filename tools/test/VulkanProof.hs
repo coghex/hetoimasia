@@ -143,12 +143,13 @@ siblingSourcesAbsent =
   "the Vulkan packages' sources are checkout-only and absent here, as in an unpacked source \
   \distribution; this check runs from a checkout, which is where the workflow group runs it"
 
--- | The mains of the three suites the headless group runs.
+-- | The mains of the four suites the headless group runs.
 headlessMains ∷ [FilePath]
 headlessMains =
   [ nativePackage </> "test/RootsMain.hs"
   , nativePackage </> "test/Main.hs"
   , integrationPackage </> "test/Main.hs"
+  , "samples/triangle/renderer/test/Main.hs"
   ]
 
 -- | The two validation groups that run through the Vulkan project.
@@ -340,6 +341,7 @@ spec = describe "The Vulkan project boundary" $ do
       `shouldBe` [ "hetoimasia-gpu-vulkan-native:test:native-tests"
                  , "hetoimasia-gpu-vulkan-native:test:shader-tests"
                  , "hetoimasia-gpu-vulkan-glfw:test:integration-tests"
+                 , "hetoimasia-sample-triangle:test:triangle-tests"
                  ]
     -- And the runner's test mode starts no display: the only display it
     -- ever starts is the native mode's.
@@ -349,7 +351,7 @@ spec = describe "The Vulkan project boundary" $ do
     filter ("x11.sh" `isInfixOf`) testMode `shouldBe` []
 
   it "fails each headless suite on a selection that matches none of its examples" $ do
-    -- The group runs three suites under one command, so one of them passing
+    -- The group runs four suites under one command, so one of them passing
     -- empty — every example filtered away by a selector or an ambient Hspec
     -- setting — would leave a passing receipt that asserted nothing for it.
     -- Each suite's main has to refuse an empty selection itself.

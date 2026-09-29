@@ -242,20 +242,22 @@
     },
     {
       "id": "test.vulkan-headless",
-      "description": "Vulkan-linked headless Hspec contracts, executed rather than only built, through cabal.project.vulkan against the provisioned native prefix: the native backend's profile and roots decisions over a stand-in native layer (native-tests), its shader contract against the provisioned compiler (shader-tests), and the window integration's controller over the GLFW package's scripted seam (integration-tests). None acquires a display, a GLFW session, or a device, and none reads desktop consent; the headers and loader are build and link prerequisites only.",
+      "description": "Vulkan-linked headless Hspec contracts, executed rather than only built, through cabal.project.vulkan against the provisioned native prefix: the native backend's profile and roots decisions over a stand-in native layer (native-tests), its shader contract against the provisioned compiler (shader-tests), the window integration's controller over the GLFW package's scripted seam (integration-tests), and the triangle sample's pipeline cache over stand-in builders (triangle-tests). None acquires a display, a GLFW session, or a device, and none reads desktop consent; the headers and loader are build and link prerequisites only.",
       "command": [
         "bash",
         "tools/vulkan/run.sh",
         "test",
         "hetoimasia-gpu-vulkan-native:test:native-tests",
         "hetoimasia-gpu-vulkan-native:test:shader-tests",
-        "hetoimasia-gpu-vulkan-glfw:test:integration-tests"
+        "hetoimasia-gpu-vulkan-glfw:test:integration-tests",
+        "hetoimasia-sample-triangle:test:triangle-tests"
       ],
       "component": "hetoimasia-gpu-vulkan-glfw:test:integration-tests",
       "inputs": [
         "cabal.project.common",
         "cabal.project.vulkan",
         "packages/gpu-vulkan/native/",
+        "samples/triangle/renderer/",
         "tools/ci-image/",
         "tools/native/",
         "tools/toolchain/binding.pin",
@@ -345,7 +347,8 @@
         "tools/flake/",
         "packages/gpu-vulkan/native/",
         "packages/gpu-vulkan/glfw/",
-        "packages/glfw/hetoimasia-glfw.cabal"
+        "packages/glfw/hetoimasia-glfw.cabal",
+        "samples/triangle/renderer/test/Main.hs"
       ],
       "framework": "hspec",
       "runner": "cpu",

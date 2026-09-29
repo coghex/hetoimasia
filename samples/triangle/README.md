@@ -8,7 +8,10 @@ only in `cabal.project.vulkan`:
 - **`renderer/` — `hetoimasia-sample-triangle`**, the drawing. `drawTriangle`
   clears a frame and draws the triangle across it inside the dynamic rendering
   it begins and ends, building a pipeline layout and a graphics pipeline for
-  each color format the first time it meets it. Its shaders
+  each color format the first time it meets it. A format's layout is built
+  once and held: when the pipeline over it is refused, the frame is skipped
+  and the next frame's attempt reuses the layout rather than building another
+  (`Hetoimasia.Sample.Triangle.Pipelines`). Its shaders
   (`Hetoimasia.Sample.Triangle.Shaders`) are GLSL compiled to SPIR-V while it
   builds, through the native backend's shader adapter, with the corners and
   the colour interpolated from `Hetoimasia.Sample.Triangle.Geometry`. It is
@@ -26,8 +29,17 @@ only in `cabal.project.vulkan`:
 
 Neither holds a native handle or calls GLFW or Vulkan itself: the host creates
 each window's surface on the main thread and calls the renderer on the
-graphics owner's thread, and every pipeline the drawing builds is the host
-session's managed resource, destroyed before the device when the session ends.
+graphics owner's thread, and every layout and pipeline the drawing builds is
+the host session's managed resource, destroyed before the device, pipeline
+before layout, when the session ends.
+
+The drawing's headless suite, `triangle-tests`, checks that pipeline cache
+over stand-in builders — no device, display or consent — and runs in the
+group `test.vulkan-headless`:
+
+```bash
+bash tools/vulkan/run.sh test hetoimasia-sample-triangle:test:triangle-tests
+```
 
 ## Building and launching it
 
