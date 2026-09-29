@@ -176,6 +176,7 @@ test-suite lua-host-tests
         Test.Lua.Protocol.Subscriptions
         Test.Lua.Protocol.Support
         Test.Lua.Protocol.Tasks
+        Test.Lua.Reentry
         Test.Lua.Spec
         Test.Lua.Support
     -- -N2 rather than -N: the independent-progress example needs Haskell to

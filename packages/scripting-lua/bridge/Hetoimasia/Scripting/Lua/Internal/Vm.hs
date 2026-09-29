@@ -28,6 +28,17 @@
 -- -- including the @__gc@ that frees each pushed Haskell function's stable
 -- pointer -- are still executing until it does.
 --
+-- The gate cannot tell its holder's callbacks from anyone else, and a callback
+-- runs on a thread of its own while the operation that called it still holds
+-- the gate. An operation a callback asks of its own VM would therefore wait for
+-- its own caller for ever, with the owner inside a @safe@ call that no
+-- cancellation reaches. So the VM keeps the threads that are running its
+-- callbacks, and an operation or close asked from one of them is refused with
+-- 'VmReentered' before it takes the gate: it runs no Lua and changes nothing.
+-- Every other thread still waits for the gate, exactly as before. A thread a
+-- callback starts is not one of them, and neither is a callback of another VM;
+-- re-entry through either is not detected and stays outside the contract.
+--
 -- A Haskell exception that reaches a callback is not thrown through the C
 -- frame. The trampoline records it here and signals an ordinary Lua error; the
 -- operation that was running reads the record back and re-raises the original
@@ -47,6 +58,8 @@ module Hetoimasia.Scripting.Lua.Internal.Vm
   , closeVm
     -- * Operations
   , withOpenVm
+    -- * Callbacks
+  , runCallback
     -- * Escaped Haskell failures
   , recordEscape
   , raiseEscape
@@ -60,6 +73,7 @@ module Hetoimasia.Scripting.Lua.Internal.Vm
   , probeReferenceSlot
   ) where
 
+import Control.Concurrent (ThreadId, myThreadId)
 import Control.Concurrent.MVar
   ( MVar
   , newEmptyMVar
@@ -71,6 +85,7 @@ import Control.Concurrent.MVar
 import Control.Exception
   ( ExceptionWithContext (ExceptionWithContext)
   , SomeException
+  , finally
   , mask
   , mask_
   , onException
@@ -78,20 +93,23 @@ import Control.Exception
   , throwIO
   , try
   )
-import Control.Monad (unless)
+import Control.Monad (unless, when)
 import Data.ByteString (useAsCString)
 import Data.Foldable (traverse_)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
+import Data.List (delete)
 import Data.Maybe (maybeToList)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Foreign.C (CChar, CInt (CInt))
 import Foreign.Ptr (Ptr, nullPtr)
+import GHC.Stack (HasCallStack)
 import Hetoimasia.Foundation.Failure
   ( Operation
   , operation
   , operationText
   , throwFailure
+  , withOperationContext
   )
 import Hetoimasia.Scripting.Lua.Internal.Fault
   ( CloseFault (CloseFault)
@@ -99,6 +117,7 @@ import Hetoimasia.Scripting.Lua.Internal.Fault
   , FaultKind (MemoryExhausted)
   , LuaFault (LuaFault)
   , VmClosed (VmClosed)
+  , VmReentered (VmReentered)
   , classify
   , luaComponent
   , renderFailure
@@ -158,6 +177,10 @@ data Vm = Vm
   , vmFinished ∷ !(MVar ())
     -- ^ Filled once, when the teardown has completed. What a second close
     -- waits on.
+  , vmCallers ∷ !(IORef [ThreadId])
+    -- ^ The threads running one of this VM's callbacks right now. Each adds
+    -- and removes only itself, and each reads it only to ask whether it is
+    -- one, so it needs no gate.
   }
 
 -- | The interpreter's current phase.
@@ -214,7 +237,8 @@ newVm libraries = mask_ $ do
   closing ← newIORef []
   releases ← newIORef []
   finished ← newEmptyMVar
-  let vm = Vm state gate phase escape closing releases finished
+  callers ← newIORef []
+  let vm = Vm state gate phase escape closing releases finished callers
   opened ← try (traverse_ (openLibrary state) libraries)
   case opened of
     Right () → pure vm
@@ -253,9 +277,11 @@ openLibrary state library = do
 -- Masked throughout, for the reason this module's header gives. The gate is
 -- released on every exit path, and an operation that leaves by an exception
 -- leaves the stack at the depth it entered at and no recorded callback failure
--- behind for the next one.
-withOpenVm ∷ Vm → Operation → (State → IO a) → IO a
+-- behind for the next one. An operation asked by one of this VM's own callbacks
+-- is refused before any of that.
+withOpenVm ∷ HasCallStack ⇒ Vm → Operation → (State → IO a) → IO a
 withOpenVm vm name body = mask_ $ do
+  refuseReentry vm name
   -- Interruptible, and deliberately the only interruptible point: a caller
   -- waiting for a VM that is busy may still be cancelled.
   takeMVar (vmGate vm)
@@ -288,8 +314,12 @@ abandon vm entry = do
 -- The teardown itself is masked. Repeated cancellation can therefore neither
 -- release the retained dependencies early nor leave a partially completed close
 -- for a later call to start again.
+--
+-- A close asked by one of this VM's own callbacks, including one a finalizer
+-- runs during the teardown, is refused rather than left waiting for itself.
 closeVm ∷ Vm → IO ()
 closeVm vm = mask $ \restore → do
+  withOperationContext luaComponent closeOperation [] (refuseReentry vm closeOperation)
   takeMVar (vmGate vm)
   phase ← readIORef (vmPhaseRef vm)
   case phase of
@@ -306,6 +336,29 @@ closeVm vm = mask $ \restore → do
       -- cancelled caller is entitled to stop waiting. The teardown itself is
       -- unaffected.
       restore (readMVar (vmFinished vm))
+
+-- | Refuse an operation asked by a thread that is running one of this VM's
+-- callbacks.
+--
+-- The operation that ran the callback holds the gate until the callback has
+-- returned, so waiting for it would be waiting for ever. Nothing is touched
+-- before the refusal: no gate, no stack, no Lua.
+refuseReentry ∷ HasCallStack ⇒ Vm → Operation → IO ()
+refuseReentry vm name = do
+  self ← myThreadId
+  callers ← readIORef (vmCallers vm)
+  when (self `elem` callers) $
+    throwFailure luaComponent name [] (VmReentered (operationText name))
+
+-- | Run a callback's action with its thread marked as one of this VM's
+-- callers, so that what it asks of this same VM is refused rather than left
+-- waiting for the operation that called it.
+runCallback ∷ Vm → IO a → IO a
+runCallback vm action = do
+  self ← myThreadId
+  atomicModifyIORef' (vmCallers vm) (\callers → (self : callers, ()))
+  action
+    `finally` atomicModifyIORef' (vmCallers vm) (\callers → (delete self callers, ()))
 
 -- | Close the interpreter, then release what its callbacks borrowed.
 --
@@ -379,6 +432,9 @@ raiseEscape vm = takeEscape vm >>= traverse_ rethrowIO
 
 openOperation ∷ Operation
 openOperation = operation "open-library"
+
+closeOperation ∷ Operation
+closeOperation = operation "close-vm"
 
 newOperation ∷ Operation
 newOperation = operation "new-vm"

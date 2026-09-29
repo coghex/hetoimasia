@@ -27,13 +27,23 @@ module Test.Lua.Support
   , recorded
     -- * Cancelling an owner
   , cancelling
+    -- * Observing an owner that may never return
+  , detached
     -- * Bridge bookkeeping
   , referenceSlot
   ) where
 
 import Control.Concurrent (ThreadId, forkIO, throwTo)
 import Control.Concurrent.MVar (MVar, modifyMVar_, newEmptyMVar, newMVar, putMVar, readMVar, takeMVar)
-import Control.Exception (Exception, SomeException, bracket, mask, try)
+import Control.Exception
+  ( Exception
+  , SomeException
+  , bracket
+  , mask
+  , rethrowIO
+  , try
+  , tryWithContext
+  )
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.Text (Text)
 import Foreign.C (CInt)
@@ -131,6 +141,23 @@ cancelling owner exception release = do
   _ ← forkIO (throwTo owner exception >> putMVar sent ())
   release
   bounded (takeMVar sent)
+
+-- | Run a body as a VM's owner on a thread of its own, and wait for it under a
+-- bound.
+--
+-- For an example whose failure would leave the owner inside a @safe@ foreign
+-- call for good. Bounding the owner itself would not do: a timeout is an
+-- asynchronous exception, and one aimed at a thread inside Lua is never
+-- delivered. So the owner is forked and the bound is on this thread, which is
+-- never inside Lua and can always be interrupted. The body's own cleanup,
+-- closing its VM included, runs on the owner's thread; a stuck owner is left
+-- where it is rather than cancelled, joined, or closed, and the example fails
+-- within the bound.
+detached ∷ IO a → IO a
+detached body = do
+  outcome ← newEmptyMVar
+  _ ← mask $ \restore → forkIO (tryWithContext @SomeException (restore body) >>= putMVar outcome)
+  bounded (takeMVar outcome) >>= either rethrowIO pure
 
 -- | The registry slot a temporary reference would take right now.
 --

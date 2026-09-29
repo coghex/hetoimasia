@@ -22,6 +22,10 @@
 -- with its own type and context, even if Lua caught the bridge's stand-in error
 -- and finished successfully; so is a cancellation delivered while a call was
 -- outstanding. Neither becomes something a script can swallow.
+--
+-- A callback that asks its own VM to run a chunk, call a global, or close is
+-- refused with 'VmReentered' rather than left waiting for the call it is part
+-- of, and the refusal travels back like any other callback failure.
 module Hetoimasia.Scripting.Lua.Bridge
   ( -- * The VM
     Vm
@@ -43,6 +47,7 @@ module Hetoimasia.Scripting.Lua.Bridge
   , FaultKind (..)
   , ErrorValue (..)
   , VmClosed (..)
+  , VmReentered (..)
   , CloseFault (..)
   ) where
 
@@ -59,6 +64,7 @@ import Hetoimasia.Scripting.Lua.Internal.Fault
   , FaultKind (..)
   , LuaFault (..)
   , VmClosed (..)
+  , VmReentered (..)
   )
 import Hetoimasia.Scripting.Lua.Internal.Library (Library (..))
 import Hetoimasia.Scripting.Lua.Internal.Vm (Vm, closeVm, newVm)

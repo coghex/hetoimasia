@@ -20,6 +20,7 @@ module Hetoimasia.Scripting.Lua.Internal.Fault
   , ErrorValue (..)
     -- * Lifetime failures
   , VmClosed (..)
+  , VmReentered (..)
   , CloseFault (..)
     -- * Naming
   , luaComponent
@@ -128,6 +129,21 @@ newtype VmClosed = VmClosed
   deriving (Eq, Show)
 
 instance Exception VmClosed
+
+-- | An operation was asked of a VM by one of that VM's own callbacks, and was
+-- refused rather than run.
+--
+-- The operation that ran the callback holds the VM for its whole duration, so
+-- the one the callback asked for could only ever wait for its own caller. It is
+-- refused before it touches the VM: it runs no Lua and changes nothing. Running
+-- Lua from inside a callback of the same VM is outside the callback contract,
+-- so this is never a transient condition to retry either.
+newtype VmReentered = VmReentered
+  { reenteredOperation ∷ Text
+  }
+  deriving (Eq, Show)
+
+instance Exception VmReentered
 
 -- | Releasing the bridge's retained dependencies failed after the Lua state
 -- was closed.
