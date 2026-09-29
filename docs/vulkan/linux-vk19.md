@@ -15,6 +15,15 @@ candidate `2829ce34c9ddb8bc83fc04dd7edba6d57ba26dc2`, the merge of the pull requ
 `cacc69c` into its base, with the catalog's `--complete` command; input identity
 `54275cf2fe5afc02720f45b0edfb34557bb0e959e2c3c86b034528717dfc3eb6`.
 
+That head contains every code change of this pull request: `cacc69c` retains
+the macOS evidence over round 5's fix, `f973e5b`, which is its parent, so the
+capture association that fix changed and its regression example are what this
+run executed. Every commit after `cacc69c` changes only this evidence file,
+which no group consumes: the validation run for the next head, `20136a8`,
+[36511427954](https://github.com/coghex/hetoimasia/actions/runs/36511427954),
+computed the same input identity and reused these receipts rather than running
+the Vulkan groups again.
+
 `test.vulkan-native`'s preparation built the suite in 6.682 s. Its
 watched native execution — the isolated X11 display the command started for
 itself, the shared session and its roots, every example and child, retirement,
