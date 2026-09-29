@@ -254,8 +254,8 @@ int hetoimasia_capture_first_failure(void *user_data);
 
 /*
 ** Which diagnostic failures have arrived — HETOIMASIA_CAPTURE_ARRIVED_ERROR and
-** _SINK, or'd — with the one that arrived first in bits 2 and 3, or -1 once
-** the slot serves another storage. Each is recorded before its failure tries
+** _SINK, or'd — with the one that arrived first in bits 2 and 3, both read in
+** one load and published together, or -1 once the slot serves another storage. Each is recorded before its failure tries
 ** to claim "first", so one that lost that claim to the owner is still known
 ** to have happened, and in what order, before its latch is set or its reason
 ** published.

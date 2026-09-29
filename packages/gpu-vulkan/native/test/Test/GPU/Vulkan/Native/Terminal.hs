@@ -265,6 +265,21 @@ spec = describe "Terminal failure" $ do
       evidenceOf rig `shouldReturn` [LaterFailure TerminalValidationError]
       clean rig
 
+    it "keeps a sink failure that arrived first behind an abandoned claim pending while a validation error follows it, then latches it first" $ do
+      rig ← newRig
+      capture ← newFakeCapture
+      atomically (watchRootsDiagnosticsOrdered (rigRoots rig) (fakeWatch capture))
+      abandonClaim rig
+      -- The sink's worker records its arrival and pauses before publishing;
+      -- an error arrives and latches meanwhile.
+      noteSinkFailure capture
+      reportValidationError capture
+      checkpointRoots (rigRoots rig) `shouldReturn` CheckpointPending
+      publishSinkFailure capture "the sink is gone"
+      checkpointRoots (rigRoots rig) `shouldReturn` CheckpointFailed (TerminalSinkFailed "the sink is gone")
+      evidenceOf rig `shouldReturn` [LaterFailure TerminalValidationError]
+      clean rig
+
     it "orders a failure of the owner's own behind a sink failure and a validation error that followed an abandoned claim, in the order they arrived" $ do
       rig ← newRig
       capture ← newFakeCapture
@@ -767,8 +782,8 @@ noteSinkFailure capture = do
   writeIORef (fakeSinkArrived capture) True
   atomicModifyIORef' (fakeFirst capture) (\held → (Just (fromMaybe FakeSink held), ()))
 
--- | Which diagnostic failure arrived first is claimed before an arrival is
--- recorded.
+-- | Record which diagnostic failure arrived first; the callers then record the
+-- arrival itself, and nothing reads the two between them.
 arrive ∷ FakeCapture → FakeFirst → IO ()
 arrive capture arrival = atomicModifyIORef' (fakeFirstArrived capture) (\held → (Just (fromMaybe arrival held), ()))
 
