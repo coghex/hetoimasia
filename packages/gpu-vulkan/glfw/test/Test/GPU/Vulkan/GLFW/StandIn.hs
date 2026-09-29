@@ -64,11 +64,20 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , awaitPresents
   , retireNextPresentations
 
+    -- * Consumer construction and capture (VK-19)
+  , Creation (..)
+  , raiseOnCreate
+  , offerUsage
+  , renderWith
+  , commandsRecorded
+  , readbackByte
+
     -- * The rig
   , Rig (..)
   , Scene
   , newRig
   , newRigOf
+  , capturingRigOf
   , visibleRig
   , visibleRigOf
   , scriptedRigOf
@@ -115,6 +124,7 @@ import Control.Concurrent.STM
 import Control.Exception (Exception, ExceptionWithContext (ExceptionWithContext), SomeException, fromException, rethrowIO, throwIO, try, tryWithContext, uninterruptibleMask_)
 import Control.Monad (void, when)
 import Data.ByteString (ByteString)
+import qualified Data.ByteString as ByteString
 import qualified Data.Vector as Vector
 import Foreign.Ptr (FunPtr, castFunPtr, castPtr)
 import Vulkan.CStruct (withCStruct)
@@ -130,7 +140,7 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Text
-import Data.Word (Word32, Word64)
+import Data.Word (Word32, Word64, Word8)
 import Foreign.C.Types (CInt (..))
 import Foreign.Ptr (Ptr, nullPtr, plusPtr)
 import Hetoimasia.Foundation.Log (Logger, callbackSink, defaultLogFilter, mkLoggerWith, systemMetadata)
@@ -160,9 +170,10 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Bridge (Created (..), Discharged (..)
 import Hetoimasia.Foundation.Time (Duration, DurationRequirement (AllowZero), Instant, addDuration, deadlineReached, durationFromNanoseconds, scriptedInstant, scriptedSource, zeroDuration)
 import Hetoimasia.GPU.Vulkan.Native.Frames (AcquireResult (..), FrameOps (..), PresentRequest (..), PresentStatus (..))
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering (VulkanRenderer (..))
-import Hetoimasia.GPU.Vulkan.Native.Recording (RecordingOps (..), Refusal (..))
+import Hetoimasia.GPU.Vulkan.Native.Recording (NativeCommand (..), PipelineRequest (..), ReadbackAllocation (..), RecordingOps (..), Refusal (..))
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
-  ( FrameEvent (..)
+  ( CaptureMode (..)
+  , FrameEvent (..)
   , RenderingOps (..)
   , VulkanHandover (..)
   , VulkanHost (..)
@@ -271,6 +282,19 @@ data Event
   | ImageReleased !Word64 ![Word32]
   | OwnerTimerArmed
     -- ^ The owner armed its timer, with a scripted clock.
+  | SwapchainPlanned !Word64 !Word32 !Bool
+    -- ^ The swapchain just made, the image usage it was created with, and
+    -- whether it was created clipped.
+  | CommandRecorded !Word64 !NativeCommand
+    -- ^ A command recorded into this command buffer.
+  | LayoutMade !Word64
+  | LayoutGone !Word64
+  | PipelineMade !Word64 !Word64 !Word32
+    -- ^ A pipeline, the layout it was built over, and its color format.
+  | PipelineGone !Word64
+  | ReadbackMade !Word64 !Natural
+    -- ^ A readback buffer, and its size in bytes.
+  | ReadbackGone !Word64
   deriving (Eq, Show)
 
 -- | Every event, newest first, with the thread that caused it.
@@ -360,6 +384,9 @@ data Native = Native
     -- anything.
   , nativeHeld ∷ !(TVar (Set Step))
     -- ^ The steps a 'HoldsUntil' script is holding a call at now.
+  , nativeUsage ∷ !(TVar Word32)
+    -- ^ The image usage every surface offers: color attachment alone unless
+    -- an example offers more.
   }
 
 -- | Wait until a call is holding at this step.
@@ -402,6 +429,10 @@ offerExtent rig extent = atomically (writeTVar (nativeCurrentExtent (rigNative r
 
 scriptNative ∷ Rig → Step → Scripted → IO ()
 scriptNative rig at scripted = atomically (modifyTVar' (nativeScript (rigNative rig)) (Map.insert at scripted))
+
+-- | Have every surface offer this image usage from now on.
+offerUsage ∷ Rig → Word32 → IO ()
+offerUsage rig usage = atomically (writeTVar (nativeUsage (rigNative rig)) usage)
 
 -- | Declare a surface the stand-in device's queue family cannot present to.
 declareUnsupported ∷ Rig → Word64 → IO ()
@@ -511,6 +542,7 @@ nativeLayer events native capture =
         GenerationOps
           { opsSurfaceOffer = \_ _ → do
               current ← readTVarIO (nativeCurrentExtent native)
+              usage ← readTVarIO (nativeUsage native)
               pure
                 SurfaceOffer
                   { offerCapabilities =
@@ -520,7 +552,7 @@ nativeLayer events native capture =
                         , capabilityCurrentExtent = current
                         , capabilityMinExtent = SurfaceExtent 1 1
                         , capabilityMaxExtent = SurfaceExtent 16384 16384
-                        , capabilityUsage = imageUsageColorAttachment
+                        , capabilityUsage = usage
                         , capabilityCurrentTransform = 1
                         , capabilityCompositeAlpha = compositeAlphaOpaque
                         }
@@ -530,7 +562,8 @@ nativeLayer events native capture =
           , opsCreateSwapchain = \_ request → do
               handle ← fresh
               let extent = planExtent (requestPlan request)
-              handle <$ step events native AtCreateSwapchain (SwapchainCreated handle (extentWidth extent, extentHeight extent) (requestOldSwapchain request))
+              step events native AtCreateSwapchain (SwapchainCreated handle (extentWidth extent, extentHeight extent) (requestOldSwapchain request))
+              handle <$ record events (SwapchainPlanned handle (planUsage (requestPlan request)) (planClipped (requestPlan request)))
           , opsSwapchainImages = \_ swapchain → pure [swapchain * 10 + index | index ← [0 .. 2]]
           , opsCreateImageView = \_ _ _ → do
               handle ← fresh
@@ -761,7 +794,17 @@ data Rendering = Rendering
     -- swapchain built at another extent answers suboptimal.
   , renderingRefusing ∷ !(TVar Bool)
     -- ^ Whether the renderer refuses every frame it is asked for.
+  , renderingCreations ∷ !(TVar (Map Creation SomeException))
+    -- ^ What the next creation of each kind raises, once.
   }
+
+-- | A managed object the recording's layer creates.
+data Creation = CreateLayout | CreatePipeline | CreateReadback
+  deriving (Eq, Ord, Show)
+
+-- | The byte every stand-in readback buffer reads back as.
+readbackByte ∷ Word8
+readbackByte = 0x5A
 
 data FenceKind = FenceIdle | FenceSubmission | FencePresent | FenceDone
   deriving (Eq, Show)
@@ -784,6 +827,7 @@ newRendering =
     <*> newTVarIO Nothing
     <*> newTVarIO Nothing
     <*> newTVarIO False
+    <*> newTVarIO Map.empty
 
 -- | Whether a submission's fence answers signalled when it is next asked.
 submissionsComplete ∷ Rig → Bool → IO ()
@@ -827,6 +871,20 @@ suboptimalWhileStale rig = atomically (writeTVar (renderingStale (rigRendering r
 -- it cannot record would.
 refuseFrames ∷ Rig → Bool → IO ()
 refuseFrames rig = atomically . writeTVar (renderingRefusing (rigRendering rig))
+
+-- | Have the next creation of this kind raise this, once, having created
+-- nothing, as a failed native creation does.
+raiseOnCreate ∷ Rig → Creation → SomeException → IO ()
+raiseOnCreate rig kind failure = atomically (modifyTVar' (renderingCreations (rigRendering rig)) (Map.insert kind failure))
+
+-- | Render every later frame with this renderer instead of the rig's clearing
+-- one; the rig's refusal ('refuseFrames') still comes first.
+renderWith ∷ Rig → VulkanRenderer Scene → IO ()
+renderWith rig renderer = atomically (writeTVar (rigRenderer rig) (Just renderer))
+
+-- | Every command recorded, oldest first, with its command buffer.
+commandsRecorded ∷ Rig → IO [(Word64, NativeCommand)]
+commandsRecorded rig = (\events → [(buffer, command) | CommandRecorded buffer command ← events]) <$> journal rig
 
 -- | How many frames the owner gave up after acquiring them.
 framesAbandoned ∷ Rig → IO Int
@@ -890,24 +948,37 @@ renderingLayers events rendering clock =
   where
     fresh = atomically (stateTVar (renderingHandles rendering) (\next → (next, next + 1)))
     fence handle kind = atomically (modifyTVar' (renderingFences rendering) (Map.insert handle kind))
+    -- A creation scripted to fail raises before it makes anything.
+    creating kind = atomically (stateTVar (renderingCreations rendering) (\held → (Map.lookup kind held, Map.delete kind held))) >>= maybe (pure ()) throwIO
     recordingLayer =
       RecordingOps
-        { opsCreatePipelineLayout = \_ → fresh
-        , opsDestroyPipelineLayout = \_ _ → pure ()
-        , opsCreatePipeline = \_ _ _ → fresh
-        , opsDestroyPipeline = \_ _ → pure ()
+        { opsCreatePipelineLayout = \_ → do
+            creating CreateLayout
+            handle ← fresh
+            handle <$ record events (LayoutMade handle)
+        , opsDestroyPipelineLayout = \_ handle → record events (LayoutGone handle)
+        , opsCreatePipeline = \_ request _ → do
+            creating CreatePipeline
+            handle ← fresh
+            handle <$ record events (PipelineMade handle (requestLayout request) (requestColorFormat request))
+        , opsDestroyPipeline = \_ handle → record events (PipelineGone handle)
         , opsCreateStorage = \_ _ → (,) <$> fresh <*> fresh
         , opsResetStorage = \_ _ → pure ()
         , opsDestroyStorage = \_ _ → pure ()
-        , opsCreateReadback = \_ _ → throwIO (StandInFailure "the stand-in makes no readback")
-        , opsDestroyReadback = \_ _ → pure ()
+        , opsCreateReadback = \_ size → do
+            creating CreateReadback
+            buffer ← fresh
+            memory ← fresh
+            record events (ReadbackMade buffer size)
+            pure (ReadbackAllocation buffer memory size size True 1 0)
+        , opsDestroyReadback = \_ allocation → record events (ReadbackGone (allocationBuffer allocation))
         , opsInvalidate = \_ _ _ → pure ()
         , opsFlush = \_ _ _ → pure ()
-        , opsReadMapped = \_ _ _ → pure mempty
+        , opsReadMapped = \_ _ size → pure (ByteString.replicate (fromIntegral size) readbackByte)
         , opsWriteMapped = \_ _ _ → pure ()
         , opsBeginCommands = \_ → pure ()
         , opsEndCommands = \_ → pure ()
-        , opsRecord = \_ _ → pure ()
+        , opsRecord = \buffer command → record events (CommandRecorded buffer command)
         , opsCommandBufferHandle = id
         }
     frameLayer =
@@ -1039,6 +1110,10 @@ data Rig = Rig
     -- ^ What every window's visibility query answers.
   , rigBudgets ∷ !BudgetRequest
     -- ^ The model's budgets, when an example narrows them.
+  , rigCaptureMode ∷ !CaptureMode
+    -- ^ Whether the host builds its generations for verification capture.
+  , rigRenderer ∷ !(TVar (Maybe (VulkanRenderer Scene)))
+    -- ^ The renderer an example put in place of the clearing one.
   }
 
 -- | Make the capture's sink raise on every record it is given from now on.
@@ -1064,6 +1139,11 @@ newRigOf count = newRigWith [hiddenTestWindowConfig (Text.pack ("window " <> sho
 -- | How many surface creations the bridge has admitted, held ones included.
 creationsBegun ∷ Rig → STM Word64
 creationsBegun rig = subtract 100 <$> readTVar (bridgeNext (rigBridge rig))
+
+-- | A rig over this many visible windows whose host is built for
+-- verification capture.
+capturingRigOf ∷ Int → IO Rig
+capturingRigOf count = (\rig → rig {rigCaptureMode = CaptureOn}) <$> visibleRigOf count
 
 -- | A rig over one window the seam reports visible, with a 640 by 480
 -- framebuffer, so its target is eligible to render and its generations are
@@ -1202,7 +1282,8 @@ newRigClocked visible windows clock = do
         , scriptFramebufferSize = \_ → readTVarIO framebuffer
         , scriptWindowAttribute = \attribute _ → (&& attribute == VisibleAttribute) <$> readTVarIO visibility
         }
-  native ← Native <$> newTVarIO Map.empty <*> newTVarIO Set.empty <*> newTVarIO 500 <*> newTVarIO Nothing <*> newTVarIO Nothing <*> newTVarIO Set.empty
+  native ← Native <$> newTVarIO Map.empty <*> newTVarIO Set.empty <*> newTVarIO 500 <*> newTVarIO Nothing <*> newTVarIO Nothing <*> newTVarIO Set.empty <*> newTVarIO imageUsageColorAttachment
+  renderer ← newTVarIO Nothing
   bridge ← Bridge <$> newTVarIO Map.empty <*> newTVarIO Nothing <*> newTVarIO 100 <*> newTVarIO []
   verdict ← newTVarIO Nothing
   refusalHook ← newTVarIO (\_ → pure ())
@@ -1238,6 +1319,8 @@ newRigClocked visible windows clock = do
       , rigPumpHeld = heldNow
       , rigVisible = visibility
       , rigBudgets = defaultBudgetRequest
+      , rigCaptureMode = CaptureOff
+      , rigRenderer = renderer
       }
 
 -- | Run a whole Vulkan graphics host under the application runner, on a bound
@@ -1257,10 +1340,12 @@ runRigHere rig body = do
   let base = vulkanHostConfig (rigHostConfig rig) (rigCapture rig) budgets scene
       config =
         base
-          { vulkanRenderer = VulkanRenderer $ \current request recorder →
+          { vulkanRenderer = VulkanRenderer $ \current request construction recorder →
               readTVarIO (renderingRefusing (rigRendering rig)) >>= \case
                 True → pure (Left (RefusedIllegal (Text.pack "the stand-in renderer refuses this frame")))
-                False → renderScene (vulkanRenderer base) current request recorder
+                False → do
+                  chosen ← maybe (vulkanRenderer base) id <$> readTVarIO (rigRenderer rig)
+                  renderScene chosen current request construction recorder
           , vulkanFrameObserver = \event → atomically $ do
               modifyTVar' (rigFrameEvents rig) (<> [event])
               case event of
@@ -1291,6 +1376,7 @@ runRigHere rig body = do
         (result, verdict) ← keepVerdict $
           withVulkanOwnerHostHooked
             (ControllerHooks (\attachment → readTVarIO (rigAfterRefusal rig) >>= ($ attachment)))
+            (rigCaptureMode rig)
             (captureLogger rig)
             (nativeLayer (rigJournal rig) (rigNative rig))
             (renderingLayers (rigJournal rig) (rigRendering rig) (rigClock rig))

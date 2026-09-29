@@ -152,6 +152,25 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , noFrameObserver
   , FrameStorageRefused (..)
 
+    -- * Consumer construction (VK-19)
+  , Construction
+  , Constructed
+  , constructPipelineLayout
+  , constructPipeline
+  , replaceConstructedPipeline
+  , releaseConstructed
+
+    -- * Verification capture (VK-19)
+  , CaptureMode (..)
+  , CaptureTicket
+  , CaptureRefusal (..)
+  , CaptureOutcome (..)
+  , CapturedFrame (..)
+  , Withheld (..)
+  , capturesRetained
+  , requestVulkanCapture
+  , takeVulkanCapture
+
     -- * The composition
   , VulkanHostConfig (..)
   , vulkanHostConfig
@@ -249,6 +268,22 @@ import Hetoimasia.GPU.Vulkan.Diagnostics
   , withDiagnosticCapture
   )
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Bridge
+import Hetoimasia.GPU.Vulkan.GLFW.Internal.Capture
+  ( CaptureMode (..)
+  , CaptureOutcome (..)
+  , CaptureRefusal (..)
+  , CaptureTicket
+  , CapturedFrame (..)
+  , Captures
+  , Withheld (..)
+  , capturesRequested
+  , capturesRetained
+  , newCaptures
+  , requestCapture
+  , takeCapture
+  , takeRequested
+  , withholdAll
+  )
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
 import Hetoimasia.GPU.Vulkan.Native.Frames (FrameOps (..))
 import Hetoimasia.GPU.Vulkan.Native.Recording (ClearColor (..), RecordingOps (..))
@@ -264,6 +299,7 @@ import Hetoimasia.GPU.Vulkan.Native.Generations
   , endGenerationUse
   , generationsDeadline
   , newGenerations
+  , newGenerationsCapturing
   , noteSwapchainResult
   , offerReplacementSurface
   , readTargetGenerations
@@ -433,6 +469,9 @@ data State inst msgr phys dev cmd lease obligation = State
   , stateFailureTaken ∷ !(TVar Bool)
     -- ^ Whether the owner's own step has found the session failed. Written by
     -- the owner's step; read by its wake.
+  , stateCaptures ∷ !Captures
+    -- ^ The verification captures requested of the session's targets, which
+    -- rendering fulfils (VK-19); refused whole unless the host captures.
   }
 
 -- | Instants the package's own examples must reach and nothing else can: a
@@ -482,7 +521,8 @@ data Replacement obligation
 -- deadlines read, which must be the host's; the period is how soon the owner
 -- looks again at an attachment whose announcement its port refused.
 newVulkanController
-  ∷ RootOps Quiesced inst msgr phys dev
+  ∷ CaptureMode
+  → RootOps Quiesced inst msgr phys dev
   → RenderingOps phys dev cmd
   → FrameObserver
   → (inst → Ptr ())
@@ -498,6 +538,7 @@ newVulkanController = newVulkanControllerWith noControllerHooks
 -- | 'newVulkanController' with the examples' hooks.
 newVulkanControllerWith
   ∷ ControllerHooks
+  → CaptureMode
   → RootOps Quiesced inst msgr phys dev
   → RenderingOps phys dev cmd
   → FrameObserver
@@ -509,10 +550,15 @@ newVulkanControllerWith
   → MonotonicSource
   → Duration
   → IO VulkanController
-newVulkanControllerWith hooks ops rendering observer pointer bridge layers validation budgets clock poll = do
+newVulkanControllerWith hooks capture ops rendering observer pointer bridge layers validation budgets clock poll = do
   roots ← newRoots ops budgets clock
-  generations ← newGenerations roots
-  rendered ← newRendering roots generations rendering observer
+  -- Only a host built for verification capture plans its swapchains
+  -- unclipped and as transfer sources; every other host's are the profile's.
+  generations ← case capture of
+    CaptureOff → newGenerations roots
+    CaptureOn → newGenerationsCapturing roots
+  captures ← newCaptures capture
+  rendered ← newRendering roots generations rendering observer captures
   fmap VulkanController $
     State roots generations rendered pointer bridge layers validation
       <$> newTVarIO Nothing
@@ -532,6 +578,7 @@ newVulkanControllerWith hooks ops rendering observer pointer bridge layers valid
       <*> pure hooks
       <*> newTVarIO Map.empty
       <*> newTVarIO False
+      <*> pure captures
 
 -- | Supply the instance extensions the window system requires, copied from
 -- the loader-aware session on the main thread. The owner's startup reads
@@ -657,7 +704,9 @@ controllerOperations (VulkanController state) renderer =
             atomically (writeTVar (stateDiagnosticPending state) False)
             progress step
     , graphicsNextDeadline = ownerDeadline state
-    , graphicsWake = join (readTVar (stateWake state))
+    , -- A capture requested from another thread asks the idle owner for the
+      -- round that asks its target a frame, and is false once that round has.
+      graphicsWake = (||) <$> join (readTVar (stateWake state)) <*> capturesRequested (stateCaptures state)
     , graphicsPrepareRetirement = \retiring → retaining state (prepareRetirement state retiring)
     , graphicsRetireTarget = \retiring → retaining state (retireTarget state retiring)
     , graphicsRetireOwner = retaining state . retireOwner state
@@ -686,6 +735,7 @@ controllerOperations (VulkanController state) renderer =
         let moved = any (\(target, current) → Map.lookup target seen /= Just current) (Map.toList observed)
         owed ← generationsOwed state now
         let targets = [(target, viewTarget view, viewEligibility view == RenderEligible) | (target, view) ← constructed]
+        capturing ← atomically (takeRequested (stateCaptures state))
         plan ←
           planStep
             (stateRendering state)
@@ -695,6 +745,7 @@ controllerOperations (VulkanController state) renderer =
               , inputsDemand = stepDemand step
               , inputsDemandRevision = stepDemandRevision step
               , inputsTargets = targets
+              , inputsCaptures = capturing
               }
         summary ←
           if moved || owed || planPolled plan || not (null (planDue plan))
@@ -706,11 +757,16 @@ controllerOperations (VulkanController state) renderer =
         -- frame in this step, not left for a later publication to notice.
         published ← requestPublished (stateRendering state) targets (planDue plan)
         presented ← renderDue (stateRendering state) renderer now (stepScene step) (stepSceneRevision step) (planDue plan <> published)
+        -- A capture whose batch completed is delivered in the step whose poll
+        -- observed it, and what the renderer or a capture released is
+        -- destroyed once nothing holds it.
+        captured ← settleCaptures (stateRendering state)
+        reclaimReleased (stateRendering state) now
         asked ← askReplacements state (summarySurfacesWanted summary)
         replaced ← settleReplacements state now (stepTargets step)
         noticeUnavailable state
         failRequired state
-        pure (if settled || summaryAdvanced summary || asked || replaced || presented then noStepWork {stepAdvanced = True} else noStepWork)
+        pure (if settled || summaryAdvanced summary || asked || replaced || presented || captured then noStepWork {stepAdvanced = True} else noStepWork)
 
 -- | Run a retirement, and if it could not verify what it owns, keep that in
 -- the terminal report as retained before the failure goes on to the owner,
@@ -1109,7 +1165,7 @@ retireTarget state retiring = do
       -- Its frames' synchronization and its frame storages go before its
       -- generations, whose holds its presentations were: preparation waited
       -- for every one of them to end.
-      retireTargetRendering (stateRendering state) now target
+      retireTargetRendering (stateRendering state) now target attachment
       retireTargetGenerations (stateGenerations state) now target
       -- Raises, and keeps the record and this mapping, if the destruction was
       -- uncertain: the owner then never offers this again.
@@ -1164,8 +1220,11 @@ retireOwner state retiring = do
   atomically $ do
     writeTVar (stateDeposits state) Map.empty
     writeTVar (stateUnannounced state) Map.empty
-  -- The recording's managed resources are the device's children.
+  -- The recording's managed resources are the device's children: the
+  -- renderer's, and a capture's readback buffers, which the captures still
+  -- outstanding give up first.
   now ← readInstant (stateClock state)
+  endCaptures (stateRendering state)
   retireRendering (stateRendering state) now
   device ← retireRoots (stateRoots state)
   pure . ownerRetired $
@@ -1457,6 +1516,24 @@ unavailabilitiesRetained = 64
 -- report is retained. An application waits on it in 'STM'.
 readVulkanUnavailability ∷ VulkanController → AttachmentId → STM (Maybe VulkanUnavailability)
 readVulkanUnavailability (VulkanController state) attachment = Map.lookup attachment <$> readTVar (stateUnavailable state)
+
+-- | Ask for the pixels of the next frame the owner renders for this
+-- attachment's target (VK-19), from any thread. Admitted, it wakes the owner,
+-- which asks the target for a frame; the answer is a ticket to read its
+-- outcome with 'takeVulkanCapture'. Refused when the host was not built for
+-- capture, when the owner holds no target for the attachment, when the
+-- attachment already has one outstanding, and once the session has failed.
+requestVulkanCapture ∷ VulkanController → AttachmentId → STM (Either CaptureRefusal CaptureTicket)
+requestVulkanCapture (VulkanController state) attachment = do
+  targeted ← Map.member attachment <$> readTVar (stateTargets state)
+  primary ← reportPrimary <$> readRootsTerminal (stateRoots state)
+  requestCapture (stateCaptures state) attachment targeted primary
+
+-- | What a capture request became, once it has settled: the frame's bytes
+-- and identities, or why it was settled without them. Each outcome is read
+-- at most once; the most recent 'capturesRetained' are kept until they are.
+takeVulkanCapture ∷ VulkanController → CaptureTicket → STM (Maybe CaptureOutcome)
+takeVulkanCapture (VulkanController state) = takeCapture (stateCaptures state)
 
 -- | Announce an attachment whose handover answered
 -- 'VulkanAnnouncementDeferred' again, now that the owner's port may have room.
@@ -1768,12 +1845,14 @@ withVulkanOwnerHostOver
   → VulkanHostConfig scene
   → (VulkanHost scene → IO r)
   → IO (r, DiagnosticVerdict)
-withVulkanOwnerHostOver = withVulkanOwnerHostHooked noControllerHooks
+withVulkanOwnerHostOver = withVulkanOwnerHostHooked noControllerHooks CaptureOff
 
--- | 'withVulkanOwnerHostOver' with the examples' hooks. Only this package's
--- private sublibrary exports it, and nothing in production calls it.
+-- | 'withVulkanOwnerHostOver' with the examples' hooks, and building its
+-- generations for verification capture or not. Only this package's private
+-- sublibrary exports it, and nothing in production calls it.
 withVulkanOwnerHostHooked
   ∷ ControllerHooks
+  → CaptureMode
   → Logger
   → (DiagnosticCapture → RootOps Quiesced inst msgr phys dev)
   → RenderingOps phys dev cmd
@@ -1784,12 +1863,13 @@ withVulkanOwnerHostHooked
   → VulkanHostConfig scene
   → (VulkanHost scene → IO r)
   → IO (r, DiagnosticVerdict)
-withVulkanOwnerHostHooked hooks logger layer rendering pointer bridge enter extensions config use =
+withVulkanOwnerHostHooked hooks capturing logger layer rendering pointer bridge enter extensions config use =
   withDiagnosticCapture (vulkanCapture config) logger $ \capture → do
     let observer = vulkanObserver config capture
     controller@(VulkanController state) ←
       newVulkanControllerWith
         hooks
+        capturing
         (observeRoots observer (layer capture))
         (observeRendering observer rendering)
         (vulkanFrameObserver config)
@@ -1825,6 +1905,11 @@ withVulkanOwnerHostHooked hooks logger layer rendering pointer bridge enter exte
     -- a messenger naming the capture, so the capture's storage is kept rather
     -- than freed under it. Only an independent publication of the owner's
     -- destruction can end the host with the instance alive.
+    -- A capture the owner never settled — its run ended before it could
+    -- retire — is settled now, without bytes: nothing waits on one for ever.
+    atomically $ do
+      primary ← reportPrimary <$> readRootsTerminal (stateRoots state)
+      withholdAll (stateCaptures state) (WithheldSessionEnded primary)
     view ← atomically (readRootsView (stateRoots state))
     proved ← atomically (readRootsQuiesced (stateRoots state))
     let survived = viewInstance view `notElem` [RootAbsent, RootDestroyed]

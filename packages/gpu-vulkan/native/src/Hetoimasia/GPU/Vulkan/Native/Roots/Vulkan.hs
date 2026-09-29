@@ -204,7 +204,7 @@ vulkanGenerationOps =
                     , preTransform = SurfaceTransformFlagBitsKHR plan.planTransform
                     , compositeAlpha = CompositeAlphaFlagBitsKHR plan.planCompositeAlpha
                     , presentMode = PresentModeKHR (fromIntegral plan.planPresentMode)
-                    , clipped = True
+                    , clipped = plan.planClipped
                     , oldSwapchain = SwapchainKHR old
                     }
                     ∷ SwapchainCreateInfoKHR '[]

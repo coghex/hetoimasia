@@ -76,6 +76,7 @@ spec = describe "Presentation" $ do
             , planUsage = imageUsageColorAttachment
             , planTransform = 1
             , planCompositeAlpha = compositeAlphaOpaque
+            , planClipped = True
             }
 
     it "takes RGBA sRGB when BGRA is not offered" $
@@ -97,7 +98,13 @@ spec = describe "Presentation" $ do
       planUsage <$> planned (planGenerationWith CaptureWhenOffered 16 geometry offering)
         `shouldBe` Just (imageUsageColorAttachment .|. imageUsageTransferSource)
       planGenerationWith CaptureWhenOffered 16 geometry (withUsage imageUsageColorAttachment)
-        `shouldBe` planGeneration 16 geometry (withUsage imageUsageColorAttachment)
+        `shouldBe` unclipped (planGeneration 16 geometry (withUsage imageUsageColorAttachment))
+
+    it "plans every normal generation clipped, and every capturing one unclipped, whatever the surface offers" $ do
+      let geometry = eligible (SurfaceExtent 640 480)
+          offers = [withUsage imageUsageColorAttachment, withUsage (imageUsageColorAttachment .|. imageUsageTransferSource)]
+      [planClipped <$> planned (planGeneration 16 geometry each) | each ← offers] `shouldBe` [Just True, Just True]
+      [planClipped <$> planned (planGenerationWith CaptureWhenOffered 16 geometry each) | each ← offers] `shouldBe` [Just False, Just False]
 
     it "reports every gap of an unsupported surface together, and falls back to no UNORM or arbitrary format" $ do
       let unorm = SurfaceFormat 44 colorSpaceSrgbNonlinear
@@ -139,6 +146,9 @@ spec = describe "Presentation" $ do
     planned = \case
       Planned plan → Just plan
       _ → Nothing
+    unclipped = \case
+      Planned plan → Planned plan {planClipped = False}
+      other → other
     withUsage usage = offer {offerCapabilities = (offerCapabilities offer) {capabilityUsage = usage}}
     withImages minimum' maximum' = offer {offerCapabilities = (offerCapabilities offer) {capabilityMinImages = minimum', capabilityMaxImages = maximum'}}
 

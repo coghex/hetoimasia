@@ -7,7 +7,8 @@ The one package that depends on both the native Vulkan backend
 delivered contracts and replaces none of them: the native backend's roots, the
 GLFW package's supervised graphics owner (VK-18), and its surface bridge
 (VK-5). Neither of those packages depends on this one. VK-16 adds the loop
-adapter and the owner's rendering here.
+adapter and the owner's rendering here, and VK-19 the consumer's construction
+and the suites' verification capture.
 
 - `Hetoimasia.GPU.Vulkan.GLFW` is the public interface. `withVulkanOwnerHost`
   composes, in the order the backend design's P-5 fixes, the diagnostic
@@ -28,12 +29,38 @@ adapter and the owner's rendering here.
   replacement surfaces the owner asked for, and bounds its wait by the owner's
   deadline; `publishVulkanScene` publishes the scene the owner renders, from
   any application thread, with the configuration's `VulkanRenderer`.
+- The renderer is the consumer's (VK-19). Each frame's `FrameRequest` names
+  its target, slot and image and the image's extent and color format before
+  anything of the renderer's is recorded, and the renderer is lent the
+  session's `Construction`: on the graphics owner's thread it builds pipeline
+  layouts and graphics pipelines over embedded shaders
+  (`constructPipelineLayout`, `constructPipeline`), replaces and releases them
+  (`replaceConstructedPipeline`, `releaseConstructed`), and binds one built for
+  the frame's format inside the dynamic rendering it begins and ends. Any other
+  thread is refused before anything native happens, a pipeline built for
+  another format is refused at its binding, and it never holds a native
+  handle. A construction refused, or one that raised having left nothing,
+  skips only that frame; one the session latched as its failure ends the run
+  with that primary. What the renderer did not release is destroyed with the
+  session's other managed resources before the device, on normal and terminal
+  exits alike. The module re-exports the recording vocabulary a renderer needs.
 - The private `controller` sublibrary holds the controller —
   `GraphicsOperations` over the native roots, with the recording and the frames
   composed into its step (`Internal.Rendering`) — the loop adapter
   (`Internal.Loop`), and the record through which it reaches the surface
   bridge, which the package's own examples replace with a stand-in, as they
   replace the recording's and the frames' native layers.
+- Verification capture (VK-19) is visible only there, so only this package's
+  suites reach it. `withVulkanOwnerHostAs CaptureOn` (`Internal.Production`)
+  is the production host with its generations built unclipped and, where the
+  surface offers it, as transfer sources; `requestVulkanCapture` asks for the
+  next frame of an attachment's target, and `takeVulkanCapture` answers, once,
+  its bytes, extent, format and identities after its batch's completion
+  evidence, or why it was withheld (`Internal.Capture`). A host with capture
+  off — `withVulkanOwnerHost`, every host outside the package — builds exactly
+  the swapchains it did before and refuses every request. A surface offering
+  no transfer-source usage is still admitted, and its capture is refused with
+  a typed reason.
 
 Every Vulkan object is created and destroyed on the graphics owner's thread;
 the controller makes no GLFW call. [`docs/gpu_backend.md`](../../../docs/gpu_backend.md)

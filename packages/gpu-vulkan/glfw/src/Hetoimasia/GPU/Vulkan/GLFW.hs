@@ -29,6 +29,16 @@
 -- on their own evidence. A main-thread stall delays what the main thread
 -- publishes and nothing the owner already holds.
 --
+-- The renderer is the consumer's (VK-19). Each frame's 'FrameRequest' names
+-- its target, slot and image and the image's extent and color format before
+-- the renderer records anything, and the renderer is lent the session's
+-- managed 'Construction': it builds pipeline layouts and graphics pipelines
+-- over embedded shaders on the owner's thread, binds a pipeline built for the
+-- frame's format, sets the viewport and scissor and draws inside the dynamic
+-- rendering it begins and ends, and releases or replaces what it built. It
+-- never holds a native handle. What it did not release is destroyed with the
+-- session's other managed resources, before the device.
+--
 -- A terminal failure — the device's loss, a validation error or a sink failure
 -- the capture reports, an uncertain effect, a failed cleanup, a required
 -- target's exhausted recovery — is latched as the session's primary failure
@@ -55,6 +65,29 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , FrameRequest (..)
   , clearRenderer
   , ClearColor (..)
+
+    -- * Consumer construction (VK-19)
+  , Construction
+  , Constructed
+  , constructPipelineLayout
+  , constructPipeline
+  , replaceConstructedPipeline
+  , releaseConstructed
+  , PipelineLayout
+  , Pipeline
+  , PipelineShaders (..)
+
+    -- * Recording a frame
+  , Recorder
+  , Refusal (..)
+  , beginRendering
+  , endRendering
+  , bindPipeline
+  , setViewport
+  , Viewport (..)
+  , setScissor
+  , Rect (..)
+  , draw
   , FrameEvent (..)
   , FrameObserver
   , noFrameObserver
@@ -106,14 +139,20 @@ module Hetoimasia.GPU.Vulkan.GLFW
   ) where
 
 import Hetoimasia.Foundation.Log (Logger)
-import Hetoimasia.GLFW.Vulkan (LoaderIntegration, allocLoaderSession, requiredInstanceExtensions)
+import Hetoimasia.GLFW.Vulkan (LoaderIntegration)
 import Hetoimasia.GLFW.Window (WindowId)
 import Hetoimasia.Runtime.GLFW (EventAdmission, GraphicsService)
 import Hetoimasia.GPU.Model.Identity (TargetClass)
 import Hetoimasia.GPU.Vulkan.Diagnostics (DiagnosticVerdict)
-import Hetoimasia.GPU.Vulkan.GLFW.Internal.Bridge (vulkanSurfaceBridge)
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
-  ( InstanceExtensionsMissing (..)
+  ( CaptureMode (CaptureOff)
+  , Construction
+  , Constructed
+  , constructPipeline
+  , constructPipelineLayout
+  , replaceConstructedPipeline
+  , releaseConstructed
+  , InstanceExtensionsMissing (..)
   , LeaseRetained (..)
   , NativeObserver (..)
   , OrphanSurfacesUncertain (..)
@@ -129,7 +168,6 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , VulkanRejection (..)
   , VulkanRequiredTargetFailed (..)
   , VulkanUnavailability (..)
-  , RenderingOps (..)
   , VulkanRenderer (..)
   , FrameRequest (..)
   , clearRenderer
@@ -151,16 +189,28 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , useVulkanGeneration
   , rejectionsRetained
   , vulkanHostConfig
-  , withVulkanOwnerHostOver
   )
 import qualified Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller as Controller
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Loop (publishVulkanScene, runVulkanOwnerLoop)
-import Hetoimasia.GPU.Vulkan.Native.Frames.Vulkan (vulkanFrameOps)
-import Hetoimasia.GPU.Vulkan.Native.Recording (ClearColor (..))
-import Hetoimasia.GPU.Vulkan.Native.Recording.Vulkan (vulkanRecordingOps)
+import Hetoimasia.GPU.Vulkan.GLFW.Internal.Production (withVulkanOwnerHostAs)
+import Hetoimasia.GPU.Vulkan.Native.Recording
+  ( ClearColor (..)
+  , Pipeline
+  , PipelineLayout
+  , PipelineShaders (..)
+  , Recorder
+  , Rect (..)
+  , Refusal (..)
+  , Viewport (..)
+  , beginRendering
+  , bindPipeline
+  , draw
+  , endRendering
+  , setScissor
+  , setViewport
+  )
 import Hetoimasia.GPU.Vulkan.Native.Profile (ValidationFeature (..))
 import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsSessionFailed (..), TeardownEvidence (..), TerminalCause (..), TerminalReport (..))
-import Hetoimasia.GPU.Vulkan.Native.Roots.Vulkan (instancePointer, vulkanRootOps)
 
 -- | Run a Vulkan graphics host over this loader capability, and answer the
 -- body's result with the diagnostic capture's verdict.
@@ -169,15 +219,7 @@ import Hetoimasia.GPU.Vulkan.Native.Roots.Vulkan (instancePointer, vulkanRootOps
 -- capability must outlive it, as its own scope does.
 withVulkanOwnerHost
   ∷ Logger → LoaderIntegration → VulkanHostConfig scene → (VulkanHost scene → IO r) → IO (r, DiagnosticVerdict)
-withVulkanOwnerHost logger integration =
-  withVulkanOwnerHostOver
-    logger
-    vulkanRootOps
-    (RenderingOps vulkanRecordingOps vulkanFrameOps)
-    instancePointer
-    (vulkanSurfaceBridge integration)
-    (allocLoaderSession integration)
-    requiredInstanceExtensions
+withVulkanOwnerHost = withVulkanOwnerHostAs CaptureOff
 
 -- | Create one window's surface on the main thread, under its attachment, and
 -- hand it to this host's owner as a required or optional target.

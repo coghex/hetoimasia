@@ -214,6 +214,13 @@ data Refusal
   | RefusedDiagnosticPending
     -- ^ A diagnostic failure has happened whose order the capture cannot yet
     -- say: nothing new is admitted, and a later checkpoint names the primary.
+  | RefusedConstructionFailed !Text
+    -- ^ A construction raised, with the session still running, after settling
+    -- everything it made: its reservation given back, or the generation it
+    -- could not name released. The recording itself re-raises such a failure;
+    -- a caller that confines it to the one frame that needed it — the window
+    -- integration's consumer construction — answers it as this refusal, with
+    -- what was raised.
   deriving (Eq, Show)
 
 -- ---------------------------------------------------------------------------
