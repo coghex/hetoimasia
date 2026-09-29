@@ -2696,7 +2696,11 @@ and [`docs/vulkan/linux-vk11.md`](vulkan/linux-vk11.md). VK-12's are retained as
 [`docs/vulkan/macos-vk14.md`](vulkan/macos-vk14.md) and
 [`docs/vulkan/linux-vk14.md`](vulkan/linux-vk14.md). VK-15's are retained as
 [`docs/vulkan/macos-vk15.md`](vulkan/macos-vk15.md) and
-[`docs/vulkan/linux-vk15.md`](vulkan/linux-vk15.md). VK-19's are retained as
+[`docs/vulkan/linux-vk15.md`](vulkan/linux-vk15.md). VK-17's are retained as
+[`docs/vulkan/macos-vk17.md`](vulkan/macos-vk17.md) and
+[`docs/vulkan/linux-vk17.md`](vulkan/linux-vk17.md), and the milestone they
+complete is [the Vulkan milestone verdict](vulkan_milestone_verdict.md).
+VK-19's are retained as
 [`docs/vulkan/macos-vk19.md`](vulkan/macos-vk19.md) and
 [`docs/vulkan/linux-vk19.md`](vulkan/linux-vk19.md). #250's are retained as
 [`docs/vulkan/macos-vkr2.md`](vulkan/macos-vkr2.md) and
