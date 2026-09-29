@@ -2653,8 +2653,9 @@ and [`docs/vulkan/linux-vk11.md`](vulkan/linux-vk11.md). VK-12's are retained as
 [`docs/vulkan/macos-vk14.md`](vulkan/macos-vk14.md) and
 [`docs/vulkan/linux-vk14.md`](vulkan/linux-vk14.md). VK-15's are retained as
 [`docs/vulkan/macos-vk15.md`](vulkan/macos-vk15.md) and
-[`docs/vulkan/linux-vk15.md`](vulkan/linux-vk15.md). VK-19's macOS evidence is
-retained as [`docs/vulkan/macos-vk19.md`](vulkan/macos-vk19.md). #250's are retained as
+[`docs/vulkan/linux-vk15.md`](vulkan/linux-vk15.md). VK-19's are retained as
+[`docs/vulkan/macos-vk19.md`](vulkan/macos-vk19.md) and
+[`docs/vulkan/linux-vk19.md`](vulkan/linux-vk19.md). #250's are retained as
 [`docs/vulkan/macos-vkr2.md`](vulkan/macos-vkr2.md) and
 [`docs/vulkan/linux-vkr2.md`](vulkan/linux-vkr2.md). #265's, taken again over
 the recording's split into private modules, are retained as
