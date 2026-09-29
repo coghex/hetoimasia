@@ -71,6 +71,7 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , offerNaming
   , failNaming
   , renderWith
+  , onFrameEvent
   , commandsRecorded
   , readbackByte
 
@@ -906,6 +907,11 @@ raiseOnCreate rig kind failure = atomically (modifyTVar' (renderingCreations (ri
 renderWith ∷ Rig → VulkanRenderer Scene → IO ()
 renderWith rig renderer = atomically (writeTVar (rigRenderer rig) (Just renderer))
 
+-- | Run this on the owner's thread with every later frame event, as a frame
+-- observer does, after the event is logged.
+onFrameEvent ∷ Rig → (FrameEvent → IO ()) → IO ()
+onFrameEvent rig = atomically . writeTVar (rigFrameHook rig)
+
 -- | Every command recorded, oldest first, with its command buffer.
 commandsRecorded ∷ Rig → IO [(Word64, NativeCommand)]
 commandsRecorded rig = (\events → [(buffer, command) | CommandRecorded buffer command ← events]) <$> journal rig
@@ -1138,6 +1144,8 @@ data Rig = Rig
     -- ^ Whether the host builds its generations for verification capture.
   , rigRenderer ∷ !(TVar (Maybe (VulkanRenderer Scene)))
     -- ^ The renderer an example put in place of the clearing one.
+  , rigFrameHook ∷ !(TVar (FrameEvent → IO ()))
+    -- ^ Run on the owner's thread with every frame event, after it is logged.
   }
 
 -- | Make the capture's sink raise on every record it is given from now on.
@@ -1308,6 +1316,7 @@ newRigClocked visible windows clock = do
         }
   native ← Native <$> newTVarIO Map.empty <*> newTVarIO Set.empty <*> newTVarIO 500 <*> newTVarIO Nothing <*> newTVarIO Nothing <*> newTVarIO Set.empty <*> newTVarIO imageUsageColorAttachment <*> newTVarIO False <*> newTVarIO Set.empty
   renderer ← newTVarIO Nothing
+  frameHook ← newTVarIO (\_ → pure ())
   bridge ← Bridge <$> newTVarIO Map.empty <*> newTVarIO Nothing <*> newTVarIO 100 <*> newTVarIO []
   verdict ← newTVarIO Nothing
   refusalHook ← newTVarIO (\_ → pure ())
@@ -1345,6 +1354,7 @@ newRigClocked visible windows clock = do
       , rigBudgets = defaultBudgetRequest
       , rigCaptureMode = CaptureOff
       , rigRenderer = renderer
+      , rigFrameHook = frameHook
       }
 
 -- | Run a whole Vulkan graphics host under the application runner, on a bound
@@ -1370,14 +1380,16 @@ runRigHere rig body = do
                 False → do
                   chosen ← maybe (vulkanRenderer base) id <$> readTVarIO (rigRenderer rig)
                   renderScene chosen current request construction recorder
-          , vulkanFrameObserver = \event → atomically $ do
-              modifyTVar' (rigFrameEvents rig) (<> [event])
-              case event of
-                FramePresented {} → do
-                  owner ← readTVar (rigOwner rig)
-                  rounds ← maybe (pure 0) (fmap statusRounds . readOwnerStatusNow) owner
-                  modifyTVar' (rigPresentRounds rig) (<> [rounds])
-                _ → pure ()
+          , vulkanFrameObserver = \event → do
+              atomically $ do
+                modifyTVar' (rigFrameEvents rig) (<> [event])
+                case event of
+                  FramePresented {} → do
+                    owner ← readTVar (rigOwner rig)
+                    rounds ← maybe (pure 0) (fmap statusRounds . readOwnerStatusNow) owner
+                    modifyTVar' (rigPresentRounds rig) (<> [rounds])
+                  _ → pure ()
+              readTVarIO (rigFrameHook rig) >>= ($ event)
           }
       timed owner = case rigClock rig of
         Nothing → owner

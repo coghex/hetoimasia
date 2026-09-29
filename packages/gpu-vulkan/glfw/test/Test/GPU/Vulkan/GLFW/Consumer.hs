@@ -101,6 +101,7 @@ spec = describe "Vulkan consumer rendering and capture" $ do
     it "settles a capture outstanding when its target retires, without bytes" (bounded testCaptureRetired)
     it "refuses a capture once its target's retirement has begun, while that retirement is still owed, and settles the one it already had" (bounded testCaptureWhileRetiring)
     it "keeps every admitted outcome until it is taken, refusing further requests at the limit as backpressure" (bounded testCaptureBacklog)
+    it "gives a request made from a frame's acquisition report a later frame, never the one already reported" (bounded testCaptureFromAcquisition)
     it "settles a presented capture without bytes when the session fails before its completion, naming the primary, and never delivers it" (bounded testCaptureTerminal)
 
 -- ---------------------------------------------------------------------------
@@ -695,6 +696,45 @@ testCaptureBacklog = do
   -- Every admitted ticket still had its outcome to take.
   outcomes `shouldSatisfy` all (\case Just (CaptureWithheld _ (WithheldUnsupported _)) → True; _ → False)
   again `shouldSatisfy` either (const False) (const True)
+
+testCaptureFromAcquisition ∷ IO ()
+testCaptureFromAcquisition = do
+  rig ← capturingRigOf 1
+  offerUsage rig (imageUsageColorAttachment + imageUsageTransferSource)
+  trigger ← newTVarIO Nothing
+  ticketHeld ← newTVarIO Nothing
+  (settled, acquired) ← runRig rig $ \host control → do
+    [window] ← windowsOf host
+    service ← handedOver host window RequiredTarget
+    TargetUsable ← awaitStanding host service
+    let controller = vulkanController host
+        attachment = graphicsAttachment service
+    -- The first acquisition's report asks for a capture, once, from the
+    -- owner's thread, as a verifier's frame observer may.
+    onFrameEvent rig $ \case
+      FrameAcquired at frame image | at == attachment → do
+        armed ← isNothing <$> readTVarIO trigger
+        when' armed $ do
+          atomically (writeTVar trigger (Just (frame, image)))
+          atomically (requestVulkanCapture controller attachment) >>= \case
+            Right ticket → atomically (writeTVar ticketHeld (Just ticket))
+            Left refusal → throwIO (StandInFailure (Text.pack ("the capture was refused: " <> show refusal)))
+      _ → pure ()
+    demandFrame host window
+    composedUntil rig host control "the request made from the report" (\_ → pure ()) (isJust <$> readTVarIO ticketHeld)
+    Just ticket ← readTVarIO ticketHeld
+    settled ← awaitCapture rig host control ticket
+    events ← frameEvents rig
+    pure (settled, [(frame, image) | FrameAcquired at frame image ← events, at == attachment])
+  Just (triggerFrame, triggerImage) ← readTVarIO trigger
+  case settled of
+    CaptureDelivered frame → do
+      (capturedFrame frame, capturedImage frame) `shouldSatisfy` (/= (triggerFrame, triggerImage))
+      -- The captured frame was acquired after the one whose report asked.
+      dropWhile (/= (triggerFrame, triggerImage)) acquired `shouldSatisfy` elem (capturedFrame frame, capturedImage frame) . drop 1
+    other → expectationFailure ("the capture was not delivered: " <> show other)
+  where
+    when' condition action = if condition then action else pure ()
 
 testCaptureTerminal ∷ IO ()
 testCaptureTerminal = do

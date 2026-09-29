@@ -762,13 +762,15 @@ renderDue rendering renderer now scene revision due =
           tryAcquireFrame (liveFrames made) target >>= \case
             Right (AcquisitionOwned owned) → do
               atomically (editTarget rendering target (\record → record {targetRetryAt = Nothing}))
-              observe (FrameAcquired attachment (ownedFrame owned) (ownedImage owned))
               -- The first frame acquired once a capture is outstanding is its
-              -- frame, whatever becomes of it.
+              -- frame, whatever becomes of it. It is associated before the
+              -- acquisition is reported, so a request made from the report is
+              -- a later frame's.
               asked ← atomically $
                 outstandingFor captures attachment >>= \case
                   Just stage | waiting stage → True <$ associateCapture captures attachment (ownedFrame owned)
                   _ → pure False
+              observe (FrameAcquired attachment (ownedFrame owned) (ownedImage owned))
               described ← describeImage target (ownedImage owned)
               case described of
                 Nothing → False <$ abandon made attachment owned (Captured asked Nothing) "its generation is no longer tracked"

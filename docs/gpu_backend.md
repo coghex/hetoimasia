@@ -1767,7 +1767,9 @@ compatibility never depends on capture. It refuses every request
   under the model's existing budgets like any managed resource.
 - **Association.** The next frame the owner acquires for the target is the
   request's, whatever becomes of it: a failed capture is settled, never moved
-  to a later frame. A frame whose generation is not a transfer source — its
+  to a later frame. A frame is associated before its acquisition is reported
+  to the frame observer, so a request made from that report is a later
+  frame's. A frame whose generation is not a transfer source — its
   surface offers no transfer-source usage, which never refuses the target
   itself — settles the request `WithheldUnsupported`, and one for which no
   readback buffer could be made settles it `WithheldNoReadback`; either frame
@@ -2300,6 +2302,8 @@ request it already had settled `WithheldTargetRetired` and a later one refused
 `CaptureNoTarget`; sixty-four requests admitted and settled without being
 taken, the sixty-fifth refused `CaptureBacklogFull`, every one of the
 sixty-four still there to take, and a request admitted again once they were;
+a request made from inside the frame observer's report of an acquisition
+captured from a later acquisition, never the one reported;
 and a presented capture whose batch completed only after a validation error
 ended the owner's run settled `WithheldSessionEnded` with that primary, and
 taken once.
