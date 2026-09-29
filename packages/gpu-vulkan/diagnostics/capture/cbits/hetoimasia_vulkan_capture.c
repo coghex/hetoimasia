@@ -733,6 +733,17 @@ void hetoimasia_capture_preset_counter(hetoimasia_capture_storage *storage, int 
   }
 }
 
+int hetoimasia_capture_slot_closed(void *user_data)
+{
+  uint64_t generation;
+  capture_slot *slot = decode_user_data(user_data, &generation);
+  if (slot == NULL || atomic_load(&slot->generation) != generation) {
+    return -1;
+  }
+  int closed = atomic_load(&slot->closed);
+  return atomic_load(&slot->generation) == generation ? closed : -1;
+}
+
 uint32_t hetoimasia_capture_offer(
   void *user_data,
   uint32_t severity,

@@ -90,6 +90,7 @@ import Hetoimasia.GPU.Vulkan.Diagnostics.Internal.Capture
   , offerMissingData
   , plainOffer
   , releaseHold
+  , slotClosed
   )
 import Test.GPU.Vulkan.Diagnostics.Support
 
@@ -642,6 +643,10 @@ spec = describe "Lifetime" $ do
               putMVar handle capture
         putMVar lifetime result
       capture ← readMVar handle
+      -- Release the producer only once closing has shut this capture's
+      -- admission and is waiting for it. The body may return at any time after
+      -- publishing the handle, so nothing else orders the release after that.
+      bounded (untilM ((== Just True) <$> slotClosed (captureUserData capture)))
       -- The lifetime cannot get past closing while the producer is announced.
       atomically (capturePhase capture) `shouldReturn` PhaseCapturing
       releaseHold hold
