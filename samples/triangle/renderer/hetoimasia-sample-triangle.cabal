@@ -42,8 +42,28 @@ library
     exposed-modules:
         Hetoimasia.Sample.Triangle
         Hetoimasia.Sample.Triangle.Geometry
+        Hetoimasia.Sample.Triangle.Pipelines
         Hetoimasia.Sample.Triangle.Shaders
     build-depends:
         base >=4.22 && <4.23,
         containers >=0.8 && <0.9,
         hetoimasia-gpu-vulkan-native ==0.1.0.0
+
+-- The drawing's headless examples: the pipeline cache's decisions over
+-- stand-in builders, with no device, display or GLFW session. The executable
+-- links the loader only because the native backend does, so it is built and
+-- run through `tools/vulkan/run.sh test` — the group `test.vulkan-headless`.
+test-suite triangle-tests
+    type: exitcode-stdio-1.0
+    default-language: GHC2024
+    default-extensions: UnicodeSyntax OverloadedStrings
+    ghc-options: -Wall -Wcompat -Wincomplete-uni-patterns -Wincomplete-record-updates -threaded -rtsopts
+    hs-source-dirs: test
+    main-is: Main.hs
+    other-modules:
+        Test.Sample.Triangle.Pipelines
+    build-depends:
+        base >=4.22 && <4.23,
+        hspec >=2.11 && <3,
+        hetoimasia-gpu-vulkan-native ==0.1.0.0,
+        hetoimasia-sample-triangle

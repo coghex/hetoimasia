@@ -238,8 +238,9 @@ install the same capture on real messengers are not this group; they are
 rather than only building them: the native backend's profile and roots decisions
 over a stand-in native layer (`native-tests`), its shader contract against the
 provisioned compiler (`shader-tests`, which regenerates the toolchain
-fingerprint first), and the window integration's controller over the GLFW
-package's scripted seam (`integration-tests`). Headless means that none of them
+fingerprint first), the window integration's controller over the GLFW
+package's scripted seam (`integration-tests`), and the triangle sample's
+pipeline cache over stand-in builders (`triangle-tests`). Headless means that none of them
 acquires a display, a GLFW session, or a device, and none reads desktop
 consent; the Vulkan headers and loader are build and link prerequisites and
 nothing more, which is why the group needs a provisioned worker and not a
@@ -248,7 +249,8 @@ command is [`tools/vulkan/run.sh`](../tools/vulkan/run.sh)'s test mode:
 
 ```bash
 bash tools/vulkan/run.sh test hetoimasia-gpu-vulkan-native:test:native-tests \
-  hetoimasia-gpu-vulkan-native:test:shader-tests hetoimasia-gpu-vulkan-glfw:test:integration-tests
+  hetoimasia-gpu-vulkan-native:test:shader-tests hetoimasia-gpu-vulkan-glfw:test:integration-tests \
+  hetoimasia-sample-triangle:test:triangle-tests
 ```
 
 Its component is the integration suite, whose closure reaches the native
@@ -258,8 +260,9 @@ a `test/` source directory no single component's closure reaches, beside
 `cabal.project.vulkan`, `cabal.project.common`, `tools/native/`,
 `tools/ci-image/`, `tools/vulkan/`, `tools/toolchain/binding.pin`, and
 `tools/test-support/`, the test-only library the shader suite compiles its
-external clients through, which the declared component's closure does not
-reach. Later
+external clients through, and `samples/triangle/renderer/`, the triangle
+sample's drawing and its suite; the declared component's closure reaches
+neither. Later
 backend slices extend its coverage and inputs as their suites grow. It stays
 apart from `test.vulkan-native`'s measured native execution on purpose: these
 examples are deterministic, need no permission, and are never optional probes.
