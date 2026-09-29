@@ -71,6 +71,14 @@ The diagnostic design captures messages and bounded object information, but no i
 
 ## Resource services beyond the triangle
 
+> **Handoff (2026-09-29):** VKR-3 through VKR-6 are carried by the
+> [GPU resource services design](designs/gpu_resource_services_design.md),
+> which owns their allocation, upload, access/layout and binding contracts.
+> Its D-1 records the owner's bindless, atlased-texture decision, which
+> overrides VKR-6's "do not assume bindless". Process these findings against
+> that design's epic rather than filing parallel issues. The review baseline
+> above is unchanged.
+
 ### VKR-3. Define GPU allocation beneath existing lifetime accounting
 
 Finite byte/object budgets and retirement are implemented, but there is no production device-memory allocation strategy. The proof’s single readback allocation is not a reusable allocator. General buffers and images need allocation requirements and backing-storage reuse to compose with the existing holds.

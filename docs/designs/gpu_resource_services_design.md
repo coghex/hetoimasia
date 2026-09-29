@@ -1,0 +1,947 @@
+# GPU resource services design
+
+Give the Vulkan backend the shared resource services that every renderer
+beyond the triangle needs — device memory, buffers and images, access and
+layout ordering, uploads, bindless texture addressing and depth — once,
+beneath both a future `render-2d` and `render-3d`. It carries VKR-3 through
+VKR-6 of the [Vulkan capability findings](../vulkan_backend_findings.md) and
+the backend prerequisites of FND-3 and FND-4 in the
+[renderer findings](../renderer_foundation_findings.md). A 2D application
+should get these services without constructing a 3D renderer (foundation
+D-2), which is the efficiency and simplicity it lacked when 2D was a 3D
+engine with a fixed viewport.
+
+Design state: `ready for issue processing`
+
+Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
+reviewed and deliberately not tracked separately · `[deferred]` blocked on a
+concrete precondition
+
+## Processing status
+
+The epic and fifteen slices are accepted for issue processing under D-25,
+as amended by D-28. Tracker artifacts remain unprocessed and require their
+own approval before creation.
+
+- [ ] EPIC. Establish shared GPU resource services for 2D and 3D consumers
+- [ ] GRS-1. Place allocations with a pure block allocator proven against VMA
+- [ ] GRS-11. Back allocations with device-memory blocks beneath the model's accounting
+- [ ] GRS-2. Create managed buffers and images as retained model subjects
+- [ ] GRS-3. Order access and layout for managed resources through checked operations
+- [ ] GRS-15. Start the device and owner progress without a window
+- [ ] GRS-12. Admit, submit and complete frame-less batches
+- [ ] GRS-5. Render into a managed offscreen color target and read it back
+- [ ] GRS-4. Record from vertex, index and instance buffers with push constants
+- [ ] GRS-6. Upload bytes through bounded engine-owned staging with completion
+- [ ] GRS-7. Own the bindless texture table and its completion-safe slot reuse
+- [ ] GRS-14. Grow the texture table to its configured cap
+- [ ] GRS-8. Draw textured quads from table slots in a 2D scaffolding fixture
+- [ ] GRS-9. Swap a texture slot's image under the same handle
+- [ ] GRS-10. Add depth attachments and a depth-tested 3D scaffolding fixture
+- [ ] GRS-13. Give each target generation a managed depth attachment
+
+## Epic contract
+
+- **Goal:** a consumer written against the native backend's public recording
+  vocabulary can allocate buffers and images, upload bytes, address textures
+  through stable bindless handles, draw instanced and indexed geometry with
+  push constants, render depth-tested or into offscreen targets, and read the
+  result back, with every resource retained and retired on completion
+  evidence.
+- **Done when:** every slice has merged; a 2D fixture draws
+  textured quads through stable handles and a 3D fixture draws occluding
+  geometry, each proven by offscreen readback with clean synchronization
+  validation on the macOS profile and the Linux CI profile (or an honestly
+  reported limitation under D-7); a slot swap is proven by readback; windowed
+  frames render with depth; D-14's and D-32's retained comparisons show the
+  allocator at parity with VMA for placement and native allocation.
+- **Users and operators:** the later `render-2d` (FND-4) and `render-3d`
+  (FND-3) arcs, the content-loading arc (RTC-4), and maintainers reading
+  retained evidence.
+- **Arc label:** `vulkan` (existing).
+
+## Current state and evidence
+
+Checked against `master@034990a` on 2026-09-29. No builds or native sessions
+ran for this document.
+
+- **Lifetime and accounting exist.** The [GPU model](../gpu_model.md) tracks
+  five independent holds on every generation and managed resource (logical
+  release, ended CPU use, recorded reference, submitted use, presentation)
+  and offers a subject for disposal only when all have ended. Admission
+  budgets include 256 MiB of accounted bytes and 4,096 accounted objects by
+  default; exhaustion is `Backpressure`, and an allocation attempt must
+  reserve bytes or objects (`EmptyAllocation`).
+- **Allocation recovery exists.** VK-14's
+  `Native/Internal/Reclamation.hs` runs one bounded reclamation pass and at
+  most one retry for a no-effect allocation failure.
+- **There is no allocator.** The only device-memory allocation is the
+  readback buffer's, one `allocateMemory` per buffer preferring host-visible
+  and cached memory (`native/src/.../Recording/Vulkan.hs:224–243`). VKR-3's
+  evidence cites the retired proof harness; this is its current location.
+- **The recorder is triangle-sized.** `Hetoimasia.GPU.Vulkan.Native.Recording`
+  exports pipeline layouts, pipelines, frame storage and readback buffers,
+  and records dynamic rendering, pipeline binds, viewport/scissor,
+  non-indexed `draw`, image transitions and `copyToReadback`. No buffers for
+  drawing, push constants, descriptors, sampled images, depth or offscreen
+  images. The design grows it only for actual consumers
+  (`docs/vulkan_backend_design.md:1024`), limits barriers to the operations
+  supported (`:1071`), and requires advanced descriptors to have their own
+  reference/mutation contract (`:1081`); descriptor pools arrive only with a
+  command that needs them (`:1452`).
+- **Batches belong to acquired frames.** `recordFrame` reserves a batch
+  against an acquired swapchain frame, and `copyToReadback` reads only a
+  swapchain image made a transfer source by `newGenerationsCapturing`.
+  Offscreen rendering has no batch owner today.
+- **The device profile** requires Vulkan 1.3 with `dynamicRendering` and
+  `synchronization2` (`native/src/.../Profile.hs:12`); no descriptor-indexing
+  feature is required.
+- **Bindings:** the backend uses the `vulkan` Hackage binding (3.27) and
+  `vulkan-utils`; shaders are GLSL compiled to SPIR-V at build time through
+  the package's `shader-toolchain` (VK-9, #221).
+- **Reference workload (Synarchy, `~/work/synarchy@3b1477a10`).** Its
+  `assets/` hold 6,251 PNGs totalling 243 MiB as RGBA8 (about 61 MiB as
+  BC7), 93% of it unit animation frames (5,302 images, 226 MiB). 97% of
+  images are under 64 KiB (48×48 and 92×92 dominate); the largest assets are
+  about 846×470 (1.5 MiB). Atlased per D-1, that content becomes tens to low
+  hundreds of sheets of roughly 1–16 MiB each — the allocator's main 2D
+  workload — beside small buffers and per-frame data.
+- **Findings owned here:** VKR-3, VKR-4, VKR-5 and VKR-6 are unprocessed;
+  RTC-4 (content loading) and RTC-3 (bounded jobs) are deferred for want of a
+  first content type, which textures now are — but D-3 keeps that loading
+  work out of this arc.
+- **No overlapping tracker arc.** Open issues are module splits (#317–#325),
+  Wayland (#202) and Lua (#145).
+
+## Desired experience
+
+- A fixture creates a texture from raw bytes and gets back a stable handle at
+  once; the handle samples placeholder slot 0 until its upload completes, and
+  then its own image, with no descriptor work by the fixture.
+- A fixture fills an instance buffer with sprite data (slot, UV rectangle,
+  transform), pushes per-draw constants, and draws many quads in one call.
+- A fixture renders into an offscreen target, reads it back once the GPU has
+  finished, and the agent reads that evidence for the owner (D-6).
+- Replacing a texture's bytes under the same handle shows the new image in
+  later frames while frames already submitted keep sampling the old one,
+  which retires only after they complete.
+
+## Scope
+
+### In scope
+
+- A device-memory allocator beneath the model's accounting (VKR-3).
+- Managed buffers and images, including sampled textures, depth attachments
+  and offscreen color targets.
+- Access and layout ordering for those resources (VKR-5).
+- Bounded uploads from engine-owned staging with completion (VKR-4's backend
+  endpoint).
+- The bindless texture table, its handles, retirement and slot swap (VKR-6
+  as overridden by D-1).
+- Vertex, index and instance buffers, indexed and instanced draws, push
+  constants.
+- Offscreen rendering and readback as the evidence path.
+- 2D and 3D scaffolding fixtures that exercise the above.
+
+### Out of scope
+
+- `render-2d`, `render-3d` and `render-api` packages (FND-4, FND-3; D-8).
+- Content loading: file decoding (PNG, KTX2), the sheet-stitching build
+  script, file watching, background decode workers and loader budgets
+  (RTC-4, RTC-3; D-3).
+- Pipeline caching and hardware qualification (VKR-7, VKR-8).
+- Additional queues, async compute, multithreaded recording.
+- Defragmentation and memory-budget extensions until measured.
+- A render graph.
+
+## Design
+
+Proposals that shaped the decisions below, organized by layer; where a
+decision settles one, the decision governs.
+
+- **P-1. Layers.** Memory → resources → access/layout → recording from
+  buffers → offscreen targets → uploads → texture table → fixtures. Each
+  layer plugs into existing model holds and budgets rather than adding its
+  own lifetime rules.
+- **P-2. Pure decisions stay testable.** Allocation placement, layout/access
+  legality and slot reuse are decided by pure functions beside the model and
+  tested in Hspec without a GPU; native layers apply them, following the
+  model/native split already used for generations and recording.
+- **P-3. Checked, explicit barriers.** The recorder refuses an access it
+  cannot prove ordered, as it refuses a released handle today; no inferred
+  render graph.
+- **P-4. Per-frame data rings.** Instance and per-frame data live in
+  per-frame-slot ring buffers that reset when the slot is reclaimed, so
+  per-frame allocation never reaches the block allocator.
+
+## Decisions
+
+### D-1. Bindless, atlased textures
+
+Owner decision 2026-09-29, previously recorded only in a private artifact;
+it overrides VKR-6's "do not assume bindless".
+
+- **Addressing:** one update-after-bind sampled-image array. A texture handle
+  is slot plus generation; sprite instances carry a stable texture handle
+  plus UV rectangle, resolved to a slot in the shader (clarified by D-23).
+  The device profile requires `runtimeDescriptorArray`,
+  `descriptorBindingPartiallyBound`,
+  `descriptorBindingSampledImageUpdateAfterBind`,
+  `shaderSampledImageArrayNonUniformIndexing` and, for a growable table,
+  `descriptorBindingVariableDescriptorCount`.
+- **Storage:** sprite sheets for animation and atlases for tile, flora and
+  font families; no one-image-per-frame content. Sheets are a texture plus an
+  optional region table.
+- **Retirement:** the texture table is one managed resource held by every
+  submission that binds it. A released slot is reused only after every
+  submission that could have sampled it completes, per the GPU model's
+  evidence; the generation catches stale handles.
+- **Handles:** stable logical handles resolve through a shader-read lookup
+  table; slot 0 is the placeholder until a texture is ready; handles are
+  never persisted.
+- **Sampling and alpha:** per-texture filtering with shared samplers chosen
+  per draw (UI and SDF fonts always linear, otherwise the game's default);
+  premultiplied alpha from the start.
+- **Growth:** the table doubles up to a game-configured cap.
+- **Evidence at decision time:** MoltenVK 1.4.0 on M3 Max offers all the
+  features, 1,000,000 update-after-bind sampled images per stage (256
+  without), BC and ASTC, and no `VK_EXT_descriptor_buffer`. Lavapipe was not
+  checked (D-7).
+
+Content-side parts of the same decision — PNG plus KTX2/BC7 as the baseline
+formats, the stitching build script, background decode, the bounded upload
+queue's loader side and hot-reload file watching — belong to the later
+content-loading arc under D-3 and are preserved in Source notes.
+
+Amended by D-27 (lookup versions protect recorded references, and a likely
+sixth feature).
+
+### D-2. The 2D consumer drives the arc, and 3D follows within it
+
+Owner decision 2026-09-29. Capabilities are ordered by what a 2D textured
+fixture needs first; the arc then continues to what 3D needs (depth,
+perspective-ready geometry) rather than leaving it to another backend arc.
+Buffers, push constants, uploads and the texture table are shared by both.
+This reverses the renderer findings' original FND-3-before-FND-4 order for
+the backend prerequisites.
+
+### D-3. The arc ends at "texture slot out"
+
+Owner decision 2026-09-29. The arc accepts raw bytes and returns texture
+handles; its consumers are scaffolding fixtures, not `render-2d` or
+`render-3d`. Decoding, asset build tooling, file watching, loader
+concurrency and budgets are a later content-loading arc (RTC-4). Work
+proceeds slowly and methodically, one layer at a time.
+
+### D-4. Write an owned allocator, proven by measurement
+
+Owner decision 2026-09-29, conditional on performance parity with VMA for
+this engine's workload. It suballocates large device-memory blocks, honours
+alignment, `bufferImageGranularity` and drivers' dedicated-allocation
+preferences, and integrates with the model's accounted bytes and VK-14's
+reclamation. Parity is established by D-14's comparison with VMA, not by
+targets chosen in advance; a failure to reach it reopens this decision
+rather than being waived. D-13 fixes its shape.
+
+### D-5. Include the hot-reload slot swap if it stays tractable
+
+Owner decision 2026-09-29. The GPU half of hot reload — replacing a slot's
+image under the same handle and retiring the old image after the
+submissions that sampled it complete — is its own late slice here. If
+refinement shows it is easier after the content-loading arc, it moves there
+by an explicit revision of this decision.
+
+### D-6. Offscreen readback is the evidence, read by the agent
+
+Owner decision 2026-09-29. Fixtures prove themselves by rendering into
+managed offscreen targets and reading them back; no desktop session is
+needed for evidence. The owner relies on the agent to interpret captures and
+report findings in plain terms until visible output is richer.
+
+### D-7. No Lavapipe contingency in advance
+
+Owner decision 2026-09-29. Whether Lavapipe supports D-1's features is
+checked when the arc first requires them. If it does not, the choice between
+another Linux driver and an honestly reported macOS-only qualification (V-8)
+is made then, with that evidence.
+
+### D-8. Services extend the native backend package
+
+Owner decision 2026-09-29. New services live in
+`hetoimasia-gpu-vulkan-native` beside `Recording`; the texture handle is
+Vulkan-side. `render-api` is not created until `render-2d` needs a
+backend-independent handle, decided in the FND-4 arc.
+
+### D-9. Uploads copy into engine-owned staging at admission
+
+Owner decision 2026-09-29. An admitted upload copies the caller's bytes into
+engine-owned staging, so ownership transfers exactly once and the caller's
+buffer is free on return. A zero-copy handoff is deferred until measured.
+
+### D-10. Documentation lands with its slice and may also land directly
+
+Owner decision 2026-09-29. This document holds the arc's decisions;
+`vulkan_backend_design.md` gains a pointer and the D-1 override in the first
+slice's pull request, and each slice updates its owning contract document
+(`gpu_backend.md`, `gpu_model.md`) in its own pull request. Standalone
+documentation may also land directly; reconciling the docs worktree with
+`master` is routine.
+
+### D-11. Texture-table cap and upload budget are application configuration
+
+Owner decision 2026-09-29. The table's growth cap and the per-frame upload
+byte budget are stated by the application and validated once, before use,
+like the GPU model's budgets: zero, negative and unrepresentable values are
+rejected, never clamped, and there is no unbounded sentinel.
+
+### D-12. Work without presentation runs in frame-less batches
+
+Owner decision 2026-09-29; resolves Q-4. Offscreen rendering and uploads
+record into a new batch kind that belongs to no swapchain frame and carries
+its own submission and completion record, so evidence runs need no window
+and uploads never wait for an acquisition. Riding inside a window's frame
+and a presentation-free virtual swapchain were rejected: the first
+contradicts D-6, the second pretends to presentation semantics it does not
+have. Verified 2026-09-29: the model admits a batch only against an
+acquired frame (`recordBatch`, `docs/gpu_model.md:193`), so frame-less
+batches need their own model admission, budget accounting and completion
+record (proposed GRS-12).
+
+### D-13. Best-fit block suballocation behind a pure placement interface
+
+Owner decision 2026-09-29; resolves Q-1's allocator shape.
+
+- **Placement** is a pure algorithm behind an interface that admits another
+  strategy: best-fit over a free list, coalescing freed neighbours. It suits
+  D-1's workload of tens to low hundreds of 1–16 MiB sheets, where the free
+  list stays short. TLSF (VMA's default) may replace it if D-14's
+  measurements call for it, typically under 3D's many small allocations.
+- **Blocks** grow per memory type from 8 MiB, doubling to 64 MiB, both
+  application configuration under D-11, so a small consumer never claims a
+  large block.
+- **Dedicated allocations** serve a resource of at least half the current
+  maximum block size, or one the driver prefers or requires dedicated.
+- **Rings**, not the block allocator, serve staging and per-frame data.
+
+Rejected: a buddy allocator, whose power-of-two rounding wastes roughly a
+third or more on mip-chained textures (about 1.33× a power of two); fixed
+64 MiB blocks, which would charge a whole block to a single small buffer;
+dedicated-only allocation, adequate for atlased 2D alone but not for 3D's
+many small buffers or allocation during streaming and hot reload.
+
+### D-14. Prove parity with VMA by replaying identical traces
+
+Owner decision 2026-09-29; resolves the measurement half of D-4. An optional
+benchmark probe replays identical allocation and free traces through the
+Haskell placement algorithm and through VMA's virtual blocks
+(`vmaCreateVirtualBlock`, which places allocations without a device), and
+compares speed and wasted space. VMA runs each trace entirely inside a
+small C shim, so its timings carry no per-call FFI cost (scope narrowed to
+placement, and a native comparison added, by D-32); the Hackage
+`VulkanMemoryAllocator` binding also exposes virtual blocks but is not the
+timing path. Traces are derived from Synarchy's asset set (sheet sizes and
+streaming or hot-reload churn), with synthetic traces added for 3D-like
+small allocations. VMA exists only in the probe: never an engine
+dependency, and its pinned source is a recorded native input (V-11).
+
+### D-15. The byte budget counts device blocks
+
+Owner decision 2026-09-29; resolves Q-2. The model's accounted bytes charge
+each device-memory block and dedicated allocation, so the budget bounds
+real device memory; growing blocks (D-13) keep small consumers from paying
+for large ones. Exceeding the budget to open a block is `Backpressure`.
+Blocks take no holds of their own: every suballocation is disposed only on
+completion evidence, so a block may be freed once empty. Disposing of a
+resource counts as reclamation progress for VK-14's retry, since the retry
+may now fit. Rejected: charging each resource's own size, which hides
+fragmentation and block slack; charging both, which gives two backpressure
+sources for one concern.
+
+### D-16. Memory types follow what the data is
+
+Owner decision 2026-09-29; resolves Q-1's memory types.
+
+- **Textures are always staged** into device-local memory on every
+  platform: optimal tiling cannot be written by the host, and Apple GPUs
+  compress private textures, so the copy is required rather than wasted.
+- **Per-frame data** (instances, camera values) lives in host-visible ring
+  buffers that the GPU reads directly, with no copy.
+- **Static geometry buffers** are staged into device-local memory. Writing
+  them directly into device-local host-visible memory on unified-memory
+  devices saves one copy and is deferred until measured.
+- **Staging and readback** use host-visible memory.
+
+### D-17. Keep one empty block per memory type
+
+Owner decision 2026-09-29; resolves Q-1's retention. One empty block per
+memory type is retained so free-then-allocate patterns do not thrash native
+allocation, as VMA does. It still counts against the byte budget (D-15), and
+a VK-14 reclamation pass may free it, which counts as progress. Amended by
+D-29: budget backpressure trims cached empty blocks first.
+
+### D-18. Resources rest in a known layout; transitions within a batch are explicit and checked
+
+Owner decision 2026-09-29; resolves Q-3.
+
+- **Resting-state rule:** every long-lived resource has a resting layout —
+  sampled textures ready for shader reads, depth images ready as
+  attachments, offscreen color targets ready as attachments. Every batch
+  returns what it touched to its resting layout before it ends, and an
+  upload leaves its texture resting before the slot is published. No layout
+  or access state is tracked across batches, so recording order and
+  submission order cannot disagree about it.
+- **Within a batch** the consumer records explicit transitions, and the
+  recorder refuses illegal ones or a batch that ends with a resource away
+  from rest. The legality rules are pure, beside the model, and tested in
+  Hspec (P-2).
+- **Later convenience:** per-pass declarations of reads and writes, with the
+  recorder inserting barriers over the same checks, may be added once
+  `render-2d` shows repeated patterns. They are not part of this arc.
+- **Between batches:** see D-26, which adds resting scopes and mechanical
+  boundary barriers.
+
+Rejected: tracking layouts across batches, which is fragile when batches are
+recorded out of submission order; automatic barriers now, which hide costs
+before any consumer has shown the patterns worth automating.
+
+### D-19. Shader interfaces are checked against compiled SPIR-V inside the Template Haskell splice
+
+Owner decision 2026-09-29; resolves Q-7. Shaders stay hand-written GLSL,
+compiled while the package builds through VK-9's splice
+(`$(vertexShader [glsl|…|])`). The splice additionally takes a Haskell
+description of the shader's interface — push-constant ranges and member
+offsets, vertex and instance input locations and formats, and the texture
+table's set and binding — declared in a separately compiled module, as
+`${…}` interpolations already are under Template Haskell's stage
+restriction. After compiling, the splice reads the SPIR-V's decorations with
+a small Haskell reader and fails the build on any mismatch. No new native
+tool is introduced. Rejected: generating GLSL declarations from Haskell,
+which would constrain how shaders are written; checking only at pipeline
+creation, which finds mismatches at runtime.
+
+### D-20. Uploads are admitted into bounded staging and publish on completion
+
+Owner decision 2026-09-29; resolves Q-5.
+
+- **Admission:** a bounded queue; admission copies the caller's bytes into
+  the staging ring (D-9), and a full ring or queue answers backpressure
+  immediately, never waiting implicitly (V-5).
+- **Per-frame budget:** D-11's byte budget caps the staged bytes recorded
+  into upload batches in each owner turn.
+- **Readiness:** a texture handle samples placeholder slot 0 until its
+  upload's frame-less submission (D-12) has completed, and only then
+  resolves to its own slot. Publishing at submission would be a frame or two
+  sooner and is ordered safely on one queue, but readiness stays on the
+  model's completion evidence.
+- **Cancellation:** permitted until the upload's copy is recorded; after
+  that the upload completes and the caller releases the handle normally.
+- **Size:** see D-30 for oversized refusal and chunked progress.
+
+### D-21. The upload endpoint accepts RGBA8 and BC7 with caller-supplied mip levels
+
+Owner decision 2026-09-29; resolves Q-8. Formats are RGBA8 (sRGB and
+linear) and BC7 (sRGB and linear); BC support is queried from the device and
+reported, never assumed. Callers supply every mip level they want; the GPU
+generates none. Container decoding such as KTX2 stays in the content arc
+(D-3), which then only unpacks into this endpoint. ASTC is deferred.
+
+### D-22. One engine-owned table layout that consumer pipelines attach
+
+Owner decision 2026-09-29; resolves Q-6.
+
+- The engine owns one descriptor-set layout holding the variable-count,
+  update-after-bind array of texture slots (D-1) and a small fixed array of
+  shared samplers (for example nearest or linear, clamp or repeat).
+- A consumer asks for the table when creating a pipeline layout; D-19's
+  build-time check verifies each shader declares it at the expected set and
+  binding.
+- A draw chooses its sampler by an index in its push constants; the shader
+  combines the slot's image with that sampler.
+- Growth to D-11's cap creates a larger set, copies the existing entries,
+  and binds the new set in later frames; the old set retires on completion
+  evidence like any other managed resource.
+
+Amended by D-27 (lookup versions) and D-31 (binding order, declared cap and
+growth).
+
+### D-23. Instances carry stable handles, resolved through a per-frame lookup
+
+Owner decision 2026-09-29; clarifies D-1. Instance and baked data carry the
+stable texture handle, never a slot. Shaders resolve a handle to its current
+slot through a lookup table versioned per frame slot, so data baked into
+buffers (a static tilemap, for example) stays valid across hot reload. The
+slot swap (D-5, GRS-9) redirects the handle's lookup entry to a new slot in
+later frames and retires the old slot on completion evidence, reusing slot
+retirement rather than adding a mechanism. Rejected: resolving slots on the
+CPU each frame, which forces baked buffers to be rewritten whenever a
+texture moves. Versioning is by D-27's lookup versions rather than frame
+slots.
+
+### D-24. Depth attachments for offscreen and windowed rendering, in separate slices
+
+Owner decision 2026-09-29; resolves Q-9. Offscreen passes gain depth with
+the 3D fixture (GRS-10). Windowed depth follows each swapchain generation
+through construction, resize, replacement and VK-14 surface recovery, as
+backend work in its own slice (GRS-13) rather than waiting for `render-3d`.
+
+### D-25. Accept fourteen dependency-ordered slices
+
+Owner decision 2026-09-29; resolves Q-10, and the owner declared the design
+ready for issue processing. The delivery plan's fourteen slices are the
+accepted issue boundaries, in dependency order. GRS-4 follows GRS-12 and
+GRS-5 so that its native proof is an offscreen readback (D-6); table growth
+is split from GRS-7 into GRS-14 so the first textured draws need only a
+fixed-size table. The device-profile feature change lands in GRS-7, where
+D-7's Lavapipe outcome surfaces, and the shader-interface check in GRS-4.
+Amended by D-28, which adds GRS-15 for window-free startup, making fifteen.
+After a review's Q-11–Q-17 were resolved by D-26–D-32, the owner confirmed
+readiness again on 2026-09-29.
+
+### D-26. Batches enter and leave a resource's resting scope through boundary barriers
+
+Owner decision 2026-09-29; resolves Q-11 and amends D-18.
+
+- A resting state is a layout plus a resting stage and access scope.
+- The recorder emits an entry barrier, from the resting scope to the
+  batch's use, at a batch's first touch of a resource, and an exit barrier,
+  from that use back to the resting scope, at its last. On the one graphics
+  queue a barrier's first scope covers every earlier-submitted command, so
+  each entry barrier chains to earlier batches' exit barriers, ordering
+  write-after-write, read-after-write and write-after-read between batches
+  even when no layout changes. These boundary barriers are mechanical under
+  the rule; transitions within a batch stay explicit and checked (D-18).
+- A new image is uninitialized until the batch that initializes it (an
+  upload, or an attachment pass that clears from undefined) has been
+  submitted; the recorder refuses any other batch's use before then.
+  Attachments cleared every pass may transition from undefined each time,
+  and still take the entry barrier.
+
+### D-27. Batches freeze their texture references in lookup versions
+
+Owner decision 2026-09-29; resolves Q-12 and amends D-1, D-22 and D-23.
+
+- A batch takes a lookup version when it first binds the texture table, and
+  that version is fixed from then on. Versions come from a version ring
+  independent of frame slots, so frame-less batches (D-12) take them the
+  same way.
+- The batch retains its version and the table set it bound through the
+  model's existing holds — recorded reference, then submitted use until
+  completion — and a version keeps every slot it maps.
+- A slot is reusable, and its descriptor rewritable, only once no live
+  version maps it. Release, replacement (D-5) and growth (D-22) publish new
+  versions and never touch an old version's slots, so a descriptor write
+  only ever targets a slot no recorded or pending batch can sample.
+- This likely requires a sixth device feature,
+  `descriptorBindingUpdateUnusedWhilePending`; GRS-7 verifies that against
+  the specification and MoltenVK before relying on it.
+- Acceptance case: record a batch, then replace or release a texture it
+  samples, then submit the earlier batch — it samples the old image, and the
+  old slot is not reused until that batch completes.
+
+### D-28. The device can start without a window inside the existing owner
+
+Owner decision 2026-09-29; resolves Q-13. The roots gain a surface-free
+bootstrap: the device is selected by its graphics queue and the profile's
+features, and any surface admitted later is checked against that queue
+family as today (`TargetSurfaceUnsupported`). The existing GLFW-hosted
+graphics owner makes progress and retires with zero targets, so offscreen
+evidence opens no window; on Linux it still runs under the isolated X11
+display. A headless owner independent of GLFW was rejected as a second
+owner machinery. Delivered by GRS-15.
+
+### D-29. Cached empty blocks are trimmed before budget backpressure
+
+Owner decision 2026-09-29; resolves Q-14 and amends D-17. Before answering
+backpressure for opening a block, the allocator frees every cached empty
+block — at most one per memory type — and checks the budget once more. Empty
+blocks take no holds (D-15), so trimming is immediate on the owner's thread.
+VK-14's reclamation is never entered for budget exhaustion
+(`native/src/.../Internal/Reclamation.hs:11`), so it cannot be relied on for
+this.
+
+### D-30. Oversized uploads are refused; large uploads progress in chunks
+
+Owner decision 2026-09-29; resolves Q-15 and amends D-20.
+
+- Admission refuses permanently, with its own refusal rather than
+  backpressure, an upload larger than the staging ring's capacity or the
+  device's image limits. A full ring or queue remains backpressure.
+- An admitted upload larger than one turn's budget is recorded in chunks
+  across turns, split at mip-level and block-row boundaries.
+- While uploading, the unpublished texture rests in the
+  transfer-destination layout (D-26); the final chunk moves it to
+  shader-read, and readiness follows that chunk's completion (D-20).
+- D-11's validation requires the per-turn budget to fit one block row of the
+  widest supported level.
+
+### D-31. The table layout declares its cap; growth keeps it compatible
+
+Owner decision 2026-09-29; resolves Q-16 and amends D-22.
+
+- The layout's bindings are fixed: the shared samplers, then the lookup
+  buffer, then the variable-count texture array as the highest binding
+  number, which Vulkan requires.
+- The layout declares D-11's validated cap as the texture array's upper
+  bound, checked at configuration against the device's update-after-bind
+  limits.
+- Each set allocates its current count. Growth allocates a larger set while
+  the old one is still retained (D-27), so descriptor pools are sized for
+  both, or a fresh pool serves each growth.
+- The layout never changes, so every pipeline layout stays compatible, and
+  D-19's check covers the lookup binding as well as the array.
+
+### D-32. Parity with VMA is measured for placement and on the device
+
+Owner decision 2026-09-29; resolves Q-17 and amends D-14. D-14's virtual-block
+comparison establishes placement speed and fragmentation only, since VMA's
+virtual blocks allocate no device memory. GRS-11 adds a native comparison:
+the probe's C shim runs VMA's real allocator on the device over the same
+traces as the owned allocator, and the retained results compare native
+allocation counts, block-open latency, mapping and end-to-end allocate and
+free throughput. Both comparisons stay in optional probes; VMA remains no
+engine dependency.
+
+## Open questions
+
+### Q-1. Allocator shape, memory types and retention
+
+Resolved by D-13, D-14, D-16 and D-17.
+
+### Q-2. How allocation meets the model's accounting and recovery
+
+Resolved by D-15.
+
+### Q-3. Who owns access and layout state
+
+Resolved by D-18.
+
+### Q-4. What owns an offscreen batch
+
+Resolved by D-12.
+
+### Q-5. Upload admission and completion
+
+Resolved by D-20. The queue bound and staging-ring size are D-11
+configuration, set when GRS-6 is drafted.
+
+### Q-6. Pipeline layouts and the texture table
+
+Resolved by D-22 and D-23.
+
+### Q-7. Shader-interface checking
+
+Resolved by D-19.
+
+### Q-8. Texture formats in this arc
+
+Resolved by D-21.
+
+### Q-9. Depth attachment ownership
+
+Resolved by D-24.
+
+### Q-10. Slice boundaries
+
+Resolved by D-25.
+
+### Q-11. Synchronization between batches
+
+Raised by review on 2026-09-29; resolved by D-26.
+
+### Q-12. Protecting recorded texture references
+
+Raised by review on 2026-09-29; resolved by D-27.
+
+### Q-13. Window-free device startup
+
+Raised by review on 2026-09-29; resolved by D-28.
+
+### Q-14. Trimming cached empty blocks under a tight budget
+
+Raised by review on 2026-09-29; resolved by D-29.
+
+### Q-15. Uploads larger than one turn's budget
+
+Raised by review on 2026-09-29; resolved by D-30.
+
+### Q-16. Descriptor growth and layout compatibility
+
+Raised by review on 2026-09-29; resolved by D-31.
+
+### Q-17. Scope of the VMA parity claim
+
+Raised by review on 2026-09-29; resolved by D-32.
+
+## Verification strategy
+
+- Pure placement, legality and reuse decisions tested in Hspec without a GPU
+  (P-2), in the owning package's suites.
+- Native layers tested over the recording stand-in for retention, refusal
+  and disposal, as `native-tests` does today.
+- Native evidence in `test.vulkan-native` with synchronization validation:
+  offscreen readbacks checked against expected pixels by the tests, and
+  retained for the agent's report (D-6), within the 30-second required
+  native budget (V-10).
+- The allocator's comparisons with VMA retained with their slices: placement
+  in GRS-1 (D-14), native allocation in GRS-11 (D-32).
+- Linux CI runs the native group on its pinned software stack; a missing
+  feature is reported, never hidden (D-7).
+
+## Delivery plan
+
+Accepted by D-25, as amended by D-28, in dependency order; each slice is one issue and one
+pull request.
+
+### GRS-1. Place allocations with a pure block allocator proven against VMA
+
+- **Outcome:** a pure placement algorithm (D-13) decides block, offset,
+  growth and dedicated placement, and an optional probe shows it matches
+  VMA's virtual blocks on identical traces (D-14).
+- **Scope:** the pure allocator and its Hspec properties; trace generation
+  from Synarchy-derived and synthetic workloads; the optional VMA shim probe
+  with its pinned source and retained results.
+- **Phase:** memory.
+- **Depends on:** none.
+- **Ordering:** critical path; can land first.
+- **Relevant decisions:** D-4, D-13, D-14, D-32.
+- **Acceptance signals:** property tests for alignment, granularity,
+  non-overlap and coalescing; retained placement speed and waste
+  comparison with VMA's virtual blocks.
+- **Out of scope:** device memory, model accounting.
+- **Open questions:** none.
+
+### GRS-11. Back allocations with device-memory blocks beneath the model's accounting
+
+- **Outcome:** blocks and dedicated allocations are native device memory,
+  charged to the model's accounted bytes, freed when empty, and recovered
+  through VK-14.
+- **Scope:** memory-type selection, D-15's charging, growth under D-11's
+  configuration.
+- **Phase:** memory.
+- **Depends on:** GRS-1.
+- **Ordering:** critical path.
+- **Relevant decisions:** D-11, D-13, D-15, D-16, D-17, D-29, D-32.
+- **Acceptance signals:** backpressure and reclamation examples over the
+  stand-in, including empty-block trimming before backpressure; native
+  allocation and release with clean validation on both local platforms;
+  the retained native comparison with VMA's real allocator (D-32).
+- **Out of scope:** defragmentation, memory-budget extension.
+- **Open questions:** none.
+
+### GRS-2. Create managed buffers and images as retained model subjects
+
+- **Outcome:** buffers and images (sampled, depth, color target) are managed
+  handles with the model's five holds, named and disposed like pipelines.
+- **Scope:** creation, release, naming, disposal.
+- **Phase:** resources.
+- **Depends on:** GRS-11.
+- **Ordering:** critical path.
+- **Relevant decisions:** D-8.
+- **Acceptance signals:** stand-in retention and disposal examples; native
+  creation and destruction with clean validation.
+- **Out of scope:** recording through them.
+- **Open questions:** none.
+
+### GRS-3. Order access and layout for managed resources through checked operations
+
+- **Outcome:** the recorder orders and transitions managed resources and
+  refuses unordered access.
+- **Scope:** VKR-5.
+- **Phase:** access.
+- **Depends on:** GRS-2.
+- **Ordering:** critical path.
+- **Relevant decisions:** D-18, D-26.
+- **Acceptance signals:** pure legality tests, including refusal of a batch
+  that ends with a resource away from rest and of use before initialization
+  is submitted; two batches writing the same resource without a layout
+  change are ordered by boundary barriers; synchronization validation clean
+  on native transitions.
+- **Out of scope:** render graph, queue-family transfer, per-pass
+  declarations.
+- **Open questions:** none.
+
+### GRS-15. Start the device and owner progress without a window
+
+- **Outcome:** a graphics session selects and creates its device without a
+  surface, makes progress and retires with zero targets, and still admits
+  later surfaces checked against its queue family.
+- **Scope:** D-28's surface-free bootstrap in the roots and the GLFW-hosted
+  owner's zero-target progress and protected teardown.
+- **Phase:** submission.
+- **Depends on:** none.
+- **Ordering:** critical path; can land first.
+- **Relevant decisions:** D-6, D-28.
+- **Acceptance signals:** stand-in examples for surface-free selection,
+  zero-target progress and teardown, and a later surface refused when its
+  queue family cannot present; a native session creates the device and
+  retires with no window opened; clean validation.
+- **Out of scope:** a headless owner independent of GLFW; additional queues.
+- **Open questions:** none.
+
+### GRS-12. Admit, submit and complete frame-less batches
+
+- **Outcome:** the model admits batches that belong to no frame, against its
+  budgets, and the backend submits them with their own completion record
+  and polls that completion on the owner's schedule.
+- **Scope:** D-12's model extension and native submission path.
+- **Phase:** submission.
+- **Depends on:** GRS-3, GRS-15.
+- **Ordering:** critical path.
+- **Relevant decisions:** D-12, D-18, D-26, D-28.
+- **Acceptance signals:** pure admission, backpressure, discard and
+  completion examples in the model suite; native frame-less submission with
+  clean validation; device loss fabricates no completion.
+- **Out of scope:** additional queues.
+- **Open questions:** none.
+
+### GRS-5. Render into a managed offscreen color target and read it back
+
+- **Outcome:** a batch renders into an offscreen target and its bytes are
+  read back on completion evidence.
+- **Scope:** D-6.
+- **Phase:** evidence.
+- **Depends on:** GRS-12.
+- **Ordering:** critical path.
+- **Relevant decisions:** D-6, D-12, D-18, D-26, D-28.
+- **Acceptance signals:** readback matches expected pixels natively, in a
+  session that opens no window.
+- **Out of scope:** depth.
+- **Open questions:** none.
+
+### GRS-4. Record from vertex, index and instance buffers with push constants
+
+- **Outcome:** indexed and instanced draws from managed buffers with push
+  constants declared by pipeline layouts, and per-frame data rings.
+- **Scope:** P-4.
+- **Phase:** recording.
+- **Depends on:** GRS-3, GRS-5.
+- **Ordering:** critical path.
+- **Relevant decisions:** D-2, D-16, D-19.
+- **Acceptance signals:** transitive retention examples; native draw proven
+  by offscreen readback; a
+  deliberately mismatched push-constant or vertex layout fails the build.
+- **Out of scope:** descriptors.
+- **Open questions:** none.
+
+### GRS-6. Upload bytes through bounded engine-owned staging with completion
+
+- **Outcome:** bytes reach buffers and images through bounded staging with
+  completion reported and cancellation handled.
+- **Scope:** VKR-4's backend endpoint, D-9, D-11.
+- **Phase:** transfer.
+- **Depends on:** GRS-12.
+- **Ordering:** critical path.
+- **Relevant decisions:** D-9, D-11, D-16, D-20, D-21, D-26, D-30.
+- **Acceptance signals:** backpressure, cancellation and completion
+  examples; native RGBA8 and BC7 uploads with mip levels verified by
+  readback; unsupported BC reported, not assumed; an upload larger than one
+  turn's budget completes in chunks; an oversized upload is refused
+  permanently, distinct from backpressure.
+- **Out of scope:** decoding, loader concurrency, GPU mip generation.
+- **Open questions:** none.
+
+### GRS-7. Own the bindless texture table and its completion-safe slot reuse
+
+- **Outcome:** the device profile requires D-1's features; textures get
+  slot-plus-generation handles, placeholder slot 0, and slot reuse only on
+  completion evidence.
+- **Scope:** D-1, D-11.
+- **Phase:** binding.
+- **Depends on:** GRS-6.
+- **Ordering:** critical path.
+- **Relevant decisions:** D-1, D-7, D-11, D-20, D-22, D-23, D-27, D-31.
+- **Acceptance signals:** pure reuse and lookup-version tests; the D-27
+  case (record, replace or release, then submit the earlier batch) samples
+  the old image and delays slot reuse to its completion; native sampling
+  through handles from a fixed-size table; placeholder until upload
+  completion; `descriptorBindingUpdateUnusedWhilePending` verified or its
+  absence resolved; the Lavapipe outcome reported (D-7).
+- **Out of scope:** hot-reload swap, table growth.
+- **Open questions:** none.
+
+### GRS-14. Grow the texture table to its configured cap
+
+- **Outcome:** the table doubles up to D-11's application-configured cap by
+  building a larger set, copying existing entries and binding it in later
+  frames, with the old set retired on completion evidence.
+- **Scope:** D-22's growth rule.
+- **Phase:** binding.
+- **Depends on:** GRS-7.
+- **Ordering:** not on the critical path of the 2D fixture.
+- **Relevant decisions:** D-11, D-22, D-27, D-31.
+- **Acceptance signals:** growth under load with handles unchanged and
+  pipeline layouts still compatible; batches recorded before growth keep
+  their set and version; the old set disposed only after completion; a cap
+  beyond the device's limits rejected at configuration; growth past the cap refused as
+  backpressure; clean validation.
+- **Out of scope:** shrinking the table.
+- **Open questions:** none.
+
+### GRS-8. Draw textured quads from table slots in a 2D scaffolding fixture
+
+- **Outcome:** a fixture draws instanced textured quads from several slots
+  and proves them by offscreen readback.
+- **Scope:** D-2, D-3, D-6.
+- **Phase:** 2D proof.
+- **Depends on:** GRS-4, GRS-5, GRS-7.
+- **Ordering:** critical path.
+- **Relevant decisions:** D-2, D-3, D-6.
+- **Acceptance signals:** captured quads with correct textures, UV
+  rectangles and premultiplied blending.
+- **Out of scope:** `render-2d`.
+- **Open questions:** none.
+
+### GRS-9. Swap a texture slot's image under the same handle
+
+- **Outcome:** a handle's image is replaced; later frames sample the new one
+  and the old retires after the submissions that sampled it complete.
+- **Scope:** D-5.
+- **Phase:** binding.
+- **Depends on:** GRS-8.
+- **Ordering:** not on the critical path.
+- **Relevant decisions:** D-5, D-23, D-27.
+- **Acceptance signals:** readback before and after the swap; baked instance
+  data unchanged across it; retirement on completion evidence.
+- **Out of scope:** file watching.
+- **Open questions:** none.
+
+### GRS-10. Add depth attachments and a depth-tested 3D scaffolding fixture
+
+- **Outcome:** offscreen passes render with depth; a fixture proves
+  occlusion by readback.
+- **Scope:** D-2's 3D continuation.
+- **Phase:** 3D proof.
+- **Depends on:** GRS-4, GRS-5.
+- **Ordering:** critical path for the 3D arc.
+- **Relevant decisions:** D-2, D-6, D-24, D-26.
+- **Acceptance signals:** captured occlusion from two camera poses.
+- **Out of scope:** `render-3d`, camera contract, math package, windowed
+  depth.
+- **Open questions:** none.
+
+### GRS-13. Give each target generation a managed depth attachment
+
+- **Outcome:** windowed frames can render with depth images that follow
+  their swapchain generation through construction, resize, replacement and
+  surface recovery.
+- **Scope:** D-24's windowed half.
+- **Phase:** 3D proof.
+- **Depends on:** GRS-10.
+- **Ordering:** not on the critical path of the evidence; required before
+  `render-3d` renders to windows.
+- **Relevant decisions:** D-18, D-24, D-26.
+- **Acceptance signals:** depth-tested windowed draw; depth images replaced
+  with their generation on resize and recovery, disposed on completion;
+  clean validation.
+- **Out of scope:** multisampling, stencil.
+- **Open questions:** none.
+
+## Source notes
+
+Content-side texture decisions of 2026-09-29, preserved for the
+content-loading arc (D-3): any texture and sheet layout, with sheets as a
+texture plus an optional region table; a build script that stitches changed
+sheets; runtime custom textures on the same path; PNG plus KTX2/BC7 as the
+baseline; hot reload required; uploads through a bounded queue with decode
+on background workers, a per-frame byte budget and a per-handle state
+snapshot.
