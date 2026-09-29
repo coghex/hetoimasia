@@ -39,14 +39,14 @@ concrete precondition
 
 ## Status
 
-- [ ] TD-1. GPU-model state implementation concentrates several responsibilities
-- [ ] TD-2. Graphics-owner implementation mixes worker progress with client handover and exit
-- [ ] TD-3. Main-thread window host combines composition, scheduling, and protected shutdown
-- [ ] TD-4. Window implementation combines callback capture with native mode transitions
-- [ ] TD-5. Graphics-owner tests embed shared fixtures among many lifecycle scenarios
-- [ ] TD-6. Lua session model concentrates several aggregate transition protocols
-- [ ] TD-7. Validation planner mixes repository parsing, selection policy, and CLI integration
-- [ ] TD-8. Asynchronous logger embeds pure record preparation in its concurrent adapter
+- [x] TD-1. GPU-model state implementation concentrates several responsibilities — [#317]
+- [x] TD-2. Graphics-owner implementation mixes worker progress with client handover and exit — [#318]
+- [x] TD-3. Main-thread window host combines composition, scheduling, and protected shutdown — [#319]
+- [x] TD-4. Window implementation combines callback capture with native mode transitions — [#320]
+- [x] TD-5. Graphics-owner tests embed shared fixtures among many lifecycle scenarios — [#321]
+- [x] TD-6. Lua session model concentrates several aggregate transition protocols — [#323]
+- [x] TD-7. Validation planner mixes repository parsing, selection policy, and CLI integration — [#324]
+- [x] TD-8. Asynchronous logger embeds pure record preparation in its concurrent adapter — [#325]
 
 ## Maintaining this report
 
@@ -180,7 +180,7 @@ the resulting names and dependency edges explain the subsystem more clearly.
 
 ## GPU model structure
 
-### TD-1. GPU-model state implementation concentrates several responsibilities
+### [#317] TD-1. GPU-model state implementation concentrates several responsibilities
 
 `packages/gpu-vulkan/model/src/Hetoimasia/GPU/Model/Internal/State.hs` contains
 2,943 lines at the inspected revision. It defines the model's records and
@@ -316,7 +316,7 @@ merely assert the chosen file layout.
 
 ## GLFW implementation structure
 
-### TD-2. Graphics-owner implementation mixes worker progress with client handover and exit
+### [#318] TD-2. Graphics-owner implementation mixes worker progress with client handover and exit
 
 **Verified at:** `da81087`; source inspection only.
 
@@ -363,7 +363,7 @@ and opacity checks, plus the resulting validation plan. Recheck PR #241's
 comment corrections. Exact exports and the dependency graph need issue-time
 design; no runtime defect or performance improvement is claimed.
 
-### TD-3. Main-thread window host combines composition, scheduling, and protected shutdown
+### [#319] TD-3. Main-thread window host combines composition, scheduling, and protected shutdown
 
 **Verified at:** `da81087`; source inspection only.
 
@@ -406,7 +406,7 @@ headless host, scheduled, dynamic-window, protected, attachment, and opacity
 coverage and required validation groups. The detailed module graph remains
 unsettled. This is a maintainability concern, not evidence of faulty pacing.
 
-### TD-4. Window implementation combines callback capture with native mode transitions
+### [#320] TD-4. Window implementation combines callback capture with native mode transitions
 
 **Verified at:** `da81087`; source inspection only.
 
@@ -449,7 +449,7 @@ Exact internal interfaces require design; no native behavioral fault is claimed.
 
 ## GLFW test organization
 
-### TD-5. Graphics-owner tests embed shared fixtures among many lifecycle scenarios
+### [#321] TD-5. Graphics-owner tests embed shared fixtures among many lifecycle scenarios
 
 **Verified at:** `da81087`; source inspection only.
 
@@ -491,7 +491,7 @@ being folded into any later cleanup; this finding covers only Owner.
 
 ## Lua protocol organization
 
-### TD-6. Lua session model concentrates several aggregate transition protocols
+### [#323] TD-6. Lua session model concentrates several aggregate transition protocols
 
 **Verified at:** `da81087`; source inspection only.
 
@@ -536,7 +536,7 @@ exports need design; no accounting bug or performance gain is claimed.
 
 ## Validation tooling organization
 
-### TD-7. Validation planner mixes repository parsing, selection policy, and CLI integration
+### [#324] TD-7. Validation planner mixes repository parsing, selection policy, and CLI integration
 
 **Verified at:** `da81087`; source inspection only.
 
@@ -580,7 +580,7 @@ loophole. Import/bootstrap behavior makes it more involved than a cosmetic move.
 
 ## Runtime logging organization
 
-### TD-8. Asynchronous logger embeds pure record preparation in its concurrent adapter
+### [#325] TD-8. Asynchronous logger embeds pure record preparation in its concurrent adapter
 
 **Verified at:** `da81087`; source inspection only.
 

@@ -82,18 +82,20 @@ finding needs one; they do not block recording or processing this report.
 
 ## Status
 
-- [ ] RTC-1. Runtime performance evidence lacks a correlated engine timeline
+- [ ] RTC-1. Runtime performance evidence lacks a correlated engine timeline — [deferred]: tracing design Q-1–Q-3 undecided
 - [x] RTC-2. Protected shutdown can outlast the available terminal diagnostics — [#251]
-- [ ] RTC-3. Finite worker jobs lack a bounded workload-execution service
-- [ ] RTC-4. Content loading lacks asynchronous request ownership and memory budgets
-- [ ] RTC-5. Timing primitives lack a worked simulation/input/render composition
-- [ ] RTC-6. The input surface still lacks capabilities already identified by RR-9
+- [ ] RTC-3. Finite worker jobs lack a bounded workload-execution service — [deferred]: no named consumer yet
+- [ ] RTC-4. Content loading lacks asynchronous request ownership and memory budgets — [deferred]: no first content type or consumer chosen
+- [ ] RTC-5. Timing primitives lack a worked simulation/input/render composition — [deferred]: no interactive consumer planned
+- [ ] RTC-6. The input surface still lacks capabilities already identified by RR-9 — [deferred]: adopts RR-9's input epic
 
 ---
 
 ## Execution visibility and shutdown diagnostics
 
-### RTC-1. Runtime performance evidence lacks a correlated engine timeline
+### [deferred] RTC-1. Runtime performance evidence lacks a correlated engine timeline
+
+> **Deferred:** the tracing contract's backend, inspection and budget choices are unresolved and the owner limited RTC-1 to documentation-only discussion — clears when `docs/runtime_tracing_design.md` records owner decisions on Q-1–Q-3 and leaves the `exploring` state.
 
 The owner requested a documentation-only contract discussion on 2026-09-23.
 The [proposed tracing contract](runtime_tracing_design.md) records an opt-in
@@ -202,7 +204,9 @@ missing is useful observation while the protected wait continues.
 
 ## Background work and content ownership
 
-### RTC-3. Finite worker jobs lack a bounded workload-execution service
+### [deferred] RTC-3. Finite worker jobs lack a bounded workload-execution service
+
+> **Deferred:** no consumer yet needs bounded background-job admission, so work granularity, parallelism and saturation behaviour would be invented — clears when a filed issue or accepted design (for example RTC-4's content loading) names that first consumer and states its job granularity and concurrency need.
 
 **Verification: Verified capability gap; no workload-driven performance need
 or scheduler bottleneck has yet been established.**
@@ -242,7 +246,9 @@ expensive short work such as decoding or procedural generation.
   The consumer requirement is a proposed processing precondition, not an
   already-applied deferred disposition. This is outside the first effort.
 
-### RTC-4. Content loading lacks asynchronous request ownership and memory budgets
+### [deferred] RTC-4. Content loading lacks asynchronous request ownership and memory budgets
+
+> **Deferred:** no content type, consumer, storage root or budget has been chosen, and no loading or asset-manager design exists — clears when a filed issue or accepted design names the first content type to load and its consumer (for example the textures behind the 2026-09-29 bindless atlased-texture decision), which then settles whether RTC-3 is a prerequisite.
 
 **Verification: Verified capability gap in the reviewed package inventory;
 no production loading hitch or memory exhaustion was reproduced.**
@@ -287,7 +293,9 @@ work retained by a future loading pipeline.
 
 ## Application composition and input
 
-### RTC-5. Timing primitives lack a worked simulation/input/render composition
+### [deferred] RTC-5. Timing primitives lack a worked simulation/input/render composition
+
+> **Deferred:** #232 and #233 have closed without assigning input to catch-up steps (the triangle sample has no input and #139's worked composition covers steps and render demand only), and no interactive consumer is planned to fix that policy — clears when a filed issue or accepted design names the first consumer that combines input with fixed-step simulation.
 
 **Verification: Verified composition gap within the inspected baseline;
 simulation ownership is deliberately application-level.**
@@ -327,7 +335,9 @@ the simulation publishes its render snapshot.
   existing consumer coverage when processed, and whether this merits a
   separate issue or focused design. This is outside the first effort.
 
-### RTC-6. The input surface still lacks capabilities already identified by RR-9
+### [deferred] RTC-6. The input surface still lacks capabilities already identified by RR-9
+
+> **Deferred:** the input capabilities are owned by RR-9 in `docs/runtime_review_findings.md`, itself deferred until the input arc's design document exists and its EPIC entry is filed; a separate issue would create the parallel arc this finding rejects — clears when RR-9's input EPIC entry carries `[#N]`, which this entry then adopts.
 
 **Verification: Verified current capability gap, with an existing report
 follow-up rather than a newly discovered requirement.**

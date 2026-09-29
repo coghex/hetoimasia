@@ -36,7 +36,7 @@ concrete precondition
 - [x] WL-1. Provision pinned Wayland inputs and an isolated headless compositor — [#204]
 - [x] WL-2. Settle Wayland session selection and the capability contract — [#205]
 - [x] WL-3. Collect headless native Wayland evidence — [#207]
-- [ ] WL-4. Collect Wayland rendering evidence on the pinned software stack — [deferred]: VK-5 and VK-8 in #155 must merge first
+- [x] WL-4. Collect Wayland rendering evidence on the pinned software stack — [#327]
 
 ## Epic contract
 
@@ -614,14 +614,6 @@ example at the cost of compositor automation.
 - **Open questions:** None.
 
 ### WL-4. Collect Wayland rendering evidence on the pinned software stack
-
-> **Deferred:** the slice adds Wayland cases to VK-8's native fixtures through
-> VK-5's surface bridge. Both are filed under #155 as
-> [#220](https://github.com/coghex/hetoimasia/issues/220) (VK-8) and
-> [#216](https://github.com/coghex/hetoimasia/issues/216) (VK-5), and remain open
-> at the 2026-09-22 review. This deferral clears when
-> both have merged, so the fixture and bridge shapes this issue must name
-> exist. WL-3/#207 also remains an implementation prerequisite.
 
 - **Outcome:** Wayland surface creation, presentation and retirement are
   demonstrated on Lavapipe under the isolated compositor with the same
