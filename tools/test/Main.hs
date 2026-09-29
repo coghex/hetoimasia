@@ -11,9 +11,9 @@ import qualified ApprovalProvenance
 import qualified CiImage
 import qualified DismissalStep
 import qualified Execution
-import qualified FlakeLab
 import qualified Packaging
 import qualified PlanStep
+import qualified QuruntulAdapter
 import qualified Reuse
 import qualified ReviewGate
 import qualified ReviewReplay
@@ -78,7 +78,7 @@ main = hspec $ do
   Validation.spec
   PlanStep.spec
   Execution.spec
-  FlakeLab.spec
+  QuruntulAdapter.spec
   Reuse.spec
   Timings.spec
   TimingStep.spec

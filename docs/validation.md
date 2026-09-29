@@ -337,7 +337,7 @@ probes in `tools/x11-test/` and `tools/wayland-test/`. They use stub programs an
 need no desktop consent. Real readiness deadlines make them occasional local
 probes: changed inputs, policy changes, and unknown-input fallback never select
 them. They have no CI worker and must not appear in PR request blocks. An
-explicit local command or coordinated `$test`/`$autotest` selection runs them;
+explicit local command or coordinated `$test` selection runs them;
 a helper edit alone does not authorize execution. Commands and selection policy
 are in [test_classification.md](test_classification.md).
 
@@ -376,7 +376,7 @@ retained evidence of the run that promoted it is
 The local-only probes are `test.x11-helper`, `test.wayland-helper`,
 `test.lua-hazard`, `test.lua-confinement-linux`, and `test.macos-confinement`.
 Optional is a selection rule; it does not imply Python, a particular executor,
-or automatic eligibility for `$autotest`. See the
+or automatic eligibility for `$test`. See the
 [classification policy](test_classification.md) before adding a new group.
 
 ### The macOS confinement probe

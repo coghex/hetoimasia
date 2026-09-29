@@ -34,9 +34,11 @@ boundaries remain below as design history, not an unfiled work queue. Current
 behavior, including GLFW's later native/display worker and image caching, is in
 [validation.md](validation.md) rather than here, because this document records
 the design rather than the shipped system.
-**Reconciled 2026-09-23:** PR #242 delivered the [local test/flake lab](../tools/flake/README.md),
+**Reconciled 2026-09-23:** PR #242 delivered the local test/flake lab,
 including Codex `test`/`autotest` integration, shared selection, claims and durable
-local evidence. This does not complete CI-5's broader receipt/scheduler scope
+local evidence. It has since moved to the external
+[quruntul](https://github.com/coghex/quruntul) lab, which this repository
+describes through [`.quruntul/adapter.py`](../.quruntul/adapter.py). This does not complete CI-5's broader receipt/scheduler scope
 or make local lab results reusable CI receipts. The remaining scope stays
 deferred pending owner direction. The original D-6/P-5 proposal below records
 the initial design; the lab's own contract describes its delivered behavior.

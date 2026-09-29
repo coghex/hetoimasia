@@ -32,15 +32,6 @@ consumed ∷ [(FilePath, String)]
 consumed =
   [ ("tools/docs_land.sh", "Main.hs lands documentation through it")
   , ("tools/docs_land_paths.py", "docs_land.sh runs it as its selection gate")
-  , ("tools/flake/catalog.py", "FlakeLab.hs exercises the local lab and its helpers")
-  , ("tools/flake/checks.py", "FlakeLab.hs exercises the local lab and its helpers")
-  , ("tools/flake/common.py", "FlakeLab.hs exercises the local lab and its helpers")
-  , ("tools/flake/install_skills.py", "FlakeLab.hs exercises the local lab and its helpers")
-  , ("tools/flake/lab.py", "FlakeLab.hs exercises the local lab and its helpers")
-  , ("tools/flake/probe.py", "FlakeLab.hs exercises the local lab and its helpers")
-  , ("tools/flake/process.py", "FlakeLab.hs exercises the local lab and its helpers")
-  , ("tools/flake/state.py", "FlakeLab.hs exercises the local lab and its helpers")
-  , ("tools/flake/probes.json", "FlakeLab.hs exercises the local lab and its helpers")
   , ("tools/display/x11.sh", "the separate x11-helper-tests suite runs it")
   , ("tools/display/wayland.sh", "the separate wayland-helper-tests suite runs it")
   , ("tools/ci-image/provision.sh", "Packaging.hs reads the pins it sources")
@@ -89,7 +80,9 @@ consumed =
 -- from a distribution; where it can see them it holds them as usual.
 checkoutOnly ∷ [(FilePath, String)]
 checkoutOnly =
-  [ ("cabal.project", "VulkanProof.hs resolves the packages it names to keep the binding off the floor")
+  [ (".quruntul/adapter.py", "QuruntulAdapter.hs checks it through .quruntul/checks.py, against the checkout's Git history")
+  , (".quruntul/checks.py", "QuruntulAdapter.hs runs it; it reads the checkout's Git history")
+  , ("cabal.project", "VulkanProof.hs resolves the packages it names to keep the binding off the floor")
   , ("cabal.project.cpu", "VulkanProof.hs resolves the packages it names to keep the binding off the floor")
   , ( "packages/gpu-vulkan/native/hetoimasia-gpu-vulkan-native.cabal"
     , "VulkanProof.hs reads the native package's dependencies beside the ordinary projects, as a sibling package"

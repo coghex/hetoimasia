@@ -4,7 +4,7 @@ Owner policy, 2026-09-22: routine validation should exercise quick, important
 contracts. Long real-time waits, unusual display-server behavior, deliberate
 nontermination, and platform feasibility experiments belong in optional local
 probes. A relevant source change alone does not request those probes. A direct
-request or an explicitly invoked coordinated `$test`/`$autotest` run can select
+request or an explicitly invoked coordinated `$test` run (`$test N` for several) can select
 one. Keep fast regressions for serious failure paths: cancellation, cleanup,
 ownership, and resource safety remain important even when failures are rare.
 
@@ -115,24 +115,37 @@ Other existing apparatus is already outside routine automation:
 
 ## Coordinated local selection
 
-The Codex `$test` and `$autotest` routes installed by
-`tools/flake/install_skills.py` select optional probes through the repository's
-[local lab](../tools/flake/README.md). Its `$flake` route uses that coordinator and can
-also repeatedly investigate CI-covered Hspec examples. Ordinary CI regressions
-remain where they are; the stress measurement is optional. The coordinator owns
-claims, deferrals, source/build provenance, all attempts, and new-probe proposals.
-It records results locally and produces a readable `coordinator.md` under the
-common Git directory's `flake-lab/`. No daemon or CI receipt import is involved.
-Other agents may use the same CLI to participate. Their legacy generic
-`codex-test` registries receive no lab claims or results; route their Hetoimasia
-probes through this CLI before relying on shared exclusion or freshness.
+Local test and flake work runs through the external
+[quruntul](https://github.com/coghex/quruntul) lab. This repository describes
+itself to it in [`.quruntul/adapter.py`](../.quruntul/adapter.py), which derives
+every suite from `tools/validation/catalog.json`: each Hspec test component a
+group runs is one suite, a probe when its group is optional, `category: probe`
+and routed to no CI worker, and a CI suite otherwise. A group that narrows a
+shared executable with `--match` is its own suite — `test.glfw-wayland` becomes
+`glfw-native-tests:glfw-wayland`, run with its selector under
+`tools/display/wayland.sh` as CI runs it, Linux only — and the executable's
+unnarrowed suite skips those examples, so each example is measured in exactly
+one profile. The adapter builds each suite the way its group does, and launches
+`vulkan-native-tests` through `tools/vulkan/run.sh native` as `test.vulkan-native`
+does, so the runner's source-digest and revision provenance reach the suite. The `workflow-tests` examples under
+`Quruntul adapter` check that it still agrees with the catalog.
 
-A skill invocation selects one eligible workload. If useful existing work is
-exhausted, the skill records and presents one missing-probe proposal for approval.
-No-candidate because of platform constraints, deferrals or active ownership is
-not permission to duplicate work or invent a coverage gap. Native desktop runs
-still require fresh human consent. See the lab's README for exact commands and
-state ownership; it is the authority for this repository's skill integration.
+- **`$test`** runs one due probe: never run, changed since it last ran, or last
+  observed more than a week ago. It never runs a CI suite. `$test N` runs N in
+  sequence (this replaces `$autotest`). Each run leaves a report whose
+  observations `$assess-tests` verifies and turns into issues on approval. When
+  nothing is due, the skill proposes one missing probe for approval rather than
+  inventing work.
+- **`$flake`** measures every test, CI suites included, **once**: a new
+  example runs in a batch of fresh-seeded trials and becomes `stable` or
+  `flaky`. A stable test is not re-measured unless the owner marks it flaky after
+  a real failure. `$deflake` fixes flaky tests through ordinary pull requests
+  carrying before/after batches.
+
+quruntul's ledger, claims, run evidence and readable `ledger.md` live under the
+common Git directory's `quruntul/`. It is local evidence, never a CI receipt.
+Native desktop suites follow AGENTS.md's desktop rules; the owner's 2026-09-29
+decision lets a `$flake` batch run them, one window-opening batch at a time.
 
 ## Remaining harness improvement
 
