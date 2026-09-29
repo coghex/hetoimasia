@@ -38,6 +38,8 @@ config/*.local.yaml
 /dist-vulkan/
 # The retired proof harness's build directory, which existing checkouts may hold.
 /dist-vulkan-proof/
-# The shader toolchain fingerprint `hetoimasia-shader-fingerprint` generates
-# before every shader build; it names this machine's native prefix.
+# The shader toolchain fingerprints `hetoimasia-shader-fingerprint` generates
+# before every shader build, one per package that splices shaders; each names
+# this machine's native prefix.
 /packages/gpu-vulkan/native/shaders/toolchain.fingerprint
+/samples/triangle/renderer/shaders/toolchain.fingerprint

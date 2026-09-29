@@ -1741,6 +1741,23 @@ the host's package and the shaders it embeds.
   destroyed — a destruction that raised, or holds that never ended — is
   retained with its parents, and the terminal report says so.
 
+The triangle sample ([`samples/triangle`](../samples/triangle/README.md),
+VK-17) is the consumer example. Its drawing, `drawTriangle`, is written against
+the native recording vocabulary alone and takes the two constructions it needs
+as values; the sample's executable, and the native suite's required profile,
+hand it to the host in one line:
+
+```haskell
+triangleRenderer ∷ Triangle → VulkanRenderer scene
+triangleRenderer triangle = VulkanRenderer $ \_ request construction recorder →
+  drawTriangle triangle
+    (Builders (constructPipelineLayout construction) (constructPipeline construction))
+    (requestFormat request) (requestExtent request) recorder
+```
+
+It builds a layout and a pipeline the first time it meets a format, keeps them
+across frames, and leaves both to the session's teardown.
+
 ### Verification capture
 
 The verification strategy's capture — the pixels of a real, presented frame —
@@ -2746,7 +2763,7 @@ companions — and adds the Vulkan owner's:
 | Main thread | Hspec runs on a thread of its own; the process main thread owns one shared production graphics session: `withLoaderIntegration`, then `runGraphicsOwnerApplication` over `withVulkanOwnerHost`, with the production native layer and surface bridge. An example that needs the main thread — to hand a window's surface over, which GLFW creates there, or to close a window — submits an operation (`onMain`); the main thread runs it between two turns of the host's owner loop and returns its result or rethrows its failure. Windows are created through the host's command port from the example's own thread, which the owner loop executes, as an application's worker would. |
 | Identities | Every dispatched operation is checked, before it runs, to be on the bound process main thread that entered the session — the Haskell thread, the bound flag, and the OS thread read through `pthread_self` — and a failed check fails the operation and the run. Every native call the session makes is recorded where it runs by a `NativeObserver`, so an example shows from the calls themselves that the instance, its messenger, the device and every surface's destruction ran on the graphics owner's thread and every surface's creation on the main thread — never from the name of an Hspec hook. |
 | Sharing | The roots — the instance, its explicit messenger, and the one device — are acquired lazily, by the first dispatched operation, at most once, and shared by every later example. Each example's windows and targets are its own and are closed inside it. |
-| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, `vk12-frames`, `vk13-presentation`, `vk14-recovery`, `vk15-validation-stop`, `vk15-retention`, `vk16-composed`, `vk19-capture`, `synchronization-hazard`, and `debug-names`. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. |
+| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, `vk12-frames`, `vk13-presentation`, `vk14-recovery`, `vk15-validation-stop`, `vk15-retention`, `vk16-composed`, `vk17-one-slot`, `vk17-two-slots`, `vk19-capture`, `synchronization-hazard`, and `debug-names`. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. |
 | Selection | Building, listing and filtering the tree, a `--dry-run`, and a selection that dispatches nothing acquire nothing and start no child. A selection matching no example fails. `--complete`, which the catalog group passes, runs the whole tree with Hspec's configuration reading left out and then fails unless the shared session was acquired once and every private scenario ran and passed, so no ambient setting can turn the group's receipt into a pass for a subset. The consent rules and the migrated proof's pure release, construction, publication and loader-selection examples need no session and run without consent. |
 | Consent | Read once, at startup, from `HETOIMASIA_NATIVE_SESSION`, with the GLFW suite's rules for `desktop` and `isolated-x11:<display>`; this suite has no Wayland session. Without it every native example is refused before its body, the session is never acquired, and the run ends with the refusal on stderr and a non-zero exit. |
 | Environment | Before any Vulkan call, the suite clears every ambient discovery override and every validation-layer setting it finds and records which, disables implicit layers, and points the layer's settings file at an empty one; a child inherits and re-establishes the same environment. |
@@ -2928,6 +2945,30 @@ presentation was made after the device's destruction began, and both surfaces,
 the device, the messenger and the instance were destroyed in that order; and
 if the verdict after the last teardown callback has no issue and no error was
 reported.
+
+VK-17's required profile, `vk17-one-slot` and `vk17-two-slots`, runs the
+triangle sample's own drawing (`hetoimasia-sample-triangle`, which the suite
+depends on, so the sample is among the group's inputs) through the production
+host with verification capture on, over two mapped windows that request no
+focus, driven by `runVulkanOwnerLoop` — once with a frame budget of one slot
+and once with two, each in a child of its own. Each window's frame is
+captured; the first window is resized through its command port and, once its
+target's active generation is the one built at the new extent, captured again;
+the first-created window is closed and, once its target has retired, the
+second is captured again. It passes only if the model ran with the budget it
+was given; if every captured frame has the sample's clear, sRGB-encoded, at a
+point near its top-left corner and the sample's triangle at the triangle's
+centroid, each channel within 6 — never a whole-image hash; if the resized
+window's capture has its new generation's extent and not the old one; if the
+first window's target retired before the second's last capture was asked
+for; if each captured frame is one the case saw acquired, submitted,
+presented and retired on its own present fence; if every generation was an
+unclipped transfer source; if every Vulkan call ran on the graphics owner's
+thread and every surface was created on the main thread; and if the verdict
+after the last teardown callback has no issue and no error was reported. Both
+children run inside the group's one thirty-second watchdog, with the rest of
+the suite. The milestone they complete is recorded in
+[the Vulkan milestone verdict](vulkan_milestone_verdict.md).
 
 VK-19's case, `vk19-capture`, runs the production composition with
 verification capture on — `withVulkanOwnerHostAs CaptureOn`, the private

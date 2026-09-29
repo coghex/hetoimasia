@@ -178,23 +178,32 @@ glfwPackage = "packages/glfw"
 interopFlag ∷ String
 interopFlag = "vulkan-interop"
 
+-- | The triangle sample's two packages (VK-17): its drawing, which the
+-- integration's native suite depends on, and its executable. Like the native
+-- and integration packages, only the Vulkan project names them.
+samplePackages ∷ [String]
+samplePackages = ["samples/triangle/renderer", "samples/triangle/app"]
+
 -- | Everything the Vulkan project names: the native package, the window
--- integration package, the GLFW package whose interop component it enables,
--- the local dependency closure of the native package and that component, and
--- the test-only support library the native package's shader suite uses. All but
--- the first two are ordinary packages the other projects list too, and with the
--- interop flag off none of them depends on the binding.
+-- integration package, the triangle sample's two packages, the GLFW package
+-- whose interop component it enables, the local dependency closure of the
+-- native package and that component, and the test-only support library the
+-- native package's shader suite uses. All but the first four are ordinary
+-- packages the other projects list too, and with the interop flag off none of
+-- them depends on the binding.
 vulkanProject ∷ [String]
 vulkanProject =
   [ nativePackage
   , integrationPackage
-  , glfwPackage
-  , "packages/gpu-vulkan/diagnostics"
-  , "packages/gpu-vulkan/model"
-  , "packages/runtime"
-  , "packages/foundation"
-  , "tools/test-support"
   ]
+    <> samplePackages
+    <> [ glfwPackage
+       , "packages/gpu-vulkan/diagnostics"
+       , "packages/gpu-vulkan/model"
+       , "packages/runtime"
+       , "packages/foundation"
+       , "tools/test-support"
+       ]
 
 -- | The Hackage package that is the Vulkan binding. Nothing the mandatory floor
 -- builds may depend on it, whatever the image happens to carry.
@@ -370,8 +379,11 @@ spec = describe "The Vulkan project boundary" $ do
         suite `shouldContain` "completeFlag = \"--complete\""
         suite `shouldContain` "evalSpec defaultConfig {configFailOnEmpty = True} examples"
         suite `shouldContain` "completenessProblems report children"
+    -- The triangle sample's executable is compiled beside it, so a sample that
+    -- no longer builds against the host fails the group rather than waiting
+    -- for someone to launch it; nothing runs it.
     (group >>= field "preparation" >>= stringsAt "command")
-      `shouldBe` Just ["bash", runner, "build", "hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests"]
+      `shouldBe` Just ["bash", runner, "build", "hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests", "hetoimasia-sample-triangle-app:exe:hetoimasia-triangle"]
     -- The execution builds nothing: the runner's native mode names an
     -- executable Cabal already built and refuses one that was not.
     script ← map trim . lines <$> readFile runner
@@ -437,7 +449,7 @@ spec = describe "The Vulkan project boundary" $ do
           \distribution; this independence check runs from a checkout, which is where the mandatory floor runs it"
       else forM_ ordinaryProjects $ \path → do
         declared ← projectPackages path
-        (path, filter (\entry → any (`isPrefixOf` entry) [retiredProof, nativePackage, integrationPackage]) declared)
+        (path, filter (\entry → any (`isPrefixOf` entry) ([retiredProof, nativePackage, integrationPackage] <> samplePackages)) declared)
           `shouldBe` (path, [])
         -- The diagnostics package is the header-free half: it is in both, and
         -- the dependency check below is what holds it free of the binding.
