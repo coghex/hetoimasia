@@ -197,6 +197,9 @@ are opt-in. Each platform supplies its own evidence. Desktop-disrupting native
 sessions an issue or pull request needs run under the owner's **standing
 approval** (owner decision 2026-09-26), always through an explicit per-command
 opt-in so nothing else opens windows; periodic testing still asks first.
+Owner decision 2026-09-29: a quruntul `$flake` batch of never-measured tests is
+covered too, one window-opening batch at a time, because every test is measured
+once and a stable test is not re-run.
 Isolated scripted displays are a separate approved path.
 Pure/model tests do not establish visual results, performance or confinement.
 See [validation](validation.md) and [test architecture](test_architecture_design.md).

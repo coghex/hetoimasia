@@ -148,13 +148,17 @@ These instructions are also the authority for Claude sessions through CLAUDE.md.
   deliberate nontermination, and platform feasibility experiments are optional
   local probes; even affected inputs do not select them. Preserve fast critical
   failure-path coverage. See [test_classification.md](docs/test_classification.md)
-  for all tiers and the `$test`/`$autotest` probe inventory. Do not use
+  for all tiers and the `$test` probe inventory. Do not use
   `cabal test all` as a routine check: Cabal does not honor catalog optionality.
-- The installed Codex `$test` and `$flake` routes share the local
-  [flake lab](tools/flake/README.md); other agents can use its CLI to participate.
-  Test mode selects optional probes; flake mode also measures Hspec examples.
-  Use its coordinator for selection, claims, results and proposals; do not
-  rerun until green or hand-edit its SQLite history. Lab measurements are optional.
+- Local test and flake work runs through the external
+  [quruntul](https://github.com/coghex/quruntul) lab and its Codex skills
+  (`$flake`, `$deflake`, `$test`, `$assess-tests`, `$profile`, `$performance`),
+  which read this repository's [adapter](.quruntul/adapter.py). The adapter
+  derives every suite from the validation catalog; keep it in step (its
+  `workflow-tests` examples check that). `$test` runs optional probes only;
+  `$flake` measures every test once. Use quruntul's command for selection,
+  claims and results; never rerun until green or hand-edit its ledger. Lab
+  measurements are optional and never CI receipts.
 - Every validation group is declared once in `tools/validation/catalog.json`.
   Ask `python3 tools/validation/plan.py --base origin/master --head HEAD` which
   groups a change requires and why; see [validation.md](docs/validation.md) for
@@ -214,8 +218,11 @@ These instructions are also the authority for Claude sessions through CLAUDE.md.
   appear is fine; never wait for a reply. The variable stays an operational
   guard, so a command that did not ask for a desktop never opens windows: never
   set it in a profile, a persistent environment, or a script that runs on its
-  own. Periodic testing and flake-lab rotations are not covered and use the
-  desktop only when the owner asks for that run. The owner can withdraw this
+  own. Owner decision 2026-09-29: a quruntul `$flake` batch of never-measured
+  tests may run these suites under the same approval, one window-opening batch
+  at a time, with the consent on the batch's own commands. Other periodic
+  testing and profiling are not covered and use the desktop only when the owner
+  asks for that run. The owner can withdraw this
   approval; per-session asking then applies again. On Linux,
   `bash tools/display/x11.sh -- <command>` runs the suite on an isolated X11
   display, supplies its own consent for that display alone, and needs no
