@@ -97,6 +97,8 @@ spec = describe "Vulkan consumer rendering and capture" $ do
     it "delivers nothing for a captured frame the renderer refused, naming why, and destroys its readback buffer" (bounded testCaptureSkipped)
     it "admits a surface offering no transfer-source usage, presents its frame, and refuses its capture with a typed reason" (bounded testCaptureUnsupported)
     it "settles a capture outstanding when its target retires, without bytes" (bounded testCaptureRetired)
+    it "refuses a capture once its target's retirement has begun, while that retirement is still owed, and settles the one it already had" (bounded testCaptureWhileRetiring)
+    it "keeps every admitted outcome until it is taken, refusing further requests at the limit as backpressure" (bounded testCaptureBacklog)
     it "settles a presented capture without bytes when the session fails before its completion, naming the primary, and never delivers it" (bounded testCaptureTerminal)
 
 -- ---------------------------------------------------------------------------
@@ -586,6 +588,74 @@ testCaptureRetired = do
     pending = \case
       FramePending {} → True
       _ → False
+
+testCaptureWhileRetiring ∷ IO ()
+testCaptureWhileRetiring = do
+  rig ← capturingRigOf 1
+  offerUsage rig (imageUsageColorAttachment + imageUsageTransferSource)
+  -- The first frame's presentation stays owed, so the target's retirement,
+  -- once begun, cannot finish until the example lets it.
+  presentationsRetire rig False
+  (first, whileOwed, surfaceThen, afterwards, settled) ← runRig rig $ \host control → do
+    [window] ← windowsOf host
+    service ← firstFrame rig host control window
+    let controller = vulkanController host
+        attachment = graphicsAttachment service
+    -- A request its target can never serve a frame for stays outstanding.
+    swapchain : _ ← (\events → [handle | SwapchainCreated handle _ _ ← events]) <$> journal rig
+    stallSwapchain rig swapchain
+    first ← atomically (requestVulkanCapture controller attachment)
+    CloseStarted ← closeHostWindow (vulkanWindowHost host) window
+    refused ← newTVarIO Nothing
+    composedUntil rig host control "a refusal while the retirement is owed" (\_ → pure ()) $ do
+      answer ← atomically (requestVulkanCapture controller attachment)
+      case answer of
+        Left CaptureTargetRetiring → do
+          surface ← elem (SurfaceDestroyed 100) <$> journal rig
+          True <$ atomically (writeTVar refused (Just (answer, surface)))
+        _ → pure False
+    Just (whileOwed, surfaceThen) ← readTVarIO refused
+    presentationsRetire rig True
+    composedUntil rig host control "the window's release" (\_ → pure ()) (elem (WindowGone False) <$> journal rig)
+    afterwards ← atomically (requestVulkanCapture controller attachment)
+    settled ← either (const (pure Nothing)) (atomically . takeVulkanCapture controller) first
+    pure (first, whileOwed, surfaceThen, afterwards, settled)
+  first `shouldSatisfy` either (const False) (const True)
+  whileOwed `shouldBe` Left CaptureTargetRetiring
+  -- Refused while the target and its surface still stood.
+  surfaceThen `shouldBe` False
+  afterwards `shouldBe` Left CaptureNoTarget
+  settled `shouldSatisfy` \case
+    Just (CaptureWithheld _ WithheldTargetRetired) → True
+    _ → False
+
+testCaptureBacklog ∷ IO ()
+testCaptureBacklog = do
+  -- Its surface offers no transfer-source usage, so every request settles, as
+  -- withheld, with its frame.
+  rig ← capturingRigOf 1
+  (tickets, full, outcomes, again) ← runRig rig $ \host control → do
+    [window] ← windowsOf host
+    service ← firstFrame rig host control window
+    let controller = vulkanController host
+        attachment = graphicsAttachment service
+    admitted ← newTVarIO []
+    refusal ← newTVarIO Nothing
+    composedUntil rig host control "the backlog's limit" (\_ → pure ()) $
+      atomically (requestVulkanCapture controller attachment) >>= \case
+        Right ticket → False <$ atomically (modifyTVar' admitted (<> [ticket]))
+        Left (CaptureOutstanding _) → pure False
+        Left other → True <$ atomically (writeTVar refusal (Just other))
+    tickets ← readTVarIO admitted
+    Just full ← readTVarIO refusal
+    outcomes ← mapM (atomically . takeVulkanCapture controller) tickets
+    again ← atomically (requestVulkanCapture controller attachment)
+    pure (tickets, full, outcomes, again)
+  length tickets `shouldBe` capturesRetained
+  full `shouldBe` CaptureBacklogFull capturesRetained
+  -- Every admitted ticket still had its outcome to take.
+  outcomes `shouldSatisfy` all (\case Just (CaptureWithheld _ (WithheldUnsupported _)) → True; _ → False)
+  again `shouldSatisfy` either (const False) (const True)
 
 testCaptureTerminal ∷ IO ()
 testCaptureTerminal = do

@@ -278,6 +278,8 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Capture
   , Withheld (..)
   , capturesRequested
   , capturesRetained
+  , closeCaptures
+  , forgetClosed
   , newCaptures
   , requestCapture
   , takeCapture
@@ -801,6 +803,10 @@ prepareRetirement state retiring =
   atomically (Map.lookup (retiringTarget retiring) <$> readTVar (stateTargets state)) >>= \case
     Nothing → pure RetirementReady
     Just target → do
+      -- No capture is admitted for a retiring target: its retirement settles
+      -- the ones it has, and a later one would have no frame and no
+      -- settlement.
+      atomically (closeCaptures (stateCaptures state) (retiringTarget retiring))
       now ← readInstant (stateClock state)
       maybe RetirementReady RetirementOwed <$> prepareTargetRetirement (stateRendering state) now target
 
@@ -1162,6 +1168,7 @@ retireTarget state retiring = do
       -- Raises, and keeps them, the surface and this mapping, if any could not
       -- be destroyed.
       now ← readInstant (stateClock state)
+      atomically (closeCaptures (stateCaptures state) attachment)
       -- Its frames' synchronization and its frame storages go before its
       -- generations, whose holds its presentations were: preparation waited
       -- for every one of them to end.
@@ -1170,7 +1177,9 @@ retireTarget state retiring = do
       -- Raises, and keeps the record and this mapping, if the destruction was
       -- uncertain: the owner then never offers this again.
       retireRootTarget (stateRoots state) target
-      atomically (modifyTVar' (stateTargets state) (Map.delete attachment))
+      atomically $ do
+        modifyTVar' (stateTargets state) (Map.delete attachment)
+        forgetClosed (stateCaptures state) attachment
       pure ("destroyed the surface of " <> tshow target)
     Nothing → pure "the roots held no target for it"
   -- A deposit the owner never took, a replacement it never settled, and any
@@ -1521,8 +1530,10 @@ readVulkanUnavailability (VulkanController state) attachment = Map.lookup attach
 -- attachment's target (VK-19), from any thread. Admitted, it wakes the owner,
 -- which asks the target for a frame; the answer is a ticket to read its
 -- outcome with 'takeVulkanCapture'. Refused when the host was not built for
--- capture, when the owner holds no target for the attachment, when the
--- attachment already has one outstanding, and once the session has failed.
+-- capture, when the owner holds no target for the attachment or its target
+-- has begun retiring, when the attachment already has one outstanding, when
+-- 'capturesRetained' requests are outstanding or settled and untaken, and once
+-- the session has failed.
 requestVulkanCapture ∷ VulkanController → AttachmentId → STM (Either CaptureRefusal CaptureTicket)
 requestVulkanCapture (VulkanController state) attachment = do
   targeted ← Map.member attachment <$> readTVar (stateTargets state)
@@ -1531,7 +1542,7 @@ requestVulkanCapture (VulkanController state) attachment = do
 
 -- | What a capture request became, once it has settled: the frame's bytes
 -- and identities, or why it was settled without them. Each outcome is read
--- at most once; the most recent 'capturesRetained' are kept until they are.
+-- once, and kept until it is.
 takeVulkanCapture ∷ VulkanController → CaptureTicket → STM (Maybe CaptureOutcome)
 takeVulkanCapture (VulkanController state) = takeCapture (stateCaptures state)
 

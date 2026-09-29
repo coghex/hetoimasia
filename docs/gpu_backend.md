@@ -1752,8 +1752,12 @@ compatibility never depends on capture. It refuses every request
 - **Request.** `requestVulkanCapture` admits, from any thread, a request for
   the next frame of an attachment's target and answers a `CaptureTicket`. It
   is refused — `CaptureRefusal` — when the host does not capture, when the
-  owner holds no target for the attachment, when the attachment already has a
-  request outstanding, and once the session has failed. Admission wakes the
+  owner holds no target for the attachment, when that target has begun
+  retiring (`CaptureTargetRetiring`: its retirement closes admission before it
+  settles the requests it has, so none is admitted after that settlement),
+  when the attachment already has a request outstanding, when 64 requests are
+  outstanding or settled and not yet taken (`CaptureBacklogFull`, which is
+  backpressure), and once the session has failed. Admission wakes the
   owner, and its next step asks that target for a frame as render demand
   would, so a verifier need publish nothing else. At most one request per
   attachment is outstanding, and each capture's readback buffer is admitted
@@ -1781,8 +1785,9 @@ compatibility never depends on capture. It refuses every request
   readback memory cannot change; the extent and format; and the frame's
   identities — target and attachment, generation, frame slot, image,
   presentation — and scene revision, kept apart from any later reuse of the
-  slot or the generation. `takeVulkanCapture` answers a settled request once;
-  the most recent 64 are kept until they are taken. The readback buffer is
+  slot or the generation. `takeVulkanCapture` answers a settled request once,
+  and keeps it until it is taken: since admission is what is bounded, no
+  admitted request's outcome is ever dropped. The readback buffer is
   released at settlement and destroyed on the owner's thread once its batch no
   longer holds it.
 - **Ending.** A request still outstanding when its target retires is settled
@@ -2282,6 +2287,12 @@ the device; a captured frame the renderer refused settled
 surface offering no transfer-source usage admitted, its frame presented and its
 capture settled `WithheldUnsupported` with no buffer made; a capture whose frame
 could never be acquired settled `WithheldTargetRetired` when its window closed;
+a request refused `CaptureTargetRetiring` once its target's retirement had
+begun, while that retirement was still owed and its surface stood, with the
+request it already had settled `WithheldTargetRetired` and a later one refused
+`CaptureNoTarget`; sixty-four requests admitted and settled without being
+taken, the sixty-fifth refused `CaptureBacklogFull`, every one of the
+sixty-four still there to take, and a request admitted again once they were;
 and a presented capture whose batch completed only after a validation error
 ended the owner's run settled `WithheldSessionEnded` with that primary, and
 taken once.

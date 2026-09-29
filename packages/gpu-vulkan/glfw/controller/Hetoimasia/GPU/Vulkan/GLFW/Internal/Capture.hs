@@ -9,8 +9,9 @@
 -- = A request's way through
 --
 -- 1. A request is admitted from any thread ('requestCapture') for an
---    attachment that has no request outstanding, and answered with a ticket.
---    It wakes the owner.
+--    attachment that has no request outstanding and whose target has not begun
+--    retiring, while fewer than 'capturesRetained' requests are outstanding or
+--    settled and untaken, and answered with a ticket. It wakes the owner.
 -- 2. The owner's next step asks the attachment's target for a frame, as
 --    render demand would ('takeRequested').
 -- 3. The next frame the owner acquires for that target is the one the request
@@ -27,8 +28,12 @@
 --    Retiring the target, or the session's end, settles a request still
 --    outstanding without bytes.
 --
--- A settled request is read once ('takeCapture'); the most recent
--- 'capturesRetained' of them are kept until then.
+-- A settled request is read once ('takeCapture'), and kept until it is: every
+-- admitted ticket has an outcome to read. Admission is what is bounded — a
+-- request beyond 'capturesRetained' outstanding or untaken ones is refused
+-- ('CaptureBacklogFull') — so nothing admitted is ever dropped. A target's
+-- retirement closes its admission ('closeCaptures') before it settles the
+-- target's requests, so none is admitted after that settlement.
 --
 -- = State
 --
@@ -39,8 +44,12 @@
 -- | requests, one per   | module    | thread; advanced and settled by the  | the owner |                              | the owner, or by the host's  |
 -- | attachment          |           | owner's rendering                    |           |                              | exit sweep                   |
 -- +---------------------+-----------+--------------------------------------+-----------+------------------------------+------------------------------+
--- | Settled outcomes    | This      | Written when a request settles; taken| Any       | Settlement until taken       | Taken once; the oldest go    |
--- |                     | module    | by 'takeCapture'                     |           |                              | past 'capturesRetained'      |
+-- | Settled outcomes    | This      | Written when a request settles; taken| Any       | Settlement until taken       | Taken once, and only then    |
+-- |                     | module    | by 'takeCapture'                     |           |                              | removed                      |
+-- +---------------------+-----------+--------------------------------------+-----------+------------------------------+------------------------------+
+-- | Closed attachments  | This      | Closed by the owner's retirement of  | Owner,    | A target's retirement until  | Forgotten with the target    |
+-- |                     | module    | a target; read by 'requestCapture'   | read from | the owner forgets the target | ('forgetClosed')             |
+-- |                     |           |                                      | any       |                              |                              |
 -- +---------------------+-----------+--------------------------------------+-----------+------------------------------+------------------------------+
 --
 -- A readback buffer a request holds is the owner's rendering's
@@ -76,12 +85,16 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Capture
   , presentCapture
   , settleCapture
   , withholdAll
+  , closeCaptures
+  , forgetClosed
   ) where
 
 import Control.Concurrent.STM (STM, TVar, modifyTVar', newTVarIO, readTVar, stateTVar, writeTVar)
 import Data.ByteString (ByteString)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
+import Data.Set (Set)
+import qualified Data.Set as Set
 import Data.Text (Text)
 import Data.Word (Word32)
 import Numeric.Natural (Natural)
@@ -114,6 +127,13 @@ data CaptureRefusal
     -- ^ The owner holds no target for the attachment.
   | CaptureOutstanding !CaptureTicket
     -- ^ The attachment already has this request outstanding.
+  | CaptureTargetRetiring
+    -- ^ The attachment's target has begun retiring: no request is admitted
+    -- for it after its retirement settled those it had.
+  | CaptureBacklogFull !Int
+    -- ^ This many requests are outstanding or settled and not yet taken, the
+    -- most the host keeps: take an outcome first. It is backpressure, and
+    -- drops nothing already admitted.
   | CaptureSessionFailed !TerminalCause
     -- ^ The graphics session has failed, with this primary failure.
   deriving (Eq, Show)
@@ -160,8 +180,7 @@ data CaptureOutcome
   | CaptureWithheld !AttachmentId !Withheld
   deriving (Eq, Show)
 
--- | How many settled outcomes are kept until they are taken, the oldest
--- dropped first.
+-- | How many requests may be outstanding or settled and untaken at once.
 capturesRetained ∷ Int
 capturesRetained = 64
 
@@ -193,23 +212,30 @@ data Captures = Captures
   , capturesNext ∷ !(TVar Natural)
   , capturesOutstanding ∷ !(TVar (Map AttachmentId Outstanding))
   , capturesSettled ∷ !(TVar (Map CaptureTicket CaptureOutcome))
+  , capturesClosed ∷ !(TVar (Set AttachmentId))
   }
 
 newCaptures ∷ CaptureMode → IO Captures
-newCaptures mode = Captures mode <$> newTVarIO 0 <*> newTVarIO Map.empty <*> newTVarIO Map.empty
+newCaptures mode = Captures mode <$> newTVarIO 0 <*> newTVarIO Map.empty <*> newTVarIO Map.empty <*> newTVarIO Set.empty
 
 -- | Admit a request for the next frame of this attachment's target, given
 -- whether the owner holds a target for it and the session's primary failure,
 -- if it has failed.
 requestCapture ∷ Captures → AttachmentId → Bool → Maybe TerminalCause → STM (Either CaptureRefusal CaptureTicket)
 requestCapture captures attachment targeted failed = do
-  held ← Map.lookup attachment <$> readTVar (capturesOutstanding captures)
+  outstanding' ← readTVar (capturesOutstanding captures)
+  settled ← readTVar (capturesSettled captures)
+  closed ← Set.member attachment <$> readTVar (capturesClosed captures)
+  let held = Map.lookup attachment outstanding'
+      backlog = Map.size outstanding' + Map.size settled
   case (capturesMode captures, failed, held) of
     (CaptureOff, _, _) → pure (Left CaptureDisabled)
     (_, Just cause, _) → pure (Left (CaptureSessionFailed cause))
+    _ | not targeted → pure (Left CaptureNoTarget)
+    _ | closed → pure (Left CaptureTargetRetiring)
     (_, _, Just (Outstanding ticket _)) → pure (Left (CaptureOutstanding ticket))
     _
-      | not targeted → pure (Left CaptureNoTarget)
+      | backlog >= capturesRetained → pure (Left (CaptureBacklogFull backlog))
       | otherwise → do
           ticket ← CaptureTicket <$> stateTVar (capturesNext captures) (\next → (next, next + 1))
           modifyTVar' (capturesOutstanding captures) (Map.insert attachment (Outstanding ticket StageRequested))
@@ -262,12 +288,22 @@ settleCapture captures attachment outcome =
     Nothing → pure ()
     Just (Outstanding ticket _) → do
       modifyTVar' (capturesOutstanding captures) (Map.delete attachment)
-      modifyTVar' (capturesSettled captures) $ \held →
-        let grown = Map.insert ticket outcome held
-         in if Map.size grown > capturesRetained then Map.deleteMin grown else grown
+      -- Admission bounded outstanding and settled requests together, so
+      -- this never grows past 'capturesRetained' and drops nothing.
+      modifyTVar' (capturesSettled captures) (Map.insert ticket outcome)
 
 -- | Settle every outstanding request without bytes, for this reason.
 withholdAll ∷ Captures → Withheld → STM ()
 withholdAll captures reason = do
   attachments ← Map.keys <$> readTVar (capturesOutstanding captures)
   mapM_ (\attachment → settleCapture captures attachment (CaptureWithheld attachment reason)) attachments
+
+-- | Admit no more requests for this attachment: its target has begun
+-- retiring. Those already admitted are the retirement's to settle.
+closeCaptures ∷ Captures → AttachmentId → STM ()
+closeCaptures captures attachment = modifyTVar' (capturesClosed captures) (Set.insert attachment)
+
+-- | Forget a closed attachment, once the owner holds no target for it and
+-- every request is refused 'CaptureNoTarget' instead.
+forgetClosed ∷ Captures → AttachmentId → STM ()
+forgetClosed captures attachment = modifyTVar' (capturesClosed captures) (Set.delete attachment)
