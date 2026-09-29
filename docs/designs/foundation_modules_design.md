@@ -15,13 +15,13 @@ concrete precondition
 The six delivery slices are accepted for issue processing under D-4. Tracker
 artifacts remain unprocessed and require their own approval before creation.
 
-- [ ] EPIC. Establish foundation's module-local data and behavior boundaries
-- [ ] FMO-1. Separate logging and failure data from their operations
-- [ ] FMO-2. Separate resource representations and collection types
-- [ ] FMO-3. Separate worker data, requests, startup, observation and group lifetime
-- [ ] FMO-4. Separate recovery policy and outcome types
-- [ ] FMO-5. Separate time data and pure arithmetic from clock operations
-- [ ] FMO-6. Separate messaging types and give its component identity a common owner
+- [x] EPIC. Establish foundation's module-local data and behavior boundaries — [#268]
+- [x] FMO-1. Separate logging and failure data from their operations — [#269]
+- [x] FMO-2. Separate resource representations and collection types — [#271]
+- [x] FMO-3. Separate worker data, requests, startup, observation and group lifetime — [#272]
+- [x] FMO-4. Separate recovery policy and outcome types — [#273]
+- [x] FMO-5. Separate time data and pure arithmetic from clock operations — [#274]
+- [x] FMO-6. Separate messaging types and give its component identity a common owner — [#275]
 
 ## Epic contract
 

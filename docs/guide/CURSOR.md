@@ -1,13 +1,13 @@
 # Guide cursor
 
-Resume after: `9e2f0333c120c613dd06bf26a62b6981b16c9799` · [2026-09-26T150528Z-9e2f033](2026-09-26T150528Z-9e2f033.md) · 2026-09-26T15:05:28Z
-Covered beyond the boundary: none
+Resume after: `50ceccea19e147537f33192c4b9118a97fab1443` · [2026-09-29T121551Z-50cecce](2026-09-29T121551Z-50cecce.md) · 2026-09-29T12:27:41Z
+Covered beyond the boundary: none. Supplementary review: [2026-09-29T121614Z-50cecce](2026-09-29T121614Z-50cecce.md).
 
 ## Next
 
-The owner is planning the `Base`/`Types` refactor in another session. Review the
-issues it files, and #266's place relative to them, before any solver starts.
-The feature backlog (#225 onward) resumes after the structural phase.
+Every finding of 2026-09-29T121551Z-50cecce is dispositioned: GUIDE-1–5 are #303–#307, and GUIDE-6 was corrected on master in `96a5506`.
+Solve #303 first (the only liveness defect), then choose the next slice; the owner-sequenced GPU-model `State.hs` decomposition is recommended.
+The supplementary report's two unique findings are dispositioned too: its GUIDE-1 is no-issue (owner decision 2026-09-29) and its GUIDE-2 is #308.
 
 ## Open findings
 
@@ -15,29 +15,25 @@ None.
 
 ## Pending handoff
 
-- Accepted feature order once the phase ends: #225 → #227 → #229/#231
-  (independent once #227 lands) → #232 → #233.
-- Qualification gates remain open: native Wayland (#207) and Lua confinement.
-  Trusted Lua delivery is independent of confinement (owner decisions
-  D-13/D-14), but its readiness is still being explored.
-- The docs lane holds unpublished vision edits (the 2026-09-26 module
-  conventions). The heading stays the published vision until they land.
+- Supplementary run leaves #292/#293 partial; the prior concurrent report completed their review at this pin. Keep each report's depth distinct.
+- Triangle layout retention was independently confirmed and deduplicated to 2026-09-29T121551Z-50cecce/GUIDE-5.
+- No remote movement at final recheck. Preserve both reports and their exact coverage; neither authorizes repairs or tracker closure.
+- Epics #155/#268 remain open; WL-3 delivered, WL-4 rendering remains; Lua confinement inconclusive.
+- No next slice accepted here: prior cursor recommends owner-sequenced GPU-model State.hs decomposition; trusted Lua, WL-4 and renderer design remain alternatives.
+- Owner-selected resize coalescing/continued presentation and MoltenVK 1.4.2 are in P-15/verdict; unpublished vision edits are provisional.
 
 ## Alignment
 
-Readings before 2026-09-26T150528Z-9e2f033 were bootstrapped from the per-PR
-verdicts in the three reports before it.
-
 | Principle | Reading | Since | Note |
 |---|---|---|---|
-| V-1 | aligned | 20260926T001418Z-9ca334e | |
-| V-2 | aligned | 2026-09-26T150528Z-9e2f033 | |
-| V-3 | aligned | 2026-09-26T150528Z-9e2f033 | |
-| V-4 | aligned | 20260926T001418Z-9ca334e | |
-| V-5 | aligned | 20260926T001418Z-9ca334e | |
-| V-6 | aligned | 20260926T001418Z-9ca334e | |
-| V-7 | aligned | 2026-09-26T150528Z-9e2f033 | |
-| V-8 | aligned | 20260926T001418Z-9ca334e | |
-| V-9 | not exercised | — | No Lua work merged in the recorded per-PR verdicts |
-| V-10 | aligned | 2026-09-26T150528Z-9e2f033 | |
-| V-11 | aligned | 2026-09-26T150528Z-9e2f033 | |
+| V-1 | aligned | 2026-09-29T121551Z-50cecce | Preserved in the reviewed paths; bounded coverage is not whole-project qualification. |
+| V-2 | aligned | 2026-09-29T121551Z-50cecce | Preserved in the reviewed paths; bounded coverage is not whole-project qualification. |
+| V-3 | aligned | 2026-09-29T121551Z-50cecce | Isolated defects #304, #305 and #307; the supplementary GUIDE-1 drift basis was closed as no-issue (unreachable in production). |
+| V-4 | aligned | 2026-09-29T121551Z-50cecce | The terminal latch keeps the primary failure; the supplementary GUIDE-1 drift basis was closed as no-issue. |
+| V-5 | aligned | 2026-09-29T121551Z-50cecce | Preserved in the reviewed paths; bounded coverage is not whole-project qualification. |
+| V-6 | aligned | 2026-09-29T121551Z-50cecce | #303 is a liveness defect in one recovery path, not drift. |
+| V-7 | aligned | 2026-09-29T121551Z-50cecce | Preserved in the reviewed paths; bounded coverage is not whole-project qualification. |
+| V-8 | aligned | 2026-09-29T121551Z-50cecce | WL-3 qualified headless window profile; Vulkan native records inspected at historical inputs. No new visual or platform qualification. |
+| V-9 | aligned | 2026-09-29T121551Z-50cecce | Same-VM callback refusal enforces the accepted no-reentry boundary; confinement remains inconclusive. |
+| V-10 | aligned | 2026-09-29T121551Z-50cecce | Two uncoordinated tests are filed as isolated repairs (#306, #308); required native profile under 30 s on both platforms. |
+| V-11 | aligned | 2026-09-29T121551Z-50cecce | Preserved in the reviewed paths; bounded coverage is not whole-project qualification. |
