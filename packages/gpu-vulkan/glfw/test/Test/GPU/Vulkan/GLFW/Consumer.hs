@@ -102,6 +102,7 @@ spec = describe "Vulkan consumer rendering and capture" $ do
     it "refuses a capture once its target's retirement has begun, while that retirement is still owed, and settles the one it already had" (bounded testCaptureWhileRetiring)
     it "keeps every admitted outcome until it is taken, refusing further requests at the limit as backpressure" (bounded testCaptureBacklog)
     it "gives a request made from a frame's acquisition report a later frame, never the one already reported" (bounded testCaptureFromAcquisition)
+    it "gives a request admitted while an acquisition is under way a later frame, never the one being acquired" (bounded testCaptureDuringAcquisition)
     it "settles a presented capture without bytes when the session fails before its completion, naming the primary, and never delivers it" (bounded testCaptureTerminal)
 
 -- ---------------------------------------------------------------------------
@@ -735,6 +736,35 @@ testCaptureFromAcquisition = do
     other → expectationFailure ("the capture was not delivered: " <> show other)
   where
     when' condition action = if condition then action else pure ()
+
+testCaptureDuringAcquisition ∷ IO ()
+testCaptureDuringAcquisition = do
+  rig ← capturingRigOf 1
+  offerUsage rig (imageUsageColorAttachment + imageUsageTransferSource)
+  (settled, before, acquired) ← runRig rig $ \host control → do
+    [window] ← windowsOf host
+    service ← firstFrame rig host control window
+    let controller = vulkanController host
+        attachment = graphicsAttachment service
+        acquisitions = (\events → [(frame, image) | FrameAcquired at frame image ← events, at == attachment]) <$> frameEvents rig
+    before ← length <$> acquisitions
+    -- The next acquisition holds inside the native call, after the owner
+    -- decided which request it would be for and before it has a frame.
+    gate ← newTVarIO False
+    holding ← holdAcquisitions rig gate
+    demandFrame host window
+    composedUntil rig host control "an acquisition under way" (\_ → pure ()) (atomically holding)
+    Right ticket ← atomically (requestVulkanCapture controller attachment)
+    atomically (writeTVar gate True)
+    settled ← awaitCapture rig host control ticket
+    (,,) settled before <$> acquisitions
+  -- The acquisition that was under way when the request was admitted.
+  held : later ← pure (drop before acquired)
+  case settled of
+    CaptureDelivered frame → do
+      (capturedFrame frame, capturedImage frame) `shouldSatisfy` (/= held)
+      later `shouldSatisfy` elem (capturedFrame frame, capturedImage frame)
+    other → expectationFailure ("the capture was not delivered: " <> show other)
 
 testCaptureTerminal ∷ IO ()
 testCaptureTerminal = do

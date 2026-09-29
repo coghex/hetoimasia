@@ -174,6 +174,7 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Capture
   , Stage (..)
   , Withheld (..)
   , associateCapture
+  , claimableFor
   , outstanding
   , outstandingFor
   , presentCapture
@@ -758,7 +759,11 @@ renderDue rendering renderer now scene revision due =
       ready ← storagesFor made target
       if not ready
         then False <$ retryAfterPending target
-        else
+        else do
+          -- The request this frame will be for is the one outstanding before
+          -- it is asked for: one admitted while the acquisition is under way
+          -- is the next frame's.
+          claimed ← atomically (claimableFor captures attachment)
           tryAcquireFrame (liveFrames made) target >>= \case
             Right (AcquisitionOwned owned) → do
               atomically (editTarget rendering target (\record → record {targetRetryAt = Nothing}))
@@ -766,10 +771,9 @@ renderDue rendering renderer now scene revision due =
               -- frame, whatever becomes of it. It is associated before the
               -- acquisition is reported, so a request made from the report is
               -- a later frame's.
-              asked ← atomically $
-                outstandingFor captures attachment >>= \case
-                  Just stage | waiting stage → True <$ associateCapture captures attachment (ownedFrame owned)
-                  _ → pure False
+              asked ← case claimed of
+                Nothing → pure False
+                Just ticket → atomically (associateCapture captures attachment ticket (ownedFrame owned))
               observe (FrameAcquired attachment (ownedFrame owned) (ownedImage owned))
               described ← describeImage target (ownedImage owned)
               case described of
@@ -782,10 +786,6 @@ renderDue rendering renderer now scene revision due =
               False <$ retryAfterPending target
             Right _ → False <$ retryAfterPending target
             Left _ → False <$ retryAfterPending target
-    waiting = \case
-      StageRequested → True
-      StageAsked → True
-      _ → False
     retryAfterPending target = do
       model ← atomically (readRootsModel (renderingRoots rendering))
       let first = case backoffSchedule (modelBudgets model) of

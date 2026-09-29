@@ -16,7 +16,10 @@
 --    render demand would ('takeRequested').
 -- 3. The next frame the owner acquires for that target is the one the request
 --    is for, whatever becomes of it: the request is never moved to a later
---    frame. If the frame's generation is not a transfer source, or no readback
+--    frame. The owner claims the request it will associate before it asks
+--    for the frame ('claimableFor'), and associates that one only
+--    ('associateCapture'), so a request admitted while an acquisition is
+--    under way is the next frame's. If the frame's generation is not a transfer source, or no readback
 --    buffer can be made for it, the request is settled without bytes and the
 --    frame is rendered as usual. Otherwise the host records, after the
 --    consumer's commands and in the same batch, the copy of the rendered image
@@ -80,6 +83,7 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Capture
   , Presented (..)
   , takeRequested
   , outstandingFor
+  , claimableFor
   , outstanding
   , associateCapture
   , presentCapture
@@ -271,10 +275,31 @@ outstandingFor captures attachment = fmap (\(Outstanding _ stage) → stage) . M
 outstanding ∷ Captures → STM [(AttachmentId, Stage)]
 outstanding captures = map (\(attachment, Outstanding _ stage) → (attachment, stage)) . Map.toList <$> readTVar (capturesOutstanding captures)
 
--- | Record that the attachment's request is this frame's.
-associateCapture ∷ Captures → AttachmentId → FrameSlotId → STM ()
-associateCapture captures attachment frame =
-  modifyTVar' (capturesOutstanding captures) (Map.adjust (\(Outstanding ticket _) → Outstanding ticket (StageInFrame frame)) attachment)
+-- | The request a frame the owner is about to acquire for this attachment
+-- will be for: one outstanding now, and not yet associated with a frame.
+claimableFor ∷ Captures → AttachmentId → STM (Maybe CaptureTicket)
+claimableFor captures attachment =
+  Map.lookup attachment <$> readTVar (capturesOutstanding captures) >>= \case
+    Just (Outstanding ticket StageRequested) → pure (Just ticket)
+    Just (Outstanding ticket StageAsked) → pure (Just ticket)
+    _ → pure Nothing
+
+-- | Record that the request claimed before this frame was acquired is this
+-- frame's, and answer whether it still was outstanding to be. A request
+-- admitted since the claim is not this frame's, whatever it asked.
+associateCapture ∷ Captures → AttachmentId → CaptureTicket → FrameSlotId → STM Bool
+associateCapture captures attachment claimed frame =
+  Map.lookup attachment <$> readTVar (capturesOutstanding captures) >>= \case
+    Just (Outstanding ticket stage)
+      | ticket == claimed, waiting stage → do
+          modifyTVar' (capturesOutstanding captures) (Map.insert attachment (Outstanding ticket (StageInFrame frame)))
+          pure True
+    _ → pure False
+  where
+    waiting = \case
+      StageRequested → True
+      StageAsked → True
+      _ → False
 
 -- | Record that the attachment's request was copied from a presented frame.
 presentCapture ∷ Captures → AttachmentId → Presented → STM ()
