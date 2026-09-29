@@ -28,6 +28,7 @@ module Test.GPU.Vulkan.Native.FramesRig
   , ok
   , clean
   , cancelled
+  , awaitThrowing
   , inModel
   , exhaust
 

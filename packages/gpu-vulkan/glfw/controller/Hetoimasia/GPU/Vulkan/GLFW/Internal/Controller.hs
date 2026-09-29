@@ -264,6 +264,7 @@ import Hetoimasia.GPU.Vulkan.Diagnostics
   , afterLastCallback
   , captureAlarms
   , captureSinkFailure
+  , readCaptureSinkFailure
   , claimCaptureOrder
   , retainStorage
   , withDiagnosticCapture
@@ -1654,7 +1655,7 @@ diagnosticOrder capture =
   claimCaptureOrder capture >>= \case
     OwnerFailedFirst → pure OwnerFirst
     ErrorLatchedFirst → pure ValidationFirst
-    SinkFailedFirst → pure (SinkFirst (fmap sinkFailureReason <$> captureSinkFailure capture))
+    SinkFailedFirst → pure (SinkFirst (fmap sinkFailureReason <$> readCaptureSinkFailure capture))
 
 -- | Whether a failure the owner has not acted on asks for a round: the
 -- capture's sink has failed and nothing is latched yet — the one diagnostic

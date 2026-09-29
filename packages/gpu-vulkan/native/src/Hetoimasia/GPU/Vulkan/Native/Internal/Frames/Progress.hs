@@ -126,7 +126,7 @@ progressFrames frames now = owner recording $ do
           ObserveSubmission submission record → do
             fence ← fmap syncFence . Map.lookup (submissionSlot record) <$> readTVarIO (framesSlots frames)
             for_ fence $ \native →
-              observe handle native >>= \case
+              observe handle native $ \case
                 Left failure → do
                   let reason = "vkGetFenceStatus raised: " <> describe failure
                   atomically $ do
@@ -144,7 +144,7 @@ progressFrames frames now = owner recording $ do
             let key = (presentationTarget presentation, presentedPool record)
             pool ← Map.lookup key <$> readTVarIO (framesPool frames)
             for_ pool $ \held →
-              observe handle (poolFence held) >>= \case
+              observe handle (poolFence held) $ \case
                 Left failure → do
                   let reason = "vkGetFenceStatus raised: " <> describe failure
                   atomically $ do
@@ -173,7 +173,7 @@ progressFrames frames now = owner recording $ do
                     Right () → modifyIORef' settled (frame :)
             for_ sync $ \held → case syncCleanupState held of
               FencePending →
-                observe handle (syncCleanup held) >>= \case
+                observe handle (syncCleanup held) $ \case
                   Left failure → do
                     let reason = "vkGetFenceStatus raised: " <> describe failure
                     atomically $ do
@@ -209,7 +209,10 @@ progressFrames frames now = owner recording $ do
     recording = framesRecording frames
     roots = framesRoots frames
     ops = framesOps frames
-    observe handle fence = mask_ (tryWithContext @SomeException (rootsCall roots "vkGetFenceStatus" (opsFenceSignalled ops handle fence)))
+    -- Asking a fence and recording its answer are one masked step: a failed
+    -- query leaves the fence uncertain, and a cancellation landing between the
+    -- two would leave that unrecorded.
+    observe handle fence record = mask_ (tryWithContext @SomeException (rootsCall roots "vkGetFenceStatus" (opsFenceSignalled ops handle fence)) >>= record)
     complete submission record = do
       applied ← stateRootsModel roots $ \model → case recordCompletion now (SubmissionCompleted submission) model of
         Admitted next → (True, next)

@@ -123,6 +123,7 @@ module Hetoimasia.GPU.Vulkan.Diagnostics
   , deliveredCount
   , SinkFailure (..)
   , captureSinkFailure
+  , readCaptureSinkFailure
   , CaptureAlarm (..)
   , captureAlarms
   , CaptureOrder (..)
@@ -405,6 +406,11 @@ deliveredCount = readTVar . handleDelivered
 captureSinkFailure ∷ DiagnosticCapture → STM (Maybe SinkFailure)
 captureSinkFailure = readTVar . handleSinkFailure
 
+-- | 'captureSinkFailure' read without a transaction of its own, so an owner can
+-- read it inside one of its own transactions.
+readCaptureSinkFailure ∷ DiagnosticCapture → IO (Maybe SinkFailure)
+readCaptureSinkFailure = readTVarIO . handleSinkFailure
+
 -- | A sink failure as the worker met it.
 newtype SinkFailure = SinkFailure
   { sinkFailureReason ∷ Text
@@ -444,6 +450,7 @@ data CaptureAlarm
 -- Then this answers 'CaptureAlarmPending' alone — a failure has happened, and
 -- admission should stay closed — and the next reading, once the first alarm is
 -- published, answers them in order. It never answers a later failure first.
+-- It runs no transaction of its own, so an owner can read it inside one.
 -- | Which failure holds first place, once the capture's owner has claimed it
 -- for a failure of its own that it is about to record: its own, unless an
 -- error report or the sink claimed it before.
@@ -474,7 +481,7 @@ claimCaptureOrder capture =
 captureAlarms ∷ DiagnosticCapture → IO [CaptureAlarm]
 captureAlarms capture = do
   latched ← statusErrorLatched <$> captureStatus capture
-  sink ← atomically (captureSinkFailure capture)
+  sink ← readCaptureSinkFailure capture
   first ← firstFailure (handleUserData capture)
   let errors = [CaptureErrorLatched | latched]
       sinks = [CaptureSinkFailed (sinkFailureReason failure) | Just failure ← [sink]]

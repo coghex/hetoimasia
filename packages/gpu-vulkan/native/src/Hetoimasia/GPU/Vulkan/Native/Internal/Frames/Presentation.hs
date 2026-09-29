@@ -149,8 +149,15 @@ classifyPresent noEffect raised status = case raised of
 --   fails, and 'FrameEffectUncertain' is raised — or the device loss itself.
 --
 -- A cancellation aimed at the owner is delivered only after that record is
--- made. The call itself may block in the driver: the handoff promises a
--- recorded outcome, not a prompt return, and it never interrupts the call.
+-- made, and the record is made whole: no part of it is observable without
+-- the rest. Its transaction never blocks, so the cancellation cannot abort it.
+-- That holds while it orders a failure of the owner's own behind a sink
+-- failure that claimed first place and has not yet published its reason: the
+-- record waits for the capture's worker, whose publication is a masked step of
+-- its own that calls nothing native and waits on nothing, and the wait
+-- introduces no driver wait and no uninterruptible masking. The call itself
+-- may block in the driver: the handoff promises a recorded outcome, not a
+-- prompt return, and it never interrupts the call.
 presentFrame ∷ Frames q inst msgr phys dev cmd → FrameSlotId → IO (Either Refusal Presented)
 presentFrame frames frame =
   owned recording . checkpointed recording $

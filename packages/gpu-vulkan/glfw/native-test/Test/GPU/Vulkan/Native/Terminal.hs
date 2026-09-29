@@ -102,7 +102,7 @@ import Hetoimasia.GPU.Vulkan.Diagnostics
   , CaptureOrder (..)
   , SinkFailure (..)
   , captureAlarms
-  , captureSinkFailure
+  , readCaptureSinkFailure
   , captureStatus
   , claimCaptureOrder
   , defaultCaptureConfig
@@ -223,7 +223,7 @@ order capture =
   claimCaptureOrder capture >>= \case
     OwnerFailedFirst → pure OwnerFirst
     ErrorLatchedFirst → pure ValidationFirst
-    SinkFailedFirst → pure (SinkFirst (fmap sinkFailureReason <$> captureSinkFailure capture))
+    SinkFailedFirst → pure (SinkFirst (fmap sinkFailureReason <$> readCaptureSinkFailure capture))
 
 -- | What the capture's latches say, as a checkpoint asks them: the error latch
 -- and the sink's failure. The controller installs the same watch.

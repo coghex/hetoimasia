@@ -2037,14 +2037,42 @@ validation error or sink failure claimed the cell first, it is latched in that
 same transaction ahead of the owner's failure, which joins the evidence; a
 transition that would have failed the session is taken on the failed session
 instead, so a required target's recovery goes no further. A sink failure whose
-reason its worker has not yet published leaves the transaction waiting, and the
-worker's publication, which follows its claim at once, wakes it. The claim
-answers the same however often a transaction runs it. Between the owner's
-claim and the commit of the transaction that records its failure, a
+reason its worker has not yet published is waited for inside the transaction,
+which never blocks: a `retry` there would make the transaction interruptible
+even under `mask_`. The worker publishes right after its claim, in one masked
+step that calls nothing native, delivers nothing to the sink and waits on
+nothing, so the wait depends on that thread's CPU bookkeeping alone — never on
+a driver, the sink or the owner — and it promises no wall-clock bound. Nothing
+in it is interruptible and it masks nothing of its own: a masked record cannot
+be cancelled there, and an unmasked one can, as anywhere else in its
+transaction. The claim answers the same however often a transaction runs it.
+
+A claim holds first place only for the transaction attempt that made it, and
+it is a compare-and-swap in C that an abandoned transaction does not undo, so
+the roots record, outside STM, each thread that enters a claim. Between the
+owner's claim and the commit of the transaction that records its failure, a
 checkpoint on another thread — a handover's, say — sees the claim
-(`CaptureOwnerClaimed`, `AlarmOwnerClaimed`) with nothing latched and answers
-`CheckpointPending`, latching nothing, so a later diagnostic failure cannot
-take the owner's place. Roots given only a list
+(`CaptureOwnerClaimed`, `AlarmOwnerClaimed`) with nothing latched and its
+claimant still running, and answers `CheckpointPending`, latching nothing, so a
+later diagnostic failure cannot take the owner's place. A claim no claimant can
+still be inside — the checking thread's own, since that thread is at the
+checkpoint, or one whose thread has ended — is void: the checkpoint latches the
+alarms beside it as usual, so an abandoned transaction leaves no checkpoint
+pending and no settled checkpoint waiting. A later failure of the owner's own,
+whose claim the void one still answers first, is ordered behind the diagnostic
+failures the capture held before that claim. A claimant thread still running
+is waited for until its own next checkpoint or its end; the owner's failures
+and settled checkpoints are all on the owner's thread.
+
+Every record of a failure of the owner's own made inside a masked step — an
+uncertain or failed presentation, an uncertain submission, a progress step's
+fence answer, a device loss — is therefore made whole or not started, whatever
+cancellation is aimed at the owner: its transaction never blocks, so the
+cancellation arrives after it. A device loss is latched with exceptions masked
+from the moment its call returns (`rootsCall`), and a progress step asks each
+fence and records its answer in one masked step.
+
+Roots given only a list
 of alarms (`watchRootsDiagnostics`, as headless examples use) latch them at
 checkpoints and order nothing; the controller installs the capture's order
 (`watchRootsDiagnosticsOrdered`). The
