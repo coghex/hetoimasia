@@ -1,6 +1,7 @@
 -- | A stand-in native layer for the recording: every call recorded in order,
--- any step made to fail, and a hook run inside a storage's reset or a
--- command's recording so an example can observe the model at that instant.
+-- any step made to fail, and a hook run inside a storage's reset, a command's
+-- recording or one call at a step, so an example can observe the model at that
+-- instant.
 --
 -- Handles are small numbers, so a record says which object each call touched.
 -- A readback buffer's memory is a byte string the stand-in keeps, mapped at
@@ -16,6 +17,7 @@ module Test.GPU.Vulkan.Native.RecordingStandIn
   , failAt
   , succeedAt
   , outOfMemoryAt
+  , onceAt
   , duringReset
   , duringRecord
   , RecordingFailure (..)
@@ -101,6 +103,9 @@ data RecordingStandIn = RecordingStandIn
   , recordingDuringRecord ∷ !(TVar (NativeCommand → IO ()))
   , recordingOutOfMemory ∷ !(TVar (Map RecordingStep Int))
     -- ^ How many more calls at each step answer out of memory (VK-14).
+  , recordingOnce ∷ !(TVar (Map RecordingStep (IO ())))
+    -- ^ What the next call at each step runs, once, if it did not answer out
+    -- of memory.
   }
 
 newRecordingStandIn ∷ IO RecordingStandIn
@@ -113,6 +118,7 @@ newRecordingStandIn =
     <*> newTVarIO True
     <*> newTVarIO (pure ())
     <*> newTVarIO (\_ → pure ())
+    <*> newTVarIO Map.empty
     <*> newTVarIO Map.empty
 
 -- | Every call so far, oldest first.
@@ -130,6 +136,11 @@ succeedAt standIn at = atomically (modifyTVar' (recordingFailing standIn) (Set.d
 -- nothing.
 outOfMemoryAt ∷ RecordingStandIn → RecordingStep → Int → IO ()
 outOfMemoryAt standIn at times = atomically (modifyTVar' (recordingOutOfMemory standIn) (Map.insert at times))
+
+-- | Run this, once, inside the step's next call that does not answer out of
+-- memory, after it is recorded: what it raises, the call raises.
+onceAt ∷ RecordingStandIn → RecordingStep → IO () → IO ()
+onceAt standIn at action = atomically (modifyTVar' (recordingOnce standIn) (Map.insert at action))
 
 -- | Run this inside every storage reset, before it is recorded.
 duringReset ∷ RecordingStandIn → IO () → IO ()
@@ -162,6 +173,10 @@ step standIn at call = do
       then True <$ modifyTVar' (recordingOutOfMemory standIn) (Map.insert at (remaining - 1))
       else pure False
   when exhausted (throwIO (StandInResult (Text.pack (show at)) FailedOutOfMemory))
+  once ← atomically $ do
+    held ← Map.lookup at <$> readTVar (recordingOnce standIn)
+    held <$ modifyTVar' (recordingOnce standIn) (Map.delete at)
+  sequence_ once
 
 fresh ∷ RecordingStandIn → IO Word64
 fresh standIn = atomically $ do
