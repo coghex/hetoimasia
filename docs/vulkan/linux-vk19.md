@@ -22,11 +22,16 @@ the diagnostic verdict after the last teardown callback, and the display's own
 teardown — took 3.472 s against the 30-second watchdog,
 over a non-empty selection of 119 examples, one of them pending: the
 graphics-owner interaction probe, which opened no window, as no run that does
-not activate it does. `test.vulkan-headless` passed too, with its suites'
-14, 312, 88 examples. The display helper's logs are in the worker's
+not activate it does. `test.vulkan-headless` passed too, with `shader-tests`'
+14 examples, `native-tests`' 312 and `integration-tests`' 88. The display helper's logs are in the worker's
 `validation-receipts-vulkan` artifact beside each scenario's output and record.
-The macOS evidence is [`macos-vk19.md`](macos-vk19.md). Every group of this run
-passed. This run replaces the evidence of run [36504897721](https://github.com/coghex/hetoimasia/actions/runs/36504897721) at `555681d`, which passed too, before round 1's fix: capture admission closed when a target's retirement begins, and admission bounded rather than settled outcomes dropped.
+The macOS evidence is [`macos-vk19.md`](macos-vk19.md). Both Vulkan groups
+passed. Not every group of the run did: on the separate `haskell-engine`
+worker, the floor group `test.foundation` failed one example, `keeps the parent
+alive while a cancellation delivery blocks` (expected `CancelledKind`, got
+`SucceededKind`). This pull request changes no input of that group, and the
+same example passed in the pull request's earlier run, 36504897721, so this
+evidence neither covers nor explains that failure. This run replaces the evidence of run [36504897721](https://github.com/coghex/hetoimasia/actions/runs/36504897721) at `555681d`, which passed too, before round 1's fix: capture admission closed when a target's retirement begins, and admission bounded rather than settled outcomes dropped.
 
 VK-19's native case, `vk19-capture`, ran on private roots in its own child
 process on llvmpipe, over the production composition with verification capture
