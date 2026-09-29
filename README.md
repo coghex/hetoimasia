@@ -94,7 +94,7 @@ provision into the private native prefix. Its headless suites, the validation
 group `test.vulkan-headless`, open no window and need no consent:
 
 ```sh
-bash tools/vulkan/run.sh test hetoimasia-gpu-vulkan-native:test:native-tests hetoimasia-gpu-vulkan-native:test:shader-tests hetoimasia-gpu-vulkan-glfw:test:integration-tests
+bash tools/vulkan/run.sh test hetoimasia-gpu-vulkan-native:test:native-tests hetoimasia-gpu-vulkan-native:test:shader-tests hetoimasia-gpu-vulkan-glfw:test:integration-tests hetoimasia-sample-triangle:test:triangle-tests
 ```
 
 Its native suite, `vulkan-native-tests`, presents windows and takes the same
