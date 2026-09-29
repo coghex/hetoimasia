@@ -55,6 +55,7 @@ class Prepared:
 class Context:
     Suite = Suite
     Prepared = Prepared
+    version = (0, 2, 0)
 
     def __init__(self, platform="Darwin"):
         self.checkout = ROOT
@@ -121,6 +122,45 @@ class AdapterChecks(unittest.TestCase):
             if chosen:
                 self.assertEqual(self.suites[suite].data["options"], [x for s in chosen for x in ("--match", s)])
 
+    def test_profiles_restrict_only_through_options_quruntul_intersects_with_selection(self):
+        # quruntul 0.2.0 drops a suite's --match selectors when a trial selects
+        # exact tests (Hspec ORs every --match) and keeps its --skip selectors,
+        # so a narrowed profile must narrow only with --match and an unnarrowed
+        # one only with --skip; then a selected example never widens a trial.
+        for suite in self.suites.values():
+            options = suite.data["options"]
+            flags = options[0::2]
+            if ":" in suite.id:
+                self.assertTrue(options and set(flags) == {"--match"}, suite.id)
+            else:
+                self.assertTrue(set(flags) <= {"--skip"}, suite.id)
+
+    def test_an_older_quruntul_is_refused(self):
+        old = Context()
+        old.version = (0, 1, 0)
+        with self.assertRaisesRegex(RuntimeError, "needs quruntul"):
+            self.module.adapter().suites(old)
+
+    def test_vulkan_native_launches_through_its_runner_with_provenance(self):
+        adapter = self.module.adapter()
+        adapter._check_toolchain = lambda checkout: None
+        adapter._discovery = lambda checkout, build_dir: {"HETOIMASIA_VULKAN_LIBDIR": "/l", "HETOIMASIA_VULKAN_INCLUDEDIR": "/i"}
+        adapter._list_bin = lambda checkout, flags, component, environment: sys.executable
+        adapter._tools = lambda checkout, component: []
+        suite = self.suites["vulkan-native-tests"]
+        runner = (ROOT / "tools" / "vulkan" / "run.sh").read_text()
+        # The provenance the native suite checks is set by run.sh native itself.
+        self.assertIn("HETOIMASIA_VULKAN_SOURCE_DIGEST", runner)
+        self.assertIn("HETOIMASIA_VULKAN_REVISION", runner)
+        for platform in ("Darwin", "Linux"):
+            prepared = adapter.prepare(Context(platform), suite)
+            self.assertEqual(prepared.wrapper, ["bash", str(ROOT / "tools" / "vulkan" / "run.sh"), "native",
+                                                suite.data["component"], "--"])
+            self.assertFalse(prepared.launches_executable)
+            self.assertEqual(prepared.cwd, str(ROOT))
+            self.assertEqual(prepared.environment.get("HETOIMASIA_NATIVE_SESSION"),
+                             "desktop" if platform == "Darwin" else None)
+
     def test_an_unnarrowed_suite_skips_every_narrowed_profile_of_its_executable(self):
         profiles = hspec_profiles()
         for suite, component, chosen in profiles:
@@ -180,7 +220,7 @@ class AdapterChecks(unittest.TestCase):
         adapter._tools = lambda checkout, component: []
         for platform, suite_id in (("Darwin", "glfw-native-tests"), ("Linux", "glfw-native-tests"),
                                    ("Linux", "glfw-native-tests:glfw-wayland"),
-                                   ("Darwin", "vulkan-native-tests"), ("Darwin", "foundation-tests")):
+                                   ("Darwin", "foundation-tests")):
             ctx = Context(platform)
             prepared = adapter.prepare(ctx, self.suites[suite_id])
             desktop = self.suites[suite_id].desktop

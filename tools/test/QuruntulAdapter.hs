@@ -22,6 +22,9 @@ spec = describe "Quruntul adapter" $
   forM_
     [ "test_every_catalog_hspec_profile_is_exactly_one_suite"
     , "test_an_unnarrowed_suite_skips_every_narrowed_profile_of_its_executable"
+    , "test_profiles_restrict_only_through_options_quruntul_intersects_with_selection"
+    , "test_an_older_quruntul_is_refused"
+    , "test_vulkan_native_launches_through_its_runner_with_provenance"
     , "test_probes_are_exactly_the_local_only_optional_groups"
     , "test_display_helpers_follow_ci"
     , "test_build_routes_follow_the_project_files"

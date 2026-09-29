@@ -125,7 +125,9 @@ shared executable with `--match` is its own suite — `test.glfw-wayland` become
 `glfw-native-tests:glfw-wayland`, run with its selector under
 `tools/display/wayland.sh` as CI runs it, Linux only — and the executable's
 unnarrowed suite skips those examples, so each example is measured in exactly
-one profile. The adapter builds each suite the way its group does. The `workflow-tests` examples under
+one profile. The adapter builds each suite the way its group does, and launches
+`vulkan-native-tests` through `tools/vulkan/run.sh native` as `test.vulkan-native`
+does, so the runner's source-digest and revision provenance reach the suite. The `workflow-tests` examples under
 `Quruntul adapter` check that it still agrees with the catalog.
 
 - **`$test`** runs one due probe: never run, changed since it last ran, or last

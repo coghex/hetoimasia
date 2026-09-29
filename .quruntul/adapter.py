@@ -8,7 +8,9 @@ how to build and start each one the way its group does. A group that narrows a
 shared executable with `--match` (test.glfw-wayland) is its own suite, run with
 that selector under the display helper CI gives it, and the executable's
 unnarrowed suite skips those examples, so each example belongs to exactly one
-profile. It imports nothing
+profile. A group whose command launches its executable through
+`tools/vulkan/run.sh native` is launched the same way, so the runner's source
+digest and revision provenance reach the native suite. It imports nothing
 from quruntul — the context supplies `Suite`, `Prepared` and `digest` — so
 `tools/test/QuruntulAdapter.hs` can check it without quruntul installed.
 
@@ -33,6 +35,8 @@ import sys
 VULKAN_PACKAGES = {"hetoimasia-gpu-vulkan-native", "hetoimasia-gpu-vulkan-glfw", "hetoimasia-sample-triangle"}
 GLFW_PACKAGES = {"hetoimasia-glfw"}
 BUILD_SECONDS = 3600
+# Exact per-test selection must supersede a profile's --match (quruntul 0.2.0).
+ENGINE = (0, 2, 0)
 
 
 def _planner(checkout: Path):
@@ -93,6 +97,8 @@ class Hetoimasia:
     refresh_days = 7
 
     def suites(self, ctx):
+        if getattr(ctx, "version", (0,)) < ENGINE:
+            raise RuntimeError("this adapter needs quruntul " + ".".join(map(str, ENGINE)) + " or newer; update quruntul")
         checkout = ctx.checkout
         plan = _planner(checkout)
         tree = plan.GitTree(str(checkout), ctx.revision)
@@ -122,6 +128,7 @@ class Hetoimasia:
                     continue
                 display = ("wayland" if group["id"] in wayland else
                            "desktop" if group.get("runner") == "display" else None)
+                launch = "vulkan-native" if group.get("command", [])[:3] == ["bash", "tools/vulkan/run.sh", "native"] else "direct"
                 probe = bool(group.get("optional")) and group.get("category") == "probe" and group["id"] not in routed
                 inputs = set(plan.component_inputs(packages, component)) | set(group.get("inputs", []))
                 inputs |= {"cabal.project", "cabal.project.cpu", "cabal.project.common", "cabal.project.vulkan",
@@ -146,7 +153,8 @@ class Hetoimasia:
                     identity=identity,
                     priority=10,
                     data=dict(component=component, package=package, route=route, group=group["id"],
-                              directory=packages[package].directory, options=options, display=display),
+                              directory=packages[package].directory, options=options, display=display,
+                              launch=launch),
                 )
         return list(suites.values())
 
@@ -174,6 +182,21 @@ class Hetoimasia:
         tools = [self._list_bin(checkout, flags, tool, environment) for tool in self._tools(checkout, component)]
         if tools:
             environment["PATH"] = os.pathsep.join([str(Path(t).parent) for t in tools] + [os.environ.get("PATH", "")])
+        if suite.data["launch"] == "vulkan-native":
+            # As test.vulkan-native runs it: run.sh native sets the source digest
+            # and revision the native suite's provenance checks require, starts
+            # the executable from the repository root, and on Linux starts its
+            # own isolated X11 display.
+            return ctx.Prepared(
+                argv=[executable, *suite.data["options"]],
+                cwd=str(checkout),
+                environment={"HETOIMASIA_NATIVE_SESSION": "desktop"} if ctx.platform == "Darwin" and suite.desktop else {},
+                wrapper=["bash", str(checkout / "tools" / "vulkan" / "run.sh"), "native", component, "--"],
+                launches_executable=False,
+                provenance=dict(component=component, route=route, launch="tools/vulkan/run.sh native",
+                                build=build.get("command"), executable=executable,
+                                executable_sha256=_sha256(Path(executable))),
+            )
         wrapper: list[str] = []
         if suite.data["display"] == "wayland":
             wrapper = ["bash", str(checkout / "tools" / "display" / "wayland.sh"), "--"]
