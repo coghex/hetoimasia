@@ -222,6 +222,30 @@ consequences follow:
 - The escape record has to live on the VM rather than on a thread, which is why
   `Vm` holds one.
 
+**A callback's operation on its own VM is refused.** The operation that ran the
+callback holds the VM's gate until the callback returns, so anything the
+callback asks of the same VM — evaluating a chunk under any message handler,
+calling or probing a global, installing a callback, closing — could only wait
+for its own caller, which is inside a `safe` call no cancellation reaches. The
+VM therefore keeps the threads running its callbacks, and an operation or close
+asked from one of them fails at once with `VmReentered`, naming the refused
+operation, before it takes the gate: it runs no Lua, leaves the stack as it was,
+retains no release and publishes no global. The refusal is an ordinary failure
+of the callback's action, so it travels like one: the operation that ran the
+callback raises it with its own type and context whatever Lua did with the
+placeholder, and the VM stays open. That includes callbacks an `__index` or
+`__newindex` metamethod runs, and callbacks a `__gc` runs during the close,
+whose refusals the close's `CloseFault` carries.
+
+Every other thread is unaffected: its operation waits for the gate while the
+owner is inside a call, then runs, exactly as before, and is never refused
+because a call is in progress. The check is by thread identity, so re-entry
+through a thread the callback starts, or through another VM whose callback
+calls back into this one, is not detected. Both remain forbidden by the
+callback contract; nested execution on one VM is outside it (`P-4` in
+[the runtime design](../../docs/lua_runtime_design.md)), and a synchronous call
+into another VM's owner is `D-13`'s to forbid.
+
 A globals table can carry `__index` and `__newindex` metamethods, so reading or
 publishing a global runs Lua too, and that Lua can call one of these callbacks.
 Every such path therefore reports its own protected call's status and drains the
@@ -303,6 +327,10 @@ Rejected:
   out of a Haskell frame to the protected call outside it.
 - **Reaching Lua from a callback with anything that allocates.** A raise there
   unwinds out of a Haskell frame to the protected call outside it.
+- **Running Lua, or closing, from inside a callback of the same VM.** Refused
+  with `VmReentered` rather than left waiting; see *How callbacks re-enter*.
+  Re-entry through a thread the callback starts, or through another VM, is not
+  detected and is equally outside the contract.
 - **Cancelling a callback thread.** Not an endpoint; see *Error and cancellation
   transport*. Cancel the VM's execution owner instead. The entry
   pushes only a boolean or a light userdata for that reason.

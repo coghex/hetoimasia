@@ -24,6 +24,12 @@
 -- the process. A trusted callback must not publish its own 'ThreadId' or leave
 -- work running past its return.
 --
+-- A callback that asks its own VM for an operation -- evaluating a chunk,
+-- calling or probing a global, installing a callback, closing -- is refused with
+-- 'Hetoimasia.Scripting.Lua.Internal.Fault.VmReentered' instead of waiting for
+-- the operation that called it. The refusal is an ordinary failure of the
+-- callback's action, so it travels like one.
+--
 -- A callback borrows whatever Haskell state it closes over. Its release is
 -- retained on the VM and run only after the terminal close, because until
 -- @lua_close@ returns Lua can still call it. It is retained /before/ the
@@ -58,6 +64,7 @@ import Hetoimasia.Scripting.Lua.Internal.Vm
   , raiseEscape
   , recordEscape
   , retainRelease
+  , runCallback
   , withOpenVm
   )
 import Lua
@@ -187,7 +194,9 @@ hetoimasiaEnter state = mask $ \restore → do
     else do
       stored ← peek (castPtr carrier)
       Installed vm action ← deRefStablePtr stored
-      outcome ← tryWithContext (restore action)
+      -- Marked as this VM's caller while it runs, so that asking the same VM
+      -- for an operation fails here instead of waiting on the caller's gate.
+      outcome ← runCallback vm (tryWithContext (restore action))
       results ← case outcome ∷ Either (ExceptionWithContext SomeException) CallbackResult of
         Right NoResult → pure (NumResults 0)
         Right (BooleanResult value) → do
