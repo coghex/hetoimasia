@@ -97,7 +97,7 @@ deliverCancellation group entry = do
       readTVar (entrySummary entry) >>= \case
         Just _ → pure Nothing
         Nothing → readTVar (entryThread entry) >>= maybe retry (pure . Just)
-    traverse_ (`throwTo` WorkerCancelled) target
+    traverse_ deliver target
     pure (isJust target)
   _ ← trySome (probeHelperSettling (groupProbe group) (entryId entry))
   atomically $ do
@@ -105,6 +105,10 @@ deliverCancellation group entry = do
       writeTVar (entryCancelDelivered entry) True
     modifyTVar' (entryHelpers entry) (subtract 1)
     retireIfSettled group entry
+  where
+    deliver thread = do
+      _ ← trySome (probeHelperDelivering (groupProbe group) (entryId entry))
+      throwTo thread WorkerCancelled
 
 -- | Request cancellation of one worker and wait for it and its helper,
 -- absorbing interruptions, for a starter that is already failing.
