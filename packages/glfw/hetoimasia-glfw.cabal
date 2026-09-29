@@ -279,6 +279,22 @@ test-suite glfw-tests
         Test.GLFW.Notify
         Test.GLFW.Opacity
         Test.GLFW.Owner
+        Test.GLFW.Owner.Cancellation
+        Test.GLFW.Owner.Discipline
+        Test.GLFW.Owner.Exit.Retirement
+        Test.GLFW.Owner.Exit.Settlement
+        Test.GLFW.Owner.Extent
+        Test.GLFW.Owner.Failure.Cancellation
+        Test.GLFW.Owner.Failure.Evidence
+        Test.GLFW.Owner.Failure.Interruption
+        Test.GLFW.Owner.Failure.Reporting
+        Test.GLFW.Owner.Fixture.Drive
+        Test.GLFW.Owner.Fixture.Fake
+        Test.GLFW.Owner.Fixture.Journal
+        Test.GLFW.Owner.Fixture.Rig
+        Test.GLFW.Owner.Handover
+        Test.GLFW.Owner.Port
+        Test.GLFW.Owner.Progress
         Test.GLFW.Protected
         Test.GLFW.Render
         Test.GLFW.Scheduled
