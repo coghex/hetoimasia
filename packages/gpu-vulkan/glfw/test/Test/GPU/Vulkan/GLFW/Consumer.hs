@@ -33,6 +33,7 @@ import Hetoimasia.GPU.Model.Identity (TargetClass (..), imageGeneration)
 import Hetoimasia.GPU.Vulkan.Diagnostics (DiagnosticVerdict, verdictIssues)
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Loop (runVulkanOwnerLoop)
+import Hetoimasia.GPU.Vulkan.Native.Naming (NativeObjectKind (ObjectPipeline))
 import Hetoimasia.GPU.Vulkan.Native.Presentation (SurfaceExtent (..), formatB8G8R8A8Srgb, formatR8G8B8A8Srgb, imageUsageColorAttachment, imageUsageTransferSource)
 import Hetoimasia.GPU.Vulkan.Native.Recording
   ( ClearColor (..)
@@ -85,6 +86,7 @@ spec = describe "Vulkan consumer rendering and capture" $ do
     it "skips only the frame whose construction was refused or raised with no effect, never calling the renderer again for it, and the session continues" (bounded testRefusedConstruction)
     it "fails the session through the terminal latch, keeping the loss primary, when a construction loses the device" (bounded testTerminalConstruction)
     it "keeps a replaced pipeline and its layout while a submitted batch still holds them, and destroys it only on that batch's completion" (bounded testReplacedInFlight)
+    it "ends the owner's run, never answering a refusal, when a replacement's new pipeline cannot be named after it was committed" (bounded testReplacementUnnamed)
 
   describe "consumer teardown" $ do
     it "destroys what the consumer built, pipeline before layout, before the device on the host's normal exit, with a clean verdict" (bounded testNormalTeardown)
@@ -373,6 +375,43 @@ testReplacedInFlight = do
       PipelineGone _ → True
       LayoutGone _ → True
       _ → False
+
+testReplacementUnnamed ∷ IO ()
+testReplacementUnnamed = do
+  rig ← visibleRig
+  offerNaming rig
+  triangle ← newTriangle
+  answered ← newTVarIO False
+  renderWith rig $ VulkanRenderer $ \scene request construction recorder →
+    readTVarIO (triangleBuilt triangle) >>= \case
+      -- The second frame replaces the first's pipeline, whose new generation
+      -- is committed, and the old one replaced, before naming it raises.
+      Just (layout, old) → do
+        failNaming rig ObjectPipeline
+        answer ← replaceConstructedPipeline construction old layout shaders (requestFormat request)
+        atomically (writeTVar answered True)
+        either (pure . Left) (drawTriangle request recorder) answer
+      Nothing → renderScene (triangleRenderer triangle) scene request construction recorder
+  outcome ← runRigCaught rig $ \host control → do
+    _ ← superviseGraphicsOwner control (vulkanGraphicsOwner host)
+    [window] ← windowsOf host
+    _ ← firstFrame rig host control window
+    demandFrame host window
+    untilOwnerFailed rig host control
+    checkRuntime control
+  failure ← raisedAs @StandInFailure outcome
+  failure `shouldBe` StandInFailure "naming a ObjectPipeline raised"
+  -- The renderer was never answered, so it could not go on holding a stale
+  -- handle as though only its frame had been refused.
+  readTVarIO answered >>= (`shouldBe` False)
+  events ← frameEvents rig
+  [reason | FrameAbandoned _ _ reason ← events, "RefusedConstructionFailed" `isInfixOf` Text.unpack reason] `shouldBe` []
+  -- Both pipelines the consumer's frames committed were destroyed before the
+  -- device all the same.
+  journaled ← journal rig
+  made ← pure [pipeline | PipelineMade pipeline _ _ ← journaled]
+  length made `shouldBe` 2
+  journaled `shouldSatisfy` isSubsequenceOf ([PipelineGone pipeline | pipeline ← made] <> [DeviceDestroyed])
 
 -- ---------------------------------------------------------------------------
 -- Consumer teardown

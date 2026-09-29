@@ -68,6 +68,8 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , Creation (..)
   , raiseOnCreate
   , offerUsage
+  , offerNaming
+  , failNaming
   , renderWith
   , commandsRecorded
   , readbackByte
@@ -209,6 +211,7 @@ import Hetoimasia.GPU.Vulkan.Native.Presentation
   , imageUsageColorAttachment
   , presentModeFifo
   )
+import Hetoimasia.GPU.Vulkan.Native.Naming (Instrumentation (..), NativeObjectKind)
 import Hetoimasia.GPU.Vulkan.Native.Roots (GenerationOps (..), NativeFailure (..), RootOps (..), SwapchainRequest (..))
 import Hetoimasia.Runtime.GLFW
   ( AttachmentId
@@ -387,6 +390,10 @@ data Native = Native
   , nativeUsage ∷ !(TVar Word32)
     -- ^ The image usage every surface offers: color attachment alone unless
     -- an example offers more.
+  , nativeNaming ∷ !(TVar Bool)
+    -- ^ Whether the device offers naming, read when it is created.
+  , nativeNamingFails ∷ !(TVar (Set NativeObjectKind))
+    -- ^ The kinds of object whose naming raises from now on.
   }
 
 -- | Wait until a call is holding at this step.
@@ -429,6 +436,15 @@ offerExtent rig extent = atomically (writeTVar (nativeCurrentExtent (rigNative r
 
 scriptNative ∷ Rig → Step → Scripted → IO ()
 scriptNative rig at scripted = atomically (modifyTVar' (nativeScript (rigNative rig)) (Map.insert at scripted))
+
+-- | Have the device offer naming, as one with debug utilities does. Set it
+-- before the host starts: the roots read it when the device is created.
+offerNaming ∷ Rig → IO ()
+offerNaming rig = atomically (writeTVar (nativeNaming (rigNative rig)) True)
+
+-- | Have every later naming of an object of this kind raise 'StandInFailure'.
+failNaming ∷ Rig → NativeObjectKind → IO ()
+failNaming rig kind = atomically (modifyTVar' (nativeNamingFails (rigNative rig)) (Set.insert kind))
 
 -- | Have every surface offer this image usage from now on.
 offerUsage ∷ Rig → Word32 → IO ()
@@ -533,11 +549,19 @@ nativeLayer events native capture =
         Set.notMember surface <$> readTVarIO (nativeUnsupported native)
     , opsDeviceLoss = \failure → isJust (fromException failure ∷ Maybe StandInLoss)
     , opsNativeFailure = \failure → FailedSurfaceLost <$ (fromException failure ∷ Maybe StandInSurfaceLost)
-    , -- The stand-in device offers no naming, so nothing is named and its
-      -- queue is never asked for.
+    , -- The stand-in device offers no naming unless an example asks for it
+      -- ('offerNaming'); without it nothing is named and its queue is never
+      -- asked for.
       opsDeviceHandle = fromIntegral
     , opsDeviceQueue = \_ _ → pure 4
-    , opsInstrumentation = \_ → pure Nothing
+    , opsInstrumentation = \_ → do
+        offered ← readTVarIO (nativeNaming native)
+        pure $
+          if not offered
+            then Nothing
+            else Just . Instrumentation $ \kind _ _ → do
+              failing ← Set.member kind <$> readTVarIO (nativeNamingFails native)
+              when failing (throwIO (StandInFailure (Text.pack ("naming a " <> show kind <> " raised"))))
     , opsGenerations =
         GenerationOps
           { opsSurfaceOffer = \_ _ → do
@@ -1282,7 +1306,7 @@ newRigClocked visible windows clock = do
         , scriptFramebufferSize = \_ → readTVarIO framebuffer
         , scriptWindowAttribute = \attribute _ → (&& attribute == VisibleAttribute) <$> readTVarIO visibility
         }
-  native ← Native <$> newTVarIO Map.empty <*> newTVarIO Set.empty <*> newTVarIO 500 <*> newTVarIO Nothing <*> newTVarIO Nothing <*> newTVarIO Set.empty <*> newTVarIO imageUsageColorAttachment
+  native ← Native <$> newTVarIO Map.empty <*> newTVarIO Set.empty <*> newTVarIO 500 <*> newTVarIO Nothing <*> newTVarIO Nothing <*> newTVarIO Set.empty <*> newTVarIO imageUsageColorAttachment <*> newTVarIO False <*> newTVarIO Set.empty
   renderer ← newTVarIO Nothing
   bridge ← Bridge <$> newTVarIO Map.empty <*> newTVarIO Nothing <*> newTVarIO 100 <*> newTVarIO []
   verdict ← newTVarIO Nothing

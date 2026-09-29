@@ -330,14 +330,17 @@ andThen first second = first >>= either (pure . Left) (const second)
 --
 -- Every call is the graphics owner's: one from any other thread is refused
 -- ('RefusedNotOwner') before anything native is done, as is one after the
--- session has failed. A construction that raised with the session still
--- running settled what it made before raising — its reservation given back,
--- or the generation it could not name released — and is answered
+-- session has failed. A construction that raised before it committed any
+-- generation, with the session still running, left nothing: its creation made
+-- nothing and gave its reservation back. It is answered
 -- 'RefusedConstructionFailed', so it skips only the frame whose renderer
 -- answers it; the allocation recovery a construction runs retries it without
--- calling the renderer again. A cancellation, and a failure the session
--- latched — the device's loss, an uncertain effect, a failed cleanup — is
--- raised as it was, and ends the owner's run with the session's primary.
+-- calling the renderer again. One that raised after committing a generation —
+-- a replacement whose new pipeline could not be named has released that
+-- generation and already replaced the old one — has an effect the renderer
+-- cannot see, so it is raised as it was and ends the owner's run, as do a
+-- cancellation and a failure the session latched — the device's loss, an
+-- uncertain effect, a failed cleanup — with the session's primary.
 --
 -- A handle outlives the frame it was made in. Whatever the renderer has not
 -- released is released and destroyed on the owner's thread before the device,
@@ -360,7 +363,7 @@ instance Constructed Pipeline where
 
 -- | A pipeline layout with no descriptor sets and no push constants.
 constructPipelineLayout ∷ Construction q inst msgr phys dev cmd → IO (Either Refusal PipelineLayout)
-constructPipelineLayout construction = confined (constructionRoots construction) (createPipelineLayout (constructionRecording construction))
+constructPipelineLayout construction = confined construction (createPipelineLayout (constructionRecording construction))
 
 -- | A graphics pipeline over the layout for dynamic rendering into this color
 -- format — a frame's 'requestFormat' — drawing triangle lists with no vertex
@@ -368,7 +371,7 @@ constructPipelineLayout construction = confined (constructionRoots construction)
 constructPipeline
   ∷ Construction q inst msgr phys dev cmd → PipelineLayout → PipelineShaders → Word32 → IO (Either Refusal Pipeline)
 constructPipeline construction layout shaders format =
-  confined (constructionRoots construction) (createPipeline (constructionRecording construction) layout shaders format)
+  confined construction (createPipeline (constructionRecording construction) layout shaders format)
 
 -- | A new generation of a pipeline, over the given layout. The old one is
 -- released: nothing records it again, and a batch that recorded it keeps it,
@@ -376,32 +379,40 @@ constructPipeline construction layout shaders format =
 replaceConstructedPipeline
   ∷ Construction q inst msgr phys dev cmd → Pipeline → PipelineLayout → PipelineShaders → Word32 → IO (Either Refusal Pipeline)
 replaceConstructedPipeline construction old layout shaders format =
-  confined (constructionRoots construction) (replacePipeline (constructionRecording construction) old layout shaders format)
+  confined construction (replacePipeline (constructionRecording construction) old layout shaders format)
 
 -- | Release a handle the renderer constructed: nothing records it again, and a
 -- batch that recorded it keeps it until that batch's references end. The
 -- owner destroys it once nothing holds it.
 releaseConstructed ∷ Constructed handle ⇒ Construction q inst msgr phys dev cmd → handle → IO (Either Refusal ())
-releaseConstructed construction handle = confined (constructionRoots construction) (release (constructionRecording construction) handle)
+releaseConstructed construction handle = confined construction (release (constructionRecording construction) handle)
 
 -- | Run one construction behind the session's checkpoint, answering a
--- synchronous failure the session did not latch as the refusal it is. Only a
--- failure the checkpoint finds nothing behind is answered: whatever the
--- session latched on its way out, and every cancellation, is raised as it was.
-confined ∷ Roots q inst msgr phys dev → IO (Either Refusal a) → IO (Either Refusal a)
-confined roots action =
+-- synchronous failure that left nothing as the refusal it is. Only a failure
+-- that committed no new generation, and that the checkpoint finds nothing
+-- behind, is answered: one that committed a generation first — whatever
+-- became of it — whatever the session latched on its way out, and every
+-- cancellation, is raised as it was.
+confined ∷ Construction q inst msgr phys dev cmd → IO (Either Refusal a) → IO (Either Refusal a)
+confined construction action =
   checkpointRoots roots >>= \case
     CheckpointFailed primary → pure (Left (RefusedSessionFailed primary))
     CheckpointPending → pure (Left RefusedDiagnosticPending)
-    CheckpointClear →
+    CheckpointClear → do
+      before ← generations
       tryWithContext action >>= \case
         Right answer → pure answer
         Left failure@(ExceptionWithContext _ exception)
           | isAsynchronous exception → rethrowIO (failure ∷ ExceptionWithContext SomeException)
-          | otherwise →
+          | otherwise → do
+              after ← generations
               checkpointRoots roots >>= \case
-                CheckpointClear → pure (Left (RefusedConstructionFailed (Text.pack (displayException exception))))
+                CheckpointClear
+                  | all (`elem` before) after → pure (Left (RefusedConstructionFailed (Text.pack (displayException exception))))
                 _ → rethrowIO failure
+  where
+    roots = constructionRoots construction
+    generations = atomically (map viewResource <$> readManaged (constructionRecording construction))
 
 isAsynchronous ∷ SomeException → Bool
 isAsynchronous exception = isJust (fromException exception ∷ Maybe SomeAsyncException)
@@ -807,7 +818,7 @@ renderDue rendering renderer now scene revision due =
       | not (imageCapturable image) = Captured False Nothing <$ withhold attachment (WithheldUnsupported (imageGeneration (ownedImage owned)))
       | otherwise = do
           let bytes = readbackBytesFor (imageExtent image)
-          confined (renderingRoots rendering) (createReadback (liveRecording made) bytes) >>= \case
+          confined (Construction (liveRecording made) (renderingRoots rendering)) (createReadback (liveRecording made) bytes) >>= \case
             Left refusal → Captured False Nothing <$ withhold attachment (WithheldNoReadback refusal)
             Right readback → pure (Captured True (Just (readback, bytes)))
     withhold attachment reason = atomically (settleCapture captures attachment (CaptureWithheld attachment reason))

@@ -1714,17 +1714,20 @@ the host's package and the shaders it embeds.
   renderer that answers it in turn skips its frame under the ordinary skip
   rules — the renderer is not called again for that frame, the target's next
   frame is tried at the backoff's first interval, and the session continues. A
-  construction that *raised* with the session still running had settled what
-  it made before raising — a creation that raised created nothing and gave its
-  reservation back; a generation that could not be named was released — and
-  is answered `RefusedConstructionFailed`, confined to that frame the same way.
-  Its allocation recovery ([Recovery](#allocation-recovery)) retries a creation
-  that ran out of memory inside the construction, never by calling the
-  renderer again. A construction that raised because the session failed — the
-  device's loss, an uncertain effect, a failed cleanup, which the call latched
-  on its way out — and every cancellation are raised as they were: the owner's
-  run ends through the [terminal latch](#terminal-failure) with that primary.
-  No exception of the renderer's own is caught.
+  construction that *raised* before committing any generation, with the
+  session still running, left nothing — its creation made nothing and gave its
+  reservation back — and is answered `RefusedConstructionFailed`, confined to
+  that frame the same way. Its allocation recovery
+  ([Recovery](#allocation-recovery)) retries a creation that ran out of memory
+  inside the construction, never by calling the renderer again. One that raised
+  after committing a generation is not confined: a replacement whose new
+  pipeline could not be named has released that generation and already
+  replaced the old one, so the renderer's handle is stale, and the failure is
+  raised as it was and ends the owner's run. So does a construction that raised
+  because the session failed — the device's loss, an uncertain effect, a failed
+  cleanup, which the call latched on its way out — with that primary through
+  the [terminal latch](#terminal-failure), and so does every cancellation. No
+  exception of the renderer's own is caught.
 - **Lifetime.** A handle outlives its frame; the consumer keeps it across
   frames. A replacement publishes a new generation and releases the old one: a
   batch that recorded the old pipeline keeps it, and its layout, until that
@@ -2259,7 +2262,8 @@ and capture`, over the same stand-ins, extended to journal every command the
 recording layer is asked to record and every pipeline, layout and readback
 buffer it makes and destroys, to report each swapchain's image usage and
 whether it was created clipped, to offer a surface usage the example chooses,
-to raise once from a chosen creation, and to read every readback buffer back as
+to raise once from a chosen creation, to offer naming that raises for a chosen
+kind of object, and to read every readback buffer back as
 one known byte. They cover: each frame's format and extent reaching the
 consumer, and its own layout and pipeline — built on the owner's thread for
 that format — bound and drawn between the controller's transitions inside the
@@ -2269,7 +2273,10 @@ refused at its binding, with no bind recorded and nothing presented; a refused
 construction and one that raised having created nothing each skipping one frame,
 the renderer called once per acquired frame, the third frame presenting and the
 session running; a construction that lost the device failing the session with
-the loss primary and never reaching the renderer as a refusal; a replaced
+the loss primary and never reaching the renderer as a refusal; a replacement
+whose new pipeline could not be named, on a device offering naming, after the
+new generation was committed ending the owner's run with that failure — the
+renderer never answered, both pipelines still destroyed before the device; a replaced
 pipeline kept while the batch that bound it is in flight and destroyed only on
 its completion, the new one and the layout still standing; the consumer's
 pipeline destroyed before its layout, and both before the device, on the normal
