@@ -12,15 +12,16 @@
 -- something /not/ to happen is labelled where it is made.
 module Test.GPU.Vulkan.GLFW.Loop (spec) where
 
-import Control.Concurrent (forkIO, threadDelay)
+import Control.Concurrent (forkIO)
 import Control.Concurrent.STM (atomically, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, registerDelay, retry, writeTVar)
 import Control.Exception (Exception (..), SomeException, throwIO, toException)
-import Control.Monad (forM_, unless, void, when)
+import Control.Monad (forM, forM_, unless, void, when)
 import Data.List (isSubsequenceOf)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust, isNothing)
-import Data.Word (Word32)
+import Data.Word (Word32, Word64)
 import qualified Data.Text as Text
+import Numeric.Natural (Natural)
 import System.Timeout (timeout)
 
 import Hetoimasia.Foundation.Messaging.Payload (prepare)
@@ -465,40 +466,67 @@ testStalledMainThread = do
   servedAfter `shouldBe` True
 
 -- | A Cocoa live resize: the main thread stays inside its native event call
--- while the surface's extent changes about every 8 ms, faster than a
--- replacement's settling period, and the swapchain answers suboptimal while it
--- is stale. The owner keeps presenting from the active generation while each
+-- while the surface's extent changes every 8 ms, faster than a replacement's
+-- 16 ms settling period, and the swapchain answers suboptimal while it is
+-- stale. The owner keeps presenting from the active generation while each
 -- replacement settles, and builds one a period from the newest extent, rather
 -- than waiting for a pause that never comes.
+--
+-- The clock is scripted. Each interval offers a wider extent and publishes a
+-- scene, waits for the owner to present it and settle, then moves the clock
+-- 8 ms and waits for the owner to settle again, so every count is taken at an
+-- owner-step boundary while the pump is still held.
 testStalledLiveResize ∷ IO ()
 testStalledLiveResize = do
-  rig ← visibleRig
-  (presented, built) ← runRig rig $ \host control → do
+  rig ← scriptedRigOf 1
+  (intervals, fromActive) ← runRig rig $ \host control → do
     [window] ← windowsOf host
     service ← firstFrame rig host control window
     suboptimalWhileStale rig
+    let attachment = graphicsAttachment service
     result ← newTVarIO Nothing
     _ ← forkIO $ do
       atomically (pumpHeld rig >>= check)
-      presentedBefore ← presentsOf rig (graphicsAttachment service)
-      builtBefore ← swapchainsCreated rig
-      forM_ [1 .. 40 ∷ Word32] $ \step → do
+      intervals ← forM [1 .. 12 ∷ Word32] $ \step → do
+        presentedBefore ← presentsOf rig attachment
+        builtBefore ← length <$> swapchainsBuilt rig
         offerExtent rig (Just (SurfaceExtent (640 + step * 4) 480))
         scene ← prepare ()
         _ ← publishVulkanScene host scene
-        threadDelay 8000
-      presentedAfter ← presentsOf rig (graphicsAttachment service)
-      builtAfter ← swapchainsCreated rig
-      atomically (writeTVar result (Just (presentedAfter - presentedBefore, builtAfter - builtBefore)))
+        awaitPresents rig attachment (presentedBefore + 1)
+        presentedIn ← maybe 0 (+ 1) . lastMaybe <$> presentRounds rig
+        awaitOwnerSettled rig host presentedIn
+        -- A deadline the move reaches leaves the settled status behind the
+        -- clock until the round that meets it; one it does not reach wakes
+        -- nothing.
+        rounds ← statusRounds <$> atomically (readOwnerStatusNow (vulkanGraphicsOwner host))
+        advanceClock rig 8
+        awaitOwnerSettled rig host rounds
+        presentedAfter ← presentsOf rig attachment
+        built ← map snd . drop builtBefore <$> swapchainsBuilt rig
+        pure (presentedAfter - presentedBefore, built)
+      fromActive ← presentedFromNewest <$> journal rig
+      atomically (writeTVar result (Just (intervals, fromActive)))
       holdPump rig False
     holdPump rig True
     composedUntil rig host control "the end of the live resize" (\_ → pure ()) (isJust <$> readTVarIO result)
-    readTVarIO result >>= maybe (throwIO (StandInFailure (Text.pack "the live resize reported nothing"))) pure
-  -- Forty scenes over about 320 ms: the owner presents throughout, where a
-  -- rule that waits for the geometry to be quiet would present almost none,
-  -- and builds several replacements, where it would build none.
-  presented `shouldSatisfy` (>= 10)
-  built `shouldSatisfy` (>= 3)
+    measured ← readTVarIO result >>= maybe (throwIO (StandInFailure (Text.pack "the live resize reported nothing"))) pure
+    letExitFinish rig
+    pure measured
+  -- A move is first seen by the suboptimal presentation of an odd interval's
+  -- scene and settles 16 ms later, at the end of the next interval: that
+  -- interval builds one replacement from the extent it offered, the newest,
+  -- and presents a frame of it besides its scene's. A rule that waited for the
+  -- geometry to be quiet would build none.
+  intervals
+    `shouldBe` [ if even step then (2, [(640 + step * 4, 480)]) else (1, [])
+               | step ← [1 .. 12 ∷ Word32]
+               ]
+  fromActive `shouldBe` True
+  where
+    lastMaybe = \case
+      [] → Nothing
+      held → Just (last held)
 
 testLossAtCheckpoint ∷ IO ()
 testLossAtCheckpoint = do
@@ -1039,6 +1067,32 @@ awaitAnchoredAfterPresent rig host = do
     lastMaybe = \case
       [] → Nothing
       held → Just (last held)
+
+-- | Wait until the owner has completed at least this many rounds and
+-- settled: its last step owes nothing at once, and its deadline, if it has
+-- one, is ahead of the scripted clock. Nothing then wakes it until the clock
+-- moves or something is published.
+awaitOwnerSettled ∷ Rig → VulkanHost Scene → Natural → IO ()
+awaitOwnerSettled rig host rounds = do
+  now ← clockNow rig
+  atomically $ do
+    status ← readOwnerStatusNow (vulkanGraphicsOwner host)
+    check (statusRounds status >= rounds && not (statusImmediate status) && maybe True (> now) (statusNextDeadline status))
+
+-- | Every swapchain created so far, oldest first, with its extent.
+swapchainsBuilt ∷ Rig → IO [(Word64, (Word32, Word32))]
+swapchainsBuilt rig = (\events → [(handle, size) | SwapchainCreated handle size _ ← events]) <$> journal rig
+
+-- | Whether every presentation went to the newest swapchain created before
+-- it: the active generation's, never one a replacement retired.
+presentedFromNewest ∷ [Event] → Bool
+presentedFromNewest = go Nothing
+  where
+    go newest = \case
+      [] → True
+      SwapchainCreated handle _ _ : rest → go (Just handle) rest
+      ImagePresented swapchain _ : rest → newest == Just swapchain && go newest rest
+      _ : rest → go newest rest
 
 -- | The owner's published deadline, once it is later than this instant.
 awaitDeadlineAfter ∷ VulkanHost Scene → Instant → IO Instant
