@@ -49,6 +49,39 @@ Only `Hetoimasia.GPU.Model`, `Hetoimasia.GPU.Model.Budget` and
 `Hetoimasia.GPU.Model.Internal` modules, which is what makes an identity
 unforgeable: no client can build one, so every value a model is handed was issued
 by some model, and the model it reaches can say whether that model was this one.
+External-client examples in the suite import each implementation module and
+require the compiler to refuse it as hidden in this library.
+
+### Implementation modules
+
+The hidden implementation is one immutable `GpuModel` value divided by
+responsibility. Every import points to a lower layer or to a sibling that does
+not import back, so the graph is acyclic without boot files. The modules below
+are all under `Hetoimasia.GPU.Model.Internal`.
+
+| Layer                  | Modules | Owns |
+| ---------------------- | ------- | ---- |
+| Value types            | `Identity`, `Hold`, `Budget`, `Recovery` | Identities and misuse, the hold ledger, validated budgets, and per-episode recovery and backoff policy |
+| Representation         | `Records`, `State` | The records a session holds; the `GpuModel` value, its construction, `Outcome`, and the session state that gates admission |
+| Shared building blocks | `Resolve`, `Accounting` | Identity resolution and misuse classification; record edits, object and byte accounting, and freeing a frame slot whose obligations have ended |
+| Read-only queries      | `Work` | The work summary, the one disposal-eligibility rule, replacements owed, and recovery deadlines |
+| Scheduling             | `Scheduling` | The one scheduling rule and the wrappers every transition applies it through |
+| Transitions            | `Session`, `Targets`, `Generations`, `Resources`, `Frames`, `Recording`, `Submission`, `Presentation`, `Completion`, `TargetRecovery`, `Disposal` | Escalation and device loss; target, generation, managed-resource and allocation lifecycles; reservation and acquisition; recorded batches; submission; presentation and abandonment; injected evidence; recovery transitions; disposal and reclamation |
+| Composition            | `Progress` | Owner turns and the deadline of the next one |
+| Views                  | `Observation` | Hold, frame and target views, usage, and the live record count |
+
+The queries sit below every transition because the schedule is decided from
+them: each transition compares the work summary before and after itself, and
+that summary counts disposable subjects, owed replacements and recovery
+deadlines. `Work`'s `eligible` is the only rule for offering a subject for
+disposal — a retired generation or a managed resource, every hold ended, and no
+earlier failed disposal — and the work summary, owner progress and reclamation
+all read it. The public `disposalEligible` is a narrower observation: it answers
+only whether a live subject still owes a hold, and never authorizes a disposal or
+a retry after one failed. `Recovery` is the episode policy as values;
+`TargetRecovery` applies it to the model's targets. Within the transition layer,
+`Presentation` builds on `Recording`'s batch discard and `Disposal` on
+`Completion`'s evidence interface, and nothing imports back.
 
 ## Answers
 
@@ -640,7 +673,10 @@ drains with `takeEscalations` never reaches the bound.
 
 The model owns no mutable state at all: it is an immutable value, and every
 operation returns the next one. Concurrency, if any, belongs to the boundary that
-threads it.
+threads it. Dividing the implementation into modules divides no state: the value's
+representation is `Internal.State` and `Internal.Records`, and each transition
+module changes only the part its responsibility names, through the shared edits in
+`Internal.Accounting` and under the one scheduling rule in `Internal.Scheduling`.
 
 ## What this contract does not promise
 
