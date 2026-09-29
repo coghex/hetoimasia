@@ -338,14 +338,20 @@ and `noProbe` live in `Worker.Types`, beside the group that holds it;
 it on each cancellation helper. The foundation's own tests import it from the
 facade.
 
-The probe's one point runs on a cancellation helper after its delivery attempt
-has ended and before the helper records it and deregisters. A terminal worker
-with a helper still pending otherwise lasts only as long as the scheduler takes
-to run the helper's next transaction; holding the helper there lets the
-foundation's own examples observe that state, and the drain waiting on it, with
-explicit coordination. A production group's probe does nothing, and no client
-can install one: a private sublibrary is visible only to the package's own
-components.
+The probe has two points, both on a cancellation helper's own thread.
+`probeHelperDelivering` runs once the helper has found the worker's thread with
+the worker not yet terminal, immediately before its `throwTo`. Scheduling alone
+does not say when a separately forked helper reaches that call. Naming the
+helper's thread there lets an example wait until the thread is actually blocked
+delivering to an uninterruptible worker, rather than inferring it from the
+owner's state. `probeHelperSettling` runs after the delivery attempt has ended
+and before the helper records it and deregisters. Otherwise, a terminal worker
+with a helper still pending lasts only as long as the scheduler takes to run
+the helper's next transaction. Holding the helper there lets the foundation's
+own examples observe that state, and the drain waiting on it, with explicit
+coordination. A synchronous failure raised by either point is discarded. A
+production group's probe does nothing, and no client can install one: a
+private sublibrary is visible only to the package's own components.
 
 ## Module structure
 

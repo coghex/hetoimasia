@@ -147,8 +147,15 @@ data WorkerGroup = WorkerGroup
 
 -- | Coordination points on the group's own production path, for the
 -- foundation's tests. Every production group uses 'noProbe'.
-newtype GroupProbe = GroupProbe
-  { probeHelperSettling ∷ WorkerId → IO ()
+data GroupProbe = GroupProbe
+  { probeHelperDelivering ∷ WorkerId → IO ()
+    -- ^ Runs on a cancellation helper that has found the worker's thread with
+    -- the worker not yet terminal, immediately before the helper delivers
+    -- 'Hetoimasia.Foundation.Worker.WorkerCancelled' to it with 'throwTo'.
+    -- It runs on the helper's own thread, so a probe can name that thread
+    -- and then observe it blocked in the delivery. A synchronous failure it
+    -- raises is discarded and the delivery still happens.
+  , probeHelperSettling ∷ WorkerId → IO ()
     -- ^ Runs on a cancellation helper once its delivery attempt has ended —
     -- delivered, skipped because the worker was already terminal, or failed —
     -- and before the helper records the attempt and deregisters. Until it
@@ -159,7 +166,7 @@ newtype GroupProbe = GroupProbe
 
 -- | The probe of every production group: it does nothing.
 noProbe ∷ GroupProbe
-noProbe = GroupProbe (\_ → pure ())
+noProbe = GroupProbe (\_ → pure ()) (\_ → pure ())
 
 -- Handles and definitions ----------------------------------------------------
 
