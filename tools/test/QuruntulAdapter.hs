@@ -4,12 +4,15 @@
 -- validation catalog through a stub context, needing neither quruntul nor a
 -- compiler, display or network. Both files, like the Git history they read,
 -- exist only in a checkout, so from a source distribution each example is
--- pending rather than failing.
+-- pending rather than failing. They read the checkout's own history, so they
+-- inherit the caller's Git configuration (a CI container's safe.directory, for
+-- one) rather than the sanitized environment the fixture repositories use.
 module QuruntulAdapter (spec) where
 
 import Control.Monad (forM_)
-import Sandbox (run, sanitizedEnvironment)
+import Sandbox (run)
 import System.Directory (doesDirectoryExist, doesFileExist, getCurrentDirectory)
+import System.Environment (getEnvironment)
 import System.Exit (ExitCode (ExitSuccess))
 import System.FilePath ((</>))
 import Test.Hspec (Spec, describe, it, pendingWith, shouldBe)
@@ -34,6 +37,6 @@ spec = describe "Quruntul adapter" $
         if not checks || not (checkout || repository)
           then pendingWith "the quruntul adapter and the Git history it reads are checkout-only"
           else do
-            environment ← sanitizedEnvironment
+            environment ← getEnvironment
             (result, output, errors) ← run environment root "python3" [".quruntul/checks.py", "AdapterChecks." ++ name]
             (result, if result == ExitSuccess then "" else output ++ errors) `shouldBe` (ExitSuccess, "")
