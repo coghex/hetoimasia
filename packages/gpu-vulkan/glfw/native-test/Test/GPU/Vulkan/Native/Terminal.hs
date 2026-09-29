@@ -102,9 +102,11 @@ import Hetoimasia.GPU.Vulkan.Diagnostics
   , CaptureOrder (..)
   , SinkFailure (..)
   , captureAlarms
-  , captureSinkFailure
+  , readCaptureSinkFailure
   , captureStatus
   , claimCaptureOrder
+  , CaptureArrivals (..)
+  , captureArrivals
   , defaultCaptureConfig
   , diagnosticVerdict
   , verdictIssues
@@ -164,6 +166,7 @@ import Hetoimasia.GPU.Vulkan.Native.Roots
   , startRoots
   , watchRootsDiagnosticsOrdered
   , DiagnosticWatch (..)
+  , DiagnosticArrivals (..)
   , DiagnosticOrder (..)
   )
 import Hetoimasia.GPU.Vulkan.Native.Roots.Vulkan (instancePointer, vulkanRootOps)
@@ -221,9 +224,9 @@ data Step = Step
 order ∷ DiagnosticCapture → IO DiagnosticOrder
 order capture =
   claimCaptureOrder capture >>= \case
-    OwnerFailedFirst → pure OwnerFirst
+    OwnerFailedFirst → (\arrived → OwnerFirst (DiagnosticArrivals (arrivedError arrived) (arrivedSink arrived) (arrivedSinkFirst arrived))) <$> captureArrivals capture
     ErrorLatchedFirst → pure ValidationFirst
-    SinkFailedFirst → pure (SinkFirst (fmap sinkFailureReason <$> captureSinkFailure capture))
+    SinkFailedFirst → pure (SinkFirst (fmap sinkFailureReason <$> readCaptureSinkFailure capture))
 
 -- | What the capture's latches say, as a checkpoint asks them: the error latch
 -- and the sink's failure. The controller installs the same watch.

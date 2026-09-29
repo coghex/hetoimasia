@@ -127,10 +127,32 @@ typedef struct capture_slot {
      consumer's sink. Claimed once, by compare-and-swap, by whichever gets
      there first, and never changed again. */
   _Atomic int first_failure;
+  /* Which diagnostic failures have arrived, each recorded before it tries to
+     claim first_failure, so one that lost the claim is still seen: the kinds
+     in bits 0 and 1, and the kind that arrived first in bits 2 and 3, set in
+     the one compare-and-swap that records the first arrival. */
+  _Atomic int arrived;
 } capture_slot;
 
 /* Zero-initialized: every slot free, closed with no storage, generation 0. */
 static capture_slot slots[HETOIMASIA_CAPTURE_SLOTS];
+
+/* Record a diagnostic failure's arrival, and, if none arrived before it, that
+   it arrived first: one compare-and-swap publishes both, so no reader sees
+   which came first without seeing that it has arrived. */
+static void note_arrival(capture_slot *slot, int kind)
+{
+  int seen = atomic_load(&slot->arrived);
+  for (;;) {
+    int next = seen | kind;
+    if ((seen & 3) == 0) {
+      next |= kind << 2;
+    }
+    if (atomic_compare_exchange_weak(&slot->arrived, &seen, next)) {
+      return;
+    }
+  }
+}
 
 /* The user data for a slot and generation. Never NULL: the index is biased. */
 static void *encode_user_data(uint32_t slot, uint64_t generation)
@@ -234,6 +256,7 @@ int hetoimasia_capture_create(
     atomic_store(&slot->counters[counter], 0);
   }
   atomic_store(&slot->first_failure, HETOIMASIA_CAPTURE_FIRST_NONE);
+  atomic_store(&slot->arrived, 0);
 
   storage->slot = index;
   storage->generation = generation;
@@ -475,7 +498,8 @@ static uint32_t capture(
      storage and a missing payload must none of them hide an error. */
   if (severity & HETOIMASIA_CAPTURE_SEVERITY_ERROR) {
     /* Claimed before the latch is set, so a reader that sees the latch sees
-       whether the error came first. */
+       whether the error came first; its arrival is recorded before either. */
+    note_arrival(slot, HETOIMASIA_CAPTURE_ARRIVED_ERROR);
     int none = HETOIMASIA_CAPTURE_FIRST_NONE;
     atomic_compare_exchange_strong(&slot->first_failure, &none, HETOIMASIA_CAPTURE_FIRST_ERROR);
     atomic_store(&slot->latches[HETOIMASIA_CAPTURE_ERROR_LATCH], 1);
@@ -697,6 +721,7 @@ int hetoimasia_capture_note_sink_failure(void *user_data)
   if (slot == NULL || atomic_load(&slot->generation) != generation) {
     return 0;
   }
+  note_arrival(slot, HETOIMASIA_CAPTURE_ARRIVED_SINK);
   int none = HETOIMASIA_CAPTURE_FIRST_NONE;
   atomic_compare_exchange_strong(&slot->first_failure, &none, HETOIMASIA_CAPTURE_FIRST_SINK);
   return atomic_load(&slot->generation) == generation;
@@ -713,6 +738,17 @@ int hetoimasia_capture_claim_owner_failure(void *user_data)
   atomic_compare_exchange_strong(&slot->first_failure, &none, HETOIMASIA_CAPTURE_FIRST_OWNER);
   int first = atomic_load(&slot->first_failure);
   return atomic_load(&slot->generation) == generation ? first : -1;
+}
+
+int hetoimasia_capture_arrived_failures(void *user_data)
+{
+  uint64_t generation;
+  capture_slot *slot = decode_user_data(user_data, &generation);
+  if (slot == NULL || atomic_load(&slot->generation) != generation) {
+    return -1;
+  }
+  int arrived = atomic_load(&slot->arrived);
+  return atomic_load(&slot->generation) == generation ? arrived : -1;
 }
 
 int hetoimasia_capture_first_failure(void *user_data)

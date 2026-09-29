@@ -18,14 +18,18 @@
 -- device is lost natively and nothing waits on a clock.
 module Test.GPU.Vulkan.Native.Terminal (spec) where
 
-import Control.Concurrent (forkIO, threadDelay)
-import Control.Concurrent.STM (atomically, newTVarIO, readTVar, readTVarIO, stateTVar, writeTVar)
-import Control.Exception (SomeException, throwIO, toException)
-import Control.Monad (forM_, void, when)
+import Control.Concurrent (forkIO, killThread, myThreadId, threadDelay)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent.STM (atomically, newTVarIO, readTVarIO, throwSTM, writeTVar)
+import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall), Exception, SomeException, fromException, mask, throwIO, toException, try)
+import Control.Monad (forM_, join, void, when)
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (nub)
-import Data.Maybe (isJust)
+import Data.Maybe (fromMaybe, isJust)
 import Data.List.NonEmpty (NonEmpty ((:|)))
-import Test.Hspec (Expectation, Spec, describe, it, shouldBe, shouldNotReturn, shouldReturn, shouldSatisfy)
+import Data.Text (Text)
+import Test.Hspec (Expectation, Spec, describe, it, shouldBe, shouldNotReturn, shouldReturn, shouldSatisfy, shouldThrow)
+import Test.Support.Bounded (bounded)
 
 import Hetoimasia.GPU.Model
   ( DeviceLossRelease (..)
@@ -54,13 +58,17 @@ import Hetoimasia.GPU.Vulkan.Native.Generations
 import Hetoimasia.GPU.Vulkan.Native.Presentation (SurfaceExtent (..))
 import Hetoimasia.GPU.Vulkan.Native.Recording (Refusal (..), recordFrame, retireRecording)
 import Hetoimasia.GPU.Vulkan.Native.Roots
-  ( DiagnosticAlarm (..)
+  ( Checkpoint (..)
+  , DiagnosticAlarm (..)
   , GraphicsDeviceLost (..)
   , RootsRetained (..)
   , TargetGenerationsRemain (..)
   , TeardownEvidence (..)
   , TerminalCause (..)
   , TerminalReport (..)
+  , checkpointRoots
+  , checkpointRootsSettled
+  , failRootsSessionBecause
   , readRootsTerminal
   , retireRootTarget
   , retireRoots
@@ -68,6 +76,7 @@ import Hetoimasia.GPU.Vulkan.Native.Roots
   , watchRootsDiagnosticsOrdered
   , DiagnosticWatch (..)
   , DiagnosticOrder (..)
+  , DiagnosticArrivals (..)
   )
 import Test.GPU.Vulkan.Native.FramesRig
 import Test.GPU.Vulkan.Native.FramesStandIn
@@ -155,22 +164,196 @@ spec = describe "Terminal failure" $ do
       tornDownUnderLoss rig
 
   describe "the primary failure" $ do
-    it "stays pending while a failure of the owner's own holds first place unrecorded, then keeps it as the primary ahead of a later validation error" $ do
+    it "stays pending while a failure of the owner's own holds first place in a transaction still running, then keeps it as the primary ahead of a later validation error" $ do
       rig ← newRig
       _ ← pendingPresentation rig
-      -- The owner has claimed first place for its loss and its transaction
-      -- has not committed; an error reached the capture after the claim.
-      atomically (watchRootsDiagnosticsOrdered (rigRoots rig) (DiagnosticWatch (pure [AlarmOwnerClaimed, AlarmValidationError]) (pure OwnerFirst)))
-      -- A checkpoint in that moment latches nothing and refuses.
-      tryAcquireFrame (rigFrames rig) (rigTarget rig) `shouldReturn` Left RefusedDiagnosticPending
-      reportPrimary <$> atomically (readRootsTerminal (rigRoots rig)) `shouldReturn` Nothing
-      -- The owner's transaction records its loss.
+      capture ← newFakeCapture
+      atomically (watchRootsDiagnosticsOrdered (rigRoots rig) (fakeWatch capture))
+      -- The owner's progress step loses the device and claims first place for
+      -- the loss. Before its transaction commits, an error reaches the
+      -- capture and another thread checkpoints.
+      seen ← newEmptyMVar
+      holdNextClaim capture $ do
+        reportValidationError capture
+        answered ← newEmptyMVar
+        _ ← forkIO $ do
+          answer ← checkpointRoots (rigRoots rig)
+          latched ← reportPrimary <$> atomically (readRootsTerminal (rigRoots rig))
+          putMVar answered (answer, latched)
+        takeMVar answered >>= putMVar seen
       loseFrameStep (rigStandIn rig) AtQueryFence
       progress rig `raises` \loss → lostDuring loss == "vkGetFenceStatus"
+      -- That checkpoint latched nothing and refused.
+      takeMVar seen `shouldReturn` (CheckpointPending, Nothing)
       tryAcquireFrame (rigFrames rig) (rigTarget rig) `shouldReturn'` (`shouldSatisfy` sessionRefused lostLoss)
       primaryIs rig lostLoss
       evidenceOf rig `shouldReturn'` (`shouldSatisfy` elem (LaterFailure TerminalValidationError))
       tornDownUnderLoss rig
+
+    it "holds nothing back for a claim whose transaction was abandoned: a settled checkpoint answers, and a validation error that follows is latched" $ do
+      rig ← newRig
+      capture ← newFakeCapture
+      atomically (watchRootsDiagnosticsOrdered (rigRoots rig) (fakeWatch capture))
+      abandonClaim rig
+      -- Nothing has failed: the settled checkpoint answers clear rather than
+      -- waiting for a record no transaction will make, and work is admitted.
+      bounded (checkpointRootsSettled (rigRoots rig)) `shouldReturn` CheckpointClear
+      frame ← owned rig
+      -- A diagnostic failure after it is not hidden behind the void claim.
+      reportValidationError capture
+      checkpointRoots (rigRoots rig) `shouldReturn` CheckpointFailed TerminalValidationError
+      evidenceOf rig `shouldReturn` []
+      recordFrame (rigRecording rig) (ownedFrame frame) (\_ → pure ()) `shouldReturn'` (`shouldSatisfy` sessionRefused (== TerminalValidationError))
+      clean rig
+
+    it "holds nothing back for a claim abandoned by a thread that is still running" $ do
+      rig ← newRig
+      capture ← newFakeCapture
+      atomically (watchRootsDiagnosticsOrdered (rigRoots rig) (fakeWatch capture))
+      abandoned ← newEmptyMVar
+      release ← newEmptyMVar
+      -- The claimant rolls its transaction back and carries on, never reaching
+      -- another checkpoint of its own.
+      _ ← forkIO (abandonClaim rig >> putMVar abandoned () >> takeMVar release)
+      bounded (takeMVar abandoned)
+      checkpointRoots (rigRoots rig) `shouldReturn` CheckpointClear
+      reportValidationError capture
+      checkpointRoots (rigRoots rig) `shouldReturn` CheckpointFailed TerminalValidationError
+      evidenceOf rig `shouldReturn` []
+      putMVar release ()
+      clean rig
+
+    it "keeps a sink failure that arrived behind an abandoned claim pending until it publishes, and orders a later failure of the owner's own behind it" $ do
+      rig ← newRig
+      capture ← newFakeCapture
+      atomically (watchRootsDiagnosticsOrdered (rigRoots rig) (fakeWatch capture))
+      abandonClaim rig
+      -- The sink fails behind the void claim and its worker has not yet
+      -- published why: something has failed, so nothing is clear.
+      noteSinkFailure capture
+      checkpointRoots (rigRoots rig) `shouldReturn` CheckpointPending
+      -- The owner's next failure waits for the reason, which is published once
+      -- it has looked and found it pending.
+      afterNextAlarms capture (publishSinkFailure capture "the sink is gone")
+      atomically (failRootsSessionBecause (rigRoots rig) CleanupFailed "a later cleanup failed")
+      primaryIs rig (== TerminalSinkFailed "the sink is gone")
+      evidenceOf rig `shouldReturn` [LaterFailure (TerminalCleanupFailed "a later cleanup failed")]
+      clean rig
+
+    it "orders a failure of the owner's own behind the validation error that followed an abandoned claim" $ do
+      rig ← newRig
+      capture ← newFakeCapture
+      atomically (watchRootsDiagnosticsOrdered (rigRoots rig) (fakeWatch capture))
+      abandonClaim rig
+      reportValidationError capture
+      -- No checkpoint runs between: the next failure of the owner's own finds
+      -- the void claim still holding the capture's first place.
+      atomically (failRootsSessionBecause (rigRoots rig) CleanupFailed "a later cleanup failed")
+      primaryIs rig (== TerminalValidationError)
+      evidenceOf rig `shouldReturn` [LaterFailure (TerminalCleanupFailed "a later cleanup failed")]
+      clean rig
+
+    it "latches a sink failure and a validation error that followed an abandoned claim in the order they arrived, at a checkpoint" $ do
+      rig ← newRig
+      capture ← newFakeCapture
+      atomically (watchRootsDiagnosticsOrdered (rigRoots rig) (fakeWatch capture))
+      abandonClaim rig
+      noteSinkFailure capture
+      publishSinkFailure capture "the sink is gone"
+      reportValidationError capture
+      checkpointRoots (rigRoots rig) `shouldReturn` CheckpointFailed (TerminalSinkFailed "the sink is gone")
+      evidenceOf rig `shouldReturn` [LaterFailure TerminalValidationError]
+      clean rig
+
+    it "keeps a sink failure that arrived first behind an abandoned claim pending while a validation error follows it, then latches it first" $ do
+      rig ← newRig
+      capture ← newFakeCapture
+      atomically (watchRootsDiagnosticsOrdered (rigRoots rig) (fakeWatch capture))
+      abandonClaim rig
+      -- The sink's worker records its arrival and pauses before publishing;
+      -- an error arrives and latches meanwhile.
+      noteSinkFailure capture
+      reportValidationError capture
+      checkpointRoots (rigRoots rig) `shouldReturn` CheckpointPending
+      publishSinkFailure capture "the sink is gone"
+      checkpointRoots (rigRoots rig) `shouldReturn` CheckpointFailed (TerminalSinkFailed "the sink is gone")
+      evidenceOf rig `shouldReturn` [LaterFailure TerminalValidationError]
+      clean rig
+
+    it "orders a failure of the owner's own behind a sink failure and a validation error that followed an abandoned claim, in the order they arrived" $ do
+      rig ← newRig
+      capture ← newFakeCapture
+      atomically (watchRootsDiagnosticsOrdered (rigRoots rig) (fakeWatch capture))
+      abandonClaim rig
+      noteSinkFailure capture
+      publishSinkFailure capture "the sink is gone"
+      reportValidationError capture
+      atomically (failRootsSessionBecause (rigRoots rig) CleanupFailed "a later cleanup failed")
+      primaryIs rig (== TerminalSinkFailed "the sink is gone")
+      evidenceOf rig `shouldReturn` [LaterFailure TerminalValidationError, LaterFailure (TerminalCleanupFailed "a later cleanup failed")]
+      clean rig
+
+    it "keeps a failure of the owner's own that claims over an abandoned claim ahead of a validation error that arrives just after its claim" $ do
+      rig ← newRig
+      capture ← newFakeCapture
+      atomically (watchRootsDiagnosticsOrdered (rigRoots rig) (fakeWatch capture))
+      abandonClaim rig
+      -- The next failure of the owner's own claims over the void claim, and
+      -- the error arrives as that claim returns.
+      holdNextClaim capture (reportValidationError capture)
+      atomically (failRootsSessionBecause (rigRoots rig) CleanupFailed "a later cleanup failed")
+      primaryIs rig (== TerminalCleanupFailed "a later cleanup failed")
+      checkpointRoots (rigRoots rig) `shouldReturn` CheckpointFailed (TerminalCleanupFailed "a later cleanup failed")
+      evidenceOf rig `shouldReturn` [LaterFailure TerminalValidationError]
+      clean rig
+
+    it "records an uncertain presentation whole when a cancellation aimed at the owner arrives while a sink failure that claimed first place is unpublished" $ do
+      rig ← newRig
+      frame ← owned rig
+      _ ← sealed rig frame >>= \batch → submitted rig (batch :| [])
+      scriptPresent (rigStandIn rig) [PresentRaisingUnwritten (toException (ErrorCall "the driver failed"))]
+      -- The sink's worker has claimed first place and not yet published why.
+      -- The presentation's record finds that out inside its transaction, and a
+      -- cancellation is then aimed at the owner and held there, waiting.
+      looks ← newIORef (0 ∷ Int)
+      let published = do
+            look ← atomicModifyIORef' looks (\count → (count + 1, count))
+            if look == 0
+              then do
+                owner ← myThreadId
+                killer ← forkIO (killThread owner)
+                awaitThrowing killer
+                pure Nothing
+              else pure (Just "the sink is gone")
+      atomically (watchRootsDiagnosticsOrdered (rigRoots rig) (DiagnosticWatch (pure []) (pure (SinkFirst published))))
+      -- The presentation runs on the owner's thread, which the cancellation is
+      -- aimed at; one still pending when it returns is delivered, and caught,
+      -- just after.
+      (presented, after) ← mask $ \restore → do
+        presented ← try @SomeException (restore (presentFrame (rigFrames rig) (ownedFrame frame)))
+        after ← try @SomeException (restore (pure ()))
+        pure (presented, after)
+      [failure | Left failure ← [void presented, after]] `shouldSatisfy` \case
+        [cancellation] → fromException cancellation == Just ThreadKilled
+        [effect, cancellation] → isJust (fromException @FrameEffectUncertain effect) && fromException cancellation == Just ThreadKilled
+        _ → False
+      -- The record is whole: the frame and its synchronization are uncertain,
+      -- admission is closed, the sink failure is the primary and the owner's
+      -- uncertain effect is kept beside it.
+      standingOf rig (ownedFrame frame) `shouldReturn'` (`shouldSatisfy` maybe False uncertainStage)
+      [PoolView _ number pool] ← atomically (readPool (rigFrames rig))
+      poolFenceState pool `shouldSatisfy` \case
+        FenceUncertain _ → True
+        _ → False
+      poolRenderedState pool `shouldSatisfy` \case
+        SemaphoreUncertain _ → True
+        _ → False
+      primaryIs rig (== TerminalSinkFailed "the sink is gone")
+      evidenceOf rig `shouldReturn'` (`shouldSatisfy` any (\case LaterFailure (TerminalUncertainEffect _) → True; _ → False))
+      refusedPrimary rig `shouldReturn` Just (TerminalSinkFailed "the sink is gone")
+      settleAll rig
+      retireTargetFrames (rigFrames rig) (rigTarget rig) `raises` \(FramesRetained _ frames' _ _ pools) → frames' == [ownedFrame frame] && pools == [number]
+      clean rig
 
     it "keeps a validation error reported during a call as the primary when that call then returns the device's loss" $ do
       rig ← newRig
@@ -262,12 +445,12 @@ spec = describe "Terminal failure" $ do
       -- The submission's own checkpoint reads nothing; the error is reported
       -- from inside the call, which then raises with an effect the frames
       -- cannot know.
-      looks ← newTVarIO (0 ∷ Int)
+      looks ← newIORef (0 ∷ Int)
       atomically $
         watchRootsDiagnosticsOrdered (rigRoots rig) $
           DiagnosticWatch
             ( do
-                seen ← atomically (stateTVar looks (\count → (count, count + 1)))
+                seen ← atomicModifyIORef' looks (\count → (count + 1, count))
                 pure [AlarmValidationError | seen > 0]
             )
             (pure ValidationFirst)
@@ -380,7 +563,7 @@ spec = describe "Terminal failure" $ do
         threadDelay 50000
         atomically (writeTVar published (Just "the sink is gone"))
       exhaustRecoveryAfter rig required $
-        atomically (watchRootsDiagnosticsOrdered (rigRoots rig) (DiagnosticWatch (pure []) (pure (SinkFirst (readTVar published)))))
+        atomically (watchRootsDiagnosticsOrdered (rigRoots rig) (DiagnosticWatch (pure []) (pure (SinkFirst (readTVarIO published)))))
       primaryIs rig (== TerminalSinkFailed "the sink is gone")
       evidenceOf rig `shouldReturn` []
       viewCondition <$> generationsOn rig required `shouldNotReturn` RecoverySpent
@@ -500,6 +683,126 @@ twoTargets ∷ Rig → IO (TargetId, TargetId)
 twoTargets rig = case rigTargets rig of
   [first, second] → pure (first, second)
   other → fail ("the rig should have two targets, not " <> show other)
+
+-- | A diagnostic capture's order and alarms kept as the real capture keeps
+-- them: one first place that whichever failure claims it first holds for good
+-- — an error-severity report, the sink, or the owner — beside the error latch,
+-- the sink's published reason, and which diagnostic failures have arrived and
+-- which first, each recorded before it tries to claim; answered as
+-- 'captureAlarms' answers them. The owner's next claim, and the next reading of the alarms, can each
+-- run an action once.
+data FakeCapture = FakeCapture
+  { fakeFirst ∷ IORef (Maybe FakeFirst)
+  , fakeErrorArrived ∷ IORef Bool
+  , fakeErrorLatched ∷ IORef Bool
+  , fakeSinkArrived ∷ IORef Bool
+  , fakeFirstArrived ∷ IORef (Maybe FakeFirst)
+  , fakeSinkReason ∷ IORef (Maybe Text)
+  , fakeAfterClaim ∷ IORef (IO ())
+  , fakeAfterAlarms ∷ IORef (IO ())
+  }
+
+data FakeFirst = FakeOwner | FakeError | FakeSink
+  deriving (Eq, Show)
+
+newFakeCapture ∷ IO FakeCapture
+newFakeCapture =
+  FakeCapture
+    <$> newIORef Nothing
+    <*> newIORef False
+    <*> newIORef False
+    <*> newIORef False
+    <*> newIORef Nothing
+    <*> newIORef Nothing
+    <*> newIORef (pure ())
+    <*> newIORef (pure ())
+
+-- | The watch the controller would install over the capture. Neither half runs
+-- a transaction, since the roots read both inside theirs.
+fakeWatch ∷ FakeCapture → DiagnosticWatch
+fakeWatch capture = DiagnosticWatch alarms order
+  where
+    alarms = do
+      latched ← readIORef (fakeErrorLatched capture)
+      sink ← readIORef (fakeSinkReason capture)
+      first ← readIORef (fakeFirst capture)
+      errorArrived ← readIORef (fakeErrorArrived capture)
+      sinkArrived ← readIORef (fakeSinkArrived capture)
+      sinkFirst ← (== Just FakeSink) <$> readIORef (fakeFirstArrived capture)
+      let errors = [AlarmValidationError | latched]
+          sinks = [AlarmSinkFailed reason | Just reason ← [sink]]
+          unpublished = (errorArrived && null errors) || (sinkArrived && null sinks)
+          answer = case first of
+            Just FakeSink
+              | null sinks → [AlarmPending]
+              | otherwise → sinks <> errors
+            Just FakeError
+              | null errors → [AlarmPending]
+            Just FakeOwner → AlarmOwnerClaimed : [AlarmPending | unpublished] <> if sinkFirst then sinks <> errors else errors <> sinks
+            _ → errors <> sinks
+      once (fakeAfterAlarms capture)
+      pure answer
+    order = do
+      first ← atomicModifyIORef' (fakeFirst capture) (\held → let first = fromMaybe FakeOwner held in (Just first, first))
+      arrived ←
+        DiagnosticArrivals
+          <$> readIORef (fakeErrorArrived capture)
+          <*> readIORef (fakeSinkArrived capture)
+          <*> ((== Just FakeSink) <$> readIORef (fakeFirstArrived capture))
+      once (fakeAfterClaim capture)
+      pure $ case first of
+        FakeError → ValidationFirst
+        FakeSink → SinkFirst (readIORef (fakeSinkReason capture))
+        FakeOwner → OwnerFirst arrived
+    once hook = join (atomicModifyIORef' hook (\after → (pure (), after)))
+
+-- | Run this once, inside the transaction of the owner's next claim, right
+-- after it claims and reads the arrivals: as the claim returns.
+holdNextClaim ∷ FakeCapture → IO () → IO ()
+holdNextClaim capture = writeIORef (fakeAfterClaim capture)
+
+-- | Run this once, right after the next reading of the alarms has been answered.
+afterNextAlarms ∷ FakeCapture → IO () → IO ()
+afterNextAlarms capture = writeIORef (fakeAfterAlarms capture)
+
+-- | An error-severity report: its arrival is recorded, then it claims first
+-- place if nothing holds it, then sets the error latch.
+reportValidationError ∷ FakeCapture → IO ()
+reportValidationError capture = do
+  arrive capture FakeError
+  writeIORef (fakeErrorArrived capture) True
+  atomicModifyIORef' (fakeFirst capture) (\held → (Just (fromMaybe FakeError held), ()))
+  writeIORef (fakeErrorLatched capture) True
+
+-- | The sink's worker meeting its failure: its arrival is recorded and it
+-- claims first place if nothing holds it; publishing why comes after.
+noteSinkFailure ∷ FakeCapture → IO ()
+noteSinkFailure capture = do
+  arrive capture FakeSink
+  writeIORef (fakeSinkArrived capture) True
+  atomicModifyIORef' (fakeFirst capture) (\held → (Just (fromMaybe FakeSink held), ()))
+
+-- | Record which diagnostic failure arrived first; the callers then record the
+-- arrival itself, and nothing reads the two between them.
+arrive ∷ FakeCapture → FakeFirst → IO ()
+arrive capture arrival = atomicModifyIORef' (fakeFirstArrived capture) (\held → (Just (fromMaybe arrival held), ()))
+
+publishSinkFailure ∷ FakeCapture → Text → IO ()
+publishSinkFailure capture = writeIORef (fakeSinkReason capture) . Just
+
+data Abandoned = Abandoned
+  deriving (Eq, Show)
+
+instance Exception Abandoned
+
+-- | A transaction of the owner's that claims the capture's first place for a
+-- failure of its own and is then abandoned: nothing it did is recorded, and
+-- the claim outlives it.
+abandonClaim ∷ Rig → IO ()
+abandonClaim rig = do
+  atomically (failRootsSessionBecause (rigRoots rig) CleanupFailed "never recorded" >> throwSTM Abandoned) `shouldThrow` (== Abandoned)
+  reportPrimary <$> atomically (readRootsTerminal (rigRoots rig)) `shouldReturn` Nothing
+  sessionState <$> modelOf rig `shouldReturn` SessionRunning
 
 primaryIs ∷ Rig → (TerminalCause → Bool) → Expectation
 primaryIs rig expected = atomically (readRootsTerminal (rigRoots rig)) `shouldReturn'` \report → reportPrimary report `shouldSatisfy` maybe False expected

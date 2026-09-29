@@ -2037,14 +2037,56 @@ validation error or sink failure claimed the cell first, it is latched in that
 same transaction ahead of the owner's failure, which joins the evidence; a
 transition that would have failed the session is taken on the failed session
 instead, so a required target's recovery goes no further. A sink failure whose
-reason its worker has not yet published leaves the transaction waiting, and the
-worker's publication, which follows its claim at once, wakes it. The claim
-answers the same however often a transaction runs it. Between the owner's
-claim and the commit of the transaction that records its failure, a
-checkpoint on another thread — a handover's, say — sees the claim
-(`CaptureOwnerClaimed`, `AlarmOwnerClaimed`) with nothing latched and answers
-`CheckpointPending`, latching nothing, so a later diagnostic failure cannot
-take the owner's place. Roots given only a list
+reason its worker has not yet published is waited for inside the transaction,
+which never blocks: a `retry` there would make the transaction interruptible
+even under `mask_`. The worker publishes right after its claim, in one masked
+step that calls nothing native, delivers nothing to the sink and waits on
+nothing, so the wait depends on that thread's CPU bookkeeping alone — never on
+a driver, the sink or the owner — and it promises no wall-clock bound. Nothing
+in it is interruptible and it masks nothing of its own: a masked record cannot
+be cancelled there, and an unmasked one can, as anywhere else in its
+transaction. The claim answers the same however often a transaction runs it.
+
+A claim holds first place only for the transaction attempt that made it, and
+it is a compare-and-swap in C that an abandoned attempt does not undo. Each
+claiming attempt therefore enters a token in the roots, held there only
+weakly, and writes it into its own transaction log: the attempt keeps it alive
+while it may still commit, and once GHC discards an abandoned attempt — rolled
+back by an exception, or run again — a collection finds the token gone,
+whatever the claiming thread goes on to do. Between the owner's claim and the
+commit of the transaction that records its failure, a checkpoint on another
+thread — a handover's, say — sees the claim (`CaptureOwnerClaimed`,
+`AlarmOwnerClaimed`) with nothing latched and its attempt's token alive, and
+answers `CheckpointPending`, latching nothing, so a later diagnostic failure
+cannot take the owner's place. A claim no live attempt holds is void: the
+checkpoint latches the alarms beside it as usual, so an abandoned transaction
+leaves no checkpoint pending and no settled checkpoint waiting. It runs a major
+collection to tell, and only while nothing is latched, a claim is visible and
+some token still answers.
+
+A diagnostic failure that arrives behind a claim loses its own claim, so the
+capture also records each one's arrival before it tries to claim, and which
+arrived first (`hetoimasia_capture_arrived_failures`). It answers those behind
+an owner's claim in the order they arrived, and one whose alarm is not yet
+readable as `CaptureAlarmPending` beside the claim. A checkpoint therefore
+answers pending, never clear, while a sink failure behind a void claim is
+unpublished. A later failure of the owner's own, whose claim the void one still
+answers first, takes the capture's arrivals, read right after its claim
+(`captureArrivals`, carried in `OwnerFirst`), as its order point: each
+diagnostic failure that had arrived by then is latched ahead of it once
+readable, in the order they arrived — a wait bounded as the sink's publication
+is — and one that arrives
+after comes after it, as it would behind a claim of its own.
+
+Every record of a failure of the owner's own made inside a masked step — an
+uncertain or failed presentation, an uncertain submission, a progress step's
+fence answer, a device loss — is therefore made whole or not started, whatever
+cancellation is aimed at the owner: its transaction never blocks, so the
+cancellation arrives after it. A device loss is latched with exceptions masked
+from the moment its call returns (`rootsCall`), and a progress step asks each
+fence and records its answer in one masked step.
+
+Roots given only a list
 of alarms (`watchRootsDiagnostics`, as headless examples use) latch them at
 checkpoints and order nothing; the controller installs the capture's order
 (`watchRootsDiagnosticsOrdered`). The

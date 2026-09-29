@@ -121,6 +121,11 @@
 -- | The diagnostic   | The roots | Installed once; every       | The owner  | The session      | —                         |
 -- | watch            |           | checkpoint reads it         |            |                  |                           |
 -- +------------------+-----------+-----------------------------+------------+------------------+---------------------------+
+-- | Owner claims     | The roots | A claiming attempt enters a | Any; not   | The session      | An attempt is dropped     |
+-- |                  |           | weak token and writes it    | STM, so an |                  | once a collection finds   |
+-- |                  |           | into its log; checkpoints   | abandoned  |                  | its token gone            |
+-- |                  |           | and later claims read them  | claim stays|                  |                           |
+-- +------------------+-----------+-----------------------------+------------+------------------+---------------------------+
 --
 -- Every mutating operation is meant for one serialized owner — the graphics
 -- owner's thread — and none is safe to run concurrently with another.
@@ -174,6 +179,8 @@ module Hetoimasia.GPU.Vulkan.Native.Roots
   , watchRootsDiagnosticsOrdered
   , DiagnosticWatch (..)
   , DiagnosticOrder (..)
+  , DiagnosticArrivals (..)
+  , noDiagnosticArrivals
   , checkpointRoots
   , syncRootsDiagnostics
   , checkpointRootsSettled
@@ -214,7 +221,7 @@ module Hetoimasia.GPU.Vulkan.Native.Roots
   ) where
 
 import Control.Concurrent (threadDelay, yield)
-import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, writeTVar)
+import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
 import GHC.Conc (unsafeIOToSTM)
 import Control.Exception
   ( Exception (displayException)
@@ -222,20 +229,25 @@ import Control.Exception
   , SomeAsyncException
   , SomeException
   , fromException
+  , mask
   , mask_
   , rethrowIO
   , throwIO
   , toException
   , tryWithContext
   )
-import Control.Monad (unless, when)
+import Control.Monad (filterM, unless, when)
 import Data.Foldable (for_)
+import Data.IORef (IORef, atomicModifyIORef', mkWeakIORef, newIORef)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
+import Data.List ((\\))
 import Data.Maybe (isJust, isNothing)
+import System.Mem (performMajorGC)
+import System.Mem.Weak (Weak, deRefWeak)
 import Data.Text (Text)
 import qualified Data.Text as Text
-import Data.Unique (newUnique)
+import Data.Unique (Unique, newUnique)
 import Data.Word (Word32, Word64)
 import Numeric.Natural (Natural)
 import Hetoimasia.Foundation.Time (MonotonicSource, readInstant)
@@ -465,6 +477,13 @@ data Roots q inst msgr phys dev = Roots
     -- it.
   , rootsWatch ∷ !(TVar DiagnosticWatch)
     -- ^ What a checkpoint asks of the diagnostic capture.
+  , rootsClaims ∷ !(IORef OwnerClaims)
+    -- ^ The transaction attempts that have claimed the capture's order for a
+    -- failure of the owner's own. Not transactional: a claim outlives the
+    -- attempt that made it, and so must this record of it.
+  , rootsClaimHold ∷ !(TVar (Maybe (IORef ())))
+    -- ^ Written by each claiming attempt with its own token, which its
+    -- transaction's log then keeps alive until it commits or is discarded.
   , rootsDebugUtils ∷ !(TVar Bool)
     -- ^ Whether the instance was created with @VK_EXT_debug_utils@.
   , rootsNamed ∷ !(TVar Bool)
@@ -496,7 +515,9 @@ newRoots ops budgets clock = do
     <*> newTVarIO True
     <*> newTVarIO Nothing
     <*> newTVarIO (TerminalReport Nothing Nothing [] 0)
-    <*> newTVarIO (DiagnosticWatch (pure []) (pure OwnerFirst))
+    <*> newTVarIO (DiagnosticWatch (pure []) (pure (OwnerFirst noDiagnosticArrivals)))
+    <*> newIORef (OwnerClaims False [])
+    <*> newTVarIO Nothing
     <*> newTVarIO False
     <*> newTVarIO False
     <*> newTVarIO []
@@ -874,9 +895,14 @@ installRootSurface roots target surface = do
 -- Device loss
 
 -- | Run one native call, latching device loss if that is what it raised.
+--
+-- The call runs in the caller's masking state; the loss it raised is latched
+-- with asynchronous exceptions masked from the moment it returns, whatever
+-- that state was, so a cancellation cannot land between the loss and its
+-- latch, nor inside the latch's transaction, which never blocks.
 guarded ∷ Roots q inst msgr phys dev → Text → IO a → IO a
 guarded roots during call =
-  tryWithContext call >>= \case
+  mask $ \restore → tryWithContext (restore call) >>= \case
     Right value → pure value
     Left failure@(ExceptionWithContext _ exception)
       | isAsynchronous exception → rethrowIO failure
@@ -1065,19 +1091,107 @@ latchTerminal roots cause = do
 -- and the model has not failed by itself — claim the capture's order for it.
 -- A diagnostic failure that claimed first is latched here, ahead of it: a
 -- validation error at once, a sink failure once the worker has published its
--- reason, which follows its claim at once and wakes this transaction. The
--- claim is the capture's one compare-and-swap, which answers the same however
--- often a transaction runs it.
+-- reason. The claim is the capture's one compare-and-swap, which answers the
+-- same however often a transaction runs it.
+--
+-- It never blocks the transaction ('retry' would make it interruptible under
+-- 'mask_', and an owner's masked record could then lose its whole
+-- transaction to a cancellation). Its waits — for a sink failure that holds
+-- first place to publish its reason, and for a failure that arrived behind a
+-- void claim to become readable — are 'awaitPublication' and
+-- 'awaitArrivals', inside the transaction.
+--
+-- A claim holds first place only for the transaction attempt that made it
+-- ('claimHeld'). A claim made before, that no attempt which could still
+-- commit holds, is void: it still holds the capture's slot, so the claim
+-- made now answers 'OwnerFirst' however much came after it. Its order point
+-- is then the capture's arrivals, read right after its claim: each diagnostic
+-- failure that had arrived by then is latched ahead of it, once readable, and
+-- one that arrives after comes after it, as it would behind a claim of its own.
 orderBehindDiagnostics ∷ Roots q inst msgr phys dev → STM ()
 orderBehindDiagnostics roots = do
   report ← readTVar (rootsTerminal roots)
   model ← readTVar (rootsModel roots)
   when (isNothing (reportPrimary report) && isNothing (fromModel model)) $ do
     watch ← readTVar (rootsWatch roots)
-    unsafeIOToSTM (watchOrder watch) >>= \case
-      OwnerFirst → pure ()
-      ValidationFirst → latchCause roots TerminalValidationError
-      SinkFirst published → published >>= maybe retry (latchCause roots . TerminalSinkFailed)
+    (token, ahead) ← unsafeIOToSTM $ do
+      token ← newIORef ()
+      attempt ← newUnique
+      held ← mkWeakIORef token (pure ())
+      -- Entered before the claim, so a checkpoint that reads the claim reads
+      -- this attempt too.
+      made ← atomicModifyIORef' (rootsClaims roots) $ \claims →
+        (OwnerClaims True ((attempt, held) : claimAttempts claims), claimsMade claims)
+      void ← if made then not <$> claimHeld roots (Just attempt) else pure False
+      ahead ← watchOrder watch >>= \case
+        OwnerFirst arrived
+          | void → awaitArrivals watch arrived
+          | otherwise → pure []
+        ValidationFirst → pure [AlarmValidationError]
+        SinkFirst published → (\reason → [AlarmSinkFailed reason]) <$> awaitPublication published
+      pure (token, ahead)
+    -- The token is written into this attempt's own log, which keeps it alive
+    -- while the attempt may still commit, and only while it may.
+    writeTVar (rootsClaimHold roots) (Just token)
+    latchAlarms roots ahead
+
+-- | Wait for the reason of a sink failure that claimed first place. The worker
+-- publishes it right after its claim, in one masked step that makes no native
+-- call, delivers nothing to the sink and waits on nothing, so the wait is
+-- bounded by that thread's CPU bookkeeping alone — never by a driver, the
+-- sink, or anything the owner does. It promises no wall-clock bound.
+--
+-- It runs inside the owner's transaction and only yields between looks. Nothing
+-- in it is interruptible, so a masked caller's record cannot be cancelled here
+-- and an unmasked caller's can, exactly as anywhere else in its transaction;
+-- it adds no masking of its own.
+awaitPublication ∷ IO (Maybe Text) → IO Text
+awaitPublication published = published >>= maybe (yield >> awaitPublication published) pure
+
+-- | The alarms of the diagnostic failures that had arrived by a claim over a
+-- void one, once each is readable, in the order they arrived. A
+-- failure sets its alarm right after recording its arrival — an error's
+-- callback at its next step, the sink's worker in the masked step that noted
+-- it — so this is bounded as 'awaitPublication' is, and waits the same way.
+awaitArrivals ∷ DiagnosticWatch → DiagnosticArrivals → IO [DiagnosticAlarm]
+awaitArrivals watch arrived = do
+  alarms ← watchAlarms watch
+  let errors = [AlarmValidationError | validationArrived arrived, AlarmValidationError `elem` alarms]
+      sinks = take 1 [alarm | sinkArrived arrived, alarm@(AlarmSinkFailed _) ← alarms]
+  if (validationArrived arrived && null errors) || (sinkArrived arrived && null sinks)
+    then yield >> awaitArrivals watch arrived
+    else pure (if sinkArrivedFirst arrived then sinks <> errors else errors <> sinks)
+
+-- | Whether a transaction attempt that claimed the capture's order — other
+-- than this one — may still commit.
+--
+-- Each attempt's token is held here only weakly; the attempt itself keeps it
+-- alive, from its stack until it writes it into its transaction's log
+-- ('rootsClaimHold') and from that log until it commits. An attempt that is
+-- abandoned — by an exception, or run again — is discarded with its log, so
+-- once a collection has run its token is gone, whatever its thread goes on to
+-- do. A major collection is run only when some token still answers, and those
+-- gone are dropped.
+claimHeld ∷ Roots q inst msgr phys dev → Maybe Unique → IO Bool
+claimHeld roots this =
+  answering >>= \case
+    False → pure False
+    True → performMajorGC >> answering
+  where
+    answering = do
+      attempts ← filter ((/= this) . Just . fst) . claimAttempts <$> atomicModifyIORef' (rootsClaims roots) (\claims → (claims, claims))
+      alive ← filterM (fmap isJust . deRefWeak . snd) attempts
+      let gone = map fst attempts \\ map fst alive
+      atomicModifyIORef' (rootsClaims roots) (\claims → (claims {claimAttempts = filter ((`notElem` gone) . fst) (claimAttempts claims)}, ()))
+      pure (not (null alive))
+
+-- | The claims of the capture's order made for failures of the owner's own
+-- ('orderBehindDiagnostics'): whether one ever has been, and each attempt
+-- that made one that has not yet been found gone.
+data OwnerClaims = OwnerClaims
+  { claimsMade ∷ !Bool
+  , claimAttempts ∷ ![(Unique, Weak (IORef ()))]
+  }
 
 latchCause ∷ Roots q inst msgr phys dev → TerminalCause → STM ()
 latchCause roots cause = do
@@ -1115,18 +1229,38 @@ noteTeardownEvidence roots evidence =
 -- | Who holds first place in the diagnostic capture's order once a failure of
 -- the owner's own has claimed it.
 data DiagnosticOrder
-  = OwnerFirst
-    -- ^ No diagnostic failure came before it.
+  = OwnerFirst !DiagnosticArrivals
+    -- ^ No diagnostic failure came before it; and which had arrived, read
+    -- right after the claim, which orders it behind them when the claim it
+    -- found was void ('orderBehindDiagnostics').
   | ValidationFirst
     -- ^ An error-severity report came first.
-  | SinkFirst !(STM (Maybe Text))
+  | SinkFirst !(IO (Maybe Text))
     -- ^ The sink failed first; its reason, once the worker has published it.
+    -- It is read inside the owner's transaction, so it runs no transaction
+    -- of its own.
+
+-- | Which diagnostic failures had arrived, whether or not they claimed first
+-- place: the capture records each arrival before its claim.
+data DiagnosticArrivals = DiagnosticArrivals
+  { validationArrived ∷ !Bool
+  , sinkArrived ∷ !Bool
+  , sinkArrivedFirst ∷ !Bool
+    -- ^ The sink's failure arrived before any validation error.
+  }
+  deriving (Eq, Show)
+
+-- | No diagnostic failure has arrived.
+noDiagnosticArrivals ∷ DiagnosticArrivals
+noDiagnosticArrivals = DiagnosticArrivals False False False
 
 -- | What the roots ask of the diagnostic capture: its alarms, at a checkpoint,
 -- and the order, before a failure of the owner's own is latched or taken by
 -- the model. Claiming the order runs inside that transaction, so it must
 -- answer the same however often it runs and must run no transaction of its
--- own.
+-- own. The alarms are read there too, after a claim over a void one, to
+-- latch what had arrived ahead of it ('orderBehindDiagnostics'); they must run
+-- no transaction of their own either.
 data DiagnosticWatch = DiagnosticWatch
   { watchAlarms ∷ IO [DiagnosticAlarm]
   , watchOrder ∷ IO DiagnosticOrder
@@ -1137,7 +1271,7 @@ data DiagnosticWatch = DiagnosticWatch
 -- owner's is never ordered behind them. Roots with none installed hear no
 -- alarm.
 watchRootsDiagnostics ∷ Roots q inst msgr phys dev → IO [DiagnosticAlarm] → STM ()
-watchRootsDiagnostics roots alarms = writeTVar (rootsWatch roots) (DiagnosticWatch alarms (pure OwnerFirst))
+watchRootsDiagnostics roots alarms = writeTVar (rootsWatch roots) (DiagnosticWatch alarms (pure (OwnerFirst noDiagnosticArrivals)))
 
 -- | Install a diagnostic capture that keeps the order itself.
 watchRootsDiagnosticsOrdered ∷ Roots q inst msgr phys dev → DiagnosticWatch → STM ()
@@ -1150,12 +1284,18 @@ watchRootsDiagnosticsOrdered roots = writeTVar (rootsWatch roots)
 -- primary. It raises nothing, calls nothing native, and waits for nothing.
 --
 -- While the capture says a failure is pending ('AlarmPending'), or that a
--- failure of the owner's own holds first place and nothing has recorded it
--- yet ('AlarmOwnerClaimed'), it latches nothing — neither the capture's alarms nor the model's own failure, which
--- might otherwise be taken ahead of the diagnostic failure that came first —
--- and answers an earlier primary if there is one, 'CheckpointPending'
--- otherwise, so admission stays closed until a later checkpoint can latch
--- them in order.
+-- failure of the owner's own holds first place ('AlarmOwnerClaimed') and a
+-- transaction that claimed it may still record it, it latches nothing —
+-- neither the capture's alarms nor the model's own failure, which might
+-- otherwise be taken ahead of the diagnostic failure that came first — and
+-- answers an earlier primary if there is one, 'CheckpointPending' otherwise,
+-- so admission stays closed until a later checkpoint can latch them in order.
+--
+-- A claim whose transaction attempt was abandoned holds nothing back
+-- ('claimHeld'): once no attempt that claimed can still commit, the alarms
+-- beside the claim are latched as usual, whatever the claiming thread goes on
+-- to do. A diagnostic failure that arrived behind that claim is answered
+-- pending until its own alarm is readable, and then latched.
 --
 -- Only the owner's ordinary operations checkpoint. Retirement does not: it
 -- runs because the session has failed, and a checkpoint there would only
@@ -1163,12 +1303,18 @@ watchRootsDiagnosticsOrdered roots = writeTVar (rootsWatch roots)
 checkpointRoots ∷ Roots q inst msgr phys dev → IO Checkpoint
 checkpointRoots roots = do
   alarms ← watchAlarms =<< readTVarIO (rootsWatch roots)
+  -- The claiming attempts are read after the alarms, and each entered before
+  -- it claimed, so the claim these alarms name has its attempt here.
+  -- Only while nothing has recorded a failure is there a claim to ask after:
+  -- once one is latched the capture answers the claim for good.
+  unrecorded ← atomically ((&&) <$> (isNothing . reportPrimary <$> readTVar (rootsTerminal roots)) <*> (isNothing . fromModel <$> readTVar (rootsModel roots)))
+  claimed ← if AlarmOwnerClaimed `elem` alarms && unrecorded then claimHeld roots Nothing else pure False
   atomically $ do
     latched ← reportPrimary <$> readTVar (rootsTerminal roots)
     modelled ← fromModel <$> readTVar (rootsModel roots)
     -- The owner's own failure claimed first place but its transaction has not
     -- recorded it yet: an alarm latched now would take a place that is its.
-    let ownerInFlight = AlarmOwnerClaimed `elem` alarms && isNothing latched && isNothing modelled
+    let ownerInFlight = claimed && isNothing latched && isNothing modelled
     if AlarmPending `elem` alarms || ownerInFlight
       then pure (maybe CheckpointPending CheckpointFailed latched)
       else do

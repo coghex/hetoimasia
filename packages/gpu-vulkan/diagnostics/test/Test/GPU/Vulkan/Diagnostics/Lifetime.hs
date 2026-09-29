@@ -64,6 +64,8 @@ import Hetoimasia.GPU.Vulkan.Diagnostics
   , captureAlarms
   , CaptureOrder (..)
   , claimCaptureOrder
+  , CaptureArrivals (..)
+  , captureArrivals
   , captureSinkFailure
   , captureStatus
   , capturePhase
@@ -343,6 +345,56 @@ spec = describe "Lifetime" $ do
           offerTo capture (plainOffer SeverityError "an error after the owner's failure")
           captureAlarms capture
       map alarmKind alarms `shouldBe` ["owner", "error"]
+
+    it "answers a sink failure that arrived behind the owner's claim as pending until it is published, and then beside the claim" $ do
+      (logger, failing) ← switchedLogger
+      (answers, _) ←
+        capturing logger $ \capture → do
+          _ ← claimCaptureOrder capture
+          -- The worker's sink fails after the owner's claim and pauses before
+          -- it publishes: its claim is lost, and its arrival is not.
+          claimed ← captureArrivals capture
+          noteSinkFailure (captureUserData capture)
+          arrived ← captureArrivals capture
+          before ← captureAlarms capture
+          atomically (writeTVar failing True)
+          offerTo capture (plainOffer SeverityWarning "a warning the sink cannot take")
+          requestDrain capture
+          _ ← bounded (atomically (captureSinkFailure capture >>= maybe retry pure))
+          after ← captureAlarms capture
+          pure ((claimed, arrived), map alarmKind before, map alarmKind after)
+      answers `shouldBe` ((CaptureArrivals False False False, CaptureArrivals False True True), ["owner", "pending"], ["owner", "sink"])
+
+    it "answers a sink failure and an error that both arrived behind the owner's claim in the order they arrived" $ do
+      (logger, failing) ← switchedLogger
+      (answers, _) ←
+        capturing logger $ \capture → do
+          _ ← claimCaptureOrder capture
+          atomically (writeTVar failing True)
+          offerTo capture (plainOffer SeverityWarning "a warning the sink cannot take")
+          requestDrain capture
+          _ ← bounded (atomically (captureSinkFailure capture >>= maybe retry pure))
+          offerTo capture (plainOffer SeverityError "an error after the sink failed")
+          (,) <$> captureArrivals capture <*> (map alarmKind <$> captureAlarms capture)
+      answers `shouldBe` (CaptureArrivals True True True, ["owner", "sink", "error"])
+
+    it "keeps a sink failure that arrived first behind the owner's claim pending, ahead of an error that follows it, until it is published" $ do
+      (logger, failing) ← switchedLogger
+      (answers, _) ←
+        capturing logger $ \capture → do
+          _ ← claimCaptureOrder capture
+          -- The worker's sink fails behind the claim and pauses before it
+          -- publishes; an error then arrives and latches.
+          noteSinkFailure (captureUserData capture)
+          offerTo capture (plainOffer SeverityError "an error after the sink failed")
+          before ← (,) <$> captureArrivals capture <*> (map alarmKind <$> captureAlarms capture)
+          atomically (writeTVar failing True)
+          offerTo capture (plainOffer SeverityWarning "a warning the sink cannot take")
+          requestDrain capture
+          _ ← bounded (atomically (captureSinkFailure capture >>= maybe retry pure))
+          after ← map alarmKind <$> captureAlarms capture
+          pure (before, after)
+      answers `shouldBe` ((CaptureArrivals True True True, ["owner", "pending", "error"]), ["owner", "sink", "error"])
 
     it "answers only that a failure is pending while the failure that came first has claimed the order but not yet published its alarm" $ do
       (logger, failing) ← switchedLogger

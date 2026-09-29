@@ -123,10 +123,13 @@ module Hetoimasia.GPU.Vulkan.Diagnostics
   , deliveredCount
   , SinkFailure (..)
   , captureSinkFailure
+  , readCaptureSinkFailure
   , CaptureAlarm (..)
   , captureAlarms
   , CaptureOrder (..)
   , claimCaptureOrder
+  , CaptureArrivals (..)
+  , captureArrivals
 
     -- * The verdict
   , DiagnosticVerdict (..)
@@ -233,6 +236,7 @@ import Hetoimasia.GPU.Vulkan.Diagnostics.Internal.Capture
   , createStorage
   , firstFailure
   , claimOwnerFailure
+  , arrivedFailures
   , freeStorage
   , noteSinkFailure
   , slotStatus
@@ -405,6 +409,11 @@ deliveredCount = readTVar . handleDelivered
 captureSinkFailure ∷ DiagnosticCapture → STM (Maybe SinkFailure)
 captureSinkFailure = readTVar . handleSinkFailure
 
+-- | 'captureSinkFailure' read without a transaction of its own, so an owner can
+-- read it inside one of its own transactions.
+readCaptureSinkFailure ∷ DiagnosticCapture → IO (Maybe SinkFailure)
+readCaptureSinkFailure = readTVarIO . handleSinkFailure
+
 -- | A sink failure as the worker met it.
 newtype SinkFailure = SinkFailure
   { sinkFailureReason ∷ Text
@@ -444,6 +453,11 @@ data CaptureAlarm
 -- Then this answers 'CaptureAlarmPending' alone — a failure has happened, and
 -- admission should stay closed — and the next reading, once the first alarm is
 -- published, answers them in order. It never answers a later failure first.
+-- A failure that arrived after the owner claimed first place is answered
+-- beside 'CaptureOwnerClaimed', in the order the failures arrived, and as
+-- 'CaptureAlarmPending' until its alarm is readable: whether that claim still
+-- stands is the owner's to say.
+-- It runs no transaction of its own, so an owner can read it inside one.
 -- | Which failure holds first place, once the capture's owner has claimed it
 -- for a failure of its own that it is about to record: its own, unless an
 -- error report or the sink claimed it before.
@@ -471,20 +485,43 @@ claimCaptureOrder capture =
     Just FirstSink → pure SinkFailedFirst
     _ → pure OwnerFailedFirst
 
+-- | Which diagnostic failures have arrived — an error-severity report, the
+-- sink's failure — whether or not they claimed first place: each is recorded
+-- before it tries to claim, so one that lost the claim to the owner is known
+-- before its own alarm is readable. Arrivals only accumulate, so one reading
+-- is a single point in the capture's order: whatever arrived after it is not
+-- in it. A capture whose slot already serves another lifetime answers none.
+data CaptureArrivals = CaptureArrivals
+  { arrivedError ∷ !Bool
+  , arrivedSink ∷ !Bool
+  , arrivedSinkFirst ∷ !Bool
+    -- ^ The sink's failure arrived before any error-severity report.
+  }
+  deriving (Eq, Show)
+
+-- | Read which diagnostic failures have arrived, in one atomic load. It runs no
+-- transaction of its own, so an owner can read it inside one.
+captureArrivals ∷ DiagnosticCapture → IO CaptureArrivals
+captureArrivals capture = maybe (CaptureArrivals False False False) (\(errors, sink, sinkFirst) → CaptureArrivals errors sink sinkFirst) <$> arrivedFailures (handleUserData capture)
+
 captureAlarms ∷ DiagnosticCapture → IO [CaptureAlarm]
 captureAlarms capture = do
   latched ← statusErrorLatched <$> captureStatus capture
-  sink ← atomically (captureSinkFailure capture)
+  sink ← readCaptureSinkFailure capture
   first ← firstFailure (handleUserData capture)
+  CaptureArrivals errorArrived sinkArrived sinkFirst ← captureArrivals capture
   let errors = [CaptureErrorLatched | latched]
       sinks = [CaptureSinkFailed (sinkFailureReason failure) | Just failure ← [sink]]
+      -- A failure that arrived behind the owner's claim, and so could not
+      -- claim first place, is known before its own alarm is readable.
+      unpublished = (errorArrived && null errors) || (sinkArrived && null sinks)
   pure $ case first of
     Just FirstSink
       | null sinks → [CaptureAlarmPending]
       | otherwise → sinks <> errors
     Just FirstError
       | null errors → [CaptureAlarmPending]
-    Just FirstOwner → CaptureOwnerClaimed : errors <> sinks
+    Just FirstOwner → CaptureOwnerClaimed : [CaptureAlarmPending | unpublished] <> if sinkFirst then sinks <> errors else errors <> sinks
     _ → errors <> sinks
 
 -- | Run a body that owns a diagnostic capture, and finalize it on every exit.

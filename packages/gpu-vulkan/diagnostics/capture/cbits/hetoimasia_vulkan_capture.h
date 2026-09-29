@@ -224,6 +224,10 @@ uint32_t hetoimasia_capture_record_label_name_length(const hetoimasia_capture_re
 #define HETOIMASIA_CAPTURE_FIRST_SINK 2
 #define HETOIMASIA_CAPTURE_FIRST_OWNER 3
 
+/* Which diagnostic failures have arrived, whether or not they claimed "first". */
+#define HETOIMASIA_CAPTURE_ARRIVED_ERROR 1
+#define HETOIMASIA_CAPTURE_ARRIVED_SINK 2
+
 /*
 ** Record that the consumer's sink has failed, claiming "first" if no error
 ** report claimed it before. Call it when the failure is known, before
@@ -247,6 +251,16 @@ int hetoimasia_capture_claim_owner_failure(void *user_data);
 ** published sink failure and reads this afterwards reads the true order.
 */
 int hetoimasia_capture_first_failure(void *user_data);
+
+/*
+** Which diagnostic failures have arrived — HETOIMASIA_CAPTURE_ARRIVED_ERROR and
+** _SINK, or'd — with the one that arrived first in bits 2 and 3, both read in
+** one load and published together, or -1 once the slot serves another storage. Each is recorded before its failure tries
+** to claim "first", so one that lost that claim to the owner is still known
+** to have happened, and in what order, before its latch is set or its reason
+** published.
+*/
+int hetoimasia_capture_arrived_failures(void *user_data);
 
 /*
 ** Read the counters and latches of the storage this user data was issued for,

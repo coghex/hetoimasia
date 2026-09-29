@@ -264,7 +264,10 @@ import Hetoimasia.GPU.Vulkan.Diagnostics
   , afterLastCallback
   , captureAlarms
   , captureSinkFailure
+  , readCaptureSinkFailure
   , claimCaptureOrder
+  , CaptureArrivals (..)
+  , captureArrivals
   , retainStorage
   , withDiagnosticCapture
   )
@@ -341,6 +344,7 @@ import Hetoimasia.GPU.Vulkan.Native.Roots
   , readRootsTerminal
   , watchRootsDiagnosticsOrdered
   , DiagnosticWatch (..)
+  , DiagnosticArrivals (..)
   , DiagnosticOrder (..)
   , destroyRoots
   , newRoots
@@ -1649,12 +1653,14 @@ readVulkanTerminal (VulkanController state) = readRootsTerminal (stateRoots stat
 -- both latches the first as the primary.
 -- | Claim the capture's order for a failure of the owner's own, and say who
 -- holds it: the owner, or the error report or sink failure that came first.
+-- With the owner's answer goes which diagnostic failures had arrived, read
+-- right after the claim: the order point a claim over a void one takes.
 diagnosticOrder ∷ DiagnosticCapture → IO DiagnosticOrder
 diagnosticOrder capture =
   claimCaptureOrder capture >>= \case
-    OwnerFailedFirst → pure OwnerFirst
+    OwnerFailedFirst → (\arrived → OwnerFirst (DiagnosticArrivals (arrivedError arrived) (arrivedSink arrived) (arrivedSinkFirst arrived))) <$> captureArrivals capture
     ErrorLatchedFirst → pure ValidationFirst
-    SinkFailedFirst → pure (SinkFirst (fmap sinkFailureReason <$> captureSinkFailure capture))
+    SinkFailedFirst → pure (SinkFirst (fmap sinkFailureReason <$> readCaptureSinkFailure capture))
 
 -- | Whether a failure the owner has not acted on asks for a round: the
 -- capture's sink has failed and nothing is latched yet — the one diagnostic
