@@ -270,7 +270,7 @@
     },
     {
       "id": "test.vulkan-native",
-      "description": "The Vulkan native suite: the package-native fixture's shared roots under the graphics owner, with GLFW's session on the process main thread, and the migrated VK-2, VK-5, VK-6 and VK-7 cases and the synchronization-validation control in private child processes, all with the validation layer and synchronization validation enabled, failing on any validation error or incomplete diagnostic capture after the last teardown. Its executable is built in a separate preparation stage; its native execution — test-owned display, fixtures, examples, retirement, diagnostic finalization and teardown — is measured alone under a 30-second watchdog. On Linux the command starts its own isolated X11 display; on macOS it needs the desktop opt-in on its own command, given under the owner's standing approval for runs an issue or pull request needs.",
+      "description": "The Vulkan native suite: the package-native fixture's shared roots under the graphics owner, with GLFW's session on the process main thread, and the migrated VK-2, VK-5, VK-6 and VK-7 cases, VK-17's required profile over the triangle sample's drawing, and the synchronization-validation control in private child processes, all with the validation layer and synchronization validation enabled, failing on any validation error or incomplete diagnostic capture after the last teardown. Its executable, and the triangle sample's, are built in a separate preparation stage; its native execution — test-owned display, fixtures, examples, retirement, diagnostic finalization and teardown — is measured alone under a 30-second watchdog. On Linux the command starts its own isolated X11 display; on macOS it needs the desktop opt-in on its own command, given under the owner's standing approval for runs an issue or pull request needs.",
       "command": [
         "bash",
         "tools/vulkan/run.sh",
@@ -284,7 +284,8 @@
           "bash",
           "tools/vulkan/run.sh",
           "build",
-          "hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests"
+          "hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests",
+          "hetoimasia-sample-triangle-app:exe:hetoimasia-triangle"
         ],
         "timeout_seconds": 3600
       },
@@ -293,6 +294,7 @@
         "cabal.project.common",
         "cabal.project.vulkan",
         "tools/ci-image/",
+        "samples/triangle/app/",
         "tools/display/",
         "tools/native/",
         "tools/toolchain/binding.pin",

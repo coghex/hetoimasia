@@ -159,6 +159,7 @@ test-suite vulkan-native-tests
         Test.GPU.Vulkan.Native.Shared
         Test.GPU.Vulkan.Native.Spec
         Test.GPU.Vulkan.Native.Terminal
+        Test.GPU.Vulkan.Native.Triangle
         Test.Vulkan.Proof.Bridge
         Test.Vulkan.Proof.BridgeSpec
         Test.Vulkan.Proof.Construction
@@ -217,4 +218,10 @@ test-suite vulkan-native-tests
         hetoimasia-gpu-vulkan-glfw,
         -- The controller's report of a swapchain result, which VK-14's shared
         -- example makes as an acquisition on the owner's thread would.
-        hetoimasia-gpu-vulkan-glfw:controller
+        hetoimasia-gpu-vulkan-glfw:controller,
+        -- The triangle sample's drawing, geometry and shaders, which VK-17's
+        -- required profile exercises unchanged; depending on it is what makes
+        -- the sample's drawing an input of `test.vulkan-native`. It depends on
+        -- the native backend alone, so this is no cycle, and only this suite
+        -- depends on it, never an engine library.
+        hetoimasia-sample-triangle ==0.1.0.0

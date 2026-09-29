@@ -1,0 +1,48 @@
+cabal-version: 3.16
+name: hetoimasia-sample-triangle-app
+version: 0.1.0.0
+synopsis: A triangle in each of two windows through Hetoimasia's Vulkan host
+description:
+    VK-17's sample executable, `hetoimasia-triangle`: the triangle sample's
+    drawing (`hetoimasia-sample-triangle`) handed to the window integration's
+    public host, in two windows sharing one Vulkan device. It uses public
+    interfaces only, nothing depends on it, and it is launched explicitly: no
+    routine check runs it.
+    .
+    It is selected only by `cabal.project.vulkan`, so neither `cabal.project`
+    nor `cabal.project.cpu` resolves the binding, the Vulkan headers or a
+    loader, and only `tools/vulkan/run.sh` builds it.
+license: GPL-3.0-only
+license-file: LICENSE
+author: Vincent Coghlan
+maintainer: Vincent Coghlan
+category: Game
+build-type: Simple
+tested-with: GHC ==9.14.1
+
+source-repository head
+    type: git
+    location: https://github.com/coghex/hetoimasia.git
+    subdir: samples/triangle/app
+
+executable hetoimasia-triangle
+    default-language: GHC2024
+    default-extensions: UnicodeSyntax OverloadedStrings
+    ghc-options: -Wall -Wcompat -Wincomplete-uni-patterns -Wincomplete-record-updates -threaded -rtsopts
+    main-is: Main.hs
+    hs-source-dirs: .
+    build-depends:
+        base >=4.22 && <4.23,
+        containers >=0.8 && <0.9,
+        stm >=2.5.3 && <2.6,
+        text >=2.1 && <2.2,
+        time >=1.15 && <1.16,
+        hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-runtime ==0.1.0.0,
+        hetoimasia-glfw ==0.1.0.0,
+        hetoimasia-glfw:runtime-glfw ==0.1.0.0,
+        hetoimasia-glfw:vulkan-interop ==0.1.0.0,
+        hetoimasia-gpu-vulkan-model ==0.1.0.0,
+        hetoimasia-gpu-vulkan-diagnostics ==0.1.0.0,
+        hetoimasia-gpu-vulkan-glfw ==0.1.0.0,
+        hetoimasia-sample-triangle ==0.1.0.0

@@ -3771,6 +3771,26 @@ Vulkan operations to this same machinery rather than replacing it: the
 controller in `hetoimasia-gpu-vulkan-glfw`, whose contract is
 [gpu_backend.md](gpu_backend.md).
 
+What *draws* is never an operation here: it is the Vulkan host's renderer,
+which the backend calls inside its own step. The triangle sample
+([`samples/triangle`](../samples/triangle/README.md), VK-17) is the consumer
+example: its executable builds the host with `withVulkanOwnerHost`, hands each
+window over on the main thread with `handOverVulkanTarget`, runs
+`runVulkanOwnerLoop`, and gives the host a renderer that is its drawing plus
+one line —
+
+```haskell
+triangleRenderer ∷ Triangle → VulkanRenderer scene
+triangleRenderer triangle = VulkanRenderer $ \_ request construction recorder →
+  drawTriangle triangle
+    (Builders (constructPipelineLayout construction) (constructPipeline construction))
+    (requestFormat request) (requestExtent request) recorder
+```
+
+— so it chooses its pipeline and draw order through the backend's managed
+recording while this machinery keeps every GLFW call on the main thread and
+every Vulkan call on the owner's.
+
 #### The handoffs
 
 | What | Direction | Transport |

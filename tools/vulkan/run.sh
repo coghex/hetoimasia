@@ -178,25 +178,39 @@ echo "vulkan: validation features ${HETOIMASIA_VULKAN_VALIDATION_FEATURES:-none}
 cd "$root"
 
 # Regenerate the shader toolchain fingerprint before Cabal decides anything is
-# up to date, and remove it again at exit if this command created it.
-fingerprint="packages/gpu-vulkan/native/shaders/toolchain.fingerprint"
+# up to date, in every package whose shader splices read it — each splice
+# reads `shaders/toolchain.fingerprint` relative to the package it compiles
+# in — and remove each again at exit if this command created it.
+fingerprints=(
+  "packages/gpu-vulkan/native/shaders/toolchain.fingerprint"
+  "samples/triangle/renderer/shaders/toolchain.fingerprint"
+)
+cleanup=""
 generate_fingerprint() {
-  if [ ! -e "$fingerprint" ]; then
-    # The directory too, when this created it: Git records no empty
-    # directory, so one left behind is an addition the candidate lacks. The
-    # cleanup must never decide the exit status — under `set -e` a failing
-    # command in the trap would replace the suites' own — so each step
-    # tolerates what it finds.
-    if [ -d "$(dirname "$fingerprint")" ]; then
-      trap 'rm -f "$root/$fingerprint" || true' EXIT
-    else
-      trap 'rm -f "$root/$fingerprint" || true; rmdir "$root/$(dirname "$fingerprint")" 2>/dev/null || true' EXIT
+  for fingerprint in "${fingerprints[@]}"; do
+    if [ ! -e "$fingerprint" ]; then
+      # The directory too, when this created it: Git records no empty
+      # directory, so one left behind is an addition the candidate lacks. The
+      # cleanup must never decide the exit status — under `set -e` a failing
+      # command in the trap would replace the suites' own — so each step
+      # tolerates what it finds.
+      cleanup="$cleanup rm -f \"\$root/$fingerprint\" || true;"
+      if [ ! -d "$(dirname "$fingerprint")" ]; then
+        cleanup="$cleanup rmdir \"\$root/$(dirname "$fingerprint")\" 2>/dev/null || true;"
+      fi
     fi
+  done
+  if [ -n "$cleanup" ]; then
+    # shellcheck disable=SC2064
+    trap "$cleanup" EXIT
   fi
   "$HETOIMASIA_GLSLANG" --hetoimasia-identity | sed 's/^/vulkan: glslang wrapper reports /'
-  cabal run -v1 "${cabal_flags[@]}" hetoimasia-gpu-vulkan-native:exe:hetoimasia-shader-fingerprint -- \
-    --output "$root/$fingerprint" \
-    | sed 's/^shader fingerprint:/vulkan: shader fingerprint:/'
+  for fingerprint in "${fingerprints[@]}"; do
+    mkdir -p "$root/$(dirname "$fingerprint")"
+    cabal run -v1 "${cabal_flags[@]}" hetoimasia-gpu-vulkan-native:exe:hetoimasia-shader-fingerprint -- \
+      --output "$root/$fingerprint" \
+      | sed 's/^shader fingerprint:/vulkan: shader fingerprint:/'
+  done
 }
 
 case "$mode" in
@@ -227,6 +241,7 @@ root = sys.argv[1]
 # input gets left out.
 roots = ["tools/vulkan", "tools/native", "tools/display",
          "packages/gpu-vulkan/native", "packages/gpu-vulkan/glfw", "packages/glfw",
+         "samples/triangle/renderer", "samples/triangle/app",
          "packages/gpu-vulkan/diagnostics", "packages/gpu-vulkan/model",
          "packages/runtime", "packages/foundation", "tools/test-support"]
 files = ["cabal.project.vulkan", "cabal.project.common",

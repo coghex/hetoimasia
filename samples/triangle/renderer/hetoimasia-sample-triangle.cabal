@@ -1,0 +1,49 @@
+cabal-version: 3.16
+name: hetoimasia-sample-triangle
+version: 0.1.0.0
+synopsis: The triangle sample's drawing for Hetoimasia's Vulkan host
+description:
+    VK-17's consumer drawing: one triangle over a clear, recorded through the
+    native backend's managed recording vocabulary, with its shaders embedded at
+    build time through the backend's shader adapter. It depends on the native
+    backend alone and names nothing of the window integration, so the
+    integration's native suite can exercise it unchanged, and the sample's
+    executable (`hetoimasia-sample-triangle-app`) hands it to the host.
+    Nothing in the engine depends on it.
+    .
+    It is selected only by `cabal.project.vulkan`, so neither `cabal.project`
+    nor `cabal.project.cpu` resolves the binding, the Vulkan headers or a
+    loader, and only `tools/vulkan/run.sh` builds it.
+license: GPL-3.0-only
+license-file: LICENSE
+author: Vincent Coghlan
+maintainer: Vincent Coghlan
+category: Game
+build-type: Simple
+tested-with: GHC ==9.14.1
+-- The shader toolchain fingerprint every splice here checks and registers,
+-- which `tools/vulkan/run.sh` generates at `shaders/toolchain.fingerprint`
+-- before every build and removes afterwards. Cabal decides whether to run GHC
+-- from the files a package lists, never from the ones a splice registers, so
+-- it is listed here; see packages/gpu-vulkan/native/README.md.
+extra-source-files:
+    **/*.fingerprint
+
+source-repository head
+    type: git
+    location: https://github.com/coghex/hetoimasia.git
+    subdir: samples/triangle/renderer
+
+library
+    default-language: GHC2024
+    default-extensions: UnicodeSyntax OverloadedStrings
+    ghc-options: -Wall -Wcompat -Wincomplete-uni-patterns -Wincomplete-record-updates
+    hs-source-dirs: src
+    exposed-modules:
+        Hetoimasia.Sample.Triangle
+        Hetoimasia.Sample.Triangle.Geometry
+        Hetoimasia.Sample.Triangle.Shaders
+    build-depends:
+        base >=4.22 && <4.23,
+        containers >=0.8 && <0.9,
+        hetoimasia-gpu-vulkan-native ==0.1.0.0

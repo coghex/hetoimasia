@@ -267,20 +267,23 @@ examples are deterministic, need no permission, and are never optional probes.
 `test.vulkan-native` is the Vulkan native suite
 ([docs/gpu_backend.md](gpu_backend.md#the-native-suite)): the package-native
 fixture's shared roots under the graphics owner, and the migrated VK-2, VK-5,
-VK-6 and VK-7 cases and the synchronization-validation control in child
-processes of their own. It requires the `display` class, is mandatory outside
+VK-6 and VK-7 cases, VK-17's required profile over the triangle sample's
+drawing, and the synchronization-validation control in child processes of
+their own. It requires the `display` class, is mandatory outside
 the floor, and is the one group with a [preparation](#preparation-and-the-watchdog):
 
 ```json
 "command": ["bash", "tools/vulkan/run.sh", "native", "hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests", "--", "--complete"],
 "preparation": {
-  "command": ["bash", "tools/vulkan/run.sh", "build", "hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests"],
+  "command": ["bash", "tools/vulkan/run.sh", "build", "hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests", "hetoimasia-sample-triangle-app:exe:hetoimasia-triangle"],
   "timeout_seconds": 3600
 },
 "timeout_seconds": 30
 ```
 
-The preparation compiles the suite; the command builds nothing — it asks Cabal
+The preparation compiles the suite, and the triangle sample's executable
+beside it so a sample that no longer builds against the host fails the group;
+nothing runs the sample. The command builds nothing — it asks Cabal
 for the built executable and refuses one that was not prepared. `--complete`
 makes the receipt speak for the whole profile: the suite runs every example
 through Hspec's own primitives with the configuration-reading step left out, so
@@ -295,9 +298,11 @@ standing approval for runs an issue or pull request needs, as
 [A local run and its receipt](#a-local-run-and-its-receipt) describes. A missing
 loader, device, layer or display fails the group; an empty selection fails the
 suite, and the suite's own report names its non-empty selection. Its inputs are
-the suite's Cabal closure, `cabal.project.vulkan`, `cabal.project.common`,
-`tools/display/`, `tools/native/`, `tools/ci-image/`, `tools/vulkan/`, and
-`tools/toolchain/binding.pin`. It declares no `platforms`: the shared profile
+the suite's Cabal closure — which reaches the triangle sample's drawing,
+geometry and shaders (`samples/triangle/renderer`), since the suite depends on
+them — `cabal.project.vulkan`, `cabal.project.common`, the sample's executable
+(`samples/triangle/app/`), `tools/display/`, `tools/native/`,
+`tools/ci-image/`, `tools/vulkan/`, and `tools/toolchain/binding.pin`. It declares no `platforms`: the shared profile
 applies everywhere, and the one case with no Cocoa equivalent — VK-5's failed
 initialization — reports itself pending on macOS rather than passing.
 

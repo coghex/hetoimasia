@@ -37,6 +37,11 @@
 -- * @vk16-composed@ — VK-16's two targets rendered through the composed loop,
 --   one suspended and resumed while the other keeps presenting, and the host's
 --   exit through D-33 ("Test.GPU.Vulkan.Native.Composed", #232);
+-- * @vk17-one-slot@ and @vk17-two-slots@ — VK-17's required profile: the
+--   triangle sample's renderer in two windows, each captured, the first
+--   resized and captured at its new extent and then closed while the second
+--   keeps rendering, with one frame slot and with two
+--   ("Test.GPU.Vulkan.Native.Triangle", #233);
 -- * @vk19-capture@ — VK-19's consumer-built triangle pipeline, captured from
 --   two targets through the production host with verification capture on
 --   ("Test.GPU.Vulkan.Native.Capture", #299);
@@ -93,6 +98,7 @@ import qualified Test.GPU.Vulkan.Native.Presentation as Presentation
 import qualified Test.GPU.Vulkan.Native.Recovery as Recovery
 import qualified Test.GPU.Vulkan.Native.Recording as Recording
 import qualified Test.GPU.Vulkan.Native.Terminal as Terminal
+import qualified Test.GPU.Vulkan.Native.Triangle as Triangle
 import qualified Test.Vulkan.Proof.Bridge as Bridge
 import qualified Test.Vulkan.Proof.BridgeSpec as BridgeSpec
 import qualified Test.Vulkan.Proof.Diagnostics as Diagnostics
@@ -192,6 +198,18 @@ scenarios =
       $ \_ journal _ → do
         outcome ← Composed.runComposed journal
         pure (Composed.spec outcome, section "The VK-16 composed loop record" (Composed.composedSection outcome))
+  , Scenario
+      "vk17-one-slot"
+      "renders the triangle sample in two windows with one frame slot, capturing each, the first again after its resize, and the second after the first closes, with validation reporting nothing"
+      $ \_ journal _ → do
+        outcome ← Triangle.runProfile 1 journal
+        pure (Triangle.spec 1 outcome, section "The VK-17 required profile record, one frame slot" (Triangle.profileSection outcome))
+  , Scenario
+      "vk17-two-slots"
+      "renders the triangle sample in two windows with two frame slots, capturing each, the first again after its resize, and the second after the first closes, with validation reporting nothing"
+      $ \_ journal _ → do
+        outcome ← Triangle.runProfile 2 journal
+        pure (Triangle.spec 2 outcome, section "The VK-17 required profile record, two frame slots" (Triangle.profileSection outcome))
   , Scenario
       "vk19-capture"
       "captures a consumer-built triangle from two targets through the production host, each beside its frame's verified presentation, with validation reporting nothing"
