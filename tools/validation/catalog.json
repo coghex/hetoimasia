@@ -310,7 +310,7 @@
     },
     {
       "id": "test.workflow",
-      "description": "Hspec examples driving the documentation landing helper, this planner and runner, the CI image builder, and the native recipe helper against temporary Git repositories; the local test/flake lab's selection, durable history, recovery, process guardians, exports, and skill installation; and the boundary that keeps the Vulkan project out of the mandatory floor, holds its two groups to their commands and routing, and holds the compatibility summary to the retained records it quotes.",
+      "description": "Hspec examples driving the documentation landing helper, this planner and runner, the CI image builder, and the native recipe helper against temporary Git repositories; the quruntul adapter's agreement with this catalog; and the boundary that keeps the Vulkan project out of the mandatory floor, holds its two groups to their commands and routing, and holds the compatibility summary to the retained records it quotes.",
       "command": [
         "cabal",
         "test",
@@ -344,7 +344,7 @@
         "tools/validation/",
         "tools/vulkan/",
         "tools/vulkan-proof/",
-        "tools/flake/",
+        ".quruntul/",
         "packages/gpu-vulkan/native/",
         "packages/gpu-vulkan/glfw/",
         "packages/glfw/hetoimasia-glfw.cabal",

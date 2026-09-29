@@ -1,0 +1,176 @@
+"""Checks that .quruntul/adapter.py still describes the catalog's suites faithfully.
+
+The adapter is Python that quruntul imports, so it is checked in Python, driven
+one example at a time by tools/test/QuruntulAdapter.hs. A stub context stands in
+for quruntul's (same `Suite`, `Prepared`, `digest` and `run` surface), so these
+checks need neither quruntul nor a compiler, display or network. They compare
+the adapter against tools/validation/catalog.json directly: the catalog stays
+the one authority for what exists.
+"""
+from __future__ import annotations
+
+import ast
+from dataclasses import dataclass, field
+import hashlib
+import importlib.util
+import json
+from pathlib import Path
+import re
+import subprocess
+import sys
+import unittest
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.dont_write_bytecode = True
+
+
+@dataclass
+class Suite:
+    id: str
+    kind: str
+    framework: str
+    description: str
+    area: str = ""
+    platforms: list = field(default_factory=lambda: ["Darwin", "Linux"])
+    desktop: bool = False
+    trial_seconds: int = 900
+    batch_seconds: int = 7200
+    identity: str = ""
+    rts: list = field(default_factory=list)
+    checks: list = field(default_factory=list)
+    priority: int = 10
+    data: dict = field(default_factory=dict)
+
+
+@dataclass
+class Prepared:
+    argv: list
+    cwd: str
+    environment: dict
+    provenance: dict = field(default_factory=dict)
+    wrapper: list = field(default_factory=list)
+    launches_executable: bool = True
+
+
+class Context:
+    Suite = Suite
+    Prepared = Prepared
+
+    def __init__(self, platform="Darwin"):
+        self.checkout = ROOT
+        self.revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True,
+                                       text=True, check=True).stdout.strip()
+        self.platform = platform
+        self.calls = []
+
+    @staticmethod
+    def digest(value):
+        return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+    def run(self, argv, name, timeout, cwd=None, environment=None):
+        self.calls.append(dict(argv=argv, name=name, environment=environment))
+        return dict(outcome="passed", log="/dev/null", command=argv)
+
+
+def load():
+    spec = importlib.util.spec_from_file_location("hetoimasia_quruntul_adapter", ROOT / ".quruntul" / "adapter.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+CATALOG = json.loads((ROOT / "tools" / "validation" / "catalog.json").read_text())
+
+
+def hspec_components():
+    found = {}
+    for group in CATALOG["groups"]:
+        if group.get("framework") != "hspec":
+            continue
+        names = [group["component"]] if ":test:" in (group.get("component") or "") else []
+        names += [w for w in group.get("command", []) if re.fullmatch(r"[\w-]+:test:[\w-]+", w)]
+        for component in names:
+            found.setdefault(component, []).append(group)
+    return found
+
+
+class AdapterChecks(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.module = load()
+        cls.suites = {s.id: s for s in cls.module.adapter().suites(Context())}
+
+    def test_every_catalog_hspec_component_is_exactly_one_suite(self):
+        expected = {component.split(":")[2]: component for component in hspec_components()}
+        self.assertEqual(sorted(self.suites), sorted(expected))
+        for name, component in expected.items():
+            self.assertEqual(self.suites[name].data["component"], component)
+
+    def test_probes_are_exactly_the_local_only_optional_groups(self):
+        workflow = (ROOT / ".github" / "workflows" / "validation.yml").read_text()
+        routed = set()
+        for declaration in re.findall(r'--worker "[^"$]+=[^"$]+:([^"$]+)"', workflow):
+            routed.update(declaration.split(","))
+        for component, groups in hspec_components().items():
+            local = any(g.get("optional") and g.get("category") == "probe" and g["id"] not in routed for g in groups)
+            self.assertEqual(self.suites[component.split(":")[2]].kind, "probe" if local else "ci", component)
+
+    def test_desktop_suites_are_the_display_runner_groups(self):
+        for component, groups in hspec_components().items():
+            display = any(g.get("runner") == "display" for g in groups)
+            self.assertEqual(self.suites[component.split(":")[2]].desktop, display, component)
+
+    def test_build_routes_follow_the_project_files(self):
+        cpu = (ROOT / "cabal.project.cpu").read_text()
+        vulkan = (ROOT / "cabal.project.vulkan").read_text()
+        for suite in self.suites.values():
+            directory = suite.data["directory"] or "."
+            route = suite.data["route"]
+            if route == "cpu":
+                self.assertRegex(cpu, rf"(?m)^\s+{re.escape(directory)}\s*$", suite.id)
+            elif route == "vulkan":
+                self.assertRegex(vulkan, rf"(?m)^\s+{re.escape(directory)}\s*$", suite.id)
+                self.assertNotRegex(cpu, rf"(?m)^\s+{re.escape(directory)}\s*$", suite.id)
+            else:
+                self.assertEqual(suite.data["package"], "hetoimasia-glfw", suite.id)
+
+    def test_platform_bound_probes(self):
+        self.assertEqual(self.suites["macos-confinement-probe"].platforms, ["Darwin"])
+        self.assertEqual(self.suites["linux-confinement-probe"].platforms, ["Linux"])
+
+    def test_identities_are_stable_and_distinct(self):
+        again = {s.id: s.identity for s in self.module.adapter().suites(Context())}
+        self.assertEqual(again, {k: s.identity for k, s in self.suites.items()})
+        self.assertEqual(len(set(again.values())), len(again))
+
+    def test_desktop_consent_is_per_command_on_macos_and_an_isolated_display_on_linux(self):
+        adapter = self.module.adapter()
+        adapter._check_toolchain = lambda checkout: None
+        adapter._discovery = lambda checkout, build_dir: {"HETOIMASIA_VULKAN_LIBDIR": "/l", "HETOIMASIA_VULKAN_INCLUDEDIR": "/i"}
+        adapter._list_bin = lambda checkout, flags, component, environment: sys.executable
+        adapter._tools = lambda checkout, component: []
+        for platform, suite_id in (("Darwin", "glfw-native-tests"), ("Linux", "glfw-native-tests"),
+                                   ("Darwin", "vulkan-native-tests"), ("Darwin", "foundation-tests")):
+            ctx = Context(platform)
+            prepared = adapter.prepare(ctx, self.suites[suite_id])
+            desktop = self.suites[suite_id].desktop
+            if desktop and platform == "Darwin":
+                self.assertEqual(prepared.environment.get("HETOIMASIA_NATIVE_SESSION"), "desktop")
+                self.assertEqual(prepared.wrapper, [])
+            elif desktop:
+                self.assertNotIn("HETOIMASIA_NATIVE_SESSION", prepared.environment)
+                self.assertEqual(prepared.wrapper[-2:], [str(ROOT / "tools" / "display" / "x11.sh"), "--"])
+            else:
+                self.assertNotIn("HETOIMASIA_NATIVE_SESSION", prepared.environment)
+            if self.suites[suite_id].data["route"] == "vulkan":
+                self.assertEqual(ctx.calls[0]["argv"][:3], ["bash", "tools/vulkan/run.sh", "build"])
+
+    def test_the_adapter_imports_nothing_from_quruntul(self):
+        tree = ast.parse((ROOT / ".quruntul" / "adapter.py").read_text())
+        imported = [alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names]
+        imported += [node.module or "" for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)]
+        self.assertEqual([name for name in imported if name.split(".")[0] == "quruntul"], [])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -5652,8 +5652,11 @@ HETOIMASIA_NATIVE_SESSION=desktop cabal test glfw-native-tests --test-show-detai
 HETOIMASIA_NATIVE_SESSION=desktop cabal test glfw-native-tests --test-show-details=direct --test-options='--match "/GLFW native/the shared session/"'
 ```
 
-Periodic testing and flake-lab rotations are not covered: they use the desktop
-only when the owner asks for that run. The owner can withdraw the standing
+A quruntul `$flake` batch of never-measured tests is covered too (owner
+decision 2026-09-29): the lab runs one window-opening batch at a time and
+supplies the consent on each trial's own command. Other periodic testing and
+profiling are not covered: they use the desktop only when the owner asks for
+that run. The owner can withdraw the standing
 approval, and per-session asking then applies again. Never set the variable in
 a shell profile, a persistent environment, or a script that runs on its own: it
 is the guard that keeps every command that did not ask for a desktop from
