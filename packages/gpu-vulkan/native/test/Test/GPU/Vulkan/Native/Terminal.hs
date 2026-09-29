@@ -18,7 +18,7 @@
 -- device is lost natively and nothing waits on a clock.
 module Test.GPU.Vulkan.Native.Terminal (spec) where
 
-import Control.Concurrent (ThreadId, forkIO, killThread, myThreadId, threadDelay, yield)
+import Control.Concurrent (forkIO, killThread, myThreadId, threadDelay)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (atomically, newTVarIO, readTVarIO, throwSTM, writeTVar)
 import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall), Exception, SomeException, fromException, mask, throwIO, toException, try)
@@ -28,7 +28,6 @@ import Data.List (nub)
 import Data.Maybe (fromMaybe, isJust)
 import Data.List.NonEmpty (NonEmpty ((:|)))
 import Data.Text (Text)
-import GHC.Conc (ThreadStatus (..), threadStatus)
 import Test.Hspec (Expectation, Spec, describe, it, shouldBe, shouldNotReturn, shouldReturn, shouldSatisfy, shouldThrow)
 import Test.Support.Bounded (bounded)
 
@@ -206,17 +205,38 @@ spec = describe "Terminal failure" $ do
       recordFrame (rigRecording rig) (ownedFrame frame) (\_ → pure ()) `shouldReturn'` (`shouldSatisfy` sessionRefused (== TerminalValidationError))
       clean rig
 
-    it "holds nothing back for a claim abandoned by a thread that has since ended" $ do
+    it "holds nothing back for a claim abandoned by a thread that is still running" $ do
       rig ← newRig
       capture ← newFakeCapture
       atomically (watchRootsDiagnosticsOrdered (rigRoots rig) (fakeWatch capture))
       abandoned ← newEmptyMVar
-      claimant ← forkIO (abandonClaim rig >> putMVar abandoned ())
-      bounded (takeMVar abandoned >> awaitEnded claimant)
+      release ← newEmptyMVar
+      -- The claimant rolls its transaction back and carries on, never reaching
+      -- another checkpoint of its own.
+      _ ← forkIO (abandonClaim rig >> putMVar abandoned () >> takeMVar release)
+      bounded (takeMVar abandoned)
       checkpointRoots (rigRoots rig) `shouldReturn` CheckpointClear
       reportValidationError capture
       checkpointRoots (rigRoots rig) `shouldReturn` CheckpointFailed TerminalValidationError
       evidenceOf rig `shouldReturn` []
+      putMVar release ()
+      clean rig
+
+    it "keeps a sink failure that arrived behind an abandoned claim pending until it publishes, and orders a later failure of the owner's own behind it" $ do
+      rig ← newRig
+      capture ← newFakeCapture
+      atomically (watchRootsDiagnosticsOrdered (rigRoots rig) (fakeWatch capture))
+      abandonClaim rig
+      -- The sink fails behind the void claim and its worker has not yet
+      -- published why: something has failed, so nothing is clear.
+      noteSinkFailure capture
+      checkpointRoots (rigRoots rig) `shouldReturn` CheckpointPending
+      -- The owner's next failure waits for the reason, which is published once
+      -- it has looked and found it pending.
+      afterNextAlarms capture (publishSinkFailure capture "the sink is gone")
+      atomically (failRootsSessionBecause (rigRoots rig) CleanupFailed "a later cleanup failed")
+      primaryIs rig (== TerminalSinkFailed "the sink is gone")
+      evidenceOf rig `shouldReturn` [LaterFailure (TerminalCleanupFailed "a later cleanup failed")]
       clean rig
 
     it "orders a failure of the owner's own behind the validation error that followed an abandoned claim" $ do
@@ -611,22 +631,34 @@ twoTargets rig = case rigTargets rig of
 
 -- | A diagnostic capture's order and alarms kept as the real capture keeps
 -- them: one first place that whichever failure claims it first holds for good
--- — an error-severity report, the sink, or the owner — beside the error latch
--- and the sink's published reason, answered as 'captureAlarms' answers them.
--- The owner's next claim can be held open after it is made, standing for a
--- transaction that has claimed and not yet committed.
+-- — an error-severity report, the sink, or the owner — beside the error latch,
+-- the sink's published reason, and which diagnostic failures have arrived,
+-- each recorded before it tries to claim; answered as 'captureAlarms' answers
+-- them. The owner's next claim, and the next reading of the alarms, can each
+-- run an action once.
 data FakeCapture = FakeCapture
   { fakeFirst ∷ IORef (Maybe FakeFirst)
+  , fakeErrorArrived ∷ IORef Bool
   , fakeErrorLatched ∷ IORef Bool
+  , fakeSinkArrived ∷ IORef Bool
   , fakeSinkReason ∷ IORef (Maybe Text)
   , fakeAfterClaim ∷ IORef (IO ())
+  , fakeAfterAlarms ∷ IORef (IO ())
   }
 
 data FakeFirst = FakeOwner | FakeError | FakeSink
   deriving (Eq, Show)
 
 newFakeCapture ∷ IO FakeCapture
-newFakeCapture = FakeCapture <$> newIORef Nothing <*> newIORef False <*> newIORef Nothing <*> newIORef (pure ())
+newFakeCapture =
+  FakeCapture
+    <$> newIORef Nothing
+    <*> newIORef False
+    <*> newIORef False
+    <*> newIORef False
+    <*> newIORef Nothing
+    <*> newIORef (pure ())
+    <*> newIORef (pure ())
 
 -- | The watch the controller would install over the capture. Neither half runs
 -- a transaction, since the roots read both inside theirs.
@@ -637,35 +669,56 @@ fakeWatch capture = DiagnosticWatch alarms order
       latched ← readIORef (fakeErrorLatched capture)
       sink ← readIORef (fakeSinkReason capture)
       first ← readIORef (fakeFirst capture)
+      errorArrived ← readIORef (fakeErrorArrived capture)
+      sinkArrived ← readIORef (fakeSinkArrived capture)
       let errors = [AlarmValidationError | latched]
           sinks = [AlarmSinkFailed reason | Just reason ← [sink]]
-      pure $ case first of
-        Just FakeSink
-          | null sinks → [AlarmPending]
-          | otherwise → sinks <> errors
-        Just FakeError
-          | null errors → [AlarmPending]
-        Just FakeOwner → AlarmOwnerClaimed : errors <> sinks
-        _ → errors <> sinks
+          unpublished = (errorArrived && null errors) || (sinkArrived && null sinks)
+          answer = case first of
+            Just FakeSink
+              | null sinks → [AlarmPending]
+              | otherwise → sinks <> errors
+            Just FakeError
+              | null errors → [AlarmPending]
+            Just FakeOwner → AlarmOwnerClaimed : [AlarmPending | unpublished] <> errors <> sinks
+            _ → errors <> sinks
+      once (fakeAfterAlarms capture)
+      pure answer
     order = do
       first ← atomicModifyIORef' (fakeFirst capture) (\held → let first = fromMaybe FakeOwner held in (Just first, first))
-      join (atomicModifyIORef' (fakeAfterClaim capture) (\after → (pure (), after)))
+      once (fakeAfterClaim capture)
       pure $ case first of
         FakeError → ValidationFirst
         FakeSink → SinkFirst (readIORef (fakeSinkReason capture))
         FakeOwner → OwnerFirst
+    once hook = join (atomicModifyIORef' hook (\after → (pure (), after)))
 
 -- | Run this once, inside the transaction of the owner's next claim, right
 -- after it claims.
 holdNextClaim ∷ FakeCapture → IO () → IO ()
 holdNextClaim capture = writeIORef (fakeAfterClaim capture)
 
--- | An error-severity report: it claims first place if nothing holds it, then
--- sets the error latch.
+-- | Run this once, right after the next reading of the alarms has been answered.
+afterNextAlarms ∷ FakeCapture → IO () → IO ()
+afterNextAlarms capture = writeIORef (fakeAfterAlarms capture)
+
+-- | An error-severity report: its arrival is recorded, then it claims first
+-- place if nothing holds it, then sets the error latch.
 reportValidationError ∷ FakeCapture → IO ()
 reportValidationError capture = do
+  writeIORef (fakeErrorArrived capture) True
   atomicModifyIORef' (fakeFirst capture) (\held → (Just (fromMaybe FakeError held), ()))
   writeIORef (fakeErrorLatched capture) True
+
+-- | The sink's worker meeting its failure: its arrival is recorded and it
+-- claims first place if nothing holds it; publishing why comes after.
+noteSinkFailure ∷ FakeCapture → IO ()
+noteSinkFailure capture = do
+  writeIORef (fakeSinkArrived capture) True
+  atomicModifyIORef' (fakeFirst capture) (\held → (Just (fromMaybe FakeSink held), ()))
+
+publishSinkFailure ∷ FakeCapture → Text → IO ()
+publishSinkFailure capture = writeIORef (fakeSinkReason capture) . Just
 
 data Abandoned = Abandoned
   deriving (Eq, Show)
@@ -680,14 +733,6 @@ abandonClaim rig = do
   atomically (failRootsSessionBecause (rigRoots rig) CleanupFailed "never recorded" >> throwSTM Abandoned) `shouldThrow` (== Abandoned)
   reportPrimary <$> atomically (readRootsTerminal (rigRoots rig)) `shouldReturn` Nothing
   sessionState <$> modelOf rig `shouldReturn` SessionRunning
-
--- | Wait until the thread has ended.
-awaitEnded ∷ ThreadId → IO ()
-awaitEnded thread =
-  threadStatus thread >>= \case
-    ThreadFinished → pure ()
-    ThreadDied → pure ()
-    _ → yield >> awaitEnded thread
 
 primaryIs ∷ Rig → (TerminalCause → Bool) → Expectation
 primaryIs rig expected = atomically (readRootsTerminal (rigRoots rig)) `shouldReturn'` \report → reportPrimary report `shouldSatisfy` maybe False expected

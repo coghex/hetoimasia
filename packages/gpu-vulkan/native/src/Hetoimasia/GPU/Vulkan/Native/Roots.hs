@@ -121,10 +121,10 @@
 -- | The diagnostic   | The roots | Installed once; every       | The owner  | The session      | —                         |
 -- | watch            |           | checkpoint reads it         |            |                  |                           |
 -- +------------------+-----------+-----------------------------+------------+------------------+---------------------------+
--- | Owner claims     | The roots | A claim of the capture's    | Any; not   | The session      | A thread leaves it at its |
--- |                  |           | order enters its thread; a  | STM, so an |                  | own checkpoint; a thread  |
--- |                  |           | checkpoint reads it and     | abandoned  |                  | that has ended is dropped |
--- |                  |           | removes its own thread      | claim stays|                  | when read                 |
+-- | Owner claims     | The roots | A claiming attempt enters a | Any; not   | The session      | An attempt is dropped     |
+-- |                  |           | weak token and writes it    | STM, so an |                  | once a collection finds   |
+-- |                  |           | into its log; checkpoints   | abandoned  |                  | its token gone            |
+-- |                  |           | and later claims read them  | claim stays|                  |                           |
 -- +------------------+-----------+-----------------------------+------------+------------------+---------------------------+
 --
 -- Every mutating operation is meant for one serialized owner — the graphics
@@ -218,9 +218,9 @@ module Hetoimasia.GPU.Vulkan.Native.Roots
   , readRootsDisposers
   ) where
 
-import Control.Concurrent (ThreadId, myThreadId, threadDelay, yield)
+import Control.Concurrent (threadDelay, yield)
 import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
-import GHC.Conc (ThreadStatus (..), threadStatus, unsafeIOToSTM)
+import GHC.Conc (unsafeIOToSTM)
 import Control.Exception
   ( Exception (displayException)
   , ExceptionWithContext (ExceptionWithContext)
@@ -236,15 +236,16 @@ import Control.Exception
   )
 import Control.Monad (filterM, unless, when)
 import Data.Foldable (for_)
-import Data.IORef (IORef, atomicModifyIORef', newIORef)
+import Data.IORef (IORef, atomicModifyIORef', mkWeakIORef, newIORef)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
+import Data.List ((\\))
 import Data.Maybe (isJust, isNothing)
-import Data.Set (Set)
-import qualified Data.Set as Set
+import System.Mem (performMajorGC)
+import System.Mem.Weak (Weak, deRefWeak)
 import Data.Text (Text)
 import qualified Data.Text as Text
-import Data.Unique (newUnique)
+import Data.Unique (Unique, newUnique)
 import Data.Word (Word32, Word64)
 import Numeric.Natural (Natural)
 import Hetoimasia.Foundation.Time (MonotonicSource, readInstant)
@@ -475,9 +476,12 @@ data Roots q inst msgr phys dev = Roots
   , rootsWatch ∷ !(TVar DiagnosticWatch)
     -- ^ What a checkpoint asks of the diagnostic capture.
   , rootsClaims ∷ !(IORef OwnerClaims)
-    -- ^ Which threads' transactions have claimed the capture's order for a
+    -- ^ The transaction attempts that have claimed the capture's order for a
     -- failure of the owner's own. Not transactional: a claim outlives the
     -- attempt that made it, and so must this record of it.
+  , rootsClaimHold ∷ !(TVar (Maybe (IORef ())))
+    -- ^ Written by each claiming attempt with its own token, which its
+    -- transaction's log then keeps alive until it commits or is discarded.
   , rootsDebugUtils ∷ !(TVar Bool)
     -- ^ Whether the instance was created with @VK_EXT_debug_utils@.
   , rootsNamed ∷ !(TVar Bool)
@@ -510,7 +514,8 @@ newRoots ops budgets clock = do
     <*> newTVarIO Nothing
     <*> newTVarIO (TerminalReport Nothing Nothing [] 0)
     <*> newTVarIO (DiagnosticWatch (pure []) (pure OwnerFirst))
-    <*> newIORef (OwnerClaims False Set.empty)
+    <*> newIORef (OwnerClaims False [])
+    <*> newTVarIO Nothing
     <*> newTVarIO False
     <*> newTVarIO False
     <*> newTVarIO []
@@ -1089,38 +1094,42 @@ latchTerminal roots cause = do
 --
 -- It never blocks the transaction ('retry' would make it interruptible under
 -- 'mask_', and an owner's masked record could then lose its whole
--- transaction to a cancellation). The one wait it has — for a sink failure
--- that holds first place to publish its reason — is 'awaitPublication',
--- inside the transaction.
+-- transaction to a cancellation). Its waits — for a sink failure that holds
+-- first place to publish its reason, and for a failure that arrived behind a
+-- void claim to become readable — are 'awaitPublication' and
+-- 'readableAlarms', inside the transaction.
 --
--- A claim holds first place only for the transaction attempt that made it.
--- One whose attempt did not commit — abandoned by an exception, or run again
--- — is void once no thread that entered a claim ('rootsClaims') can still be
--- inside one: this thread, which is here, and every thread that has ended are
--- not. A void claim still holds the capture's slot, so the claim made now
--- answers 'OwnerFirst' however much came after it; what the capture held
--- before this claim is latched ahead of it instead.
+-- A claim holds first place only for the transaction attempt that made it
+-- ('claimHeld'). A claim made before, that no attempt which could still
+-- commit holds, is void: it still holds the capture's slot, so the claim
+-- made now answers 'OwnerFirst' however much came after it, and every
+-- diagnostic failure the capture has seen arrive is latched ahead of this one
+-- instead.
 orderBehindDiagnostics ∷ Roots q inst msgr phys dev → STM ()
 orderBehindDiagnostics roots = do
   report ← readTVar (rootsTerminal roots)
   model ← readTVar (rootsModel roots)
   when (isNothing (reportPrimary report) && isNothing (fromModel model)) $ do
     watch ← readTVar (rootsWatch roots)
-    ahead ← unsafeIOToSTM $ do
-      me ← myThreadId
+    (token, ahead) ← unsafeIOToSTM $ do
+      token ← newIORef ()
+      attempt ← newUnique
+      held ← mkWeakIORef token (pure ())
       -- Entered before the claim, so a checkpoint that reads the claim reads
-      -- its claimant too.
+      -- this attempt too.
       made ← atomicModifyIORef' (rootsClaims roots) $ \claims →
-        (OwnerClaims True (Set.insert me (claimants claims)), claimsMade claims)
-      before ← if made then watchAlarms watch else pure []
-      watchOrder watch >>= \case
+        (OwnerClaims True ((attempt, held) : claimAttempts claims), claimsMade claims)
+      void ← if made then not <$> claimHeld roots (Just attempt) else pure False
+      ahead ← watchOrder watch >>= \case
         OwnerFirst
-          | AlarmOwnerClaimed `elem` before → do
-              live ← liveClaimants roots me
-              pure (if live then [] else before)
+          | void → readableAlarms watch
           | otherwise → pure []
         ValidationFirst → pure [AlarmValidationError]
         SinkFirst published → (\reason → [AlarmSinkFailed reason]) <$> awaitPublication published
+      pure (token, ahead)
+    -- The token is written into this attempt's own log, which keeps it alive
+    -- while the attempt may still commit, and only while it may.
+    writeTVar (rootsClaimHold roots) (Just token)
     latchAlarms roots ahead
 
 -- | Wait for the reason of a sink failure that claimed first place. The worker
@@ -1136,21 +1145,44 @@ orderBehindDiagnostics roots = do
 awaitPublication ∷ IO (Maybe Text) → IO Text
 awaitPublication published = published >>= maybe (yield >> awaitPublication published) pure
 
--- | Whether a thread other than this one that entered a claim may still be in
--- its transaction: one that has not ended. Those that have are dropped.
-liveClaimants ∷ Roots q inst msgr phys dev → ThreadId → IO Bool
-liveClaimants roots me = do
-  others ← Set.toList . Set.delete me . claimants <$> atomicModifyIORef' (rootsClaims roots) (\claims → (claims, claims))
-  running ← filterM (fmap (`notElem` [ThreadFinished, ThreadDied]) . threadStatus) others
-  let ended = Set.fromList others `Set.difference` Set.fromList running
-  atomicModifyIORef' (rootsClaims roots) (\claims → (claims {claimants = claimants claims `Set.difference` ended}, ()))
-  pure (not (null running))
+-- | The capture's alarms once none is pending: a failure that arrived behind
+-- a void claim sets its alarm right after recording its arrival — an error's
+-- callback at its next step, the sink's worker in the masked step that noted
+-- it — so this is bounded as 'awaitPublication' is, and waits the same way.
+readableAlarms ∷ DiagnosticWatch → IO [DiagnosticAlarm]
+readableAlarms watch =
+  watchAlarms watch >>= \alarms →
+    if AlarmPending `elem` alarms then yield >> readableAlarms watch else pure alarms
 
--- | The threads that entered a claim of the capture's order for a failure of
--- the owner's own ('orderBehindDiagnostics'), and whether one ever has.
+-- | Whether a transaction attempt that claimed the capture's order — other
+-- than this one — may still commit.
+--
+-- Each attempt's token is held here only weakly; the attempt itself keeps it
+-- alive, from its stack until it writes it into its transaction's log
+-- ('rootsClaimHold') and from that log until it commits. An attempt that is
+-- abandoned — by an exception, or run again — is discarded with its log, so
+-- once a collection has run its token is gone, whatever its thread goes on to
+-- do. A major collection is run only when some token still answers, and those
+-- gone are dropped.
+claimHeld ∷ Roots q inst msgr phys dev → Maybe Unique → IO Bool
+claimHeld roots this =
+  answering >>= \case
+    False → pure False
+    True → performMajorGC >> answering
+  where
+    answering = do
+      attempts ← filter ((/= this) . Just . fst) . claimAttempts <$> atomicModifyIORef' (rootsClaims roots) (\claims → (claims, claims))
+      alive ← filterM (fmap isJust . deRefWeak . snd) attempts
+      let gone = map fst attempts \\ map fst alive
+      atomicModifyIORef' (rootsClaims roots) (\claims → (claims {claimAttempts = filter ((`notElem` gone) . fst) (claimAttempts claims)}, ()))
+      pure (not (null alive))
+
+-- | The claims of the capture's order made for failures of the owner's own
+-- ('orderBehindDiagnostics'): whether one ever has been, and each attempt
+-- that made one that has not yet been found gone.
 data OwnerClaims = OwnerClaims
   { claimsMade ∷ !Bool
-  , claimants ∷ !(Set ThreadId)
+  , claimAttempts ∷ ![(Unique, Weak (IORef ()))]
   }
 
 latchCause ∷ Roots q inst msgr phys dev → TerminalCause → STM ()
@@ -1235,12 +1267,11 @@ watchRootsDiagnosticsOrdered roots = writeTVar (rootsWatch roots)
 -- answers an earlier primary if there is one, 'CheckpointPending' otherwise,
 -- so admission stays closed until a later checkpoint can latch them in order.
 --
--- A claim whose transaction was abandoned holds nothing back. This thread is
--- here, so none of its claims is still in a transaction, and a claimant
--- thread that has ended recorded nothing; with no other claimant left, the
--- alarms beside the claim are latched as usual. A claimant on another thread
--- that is still running may be mid-transaction, so it is waited for: until
--- that thread's own next checkpoint, or its end.
+-- A claim whose transaction attempt was abandoned holds nothing back
+-- ('claimHeld'): once no attempt that claimed can still commit, the alarms
+-- beside the claim are latched as usual, whatever the claiming thread goes on
+-- to do. A diagnostic failure that arrived behind that claim is answered
+-- pending until its own alarm is readable, and then latched.
 --
 -- Only the owner's ordinary operations checkpoint. Retirement does not: it
 -- runs because the session has failed, and a checkpoint there would only
@@ -1248,15 +1279,12 @@ watchRootsDiagnosticsOrdered roots = writeTVar (rootsWatch roots)
 checkpointRoots ∷ Roots q inst msgr phys dev → IO Checkpoint
 checkpointRoots roots = do
   alarms ← watchAlarms =<< readTVarIO (rootsWatch roots)
-  -- The claimants are read after the alarms, and each entered before it
-  -- claimed, so the claim these alarms name has its claimant here.
-  claimed ←
-    if AlarmOwnerClaimed `elem` alarms
-      then do
-        me ← myThreadId
-        atomicModifyIORef' (rootsClaims roots) (\claims → (claims {claimants = Set.delete me (claimants claims)}, ()))
-        liveClaimants roots me
-      else pure False
+  -- The claiming attempts are read after the alarms, and each entered before
+  -- it claimed, so the claim these alarms name has its attempt here.
+  -- Only while nothing has recorded a failure is there a claim to ask after:
+  -- once one is latched the capture answers the claim for good.
+  unrecorded ← atomically ((&&) <$> (isNothing . reportPrimary <$> readTVar (rootsTerminal roots)) <*> (isNothing . fromModel <$> readTVar (rootsModel roots)))
+  claimed ← if AlarmOwnerClaimed `elem` alarms && unrecorded then claimHeld roots Nothing else pure False
   atomically $ do
     latched ← reportPrimary <$> readTVar (rootsTerminal roots)
     modelled ← fromModel <$> readTVar (rootsModel roots)

@@ -2048,21 +2048,31 @@ be cancelled there, and an unmasked one can, as anywhere else in its
 transaction. The claim answers the same however often a transaction runs it.
 
 A claim holds first place only for the transaction attempt that made it, and
-it is a compare-and-swap in C that an abandoned transaction does not undo, so
-the roots record, outside STM, each thread that enters a claim. Between the
-owner's claim and the commit of the transaction that records its failure, a
-checkpoint on another thread — a handover's, say — sees the claim
-(`CaptureOwnerClaimed`, `AlarmOwnerClaimed`) with nothing latched and its
-claimant still running, and answers `CheckpointPending`, latching nothing, so a
-later diagnostic failure cannot take the owner's place. A claim no claimant can
-still be inside — the checking thread's own, since that thread is at the
-checkpoint, or one whose thread has ended — is void: the checkpoint latches the
-alarms beside it as usual, so an abandoned transaction leaves no checkpoint
-pending and no settled checkpoint waiting. A later failure of the owner's own,
-whose claim the void one still answers first, is ordered behind the diagnostic
-failures the capture held before that claim. A claimant thread still running
-is waited for until its own next checkpoint or its end; the owner's failures
-and settled checkpoints are all on the owner's thread.
+it is a compare-and-swap in C that an abandoned attempt does not undo. Each
+claiming attempt therefore enters a token in the roots, held there only
+weakly, and writes it into its own transaction log: the attempt keeps it alive
+while it may still commit, and once GHC discards an abandoned attempt — rolled
+back by an exception, or run again — a collection finds the token gone,
+whatever the claiming thread goes on to do. Between the owner's claim and the
+commit of the transaction that records its failure, a checkpoint on another
+thread — a handover's, say — sees the claim (`CaptureOwnerClaimed`,
+`AlarmOwnerClaimed`) with nothing latched and its attempt's token alive, and
+answers `CheckpointPending`, latching nothing, so a later diagnostic failure
+cannot take the owner's place. A claim no live attempt holds is void: the
+checkpoint latches the alarms beside it as usual, so an abandoned transaction
+leaves no checkpoint pending and no settled checkpoint waiting. It runs a major
+collection to tell, and only while nothing is latched, a claim is visible and
+some token still answers.
+
+A diagnostic failure that arrives behind a claim loses its own claim, so the
+capture also records each one's arrival before it tries to claim
+(`hetoimasia_capture_arrived_failures`), and answers one whose alarm is not yet
+readable as `CaptureAlarmPending` beside the claim. A checkpoint therefore
+answers pending, never clear, while a sink failure behind a void claim is
+unpublished. A later failure of the owner's own, whose claim the void one still
+answers first, waits until every such failure is readable — bounded as the
+sink's publication is — and is ordered behind every diagnostic failure the
+capture has seen arrive.
 
 Every record of a failure of the owner's own made inside a masked step — an
 uncertain or failed presentation, an uncertain submission, a progress step's

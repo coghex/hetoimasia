@@ -50,6 +50,7 @@ module Hetoimasia.GPU.Vulkan.Diagnostics.Internal.Capture
   , noteSinkFailure
   , claimOwnerFailure
   , firstFailure
+  , arrivedFailures
   , counterValue
   , latchSet
 
@@ -72,6 +73,7 @@ import Control.Exception (Exception, throwIO)
 import Data.Bits ((.&.))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
+import Data.Functor ((<&>))
 import Data.Int (Int32)
 import Data.Maybe (fromMaybe)
 import Data.Word (Word32, Word64)
@@ -459,6 +461,15 @@ claimOwnerFailure userData = decodeFirst <$> hetoimasia_capture_claim_owner_fail
 firstFailure ∷ Ptr () → IO (Maybe FirstFailure)
 firstFailure userData = decodeFirst <$> hetoimasia_capture_first_failure userData
 
+-- | Which diagnostic failures have arrived — an error report, the sink —
+-- whether or not they claimed first place, or 'Nothing' once the slot serves
+-- another. Each is recorded before it tries to claim, so one that lost the
+-- claim to the owner is known before its latch is set or its reason published.
+arrivedFailures ∷ Ptr () → IO (Maybe (Bool, Bool))
+arrivedFailures userData =
+  hetoimasia_capture_arrived_failures userData <&> \arrived →
+    if arrived < 0 then Nothing else Just (arrived .&. 1 /= 0, arrived .&. 2 /= 0)
+
 decodeFirst ∷ CInt → Maybe FirstFailure
 decodeFirst = \case
   1 → Just FirstError
@@ -669,6 +680,9 @@ foreign import ccall unsafe "hetoimasia_vulkan_capture.h hetoimasia_capture_clai
 
 foreign import ccall unsafe "hetoimasia_vulkan_capture.h hetoimasia_capture_first_failure"
   hetoimasia_capture_first_failure ∷ Ptr () → IO CInt
+
+foreign import ccall unsafe "hetoimasia_vulkan_capture.h hetoimasia_capture_arrived_failures"
+  hetoimasia_capture_arrived_failures ∷ Ptr () → IO CInt
 
 foreign import ccall unsafe "hetoimasia_vulkan_capture.h hetoimasia_capture_status"
   hetoimasia_capture_status ∷ Ptr () → Ptr Word64 → Ptr CInt → IO CInt
