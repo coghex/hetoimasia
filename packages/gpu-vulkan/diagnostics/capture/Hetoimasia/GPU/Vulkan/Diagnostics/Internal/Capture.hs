@@ -64,6 +64,7 @@ module Hetoimasia.GPU.Vulkan.Diagnostics.Internal.Capture
   , offerAnnounced
   , holdArrived
   , releaseHold
+  , slotClosed
   , presetCounter
   ) where
 
@@ -623,6 +624,17 @@ holdArrived (Hold arrived _) = withForeignPtr arrived (fmap (/= 0) . hetoimasia_
 releaseHold ∷ Hold → IO ()
 releaseHold (Hold _ gate) = withForeignPtr gate hetoimasia_capture_flag_set
 
+-- | Whether admission is closed for the storage this user data was issued for,
+-- or 'Nothing' once its slot serves another. Unlike 'storageClosed' it needs
+-- only the user data, so an example that holds a lifetime's capture but not its
+-- private storage can see that the lifetime has begun closing.
+slotClosed ∷ Ptr () → IO (Maybe Bool)
+slotClosed userData =
+  hetoimasia_capture_slot_closed userData >>= \case
+    0 → pure (Just False)
+    1 → pure (Just True)
+    _ → pure Nothing
+
 -- | Set a counter directly, so saturation can be shown.
 presetCounter ∷ Storage → Counter → Word64 → IO ()
 presetCounter (Storage storage _) counter = hetoimasia_capture_preset_counter storage (fromIntegral (fromEnum counter))
@@ -666,6 +678,9 @@ foreign import ccall safe "hetoimasia_vulkan_capture.h hetoimasia_capture_offer_
 
 foreign import ccall safe "hetoimasia_vulkan_capture.h hetoimasia_capture_offer_held"
   hetoimasia_capture_offer_held ∷ Ptr () → Ptr CInt → Ptr CInt → Word32 → CString → IO Word32
+
+foreign import ccall unsafe "hetoimasia_vulkan_capture.h hetoimasia_capture_slot_closed"
+  hetoimasia_capture_slot_closed ∷ Ptr () → IO CInt
 
 foreign import ccall unsafe "hetoimasia_vulkan_capture.h hetoimasia_capture_flag_set"
   hetoimasia_capture_flag_set ∷ Ptr CInt → IO ()
