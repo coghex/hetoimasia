@@ -27,8 +27,7 @@ import qualified Data.Text as Text
 import Hetoimasia.Runtime.GLFW
 import qualified Hetoimasia.Runtime.GLFW.Internal as Private
 import Test.GLFW.Owner.Fixture.Drive
-  ( accountedFor
-  , awaitConstructed
+  ( awaitConstructed
   , awaitRound
   , awaitStanding
   , awaitTerminal
@@ -181,6 +180,15 @@ testPartialConstruction = do
   standing `shouldBe` TargetUnusable True
   accountedFor record `shouldBe` allRetirementFacts
   map retiringConstructed retirements `shouldBe` [False]
+
+-- | Every fact one terminal record established, published or still owed.
+--
+-- A record is written before its facts are offered to the transport, so which
+-- side of the split a fact is on at the instant an example reads it is a
+-- race. That they are all on one side or the other is not: it is exactly what
+-- the record retaining them means.
+accountedFor ∷ TerminalRecord → [RetirementFact]
+accountedFor record = terminalPublished record <> terminalOwed record
 
 -- | A construction whose failure the backend did not verify a rollback for
 -- leaves the owner owning something, so the owner retires it.

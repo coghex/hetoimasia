@@ -12,7 +12,6 @@ module Test.GLFW.Owner.Fixture.Drive
   , handedOver
   , sampledObservation
   , observed
-  , accountedFor
   , awaitTerminal
   , awaitStanding
   , awaitConstructed
@@ -107,15 +106,6 @@ sampledObservation host window =
 observed ∷ GraphicsOwner Scene → GraphicsService → Natural → WindowObservation → IO ObservationPublication
 observed owner service revision observation =
   publishGraphicsObservation owner service revision observation RenderEligible Nothing
-
--- | Every fact one terminal record established, published or still owed.
---
--- A record is written before its facts are offered to the transport, so which
--- side of the split a fact is on at the instant an example reads it is a
--- race. That they are all on one side or the other is not: it is exactly what
--- the record retaining them means.
-accountedFor ∷ TerminalRecord → [RetirementFact]
-accountedFor record = terminalPublished record <> terminalOwed record
 
 -- | Wait until the owner has recorded a terminal record for this target.
 awaitTerminal ∷ GraphicsOwner Scene → GraphicsService → IO TerminalRecord
