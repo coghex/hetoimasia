@@ -209,10 +209,18 @@ shaderNaming recording issued =
 
 -- | Reserve the accounting, make the native object, and turn the reservation
 -- into a managed generation — or into a new generation of the one being
--- replaced — in one masked step. A creation that raised created nothing: its
--- reservation is given back, and the failure is re-raised. The creation is
--- told the identity the model is about to issue the generation, for what it
--- names before that identity exists.
+-- replaced — in one masked step. The creation is told the identity the model
+-- is about to issue the generation, for what it names before that identity
+-- exists.
+--
+-- Every exit that produces no managed generation gives the reservation back,
+-- exactly once: a refusal the model answers, and a creation that raised, which
+-- created nothing — its failure re-raised unchanged, whether it raised at
+-- first or during an out-of-memory recovery, from the retry or the
+-- reclamation pass, and whether it was a synchronous failure, device loss or a
+-- cancellation. A generation the model recorded, on the first creation or the
+-- retry, keeps the reservation as its accounting, even when naming it then
+-- raises and releases it.
 construct
   ∷ Recording q inst msgr phys dev cmd
   → Natural
@@ -259,9 +267,13 @@ construct recording bytes objects name create replacing =
                   Left (ExceptionWithContext _ exception)
                     | not (isAsynchronous exception)
                     , rootsNativeFailure roots exception == Just FailedOutOfMemory →
-                        recoverAllocation roots name (Just allocation) Nothing (Text.pack (displayException exception)) (failingAgain roots creation) >>= \case
-                          Right native → pure native
-                          Left notRecovered → abandoned >> throwIO notRecovered
+                        tryWithContext @SomeException (recoverAllocation roots name (Just allocation) Nothing (Text.pack (displayException exception)) (failingAgain roots creation)) >>= \case
+                          Right (Right native) → pure native
+                          Right (Left notRecovered) → abandoned >> throwIO notRecovered
+                          -- The retry raised — device loss, a cancellation, a
+                          -- failure the roots classify — or the reclamation
+                          -- pass did: the retry made nothing either way.
+                          Left failure → abandoned >> rethrowIO failure
                   Left failure → abandoned >> rethrowIO failure
                   Right native → pure native
                 committed ← atomically $ do

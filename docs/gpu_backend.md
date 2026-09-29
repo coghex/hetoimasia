@@ -1759,7 +1759,10 @@ triangleRenderer triangle = VulkanRenderer $ \_ request construction recorder â†
 ```
 
 It builds a layout and a pipeline the first time it meets a format, keeps them
-across frames, and leaves both to the session's teardown.
+across frames, and leaves both to the session's teardown. A format's layout is
+built once: when the pipeline over it is refused, the frame is skipped and the
+layout is kept for the next frame's attempt, so a refusal that recurs never
+spends the session's object budget on another layout.
 
 ### Verification capture
 
@@ -2279,7 +2282,12 @@ VK-18's D-33 order and releases nothing early.
   the owner's thread from the geometry the owner folded, replaced after a resize
   with the old one handed over and destroyed only once its hold ended, none for a
   hidden target, and a closing window's views and swapchain destroyed before its
-  surface.
+  surface;
+- `hetoimasia-sample-triangle:triangle-tests` â€” the triangle sample's pipeline
+  cache over stand-in builders: a format's layout built once and handed to
+  every attempt while its pipeline is refused, each refusal answered as it
+  was, the built pipeline reused for every later frame of its format, nothing
+  held after a refused layout, and one layout and one pipeline per color format.
 
 VK-19's examples are in `integration-tests`, under `Vulkan consumer rendering
 and capture`, over the same stand-ins, extended to journal every command the

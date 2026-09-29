@@ -18,8 +18,9 @@
 # the native execution it prepares and never counted in it.
 #
 # `test` builds and runs the named test suites. `test.vulkan-headless` runs the
-# native backend's `native-tests` and `shader-tests` and the window
-# integration's `integration-tests` through it: none of them opens a window,
+# native backend's `native-tests` and `shader-tests`, the window integration's
+# `integration-tests` and the triangle sample's `triangle-tests` through it:
+# none of them opens a window,
 # acquires a display or a session, or creates a device, and none reads consent.
 # Every argument after `--` reaches every suite as a test option.
 #

@@ -17,10 +17,12 @@
 -- STM. Where a state lasts only between a helper's delivery and its
 -- deregistration, they hold the helper with the package-private coordination
 -- probe, which runs on the production helper path of a production group; the
--- probe's own opacity is proven by "Test.Foundation.Workers.Opacity".
+-- probe's own opacity is proven by "Test.Foundation.Workers.Opacity". The
+-- blocked-delivery example uses the same probe to name the helper's thread,
+-- then waits for it to block in its 'throwTo' before releasing the worker.
 module Test.Foundation.Workers.Spec (spec) where
 
-import Control.Concurrent (ThreadId, forkIO, killThread, throwTo, yield)
+import Control.Concurrent (ThreadId, forkIO, killThread, myThreadId, throwTo, yield)
 import Control.Concurrent.MVar
   ( MVar
   , newEmptyMVar
@@ -56,7 +58,7 @@ import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.List (elemIndex)
 import Data.Maybe (isNothing)
 import Data.Text (Text)
-import GHC.Conc (BlockReason (BlockedOnSTM), ThreadStatus (ThreadBlocked), threadStatus)
+import GHC.Conc (BlockReason (BlockedOnException, BlockedOnSTM), ThreadStatus (ThreadBlocked), threadStatus)
 import Hetoimasia.Foundation.Failure
   ( FailureCause (..)
   , FailureEvidence (failureCause)
@@ -113,7 +115,7 @@ import Hetoimasia.Foundation.Worker
   , workerId
   , workerLabel
   )
-import Hetoimasia.Foundation.Worker.Internal (GroupProbe (..), withWorkerGroupProbed)
+import Hetoimasia.Foundation.Worker.Internal (GroupProbe (..), noProbe, withWorkerGroupProbed)
 import System.Timeout (timeout)
 import qualified Test.Foundation.Workers.Opacity as Opacity
 import qualified Test.Foundation.Workers.Visibility as Visibility
@@ -277,13 +279,17 @@ forkOwner action = do
   thread ← forkIO (tryWithContext action >>= putMVar done)
   pure (thread, done)
 
+-- | Wait until a thread is blocked for a given reason.
+awaitBlocked ∷ BlockReason → ThreadId → IO ()
+awaitBlocked reason thread = do
+  status ← threadStatus thread
+  if status == ThreadBlocked reason
+    then pure ()
+    else yield >> awaitBlocked reason thread
+
 -- | Wait until a thread is blocked in an STM transaction.
 awaitBlockedOnSTM ∷ ThreadId → IO ()
-awaitBlockedOnSTM thread = do
-  status ← threadStatus thread
-  case status of
-    ThreadBlocked BlockedOnSTM → pure ()
-    _ → yield >> awaitBlockedOnSTM thread
+awaitBlockedOnSTM = awaitBlocked BlockedOnSTM
 
 -- | Require an absent value whose type has no 'Show' instance.
 expectNothing ∷ Maybe a → Expectation
@@ -767,18 +773,25 @@ testBlockedCancellationDelivery = do
   running ← newEmptyMVar
   failing ← newEmptyMVar
   release ← newEmptyMVar
+  delivering ← newEmptyMVar
+  let probe = noProbe {probeHelperDelivering = \_ → myThreadId >>= putMVar delivering}
   (owner, done) ← forkOwner $
-    withScoped (resource trace "parent" >> allocWorkerGroup) $ \group → do
-      _ ←
-        expectStarted
-          =<< startWorker group
-            ( workerDefinition "uninterruptible" (\_ → resource trace "child") $ \_ () →
-                uninterruptibleMask_ (putMVar running () >> takeMVar release)
-            )
-      takeMVar running
-      putMVar failing ()
-      throwIO (Broken "owner")
+    withScoped (resource trace "parent") $ \() →
+      withWorkerGroupProbed probe $ \group → do
+        _ ←
+          expectStarted
+            =<< startWorker group
+              ( workerDefinition "uninterruptible" (\_ → resource trace "child") $ \_ () →
+                  uninterruptibleMask_ (putMVar running () >> takeMVar release)
+              )
+        takeMVar running
+        putMVar failing ()
+        throwIO (Broken "owner")
   takeMVar failing
+  -- The drain's helper names its thread just before its 'throwTo'. Blocked in
+  -- that delivery, it is waiting on the uninterruptible worker, so releasing
+  -- the worker now cannot let it finish before the cancellation arrives.
+  takeMVar delivering >>= awaitBlocked BlockedOnException
   awaitBlockedOnSTM owner
   tryReadMVar done >>= expectNothing
   readIORef trace >>= (`shouldBe` ["acquire parent", "acquire child"])
@@ -863,7 +876,7 @@ newHeldHelpers ∷ IO HeldHelpers
 newHeldHelpers = HeldHelpers <$> newEmptyMVar <*> newEmptyMVar
 
 heldProbe ∷ HeldHelpers → GroupProbe
-heldProbe held = GroupProbe (\_ → putMVar (heldArrived held) () >> takeMVar (heldRelease held))
+heldProbe held = noProbe {probeHelperSettling = \_ → putMVar (heldArrived held) () >> takeMVar (heldRelease held)}
 
 -- | A report reduced to what a caller can compare: each list's labels, result
 -- kinds, run-exit records, and cleanup labels.
