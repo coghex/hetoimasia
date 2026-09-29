@@ -1,8 +1,9 @@
 # Graphics-owner progress during macOS window interactions: VK-16's verdict
 
 **Measured: during a Cocoa live resize and during a Cocoa menu-bar interaction
-the graphics owner kept rendering at the display's rate while the main thread
-was blocked.**
+the graphics owner kept making present requests and observing present-fence
+completion, on average every 13 ms and 17 ms respectively and never more than
+21 ms apart, while the main thread was blocked.**
 
 - **Live resize.** For the whole of a 14.55 s block of the main thread's native
   event call, with no owner turn in between, the owner made 1154 present
@@ -17,8 +18,10 @@ was blocked.**
   newer scene.
 
 D-29 moved rendering to the graphics owner so that a Cocoa modal loop would not
-leave a stale or stretched surface. That is now measured for both modal loops,
-on the request and completion evidence this probe can collect.
+leave a stale or stretched surface. For both modal loops, the request and
+completion evidence this probe can collect now shows the owner kept presenting
+throughout; whether the surface stayed fresh and unstretched is the visual
+question below, which this evidence does not settle.
 
 **Not proved by evidence: visible progress.** A present call's return proves
 the request was admitted. A signalled present fence proves the presentation
