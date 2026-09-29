@@ -20,7 +20,11 @@ from quruntul — the context supplies `Suite`, `Prepared` and `digest` — so
 Build routes follow AGENTS.md: CPU packages through `cabal.project.cpu`,
 `hetoimasia-glfw` through `cabal.project` with the native prefix's
 `PKG_CONFIG_PATH`, and the Vulkan packages through `tools/vulkan/run.sh`, whose
-native-prefix discovery supplies the loader environment. Desktop suites get
+native-prefix discovery supplies the loader environment. The compiler is chosen
+by `PATH` (docs/toolchain.md), so when the `ghc` or `cabal` on `PATH` is not
+the revision's pin but ghcup's versioned `ghc-<pin>` is installed, every build
+and trial runs with a private directory of links to it first on `PATH`;
+ghcup's default, which may be another project's, is left alone. Desktop suites get
 the per-command consent on macOS (owner decision 2026-09-29: flake measures
 them like every other test) and an isolated X11 display on Linux.
 """
@@ -32,9 +36,12 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 
+# What ghcup installs for each GHC version, as `<tool>-<version>`.
+GHC_TOOLS = ("ghc", "ghc-pkg", "ghci", "haddock", "hp2ps", "hpc", "hsc2hs", "runghc", "runhaskell")
 VULKAN_PACKAGES = {"hetoimasia-gpu-vulkan-native", "hetoimasia-gpu-vulkan-glfw", "hetoimasia-sample-triangle"}
 GLFW_PACKAGES = {"hetoimasia-glfw"}
 BUILD_SECONDS = 3600
@@ -165,20 +172,22 @@ class Hetoimasia:
         checkout = ctx.checkout
         component = suite.data["component"]
         route = suite.data["route"]
-        self._check_toolchain(checkout)
-        environment: dict[str, str] = {}
+        # Builds, list-bin and every trial see the pinned compiler: the
+        # ExternalClient examples compile against the `ghc` on PATH.
+        path = self._toolchain(checkout)
+        environment: dict[str, str] = {"PATH": path}
         if route == "vulkan":
             # The group's own preparation when it declares one; else build the suite.
             command = suite.data.get("preparation") or ["bash", "tools/vulkan/run.sh", "build", component]
-            build = ctx.run(command, "build", BUILD_SECONDS)
+            build = ctx.run(command, "build", BUILD_SECONDS, environment=environment)
             self._built(build)
-            environment = self._discovery(checkout, "dist-vulkan")
+            environment.update(self._discovery(checkout, "dist-vulkan"))
             flags = ["--project-file=cabal.project.vulkan", f"--builddir={checkout / 'dist-vulkan'}",
                      f"--extra-lib-dirs={environment['HETOIMASIA_VULKAN_LIBDIR']}",
                      f"--extra-include-dirs={environment['HETOIMASIA_VULKAN_INCLUDEDIR']}"]
         else:
             if route == "glfw":
-                environment = self._discovery(checkout, "dist-newstyle")
+                environment.update(self._discovery(checkout, "dist-newstyle"))
             flags = ["--project-file", "cabal.project" if route == "glfw" else "cabal.project.cpu"]
             command = suite.data.get("preparation") or ["cabal", "build", *flags, component]
             build = ctx.run(command, "build", BUILD_SECONDS, environment=environment)
@@ -186,7 +195,7 @@ class Hetoimasia:
         executable = self._list_bin(checkout, flags, component, environment)
         tools = [self._list_bin(checkout, flags, tool, environment) for tool in self._tools(checkout, component)]
         if tools:
-            environment["PATH"] = os.pathsep.join([str(Path(t).parent) for t in tools] + [os.environ.get("PATH", "")])
+            environment["PATH"] = os.pathsep.join([str(Path(t).parent) for t in tools] + [path])
         if suite.data["launch"] == "vulkan-native":
             # As test.vulkan-native runs it: run.sh native sets the source digest
             # and revision the native suite's provenance checks require, starts
@@ -195,7 +204,8 @@ class Hetoimasia:
             return ctx.Prepared(
                 argv=[executable, *suite.data["options"]],
                 cwd=str(checkout),
-                environment={"HETOIMASIA_NATIVE_SESSION": "desktop"} if ctx.platform == "Darwin" and suite.desktop else {},
+                environment={"PATH": path, **({"HETOIMASIA_NATIVE_SESSION": "desktop"}
+                                              if ctx.platform == "Darwin" and suite.desktop else {})},
                 wrapper=["bash", str(checkout / "tools" / "vulkan" / "run.sh"), "native", component, "--"],
                 launches_executable=False,
                 provenance=dict(component=component, route=route, launch="tools/vulkan/run.sh native",
@@ -223,18 +233,28 @@ class Hetoimasia:
     # -- helpers ------------------------------------------------------------
 
     @staticmethod
-    def _check_toolchain(checkout: Path) -> None:
+    def _toolchain(checkout: Path) -> str:
+        """The PATH on which `ghc` and `cabal` are this revision's pins, or a refusal.
+
+        The PATH quruntul was started with when it already qualifies; otherwise
+        that PATH behind a shim of the pinned version's ghcup binaries
+        (`_shim`), for this run's builds and trials only.
+        """
         pins = dict(line.split("=", 1) for line in (checkout / "tools/ci-image/toolchain.pin").read_text().splitlines()
                     if line and not line.startswith("#") and "=" in line)
-        for tool, key in (("ghc", "GHC_VERSION"), ("cabal", "CABAL_VERSION")):
-            try:
-                actual = subprocess.run([tool, "--numeric-version"], capture_output=True, text=True,
-                                        timeout=60).stdout.strip()
-            except OSError:
-                actual = "absent"
-            if actual != pins[key]:
-                raise RuntimeError(f"{tool} on PATH is {actual}; this revision pins {pins[key]}. "
-                                   "Activate docs/toolchain.md's qualified toolchain first.")
+        path = os.environ.get("PATH", "")
+        for family, key in ((GHC_TOOLS, "GHC_VERSION"), (("cabal",), "CABAL_VERSION")):
+            tool, pinned = family[0], pins[key]
+            if _version(tool, path) != pinned:
+                shim = _shim(family, pinned, path)
+                if shim:
+                    path = os.pathsep.join([shim, path])
+            actual = _version(tool, path)
+            if actual != pinned:
+                raise RuntimeError(f"{tool} on PATH is {actual} and no {tool}-{pinned} is installed on PATH or in "
+                                   f"ghcup's bin directory; this revision pins {pinned}. Install the qualified "
+                                   "toolchain docs/toolchain.md names.")
+        return path
 
     @staticmethod
     def _built(result: dict) -> None:
@@ -285,6 +305,45 @@ def _platforms(group_id: str) -> list[str]:
     # The catalog names Linux-only groups; the macOS confinement probe's
     # components are simply not built off Darwin (AGENTS.md), so say so here.
     return ["Darwin"] if group_id == "test.macos-confinement" else ["Darwin", "Linux"]
+
+
+def _version(tool: str, path: str) -> str:
+    """What `tool --numeric-version` reports when resolved on `path`."""
+    executable = shutil.which(tool, path=path)
+    if not executable:
+        return "absent"
+    try:
+        return subprocess.run([executable, "--numeric-version"], capture_output=True, text=True, timeout=60,
+                              env={**os.environ, "PATH": path}).stdout.strip() or "unknown"
+    except (OSError, subprocess.TimeoutExpired):
+        return "unknown"
+
+
+def _shim(tools: tuple[str, ...], version: str, path: str) -> str | None:
+    """A directory naming each of `tools` as its installed `<tool>-<version>`, or None without the first.
+
+    ghcup installs every version's binaries under versioned names beside its
+    default's plain ones. The directory lives in the user's cache, keyed by
+    version, and each link is replaced atomically, so concurrent batches share
+    it and one that finds it current changes nothing.
+    """
+    ghcup = Path(os.environ.get("GHCUP_INSTALL_BASE_PREFIX") or Path.home()) / ".ghcup" / "bin"
+    search = os.pathsep.join([path, str(ghcup)])
+    targets = {tool: shutil.which(f"{tool}-{version}", path=search) for tool in tools}
+    if not targets[tools[0]]:
+        return None
+    directory = (Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+                 / "hetoimasia" / "toolchain" / f"{tools[0]}-{version}" / "bin")
+    directory.mkdir(parents=True, exist_ok=True)
+    for tool, target in targets.items():
+        link = directory / tool
+        if not target or (link.is_symlink() and os.readlink(link) == target):
+            continue
+        staged = directory / f".{tool}.{os.getpid()}"
+        staged.unlink(missing_ok=True)
+        os.symlink(target, staged)
+        os.replace(staged, link)
+    return str(directory)
 
 
 def _sha256(path: Path) -> str:

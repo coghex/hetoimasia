@@ -127,7 +127,11 @@ shared executable with `--match` is its own suite — `test.glfw-wayland` become
 unnarrowed suite skips those examples, so each example is measured in exactly
 one profile. The adapter builds each suite the way its group does, and launches
 `vulkan-native-tests` through `tools/vulkan/run.sh native` as `test.vulkan-native`
-does, so the runner's source-digest and revision provenance reach the suite. The `workflow-tests` examples under
+does, so the runner's source-digest and revision provenance reach the suite.
+Builds and trials run on the pinned toolchain: when the `ghc` or `cabal` on
+`PATH` is not [the pin](toolchain.md), the adapter puts a cached directory of
+links to ghcup's versioned binaries (`ghc-9.14.1` and its siblings) first on
+that run's `PATH`, and refuses when they are not installed. The `workflow-tests` examples under
 `Quruntul adapter` check that it still agrees with the catalog.
 
 - **`$test`** runs one due probe: never run, changed since it last ran, or last

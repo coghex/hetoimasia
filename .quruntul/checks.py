@@ -14,13 +14,17 @@ from dataclasses import dataclass, field
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
+PINNED = "/qualified/bin"
 sys.dont_write_bytecode = True
 
 
@@ -143,7 +147,7 @@ class AdapterChecks(unittest.TestCase):
 
     def test_vulkan_native_launches_through_its_runner_with_provenance(self):
         adapter = self.module.adapter()
-        adapter._check_toolchain = lambda checkout: None
+        adapter._toolchain = lambda checkout: PINNED
         adapter._discovery = lambda checkout, build_dir: {"HETOIMASIA_VULKAN_LIBDIR": "/l", "HETOIMASIA_VULKAN_INCLUDEDIR": "/i"}
         adapter._list_bin = lambda checkout, flags, component, environment: sys.executable
         adapter._tools = lambda checkout, component: []
@@ -163,7 +167,7 @@ class AdapterChecks(unittest.TestCase):
 
     def test_a_declared_group_preparation_is_the_build(self):
         adapter = self.module.adapter()
-        adapter._check_toolchain = lambda checkout: None
+        adapter._toolchain = lambda checkout: PINNED
         adapter._discovery = lambda checkout, build_dir: {"HETOIMASIA_VULKAN_LIBDIR": "/l", "HETOIMASIA_VULKAN_INCLUDEDIR": "/i"}
         adapter._list_bin = lambda checkout, flags, component, environment: sys.executable
         adapter._tools = lambda checkout, component: []
@@ -232,7 +236,7 @@ class AdapterChecks(unittest.TestCase):
 
     def test_desktop_consent_is_per_command_on_macos_and_an_isolated_display_on_linux(self):
         adapter = self.module.adapter()
-        adapter._check_toolchain = lambda checkout: None
+        adapter._toolchain = lambda checkout: PINNED
         adapter._discovery = lambda checkout, build_dir: {"HETOIMASIA_VULKAN_LIBDIR": "/l", "HETOIMASIA_VULKAN_INCLUDEDIR": "/i"}
         adapter._list_bin = lambda checkout, flags, component, environment: sys.executable
         adapter._tools = lambda checkout, component: []
@@ -256,6 +260,61 @@ class AdapterChecks(unittest.TestCase):
                 self.assertNotIn("HETOIMASIA_NATIVE_SESSION", prepared.environment)
             if self.suites[suite_id].data["route"] == "vulkan":
                 self.assertEqual(ctx.calls[0]["argv"][:3], ["bash", "tools/vulkan/run.sh", "build"])
+
+    def test_every_build_and_trial_runs_on_the_qualified_toolchain(self):
+        adapter = self.module.adapter()
+        adapter._toolchain = lambda checkout: PINNED
+        adapter._discovery = lambda checkout, build_dir: {"HETOIMASIA_VULKAN_LIBDIR": "/l", "HETOIMASIA_VULKAN_INCLUDEDIR": "/i"}
+        listed = []
+        adapter._list_bin = lambda checkout, flags, component, environment: listed.append(environment) or sys.executable
+        adapter._tools = lambda checkout, component: ["x:exe:y"]
+        for platform in ("Darwin", "Linux"):
+            for suite in self.suites.values():
+                ctx = Context(platform)
+                prepared = adapter.prepare(ctx, suite)
+                for environment in [call["environment"] for call in ctx.calls] + listed + [prepared.environment]:
+                    self.assertIn(PINNED, (environment or {}).get("PATH", "").split(os.pathsep), suite.id)
+                listed.clear()
+
+    def test_a_mismatched_compiler_runs_behind_a_shim_of_the_pinned_ghcup_binaries(self):
+        pins = dict(line.split("=", 1) for line in (ROOT / "tools/ci-image/toolchain.pin").read_text().splitlines()
+                    if "=" in line and not line.startswith("#"))
+        ghc, cabal = pins["GHC_VERSION"], pins["CABAL_VERSION"]
+        with tempfile.TemporaryDirectory() as scratch:
+            scratch = Path(scratch)
+            default, ghcup = scratch / "default", scratch / "home" / ".ghcup" / "bin"
+            tools = {default / "ghc": "0.0.0", default / "cabal": cabal}
+            tools |= {ghcup / f"{tool}-{ghc}": ghc for tool in self.module.GHC_TOOLS}
+            for path, version in tools.items():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(f"#!/bin/sh\necho {version}\n")
+                path.chmod(0o755)
+            environment = dict(PATH=str(default), GHCUP_INSTALL_BASE_PREFIX=str(scratch / "home"),
+                               XDG_CACHE_HOME=str(scratch / "cache"))
+            with mock.patch.dict(os.environ, environment):
+                path = self.module.Hetoimasia._toolchain(ROOT)
+                self.assertEqual(os.environ["PATH"], str(default), "the adapter changed its own PATH")
+                shim = scratch / "cache" / "hetoimasia" / "toolchain" / f"ghc-{ghc}" / "bin"
+                self.assertEqual(path.split(os.pathsep), [str(shim), str(default)])
+                self.assertEqual(self.module._version("ghc", path), ghc)
+                for tool in self.module.GHC_TOOLS:
+                    self.assertEqual(os.readlink(shim / tool), str(ghcup / f"{tool}-{ghc}"))
+                self.assertEqual(self.module.Hetoimasia._toolchain(ROOT), path)
+                # A PATH that already qualifies is used as it is.
+                (default / "ghc").write_text(f"#!/bin/sh\necho {ghc}\n")
+                self.assertEqual(self.module.Hetoimasia._toolchain(ROOT), str(default))
+
+    def test_a_compiler_that_is_not_installed_is_refused(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            ghc = Path(scratch) / "bin" / "ghc"
+            ghc.parent.mkdir()
+            ghc.write_text("#!/bin/sh\necho 0.0.0\n")
+            ghc.chmod(0o755)
+            with mock.patch.dict(os.environ, dict(PATH=str(ghc.parent), GHCUP_INSTALL_BASE_PREFIX=scratch,
+                                                  XDG_CACHE_HOME=scratch)):
+                with self.assertRaisesRegex(RuntimeError, r"ghc on PATH is 0\.0\.0 and no ghc-"):
+                    self.module.Hetoimasia._toolchain(ROOT)
+            self.assertFalse((Path(scratch) / "hetoimasia").exists())
 
     def test_the_adapter_imports_nothing_from_quruntul(self):
         tree = ast.parse((ROOT / ".quruntul" / "adapter.py").read_text())

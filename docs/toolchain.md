@@ -405,3 +405,7 @@ the one each suite was built with — an external client compiled by a different
 compiler does not answer the question those examples ask. Activate the qualified
 toolchain for this repository's work; that is what makes
 `ghc --numeric-version` report the pin.
+The [quruntul adapter](../.quruntul/adapter.py) does this for its own runs:
+it puts links to ghcup's `ghc-<pin>` binaries, cached under
+`${XDG_CACHE_HOME:-~/.cache}/hetoimasia/toolchain/`, first on each build's and
+trial's `PATH`, and leaves ghcup's default alone.
