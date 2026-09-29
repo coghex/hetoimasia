@@ -454,8 +454,9 @@ data CaptureAlarm
 -- admission should stay closed — and the next reading, once the first alarm is
 -- published, answers them in order. It never answers a later failure first.
 -- A failure that arrived after the owner claimed first place is answered
--- beside 'CaptureOwnerClaimed', and as 'CaptureAlarmPending' until its alarm
--- is readable: whether that claim still stands is the owner's to say.
+-- beside 'CaptureOwnerClaimed', in the order the failures arrived, and as
+-- 'CaptureAlarmPending' until its alarm is readable: whether that claim still
+-- stands is the owner's to say.
 -- It runs no transaction of its own, so an owner can read it inside one.
 -- | Which failure holds first place, once the capture's owner has claimed it
 -- for a failure of its own that it is about to record: its own, unless an
@@ -493,20 +494,22 @@ claimCaptureOrder capture =
 data CaptureArrivals = CaptureArrivals
   { arrivedError ∷ !Bool
   , arrivedSink ∷ !Bool
+  , arrivedSinkFirst ∷ !Bool
+    -- ^ The sink's failure arrived before any error-severity report.
   }
   deriving (Eq, Show)
 
 -- | Read which diagnostic failures have arrived, in one atomic load. It runs no
 -- transaction of its own, so an owner can read it inside one.
 captureArrivals ∷ DiagnosticCapture → IO CaptureArrivals
-captureArrivals capture = maybe (CaptureArrivals False False) (uncurry CaptureArrivals) <$> arrivedFailures (handleUserData capture)
+captureArrivals capture = maybe (CaptureArrivals False False False) (\(errors, sink, sinkFirst) → CaptureArrivals errors sink sinkFirst) <$> arrivedFailures (handleUserData capture)
 
 captureAlarms ∷ DiagnosticCapture → IO [CaptureAlarm]
 captureAlarms capture = do
   latched ← statusErrorLatched <$> captureStatus capture
   sink ← readCaptureSinkFailure capture
   first ← firstFailure (handleUserData capture)
-  CaptureArrivals errorArrived sinkArrived ← captureArrivals capture
+  CaptureArrivals errorArrived sinkArrived sinkFirst ← captureArrivals capture
   let errors = [CaptureErrorLatched | latched]
       sinks = [CaptureSinkFailed (sinkFailureReason failure) | Just failure ← [sink]]
       -- A failure that arrived behind the owner's claim, and so could not
@@ -518,7 +521,7 @@ captureAlarms capture = do
       | otherwise → sinks <> errors
     Just FirstError
       | null errors → [CaptureAlarmPending]
-    Just FirstOwner → CaptureOwnerClaimed : [CaptureAlarmPending | unpublished] <> errors <> sinks
+    Just FirstOwner → CaptureOwnerClaimed : [CaptureAlarmPending | unpublished] <> if sinkFirst then sinks <> errors else errors <> sinks
     _ → errors <> sinks
 
 -- | Run a body that owns a diagnostic capture, and finalize it on every exit.

@@ -2065,15 +2065,17 @@ collection to tell, and only while nothing is latched, a claim is visible and
 some token still answers.
 
 A diagnostic failure that arrives behind a claim loses its own claim, so the
-capture also records each one's arrival before it tries to claim
-(`hetoimasia_capture_arrived_failures`), and answers one whose alarm is not yet
+capture also records each one's arrival before it tries to claim, and which
+arrived first (`hetoimasia_capture_arrived_failures`). It answers those behind
+an owner's claim in the order they arrived, and one whose alarm is not yet
 readable as `CaptureAlarmPending` beside the claim. A checkpoint therefore
 answers pending, never clear, while a sink failure behind a void claim is
 unpublished. A later failure of the owner's own, whose claim the void one still
 answers first, takes the capture's arrivals, read right after its claim
 (`captureArrivals`, carried in `OwnerFirst`), as its order point: each
 diagnostic failure that had arrived by then is latched ahead of it once
-readable — a wait bounded as the sink's publication is — and one that arrives
+readable, in the order they arrived — a wait bounded as the sink's publication
+is — and one that arrives
 after comes after it, as it would behind a claim of its own.
 
 Every record of a failure of the owner's own made inside a masked step — an

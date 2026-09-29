@@ -363,7 +363,20 @@ spec = describe "Lifetime" $ do
           _ ← bounded (atomically (captureSinkFailure capture >>= maybe retry pure))
           after ← captureAlarms capture
           pure ((claimed, arrived), map alarmKind before, map alarmKind after)
-      answers `shouldBe` ((CaptureArrivals False False, CaptureArrivals False True), ["owner", "pending"], ["owner", "sink"])
+      answers `shouldBe` ((CaptureArrivals False False False, CaptureArrivals False True True), ["owner", "pending"], ["owner", "sink"])
+
+    it "answers a sink failure and an error that both arrived behind the owner's claim in the order they arrived" $ do
+      (logger, failing) ← switchedLogger
+      (answers, _) ←
+        capturing logger $ \capture → do
+          _ ← claimCaptureOrder capture
+          atomically (writeTVar failing True)
+          offerTo capture (plainOffer SeverityWarning "a warning the sink cannot take")
+          requestDrain capture
+          _ ← bounded (atomically (captureSinkFailure capture >>= maybe retry pure))
+          offerTo capture (plainOffer SeverityError "an error after the sink failed")
+          (,) <$> captureArrivals capture <*> (map alarmKind <$> captureAlarms capture)
+      answers `shouldBe` (CaptureArrivals True True True, ["owner", "sink", "error"])
 
     it "answers only that a failure is pending while the failure that came first has claimed the order but not yet published its alarm" $ do
       (logger, failing) ← switchedLogger

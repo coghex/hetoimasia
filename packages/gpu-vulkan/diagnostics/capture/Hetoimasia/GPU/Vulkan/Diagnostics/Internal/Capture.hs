@@ -70,7 +70,7 @@ module Hetoimasia.GPU.Vulkan.Diagnostics.Internal.Capture
   ) where
 
 import Control.Exception (Exception, throwIO)
-import Data.Bits ((.&.))
+import Data.Bits (shiftR, (.&.))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import Data.Functor ((<&>))
@@ -462,13 +462,14 @@ firstFailure ∷ Ptr () → IO (Maybe FirstFailure)
 firstFailure userData = decodeFirst <$> hetoimasia_capture_first_failure userData
 
 -- | Which diagnostic failures have arrived — an error report, the sink —
--- whether or not they claimed first place, or 'Nothing' once the slot serves
--- another. Each is recorded before it tries to claim, so one that lost the
--- claim to the owner is known before its latch is set or its reason published.
-arrivedFailures ∷ Ptr () → IO (Maybe (Bool, Bool))
+-- whether or not they claimed first place, and whether the sink's arrived
+-- first; 'Nothing' once the slot serves another. Each is recorded before it
+-- tries to claim, so one that lost the claim to the owner is known, and in
+-- what order, before its latch is set or its reason published.
+arrivedFailures ∷ Ptr () → IO (Maybe (Bool, Bool, Bool))
 arrivedFailures userData =
   hetoimasia_capture_arrived_failures userData <&> \arrived →
-    if arrived < 0 then Nothing else Just (arrived .&. 1 /= 0, arrived .&. 2 /= 0)
+    if arrived < 0 then Nothing else Just (arrived .&. 1 /= 0, arrived .&. 2 /= 0, arrived `shiftR` 2 == 2)
 
 decodeFirst ∷ CInt → Maybe FirstFailure
 decodeFirst = \case

@@ -1658,7 +1658,7 @@ readVulkanTerminal (VulkanController state) = readRootsTerminal (stateRoots stat
 diagnosticOrder ∷ DiagnosticCapture → IO DiagnosticOrder
 diagnosticOrder capture =
   claimCaptureOrder capture >>= \case
-    OwnerFailedFirst → (\arrived → OwnerFirst (DiagnosticArrivals (arrivedError arrived) (arrivedSink arrived))) <$> captureArrivals capture
+    OwnerFailedFirst → (\arrived → OwnerFirst (DiagnosticArrivals (arrivedError arrived) (arrivedSink arrived) (arrivedSinkFirst arrived))) <$> captureArrivals capture
     ErrorLatchedFirst → pure ValidationFirst
     SinkFailedFirst → pure (SinkFirst (fmap sinkFailureReason <$> readCaptureSinkFailure capture))
 

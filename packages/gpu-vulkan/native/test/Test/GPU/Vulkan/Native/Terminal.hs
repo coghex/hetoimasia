@@ -253,6 +253,31 @@ spec = describe "Terminal failure" $ do
       evidenceOf rig `shouldReturn` [LaterFailure (TerminalCleanupFailed "a later cleanup failed")]
       clean rig
 
+    it "latches a sink failure and a validation error that followed an abandoned claim in the order they arrived, at a checkpoint" $ do
+      rig ← newRig
+      capture ← newFakeCapture
+      atomically (watchRootsDiagnosticsOrdered (rigRoots rig) (fakeWatch capture))
+      abandonClaim rig
+      noteSinkFailure capture
+      publishSinkFailure capture "the sink is gone"
+      reportValidationError capture
+      checkpointRoots (rigRoots rig) `shouldReturn` CheckpointFailed (TerminalSinkFailed "the sink is gone")
+      evidenceOf rig `shouldReturn` [LaterFailure TerminalValidationError]
+      clean rig
+
+    it "orders a failure of the owner's own behind a sink failure and a validation error that followed an abandoned claim, in the order they arrived" $ do
+      rig ← newRig
+      capture ← newFakeCapture
+      atomically (watchRootsDiagnosticsOrdered (rigRoots rig) (fakeWatch capture))
+      abandonClaim rig
+      noteSinkFailure capture
+      publishSinkFailure capture "the sink is gone"
+      reportValidationError capture
+      atomically (failRootsSessionBecause (rigRoots rig) CleanupFailed "a later cleanup failed")
+      primaryIs rig (== TerminalSinkFailed "the sink is gone")
+      evidenceOf rig `shouldReturn` [LaterFailure TerminalValidationError, LaterFailure (TerminalCleanupFailed "a later cleanup failed")]
+      clean rig
+
     it "keeps a failure of the owner's own that claims over an abandoned claim ahead of a validation error that arrives just after its claim" $ do
       rig ← newRig
       capture ← newFakeCapture
@@ -647,15 +672,16 @@ twoTargets rig = case rigTargets rig of
 -- | A diagnostic capture's order and alarms kept as the real capture keeps
 -- them: one first place that whichever failure claims it first holds for good
 -- — an error-severity report, the sink, or the owner — beside the error latch,
--- the sink's published reason, and which diagnostic failures have arrived,
--- each recorded before it tries to claim; answered as 'captureAlarms' answers
--- them. The owner's next claim, and the next reading of the alarms, can each
+-- the sink's published reason, and which diagnostic failures have arrived and
+-- which first, each recorded before it tries to claim; answered as
+-- 'captureAlarms' answers them. The owner's next claim, and the next reading of the alarms, can each
 -- run an action once.
 data FakeCapture = FakeCapture
   { fakeFirst ∷ IORef (Maybe FakeFirst)
   , fakeErrorArrived ∷ IORef Bool
   , fakeErrorLatched ∷ IORef Bool
   , fakeSinkArrived ∷ IORef Bool
+  , fakeFirstArrived ∷ IORef (Maybe FakeFirst)
   , fakeSinkReason ∷ IORef (Maybe Text)
   , fakeAfterClaim ∷ IORef (IO ())
   , fakeAfterAlarms ∷ IORef (IO ())
@@ -672,6 +698,7 @@ newFakeCapture =
     <*> newIORef False
     <*> newIORef False
     <*> newIORef Nothing
+    <*> newIORef Nothing
     <*> newIORef (pure ())
     <*> newIORef (pure ())
 
@@ -686,6 +713,7 @@ fakeWatch capture = DiagnosticWatch alarms order
       first ← readIORef (fakeFirst capture)
       errorArrived ← readIORef (fakeErrorArrived capture)
       sinkArrived ← readIORef (fakeSinkArrived capture)
+      sinkFirst ← (== Just FakeSink) <$> readIORef (fakeFirstArrived capture)
       let errors = [AlarmValidationError | latched]
           sinks = [AlarmSinkFailed reason | Just reason ← [sink]]
           unpublished = (errorArrived && null errors) || (sinkArrived && null sinks)
@@ -695,13 +723,17 @@ fakeWatch capture = DiagnosticWatch alarms order
               | otherwise → sinks <> errors
             Just FakeError
               | null errors → [AlarmPending]
-            Just FakeOwner → AlarmOwnerClaimed : [AlarmPending | unpublished] <> errors <> sinks
+            Just FakeOwner → AlarmOwnerClaimed : [AlarmPending | unpublished] <> if sinkFirst then sinks <> errors else errors <> sinks
             _ → errors <> sinks
       once (fakeAfterAlarms capture)
       pure answer
     order = do
       first ← atomicModifyIORef' (fakeFirst capture) (\held → let first = fromMaybe FakeOwner held in (Just first, first))
-      arrived ← DiagnosticArrivals <$> readIORef (fakeErrorArrived capture) <*> readIORef (fakeSinkArrived capture)
+      arrived ←
+        DiagnosticArrivals
+          <$> readIORef (fakeErrorArrived capture)
+          <*> readIORef (fakeSinkArrived capture)
+          <*> ((== Just FakeSink) <$> readIORef (fakeFirstArrived capture))
       once (fakeAfterClaim capture)
       pure $ case first of
         FakeError → ValidationFirst
@@ -722,6 +754,7 @@ afterNextAlarms capture = writeIORef (fakeAfterAlarms capture)
 -- place if nothing holds it, then sets the error latch.
 reportValidationError ∷ FakeCapture → IO ()
 reportValidationError capture = do
+  arrive capture FakeError
   writeIORef (fakeErrorArrived capture) True
   atomicModifyIORef' (fakeFirst capture) (\held → (Just (fromMaybe FakeError held), ()))
   writeIORef (fakeErrorLatched capture) True
@@ -730,8 +763,14 @@ reportValidationError capture = do
 -- claims first place if nothing holds it; publishing why comes after.
 noteSinkFailure ∷ FakeCapture → IO ()
 noteSinkFailure capture = do
+  arrive capture FakeSink
   writeIORef (fakeSinkArrived capture) True
   atomicModifyIORef' (fakeFirst capture) (\held → (Just (fromMaybe FakeSink held), ()))
+
+-- | Which diagnostic failure arrived first is claimed before an arrival is
+-- recorded.
+arrive ∷ FakeCapture → FakeFirst → IO ()
+arrive capture arrival = atomicModifyIORef' (fakeFirstArrived capture) (\held → (Just (fromMaybe arrival held), ()))
 
 publishSinkFailure ∷ FakeCapture → Text → IO ()
 publishSinkFailure capture = writeIORef (fakeSinkReason capture) . Just

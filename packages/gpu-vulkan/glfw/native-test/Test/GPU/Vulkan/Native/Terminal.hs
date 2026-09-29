@@ -224,7 +224,7 @@ data Step = Step
 order ∷ DiagnosticCapture → IO DiagnosticOrder
 order capture =
   claimCaptureOrder capture >>= \case
-    OwnerFailedFirst → (\arrived → OwnerFirst (DiagnosticArrivals (arrivedError arrived) (arrivedSink arrived))) <$> captureArrivals capture
+    OwnerFailedFirst → (\arrived → OwnerFirst (DiagnosticArrivals (arrivedError arrived) (arrivedSink arrived) (arrivedSinkFirst arrived))) <$> captureArrivals capture
     ErrorLatchedFirst → pure ValidationFirst
     SinkFailedFirst → pure (SinkFirst (fmap sinkFailureReason <$> readCaptureSinkFailure capture))
 

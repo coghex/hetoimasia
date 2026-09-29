@@ -1149,8 +1149,7 @@ awaitPublication ∷ IO (Maybe Text) → IO Text
 awaitPublication published = published >>= maybe (yield >> awaitPublication published) pure
 
 -- | The alarms of the diagnostic failures that had arrived by a claim over a
--- void one, once each is readable — the validation error, then the sink's
--- failure, as the capture answers two that came after the owner's claim. A
+-- void one, once each is readable, in the order they arrived. A
 -- failure sets its alarm right after recording its arrival — an error's
 -- callback at its next step, the sink's worker in the masked step that noted
 -- it — so this is bounded as 'awaitPublication' is, and waits the same way.
@@ -1161,7 +1160,7 @@ awaitArrivals watch arrived = do
       sinks = take 1 [alarm | sinkArrived arrived, alarm@(AlarmSinkFailed _) ← alarms]
   if (validationArrived arrived && null errors) || (sinkArrived arrived && null sinks)
     then yield >> awaitArrivals watch arrived
-    else pure (errors <> sinks)
+    else pure (if sinkArrivedFirst arrived then sinks <> errors else errors <> sinks)
 
 -- | Whether a transaction attempt that claimed the capture's order — other
 -- than this one — may still commit.
@@ -1246,12 +1245,14 @@ data DiagnosticOrder
 data DiagnosticArrivals = DiagnosticArrivals
   { validationArrived ∷ !Bool
   , sinkArrived ∷ !Bool
+  , sinkArrivedFirst ∷ !Bool
+    -- ^ The sink's failure arrived before any validation error.
   }
   deriving (Eq, Show)
 
 -- | No diagnostic failure has arrived.
 noDiagnosticArrivals ∷ DiagnosticArrivals
-noDiagnosticArrivals = DiagnosticArrivals False False
+noDiagnosticArrivals = DiagnosticArrivals False False False
 
 -- | What the roots ask of the diagnostic capture: its alarms, at a checkpoint,
 -- and the order, before a failure of the owner's own is latched or taken by
