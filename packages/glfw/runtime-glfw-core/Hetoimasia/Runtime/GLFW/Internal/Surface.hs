@@ -165,18 +165,12 @@ import Hetoimasia.GLFW.Internal.Session
   )
 import Hetoimasia.GLFW.Internal.Window (WindowResult (..), windowNativeHandle)
 import Hetoimasia.GLFW.Window (WindowId, windowLocalIdentity)
-import Hetoimasia.Runtime.GLFW.Internal
-  ( AttachmentProtocol (..)
-  , GraphicsAttachment
-  , WindowHost
-  , attachWindowGraphics
-  , hostRetirementOf
-  , hostSessionOf
-  , hostWindowClosing
-  , withHostWindow
-  )
+import Hetoimasia.Runtime.GLFW.Internal.Host.Attachments (GraphicsAttachment, attachWindowGraphics)
+import Hetoimasia.Runtime.GLFW.Internal.Host.State (WindowHost, hostRetirementOf, hostSessionOf)
+import Hetoimasia.Runtime.GLFW.Internal.Host.Windows (hostWindowClosing, withHostWindow)
 import Hetoimasia.Runtime.GLFW.Internal.Retirement
-  ( HostRetirement
+  ( AttachmentProtocol (..)
+  , HostRetirement
   , holdAttachment
   , releaseAttachmentHold
   , windowAttachmentState

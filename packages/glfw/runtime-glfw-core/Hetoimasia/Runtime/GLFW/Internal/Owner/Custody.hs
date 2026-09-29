@@ -19,7 +19,7 @@ module Hetoimasia.Runtime.GLFW.Internal.Owner.Custody
 
 import Control.Concurrent.STM (STM, modifyTVar', readTVar)
 import qualified Data.Map.Strict as Map
-import Hetoimasia.Runtime.GLFW.Internal (Acknowledgement, AttachmentId)
+import Hetoimasia.GLFW.Internal.Attachment (Acknowledgement, AttachmentId)
 import Hetoimasia.Runtime.GLFW.Internal.Owner.State
   ( Custody (..)
   , GraphicsOwner (ownerCustody)

@@ -19,7 +19,7 @@ import Control.Exception (evaluate, mask, tryWithContext)
 import Control.Monad (forM_, unless)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust)
-import Hetoimasia.Runtime.GLFW.Internal (attachmentIncarnation, attachmentWindow)
+import Hetoimasia.GLFW.Internal.Attachment (attachmentIncarnation, attachmentWindow)
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Config (GraphicsOwnerConfig (..))
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Custody (advanceCustody)
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Handoff

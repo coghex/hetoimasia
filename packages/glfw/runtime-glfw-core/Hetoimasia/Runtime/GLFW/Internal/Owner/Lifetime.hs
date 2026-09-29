@@ -55,15 +55,13 @@ import Hetoimasia.Foundation.Recovery (Disposition (Required))
 import Hetoimasia.Foundation.Resource (Scoped)
 import Hetoimasia.Foundation.Worker (requestStop, stopRequested, withWorkerGroup, workerDefinition)
 import Hetoimasia.GLFW.Session (Session)
-import Hetoimasia.Runtime.GLFW.Internal
-  ( HostConfig
-  , HostHooks (..)
-  , ProtectedExit (..)
-  , WindowHost
-  , noHostHooks
+import Hetoimasia.Runtime.GLFW.Internal.Host.Config (HostConfig)
+import Hetoimasia.Runtime.GLFW.Internal.Host.Lifetime
+  ( ProtectedExit (..)
   , runProtectedWindowApplication
   , withProtectedWindowHostOver
   )
+import Hetoimasia.Runtime.GLFW.Internal.Host.State (HostHooks (..), WindowHost, noHostHooks)
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Config (GraphicsOwnerConfig (..), graphicsOwnerComponent)
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Exit (finishOwnerExit)
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Handoff (closeOwnerPublications)

@@ -14,18 +14,15 @@ import Control.Concurrent.STM (atomically)
 import Control.Monad (forM, when)
 import Data.Maybe (isJust)
 import Hetoimasia.Foundation.Recovery (Disposition (Required))
-import Hetoimasia.Runtime.GLFW.Internal
+import Hetoimasia.GLFW.Internal.Attachment
   ( Acknowledgement
   , AttachmentId
-  , AttachmentProtocol (..)
-  , CompletionPolicy (FiniteCompletion)
   , FactAnswer (..)
-  , RetirementProgress (..)
   , RollbackOutcome (RollbackSafe)
-  , WindowHost
   , allRetirementFacts
-  , certifyGraphicsFact
   )
+import Hetoimasia.Runtime.GLFW.Internal.Host.Attachments (certifyGraphicsFact)
+import Hetoimasia.Runtime.GLFW.Internal.Host.State (WindowHost)
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Custody (recordRegistered)
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Handoff
   ( OwnerStatus (statusNextDeadline)
@@ -37,6 +34,11 @@ import Hetoimasia.Runtime.GLFW.Internal.Owner.Handoff
   )
 import Hetoimasia.Runtime.GLFW.Internal.Owner.State (GraphicsOwner (..))
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Stranded (retireStranded)
+import Hetoimasia.Runtime.GLFW.Internal.Retirement
+  ( AttachmentProtocol (..)
+  , CompletionPolicy (FiniteCompletion)
+  , RetirementProgress (..)
+  )
 
 -- | The protocol the main thread registers for an owner target.
 --
