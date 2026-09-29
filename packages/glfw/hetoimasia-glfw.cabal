@@ -147,8 +147,11 @@ library runtime-glfw
 -- the dynamic window examples use to deliver a cancellation at a precise point,
 -- the pure render demand helper that composes the runtime's simulation
 -- demand with each window's observed eligibility and published demand, the
--- retirement boundary that owns the attachment model, and the opaque graphics
--- service and observation the public attachment contract hands an application.
+-- retirement boundary that owns the attachment model, the opaque graphics
+-- service and observation the public attachment contract hands an application,
+-- and the supervised graphics owner: the composition module
+-- Hetoimasia.Runtime.GLFW.Internal.Owner over the private modules beneath it,
+-- one per responsibility, with its cross-thread Handoff.
 -- Private, so no package outside this one can name them; the public
 -- runtime-glfw sublibrary re-exports everything else.
 library runtime-glfw-core
@@ -160,7 +163,27 @@ library runtime-glfw-core
         Hetoimasia.Runtime.GLFW.Internal.Graphics
         Hetoimasia.Runtime.GLFW.Internal.Measurement
         Hetoimasia.Runtime.GLFW.Internal.Owner
+        Hetoimasia.Runtime.GLFW.Internal.Owner.Config
+        Hetoimasia.Runtime.GLFW.Internal.Owner.Custody
+        Hetoimasia.Runtime.GLFW.Internal.Owner.Drain
+        Hetoimasia.Runtime.GLFW.Internal.Owner.Evidence
+        Hetoimasia.Runtime.GLFW.Internal.Owner.Exit
         Hetoimasia.Runtime.GLFW.Internal.Owner.Handoff
+        Hetoimasia.Runtime.GLFW.Internal.Owner.Handover
+        Hetoimasia.Runtime.GLFW.Internal.Owner.Latch
+        Hetoimasia.Runtime.GLFW.Internal.Owner.Lifetime
+        Hetoimasia.Runtime.GLFW.Internal.Owner.Observation
+        Hetoimasia.Runtime.GLFW.Internal.Owner.Operations
+        Hetoimasia.Runtime.GLFW.Internal.Owner.Protocol
+        Hetoimasia.Runtime.GLFW.Internal.Owner.Release
+        Hetoimasia.Runtime.GLFW.Internal.Owner.Reservation
+        Hetoimasia.Runtime.GLFW.Internal.Owner.Start
+        Hetoimasia.Runtime.GLFW.Internal.Owner.State
+        Hetoimasia.Runtime.GLFW.Internal.Owner.Stranded
+        Hetoimasia.Runtime.GLFW.Internal.Owner.Targets
+        Hetoimasia.Runtime.GLFW.Internal.Owner.Terminal
+        Hetoimasia.Runtime.GLFW.Internal.Owner.Wake
+        Hetoimasia.Runtime.GLFW.Internal.Owner.Worker
         Hetoimasia.Runtime.GLFW.Internal.RenderDemand
         Hetoimasia.Runtime.GLFW.Internal.Retirement
         Hetoimasia.Runtime.GLFW.Internal.Surface

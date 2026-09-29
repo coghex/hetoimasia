@@ -3,9 +3,9 @@
 -- a publisher is told when it does not fit.
 --
 -- This module owns no thread, starts no worker, and makes no backend call. It
--- is the vocabulary and the state "Hetoimasia.Runtime.GLFW.Internal.Owner"
--- runs the owner over, kept apart so the handoff rules can be read, and
--- asserted, without the worker lifetime around them.
+-- is the vocabulary and the state the modules beneath
+-- "Hetoimasia.Runtime.GLFW.Internal.Owner" run the owner over, kept apart so
+-- the handoff rules can be read, and asserted, without the worker lifetime.
 --
 -- = Which way each thing goes
 --
