@@ -44,24 +44,24 @@ required.
 
 | Native call | OS thread | Main thread | Haskell thread | Reports during it | Raised |
 | --- | --- | --- | --- | --- | --- |
-| vkEnumerateInstanceExtensionProperties | 0x16bf43000 | no | ThreadId 6 | 0 | no |
-| vkCreateInstance | 0x16bf43000 | no | ThreadId 6 | 44 | no |
-| vkCreateDebugUtilsMessengerEXT | 0x16bf43000 | no | ThreadId 6 | 0 | no |
+| vkEnumerateInstanceExtensionProperties | 0x16f4ab000 | no | ThreadId 6 | 0 | no |
+| vkCreateInstance | 0x16f4ab000 | no | ThreadId 6 | 44 | no |
+| vkCreateDebugUtilsMessengerEXT | 0x16f4ab000 | no | ThreadId 6 | 0 | no |
 | glfwCreateWindowSurface | 0x1ef1461c0 | yes | ThreadId 4 | 0 | no |
-| vkEnumeratePhysicalDevices | 0x16bf43000 | no | ThreadId 6 | 0 | no |
-| vkCreateDevice | 0x16bf43000 | no | ThreadId 6 | 16 | no |
-| vkSetDebugUtilsObjectNameEXT | 0x16bf43000 | no | ThreadId 6 | 0 | no |
-| vkGetDeviceQueue | 0x16bf43000 | no | ThreadId 6 | 0 | no |
-| vkSetDebugUtilsObjectNameEXT | 0x16bf43000 | no | ThreadId 6 | 0 | no |
-| vkSetDebugUtilsObjectNameEXT | 0x16bf43000 | no | ThreadId 6 | 0 | no |
+| vkEnumeratePhysicalDevices | 0x16f4ab000 | no | ThreadId 6 | 0 | no |
+| vkCreateDevice | 0x16f4ab000 | no | ThreadId 6 | 16 | no |
+| vkSetDebugUtilsObjectNameEXT | 0x16f4ab000 | no | ThreadId 6 | 0 | no |
+| vkGetDeviceQueue | 0x16f4ab000 | no | ThreadId 6 | 0 | no |
+| vkSetDebugUtilsObjectNameEXT | 0x16f4ab000 | no | ThreadId 6 | 0 | no |
+| vkSetDebugUtilsObjectNameEXT | 0x16f4ab000 | no | ThreadId 6 | 0 | no |
 | glfwCreateWindowSurface | 0x1ef1461c0 | yes | ThreadId 4 | 0 | no |
-| vkGetPhysicalDeviceSurfaceSupportKHR | 0x16bf43000 | no | ThreadId 6 | 0 | no |
-| vkSetDebugUtilsObjectNameEXT | 0x16bf43000 | no | ThreadId 6 | 0 | no |
-| vkDestroySurfaceKHR | 0x16bf43000 | no | ThreadId 6 | 0 | no |
-| vkDestroySurfaceKHR | 0x16bf43000 | no | ThreadId 6 | 0 | no |
-| vkDestroyDevice | 0x16bf43000 | no | ThreadId 6 | 1 | no |
-| vkDestroyDebugUtilsMessengerEXT | 0x16bf43000 | no | ThreadId 6 | 0 | no |
-| vkDestroyInstance | 0x16bf43000 | no | ThreadId 6 | 3 | no |
+| vkGetPhysicalDeviceSurfaceSupportKHR | 0x16f4ab000 | no | ThreadId 6 | 0 | no |
+| vkSetDebugUtilsObjectNameEXT | 0x16f4ab000 | no | ThreadId 6 | 0 | no |
+| vkDestroySurfaceKHR | 0x16f4ab000 | no | ThreadId 6 | 0 | no |
+| vkDestroySurfaceKHR | 0x16f4ab000 | no | ThreadId 6 | 0 | no |
+| vkDestroyDevice | 0x16f4ab000 | no | ThreadId 6 | 1 | no |
+| vkDestroyDebugUtilsMessengerEXT | 0x16f4ab000 | no | ThreadId 6 | 0 | no |
+| vkDestroyInstance | 0x16f4ab000 | no | ThreadId 6 | 3 | no |
 
 ## Transcript
 
