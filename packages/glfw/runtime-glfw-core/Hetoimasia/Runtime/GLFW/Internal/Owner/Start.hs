@@ -17,17 +17,12 @@ import Control.Exception (Exception, throwIO)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import qualified Data.Map.Strict as Map
 import Hetoimasia.Foundation.Worker (WorkerGroup, awaitStartup, startWorkerWith, workerDefinition)
-import Hetoimasia.GLFW.Internal.Attachment (AttachmentPhase (AttachmentRetiring), viewPhase)
-import Hetoimasia.Runtime.GLFW.Internal
-  ( AttachmentId
-  , HostConfig (..)
-  , WindowHost
-  , hostAttachmentView
-  , hostConfiguration
-  , hostGraphicsPublisher
-  , hostPendingAttachments
-  , hostWakeNotifier
-  )
+import Hetoimasia.GLFW.Internal.Attachment (AttachmentId, AttachmentPhase (AttachmentRetiring), viewPhase)
+import Hetoimasia.Runtime.GLFW.Internal.Host.Attachments (hostGraphicsPublisher)
+import Hetoimasia.Runtime.GLFW.Internal.Host.Config (HostConfig (..))
+import Hetoimasia.Runtime.GLFW.Internal.Host.Seam (hostAttachmentView, hostPendingAttachments)
+import Hetoimasia.Runtime.GLFW.Internal.Host.State (WindowHost, hostConfiguration)
+import Hetoimasia.Runtime.GLFW.Internal.Host.Wake (hostWakeNotifier)
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Config (GraphicsOwnerConfig (..))
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Handoff (newOwnerHandoff)
 import Hetoimasia.Runtime.GLFW.Internal.Owner.State (GraphicsOwner (..), retainedFailureBound)

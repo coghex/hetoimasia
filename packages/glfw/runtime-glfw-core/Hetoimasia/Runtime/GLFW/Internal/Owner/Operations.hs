@@ -25,8 +25,8 @@ module Hetoimasia.Runtime.GLFW.Internal.Owner.Operations
 import Control.Concurrent.STM (STM)
 import Data.Text (Text)
 import Hetoimasia.Foundation.Time (Instant)
+import Hetoimasia.GLFW.Internal.Attachment (AttachmentId)
 import Hetoimasia.GLFW.Window (WindowId)
-import Hetoimasia.Runtime.GLFW.Internal (AttachmentId)
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Evidence
   ( OwnerDestroyed
   , OwnerReady

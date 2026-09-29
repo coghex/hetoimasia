@@ -410,6 +410,20 @@ spec = describe "GLFW session opacity across the package boundary" $ do
       clientOutput outcome `shouldContain` "runtime-glfw-core"
       clientOutput outcome `shouldNotContain` "cannot satisfy"
 
+  it "rejects a client that reaches for the window host's split implementation modules" $
+    withHostClient "Client.hs" hostPartsClient $ \compile → do
+      outcome ← compile Typecheck
+      case clientStatus outcome of
+        ExitFailure _ → pure ()
+        ExitSuccess →
+          expectationFailure
+            ("the client compiled, so the host's implementation modules are reachable:\n" <> clientOutput outcome)
+      -- Each is found in the built package and refused as private, not missing.
+      for_ hostPartModules $ \name → clientOutput outcome `shouldContain` name
+      clientOutput outcome `shouldContain` "hidden package"
+      clientOutput outcome `shouldContain` "runtime-glfw-core"
+      clientOutput outcome `shouldNotContain` "cannot satisfy"
+
   it "rejects a client that forges a window's client capabilities or takes another window's port out of them" $
     withHostClient "Client.hs" windowClientForgeryClient $ \compile → do
       outcome ← compile Typecheck
@@ -686,6 +700,28 @@ hostCoreClient =
     , "collection ∷ WindowHost → Collection"
     , "collection = hostCollection"
     ]
+
+-- | A client importing the window host's private parts directly: the host
+-- handle's representation, the close protocol, and the protected lifetime.
+hostPartsClient ∷ String
+hostPartsClient =
+  unlines
+    [ "module Client (Parts) where"
+    , ""
+    , "import Hetoimasia.Runtime.GLFW.Internal.Host.Lifetime (ProtectedExit (..))"
+    , "import Hetoimasia.Runtime.GLFW.Internal.Host.State (WindowHost (..))"
+    , "import Hetoimasia.Runtime.GLFW.Internal.Host.Windows (beginClose)"
+    , ""
+    , "data Parts = Parts"
+    ]
+
+-- | The modules 'hostPartsClient' imports, each of which must be refused.
+hostPartModules ∷ [String]
+hostPartModules =
+  [ "Hetoimasia.Runtime.GLFW.Internal.Host.Lifetime"
+  , "Hetoimasia.Runtime.GLFW.Internal.Host.State"
+  , "Hetoimasia.Runtime.GLFW.Internal.Host.Windows"
+  ]
 
 -- | A client forging a window's capabilities through their constructor, and
 -- reading the port field out of capabilities it was given.

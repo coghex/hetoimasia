@@ -31,17 +31,15 @@ import Control.Monad (void)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Hetoimasia.Foundation.Messaging.Payload (prepare)
+import Hetoimasia.GLFW.Internal.Attachment (AttachmentId)
 import Hetoimasia.GLFW.Window (WindowId, WindowObservation)
-import Hetoimasia.Runtime.GLFW.Internal
-  ( AttachmentId
-  , GraphicsAttachment (..)
+import Hetoimasia.Runtime.GLFW.Internal.Graphics (GraphicsService, graphicsAttachment)
+import Hetoimasia.Runtime.GLFW.Internal.Host.Attachments
+  ( GraphicsAttachment (..)
   , GraphicsRefusal
-  , GraphicsService
-  , RolledBack (rolledBackAttachment)
-  , WindowHost
   , attachWindowGraphics
-  , graphicsAttachment
   )
+import Hetoimasia.Runtime.GLFW.Internal.Host.State (WindowHost)
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Custody (advanceCustody, custodyAcknowledgementOf, custodyOf)
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Handoff
   ( EventAdmission (..)
@@ -65,6 +63,7 @@ import Hetoimasia.Runtime.GLFW.Internal.Owner.Stranded
   , retireUnannounced
   )
 import Hetoimasia.Runtime.GLFW.Internal.RenderDemand (RenderEligibility)
+import Hetoimasia.Runtime.GLFW.Internal.Retirement (RolledBack (rolledBackAttachment))
 import Numeric.Natural (Natural)
 
 -- | How a handover settled.

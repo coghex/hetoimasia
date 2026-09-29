@@ -37,11 +37,8 @@ import Hetoimasia.Foundation.Worker
   , WorkerGroup
   , closeWorkerGroup
   )
-import Hetoimasia.Runtime.GLFW.Internal
-  ( RetirementEnvironment (..)
-  , WindowHost
-  , retirementEnvironmentOf
-  )
+import Hetoimasia.Runtime.GLFW.Internal.Host.Lifetime (retirementEnvironmentOf)
+import Hetoimasia.Runtime.GLFW.Internal.Host.State (WindowHost)
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Config (graphicsOwnerComponent)
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Drain (raiseRetainingOwner)
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Evidence (HasEvidence (..), OwnerDestroyed, OwnerRetired)
@@ -54,6 +51,7 @@ import Hetoimasia.Runtime.GLFW.Internal.Owner.Handoff
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Latch (isAsynchronous)
 import Hetoimasia.Runtime.GLFW.Internal.Owner.State (GraphicsOwner (..), LatchSource (..), Latched (..))
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Wake (wakeGraphicsHost)
+import Hetoimasia.Runtime.GLFW.Internal.Retirement (RetirementEnvironment (..))
 
 -- | The owner's run ended without the injected whole-owner destruction
 -- returning evidence.

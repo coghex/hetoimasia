@@ -19,21 +19,18 @@ import Control.Monad (forM, forM_, unless, void, when)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust, listToMaybe)
 import GHC.Stack (HasCallStack)
+import Hetoimasia.GLFW.Internal.Attachment (AttachmentId, allRetirementFacts, attachmentWindow)
 import Hetoimasia.GLFW.Window (WindowId)
-import Hetoimasia.Runtime.GLFW.Internal
-  ( AttachmentId
-  , DetachAnswer (..)
-  , GraphicsService
-  , WindowHost
-  , allRetirementFacts
-  , attachmentWindow
-  , certifyGraphicsFact
+import Hetoimasia.Runtime.GLFW.Internal.Graphics (GraphicsService, graphicsAttachment)
+import Hetoimasia.Runtime.GLFW.Internal.Host.Attachments
+  ( certifyGraphicsFact
   , detachWindowGraphics
-  , graphicsAttachment
   , windowGraphicsService
   )
+import Hetoimasia.Runtime.GLFW.Internal.Host.State (WindowHost)
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Custody (advanceCustody, claimSettlement, recordSettled)
 import Hetoimasia.Runtime.GLFW.Internal.Owner.State (Custody (..), GraphicsOwner (..), Stage (..))
+import Hetoimasia.Runtime.GLFW.Internal.Retirement (DetachAnswer (..))
 
 -- | Retire an attachment the owner never received, on the owner thread.
 --

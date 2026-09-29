@@ -16,13 +16,9 @@ import Control.Concurrent.STM (atomically)
 import Control.Exception (ExceptionWithContext, SomeException, mask_, rethrowIO, tryWithContext)
 import GHC.Stack (HasCallStack)
 import Hetoimasia.Foundation.Messaging.Payload (prepare)
-import Hetoimasia.Runtime.GLFW.Internal
-  ( DetachAnswer (..)
-  , GraphicsService
-  , WindowHost
-  , detachWindowGraphics
-  , graphicsAttachment
-  )
+import Hetoimasia.Runtime.GLFW.Internal.Graphics (GraphicsService, graphicsAttachment)
+import Hetoimasia.Runtime.GLFW.Internal.Host.Attachments (detachWindowGraphics)
+import Hetoimasia.Runtime.GLFW.Internal.Host.State (WindowHost)
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Custody (custodyOf)
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Handoff (EventAdmission (EventAdmitted), TargetEvent (TargetReleased))
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Reservation
@@ -33,6 +29,7 @@ import Hetoimasia.Runtime.GLFW.Internal.Owner.Reservation
   )
 import Hetoimasia.Runtime.GLFW.Internal.Owner.State (GraphicsOwner, Stage (CustodyRegistered))
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Stranded (retireStranded)
+import Hetoimasia.Runtime.GLFW.Internal.Retirement (DetachAnswer (..))
 
 -- | What a release answered.
 data ReleaseAnswer

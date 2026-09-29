@@ -143,7 +143,9 @@ library runtime-glfw
         base >=4.22 && <4.23,
         hetoimasia-glfw:runtime-glfw-core
 
--- The runtime integration's implementation, including the test-only host hooks
+-- The runtime integration's implementation: the window host's composition
+-- module Hetoimasia.Runtime.GLFW.Internal over the private Host modules
+-- beneath it, one per responsibility, including the test-only host hooks
 -- the dynamic window examples use to deliver a cancellation at a precise point,
 -- the pure render demand helper that composes the runtime's simulation
 -- demand with each window's observed eligibility and published demand, the
@@ -161,6 +163,21 @@ library runtime-glfw-core
     exposed-modules:
         Hetoimasia.Runtime.GLFW.Internal
         Hetoimasia.Runtime.GLFW.Internal.Graphics
+        Hetoimasia.Runtime.GLFW.Internal.Host.Application
+        Hetoimasia.Runtime.GLFW.Internal.Host.Attachments
+        Hetoimasia.Runtime.GLFW.Internal.Host.Commands
+        Hetoimasia.Runtime.GLFW.Internal.Host.Config
+        Hetoimasia.Runtime.GLFW.Internal.Host.Construction
+        Hetoimasia.Runtime.GLFW.Internal.Host.Demand
+        Hetoimasia.Runtime.GLFW.Internal.Host.Lifetime
+        Hetoimasia.Runtime.GLFW.Internal.Host.Loop
+        Hetoimasia.Runtime.GLFW.Internal.Host.Pacing
+        Hetoimasia.Runtime.GLFW.Internal.Host.Progress
+        Hetoimasia.Runtime.GLFW.Internal.Host.Seam
+        Hetoimasia.Runtime.GLFW.Internal.Host.State
+        Hetoimasia.Runtime.GLFW.Internal.Host.Turn
+        Hetoimasia.Runtime.GLFW.Internal.Host.Wake
+        Hetoimasia.Runtime.GLFW.Internal.Host.Windows
         Hetoimasia.Runtime.GLFW.Internal.Measurement
         Hetoimasia.Runtime.GLFW.Internal.Owner
         Hetoimasia.Runtime.GLFW.Internal.Owner.Config
