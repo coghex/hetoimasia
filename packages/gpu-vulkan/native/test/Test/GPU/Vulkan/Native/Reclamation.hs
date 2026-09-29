@@ -11,10 +11,12 @@
 -- Nothing here creates a Vulkan object, and nothing waits on a clock.
 module Test.GPU.Vulkan.Native.Reclamation (spec) where
 
-import Control.Concurrent.STM (atomically)
-import Control.Exception (ErrorCall (ErrorCall), toException, try)
+import Control.Concurrent (forkIO, killThread, myThreadId)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent.STM (atomically, newTVarIO, writeTVar)
+import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall), Exception, throwIO, toException, try)
 import Control.Monad (when)
-import Data.IORef (atomicModifyIORef', modifyIORef', newIORef, readIORef)
+import Data.IORef (atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List.NonEmpty (NonEmpty ((:|)))
 import qualified Data.Map.Strict as Map
 import qualified Data.Text as Text
@@ -28,10 +30,11 @@ import Hetoimasia.GPU.Model
   , SessionFailureCause (CleanupFailed)
   , SessionState (..)
   , TargetView (..)
+  , Usage (..)
+  , deviceLossObserved
   , disposalEligible
   , sessionState
   , usage
-  , usageObjects
   )
 import Hetoimasia.GPU.Model.Budget (BudgetRequest (..), defaultBudgetRequest)
 import Hetoimasia.GPU.Model.Identity (GenerationId, HoldSubject (..), TargetClass (..), TargetId, generationTarget)
@@ -50,10 +53,16 @@ import Hetoimasia.GPU.Vulkan.Native.Generations
   )
 import Hetoimasia.GPU.Vulkan.Native.Presentation (SurfaceExtent (..), TargetGeometry (..))
 import Hetoimasia.GPU.Vulkan.Native.Recording (Refusal (..), createReadback, recordFrame)
-import Hetoimasia.GPU.Vulkan.Native.Roots (NativeFailure (..), admitRootTarget)
+import Hetoimasia.GPU.Vulkan.Native.Roots
+  ( GraphicsDeviceLost (..)
+  , NativeFailure (..)
+  , TerminalReport (..)
+  , admitRootTarget
+  , readRootsTerminal
+  )
 import Test.GPU.Vulkan.Native.FramesRig
 import Test.GPU.Vulkan.Native.FramesStandIn
-import Test.GPU.Vulkan.Native.RecordingStandIn (RecordingCall (..), RecordingStandIn, RecordingStep (..), outOfMemoryAt, recordingCalls)
+import Test.GPU.Vulkan.Native.RecordingStandIn (RecordingCall (..), RecordingStandIn, RecordingStep (..), onceAt, outOfMemoryAt, recordingCalls)
 import qualified Test.GPU.Vulkan.Native.StandIn as Roots
 
 spec ∷ Spec
@@ -97,6 +106,57 @@ spec = describe "Allocation recovery" $ do
         _ → False
       length (notRecoveredDisposed failure) `shouldBe` 1
       readbacks recording `shouldReturn` 2
+
+    it "gives the reservation back when the retry raises a failure the roots classify, which it re-raises" $ do
+      (rig, recording) ← rigWithRecording 1
+      _ ← retiredEligible rig (rigTarget rig)
+      before ← usage <$> modelOf rig
+      atRetry ← retryRaising rig recording (throwIO (Roots.StandInResult "retry" FailedSurfaceLost))
+      raisedBy (createReadback (rigRecording rig) readbackBytes) `shouldReturn` Roots.StandInResult "retry" FailedSurfaceLost
+      readbacks recording `shouldReturn` 2
+      atRetry >>= givenBack rig before
+
+    it "gives the reservation back when the retry loses the device, whose loss it re-raises and latches" $ do
+      (rig, recording) ← rigWithRecording 1
+      _ ← retiredEligible rig (rigTarget rig)
+      before ← usage <$> modelOf rig
+      atRetry ← retryRaising rig recording (throwIO (Roots.StandInLoss Roots.AtFrameCall))
+      loss ← raisedBy (createReadback (rigRecording rig) readbackBytes)
+      lostDuring loss `shouldBe` "vkCreateBuffer"
+      reportDeviceLost <$> atomically (readRootsTerminal (rigRoots rig)) `shouldReturn` Just loss
+      deviceLossObserved <$> modelOf rig `shouldReturn` True
+      atRetry >>= givenBack rig before
+
+    it "gives the reservation back when the retry is cancelled, which it re-raises" $ do
+      (rig, recording) ← rigWithRecording 1
+      _ ← retiredEligible rig (rigTarget rig)
+      before ← usage <$> modelOf rig
+      started ← newEmptyMVar
+      never ← newEmptyMVar
+      -- The construction runs on the owner's thread, this one; the
+      -- cancellation comes from another once the retry is under way.
+      owner ← myThreadId
+      _ ← forkIO (takeMVar started >> killThread owner >> putMVar never ())
+      atRetry ← retryRaising rig recording (putMVar started () >> takeMVar never)
+      raisedBy (createReadback (rigRecording rig) readbackBytes) `shouldReturn` ThreadKilled
+      atRetry >>= givenBack rig before
+
+    it "gives the reservation back when the reclamation pass is cancelled, which it re-raises" $ do
+      (rig, recording) ← rigWithRecording 1
+      old ← retiredEligible rig (rigTarget rig)
+      oldSwapchain ← swapchainOf rig old
+      before ← usage <$> modelOf rig
+      gate ← newTVarIO False
+      Roots.script (rigRootsStandIn rig) Roots.AtDestroySwapchain (Roots.WaitsInterruptibly gate)
+      outOfMemoryAt recording AtCreateReadback 1
+      owner ← myThreadId
+      _ ← forkIO (Roots.awaitCall (rigRootsStandIn rig) (Roots.DestroyedSwapchain oldSwapchain) >> killThread owner >> atomically (writeTVar gate True))
+      raisedBy (createReadback (rigRecording rig) readbackBytes) `shouldReturn` ThreadKilled
+      readbacks recording `shouldReturn` 1
+      -- The pass released nothing: its one destruction never returned.
+      after ← usage <$> modelOf rig
+      usageAllocations after `shouldBe` usageAllocations before
+      (usageBytes after, usageObjects after) `shouldBe` (usageBytes before, usageObjects before)
 
     it "escalates a disposal that failed and permits no retry, however much else the pass reclaimed" $ do
       (rig, recording) ← rigWithRecording 2
@@ -333,6 +393,44 @@ swapchainOf rig generation = do
 -- | An eligible target observed at this framebuffer.
 geometryAt ∷ Word32 → Word32 → TargetGeometry
 geometryAt width height = TargetGeometry (Right ()) (Just (SurfaceExtent width height)) Nothing 1
+
+-- | The readback every construction example makes, and the accounting its
+-- construction reserves: its bytes, and its buffer and memory.
+readbackBytes, readbackObjects ∷ Natural
+readbackBytes = 1024
+readbackObjects = 2
+
+-- | Have the readback creation answer out of memory, and its one retry run
+-- this — which raises — once it has read the model's usage: the attempt still
+-- reserved, and whatever the reclamation pass released already gone. Answers
+-- that usage, once the retry has run.
+retryRaising ∷ Rig → RecordingStandIn → IO () → IO (IO Usage)
+retryRaising rig recording raise = do
+  seen ← newIORef Nothing
+  outOfMemoryAt recording AtCreateReadback 1
+  onceAt recording AtCreateReadback (modelOf rig >>= writeIORef seen . Just . usage >> raise)
+  pure (readIORef seen >>= maybe (fail "the retry was never made") pure)
+
+-- | The failed construction left no attempt behind and gave its reservation
+-- back: usage is what it was before the construction, less what the
+-- reclamation pass released, which disposed of something.
+givenBack ∷ Rig → Usage → Usage → IO ()
+givenBack rig before atRetry = do
+  after ← usage <$> modelOf rig
+  let releasedBytes = usageBytes before + readbackBytes - usageBytes atRetry
+      releasedObjects = usageObjects before + readbackObjects - usageObjects atRetry
+  releasedObjects `shouldSatisfy` (> 0)
+  usageAllocations after `shouldBe` usageAllocations before
+  (usageBytes after, usageObjects after) `shouldBe` (usageBytes before - releasedBytes, usageObjects before - releasedObjects)
+
+-- | Run the action, which must raise this exception, and answer it.
+raisedBy ∷ (Exception e, Show a) ⇒ IO a → IO e
+raisedBy action =
+  try action >>= \case
+    Left failure → pure failure
+    Right value → do
+      expectationFailure ("nothing was raised: " <> show value)
+      fail "unreachable"
 
 -- | How many readbacks the recording asked the native layer for.
 readbacks ∷ RecordingStandIn → IO Int
