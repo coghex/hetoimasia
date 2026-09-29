@@ -10,7 +10,10 @@ that selector under the display helper CI gives it, and the executable's
 unnarrowed suite skips those examples, so each example belongs to exactly one
 profile. A group whose command launches its executable through
 `tools/vulkan/run.sh native` is launched the same way, so the runner's source
-digest and revision provenance reach the native suite. It imports nothing
+digest and revision provenance reach the native suite. A group that declares a
+`preparation` command is prepared by exactly that command, as CI prepares it
+(test.vulkan-native also builds the triangle sample app, so an app that no
+longer builds fails the suite here too). It imports nothing
 from quruntul — the context supplies `Suite`, `Prepared` and `digest` — so
 `tools/test/QuruntulAdapter.hs` can check it without quruntul installed.
 
@@ -154,7 +157,7 @@ class Hetoimasia:
                     priority=10,
                     data=dict(component=component, package=package, route=route, group=group["id"],
                               directory=packages[package].directory, options=options, display=display,
-                              launch=launch),
+                              launch=launch, preparation=(group.get("preparation") or {}).get("command")),
                 )
         return list(suites.values())
 
@@ -165,7 +168,9 @@ class Hetoimasia:
         self._check_toolchain(checkout)
         environment: dict[str, str] = {}
         if route == "vulkan":
-            build = ctx.run(["bash", "tools/vulkan/run.sh", "build", component], "build", BUILD_SECONDS)
+            # The group's own preparation when it declares one; else build the suite.
+            command = suite.data.get("preparation") or ["bash", "tools/vulkan/run.sh", "build", component]
+            build = ctx.run(command, "build", BUILD_SECONDS)
             self._built(build)
             environment = self._discovery(checkout, "dist-vulkan")
             flags = ["--project-file=cabal.project.vulkan", f"--builddir={checkout / 'dist-vulkan'}",
@@ -175,8 +180,8 @@ class Hetoimasia:
             if route == "glfw":
                 environment = self._discovery(checkout, "dist-newstyle")
             flags = ["--project-file", "cabal.project" if route == "glfw" else "cabal.project.cpu"]
-            build = ctx.run(["cabal", "build", *flags, component], "build", BUILD_SECONDS,
-                            environment=environment)
+            command = suite.data.get("preparation") or ["cabal", "build", *flags, component]
+            build = ctx.run(command, "build", BUILD_SECONDS, environment=environment)
             self._built(build)
         executable = self._list_bin(checkout, flags, component, environment)
         tools = [self._list_bin(checkout, flags, tool, environment) for tool in self._tools(checkout, component)]

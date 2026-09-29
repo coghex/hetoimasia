@@ -161,6 +161,24 @@ class AdapterChecks(unittest.TestCase):
             self.assertEqual(prepared.environment.get("HETOIMASIA_NATIVE_SESSION"),
                              "desktop" if platform == "Darwin" else None)
 
+    def test_a_declared_group_preparation_is_the_build(self):
+        adapter = self.module.adapter()
+        adapter._check_toolchain = lambda checkout: None
+        adapter._discovery = lambda checkout, build_dir: {"HETOIMASIA_VULKAN_LIBDIR": "/l", "HETOIMASIA_VULKAN_INCLUDEDIR": "/i"}
+        adapter._list_bin = lambda checkout, flags, component, environment: sys.executable
+        adapter._tools = lambda checkout, component: []
+        prepared_groups = {g["id"]: g["preparation"]["command"] for g in CATALOG["groups"] if g.get("preparation")}
+        self.assertTrue(prepared_groups, "the catalog declares no preparation; update this check")
+        for suite in self.suites.values():
+            ctx = Context()
+            adapter.prepare(ctx, suite)
+            expected = prepared_groups.get(suite.data["group"])
+            if expected:
+                self.assertEqual(ctx.calls[0]["argv"], expected, suite.id)
+        native = Context()
+        adapter.prepare(native, self.suites["vulkan-native-tests"])
+        self.assertIn("hetoimasia-sample-triangle-app:exe:hetoimasia-triangle", native.calls[0]["argv"])
+
     def test_an_unnarrowed_suite_skips_every_narrowed_profile_of_its_executable(self):
         profiles = hspec_profiles()
         for suite, component, chosen in profiles:
