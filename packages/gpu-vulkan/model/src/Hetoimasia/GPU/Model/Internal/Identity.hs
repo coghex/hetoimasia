@@ -3,9 +3,10 @@
 -- consumed.
 --
 -- Every identity here is opaque to clients: this module is not exposed, and
--- the public faces re-export the types without their constructors. Only
--- "Hetoimasia.GPU.Model.Internal.State" issues one, and it issues each from a
--- counter that is never reissued, so a value a client still holds names
+-- the public faces re-export the types without their constructors. Only the
+-- model's hidden implementation issues one — its construction in
+-- "Hetoimasia.GPU.Model.Internal.State" and the transitions beside it — and
+-- each is issued from a counter that is never reissued, so a value a client still holds names
 -- exactly the object it named when it was made — or names one this model has
 -- forgotten, which is what makes staleness decidable without remembering every
 -- identity ever issued.

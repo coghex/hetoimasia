@@ -164,4 +164,93 @@ module Hetoimasia.GPU.Model
 
 import Hetoimasia.GPU.Model.Internal.Hold (HoldKind (..))
 import Hetoimasia.GPU.Model.Internal.Recovery (RetryVerdict (..))
+import Hetoimasia.GPU.Model.Internal.Completion
+  ( CompletionFact (..)
+  , DisposalResult (..)
+  , EvidenceSource (..)
+  , recordCompletion
+  , silentEvidence
+  )
+import Hetoimasia.GPU.Model.Internal.Disposal (ReclaimReport (..), reclaimPass)
+import Hetoimasia.GPU.Model.Internal.Frames (AcquireAnswer (..), AcquireOutcome (..), acquireImage, reserveFrame)
+import Hetoimasia.GPU.Model.Internal.Generations
+  ( PublicationAnswer (..)
+  , beginGeneration
+  , endGenerationCpuUse
+  , failGenerationConstruction
+  , publishGeneration
+  , retireGeneration
+  )
+import Hetoimasia.GPU.Model.Internal.Observation
+  ( FrameView (..)
+  , HoldView (..)
+  , TargetView (..)
+  , Usage (..)
+  , disposalEligible
+  , frameView
+  , holdView
+  , liveRecordCount
+  , presentationImage
+  , targetView
+  , usage
+  )
+import Hetoimasia.GPU.Model.Internal.Presentation
+  ( PresentAnswer (..)
+  , PresentOutcome (..)
+  , closeSubmittedFrame
+  , enqueuePresentation
+  , skipUnsubmittedFrame
+  )
+import Hetoimasia.GPU.Model.Internal.Progress (NextTurn (..), TurnReport (..), nextDeadline, progressDeadline, runProgressTurn)
+import Hetoimasia.GPU.Model.Internal.Records (FramePhase (..), GenerationPhase (..), TargetPhase (..))
+import Hetoimasia.GPU.Model.Internal.Recording (discardBatch, extendBatch, recordBatch, resetRecorder)
+import Hetoimasia.GPU.Model.Internal.Resources
+  ( abandonAllocation
+  , beginAllocation
+  , createResource
+  , endResourceCpuUse
+  , noteOldSwapchainRetired
+  , rebuildResource
+  , recordAllocationFailure
+  , releaseResource
+  , retryAllocation
+  )
+import Hetoimasia.GPU.Model.Internal.Session
+  ( DeviceLossRelease (..)
+  , deviceLossObserved
+  , escalateSession
+  , escalations
+  , escalationsDropped
+  , noteDeviceLoss
+  , releaseToDeviceLoss
+  , takeEscalations
+  )
 import Hetoimasia.GPU.Model.Internal.State
+  ( Escalation (..)
+  , GpuModel
+  , Outcome (..)
+  , SessionFailureCause (..)
+  , SessionState (..)
+  , modelBudgets
+  , modelDeviceId
+  , modelSessionIdentity
+  , newGpuModel
+  , outcomeModel
+  , sessionState
+  )
+import Hetoimasia.GPU.Model.Internal.Submission
+  ( SubmitAnswer (..)
+  , SubmitOutcome (..)
+  , resetSubmissionFence
+  , submissionCarries
+  , submitFrames
+  )
+import Hetoimasia.GPU.Model.Internal.TargetRecovery
+  ( RecoveryAnswer (..)
+  , beginTargetRecovery
+  , declareTargetUnrecoverable
+  , recordRecoveryFailure
+  , recordRecoverySuccess
+  )
+import Hetoimasia.GPU.Model.Internal.Targets (admitTarget, closeTarget, requestRender, resumeTarget, suspendTarget)
+import Hetoimasia.GPU.Model.Internal.Work (pendingObligations)

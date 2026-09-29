@@ -47,15 +47,38 @@ library
         Hetoimasia.GPU.Model.Budget
         Hetoimasia.GPU.Model.Identity
     -- The identity constructors, the hold ledger, the admission arithmetic, the
-    -- recovery accounting and the state machine itself. Hiding them is what
-    -- makes an identity unforgeable: a client cannot build one, so every value
-    -- a model is handed was issued by some model.
+    -- recovery accounting, and the state machine itself: its representation
+    -- (Records, State), the shared resolution and accounting it is edited
+    -- through (Resolve, Accounting), the read-only queries and the one
+    -- scheduling rule every transition applies (Work, Scheduling), the
+    -- transitions grouped by responsibility, owner progress, and the read-only
+    -- views. Hiding them is what makes an identity unforgeable: a client cannot
+    -- build one, so every value a model is handed was issued by some model.
+    -- The layering is described in docs/gpu_model.md.
     other-modules:
+        Hetoimasia.GPU.Model.Internal.Accounting
         Hetoimasia.GPU.Model.Internal.Budget
+        Hetoimasia.GPU.Model.Internal.Completion
+        Hetoimasia.GPU.Model.Internal.Disposal
+        Hetoimasia.GPU.Model.Internal.Frames
+        Hetoimasia.GPU.Model.Internal.Generations
         Hetoimasia.GPU.Model.Internal.Hold
         Hetoimasia.GPU.Model.Internal.Identity
+        Hetoimasia.GPU.Model.Internal.Observation
+        Hetoimasia.GPU.Model.Internal.Presentation
+        Hetoimasia.GPU.Model.Internal.Progress
+        Hetoimasia.GPU.Model.Internal.Recording
+        Hetoimasia.GPU.Model.Internal.Records
         Hetoimasia.GPU.Model.Internal.Recovery
+        Hetoimasia.GPU.Model.Internal.Resolve
+        Hetoimasia.GPU.Model.Internal.Resources
+        Hetoimasia.GPU.Model.Internal.Scheduling
+        Hetoimasia.GPU.Model.Internal.Session
         Hetoimasia.GPU.Model.Internal.State
+        Hetoimasia.GPU.Model.Internal.Submission
+        Hetoimasia.GPU.Model.Internal.TargetRecovery
+        Hetoimasia.GPU.Model.Internal.Targets
+        Hetoimasia.GPU.Model.Internal.Work
     build-depends:
         base >=4.22 && <4.23,
         containers >=0.8 && <0.9,

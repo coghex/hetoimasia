@@ -1,5 +1,6 @@
 -- | Examples proving that a validated 'Hetoimasia.GPU.Model.Budget.Budgets' is
--- read-only to a client outside the package.
+-- read-only to a client outside the package, and that no implementation module
+-- is reachable from one.
 --
 -- The other budget examples import the model package directly, so they share
 -- this suite's own module environment and cannot observe what the package
@@ -10,9 +11,9 @@
 -- can say is exactly what the library's @exposed-modules@ and each module's
 -- export list allow, which is the boundary the opacity claim is about.
 --
--- Thirteen clients are compiled. Twelve must be rejected: one for each of the
--- eleven validated fields, reached for through record-update syntax, and one
--- that names the constructor. Each is checked against the specific diagnostic
+-- Thirteen budget clients are compiled. Twelve must be rejected: one for each
+-- of the eleven validated fields, reached for through record-update syntax, and
+-- one that names the constructor. Each is checked against the specific diagnostic
 -- that names the rejection's cause, so a missing package, an absent compiler,
 -- or an unrelated error can never be mistaken for the guarantee holding. One
 -- must be accepted, linked, and run, which is both the control proving the
@@ -33,18 +34,47 @@
 -- Nothing here re-checks a budget at run time. The guarantee is the absence of
 -- a way to express the rewrite, checked when the client is compiled.
 --
+-- The implementation modules are the other half of the same boundary: they
+-- hold every constructor the public modules keep abstract, so a client that
+-- could import one could forge an identity or build a model by hand. One more
+-- client per hidden module imports it and must be refused with @GHC-87110@
+-- against this library's own unit, which tells a hidden module apart from a
+-- missing one, an unresolvable package or a broken compiler environment. The
+-- accepted budget client above is the control for these too: it links against
+-- the same unit through the public modules.
+--
 -- The compilation harness lives in "Test.Support.ExternalClient", shared with
 -- the foundation, runtime, messaging, Lua, and GLFW opacity examples.
 module Test.GPU.Model.Opacity (spec) where
 
-import System.Exit (ExitCode (ExitSuccess))
+import Control.Monad (forM_)
+import System.Exit (ExitCode (ExitFailure, ExitSuccess))
 import System.FilePath ((</>))
 import System.Process (CreateProcess (cwd), proc, readCreateProcessWithExitCode)
-import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldContain)
+import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldContain, shouldNotContain)
 import Test.Support.ExternalClient (Client (..), Mode (..), rejectedBecause, withPackageClient)
 
 spec ∷ Spec
-spec = describe "budget opacity across the package boundary" $ do
+spec = do
+  budgetSpec
+  describe "implementation opacity across the package boundary" $
+    forM_ hiddenModules $ \hidden →
+      it ("rejects a client that imports the hidden module " <> hidden) $
+        withClient "Client.hs" (importClient hidden) $ \compile → do
+          outcome ← compile Typecheck
+          case clientStatus outcome of
+            ExitFailure _ → pure ()
+            ExitSuccess →
+              expectationFailure ("the client compiled, so " <> hidden <> " is reachable:\n" <> clientOutput outcome)
+          -- Found in this library and refused as hidden; naming the unit tells
+          -- this apart from a missing module or an unresolvable package.
+          clientOutput outcome `shouldContain` "GHC-87110"
+          clientOutput outcome `shouldContain` "hetoimasia-gpu-vulkan-model-0.1.0.0"
+          clientOutput outcome `shouldNotContain` "cannot satisfy"
+          clientOutput outcome `shouldNotContain` "Could not find module"
+
+budgetSpec ∷ Spec
+budgetSpec = describe "budget opacity across the package boundary" $ do
   mapM_ rejectsFieldUpdate protectedFields
 
   it "rejects a client that names the constructor" $
@@ -79,6 +109,39 @@ spec = describe "budget opacity across the package boundary" $ do
                    , "model limits = [3,2,32,2,5,7,268435456,4096,64,7]"
                    , "model cap = Duration 25000000ns"
                    ]
+
+-- | Every implementation module the library keeps out of its @exposed-modules@.
+hiddenModules ∷ [String]
+hiddenModules =
+  map
+    ("Hetoimasia.GPU.Model.Internal." <>)
+    [ "Accounting"
+    , "Budget"
+    , "Completion"
+    , "Disposal"
+    , "Frames"
+    , "Generations"
+    , "Hold"
+    , "Identity"
+    , "Observation"
+    , "Presentation"
+    , "Progress"
+    , "Recording"
+    , "Records"
+    , "Recovery"
+    , "Resolve"
+    , "Resources"
+    , "Scheduling"
+    , "Session"
+    , "State"
+    , "Submission"
+    , "TargetRecovery"
+    , "Targets"
+    , "Work"
+    ]
+
+importClient ∷ String → String
+importClient hidden = unlines ["module Client () where", "", "import " <> hidden]
 
 -- | Every field of a validated configuration, with the type its replacement
 -- would have and the import that type needs.

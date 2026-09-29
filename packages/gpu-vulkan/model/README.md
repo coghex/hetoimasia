@@ -42,7 +42,12 @@ The public API is `Hetoimasia.GPU.Model`, with the identities in
 `Hetoimasia.GPU.Model.Identity` and the configuration in
 `Hetoimasia.GPU.Model.Budget`. The implementation modules under
 `Hetoimasia.GPU.Model.Internal` are hidden, which is what makes an identity
-unforgeable: no client can build one. A validated `Budgets` is closed the same
+unforgeable: no client can build one. They divide one immutable model value by
+responsibility — its representation, shared resolution and accounting, the
+read-only queries and the one scheduling rule every transition applies, the
+transitions themselves, owner progress, and read-only views — in an acyclic
+layering that [`docs/gpu_model.md`](../../../docs/gpu_model.md#implementation-modules)
+describes. A validated `Budgets` is closed the same
 way and for the same reason — no constructor and no field label reaches a
 client, so the limits a model enforces are read-only to it and can only be the
 ones `validateBudgets` accepted.
@@ -62,8 +67,9 @@ cabal test --project-file cabal.project.cpu hetoimasia-gpu-vulkan-model:gpu-mode
 Every example is deterministic and ordering-based. Time enters through the
 foundation's scripted clock, never through a sleep.
 
-The budget opacity examples compile external single-module clients against this
+The opacity examples compile external single-module clients against this
 build's own package database, so they need the qualified `ghc` on `PATH` — the
-same compiler this suite was built with. They assert on the specific diagnostic
-each rejection produces, so a missing package or an absent compiler fails rather
-than passing as the boundary holding.
+same compiler this suite was built with. They cover the validated budgets and
+every hidden implementation module, and assert on the specific diagnostic each
+rejection produces, so a missing package or an absent compiler fails rather than
+passing as the boundary holding.
