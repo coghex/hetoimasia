@@ -264,6 +264,14 @@ int hetoimasia_capture_status(void *user_data, uint64_t *counters, int *latches)
 void hetoimasia_capture_preset_counter(hetoimasia_capture_storage *storage, int which, uint64_t value);
 
 /*
+** Test support: whether admission is closed for the storage this user data was
+** issued for — 1 once its closer has begun, 0 before — or -1 once its slot
+** serves another. A lifetime that owns its storage privately can be seen to
+** have begun closing through it. Nothing in production calls it.
+*/
+int hetoimasia_capture_slot_closed(void *user_data);
+
+/*
 ** Test support: offer one record exactly as a messenger would, building the
 ** callback data on this frame and calling `hetoimasia_capture_callback` with
 ** it. `null_data` passes NULL callback data instead, which is how a
