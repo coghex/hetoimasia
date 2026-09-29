@@ -86,6 +86,14 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
   , FrameRequest (..)
   , clearRenderer
 
+    -- * Consumer construction (VK-19)
+  , Construction
+  , Constructed
+  , constructPipelineLayout
+  , constructPipeline
+  , replaceConstructedPipeline
+  , releaseConstructed
+
     -- * Observing frames
   , FrameEvent (..)
   , FrameObserver
@@ -99,12 +107,15 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
   , planStep
   , requestPublished
   , renderDue
+  , settleCaptures
+  , reclaimReleased
   , renderingDeadline
   , pollDue
 
     -- * Retirement
   , prepareTargetRetirement
   , retireTargetRendering
+  , endCaptures
   , retireRendering
 
     -- * Failures
@@ -112,16 +123,29 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
   ) where
 
 import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, stateTVar, writeTVar)
-import Control.Exception (Exception, throwIO)
+import Control.Exception
+  ( Exception (displayException)
+  , ExceptionWithContext (ExceptionWithContext)
+  , SomeAsyncException
+  , SomeException
+  , fromException
+  , onException
+  , rethrowIO
+  , throwIO
+  , tryWithContext
+  )
 import Control.Monad (forM, forM_, unless, void, when)
+import Data.Bits ((.&.))
+import qualified Data.ByteString as ByteString
 import Data.Foldable (for_)
 import Data.List (find)
 import Data.List.NonEmpty (NonEmpty ((:|)))
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (isJust)
+import Data.Maybe (isJust, isNothing)
 import Data.Text (Text)
 import qualified Data.Text as Text
+import Data.Word (Word32)
 import Numeric.Natural (Natural)
 
 import Hetoimasia.Foundation.Time (Instant, addDuration, deadlineReached)
@@ -134,13 +158,29 @@ import Hetoimasia.GPU.Model
   , TargetView (..)
   , closeTarget
   , deviceLossObserved
+  , disposalEligible
   , modelBudgets
   , progressDeadline
   , requestRender
   , targetView
   )
 import Hetoimasia.GPU.Model.Budget (backoffSchedule, frameSlotLimit)
-import Hetoimasia.GPU.Model.Identity (FrameSlotId, GenerationId, ImageId, PresentationId, SubmissionId, TargetId, imageGeneration, presentationTarget, frameTarget)
+import Hetoimasia.GPU.Model.Identity (FrameSlotId, GenerationId, HoldSubject (..), ImageId, PresentationId, SubmissionId, TargetId, imageGeneration, presentationTarget, frameTarget)
+import Hetoimasia.GPU.Vulkan.GLFW.Internal.Capture
+  ( CaptureOutcome (..)
+  , CapturedFrame (..)
+  , Captures
+  , Presented (..)
+  , Stage (..)
+  , Withheld (..)
+  , associateCapture
+  , claimableFor
+  , outstanding
+  , outstandingFor
+  , presentCapture
+  , settleCapture
+  , withholdAll
+  )
 import Hetoimasia.GPU.Vulkan.Native.Frames
   ( Acquisition (..)
   , FrameOps
@@ -171,27 +211,50 @@ import Hetoimasia.GPU.Vulkan.Native.Generations
   , readTargetGenerations
   , stepGenerations
   )
-import Hetoimasia.GPU.Vulkan.Native.Presentation (GenerationPlan (..), SurfaceExtent)
+import Hetoimasia.GPU.Vulkan.Native.Presentation (GenerationPlan (..), SurfaceExtent, SurfaceFormat (..), imageUsageTransferSource)
 import Hetoimasia.GPU.Vulkan.Native.Profile (DevicePlan (..))
 import Hetoimasia.GPU.Vulkan.Native.Recording
   ( ClearColor
   , FrameStorage
   , ImageLayout (..)
+  , ManagedStanding (..)
+  , ManagedView (..)
+  , Pipeline
+  , PipelineLayout
+  , PipelineShaders
+  , Readback
   , Recorder
   , Recording
   , RecordingOps
-  , Refusal
+  , Refusal (..)
   , beginRendering
+  , copyToReadback
   , createFrameStorage
+  , createPipeline
+  , createPipelineLayout
+  , createReadback
   , disposeResources
   , endRendering
   , newRecording
+  , readManaged
+  , readReadback
+  , readbackBytesFor
   , recordFrame
   , releaseManaged
+  , replacePipeline
   , retireRecording
   , transitionImage
   )
-import Hetoimasia.GPU.Vulkan.Native.Roots (Roots, readRootsDevice, readRootsModel, stateRootsModel)
+import Hetoimasia.GPU.Vulkan.Native.Roots
+  ( Checkpoint (..)
+  , Roots
+  , TerminalReport (..)
+  , checkpointRoots
+  , readRootsDevice
+  , readRootsModel
+  , readRootsTerminal
+  , stateRootsModel
+  )
 import Hetoimasia.Runtime.GLFW (AttachmentId, OwnerDemand (..))
 
 -- ---------------------------------------------------------------------------
@@ -218,6 +281,9 @@ data FrameRequest = FrameRequest
   , requestImage ∷ !ImageId
   , requestExtent ∷ !SurfaceExtent
     -- ^ The extent of the generation the image belongs to.
+  , requestFormat ∷ !Word32
+    -- ^ The image's Vulkan color format: what a pipeline bound in the frame
+    -- must have been built for.
   , requestSceneRevision ∷ !Natural
     -- ^ The revision of the scene being rendered, zero for the owner's
     -- initial one.
@@ -226,23 +292,131 @@ data FrameRequest = FrameRequest
 
 -- | How a frame of the scene is recorded, on the graphics owner's thread.
 --
--- The image is already in the color-attachment layout when it is called, and
--- is transitioned for presentation after it returns: the renderer begins
--- dynamic rendering, records into it and ends it. An answer of 'Left', or a
--- command it left refused, skips the frame; nothing it recorded is submitted.
--- It runs exactly once per frame and must return finitely.
+-- The request describes the frame — its target, its slot, its image, and the
+-- image's extent and color format — before anything of the renderer's is
+-- recorded. The image is already in the color-attachment layout when it is
+-- called, and is transitioned for presentation (or, for a capture, for the
+-- copy) after it returns: the renderer begins dynamic rendering, records into
+-- it and ends it. It may construct, replace and release managed pipelines and
+-- layouts through the 'Construction' it is lent, and bind them in the frame.
+-- An answer of 'Left', or a command it left refused, skips the frame; nothing
+-- it recorded is submitted. It runs exactly once per frame and must return
+-- finitely.
 newtype VulkanRenderer scene = VulkanRenderer
-  { renderScene ∷ ∀ q inst msgr phys dev cmd. scene → FrameRequest → Recorder q inst msgr phys dev cmd → IO (Either Refusal ())
+  { renderScene
+      ∷ ∀ q inst msgr phys dev cmd
+       . scene
+      → FrameRequest
+      → Construction q inst msgr phys dev cmd
+      → Recorder q inst msgr phys dev cmd
+      → IO (Either Refusal ())
   }
 
 -- | A renderer that clears each frame to the color it computes and draws
 -- nothing else.
 clearRenderer ∷ (scene → FrameRequest → ClearColor) → VulkanRenderer scene
-clearRenderer color = VulkanRenderer $ \scene request recorder →
+clearRenderer color = VulkanRenderer $ \scene request _ recorder →
   beginRendering recorder (color scene request) `andThen` endRendering recorder
 
 andThen ∷ IO (Either Refusal ()) → IO (Either Refusal ()) → IO (Either Refusal ())
 andThen first second = first >>= either (pure . Left) (const second)
+
+-- ---------------------------------------------------------------------------
+-- Consumer construction
+
+-- | The session's managed construction, lent to the renderer with each frame
+-- (VK-19): the pipeline layouts and graphics pipelines it builds over
+-- embedded shaders, and releases or replaces, live in the session's recording
+-- beside the host's own resources and are never native handles.
+--
+-- Every call is the graphics owner's: one from any other thread is refused
+-- ('RefusedNotOwner') before anything native is done, as is one after the
+-- session has failed. A construction that raised before it committed any
+-- generation, with the session still running, left nothing: its creation made
+-- nothing and gave its reservation back. It is answered
+-- 'RefusedConstructionFailed', so it skips only the frame whose renderer
+-- answers it; the allocation recovery a construction runs retries it without
+-- calling the renderer again. One that raised after committing a generation —
+-- a replacement whose new pipeline could not be named has released that
+-- generation and already replaced the old one — has an effect the renderer
+-- cannot see, so it is raised as it was and ends the owner's run, as do a
+-- cancellation and a failure the session latched — the device's loss, an
+-- uncertain effect, a failed cleanup — with the session's primary.
+--
+-- A handle outlives the frame it was made in. Whatever the renderer has not
+-- released is released and destroyed on the owner's thread before the device,
+-- on the host's normal and terminal exits alike; a batch still in flight keeps
+-- what it recorded until its own references end.
+data Construction q inst msgr phys dev cmd = Construction
+  { constructionRecording ∷ !(Recording q inst msgr phys dev cmd)
+  , constructionRoots ∷ !(Roots q inst msgr phys dev)
+  }
+
+-- | What the renderer can release: the handles it can construct.
+class Constructed handle where
+  release ∷ Recording q inst msgr phys dev cmd → handle → IO (Either Refusal ())
+
+instance Constructed PipelineLayout where
+  release = releaseManaged
+
+instance Constructed Pipeline where
+  release = releaseManaged
+
+-- | A pipeline layout with no descriptor sets and no push constants.
+constructPipelineLayout ∷ Construction q inst msgr phys dev cmd → IO (Either Refusal PipelineLayout)
+constructPipelineLayout construction = confined construction (createPipelineLayout (constructionRecording construction))
+
+-- | A graphics pipeline over the layout for dynamic rendering into this color
+-- format — a frame's 'requestFormat' — drawing triangle lists with no vertex
+-- input, and a dynamic viewport and scissor.
+constructPipeline
+  ∷ Construction q inst msgr phys dev cmd → PipelineLayout → PipelineShaders → Word32 → IO (Either Refusal Pipeline)
+constructPipeline construction layout shaders format =
+  confined construction (createPipeline (constructionRecording construction) layout shaders format)
+
+-- | A new generation of a pipeline, over the given layout. The old one is
+-- released: nothing records it again, and a batch that recorded it keeps it,
+-- and its layout, until that batch's references end.
+replaceConstructedPipeline
+  ∷ Construction q inst msgr phys dev cmd → Pipeline → PipelineLayout → PipelineShaders → Word32 → IO (Either Refusal Pipeline)
+replaceConstructedPipeline construction old layout shaders format =
+  confined construction (replacePipeline (constructionRecording construction) old layout shaders format)
+
+-- | Release a handle the renderer constructed: nothing records it again, and a
+-- batch that recorded it keeps it until that batch's references end. The
+-- owner destroys it once nothing holds it.
+releaseConstructed ∷ Constructed handle ⇒ Construction q inst msgr phys dev cmd → handle → IO (Either Refusal ())
+releaseConstructed construction handle = confined construction (release (constructionRecording construction) handle)
+
+-- | Run one construction behind the session's checkpoint, answering a
+-- synchronous failure that left nothing as the refusal it is. Only a failure
+-- that committed no new generation, and that the checkpoint finds nothing
+-- behind, is answered: one that committed a generation first — whatever
+-- became of it — whatever the session latched on its way out, and every
+-- cancellation, is raised as it was.
+confined ∷ Construction q inst msgr phys dev cmd → IO (Either Refusal a) → IO (Either Refusal a)
+confined construction action =
+  checkpointRoots roots >>= \case
+    CheckpointFailed primary → pure (Left (RefusedSessionFailed primary))
+    CheckpointPending → pure (Left RefusedDiagnosticPending)
+    CheckpointClear → do
+      before ← generations
+      tryWithContext action >>= \case
+        Right answer → pure answer
+        Left failure@(ExceptionWithContext _ exception)
+          | isAsynchronous exception → rethrowIO (failure ∷ ExceptionWithContext SomeException)
+          | otherwise → do
+              after ← generations
+              checkpointRoots roots >>= \case
+                CheckpointClear
+                  | all (`elem` before) after → pure (Left (RefusedConstructionFailed (Text.pack (displayException exception))))
+                _ → rethrowIO failure
+  where
+    roots = constructionRoots construction
+    generations = atomically (map viewResource <$> readManaged (constructionRecording construction))
+
+isAsynchronous ∷ SomeException → Bool
+isAsynchronous exception = isJust (fromException exception ∷ Maybe SomeAsyncException)
 
 -- ---------------------------------------------------------------------------
 -- Observing frames
@@ -326,6 +500,10 @@ data Rendering q inst msgr phys dev cmd = Rendering
   , renderingDemandAt ∷ !(TVar (Maybe Instant))
   , renderingCursor ∷ !(TVar Natural)
   , renderingObserver ∷ !FrameObserver
+  , renderingCaptures ∷ !Captures
+    -- ^ The verification captures requested of the session's targets
+    -- ("Hetoimasia.GPU.Vulkan.GLFW.Internal.Capture"), whose readback buffers
+    -- this module makes, releases and destroys.
   }
 
 newRendering
@@ -333,8 +511,9 @@ newRendering
   → Generations q inst msgr phys dev
   → RenderingOps phys dev cmd
   → FrameObserver
+  → Captures
   → IO (Rendering q inst msgr phys dev cmd)
-newRendering roots generations ops observer =
+newRendering roots generations ops observer captures =
   Rendering roots generations ops
     <$> newTVarIO Nothing
     <*> newTVarIO Map.empty
@@ -342,6 +521,7 @@ newRendering roots generations ops observer =
     <*> newTVarIO Nothing
     <*> newTVarIO 0
     <*> pure observer
+    <*> pure captures
 
 -- | The recording and the frames, made the first time they are needed once
 -- the device exists, on the owner's thread, which is what makes it their
@@ -381,6 +561,9 @@ data StepInputs = StepInputs
   , inputsTargets ∷ ![(TargetId, AttachmentId, Bool)]
     -- ^ Every target the owner constructed, with whether it is eligible to
     -- render now.
+  , inputsCaptures ∷ ![AttachmentId]
+    -- ^ The attachments a verification capture has just been requested of,
+    -- each of which asks its target for a frame.
   }
 
 -- | What the step owes before it renders.
@@ -409,10 +592,11 @@ planStep rendering inputs = do
     let demandDue = ownerDemandImmediate demand || maybe False (deadlineReached now) (ownerDemandDeadline demand)
         wanted =
           [ target
-          | (target, _, eligible) ← inputsTargets inputs
+          | (target, attachment, eligible) ← inputsTargets inputs
           , let record = Map.findWithDefault freshTarget target held
           , not (targetClosing record)
           , came
+              || attachment `elem` inputsCaptures inputs
               || (inputsDemandRevision inputs > targetDemandSeen record && demandDue)
               || inputsSceneRevision inputs > targetSceneSeen record
               || ( isJust (targetShown record)
@@ -544,6 +728,15 @@ poll rendering now =
 
 -- | Offer each due target one frame of the scene. Answers whether any frame
 -- was presented.
+--
+-- A frame acquired for a target whose attachment has a verification capture
+-- outstanding is that capture's frame, whatever becomes of it. Its commands
+-- end, after the renderer's, with the image's transition to the transfer
+-- source, the copy into a readback buffer made for it with the write made
+-- visible to the host, and the transition to presentation — or, where its
+-- generation is not a transfer source or no buffer can be made, the capture
+-- is settled without bytes and the frame recorded as any other. A frame given
+-- up after its acquisition settles its capture without bytes.
 renderDue
   ∷ Rendering q inst msgr phys dev cmd
   → VulkanRenderer scene
@@ -561,19 +754,33 @@ renderDue rendering renderer now scene revision due =
         Just made → or <$> forM due (renderOne made)
   where
     observe = renderingObserver rendering
+    captures = renderingCaptures rendering
     renderOne made (target, attachment) = do
       ready ← storagesFor made target
       if not ready
         then False <$ retryAfterPending target
-        else
+        else do
+          -- The request this frame will be for is the one outstanding before
+          -- it is asked for: one admitted while the acquisition is under way
+          -- is the next frame's.
+          claimed ← atomically (claimableFor captures attachment)
           tryAcquireFrame (liveFrames made) target >>= \case
             Right (AcquisitionOwned owned) → do
               atomically (editTarget rendering target (\record → record {targetRetryAt = Nothing}))
+              -- The first frame acquired once a capture is outstanding is its
+              -- frame, whatever becomes of it. It is associated before the
+              -- acquisition is reported, so a request made from the report is
+              -- a later frame's.
+              asked ← case claimed of
+                Nothing → pure False
+                Just ticket → atomically (associateCapture captures attachment ticket (ownedFrame owned))
               observe (FrameAcquired attachment (ownedFrame owned) (ownedImage owned))
-              extent ← extentOf target (ownedImage owned)
-              case extent of
-                Nothing → False <$ abandon made attachment owned "its generation is no longer tracked"
-                Just size → recordOne made target attachment owned size
+              described ← describeImage target (ownedImage owned)
+              case described of
+                Nothing → False <$ abandon made attachment owned (Captured asked Nothing) "its generation is no longer tracked"
+                Just image → do
+                  capture ← if asked then prepareCapture made attachment owned image else pure (Captured False Nothing)
+                  recordOne made target attachment owned image capture
             Right (AcquisitionPending reason) → do
               observe (FramePending attachment reason)
               False <$ retryAfterPending target
@@ -599,51 +806,166 @@ renderDue rendering renderer now scene revision due =
               Left refusal → throwIO (FrameStorageRefused target slot refusal)
           atomically (editTarget rendering target (\record → record {targetStorages = made'}))
           pure True
-    extentOf target image = do
+    describeImage target image = do
       view ← atomically (readTargetGenerations (renderingGenerations rendering) target)
       pure $ do
         generations ← viewGenerations <$> view
         generation ← find ((== imageGeneration image) . viewGeneration) generations
-        pure (planExtent (viewPlan generation))
-    recordOne made target attachment owned size = do
-      let request = FrameRequest attachment target (ownedFrame owned) (ownedImage owned) size revision
+        let plan = viewPlan generation
+        pure (ImageDescription (planExtent plan) (surfaceFormat (planFormat plan)) (planUsage plan .&. imageUsageTransferSource /= 0))
+    -- A readback buffer for the capture, or the capture settled without bytes
+    -- and the frame recorded as any other — no longer a capture's, so nothing
+    -- that later becomes of it can settle a newer request.
+    prepareCapture made attachment owned image
+      | not (imageCapturable image) = Captured False Nothing <$ withhold attachment (WithheldUnsupported (imageGeneration (ownedImage owned)))
+      | otherwise = do
+          let bytes = readbackBytesFor (imageExtent image)
+          confined (Construction (liveRecording made) (renderingRoots rendering)) (createReadback (liveRecording made) bytes) >>= \case
+            Left refusal → Captured False Nothing <$ withhold attachment (WithheldNoReadback refusal)
+            Right readback → pure (Captured True (Just (readback, bytes)))
+    withhold attachment reason = atomically (settleCapture captures attachment (CaptureWithheld attachment reason))
+    recordOne made target attachment owned image capture = do
+      let request = FrameRequest attachment target (ownedFrame owned) (ownedImage owned) (imageExtent image) (imageFormat image) revision
+          construction = Construction (liveRecording made) (renderingRoots rendering)
+          finish recorder = case capturedWork capture of
+            Nothing → transitionImage recorder LayoutColorAttachment LayoutPresentSource
+            Just (readback, _) →
+              transitionImage recorder LayoutColorAttachment LayoutTransferSource
+                `andThen` copyToReadback recorder readback
+                `andThen` transitionImage recorder LayoutTransferSource LayoutPresentSource
       recorded ←
-        recordFrame (liveRecording made) (ownedFrame owned) $ \recorder →
+        recordFrame (liveRecording made) (ownedFrame owned) (\recorder →
           transitionImage recorder LayoutUndefined LayoutColorAttachment
-            `andThen` renderScene renderer scene request recorder
-            `andThen` transitionImage recorder LayoutColorAttachment LayoutPresentSource
+            `andThen` renderScene renderer scene request construction recorder
+            `andThen` finish recorder)
+          `onException` giveUp made attachment owned capture "its recording raised"
       case recorded of
         Right (batch, Right ()) →
           submitFrames (liveFrames made) (batch :| []) >>= \case
             Right (SubmittedAs submission) → do
               observe (FrameSubmitted attachment (ownedFrame owned) submission)
-              present made target attachment owned
-            Right (SubmittedNothing reason) → False <$ abandon made attachment owned ("its submission had no effect: " <> reason)
-            Left refusal → False <$ abandon made attachment owned ("its submission was refused: " <> tshow refusal)
-        Right (_, Left refusal) → False <$ abandon made attachment owned ("the renderer refused: " <> tshow refusal)
-        Left refusal → False <$ abandon made attachment owned ("its recording was refused: " <> tshow refusal)
-    present made target attachment owned = do
+              present made target attachment owned image capture
+            Right (SubmittedNothing reason) → False <$ abandon made attachment owned capture ("its submission had no effect: " <> reason)
+            Left refusal → False <$ abandon made attachment owned capture ("its submission was refused: " <> tshow refusal)
+        Right (_, Left refusal) → False <$ abandon made attachment owned capture ("the renderer refused: " <> tshow refusal)
+        Left refusal → False <$ abandon made attachment owned capture ("its recording was refused: " <> tshow refusal)
+    present made target attachment owned image capture = do
       observe (FramePresentRequested attachment (ownedFrame owned) (ownedImage owned) revision)
       presentFrame (liveFrames made) (ownedFrame owned) >>= \case
         Right (PresentedAs presentation outcome) → do
           observe (FramePresented attachment (ownedFrame owned) presentation outcome)
-          atomically (editTarget rendering target (\record → record {targetShown = Just (imageGeneration (ownedImage owned))}))
+          atomically $ do
+            editTarget rendering target (\record → record {targetShown = Just (imageGeneration (ownedImage owned))})
+            for_ (capturedWork capture) $ \(readback, bytes) →
+              presentCapture captures attachment . Presented readback bytes $ \copied →
+                CapturedFrame
+                  { capturedAttachment = attachment
+                  , capturedTarget = target
+                  , capturedGeneration = imageGeneration (ownedImage owned)
+                  , capturedFrame = ownedFrame owned
+                  , capturedImage = ownedImage owned
+                  , capturedPresentation = presentation
+                  , capturedExtent = imageExtent image
+                  , capturedFormat = imageFormat image
+                  , capturedSceneRevision = revision
+                  , capturedBytes = copied
+                  }
           pure True
         Right (PresentedNothing reason) → do
           _ ← closeUnpresentedFrame (liveFrames made) (ownedFrame owned)
-          observe (FrameAbandoned attachment (ownedFrame owned) ("its presentation enqueued nothing: " <> reason))
+          let why = "its presentation enqueued nothing: " <> reason
+          observe (FrameAbandoned attachment (ownedFrame owned) why)
+          giveUp made attachment owned capture why
           False <$ retryAfterPending target
         Left refusal → do
           _ ← closeUnpresentedFrame (liveFrames made) (ownedFrame owned)
-          observe (FrameAbandoned attachment (ownedFrame owned) ("its presentation was refused: " <> tshow refusal))
+          let why = "its presentation was refused: " <> tshow refusal
+          observe (FrameAbandoned attachment (ownedFrame owned) why)
+          giveUp made attachment owned capture why
           False <$ retryAfterPending target
     -- A frame given up after its acquisition leaves the target's render
     -- demand standing: the frame is tried again at the backoff's first
     -- interval, as a pending acquisition is, never on every round.
-    abandon made attachment owned reason = do
+    abandon made attachment owned capture reason = do
       _ ← skipFrame (liveFrames made) (ownedFrame owned)
       observe (FrameAbandoned attachment (ownedFrame owned) reason)
+      giveUp made attachment owned capture reason
       retryAfterPending (frameTarget (ownedFrame owned))
+    -- The capture of a frame given up is settled without bytes, and its
+    -- readback buffer released: a batch that recorded the copy keeps it until
+    -- its own references end.
+    giveUp made attachment owned capture reason = when (capturedAsked capture) $ do
+      for_ (capturedWork capture) (\(readback, _) → void (releaseManaged (liveRecording made) readback))
+      withhold attachment (WithheldFrameAbandoned (ownedFrame owned) reason)
+
+-- | What rendering knows of a frame's image from its generation's plan.
+data ImageDescription = ImageDescription
+  { imageExtent ∷ !SurfaceExtent
+  , imageFormat ∷ !Word32
+  , imageCapturable ∷ !Bool
+    -- ^ Whether its generation made it a transfer source.
+  }
+
+-- | Whether a frame is still an outstanding capture's, and the readback
+-- buffer the copy goes into and its size, once one was made.
+data Captured = Captured
+  { capturedAsked ∷ !Bool
+  , capturedWork ∷ !(Maybe (Readback, Natural))
+  }
+
+-- | Settle every capture whose frame was presented and whose bytes the
+-- batch's completion evidence now exposes, delivering a copy of them, and
+-- release its readback buffer. Nothing is read once the session has failed or
+-- the device has been lost: a hold the loss let go of is not completion.
+-- Answers whether it settled any.
+settleCaptures ∷ Rendering q inst msgr phys dev cmd → IO Bool
+settleCaptures rendering =
+  readTVarIO (renderingLive rendering) >>= \case
+    Nothing → pure False
+    Just made → do
+      (waiting, running) ← atomically $ do
+        held ← outstanding captures
+        terminal ← readRootsTerminal (renderingRoots rendering)
+        model ← readRootsModel (renderingRoots rendering)
+        pure ([(attachment, presented) | (attachment, StagePresented presented) ← held], isNothing (reportPrimary terminal) && not (deviceLossObserved model))
+      if not running
+        then pure False
+        else fmap or . forM waiting $ \(attachment, presented) →
+          readReadback (liveRecording made) (presentedReadback presented) 0 (presentedBytes presented) >>= \case
+            Left (RefusedNotWritten _) → pure False
+            answer → do
+              _ ← releaseManaged (liveRecording made) (presentedReadback presented)
+              atomically . settleCapture captures attachment $ case answer of
+                Right bytes → CaptureDelivered (presentedFrame presented (ByteString.copy bytes))
+                Left refusal → CaptureWithheld attachment (WithheldReadRefused refusal)
+              pure True
+  where
+    captures = renderingCaptures rendering
+
+-- | Destroy, on the owner's thread, every released generation — a replaced or
+-- released pipeline of the renderer's, a capture's readback buffer — that
+-- nothing holds any more. It takes a model turn only when there is one.
+reclaimReleased ∷ Rendering q inst msgr phys dev cmd → Instant → IO ()
+reclaimReleased rendering now =
+  readTVarIO (renderingLive rendering) >>= \case
+    Nothing → pure ()
+    Just made → do
+      due ← atomically $ do
+        views ← readManaged (liveRecording made)
+        model ← readRootsModel (renderingRoots rendering)
+        pure
+          ( or
+              [ disposalEligible (ResourceSubject (viewResource view)) model
+              | view ← views
+              , released (viewManagedStanding view)
+              ]
+          )
+      when due (void (disposeResources (liveRecording made) now))
+  where
+    released = \case
+      ManagedReleased → True
+      ManagedReplaced _ → True
+      _ → False
 
 editTarget ∷ Rendering q inst msgr phys dev cmd → TargetId → (TargetRendering → TargetRendering) → STM ()
 editTarget rendering target edit = modifyTVar' (renderingTargets rendering) (Map.alter (Just . edit . maybe freshTarget id) target)
@@ -735,16 +1057,52 @@ prepareTargetRetirement rendering now target =
 -- and its presentation pool, which raises, retaining them, if anything of the
 -- target is still owed; and its frame storages, released and destroyed once
 -- the model reports them unheld.
-retireTargetRendering ∷ Rendering q inst msgr phys dev cmd → Instant → TargetId → IO ()
-retireTargetRendering rendering now target =
+--
+-- A capture of the target's attachment still outstanding is settled first:
+-- with its bytes when its batch's completion evidence exposes them — the
+-- retirement's preparation waited for every frame and presentation of the
+-- target to end on its own evidence — and otherwise without: the session's
+-- primary failure when it has failed, and the target's retirement otherwise.
+-- Its readback buffer is released and destroyed with the rest.
+retireTargetRendering ∷ Rendering q inst msgr phys dev cmd → Instant → TargetId → AttachmentId → IO ()
+retireTargetRendering rendering now target attachment =
   readTVarIO (renderingLive rendering) >>= \case
-    Nothing → atomically (modifyTVar' (renderingTargets rendering) (Map.delete target))
+    Nothing → do
+      withheld
+      atomically (modifyTVar' (renderingTargets rendering) (Map.delete target))
     Just made → do
+      _ ← settleCaptures rendering
+      stage ← atomically (outstandingFor (renderingCaptures rendering) attachment)
+      case stage of
+        Just (StagePresented presented) → void (releaseManaged (liveRecording made) (presentedReadback presented))
+        _ → pure ()
+      withheld
       retireTargetFrames (liveFrames made) target
       storages ← maybe [] targetStorages . Map.lookup target <$> readTVarIO (renderingTargets rendering)
       forM_ storages (void . releaseManaged (liveRecording made))
       _ ← disposeResources (liveRecording made) now
       atomically (modifyTVar' (renderingTargets rendering) (Map.delete target))
+  where
+    withheld = atomically $ do
+      primary ← reportPrimary <$> readRootsTerminal (renderingRoots rendering)
+      let reason = maybe WithheldTargetRetired (WithheldSessionEnded . Just) primary
+      settleCapture (renderingCaptures rendering) attachment (CaptureWithheld attachment reason)
+
+-- | Settle every capture still outstanding without bytes, the session
+-- ending — with its primary failure, if it failed — and release their readback
+-- buffers, which the recording's retirement then destroys with everything
+-- else. The owner's retirement runs it before the recording's.
+endCaptures ∷ Rendering q inst msgr phys dev cmd → IO ()
+endCaptures rendering = do
+  (held, primary) ← atomically ((,) <$> outstanding captures <*> (reportPrimary <$> readRootsTerminal (renderingRoots rendering)))
+  readTVarIO (renderingLive rendering) >>= \case
+    Nothing → pure ()
+    Just made →
+      for_ [presented | (_, StagePresented presented) ← held] $ \presented →
+        void (releaseManaged (liveRecording made) (presentedReadback presented))
+  atomically (withholdAll captures (WithheldSessionEnded primary))
+  where
+    captures = renderingCaptures rendering
 
 -- | Retire the recording, releasing and destroying every managed resource
 -- left, before the device is destroyed. Raises, retaining them, if any

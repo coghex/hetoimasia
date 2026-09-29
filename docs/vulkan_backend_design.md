@@ -50,6 +50,7 @@ concrete precondition
 - [x] VK-14. Apply bounded target and allocation recovery — [#229]
 - [x] VK-15. Complete terminal graphics failure and device-loss teardown — [#231]
 - [x] VK-16. Compose rendering demand and retirement with TIME and LIFE — [#232]
+- [x] VK-19. Expose consumer-built pipelines and verification capture through the Vulkan host — [#299]
 - [x] VK-17. Deliver the multi-window triangle consumer and final evidence — [#233]
 
 Slices are mirrored below in dependency order. The owner signed off the
@@ -2419,7 +2420,11 @@ tracker artifacts. D-29–D-33 (2026-09-20) insert VK-18 before VK-7 and revise
 the VK-7, VK-8, VK-10, VK-16 and VK-17 boundaries. The owner's requested
 2026-09-20 review signs off those revisions. VK-5, VK-6 and VK-18 are parallel
 prerequisite branches converging at VK-7, followed by VK-8 → VK-10 → VK-11 →
-VK-12 → VK-13 → VK-14/VK-15 → VK-16 → VK-17; VK-9 also gates VK-11.
+VK-12 → VK-13 → VK-14/VK-15 → VK-16 → VK-19 → VK-17; VK-9 also gates VK-11.
+VK-19 was added on 2026-09-28, after VK-16 composed the host: no slice had
+assigned exposing VK-11's managed construction and readback through it, and
+VK-17's consumer and image assertions cannot be met through the public host
+without them.
 
 VK-1 and VK-2 qualify the shared toolchain and native profile; VK-3 can progress
 beside VK-2. Downstream native slices are deliberately deferred until VK-2
@@ -2725,6 +2730,25 @@ native evidence obligations even when its implementation can run in parallel.
 - **Out of scope:** A new simulation driver (D-31), game EngineEnv, a second graphics owner, the reserve callback geometry record unless the measurement shows D-30's capabilities path insufficient, or any Linux substitute for the Cocoa measurement.
 - **Open questions:** None; consume delivered TIME/LIFE contracts and D-30–D-33. If the measurement shows the capabilities path insufficient on a supported platform, stop and revise D-30 explicitly rather than improvising the reserve record.
 
+### VK-19. Expose consumer-built pipelines and verification capture through the Vulkan host
+
+> Filed as #299 on 2026-09-28, after VK-16. Placement: the construction
+> capability and the frame's description are public in
+> `hetoimasia-gpu-vulkan-glfw`; verification capture is visible only through
+> its private `controller` sublibrary, as the design's test-only readback
+> usage (P-15) requires; the capture swapchain's `clipped = False` is the
+> native package's plan.
+
+- **Outcome:** A consumer of the public host builds, binds, replaces and releases its own managed pipelines in the frames the host records, and the package's own suites read back a real presented frame's pixels through the production host.
+- **Scope:** The renderer lent the session's managed construction on the graphics owner's thread, and each frame's color format and extent before it records; construction refused or failed with no native effect skipping only its frame, and a session-latched failure ending the run with its primary; consumer resources released and destroyed before the device on normal and terminal exits; capture off by default with swapchains unchanged, and on through the private sublibrary with unclipped, transfer-source-where-offered generations, a copy after the consumer's commands in the same batch, delivery at most once after completion evidence, and typed withholding otherwise; headless examples, one native case, and docs.
+- **Phase:** Runtime integration.
+- **Depends on:** `VK-11`, `VK-16`.
+- **Ordering:** critical path, before VK-17.
+- **Relevant decisions:** D-15, D-20, D-21, D-26, D-29, D-33; P-1, P-15.
+- **Acceptance signals:** Both ordinary builds unchanged and warning-clean; the headless examples cover the owner-thread refusal, the consumer's pipeline drawn in a host frame, a refused construction skipping one frame, teardown before the device on both exits, capture off and on, bytes withheld until completion and delivered once, a skipped captured frame delivering nothing, and a surface without transfer-source usage admitted with its capture refused; a native case in #220's fixture asserts known clear and triangle points of each of two targets' captured frames beside their verified presentations, all Vulkan calls on the owner's thread and a clean verdict, within the group's 30-second watchdog on both platforms.
+- **Out of scope:** VK-17's sample and profile, pipeline caches, vertex or texture upload, a general allocator, raw native handles or unchecked callbacks, and public capture.
+- **Open questions:** None. Capture stays private; a consumer outside the package that needs it returns the question to the owner.
+
 ### VK-17. Deliver the multi-window triangle consumer and final evidence
 
 > Filed as #233 on 2026-09-20. Placement: the consumer is a sample executable
@@ -2735,7 +2759,7 @@ native evidence obligations even when its implementation can run in parallel.
 - **Outcome:** A small renderer client proves the managed API and complete two-window milestone on both platforms.
 - **Scope:** Embedded triangle shaders, required image assertions and two-window resize/first-window close, one/two-frame configurations, final teardown verdict, usage docs and local/remote evidence.
 - **Phase:** Milestone.
-- **Depends on:** `VK-8`, `VK-16`.
+- **Depends on:** `VK-8`, `VK-16`, `VK-19`.
 - **Ordering:** last on critical path.
 - **Relevant decisions:** D-1–D-4, D-7, D-16, D-20, D-21, D-26, D-29.
 - **Acceptance signals:** Full required native profile including test-owned setup and teardown measures under 30 seconds on each platform; second window renders after first closes; no missing validation detail; component docs/evidence land before final review; the triangle consumer never calls GLFW or Vulkan from a thread other than the one D-29 assigns, and VK-16's retained stall evidence is linked from the final verdict rather than re-measured.

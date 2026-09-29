@@ -43,7 +43,9 @@ destroys it.
   before parent once every hold has ended. Its calls are the
   roots' `GenerationOps`. `newGenerationsCapturing` also makes a generation's
   images transfer sources where the surface offers it, for a verification
-  capture; no normal target is built that way. It is the entry point only: its
+  capture, and creates its swapchain with `clipped = False` (`planClipped`), so
+  obscured pixels stay defined for the copy; no normal target is built that
+  way, and every other swapchain is created with `clipped = True`. It is the entry point only: its
   code lives in private modules under
   `Hetoimasia.GPU.Vulkan.Native.Internal.Generations`, which it re-exports
   unchanged and no client can import. `State` holds the `Generations`, its

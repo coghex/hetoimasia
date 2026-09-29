@@ -22,9 +22,11 @@
 --
 -- Native verification reads rendered images back, which needs the images to
 -- be transfer sources. 'planGenerationWith' 'CaptureWhenOffered' adds that
--- usage wherever the surface offers it, and otherwise plans exactly what
--- 'planGeneration' does: capture is never a gap, and no normal target asks
--- for it.
+-- usage wherever the surface offers it, and plans the swapchain unclipped, so
+-- the presentation engine keeps every pixel it is given even where the window
+-- is obscured; otherwise it plans exactly what 'planGeneration' does: capture
+-- is never a gap, and no normal target asks for it. Every normal generation is
+-- clipped.
 --
 -- = The extent
 --
@@ -234,6 +236,10 @@ data GenerationPlan = GenerationPlan
   , planUsage ∷ !Word32
   , planTransform ∷ !Word32
   , planCompositeAlpha ∷ !Word32
+  , planClipped ∷ !Bool
+    -- ^ Whether the presentation engine may discard the pixels of regions
+    -- that are not visible. A normal generation is clipped; one planned for a
+    -- verification capture is not, since a capture reads every pixel.
   }
   deriving (Eq, Show)
 
@@ -273,8 +279,10 @@ data CaptureUsage
   = WithoutCapture
     -- ^ The profile alone: every normal target.
   | CaptureWhenOffered
-    -- ^ Add transfer-source usage where the surface offers it. Where it does
-    -- not, the plan is the profile's, and a copy from its images is refused.
+    -- ^ Add transfer-source usage where the surface offers it, and plan the
+    -- swapchain unclipped. Where the surface offers no transfer-source usage
+    -- the plan is otherwise the profile's, and a copy from its images is
+    -- refused.
   deriving (Eq, Show)
 
 -- | 'planGeneration', asking for capture usage or not.
@@ -293,6 +301,7 @@ planGenerationWith capture trackingLimit geometry offer = case chooseExtent geom
           , planUsage = imageUsageColorAttachment .|. captured
           , planTransform = capabilityCurrentTransform capabilities
           , planCompositeAlpha = composite
+          , planClipped = capture == WithoutCapture
           }
     _ → PlanUnsupported gaps
   where

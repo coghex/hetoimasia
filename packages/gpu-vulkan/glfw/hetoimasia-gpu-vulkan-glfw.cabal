@@ -44,8 +44,10 @@ library controller
     hs-source-dirs: controller
     exposed-modules:
         Hetoimasia.GPU.Vulkan.GLFW.Internal.Bridge
+        Hetoimasia.GPU.Vulkan.GLFW.Internal.Capture
         Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
         Hetoimasia.GPU.Vulkan.GLFW.Internal.Loop
+        Hetoimasia.GPU.Vulkan.GLFW.Internal.Production
         Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
     build-depends:
         base >=4.22 && <4.23,
@@ -92,6 +94,7 @@ test-suite integration-tests
     main-is: Main.hs
     hs-source-dirs: test
     other-modules:
+        Test.GPU.Vulkan.GLFW.Consumer
         Test.GPU.Vulkan.GLFW.Controller
         Test.GPU.Vulkan.GLFW.Loop
         Test.GPU.Vulkan.GLFW.StandIn
@@ -139,6 +142,7 @@ test-suite vulkan-native-tests
     default-extensions: PatternSynonyms
     ghc-options: -threaded -rtsopts
     other-modules:
+        Test.GPU.Vulkan.Native.Capture
         Test.GPU.Vulkan.Native.Composed
         Test.GPU.Vulkan.Native.Consent
         Test.GPU.Vulkan.Native.Environment
