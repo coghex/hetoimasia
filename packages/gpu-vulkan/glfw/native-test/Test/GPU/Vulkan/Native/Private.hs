@@ -55,6 +55,9 @@
 --   other consent its example is pending, asserts nothing, and starts no child,
 --   and the complete profile does not require it ('requiredScenarios').
 --
+-- Under the isolated compositor's consent @vk16-composed@ is pending with its
+-- named reason, 'composedOnWayland', starts no child, and is not required.
+--
 -- Every child requests the backend its consent names
 -- ("Test.GPU.Vulkan.Native.Platform"): Wayland by name under the isolated
 -- compositor's consent, and the platform's own backend otherwise.
@@ -144,6 +147,9 @@ data Scenario = Scenario
   , scenarioTitle ∷ String
   , scenarioWaylandOnly ∷ Bool
     -- ^ Whether it runs only under the isolated compositor's consent.
+  , scenarioWaylandPending ∷ Maybe String
+    -- ^ Why it is pending under the isolated compositor's consent, when it
+    -- cannot run there: a known engine gap, named, never a silent skip.
   , scenarioRun ∷ Consent → Journal → Conclude → IO (Spec, Bool → [Text] → Text)
     -- ^ The native procedure, run to completion and torn down before it
     -- returns; then the examples that assert over what it saw, and the record
@@ -163,22 +169,24 @@ scenarios =
       "vk2-compatibility"
       "proves the VK-2 compatibility profile, presentation completion, safe abandonment and capture"
       False
+      Nothing
       $ \consent journal _ → do
         outcome ← runProof journal consent
         pure (Proof.spec outcome, \passed transcript → renderRecord "The VK-2 native Vulkan compatibility record" (invocation consent) transcript outcome passed)
-  , Scenario "vk6-capture" "proves VK-6's C-only validation capture on an instance of its own" False $ \_ journal _ → do
+  , Scenario "vk6-capture" "proves VK-6's C-only validation capture on an instance of its own" False Nothing $ \_ journal _ → do
       outcome ← Diagnostics.runDiagnostics journal
       pure (DiagnosticsSpec.spec outcome, section "The VK-6 validation capture record" (diagnosticsSection outcome))
-  , Scenario "vk5-bridge" "proves VK-5's loader-aware surface bridge in a session of its own" False $ \consent journal _ → do
+  , Scenario "vk5-bridge" "proves VK-5's loader-aware surface bridge in a session of its own" False Nothing $ \consent journal _ → do
       outcome ← Bridge.runBridge (consentBackend consent) journal
       pure (BridgeSpec.spec outcome, section "The VK-5 surface bridge record" (bridgeSection outcome))
-  , Scenario "vk7-roots" "proves VK-7's roots under the graphics owner, through their destruction at the host's exit" False $ \consent journal _ → do
+  , Scenario "vk7-roots" "proves VK-7's roots under the graphics owner, through their destruction at the host's exit" False Nothing $ \consent journal _ → do
       outcome ← Roots.runRoots (consentBackend consent) journal
       pure (RootsSpec.spec outcome, section "The VK-7 Vulkan roots record" (rootsSection outcome))
   , Scenario
       "vk11-recording"
       "records and discards a triangle batch through VK-11's managed resources, with validation reporting nothing"
       False
+      Nothing
       $ \consent journal _ → do
         outcome ← Recording.runRecording (consentBackend consent) journal
         pure (Recording.spec outcome, section "The VK-11 managed recording record" (Recording.recordingSection outcome))
@@ -186,6 +194,7 @@ scenarios =
       "vk12-frames"
       "acquires, submits and awaits a triangle batch with its capture, and returns images without presenting, with validation reporting nothing"
       False
+      Nothing
       $ \consent journal _ → do
         outcome ← Frames.runFrames (consentBackend consent) journal
         pure (Frames.spec outcome, section "The VK-12 frames record" (Frames.framesSection outcome))
@@ -193,6 +202,7 @@ scenarios =
       "vk13-presentation"
       "presents to two windows on verified present fences, retires a resized generation and the first window on that evidence, with validation reporting nothing"
       False
+      Nothing
       $ \consent journal _ → do
         outcome ← Presentation.runPresentation (consentBackend consent) journal
         pure (Presentation.spec outcome, section "The VK-13 presentation record" (Presentation.presentationSection outcome))
@@ -200,6 +210,7 @@ scenarios =
       "vk14-recovery"
       "replaces a lost surface on its live window while another presents, and recovers an allocation by reclaiming a retired generation, with validation reporting nothing"
       False
+      Nothing
       $ \consent journal _ → do
         outcome ← Recovery.runRecovery (consentBackend consent) journal
         pure (Recovery.spec outcome, section "The VK-14 recovery record" (Recovery.recoverySection outcome))
@@ -207,6 +218,7 @@ scenarios =
       "vk15-validation-stop"
       "stops rendering at the checkpoint after an injected validation error, tearing down under the ordinary rules with the error as the primary and the final callbacks in the verdict"
       False
+      Nothing
       $ \consent journal _ → do
         outcome ← Terminal.runValidationStop (consentBackend consent) journal
         pure (Terminal.validationSpec outcome, section "The VK-15 validation stop record" (Terminal.validationSection outcome))
@@ -214,6 +226,7 @@ scenarios =
       "vk15-retention"
       "reports a deliberately retained unverified generation and its parents rather than releasing them, and ends by process termination"
       False
+      Nothing
       $ \consent journal conclude →
         Terminal.runRetention (consentBackend consent) journal $ \outcome →
           conclude (Terminal.retentionSpec outcome, section "The VK-15 retention record" (Terminal.retentionSection outcome))
@@ -221,6 +234,7 @@ scenarios =
       "vk16-composed"
       "renders two targets through the composed loop, suspending and resuming one while the other presents, and exits through D-33 with validation reporting nothing"
       False
+      (Just composedOnWayland)
       $ \consent journal _ → do
         outcome ← Composed.runComposed (consentBackend consent) journal
         pure (Composed.spec outcome, section "The VK-16 composed loop record" (Composed.composedSection outcome))
@@ -228,6 +242,7 @@ scenarios =
       "vk17-one-slot"
       "renders the triangle sample in two windows with one frame slot, capturing each, the first again after its resize, and the second after the first closes, with validation reporting nothing"
       False
+      Nothing
       $ \consent journal _ → do
         outcome ← Triangle.runProfile (consentBackend consent) 1 journal
         pure (Triangle.spec 1 outcome, section "The VK-17 required profile record, one frame slot" (Triangle.profileSection outcome))
@@ -235,6 +250,7 @@ scenarios =
       "vk17-two-slots"
       "renders the triangle sample in two windows with two frame slots, capturing each, the first again after its resize, and the second after the first closes, with validation reporting nothing"
       False
+      Nothing
       $ \consent journal _ → do
         outcome ← Triangle.runProfile (consentBackend consent) 2 journal
         pure (Triangle.spec 2 outcome, section "The VK-17 required profile record, two frame slots" (Triangle.profileSection outcome))
@@ -242,6 +258,7 @@ scenarios =
       "vk19-capture"
       "captures a consumer-built triangle from two targets through the production host, each beside its frame's verified presentation, with validation reporting nothing"
       False
+      Nothing
       $ \consent journal _ → do
         outcome ← Capture.runCapture (consentBackend consent) journal
         pure (Capture.spec outcome, section "The VK-19 consumer pipeline and capture record" (Capture.captureSection outcome))
@@ -249,6 +266,7 @@ scenarios =
       "synchronization-hazard"
       "observes a deliberate synchronization hazard, proving synchronization validation active"
       False
+      Nothing
       $ \_ journal _ → do
         outcome ← Hazard.runHazard journal
         pure (Hazard.spec outcome, section "The synchronization validation control record" (Hazard.hazardSection outcome))
@@ -256,6 +274,7 @@ scenarios =
       "debug-names"
       "carries a provoked validation report's named managed resource, and its batch's label, into the capture"
       False
+      Nothing
       $ \consent journal _ → do
         outcome ← Naming.runNaming (consentBackend consent) journal
         pure (Naming.spec outcome, section "The #250 debug names and labels record" (Naming.namingSection outcome))
@@ -263,6 +282,7 @@ scenarios =
       "wayland-connection-loss"
       "ends its own compositor while the production host renders to a Wayland surface, and the session ends terminally with the loss, retired under the protected boundary with no completion recorded for interrupted work"
       True
+      Nothing
       $ \consent journal _ → do
         case consent of
           IsolatedWayland _ → pure ()
@@ -286,11 +306,27 @@ scenarios =
 scenarioNames ∷ [String]
 scenarioNames = map scenarioName scenarios
 
+-- | Why VK-16's case is pending on Wayland (owner decision on #327,
+-- 2026-09-30). Weston 13 offers no @wp_fifo_v1@, so Mesa's Wayland WSI
+-- throttles FIFO with frame callbacks: each present waits, without a timeout,
+-- for the previous one's callback, and Weston fires none for an unmapped
+-- surface. Hiding a window whose target is presenting therefore blocks the
+-- graphics owner in its next present to it. That is an engine gap on Wayland,
+-- tracked apart from this qualification; it is not a pass.
+composedOnWayland ∷ String
+composedOnWayland =
+  "not qualified on Wayland: hiding a window whose target is presenting blocks the graphics owner, because Mesa's legacy FIFO waits for a frame callback the compositor never sends an unmapped surface (Weston 13 has no wp_fifo_v1); an engine gap tracked apart from #327"
+
 -- | The scenarios a complete run under this consent must run to a pass: every
 -- one, except that a Wayland-only one is required only under the isolated
--- compositor's consent. A run without consent is held to the others.
+-- compositor's consent, and one with a named Wayland gap is not required
+-- there. A run without consent is held to the others.
 requiredScenarios ∷ Either Refusal Consent → [String]
-requiredScenarios consent = [scenarioName scenario | scenario ← scenarios, not (scenarioWaylandOnly scenario) || wayland]
+requiredScenarios consent =
+  [ scenarioName scenario
+  | scenario ← scenarios
+  , if wayland then scenarioWaylandPending scenario == Nothing else not (scenarioWaylandOnly scenario)
+  ]
   where
     wayland = case consent of
       Right (IsolatedWayland _) → True
@@ -382,7 +418,9 @@ spec gate timings = describe "with private roots in a child process" $
     example scenario = it (scenarioTitle scenario) $ do
       consent ← admit gate
       case consent of
-        IsolatedWayland _ → launch scenario
+        IsolatedWayland _
+          | Just reason ← scenarioWaylandPending scenario → pendingWith reason
+          | otherwise → launch scenario
         _
           | scenarioWaylandOnly scenario →
               pendingWith "this case ends a Wayland compositor, and runs only under the isolated compositor's consent (tools/display/wayland.sh)"

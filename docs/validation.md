@@ -351,7 +351,11 @@ is mandatory outside the floor, required when affected. `--complete` holds it to
 the same rule as on X11 — one shared-session acquisition, and every private
 scenario its consent requires run and passed — and under this consent that
 includes `wayland-connection-loss`, which ends a compositor of its own while
-rendering and is pending under any other consent. It declares no `platforms`,
+rendering and is pending under any other consent, and excludes VK-16's
+`vk16-composed`, which is pending there with its reason named: hiding a
+presenting window blocks the graphics owner under Mesa's legacy FIFO on Weston
+13 ([gpu_backend.md](gpu_backend.md#the-native-suite)), an engine gap tracked
+apart from this group. It declares no `platforms`,
 as `test.glfw-wayland` does not: the compositor exists only on Linux, and no
 worker runs it elsewhere. `test.vulkan-native` is unchanged.
 

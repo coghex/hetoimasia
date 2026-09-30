@@ -772,7 +772,11 @@ The remaining gaps are stated rather than estimated:
   boundary, and a compositor lost during rendering ending the session with no
   completion recorded for work it interrupted. Its run is retained in
   [the qualification record](wayland_qualification_record.md#rendering).
-  Hardware drivers, desktop compositors and macOS stay unqualified for
+  Hiding a window whose target is presenting is not qualified: Weston 13
+  offers no `wp_fifo_v1`, so Mesa's FIFO waits for a frame callback the
+  compositor never sends an unmapped surface and the graphics owner blocks, so
+  VK-16's hide-and-show case is pending on Wayland, an engine gap tracked
+  apart. Hardware drivers, desktop compositors and macOS stay unqualified for
   rendering on Wayland: no hardware driver, no compositor but packaged
   headless Weston, and no macOS path was exercised, and macOS has no Wayland.
 - **Close requests.** A compositor-generated close request has not been
