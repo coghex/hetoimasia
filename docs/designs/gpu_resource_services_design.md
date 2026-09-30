@@ -744,8 +744,6 @@ priority, so production allocation uses VMA.
 - dedicated allocations: the driver's preferred or required dedication, and
   VMA's size heuristic;
 - empty-block retention: at most one empty block per memory type, as VMA does;
-- choosing a memory type from the property flags the engine requires and
-  prefers;
 - persistent mapping, and atom-aligned flush and invalidate of host-visible
   allocations.
 
@@ -771,9 +769,16 @@ who sees it:
 - **Recovery.** VK-14's single reclamation pass and single retry for a
   no-effect out-of-memory failure from VMA. An uncertain effect is terminal,
   as today.
-- **Memory-type policy.** D-16's usages, stated as the required and preferred
-  property flags VMA selects from. A usage no memory type can serve is a
-  structured refusal, never a silent fallback.
+- **Memory-type selection.** The engine chooses the one memory type every
+  allocation uses:
+  - It applies D-16's usage, stated as required and preferred property flags,
+    to the resource's `memoryTypeBits`. It may ask VMA's memory-type query to
+    rank the candidates, but the engine makes the choice.
+  - It pins the choice by passing only that type's bit in the allocation's
+    `memoryTypeBits`, so VMA can neither choose nor fall back to another type.
+    D-40's reservation depends on this.
+  - A usage no memory type can serve is a structured refusal, never a silent
+    fallback.
 - **Retirement.** Every allocation freed before the allocator is destroyed,
   and the allocator destroyed before the device (the roots'
   child-before-parent order).
