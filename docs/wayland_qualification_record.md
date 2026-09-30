@@ -512,19 +512,21 @@ owner's machine.
 
 ### The run
 
-Workflow run [36742775061](https://github.com/coghex/hetoimasia/actions/runs/36742775061),
+Workflow run [36747611445](https://github.com/coghex/hetoimasia/actions/runs/36747611445),
 attempt 1, job `vulkan`, group `test.vulkan-wayland`, for pull request
-[#359](https://github.com/coghex/hetoimasia/pull/359) at commit `ac0b65c`,
-executed on GitHub's merge candidate `6f212b1`. The plan resolved the
+[#359](https://github.com/coghex/hetoimasia/pull/359) at commit `1cd3c3f`,
+executed on GitHub's merge candidate `a6642f4`. The plan resolved the
 candidate's input identity as
-`a6d11e93c03425615a708fe8c98e24f4c31b4bb782143f13fee71f90ad0cf995`, under
-catalog policy version 23. The group passed in 4.673 s of its 30-second budget;
+`24e84bd58a620fbc0a1956545c001d787ce492a193dc7afd9d23758436007564`, under
+catalog policy version 23. The group passed in 4.473 s of its 30-second budget;
 its receipt, `test.vulkan-wayland.json`, and every private case's record are in
-that run's `validation-receipts-vulkan` artifact.
+that run's `validation-receipts-vulkan` artifact. An earlier run of the same
+case at `ac0b65c`, before review narrowed which step a hide waits for
+(run 36742775061), passed with the same VK-16 counts.
 
 Only this record, which is Markdown no group consumes, changes after that
 commit, so the run stays input-equivalent to the head it ships with:
-`plan.py --base ac0b65c --head HEAD` reports `test.vulkan-wayland` unaffected.
+`plan.py --base 1cd3c3f --head HEAD` reports `test.vulkan-wayland` unaffected.
 That has to be rechecked whenever the head moves for any other reason.
 
 ### Identity
@@ -535,12 +537,12 @@ That has to be rechecked whenever the head moves for any other reason.
 | Image digest | `sha256:71ef73f2fd6432b1b70bc96dc0ab7ded728091ad76232309c7e4ec58858603cb`, verified by the job before it ran anything |
 | Native manifest | `c074c480471ad2e58ccd309f18d24da736b7c61e6cf0ce92872f5b5c15287965` |
 | Compositor package | Ubuntu 24.04's `weston` `13.0.0-4build3`, which reports itself as `weston 13.0.0`, headless backend, offering no `wp_fifo_v1` |
-| Selected backend | `Wayland`, under the consent `isolated-wayland:hetoimasia-3305`, asserted by the shared session before any example rendered |
+| Selected backend | `Wayland`, under the consent `isolated-wayland:hetoimasia-2177`, asserted by the shared session before any example rendered |
 | Vulkan loader | `vulkan-loader` `1.3.275 e833b010f814` |
 | Vulkan driver | `vulkan-driver` `lvp 1.4.318 9d69cae2004b`: packaged Lavapipe, whose Wayland WSI throttles FIFO with frame callbacks there |
 | Validation layer | `vulkan-layers` `VK_LAYER_KHRONOS_validation 1.3.275 1d486283e4ce +synchronization`, with synchronization validation |
 | Toolchain | GHC 9.14.1, Cabal 3.18.1.0, `x86_64-linux`; `glslang` `15.1.0 96ea85d4228d`; `vulkan` `0a53afbd93d705f228556e9c4bbcacd4c1e0e79b1216b2c8f68458668d384a71` |
-| Sources | repository revision `6f212b17de2c3d061203ff2a06634d455cbe3fee`, source digest `d2f8653a79529dddce301ac5a9b74f2e44a016de95d242fca6317f6dc52be4bf`, as the runner printed them |
+| Sources | repository revision `a6642f482e8466f000cc82b463fda6c20b353413`, source digest `574f82589dae94bca81af78dd15c98cd7b5ff338e5c074030bff9daef4f71f4c`, as the runner printed them |
 
 The group's preparation and command were WL-4's, under the same `--toolchain`
 arguments:
@@ -560,16 +562,16 @@ VK-16's own record, from each run's evidence, beside the two regressions:
 
 | | Wayland (`test.vulkan-wayland`) | X11 (`test.vulkan-native`, same run) | Cocoa (owner's machine) |
 | --- | --- | --- | --- |
-| Revision | candidate `6f212b1` | candidate `6f212b1` | `ac0b65c` |
+| Revision | candidate `a6642f4` | candidate `a6642f4` | `1cd3c3f` |
 | Group outcome | 125 examples, 0 failures, 1 pending | 125 examples, 0 failures, 2 pending | 125 examples, 0 failures, 2 pending |
-| Frames before the hide (first, second) | (4, 4) | (3, 4) | (5, 5) |
+| Frames before the hide (first, second) | (4, 4) | (3, 4) | (4, 4) |
 | Hide settled as attempted, window observed hidden, target suspended | yes | yes | yes |
 | Frames while hidden (first, second) | (0, 3) | (0, 3) | (0, 3) |
 | First target's frames from the hide's settlement until the show | 0 | 0 | 0 |
 | First target's frames once shown again, after the show settled and the window was observed visible | 1 | 1 | 1 |
 | Swapchains created: one per window and the shown window's replacement | 3 | 3 | 3 |
-| Presentations made / retired on their own present fences | 16 / 16 | 13 / 13 | 15 / 15 |
-| Vulkan calls, and the threads they ran on | 295, one | 253, one | 323, one |
+| Presentations made / retired on their own present fences | 16 / 16 | 13 / 13 | 16 / 16 |
+| Vulkan calls, and the threads they ran on | 295, one | 253, one | 328, one |
 | Verdict issues, error reports | none, 0 | none, 0 | none, 0 |
 
 X11's and Cocoa's second pending example is `wayland-connection-loss`, which
@@ -597,14 +599,14 @@ with the log's timestamps and colour codes removed:
 
 ```text
 validation: running test.vulkan-wayland (affected) under a 30s budget: bash tools/display/wayland.sh -- bash tools/vulkan/run.sh native hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests -- --complete
-wayland.sh: compositor weston 13.0.0 on socket hetoimasia-3305 in runtime directory /tmp/hetoimasia-wayland.uhI6ua/runtime, DISPLAY and WAYLAND_SOCKET unset
+wayland.sh: compositor weston 13.0.0 on socket hetoimasia-2177 in runtime directory /tmp/hetoimasia-wayland.8gmp53/runtime, DISPLAY and WAYLAND_SOCKET unset
 vulkan: ghc 9.14.1, cabal 3.18.1.0
 vulkan: native prefix /opt/hetoimasia/native/glfw
 vulkan: VK_DRIVER_FILES=/opt/hetoimasia/native/glfw/vulkan/share/vulkan/icd.d/lvp_icd.json
 vulkan: VK_LAYER_PATH=/opt/hetoimasia/native/glfw/vulkan/share/vulkan/explicit_layer.d
 vulkan: validation features synchronization
-vulkan: repository revision 6f212b17de2c3d061203ff2a06634d455cbe3fee
-vulkan: source digest d2f8653a79529dddce301ac5a9b74f2e44a016de95d242fca6317f6dc52be4bf
+vulkan: repository revision a6642f482e8466f000cc82b463fda6c20b353413
+vulkan: source digest 574f82589dae94bca81af78dd15c98cd7b5ff338e5c074030bff9daef4f71f4c
 vulkan-native-tests: implicit-layer policy: VK_LOADER_LAYERS_DISABLE=~implicit~, so no implicit layer joins the chain and the explicit layers below are all of it
 vulkan-native-tests: layer settings: VK_LAYER_SETTINGS_PATH=/dev/null, so no settings file decides what the layer validates
 
@@ -766,29 +768,29 @@ Vulkan native
     records the native pump, the callbacks inside it, owner turns, and the graphics owner's present requests and present-fence completions while a person moves, resizes, and uses the menu bar [‐]
       # PENDING: the graphics-owner interaction probe runs only when HETOIMASIA_INTERACTION_PROBE_SECONDS names the seconds each phase lasts, and it needs a person at the desktop
 
-Finished in 3.7098 seconds
+Finished in 3.4027 seconds
 125 examples, 0 failures, 1 pending
 vulkan-native-tests: shared session acquisitions: 1
 vulkan-native-tests: shared session native calls: 193
 vulkan-native-tests: shared session destruction: vkDestroySurfaceKHR, vkDestroySurfaceKHR, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroySwapchainKHR, vkDestroySurfaceKHR, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroySwapchainKHR, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroySwapchainKHR, vkDestroySurfaceKHR, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroySwapchainKHR, vkDestroySurfaceKHR, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroySwapchainKHR, vkDestroySurfaceKHR, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroySwapchainKHR, vkDestroySurfaceKHR, vkDestroySurfaceKHR, vkDestroyDevice, vkDestroyDebugUtilsMessengerEXT, vkDestroyInstance
 vulkan-native-tests: shared session verdict: clean, 89 records delivered
-vulkan-native-tests: private debug-names: ExitSuccess in 9.2798591e-2s
-vulkan-native-tests: private synchronization-hazard: ExitSuccess in 8.5354488e-2s
-vulkan-native-tests: private vk11-recording: ExitSuccess in 8.9292432e-2s
-vulkan-native-tests: private vk12-frames: ExitSuccess in 9.0723539e-2s
-vulkan-native-tests: private vk13-presentation: ExitSuccess in 0.309492016s
-vulkan-native-tests: private vk14-recovery: ExitSuccess in 0.305432017s
-vulkan-native-tests: private vk15-retention: ExitSuccess in 8.0647902e-2s
-vulkan-native-tests: private vk15-validation-stop: ExitSuccess in 9.4111249e-2s
-vulkan-native-tests: private vk16-composed: ExitSuccess in 0.319380897s
-vulkan-native-tests: private vk17-one-slot: ExitSuccess in 0.175099963s
-vulkan-native-tests: private vk17-two-slots: ExitSuccess in 0.374216597s
-vulkan-native-tests: private vk19-capture: ExitSuccess in 0.119009177s
-vulkan-native-tests: private vk2-compatibility: ExitSuccess in 0.252024168s
-vulkan-native-tests: private vk5-bridge: ExitSuccess in 2.9225889e-2s
-vulkan-native-tests: private vk6-capture: ExitSuccess in 9.3064396e-2s
-vulkan-native-tests: private vk7-roots: ExitSuccess in 9.5396951e-2s
-vulkan-native-tests: private wayland-connection-loss: ExitSuccess in 0.303341732s
-vulkan-native-tests: the process ran for 3.729122393s, fixtures, examples and teardown included
-validation: test.vulkan-wayland passed after 4.7s (exit 0); receipt receipts/test.vulkan-wayland.json
+vulkan-native-tests: private debug-names: ExitSuccess in 9.3892314e-2s
+vulkan-native-tests: private synchronization-hazard: ExitSuccess in 8.7871116e-2s
+vulkan-native-tests: private vk11-recording: ExitSuccess in 9.5278589e-2s
+vulkan-native-tests: private vk12-frames: ExitSuccess in 9.4116912e-2s
+vulkan-native-tests: private vk13-presentation: ExitSuccess in 0.304684684s
+vulkan-native-tests: private vk14-recovery: ExitSuccess in 0.305319399s
+vulkan-native-tests: private vk15-retention: ExitSuccess in 8.0869606e-2s
+vulkan-native-tests: private vk15-validation-stop: ExitSuccess in 9.4009019e-2s
+vulkan-native-tests: private vk16-composed: ExitSuccess in 0.319354051s
+vulkan-native-tests: private vk17-one-slot: ExitSuccess in 0.150402995s
+vulkan-native-tests: private vk17-two-slots: ExitSuccess in 0.179391506s
+vulkan-native-tests: private vk19-capture: ExitSuccess in 0.115500093s
+vulkan-native-tests: private vk2-compatibility: ExitSuccess in 0.253164305s
+vulkan-native-tests: private vk5-bridge: ExitSuccess in 2.7538035e-2s
+vulkan-native-tests: private vk6-capture: ExitSuccess in 8.8852647e-2s
+vulkan-native-tests: private vk7-roots: ExitSuccess in 9.8298647e-2s
+vulkan-native-tests: private wayland-connection-loss: ExitSuccess in 0.312794804s
+vulkan-native-tests: the process ran for 3.428806328s, fixtures, examples and teardown included
+validation: test.vulkan-wayland passed after 4.5s (exit 0); receipt receipts/test.vulkan-wayland.json
 ```
