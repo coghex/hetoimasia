@@ -4,7 +4,9 @@
 module Test.Math.Projection (spec) where
 
 import Control.Monad (forM_)
-import Hetoimasia.Math.Matrix (Index (..), M44, apply, element)
+import qualified Data.List as List
+import Data.Maybe (isNothing)
+import Hetoimasia.Math.Matrix (Index (..), M44, apply, element, toColumnMajor)
 import Hetoimasia.Math.Projection
   ( ClipY (..)
   , DepthRange (..)
@@ -13,9 +15,9 @@ import Hetoimasia.Math.Projection
   , perspective
   )
 import Hetoimasia.Math.Transform (translation)
-import Hetoimasia.Math.Vector (V3 (..), V4 (..), add, cross, norm, sub)
-import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
-import Test.Hspec.QuickCheck (prop)
+import Hetoimasia.Math.Vector (V3 (..), V4 (..), add, cross, norm, scale, sub)
+import Test.Hspec (Expectation, Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
+import Test.Hspec.QuickCheck (modifyMaxSuccess, prop)
 import Test.Math.Support
   ( approx
   , approxM44
@@ -31,6 +33,7 @@ import Test.QuickCheck
   , Testable
   , choose
   , counterexample
+  , frequency
   , forAll
   , property
   , suchThat
@@ -77,6 +80,20 @@ spec = describe "Projection" $ do
       lookAt (V3 (0 / 0) 0 5) (V3 0 0 0) (V3 0 1 0) `shouldBe` Nothing
       lookAt (V3 0 0 5) (V3 0 (1 / 0) 0) (V3 0 1 0) `shouldBe` Nothing
       lookAt (V3 0 0 5) (V3 0 0 0) (V3 0 (1 / 0) 0) `shouldBe` Nothing
+
+    it "accepts a view whose translations cancel within the largest Float" $
+      matchesReference (V3 3.0e38 3.0e38 3.0e38) (V3 2.3333334e38 3.3333333e38 2.3333334e38) (V3 (-1) 2 2)
+
+    it "accepts a view whose eye and target are further apart than the largest Float" $
+      case lookAt (V3 0 0 2.0e38) (V3 0 0 (-2.0e38)) (V3 0 1 0) of
+        Nothing → expectationFailure "lookAt returned Nothing"
+        Just view → shouldApproximate approxM44 view (translation (V3 0 0 (-2.0e38)))
+
+    -- A thousand cases rather than the default hundred: overflow-prone scenes
+    -- are a minority of those generated.
+    modifyMaxSuccess (max 1000) $
+      prop "agrees with a double-precision reference at any scale" $
+        forAll scaledScene $ \(eye, target, up) → agreesWithReference eye target up
 
     prop "never returns a non-finite matrix" $
       forAll extremeVector3 $ \eye → forAll extremeVector3 $ \target → forAll extremeVector3 $ \up →
@@ -167,6 +184,79 @@ scene = do
   up ← vector3 `suchThat` \u →
     norm u >= 0.01 && norm (direction `cross` u) >= 0.1 * norm direction * norm u
   pure (eye, target, up)
+
+-- | A 'scene' scaled by a mantissa in @[1, 3.3]@ times a power of ten in
+-- @[1e-30, 1e36]@, half the time in @[1e35, 1e36]@, where coordinates approach
+-- the largest @Float@: there the difference between the eye and the target, a
+-- translation's partial sums, or the translation itself can overflow.
+scaledScene ∷ Gen (V3, V3, V3)
+scaledScene = do
+  (eye, target, up) ← scene
+  mantissa ← choose (1, 3.3)
+  exponent' ← frequency [(1, choose (-30, 36 ∷ Int)), (1, choose (35, 36))]
+  let factor = mantissa * 10 ^^ exponent'
+  pure (scale factor eye, scale factor target, scale factor up)
+
+-- | The view matrix computed in @Double@, as its sixteen elements column by
+-- column. @Double@ holds every intermediate a @Float@ scene produces without
+-- overflow, so it tells a representable view from one that is not.
+referenceView ∷ V3 → V3 → V3 → [Double]
+referenceView eye target up =
+  concat (List.transpose [translated side, translated upward, facing, [0, 0, 0, 1]])
+  where
+    e = wide eye
+    forward = unit (wide target `minus` e)
+    side = unit (forward `crossD` unit (wide up))
+    upward = side `crossD` forward
+    translated (x, y, z) = [x, y, z, negate (dotD (x, y, z) e)]
+    facing = let (x, y, z) = forward in [negate x, negate y, negate z, dotD forward e]
+    wide (V3 x y z) = (realToFrac x, realToFrac y, realToFrac z)
+    minus (a, b, c) (x, y, z) = (a - x, b - y, c - z)
+    dotD (a, b, c) (x, y, z) = a * x + b * y + c * z
+    crossD (a, b, c) (x, y, z) = (b * z - c * y, c * x - a * z, a * y - b * x)
+    unit v@(x, y, z) = let n = sqrt (dotD v v) in (x / n, y / n, z / n)
+
+-- | 'lookAt' agrees with 'referenceView': a view whose reference elements all
+-- lie well inside @Float@'s range must be returned and match it, one with an
+-- element well outside must be 'Nothing', and near the boundary either is
+-- acceptable.
+agreesWithReference ∷ V3 → V3 → V3 → Property
+agreesWithReference eye target up
+  | all (\x → abs x <= 0.99 * largest) reference = case lookAt eye target up of
+      Nothing → counterexample ("no view; reference " <> show reference) False
+      Just view →
+        let wrong = mismatches eye view reference
+         in counterexample (show view <> "\nmismatched " <> show wrong) (null wrong)
+  | any (\x → abs x > 1.01 * largest) reference =
+      counterexample "an unrepresentable view was returned" (isNothing (lookAt eye target up))
+  | otherwise = property True
+  where
+    reference = referenceView eye target up
+    largest = realToFrac (3.4028235e38 ∷ Float)
+
+-- | The view exists and agrees with 'referenceView'.
+matchesReference ∷ V3 → V3 → V3 → Expectation
+matchesReference eye target up = case lookAt eye target up of
+  Nothing → expectationFailure "lookAt returned Nothing"
+  Just view → do
+    view `shouldSatisfy` finiteM44
+    mismatches eye view (referenceView eye target up) `shouldBe` []
+
+-- | The elements of a view, by column-major position, that differ from the
+-- reference by more than @1e-4@, or, for the three translations, by more than
+-- @1e-4@ of the eye's distance from the origin: the scale their rounding grows
+-- with.
+mismatches ∷ V3 → M44 → [Double] → [(Int, Float, Double)]
+mismatches eye view reference =
+  [ (index, actual, expected)
+  | (index, actual, expected) ← zip3 [0 ..] (toColumnMajor view) reference
+  , abs (realToFrac actual - expected) > tolerance index
+  ]
+  where
+    tolerance index
+      | index >= 12 && index < 15 = 1e-4 * max 1 distance
+      | otherwise = 1e-4
+    distance = let V3 x y z = eye in sqrt (sum [realToFrac c * realToFrac c | c ← [x, y, z]])
 
 -- | A frustum in the ordinary domain: a field of view in @[0.1, 3]@, an
 -- aspect ratio in @[0.1, 10]@, a near plane in @[0.01, 10]@, and a far plane

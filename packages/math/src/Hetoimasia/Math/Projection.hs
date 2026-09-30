@@ -31,9 +31,9 @@ module Hetoimasia.Math.Projection
   , perspective
   ) where
 
-import Hetoimasia.Math.Internal.Finite (allFinite)
+import Hetoimasia.Math.Internal.Finite (allFinite, finite)
 import Hetoimasia.Math.Matrix (M44, fromRows, toColumnMajor)
-import Hetoimasia.Math.Vector (V3 (..), V4 (..), cross, dot, norm, normalize, sub)
+import Hetoimasia.Math.Vector (V3 (..), V4 (..), cross, dot, norm, normalize, scale, sub)
 
 -- | The view matrix of an eye at @eye@ looking toward @target@, with @up@
 -- choosing which way is up: @lookAt eye target up@.
@@ -46,9 +46,13 @@ import Hetoimasia.Math.Vector (V3 (..), V4 (..), cross, dot, norm, normalize, su
 -- parallel to the view direction (either way along it), or when an input or the
 -- result is not finite. Parallel means the sine of the angle between them is
 -- below 'parallelTolerance'.
+--
+-- No intermediate overflow rejects a view whose matrix is representable: the
+-- view direction and the translations are recomputed from halved points where
+-- the direct calculation overflows.
 lookAt ∷ V3 → V3 → V3 → Maybe M44
 lookAt eye target up = do
-  forward ← normalize (target `sub` eye)
+  forward ← normalize (viewDirection eye target)
   upward ← normalize up
   let side = forward `cross` upward
   if norm side < parallelTolerance
@@ -59,11 +63,34 @@ lookAt eye target up = do
           V3 fx fy fz = forward
           matrix =
             fromRows
-              (V4 sx sy sz (negate (V3 sx sy sz `dot` eye)))
-              (V4 ux uy uz (negate (V3 ux uy uz `dot` eye)))
-              (V4 (negate fx) (negate fy) (negate fz) (forward `dot` eye))
+              (V4 sx sy sz (negate (V3 sx sy sz `onto` eye)))
+              (V4 ux uy uz (negate (V3 ux uy uz `onto` eye)))
+              (V4 (negate fx) (negate fy) (negate fz) (forward `onto` eye))
               (V4 0 0 0 1)
       checked matrix
+
+-- | A vector along @target − eye@: the difference itself, or, where that
+-- overflows, the difference of the halved points. Only its direction is used,
+-- and the halves of two finite points are at most the largest @Float@ apart,
+-- so the second is finite whenever both points are.
+viewDirection ∷ V3 → V3 → V3
+viewDirection eye target
+  | allFinite (components full) = full
+  | otherwise = scale 0.5 target `sub` scale 0.5 eye
+  where
+    full = target `sub` eye
+    components (V3 x y z) = [x, y, z]
+
+-- | The dot product of a unit axis with a point. Where a partial sum
+-- overflows although the terms may cancel, it is recomputed over the halved
+-- point, whose partial sums stay below the largest @Float@, and doubled; the
+-- doubling overflows only when the product itself is not representable.
+onto ∷ V3 → V3 → Float
+onto axis point
+  | finite direct = direct
+  | otherwise = 2 * (axis `dot` scale 0.5 point)
+  where
+    direct = axis `dot` point
 
 -- | The sine of the smallest angle between a look-at's view direction and its
 -- up vector: @1e-5@, about two thousandths of a degree. Closer than this and

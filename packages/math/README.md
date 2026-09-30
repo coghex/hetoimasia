@@ -55,7 +55,10 @@ input, when the result it would calculate is not finite, and in these cases:
 
 `normalize` divides by the largest component magnitude before taking the
 length, so a vector whose squared length would overflow or underflow still
-normalizes. A rotation's axis need not be unit length.
+normalizes. A rotation's axis need not be unit length. `lookAt` and
+`perspective` likewise arrange their intermediates so that none overflows
+unless an element of the matrix itself would: for a finite, non-degenerate
+input they return `Nothing` only when the result cannot be represented.
 
 Everything else — `add`, `sub`, `scale`, `dot`, `cross`, `norm`, the matrix
 operations, `translation` and `scaling` — is ordinary IEEE `Float` arithmetic:
