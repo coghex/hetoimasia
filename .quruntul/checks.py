@@ -148,6 +148,7 @@ class AdapterChecks(unittest.TestCase):
     def test_vulkan_native_launches_through_its_runner_with_provenance(self):
         adapter = self.module.adapter()
         adapter._toolchain = lambda checkout: PINNED
+        adapter._fingerprints = lambda checkout: []
         adapter._discovery = lambda checkout, build_dir: {"HETOIMASIA_VULKAN_LIBDIR": "/l", "HETOIMASIA_VULKAN_INCLUDEDIR": "/i"}
         adapter._list_bin = lambda checkout, flags, component, environment: sys.executable
         adapter._tools = lambda checkout, component: []
@@ -168,6 +169,7 @@ class AdapterChecks(unittest.TestCase):
     def test_a_declared_group_preparation_is_the_build(self):
         adapter = self.module.adapter()
         adapter._toolchain = lambda checkout: PINNED
+        adapter._fingerprints = lambda checkout: []
         adapter._discovery = lambda checkout, build_dir: {"HETOIMASIA_VULKAN_LIBDIR": "/l", "HETOIMASIA_VULKAN_INCLUDEDIR": "/i"}
         adapter._list_bin = lambda checkout, flags, component, environment: sys.executable
         adapter._tools = lambda checkout, component: []
@@ -237,6 +239,7 @@ class AdapterChecks(unittest.TestCase):
     def test_desktop_consent_is_per_command_on_macos_and_an_isolated_display_on_linux(self):
         adapter = self.module.adapter()
         adapter._toolchain = lambda checkout: PINNED
+        adapter._fingerprints = lambda checkout: []
         adapter._discovery = lambda checkout, build_dir: {"HETOIMASIA_VULKAN_LIBDIR": "/l", "HETOIMASIA_VULKAN_INCLUDEDIR": "/i"}
         adapter._list_bin = lambda checkout, flags, component, environment: sys.executable
         adapter._tools = lambda checkout, component: []
@@ -264,6 +267,7 @@ class AdapterChecks(unittest.TestCase):
     def test_every_build_and_trial_runs_on_the_qualified_toolchain(self):
         adapter = self.module.adapter()
         adapter._toolchain = lambda checkout: PINNED
+        adapter._fingerprints = lambda checkout: []
         adapter._discovery = lambda checkout, build_dir: {"HETOIMASIA_VULKAN_LIBDIR": "/l", "HETOIMASIA_VULKAN_INCLUDEDIR": "/i"}
         listed = []
         adapter._list_bin = lambda checkout, flags, component, environment: listed.append(environment) or sys.executable
@@ -315,6 +319,37 @@ class AdapterChecks(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, r"ghc on PATH is 0\.0\.0 and no ghc-"):
                     self.module.Hetoimasia._toolchain(ROOT)
             self.assertFalse((Path(scratch) / "hetoimasia").exists())
+
+    def test_vulkan_builds_keep_the_shader_fingerprints_run_sh_generates(self):
+        declared = self.module.Hetoimasia._fingerprints(ROOT)
+        runner = (ROOT / "tools" / "vulkan" / "run.sh").read_text()
+        self.assertTrue(declared)
+        for path in declared:
+            relative = str(path.relative_to(ROOT))
+            self.assertIn(f'"{relative}"', runner)
+            # Ignored, so a kept fingerprint never makes quruntul's checkout dirty.
+            ignored = subprocess.run(["git", "check-ignore", "-q", relative], cwd=ROOT)
+            self.assertEqual(ignored.returncode, 0, relative)
+        with tempfile.TemporaryDirectory() as scratch:
+            fingerprints = [Path(scratch) / "a" / "shaders" / "toolchain.fingerprint",
+                            Path(scratch) / "b" / "shaders" / "toolchain.fingerprint"]
+            adapter = self.module.adapter()
+            adapter._toolchain = lambda checkout: PINNED
+            adapter._fingerprints = lambda checkout: fingerprints
+            adapter._discovery = lambda checkout, build_dir: {"HETOIMASIA_VULKAN_LIBDIR": "/l", "HETOIMASIA_VULKAN_INCLUDEDIR": "/i"}
+            adapter._list_bin = lambda checkout, flags, component, environment: sys.executable
+            adapter._tools = lambda checkout, component: []
+            for suite in self.suites.values():
+                ctx = Context()
+                existed = []
+                ctx.run = lambda argv, name, timeout, cwd=None, environment=None: (
+                    existed.append(all(f.is_file() for f in fingerprints))
+                    or dict(outcome="passed", log="/dev/null", command=argv))
+                for fingerprint in fingerprints:
+                    fingerprint.unlink(missing_ok=True)
+                adapter.prepare(ctx, suite)
+                # run.sh keeps a fingerprint it did not create, so each exists before a Vulkan build.
+                self.assertEqual(existed, [suite.data["route"] == "vulkan"], suite.id)
 
     def test_the_adapter_imports_nothing_from_quruntul(self):
         tree = ast.parse((ROOT / ".quruntul" / "adapter.py").read_text())
