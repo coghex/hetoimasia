@@ -76,7 +76,7 @@ import Hetoimasia.GLFW.Vulkan (withLoaderIntegration)
 import Hetoimasia.GLFW.Window (WindowConfig (..), hiddenTestWindowConfig)
 import Hetoimasia.GPU.Model.Budget (defaultBudgetRequest, validateBudgets)
 import Hetoimasia.GPU.Model.Identity (TargetClass (..))
-import Hetoimasia.GPU.Vulkan.Diagnostics (CaptureConfig (..), DiagnosticVerdict (..), defaultCaptureConfig, verdictIssues)
+import Hetoimasia.GPU.Vulkan.Diagnostics (CaptureConfig (..), DiagnosticVerdict (..), defaultCaptureConfig, diagnosticVerdict, verdictIssues)
 import Hetoimasia.GPU.Vulkan.GLFW
   ( FrameEvent (..)
   , Readiness (..)
@@ -183,7 +183,9 @@ session journal compositor = do
           vulkanWindowHost
           (\vulkan _ → pure vulkan)
           (\vulkan control → body vulkan control recorded events lossHeld)
-  verdict ← readIORef verdictHeld
+  -- The host returns its verdict only when it returns; a host the loss ended
+  -- attaches it to the failure instead.
+  verdict ← maybe (either diagnosticVerdict (const Nothing) outcome) Just <$> readIORef verdictHeld
   calls ← reverse <$> readIORef recorded
   entries ← readTVarIO logged
   seen ← reverse <$> readTVarIO events
