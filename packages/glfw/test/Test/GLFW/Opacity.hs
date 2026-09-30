@@ -171,6 +171,20 @@ spec = describe "GLFW session opacity across the package boundary" $ do
       clientOutput outcome `shouldContain` "hetoimasia-glfw"
       clientOutput outcome `shouldNotContain` "cannot satisfy"
 
+  it "rejects a client that reaches for the window model's split implementation modules" $
+    withClient "Client.hs" windowPartsClient $ \compile → do
+      outcome ← compile Typecheck
+      case clientStatus outcome of
+        ExitFailure _ → pure ()
+        ExitSuccess →
+          expectationFailure
+            ("the client compiled, so the window model's implementation modules are reachable:\n" <> clientOutput outcome)
+      -- Each is found in the built package and refused as private, not missing.
+      for_ windowPartModules $ \name → clientOutput outcome `shouldContain` name
+      clientOutput outcome `shouldContain` "hidden package"
+      clientOutput outcome `shouldContain` "hetoimasia-glfw"
+      clientOutput outcome `shouldNotContain` "cannot satisfy"
+
   it "rejects a client that closes a window's observations through its read endpoint" $
     withClient "Client.hs" publisherClient $ \compile → do
       outcome ← compile Typecheck
@@ -1462,6 +1476,29 @@ windowInternalsClient =
     , "handleOf ∷ Window → Ptr NativeWindow"
     , "handleOf = windowNativeHandle"
     ]
+
+-- | A client importing the window model's private parts directly: the window
+-- handle's representation, the identity's issuer, and the reconciliation
+-- protocol.
+windowPartsClient ∷ String
+windowPartsClient =
+  unlines
+    [ "module Client (Parts) where"
+    , ""
+    , "import Hetoimasia.GLFW.Internal.Window.Identity (issuedWindowId)"
+    , "import Hetoimasia.GLFW.Internal.Window.Reconcile (reconcileAdjusted)"
+    , "import Hetoimasia.GLFW.Internal.Window.State (Window (..))"
+    , ""
+    , "data Parts = Parts"
+    ]
+
+-- | The modules 'windowPartsClient' imports, each of which must be refused.
+windowPartModules ∷ [String]
+windowPartModules =
+  [ "Hetoimasia.GLFW.Internal.Window.Identity"
+  , "Hetoimasia.GLFW.Internal.Window.Reconcile"
+  , "Hetoimasia.GLFW.Internal.Window.State"
+  ]
 
 -- | A client trying to end a window's observations, which needs the publisher
 -- endpoint the package never hands out.
