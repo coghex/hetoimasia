@@ -85,6 +85,19 @@ target's exhaustion fails the session through the terminal latch, and
 device-loss teardown across submitted work and pending presentations is the
 frames' own ([Terminal failure](#terminal-failure)).
 
+GRS-15 ([#336](https://github.com/coghex/hetoimasia/issues/336)) of
+[the GPU resource services design](designs/gpu_resource_services_design.md)
+lets a session **start its device without a window**: an opt-in host setting,
+`DeviceSurfaceFree`, has the owner's startup select and create the device
+against no surface, and a window handed over later is admitted only if the
+chosen queue family presents to it. A session with no target — one that never
+had a window, or whose windows have all closed — keeps making owner progress
+and retires through the same protected exit. And a consumer on any thread can
+hand the owner a bounded **owner-thread action**, run on the owner's thread
+with the session's `Construction`, with or without targets. D-6, D-12 and D-28
+of that design. See
+[Surface-free sessions and owner-thread actions](#surface-free-sessions-and-owner-thread-actions).
+
 ## Packages
 
 | Package | Location | Holds | Depends on |
@@ -149,20 +162,32 @@ and its surface recovery, the generations' `Surface` (see
                                ├─ instance ◀─ lease (surface bridge)
                                │    ├─ explicit messenger
                                │    ├─ device (one, shared, selected against the
-                               │    │          first target's surface)
+                               │    │          first target's surface — or, for a
+                               │    │          surface-free start, against none)
                                │    └─ target surfaces, one record per target,
                                │         keyed by the model's TargetId
                                │           └─ swapchain generations, keyed by
                                │              GenerationId: each swapchain, its
                                │              images and their views
                                └─ GPU model (identities, the session's state)
+                           ├─ recording (managed resources: the consumer's
+                           │    pipelines and layouts, frame storages)
+                           └─ owner-thread actions (bounded queue; each run
+                                once on the owner's thread, lent the
+                                recording's Construction)
 ```
 
 - **The instance, its explicit messenger and the device belong to the roots**,
   for the session. No target owns the device or gates its lifetime —
   including the bootstrap target, whose surface the device was selected
   against — so closing the first-created window cannot release a device
-  another target is using (D-7).
+  another target is using (D-7). A surface-free session's device has no
+  bootstrap target at all, and a session with no target still holds it until
+  whole-owner retirement.
+- **An owner-thread action's standing belongs to the controller's queue**
+  from admission until it is settled; what the action constructs belongs to
+  the recording, as the renderer's constructions do, whatever becomes of the
+  action.
 - **Each admitted target's surface belongs to the roots** from admission until
   its retirement destroys it. Each target record carries the model's
   `TargetId`, the application's required or optional designation (D-22), the
@@ -213,7 +238,10 @@ the instance layers to enable (each must be offered by the loader), the model's
 budgets, the owner's initial scene, an adjustment to the owner's configuration,
 a `NativeObserver`: something that wraps every native call the controller
 makes — the recording's and the frames' included — for evidence, a
-`VulkanRenderer`, and a `FrameObserver`. The observer must run each call once
+`VulkanRenderer`, a `FrameObserver`, when the device is created
+(`vulkanDeviceStart`: `DeviceAtFirstSurface`, the default, or
+`DeviceSurfaceFree`), and how many owner-thread actions may be queued at once
+(`vulkanActionCapacity`, `defaultActionCapacity` — 64 — by default). The observer must run each call once
 and answer what it answered; it decides nothing, and the default observes
 nothing. The renderer records one frame of the scene between the controller's
 transitions into rendering and to presentation, with the session's managed
@@ -246,6 +274,8 @@ suites can capture.
 | Reporting a swapchain call's out-of-date, suboptimal or surface-lost result | The graphics owner, whose acquisitions and presentations produce it |
 | Destroying a lost surface, rechecking a replacement's support, a reclamation pass | The graphics owner |
 | Creating a replacement surface under a target's existing attachment (`replaceVulkanSurfaces`) | The main thread: `runVulkanOwnerLoop` does it every turn |
+| Submitting an owner-thread action (`submitVulkanAction`) and reading or awaiting its outcome | Any thread, in `STM` |
+| Running an owner-thread action, and everything it constructs or releases | The graphics owner, in its step, never beside a frame's rendering |
 
 The controller makes no GLFW call. A surface is destroyed through the loader
 capability's `vkDestroySurfaceKHR`, a Vulkan call, by the thread that holds its
@@ -261,6 +291,9 @@ against what the loader offers, creates the instance with the capture's
 messenger chained into its create info, creates the explicit messenger, and
 leases the instance to the surface bridge. `readReadiness` answers
 `RootsReady` from then on, and an application hands windows over only after it.
+A host configured with `DeviceSurfaceFree` also creates the device in that
+startup, between the messenger and the lease, so `RootsReady` then means a
+device exists too ([Surface-free bootstrap](#surface-free-bootstrap)).
 
 The instance plan (`planInstance`) asks for Vulkan 1.3, the window system's
 surface extensions, `VK_EXT_debug_utils`, `VK_KHR_get_surface_capabilities2`
@@ -318,7 +351,8 @@ application's checkpoints like any other owner failure.
 
 The owner's construction takes the deposit:
 
-- **A live surface** is offered to the roots. The first one is the bootstrap:
+- **A live surface** is offered to the roots. Without a device, the first one
+  is the bootstrap:
   every physical device is queried with each queue family's presentation
   support for that surface, `selectDevice` takes the first satisfying the
   profile — Vulkan 1.3, `dynamicRendering`, `synchronization2`,
@@ -329,7 +363,8 @@ The owner's construction takes the deposit:
   it. No satisfying device is `NoCompatibleDevice`, naming every candidate
   and everything each lacks: a structured startup failure, fatal to the owner,
   whose drain destroys the surface, the messenger and the instance.
-- **A later surface** is checked against the session's queue family with
+- **A later surface** — every surface, once a surface-free start has created
+  the device — is checked against the session's queue family with
   `vkGetPhysicalDeviceSurfaceSupportKHR`. One it cannot present to is rejected
   with `TargetSurfaceUnsupported`: its surface is destroyed there and then, on
   the owner's thread, the target settles as a verified rollback, and the
@@ -1888,8 +1923,9 @@ storages are released and destroyed, then its generations, then its surface.
 An owed retirement certifies nothing; the attachment's terminal record is
 written only by the retirement's own return, exactly as before.
 
-Whole-owner retirement retires the recording — releasing and destroying every
-managed resource still live — before the device is destroyed.
+Whole-owner retirement refuses every owner-thread action still queued, then
+retires the recording — releasing and destroying every managed resource still
+live — before the device is destroyed.
 
 ### Status
 
@@ -1926,7 +1962,11 @@ timeout ends that wait, because a timeout is not evidence, and a cancellation
 ends it by leaving what is still owed with the owner, unverified, and naming it
 to whole-owner retirement. Nothing waits for a command from the ended loop: a
 window command submitted once the loop has ended is answered by the host's
-quiescence, never left waiting.
+quiescence, never left waiting. Nor does anything wait for an owner-thread
+action the exit will never run: quiescence's closing of the owner's
+publications is also what refuses every queued action that has not started,
+before ordinary workers drain, so a worker awaiting one is answered and can
+drain ([Owner-thread actions](#owner-thread-actions)).
 
 ### During a main-thread stall
 
@@ -1959,13 +1999,162 @@ states what was measured and what was not.
 | `Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering` | The recording and the frames above the generations, what asks a target for a frame, one frame's attempt, completion polls, the rendering deadline, and a target's retirement readiness and rendering retirement |
 | `Hetoimasia.GPU.Vulkan.GLFW.Internal.Loop` | The adapter: one turn's handoffs, the deadline fold, and `runVulkanOwnerLoop` |
 | `Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller` | Wires both into the owner's step, its deadline, its wake and its retirements |
+| `Hetoimasia.GPU.Vulkan.GLFW.Internal.Actions` | The owner-thread actions' bounded queue, their tickets and standing, admission and start against the gate, and refusal of what is left |
+
+## Surface-free sessions and owner-thread actions
+
+GRS-15 ([#336](https://github.com/coghex/hetoimasia/issues/336)) delivers
+[D-28](designs/gpu_resource_services_design.md#d-28-the-device-can-start-without-a-window-inside-the-existing-owner):
+offscreen and upload work runs without a window inside the existing
+GLFW-hosted graphics owner, not a second, headless one. On Linux the host
+still runs under a display — the native suite's isolated X11 display — because
+GLFW's session needs one; running without a display server is out of scope.
+
+### The setting
+
+`vulkanDeviceStart` in `VulkanHostConfig` says when the session's one device
+is created:
+
+- **`DeviceAtFirstSurface`**, the default, is every windowed application's
+  selection, unchanged: the device is selected against the first window
+  surface handed over and created at its admission
+  ([Admitting targets](#admitting-targets)). The triangle sample keeps it.
+- **`DeviceSurfaceFree`** creates the device in the owner's startup, before any
+  window and against no surface.
+
+Either way it is the session's only device. No setting creates a second one,
+and adapter preference among several compatible devices is not decided here
+(the first compatible device in enumeration order is taken, as before).
+
+### Surface-free bootstrap
+
+The owner's startup creates the instance and its explicit messenger as
+always, then — before it leases the instance to the surface bridge — the roots'
+`startRootsDevice`:
+
+1. every physical device is enumerated **with no surface-support query**
+   (`opsDeviceOffers` is given no bootstrap surface, and answers every queue
+   family as not presenting);
+2. `selectSurfaceFreeDevice` takes the first device satisfying the whole
+   profile except the presentation requirement: Vulkan 1.3,
+   `dynamicRendering`, `synchronization2`, `VK_KHR_swapchain`,
+   `VK_EXT_swapchain_maintenance1` and its `swapchainMaintenance1` feature,
+   `VK_KHR_portability_subset` where advertised, and one queue family that
+   answers graphics. Dropping only presentation keeps every extension and
+   feature a later swapchain needs, so the device can still present once a
+   surface arrives;
+3. the device is created with that family's one queue, recorded in the same
+   masked step, and it and its queue are named, exactly as at a first
+   admission ([Names and labels](#names-and-labels)).
+
+No satisfying device is `NoCompatibleDevice`, naming every candidate and what
+each lacks — `DeviceNoGraphicsFamily` when no family answers graphics — a
+structured startup failure, fatal to the owner, having created no device; the
+owner's drain destroys the messenger and the instance. `readReadiness` then
+answers `RootsFailed`. A session whose failure was latched before the device
+could be created raises that primary instead of creating anything.
+
+### Later admission
+
+Once a surface-free start has created the device, every window handed over is
+a later target: its surface is checked against the chosen queue family with
+`vkGetPhysicalDeviceSurfaceSupportKHR`, admitted if that family presents to
+it, and otherwise rolled back with `TargetSurfaceUnsupported`, destroyed on
+the owner's thread, exactly as any later target is today. No second device
+and no second queue is ever created (D-7).
+
+### Zero-target progress
+
+A session with zero targets — one that never had a window, or whose windows
+have all closed — keeps making owner progress until the application ends it.
+The owner offers its step every round, whatever its targets, and a round comes
+when something wakes it or its own deadline does: the model's completion-poll
+schedule, a released resource's disposal, an admitted owner-thread action. In
+that step completion is polled when the model's schedule says a poll is due,
+and every released managed resource nothing still holds is destroyed
+(`reclaimReleased`). It records no frame and needs no render demand: nothing
+asks a frame of a session with no target. When nothing is owed it names no
+deadline and sleeps until woken; it never polls without cause.
+
+It retires through the same protected exit as a windowed session
+([Destruction order](#destruction-order)): with no target to retire,
+whole-owner retirement refuses what is still queued, disposes of every managed
+resource, and destroys the device, and whole-owner destruction then destroys
+the messenger and the instance, keeping the primary failure, if there was
+one, and the teardown evidence beside it.
+
+### Owner-thread actions
+
+`submitVulkanAction` hands the graphics owner a `VulkanAction`: bounded work,
+run once on the owner's thread and lent the session's `Construction` — the
+same one each frame's renderer is lent
+([Consumer construction](#consumer-construction)) — whose result the caller
+takes back from the `ActionTicket` it is given, with `readVulkanAction` or
+`awaitVulkanAction`. It works with or without targets. GRS-12 extends it with
+frame-less batch recording.
+
+- **Admission** is one `STM` transaction that never waits. It refuses at
+  once, with the reason, when the session has failed (`ActionSessionFailed`,
+  with its primary), when the owner's admission has closed — its exit has
+  begun, or its run has ended (`ActionOwnerClosed`) — when no device exists
+  yet (`ActionDeviceNotReady`: under `DeviceAtFirstSurface`, until the first
+  window is admitted; nothing is created for it and it is never held until a
+  device exists), and when the queue already holds `vulkanActionCapacity`
+  actions (`ActionQueueFull`). Waiting for the outcome is the caller's
+  explicit choice. Admission wakes an idle owner without any window event or
+  render demand: the queue is part of the owner's wake, except while a
+  diagnostic failure is pending, when the owner looks again within its poll.
+- **Running.** The owner's step, after its checkpoint, runs the actions queued
+  when the step began before anything else it does, one at a time; the rest of
+  the step — completion polls, reclamation, frames — follows in the same round.
+  So an action never runs concurrently with a frame's rendering, and what it
+  releases is reclaimed by that same step when nothing holds it. An action
+  admitted meanwhile waits for the next round, which its admission asks for.
+- **Start and exit.** Each action is started in one transaction that asks the
+  same gate admission asks: once the session has failed or the owner's
+  admission has closed, a queued action is refused (`ActionRefused`) and never
+  runs. A caller reading its ticket asks that gate too, and settles a queued
+  action the gate refuses there and then, so quiescence — which closes the
+  owner's admission before ordinary workers drain
+  ([Stop and quiescence](#stop-and-quiescence)) — answers every waiting worker
+  at once, without waiting for the owner. Exactly one of the two decides:
+  every admitted action receives a settled outcome or a refusal. An action
+  already running finishes, keeping what it borrowed until it returns.
+  Whole-owner retirement refuses whatever is still queued.
+- **Failure.** An action that raises answers `ActionRaised` with what it
+  raised, and the owner goes on; whatever it constructed before it raised is a
+  managed resource of the session, released and destroyed as the renderer's
+  are. It is never run again. What the owner's run must end with is raised on
+  after the ticket is settled, exactly as a renderer's would end it: a
+  cancellation of the owner; a construction whose failure escaped it — one
+  that committed a generation, or that raised because the session latched a
+  failure, such as the device's loss — which the construction records as it
+  raises; and a failure the session latched meanwhile, raised as its primary
+  as the step's own checkpoint raises it. None clears the terminal latch.
+- **Cooperation.** An action is a cooperative, finite callback. The owner does
+  nothing else while it runs, so it must not wait for work that needs the same
+  owner — another action's outcome, a frame, a handover — which could only
+  come after it returns. `Construction` calls from any other thread are
+  refused (`RefusedNotOwner`), as they are for the renderer.
+
+The headless examples cover each case over the scripted seam — surface-free
+startup and teardown order with no window, later admission and refusal, an
+action on the owner's thread returning its result, the default setting's
+device-not-ready refusal, the full queue's immediate refusal, a raising
+action's failure and its retained resources, a construction's device loss
+ending the owner, refusal after terminal failure and after exit begins
+(including one queued behind a running action), serialization with frames,
+zero-target disposal with no target and after the last target closes, and an
+idle session with no target naming no deadline until an action wakes it;
+the native suite's `grs15-surface-free` and `grs15-surface-free-window` run
+them against the device ([The native suite](#the-native-suite)).
 
 ## Destruction order
 
 | Exit | What is destroyed, in order, on the owner's thread |
 | --- | --- |
 | A window closed or a target released | That target's swapchain generations — each one's image views, newest first, then its swapchain — and then its surface. The owner writes its terminal record only after the destructions returned, and the main thread then certifies the attachment's facts and releases the window. The device, the instance, the owner and every other target stay live, and nothing is joined. A generation still held retains the surface, and with it everything above. |
-| Whole-host exit (D-33) | Every remaining target's surface; then — whole-owner retirement — every surface the lease still owes that no target held (an attachment whose announcement never reached the owner), every managed resource the recording still holds — the consumer's pipelines before their layouts, and any capture's readback buffer, each once no batch holds it (VK-19) — and the device; then — whole-owner destruction — any surface a creation still in its native call left, the explicit messenger, and the instance, the last call that can reach the capture's callback. Only after that evidence is the owner joined, and only then are windows, the session and the capability released. |
+| Whole-host exit (D-33), with or without targets | Every remaining target's surface, if any remains; then — whole-owner retirement — every surface the lease still owes that no target held (an attachment whose announcement never reached the owner), every owner-thread action still queued is refused, every managed resource the recording still holds — the consumer's pipelines before their layouts, whether its renderer or an owner-thread action built them, and any capture's readback buffer, each once no batch holds it (VK-19) — and the device; then — whole-owner destruction — any surface a creation still in its native call left, the explicit messenger, and the instance, the last call that can reach the capture's callback. Only after that evidence is the owner joined, and only then are windows, the session and the capability released. |
 
 Each step is refused rather than reordered when something that must go first
 has not verifiably gone. A destruction that raised is uncertain: it is recorded,
@@ -2242,7 +2431,12 @@ VK-18's D-33 order and releases nothing early.
 | Generation records | The generations' `Internal.Generations.State`, which defines them | `Reconciliation` builds and replaces, `Retirement` retires the active one, and `Disposal` destroys and removes, on the owner's step; any thread holds and ends a CPU use through `Uses`, in `STM` | The owner (uses: any) | From the construction that begins one until its destruction returned | Kept, explicitly uncertain, when a destruction raised; never retried |
 | Swapchain results | The generations' `Internal.Generations.State`, which defines them | The owner reports through `Uses`; `Reconciliation` consumes on its step | The owner | Until the active generation is replaced | Cleared by the publication that replaces it, or by the surface's loss |
 | A target's lost surface and outstanding attempt | The generations' `Internal.Generations.State`, which defines them | `Reconciliation` marks the loss; `Surface` releases, asks and installs; `Retirement` settles an attempt still outstanding | The owner | From the loss until a replacement is installed, or the target retires | Cleared by the installation, or by retirement |
-| Rendering: the recording and the frames | The controller's rendering | Made by the first frame attempted once the device exists; read by every step and retirement | The owner | From then until whole-owner retirement | Retired before the device is destroyed |
+| Rendering: the recording and the frames | The controller's rendering | Made by the first frame attempted, or the first owner-thread action run, once the device exists; read by every step and retirement | The owner | From then until whole-owner retirement | Retired before the device is destroyed |
+| Rendering: the construction's escape record | The controller's rendering | Set by a construction whose failure must end the owner's run; read by the owner-thread action's runner | The owner | The owner's run | Cleared each time the construction is lent to an action |
+| Owner-thread action queue | The controller's `Internal.Actions` | Any thread admits in `STM`; the owner's step takes and removes | Any, in `STM` | The session | Each entry removed when the owner takes it; emptied by whole-owner retirement, which refuses what is left |
+| An owner-thread action's standing | The controller's `Internal.Actions` | The owner starts and settles it; a reader of its ticket settles one the gate now refuses | Any, in `STM` | From admission until its reader drops the ticket | Only advances: queued, running, settled |
+| The owner's open admission, as actions read it | The controller | Installed once by the composition with the owner's own port state; read by every action's admission and start | Any, in `STM` | The host | Closes with the owner's publications, never reopened |
+| The device start | The controller | Configured; read by the owner's startup | The owner | The host | — |
 | Rendering: per-target records (frame storages, acquisition retry, last generation shown, eligibility, closing) | The controller's rendering | The owner's step, retirement readiness and retirement | The owner | From a target's first render request until its retirement | Removed by the target's retirement |
 | Rendering: the demand and scene revisions acted on, and a demand deadline ahead | The controller's rendering | The owner's step | The owner | The owner's run | Only rise |
 | Observations reconciled | The controller | The owner's step: each target's observation revision and eligibility the generations were last stepped with | The owner | The owner's run | Replaced every step that reconciles |
@@ -2820,7 +3014,7 @@ companions — and adds the Vulkan owner's:
 | Main thread | Hspec runs on a thread of its own; the process main thread owns one shared production graphics session: `withLoaderIntegration`, then `runGraphicsOwnerApplication` over `withVulkanOwnerHost`, with the production native layer and surface bridge. An example that needs the main thread — to hand a window's surface over, which GLFW creates there, or to close a window — submits an operation (`onMain`); the main thread runs it between two turns of the host's owner loop and returns its result or rethrows its failure. Windows are created through the host's command port from the example's own thread, which the owner loop executes, as an application's worker would. |
 | Identities | Every dispatched operation is checked, before it runs, to be on the bound process main thread that entered the session — the Haskell thread, the bound flag, and the OS thread read through `pthread_self` — and a failed check fails the operation and the run. Every native call the session makes is recorded where it runs by a `NativeObserver`, so an example shows from the calls themselves that the instance, its messenger, the device and every surface's destruction ran on the graphics owner's thread and every surface's creation on the main thread — never from the name of an Hspec hook. |
 | Sharing | The roots — the instance, its explicit messenger, and the one device — are acquired lazily, by the first dispatched operation, at most once, and shared by every later example. Each example's windows and targets are its own and are closed inside it. |
-| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, `vk12-frames`, `vk13-presentation`, `vk14-recovery`, `vk15-validation-stop`, `vk15-retention`, `vk16-composed`, `vk17-one-slot`, `vk17-two-slots`, `vk19-capture`, `synchronization-hazard`, `debug-names`, and, under the isolated compositor's consent only, `wayland-connection-loss`. Under that consent `vk16-composed` is pending instead, with its reason named, and starts no child. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. Each child runs in a process group of its own under an external 20-second deadline covering its exit and the end of its output; one still running at it is terminated with its group and fails its example as expired. |
+| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, `vk12-frames`, `vk13-presentation`, `vk14-recovery`, `vk15-validation-stop`, `vk15-retention`, `vk16-composed`, `vk17-one-slot`, `vk17-two-slots`, `vk19-capture`, `grs15-surface-free`, `grs15-surface-free-window`, `synchronization-hazard`, `debug-names`, and, under the isolated compositor's consent only, `wayland-connection-loss`. Under that consent `vk16-composed` is pending instead, with its reason named, and starts no child. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. Each child runs in a process group of its own under an external 20-second deadline covering its exit and the end of its output; one still running at it is terminated with its group and fails its example as expired. |
 | Selection | Building, listing and filtering the tree, a `--dry-run`, and a selection that dispatches nothing acquire nothing and start no child. A selection matching no example fails. `--complete`, which the catalog group passes, runs the whole tree with Hspec's configuration reading left out and then fails unless the shared session was acquired once and every private scenario the run's consent requires ran and passed — every one, except that `wayland-connection-loss` is required under the isolated compositor's consent and pending under any other, and `vk16-composed` is pending under that consent and required under every other — so no ambient setting can turn the group's receipt into a pass for a subset. The consent rules and the migrated proof's pure release, construction, publication and loader-selection examples need no session and run without consent. |
 | Consent | Read once, at startup, from `HETOIMASIA_NATIVE_SESSION`, with the GLFW suite's rules for `desktop`, `isolated-x11:<display>` and `isolated-wayland:<socket>`: the last only on Linux, only when `WAYLAND_DISPLAY` names that socket, and never beside a `DISPLAY`. Under the Wayland consent every session requests Wayland by name — the shared host, each child's host, the VK-5 bridge's loader-aware session, and the proof shim's raw initialization, which sets `GLFW_PLATFORM` and fails one that selected another platform — so no X11 or XWayland session stands in; under the others every session requests nothing, as before. The first shared example asserts the platform GLFW selected before any example renders. Without consent every native example is refused before its body, the session is never acquired, and the run ends with the refusal on stderr and a non-zero exit. |
 | Environment | Before any Vulkan call, the suite clears every ambient discovery override and every validation-layer setting it finds and records which, disables implicit layers, and points the layer's settings file at an empty one; a child inherits and re-establishes the same environment. |
@@ -3075,6 +3269,31 @@ of both targets was an unclipped transfer source; if every Vulkan call ran on
 the graphics owner's thread and every surface was created on the main thread;
 and if the verdict after the last teardown callback has no issue and no error
 was reported. It infers no cadence, vertical blank or pacing from any timing.
+
+GRS-15's two cases run the production composition with `DeviceSurfaceFree`,
+the validation layer and synchronization validation.
+`grs15-surface-free` opens no window at all: once the owner's startup has
+answered `RootsReady`, one owner-thread action builds a pipeline layout and a
+pipeline over the embedded verification shaders, and a second releases both;
+the case waits until the owner's own progress — with no target and no frame —
+has destroyed them, and the host then exits through D-33. It passes only if no
+window and no surface was created; if the calls after the instance and its
+messenger were `vkEnumeratePhysicalDevices` and `vkCreateDevice`, with no
+`vkGetPhysicalDeviceSurfaceSupportKHR` anywhere; if both actions returned
+and ran on the thread that created the device, which is not the main thread;
+if the pipeline and its layout were destroyed before the body returned and no
+frame event was reported; if the destructions ran pipeline layout, device,
+messenger, instance, in that order, with every Vulkan call on the owner's
+thread; and if the verdict after the last teardown callback has no issue and no
+error was reported. `grs15-surface-free-window` starts the same way over one
+mapped window that requests no focus, hands it over once the device exists,
+publishes a scene, and turns `runVulkanOwnerLoop` until that frame is presented
+and its presentation retires on its own present fence. It passes only if the
+device was created with no surface before the window's surface existed, and
+the surface was then checked with `vkGetPhysicalDeviceSurfaceSupportKHR`; if
+the target was admitted, with one device created in all; if a presentation
+retired; if the destructions ran surface, device, messenger, instance, with
+every Vulkan call on the owner's thread; and if the verdict is clean.
 
 #250's case, `debug-names`, is VK-11's on private roots of its own, with one
 destructive seam only the fixture holds: it wraps the production recording

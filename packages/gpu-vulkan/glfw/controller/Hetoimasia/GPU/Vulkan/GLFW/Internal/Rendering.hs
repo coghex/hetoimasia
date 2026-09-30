@@ -65,9 +65,10 @@
 -- +---------------------+-----------+------------------------------------+--------+------------------------------+------------------------------+
 -- | State               | Owner     | Readers and writers                | Thread | Lifetime                     | Reset or disposal            |
 -- +=====================+===========+====================================+========+==============================+==============================+
--- | The recording and   | This      | Made by the first frame attempted  | Owner  | The first attempt after the  | 'retireRendering', before    |
--- | the frames          | module    | once the device exists; read by    |        | device exists until          | the device is destroyed      |
--- |                     |           | every function here                |        | whole-owner retirement       |                              |
+-- | The recording and   | This      | Made by the first frame attempted, | Owner  | The first attempt or action  | 'retireRendering', before    |
+-- | the frames          | module    | or the first owner-thread action,  |        | after the device exists      | the device is destroyed      |
+-- |                     |           | once the device exists; read by    |        | until whole-owner retirement |                              |
+-- |                     |           | every function here                |        |                              |                              |
 -- +---------------------+-----------+------------------------------------+--------+------------------------------+------------------------------+
 -- | Per-target records  | This      | Written by the step, retirement    | Owner  | A target's first render      | Removed by                   |
 -- |                     | module    | preparation and retirement; read   |        | request until its retirement | 'retireTargetRendering'      |
@@ -76,6 +77,9 @@
 -- | The revisions acted | This      | The step alone                     | Owner  | The owner's run              | Never reset: revisions only  |
 -- | on, and a demand    | module    |                                    |        |                              | rise                         |
 -- | deadline ahead      |           |                                    |        |                              |                              |
+-- +---------------------+-----------+------------------------------------+--------+------------------------------+------------------------------+
+-- | The construction's  | This      | 'confined' sets it; an owner-thread| Owner  | The owner's run              | Cleared each time the        |
+-- | escape record       | module    | action's runner reads it           |        |                              | construction is lent         |
 -- +---------------------+-----------+------------------------------------+--------+------------------------------+------------------------------+
 module Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
   ( -- * The native layers
@@ -93,6 +97,8 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
   , constructPipeline
   , replaceConstructedPipeline
   , releaseConstructed
+  , lendConstruction
+  , constructionEscaped
 
     -- * Observing frames
   , FrameEvent (..)
@@ -348,9 +354,18 @@ andThen first second = first >>= either (pure . Left) (const second)
 -- released is released and destroyed on the owner's thread before the device,
 -- on the host's normal and terminal exits alike; a batch still in flight keeps
 -- what it recorded until its own references end.
+--
+-- The same construction is lent to an owner-thread action
+-- ("Hetoimasia.GPU.Vulkan.GLFW.Internal.Actions") with no frame at all, and
+-- what it builds lives, and is released, exactly as the renderer's does.
 data Construction q inst msgr phys dev cmd = Construction
   { constructionRecording ∷ !(Recording q inst msgr phys dev cmd)
   , constructionRoots ∷ !(Roots q inst msgr phys dev)
+  , constructionEscape ∷ !(TVar Bool)
+    -- ^ Set when a call raised a failure the owner's run must end with — one
+    -- that committed a generation, or that the session latched — rather than
+    -- answering it: whoever the construction was lent to raises it on, however
+    -- it handled it.
   }
 
 -- | What the renderer can release: the handles it can construct.
@@ -394,7 +409,8 @@ releaseConstructed construction handle = confined construction (release (constru
 -- that committed no new generation, and that the checkpoint finds nothing
 -- behind, is answered: one that committed a generation first — whatever
 -- became of it — whatever the session latched on its way out, and every
--- cancellation, is raised as it was.
+-- cancellation, is raised as it was, and the first two are recorded as having
+-- escaped the construction ('constructionEscaped').
 confined ∷ Construction q inst msgr phys dev cmd → IO (Either Refusal a) → IO (Either Refusal a)
 confined construction action =
   checkpointRoots roots >>= \case
@@ -411,13 +427,36 @@ confined construction action =
               checkpointRoots roots >>= \case
                 CheckpointClear
                   | all (`elem` before) after → pure (Left (RefusedConstructionFailed (Text.pack (displayException exception))))
-                _ → rethrowIO failure
+                _ → do
+                  atomically (writeTVar (constructionEscape construction) True)
+                  rethrowIO failure
   where
     roots = constructionRoots construction
     generations = atomically (map viewResource <$> readManaged (constructionRecording construction))
 
 isAsynchronous ∷ SomeException → Bool
 isAsynchronous exception = isJust (fromException exception ∷ Maybe SomeAsyncException)
+
+-- | Whether a call on this construction, since it was lent, raised a failure
+-- the owner's run must end with.
+constructionEscaped ∷ Construction q inst msgr phys dev cmd → STM Bool
+constructionEscaped = readTVar . constructionEscape
+
+-- | The session's construction, lent on the owner's thread outside any frame
+-- — to an owner-thread action — with nothing yet escaped from it. The
+-- recording is made here if no frame has made it yet; there is none while the
+-- session has no device.
+lendConstruction ∷ Rendering q inst msgr phys dev cmd → IO (Maybe (Construction q inst msgr phys dev cmd))
+lendConstruction rendering =
+  live rendering >>= \case
+    Nothing → pure Nothing
+    Just made → do
+      atomically (writeTVar (renderingEscape rendering) False)
+      pure (Just (construct rendering made))
+
+-- | The construction over the session's recording.
+construct ∷ Rendering q inst msgr phys dev cmd → Live q inst msgr phys dev cmd → Construction q inst msgr phys dev cmd
+construct rendering made = Construction (liveRecording made) (renderingRoots rendering) (renderingEscape rendering)
 
 -- ---------------------------------------------------------------------------
 -- Observing frames
@@ -505,6 +544,8 @@ data Rendering q inst msgr phys dev cmd = Rendering
     -- ^ The verification captures requested of the session's targets
     -- ("Hetoimasia.GPU.Vulkan.GLFW.Internal.Capture"), whose readback buffers
     -- this module makes, releases and destroys.
+  , renderingEscape ∷ !(TVar Bool)
+    -- ^ The lent construction's record of a failure that escaped it.
   }
 
 newRendering
@@ -523,6 +564,7 @@ newRendering roots generations ops observer captures =
     <*> newTVarIO 0
     <*> pure observer
     <*> pure captures
+    <*> newTVarIO False
 
 -- | The recording and the frames, made the first time they are needed once
 -- the device exists, on the owner's thread, which is what makes it their
@@ -821,13 +863,13 @@ renderDue rendering renderer now scene revision due =
       | not (imageCapturable image) = Captured False Nothing <$ withhold attachment (WithheldUnsupported (imageGeneration (ownedImage owned)))
       | otherwise = do
           let bytes = readbackBytesFor (imageExtent image)
-          confined (Construction (liveRecording made) (renderingRoots rendering)) (createReadback (liveRecording made) bytes) >>= \case
+          confined (construct rendering made) (createReadback (liveRecording made) bytes) >>= \case
             Left refusal → Captured False Nothing <$ withhold attachment (WithheldNoReadback refusal)
             Right readback → pure (Captured True (Just (readback, bytes)))
     withhold attachment reason = atomically (settleCapture captures attachment (CaptureWithheld attachment reason))
     recordOne made target attachment owned image capture = do
       let request = FrameRequest attachment target (ownedFrame owned) (ownedImage owned) (imageExtent image) (imageFormat image) revision
-          construction = Construction (liveRecording made) (renderingRoots rendering)
+          construction = construct rendering made
           finish recorder = case capturedWork capture of
             Nothing → transitionImage recorder LayoutColorAttachment LayoutPresentSource
             Just (readback, _) →
