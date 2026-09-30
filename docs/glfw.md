@@ -761,8 +761,20 @@ The remaining gaps are stated rather than estimated:
   qualified. Desktop compositors, their decorations, and compositor-specific
   behaviour are not; their probes stay optional and none exists.
 - **No hardware.** No GPU, display, input device, or output hotplug was
-  involved. Rendering on Wayland is WL-4's, deferred until the Vulkan surface
-  slices exist, and nothing here claims presentation or GPU completion.
+  involved.
+- **Rendering is qualified on packaged Weston and Lavapipe only.** WL-4
+  (#327) established Vulkan rendering on this same headless Weston with the
+  pinned software stack — packaged Lavapipe, the pinned loader and the Khronos
+  validation layer with synchronization validation — as the group
+  `test.vulkan-wayland` ([gpu_backend.md](gpu_backend.md#the-native-suite)):
+  surfaces created through the VK-5 bridge on Wayland windows, presented to
+  with verified present-fence completion, and retired under the protected
+  boundary, and a compositor lost during rendering ending the session with no
+  completion recorded for work it interrupted. Its run is retained in
+  [the qualification record](wayland_qualification_record.md#rendering).
+  Hardware drivers, desktop compositors and macOS stay unqualified for
+  rendering on Wayland: no hardware driver, no compositor but packaged
+  headless Weston, and no macOS path was exercised, and macOS has no Wayland.
 - **Close requests.** A compositor-generated close request has not been
   demonstrated on Wayland: no client can make the compositor send one, and the
   X11 close driver is unavailable there (D-9). The examples exercise close

@@ -127,7 +127,11 @@ shared executable with `--match` is its own suite — `test.glfw-wayland` become
 unnarrowed suite skips those examples, so each example is measured in exactly
 one profile. The adapter builds each suite the way its group does, and launches
 `vulkan-native-tests` through `tools/vulkan/run.sh native` as `test.vulkan-native`
-does, so the runner's source-digest and revision provenance reach the suite.
+does, so the runner's source-digest and revision provenance reach the suite. A
+group whose own command starts the compositor around the whole executable is a
+profile of its own too: `test.vulkan-wayland` becomes
+`vulkan-native-tests:vulkan-wayland`, launched through `tools/vulkan/run.sh
+native` inside `tools/display/wayland.sh` as CI runs it, Linux only.
 Builds and trials run on the pinned toolchain: when the `ghc` or `cabal` on
 `PATH` is not [the pin](toolchain.md), the adapter puts a cached directory of
 links to ghcup's versioned binaries (`ghc-9.14.1` and its siblings) first on
