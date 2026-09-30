@@ -182,12 +182,14 @@ rejectsFieldUpdate (reader, replacementType, extraImports) =
 -- | Write one client into a temporary directory, compile it against this
 -- build's own package database, and hand the outcome to the example.
 --
--- The model's clients see exactly @base@, @hetoimasia-foundation@, and
--- @hetoimasia-gpu-vulkan-model@. Every package either library depends on is a
+-- The model's clients see exactly @base@, @hetoimasia-foundation@, and the
+-- model's main library, named by its local unit id: the package also registers
+-- its test-only @placement-reference@ sublibrary under the same package name,
+-- so the name alone would not pick one unit. Every package either library depends on is a
 -- boot library, so the build's own database resolves the whole unit graph and
 -- no dependency store has to be exposed.
 withClient ∷ FilePath → String → ((Mode → IO Client) → IO ()) → IO ()
-withClient = withPackageClient ["base", "hetoimasia-foundation", "hetoimasia-gpu-vulkan-model"]
+withClient = withPackageClient ["base", "hetoimasia-foundation", "hetoimasia-gpu-vulkan-model-0.1.0.0-inplace"]
 
 -- | The client from the issue, one field at a time: it replaces part of a
 -- validated configuration through record-update syntax, which needs only the

@@ -54,6 +54,17 @@ ones `validateBudgets` accepted.
 
 [`docs/gpu_model.md`](../../../docs/gpu_model.md) is the contract in prose.
 
+## The placement reference
+
+`placement-reference` is a public sublibrary of this package holding
+`Hetoimasia.GPU.Model.Placement`: the pure best-fit block placement #331 built
+and measured against VMA, with its hidden `Internal.Placement.*` modules. It is
+a test reference only — production allocation uses VMA (resource services
+design D-38) — so only test suites may depend on it: `gpu-model-tests` and the
+native package's allocator parity probe. The model library does not. See
+[`docs/gpu_model.md`](../../../docs/gpu_model.md#the-placement-reference) and
+[the parity record](../../../docs/gpu_allocator_parity_record.md).
+
 ## Testing
 
 `gpu-model-tests` owns the `GPU model` group and is registered in
