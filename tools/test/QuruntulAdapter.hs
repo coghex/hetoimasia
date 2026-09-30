@@ -32,6 +32,9 @@ spec = describe "Quruntul adapter" $
     , "test_platform_bound_probes"
     , "test_identities_are_stable_and_distinct"
     , "test_desktop_consent_is_per_command_on_macos_and_an_isolated_display_on_linux"
+    , "test_every_build_and_trial_runs_on_the_qualified_toolchain"
+    , "test_a_mismatched_compiler_runs_behind_a_shim_of_the_pinned_ghcup_binaries"
+    , "test_a_compiler_that_is_not_installed_is_refused"
     , "test_the_adapter_imports_nothing_from_quruntul"
     ] $ \name →
       it name $ do
