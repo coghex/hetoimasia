@@ -404,6 +404,7 @@ protocolFor journal host owner script =
     , protocolCompletion = scriptCompletion script
     , protocolDisposition = scriptDisposition script
     , protocolRecognizes = \_ → pure (scriptRecognizes script)
+    , protocolBeforeHide = \_ → pure (pure ())
     }
   where
     perform target acknowledgement = \case

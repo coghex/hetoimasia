@@ -16,6 +16,7 @@ import Control.Concurrent.STM (STM, newTVarIO)
 import Control.Exception (Exception, throwIO)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import qualified Data.Map.Strict as Map
+import qualified Data.Set as Set
 import Hetoimasia.Foundation.Worker (WorkerGroup, awaitStartup, startWorkerWith, workerDefinition)
 import Hetoimasia.GLFW.Internal.Attachment (AttachmentId, AttachmentPhase (AttachmentRetiring), viewPhase)
 import Hetoimasia.Runtime.GLFW.Internal.Host.Attachments (hostGraphicsPublisher)
@@ -68,6 +69,9 @@ startGraphicsOwner group host settled config publish = do
   custody ← newTVarIO Map.empty
   geometry ← newTVarIO Map.empty
   seenInputs ← newTVarIO (0, 0)
+  withheld ← newTVarIO Map.empty
+  withholdRequests ← newTVarIO 0
+  presenting ← newTVarIO Set.empty
   started ← newTVarIO False
   reservations ← newTVarIO 0
   let partial worker =
@@ -82,6 +86,9 @@ startGraphicsOwner group host settled config publish = do
           custody
           geometry
           seenInputs
+          withheld
+          withholdRequests
+          presenting
           (hostPendingAttachments host)
           (retiringAttachments host)
           started

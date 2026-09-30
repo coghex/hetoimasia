@@ -637,6 +637,7 @@ protocolOf construct rollback =
     , protocolCompletion = FiniteCompletion
     , protocolDisposition = Required
     , protocolRecognizes = \_ → pure False
+    , protocolBeforeHide = \_ → pure (pure ())
     }
 
 -- | Attach with a construction step that runs the given action on its open

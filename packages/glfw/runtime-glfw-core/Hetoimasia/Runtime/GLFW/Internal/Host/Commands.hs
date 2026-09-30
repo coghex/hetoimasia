@@ -7,6 +7,11 @@
 -- cursor is the one cell this module writes, and only the owner thread does.
 -- Clients on any thread submit through the ports themselves, never through
 -- this module.
+--
+-- A hide is the one control that consults a window's graphics attachment
+-- first: the attachment's protocol withholds its presentation before the
+-- native call ('protocolBeforeHide'), so no owner presents to a window the
+-- compositor has unmapped (#357).
 module Hetoimasia.Runtime.GLFW.Internal.Host.Commands
   ( dispatchCommands
   , queuedCommands
@@ -30,6 +35,7 @@ import Hetoimasia.GLFW.Command
   )
 import Hetoimasia.GLFW.Internal.Command
   ( CommandOrigin
+  , Disposition (Attempted)
   , Execution (..)
   , ExecutionStep (..)
   , WindowCommand (..)
@@ -39,12 +45,14 @@ import Hetoimasia.GLFW.Internal.Command
   , nativeRejectionOf
   , observeWindow
   )
+import Hetoimasia.GLFW.Internal.Control (WindowControl (HideControl))
 import Hetoimasia.GLFW.Internal.Session (ownerOperation)
 import Hetoimasia.GLFW.Session (SessionMisuse (SessionPoisoned))
-import Hetoimasia.GLFW.Window (WindowConfig, validateWindowConfig)
+import Hetoimasia.GLFW.Window (WindowConfig, WindowId, validateWindowConfig)
 import Hetoimasia.Runtime.GLFW.Internal.Host.Config (HostConfig (..))
 import Hetoimasia.Runtime.GLFW.Internal.Host.State (HostEntry (..), PortKey (..), WindowHost (..))
 import Hetoimasia.Runtime.GLFW.Internal.Host.Windows (CloseStart (..), beginClose, borrowWindow, registerWindow)
+import Hetoimasia.Runtime.GLFW.Internal.Retirement (AttachmentProtocol (..), windowAttachmentProtocol)
 import Numeric.Natural (Natural)
 
 bookkeepingOperation ∷ Operation
@@ -140,7 +148,7 @@ executeHostCommand host _ = \case
       Nothing → completed (Left (WindowNotServed target))
       Just entry
         | entryClosing entry → completed (Left (WindowIsClosing target))
-        | otherwise → Settled <$> borrowWindow host target entry (controlDisposition target control)
+        | otherwise → Settled <$> beforeUnmapping host target control (borrowWindow host target entry (controlDisposition target control))
   ModeWindow target request →
     readTVarIO (hostEntries host) >>= \entries → case Map.lookup target entries of
       Nothing → completed (Left (WindowNotServed target))
@@ -149,6 +157,30 @@ executeHostCommand host _ = \case
         | otherwise → Settled <$> borrowWindow host target entry (modeDisposition target request)
   where
     completed = pure . Completed
+
+-- | Run a control, having the graphics attachment of the window a hide
+-- unmaps withhold its presentation first.
+--
+-- The hold outlives the native call: the owner presents to the window again
+-- only once an observation newer than the one it had when the hold began is
+-- published, and the hidden window's is. A hide that made no native call — it
+-- was refused, or the platform cannot perform it — changed nothing, so its
+-- hold is lifted at once. One that raised keeps its hold, since whether the
+-- window was unmapped is unknown. Any other control, and a window with no
+-- attachment, runs unchanged.
+beforeUnmapping ∷ WindowHost → WindowId → WindowControl → IO Disposition → IO Disposition
+beforeUnmapping host target control run = case (control, hostRetirementState host) of
+  (HideControl, Just retirement) →
+    atomically (windowAttachmentProtocol retirement target) >>= \case
+      Nothing → run
+      Just (attachment, protocol) → do
+        lift ← protocolBeforeHide protocol attachment
+        disposition ← run
+        case disposition of
+          Attempted _ → pure ()
+          _ → lift
+        pure disposition
+  _ → run
 
 -- | What the host holds, for bounding checks: every count is proportional to the
 -- live windows, never to how many were ever created.

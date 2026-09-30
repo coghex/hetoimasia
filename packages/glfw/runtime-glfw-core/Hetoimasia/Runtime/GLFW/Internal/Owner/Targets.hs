@@ -59,7 +59,7 @@ takeLifetimeEvents owner = atomically $ do
         Map.insertWith
           (\_ existing → existing)
           target
-          (TargetState acknowledgement ConstructionPending 0 initialEligibility False False)
+          (TargetState acknowledgement ConstructionPending 0 initialEligibility False False 0)
           states
       TargetReleased target → Map.adjust (\state → state {targetReleasing = True}) target states
 

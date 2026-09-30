@@ -51,6 +51,8 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , scriptPresentStatus
   , slowNativeCalls
   , holdAcquisitions
+  , holdPresentations
+  , keepPresentationsOf
   , stallSwapchain
   , raiseOnPresent
   , suboptimalWhileStale
@@ -152,7 +154,8 @@ import Hetoimasia.Foundation.Log (Logger, callbackSink, defaultLogFilter, mkLogg
 import Hetoimasia.Foundation.Messaging.Payload (prepare)
 import qualified Hetoimasia.Foundation.Worker as Worker
 import Hetoimasia.GLFW.Seam
-  ( Seam
+  ( NativeCall (HideWindow, ShowWindow)
+  , Seam
   , SeamScript (..)
   , WindowAttribute (VisibleAttribute)
   , asProcessMainThread
@@ -306,6 +309,12 @@ data Event
   | ReadbackMade !Word64 !Natural
     -- ^ A readback buffer, and its size in bytes.
   | ReadbackGone !Word64
+  | WindowHidden !Int
+    -- ^ The seam made a hide control's native call for the window with this
+    -- key. From then on that window reports itself invisible, whatever
+    -- 'setVisible' last said, until it is shown.
+  | WindowShown !Int
+    -- ^ The seam made a show control's native call for that window.
   deriving (Eq, Show)
 
 -- | Every event, newest first, with the thread that caused it.
@@ -829,6 +838,15 @@ data Rendering = Rendering
     -- ^ Whether the renderer refuses every frame it is asked for.
   , renderingCreations ∷ !(TVar (Map Creation SomeException))
     -- ^ What the next creation of each kind raises, once.
+  , renderingPresentHold ∷ !(TVar (Maybe (TVar Bool)))
+    -- ^ When set, every presentation holds until the gate opens, before it
+    -- does anything, as Mesa's legacy FIFO present does while it waits for
+    -- the frame callback its swapchain's previous presentation requested.
+  , renderingPresentHolding ∷ !(TVar Bool)
+    -- ^ Whether a presentation is holding now.
+  , renderingKept ∷ !(TVar (Set Word64))
+    -- ^ Swapchains whose presentations' present fences answer unsignalled,
+    -- whatever 'presentationsRetire' says.
   }
 
 -- | A managed object the recording's layer creates, or the recording's layer
@@ -863,6 +881,9 @@ newRendering =
     <*> newTVarIO Nothing
     <*> newTVarIO False
     <*> newTVarIO Map.empty
+    <*> newTVarIO Nothing
+    <*> newTVarIO False
+    <*> newTVarIO Set.empty
 
 -- | Whether a submission's fence answers signalled when it is next asked.
 submissionsComplete ∷ Rig → Bool → IO ()
@@ -887,6 +908,19 @@ holdAcquisitions ∷ Rig → TVar Bool → IO (STM Bool)
 holdAcquisitions rig gate = do
   atomically (writeTVar (renderingHold (rigRendering rig)) (Just gate))
   pure (readTVar (renderingHolding (rigRendering rig)))
+
+-- | Hold every later presentation until the gate opens, and answer a
+-- transaction that says whether one is holding now.
+holdPresentations ∷ Rig → TVar Bool → IO (STM Bool)
+holdPresentations rig gate = do
+  atomically (writeTVar (renderingPresentHold (rigRendering rig)) (Just gate))
+  pure (readTVar (renderingPresentHolding (rigRendering rig)))
+
+-- | Whether the present fences of every presentation made to this swapchain
+-- answer unsignalled from now on, whatever 'presentationsRetire' says.
+keepPresentationsOf ∷ Rig → Word64 → Bool → IO ()
+keepPresentationsOf rig swapchain kept =
+  atomically (modifyTVar' (renderingKept (rigRendering rig)) (if kept then Set.insert swapchain else Set.delete swapchain))
 
 -- | Answer not ready to every later acquisition from this swapchain.
 stallSwapchain ∷ Rig → Word64 → IO ()
@@ -1038,10 +1072,13 @@ renderingLayers events rendering clock =
               submissions ← readTVar (renderingSubmissions rendering)
               presentations ← readTVar (renderingPresentations rendering)
               counted ← readTVar (renderingRetireCount rendering)
+              kept ← readTVar (renderingKept rendering)
+              presentedTo ← fmap fst . Map.lookup handle <$> readTVar (renderingPresented rendering)
+              let keeping = maybe False (`Set.member` kept) presentedTo
               case kind of
                 Just FenceDone → pure True
                 Just FenceSubmission | submissions → True <$ modifyTVar' (renderingFences rendering) (Map.insert handle FenceDone)
-                Just FencePresent | presentations && maybe True (> 0) counted → do
+                Just FencePresent | presentations && not keeping && maybe True (> 0) counted → do
                   writeTVar (renderingRetireCount rendering) (subtract 1 <$> counted)
                   modifyTVar' (renderingFences rendering) (Map.insert handle FenceDone)
                   held ← Map.lookup handle <$> readTVar (renderingPresented rendering)
@@ -1074,6 +1111,12 @@ renderingLayers events rendering clock =
             atomically (modifyTVar' (renderingBusy rendering) (Map.adjust (\held → foldr Set.delete held indices) swapchain))
             record events (ImageReleased swapchain indices)
         , opsPresent = \_ _ request status → do
+            readTVarIO (renderingPresentHold rendering) >>= \case
+              Nothing → pure ()
+              Just gate → uninterruptibleMask_ $ do
+                atomically (writeTVar (renderingPresentHolding rendering) True)
+                atomically (readTVar gate >>= check)
+                atomically (writeTVar (renderingPresentHolding rendering) False)
             answer ← stale (presentSwapchain request) >>= maybe (readTVarIO (renderingStatus rendering)) pure
             writeIORef status answer
             fence (presentFence request) FencePresent
@@ -1301,6 +1344,7 @@ newRigClocked visible windows clock = do
   pumpHold ← newTVarIO False
   heldNow ← newTVarIO False
   visibility ← newTVarIO visible
+  hidden ← newTVarIO Set.empty
   framebuffer ← newTVarIO (640, 480)
   nudges ← newTVarIO 0
   events ← newTVarIO []
@@ -1336,6 +1380,15 @@ newRigClocked visible windows clock = do
         , scriptTerminate = \_ → record events SessionEnded
         , scriptFramebufferSize = \_ → readTVarIO framebuffer
         , scriptWindowAttribute = \attribute _ → (&& attribute == VisibleAttribute) <$> readTVarIO visibility
+        , -- A window a hide control's call unmapped reports itself invisible
+          -- until one shows it again.
+          scriptWindowAttributeOf = \key attribute → do
+            hiddenNow ← Set.member key <$> readTVarIO hidden
+            pure (if attribute == VisibleAttribute && hiddenNow then Just False else Nothing)
+        , scriptWindowControl = \call _ → case call of
+            HideWindow key → atomically (modifyTVar' hidden (Set.insert key)) >> record events (WindowHidden key)
+            ShowWindow key → atomically (modifyTVar' hidden (Set.delete key)) >> record events (WindowShown key)
+            _ → pure ()
         }
   native ← Native <$> newTVarIO Map.empty <*> newTVarIO Set.empty <*> newTVarIO 500 <*> newTVarIO Nothing <*> newTVarIO Nothing <*> newTVarIO Set.empty <*> newTVarIO imageUsageColorAttachment <*> newTVarIO False <*> newTVarIO Set.empty
   renderer ← newTVarIO Nothing

@@ -215,6 +215,7 @@ library runtime-glfw-core
         Hetoimasia.Runtime.GLFW.Internal.Owner.Terminal
         Hetoimasia.Runtime.GLFW.Internal.Owner.Wake
         Hetoimasia.Runtime.GLFW.Internal.Owner.Worker
+        Hetoimasia.Runtime.GLFW.Internal.Owner.Withhold
         Hetoimasia.Runtime.GLFW.Internal.RenderDemand
         Hetoimasia.Runtime.GLFW.Internal.Retirement
         Hetoimasia.Runtime.GLFW.Internal.Surface

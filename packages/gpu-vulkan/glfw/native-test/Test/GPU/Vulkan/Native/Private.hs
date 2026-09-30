@@ -35,8 +35,9 @@
 --   than released, ending by process termination rather than orderly cleanup
 --   (#231);
 -- * @vk16-composed@ — VK-16's two targets rendered through the composed loop,
---   one suspended and resumed while the other keeps presenting, and the host's
---   exit through D-33 ("Test.GPU.Vulkan.Native.Composed", #232);
+--   one hidden, suspended and shown again while the other keeps presenting,
+--   and the host's exit through D-33 ("Test.GPU.Vulkan.Native.Composed", #232;
+--   required on Wayland too since #357);
 -- * @vk17-one-slot@ and @vk17-two-slots@ — VK-17's required profile: the
 --   triangle sample's renderer in two windows, each captured, the first
 --   resized and captured at its new extent and then closed while the second
@@ -62,8 +63,10 @@
 --   other consent its example is pending, asserts nothing, and starts no child,
 --   and the complete profile does not require it ('requiredScenarios').
 --
--- Under the isolated compositor's consent @vk16-composed@ is pending with its
--- named reason, 'composedOnWayland', starts no child, and is not required.
+-- A scenario with a named Wayland gap ('scenarioWaylandPending') would be
+-- pending under the isolated compositor's consent, start no child, and not be
+-- required there. None has one: @vk16-composed@'s, hiding a presenting window,
+-- was closed by #357.
 --
 -- Every child requests the backend its consent names
 -- ("Test.GPU.Vulkan.Native.Platform"): Wayland by name under the isolated
@@ -242,7 +245,7 @@ scenarios =
       "vk16-composed"
       "renders two targets through the composed loop, suspending and resuming one while the other presents, and exits through D-33 with validation reporting nothing"
       False
-      (Just composedOnWayland)
+      Nothing
       $ \consent journal _ → do
         outcome ← Composed.runComposed (consentBackend consent) journal
         pure (Composed.spec outcome, section "The VK-16 composed loop record" (Composed.composedSection outcome))
@@ -329,17 +332,6 @@ scenarios =
 
 scenarioNames ∷ [String]
 scenarioNames = map scenarioName scenarios
-
--- | Why VK-16's case is pending on Wayland (owner decision on #327,
--- 2026-09-30). Weston 13 offers no @wp_fifo_v1@, so Mesa's Wayland WSI
--- throttles FIFO with frame callbacks: each present waits, without a timeout,
--- for the previous one's callback, and Weston fires none for an unmapped
--- surface. Hiding a window whose target is presenting therefore blocks the
--- graphics owner in its next present to it. That is an engine gap on Wayland,
--- tracked apart from this qualification; it is not a pass.
-composedOnWayland ∷ String
-composedOnWayland =
-  "not qualified on Wayland: hiding a window whose target is presenting blocks the graphics owner, because Mesa's legacy FIFO waits for a frame callback the compositor never sends an unmapped surface (Weston 13 has no wp_fifo_v1); an engine gap tracked apart from #327"
 
 -- | The scenarios a complete run under this consent must run to a pass: every
 -- one, except that a Wayland-only one is required only under the isolated

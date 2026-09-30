@@ -602,6 +602,7 @@ scriptedOwner journal remaining host =
     , Runtime.protocolCompletion = Runtime.FiniteCompletion
     , Runtime.protocolDisposition = Required
     , Runtime.protocolRecognizes = \_ → pure False
+    , Runtime.protocolBeforeHide = \_ → pure (pure ())
     }
 
 -- | Two real windows, each with a graphics owner attached through the public
@@ -840,6 +841,7 @@ namedOwner journal remaining host name =
     , Runtime.protocolCompletion = Runtime.FiniteCompletion
     , Runtime.protocolDisposition = Required
     , Runtime.protocolRecognizes = \_ → pure False
+    , Runtime.protocolBeforeHide = \_ → pure (pure ())
     }
 
 -- | Whether the window's exclusive slot is free again.

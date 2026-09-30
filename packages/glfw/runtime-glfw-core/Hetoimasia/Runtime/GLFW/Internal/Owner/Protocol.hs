@@ -34,6 +34,7 @@ import Hetoimasia.Runtime.GLFW.Internal.Owner.Handoff
   )
 import Hetoimasia.Runtime.GLFW.Internal.Owner.State (GraphicsOwner (..))
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Stranded (retireStranded)
+import Hetoimasia.Runtime.GLFW.Internal.Owner.Withhold (withholdPresentation)
 import Hetoimasia.Runtime.GLFW.Internal.Retirement
   ( AttachmentProtocol (..)
   , CompletionPolicy (FiniteCompletion)
@@ -67,6 +68,8 @@ graphicsTargetProtocol host owner =
     , protocolCompletion = FiniteCompletion
     , protocolDisposition = Required
     , protocolRecognizes = \_ → pure False
+    , -- The one callback that may wait, for the step in flight at most.
+      protocolBeforeHide = withholdPresentation owner
     }
 
 -- | One bounded main-thread opportunity for an owner target.

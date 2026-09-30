@@ -374,6 +374,7 @@ import Hetoimasia.GPU.Vulkan.Native.Generations
   , stepGenerations
   , trackTarget
   , useGeneration
+  , withdrawGeneration
   )
 import Hetoimasia.GPU.Vulkan.Native.Naming (Instrumentation (..))
 import Hetoimasia.GPU.Vulkan.Native.Presentation (SurfaceExtent (..))
@@ -532,9 +533,10 @@ data State inst msgr phys dev cmd lease obligation = State
   , statePoll ∷ !Duration
     -- ^ How soon the owner looks at them again, while any exist.
   , stateHooks ∷ !ControllerHooks
-  , stateSeen ∷ !(TVar (Map TargetId (Natural, RenderEligibility)))
-    -- ^ The observation revision and eligibility each target's generations
-    -- were last reconciled with. The owner thread's alone.
+  , stateSeen ∷ !(TVar (Map TargetId (Natural, RenderEligibility, Natural)))
+    -- ^ The observation revision, eligibility and withdrawal count each
+    -- target's generations were last reconciled with. The owner thread's
+    -- alone.
   , stateFailureTaken ∷ !(TVar Bool)
     -- ^ Whether the owner's own step has found the session failed. Written by
     -- the owner's step; read by its wake.
@@ -766,10 +768,14 @@ readReadiness (VulkanController state) =
 -- attachment whose announcement the port refused and whose slot has since
 -- begun retiring; folds the step's demand and scene into render requests and,
 -- when a poll is due or a frame is to be attempted, asks the fences
--- ("Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering"); reconciles every admitted
--- target's swapchain generations with the geometry the owner folded for it —
+-- ("Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering"); withdraws the active
+-- generation of every target whose view's withdrawal count rose — a hide's
+-- presentation hold (#357) — before anything else is done for it; reconciles
+-- every admitted target's swapchain generations with the geometry the owner
+-- folded for it —
 -- its eligibility, its last coherent framebuffer observation and the bounds
--- the platform published ('targetGeometry') — whenever an observation moved,
+-- the platform published ('targetGeometry') — whenever an observation, or a
+-- withdrawal count, moved,
 -- the generations' own deadline came, or a frame is to be attempted; and then
 -- offers each target that wants a frame one attempt. It asks for a round while
 -- an unannounced attachment is watched, when the generations name a deadline —
@@ -827,7 +833,7 @@ controllerOperations (VulkanController state) renderer =
               , Just target ← [Map.lookup (viewTarget view) mapped]
               ]
             geometries = Map.fromList [(target, targetGeometry view) | (target, view) ← constructed]
-            observed = Map.fromList [(target, (viewRevision view, viewEligibility view)) | (target, view) ← constructed]
+            observed = Map.fromList [(target, (viewRevision view, viewEligibility view, viewWithdrawals view)) | (target, view) ← constructed]
         -- The generations are stepped when there is something for them to do:
         -- a target's observation moved, their own deadline — a settling
         -- resize, a recovery attempt, a result to reconcile, the model's poll
@@ -836,6 +842,16 @@ controllerOperations (VulkanController state) renderer =
         -- moves the backoff on.
         seen ← readTVarIO (stateSeen state)
         let moved = any (\(target, current) → Map.lookup target seen /= Just current) (Map.toList observed)
+            withdrawals (_, _, count) = count
+        -- A presentation hold the owner applied since the generations last
+        -- looked: the target's window was hidden, or is about to be, so its
+        -- active generation presents no more (#357). It is withdrawn before
+        -- any frame of this step, even when the hold is already over and the
+        -- view is eligible again; the step that reconciles it builds the
+        -- replacement.
+        atomically $
+          forM_ (Map.toList observed) $ \(target, current) →
+            when (withdrawals current > maybe 0 withdrawals (Map.lookup target seen)) (withdrawGeneration (stateGenerations state) target)
         owed ← generationsOwed state now
         let targets = [(target, viewTarget view, viewEligibility view == RenderEligible) | (target, view) ← constructed]
         capturing ← atomically (takeRequested (stateCaptures state))
