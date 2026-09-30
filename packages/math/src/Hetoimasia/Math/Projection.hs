@@ -131,12 +131,16 @@ perspective range clipY (Frustum fov aspect near far)
     direction = case clipY of
       YUp → 1
       YDown → -1
-    -- The offsets multiply by the ratio rather than forming @near * far@, which
-    -- would underflow or overflow for extreme but representable planes.
+    -- No intermediate here overflows unless the coefficient it feeds does. The
+    -- offsets multiply by the ratio rather than forming @near * far@, which
+    -- would underflow or overflow for extreme but representable planes, and
+    -- the symmetric range's scale divides each plane separately rather than
+    -- forming @far + near@. Since @|ratio| > 1@, @2 * near@ overflows only
+    -- when the offset itself cannot be represented.
     ratio = far / (near - far)
     (depthScale, depthOffset) = case range of
       ZeroToOne → (ratio, near * ratio)
-      NegativeOneToOne → ((far + near) / (near - far), 2 * near * ratio)
+      NegativeOneToOne → (ratio + near / (near - far), 2 * near * ratio)
 
 -- | The matrix, when every element is finite.
 checked ∷ M44 → Maybe M44

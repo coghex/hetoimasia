@@ -4,7 +4,7 @@
 module Test.Math.Projection (spec) where
 
 import Control.Monad (forM_)
-import Hetoimasia.Math.Matrix (M44, apply)
+import Hetoimasia.Math.Matrix (Index (..), M44, apply, element)
 import Hetoimasia.Math.Projection
   ( ClipY (..)
   , DepthRange (..)
@@ -14,7 +14,7 @@ import Hetoimasia.Math.Projection
   )
 import Hetoimasia.Math.Transform (translation)
 import Hetoimasia.Math.Vector (V3 (..), V4 (..), add, cross, norm, sub)
-import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe)
+import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
 import Test.Hspec.QuickCheck (prop)
 import Test.Math.Support
   ( approx
@@ -134,6 +134,23 @@ spec = describe "Projection" $ do
           forM_ [1, 0.5, -10, 0 / 0, 1 / 0] $ \far →
             perspective range clipY (Frustum 1 1 1 far) `shouldBe` Nothing
 
+        it "accepts planes near the largest Float, whose coefficients are finite" $
+          case perspective range clipY (Frustum (pi / 2) 1 1.0e38 3.0e38) of
+            Nothing → expectationFailure "perspective returned Nothing"
+            Just m → do
+              let (scaleExpected, offsetExpected) = case range of
+                    ZeroToOne → (-1.5, -1.5e38)
+                    NegativeOneToOne → (-2, -3.0e38)
+              shouldApproximate approx (element I2 I2 m) scaleExpected
+              shouldApproximate approx (element I2 I3 m) offsetExpected
+              m `shouldSatisfy` finiteM44
+
+        prop "accepts a valid frustum at any scale and maps its planes" $
+          forAll scaledFrustum $ \f → withProjection range clipY f $ \m →
+            finiteM44 m
+              && approx (depth m (nearPlane f)) (nearEnd range)
+              && approx (depth m (farPlane f)) 1
+
         prop "never returns a non-finite matrix" $
           forAll (Frustum <$> extreme <*> extreme <*> extreme <*> extreme) $ \f →
             maybe True finiteM44 (perspective range clipY f)
@@ -160,6 +177,21 @@ frustum = do
   aspect ← choose (0.1, 10)
   near ← choose (0.01, 10)
   ratio ← choose (1.5, 1000)
+  pure (Frustum fov aspect near (near * ratio))
+
+-- | A valid frustum whose planes lie anywhere from about @1e-30@ to @3e37@:
+-- the near plane a mantissa in @[1, 9.9]@ times a power of ten in
+-- @[1e-30, 1e36]@, and the far plane 1.5 to 3 times as far. The ceiling keeps
+-- the test's own evaluation of a far-plane point finite; the example above
+-- covers planes near the largest @Float@.
+scaledFrustum ∷ Gen Frustum
+scaledFrustum = do
+  fov ← choose (0.1, 3)
+  aspect ← choose (0.1, 10)
+  mantissa ← choose (1, 9.9)
+  exponent' ← choose (-30, 36 ∷ Int)
+  ratio ← choose (1.5, 3)
+  let near = mantissa * 10 ^^ exponent'
   pure (Frustum fov aspect near (near * ratio))
 
 -- | The normalized-device depth of the point on the view axis at a distance.
