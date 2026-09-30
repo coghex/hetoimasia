@@ -688,6 +688,24 @@ module changes only the part its responsibility names, through the shared edits 
 - That a presentation record retiring means an image has appeared on screen.
   Visual timing is a separate question from safe object reuse.
 
+## The placement reference
+
+The package also builds a public sublibrary, `placement-reference`. It holds
+the pure best-fit block placement #331 built and measured against VMA:
+validated configuration, requests and typed rejections; best fit over a free
+list with coalescing, alignment and `bufferImageGranularity`; per-memory-type
+growth and dedicated routing; and a strategy interface. It is **a test
+reference, not production code.** The owner chose VMA for production
+allocation (resource services design D-38) after neither this placement nor a
+mutable prototype of it met the parity gates, which
+[the parity record](gpu_allocator_parity_record.md) retains.
+
+No library depends on it. `gpu-model-tests` tests it — its `placement` group
+checks every rule by hand and against a brute-force best-fit reference over
+generated scripts — and the optional allocator parity probe measures it. The
+model library itself is unchanged by it, and its clients name the main
+library's unit id to tell the two apart.
+
 ## Verification
 
 `test.vulkan` runs `gpu-model-tests`, the package's own suite, through

@@ -84,6 +84,29 @@ library
         containers >=0.8 && <0.9,
         hetoimasia-foundation ==0.1.0.0
 
+-- A test reference, never a production dependency: the pure best-fit block
+-- placement #331 built and measured against VMA before the owner chose VMA for
+-- production allocation (design decision D-38). It is kept because it states
+-- best fit's rules exactly and is tested against them, so tests and the
+-- allocator parity probe can compare other placements with it. Only test suites
+-- may depend on it; the model library does not, and neither may any engine
+-- library. See packages/gpu-vulkan/model/README.md.
+library placement-reference
+    import: language
+    visibility: public
+    hs-source-dirs: placement-reference
+    exposed-modules:
+        Hetoimasia.GPU.Model.Placement
+    other-modules:
+        Hetoimasia.GPU.Model.Internal.Placement.Allocator
+        Hetoimasia.GPU.Model.Internal.Placement.BestFit
+        Hetoimasia.GPU.Model.Internal.Placement.Config
+        Hetoimasia.GPU.Model.Internal.Placement.Strategy
+        Hetoimasia.GPU.Model.Internal.Placement.Types
+    build-depends:
+        base >=4.22 && <4.23,
+        containers >=0.8 && <0.9
+
 -- This package's own contracts. It depends on this library, the foundation, the
 -- neutral `hetoimasia-test-support` library its opacity examples compile
 -- external clients with, and third-party packages alone, so it builds and runs
@@ -101,6 +124,7 @@ test-suite gpu-model-tests
         Test.GPU.Model.Holds
         Test.GPU.Model.Identities
         Test.GPU.Model.Opacity
+        Test.GPU.Model.Placement
         Test.GPU.Model.Progress
         Test.GPU.Model.Recovery
         Test.GPU.Model.Sequences
@@ -112,6 +136,8 @@ test-suite gpu-model-tests
         filepath >=1.5 && <1.6,
         hspec >=2.11 && <3,
         process >=1.6 && <1.7,
+        QuickCheck >=2.15 && <2.19,
         hetoimasia-foundation ==0.1.0.0,
         hetoimasia-gpu-vulkan-model ==0.1.0.0,
+        hetoimasia-gpu-vulkan-model:placement-reference,
         hetoimasia-test-support ==0.1.0.0

@@ -91,7 +91,7 @@ also includes them and must not be used in a PR request.
 | `probe:lua-confinement-linux` / `test.lua-confinement-linux` | `cabal test hetoimasia-scripting-lua:linux-confinement-probe --test-show-details=direct` | Linux only; confinement, limits, isolation, and lifetime feasibility; missing prerequisites can leave evidence unproven |
 | `probe:lua-confinement-macos` / `test.macos-confinement` | `cabal test hetoimasia-scripting-lua:macos-confinement-probe --test-show-details=direct` | Darwin only; confinement and resource-limit feasibility using unsupported interfaces |
 
-Use `--project-file cabal.project.cpu` with these commands when the GLFW SDK
+Use `--project-file cabal.project.cpu` with the `cabal test` commands when the GLFW SDK
 is unavailable. The catalog command deadlines include compilation overhead;
 they are not the probes' expected execution times.
 
@@ -108,6 +108,14 @@ Other existing apparatus is already outside routine automation:
   see [GLFW's native suite](glfw.md#the-native-suite).
 - `lua-hazard callback-cancellation`: unsupported-path manual diagnostic with
   potentially variable/crashing outcomes; not a pass/fail regression.
+- The allocator parity probe,
+  `bash tools/vulkan/run.sh test hetoimasia-gpu-vulkan-native:test:allocator-parity-probe`:
+  #331's measurement of an owned allocator against VMA, kept as the evidence
+  for the resource services design's D-38 ([its record](gpu_allocator_parity_record.md)).
+  It is deliberately not a catalog group: only the three required Vulkan groups
+  may run a Vulkan-project command, and it reports figures rather than Hspec
+  examples. Run it on request, on a quiet machine; about 70 seconds after the
+  build.
 - The [toolchain qualification](toolchain.md): deliberate qualification work,
   outside the routine catalog; follow its own platform and consent rules. The
   retired Vulkan compatibility proof's cases are now the required group

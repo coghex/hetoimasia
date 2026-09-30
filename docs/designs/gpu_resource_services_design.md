@@ -20,10 +20,14 @@ concrete precondition
 ## Processing status
 
 The epic and seventeen slices, accepted for issue processing under D-25 as
-amended by D-28, D-34 and D-37, are all filed as the issues below.
+amended by D-28, D-34 and D-37, are filed as the issues below. On 2026-09-30
+D-38 chose VMA for production allocation: GRS-1 is superseded rather than
+delivered, GRS-11 is rescoped onto VMA (#333 amended), and D-39 adds GRS-18,
+filed as #361.
 
 - [x] EPIC. Establish shared GPU resource services for 2D and 3D consumers — [#330]
-- [x] GRS-1. Place allocations with a pure block allocator proven against VMA — [#331]
+- [x] GRS-1. Place allocations with a pure block allocator proven against VMA — [#331] (superseded by D-38)
+- [x] GRS-18. Qualify the production VMA integration by bounded measurement — [#361]
 - [x] GRS-11. Back allocations with device-memory blocks beneath the model's accounting — [#333]
 - [x] GRS-2. Create managed buffers and images as retained model subjects — [#334]
 - [x] GRS-3. Order access and layout for managed resources through checked operations — [#335]
@@ -54,8 +58,8 @@ amended by D-28, D-34 and D-37, are all filed as the issues below.
   geometry, each proven by offscreen readback with clean synchronization
   validation on the macOS profile and the Linux CI profile (or an honestly
   reported limitation under D-7); a slot swap is proven by readback; windowed
-  frames render with depth; D-14's and D-32's retained comparisons show the
-  allocator at parity with VMA for placement and native allocation.
+  frames render with depth; GRS-18's retained validation shows the VMA
+  integration within its accepted bounds (D-39).
 - **Users and operators:** the later `render-2d` (FND-4) and `render-3d`
   (FND-3) arcs, the content-loading arc (RTC-4), and maintainers reading
   retained evidence.
@@ -76,6 +80,11 @@ ran for this document.
 - **Allocation recovery exists.** VK-14's
   `Native/Internal/Reclamation.hs` runs one bounded reclamation pass and at
   most one retry for a no-effect allocation failure.
+- **Update 2026-09-30 (D-38).** #331 measured an owned allocator against VMA
+  and missed its gates, and the owner chose VMA for production allocation.
+  The evidence is [the parity record](../gpu_allocator_parity_record.md).
+  The facts below are as of 2026-09-29 and still hold: no allocator exists in
+  the engine yet.
 - **There is no allocator.** The only device-memory allocation is the
   readback buffer's, one `allocateMemory` per buffer preferring host-visible
   and cached memory (`native/src/.../Recording/Vulkan.hs:224–243`). VKR-3's
@@ -131,7 +140,8 @@ ran for this document.
 
 ### In scope
 
-- A device-memory allocator beneath the model's accounting (VKR-3).
+- Device-memory allocation through VMA beneath the model's accounting
+  (VKR-3; D-38).
 - Managed buffers and images, including sampled textures, depth attachments
   and offscreen color targets.
 - Access and layout ordering for those resources (VKR-5).
@@ -167,7 +177,9 @@ decision settles one, the decision governs.
 - **P-2. Pure decisions stay testable.** Allocation placement, layout/access
   legality and slot reuse are decided by pure functions beside the model and
   tested in Hspec without a GPU; native layers apply them, following the
-  model/native split already used for generations and recording.
+  model/native split already used for generations and recording. Allocation
+  placement left this list with D-38: VMA places allocations, and the pure
+  placement survives only as a test reference.
 - **P-3. Checked, explicit barriers.** The recorder refuses an access it
   cannot prove ordered, as it refuses a released handle today; no inferred
   render graph.
@@ -244,6 +256,9 @@ preferences, and integrates with the model's accounted bytes and VK-14's
 reclamation. Parity is established by D-14's comparison with VMA, not by
 targets chosen in advance; a failure to reach it reopens this decision
 rather than being waived. D-13 fixes its shape.
+
+Reversed by D-38 on 2026-09-30: parity was not reached
+([the parity record](../gpu_allocator_parity_record.md)).
 
 ### D-5. Include the hot-reload slot swap if it stays tractable
 
@@ -331,6 +346,10 @@ third or more on mip-chained textures (about 1.33× a power of two); fixed
 dedicated-only allocation, adequate for atlased 2D alone but not for 3D's
 many small buffers or allocation during streaming and hot reload.
 
+Superseded by D-38 on 2026-09-30. The pure best-fit placement #331 built is
+kept only as the model package's test-only `placement-reference` sublibrary,
+which no production component depends on.
+
 ### D-14. Prove parity with VMA by replaying identical traces
 
 Owner decision 2026-09-29; resolves the measurement half of D-4. An optional
@@ -346,6 +365,10 @@ streaming or hot-reload churn), with synthetic traces added for 3D-like
 small allocations. VMA exists only in the probe: never an engine
 dependency, and its pinned source is a recorded native input (V-11).
 
+Superseded by D-38 and D-39 on 2026-09-30. The probe, its traces and its
+three runs are retained as D-38's evidence; the placement comparison gates
+nothing further.
+
 ### D-15. The byte budget counts device blocks
 
 Owner decision 2026-09-29; resolves Q-2. The model's accounted bytes charge
@@ -358,6 +381,10 @@ resource counts as reclamation progress for VK-14's retry, since the retry
 may now fit. Rejected: charging each resource's own size, which hides
 fragmentation and block slack; charging both, which gives two backpressure
 sources for one concern.
+
+Amended by D-38 on 2026-09-30: VMA opens and frees the blocks. The budget
+still bounds device memory, and still answers `Backpressure` before memory is
+allocated; D-40 decides how its charges follow VMA's blocks.
 
 ### D-16. Memory types follow what the data is
 
@@ -380,6 +407,10 @@ memory type is retained so free-then-allocate patterns do not thrash native
 allocation, as VMA does. It still counts against the byte budget (D-15), and
 a VK-14 reclamation pass may free it, which counts as progress. Amended by
 D-29: budget backpressure trims cached empty blocks first.
+
+Superseded by D-38 on 2026-09-30: VMA keeps at most one empty block per
+memory type itself and frees any other block that empties. The engine keeps
+no block cache of its own.
 
 ### D-18. Resources rest in a known layout; transitions within a batch are explicit and checked
 
@@ -500,7 +531,9 @@ Amended by D-28, which adds GRS-15 for window-free startup, making fifteen.
 After a review's Q-11–Q-17 were resolved by D-26–D-32, the owner confirmed
 readiness again on 2026-09-29. Amended by D-34, which moves the
 shader-interface check out of GRS-4 into GRS-16, making sixteen, and by
-D-37, which adds GRS-17 for `packages/math`, making seventeen.
+D-37, which adds GRS-17 for `packages/math`, making seventeen. Amended by
+D-38 and D-39, which supersede GRS-1 and add GRS-18 in its place on the
+critical path, keeping seventeen live slices.
 
 ### D-26. Batches enter and leave a resource's resting scope through boundary barriers
 
@@ -564,6 +597,10 @@ VK-14's reclamation is never entered for budget exhaustion
 (`native/src/.../Internal/Reclamation.hs:11`), so it cannot be relied on for
 this.
 
+Amended by D-38 on 2026-09-30: there is no engine-owned empty-block cache to
+trim, and D-40 decides that backpressure does not release VMA's retained
+empty block.
+
 ### D-30. Oversized uploads are refused; large uploads progress in chunks
 
 Owner decision 2026-09-29; resolves Q-15 and amends D-20.
@@ -607,6 +644,10 @@ traces as the owned allocator, and the retained results compare native
 allocation counts, block-open latency, mapping and end-to-end allocate and
 free throughput. Both comparisons stay in optional probes; VMA remains no
 engine dependency.
+
+Superseded by D-39 on 2026-09-30: with no owned allocator there is nothing to
+compare with VMA's. The native measurement moves to GRS-18 as a validation of
+VMA's integration.
 
 ### D-33. One shared ring serves per-batch data
 
@@ -685,15 +726,153 @@ package inside GRS-10, which would put a new public API and a fixture in
 one pull request; a private helper in the sample, which the owner declined
 because the package's time had come.
 
+### D-38. Use VMA for device-memory allocation
+
+Owner decision 2026-09-30; reverses D-4, supersedes D-13, D-14 and D-17, and
+amends D-15 and D-29. #331 measured the owned allocator D-4 made conditional
+on parity. Neither its pure best-fit placement nor a mutable prototype making
+the same decisions met the gates. The prototype was still 2.0–4.4× VMA's
+median time per operation, and the fragmentation and refused-bytes gates
+could not move with speed
+([the parity record](../gpu_allocator_parity_record.md)). Performance is the
+priority, so production allocation uses VMA.
+
+**VMA owns** how memory is laid out:
+
+- opening, sizing and freeing device-memory blocks, and suballocating them,
+  including alignment and `bufferImageGranularity`;
+- dedicated allocations: the driver's preferred or required dedication, and
+  VMA's size heuristic;
+- empty-block retention: at most one empty block per memory type, as VMA does;
+- persistent mapping, and atom-aligned flush and invalidate of host-visible
+  allocations.
+
+**The engine keeps** everything about when memory may be used and freed, and
+who sees it:
+
+- **Resource lifetime.** Every buffer and image, and the VMA allocation behind
+  it, belongs to a managed resource that is a model subject. The model's
+  holds decide disposal. VMA never decides that memory is free: an allocation
+  is freed only when the resource's disposal destroys it, view first, then
+  the resource, then its allocation.
+- **GPU-completion tracking.** VMA tracks no GPU use. An allocation is freed
+  only after the model's completion evidence ends every submitted use, so no
+  allocation still named by a pending submission ever reaches VMA's free.
+  Device loss follows the backend's existing terminal policy.
+- **Threading.** One VMA allocator per device, created, used and destroyed
+  only on the graphics owner thread, with
+  `VMA_ALLOCATOR_CREATE_EXTERNALLY_SYNCHRONIZED_BIT`. No other thread calls
+  VMA, and the design relies on none of VMA's internal locking.
+- **Accounting and backpressure.** The model's validated byte and object
+  budgets (D-11, D-15) and typed `Backpressure`, checked on the owner's
+  thread before memory is allocated, by D-40's mechanism.
+- **Recovery.** VK-14's single reclamation pass and single retry for a
+  no-effect out-of-memory failure from VMA. An uncertain effect is terminal,
+  as today.
+- **Memory-type selection.** The engine chooses the one memory type every
+  allocation uses:
+  - It applies D-16's usage, stated as required and preferred property flags,
+    to the resource's `memoryTypeBits`. It may ask VMA's memory-type query to
+    rank the candidates, but the engine makes the choice.
+  - It pins the choice by passing only that type's bit in the allocation's
+    `memoryTypeBits`, so VMA can neither choose nor fall back to another type.
+    D-40's reservation depends on this.
+  - A usage no memory type can serve is a structured refusal, never a silent
+    fallback.
+- **Retirement.** Every allocation freed before the allocator is destroyed,
+  and the allocator destroyed before the device (the roots'
+  child-before-parent order).
+- **Naming and diagnostics.** Engine objects are named from model identities
+  as today; VMA allocations are named through VMA.
+- **The engine-facing abstraction.** Consumers keep the native backend's
+  managed resources keyed by model identities. No VMA type crosses the native
+  backend's public API: VMA is confined to its internal modules, and the model
+  package never depends on it.
+
+VMA becomes a production native input under V-11. Its pinned version, build
+flags and binding are recorded in `docs/toolchain.md` when GRS-11 integrates
+it. The binding is Q-19. Rejected: continuing to optimise the owned
+allocator, which could at best have closed the speed gate on the sheet
+workload alone; relaxing the gates after the fact.
+
+### D-39. Qualify the VMA integration by bounded measurement before building on it
+
+Owner decision 2026-09-30; supersedes D-32. The virtual-block probe proves
+nothing about the production path: it allocates no device memory and calls
+VMA from C. Before GRS-11 builds on VMA, GRS-18 measures the path the engine
+will use and retains the results:
+
+- **Haskell↔C cost.** Each call the engine will make — create a buffer or
+  image with its allocation, free it, map it, flush it — made through the
+  chosen binding from Haskell, against the same calls driven from C, on a real
+  device. It reports per-call medians and 95th percentiles, and the overhead
+  of the crossing itself.
+- **Representative workloads.** The probe's Synarchy sheet and small-buffer
+  traces replayed as real buffers and images under D-16's usages. It records
+  native allocation counts, per-operation latency and device bytes held.
+- **The completion-deferred free.** Frees delayed until a fence signals, as
+  the model will defer them, with no cost cliff and no allocation freed early.
+- **Ownership.** An externally synchronised allocator used from the owner
+  thread alone.
+
+Its acceptance thresholds are set when GRS-18 is filed. It stays an optional,
+local probe and gates no CI.
+
+### D-40. The byte budget charges VMA's blocks, reserved before one can open
+
+Owner decision 2026-09-30; resolves Q-18 with its option (a), made precise by
+review, and amends D-15 and D-29 for VMA. Keeping D-15's meaning, the model's
+accounted bytes charge the device memory VMA holds — each block and each
+dedicated allocation — not each resource's own size. VMA reports a block only
+after it has opened one, so the budget is enforced by a reservation bounded
+before the call and reconciled after it:
+
+1. **One memory type.** The engine chooses the memory type itself from D-16's
+   usage flags and the resource's `memoryTypeBits`, and passes only that type
+   to VMA. VMA cannot fall back to another type.
+2. **Held memory first.** The request is made with
+   `VMA_ALLOCATION_CREATE_NEVER_ALLOCATE_BIT`. That succeeds only inside
+   memory VMA already holds, and charges nothing new.
+3. **Reserve the most VMA could open.** Otherwise the engine reserves an upper
+   bound on what the allocating call could open: the larger of that memory
+   type's preferred block size and the request's own size. The engine sets
+   the preferred block size in the allocator's configuration and computes it
+   exactly as VMA does. VMA opens no block larger than that, and a dedicated
+   allocation of exactly the request's size. A reservation the budget cannot
+   hold is typed `Backpressure`, answered on the owner's thread before any
+   native call.
+4. **Allocate and reconcile.** VMA's device-memory callbacks run inside the
+   allocating call on the owner's thread and record exactly what it opened.
+   Afterwards the reservation is replaced by that amount — nothing if it
+   opened nothing — and the rest is returned at once.
+   - More than was reserved would contradict VMA's sizing. It is never
+     silently carried over budget: the allocation is freed, and the request
+     fails as an accounting defect.
+5. **Freeing.** The callbacks uncharge a block when VMA frees it. VMA's own
+   retained empty block therefore stays charged, like any other block, until
+   VMA frees it.
+
+The bound is conservative. Near the budget, a request may be refused that a
+smaller block VMA would have chosen could have served; below it, the charge
+is exact. Budget backpressure does not release VMA's retained empty block:
+VMA frees extra empty blocks itself, and D-29's trimming has no engine-owned
+cache to act on. Whether the callbacks cross into Haskell, needing safe
+foreign calls, or count in C is for GRS-18's measurements and GRS-11.
+Rejected: charging each allocation's size (Q-18 (b)), which hides block slack
+as D-15 said; capping heaps with `pHeapSizeLimit` (Q-18 (c)), which loses the
+typed answer; and checking only after `NEVER_ALLOCATE` fails without a
+reservation, which cannot bound what VMA then opens.
+
 ## Open questions
 
 ### Q-1. Allocator shape, memory types and retention
 
-Resolved by D-13, D-14, D-16 and D-17.
+Resolved by D-13, D-14, D-16 and D-17. Shape and retention are resolved again
+by D-38; D-16's memory types stand.
 
 ### Q-2. How allocation meets the model's accounting and recovery
 
-Resolved by D-15.
+Resolved by D-15. Its mechanism under VMA is Q-18, resolved by D-40.
 
 ### Q-3. Who owns access and layout state
 
@@ -754,7 +933,36 @@ Raised by review on 2026-09-29; resolved by D-31.
 
 ### Q-17. Scope of the VMA parity claim
 
-Raised by review on 2026-09-29; resolved by D-32.
+Raised by review on 2026-09-29; resolved by D-32, which D-39 supersedes.
+
+### Q-18. How the byte budget charges memory VMA holds
+
+Raised by D-38 on 2026-09-30; resolved the same day by D-40, which chose (a).
+D-15 charges device blocks, but VMA opens them. The candidates were:
+
+- **(a) Charge blocks, checked before they open.** First place with
+  `VMA_ALLOCATION_CREATE_NEVER_ALLOCATE_BIT`, which only succeeds inside an
+  existing block. When that fails, check the budget for the block or
+  dedicated allocation VMA would open, then allocate. VMA's device-memory
+  callbacks charge and uncharge each block as it opens and frees. This keeps
+  D-15's meaning, at the cost of two calls for a request that opens a block.
+- **(b) Charge each allocation's own size.** Simple, but it hides block slack.
+  D-15 rejected it.
+- **(c) Cap each heap with VMA's `pHeapSizeLimit`.** This loses the typed
+  `Backpressure` answer, because a refusal becomes out-of-memory.
+
+D-29's trimming question folds in here: whether backpressure should first
+release VMA's retained empty block.
+
+### Q-19. Which binding calls VMA in production
+
+Raised by D-38 on 2026-09-30; open, and answered by GRS-18's measurements.
+Candidates:
+
+- the Hackage `VulkanMemoryAllocator` binding, which bundles VMA 3.3.0, makes
+  unsafe foreign calls unless its `safe-foreign-calls` flag is set, and needs
+  Vulkan function pointers from the `vulkan` binding's dispatch;
+- a small engine-owned C shim over the same pinned VMA source.
 
 ## Verification strategy
 
@@ -766,8 +974,9 @@ Raised by review on 2026-09-29; resolved by D-32.
   offscreen readbacks checked against expected pixels by the tests, and
   retained for the agent's report (D-6), within the 30-second required
   native budget (V-10).
-- The allocator's comparisons with VMA retained with their slices: placement
-  in GRS-1 (D-14), native allocation in GRS-11 (D-32).
+- The owned allocator's comparison with VMA is retained as D-38's evidence
+  ([the parity record](../gpu_allocator_parity_record.md)). GRS-18 retains
+  the VMA integration's validation (D-39).
 - Linux CI runs the native group on its pinned software stack; a missing
   feature is reported, never hidden (D-7).
 
@@ -777,6 +986,12 @@ Accepted by D-25, as amended by D-28, in dependency order; each slice is one iss
 pull request.
 
 ### GRS-1. Place allocations with a pure block allocator proven against VMA
+
+> **Superseded 2026-09-30 by D-38.** Delivered as evidence, not as an
+> allocator: the pure placement became the test-only `placement-reference`
+> sublibrary, and the probe and its runs are retained in
+> [the parity record](../gpu_allocator_parity_record.md). Neither Haskell
+> allocator met the gates. GRS-18 replaces this slice on the critical path.
 
 > Filed as #331. Owner clarifications at filing, 2026-09-29: the pure
 > placement algorithm lives in `hetoimasia-gpu-vulkan-model`; parity means
@@ -801,7 +1016,39 @@ pull request.
 - **Out of scope:** device memory, model accounting.
 - **Open questions:** none.
 
+### GRS-18. Qualify the production VMA integration by bounded measurement
+
+> Filed as #361, with proposed thresholds for the owner to confirm before it
+> is solved.
+
+- **Outcome:** retained measurements (D-39) show the chosen binding's
+  Haskell↔C cost, VMA's behaviour on representative workloads on a real
+  device, and the completion-deferred free path, each within accepted bounds.
+  The measurements answer Q-19.
+- **Scope:** an optional local probe in the native package, driving VMA
+  through the candidate binding and through C on a windowless device, over
+  the retained traces; the retained record; the binding choice.
+- **Phase:** memory.
+- **Depends on:** none.
+- **Ordering:** critical path; replaces GRS-1.
+- **Relevant decisions:** D-16, D-38, D-39.
+- **Acceptance signals:** the probe's retained report on macOS stating every
+  threshold met or missed; a binding recommendation.
+- **Out of scope:** engine integration, model accounting (GRS-11).
+- **Open questions:** the acceptance thresholds, settled at filing.
+
 ### GRS-11. Back allocations with device-memory blocks beneath the model's accounting
+
+> **Rescoped 2026-09-30 by D-38: back allocations with VMA beneath the
+> model's accounting.**
+> - VMA replaces the owned blocks, placement, mapping and empty-block cache.
+> - The slice keeps usages and memory-type policy, accounting and
+>   backpressure (D-40), recovery, naming, retirement order and the readback
+>   buffer's move onto the allocator.
+> - It depends on GRS-18 instead of GRS-1, and its native comparison with VMA
+>   is dropped (D-39).
+>
+> #333 was amended to match on 2026-09-30.
 
 > Filed as #333. Owner clarifications at filing, 2026-09-29: the existing
 > readback buffer moves onto the allocator as its first consumer; the native
@@ -810,21 +1057,22 @@ pull request.
 > host-visible blocks are mapped once for their lifetime. #333 also carries
 > D-10's `vulkan_backend_design.md` pointer unless #331 lands it first.
 
-- **Outcome:** blocks and dedicated allocations are native device memory,
-  charged to the model's accounted bytes, freed when empty, and recovered
-  through VK-14.
-- **Scope:** memory-type selection, D-15's charging, growth under D-11's
-  configuration.
+- **Outcome:** device memory comes from VMA, allocated and freed only on the
+  owner thread. It is charged to the model's accounted bytes by D-40's mechanism, freed
+  only once completion evidence allows disposal, and recovered through VK-14.
+- **Scope:** VMA's allocator in the native backend (D-38), D-16's usages as
+  VMA memory-type flags, D-15's charging, and the readback buffer moving onto
+  it.
 - **Phase:** memory.
-- **Depends on:** GRS-1.
+- **Depends on:** GRS-18 (was GRS-1; D-38).
 - **Ordering:** critical path.
-- **Relevant decisions:** D-11, D-13, D-15, D-16, D-17, D-29, D-32.
+- **Relevant decisions:** D-11, D-15, D-16, D-29, D-38, D-39, D-40 (D-13, D-17 and
+  D-32 superseded).
 - **Acceptance signals:** backpressure and reclamation examples over the
-  stand-in, including empty-block trimming before backpressure; native
-  allocation and release with clean validation on both local platforms;
-  the retained native comparison with VMA's real allocator (D-32).
+  stand-in; native allocation and release through VMA with clean validation
+  on both local platforms; no VMA type in the native backend's public API.
 - **Out of scope:** defragmentation, memory-budget extension.
-- **Open questions:** none.
+- **Open questions:** none; Q-18 is resolved by D-40.
 
 ### GRS-2. Create managed buffers and images as retained model subjects
 
