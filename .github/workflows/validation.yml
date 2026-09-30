@@ -161,7 +161,7 @@ jobs:
           arguments+=(--worker "haskell-engine=cpu:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.vulkan,test.vulkan-diagnostics,test.math,smoke.console")
           arguments+=(--worker "haskell-workflow=cpu:test.workflow")
           arguments+=(--worker "glfw-native=display:test.glfw-native,test.glfw-wayland")
-          arguments+=(--worker "vulkan=cpu+display:test.vulkan-headless,test.vulkan-native")
+          arguments+=(--worker "vulkan=cpu+display:test.vulkan-headless,test.vulkan-native,test.vulkan-wayland")
           if [ "$EVENT_NAME" = "pull_request" ]; then
             # A push carries no pull-request body, so it carries no request.
             arguments+=(--request-file request.txt)
@@ -1001,15 +1001,16 @@ jobs:
   vulkan:
     needs: plan
     # The Vulkan project's worker: the Vulkan-linked headless suites, on the
-    # cpu class, and the Vulkan native suite, on the display class. Both run
-    # through cabal.project.vulkan against the image's provisioned native
-    # prefix, so they share one build of the Vulkan closure here rather than
-    # adding it to the other workers' builds. No display helper wraps a group:
-    # the native group's command starts its own isolated X11 display inside
-    # the execution the runner times and watches, so the display's startup and
-    # teardown are part of that measurement and a display that cannot be
-    # established fails the group with a receipt. The headless group acquires
-    # no display at all.
+    # cpu class, and the Vulkan native suite's two profiles, on the display
+    # class. All run through cabal.project.vulkan against the image's
+    # provisioned native prefix, so they share one build of the Vulkan closure
+    # here rather than adding it to the other workers' builds. No display
+    # helper wraps a group: each native group's command starts its own
+    # isolated display inside the execution the runner times and watches — an
+    # X11 display for test.vulkan-native, the headless Wayland compositor for
+    # test.vulkan-wayland — so its startup and teardown are part of that
+    # measurement and a display that cannot be established fails the group
+    # with a receipt. The headless group acquires no display at all.
     if: needs.plan.outputs.vulkan == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -1137,16 +1138,18 @@ jobs:
           done
           exit "$status"
 
-      - name: Summarize the native execution
-        if: always() && hashFiles('receipts/test.vulkan-native.json') != ''
+      - name: Summarize the native executions
+        if: always() && (hashFiles('receipts/test.vulkan-native.json') != '' || hashFiles('receipts/test.vulkan-wayland.json') != '')
         run: |
           set -euo pipefail
-          python3 - receipts/test.vulkan-native.json >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          for group in test.vulkan-native test.vulkan-wayland; do
+            [ -f "receipts/$group.json" ] || continue
+            python3 - "receipts/$group.json" "$group" >> "$GITHUB_STEP_SUMMARY" <<'PY'
           import json, sys
           receipt = json.load(open(sys.argv[1], encoding="utf-8"))
           preparation = receipt["preparation"] or {}
           expiry = receipt["expiry"]
-          print("## test.vulkan-native")
+          print("## " + sys.argv[2])
           print()
           print("| Stage | Outcome | Seconds | Budget |")
           print("| --- | --- | --- | --- |")
@@ -1158,7 +1161,9 @@ jobs:
               print(f"The deadline expired at {expiry['expired_at']}; cleanup took a further {expiry['cleanup_seconds']}s.")
           print()
           print("Evidence: " + (", ".join(receipt["evidence"]) or "none"))
+          print()
           PY
+          done
 
       - name: Save the package store
         if: ${{ !cancelled() && steps.store.outcome == 'success' && steps.store.outputs.cache-hit != 'true' }}
@@ -1207,6 +1212,15 @@ jobs:
         with:
           name: receipt-test.vulkan-native-${{ needs.plan.outputs.identity }}
           path: receipts/test.vulkan-native.json
+          if-no-files-found: error
+          overwrite: true
+
+      - name: Publish the test.vulkan-wayland receipt as reusable evidence
+        if: always() && hashFiles('receipts/test.vulkan-wayland.json') != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: receipt-test.vulkan-wayland-${{ needs.plan.outputs.identity }}
+          path: receipts/test.vulkan-wayland.json
           if-no-files-found: error
           overwrite: true
 

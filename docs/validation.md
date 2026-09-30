@@ -157,6 +157,9 @@ the audited suite inventory, and which optional probes are local-only.
 | `test.macos-confinement` | `cabal test hetoimasia-scripting-lua:macos-confinement-probe --test-show-details=direct` | yes | no | any (component Darwin-only) |
 | `test.glfw-native` | `cabal test glfw-native-tests --test-show-details=direct` | no | no | any |
 | `test.glfw-wayland` | `cabal test glfw-native-tests --test-show-details=direct --test-option=--match --test-option=/GLFW native/on an isolated Wayland session/` | no | no | any |
+| `test.vulkan-headless` | `bash tools/vulkan/run.sh test hetoimasia-gpu-vulkan-native:test:native-tests hetoimasia-gpu-vulkan-native:test:shader-tests hetoimasia-gpu-vulkan-glfw:test:integration-tests hetoimasia-sample-triangle:test:triangle-tests` | no | no | any |
+| `test.vulkan-native` | `bash tools/vulkan/run.sh native hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests -- --complete` | no | no | any |
+| `test.vulkan-wayland` | `bash tools/display/wayland.sh -- bash tools/vulkan/run.sh native hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests -- --complete` | no | no | any |
 
 *Platforms* is the group's `platforms` declaration: *any* is the ordinary group,
 which declares nothing and is applicable everywhere. A plan taken on a platform
@@ -342,6 +345,33 @@ them — `cabal.project.vulkan`, `cabal.project.common`, the sample's executable
 `tools/ci-image/`, `tools/vulkan/`, and `tools/toolchain/binding.pin`. It declares no `platforms`: the shared profile
 applies everywhere, and the one case with no Cocoa equivalent — VK-5's failed
 initialization — reports itself pending on macOS rather than passing.
+
+`test.vulkan-wayland` runs the same suite's whole `--complete` profile on native
+Wayland (WL-4, #327). Its command starts the isolated headless compositor
+itself, around the native runner, so the compositor's startup and teardown are
+inside the execution the runner measures and watches:
+
+```json
+"command": ["bash", "tools/display/wayland.sh", "--", "bash", "tools/vulkan/run.sh", "native", "hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests", "--", "--complete"],
+"timeout_seconds": 30
+```
+
+`tools/display/wayland.sh` gives the command the consent
+`isolated-wayland:<socket>`, which `tools/vulkan/run.sh native` then uses rather
+than starting an X11 display, and under which every session the suite enters
+requests Wayland by name. The group has `test.vulkan-native`'s preparation,
+component and inputs, the `display` class, and the same thirty-second budget; it
+is mandatory outside the floor, required when affected. `--complete` holds it to
+the same rule as on X11 — one shared-session acquisition, and every private
+scenario its consent requires run and passed — and under this consent that
+includes `wayland-connection-loss`, which ends a compositor of its own while
+rendering and is pending under any other consent, and excludes VK-16's
+`vk16-composed`, which is pending there with its reason named: hiding a
+presenting window blocks the graphics owner under Mesa's legacy FIFO on Weston
+13 ([gpu_backend.md](gpu_backend.md#the-native-suite)), an engine gap tracked
+as [#357](https://github.com/coghex/hetoimasia/issues/357). It declares no `platforms`,
+as `test.glfw-wayland` does not: the compositor exists only on Linux, and no
+worker runs it elsewhere. `test.vulkan-native` is unchanged.
 
 Every validation-enabled instance either group creates enables the Khronos
 layer's **synchronization validation** through its own create info
@@ -739,7 +769,7 @@ is the only place the routing between them is written down:
 | Class | What a worker declaring it provides |
 | --- | --- |
 | `cpu` | An ordinary headless worker: builds, Hspec suites, and the console smoke. |
-| `display` | A windowing session — on Linux, an isolated X11 display established for each group it runs, by the worker around the group or by the group's own command inside its execution. |
+| `display` | A windowing session — on Linux, an isolated X11 display or headless Wayland compositor established for each group it runs, by the worker around the group or by the group's own command inside its execution. |
 
 Each worker is declared once, to the planner:
 
@@ -748,7 +778,7 @@ python3 tools/validation/plan.py --base origin/master --head HEAD \
   --worker haskell-engine=cpu:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.vulkan,test.vulkan-diagnostics,test.math,smoke.console \
   --worker haskell-workflow=cpu:test.workflow \
   --worker glfw-native=display:test.glfw-native,test.glfw-wayland \
-  --worker vulkan=cpu+display:test.vulkan-headless,test.vulkan-native
+  --worker vulkan=cpu+display:test.vulkan-headless,test.vulkan-native,test.vulkan-wayland
 ```
 
 Before producing a plan, the planner refuses — naming every problem — a worker
@@ -913,7 +943,7 @@ class to every execution:
 | `haskell-engine` | `cpu` | `build.all`, `test.engine`, `test.foundation`, `test.runtime`, `test.glfw`, `test.scripting-lua`, `test.vulkan`, `test.vulkan-diagnostics`, `test.math`, `smoke.console` |
 | `haskell-workflow` | `cpu` | `test.workflow` |
 | `glfw-native` | `display` | `test.glfw-native`, `test.glfw-wayland` |
-| `vulkan` | `cpu`, `display` | `test.vulkan-headless`, `test.vulkan-native` |
+| `vulkan` | `cpu`, `display` | `test.vulkan-headless`, `test.vulkan-native`, `test.vulkan-wayland` |
 
 A worker runs every group it still has to execute and continues past a failure,
 so the aggregate sees a receipt for each of them rather than inferring the rest
@@ -1073,7 +1103,7 @@ skipped through valid receipt reuse instead.
 
 ### The Vulkan worker
 
-`vulkan` runs the two groups that build through `cabal.project.vulkan`, so the
+`vulkan` runs the three groups that build through `cabal.project.vulkan`, so the
 Vulkan closure — the binding, the native backend, the window integration — is
 built once, in `dist-vulkan`, by one job. It declares both runner classes and
 executes each group with both:
@@ -1090,12 +1120,14 @@ part of the execution the runner measures and watches, and a display that
 cannot be established is that execution failing — with a receipt — rather than
 a job failing before any group began. A command already running inside an
 isolated display, or carrying the desktop opt-in, uses that session and
-starts no second one. The helper keeps its server and window-manager logs in
+starts no second one. `test.vulkan-wayland`'s command starts
+`tools/display/wayland.sh` itself, around the runner, for the same reason, and
+the runner then uses the compositor's consent. The X11 helper keeps its server and window-manager logs in
 the group's evidence directory (`--retain`), and the suite writes each private
 scenario's output and record there too; the worker uploads them with its
 receipts. Its caches are keyed on `cabal.project.vulkan` rather than
 `cabal.project`: `cabal-store-vulkan-…`, falling back to the ordinary store, and
-`dist-vulkan-…`. A job summary shows the native group's preparation and
+`dist-vulkan-…`. A job summary shows each native group's preparation and
 execution times against their budgets.
 
 #### The isolated headless Wayland session

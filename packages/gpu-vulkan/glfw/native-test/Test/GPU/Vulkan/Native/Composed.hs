@@ -95,6 +95,8 @@ import Hetoimasia.Runtime.GLFW
   )
 import Hetoimasia.Runtime.Logging (withLoggingLifetime)
 import Test.GPU.Vulkan.Native.Environment (validationFeatures)
+import Hetoimasia.GLFW.Session (Backend)
+import Test.GPU.Vulkan.Native.Platform (requestingBackend)
 import Test.Vulkan.Proof.Journal (Journal, heading, note)
 import Test.Vulkan.Proof.Roots (NativeCall (..), nativeCallObserver)
 
@@ -132,8 +134,8 @@ data Phase
   | Done
 
 -- | Run the case on the calling thread, which must be the process main thread.
-runComposed ∷ Journal → IO ComposedOutcome
-runComposed journal = do
+runComposed ∷ Maybe Backend → Journal → IO ComposedOutcome
+runComposed backend journal = do
   heading journal "VK-16: two targets rendered through the composed loop, one suspended and resumed while the other presents"
   started ← getCurrentTime
   recorded ← newIORef []
@@ -144,7 +146,7 @@ runComposed journal = do
   scene ← prepare ()
   budgets ← either (stopWith . tshow) pure (validateBudgets defaultBudgetRequest)
   let window name = (hiddenTestWindowConfig name 160 120) {windowVisible = True}
-      host = defaultHostConfig [window "hetoimasia VK-16 first", window "hetoimasia VK-16 second"]
+      host = requestingBackend backend (defaultHostConfig [window "hetoimasia VK-16 first", window "hetoimasia VK-16 second"])
       logger = recordingLogger (\entry → atomically (modifyTVar' logged (entry :)))
       config =
         (vulkanHostConfig host defaultCaptureConfig {captureTextBudget = 16384} budgets scene)
@@ -249,7 +251,10 @@ runComposed journal = do
       deadline ← addUTCTime 15 <$> getCurrentTime
       runVulkanOwnerLoop vulkan control . defaultScheduledHooks quiet $ \_ → do
         now ← getCurrentTime
-        when (now > deadline) (stopWith "the composed loop did not finish within 15 seconds")
+        when (now > deadline) $ do
+          counts ← (,) <$> presents one <*> presents two
+          note journal ("the composed loop reached its deadline having presented " <> tshow counts)
+          stopWith "the composed loop did not finish within 15 seconds"
         demand first one
         demand second two
         current ← readTVarIO phase
@@ -258,6 +263,7 @@ runComposed journal = do
         case current of
           RenderingBoth
             | firstCount >= 3 && secondCount >= 3 → do
+                note journal ("both targets presented three frames " <> tshow (firstCount, secondCount) <> "; hiding the first window")
                 command first hideWindowCommand
                 atomically (writeTVar phase (Hiding (firstCount, secondCount)))
           -- Counted from the turn the suspension was seen: a frame the first
@@ -265,7 +271,9 @@ runComposed journal = do
           -- visible window's.
           Hiding _ → do
             done ← atomically (suspended one)
-            when done (atomically (writeTVar phase (Hidden (firstCount, secondCount))))
+            when done $ do
+              note journal ("the first target is suspended at " <> tshow (firstCount, secondCount))
+              atomically (writeTVar phase (Hidden (firstCount, secondCount)))
           Hidden (firstAt, secondAt)
             | secondCount >= secondAt + 3 → do
                 writeIORef factsHeld . Just $
@@ -282,10 +290,12 @@ runComposed journal = do
                     , factsErrors = []
                     , factsSeconds = 0
                     }
+                note journal ("the second target presented three more frames " <> tshow (firstCount, secondCount) <> "; showing the first window")
                 command first showWindowCommand
                 atomically (writeTVar phase (Showing firstCount))
           Showing firstAt
             | firstCount > firstAt → do
+                note journal ("the first target presented again " <> tshow (firstCount, secondCount))
                 modifyIORef' factsHeld (fmap (\facts → facts {factsAfterShown = firstCount - firstAt}))
                 atomically (writeTVar phase Done)
           _ → pure ()

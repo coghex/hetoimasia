@@ -87,6 +87,14 @@ def load():
 CATALOG = json.loads((ROOT / "tools" / "validation" / "catalog.json").read_text())
 
 
+WAYLAND_HELPER = ["bash", "tools/display/wayland.sh", "--"]
+
+
+def own_compositor(group):
+    """Whether a group's own command starts the isolated compositor around what it runs."""
+    return group.get("command", [])[:len(WAYLAND_HELPER)] == WAYLAND_HELPER
+
+
 def selectors(group):
     options = [w.split("=", 1)[1] for w in group.get("command", []) if w.startswith("--test-option=")]
     return [options[i + 1] for i, o in enumerate(options) if o in ("--match", "-m") and i + 1 < len(options)]
@@ -102,14 +110,17 @@ def hspec_profiles():
         names += [w for w in group.get("command", []) if re.fullmatch(r"[\w-]+:test:[\w-]+", w) and w not in names]
         chosen = selectors(group)
         for component in names:
-            suite = component.split(":")[2] + (f":{group['id'].removeprefix('test.')}" if chosen else "")
+            profiled = chosen or own_compositor(group)
+            suite = component.split(":")[2] + (f":{group['id'].removeprefix('test.')}" if profiled else "")
             found.setdefault((suite, component, tuple(chosen)), []).append(group)
     return found
 
 
 def wayland_groups():
+    """Groups the display worker wraps in the compositor, and groups whose own command starts it."""
     workflow = (ROOT / ".github" / "workflows" / "validation.yml").read_text()
-    return set(re.findall(r'if \[ "\$group" = "([\w.-]+)" \]; then\s+helper=tools/display/wayland\.sh', workflow))
+    wrapped = set(re.findall(r'if \[ "\$group" = "([\w.-]+)" \]; then\s+helper=tools/display/wayland\.sh', workflow))
+    return wrapped | {g["id"] for g in CATALOG["groups"] if own_compositor(g)}
 
 
 class AdapterChecks(unittest.TestCase):
@@ -131,10 +142,13 @@ class AdapterChecks(unittest.TestCase):
         # exact tests (Hspec ORs every --match) and keeps its --skip selectors,
         # so a narrowed profile must narrow only with --match and an unnarrowed
         # one only with --skip; then a selected example never widens a trial.
+        # A profile under a compositor its own command starts runs the whole
+        # executable, so it is unnarrowed like the executable's plain suite.
+        groups = {g["id"]: g for g in CATALOG["groups"]}
         for suite in self.suites.values():
             options = suite.data["options"]
             flags = options[0::2]
-            if ":" in suite.id:
+            if ":" in suite.id and not own_compositor(groups[suite.data["group"]]):
                 self.assertTrue(options and set(flags) == {"--match"}, suite.id)
             else:
                 self.assertTrue(set(flags) <= {"--skip"}, suite.id)
@@ -165,6 +179,27 @@ class AdapterChecks(unittest.TestCase):
             self.assertEqual(prepared.cwd, str(ROOT))
             self.assertEqual(prepared.environment.get("HETOIMASIA_NATIVE_SESSION"),
                              "desktop" if platform == "Darwin" else None)
+
+    def test_the_wayland_vulkan_profile_launches_its_runner_inside_its_own_compositor(self):
+        adapter = self.module.adapter()
+        adapter._toolchain = lambda checkout: PINNED
+        adapter._fingerprints = lambda checkout: []
+        adapter._discovery = lambda checkout, build_dir: {"HETOIMASIA_VULKAN_LIBDIR": "/l", "HETOIMASIA_VULKAN_INCLUDEDIR": "/i"}
+        adapter._list_bin = lambda checkout, flags, component, environment: sys.executable
+        adapter._tools = lambda checkout, component: []
+        suite = self.suites["vulkan-native-tests:vulkan-wayland"]
+        self.assertEqual((suite.data["launch"], suite.data["display"], suite.desktop, suite.platforms),
+                         ("vulkan-native", "wayland", False, ["Linux"]))
+        self.assertEqual(suite.data["options"], [])
+        self.assertNotEqual(suite.identity, self.suites["vulkan-native-tests"].identity)
+        prepared = adapter.prepare(Context("Linux"), suite)
+        # As the catalog command runs it: the compositor around run.sh native,
+        # which then uses the compositor's consent and starts no display.
+        self.assertEqual(prepared.wrapper, ["bash", str(ROOT / "tools" / "display" / "wayland.sh"), "--",
+                                            "bash", str(ROOT / "tools" / "vulkan" / "run.sh"), "native",
+                                            suite.data["component"], "--"])
+        self.assertFalse(prepared.launches_executable)
+        self.assertNotIn("HETOIMASIA_NATIVE_SESSION", prepared.environment)
 
     def test_a_declared_group_preparation_is_the_build(self):
         adapter = self.module.adapter()

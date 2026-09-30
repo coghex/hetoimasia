@@ -26,10 +26,25 @@ typedef struct hetoimasia_proof_window hetoimasia_proof_window;
  * reports neither success nor whether GLFW was already initialized. */
 int hetoimasia_proof_init_vulkan_loader(void *entry);
 
-/* Clear the stored error description, install the shim's error callback, and
- * initialize GLFW. Returns `glfwInit`'s own result. Window hints, the client
- * API among them, belong to `hetoimasia_proof_create_window`. */
-int hetoimasia_proof_glfw_init(void);
+/* The platform a proof session asks GLFW for. `ANY` is GLFW's own default,
+ * which on Linux these sessions have always taken; the others name one
+ * platform, and a session that names one is never answered with another. */
+#define HETOIMASIA_PROOF_PLATFORM_ANY 0
+#define HETOIMASIA_PROOF_PLATFORM_WAYLAND 1
+#define HETOIMASIA_PROOF_PLATFORM_X11 2
+#define HETOIMASIA_PROOF_PLATFORM_COCOA 3
+
+/* Clear the stored error description, install the shim's error callback, set
+ * GLFW's platform initialization hint to `platform`, and initialize GLFW. A
+ * named platform that initialization did not select is a failure: GLFW is
+ * terminated again and the stored description says what it selected instead.
+ * Returns 1 on success and 0 otherwise. Window hints, the client API among
+ * them, belong to `hetoimasia_proof_create_window`. */
+int hetoimasia_proof_glfw_init(int platform);
+
+/* The platform the initialized GLFW selected, as a lower-case name ("wayland",
+ * "x11", "cocoa", "win32", "null"), or "none" when GLFW is not initialized. */
+const char *hetoimasia_proof_glfw_platform(void);
 
 void hetoimasia_proof_glfw_terminate(void);
 

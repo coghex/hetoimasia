@@ -19,6 +19,7 @@ import Control.Concurrent (isCurrentThreadBound, myThreadId)
 import Control.Concurrent.STM (atomically)
 import Control.Monad (when)
 import Data.Maybe (isJust)
+import Data.Text (Text)
 import qualified System.Info as Info
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldNotBe, shouldSatisfy)
 
@@ -62,11 +63,19 @@ import Hetoimasia.GPU.Vulkan.Native.Roots (RootStanding (..), RootTargetView (..
 import Hetoimasia.GLFW.Window (observedRevision)
 import Hetoimasia.Runtime.GLFW (GraphicsService, TargetStanding (..), graphicsAttachment, publishGraphicsObservation, readTargetStanding, windowRenderEligibility)
 import Test.GPU.Vulkan.Native.Fixture
-import Test.Vulkan.Proof.Interop (osThread)
+import Test.GPU.Vulkan.Native.Consent (Consent (..))
+import Test.Vulkan.Proof.Interop (glfwPlatform, osThread)
 import Test.Vulkan.Proof.Roots (NativeCall (..))
 
 spec ∷ Fixture → Spec
 spec fixture = describe "the shared roots" $ do
+  -- First, so every later shared example is known to run on the backend the
+  -- consent asked for: under the isolated compositor's consent the session
+  -- requests Wayland by name, and an X11 or XWayland session never stands in.
+  it "entered GLFW on the backend the run's consent names, before any example renders" $ do
+    selected ← onMain fixture (\_ → glfwPlatform)
+    either (\_ → pure ()) (\consent → selected `shouldBe` expectedPlatform consent) (fixtureConsent fixture)
+
   it "runs every dispatched operation on the process main thread that entered the session" $ do
     example ← myThreadId
     (thread, bound, os) ← onMain fixture (\_ → (,,) <$> myThreadId <*> isCurrentThreadBound <*> osThread)
@@ -337,3 +346,12 @@ standing vulkan service = atomically (readTargetStanding (vulkanGraphicsOwner vu
 
 shouldReturnJust ∷ (Eq a, Show a) ⇒ IO (Maybe a) → a → IO ()
 shouldReturnJust action expected = action >>= (`shouldBe` Just expected)
+
+-- | The platform GLFW selects for a run's consent: Wayland only when the
+-- isolated compositor's consent requested it, and otherwise this platform's
+-- own backend.
+expectedPlatform ∷ Consent → Text
+expectedPlatform = \case
+  IsolatedWayland _ → "wayland"
+  _ | Info.os == "darwin" → "cocoa"
+    | otherwise → "x11"

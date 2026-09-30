@@ -102,6 +102,7 @@ import Hetoimasia.Runtime.GLFW
   , withProtectedWindowHostIn
   )
 import Test.Vulkan.Proof.Interop (Provenance (..), describeProvenance, initVulkanLoader, provenanceOf)
+import Test.GPU.Vulkan.Native.Platform (notePlatform)
 import Test.Vulkan.Proof.Journal (Journal, heading, note)
 
 -- | What a failed initialization left, where one could be provoked.
@@ -166,8 +167,8 @@ absentWaylandDisplay ∷ String
 absentWaylandDisplay = "hetoimasia-vulkan-proof-no-such-display"
 
 -- | Run the session on the process main thread.
-runBridge ∷ Journal → IO BridgeOutcome
-runBridge journal = do
+runBridge ∷ Maybe Backend → Journal → IO BridgeOutcome
+runBridge backend journal = do
   heading journal "VK-5: the loader-aware GLFW surface bridge"
   -- The VK-2 case hands GLFW this same entry point through its throwaway shim
   -- and never takes it back. This session has a process of its own, but it
@@ -175,7 +176,7 @@ runBridge journal = do
   -- one the production shim made whatever ran before it.
   initVulkanLoader nullFunPtr
   note journal "restored GLFW's default loader through the VK-2 shim before the production shim's first setting"
-  outcome ← try @SomeException (session journal)
+  outcome ← try @SomeException (session backend journal)
   case outcome of
     Left failure → do
       note journal ("the bridge session stopped: " <> Text.pack (displayException failure))
@@ -185,15 +186,16 @@ runBridge journal = do
 stopWith ∷ Text → IO a
 stopWith reason = throwIO (userError (Text.unpack reason))
 
-session ∷ Journal → IO BridgeFacts
-session journal = do
+session ∷ Maybe Backend → Journal → IO BridgeFacts
+session backend journal = do
   bindingEntry ←
     Char8.useAsCString "vkGetInstanceProcAddr" (getInstanceProcAddrOf nullPtr) >>= canonical
   (live, afterTermination) ←
     withLoaderIntegration $ \integration → do
       capabilityEntry ← canonical (castFunPtrToPtr (capabilityLoaderEntry integration))
       note journal ("the capability was made from " <> describeProvenance capabilityEntry)
-      live ← withLoaderSession integration defaultSessionConfig $ \glfw → do
+      live ← withLoaderSession integration defaultSessionConfig {requestedBackend = backend} $ \glfw → do
+        notePlatform journal backend
         use ← readIntegrationUse (loaderCapability integration)
         installed ← installedLoaderEntry >>= canonical
         note journal ("while the session is live the shim holds " <> describeProvenance installed)

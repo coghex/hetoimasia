@@ -10,7 +10,11 @@ that selector under the display helper CI gives it, and the executable's
 unnarrowed suite skips those examples, so each example belongs to exactly one
 profile. A group whose command launches its executable through
 `tools/vulkan/run.sh native` is launched the same way, so the runner's source
-digest and revision provenance reach the native suite. A group that declares a
+digest and revision provenance reach the native suite. A group whose own command
+starts the isolated Weston compositor (`tools/display/wayland.sh -- ...`, as
+test.vulkan-wayland's does) runs the whole executable there as a profile of its
+own, `<suite>:<group>`, beside the executable's unnarrowed suite, and is launched
+inside that compositor the same way. A group that declares a
 `preparation` command is prepared by exactly that command, as CI prepares it
 (test.vulkan-native also builds the triangle sample app, so an app that no
 longer builds fails the suite here too). It imports nothing
@@ -119,10 +123,33 @@ def _selectors(group: dict) -> list[str]:
     return found
 
 
+WAYLAND_HELPER = ["bash", "tools/display/wayland.sh", "--"]
+VULKAN_NATIVE = ["bash", "tools/vulkan/run.sh", "native"]
+
+
 def _wayland_groups(checkout: Path) -> set[str]:
-    """Groups CI runs under the isolated Weston compositor rather than isolated X11."""
+    """Groups CI runs under the isolated Weston compositor rather than isolated X11.
+
+    Either the display worker wraps the group in the compositor, or the group's
+    own command starts it.
+    """
     workflow = (checkout / ".github" / "workflows" / "validation.yml").read_text()
-    return set(re.findall(r'if \[ "\$group" = "([\w.-]+)" \]; then\s+helper=tools/display/wayland\.sh', workflow))
+    wrapped = set(re.findall(r'if \[ "\$group" = "([\w.-]+)" \]; then\s+helper=tools/display/wayland\.sh', workflow))
+    catalog = json.loads((checkout / "tools" / "validation" / "catalog.json").read_text())
+    return wrapped | {g["id"] for g in catalog["groups"] if _own_compositor(g)}
+
+
+def _own_compositor(group: dict) -> bool:
+    """Whether a group's own command starts the isolated Weston compositor around what it runs."""
+    return group.get("command", [])[:len(WAYLAND_HELPER)] == WAYLAND_HELPER
+
+
+def _launched_by_vulkan_runner(group: dict) -> bool:
+    """Whether a group's command runs its executable through `tools/vulkan/run.sh native`, directly or inside its own compositor."""
+    command = group.get("command", [])
+    if _own_compositor(group):
+        command = command[len(WAYLAND_HELPER):]
+    return command[:len(VULKAN_NATIVE)] == VULKAN_NATIVE
 
 
 def _routed(checkout: Path) -> set[str]:
@@ -166,20 +193,29 @@ class Hetoimasia:
                 if selectors:
                     suite_name = f"{suite_name}:{group['id'].removeprefix('test.')}"
                     options = [x for s in selectors for x in ("--match", s)]
+                elif _own_compositor(group):
+                    # The whole executable again, under the compositor its
+                    # command starts: a distinct execution profile.
+                    suite_name = f"{suite_name}:{group['id'].removeprefix('test.')}"
+                    options = []
                 else:
                     options = [x for s in narrowed.get(component, []) for x in ("--skip", s)]
                 if suite_name in suites or not cabal.resolve_component(packages, component):
                     continue
                 display = ("wayland" if group["id"] in wayland else
                            "desktop" if group.get("runner") == "display" else None)
-                launch = "vulkan-native" if group.get("command", [])[:3] == ["bash", "tools/vulkan/run.sh", "native"] else "direct"
+                launch = "vulkan-native" if _launched_by_vulkan_runner(group) else "direct"
                 probe = bool(group.get("optional")) and group.get("category") == "probe" and group["id"] not in routed
                 inputs = set(cabal.component_inputs(packages, component)) | set(group.get("inputs", []))
                 inputs |= {"cabal.project", "cabal.project.cpu", "cabal.project.common", "cabal.project.vulkan",
                            "tools/ci-image/toolchain.pin", "tools/toolchain/binding.pin"}
+                # A profile under a compositor its own command starts shares its
+                # executable and options with the unnarrowed suite, so it says
+                # so; every other identity is unchanged.
                 identity = ctx.digest(dict(
                     adapter=adapter_hash, component=component, options=options,
-                    entries=[e for e in entries if any(repository.matches_input(e[0], x) for x in inputs)]))
+                    entries=[e for e in entries if any(repository.matches_input(e[0], x) for x in inputs)],
+                    **({"compositor": group["id"]} if _own_compositor(group) else {})))
                 route = "vulkan" if package in VULKAN_PACKAGES else "glfw" if package in GLFW_PACKAGES else "cpu"
                 suites[suite_name] = ctx.Suite(
                     id=suite_name,
@@ -243,13 +279,18 @@ class Hetoimasia:
             # As test.vulkan-native runs it: run.sh native sets the source digest
             # and revision the native suite's provenance checks require, starts
             # the executable from the repository root, and on Linux starts its
-            # own isolated X11 display.
+            # own isolated X11 display. As test.vulkan-wayland runs it, the
+            # isolated compositor is started around run.sh instead, whose
+            # consent run.sh then uses rather than starting a display.
+            runner = ["bash", str(checkout / "tools" / "vulkan" / "run.sh"), "native", component, "--"]
+            compositor = (["bash", str(checkout / "tools" / "display" / "wayland.sh"), "--"]
+                          if suite.data["display"] == "wayland" else [])
             return ctx.Prepared(
                 argv=[executable, *suite.data["options"]],
                 cwd=str(checkout),
                 environment={"PATH": path, **({"HETOIMASIA_NATIVE_SESSION": "desktop"}
                                               if ctx.platform == "Darwin" and suite.desktop else {})},
-                wrapper=["bash", str(checkout / "tools" / "vulkan" / "run.sh"), "native", component, "--"],
+                wrapper=[*compositor, *runner],
                 launches_executable=False,
                 provenance=dict(component=component, route=route, launch="tools/vulkan/run.sh native",
                                 build=build.get("command"), executable=executable,

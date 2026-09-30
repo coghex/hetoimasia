@@ -11,11 +11,13 @@
 # the window integration package, or turns the GLFW package's Vulkan interop
 # component on — so an ordinary `cabal build all`, with either of the other two
 # project files, neither resolves nor links the Vulkan binding. The validation
-# groups `test.vulkan-headless` and `test.vulkan-native` run through it.
+# groups `test.vulkan-headless`, `test.vulkan-native` and `test.vulkan-wayland`
+# run through it.
 #
 # `build` compiles the named components, and nothing else. `test.vulkan-native`
-# runs it as its preparation stage, so the compilation is recorded apart from
-# the native execution it prepares and never counted in it.
+# and `test.vulkan-wayland` run it as their preparation stage, so the
+# compilation is recorded apart from the native execution it prepares and
+# never counted in it.
 #
 # `test` builds and runs the named test suites. `test.vulkan-headless` runs the
 # native backend's `native-tests` and `shader-tests`, the window integration's
@@ -30,8 +32,10 @@
 # isolated X11 display `tools/display/x11.sh` starts for it, which supplies the
 # consent for that display alone and needs no approval; the display's startup
 # and teardown are part of the run. A run that already carries consent — the
-# isolated display it was started inside, or the desktop opt-in — uses it, and
-# no second display is started. On macOS `HETOIMASIA_NATIVE_SESSION=desktop`
+# isolated display or compositor it was started inside, or the desktop opt-in —
+# uses it, and no second display is started: `test.vulkan-wayland` starts
+# `tools/display/wayland.sh` around this command, so the same suite runs on the
+# isolated headless compositor instead. On macOS `HETOIMASIA_NATIVE_SESSION=desktop`
 # must be on the run's own command, and this supplies none. Every argument
 # after `--` reaches the executable.
 #

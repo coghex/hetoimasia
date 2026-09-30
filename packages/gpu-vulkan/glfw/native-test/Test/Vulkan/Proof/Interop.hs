@@ -19,6 +19,7 @@ module Test.Vulkan.Proof.Interop
 
     -- * GLFW
   , glfwInit
+  , glfwPlatform
   , glfwTerminate
   , requiredInstanceExtensions
   , createProofWindow
@@ -49,6 +50,8 @@ import Foreign.Ptr (FunPtr, Ptr, castFunPtrToPtr, castPtr, nullPtr, plusPtr)
 import Foreign.Storable (peek)
 import Data.Word (Word64)
 
+import Hetoimasia.GLFW.Session (Backend (..))
+
 -- | The shim's opaque window. No GLFW type crosses into Haskell.
 data ProofWindow
 
@@ -56,7 +59,10 @@ foreign import ccall safe "hetoimasia_proof_init_vulkan_loader"
   c_initVulkanLoader ∷ Ptr () → IO CInt
 
 foreign import ccall safe "hetoimasia_proof_glfw_init"
-  c_glfwInit ∷ IO CInt
+  c_glfwInit ∷ CInt → IO CInt
+
+foreign import ccall safe "hetoimasia_proof_glfw_platform"
+  c_glfwPlatform ∷ IO CString
 
 foreign import ccall safe "hetoimasia_proof_glfw_terminate"
   c_glfwTerminate ∷ IO ()
@@ -105,8 +111,23 @@ foreign import ccall safe "hetoimasia_proof_image_of"
 initVulkanLoader ∷ FunPtr a → IO ()
 initVulkanLoader entry = () <$ c_initVulkanLoader (castFunPtrToPtr entry)
 
-glfwInit ∷ IO Bool
-glfwInit = (/= 0) <$> c_glfwInit
+-- | Initialize GLFW, asking it for the backend named, or for GLFW's own
+-- default given 'Nothing'. A named backend that initialization did not select
+-- is a failed initialization, with 'lastGlfwError' saying what was selected
+-- instead, so no other backend ever stands in for the one requested.
+glfwInit ∷ Maybe Backend → IO Bool
+glfwInit requested = (/= 0) <$> c_glfwInit (maybe 0 code requested)
+  where
+    -- The shim's HETOIMASIA_PROOF_PLATFORM_* values.
+    code = \case
+      Wayland → 1
+      X11 → 2
+      Cocoa → 3
+
+-- | The platform the initialized GLFW selected, as a lower-case name, or
+-- @none@ when GLFW is not initialized.
+glfwPlatform ∷ IO Text
+glfwPlatform = Text.pack <$> (c_glfwPlatform >>= peekCString)
 
 glfwTerminate ∷ IO ()
 glfwTerminate = c_glfwTerminate

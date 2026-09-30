@@ -59,11 +59,58 @@ int hetoimasia_proof_init_vulkan_loader(void *entry)
   return 1;
 }
 
-int hetoimasia_proof_glfw_init(void)
+static int platform_code(int platform)
 {
+  switch (platform) {
+  case HETOIMASIA_PROOF_PLATFORM_WAYLAND:
+    return GLFW_PLATFORM_WAYLAND;
+  case HETOIMASIA_PROOF_PLATFORM_X11:
+    return GLFW_PLATFORM_X11;
+  case HETOIMASIA_PROOF_PLATFORM_COCOA:
+    return GLFW_PLATFORM_COCOA;
+  default:
+    return GLFW_ANY_PLATFORM;
+  }
+}
+
+const char *hetoimasia_proof_glfw_platform(void)
+{
+  switch (glfwGetPlatform()) {
+  case GLFW_PLATFORM_WAYLAND:
+    return "wayland";
+  case GLFW_PLATFORM_X11:
+    return "x11";
+  case GLFW_PLATFORM_COCOA:
+    return "cocoa";
+  case GLFW_PLATFORM_WIN32:
+    return "win32";
+  case GLFW_PLATFORM_NULL:
+    return "null";
+  default:
+    return "none";
+  }
+}
+
+int hetoimasia_proof_glfw_init(int platform)
+{
+  int requested = platform_code(platform);
   last_error[0] = '\0';
   glfwSetErrorCallback(record_error);
-  return glfwInit();
+  /* An initialization hint outlives the initialization it was set for, so it
+   * is set on every call, the default included: nothing an earlier session in
+   * this process asked for decides what this one selects. */
+  glfwInitHint(GLFW_PLATFORM, requested);
+  if (!glfwInit()) {
+    return 0;
+  }
+  if (requested != GLFW_ANY_PLATFORM && glfwGetPlatform() != requested) {
+    snprintf(last_error, sizeof last_error,
+             "GLFW initialized the %s platform, not the one this session requested",
+             hetoimasia_proof_glfw_platform());
+    glfwTerminate();
+    return 0;
+  }
+  return 1;
 }
 
 void hetoimasia_proof_glfw_terminate(void)

@@ -2820,9 +2820,9 @@ companions — and adds the Vulkan owner's:
 | Main thread | Hspec runs on a thread of its own; the process main thread owns one shared production graphics session: `withLoaderIntegration`, then `runGraphicsOwnerApplication` over `withVulkanOwnerHost`, with the production native layer and surface bridge. An example that needs the main thread — to hand a window's surface over, which GLFW creates there, or to close a window — submits an operation (`onMain`); the main thread runs it between two turns of the host's owner loop and returns its result or rethrows its failure. Windows are created through the host's command port from the example's own thread, which the owner loop executes, as an application's worker would. |
 | Identities | Every dispatched operation is checked, before it runs, to be on the bound process main thread that entered the session — the Haskell thread, the bound flag, and the OS thread read through `pthread_self` — and a failed check fails the operation and the run. Every native call the session makes is recorded where it runs by a `NativeObserver`, so an example shows from the calls themselves that the instance, its messenger, the device and every surface's destruction ran on the graphics owner's thread and every surface's creation on the main thread — never from the name of an Hspec hook. |
 | Sharing | The roots — the instance, its explicit messenger, and the one device — are acquired lazily, by the first dispatched operation, at most once, and shared by every later example. Each example's windows and targets are its own and are closed inside it. |
-| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, `vk12-frames`, `vk13-presentation`, `vk14-recovery`, `vk15-validation-stop`, `vk15-retention`, `vk16-composed`, `vk17-one-slot`, `vk17-two-slots`, `vk19-capture`, `synchronization-hazard`, and `debug-names`. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. |
-| Selection | Building, listing and filtering the tree, a `--dry-run`, and a selection that dispatches nothing acquire nothing and start no child. A selection matching no example fails. `--complete`, which the catalog group passes, runs the whole tree with Hspec's configuration reading left out and then fails unless the shared session was acquired once and every private scenario ran and passed, so no ambient setting can turn the group's receipt into a pass for a subset. The consent rules and the migrated proof's pure release, construction, publication and loader-selection examples need no session and run without consent. |
-| Consent | Read once, at startup, from `HETOIMASIA_NATIVE_SESSION`, with the GLFW suite's rules for `desktop` and `isolated-x11:<display>`; this suite has no Wayland session. Without it every native example is refused before its body, the session is never acquired, and the run ends with the refusal on stderr and a non-zero exit. |
+| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, `vk12-frames`, `vk13-presentation`, `vk14-recovery`, `vk15-validation-stop`, `vk15-retention`, `vk16-composed`, `vk17-one-slot`, `vk17-two-slots`, `vk19-capture`, `synchronization-hazard`, `debug-names`, and, under the isolated compositor's consent only, `wayland-connection-loss`. Under that consent `vk16-composed` is pending instead, with its reason named, and starts no child. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. Each child runs in a process group of its own under an external 20-second deadline covering its exit and the end of its output; one still running at it is terminated with its group and fails its example as expired. |
+| Selection | Building, listing and filtering the tree, a `--dry-run`, and a selection that dispatches nothing acquire nothing and start no child. A selection matching no example fails. `--complete`, which the catalog group passes, runs the whole tree with Hspec's configuration reading left out and then fails unless the shared session was acquired once and every private scenario the run's consent requires ran and passed — every one, except that `wayland-connection-loss` is required under the isolated compositor's consent and pending under any other, and `vk16-composed` is pending under that consent and required under every other — so no ambient setting can turn the group's receipt into a pass for a subset. The consent rules and the migrated proof's pure release, construction, publication and loader-selection examples need no session and run without consent. |
+| Consent | Read once, at startup, from `HETOIMASIA_NATIVE_SESSION`, with the GLFW suite's rules for `desktop`, `isolated-x11:<display>` and `isolated-wayland:<socket>`: the last only on Linux, only when `WAYLAND_DISPLAY` names that socket, and never beside a `DISPLAY`. Under the Wayland consent every session requests Wayland by name — the shared host, each child's host, the VK-5 bridge's loader-aware session, and the proof shim's raw initialization, which sets `GLFW_PLATFORM` and fails one that selected another platform — so no X11 or XWayland session stands in; under the others every session requests nothing, as before. The first shared example asserts the platform GLFW selected before any example renders. Without consent every native example is refused before its body, the session is never acquired, and the run ends with the refusal on stderr and a non-zero exit. |
 | Environment | Before any Vulkan call, the suite clears every ambient discovery override and every validation-layer setting it finds and records which, disables implicit layers, and points the layer's settings file at an empty one; a child inherits and re-establishes the same environment. |
 | Validation | Every validation-enabled instance, shared or private, enables the Khronos layer and its **synchronization validation** through the instance's own create info. The fixture refuses to run with a set other than the one the provisioned layer is pinned to (`HETOIMASIA_VULKAN_VALIDATION_FEATURES`), which is the one the receipt names. `synchronization-hazard` records two `vkCmdFillBuffer` writes to one buffer with no barrier between them, on an instance the production native layer planned from the same request, and passes only when the capture carries `SYNC-HAZARD-WRITE-AFTER-WRITE` from inside the second write, completely, and its post-teardown verdict fails for that latched error and nothing else — reported apart from the clean profile's verdict and never filtered out of it. |
 | After teardown | The shared session is released only once Hspec has finished: the loop finishes, the host retires every remaining target, and the owner destroys every surface, then the device, then the messenger, then the instance, which is the last native call. Only then does the run check that order, the owner's thread for each of them, and the capture's final verdict, which must be clean: any validation error or incomplete capture fails the run, and the run prints the error records. |
@@ -2850,6 +2850,36 @@ assertions unchanged — VK-2's profile, completion, abandonment and capture,
 with the synchronization-validation finding added; VK-6's C-only capture;
 VK-5's bridge; VK-7's roots through the destruction order at the host's exit —
 and the synchronization control.
+
+The same profile runs on native Wayland as `test.vulkan-wayland` (WL-4, #327):
+`tools/display/wayland.sh` starts packaged Weston headless around the run and
+gives it the consent `isolated-wayland:<socket>`, and every session then
+requests Wayland by name, so the shared roots, every private case but one and
+VK-17's required profile are created, presented to and retired on Wayland
+surfaces through the VK-5 bridge on Lavapipe, under the same completion rules
+as on X11. The exception is VK-16's `vk16-composed`, which is pending there
+with its reason named, by the owner's decision on #327: Weston 13 offers no
+`wp_fifo_v1`, so Mesa's Wayland WSI throttles FIFO with frame callbacks — each
+present waits, with no timeout, for the previous one's callback — and Weston
+fires none for an unmapped surface, so hiding a window whose target is
+presenting blocks the graphics owner in its next present to it. That is an
+engine gap on Wayland, not qualified here and tracked as
+[#357](https://github.com/coghex/hetoimasia/issues/357).
+Its one extra case, `wayland-connection-loss`, starts a Weston of its own and
+renders continuously to one window through the production host; once a
+presentation has been observed retiring on its own present fence it ends that
+compositor from the loop's update, never after an elapsed time. The next event
+processing raises `ConnectionFailed` ([glfw.md](glfw.md#wayland-connection-loss)),
+which ends the loop, and the host's protected exit retires the target, the
+device, the messenger and the instance. The case requires that the application
+end with that loss, a transport closure or protocol failure; that no surface be
+created after it; that every present-fence retirement and every submission
+completion recorded belong to a presentation or submission the owner made, so
+the loss is never recorded as a signalled fence, a completion or a device loss,
+while completion the driver genuinely reports is kept; and that every
+swapchain be destroyed, the roots in dependency order with the instance last,
+with a clean verdict. An expiry of its deadline fails it. Under X11 or desktop
+consent it is pending and asserts nothing.
 
 VK-11's case, `vk11-recording`, runs on private roots because it records
 against a generation of its own and destroys everything it made: the production
@@ -3111,7 +3141,14 @@ bash tools/vulkan/run.sh native hetoimasia-gpu-vulkan-glfw:test:vulkan-native-te
 ```
 
 On Linux the native mode starts an isolated X11 display for the run and needs
-no approval. On macOS the suite opens windows on the owner's desktop. The
+no approval. `test.vulkan-wayland` runs the same profile on the isolated
+headless compositor instead, which needs no approval either:
+
+```bash
+bash tools/display/wayland.sh -- bash tools/vulkan/run.sh native hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests -- --complete
+```
+
+On macOS the suite opens windows on the owner's desktop. The
 owner's standing approval covers a run an issue or pull request needs (see
 [the GLFW native suite](glfw.md#the-native-suite)), so the agent runs it
 without asking, with the consent on that one command:

@@ -611,15 +611,16 @@ spec = describe "Validation evidence reuse" $ do
           workerGroups plan "local-probes" `shouldReturn` [group]
 
   describe "the checked-in routing of the Vulkan groups" $ do
-    it "routes both Vulkan groups to the one worker providing both classes, and publishes each receipt" $
+    it "routes every Vulkan group to the one worker providing both classes, and publishes each receipt" $
       withCheckedInRouting $ \fixture workers → do
         workflow ← readFile =<< ((</> ".github/workflows/validation.yml") <$> getCurrentDirectory)
         change fixture "tools/vulkan/run.sh" "a changed runner\n"
         plan ← planRouted fixture workers "vulkan-routing-plan.json"
-        workerGroups plan "vulkan" `shouldReturn` ["test.vulkan-headless", "test.vulkan-native"]
+        workerGroups plan "vulkan" `shouldReturn` ["test.vulkan-headless", "test.vulkan-native", "test.vulkan-wayland"]
         entryText plan "test.vulkan-headless" "runner" `shouldReturn` Just "cpu"
         entryText plan "test.vulkan-native" "runner" `shouldReturn` Just "display"
-        forM_ ["test.vulkan-headless", "test.vulkan-native"] $ \group → do
+        entryText plan "test.vulkan-wayland" "runner" `shouldReturn` Just "display"
+        forM_ ["test.vulkan-headless", "test.vulkan-native", "test.vulkan-wayland"] $ \group → do
           entryText plan group "reason" `shouldReturn` Just "affected"
           workflow `shouldContain` ("name: receipt-" ++ group ++ "-${{ needs.plan.outputs.identity }}")
           workflow `shouldContain` ("path: receipts/" ++ group ++ ".json")
@@ -632,6 +633,7 @@ spec = describe "Validation evidence reuse" $ do
         prose ← planRouted fixture workers "vulkan-prose-plan.json"
         entryText prose "test.vulkan-headless" "reason" `shouldReturn` Just "unaffected"
         entryText prose "test.vulkan-native" "reason" `shouldReturn` Just "unaffected"
+        entryText prose "test.vulkan-wayland" "reason" `shouldReturn` Just "unaffected"
         change fixture "hetoimasia-gpu-vulkan-glfw/integration-tests/Main.hs" "module Main (main) where\n"
         affected ← planRouted fixture workers "vulkan-headless-plan.json"
         entryText affected "test.vulkan-headless" "reason" `shouldReturn` Just "affected"

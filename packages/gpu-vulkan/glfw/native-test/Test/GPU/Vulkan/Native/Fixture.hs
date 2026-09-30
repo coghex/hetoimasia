@@ -44,6 +44,7 @@ module Test.GPU.Vulkan.Native.Fixture
   , SharedReport (..)
   , ThreadCheck (..)
   , runShared
+  , fixtureConsent
   , onMain
   , sharedHost
   , nativeCalls
@@ -153,7 +154,9 @@ import Hetoimasia.Runtime.GLFW
 import Hetoimasia.Runtime.Logging (withLoggingLifetime)
 import Hetoimasia.Runtime.Supervision (RuntimeControl)
 import Test.GPU.Vulkan.Native.Environment (checkValidationFeatures, validationFeatures)
-import Test.GPU.Vulkan.Native.Gate (Gate, admit)
+import Test.GPU.Vulkan.Native.Consent (Consent, Refusal, consentBackend)
+import Test.GPU.Vulkan.Native.Gate (Gate, admit, gateConsent)
+import Test.GPU.Vulkan.Native.Platform (requestingBackend)
 import Test.Vulkan.Proof.Interop (osThread)
 import Test.Vulkan.Proof.Roots (NativeCall, nativeCallObserver, rootsCaptureConfig)
 
@@ -211,6 +214,11 @@ instance Show Finished where
 
 instance Exception Finished
 
+-- | The consent the run was started with, which names the backend the shared
+-- session requests.
+fixtureConsent ∷ Fixture → Either Refusal Consent
+fixtureConsent = gateConsent . fixtureGate
+
 -- | Run the borrower — the Hspec run — on a thread of its own, and serve its
 -- operations on this one, which must be the process main thread.
 runShared ∷ Gate → (Fixture → IO a) → IO (a, SharedReport)
@@ -267,13 +275,13 @@ acquire fixture verdictCell first = do
   outcome ← try @SomeException $ do
     -- Consent is asked again before anything native is initialized, so an
     -- operation that reached the owner without passing the gate is refused
-    -- here.
-    _ ← admit (fixtureGate fixture)
+    -- here. It also names the backend the session requests.
+    consent ← admit (fixtureGate fixture)
     checkValidationFeatures >>= either (throwIO . userError . Text.unpack) pure
     scene ← prepare ()
     budgets ← either (throwIO . userError . show) pure (validateBudgets defaultBudgetRequest)
     let logger = collectingLogger (fixtureEntries fixture)
-        host = (defaultHostConfig []) {hostIdleWait = 0.02, hostWindowLimit = 8}
+        host = requestingBackend (consentBackend consent) (defaultHostConfig []) {hostIdleWait = 0.02, hostWindowLimit = 8}
         config =
           (vulkanHostConfig host rootsCaptureConfig budgets scene)
             { vulkanLayers = [Encoding.encodeUtf8 "VK_LAYER_KHRONOS_validation"]

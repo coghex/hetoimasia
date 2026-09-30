@@ -145,7 +145,6 @@ import Test.Vulkan.Proof.Interop
   , createWindowSurface
   , destroyProofWindow
   , framebufferSize
-  , glfwInit
   , glfwTerminate
   , initVulkanLoader
   , lastGlfwError
@@ -153,6 +152,8 @@ import Test.Vulkan.Proof.Interop
   , requiredInstanceExtensions
   , setWindowSize
   )
+import Hetoimasia.GLFW.Session (Backend)
+import Test.GPU.Vulkan.Native.Platform (initRequested)
 import Test.Vulkan.Proof.Journal (Journal, heading, note)
 
 type VulkanRoots = Roots Quiesced Instance DebugUtilsMessengerEXT PhysicalDevice Device
@@ -244,8 +245,8 @@ stopWith reason = throwIO (userError (Text.unpack reason))
 -- | Run the case on the calling thread, which must be the process main
 -- thread: GLFW's windows and surfaces are made there, and so is everything
 -- else, since this private process has no other owner.
-runRecovery ∷ Journal → IO RecoveryOutcome
-runRecovery journal = do
+runRecovery ∷ Maybe Backend → Journal → IO RecoveryOutcome
+runRecovery backend journal = do
   heading journal "VK-14: a lost surface replaced on its live window, and an allocation recovered by reclamation"
   logged ← newTVarIO []
   steps ← newIORef []
@@ -261,7 +262,7 @@ runRecovery journal = do
           (callbackSink (\entry → atomically (modifyTVar' logged (entry :))))
   entry ← Char8.useAsCString "vkGetInstanceProcAddr" (getInstanceProcAddr' nullPtr)
   initVulkanLoader entry
-  started ← glfwInit
+  started ← initRequested journal backend
   outcome ←
     if not started
       then (\reason → Left (Text.unpack reason, Nothing)) <$> lastGlfwError

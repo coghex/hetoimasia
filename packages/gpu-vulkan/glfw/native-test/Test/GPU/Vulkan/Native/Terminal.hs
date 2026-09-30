@@ -192,13 +192,14 @@ import Test.Vulkan.Proof.Interop
   , createWindowSurface
   , destroyProofWindow
   , framebufferSize
-  , glfwInit
   , glfwTerminate
   , initVulkanLoader
   , lastGlfwError
   , pollEvents
   , requiredInstanceExtensions
   )
+import Hetoimasia.GLFW.Session (Backend)
+import Test.GPU.Vulkan.Native.Platform (initRequested, requestingBackend)
 import Test.Vulkan.Proof.Journal (Journal, heading, note)
 import Test.Vulkan.Proof.Roots (NativeCall (..), nativeCallObserver)
 
@@ -290,8 +291,8 @@ stopWith ∷ Text → IO a
 stopWith reason = throwIO (userError (Text.unpack reason))
 
 -- | Run the case on the calling thread, which must be the process main thread.
-runValidationStop ∷ Journal → IO ValidationOutcome
-runValidationStop journal = do
+runValidationStop ∷ Maybe Backend → Journal → IO ValidationOutcome
+runValidationStop backend journal = do
   heading journal "VK-15: a validation error during rendering stops the session at its next checkpoint"
   logged ← newTVarIO []
   steps ← newIORef []
@@ -299,7 +300,7 @@ runValidationStop journal = do
   let logger = recordingLogger (\entry → atomically (modifyTVar' logged (entry :)))
   entry ← Char8.useAsCString "vkGetInstanceProcAddr" (getInstanceProcAddr' nullPtr)
   initVulkanLoader entry
-  started ← glfwInit
+  started ← initRequested journal backend
   outcome ←
     if not started
       then (\reason → Left (Text.unpack reason, Nothing)) <$> lastGlfwError
@@ -655,8 +656,8 @@ data RetentionFacts = RetentionFacts
 -- It never returns: once the retention has been reported, the watcher hands
 -- the facts to the continuation, which writes the case's record and
 -- terminates the process.
-runRetention ∷ Journal → (Either Text RetentionFacts → IO ()) → IO a
-runRetention journal conclude = do
+runRetention ∷ Maybe Backend → Journal → (Either Text RetentionFacts → IO ()) → IO a
+runRetention backend journal conclude = do
   heading journal "VK-15: a retained unverified resource, reported rather than released"
   recorded ← newIORef []
   logged ← newTVarIO []
@@ -686,7 +687,7 @@ runRetention journal conclude = do
   conclude (Left ("the host returned, or failed, instead of retaining: " <> either (Text.pack . displayException) (const "it returned") outcome))
   stopWith "the process was not terminated"
   where
-    defaultHost = defaultHostConfig
+    defaultHost = requestingBackend backend . defaultHostConfig
     body vulkan recorded = do
       let controller = vulkanController vulkan
           owner = vulkanGraphicsOwner vulkan

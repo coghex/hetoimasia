@@ -155,7 +155,9 @@ import Hetoimasia.Runtime.GLFW.Trace
   , takeTrace
   )
 import Hetoimasia.Runtime.Logging (withLoggingLifetime)
-import Test.GPU.Vulkan.Native.Consent (Consent, Refusal, refusalMessage)
+import Hetoimasia.GLFW.Session (Backend)
+import Test.GPU.Vulkan.Native.Consent (Consent, Refusal, consentBackend, refusalMessage)
+import Test.GPU.Vulkan.Native.Platform (requestingBackend)
 import Test.GPU.Vulkan.Native.Environment (validationFeatures)
 import Test.GPU.Vulkan.Native.Gate (Gate, admit)
 
@@ -247,7 +249,7 @@ runInteractionProbe = \case
   Left refusal → do
     hPutStrLn stderr ("vulkan-native-tests interaction probe: " <> Text.unpack (refusalMessage refusal))
     exitWith (ExitFailure 3)
-  Right _ → do
+  Right consent → do
     environment ← getEnvironment
     seconds ← case probeActivation environment of
       Left inactive → hPutStrLn stderr (inactiveMessage inactive) >> exitWith (ExitFailure 2)
@@ -255,7 +257,7 @@ runInteractionProbe = \case
     duration ← case durationFromSeconds RequirePositive seconds of
       Right converted → pure (convertedDuration converted)
       Left rejected → failWith (probeVariable <> " is not a duration: " <> show rejected)
-    outcome ← try @SomeException (measure duration)
+    outcome ← try @SomeException (measure (consentBackend consent) duration)
     case outcome of
       Left failure → failWith ("the probe failed: " <> displayException failure)
       Right (device, verdict, results) → do
@@ -307,8 +309,8 @@ verdictProblems = \case
 -- Measuring
 
 -- | Run the composed loop through every phase, on the process main thread.
-measure ∷ Duration → IO (Text, Maybe DiagnosticVerdict, [PhaseResult])
-measure duration = do
+measure ∷ Maybe Backend → Duration → IO (Text, Maybe DiagnosticVerdict, [PhaseResult])
+measure backend duration = do
   traced ← newIORef Nothing
   collected ← newIORef []
   verdictHeld ← newIORef Nothing
@@ -316,7 +318,7 @@ measure duration = do
   -- The scene the owner renders is its publication's number.
   scene ← prepare (0 ∷ Natural)
   budgets ← either (\rejected → failWith ("the budgets were refused: " <> show rejected)) pure (validateBudgets defaultBudgetRequest)
-  let host = defaultHostConfig [defaultWindowConfig "Hetoimasia graphics-owner interaction probe" 640 480]
+  let host = requestingBackend backend (defaultHostConfig [defaultWindowConfig "Hetoimasia graphics-owner interaction probe" 640 480])
       config =
         (vulkanHostConfig host defaultCaptureConfig {captureTextBudget = 16384} budgets scene)
           { vulkanLayers = ["VK_LAYER_KHRONOS_validation"]

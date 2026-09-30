@@ -119,6 +119,8 @@ import Hetoimasia.Runtime.Logging (withLoggingLifetime)
 import Hetoimasia.Sample.Triangle (Builders (..), Triangle, drawTriangle, newTriangle, triangleFormats)
 import Hetoimasia.Sample.Triangle.Geometry (clearColour, interior, triangleColour)
 import Test.GPU.Vulkan.Native.Environment (validationFeatures)
+import Hetoimasia.GLFW.Session (Backend)
+import Test.GPU.Vulkan.Native.Platform (requestingBackend)
 import Test.Vulkan.Proof.Journal (Journal, heading, note)
 import Test.Vulkan.Proof.Roots (NativeCall (..), nativeCallObserver)
 
@@ -175,8 +177,8 @@ data Step
 
 -- | Run one profile, with this many frame slots, on the calling thread, which
 -- must be the process main thread.
-runProfile ∷ Natural → Journal → IO ProfileOutcome
-runProfile slots journal = do
+runProfile ∷ Maybe Backend → Natural → Journal → IO ProfileOutcome
+runProfile backend slots journal = do
   heading journal ("VK-17: the triangle sample in two windows, resized and closed, with " <> tshow slots <> " frame slot(s)")
   started ← getCurrentTime
   recorded ← newIORef []
@@ -189,7 +191,7 @@ runProfile slots journal = do
   outcome ← try @SomeException $ do
     budgets ← either (stopWith . tshow) pure (validateBudgets defaultBudgetRequest {requestedFrameSlots = fromIntegral slots})
     let window name = (hiddenTestWindowConfig name 160 120) {windowVisible = True}
-        host = defaultHostConfig [window "hetoimasia VK-17 first", window "hetoimasia VK-17 second"]
+        host = requestingBackend backend (defaultHostConfig [window "hetoimasia VK-17 first", window "hetoimasia VK-17 second"])
         logger = recordingLogger (\entry → atomically (modifyTVar' logged (entry :)))
         config =
           (vulkanHostConfig host defaultCaptureConfig {captureTextBudget = 16384} budgets scene)

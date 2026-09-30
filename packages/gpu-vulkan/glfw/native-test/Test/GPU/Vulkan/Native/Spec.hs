@@ -12,7 +12,8 @@ module Test.GPU.Vulkan.Native.Spec (spec) where
 import Data.IORef (IORef)
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 
-import Test.GPU.Vulkan.Native.Consent (Consent (..), Refusal (..), consentFrom)
+import Hetoimasia.GLFW.Session (Backend (Wayland))
+import Test.GPU.Vulkan.Native.Consent (Consent (..), Refusal (..), consentBackend, consentFrom)
 import Test.GPU.Vulkan.Native.Fixture (Fixture)
 import Test.GPU.Vulkan.Native.Gate (Gate)
 import qualified Test.GPU.Vulkan.Native.Interaction as Interaction
@@ -49,10 +50,31 @@ consent = do
     consentFrom "linux" [("HETOIMASIA_NATIVE_SESSION", "isolated-x11::7"), ("DISPLAY", ":8")] `shouldSatisfy` refused
     consentFrom "darwin" [("HETOIMASIA_NATIVE_SESSION", "isolated-x11::7"), ("DISPLAY", ":7")] `shouldSatisfy` refused
 
-  it "takes nothing else as consent: an unset or empty variable, another value, a bare DISPLAY, or CI" $ do
+  it "accepts an isolated Wayland socket only on Linux, only for the socket WAYLAND_DISPLAY names, and never beside a DISPLAY" $ do
+    consentFrom "linux" [("HETOIMASIA_NATIVE_SESSION", "isolated-wayland:hetoimasia-7"), ("WAYLAND_DISPLAY", "hetoimasia-7")]
+      `shouldBe` Right (IsolatedWayland "hetoimasia-7")
+    consentFrom "darwin" [("HETOIMASIA_NATIVE_SESSION", "isolated-wayland:hetoimasia-7"), ("WAYLAND_DISPLAY", "hetoimasia-7")]
+      `shouldBe` Left (WaylandIsolationOffPlatform "hetoimasia-7" "darwin")
+    consentFrom "linux" [("HETOIMASIA_NATIVE_SESSION", "isolated-wayland:hetoimasia-7"), ("WAYLAND_DISPLAY", "hetoimasia-7"), ("DISPLAY", ":7")]
+      `shouldBe` Left (WaylandIsolationBesideX11 "hetoimasia-7" ":7")
+    consentFrom "linux" [("HETOIMASIA_NATIVE_SESSION", "isolated-wayland:hetoimasia-7"), ("WAYLAND_DISPLAY", "hetoimasia-7"), ("DISPLAY", "")]
+      `shouldBe` Left (WaylandIsolationBesideX11 "hetoimasia-7" "")
+    consentFrom "linux" [("HETOIMASIA_NATIVE_SESSION", "isolated-wayland:hetoimasia-7"), ("WAYLAND_DISPLAY", "wayland-0")]
+      `shouldBe` Left (WaylandIsolationElsewhere "hetoimasia-7" (Just "wayland-0"))
+    consentFrom "linux" [("HETOIMASIA_NATIVE_SESSION", "isolated-wayland:hetoimasia-7")]
+      `shouldBe` Left (WaylandIsolationElsewhere "hetoimasia-7" Nothing)
+    consentFrom "linux" [("HETOIMASIA_NATIVE_SESSION", "isolated-wayland:"), ("WAYLAND_DISPLAY", "")] `shouldSatisfy` refused
+
+  it "requests Wayland by name under the isolated compositor's consent, and nothing under any other" $ do
+    consentBackend (IsolatedWayland "hetoimasia-7") `shouldBe` Just Wayland
+    consentBackend (IsolatedX11 ":7") `shouldBe` Nothing
+    consentBackend Desktop `shouldBe` Nothing
+
+  it "takes nothing else as consent: an unset or empty variable, another value, a bare DISPLAY or WAYLAND_DISPLAY, or CI" $ do
     consentFrom "linux" [] `shouldBe` Left NoConsent
     consentFrom "linux" [("HETOIMASIA_NATIVE_SESSION", "")] `shouldBe` Left NoConsent
-    consentFrom "linux" [("HETOIMASIA_NATIVE_SESSION", "isolated-wayland:wayland-1")] `shouldSatisfy` refused
+    consentFrom "linux" [("HETOIMASIA_NATIVE_SESSION", "wayland")] `shouldSatisfy` refused
     consentFrom "linux" [("DISPLAY", ":0"), ("CI", "true")] `shouldBe` Left NoConsent
+    consentFrom "linux" [("WAYLAND_DISPLAY", "wayland-0"), ("CI", "true")] `shouldBe` Left NoConsent
   where
     refused = either (const True) (const False)

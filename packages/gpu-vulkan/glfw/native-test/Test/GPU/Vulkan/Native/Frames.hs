@@ -118,12 +118,13 @@ import Test.Vulkan.Proof.Interop
   ( createProofWindow
   , createWindowSurface
   , destroyProofWindow
-  , glfwInit
   , glfwTerminate
   , initVulkanLoader
   , lastGlfwError
   , requiredInstanceExtensions
   )
+import Hetoimasia.GLFW.Session (Backend)
+import Test.GPU.Vulkan.Native.Platform (initRequested)
 import Test.Vulkan.Proof.Journal (Journal, heading, note)
 
 type VulkanRoots = Roots Quiesced Instance DebugUtilsMessengerEXT PhysicalDevice Device
@@ -213,8 +214,8 @@ stopWith reason = throwIO (userError (Text.unpack reason))
 -- | Run the case on the calling thread, which must be the process main
 -- thread: GLFW's window and surface are made there, and so is everything
 -- else, since this private process has no other owner.
-runFrames ∷ Journal → IO FramesOutcome
-runFrames journal = do
+runFrames ∷ Maybe Backend → Journal → IO FramesOutcome
+runFrames backend journal = do
   heading journal "VK-12: frames acquired, submitted, awaited and returned without presenting"
   logged ← newTVarIO []
   steps ← newIORef []
@@ -230,7 +231,7 @@ runFrames journal = do
           (callbackSink (\entry → atomically (modifyTVar' logged (entry :))))
   entry ← Char8.useAsCString "vkGetInstanceProcAddr" (getInstanceProcAddr' nullPtr)
   initVulkanLoader entry
-  started ← glfwInit
+  started ← initRequested journal backend
   outcome ←
     if not started
       then (\reason → Left (Text.unpack reason, Nothing)) <$> lastGlfwError
