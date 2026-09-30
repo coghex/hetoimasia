@@ -32,8 +32,9 @@ status is 0 when every gate is met for both Haskell implementations, 1 when a
 gate is missed on a gated trace, and 2 when a self-check fails. A miss is
 reported as a miss, never waived.
 
-The probe is the optional, local-only validation group `test.allocator-parity`:
-no CI worker runs it and no change selects it. It is built only through
+The probe is local apparatus, not a validation group: no CI worker runs it and
+no change selects it, and `docs/test_classification.md` lists it with the other
+work outside routine automation. It is built only through
 `cabal.project.vulkan`, and here VMA reaches this test suite alone. Take
 timings only on a quiet machine; each report records the load average at its
 start.

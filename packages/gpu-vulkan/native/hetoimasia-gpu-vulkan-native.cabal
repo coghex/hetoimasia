@@ -288,10 +288,10 @@ test-suite native-tests
 -- the committed traces replayed into one fixed block through the pure placement
 -- reference, a mutable prototype of it and VMA's virtual block, timed, and
 -- judged against #331's requirement 7. Neither Haskell allocator met those
--- gates, and the owner chose VMA for production allocation. The probe is
--- optional and local-only — the validation group `test.allocator-parity`,
--- which no CI worker runs and no change selects — and is built and run only
--- through `tools/vulkan/run.sh`. Here VMA is the copy the pinned Hackage
+-- gates, and the owner chose VMA for production allocation. The probe is local
+-- apparatus, deliberately not a validation group — only the three required
+-- Vulkan groups may run a Vulkan-project command — so nothing selects it; it
+-- is built and run on request through `tools/vulkan/run.sh`. Here VMA is the copy the pinned Hackage
 -- `VulkanMemoryAllocator` package compiles, reaching this suite alone. See
 -- probe/allocator-parity/README.md and docs/gpu_allocator_parity_record.md.
 test-suite allocator-parity-probe

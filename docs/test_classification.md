@@ -77,7 +77,7 @@ an ordinary example hanging during protected cleanup.
 
 ## Local probe inventory
 
-All six catalog groups below have `optional: true`, `category: probe`, and no
+All five catalog groups below have `optional: true`, `category: probe`, and no
 CI worker assignment. They remain in the catalog so their commands, ownership,
 inputs, and platform constraints have one authority. They must not be named in
 a PR `validation-request` block; a hosted plan cannot route them. `all-hspec`
@@ -90,7 +90,6 @@ also includes them and must not be used in a PR request.
 | `probe:lua-nontermination` / `test.lua-hazard` | `cabal test hetoimasia-scripting-lua:lua-hazard-probes --test-show-details=direct` | Five-second cancellation observation of deliberately nonterminating Lua in a child that the probe terminates |
 | `probe:lua-confinement-linux` / `test.lua-confinement-linux` | `cabal test hetoimasia-scripting-lua:linux-confinement-probe --test-show-details=direct` | Linux only; confinement, limits, isolation, and lifetime feasibility; missing prerequisites can leave evidence unproven |
 | `probe:lua-confinement-macos` / `test.macos-confinement` | `cabal test hetoimasia-scripting-lua:macos-confinement-probe --test-show-details=direct` | Darwin only; confinement and resource-limit feasibility using unsupported interfaces |
-| `probe:allocator-parity` / `test.allocator-parity` | `bash tools/vulkan/run.sh test hetoimasia-gpu-vulkan-native:test:allocator-parity-probe` | About 70 seconds after the build; replays 19 traces through the pure placement reference, its mutable prototype and VMA's virtual block, and reports #331's gates. Timings need a quiet machine. Retained as D-38's evidence ([record](gpu_allocator_parity_record.md)); not an Hspec suite, so quruntul derives none |
 
 Use `--project-file cabal.project.cpu` with the `cabal test` commands when the GLFW SDK
 is unavailable. The catalog command deadlines include compilation overhead;
@@ -109,6 +108,14 @@ Other existing apparatus is already outside routine automation:
   see [GLFW's native suite](glfw.md#the-native-suite).
 - `lua-hazard callback-cancellation`: unsupported-path manual diagnostic with
   potentially variable/crashing outcomes; not a pass/fail regression.
+- The allocator parity probe,
+  `bash tools/vulkan/run.sh test hetoimasia-gpu-vulkan-native:test:allocator-parity-probe`:
+  #331's measurement of an owned allocator against VMA, kept as the evidence
+  for the resource services design's D-38 ([its record](gpu_allocator_parity_record.md)).
+  It is deliberately not a catalog group: only the three required Vulkan groups
+  may run a Vulkan-project command, and it reports figures rather than Hspec
+  examples. Run it on request, on a quiet machine; about 70 seconds after the
+  build.
 - The [toolchain qualification](toolchain.md): deliberate qualification work,
   outside the routine catalog; follow its own platform and consent rules. The
   retired Vulkan compatibility proof's cases are now the required group

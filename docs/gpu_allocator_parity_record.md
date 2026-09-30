@@ -164,5 +164,5 @@ bash tools/vulkan/run.sh test hetoimasia-gpu-vulkan-native:test:allocator-parity
 ```
 
 Take timings only on a quiet machine. Each report records the load average at
-its start. The validation group `test.allocator-parity` names the same
-command, and it is optional and local-only.
+its start. The probe is local apparatus outside routine automation, not a
+validation group ([test classification](test_classification.md)).
