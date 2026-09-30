@@ -27,6 +27,10 @@
 -- | The port reservations| This lifetime    | The main thread alone           | Any    | The owner worker's  | Each is released by the send  |
 -- |                      |                  |                                 |        | lifetime            | that spends it                |
 -- +----------------------+------------------+---------------------------------+--------+---------------------+-------------------------------+
+-- | Presentation holds   | This lifetime    | The main thread asks and lifts; | Any    | From a hide until a | Pruned by the owner's step    |
+-- | and the presenting   |                  | the owner's step prunes and     |        | newer observation;  | once obsolete or unowned;     |
+-- | set                  |                  | writes the presenting set       |        | the set, one step   | at most one per attachment    |
+-- +----------------------+------------------+---------------------------------+--------+---------------------+-------------------------------+
 module Hetoimasia.Runtime.GLFW.Internal.Owner.State
   ( -- * The owner handle
     GraphicsOwner (..)
@@ -39,6 +43,7 @@ module Hetoimasia.Runtime.GLFW.Internal.Owner.State
   , TargetStanding (..)
   , standingOf
   , initialEligibility
+  , Withheld (..)
 
     -- * Who owes an attachment's settlement
   , Custody (..)
@@ -52,6 +57,7 @@ module Hetoimasia.Runtime.GLFW.Internal.Owner.State
 import Control.Concurrent.STM (STM, TVar)
 import Control.Exception (ExceptionWithContext, SomeException)
 import Data.Map.Strict (Map)
+import Data.Set (Set)
 import Hetoimasia.Foundation.Time (MonotonicSource)
 import Hetoimasia.Foundation.Worker (Worker, WorkerGroup)
 import Hetoimasia.GLFW.Internal.Attachment (Acknowledgement, AttachmentId)
@@ -77,6 +83,9 @@ data TargetState = TargetState
     -- design admits no blind retry, and an operation that failed once may
     -- have disposed part of what it owns. Only independent evidence settles
     -- it.
+  , targetWithdrawals ∷ !Natural
+    -- ^ The latest presentation hold a step has applied to it, which only
+    -- rises. See 'Withheld'.
   }
 
 -- | Where a target's construction settled, which is what decides whether the
@@ -237,6 +246,15 @@ data GraphicsOwner scene = GraphicsOwner
     -- ^ The demand and scene snapshot revisions the owner's last step read.
     -- Its wait compares them, so a publication into either really does wake
     -- an idle owner rather than sitting until something else does.
+  , ownerWithheld ∷ !(TVar (Map AttachmentId Withheld))
+    -- ^ The presentation holds standing, one per attachment at most. The main
+    -- thread asks for and lifts them; the owner's step prunes them.
+  , ownerWithholdRequests ∷ !(TVar Natural)
+    -- ^ How many holds the main thread has asked for. Only rises.
+  , ownerPresenting ∷ !(TVar (Set AttachmentId))
+    -- ^ The targets the step in flight may present to: written in the
+    -- transaction that read its inputs, and emptied when it returns. A hide
+    -- waits while its window's target is in it.
   , ownerPending ∷ !(STM [AttachmentId])
     -- ^ The host's own pending-attachment set, read only. It is what tells the
     -- owner that an exact attachment has validated the facts it established,
@@ -263,6 +281,24 @@ data GraphicsOwner scene = GraphicsOwner
     -- passes 'noHostHooks', whose is @pure ()@.
   , ownerSettings ∷ !(GraphicsOwnerConfig scene)
   }
+
+-- | One presentation hold the main thread asked for before hiding a target's
+-- window ('Hetoimasia.Runtime.GLFW.Internal.Owner.Withhold').
+--
+-- While it stands and the owner has folded no observation newer than
+-- 'withheldBound', every step views the target as suspended, so nothing is
+-- presented to the window the hide unmaps. Each step that finds it also
+-- raises the target's 'targetWithdrawals' to 'withheldRequest', and hands that
+-- count to the backend, which must not present again to what the target
+-- presented to before: the compositor may never answer a presentation it was
+-- made for a surface it has since unmapped.
+data Withheld = Withheld
+  { withheldRequest ∷ !Natural
+    -- ^ The owner's count of holds asked for, when this one was.
+  , withheldBound ∷ !Natural
+    -- ^ The observation revision published for the target when it was asked.
+  }
+  deriving (Eq, Show)
 
 -- | The most failures an owner over a host of this many windows keeps.
 --

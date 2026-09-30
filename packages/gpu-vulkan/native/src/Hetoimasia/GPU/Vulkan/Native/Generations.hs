@@ -124,7 +124,8 @@
 -- |                  | constructors, 'trackTarget', the failures and  |                                    |
 -- |                  | the helpers every other module shares          |                                    |
 -- +------------------+------------------------------------------------+------------------------------------+
--- | @Uses@           | 'noteSwapchainResult' and CPU uses, in 'STM'   | @State@                            |
+-- | @Uses@           | 'noteSwapchainResult', 'withdrawGeneration'    | @State@                            |
+-- |                  | and CPU uses, in 'STM'                         |                                    |
 -- +------------------+------------------------------------------------+------------------------------------+
 -- | @Disposal@       | Making the generations, with their disposer;   | @State@                            |
 -- |                  | destroying generations whose holds ended, child|                                    |
@@ -191,6 +192,7 @@ module Hetoimasia.GPU.Vulkan.Native.Generations
     -- * Reports from swapchain calls
   , SwapchainResult (..)
   , noteSwapchainResult
+  , withdrawGeneration
 
     -- * CPU use
   , GenerationUse
@@ -260,4 +262,5 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Generations.Uses
   , endGenerationUse
   , noteSwapchainResult
   , useGeneration
+  , withdrawGeneration
   )

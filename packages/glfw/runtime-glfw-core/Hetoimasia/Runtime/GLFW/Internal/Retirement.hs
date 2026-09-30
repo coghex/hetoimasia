@@ -127,6 +127,7 @@ module Hetoimasia.Runtime.GLFW.Internal.Retirement
   , attachmentViewOf
   , certifyRetirementFact
   , windowAttachmentState
+  , windowAttachmentProtocol
 
     -- * Detaching and in-run progress
   , DetachAnswer (..)
@@ -543,6 +544,16 @@ data CompletionPolicy
 -- may wait on a GPU, wait on a worker, or pump native events.
 -- 'protocolStep' is one bounded opportunity that must return finitely.
 --
+-- 'protocolBeforeHide' is the one exception, and it is bounded. Before the
+-- host hides a window natively, the integration presenting to it must have
+-- stopped: a present made to a surface the compositor has since unmapped need
+-- never return — Mesa's legacy FIFO on Wayland waits for a frame callback the
+-- compositor never sends one — and it would block the graphics owner for ever
+-- (#357). So the callback may wait for the graphics owner's step in flight to
+-- end, when that step may present to the window. A step must return finitely
+-- and the graphics owner never waits for this thread, so the wait is one step
+-- at most, and it pumps nothing.
+--
 -- That permission does not move the graphics owner's responsibilities into a
 -- callback. Under the lifetime design's D-6, GPU effects and disposal of
 -- graphics-owned dependents execute on the graphics owner's own thread: a
@@ -592,6 +603,13 @@ data AttachmentProtocol = AttachmentProtocol
     -- ^ Whether a failed step is one this integration recognizes. An
     -- unrecognized failure is fatal whatever the disposition says, as are a
     -- cancellation and a failure that retained cleanup evidence.
+  , protocolBeforeHide ∷ AttachmentId → IO (IO ())
+    -- ^ Runs on the owner thread before a hide control's native call, while
+    -- this attachment holds the window's slot. It returns once the owner will
+    -- present to the window no more until an observation newer than the one
+    -- already published for it arrives, and answers the action that lifts
+    -- that hold, which the host runs when the control made no native call. An
+    -- integration that presents nothing answers @pure (pure ())@.
   }
 
 -- | How a request to attach was answered.
@@ -946,6 +964,18 @@ windowAttachmentState retirement window = do
   pure $ case windowVeto window model of
     Right (VetoedByAttachment target phase missing) → Just (target, phase, missing)
     _ → Nothing
+
+-- | The attachment occupying a window's slot, whatever its phase, with the
+-- protocol it registered, or 'Nothing' when the slot is free. Any thread may
+-- read it; running the protocol's callbacks is the owner thread's.
+windowAttachmentProtocol ∷ HostRetirement → WindowId → STM (Maybe (AttachmentId, AttachmentProtocol))
+windowAttachmentProtocol retirement window = do
+  occupant ← windowAttachmentState retirement window
+  registrations ← readTVar (retirementRegistrations retirement)
+  pure $ do
+    (target, _, _) ← occupant
+    registration ← find ((== target) . registrationTarget) registrations
+    pure (target, registrationProtocol registration)
 
 -- ---------------------------------------------------------------------------
 -- Detaching

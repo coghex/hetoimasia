@@ -199,6 +199,14 @@ data TargetRecord = TargetRecord
   , recordSurfaceLost ∷ !Bool
     -- ^ The surface 'recordSurface' names was lost (VK-14): nothing is planned
     -- or built on it, and it is released and replaced.
+  , recordWithdrawn ∷ !Bool
+    -- ^ The target was suspended as ineligible while its active generation
+    -- stood. Its window may have been hidden or minimized since that
+    -- generation last presented, and a compositor need not answer that
+    -- presentation for a surface it no longer shows — Mesa's legacy FIFO on
+    -- Wayland then blocks the generation's next present for ever (#357) — so
+    -- the generation presents no more: the target resumes on a replacement.
+    -- Cleared when a generation is published.
   }
 
 -- | The generations of one session's targets, over its roots.
@@ -249,6 +257,7 @@ trackTarget generations target classification surface =
         , recordRecovering = False
         , recordConstructions = 0
         , recordSurfaceLost = False
+        , recordWithdrawn = False
         }
 
 -- ---------------------------------------------------------------------------

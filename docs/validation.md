@@ -365,11 +365,11 @@ is mandatory outside the floor, required when affected. `--complete` holds it to
 the same rule as on X11 — one shared-session acquisition, and every private
 scenario its consent requires run and passed — and under this consent that
 includes `wayland-connection-loss`, which ends a compositor of its own while
-rendering and is pending under any other consent, and excludes VK-16's
-`vk16-composed`, which is pending there with its reason named: hiding a
-presenting window blocks the graphics owner under Mesa's legacy FIFO on Weston
-13 ([gpu_backend.md](gpu_backend.md#the-native-suite)), an engine gap tracked
-as [#357](https://github.com/coghex/hetoimasia/issues/357). It declares no `platforms`,
+rendering and is pending under any other consent, and VK-16's `vk16-composed`,
+which hides a presenting window and shows it again: under Mesa's legacy FIFO
+on Weston 13 that needs the owner's presentation hold and the replacement on
+resume ([gpu_backend.md](gpu_backend.md#pacing-suspension-and-fairness)),
+which [#357](https://github.com/coghex/hetoimasia/issues/357) added. It declares no `platforms`,
 as `test.glfw-wayland` does not: the compositor exists only on Linux, and no
 worker runs it elsewhere. `test.vulkan-native` is unchanged.
 

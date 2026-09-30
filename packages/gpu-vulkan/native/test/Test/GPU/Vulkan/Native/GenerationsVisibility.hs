@@ -111,6 +111,7 @@ supportedClient =
       , "generationsDeadline"
       , "SwapchainResult (..)"
       , "noteSwapchainResult"
+      , "withdrawGeneration"
       , "GenerationUse"
       , "UseRefusal (..)"
       , "useGeneration"

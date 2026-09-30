@@ -79,6 +79,10 @@ data TargetHandoff
 data TargetStepView = TargetStepView
   { viewTarget ∷ !AttachmentId
   , viewEligibility ∷ !RenderEligibility
+    -- ^ A backend presents only to a target it views as constructed and
+    -- 'Hetoimasia.Runtime.GLFW.Internal.RenderDemand.RenderEligible'. A hide
+    -- waits for a step in flight only when that step views the window's target
+    -- so ("Hetoimasia.Runtime.GLFW.Internal.Owner.Withhold").
   , viewGeometry ∷ !TargetGeometry
   , viewRevision ∷ !Natural
     -- ^ The observation revision this view was folded from, so a backend can
@@ -88,6 +92,12 @@ data TargetStepView = TargetStepView
     -- ^ Whether the backend's own construction accepted this target. A view
     -- for a partial or unverified target is offered so the backend can see it,
     -- never as a claim that it is usable.
+  , viewWithdrawals ∷ !Natural
+    -- ^ The latest presentation hold the main thread asked for before hiding
+    -- this target's window, which only rises. A backend that sees it rise must
+    -- not present again to anything the target presented to before — the
+    -- compositor may never answer a presentation to a surface it unmapped —
+    -- even if no view in between was suspended. Zero until the first hold.
   }
   deriving (Eq, Show)
 

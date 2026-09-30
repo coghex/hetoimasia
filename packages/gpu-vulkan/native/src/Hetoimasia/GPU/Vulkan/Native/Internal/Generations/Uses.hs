@@ -1,17 +1,22 @@
 -- | What any thread may do with a target's generations
 -- ("Hetoimasia.GPU.Vulkan.Native.Generations"), in 'STM': report what a
--- swapchain call answered, and hold and end a CPU use of the active
--- generation. A held use keeps the generation's ended-CPU-use hold on, so the
+-- swapchain call answered, withdraw the active generation of a target whose
+-- window was hidden, and hold and end a CPU use of the active generation. A
+-- held use keeps the generation's ended-CPU-use hold on, so the
 -- owner's disposal cannot destroy it; ending the last use of a retired
 -- generation ends its CPU use in the model.
 --
--- This module notes swapchain results and counts uses in the target and
+-- This module notes swapchain results and withdrawals and counts uses in the
+-- target and
 -- generation records of "Hetoimasia.GPU.Vulkan.Native.Internal.Generations.State".
 -- The only state it creates is each 'GenerationUse''s own ended flag, which
 -- belongs to the holder of that use from 'useGeneration' until it is ended.
 module Hetoimasia.GPU.Vulkan.Native.Internal.Generations.Uses
   ( -- * Reports from swapchain calls
     noteSwapchainResult
+
+    -- * Withdrawing the active generation
+  , withdrawGeneration
 
     -- * CPU use
   , GenerationUse
@@ -20,11 +25,12 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Generations.Uses
   , endGenerationUse
   ) where
 
-import Control.Concurrent.STM (STM, TVar, newTVar, readTVar, writeTVar)
+import Control.Concurrent.STM (STM, TVar, modifyTVar', newTVar, readTVar, writeTVar)
 import Control.Monad (unless)
 import qualified Data.Map.Strict as Map
+import Data.Maybe (isJust)
 
-import Hetoimasia.GPU.Model.Identity (GenerationId, generationTarget)
+import Hetoimasia.GPU.Model.Identity (GenerationId, TargetId, generationTarget)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Generations.State
   ( GenerationStanding (..)
   , Generations (..)
@@ -35,6 +41,23 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Generations.State
   , endCpuUse
   , lookupGeneration
   )
+
+-- | Withdraw a target's active generation: the target's window was hidden,
+-- or is about to be, since the generation last presented. A compositor need
+-- not answer a presentation made for a surface it no longer shows, and under
+-- Mesa's legacy FIFO on Wayland the generation's next present would wait for
+-- that answer for ever (#357). So it presents no more: the target's next
+-- reconciliation suspends it, and replaces the generation at once, handing it
+-- over, as soon as the target is eligible. A target with no active generation
+-- has nothing to withdraw, and one it no longer tracks is left alone.
+--
+-- It is the owner's, which learns of the hide from its step's view of the
+-- target, before any frame of that step is attempted.
+withdrawGeneration ∷ Generations q inst msgr phys dev → TargetId → STM ()
+withdrawGeneration generations target =
+  modifyTVar'
+    (generationsTargets generations)
+    (Map.adjust (\record → record {recordWithdrawn = recordWithdrawn record || isJust (recordActive record)}) target)
 
 -- | Report what a swapchain call on a generation answered. Only the target's
 -- active generation is replaced for an out-of-date or suboptimal result; one

@@ -322,6 +322,7 @@ protocolFor journal host owner script =
     , protocolCompletion = scriptCompletion script
     , protocolDisposition = scriptDisposition script
     , protocolRecognizes = \_ → pure False
+    , protocolBeforeHide = \_ → pure (pure ())
     }
   where
     perform acknowledgement = \case
