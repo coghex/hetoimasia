@@ -8,7 +8,7 @@ module Test.GPU.Vulkan.Native.Roots (spec) where
 
 import Control.Concurrent (forkIO, killThread)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Concurrent.STM (atomically, newTVarIO, writeTVar)
+import Control.Concurrent.STM (STM, atomically, newTVarIO, writeTVar)
 import Control.Exception (AsyncException, Exception, SomeException, fromException, try)
 import Control.Monad (void)
 import qualified Data.ByteString as ByteString
@@ -19,7 +19,16 @@ import Hetoimasia.GPU.Model (SessionFailureCause (DeviceLost), SessionState (..)
 import Hetoimasia.GPU.Model.Budget (BudgetKind (TargetRecordBudget))
 import Hetoimasia.GPU.Model.Identity (TargetClass (..), TargetId)
 import Hetoimasia.GPU.Vulkan.Native.Naming (NativeObjectKind (..), maximumNameBytes, surfaceName)
-import Hetoimasia.GPU.Vulkan.Native.Profile (NoCompatibleDevice (..), TargetRejection (..))
+import Hetoimasia.GPU.Vulkan.Native.Profile
+  ( DeviceOffer (..)
+  , DevicePlan (..)
+  , DeviceRejection (..)
+  , NoCompatibleDevice (..)
+  , QueueFamilyOffer (..)
+  , TargetRejection (..)
+  , selectDevice
+  , selectSurfaceFreeDevice
+  )
 import Hetoimasia.GPU.Vulkan.Native.Roots
 import Test.GPU.Vulkan.Native.StandIn
 import Test.Hspec (Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy)
@@ -105,6 +114,86 @@ spec = describe "Roots" $ do
       _ ← retireRoots roots
       _ ← destroyRoots roots
       reverse . take 2 . reverse <$> calls standIn `shouldReturn` [DestroyedMessenger, DestroyedInstance]
+
+  describe "surface-free bootstrap" $ do
+    it "selects and creates the device with no surface, asking no family about presentation" $ do
+      (standIn, roots) ← started
+      before ← length <$> calls standIn
+      startRootsDevice roots `shouldReturn` "stand-in device"
+      drop before <$> calls standIn `shouldReturn` [QueriedDevicesWithoutSurface, CreatedDevice "stand-in device" 0]
+      view ← atomically (readRootsView roots)
+      (viewDevice view, viewQueueFamily view, viewTargets view) `shouldBe` (RootLive, Just 0, [])
+      raised @DeviceAlreadyStarted (startRootsDevice roots) `shouldReturn` True
+      devicesCreated standIn `shouldReturn` 1
+
+    it "takes a graphics family that presents to no surface, and still requires the rest of the profile" $ do
+      -- A graphics family nothing has asked about presentation serves a
+      -- surface-free bootstrap, and would not serve a surface one; a device
+      -- that lacks a feature is refused either way, however its families
+      -- answer.
+      let graphicsOnly = standInDevice {offerQueueFamilies = [QueueFamilyOffer 0 True False]}
+          lacking = standInDevice {offerDeviceName = "lacking", offerSynchronization2 = False}
+      planDeviceName <$> selectSurfaceFreeDevice [lacking, graphicsOnly] `shouldBe` Right "stand-in device"
+      fmap planDeviceName (selectDevice [graphicsOnly])
+        `shouldBe` Left (NoCompatibleDevice [("stand-in device", [DeviceNoPresentingGraphicsFamily])])
+      fmap planDeviceName (selectSurfaceFreeDevice [lacking])
+        `shouldBe` Left (NoCompatibleDevice [("lacking", [DeviceFeatureMissing "synchronization2"])])
+
+    it "fails startup with NoCompatibleDevice when no family answers graphics, creating nothing, and rolls back" $ do
+      standIn ← (\made → made {standOffers = [standInDevice {offerQueueFamilies = [QueueFamilyOffer 0 False True]}]}) <$> newStandIn
+      roots ← newStandInRoots standIn (testBudgets 16)
+      _ ← startRoots roots standardRequest
+      try (startRootsDevice roots) >>= \case
+        Left (NoCompatibleDevice [(name, reasons)]) → (name, reasons) `shouldBe` ("stand-in device", [DeviceNoGraphicsFamily])
+        other → fail ("expected no compatible device, but: " <> either show show other)
+      viewDevice <$> atomically (readRootsView roots) `shouldReturn` RootAbsent
+      _ ← retireRoots roots
+      _ ← destroyRoots roots
+      calls standIn `shouldReturn'` [QueriedDevicesWithoutSurface, DestroyedMessenger, DestroyedInstance]
+      devicesCreated standIn `shouldReturn` 0
+
+    it "admits a later surface its queue family presents to, and refuses one it cannot, creating no second device" $ do
+      (standIn, roots) ← started
+      _ ← startRootsDevice roots
+      target ← admitted roots RequiredTarget (surfaceNumbered standIn 10)
+      refused ← admitRootTarget roots OptionalTarget (surfaceNumbered standIn unsupportedSurface)
+      fmap (const ()) refused `shouldBe` Left (TargetSurfaceUnsupported 0)
+      viewTargets <$> atomically (readRootsView roots) `shouldReturn` [target]
+      -- Each surface was checked against the chosen family; the device was
+      -- never selected again.
+      calls standIn `shouldReturn'` [QueriedDevicesWithoutSurface, CreatedDevice "stand-in device" 0, QueriedSupport 10, QueriedSupport unsupportedSurface]
+      devicesCreated standIn `shouldReturn` 1
+      surfacesDestroyed standIn `shouldReturn` []
+
+    it "retires a session that never had a target: the device, then the messenger, then the instance" $ do
+      (standIn, roots) ← started
+      _ ← startRootsDevice roots
+      before ← length <$> calls standIn
+      retireRoots roots `shouldReturn` "destroyed the device stand-in device"
+      destroyRoots roots `shouldReturn` Just ()
+      drop before <$> calls standIn `shouldReturn` [DestroyedDevice, DestroyedMessenger, DestroyedInstance]
+
+    it "names the device and its queue at the surface-free bootstrap, and no surface until one is admitted" $ do
+      (standIn, roots) ← fresh
+      offerNaming standIn
+      _ ← startRoots roots standardRequest
+      _ ← startRootsDevice roots
+      namesGiven standIn
+        `shouldReturn` [(ObjectDevice, 3, "hetoimasia device"), (ObjectQueue, 4, "hetoimasia queue family 0 index 0")]
+      target ← admitted roots RequiredTarget (surfaceNumbered standIn 10)
+      namesGiven standIn
+        `shouldReturn` [ (ObjectDevice, 3, "hetoimasia device")
+                       , (ObjectQueue, 4, "hetoimasia queue family 0 index 0")
+                       , (ObjectSurface, 10, surfaceName target)
+                       ]
+
+    it "refuses before the instance exists, and raises a latched primary failure rather than creating anything" $ do
+      (standIn, roots) ← fresh
+      raised @RootsNotStarted (startRootsDevice roots) `shouldReturn` True
+      _ ← startRoots roots standardRequest
+      atomically (latchDeviceLoss' roots)
+      raised @GraphicsDeviceLost (startRootsDevice roots) `shouldReturn` True
+      devicesCreated standIn `shouldReturn` 0
 
   describe "targets" $ do
     it "keys every admitted target by the model's identity and records its designation" $ do
@@ -367,6 +456,10 @@ started = do
 admitted ∷ StandInRoots → TargetClass → TargetSurface → IO TargetId
 admitted roots classification surface =
   admitRootTarget roots classification surface >>= either (fail . ("the target was refused: " <>) . show) pure
+
+-- | Latch a device loss, as a native call that reported one would.
+latchDeviceLoss' ∷ StandInRoots → STM ()
+latchDeviceLoss' roots = latchTerminal roots (TerminalDeviceLost (GraphicsDeviceLost "an example" "lost"))
 
 -- | Whether the action raised this exception type.
 raised ∷ ∀ e a. Exception e ⇒ IO a → IO Bool

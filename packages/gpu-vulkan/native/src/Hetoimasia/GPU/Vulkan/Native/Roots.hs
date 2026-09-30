@@ -29,11 +29,16 @@
 -- = Order
 --
 -- Creation runs parent before child: the instance, the explicit messenger,
--- then — on the first admission, against that target's surface — the device.
+-- then the device — on the first admission, against that target's surface, or,
+-- for a surface-free session, at its start ('startRootsDevice'), against no
+-- surface at all. Either way it is the session's one device: a surface
+-- admitted after a surface-free start is checked against the queue family
+-- already chosen, as any later target's is.
 -- Destruction runs child before parent and is refused rather than reordered:
 --
 -- 1. every target's surface ('retireRootTarget');
--- 2. the device ('retireRoots'), only once no target record remains;
+-- 2. the device ('retireRoots'), only once no target record remains — which a
+--    session that never had a target satisfies from the start;
 -- 3. the explicit messenger, and then the instance ('destroyRoots'), only once
 --    the device is gone. The messenger goes immediately before the instance,
 --    so every child's destruction still reports somewhere, and the instance's
@@ -44,7 +49,8 @@
 -- When the instance enabled @VK_EXT_debug_utils@ and the device offers its
 -- naming call ('opsInstrumentation'), the roots name what they own once a
 -- device exists to name it through ("Hetoimasia.GPU.Vulkan.Native.Naming"):
--- the device and its one queue at the first admission, and each target's
+-- the device and its one queue where the device is created — at the first
+-- admission, or at a surface-free start — and each target's
 -- surface before the target is admitted, under the 'TargetId' the model is
 -- about to issue it. A naming call runs on the
 -- owner's thread like every other call here, and one that raised fails the
@@ -145,6 +151,8 @@ module Hetoimasia.GPU.Vulkan.Native.Roots
     -- * Startup
   , startRoots
   , RootsAlreadyStarted (..)
+  , startRootsDevice
+  , DeviceAlreadyStarted (..)
 
     -- * Targets
   , TargetSurface (..)
@@ -290,6 +298,7 @@ import Hetoimasia.GPU.Vulkan.Native.Profile
   , debugUtilsExtension
   , planInstance
   , selectDevice
+  , selectSurfaceFreeDevice
   , InstanceOffer
   , DeviceOffer
   )
@@ -317,9 +326,11 @@ data RootOps q inst msgr phys dev = RootOps
   , opsDestroyInstance ∷ inst → IO q
     -- ^ @vkDestroyInstance@: the last call that can invoke the capture's
     -- callback, answering the evidence that none can still run.
-  , opsDeviceOffers ∷ inst → Word64 → IO [DeviceOffer phys]
+  , opsDeviceOffers ∷ inst → Maybe Word64 → IO [DeviceOffer phys]
     -- ^ Every physical device, with each queue family's presentation support
-    -- for the given bootstrap surface.
+    -- for the given bootstrap surface. Given none — a surface-free bootstrap —
+    -- it makes no surface-support query and answers every family as not
+    -- presenting.
   , opsCreateDevice ∷ inst → DevicePlan phys → IO dev
   , opsDestroyDevice ∷ dev → IO ()
   , opsSurfaceSupport ∷ inst → phys → Word32 → Word64 → IO Bool
@@ -542,6 +553,13 @@ data RootsAlreadyStarted = RootsAlreadyStarted
 
 instance Exception RootsAlreadyStarted
 
+-- | 'startRootsDevice' ran on roots whose device had already been created,
+-- by an earlier surface-free start or by a first admission.
+data DeviceAlreadyStarted = DeviceAlreadyStarted
+  deriving (Eq, Show)
+
+instance Exception DeviceAlreadyStarted
+
 -- | A target was offered before the instance existed.
 data RootsNotStarted = RootsNotStarted
   deriving (Eq, Show)
@@ -657,16 +675,56 @@ creating slot create = mask_ $ do
   atomically (writeTVar slot (Live created))
   pure created
 
+-- | Select and create the session's device with no surface, on the calling
+-- thread, and name it and its queue: a surface-free session's bootstrap.
+--
+-- It requires the started instance ('RootsNotStarted' otherwise), a session
+-- that has not failed — a latched primary failure is raised as a checkpoint
+-- raises it — and a device not yet created ('DeviceAlreadyStarted'). Selection is the profile's
+-- 'selectSurfaceFreeDevice': a queue family that answers graphics, with every
+-- other requirement unchanged, and no surface-support query at all. No device
+-- that can satisfy it raises
+-- 'Hetoimasia.GPU.Vulkan.Native.Profile.NoCompatibleDevice', a structured
+-- startup failure, having created nothing. The device is recorded in the same
+-- masked step that creates it, as at a first admission, and every later
+-- target is checked against its queue family by 'admitRootTarget'. A naming
+-- call that raised leaves it unnamed, to be named again at the next
+-- admission, and is raised; the device stays recorded for retirement.
+--
+-- It answers the device's name.
+startRootsDevice ∷ Roots q inst msgr phys dev → IO Text
+startRootsDevice roots = do
+  open ← atomically ((&&) <$> readTVar (rootsAdmitting roots) <*> (not . isJust <$> readTVar (rootsLoss roots)))
+  readTVarIO (rootsInstance roots) >>= \case
+    Live created
+      -- Admission closed by a latched failure: that failure is the answer,
+      -- and nothing is created for a failed session.
+      | not open → atomically (reportPrimary <$> readRootsTerminal roots) >>= maybe (throwIO RootsNotStarted) (throwIO . terminalFailure)
+      | otherwise →
+          readTVarIO (rootsDevice roots) >>= \case
+            Absent → do
+              offers ← guarded roots "the device query" (opsDeviceOffers ops created Nothing)
+              plan ← either throwIO pure (selectSurfaceFreeDevice offers)
+              _ ← creating (rootsDevice roots) (Selected plan <$> guarded roots "vkCreateDevice" (opsCreateDevice ops created plan))
+              nameRoots roots
+              pure (planDeviceName plan)
+            _ → throwIO DeviceAlreadyStarted
+    _ → throwIO RootsNotStarted
+  where
+    ops = rootsOps roots
+
 -- ---------------------------------------------------------------------------
 -- Targets
 
 -- | Offer one surface as a target, classified required or optional.
 --
--- The first target is the bootstrap: the device is selected against its
--- surface and created — owned by the roots, not by the target — before the
--- target is admitted. A later target is checked against the queue family
--- already chosen, and a surface that family cannot present to is refused with
--- 'TargetSurfaceUnsupported'; no second device is ever created.
+-- Without a device, the first target is the bootstrap: the device is selected
+-- against its surface and created — owned by the roots, not by the target —
+-- before the target is admitted. Once the device exists — made by that
+-- bootstrap, or by a surface-free start ('startRootsDevice') — a target is
+-- checked against the queue family already chosen, and a surface that family
+-- cannot present to is refused with 'TargetSurfaceUnsupported'; no second
+-- device is ever created.
 --
 -- An answer, either way, says who owns the surface: 'Right' means the roots
 -- do, and will destroy it in 'retireRootTarget'; 'Left' means its creator
@@ -693,7 +751,7 @@ admitRootTarget roots classification surface = do
                 then admit
                 else pure (Left (TargetSurfaceUnsupported (planQueueFamily plan)))
             Absent → do
-              offers ← guarded roots "the device query" (opsDeviceOffers ops created handle)
+              offers ← guarded roots "the device query" (opsDeviceOffers ops created (Just handle))
               plan ← either throwIO pure (selectDevice offers)
               _ ← creating (rootsDevice roots) (Selected plan <$> guarded roots "vkCreateDevice" (opsCreateDevice ops created plan))
               admit

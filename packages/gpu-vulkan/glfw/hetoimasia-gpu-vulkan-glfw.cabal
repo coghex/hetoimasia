@@ -43,6 +43,7 @@ library controller
     visibility: private
     hs-source-dirs: controller
     exposed-modules:
+        Hetoimasia.GPU.Vulkan.GLFW.Internal.Actions
         Hetoimasia.GPU.Vulkan.GLFW.Internal.Bridge
         Hetoimasia.GPU.Vulkan.GLFW.Internal.Capture
         Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
@@ -94,6 +95,7 @@ test-suite integration-tests
     main-is: Main.hs
     hs-source-dirs: test
     other-modules:
+        Test.GPU.Vulkan.GLFW.Actions
         Test.GPU.Vulkan.GLFW.Consumer
         Test.GPU.Vulkan.GLFW.Controller
         Test.GPU.Vulkan.GLFW.Loop
@@ -161,6 +163,7 @@ test-suite vulkan-native-tests
         Test.GPU.Vulkan.Native.Private
         Test.GPU.Vulkan.Native.Recording
         Test.GPU.Vulkan.Native.Shared
+        Test.GPU.Vulkan.Native.SurfaceFree
         Test.GPU.Vulkan.Native.Spec
         Test.GPU.Vulkan.Native.Terminal
         Test.GPU.Vulkan.Native.Triangle
