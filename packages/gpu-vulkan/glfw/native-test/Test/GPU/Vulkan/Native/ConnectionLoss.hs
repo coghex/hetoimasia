@@ -189,7 +189,12 @@ session journal compositor = do
   calls ← reverse <$> readIORef recorded
   entries ← readTVarIO logged
   seen ← reverse <$> readTVarIO events
-  let errors = [maybe "" id (Map.lookup "message" entry.entryFields) | entry ← entries, Map.lookup "severity" entry.entryFields == Just "error"]
+  let errors =
+        [ Map.findWithDefault "" "message.id" entry.entryFields <> ": " <> Map.findWithDefault "" "message" entry.entryFields
+        | entry ← entries
+        , Map.lookup "severity" entry.entryFields == Just "error"
+        ]
+  forM_ errors (note journal . ("validation reported an error: " <>))
   readIORef lossHeld >>= \case
     Nothing → pure (LossFailed ("the compositor was never ended: " <> either (Text.pack . displayException) (const "the loop returned") outcome))
     Just loss → do
@@ -296,6 +301,7 @@ lossSection = \case
     , "- verdict issues: " <> maybe "no verdict" (tshow . verdictIssues) (factsVerdict facts)
     , "- error reports: " <> tshow (length (factsErrors facts))
     ]
+      <> ["  - " <> reported | reported ← factsErrors facts]
   where
     presentedIn seen = length [() | FramePresented {} ← seen]
     retiredIn seen = length [() | PresentationRetired _ ← seen]
