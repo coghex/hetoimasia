@@ -54,7 +54,9 @@ common language
 -- admission, execution, and completion, and bounded input feeds with their
 -- acknowledged reset, bounded input staging at the window callbacks, and the
 -- pure window attachment model, written over a table of native operations. It binds nothing, so the test seam
--- can drive it without linking GLFW.
+-- can drive it without linking GLFW. The window model is the composition module
+-- Hetoimasia.GLFW.Internal.Window over the private Window modules beneath it,
+-- one per responsibility, with the window identity in its own leaf.
 library model
     import: language
     visibility: private
@@ -74,6 +76,18 @@ library model
         Hetoimasia.GLFW.Internal.Session
         Hetoimasia.GLFW.Internal.Trace
         Hetoimasia.GLFW.Internal.Window
+        Hetoimasia.GLFW.Internal.Window.Boundary
+        Hetoimasia.GLFW.Internal.Window.Callbacks
+        Hetoimasia.GLFW.Internal.Window.Config
+        Hetoimasia.GLFW.Internal.Window.Construction
+        Hetoimasia.GLFW.Internal.Window.Controls
+        Hetoimasia.GLFW.Internal.Window.Identity
+        Hetoimasia.GLFW.Internal.Window.ModeAttempt
+        Hetoimasia.GLFW.Internal.Window.ModeTransition
+        Hetoimasia.GLFW.Internal.Window.Observation
+        Hetoimasia.GLFW.Internal.Window.Reconcile
+        Hetoimasia.GLFW.Internal.Window.Sample
+        Hetoimasia.GLFW.Internal.Window.State
         Hetoimasia.GLFW.Internal.Command
     build-depends:
         base >=4.22 && <4.23,

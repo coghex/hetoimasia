@@ -302,7 +302,7 @@ import Hetoimasia.Foundation.Messaging.Channel
   )
 import Hetoimasia.Foundation.Messaging.Payload (Prepared, prepare, preparedValue)
 import Hetoimasia.GLFW.Internal.Attribute (CursorPosition (..))
-import {-# SOURCE #-} Hetoimasia.GLFW.Internal.Window (WindowId, windowLocalIdentity)
+import Hetoimasia.GLFW.Internal.Window.Identity (WindowId, windowLocalIdentity)
 import Numeric.Natural (Natural)
 
 -- ---------------------------------------------------------------------------
