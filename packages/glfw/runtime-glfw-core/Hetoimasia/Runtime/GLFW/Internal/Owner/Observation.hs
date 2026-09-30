@@ -27,7 +27,7 @@ import Control.Exception (ExceptionWithContext, SomeException)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Hetoimasia.Foundation.Worker (Worker)
-import Hetoimasia.Runtime.GLFW.Internal (Acknowledgement, AttachmentId)
+import Hetoimasia.GLFW.Internal.Attachment (Acknowledgement, AttachmentId)
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Custody (custodyAcknowledgementOf)
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Handoff
   ( OwnerHandoff

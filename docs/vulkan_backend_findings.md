@@ -33,12 +33,12 @@ VKR-3 through VKR-8 remain future capability findings, not automatic gates on th
 
 - [x] VKR-1. Make synchronization-validation coverage explicit — [#220]
 - [x] VKR-2. Identify native resources and recording regions in graphics captures — [#250]
-- [ ] VKR-3. Define GPU allocation beneath existing lifetime accounting
-- [ ] VKR-4. Define managed resource uploads at the content-loader boundary
-- [ ] VKR-5. Define access and layout transitions for reusable resources
-- [ ] VKR-6. Define descriptor ownership and shader-interface compatibility
-- [ ] VKR-7. Manage pipeline reuse and persistent cache compatibility
-- [ ] VKR-8. Define deployment and hardware qualification beyond proof profiles
+- [x] VKR-3. Define GPU allocation beneath existing lifetime accounting — [#330]
+- [x] VKR-4. Define managed resource uploads at the content-loader boundary — [#330]
+- [x] VKR-5. Define access and layout transitions for reusable resources — [#330]
+- [x] VKR-6. Define descriptor ownership and shader-interface compatibility — [#330]
+- [ ] VKR-7. Manage pipeline reuse and persistent cache compatibility — [deferred]: needs a filed render-2d/render-3d consumer
+- [ ] VKR-8. Define deployment and hardware qualification beyond proof profiles — [deferred]: owner release target and hardware matrix unrecorded
 
 ---
 
@@ -79,7 +79,7 @@ The diagnostic design captures messages and bounded object information, but no i
 > that design's epic rather than filing parallel issues. The review baseline
 > above is unchanged.
 
-### VKR-3. Define GPU allocation beneath existing lifetime accounting
+### [#330] VKR-3. Define GPU allocation beneath existing lifetime accounting
 
 Finite byte/object budgets and retirement are implemented, but there is no production device-memory allocation strategy. The proof’s single readback allocation is not a reusable allocator. General buffers and images need allocation requirements and backing-storage reuse to compose with the existing holds.
 
@@ -92,7 +92,7 @@ Finite byte/object budgets and retirement are implemented, but there is no produ
 
 **Handoff context:** Establish memory-type selection, alignment/granularity, required dedicated allocations, mapped-range rules, backing-allocation accounting, and completion-safe reuse before general resource creation. Evaluate a private VMA integration versus a small owned allocator; neither is selected here. Reuse #160/#229 rather than creating competing budgets or recovery. RTC-4 proposes loading-stage accounting; define how future reservations relate to backend storage without assuming that a loader already exists. No fragmentation or performance problem has been measured.
 
-### VKR-4. Define managed resource uploads at the content-loader boundary
+### [#330] VKR-4. Define managed resource uploads at the content-loader boundary
 
 The triangle plan provides a readback buffer, but not a reusable native path for uploading vertex/index data or sampled images. RTC-4 already proposes content loading and ownership transfer into GPU resources; the missing backend endpoint should be designed jointly with that work.
 
@@ -105,7 +105,7 @@ The triangle plan provides a readback buffer, but not a reusable native path for
 
 **Handoff context:** Refine a native upload capability with owned source/staging bytes, bounded admission, explicit completion, cancellation after submission, and safe reclamation. Identify the exact transfer of accounting responsibility so bytes neither disappear nor acquire conflicting owners. Use the existing graphics queue initially unless a measured consumer justifies another. Do not file a second asynchronous-loader issue; the consumer and division into delivery slices remain open.
 
-### VKR-5. Define access and layout transitions for reusable resources
+### [#330] VKR-5. Define access and layout transitions for reusable resources
 
 The existing design explicitly distinguishes lifetime retention from synchronization. Its supported barriers cover triangle rendering and readback; extending to uploads, sampled images, and offscreen targets needs a corresponding access contract. A live resource is not automatically safe to read or overwrite.
 
@@ -117,7 +117,7 @@ The existing design explicitly distinguishes lifetime retention from synchroniza
 
 **Handoff context:** Before extending the recorder, assign ownership of image subresource layouts, buffer ranges, access/stage dependencies, and any queue-family transitions actually supported. Start with explicit checked operations; a render graph is not selected. Cover upload-to-use and attachment-to-sampling transitions, overlapping updates, and cancellation/failed recording without manufacturing completion. Coordinate with VKR-4/VKR-6 and #223; the appropriate consumer and API granularity remain design questions.
 
-### VKR-6. Define descriptor ownership and shader-interface compatibility
+### [#330] VKR-6. Define descriptor ownership and shader-interface compatibility
 
 The managed-retention policy anticipates transitive dependencies, but the first recorder does not supply reusable bindings for textures or per-object data. The shader-build slice preserves source/interpolation identity without establishing a general check that host layouts and bound resources match shader interfaces.
 
@@ -132,7 +132,9 @@ The managed-retention policy anticipates transitive dependencies, but the first 
 
 ## Pipeline and deployment readiness
 
-### VKR-7. Manage pipeline reuse and persistent cache compatibility
+### [deferred] VKR-7. Manage pipeline reuse and persistent cache compatibility
+
+> **Deferred:** no renderer yet has the pipeline variants needed to define cache keys or measure creation cost — clears when the first `render-2d` or `render-3d` consumer issue (FND-4 or FND-3 in `renderer_foundation_findings.md`) is filed, naming its pipeline variants.
 
 The plan creates compatible triangle pipelines and reproducible SPIR-V, but does not define pipeline reuse, warmup, or persistent driver-cache handling. Ahead-of-time GLSL compilation does not remove native pipeline-creation work as renderer variants grow.
 
@@ -144,7 +146,9 @@ The plan creates compatible triangle pipelines and reproducible SPIR-V, but does
 
 **Handoff context:** Through a representative renderer, define complete pipeline keys, reuse ownership, compatible cache loading, bounded storage, safe handling of invalid cache data, and warmup scheduling. A cache failure must not corrupt rendering. Test with temporary files and retain measurements before claiming reduced stutter. Background compilation would need explicit graphics/worker ownership; it is not implicitly authorized. This is a future capability gap, not an observed triangle slowdown.
 
-### VKR-8. Define deployment and hardware qualification beyond proof profiles
+### [deferred] VKR-8. Define deployment and hardware qualification beyond proof profiles
+
+> **Deferred:** the supported hardware and driver matrix and release targets are unrecorded owner decisions, and no distributable application exists — clears when the owner records a first release target (platforms, GPU/driver matrix and available qualification hardware) in `docs/vision.md` or a design document.
 
 The retained proof establishes particular Apple/MoltenVK and Lavapipe environments. It does not establish general Linux hardware support or a packaged end-user runtime. The current provisioning work must not be duplicated or mistaken for those broader claims.
 

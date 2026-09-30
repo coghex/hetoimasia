@@ -163,7 +163,7 @@ import Hetoimasia.GLFW.Window
   , observedVisible
   , observedWindow
   )
-import Hetoimasia.Runtime.GLFW.Internal (UpdateSchedule (..))
+import Hetoimasia.Runtime.GLFW.Internal.Host.Pacing (UpdateSchedule (..))
 import Hetoimasia.Runtime.UpdatePolicy (Demand (..))
 import Numeric.Natural (Natural)
 

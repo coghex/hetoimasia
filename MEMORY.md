@@ -85,8 +85,10 @@ Guide is advisory and does not replace Kanban approval or project-review records
   2026-09-26: desktop-disrupting native runs an issue or PR needs have
   **standing approval** — run them without asking, with
   `HETOIMASIA_NATIVE_SESSION=desktop` on that one command. Never set the flag
-  persistently. Periodic testing and flake-lab rotations still need the owner's
-  request for that run. Isolated X11 through `tools/display/x11.sh` and
+  persistently. Owner decision 2026-09-29: a quruntul `$flake` batch of
+  never-measured tests may run them under the same approval, one
+  window-opening batch at a time. Other periodic testing and profiling still
+  need the owner's request for that run. Isolated X11 through `tools/display/x11.sh` and
   approval-free native selectors need no consent at all.
 
 ## Implemented and reviewed
@@ -458,8 +460,9 @@ Guide is advisory and does not replace Kanban approval or project-review records
 - Test selection follows [the owner policy](docs/test_classification.md): quick
   core contracts in the floor, relevant integration/tooling contracts selected
   by changes, and optional local display-deadline/nontermination/confinement
-  probes. The [local lab](tools/flake/README.md) supplies shared `$test`/`$flake`
-  selection, `$autotest` integration and durable evidence; broader CI-5
+  probes. The external [quruntul](https://github.com/coghex/quruntul) lab, via
+  [its adapter](.quruntul/adapter.py), supplies `$test`/`$flake` selection,
+  claims and durable evidence; broader CI-5
   receipt/scheduler work remains deferred. The old foundation umbrella is
   architectural context, not another queue for duplicating completed arcs.
 - No game save schema, full Synarchy port, permanent RTS tuning, or general

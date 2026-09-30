@@ -26,15 +26,13 @@ import Control.Exception
 import Control.Monad (forM_, unless)
 import Data.Foldable (for_)
 import qualified Data.Map.Strict as Map
-import Hetoimasia.Runtime.GLFW.Internal
+import Hetoimasia.GLFW.Internal.Attachment
   ( Acknowledgement
   , AttachmentId
-  , CompletionPublication (..)
   , NoticeAdmission (..)
   , allRetirementFacts
   , attachmentWindow
   , completionNotice
-  , publishCompletion
   )
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Config (GraphicsOwnerConfig (..))
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Custody (recordSettled)
@@ -61,6 +59,7 @@ import Hetoimasia.Runtime.GLFW.Internal.Owner.State
   , TargetState (..)
   , constructed
   )
+import Hetoimasia.Runtime.GLFW.Internal.Retirement (CompletionPublication (..), publishCompletion)
 
 -- | Retire every target the main thread released, through the injected
 -- operation, and record exactly what it returned.

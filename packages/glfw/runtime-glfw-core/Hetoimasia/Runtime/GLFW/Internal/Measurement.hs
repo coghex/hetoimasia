@@ -43,7 +43,7 @@ import Hetoimasia.GLFW.Internal.Trace
   , takeTrace
   , traceRunning
   )
-import Hetoimasia.Runtime.GLFW.Internal (WindowHost, hostSessionOf)
+import Hetoimasia.Runtime.GLFW.Internal.Host.State (WindowHost, hostSessionOf)
 
 -- | The trace of the session this host owns.
 hostTrace ∷ WindowHost → Trace
