@@ -98,8 +98,9 @@ free is a no-op there and is not timed. Every request is an optimally tiled
 resource. VMA's virtual blocks have no `bufferImageGranularity`, so the traces
 use one tiling and the Haskell block uses granularity 1, which makes the
 placement constraints equivalent. Mixed-tiling granularity is proven by
-`gpu-model-tests`, and compared with VMA's real allocator only in GRS-11's
-native comparison (D-32).
+`gpu-model-tests`. No comparison with VMA's real allocator follows: D-39
+superseded D-32's native comparison, and GRS-18 (#361) validates VMA's
+production integration on a device instead.
 
 The trace parser rejects a malformed trace before any replay: a
 non-dense identity, a free of an identity that is not live, or a request the

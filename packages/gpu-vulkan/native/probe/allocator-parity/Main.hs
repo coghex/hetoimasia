@@ -209,7 +209,7 @@ sideLabel VmaMinMemorySide = "VMA MIN_MEMORY"
 sides ∷ [SideName]
 sides = [Haskell, HaskellMutable, VmaBaseline, VmaMinMemorySide]
 
--- | The two Haskell sides: the production reference and the prototype.
+-- | The two Haskell sides: the pure reference and the mutable prototype.
 haskellSides ∷ [SideName]
 haskellSides = [Haskell, HaskellMutable]
 
@@ -500,7 +500,7 @@ describeEnvironment options arguments (haskellClock, shimClock) = do
     , ""
     , "- **Gates** are requirement 7's four criteria, computed exactly as in run 1: per-operation samples, Haskell against VMA's default strategy, on the four gated traces."
     , "- **VMA MIN_MEMORY** is VMA's closest analogue of best fit. It is a separate comparison and gates nothing."
-    , "- **The mutable prototype** (`Prototype/MutableBestFit.hs`) is best fit over mutable arrays in `ST`, owned by the probe's thread: segments in a slot pool linked to their physical neighbours, and free segments in TLSF-style size bins, each a treap ordered by (size, offset). It makes exactly the reference's decisions, which the self-checks prove, so its placements, refusals and fragmentation are the reference's and only its cost differs. The reference stays the production D-13 strategy; the gates are evaluated for both."
+    , "- **The mutable prototype** (`Prototype/MutableBestFit.hs`) is best fit over mutable arrays in `ST`, owned by the probe's thread: segments in a slot pool linked to their physical neighbours, and free segments in TLSF-style size bins, each a treap ordered by (size, offset). It makes exactly the reference's decisions, which the self-checks prove, so its placements, refusals and fragmentation are the reference's and only its cost differs. The reference is the pure best fit #331 built (D-13), kept only as a test reference since the owner chose VMA for production allocation (D-38); the gates are evaluated for both."
     , "- **Per-operation figures** time each operation with one clock pair and average each operation over the repetitions. Every sample includes one empty timed interval; the *corrected* figures subtract it."
     , "- **Throughput diagnostics** time windows of " <> show windowOperations <> " consecutive operations, or runs of at least "
         <> show segmentOperations <> " same-kind operations, with one clock pair each. They are mean nanoseconds per executed operation, loop and collection included; a window's p95 describes windows, not individual-operation latency."
@@ -528,8 +528,8 @@ sourceDigest = do
     roots =
       [ "probe/allocator-parity"
       , "hetoimasia-gpu-vulkan-native.cabal"
-      , "../model/src/Hetoimasia/GPU/Model/Placement.hs"
-      , "../model/src/Hetoimasia/GPU/Model/Internal/Placement"
+      , "../model/placement-reference"
+      , "../model/hetoimasia-gpu-vulkan-model.cabal"
       , "../../../cabal.project.vulkan"
       , "../../../cabal.project.common"
       ]
@@ -543,7 +543,7 @@ sourceDigest = do
             then do
               names ← sort <$> listDirectory path
               concat <$> mapM (expand . (path </>)) [n | n ← names, n /= "__pycache__", n /= ".DS_Store"]
-            else pure []
+            else fail ("the source digest's root " <> path <> " does not exist, so the digest would not cover what the probe measures")
     hex = concatMap byte . ByteString.unpack
     byte (b ∷ Word8) = let s = showHex b "" in if length s == 1 then '0' : s else s
 
@@ -565,13 +565,13 @@ gateSummary ∷ [Result] → [String]
 gateSummary results =
   [ "## Gates"
   , ""
-  , "Requirement 7's four criteria against VMA default, computed as in run 1, for the production reference and for the mutable prototype."
+  , "Requirement 7's four criteria against VMA default, computed as in run 1, for the pure best-fit reference and for the mutable prototype."
   , ""
   , "| Trace | Implementation | Refused bytes | Fragmentation | Median time | Placement under 5 µs |"
   , "| --- | --- | --- | --- | --- | --- |"
   ]
     <> concat
-      [ [ "| " <> traceName (resultTrace r) <> " | Reference (D-13) | " <> intercalate " | " (map mark (resultVerdicts r)) <> " |"
+      [ [ "| " <> traceName (resultTrace r) <> " | Reference (pure best fit) | " <> intercalate " | " (map mark (resultVerdicts r)) <> " |"
         , "| " <> traceName (resultTrace r) <> " | Mutable prototype | " <> intercalate " | " (map mark (resultMutableVerdicts r)) <> " |"
         ]
       | r ← results

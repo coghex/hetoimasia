@@ -813,32 +813,50 @@ will use and retains the results:
 Its acceptance thresholds are set when GRS-18 is filed. It stays an optional,
 local probe and gates no CI.
 
-### D-40. The byte budget charges VMA's blocks, checked before one opens
+### D-40. The byte budget charges VMA's blocks, reserved before one can open
 
-Owner decision 2026-09-30; resolves Q-18 with its option (a), and amends D-15
-and D-29 for VMA. Keeping D-15's meaning, the model's accounted bytes charge
-the device memory VMA holds — each block and each dedicated allocation — not
-each resource's own size.
+Owner decision 2026-09-30; resolves Q-18 with its option (a), made precise by
+review, and amends D-15 and D-29 for VMA. Keeping D-15's meaning, the model's
+accounted bytes charge the device memory VMA holds — each block and each
+dedicated allocation — not each resource's own size. VMA reports a block only
+after it has opened one, so the budget is enforced by a reservation bounded
+before the call and reconciled after it:
 
-- **Placement first.** A request is first made with
-  `VMA_ALLOCATION_CREATE_NEVER_ALLOCATE_BIT`, which succeeds only inside a
-  block VMA already holds and so charges nothing new.
-- **Opening is checked first.** Only when that fails does the engine check the
-  budget for the memory VMA would open: its next block, or a dedicated
-  allocation of the request's size. Only then does it allocate. Exceeding the
-  budget is typed `Backpressure`, answered on the owner's thread before any
-  native allocation.
-- **Charges follow VMA's blocks.** VMA's device-memory callbacks charge a block
-  as it opens and uncharge it as it is freed, so VMA's own empty-block
-  retention is charged like any other block.
+1. **One memory type.** The engine chooses the memory type itself from D-16's
+   usage flags and the resource's `memoryTypeBits`, and passes only that type
+   to VMA. VMA cannot fall back to another type.
+2. **Held memory first.** The request is made with
+   `VMA_ALLOCATION_CREATE_NEVER_ALLOCATE_BIT`. That succeeds only inside
+   memory VMA already holds, and charges nothing new.
+3. **Reserve the most VMA could open.** Otherwise the engine reserves an upper
+   bound on what the allocating call could open: the larger of that memory
+   type's preferred block size and the request's own size. The engine sets
+   the preferred block size in the allocator's configuration and computes it
+   exactly as VMA does. VMA opens no block larger than that, and a dedicated
+   allocation of exactly the request's size. A reservation the budget cannot
+   hold is typed `Backpressure`, answered on the owner's thread before any
+   native call.
+4. **Allocate and reconcile.** VMA's device-memory callbacks run inside the
+   allocating call on the owner's thread and record exactly what it opened.
+   Afterwards the reservation is replaced by that amount — nothing if it
+   opened nothing — and the rest is returned at once.
+   - More than was reserved would contradict VMA's sizing. It is never
+     silently carried over budget: the allocation is freed, and the request
+     fails as an accounting defect.
+5. **Freeing.** The callbacks uncharge a block when VMA frees it. VMA's own
+   retained empty block therefore stays charged, like any other block, until
+   VMA frees it.
 
-Budget backpressure does not release VMA's retained empty block: VMA frees
-extra empty blocks itself, and D-29's trimming has no engine-owned cache to
-act on. Whether the callbacks cross into Haskell, needing safe foreign calls,
-or count in C is for GRS-18's measurements and GRS-11. Rejected: charging
-each allocation's size (Q-18 (b)), which hides block slack as D-15 said;
-capping heaps with `pHeapSizeLimit` (Q-18 (c)), which loses the typed
-answer.
+The bound is conservative. Near the budget, a request may be refused that a
+smaller block VMA would have chosen could have served; below it, the charge
+is exact. Budget backpressure does not release VMA's retained empty block:
+VMA frees extra empty blocks itself, and D-29's trimming has no engine-owned
+cache to act on. Whether the callbacks cross into Haskell, needing safe
+foreign calls, or count in C is for GRS-18's measurements and GRS-11.
+Rejected: charging each allocation's size (Q-18 (b)), which hides block slack
+as D-15 said; capping heaps with `pHeapSizeLimit` (Q-18 (c)), which loses the
+typed answer; and checking only after `NEVER_ALLOCATE` fails without a
+reservation, which cannot bound what VMA then opens.
 
 ## Open questions
 

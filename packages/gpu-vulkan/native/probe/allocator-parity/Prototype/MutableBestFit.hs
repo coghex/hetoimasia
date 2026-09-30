@@ -2,9 +2,10 @@
 
 -- | A bounded prototype: best fit over one block, in mutable arrays.
 --
--- __Status.__ An experiment for #331's parity probe, not production code. The
--- production strategy is the pure 'Hetoimasia.GPU.Model.Placement.bestFit'
--- (D-13), and this prototype is measured against it. It exists to show what
+-- __Status.__ An experiment for #331's parity probe, not production code. It is
+-- measured against the pure 'Hetoimasia.GPU.Model.Placement.bestFit' (D-13),
+-- itself now only a test reference: the owner chose VMA for production
+-- allocation (D-38) after neither met the parity gates. It exists to show what
 -- the persistent maps cost, so it keeps the reference's decisions exactly: the
 -- smallest free range the request fits once aligned, the lowest offset among
 -- ranges of that size, the same granularity rule and the same validation. The

@@ -1,7 +1,7 @@
 {-# LANGUAGE BangPatterns #-}
 
 -- | The Haskell side of the probe: a trace replayed into one fixed block of
--- the production placement strategy.
+-- the pure best-fit placement reference.
 --
 -- The block never grows and never goes dedicated, so a request that does not
 -- fit is refused, exactly as VMA's virtual block refuses it. Every operation's
@@ -233,7 +233,7 @@ liveBytes = do
   performMajorGC
   gcdetails_live_bytes . gc <$> getRTSStats
 
--- | Validate and place, as one production request would be. A trace's
+-- | Validate and place, as the reference's allocator places one request. A trace's
 -- requests were checked when it was read, so validation never refuses here.
 placeRequest ∷ Word64 → Word64 → Block → Fitted
 placeRequest size alignment block =
