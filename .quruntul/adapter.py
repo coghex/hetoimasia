@@ -30,7 +30,8 @@ them like every other test) and an isolated X11 display on Linux.
 """
 from __future__ import annotations
 
-import importlib
+import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -49,21 +50,52 @@ BUILD_SECONDS = 3600
 ENGINE = (0, 2, 0)
 
 
+# The planner modules this adapter reads helpers from, in dependency order: each
+# imports only the standard library and the modules before it.
+PLANNER_MODULES = ("plan_repository", "plan_cabal", "plan_identity")
+_PLANNERS: dict[str, dict[str, object]] = {}
+
+
 def _planner(checkout: Path, name: str):
     """One of the validation planner's modules from the checkout being measured.
 
-    Each helper is imported from the module that owns it (plan_repository,
-    plan_cabal, plan_identity), never through the plan.py command line. They
-    import each other by plain name, so their directory joins the path and each
-    is imported once per process, as plan.py's siblings always were. Their
-    `plan_` prefix keeps them from shadowing a standard or quruntul module.
+    Each helper is imported from the module that owns it, never through the
+    plan.py command line. One process may measure more than one checkout, so each
+    checkout's modules are loaded from its own files under names of their own.
+    They import each other by plain name, so those names point at this
+    checkout's copies only while it loads and are restored afterwards; nothing is
+    put on `sys.path`, and a `plan_` module another checkout loaded is never
+    reused.
     """
-    directory = checkout / "tools" / "validation"
-    if str(directory) not in sys.path:
-        sys.path.insert(0, str(directory))
-    # Importing them must leave no __pycache__ in the checkout, as plan.py ensures.
+    directory = (checkout / "tools" / "validation").resolve()
+    key = f"hetoimasia_planner_{hashlib.sha256(str(directory).encode()).hexdigest()[:16]}"
+    if key not in _PLANNERS:
+        _PLANNERS[key] = _load_planner(directory, key)
+    return _PLANNERS[key][name]
+
+
+def _load_planner(directory: Path, key: str) -> dict[str, object]:
+    saved = {name: sys.modules.get(name) for name in PLANNER_MODULES}
+    writes_bytecode = sys.dont_write_bytecode
+    # Loading them must leave no __pycache__ in the checkout, as plan.py ensures.
     sys.dont_write_bytecode = True
-    return importlib.import_module(name)
+    loaded: dict[str, object] = {}
+    try:
+        for name in PLANNER_MODULES:
+            spec = importlib.util.spec_from_file_location(f"{key}_{name}", directory / f"{name}.py")
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = module
+            sys.modules[name] = module
+            spec.loader.exec_module(module)
+            loaded[name] = module
+    finally:
+        sys.dont_write_bytecode = writes_bytecode
+        for name, previous in saved.items():
+            if previous is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous
+    return loaded
 
 
 def _components(group: dict) -> list[str]:

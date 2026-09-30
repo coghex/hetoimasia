@@ -351,6 +351,30 @@ class AdapterChecks(unittest.TestCase):
                 # run.sh keeps a fingerprint it did not create, so each exists before a Vulkan build.
                 self.assertEqual(existed, [suite.data["route"] == "vulkan"], suite.id)
 
+    def test_planner_helpers_come_from_the_checkout_being_measured(self):
+        # One process can measure two checkouts; each must get its own planner
+        # modules, bound to each other, and leave no plain-named module behind.
+        adapter = load()
+        before = {name: sys.modules.get(name) for name in adapter.PLANNER_MODULES}
+        with tempfile.TemporaryDirectory() as scratch:
+            checkouts = []
+            for mark in ("first", "second"):
+                checkout = Path(scratch) / mark
+                (checkout / "tools" / "validation").mkdir(parents=True)
+                for name in adapter.PLANNER_MODULES:
+                    source = (ROOT / "tools" / "validation" / f"{name}.py").read_text()
+                    (checkout / "tools" / "validation" / f"{name}.py").write_text(source + f"\nCHECKOUT = {mark!r}\n")
+                checkouts.append((mark, checkout))
+            for mark, checkout in checkouts + checkouts:
+                modules = {name: adapter._planner(checkout, name) for name in adapter.PLANNER_MODULES}
+                self.assertEqual({name: m.CHECKOUT for name, m in modules.items()},
+                                 {name: mark for name in adapter.PLANNER_MODULES})
+                self.assertIs(modules["plan_cabal"].join_path, modules["plan_repository"].join_path)
+                self.assertIs(modules["plan_identity"].component_inputs, modules["plan_cabal"].component_inputs)
+                self.assertIs(modules["plan_identity"].run_git, modules["plan_repository"].run_git)
+            self.assertEqual([p for p in Path(scratch).rglob("__pycache__")], [])
+        self.assertEqual({name: sys.modules.get(name) for name in adapter.PLANNER_MODULES}, before)
+
     def test_the_adapter_imports_nothing_from_quruntul(self):
         tree = ast.parse((ROOT / ".quruntul" / "adapter.py").read_text())
         imported = [alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names]
