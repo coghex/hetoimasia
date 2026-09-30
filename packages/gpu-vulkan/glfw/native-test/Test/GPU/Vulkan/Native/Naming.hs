@@ -142,12 +142,13 @@ import Test.Vulkan.Proof.Interop
   ( createProofWindow
   , createWindowSurface
   , destroyProofWindow
-  , glfwInit
   , glfwTerminate
   , initVulkanLoader
   , lastGlfwError
   , requiredInstanceExtensions
   )
+import Hetoimasia.GLFW.Session (Backend)
+import Test.GPU.Vulkan.Native.Platform (initRequested)
 import Test.Vulkan.Proof.Journal (Journal, heading, note)
 
 type VulkanRoots = Roots Quiesced Instance DebugUtilsMessengerEXT PhysicalDevice Device
@@ -212,8 +213,8 @@ stopWith reason = throwIO (userError (Text.unpack reason))
 -- | Run the case on the calling thread, which must be the process main
 -- thread: GLFW's window and surface are made there, and so is everything
 -- else, since this private process has no other owner.
-runNaming ∷ Journal → IO NamingOutcome
-runNaming journal = do
+runNaming ∷ Maybe Backend → Journal → IO NamingOutcome
+runNaming backend journal = do
   heading journal "#250: a validation report on a named managed resource inside a labelled batch"
   logged ← newTVarIO []
   steps ← newIORef []
@@ -229,7 +230,7 @@ runNaming journal = do
           (callbackSink (\entry → atomically (modifyTVar' logged (entry :))))
   entry ← Char8.useAsCString "vkGetInstanceProcAddr" (getInstanceProcAddr' nullPtr)
   initVulkanLoader entry
-  started ← glfwInit
+  started ← initRequested journal backend
   outcome ←
     if not started
       then (\reason → Left (Text.unpack reason, Nothing)) <$> lastGlfwError

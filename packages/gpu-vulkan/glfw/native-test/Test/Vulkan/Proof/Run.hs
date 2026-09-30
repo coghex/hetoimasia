@@ -102,7 +102,8 @@ import Vulkan.Extensions.VK_KHR_swapchain
 import Vulkan.Zero (zero)
 
 import Hetoimasia.GPU.Vulkan.Native.Roots.Vulkan (validationFeaturesInfo)
-import Test.GPU.Vulkan.Native.Consent (Consent, describeConsent)
+import Test.GPU.Vulkan.Native.Consent (Consent, consentBackend, describeConsent)
+import Test.GPU.Vulkan.Native.Platform (notePlatform)
 import Test.GPU.Vulkan.Native.Environment (applyImplicitLayerPolicy, clearConflictingOverrides, validationFeatures)
 import Test.Vulkan.Proof.Findings
 import Test.Vulkan.Proof.Interop
@@ -434,12 +435,13 @@ procedure journal consent cleanups sink ledger = do
   -- through 'owning' or through a mask of its own where the call reports
   -- success some other way than by returning the handle.
   started ← mask_ $ do
-    ok ← glfwInit
+    ok ← glfwInit (consentBackend consent)
     when ok (onExit cleanups GlfwTermination glfwTerminate)
     pure ok
   unless started $ do
     reason ← lastGlfwError
     stop "GLFW initialization" ("glfwInit failed: " <> reason)
+  notePlatform journal (consentBackend consent)
   supported ← vulkanSupported
   require "GLFW's loader" "glfwVulkanSupported reported no Vulkan loader after being handed the binding's own" supported
   glfwEntry ← instanceProcAddress nullPtr "vkGetInstanceProcAddr" >>= provenanceOf

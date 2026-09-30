@@ -48,7 +48,16 @@
 -- * @synchronization-hazard@ — the negative control that proves
 --   synchronization validation active ("Test.GPU.Vulkan.Native.Hazard");
 -- * @debug-names@ — #250's provoked validation report on a named managed
---   resource inside a labelled batch ("Test.GPU.Vulkan.Native.Naming").
+--   resource inside a labelled batch ("Test.GPU.Vulkan.Native.Naming");
+-- * @wayland-connection-loss@ — WL-4's compositor ended while the production
+--   host renders to a Wayland surface ("Test.GPU.Vulkan.Native.ConnectionLoss",
+--   #327). It runs only under the isolated compositor's consent; under any
+--   other consent its example is pending, asserts nothing, and starts no child,
+--   and the complete profile does not require it ('requiredScenarios').
+--
+-- Every child requests the backend its consent names
+-- ("Test.GPU.Vulkan.Native.Platform"): Wayland by name under the isolated
+-- compositor's consent, and the platform's own backend otherwise.
 --
 -- The child asserts its migrated examples exactly as the proof did: the whole
 -- spec and only the whole spec, through Hspec's own primitives with the
@@ -58,6 +67,11 @@
 -- and the record the child writes, go to the evidence directory the validation
 -- runner names, so a failed or expired run keeps them.
 --
+-- Each child is bounded from outside ("Test.GPU.Vulkan.Native.Child"): its
+-- deadline, 'childDeadline', covers its exit and the end of its output, and a
+-- child still running at it is terminated with its process group and fails its
+-- example as expired, whatever it printed.
+--
 -- The parent starts no child without the run's consent, and the child, which
 -- inherits it, refuses on stderr with exit status 3 when started directly
 -- without it, before it looks its scenario up; an unknown scenario under
@@ -65,6 +79,7 @@
 module Test.GPU.Vulkan.Native.Private
   ( privateRootsFlag
   , scenarioNames
+  , requiredScenarios
   , runScenario
   , spec
   , ChildRun (..)
@@ -82,15 +97,16 @@ import System.Exit (ExitCode (..), exitWith)
 import System.FilePath ((</>))
 import Foreign.C.Types (CInt (..))
 import System.IO (hFlush, hPutStrLn, stderr, stdout)
-import System.Process (readProcessWithExitCode)
-import Test.Hspec (Spec, describe, expectationFailure, it)
+import Test.Hspec (Spec, describe, expectationFailure, it, pendingWith)
 import Test.Hspec.Runner (Config (configFailOnEmpty), defaultConfig, evalSpec, runSpecForest, specResultSuccess)
 
-import Test.GPU.Vulkan.Native.Consent (Consent, Refusal, refusalMessage)
+import Test.GPU.Vulkan.Native.Child (ChildEnd (..), Launched (..), launchCommand)
+import Test.GPU.Vulkan.Native.Consent (Consent (..), Refusal, consentBackend, refusalMessage)
 import Test.GPU.Vulkan.Native.Environment (checkValidationFeatures)
 import Test.GPU.Vulkan.Native.Gate (Gate, admit)
 import qualified Test.GPU.Vulkan.Native.Capture as Capture
 import qualified Test.GPU.Vulkan.Native.Composed as Composed
+import qualified Test.GPU.Vulkan.Native.ConnectionLoss as ConnectionLoss
 import qualified Test.GPU.Vulkan.Native.Frames as Frames
 import qualified Test.GPU.Vulkan.Native.Hazard as Hazard
 import qualified Test.GPU.Vulkan.Native.Naming as Naming
@@ -126,6 +142,8 @@ data ChildRun = ChildRun
 data Scenario = Scenario
   { scenarioName ∷ String
   , scenarioTitle ∷ String
+  , scenarioWaylandOnly ∷ Bool
+    -- ^ Whether it runs only under the isolated compositor's consent.
   , scenarioRun ∷ Consent → Journal → Conclude → IO (Spec, Bool → [Text] → Text)
     -- ^ The native procedure, run to completion and torn down before it
     -- returns; then the examples that assert over what it saw, and the record
@@ -144,93 +162,119 @@ scenarios =
   [ Scenario
       "vk2-compatibility"
       "proves the VK-2 compatibility profile, presentation completion, safe abandonment and capture"
+      False
       $ \consent journal _ → do
         outcome ← runProof journal consent
-        pure (Proof.spec outcome, \passed transcript → renderRecord "The VK-2 native Vulkan compatibility record" invocation transcript outcome passed)
-  , Scenario "vk6-capture" "proves VK-6's C-only validation capture on an instance of its own" $ \_ journal _ → do
+        pure (Proof.spec outcome, \passed transcript → renderRecord "The VK-2 native Vulkan compatibility record" (invocation consent) transcript outcome passed)
+  , Scenario "vk6-capture" "proves VK-6's C-only validation capture on an instance of its own" False $ \_ journal _ → do
       outcome ← Diagnostics.runDiagnostics journal
       pure (DiagnosticsSpec.spec outcome, section "The VK-6 validation capture record" (diagnosticsSection outcome))
-  , Scenario "vk5-bridge" "proves VK-5's loader-aware surface bridge in a session of its own" $ \_ journal _ → do
-      outcome ← Bridge.runBridge journal
+  , Scenario "vk5-bridge" "proves VK-5's loader-aware surface bridge in a session of its own" False $ \consent journal _ → do
+      outcome ← Bridge.runBridge (consentBackend consent) journal
       pure (BridgeSpec.spec outcome, section "The VK-5 surface bridge record" (bridgeSection outcome))
-  , Scenario "vk7-roots" "proves VK-7's roots under the graphics owner, through their destruction at the host's exit" $ \_ journal _ → do
-      outcome ← Roots.runRoots journal
+  , Scenario "vk7-roots" "proves VK-7's roots under the graphics owner, through their destruction at the host's exit" False $ \consent journal _ → do
+      outcome ← Roots.runRoots (consentBackend consent) journal
       pure (RootsSpec.spec outcome, section "The VK-7 Vulkan roots record" (rootsSection outcome))
   , Scenario
       "vk11-recording"
       "records and discards a triangle batch through VK-11's managed resources, with validation reporting nothing"
-      $ \_ journal _ → do
-        outcome ← Recording.runRecording journal
+      False
+      $ \consent journal _ → do
+        outcome ← Recording.runRecording (consentBackend consent) journal
         pure (Recording.spec outcome, section "The VK-11 managed recording record" (Recording.recordingSection outcome))
   , Scenario
       "vk12-frames"
       "acquires, submits and awaits a triangle batch with its capture, and returns images without presenting, with validation reporting nothing"
-      $ \_ journal _ → do
-        outcome ← Frames.runFrames journal
+      False
+      $ \consent journal _ → do
+        outcome ← Frames.runFrames (consentBackend consent) journal
         pure (Frames.spec outcome, section "The VK-12 frames record" (Frames.framesSection outcome))
   , Scenario
       "vk13-presentation"
       "presents to two windows on verified present fences, retires a resized generation and the first window on that evidence, with validation reporting nothing"
-      $ \_ journal _ → do
-        outcome ← Presentation.runPresentation journal
+      False
+      $ \consent journal _ → do
+        outcome ← Presentation.runPresentation (consentBackend consent) journal
         pure (Presentation.spec outcome, section "The VK-13 presentation record" (Presentation.presentationSection outcome))
   , Scenario
       "vk14-recovery"
       "replaces a lost surface on its live window while another presents, and recovers an allocation by reclaiming a retired generation, with validation reporting nothing"
-      $ \_ journal _ → do
-        outcome ← Recovery.runRecovery journal
+      False
+      $ \consent journal _ → do
+        outcome ← Recovery.runRecovery (consentBackend consent) journal
         pure (Recovery.spec outcome, section "The VK-14 recovery record" (Recovery.recoverySection outcome))
   , Scenario
       "vk15-validation-stop"
       "stops rendering at the checkpoint after an injected validation error, tearing down under the ordinary rules with the error as the primary and the final callbacks in the verdict"
-      $ \_ journal _ → do
-        outcome ← Terminal.runValidationStop journal
+      False
+      $ \consent journal _ → do
+        outcome ← Terminal.runValidationStop (consentBackend consent) journal
         pure (Terminal.validationSpec outcome, section "The VK-15 validation stop record" (Terminal.validationSection outcome))
   , Scenario
       "vk15-retention"
       "reports a deliberately retained unverified generation and its parents rather than releasing them, and ends by process termination"
-      $ \_ journal conclude →
-        Terminal.runRetention journal $ \outcome →
+      False
+      $ \consent journal conclude →
+        Terminal.runRetention (consentBackend consent) journal $ \outcome →
           conclude (Terminal.retentionSpec outcome, section "The VK-15 retention record" (Terminal.retentionSection outcome))
   , Scenario
       "vk16-composed"
       "renders two targets through the composed loop, suspending and resuming one while the other presents, and exits through D-33 with validation reporting nothing"
-      $ \_ journal _ → do
-        outcome ← Composed.runComposed journal
+      False
+      $ \consent journal _ → do
+        outcome ← Composed.runComposed (consentBackend consent) journal
         pure (Composed.spec outcome, section "The VK-16 composed loop record" (Composed.composedSection outcome))
   , Scenario
       "vk17-one-slot"
       "renders the triangle sample in two windows with one frame slot, capturing each, the first again after its resize, and the second after the first closes, with validation reporting nothing"
-      $ \_ journal _ → do
-        outcome ← Triangle.runProfile 1 journal
+      False
+      $ \consent journal _ → do
+        outcome ← Triangle.runProfile (consentBackend consent) 1 journal
         pure (Triangle.spec 1 outcome, section "The VK-17 required profile record, one frame slot" (Triangle.profileSection outcome))
   , Scenario
       "vk17-two-slots"
       "renders the triangle sample in two windows with two frame slots, capturing each, the first again after its resize, and the second after the first closes, with validation reporting nothing"
-      $ \_ journal _ → do
-        outcome ← Triangle.runProfile 2 journal
+      False
+      $ \consent journal _ → do
+        outcome ← Triangle.runProfile (consentBackend consent) 2 journal
         pure (Triangle.spec 2 outcome, section "The VK-17 required profile record, two frame slots" (Triangle.profileSection outcome))
   , Scenario
       "vk19-capture"
       "captures a consumer-built triangle from two targets through the production host, each beside its frame's verified presentation, with validation reporting nothing"
-      $ \_ journal _ → do
-        outcome ← Capture.runCapture journal
+      False
+      $ \consent journal _ → do
+        outcome ← Capture.runCapture (consentBackend consent) journal
         pure (Capture.spec outcome, section "The VK-19 consumer pipeline and capture record" (Capture.captureSection outcome))
   , Scenario
       "synchronization-hazard"
       "observes a deliberate synchronization hazard, proving synchronization validation active"
+      False
       $ \_ journal _ → do
         outcome ← Hazard.runHazard journal
         pure (Hazard.spec outcome, section "The synchronization validation control record" (Hazard.hazardSection outcome))
   , Scenario
       "debug-names"
       "carries a provoked validation report's named managed resource, and its batch's label, into the capture"
-      $ \_ journal _ → do
-        outcome ← Naming.runNaming journal
+      False
+      $ \consent journal _ → do
+        outcome ← Naming.runNaming (consentBackend consent) journal
         pure (Naming.spec outcome, section "The #250 debug names and labels record" (Naming.namingSection outcome))
+  , Scenario
+      "wayland-connection-loss"
+      "ends its own compositor while the production host renders to a Wayland surface, and the session ends terminally with the loss, retired under the protected boundary with no completion recorded for interrupted work"
+      True
+      $ \consent journal _ → do
+        case consent of
+          IsolatedWayland _ → pure ()
+          other → ioError (userError ("the connection-loss case runs only under the isolated compositor's consent, not " <> show other))
+        outcome ← ConnectionLoss.runConnectionLoss journal
+        pure (ConnectionLoss.spec outcome, section "The WL-4 connection loss record" (ConnectionLoss.lossSection outcome))
   ]
   where
-    invocation = "tools/vulkan/run.sh native hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests -- --complete"
+    -- The command of the catalog group that runs this consent's profile.
+    invocation = \case
+      IsolatedWayland _ → "tools/display/wayland.sh -- bash tools/vulkan/run.sh native hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests -- --complete"
+      _ → "tools/vulkan/run.sh native hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests -- --complete"
     section title body passed transcript =
       Text.unlines $
         ["# " <> title, "", "Verdict: **" <> (if passed then "pass" else "fail") <> "**."]
@@ -241,6 +285,22 @@ scenarios =
 
 scenarioNames ∷ [String]
 scenarioNames = map scenarioName scenarios
+
+-- | The scenarios a complete run under this consent must run to a pass: every
+-- one, except that a Wayland-only one is required only under the isolated
+-- compositor's consent. A run without consent is held to the others.
+requiredScenarios ∷ Either Refusal Consent → [String]
+requiredScenarios consent = [scenarioName scenario | scenario ← scenarios, not (scenarioWaylandOnly scenario) || wayland]
+  where
+    wayland = case consent of
+      Right (IsolatedWayland _) → True
+      _ → False
+
+-- | How long one child may take, from its start to its exit and the end of its
+-- output, before it is terminated and its example fails as expired. Each takes
+-- well under a second; this bounds a hung one inside the group's own budget.
+childDeadline ∷ Double
+childDeadline = 20
 
 -- | The exit status of a child started without consent.
 refusedExit ∷ ExitCode
@@ -313,21 +373,37 @@ retain file contents =
     Just "" → pure ()
     Just directory → Text.writeFile (directory </> file) contents
 
--- | One example per scenario, each starting its child only under consent.
+-- | One example per scenario, each starting its child only under consent, and
+-- a Wayland-only one only under the isolated compositor's.
 spec ∷ Gate → IORef [ChildRun] → Spec
 spec gate timings = describe "with private roots in a child process" $
   mapM_ example scenarios
   where
     example scenario = it (scenarioTitle scenario) $ do
-      _ ← admit gate
+      consent ← admit gate
+      case consent of
+        IsolatedWayland _ → launch scenario
+        _
+          | scenarioWaylandOnly scenario →
+              pendingWith "this case ends a Wayland compositor, and runs only under the isolated compositor's consent (tools/display/wayland.sh)"
+          | otherwise → launch scenario
+    launch scenario = do
       executable ← getExecutablePath
       started ← getCurrentTime
-      (status, out, err) ← readProcessWithExitCode executable [privateRootsFlag, scenarioName scenario] ""
+      Launched end out err _ ← launchCommand childDeadline executable [privateRootsFlag, scenarioName scenario]
       finished ← getCurrentTime
       let seconds = realToFrac (diffUTCTime finished started)
+          status = case end of
+            ChildExited code → code
+            ChildExpired _ code → code
       modifyIORef' timings (ChildRun (scenarioName scenario) seconds status :)
       retain (scenarioName scenario <> ".log") (Text.pack (out <> err))
       let passedLine = "vulkan-native-tests " <> scenarioName scenario <> ": every check passed"
-      unless (status == ExitSuccess && passedLine `isInfixOf` out) $
-        expectationFailure
-          ("the private " <> scenarioName scenario <> " process exited " <> show status <> ":\n" <> out <> err)
+      case end of
+        ChildExpired deadline _ →
+          expectationFailure
+            ("the private " <> scenarioName scenario <> " process had not finished at its " <> show deadline <> "s deadline and was terminated:\n" <> out <> err)
+        ChildExited _ →
+          unless (status == ExitSuccess && passedLine `isInfixOf` out) $
+            expectationFailure
+              ("the private " <> scenarioName scenario <> " process exited " <> show status <> ":\n" <> out <> err)

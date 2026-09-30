@@ -95,6 +95,8 @@ import Hetoimasia.Runtime.GLFW
   )
 import Hetoimasia.Runtime.Logging (withLoggingLifetime)
 import Test.GPU.Vulkan.Native.Environment (validationFeatures)
+import Hetoimasia.GLFW.Session (Backend)
+import Test.GPU.Vulkan.Native.Platform (requestingBackend)
 import Test.Vulkan.Proof.Journal (Journal, heading, note)
 import Test.Vulkan.Proof.Roots (NativeCall (..), nativeCallObserver)
 
@@ -132,8 +134,8 @@ data Phase
   | Done
 
 -- | Run the case on the calling thread, which must be the process main thread.
-runComposed ∷ Journal → IO ComposedOutcome
-runComposed journal = do
+runComposed ∷ Maybe Backend → Journal → IO ComposedOutcome
+runComposed backend journal = do
   heading journal "VK-16: two targets rendered through the composed loop, one suspended and resumed while the other presents"
   started ← getCurrentTime
   recorded ← newIORef []
@@ -144,7 +146,7 @@ runComposed journal = do
   scene ← prepare ()
   budgets ← either (stopWith . tshow) pure (validateBudgets defaultBudgetRequest)
   let window name = (hiddenTestWindowConfig name 160 120) {windowVisible = True}
-      host = defaultHostConfig [window "hetoimasia VK-16 first", window "hetoimasia VK-16 second"]
+      host = requestingBackend backend (defaultHostConfig [window "hetoimasia VK-16 first", window "hetoimasia VK-16 second"])
       logger = recordingLogger (\entry → atomically (modifyTVar' logged (entry :)))
       config =
         (vulkanHostConfig host defaultCaptureConfig {captureTextBudget = 16384} budgets scene)

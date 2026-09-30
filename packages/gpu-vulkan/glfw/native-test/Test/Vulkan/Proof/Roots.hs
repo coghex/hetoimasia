@@ -107,6 +107,8 @@ import Hetoimasia.Runtime.Logging (withLoggingLifetime)
 import Hetoimasia.Runtime.Supervision (RuntimeControl)
 import Test.GPU.Vulkan.Native.Environment (validationFeatures)
 import Test.Vulkan.Proof.Interop (osThread)
+import Hetoimasia.GLFW.Session (Backend)
+import Test.GPU.Vulkan.Native.Platform (requestingBackend)
 import Test.Vulkan.Proof.Journal (Journal, heading, note)
 
 -- | One native call, where it ran, and what the capture received during it.
@@ -165,11 +167,11 @@ teardownReports calls =
     teardown = dropWhile ((/= "vkDestroySurfaceKHR") . callName) calls
 
 -- | Run the session on the process main thread.
-runRoots ∷ Journal → IO RootsOutcome
-runRoots journal = do
+runRoots ∷ Maybe Backend → Journal → IO RootsOutcome
+runRoots backend journal = do
   heading journal "VK-7: the Vulkan roots under the graphics owner"
   recorded ← newIORef []
-  outcome ← try @SomeException (session journal recorded)
+  outcome ← try @SomeException (session backend journal recorded)
   case outcome of
     Right facts → pure (RootsProved facts)
     Left failure → do
@@ -180,15 +182,15 @@ runRoots journal = do
 stopWith ∷ Text → IO a
 stopWith reason = throwIO (userError (Text.unpack reason))
 
-session ∷ Journal → IORef [NativeCall] → IO RootsFacts
-session journal recorded = do
+session ∷ Maybe Backend → Journal → IORef [NativeCall] → IO RootsFacts
+session backend journal recorded = do
   mainOs ← osThread
   mainHaskell ← myThreadId
   scene ← prepare ()
   budgets ← either (stopWith . Text.pack . show) pure (validateBudgets defaultBudgetRequest)
   verdictCell ← newIORef Nothing
   let windows = [hiddenTestWindowConfig "hetoimasia VK-7 first" 320 240, hiddenTestWindowConfig "hetoimasia VK-7 second" 320 240]
-      host = defaultHostConfig windows
+      host = requestingBackend backend (defaultHostConfig windows)
       config =
         (vulkanHostConfig host rootsCaptureConfig budgets scene)
           { vulkanLayers = [encode validationLayer]

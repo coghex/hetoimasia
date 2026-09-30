@@ -152,10 +152,13 @@ headlessMains =
   , "samples/triangle/renderer/test/Main.hs"
   ]
 
--- | The two validation groups that run through the Vulkan project.
-headlessGroup, nativeGroup ∷ String
+-- | The three validation groups that run through the Vulkan project: the
+-- headless suites, and the native suite's profile on an isolated X11 display
+-- and on the isolated headless Wayland compositor.
+headlessGroup, nativeGroup, waylandGroup ∷ String
 headlessGroup = "test.vulkan-headless"
 nativeGroup = "test.vulkan-native"
+waylandGroup = "test.vulkan-wayland"
 
 -- | The native backend package. Like the proof it resolves the binding and the
 -- Vulkan headers, so the Vulkan project is the only one that may name it.
@@ -303,11 +306,11 @@ spec = describe "The Vulkan project boundary" $ do
     script `shouldContain` "VULKAN_FLAG_SAFE_FOREIGN_CALLS"
     script `shouldContain` "VULKAN_FLAG_DARWIN_LIB_DIRS"
 
-  it "declares exactly the headless and native groups through the Vulkan project, both required and off the floor" $ do
+  it "declares exactly the headless, native and Wayland groups through the Vulkan project, all required and off the floor" $ do
     catalog ← readFile "tools/validation/catalog.json"
     -- A group may declare the Vulkan project's files as *inputs* — the
-    -- workflow group does, because this module reads them — but only these two
-    -- may run a command that selects the project. One more would put a Vulkan
+    -- workflow group does, because this module reads them — but only these
+    -- three may run a command that selects the project. One more would put a Vulkan
     -- build where nothing accounts for it; one on the floor would build the
     -- binding for every change.
     case parseJson catalog of
@@ -323,7 +326,7 @@ spec = describe "The Vulkan project boundary" $ do
                       <> maybe [] id (field "preparation" group >>= stringsAt "command")
               , any (\word → any (`isInfixOf` word) [runner, "cabal.project.vulkan", "vulkan-proof"]) words'
               ]
-        reaching `shouldBe` [headlessGroup, nativeGroup]
+        reaching `shouldBe` [headlessGroup, nativeGroup, waylandGroup]
         filter (`elem` reaching) floor' `shouldBe` []
         forM_ reaching $ \identifier → do
           group ← catalogGroup identifier
@@ -380,7 +383,7 @@ spec = describe "The Vulkan project boundary" $ do
         suite ← readFile nativeSuiteMain
         suite `shouldContain` "completeFlag = \"--complete\""
         suite `shouldContain` "evalSpec defaultConfig {configFailOnEmpty = True} examples"
-        suite `shouldContain` "completenessProblems report children"
+        suite `shouldContain` "completenessProblems consent report children"
     -- The triangle sample's executable is compiled beside it, so a sample that
     -- no longer builds against the host fails the group rather than waiting
     -- for someone to launch it; nothing runs it.
@@ -395,11 +398,25 @@ spec = describe "The Vulkan project boundary" $ do
     nativeMode `shouldSatisfy` any ("cabal list-bin" `isInfixOf`)
     nativeMode `shouldSatisfy` any ("has not been built" `isInfixOf`)
 
-  it "routes both groups to a worker whose loop starts no display around them" $ do
+  it "runs the native suite's whole profile inside the compositor its own command starts, for thirty seconds, with the native group's preparation and inputs" $ do
+    native ← catalogGroup nativeGroup
+    group ← catalogGroup waylandGroup
+    (group >>= field "runner" >>= asString) `shouldBe` Just "display"
+    (group >>= field "timeout_seconds") `shouldBe` Just (JNumber 30)
+    -- The compositor's startup and teardown are inside the timed execution,
+    -- as the native group's X11 display is, and the runner then uses the
+    -- compositor's consent rather than starting a display of its own.
+    (group >>= stringsAt "command")
+      `shouldBe` Just ["bash", "tools/display/wayland.sh", "--", "bash", runner, "native", "hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests", "--", "--complete"]
+    (group >>= field "preparation" >>= stringsAt "command") `shouldBe` (native >>= field "preparation" >>= stringsAt "command")
+    (group >>= stringsAt "inputs") `shouldBe` (native >>= stringsAt "inputs")
+    (group >>= field "component" >>= asString) `shouldBe` (native >>= field "component" >>= asString)
+
+  it "routes all three groups to a worker whose loop starts no display around them" $ do
     workflow ← lines <$> readFile ".github/workflows/validation.yml"
-    -- The plan step's declaration: both classes, both groups, one worker.
-    workflow `shouldSatisfy` any ("--worker \"vulkan=cpu+display:test.vulkan-headless,test.vulkan-native\"" `isInfixOf`)
-    -- The native group's command starts its own display inside the timed
+    -- The plan step's declaration: both classes, all three groups, one worker.
+    workflow `shouldSatisfy` any ("--worker \"vulkan=cpu+display:test.vulkan-headless,test.vulkan-native,test.vulkan-wayland\"" `isInfixOf`)
+    -- Each native group's command starts its own display inside the timed
     -- execution, so the job must not start a second one around run.py.
     let job = takeWhile (not . ("  seed-dependencies:" `isPrefixOf`)) (dropWhile (/= "  vulkan:") workflow)
         active = [line | line ← job, not ("#" `isPrefixOf` trim line)]

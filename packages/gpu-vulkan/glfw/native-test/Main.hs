@@ -21,13 +21,19 @@
 -- > bash tools/vulkan/run.sh native hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests -- --complete
 --
 -- where @--complete@ runs the whole profile with nothing an environment could
--- narrow, and fails unless the shared session and every private scenario ran;
--- without it the suite is an ordinary Hspec run that selects as asked.
+-- narrow, and fails unless the shared session and every private scenario its
+-- consent requires ran; without it the suite is an ordinary Hspec run that
+-- selects as asked.
 --
 -- which on Linux starts an isolated X11 display for it, and on macOS needs
 -- the desktop opt-in, @HETOIMASIA_NATIVE_SESSION=desktop@ on the run's own
--- command, given under the owner's standing approval (AGENTS.md). See
--- docs/gpu_backend.md.
+-- command, given under the owner's standing approval (AGENTS.md). The catalog
+-- group @test.vulkan-wayland@ runs the same profile on the isolated headless
+-- compositor instead, where every session requests Wayland by name:
+--
+-- > bash tools/display/wayland.sh -- bash tools/vulkan/run.sh native hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests -- --complete
+--
+-- See docs/gpu_backend.md.
 module Main (main) where
 
 import Control.Monad (forM_, unless)
@@ -59,7 +65,7 @@ import Test.GPU.Vulkan.Native.Environment (establishEnvironment)
 import Test.GPU.Vulkan.Native.Fixture (SharedReport (..), ThreadCheck (..), runShared)
 import Test.GPU.Vulkan.Native.Gate (newGate, refusals)
 import Test.GPU.Vulkan.Native.Interaction (interactionProbeFlag, runInteractionProbe)
-import Test.GPU.Vulkan.Native.Private (ChildRun (..), privateRootsFlag, runScenario, scenarioNames)
+import Test.GPU.Vulkan.Native.Private (ChildRun (..), privateRootsFlag, requiredScenarios, runScenario)
 import qualified Test.GPU.Vulkan.Native.Spec as Native
 import Test.Vulkan.Proof.Roots (NativeCall (..))
 
@@ -117,19 +123,21 @@ runSuite consent started complete = do
   let problems =
         sharedProblems report
           <> refusalProblems consent refused
-          <> (if complete then completenessProblems report children else [])
+          <> (if complete then completenessProblems consent report children else [])
   forM_ problems (hPutStrLn stderr . ("vulkan-native-tests: " <>) . Text.unpack)
   unless (passed && null problems) exitFailure
 
 -- | What a complete run must have done, whatever Hspec reported: the shared
--- session acquired once, and every private scenario run to a pass.
-completenessProblems ∷ SharedReport → [ChildRun] → [Text]
-completenessProblems report children =
+-- session acquired once, and every private scenario its consent requires run to
+-- a pass. The Wayland-only connection-loss case is required under the isolated
+-- compositor's consent and pending under any other ('requiredScenarios').
+completenessProblems ∷ Either Refusal Consent → SharedReport → [ChildRun] → [Text]
+completenessProblems consent report children =
   [ "the complete profile never acquired the shared session"
   | report.reportAcquisitions /= 1
   ]
     <> [ "the complete profile did not run the private scenario " <> Text.pack name <> " to a pass"
-       | name ← scenarioNames
+       | name ← requiredScenarios consent
        , name `notElem` [child.childScenario | child ← children, child.childStatus == ExitSuccess]
        ]
 

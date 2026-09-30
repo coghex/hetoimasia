@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "policy_version": 22,
+  "policy_version": 23,
   "policy_inputs": [
     "tools/validation/",
     ".github/workflows/"
@@ -309,8 +309,49 @@
       "optional": false
     },
     {
+      "id": "test.vulkan-wayland",
+      "description": "The Vulkan native suite's whole --complete profile under the isolated headless compositor tools/display/wayland.sh starts inside the timed execution: the shared roots, the migrated VK-2, VK-5, VK-6 and VK-7 cases, VK-17's required profile over the triangle sample's drawing and the synchronization-validation control, every session requesting Wayland by name and the shared session's selected backend asserted before any rendering example, with the validation layer and synchronization validation enabled and failing on any validation error or incomplete diagnostic capture after the last teardown; and WL-4's connection-loss case, a child that ends a compositor of its own while rendering to a Wayland surface. It has test.vulkan-native's preparation stage and inputs, and its native execution — compositor startup and teardown included — is measured alone under a 30-second watchdog. Linux only.",
+      "command": [
+        "bash",
+        "tools/display/wayland.sh",
+        "--",
+        "bash",
+        "tools/vulkan/run.sh",
+        "native",
+        "hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests",
+        "--",
+        "--complete"
+      ],
+      "preparation": {
+        "command": [
+          "bash",
+          "tools/vulkan/run.sh",
+          "build",
+          "hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests",
+          "hetoimasia-sample-triangle-app:exe:hetoimasia-triangle"
+        ],
+        "timeout_seconds": 3600
+      },
+      "component": "hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests",
+      "inputs": [
+        "cabal.project.common",
+        "cabal.project.vulkan",
+        "tools/ci-image/",
+        "samples/triangle/app/",
+        "tools/display/",
+        "tools/native/",
+        "tools/toolchain/binding.pin",
+        "tools/vulkan/"
+      ],
+      "framework": "hspec",
+      "runner": "display",
+      "timeout_seconds": 30,
+      "category": "test",
+      "optional": false
+    },
+    {
       "id": "test.workflow",
-      "description": "Hspec examples driving the documentation landing helper, this planner and runner, the CI image builder, and the native recipe helper against temporary Git repositories; the quruntul adapter's agreement with this catalog; and the boundary that keeps the Vulkan project out of the mandatory floor, holds its two groups to their commands and routing, and holds the compatibility summary to the retained records it quotes.",
+      "description": "Hspec examples driving the documentation landing helper, this planner and runner, the CI image builder, and the native recipe helper against temporary Git repositories; the quruntul adapter's agreement with this catalog; and the boundary that keeps the Vulkan project out of the mandatory floor, holds its three groups to their commands and routing, and holds the compatibility summary to the retained records it quotes.",
       "command": [
         "cabal",
         "test",
