@@ -95,6 +95,15 @@ library model
         Hetoimasia.Scripting.Lua.Internal.Protocol.Limits
         Hetoimasia.Scripting.Lua.Internal.Protocol.Request
         Hetoimasia.Scripting.Lua.Internal.Protocol.Session
+        Hetoimasia.Scripting.Lua.Internal.Protocol.Session.Epoch
+        Hetoimasia.Scripting.Lua.Internal.Protocol.Session.Failure
+        Hetoimasia.Scripting.Lua.Internal.Protocol.Session.Requests
+        Hetoimasia.Scripting.Lua.Internal.Protocol.Session.Revocation
+        Hetoimasia.Scripting.Lua.Internal.Protocol.Session.State
+        Hetoimasia.Scripting.Lua.Internal.Protocol.Session.Step
+        Hetoimasia.Scripting.Lua.Internal.Protocol.Session.Stop
+        Hetoimasia.Scripting.Lua.Internal.Protocol.Session.Subscriptions
+        Hetoimasia.Scripting.Lua.Internal.Protocol.Session.Tasks
         Hetoimasia.Scripting.Lua.Internal.Protocol.Subscription
         Hetoimasia.Scripting.Lua.Internal.Protocol.Task
         Hetoimasia.Scripting.Lua.Internal.Protocol.Value

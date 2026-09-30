@@ -17,10 +17,10 @@ module Test.Lua.Protocol.Boundary (spec) where
 
 import Control.Monad (filterM)
 import Data.Char (isSpace)
-import Data.List (isInfixOf, isPrefixOf, sort)
+import Data.List (isInfixOf, isPrefixOf, isSuffixOf, sort)
 import System.Directory (doesDirectoryExist, doesFileExist, listDirectory)
 import System.FilePath ((</>), takeExtension)
-import Test.Hspec (Spec, describe, it, shouldBe, shouldReturn)
+import Test.Hspec (Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy)
 
 -- | The package this suite belongs to, found from wherever the suite runs.
 packageRoot ∷ IO FilePath
@@ -78,7 +78,10 @@ spec = describe "boundary" $ do
 
   it "contains modules, all of which import neither the binding nor raw Lua" $ do
     sources ← modelSources
-    length sources `shouldBe` 8
+    sources `shouldSatisfy` (not . null)
+    -- The session's implementation lives in modules nested beneath its
+    -- facade, so a walk that stopped at the top directory would miss them.
+    sources `shouldSatisfy` any (("Session" </> "State.hs") `isSuffixOf`)
     offending ← concat <$> mapM bindingImports sources
     offending `shouldBe` []
   where

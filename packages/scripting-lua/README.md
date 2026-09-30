@@ -484,7 +484,22 @@ recorded and enforced by nothing here; choosing what runs next is LUA-6's.
 
 ### The session
 
-`…Protocol.Session` composes the rest. Each operation answers
+`…Protocol.Session` composes the rest. It is a facade over one pure session
+value, and it states the aggregate's contract; the implementation sits beneath
+it in `…Protocol.Session.*`, one responsibility per module and an acyclic
+import graph from the bottom up:
+
+| Module | Owns |
+| --- | --- |
+| `Session.State` | The `Session` value, `newSession`, `Counters`, `SessionRejection`, and the records it keeps (`FailureRecord`, `ExitRecord`) |
+| `Session.Step` | Refusal, counters, the not-stopped and not-failed preconditions, ordinal/task-name/generation issuance, and one task transition |
+| `Session.Revocation` | `retire`, `invalidateHoldingsOf`, `revokeOne`, `revocableRequests`, `reclaim` — the one definition of the shared provider accounting |
+| `Session.Tasks` | Admission, activation, and every task transition up to observing its result |
+| `Session.Requests` | Accepting requests, replies, cancellation, observation, provider completion |
+| `Session.Subscriptions` | Registration, delivery, taking events, unsubscribing |
+| `Session.Epoch`, `Session.Failure`, `Session.Stop` | The three session-wide invalidations, kept apart because each retains different records and reports different counts |
+
+Callers import the facade only. Each operation answers
 `(Session v, Either SessionRejection a)`. A rejection never advances the
 protocol: no task changes state, no cursor moves, no settled slot is
 overwritten, no event is delivered, no admission is accepted. It is *not* true
