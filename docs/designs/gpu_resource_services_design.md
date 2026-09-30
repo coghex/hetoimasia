@@ -19,9 +19,8 @@ concrete precondition
 
 ## Processing status
 
-The epic and seventeen slices are accepted for issue processing under D-25,
-as amended by D-28, D-34 and D-37. Tracker artifacts remain unprocessed and require their
-own approval before creation.
+The epic and seventeen slices, accepted for issue processing under D-25 as
+amended by D-28, D-34 and D-37, are all filed as the issues below.
 
 - [x] EPIC. Establish shared GPU resource services for 2D and 3D consumers — [#330]
 - [x] GRS-1. Place allocations with a pure block allocator proven against VMA — [#331]
