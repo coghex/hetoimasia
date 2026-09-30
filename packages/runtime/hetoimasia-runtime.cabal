@@ -35,6 +35,8 @@ library
         Hetoimasia.Runtime.Resources
         Hetoimasia.Runtime.Supervision
         Hetoimasia.Runtime.UpdatePolicy
+    other-modules:
+        Hetoimasia.Runtime.AsyncLog.Entry
     hs-source-dirs: src
     default-language: GHC2024
     default-extensions: UnicodeSyntax OverloadedStrings

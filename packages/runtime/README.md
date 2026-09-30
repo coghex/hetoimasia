@@ -49,7 +49,11 @@ back through itself. Its lifetime encloses `withLoggingLifetime`, it adds no
 second final flush, and it never closes the caller's sink. Nothing else changes:
 existing sinks, loggers, and callers keep their synchronous semantics, and an
 application opts in by injecting a logger over `adapterSink`. It is not the
-Vulkan native-capture path. The contract is
+Vulkan native-capture path. Record preparation — the byte budget, collection
+limits, truncation marker, and detached copies — lives in the library's private
+`Hetoimasia.Runtime.AsyncLog.Entry` module, whose public constants the adapter
+re-exports; admission still forces each prepared record on the producer thread
+before enqueueing it. The contract is
 [Asynchronous adapter](../../docs/logging.md#asynchronous-adapter).
 
 `Hetoimasia.Runtime.Supervision` supervises an owned worker group on the
