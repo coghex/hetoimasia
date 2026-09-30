@@ -241,6 +241,28 @@
       "optional": false
     },
     {
+      "id": "test.math",
+      "description": "Portable Hspec and QuickCheck contracts for the math package: vector arithmetic and checked normalization, 4×4 matrix identities, element access and the column-vector multiplication order, translation, scaling and checked axis-angle rotation, the right-handed look-at view, and the perspective projection under every combination of its depth range and clip-space Y direction, with every degenerate or non-finite input returning Nothing. It runs through the CPU project; the library depends on base alone.",
+      "command": [
+        "cabal",
+        "test",
+        "--project-file",
+        "cabal.project.cpu",
+        "hetoimasia-math:math-tests",
+        "--test-show-details=direct"
+      ],
+      "component": "hetoimasia-math:test:math-tests",
+      "inputs": [
+        "cabal.project.common",
+        "cabal.project.cpu"
+      ],
+      "framework": "hspec",
+      "runner": "cpu",
+      "timeout_seconds": 1800,
+      "category": "test",
+      "optional": false
+    },
+    {
       "id": "test.vulkan-headless",
       "description": "Vulkan-linked headless Hspec contracts, executed rather than only built, through cabal.project.vulkan against the provisioned native prefix: the native backend's profile and roots decisions over a stand-in native layer (native-tests), its shader contract against the provisioned compiler (shader-tests), the window integration's controller over the GLFW package's scripted seam (integration-tests), and the triangle sample's pipeline cache over stand-in builders (triangle-tests). None acquires a display, a GLFW session, or a device, and none reads desktop consent; the headers and loader are build and link prerequisites only.",
       "command": [

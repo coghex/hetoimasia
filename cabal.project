@@ -3,6 +3,7 @@ import: cabal.project.common
 packages:
   .
   packages/foundation
+  packages/math
   packages/runtime
   packages/scripting-lua
   packages/glfw
