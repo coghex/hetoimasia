@@ -19,26 +19,27 @@ concrete precondition
 
 ## Processing status
 
-The epic and fifteen slices are accepted for issue processing under D-25,
-as amended by D-28. Tracker artifacts remain unprocessed and require their
-own approval before creation.
+The epic and seventeen slices, accepted for issue processing under D-25 as
+amended by D-28, D-34 and D-37, are all filed as the issues below.
 
-- [ ] EPIC. Establish shared GPU resource services for 2D and 3D consumers
-- [ ] GRS-1. Place allocations with a pure block allocator proven against VMA
-- [ ] GRS-11. Back allocations with device-memory blocks beneath the model's accounting
-- [ ] GRS-2. Create managed buffers and images as retained model subjects
-- [ ] GRS-3. Order access and layout for managed resources through checked operations
-- [ ] GRS-15. Start the device and owner progress without a window
-- [ ] GRS-12. Admit, submit and complete frame-less batches
-- [ ] GRS-5. Render into a managed offscreen color target and read it back
-- [ ] GRS-4. Record from vertex, index and instance buffers with push constants
-- [ ] GRS-6. Upload bytes through bounded engine-owned staging with completion
-- [ ] GRS-7. Own the bindless texture table and its completion-safe slot reuse
-- [ ] GRS-14. Grow the texture table to its configured cap
-- [ ] GRS-8. Draw textured quads from table slots in a 2D scaffolding fixture
-- [ ] GRS-9. Swap a texture slot's image under the same handle
-- [ ] GRS-10. Add depth attachments and a depth-tested 3D scaffolding fixture
-- [ ] GRS-13. Give each target generation a managed depth attachment
+- [x] EPIC. Establish shared GPU resource services for 2D and 3D consumers — [#330]
+- [x] GRS-1. Place allocations with a pure block allocator proven against VMA — [#331]
+- [x] GRS-11. Back allocations with device-memory blocks beneath the model's accounting — [#333]
+- [x] GRS-2. Create managed buffers and images as retained model subjects — [#334]
+- [x] GRS-3. Order access and layout for managed resources through checked operations — [#335]
+- [x] GRS-15. Start the device and owner progress without a window — [#336]
+- [x] GRS-12. Admit, submit and complete frame-less batches — [#337]
+- [x] GRS-5. Render into a managed offscreen color target and read it back — [#338]
+- [x] GRS-4. Record from vertex, index and instance buffers with push constants — [#340]
+- [x] GRS-16. Check shader interfaces against compiled SPIR-V in the Template Haskell splice — [#341]
+- [x] GRS-6. Upload bytes through bounded engine-owned staging with completion — [#342]
+- [x] GRS-7. Own the bindless texture table and its completion-safe slot reuse — [#343]
+- [x] GRS-14. Grow the texture table to its configured cap — [#344]
+- [x] GRS-8. Draw textured quads from table slots in a 2D scaffolding fixture — [#345]
+- [x] GRS-9. Swap a texture slot's image under the same handle — [#346]
+- [x] GRS-17. Establish `packages/math` with the vectors, matrices and projections the 3D fixture needs — [#348]
+- [x] GRS-10. Add depth attachments and a depth-tested 3D scaffolding fixture — [#349]
+- [x] GRS-13. Give each target generation a managed depth attachment — [#350]
 
 ## Epic contract
 
@@ -172,7 +173,8 @@ decision settles one, the decision governs.
   render graph.
 - **P-4. Per-frame data rings.** Instance and per-frame data live in
   per-frame-slot ring buffers that reset when the slot is reclaimed, so
-  per-frame allocation never reaches the block allocator.
+  per-frame allocation never reaches the block allocator. Superseded by
+  D-33's single shared ring with per-batch regions.
 
 ## Decisions
 
@@ -417,7 +419,8 @@ restriction. After compiling, the splice reads the SPIR-V's decorations with
 a small Haskell reader and fails the build on any mismatch. No new native
 tool is introduced. Rejected: generating GLSL declarations from Haskell,
 which would constrain how shaders are written; checking only at pipeline
-creation, which finds mismatches at runtime.
+creation, which finds mismatches at runtime. Delivered by GRS-16 rather than
+GRS-4 (D-34).
 
 ### D-20. Uploads are admitted into bounded staging and publish on completion
 
@@ -495,7 +498,9 @@ fixed-size table. The device-profile feature change lands in GRS-7, where
 D-7's Lavapipe outcome surfaces, and the shader-interface check in GRS-4.
 Amended by D-28, which adds GRS-15 for window-free startup, making fifteen.
 After a review's Q-11–Q-17 were resolved by D-26–D-32, the owner confirmed
-readiness again on 2026-09-29.
+readiness again on 2026-09-29. Amended by D-34, which moves the
+shader-interface check out of GRS-4 into GRS-16, making sixteen, and by
+D-37, which adds GRS-17 for `packages/math`, making seventeen.
 
 ### D-26. Batches enter and leave a resource's resting scope through boundary barriers
 
@@ -590,6 +595,8 @@ Owner decision 2026-09-29; resolves Q-16 and amends D-22.
 - The layout never changes, so every pipeline layout stays compatible, and
   D-19's check covers the lookup binding as well as the array.
 
+
+Amended by D-35: the lookup buffer moves to its own set.
 ### D-32. Parity with VMA is measured for placement and on the device
 
 Owner decision 2026-09-29; resolves Q-17 and amends D-14. D-14's virtual-block
@@ -600,6 +607,83 @@ traces as the owned allocator, and the retained results compare native
 allocation counts, block-open latency, mapping and end-to-end allocate and
 free throughput. Both comparisons stay in optional probes; VMA remains no
 engine dependency.
+
+### D-33. One shared ring serves per-batch data
+
+Owner decision 2026-09-29, at GRS-4's filing; supersedes P-4. Each session
+has one host-visible ring buffer from the allocator, sized by application
+configuration under D-11. A batch — frame or frame-less alike — claims
+regions of it while recording, and each region is reclaimed only when its
+batch completes or is discarded. A full ring answers backpressure. Ring
+regions can be bound as vertex, index or instance data, and host writes
+into them are made visible at submission (D-26). Rejected: one ring per
+frame slot and per frame-less slot, which fixes many small sizes per slot
+and has no natural owner for frame-less work.
+
+### D-34. Split the shader-interface check into its own slice
+
+Owner decision 2026-09-29, at GRS-4's filing; amends D-25 and D-19's
+placement. GRS-4 as planned bundled drawing from buffers, the first CPU
+write path and D-19's build-time interface check, which is too large for
+one reviewable pull request. GRS-4 keeps drawing and the shared ring
+(D-33); the new GRS-16 delivers D-19's check, depends on GRS-4, and GRS-7
+depends on it so the texture table's bindings are checked from the start
+(D-31). The owner approved the amended boundaries explicitly, and readiness
+stands.
+
+### D-35. The lookup buffer is its own descriptor set
+
+Owner decision 2026-09-29, at GRS-7's filing; amends D-22 and D-31's
+binding list. A set created with Vulkan's update-after-bind pool flag may
+not contain dynamic buffer descriptors
+(`VUID-VkDescriptorSetLayoutCreateInfo-flags-03000`), so the lookup buffer
+cannot share the texture table's set and still select a batch's version by
+dynamic offset (D-27). Set 0 is the table: the shared samplers, then the
+variable-count, update-after-bind texture array as its highest binding. Set 1
+is the lookup: one dynamic storage buffer over the version ring, whose
+offset, supplied at bind, selects the batch's version. Both layouts are
+engine-owned and fixed, so pipeline layouts stay compatible, and D-19's
+check covers both sets. Rejected: one set with a plain storage buffer and the
+version offset in a reserved push-constant field, which takes push-constant
+space from every consumer and complicates interface descriptions.
+
+### D-36. Vulkan clip conventions and standard depth
+
+Owner decision 2026-09-29, at GRS-10's filing. Coordinates follow Vulkan's
+own conventions, not OpenGL's: clip space has Y pointing down and depth from
+0 to 1, with no Y flip in the viewport. Depth attachments are depth-only —
+`D32_SFLOAT` where supported, otherwise the device's other supported
+depth-only format, queried and never assumed, with no stencil — cleared to
+1.0 and compared less-or-equal. The backend takes the compare operation and
+clear value per pass, so the later `render-3d` arc can adopt reversed-Z
+without backend changes. Rejected for now: reversed-Z as the fixed default.
+
+### D-37. Create `packages/math` in this arc, as its own slice
+
+Owner decision 2026-09-29, at GRS-10's filing; amends D-25 and delivers
+vision V-1's planned package earlier than its original render-3d placement.
+`packages/math` is a new Cabal package depending on `base` alone and on no
+local or graphics package. Its first API is minimal: 2-, 3- and 4-component
+vectors of 32-bit `Float`, 4×4 matrices, translation, rotation about an
+axis, scale, perspective and look-at, with strict fields. Conventions:
+column vectors multiplied as `M × v`; right-handed world and view space with
+the camera looking down −Z. Within `docs/module_conventions.md`'s accepted
+boundary (owner clarification at filing):
+- math defines matrices mathematically (element access by row and column,
+  and a column-major element list as a mathematical view) and promises no
+  byte layout; consumers pack matrices for the GPU themselves;
+- projections take their depth range and clip-space Y direction as explicit,
+  documented parameters, and consumers choose D-36's Vulkan values;
+- degenerate operations (normalizing a zero vector, a look-at whose
+  direction is zero or parallel to up, a perspective with invalid field of
+  view, aspect or planes) return `Maybe` rather than producing NaN or
+  infinity; ordinary arithmetic follows IEEE `Float`.
+
+Quaternions, 3×3 matrices and anything else wait for a consumer. It is
+delivered by GRS-17, which GRS-10 depends on. Rejected: building the
+package inside GRS-10, which would put a new public API and a fixture in
+one pull request; a private helper in the sample, which the owner declined
+because the package's time had come.
 
 ## Open questions
 
@@ -694,6 +778,13 @@ pull request.
 
 ### GRS-1. Place allocations with a pure block allocator proven against VMA
 
+> Filed as #331. Owner clarifications at filing, 2026-09-29: the pure
+> placement algorithm lives in `hetoimasia-gpu-vulkan-model`; parity means
+> refused bytes and fragmentation each within 2 percentage points of VMA's,
+> no more than 2× VMA's median time per operation, and a median placement
+> under 5 µs; VMA's source comes from the Hackage `VulkanMemoryAllocator`
+> package rather than a new native input.
+
 - **Outcome:** a pure placement algorithm (D-13) decides block, offset,
   growth and dedicated placement, and an optional probe shows it matches
   VMA's virtual blocks on identical traces (D-14).
@@ -711,6 +802,13 @@ pull request.
 - **Open questions:** none.
 
 ### GRS-11. Back allocations with device-memory blocks beneath the model's accounting
+
+> Filed as #333. Owner clarifications at filing, 2026-09-29: the existing
+> readback buffer moves onto the allocator as its first consumer; the native
+> comparison with VMA gates native allocation count (no more than VMA's) and
+> end-to-end time (within 2×), recording latency and mapping cost ungated;
+> host-visible blocks are mapped once for their lifetime. #333 also carries
+> D-10's `vulkan_backend_design.md` pointer unless #331 lands it first.
 
 - **Outcome:** blocks and dedicated allocations are native device memory,
   charged to the model's accounted bytes, freed when empty, and recovered
@@ -730,6 +828,12 @@ pull request.
 
 ### GRS-2. Create managed buffers and images as retained model subjects
 
+> Filed as #334. Owner clarifications at filing, 2026-09-29: creation names
+> engine-defined kinds (texture, depth target, colour target; vertex, index,
+> instance or ring, lookup and staging buffers) that fix usage flags and
+> memory usage, never raw flags; GRS-2 has no CPU write path (rings arrive in
+> GRS-4, uploads in GRS-6); each image owns one full-resource view.
+
 - **Outcome:** buffers and images (sampled, depth, color target) are managed
   handles with the model's five holds, named and disposed like pipelines.
 - **Scope:** creation, release, naming, disposal.
@@ -743,6 +847,13 @@ pull request.
 - **Open questions:** none.
 
 ### GRS-3. Order access and layout for managed resources through checked operations
+
+> Filed as #335. Owner clarifications at filing, 2026-09-29: the pure
+> legality and initialization rules live in `hetoimasia-gpu-vulkan-model`,
+> in engine terms; buffers rest as follows — vertex and index at vertex-input
+> read, instance or ring at vertex-input and shader read (host writes visible
+> at submission), lookup at vertex and fragment storage read, staging at
+> transfer read — beside D-18's image resting states.
 
 - **Outcome:** the recorder orders and transitions managed resources and
   refuses unordered access.
@@ -762,6 +873,12 @@ pull request.
 
 ### GRS-15. Start the device and owner progress without a window
 
+> Filed as #336. Owner clarifications at filing, 2026-09-29: the
+> surface-free device is an opt-in host setting, leaving windowed
+> applications' surface-guided selection unchanged; GRS-15 also adds a
+> bounded owner-thread action entry, lent the session's `Construction`, that
+> GRS-12 extends with frame-less batch recording.
+
 - **Outcome:** a graphics session selects and creates its device without a
   surface, makes progress and retires with zero targets, and still admits
   later surfaces checked against its queue family.
@@ -780,6 +897,14 @@ pull request.
 
 ### GRS-12. Admit, submit and complete frame-less batches
 
+> Filed as #337. Owner clarifications at filing, 2026-09-29: a dedicated,
+> validated budget of frame-less batches in flight (default 4), each slot with
+> its own command storage reused only after completion or discard; sealed
+> batches are submitted when the owner-thread action returns, in seal order,
+> before any later frame; completion reaches callers through tickets that are
+> read without blocking or waited on with a deadline, and report lost after
+> device loss.
+
 - **Outcome:** the model admits batches that belong to no frame, against its
   budgets, and the backend submits them with their own completion record
   and polls that completion on the owner's schedule.
@@ -796,6 +921,12 @@ pull request.
 
 ### GRS-5. Render into a managed offscreen color target and read it back
 
+> Filed as #338. Owner clarifications at filing, 2026-09-29: frame and
+> frame-less batches alike may render into a managed colour target; colour
+> targets are RGBA8 in sRGB and linear; the slice proves itself by exact 8-bit
+> probe pixels away from edges, writing its readback as an uncommitted PNG
+> for inspection, with committed captures starting at GRS-8 and GRS-10.
+
 - **Outcome:** a batch renders into an offscreen target and its bytes are
   read back on completion evidence.
 - **Scope:** D-6.
@@ -810,20 +941,54 @@ pull request.
 
 ### GRS-4. Record from vertex, index and instance buffers with push constants
 
-- **Outcome:** indexed and instanced draws from managed buffers with push
-  constants declared by pipeline layouts, and per-frame data rings.
-- **Scope:** P-4.
+> Filed as #340. At filing the owner split the shader-interface check into
+> GRS-16 (D-34) and chose one shared ring with per-batch regions (D-33).
+
+- **Outcome:** indexed and instanced draws from managed buffers and ring
+  regions, with push constants declared by pipeline layouts, and the shared
+  per-batch ring.
+- **Scope:** D-33.
 - **Phase:** recording.
 - **Depends on:** GRS-3, GRS-5.
 - **Ordering:** critical path.
-- **Relevant decisions:** D-2, D-16, D-19.
-- **Acceptance signals:** transitive retention examples; native draw proven
-  by offscreen readback; a
-  deliberately mismatched push-constant or vertex layout fails the build.
-- **Out of scope:** descriptors.
+- **Relevant decisions:** D-2, D-16, D-26, D-33, D-34.
+- **Acceptance signals:** transitive retention examples; ring regions
+  reclaimed only on completion or discard, and backpressure when full; native
+  draw proven by offscreen readback.
+- **Out of scope:** descriptors; the shader-interface check (GRS-16).
+- **Open questions:** none.
+
+### GRS-16. Check shader interfaces against compiled SPIR-V in the Template Haskell splice
+
+> Filed as #341. Owner clarifications at filing, 2026-09-29: checked
+> shaders carry their interface description and pipelines take push-constant
+> ranges and vertex input from it, refusing stages that disagree; unchecked
+> splices remain only for shaders that declare no interface, and fail the
+> build otherwise.
+
+- **Outcome:** VK-9's Template Haskell splice checks each shader's compiled
+  SPIR-V against a Haskell interface description and fails the build on a
+  mismatch.
+- **Scope:** D-19: push-constant ranges and member offsets, vertex and
+  instance input locations and formats, and the texture table's set and
+  binding declarations.
+- **Phase:** recording.
+- **Depends on:** GRS-4.
+- **Ordering:** critical path (GRS-7 depends on it).
+- **Relevant decisions:** D-19, D-31, D-34.
+- **Acceptance signals:** deliberately mismatched push-constant, vertex and
+  binding declarations each fail the build with a message naming the
+  mismatch; matching shaders build unchanged; no new native tool.
+- **Out of scope:** generating GLSL from Haskell; runtime checks.
 - **Open questions:** none.
 
 ### GRS-6. Upload bytes through bounded engine-owned staging with completion
+
+> Filed as #342. Owner clarifications at filing, 2026-09-29: uploads are
+> admitted from any thread (a caller-thread copy into engine memory, then the
+> owner copies into staging); uploads target only fresh, uninitialized
+> resources, so replacing a texture is the GRS-9 swap; the texture kind gains
+> transfer-source usage so uploads are verified by exact readback.
 
 - **Outcome:** bytes reach buffers and images through bounded staging with
   completion reported and cancellation handled.
@@ -842,12 +1007,18 @@ pull request.
 
 ### GRS-7. Own the bindless texture table and its completion-safe slot reuse
 
+> Filed as #343. Owner clarifications at filing, 2026-09-29: four immutable
+> samplers (nearest and linear, each clamp-to-edge and repeat; no
+> anisotropy); lookup versions are whole-table copies in a version ring of
+> configured length (default 8), written only on change; slot 0 is a
+> transparent-black placeholder; the lookup buffer is its own set (D-35).
+
 - **Outcome:** the device profile requires D-1's features; textures get
   slot-plus-generation handles, placeholder slot 0, and slot reuse only on
   completion evidence.
 - **Scope:** D-1, D-11.
 - **Phase:** binding.
-- **Depends on:** GRS-6.
+- **Depends on:** GRS-6, GRS-16.
 - **Ordering:** critical path.
 - **Relevant decisions:** D-1, D-7, D-11, D-20, D-22, D-23, D-27, D-31.
 - **Acceptance signals:** pure reuse and lookup-version tests; the D-27
@@ -860,6 +1031,12 @@ pull request.
 - **Open questions:** none.
 
 ### GRS-14. Grow the texture table to its configured cap
+
+> Filed as #344. Owner clarifications at filing, 2026-09-29: the table grows
+> as soon as registration finds no free slot, even while released slots await
+> retirement, doubling to the cap; the lookup version ring is sized for the
+> cap from the start, so only set 0 grows; each grown set has its own
+> descriptor pool, destroyed with it on completion.
 
 - **Outcome:** the table doubles up to D-11's application-configured cap by
   building a larger set, copying existing entries and binding it in later
@@ -879,6 +1056,15 @@ pull request.
 
 ### GRS-8. Draw textured quads from table slots in a 2D scaffolding fixture
 
+> Filed as #345. Owner clarifications at filing, 2026-09-29: the fixture is a
+> `samples/sprites/` package mirroring the triangle, with a windowless
+> evidence mode the native suite runs and a windowed mode for the owner;
+> evidence is a Markdown record plus one PNG per platform under
+> `docs/evidence/gpu_2d/`, the Linux capture uploaded by CI; checks are exact
+> at nearest-sampled texel centres and ±1 per channel where filtering or
+> blending contributes. The slice also adds premultiplied-alpha pipeline
+> blending, its first user.
+
 - **Outcome:** a fixture draws instanced textured quads from several slots
   and proves them by offscreen readback.
 - **Scope:** D-2, D-3, D-6.
@@ -893,6 +1079,13 @@ pull request.
 
 ### GRS-9. Swap a texture slot's image under the same handle
 
+> Filed as #346. Owner clarifications at filing, 2026-09-29: a swap names the
+> replacement's upload and takes effect in the first version after it
+> completes, never showing the placeholder, while a failed upload leaves the
+> old image; the replacement may change format and size; the handle owns its
+> current texture, so the old one is released automatically and retires on
+> completion; a second pending swap supersedes the first.
+
 - **Outcome:** a handle's image is replaced; later frames sample the new one
   and the old retires after the submissions that sampled it complete.
 - **Scope:** D-5.
@@ -905,25 +1098,55 @@ pull request.
 - **Out of scope:** file watching.
 - **Open questions:** none.
 
+### GRS-17. Establish `packages/math` with the vectors, matrices and projections the 3D fixture needs
+
+> Filed as #348 under D-36 and D-37, within `docs/module_conventions.md`'s
+> accepted boundary: no byte-layout promise, explicit clip-convention
+> parameters, and `Maybe` for degenerate operations. The PR also updates
+> AGENTS.md's and vision V-1's "planned" wording.
+
+- **Outcome:** a new `packages/math` package supplies the vectors,
+  matrices and projections the 3D fixture needs, under D-37's conventions.
+- **Scope:** D-37's minimal API.
+- **Phase:** 3D proof.
+- **Depends on:** none.
+- **Ordering:** can land first; critical path for GRS-10.
+- **Relevant decisions:** D-36, D-37.
+- **Acceptance signals:** Hspec properties for the transforms and
+  projections, a column-major byte-layout example, and a dependency check
+  showing no local or graphics package.
+- **Out of scope:** quaternions, 3×3 matrices, SIMD, and geometry types.
+- **Open questions:** none.
+
 ### GRS-10. Add depth attachments and a depth-tested 3D scaffolding fixture
+
+> Filed as #349: depth per D-36, and a `samples/scene3d/` evidence mode with
+> committed captures under `docs/evidence/gpu_3d/`, its camera built from
+> `hetoimasia-math` (#348); the windowed mode follows with GRS-13.
 
 - **Outcome:** offscreen passes render with depth; a fixture proves
   occlusion by readback.
 - **Scope:** D-2's 3D continuation.
 - **Phase:** 3D proof.
-- **Depends on:** GRS-4, GRS-5.
+- **Depends on:** GRS-4, GRS-5, GRS-17.
 - **Ordering:** critical path for the 3D arc.
-- **Relevant decisions:** D-2, D-6, D-24, D-26.
-- **Acceptance signals:** captured occlusion from two camera poses.
-- **Out of scope:** `render-3d`, camera contract, math package, windowed
-  depth.
+- **Relevant decisions:** D-2, D-6, D-24, D-26, D-36, D-37.
+- **Acceptance signals:** captured occlusion from two camera poses, from a
+  `samples/scene3d/` evidence mode, recorded under `docs/evidence/gpu_3d/`.
+- **Out of scope:** `render-3d`, camera contract, windowed depth and the
+  sample's windowed mode (GRS-13).
 - **Open questions:** none.
 
 ### GRS-13. Give each target generation a managed depth attachment
 
+> Filed as #350. Owner clarifications at filing, 2026-09-29: one depth image
+> per swapchain generation, shared by its frames in flight; windowed depth is
+> an opt-in host setting; `samples/scene3d/`'s windowed mode orbits the
+> camera around the evidence scene.
+
 - **Outcome:** windowed frames can render with depth images that follow
   their swapchain generation through construction, resize, replacement and
-  surface recovery.
+  surface recovery; `samples/scene3d/` gains its windowed mode.
 - **Scope:** D-24's windowed half.
 - **Phase:** 3D proof.
 - **Depends on:** GRS-10.

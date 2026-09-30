@@ -420,7 +420,11 @@ Guide is advisory and does not replace Kanban approval or project-review records
   epic #155. Reconciled on 2026-09-23 against `80c974a`: shared toolchain #157,
   native compatibility proof #158, pure ownership model #160, reusable
   supervised graphics owner #218, and native provisioning #208 have merged.
-  The production native backend remains outstanding in its filed slices.
+  Since that snapshot, the production native backend and window integration
+  (#219–#232) and the independent two-window triangle consumer (#233) have
+  merged. Epic #155 is complete; the
+  [milestone verdict](docs/vulkan_milestone_verdict.md) records its final required
+  native profile on macOS and Linux, with both one and two frame slots.
   Vulkan 1.3 minimum, a shared
   loader, managed retention, present-fence retirement, and default two frame
   slots are accepted design choices. #158 proved the native profile on both platforms and recorded it in

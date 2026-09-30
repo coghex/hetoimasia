@@ -139,11 +139,14 @@ Use `cabal build all`, the console smoke, and the focused
 `hetoimasia-glfw:glfw-tests`, `hetoimasia-scripting-lua:lua-host-tests`,
 `hetoimasia-gpu-vulkan-model:gpu-model-tests`,
 `hetoimasia-gpu-vulkan-diagnostics:diagnostics-tests`, and `hetoimasia-tests` Hspec suites for
-the current bootstrap. Prefer Hspec for future integration and
+the current components. Prefer Hspec for future integration and
 resource tests too; use Python probes only where Hspec cannot reasonably exercise
 the boundary. Run `cabal check` in the root and each active
-package directory when editing package metadata. Vulkan validation, offscreen
-captures, and meaningful performance workloads arrive with rendering.
+package directory when editing package metadata. The Vulkan suites already
+exercise validation and verification capture; follow the
+[native-suite](gpu_backend.md#the-native-suite) and
+[triangle-sample](../samples/triangle/README.md) instructions for those checks.
+Meaningful performance workloads remain future work.
 
 For changes to the documentation landing integration or the validation
 planner, run `cabal test workflow-tests --test-show-details=direct`. These Hspec
