@@ -61,6 +61,15 @@ constraints:
     vulkan +safe-foreign-calls,
     vulkan -darwin-lib-dirs
 
+-- VMA for the allocator parity probe alone (GRS-1, D-14): the Hackage package
+-- that bundles VMA's source, pinned beside the probe's own `==0.11.1.0`, and
+-- built with assertions compiled out, as a release build of VMA is. Nothing
+-- but that probe depends on it. See
+-- packages/gpu-vulkan/native/probe/allocator-parity/README.md.
+constraints:
+    VulkanMemoryAllocator ==0.11.1.0,
+    VulkanMemoryAllocator +vma-ndebug
+
 -- Where macOS finds the loader while it compiles. `vulkan-utils`, and every
 -- shader splice through it, runs Template Haskell against the compiled binding,
 -- so GHC loads the binding's dylib during the build, and that dylib records the

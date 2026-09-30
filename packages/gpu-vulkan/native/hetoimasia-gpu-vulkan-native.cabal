@@ -283,3 +283,46 @@ test-suite native-tests
         hetoimasia-gpu-vulkan-model ==0.1.0.0,
         hetoimasia-gpu-vulkan-native,
         hetoimasia-test-support ==0.1.0.0
+
+-- GRS-1's allocator parity probe (#331, D-14), kept as the evidence for D-38:
+-- the committed traces replayed into one fixed block through the pure placement
+-- reference, a mutable prototype of it and VMA's virtual block, timed, and
+-- judged against #331's requirement 7. Neither Haskell allocator met those
+-- gates, and the owner chose VMA for production allocation. The probe is
+-- optional and local-only — the validation group `test.allocator-parity`,
+-- which no CI worker runs and no change selects — and is built and run only
+-- through `tools/vulkan/run.sh`. Here VMA is the copy the pinned Hackage
+-- `VulkanMemoryAllocator` package compiles, reaching this suite alone. See
+-- probe/allocator-parity/README.md and docs/gpu_allocator_parity_record.md.
+test-suite allocator-parity-probe
+    import: language
+    type: exitcode-stdio-1.0
+    main-is: Main.hs
+    hs-source-dirs: probe/allocator-parity
+    other-modules:
+        Parity.Differential
+        Parity.Haskell
+        Parity.Mutable
+        Parity.Reference
+        Parity.Replay
+        Parity.Report
+        Parity.Trace
+        Parity.Vma
+        Prototype.MutableBestFit
+    cxx-sources: probe/allocator-parity/cbits/vma_replay.cpp
+    cxx-options: -std=c++17 -O2 -Wall -Wextra -Werror
+    -- `-T` keeps the runtime's statistics, which the allocation and collection
+    -- figures read; `-rtsopts` lets a run choose its nursery (`+RTS -A…`).
+    ghc-options: -rtsopts "-with-rtsopts=-T"
+    build-depends:
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        containers >=0.8 && <0.9,
+        cryptohash-sha256 >=0.11.102 && <0.12,
+        directory >=1.3 && <1.4,
+        filepath >=1.5 && <1.6,
+        process >=1.6 && <1.7,
+        vector >=0.13 && <0.14,
+        vulkan >=3.27 && <3.28,
+        VulkanMemoryAllocator ==0.11.1.0,
+        hetoimasia-gpu-vulkan-model:placement-reference
