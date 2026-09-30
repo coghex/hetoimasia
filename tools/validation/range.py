@@ -32,7 +32,7 @@ import sys
 # turned off before the imports that would create it.
 sys.dont_write_bytecode = True
 
-from plan import PlannerError, run_git
+from plan_repository import PlannerError, run_git
 
 EMPTY_COMMIT = "0" * 40
 

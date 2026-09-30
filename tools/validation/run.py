@@ -133,19 +133,35 @@ def candidate_module(name: str):
     return module
 
 
-# ``plan`` is deliberately not imported here either. It is the candidate's own
-# classifier, loaded from the checkout being validated, so importing it would
-# run code this run has not yet established is the candidate's — and its
-# `harmless_prose` is exactly what decides whether an edit to it matters. The
-# provenance check refuses any difference under a policy root before the import
-# happens; see `candidate_classification`.
+# ``plan`` is deliberately not imported here either. The planner is the
+# candidate's own classifier, loaded from the checkout being validated, so
+# importing it would run code this run has not yet established is the
+# candidate's — and its `harmless_prose` is exactly what decides whether an edit
+# to it matters. The provenance check refuses any difference under a policy root
+# before the import happens; see `candidate_classification`.
+
+# The planner's modules beside `plan.py`, in dependency order: each imports only
+# the standard library, `receipts`, and modules earlier in this list. The
+# narrowed import path finds none of them, so they are loaded by path in this
+# order, and each name one of them asks for is already registered to the
+# candidate's own copy. All of them are loaded, not only those the
+# classification reads, as importing `plan.py` itself would.
+PLANNER_MODULES = (
+    "plan_repository",
+    "plan_cabal",
+    "plan_catalog",
+    "plan_request",
+    "plan_identity",
+    "plan_selection",
+    "plan_render",
+)
 
 # The roots a candidate can never exempt itself from, restated here rather than
-# read from the catalog or from `plan.py`. Both of those live under these very
+# read from the catalog or from the planner. Both of those live under these very
 # prefixes: taking the list from them would let an edited policy narrow the
-# check that is meant to notice it. `plan.py` unions the same roots into every
-# candidate's identity, so this is a restatement of that contract, not a second
-# one.
+# check that is meant to notice it. `plan_identity.py` unions the same roots
+# into every candidate's identity, as `REQUIRED_POLICY_ROOTS`, so this is a
+# restatement of that contract, not a second one.
 POLICY_ROOTS = ("tools/validation/", ".github/workflows/")
 
 # Environment variables that would point Git at another repository, index, or
@@ -467,7 +483,7 @@ def implied_directories(recorded: set[str]) -> set[str]:
     return directories
 
 
-def generated(planner, path: str, catalog: dict, consumed: set[str]) -> bool:
+def generated(repository, identity, path: str, catalog: dict, consumed: set[str]) -> bool:
     """Whether the candidate's catalog declares this path as a run's own output.
 
     A declaration never outranks an input. A path some group consumes, or that
@@ -482,16 +498,16 @@ def generated(planner, path: str, catalog: dict, consumed: set[str]) -> bool:
     already uses, and anything else is an exact repository-relative path. A
     catalog that declares none exempts nothing.
     """
-    if path in planner.NEVER_HARMLESS_PATHS or path.endswith(planner.NEVER_HARMLESS_SUFFIXES):
+    if path in identity.NEVER_HARMLESS_PATHS or path.endswith(identity.NEVER_HARMLESS_SUFFIXES):
         return False
-    if any(planner.matches_input(path, entry) for entry in consumed):
+    if any(repository.matches_input(path, entry) for entry in consumed):
         return False
     for entry in catalog.get("generated_paths", ()):
         if entry.endswith("/"):
-            if planner.matches_input(path, entry):
+            if repository.matches_input(path, entry):
                 return True
         elif "*" in entry:
-            if planner.matches_class(path, entry):
+            if repository.matches_class(path, entry):
                 return True
         elif path == entry:
             return True
@@ -510,7 +526,7 @@ def relevant_uncommitted(
 
     The order here is the point. Differences are found first, with this module's
     own code and nothing else, because the classifier is one of the files being
-    compared: `plan.py` decides what counts as harmless prose, and it lives
+    compared: `plan_identity.py` decides what counts as harmless prose, and it lives
     under a policy root, so a checkout that had edited it could otherwise have
     that edit excuse itself. Any difference under a policy root is therefore
     refused outright, before the classifier is so much as imported — no
@@ -530,19 +546,22 @@ def relevant_uncommitted(
     `cabal.project.local` that every Cabal command would read. The one exemption
     is what the candidate's catalog declares as a run's own output.
     """
-    planner, catalog, packages = candidate_classification(root, plan)
-    consumed = planner.consumed_entries(catalog, packages)
-    changed |= {path for path in added if not generated(planner, path, catalog, consumed)}
-    return sorted(path for path in changed if not planner.harmless_prose(path, consumed, catalog))
+    repository, identity, catalog, packages = candidate_classification(root, plan)
+    consumed = identity.consumed_entries(catalog, packages)
+    changed |= {
+        path for path in added if not generated(repository, identity, path, catalog, consumed)
+    }
+    return sorted(path for path in changed if not identity.harmless_prose(path, consumed, catalog))
 
 
 def candidate_classification(root: str, plan: dict):
     """The classifier, catalog, and package graph the plan's identity came from.
 
-    The import happens here rather than at module scope: `plan.py` is the
-    candidate's own code read out of the checkout being validated, and this is
-    the first point at which the caller has established that the checkout's copy
-    of it is the candidate's.
+    The classifier is the candidate's repository and identity modules, returned
+    first. The import happens here rather than at module scope: the planner's
+    modules are the candidate's own code read out of the checkout being
+    validated, and this is the first point at which the caller has established
+    that the checkout's copy of them is the candidate's.
 
     The candidate's package graph comes from its commit and cannot have moved.
     Its catalog usually comes from there too, but a plan resolved with
@@ -552,29 +571,28 @@ def candidate_classification(root: str, plan: dict):
     longer digests to it is refused rather than believed: a classification this
     plan was not built from cannot say what a dirty checkout means.
     """
-    # `plan` imports its image contract by name, and the narrowed import path
-    # cannot find it; loading it first registers the candidate's own copy under
-    # that name. It lives under the same policy root, so it is just as proven.
-    candidate_module("ci_image")
-    planner = candidate_module("plan")
-    PlannerError = planner.PlannerError
+    # They live under the same policy root as this runner, so they are just as
+    # proven; see `PLANNER_MODULES` for the order.
+    modules = {name: candidate_module(name) for name in PLANNER_MODULES}
+    repository = modules["plan_repository"]
+    identity = modules["plan_identity"]
 
     override = plan["catalog"]["override"]
     try:
-        candidate = planner.GitTree(root, plan["candidate"]["commit"])
-        catalog, source = planner.read_catalog(candidate, override, root)
-        packages = planner.load_packages(candidate, required=True)
-    except PlannerError as failure:
+        candidate = repository.GitTree(root, plan["candidate"]["commit"])
+        catalog, source = modules["plan_catalog"].read_catalog(candidate, override, root)
+        packages = modules["plan_cabal"].load_packages(candidate, required=True)
+    except repository.PlannerError as failure:
         raise ProvenanceError(
             f"cannot read the classification this plan was resolved with: {failure}"
         ) from failure
     recorded = plan["catalog"]["candidate_digest"]
-    if planner.digest(catalog) != recorded:
+    if identity.digest(catalog) != recorded:
         raise ProvenanceError(
             f"the catalog at {source} is not the one this plan was resolved with "
             f"({recorded[:12]}), so it cannot say what this checkout holds"
         )
-    return planner, catalog, packages
+    return repository, identity, catalog, packages
 
 
 def bootstrap_candidate(path: str) -> dict:

@@ -656,19 +656,54 @@ spec = describe "Validation execution" $ do
         -- classifier is itself one of the inputs it would classify. This one
         -- has been taught that every path is harmless prose, which under the
         -- old order would have excused its own edit and every other.
-        mapM_ (vendorTool fixture) ["run.py", "plan.py", "receipts.py"]
+        mapM_ (vendorTool fixture) validationTools
         void $ gitIn fixture ["add", "-A", "."]
         void $ gitIn fixture ["commit", "-q", "-m", "Vendor the validation tools"]
         plan ← planAgainst fixture (seeded fixture)
         -- Appended, so the later definition is the one the module ends with.
         appendFile
-          (root fixture </> "tools/validation/plan.py")
+          (root fixture </> "tools/validation/plan_identity.py")
           "\n\ndef harmless_prose(path, consumed, catalog):\n    return True\n"
         (result, _, errors) ←
           runFrom fixture (root fixture </> "tools/validation/run.py") "build.pass" plan
         result `shouldBe` ExitFailure 2
         errors `shouldContain` "changed the policy that decides what a result means"
-        errors `shouldContain` "tools/validation/plan.py"
+        errors `shouldContain` "tools/validation/plan_identity.py"
+        doesFileExist (receiptPath fixture "build.pass") `shouldReturn` False
+
+    it "runs a clean candidate that carries the complete planner module graph" $
+      withFixture $ \fixture → do
+        -- The runner loads each planner module from the candidate by path, in
+        -- dependency order, under an import path that finds none of them. A
+        -- module that order missed would fail to import and refuse this run.
+        mapM_ (vendorTool fixture) validationTools
+        void $ gitIn fixture ["add", "-A", "."]
+        void $ gitIn fixture ["commit", "-q", "-m", "Vendor the validation tools"]
+        plan ← planAgainst fixture (seeded fixture)
+        (result, _, errors) ←
+          runFrom fixture (root fixture </> "tools/validation/run.py") "build.pass" plan
+        (result, errors) `shouldBe` (ExitSuccess, "")
+        receipt ← readReceipt fixture "build.pass"
+        stringField receipt "outcome" `shouldBe` Just "passed"
+
+    it "refuses an edited planner helper before any of its code runs" $
+      withFixture $ \fixture → do
+        -- The classifier is several modules now, and an edit to any of them is
+        -- refused before the first is loaded: this one announces itself the
+        -- moment it is imported.
+        mapM_ (vendorTool fixture) validationTools
+        void $ gitIn fixture ["add", "-A", "."]
+        void $ gitIn fixture ["commit", "-q", "-m", "Vendor the validation tools"]
+        plan ← planAgainst fixture (seeded fixture)
+        appendFile
+          (root fixture </> "tools/validation/plan_cabal.py")
+          "\n\nimport sys\nprint('the edited helper ran', file=sys.stderr)\n"
+        (result, _, errors) ←
+          runFrom fixture (root fixture </> "tools/validation/run.py") "build.pass" plan
+        result `shouldBe` ExitFailure 2
+        errors `shouldContain` "changed the policy that decides what a result means"
+        errors `shouldContain` "tools/validation/plan_cabal.py"
+        errors `shouldNotContain` "the edited helper ran"
         doesFileExist (receiptPath fixture "build.pass") `shouldReturn` False
 
     it "refuses an edited receipt contract without importing it" $
@@ -676,7 +711,7 @@ spec = describe "Validation execution" $ do
         -- `receipts.py` supplies the plan contract and writes the receipt, so
         -- importing a dirty copy would run its code — and let it forge one —
         -- before anything had looked at its path.
-        mapM_ (vendorTool fixture) ["run.py", "plan.py", "receipts.py"]
+        mapM_ (vendorTool fixture) validationTools
         void $ gitIn fixture ["add", "-A", "."]
         void $ gitIn fixture ["commit", "-q", "-m", "Vendor the validation tools"]
         plan ← planAgainst fixture (seeded fixture)
@@ -696,7 +731,7 @@ spec = describe "Validation execution" $ do
         -- The runner's own directory leads the import path, so a file named for
         -- a standard library module would be imported in its place, before
         -- anything had looked at its path.
-        mapM_ (vendorTool fixture) ["run.py", "plan.py", "receipts.py"]
+        mapM_ (vendorTool fixture) validationTools
         void $ gitIn fixture ["add", "-A", "."]
         void $ gitIn fixture ["commit", "-q", "-m", "Vendor the validation tools"]
         plan ← planAgainst fixture (seeded fixture)
@@ -1549,6 +1584,24 @@ replaceAll _ _ [] = []
 replaceAll needle replacement haystack@(first : rest)
   | take (length needle) haystack == needle = replacement ++ replaceAll needle replacement (drop (length needle) haystack)
   | otherwise = first : replaceAll needle replacement rest
+
+-- | Every validation tool the runner loads from a checkout: itself, the receipt
+-- contract, and the planner with every module it imports. Vendoring all of them
+-- gives a fixture the complete planner graph a hosted worker's checkout holds.
+validationTools ∷ [FilePath]
+validationTools =
+  [ "run.py"
+  , "receipts.py"
+  , "plan.py"
+  , "ci_image.py"
+  , "plan_repository.py"
+  , "plan_cabal.py"
+  , "plan_catalog.py"
+  , "plan_request.py"
+  , "plan_identity.py"
+  , "plan_selection.py"
+  , "plan_render.py"
+  ]
 
 -- | Copy one of the real tools into the fixture's own tree, so an example can
 -- drive the checkout's copy the way a hosted worker does.

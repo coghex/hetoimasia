@@ -6,6 +6,26 @@ reads that catalog, compares two revisions, and reports which groups a change
 requires and why. It needs Python 3 and Git only: no GHC, no Cabal, and no
 `dist-newstyle/`.
 
+`plan.py` is the command line: its flags, and the order a plan is assembled in.
+The planner's work lives in modules beside it, each importing only the standard
+library, `receipts.py`, and the modules listed before it:
+
+| Module | Owns |
+| --- | --- |
+| `plan_repository.py` | `PlannerError`, repository-relative path matching, Git and working trees, and the paths two revisions differ in |
+| `plan_cabal.py` | the bounded Cabal reader, the local package graph, and each component's derived inputs |
+| `plan_catalog.py` | reading a catalog and checking its schema |
+| `plan_request.py` | the request block and the contribution rules |
+| `plan_identity.py` | [harmless prose](#harmless-prose) and the [candidate identities](#candidate-identity) |
+| `plan_selection.py` | `build_plan`, which composes the others into a plan |
+| `plan_render.py` | the prose rendering of a plan |
+
+A sibling tool imports a helper from the module that owns it — `range.py` from
+`plan_repository.py`, `aggregate.py` from `plan_repository.py` and
+`plan_request.py` — never from `plan.py`. The runner loads the same modules, in
+the same order, from the candidate once it has proven it; see
+[Receipts](#receipts).
+
 The selection policy is the one settled in
 [the CI validation design](ci_validation_design.md):
 
@@ -1178,9 +1198,10 @@ The comparison is against the **candidate**, not the head. A plan resolved with
 a `--candidate` that differs from its head still runs from a checkout of that
 candidate, and its receipt keeps `head_commit` and `executed_commit` distinct.
 
-**The candidate's own code is checked before any of it runs.** `plan.py` decides
-what counts as harmless prose and `receipts.py` supplies the plan contract and
-writes the receipt — and both live under `tools/validation/`, so both are
+**The candidate's own code is checked before any of it runs.** The planner's
+`plan_identity.py` decides what counts as harmless prose and `receipts.py`
+supplies the plan contract and writes the receipt — and both live under
+`tools/validation/`, so both are
 mandatory policy inputs of the candidate this run has not yet confirmed it is
 standing in. Importing either first would execute code out of the mutable
 checkout: an edited classifier could excuse its own edit, and an edited contract
@@ -1208,8 +1229,9 @@ So the runner reads the plan's candidate for itself, with the standard library
 alone, proves the checkout with its own code and Git plumbing, and refuses
 **any** difference under a mandatory policy root — `tools/validation/` or
 `.github/workflows/` — outright, with no classification at all. Only then are
-`receipts` and `plan` imported, which is the first moment this run knows the
-copies on disk are the candidate's. Those two roots are restated in the runner
+`receipts` and the planner's modules imported, each by path in the planner's
+dependency order, which is the first moment this run knows the copies on disk
+are the candidate's. Those two roots are restated in the runner
 rather than read from the catalog or the planner, because both of those live
 under them.
 
