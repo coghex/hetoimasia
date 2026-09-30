@@ -2863,7 +2863,8 @@ with its reason named, by the owner's decision on #327: Weston 13 offers no
 present waits, with no timeout, for the previous one's callback — and Weston
 fires none for an unmapped surface, so hiding a window whose target is
 presenting blocks the graphics owner in its next present to it. That is an
-engine gap on Wayland, not qualified here and tracked apart.
+engine gap on Wayland, not qualified here and tracked as
+[#357](https://github.com/coghex/hetoimasia/issues/357).
 Its one extra case, `wayland-connection-loss`, starts a Weston of its own and
 renders continuously to one window through the production host; once a
 presentation has been observed retiring on its own present fence it ends that

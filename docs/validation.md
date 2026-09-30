@@ -355,7 +355,7 @@ rendering and is pending under any other consent, and excludes VK-16's
 `vk16-composed`, which is pending there with its reason named: hiding a
 presenting window blocks the graphics owner under Mesa's legacy FIFO on Weston
 13 ([gpu_backend.md](gpu_backend.md#the-native-suite)), an engine gap tracked
-apart from this group. It declares no `platforms`,
+as [#357](https://github.com/coghex/hetoimasia/issues/357). It declares no `platforms`,
 as `test.glfw-wayland` does not: the compositor exists only on Linux, and no
 worker runs it elsewhere. `test.vulkan-native` is unchanged.
 

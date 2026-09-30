@@ -275,7 +275,8 @@ below.
   callback. Weston sends a frame callback only for a surface on an output, so
   the present after GLFW unmaps the hidden window never returns. The loop's own
   notes stopped at `both targets presented three frames (3,3); hiding the first
-  window`. This is an engine gap on Wayland, tracked apart; it passes under
+  window`. This is an engine gap on Wayland, tracked as
+  [#357](https://github.com/coghex/hetoimasia/issues/357); it passes under
   `test.vulkan-native`.
 - **Hardware drivers, desktop compositors and macOS.** Only packaged Lavapipe
   under packaged headless Weston was exercised. No hardware driver, no other

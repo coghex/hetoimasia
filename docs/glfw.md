@@ -776,7 +776,7 @@ The remaining gaps are stated rather than estimated:
   offers no `wp_fifo_v1`, so Mesa's FIFO waits for a frame callback the
   compositor never sends an unmapped surface and the graphics owner blocks, so
   VK-16's hide-and-show case is pending on Wayland, an engine gap tracked
-  apart. Hardware drivers, desktop compositors and macOS stay unqualified for
+  as [#357](https://github.com/coghex/hetoimasia/issues/357). Hardware drivers, desktop compositors and macOS stay unqualified for
   rendering on Wayland: no hardware driver, no compositor but packaged
   headless Weston, and no macOS path was exercised, and macOS has no Wayland.
 - **Close requests.** A compositor-generated close request has not been
