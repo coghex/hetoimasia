@@ -565,6 +565,14 @@ the record its context. A field entry or breadcrumb that does not fit is dropped
 whole and counted rather than half-kept. A producer field named `log.truncated`
 is removed, and its removal is itself counted as a dropped field.
 
+**Where preparation lives.** The budget, the collection limits, the marker, and
+the bounded, detached copy are pure record preparation in the runtime library's
+private `Hetoimasia.Runtime.AsyncLog.Entry` module. `Hetoimasia.Runtime.AsyncLog`
+re-exports its public constants and keeps every piece of state the table below
+lists. Being pure does not move the work: admission evaluates the prepared
+record on the producer thread before its enqueueing transaction, so the writer
+never completes a producer's copy.
+
 **Loss is counted, never hidden.** A record arriving at a full queue is
 discarded and counted by severity. Records still queued when the writer is gone
 are counted as unattempted-abandoned. A record whose write failed, or was
