@@ -4,7 +4,9 @@ The records WL-3 (#207) and WL-4 (#327) require: the run that established the
 headless native Wayland profile [glfw.md](glfw.md#wayland) states, and the run
 that established Vulkan rendering on it ([Rendering](#rendering)), each kept
 verbatim because a run's own output is the evidence and a CI log that expires
-is not a record. Each names what ran, where, and on what. The first lists the
+is not a record. A third, #357's, qualifies hiding a presenting window, which
+WL-4's run left unqualified ([Hiding a presenting window](#hiding-a-presenting-window));
+the earlier runs are kept as they were. Each names what ran, where, and on what. The first lists the
 experiments the Wayland qualification design's D-12 declares unavailable, which
 are listed here and never asserted; the second names what stays unqualified.
 
@@ -277,7 +279,9 @@ below.
   notes stopped at `both targets presented three frames (3,3); hiding the first
   window`. This is an engine gap on Wayland, tracked as
   [#357](https://github.com/coghex/hetoimasia/issues/357); it passes under
-  `test.vulkan-native`.
+  `test.vulkan-native`. *Since closed: [Hiding a presenting
+  window](#hiding-a-presenting-window) retains the run that qualifies it. This
+  run's results above are unchanged.*
 - **Hardware drivers, desktop compositors and macOS.** Only packaged Lavapipe
   under packaged headless Weston was exercised. No hardware driver, no other
   compositor, and no macOS path was involved, and macOS has no Wayland.
@@ -492,4 +496,299 @@ vulkan-native-tests: private vk7-roots: ExitSuccess in 0.119826386s
 vulkan-native-tests: private wayland-connection-loss: ExitSuccess in 0.32821068s
 vulkan-native-tests: the process ran for 3.364540535s, fixtures, examples and teardown included
 validation: test.vulkan-wayland passed after 4.5s (exit 0); receipt receipts/test.vulkan-wayland.json
+```
+
+## Hiding a presenting window
+
+The run [#357](https://github.com/coghex/hetoimasia/issues/357) requires:
+VK-16's `vk16-composed`, which hides one of two presenting windows and shows it
+again, run and passed under the isolated compositor's consent, where WL-4's run
+left it pending. The engine change it qualifies is the presentation hold a hide
+takes before its native call and the replacement a resumed target is given
+([gpu_backend.md](gpu_backend.md#pacing-suspension-and-fairness),
+[glfw.md](glfw.md#hiding-an-attached-window)). The same run's
+`test.vulkan-native` is the X11 regression; the Cocoa one was run on the
+owner's machine.
+
+### The run
+
+Workflow run [36742775061](https://github.com/coghex/hetoimasia/actions/runs/36742775061),
+attempt 1, job `vulkan`, group `test.vulkan-wayland`, for pull request
+[#359](https://github.com/coghex/hetoimasia/pull/359) at commit `ac0b65c`,
+executed on GitHub's merge candidate `6f212b1`. The plan resolved the
+candidate's input identity as
+`a6d11e93c03425615a708fe8c98e24f4c31b4bb782143f13fee71f90ad0cf995`, under
+catalog policy version 23. The group passed in 4.673 s of its 30-second budget;
+its receipt, `test.vulkan-wayland.json`, and every private case's record are in
+that run's `validation-receipts-vulkan` artifact.
+
+Only this record, which is Markdown no group consumes, changes after that
+commit, so the run stays input-equivalent to the head it ships with:
+`plan.py --base ac0b65c --head HEAD` reports `test.vulkan-wayland` unaffected.
+That has to be rechecked whenever the head moves for any other reason.
+
+### Identity
+
+| What | Value |
+| --- | --- |
+| Image recipe fingerprint | `ec577e83e83b888caa92189be9e727b02899a4fc95c35b72eeab1b371c34b894` (`tools/ci-image/descriptor.json`, unchanged since WL-4's run) |
+| Image digest | `sha256:71ef73f2fd6432b1b70bc96dc0ab7ded728091ad76232309c7e4ec58858603cb`, verified by the job before it ran anything |
+| Native manifest | `c074c480471ad2e58ccd309f18d24da736b7c61e6cf0ce92872f5b5c15287965` |
+| Compositor package | Ubuntu 24.04's `weston` `13.0.0-4build3`, which reports itself as `weston 13.0.0`, headless backend, offering no `wp_fifo_v1` |
+| Selected backend | `Wayland`, under the consent `isolated-wayland:hetoimasia-3305`, asserted by the shared session before any example rendered |
+| Vulkan loader | `vulkan-loader` `1.3.275 e833b010f814` |
+| Vulkan driver | `vulkan-driver` `lvp 1.4.318 9d69cae2004b`: packaged Lavapipe, whose Wayland WSI throttles FIFO with frame callbacks there |
+| Validation layer | `vulkan-layers` `VK_LAYER_KHRONOS_validation 1.3.275 1d486283e4ce +synchronization`, with synchronization validation |
+| Toolchain | GHC 9.14.1, Cabal 3.18.1.0, `x86_64-linux`; `glslang` `15.1.0 96ea85d4228d`; `vulkan` `0a53afbd93d705f228556e9c4bbcacd4c1e0e79b1216b2c8f68458668d384a71` |
+| Sources | repository revision `6f212b17de2c3d061203ff2a06634d455cbe3fee`, source digest `d2f8653a79529dddce301ac5a9b74f2e44a016de95d242fca6317f6dc52be4bf`, as the runner printed them |
+
+The group's preparation and command were WL-4's, under the same `--toolchain`
+arguments:
+
+```bash
+bash tools/vulkan/run.sh build hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests hetoimasia-sample-triangle-app:exe:hetoimasia-triangle
+bash tools/display/wayland.sh -- bash tools/vulkan/run.sh native hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests -- --complete
+```
+
+### Cases and outcomes
+
+125 examples, 0 failures, 1 pending: the optional interaction probe, as
+everywhere. Every private scenario this consent requires ran and passed,
+`vk16-composed` now among them, and every other case passed as in WL-4's run.
+
+VK-16's own record, from each run's evidence, beside the two regressions:
+
+| | Wayland (`test.vulkan-wayland`) | X11 (`test.vulkan-native`, same run) | Cocoa (owner's machine) |
+| --- | --- | --- | --- |
+| Revision | candidate `6f212b1` | candidate `6f212b1` | `ac0b65c` |
+| Group outcome | 125 examples, 0 failures, 1 pending | 125 examples, 0 failures, 2 pending | 125 examples, 0 failures, 2 pending |
+| Frames before the hide (first, second) | (4, 4) | (3, 4) | (5, 5) |
+| Hide settled as attempted, window observed hidden, target suspended | yes | yes | yes |
+| Frames while hidden (first, second) | (0, 3) | (0, 3) | (0, 3) |
+| First target's frames from the hide's settlement until the show | 0 | 0 | 0 |
+| First target's frames once shown again, after the show settled and the window was observed visible | 1 | 1 | 1 |
+| Swapchains created: one per window and the shown window's replacement | 3 | 3 | 3 |
+| Presentations made / retired on their own present fences | 16 / 16 | 13 / 13 | 15 / 15 |
+| Vulkan calls, and the threads they ran on | 295, one | 253, one | 323, one |
+| Verdict issues, error reports | none, 0 | none, 0 | none, 0 |
+
+X11's and Cocoa's second pending example is `wayland-connection-loss`, which
+runs only under this consent. The Cocoa run was
+`HETOIMASIA_NATIVE_SESSION=desktop bash tools/vulkan/run.sh native hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests -- --complete`
+on macOS with MoltenVK, under the owner's standing approval.
+
+The Wayland case's transcript, from its record:
+
+```text
+## VK-16: two targets rendered through the composed loop, one suspended and resumed while the other presents
+both targets presented three frames (3,3); hiding the first window
+the hide settled as attempted at (4,4)
+the first window is observed hidden and its target suspended at (4,4)
+the second target presented three more frames (4,7); showing the first window
+the show settled as attempted and the first window is observed visible at (4,7)
+the first target presented again (5,9)
+presented 16 frames; 16 presentations retired on their present fences
+```
+
+### The output
+
+What the job printed for the group, from the runner's first line to its last,
+with the log's timestamps and colour codes removed:
+
+```text
+validation: running test.vulkan-wayland (affected) under a 30s budget: bash tools/display/wayland.sh -- bash tools/vulkan/run.sh native hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests -- --complete
+wayland.sh: compositor weston 13.0.0 on socket hetoimasia-3305 in runtime directory /tmp/hetoimasia-wayland.uhI6ua/runtime, DISPLAY and WAYLAND_SOCKET unset
+vulkan: ghc 9.14.1, cabal 3.18.1.0
+vulkan: native prefix /opt/hetoimasia/native/glfw
+vulkan: VK_DRIVER_FILES=/opt/hetoimasia/native/glfw/vulkan/share/vulkan/icd.d/lvp_icd.json
+vulkan: VK_LAYER_PATH=/opt/hetoimasia/native/glfw/vulkan/share/vulkan/explicit_layer.d
+vulkan: validation features synchronization
+vulkan: repository revision 6f212b17de2c3d061203ff2a06634d455cbe3fee
+vulkan: source digest d2f8653a79529dddce301ac5a9b74f2e44a016de95d242fca6317f6dc52be4bf
+vulkan-native-tests: implicit-layer policy: VK_LOADER_LAYERS_DISABLE=~implicit~, so no implicit layer joins the chain and the explicit layers below are all of it
+vulkan-native-tests: layer settings: VK_LAYER_SETTINGS_PATH=/dev/null, so no settings file decides what the layer validates
+
+Vulkan native
+  the native opt-in
+    accepts the desktop opt-in for one run, on either platform [✔]
+    accepts an isolated X11 display only on Linux, and only for the display it names [✔]
+    accepts an isolated Wayland socket only on Linux, only for the socket WAYLAND_DISPLAY names, and never beside a DISPLAY [✔]
+    requests Wayland by name under the isolated compositor's consent, and nothing under any other [✔]
+    takes nothing else as consent: an unset or empty variable, another value, a bare DISPLAY or WAYLAND_DISPLAY, or CI [✔]
+  without a native session
+    A whole run
+      releases the same ten entries, in the same order [✔]
+      retains nothing and destroys every handle in plan order [✔]
+      counts the boundary as an entry that ran and not as a handle destroyed [✔]
+      reports the ordinary destruction rules, not device loss [✔]
+    A present fence that times out
+      retains that slot's present fence and presentation semaphore, the swapchain, and every parent above them [✔]
+      destroys only what does not depend on the unretired present [✔]
+      names the reason on each retained handle [✔]
+      is not device loss, however long the wait went unsatisfied [✔]
+    A teardown boundary that fails without device loss
+      prohibits every release whose safety the boundary was to establish [✔]
+      reports the boundary failure as the reason rather than a presentation [✔]
+      is not discharged by a later valid present fence [✔]
+    Later valid present-fence evidence
+      permits ordered release once the fence signals during teardown [✔]
+    Device loss
+      permits destruction under the specification's own rule [✔]
+      is never reached by promoting a timeout to it [✔]
+      is established by the boundary alone as readily as by a fence [✔]
+    A present rejected out-of-date or surface-lost
+      counts its enqueued operations and holds the slot [✔]
+      releases the slot only on the fence, never on the error result [✔]
+      creates no obligation for the specified no-effect results [✔]
+    An exception in place of a result
+      classifies a thrown Vulkan result as that result [✔]
+      treats an exception carrying no result as evidence of nothing [✔]
+      treats a boundary that threw as a boundary that failed [✔]
+    A run that stopped before the boundary was registered
+      releases what it registered [✔]
+      still withholds when a registered boundary reached no result at all [✔]
+    A recycled slot
+      is not discharged by the completion of the present before it [✔]
+    The record a stopped run renders
+      keeps the failing step and the failed verdict [✔]
+      renders the retained handles, their reasons, and the disposition [✔]
+      still claims nothing the run did not establish [✔]
+    A frame slot whose construction stops
+      releases every child it created when step 0 fails [✔]
+      releases every child it created when step 1 fails [✔]
+      releases every child it created when step 2 fails [✔]
+      releases every child it created when step 3 fails [✔]
+      releases every child it created when step 4 fails [✔]
+      releases every child it created when step 5 fails [✔]
+      releases every child it created when step 6 fails [✔]
+      releases every child it created when step 7 fails [✔]
+      releases every child it created when step 8 fails [✔]
+      releases every child it created when step 9 fails [✔]
+      releases every child it created when step 10 fails [✔]
+      releases every child it created when step 11 fails [✔]
+      creates exactly the prefix of children the failing step allows [✔]
+      destroys a slot's children in dependency order [✔]
+      owns a command buffer through its command pool rather than separately [✔]
+      never destroys a handle the failing step never created [✔]
+    A cleanup entry that holds nothing
+      is neither destroyed nor retained when the construction created nothing [✔]
+      names only the children a partial construction actually created [✔]
+      does not claim a capture handle a stopped capture never created [✔]
+      does not retain an empty place when the boundary failed [✔]
+    A release that fails under device loss
+      still withholds the parents that must outlive what may have survived [✔]
+    A cleanup entry that owns several children
+      records every failure, not only the first [✔]
+      still names the sibling that was destroyed [✔]
+      is not reported as an entry that released [✔]
+    The capture freeing its own handles
+      leaves a failed self-release visible to teardown [✔]
+      withholds the device over what may have survived [✔]
+      does not retry the destroy that failed, and finishes the buffer [✔]
+    A swapchain whose construction stops after it exists
+      releases it before the device when the step after its creation fails [✔]
+    A cancellation at the acquisition-to-registration handoff
+      leaves the handle owned rather than orphaned [✔]
+    A release that fails while a construction failure is being handled
+      keeps the primary failure and records the release failure beside it [✔]
+      continues the independent releases and retries none of them [✔]
+      withholds the parents that must outlive what may have survived [✔]
+      renders both failures in the record a stopped run writes [✔]
+    The capture path
+      owns both handles when it stops while creating the buffer [✔]
+      owns both handles when it stops while allocating the memory [✔]
+      owns both handles when it stops while binding the memory [✔]
+      owns both handles when it stops while acquiring the image [✔]
+      owns both handles when it stops while submitting the copy [✔]
+      owns both handles when it stops while waiting for the copy to complete [✔]
+      owns both handles when it stops while mapping the memory [✔]
+      owns both handles when it stops while presenting [✔]
+      frees the memory before the buffer, as the successful path does [✔]
+      destroys neither handle when it never created it [✔]
+      reports both handles as destroyed rather than only as entries [✔]
+      retains both when the boundary established no completion for the copy [✔]
+      is not held by an unretired present, which touches neither handle [✔]
+    A run that completes
+      frees the capture's two handles itself, exactly once [✔]
+      arrives at teardown holding neither of them [✔]
+      builds both whole slots and releases each child once [✔]
+      releases the same ten entries, in the same order [✔]
+      destroys every object it created, exactly once and before its device [✔]
+    A cancellation taken at the present handoff
+      records the presentation the enqueue created before it is taken [✔]
+      preserves the result the present reported rather than the exception that stopped the run [✔]
+      stops the run at the presentation step, carrying the cancellation's own failure [✔]
+      keeps teardown's own boundary and fence-wait observations beside it [✔]
+      retains the slot's present fence and presentation semaphore, the swapchain, and every parent [✔]
+      names each retained handle and why it was retained [✔]
+    A cancellation at the handoff of a recycled slot
+      records the new present rather than carrying the retired one forward [✔]
+      reopens the obligation the earlier present's completion had closed [✔]
+      retains exactly what the fresh slot's cancellation retains [✔]
+    A present handoff no cancellation reaches
+      records the result and returns, exactly as it did before [✔]
+      leaves the caller unmasked, so the waits after it are as interruptible as ever [✔]
+      keeps the classification of a call that threw [✔]
+    The loaded Vulkan loader
+      accepts the recorded loader [✔]
+      refuses an alternate loader found ahead of it on the search path, naming both [✔]
+      refuses a run whose runner named no recorded loader [✔]
+      refuses an entry point attributed to no image [✔]
+  the shared roots
+    entered GLFW on the backend the run's consent names, before any example renders [✔]
+    runs every dispatched operation on the process main thread that entered the session [✔]
+    creates the instance and its explicit messenger on the graphics owner's thread, never the main thread [✔]
+    hands two windows over as required targets on one shared device, and keeps the roots live when the first-created closes [✔]
+    VK-10 generation: 160x120 from ExtentFromObservation, window 160x120 at content scale 1.0, 5 images of format 50
+    builds a generation on the owner's thread from the surface's extent and the profile's format, the framebuffer's pixels rather than the window's size [✔]
+    replaces a generation after a resize through the main-thread dispatch, retiring the old one only after its hold ends [✔]
+    replaces a lost surface through the bridge on the main thread under the same attachment, leaving another window's target presenting [✔]
+    serves a later example's target from the same device [✔]
+  with private roots in a child process
+    proves the VK-2 compatibility profile, presentation completion, safe abandonment and capture [✔]
+    proves VK-6's C-only validation capture on an instance of its own [✔]
+    proves VK-5's loader-aware surface bridge in a session of its own [✔]
+    proves VK-7's roots under the graphics owner, through their destruction at the host's exit [✔]
+    records and discards a triangle batch through VK-11's managed resources, with validation reporting nothing [✔]
+    acquires, submits and awaits a triangle batch with its capture, and returns images without presenting, with validation reporting nothing [✔]
+    presents to two windows on verified present fences, retires a resized generation and the first window on that evidence, with validation reporting nothing [✔]
+    replaces a lost surface on its live window while another presents, and recovers an allocation by reclaiming a retired generation, with validation reporting nothing [✔]
+    stops rendering at the checkpoint after an injected validation error, tearing down under the ordinary rules with the error as the primary and the final callbacks in the verdict [✔]
+    reports a deliberately retained unverified generation and its parents rather than releasing them, and ends by process termination [✔]
+    renders two targets through the composed loop, suspending and resuming one while the other presents, and exits through D-33 with validation reporting nothing [✔]
+    renders the triangle sample in two windows with one frame slot, capturing each, the first again after its resize, and the second after the first closes, with validation reporting nothing [✔]
+    renders the triangle sample in two windows with two frame slots, capturing each, the first again after its resize, and the second after the first closes, with validation reporting nothing [✔]
+    captures a consumer-built triangle from two targets through the production host, each beside its frame's verified presentation, with validation reporting nothing [✔]
+    observes a deliberate synchronization hazard, proving synchronization validation active [✔]
+    carries a provoked validation report's named managed resource, and its batch's label, into the capture [✔]
+    ends its own compositor while the production host renders to a Wayland surface, and the session ends terminally with the loss, retired under the protected boundary with no completion recorded for interrupted work [✔]
+  graphics-owner progress during window interactions
+    records the native pump, the callbacks inside it, owner turns, and the graphics owner's present requests and present-fence completions while a person moves, resizes, and uses the menu bar [‐]
+      # PENDING: the graphics-owner interaction probe runs only when HETOIMASIA_INTERACTION_PROBE_SECONDS names the seconds each phase lasts, and it needs a person at the desktop
+
+Finished in 3.7098 seconds
+125 examples, 0 failures, 1 pending
+vulkan-native-tests: shared session acquisitions: 1
+vulkan-native-tests: shared session native calls: 193
+vulkan-native-tests: shared session destruction: vkDestroySurfaceKHR, vkDestroySurfaceKHR, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroySwapchainKHR, vkDestroySurfaceKHR, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroySwapchainKHR, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroySwapchainKHR, vkDestroySurfaceKHR, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroySwapchainKHR, vkDestroySurfaceKHR, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroySwapchainKHR, vkDestroySurfaceKHR, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroySwapchainKHR, vkDestroySurfaceKHR, vkDestroySurfaceKHR, vkDestroyDevice, vkDestroyDebugUtilsMessengerEXT, vkDestroyInstance
+vulkan-native-tests: shared session verdict: clean, 89 records delivered
+vulkan-native-tests: private debug-names: ExitSuccess in 9.2798591e-2s
+vulkan-native-tests: private synchronization-hazard: ExitSuccess in 8.5354488e-2s
+vulkan-native-tests: private vk11-recording: ExitSuccess in 8.9292432e-2s
+vulkan-native-tests: private vk12-frames: ExitSuccess in 9.0723539e-2s
+vulkan-native-tests: private vk13-presentation: ExitSuccess in 0.309492016s
+vulkan-native-tests: private vk14-recovery: ExitSuccess in 0.305432017s
+vulkan-native-tests: private vk15-retention: ExitSuccess in 8.0647902e-2s
+vulkan-native-tests: private vk15-validation-stop: ExitSuccess in 9.4111249e-2s
+vulkan-native-tests: private vk16-composed: ExitSuccess in 0.319380897s
+vulkan-native-tests: private vk17-one-slot: ExitSuccess in 0.175099963s
+vulkan-native-tests: private vk17-two-slots: ExitSuccess in 0.374216597s
+vulkan-native-tests: private vk19-capture: ExitSuccess in 0.119009177s
+vulkan-native-tests: private vk2-compatibility: ExitSuccess in 0.252024168s
+vulkan-native-tests: private vk5-bridge: ExitSuccess in 2.9225889e-2s
+vulkan-native-tests: private vk6-capture: ExitSuccess in 9.3064396e-2s
+vulkan-native-tests: private vk7-roots: ExitSuccess in 9.5396951e-2s
+vulkan-native-tests: private wayland-connection-loss: ExitSuccess in 0.303341732s
+vulkan-native-tests: the process ran for 3.729122393s, fixtures, examples and teardown included
+validation: test.vulkan-wayland passed after 4.7s (exit 0); receipt receipts/test.vulkan-wayland.json
 ```
