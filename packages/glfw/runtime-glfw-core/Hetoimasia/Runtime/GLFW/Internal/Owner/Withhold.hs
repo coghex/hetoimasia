@@ -15,7 +15,11 @@
 -- 1. the hold is recorded against the attachment, bound to the observation
 --    revision already published for it;
 -- 2. the main thread then waits while the step in flight, if any, may present
---    to that target, and no longer. Every later step reads the hold in the
+--    to that target, and no longer. A step may present only to a target it
+--    views as constructed and 'RenderEligible' (the backend's side of the
+--    contract, stated on 'TargetStepView'), so a hide of a window whose target
+--    is suspended, deferred or unconstructed never waits, whatever another
+--    target's presentation is doing. Every later step reads the hold in the
 --    transaction that reads its inputs, so none of them presents to it.
 --
 -- The owner's step applies the holds ('applyWithholding'). It views a held
@@ -32,10 +36,13 @@
 -- owner, one still starting, or one whose step cannot present to the window.
 --
 -- Main thread: 'withholdPresentation' and the lift it answers. Owner thread:
--- 'applyWithholding' and 'endStepPresenting', inside its step.
+-- 'applyWithholding', 'recordStepPresenting' and 'endStepPresenting', around
+-- its step. The set the step may present to is recorded and cleared under one
+-- mask, so no cancellation can leave a target in it once the step has gone.
 module Hetoimasia.Runtime.GLFW.Internal.Owner.Withhold
   ( withholdPresentation
   , applyWithholding
+  , recordStepPresenting
   , endStepPresenting
   ) where
 
@@ -46,6 +53,8 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 import Hetoimasia.GLFW.Internal.Attachment (AttachmentId)
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Handoff (TargetObservation (targetRevision), readTargetObservations)
+import Hetoimasia.Runtime.GLFW.Internal.Owner.Operations (TargetStepView (..))
+import Hetoimasia.Runtime.GLFW.Internal.RenderDemand (RenderEligibility (RenderEligible))
 import Hetoimasia.Runtime.GLFW.Internal.Owner.State
   ( GraphicsOwner (..)
   , TargetState (..)
@@ -74,9 +83,8 @@ withholdPresentation owner target = do
 
 -- | Apply the standing holds to the step about to be offered, in the
 -- transaction that reads its inputs, on the owner thread: raise each held
--- target's withdrawal count, prune the holds that are obsolete or unowned,
--- record the targets the step may present to, and answer the ones it views as
--- suspended.
+-- target's withdrawal count, prune the holds that are obsolete or unowned, and
+-- answer the ones it views as suspended.
 --
 -- Every hold is counted by the first step that finds it, even one it finds
 -- obsolete, so a hide and a show that both came between two steps still reach
@@ -97,9 +105,18 @@ applyWithholding owner = do
         Nothing → state
   writeTVar (ownerWithheld owner) kept
   writeTVar (ownerTargets owner) (Map.mapWithKey raise states)
-  writeTVar (ownerPresenting owner) (Map.keysSet states `Set.difference` suspended)
   pure suspended
 
--- | The step has returned: it presents to nothing now.
+-- | Record the targets the step about to be offered may present to, in the
+-- transaction that reads its inputs: those it views as constructed and
+-- 'RenderEligible', which a held target never is.
+recordStepPresenting ∷ GraphicsOwner scene → [TargetStepView] → STM ()
+recordStepPresenting owner views =
+  writeTVar
+    (ownerPresenting owner)
+    (Set.fromList [viewTarget view | view ← views, viewConstructed view, viewEligibility view == RenderEligible])
+
+-- | The step has returned, or the owner's run has ended: it presents to
+-- nothing now.
 endStepPresenting ∷ GraphicsOwner scene → STM ()
 endStepPresenting owner = writeTVar (ownerPresenting owner) Set.empty

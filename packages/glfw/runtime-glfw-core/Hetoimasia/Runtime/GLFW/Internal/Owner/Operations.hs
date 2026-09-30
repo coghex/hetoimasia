@@ -79,6 +79,10 @@ data TargetHandoff
 data TargetStepView = TargetStepView
   { viewTarget ∷ !AttachmentId
   , viewEligibility ∷ !RenderEligibility
+    -- ^ A backend presents only to a target it views as constructed and
+    -- 'Hetoimasia.Runtime.GLFW.Internal.RenderDemand.RenderEligible'. A hide
+    -- waits for a step in flight only when that step views the window's target
+    -- so ("Hetoimasia.Runtime.GLFW.Internal.Owner.Withhold").
   , viewGeometry ∷ !TargetGeometry
   , viewRevision ∷ !Natural
     -- ^ The observation revision this view was folded from, so a backend can

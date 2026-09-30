@@ -71,7 +71,7 @@ import Hetoimasia.Runtime.GLFW.Internal.Owner.Terminal
   , validatedTargets
   )
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Wake (wakeGraphicsHost)
-import Hetoimasia.Runtime.GLFW.Internal.Owner.Withhold (applyWithholding, endStepPresenting)
+import Hetoimasia.Runtime.GLFW.Internal.Owner.Withhold (applyWithholding, endStepPresenting, recordStepPresenting)
 import Hetoimasia.Runtime.GLFW.Internal.RenderDemand (RenderEligibility (RenderSuspended))
 
 -- | The owner's whole run: the protected retirement, the body, and the settled
@@ -83,6 +83,8 @@ runOwnerAction owner token = mask $ \restore → do
   -- — an expected stop, a startup failure, a run failure, and a cancellation —
   -- leaves through the same drain.
   outcome ← tryWithContext (restore (ownerRun owner token))
+  -- No step runs again: a hide need wait for none, whatever ended the run.
+  atomically (endStepPresenting owner)
   latchFailure owner outcome
   -- Unconditionally, and before the drain takes its final backlog: a normal
   -- stop ends the run without a failure to latch, and 'graphicsOwnerWorker'
@@ -179,23 +181,27 @@ deadlineInstant = \case
 -- last. The presentation holds are applied in that same transaction
 -- ("Hetoimasia.Runtime.GLFW.Internal.Owner.Withhold"): a held target is viewed
 -- as suspended, and the set of targets the step may present to stands until
--- it returns.
+-- it returns. That set is recorded and its clearing installed under one mask,
+-- and only the step itself is interruptible, so no cancellation can leave a
+-- target in it for a hide to wait on.
 offerStep ∷ GraphicsOwner scene → IO (StepReport, NextDeadline)
 offerStep owner = do
   now ← readInstant (ownerClock owner)
-  (scene, sceneRevision, demand, demandRevision, views) ← atomically $ do
-    (scene, sceneRevision) ← readOwnerSceneAt handoff
-    (demand, demandRevision) ← readOwnerDemandAt handoff
-    withheld ← applyWithholding owner
-    states ← readTVar (ownerTargets owner)
-    geometry ← readTVar (ownerGeometryCells owner)
-    -- Recorded in the same transaction the step's inputs were read in, so the
-    -- wait below can never conclude that a publication this step did not see
-    -- has already been folded.
-    writeTVar (ownerSeenInputs owner) (demandRevision, sceneRevision)
-    pure (scene, sceneRevision, demand, demandRevision, map (stepView geometry withheld) (Map.toAscList states))
-  report ←
-    (graphicsStep operations (OwnerStep now scene sceneRevision demand demandRevision views) >>= evaluate)
+  report ← mask $ \restore → do
+    (scene, sceneRevision, demand, demandRevision, views) ← atomically $ do
+      (scene, sceneRevision) ← readOwnerSceneAt handoff
+      (demand, demandRevision) ← readOwnerDemandAt handoff
+      withheld ← applyWithholding owner
+      states ← readTVar (ownerTargets owner)
+      geometry ← readTVar (ownerGeometryCells owner)
+      -- Recorded in the same transaction the step's inputs were read in, so
+      -- the wait below can never conclude that a publication this step did
+      -- not see has already been folded.
+      writeTVar (ownerSeenInputs owner) (demandRevision, sceneRevision)
+      let views = map (stepView geometry withheld) (Map.toAscList states)
+      recordStepPresenting owner views
+      pure (scene, sceneRevision, demand, demandRevision, views)
+    restore (graphicsStep operations (OwnerStep now scene sceneRevision demand demandRevision views) >>= evaluate)
       `finally` atomically (endStepPresenting owner)
   deadline ← graphicsNextDeadline operations >>= evaluate
   pure (report, deadline)

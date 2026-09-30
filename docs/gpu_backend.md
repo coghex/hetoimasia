@@ -2452,7 +2452,9 @@ presentation returns, the other target presenting three frames and the hidden
 one none, its old swapchain kept while its presentations are unretired, and
 the shown window presenting on a replacement handed that swapchain and never on
 the old one — an example that fails with the hold or the replacement removed
-(#357);
+(#357); a window whose target is already suspended hidden again while the other
+target's presentation holds, whose hide makes its native call without waiting
+for that step;
 a renderer refusing every frame, with the owner's deadline one backoff interval
 ahead of a still clock and no second attempt until the clock reaches it; a
 fresh request, made while such a retry is pending, rendered at once with the

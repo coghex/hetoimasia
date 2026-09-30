@@ -26,7 +26,7 @@ import System.Timeout (timeout)
 
 import Hetoimasia.Foundation.Messaging.Payload (prepare)
 import Hetoimasia.Foundation.Time (Duration, DurationRequirement (AllowZero), Instant, addDuration, durationFromNanoseconds, elapsedBetween, readInstant, scriptedInstant, zeroDuration)
-import Hetoimasia.GLFW.Command (WaitedSubmission (..), awaitCompletion, awaitSubmitWindowCommand, clientDemandPublisher, hideWindowCommand, setWindowSizeCommand, showWindowCommand)
+import Hetoimasia.GLFW.Command (WaitedSubmission (..), WindowCommand, awaitCompletion, awaitSubmitWindowCommand, clientDemandPublisher, hideWindowCommand, setWindowSizeCommand, showWindowCommand)
 import Hetoimasia.GLFW.Demand (deadlineDemand, immediateDemand, publishDemand)
 import Hetoimasia.GLFW.Window (Extent (..), WindowId)
 import Hetoimasia.GPU.Model (TargetPhase (..), TargetView (..), targetView)
@@ -92,6 +92,7 @@ spec = describe "Vulkan loop adapter" $ do
 
   describe "hiding a presenting window (#357)" $ do
     it "makes the hide's native call only once the presentation in flight has returned, keeps the other target presenting, keeps the old swapchain while its presentations are unretired, and resumes the shown window on a replacement" (bounded testHideWhilePresenting)
+    it "makes the native call of a hide whose window's target is suspended while another target's presentation holds, waiting for no step" (bounded testHideSuspendedWhileOtherPresents)
 
   describe "a stalled main thread" $ do
     it "keeps the owner rendering while the native event call is held, and serves a window command once it returns" (bounded testStalledMainThread)
@@ -528,6 +529,64 @@ testHideWhilePresenting = do
     isHidden = \case
       WindowHidden _ → True
       _ → False
+
+-- | A hide waits only for a step that may present to its own window's target.
+-- The first window is hidden and its target suspended; then the owner's
+-- presentation to the second holds, and the first is hidden again. That hide
+-- must make its native call while the presentation still holds: a hide that
+-- waited for every step in flight would wait for the second target's, which
+-- waits for the gate — a deadlock the example ends itself, after a labelled
+-- bound, by opening the gate and failing.
+testHideSuspendedWhileOtherPresents ∷ IO ()
+testHideSuspendedWhileOtherPresents = do
+  rig ← visibleRigOf 2
+  settledWhileHeld ← runRig rig $ \host control → do
+    [first, second] ← windowsOf host
+    one ← firstFrame rig host control first
+    _ ← firstFrame rig host control second
+    hidden ← newTVarIO False
+    _ ← forkIO (commandSettled host (hideWindowCommand first) >> atomically (writeTVar hidden True))
+    composedUntil rig host control "the hidden window's suspension" (\_ → pure ()) $
+      (&&) <$> readTVarIO hidden <*> targetSuspended host one
+    gate ← newTVarIO False
+    presenting ← holdPresentations rig gate
+    result ← newTVarIO Nothing
+    before ← length . filter isHidden <$> journal rig
+    _ ← forkIO $ do
+      atomically (presenting >>= check)
+      _ ← forkIO (commandSettled host (hideWindowCommand first))
+      -- The bound only ends a regression's deadlock: a hide that waits for no
+      -- step makes its native call at once, and the example passes as soon as
+      -- it does.
+      expired ← registerDelay 10000000
+      made ← atomically $
+        (True <$ (length . filter (isHidden . snd) <$> readTVar (rigJournal rig) >>= check . (> before)))
+          `orElse` (False <$ (readTVar expired >>= check))
+      atomically (writeTVar result (Just made))
+      atomically (writeTVar gate True)
+    demandFrame host second
+    composedUntil rig host control "the second hide's native call" (\_ → pure ()) (isJust <$> readTVarIO result)
+    readTVarIO result
+  settledWhileHeld `shouldBe` Just True
+  where
+    isHidden = \case
+      WindowHidden _ → True
+      _ → False
+
+-- | Submit a command through the host's port and wait for its settlement,
+-- from a thread that is not the main one.
+commandSettled ∷ VulkanHost Scene → WindowCommand → IO ()
+commandSettled host command =
+  awaitSubmitWindowCommand (hostCommandPort (vulkanWindowHost host)) [("client", "integration-tests")] command >>= \case
+    WaitAccepted ticket → void (awaitCompletion ticket)
+    WaitClosed → failWith "the host's command port closed"
+
+-- | Whether a target is suspended in the GPU model.
+targetSuspended ∷ VulkanHost Scene → GraphicsService → IO Bool
+targetSuspended host service = do
+  model ← atomically (readVulkanModel (vulkanController host))
+  targets ← atomically (readVulkanTargets (vulkanController host))
+  pure (or [viewTargetPhase held == TargetSuspended | (attachment, view) ← targets, attachment == graphicsAttachment service, Just held ← [targetView (targetViewIdentity view) model]])
 
 testStalledMainThread ∷ IO ()
 testStalledMainThread = do

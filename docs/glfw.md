@@ -3510,7 +3510,13 @@ The graphics owner's protocol implements it with a **presentation hold**
 (`Hetoimasia.Runtime.GLFW.Internal.Owner.Withhold`): the hold is recorded
 against the attachment, bound to the observation revision already published
 for it, and the main thread then waits while the owner's step in flight, if
-any, may present to that target. Every later step reads the hold in the
+any, may present to that target: one that views it as constructed and
+`RenderEligible`, since a backend presents to no other target. A hide of a
+window whose target is suspended, deferred or not yet constructed therefore
+never waits, whatever another target's presentation is doing. The set of
+targets a step may present to is recorded with its inputs and cleared when it
+returns, under one mask, and again when the owner's run ends, so no
+cancellation leaves a hide waiting on a step that has gone. Every later step reads the hold in the
 transaction that reads its inputs, views the target as `RenderSuspended` until
 it has folded a newer observation, and carries the target's **withdrawal
 count** (`viewWithdrawals`), which rises with every hold a step applies. A
