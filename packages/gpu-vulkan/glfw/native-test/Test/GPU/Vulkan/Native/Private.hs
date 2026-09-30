@@ -46,6 +46,13 @@
 -- * @vk19-capture@ — VK-19's consumer-built triangle pipeline, captured from
 --   two targets through the production host with verification capture on
 --   ("Test.GPU.Vulkan.Native.Capture", #299);
+-- * @grs15-surface-free@ — GRS-15's surface-free session with no window: the
+--   device created in the owner's startup, a pipeline layout and a pipeline
+--   built and released through owner-thread actions and destroyed by the
+--   owner's own progress, and a clean exit ("Test.GPU.Vulkan.Native.SurfaceFree",
+--   #336);
+-- * @grs15-surface-free-window@ — the same device start, then a window admitted
+--   against its queue family and presented to (#336);
 -- * @synchronization-hazard@ — the negative control that proves
 --   synchronization validation active ("Test.GPU.Vulkan.Native.Hazard");
 -- * @debug-names@ — #250's provoked validation report on a named managed
@@ -119,6 +126,7 @@ import qualified Test.GPU.Vulkan.Native.Naming as Naming
 import qualified Test.GPU.Vulkan.Native.Presentation as Presentation
 import qualified Test.GPU.Vulkan.Native.Recovery as Recovery
 import qualified Test.GPU.Vulkan.Native.Recording as Recording
+import qualified Test.GPU.Vulkan.Native.SurfaceFree as SurfaceFree
 import qualified Test.GPU.Vulkan.Native.Terminal as Terminal
 import qualified Test.GPU.Vulkan.Native.Triangle as Triangle
 import qualified Test.Vulkan.Proof.Bridge as Bridge
@@ -265,6 +273,22 @@ scenarios =
       $ \consent journal _ → do
         outcome ← Capture.runCapture (consentBackend consent) journal
         pure (Capture.spec outcome, section "The VK-19 consumer pipeline and capture record" (Capture.captureSection outcome))
+  , Scenario
+      "grs15-surface-free"
+      "creates the device with no surface and no window, builds and releases a pipeline through owner-thread actions, and retires cleanly, with validation reporting nothing"
+      False
+      Nothing
+      $ \consent journal _ → do
+        outcome ← SurfaceFree.runSurfaceFree (consentBackend consent) journal
+        pure (SurfaceFree.surfaceFreeSpec outcome, section "The GRS-15 surface-free session record" (SurfaceFree.surfaceFreeSection outcome))
+  , Scenario
+      "grs15-surface-free-window"
+      "creates the device with no surface, then admits a window against its queue family and presents to it, with validation reporting nothing"
+      False
+      Nothing
+      $ \consent journal _ → do
+        outcome ← SurfaceFree.runLaterWindow (consentBackend consent) journal
+        pure (SurfaceFree.laterWindowSpec outcome, section "The GRS-15 later window record" (SurfaceFree.laterWindowSection outcome))
   , Scenario
       "synchronization-hazard"
       "observes a deliberate synchronization hazard, proving synchronization validation active"

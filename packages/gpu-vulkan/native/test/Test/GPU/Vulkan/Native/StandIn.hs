@@ -97,6 +97,9 @@ data Call
   | CreatedInstance ![Text]
   | CreatedMessenger
   | QueriedDevices !Word64
+  | QueriedDevicesWithoutSurface
+    -- ^ The devices were enumerated for a surface-free bootstrap, which asks
+    -- no family about presentation.
   | CreatedDevice !Text !Word32
   | QueriedSupport !Word64
   | DestroyedSurface !Word64
@@ -367,10 +370,10 @@ standInOps standIn =
     , opsCreateMessenger = \_ → 2 <$ step standIn AtCreateMessenger CreatedMessenger
     , opsDestroyMessenger = \_ _ → step standIn AtDestroyMessenger DestroyedMessenger
     , opsDestroyInstance = \_ → step standIn AtDestroyInstance DestroyedInstance
-    , opsDeviceOffers = \_ surface → do
-        step standIn AtQueryDevices (QueriedDevices surface)
+    , opsDeviceOffers = \_ bootstrap → do
+        step standIn AtQueryDevices (maybe QueriedDevicesWithoutSurface QueriedDevices bootstrap)
         pure
-          [ offer {offerQueueFamilies = [family {familyPresents = familyPresents family && surface /= unsupportedSurface} | family ← offerQueueFamilies offer]}
+          [ offer {offerQueueFamilies = [family {familyPresents = presents (familyPresents family) bootstrap} | family ← offerQueueFamilies offer]}
           | offer ← standOffers standIn
           ]
     , opsCreateDevice = \_ plan → 3 <$ step standIn AtCreateDevice (CreatedDevice (planDeviceName plan) (planQueueFamily plan))
@@ -419,6 +422,11 @@ standInOps standIn =
     }
   where
     decode = Encoding.decodeUtf8Lenient
+    -- A surface-free bootstrap's families are not asked about presentation,
+    -- as the production layer asks nothing without a surface.
+    presents offered = \case
+      Just surface → offered && surface /= unsupportedSurface
+      Nothing → False
 
 -- | A surface whose destruction the stand-in records and which succeeds.
 surfaceNumbered ∷ StandIn → Word64 → TargetSurface

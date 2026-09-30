@@ -25,11 +25,16 @@
 --   the Khronos layer leaves off unless the instance's own create info turns
 --   it on; and
 -- * one queue family that answers both graphics and presentation to the
---   bootstrap surface.
+--   bootstrap surface — or, for a surface-free bootstrap
+--   ('selectSurfaceFreeDevice'), one that answers graphics, with no surface
+--   asked about at all.
 --
--- A later surface is admitted only if that same queue family presents to it
--- ('TargetRejection'); no second device and no second queue is ever chosen
--- for it (D-7).
+-- A surface-free bootstrap drops only the presentation requirement: the
+-- version, the extensions, the features and portability are the same, so a
+-- device it selects can still present once a surface arrives. A later surface
+-- is admitted only if the session's one queue family presents to it
+-- ('TargetRejection'); no second device and no second queue is ever chosen for
+-- it (D-7).
 module Hetoimasia.GPU.Vulkan.Native.Profile
   ( -- * Versions
     packApiVersion
@@ -63,6 +68,7 @@ module Hetoimasia.GPU.Vulkan.Native.Profile
   , DevicePlan (..)
   , NoCompatibleDevice (..)
   , selectDevice
+  , selectSurfaceFreeDevice
 
     -- * Later targets
   , TargetRejection (..)
@@ -267,7 +273,8 @@ data QueueFamilyOffer = QueueFamilyOffer
   { familyIndex ∷ !Word32
   , familyGraphics ∷ !Bool
   , familyPresents ∷ !Bool
-    -- ^ Whether it presents to the bootstrap surface.
+    -- ^ Whether it presents to the bootstrap surface: 'False', and never
+    -- asked, for a surface-free bootstrap, which has none.
   }
   deriving (Eq, Show)
 
@@ -291,6 +298,9 @@ data DeviceRejection
   | DeviceNoPresentingGraphicsFamily
     -- ^ No single queue family answers both graphics and presentation to the
     -- bootstrap surface.
+  | DeviceNoGraphicsFamily
+    -- ^ No queue family answers graphics: a surface-free bootstrap's own
+    -- rejection, which asks nothing about presentation.
   deriving (Eq, Show)
 
 -- | The device the session takes, and what it is created with.
@@ -300,7 +310,8 @@ data DevicePlan device = DevicePlan
   , planDeviceApiVersion ∷ !Word32
   , planQueueFamily ∷ !Word32
     -- ^ The one queue family graphics and presentation share, for every
-    -- target of the session.
+    -- target of the session. A surface-free bootstrap chose it for graphics
+    -- alone; each target's surface is then checked against it.
   , planDeviceExtensions ∷ ![ByteString]
   , planPortabilitySubset ∷ !Bool
   }
@@ -324,17 +335,30 @@ instance Exception NoCompatibleDevice where
         DeviceExtensionMissing name → "no " <> Char8.unpack name
         DeviceFeatureMissing name → "no " <> Text.unpack name
         DeviceNoPresentingGraphicsFamily → "no queue family with both graphics and presentation"
+        DeviceNoGraphicsFamily → "no queue family with graphics"
 
 -- | The first device, in enumeration order, that satisfies the whole profile.
 selectDevice ∷ [DeviceOffer device] → Either NoCompatibleDevice (DevicePlan device)
-selectDevice candidates = case [plan | Right plan ← examined] of
+selectDevice = selectFor True
+
+-- | The first device, in enumeration order, that satisfies the whole profile
+-- without a bootstrap surface: its queue family must answer graphics, and
+-- whether it presents is not asked. Everything else the profile requires is
+-- required alike, so the device can still present to a surface admitted
+-- later that its queue family presents to.
+selectSurfaceFreeDevice ∷ [DeviceOffer device] → Either NoCompatibleDevice (DevicePlan device)
+selectSurfaceFreeDevice = selectFor False
+
+-- | Select against a bootstrap surface, or without one.
+selectFor ∷ Bool → [DeviceOffer device] → Either NoCompatibleDevice (DevicePlan device)
+selectFor presenting candidates = case [plan | Right plan ← examined] of
   plan : _ → Right plan
   [] → Left (NoCompatibleDevice [(offerDeviceName offer, reasons) | (offer, Left reasons) ← zip candidates examined])
   where
-    examined = map examine candidates
+    examined = map (examine presenting) candidates
 
-examine ∷ DeviceOffer device → Either [DeviceRejection] (DevicePlan device)
-examine offer = case (rejections, family) of
+examine ∷ Bool → DeviceOffer device → Either [DeviceRejection] (DevicePlan device)
+examine presenting offer = case (rejections, family) of
   ([], Just chosen) →
     Right
       DevicePlan
@@ -349,7 +373,7 @@ examine offer = case (rejections, family) of
   where
     has name = name `elem` offerDeviceExtensions offer
     portability = has portabilitySubsetExtension
-    family = case [familyIndex queue | queue ← offerQueueFamilies offer, familyGraphics queue, familyPresents queue] of
+    family = case [familyIndex queue | queue ← offerQueueFamilies offer, familyGraphics queue, not presenting || familyPresents queue] of
       first : _ → Just first
       [] → Nothing
     rejections =
@@ -358,7 +382,7 @@ examine offer = case (rejections, family) of
         <> [DeviceFeatureMissing "dynamicRendering" | not (offerDynamicRendering offer)]
         <> [DeviceFeatureMissing "synchronization2" | not (offerSynchronization2 offer)]
         <> [DeviceFeatureMissing "swapchainMaintenance1" | not (offerSwapchainMaintenance1 offer)]
-        <> [DeviceNoPresentingGraphicsFamily | family == Nothing]
+        <> [(if presenting then DeviceNoPresentingGraphicsFamily else DeviceNoGraphicsFamily) | family == Nothing]
 
 -- ---------------------------------------------------------------------------
 -- Later targets

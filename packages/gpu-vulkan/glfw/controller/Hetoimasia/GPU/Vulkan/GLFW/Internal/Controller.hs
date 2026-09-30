@@ -92,6 +92,37 @@
 -- owner's run and reaches the application's checkpoints like any other owner
 -- failure.
 --
+-- = A surface-free session
+--
+-- By default the session's one device is selected against the first window
+-- surface admitted and created at its admission. A host configured to start
+-- its device without a surface ('DeviceSurfaceFree') creates it in the owner's
+-- startup instead, after the instance and its messenger and before the
+-- instance is leased to the surface bridge, against no surface at all; a
+-- device that cannot satisfy the profile fails the startup with
+-- 'Hetoimasia.GPU.Vulkan.Native.Profile.NoCompatibleDevice'. A window handed
+-- over later is admitted only if the chosen queue family presents to it, and
+-- rolled back with 'TargetSurfaceUnsupported' otherwise, as any later target
+-- is. The session needs no window at all: with none, or once every window has
+-- closed, the owner still takes its step each round it is woken or its
+-- deadline comes — completion polls, the disposal of released resources, and
+-- owner-thread actions — and records no frame.
+--
+-- = Owner-thread actions
+--
+-- A consumer on any thread can hand the owner a bounded action
+-- ('submitVulkanAction'), which runs on the owner's thread with the session's
+-- 'Construction' and whose outcome the caller reads from its ticket
+-- ("Hetoimasia.GPU.Vulkan.GLFW.Internal.Actions"). Admission is one
+-- transaction that never waits, and it wakes an idle owner: the queue is part
+-- of the owner's wake. The owner's step runs the actions queued when it begins
+-- before anything else it does, one at a time, so none runs beside a frame's
+-- rendering, and the rest of the step — polls, reclamation, frames — follows
+-- in the same round. An action is admitted only once the device exists, and
+-- only while the session has not failed and the owner's admission is open;
+-- one queued when either ends is refused, never run. Whole-owner retirement
+-- refuses any still queued before it retires the recording.
+--
 -- = Destruction
 --
 -- A target's retirement destroys its swapchain generations and then its
@@ -99,7 +130,9 @@
 -- not, and raises — manufacturing no evidence — when a destruction was
 -- uncertain or a generation is still held. Whole-owner retirement
 -- closes the lease, destroys every surface no target holds (those whose
--- announcement never reached the owner), and destroys the device; whole-owner
+-- announcement never reached the owner), refuses every owner-thread action
+-- still queued, retires the recording's managed resources and destroys the
+-- device; whole-owner
 -- destruction waits for any surface creation still in its native call, settles
 -- what it left, and destroys the explicit messenger and then the instance —
 -- only once the lease is releasable. What any of it cannot verify retains
@@ -153,6 +186,15 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , noFrameObserver
   , FrameStorageRefused (..)
 
+    -- * Owner-thread actions (GRS-15)
+  , VulkanAction (..)
+  , ActionRefusal (..)
+  , ActionOutcome (..)
+  , ActionTicket
+  , submitVulkanAction
+  , readVulkanAction
+  , awaitVulkanAction
+
     -- * Consumer construction (VK-19)
   , Construction
   , Constructed
@@ -174,7 +216,9 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
 
     -- * The composition
   , VulkanHostConfig (..)
+  , VulkanDeviceStart (..)
   , vulkanHostConfig
+  , defaultActionCapacity
   , VulkanHost (..)
   , withVulkanOwnerHostOver
   , withVulkanOwnerHostHooked
@@ -271,6 +315,22 @@ import Hetoimasia.GPU.Vulkan.Diagnostics
   , retainStorage
   , withDiagnosticCapture
   )
+import Hetoimasia.GPU.Vulkan.GLFW.Internal.Actions
+  ( ActionOutcome (..)
+  , ActionRefusal (..)
+  , ActionTicket
+  , Actions
+  , Started (..)
+  , VulkanAction (..)
+  , actionsCount
+  , actionsWaiting
+  , admitAction
+  , awaitActionTicket
+  , newActions
+  , readActionTicket
+  , refuseRemaining
+  , startAction
+  )
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Bridge
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Capture
   ( CaptureMode (..)
@@ -352,11 +412,13 @@ import Hetoimasia.GPU.Vulkan.Native.Roots
   , readRootTargets
   , readRootsInstance
   , readRootsModel
+  , readRootsDevice
   , readRootsQuiesced
   , readRootsView
   , retireRootTarget
   , retireRoots
   , startRoots
+  , startRootsDevice
   )
 import Hetoimasia.Runtime.GLFW
   ( AttachmentId
@@ -481,6 +543,16 @@ data State inst msgr phys dev cmd lease obligation = State
   , stateCaptures ∷ !Captures
     -- ^ The verification captures requested of the session's targets, which
     -- rendering fulfils (VK-19); refused whole unless the host captures.
+  , stateDeviceStart ∷ !VulkanDeviceStart
+    -- ^ Whether the owner's startup creates the device without a surface.
+  , stateActions ∷ !Actions
+    -- ^ The owner-thread actions admitted and not yet taken (GRS-15): any
+    -- thread admits; the owner's step takes and runs them, and whole-owner
+    -- retirement refuses what is left.
+  , stateOwnerOpen ∷ !(TVar (STM Bool))
+    -- ^ Whether the owner's admission is still open, read by every action's
+    -- admission and start. The composition installs the owner's own once it
+    -- exists; it closes when the owner's exit begins or its run ends.
   }
 
 -- | Instants the package's own examples must reach and nothing else can: a
@@ -524,13 +596,17 @@ data Replacement obligation
 
 -- | A controller over a native layer and a surface bridge.
 --
--- The layers are the ones the instance is asked to enable, each of which the
--- loader must offer, and the validation features are the ones its create info
--- enables through them. The clock is the one the roots' model and the owner's
+-- The device start says whether the owner's startup creates the device
+-- without a surface, and the capacity bounds the owner-thread actions queued
+-- at once. The layers are the ones the instance is asked to enable, each of
+-- which the loader must offer, and the validation features are the ones its
+-- create info enables through them. The clock is the one the roots' model and the owner's
 -- deadlines read, which must be the host's; the period is how soon the owner
 -- looks again at an attachment whose announcement its port refused.
 newVulkanController
   ∷ CaptureMode
+  → VulkanDeviceStart
+  → Natural
   → RootOps Quiesced inst msgr phys dev
   → RenderingOps phys dev cmd
   → FrameObserver
@@ -548,6 +624,8 @@ newVulkanController = newVulkanControllerWith noControllerHooks
 newVulkanControllerWith
   ∷ ControllerHooks
   → CaptureMode
+  → VulkanDeviceStart
+  → Natural
   → RootOps Quiesced inst msgr phys dev
   → RenderingOps phys dev cmd
   → FrameObserver
@@ -559,8 +637,10 @@ newVulkanControllerWith
   → MonotonicSource
   → Duration
   → IO VulkanController
-newVulkanControllerWith hooks capture ops rendering observer pointer bridge layers validation budgets clock poll = do
+newVulkanControllerWith hooks capture deviceStart capacity ops rendering observer pointer bridge layers validation budgets clock poll = do
   roots ← newRoots ops budgets clock
+  ownerOpen ← newTVarIO (pure True)
+  actions ← newActions capacity (actionGate roots ownerOpen)
   -- Only a host built for verification capture plans its swapchains
   -- unclipped and as transfer sources; every other host's are the profile's.
   generations ← case capture of
@@ -588,6 +668,9 @@ newVulkanControllerWith hooks capture ops rendering observer pointer bridge laye
       <*> newTVarIO Map.empty
       <*> newTVarIO False
       <*> pure captures
+      <*> pure deviceStart
+      <*> pure actions
+      <*> pure ownerOpen
 
 -- | Supply the instance extensions the window system requires, copied from
 -- the loader-aware session on the main thread. The owner's startup reads
@@ -719,7 +802,16 @@ controllerOperations (VulkanController state) renderer =
     , graphicsNextDeadline = ownerDeadline state
     , -- A capture requested from another thread asks the idle owner for the
       -- round that asks its target a frame, and is false once that round has.
-      graphicsWake = (||) <$> join (readTVar (stateWake state)) <*> capturesRequested (stateCaptures state)
+      -- An admitted owner-thread action does the same, except while a
+      -- diagnostic failure is pending: the step then runs none, and the owner
+      -- looks again within its poll rather than at once.
+      graphicsWake =
+        or
+          <$> sequence
+            [ join (readTVar (stateWake state))
+            , capturesRequested (stateCaptures state)
+            , (&&) <$> actionsWaiting (stateActions state) <*> (not <$> readTVar (stateDiagnosticPending state))
+            ]
     , graphicsPrepareRetirement = \retiring → retaining state (prepareRetirement state retiring)
     , graphicsRetireTarget = \retiring → retaining state (retireTarget state retiring)
     , graphicsRetireOwner = retaining state . retireOwner state
@@ -727,6 +819,10 @@ controllerOperations (VulkanController state) renderer =
     }
   where
     progress step = do
+        -- Owner-thread actions first, each alone on this thread: none runs
+        -- beside a frame's rendering, and what they release is reclaimed by
+        -- this same step.
+        served ← serviceActions state
         settled ← settleUnannounced state
         mapped ← readTVarIO (stateTargets state)
         let now = stepNow step
@@ -789,7 +885,80 @@ controllerOperations (VulkanController state) renderer =
         replaced ← settleReplacements state now (stepTargets step)
         noticeUnavailable state
         failRequired state
-        pure (if settled || summaryAdvanced summary || asked || replaced || presented || captured then noStepWork {stepAdvanced = True} else noStepWork)
+        pure (if served || settled || summaryAdvanced summary || asked || replaced || presented || captured then noStepWork {stepAdvanced = True} else noStepWork)
+
+-- | Whether an owner-thread action may be admitted or started now: refused
+-- once the session has failed, with its primary, and once the owner's
+-- admission has closed.
+actionGate ∷ Roots Quiesced inst msgr phys dev → TVar (STM Bool) → STM (Maybe ActionRefusal)
+actionGate roots ownerOpen =
+  reportPrimary <$> readRootsTerminal roots >>= \case
+    Just primary → pure (Just (ActionSessionFailed primary))
+    Nothing → join (readTVar ownerOpen) <&> \open → if open then Nothing else Just ActionOwnerClosed
+
+-- | Run the owner-thread actions queued when the step began, one at a time,
+-- on the owner's thread. Each is taken and marked running in one transaction,
+-- which the gate refuses once the session has failed or the owner's admission
+-- has closed. From that transaction until its ticket is settled, asynchronous
+-- exceptions are masked except inside the construction's setup and the action
+-- itself, each of which runs restored to the owner's own masking state; so no
+-- cancellation, and no failure of either, can end the owner with a ticket left
+-- running. Each is run once. Answers whether it ran or settled any.
+--
+-- What an action raised is its outcome, and the owner goes on — unless it is
+-- a failure the owner's run must end with, which is then raised on here,
+-- after the ticket is settled: a cancellation of the owner; a failure setting
+-- the construction up, which ends the run as it would a frame's; a
+-- construction failure that escaped the construction, however the action
+-- handled it — caught and returned, or raised — which settles the ticket as
+-- that failure unless the action raised its own; or a failure the session
+-- latched, which a checkpoint raises as its primary as the step's own does.
+serviceActions ∷ State inst msgr phys dev cmd lease obligation → IO Bool
+serviceActions state = do
+  -- Only those waiting now: a flood of later admissions waits for the next
+  -- round, which the queue's wake asks for, rather than holding this one.
+  due ← atomically (actionsCount (stateActions state))
+  go due False
+  where
+    go 0 served = pure served
+    go remaining served = do
+      ran ← mask $ \restore →
+        atomically (startAction (stateActions state)) >>= \case
+          Nothing → pure False
+          Just started → True <$ run restore started
+      if ran then go (remaining - 1 ∷ Int) True else pure served
+    run ∷ (∀ a. IO a → IO a) → Started → IO ()
+    run restore (Started action settle) =
+      tryWithContext (restore (lendConstruction (stateRendering state))) >>= \case
+        Left failure → do
+          atomically (settle (ActionRaised failure))
+          rethrowIO (failure ∷ ExceptionWithContextSome)
+        -- A device exists whenever an action was admitted, and outlives every
+        -- round; this is only what a missing one would mean.
+        Right Nothing → atomically (settle (ActionRefused ActionDeviceNotReady))
+        Right (Just construction) → do
+          outcome ← tryWithContext (restore (runVulkanAction action construction))
+          escaped ← atomically (constructionEscaped construction)
+          case (outcome, escaped) of
+            (Left failure@(ExceptionWithContext _ exception), _)
+              | isAsynchronous exception → do
+                  atomically (settle (ActionRaised failure))
+                  rethrowIO failure
+            (_, Just failure) → do
+              atomically (settle (ActionRaised (either id (const failure) outcome)))
+              rethrowIO failure
+            (Left failure, Nothing) → do
+              atomically (settle (ActionRaised failure))
+              latched
+            (Right value, Nothing) → do
+              atomically (settle (ActionReturned value))
+              latched
+    latched =
+      checkpointRoots (stateRoots state) >>= \case
+        CheckpointFailed primary → do
+          atomically (writeTVar (stateFailureTaken state) True)
+          throwIO (terminalFailure primary)
+        _ → pure ()
 
 -- | Run a retirement, and if it could not verify what it owns, keep that in
 -- the terminal report as retained before the failure goes on to the owner,
@@ -1079,19 +1248,26 @@ startOwner state = do
     request ← readTVarIO (stateRequest state) >>= maybe (throwIO InstanceExtensionsMissing) pure
     plan ← startRoots roots request
     created ← atomically (readRootsInstance roots) >>= maybe (throwIO RootsNotStarted) pure
+    -- A surface-free session's device exists before any window can be handed
+    -- over, so readiness means a device to act on.
+    device ← case stateDeviceStart state of
+      DeviceAtFirstSurface → pure Nothing
+      DeviceSurfaceFree → Just <$> startRootsDevice roots
     lease ← bridgeLease (stateBridge state) (statePointer state created)
     atomically (writeTVar (stateLease state) (LeaseReady lease))
-    pure plan
+    pure (plan, device)
   case attempted of
     Left (failure ∷ ExceptionWithContext SomeException) → do
       atomically (writeTVar (stateLease state) (LeaseFailed (Text.pack (displayException failure))))
       rethrowIO failure
-    Right plan →
+    Right (plan, device) →
       pure . ownerReady $
         "created the instance with "
           <> listNames (planInstanceExtensions plan)
           <> (if planPortabilityEnumeration plan then ", portability enumeration on" else "")
-          <> ", and its explicit messenger; leased it to the surface bridge"
+          <> ", and its explicit messenger; "
+          <> maybe "" (\name → "created the device " <> name <> " without a surface; ") device
+          <> "leased it to the surface bridge"
   where
     roots = stateRoots state
 
@@ -1259,6 +1435,9 @@ retireOwner state retiring = do
   -- The recording's managed resources are the device's children: the
   -- renderer's, and a capture's readback buffers, which the captures still
   -- outstanding give up first.
+  -- No owner-thread action starts once the owner retires: each still queued
+  -- is refused, before the recording its construction would use is retired.
+  atomically (refuseRemaining (stateActions state) ActionOwnerClosed)
   now ← readInstant (stateClock state)
   endCaptures (stateRendering state)
   retireRendering (stateRendering state) now
@@ -1573,6 +1752,37 @@ requestVulkanCapture (VulkanController state) attachment = do
 takeVulkanCapture ∷ VulkanController → CaptureTicket → STM (Maybe CaptureOutcome)
 takeVulkanCapture (VulkanController state) = takeCapture (stateCaptures state)
 
+-- | Hand the graphics owner a bounded action to run on its own thread with
+-- the session's 'Construction' (GRS-15), from any thread, answering a ticket
+-- to read its outcome with — or refusing it at once, with the reason: the
+-- queue is full ('ActionQueueFull'), the session has no device yet
+-- ('ActionDeviceNotReady'), the session has failed ('ActionSessionFailed'), or
+-- the owner's admission has closed ('ActionOwnerClosed'). Nothing waits for
+-- room. Admitted, it wakes an idle owner, which runs it in its next step, alone
+-- on its thread and never beside a frame's rendering.
+--
+-- The device exists from the owner's startup when the host starts it without
+-- a surface ('DeviceSurfaceFree'), and otherwise from the first window's
+-- admission: before then an action is refused, never held until one exists.
+submitVulkanAction ∷ VulkanController → VulkanAction r → STM (Either ActionRefusal (ActionTicket r))
+submitVulkanAction (VulkanController state) action = do
+  device ← isJust <$> readRootsDevice (stateRoots state)
+  admitAction (stateActions state) device action
+
+-- | An action's outcome, once it has one: what it returned, what it raised,
+-- or that it was refused before it started — the owner's exit or the
+-- session's failure began first, which this read itself settles. It never
+-- waits.
+readVulkanAction ∷ ActionTicket r → STM (Maybe (ActionOutcome r))
+readVulkanAction = readActionTicket
+
+-- | Wait for an action's outcome. The wait is explicit and the caller's: it
+-- ends when the action has run, or as soon as the owner's exit or the
+-- session's failure refuses it. It must not be made from inside an action,
+-- whose outcome can only come after the action waiting for it returns.
+awaitVulkanAction ∷ ActionTicket r → STM (ActionOutcome r)
+awaitVulkanAction = awaitActionTicket
+
 -- | Announce an attachment whose handover answered
 -- 'VulkanAnnouncementDeferred' again, now that the owner's port may have room.
 -- Once admitted, the owner constructs it as any other target; until then the
@@ -1843,14 +2053,38 @@ data VulkanHostConfig scene = VulkanHostConfig
   , vulkanFrameObserver ∷ FrameObserver
     -- ^ What the owner reports each frame's acquisition, submission,
     -- presentation and observed completion to, on its own thread.
+  , vulkanDeviceStart ∷ !VulkanDeviceStart
+    -- ^ When the session's one device is created: at the first window's
+    -- admission, by default, or in the owner's startup without a surface.
+  , vulkanActionCapacity ∷ !Natural
+    -- ^ How many owner-thread actions may be queued at once; one more is
+    -- refused, never waited for.
   }
 
+-- | When the session's one device is selected and created.
+data VulkanDeviceStart
+  = DeviceAtFirstSurface
+    -- ^ Against the first window surface handed over, at its admission. The
+    -- default, and what every windowed application uses.
+  | DeviceSurfaceFree
+    -- ^ In the owner's startup, before any window, against no surface: a
+    -- queue family that answers graphics, with the rest of the profile
+    -- unchanged. A window handed over later is admitted only if that family
+    -- presents to it. The session can run and act on its device with no
+    -- window at all.
+  deriving (Eq, Show)
+
+-- | How many owner-thread actions 'vulkanHostConfig' lets be queued at once.
+defaultActionCapacity ∷ Natural
+defaultActionCapacity = 64
+
 -- | A configuration with the given capture configuration and budgets, no
--- layers or validation features, the owner's defaults, no observer, and a
--- renderer that clears every frame to opaque black.
+-- layers or validation features, the owner's defaults, no observer, a
+-- renderer that clears every frame to opaque black, the device created at the
+-- first window's admission, and 'defaultActionCapacity'.
 vulkanHostConfig ∷ HostConfig → CaptureConfig → Budgets → Prepared scene → VulkanHostConfig scene
 vulkanHostConfig host capture budgets scene =
-  VulkanHostConfig host capture [] [] budgets scene id (const noObserver) (clearRenderer (\_ _ → ClearColor 0 0 0 1)) noFrameObserver
+  VulkanHostConfig host capture [] [] budgets scene id (const noObserver) (clearRenderer (\_ _ → ClearColor 0 0 0 1)) noFrameObserver DeviceAtFirstSurface defaultActionCapacity
 
 -- | A running Vulkan graphics host.
 data VulkanHost scene = VulkanHost
@@ -1910,6 +2144,8 @@ withVulkanOwnerHostHooked hooks capturing logger layer rendering pointer bridge 
       newVulkanControllerWith
         hooks
         capturing
+        (vulkanDeviceStart config)
+        (vulkanActionCapacity config)
         (observeRoots observer (layer capture))
         (observeRendering observer rendering)
         (vulkanFrameObserver config)
@@ -1938,8 +2174,11 @@ withVulkanOwnerHostHooked hooks capturing logger layer rendering pointer bridge 
       tryWithContext $
         withGraphicsOwnerHostIn logger session host owner $ \windows graphics → do
           -- From now on the owner can wake the main thread when it asks for a
-          -- replacement surface.
-          atomically (writeTVar (stateHostWake state) (wakeGraphicsHost graphics))
+          -- replacement surface, and an owner-thread action is admitted only
+          -- while the owner's own admission is open.
+          atomically $ do
+            writeTVar (stateHostWake state) (wakeGraphicsHost graphics)
+            writeTVar (stateOwnerOpen state) (targetEventsOpen (ownerHandoff graphics))
           use (VulkanHost windows graphics controller)
     -- However the host ended, an instance it did not destroy may still have
     -- a messenger naming the capture, so the capture's storage is kept rather

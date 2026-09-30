@@ -44,10 +44,21 @@ and the suites' verification capture.
   with that primary. What the renderer did not release is destroyed with the
   session's other managed resources before the device, on normal and terminal
   exits alike. The module re-exports the recording vocabulary a renderer needs.
+- A host configured with `DeviceSurfaceFree` (`vulkanDeviceStart`) creates
+  the session's device in the owner's startup, with no surface and before any
+  window; a window handed over later is admitted only if the chosen queue
+  family presents to it. With or without windows, `submitVulkanAction` hands
+  the owner a bounded `VulkanAction` from any thread, run once on the owner's
+  thread with the same `Construction`, never beside a frame; admission refuses
+  at once — a full queue, no device yet, a failed session, a closed owner —
+  and an action still queued when the owner's exit or the session's failure
+  begins is refused, never run. A session with no target keeps polling
+  completion and disposing of released resources until it is ended, and
+  retires through the same protected exit.
 - The private `controller` sublibrary holds the controller —
   `GraphicsOperations` over the native roots, with the recording and the frames
-  composed into its step (`Internal.Rendering`) — the loop adapter
-  (`Internal.Loop`), and the record through which it reaches the surface
+  composed into its step (`Internal.Rendering`) — the owner-thread actions'
+  queue (`Internal.Actions`), the loop adapter (`Internal.Loop`), and the record through which it reaches the surface
   bridge, which the package's own examples replace with a stand-in, as they
   replace the recording's and the frames' native layers.
 - Verification capture (VK-19) is visible only there, so only this package's

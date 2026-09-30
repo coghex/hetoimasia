@@ -82,6 +82,8 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , Scene
   , newRig
   , newRigOf
+  , surfaceFreeRig
+  , withActionCapacity
   , capturingRigOf
   , visibleRig
   , visibleRigOf
@@ -186,6 +188,8 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , VulkanHostConfig (..)
   , Readiness (..)
   , ControllerHooks (..)
+  , VulkanDeviceStart (..)
+  , defaultActionCapacity
   , handOverVulkanTarget
   , readReadiness
   , vulkanHostConfig
@@ -259,6 +263,9 @@ data Event
   = InstanceCreated
   | MessengerCreated
   | DevicesQueried !Word64
+  | DevicesQueriedWithoutSurface
+    -- ^ The devices were enumerated for a surface-free start, asking no
+    -- family about presentation.
   | DeviceCreated
   | SupportQueried !Word64
   | SurfaceCreated !Word64
@@ -537,8 +544,8 @@ nativeLayer events native capture =
     , -- The destruction's return is the capture's quiescence evidence, as the
       -- production layer's is.
       opsDestroyInstance = \_ → afterLastCallback capture (step events native AtDestroyInstance InstanceDestroyed)
-    , opsDeviceOffers = \_ surface → do
-        step events native AtQueryDevices (DevicesQueried surface)
+    , opsDeviceOffers = \_ bootstrap → do
+        step events native AtQueryDevices (maybe DevicesQueriedWithoutSurface DevicesQueried bootstrap)
         unsupported ← readTVarIO (nativeUnsupported native)
         pure
           [ DeviceOffer
@@ -549,7 +556,8 @@ nativeLayer events native capture =
               , offerDynamicRendering = True
               , offerSynchronization2 = True
               , offerSwapchainMaintenance1 = True
-              , offerQueueFamilies = [QueueFamilyOffer 0 True (surface `Set.notMember` unsupported)]
+              , -- Without a surface, nothing is asked about presentation.
+                offerQueueFamilies = [QueueFamilyOffer 0 True (maybe False (`Set.notMember` unsupported) bootstrap)]
               }
           ]
     , opsCreateDevice = \_ plan → 3 <$ (planQueueFamily plan `seq` step events native AtCreateDevice DeviceCreated)
@@ -841,8 +849,10 @@ data Rendering = Rendering
     -- whatever 'presentationsRetire' says.
   }
 
--- | A managed object the recording's layer creates.
-data Creation = CreateLayout | CreatePipeline | CreateReadback
+-- | A managed object the recording's layer creates, or the recording's layer
+-- itself, made from the session's physical device when the recording is first
+-- needed.
+data Creation = CreateLayout | CreatePipeline | CreateReadback | CreateRecording
   deriving (Eq, Ord, Show)
 
 -- | The byte every stand-in readback buffer reads back as.
@@ -1006,7 +1016,7 @@ retireNextPresentations rig = atomically . writeTVar (renderingRetireCount (rigR
 renderingLayers ∷ Journal → Rendering → Maybe (TVar Instant) → RenderingOps Text Int Word64
 renderingLayers events rendering clock =
   RenderingOps
-    { renderingRecordingOps = \_ → pure recordingLayer
+    { renderingRecordingOps = \_ → recordingLayer <$ creating CreateRecording
     , renderingFrameOps = frameLayer
     }
   where
@@ -1189,6 +1199,10 @@ data Rig = Rig
     -- ^ The renderer an example put in place of the clearing one.
   , rigFrameHook ∷ !(TVar (FrameEvent → IO ()))
     -- ^ Run on the owner's thread with every frame event, after it is logged.
+  , rigDeviceStart ∷ !VulkanDeviceStart
+    -- ^ When the host creates the session's device.
+  , rigActionCapacity ∷ !Natural
+    -- ^ How many owner-thread actions may be queued at once.
   }
 
 -- | Make the capture's sink raise on every record it is given from now on.
@@ -1210,6 +1224,15 @@ twoWindows = newRigOf 2
 -- | A rig over this many hidden windows.
 newRigOf ∷ Int → IO Rig
 newRigOf count = newRigWith [hiddenTestWindowConfig (Text.pack ("window " <> show number)) 64 48 | number ← [1 .. count]]
+
+-- | A rig over this many hidden windows, possibly none, whose host creates its
+-- device in the owner's startup without a surface.
+surfaceFreeRig ∷ Int → IO Rig
+surfaceFreeRig count = (\rig → rig {rigDeviceStart = DeviceSurfaceFree}) <$> newRigOf count
+
+-- | The same rig with this many owner-thread actions queued at once.
+withActionCapacity ∷ Natural → Rig → Rig
+withActionCapacity capacity rig = rig {rigActionCapacity = capacity}
 
 -- | How many surface creations the bridge has admitted, held ones included.
 creationsBegun ∷ Rig → STM Word64
@@ -1408,6 +1431,8 @@ newRigClocked visible windows clock = do
       , rigCaptureMode = CaptureOff
       , rigRenderer = renderer
       , rigFrameHook = frameHook
+      , rigDeviceStart = DeviceAtFirstSurface
+      , rigActionCapacity = defaultActionCapacity
       }
 
 -- | Run a whole Vulkan graphics host under the application runner, on a bound
@@ -1433,6 +1458,8 @@ runRigHere rig body = do
                 False → do
                   chosen ← maybe (vulkanRenderer base) id <$> readTVarIO (rigRenderer rig)
                   renderScene chosen current request construction recorder
+          , vulkanDeviceStart = rigDeviceStart rig
+          , vulkanActionCapacity = rigActionCapacity rig
           , vulkanFrameObserver = \event → do
               atomically $ do
                 modifyTVar' (rigFrameEvents rig) (<> [event])
