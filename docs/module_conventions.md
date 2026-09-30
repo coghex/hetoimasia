@@ -3,8 +3,10 @@
 Owner direction settled on 2026-09-26. These conventions apply to new code and
 deliberate refactors. They guide cohesive ownership and dependency direction;
 they do not require a repository-wide rename or invalidate already approved
-work. The math package boundary below is accepted direction, not an implemented
-package or a complete numerical API design.
+work. The math package boundary below is accepted direction. The package now
+exists with a minimal first API; its settled choices are recorded
+[below](#delivery-and-choices-still-to-settle), and further capabilities are
+designed with the consumers that need them.
 
 ## Organize by responsibility and dependency
 
@@ -119,12 +121,35 @@ their contracts permit direct construction.
 
 ## Delivery and choices still to settle
 
-The package boundary and flexible module conventions are settled. Concrete
-math APIs, scalar precision, representation, coordinate/matrix conventions,
-degenerate/non-finite behavior, and any storage or interoperability guarantees
-still need design with the first concrete consumer. No vector implementation,
-Synarchy port, numerical policy, package scaffold or new dependency is selected
-by this document. Native storage adapters stay outside the math contract.
+The package boundary and flexible module conventions are settled. The math
+package's first concrete consumer, the GPU resource services arc's 3D fixture,
+settled its first shape (#348, under that arc's
+[D-37](designs/gpu_resource_services_design.md#d-37-create-packagesmath-in-this-arc-as-its-own-slice)):
+
+- **Precision and API.** 32-bit `Float` throughout, and a minimal API: 2-, 3-
+  and 4-component vectors and 4×4 matrices with strict fields, translation,
+  axis-angle rotation, non-uniform scale, look-at and perspective, in focused
+  `Vector`, `Matrix`, `Transform` and `Projection` modules with no collecting
+  module.
+- **Matrix convention.** Column vectors, multiplied as `M × v`. Matrices are
+  defined mathematically — element access by row and column, and a
+  column-major element list as a mathematical view.
+- **Coordinates.** Right-handed world and view space, the camera looking down
+  −Z; angles in radians, a positive rotation turning by the right-hand rule.
+- **Clip conventions.** A perspective projection takes its depth range (0 to 1
+  or −1 to 1) and clip-space Y direction as explicit parameters; math chooses no
+  graphics API's convention.
+- **Degenerate and non-finite behavior.** Normalization, rotation, look-at and
+  perspective are checked: they return `Maybe`, rejecting non-finite input and
+  their degenerate cases, and a `Just` result is finite. Ordinary arithmetic
+  follows IEEE `Float`.
+- **Storage.** No byte layout, alignment or packing is promised for any type.
+
+[The package's contract](../packages/math/README.md) is the authority for the
+details. Everything else stays open until a consumer needs it: quaternions, 3×3
+matrices, `Double` precision, SIMD or unboxed storage, and geometry and topology
+types. No Synarchy port is selected by this document. Native storage adapters
+stay outside the math contract.
 
 Owner sequencing decision on 2026-09-26: first refactor existing code to establish
 the flexible `Base`/`Types` dependency layers, preserving cohesive dedicated
@@ -134,9 +159,9 @@ public APIs, constructor privacy and behavior unchanged during structural moves.
 The exact package scope and delivery slices still need an implementation plan.
 Required implementation docs, tests and evidence belong in each refactor's own PR.
 
-Implementation of `packages/math` is deferred. Its accepted dependency boundary
-remains recorded above, but neither the `Base`/`Types` refactor nor the later
-`State.hs` decomposition depends on creating the package.
+`packages/math` exists (#348) within the dependency boundary recorded above;
+neither the `Base`/`Types` refactor nor the later `State.hs` decomposition
+depended on creating it.
 
 Owner priority on 2026-09-26 is to settle these conventions and finish the
 structural refactors before returning to the feature backlog. This policy

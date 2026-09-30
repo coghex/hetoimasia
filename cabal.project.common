@@ -16,6 +16,9 @@ package hetoimasia
 package hetoimasia-foundation
   ghc-options: -Werror -j
 
+package hetoimasia-math
+  ghc-options: -Werror -j
+
 package hetoimasia-runtime
   ghc-options: -Werror -j
 

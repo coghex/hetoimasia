@@ -18,7 +18,8 @@ These instructions are also the authority for Claude sessions through CLAUDE.md.
   with libraries to evade a component boundary.
 - Follow [module conventions](docs/module_conventions.md): `Base` and `Types`
   are flexible defaults; dedicated type modules are welcome. Preserve acyclic
-  dependencies. The planned math package imports no other local or graphics package.
+  dependencies. The math package, `hetoimasia-math` at `packages/math`, imports
+  no other local or graphics package; see [its contract](packages/math/README.md).
 - The application entry point assembles services. Pass narrow services or
   abstract handles to consumers; do not introduce a universal `EngineEnv`,
   service locator, or global mutable registry.
@@ -65,6 +66,7 @@ These instructions are also the authority for Claude sessions through CLAUDE.md.
   `cabal test hetoimasia-scripting-lua:lua-host-tests --test-show-details=direct`,
   `cabal test hetoimasia-gpu-vulkan-model:gpu-model-tests --test-show-details=direct`,
   `cabal test hetoimasia-gpu-vulkan-diagnostics:diagnostics-tests --test-show-details=direct`,
+  `cabal test --project-file cabal.project.cpu hetoimasia-math:math-tests --test-show-details=direct`,
   and `cabal test hetoimasia-tests --test-show-details=direct`.
 - On Linux only,
   `cabal test hetoimasia-scripting-lua:linux-confinement-probe --test-show-details=direct`

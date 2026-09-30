@@ -1,0 +1,66 @@
+cabal-version: 3.16
+name: hetoimasia-math
+version: 0.1.0.0
+synopsis: Vectors, matrices and projective transformations for Hetoimasia
+description:
+    Two-, three- and four-component vectors and 4×4 matrices of 32-bit Float,
+    affine transforms, a look-at view matrix, and a perspective projection whose
+    depth range and clip-space Y direction are explicit parameters. Conventions:
+    column vectors multiplied as M × v, right-handed world and view space with
+    the camera looking down −Z, and checked operations that return Maybe rather
+    than NaN or infinity for degenerate or non-finite input. No storage or byte
+    layout is promised. The library depends on base alone: no other local
+    package, no graphics package, and no foundation or runtime.
+license: GPL-3.0-only
+license-file: LICENSE
+author: Vincent Coghlan
+maintainer: Vincent Coghlan
+category: Math
+build-type: Simple
+tested-with: GHC ==9.14.1
+extra-doc-files: README.md
+
+source-repository head
+    type: git
+    location: https://github.com/coghex/hetoimasia.git
+    subdir: packages/math
+
+common language
+    default-language: GHC2024
+    default-extensions: UnicodeSyntax
+    ghc-options: -Wall -Wcompat -Wincomplete-uni-patterns -Wincomplete-record-updates
+
+library
+    import: language
+    hs-source-dirs: src
+    exposed-modules:
+        Hetoimasia.Math.Matrix
+        Hetoimasia.Math.Projection
+        Hetoimasia.Math.Transform
+        Hetoimasia.Math.Vector
+    -- The finiteness test the checked operations share.
+    other-modules:
+        Hetoimasia.Math.Internal.Finite
+    build-depends:
+        base >=4.22 && <4.23
+
+-- This package's own contracts, registered as the CPU validation group
+-- `test.math`. Hspec and QuickCheck are the suite's alone; the library still
+-- depends on base only.
+test-suite math-tests
+    import: language
+    type: exitcode-stdio-1.0
+    main-is: Main.hs
+    hs-source-dirs: test
+    other-modules:
+        Test.Math.Matrix
+        Test.Math.Projection
+        Test.Math.Spec
+        Test.Math.Support
+        Test.Math.Transform
+        Test.Math.Vector
+    build-depends:
+        base >=4.22 && <4.23,
+        hspec >=2.11 && <3,
+        QuickCheck >=2.15 && <2.19,
+        hetoimasia-math ==0.1.0.0
