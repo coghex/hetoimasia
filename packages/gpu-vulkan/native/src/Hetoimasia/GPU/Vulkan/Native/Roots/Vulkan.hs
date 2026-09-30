@@ -300,9 +300,11 @@ validationFeaturesInfo features =
   where
     enable SynchronizationValidation = VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT
 
--- | Every physical device, with what the profile asks of it.
-deviceOffers ∷ Instance → Word64 → IO [DeviceOffer PhysicalDevice]
-deviceOffers created surface = do
+-- | Every physical device, with what the profile asks of it. Without a
+-- bootstrap surface no surface-support query is made, and no family is
+-- answered as presenting.
+deviceOffers ∷ Instance → Maybe Word64 → IO [DeviceOffer PhysicalDevice]
+deviceOffers created bootstrap = do
   (_, devices) ← enumeratePhysicalDevices created
   forM (Vector.toList devices) $ \physical → do
     properties ← getPhysicalDeviceProperties physical
@@ -311,7 +313,7 @@ deviceOffers created surface = do
     (_, extensions) ← enumerateDeviceExtensionProperties physical Nothing
     families ← getPhysicalDeviceQueueFamilyProperties physical
     offered ← forM (zip [0 ..] (Vector.toList families)) $ \(index, family) → do
-      presents ← getPhysicalDeviceSurfaceSupportKHR physical index (SurfaceKHR surface)
+      presents ← maybe (pure False) (getPhysicalDeviceSurfaceSupportKHR physical index . SurfaceKHR) bootstrap
       pure
         QueueFamilyOffer
           { familyIndex = index

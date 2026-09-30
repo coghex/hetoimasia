@@ -39,6 +39,16 @@
 -- never holds a native handle. What it did not release is destroyed with the
 -- session's other managed resources, before the device.
 --
+-- A host configured with 'DeviceSurfaceFree' creates the device in the
+-- owner's startup, before and without any window, and admits a window handed
+-- over later only if the chosen queue family presents to it. With or without
+-- windows, a consumer on any thread can hand the owner a bounded action
+-- ('submitVulkanAction') that runs on the owner's thread with the same
+-- 'Construction', never beside a frame, and reads its outcome from the ticket
+-- it was given: admission refuses at once rather than waiting, and an action
+-- still queued when the owner's exit or the session's failure begins is
+-- refused, never run.
+--
 -- A terminal failure — the device's loss, a validation error or a sink failure
 -- the capture reports, an uncertain effect, a failed cleanup, a required
 -- target's exhausted recovery — is latched as the session's primary failure
@@ -50,7 +60,9 @@ module Hetoimasia.GPU.Vulkan.GLFW
   ( -- * The composition
     withVulkanOwnerHost
   , VulkanHostConfig (..)
+  , VulkanDeviceStart (..)
   , vulkanHostConfig
+  , defaultActionCapacity
   , ValidationFeature (..)
   , VulkanHost (..)
   , NativeObserver (..)
@@ -76,6 +88,15 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , PipelineLayout
   , Pipeline
   , PipelineShaders (..)
+
+    -- * Owner-thread actions (GRS-15)
+  , VulkanAction (..)
+  , submitVulkanAction
+  , ActionRefusal (..)
+  , ActionTicket
+  , readVulkanAction
+  , awaitVulkanAction
+  , ActionOutcome (..)
 
     -- * Recording a frame
   , Recorder
@@ -138,6 +159,7 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , FrameStorageRefused (..)
   ) where
 
+import Control.Concurrent.STM (STM)
 import Hetoimasia.Foundation.Log (Logger)
 import Hetoimasia.GLFW.Vulkan (LoaderIntegration)
 import Hetoimasia.GLFW.Window (WindowId)
@@ -145,8 +167,16 @@ import Hetoimasia.Runtime.GLFW (EventAdmission, GraphicsService)
 import Hetoimasia.GPU.Model.Identity (TargetClass)
 import Hetoimasia.GPU.Vulkan.Diagnostics (DiagnosticVerdict)
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
-  ( CaptureMode (CaptureOff)
+  ( ActionOutcome (..)
+  , ActionRefusal (..)
+  , ActionTicket
+  , CaptureMode (CaptureOff)
   , Construction
+  , VulkanAction (..)
+  , VulkanDeviceStart (..)
+  , awaitVulkanAction
+  , defaultActionCapacity
+  , readVulkanAction
   , Constructed
   , constructPipeline
   , constructPipelineLayout
@@ -220,6 +250,11 @@ import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsSessionFailed (..), TeardownE
 withVulkanOwnerHost
   ∷ Logger → LoaderIntegration → VulkanHostConfig scene → (VulkanHost scene → IO r) → IO (r, DiagnosticVerdict)
 withVulkanOwnerHost = withVulkanOwnerHostAs CaptureOff
+
+-- | Hand this host's owner a bounded action to run on its own thread with the
+-- session's 'Construction', from any thread, or have it refused at once.
+submitVulkanAction ∷ VulkanHost scene → VulkanAction r → STM (Either ActionRefusal (ActionTicket r))
+submitVulkanAction host = Controller.submitVulkanAction (vulkanController host)
 
 -- | Create one window's surface on the main thread, under its attachment, and
 -- hand it to this host's owner as a required or optional target.
