@@ -1,12 +1,12 @@
 # Guide cursor
 
-Resume after: `59272883680df53425673059695cf93818414c0a` · [2026-09-29T150521Z-5927288](2026-09-29T150521Z-5927288.md) · 2026-09-29T15:05:21Z
+Resume after: `e1c842add120a2eb46531684fc4619cb3aee6a37` · [2026-09-30T040151Z-e1c842a](2026-09-30T040151Z-e1c842a.md) · 2026-09-30T04:01:51Z
 Covered beyond the boundary: none
 
 ## Next
 
-Finish #304 (PR #316, `reviewed:changes`). If another round finds more ordering gaps, settle the capture's order-claim protocol as a design decision rather than patching again.
-Then close epics #155 and #268 and choose the next arc; the owner-sequenced GPU-model `State.hs` decomposition is recommended.
+Both guide amendments are posted to #324 and #349; no findings remain to process.
+Finish the remaining structural refactors before resuming shared GPU services; recheck #345's changed sampling specification.
 
 ## Open findings
 
@@ -14,24 +14,26 @@ None.
 
 ## Pending handoff
 
-- #304 / PR #316 is the one open repair from 2026-09-29T121551Z-50cecce; its third review found an ordering gap after an abandoned claim.
-- Test races keep surfacing after merge (#280, #284, #306, #308, #313); an owner-requested flake-lab sweep of the foundation, headless Vulkan and diagnostics suites is suggested.
-- Epics #155 and #268 are complete but still open, with stale checkboxes (tracker housekeeping).
-- No settled next slice: the `State.hs` decomposition (recommended), a 2D renderer design, trusted-Lua slices (D-13/D-14), or Wayland WL-4 under #202.
-- Qualification gates remain open: Lua confinement (both verdicts inconclusive) and Wayland rendering WL-4.
+- #351 owns the quruntul shader-fingerprint trial failure; #352 implements the #323 Lua aggregate split. Open PR heads are context only.
+- Remaining structural refactors: #323/#324/#325; feature sequencing remains owner-controlled.
+- Follow-up: revised #345 retains per-draw sampling and has a canonical rereview approval; full newer-spec audit remains pending.
+- #330 supplies a settled next service arc; owned-allocator parity (#331/#333) and native bindless support (#343) remain evidence gates.
+- Lua confinement remains inconclusive; Wayland rendering qualification awaits #327.
+- Unpublished design/vision edits do not change the heading reviewed at the pin.
+- End recheck: #345 specification changed and #351 updated; newer states are unreviewed. Default branch/vision stayed at the pin.
 
 ## Alignment
 
 | Principle | Reading | Since | Note |
 |---|---|---|---|
-| V-1 | aligned | 2026-09-29T150521Z-5927288 | |
-| V-2 | aligned | 2026-09-29T121551Z-50cecce | |
-| V-3 | aligned | 2026-09-29T150521Z-5927288 | #311 restores exact reservation accounting |
+| V-1 | aligned | 2026-09-29T150521Z-5927288 | Private boundaries preserved |
+| V-2 | drifting | 2026-09-30T040151Z-e1c842a | GUIDE-2: amendment posted to #349; implementation pending |
+| V-3 | aligned | 2026-09-29T150521Z-5927288 | #316 repairs publication; protected ownership preserved |
 | V-4 | aligned | 2026-09-29T121551Z-50cecce | |
 | V-5 | aligned | 2026-09-29T150521Z-5927288 | |
-| V-6 | aligned | 2026-09-29T150521Z-5927288 | #312 closes the replacement liveness gap |
+| V-6 | aligned | 2026-09-29T150521Z-5927288 | |
 | V-7 | aligned | 2026-09-29T121551Z-50cecce | |
-| V-8 | aligned | 2026-09-29T121551Z-50cecce | |
-| V-9 | aligned | 2026-09-29T121551Z-50cecce | |
-| V-10 | aligned | 2026-09-29T150521Z-5927288 | Test races are repaired as they surface; see the handoff |
-| V-11 | aligned | 2026-09-29T121551Z-50cecce | |
+| V-8 | aligned | 2026-09-29T121551Z-50cecce | Qualification gates retained |
+| V-9 | aligned | 2026-09-29T121551Z-50cecce | Lua model stays pure |
+| V-10 | aligned | 2026-09-29T150521Z-5927288 | Package-owned examples preserved |
+| V-11 | drifting | 2026-09-30T040151Z-e1c842a | GUIDE-1: amendment posted to #324; implementation pending |

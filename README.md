@@ -27,12 +27,14 @@ current findings.
 
 Shared toolchain qualification #157 is complete, and the [Vulkan compatibility
 proof](docs/vulkan_compatibility_record.md) #158 records the selected profiles. The
-[Vulkan design](docs/vulkan_backend_design.md) (#155) has all delivery slices
-filed. The reviewed model/proof repairs #181–#184 and #189–#190 are merged,
-as is the reusable supervised graphics owner #218. The production native
-backend has since merged through #219–#232, with its contract in
-[docs/gpu_backend.md](docs/gpu_backend.md); the multi-window triangle consumer
-and its final evidence (#233) remain. The
+[Vulkan design](docs/vulkan_backend_design.md) (#155) is complete, with all
+nineteen delivery slices completed. The reviewed model/proof repairs #181–#184
+and #189–#190 are merged, as is the reusable supervised graphics owner #218.
+The production native backend has merged through #219–#232, with its contract
+in [docs/gpu_backend.md](docs/gpu_backend.md). The independent
+[two-window triangle consumer](samples/triangle/README.md) (#233) is delivered;
+the [milestone verdict](docs/vulkan_milestone_verdict.md) links the final
+required native-profile evidence on macOS and Linux. The
 [Lua design](docs/lua_runtime_design.md) (#145) has returned to exploring: both platform confinement verdicts are inconclusive, so
 production mod-process work needs the deployment decision required by D-11.
 
@@ -167,7 +169,7 @@ uses, and releases both resources and still exits 0 — it just says nothing.
 | `packages/gpu-vulkan/glfw/` | Window integration: session controller, surface handover and the scheduled owner loop | Buildable only through `cabal.project.vulkan` |
 | `packages/render-2d/`, `packages/render-3d/` | Dedicated rendering paths | Planned |
 | `packages/scripting-lua/` | Lua binding, protocol model, and confinement experiments | Binding/model buildable; production runtime planned |
-| `samples/` | Future independent rendering consumers | Planned |
+| `samples/triangle/` | Independent two-window triangle consumer | Buildable only through `cabal.project.vulkan`; required native profile recorded on macOS and Linux |
 | `integrations/` | Game adapters | Planned |
 | `packages/foundation/test/` | Foundation-owned headless Hspec contracts | Buildable without GLFW through `cabal.project.cpu` |
 | `packages/runtime/test/`, `packages/glfw/test/` | Package-owned runtime and headless GLFW contracts | Buildable |
