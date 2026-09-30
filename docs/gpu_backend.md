@@ -414,9 +414,10 @@ at once; it is a structured target failure, not an assumption.
 
 ### Replacement
 
-A target is rebuilt when its geometry moves or when a swapchain call on its
+A target is rebuilt when its geometry moves, when a swapchain call on its
 active generation answered out of date or suboptimal (`noteSwapchainResult`, or
-a replacement the model counted from an acquisition). Those calls run on the
+a replacement the model counted from an acquisition), or when it resumes after
+its active generation was withdrawn. Those calls run on the
 owner's thread, and so does the report: it makes the owner's next deadline
 immediate, so the owner that reported a result takes the round that
 reconciles it rather than going idle. A report from another thread wakes
@@ -435,6 +436,14 @@ nothing, and the package's public module does not offer one.
   returns to the active generation's geometry is cancelled. A surface that
   reports its new extent later than the period is reported by the active
   generation's next suboptimal or out-of-date answer, as any resize is.
+- **Withdrawal** is not a failed construction either. A target suspended as
+  ineligible while a generation stood — its window hidden or minimized — or
+  whose generation the owner withdrew (`withdrawGeneration`, when its step
+  view's withdrawal count rose before a hide) presents on that generation no
+  more: once eligible it is replaced at once, at whatever extent, handing the
+  old one over, with no settling period and no recovery attempt, and it stays
+  suspended in the model until the replacement is published
+  ([Pacing, suspension and fairness](#pacing-suspension-and-fairness), #357).
 - **Reconciliation without a fresh observation.** With a concrete surface
   extent, an out-of-date or suboptimal result is enough to rebuild at the
   surface's new extent: a main thread stalled in a platform modal loop does not
@@ -1873,6 +1882,33 @@ target, or one whose acquisitions cannot be answered, never pauses another:
 each is offered its own attempt, and a pending acquisition only reschedules
 that target's retry.
 
+A target resumed from an ineligibility suspension while a generation stood —
+its window hidden or minimized — is **replaced**, never resumed on that
+generation: the reconciliation that finds it eligible again builds a
+replacement at once, handing the old one over as `oldSwapchain`, with no
+settling period and no recovery attempt spent, and the target stays suspended
+in the model until the replacement is published. A compositor need not answer
+a presentation made for a surface it has since unmapped: on Wayland, Weston 13
+offers no `wp_fifo_v1`, so Mesa's FIFO present waits, with no timeout, for the
+frame callback its swapchain's previous presentation requested, and the old
+generation's next present would never return
+([#357](https://github.com/coghex/hetoimasia/issues/357)). It costs one
+swapchain creation per resume on every platform. The old generation is
+retired as any replaced one is: held until its presentations have retired on
+their own present fences, then destroyed.
+
+**Hiding a presenting window.** A hide command's native call is itself the
+hazard, because the owner learns a window was hidden only from the observation
+published after it. So the host has the window's graphics owner withhold its
+presentation first ([glfw.md](glfw.md#hiding-an-attached-window)): the main
+thread waits while the owner's step in flight may present to the target, and
+every later step views the target as suspended until the hidden window's
+observation is folded. The step view's withdrawal count (`viewWithdrawals`)
+rises with every hold a step applies, and the controller then withdraws the
+target's active generation (`withdrawGeneration`) before any frame of that
+step, so even a hide and a show that both came between two steps resume the
+target on a replacement.
+
 ### Retiring a target
 
 A target's retirement is owed (`RetirementOwed`) until it can be performed.
@@ -2410,6 +2446,13 @@ next interval followed by the next poll with no timer armed between them; a
 suspended target keeping a finite deadline with its presentation pending, not
 spinning while the clock stands still, and polling when it comes; one target
 presenting five more frames while another's acquisitions all answer not ready;
+a window hidden while the owner's presentation to it holds, as Mesa's legacy
+FIFO present does, whose hide makes its native call only once that
+presentation returns, the other target presenting three frames and the hidden
+one none, its old swapchain kept while its presentations are unretired, and
+the shown window presenting on a replacement handed that swapchain and never on
+the old one — an example that fails with the hold or the replacement removed
+(#357);
 a renderer refusing every frame, with the owner's deadline one backoff interval
 ahead of a still clock and no second attempt until the clock reaches it; a
 fresh request, made while such a retry is pending, rendered at once with the
@@ -2820,8 +2863,8 @@ companions — and adds the Vulkan owner's:
 | Main thread | Hspec runs on a thread of its own; the process main thread owns one shared production graphics session: `withLoaderIntegration`, then `runGraphicsOwnerApplication` over `withVulkanOwnerHost`, with the production native layer and surface bridge. An example that needs the main thread — to hand a window's surface over, which GLFW creates there, or to close a window — submits an operation (`onMain`); the main thread runs it between two turns of the host's owner loop and returns its result or rethrows its failure. Windows are created through the host's command port from the example's own thread, which the owner loop executes, as an application's worker would. |
 | Identities | Every dispatched operation is checked, before it runs, to be on the bound process main thread that entered the session — the Haskell thread, the bound flag, and the OS thread read through `pthread_self` — and a failed check fails the operation and the run. Every native call the session makes is recorded where it runs by a `NativeObserver`, so an example shows from the calls themselves that the instance, its messenger, the device and every surface's destruction ran on the graphics owner's thread and every surface's creation on the main thread — never from the name of an Hspec hook. |
 | Sharing | The roots — the instance, its explicit messenger, and the one device — are acquired lazily, by the first dispatched operation, at most once, and shared by every later example. Each example's windows and targets are its own and are closed inside it. |
-| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, `vk12-frames`, `vk13-presentation`, `vk14-recovery`, `vk15-validation-stop`, `vk15-retention`, `vk16-composed`, `vk17-one-slot`, `vk17-two-slots`, `vk19-capture`, `synchronization-hazard`, `debug-names`, and, under the isolated compositor's consent only, `wayland-connection-loss`. Under that consent `vk16-composed` is pending instead, with its reason named, and starts no child. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. Each child runs in a process group of its own under an external 20-second deadline covering its exit and the end of its output; one still running at it is terminated with its group and fails its example as expired. |
-| Selection | Building, listing and filtering the tree, a `--dry-run`, and a selection that dispatches nothing acquire nothing and start no child. A selection matching no example fails. `--complete`, which the catalog group passes, runs the whole tree with Hspec's configuration reading left out and then fails unless the shared session was acquired once and every private scenario the run's consent requires ran and passed — every one, except that `wayland-connection-loss` is required under the isolated compositor's consent and pending under any other, and `vk16-composed` is pending under that consent and required under every other — so no ambient setting can turn the group's receipt into a pass for a subset. The consent rules and the migrated proof's pure release, construction, publication and loader-selection examples need no session and run without consent. |
+| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, `vk12-frames`, `vk13-presentation`, `vk14-recovery`, `vk15-validation-stop`, `vk15-retention`, `vk16-composed`, `vk17-one-slot`, `vk17-two-slots`, `vk19-capture`, `synchronization-hazard`, `debug-names`, and, under the isolated compositor's consent only, `wayland-connection-loss`. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. Each child runs in a process group of its own under an external 20-second deadline covering its exit and the end of its output; one still running at it is terminated with its group and fails its example as expired. |
+| Selection | Building, listing and filtering the tree, a `--dry-run`, and a selection that dispatches nothing acquire nothing and start no child. A selection matching no example fails. `--complete`, which the catalog group passes, runs the whole tree with Hspec's configuration reading left out and then fails unless the shared session was acquired once and every private scenario the run's consent requires ran and passed — every one, except that `wayland-connection-loss` is required under the isolated compositor's consent and pending under any other — so no ambient setting can turn the group's receipt into a pass for a subset. The consent rules and the migrated proof's pure release, construction, publication and loader-selection examples need no session and run without consent. |
 | Consent | Read once, at startup, from `HETOIMASIA_NATIVE_SESSION`, with the GLFW suite's rules for `desktop`, `isolated-x11:<display>` and `isolated-wayland:<socket>`: the last only on Linux, only when `WAYLAND_DISPLAY` names that socket, and never beside a `DISPLAY`. Under the Wayland consent every session requests Wayland by name — the shared host, each child's host, the VK-5 bridge's loader-aware session, and the proof shim's raw initialization, which sets `GLFW_PLATFORM` and fails one that selected another platform — so no X11 or XWayland session stands in; under the others every session requests nothing, as before. The first shared example asserts the platform GLFW selected before any example renders. Without consent every native example is refused before its body, the session is never acquired, and the run ends with the refusal on stderr and a non-zero exit. |
 | Environment | Before any Vulkan call, the suite clears every ambient discovery override and every validation-layer setting it finds and records which, disables implicit layers, and points the layer's settings file at an empty one; a child inherits and re-establishes the same environment. |
 | Validation | Every validation-enabled instance, shared or private, enables the Khronos layer and its **synchronization validation** through the instance's own create info. The fixture refuses to run with a set other than the one the provisioned layer is pinned to (`HETOIMASIA_VULKAN_VALIDATION_FEATURES`), which is the one the receipt names. `synchronization-hazard` records two `vkCmdFillBuffer` writes to one buffer with no barrier between them, on an instance the production native layer planned from the same request, and passes only when the capture carries `SYNC-HAZARD-WRITE-AFTER-WRITE` from inside the second write, completely, and its post-teardown verdict fails for that latched error and nothing else — reported apart from the clean profile's verdict and never filtered out of it. |
@@ -2857,14 +2900,15 @@ gives it the consent `isolated-wayland:<socket>`, and every session then
 requests Wayland by name, so the shared roots, every private case but one and
 VK-17's required profile are created, presented to and retired on Wayland
 surfaces through the VK-5 bridge on Lavapipe, under the same completion rules
-as on X11. The exception is VK-16's `vk16-composed`, which is pending there
-with its reason named, by the owner's decision on #327: Weston 13 offers no
+as on X11, VK-16's `vk16-composed` included. Weston 13 offers no
 `wp_fifo_v1`, so Mesa's Wayland WSI throttles FIFO with frame callbacks — each
 present waits, with no timeout, for the previous one's callback — and Weston
-fires none for an unmapped surface, so hiding a window whose target is
-presenting blocks the graphics owner in its next present to it. That is an
-engine gap on Wayland, not qualified here and tracked as
-[#357](https://github.com/coghex/hetoimasia/issues/357).
+fires none for an unmapped surface: hiding a window whose target is presenting
+would block the graphics owner in its next present to it, and showing it again
+would block its old swapchain's. The presentation hold and the replacement on
+resume ([Pacing, suspension and fairness](#pacing-suspension-and-fairness),
+[#357](https://github.com/coghex/hetoimasia/issues/357)) are what the case
+proves there; it was pending until they existed.
 Its one extra case, `wayland-connection-loss`, starts a Weston of its own and
 renders continuously to one window through the production host; once a
 presentation has been observed retiring on its own present fence it ends that
@@ -3022,10 +3066,14 @@ visible windows, driven by `runVulkanOwnerLoop` with nothing published by hand:
 the adapter publishes each window's observation and captured demand, and the
 application asks each window for a frame as soon as its last one was
 presented. Once each target has presented three frames, the first window is
-hidden through its command port; when its target is suspended in the model the
-second presents three more while the first presents none; the first is shown
-again and presents again; and the loop finishes, so the host exits through
-D-33. It passes only if every Vulkan call ran on one thread, the graphics
+hidden through its command port. Once that command has settled as attempted,
+the window has been observed hidden and its target is suspended in the model,
+the second presents three more while the first presents none — none since the
+hide settled. The first is then shown again; once that command has settled as
+attempted and the window has been observed visible, the first presents again,
+on a replacement swapchain; and the loop finishes, so the host exits through
+D-33. On Wayland it is what shows that a hide never blocks the owner and that
+a shown window never presents on its old swapchain (#357). It passes only if every Vulkan call ran on one thread, the graphics
 owner's, and every surface was created on the main thread; if every
 presentation's retirement was observed through its own present fence, no
 presentation was made after the device's destruction began, and both surfaces,

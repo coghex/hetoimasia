@@ -17,10 +17,11 @@ module Hetoimasia.Runtime.GLFW.Internal.Owner.Worker
   ) where
 
 import Control.Concurrent.STM (STM, atomically, check, readTVar, readTVarIO, writeTVar)
-import Control.Exception (evaluate, mask, tryWithContext)
+import Control.Exception (evaluate, finally, mask, tryWithContext)
 import Control.Monad (unless)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust)
+import qualified Data.Set as Set
 import Hetoimasia.Foundation.Time (Instant, deadlineReached, readInstant, remainingUntil)
 import Hetoimasia.Foundation.Worker (StopToken, stopRequested)
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Config (GraphicsOwnerConfig (..), OwnerTimer (..))
@@ -70,6 +71,8 @@ import Hetoimasia.Runtime.GLFW.Internal.Owner.Terminal
   , validatedTargets
   )
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Wake (wakeGraphicsHost)
+import Hetoimasia.Runtime.GLFW.Internal.Owner.Withhold (applyWithholding, endStepPresenting)
+import Hetoimasia.Runtime.GLFW.Internal.RenderDemand (RenderEligibility (RenderSuspended))
 
 -- | The owner's whole run: the protected retirement, the body, and the settled
 -- outcome.
@@ -173,33 +176,40 @@ deadlineInstant = \case
 --
 -- Everything the step is given is read in one transaction, so a backend never
 -- sees one target's observation from this round beside another's from the
--- last.
+-- last. The presentation holds are applied in that same transaction
+-- ("Hetoimasia.Runtime.GLFW.Internal.Owner.Withhold"): a held target is viewed
+-- as suspended, and the set of targets the step may present to stands until
+-- it returns.
 offerStep ∷ GraphicsOwner scene → IO (StepReport, NextDeadline)
 offerStep owner = do
   now ← readInstant (ownerClock owner)
   (scene, sceneRevision, demand, demandRevision, views) ← atomically $ do
     (scene, sceneRevision) ← readOwnerSceneAt handoff
     (demand, demandRevision) ← readOwnerDemandAt handoff
+    withheld ← applyWithholding owner
     states ← readTVar (ownerTargets owner)
     geometry ← readTVar (ownerGeometryCells owner)
     -- Recorded in the same transaction the step's inputs were read in, so the
     -- wait below can never conclude that a publication this step did not see
     -- has already been folded.
     writeTVar (ownerSeenInputs owner) (demandRevision, sceneRevision)
-    pure (scene, sceneRevision, demand, demandRevision, map (stepView geometry) (Map.toAscList states))
-  report ← graphicsStep operations (OwnerStep now scene sceneRevision demand demandRevision views) >>= evaluate
+    pure (scene, sceneRevision, demand, demandRevision, map (stepView geometry withheld) (Map.toAscList states))
+  report ←
+    (graphicsStep operations (OwnerStep now scene sceneRevision demand demandRevision views) >>= evaluate)
+      `finally` atomically (endStepPresenting owner)
   deadline ← graphicsNextDeadline operations >>= evaluate
   pure (report, deadline)
   where
     handoff = ownerHandoff' owner
     operations = ownerOperations (ownerSettings owner)
-    stepView geometry (target, state) =
+    stepView geometry withheld (target, state) =
       TargetStepView
         { viewTarget = target
-        , viewEligibility = targetEligible state
+        , viewEligibility = if Set.member target withheld then RenderSuspended else targetEligible state
         , viewGeometry = Map.findWithDefault noTargetGeometry target geometry
         , viewRevision = targetSeen state
         , viewConstructed = constructed (targetConstruction state)
+        , viewWithdrawals = targetWithdrawals state
         }
 
 -- | Wait for the next thing worth a round: a stop, a lifetime event, a fresher

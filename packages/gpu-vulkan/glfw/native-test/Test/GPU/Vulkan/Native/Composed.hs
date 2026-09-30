@@ -13,15 +13,25 @@
 --
 -- 1. Both windows are asked for frames, each as soon as its last one was
 --    presented, until each has presented three.
--- 2. The first window is hidden through its command port. Its target is
---    suspended in the model — its eligibility is the main thread's observation
---    of the hidden window — while the second keeps presenting three more
---    frames, and the first presents none.
--- 3. The first window is shown again, and presents again.
+-- 2. The first window is hidden through its command port. The hide's native
+--    call waits until no presentation to the window is in flight, and the
+--    owner presents to it no more (#357). Once the command has settled as
+--    attempted, the window has been observed hidden and its target is
+--    suspended in the model, the second presents three more frames while the
+--    first presents none — none since the hide settled.
+-- 3. The first window is shown again. Once that command has settled as
+--    attempted and the window has been observed visible, the first presents
+--    again, on a replacement for the swapchain it presented to before the
+--    hide.
 -- 4. The loop finishes and the host exits through D-33: the owner retires
 --    both targets once every presentation of theirs has retired on its present
 --    fence, then the device, the messenger and the instance, and is joined
 --    before the windows go.
+--
+-- On Wayland under Mesa's legacy FIFO — Weston 13 offers no @wp_fifo_v1@ — a
+-- present to the hidden window, or to its old swapchain once it is shown
+-- again, would wait for ever for a frame callback the compositor never sends;
+-- the case would then end at its deadline.
 --
 -- The case asserts the counts, that every Vulkan call ran on the graphics
 -- owner's thread and no other while every surface was created on the main
@@ -56,11 +66,24 @@ import Hetoimasia.Foundation.Log
   , callbackSink
   , mkLogger
   )
-import Hetoimasia.Foundation.Messaging.Payload (prepare)
-import Hetoimasia.GLFW.Command (SubmitResult (..), clientDemandPublisher, hideWindowCommand, showWindowCommand, submitWindowCommand)
+import Hetoimasia.Foundation.Messaging.Payload (prepare, preparedValue)
+import Hetoimasia.Foundation.Messaging.Snapshot (observedValue, readSnapshot)
+import Hetoimasia.GLFW.Command
+  ( CompletionTicket
+  , ControlAttempt (..)
+  , ControlOutcome (..)
+  , Disposition (..)
+  , SubmitResult (..)
+  , clientDemandPublisher
+  , clientObservations
+  , hideWindowCommand
+  , pollCompletion
+  , showWindowCommand
+  , submitWindowCommand
+  )
 import Hetoimasia.GLFW.Demand (immediateDemand, publishDemand)
 import Hetoimasia.GLFW.Vulkan (withLoaderIntegration)
-import Hetoimasia.GLFW.Window (WindowConfig (..), hiddenTestWindowConfig)
+import Hetoimasia.GLFW.Window (Attribute (..), WindowConfig (..), hiddenTestWindowConfig, observedVisible)
 import Hetoimasia.GPU.Model (TargetPhase (..), TargetView (..), targetView)
 import Hetoimasia.GPU.Model.Budget (defaultBudgetRequest, validateBudgets)
 import Hetoimasia.GPU.Model.Identity (TargetClass (..))
@@ -110,6 +133,9 @@ data ComposedFacts = ComposedFacts
     -- ^ Frames each presented while the first was hidden.
   , factsAfterShown ∷ !Int
     -- ^ Frames the first presented once shown again.
+  , factsSinceHideSettled ∷ !Int
+    -- ^ Frames the first presented from its hide's settlement until it was
+    -- asked to show.
   , factsPresented ∷ !Int
   , factsRetired ∷ !Int
     -- ^ Presentations whose present fences were observed signalled.
@@ -127,10 +153,18 @@ data ComposedOutcome
 -- | The phase the composed loop's update opportunity is in.
 data Phase
   = RenderingBoth
-  | Hiding !(Int, Int)
-    -- ^ The counts when the first window was asked to hide.
-  | Hidden !(Int, Int)
-  | Showing !Int
+  | Hiding !CompletionTicket
+    -- ^ The hide was admitted; its settlement is awaited.
+  | Settled !Int
+    -- ^ The hide settled with the first target at this count; the hidden
+    -- window's observation and its target's suspension are awaited.
+  | Hidden !Int !(Int, Int)
+    -- ^ The first target's count at the hide's settlement, and both counts
+    -- once the window was observed hidden and its target suspended.
+  | Showing !CompletionTicket
+  | Shown !Int
+    -- ^ The show settled and the window was observed visible, with the first
+    -- target at this count.
   | Done
 
 -- | Run the case on the calling thread, which must be the process main thread.
@@ -235,8 +269,19 @@ runComposed backend journal = do
             pure (or [viewTargetPhase held == TargetSuspended | (at, view) ← targets, at == attachment, Just held ← [targetView (targetViewIdentity view) model]])
           command window build =
             submitWindowCommand (hostCommandPort windowHost) [("client", "vk16-composed")] (build window) >>= \case
-              SubmitAccepted _ → pure ()
+              SubmitAccepted ticket → pure ticket
               other → stopWith ("a window command was not admitted: " <> tshow other)
+          -- Whether the control settled, and settled as attempted with every
+          -- native call returning cleanly; any other settlement ends the case.
+          attempted what ticket =
+            atomically (pollCompletion ticket) >>= \case
+              Nothing → pure False
+              Just (Attempted (ControlAttempt _ ControlReturned _)) → pure True
+              Just other → stopWith ("the " <> what <> " settled as " <> tshow other)
+          -- What the window's latest observation says about its visibility.
+          visible window = do
+            client ← atomically (hostWindowClient windowHost window) >>= maybe (stopWith "a window has no client") pure
+            observedVisible . preparedValue . observedValue <$> atomically (readSnapshot (clientObservations client))
       asked ← newTVarIO (Map.fromList [(one, 0), (two, 0)])
       phase ← newTVarIO RenderingBoth
       -- Ask a window for a frame as soon as its last one was presented: a
@@ -264,17 +309,24 @@ runComposed backend journal = do
           RenderingBoth
             | firstCount >= 3 && secondCount >= 3 → do
                 note journal ("both targets presented three frames " <> tshow (firstCount, secondCount) <> "; hiding the first window")
-                command first hideWindowCommand
-                atomically (writeTVar phase (Hiding (firstCount, secondCount)))
-          -- Counted from the turn the suspension was seen: a frame the first
-          -- target made before its hidden window's observation arrived was a
-          -- visible window's.
-          Hiding _ → do
-            done ← atomically (suspended one)
+                ticket ← command first hideWindowCommand
+                atomically (writeTVar phase (Hiding ticket))
+          Hiding ticket → do
+            done ← attempted "hide" ticket
             when done $ do
-              note journal ("the first target is suspended at " <> tshow (firstCount, secondCount))
-              atomically (writeTVar phase (Hidden (firstCount, secondCount)))
-          Hidden (firstAt, secondAt)
+              note journal ("the hide settled as attempted at " <> tshow (firstCount, secondCount))
+              atomically (writeTVar phase (Settled firstCount))
+          -- Counted from the turn the hidden window's observation and its
+          -- target's suspension were both seen; the first target's frames are
+          -- also counted from the hide's settlement, when the window was
+          -- already unmapped.
+          Settled settledAt → do
+            shown ← visible first
+            done ← atomically (suspended one)
+            when (shown == Observed False && done) $ do
+              note journal ("the first window is observed hidden and its target suspended at " <> tshow (firstCount, secondCount))
+              atomically (writeTVar phase (Hidden settledAt (firstCount, secondCount)))
+          Hidden settledAt (firstAt, secondAt)
             | secondCount >= secondAt + 3 → do
                 writeIORef factsHeld . Just $
                   ComposedFacts
@@ -282,6 +334,7 @@ runComposed backend journal = do
                     , factsSuspended = True
                     , factsWhileHidden = (firstCount - firstAt, secondCount - secondAt)
                     , factsAfterShown = 0
+                    , factsSinceHideSettled = firstCount - settledAt
                     , factsPresented = 0
                     , factsRetired = 0
                     , factsCalls = []
@@ -291,9 +344,15 @@ runComposed backend journal = do
                     , factsSeconds = 0
                     }
                 note journal ("the second target presented three more frames " <> tshow (firstCount, secondCount) <> "; showing the first window")
-                command first showWindowCommand
-                atomically (writeTVar phase (Showing firstCount))
-          Showing firstAt
+                ticket ← command first showWindowCommand
+                atomically (writeTVar phase (Showing ticket))
+          Showing ticket → do
+            done ← attempted "show" ticket
+            shown ← visible first
+            when (done && shown == Observed True) $ do
+              note journal ("the show settled as attempted and the first window is observed visible at " <> tshow (firstCount, secondCount))
+              atomically (writeTVar phase (Shown firstCount))
+          Shown firstAt
             | firstCount > firstAt → do
                 note journal ("the first target presented again " <> tshow (firstCount, secondCount))
                 modifyIORef' factsHeld (fmap (\facts → facts {factsAfterShown = firstCount - firstAt}))
@@ -316,13 +375,18 @@ composedSection = \case
     , "- frames before the first window was hidden (first, second): " <> tshow (factsFirstFrames facts)
     , "- the hidden window's target was suspended: " <> tshow (factsSuspended facts)
     , "- frames while it was hidden (first, second): " <> tshow (factsWhileHidden facts)
+    , "- frames the first presented from its hide's settlement until it was asked to show: " <> tshow (factsSinceHideSettled facts)
     , "- frames the first presented once shown again: " <> tshow (factsAfterShown facts)
+    , "- swapchains created: " <> tshow (swapchainsCreated facts)
     , "- presentations made: " <> tshow (factsPresented facts) <> "; retired on their present fences: " <> tshow (factsRetired facts)
     , "- Vulkan calls: " <> tshow (length (vulkanCalls facts)) <> ", on " <> tshow (length (nub (map (.callHaskellThread) (vulkanCalls facts)))) <> " thread(s)"
     , "- verdict issues: " <> maybe "no verdict" (tshow . verdictIssues) (factsVerdict facts)
     , "- error reports: " <> tshow (length (factsErrors facts))
     , "- seconds, from the loader integration to the verdict: " <> Text.pack (show (factsSeconds facts))
     ]
+
+swapchainsCreated ∷ ComposedFacts → Int
+swapchainsCreated facts = length [() | call ← factsCalls facts, call.callName == "vkCreateSwapchainKHR"]
 
 vulkanCalls ∷ ComposedFacts → [NativeCall]
 vulkanCalls facts = [call | call ← factsCalls facts, "vk" `Text.isPrefixOf` call.callName]
@@ -332,14 +396,18 @@ spec outcome = describe "VK-16 composed loop" $ do
   it "rendered both targets through the adapter's publications, with nothing published by hand" $
     on outcome $ \facts → factsFirstFrames facts `shouldSatisfy` \(first, second) → first >= 3 && second >= 3
 
-  it "suspended the hidden window's target while the other kept presenting, and presented to it none" $
+  it "suspended the hidden window's target while the other kept presenting, and presented to it none once its hide had settled" $
     on outcome $ \facts → do
       factsSuspended facts `shouldBe` True
       fst (factsWhileHidden facts) `shouldBe` 0
+      factsSinceHideSettled facts `shouldBe` 0
       snd (factsWhileHidden facts) `shouldSatisfy` (>= 3)
 
-  it "presented to the first target again once its window was shown" $
-    on outcome $ \facts → factsAfterShown facts `shouldSatisfy` (>= 1)
+  it "presented to the first target again once its window was shown, on a replacement for the swapchain it presented to before the hide" $
+    on outcome $ \facts → do
+      factsAfterShown facts `shouldSatisfy` (>= 1)
+      -- One generation per window, and the shown window's replacement.
+      swapchainsCreated facts `shouldSatisfy` (>= 3)
 
   it "made every Vulkan call on the graphics owner's thread, and every surface creation on the main thread" $
     on outcome $ \facts → do

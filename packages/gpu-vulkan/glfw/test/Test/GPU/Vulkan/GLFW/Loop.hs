@@ -26,7 +26,7 @@ import System.Timeout (timeout)
 
 import Hetoimasia.Foundation.Messaging.Payload (prepare)
 import Hetoimasia.Foundation.Time (Duration, DurationRequirement (AllowZero), Instant, addDuration, durationFromNanoseconds, elapsedBetween, readInstant, scriptedInstant, zeroDuration)
-import Hetoimasia.GLFW.Command (WaitedSubmission (..), awaitCompletion, awaitSubmitWindowCommand, clientDemandPublisher, setWindowSizeCommand)
+import Hetoimasia.GLFW.Command (WaitedSubmission (..), awaitCompletion, awaitSubmitWindowCommand, clientDemandPublisher, hideWindowCommand, setWindowSizeCommand, showWindowCommand)
 import Hetoimasia.GLFW.Demand (deadlineDemand, immediateDemand, publishDemand)
 import Hetoimasia.GLFW.Window (Extent (..), WindowId)
 import Hetoimasia.GPU.Model (TargetPhase (..), TargetView (..), targetView)
@@ -89,6 +89,9 @@ spec = describe "Vulkan loop adapter" $ do
     it "asks a frame of a generation a target moved to once, so an unrelated wake does not retry it early" (bounded testGenerationAskedOnce)
     it "renders a quiet target's replacement published in the step that disposed of its only generation, with nothing published" (bounded testQuietReplacementRendered)
     it "records the replacement a due target is offered as asked, so an unrelated wake does not retry its refused frame early" (bounded testDueTargetReplacementAsked)
+
+  describe "hiding a presenting window (#357)" $ do
+    it "makes the hide's native call only once the presentation in flight has returned, keeps the other target presenting, keeps the old swapchain while its presentations are unretired, and resumes the shown window on a replacement" (bounded testHideWhilePresenting)
 
   describe "a stalled main thread" $ do
     it "keeps the owner rendering while the native event call is held, and serves a window command once it returns" (bounded testStalledMainThread)
@@ -423,6 +426,107 @@ testBusyTargetFairness = do
   where
     pendingFor attachment = \case
       FramePending at _ → at == attachment
+      _ → False
+
+-- | Hiding a window whose target is presenting (#357). On Wayland under Mesa's
+-- legacy FIFO a present waits for the frame callback its swapchain's previous
+-- presentation requested, and a compositor sends none for a surface it has
+-- unmapped: a present made after the hide's native call, or on that swapchain
+-- after the window is shown again, would never return.
+--
+-- Here the owner's presentation to the first window holds, as that present
+-- does, when the first window is hidden through its command port. The hide's
+-- native call must wait for that presentation to return. While the first is
+-- hidden the second presents three frames and the first none; the first's old
+-- swapchain, whose presentations are kept unretired, is not destroyed; and
+-- once shown the first presents on a replacement handed that swapchain, and on
+-- that swapchain never again. The old swapchain goes only once its
+-- presentations are let retire.
+testHideWhilePresenting ∷ IO ()
+testHideWhilePresenting = do
+  rig ← visibleRigOf 2
+  (heldHide, hiddenPresents, keptWhileUnretired, afterHide, resumed) ← runRig rig $ \host control → do
+    [first, second] ← windowsOf host
+    one ← firstFrame rig host control first
+    two ← firstFrame rig host control second
+    let a = graphicsAttachment one
+        b = graphicsAttachment two
+    old ← activeSwapchain host one
+    keepPresentationsOf rig old True
+    gate ← newTVarIO False
+    presenting ← holdPresentations rig gate
+    early ← newTVarIO Nothing
+    hideSettled ← newTVarIO False
+    let hiddenYet = any (isHidden . snd) <$> readTVar (rigJournal rig)
+    -- The test's own thread: once the owner is inside its presentation to
+    -- the first window, it asks for the hide, which the main thread takes on
+    -- its next turn.
+    _ ← forkIO $ do
+      atomically (presenting >>= check)
+      awaitSubmitWindowCommand (hostCommandPort (vulkanWindowHost host)) [("client", "integration-tests")] (hideWindowCommand first) >>= \case
+        WaitAccepted ticket → do
+          -- The one bounded wait for something not to happen: a hide that did
+          -- not wait for the presentation would make its native call well
+          -- within this time.
+          expired ← registerDelay 50000
+          made ← atomically ((True <$ (hiddenYet >>= check)) `orElse` (False <$ (readTVar expired >>= check)))
+          atomically (writeTVar early (Just made))
+          atomically (writeTVar gate True)
+          _ ← awaitCompletion ticket
+          atomically (writeTVar hideSettled True)
+        WaitClosed → pure ()
+    demandFrame host first
+    composedUntil rig host control "the hide's settlement" (\_ → pure ()) (readTVarIO hideSettled)
+    firstAt ← presentsOf rig a
+    secondAt ← presentsOf rig b
+    -- Both windows are asked for frames; only the second is shown.
+    asked ← newTVarIO secondAt
+    composedUntil
+      rig
+      host
+      control
+      "three frames on the second target while the first is hidden"
+      ( \_ → do
+          demandFrame host first
+          presented ← presentsOf rig b
+          wanted ← readTVarIO asked
+          when (presented >= wanted) $ do
+            demandFrame host second
+            atomically (writeTVar asked (presented + 1))
+      )
+      ((>= secondAt + 3) <$> presentsOf rig b)
+    hidden ← subtract firstAt <$> presentsOf rig a
+    showSettled ← newTVarIO False
+    _ ← forkIO $
+      awaitSubmitWindowCommand (hostCommandPort (vulkanWindowHost host)) [("client", "integration-tests")] (showWindowCommand first) >>= \case
+        WaitAccepted ticket → awaitCompletion ticket >> atomically (writeTVar showSettled True)
+        WaitClosed → pure ()
+    composedUntil rig host control "a frame on the first target once shown" (\_ → demandFrame host first) $
+      (&&) <$> readTVarIO showSettled <*> ((> firstAt + hidden) <$> presentsOf rig a)
+    resumedCount ← subtract (firstAt + hidden) <$> presentsOf rig a
+    kept ← not <$> atomically (journalHas rig (SwapchainDestroyed old))
+    events ← journal rig
+    let sinceHide = drop 1 (dropWhile (not . isHidden) events)
+        onOld = length [() | ImagePresented swapchain _ ← sinceHide, swapchain == old]
+        handedOld = length [() | SwapchainCreated _ _ (Just handed) ← sinceHide, handed == old]
+    -- Let its presentations retire: a replaced swapchain then goes, on the
+    -- owner's own polls. One nothing replaced would stay, and the assertions
+    -- below say so rather than this wait.
+    keepPresentationsOf rig old False
+    when (handedOld > 0) $
+      composedUntil rig host control "the old swapchain's destruction" (\_ → pure ()) (atomically (journalHas rig (SwapchainDestroyed old)))
+    held ← readTVarIO early
+    pure (held, hidden, kept, (onOld, handedOld), resumedCount)
+  heldHide `shouldBe` Just False
+  hiddenPresents `shouldBe` 0
+  keptWhileUnretired `shouldBe` True
+  -- Nothing presented to the old swapchain after the hide, and a replacement
+  -- was handed it.
+  afterHide `shouldBe` (0, 1)
+  resumed `shouldSatisfy` (>= 1)
+  where
+    isHidden = \case
+      WindowHidden _ → True
       _ → False
 
 testStalledMainThread ∷ IO ()
@@ -1124,6 +1228,15 @@ awaitRetirementsObserved rig host due = do
 
 millis ∷ Integer → Duration
 millis count = either (error . show) id (durationFromNanoseconds AllowZero (count * 1000000))
+
+-- | The swapchain of a target's active generation.
+activeSwapchain ∷ VulkanHost Scene → GraphicsService → IO Word64
+activeSwapchain host service = do
+  view ← atomically (readVulkanGenerations (vulkanController host) (graphicsAttachment service)) >>= maybe (failWith "the target has no generations") pure
+  active ← maybe (failWith "the target has no active generation") pure (viewActive view)
+  case [handle | generation ← viewGenerations view, viewGeneration generation == active, Just handle ← [viewSwapchain generation]] of
+    handle : _ → pure handle
+    [] → failWith "the target's active generation has no swapchain"
 
 bounded ∷ IO () → Expectation
 bounded action =

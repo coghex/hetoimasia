@@ -772,11 +772,16 @@ The remaining gaps are stated rather than estimated:
   boundary, and a compositor lost during rendering ending the session with no
   completion recorded for work it interrupted. Its run is retained in
   [the qualification record](wayland_qualification_record.md#rendering).
-  Hiding a window whose target is presenting is not qualified: Weston 13
-  offers no `wp_fifo_v1`, so Mesa's FIFO waits for a frame callback the
-  compositor never sends an unmapped surface and the graphics owner blocks, so
-  VK-16's hide-and-show case is pending on Wayland, an engine gap tracked
-  as [#357](https://github.com/coghex/hetoimasia/issues/357). Hardware drivers, desktop compositors and macOS stay unqualified for
+  Hiding a window whose target is presenting is qualified there too, since
+  [#357](https://github.com/coghex/hetoimasia/issues/357): Weston 13 offers
+  no `wp_fifo_v1`, so Mesa's FIFO waits for a frame callback the compositor
+  never sends an unmapped surface, and the host therefore has the window's
+  graphics owner withhold its presentation before the hide's native call
+  ([Hiding an attached window](#hiding-an-attached-window)), and the target
+  resumes on a replacement swapchain. VK-16's hide-and-show case runs and
+  passes under the group. Minimizing a presenting window on Wayland is not
+  covered by that hold and stays unqualified, as minimization does below.
+  Hardware drivers, desktop compositors and macOS stay unqualified for
   rendering on Wayland: no hardware driver, no compositor but packaged
   headless Weston, and no macOS path was exercised, and macOS has no Wayland.
 - **Close requests.** A compositor-generated close request has not been
@@ -3314,7 +3319,8 @@ design's open question (Q-3) and is not decided here.
 `attachWindowGraphics host window owner` runs on the owner thread and takes the
 caller's own `AttachmentProtocol`: how to construct the dependents, how to roll
 a failed construction back, one bounded retirement step, the `CompletionPolicy`
-those steps are offered under, and how a failed step is classified. The boundary
+those steps are offered under, how a failed step is classified, and what to do
+before the window is hidden (`protocolBeforeHide`). The boundary
 supplies the exclusivity, the ordering, and the retirement rule, and nothing
 else.
 
@@ -3322,7 +3328,9 @@ Every callback runs on the owner thread, outside every transaction, native
 callback, and release. It may do finite, nonblocking native and backend work —
 constructing dependents, querying, handing work to the graphics owner, and safe
 disposal — and may not wait on a GPU, wait on a worker, or pump native events;
-`protocolStep` is one bounded opportunity that returns finitely. That work does
+`protocolStep` is one bounded opportunity that returns finitely. The one
+exception is `protocolBeforeHide`, which may wait for the graphics owner's step
+in flight to end, and no longer ([Hiding an attached window](#hiding-an-attached-window)). That work does
 not move the graphics owner's responsibilities into a callback: under the
 [lifetime design's D-6](window_graphics_lifetime_design.md#d-6-the-graphics-owner-survives-worker-drain-and-retires-on-its-own-thread),
 GPU effects and graphics-owned disposal execute on the graphics owner, and a
@@ -3350,7 +3358,7 @@ that raises when it is demanded answers `GraphicsMetadataRejected`, carrying the
 failure with the context it propagated with and naming no attachment, because
 none was issued: no slot was reserved, no protocol registered, no construction
 entered, and no rollback run, so there is nothing to retire and the window's
-slot is left exactly as it was found. The other four fields are callbacks, each
+slot is left exactly as it was found. The other five fields are callbacks, each
 entered inside a handler that already answers its own failure, so none is
 demanded early.
 
@@ -3474,6 +3482,47 @@ acknowledgement is refused and releases nothing. Detaching an owner that has
 already retired, or one that is already retiring, is a typed no-op —
 `DetachAbsent` or `DetachAlreadyRetiring` — not a failure. Swapping render
 modules inside one backend is not a detach and never reaches this boundary.
+
+#### Hiding an attached window
+
+A hide is the one window control that consults the window's attachment first
+([#357](https://github.com/coghex/hetoimasia/issues/357)). A hide's native
+call can unmap the window's surface, and a compositor need not answer a
+presentation made for a surface it no longer shows: on Wayland, Weston 13
+offers no `wp_fifo_v1`, so Mesa's FIFO present waits, with no timeout, for the
+frame callback its swapchain's previous presentation requested, and Weston
+sends none for an unmapped surface. The engine learns a window was hidden only
+from the observation published after the call, which is too late.
+
+So before a hide command's native call, the host runs the protocol of the
+attachment holding the window's slot, whatever its phase:
+`protocolBeforeHide attachment` returns once the owner will present to the
+window no more until an observation newer than the one already published for
+it arrives, and answers the action that lifts that hold. The hidden window's
+own observation is newer, so a hide that made its native call keeps the hold
+until then — including one whose call reported an error, since its sample
+still publishes — and one that raised keeps it too. A hide that made no native
+call — refused, or unsupported by the platform — changed nothing, and the host
+lifts the hold at once. A window with no attachment, and every other control,
+is executed exactly as before.
+
+The graphics owner's protocol implements it with a **presentation hold**
+(`Hetoimasia.Runtime.GLFW.Internal.Owner.Withhold`): the hold is recorded
+against the attachment, bound to the observation revision already published
+for it, and the main thread then waits while the owner's step in flight, if
+any, may present to that target. Every later step reads the hold in the
+transaction that reads its inputs, views the target as `RenderSuspended` until
+it has folded a newer observation, and carries the target's **withdrawal
+count** (`viewWithdrawals`), which rises with every hold a step applies. A
+backend that sees it rise must not present again to anything the target
+presented to before the hide — its last presentation may never be answered —
+even if a show followed so quickly that no view in between was suspended. A
+step must return finitely and the owner never waits for the main thread, so
+the main thread waits for one step at most, pumps nothing meanwhile, and never
+waits for an idle owner, one still starting, or one whose step cannot present
+to the window. Minimizing, and anything the platform does to a window on its
+own, is not held: the target is suspended from the observation that reports it,
+as before.
 
 #### Progress and scheduling
 
@@ -5091,6 +5140,7 @@ see [the Vulkan native suite](gpu_backend.md#the-native-suite).
 | Surface access phase | The attach or replacement that made the access | Opened and closed around its step; creation reads it | Owner | The access value | Closed when its step ends, however it ends |
 | Surface obligation state | Whoever holds the obligation | Creation makes it owed; one discharge settles it | Any; STM | Until discharged, or for good | Discharged once; uncertain is retained for good |
 | Graphics owner port reservations | The graphics owner composition | The main thread holds one across a handover and the send that spends it | Any; STM | The owner worker | Each is released by the send that spends it, or given back by a handover that reserved nothing else |
+| Graphics owner presentation holds and presenting set | The graphics owner composition | The main thread asks for a hold before a hide's native call and lifts one whose hide made no call; the owner's step prunes holds and writes the set of targets it may present to | Any; STM | A hold, from its hide until the owner folds a newer observation; the set, one step | The step prunes a hold once it is obsolete or names an attachment the owner has no custody of, so at most one stands per attachment; the set is emptied when the step returns |
 
 The guard holds only occupancy and poison. None of this is application state.
 

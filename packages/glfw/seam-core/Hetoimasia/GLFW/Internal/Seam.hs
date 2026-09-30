@@ -439,6 +439,10 @@ data SeamScript = SeamScript
   , scriptContentScale ∷ Reporter → IO (Float, Float)
   , scriptWindowPosition ∷ Reporter → IO (Int, Int)
   , scriptWindowAttribute ∷ WindowAttribute → Reporter → IO Bool
+  , scriptWindowAttributeOf ∷ Int → WindowAttribute → IO (Maybe Bool)
+    -- ^ One window's own answer, by its key, which an attribute query answers
+    -- in place of 'scriptWindowAttribute' when it gives one: how a script
+    -- tells one window's visibility from another's.
   , scriptPollEvents ∷ Reporter → IO ()
     -- ^ Runs inside a poll, before the events queued for it are delivered.
   , scriptWaitEvents ∷ Double → Reporter → IO ()
@@ -487,6 +491,7 @@ defaultScript =
     , scriptContentScale = \_ → pure (2, 2)
     , scriptWindowPosition = \_ → pure (40, 30)
     , scriptWindowAttribute = \_ _ → pure False
+    , scriptWindowAttributeOf = \_ _ → pure Nothing
     , scriptPollEvents = \_ → pure ()
     , scriptWaitEvents = \_ _ → pure ()
     , scriptPostEmptyEvent = \_ → pure ()
@@ -1017,9 +1022,10 @@ seamNative seam =
     , nativeWindowAttribute = \handle attribute → do
         record (QueryWindowAttribute attribute)
         scripted ← scriptWindowAttribute script attribute reporter
+        own ← scriptWindowAttributeOf script (windowKey handle) attribute
         case attribute of
           DecoratedAttribute → maybe True trackedDecorated . lookup (windowKey handle) <$> readIORef (seamTracked seam)
-          _ → pure scripted
+          _ → pure (maybe scripted id own)
     , nativePollEvents = do
         record PollEvents
         scriptPollEvents script reporter

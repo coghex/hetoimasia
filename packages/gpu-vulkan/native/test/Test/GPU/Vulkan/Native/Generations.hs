@@ -94,15 +94,55 @@ spec = describe "Generations" $ do
       viewTargetPhase <$> modelTarget rig `shouldReturn` TargetSuspended
       recoveryAttempts rig `shouldReturn` 0
 
-    it "suspends an ineligible target before asking its surface anything, and resumes it without a rebuild" $ do
+    it "suspends an ineligible target before asking its surface anything, and resumes it on a replacement handed the withdrawn generation" $ do
       rig ← newRig
       stepAt rig 0 (seen 640 480)
+      [old] ← swapchains rig
       stepAt rig 1 (seen 640 480) {geometryEligibility = Left "minimized"}
       viewCondition <$> generationsOf rig `shouldReturn` Suspended (SuspendedIneligible "minimized")
+      viewTargetPhase <$> modelTarget rig `shouldReturn` TargetSuspended
+      length . filter isQuery <$> swapchainCalls rig `shouldReturn` 1
+      -- The window may have been unmapped since the generation last
+      -- presented, so it presents no more: the resume builds a replacement at
+      -- once, at the same extent, with no settling period and no recovery
+      -- attempt (#357).
       stepAt rig 2 (seen 640 480)
       viewCondition <$> generationsOf rig `shouldReturn` Presenting
       viewTargetPhase <$> modelTarget rig `shouldReturn` TargetAdmitted
-      length . filter isQuery <$> swapchainCalls rig `shouldReturn` 1
+      created rig `shouldReturn` [(640, 480), (640, 480)]
+      handedOver rig `shouldReturn` [Nothing, Just old]
+      recoveryAttempts rig `shouldReturn` 0
+      -- The replacement is what it resumed on, so a later step builds nothing.
+      stepAt rig 3 (seen 640 480)
+      created rig `shouldReturn` [(640, 480), (640, 480)]
+
+    it "resumes a target suspended before its first generation with that one generation, and nothing replaced" $ do
+      rig ← newRig
+      stepAt rig 0 (seen 640 480) {geometryEligibility = Left "hidden"}
+      created rig `shouldReturn` []
+      stepAt rig 1 (seen 640 480)
+      created rig `shouldReturn` [(640, 480)]
+      handedOver rig `shouldReturn` [Nothing]
+
+    it "replaces a withdrawn generation at the next step even when no view in between was ineligible, and spends no recovery attempt" $ do
+      rig ← newRig
+      stepAt rig 0 (seen 640 480)
+      [old] ← swapchains rig
+      -- A hide and a show both came between two steps: the owner reports the
+      -- withdrawal, and every observation it saw was eligible.
+      atomically (withdrawGeneration (rigGenerations rig) (rigTarget rig))
+      stepAt rig 1 (seen 640 480)
+      created rig `shouldReturn` [(640, 480), (640, 480)]
+      handedOver rig `shouldReturn` [Nothing, Just old]
+      recoveryAttempts rig `shouldReturn` 0
+      viewCondition <$> generationsOf rig `shouldReturn` Presenting
+      viewTargetPhase <$> modelTarget rig `shouldReturn` TargetAdmitted
+
+    it "withdraws nothing from a target with no active generation" $ do
+      rig ← newRig
+      atomically (withdrawGeneration (rigGenerations rig) (rigTarget rig))
+      stepAt rig 0 (seen 640 480)
+      stepAt rig 1 (seen 640 480)
       created rig `shouldReturn` [(640, 480)]
 
   describe "replacement" $ do

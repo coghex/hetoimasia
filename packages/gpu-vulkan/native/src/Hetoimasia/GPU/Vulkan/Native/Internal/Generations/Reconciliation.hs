@@ -6,6 +6,11 @@
 -- retiring the active generation on its own when the limit is one — and
 -- constructs, names and publishes a candidate, handing the active generation
 -- over as @oldSwapchain@ only when the creation that passes it is called.
+-- A target suspended as ineligible while a generation stood — its window
+-- hidden or minimized — resumes on a replacement, never on that generation: a
+-- compositor need not answer a presentation made to a surface it then stopped
+-- showing, and under Mesa's legacy FIFO on Wayland the generation's next
+-- present would wait for that answer for ever (#357).
 --
 -- A lost surface (VK-14) — reported by a swapchain call, or raised by the
 -- surface's query or a swapchain's creation — retires the active generation and
@@ -145,10 +150,14 @@ reconcile generations now target geometry = do
             Backpressured _ → True
             _ → False
       case geometryEligibility geometry of
-        -- Eligibility is decided before the surface is asked anything.
-        Left reason → Nothing <$ suspend (SuspendedIneligible reason)
+        -- Eligibility is decided before the surface is asked anything. A
+        -- target withdrawn with a generation standing resumes on a
+        -- replacement ('recordWithdrawn').
+        Left reason → do
+          atomically (modifyRecord (\entry → entry {recordWithdrawn = recordWithdrawn entry || isJust (recordActive entry)}))
+          Nothing <$ suspend (SuspendedIneligible reason)
         Right ()
-          | isJust active && not moved && not reported && not (recordFailed record) → do
+          | isJust active && not moved && not reported && not (recordFailed record) && not (recordWithdrawn record) → do
               -- Nothing to build: a target back to the geometry its generation
               -- has resumes without a rebuild, and a move it had begun to settle
               -- is cancelled, so a later move waits its own full period.
@@ -192,6 +201,14 @@ reconcile generations now target geometry = do
           if maybe False (\(extent, observed) → extent == planExtent planned && sameGeometry observed geometry) (recordLastPlanned record)
             then unmoved planned
             else settle planned (recover planned)
+      -- Resumed after it was withdrawn: the active generation presents no
+      -- more, so it is replaced at once and handed over, whatever the extent.
+      -- It is not a recovery attempt and spends none of the episode. The
+      -- target stays suspended until the replacement is published, so a
+      -- construction that must wait acquires nothing from the withdrawn one.
+      | recordWithdrawn record, Just _ ← active = do
+          atomically (modelEdit_ (suspendTarget target))
+          construct planned
       | Just (_, native) ← active
       , reported
       , planExtent (genPlan native) == planExtent planned =
@@ -439,7 +456,7 @@ reconcile generations now target geometry = do
           atomically $ do
             editGeneration generations candidate (\entry → entry {genStanding = GenerationPresenting})
             modifyRecord $ \entry →
-              entry {recordActive = Just candidate, recordResult = Nothing, recordFailed = False}
+              entry {recordActive = Just candidate, recordResult = Nothing, recordFailed = False, recordWithdrawn = False}
             modelEdit_ (resumeTarget target)
           settleRecovery True
           _ ← setCondition Presenting

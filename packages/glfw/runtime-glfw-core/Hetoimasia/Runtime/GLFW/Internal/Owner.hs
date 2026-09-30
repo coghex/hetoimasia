@@ -47,6 +47,8 @@
 --   "Hetoimasia.Runtime.GLFW.Internal.Owner.Latch" and
 --   "Hetoimasia.Runtime.GLFW.Internal.Owner.Drain": worker progress, on the
 --   owner thread. None of them imports the handover or the lifetime.
+-- * "Hetoimasia.Runtime.GLFW.Internal.Owner.Withhold": the presentation holds
+--   a hide asks for on the main thread and the owner's step applies (#357).
 -- * "Hetoimasia.Runtime.GLFW.Internal.Owner.Handover",
 --   "Hetoimasia.Runtime.GLFW.Internal.Owner.Release",
 --   "Hetoimasia.Runtime.GLFW.Internal.Owner.Protocol",

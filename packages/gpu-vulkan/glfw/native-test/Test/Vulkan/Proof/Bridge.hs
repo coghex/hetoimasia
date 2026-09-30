@@ -237,6 +237,7 @@ session backend journal = do
                     , protocolCompletion = FiniteCompletion
                     , protocolDisposition = Required
                     , protocolRecognizes = \_ → pure False
+                    , protocolBeforeHide = \_ → pure (pure ())
                     }
               service ← case answered of
                 GraphicsAttached service → pure service
