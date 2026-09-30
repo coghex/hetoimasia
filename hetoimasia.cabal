@@ -53,6 +53,13 @@ extra-source-files:
     tools/native/patches/0001-wayland-fix-segfault-when-there-is-no-seat.patch
     tools/validation/ci_image.py
     tools/validation/plan.py
+    tools/validation/plan_repository.py
+    tools/validation/plan_cabal.py
+    tools/validation/plan_catalog.py
+    tools/validation/plan_request.py
+    tools/validation/plan_identity.py
+    tools/validation/plan_selection.py
+    tools/validation/plan_render.py
     tools/validation/range.py
     tools/validation/catalog.json
     tools/validation/receipts.py

@@ -45,7 +45,8 @@ import sys
 sys.dont_write_bytecode = True
 
 import receipts
-from plan import PlannerError, parse_request
+from plan_repository import PlannerError
+from plan_request import parse_request
 from receipts import EvidenceError
 
 # The only worker result that accounts for the groups a worker owns. Every

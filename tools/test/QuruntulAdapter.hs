@@ -36,6 +36,7 @@ spec = describe "Quruntul adapter" $
     , "test_a_mismatched_compiler_runs_behind_a_shim_of_the_pinned_ghcup_binaries"
     , "test_a_compiler_that_is_not_installed_is_refused"
     , "test_vulkan_builds_keep_the_shader_fingerprints_run_sh_generates"
+    , "test_planner_helpers_come_from_the_checkout_being_measured"
     , "test_the_adapter_imports_nothing_from_quruntul"
     ] $ \name →
       it name $ do

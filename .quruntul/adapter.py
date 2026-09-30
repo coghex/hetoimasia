@@ -30,6 +30,7 @@ them like every other test) and an isolated X11 display on Linux.
 """
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -49,20 +50,52 @@ BUILD_SECONDS = 3600
 ENGINE = (0, 2, 0)
 
 
-def _planner(checkout: Path):
-    """tools/validation/plan.py from the checkout being measured."""
-    path = checkout / "tools" / "validation" / "plan.py"
-    name = f"hetoimasia_plan_{abs(hash(str(path)))}"
-    if name in sys.modules:
-        return sys.modules[name]
-    # plan.py imports its siblings (ci_image and others) by plain name.
-    if str(path.parent) not in sys.path:
-        sys.path.insert(0, str(path.parent))
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
+# The planner modules this adapter reads helpers from, in dependency order: each
+# imports only the standard library and the modules before it.
+PLANNER_MODULES = ("plan_repository", "plan_cabal", "plan_identity")
+_PLANNERS: dict[str, dict[str, object]] = {}
+
+
+def _planner(checkout: Path, name: str):
+    """One of the validation planner's modules from the checkout being measured.
+
+    Each helper is imported from the module that owns it, never through the
+    plan.py command line. One process may measure more than one checkout, so each
+    checkout's modules are loaded from its own files under names of their own.
+    They import each other by plain name, so those names point at this
+    checkout's copies only while it loads and are restored afterwards; nothing is
+    put on `sys.path`, and a `plan_` module another checkout loaded is never
+    reused.
+    """
+    directory = (checkout / "tools" / "validation").resolve()
+    key = f"hetoimasia_planner_{hashlib.sha256(str(directory).encode()).hexdigest()[:16]}"
+    if key not in _PLANNERS:
+        _PLANNERS[key] = _load_planner(directory, key)
+    return _PLANNERS[key][name]
+
+
+def _load_planner(directory: Path, key: str) -> dict[str, object]:
+    saved = {name: sys.modules.get(name) for name in PLANNER_MODULES}
+    writes_bytecode = sys.dont_write_bytecode
+    # Loading them must leave no __pycache__ in the checkout, as plan.py ensures.
+    sys.dont_write_bytecode = True
+    loaded: dict[str, object] = {}
+    try:
+        for name in PLANNER_MODULES:
+            spec = importlib.util.spec_from_file_location(f"{key}_{name}", directory / f"{name}.py")
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = module
+            sys.modules[name] = module
+            spec.loader.exec_module(module)
+            loaded[name] = module
+    finally:
+        sys.dont_write_bytecode = writes_bytecode
+        for name, previous in saved.items():
+            if previous is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous
+    return loaded
 
 
 def _components(group: dict) -> list[str]:
@@ -110,10 +143,11 @@ class Hetoimasia:
         if getattr(ctx, "version", (0,)) < ENGINE:
             raise RuntimeError("this adapter needs quruntul " + ".".join(map(str, ENGINE)) + " or newer; update quruntul")
         checkout = ctx.checkout
-        plan = _planner(checkout)
-        tree = plan.GitTree(str(checkout), ctx.revision)
-        packages = plan.load_packages(tree, required=True)
-        entries = plan.tree_entries(str(checkout), ctx.revision)
+        repository = _planner(checkout, "plan_repository")
+        cabal = _planner(checkout, "plan_cabal")
+        tree = repository.GitTree(str(checkout), ctx.revision)
+        packages = cabal.load_packages(tree, required=True)
+        entries = _planner(checkout, "plan_identity").tree_entries(str(checkout), ctx.revision)
         catalog = json.loads((checkout / "tools" / "validation" / "catalog.json").read_text())
         routed = _routed(checkout)
         wayland = _wayland_groups(checkout)
@@ -134,18 +168,18 @@ class Hetoimasia:
                     options = [x for s in selectors for x in ("--match", s)]
                 else:
                     options = [x for s in narrowed.get(component, []) for x in ("--skip", s)]
-                if suite_name in suites or not plan.resolve_component(packages, component):
+                if suite_name in suites or not cabal.resolve_component(packages, component):
                     continue
                 display = ("wayland" if group["id"] in wayland else
                            "desktop" if group.get("runner") == "display" else None)
                 launch = "vulkan-native" if group.get("command", [])[:3] == ["bash", "tools/vulkan/run.sh", "native"] else "direct"
                 probe = bool(group.get("optional")) and group.get("category") == "probe" and group["id"] not in routed
-                inputs = set(plan.component_inputs(packages, component)) | set(group.get("inputs", []))
+                inputs = set(cabal.component_inputs(packages, component)) | set(group.get("inputs", []))
                 inputs |= {"cabal.project", "cabal.project.cpu", "cabal.project.common", "cabal.project.vulkan",
                            "tools/ci-image/toolchain.pin", "tools/toolchain/binding.pin"}
                 identity = ctx.digest(dict(
                     adapter=adapter_hash, component=component, options=options,
-                    entries=[e for e in entries if any(plan.matches_input(e[0], x) for x in inputs)]))
+                    entries=[e for e in entries if any(repository.matches_input(e[0], x) for x in inputs)]))
                 route = "vulkan" if package in VULKAN_PACKAGES else "glfw" if package in GLFW_PACKAGES else "cpu"
                 suites[suite_name] = ctx.Suite(
                     id=suite_name,
@@ -311,12 +345,12 @@ class Hetoimasia:
     @staticmethod
     def _tools(checkout: Path, component: str) -> list[str]:
         """Executables the suite's build-tool-depends puts on PATH under `cabal test`."""
-        plan = _planner(checkout)
-        tree = plan.GitTree(str(checkout), "HEAD")
-        packages = plan.load_packages(tree, required=True)
+        cabal = _planner(checkout, "plan_cabal")
+        tree = _planner(checkout, "plan_repository").GitTree(str(checkout), "HEAD")
+        packages = cabal.load_packages(tree, required=True)
         package, kind, name = component.split(":")
         return [f"{pkg}:exe:{exe}" for pkg, k, exe in sorted(
-            plan.component_closure(packages, [(package, kind, name)])) if k == "exe"]
+            cabal.component_closure(packages, [(package, kind, name)])) if k == "exe"]
 
 
 def _platforms(group_id: str) -> list[str]:
