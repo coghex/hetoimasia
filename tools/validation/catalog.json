@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "policy_version": 22,
+  "policy_version": 23,
   "policy_inputs": [
     "tools/validation/",
     ".github/workflows/"
@@ -230,6 +230,28 @@
         "--test-show-details=direct"
       ],
       "component": "hetoimasia-gpu-vulkan-diagnostics:test:diagnostics-tests",
+      "inputs": [
+        "cabal.project.common",
+        "cabal.project.cpu"
+      ],
+      "framework": "hspec",
+      "runner": "cpu",
+      "timeout_seconds": 1800,
+      "category": "test",
+      "optional": false
+    },
+    {
+      "id": "test.math",
+      "description": "Portable Hspec and QuickCheck contracts for the math package: vector arithmetic and checked normalization, 4×4 matrix identities, element access and the column-vector multiplication order, translation, scaling and checked axis-angle rotation, the right-handed look-at view, and the perspective projection under every combination of its depth range and clip-space Y direction, with every degenerate or non-finite input returning Nothing. It runs through the CPU project; the library depends on base alone.",
+      "command": [
+        "cabal",
+        "test",
+        "--project-file",
+        "cabal.project.cpu",
+        "hetoimasia-math:math-tests",
+        "--test-show-details=direct"
+      ],
+      "component": "hetoimasia-math:test:math-tests",
       "inputs": [
         "cabal.project.common",
         "cabal.project.cpu"

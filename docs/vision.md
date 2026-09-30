@@ -32,8 +32,10 @@ conventions, allowing dedicated type modules and explicit low-level local
 contracts. Shared mathematics and mathematical structures belong in a separate
 `packages/math` Cabal package, independent of every other local package and of
 graphics packages. Rendering policy and API adapters stay with graphics.
-The package is planned; numerical APIs remain to be designed. See
-[module conventions](module_conventions.md) for the accepted boundaries.
+The package exists as `hetoimasia-math`, with the minimal first API its
+first consumer needed; its boundaries still hold. See
+[module conventions](module_conventions.md) for them and
+[its contract](../packages/math/README.md) for its conventions.
 
 ### V-2. Build infrastructure methodically
 
