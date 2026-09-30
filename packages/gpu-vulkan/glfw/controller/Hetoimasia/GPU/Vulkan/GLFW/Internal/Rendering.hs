@@ -78,8 +78,9 @@
 -- | on, and a demand    | module    |                                    |        |                              | rise                         |
 -- | deadline ahead      |           |                                    |        |                              |                              |
 -- +---------------------+-----------+------------------------------------+--------+------------------------------+------------------------------+
--- | The construction's  | This      | 'confined' sets it; an owner-thread| Owner  | The owner's run              | Cleared each time the        |
--- | escape record       | module    | action's runner reads it           |        |                              | construction is lent         |
+-- | The construction's  | This      | 'confined' keeps the first escaped | Owner  | The owner's run              | Cleared each time the        |
+-- | escape record       | module    | failure; an owner-thread action's  |        |                              | construction is lent         |
+-- |                     |           | runner reads it                    |        |                              |                              |
 -- +---------------------+-----------+------------------------------------+--------+------------------------------+------------------------------+
 module Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
   ( -- * The native layers
@@ -361,11 +362,11 @@ andThen first second = first >>= either (pure . Left) (const second)
 data Construction q inst msgr phys dev cmd = Construction
   { constructionRecording ∷ !(Recording q inst msgr phys dev cmd)
   , constructionRoots ∷ !(Roots q inst msgr phys dev)
-  , constructionEscape ∷ !(TVar Bool)
-    -- ^ Set when a call raised a failure the owner's run must end with — one
-    -- that committed a generation, or that the session latched — rather than
-    -- answering it: whoever the construction was lent to raises it on, however
-    -- it handled it.
+  , constructionEscape ∷ !(TVar (Maybe (ExceptionWithContext SomeException)))
+    -- ^ The first failure a call raised that the owner's run must end with —
+    -- one that committed a generation, or that the session latched — rather
+    -- than answering it. An owner-thread action's runner raises it on however
+    -- the action handled it.
   }
 
 -- | What the renderer can release: the handles it can construct.
@@ -428,7 +429,7 @@ confined construction action =
                 CheckpointClear
                   | all (`elem` before) after → pure (Left (RefusedConstructionFailed (Text.pack (displayException exception))))
                 _ → do
-                  atomically (writeTVar (constructionEscape construction) True)
+                  atomically (modifyTVar' (constructionEscape construction) (maybe (Just failure) Just))
                   rethrowIO failure
   where
     roots = constructionRoots construction
@@ -437,9 +438,9 @@ confined construction action =
 isAsynchronous ∷ SomeException → Bool
 isAsynchronous exception = isJust (fromException exception ∷ Maybe SomeAsyncException)
 
--- | Whether a call on this construction, since it was lent, raised a failure
--- the owner's run must end with.
-constructionEscaped ∷ Construction q inst msgr phys dev cmd → STM Bool
+-- | The first failure a call on this construction raised, since it was lent,
+-- that the owner's run must end with.
+constructionEscaped ∷ Construction q inst msgr phys dev cmd → STM (Maybe (ExceptionWithContext SomeException))
 constructionEscaped = readTVar . constructionEscape
 
 -- | The session's construction, lent on the owner's thread outside any frame
@@ -451,7 +452,7 @@ lendConstruction rendering =
   live rendering >>= \case
     Nothing → pure Nothing
     Just made → do
-      atomically (writeTVar (renderingEscape rendering) False)
+      atomically (writeTVar (renderingEscape rendering) Nothing)
       pure (Just (construct rendering made))
 
 -- | The construction over the session's recording.
@@ -544,7 +545,7 @@ data Rendering q inst msgr phys dev cmd = Rendering
     -- ^ The verification captures requested of the session's targets
     -- ("Hetoimasia.GPU.Vulkan.GLFW.Internal.Capture"), whose readback buffers
     -- this module makes, releases and destroys.
-  , renderingEscape ∷ !(TVar Bool)
+  , renderingEscape ∷ !(TVar (Maybe (ExceptionWithContext SomeException)))
     -- ^ The lent construction's record of a failure that escaped it.
   }
 
@@ -564,7 +565,7 @@ newRendering roots generations ops observer captures =
     <*> newTVarIO 0
     <*> pure observer
     <*> pure captures
-    <*> newTVarIO False
+    <*> newTVarIO Nothing
 
 -- | The recording and the frames, made the first time they are needed once
 -- the device exists, on the owner's thread, which is what makes it their

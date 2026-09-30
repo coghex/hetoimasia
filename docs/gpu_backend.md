@@ -2125,12 +2125,19 @@ frame-less batch recording.
   raised, and the owner goes on; whatever it constructed before it raised is a
   managed resource of the session, released and destroyed as the renderer's
   are. It is never run again. What the owner's run must end with is raised on
-  after the ticket is settled, exactly as a renderer's would end it: a
-  cancellation of the owner; a construction whose failure escaped it — one
-  that committed a generation, or that raised because the session latched a
-  failure, such as the device's loss — which the construction records as it
-  raises; and a failure the session latched meanwhile, raised as its primary
-  as the step's own checkpoint raises it. None clears the terminal latch.
+  after the ticket is settled: a cancellation of the owner; a failure setting
+  the construction up — making the recording, the first time one is needed —
+  which ends the run as it would a frame's; a construction whose failure
+  escaped it — one that committed a generation, or that raised because the
+  session latched a failure, such as the device's loss — which the
+  construction records as it raises, so it ends the run however the action
+  handled it, even caught and returned from, and the ticket then answers
+  `ActionRaised` with it unless the action raised its own; and a failure the
+  session latched meanwhile, raised as its primary as the step's own
+  checkpoint raises it. None clears the terminal latch. The ticket is marked
+  running, and settled, with asynchronous exceptions masked everywhere but
+  inside the construction's setup and the action itself, so nothing can end
+  the owner with a ticket left running.
 - **Cooperation.** An action is a cooperative, finite callback. The owner does
   nothing else while it runs, so it must not wait for work that needs the same
   owner — another action's outcome, a frame, a handover — which could only
@@ -2142,7 +2149,8 @@ startup and teardown order with no window, later admission and refusal, an
 action on the owner's thread returning its result, the default setting's
 device-not-ready refusal, the full queue's immediate refusal, a raising
 action's failure and its retained resources, a construction's device loss
-ending the owner, refusal after terminal failure and after exit begins
+ending the owner — raised, or caught and returned from — a failure setting the
+construction up settling its ticket before it ends the owner, refusal after terminal failure and after exit begins
 (including one queued behind a running action), serialization with frames,
 zero-target disposal with no target and after the last target closes, and an
 idle session with no target naming no deadline until an action wakes it;
@@ -2432,7 +2440,7 @@ VK-18's D-33 order and releases nothing early.
 | Swapchain results | The generations' `Internal.Generations.State`, which defines them | The owner reports through `Uses`; `Reconciliation` consumes on its step | The owner | Until the active generation is replaced | Cleared by the publication that replaces it, or by the surface's loss |
 | A target's lost surface and outstanding attempt | The generations' `Internal.Generations.State`, which defines them | `Reconciliation` marks the loss; `Surface` releases, asks and installs; `Retirement` settles an attempt still outstanding | The owner | From the loss until a replacement is installed, or the target retires | Cleared by the installation, or by retirement |
 | Rendering: the recording and the frames | The controller's rendering | Made by the first frame attempted, or the first owner-thread action run, once the device exists; read by every step and retirement | The owner | From then until whole-owner retirement | Retired before the device is destroyed |
-| Rendering: the construction's escape record | The controller's rendering | Set by a construction whose failure must end the owner's run; read by the owner-thread action's runner | The owner | The owner's run | Cleared each time the construction is lent to an action |
+| Rendering: the construction's escape record | The controller's rendering | The first failure a construction raised that must end the owner's run, set as it raises; read by the owner-thread action's runner on both its return and raise paths | The owner | The owner's run | Cleared each time the construction is lent to an action |
 | Owner-thread action queue | The controller's `Internal.Actions` | Any thread admits in `STM`; the owner's step takes and removes | Any, in `STM` | The session | Each entry removed when the owner takes it; emptied by whole-owner retirement, which refuses what is left |
 | An owner-thread action's standing | The controller's `Internal.Actions` | The owner starts and settles it; a reader of its ticket settles one the gate now refuses | Any, in `STM` | From admission until its reader drops the ticket | Only advances: queued, running, settled |
 | The owner's open admission, as actions read it | The controller | Installed once by the composition with the owner's own port state; read by every action's admission and start | Any, in `STM` | The host | Closes with the owner's publications, never reopened |

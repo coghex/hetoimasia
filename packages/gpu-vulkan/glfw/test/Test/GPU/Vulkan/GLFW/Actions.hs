@@ -13,7 +13,7 @@ module Test.GPU.Vulkan.GLFW.Actions (spec) where
 
 import Control.Concurrent (forkIO, myThreadId)
 import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
-import Control.Exception (Exception (..), ExceptionWithContext (..), SomeException, throwIO, toException)
+import Control.Exception (Exception (..), ExceptionWithContext (..), SomeException, throwIO, toException, try)
 import Control.Monad (void, when)
 import Data.List (isSubsequenceOf)
 import Data.Maybe (isJust, isNothing)
@@ -61,6 +61,8 @@ spec = describe "Vulkan surface-free sessions and owner-thread actions" $ do
     it "are refused at once when the queue is full, never waiting for room" (bounded testQueueFull)
     it "return a raising action's failure to the caller, keep what it constructed managed, and let the owner go on" (bounded testRaisingAction)
     it "end the owner's run when a construction inside one loses the device, never answering it as the action's own failure alone" (bounded testEscapedConstruction)
+    it "end the owner's run with a construction's loss that the action caught and returned from, answering the ticket with the loss" (bounded testCaughtEscape)
+    it "settle the ticket with a failure setting the construction up before that failure ends the owner's run" (bounded testSetupFailure)
     it "are refused after the session's terminal failure, including one queued before it that never started" (bounded testTerminalRefusal)
     it "are refused once the owner's exit begins, including one queued behind a running action, which finishes" (bounded testExitRefusal)
     it "never run beside a frame's rendering: a frame asked for meanwhile follows the action" (bounded testSerialization)
@@ -224,6 +226,43 @@ testEscapedConstruction = do
   case answered of
     Just (ActionRaised failure) → show failure `shouldSatisfy` isSubsequenceOf "vkCreateGraphicsPipelines"
     other → failWith ("the action was not answered with the loss it raised: " <> maybe "nothing" outcomeText other)
+
+testCaughtEscape ∷ IO ()
+testCaughtEscape = do
+  rig ← surfaceFreeRig 0
+  raiseOnCreate rig CreatePipeline (toException (StandInLoss "vkCreateGraphicsPipelines"))
+  observed ← newTVarIO Nothing
+  outcome ← runRigCaught rig $ \host control → do
+    _ ← superviseGraphicsOwner control (vulkanGraphicsOwner host)
+    awaitReady host
+    -- The action swallows what the construction raised and returns normally.
+    answer ← act host (VulkanAction (\construction → either (\(_ ∷ SomeException) → "swallowed" ∷ String) (const "built") <$> try (buildPipeline construction)))
+    atomically (writeTVar observed (Just answer))
+    atomically (readOwnerFailure (vulkanGraphicsOwner host) >>= check . isJust)
+    checkRuntime control
+  loss ← raisedAs @GraphicsDeviceLost outcome
+  lostDuring loss `shouldBe` "vkCreateGraphicsPipelines"
+  readTVarIO observed >>= \case
+    Just (ActionRaised failure) → show failure `shouldSatisfy` isSubsequenceOf "vkCreateGraphicsPipelines"
+    other → failWith ("the ticket was not answered with the escaped loss: " <> maybe "nothing" outcomeText other)
+
+testSetupFailure ∷ IO ()
+testSetupFailure = do
+  rig ← surfaceFreeRig 0
+  raiseOnCreate rig CreateRecording (toException (StandInFailure "the recording's layer could not be made"))
+  observed ← newTVarIO Nothing
+  outcome ← runRigCaught rig $ \host control → do
+    _ ← superviseGraphicsOwner control (vulkanGraphicsOwner host)
+    awaitReady host
+    answer ← act host (VulkanAction (\_ → pure ()))
+    atomically (writeTVar observed (Just answer))
+    atomically (readOwnerFailure (vulkanGraphicsOwner host) >>= check . isJust)
+    checkRuntime control
+  failure ← raisedAs @StandInFailure outcome
+  failure `shouldBe` StandInFailure "the recording's layer could not be made"
+  readTVarIO observed >>= \case
+    Just (ActionRaised (ExceptionWithContext _ inner)) → fromException inner `shouldBe` Just failure
+    other → failWith ("the ticket was not settled with the setup failure: " <> maybe "nothing" outcomeText other)
 
 testTerminalRefusal ∷ IO ()
 testTerminalRefusal = do

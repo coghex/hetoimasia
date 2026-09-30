@@ -831,8 +831,10 @@ data Rendering = Rendering
     -- ^ What the next creation of each kind raises, once.
   }
 
--- | A managed object the recording's layer creates.
-data Creation = CreateLayout | CreatePipeline | CreateReadback
+-- | A managed object the recording's layer creates, or the recording's layer
+-- itself, made from the session's physical device when the recording is first
+-- needed.
+data Creation = CreateLayout | CreatePipeline | CreateReadback | CreateRecording
   deriving (Eq, Ord, Show)
 
 -- | The byte every stand-in readback buffer reads back as.
@@ -980,7 +982,7 @@ retireNextPresentations rig = atomically . writeTVar (renderingRetireCount (rigR
 renderingLayers ∷ Journal → Rendering → Maybe (TVar Instant) → RenderingOps Text Int Word64
 renderingLayers events rendering clock =
   RenderingOps
-    { renderingRecordingOps = \_ → pure recordingLayer
+    { renderingRecordingOps = \_ → recordingLayer <$ creating CreateRecording
     , renderingFrameOps = frameLayer
     }
   where

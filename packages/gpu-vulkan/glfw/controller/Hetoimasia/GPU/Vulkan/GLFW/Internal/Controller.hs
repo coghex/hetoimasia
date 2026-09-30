@@ -883,14 +883,19 @@ actionGate roots ownerOpen =
 -- | Run the owner-thread actions queued when the step began, one at a time,
 -- on the owner's thread. Each is taken and marked running in one transaction,
 -- which the gate refuses once the session has failed or the owner's admission
--- has closed; and each is run once, restored to the owner's own masking
--- state, and settled with what it did before anything can interrupt the
--- settlement. Answers whether it ran or settled any.
+-- has closed. From that transaction until its ticket is settled, asynchronous
+-- exceptions are masked except inside the construction's setup and the action
+-- itself, each of which runs restored to the owner's own masking state; so no
+-- cancellation, and no failure of either, can end the owner with a ticket left
+-- running. Each is run once. Answers whether it ran or settled any.
 --
 -- What an action raised is its outcome, and the owner goes on — unless it is
 -- a failure the owner's run must end with, which is then raised on here,
--- after the ticket is settled: a cancellation of the owner, a construction
--- failure whose effect escaped the construction, or a failure the session
+-- after the ticket is settled: a cancellation of the owner; a failure setting
+-- the construction up, which ends the run as it would a frame's; a
+-- construction failure that escaped the construction, however the action
+-- handled it — caught and returned, or raised — which settles the ticket as
+-- that failure unless the action raised its own; or a failure the session
 -- latched, which a checkpoint raises as its primary as the step's own does.
 serviceActions ∷ State inst msgr phys dev cmd lease obligation → IO Bool
 serviceActions state = do
@@ -900,27 +905,44 @@ serviceActions state = do
   go due False
   where
     go 0 served = pure served
-    go remaining served =
-      atomically (startAction (stateActions state)) >>= \case
-        Nothing → pure served
-        Just started → run started >> go (remaining - 1 ∷ Int) True
-    run (Started action settle) = mask $ \restore →
-      lendConstruction (stateRendering state) >>= \case
+    go remaining served = do
+      ran ← mask $ \restore →
+        atomically (startAction (stateActions state)) >>= \case
+          Nothing → pure False
+          Just started → True <$ run restore started
+      if ran then go (remaining - 1 ∷ Int) True else pure served
+    run ∷ (∀ a. IO a → IO a) → Started → IO ()
+    run restore (Started action settle) =
+      tryWithContext (restore (lendConstruction (stateRendering state))) >>= \case
+        Left failure → do
+          atomically (settle (ActionRaised failure))
+          rethrowIO (failure ∷ ExceptionWithContextSome)
         -- A device exists whenever an action was admitted, and outlives every
         -- round; this is only what a missing one would mean.
-        Nothing → atomically (settle (ActionRefused ActionDeviceNotReady))
-        Just construction →
-          tryWithContext (restore (runVulkanAction action construction)) >>= \case
-            Right value → atomically (settle (ActionReturned value))
-            Left failure@(ExceptionWithContext _ exception) → do
+        Right Nothing → atomically (settle (ActionRefused ActionDeviceNotReady))
+        Right (Just construction) → do
+          outcome ← tryWithContext (restore (runVulkanAction action construction))
+          escaped ← atomically (constructionEscaped construction)
+          case (outcome, escaped) of
+            (Left failure@(ExceptionWithContext _ exception), _)
+              | isAsynchronous exception → do
+                  atomically (settle (ActionRaised failure))
+                  rethrowIO failure
+            (_, Just failure) → do
+              atomically (settle (ActionRaised (either id (const failure) outcome)))
+              rethrowIO failure
+            (Left failure, Nothing) → do
               atomically (settle (ActionRaised failure))
-              escaped ← atomically (constructionEscaped construction)
-              when (isAsynchronous exception || escaped) (rethrowIO failure)
-              checkpointRoots (stateRoots state) >>= \case
-                CheckpointFailed primary → do
-                  atomically (writeTVar (stateFailureTaken state) True)
-                  throwIO (terminalFailure primary)
-                _ → pure ()
+              latched
+            (Right value, Nothing) → do
+              atomically (settle (ActionReturned value))
+              latched
+    latched =
+      checkpointRoots (stateRoots state) >>= \case
+        CheckpointFailed primary → do
+          atomically (writeTVar (stateFailureTaken state) True)
+          throwIO (terminalFailure primary)
+        _ → pure ()
 
 -- | Run a retirement, and if it could not verify what it owns, keep that in
 -- the terminal report as retained before the failure goes on to the owner,
