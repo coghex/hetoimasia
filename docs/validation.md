@@ -155,6 +155,7 @@ the audited suite inventory, and which optional probes are local-only.
 | `test.wayland-helper` | `cabal test wayland-helper-tests --test-show-details=direct` | yes | no | any |
 | `test.lua-hazard` | `cabal test hetoimasia-scripting-lua:lua-hazard-probes --test-show-details=direct` | yes | no | any |
 | `test.macos-confinement` | `cabal test hetoimasia-scripting-lua:macos-confinement-probe --test-show-details=direct` | yes | no | any (component Darwin-only) |
+| `test.allocator-parity` | `bash tools/vulkan/run.sh test hetoimasia-gpu-vulkan-native:test:allocator-parity-probe` | yes | no | any |
 | `test.glfw-native` | `cabal test glfw-native-tests --test-show-details=direct` | no | no | any |
 | `test.glfw-wayland` | `cabal test glfw-native-tests --test-show-details=direct --test-option=--match --test-option=/GLFW native/on an isolated Wayland session/` | no | no | any |
 | `test.vulkan-headless` | `bash tools/vulkan/run.sh test hetoimasia-gpu-vulkan-native:test:native-tests hetoimasia-gpu-vulkan-native:test:shader-tests hetoimasia-gpu-vulkan-glfw:test:integration-tests hetoimasia-sample-triangle:test:triangle-tests` | no | no | any |
@@ -438,7 +439,12 @@ retained evidence of the run that promoted it is
 [the Wayland qualification record](wayland_qualification_record.md).
 
 The local-only probes are `test.x11-helper`, `test.wayland-helper`,
-`test.lua-hazard`, `test.lua-confinement-linux`, and `test.macos-confinement`.
+`test.lua-hazard`, `test.lua-confinement-linux`, `test.macos-confinement`, and
+`test.allocator-parity`. The last is #331's allocator parity probe, kept as the
+evidence for the resource services design's D-38 (its
+[record](gpu_allocator_parity_record.md)). It is `framework: none` — it
+reports figures, not Hspec examples — so the quruntul adapter derives no suite
+from it.
 Optional is a selection rule; it does not imply Python, a particular executor,
 or automatic eligibility for `$test`. See the
 [classification policy](test_classification.md) before adding a new group.

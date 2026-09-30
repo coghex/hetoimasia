@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "policy_version": 23,
+  "policy_version": 24,
   "policy_inputs": [
     "tools/validation/",
     ".github/workflows/"
@@ -540,6 +540,30 @@
       "framework": "hspec",
       "runner": "cpu",
       "timeout_seconds": 600,
+      "category": "probe",
+      "optional": true
+    },
+    {
+      "id": "test.allocator-parity",
+      "description": "Local-only optional allocator parity probe (#331, D-14), retained as the evidence for the owner's choice of VMA (D-38). Replays committed allocation and free traces into one fixed block through the pure best-fit placement reference, a mutable prototype making the same decisions, and VMA's virtual block, and reports #331's four gates with timing, allocation, collection and fragmentation diagnostics; neither Haskell allocator met them. Built through cabal.project.vulkan by tools/vulkan/run.sh; creates no device and opens no window. Its timings mean something only on a quiet machine.",
+      "command": [
+        "bash",
+        "tools/vulkan/run.sh",
+        "test",
+        "hetoimasia-gpu-vulkan-native:test:allocator-parity-probe"
+      ],
+      "component": "hetoimasia-gpu-vulkan-native:test:allocator-parity-probe",
+      "inputs": [
+        "cabal.project.common",
+        "cabal.project.vulkan",
+        "packages/gpu-vulkan/native/",
+        "tools/native/",
+        "tools/toolchain/binding.pin",
+        "tools/vulkan/"
+      ],
+      "framework": "none",
+      "runner": "cpu",
+      "timeout_seconds": 3600,
       "category": "probe",
       "optional": true
     }
