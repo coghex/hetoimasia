@@ -122,7 +122,7 @@ import qualified Test.Vulkan.Proof.Bridge as Bridge
 import qualified Test.Vulkan.Proof.BridgeSpec as BridgeSpec
 import qualified Test.Vulkan.Proof.Diagnostics as Diagnostics
 import qualified Test.Vulkan.Proof.DiagnosticsSpec as DiagnosticsSpec
-import Test.Vulkan.Proof.Journal (Journal, entries, newJournal)
+import Test.Vulkan.Proof.Journal (Journal, entries, newEchoingJournal)
 import Test.Vulkan.Proof.Record (bridgeSection, diagnosticsSection, renderRecord, rootsSection)
 import qualified Test.Vulkan.Proof.Roots as Roots
 import qualified Test.Vulkan.Proof.RootsSpec as RootsSpec
@@ -365,7 +365,7 @@ runScenario refusedOrGranted name = case refusedOrGranted of
         Left reason → do
           hPutStrLn stderr ("vulkan-native-tests " <> name <> ": " <> Text.unpack reason)
           exitWith (ExitFailure 1)
-      journal ← newJournal
+      journal ← newEchoingJournal
       let finish (examples, record) = do
             passed ← runCompleteSpec examples
             transcript ← entries journal
