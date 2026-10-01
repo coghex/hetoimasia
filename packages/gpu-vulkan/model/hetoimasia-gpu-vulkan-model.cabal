@@ -64,6 +64,7 @@ library
         Hetoimasia.GPU.Model.Internal.Generations
         Hetoimasia.GPU.Model.Internal.Hold
         Hetoimasia.GPU.Model.Internal.Identity
+        Hetoimasia.GPU.Model.Internal.Memory
         Hetoimasia.GPU.Model.Internal.Observation
         Hetoimasia.GPU.Model.Internal.Presentation
         Hetoimasia.GPU.Model.Internal.Progress
@@ -123,6 +124,7 @@ test-suite gpu-model-tests
         Test.GPU.Model.Frames
         Test.GPU.Model.Holds
         Test.GPU.Model.Identities
+        Test.GPU.Model.Memory
         Test.GPU.Model.Opacity
         Test.GPU.Model.Placement
         Test.GPU.Model.Progress

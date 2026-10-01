@@ -242,6 +242,10 @@ data AllocationAttempt = AllocationAttempt
   , attemptRetiredOldSwapchain ∷ !Bool
     -- ^ Whether this attempt's construction already retired a generation by
     -- passing it as @oldSwapchain@.
+  , attemptMemoryReserved ∷ !Natural
+    -- ^ Device-memory bytes reserved for an allocating call and not yet
+    -- settled ("Hetoimasia.GPU.Model.Internal.Memory"). They are accounted
+    -- bytes until settlement replaces them by what the call opened.
   }
   deriving (Eq, Show)
 
@@ -254,6 +258,7 @@ newAllocationAttempt bytes objects =
     , attemptRetrySpent = False
     , attemptReclaimedSince = False
     , attemptRetiredOldSwapchain = False
+    , attemptMemoryReserved = 0
     }
 
 -- | Whether this attempt may retry, and if not, why not.

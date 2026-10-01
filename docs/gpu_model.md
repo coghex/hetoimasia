@@ -66,7 +66,7 @@ are all under `Hetoimasia.GPU.Model.Internal`.
 | Shared building blocks | `Resolve`, `Accounting` | Identity resolution and misuse classification; record edits, object and byte accounting, and freeing a frame slot whose obligations have ended |
 | Read-only queries      | `Work` | The work summary, the one disposal-eligibility rule, replacements owed, and recovery deadlines |
 | Scheduling             | `Scheduling` | The one scheduling rule and the wrappers every transition applies it through |
-| Transitions            | `Session`, `Targets`, `Generations`, `Resources`, `Frames`, `Recording`, `Submission`, `Presentation`, `Completion`, `TargetRecovery`, `Disposal` | Escalation and device loss; target, generation, managed-resource and allocation lifecycles; reservation and acquisition; recorded batches; submission; presentation and abandonment; injected evidence; recovery transitions; disposal and reclamation |
+| Transitions            | `Session`, `Targets`, `Generations`, `Resources`, `Memory`, `Frames`, `Recording`, `Submission`, `Presentation`, `Completion`, `TargetRecovery`, `Disposal` | Escalation and device loss; target, generation, managed-resource and allocation lifecycles; device-memory reservation and settlement; reservation and acquisition; recorded batches; submission; presentation and abandonment; injected evidence; recovery transitions; disposal and reclamation |
 | Composition            | `Progress` | Owner turns and the deadline of the next one |
 | Views                  | `Observation` | Hold, frame and target views, usage, and the live record count |
 
@@ -317,7 +317,7 @@ never clamped; there is no unbounded sentinel.
 | Live generations       | 2         | Active, constructing and retired together                            |
 | Image tracking limit   | 16        | Tracked image records of one generation                              |
 | Presentation pool      | 18 (derived) | Reserved, unpresented and pending records, shared by the target's active and retired generations |
-| Accounted bytes        | 256 MiB   | Recorded-but-unsubmitted and retired allocations too                 |
+| Accounted bytes        | 256 MiB   | Recorded-but-unsubmitted and retired allocations too, device-memory reservations, and the device memory the allocator holds ([Device memory](#device-memory)) |
 | Accounted objects      | 4,096     | Pool records, image records, batch records, submission records and resources |
 | Reclaim examination    | 64        | Records one reclamation pass may examine                             |
 | Progress actions       | 32        | Completion or disposal actions per owner turn                        |
@@ -365,6 +365,37 @@ nothing, which is the one way attempts could accumulate without limit.
 Because every admission point is bounded and every record is accounted, storage
 is finite even when no completion ever arrives. The record count is a function of
 the configuration, not of how many attempts were made.
+
+### Device memory
+
+The accounted bytes also charge the device memory the backend's allocator holds
+— each block and each dedicated allocation — for as long as it holds it (D-15,
+D-40 of the [GPU resource services design](designs/gpu_resource_services_design.md)).
+Those charges belong to the memory, not to any resource: a block serves many
+resources and may outlive them all, so creating, disposing of or abandoning a
+resource never moves them. The model learns about the memory only as the
+boundary reports it, as plain byte counts:
+
+- `reserveDeviceMemory` reserves, for one allocation attempt, the most an
+  allocating call could open, before the call. A reservation the byte budget
+  cannot hold is `Backpressure ByteBudget` and changes nothing. An attempt holds
+  at most one, a failed attempt none until its retry is permitted, and a
+  reservation of nothing is `EmptyAllocation`.
+- `settleDeviceMemory` settles one allocator call's `MemoryEffect` — the bytes
+  it opened and freed — under the attempt's reservation or under none: the
+  reservation is released, what was opened is charged as held, and what was
+  freed is released. It answers `MemorySettled`, or names a defect the
+  boundary must act on: `MemoryBeyondReservation`, memory opened past the
+  reservation, which is charged in full because it is held, even over the
+  budget; or `MemoryFreedUnheld`, a free of more than was held, whose charge
+  stops at zero. Settlement records what already happened, so a failed
+  session settles too.
+- `createResource` and `rebuildResource` refuse an attempt whose reservation is
+  unsettled (`WrongPhase`), and `abandonAllocation` gives such a reservation
+  back with the rest of the attempt's accounting — never memory already
+  charged as held.
+
+`usageDeviceMemory` is the part of `usageBytes` that is held device memory.
 
 ## Recovery
 
@@ -657,6 +688,7 @@ prove the whole schedule.
 | ----------------- | ------------------ | ------------------------- | ------ | ------------ | -------------------------------------------- |
 | The `GpuModel`    | The owning boundary| Whoever threads the value | Any    | The session  | A record leaves only when every hold has ended |
 | Escalation notices| The owning boundary| The model raises; `takeEscalations` drains | Any | Until taken | Dropped oldest-first past the window, and counted |
+| Device-memory charges | The owning boundary | Reserved per attempt by `reserveDeviceMemory`; settled by `settleDeviceMemory` after every allocator call | Any | The session | Released only as the boundary reports memory freed |
 
 Nothing accumulates as history. A disposed resource's current-generation entry is
 removed, a settled frame gives back the reservations it never used, and a

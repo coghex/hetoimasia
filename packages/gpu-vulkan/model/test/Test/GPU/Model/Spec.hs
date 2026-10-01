@@ -11,6 +11,7 @@ import qualified Test.GPU.Model.DeviceLoss as DeviceLoss
 import qualified Test.GPU.Model.Frames as Frames
 import qualified Test.GPU.Model.Holds as Holds
 import qualified Test.GPU.Model.Identities as Identities
+import qualified Test.GPU.Model.Memory as Memory
 import qualified Test.GPU.Model.Opacity as Opacity
 import qualified Test.GPU.Model.Placement as Placement
 import qualified Test.GPU.Model.Progress as Progress
@@ -25,6 +26,7 @@ spec = describe "GPU model" $ do
   Frames.spec
   DeviceLoss.spec
   Budgets.spec
+  Memory.spec
   Opacity.spec
   Recovery.spec
   Progress.spec

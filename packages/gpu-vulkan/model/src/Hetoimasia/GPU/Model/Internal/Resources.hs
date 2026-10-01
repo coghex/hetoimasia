@@ -31,6 +31,7 @@ import Hetoimasia.GPU.Model.Internal.Recovery
   ( AllocationAttempt
       ( attemptBytes
       , attemptFailed
+      , attemptMemoryReserved
       , attemptObjects
       , attemptReclaimedSince
       , attemptRetiredOldSwapchain
@@ -49,12 +50,14 @@ import Numeric.Natural (Natural)
 -- Managed resources
 
 -- | Turn a successful allocation attempt into a managed resource generation.
+-- An attempt whose device-memory reservation is still unsettled is refused:
+-- its memory is not the resource's to keep.
 createResource ∷ AllocationId → GpuModel → Outcome (GpuModel, ResourceId)
 createResource identity model =
   scheduling model $
   resolved (running model) $ \() →
     resolved (resolveAllocation model identity) $ \(number, attempt) →
-      if attemptFailed attempt
+      if attemptFailed attempt || attemptMemoryReserved attempt /= 0
         then Rejected (WrongPhase AllocationIdentity)
         else
           let logical = gpuNextResource model
@@ -94,7 +97,7 @@ rebuildResource identity allocation model =
             if logicalReleased (resourceHolds existing)
               then Rejected (AlreadyConsumed ResourceIdentity)
               else
-                if attemptFailed attempt
+                if attemptFailed attempt || attemptMemoryReserved attempt /= 0
                   then Rejected (WrongPhase AllocationIdentity)
                   else
                     let next = generation + 1
@@ -211,13 +214,15 @@ retryAllocation identity model =
             )
         verdict → Admitted (model, verdict)
 
--- | Give up an attempt and release the accounting it reserved.
+-- | Give up an attempt and release the accounting it reserved, including a
+-- device-memory reservation it never settled. Device memory an allocator call
+-- already opened under it stays charged: it is held until it is freed.
 abandonAllocation ∷ AllocationId → GpuModel → Outcome GpuModel
 abandonAllocation identity model =
   scheduling_ model $
   resolved (resolveAllocation model identity) $ \(number, attempt) →
     Admitted
       ( releaseBytes
-          (attemptBytes attempt)
+          (attemptBytes attempt + attemptMemoryReserved attempt)
           (releaseObjects (attemptObjects attempt) model {gpuAllocations = Map.delete number (gpuAllocations model)})
       )

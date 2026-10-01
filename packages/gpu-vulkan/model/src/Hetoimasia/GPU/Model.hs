@@ -147,6 +147,13 @@ module Hetoimasia.GPU.Model
   , ReclaimReport (..)
   , reclaimPass
 
+    -- * Device memory
+  , MemoryEffect (..)
+  , noMemoryEffect
+  , MemorySettlement (..)
+  , reserveDeviceMemory
+  , settleDeviceMemory
+
     -- * Observation
   , HoldKind (..)
   , HoldView (..)
@@ -180,6 +187,13 @@ import Hetoimasia.GPU.Model.Internal.Generations
   , failGenerationConstruction
   , publishGeneration
   , retireGeneration
+  )
+import Hetoimasia.GPU.Model.Internal.Memory
+  ( MemoryEffect (..)
+  , MemorySettlement (..)
+  , noMemoryEffect
+  , reserveDeviceMemory
+  , settleDeviceMemory
   )
 import Hetoimasia.GPU.Model.Internal.Observation
   ( FrameView (..)

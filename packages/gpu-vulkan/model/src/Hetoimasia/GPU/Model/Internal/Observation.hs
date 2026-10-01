@@ -182,6 +182,8 @@ data Usage = Usage
   , usageBatches ∷ !Natural
   , usageSubmissions ∷ !Natural
   , usageBytes ∷ !Natural
+  , usageDeviceMemory ∷ !Natural
+    -- ^ The part of 'usageBytes' that is device memory the allocator holds.
   , usageObjects ∷ !Natural
   , usageAllocations ∷ !Natural
   , usageResources ∷ !Natural
@@ -196,6 +198,7 @@ usage model =
     , usageBatches = fromIntegral (Map.size (gpuBatches model))
     , usageSubmissions = fromIntegral (Map.size (gpuSubmissions model))
     , usageBytes = gpuBytes model
+    , usageDeviceMemory = gpuDeviceMemory model
     , usageObjects = gpuObjects model
     , usageAllocations = fromIntegral (Map.size (gpuAllocations model))
     , usageResources = fromIntegral (Map.size (gpuResources model))
