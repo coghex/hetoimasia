@@ -956,8 +956,13 @@ release VMA's retained empty block.
 
 ### Q-19. Which binding calls VMA in production
 
-Raised by D-38 on 2026-09-30; open, and answered by GRS-18's measurements.
-Candidates:
+Raised by D-38 on 2026-09-30; GRS-18 (#361) measured both candidates. Its
+runs recommend the engine-owned shim, imported with unsafe calls, with D-40's
+callbacks counting in C: the only configuration that met every accepted
+limit, in both binding variants' runs. The Hackage binding missed in both its
+variants, and safe calls missed through either
+([the VMA qualification record](../gpu_vma_qualification_record.md)). The
+question stays open until the owner adopts a binding. Candidates:
 
 - the Hackage `VulkanMemoryAllocator` binding, which bundles VMA 3.3.0, makes
   unsafe foreign calls unless its `safe-foreign-calls` flag is set, and needs
