@@ -18,11 +18,10 @@ configuration met every accepted limit in both runs, so it qualifies for #333
 - Safe calls do not qualify through either binding: the engine shim with safe
   imports missed 11 of 15 limits, with C or Haskell callbacks.
 - D-40's callbacks therefore run in C. No unsafe call may reach a Haskell
-  callback, and only safe calls, which miss, could allow one. Under safe calls,
-  callbacks into Haskell also cost more than callbacks into C on the calls that
-  open or free device memory.
-- Every configuration met the completion-deferred free gate: no free before its
-  batch's fence signalled, and synchronization validation reported nothing.
+  callback, and only safe calls, which miss, could allow one.
+- Every configuration met the completion-deferred free gate through its own
+  API and callbacks: no free before its batch's fence signalled, and
+  synchronization validation reported nothing.
 
 The qualification is for the configuration measured: a shim whose Haskell
 side marshals no struct and calls each entry directly. The probe's shim is
@@ -36,14 +35,14 @@ shape. D-38 leaves making VMA a production native input, and its
 
 ## The runs
 
-Both runs come from commit `0af6bce`, source digest
-`df00b86d67fe4dc3f9f73133a099b6c55447c33a2aaf9d111291889b73001ff7`, with
+Both runs come from commit `e0846a2`, source digest
+`bcd85bd2dd21b25460d58e27d5eee68df97579b09ba0d7a7cf73b5097818873e`, with
 3 warm-up and 20 measured repetitions, on 2026-10-01:
 
 | Run | Binding variant | Load average (1, 5, 15 min) | Report |
 | --- | --- | --- | --- |
-| 1, unsafe | default unsafe calls, what the unmodified tracked tree builds | 3.04 3.34 3.52 | [run-1-2026-10-01-unsafe.md](gpu_vma_qualification/run-1-2026-10-01-unsafe.md) |
-| 1, safe | `safe-foreign-calls` | 4.49 3.61 3.61 | [run-1-2026-10-01-safe.md](gpu_vma_qualification/run-1-2026-10-01-safe.md) |
+| 1, unsafe | default unsafe calls, what the unmodified tracked tree builds | 2.79 3.48 3.73 | [run-1-2026-10-01-unsafe.md](gpu_vma_qualification/run-1-2026-10-01-unsafe.md) |
+| 1, safe | `safe-foreign-calls` | 2.96 3.39 3.68 | [run-1-2026-10-01-safe.md](gpu_vma_qualification/run-1-2026-10-01-safe.md) |
 
 - **Machine:** Mac15,9, Apple M3 Max, 64 GiB, macOS 26.7.1 (Darwin 25.6.0
   arm64), on AC power.
@@ -67,7 +66,7 @@ and the timing protocol. The probe's
 [README](../packages/gpu-vulkan/native/probe/allocator-parity/README.md)
 states the protocol in full.
 
-The machine was not quiet: other work held the load average at 3 to 4.5 on
+The machine was not quiet: other work held the load average near 3 to 3.7 on
 this 16-core machine. Both drivers in a run share that load, interleaved
 within every repetition. The recommended configuration's margins below are
 wide, and the two runs agree to within a few nanoseconds per call.
@@ -94,24 +93,24 @@ or 50 ns:
 
 | Call | Run 1, unsafe: C / overhead | Run 1, safe: C / overhead | Allowance |
 | --- | --- | --- | ---: |
-| create buffer, one allocating call | 85.6 / 24.2 ns | 81.6 / 26.1 ns | 50 ns |
-| create image, one allocating call | 1852.1 / 28.5 ns | 1846.0 / 38.8 ns | 461–463 ns |
-| free buffer | 183.6 / 3.2 ns | 179.3 / 5.4 ns | 50 ns |
-| free image | 143.8 / 5.4 ns | 141.8 / 7.5 ns | 50 ns |
-| map | 2.2 / 5.5 ns | 0.2 / 7.5 ns | 50 ns |
-| unmap | 0.2 / 5.4 ns | 0.2 / 5.5 ns | 50 ns |
-| flush | 0.2 / 5.5 ns | 0.2 / 5.5 ns | 50 ns |
-| invalidate | 0.2 / 5.5 ns | 0.2 / 5.5 ns | 50 ns |
-| D-40: `NEVER_ALLOCATE` placed in held memory | 71.0 / 15.8 ns | 70.8 / 16.0 ns | 50 ns |
-| D-40: failed attempt, then a block opened | 11496.0 / −236.3 ns | 11181.4 / −536.2 ns | 2.8–2.9 µs |
-| D-40: failed attempt, then a dedicated allocation | 8366.7 / −511.0 ns | 7437.6 / 374.1 ns | 1.9–2.1 µs |
+| create buffer, one allocating call | 87.6 / 24.2 ns | 85.6 / 22.2 ns | 50 ns |
+| create image, one allocating call | 1829.3 / 38.8 ns | 1858.5 / 22.0 ns | 457–465 ns |
+| free buffer | 185.4 / 1.4 ns | 187.8 / 9.4 ns | 50 ns |
+| free image | 141.7 / 1.5 ns | 152.1 / 1.6 ns | 50 ns |
+| map | 0.2 / 7.6 ns | 0.2 / 7.6 ns | 50 ns |
+| unmap | 0.1 / 5.5 ns | 0.2 / 5.5 ns | 50 ns |
+| flush | 0.1 / 5.6 ns | 0.2 / 5.5 ns | 50 ns |
+| invalidate | 0.1 / 5.4 ns | 0.1 / 5.4 ns | 50 ns |
+| D-40: `NEVER_ALLOCATE` placed in held memory | 70.8 / 18.1 ns | 73.0 / 13.9 ns | 50 ns |
+| D-40: failed attempt, then a block opened | 10729.3 / 586.6 ns | 11525.2 / −419.5 ns | 2.7–2.9 µs |
+| D-40: failed attempt, then a dedicated allocation | 7491.7 / 207.8 ns | 7843.9 / −42.4 ns | 1.9–2.0 µs |
 
 | Trace | Run 1, unsafe: Haskell ÷ C | Run 1, safe: Haskell ÷ C | Limit |
 | --- | ---: | ---: | ---: |
-| synarchy-sheets | 1.019× | 1.028× | 1.25× |
-| small-steady | 1.127× | 1.118× | 1.25× |
-| small-bursty | 1.050× | 1.049× | 1.25× |
-| small-mixed | 1.111× | 1.108× | 1.25× |
+| synarchy-sheets | 1.020× | 1.016× | 1.25× |
+| small-steady | 1.118× | 1.124× | 1.25× |
+| small-bursty | 1.045× | 1.058× | 1.25× |
+| small-mixed | 1.109× | 1.119× | 1.25× |
 
 Map, unmap, flush and invalidate do almost no work in C: the staging
 allocation is persistently mapped, and its memory type is coherent, so VMA's
@@ -123,24 +122,23 @@ flush and invalidate return at once. Their medians sit below the clock's
 - **The Hackage binding's wrappers.** Unsafe calls themselves are cheap, but
   each creation marshals its create infos in `ContT`, allocates and frees two
   output cells under `bracket`, and reads back an `AllocationInfo`. That adds
-  about 230 ns to a 70–86 ns call: create buffer 240.7 ns over C, a
-  `NEVER_ALLOCATE` placement 226.3 ns over. A refused `NEVER_ALLOCATE` arrives
-  as a thrown `VulkanException`, so the failed attempt costs several times its
-  C cost. On the small-buffer traces, where nearly every allocation is a cheap
-  placement, the binding took 1.32–1.73× C's time. On `synarchy-sheets`, where
+  about 230 ns to a 70–88 ns call: create buffer 236.8 ns over C, a
+  `NEVER_ALLOCATE` placement 230.8 ns over. A refused `NEVER_ALLOCATE` arrives
+  as a thrown `VulkanException`, so the failed attempt costs about five times
+  its C cost. On the small-buffer traces, where nearly every allocation is a
+  cheap placement, the binding took 1.31–1.73× C's time. On `synarchy-sheets`, where
   each image creation costs about 1.9 µs in C, it stayed within the limit.
 - **Safe calls.** A safe call releases and reacquires the capability, about
   110–160 ns per call whatever the binding. That alone exceeds the 50 ns
   floor on every cheap call. Through the Hackage binding, safe calls add to
-  the wrappers' cost: 430 ns on create buffer, and 1.3–2.7× C's time on every
-  trace.
+  the wrappers' cost: 424 ns on create buffer, and 1.30–2.67× C's time on
+  every trace.
 - **Callbacks into Haskell.** They need safe calls, so they inherit those
-  calls' misses. On the calls that open device memory or free a dedicated
-  allocation, callbacks into Haskell cost more than callbacks into C: 110–810 ns
-  more per call through the Hackage binding (run 1, safe), and 75–1,310 ns
-  through the shim (both runs). On frees that release no device memory, the two
-  differ by under 5 ns. Callbacks fire rarely: once per block VMA opens or
-  frees.
+  calls' misses; that, not their own cost, rules them out. Callbacks fire only
+  when VMA opens or frees device memory, calls that take about 5 to 14 µs. On those
+  calls, Haskell callbacks measured between 448 ns faster and 929 ns slower
+  than C callbacks across the two runs and both safe drivers. With 16 or 17
+  such calls in the script, that difference is within the calls' own spread.
 
 ## D-40's accounting
 
@@ -173,20 +171,22 @@ For sheets they exceed them by under 1%, at 128-byte alignment.
 
 ## Completion-deferred frees
 
-`small-steady` replayed from Haskell through the Hackage binding with C
-callbacks. The GPU executed 313 batches of 64 operations, three in flight. Each
-free waited for the fence of the batch that last used its resource; peak 129
-frees waited at once, 93.6 per batch on average. Neither the 40 timed passes nor
-the 2 validated passes of the two runs freed anything early, and synchronization
-validation reported nothing.
+`small-steady` replayed once per Haskell configuration, through that
+configuration's own API and callbacks. The GPU executed 313 batches of 64
+operations, three in flight. Each free waited for the fence of the batch that
+last used its resource; peak 129 frees waited at once, 93.6 per batch on
+average. In every configuration of both runs, neither the 20 timed passes nor
+the validated pass freed anything early, and synchronization validation
+reported nothing.
 
-A destroy the GPU has used costs more on MoltenVK than one it has not: the
-median deferred `vmaDestroyBuffer` took 898 ns against 269 ns for the same
-trace's immediate frees in the plain replay (run 1, unsafe). The frees took
-9.3 ms in total against 2.7 ms, and draining them, bookkeeping included, took
-11.7 ms. The owner set no numeric limit on this comparison; the
-reports give the rest of the deferred workload's costs: allocation, recording
-and submission, and fence waits.
+A destroy the GPU has used costs more on MoltenVK than one it has not. For the
+recommended configuration, the median deferred `vmaDestroyBuffer` took 919 ns
+against 256 ns for the same trace's immediate frees in its plain replay
+(run 1, unsafe). Its frees took 9.5 ms in total against 2.5 ms, and draining
+them, bookkeeping included, took 12.1 ms. Across every configuration and both
+runs, a deferred free cost 658–742 ns more than an immediate one. The owner set
+no numeric limit on this comparison; each report gives the deferred workload's
+other costs: allocation, recording and submission, and fence waits.
 
 ## Reproducing
 
