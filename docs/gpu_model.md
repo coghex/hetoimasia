@@ -388,7 +388,9 @@ boundary reports it, as plain byte counts:
   boundary must act on: `MemoryBeyondReservation`, memory opened past the
   reservation, which is charged in full because it is held, even over the
   budget; or `MemoryFreedUnheld`, a free of more than was held, whose charge
-  stops at zero. Settlement records what already happened, so a failed
+  stops at zero and so no longer bounds the memory. A call that did both is
+  answered with `MemoryFreedUnheld`, the defect the boundary must treat as
+  terminal. Settlement records what already happened, so a failed
   session settles too.
 - `createResource` and `rebuildResource` refuse an attempt whose reservation is
   unsettled (`WrongPhase`), and `abandonAllocation` gives such a reservation

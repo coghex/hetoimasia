@@ -123,6 +123,14 @@ spec = describe "device memory" $ do
       usageDeviceMemory (usage freed) `shouldBe` 0
       usageBytes (usage freed) `shouldBe` 0
 
+    it "answers a call that opened beyond its reservation and freed beyond what was held with the over-free" $ do
+      model ← freshModelWith smallRequest
+      (attempted, attempt) ← admitted "an attempt" (beginAllocation 0 2 model)
+      reserved ← admitted_ "reserving" (reserveDeviceMemory attempt 10 attempted)
+      (settled, answer) ← admitted "settling both defects" (settleDeviceMemory (Just attempt) (MemoryEffect 11 12) reserved)
+      answer `shouldBe` MemoryFreedUnheld 1
+      usageDeviceMemory (usage settled) `shouldBe` 0
+
     it "settles a call's effect in a failed session, admitting nothing new" $ do
       model ← freshModelWith smallRequest
       (attempted, attempt) ← admitted "an attempt" (beginAllocation 0 2 model)

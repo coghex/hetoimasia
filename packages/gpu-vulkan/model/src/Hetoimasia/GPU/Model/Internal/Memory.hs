@@ -57,7 +57,9 @@ data MemorySettlement
     -- frees what the call made and treats the request as failed.
   | MemoryFreedUnheld !Natural
     -- ^ The call freed this many bytes more than the model held. The held
-    -- charge stops at zero.
+    -- charge stops at zero, so it no longer bounds what is held. This answer
+    -- takes priority: a call that also opened beyond its reservation is
+    -- answered with this one.
   deriving (Eq, Show)
 
 -- | Reserve the most an allocating call could open for this attempt: the
@@ -110,8 +112,11 @@ settleDeviceMemory identity effect model =
           -- The reservation and the memory held before were both accounted
           -- bytes; they are replaced by what is held now.
           bytes = saturatingMinus (saturatingMinus (gpuBytes current) reserved) before + after
+          -- A free of more than was held is answered first, whatever else
+          -- the call did: the held charge no longer bounds the memory, which
+          -- the boundary must never treat as the lesser defect.
           settlement
-            | opened > reserved = MemoryBeyondReservation (opened - reserved)
             | freed > available = MemoryFreedUnheld (freed - available)
+            | opened > reserved = MemoryBeyondReservation (opened - reserved)
             | otherwise = MemorySettled
        in (current {gpuBytes = bytes, gpuDeviceMemory = after}, settlement)
