@@ -138,7 +138,6 @@ supportedClient =
       , "noteBatchSubmitted"
       , "readReadback"
       , "fillReadback"
-      , "mappedRange"
       , "disposeResources"
       , "retireRecording"
       , "ManagedStanding (..)"

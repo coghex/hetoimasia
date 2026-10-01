@@ -29,6 +29,7 @@ import Data.Text (Text)
 import Data.Word (Word32, Word64)
 import Numeric.Natural (Natural)
 
+import Hetoimasia.GPU.Vulkan.Native.Allocator (BufferMemory)
 import Hetoimasia.GPU.Vulkan.Native.Naming (ShaderStage)
 import Hetoimasia.GPU.Vulkan.Native.Presentation (SurfaceExtent)
 
@@ -115,20 +116,19 @@ data PipelineRequest = PipelineRequest
   }
   deriving (Eq, Show)
 
--- | A readback buffer's native objects: the buffer, its memory, and how that
--- memory is mapped.
+-- | A readback buffer's native objects: the buffer, its allocation from the
+-- device's allocator ("Hetoimasia.GPU.Vulkan.Native.Allocator"), and where
+-- that allocation is mapped.
 data ReadbackAllocation = ReadbackAllocation
   { allocationBuffer ∷ !Word64
-  , allocationMemory ∷ !Word64
+  , allocationMemory ∷ !BufferMemory
+    -- ^ The buffer with its allocation, which may share device memory with
+    -- others.
   , allocationSize ∷ !Natural
     -- ^ The buffer's size: what may be copied into it and read out of it.
-  , allocationMemorySize ∷ !Natural
-    -- ^ The memory's size, which bounds every flushed or invalidated range.
   , allocationCoherent ∷ !Bool
-  , allocationAtom ∷ !Natural
-    -- ^ The device's non-coherent atom size.
   , allocationMapped ∷ !Word64
-    -- ^ Where the whole memory is mapped, from offset zero.
+    -- ^ Where the allocation is mapped, from its own start, for its lifetime.
   }
   deriving (Eq, Show)
 
@@ -151,14 +151,10 @@ data RecordingOps dev cmd = RecordingOps
     -- buffer: nothing recorded before the reset can be submitted after it.
   , opsDestroyStorage ∷ dev → Word64 → IO ()
     -- ^ Destroy the pool, which frees its command buffer.
-  , opsCreateReadback ∷ dev → Natural → IO ReadbackAllocation
-    -- ^ A transfer-destination buffer of the size, in host-visible memory,
-    -- bound and mapped.
-  , opsDestroyReadback ∷ dev → ReadbackAllocation → IO ()
-  , opsInvalidate ∷ dev → ReadbackAllocation → (Natural, Natural) → IO ()
-    -- ^ Invalidate the mapped range: an offset into the memory and a size.
-  , opsFlush ∷ dev → ReadbackAllocation → (Natural, Natural) → IO ()
   , opsReadMapped ∷ ReadbackAllocation → Natural → Natural → IO ByteString
+    -- ^ Copy bytes out of a readback buffer's mapping: an offset into the
+    -- buffer and a size. The buffer's memory, its mapping and its maintenance
+    -- are the device allocator's.
   , opsWriteMapped ∷ ReadbackAllocation → Natural → ByteString → IO ()
   , opsBeginCommands ∷ cmd → IO ()
     -- ^ Begin the command buffer for one submission.

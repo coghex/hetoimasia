@@ -20,6 +20,7 @@ kept here.
 | Dependency index | `index-state: 2026-09-18T00:00:00Z` | `cabal.project.common` |
 | Vulkan binding | `vulkan-3.27` with `vulkan-utils-0.5.11.0` | `tools/toolchain/binding.pin` |
 | Binding flags | `+safe-foreign-calls`, `-darwin-lib-dirs` | `tools/toolchain/binding.pin` |
+| Device-memory allocator | VMA **3.3.0**, compiled by `VulkanMemoryAllocator-0.11.1.0` with `+vma-ndebug`, called through the engine's own C shim | `cabal.project.vulkan`; the vendored header `packages/gpu-vulkan/native/vendor/vma/vk_mem_alloc.h` ([VMA](#vma)) |
 
 Qualified by [#157](https://github.com/coghex/hetoimasia/issues/157).
 [`toolchain/README.md`](toolchain/README.md) names the revision each piece of
@@ -280,6 +281,42 @@ native package, and its test mode runs the shader suite as part of the
 `test.vulkan-headless` group. The adapter's contract, and what it
 refuses, is in
 [the native package's README](../packages/gpu-vulkan/native/README.md#shaders).
+
+### VMA
+
+GRS-11 (#333) makes VMA a production native input of the Vulkan project (V-11,
+D-38). What is pinned, and where:
+
+| What | Value | Constrained by |
+| --- | --- | --- |
+| VMA | 3.3.0, as the Hackage package `VulkanMemoryAllocator-0.11.1.0` bundles it | `VulkanMemoryAllocator ==0.11.1.0` in `cabal.project.vulkan` and in the native package's `build-depends` |
+| The package's distribution | `VulkanMemoryAllocator-0.11.1.0.tar.gz`, SHA-256 `7ae824bd29cd443b7b5d8c23509fb5c02bb5f06b23dfc864a7f11d4ee99d6a91` | The index state, as every Hackage dependency |
+| VMA's build flags | `+vma-ndebug` (assertions compiled out, `NDEBUG`); the package's own `src/lib.cpp` configuration: `VMA_STATIC_VULKAN_FUNCTIONS 0`, `VMA_DEDICATED_ALLOCATION`, `VMA_BIND_MEMORY2`, `VMA_MEMORY_BUDGET`, `VMA_BUFFER_DEVICE_ADDRESS`, `VMA_MEMORY_PRIORITY` and `VMA_EXTERNAL_MEMORY` all 1, C++17 | `VulkanMemoryAllocator +vma-ndebug` in `cabal.project.vulkan`; the shim restates the configuration |
+| The header | `vk_mem_alloc.h` from that distribution, vendored unchanged with its MIT license, SHA-256 `90ce12fc4a2466235a09ae02905dd0c13aee80c1bbf11b331ab61230c2ceb112` | `packages/gpu-vulkan/native/vendor/vma/`; the native suite checks the digest |
+| The binding | The engine-owned C shim `packages/gpu-vulkan/native/cbits/hetoimasia_vma.cpp`, compiled `-std=c++17 -O2`, imported `unsafe` by the private `Internal.Vma`, with the device-memory callbacks counting in C | The native package; its FFI audit (`ffiAllocatorImports`) |
+
+VMA itself is the copy the pinned package compiles into its library: the native
+package depends on `VulkanMemoryAllocator` for that compiled VMA alone and
+imports none of its Haskell modules. The package does not install
+`vk_mem_alloc.h`, so the shim includes the copy vendored from the same
+distribution, under exactly the configuration the package's `src/lib.cpp`
+compiles VMA with, so every structure the shim builds has the layout the
+compiled VMA reads. Both see the same Vulkan headers, the ones the native pin
+names (`/usr/include` on Linux, `/usr/local/include` on macOS).
+
+The binding is #361's recommendation (Q-19), measured in
+[the VMA qualification record](gpu_vma_qualification_record.md): an
+engine-owned shim taking scalars and one reused result record, imported
+`unsafe`, with D-40's callbacks counting in C. The Hackage package's own
+Haskell binding is not used by the engine; only the allocator probe calls it,
+and `HETOIMASIA_VMA_FOREIGN_CALLS` chooses its call safety for that probe
+alone. The allocator's configuration — externally synchronised, the backend's
+own dispatch, Vulkan 1.3, a 256 MiB large-heap block — is in
+[gpu_backend.md](gpu_backend.md#device-memory).
+
+Changing VMA's version, its flags, the header or the shim's calling shape is a
+requalification: the qualification record holds only for the configuration it
+measured.
 
 ## Running the qualification
 

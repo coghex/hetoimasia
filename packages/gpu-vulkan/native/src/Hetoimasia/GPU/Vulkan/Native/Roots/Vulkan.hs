@@ -82,6 +82,7 @@ import Hetoimasia.GPU.Vulkan.Native.Diagnostics
   , destroyCaptureMessenger
   , destroyInstanceQuiesced
   )
+import Hetoimasia.GPU.Vulkan.Native.Allocator.Vulkan (vmaAllocatorOps)
 import Hetoimasia.GPU.Vulkan.Native.Naming (Instrumentation (..), objectTypeCode)
 import Hetoimasia.GPU.Vulkan.Native.Profile
   ( DeviceOffer (..)
@@ -141,6 +142,7 @@ vulkanRootOps capture =
     , opsDeviceOffers = deviceOffers
     , opsCreateDevice = \_ plan → createDevice plan.planDevice (deviceCreateInfo plan) Nothing
     , opsDestroyDevice = \device → destroyDevice device Nothing
+    , opsCreateAllocator = \created plan device → vmaAllocatorOps created plan.planDevice device
     , opsSurfaceSupport = \_ physical family surface →
         getPhysicalDeviceSurfaceSupportKHR physical family (SurfaceKHR surface)
     , opsDeviceLoss = isDeviceLoss

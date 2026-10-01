@@ -54,6 +54,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , checkpointed
   , liveNative
   , destroyNative
+  , readbackBuffer
   , batchHeld
   , modelEdit
   , modelAnswer
@@ -87,7 +88,9 @@ import Hetoimasia.GPU.Model.Identity
   , TargetId
   , resourceSession
   )
+import Hetoimasia.GPU.Vulkan.Native.Allocator (BufferMemory (memoryAllocation), MemoryUsage)
 import Hetoimasia.GPU.Vulkan.Native.Generations (Generations)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Allocation (AllocatedBuffer (..), freeBuffer)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer (ReadbackAllocation (..), RecordingOps (..))
 import Hetoimasia.GPU.Vulkan.Native.Roots (Checkpoint (..), Roots, TerminalCause, checkpointRoots, rootsCall, rootsSessionIdentity, stateRootsModel)
 
@@ -208,6 +211,9 @@ data Refusal
   | RefusedInUse
     -- ^ A batch or a submission still holds what would be changed in place.
   | RefusedWrongKind
+  | RefusedNoMemoryType !MemoryUsage
+    -- ^ No memory type the resource allows serves its usage; nothing was
+    -- allocated in another type instead.
   | RefusedSessionFailed !TerminalCause
     -- ^ The session has failed, and this is its primary failure: no new
     -- rendering, acquisition, submission or presentation is admitted.
@@ -304,7 +310,7 @@ readManaged recording =
             NativeLayout handle → ("pipeline layout", [handle])
             NativePipeline handle _ _ → ("pipeline", [handle])
             NativeStorage _ _ pool _ → ("frame storage", [pool])
-            NativeReadback allocation _ → ("readback", [allocationBuffer allocation, allocationMemory allocation])
+            NativeReadback allocation _ → ("readback", [allocationBuffer allocation, memoryAllocation (allocationMemory allocation)])
        in ManagedView resource (managedStanding record) kind handles
 
 data BatchView = BatchView
@@ -397,13 +403,18 @@ editManaged recording resource edit = modifyTVar' (recordingManaged recording) (
 editBatch ∷ Recording q inst msgr phys dev cmd → BatchId → (BatchRecord → BatchRecord) → STM ()
 editBatch recording batch edit = modifyTVar' (recordingBatches recording) (Map.adjust edit batch)
 
+-- | A readback buffer's allocation, as the allocation protocol frees, flushes
+-- and names it: always mapped.
+readbackBuffer ∷ ReadbackAllocation → AllocatedBuffer
+readbackBuffer allocation = AllocatedBuffer (allocationMemory allocation) (allocationCoherent allocation) (Just (allocationMapped allocation))
+
 -- | Destroy one managed generation's native objects.
 destroyNative ∷ Recording q inst msgr phys dev cmd → dev → NativeResource cmd → IO ()
 destroyNative recording device = \case
   NativeLayout handle → rootsCall roots "vkDestroyPipelineLayout" (opsDestroyPipelineLayout ops device handle)
   NativePipeline handle _ _ → rootsCall roots "vkDestroyPipeline" (opsDestroyPipeline ops device handle)
   NativeStorage _ _ pool _ → rootsCall roots "vkDestroyCommandPool" (opsDestroyStorage ops device pool)
-  NativeReadback allocation _ → rootsCall roots "vkDestroyBuffer" (opsDestroyReadback ops device allocation)
+  NativeReadback allocation _ → freeBuffer roots (readbackBuffer allocation)
   where
     roots = recordingRoots recording
     ops = recordingOps recording

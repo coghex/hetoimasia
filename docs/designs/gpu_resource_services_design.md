@@ -961,8 +961,10 @@ runs recommend the engine-owned shim, imported with unsafe calls, with D-40's
 callbacks counting in C: the only configuration that met every accepted
 limit, in both binding variants' runs. The Hackage binding missed in both its
 variants, and safe calls missed through either
-([the VMA qualification record](../gpu_vma_qualification_record.md)). The
-question stays open until the owner adopts a binding. Candidates:
+([the VMA qualification record](../gpu_vma_qualification_record.md)).
+Resolved by #333 (GRS-11), whose requirement 1 adopts that recommendation: the
+production binding is the engine's own shim, recorded in
+[the toolchain record](../toolchain.md#vma). The candidates were:
 
 - the Hackage `VulkanMemoryAllocator` binding, which bundles VMA 3.3.0, makes
   unsafe foreign calls unless its `safe-foreign-calls` flag is set, and needs

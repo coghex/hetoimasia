@@ -21,13 +21,11 @@ module Hetoimasia.GPU.Vulkan.Native.Recording.Vulkan
 import Control.Exception (onException)
 import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Unsafe as Unsafe
-import Data.Bits ((.&.), (.|.))
-import Data.List (find)
+import Data.Bits ((.|.))
 import qualified Data.Vector as Vector
-import Data.Word (Word32, Word64)
+import Data.Word (Word64)
 import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (Ptr, WordPtr (..), castPtr, plusPtr, ptrToWordPtr, wordPtrToPtr)
-import Numeric.Natural (Natural)
 import Vulkan.CStruct.Extends (SomeStruct (..))
 import Vulkan.Core10 hiding (ImageLayout, Viewport (..))
 import qualified Vulkan.Core10 as Core10
@@ -61,13 +59,13 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   )
 
 
--- | The recording's native layer for the session's physical device, whose
--- memory types and non-coherent atom size it reads once.
+-- | The recording's native layer for the session's physical device. A
+-- readback buffer's memory, its mapping and its maintenance are the device
+-- allocator's ("Hetoimasia.GPU.Vulkan.Native.Allocator.Vulkan"); this layer
+-- only copies bytes through the mapping it is handed, and reads nothing of the
+-- physical device itself.
 vulkanRecordingOps ∷ PhysicalDevice → IO (RecordingOps Device CommandBuffer)
-vulkanRecordingOps physical = do
-  memory ← getPhysicalDeviceMemoryProperties physical
-  properties ← getPhysicalDeviceProperties physical
-  let atom = fromIntegral properties.limits.nonCoherentAtomSize
+vulkanRecordingOps _ =
   pure
     RecordingOps
       { opsCreatePipelineLayout = \device →
@@ -90,13 +88,6 @@ vulkanRecordingOps physical = do
               fail "the pool allocated no command buffer"
       , opsResetStorage = \device pool → resetCommandPool device (CommandPool pool) zero
       , opsDestroyStorage = \device pool → destroyCommandPool device (CommandPool pool) Nothing
-      , opsCreateReadback = createReadback' memory atom
-      , opsDestroyReadback = \device allocation → do
-          unmapMemory device (DeviceMemory allocation.allocationMemory)
-          destroyBuffer device (Buffer allocation.allocationBuffer) Nothing
-          freeMemory device (DeviceMemory allocation.allocationMemory) Nothing
-      , opsInvalidate = \device allocation range → invalidateMappedMemoryRanges device (Vector.singleton (mappedRangeOf allocation range))
-      , opsFlush = \device allocation range → flushMappedMemoryRanges device (Vector.singleton (mappedRangeOf allocation range))
       , opsReadMapped = \allocation offset size →
           ByteString.packCStringLen (castPtr (mapped allocation `plusPtr` fromIntegral offset), fromIntegral size)
       , opsWriteMapped = \allocation offset bytes →
@@ -111,10 +102,6 @@ vulkanRecordingOps physical = do
 
 mapped ∷ ReadbackAllocation → Ptr ()
 mapped allocation = wordPtrToPtr (WordPtr (fromIntegral allocation.allocationMapped))
-
-mappedRangeOf ∷ ReadbackAllocation → (Natural, Natural) → MappedMemoryRange
-mappedRangeOf allocation (offset, size) =
-  MappedMemoryRange {memory = DeviceMemory allocation.allocationMemory, offset = fromIntegral offset, size = fromIntegral size}
 
 -- | A pipeline for dynamic rendering into one color format: its two shader
 -- modules are made, named, used and destroyed here.
@@ -206,47 +193,6 @@ createPipeline' device request name = do
   case Vector.toList (snd created) of
     [Pipeline handle] → pure handle
     _ → fail "the device created no pipeline"
-
--- | A transfer-destination buffer in host-visible memory — cached where the
--- device offers it, which is where a read-back is fast and where memory is
--- most often not coherent — bound, and mapped whole for its lifetime.
-createReadback' ∷ PhysicalDeviceMemoryProperties → Natural → Device → Natural → IO ReadbackAllocation
-createReadback' memory atom device bytes = do
-  Buffer buffer ←
-    createBuffer
-      device
-      BufferCreateInfo {next = (), flags = zero, size = fromIntegral bytes, usage = BUFFER_USAGE_TRANSFER_DST_BIT, sharingMode = SHARING_MODE_EXCLUSIVE, queueFamilyIndices = Vector.empty}
-      Nothing
-  -- Every step after the buffer exists destroys what it made before raising,
-  -- since the caller learns no handle unless this returns.
-  let destroyedBuffer = destroyBuffer device (Buffer buffer) Nothing
-  requirements ← getBufferMemoryRequirements device (Buffer buffer) `onException` destroyedBuffer
-  let types = zip [0 ∷ Word32 ..] (Vector.toList memory.memoryTypes)
-      allowed index = requirements.memoryTypeBits .&. (2 ^ index) /= 0
-      offers flags (index, kind) = allowed index && kind.propertyFlags .&. flags == flags && index < memory.memoryTypeCount
-      chosen =
-        find (offers (MEMORY_PROPERTY_HOST_VISIBLE_BIT .|. MEMORY_PROPERTY_HOST_CACHED_BIT)) types
-          `orElse` find (offers MEMORY_PROPERTY_HOST_VISIBLE_BIT) types
-  (index, kind) ← maybe (destroyedBuffer >> fail "no host-visible memory type can back the readback buffer") pure chosen
-  DeviceMemory allocated ←
-    allocateMemory device MemoryAllocateInfo {next = (), allocationSize = requirements.size, memoryTypeIndex = index} Nothing
-      `onException` destroyedBuffer
-  let released = freeMemory device (DeviceMemory allocated) Nothing >> destroyedBuffer
-  bindBufferMemory device (Buffer buffer) (DeviceMemory allocated) 0 `onException` released
-  pointer ← mapMemory device (DeviceMemory allocated) 0 WHOLE_SIZE zero `onException` released
-  pure
-    ReadbackAllocation
-      { allocationBuffer = buffer
-      , allocationMemory = allocated
-      , allocationSize = bytes
-      , allocationMemorySize = fromIntegral requirements.size
-      , allocationCoherent = kind.propertyFlags .&. MEMORY_PROPERTY_HOST_COHERENT_BIT /= zero
-      , allocationAtom = atom
-      , allocationMapped = fromIntegral (ptrToWordPtr pointer)
-      }
-  where
-    orElse (Just found) _ = Just found
-    orElse Nothing other = other
 
 -- | The stages and accesses each supported image transition synchronizes: the
 -- source scope, then the destination scope. Entering rendering waits on the

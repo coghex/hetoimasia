@@ -62,7 +62,8 @@ import Hetoimasia.GPU.Vulkan.Native.Roots
   )
 import Test.GPU.Vulkan.Native.FramesRig
 import Test.GPU.Vulkan.Native.FramesStandIn
-import Test.GPU.Vulkan.Native.RecordingStandIn (RecordingCall (..), RecordingStandIn, RecordingStep (..), onceAt, outOfMemoryAt, recordingCalls)
+import Hetoimasia.GPU.Vulkan.Native.Allocator (Placement (..))
+import Test.GPU.Vulkan.Native.AllocatorStandIn (AllocatorCall (..), AllocatorStandIn, allocatorCalls, allocatorOutOfMemory, duringAllocating, standInBlockSize)
 import qualified Test.GPU.Vulkan.Native.StandIn as Roots
 
 spec ∷ Spec
@@ -72,7 +73,7 @@ spec = describe "Allocation recovery" $ do
       (rig, recording) ← rigWithRecording 1
       old ← retiredEligible rig (rigTarget rig)
       oldSwapchain ← swapchainOf rig old
-      outOfMemoryAt recording AtCreateReadback 1
+      allocatorOutOfMemory recording 1
       created ← createReadback (rigRecording rig) 1024
       either (\refusal → expectationFailure ("refused: " <> show refusal)) (const (pure ())) created
       readbacks recording `shouldReturn` 2
@@ -86,7 +87,7 @@ spec = describe "Allocation recovery" $ do
     it "does not retry without reclamation progress, and reports the original failure with the pass's evidence" $ do
       (rig, recording) ← rigWithRecording 1
       before ← usageObjects . usage <$> modelOf rig
-      outOfMemoryAt recording AtCreateReadback 1
+      allocatorOutOfMemory recording 1
       failure ← notRecovered (createReadback (rigRecording rig) 1024)
       notRecoveredEnd failure `shouldBe` RetryRefused RetryWithoutReclamation
       notRecoveredDisposed failure `shouldBe` []
@@ -99,7 +100,7 @@ spec = describe "Allocation recovery" $ do
     it "ends the recovery at a second failure, with one retry made" $ do
       (rig, recording) ← rigWithRecording 1
       _ ← retiredEligible rig (rigTarget rig)
-      outOfMemoryAt recording AtCreateReadback 2
+      allocatorOutOfMemory recording 2
       failure ← notRecovered (createReadback (rigRecording rig) 1024)
       notRecoveredEnd failure `shouldSatisfy` \case
         RetryFailedAgain _ → True
@@ -122,7 +123,7 @@ spec = describe "Allocation recovery" $ do
       before ← usage <$> modelOf rig
       atRetry ← retryRaising rig recording (throwIO (Roots.StandInLoss Roots.AtFrameCall))
       loss ← raisedBy (createReadback (rigRecording rig) readbackBytes)
-      lostDuring loss `shouldBe` "vkCreateBuffer"
+      lostDuring loss `shouldBe` "vmaCreateBuffer"
       reportDeviceLost <$> atomically (readRootsTerminal (rigRoots rig)) `shouldReturn` Just loss
       deviceLossObserved <$> modelOf rig `shouldReturn` True
       atRetry >>= givenBack rig before
@@ -148,7 +149,7 @@ spec = describe "Allocation recovery" $ do
       before ← usage <$> modelOf rig
       gate ← newTVarIO False
       Roots.script (rigRootsStandIn rig) Roots.AtDestroySwapchain (Roots.WaitsInterruptibly gate)
-      outOfMemoryAt recording AtCreateReadback 1
+      allocatorOutOfMemory recording 1
       owner ← myThreadId
       _ ← forkIO (Roots.awaitCall (rigRootsStandIn rig) (Roots.DestroyedSwapchain oldSwapchain) >> killThread owner >> atomically (writeTVar gate True))
       raisedBy (createReadback (rigRecording rig) readbackBytes) `shouldReturn` ThreadKilled
@@ -164,7 +165,7 @@ spec = describe "Allocation recovery" $ do
       -- The first generation's destruction returns; the second's swapchain
       -- destruction raises.
       Roots.script (rigRootsStandIn rig) Roots.AtDestroySwapchain (Roots.SucceedsThenFails 1)
-      outOfMemoryAt recording AtCreateReadback 1
+      allocatorOutOfMemory recording 1
       failure ← notRecovered (createReadback (rigRecording rig) 1024)
       notRecoveredDisposed failure `shouldBe` [GenerationSubject firstOld]
       notRecoveredFailed failure `shouldBe` [GenerationSubject secondOld]
@@ -180,13 +181,13 @@ spec = describe "Allocation recovery" $ do
       _ ← retiredEligible rig second
       -- The window holds one record: the first target's active generation,
       -- which is not eligible. Examining it is not progress.
-      outOfMemoryAt recording AtCreateReadback 1
+      allocatorOutOfMemory recording 1
       failure ← notRecovered (createReadback (rigRecording rig) 1024)
       notRecoveredExamined failure `shouldBe` 1
       notRecoveredEnd failure `shouldBe` RetryRefused RetryWithoutReclamation
       -- The next failure's pass starts where that one stopped, and reaches
       -- the second target's retired generation.
-      outOfMemoryAt recording AtCreateReadback 1
+      allocatorOutOfMemory recording 1
       again ← createReadback (rigRecording rig) 1024
       either (\refusal → expectationFailure ("refused: " <> show refusal)) (const (pure ())) again
       readbacks recording `shouldReturn` 3
@@ -353,14 +354,14 @@ spec = describe "Allocation recovery" $ do
 -- ---------------------------------------------------------------------------
 -- Helpers
 
--- | A frames rig of this many targets, and its recording's stand-in.
-rigWithRecording ∷ Int → IO (Rig, RecordingStandIn)
+-- | A frames rig of this many targets, and its device's stand-in allocator.
+rigWithRecording ∷ Int → IO (Rig, AllocatorStandIn)
 rigWithRecording count = rigWithRecordingOver count defaultBudgetRequest
 
-rigWithRecordingOver ∷ Int → BudgetRequest → IO (Rig, RecordingStandIn)
+rigWithRecordingOver ∷ Int → BudgetRequest → IO (Rig, AllocatorStandIn)
 rigWithRecordingOver count request = do
   rig ← newRigOver count request
-  pure (rig, rigRecordingStandIn rig)
+  pure (rig, Roots.standAllocator (rigRootsStandIn rig))
 
 -- | 'retiredEligible' for several targets at once, in one step, so no step's
 -- disposal runs between them.
@@ -395,20 +396,25 @@ geometryAt ∷ Word32 → Word32 → TargetGeometry
 geometryAt width height = TargetGeometry (Right ()) (Just (SurfaceExtent width height)) Nothing 1
 
 -- | The readback every construction example makes, and the accounting its
--- construction reserves: its bytes, and its buffer and memory.
-readbackBytes, readbackObjects ∷ Natural
+-- construction reserves: no bytes of its own, its buffer and allocation, and,
+-- for the allocating call, the most it could open — a stand-in block.
+readbackBytes, readbackObjects, readbackReservation ∷ Natural
 readbackBytes = 1024
 readbackObjects = 2
+readbackReservation = standInBlockSize
 
--- | Have the readback creation answer out of memory, and its one retry run
--- this — which raises — once it has read the model's usage: the attempt still
--- reserved, and whatever the reclamation pass released already gone. Answers
--- that usage, once the retry has run.
-retryRaising ∷ Rig → RecordingStandIn → IO () → IO (IO Usage)
+-- | Have the readback's allocating call answer out of memory, and its one
+-- retry's allocating call run this — which raises — once it has read the
+-- model's usage: the attempt and its memory reservation still held, and
+-- whatever the reclamation pass released already gone. Answers that usage,
+-- once the retry has run.
+retryRaising ∷ Rig → AllocatorStandIn → IO () → IO (IO Usage)
 retryRaising rig recording raise = do
   seen ← newIORef Nothing
-  outOfMemoryAt recording AtCreateReadback 1
-  onceAt recording AtCreateReadback (modelOf rig >>= writeIORef seen . Just . usage >> raise)
+  allocatorOutOfMemory recording 1
+  -- The first allocating call answers out of memory after installing the
+  -- action for the next, which is the retry's.
+  duringAllocating recording (duringAllocating recording (modelOf rig >>= writeIORef seen . Just . usage >> raise))
   pure (readIORef seen >>= maybe (fail "the retry was never made") pure)
 
 -- | The failed construction left no attempt behind and gave its reservation
@@ -417,7 +423,7 @@ retryRaising rig recording raise = do
 givenBack ∷ Rig → Usage → Usage → IO ()
 givenBack rig before atRetry = do
   after ← usage <$> modelOf rig
-  let releasedBytes = usageBytes before + readbackBytes - usageBytes atRetry
+  let releasedBytes = usageBytes before + readbackReservation - usageBytes atRetry
       releasedObjects = usageObjects before + readbackObjects - usageObjects atRetry
   releasedObjects `shouldSatisfy` (> 0)
   usageAllocations after `shouldBe` usageAllocations before
@@ -432,9 +438,9 @@ raisedBy action =
       expectationFailure ("nothing was raised: " <> show value)
       fail "unreachable"
 
--- | How many readbacks the recording asked the native layer for.
-readbacks ∷ RecordingStandIn → IO Int
-readbacks recording = length . filter (\case CreatedReadback {} → True; _ → False) <$> recordingCalls recording
+-- | How many allocating calls the readback creations made.
+readbacks ∷ AllocatorStandIn → IO Int
+readbacks recording = length . filter (\case Placing _ _ MayOpenMemory → True; _ → False) <$> allocatorCalls recording
 
 -- | Every swapchain the roots' stand-in destroyed, oldest first.
 destroyedSwapchains ∷ Rig → IO [Word64]

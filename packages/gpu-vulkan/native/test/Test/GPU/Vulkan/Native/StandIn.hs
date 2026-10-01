@@ -90,6 +90,7 @@ import Hetoimasia.GPU.Vulkan.Native.Roots
   , newRoots
   )
 import qualified Data.Text.Encoding as Encoding
+import Test.GPU.Vulkan.Native.AllocatorStandIn (AllocatorStandIn, StandInResult (..), allocatorStandInOps, newAllocatorStandIn)
 
 -- | One native call the roots made, in the order they made it.
 data Call
@@ -101,6 +102,8 @@ data Call
     -- ^ The devices were enumerated for a surface-free bootstrap, which asks
     -- no family about presentation.
   | CreatedDevice !Text !Word32
+  | CreatedAllocator
+    -- ^ The device's allocator: the stand-in allocator ('standAllocator').
   | QueriedSupport !Word64
   | DestroyedSurface !Word64
   | DestroyedDevice
@@ -128,6 +131,7 @@ data Step
   | AtCreateMessenger
   | AtQueryDevices
   | AtCreateDevice
+  | AtCreateAllocator
   | AtSupport
   | AtDestroyDevice
   | AtDestroyMessenger
@@ -178,13 +182,6 @@ newtype StandInLoss = StandInLoss Step
 
 instance Exception StandInLoss
 
--- | A native result recovery acts on, raised at a step — named, so another
--- layer's stand-in can raise it too.
-data StandInResult = StandInResult !Text !NativeFailure
-  deriving (Eq, Show)
-
-instance Exception StandInResult
-
 data StandIn = StandIn
   { standCalls ∷ !(TVar [Call])
     -- ^ Newest first.
@@ -201,6 +198,8 @@ data StandIn = StandIn
     -- ^ Whether the device offers naming; off unless an example turns it on.
   , standNameFails ∷ !(TVar [NativeObjectKind])
     -- ^ Kinds whose naming raises 'NamingFailure'.
+  , standAllocator ∷ !AllocatorStandIn
+    -- ^ The allocator every device of this stand-in is given.
   }
 
 newStandIn ∷ IO StandIn
@@ -214,6 +213,7 @@ newStandIn = do
     <*> newTVarIO 100
     <*> newTVarIO False
     <*> newTVarIO []
+    <*> newAllocatorStandIn
 
 -- | A surface that supplies a concrete 640 by 480 extent and offers the
 -- profile's BGRA sRGB format, FIFO, color attachment and opaque composition,
@@ -378,6 +378,7 @@ standInOps standIn =
           ]
     , opsCreateDevice = \_ plan → 3 <$ step standIn AtCreateDevice (CreatedDevice (planDeviceName plan) (planQueueFamily plan))
     , opsDestroyDevice = \_ → step standIn AtDestroyDevice DestroyedDevice
+    , opsCreateAllocator = \_ _ _ → allocatorStandInOps (standAllocator standIn) <$ step standIn AtCreateAllocator CreatedAllocator
     , opsSurfaceSupport = \_ _ _ surface → do
         step standIn AtSupport (QueriedSupport surface)
         pure (surface /= unsupportedSurface)

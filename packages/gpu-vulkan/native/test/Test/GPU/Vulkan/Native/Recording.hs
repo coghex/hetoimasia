@@ -10,7 +10,7 @@ module Test.GPU.Vulkan.Native.Recording (spec) where
 
 import Control.Concurrent (forkIO, killThread, myThreadId)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Concurrent.STM (atomically, writeTVar)
+import Control.Concurrent.STM (atomically)
 import Control.Exception (ErrorCall (ErrorCall), SomeException, throwIO, try)
 import Control.Monad (void)
 import qualified Data.ByteString as ByteString
@@ -77,16 +77,24 @@ import Hetoimasia.GPU.Vulkan.Native.Naming
   , pipelineLayoutName
   , pipelineName
   , readbackBufferName
-  , readbackMemoryName
   , shaderModuleName
   )
 import Hetoimasia.GPU.Vulkan.Native.Presentation
 import Hetoimasia.GPU.Vulkan.Native.Recording
 import Hetoimasia.GPU.Vulkan.Native.Roots
+import Test.GPU.Vulkan.Native.AllocatorStandIn
+  ( AllocatorCall (..)
+  , AllocatorFailure (..)
+  , AllocatorStandIn
+  , AllocatorStep (..)
+  , allocatorCalls
+  , failAllocatorAt
+  , nonCoherentReadback
+  )
 import Test.GPU.Vulkan.Native.RecordingStandIn
 import Test.GPU.Vulkan.Native.StandIn
   ( NamingFailure (..)
-  , StandIn
+  , StandIn (standAllocator)
   , StandInRoots
   , failNaming
   , namesGiven
@@ -505,13 +513,6 @@ spec = describe "Recording" $ do
         Right () → expectationFailure "retirement claimed resources a batch still holds"
 
   describe "readback" $ do
-    it "computes the atom-aligned mapped range, clamped to the memory" $ do
-      mappedRange 64 256 0 256 `shouldBe` (0, 256)
-      mappedRange 64 256 10 20 `shouldBe` (0, 64)
-      mappedRange 64 256 70 100 `shouldBe` (64, 128)
-      mappedRange 64 250 200 50 `shouldBe` (192, 58)
-      mappedRange 1 100 3 4 `shouldBe` (3, 4)
-
     it "refuses a transfer-source transition or a copy of an image its generation did not make a transfer source, before recording either" $ do
       rig ← newRig
       _ ← newKit rig
@@ -543,24 +544,27 @@ spec = describe "Recording" $ do
       readIORef answers `shouldReturn` [Left (RefusedOutOfBounds (640 * 480 * 4) 1024)]
       nativeOf rig `shouldReturn'` \calls → [() | Recorded _ (CommandCopyImageToBuffer {}) ← calls] `shouldBe` []
 
-    it "exposes non-coherent bytes only after the copying batch's submission completed, invalidating the aligned range first" $ do
+    it "exposes non-coherent bytes only after the copying batch's submission completed, invalidating the bytes read first" $ do
       rig ← newCapturingRig
       kit ← newKit rig
-      atomically (writeTVar (recordingCoherent (rigRecording' rig)) False)
+      nonCoherentReadback (allocatorOf rig)
       let bytes = 640 * 480 * 4
       readback ← created (createReadback (rigRecording rig) bytes)
-      -- A sentinel from the host is flushed over the whole aligned buffer.
+      allocation ← allocationOf rig
+      -- A sentinel from the host is flushed over the whole buffer, as a range
+      -- of its own allocation the allocator aligns.
       ok (fillReadback (rigRecording rig) readback 0xAB)
-      nativeOf rig `shouldReturn'` \calls → last calls `shouldBe` Flushed (0, standInMemorySize bytes)
+      last <$> allocatorCalls (allocatorOf rig) `shouldReturn` Flushed allocation (0, bytes)
       frame ← acquired rig
       (batch, ()) ← recorded rig frame $ \recorder → do
         drawTriangle recorder kit
         ok (transitionImage recorder LayoutColorAttachment LayoutTransferSource)
         ok (copyToReadback recorder readback)
+      buffer ← bufferOf rig
       nativeOf rig `shouldReturn'` \calls →
         [command | Recorded _ command ← calls, isCopyOrHostBarrier command]
-          `shouldBe` [ CommandCopyImageToBuffer (kitImage kit) (SurfaceExtent 640 480) (bufferOf calls)
-                     , CommandHostReadBarrier (bufferOf calls) (fromIntegral bytes)
+          `shouldBe` [ CommandCopyImageToBuffer (kitImage kit) (SurfaceExtent 640 480) buffer
+                     , CommandHostReadBarrier buffer (fromIntegral bytes)
                      ]
       -- Recorded, not submitted: no bytes, and no host write either.
       readReadback (rigRecording rig) readback 0 16 `shouldReturn` Left (RefusedNotWritten "a batch or a submission still holds the buffer")
@@ -571,14 +575,17 @@ spec = describe "Recording" $ do
       readReadback (rigRecording rig) readback 0 16 `shouldReturn` Left (RefusedNotWritten "a batch or a submission still holds the buffer")
       completeInModel rig submission
       before ← nativeCount rig
+      allocatorBefore ← length <$> allocatorCalls (allocatorOf rig)
       readReadback (rigRecording rig) readback 100 16 `shouldReturn` Right (ByteString.replicate 16 0xAB)
-      calls ← drop before <$> nativeCalls' rig
-      calls `shouldBe` [Invalidated (64, 64), ReadMapped 100 16]
+      drop before <$> nativeCalls' rig `shouldReturn` [ReadMapped 100 16]
+      drop allocatorBefore <$> allocatorCalls (allocatorOf rig) `shouldReturn` [Invalidated allocation (100, 16)]
       readReadback (rigRecording rig) readback (bytes - 8) 16 `shouldReturn` Left (RefusedOutOfBounds (bytes + 8) bytes)
       -- An empty read reads nothing and invalidates nothing.
       empty ← nativeCount rig
+      allocatorEmpty ← length <$> allocatorCalls (allocatorOf rig)
       readReadback (rigRecording rig) readback 0 0 `shouldReturn` Right ByteString.empty
       nativeCount rig `shouldReturn` empty
+      length <$> allocatorCalls (allocatorOf rig) `shouldReturn` allocatorEmpty
 
     it "forgets what a discarded copy would have written, and reads coherent memory without invalidating it" $ do
       rig ← newCapturingRig
@@ -593,8 +600,10 @@ spec = describe "Recording" $ do
       readReadback (rigRecording rig) readback 0 4 `shouldReturn` Left (RefusedNotWritten "nothing has written the buffer")
       ok (fillReadback (rigRecording rig) readback 7)
       before ← nativeCount rig
+      allocatorBefore ← length <$> allocatorCalls (allocatorOf rig)
       readReadback (rigRecording rig) readback 0 4 `shouldReturn` Right (ByteString.replicate 4 7)
       drop before <$> nativeCalls' rig `shouldReturn` [ReadMapped 0 4]
+      drop allocatorBefore <$> allocatorCalls (allocatorOf rig) `shouldReturn` []
       -- Released, it is read no more.
       ok (releaseManaged (rigRecording rig) readback)
       readReadback (rigRecording rig) readback 0 4 `shouldReturn` Left (RefusedMisuse (WrongPhase ResourceIdentity))
@@ -724,15 +733,37 @@ spec = describe "Recording" $ do
       nativeCount rig `shouldReturn` before
       fmap viewBatchStanding <$> atomically (readBatch (rigRecording rig) batch) `shouldReturn` Just (BatchSubmitted submitted)
 
+    it "frees a readback's allocation only once completion evidence ends its submitted use, the buffer before its memory" $ do
+      rig ← newCapturingRig
+      kit ← newKit rig
+      readback ← created (createReadback (rigRecording rig) (640 * 480 * 4))
+      allocation ← allocationOf rig
+      frame ← acquired rig
+      (batch, ()) ← recorded rig frame $ \recorder → do
+        drawTriangle recorder kit
+        ok (transitionImage recorder LayoutColorAttachment LayoutTransferSource)
+        ok (copyToReadback recorder readback)
+      submission@(SubmissionIdOf submitted) ← submitInModel rig frame
+      ok (noteBatchSubmitted (rigRecording rig) batch submitted)
+      ok (releaseManaged (rigRecording rig) readback)
+      -- Released, but the submission still uses it: nothing is freed.
+      dispose rig >>= (`shouldSatisfy` notElem (managedResource readback))
+      allocatorCalls (allocatorOf rig) >>= \journal → [() | FreedAllocation _ ← journal] `shouldBe` []
+      completeInModel rig submission
+      dispose rig >>= (`shouldContain` [managedResource readback])
+      buffer ← bufferOf rig
+      teardown ← filter (\case Unmapped _ → True; DestroyedBuffer _ → True; FreedAllocation _ → True; _ → False) <$> allocatorCalls (allocatorOf rig)
+      teardown `shouldBe` [Unmapped allocation, DestroyedBuffer buffer, FreedAllocation allocation]
+
     it "exposes nothing a fill changed if its flush raised, whatever the buffer held before" $ do
       rig ← newCapturingRig
-      atomically (writeTVar (recordingCoherent (rigRecording' rig)) False)
+      nonCoherentReadback (allocatorOf rig)
       readback ← created (createReadback (rigRecording rig) 1024)
       ok (fillReadback (rigRecording rig) readback 1)
       readReadback (rigRecording rig) readback 0 4 `shouldReturn` Right (ByteString.replicate 4 1)
-      failAt (rigRecording' rig) AtFlush
-      raised ← try @RecordingFailure (fillReadback (rigRecording rig) readback 2)
-      fmap (const ()) raised `shouldBe` Left (RecordingFailure AtFlush)
+      failAllocatorAt (allocatorOf rig) AtFlush
+      raised ← try @AllocatorFailure (fillReadback (rigRecording rig) readback 2)
+      fmap (const ()) raised `shouldBe` Left (AllocatorFailure AtFlush)
       readReadback (rigRecording rig) readback 0 4 `shouldReturn` Left (RefusedNotWritten "nothing has written the buffer")
 
   describe "names" $ do
@@ -747,6 +778,7 @@ spec = describe "Recording" $ do
           pipelineNative = last [handle | CreatedPipeline handle _ _ ← calls]
           (pool, buffer) = last [(created', commands) | CreatedStorage created' commands ← calls]
       [readbackHandles] ← map viewNativeHandles . filter ((== managedResource readback) . viewResource) <$> atomically (readManaged (rigRecording rig))
+      allocation ← allocationOf rig
       namesGiven (rigStandIn rig)
         `shouldReturn` [ (ObjectPipelineLayout, layoutNative, pipelineLayoutName (managedResource layout))
                        , -- The stand-in numbers the modules just before the pipeline.
@@ -756,8 +788,12 @@ spec = describe "Recording" $ do
                        , (ObjectCommandPool, pool, commandPoolName (managedResource storage) (rigTarget rig) 0)
                        , (ObjectCommandBuffer, buffer, commandBufferName (managedResource storage) (rigTarget rig) 0)
                        , (ObjectBuffer, firstOr 0 readbackHandles, readbackBufferName (managedResource readback))
-                       , (ObjectDeviceMemory, lastOr 0 readbackHandles, readbackMemoryName (managedResource readback))
                        ]
+      -- The readback's allocation is named inside the allocator, and the
+      -- device memory it lies in, which others may share, is named nowhere.
+      lastOr 0 readbackHandles `shouldBe` allocation
+      allocatorNames ← allocatorCalls (allocatorOf rig)
+      [(handle, name) | NamedAllocation handle name ← allocatorNames] `shouldBe` [(allocation, readbackBufferName (managedResource readback))]
 
     it "fails a pipeline whose shader module could not be named: nothing is created or managed, and the reservation is given back" $ do
       rig ← newNamingRig
@@ -905,15 +941,16 @@ spec = describe "Recording" $ do
       ok (discardBatch (rigRecording rig) (viewBatch view))
 
   describe "the FFI audit" $
-    it "declares a genuine unsafe import for exactly the recording subset the configuration records, and for nothing else" $ do
+    it "declares a genuine unsafe import for exactly the recording subset and the allocator shim the configuration records, and for nothing else" $ do
       sources ← haskellSources "src"
       declarations ← concat <$> mapM (fmap unsafeDeclarations . Text.readFile) sources
-      -- Every unsafe "dynamic" import is one Vulkan entry point; the only
-      -- other unsafe declaration is the capture callback's address.
+      -- Every unsafe "dynamic" import is one Vulkan entry point; the other
+      -- unsafe declarations are the capture callback's address and the
+      -- allocator shim's entries.
       let dynamic = [name | Right name ← declarations]
           addresses = [name | Left name ← declarations]
       sort dynamic `shouldBe` sort (ffiUnsafeImports nativeFfiConfiguration)
-      addresses `shouldBe` ["&hetoimasia_vulkan_capture_messenger"]
+      sort addresses `shouldBe` sort ("&hetoimasia_vulkan_capture_messenger" : ffiAllocatorImports nativeFfiConfiguration)
 
 -- ---------------------------------------------------------------------------
 -- The rig
@@ -1119,7 +1156,6 @@ isDestruction = \case
   DestroyedPipeline _ → True
   DestroyedLayout _ → True
   DestroyedStorage _ → True
-  DestroyedReadback _ → True
   _ → False
 
 isCopyOrHostBarrier ∷ NativeCommand → Bool
@@ -1128,8 +1164,14 @@ isCopyOrHostBarrier = \case
   CommandHostReadBarrier {} → True
   _ → False
 
-bufferOf ∷ [RecordingCall] → Word64
-bufferOf calls = last [buffer | CreatedReadback buffer _ _ ← calls]
+-- | The stand-in allocator every device of the rig is given.
+allocatorOf ∷ Rig → AllocatorStandIn
+allocatorOf = standAllocator . rigStandIn
+
+-- | The last buffer the allocator made, and its allocation.
+bufferOf, allocationOf ∷ Rig → IO Word64
+bufferOf rig = (\calls → last [buffer | MadeBuffer buffer _ _ ← calls]) <$> allocatorCalls (allocatorOf rig)
+allocationOf rig = (\calls → last [allocation | MadeBuffer _ allocation _ ← calls]) <$> allocatorCalls (allocatorOf rig)
 
 -- | A label command's name as 'Left', a few other commands' kinds as 'Right',
 -- and anything else as 'Nothing'.

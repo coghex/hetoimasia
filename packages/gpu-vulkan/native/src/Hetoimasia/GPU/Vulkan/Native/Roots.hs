@@ -13,8 +13,8 @@
 --
 -- = Ownership
 --
--- * The instance, the explicit messenger and the device belong to the roots,
---   for the session. No target owns the device or gates its lifetime —
+-- * The instance, the explicit messenger, the device and the device's one
+--   memory allocator belong to the roots, for the session. No target owns the device or gates its lifetime —
 --   including the bootstrap target whose surface the device was selected
 --   against — so closing the first-created window cannot release a device
 --   another target is using (D-7, P-5).
@@ -31,14 +31,22 @@
 -- Creation runs parent before child: the instance, the explicit messenger,
 -- then the device — on the first admission, against that target's surface, or,
 -- for a surface-free session, at its start ('startRootsDevice'), against no
--- surface at all. Either way it is the session's one device: a surface
+-- surface at all — and right after the device, its memory allocator
+-- ("Hetoimasia.GPU.Vulkan.Native.Allocator"), which every user of the device
+-- shares. An allocator whose creation raised is absent, the device stays
+-- recorded for retirement, and the failure is raised. Either way it is the session's one device: a surface
 -- admitted after a surface-free start is checked against the queue family
 -- already chosen, as any later target's is.
 -- Destruction runs child before parent and is refused rather than reordered:
 --
 -- 1. every target's surface ('retireRootTarget');
--- 2. the device ('retireRoots'), only once no target record remains — which a
---    session that never had a target satisfies from the start;
+-- 2. the allocator, and then the device ('retireRoots'), only once no target
+--    record remains — which a session that never had a target satisfies from
+--    the start — and the allocator only once every allocation made from it
+--    has been freed ('AllocationsRemain'). What its destruction frees — the
+--    empty blocks it still held — is released from the model's accounting
+--    then, exactly once, and a release that disagrees with what was charged
+--    fails the session;
 -- 3. the explicit messenger, and then the instance ('destroyRoots'), only once
 --    the device is gone. The messenger goes immediately before the instance,
 --    so every child's destruction still reports somewhere, and the instance's
@@ -110,6 +118,10 @@
 -- |                  |           | retirement removes; recovery|            | destroyed        | destruction that returned |
 -- |                  |           | releases and replaces a lost|            |                  |                           |
 -- |                  |           | surface in place            |            |                  |                           |
+-- +------------------+-----------+-----------------------------+------------+------------------+---------------------------+
+-- | Live allocations | The roots | The allocation protocol     | The owner  | The session      | Counts down as each       |
+-- |                  |           | counts each allocation made |            |                  | allocation is freed       |
+-- |                  |           | and freed; retirement reads |            |                  |                           |
 -- +------------------+-----------+-----------------------------+------------+------------------+---------------------------+
 -- | The model        | The roots | Admission, retirement and   | As above   | The session      | Never reset               |
 -- |                  |           | loss                        |            |                  |                           |
@@ -213,6 +225,9 @@ module Hetoimasia.GPU.Vulkan.Native.Roots
 
     -- * For the generations above the roots
   , readRootsDevice
+  , readRootsAllocator
+  , noteRootsAllocation
+  , readRootsAllocations
   , readRootsInstrumentation
   , nameRootsObject
   , rootsGenerationOps
@@ -272,7 +287,10 @@ import Hetoimasia.GPU.Model
   , closeTarget
   , escalateSession
   , escalations
+  , MemoryEffect (..)
+  , MemorySettlement (MemorySettled)
   , newGpuModel
+  , settleDeviceMemory
   , noteDeviceLoss
   , runProgressTurn
   , sessionState
@@ -289,6 +307,7 @@ import Hetoimasia.GPU.Vulkan.Native.Naming
   , queueName
   , surfaceName
   )
+import Hetoimasia.GPU.Vulkan.Native.Allocator (AllocatorOps (allocatorDestroy), MemoryEvents (..))
 import Hetoimasia.GPU.Vulkan.Native.Presentation (GenerationPlan, SurfaceOffer)
 import Hetoimasia.GPU.Vulkan.Native.Profile
   ( DevicePlan (..)
@@ -333,6 +352,9 @@ data RootOps q inst msgr phys dev = RootOps
     -- presenting.
   , opsCreateDevice ∷ inst → DevicePlan phys → IO dev
   , opsDestroyDevice ∷ dev → IO ()
+  , opsCreateAllocator ∷ inst → DevicePlan phys → dev → IO AllocatorOps
+    -- ^ The device's one memory allocator, made right after the device and
+    -- destroyed through its own 'allocatorDestroy' right before it.
   , opsSurfaceSupport ∷ inst → phys → Word32 → Word64 → IO Bool
     -- ^ Whether that queue family of that device presents to that surface.
   , opsDeviceLoss ∷ SomeException → Bool
@@ -477,6 +499,9 @@ data Roots q inst msgr phys dev = Roots
   , rootsInstance ∷ !(TVar (Root inst))
   , rootsMessenger ∷ !(TVar (Root msgr))
   , rootsDevice ∷ !(TVar (Root (Selected phys dev)))
+  , rootsAllocator ∷ !(TVar (Root AllocatorOps))
+  , rootsAllocations ∷ !(TVar Natural)
+    -- ^ How many allocations made from the allocator have not been freed.
   , rootsQuiesced ∷ !(TVar (Maybe q))
   , rootsTargets ∷ !(TVar (Map TargetId TargetRecord))
   , rootsModel ∷ !(TVar GpuModel)
@@ -520,6 +545,8 @@ newRoots ops budgets clock = do
     <$> newTVarIO Absent
     <*> newTVarIO Absent
     <*> newTVarIO Absent
+    <*> newTVarIO Absent
+    <*> newTVarIO 0
     <*> newTVarIO Nothing
     <*> newTVarIO Map.empty
     <*> newTVarIO model
@@ -629,6 +656,11 @@ data RootsRetained
   | DeviceRemains !RootStanding
     -- ^ The device is live or uncertain, so the messenger and the instance are
     -- retained.
+  | AllocationsRemain !Natural
+    -- ^ This many allocations made from the device's allocator have not been
+    -- freed, so the allocator and the device are retained.
+  | AllocatorRemains !RootStanding
+    -- ^ The allocator's destruction was uncertain, so the device is retained.
   | MessengerUncertain !Text
     -- ^ The explicit messenger's destruction raised, so the instance is
     -- retained.
@@ -640,6 +672,8 @@ instance Exception RootsRetained where
   displayException = \case
     TargetsRemain targets → "the Vulkan roots are retained: " <> show (length targets) <> " target surfaces have not verifiably been destroyed"
     DeviceRemains standing → "the Vulkan messenger and instance are retained: the device is " <> show standing
+    AllocationsRemain count → "the Vulkan device and its allocator are retained: " <> show count <> " allocations have not been freed"
+    AllocatorRemains standing → "the Vulkan device is retained: its allocator is " <> show standing
     MessengerUncertain reason → "the Vulkan instance is retained: its explicit messenger's destruction did not complete (" <> Text.unpack reason <> ")"
     InstanceUncertain reason → "the Vulkan instance's earlier destruction did not complete (" <> Text.unpack reason <> ")"
 
@@ -705,11 +739,22 @@ startRootsDevice roots = do
             Absent → do
               offers ← guarded roots "the device query" (opsDeviceOffers ops created Nothing)
               plan ← either throwIO pure (selectSurfaceFreeDevice offers)
-              _ ← creating (rootsDevice roots) (Selected plan <$> guarded roots "vkCreateDevice" (opsCreateDevice ops created plan))
+              createDevice roots created plan
               nameRoots roots
               pure (planDeviceName plan)
             _ → throwIO DeviceAlreadyStarted
     _ → throwIO RootsNotStarted
+  where
+    ops = rootsOps roots
+
+-- | Create the device and then its allocator, each recorded in the masked
+-- step that creates it. An allocator whose creation raised made nothing: it
+-- stays absent, and the device stays recorded for retirement.
+createDevice ∷ Roots q inst msgr phys dev → inst → DevicePlan phys → IO ()
+createDevice roots created plan = do
+  device ← creating (rootsDevice roots) (Selected plan <$> guarded roots "vkCreateDevice" (opsCreateDevice ops created plan))
+  _ ← creating (rootsAllocator roots) (guarded roots "vmaCreateAllocator" (opsCreateAllocator ops created plan (selectedDevice device)))
+  pure ()
   where
     ops = rootsOps roots
 
@@ -753,7 +798,7 @@ admitRootTarget roots classification surface = do
             Absent → do
               offers ← guarded roots "the device query" (opsDeviceOffers ops created (Just handle))
               plan ← either throwIO pure (selectDevice offers)
-              _ ← creating (rootsDevice roots) (Selected plan <$> guarded roots "vkCreateDevice" (opsCreateDevice ops created plan))
+              createDevice roots created plan
               admit
             _ → pure (Left TargetAdmissionClosed)
         Absent → throwIO RootsNotStarted
@@ -1474,8 +1519,35 @@ retireRoots roots = do
     Destroyed → pure "the device was already destroyed"
     Uncertain reason → throwIO (DeviceRemains (RootUncertain reason))
     Live selected → do
+      retireAllocator roots
       destroying roots (rootsDevice roots) "device" (opsDestroyDevice (rootsOps roots) (selectedDevice selected))
       pure ("destroyed the device " <> planDeviceName (selectedPlan selected) <> if lost then " after its loss" else "")
+
+-- | Destroy the device's allocator, once every allocation made from it has
+-- been freed, and release what its destruction freed from the model's
+-- accounting in the same masked step. A destruction that raised is uncertain
+-- and retains the device.
+retireAllocator ∷ Roots q inst msgr phys dev → IO ()
+retireAllocator roots =
+  readTVarIO (rootsAllocator roots) >>= \case
+    Live allocator → do
+      remaining ← readTVarIO (rootsAllocations roots)
+      when (remaining > 0) (throwIO (AllocationsRemain remaining))
+      mask_ $
+        tryWithContext (allocatorDestroy allocator) >>= \case
+          Right events → atomically $ do
+            writeTVar (rootsAllocator roots) Destroyed
+            settlement ← stateRootsModel roots $ \model → case settleDeviceMemory Nothing (MemoryEffect (eventsOpenedBytes events) (eventsFreedBytes events)) model of
+              Admitted (next, settled) → (settled, next)
+              _ → (MemorySettled, model)
+            -- What the destruction freed disagreed with what was charged: the
+            -- accounting no longer bounded the device memory, which fails the
+            -- session as any accounting defect does.
+            unless (settlement == MemorySettled) $
+              latchTerminal roots (TerminalCleanupFailed ("destroying the allocator settled " <> Text.pack (show settlement) <> " against the device memory charged"))
+          Left failure → uncertainly roots (rootsAllocator roots) "allocator" failure
+    Uncertain reason → throwIO (AllocatorRemains (RootUncertain reason))
+    _ → pure ()
 
 -- | Destroy the explicit messenger and then the instance, once the device has
 -- gone, and keep what the instance's destruction proved.
@@ -1547,6 +1619,7 @@ data RootsView = RootsView
   { viewInstance ∷ !RootStanding
   , viewMessenger ∷ !RootStanding
   , viewDevice ∷ !RootStanding
+  , viewAllocator ∷ !RootStanding
   , viewDeviceName ∷ !(Maybe Text)
   , viewQueueFamily ∷ !(Maybe Word32)
   , viewTargets ∷ ![TargetId]
@@ -1560,6 +1633,7 @@ readRootsView roots = do
   instanceRoot ← readTVar (rootsInstance roots)
   messenger ← readTVar (rootsMessenger roots)
   device ← readTVar (rootsDevice roots)
+  allocator ← readTVar (rootsAllocator roots)
   targets ← readTVar (rootsTargets roots)
   admitting ← readTVar (rootsAdmitting roots)
   loss ← readTVar (rootsLoss roots)
@@ -1571,6 +1645,7 @@ readRootsView roots = do
       { viewInstance = standingOf instanceRoot
       , viewMessenger = standingOf messenger
       , viewDevice = standingOf device
+      , viewAllocator = standingOf allocator
       , viewDeviceName = planDeviceName <$> plan
       , viewQueueFamily = planQueueFamily <$> plan
       , viewTargets = Map.keys targets
@@ -1607,6 +1682,22 @@ readRootsDevice roots =
   readTVar (rootsDevice roots) >>= \case
     Live selected → pure (Just (selectedPlan selected, selectedDevice selected))
     _ → pure Nothing
+
+-- | The device's allocator, once it is live.
+readRootsAllocator ∷ Roots q inst msgr phys dev → STM (Maybe AllocatorOps)
+readRootsAllocator roots =
+  readTVar (rootsAllocator roots) >>= \case
+    Live allocator → pure (Just allocator)
+    _ → pure Nothing
+
+-- | Count one allocation made from the allocator, or one freed: what
+-- retirement reads before it may destroy the allocator.
+noteRootsAllocation ∷ Roots q inst msgr phys dev → Bool → STM ()
+noteRootsAllocation roots made = modifyTVar' (rootsAllocations roots) (\count → if made then count + 1 else if count == 0 then 0 else count - 1)
+
+-- | How many allocations made from the allocator have not been freed.
+readRootsAllocations ∷ Roots q inst msgr phys dev → STM Natural
+readRootsAllocations = readTVar . rootsAllocations
 
 -- | The live device and its naming call, when the instance enabled
 -- @VK_EXT_debug_utils@ and the device offers one. 'Nothing' means nothing is

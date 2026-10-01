@@ -64,8 +64,10 @@
 # writes the same bytes, which is all a warm build compares.
 #
 # `HETOIMASIA_VMA_FOREIGN_CALLS` chooses the call safety of the Hackage
-# `VulkanMemoryAllocator` binding, which only the allocator probe depends on
-# (GRS-18, #361): `unsafe`, the default and the binding's own default, or
+# `VulkanMemoryAllocator` binding's Haskell imports, which only the allocator
+# probe calls (GRS-18, #361); the native backend links the VMA that package
+# compiles but calls it through its own shim, so the choice changes nothing
+# the engine runs: `unsafe`, the default and the binding's own default, or
 # `safe`, its `safe-foreign-calls` flag. A project builds one configuration of
 # a dependency, so the choice is a constraint on the command line, every other
 # input identical, and the safe build keeps its own build directory so neither

@@ -133,6 +133,11 @@ data GpuModel = GpuModel
   , gpuAllocations ∷ !(Map Natural AllocationAttempt)
   , gpuNextAllocation ∷ !Natural
   , gpuBytes ∷ !Natural
+    -- ^ Every accounted byte: resources' own bytes, attempts' reservations,
+    -- and the device memory held ('gpuDeviceMemory').
+  , gpuDeviceMemory ∷ !Natural
+    -- ^ The device memory the allocator holds, as its calls' effects were
+    -- settled: each block and dedicated allocation until it is freed.
   , gpuObjects ∷ !Natural
   , gpuDisposalFailures ∷ !(Set SubjectKey)
   , gpuBackoff ∷ !BackoffState
@@ -177,6 +182,7 @@ newGpuModel session budgets = (model, device)
         , gpuAllocations = Map.empty
         , gpuNextAllocation = 0
         , gpuBytes = 0
+        , gpuDeviceMemory = 0
         , gpuObjects = 0
         , gpuDisposalFailures = Set.empty
         , gpuBackoff = freshBackoff

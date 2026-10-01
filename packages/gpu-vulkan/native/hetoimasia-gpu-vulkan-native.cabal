@@ -48,6 +48,8 @@ extra-doc-files: README.md
 -- because the generator rewrites it and every splice checks it.
 extra-source-files:
     cbits/hetoimasia_vulkan_native.h
+    vendor/vma/vk_mem_alloc.h
+    vendor/vma/LICENSE.txt
     **/*.fingerprint
     test/shaders/*.frag
     test/shaders/**/*.glsl
@@ -66,6 +68,8 @@ library
     import: language
     hs-source-dirs: src
     exposed-modules:
+        Hetoimasia.GPU.Vulkan.Native.Allocator
+        Hetoimasia.GPU.Vulkan.Native.Allocator.Vulkan
         Hetoimasia.GPU.Vulkan.Native.Diagnostics
         Hetoimasia.GPU.Vulkan.Native.Frames
         Hetoimasia.GPU.Vulkan.Native.Frames.Vulkan
@@ -123,6 +127,7 @@ library
     -- surface-loss recovery for a target's generations, which the public
     -- Generations re-exports.
     other-modules:
+        Hetoimasia.GPU.Vulkan.Native.Internal.Allocation
         Hetoimasia.GPU.Vulkan.Native.Internal.Commands
         Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Abandonment
         Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Acquisition
@@ -148,6 +153,7 @@ library
         Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Readback
         Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Recorder
         Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
+        Hetoimasia.GPU.Vulkan.Native.Internal.Vma
     -- The messenger callback, and the compile-time check that the diagnostics
     -- package's layout mirror is the Vulkan headers' layout. The headers come
     -- from the provisioned Vulkan prefix `tools/vulkan/run.sh` passes to
@@ -155,6 +161,16 @@ library
     c-sources: cbits/hetoimasia_vulkan_native.c
     include-dirs: cbits
     cc-options: -std=c11 -Wall -Wextra -Werror
+    -- GRS-11's VMA shim: the engine-owned C entries the private
+    -- Internal.Vma imports unsafe, with D-40's device-memory callbacks
+    -- counting in C — the configuration #361 qualified. It includes the
+    -- vendored `vk_mem_alloc.h` for declarations only; VMA itself is the copy
+    -- the pinned `VulkanMemoryAllocator` package compiles, with the flags
+    -- `cabal.project.vulkan` constrains. Compiled as the qualified shim was.
+    -- See docs/toolchain.md, "VMA".
+    cxx-sources: cbits/hetoimasia_vma.cpp
+    include-dirs: vendor/vma
+    cxx-options: -std=c++17 -O2 -Wall -Wextra -Werror
     build-depends:
         base >=4.22 && <4.23,
         bytestring >=0.12 && <0.13,
@@ -166,6 +182,8 @@ library
         vector >=0.13 && <0.14,
         vulkan >=3.27 && <3.28,
         vulkan-utils ==0.5.11.0,
+        -- Only for the VMA it compiles; no module of it is imported.
+        VulkanMemoryAllocator ==0.11.1.0,
         hetoimasia-foundation ==0.1.0.0,
         hetoimasia-gpu-vulkan-diagnostics ==0.1.0.0,
         hetoimasia-gpu-vulkan-model ==0.1.0.0,
@@ -252,6 +270,9 @@ test-suite native-tests
     main-is: RootsMain.hs
     hs-source-dirs: test
     other-modules:
+        Test.GPU.Vulkan.Native.Allocation
+        Test.GPU.Vulkan.Native.AllocatorStandIn
+        Test.GPU.Vulkan.Native.AllocatorVisibility
         Test.GPU.Vulkan.Native.Frames
         Test.GPU.Vulkan.Native.FramesPresentation
         Test.GPU.Vulkan.Native.FramesRig
@@ -273,6 +294,7 @@ test-suite native-tests
         base >=4.22 && <4.23,
         bytestring >=0.12 && <0.13,
         containers >=0.8 && <0.9,
+        cryptohash-sha256 >=0.11.102 && <0.12,
         directory >=1.3 && <1.4,
         filepath >=1.5 && <1.6,
         hspec >=2.11 && <3,

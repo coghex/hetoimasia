@@ -46,7 +46,9 @@ import Hetoimasia.GPU.Model
   )
 import qualified Hetoimasia.GPU.Model as Model
 import Hetoimasia.GPU.Model.Budget (frameSlotLimit)
-import Hetoimasia.GPU.Model.Identity (IdentityKind (..), Misuse (..), ResourceId, TargetId, targetSession)
+import Hetoimasia.GPU.Model.Identity (AllocationId, IdentityKind (..), Misuse (..), ResourceId, TargetId, targetSession)
+import Hetoimasia.GPU.Vulkan.Native.Allocator (BufferMemory (..), BufferRequest (..), MemoryTypeRefused (..), MemoryUsage (UsageReadback))
+import Hetoimasia.GPU.Vulkan.Native.Internal.Allocation (AllocatedBuffer (..), AllocationRefusal (..), allocateBuffer, freeBuffer, nameBuffer)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   ( PipelineRequest (..)
   , PipelineShaders
@@ -72,6 +74,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , modelAnswer
   , modelEdit
   , owned
+  , readbackBuffer
   )
 import Hetoimasia.GPU.Vulkan.Native.Internal.Reclamation (failingAgain, recoverAllocation)
 import Hetoimasia.GPU.Vulkan.Native.Naming
@@ -82,7 +85,6 @@ import Hetoimasia.GPU.Vulkan.Native.Naming
   , pipelineLayoutName
   , pipelineName
   , readbackBufferName
-  , readbackMemoryName
   , shaderModuleName
   )
 import Hetoimasia.GPU.Vulkan.Native.Profile (DevicePlan (..))
@@ -101,7 +103,7 @@ import Hetoimasia.GPU.Vulkan.Native.Roots
 createPipelineLayout ∷ Recording q inst msgr phys dev cmd → IO (Either Refusal PipelineLayout)
 createPipelineLayout recording =
   fmap PipelineLayout
-    <$> construct recording 0 1 "vkCreatePipelineLayout" (\ops device _ → NativeLayout <$> opsCreatePipelineLayout ops device) Nothing
+    <$> construct recording 0 1 "vkCreatePipelineLayout" (\ops device _ _ → Right . NativeLayout <$> opsCreatePipelineLayout ops device) Nothing
 
 -- | A graphics pipeline over the layout, rendering to the color format. The
 -- layout must be live; the pipeline depends on that exact generation, which
@@ -134,9 +136,9 @@ buildPipeline recording (PipelineLayout layout) shaders format replacing =
           0
           1
           "vkCreateGraphicsPipelines"
-          ( \ops device issued → do
+          ( \ops device _ issued → do
               naming ← shaderNaming recording issued
-              (\created → NativePipeline created layout format) <$> opsCreatePipeline ops device (PipelineRequest handle shaders format) naming
+              (\created → Right (NativePipeline created layout format)) <$> opsCreatePipeline ops device (PipelineRequest handle shaders format) naming
           )
           replacing
     Right _ → pure (Left RefusedWrongKind)
@@ -174,13 +176,21 @@ createFrameStorage recording target slot = do
               0
               2
               "vkCreateCommandPool"
-              (\ops device _ → (\(pool, commands) → NativeStorage target slot pool commands) <$> opsCreateStorage ops device queueFamily)
+              (\ops device _ _ → (\(pool, commands) → Right (NativeStorage target slot pool commands)) <$> opsCreateStorage ops device queueFamily)
               Nothing
           for_ made (\resource → atomically (modifyTVar' (recordingStorages recording) (Map.insert (target, slot) resource)))
           pure (FrameStorage <$> made)
 
--- | A host-visible readback buffer of this many bytes, mapped for its
--- lifetime. 'readbackBytesFor' is what one frame's copy needs.
+-- | A readback buffer of this many bytes, its memory from the device's
+-- allocator under the readback usage — host-visible, cached where the device
+-- offers it — and mapped for its lifetime. 'readbackBytesFor' is what one
+-- frame's copy needs.
+--
+-- The memory is charged as the allocator holds it (D-40), not as the buffer's
+-- own size: the attempt reserves two objects, the buffer and its allocation,
+-- and no bytes of its own. A usage no memory type serves is
+-- 'RefusedNoMemoryType', and a block the byte budget cannot hold is
+-- 'RefusedBackpressure', each having allocated nothing.
 createReadback ∷ Recording q inst msgr phys dev cmd → Natural → IO (Either Refusal Readback)
 createReadback recording bytes
   | bytes == 0 = pure (Left (RefusedOutOfBounds 0 0))
@@ -188,11 +198,29 @@ createReadback recording bytes
       fmap Readback
         <$> construct
           recording
-          bytes
+          0
           2
-          "vkCreateBuffer"
-          (\ops device _ → (\allocation → NativeReadback allocation ContentsUndefined) <$> opsCreateReadback ops device bytes)
+          "vmaCreateBuffer"
+          ( \_ _ attempt _ →
+              allocateBuffer (recordingRoots recording) attempt UsageReadback (BufferRequest bytes transferDestination) >>= \case
+                Left AllocationNoAllocator → pure (Left RefusedDeviceAbsent)
+                Left (AllocationNoMemoryType (MemoryTypeRefused kind _)) → pure (Left (RefusedNoMemoryType kind))
+                Left (AllocationBackpressure budget) → pure (Left (RefusedBackpressure budget))
+                Left (AllocationRejected misuse) → pure (Left (RefusedMisuse misuse))
+                Right allocated → case allocatedMapped allocated of
+                  Just mapped →
+                    pure (Right (NativeReadback (ReadbackAllocation (memoryBuffer (allocatedMemory allocated)) (allocatedMemory allocated) bytes (allocatedCoherent allocated) mapped) ContentsUndefined))
+                  -- The readback usage requires host-visible memory, which
+                  -- is always mapped.
+                  Nothing → do
+                    freeBuffer (recordingRoots recording) allocated
+                    fail "the readback buffer's memory is not mapped"
+          )
           Nothing
+
+-- | @VK_BUFFER_USAGE_TRANSFER_DST_BIT@: what a readback buffer is used as.
+transferDestination ∷ Word32
+transferDestination = 0x00000002
 
 -- | The naming call a pipeline's shader modules are given: under the
 -- identity the model is about to issue the pipeline, when the roots offer
@@ -226,7 +254,7 @@ construct
   → Natural
   → Natural
   → Text
-  → (RecordingOps dev cmd → dev → Maybe ResourceId → IO (NativeResource cmd))
+  → (RecordingOps dev cmd → dev → AllocationId → Maybe ResourceId → IO (Either Refusal (NativeResource cmd)))
   → Maybe ResourceId
   → IO (Either Refusal ResourceId)
 construct recording bytes objects name create replacing =
@@ -255,11 +283,11 @@ construct recording bytes objects name create replacing =
                           _ → Nothing
                       , model
                       )
-                let creation = rootsCall roots name (create (recordingOps recording) device issued)
+                let creation = rootsCall roots name (create (recordingOps recording) device allocation issued)
                     abandoned = atomically $ do
                       modelEdit roots (recordAllocationFailure allocation)
                       modelEdit roots (abandonAllocation allocation)
-                native ← tryWithContext @SomeException creation >>= \case
+                made ← tryWithContext @SomeException creation >>= \case
                   -- A creation that raised created nothing, so its rollback is
                   -- complete: out of memory is recovered as an allocation, with
                   -- one reclamation pass and the creation once more only if the
@@ -276,51 +304,67 @@ construct recording bytes objects name create replacing =
                           Left failure → abandoned >> rethrowIO failure
                   Left failure → abandoned >> rethrowIO failure
                   Right native → pure native
-                committed ← atomically $ do
-                  answer ← case replacing of
-                    Nothing → modelAnswer roots (createResource allocation)
-                    Just old → modelAnswer roots (rebuildResource old allocation)
-                  case answer of
-                    Right resource → do
-                      modifyTVar' (recordingManaged recording) (Map.insert resource (ManagedRecord native ManagedLive))
-                      for_ replacing $ \old → do
-                        -- The rebuild released the old generation; its CPU
-                        -- use ends with it, since no handle may record it.
-                        modelEdit roots (endResourceCpuUse old)
-                        editManaged recording old (\entry → entry {managedStanding = ManagedReplaced resource})
-                      pure (Right resource)
-                    Left refusal → do
-                      modelEdit roots (abandonAllocation allocation)
-                      pure (Left refusal)
-                case committed of
-                  Right resource → nameManaged recording resource native
+                case made of
+                  -- The creation refused, having made nothing and holding no
+                  -- reservation: backpressure on the memory it would open, or
+                  -- no memory type for it.
                   Left refusal → do
-                    -- The model refused to record what now exists, so
-                    -- nothing can reference it: destroy it at once.
-                    destroyNative recording device native
+                    atomically (modelEdit roots (abandonAllocation allocation))
                     pure (Left refusal)
+                  Right native → do
+                    committed ← atomically $ do
+                      answer ← case replacing of
+                        Nothing → modelAnswer roots (createResource allocation)
+                        Just old → modelAnswer roots (rebuildResource old allocation)
+                      case answer of
+                        Right resource → do
+                          modifyTVar' (recordingManaged recording) (Map.insert resource (ManagedRecord native ManagedLive))
+                          for_ replacing $ \old → do
+                            -- The rebuild released the old generation; its CPU
+                            -- use ends with it, since no handle may record it.
+                            modelEdit roots (endResourceCpuUse old)
+                            editManaged recording old (\entry → entry {managedStanding = ManagedReplaced resource})
+                          pure (Right resource)
+                        Left refusal → do
+                          modelEdit roots (abandonAllocation allocation)
+                          pure (Left refusal)
+                    case committed of
+                      Right resource → nameManaged recording resource native
+                      Left refusal → do
+                        -- The model refused to record what now exists, so
+                        -- nothing can reference it: destroy it at once.
+                        destroyNative recording device native
+                        pure (Left refusal)
   where
     roots = recordingRoots recording
 
--- | Name a generation's native objects, when the roots offer naming, before
--- its handle is returned. A naming call that raised releases the generation —
+-- | Name a generation's native objects, when the roots offer naming, and a
+-- readback's allocation inside the device's allocator, before its handle is
+-- returned. A naming call that raised releases the generation —
 -- nothing can record it, its CPU use ends, and the owner's disposal destroys it
 -- like any other released generation — and the failure is re-raised.
 nameManaged ∷ Recording q inst msgr phys dev cmd → ResourceId → NativeResource cmd → IO (Either Refusal ResourceId)
 nameManaged recording resource native =
-  readRootsInstrumentation roots >>= \case
-    Nothing → pure (Right resource)
-    Just (_, instrumentation) →
-      tryWithContext @SomeException (for_ (managedNames recording resource native) (\(kind, handle, name) → nameRootsObject roots instrumentation kind handle name)) >>= \case
-        Right () → pure (Right resource)
-        Left failure → do
-          atomically $ do
-            modelEdit roots (releaseResource resource)
-            modelEdit roots (endResourceCpuUse resource)
-            editManaged recording resource (\entry → entry {managedStanding = ManagedReleased})
-          rethrowIO failure
+  tryWithContext @SomeException naming >>= \case
+    Right () → pure (Right resource)
+    Left failure → do
+      atomically $ do
+        modelEdit roots (releaseResource resource)
+        modelEdit roots (endResourceCpuUse resource)
+        editManaged recording resource (\entry → entry {managedStanding = ManagedReleased})
+      rethrowIO failure
   where
     roots = recordingRoots recording
+    -- A readback's allocation is named inside the allocator whether or not
+    -- the device offers naming; its engine objects only when it does.
+    naming = do
+      case native of
+        NativeReadback allocation _ → nameBuffer roots (readbackBuffer allocation) (readbackBufferName resource)
+        _ → pure ()
+      readRootsInstrumentation roots >>= \case
+        Nothing → pure ()
+        Just (_, instrumentation) →
+          for_ (managedNames recording resource native) (\(kind, handle, name) → nameRootsObject roots instrumentation kind handle name)
 
 -- | What each of a generation's native objects is named.
 managedNames ∷ Recording q inst msgr phys dev cmd → ResourceId → NativeResource cmd → [(NativeObjectKind, Word64, ByteString)]
@@ -331,10 +375,7 @@ managedNames recording resource = \case
     [ (ObjectCommandPool, pool, commandPoolName resource target slot)
     , (ObjectCommandBuffer, opsCommandBufferHandle (recordingOps recording) commands, commandBufferName resource target slot)
     ]
-  NativeReadback allocation _ →
-    [ (ObjectBuffer, allocationBuffer allocation, readbackBufferName resource)
-    , (ObjectDeviceMemory, allocationMemory allocation, readbackMemoryName resource)
-    ]
+  NativeReadback allocation _ → [(ObjectBuffer, allocationBuffer allocation, readbackBufferName resource)]
 
 -- | Release a handle: nothing records through it again, and its CPU use —
 -- reading a readback included — ends with it. Batches that already recorded
