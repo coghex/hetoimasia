@@ -20,8 +20,9 @@
 -- layer's own lifetime checks and synchronization validation watch the same
 -- frees.
 --
--- Allocation follows D-40, through the binding, exactly as in the trace
--- replays; the callbacks count in C.
+-- It runs in any Haskell configuration: allocation follows D-40 and every
+-- creation and destroy goes through that configuration's API, with its
+-- callbacks, exactly as in the trace replays.
 module Production.Deferred
   ( DeferredRun (..)
   , runDeferred
@@ -29,7 +30,7 @@ module Production.Deferred
   , inFlight
   ) where
 
-import Control.Exception (bracket, evaluate, try)
+import Control.Exception (bracket)
 import Control.Monad (forM_, unless, when)
 import Data.Bits ((.|.))
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
@@ -37,16 +38,29 @@ import qualified Data.IntMap.Strict as IntMap
 import qualified Data.Vector as Vector
 import qualified Data.Vector.Storable.Mutable as StorableMutable
 import qualified Data.Vector.Unboxed as Unboxed
-import Data.Word (Word64)
+import Data.Word (Word64, Word8)
 import Foreign.Marshal.Alloc (callocBytes, free)
 import Foreign.Ptr (Ptr, castPtr)
 import Foreign.Storable (peekByteOff)
 import Production.Device (Device (..))
-import Production.Driver (allocationInfo, allocatorCreateInfo, bufferInfo, cOnAllocate, cOnFree, neverAllocate, probeNow, safeDestroyAllocator)
+import Production.Driver
+  ( Api (..)
+  , CallSafety (..)
+  , Configuration (..)
+  , Driver (..)
+  , Session (..)
+  , allocatorCreateInfo
+  , callbacksFor
+  , hackageApi
+  , prepare
+  , probeNow
+  , safeDestroyAllocator
+  , shimApi
+  , shimResultBytes
+  )
 import Production.Script
 import Vulkan.CStruct.Extends (SomeStruct (..))
 import qualified Vulkan.Core10 as Vk
-import Vulkan.Exception (VulkanException (..))
 import Vulkan.Zero (zero)
 import qualified VulkanMemoryAllocator as Vma
 
@@ -87,16 +101,26 @@ data DeferredRun = DeferredRun
 
 data Pending = Pending
   { pendingOperation ∷ !Int
-  , pendingBuffer ∷ !Vk.Buffer
-  , pendingAllocation ∷ !Vma.Allocation
+  , pendingBuffer ∷ !Word64
+  , pendingAllocation ∷ !Word64
   , pendingBatch ∷ !Int
   }
 
--- | Replay a buffer script in GPU-executed batches with deferred frees.
-runDeferred ∷ Device → Vector.Vector ResourceClass → Script → IO DeferredRun
-runDeferred device classes script =
+-- | Replay a buffer script in GPU-executed batches with deferred frees, in
+-- one Haskell configuration.
+runDeferred ∷ Session → Configuration → Script → IO DeferredRun
+runDeferred session configuration script =
+  bracket (callocBytes shimResultBytes) free $ \out → case configurationDriver configuration of
+    DriverHackage → deferredWith (hackageApi out) out session configuration script
+    DriverShim UnsafeCalls → deferredWith (shimApi UnsafeCalls out) out session configuration script
+    DriverShim SafeCalls → deferredWith (shimApi SafeCalls out) out session configuration script
+    DriverC → fail "the deferred-free workload runs from Haskell"
+
+{-# INLINE deferredWith #-}
+deferredWith ∷ Api → Ptr Word8 → Session → Configuration → Script → IO DeferredRun
+deferredWith api out session configuration script =
   bracket (callocBytes 80) free $ \counters →
-    bracket (Vma.createAllocator (allocatorCreateInfo device cOnAllocate cOnFree (castPtr counters))) safeDestroyAllocator $ \allocator →
+    bracket (Vma.createAllocator (allocatorCreateInfo device onAllocate onFree (castPtr counters))) safeDestroyAllocator $ \allocator →
       bracket (Vk.createCommandPool logical poolInfo Nothing) (\pool → Vk.destroyCommandPool logical pool Nothing) $ \pool → do
         commandBuffers ←
           Vk.allocateCommandBuffers logical (Vk.CommandBufferAllocateInfo pool Vk.COMMAND_BUFFER_LEVEL_PRIMARY (fromIntegral inFlight))
@@ -105,26 +129,32 @@ runDeferred device classes script =
           c : _ → pure c
           [] → fail "no geometry class"
         let scratchBytes = max (64 * 1024) (scratchNeeded script)
-        (scratch, scratchAllocation, _) ←
-          Vma.createBuffer allocator (bufferInfo scratchBytes (specUsage (classSpec geometry))) (allocationInfo geometry 0)
-        result ← replay allocator (Vector.toList commandBuffers) fences scratch
-        Vma.destroyBuffer allocator scratch scratchAllocation
+        scratchResult ← apiCreateBuffer api allocator (prepare geometry) scratchBytes False
+        unless (scratchResult == 0) $ fail ("the scratch buffer failed with " <> show scratchResult)
+        scratchHandle ← peekByteOff out 0 ∷ IO Word64
+        scratchAllocation ← peekByteOff out 8 ∷ IO Word64
+        result ← replay allocator (Vector.toList commandBuffers) fences (Vk.Buffer scratchHandle)
+        apiDestroyBuffer api allocator scratchHandle scratchAllocation
         Vector.mapM_ (\f → Vk.destroyFence logical f Nothing) fences
         Vk.freeCommandBuffers logical pool commandBuffers
         opened ← peekCounter counters 0
         freedBlocks ← peekCounter counters 16
         pure result {deferredOpened = opened, deferredFreedBlocks = freedBlocks}
   where
+    device = sessionDevice session
+    (onAllocate, onFree) = callbacksFor session configuration
+    classes = scriptClasses script
+    prepared = Vector.map prepare classes
     logical = deviceVulkan device
     poolInfo =
       Vk.CommandPoolCreateInfo {Vk.next = (), Vk.flags = Vk.COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, Vk.queueFamilyIndex = deviceQueueFamily device}
         ∷ Vk.CommandPoolCreateInfo '[]
     count = Unboxed.length (scriptKinds script)
     batches = (count + batchOperations - 1) `div` batchOperations
-    classOf i = scriptClasses script Vector.! fromIntegral (scriptClassIndices script Unboxed.! i)
+    classIndexOf i = fromIntegral (scriptClassIndices script Unboxed.! i)
     replay allocator commandBuffers fences scratch = do
       -- Each live resource, with the batch that last used it.
-      live ← newIORef (IntMap.empty ∷ IntMap.IntMap (Vk.Buffer, Vma.Allocation, ResourceClass, Word64, Int))
+      live ← newIORef (IntMap.empty ∷ IntMap.IntMap (Word64, Word64, ResourceClass, Word64, Int))
       pending ← newIORef (IntMap.empty ∷ IntMap.IntMap [Pending])
       slotBatch ← StorableMutable.replicate inFlight (-1 ∷ Int)
       destroySamples ← StorableMutable.replicate (max 1 count) (0 ∷ Word64)
@@ -152,12 +182,12 @@ runDeferred device classes script =
               status ← Vk.getFenceStatus logical (fences Vector.! slot)
               unless (owner == pendingBatch p && status == Vk.SUCCESS) $ tally 2
               start ← probeNow
-              Vma.destroyBuffer allocator (pendingBuffer p) (pendingAllocation p)
+              apiDestroyBuffer api allocator (pendingBuffer p) (pendingAllocation p)
               end ← probeNow
               StorableMutable.write destroySamples (pendingOperation p) (end - start)
               addTime 4 (end - start)
               tally 1
-          use commandBuffer scratchOffset (Vk.Buffer handle) resourceClass size =
+          use commandBuffer scratchOffset handle resourceClass size =
             if specUsage (classSpec resourceClass) == 0x1
               then do
                 Vk.cmdCopyBuffer commandBuffer (Vk.Buffer handle) scratch (Vector.singleton (Vk.BufferCopy 0 scratchOffset size))
@@ -196,19 +226,19 @@ runDeferred device classes script =
         forM_ [batch * batchOperations .. min count ((batch + 1) * batchOperations) - 1] $ \i →
           case opCode (scriptKinds script Unboxed.! i) of
             CreateD40 → do
-              let resourceClass = classOf i
+              let resourceClass = classes Vector.! classIndexOf i
+                  spec = prepared Vector.! classIndexOf i
                   size = scriptSizes script Unboxed.! i
-                  info = bufferInfo size (specUsage (classSpec resourceClass))
               start ← probeNow
-              placed ← try (Vma.createBuffer allocator info (allocationInfo resourceClass neverAllocate)) >>= evaluate
-              created ← case placed of
-                Right r → pure (Right r)
-                Left (VulkanException _) → try (Vma.createBuffer allocator info (allocationInfo resourceClass 0))
+              placed ← apiCreateBuffer api allocator spec size True
+              created ← if placed == 0 then pure placed else apiCreateBuffer api allocator spec size False
               end ← probeNow
               addTime 0 (end - start)
-              case created of
-                Left (VulkanException _) → tally 3
-                Right (buffer, allocation, _) → do
+              if created /= 0
+                then tally 3
+                else do
+                  buffer ← peekByteOff out 0 ∷ IO Word64
+                  allocation ← peekByteOff out 8 ∷ IO Word64
                   tally 0
                   modifyIORef' live (IntMap.insert (fromIntegral (scriptIds script Unboxed.! i)) (buffer, allocation, resourceClass, size, batch))
                   readIORef offset >>= \o → use commandBuffer o buffer resourceClass size >>= writeIORef offset
@@ -249,7 +279,7 @@ runDeferred device classes script =
       wholeEnd ← probeNow
       -- Whatever the trace left live was never freed by it; free it untimed.
       remaining ← readIORef live
-      forM_ (IntMap.elems remaining) $ \(buffer, allocation, _, _, _) → Vma.destroyBuffer allocator buffer allocation
+      forM_ (IntMap.elems remaining) $ \(buffer, allocation, _, _, _) → apiDestroyBuffer api allocator buffer allocation
       (allocateTime, recordTime, waitTime, drainTime, destroyTime, _) ← readIORef totals
       (creates, destroys, early, failures) ← readIORef tallies
       (peak, total) ← readIORef pendingStats

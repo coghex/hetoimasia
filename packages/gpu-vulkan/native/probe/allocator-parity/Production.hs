@@ -97,18 +97,18 @@ workOf ∷ PassResult → [Word64]
 workOf pass =
   map (summaryWord pass) [SummaryChecksum, SummaryCreates, SummaryDestroys, SummaryHits, SummaryMisses, SummaryOther, SummaryBoundBroken, SummaryFailures]
 
-measureScript ∷ Session → IORef [String] → [Configuration] → Int → Int → Script → IO Measurement
-measureScript session failures configurations warmup repetitions script = do
+measureScript ∷ CallSafety → Session → IORef [String] → [Configuration] → Int → Int → Script → IO Measurement
+measureScript safety session failures configurations warmup repetitions script = do
   let count = Unboxed.length (scriptKinds script)
       failed problem = modifyIORef' failures ((scriptName script <> ": " <> problem) :)
   evidence ← fmap Map.fromList $ forM configurations $ \c → do
     performMajorGC
     (,) c <$> runPass session c script EvidenceMode
-  checkEvidence failed (sessionDevice session) script evidence
+  checkEvidence safety failed script evidence
   let reference = evidence Map.! Configuration DriverC CallbacksInC
       check c what pass =
         unless (workOf pass == workOf reference) $
-          failed (configurationLabel UnsafeCalls c <> "'s " <> what <> " pass did different work from the evidence pass")
+          failed (configurationLabel safety c <> "'s " <> what <> " pass did different work from the evidence pass")
   replicateM_ warmup $ forM_ configurations $ \c → performMajorGC >> runPass session c script Whole
   perOperation ← forM configurations $ \c → do
     e ← StorableMutable.replicate (max 1 count) 0
@@ -133,13 +133,13 @@ measureScript session failures configurations warmup repetitions script = do
 -- accounting equal to VMA's own statistics, everything released with the
 -- allocator, and every Haskell configuration's work identical to C's — the
 -- same placements, outcomes and block events, operation by operation.
-checkEvidence ∷ (String → IO ()) → Device → Script → Map.Map Configuration PassResult → IO ()
-checkEvidence failed _ script evidence = do
+checkEvidence ∷ CallSafety → (String → IO ()) → Script → Map.Map Configuration PassResult → IO ()
+checkEvidence safety failed script evidence = do
   let reference = evidence Map.! Configuration DriverC CallbacksInC
       count = Unboxed.length (scriptKinds script)
       haskellWords pass = [w | i ← [0 .. count - 1], k ← [0 .. 4], let w = passEvidence pass Unboxed.! (i * evidenceWords + k)]
   forM_ (Map.toList evidence) $ \(c, pass) → do
-    let label = configurationLabel UnsafeCalls c
+    let label = configurationLabel safety c
     when (summaryWord pass SummaryFailures /= 0) $
       failed (label <> ": the device refused " <> show (summaryWord pass SummaryFailures) <> " requests")
     when (summaryWord pass SummaryHeldMismatches /= 0) $
@@ -310,18 +310,20 @@ runProduction options = do
                ]
     callsScript ← encodeScript "per-call script" classes preferred callScript []
     progress "measuring the per-call script"
-    calls ← measureScript session failures configurations (productionWarmup options) (productionRepetitions options) callsScript
+    calls ← measureScript safety session failures configurations (productionWarmup options) (productionRepetitions options) callsScript
     workloads ← forM gatedTraces $ \trace → do
       ops ← either fail pure (traceScript trace)
       script ← encodeScript (traceName trace) classes preferred ops (traceCheckpoints trace)
       progress ("replaying " <> traceName trace)
-      (,) trace <$> measureScript session failures configurations (productionWarmup options) (productionRepetitions options) script
+      (,) trace <$> measureScript safety session failures configurations (productionWarmup options) (productionRepetitions options) script
     deferred ← case [(t, m) | (t, m) ← workloads, traceName t == "small-steady"] of
       [(_, m)] → do
         progress "measuring completion-deferred frees on small-steady"
-        replicateM_ (productionWarmup options) (performMajorGC >> runDeferred device classes (measurementScript m))
-        runs ← forM [1 .. productionRepetitions options] $ \_ → performMajorGC >> runDeferred device classes (measurementScript m)
-        pure (Just (m, runs))
+        perConfiguration ← forM [c | c ← configurations, configurationDriver c /= DriverC] $ \c → do
+          replicateM_ (productionWarmup options) (performMajorGC >> runDeferred session c (measurementScript m))
+          runs ← forM [1 .. productionRepetitions options] $ \_ → performMajorGC >> runDeferred session c (measurementScript m)
+          pure (c, runs)
+        pure (Just (m, Map.fromList perConfiguration))
       _ → failed "small-steady is missing, so the deferred-free workload did not run" >> pure Nothing
     pure (device, classes, safety, configurations, calls, workloads, deferred)
   -- The correctness passes on a validating device.
@@ -330,20 +332,21 @@ runProduction options = do
     classes ← resolveClasses device >>= either fail pure
     let preferred = Storable.fromList [preferredBlockSize device (offerIndex o) | o ← deviceMemoryTypes device]
     callsScript ← encodeScript "per-call script" classes preferred callScript []
+    let buildSafety = either (const UnsafeCalls) (\(_, _, safety, _, _, _, _) → safety) timed
     configurations ← case timed of
       Right (_, _, _, cs, _, _, _) → pure cs
       Left _ → pure [Configuration DriverC CallbacksInC, Configuration DriverHackage CallbacksInC]
     scripts ← (callsScript :) <$> forM gatedTraces (\trace → either fail pure (traceScript trace) >>= \ops → encodeScript (traceName trace) classes preferred ops (traceCheckpoints trace))
     forM_ scripts $ \script → do
       evidence ← fmap Map.fromList $ forM configurations $ \c → (,) c <$> runPass session c script EvidenceMode
-      checkEvidence (\p → failed ("under validation, " <> scriptName script <> ": " <> p)) device script evidence
-    deferredRun ← case [t | t ← gatedTraces, traceName t == "small-steady"] of
+      checkEvidence buildSafety (\p → failed ("under validation, " <> scriptName script <> ": " <> p)) script evidence
+    deferredRuns ← case [t | t ← gatedTraces, traceName t == "small-steady"] of
       [t] → do
         ops ← either fail pure (traceScript t)
         script ← encodeScript (traceName t) classes preferred ops (traceCheckpoints t)
-        Just <$> runDeferred device classes script
-      _ → pure Nothing
-    pure (deviceLayers device, deferredRun)
+        fmap Map.fromList $ forM [c | c ← configurations, configurationDriver c /= DriverC] $ \c → (,) c <$> runDeferred session c script
+      _ → pure Map.empty
+    pure (deviceLayers device, deferredRuns)
   messages ← validationMessages
   problemsSoFar ← readIORef failures
   report ← case timed of
@@ -356,14 +359,17 @@ runProduction options = do
     Right (_, deferredValidated) → do
       when (messageErrors messages + messageWarnings messages + messageOther messages /= 0) $
         failed (show (messageErrors messages) <> " validation errors and " <> show (messageWarnings messages) <> " warnings were reported")
-      forM_ deferredValidated $ \run → do
-        unless (deferredEarly run == 0) $ failed (show (deferredEarly run) <> " frees ran before their batch's fence was observed signalled, under validation")
-        unless (deferredFailures run == 0) $ failed (show (deferredFailures run) <> " deferred-free allocations were refused, under validation")
+      forM_ (Map.toList deferredValidated) $ \(c, run) → do
+        let label = configurationLabel (either (const UnsafeCalls) (\(_, _, safety, _, _, _, _) → safety) timed) c
+        unless (deferredEarly run == 0) $ failed (label <> ": " <> show (deferredEarly run) <> " frees ran before their batch's fence was observed signalled, under validation")
+        unless (deferredFailures run == 0) $ failed (label <> ": " <> show (deferredFailures run) <> " deferred-free allocations were refused, under validation")
   case report of
-    Right (_, _, _, _, _, _, Just (_, runs)) →
-      forM_ runs $ \run → do
-        unless (deferredEarly run == 0) $ failed (show (deferredEarly run) <> " frees ran before their batch's fence was observed signalled")
-        unless (deferredFailures run == 0) $ failed (show (deferredFailures run) <> " deferred-free allocations were refused")
+    Right (_, _, safety, configurations, _, _, Just (_, runsBy)) →
+      forM_ [c | c ← configurations, configurationDriver c /= DriverC] $ \c → case Map.lookup c runsBy of
+        Nothing → failed (configurationLabel safety c <> ": the deferred-free workload did not run")
+        Just runs → forM_ runs $ \run → do
+          unless (deferredEarly run == 0) $ failed (configurationLabel safety c <> ": " <> show (deferredEarly run) <> " frees ran before their batch's fence was observed signalled")
+          unless (deferredFailures run == 0) $ failed (configurationLabel safety c <> ": " <> show (deferredFailures run) <> " deferred-free allocations were refused")
     _ → pure ()
   case (report, declaredVariant) of
     (Right (_, _, safety, _, _, _, _), Just declared)
@@ -390,7 +396,7 @@ runProduction options = do
             <> selfChecks problems
             <> limitsSection invalid report verdicts validated messages
             <> either (const []) (detailSections clocks) report
-            <> validationSection validated messages
+            <> validationSection (either (const UnsafeCalls) (\(_, _, safety, _, _, _, _) → safety) report) validated messages
   putStr text
   forM_ (productionOutput options) (`writeFile` text)
   when invalid $ do
@@ -441,7 +447,7 @@ type Timed =
   , [Configuration]
   , Measurement
   , [(Trace, Measurement)]
-  , Maybe (Measurement, [DeferredRun])
+  , Maybe (Measurement, Map.Map Configuration [DeferredRun])
   )
 
 version ∷ Word32 → String
@@ -529,7 +535,7 @@ selfChecks problems =
     <> ["- " <> p | p ← problems]
     <> [""]
 
-limitsSection ∷ Bool → Either String Timed → [Verdict] → Either SomeException ([String], Maybe DeferredRun) → ValidationMessages → [String]
+limitsSection ∷ Bool → Either String Timed → [Verdict] → Either SomeException ([String], Map.Map Configuration DeferredRun) → ValidationMessages → [String]
 limitsSection invalid report verdicts validated messages =
   [ "## Accepted limits"
   , ""
@@ -549,7 +555,7 @@ limitsSection invalid report verdicts validated messages =
                  | v ← verdicts
                  , verdictConfiguration v == c
                  ]
-              <> [ "| completion-deferred frees | " <> deferredResult <> " | " <> deferredDetail <> " |"
+              <> [ "| completion-deferred frees, through this configuration | " <> deferredResult c <> " | " <> deferredDetail c <> " |"
                  , ""
                  , configurationVerdict c
                  , ""
@@ -557,7 +563,7 @@ limitsSection invalid report verdicts validated messages =
           | c ← configurations
           , configurationDriver c /= DriverC
           ]
-          <> [ "The deferred-free workload runs from Haskell through this build's binding with C callbacks; its correctness gate is the configuration-independent property that no free precedes its fence, so it is reported against each configuration."
+          <> [ "Each Haskell configuration runs the deferred-free workload through its own API and callbacks, timed and once more under validation, and its gate is judged on its own runs."
              , ""
              , if invalid
                  then "**This run is invalid** (see the self-checks), so none of the results above qualifies anything."
@@ -566,24 +572,26 @@ limitsSection invalid report verdicts validated messages =
              , ""
              ]
         where
-          deferredClean = case validated of
-            Right (_, Just run) → deferredEarly run == 0 && messageErrors messages + messageWarnings messages + messageOther messages == 0
-            _ → False
-          timedClean = case deferred of
-            Just (_, runs) → all ((== 0) . deferredEarly) runs
+          messagesClean = messageErrors messages + messageWarnings messages + messageOther messages == 0
+          validatedRun c = case validated of
+            Right (_, runs) → Map.lookup c runs
+            Left _ → Nothing
+          timedRuns c = maybe [] (Map.findWithDefault [] c . snd) deferred
+          gateMet c = case validatedRun c of
+            Just run → deferredEarly run == 0 && deferredFailures run == 0 && messagesClean && not (null (timedRuns c)) && all (\r → deferredEarly r == 0 && deferredFailures r == 0) (timedRuns c)
             Nothing → False
-          deferredResult = if deferredClean && timedClean then "Met" else "**Not met: the run is invalid**"
-          deferredDetail = case (deferred, validated) of
-            (Just (_, runs), Right (_, Just run)) →
-              show (sum (map deferredEarly runs) + deferredEarly run) <> " early frees over " <> show (length runs + 1) <> " passes, "
-                <> show (messageErrors messages) <> " validation errors and " <> show (messageWarnings messages) <> " warnings"
+          deferredResult c = if gateMet c then "Met" else "**Not met: the run is invalid**"
+          deferredDetail c = case validatedRun c of
+            Just run | not (null (timedRuns c)) →
+              show (sum (map deferredEarly (timedRuns c)) + deferredEarly run) <> " early frees over " <> show (length (timedRuns c) + 1) <> " passes, the last under validation; "
+                <> show (messageErrors messages) <> " validation errors and " <> show (messageWarnings messages) <> " warnings in the run"
             _ → "the workload did not complete"
           configurationVerdict c =
             let mine = [v | v ← verdicts, verdictConfiguration v == c]
                 missed = length (filter (not . verdictMet) mine)
-             in if missed == 0 && deferredClean && timedClean && not invalid
+             in if missed == 0 && gateMet c && not invalid
                   then "**" <> configurationLabel safety c <> " met every accepted limit in this run.**"
-                  else "**" <> configurationLabel safety c <> " missed " <> show missed <> " of " <> show (length mine) <> " timed limits" <> (if deferredClean && timedClean then "" else ", and the deferred-free gate is not met") <> "; it does not qualify.**"
+                  else "**" <> configurationLabel safety c <> " missed " <> show missed <> " of " <> show (length mine) <> " timed limits" <> (if gateMet c then "" else ", and the deferred-free gate is not met") <> "; it does not qualify.**"
 
 detailSections ∷ (Double, Double) → Timed → [String]
 detailSections clocks (_, classes, safety, configurations, calls, workloads, deferred) =
@@ -734,61 +742,72 @@ workloadSection safety configurations classes (trace, measurement) =
                    ]
                 <> [""]
 
-deferredSection ∷ CallSafety → [Configuration] → [(Trace, Measurement)] → (Measurement, [DeferredRun]) → [String]
-deferredSection _ _ _ (_, []) = []
-deferredSection safety configurations workloads (_, first : rest) =
+deferredSection ∷ CallSafety → [Configuration] → [(Trace, Measurement)] → (Measurement, Map.Map Configuration [DeferredRun]) → [String]
+deferredSection safety configurations workloads (_, runsBy) =
   [ "## Completion-deferred frees"
   , ""
-  , "`small-steady` replayed in batches of " <> show batchOperations <> " operations that the GPU executes, " <> show inFlight <> " in flight, from Haskell through this build's binding (" <> callSafetyLabel safety <> ") with C callbacks. Each resource is used by a transfer command in the batch that creates it and in the batch that frees it; its free waits until that batch's fence has signalled. Immediate frees are the same trace's frees in the plain replay, the same configuration, with no GPU use."
-  , ""
-  , "- Batches " <> show (deferredBatches first) <> "; allocations " <> show (deferredCreates first) <> "; frees " <> show (deferredDestroys first)
-      <> "; frees waiting at once: peak " <> show (deferredPendingPeak first) <> ", mean " <> fixed 1 (deferredPendingMean first) <> " per batch"
-  , "- Early frees: " <> show (sum (map deferredEarly runs)) <> " over " <> show (length runs) <> " timed passes (the validated pass is reported under Validation)"
-  , ""
-  , "| Figure (median over repetitions) | Deferred | Immediate |"
-  , "| --- | ---: | ---: |"
-  , "| Free call (`vmaDestroyBuffer`): median / p95 (ns) | " <> pair deferredFrees <> " | " <> pair immediateFrees <> " |"
-  , "| Free calls, total | " <> milliseconds (med (map (fromIntegral . deferredDestroyNanoseconds) runs)) <> " | " <> milliseconds (sum immediateFrees) <> " |"
-  , "| Draining released frees (bookkeeping and free calls) | " <> milliseconds (med (map (fromIntegral . deferredDrainNanoseconds) runs)) <> " | — |"
-  , "| Allocation (D-40) | " <> milliseconds (med (map (fromIntegral . deferredAllocateNanoseconds) runs)) <> " | — |"
-  , "| Recording and submission | " <> milliseconds (med (map (fromIntegral . deferredRecordNanoseconds) runs)) <> " | — |"
-  , "| Fence waits | " <> milliseconds (med (map (fromIntegral . deferredWaitNanoseconds) runs)) <> " | — |"
-  , "| Whole workload | " <> milliseconds (med (map (fromIntegral . deferredWholeNanoseconds) runs)) <> " | " <> immediateWhole <> " |"
-  , ""
-  , "Deferred minus immediate free calls, median per free: " <> fixed 1 (nearestRank 0.5 deferredFrees - nearestRank 0.5 immediateFrees) <> " ns. This comparison is reported and carries no numeric limit."
+  , "`small-steady` replayed in batches of " <> show batchOperations <> " operations that the GPU executes, " <> show inFlight <> " in flight, from Haskell through each configuration's own API and callbacks. Each resource is used by a transfer command in the batch that creates it and in the batch that frees it; its free waits until that batch's fence has signalled. Immediate frees are the same trace's frees in the same configuration's plain replay, with no GPU use. Figures are medians over the repetitions; the comparison carries no numeric limit."
   , ""
   ]
+    <> concat
+      [ [ "- " <> configurationLabel safety c <> ": batches " <> show (deferredBatches first) <> ", allocations " <> show (deferredCreates first) <> ", frees " <> show (deferredDestroys first)
+            <> "; frees waiting at once: peak " <> show (deferredPendingPeak first) <> ", mean " <> fixed 1 (deferredPendingMean first) <> " per batch; early frees " <> show (sum (map deferredEarly runs)) <> " over " <> show (length runs) <> " timed passes"
+        ]
+      | c ← haskellConfigurations
+      , Just runs@(first : _) ← [Map.lookup c runsBy]
+      ]
+    <> [ ""
+       , "| Configuration | Free call, deferred: median / p95 (ns) | Free call, immediate: median / p95 (ns) | Deferred − immediate, median (ns) | Free calls, deferred / immediate | Draining (bookkeeping and free calls) | Allocation (D-40) | Recording and submission | Fence waits | Whole workload, deferred / immediate |"
+       , "| --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | --- |"
+       ]
+    <> [ "| " <> configurationLabel safety c
+           <> " | " <> pair deferredFrees
+           <> " | " <> pair immediateFrees
+           <> " | " <> fixed 1 (nearestRank 0.5 deferredFrees - nearestRank 0.5 immediateFrees)
+           <> " | " <> milliseconds (med (map (fromIntegral . deferredDestroyNanoseconds) runs)) <> " / " <> milliseconds (sum immediateFrees)
+           <> " | " <> milliseconds (med (map (fromIntegral . deferredDrainNanoseconds) runs))
+           <> " | " <> milliseconds (med (map (fromIntegral . deferredAllocateNanoseconds) runs))
+           <> " | " <> milliseconds (med (map (fromIntegral . deferredRecordNanoseconds) runs))
+           <> " | " <> milliseconds (med (map (fromIntegral . deferredWaitNanoseconds) runs))
+           <> " | " <> milliseconds (med (map (fromIntegral . deferredWholeNanoseconds) runs)) <> " / " <> immediateWhole c
+           <> " |"
+       | c ← haskellConfigurations
+       , Just runs@(_ : _) ← [Map.lookup c runsBy]
+       , let deferredFrees = [fromIntegral x / fromIntegral (length runs) | x ← foldr1 (zipWith (+)) (map deferredDestroySamples runs)] ∷ [Double]
+             immediateFrees = immediateOf c
+       ]
+    <> [""]
   where
-    runs = first : rest
+    haskellConfigurations = [c | c ← configurations, configurationDriver c /= DriverC]
     med = nearestRank 0.5
-    perFree = [fromIntegral x / fromIntegral (length runs) | x ← foldr1 (zipWith (+)) (map deferredDestroySamples runs)] ∷ [Double]
-    deferredFrees = perFree
-    haskellC = Configuration DriverHackage CallbacksInC
     steady = [m | (t, m) ← workloads, traceName t == "small-steady"]
-    immediateFrees = case steady of
+    immediateOf c = case steady of
       [m] →
         let script = measurementScript m
-            (totals, _) = measurementPerOperation m Map.! haskellC
+            (totals, _) = measurementPerOperation m Map.! c
          in [totals Unboxed.! i | i ← [0 .. Unboxed.length (scriptKinds script) - 1], opCode (scriptKinds script Unboxed.! i) == Destroy]
       _ → []
-    immediateWhole = case steady of
-      [m] | haskellC `elem` configurations → milliseconds (medianWhole m haskellC)
+    immediateWhole c = case steady of
+      [m] → milliseconds (medianWhole m c)
       _ → "n/a"
     pair xs = if null xs then "n/a" else fixed 1 (nearestRank 0.5 xs) <> " / " <> fixed 1 (nearestRank 0.95 xs)
 
-validationSection ∷ Either SomeException ([String], Maybe DeferredRun) → ValidationMessages → [String]
-validationSection validated messages =
+validationSection ∷ CallSafety → Either SomeException ([String], Map.Map Configuration DeferredRun) → ValidationMessages → [String]
+validationSection safety validated messages =
   [ "## Validation"
   , ""
   ]
     <> case validated of
       Left e → ["The validated passes did not complete: " <> displayException e, ""]
-      Right (layers, run) →
-        [ "Every configuration's evidence pass of the per-call script and of each gated trace, and one deferred-free pass, ran again on a device with " <> intercalate ", " layers <> " and the features above. "
+      Right (layers, runs) →
+        [ "Every configuration's evidence pass of the per-call script and of each gated trace, and each Haskell configuration's deferred-free pass, ran again on a device with " <> intercalate ", " layers <> " and the features above. "
             <> "Messages (errors, warnings, other): " <> show (messageErrors messages) <> ", " <> show (messageWarnings messages) <> ", " <> show (messageOther messages) <> "."
-            <> maybe "" (\r → " The validated deferred-free pass freed " <> show (deferredDestroys r) <> " resources with " <> show (deferredEarly r) <> " early frees.") run
         , ""
         ]
+          <> [ "- Deferred frees under validation, " <> configurationLabel safety c <> ": " <> show (deferredDestroys r) <> " resources freed, " <> show (deferredEarly r) <> " early"
+             | (c, r) ← Map.toList runs
+             ]
+          <> (if Map.null runs then [] else [""])
           <> ["- " <> t | t ← messageTexts messages]
           <> (if null (messageTexts messages) then [] else [""])
 

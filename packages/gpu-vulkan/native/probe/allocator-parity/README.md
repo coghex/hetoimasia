@@ -213,16 +213,18 @@ The owner's limits (#361), evaluated for every Haskell configuration:
 ### Completion-deferred frees
 
 `small-steady` is replayed in batches of 64 operations that the GPU executes,
-three in flight, from Haskell through the build's Hackage binding with C
-callbacks (`Production/Deferred.hs`). Each resource is used by a transfer
+three in flight, once per Haskell configuration, through that
+configuration's own API and callbacks (`Production/Deferred.hs`), so each
+configuration's gate is judged on its own frees. Each resource is used by a transfer
 command in the batch that creates it and again in the batch that frees it,
 unless that is the same batch: geometry and readback buffers are filled,
 staging buffers are copied into their own region of a scratch buffer. Every
 command buffer begins with one transfer-to-transfer memory barrier. A free
 waits until that batch's fence has been waited on, and each destroy first
-checks that the fence is signalled and still that batch's. The timed passes
-run on the unvalidated device; one more runs under validation. Immediate frees
-are the same trace's frees in the plain replay by the same configuration.
+checks that the fence is signalled and still that batch's. Each
+configuration's timed passes run on the unvalidated device, and one more runs
+under validation. Immediate frees are the same trace's frees in that
+configuration's plain replay.
 
 ### Self-checks
 

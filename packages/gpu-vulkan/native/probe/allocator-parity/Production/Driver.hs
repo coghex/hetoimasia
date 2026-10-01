@@ -48,6 +48,13 @@ module Production.Driver
   , cOnFree
   , probeNow
   , safeDestroyAllocator
+  , Api (..)
+  , hackageApi
+  , shimApi
+  , Prepared (..)
+  , prepare
+  , shimResultBytes
+  , callbacksFor
   ) where
 
 import Control.Concurrent (forkIO, killThread, threadDelay)
@@ -607,15 +614,19 @@ data PassResult = PassResult
     -- ^ 'checkpointWords' per checkpoint; empty outside the evidence mode.
   }
 
+-- | The device-memory callbacks a configuration installs.
+callbacksFor ∷ Session → Configuration → (Vma.PFN_vmaAllocateDeviceMemoryFunction, Vma.PFN_vmaFreeDeviceMemoryFunction)
+callbacksFor session configuration = case configurationCallbacks configuration of
+  CallbacksInC → (cOnAllocate, cOnFree)
+  CallbacksInHaskell → (sessionHaskellOnAllocate session, sessionHaskellOnFree session)
+
 -- | Replay a script once in one configuration.
 runPass ∷ Session → Configuration → Script → Mode → IO PassResult
 runPass session configuration script mode = do
   let count = Unboxed.length (scriptKinds script)
       evidence = case mode of EvidenceMode → True; _ → False
       logCapacity = if evidence then 65536 else 0 ∷ Int
-      (onAllocate, onFree) = case configurationCallbacks configuration of
-        CallbacksInC → (cOnAllocate, cOnFree)
-        CallbacksInHaskell → (sessionHaskellOnAllocate session, sessionHaskellOnFree session)
+      (onAllocate, onFree) = callbacksFor session configuration
   when (configurationDriver configuration == DriverC && configurationCallbacks configuration /= CallbacksInC) $
     fail "the C driver runs with C callbacks only"
   when (configurationDriver configuration == DriverShim UnsafeCalls && configurationCallbacks configuration /= CallbacksInC) $
