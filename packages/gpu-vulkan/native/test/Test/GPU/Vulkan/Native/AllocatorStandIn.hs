@@ -5,8 +5,8 @@
 --
 -- It follows the rules the allocation protocol relies on, as VMA keeps them:
 --
--- * A placement in held memory opens nothing, and answers out of memory when
---   nothing held fits.
+-- * A placement in held memory opens nothing, and answers 'NotPlaced' when
+--   nothing held fits or the driver requires a dedicated allocation.
 -- * An allocating call places in a held block if one fits, and otherwise opens
 --   one block of the type's block size — or, for a request larger than the
 --   preferred block or one the driver requires dedicated, a dedicated
@@ -31,6 +31,8 @@ module Test.GPU.Vulkan.Native.AllocatorStandIn
   , clearAllocatorAt
   , allocatorOutOfMemory
   , duringAllocating
+  , duringPlacing
+  , freeExtra
   , StandInResult (..)
   , AllocatorFailure (..)
 
@@ -155,6 +157,12 @@ data AllocatorStandIn = AllocatorStandIn
     -- ^ The device memory there is; opening more answers out of memory.
   , allocatorAllowed ∷ !(TVar Word32)
     -- ^ The memory types a buffer's requirements allow.
+  , allocatorPlacing ∷ !(TVar (Maybe (IO ())))
+    -- ^ What the next placement in held memory runs, once, before anything
+    -- else.
+  , allocatorFreeExtra ∷ !(TVar Natural)
+    -- ^ Bytes every freed block or dedicated allocation reports beyond its
+    -- size: a defect the engine must catch.
   }
 
 newAllocatorStandIn ∷ IO AllocatorStandIn
@@ -172,6 +180,8 @@ newAllocatorStandIn =
     <*> newTVarIO 0
     <*> newTVarIO Nothing
     <*> newTVarIO 0x7
+    <*> newTVarIO Nothing
+    <*> newTVarIO 0
 
 -- | The stand-in's preferred block size: 64 KiB for every type.
 standInBlockSize ∷ Natural
@@ -226,6 +236,15 @@ allocatorOutOfMemory standIn times = atomically (writeTVar (allocatorExhausted s
 -- the call raises, having made nothing.
 duringAllocating ∷ AllocatorStandIn → IO () → IO ()
 duringAllocating standIn action = atomically (writeTVar (allocatorDuring standIn) (Just action))
+
+-- | Run this, once, at the start of the next placement in held memory.
+duringPlacing ∷ AllocatorStandIn → IO () → IO ()
+duringPlacing standIn action = atomically (writeTVar (allocatorPlacing standIn) (Just action))
+
+-- | Have every freed block or dedicated allocation report this many bytes
+-- more than its size from now on.
+freeExtra ∷ AllocatorStandIn → Natural → IO ()
+freeExtra standIn bytes = atomically (writeTVar (allocatorFreeExtra standIn) bytes)
 
 -- | Have the driver require a dedicated allocation for every buffer.
 requireDedicated ∷ AllocatorStandIn → IO ()
@@ -323,22 +342,21 @@ allocatorStandInOps standIn =
           writeTVar (allocatorBlocks standIn) Map.empty
           writeTVar (allocatorPlaced standIn) Map.empty
           mapM_ (\(handle, block) → journal standIn (FreedMemory handle (blockSize block))) (Map.toAscList blocks)
-          pure (MemoryEvents 0 0 (fromIntegral (Map.size blocks)) (sum (map blockSize (Map.elems blocks))))
+          extra ← readTVar (allocatorFreeExtra standIn)
+          pure (MemoryEvents 0 0 (fromIntegral (Map.size blocks)) (sum (map ((+ extra) . blockSize) (Map.elems blocks))))
     }
   where
     create size kind placement = do
       atomically (journal standIn (Placing size kind placement))
-      during ←
-        if placement == MayOpenMemory
-          then atomically $ do
-            held ← readTVar (allocatorDuring standIn)
-            writeTVar (allocatorDuring standIn) Nothing
-            pure held
-          else pure Nothing
+      during ← atomically $ do
+        let hook = if placement == MayOpenMemory then allocatorDuring standIn else allocatorPlacing standIn
+        held ← readTVar hook
+        writeTVar hook Nothing
+        pure held
       sequence_ during
       refused ← failing standIn AtCreate
       if refused
-        then pure (noMemoryEvents, Left (toException (AllocatorFailure AtCreate)))
+        then pure (noMemoryEvents, CreationFailed (toException (AllocatorFailure AtCreate)))
         else do
           bindFails ← failing standIn AtBind
           atomically $ do
@@ -346,7 +364,7 @@ allocatorStandInOps standIn =
             if placement == MayOpenMemory && exhausted > 0
               then do
                 writeTVar (allocatorExhausted standIn) (exhausted - 1)
-                pure (noMemoryEvents, Left (outOfMemory "vmaCreateBuffer"))
+                pure (noMemoryEvents, CreationFailed (outOfMemory "vmaCreateBuffer"))
               else place size kind placement bindFails
 
     -- Place in a held block that fits, or open memory if the placement allows.
@@ -359,7 +377,7 @@ allocatorStandInOps standIn =
       case candidate of
         Just (handle, _) → allocate handle size (MemoryEvents 0 0 0 0) bindFails
         Nothing
-          | placement == InHeldMemory → pure (noMemoryEvents, Left (outOfMemory "vmaCreateBuffer"))
+          | placement == InHeldMemory → pure (noMemoryEvents, NotPlaced)
           | otherwise → do
               extra ← readTVar (allocatorExtra standIn)
               growing ← readTVar (allocatorBlockSize standIn)
@@ -368,7 +386,7 @@ allocatorStandInOps standIn =
                   opening = (if alone then size else maybe preferred (max size) growing) + extra
                   held = sum (map blockSize (Map.elems blocks))
               case limit of
-                Just most | held + opening > most → pure (noMemoryEvents, Left (outOfMemory "vmaCreateBuffer"))
+                Just most | held + opening > most → pure (noMemoryEvents, CreationFailed (outOfMemory "vmaCreateBuffer"))
                 _ → do
                   handle ← fresh standIn
                   modifyTVar' (allocatorBlocks standIn) (Map.insert handle (Block kind opening 0 Set.empty alone))
@@ -385,11 +403,11 @@ allocatorStandInOps standIn =
         then do
           journal standIn (BindFailed allocation)
           freed ← release allocation
-          pure (sumEvents opened freed, Left (toException (AllocatorFailure AtBind)))
+          pure (sumEvents opened freed, CreationFailed (toException (AllocatorFailure AtBind)))
         else do
           journal standIn (MadeBuffer buffer allocation block)
           kind ← maybe 0 blockType . Map.lookup block <$> readTVar (allocatorBlocks standIn)
-          pure (opened, Right (BufferMemory buffer allocation block offset size kind))
+          pure (opened, Created (BufferMemory buffer allocation block offset size kind))
 
     -- Free an allocation, and its block if that leaves it empty and it is
     -- dedicated or not the type's only empty block.
@@ -408,7 +426,8 @@ allocatorStandInOps standIn =
                 then do
                   modifyTVar' (allocatorBlocks standIn) (Map.delete handle)
                   journal standIn (FreedMemory handle (blockSize block))
-                  pure (MemoryEvents 0 0 1 (blockSize block))
+                  extra ← readTVar (allocatorFreeExtra standIn)
+                  pure (MemoryEvents 0 0 1 (blockSize block + extra))
                 else pure noMemoryEvents
             _ → pure noMemoryEvents
 

@@ -21,9 +21,10 @@
 module Hetoimasia.GPU.Vulkan.Native.Allocator.Vulkan
   ( vmaAllocatorOps
   , memoryTypeOffers
+  , creationAnswer
   ) where
 
-import Control.Exception (SomeException, throwIO, toException)
+import Control.Exception (throwIO, toException)
 import Control.Monad (unless, when)
 import Data.Bits ((.&.))
 import qualified Data.ByteString as ByteString
@@ -45,6 +46,7 @@ import Hetoimasia.GPU.Vulkan.Native.Allocator
   ( AllocatorOps (..)
   , BufferMemory (..)
   , BufferRequest (..)
+  , Creation (..)
   , MemoryProperty (..)
   , MemoryRequirements (..)
   , MemoryTypeOffer (..)
@@ -103,9 +105,9 @@ vmaAllocatorOps created physical device = do
               (case placement of InHeldMemory → 1; MayOpenMemory → 0)
               out
           events ← resultEvents out
-          if code /= 0
-            then pure (events, Left (failure code))
-            else do
+          case creationAnswer placement code of
+            Just answer → pure (events, answer)
+            Nothing → do
               made ←
                 BufferMemory
                   <$> resultBuffer out
@@ -114,7 +116,7 @@ vmaAllocatorOps created physical device = do
                   <*> (fromIntegral <$> resultOffset out)
                   <*> (fromIntegral <$> resultSize out)
                   <*> resultMemoryType out
-              pure (events, Right made)
+              pure (events, Created made)
       , allocatorDestroyBuffer = \memory → call $ \out → do
           c_destroyBuffer state (memoryBuffer memory) (allocation memory) out
           resultEvents out
@@ -133,8 +135,18 @@ vmaAllocatorOps created physical device = do
       }
   where
     failing code = when (code /= 0) (throwIO (VulkanException (Result code)))
-    failure ∷ Int32 → SomeException
-    failure code = toException (VulkanException (Result code))
+
+-- | What a creation's result means, 'Nothing' for success. In held memory
+-- only, VMA answers a request nothing held fits with
+-- @VK_ERROR_OUT_OF_DEVICE_MEMORY@, and one the driver requires dedicated with
+-- @VK_ERROR_FEATURE_NOT_PRESENT@, since a dedicated allocation is never made
+-- in held memory: both are 'NotPlaced'. Any other result, and every failure
+-- of an allocating call, is the binding's 'VulkanException' for it.
+creationAnswer ∷ Placement → Int32 → Maybe Creation
+creationAnswer placement code
+  | code == 0 = Nothing
+  | placement == InHeldMemory, Result code `elem` [ERROR_OUT_OF_DEVICE_MEMORY, ERROR_FEATURE_NOT_PRESENT] = Just NotPlaced
+  | otherwise = Just (CreationFailed (toException (VulkanException (Result code))))
 
 -- | A buffer's create info for a request: exclusive to one queue family.
 bufferCreateInfo ∷ BufferRequest → BufferCreateInfo '[]

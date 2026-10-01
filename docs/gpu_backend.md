@@ -696,30 +696,42 @@ in this order:
    it (`vkGetDeviceBufferMemoryRequirements`), and the memory type chosen.
 2. The buffer is created in held memory only
    (`VMA_ALLOCATION_CREATE_NEVER_ALLOCATE_BIT`). That opens nothing and charges
-   nothing new; its out-of-memory answer is the expected miss, spends no
-   recovery, and leads to the next step.
+   nothing new. A request nothing held fits (VMA's
+   `VK_ERROR_OUT_OF_DEVICE_MEMORY`) and one the driver requires dedicated (VMA's
+   `VK_ERROR_FEATURE_NOT_PRESENT`, since a dedicated allocation is never made
+   in held memory) are both the expected miss, `NotPlaced`: they spend no
+   recovery and lead to the next step.
 3. The attempt reserves the most the allocating call could open
    (`reserveDeviceMemory`): the larger of the type's preferred block size —
    VMA's `CalcPreferredBlockSize`, an eighth of a heap of at most 1 GiB and
    otherwise the configured 256 MiB, aligned to 32 bytes (`preferredBlockSize`)
    — and the requirements' size. A reservation the byte budget cannot hold is
    `RefusedBackpressure`, answered before the call that could open memory, and
-   never enters recovery.
+   never enters recovery. A reservation the model rejects — the session failed,
+   or the attempt may no longer allocate — is refused with its misuse
+   (`RefusedMisuse`), and the call that could open memory is never made.
 4. The allocating call. VMA's device-memory callbacks, counting in C inside
    that call, record every block or dedicated allocation it opened and freed.
    Right after it — whether it succeeded or not — the effect is settled
    (`settleDeviceMemory`): the reservation is replaced by what it opened,
    nothing if it opened nothing, the rest returned at once, and what it freed
    released.
-5. Opening more than was reserved contradicts VMA's sizing. The buffer is
-   destroyed before its allocation is freed, that effect settled too, and the
-   request fails with `AllocatorAccountingDefect`. The memory still held stays
-   charged; if that leaves the accounted bytes above the budget, the session
-   fails with `CleanupFailed`, and nothing else is freed for it.
+5. An effect that disagrees with the accounting is a defect
+   (`AccountingFinding`): opening more than was reserved, which contradicts
+   VMA's sizing; freeing more than was charged as held, after which the charge
+   would no longer bound the memory; or an effect the model refused to settle
+   under the attempt, which is then settled under no reservation so nothing
+   held goes uncharged. The buffer is destroyed before its allocation is
+   freed, that effect settled too, and the request fails with
+   `AllocatorAccountingDefect`. The memory still held stays charged. The
+   session fails with `CleanupFailed`, and nothing else is freed for it,
+   unless the defect is memory opened beyond a reservation that the budget
+   still holds.
 6. A host-visible allocation is mapped for its lifetime (`vmaMapMemory`).
 
 Every later call that can free memory — a destruction, the allocator's own —
-is settled the same way before anything else is admitted. A block several
+is settled the same way before anything else is admitted, and a defect there
+fails the session the same way, though the destruction itself stands. A block several
 resources share is charged once, and disposing of or abandoning a resource
 releases none of it; VMA's retained empty block stays charged until VMA frees
 it. Under the default 256 MiB byte budget and VMA's 256 MiB large-heap block,

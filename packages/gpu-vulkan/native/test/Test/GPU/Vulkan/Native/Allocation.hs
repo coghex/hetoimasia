@@ -11,10 +11,15 @@
 module Test.GPU.Vulkan.Native.Allocation (spec) where
 
 import Control.Concurrent.STM (atomically)
-import Control.Exception (Exception, try)
+import Control.Exception (Exception, fromException, try)
 import qualified Crypto.Hash.SHA256 as SHA256
 import qualified Data.ByteString as ByteString
+import Data.Maybe (isNothing)
 import Data.Text (Text)
+import Hetoimasia.GPU.Model.Identity (Misuse (SessionAlreadyFailed))
+import Hetoimasia.GPU.Vulkan.Native.Allocator.Vulkan (creationAnswer)
+import Vulkan.Core10.Enums.Result (Result (..))
+import Vulkan.Exception (VulkanException (..))
 import Data.Word (Word32, Word64, Word8)
 import Numeric.Natural (Natural)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldReturn, shouldSatisfy)
@@ -49,6 +54,22 @@ spec = describe "Allocator" $ do
       chosen UsageTexture 0xF `shouldBe` Right deviceLocalType
       chosen UsageStaticGeometry 0xF `shouldBe` Right deviceLocalType
       chosen UsageTexture (bit hostCoherentType) `shouldBe` Left (MemoryTypeRefused UsageTexture (bit hostCoherentType))
+
+    it "reads VMA's answers to a placement in held memory as a miss, and an allocating call's as failures" $ do
+      let answer placement result = creationAnswer placement (case result of Result code → code)
+          missed = \case
+            Just NotPlaced → True
+            _ → False
+          outOfMemory = \case
+            Just (CreationFailed failure) → fromException failure == Just (VulkanException ERROR_OUT_OF_DEVICE_MEMORY)
+            _ → False
+      answer InHeldMemory SUCCESS `shouldSatisfy` isNothing
+      -- A driver-required dedication cannot be placed in held memory.
+      answer InHeldMemory ERROR_FEATURE_NOT_PRESENT `shouldSatisfy` missed
+      answer InHeldMemory ERROR_OUT_OF_DEVICE_MEMORY `shouldSatisfy` missed
+      answer InHeldMemory ERROR_OUT_OF_HOST_MEMORY `shouldSatisfy` (not . missed)
+      answer MayOpenMemory ERROR_OUT_OF_DEVICE_MEMORY `shouldSatisfy` outOfMemory
+      answer MayOpenMemory ERROR_FEATURE_NOT_PRESENT `shouldSatisfy` (not . missed)
 
     it "computes the preferred block size as VMA does, and bounds a reservation by it or the request" $ do
       preferredBlockSize (512 * mebibyte) `shouldBe` 64 * mebibyte
@@ -126,6 +147,9 @@ spec = describe "Allocator" $ do
       rig ← newRig defaultBudgetRequest
       requireDedicated (rigAllocator rig)
       readback ← readbackOf rig 1024
+      -- The held-memory placement is not placed, as VMA answers a required
+      -- dedication there, and the allocating call makes it.
+      map (\(_, _, placement) → placement) <$> placements rig `shouldReturn` [InHeldMemory, MayOpenMemory]
       journalOf rig `shouldReturn'` \journal → [(dedicated, size) | OpenedMemory _ _ size dedicated ← journal] `shouldBe` [(True, 1024)]
       usageDeviceMemory <$> usageOf rig `shouldReturn` 1024
       gone rig readback
@@ -152,7 +176,7 @@ spec = describe "Allocator" $ do
       rig ← newRig defaultBudgetRequest
       openExtra (rigAllocator rig) 512
       defect ← raisedBy @AllocatorAccountingDefect (createReadback (rigRecording rig) 1024)
-      (defectReserved defect, defectOpened defect) `shouldBe` (standInBlockSize, standInBlockSize + 512)
+      defectFinding defect `shouldBe` OpenedBeyondReservation standInBlockSize (standInBlockSize + 512)
       journal ← allocatorCalls (rigAllocator rig)
       let ending = dropWhile (\case MadeBuffer {} → False; _ → True) journal
       [call | call ← ending, isTeardown call] `shouldSatisfy` \case
@@ -164,6 +188,43 @@ spec = describe "Allocator" $ do
       usageDeviceMemory <$> usageOf rig `shouldReturn` standInBlockSize + 512
       (usageObjects &&& usageAllocations) <$> usageOf rig `shouldReturn` (0, 0)
       sessionState <$> modelOf rig `shouldReturn` SessionRunning
+
+    it "makes no allocating call when the model rejects the reservation, answering the misuse" $ do
+      rig ← newRig defaultBudgetRequest
+      duringPlacing (rigAllocator rig) (atomically (failRootsSession (rigRoots rig) CleanupFailed))
+      createReadback (rigRecording rig) 1024 `shouldReturn` Left (RefusedMisuse SessionAlreadyFailed)
+      map (\(_, _, placement) → placement) <$> placements rig `shouldReturn` [InHeldMemory]
+      heldBlocks (rigAllocator rig) `shouldReturn` []
+      (usageBytes &&& usageObjects) <$> usageOf rig `shouldReturn` (0, 0)
+
+    it "fails a request whose call freed more than was charged, and the session with it" $ do
+      rig ← newRig defaultBudgetRequest
+      requireDedicated (rigAllocator rig)
+      failAllocatorAt (rigAllocator rig) AtBind
+      freeExtra (rigAllocator rig) 100
+      defect ← raisedBy @AllocatorAccountingDefect (createReadback (rigRecording rig) 1024)
+      defectFinding defect `shouldBe` FreedBeyondHeld 100
+      sessionState <$> modelOf rig `shouldReturn` SessionFailed CleanupFailed
+      (usageBytes &&& usageDeviceMemory) <$> usageOf rig `shouldReturn` (0, 0)
+
+    it "fails the session when a destruction freed more than was charged, the destruction itself standing" $ do
+      rig ← newRig defaultBudgetRequest
+      requireDedicated (rigAllocator rig)
+      readback ← readbackOf rig 1024
+      freeExtra (rigAllocator rig) 100
+      gone rig readback
+      liveAllocations (rigAllocator rig) `shouldReturn` 0
+      sessionState <$> modelOf rig `shouldReturn` SessionFailed CleanupFailed
+
+    it "fails the session when what the allocator's destruction freed disagrees with what was charged" $ do
+      rig ← newRig defaultBudgetRequest
+      readback ← readbackOf rig 1024
+      gone rig readback
+      freeExtra (rigAllocator rig) 100
+      _ ← retireRoots (rigRoots rig)
+      sessionState <$> modelOf rig `shouldReturn` SessionFailed CleanupFailed
+      view ← atomically (readRootsView (rigRoots rig))
+      (viewAllocator view, viewDevice view) `shouldBe` (RootDestroyed, RootDestroyed)
 
     it "fails the session when what a defect left held exceeds the byte budget, freeing nothing else" $ do
       rig ← newRig defaultBudgetRequest {requestedBytes = fromIntegral standInBlockSize + 256}

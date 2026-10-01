@@ -45,7 +45,8 @@
 --    the start — and the allocator only once every allocation made from it
 --    has been freed ('AllocationsRemain'). What its destruction frees — the
 --    empty blocks it still held — is released from the model's accounting
---    then, exactly once;
+--    then, exactly once, and a release that disagrees with what was charged
+--    fails the session;
 -- 3. the explicit messenger, and then the instance ('destroyRoots'), only once
 --    the device is gone. The messenger goes immediately before the instance,
 --    so every child's destruction still reports somewhere, and the instance's
@@ -287,6 +288,7 @@ import Hetoimasia.GPU.Model
   , escalateSession
   , escalations
   , MemoryEffect (..)
+  , MemorySettlement (MemorySettled)
   , newGpuModel
   , settleDeviceMemory
   , noteDeviceLoss
@@ -1535,9 +1537,14 @@ retireAllocator roots =
         tryWithContext (allocatorDestroy allocator) >>= \case
           Right events → atomically $ do
             writeTVar (rootsAllocator roots) Destroyed
-            stateRootsModel roots $ \model → case settleDeviceMemory Nothing (MemoryEffect (eventsOpenedBytes events) (eventsFreedBytes events)) model of
-              Admitted (next, _) → ((), next)
-              _ → ((), model)
+            settlement ← stateRootsModel roots $ \model → case settleDeviceMemory Nothing (MemoryEffect (eventsOpenedBytes events) (eventsFreedBytes events)) model of
+              Admitted (next, settled) → (settled, next)
+              _ → (MemorySettled, model)
+            -- What the destruction freed disagreed with what was charged: the
+            -- accounting no longer bounded the device memory, which fails the
+            -- session as any accounting defect does.
+            unless (settlement == MemorySettled) $
+              latchTerminal roots (TerminalCleanupFailed ("destroying the allocator settled " <> Text.pack (show settlement) <> " against the device memory charged"))
           Left failure → uncertainly roots (rootsAllocator roots) "allocator" failure
     Uncertain reason → throwIO (AllocatorRemains (RootUncertain reason))
     _ → pure ()

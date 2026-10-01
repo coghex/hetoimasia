@@ -9,23 +9,28 @@
 --    chooses the one memory type ('chooseMemoryType'). A usage no allowed type
 --    serves is refused, naming it, before any allocation.
 -- 2. The buffer is created in held memory only ('InHeldMemory'). That opens
---    nothing and charges nothing new; an out-of-memory answer is the expected
---    miss, not a failure, and spends no recovery.
+--    nothing and charges nothing new; 'NotPlaced' — nothing held fits, or the
+--    driver requires a dedicated allocation — is the expected miss, not a
+--    failure, and spends no recovery.
 -- 3. On a miss, the attempt reserves the most the allocating call could open
 --    ('reservationBound'): the type's preferred block size or the requirements'
 --    size, whichever is larger. A reservation the byte budget cannot hold is
---    backpressure, answered before the call that could open memory.
+--    backpressure, and one the model rejects is refused with its misuse, each
+--    answered before the call that could open memory, which is then never
+--    made.
 -- 4. The allocating call ('MayOpenMemory'). Its effect is settled at once —
 --    the reservation replaced by what it opened, what it freed released —
 --    whether it succeeded or not. A failure is raised as the call raised it,
 --    so an out-of-memory result reaches the caller's VK-14 recovery with its
 --    reservation already returned; a retry reserves again against the
 --    reconciled accounting.
--- 5. More opened than was reserved is an accounting defect: the buffer is
---    destroyed and its allocation freed, that effect settled too, and
---    'AllocatorAccountingDefect' raised. If the memory still held leaves the
---    accounted bytes above the budget, the session fails, with nothing else
---    freed.
+-- 5. Any effect that disagrees with the accounting is a defect
+--    ('AccountingFinding'): more opened than was reserved, more freed than was
+--    held, or an effect the model refused to settle under the attempt. The
+--    buffer is destroyed and its allocation freed, that effect settled too,
+--    and 'AllocatorAccountingDefect' raised. The session fails, with nothing
+--    else freed, unless the defect is memory opened beyond a reservation that
+--    the budget still holds.
 -- 6. A host-visible allocation is mapped for its lifetime. A map that failed
 --    destroys what was made, settling that effect, and is raised.
 --
@@ -35,7 +40,9 @@
 -- = Freeing
 --
 -- 'freeBuffer' unmaps a mapped allocation, destroys the buffer and frees its
--- allocation — the resource before its memory — and settles what that freed.
+-- allocation — the resource before its memory — and settles what that freed;
+-- an effect that disagrees with the accounting fails the session, as at
+-- creation, though the destruction itself returned.
 -- It is only ever reached through a disposal the model allowed, after
 -- completion evidence ended every submitted use: the allocator tracks no GPU
 -- use and is never relied on to.
@@ -53,9 +60,10 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Allocation
   ) where
 
 import Control.Concurrent.STM (STM, atomically)
-import Control.Exception (SomeException, onException, throwIO)
+import Control.Exception (Exception (displayException), SomeException, onException, throwIO)
 import Control.Monad (when)
 import Data.ByteString (ByteString)
+import Data.Foldable (for_, traverse_)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word64)
@@ -73,12 +81,14 @@ import Hetoimasia.GPU.Model
   , usage
   )
 import Hetoimasia.GPU.Model.Budget (BudgetKind, byteLimit)
-import Hetoimasia.GPU.Model.Identity (AllocationId)
+import Hetoimasia.GPU.Model.Identity (AllocationId, Misuse)
 import Hetoimasia.GPU.Vulkan.Native.Allocator
-  ( AllocatorAccountingDefect (..)
+  ( AccountingFinding (..)
+  , AllocatorAccountingDefect (..)
   , AllocatorOps (..)
   , BufferMemory (..)
   , BufferRequest (..)
+  , Creation (..)
   , MemoryEvents (..)
   , MemoryProperty (..)
   , noMemoryEvents
@@ -91,13 +101,11 @@ import Hetoimasia.GPU.Vulkan.Native.Allocator
   , reservationBound
   )
 import Hetoimasia.GPU.Vulkan.Native.Roots
-  ( NativeFailure (FailedOutOfMemory)
-  , Roots
+  ( Roots
   , failRootsSessionBecause
   , noteRootsAllocation
   , readRootsAllocator
   , rootsCall
-  , rootsNativeFailure
   , stateRootsModel
   )
 
@@ -118,6 +126,10 @@ data AllocationRefusal
     -- ^ No memory type the buffer allows serves its usage.
   | AllocationBackpressure !BudgetKind
     -- ^ The byte budget cannot hold what the allocating call could open.
+  | AllocationRejected !Misuse
+    -- ^ The model would not reserve for the attempt — the session failed, or
+    -- the attempt is no longer one that may allocate — so the call that could
+    -- open memory was never made.
   deriving (Eq, Show)
 
 -- | Make a buffer's memory for the attempt, in the memory type the usage
@@ -137,38 +149,34 @@ allocateBuffer roots attempt kind request =
         Left refused → pure (Left (AllocationNoMemoryType refused))
         Right offer → do
           let index = offerTypeIndex offer
-          (heldEvents, held) ← rootsCall roots "vmaCreateBuffer" (allocatorCreateBuffer ops request index InHeldMemory)
-          settled ← settle roots Nothing heldEvents
-          case (held, settled) of
-            -- A placement in held memory opens nothing; one that did is the
-            -- same defect as opening more than was reserved.
-            (Right memory, MemoryBeyondReservation _) → defect roots ops memory "vmaCreateBuffer in held memory" 0 (eventsOpenedBytes heldEvents)
-            (Left _, MemoryBeyondReservation _) → do
-              overBudget roots "vmaCreateBuffer in held memory" 0 (eventsOpenedBytes heldEvents)
-              throwIO (AllocatorAccountingDefect "vmaCreateBuffer in held memory" 0 (eventsOpenedBytes heldEvents))
-            (Right memory, _) → Right <$> finish ops offer memory
-            (Left failure, _)
-              | rootsNativeFailure roots failure == Just FailedOutOfMemory → do
-                  let bound = reservationBound offer (requirementSize needs)
-                  reserved ← atomically $ stateRootsModel roots $ \model → case reserveDeviceMemory attempt bound model of
-                    Admitted next → (Right (), next)
-                    Backpressure budget → (Left budget, model)
-                    Rejected _ → (Right (), model)
-                  case reserved of
-                    Left budget → pure (Left (AllocationBackpressure budget))
-                    Right () → do
-                      (events, made) ←
-                        rootsCall roots "vmaCreateBuffer" (allocatorCreateBuffer ops request index MayOpenMemory)
-                          `onException` atomically (settleWith roots (Just attempt) noMemoryEvents)
-                      settlement ← settle roots (Just attempt) events
-                      case (made, settlement) of
-                        (Right memory, MemoryBeyondReservation _) → defect roots ops memory "vmaCreateBuffer" bound (eventsOpenedBytes events)
-                        (Left _, MemoryBeyondReservation _) → do
-                          overBudget roots "vmaCreateBuffer" bound (eventsOpenedBytes events)
-                          throwIO (AllocatorAccountingDefect "vmaCreateBuffer" bound (eventsOpenedBytes events))
-                        (Right memory, _) → Right <$> finish ops offer memory
-                        (Left raised, _) → raise roots "vmaCreateBuffer" raised
-              | otherwise → raise roots "vmaCreateBuffer" failure
+              heldCall = "vmaCreateBuffer in held memory"
+          (heldEvents, held) ← rootsCall roots heldCall (allocatorCreateBuffer ops request index InHeldMemory)
+          heldFinding ← atomically (settle roots Nothing 0 heldEvents)
+          -- A placement in held memory opens nothing; one that did, or any
+          -- effect the accounting cannot take, fails the request.
+          for_ heldFinding (failRequest roots ops heldCall held)
+          case held of
+            Created memory → Right <$> finish ops offer memory
+            CreationFailed failure → raise roots heldCall failure
+            NotPlaced → do
+              let bound = reservationBound offer (requirementSize needs)
+              reserved ← atomically $ stateRootsModel roots $ \model → case reserveDeviceMemory attempt bound model of
+                Admitted next → (Right (), next)
+                Backpressure budget → (Left (AllocationBackpressure budget), model)
+                Rejected misuse → (Left (AllocationRejected misuse), model)
+              case reserved of
+                Left refusal → pure (Left refusal)
+                Right () → do
+                  let call = "vmaCreateBuffer"
+                  (events, made) ←
+                    rootsCall roots call (allocatorCreateBuffer ops request index MayOpenMemory)
+                      `onException` atomically (settle roots (Just attempt) bound noMemoryEvents)
+                  finding ← atomically (settle roots (Just attempt) bound events)
+                  for_ finding (failRequest roots ops call made)
+                  case made of
+                    Created memory → Right <$> finish ops offer memory
+                    CreationFailed failure → raise roots call failure
+                    NotPlaced → throwIO (userError "the allocator answered an allocating call as a placement miss")
   where
     -- Map what is host-visible, count the allocation, and answer it. A map
     -- that failed destroys what was made, settling that, and is raised.
@@ -187,22 +195,21 @@ allocateBuffer roots attempt kind request =
 
 -- | Unmap, destroy the buffer, then free its allocation, settling what that
 -- freed and counting the allocation gone. A call that raised has an unknown
--- effect; the caller retains what it concerns.
+-- effect; the caller retains what it concerns. The destruction itself
+-- returned even when its effect disagrees with the accounting, so that
+-- defect fails the session rather than the destruction.
 freeBuffer ∷ Roots q inst msgr phys dev → AllocatedBuffer → IO ()
 freeBuffer roots allocated =
   atomically (readRootsAllocator roots) >>= \case
     Nothing → throwIO (userError "the device's allocator is gone while an allocation made from it remains")
     Just ops → do
       let memory = allocatedMemory allocated
-      for' (allocatedMapped allocated) $ \_ → rootsCall roots "vmaUnmapMemory" (allocatorUnmap ops memory)
+      for_ (allocatedMapped allocated) $ \_ → rootsCall roots "vmaUnmapMemory" (allocatorUnmap ops memory)
       events ← rootsCall roots "vmaDestroyBuffer" (allocatorDestroyBuffer ops memory)
-      settled ← settle roots Nothing events
-      atomically (noteRootsAllocation roots False)
-      case settled of
-        MemoryBeyondReservation opened → overBudget roots "vmaDestroyBuffer" 0 opened
-        _ → pure ()
-  where
-    for' value action = maybe (pure ()) action value
+      atomically $ do
+        finding ← settle roots Nothing 0 events
+        noteRootsAllocation roots False
+        for_ finding (defectFails roots "vmaDestroyBuffer")
 
 -- | Flush a range of a buffer's allocation, relative to its start, after host
 -- writes to non-coherent memory.
@@ -226,15 +233,37 @@ withAllocator roots use =
     Nothing → throwIO (userError "the device's allocator is gone while an allocation made from it remains")
     Just ops → use ops
 
--- | Settle one call's events into the model, answering what settling found.
-settle ∷ Roots q inst msgr phys dev → Maybe AllocationId → MemoryEvents → IO MemorySettlement
-settle roots attempt events = atomically (settleWith roots attempt events)
+-- | Settle one call's events into the model, under the attempt's reservation
+-- of this many bytes or under none, answering what disagreed, if anything.
+-- An effect the model refuses to settle under the attempt is settled under no
+-- reservation instead, so nothing held goes uncharged, and is a finding too.
+settle ∷ Roots q inst msgr phys dev → Maybe AllocationId → Natural → MemoryEvents → STM (Maybe AccountingFinding)
+settle roots attempt reserved events =
+  stateRootsModel roots $ \model → case settleDeviceMemory attempt effect model of
+    Admitted (next, settlement) → (judged settlement, next)
+    refused →
+      let why = Text.pack (show (fmap fst refused))
+       in case settleDeviceMemory Nothing effect model of
+            Admitted (next, _) → (Just (SettlementRefused why), next)
+            _ → (Just (SettlementRefused why), model)
+  where
+    opened = eventsOpenedBytes events
+    effect = MemoryEffect opened (eventsFreedBytes events)
+    judged = \case
+      MemorySettled → Nothing
+      MemoryBeyondReservation _ → Just (OpenedBeyondReservation reserved opened)
+      MemoryFreedUnheld excess → Just (FreedBeyondHeld excess)
 
-settleWith ∷ Roots q inst msgr phys dev → Maybe AllocationId → MemoryEvents → STM MemorySettlement
-settleWith roots attempt events =
-  stateRootsModel roots $ \model → case settleDeviceMemory attempt (MemoryEffect (eventsOpenedBytes events) (eventsFreedBytes events)) model of
-    Admitted (next, settlement) → (settlement, next)
-    _ → (MemorySettled, model)
+-- | A request's call disagreed with the accounting: destroy what it made,
+-- settling that, fail the session as the finding requires, and raise the
+-- defect.
+failRequest ∷ Roots q inst msgr phys dev → AllocatorOps → Text → Creation → AccountingFinding → IO a
+failRequest roots ops operation made finding = do
+  case made of
+    Created memory → destroyMade roots ops memory
+    _ → pure ()
+  atomically (defectFails roots operation finding)
+  throwIO (AllocatorAccountingDefect operation finding)
 
 -- | Destroy what a creation made before it is returned, settling what that
 -- freed. Used on the paths that raise afterwards, so a destruction that
@@ -242,33 +271,21 @@ settleWith roots attempt events =
 destroyMade ∷ Roots q inst msgr phys dev → AllocatorOps → BufferMemory → IO ()
 destroyMade roots ops memory = do
   events ← rootsCall roots "vmaDestroyBuffer" (allocatorDestroyBuffer ops memory)
-  _ ← settle roots Nothing events
-  pure ()
+  atomically (settle roots Nothing 0 events >>= traverse_ (defectFails roots "vmaDestroyBuffer"))
 
--- | An allocating call opened more than was reserved: destroy what it made,
--- free its allocation, settle that, and raise the defect.
-defect ∷ Roots q inst msgr phys dev → AllocatorOps → BufferMemory → Text → Natural → Natural → IO a
-defect roots ops memory operation reserved opened = do
-  destroyMade roots ops memory
-  overBudget roots operation reserved opened
-  throwIO (AllocatorAccountingDefect operation reserved opened)
-
--- | Fail the session if the device memory still held — after a defect's
--- rollback, which the allocator may have kept as an empty block — leaves the
--- accounted bytes above the budget: admission cannot resume over unaccounted
--- memory. Nothing else is freed for it.
-overBudget ∷ Roots q inst msgr phys dev → Text → Natural → Natural → IO ()
-overBudget roots operation reserved opened =
-  atomically $ do
-    over ← stateRootsModel roots $ \model → (usageBytes (usage model) > byteLimit (modelBudgets model), model)
-    when over $
-      failRootsSessionBecause roots CleanupFailed $
-        operation
-          <> " opened "
-          <> Text.pack (show opened)
-          <> " bytes of device memory where "
-          <> Text.pack (show reserved)
-          <> " were reserved, and what it left held exceeds the byte budget"
+-- | Fail the session for an accounting defect, unless it is memory opened
+-- beyond a reservation that the budget still holds: admission never resumes
+-- over memory the accounting does not bound. Nothing else is freed for it.
+defectFails ∷ Roots q inst msgr phys dev → Text → AccountingFinding → STM ()
+defectFails roots operation finding = do
+  over ← stateRootsModel roots $ \model → (usageBytes (usage model) > byteLimit (modelBudgets model), model)
+  let fails = case finding of
+        OpenedBeyondReservation _ _ → over
+        _ → True
+  when fails $
+    failRootsSessionBecause roots CleanupFailed $
+      Text.pack (displayException (AllocatorAccountingDefect operation finding))
+        <> if over then "; what is held exceeds the byte budget" else ""
 
 -- | Raise an allocator call's failure through the roots, so a device loss is
 -- latched as any other call's is.

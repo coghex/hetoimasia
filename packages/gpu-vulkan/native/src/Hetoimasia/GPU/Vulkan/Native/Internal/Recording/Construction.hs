@@ -206,6 +206,7 @@ createReadback recording bytes
                 Left AllocationNoAllocator → pure (Left RefusedDeviceAbsent)
                 Left (AllocationNoMemoryType (MemoryTypeRefused kind _)) → pure (Left (RefusedNoMemoryType kind))
                 Left (AllocationBackpressure budget) → pure (Left (RefusedBackpressure budget))
+                Left (AllocationRejected misuse) → pure (Left (RefusedMisuse misuse))
                 Right allocated → case allocatedMapped allocated of
                   Just mapped →
                     pure (Right (NativeReadback (ReadbackAllocation (memoryBuffer (allocatedMemory allocated)) (allocatedMemory allocated) bytes (allocatedCoherent allocated) mapped) ContentsUndefined))

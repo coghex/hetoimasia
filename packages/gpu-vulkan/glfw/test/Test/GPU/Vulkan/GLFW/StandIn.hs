@@ -128,7 +128,7 @@ import Control.Concurrent.STM
   , stateTVar
   , writeTVar
   )
-import Control.Exception (Exception, ExceptionWithContext (ExceptionWithContext), SomeException, fromException, rethrowIO, throwIO, toException, try, tryWithContext, uninterruptibleMask_)
+import Control.Exception (Exception, ExceptionWithContext (ExceptionWithContext), SomeException, fromException, rethrowIO, throwIO, try, tryWithContext, uninterruptibleMask_)
 import Control.Monad (void, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
@@ -189,6 +189,7 @@ import Hetoimasia.GPU.Vulkan.Native.Allocator
   , Placement (..)
   , noMemoryEvents
   )
+import qualified Hetoimasia.GPU.Vulkan.Native.Allocator as Allocator
 import Hetoimasia.GPU.Vulkan.Native.Recording (NativeCommand (..), PipelineRequest (..), RecordingOps (..), Refusal (..))
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   ( CaptureMode (..)
@@ -387,14 +388,6 @@ data Scripted
     -- surface's loss (VK-14).
 
 -- | @VK_ERROR_SURFACE_LOST_KHR@, as the stand-in raises it.
--- | The stand-in allocator's out-of-memory answer, which this layer
--- classifies as such: a placement in held memory always misses, since every
--- allocation it makes is dedicated.
-data StandInOutOfMemory = StandInOutOfMemory
-  deriving (Eq, Show)
-
-instance Exception StandInOutOfMemory
-
 newtype StandInSurfaceLost = StandInSurfaceLost Text
   deriving (Eq, Show)
 
@@ -586,10 +579,7 @@ nativeLayer events native allocator capture =
         step events native AtSupport (SupportQueried surface)
         Set.notMember surface <$> readTVarIO (nativeUnsupported native)
     , opsDeviceLoss = \failure → isJust (fromException failure ∷ Maybe StandInLoss)
-    , opsNativeFailure = \failure →
-        case fromException failure of
-          Just (StandInSurfaceLost _) → Just FailedSurfaceLost
-          Nothing → FailedOutOfMemory <$ (fromException failure ∷ Maybe StandInOutOfMemory)
+    , opsNativeFailure = \failure → FailedSurfaceLost <$ (fromException failure ∷ Maybe StandInSurfaceLost)
     , -- The stand-in device offers no naming unless an example asks for it
       -- ('offerNaming'); without it nothing is named and its queue is never
       -- asked for.
@@ -1037,8 +1027,8 @@ retireNextPresentations ∷ Rig → Maybe Int → IO ()
 retireNextPresentations rig = atomically . writeTVar (renderingRetireCount (rigRendering rig))
 
 -- | The device's allocator: one host-visible, coherent and cached memory
--- type, and every allocation dedicated, so a placement in held memory always
--- misses and an allocating call opens exactly what it allocates. A readback's
+-- type, and every allocation dedicated, so a placement in held memory is
+-- never placed and an allocating call opens exactly what it allocates. A readback's
 -- creation raises what 'raiseOnCreate' scripted for it before anything is
 -- made.
 renderingAllocator ∷ Journal → Rendering → AllocatorOps
@@ -1049,14 +1039,14 @@ renderingAllocator events rendering =
     , allocatorCreateBuffer = \request _ placement → case placement of
         InHeldMemory →
           atomically (stateTVar (renderingCreations rendering) (\held → (Map.lookup CreateReadback held, Map.delete CreateReadback held))) >>= \case
-            Just failure → pure (noMemoryEvents, Left failure)
-            Nothing → pure (noMemoryEvents, Left (toException StandInOutOfMemory))
+            Just failure → pure (noMemoryEvents, Allocator.CreationFailed failure)
+            Nothing → pure (noMemoryEvents, Allocator.NotPlaced)
         MayOpenMemory → do
           buffer ← fresh
           allocation ← fresh
           let size = requestBufferSize request
           record events (ReadbackMade buffer size)
-          pure (MemoryEvents 1 size 0 0, Right (BufferMemory buffer allocation allocation 0 size 0))
+          pure (MemoryEvents 1 size 0 0, Allocator.Created (BufferMemory buffer allocation allocation 0 size 0))
     , allocatorDestroyBuffer = \memory → do
         record events (ReadbackGone (memoryBuffer memory))
         pure (MemoryEvents 0 0 1 (memorySize memory))

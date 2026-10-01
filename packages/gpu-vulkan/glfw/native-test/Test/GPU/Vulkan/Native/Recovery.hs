@@ -99,7 +99,7 @@ import Hetoimasia.GPU.Vulkan.Diagnostics
   , verdictIssues
   , withDiagnosticCapture
   )
-import Hetoimasia.GPU.Vulkan.Native.Allocator (AllocatorOps (..), Placement (..), noMemoryEvents)
+import Hetoimasia.GPU.Vulkan.Native.Allocator (AllocatorOps (..), Creation (..), Placement (..), noMemoryEvents)
 import Hetoimasia.GPU.Vulkan.Native.Frames
 import Hetoimasia.GPU.Vulkan.Native.Frames.Vulkan (vulkanFrameOps)
 import Hetoimasia.GPU.Vulkan.Native.Generations
@@ -338,7 +338,7 @@ journaled injections ops =
                   if armed
                     then do
                       modifyIORef' (rootCalls injections) ("vmaCreateBuffer: VK_ERROR_OUT_OF_DEVICE_MEMORY (injected)" :)
-                      pure (noMemoryEvents, Left (toException (VulkanException ERROR_OUT_OF_DEVICE_MEMORY)))
+                      pure (noMemoryEvents, CreationFailed (toException (VulkanException ERROR_OUT_OF_DEVICE_MEMORY)))
                     else noted "vmaCreateBuffer" (allocatorCreateBuffer allocator request kind placement)
             }
     , opsSurfaceSupport = \created physical family surface → noted ("vkGetPhysicalDeviceSurfaceSupportKHR " <> hex surface) (opsSurfaceSupport ops created physical family surface)
