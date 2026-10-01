@@ -776,7 +776,13 @@ failed destroys the buffer and frees its allocation, settling that; an owned
 view whose creation failed destroys its image and frees the image's
 allocation, settling that. Memory such
 a failure left held — a block opened for it and kept, empty — stays charged
-until VMA frees it, and the next request may place in it. A failed request
+until VMA frees it, and the next request may place in it. Each allocation is
+counted with the roots the moment the call that made it returns, and a
+failed request counts what it made gone only once destroying it returned; a
+destruction that raised there has an unknown effect, so the allocation stays
+counted — the allocator, and the device, are never destroyed under it — the
+session fails with `CleanupFailed`, and the request's own failure is the one
+raised. A failed request
 rolls back only itself: other allocations, their blocks and their mappings are
 untouched.
 
@@ -1189,7 +1195,11 @@ undefined layout. Before anything native is created:
   `vkGetPhysicalDeviceImageFormatProperties` allows for the kind's usage: a
   combination it does not support is `RefusedImageUnsupported`, and a width,
   height or mip count beyond what it allows `RefusedOutOfBounds`. That query
-  is the only native call before creation.
+  is the only native call before the creation's reservation;
+- once the attempt is reserved, the image's memory requirements are asked of
+  the device, still creating nothing, and requirements beyond the device's
+  largest resource for that use (`maxResourceSize`) are `RefusedOutOfBounds`,
+  naming both sizes, with the reservation given back.
 
 **The owned view.** Each image owns exactly one view of its whole resource —
 two-dimensional, every mip level of its one layer, in its own format, over

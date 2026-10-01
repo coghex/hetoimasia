@@ -129,7 +129,7 @@ newRecordingStandIn =
 
 -- | What every image is supported up to unless an example says otherwise.
 standInImageLimits ∷ ImageLimits
-standInImageLimits = ImageLimits 16384 16384 15
+standInImageLimits = ImageLimits 16384 16384 15 (2 ^ (31 ∷ Int))
 
 -- | The largest buffer unless an example says otherwise: 1 GiB.
 standInMaxBufferSize ∷ Natural

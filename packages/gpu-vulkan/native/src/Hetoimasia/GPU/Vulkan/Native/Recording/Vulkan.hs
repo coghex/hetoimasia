@@ -131,8 +131,8 @@ vulkanRecordingOps physical = do
 
 -- | Whether the physical device supports an optimally tiled two-dimensional
 -- image of the query: its format offers every format feature asked for, and
--- the device answers its format properties for the usage — the extent and mip
--- levels it allows. A combination the device answers
+-- the device answers its format properties for the usage — the extent, mip
+-- levels and resource size it allows. A combination the device answers
 -- @VK_ERROR_FORMAT_NOT_SUPPORTED@ for is unsupported; any other failure is
 -- raised.
 imageSupport ∷ PhysicalDevice → ImageQuery → IO (Maybe ImageLimits)
@@ -155,6 +155,7 @@ imageSupport physical query = do
         { limitWidth = properties.maxExtent.width
         , limitHeight = properties.maxExtent.height
         , limitMipLevels = properties.maxMipLevels
+        , limitResourceSize = fromIntegral properties.maxResourceSize
         }
 
 mapped ∷ ReadbackAllocation → Ptr ()

@@ -40,8 +40,11 @@
 --    An image's allocation is never mapped: it is optimally tiled, and the
 --    host never writes it directly (D-16).
 --
--- Every allocation made is counted with the roots ('noteRootsAllocation'),
--- which refuse to destroy the allocator while any remain.
+-- Every allocation made is counted with the roots ('noteRootsAllocation') the
+-- moment the call that made it returns, and the roots refuse to destroy the
+-- allocator while any remain. A request that destroys what it made, on a
+-- failure, counts it gone only once that destruction returned; one that
+-- raised leaves it counted, and fails the session with 'CleanupFailed'.
 --
 -- = Freeing
 --
@@ -70,10 +73,21 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Allocation
   ) where
 
 import Control.Concurrent.STM (STM, atomically)
-import Control.Exception (Exception (displayException), SomeException, onException, throwIO)
+import Control.Exception
+  ( Exception (displayException)
+  , ExceptionWithContext (ExceptionWithContext)
+  , SomeAsyncException
+  , SomeException
+  , fromException
+  , onException
+  , rethrowIO
+  , throwIO
+  , tryWithContext
+  )
 import Control.Monad (when)
 import Data.ByteString (ByteString)
 import Data.Foldable (for_, traverse_)
+import Data.Maybe (isJust)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word32, Word64)
@@ -141,6 +155,9 @@ data AllocationRefusal
     -- ^ The model would not reserve for the attempt — the session failed, or
     -- the attempt is no longer one that may allocate — so the call that could
     -- open memory was never made.
+  | AllocationBeyondResource !Natural !Natural
+    -- ^ The resource's memory requirements exceed what the device allows one
+    -- resource: what it needs, and the most. Nothing was created.
   deriving (Eq, Show)
 
 -- | How the protocol makes and destroys one kind of resource: the
@@ -153,6 +170,9 @@ data Shape = Shape
   , shapeDestroyer ∷ !Destroyer
   , shapeMapped ∷ !Bool
     -- ^ Whether a host-visible allocation is mapped for its lifetime.
+  , shapeMostSize ∷ !(Maybe Natural)
+    -- ^ The most memory the device allows one such resource, when it states
+    -- one.
   }
 
 -- | How one kind of resource is destroyed with its allocation, and the name
@@ -175,10 +195,11 @@ bufferShape request =
     , shapeCreate = \ops → allocatorCreateBuffer ops request
     , shapeDestroyer = bufferDestroyer
     , shapeMapped = True
+    , shapeMostSize = Nothing
     }
 
-imageShape ∷ ImageRequest → Shape
-imageShape request =
+imageShape ∷ ImageRequest → Natural → Shape
+imageShape request most =
   Shape
     { shapeRequirementsCall = "vkGetDeviceImageMemoryRequirements"
     , shapeRequirements = \ops → allocatorImageRequirements ops request
@@ -186,6 +207,7 @@ imageShape request =
     , shapeCreate = \ops → allocatorCreateImage ops request
     , shapeDestroyer = imageDestroyer
     , shapeMapped = False
+    , shapeMostSize = Just most
     }
 
 -- | Make a buffer's memory for the attempt, in the memory type the usage
@@ -200,14 +222,17 @@ allocateBuffer roots attempt kind request = allocate roots (bufferShape request)
 
 -- | Make an image's memory for the attempt, in the memory type the usage
 -- chooses, by the protocol above: the image and its allocation, bound, and
--- never mapped.
+-- never mapped. An image whose memory requirements exceed the device's
+-- largest resource (@maxResourceSize@) is refused once they are known, before
+-- anything is created.
 allocateImage
   ∷ Roots q inst msgr phys dev
   → AllocationId
   → MemoryUsage
   → ImageRequest
+  → Natural
   → IO (Either AllocationRefusal BoundMemory)
-allocateImage roots attempt kind request = fmap allocatedMemory <$> allocate roots (imageShape request) attempt kind
+allocateImage roots attempt kind request most = fmap allocatedMemory <$> allocate roots (imageShape request most) attempt kind
 
 allocate
   ∷ Roots q inst msgr phys dev
@@ -221,12 +246,13 @@ allocate roots shape attempt kind =
     Just ops → do
       needs ← rootsCall roots (shapeRequirementsCall shape) (shapeRequirements shape ops)
       case chooseMemoryType kind (requirementTypes needs) (allocatorMemoryTypes ops) of
+        _ | Just most ← shapeMostSize shape, requirementSize needs > most → pure (Left (AllocationBeyondResource (requirementSize needs) most))
         Left refused → pure (Left (AllocationNoMemoryType refused))
         Right offer → do
           let index = offerTypeIndex offer
               heldCall = shapeCreateCall shape <> " in held memory"
           (heldEvents, held) ← rootsCall roots heldCall (shapeCreate shape ops index InHeldMemory)
-          heldFinding ← atomically (settle roots Nothing 0 heldEvents)
+          heldFinding ← atomically (counted held >> settle roots Nothing 0 heldEvents)
           -- A placement in held memory opens nothing; one that did, or any
           -- effect the accounting cannot take, fails the request.
           for_ heldFinding (failRequest roots shape ops heldCall held)
@@ -246,16 +272,20 @@ allocate roots shape attempt kind =
                   (events, made) ←
                     rootsCall roots call (shapeCreate shape ops index MayOpenMemory)
                       `onException` atomically (settle roots (Just attempt) bound noMemoryEvents)
-                  finding ← atomically (settle roots (Just attempt) bound events)
+                  finding ← atomically (counted made >> settle roots (Just attempt) bound events)
                   for_ finding (failRequest roots shape ops call made)
                   case made of
                     Created memory → Right <$> finish ops offer memory
                     CreationFailed failure → raise roots call failure
                     NotPlaced → throwIO (userError "the allocator answered an allocating call as a placement miss")
   where
-    -- Map what is host-visible and mapped by this shape, count the
-    -- allocation, and answer it. A map that failed destroys what was made,
-    -- settling that, and is raised.
+    -- Count an allocation with the roots the moment a call answers it made,
+    -- so it is counted for as long as anything might still hold it.
+    counted = \case
+      Created _ → noteRootsAllocation roots True
+      _ → pure ()
+    -- Map what is host-visible and mapped by this shape, and answer it. A map
+    -- that failed destroys what was made, settling that, and is raised.
     finish ops offer memory = do
       let visible = shapeMapped shape && HostVisible `elem` offerProperties offer
           coherent = HostCoherent `elem` offerProperties offer
@@ -266,7 +296,6 @@ allocate roots shape attempt kind =
               <$> rootsCall roots "vmaMapMemory" (allocatorMap ops memory)
                 `onException` destroyMade roots (shapeDestroyer shape) ops memory
           else pure Nothing
-      atomically (noteRootsAllocation roots True)
       pure (AllocatedBuffer memory coherent mapped)
 
 -- | Unmap, destroy the buffer, then free its allocation, settling what that
@@ -355,12 +384,24 @@ failRequest roots shape ops operation made finding = do
   throwIO (AllocatorAccountingDefect operation finding)
 
 -- | Destroy what a creation made before it is returned, settling what that
--- freed. Used on the paths that raise afterwards, so a destruction that
--- raised too is left to propagate in its place.
+-- freed and counting the allocation gone. It is used on the paths that raise
+-- their own failure afterwards, so a destruction that raised is not raised in
+-- its place: its effect is unknown, so the allocation stays counted — the
+-- allocator is never destroyed under it, nor the device — and the session
+-- fails with 'CleanupFailed'. A cancellation of it is re-raised.
 destroyMade ∷ Roots q inst msgr phys dev → Destroyer → AllocatorOps → BoundMemory → IO ()
-destroyMade roots destroyer ops memory = do
-  events ← rootsCall roots (destroyerCall destroyer) (destroyerDestroy destroyer ops memory)
-  atomically (settle roots Nothing 0 events >>= traverse_ (defectFails roots (destroyerCall destroyer)))
+destroyMade roots destroyer ops memory =
+  tryWithContext @SomeException (rootsCall roots call (destroyerDestroy destroyer ops memory)) >>= \case
+    Right events → atomically $ do
+      settle roots Nothing 0 events >>= traverse_ (defectFails roots call)
+      noteRootsAllocation roots False
+    Left failure@(ExceptionWithContext _ exception) → do
+      atomically $
+        failRootsSessionBecause roots CleanupFailed $
+          call <> " of what a failed request made raised: " <> Text.pack (displayException exception)
+      when (isJust (fromException exception ∷ Maybe SomeAsyncException)) (rethrowIO failure)
+  where
+    call = destroyerCall destroyer
 
 -- | Fail the session for an accounting defect, unless it is memory opened
 -- beyond a reservation that the budget still holds: admission never resumes

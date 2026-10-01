@@ -314,12 +314,13 @@ data ImageQuery = ImageQuery
   }
   deriving (Eq, Show)
 
--- | The most a supported image of one query may be: its extent and its mip
--- levels.
+-- | The most a supported image of one query may be: its extent, its mip
+-- levels, and the bytes its memory may need (@maxResourceSize@).
 data ImageLimits = ImageLimits
   { limitWidth ∷ !Word32
   , limitHeight ∷ !Word32
   , limitMipLevels ∷ !Word32
+  , limitResourceSize ∷ !Natural
   }
   deriving (Eq, Show)
 

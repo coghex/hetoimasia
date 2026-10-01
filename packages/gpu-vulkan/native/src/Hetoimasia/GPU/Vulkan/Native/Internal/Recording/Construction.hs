@@ -305,7 +305,10 @@ createBuffer recording (BufferDescription kind bytes)
 -- asked about the format, usage and format features — the one native call
 -- before creation — and a combination it does not support is
 -- 'RefusedImageUnsupported', and an extent or mip count beyond what it
--- supports for it 'RefusedOutOfBounds'.
+-- supports for it 'RefusedOutOfBounds'. Once the attempt has its reservation,
+-- the image's memory requirements are asked of the device, still creating
+-- nothing, and ones beyond the device's largest resource for it
+-- (@maxResourceSize@) are 'RefusedOutOfBounds' too, naming both sizes.
 --
 -- The attempt reserves three objects — the image, its allocation and its view
 -- — and no bytes of its own (D-40). A view whose creation raised destroys the
@@ -328,7 +331,7 @@ createImage recording description =
                   | width > limitWidth limits → pure (Left (RefusedOutOfBounds (fromIntegral width) (fromIntegral (limitWidth limits))))
                   | height > limitHeight limits → pure (Left (RefusedOutOfBounds (fromIntegral height) (fromIntegral (limitHeight limits))))
                   | levels > limitMipLevels limits → pure (Left (RefusedOutOfBounds (fromIntegral levels) (fromIntegral (limitMipLevels limits))))
-                  | otherwise → fmap Image <$> construct recording 0 3 "vmaCreateImage" create Nothing
+                  | otherwise → fmap Image <$> construct recording 0 3 "vmaCreateImage" (create (limitResourceSize limits)) Nothing
   where
     roots = recordingRoots recording
     ops = recordingOps recording
@@ -342,8 +345,8 @@ createImage recording description =
       | width == 0 || height == 0 || levels == 0 = Just (RefusedOutOfBounds 0 0)
       | levels > chain = Just (RefusedOutOfBounds (fromIntegral levels) (fromIntegral chain))
       | otherwise = Nothing
-    create native device attempt _ =
-      allocateImage roots attempt (useMemory use) (ImageRequest code width height levels (useImageFlags use)) >>= \case
+    create most native device attempt _ =
+      allocateImage roots attempt (useMemory use) (ImageRequest code width height levels (useImageFlags use)) most >>= \case
         Left refusal → pure (Left (allocationRefused refusal))
         Right memory → do
           view ←
@@ -359,6 +362,7 @@ allocationRefused = \case
   AllocationNoMemoryType (MemoryTypeRefused kind _) → RefusedNoMemoryType kind
   AllocationBackpressure budget → RefusedBackpressure budget
   AllocationRejected misuse → RefusedMisuse misuse
+  AllocationBeyondResource needed most → RefusedOutOfBounds needed most
 
 -- | Undo part of a creation that is raising. A cleanup that raised has an
 -- unknown effect: what it concerned is retained — an allocation it did not

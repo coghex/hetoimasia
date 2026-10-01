@@ -1130,13 +1130,24 @@ spec = describe "Recording" $ do
       rig ← newRig
       supportImages (rigRecording' rig) (const Nothing)
       createImage (rigRecording rig) (ImageDescription ColorTarget Rgba8Linear 16 16 1) `shouldReturn` Left (RefusedImageUnsupported ColorTarget Rgba8Linear)
-      supportImages (rigRecording' rig) (const (Just (ImageLimits 32 16 3)))
+      supportImages (rigRecording' rig) (const (Just (ImageLimits 32 16 3 (2 ^ (31 ∷ Int)))))
       createImage (rigRecording rig) (ImageDescription TextureImage Rgba8Srgb 64 16 1) `shouldReturn` Left (RefusedOutOfBounds 64 32)
       createImage (rigRecording rig) (ImageDescription TextureImage Rgba8Srgb 16 32 1) `shouldReturn` Left (RefusedOutOfBounds 32 16)
       createImage (rigRecording rig) (ImageDescription TextureImage Rgba8Srgb 16 16 4) `shouldReturn` Left (RefusedOutOfBounds 4 3)
       nativeOf rig `shouldReturn'` \calls → [() | call ← calls, not (isQuery call)] `shouldBe` []
       length <$> nativeCalls' rig `shouldReturn` 4
       allocatorCalls (allocatorOf rig) `shouldReturn` []
+
+    it "refuses an image whose memory the device needs beyond its largest resource, having created nothing and kept no reservation" $ do
+      rig ← newRig
+      base ← chargedOf rig
+      supportImages (rigRecording' rig) (const (Just (ImageLimits 16384 16384 15 1000)))
+      -- The stand-in's image needs four bytes a texel of its base level.
+      createImage (rigRecording rig) (ImageDescription TextureImage Rgba8Srgb 32 32 1) `shouldReturn` Left (RefusedOutOfBounds 4096 1000)
+      allocatorCalls (allocatorOf rig) `shouldReturn` [AskedImageRequirements 43 32 32]
+      nativeOf rig `shouldReturn'` \calls → [() | CreatedView {} ← calls] `shouldBe` []
+      chargedSince rig base `shouldReturn` (0, 0)
+      atomically (readManaged (rigRecording rig)) `shouldReturn` []
 
     it "refuses a BC7 texture on a device created without BC compression, asking it nothing, and still creates the other textures" $ do
       rig ← newRigOn (\standIn → standIn {standOffers = [standInDevice {offerTextureCompressionBC = False}]}) defaultBudgetRequest
@@ -1191,9 +1202,21 @@ spec = describe "Recording" $ do
         raised ← try @AllocatorFailure (createBuffer (rigRecording rig) (BufferDescription StagingBuffer 64))
         fmap (const ()) raised `shouldBe` Left (AllocatorFailure step)
         liveAllocations (allocatorOf rig) `shouldReturn` 0
+        atomically (readRootsAllocations (rigRoots rig)) `shouldReturn` 0
         snd <$> chargedSince rig base `shouldReturn` 0
         atomically (readManaged (rigRecording rig)) `shouldReturn` []
         sessionState <$> modelOf rig `shouldReturn` SessionRunning
+
+    it "keeps counting a buffer whose map and whose cleanup both raised, so its allocator outlives it, and fails the session, raising the map's failure" $ do
+      rig ← newRig
+      failAllocatorAt (allocatorOf rig) AtMap
+      failAllocatorAt (allocatorOf rig) AtDestroyBuffer
+      raised ← try @AllocatorFailure (createBuffer (rigRecording rig) (BufferDescription StagingBuffer 64))
+      fmap (const ()) raised `shouldBe` Left (AllocatorFailure AtMap)
+      sessionState <$> modelOf rig `shouldReturn` SessionFailed CleanupFailed
+      liveAllocations (allocatorOf rig) `shouldReturn` 1
+      atomically (readRootsAllocations (rigRoots rig)) `shouldReturn` 1
+      atomically (readManaged (rigRecording rig)) `shouldReturn` []
 
     it "leaves nothing made, allocated or reserved when an image's requirements, creation, bind or view raised, destroying the image a view failed over" $ do
       forM_ [AtRequirements, AtCreate, AtBind] $ \step → do

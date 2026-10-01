@@ -1126,7 +1126,7 @@ renderingLayers events rendering clock =
         , opsEndCommands = \_ → pure ()
         , opsRecord = \buffer command → record events (CommandRecorded buffer command)
         , opsCommandBufferHandle = id
-        , opsImageSupport = \_ → pure (Just (ImageLimits 16384 16384 15))
+        , opsImageSupport = \_ → pure (Just (ImageLimits 16384 16384 15 (2 ^ (31 ∷ Int))))
         , opsMaxBufferSize = pure (1024 * 1024 * 1024)
         , opsCreateView = \_ request → do
             handle ← fresh
