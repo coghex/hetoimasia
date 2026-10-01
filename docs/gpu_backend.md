@@ -21,6 +21,17 @@ batches that can be discarded, readback memory, and the audited `unsafe`
 recording subset — D-15, D-26 and D-28, P-1's renderer-facing boundary and
 P-8. See [Recording through managed resources](#recording-through-managed-resources).
 
+GRS-11 ([#333](https://github.com/coghex/hetoimasia/issues/333)) backs **device
+memory** with VMA: one externally synchronised allocator per device, owned by
+the roots and used on the graphics owner's thread alone, through the engine's
+own `unsafe` C shim; memory types chosen by the engine from each usage's
+properties; the model's accounted bytes charging the blocks VMA holds, through
+a bounded reservation before any call that could open one; VK-14's recovery
+for a no-effect allocating failure; and readback buffers moved onto it as its
+first consumer — D-15, D-16, D-38 and D-40 of the
+[GPU resource services design](designs/gpu_resource_services_design.md). See
+[Device memory](#device-memory).
+
 VK-12 ([#225](https://github.com/coghex/hetoimasia/issues/225)) adds **frames**:
 non-blocking acquisition, submission of sealed batches with one completion
 obligation per native submission, and safe abandonment — a skipped
@@ -127,8 +138,14 @@ the generations above the roots; and VK-11's `Hetoimasia.GPU.Vulkan.Native.Recor
 `Hetoimasia.GPU.Vulkan.Native.Recording.Shaders`, the verification pipeline's
 embedded shaders; and VK-12's `Hetoimasia.GPU.Vulkan.Native.Frames` —
 acquisition, submission and abandonment over an open native layer — and
-`Hetoimasia.GPU.Vulkan.Native.Frames.Vulkan`, its production layer. The package's private modules, which no client can import,
+`Hetoimasia.GPU.Vulkan.Native.Frames.Vulkan`, its production layer; and GRS-11's
+`Hetoimasia.GPU.Vulkan.Native.Allocator` — the device-memory allocator's shape
+and the engine's memory-type policy — and
+`Hetoimasia.GPU.Vulkan.Native.Allocator.Vulkan`, its production form over VMA
+(see [Device memory](#device-memory)). The package's private modules, which no client can import,
 are the audited `unsafe` subset, `Hetoimasia.GPU.Vulkan.Native.Internal.Commands`;
+the VMA shim's imports, `Hetoimasia.GPU.Vulkan.Native.Internal.Vma`, and the
+allocation protocol above them, `Hetoimasia.GPU.Vulkan.Native.Internal.Allocation`;
 the generations' implementation under
 `Hetoimasia.GPU.Vulkan.Native.Internal.Generations`: `State`, `Uses`,
 `Disposal`, `Reconciliation`, `Step`, `Retirement` and `Observation`, which the
@@ -164,6 +181,9 @@ and its surface recovery, the generations' `Surface` (see
                                │    ├─ device (one, shared, selected against the
                                │    │          first target's surface — or, for a
                                │    │          surface-free start, against none)
+                               │    │    └─ allocator (VMA, one per device; the
+                               │    │         device memory every allocation
+                               │    │         lies in, charged to the model)
                                │    └─ target surfaces, one record per target,
                                │         keyed by the model's TargetId
                                │           └─ swapchain generations, keyed by
@@ -171,14 +191,16 @@ and its surface recovery, the generations' `Surface` (see
                                │              images and their views
                                └─ GPU model (identities, the session's state)
                            ├─ recording (managed resources: the consumer's
-                           │    pipelines and layouts, frame storages)
+                           │    pipelines and layouts, frame storages,
+                           │    readback buffers and their allocations)
                            └─ owner-thread actions (bounded queue; each run
                                 once on the owner's thread, lent the
                                 recording's Construction)
 ```
 
-- **The instance, its explicit messenger and the device belong to the roots**,
-  for the session. No target owns the device or gates its lifetime —
+- **The instance, its explicit messenger, the device and the device's
+  allocator belong to the roots**, for the session. Every allocation made from
+  the allocator belongs to the managed resource whose memory it is. No target owns the device or gates its lifetime —
   including the bootstrap target, whose surface the device was selected
   against — so closing the first-created window cannot release a device
   another target is using (D-7). A surface-free session's device has no
@@ -604,6 +626,149 @@ exported only by `State` and `Uses`, which clients cannot import. The
 recording's private modules still import the public module, and no new module
 declares a foreign import.
 
+## Device memory
+
+GRS-11 (#333) backs device memory with VMA beneath the model's accounting, as
+D-38 and D-40 of the [GPU resource services design](designs/gpu_resource_services_design.md)
+decide. `Hetoimasia.GPU.Vulkan.Native.Allocator` is the allocator's shape — an
+open record of calls, `AllocatorOps`, over 64-bit handles — and the engine's
+memory-type policy; `Hetoimasia.GPU.Vulkan.Native.Allocator.Vulkan` is its
+production form, VMA through the engine's own shim; the headless examples
+supply a stand-in that keeps its blocks in Haskell. No VMA type crosses the
+package's public API: the shim's imports are private, and an external-client
+example proves neither they nor the Hackage binding the package links for its
+compiled VMA are reachable.
+
+### Ownership and thread
+
+One allocator per device. The roots create it right after the device — at the
+first admission or a surface-free start — with
+`VMA_ALLOCATOR_CREATE_EXTERNALLY_SYNCHRONIZED_BIT`, the instance's
+`vkGetInstanceProcAddr` and the device's `vkGetDeviceProcAddr` from the
+binding's own dispatch tables, `vulkanApiVersion` 1.3, and an explicit
+large-heap block size of 256 MiB (`largeHeapBlockSize`, VMA's own default, as
+#361 measured it). Every user of the device shares it, and every call to it is
+made on the graphics owner's thread; nothing relies on VMA's internal locking.
+An allocator whose creation raised is absent: the device stays recorded for
+retirement and the failure is raised, and nothing can be allocated
+(`RefusedDeviceAbsent`).
+
+The roots destroy it child before parent: after every target's surface and
+before the device, and only once every allocation made from it has been freed —
+`retireRoots` raises `AllocationsRemain`, retaining the allocator and the
+device, while one remains. Its destruction frees the device memory VMA still
+held, its retained empty blocks, and that is released from the model's
+accounting in the same masked step, exactly once. A destruction that raised is
+uncertain: the allocator is recorded so, the session fails with
+`CleanupFailed`, and the device is retained (`AllocatorRemains`).
+
+### Usages and memory types
+
+An allocation names a `MemoryUsage`, which states the properties it requires
+and prefers (D-16):
+
+| Usage | Required | Preferred | For |
+| --- | --- | --- | --- |
+| `UsageTexture` | device-local | — | textures, always staged |
+| `UsageStaticGeometry` | device-local | — | static geometry, staged |
+| `UsageStaging` | host-visible | host-coherent | staging written by the host |
+| `UsageFrameRing` | host-visible | host-coherent | per-frame rings the device reads directly |
+| `UsageReadback` | host-visible | host-cached | readback buffers |
+
+The engine, not VMA, chooses the one memory type an allocation uses
+(`chooseMemoryType`): among the types the buffer's `memoryTypeBits` allow
+with every required property, the one with the most preferred properties, and
+of those the lowest index. It passes only that type's bit to VMA, so VMA can
+neither choose nor fall back to another; VMA still honours the driver's
+preferred or required dedicated allocation within that type. A usage no
+allowed type serves is `RefusedNoMemoryType`, naming the usage, before any
+allocation. Only the readback usage has a consumer yet; the others are defined
+for GRS-2's buffers and images.
+
+### Accounting and backpressure
+
+The model's accounted bytes charge the device memory VMA holds — each block
+and each dedicated allocation — never a resource's own size (D-15, D-40). The
+private allocation protocol makes a buffer's memory for an allocation attempt
+in this order:
+
+1. The buffer's memory requirements are asked of the device without creating
+   it (`vkGetDeviceBufferMemoryRequirements`), and the memory type chosen.
+2. The buffer is created in held memory only
+   (`VMA_ALLOCATION_CREATE_NEVER_ALLOCATE_BIT`). That opens nothing and charges
+   nothing new; its out-of-memory answer is the expected miss, spends no
+   recovery, and leads to the next step.
+3. The attempt reserves the most the allocating call could open
+   (`reserveDeviceMemory`): the larger of the type's preferred block size —
+   VMA's `CalcPreferredBlockSize`, an eighth of a heap of at most 1 GiB and
+   otherwise the configured 256 MiB, aligned to 32 bytes (`preferredBlockSize`)
+   — and the requirements' size. A reservation the byte budget cannot hold is
+   `RefusedBackpressure`, answered before the call that could open memory, and
+   never enters recovery.
+4. The allocating call. VMA's device-memory callbacks, counting in C inside
+   that call, record every block or dedicated allocation it opened and freed.
+   Right after it — whether it succeeded or not — the effect is settled
+   (`settleDeviceMemory`): the reservation is replaced by what it opened,
+   nothing if it opened nothing, the rest returned at once, and what it freed
+   released.
+5. Opening more than was reserved contradicts VMA's sizing. The buffer is
+   destroyed before its allocation is freed, that effect settled too, and the
+   request fails with `AllocatorAccountingDefect`. The memory still held stays
+   charged; if that leaves the accounted bytes above the budget, the session
+   fails with `CleanupFailed`, and nothing else is freed for it.
+6. A host-visible allocation is mapped for its lifetime (`vmaMapMemory`).
+
+Every later call that can free memory — a destruction, the allocator's own —
+is settled the same way before anything else is admitted. A block several
+resources share is charged once, and disposing of or abandoning a resource
+releases none of it; VMA's retained empty block stays charged until VMA frees
+it. Under the default 256 MiB byte budget and VMA's 256 MiB large-heap block,
+the bound admits an allocating call on a large heap only while nothing else is
+charged, so a consumer that needs more than one block on such a heap raises
+the budget (D-11); placements in held memory are unaffected.
+
+### Recovery
+
+A no-effect out-of-memory result from the allocating call reaches the
+construction's VK-14 recovery with its reservation already returned: one
+reclamation pass and at most one retry, which runs the whole protocol again —
+held memory first, then a fresh reservation against the reconciled
+accounting. Disposing of a resource counts as progress, so a retry can succeed
+by placing in memory the pass emptied, even when no block was freed; the
+nested steps of one construction make one retry between them. A placement miss
+is never a failure, and backpressure never reaches recovery. An effect that is
+uncertain follows the [terminal-failure policy](#terminal-failure).
+
+### Failure cleanup
+
+A creation, bind or map that failed leaves nothing allocated and no
+reservation held. VMA's own creation destroys what it made when its bind
+fails, inside the same call, and the effect it reports is settled; a map that
+failed destroys the buffer and frees its allocation, settling that. Memory such
+a failure left held — a block opened for it and kept, empty — stays charged
+until VMA frees it, and the next request may place in it. A failed request
+rolls back only itself: other allocations, their blocks and their mappings are
+untouched.
+
+### Lifetime and mapping
+
+An allocation is freed only when the model allows its resource's disposal,
+after completion evidence has ended every submitted use: VMA tracks no GPU use
+and is never relied on to. Teardown unmaps, destroys the buffer, then frees its
+allocation. Each allocation is mapped once, for its lifetime; VMA maps the
+block beneath as it needs, and unmapping one allocation leaves its siblings'
+mappings alone. Flushes and invalidates are allocation-relative ranges given to
+VMA ([Readback memory](#readback-memory)).
+
+### State
+
+| State | Owner | Readers and writers | Thread | Lifetime | Reset or disposal |
+| --- | --- | --- | --- | --- | --- |
+| The allocator | The roots | Created after the device by `createDevice`; read by the allocation protocol; destroyed by `retireRoots` | The owner | The device's | Destroyed once no allocation remains, before the device; uncertain if its destruction raised, retaining the device |
+| Live allocations | The roots | The allocation protocol counts each made and freed; `retireRoots` reads | The owner | The session | Counts down as each is freed |
+| The callbacks' counts | The shim's allocator state | VMA's device-memory callbacks write, inside each call; each shim entry clears them before the call and copies them out after | The owner, inside a VMA call | The allocator's | Freed with the allocator |
+| Device-memory charges | The model (`gpuDeviceMemory`) | Settled after every allocator call; reserved per attempt before an allocating call | The owner | The session | Released only as VMA reports memory freed |
+
 ## Recording through managed resources
 
 `Hetoimasia.GPU.Vulkan.Native.Recording` is D-26's small Vulkan-specific
@@ -632,7 +797,7 @@ moved code and changed no behaviour; each module's Haddock states what it owns.
 | `Construction` | Creating, replacing, naming and releasing managed resources, each in one masked step. | `Layer`, `State` |
 | `Batches` | Discard, reset, submission evidence, and freeing a slot of completed batches: invalidate natively, then discharge. | `Layer`, `State` |
 | `Recorder` | `recordFrame`, the `Recorder` and its commands, retention before each native call, and label balancing. | `Layer`, `State`, `Batches` |
-| `Readback` | Host reads gated on completion evidence, host fills, and the atom-aligned mapped range. | `Layer`, `State` |
+| `Readback` | Host reads gated on completion evidence, host fills, and their flushes and invalidations through the allocator. | `Layer`, `State` |
 | `Disposal` | Destroying released generations child before parent, recording disposals, and retirement. | `State` |
 
 The graph is acyclic, and no module adds state: the managed records, the frame
@@ -652,7 +817,7 @@ only home of the `unsafe` subset.
 | Checked frame | `recordFrame` takes a `FrameSlotId` the model holds acquired, and resolves its image, view, extent and format through the generation that owns them | The frame's generation, retained by the batch |
 | Scoped recorder | `transitionImage`, `beginRendering`, `bindPipeline`, `setViewport`, `setScissor`, `draw`, `endRendering`, `copyToReadback` | The slot's command storage and the batch's recorded references |
 | Recorded batch | `discardBatch`; `resetFrameRecorder`; `noteBatchSubmitted`, which VK-12's `submitFrames` calls | Sealed commands and references, whether or not the caller keeps the `BatchId` |
-| Readback | `readReadback`, `fillReadback` | The mapped memory and what last wrote it |
+| Readback | `readReadback`, `fillReadback` | The buffer's allocation, its mapping, and what last wrote it |
 | Disposal | `disposeResources`, `retireRecording` | Destruction on the owner, only once the model reports every hold ended |
 
 The supported vocabulary is exactly the triangle and its verification: dynamic
@@ -682,8 +847,11 @@ and one outstanding batch; `createFrameStorage` refuses, before any native
 call, a target that is not this session's, not admitted or suspended, or a slot
 the frame budget cannot issue. A construction whose native layer raised after
 making part of its objects — a pool whose command buffer could not be
-allocated, a buffer whose memory could not be bound — destroys that part before
-raising, so a creation that raised created nothing.
+allocated, a buffer whose memory could not be mapped — destroys that part before
+raising, so a creation that raised created nothing. A readback's creation may
+also refuse, having made nothing: `RefusedBackpressure` for device memory the
+budget cannot hold, `RefusedNoMemoryType` for a usage no memory type serves
+([Device memory](#device-memory)).
 
 ### Retention
 
@@ -786,7 +954,7 @@ No caller-supplied text reaches a name.
 | A pipeline layout, a pipeline | `resource <n>.<generation> pipeline layout`, `… pipeline` | After the model issues the `ResourceId`, before the handle is returned |
 | A pipeline's vertex and fragment shader modules | `resource <n>.<g> pipeline vertex shader`, `… fragment shader` | Each right after it is created and before the pipeline is built from it, under the `ResourceId` the model is about to issue the pipeline; the modules are destroyed once it is built |
 | A frame storage's pool and command buffer | `resource <n>.<g> command pool target <t> slot <s>`, `… command buffer …` | The same |
-| A readback's buffer and memory | `resource <n>.<g> readback buffer`, `… readback memory` | The same |
+| A readback's buffer | `resource <n>.<g> readback buffer` | The same. Its allocation is named the same inside the allocator, through VMA, whether or not the device offers naming; the device memory it lies in, which other allocations share, is named nowhere |
 
 Every naming call runs on the graphics owner's thread through the roots' device
 loss classification, and one that raised is handled as a failure of what it was
@@ -871,8 +1039,12 @@ contract, not an automatic hazard resolver.
 
 ### Readback memory
 
-A readback buffer is a transfer-destination buffer in host-visible memory —
-cached where the device offers it — bound, and mapped whole for its lifetime.
+A readback buffer is a transfer-destination buffer whose memory comes from the
+device's [allocator](#device-memory) under the readback usage — host-visible,
+cached where the device offers it — bound, and mapped for its lifetime. It is
+the allocator's first consumer. Its attempt reserves two objects, the buffer
+and its allocation, and no bytes of its own: the memory is charged as the
+allocator holds it, never as the buffer's size.
 
 - **The copy.** `copyToReadback` needs the frame's image in the transfer-source
   layout, and an image its generation made a transfer source: only generations
@@ -900,13 +1072,16 @@ cached where the device offers it — bound, and mapped whole for its lifetime.
   recorded barrier is what makes the write visible, and the completion is what
   makes reading it legal. With nothing submitted, a read is `RefusedNotWritten`,
   so a recorded-and-discarded batch never claims a captured pixel.
-- **Non-coherent memory.** Before a read of non-coherent memory the mapped range
-  is invalidated, and after `fillReadback` writes it the range is flushed. The
-  range (`mappedRange`) is the bytes asked for with the start rounded down and
-  the end rounded up to the device's non-coherent atom, the end clamped to the
-  memory's size, which is what Vulkan requires of both calls. Coherent memory is
-  read without either, and an empty read reads nothing and invalidates
-  nothing. `fillReadback` marks the bytes unreadable before its write changes
+- **Non-coherent memory.** Before a read of non-coherent memory the bytes
+  asked for are invalidated, and after `fillReadback` writes the buffer it is
+  flushed, each as a range of the buffer's own allocation — an offset from its
+  start and a size — through the allocator, which translates it into the
+  device memory the allocation lies in and aligns it to the non-coherent atom.
+  Nothing rounds the range before VMA does, and no range reaches past the
+  allocation, so a neighbouring allocation in the same block is never flushed
+  or invalidated over by this one's maintenance. Bounds are checked first: a
+  read past the buffer is `RefusedOutOfBounds`. Coherent memory is read without
+  either, and an empty read reads nothing and invalidates nothing. `fillReadback` marks the bytes unreadable before its write changes
   the first of them, and readable again only once the write and any flush have
   returned, so a write or flush that raised part-way exposes nothing.
 - **Release.** Releasing a readback ends its CPU use: it is read no more.
@@ -937,7 +1112,10 @@ destruction that raised is uncertain, never retried, fails the session with
 `CleanupFailed` and raises `ResourceDestructionFailed`, and retains everything
 that depends on it. `retireRecording` releases every live handle, destroys what
 it can and raises `ResourcesRetained`, naming the rest, without manufacturing
-evidence; every managed resource must be gone before the device.
+evidence; every managed resource must be gone before the device. A readback's
+destruction unmaps its allocation, destroys its buffer and then frees the
+allocation (VMA's `vmaDestroyBuffer`), and settles whatever device memory that
+freed; a sibling allocation's mapping and memory are untouched.
 
 ### The FFI audit
 
@@ -978,12 +1156,23 @@ Masking, native-effect accounting and retention hold across the mix, because
 every unsafe call sits inside the same masked step as the retention before it
 and the count after it, and an unsafe call cannot be interrupted.
 
-`nativeFfiConfiguration` records the list (`ffiUnsafeImports`), the binding's
-flags and the C-only callback; the native case's record prints it, so it is
-part of the evidence identity beside the build's source digest. The headless
-suite reads the package's own import declarations and requires exactly those
-twelve `dynamic` imports and, besides them, only the capture callback's address
-import.
+GRS-11 adds the second set of `unsafe` imports: the allocator's VMA shim, in
+the private `Hetoimasia.GPU.Vulkan.Native.Internal.Vma`. Each is one C entry
+of the engine's own shim (`cbits/hetoimasia_vma.cpp`) taking scalars and one
+result record the allocator reuses, the shape #361 qualified
+([the VMA qualification record](gpu_vma_qualification_record.md)). VMA's
+device-memory callbacks are C functions counting into the allocator's own
+state, so none of these calls can enter Haskell, and VMA's own Vulkan calls
+reach the capture's C messenger at most. They are made on the owner's thread
+alone, under the same masked steps as the accounting around them.
+
+`nativeFfiConfiguration` records the lists (`ffiUnsafeImports` and
+`ffiAllocatorImports`), the binding's flags, the allocator, and the C-only
+callback; the native case's record prints it, so it is part of the evidence
+identity beside the build's source digest. The headless suite reads the
+package's own import declarations and requires exactly those twelve `dynamic`
+imports and, besides them, only the capture callback's address import and the
+allocator shim's entries.
 
 ## Frames: acquisition, submission and abandonment
 
@@ -1554,6 +1743,7 @@ whose rollback is complete — and nowhere else:
 | `vkQueueSubmit2` | The specified no-effect result | The same request, its batches as sealed |
 | `vkQueuePresentKHR` | The specified no-effect result, read from the swapchain's entry | The same frame's presentation |
 | A managed resource's creation | A creation that raised created nothing; a composite one destroyed what it made before raising | The same creation, for the same allocation attempt |
+| A readback's allocating VMA call | VMA destroyed what the call made, and the call's effect was settled, its reservation returned | The whole allocation protocol once more: held memory first, then a fresh reservation ([Device memory](#recovery)) |
 | A swapchain's creation that handed nothing over, or an image view's | A creation call that raised created nothing | That call |
 | A frame slot's or a pool record's semaphore or fence | A creation call that raised created nothing; if its recovery does not succeed, the objects made before it are destroyed before the failure is raised | That call |
 | A swapchain's creation that handed a generation over | Never: that call retired the generation whatever it answered | Nothing; the construction fails into the episode's fresh construction |
@@ -2198,7 +2388,7 @@ them against the device ([The native suite](#the-native-suite)).
 | Exit | What is destroyed, in order, on the owner's thread |
 | --- | --- |
 | A window closed or a target released | That target's swapchain generations — each one's image views, newest first, then its swapchain — and then its surface. The owner writes its terminal record only after the destructions returned, and the main thread then certifies the attachment's facts and releases the window. The device, the instance, the owner and every other target stay live, and nothing is joined. A generation still held retains the surface, and with it everything above. |
-| Whole-host exit (D-33), with or without targets | Every remaining target's surface, if any remains; then — whole-owner retirement — every surface the lease still owes that no target held (an attachment whose announcement never reached the owner), every owner-thread action still queued is refused, every managed resource the recording still holds — the consumer's pipelines before their layouts, whether its renderer or an owner-thread action built them, and any capture's readback buffer, each once no batch holds it (VK-19) — and the device; then — whole-owner destruction — any surface a creation still in its native call left, the explicit messenger, and the instance, the last call that can reach the capture's callback. Only after that evidence is the owner joined, and only then are windows, the session and the capability released. |
+| Whole-host exit (D-33), with or without targets | Every remaining target's surface, if any remains; then — whole-owner retirement — every surface the lease still owes that no target held (an attachment whose announcement never reached the owner), every owner-thread action still queued is refused, every managed resource the recording still holds — the consumer's pipelines before their layouts, whether its renderer or an owner-thread action built them, and any capture's readback buffer, each once no batch holds it (VK-19) — then the device's allocator, once no allocation made from it remains, and the device; then — whole-owner destruction — any surface a creation still in its native call left, the explicit messenger, and the instance, the last call that can reach the capture's callback. Only after that evidence is the owner joined, and only then are windows, the session and the capability released. |
 
 Each step is refused rather than reordered when something that must go first
 has not verifiably gone. A destruction that raised is uncertain: it is recorded,
@@ -2208,7 +2398,9 @@ that returned always removes its record and one that raised — synchronously or
 with a cancellation of its own — always leaves it marked uncertain; a
 cancellation is re-raised only after that record exists. The failures are
 `SurfaceDestructionFailed`, `RootDestructionFailed` and `RootsRetained`, which
-name what was retained. The owner then produces no evidence for what is retained, so the host
+name what was retained — `AllocationsRemain` and `AllocatorRemains` among them,
+for an allocator that still holds an allocation or whose destruction was
+uncertain, either of which retains the device. The owner then produces no evidence for what is retained, so the host
 keeps the window, the session and every parent, as VK-18's contract requires;
 only independent evidence ends that wait. The instance is destroyed only once
 the surface bridge's lease is releasable. No timeout, cancellation or cleanup
@@ -2458,7 +2650,8 @@ VK-18's D-33 order and releases nothing early.
 
 | State | Owner | Readers and writers | Thread | Lifetime | Reset or disposal |
 | --- | --- | --- | --- | --- | --- |
-| Each root's slot (instance, messenger, device) | The roots | Written by startup, admission and retirement; any thread reads | The owner | The session | Only advances: absent, live, then destroyed or uncertain |
+| Each root's slot (instance, messenger, device, allocator) | The roots | Written by startup, admission and retirement; any thread reads | The owner | The session | Only advances: absent, live, then destroyed or uncertain |
+| Live allocations | The roots | The allocation protocol counts each allocation made and freed; retirement reads | The owner | The session | Counts down as each is freed; the allocator is destroyed only at zero ([Device memory](#state)) |
 | Target records | The roots | Admission inserts, retirement removes; recovery releases a lost surface and installs its replacement in place | The owner | Admission until destroyed | Removed only by a destruction that returned; a surface released by recovery leaves the record with none until a replacement is installed |
 | Disposers | The roots | The generations and the recording each register one when made; a reclamation pass reads them | The owner | The session | Never removed |
 | The GPU model | The roots | Admission, retirement, loss | The owner | The session | Never reset |
@@ -2704,7 +2897,7 @@ discharging only its own references; a submitted batch neither discarded nor
 reset; release preserving a sealed batch, a layout outliving its pipelines, and
 a failed destruction retained without a retry, every destruction recorded
 beyond one progress turn's action limit, and frame storage refused for a
-foreign target or an unissuable slot; the readback's aligned ranges, bounds,
+foreign target or an unissuable slot; the readback's allocation-relative ranges, bounds,
 transfer-source requirement, non-coherent invalidation and flush, completion
 before exposure, and no exposure after a skip or a reset in the model, after a
 reset followed by the frame's submission, or after a fill whose flush raised; a

@@ -1,7 +1,9 @@
 -- | Host access to readback buffers for the managed recording
 -- ("Hetoimasia.GPU.Vulkan.Native.Recording"): reading bytes a completed
--- submission wrote, filling a buffer from the host, and the atom-aligned range
--- non-coherent memory is invalidated or flushed over. Bytes are exposed only
+-- submission wrote, and filling a buffer from the host. Non-coherent memory is
+-- invalidated or flushed through the device's allocator, over the range of the
+-- buffer's own allocation that was read or written; the allocator translates
+-- it into its device memory and aligns it to the atom. Bytes are exposed only
 -- with completion evidence — the copying batch recorded as submitted and the
 -- buffer owing no recorded reference and no submitted use — or after the host
 -- wrote them.
@@ -16,7 +18,6 @@
 module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Readback
   ( readReadback
   , fillReadback
-  , mappedRange
   ) where
 
 import Control.Concurrent.STM (atomically)
@@ -24,7 +25,6 @@ import Control.Exception (mask_)
 import Control.Monad (unless)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
-import Data.Foldable (for_)
 import Data.Word (Word8)
 import Numeric.Natural (Natural)
 
@@ -41,26 +41,17 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , editManaged
   , liveNative
   , owned
+  , readbackBuffer
   )
-import Hetoimasia.GPU.Vulkan.Native.Roots (readRootsDevice, rootsCall, stateRootsModel)
-
--- | The range of the mapped memory a flush or an invalidation of these bytes
--- of the buffer covers: its start rounded down and its end rounded up to the
--- non-coherent atom, and the end clamped to the memory's size. Answers the
--- offset and the size.
-mappedRange ∷ Natural → Natural → Natural → Natural → (Natural, Natural)
-mappedRange atom memorySize offset size = (start, end - start)
-  where
-    step = max 1 atom
-    start = (offset `div` step) * step
-    end = min memorySize (((offset + size + step - 1) `div` step) * step)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Allocation (flushBuffer, invalidateBuffer)
+import Hetoimasia.GPU.Vulkan.Native.Roots (stateRootsModel)
 
 -- | Read bytes a completed submission wrote. Refused unless the batch that
 -- recorded the copy was recorded as submitted ('noteBatchSubmitted') and the
 -- buffer owes no recorded reference and no submitted use — which the model
 -- discharges only on that submission's completion fact; or unless the host
 -- wrote them.
--- Non-coherent memory is invalidated over the aligned range first.
+-- Non-coherent memory is invalidated over the bytes read first.
 readReadback ∷ Recording q inst msgr phys dev cmd → Readback → Natural → Natural → IO (Either Refusal ByteString)
 readReadback recording (Readback readback) offset size =
   owned recording $
@@ -100,11 +91,8 @@ readReadback recording (Readback readback) offset size =
   where
     roots = recordingRoots recording
     readMapped allocation = do
-      device ← fmap snd <$> atomically (readRootsDevice roots)
       unless (allocationCoherent allocation) $
-        for_ device $ \handle →
-          rootsCall roots "vkInvalidateMappedMemoryRanges" $
-            opsInvalidate (recordingOps recording) handle allocation (mappedRange (allocationAtom allocation) (allocationMemorySize allocation) offset size)
+        invalidateBuffer roots (readbackBuffer allocation) (offset, size)
       opsReadMapped (recordingOps recording) allocation offset size
 
 -- | Fill the whole buffer with one byte from the host — a sentinel a later
@@ -129,11 +117,8 @@ fillReadback recording (Readback readback) byte =
             -- old contents' evidence.
             atomically (setContents ContentsUndefined)
             opsWriteMapped (recordingOps recording) allocation 0 (ByteString.replicate (fromIntegral (allocationSize allocation)) byte)
-            device ← fmap snd <$> atomically (readRootsDevice roots)
             unless (allocationCoherent allocation) $
-              for_ device $ \handle →
-                rootsCall roots "vkFlushMappedMemoryRanges" $
-                  opsFlush (recordingOps recording) handle allocation (mappedRange (allocationAtom allocation) (allocationMemorySize allocation) 0 (allocationSize allocation))
+              flushBuffer roots (readbackBuffer allocation) (0, allocationSize allocation)
             atomically (setContents ContentsHostWritten)
             pure (Right ())
       Right _ → pure (Left RefusedWrongKind)

@@ -91,9 +91,12 @@
 -- barrier from the transfer write to the host read. Bytes are exposed only
 -- with completion evidence: the batch that wrote them was recorded as
 -- submitted ('noteBatchSubmitted'), and the buffer owes no recorded reference
--- and no submitted use. Non-coherent memory is
--- invalidated over the atom-aligned range before it is read and flushed over
--- that range after 'fillReadback' writes it; 'mappedRange' is that range. A
+-- and no submitted use. Its memory is the device allocator's
+-- ("Hetoimasia.GPU.Vulkan.Native.Allocator"), under the readback usage, and
+-- is charged as the allocator holds it: the buffer's own size is never
+-- charged. Non-coherent memory is invalidated over the bytes read before they
+-- are read, and flushed over the buffer after 'fillReadback' writes it, each
+-- as a range of the buffer's own allocation that the allocator aligns. A
 -- write while any batch or submission holds the buffer is refused.
 --
 -- = State
@@ -183,7 +186,6 @@ module Hetoimasia.GPU.Vulkan.Native.Recording
     -- * Readback
   , readReadback
   , fillReadback
-  , mappedRange
 
     -- * Disposal
   , disposeResources
@@ -231,7 +233,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   , Viewport (..)
   , supportedTransition
   )
-import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Readback (fillReadback, mappedRange, readReadback)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Readback (fillReadback, readReadback)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Recorder
   ( Recorder
   , beginRendering

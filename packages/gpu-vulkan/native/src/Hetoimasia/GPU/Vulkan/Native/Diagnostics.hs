@@ -134,6 +134,11 @@ data NativeFfiConfiguration = NativeFfiConfiguration
     -- ^ Genuine @unsafe@ Vulkan calls this package declares: VK-11's audited
     -- recording subset, by entry point. The capture callback's own import is
     -- the address of a C function, not a call, and is not among them.
+  , ffiAllocator ∷ !Text
+    -- ^ The device-memory allocator and the binding that calls it (GRS-11).
+  , ffiAllocatorImports ∷ ![Text]
+    -- ^ The allocator shim's C entries, every one imported @unsafe@. None can
+    -- reach Haskell: the device-memory callbacks count in C.
   }
   deriving (Eq, Show)
 
@@ -149,6 +154,19 @@ nativeFfiConfiguration =
     , ffiCaptureCallback = "hetoimasia_vulkan_capture_messenger (C) → hetoimasia_capture_callback (C)"
     , ffiHaskellCallbacks = []
     , ffiUnsafeImports = unsafeImports
+    , ffiAllocator = "VMA 3.3.0 from VulkanMemoryAllocator-0.11.1.0 +vma-ndebug, through the engine's own C shim, device-memory callbacks in C"
+    , ffiAllocatorImports =
+        [ "hetoimasia_vma_result_size"
+        , "hetoimasia_vma_create"
+        , "hetoimasia_vma_destroy"
+        , "hetoimasia_vma_create_buffer"
+        , "hetoimasia_vma_destroy_buffer"
+        , "hetoimasia_vma_map"
+        , "hetoimasia_vma_unmap"
+        , "hetoimasia_vma_flush"
+        , "hetoimasia_vma_invalidate"
+        , "hetoimasia_vma_set_name"
+        ]
     }
 
 -- | The configuration as the lines an evidence record prints.
@@ -160,6 +178,8 @@ describeFfiConfiguration configuration =
   , ("capture callback", ffiCaptureCallback configuration)
   , ("Haskell callbacks installed", listed (ffiHaskellCallbacks configuration))
   , ("unsafe imports declared", listed (ffiUnsafeImports configuration))
+  , ("allocator", ffiAllocator configuration)
+  , ("allocator shim imports, unsafe", listed (ffiAllocatorImports configuration))
   , ("safe calls", "everything else: waits, submission, presentation, pipeline creation, construction and destruction, through the binding")
   ]
   where

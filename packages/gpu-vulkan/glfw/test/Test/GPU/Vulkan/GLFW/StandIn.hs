@@ -128,7 +128,7 @@ import Control.Concurrent.STM
   , stateTVar
   , writeTVar
   )
-import Control.Exception (Exception, ExceptionWithContext (ExceptionWithContext), SomeException, fromException, rethrowIO, throwIO, try, tryWithContext, uninterruptibleMask_)
+import Control.Exception (Exception, ExceptionWithContext (ExceptionWithContext), SomeException, fromException, rethrowIO, throwIO, toException, try, tryWithContext, uninterruptibleMask_)
 import Control.Monad (void, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
@@ -178,7 +178,18 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Bridge (Created (..), Discharged (..)
 import Hetoimasia.Foundation.Time (Duration, DurationRequirement (AllowZero), Instant, addDuration, deadlineReached, durationFromNanoseconds, scriptedInstant, scriptedSource, zeroDuration)
 import Hetoimasia.GPU.Vulkan.Native.Frames (AcquireResult (..), FrameOps (..), PresentRequest (..), PresentStatus (..))
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering (VulkanRenderer (..))
-import Hetoimasia.GPU.Vulkan.Native.Recording (NativeCommand (..), PipelineRequest (..), ReadbackAllocation (..), RecordingOps (..), Refusal (..))
+import Hetoimasia.GPU.Vulkan.Native.Allocator
+  ( AllocatorOps (..)
+  , BufferMemory (..)
+  , BufferRequest (..)
+  , MemoryEvents (..)
+  , MemoryProperty (..)
+  , MemoryRequirements (..)
+  , MemoryTypeOffer (..)
+  , Placement (..)
+  , noMemoryEvents
+  )
+import Hetoimasia.GPU.Vulkan.Native.Recording (NativeCommand (..), PipelineRequest (..), RecordingOps (..), Refusal (..))
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   ( CaptureMode (..)
   , FrameEvent (..)
@@ -376,6 +387,14 @@ data Scripted
     -- surface's loss (VK-14).
 
 -- | @VK_ERROR_SURFACE_LOST_KHR@, as the stand-in raises it.
+-- | The stand-in allocator's out-of-memory answer, which this layer
+-- classifies as such: a placement in held memory always misses, since every
+-- allocation it makes is dedicated.
+data StandInOutOfMemory = StandInOutOfMemory
+  deriving (Eq, Show)
+
+instance Exception StandInOutOfMemory
+
 newtype StandInSurfaceLost = StandInSurfaceLost Text
   deriving (Eq, Show)
 
@@ -525,8 +544,8 @@ report capture severity text =
 -- | The stand-in native layer. The instance is 1, the messenger 2 and the
 -- device 3; one device, one queue family, presenting to every surface but the
 -- ones declared unsupported.
-nativeLayer ∷ Journal → Native → DiagnosticCapture → RootOps Quiesced Int Int Text Int
-nativeLayer events native capture =
+nativeLayer ∷ Journal → Native → AllocatorOps → DiagnosticCapture → RootOps Quiesced Int Int Text Int
+nativeLayer events native allocator capture =
   RootOps
     { opsInstanceOffer = do
         atomically (writeTVar (nativeCapture native) (Just capture))
@@ -562,11 +581,15 @@ nativeLayer events native capture =
           ]
     , opsCreateDevice = \_ plan → 3 <$ (planQueueFamily plan `seq` step events native AtCreateDevice DeviceCreated)
     , opsDestroyDevice = \_ → step events native AtDestroyDevice DeviceDestroyed
+    , opsCreateAllocator = \_ _ _ → pure allocator
     , opsSurfaceSupport = \_ _ _ surface → do
         step events native AtSupport (SupportQueried surface)
         Set.notMember surface <$> readTVarIO (nativeUnsupported native)
     , opsDeviceLoss = \failure → isJust (fromException failure ∷ Maybe StandInLoss)
-    , opsNativeFailure = \failure → FailedSurfaceLost <$ (fromException failure ∷ Maybe StandInSurfaceLost)
+    , opsNativeFailure = \failure →
+        case fromException failure of
+          Just (StandInSurfaceLost _) → Just FailedSurfaceLost
+          Nothing → FailedOutOfMemory <$ (fromException failure ∷ Maybe StandInOutOfMemory)
     , -- The stand-in device offers no naming unless an example asks for it
       -- ('offerNaming'); without it nothing is named and its queue is never
       -- asked for.
@@ -1013,6 +1036,40 @@ presentsNow rig attachment = length . filter presented <$> readTVar (rigFrameEve
 retireNextPresentations ∷ Rig → Maybe Int → IO ()
 retireNextPresentations rig = atomically . writeTVar (renderingRetireCount (rigRendering rig))
 
+-- | The device's allocator: one host-visible, coherent and cached memory
+-- type, and every allocation dedicated, so a placement in held memory always
+-- misses and an allocating call opens exactly what it allocates. A readback's
+-- creation raises what 'raiseOnCreate' scripted for it before anything is
+-- made.
+renderingAllocator ∷ Journal → Rendering → AllocatorOps
+renderingAllocator events rendering =
+  AllocatorOps
+    { allocatorMemoryTypes = [MemoryTypeOffer 0 [HostVisible, HostCoherent, HostCached] (1024 * 1024)]
+    , allocatorBufferRequirements = \request → pure (MemoryRequirements (requestBufferSize request) 1)
+    , allocatorCreateBuffer = \request _ placement → case placement of
+        InHeldMemory →
+          atomically (stateTVar (renderingCreations rendering) (\held → (Map.lookup CreateReadback held, Map.delete CreateReadback held))) >>= \case
+            Just failure → pure (noMemoryEvents, Left failure)
+            Nothing → pure (noMemoryEvents, Left (toException StandInOutOfMemory))
+        MayOpenMemory → do
+          buffer ← fresh
+          allocation ← fresh
+          let size = requestBufferSize request
+          record events (ReadbackMade buffer size)
+          pure (MemoryEvents 1 size 0 0, Right (BufferMemory buffer allocation allocation 0 size 0))
+    , allocatorDestroyBuffer = \memory → do
+        record events (ReadbackGone (memoryBuffer memory))
+        pure (MemoryEvents 0 0 1 (memorySize memory))
+    , allocatorMap = pure . memoryAllocation
+    , allocatorUnmap = \_ → pure ()
+    , allocatorFlush = \_ _ → pure ()
+    , allocatorInvalidate = \_ _ → pure ()
+    , allocatorName = \_ _ → pure ()
+    , allocatorDestroy = pure noMemoryEvents
+    }
+  where
+    fresh = atomically (stateTVar (renderingHandles rendering) (\next → (next, next + 1)))
+
 renderingLayers ∷ Journal → Rendering → Maybe (TVar Instant) → RenderingOps Text Int Word64
 renderingLayers events rendering clock =
   RenderingOps
@@ -1039,15 +1096,6 @@ renderingLayers events rendering clock =
         , opsCreateStorage = \_ _ → (,) <$> fresh <*> fresh
         , opsResetStorage = \_ _ → pure ()
         , opsDestroyStorage = \_ _ → pure ()
-        , opsCreateReadback = \_ size → do
-            creating CreateReadback
-            buffer ← fresh
-            memory ← fresh
-            record events (ReadbackMade buffer size)
-            pure (ReadbackAllocation buffer memory size size True 1 0)
-        , opsDestroyReadback = \_ allocation → record events (ReadbackGone (allocationBuffer allocation))
-        , opsInvalidate = \_ _ _ → pure ()
-        , opsFlush = \_ _ _ → pure ()
         , opsReadMapped = \_ _ size → pure (ByteString.replicate (fromIntegral size) readbackByte)
         , opsWriteMapped = \_ _ _ → pure ()
         , opsBeginCommands = \_ → pure ()
@@ -1494,7 +1542,7 @@ runRigHere rig body = do
             (ControllerHooks (\attachment → readTVarIO (rigAfterRefusal rig) >>= ($ attachment)))
             (rigCaptureMode rig)
             (captureLogger rig)
-            (nativeLayer (rigJournal rig) (rigNative rig))
+            (nativeLayer (rigJournal rig) (rigNative rig) (renderingAllocator (rigJournal rig) (rigRendering rig)))
             (renderingLayers (rigJournal rig) (rigRendering rig) (rigClock rig))
             instanceAddress
             (surfaceBridge (rigJournal rig) (rigBridge rig))

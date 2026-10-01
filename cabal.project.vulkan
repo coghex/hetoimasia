@@ -61,11 +61,12 @@ constraints:
     vulkan +safe-foreign-calls,
     vulkan -darwin-lib-dirs
 
--- VMA for the allocator parity probe alone (GRS-1, D-14): the Hackage package
--- that bundles VMA's source, pinned beside the probe's own `==0.11.1.0`, and
--- built with assertions compiled out, as a release build of VMA is. Nothing
--- but that probe depends on it. See
--- packages/gpu-vulkan/native/probe/allocator-parity/README.md.
+-- VMA, a production native input (GRS-11, D-38): the Hackage package that
+-- bundles and compiles VMA 3.3.0, built with assertions compiled out, as a
+-- release build of VMA is. The native backend links the VMA it compiles and
+-- calls it through the engine's own shim, never through the package's Haskell
+-- binding; the allocator probe also uses that binding. See docs/toolchain.md,
+-- "VMA", and packages/gpu-vulkan/native/probe/allocator-parity/README.md.
 constraints:
     VulkanMemoryAllocator ==0.11.1.0,
     VulkanMemoryAllocator +vma-ndebug

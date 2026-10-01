@@ -52,7 +52,7 @@ module Test.GPU.Vulkan.Native.Recovery
 
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.STM (atomically, modifyTVar', newTVarIO, readTVarIO)
-import Control.Exception (SomeException, displayException, finally, onException, throwIO, try, tryWithContext)
+import Control.Exception (SomeException, displayException, finally, onException, throwIO, toException, try, tryWithContext)
 import Control.Monad (forM, forM_, replicateM, unless, when)
 import qualified Data.ByteString.Char8 as Char8
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
@@ -99,6 +99,7 @@ import Hetoimasia.GPU.Vulkan.Diagnostics
   , verdictIssues
   , withDiagnosticCapture
   )
+import Hetoimasia.GPU.Vulkan.Native.Allocator (AllocatorOps (..), Placement (..), noMemoryEvents)
 import Hetoimasia.GPU.Vulkan.Native.Frames
 import Hetoimasia.GPU.Vulkan.Native.Frames.Vulkan (vulkanFrameOps)
 import Hetoimasia.GPU.Vulkan.Native.Generations
@@ -297,7 +298,7 @@ data Injections = Injections
   { injectLoss ∷ !(IORef (Maybe Word64))
     -- ^ The swapchain whose next acquisition answers the surface lost.
   , injectOutOfMemory ∷ !(IORef Bool)
-    -- ^ Whether the next readback creation runs out of memory.
+    -- ^ Whether the allocator's next allocating call runs out of memory.
   , rootCalls ∷ !(IORef [Text])
     -- ^ The roots' and the recording's native calls, newest first.
   }
@@ -320,11 +321,27 @@ session journal steps capture = do
     Just quiesced → pure (observed, quiesced)
     Nothing → stopWith "the instance's destruction proved nothing"
 
--- | The roots' native layer, noting each generation and support call.
+-- | The roots' native layer, noting each generation and support call and each
+-- buffer creation the allocator is asked for, and answering the one armed
+-- allocating call out of memory without making it.
 journaled ∷ Injections → RootOps q inst msgr phys dev → RootOps q inst msgr phys dev
 journaled injections ops =
   ops
-    { opsSurfaceSupport = \created physical family surface → noted ("vkGetPhysicalDeviceSurfaceSupportKHR " <> hex surface) (opsSurfaceSupport ops created physical family surface)
+    { opsCreateAllocator = \created plan device → do
+        allocator ← opsCreateAllocator ops created plan device
+        pure
+          allocator
+            { allocatorCreateBuffer = \request kind placement → case placement of
+                InHeldMemory → noted "vmaCreateBuffer in held memory" (allocatorCreateBuffer allocator request kind placement)
+                MayOpenMemory → do
+                  armed ← atomicModifyIORef' (injectOutOfMemory injections) (\held → (False, held))
+                  if armed
+                    then do
+                      modifyIORef' (rootCalls injections) ("vmaCreateBuffer: VK_ERROR_OUT_OF_DEVICE_MEMORY (injected)" :)
+                      pure (noMemoryEvents, Left (toException (VulkanException ERROR_OUT_OF_DEVICE_MEMORY)))
+                    else noted "vmaCreateBuffer" (allocatorCreateBuffer allocator request kind placement)
+            }
+    , opsSurfaceSupport = \created physical family surface → noted ("vkGetPhysicalDeviceSurfaceSupportKHR " <> hex surface) (opsSurfaceSupport ops created physical family surface)
     , opsGenerations =
         generations
           { opsCreateSwapchain = \device request →
@@ -399,7 +416,7 @@ withFrames journal step injections roots generations first second replacementSur
     pure (surfaceFormat (planFormat (viewPlan generation)))
   (devicePlan, _) ← atomically (readRootsDevice roots) >>= maybe (stopWith "the roots hold no device") pure
   ops ← vulkanRecordingOps (planDevice devicePlan)
-  recording ← newRecording (injectingOutOfMemory injections ops) roots generations
+  recording ← newRecording ops roots generations
   frames ← newFrames (injectingLoss injections vulkanFrameOps) recording
   outcome ← try @SomeException (exercise journal step injections roots generations recording frames format first second replacementSurface)
   case outcome of
@@ -433,17 +450,6 @@ injectingLoss injections ops =
     { opsAcquireImage = \device swapchain semaphore → do
         armed ← atomicModifyIORef' (injectLoss injections) (\held → if held == Just swapchain then (Nothing, True) else (held, False))
         if armed then pure AcquiringSurfaceLost else opsAcquireImage ops device swapchain semaphore
-    }
-
--- | The recording layer, raising out of memory at the one armed readback
--- creation without making the call.
-injectingOutOfMemory ∷ Injections → RecordingOps dev cmd → RecordingOps dev cmd
-injectingOutOfMemory injections ops =
-  ops
-    { opsCreateReadback = \device bytes → do
-        armed ← atomicModifyIORef' (injectOutOfMemory injections) (\held → (False, held))
-        modifyIORef' (rootCalls injections) ((if armed then "vkCreateBuffer: VK_ERROR_OUT_OF_DEVICE_MEMORY (injected)" else "vkCreateBuffer") :)
-        if armed then throwIO (VulkanException ERROR_OUT_OF_DEVICE_MEMORY) else opsCreateReadback ops device bytes
     }
 
 -- | Every live window's geometry: eligible, at its current framebuffer.
@@ -750,8 +756,17 @@ spec outcome = describe "VK-14 recovery" $ do
       reclaimedEligible reclaimed `shouldBe` True
       reclaimedGone reclaimed `shouldBe` True
       reclaimedAnswer reclaimed `shouldBe` "a readback"
-      calls `shouldSatisfy` isSubsequenceOf ["vkCreateBuffer: VK_ERROR_OUT_OF_DEVICE_MEMORY (injected)", "vkDestroyImageView", "vkCreateBuffer"]
-      length [call | call ← calls, "vkCreateBuffer" `Text.isPrefixOf` call] `shouldBe` 2
+      -- Each creation first tried held memory, which held nothing to place
+      -- it in; only the allocating calls could open memory.
+      calls
+        `shouldSatisfy` isSubsequenceOf
+          [ "vmaCreateBuffer in held memory"
+          , "vmaCreateBuffer: VK_ERROR_OUT_OF_DEVICE_MEMORY (injected)"
+          , "vkDestroyImageView"
+          , "vmaCreateBuffer in held memory"
+          , "vmaCreateBuffer"
+          ]
+      length [call | call ← calls, call `elem` ["vmaCreateBuffer", "vmaCreateBuffer: VK_ERROR_OUT_OF_DEVICE_MEMORY (injected)"]] `shouldBe` 2
       length [call | call ← calls, "vkDestroySwapchainKHR" `Text.isPrefixOf` call] `shouldBe` 1
 
   it "held nothing unsettled before the session's retirement, every fence observed" $

@@ -36,7 +36,7 @@ import Test.Hspec (Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy)
 spec ∷ Spec
 spec = describe "Roots" $ do
   describe "construction" $ do
-    it "creates the instance, then the messenger, then the device against the bootstrap surface" $ do
+    it "creates the instance, then the messenger, then the device against the bootstrap surface, then its allocator" $ do
       (standIn, roots) ← fresh
       _ ← startRoots roots standardRequest
       answer ← admitRootTarget roots RequiredTarget (surfaceNumbered standIn 10)
@@ -54,6 +54,7 @@ spec = describe "Roots" $ do
                        , CreatedMessenger
                        , QueriedDevices 10
                        , CreatedDevice "stand-in device" 0
+                       , CreatedAllocator
                        ]
 
     it "refuses to start twice" $ do
@@ -120,7 +121,7 @@ spec = describe "Roots" $ do
       (standIn, roots) ← started
       before ← length <$> calls standIn
       startRootsDevice roots `shouldReturn` "stand-in device"
-      drop before <$> calls standIn `shouldReturn` [QueriedDevicesWithoutSurface, CreatedDevice "stand-in device" 0]
+      drop before <$> calls standIn `shouldReturn` [QueriedDevicesWithoutSurface, CreatedDevice "stand-in device" 0, CreatedAllocator]
       view ← atomically (readRootsView roots)
       (viewDevice view, viewQueueFamily view, viewTargets view) `shouldBe` (RootLive, Just 0, [])
       raised @DeviceAlreadyStarted (startRootsDevice roots) `shouldReturn` True

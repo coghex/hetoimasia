@@ -26,6 +26,12 @@ and settled the graphics owner's shutdown under D-33, which the
 Merged slices VK-1–VK-3 and the approved VK-4 (#208) are unaffected and may
 continue.
 
+The resources this backend's renderers draw with — device memory, managed
+buffers and images, uploads, and the texture table — are designed in the
+[GPU resource services design](designs/gpu_resource_services_design.md), epic
+#330. Its D-1 (bindless, atlased textures) overrides VKR-6's "do not assume
+bindless" in the [Vulkan capability findings](vulkan_backend_findings.md).
+
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
 reviewed and deliberately not tracked separately · `[deferred]` blocked on a
 concrete precondition

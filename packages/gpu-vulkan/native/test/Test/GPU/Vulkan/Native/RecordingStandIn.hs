@@ -4,9 +4,10 @@
 -- instant.
 --
 -- Handles are small numbers, so a record says which object each call touched.
--- A readback buffer's memory is a byte string the stand-in keeps, mapped at
--- the buffer's own number, whose size is the buffer's rounded up to 256 bytes
--- and whose coherence and atom the example chooses.
+-- A readback buffer's memory, and its mapping, are the stand-in allocator's
+-- ("Test.GPU.Vulkan.Native.AllocatorStandIn"); the bytes behind a mapping are
+-- a byte string this stand-in keeps under the mapped address, made on the
+-- first write.
 module Test.GPU.Vulkan.Native.RecordingStandIn
   ( RecordingStandIn (..)
   , newRecordingStandIn
@@ -21,8 +22,6 @@ module Test.GPU.Vulkan.Native.RecordingStandIn
   , duringReset
   , duringRecord
   , RecordingFailure (..)
-  , standInMemorySize
-  , standInAtom
   ) where
 
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
@@ -31,6 +30,7 @@ import Control.Monad (when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import Data.Map.Strict (Map)
+import Data.Maybe (fromMaybe)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
@@ -54,11 +54,6 @@ data RecordingCall
     -- ^ The pool and its command buffer.
   | ResetStorage !Word64
   | DestroyedStorage !Word64
-  | CreatedReadback !Word64 !Natural !Bool
-    -- ^ The buffer, its size, and whether its memory is coherent.
-  | DestroyedReadback !Word64
-  | Invalidated !(Natural, Natural)
-  | Flushed !(Natural, Natural)
   | ReadMapped !Natural !Natural
   | WroteMapped !Natural !Natural
   | Began !Word64
@@ -75,14 +70,12 @@ data RecordingStep
   | AtDestroyLayout
   | AtDestroyPipeline
   | AtDestroyStorage
-  | AtCreateReadback
   | AtBegin
   | AtEnd
   | AtRecord
     -- ^ Every recorded command but a label's.
   | AtBeginLabel
   | AtEndLabel
-  | AtFlush
   deriving (Eq, Ord, Show)
 
 -- | What a failing step raises, after recording the call.
@@ -97,8 +90,6 @@ data RecordingStandIn = RecordingStandIn
   , recordingFailing ∷ !(TVar (Set RecordingStep))
   , recordingHandles ∷ !(TVar Word64)
   , recordingMemory ∷ !(TVar (Map Word64 ByteString))
-  , recordingCoherent ∷ !(TVar Bool)
-    -- ^ Whether the next readback's memory is coherent.
   , recordingDuringReset ∷ !(TVar (IO ()))
   , recordingDuringRecord ∷ !(TVar (NativeCommand → IO ()))
   , recordingOutOfMemory ∷ !(TVar (Map RecordingStep Int))
@@ -115,7 +106,6 @@ newRecordingStandIn =
     <*> newTVarIO Set.empty
     <*> newTVarIO 500
     <*> newTVarIO Map.empty
-    <*> newTVarIO True
     <*> newTVarIO (pure ())
     <*> newTVarIO (\_ → pure ())
     <*> newTVarIO Map.empty
@@ -149,14 +139,6 @@ duringReset standIn action = atomically (writeTVar (recordingDuringReset standIn
 -- | Run this inside every recorded command, before it is recorded.
 duringRecord ∷ RecordingStandIn → (NativeCommand → IO ()) → IO ()
 duringRecord standIn action = atomically (writeTVar (recordingDuringRecord standIn) action)
-
--- | The memory a readback of this many bytes is given.
-standInMemorySize ∷ Natural → Natural
-standInMemorySize bytes = ((bytes + 255) `div` 256) * 256
-
--- | The stand-in device's non-coherent atom.
-standInAtom ∷ Natural
-standInAtom = 64
 
 journal ∷ RecordingStandIn → RecordingCall → IO ()
 journal standIn call = atomically (modifyTVar' (recordingJournal standIn) (call :))
@@ -212,26 +194,6 @@ recordingStandInOps standIn =
         action
         step standIn AtResetStorage (ResetStorage pool)
     , opsDestroyStorage = \_ pool → step standIn AtDestroyStorage (DestroyedStorage pool)
-    , opsCreateReadback = \_ bytes → do
-        buffer ← fresh standIn
-        memory ← fresh standIn
-        coherent ← readTVarIO (recordingCoherent standIn)
-        step standIn AtCreateReadback (CreatedReadback buffer bytes coherent)
-        let size = standInMemorySize bytes
-        atomically (modifyTVar' (recordingMemory standIn) (Map.insert buffer (ByteString.replicate (fromIntegral size) 0)))
-        pure
-          ReadbackAllocation
-            { allocationBuffer = buffer
-            , allocationMemory = memory
-            , allocationSize = bytes
-            , allocationMemorySize = size
-            , allocationCoherent = coherent
-            , allocationAtom = standInAtom
-            , allocationMapped = buffer
-            }
-    , opsDestroyReadback = \_ allocation → journal standIn (DestroyedReadback (allocationBuffer allocation))
-    , opsInvalidate = \_ _ range → journal standIn (Invalidated range)
-    , opsFlush = \_ _ range → step standIn AtFlush (Flushed range)
     , opsReadMapped = \allocation offset size → do
         journal standIn (ReadMapped offset size)
         bytes ← Map.findWithDefault ByteString.empty (allocationMapped allocation) <$> readTVarIO (recordingMemory standIn)
@@ -239,11 +201,14 @@ recordingStandInOps standIn =
     , opsWriteMapped = \allocation offset bytes → do
         journal standIn (WroteMapped offset (fromIntegral (ByteString.length bytes)))
         atomically $ modifyTVar' (recordingMemory standIn) $
-          Map.adjust
+          Map.alter
             ( \held →
-                ByteString.take (fromIntegral offset) held
-                  <> bytes
-                  <> ByteString.drop (fromIntegral offset + ByteString.length bytes) held
+                let current = fromMaybe (ByteString.replicate (fromIntegral (allocationSize allocation)) 0) held
+                 in Just
+                      ( ByteString.take (fromIntegral offset) current
+                          <> bytes
+                          <> ByteString.drop (fromIntegral offset + ByteString.length bytes) current
+                      )
             )
             (allocationMapped allocation)
     , opsBeginCommands = \commands → step standIn AtBegin (Began commands)
