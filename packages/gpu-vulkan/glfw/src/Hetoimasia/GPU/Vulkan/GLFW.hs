@@ -36,7 +36,8 @@
 -- over embedded shaders on the owner's thread, binds a pipeline built for the
 -- frame's format, sets the viewport and scissor and draws inside the dynamic
 -- rendering it begins and ends, and releases or replaces what it built. It
--- never holds a native handle. What it did not release is destroyed with the
+-- also creates and releases buffers and images of the engine's kinds (GRS-2),
+-- which it cannot yet record through. It never holds a native handle. What it did not release is destroyed with the
 -- session's other managed resources, before the device.
 --
 -- A host configured with 'DeviceSurfaceFree' creates the device in the
@@ -88,6 +89,17 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , PipelineLayout
   , Pipeline
   , PipelineShaders (..)
+
+    -- * Buffers and images (GRS-2)
+  , constructBuffer
+  , constructImage
+  , Buffer
+  , BufferKind (..)
+  , BufferDescription (..)
+  , Image
+  , ImageKind (..)
+  , ImageFormat (..)
+  , ImageDescription (..)
 
     -- * Owner-thread actions (GRS-15)
   , VulkanAction (..)
@@ -178,6 +190,8 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , defaultActionCapacity
   , readVulkanAction
   , Constructed
+  , constructBuffer
+  , constructImage
   , constructPipeline
   , constructPipelineLayout
   , replaceConstructedPipeline
@@ -224,7 +238,14 @@ import qualified Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller as Controller
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Loop (publishVulkanScene, runVulkanOwnerLoop)
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Production (withVulkanOwnerHostAs)
 import Hetoimasia.GPU.Vulkan.Native.Recording
-  ( ClearColor (..)
+  ( Buffer
+  , BufferDescription (..)
+  , BufferKind (..)
+  , ClearColor (..)
+  , Image
+  , ImageDescription (..)
+  , ImageFormat (..)
+  , ImageKind (..)
   , Pipeline
   , PipelineLayout
   , PipelineShaders (..)

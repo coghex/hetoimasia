@@ -36,7 +36,12 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Loop (runVulkanOwnerLoop)
 import Hetoimasia.GPU.Vulkan.Native.Naming (NativeObjectKind (ObjectPipeline))
 import Hetoimasia.GPU.Vulkan.Native.Presentation (SurfaceExtent (..), formatB8G8R8A8Srgb, formatR8G8B8A8Srgb, imageUsageColorAttachment, imageUsageTransferSource)
 import Hetoimasia.GPU.Vulkan.Native.Recording
-  ( ClearColor (..)
+  ( BufferDescription (..)
+  , BufferKind (..)
+  , ClearColor (..)
+  , ImageDescription (..)
+  , ImageFormat (..)
+  , ImageKind (..)
   , ImageLayout (..)
   , NativeCommand (..)
   , Pipeline
@@ -81,7 +86,7 @@ spec ∷ Spec
 spec = describe "Vulkan consumer rendering and capture" $ do
   describe "consumer construction" $ do
     it "describes each frame's format and extent, and binds and draws a pipeline the consumer built in the host's frame" (bounded testConsumerTriangle)
-    it "refuses construction and release off the owner's thread before any native call" (bounded testOffOwnerThread)
+    it "refuses construction and release off the owner's thread before any native call, buffers and images included" (bounded testOffOwnerThread)
     it "refuses a pipeline built for another format at its binding, recording nothing of it" (bounded testIncompatibleFormat)
     it "skips only the frame whose construction was refused or raised with no effect, never calling the renderer again for it, and the session continues" (bounded testRefusedConstruction)
     it "fails the session through the terminal latch, keeping the loss primary, when a construction loses the device" (bounded testTerminalConstruction)
@@ -206,7 +211,7 @@ testOffOwnerThread = do
   renderWith rig $ VulkanRenderer $ \scene request construction recorder → do
     writeIORef lent (Just (Lent construction))
     renderScene (triangleRenderer triangle) scene request construction recorder
-  (layout, pipeline, release, before, after) ← runRig rig $ \host control → do
+  (layout, pipeline, release, resources, before, after) ← runRig rig $ \host control → do
     [window] ← windowsOf host
     _ ← firstFrame rig host control window
     Just (Lent construction) ← readIORef lent
@@ -216,16 +221,23 @@ testOffOwnerThread = do
     layout ← constructPipelineLayout construction
     pipeline ← constructPipeline construction built shaders formatB8G8R8A8Srgb
     release ← releaseConstructed construction pipeline'
+    buffer ← constructBuffer construction (BufferDescription StagingBuffer 64)
+    image ← constructImage construction (ImageDescription TextureImage Rgba8Srgb 16 16 1)
     after ← journal rig
-    pure (layout, pipeline, release, before, after)
+    pure (layout, pipeline, release, (buffer, image), before, after)
   either Just (const Nothing) layout `shouldBe` Just RefusedNotOwner
   either Just (const Nothing) pipeline `shouldBe` Just RefusedNotOwner
   release `shouldBe` Left RefusedNotOwner
+  either Just (const Nothing) (fst resources) `shouldBe` Just RefusedNotOwner
+  either Just (const Nothing) (snd resources) `shouldBe` Just RefusedNotOwner
   -- Nothing native happened for any of them.
   let made = \case
         LayoutMade _ → True
         PipelineMade {} → True
         PipelineGone _ → True
+        BufferMade {} → True
+        ImageMade {} → True
+        OwnedViewMade {} → True
         _ → False
   filter made after `shouldBe` filter made before
 

@@ -20,13 +20,15 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Vma
   , c_destroy
   , c_createBuffer
   , c_destroyBuffer
+  , c_createImage
+  , c_destroyImage
   , c_map
   , c_unmap
   , c_flush
   , c_invalidate
   , c_setName
   , c_resultSize
-  , resultBuffer
+  , resultResource
   , resultAllocation
   , resultDeviceMemory
   , resultOffset
@@ -75,6 +77,12 @@ foreign import ccall unsafe "hetoimasia_vma_create_buffer"
 foreign import ccall unsafe "hetoimasia_vma_destroy_buffer"
   c_destroyBuffer ∷ Ptr VmaState → Word64 → Word64 → Ptr VmaResult → IO ()
 
+foreign import ccall unsafe "hetoimasia_vma_create_image"
+  c_createImage ∷ Ptr VmaState → Word32 → Word32 → Word32 → Word32 → Word32 → Word32 → Word32 → Ptr VmaResult → IO Int32
+
+foreign import ccall unsafe "hetoimasia_vma_destroy_image"
+  c_destroyImage ∷ Ptr VmaState → Word64 → Word64 → Ptr VmaResult → IO ()
+
 foreign import ccall unsafe "hetoimasia_vma_map"
   c_map ∷ Ptr VmaState → Word64 → Ptr VmaResult → IO Int32
 
@@ -90,8 +98,9 @@ foreign import ccall unsafe "hetoimasia_vma_invalidate"
 foreign import ccall unsafe "hetoimasia_vma_set_name"
   c_setName ∷ Ptr VmaState → Word64 → CString → IO ()
 
-resultBuffer, resultAllocation, resultDeviceMemory, resultOffset, resultSize, resultMapped ∷ Ptr VmaResult → IO Word64
-resultBuffer pointer = peekByteOff pointer 0
+-- | The buffer or image a creation made.
+resultResource, resultAllocation, resultDeviceMemory, resultOffset, resultSize, resultMapped ∷ Ptr VmaResult → IO Word64
+resultResource pointer = peekByteOff pointer 0
 resultAllocation pointer = peekByteOff pointer 8
 resultDeviceMemory pointer = peekByteOff pointer 16
 resultOffset pointer = peekByteOff pointer 24

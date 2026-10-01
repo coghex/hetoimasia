@@ -7,7 +7,8 @@
 -- the engine's own shim ("Hetoimasia.GPU.Vulkan.Native.Allocator.Vulkan"); the
 -- headless examples supply a stand-in that keeps its blocks in Haskell. No VMA
 -- type appears here or anywhere else in the package's public modules: a buffer
--- and its allocation are 64-bit handles, as every other native object is.
+-- or an image and its allocation are 64-bit handles, as every other native
+-- object is.
 --
 -- = What the engine decides
 --
@@ -31,12 +32,13 @@ module Hetoimasia.GPU.Vulkan.Native.Allocator
   ( -- * The native layer
     AllocatorOps (..)
   , BufferRequest (..)
+  , ImageRequest (..)
   , MemoryRequirements (..)
   , Placement (..)
   , Creation (..)
   , MemoryEvents (..)
   , noMemoryEvents
-  , BufferMemory (..)
+  , BoundMemory (..)
 
     -- * Memory types
   , MemoryProperty (..)
@@ -91,7 +93,8 @@ data MemoryTypeOffer = MemoryTypeOffer
 -- (D-16).
 data MemoryUsage
   = UsageTexture
-    -- ^ Always staged into device-local memory.
+    -- ^ Always staged into device-local memory. Depth and color targets,
+    -- which only the device writes and reads, live there too.
   | UsageStaticGeometry
     -- ^ Staged into device-local memory.
   | UsageStaging
@@ -209,8 +212,20 @@ data BufferRequest = BufferRequest
   }
   deriving (Eq, Show)
 
--- | What a buffer of that request needs: the size of its memory and the
--- memory types it may live in, as a bit mask.
+-- | An image to create: two-dimensional, optimally tiled, one array layer and
+-- one sample, exclusive to one queue family, in the undefined layout — its
+-- format, its extent, how many mip levels it has, and its Vulkan usage flags.
+data ImageRequest = ImageRequest
+  { requestImageFormat ∷ !Word32
+  , requestImageWidth ∷ !Word32
+  , requestImageHeight ∷ !Word32
+  , requestImageMipLevels ∷ !Word32
+  , requestImageUsage ∷ !Word32
+  }
+  deriving (Eq, Show)
+
+-- | What a buffer or image of that request needs: the size of its memory and
+-- the memory types it may live in, as a bit mask.
 data MemoryRequirements = MemoryRequirements
   { requirementSize ∷ !Natural
   , requirementTypes ∷ !Word32
@@ -226,9 +241,9 @@ data Placement
     -- ^ Opening a block or a dedicated allocation if it must.
   deriving (Eq, Show)
 
--- | What a buffer's creation answered.
+-- | What a buffer's or an image's creation answered.
 data Creation
-  = Created !BufferMemory
+  = Created !BoundMemory
   | NotPlaced
     -- ^ Asked for in held memory only, it could not be placed there: nothing
     -- held fits it, or the driver requires a dedicated allocation, which only
@@ -254,9 +269,10 @@ data MemoryEvents = MemoryEvents
 noMemoryEvents ∷ MemoryEvents
 noMemoryEvents = MemoryEvents 0 0 0 0
 
--- | One buffer with its allocation, bound.
-data BufferMemory = BufferMemory
-  { memoryBuffer ∷ !Word64
+-- | One buffer or image with its allocation, bound.
+data BoundMemory = BoundMemory
+  { memoryResource ∷ !Word64
+    -- ^ The buffer or the image.
   , memoryAllocation ∷ !Word64
     -- ^ The allocator's handle for the allocation.
   , memoryDevice ∷ !Word64
@@ -285,18 +301,26 @@ data AllocatorOps = AllocatorOps
   , allocatorCreateBuffer ∷ BufferRequest → Word32 → Placement → IO (MemoryEvents, Creation)
     -- ^ Create the buffer and its allocation in exactly that memory type,
     -- bound.
-  , allocatorDestroyBuffer ∷ BufferMemory → IO MemoryEvents
+  , allocatorDestroyBuffer ∷ BoundMemory → IO MemoryEvents
     -- ^ Destroy the buffer, then free its allocation.
-  , allocatorMap ∷ BufferMemory → IO Word64
+  , allocatorImageRequirements ∷ ImageRequest → IO MemoryRequirements
+    -- ^ What an image of the request would need, asked of the device without
+    -- creating one.
+  , allocatorCreateImage ∷ ImageRequest → Word32 → Placement → IO (MemoryEvents, Creation)
+    -- ^ Create the image and its allocation in exactly that memory type,
+    -- bound.
+  , allocatorDestroyImage ∷ BoundMemory → IO MemoryEvents
+    -- ^ Destroy the image, then free its allocation.
+  , allocatorMap ∷ BoundMemory → IO Word64
     -- ^ Map the allocation, answering its address. Opens nothing.
-  , allocatorUnmap ∷ BufferMemory → IO ()
-  , allocatorFlush ∷ BufferMemory → (Natural, Natural) → IO ()
+  , allocatorUnmap ∷ BoundMemory → IO ()
+  , allocatorFlush ∷ BoundMemory → (Natural, Natural) → IO ()
     -- ^ Flush a range of the allocation — an offset from its start and a
     -- size — after host writes to non-coherent memory. The allocator
     -- translates it into its device memory and aligns it to the atom.
-  , allocatorInvalidate ∷ BufferMemory → (Natural, Natural) → IO ()
+  , allocatorInvalidate ∷ BoundMemory → (Natural, Natural) → IO ()
     -- ^ Invalidate such a range before host reads.
-  , allocatorName ∷ BufferMemory → ByteString → IO ()
+  , allocatorName ∷ BoundMemory → ByteString → IO ()
     -- ^ Name the allocation inside the allocator.
   , allocatorDestroy ∷ IO MemoryEvents
     -- ^ Destroy the allocator once every allocation is freed, which frees the

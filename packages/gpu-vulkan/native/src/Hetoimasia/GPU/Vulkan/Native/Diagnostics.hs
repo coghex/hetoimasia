@@ -161,6 +161,8 @@ nativeFfiConfiguration =
         , "hetoimasia_vma_destroy"
         , "hetoimasia_vma_create_buffer"
         , "hetoimasia_vma_destroy_buffer"
+        , "hetoimasia_vma_create_image"
+        , "hetoimasia_vma_destroy_image"
         , "hetoimasia_vma_map"
         , "hetoimasia_vma_unmap"
         , "hetoimasia_vma_flush"

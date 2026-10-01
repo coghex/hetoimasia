@@ -332,11 +332,13 @@ deviceOffers created bootstrap = do
         , offerDynamicRendering = thirteen.dynamicRendering
         , offerSynchronization2 = thirteen.synchronization2
         , offerSwapchainMaintenance1 = maintenance.swapchainMaintenance1
+        , offerTextureCompressionBC = features.features.textureCompressionBC
         , offerQueueFamilies = offered
         }
 
 -- | One queue from the chosen family, the profile's features, and its
--- extensions.
+-- extensions; and @textureCompressionBC@ when the plan enables it, which is
+-- the one optional feature.
 deviceCreateInfo
   ∷ DevicePlan PhysicalDevice
   → DeviceCreateInfo '[PhysicalDeviceVulkan13Features, PhysicalDeviceSwapchainMaintenance1FeaturesKHR]
@@ -361,7 +363,10 @@ deviceCreateInfo plan =
           )
     , enabledLayerNames = Vector.empty
     , enabledExtensionNames = Vector.fromList plan.planDeviceExtensions
-    , enabledFeatures = Nothing
+    , enabledFeatures =
+        if plan.planTextureCompressionBC
+          then Just ((zero ∷ PhysicalDeviceFeatures) {textureCompressionBC = True})
+          else Nothing
     }
 
 -- | The instance's dispatchable handle, untyped, as the surface bridge leases

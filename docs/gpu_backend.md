@@ -32,6 +32,16 @@ first consumer — D-15, D-16, D-38 and D-40 of the
 [GPU resource services design](designs/gpu_resource_services_design.md). See
 [Device memory](#device-memory).
 
+GRS-2 ([#334](https://github.com/coghex/hetoimasia/issues/334)) adds **managed
+buffers and images**: opaque handles over the model's `ResourceId`, created on
+the graphics owner's thread — and lent to renderers and owner-thread actions
+through the host's `Construction` — from engine-defined kinds that fix their
+usage flags and memory usage; images checked against the device before
+anything is created, each with one owned view of the whole image; their memory
+placed through the allocator and charged as its blocks; and released and
+disposed of like every other managed resource. Nothing records through them
+yet. See [Buffers and images](#buffers-and-images).
+
 VK-12 ([#225](https://github.com/coghex/hetoimasia/issues/225)) adds **frames**:
 non-blocking acquisition, submission of sealed batches with one completion
 obligation per native submission, and safe abandonment — a skipped
@@ -682,19 +692,23 @@ of those the lowest index. It passes only that type's bit to VMA, so VMA can
 neither choose nor fall back to another; VMA still honours the driver's
 preferred or required dedicated allocation within that type. A usage no
 allowed type serves is `RefusedNoMemoryType`, naming the usage, before any
-allocation. Only the readback usage has a consumer yet; the others are defined
-for GRS-2's buffers and images.
+allocation. Each [buffer or image kind](#buffers-and-images) fixes the usage
+its allocation is made under; depth and color targets, which only the device
+writes and reads, use the texture usage's device-local memory.
 
 ### Accounting and backpressure
 
 The model's accounted bytes charge the device memory VMA holds — each block
 and each dedicated allocation — never a resource's own size (D-15, D-40). The
-private allocation protocol makes a buffer's memory for an allocation attempt
-in this order:
+private allocation protocol makes a buffer's or an image's memory for an
+allocation attempt in this order; the two differ only in VMA's calls
+(`vmaCreateBuffer` and `vmaCreateImage`, `vmaDestroyBuffer` and
+`vmaDestroyImage`) and in that an image is never mapped:
 
-1. The buffer's memory requirements are asked of the device without creating
-   it (`vkGetDeviceBufferMemoryRequirements`), and the memory type chosen.
-2. The buffer is created in held memory only
+1. The resource's memory requirements are asked of the device without
+   creating it (`vkGetDeviceBufferMemoryRequirements`,
+   `vkGetDeviceImageMemoryRequirements`), and the memory type chosen.
+2. The resource is created in held memory only
    (`VMA_ALLOCATION_CREATE_NEVER_ALLOCATE_BIT`). That opens nothing and charges
    nothing new. A request nothing held fits (VMA's
    `VK_ERROR_OUT_OF_DEVICE_MEMORY`) and one the driver requires dedicated (VMA's
@@ -721,13 +735,15 @@ in this order:
    VMA's sizing; freeing more than was charged as held, after which the charge
    would no longer bound the memory; or an effect the model refused to settle
    under the attempt, which is then settled under no reservation so nothing
-   held goes uncharged. The buffer is destroyed before its allocation is
+   held goes uncharged. The resource is destroyed before its allocation is
    freed, that effect settled too, and the request fails with
    `AllocatorAccountingDefect`. The memory still held stays charged. The
    session fails with `CleanupFailed`, and nothing else is freed for it,
    unless the defect is memory opened beyond a reservation that the budget
    still holds.
-6. A host-visible allocation is mapped for its lifetime (`vmaMapMemory`).
+6. A buffer's host-visible allocation is mapped for its lifetime
+   (`vmaMapMemory`). An image's is not: it is optimally tiled, and the host
+   never writes it directly (D-16).
 
 Every later call that can free memory — a destruction, the allocator's own —
 is settled the same way before anything else is admitted, and a defect there
@@ -756,9 +772,17 @@ uncertain follows the [terminal-failure policy](#terminal-failure).
 A creation, bind or map that failed leaves nothing allocated and no
 reservation held. VMA's own creation destroys what it made when its bind
 fails, inside the same call, and the effect it reports is settled; a map that
-failed destroys the buffer and frees its allocation, settling that. Memory such
+failed destroys the buffer and frees its allocation, settling that; an owned
+view whose creation failed destroys its image and frees the image's
+allocation, settling that. Memory such
 a failure left held — a block opened for it and kept, empty — stays charged
-until VMA frees it, and the next request may place in it. A failed request
+until VMA frees it, and the next request may place in it. Each allocation is
+counted with the roots the moment the call that made it returns, and a
+failed request counts what it made gone only once destroying it returned; a
+destruction that raised there has an unknown effect, so the allocation stays
+counted — the allocator, and the device, are never destroyed under it — the
+session fails with `CleanupFailed`, and the request's own failure is the one
+raised. A failed request
 rolls back only itself: other allocations, their blocks and their mappings are
 untouched.
 
@@ -767,7 +791,8 @@ untouched.
 An allocation is freed only when the model allows its resource's disposal,
 after completion evidence has ended every submitted use: VMA tracks no GPU use
 and is never relied on to. Teardown unmaps, destroys the buffer, then frees its
-allocation. Each allocation is mapped once, for its lifetime; VMA maps the
+allocation; for an image it destroys the owned view, then the image, then frees
+its allocation. Each allocation is mapped once, for its lifetime; VMA maps the
 block beneath as it needs, and unmapping one allocation leaves its siblings'
 mappings alone. Flushes and invalidates are allocation-relative ranges given to
 VMA ([Readback memory](#readback-memory)).
@@ -804,7 +829,7 @@ moved code and changed no behaviour; each module's Haddock states what it owns.
 
 | Module | Responsibility | Depends on |
 | --- | --- | --- |
-| `Layer` | The native layer's shape: `RecordingOps` and the command, layout and request vocabulary. No state, no call. | — |
+| `Layer` | The native layer's shape: `RecordingOps` and the command, layout and request vocabulary, the buffer and image kinds and what each fixes. No state, no call. | — |
 | `State` | The `Recording` and the three maps it holds; handles, refusals, failures and views; the owner check, the live-generation check, the model helpers and a generation's one native destruction. | `Layer` |
 | `Construction` | Creating, replacing, naming and releasing managed resources, each in one masked step. | `Layer`, `State` |
 | `Batches` | Discard, reset, submission evidence, and freeing a slot of completed batches: invalidate natively, then discharge. | `Layer`, `State` |
@@ -825,7 +850,7 @@ only home of the `unsafe` subset.
 
 | Capability | Operation | What the backend keeps |
 | --- | --- | --- |
-| Managed rendering resources | `createPipelineLayout`; `createPipeline` over a layout, VK-9's embedded shaders and a color format; `replacePipeline`; `createFrameStorage` for a target's frame slot; `createReadback` of a byte size; `releaseManaged` | The native objects, their accounting reserved with `beginAllocation` before each creation, and the exact generation each handle names |
+| Managed rendering resources | `createPipelineLayout`; `createPipeline` over a layout, VK-9's embedded shaders and a color format; `replacePipeline`; `createFrameStorage` for a target's frame slot; `createReadback` of a byte size; `createBuffer` and `createImage` of an engine-defined kind ([Buffers and images](#buffers-and-images)); `releaseManaged` | The native objects, their accounting reserved with `beginAllocation` before each creation, and the exact generation each handle names |
 | Checked frame | `recordFrame` takes a `FrameSlotId` the model holds acquired, and resolves its image, view, extent and format through the generation that owns them | The frame's generation, retained by the batch |
 | Scoped recorder | `transitionImage`, `beginRendering`, `bindPipeline`, `setViewport`, `setScissor`, `draw`, `endRendering`, `copyToReadback` | The slot's command storage and the batch's recorded references |
 | Recorded batch | `discardBatch`; `resetFrameRecorder`; `noteBatchSubmitted`, which VK-12's `submitFrames` calls | Sealed commands and references, whether or not the caller keeps the `BatchId` |
@@ -837,7 +862,8 @@ rendering into the frame's one color view, a graphics pipeline compatible with
 the frame's format, dynamic viewport and scissor, whole-triangle draws, the four
 image transitions below, and one bounded copy of the whole image into a readback
 buffer. There is no raw command buffer, no callback escape hatch, no descriptor,
-no vertex buffer and no render graph. A command outside that vocabulary — an
+no binding of a managed buffer or image — GRS-2 creates them, and GRS-3 and
+GRS-4 record through them — and no render graph. A command outside that vocabulary — an
 unsupported transition, a draw that is not whole triangles, a transition into or
 out of the transfer-source layout or a copy of an image that is not a transfer
 source — is `RefusedUnsupported`; one the recorder's state
@@ -967,6 +993,8 @@ No caller-supplied text reaches a name.
 | A pipeline's vertex and fragment shader modules | `resource <n>.<g> pipeline vertex shader`, `… fragment shader` | Each right after it is created and before the pipeline is built from it, under the `ResourceId` the model is about to issue the pipeline; the modules are destroyed once it is built |
 | A frame storage's pool and command buffer | `resource <n>.<g> command pool target <t> slot <s>`, `… command buffer …` | The same |
 | A readback's buffer | `resource <n>.<g> readback buffer` | The same. Its allocation is named the same inside the allocator, through VMA, whether or not the device offers naming; the device memory it lies in, which other allocations share, is named nowhere |
+| A managed buffer | `resource <n>.<g> buffer` | The same, its allocation named the same inside the allocator, as a readback's is |
+| A managed image, and its owned view | `resource <n>.<g> image`, `… image view` | The same, the image's allocation named as the image inside the allocator |
 
 Every naming call runs on the graphics owner's thread through the roots' device
 loss classification, and one that raised is handled as a failure of what it was
@@ -1112,6 +1140,114 @@ target does, and the controller does so only for a host composed with
 [verification capture](#verification-capture) on. VK-2 verified the
 transfer-source capture profile on both drivers.
 
+### Buffers and images
+
+GRS-2 (#334) adds two managed handles, `Buffer` and `Image`, opaque over the
+model's `ResourceId` like the others: no constructor and no native handle
+reaches a client. `createBuffer` and `createImage` make them on the graphics
+owner's thread; the window integration lends both, with `releaseConstructed`,
+through the host's `Construction` (`constructBuffer`, `constructImage`), to a
+renderer and to an owner-thread action alike, behind the same owner check,
+checkpoint and construction-failure handling as its pipelines. Nothing
+records through them yet: binding, transitions, layouts and CPU writes are
+GRS-3, GRS-4 and GRS-6's.
+
+**Kinds.** A creation names an engine-defined kind, never raw usage flags.
+Each kind fixes the resource's Vulkan usage flags and the memory usage its
+allocation is made under ([Usages and memory types](#usages-and-memory-types)):
+
+| Buffer kind | Usage flags | Memory usage | For |
+| --- | --- | --- | --- |
+| `VertexBuffer` | vertex buffer, transfer destination | `UsageStaticGeometry` | static vertex data, staged |
+| `IndexBuffer` | index buffer, transfer destination | `UsageStaticGeometry` | static index data, staged |
+| `InstanceBuffer` | vertex buffer, index buffer | `UsageFrameRing` | per-frame instance data, or the shared ring (D-33), which the device reads directly |
+| `LookupBuffer` | storage buffer | `UsageFrameRing` | a per-frame lookup table (D-23, D-35) |
+| `StagingBuffer` | transfer source | `UsageStaging` | host-written bytes the device copies from |
+
+| Image kind | Usage flags | Format features required | Memory usage | View aspect | Formats |
+| --- | --- | --- | --- | --- | --- |
+| `TextureImage` | sampled, transfer destination | sampled image, transfer destination | `UsageTexture` | color | RGBA8 and BC7, each sRGB and linear (D-21) |
+| `DepthTarget` | depth-stencil attachment | depth-stencil attachment | `UsageTexture` | depth | `D32_SFLOAT`, `X8_D24_UNORM_PACK32`, `D16_UNORM`: depth-only (D-36) |
+| `ColorTarget` | color attachment, transfer source | color attachment, transfer source | `UsageTexture` | color | RGBA8 and BGRA8, each sRGB and linear |
+
+`bufferKindUse`, `imageKindUse` and `kindFormats` state these as pure
+functions. A buffer's host-visible allocation is mapped for its lifetime; an
+image's never is.
+
+**Descriptions.** A buffer is described by its kind and its size in bytes
+(`BufferDescription`); an image by its kind, format, extent and mip-level
+count (`ImageDescription`) — two-dimensional, one array layer, one sample,
+optimally tiled, exclusive to the session's queue family, created in the
+undefined layout. Before anything native is created:
+
+- a buffer of zero bytes, of more than a `VkDeviceSize` holds, or larger than
+  the device's `maxBufferSize` is `RefusedOutOfBounds`;
+- an image whose format its kind does not take is
+  `RefusedImageUnsupported`, naming both; a zero width, height or mip count is
+  `RefusedOutOfBounds`, and so is more mip levels than the extent's full chain
+  (`fullMipChain`);
+- a BC7 image on a device created without `textureCompressionBC` is
+  `RefusedImageUnsupported`. The profile enables that feature exactly when the
+  device offers it (`planTextureCompressionBC`); it is optional, so a device
+  without it is still selected, and only BC7 is refused on it;
+- the device is then asked, without creating anything, whether its optimal
+  tiling offers the kind's format features for the format, and what
+  `vkGetPhysicalDeviceImageFormatProperties` allows for the kind's usage: a
+  combination it does not support is `RefusedImageUnsupported`, and a width,
+  height or mip count beyond what it allows `RefusedOutOfBounds`. That query
+  is the only native call before the creation's reservation;
+- once the attempt is reserved, the image's memory requirements are asked of
+  the device, still creating nothing, and requirements beyond the device's
+  largest resource for that use (`maxResourceSize`) are `RefusedOutOfBounds`,
+  naming both sizes, with the reservation given back.
+
+**The owned view.** Each image owns exactly one view of its whole resource —
+two-dimensional, every mip level of its one layer, in its own format, over
+the aspect its kind fixes — created right after the image under the same
+`ResourceId`, named with it, and destroyed with it. Separate or partial views
+and samplers are GRS-7's.
+
+**Memory and accounting.** Each is placed through the allocator under its
+kind's memory usage ([Device memory](#device-memory)): its bytes are charged
+only as the blocks VMA holds, never as its own size. Its attempt reserves its
+objects and no bytes: two for a buffer (the buffer and its allocation), three
+for an image (the image, its allocation and its view), so the object budget
+refuses one with `RefusedBackpressure` before anything native is done.
+Allocation backpressure and `RefusedNoMemoryType` reach the caller as the
+allocator answers them, having opened nothing.
+
+**Failure.** A creation that raised before it was committed — at the
+requirements, the creation, the bind, a buffer's map, or an image's view —
+destroys what it made and frees its allocation, settling that, gives back its
+reservation, and returns no handle; VK-14's recovery applies to an
+out-of-memory failure as to any construction. If destroying the image whose
+view could not be created raises too, its effect is uncertain: the image and
+its allocation are retained — the allocator can then not be destroyed, so
+neither can the device — the session fails with `CleanupFailed`, and the view's
+failure is the one raised. A naming call that raised after the generation was
+committed follows the [naming contract](#names-and-labels): the generation is
+released, its handle never returned, and the owner's disposal destroys it and
+gives its objects back.
+
+**Release and disposal.** `releaseManaged` ends a buffer's or an image's
+logical and CPU use together, like any managed resource's. `disposeResources`
+destroys one only once the model reports every hold ended: an image's view,
+then the image, then its allocation (`vmaDestroyImage`); a buffer, unmapped
+first when mapped, then its allocation (`vmaDestroyBuffer`). The destruction
+and the record of what it did are one masked step, and the model records the
+disposal before `disposeResources` returns; a destruction that raised is
+uncertain, never retried, retains what it was made from and fails the session,
+as for every managed resource. `readManaged` reports each with its kind —
+`vertex buffer`, `index buffer`, `instance buffer`, `lookup buffer`,
+`staging buffer`, `texture`, `depth target`, `color target` — its standing,
+and its native handles: a buffer's and its allocation's, or an image's, its
+view's and its allocation's.
+
+| State | Owner | Readers and writers | Thread | Lifetime | Reset or disposal |
+| --- | --- | --- | --- | --- | --- |
+| A buffer's or an image's managed record | The recording's managed records (`State`) | `Construction` inserts it, and releases it — on release or on a naming failure; `Disposal` advances it to destroyed or uncertain and removes it; `readManaged` reads it | The graphics owner | From its creation's commit until the model records its disposal | Destroyed once every hold has ended — view, image or buffer, then allocation — and removed when the model records that; kept, never retried, if its destruction was uncertain |
+| Its native objects and allocation | The same record | Made by the allocation protocol and the native layer inside the creation's masked step; freed only by its disposal, or by a creation's own rollback | The graphics owner | The record's | Freed with the record's disposal; retained with an uncertain one |
+
 ### Destruction
 
 `disposeResources` destroys, on the owner, every released generation the model
@@ -1127,7 +1263,9 @@ it can and raises `ResourcesRetained`, naming the rest, without manufacturing
 evidence; every managed resource must be gone before the device. A readback's
 destruction unmaps its allocation, destroys its buffer and then frees the
 allocation (VMA's `vmaDestroyBuffer`), and settles whatever device memory that
-freed; a sibling allocation's mapping and memory are untouched.
+freed; a sibling allocation's mapping and memory are untouched. A managed
+buffer's is the same; a managed image's destroys its owned view, then the
+image, then frees its allocation (`vmaDestroyImage`), settling that too.
 
 ### The FFI audit
 

@@ -16,7 +16,9 @@
 -- * @vk7-roots@ — VK-7's roots under the graphics owner, over two windows,
 --   including the destruction order at the host's exit (#219);
 -- * @vk11-recording@ — VK-11's managed resources and a recorded, discarded
---   triangle batch against a swapchain generation's image (#223);
+--   triangle batch against a swapchain generation's image (#223), then a
+--   buffer and an image of every kind created, named, released and disposed
+--   of (#334);
 -- * @vk12-frames@ — VK-12's frames: acquired, a triangle batch with its
 --   capture submitted and awaited, and images returned through cleanup
 --   submissions and maintenance release without presenting (#225);

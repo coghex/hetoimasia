@@ -102,6 +102,8 @@ disposeResources recording now = owner recording (go [])
       NativePipeline {} → 0 ∷ Int
       NativeStorage {} → 1
       NativeReadback {} → 2
+      NativeBuffer {} → 2
+      NativeImage {} → 2
       NativeLayout _ → 3
 
 -- | Whether a generation may be destroyed natively now, as far as the

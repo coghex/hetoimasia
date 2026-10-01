@@ -66,14 +66,15 @@ destroys it.
 - `Hetoimasia.GPU.Vulkan.Native.Recording` is VK-11's renderer-facing boundary
   over an open native layer (`RecordingOps`): opaque managed handles — a
   pipeline layout, a pipeline, a frame slot's command storage, a readback
-  buffer — keyed by the model's `ResourceId`; a scoped recorder that retains,
-  in the model and before each native call, the exact generations each command
-  references, a pipeline's layout included; sealed single-use batches that a
-  discard or a reset invalidates natively before their references are
-  discharged; readback reads gated on completion evidence, with non-coherent
-  memory invalidated and flushed over ranges of the buffer's own allocation,
-  which the device's allocator aligns; and destruction on
-  the owner once every hold has ended. It is the entry point only: its code
+  buffer, and GRS-2's buffers and images of engine-defined kinds, each image
+  with one owned view — keyed by the model's `ResourceId`; a scoped recorder
+  that retains, in the model and before each native call, the exact
+  generations each command references, a pipeline's layout included; sealed
+  single-use batches that a discard or a reset invalidates natively before
+  their references are discharged; readback reads gated on completion
+  evidence, with non-coherent memory invalidated and flushed over ranges of the
+  buffer's own allocation, which the device's allocator aligns; and destruction
+  on the owner once every hold has ended. It is the entry point only: its code
   lives in private modules under
   `Hetoimasia.GPU.Vulkan.Native.Internal.Recording`, which it re-exports
   unchanged and no client can import. `Layer` is the native layer's shape;

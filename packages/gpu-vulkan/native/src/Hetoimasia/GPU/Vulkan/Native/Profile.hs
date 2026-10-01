@@ -287,6 +287,9 @@ data DeviceOffer device = DeviceOffer
   , offerDynamicRendering ∷ !Bool
   , offerSynchronization2 ∷ !Bool
   , offerSwapchainMaintenance1 ∷ !Bool
+  , offerTextureCompressionBC ∷ !Bool
+    -- ^ Whether it offers the @textureCompressionBC@ feature, which BC7
+    -- textures need. Optional: a device without it is still selected.
   , offerQueueFamilies ∷ ![QueueFamilyOffer]
   }
 
@@ -314,6 +317,10 @@ data DevicePlan device = DevicePlan
     -- alone; each target's surface is then checked against it.
   , planDeviceExtensions ∷ ![ByteString]
   , planPortabilitySubset ∷ !Bool
+  , planTextureCompressionBC ∷ !Bool
+    -- ^ Whether the device is created with @textureCompressionBC@ enabled: it
+    -- is, exactly when the device offers it, and only then may a BC7 image be
+    -- created.
   }
 
 instance Functor DevicePlan where
@@ -368,6 +375,7 @@ examine presenting offer = case (rejections, family) of
         , planQueueFamily = chosen
         , planDeviceExtensions = [swapchainExtension, swapchainMaintenance1Extension] <> [portabilitySubsetExtension | portability]
         , planPortabilitySubset = portability
+        , planTextureCompressionBC = offerTextureCompressionBC offer
         }
   _ → Left rejections
   where

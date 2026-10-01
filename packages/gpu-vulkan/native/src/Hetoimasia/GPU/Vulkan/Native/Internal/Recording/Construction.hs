@@ -1,6 +1,7 @@
 -- | Managed-resource construction and release for the managed recording
 -- ("Hetoimasia.GPU.Vulkan.Native.Recording"): pipeline layouts, pipelines and
--- their replacements, frame storages and readback buffers, each made in one
+-- their replacements, frame storages, readback buffers, and buffers and
+-- images of the engine's kinds (GRS-2), each made in one
 -- masked step that reserves the model's accounting, makes the native object,
 -- turns the reservation into a managed generation and names that generation
 -- before its handle is returned; and 'releaseManaged', which ends a handle's
@@ -18,11 +19,14 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Construction
   , replacePipeline
   , createFrameStorage
   , createReadback
+  , createBuffer
+  , createImage
   , releaseManaged
   ) where
 
 import Control.Concurrent.STM (atomically, modifyTVar', readTVarIO)
-import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, displayException, mask_, rethrowIO, throwIO, tryWithContext)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, displayException, mask_, onException, rethrowIO, throwIO, tryWithContext)
+import Control.Monad (when)
 import qualified Data.Text as Text
 import Data.ByteString (ByteString)
 import Data.Foldable (for_)
@@ -41,22 +45,46 @@ import Hetoimasia.GPU.Model
   , endResourceCpuUse
   , modelBudgets
   , rebuildResource
+  , SessionFailureCause (CleanupFailed)
   , recordAllocationFailure
   , releaseResource
   )
 import qualified Hetoimasia.GPU.Model as Model
 import Hetoimasia.GPU.Model.Budget (frameSlotLimit)
 import Hetoimasia.GPU.Model.Identity (AllocationId, IdentityKind (..), Misuse (..), ResourceId, TargetId, targetSession)
-import Hetoimasia.GPU.Vulkan.Native.Allocator (BufferMemory (..), BufferRequest (..), MemoryTypeRefused (..), MemoryUsage (UsageReadback))
-import Hetoimasia.GPU.Vulkan.Native.Internal.Allocation (AllocatedBuffer (..), AllocationRefusal (..), allocateBuffer, freeBuffer, nameBuffer)
+import Hetoimasia.GPU.Vulkan.Native.Allocator (BoundMemory (..), BufferRequest (..), ImageRequest (..), MemoryTypeRefused (..), MemoryUsage (UsageReadback))
+import Hetoimasia.GPU.Vulkan.Native.Internal.Allocation
+  ( AllocatedBuffer (..)
+  , AllocationRefusal (..)
+  , allocateBuffer
+  , allocateImage
+  , freeBuffer
+  , freeImage
+  , nameAllocation
+  , nameBuffer
+  )
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
-  ( PipelineRequest (..)
+  ( BufferDescription (..)
+  , ImageDescription (..)
+  , ImageLimits (..)
+  , ImageQuery (..)
+  , ImageUse (..)
+  , PipelineRequest (..)
   , PipelineShaders
   , ReadbackAllocation (..)
   , RecordingOps (..)
+  , ViewRequest (..)
+  , bufferKindUse
+  , formatCode
+  , formatNeedsCompressionBC
+  , fullMipChain
+  , imageKindUse
+  , kindFormats
   )
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
-  ( Managed (..)
+  ( Buffer (..)
+  , Image (..)
+  , Managed (..)
   , ManagedRecord (..)
   , ManagedStanding (..)
   , NativeResource (..)
@@ -80,8 +108,11 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Reclamation (failingAgain, recoverA
 import Hetoimasia.GPU.Vulkan.Native.Naming
   ( NativeObjectKind (..)
   , ShaderStage
+  , bufferName
   , commandBufferName
   , commandPoolName
+  , imageName
+  , ownedViewName
   , pipelineLayoutName
   , pipelineName
   , readbackBufferName
@@ -90,6 +121,8 @@ import Hetoimasia.GPU.Vulkan.Native.Naming
 import Hetoimasia.GPU.Vulkan.Native.Profile (DevicePlan (..))
 import Hetoimasia.GPU.Vulkan.Native.Roots
   ( NativeFailure (..)
+  , Roots
+  , failRootsSessionBecause
   , nameRootsObject
   , readRootsDevice
   , readRootsInstrumentation
@@ -203,13 +236,10 @@ createReadback recording bytes
           "vmaCreateBuffer"
           ( \_ _ attempt _ →
               allocateBuffer (recordingRoots recording) attempt UsageReadback (BufferRequest bytes transferDestination) >>= \case
-                Left AllocationNoAllocator → pure (Left RefusedDeviceAbsent)
-                Left (AllocationNoMemoryType (MemoryTypeRefused kind _)) → pure (Left (RefusedNoMemoryType kind))
-                Left (AllocationBackpressure budget) → pure (Left (RefusedBackpressure budget))
-                Left (AllocationRejected misuse) → pure (Left (RefusedMisuse misuse))
+                Left refusal → pure (Left (allocationRefused refusal))
                 Right allocated → case allocatedMapped allocated of
                   Just mapped →
-                    pure (Right (NativeReadback (ReadbackAllocation (memoryBuffer (allocatedMemory allocated)) (allocatedMemory allocated) bytes (allocatedCoherent allocated) mapped) ContentsUndefined))
+                    pure (Right (NativeReadback (ReadbackAllocation (memoryResource (allocatedMemory allocated)) (allocatedMemory allocated) bytes (allocatedCoherent allocated) mapped) ContentsUndefined))
                   -- The readback usage requires host-visible memory, which
                   -- is always mapped.
                   Nothing → do
@@ -221,6 +251,131 @@ createReadback recording bytes
 -- | @VK_BUFFER_USAGE_TRANSFER_DST_BIT@: what a readback buffer is used as.
 transferDestination ∷ Word32
 transferDestination = 0x00000002
+
+-- | A buffer of the description's kind and size. The kind fixes its usage
+-- flags and the memory usage its allocation is made under
+-- ('bufferKindUse'); its memory comes from the device's allocator and, when
+-- host-visible, is mapped for its lifetime. Nothing writes it yet.
+--
+-- A size of zero, one no Vulkan size can hold, or one larger than the
+-- device's @maxBufferSize@ is 'RefusedOutOfBounds' before anything is
+-- created. Like a readback, its attempt reserves two objects — the buffer and
+-- its allocation — and no bytes of its own: the memory is charged as the
+-- allocator holds it (D-40). A usage no memory type serves is
+-- 'RefusedNoMemoryType', and a block the byte budget cannot hold is
+-- 'RefusedBackpressure', each having allocated nothing.
+createBuffer ∷ Recording q inst msgr phys dev cmd → BufferDescription → IO (Either Refusal Buffer)
+createBuffer recording (BufferDescription kind bytes)
+  | bytes == 0 = pure (Left (RefusedOutOfBounds 0 0))
+  | bytes > largestSize = pure (Left (RefusedOutOfBounds bytes largestSize))
+  | otherwise =
+      owned recording $ do
+        most ← opsMaxBufferSize (recordingOps recording)
+        if bytes > most
+          then pure (Left (RefusedOutOfBounds bytes most))
+          else
+            fmap Buffer
+              <$> construct
+                recording
+                0
+                2
+                "vmaCreateBuffer"
+                ( \_ _ attempt _ →
+                    either (Left . allocationRefused) (Right . NativeBuffer kind bytes)
+                      <$> allocateBuffer (recordingRoots recording) attempt usage (BufferRequest bytes flags)
+                )
+                Nothing
+  where
+    (flags, usage) = bufferKindUse kind
+    -- A @VkDeviceSize@.
+    largestSize = 2 ^ (64 ∷ Int) - 1
+
+-- | An image of the description's kind, format, extent and mip levels, and
+-- its one owned view: the whole image, in its format, over the aspect its kind
+-- fixes. The kind fixes its usage flags, the format features it needs and its
+-- memory usage ('imageKindUse'); its memory comes from the device's allocator
+-- and is never mapped. Nothing writes it, or moves it out of the undefined
+-- layout, yet.
+--
+-- Before anything is created, in this order: a format the kind does not take
+-- ('kindFormats') is 'RefusedImageUnsupported'; a zero width, height or mip
+-- count is 'RefusedOutOfBounds', and so is more mip levels than the extent's
+-- full chain; a BC7 format on a device created without
+-- @textureCompressionBC@ is 'RefusedImageUnsupported'; then the device is
+-- asked about the format, usage and format features — the one native call
+-- before creation — and a combination it does not support is
+-- 'RefusedImageUnsupported', and an extent or mip count beyond what it
+-- supports for it 'RefusedOutOfBounds'. Once the attempt has its reservation,
+-- the image's memory requirements are asked of the device, still creating
+-- nothing, and ones beyond the device's largest resource for it
+-- (@maxResourceSize@) are 'RefusedOutOfBounds' too, naming both sizes.
+--
+-- The attempt reserves three objects — the image, its allocation and its view
+-- — and no bytes of its own (D-40). A view whose creation raised destroys the
+-- image and frees its allocation before the failure is raised, so a creation
+-- that raised created nothing; if that cleanup raised too, what it concerned
+-- is retained and the session fails with 'CleanupFailed'.
+createImage ∷ Recording q inst msgr phys dev cmd → ImageDescription → IO (Either Refusal Image)
+createImage recording description =
+  owned recording $ case describedRefusal of
+    Just refusal → pure (Left refusal)
+    Nothing →
+      atomically (readRootsDevice roots) >>= \case
+        Nothing → pure (Left RefusedDeviceAbsent)
+        Just (plan, _)
+          | formatNeedsCompressionBC format && not (planTextureCompressionBC plan) → pure (Left unsupported)
+          | otherwise →
+              opsImageSupport ops (ImageQuery code (useImageFlags use) (useFormatFeatures use)) >>= \case
+                Nothing → pure (Left unsupported)
+                Just limits
+                  | width > limitWidth limits → pure (Left (RefusedOutOfBounds (fromIntegral width) (fromIntegral (limitWidth limits))))
+                  | height > limitHeight limits → pure (Left (RefusedOutOfBounds (fromIntegral height) (fromIntegral (limitHeight limits))))
+                  | levels > limitMipLevels limits → pure (Left (RefusedOutOfBounds (fromIntegral levels) (fromIntegral (limitMipLevels limits))))
+                  | otherwise → fmap Image <$> construct recording 0 3 "vmaCreateImage" (create (limitResourceSize limits)) Nothing
+  where
+    roots = recordingRoots recording
+    ops = recordingOps recording
+    ImageDescription kind format width height levels = description
+    use = imageKindUse kind
+    code = formatCode format
+    unsupported = RefusedImageUnsupported kind format
+    chain = fullMipChain width height
+    describedRefusal
+      | format `notElem` kindFormats kind = Just unsupported
+      | width == 0 || height == 0 || levels == 0 = Just (RefusedOutOfBounds 0 0)
+      | levels > chain = Just (RefusedOutOfBounds (fromIntegral levels) (fromIntegral chain))
+      | otherwise = Nothing
+    create most native device attempt _ =
+      allocateImage roots attempt (useMemory use) (ImageRequest code width height levels (useImageFlags use)) most >>= \case
+        Left refusal → pure (Left (allocationRefused refusal))
+        Right memory → do
+          view ←
+            rootsCall roots "vkCreateImageView" (opsCreateView native device (ViewRequest (memoryResource memory) code (useAspect use) levels))
+              `onException` undoing roots "destroying the image whose view could not be created" (freeImage roots memory)
+          pure (Right (NativeImage description memory view))
+
+-- | What an allocation that made nothing refused with, as the recording
+-- answers it.
+allocationRefused ∷ AllocationRefusal → Refusal
+allocationRefused = \case
+  AllocationNoAllocator → RefusedDeviceAbsent
+  AllocationNoMemoryType (MemoryTypeRefused kind _) → RefusedNoMemoryType kind
+  AllocationBackpressure budget → RefusedBackpressure budget
+  AllocationRejected misuse → RefusedMisuse misuse
+  AllocationBeyondResource needed most → RefusedOutOfBounds needed most
+
+-- | Undo part of a creation that is raising. A cleanup that raised has an
+-- unknown effect: what it concerned is retained — an allocation it did not
+-- free still counts against the allocator's destruction — never attempted
+-- again, and the session fails with 'CleanupFailed'. The creation's own
+-- failure is the one raised, unless the cleanup was cancelled.
+undoing ∷ Roots q inst msgr phys dev → Text → IO () → IO ()
+undoing roots what cleanup =
+  tryWithContext @SomeException cleanup >>= \case
+    Right () → pure ()
+    Left failure@(ExceptionWithContext _ exception) → do
+      atomically (failRootsSessionBecause roots CleanupFailed (what <> " raised: " <> Text.pack (displayException exception)))
+      when (isAsynchronous exception) (rethrowIO failure)
 
 -- | The naming call a pipeline's shader modules are given: under the
 -- identity the model is about to issue the pipeline, when the roots offer
@@ -339,7 +494,8 @@ construct recording bytes objects name create replacing =
     roots = recordingRoots recording
 
 -- | Name a generation's native objects, when the roots offer naming, and a
--- readback's allocation inside the device's allocator, before its handle is
+-- readback's, a buffer's or an image's allocation inside the device's
+-- allocator, before its handle is
 -- returned. A naming call that raised releases the generation —
 -- nothing can record it, its CPU use ends, and the owner's disposal destroys it
 -- like any other released generation — and the failure is re-raised.
@@ -355,11 +511,13 @@ nameManaged recording resource native =
       rethrowIO failure
   where
     roots = recordingRoots recording
-    -- A readback's allocation is named inside the allocator whether or not
-    -- the device offers naming; its engine objects only when it does.
+    -- An allocation is named inside the allocator whether or not the device
+    -- offers naming; the engine's objects only when it does.
     naming = do
       case native of
         NativeReadback allocation _ → nameBuffer roots (readbackBuffer allocation) (readbackBufferName resource)
+        NativeBuffer _ _ allocated → nameBuffer roots allocated (bufferName resource)
+        NativeImage _ memory _ → nameAllocation roots memory (imageName resource)
         _ → pure ()
       readRootsInstrumentation roots >>= \case
         Nothing → pure ()
@@ -376,6 +534,8 @@ managedNames recording resource = \case
     , (ObjectCommandBuffer, opsCommandBufferHandle (recordingOps recording) commands, commandBufferName resource target slot)
     ]
   NativeReadback allocation _ → [(ObjectBuffer, allocationBuffer allocation, readbackBufferName resource)]
+  NativeBuffer _ _ allocated → [(ObjectBuffer, memoryResource (allocatedMemory allocated), bufferName resource)]
+  NativeImage _ memory view → [(ObjectImage, memoryResource memory, imageName resource), (ObjectImageView, view, ownedViewName resource)]
 
 -- | Release a handle: nothing records through it again, and its CPU use —
 -- reading a readback included — ends with it. Batches that already recorded

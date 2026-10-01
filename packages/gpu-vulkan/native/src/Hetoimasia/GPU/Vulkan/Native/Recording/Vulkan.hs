@@ -18,10 +18,10 @@ module Hetoimasia.GPU.Vulkan.Native.Recording.Vulkan
   , transitionScopes
   ) where
 
-import Control.Exception (onException)
+import Control.Exception (catch, onException, throwIO)
 import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Unsafe as Unsafe
-import Data.Bits ((.|.))
+import Data.Bits ((.&.), (.|.))
 import qualified Data.Vector as Vector
 import Data.Word (Word64)
 import Foreign.Marshal.Utils (copyBytes)
@@ -29,8 +29,10 @@ import Foreign.Ptr (Ptr, WordPtr (..), castPtr, plusPtr, ptrToWordPtr, wordPtrTo
 import Vulkan.CStruct.Extends (SomeStruct (..))
 import Vulkan.Core10 hiding (ImageLayout, Viewport (..))
 import qualified Vulkan.Core10 as Core10
+import Vulkan.Core11 (PhysicalDeviceProperties2 (..), getPhysicalDeviceProperties2)
 import Vulkan.Core13
   ( DependencyInfo (..)
+  , PhysicalDeviceVulkan13Properties (..)
   , ImageMemoryBarrier2 (..)
   , BufferMemoryBarrier2 (..)
   , PipelineRenderingCreateInfo (..)
@@ -40,6 +42,7 @@ import Vulkan.Core13
 import Vulkan.Core13.Enums.AccessFlags2
 import Vulkan.Core13.Enums.PipelineStageFlags2
 import Vulkan.Core12 (ResolveModeFlagBits (RESOLVE_MODE_NONE))
+import Vulkan.Exception (VulkanException (..))
 import Vulkan.Extensions.VK_EXT_debug_utils (DebugUtilsLabelEXT (..))
 import Vulkan.Zero (zero)
 
@@ -49,12 +52,15 @@ import Hetoimasia.GPU.Vulkan.Native.Presentation (SurfaceExtent (..))
 import Hetoimasia.GPU.Vulkan.Native.Recording
   ( ClearColor (..)
   , ImageLayout (..)
+  , ImageLimits (..)
+  , ImageQuery (..)
   , NativeCommand (..)
   , PipelineRequest (..)
   , PipelineShaders (..)
   , ReadbackAllocation (..)
   , Rect (..)
   , RecordingOps (..)
+  , ViewRequest (..)
   , Viewport (..)
   )
 
@@ -62,10 +68,14 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
 -- | The recording's native layer for the session's physical device. A
 -- readback buffer's memory, its mapping and its maintenance are the device
 -- allocator's ("Hetoimasia.GPU.Vulkan.Native.Allocator.Vulkan"); this layer
--- only copies bytes through the mapping it is handed, and reads nothing of the
--- physical device itself.
+-- only copies bytes through the mapping it is handed. Of the physical device
+-- it reads the largest buffer it may create, once, and whether it supports an
+-- image before one is created.
 vulkanRecordingOps ∷ PhysicalDevice → IO (RecordingOps Device CommandBuffer)
-vulkanRecordingOps _ =
+vulkanRecordingOps physical = do
+  properties ∷ PhysicalDeviceProperties2 '[PhysicalDeviceVulkan13Properties] ← getPhysicalDeviceProperties2 physical
+  let (thirteen, ()) = properties.next
+      largest = fromIntegral thirteen.maxBufferSize
   pure
     RecordingOps
       { opsCreatePipelineLayout = \device →
@@ -98,7 +108,55 @@ vulkanRecordingOps _ =
       , opsEndCommands = endCommandBufferUnsafe
       , opsRecord = recordCommand
       , opsCommandBufferHandle = fromIntegral . ptrToWordPtr . commandBufferHandle
+      , opsImageSupport = imageSupport physical
+      , opsMaxBufferSize = pure largest
+      , opsCreateView = \device request →
+          (\(ImageView created) → created)
+            <$> createImageView
+              device
+              ( ImageViewCreateInfo
+                  { next = ()
+                  , flags = zero
+                  , image = Image request.requestViewImage
+                  , viewType = IMAGE_VIEW_TYPE_2D
+                  , format = Format (fromIntegral request.requestViewFormat)
+                  , components = ComponentMapping COMPONENT_SWIZZLE_IDENTITY COMPONENT_SWIZZLE_IDENTITY COMPONENT_SWIZZLE_IDENTITY COMPONENT_SWIZZLE_IDENTITY
+                  , subresourceRange = ImageSubresourceRange (ImageAspectFlagBits request.requestViewAspect) 0 request.requestViewMipLevels 0 1
+                  }
+                  ∷ ImageViewCreateInfo '[]
+              )
+              Nothing
+      , opsDestroyView = \device view → destroyImageView device (ImageView view) Nothing
       }
+
+-- | Whether the physical device supports an optimally tiled two-dimensional
+-- image of the query: its format offers every format feature asked for, and
+-- the device answers its format properties for the usage — the extent, mip
+-- levels and resource size it allows. A combination the device answers
+-- @VK_ERROR_FORMAT_NOT_SUPPORTED@ for is unsupported; any other failure is
+-- raised.
+imageSupport ∷ PhysicalDevice → ImageQuery → IO (Maybe ImageLimits)
+imageSupport physical query = do
+  let format = Format (fromIntegral query.queryFormat)
+      needed = FormatFeatureFlagBits query.queryFeatures
+  offered ← (.optimalTilingFeatures) <$> getPhysicalDeviceFormatProperties physical format
+  if offered .&. needed /= needed
+    then pure Nothing
+    else
+      ( Just . limits
+          <$> getPhysicalDeviceImageFormatProperties physical format IMAGE_TYPE_2D IMAGE_TILING_OPTIMAL (ImageUsageFlagBits query.queryUsage) zero
+      )
+        `catch` \case
+          VulkanException ERROR_FORMAT_NOT_SUPPORTED → pure Nothing
+          failure → throwIO failure
+  where
+    limits properties =
+      ImageLimits
+        { limitWidth = properties.maxExtent.width
+        , limitHeight = properties.maxExtent.height
+        , limitMipLevels = properties.maxMipLevels
+        , limitResourceSize = fromIntegral properties.maxResourceSize
+        }
 
 mapped ∷ ReadbackAllocation → Ptr ()
 mapped allocation = wordPtrToPtr (WordPtr (fromIntegral allocation.allocationMapped))
