@@ -63,6 +63,15 @@
 # group run from the same checkout. Recreating it with the same toolchain
 # writes the same bytes, which is all a warm build compares.
 #
+# `HETOIMASIA_VMA_FOREIGN_CALLS` chooses the call safety of the Hackage
+# `VulkanMemoryAllocator` binding, which only the allocator probe depends on
+# (GRS-18, #361): `unsafe`, the default and the binding's own default, or
+# `safe`, its `safe-foreign-calls` flag. A project builds one configuration of
+# a dependency, so the choice is a constraint on the command line, every other
+# input identical, and the safe build keeps its own build directory so neither
+# variant rebuilds the other. The choice is exported to what runs, which the
+# probe checks against the binding's behaviour.
+#
 # Exit status: the build's, the suites', or the executable's own; 2 for a
 # configuration diagnostic.
 set -euo pipefail
@@ -157,6 +166,16 @@ case "$(uname -s)" in
   *) refuse "$(uname -s) is not a platform the Vulkan project is qualified on" ;;
 esac
 build_directory="$root/dist-vulkan"
+vma_calls="${HETOIMASIA_VMA_FOREIGN_CALLS:-unsafe}"
+case "$vma_calls" in
+  unsafe) vma_constraint="VulkanMemoryAllocator -safe-foreign-calls" ;;
+  safe)
+    vma_constraint="VulkanMemoryAllocator +safe-foreign-calls"
+    build_directory="$root/dist-vulkan-vma-safe"
+    ;;
+  *) refuse "HETOIMASIA_VMA_FOREIGN_CALLS is '$vma_calls'; it is 'unsafe' (the default) or 'safe'" ;;
+esac
+export HETOIMASIA_VMA_FOREIGN_CALLS="$vma_calls"
 discovery="$(python3 "$root/tools/native/native.py" prepare --prefix "$native_prefix" --build-dir "$build_directory")" \
   || refuse "the private native prefix at $native_prefix is not what this configuration provisions; the diagnosis above says what differs, and a prefix that is simply out of date is rebuilt with: python3 tools/native/native.py build --prefix $native_prefix"
 eval "$discovery"
@@ -172,6 +191,7 @@ cabal_flags=(
   --builddir="$build_directory"
   --extra-lib-dirs="$HETOIMASIA_VULKAN_LIBDIR"
   --extra-include-dirs="$HETOIMASIA_VULKAN_INCLUDEDIR"
+  "--constraint=$vma_constraint"
 )
 
 echo "vulkan: ghc $actual_ghc, cabal $actual_cabal"
@@ -179,6 +199,7 @@ echo "vulkan: native prefix $native_prefix"
 echo "vulkan: VK_DRIVER_FILES=$VK_DRIVER_FILES"
 echo "vulkan: VK_LAYER_PATH=$VK_LAYER_PATH"
 echo "vulkan: validation features ${HETOIMASIA_VULKAN_VALIDATION_FEATURES:-none}"
+echo "vulkan: VMA binding calls $vma_calls ($vma_constraint), build directory $build_directory"
 
 cd "$root"
 

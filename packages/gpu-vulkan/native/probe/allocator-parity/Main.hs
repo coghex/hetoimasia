@@ -1,17 +1,22 @@
 {-# LANGUAGE CPP #-}
 
--- | The allocator parity probe (GRS-1, D-14): replays committed traces into
--- one fixed-size block through the Haskell placement and through VMA's virtual
--- block, reports requirement 7's four criteria for the gated traces, and
--- reports diagnostics that separate search, copying, collection and timer
--- overhead.
+-- | The allocator probe. By default it runs GRS-18's qualification of the
+-- production VMA integration on a real device (#361, D-39; "Production");
+-- with @--virtual-block-parity@ it runs GRS-1's comparison (#331, D-14), kept
+-- as D-38's evidence: committed traces replayed into one fixed-size block
+-- through the Haskell placement and through VMA's virtual block, requirement
+-- 7's four criteria for the gated traces, and diagnostics that separate
+-- search, copying, collection and timer overhead.
 --
 --   bash tools/vulkan/run.sh test hetoimasia-gpu-vulkan-native:test:allocator-parity-probe
+--   bash tools/vulkan/run.sh test hetoimasia-gpu-vulkan-native:test:allocator-parity-probe -- --virtual-block-parity
 --
 -- Options, after @--@: @--output FILE@ to also write the report there,
--- @--gate-traces DIR@, @--diagnostic-traces DIR@ (repeatable), @--warmup N@
--- and @--repetitions N@. It exits 1 when a gate is missed on a gated trace and
--- 2 when a self-check fails. README.md beside it states the protocol.
+-- @--gate-traces DIR@, @--warmup N@ and @--repetitions N@; with
+-- @--virtual-block-parity@ also @--diagnostic-traces DIR@ (repeatable). Either
+-- mode exits 0 when every limit or gate is met, 1 when one is missed and 2
+-- when the run is invalid or incomplete. README.md beside it states both
+-- protocols.
 module Main (main) where
 
 import Control.Exception (SomeException, try)
@@ -40,6 +45,7 @@ import Parity.Replay (Evidence (..), Mode (..), Pass (..), sampleEvery, samePass
 import Parity.Report
 import Parity.Trace (OpKind (..), Trace (..), opKind, readTrace)
 import Parity.Vma (VmaStrategy (..), checkLayouts, clockPairNanoseconds, encodeTrace, probeCompiler, replayVma)
+import Production (ProductionOptions (..), runProduction)
 import System.Directory (doesDirectoryExist, doesFileExist, listDirectory)
 import System.Environment (getArgs)
 import System.Exit (ExitCode (..), exitWith)
@@ -79,7 +85,9 @@ segmentOperations ∷ Int
 segmentOperations = 256
 
 data Options = Options
-  { optionGateTraces ∷ FilePath
+  { optionParity ∷ Bool
+    -- ^ GRS-1's virtual-block comparison instead of GRS-18's measurement.
+  , optionGateTraces ∷ FilePath
   , optionDiagnosticTraces ∷ [FilePath]
   , optionOutput ∷ Maybe FilePath
   , optionWarmup ∷ Int
@@ -87,7 +95,7 @@ data Options = Options
   }
 
 parseOptions ∷ [String] → Either String Options
-parseOptions = go (Options "probe/allocator-parity/traces" [] Nothing 3 20) False
+parseOptions = go (Options False "probe/allocator-parity/traces" [] Nothing 3 20) False
   where
     go options diagnosticsGiven [] =
       Right
@@ -95,6 +103,7 @@ parseOptions = go (Options "probe/allocator-parity/traces" [] Nothing 3 20) Fals
             then options
             else options {optionDiagnosticTraces = ["probe/allocator-parity/traces/churn", "probe/allocator-parity/traces/sweep"]}
         )
+    go options given ("--virtual-block-parity" : rest) = go options {optionParity = True} given rest
     go options given ("--gate-traces" : value : rest) = go options {optionGateTraces = value} given rest
     go options _ ("--diagnostic-traces" : value : rest) =
       go options {optionDiagnosticTraces = optionDiagnosticTraces options <> [value]} True rest
@@ -112,6 +121,19 @@ main = do
   options ← either (\problem → hPutStrLn stderr problem >> exitWith (ExitFailure 2)) pure (parseOptions arguments)
   unless (optionRepetitions options >= 1) $ hPutStrLn stderr "at least one repetition is needed" >> exitWith (ExitFailure 2)
   checkLayouts
+  unless (optionParity options) $ do
+    digest ← sourceDigest
+    runProduction
+      ProductionOptions
+        { productionTraces = optionGateTraces options
+        , productionOutput = optionOutput options
+        , productionWarmup = optionWarmup options
+        , productionRepetitions = optionRepetitions options
+        , productionArguments = arguments
+        , productionDigest = digest
+        , productionTraceDigests = runOneDigests
+        }
+    exitWith ExitSuccess
   failures ← newIORef []
   selfCheckStatistics failures
   progress "running the differential check of the prototype against the reference"
@@ -478,8 +500,8 @@ describeEnvironment options arguments (haskellClock, shimClock) = do
     , ""
     , "## Reproduction"
     , ""
-    , "- Command: `bash tools/vulkan/run.sh test hetoimasia-gpu-vulkan-native:test:allocator-parity-probe"
-        <> (if null arguments then "" else " -- " <> unwords arguments)
+    , "- Command: `bash tools/vulkan/run.sh test hetoimasia-gpu-vulkan-native:test:allocator-parity-probe -- "
+        <> unwords arguments
         <> "`"
     , "- Source digest: `" <> fst sources <> "` over " <> intercalate ", " (snd sources)
     , "- Machine: " <> intercalate ", " (filter (not . null) [model, cpu, system, if null osVersion then "" else "macOS " <> osVersion])
@@ -532,6 +554,7 @@ sourceDigest = do
       , "../model/hetoimasia-gpu-vulkan-model.cabal"
       , "../../../cabal.project.vulkan"
       , "../../../cabal.project.common"
+      , "../../../tools/vulkan/run.sh"
       ]
     expand path = do
       isFile ← doesFileExist path

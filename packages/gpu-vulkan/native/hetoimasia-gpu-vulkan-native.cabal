@@ -284,16 +284,25 @@ test-suite native-tests
         hetoimasia-gpu-vulkan-native,
         hetoimasia-test-support ==0.1.0.0
 
--- GRS-1's allocator parity probe (#331, D-14), kept as the evidence for D-38:
--- the committed traces replayed into one fixed block through the pure placement
--- reference, a mutable prototype of it and VMA's virtual block, timed, and
--- judged against #331's requirement 7. Neither Haskell allocator met those
--- gates, and the owner chose VMA for production allocation. The probe is local
--- apparatus, deliberately not a validation group — only the three required
--- Vulkan groups may run a Vulkan-project command — so nothing selects it; it
--- is built and run on request through `tools/vulkan/run.sh`. Here VMA is the copy the pinned Hackage
--- `VulkanMemoryAllocator` package compiles, reaching this suite alone. See
--- probe/allocator-parity/README.md and docs/gpu_allocator_parity_record.md.
+-- The allocator probe, local apparatus with two modes. By default it is
+-- GRS-18's qualification of the production VMA integration (#361, D-39): a
+-- windowless device of its own, one externally synchronised allocator per
+-- pass, and the engine's VMA calls made from a C driver and from Haskell
+-- through the Hackage binding, timed per call and over the four retained
+-- traces translated into real buffers and images, with D-40's block
+-- accounting, completion-deferred frees and synchronization validation. With
+-- `--virtual-block-parity` it is GRS-1's parity probe (#331, D-14), kept as
+-- the evidence for D-38: the committed traces replayed into one fixed block
+-- through the pure placement reference, a mutable prototype of it and VMA's
+-- virtual block, judged against #331's requirement 7. It is deliberately not
+-- a validation group — only the three required Vulkan groups may run a
+-- Vulkan-project command — so nothing selects it; it is built and run on
+-- request through `tools/vulkan/run.sh`, whose `HETOIMASIA_VMA_FOREIGN_CALLS`
+-- chooses the binding's call safety. Here VMA is the copy the pinned Hackage
+-- `VulkanMemoryAllocator` package compiles, reaching this suite alone. It is
+-- linked with the threaded runtime the engine uses. See
+-- probe/allocator-parity/README.md, docs/gpu_vma_qualification_record.md and
+-- docs/gpu_allocator_parity_record.md.
 test-suite allocator-parity-probe
     import: language
     type: exitcode-stdio-1.0
@@ -308,12 +317,21 @@ test-suite allocator-parity-probe
         Parity.Report
         Parity.Trace
         Parity.Vma
+        Production
+        Production.Deferred
+        Production.Device
+        Production.Driver
+        Production.Script
         Prototype.MutableBestFit
-    cxx-sources: probe/allocator-parity/cbits/vma_replay.cpp
+    cxx-sources:
+        probe/allocator-parity/cbits/vma_replay.cpp
+        probe/allocator-parity/cbits/vma_production.cpp
     cxx-options: -std=c++17 -O2 -Wall -Wextra -Werror
     -- `-T` keeps the runtime's statistics, which the allocation and collection
     -- figures read; `-rtsopts` lets a run choose its nursery (`+RTS -A…`).
-    ghc-options: -rtsopts "-with-rtsopts=-T"
+    -- `-threaded` because a safe foreign call's cost, and whether another
+    -- Haskell thread can run during one, depend on it.
+    ghc-options: -threaded -rtsopts "-with-rtsopts=-T"
     build-depends:
         base >=4.22 && <4.23,
         bytestring >=0.12 && <0.13,

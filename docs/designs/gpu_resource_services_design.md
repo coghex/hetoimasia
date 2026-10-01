@@ -1018,8 +1018,16 @@ pull request.
 
 ### GRS-18. Qualify the production VMA integration by bounded measurement
 
-> Filed as #361, with proposed thresholds for the owner to confirm before it
-> is solved.
+> Filed as #361. The owner confirmed its acceptance limits there as final:
+> for each measured call, Haskell median minus C median — the total
+> binding-path overhead, marshalling and wrappers included — no greater than
+> the larger of 25% of the C median or 50 ns; on every gated trace, Haskell
+> elapsed time no more than 1.25 × C elapsed time for identical completed
+> work; and no completion-deferred free before its batch's fence signals,
+> with clean synchronization validation, its cost against immediate frees
+> reported with no numeric limit. A miss is retained and reported, never
+> waived, and leaves GRS-11's prerequisite unsatisfied. The runs are in
+> [the VMA qualification record](../gpu_vma_qualification_record.md).
 
 - **Outcome:** retained measurements (D-39) show the chosen binding's
   Haskell↔C cost, VMA's behaviour on representative workloads on a real
@@ -1035,7 +1043,7 @@ pull request.
 - **Acceptance signals:** the probe's retained report on macOS stating every
   threshold met or missed; a binding recommendation.
 - **Out of scope:** engine integration, model accounting (GRS-11).
-- **Open questions:** the acceptance thresholds, settled at filing.
+- **Open questions:** none; the acceptance limits were confirmed in #361.
 
 ### GRS-11. Back allocations with device-memory blocks beneath the model's accounting
 

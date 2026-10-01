@@ -108,14 +108,18 @@ Other existing apparatus is already outside routine automation:
   see [GLFW's native suite](glfw.md#the-native-suite).
 - `lua-hazard callback-cancellation`: unsupported-path manual diagnostic with
   potentially variable/crashing outcomes; not a pass/fail regression.
-- The allocator parity probe,
+- The allocator probe,
   `bash tools/vulkan/run.sh test hetoimasia-gpu-vulkan-native:test:allocator-parity-probe`:
-  #331's measurement of an owned allocator against VMA, kept as the evidence
-  for the resource services design's D-38 ([its record](gpu_allocator_parity_record.md)).
-  It is deliberately not a catalog group: only the three required Vulkan groups
-  may run a Vulkan-project command, and it reports figures rather than Hspec
-  examples. Run it on request, on a quiet machine; about 70 seconds after the
-  build.
+  by default GRS-18's qualification of the production VMA integration on a
+  windowless device (#361, [its record](gpu_vma_qualification_record.md)),
+  run once per binding variant with `HETOIMASIA_VMA_FOREIGN_CALLS` unset or
+  `safe`; with `-- --virtual-block-parity`, #331's measurement of an owned
+  allocator against VMA, kept as the evidence for the resource services
+  design's D-38 ([its record](gpu_allocator_parity_record.md)). It is
+  deliberately not a catalog group: only the three required Vulkan groups may
+  run a Vulkan-project command, and it reports figures rather than Hspec
+  examples. It opens no window. Run it on request, on a quiet machine; each
+  mode takes a few minutes after the build.
 - The [toolchain qualification](toolchain.md): deliberate qualification work,
   outside the routine catalog; follow its own platform and consent rules. The
   retired Vulkan compatibility proof's cases are now the required group
