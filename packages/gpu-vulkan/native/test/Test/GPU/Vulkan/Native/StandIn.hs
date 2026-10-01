@@ -268,6 +268,7 @@ standInDevice =
     , offerDynamicRendering = True
     , offerSynchronization2 = True
     , offerSwapchainMaintenance1 = True
+    , offerTextureCompressionBC = True
     , offerQueueFamilies = [QueueFamilyOffer 0 True True]
     }
 

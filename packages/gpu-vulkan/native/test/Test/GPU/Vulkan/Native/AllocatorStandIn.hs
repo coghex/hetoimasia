@@ -89,6 +89,8 @@ instance Exception AllocatorFailure
 -- the order they happened.
 data AllocatorCall
   = AskedRequirements !Natural
+  | AskedImageRequirements !Word32 !Word32 !Word32
+    -- ^ An image's: its format, width and height.
   | Placing !Natural !Word32 !Placement
     -- ^ A creation was asked for: the size, the memory type, and where it may
     -- be placed.
@@ -98,9 +100,13 @@ data AllocatorCall
   | FreedMemory !Word64 !Natural
   | MadeBuffer !Word64 !Word64 !Word64
     -- ^ The buffer, its allocation, and the device memory it lies in.
+  | MadeImage !Word64 !Word64 !Word64
+    -- ^ The image, its allocation, and the device memory it lies in.
   | BindFailed !Word64
-    -- ^ The buffer's bind failed: its allocation and buffer were destroyed.
+    -- ^ The buffer's or image's bind failed: its allocation and the resource
+    -- were destroyed.
   | DestroyedBuffer !Word64
+  | DestroyedImage !Word64
   | FreedAllocation !Word64
   | Mapped !Word64
   | Unmapped !Word64
@@ -123,6 +129,7 @@ data AllocatorStep
   | AtInvalidate
   | AtName
   | AtDestroyBuffer
+  | AtDestroyImage
   | AtDestroyAllocator
   deriving (Eq, Ord, Show, Enum, Bounded)
 
@@ -294,8 +301,8 @@ fresh standIn = do
 outOfMemory ∷ Text → SomeException
 outOfMemory during = toException (StandInResult during FailedOutOfMemory)
 
--- | The stand-in's allocator: requirements are the request's size, in any of
--- the three types.
+-- | The stand-in's allocator: requirements are the request's size — an
+-- image's four bytes a texel of its base level — in any of the three types.
 allocatorStandInOps ∷ AllocatorStandIn → AllocatorOps
 allocatorStandInOps standIn =
   AllocatorOps
@@ -305,16 +312,15 @@ allocatorStandInOps standIn =
         refused ← failing standIn AtRequirements
         when refused (throwIO (AllocatorFailure AtRequirements))
         MemoryRequirements (requestBufferSize request) <$> readTVarIO (allocatorAllowed standIn)
-    , allocatorCreateBuffer = \request kind placement → create (requestBufferSize request) kind placement
-    , allocatorDestroyBuffer = \memory → do
-        refused ← failing standIn AtDestroyBuffer
-        when refused $ do
-          atomically (journal standIn (DestroyedBuffer (memoryBuffer memory)))
-          throwIO (AllocatorFailure AtDestroyBuffer)
-        atomically $ do
-          journal standIn (DestroyedBuffer (memoryBuffer memory))
-          journal standIn (FreedAllocation (memoryAllocation memory))
-          release (memoryAllocation memory)
+    , allocatorCreateBuffer = \request kind placement → create MadeBuffer (requestBufferSize request) kind placement
+    , allocatorDestroyBuffer = destroy AtDestroyBuffer DestroyedBuffer
+    , allocatorImageRequirements = \request → do
+        atomically (journal standIn (AskedImageRequirements (requestImageFormat request) (requestImageWidth request) (requestImageHeight request)))
+        refused ← failing standIn AtRequirements
+        when refused (throwIO (AllocatorFailure AtRequirements))
+        MemoryRequirements (imageSize request) <$> readTVarIO (allocatorAllowed standIn)
+    , allocatorCreateImage = \request kind placement → create MadeImage (imageSize request) kind placement
+    , allocatorDestroyImage = destroy AtDestroyImage DestroyedImage
     , allocatorMap = \memory → do
         atomically (journal standIn (Mapped (memoryAllocation memory)))
         refused ← failing standIn AtMap
@@ -346,7 +352,19 @@ allocatorStandInOps standIn =
           pure (MemoryEvents 0 0 (fromIntegral (Map.size blocks)) (sum (map ((+ extra) . blockSize) (Map.elems blocks))))
     }
   where
-    create size kind placement = do
+    imageSize request = fromIntegral (requestImageWidth request) * fromIntegral (requestImageHeight request) * 4
+
+    destroy at destroyed memory = do
+      refused ← failing standIn at
+      when refused $ do
+        atomically (journal standIn (destroyed (memoryResource memory)))
+        throwIO (AllocatorFailure at)
+      atomically $ do
+        journal standIn (destroyed (memoryResource memory))
+        journal standIn (FreedAllocation (memoryAllocation memory))
+        release (memoryAllocation memory)
+
+    create made size kind placement = do
       atomically (journal standIn (Placing size kind placement))
       during ← atomically $ do
         let hook = if placement == MayOpenMemory then allocatorDuring standIn else allocatorPlacing standIn
@@ -365,17 +383,17 @@ allocatorStandInOps standIn =
               then do
                 writeTVar (allocatorExhausted standIn) (exhausted - 1)
                 pure (noMemoryEvents, CreationFailed (outOfMemory "vmaCreateBuffer"))
-              else place size kind placement bindFails
+              else place made size kind placement bindFails
 
     -- Place in a held block that fits, or open memory if the placement allows.
-    place size kind placement bindFails = do
+    place made size kind placement bindFails = do
       dedicated ← readTVar (allocatorDedicated standIn)
       blocks ← readTVar (allocatorBlocks standIn)
       let fits (_, block) = blockType block == kind && not (blockDedicated block) && blockSize block - blockUsed block >= size
           preferred = maybe standInBlockSize offerPreferredBlock (find ((== kind) . offerTypeIndex) standInMemoryTypes)
           candidate = if dedicated then Nothing else find fits (sortOn fst (Map.toList blocks))
       case candidate of
-        Just (handle, _) → allocate handle size (MemoryEvents 0 0 0 0) bindFails
+        Just (handle, _) → allocate made handle size (MemoryEvents 0 0 0 0) bindFails
         Nothing
           | placement == InHeldMemory → pure (noMemoryEvents, NotPlaced)
           | otherwise → do
@@ -391,11 +409,11 @@ allocatorStandInOps standIn =
                   handle ← fresh standIn
                   modifyTVar' (allocatorBlocks standIn) (Map.insert handle (Block kind opening 0 Set.empty alone))
                   journal standIn (OpenedMemory handle kind opening alone)
-                  allocate handle size (MemoryEvents 1 opening 0 0) bindFails
+                  allocate made handle size (MemoryEvents 1 opening 0 0) bindFails
 
-    allocate block size opened bindFails = do
+    allocate made block size opened bindFails = do
       allocation ← fresh standIn
-      buffer ← fresh standIn
+      resource ← fresh standIn
       offset ← maybe 0 blockUsed . Map.lookup block <$> readTVar (allocatorBlocks standIn)
       modifyTVar' (allocatorBlocks standIn) (Map.adjust (\held → held {blockUsed = blockUsed held + size, blockAllocations = Set.insert allocation (blockAllocations held)}) block)
       modifyTVar' (allocatorPlaced standIn) (Map.insert allocation (block, size))
@@ -405,9 +423,9 @@ allocatorStandInOps standIn =
           freed ← release allocation
           pure (sumEvents opened freed, CreationFailed (toException (AllocatorFailure AtBind)))
         else do
-          journal standIn (MadeBuffer buffer allocation block)
+          journal standIn (made resource allocation block)
           kind ← maybe 0 blockType . Map.lookup block <$> readTVar (allocatorBlocks standIn)
-          pure (opened, Created (BufferMemory buffer allocation block offset size kind))
+          pure (opened, Created (BoundMemory resource allocation block offset size kind))
 
     -- Free an allocation, and its block if that leaves it empty and it is
     -- dedicated or not the type's only empty block.

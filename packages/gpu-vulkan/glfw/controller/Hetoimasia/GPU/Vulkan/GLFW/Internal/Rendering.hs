@@ -97,6 +97,8 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
   , constructPipelineLayout
   , constructPipeline
   , replaceConstructedPipeline
+  , constructBuffer
+  , constructImage
   , releaseConstructed
   , lendConstruction
   , constructionEscaped
@@ -222,8 +224,12 @@ import Hetoimasia.GPU.Vulkan.Native.Generations
 import Hetoimasia.GPU.Vulkan.Native.Presentation (GenerationPlan (..), SurfaceExtent, SurfaceFormat (..), imageUsageTransferSource)
 import Hetoimasia.GPU.Vulkan.Native.Profile (DevicePlan (..))
 import Hetoimasia.GPU.Vulkan.Native.Recording
-  ( ClearColor
+  ( Buffer
+  , BufferDescription
+  , ClearColor
   , FrameStorage
+  , Image
+  , ImageDescription
   , ImageLayout (..)
   , ManagedStanding (..)
   , ManagedView (..)
@@ -237,7 +243,9 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , Refusal (..)
   , beginRendering
   , copyToReadback
+  , createBuffer
   , createFrameStorage
+  , createImage
   , createPipeline
   , createPipelineLayout
   , createReadback
@@ -334,8 +342,9 @@ andThen first second = first >>= either (pure . Left) (const second)
 
 -- | The session's managed construction, lent to the renderer with each frame
 -- (VK-19): the pipeline layouts and graphics pipelines it builds over
--- embedded shaders, and releases or replaces, live in the session's recording
--- beside the host's own resources and are never native handles.
+-- embedded shaders, and releases or replaces, and the buffers and images of
+-- the engine's kinds it creates and releases (GRS-2), live in the session's
+-- recording beside the host's own resources and are never native handles.
 --
 -- Every call is the graphics owner's: one from any other thread is refused
 -- ('RefusedNotOwner') before anything native is done, as is one after the
@@ -379,6 +388,12 @@ instance Constructed PipelineLayout where
 instance Constructed Pipeline where
   release = releaseManaged
 
+instance Constructed Buffer where
+  release = releaseManaged
+
+instance Constructed Image where
+  release = releaseManaged
+
 -- | A pipeline layout with no descriptor sets and no push constants.
 constructPipelineLayout ∷ Construction q inst msgr phys dev cmd → IO (Either Refusal PipelineLayout)
 constructPipelineLayout construction = confined construction (createPipelineLayout (constructionRecording construction))
@@ -398,6 +413,18 @@ replaceConstructedPipeline
   ∷ Construction q inst msgr phys dev cmd → Pipeline → PipelineLayout → PipelineShaders → Word32 → IO (Either Refusal Pipeline)
 replaceConstructedPipeline construction old layout shaders format =
   confined construction (replacePipeline (constructionRecording construction) old layout shaders format)
+
+-- | A buffer of one of the engine's kinds and a size in bytes. The kind fixes
+-- its usage and the memory it lives in; nothing writes it yet.
+constructBuffer ∷ Construction q inst msgr phys dev cmd → BufferDescription → IO (Either Refusal Buffer)
+constructBuffer construction description = confined construction (createBuffer (constructionRecording construction) description)
+
+-- | An image of one of the engine's kinds — a texture, a depth target or a
+-- color target — with its format, extent and mip levels, and its one owned
+-- view. A format the kind does not take or the device does not support for
+-- it is refused before anything is created; nothing writes it yet.
+constructImage ∷ Construction q inst msgr phys dev cmd → ImageDescription → IO (Either Refusal Image)
+constructImage construction description = confined construction (createImage (constructionRecording construction) description)
 
 -- | Release a handle the renderer constructed: nothing records it again, and a
 -- batch that recorded it keeps it until that batch's references end. The
@@ -856,7 +883,7 @@ renderDue rendering renderer now scene revision due =
         generations ← viewGenerations <$> view
         generation ← find ((== imageGeneration image) . viewGeneration) generations
         let plan = viewPlan generation
-        pure (ImageDescription (planExtent plan) (surfaceFormat (planFormat plan)) (planUsage plan .&. imageUsageTransferSource /= 0))
+        pure (FrameImage (planExtent plan) (surfaceFormat (planFormat plan)) (planUsage plan .&. imageUsageTransferSource /= 0))
     -- A readback buffer for the capture, or the capture settled without bytes
     -- and the frame recorded as any other — no longer a capture's, so nothing
     -- that later becomes of it can settle a newer request.
@@ -943,7 +970,7 @@ renderDue rendering renderer now scene revision due =
       withhold attachment (WithheldFrameAbandoned (ownedFrame owned) reason)
 
 -- | What rendering knows of a frame's image from its generation's plan.
-data ImageDescription = ImageDescription
+data FrameImage = FrameImage
   { imageExtent ∷ !SurfaceExtent
   , imageFormat ∷ !Word32
   , imageCapturable ∷ !Bool

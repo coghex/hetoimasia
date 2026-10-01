@@ -34,6 +34,18 @@
 -- Nothing is submitted, so the readback buffer's bytes are never valid; the
 -- case asserts the backend refuses to expose them rather than claiming a
 -- captured pixel.
+--
+-- = Buffers and images (GRS-2)
+--
+-- After the discard the case creates one buffer of every kind and one image
+-- of every kind — a BC7 texture too when the device was created with BC
+-- compression, and the first depth-only format the device supports — each
+-- named from its 'ResourceId', with its allocation named inside VMA and an
+-- image's owned view beside it; then releases every one and disposes of them,
+-- view before image before allocation, all under validation. Each memory type
+-- an allocation opens a block in reserves up to VMA's 256 MiB large-heap
+-- block, so the case's byte budget is 2 GiB rather than the default 256 MiB,
+-- which admits one such block at a time.
 module Test.GPU.Vulkan.Native.Recording
   ( RecordingOutcome (..)
   , RecordingFacts (..)
@@ -53,7 +65,7 @@ import Control.Monad (unless, when)
 import qualified Data.ByteString.Char8 as Char8
 import Data.Foldable (for_)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
-import Data.List (find)
+import Data.List (find, sort)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -86,7 +98,7 @@ import Hetoimasia.GPU.Model
   , reserveFrame
   , skipUnsubmittedFrame
   )
-import Hetoimasia.GPU.Model.Budget (defaultBudgetRequest, validateBudgets)
+import Hetoimasia.GPU.Model.Budget (BudgetRequest (..), defaultBudgetRequest, validateBudgets)
 import Hetoimasia.GPU.Model.Identity (BatchId, FrameSlotId, HoldSubject (..), ResourceId, TargetClass (..), TargetId, frameSlotNumber)
 import Hetoimasia.GPU.Vulkan.Diagnostics
   ( CaptureConfig (..)
@@ -176,6 +188,11 @@ data Observed = Observed
     -- ^ What reading the readback answered with nothing submitted.
   , observedResources ∷ ![ResourceId]
   , observedDestroyed ∷ ![ResourceId]
+  , observedCompressionBC ∷ !Bool
+    -- ^ Whether the device was created with BC compression.
+  , observedKinds ∷ ![(Text, ResourceId)]
+    -- ^ Each buffer and image created, by what it was asked as.
+  , observedKindsDisposed ∷ ![ResourceId]
   }
   deriving (Show)
 
@@ -259,7 +276,7 @@ session journal steps capture = do
   let step ∷ Text → IO a → IO a
       step = measure capture steps
   required ← requiredInstanceExtensions >>= maybe (stopWith "GLFW requires no surface extensions, so no surface can be made") pure
-  budgets ← either (stopWith . tshow) pure (validateBudgets defaultBudgetRequest)
+  budgets ← either (stopWith . tshow) pure (validateBudgets defaultBudgetRequest {requestedBytes = 2 * 1024 * 1024 * 1024})
   roots ← newRoots (vulkanRootOps capture) budgets (scriptedSource (pure (scriptedInstant zeroDuration)))
   _ ← step "the instance and its messenger" (startRoots roots (InstanceRequest required ["VK_LAYER_KHRONOS_validation"] validationFeatures))
   -- Whatever happens below, the roots are retired child before parent, and
@@ -318,6 +335,7 @@ withGeneration journal step roots generations target = do
   ops ← vulkanRecordingOps (planDevice devicePlan)
   recording ← newRecording ops roots generations
   (batch, heldBefore, heldAfter, readback, resources) ← record journal step roots recording target extent format
+  (kinds, kindsDisposed) ← everyKind journal step recording (planTextureCompressionBC devicePlan)
   destroyed ← step "releasing and destroying the managed resources" $ do
     retireRecording recording (at 1)
     pure resources
@@ -333,6 +351,9 @@ withGeneration journal step roots generations target = do
       , observedReadback = readback
       , observedResources = resources
       , observedDestroyed = destroyed
+      , observedCompressionBC = planTextureCompressionBC devicePlan
+      , observedKinds = kinds
+      , observedKindsDisposed = kindsDisposed
       }
 
 -- | Construct the managed resources, supply the frame, record, observe and
@@ -386,6 +407,41 @@ record journal step roots recording target extent format = do
   settleInModel roots frame
   pure (view, heldBefore, heldAfter, readbackAnswer, resources)
 
+-- | One buffer of every kind and one image of every kind, created, released
+-- and disposed of (GRS-2). Answers what each was created as, and what the
+-- disposal destroyed.
+everyKind ∷ Journal → (∀ a. Text → IO a → IO a) → VulkanRecording → Bool → IO ([(Text, ResourceId)], [ResourceId])
+everyKind journal step recording compressionBC = do
+  let made ∷ Show refusal ⇒ Text → IO (Either refusal a) → IO a
+      made name action = step name action >>= either (stopWith . ((name <> " was refused: ") <>) . tshow) pure
+      released ∷ Managed handle ⇒ (Text, handle) → IO ()
+      released (name, handle) =
+        releaseManaged recording handle >>= either (stopWith . (("releasing the " <> name <> " was refused: ") <>) . tshow) pure
+  buffers ←
+    mapM (\kind → (,) (tshow kind) <$> made ("creating " <> tshow kind) (createBuffer recording (BufferDescription kind 4096))) [minBound .. maxBound]
+  let textures = [ImageDescription TextureImage Rgba8Srgb 64 64 7, ImageDescription TextureImage Rgba8Linear 64 64 1] <> [ImageDescription TextureImage Bc7Srgb 64 64 7 | compressionBC]
+      describe' description = tshow (imageKind description) <> " " <> tshow (imageFormat description)
+  images ←
+    mapM (\description → (,) (describe' description) <$> made ("creating " <> describe' description) (createImage recording description)) (textures <> [ImageDescription ColorTarget Bgra8Srgb 64 64 1])
+  -- The first depth-only format the device supports (D-36).
+  let depth = \case
+        [] → stopWith "the device supports no depth-only format"
+        format : rest →
+          step ("creating a depth target of " <> tshow format) (createImage recording (ImageDescription DepthTarget format 64 64 1)) >>= \case
+            Right image → pure (tshow DepthTarget <> " " <> tshow format, image)
+            Left (RefusedImageUnsupported _ _) → depth rest
+            Left refusal → stopWith ("the depth target was refused: " <> tshow refusal)
+  target ← depth (kindFormats DepthTarget)
+  let kinds = [(name, managedResource buffer) | (name, buffer) ← buffers] <> [(name, managedResource image) | (name, image) ← images <> [target]]
+  note journal ("created " <> tshow (length kinds) <> " buffers and images: " <> Text.intercalate ", " (map fst kinds))
+  views ← atomically (readManaged recording)
+  for_ views $ \view → note journal (tshow (viewResource view) <> ": " <> viewKind view <> " " <> tshow (viewNativeHandles view))
+  step "releasing the buffers and images" $ do
+    for_ buffers released
+    for_ (images <> [target]) released
+  disposed ← step "disposing of the buffers and images: each view, image or buffer, then its allocation" (disposeResources recording (at 1))
+  pure (kinds, disposed)
+
 -- | The fixture-private frame: reserve one on the target and record the
 -- acquisition of image 0 in the model alone. No native acquisition is made.
 acquireInModel ∷ VulkanRoots → TargetId → IO FrameSlotId
@@ -429,6 +485,9 @@ recordingSection = \case
         , "- held after the discard: " <> tshow (observedHeldAfter observed)
         , "- the readback with nothing submitted: " <> observedReadback observed
         , "- managed resources destroyed: " <> tshow (length (observedDestroyed observed))
+        , "- BC compression enabled: " <> tshow (observedCompressionBC observed)
+        , "- buffers and images created: " <> Text.intercalate ", " (map fst (observedKinds observed))
+        , "- buffers and images disposed of: " <> tshow (length (observedKindsDisposed observed))
         , ""
         ]
           <> stepTable (factsSteps facts)
@@ -474,6 +533,18 @@ spec outcome = describe "VK-11 managed recording" $ do
   it "constructed, released and destroyed every managed resource" $
     onFacts outcome $ \facts →
       length (observedDestroyed (factsObserved facts)) `shouldBe` 4
+
+  it "created, named, released and disposed of one buffer and one image of every kind, BC7 where the device was created with BC compression" $
+    onFacts outcome $ \facts → do
+      let observed = factsObserved facts
+          kinds = map fst (observedKinds observed)
+          bc7 = observedCompressionBC observed
+      length kinds `shouldBe` (5 + 4 + if bc7 then 1 else 0)
+      filter (`elem` kinds) ["VertexBuffer", "IndexBuffer", "InstanceBuffer", "LookupBuffer", "StagingBuffer"] `shouldBe` ["VertexBuffer", "IndexBuffer", "InstanceBuffer", "LookupBuffer", "StagingBuffer"]
+      ("TextureImage Bc7Srgb" `elem` kinds) `shouldBe` bc7
+      length (filter ("DepthTarget " `Text.isPrefixOf`) kinds) `shouldBe` 1
+      length (filter ("ColorTarget " `Text.isPrefixOf`) kinds) `shouldBe` 1
+      sort (observedKindsDisposed observed) `shouldBe` sort (map snd (observedKinds observed))
 
   it "received no validation error during any step" $
     onFacts outcome $ \facts →

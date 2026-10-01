@@ -4,6 +4,9 @@
 -- instant.
 --
 -- Handles are small numbers, so a record says which object each call touched.
+-- Every image is supported up to 'standInImageLimits' unless an example says
+-- otherwise ('supportImages'), and a buffer may be as large as
+-- 'standInMaxBufferSize' unless it says otherwise ('limitBuffers').
 -- A readback buffer's memory, and its mapping, are the stand-in allocator's
 -- ("Test.GPU.Vulkan.Native.AllocatorStandIn"); the bytes behind a mapping are
 -- a byte string this stand-in keeps under the mapped address, made on the
@@ -22,6 +25,10 @@ module Test.GPU.Vulkan.Native.RecordingStandIn
   , duringReset
   , duringRecord
   , RecordingFailure (..)
+  , supportImages
+  , standInImageLimits
+  , limitBuffers
+  , standInMaxBufferSize
   ) where
 
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
@@ -59,6 +66,9 @@ data RecordingCall
   | Began !Word64
   | Ended !Word64
   | Recorded !Word64 !NativeCommand
+  | QueriedSupport !ImageQuery
+  | CreatedView !Word64 !ViewRequest
+  | DestroyedView !Word64
   deriving (Eq, Show)
 
 -- | A step the stand-in can be made to fail at.
@@ -76,6 +86,8 @@ data RecordingStep
     -- ^ Every recorded command but a label's.
   | AtBeginLabel
   | AtEndLabel
+  | AtCreateView
+  | AtDestroyView
   deriving (Eq, Ord, Show)
 
 -- | What a failing step raises, after recording the call.
@@ -97,6 +109,8 @@ data RecordingStandIn = RecordingStandIn
   , recordingOnce ∷ !(TVar (Map RecordingStep (IO ())))
     -- ^ What the next call at each step runs, once, if it did not answer out
     -- of memory.
+  , recordingSupport ∷ !(TVar (ImageQuery → Maybe ImageLimits))
+  , recordingMaxBuffer ∷ !(TVar Natural)
   }
 
 newRecordingStandIn ∷ IO RecordingStandIn
@@ -110,6 +124,24 @@ newRecordingStandIn =
     <*> newTVarIO (\_ → pure ())
     <*> newTVarIO Map.empty
     <*> newTVarIO Map.empty
+    <*> newTVarIO (const (Just standInImageLimits))
+    <*> newTVarIO standInMaxBufferSize
+
+-- | What every image is supported up to unless an example says otherwise.
+standInImageLimits ∷ ImageLimits
+standInImageLimits = ImageLimits 16384 16384 15
+
+-- | The largest buffer unless an example says otherwise: 1 GiB.
+standInMaxBufferSize ∷ Natural
+standInMaxBufferSize = 1024 * 1024 * 1024
+
+-- | Answer every later image support query with this.
+supportImages ∷ RecordingStandIn → (ImageQuery → Maybe ImageLimits) → IO ()
+supportImages standIn answer = atomically (writeTVar (recordingSupport standIn) answer)
+
+-- | Have the device create no buffer larger than this from now on.
+limitBuffers ∷ RecordingStandIn → Natural → IO ()
+limitBuffers standIn most = atomically (writeTVar (recordingMaxBuffer standIn) most)
 
 -- | Every call so far, oldest first.
 recordingCalls ∷ RecordingStandIn → IO [RecordingCall]
@@ -222,4 +254,12 @@ recordingStandInOps standIn =
               _ → AtRecord
         step standIn at (Recorded commands native)
     , opsCommandBufferHandle = id
+    , opsImageSupport = \query → do
+        journal standIn (QueriedSupport query)
+        ($ query) <$> readTVarIO (recordingSupport standIn)
+    , opsMaxBufferSize = readTVarIO (recordingMaxBuffer standIn)
+    , opsCreateView = \_ request → do
+        handle ← fresh standIn
+        handle <$ step standIn AtCreateView (CreatedView handle request)
+    , opsDestroyView = \_ handle → step standIn AtDestroyView (DestroyedView handle)
     }

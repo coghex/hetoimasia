@@ -27,7 +27,16 @@ import Hetoimasia.GPU.Vulkan.Diagnostics (verdictIssues)
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Loop (runVulkanOwnerLoop)
 import Hetoimasia.GPU.Vulkan.Native.Profile (TargetRejection (..))
-import Hetoimasia.GPU.Vulkan.Native.Recording (Pipeline, PipelineLayout, PipelineShaders (..), Refusal)
+import Hetoimasia.GPU.Vulkan.Native.Recording
+  ( BufferDescription (..)
+  , ImageDescription (..)
+  , ImageFormat (..)
+  , ImageKind (..)
+  , Pipeline
+  , PipelineLayout
+  , PipelineShaders (..)
+  , Refusal
+  )
 import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost (..), GraphicsSessionFailed (..), RootStanding (..), RootsView (..), TerminalCause (..))
 import Hetoimasia.Runtime.GLFW
   ( ScheduledStep (..)
@@ -66,6 +75,7 @@ spec = describe "Vulkan surface-free sessions and owner-thread actions" $ do
     it "are refused after the session's terminal failure, including one queued before it that never started" (bounded testTerminalRefusal)
     it "are refused once the owner's exit begins, including one queued behind a running action, which finishes" (bounded testExitRefusal)
     it "never run beside a frame's rendering: a frame asked for meanwhile follows the action" (bounded testSerialization)
+    it "create a buffer and an image of every kind through the lent construction on the owner's thread, and release them for the owner to destroy, each view before its image" (bounded testBuffersAndImages)
 
   describe "zero-target progress" $ do
     it "disposes of a released resource with no target, recording no frame, before the host exits" (bounded testZeroTargetDisposal)
@@ -346,6 +356,45 @@ testSerialization = do
   recorded `shouldSatisfy` isSubsequenceOf ["frame presented", "action began", "action ended", "frame acquired", "frame presented"]
   -- Nothing of a frame happened between the action's beginning and its end.
   takeWhile (/= "action ended") (dropWhile (/= "action began") recorded) `shouldBe` ["action began"]
+
+-- | GRS-2's buffers and images, through the construction an action is lent:
+-- made on the owner's thread, released through the same construction, and
+-- destroyed by the owner's own progress while the host still runs — an
+-- image's view before the image, and both before the device.
+testBuffersAndImages ∷ IO ()
+testBuffersAndImages = do
+  rig ← surfaceFreeRig 0
+  (owner, whileRunning) ← runRig rig $ \host _ → do
+    awaitReady host
+    let images = [ImageDescription TextureImage Rgba8Srgb 16 16 5, ImageDescription DepthTarget Depth32Float 16 16 1, ImageDescription ColorTarget Bgra8Srgb 16 16 1]
+    (owner, made) ←
+      returned =<< act host (VulkanAction (\construction → do
+        owner ← myThreadId
+        buffers ← mapM (\kind → constructBuffer construction (BufferDescription kind 256)) [minBound .. maxBound]
+        made ← mapM (constructImage construction) images
+        pure (owner, (sequence buffers, sequence made))))
+    (buffers, built) ← case made of
+      (Right buffers, Right built) → pure (buffers, built)
+      other → failWith ("a construction was refused: " <> show (either Just (const Nothing) (fst other), either Just (const Nothing) (snd other)))
+    released ←
+      returned =<< act host (VulkanAction (\construction → (,) <$> mapM (releaseConstructed construction) buffers <*> mapM (releaseConstructed construction) built))
+    released `shouldBe` (map (const (Right ())) buffers, map (const (Right ())) built)
+    events ← journal rig
+    -- Reclaimed by the owner's own progress, with no target and no frame.
+    mapM_ (awaitEvent rig . BufferGone) [buffer | BufferMade buffer _ ← events]
+    mapM_ (awaitEvent rig . ImageGone) [image | ImageMade image _ ← events]
+    (,) owner <$> journal rig
+  [size | BufferMade _ size ← whileRunning] `shouldBe` replicate 5 256
+  [format | ImageMade _ format ← whileRunning] `shouldBe` [43, 126, 50]
+  makers ← threadsOf rig (\case BufferMade {} → True; ImageMade {} → True; OwnedViewMade {} → True; DeviceCreated → True; _ → False)
+  makers `shouldBe` replicate 12 owner
+  [ ()
+    | OwnedViewMade view image ← whileRunning
+    , not ([OwnedViewMade view image, OwnedViewGone view, ImageGone image] `isSubsequenceOf` whileRunning)
+    ]
+    `shouldBe` []
+  length [() | OwnedViewGone _ ← whileRunning] `shouldBe` 3
+  whileRunning `shouldSatisfy` notElem DeviceDestroyed
 
 -- ---------------------------------------------------------------------------
 -- Zero-target progress

@@ -17,7 +17,8 @@
 -- Every VMA call goes through the private shim module, imported @unsafe@ with
 -- the device-memory callbacks counting in C; see docs/gpu_backend.md, "The
 -- allocator". The memory requirements of a buffer not yet created are the
--- binding's own @vkGetDeviceBufferMemoryRequirements@ (Vulkan 1.3).
+-- binding's own @vkGetDeviceBufferMemoryRequirements@ (Vulkan 1.3), and an
+-- image's its @vkGetDeviceImageMemoryRequirements@.
 module Hetoimasia.GPU.Vulkan.Native.Allocator.Vulkan
   ( vmaAllocatorOps
   , memoryTypeOffers
@@ -37,16 +38,23 @@ import Foreign.Storable (peek)
 import Vulkan.CStruct.Extends (SomeStruct (..))
 import Vulkan.Core10 hiding (MemoryRequirements)
 import Vulkan.Core11 (MemoryRequirements2 (..))
-import Vulkan.Core13 (DeviceBufferMemoryRequirements (..), getDeviceBufferMemoryRequirements, data API_VERSION_1_3)
+import Vulkan.Core13
+  ( DeviceBufferMemoryRequirements (..)
+  , DeviceImageMemoryRequirements (..)
+  , getDeviceBufferMemoryRequirements
+  , getDeviceImageMemoryRequirements
+  , data API_VERSION_1_3
+  )
 import Vulkan.Dynamic (DeviceCmds (..), InstanceCmds (..))
 import Vulkan.Exception (VulkanException (..))
 import Vulkan.Zero (zero)
 
 import Hetoimasia.GPU.Vulkan.Native.Allocator
   ( AllocatorOps (..)
-  , BufferMemory (..)
+  , BoundMemory (..)
   , BufferRequest (..)
   , Creation (..)
+  , ImageRequest (..)
   , MemoryProperty (..)
   , MemoryRequirements (..)
   , MemoryTypeOffer (..)
@@ -102,23 +110,38 @@ vmaAllocatorOps created physical device = do
               (fromIntegral (requestBufferSize request))
               (requestBufferUsage request)
               kind
-              (case placement of InHeldMemory → 1; MayOpenMemory → 0)
+              (neverAllocate placement)
               out
-          events ← resultEvents out
-          case creationAnswer placement code of
-            Just answer → pure (events, answer)
-            Nothing → do
-              made ←
-                BufferMemory
-                  <$> resultBuffer out
-                  <*> resultAllocation out
-                  <*> resultDeviceMemory out
-                  <*> (fromIntegral <$> resultOffset out)
-                  <*> (fromIntegral <$> resultSize out)
-                  <*> resultMemoryType out
-              pure (events, Created made)
+          answered placement code out
       , allocatorDestroyBuffer = \memory → call $ \out → do
-          c_destroyBuffer state (memoryBuffer memory) (allocation memory) out
+          c_destroyBuffer state (memoryResource memory) (allocation memory) out
+          resultEvents out
+      , allocatorImageRequirements = \request → do
+          needs ←
+            getDeviceImageMemoryRequirements
+              device
+              DeviceImageMemoryRequirements {createInfo = SomeStruct (imageCreateInfo request), planeAspect = zero}
+              ∷ IO (MemoryRequirements2 '[])
+          pure
+            MemoryRequirements
+              { requirementSize = fromIntegral needs.memoryRequirements.size
+              , requirementTypes = needs.memoryRequirements.memoryTypeBits
+              }
+      , allocatorCreateImage = \request kind placement → call $ \out → do
+          code ←
+            c_createImage
+              state
+              (requestImageFormat request)
+              (requestImageWidth request)
+              (requestImageHeight request)
+              (requestImageMipLevels request)
+              (requestImageUsage request)
+              kind
+              (neverAllocate placement)
+              out
+          answered placement code out
+      , allocatorDestroyImage = \memory → call $ \out → do
+          c_destroyImage state (memoryResource memory) (allocation memory) out
           resultEvents out
       , allocatorMap = \memory → call $ \out → do
           c_map state (allocation memory) out >>= failing
@@ -135,6 +158,25 @@ vmaAllocatorOps created physical device = do
       }
   where
     failing code = when (code /= 0) (throwIO (VulkanException (Result code)))
+    neverAllocate = \case
+      InHeldMemory → 1
+      MayOpenMemory → 0
+    -- What a creation's call answered, with the call's events: the resource
+    -- and its allocation as the record holds them, unless it failed.
+    answered placement code out = do
+      events ← resultEvents out
+      case creationAnswer placement code of
+        Just answer → pure (events, answer)
+        Nothing → do
+          made ←
+            BoundMemory
+              <$> resultResource out
+              <*> resultAllocation out
+              <*> resultDeviceMemory out
+              <*> (fromIntegral <$> resultOffset out)
+              <*> (fromIntegral <$> resultSize out)
+              <*> resultMemoryType out
+          pure (events, Created made)
 
 -- | What a creation's result means, 'Nothing' for success. In held memory
 -- only, VMA answers a request nothing held fits with
@@ -155,6 +197,25 @@ bufferCreateInfo request =
     { size = fromIntegral (requestBufferSize request)
     , usage = BufferUsageFlagBits (requestBufferUsage request)
     , sharingMode = SHARING_MODE_EXCLUSIVE
+    }
+
+-- | An image's create info for a request, exactly as the shim's
+-- @hetoimasia_vma_create_image@ builds it: two-dimensional, optimally tiled,
+-- one array layer and one sample, exclusive to one queue family, in the
+-- undefined layout.
+imageCreateInfo ∷ ImageRequest → ImageCreateInfo '[]
+imageCreateInfo request =
+  zero
+    { imageType = IMAGE_TYPE_2D
+    , format = Format (fromIntegral (requestImageFormat request))
+    , extent = Extent3D (requestImageWidth request) (requestImageHeight request) 1
+    , mipLevels = requestImageMipLevels request
+    , arrayLayers = 1
+    , samples = SAMPLE_COUNT_1_BIT
+    , tiling = IMAGE_TILING_OPTIMAL
+    , usage = ImageUsageFlagBits (requestImageUsage request)
+    , sharingMode = SHARING_MODE_EXCLUSIVE
+    , initialLayout = IMAGE_LAYOUT_UNDEFINED
     }
 
 -- | Every memory type the device offers, with the properties the engine

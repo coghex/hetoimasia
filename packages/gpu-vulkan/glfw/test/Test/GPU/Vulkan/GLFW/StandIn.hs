@@ -180,8 +180,9 @@ import Hetoimasia.GPU.Vulkan.Native.Frames (AcquireResult (..), FrameOps (..), P
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering (VulkanRenderer (..))
 import Hetoimasia.GPU.Vulkan.Native.Allocator
   ( AllocatorOps (..)
-  , BufferMemory (..)
+  , BoundMemory (..)
   , BufferRequest (..)
+  , ImageRequest (..)
   , MemoryEvents (..)
   , MemoryProperty (..)
   , MemoryRequirements (..)
@@ -190,7 +191,7 @@ import Hetoimasia.GPU.Vulkan.Native.Allocator
   , noMemoryEvents
   )
 import qualified Hetoimasia.GPU.Vulkan.Native.Allocator as Allocator
-import Hetoimasia.GPU.Vulkan.Native.Recording (NativeCommand (..), PipelineRequest (..), RecordingOps (..), Refusal (..))
+import Hetoimasia.GPU.Vulkan.Native.Recording (ImageLimits (..), NativeCommand (..), PipelineRequest (..), RecordingOps (..), Refusal (..), ViewRequest (..))
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   ( CaptureMode (..)
   , FrameEvent (..)
@@ -321,6 +322,15 @@ data Event
   | ReadbackMade !Word64 !Natural
     -- ^ A readback buffer, and its size in bytes.
   | ReadbackGone !Word64
+  | BufferMade !Word64 !Natural
+    -- ^ A buffer of one of the engine's kinds, and its size in bytes.
+  | BufferGone !Word64
+  | ImageMade !Word64 !Word32
+    -- ^ An image of one of the engine's kinds, and its format.
+  | ImageGone !Word64
+  | OwnedViewMade !Word64 !Word64
+    -- ^ An image's owned view, and the image.
+  | OwnedViewGone !Word64
   | WindowHidden !Int
     -- ^ The seam made a hide control's native call for the window with this
     -- key. From then on that window reports itself invisible, whatever
@@ -568,6 +578,7 @@ nativeLayer events native allocator capture =
               , offerDynamicRendering = True
               , offerSynchronization2 = True
               , offerSwapchainMaintenance1 = True
+              , offerTextureCompressionBC = True
               , -- Without a surface, nothing is asked about presentation.
                 offerQueueFamilies = [QueueFamilyOffer 0 True (maybe False (`Set.notMember` unsupported) bootstrap)]
               }
@@ -860,6 +871,9 @@ data Rendering = Rendering
   , renderingKept ∷ !(TVar (Set Word64))
     -- ^ Swapchains whose presentations' present fences answer unsignalled,
     -- whatever 'presentationsRetire' says.
+  , renderingKindBuffers ∷ !(TVar (Set Word64))
+    -- ^ The live buffers of the engine's kinds (GRS-2), as against readback
+    -- buffers.
   }
 
 -- | A managed object the recording's layer creates, or the recording's layer
@@ -896,6 +910,7 @@ newRendering =
     <*> newTVarIO Map.empty
     <*> newTVarIO Nothing
     <*> newTVarIO False
+    <*> newTVarIO Set.empty
     <*> newTVarIO Set.empty
 
 -- | Whether a submission's fence answers signalled when it is next asked.
@@ -1027,15 +1042,17 @@ retireNextPresentations ∷ Rig → Maybe Int → IO ()
 retireNextPresentations rig = atomically . writeTVar (renderingRetireCount (rigRendering rig))
 
 -- | The device's allocator: one host-visible, coherent and cached memory
--- type, and every allocation dedicated, so a placement in held memory is
--- never placed and an allocating call opens exactly what it allocates. A readback's
--- creation raises what 'raiseOnCreate' scripted for it before anything is
--- made.
+-- type and one device-local type, and every allocation dedicated, so a
+-- placement in held memory is never placed and an allocating call opens
+-- exactly what it allocates. A readback's creation raises what
+-- 'raiseOnCreate' scripted for it before anything is made. A buffer is a
+-- readback buffer when its usage is exactly a transfer destination, which no
+-- buffer kind's is; an image's memory is four bytes a texel.
 renderingAllocator ∷ Journal → Rendering → AllocatorOps
 renderingAllocator events rendering =
   AllocatorOps
-    { allocatorMemoryTypes = [MemoryTypeOffer 0 [HostVisible, HostCoherent, HostCached] (1024 * 1024)]
-    , allocatorBufferRequirements = \request → pure (MemoryRequirements (requestBufferSize request) 1)
+    { allocatorMemoryTypes = [MemoryTypeOffer 0 [HostVisible, HostCoherent, HostCached] (1024 * 1024), MemoryTypeOffer 1 [DeviceLocal] (1024 * 1024)]
+    , allocatorBufferRequirements = \request → pure (MemoryRequirements (requestBufferSize request) 3)
     , allocatorCreateBuffer = \request _ placement → case placement of
         InHeldMemory →
           atomically (stateTVar (renderingCreations rendering) (\held → (Map.lookup CreateReadback held, Map.delete CreateReadback held))) >>= \case
@@ -1045,10 +1062,26 @@ renderingAllocator events rendering =
           buffer ← fresh
           allocation ← fresh
           let size = requestBufferSize request
-          record events (ReadbackMade buffer size)
-          pure (MemoryEvents 1 size 0 0, Allocator.Created (BufferMemory buffer allocation allocation 0 size 0))
+          if requestBufferUsage request == 0x2
+            then record events (ReadbackMade buffer size)
+            else do
+              atomically (modifyTVar' (renderingKindBuffers rendering) (Set.insert buffer))
+              record events (BufferMade buffer size)
+          pure (MemoryEvents 1 size 0 0, Allocator.Created (BoundMemory buffer allocation allocation 0 size 0))
     , allocatorDestroyBuffer = \memory → do
-        record events (ReadbackGone (memoryBuffer memory))
+        kind ← atomically (stateTVar (renderingKindBuffers rendering) (\held → (Set.member (memoryResource memory) held, Set.delete (memoryResource memory) held)))
+        record events ((if kind then BufferGone else ReadbackGone) (memoryResource memory))
+        pure (MemoryEvents 0 0 1 (memorySize memory))
+    , allocatorImageRequirements = \request → pure (MemoryRequirements (imageBytes request) 2)
+    , allocatorCreateImage = \request _ placement → case placement of
+        InHeldMemory → pure (noMemoryEvents, Allocator.NotPlaced)
+        MayOpenMemory → do
+          image ← fresh
+          allocation ← fresh
+          record events (ImageMade image (requestImageFormat request))
+          pure (MemoryEvents 1 (imageBytes request) 0 0, Allocator.Created (BoundMemory image allocation allocation 0 (imageBytes request) 1))
+    , allocatorDestroyImage = \memory → do
+        record events (ImageGone (memoryResource memory))
         pure (MemoryEvents 0 0 1 (memorySize memory))
     , allocatorMap = pure . memoryAllocation
     , allocatorUnmap = \_ → pure ()
@@ -1059,6 +1092,7 @@ renderingAllocator events rendering =
     }
   where
     fresh = atomically (stateTVar (renderingHandles rendering) (\next → (next, next + 1)))
+    imageBytes request = fromIntegral (requestImageWidth request) * fromIntegral (requestImageHeight request) * 4
 
 renderingLayers ∷ Journal → Rendering → Maybe (TVar Instant) → RenderingOps Text Int Word64
 renderingLayers events rendering clock =
@@ -1092,6 +1126,12 @@ renderingLayers events rendering clock =
         , opsEndCommands = \_ → pure ()
         , opsRecord = \buffer command → record events (CommandRecorded buffer command)
         , opsCommandBufferHandle = id
+        , opsImageSupport = \_ → pure (Just (ImageLimits 16384 16384 15))
+        , opsMaxBufferSize = pure (1024 * 1024 * 1024)
+        , opsCreateView = \_ request → do
+            handle ← fresh
+            handle <$ record events (OwnedViewMade handle (requestViewImage request))
+        , opsDestroyView = \_ handle → record events (OwnedViewGone handle)
         }
     frameLayer =
       FrameOps

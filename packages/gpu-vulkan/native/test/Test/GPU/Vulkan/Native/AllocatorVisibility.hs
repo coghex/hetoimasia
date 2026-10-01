@@ -76,11 +76,12 @@ supportedClient =
     publicNames =
       [ "AllocatorOps (..)"
       , "BufferRequest (..)"
+      , "ImageRequest (..)"
       , "MemoryRequirements (..)"
       , "Placement (..)"
       , "MemoryEvents (..)"
       , "noMemoryEvents"
-      , "BufferMemory (..)"
+      , "BoundMemory (..)"
       , "MemoryProperty (..)"
       , "MemoryTypeOffer (..)"
       , "MemoryUsage (..)"

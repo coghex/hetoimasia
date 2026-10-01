@@ -201,6 +201,8 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , constructPipelineLayout
   , constructPipeline
   , replaceConstructedPipeline
+  , constructBuffer
+  , constructImage
   , releaseConstructed
 
     -- * Verification capture (VK-19)

@@ -99,6 +99,23 @@
 -- as a range of the buffer's own allocation that the allocator aligns. A
 -- write while any batch or submission holds the buffer is refused.
 --
+-- = Buffers and images
+--
+-- 'createBuffer' and 'createImage' (GRS-2) make a 'Buffer' or an 'Image' of an
+-- engine-defined kind, which fixes its usage flags and the memory usage its
+-- allocation is made under ('bufferKindUse', 'imageKindUse'); a consumer never
+-- passes raw flags. An image is described by its kind, format, extent and mip
+-- levels, and is refused before anything is created — 'RefusedImageUnsupported'
+-- naming both, or 'RefusedOutOfBounds' — if its kind does not take the format,
+-- its description is empty or beyond its full mip chain, its format needs a
+-- device feature the device was not created with, or the device does not
+-- support it for the kind's use or at that size. Each image owns one view of
+-- its whole resource, created, named and destroyed with it. Their memory is the
+-- device allocator's, charged as its blocks; each reserves its objects — two
+-- for a buffer, three for an image — and no bytes. Nothing records through
+-- them yet, and nothing writes them. Disposal destroys an image's view, then
+-- the image, then its allocation.
+--
 -- = State
 --
 -- The recording's state is three maps the 'Recording' holds, and each
@@ -144,6 +161,9 @@ module Hetoimasia.GPU.Vulkan.Native.Recording
   , ClearColor (..)
   , Viewport (..)
   , Rect (..)
+  , ImageQuery (..)
+  , ImageLimits (..)
+  , ViewRequest (..)
 
     -- * The recording
   , Recording
@@ -162,6 +182,24 @@ module Hetoimasia.GPU.Vulkan.Native.Recording
   , createFrameStorage
   , createReadback
   , releaseManaged
+
+    -- * Buffers and images (GRS-2)
+  , Buffer
+  , BufferKind (..)
+  , bufferKindUse
+  , BufferDescription (..)
+  , createBuffer
+  , Image
+  , ImageKind (..)
+  , ImageUse (..)
+  , imageKindUse
+  , ImageFormat (..)
+  , formatCode
+  , formatNeedsCompressionBC
+  , kindFormats
+  , ImageDescription (..)
+  , fullMipChain
+  , createImage
 
     -- * Recording
   , Recorder
@@ -212,7 +250,9 @@ module Hetoimasia.GPU.Vulkan.Native.Recording
 
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Batches (discardBatch, noteBatchSubmitted, resetFrameRecorder)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Construction
-  ( createFrameStorage
+  ( createBuffer
+  , createFrameStorage
+  , createImage
   , createPipeline
   , createPipelineLayout
   , createReadback
@@ -222,8 +262,23 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Construction
 import Hetoimasia.GPU.Vulkan.Native.Internal.Reclamation (AllocationNotRecovered (..), RecoveryEnd (..))
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Disposal (disposeResources, newRecording, retireRecording)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
-  ( ClearColor (..)
+  ( BufferDescription (..)
+  , BufferKind (..)
+  , ClearColor (..)
+  , ImageDescription (..)
+  , ImageFormat (..)
+  , ImageKind (..)
   , ImageLayout (..)
+  , ImageLimits (..)
+  , ImageQuery (..)
+  , ImageUse (..)
+  , ViewRequest (..)
+  , bufferKindUse
+  , formatCode
+  , formatNeedsCompressionBC
+  , fullMipChain
+  , imageKindUse
+  , kindFormats
   , NativeCommand (..)
   , PipelineRequest (..)
   , PipelineShaders (..)
@@ -252,7 +307,9 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   ( BatchInvalidationFailed (..)
   , BatchStanding (..)
   , BatchView (..)
+  , Buffer
   , FrameStorage
+  , Image
   , Managed (managedResource)
   , ManagedStanding (..)
   , ManagedView (..)

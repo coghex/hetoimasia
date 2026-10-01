@@ -34,6 +34,8 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , Pipeline (..)
   , FrameStorage (..)
   , Readback (..)
+  , Buffer (..)
+  , Image (..)
   , Managed (..)
 
     -- * Failures
@@ -88,10 +90,17 @@ import Hetoimasia.GPU.Model.Identity
   , TargetId
   , resourceSession
   )
-import Hetoimasia.GPU.Vulkan.Native.Allocator (BufferMemory (memoryAllocation), MemoryUsage)
+import Hetoimasia.GPU.Vulkan.Native.Allocator (BoundMemory (memoryAllocation, memoryResource), MemoryUsage)
 import Hetoimasia.GPU.Vulkan.Native.Generations (Generations)
-import Hetoimasia.GPU.Vulkan.Native.Internal.Allocation (AllocatedBuffer (..), freeBuffer)
-import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer (ReadbackAllocation (..), RecordingOps (..))
+import Hetoimasia.GPU.Vulkan.Native.Internal.Allocation (AllocatedBuffer (..), freeBuffer, freeImage)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
+  ( BufferKind (..)
+  , ImageDescription (..)
+  , ImageFormat
+  , ImageKind (..)
+  , ReadbackAllocation (..)
+  , RecordingOps (..)
+  )
 import Hetoimasia.GPU.Vulkan.Native.Roots (Checkpoint (..), Roots, TerminalCause, checkpointRoots, rootsCall, rootsSessionIdentity, stateRootsModel)
 
 -- ---------------------------------------------------------------------------
@@ -119,6 +128,11 @@ data NativeResource cmd
   | NativeStorage !TargetId !Natural !Word64 !cmd
     -- ^ The target and frame slot it serves, its pool and its command buffer.
   | NativeReadback !ReadbackAllocation !ReadbackContents
+  | NativeBuffer !BufferKind !Natural !AllocatedBuffer
+    -- ^ The buffer's kind, its size, and the buffer with its allocation.
+  | NativeImage !ImageDescription !BoundMemory !Word64
+    -- ^ What the image was created as, the image with its allocation, and
+    -- its one owned view.
 
 -- | What a readback buffer's bytes are.
 data ReadbackContents
@@ -214,6 +228,10 @@ data Refusal
   | RefusedNoMemoryType !MemoryUsage
     -- ^ No memory type the resource allows serves its usage; nothing was
     -- allocated in another type instead.
+  | RefusedImageUnsupported !ImageKind !ImageFormat
+    -- ^ The kind does not take the format, or the device does not support
+    -- the format for the kind's use: its format features, its usage, or the
+    -- device feature it needs. Nothing was created.
   | RefusedSessionFailed !TerminalCause
     -- ^ The session has failed, and this is its primary failure: no new
     -- rendering, acquisition, submission or presentation is admitted.
@@ -244,6 +262,14 @@ newtype FrameStorage = FrameStorage ResourceId
 newtype Readback = Readback ResourceId
   deriving (Eq, Ord, Show)
 
+-- | A managed buffer of one 'BufferKind'.
+newtype Buffer = Buffer ResourceId
+  deriving (Eq, Ord, Show)
+
+-- | A managed image of one 'ImageKind', with its one owned view.
+newtype Image = Image ResourceId
+  deriving (Eq, Ord, Show)
+
 -- | A managed handle: the one generation of one managed resource it names.
 class Managed handle where
   managedResource ∷ handle → ResourceId
@@ -259,6 +285,12 @@ instance Managed FrameStorage where
 
 instance Managed Readback where
   managedResource (Readback resource) = resource
+
+instance Managed Buffer where
+  managedResource (Buffer resource) = resource
+
+instance Managed Image where
+  managedResource (Image resource) = resource
 
 -- ---------------------------------------------------------------------------
 -- Failures
@@ -311,7 +343,21 @@ readManaged recording =
             NativePipeline handle _ _ → ("pipeline", [handle])
             NativeStorage _ _ pool _ → ("frame storage", [pool])
             NativeReadback allocation _ → ("readback", [allocationBuffer allocation, memoryAllocation (allocationMemory allocation)])
+            NativeBuffer purpose _ allocated →
+              (bufferKindText purpose, [memoryResource (allocatedMemory allocated), memoryAllocation (allocatedMemory allocated)])
+            NativeImage description memory imageView →
+              (imageKindText (imageKind description), [memoryResource memory, imageView, memoryAllocation memory])
        in ManagedView resource (managedStanding record) kind handles
+    bufferKindText = \case
+      VertexBuffer → "vertex buffer"
+      IndexBuffer → "index buffer"
+      InstanceBuffer → "instance buffer"
+      LookupBuffer → "lookup buffer"
+      StagingBuffer → "staging buffer"
+    imageKindText = \case
+      TextureImage → "texture"
+      DepthTarget → "depth target"
+      ColorTarget → "color target"
 
 data BatchView = BatchView
   { viewBatch ∷ !BatchId
@@ -408,13 +454,19 @@ editBatch recording batch edit = modifyTVar' (recordingBatches recording) (Map.a
 readbackBuffer ∷ ReadbackAllocation → AllocatedBuffer
 readbackBuffer allocation = AllocatedBuffer (allocationMemory allocation) (allocationCoherent allocation) (Just (allocationMapped allocation))
 
--- | Destroy one managed generation's native objects.
+-- | Destroy one managed generation's native objects, each before what it was
+-- made from.
 destroyNative ∷ Recording q inst msgr phys dev cmd → dev → NativeResource cmd → IO ()
 destroyNative recording device = \case
   NativeLayout handle → rootsCall roots "vkDestroyPipelineLayout" (opsDestroyPipelineLayout ops device handle)
   NativePipeline handle _ _ → rootsCall roots "vkDestroyPipeline" (opsDestroyPipeline ops device handle)
   NativeStorage _ _ pool _ → rootsCall roots "vkDestroyCommandPool" (opsDestroyStorage ops device pool)
   NativeReadback allocation _ → freeBuffer roots (readbackBuffer allocation)
+  NativeBuffer _ _ allocated → freeBuffer roots allocated
+  -- The view, then the image, then its allocation.
+  NativeImage _ memory imageView → do
+    rootsCall roots "vkDestroyImageView" (opsDestroyView ops device imageView)
+    freeImage roots memory
   where
     roots = recordingRoots recording
     ops = recordingOps recording

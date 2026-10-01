@@ -316,7 +316,10 @@ own dispatch, Vulkan 1.3, a 256 MiB large-heap block — is in
 
 Changing VMA's version, its flags, the header or the shim's calling shape is a
 requalification: the qualification record holds only for the configuration it
-measured.
+measured. GRS-2 (#334) added the shim's image entries,
+`hetoimasia_vma_create_image` and `hetoimasia_vma_destroy_image`, in the shape
+the qualification measured image creation and freeing through: scalars and the
+one reused result record, `unsafe`, the callbacks counting in C.
 
 ## Running the qualification
 

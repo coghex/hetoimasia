@@ -80,7 +80,7 @@ implementationModules =
 -- | The types the public recording module exports without their
 -- constructors, each of which has one of its own name.
 abstractHandles ∷ [String]
-abstractHandles = ["Recording", "PipelineLayout", "Pipeline", "FrameStorage", "Readback", "Recorder"]
+abstractHandles = ["Recording", "PipelineLayout", "Pipeline", "FrameStorage", "Readback", "Buffer", "Image", "Recorder"]
 
 supportedClient ∷ String
 supportedClient =
@@ -106,6 +106,9 @@ supportedClient =
       , "ClearColor (..)"
       , "Viewport (..)"
       , "Rect (..)"
+      , "ImageQuery (..)"
+      , "ImageLimits (..)"
+      , "ViewRequest (..)"
       , "Recording"
       , "newRecording"
       , "Refusal (..)"
@@ -120,6 +123,22 @@ supportedClient =
       , "createFrameStorage"
       , "createReadback"
       , "releaseManaged"
+      , "Buffer"
+      , "BufferKind (..)"
+      , "bufferKindUse"
+      , "BufferDescription (..)"
+      , "createBuffer"
+      , "Image"
+      , "ImageKind (..)"
+      , "ImageUse (..)"
+      , "imageKindUse"
+      , "ImageFormat (..)"
+      , "formatCode"
+      , "formatNeedsCompressionBC"
+      , "kindFormats"
+      , "ImageDescription (..)"
+      , "fullMipChain"
+      , "createImage"
       , "Recorder"
       , "recorderBatch"
       , "recordFrame"

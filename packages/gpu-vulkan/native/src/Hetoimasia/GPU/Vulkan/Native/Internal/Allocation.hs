@@ -1,14 +1,18 @@
--- | The allocation protocol (GRS-11, D-40): how a buffer's memory is made from
--- the device's allocator beneath the model's accounting, and how it is freed.
+-- | The allocation protocol (GRS-11, D-40): how a buffer's or an image's
+-- memory is made from the device's allocator beneath the model's accounting,
+-- and how it is freed. A buffer and an image (GRS-2) follow it alike; they
+-- differ only in the allocator's calls that make and destroy them, and in
+-- that an image is never mapped.
 --
 -- = Making
 --
--- For an allocation attempt the caller holds ('allocateBuffer'):
+-- For an allocation attempt the caller holds ('allocateBuffer',
+-- 'allocateImage'):
 --
--- 1. The buffer's memory requirements are asked of the device, and the engine
---    chooses the one memory type ('chooseMemoryType'). A usage no allowed type
---    serves is refused, naming it, before any allocation.
--- 2. The buffer is created in held memory only ('InHeldMemory'). That opens
+-- 1. The resource's memory requirements are asked of the device, and the
+--    engine chooses the one memory type ('chooseMemoryType'). A usage no
+--    allowed type serves is refused, naming it, before any allocation.
+-- 2. The resource is created in held memory only ('InHeldMemory'). That opens
 --    nothing and charges nothing new; 'NotPlaced' — nothing held fits, or the
 --    driver requires a dedicated allocation — is the expected miss, not a
 --    failure, and spends no recovery.
@@ -27,12 +31,14 @@
 -- 5. Any effect that disagrees with the accounting is a defect
 --    ('AccountingFinding'): more opened than was reserved, more freed than was
 --    held, or an effect the model refused to settle under the attempt. The
---    buffer is destroyed and its allocation freed, that effect settled too,
+--    resource is destroyed and its allocation freed, that effect settled too,
 --    and 'AllocatorAccountingDefect' raised. The session fails, with nothing
 --    else freed, unless the defect is memory opened beyond a reservation that
 --    the budget still holds.
--- 6. A host-visible allocation is mapped for its lifetime. A map that failed
---    destroys what was made, settling that effect, and is raised.
+-- 6. A buffer's host-visible allocation is mapped for its lifetime. A map
+--    that failed destroys what was made, settling that effect, and is raised.
+--    An image's allocation is never mapped: it is optimally tiled, and the
+--    host never writes it directly (D-16).
 --
 -- Every allocation made is counted with the roots ('noteRootsAllocation'),
 -- which refuse to destroy the allocator while any remain.
@@ -41,6 +47,7 @@
 --
 -- 'freeBuffer' unmaps a mapped allocation, destroys the buffer and frees its
 -- allocation — the resource before its memory — and settles what that freed;
+-- 'freeImage' destroys an image and frees its allocation the same way;
 -- an effect that disagrees with the accounting fails the session, as at
 -- creation, though the destruction itself returned.
 -- It is only ever reached through a disposal the model allowed, after
@@ -53,10 +60,13 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Allocation
   ( AllocatedBuffer (..)
   , AllocationRefusal (..)
   , allocateBuffer
+  , allocateImage
   , freeBuffer
+  , freeImage
   , flushBuffer
   , invalidateBuffer
   , nameBuffer
+  , nameAllocation
   ) where
 
 import Control.Concurrent.STM (STM, atomically)
@@ -66,7 +76,7 @@ import Data.ByteString (ByteString)
 import Data.Foldable (for_, traverse_)
 import Data.Text (Text)
 import qualified Data.Text as Text
-import Data.Word (Word64)
+import Data.Word (Word32, Word64)
 import Numeric.Natural (Natural)
 
 import Hetoimasia.GPU.Model
@@ -86,9 +96,10 @@ import Hetoimasia.GPU.Vulkan.Native.Allocator
   ( AccountingFinding (..)
   , AllocatorAccountingDefect (..)
   , AllocatorOps (..)
-  , BufferMemory (..)
+  , BoundMemory (..)
   , BufferRequest (..)
   , Creation (..)
+  , ImageRequest (..)
   , MemoryEvents (..)
   , MemoryProperty (..)
   , noMemoryEvents
@@ -112,7 +123,7 @@ import Hetoimasia.GPU.Vulkan.Native.Roots
 -- | A buffer's memory, made: the buffer and its allocation, whether its
 -- memory is host-coherent, and where it is mapped, if it is host-visible.
 data AllocatedBuffer = AllocatedBuffer
-  { allocatedMemory ∷ !BufferMemory
+  { allocatedMemory ∷ !BoundMemory
   , allocatedCoherent ∷ !Bool
   , allocatedMapped ∷ !(Maybe Word64)
   }
@@ -132,6 +143,51 @@ data AllocationRefusal
     -- open memory was never made.
   deriving (Eq, Show)
 
+-- | How the protocol makes and destroys one kind of resource: the
+-- allocator's calls, and the names they are made under.
+data Shape = Shape
+  { shapeRequirementsCall ∷ !Text
+  , shapeRequirements ∷ AllocatorOps → IO MemoryRequirements
+  , shapeCreateCall ∷ !Text
+  , shapeCreate ∷ AllocatorOps → Word32 → Placement → IO (MemoryEvents, Creation)
+  , shapeDestroyer ∷ !Destroyer
+  , shapeMapped ∷ !Bool
+    -- ^ Whether a host-visible allocation is mapped for its lifetime.
+  }
+
+-- | How one kind of resource is destroyed with its allocation, and the name
+-- of that call.
+data Destroyer = Destroyer
+  { destroyerCall ∷ !Text
+  , destroyerDestroy ∷ AllocatorOps → BoundMemory → IO MemoryEvents
+  }
+
+bufferDestroyer, imageDestroyer ∷ Destroyer
+bufferDestroyer = Destroyer "vmaDestroyBuffer" allocatorDestroyBuffer
+imageDestroyer = Destroyer "vmaDestroyImage" allocatorDestroyImage
+
+bufferShape ∷ BufferRequest → Shape
+bufferShape request =
+  Shape
+    { shapeRequirementsCall = "vkGetDeviceBufferMemoryRequirements"
+    , shapeRequirements = \ops → allocatorBufferRequirements ops request
+    , shapeCreateCall = "vmaCreateBuffer"
+    , shapeCreate = \ops → allocatorCreateBuffer ops request
+    , shapeDestroyer = bufferDestroyer
+    , shapeMapped = True
+    }
+
+imageShape ∷ ImageRequest → Shape
+imageShape request =
+  Shape
+    { shapeRequirementsCall = "vkGetDeviceImageMemoryRequirements"
+    , shapeRequirements = \ops → allocatorImageRequirements ops request
+    , shapeCreateCall = "vmaCreateImage"
+    , shapeCreate = \ops → allocatorCreateImage ops request
+    , shapeDestroyer = imageDestroyer
+    , shapeMapped = False
+    }
+
 -- | Make a buffer's memory for the attempt, in the memory type the usage
 -- chooses, by the protocol above.
 allocateBuffer
@@ -140,21 +196,40 @@ allocateBuffer
   → MemoryUsage
   → BufferRequest
   → IO (Either AllocationRefusal AllocatedBuffer)
-allocateBuffer roots attempt kind request =
+allocateBuffer roots attempt kind request = allocate roots (bufferShape request) attempt kind
+
+-- | Make an image's memory for the attempt, in the memory type the usage
+-- chooses, by the protocol above: the image and its allocation, bound, and
+-- never mapped.
+allocateImage
+  ∷ Roots q inst msgr phys dev
+  → AllocationId
+  → MemoryUsage
+  → ImageRequest
+  → IO (Either AllocationRefusal BoundMemory)
+allocateImage roots attempt kind request = fmap allocatedMemory <$> allocate roots (imageShape request) attempt kind
+
+allocate
+  ∷ Roots q inst msgr phys dev
+  → Shape
+  → AllocationId
+  → MemoryUsage
+  → IO (Either AllocationRefusal AllocatedBuffer)
+allocate roots shape attempt kind =
   atomically (readRootsAllocator roots) >>= \case
     Nothing → pure (Left AllocationNoAllocator)
     Just ops → do
-      needs ← rootsCall roots "vkGetDeviceBufferMemoryRequirements" (allocatorBufferRequirements ops request)
+      needs ← rootsCall roots (shapeRequirementsCall shape) (shapeRequirements shape ops)
       case chooseMemoryType kind (requirementTypes needs) (allocatorMemoryTypes ops) of
         Left refused → pure (Left (AllocationNoMemoryType refused))
         Right offer → do
           let index = offerTypeIndex offer
-              heldCall = "vmaCreateBuffer in held memory"
-          (heldEvents, held) ← rootsCall roots heldCall (allocatorCreateBuffer ops request index InHeldMemory)
+              heldCall = shapeCreateCall shape <> " in held memory"
+          (heldEvents, held) ← rootsCall roots heldCall (shapeCreate shape ops index InHeldMemory)
           heldFinding ← atomically (settle roots Nothing 0 heldEvents)
           -- A placement in held memory opens nothing; one that did, or any
           -- effect the accounting cannot take, fails the request.
-          for_ heldFinding (failRequest roots ops heldCall held)
+          for_ heldFinding (failRequest roots shape ops heldCall held)
           case held of
             Created memory → Right <$> finish ops offer memory
             CreationFailed failure → raise roots heldCall failure
@@ -167,28 +242,29 @@ allocateBuffer roots attempt kind request =
               case reserved of
                 Left refusal → pure (Left refusal)
                 Right () → do
-                  let call = "vmaCreateBuffer"
+                  let call = shapeCreateCall shape
                   (events, made) ←
-                    rootsCall roots call (allocatorCreateBuffer ops request index MayOpenMemory)
+                    rootsCall roots call (shapeCreate shape ops index MayOpenMemory)
                       `onException` atomically (settle roots (Just attempt) bound noMemoryEvents)
                   finding ← atomically (settle roots (Just attempt) bound events)
-                  for_ finding (failRequest roots ops call made)
+                  for_ finding (failRequest roots shape ops call made)
                   case made of
                     Created memory → Right <$> finish ops offer memory
                     CreationFailed failure → raise roots call failure
                     NotPlaced → throwIO (userError "the allocator answered an allocating call as a placement miss")
   where
-    -- Map what is host-visible, count the allocation, and answer it. A map
-    -- that failed destroys what was made, settling that, and is raised.
+    -- Map what is host-visible and mapped by this shape, count the
+    -- allocation, and answer it. A map that failed destroys what was made,
+    -- settling that, and is raised.
     finish ops offer memory = do
-      let visible = HostVisible `elem` offerProperties offer
+      let visible = shapeMapped shape && HostVisible `elem` offerProperties offer
           coherent = HostCoherent `elem` offerProperties offer
       mapped ←
         if visible
           then
             Just
               <$> rootsCall roots "vmaMapMemory" (allocatorMap ops memory)
-                `onException` destroyMade roots ops memory
+                `onException` destroyMade roots (shapeDestroyer shape) ops memory
           else pure Nothing
       atomically (noteRootsAllocation roots True)
       pure (AllocatedBuffer memory coherent mapped)
@@ -199,17 +275,26 @@ allocateBuffer roots attempt kind request =
 -- returned even when its effect disagrees with the accounting, so that
 -- defect fails the session rather than the destruction.
 freeBuffer ∷ Roots q inst msgr phys dev → AllocatedBuffer → IO ()
-freeBuffer roots allocated =
+freeBuffer roots = release roots bufferDestroyer
+
+-- | Destroy the image, then free its allocation, exactly as 'freeBuffer'
+-- frees a buffer's.
+freeImage ∷ Roots q inst msgr phys dev → BoundMemory → IO ()
+freeImage roots memory = release roots imageDestroyer (AllocatedBuffer memory False Nothing)
+
+release ∷ Roots q inst msgr phys dev → Destroyer → AllocatedBuffer → IO ()
+release roots destroyer allocated =
   atomically (readRootsAllocator roots) >>= \case
     Nothing → throwIO (userError "the device's allocator is gone while an allocation made from it remains")
     Just ops → do
       let memory = allocatedMemory allocated
+          call = destroyerCall destroyer
       for_ (allocatedMapped allocated) $ \_ → rootsCall roots "vmaUnmapMemory" (allocatorUnmap ops memory)
-      events ← rootsCall roots "vmaDestroyBuffer" (allocatorDestroyBuffer ops memory)
+      events ← rootsCall roots call (destroyerDestroy destroyer ops memory)
       atomically $ do
         finding ← settle roots Nothing 0 events
         noteRootsAllocation roots False
-        for_ finding (defectFails roots "vmaDestroyBuffer")
+        for_ finding (defectFails roots call)
 
 -- | Flush a range of a buffer's allocation, relative to its start, after host
 -- writes to non-coherent memory.
@@ -224,8 +309,12 @@ invalidateBuffer roots allocated range = withAllocator roots $ \ops →
 
 -- | Name a buffer's allocation inside the allocator.
 nameBuffer ∷ Roots q inst msgr phys dev → AllocatedBuffer → ByteString → IO ()
-nameBuffer roots allocated name = withAllocator roots $ \ops →
-  rootsCall roots "vmaSetAllocationName" (allocatorName ops (allocatedMemory allocated) name)
+nameBuffer roots allocated = nameAllocation roots (allocatedMemory allocated)
+
+-- | Name a buffer's or an image's allocation inside the allocator.
+nameAllocation ∷ Roots q inst msgr phys dev → BoundMemory → ByteString → IO ()
+nameAllocation roots memory name = withAllocator roots $ \ops →
+  rootsCall roots "vmaSetAllocationName" (allocatorName ops memory name)
 
 withAllocator ∷ Roots q inst msgr phys dev → (AllocatorOps → IO ()) → IO ()
 withAllocator roots use =
@@ -257,10 +346,10 @@ settle roots attempt reserved events =
 -- | A request's call disagreed with the accounting: destroy what it made,
 -- settling that, fail the session as the finding requires, and raise the
 -- defect.
-failRequest ∷ Roots q inst msgr phys dev → AllocatorOps → Text → Creation → AccountingFinding → IO a
-failRequest roots ops operation made finding = do
+failRequest ∷ Roots q inst msgr phys dev → Shape → AllocatorOps → Text → Creation → AccountingFinding → IO a
+failRequest roots shape ops operation made finding = do
   case made of
-    Created memory → destroyMade roots ops memory
+    Created memory → destroyMade roots (shapeDestroyer shape) ops memory
     _ → pure ()
   atomically (defectFails roots operation finding)
   throwIO (AllocatorAccountingDefect operation finding)
@@ -268,10 +357,10 @@ failRequest roots ops operation made finding = do
 -- | Destroy what a creation made before it is returned, settling what that
 -- freed. Used on the paths that raise afterwards, so a destruction that
 -- raised too is left to propagate in its place.
-destroyMade ∷ Roots q inst msgr phys dev → AllocatorOps → BufferMemory → IO ()
-destroyMade roots ops memory = do
-  events ← rootsCall roots "vmaDestroyBuffer" (allocatorDestroyBuffer ops memory)
-  atomically (settle roots Nothing 0 events >>= traverse_ (defectFails roots "vmaDestroyBuffer"))
+destroyMade ∷ Roots q inst msgr phys dev → Destroyer → AllocatorOps → BoundMemory → IO ()
+destroyMade roots destroyer ops memory = do
+  events ← rootsCall roots (destroyerCall destroyer) (destroyerDestroy destroyer ops memory)
+  atomically (settle roots Nothing 0 events >>= traverse_ (defectFails roots (destroyerCall destroyer)))
 
 -- | Fail the session for an accounting defect, unless it is memory opened
 -- beyond a reservation that the budget still holds: admission never resumes

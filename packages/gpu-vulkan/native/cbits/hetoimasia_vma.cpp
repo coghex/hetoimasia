@@ -61,11 +61,11 @@ struct hetoimasia_vma_allocator {
   hetoimasia_vma_events events;
 };
 
-// The record every entry writes its results into: the buffer and allocation a
-// creation made, where the allocation lies, the mapped address a map answered,
-// and the events of the call.
+// The record every entry writes its results into: the buffer or image and the
+// allocation a creation made, where the allocation lies, the mapped address a
+// map answered, and the events of the call.
 struct hetoimasia_vma_result {
-  uint64_t buffer;
+  uint64_t resource;
   uint64_t allocation;
   uint64_t device_memory;
   uint64_t offset;
@@ -174,7 +174,7 @@ int32_t hetoimasia_vma_create_buffer(hetoimasia_vma_allocator* state, uint64_t s
   VkResult result = vmaCreateBuffer(state->allocator, &buffer_info, &request, &buffer, &allocation, &info);
   hetoimasia_vma_end(state, out);
   if (result == VK_SUCCESS) {
-    out->buffer = reinterpret_cast<uint64_t>(buffer);
+    out->resource = reinterpret_cast<uint64_t>(buffer);
     out->allocation = reinterpret_cast<uint64_t>(allocation);
     out->device_memory = reinterpret_cast<uint64_t>(info.deviceMemory);
     out->offset = info.offset;
@@ -189,6 +189,60 @@ void hetoimasia_vma_destroy_buffer(hetoimasia_vma_allocator* state, uint64_t buf
                                    hetoimasia_vma_result* out) {
   hetoimasia_vma_begin(state);
   vmaDestroyBuffer(state->allocator, reinterpret_cast<VkBuffer>(buffer), reinterpret_cast<VmaAllocation>(allocation));
+  hetoimasia_vma_end(state, out);
+}
+
+// Create an image and its allocation in exactly one memory type, bound, as one
+// VMA call, exactly as `hetoimasia_vma_create_buffer` creates a buffer: a
+// two-dimensional, optimally tiled image of one array layer and one sample,
+// exclusive to one queue family, in the undefined layout. The engine asked the
+// device for this same image's memory requirements, so the description here
+// must stay the one `Allocator.Vulkan` builds.
+int32_t hetoimasia_vma_create_image(hetoimasia_vma_allocator* state, uint32_t format, uint32_t width, uint32_t height,
+                                    uint32_t mip_levels, uint32_t usage, uint32_t memory_type,
+                                    uint32_t never_allocate, hetoimasia_vma_result* out) {
+  VkImageCreateInfo image_info;
+  std::memset(&image_info, 0, sizeof image_info);
+  image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+  image_info.imageType = VK_IMAGE_TYPE_2D;
+  image_info.format = static_cast<VkFormat>(format);
+  image_info.extent.width = width;
+  image_info.extent.height = height;
+  image_info.extent.depth = 1;
+  image_info.mipLevels = mip_levels;
+  image_info.arrayLayers = 1;
+  image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+  image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+  image_info.usage = usage;
+  image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  VmaAllocationCreateInfo request;
+  std::memset(&request, 0, sizeof request);
+  request.flags = never_allocate != 0 ? VMA_ALLOCATION_CREATE_NEVER_ALLOCATE_BIT : 0;
+  request.usage = VMA_MEMORY_USAGE_UNKNOWN;
+  request.memoryTypeBits = 1u << memory_type;
+  VkImage image = VK_NULL_HANDLE;
+  VmaAllocation allocation = VK_NULL_HANDLE;
+  VmaAllocationInfo info;
+  hetoimasia_vma_begin(state);
+  VkResult result = vmaCreateImage(state->allocator, &image_info, &request, &image, &allocation, &info);
+  hetoimasia_vma_end(state, out);
+  if (result == VK_SUCCESS) {
+    out->resource = reinterpret_cast<uint64_t>(image);
+    out->allocation = reinterpret_cast<uint64_t>(allocation);
+    out->device_memory = reinterpret_cast<uint64_t>(info.deviceMemory);
+    out->offset = info.offset;
+    out->size = info.size;
+    out->memory_type = info.memoryType;
+  }
+  return result;
+}
+
+// Destroy the image, then free its allocation.
+void hetoimasia_vma_destroy_image(hetoimasia_vma_allocator* state, uint64_t image, uint64_t allocation,
+                                  hetoimasia_vma_result* out) {
+  hetoimasia_vma_begin(state);
+  vmaDestroyImage(state->allocator, reinterpret_cast<VkImage>(image), reinterpret_cast<VmaAllocation>(allocation));
   hetoimasia_vma_end(state, out);
 }
 

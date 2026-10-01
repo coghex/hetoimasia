@@ -1,18 +1,20 @@
 -- | Managed resources and the scoped recorder over stand-in native layers:
 -- retention before every capturing call, refusals before any native effect,
 -- partial and cancelled recording, discard and reset, replacement, release,
--- readback and disposal.
+-- readback and disposal; and buffers and images of every kind (GRS-2), their
+-- refusals, failure cleanup, names, holds and disposal.
 --
 -- A frame is acquired the way the native cases acquire one: in the model
 -- alone, through the roots' model, since public acquisition is VK-12's.
 -- Nothing here creates a Vulkan object, and nothing waits on a clock.
 module Test.GPU.Vulkan.Native.Recording (spec) where
 
+import Control.Arrow ((&&&))
 import Control.Concurrent (forkIO, killThread, myThreadId)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (atomically)
 import Control.Exception (ErrorCall (ErrorCall), SomeException, throwIO, try)
-import Control.Monad (void)
+import Control.Monad (forM_, void)
 import qualified Data.ByteString as ByteString
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (sort)
@@ -23,6 +25,7 @@ import qualified Data.Text.IO as Text
 import Data.Bits ((.|.))
 import Data.Maybe (isJust)
 import Data.Word (Word32, Word64)
+import Numeric.Natural (Natural)
 import System.Directory (listDirectory, doesDirectoryExist)
 import System.FilePath ((</>), takeExtension)
 import Hetoimasia.Foundation.Time (DurationRequirement (AllowZero), Instant, durationFromNanoseconds, scriptedInstant)
@@ -37,8 +40,10 @@ import Hetoimasia.GPU.Model
   , SessionState (..)
   , SubmitAnswer (..)
   , SubmitOutcome (..)
+  , Usage (..)
   , acquireImage
   , beginAllocation
+  , extendBatch
   , holdView
   , modelBudgets
   , recordCompletion
@@ -49,9 +54,8 @@ import Hetoimasia.GPU.Model
   , sessionState
   , submitFrames
   , usage
-  , usageObjects
   )
-import Hetoimasia.GPU.Model.Budget (BudgetKind (ObjectBudget), BudgetRequest (..), defaultBudgetRequest, objectLimit, validateBudgets)
+import Hetoimasia.GPU.Model.Budget (BudgetKind (ByteBudget, ObjectBudget), BudgetRequest (..), byteLimit, defaultBudgetRequest, objectLimit, validateBudgets)
 import Hetoimasia.GPU.Model.Identity
   ( BatchId
   , FrameSlotId
@@ -66,13 +70,17 @@ import Hetoimasia.GPU.Model.Identity
   , frameSlotNumber
   )
 import Hetoimasia.GPU.Vulkan.Native.Diagnostics (NativeFfiConfiguration (..), nativeFfiConfiguration)
+import Hetoimasia.GPU.Vulkan.Native.Allocator (MemoryUsage (..), Placement (..))
 import Hetoimasia.GPU.Vulkan.Native.Generations
 import Hetoimasia.GPU.Vulkan.Native.Naming
   ( NativeObjectKind (..)
   , ShaderStage (..)
   , batchLabel
+  , bufferName
   , commandBufferName
   , commandPoolName
+  , imageName
+  , ownedViewName
   , passLabel
   , pipelineLayoutName
   , pipelineName
@@ -80,6 +88,7 @@ import Hetoimasia.GPU.Vulkan.Native.Naming
   , shaderModuleName
   )
 import Hetoimasia.GPU.Vulkan.Native.Presentation
+import Hetoimasia.GPU.Vulkan.Native.Profile (DeviceOffer (..), DevicePlan (..))
 import Hetoimasia.GPU.Vulkan.Native.Recording
 import Hetoimasia.GPU.Vulkan.Native.Roots
 import Test.GPU.Vulkan.Native.AllocatorStandIn
@@ -88,13 +97,21 @@ import Test.GPU.Vulkan.Native.AllocatorStandIn
   , AllocatorStandIn
   , AllocatorStep (..)
   , allocatorCalls
+  , allowTypes
+  , clearAllocatorAt
+  , deviceLocalType
   , failAllocatorAt
+  , heldBlocks
+  , heldBytes
+  , hostCoherentType
+  , liveAllocations
   , nonCoherentReadback
+  , standInBlockSize
   )
 import Test.GPU.Vulkan.Native.RecordingStandIn
 import Test.GPU.Vulkan.Native.StandIn
   ( NamingFailure (..)
-  , StandIn (standAllocator)
+  , StandIn (standAllocator, standOffers)
   , StandInRoots
   , failNaming
   , namesGiven
@@ -102,6 +119,7 @@ import Test.GPU.Vulkan.Native.StandIn
   , newStandInRoots
   , offerNaming
   , offerSurface
+  , standInDevice
   , standardRequest
   , surfaceNumbered
   )
@@ -940,6 +958,317 @@ spec = describe "Recording" $ do
       succeedAt (rigRecording' rig) AtEndLabel
       ok (discardBatch (rigRecording rig) (viewBatch view))
 
+  describe "buffers and images" $ do
+    it "fixes each kind's usage flags, memory usage, format features and view aspect, and the formats each image kind takes" $ do
+      map bufferKindUse [minBound .. maxBound]
+        `shouldBe` [ (0x80 .|. 0x02, UsageStaticGeometry)
+                   , (0x40 .|. 0x02, UsageStaticGeometry)
+                   , (0x80 .|. 0x40, UsageFrameRing)
+                   , (0x20, UsageFrameRing)
+                   , (0x01, UsageStaging)
+                   ]
+      map imageKindUse [minBound .. maxBound]
+        `shouldBe` [ ImageUse (0x04 .|. 0x02) (0x0001 .|. 0x8000) UsageTexture 0x1
+                   , ImageUse 0x20 0x0200 UsageTexture 0x2
+                   , ImageUse (0x10 .|. 0x01) (0x0080 .|. 0x4000) UsageTexture 0x1
+                   ]
+      map kindFormats [minBound .. maxBound]
+        `shouldBe` [[Rgba8Srgb, Rgba8Linear, Bc7Srgb, Bc7Linear], [Depth32Float, Depth24, Depth16], [Rgba8Srgb, Rgba8Linear, Bgra8Srgb, Bgra8Linear]]
+      [fullMipChain width height | (width, height) ← [(1, 1), (64, 64), (64, 1), (100, 30), (4096, 2048), (0, 0)]] `shouldBe` [1, 7, 7, 7, 13, 0]
+
+    it "creates a buffer of every kind in the memory its usage chooses, mapping only host-visible memory, and reports each live by kind" $ do
+      rig ← newRig
+      buffers ← mapM (\kind → created (createBuffer (rigRecording rig) (BufferDescription kind 256))) [minBound .. maxBound]
+      views ← managedOf rig (map managedResource buffers)
+      [(viewKind view, viewManagedStanding view) | view ← views]
+        `shouldBe` [(kind, ManagedLive) | kind ← ["vertex buffer", "index buffer", "instance buffer", "lookup buffer", "staging buffer"]]
+      calls ← allocatorCalls (allocatorOf rig)
+      blocks ← heldBlocks (allocatorOf rig)
+      let placed view = case viewNativeHandles view of
+            [buffer, allocation] →
+              ( [kind | MadeBuffer made allocated block ← calls, made == buffer, allocated == allocation, (held, kind, _, _) ← blocks, held == block]
+              , [() | Mapped mapped ← calls, mapped == allocation]
+              )
+            _ → ([], [])
+      map placed views
+        `shouldBe` [ ([deviceLocalType], [])
+                   , ([deviceLocalType], [])
+                   , ([hostCoherentType], [()])
+                   , ([hostCoherentType], [()])
+                   , ([hostCoherentType], [()])
+                   ]
+
+    it "creates an image of every kind, BC7 included, with its one owned view of the whole image, after asking the device about exactly its use" $ do
+      rig ← newRig
+      let described = [ImageDescription TextureImage Rgba8Srgb 64 64 7, ImageDescription TextureImage Bc7Linear 64 32 7, ImageDescription DepthTarget Depth32Float 64 64 1, ImageDescription ColorTarget Bgra8Srgb 64 64 1]
+      images ← mapM (created . createImage (rigRecording rig)) described
+      views ← managedOf rig (map managedResource images)
+      [(viewKind view, viewManagedStanding view) | view ← views]
+        `shouldBe` [("texture", ManagedLive), ("texture", ManagedLive), ("depth target", ManagedLive), ("color target", ManagedLive)]
+      native ← nativeCalls' rig
+      [query | QueriedSupport query ← native]
+        `shouldBe` [ ImageQuery (formatCode format) (useImageFlags (imageKindUse kind)) (useFormatFeatures (imageKindUse kind))
+                   | ImageDescription kind format _ _ _ ← described
+                   ]
+      calls ← allocatorCalls (allocatorOf rig)
+      blocks ← heldBlocks (allocatorOf rig)
+      -- Each view covers its own image, in its format, over the kind's aspect,
+      -- across every mip level; each image is device-local and never mapped.
+      [ (request, [kind | MadeImage made allocated block ← calls, made == image, allocated == allocation, (held, kind, _, _) ← blocks, held == block], [() | Mapped mapped ← calls, mapped == allocation])
+        | view ← views
+        , [image, owned, allocation] ← [viewNativeHandles view]
+        , CreatedView handle request ← native
+        , handle == owned
+        ]
+        `shouldBe` [ (ViewRequest image (formatCode format) (useAspect (imageKindUse kind)) levels, [deviceLocalType], [])
+                   | (ImageDescription kind format _ _ levels, image) ← zip described [image | MadeImage image _ _ ← calls]
+                   ]
+
+    it "charges the allocator's blocks and never a resource's own size, reserving two objects for a buffer and three for an image" $ do
+      rig ← newRig
+      base ← chargedOf rig
+      _ ← created (createBuffer (rigRecording rig) (BufferDescription StagingBuffer 100))
+      chargedSince rig base `shouldReturn` (standInBlockSize, 2)
+      -- A second buffer places in the block the first opened: nothing new is
+      -- charged but its objects.
+      _ ← created (createBuffer (rigRecording rig) (BufferDescription StagingBuffer 100))
+      chargedSince rig base `shouldReturn` (standInBlockSize, 4)
+      _ ← created (createImage (rigRecording rig) (ImageDescription TextureImage Rgba8Srgb 16 16 1))
+      chargedSince rig base `shouldReturn` (2 * standInBlockSize, 7)
+      usageDeviceMemory <$> usageOf' rig >>= \charged → heldBytes (allocatorOf rig) `shouldReturn` charged
+
+    it "destroys a released image's view, then the image, then its allocation, and a buffer before its allocation, giving back their objects" $ do
+      rig ← newRig
+      base ← chargedOf rig
+      image ← created (createImage (rigRecording rig) (ImageDescription TextureImage Rgba8Srgb 16 16 1))
+      buffer ← created (createBuffer (rigRecording rig) (BufferDescription VertexBuffer 64))
+      [[imageNative, view, imageAllocation], [bufferNative, bufferAllocation]] ← map viewNativeHandles <$> managedOf rig [managedResource image, managedResource buffer]
+      -- What the allocator had done when the view was destroyed.
+      seen ← newIORef Nothing
+      onceAt (rigRecording' rig) AtDestroyView (allocatorCalls (allocatorOf rig) >>= writeIORef seen . Just)
+      ok (releaseManaged (rigRecording rig) image)
+      ok (releaseManaged (rigRecording rig) buffer)
+      sort <$> dispose rig `shouldReturn` sort [managedResource image, managedResource buffer]
+      nativeOf rig `shouldReturn'` \calls → [handle | DestroyedView handle ← calls] `shouldBe` [view]
+      readIORef seen `shouldReturn'` \case
+        Just atView → [() | DestroyedImage _ ← atView] `shouldBe` []
+        Nothing → expectationFailure "the view was never destroyed"
+      teardown ← filter (\case DestroyedImage _ → True; DestroyedBuffer _ → True; FreedAllocation _ → True; Unmapped _ → True; _ → False) <$> allocatorCalls (allocatorOf rig)
+      [call | call ← teardown, call `elem` [DestroyedImage imageNative, FreedAllocation imageAllocation]] `shouldBe` [DestroyedImage imageNative, FreedAllocation imageAllocation]
+      [call | call ← teardown, call `elem` [DestroyedBuffer bufferNative, FreedAllocation bufferAllocation]] `shouldBe` [DestroyedBuffer bufferNative, FreedAllocation bufferAllocation]
+      liveAllocations (allocatorOf rig) `shouldReturn` 0
+      -- The blocks VMA keeps stay charged; the objects are given back.
+      snd <$> chargedSince rig base `shouldReturn` 0
+      managedOf rig [managedResource image, managedResource buffer] `shouldReturn` []
+
+    it "keeps a released buffer and image while a batch's hold on them remains, and destroys them once it ends" $ do
+      rig ← newRig
+      kit ← newKit rig
+      buffer ← created (createBuffer (rigRecording rig) (BufferDescription VertexBuffer 64))
+      image ← created (createImage (rigRecording rig) (ImageDescription TextureImage Rgba8Srgb 16 16 1))
+      frame ← acquired rig
+      -- Nothing records through them yet (GRS-3), so the batch takes its
+      -- references in the model directly.
+      (batch, ()) ← recorded rig frame $ \recorder → do
+        inModel rig (extendBatch (recorderBatch recorder) [managedResource buffer, managedResource image])
+        drawTriangle recorder kit
+      ok (releaseManaged (rigRecording rig) buffer)
+      ok (releaseManaged (rigRecording rig) image)
+      dispose rig `shouldReturn` []
+      map viewManagedStanding <$> managedOf rig [managedResource buffer, managedResource image] `shouldReturn` [ManagedReleased, ManagedReleased]
+      allocatorCalls (allocatorOf rig) >>= \calls → [() | FreedAllocation _ ← calls] `shouldBe` []
+      ok (discardBatch (rigRecording rig) batch)
+      disposed ← dispose rig
+      disposed `shouldContain` [managedResource buffer]
+      disposed `shouldContain` [managedResource image]
+      liveAllocations (allocatorOf rig) `shouldReturn` 0
+
+    it "retains an image whose view's destruction raised, never retries it, keeps its image and allocation, and fails the session" $ do
+      rig ← newRig
+      image ← created (createImage (rigRecording rig) (ImageDescription DepthTarget Depth32Float 16 16 1))
+      failAt (rigRecording' rig) AtDestroyView
+      ok (releaseManaged (rigRecording rig) image)
+      raised ← try @ResourceDestructionFailed (dispose rig)
+      fmap (const ()) raised `shouldSatisfy` either (const True) (const False)
+      standingOf' rig (managedResource image) `shouldReturn` Just (ManagedUncertain "RecordingFailure AtDestroyView")
+      sessionState <$> modelOf rig `shouldReturn` SessionFailed CleanupFailed
+      succeedAt (rigRecording' rig) AtDestroyView
+      _ ← try @ResourceDestructionFailed (dispose rig)
+      nativeOf rig `shouldReturn'` \calls → length [() | DestroyedView _ ← calls] `shouldBe` 1
+      allocatorCalls (allocatorOf rig) >>= \calls → [() | DestroyedImage _ ← calls] `shouldBe` []
+      liveAllocations (allocatorOf rig) `shouldReturn` 1
+
+    it "retains a buffer whose destruction raised, never retries it, and fails the session" $ do
+      rig ← newRig
+      buffer ← created (createBuffer (rigRecording rig) (BufferDescription IndexBuffer 64))
+      failAllocatorAt (allocatorOf rig) AtDestroyBuffer
+      ok (releaseManaged (rigRecording rig) buffer)
+      raised ← try @ResourceDestructionFailed (dispose rig)
+      fmap (const ()) raised `shouldSatisfy` either (const True) (const False)
+      standingOf' rig (managedResource buffer) `shouldReturn` Just (ManagedUncertain "AllocatorFailure AtDestroyBuffer")
+      sessionState <$> modelOf rig `shouldReturn` SessionFailed CleanupFailed
+      clearAllocatorAt (allocatorOf rig) AtDestroyBuffer
+      _ ← try @ResourceDestructionFailed (dispose rig)
+      allocatorCalls (allocatorOf rig) >>= \calls → length [() | DestroyedBuffer _ ← calls] `shouldBe` 1
+      liveAllocations (allocatorOf rig) `shouldReturn` 1
+
+  describe "buffer and image refusals before any native effect" $ do
+    it "refuses a format the image kind does not take, an empty extent, and mip levels beyond the full chain, calling nothing" $ do
+      rig ← newRig
+      let refusal description = createImage (rigRecording rig) description
+      refusal (ImageDescription TextureImage Depth32Float 16 16 1) `shouldReturn` Left (RefusedImageUnsupported TextureImage Depth32Float)
+      refusal (ImageDescription DepthTarget Rgba8Srgb 16 16 1) `shouldReturn` Left (RefusedImageUnsupported DepthTarget Rgba8Srgb)
+      refusal (ImageDescription ColorTarget Bc7Srgb 16 16 1) `shouldReturn` Left (RefusedImageUnsupported ColorTarget Bc7Srgb)
+      refusal (ImageDescription TextureImage Rgba8Srgb 0 16 1) `shouldReturn` Left (RefusedOutOfBounds 0 0)
+      refusal (ImageDescription TextureImage Rgba8Srgb 16 0 1) `shouldReturn` Left (RefusedOutOfBounds 0 0)
+      refusal (ImageDescription TextureImage Rgba8Srgb 16 16 0) `shouldReturn` Left (RefusedOutOfBounds 0 0)
+      refusal (ImageDescription TextureImage Rgba8Srgb 64 64 8) `shouldReturn` Left (RefusedOutOfBounds 8 7)
+      nativeCount rig `shouldReturn` 0
+      allocatorCalls (allocatorOf rig) `shouldReturn` []
+
+    it "refuses an image the device does not support for the kind's use, or beyond its limits, after its one query and before anything else" $ do
+      rig ← newRig
+      supportImages (rigRecording' rig) (const Nothing)
+      createImage (rigRecording rig) (ImageDescription ColorTarget Rgba8Linear 16 16 1) `shouldReturn` Left (RefusedImageUnsupported ColorTarget Rgba8Linear)
+      supportImages (rigRecording' rig) (const (Just (ImageLimits 32 16 3)))
+      createImage (rigRecording rig) (ImageDescription TextureImage Rgba8Srgb 64 16 1) `shouldReturn` Left (RefusedOutOfBounds 64 32)
+      createImage (rigRecording rig) (ImageDescription TextureImage Rgba8Srgb 16 32 1) `shouldReturn` Left (RefusedOutOfBounds 32 16)
+      createImage (rigRecording rig) (ImageDescription TextureImage Rgba8Srgb 16 16 4) `shouldReturn` Left (RefusedOutOfBounds 4 3)
+      nativeOf rig `shouldReturn'` \calls → [() | call ← calls, not (isQuery call)] `shouldBe` []
+      length <$> nativeCalls' rig `shouldReturn` 4
+      allocatorCalls (allocatorOf rig) `shouldReturn` []
+
+    it "refuses a BC7 texture on a device created without BC compression, asking it nothing, and still creates the other textures" $ do
+      rig ← newRigOn (\standIn → standIn {standOffers = [standInDevice {offerTextureCompressionBC = False}]}) defaultBudgetRequest
+      (planTextureCompressionBC . fst <$>) <$> atomically (readRootsDevice (rigRoots rig)) `shouldReturn` Just False
+      createImage (rigRecording rig) (ImageDescription TextureImage Bc7Srgb 16 16 1) `shouldReturn` Left (RefusedImageUnsupported TextureImage Bc7Srgb)
+      nativeCount rig `shouldReturn` 0
+      allocatorCalls (allocatorOf rig) `shouldReturn` []
+      _ ← created (createImage (rigRecording rig) (ImageDescription TextureImage Rgba8Srgb 16 16 1))
+      pure ()
+
+    it "refuses an empty buffer, one no device size can hold, and one beyond the device's largest, calling nothing" $ do
+      rig ← newRig
+      limitBuffers (rigRecording' rig) 1024
+      let refusal kind bytes = createBuffer (rigRecording rig) (BufferDescription kind bytes)
+      refusal StagingBuffer 0 `shouldReturn` Left (RefusedOutOfBounds 0 0)
+      refusal VertexBuffer (2 ^ (64 ∷ Int)) `shouldReturn` Left (RefusedOutOfBounds (2 ^ (64 ∷ Int)) (2 ^ (64 ∷ Int) - 1))
+      refusal LookupBuffer 1025 `shouldReturn` Left (RefusedOutOfBounds 1025 1024)
+      nativeCount rig `shouldReturn` 0
+      allocatorCalls (allocatorOf rig) `shouldReturn` []
+
+    it "refuses a buffer or image whose objects the budget cannot reserve, and one from a stranger's thread, calling nothing" $ do
+      rig ← newRig
+      exhaust rig
+      createBuffer (rigRecording rig) (BufferDescription StagingBuffer 64) `shouldReturn` Left (RefusedBackpressure ObjectBudget)
+      createImage (rigRecording rig) (ImageDescription TextureImage Rgba8Srgb 16 16 1) `shouldReturn` Left (RefusedBackpressure ObjectBudget)
+      answer ← newEmptyMVar
+      _ ← forkIO (createImage (rigRecording rig) (ImageDescription TextureImage Rgba8Srgb 16 16 1) >>= putMVar answer)
+      takeMVar answer `shouldReturn` Left RefusedNotOwner
+      allocatorCalls (allocatorOf rig) `shouldReturn` []
+      nativeOf rig `shouldReturn'` \calls → [() | call ← calls, not (isQuery call)] `shouldBe` []
+
+    it "passes the allocator's backpressure and memory-type refusals through, having opened nothing" $ do
+      rig ← newRig
+      base ← chargedOf rig
+      exhaustBytes rig
+      createImage (rigRecording rig) (ImageDescription TextureImage Rgba8Srgb 16 16 1) `shouldReturn` Left (RefusedBackpressure ByteBudget)
+      createBuffer (rigRecording rig) (BufferDescription StagingBuffer 64) `shouldReturn` Left (RefusedBackpressure ByteBudget)
+      allocatorCalls (allocatorOf rig) >>= \calls → [() | Placing _ _ MayOpenMemory ← calls] `shouldBe` []
+      heldBytes (allocatorOf rig) `shouldReturn` 0
+      allowTypes (allocatorOf rig) (2 ^ hostCoherentType)
+      createImage (rigRecording rig) (ImageDescription DepthTarget Depth16 16 16 1) `shouldReturn` Left (RefusedNoMemoryType UsageTexture)
+      usageDeviceMemory <$> usageOf' rig `shouldReturn` 0
+      snd <$> chargedSince rig base `shouldReturn` 0
+      nativeOf rig `shouldReturn'` \calls → [() | CreatedView {} ← calls] `shouldBe` []
+
+  describe "buffer and image failure cleanup" $ do
+    it "leaves nothing made, allocated or reserved when a buffer's requirements, creation, bind or map raised" $
+      forM_ [AtRequirements, AtCreate, AtBind, AtMap] $ \step → do
+        rig ← newRig
+        base ← chargedOf rig
+        failAllocatorAt (allocatorOf rig) step
+        raised ← try @AllocatorFailure (createBuffer (rigRecording rig) (BufferDescription StagingBuffer 64))
+        fmap (const ()) raised `shouldBe` Left (AllocatorFailure step)
+        liveAllocations (allocatorOf rig) `shouldReturn` 0
+        snd <$> chargedSince rig base `shouldReturn` 0
+        atomically (readManaged (rigRecording rig)) `shouldReturn` []
+        sessionState <$> modelOf rig `shouldReturn` SessionRunning
+
+    it "leaves nothing made, allocated or reserved when an image's requirements, creation, bind or view raised, destroying the image a view failed over" $ do
+      forM_ [AtRequirements, AtCreate, AtBind] $ \step → do
+        rig ← newRig
+        base ← chargedOf rig
+        failAllocatorAt (allocatorOf rig) step
+        raised ← try @AllocatorFailure (createImage (rigRecording rig) (ImageDescription TextureImage Rgba8Srgb 16 16 1))
+        fmap (const ()) raised `shouldBe` Left (AllocatorFailure step)
+        liveAllocations (allocatorOf rig) `shouldReturn` 0
+        snd <$> chargedSince rig base `shouldReturn` 0
+        atomically (readManaged (rigRecording rig)) `shouldReturn` []
+        nativeOf rig `shouldReturn'` \calls → [() | CreatedView {} ← calls] `shouldBe` []
+      rig ← newRig
+      base ← chargedOf rig
+      failAt (rigRecording' rig) AtCreateView
+      raised ← try @RecordingFailure (createImage (rigRecording rig) (ImageDescription ColorTarget Rgba8Srgb 16 16 1))
+      fmap (const ()) raised `shouldBe` Left (RecordingFailure AtCreateView)
+      image ← (\calls → [made | MadeImage made _ _ ← calls]) <$> allocatorCalls (allocatorOf rig)
+      allocatorCalls (allocatorOf rig) >>= \calls → [destroyed | DestroyedImage destroyed ← calls] `shouldBe` image
+      liveAllocations (allocatorOf rig) `shouldReturn` 0
+      snd <$> chargedSince rig base `shouldReturn` 0
+      atomically (readManaged (rigRecording rig)) `shouldReturn` []
+      sessionState <$> modelOf rig `shouldReturn` SessionRunning
+
+    it "retains the image when destroying it after its view failed raised too, and fails the session, raising the view's failure" $ do
+      rig ← newRig
+      failAt (rigRecording' rig) AtCreateView
+      failAllocatorAt (allocatorOf rig) AtDestroyImage
+      raised ← try @RecordingFailure (createImage (rigRecording rig) (ImageDescription TextureImage Rgba8Srgb 16 16 1))
+      fmap (const ()) raised `shouldBe` Left (RecordingFailure AtCreateView)
+      sessionState <$> modelOf rig `shouldReturn` SessionFailed CleanupFailed
+      liveAllocations (allocatorOf rig) `shouldReturn` 1
+
+  describe "buffer and image names" $ do
+    it "names a buffer, an image and its view from the ResourceId, and each allocation inside the allocator, before returning them" $ do
+      rig ← newNamingRig
+      buffer ← created (createBuffer (rigRecording rig) (BufferDescription InstanceBuffer 64))
+      image ← created (createImage (rigRecording rig) (ImageDescription TextureImage Rgba8Srgb 16 16 1))
+      [[bufferNative, bufferAllocation], [imageNative, view, imageAllocation]] ← map viewNativeHandles <$> managedOf rig [managedResource buffer, managedResource image]
+      namesGiven (rigStandIn rig)
+        `shouldReturn` [ (ObjectBuffer, bufferNative, bufferName (managedResource buffer))
+                       , (ObjectImage, imageNative, imageName (managedResource image))
+                       , (ObjectImageView, view, ownedViewName (managedResource image))
+                       ]
+      allocatorCalls (allocatorOf rig) >>= \calls →
+        [(handle, name) | NamedAllocation handle name ← calls]
+          `shouldBe` [(bufferAllocation, bufferName (managedResource buffer)), (imageAllocation, imageName (managedResource image))]
+
+    it "releases an image whose naming raised, returns no handle, and disposal destroys it and restores its objects" $ do
+      rig ← newNamingRig
+      base ← chargedOf rig
+      failNaming (rigStandIn rig) ObjectImageView
+      raised ← try @NamingFailure (createImage (rigRecording rig) (ImageDescription TextureImage Rgba8Srgb 16 16 1))
+      fmap (const ()) raised `shouldBe` Left (NamingFailure ObjectImageView)
+      [(unnamed, standing)] ← (\views → [(viewResource view, viewManagedStanding view) | view ← views]) <$> atomically (readManaged (rigRecording rig))
+      standing `shouldBe` ManagedReleased
+      -- The generation keeps its accounting until its disposal restores it.
+      snd <$> chargedSince rig base `shouldReturn` 3
+      dispose rig `shouldReturn` [unnamed]
+      nativeOf rig `shouldReturn'` \calls → length [() | DestroyedView _ ← calls] `shouldBe` 1
+      liveAllocations (allocatorOf rig) `shouldReturn` 0
+      snd <$> chargedSince rig base `shouldReturn` 0
+      sessionState <$> modelOf rig `shouldReturn` SessionRunning
+
+    it "releases a buffer whose allocation could not be named, and disposal destroys it" $ do
+      rig ← newRig
+      base ← chargedOf rig
+      failAllocatorAt (allocatorOf rig) AtName
+      raised ← try @AllocatorFailure (createBuffer (rigRecording rig) (BufferDescription StagingBuffer 64))
+      fmap (const ()) raised `shouldBe` Left (AllocatorFailure AtName)
+      [(unnamed, ManagedReleased)] ← (\views → [(viewResource view, viewManagedStanding view) | view ← views]) <$> atomically (readManaged (rigRecording rig))
+      dispose rig `shouldReturn` [unnamed]
+      liveAllocations (allocatorOf rig) `shouldReturn` 0
+      snd <$> chargedSince rig base `shouldReturn` 0
+
   describe "the FFI audit" $
     it "declares a genuine unsafe import for exactly the recording subset and the allocator shim the configuration records, and for nothing else" $ do
       sources ← haskellSources "src"
@@ -983,8 +1312,16 @@ newCapturingRig ∷ IO Rig
 newCapturingRig = newRigWith CaptureWhenOffered defaultBudgetRequest
 
 newRigWith ∷ CaptureUsage → BudgetRequest → IO Rig
-newRigWith capture request = do
-  standIn ← newStandIn
+newRigWith capture = newRigFrom capture id
+
+-- | 'newRig' over a stand-in this edits before any roots exist, under this
+-- budget.
+newRigOn ∷ (StandIn → StandIn) → BudgetRequest → IO Rig
+newRigOn = newRigFrom WithoutCapture
+
+newRigFrom ∷ CaptureUsage → (StandIn → StandIn) → BudgetRequest → IO Rig
+newRigFrom capture edit request = do
+  standIn ← edit <$> newStandIn
   offerSurface standIn $ \offer →
     offer {offerCapabilities = (offerCapabilities offer) {capabilityUsage = imageUsageColorAttachment .|. imageUsageTransferSource}}
   roots ← newStandInRoots standIn (either (error . show) id (validateBudgets request))
@@ -1089,6 +1426,37 @@ completeInModel rig (SubmissionIdOf submission) = atomically $ stateRootsModel (
     _ → error "the completion was refused"
 
 newtype SubmissionIdOf = SubmissionIdOf SubmissionId
+
+-- | Fill the byte budget, so no device memory can be reserved.
+exhaustBytes ∷ Rig → IO ()
+exhaustBytes rig = atomically $ stateRootsModel (rigRoots rig) $ \model →
+  let remaining = byteLimit (modelBudgets model) - usageBytes (usage model)
+   in case beginAllocation remaining 0 model of
+        Admitted (next, _) → ((), next)
+        _ → error "the byte budget could not be filled"
+
+-- | The model's usage now.
+usageOf' ∷ Rig → IO Usage
+usageOf' rig = usage <$> modelOf rig
+
+-- | The device memory charged and the objects reserved now.
+chargedOf ∷ Rig → IO (Natural, Natural)
+chargedOf rig = (usageDeviceMemory &&& usageObjects) <$> usageOf' rig
+
+-- | How much more device memory is charged, and how many more objects are
+-- reserved, than at a baseline 'chargedOf' answered.
+chargedSince ∷ Rig → (Natural, Natural) → IO (Natural, Natural)
+chargedSince rig (memory, objects) = (\(now, held) → (now - memory, held - objects)) <$> chargedOf rig
+
+-- | The managed views of these resources, in this order, of those still
+-- managed.
+managedOf ∷ Rig → [ResourceId] → IO [ManagedView]
+managedOf rig resources = (\views → [view | resource ← resources, view ← views, viewResource view == resource]) <$> atomically (readManaged (rigRecording rig))
+
+isQuery ∷ RecordingCall → Bool
+isQuery = \case
+  QueriedSupport _ → True
+  _ → False
 
 -- | Fill the object budget, so nothing more can be admitted.
 exhaust ∷ Rig → IO ()

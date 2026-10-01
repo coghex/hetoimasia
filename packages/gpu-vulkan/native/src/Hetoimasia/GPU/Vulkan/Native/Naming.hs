@@ -43,6 +43,9 @@ module Hetoimasia.GPU.Vulkan.Native.Naming
   , commandBufferName
   , readbackBufferName
   , readbackMemoryName
+  , bufferName
+  , imageName
+  , ownedViewName
   , SlotObject (..)
   , slotObjectName
   , PoolObject (..)
@@ -193,6 +196,20 @@ readbackBufferName resource = boundedName (resourceText resource <> " readback b
 
 readbackMemoryName ∷ ResourceId → ByteString
 readbackMemoryName resource = boundedName (resourceText resource <> " readback memory")
+
+-- | A managed buffer (GRS-2). Its allocation is named the same inside the
+-- allocator.
+bufferName ∷ ResourceId → ByteString
+bufferName resource = boundedName (resourceText resource <> " buffer")
+
+-- | A managed image (GRS-2). Its allocation is named the same inside the
+-- allocator.
+imageName ∷ ResourceId → ByteString
+imageName resource = boundedName (resourceText resource <> " image")
+
+-- | A managed image's one owned view.
+ownedViewName ∷ ResourceId → ByteString
+ownedViewName resource = boundedName (resourceText resource <> " image view")
 
 -- | One of the synchronization objects a frame slot owns (VK-12).
 data SlotObject
