@@ -154,14 +154,22 @@ It says nothing about:
 - the completion-deferred free path the engine needs.
 
 Those are what the bounded validation of the VMA integration (GRS-18 in the
-design) must establish before GRS-11 builds on it.
+design) establishes; its runs are in
+[the VMA qualification record](gpu_vma_qualification_record.md).
 
 ## Reproducing
 
+The probe's default is now GRS-18's measurement, so this comparison takes
+`--virtual-block-parity`:
+
 ```bash
-bash tools/vulkan/run.sh test hetoimasia-gpu-vulkan-native:test:allocator-parity-probe -- --output FILE
-bash tools/vulkan/run.sh test hetoimasia-gpu-vulkan-native:test:allocator-parity-probe -- --output FILE +RTS -A1g -RTS
+bash tools/vulkan/run.sh test hetoimasia-gpu-vulkan-native:test:allocator-parity-probe -- --virtual-block-parity --output FILE
+bash tools/vulkan/run.sh test hetoimasia-gpu-vulkan-native:test:allocator-parity-probe -- --virtual-block-parity --output FILE +RTS -A1g -RTS
 ```
+
+Runs 1 to 3 used the non-threaded runtime; the suite is now linked threaded
+for GRS-18, which this comparison's pure Haskell and unsafe calls do not
+depend on, so a new run is comparable but not identical.
 
 Take timings only on a quiet machine. Each report records the load average at
 its start. The probe is local apparatus outside routine automation, not a

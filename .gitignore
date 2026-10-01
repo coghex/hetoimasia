@@ -36,6 +36,7 @@ config/*.local.yaml
 /receipts/
 /cabal.project.vulkan.local
 /dist-vulkan/
+/dist-vulkan-vma-safe/
 # The retired proof harness's build directory, which existing checkouts may hold.
 /dist-vulkan-proof/
 # The shader toolchain fingerprints `hetoimasia-shader-fingerprint` generates
