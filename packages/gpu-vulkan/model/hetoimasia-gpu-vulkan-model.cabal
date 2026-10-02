@@ -12,8 +12,10 @@ description:
     obligations each retains and the exits legal from it; validated finite
     admission budgets whose exhaustion is typed backpressure rather than
     failure; per-episode recovery accounting that nested helpers cannot
-    replenish; and bounded round-robin owner progress against the foundation's
-    injected monotonic clock.
+    replenish; bounded round-robin owner progress against the foundation's
+    injected monotonic clock; and the pure ordering rules for managed
+    resources, with image initialization published only by a confirmed
+    submission.
     .
     Completion is supplied as abstract facts through an injected interface. This
     package proves no native completion, makes no Vulkan call and names no
@@ -44,6 +46,7 @@ library
     hs-source-dirs: src
     exposed-modules:
         Hetoimasia.GPU.Model
+        Hetoimasia.GPU.Model.Access
         Hetoimasia.GPU.Model.Budget
         Hetoimasia.GPU.Model.Identity
     -- The identity constructors, the hold ledger, the admission arithmetic, the
@@ -56,6 +59,7 @@ library
     -- build one, so every value a model is handed was issued by some model.
     -- The layering is described in docs/gpu_model.md.
     other-modules:
+        Hetoimasia.GPU.Model.Internal.Access
         Hetoimasia.GPU.Model.Internal.Accounting
         Hetoimasia.GPU.Model.Internal.Budget
         Hetoimasia.GPU.Model.Internal.Completion
@@ -64,6 +68,7 @@ library
         Hetoimasia.GPU.Model.Internal.Generations
         Hetoimasia.GPU.Model.Internal.Hold
         Hetoimasia.GPU.Model.Internal.Identity
+        Hetoimasia.GPU.Model.Internal.Initialization
         Hetoimasia.GPU.Model.Internal.Memory
         Hetoimasia.GPU.Model.Internal.Observation
         Hetoimasia.GPU.Model.Internal.Presentation
@@ -119,6 +124,7 @@ test-suite gpu-model-tests
     main-is: Main.hs
     hs-source-dirs: test
     other-modules:
+        Test.GPU.Model.Access
         Test.GPU.Model.Budgets
         Test.GPU.Model.DeviceLoss
         Test.GPU.Model.Frames

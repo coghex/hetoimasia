@@ -1079,7 +1079,10 @@ Managed construction returns opaque resources under the controller. Logical
 release denies new recordings but cannot invalidate already sealed batches.
 The minimal recorder supports dynamic rendering, compatible graphics pipelines,
 viewport/scissor, triangle draws, barriers required by those operations and
-bounded verification readback. Unsupported commands fail at the interface rather
+bounded verification readback. Managed buffers and images are ordered by
+GRS-3's contract instead: resting states, mechanical boundary barriers, and
+checked explicit transitions
+([gpu_backend.md](gpu_backend.md#ordering-managed-resources)). Unsupported commands fail at the interface rather
 than becoming an unchecked callback escape hatch.
 
 Recording operations retain dependencies through managed handles, including

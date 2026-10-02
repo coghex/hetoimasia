@@ -12,7 +12,9 @@
 -- "Hetoimasia.GPU.Vulkan.Native.Internal.Commands". Every decision about what
 -- may be recorded, retained or destroyed is the recording's; this module only
 -- turns each request into its native call, including which pipeline stages and
--- accesses each supported image transition synchronizes.
+-- accesses each supported image transition synchronizes. A managed resource's
+-- barrier arrives with its stages, accesses and layouts already decided
+-- ('Hetoimasia.GPU.Vulkan.Native.Recording.useScope').
 module Hetoimasia.GPU.Vulkan.Native.Recording.Vulkan
   ( vulkanRecordingOps
   , transitionScopes
@@ -50,7 +52,9 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Commands
 import Hetoimasia.GPU.Vulkan.Native.Naming (ShaderStage (..))
 import Hetoimasia.GPU.Vulkan.Native.Presentation (SurfaceExtent (..))
 import Hetoimasia.GPU.Vulkan.Native.Recording
-  ( ClearColor (..)
+  ( AccessScope (..)
+  , BarrierObject (..)
+  , ClearColor (..)
   , ImageLayout (..)
   , ImageLimits (..)
   , ImageQuery (..)
@@ -399,6 +403,51 @@ recordCommand commands = \case
                     }
               )
         , imageMemoryBarriers = Vector.empty
+        }
+  CommandResourceBarrier object (AccessScope sourceStage sourceAccess) (AccessScope destinationStage destinationAccess) →
+    pipelineBarrier2Unsafe
+      commands
+      DependencyInfo
+        { next = ()
+        , dependencyFlags = zero
+        , memoryBarriers = Vector.empty
+        , bufferMemoryBarriers = case object of
+            BarrierBuffer buffer →
+              Vector.singleton
+                ( SomeStruct
+                    BufferMemoryBarrier2
+                      { next = ()
+                      , srcStageMask = PipelineStageFlagBits2 sourceStage
+                      , srcAccessMask = AccessFlagBits2 sourceAccess
+                      , dstStageMask = PipelineStageFlagBits2 destinationStage
+                      , dstAccessMask = AccessFlagBits2 destinationAccess
+                      , srcQueueFamilyIndex = QUEUE_FAMILY_IGNORED
+                      , dstQueueFamilyIndex = QUEUE_FAMILY_IGNORED
+                      , buffer = Buffer buffer
+                      , offset = 0
+                      , size = WHOLE_SIZE
+                      }
+                )
+            BarrierImage {} → Vector.empty
+        , imageMemoryBarriers = case object of
+            BarrierImage image aspect levels from to →
+              Vector.singleton
+                ( SomeStruct
+                    ImageMemoryBarrier2
+                      { next = ()
+                      , srcStageMask = PipelineStageFlagBits2 sourceStage
+                      , srcAccessMask = AccessFlagBits2 sourceAccess
+                      , dstStageMask = PipelineStageFlagBits2 destinationStage
+                      , dstAccessMask = AccessFlagBits2 destinationAccess
+                      , oldLayout = Core10.ImageLayout (fromIntegral from)
+                      , newLayout = Core10.ImageLayout (fromIntegral to)
+                      , srcQueueFamilyIndex = QUEUE_FAMILY_IGNORED
+                      , dstQueueFamilyIndex = QUEUE_FAMILY_IGNORED
+                      , image = Image image
+                      , subresourceRange = ImageSubresourceRange {aspectMask = ImageAspectFlagBits aspect, baseMipLevel = 0, levelCount = levels, baseArrayLayer = 0, layerCount = 1}
+                      }
+                )
+            BarrierBuffer _ → Vector.empty
         }
   CommandBeginLabel name → beginLabelUnsafe commands DebugUtilsLabelEXT {labelName = name, color = (0, 0, 0, 0)}
   CommandEndLabel → endLabelUnsafe commands

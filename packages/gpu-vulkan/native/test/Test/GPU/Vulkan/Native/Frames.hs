@@ -25,11 +25,13 @@ import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldRetur
 import Hetoimasia.GPU.Model
   ( FramePhase (..)
   , FrameView (..)
+  , Initialization (..)
   , SessionFailureCause (..)
   , SessionState (..)
   , TargetPhase (..)
   , TargetView (..)
   , closeTarget
+  , resourceInitialization
   , sessionState
   , suspendTarget
   , usage
@@ -42,6 +44,8 @@ import Hetoimasia.GPU.Model.Identity
   , IdentityKind (..)
   , Misuse (..)
   , frameSlotNumber
+  , ResourceId
+  , BatchId
   , imageGeneration
   , imageIndex
   )
@@ -298,6 +302,47 @@ spec = describe "Frames" $ do
       settleAll rig
       retireTargetFrames (rigFrames rig) (rigTarget rig) `raises` \(FramesRetained _ frames slots _ _) → null frames && slots == [0]
       clean rig
+
+  describe "image initialization (GRS-3)" $ do
+    it "publishes a new image's initialization once the queue accepted its batch, before that submission completes" $ do
+      rig ← newRig
+      frame ← owned rig
+      (image, batch) ← initializingBatch rig frame
+      initializationOf rig image `shouldReturn` Just (InitializingIn batch)
+      _ ← submitted rig (batch :| [])
+      progress rig `shouldReturn'` \report → progressCompleted report `shouldBe` []
+      initializationOf rig image `shouldReturn` Just Initialized
+      clean rig
+
+    it "publishes nothing on a no-effect failure, and publishes on the retry the queue accepts" $ do
+      rig ← newRig
+      frame ← owned rig
+      (image, batch) ← initializingBatch rig frame
+      failFrameStep (rigStandIn rig) AtSubmitNoEffect
+      submitFrames (rigFrames rig) (batch :| []) `shouldReturn'` \case
+        Right (SubmittedNothing _) → pure ()
+        other → expectationFailure ("the submission answered " <> show other)
+      initializationOf rig image `shouldReturn` Just (InitializingIn batch)
+      clearFrameStep (rigStandIn rig) AtSubmitNoEffect
+      _ ← submitted rig (batch :| [])
+      initializationOf rig image `shouldReturn` Just Initialized
+      clean rig
+
+    it "publishes nothing when the submission's effect is unknown, or its fence's reset raised" $ do
+      uncertainRig ← newRig
+      uncertainFrame ← owned uncertainRig
+      (uncertainImage, uncertainBatch) ← initializingBatch uncertainRig uncertainFrame
+      failFrameStep (rigStandIn uncertainRig) AtSubmit
+      outcome ← try @FrameEffectUncertain (submitFrames (rigFrames uncertainRig) (uncertainBatch :| []))
+      fmap (const ()) outcome `shouldSatisfy` either (const True) (const False)
+      initializationOf uncertainRig uncertainImage `shouldReturn` Just Uninitialized
+      fenceRig ← newRig
+      fenceFrame ← owned fenceRig
+      (fenceImage, fenceBatch) ← initializingBatch fenceRig fenceFrame
+      failFrameStep (rigStandIn fenceRig) AtResetFence
+      reset ← try @FrameStepFailed (submitFrames (rigFrames fenceRig) (fenceBatch :| []))
+      fmap (const ()) reset `shouldBe` Left (FrameStepFailed AtResetFence)
+      initializationOf fenceRig fenceImage `shouldReturn` Just (InitializingIn fenceBatch)
 
   describe "abandonment" $ do
     it "skips an acquired frame through a cleanup submission and returns its image once that has completed, rebuilding nothing" $ do
@@ -562,3 +607,14 @@ spec = describe "Frames" $ do
       phaseOf rig (ownedFrame frame) `shouldReturn` Nothing
       imagesOwned (rigStandIn rig) `shouldReturn` []
       clean rig
+
+-- | A new color target, and a sealed batch of the frame that initializes it.
+initializingBatch ∷ Rig → OwnedFrame → IO (ResourceId, BatchId)
+initializingBatch rig frame = do
+  image ← createImage (rigRecording rig) (ImageDescription ColorTarget Rgba8Srgb 16 16 1) >>= either (fail . show) pure
+  recordFrame (rigRecording rig) (ownedFrame frame) (\recorder → transitionResource recorder image FromUndefined ColorAttachment) >>= \case
+    Right (batch, Right ()) → pure (managedResource image, batch)
+    other → fail ("the initializing batch was refused: " <> show (fmap (fmap (const ())) other))
+
+initializationOf ∷ Rig → ResourceId → IO (Maybe Initialization)
+initializationOf rig resource = resourceInitialization resource <$> modelOf rig

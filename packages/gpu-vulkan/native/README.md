@@ -71,7 +71,10 @@ destroys it.
   that retains, in the model and before each native call, the exact
   generations each command references, a pipeline's layout included; sealed
   single-use batches that a discard or a reset invalidates natively before
-  their references are discharged; readback reads gated on completion
+  their references are discharged; GRS-3's checked transitions of buffers and
+  images under the model's ordering rules, with the entry and exit barriers
+  each batch owes, and images refused until their initializing batch is
+  submitted; readback reads gated on completion
   evidence, with non-coherent memory invalidated and flushed over ranges of the
   buffer's own allocation, which the device's allocator aligns; and destruction
   on the owner once every hold has ended. It is the entry point only: its code

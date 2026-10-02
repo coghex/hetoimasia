@@ -37,6 +37,8 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , Buffer (..)
   , Image (..)
   , Managed (..)
+  , Ordered
+  , orderedObject
 
     -- * Failures
   , BatchInvalidationFailed (..)
@@ -79,6 +81,7 @@ import Numeric.Natural (Natural)
 
 import Hetoimasia.GPU.Model (GpuModel, Outcome (..))
 import qualified Hetoimasia.GPU.Model as Model
+import Hetoimasia.GPU.Model.Access (ResourceKind)
 import Hetoimasia.GPU.Model.Budget (BudgetKind)
 import Hetoimasia.GPU.Model.Identity
   ( BatchId
@@ -98,8 +101,12 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   , ImageDescription (..)
   , ImageFormat
   , ImageKind (..)
+  , ImageUse (..)
   , ReadbackAllocation (..)
   , RecordingOps (..)
+  , bufferResourceKind
+  , imageKindUse
+  , imageResourceKind
   )
 import Hetoimasia.GPU.Vulkan.Native.Roots (Checkpoint (..), Roots, TerminalCause, checkpointRoots, rootsCall, rootsSessionIdentity, stateRootsModel)
 
@@ -238,6 +245,9 @@ data Refusal
   | RefusedDiagnosticPending
     -- ^ A diagnostic failure has happened whose order the capture cannot yet
     -- say: nothing new is admitted, and a later checkpoint names the primary.
+  | RefusedUninitialized
+    -- ^ An image that awaits initialization was touched by a batch that does
+    -- not initialize it, or before the batch that does was submitted (GRS-3).
   | RefusedConstructionFailed !Text
     -- ^ A construction raised, with the session still running, after settling
     -- everything it made: its reservation given back, or the generation it
@@ -291,6 +301,28 @@ instance Managed Buffer where
 
 instance Managed Image where
   managedResource (Image resource) = resource
+
+-- | A managed handle the recorder orders and transitions (GRS-3): a buffer
+-- or an image.
+class Managed handle ⇒ Ordered handle
+
+instance Ordered Buffer
+
+instance Ordered Image
+
+-- | What the ordering rules need of a managed generation: its kind, its
+-- native handle, and for an image the aspect and mip levels its barriers
+-- cover. Anything other than a buffer or an image has none.
+orderedObject ∷ NativeResource cmd → Maybe (ResourceKind, Word64, Maybe (Word32, Word32))
+orderedObject = \case
+  NativeBuffer kind _ allocated → Just (bufferResourceKind kind, memoryResource (allocatedMemory allocated), Nothing)
+  NativeImage description memory _ →
+    Just
+      ( imageResourceKind (imageKind description)
+      , memoryResource memory
+      , Just (useAspect (imageKindUse (imageKind description)), imageMipLevels description)
+      )
+  _ → Nothing
 
 -- ---------------------------------------------------------------------------
 -- Failures

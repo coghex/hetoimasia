@@ -48,6 +48,7 @@ import Hetoimasia.GPU.Model
   , SessionFailureCause (CleanupFailed)
   , recordAllocationFailure
   , releaseResource
+  , requireInitialization
   )
 import qualified Hetoimasia.GPU.Model as Model
 import Hetoimasia.GPU.Model.Budget (frameSlotLimit)
@@ -294,8 +295,9 @@ createBuffer recording (BufferDescription kind bytes)
 -- its one owned view: the whole image, in its format, over the aspect its kind
 -- fixes. The kind fixes its usage flags, the format features it needs and its
 -- memory usage ('imageKindUse'); its memory comes from the device's allocator
--- and is never mapped. Nothing writes it, or moves it out of the undefined
--- layout, yet.
+-- and is never mapped. It awaits initialization: the first batch that touches
+-- it must move it out of the undefined layout ('transitionResource'), and no
+-- other batch may use it until that one has been submitted (GRS-3).
 --
 -- Before anything is created, in this order: a format the kind does not take
 -- ('kindFormats') is 'RefusedImageUnsupported'; a zero width, height or mip
@@ -474,6 +476,11 @@ construct recording bytes objects name create replacing =
                       case answer of
                         Right resource → do
                           modifyTVar' (recordingManaged recording) (Map.insert resource (ManagedRecord native ManagedLive))
+                          -- A new image's contents are undefined until the
+                          -- batch that initializes it is submitted (GRS-3).
+                          case native of
+                            NativeImage {} → modelEdit roots (requireInitialization resource)
+                            _ → pure ()
                           for_ replacing $ \old → do
                             -- The rebuild released the old generation; its CPU
                             -- use ends with it, since no handle may record it.

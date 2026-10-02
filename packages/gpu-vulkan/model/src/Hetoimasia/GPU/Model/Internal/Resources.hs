@@ -66,6 +66,7 @@ createResource identity model =
                   { resourceHolds = newHolds
                   , resourceBytes = attemptBytes attempt
                   , resourceObjects = attemptObjects attempt
+                  , resourceInitializationState = NoInitialization
                   }
            in Admitted
                 ( model
@@ -106,6 +107,7 @@ rebuildResource identity allocation model =
                             { resourceHolds = newHolds
                             , resourceBytes = attemptBytes attempt
                             , resourceObjects = attemptObjects attempt
+                            , resourceInitializationState = NoInitialization
                             }
                         released = editHolds (ResourceKey logical generation) releaseLogically model
                      in Admitted

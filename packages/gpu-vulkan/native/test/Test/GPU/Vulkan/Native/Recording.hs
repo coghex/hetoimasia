@@ -14,7 +14,7 @@ import Control.Concurrent (forkIO, killThread, myThreadId)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (atomically)
 import Control.Exception (ErrorCall (ErrorCall), SomeException, throwIO, try)
-import Control.Monad (forM_, void)
+import Control.Monad (forM_, void, when)
 import qualified Data.ByteString as ByteString
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (sort)
@@ -35,6 +35,7 @@ import Hetoimasia.GPU.Model
   , CompletionFact (..)
   , GpuModel
   , HoldView (..)
+  , Initialization (..)
   , Outcome (..)
   , SessionFailureCause (..)
   , SessionState (..)
@@ -48,6 +49,7 @@ import Hetoimasia.GPU.Model
   , modelBudgets
   , recordCompletion
   , reserveFrame
+  , resourceInitialization
   , closeSubmittedFrame
   , resetRecorder
   , skipUnsubmittedFrame
@@ -55,6 +57,7 @@ import Hetoimasia.GPU.Model
   , submitFrames
   , usage
   )
+import Hetoimasia.GPU.Model.Access (ResourceKind (..), legalUses)
 import Hetoimasia.GPU.Model.Budget (BudgetKind (ByteBudget, ObjectBudget), BudgetRequest (..), byteLimit, defaultBudgetRequest, objectLimit, validateBudgets)
 import Hetoimasia.GPU.Model.Identity
   ( BatchId
@@ -1292,6 +1295,254 @@ spec = describe "Recording" $ do
       liveAllocations (allocatorOf rig) `shouldReturn` 0
       snd <$> chargedSince rig base `shouldReturn` 0
 
+  describe "ordering managed resources (GRS-3)" $ do
+    it "maps every kind's legal uses onto the stages, accesses and layouts the issue fixes" $ do
+      let scope kind use = (scopeStages (useScope kind use), scopeAccess (useScope kind use), useLayout use)
+      [scope (imageResourceKind kind) use | kind ← [minBound .. maxBound], use ← legalUses (imageResourceKind kind)]
+        `shouldBe` [ (0x80, 0x100000000, Just 5)
+                   , (0x1000, 0x1000, Just 7)
+                   , (0x300, 0x600, Just 1000241000)
+                   , (0x400, 0x180, Just 2)
+                   , (0x1000, 0x800, Just 6)
+                   ]
+      -- A buffer has no layout: only its stages and accesses matter.
+      [(\(stages, access, _) → (stages, access)) (scope (bufferResourceKind kind) use) | kind ← [minBound .. maxBound], use ← legalUses (bufferResourceKind kind)]
+        `shouldBe` [ (0x4, 0x4)
+                   , (0x1000, 0x1000)
+                   , (0x4, 0x2)
+                   , (0x1000, 0x1000)
+                   , (0x8C, 0x26)
+                   , (0x88, 0x200000000)
+                   , (0x1000, 0x800)
+                   ]
+
+    it "records the entry barrier at a batch's first touch, the explicit transitions, and the exit barriers at its seal, retaining each resource first" $ do
+      rig ← newRig
+      kit ← newKit rig
+      buffer ← created (createBuffer (rigRecording rig) (BufferDescription VertexBuffer 64))
+      image ← created (createImage (rigRecording rig) (ImageDescription TextureImage Rgba8Srgb 16 16 2))
+      [bufferNative : _, imageNative : _] ← map viewNativeHandles <$> managedOf rig [managedResource buffer, managedResource image]
+      frame ← acquired rig
+      -- Inside the first barrier's native call, the batch already retains the
+      -- buffer's exact generation.
+      retainedAtFirst ← newIORef Nothing
+      duringRecord (rigRecording' rig) $ \case
+        CommandResourceBarrier {} → readIORef retainedAtFirst >>= \case
+          Nothing → modelOf rig >>= \model → writeIORef retainedAtFirst (Just (recordedOf model (managedResource buffer)))
+          Just _ → pure ()
+        _ → pure ()
+      before ← nativeCount rig
+      (batch, ()) ← recorded rig frame $ \recorder → do
+        ok (transitionResource recorder buffer (FromUse GeometryRead) TransferWrite)
+        ok (transitionResource recorder buffer (FromUse TransferWrite) GeometryRead)
+        ok (transitionResource recorder image FromUndefined TransferWrite)
+        ok (transitionResource recorder image (FromUse TransferWrite) ShaderSampled)
+        drawTriangle recorder kit
+        ok (transitionImage recorder LayoutColorAttachment LayoutPresentSource)
+      readIORef retainedAtFirst `shouldReturn` Just [batch]
+      calls ← drop before <$> nativeCalls' rig
+      let vertex = useScope VertexResource
+          texture = useScope TextureResource
+          wholeImage = BarrierImage imageNative 1 2
+          barriers = [(object, from, to) | Recorded _ (CommandResourceBarrier object from to) ← calls]
+      barriers
+        `shouldBe` [ (BarrierBuffer bufferNative, vertex GeometryRead, vertex TransferWrite)
+                   , (BarrierBuffer bufferNative, vertex TransferWrite, vertex GeometryRead)
+                   , (wholeImage 0 7, texture ShaderSampled, texture TransferWrite)
+                   , (wholeImage 7 5, texture TransferWrite, texture ShaderSampled)
+                   , (BarrierBuffer bufferNative, vertex GeometryRead, vertex GeometryRead)
+                   , (wholeImage 5 5, texture ShaderSampled, texture ShaderSampled)
+                   ]
+      -- The exit barriers come after every consumer command and before the
+      -- command buffer ends.
+      let tail' = reverse (take 3 (reverse calls))
+      [isExit call | call ← tail'] `shouldBe` [True, True, False]
+      fmap viewBatchStanding <$> atomically (readBatch (rigRecording rig) batch) `shouldReturn` Just BatchSealed
+      model ← modelOf rig
+      [recordedOf model (managedResource handle) | handle ← [buffer]] `shouldBe` [[batch]]
+      recordedOf model (managedResource image) `shouldBe` [batch]
+
+    it "records a resource a batch touches without a layout change with its boundary barriers alone" $ do
+      rig ← newRig
+      _ ← newKit rig
+      buffer ← created (createBuffer (rigRecording rig) (BufferDescription LookupBuffer 64))
+      [native : _] ← map viewNativeHandles <$> managedOf rig [managedResource buffer]
+      frame ← acquired rig
+      before ← nativeCount rig
+      _ ← recorded rig frame $ \recorder → ok (transitionResource recorder buffer (FromUse StorageRead) StorageRead)
+      calls ← drop before <$> nativeCalls' rig
+      let lookup' = useScope LookupResource StorageRead
+      [(object, from, to) | Recorded _ (CommandResourceBarrier object from to) ← calls]
+        `shouldBe` replicate 2 (BarrierBuffer native, lookup', lookup')
+
+    it "refuses an illegal transition, one that does not start from the batch's use, and one inside rendering, with no native call or retention" $ do
+      rig ← newRig
+      _ ← newKit rig
+      vertices ← created (createBuffer (rigRecording rig) (BufferDescription VertexBuffer 64))
+      lookup' ← created (createBuffer (rigRecording rig) (BufferDescription LookupBuffer 64))
+      depth ← created (createImage (rigRecording rig) (ImageDescription DepthTarget Depth32Float 16 16 1))
+      frame ← acquired rig
+      answers ← newIORef []
+      counts ← newIORef []
+      let attempt recorder action = do
+            before ← nativeCount rig
+            answer ← action recorder
+            after ← nativeCount rig
+            modifyIORef' answers (answer :)
+            modifyIORef' counts ((after - before) :)
+      _ ← recorded rig frame $ \recorder → do
+        attempt recorder $ \r → transitionResource r depth FromUndefined TransferWrite
+        attempt recorder $ \r → transitionResource r lookup' (FromUse StorageRead) TransferWrite
+        attempt recorder $ \r → transitionResource r vertices FromUndefined TransferWrite
+        attempt recorder $ \r → transitionResource r vertices (FromUse TransferWrite) GeometryRead
+        enterRendering recorder
+        attempt recorder $ \r → transitionResource r vertices (FromUse GeometryRead) TransferWrite
+        ok (endRendering recorder)
+      reverse <$> readIORef answers
+        `shouldReturn` [ Left (RefusedUnsupported "the use TransferWrite of a DepthTargetResource")
+                       , Left (RefusedUnsupported "the use TransferWrite of a LookupResource")
+                       , Left (RefusedUnsupported "discarding the contents of a VertexResource")
+                       , Left (RefusedIllegal "a resource that is GeometryRead, not TransferWrite")
+                       , Left (RefusedIllegal "a resource transition inside rendering")
+                       ]
+      readIORef counts `shouldReturn` replicate 5 0
+      model ← modelOf rig
+      [recordedOf model (managedResource handle) | handle ← [vertices, lookup']] `shouldBe` [[], []]
+      recordedOf model (managedResource depth) `shouldBe` []
+
+    it "refuses a foreign, a released and a stranger's transition, and one through a recorder kept past its consumer, before any native call" $ do
+      rig ← newRig
+      _ ← newKit rig
+      foreignRig ← newRig
+      foreign' ← created (createBuffer (rigRecording foreignRig) (BufferDescription VertexBuffer 64))
+      released ← created (createBuffer (rigRecording rig) (BufferDescription VertexBuffer 64))
+      ok (releaseManaged (rigRecording rig) released)
+      live ← created (createBuffer (rigRecording rig) (BufferDescription VertexBuffer 64))
+      frame ← acquired rig
+      before ← nativeCount rig
+      stranger ← newEmptyMVar
+      (_, (foreignAnswer, releasedAnswer, kept)) ← recorded rig frame $ \recorder → do
+        foreignAnswer ← transitionResource recorder foreign' (FromUse GeometryRead) TransferWrite
+        releasedAnswer ← transitionResource recorder released (FromUse GeometryRead) TransferWrite
+        _ ← forkIO (transitionResource recorder released (FromUse GeometryRead) GeometryRead >>= putMVar stranger)
+        strangerAnswer ← takeMVar stranger
+        strangerAnswer `shouldBe` Left RefusedNotOwner
+        pure (foreignAnswer, releasedAnswer, recorder)
+      (foreignAnswer, releasedAnswer) `shouldBe` (Left (RefusedMisuse (ForeignIdentity ResourceIdentity)), Left (RefusedMisuse (WrongPhase ResourceIdentity)))
+      transitionResource kept live (FromUse GeometryRead) GeometryRead `shouldReturn` Left RefusedRecorderClosed
+      calls ← drop before <$> nativeCalls' rig
+      [() | Recorded _ (CommandResourceBarrier {}) ← calls] `shouldBe` []
+
+    it "leaves a batch whose consumer left a resource away from rest partial, unsealed and owned, recording no exit barrier" $ do
+      rig ← newRig
+      kit ← newKit rig
+      buffer ← created (createBuffer (rigRecording rig) (BufferDescription IndexBuffer 64))
+      frame ← acquired rig
+      before ← nativeCount rig
+      answer ← recordFrame (rigRecording rig) frame $ \recorder → do
+        ok (transitionResource recorder buffer (FromUse GeometryRead) TransferWrite)
+        drawTriangle recorder kit
+      let away = Text.pack (show (managedResource buffer)) <> ", a IndexResource, TransferWrite rather than at rest"
+      fmap (const ()) answer `shouldBe` Left (RefusedIllegal ("the consumer left " <> away <> ", so the batch was not sealed"))
+      [view] ← atomically (readBatches (rigRecording rig))
+      viewBatchStanding view `shouldBe` BatchPartial ("the consumer left " <> away)
+      calls ← drop before <$> nativeCalls' rig
+      length [() | Recorded _ (CommandResourceBarrier {}) ← calls] `shouldBe` 1
+      [() | Ended _ ← calls] `shouldBe` []
+      model ← modelOf rig
+      recordedOf model (managedResource buffer) `shouldBe` [viewBatch view]
+      -- Only a discard ends it: the storage is reset first, then the
+      -- references go.
+      ok (discardBatch (rigRecording rig) (viewBatch view))
+      after ← modelOf rig
+      recordedOf after (managedResource buffer) `shouldBe` []
+
+    it "leaves a batch partial, every reference retained, when an entry, a transition or an exit barrier raised" $ do
+      forM_ [(0 ∷ Int, "entry"), (1, "transition"), (2, "exit")] $ \(failing, name) → do
+        rig ← newRig
+        _ ← newKit rig
+        buffer ← created (createBuffer (rigRecording rig) (BufferDescription VertexBuffer 64))
+        frame ← acquired rig
+        seen ← newIORef (0 ∷ Int)
+        duringRecord (rigRecording' rig) $ \case
+          CommandResourceBarrier {} → do
+            count ← readIORef seen
+            writeIORef seen (count + 1)
+            when (count == failing) (throwIO (ErrorCall ("the " <> name <> " barrier failed")))
+          _ → pure ()
+        raised ← try @ErrorCall $ recorded rig frame $ \recorder → do
+          ok (transitionResource recorder buffer (FromUse GeometryRead) TransferWrite)
+          ok (transitionResource recorder buffer (FromUse TransferWrite) GeometryRead)
+        fmap (const ()) raised `shouldBe` Left (ErrorCall ("the " <> name <> " barrier failed"))
+        [view] ← atomically (readBatches (rigRecording rig))
+        viewBatchStanding view `shouldSatisfy` \case
+          BatchPartial reason → "vkCmdPipelineBarrier2 raised" `Text.isPrefixOf` reason
+          _ → False
+        nativeOf rig `shouldReturn'` \calls → [() | Ended _ ← calls] `shouldBe` []
+        model ← modelOf rig
+        recordedOf model (managedResource buffer) `shouldBe` [viewBatch view]
+        ok (discardBatch (rigRecording rig) (viewBatch view))
+        after ← modelOf rig
+        recordedOf after (managedResource buffer) `shouldBe` []
+
+    it "lets only a batch that initializes a new image touch it, and no other until that batch is submitted" $ do
+      rig ← newRig
+      _ ← newKit rig
+      _ ← created (createFrameStorage (rigRecording rig) (rigTarget rig) 1)
+      image ← created (createImage (rigRecording rig) (ImageDescription ColorTarget Rgba8Srgb 16 16 1))
+      let resource = managedResource image
+      initializationOf rig resource `shouldReturn` Just Uninitialized
+      first ← acquired rig
+      second ← acquiredOn rig 1
+      -- A first touch that keeps the contents of an uninitialized image.
+      before ← nativeCount rig
+      keeping ← recordFrame (rigRecording rig) first (\recorder → transitionResource recorder image (FromUse ColorAttachment) ColorAttachment)
+      fmap snd keeping `shouldBe` Right (Left RefusedUninitialized)
+      [discarded] ← map viewBatch <$> atomically (readBatches (rigRecording rig))
+      ok (discardBatch (rigRecording rig) discarded)
+      (initializing, ()) ← recorded rig first $ \recorder → ok (transitionResource recorder image FromUndefined ColorAttachment)
+      initializationOf rig resource `shouldReturn` Just (InitializingIn initializing)
+      -- Another batch, however it would touch it, before the submission.
+      during ← recordFrame (rigRecording rig) second $ \recorder → do
+        keeps ← transitionResource recorder image (FromUse ColorAttachment) ColorAttachment
+        discards ← transitionResource recorder image FromUndefined ColorAttachment
+        pure (keeps, discards)
+      fmap snd during `shouldBe` Right (Left RefusedUninitialized, Left RefusedUninitialized)
+      model ← modelOf rig
+      recordedOf model resource `shouldBe` [initializing]
+      length . filter (\case Recorded _ (CommandResourceBarrier {}) → True; _ → False) . drop before <$> nativeCalls' rig `shouldReturn` 2
+      -- Submitted, not completed: initialized, and the other batch may use it.
+      _ ← submitInModel rig first
+      initializationOf rig resource `shouldReturn` Just Initialized
+      [other] ← map viewBatch . filter ((== second) . viewBatchFrame) <$> atomically (readBatches (rigRecording rig))
+      ok (discardBatch (rigRecording rig) other)
+      _ ← recorded rig second $ \recorder → ok (transitionResource recorder image (FromUse ColorAttachment) TransferRead) >> ok (transitionResource recorder image (FromUse TransferRead) ColorAttachment)
+      pure ()
+
+    it "leaves an image uninitialized, and every resting use unchanged, when its initializing batch is discarded or its recorder reset" $ do
+      rig ← newRig
+      _ ← newKit rig
+      image ← created (createImage (rigRecording rig) (ImageDescription TextureImage Rgba8Srgb 16 16 1))
+      let resource = managedResource image
+      frame ← acquired rig
+      (batch, ()) ← recorded rig frame $ \recorder → do
+        ok (transitionResource recorder image FromUndefined TransferWrite)
+        ok (transitionResource recorder image (FromUse TransferWrite) ShaderSampled)
+      ok (discardBatch (rigRecording rig) batch)
+      initializationOf rig resource `shouldReturn` Just Uninitialized
+      (again, ()) ← recorded rig frame $ \recorder → ok (transitionResource recorder image FromUndefined ShaderSampled)
+      initializationOf rig resource `shouldReturn` Just (InitializingIn again)
+      ok (resetFrameRecorder (rigRecording rig) frame)
+      initializationOf rig resource `shouldReturn` Just Uninitialized
+      -- A partial initializing batch initializes nothing either, and the next
+      -- batch finds the image at rest, wherever the last one left it.
+      _ ← recordFrame (rigRecording rig) frame (\recorder → ok (transitionResource recorder image FromUndefined TransferWrite))
+      [partial] ← map viewBatch <$> atomically (readBatches (rigRecording rig))
+      ok (discardBatch (rigRecording rig) partial)
+      initializationOf rig resource `shouldReturn` Just Uninitialized
+      (_, answer) ← recorded rig frame $ \recorder → transitionResource recorder image (FromUse TransferWrite) ShaderSampled
+      answer `shouldBe` Left (RefusedIllegal "a resource that is ShaderSampled, not TransferWrite")
+
   describe "the FFI audit" $
     it "declares a genuine unsafe import for exactly the recording subset and the allocator shim the configuration records, and for nothing else" $ do
       sources ← haskellSources "src"
@@ -1548,6 +1799,16 @@ isDestruction = \case
   DestroyedLayout _ → True
   DestroyedStorage _ → True
   _ → False
+
+-- | Whether the call recorded a managed resource's barrier.
+isExit ∷ RecordingCall → Bool
+isExit = \case
+  Recorded _ (CommandResourceBarrier {}) → True
+  _ → False
+
+-- | Where an image's initialization stands in the model.
+initializationOf ∷ Rig → ResourceId → IO (Maybe Initialization)
+initializationOf rig resource = resourceInitialization resource <$> modelOf rig
 
 isCopyOrHostBarrier ∷ NativeCommand → Bool
 isCopyOrHostBarrier = \case

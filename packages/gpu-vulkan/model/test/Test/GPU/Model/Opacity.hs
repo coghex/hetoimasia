@@ -115,7 +115,8 @@ hiddenModules ∷ [String]
 hiddenModules =
   map
     ("Hetoimasia.GPU.Model.Internal." <>)
-    [ "Accounting"
+    [ "Access"
+    , "Accounting"
     , "Budget"
     , "Completion"
     , "Disposal"
@@ -123,6 +124,7 @@ hiddenModules =
     , "Generations"
     , "Hold"
     , "Identity"
+    , "Initialization"
     , "Observation"
     , "Presentation"
     , "Progress"

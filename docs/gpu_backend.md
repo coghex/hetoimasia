@@ -852,7 +852,7 @@ only home of the `unsafe` subset.
 | --- | --- | --- |
 | Managed rendering resources | `createPipelineLayout`; `createPipeline` over a layout, VK-9's embedded shaders and a color format; `replacePipeline`; `createFrameStorage` for a target's frame slot; `createReadback` of a byte size; `createBuffer` and `createImage` of an engine-defined kind ([Buffers and images](#buffers-and-images)); `releaseManaged` | The native objects, their accounting reserved with `beginAllocation` before each creation, and the exact generation each handle names |
 | Checked frame | `recordFrame` takes a `FrameSlotId` the model holds acquired, and resolves its image, view, extent and format through the generation that owns them | The frame's generation, retained by the batch |
-| Scoped recorder | `transitionImage`, `beginRendering`, `bindPipeline`, `setViewport`, `setScissor`, `draw`, `endRendering`, `copyToReadback` | The slot's command storage and the batch's recorded references |
+| Scoped recorder | `transitionImage`, `transitionResource` ([Ordering](#ordering-managed-resources)), `beginRendering`, `bindPipeline`, `setViewport`, `setScissor`, `draw`, `endRendering`, `copyToReadback` | The slot's command storage, the batch's recorded references, and its managed resources' uses |
 | Recorded batch | `discardBatch`; `resetFrameRecorder`; `noteBatchSubmitted`, which VK-12's `submitFrames` calls | Sealed commands and references, whether or not the caller keeps the `BatchId` |
 | Readback | `readReadback`, `fillReadback` | The buffer's allocation, its mapping, and what last wrote it |
 | Disposal | `disposeResources`, `retireRecording` | Destruction on the owner, only once the model reports every hold ended |
@@ -860,10 +860,11 @@ only home of the `unsafe` subset.
 The supported vocabulary is exactly the triangle and its verification: dynamic
 rendering into the frame's one color view, a graphics pipeline compatible with
 the frame's format, dynamic viewport and scissor, whole-triangle draws, the four
-image transitions below, and one bounded copy of the whole image into a readback
-buffer. There is no raw command buffer, no callback escape hatch, no descriptor,
-no binding of a managed buffer or image — GRS-2 creates them, and GRS-3 and
-GRS-4 record through them — and no render graph. A command outside that vocabulary — an
+image transitions below, one bounded copy of the whole image into a readback
+buffer, and GRS-3's checked transitions and boundary barriers of managed
+buffers and images. There is no raw command buffer, no callback escape hatch,
+no descriptor, no binding of a managed buffer or image — GRS-4 and GRS-5
+record through them — and no render graph. A command outside that vocabulary — an
 unsupported transition, a draw that is not whole triangles, a transition into or
 out of the transfer-source layout or a copy of an image that is not a transfer
 source — is `RefusedUnsupported`; one the recorder's state
@@ -1075,7 +1076,9 @@ no destination stage the transition chained into nothing that followed it, and
 on Lavapipe synchronization validation reported every presentation as
 `SYNC-HAZARD-PRESENT-AFTER-WRITE` (VK-13). Retention proves lifetime only: these
 layout and synchronization rules are the supported operations' own explicit
-contract, not an automatic hazard resolver.
+contract, not an automatic hazard resolver. They are a swapchain image's
+alone; managed buffers and images are ordered by
+[GRS-3's contract](#ordering-managed-resources).
 
 ### Readback memory
 
@@ -1148,9 +1151,10 @@ reaches a client. `createBuffer` and `createImage` make them on the graphics
 owner's thread; the window integration lends both, with `releaseConstructed`,
 through the host's `Construction` (`constructBuffer`, `constructImage`), to a
 renderer and to an owner-thread action alike, behind the same owner check,
-checkpoint and construction-failure handling as its pipelines. Nothing
-records through them yet: binding, transitions, layouts and CPU writes are
-GRS-3, GRS-4 and GRS-6's.
+checkpoint and construction-failure handling as its pipelines. A batch orders
+and transitions them through GRS-3's checked operations
+([below](#ordering-managed-resources)); binding, uploads and CPU writes are
+GRS-4 and GRS-6's.
 
 **Kinds.** A creation names an engine-defined kind, never raw usage flags.
 Each kind fixes the resource's Vulkan usage flags and the memory usage its
@@ -1247,6 +1251,94 @@ view's and its allocation's.
 | --- | --- | --- | --- | --- | --- |
 | A buffer's or an image's managed record | The recording's managed records (`State`) | `Construction` inserts it, and releases it — on release or on a naming failure; `Disposal` advances it to destroyed or uncertain and removes it; `readManaged` reads it | The graphics owner | From its creation's commit until the model records its disposal | Destroyed once every hold has ended — view, image or buffer, then allocation — and removed when the model records that; kept, never retried, if its destruction was uncertain |
 | Its native objects and allocation | The same record | Made by the allocation protocol and the native layer inside the creation's masked step; freed only by its disposal, or by a creation's own rollback | The graphics owner | The record's | Freed with the record's disposal; retained with an uncertain one |
+
+### Ordering managed resources
+
+GRS-3 (#335; resource services design D-18 and D-26) orders every access a
+batch makes to a managed buffer or image. The rules are the GPU model's pure
+ones ([the model contract](gpu_model.md#ordering-managed-resources)); the
+recorder applies them, maps their answers onto Vulkan, and records what they
+owe. Swapchain images keep their own path: `transitionImage` and
+`supportedTransition` are [unchanged](#image-transitions).
+
+**Resting states.** Every kind rests in one use between batches. Each use maps
+onto the stages and accesses it covers and, for an image, a layout
+(`useScope`, `useLayout`, over `bufferResourceKind` and `imageResourceKind`):
+
+| Kind | Resting use | Resting layout | Resting stages | Resting accesses |
+| --- | --- | --- | --- | --- |
+| `TextureImage` | `ShaderSampled` | shader-read-only | fragment shader | shader sampled read |
+| `DepthTarget` | `DepthAttachment` | depth attachment | early and late fragment tests | depth-stencil attachment read and write |
+| `ColorTarget` | `ColorAttachment` | color attachment | color-attachment output | color-attachment read and write |
+| `VertexBuffer` | `GeometryRead` | — | vertex input | vertex attribute read |
+| `IndexBuffer` | `GeometryRead` | — | vertex input | index read |
+| `InstanceBuffer` | `InstanceRead` | — | vertex input, vertex and fragment shaders | vertex attribute, index and shader read |
+| `LookupBuffer` | `StorageRead` | — | vertex and fragment shaders | shader storage read |
+| `StagingBuffer` | `TransferRead` | — | transfer | transfer read |
+
+The other legal uses are `TransferWrite` for a texture and for vertex and index
+buffers — the transfer stage's transfer write, in the transfer-destination
+layout for a texture — and `TransferRead` for a color target, in the
+transfer-source layout. Instance, lookup and staging buffers are host-written:
+the submission that follows a host write makes it visible to the device, so no
+scope names the host. That waives none of the boundary barriers below, none of
+a non-coherent allocation's flushing, and none of the protection a buffer
+retained by a batch or a submission has against being written in place; the
+mapped-memory safeguards of [readback memory](#readback-memory) stay as they
+are, and nothing writes a managed buffer from the host yet.
+
+**Transitions.** `transitionResource` moves a `Buffer` or an `Image` (the
+`Ordered` handles) within a batch, from the use the batch left it in
+(`FromUse`) or from undefined contents (`FromUndefined`, an image only), into
+another legal use of its kind, or into the same use, which orders the batch's
+earlier accesses in it before its later ones. Like every command it checks
+the owner's thread, the handle — this session's, still managed, live, a buffer
+or an image — the recorder, that rendering is not open, and the rules; it
+retains the exact generation in the model before its barrier; and only then
+records it. An illegal use is `RefusedUnsupported`; a move that does not start
+from the use the batch left the resource in, or one inside rendering, is
+`RefusedIllegal`; and each is refused with no native call and no retention.
+
+**Boundary barriers.** A batch's first touch of a resource finds it at rest,
+so its first transition must start from the resting use, or from undefined; it
+is recorded as the **entry barrier**, one barrier from the resting scope
+straight into its destination. When the consumer returns, with rendering
+ended and every touched resource back at rest, the recorder records an **exit
+barrier** for each — from the resting use back to it, a same-use barrier
+still owed — inside the batch's label, before its labels are balanced and its
+command buffer ends. Consumers never record either. On the one graphics queue
+a barrier's first scope covers every earlier submission, so each batch's entry
+barriers chain to earlier batches' exit barriers, ordering write-after-write,
+read-after-write and write-after-read between batches even when no layout
+changes. A barrier that discards leaves the undefined layout, and its first
+scope is still the resting one.
+
+**Sealing.** A batch whose consumer leaves a resource away from rest is
+refused, `RefusedIllegal` naming the resource, its kind and its use, and left
+partial, as one that leaves rendering open is: its exit barriers are never
+recorded, so they never stand in for the transition the consumer omitted, and
+only a discard or a reset ends it. A barrier that raised — an entry, a
+transition or an exit — leaves the batch partial like any command that raised,
+with every reference it took retained until a valid invalidation; an exit
+barrier's failure is raised once the batch's labels are balanced.
+
+**Initialization.** A new image awaits initialization: `createImage` marks it
+in the model as it commits. The first batch that touches it must initialize it,
+by a transition from undefined; any other first touch, and any touch by another
+batch before the initializing batch has been submitted, is
+`RefusedUninitialized`, with no native call. A color or depth target cleared
+every pass may transition from undefined every time, and still takes the entry
+barrier. Only a submission the queue accepted publishes the initialization —
+`submitFrames` records it with the submission, before anything has completed.
+Recording, sealing, a fence reset, a no-effect failure and an unknown effect
+never publish it, and a discarded batch, a reset recorder, a skipped frame and
+an uncertain submission leave what their batch was initializing uninitialized
+again. Nothing changes a resting state, which is the kind's.
+
+| State | Owner | Readers and writers | Thread | Lifetime | Reset or disposal |
+| --- | --- | --- | --- | --- | --- |
+| The batch's accesses, and each touched resource's native handle | The recorder (`Recorder`) | `transitionResource` advances them; `recordFrame`'s seal reads them for the exit barriers | The graphics owner | One consumer action | Dropped with the recorder |
+| An image's initialization | The model (`Internal.Initialization`) | `createImage` marks it; a first touch claims it; an accepted submission publishes it; a dropped batch or an unknown effect withdraws it | The graphics owner, through the roots' model | The generation's record | Leaves with the record |
 
 ### Destruction
 
@@ -3410,7 +3502,7 @@ companions — and adds the Vulkan owner's:
 | Main thread | Hspec runs on a thread of its own; the process main thread owns one shared production graphics session: `withLoaderIntegration`, then `runGraphicsOwnerApplication` over `withVulkanOwnerHost`, with the production native layer and surface bridge. An example that needs the main thread — to hand a window's surface over, which GLFW creates there, or to close a window — submits an operation (`onMain`); the main thread runs it between two turns of the host's owner loop and returns its result or rethrows its failure. Windows are created through the host's command port from the example's own thread, which the owner loop executes, as an application's worker would. |
 | Identities | Every dispatched operation is checked, before it runs, to be on the bound process main thread that entered the session — the Haskell thread, the bound flag, and the OS thread read through `pthread_self` — and a failed check fails the operation and the run. Every native call the session makes is recorded where it runs by a `NativeObserver`, so an example shows from the calls themselves that the instance, its messenger, the device and every surface's destruction ran on the graphics owner's thread and every surface's creation on the main thread — never from the name of an Hspec hook. |
 | Sharing | The roots — the instance, its explicit messenger, and the one device — are acquired lazily, by the first dispatched operation, at most once, and shared by every later example. Each example's windows and targets are its own and are closed inside it. |
-| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, `vk12-frames`, `vk13-presentation`, `vk14-recovery`, `vk15-validation-stop`, `vk15-retention`, `vk16-composed`, `vk17-one-slot`, `vk17-two-slots`, `vk19-capture`, `grs15-surface-free`, `grs15-surface-free-window`, `synchronization-hazard`, `debug-names`, and, under the isolated compositor's consent only, `wayland-connection-loss`. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. Each child runs in a process group of its own under an external 20-second deadline covering its exit and the end of its output; one still running at it is terminated with its group and fails its example as expired. |
+| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, `vk12-frames`, `vk13-presentation`, `vk14-recovery`, `vk15-validation-stop`, `vk15-retention`, `vk16-composed`, `vk17-one-slot`, `vk17-two-slots`, `vk19-capture`, `grs15-surface-free`, `grs15-surface-free-window`, `grs3-ordering`, `synchronization-hazard`, `debug-names`, and, under the isolated compositor's consent only, `wayland-connection-loss`. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. Each child runs in a process group of its own under an external 20-second deadline covering its exit and the end of its output; one still running at it is terminated with its group and fails its example as expired. |
 | Selection | Building, listing and filtering the tree, a `--dry-run`, and a selection that dispatches nothing acquire nothing and start no child. A selection matching no example fails. `--complete`, which the catalog group passes, runs the whole tree with Hspec's configuration reading left out and then fails unless the shared session was acquired once and every private scenario the run's consent requires ran and passed — every one, except that `wayland-connection-loss` is required under the isolated compositor's consent and pending under any other — so no ambient setting can turn the group's receipt into a pass for a subset. The consent rules and the migrated proof's pure release, construction, publication and loader-selection examples need no session and run without consent. |
 | Consent | Read once, at startup, from `HETOIMASIA_NATIVE_SESSION`, with the GLFW suite's rules for `desktop`, `isolated-x11:<display>` and `isolated-wayland:<socket>`: the last only on Linux, only when `WAYLAND_DISPLAY` names that socket, and never beside a `DISPLAY`. Under the Wayland consent every session requests Wayland by name — the shared host, each child's host, the VK-5 bridge's loader-aware session, and the proof shim's raw initialization, which sets `GLFW_PLATFORM` and fails one that selected another platform — so no X11 or XWayland session stands in; under the others every session requests nothing, as before. The first shared example asserts the platform GLFW selected before any example renders. Without consent every native example is refused before its body, the session is never acquired, and the run ends with the refusal on stderr and a non-zero exit. |
 | Environment | Before any Vulkan call, the suite clears every ambient discovery override and every validation-layer setting it finds and records which, disables implicit layers, and points the layer's settings file at an empty one; a child inherits and re-establishes the same environment. |
@@ -3695,6 +3787,31 @@ the surface was then checked with `vkGetPhysicalDeviceSurfaceSupportKHR`; if
 the target was admitted, with one device created in all; if a presentation
 retired; if the destructions ran surface, device, messenger, instance, with
 every Vulkan call on the owner's thread; and if the verdict is clean.
+
+GRS-3's case, `grs3-ordering`, runs VK-12's roots, generation, recording and
+frames with synchronization validation over one managed `D32_SFLOAT` depth
+target and one vertex buffer. A first frame batch initializes the depth target
+by a transition from undefined and moves the buffer into the copy's use and
+back, writing both; it is submitted and awaited, and its frame closed and
+settled. Then two frames are acquired, and each batch touches the same depth
+target and buffer with no layout change, writing both, the second submitted
+while the first is still outstanding. The writes are the issue's narrowly
+scoped test-only accesses, recorded straight into the batch's command buffer:
+a depth-only dynamic rendering pass that clears and stores the depth target,
+and a `vkCmdFillBuffer` of the buffer; no production attachment, binding or
+upload API is added for them. Between the two later batches' writes stand only
+the first's exit barriers and the second's entry barriers. It passes only if
+the depth target's initialization was published by its batch's submission; if
+each batch recorded exactly the expected entry, transition and exit barriers;
+if the third batch was submitted while the second's submission was
+outstanding; if nothing was left unsettled; and if no step reported a
+validation error and the verdict after the last teardown callback is clean. On
+the pinned layer, measured once by hand with every barrier of the two later
+batches dropped, submit-time synchronization validation reports the buffer's
+write-after-write at the third submission, but nothing for the depth target's
+load-op clear across submissions: for the depth target the case shows the
+barriers recorded and their layouts accepted, not a hazard the layer could
+have seen.
 
 #250's case, `debug-names`, is VK-11's on private roots of its own, with one
 destructive seam only the fixture holds: it wraps the production recording

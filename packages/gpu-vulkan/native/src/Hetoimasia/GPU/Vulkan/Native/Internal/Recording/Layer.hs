@@ -3,7 +3,8 @@
 -- the open record 'RecordingOps', and the vocabulary of commands, layouts and
 -- requests those calls are given — including the engine-defined kinds of
 -- managed buffer and image (GRS-2), and the usage flags and memory usage each
--- kind fixes.
+-- kind fixes; and how each use the GPU model's ordering rules name (GRS-3)
+-- maps onto Vulkan's layouts, stages and accesses.
 --
 -- This module holds no state and makes no call: it is the shape of the layer,
 -- which "Hetoimasia.GPU.Vulkan.Native.Recording.Vulkan" implements over the
@@ -40,6 +41,15 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   , ImageQuery (..)
   , ImageLimits (..)
   , ViewRequest (..)
+
+    -- * Ordering managed resources (GRS-3)
+  , AccessScope (..)
+  , BarrierObject (..)
+  , bufferResourceKind
+  , imageResourceKind
+  , useScope
+  , useLayout
+  , resourceBarrier
   ) where
 
 import Data.Bits (finiteBitSize, countLeadingZeros, (.|.))
@@ -49,6 +59,7 @@ import Data.Text (Text)
 import Data.Word (Word32, Word64)
 import Numeric.Natural (Natural)
 
+import Hetoimasia.GPU.Model.Access (Barrier (..), ResourceKind (..), ResourceUse (..))
 import Hetoimasia.GPU.Vulkan.Native.Allocator (BoundMemory, MemoryUsage (..))
 import Hetoimasia.GPU.Vulkan.Native.Naming (ShaderStage)
 import Hetoimasia.GPU.Vulkan.Native.Presentation (SurfaceExtent)
@@ -118,6 +129,9 @@ data NativeCommand
     -- ^ Open a command-buffer label region with this name.
   | CommandEndLabel
     -- ^ Close the innermost open label region.
+  | CommandResourceBarrier !BarrierObject !AccessScope !AccessScope
+    -- ^ One managed buffer or image, the scope its barrier waits for, and the
+    -- scope it makes ready (GRS-3).
   deriving (Eq, Show)
 
 -- | The shaders of a graphics pipeline, as SPIR-V.
@@ -391,3 +405,109 @@ nativeName = \case
   CommandHostReadBarrier {} → "vkCmdPipelineBarrier2"
   CommandBeginLabel _ → "vkCmdBeginDebugUtilsLabelEXT"
   CommandEndLabel → "vkCmdEndDebugUtilsLabelEXT"
+  CommandResourceBarrier {} → "vkCmdPipelineBarrier2"
+
+-- ---------------------------------------------------------------------------
+-- Ordering managed resources (GRS-3)
+
+-- | The pipeline stages a use covers and the accesses it makes there, as
+-- @VkPipelineStageFlags2@ and @VkAccessFlags2@.
+data AccessScope = AccessScope
+  { scopeStages ∷ !Word64
+  , scopeAccess ∷ !Word64
+  }
+  deriving (Eq, Show)
+
+-- | What one managed resource's barrier covers.
+data BarrierObject
+  = BarrierBuffer !Word64
+    -- ^ The whole buffer.
+  | BarrierImage !Word64 !Word32 !Word32 !Word32 !Word32
+    -- ^ The whole image — its view's aspect and every mip level of its one
+    -- layer — and the @VkImageLayout@ values it leaves and enters.
+  deriving (Eq, Show)
+
+-- | The ordering rules' kind of a managed buffer.
+bufferResourceKind ∷ BufferKind → ResourceKind
+bufferResourceKind = \case
+  VertexBuffer → VertexResource
+  IndexBuffer → IndexResource
+  InstanceBuffer → InstanceResource
+  LookupBuffer → LookupResource
+  StagingBuffer → StagingResource
+
+-- | The ordering rules' kind of a managed image.
+imageResourceKind ∷ ImageKind → ResourceKind
+imageResourceKind = \case
+  TextureImage → TextureResource
+  DepthTarget → DepthTargetResource
+  ColorTarget → ColorTargetResource
+
+-- | The stages and accesses a use of a kind of resource covers: each resting
+-- use as the issue fixes it, and the copies into and out of a resource as the
+-- transfer stage's reads or writes. Host writes into instance, lookup and
+-- staging buffers are made visible by the submission that follows them, so no
+-- scope names the host.
+useScope ∷ ResourceKind → ResourceUse → AccessScope
+useScope kind = \case
+  ShaderSampled → AccessScope stageFragmentShader accessShaderSampledRead
+  DepthAttachment → AccessScope (stageEarlyFragmentTests .|. stageLateFragmentTests) (accessDepthRead .|. accessDepthWrite)
+  ColorAttachment → AccessScope stageColorOutput (accessColorRead .|. accessColorWrite)
+  GeometryRead → AccessScope stageVertexInput (if kind == IndexResource then accessIndexRead else accessVertexRead)
+  InstanceRead →
+    AccessScope (stageVertexInput .|. stageVertexShader .|. stageFragmentShader) (accessVertexRead .|. accessIndexRead .|. accessShaderRead)
+  StorageRead → AccessScope (stageVertexShader .|. stageFragmentShader) accessShaderStorageRead
+  TransferRead → AccessScope stageTransfer accessTransferRead
+  TransferWrite → AccessScope stageTransfer accessTransferWrite
+  where
+    stageVertexInput = 0x00000004
+    stageVertexShader = 0x00000008
+    stageFragmentShader = 0x00000080
+    stageEarlyFragmentTests = 0x00000100
+    stageLateFragmentTests = 0x00000200
+    stageColorOutput = 0x00000400
+    stageTransfer = 0x00001000
+    accessIndexRead = 0x00000002
+    accessVertexRead = 0x00000004
+    accessShaderRead = 0x00000020
+    accessColorRead = 0x00000080
+    accessColorWrite = 0x00000100
+    accessDepthRead = 0x00000200
+    accessDepthWrite = 0x00000400
+    accessTransferRead = 0x00000800
+    accessTransferWrite = 0x00001000
+    accessShaderSampledRead = 0x100000000
+    accessShaderStorageRead = 0x200000000
+
+-- | The @VkImageLayout@ an image is in for a use: none for a use only a
+-- buffer is put to.
+useLayout ∷ ResourceUse → Maybe Word32
+useLayout = \case
+  ShaderSampled → Just 5
+  DepthAttachment → Just 1000241000
+  ColorAttachment → Just 2
+  TransferRead → Just 6
+  TransferWrite → Just 7
+  GeometryRead → Nothing
+  InstanceRead → Nothing
+  StorageRead → Nothing
+
+-- | The native command for one barrier the ordering rules owe, over a buffer,
+-- or over an image with its view's aspect and its mip levels. A barrier that
+-- discards leaves the undefined layout; its first scope is still the use it
+-- waits for.
+resourceBarrier ∷ Word64 → Maybe (Word32, Word32) → Barrier k → NativeCommand
+resourceBarrier handle image barrier =
+  CommandResourceBarrier object (useScope kind (barrierAfter barrier)) (useScope kind (barrierBefore barrier))
+  where
+    kind = barrierKind barrier
+    layout = maybe 0 id . useLayout
+    object = case image of
+      Nothing → BarrierBuffer handle
+      Just (aspect, levels) →
+        BarrierImage
+          handle
+          aspect
+          levels
+          (if barrierDiscards barrier then 0 else layout (barrierAfter barrier))
+          (layout (barrierBefore barrier))

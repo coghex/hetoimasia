@@ -6,6 +6,7 @@
 -- the contract it asserts; this module only composes.
 module Test.GPU.Model.Spec (spec) where
 
+import qualified Test.GPU.Model.Access as Access
 import qualified Test.GPU.Model.Budgets as Budgets
 import qualified Test.GPU.Model.DeviceLoss as DeviceLoss
 import qualified Test.GPU.Model.Frames as Frames
@@ -31,4 +32,5 @@ spec = describe "GPU model" $ do
   Recovery.spec
   Progress.spec
   Sequences.spec
+  Access.spec
   Placement.spec

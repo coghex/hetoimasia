@@ -55,6 +55,11 @@
 --   #336);
 -- * @grs15-surface-free-window@ — the same device start, then a window admitted
 --   against its queue family and presented to (#336);
+-- * @grs3-ordering@ — GRS-3's managed depth target and buffer written by an
+--   initializing batch, then by two batches submitted in order with no
+--   completion wait between and no layout change, ordered only by the
+--   recorder's checked transitions and boundary barriers
+--   ("Test.GPU.Vulkan.Native.Ordering", #335);
 -- * @synchronization-hazard@ — the negative control that proves
 --   synchronization validation active ("Test.GPU.Vulkan.Native.Hazard");
 -- * @debug-names@ — #250's provoked validation report on a named managed
@@ -125,6 +130,7 @@ import qualified Test.GPU.Vulkan.Native.ConnectionLoss as ConnectionLoss
 import qualified Test.GPU.Vulkan.Native.Frames as Frames
 import qualified Test.GPU.Vulkan.Native.Hazard as Hazard
 import qualified Test.GPU.Vulkan.Native.Naming as Naming
+import qualified Test.GPU.Vulkan.Native.Ordering as Ordering
 import qualified Test.GPU.Vulkan.Native.Presentation as Presentation
 import qualified Test.GPU.Vulkan.Native.Recovery as Recovery
 import qualified Test.GPU.Vulkan.Native.Recording as Recording
@@ -291,6 +297,14 @@ scenarios =
       $ \consent journal _ → do
         outcome ← SurfaceFree.runLaterWindow (consentBackend consent) journal
         pure (SurfaceFree.laterWindowSpec outcome, section "The GRS-15 later window record" (SurfaceFree.laterWindowSection outcome))
+  , Scenario
+      "grs3-ordering"
+      "orders a managed depth target and buffer through checked transitions and boundary barriers across two batches submitted in order, with synchronization validation reporting nothing"
+      False
+      Nothing
+      $ \consent journal _ → do
+        outcome ← Ordering.runOrdering (consentBackend consent) journal
+        pure (Ordering.spec outcome, section "The GRS-3 ordering record" (Ordering.orderingSection outcome))
   , Scenario
       "synchronization-hazard"
       "observes a deliberate synchronization hazard, proving synchronization validation active"

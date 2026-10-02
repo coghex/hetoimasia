@@ -20,6 +20,7 @@ import qualified Data.Set as Set
 import Hetoimasia.GPU.Model.Internal.Accounting (editFrame, editHolds, releaseObjects, reservedSubmission, saturatingMinus)
 import Hetoimasia.GPU.Model.Internal.Hold (dischargeRecorded, retainSubmitted)
 import Hetoimasia.GPU.Model.Internal.Identity
+import Hetoimasia.GPU.Model.Internal.Initialization (publishInitialization, withdrawInitialization)
 import Hetoimasia.GPU.Model.Internal.Records
 import Hetoimasia.GPU.Model.Internal.Resolve (resolveFrame, resolveSubmission, targetIdOf)
 import Hetoimasia.GPU.Model.Internal.Scheduling (scheduling, scheduling_)
@@ -107,8 +108,19 @@ submitFrames identities outcome model
                 , Just generation ← [frameGeneration frame]
                 ]
             subjects = Set.unions (rendered : map referenced batches)
+            -- A confirmed submission publishes what its batches initialize;
+            -- one whose effect is unknown publishes nothing, and what its
+            -- batches were initializing awaits initialization again.
+            settled =
+              foldl'
+                ( \current batch → case Map.lookup batch (gpuBatches charged) of
+                    Nothing → current
+                    Just record → (if uncertain then withdrawInitialization else publishInitialization) batch record current
+                )
+                charged
+                batches
             promoted =
-              foldl' (\current key → editHolds key (retainSubmitted submission) current) charged (Set.toList subjects)
+              foldl' (\current key → editHolds key (retainSubmitted submission) current) settled (Set.toList subjects)
             dischargedRefs =
               foldl'
                 ( \current batch →

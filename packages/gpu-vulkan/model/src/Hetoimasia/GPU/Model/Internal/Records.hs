@@ -22,6 +22,7 @@ module Hetoimasia.GPU.Model.Internal.Records
   , Batch (..)
   , Submission (..)
   , Resource (..)
+  , InitializationState (..)
   , SubjectKey (..)
   ) where
 
@@ -188,7 +189,20 @@ data Resource = Resource
   { resourceHolds ∷ !Holds
   , resourceBytes ∷ !Natural
   , resourceObjects ∷ !Natural
+  , resourceInitializationState ∷ !InitializationState
   }
+  deriving (Eq, Show)
+
+-- | Whether a resource generation's contents are usable yet. Only an image
+-- awaits initialization; it advances only on a confirmed submission of the
+-- batch that initializes it, and falls back when that batch is dropped.
+data InitializationState
+  = NoInitialization
+    -- ^ Usable from its creation.
+  | AwaitingInitialization
+  | InitializingBatch !Natural
+    -- ^ The batch, by number, that initializes it, not yet submitted.
+  | InitializationSubmitted
   deriving (Eq, Show)
 
 -- | The internal key of a subject that carries holds.
