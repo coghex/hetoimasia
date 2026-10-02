@@ -121,12 +121,20 @@ data PendingAction
 -- reclaiming managed resources every hold of which has ended.
 nextAction ∷ EvidenceSource → GpuModel → Maybe Natural → Maybe PendingAction
 nextAction source model place = case place of
+  -- The session's own work: frame-less submissions' completions (GRS-12),
+  -- then the managed resources every hold of which has ended.
   Nothing →
     firstOf
-      [ DisposeSubject key
-      | key@(ResourceKey _ _) ← eligibleSubjects model
-      , offered key
+      [ ApplySubmission (SubmissionId (gpuSession model) submission)
+      | SlotSubmitted submission ← Map.elems (gpuFramelessSlots model)
+      , maybe False (not . submissionUncertain) (Map.lookup submission (gpuSubmissions model))
+      , submissionEvidence source (SubmissionId (gpuSession model) submission)
       ]
+      `orElse` firstOf
+        [ DisposeSubject key
+        | key@(ResourceKey _ _) ← eligibleSubjects model
+        , offered key
+        ]
   Just number → case Map.lookup number (gpuTargets model) of
     Nothing → Nothing
     Just target →

@@ -18,7 +18,7 @@ import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust, isNothing)
 import qualified Data.Set as Set
 import Hetoimasia.Foundation.Time (Instant)
-import Hetoimasia.GPU.Model.Internal.Accounting (editFrame, editHolds, editTarget, releaseObjects, settleFrames)
+import Hetoimasia.GPU.Model.Internal.Accounting (editFrame, editHolds, editTarget, freeFramelessSlot, releaseObjects, settleFrames)
 import Hetoimasia.GPU.Model.Internal.Hold (dischargePresentation, dischargeSubmitted)
 import Hetoimasia.GPU.Model.Internal.Identity
 import Hetoimasia.GPU.Model.Internal.Records
@@ -91,8 +91,11 @@ recordCompletion now fact model = observing_ model $ case fact of
           Nothing → Rejected (AlreadyConsumed PresentationIdentity)
           Just pool → Admitted (applySettlement number slot pool frame model)
 
+-- | A submission completed: its holds end, every frame it carried that owes
+-- nothing else is freed, and so is the frame-less slot whose batch it
+-- consumed (GRS-12).
 applySubmission ∷ Instant → Natural → Submission → GpuModel → GpuModel
-applySubmission now number submission model = settleFrames (submissionFrames submission) advanced
+applySubmission now number submission model = freeFramelessSlot number (settleFrames (submissionFrames submission) advanced)
   where
     discharged =
       releaseObjects

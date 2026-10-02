@@ -18,6 +18,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Construction
   , createPipeline
   , replacePipeline
   , createFrameStorage
+  , createFramelessStorage
   , createReadback
   , createBuffer
   , createImage
@@ -96,6 +97,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , ReadbackContents (..)
   , Recording (..)
   , Refusal (..)
+  , StorageOwner (..)
   , destroyNative
   , editManaged
   , isAsynchronous
@@ -112,6 +114,8 @@ import Hetoimasia.GPU.Vulkan.Native.Naming
   , bufferName
   , commandBufferName
   , commandPoolName
+  , framelessBufferName
+  , framelessPoolName
   , imageName
   , ownedViewName
   , pipelineLayoutName
@@ -186,7 +190,7 @@ buildPipeline recording (PipelineLayout layout) shaders format replacing =
 -- any native call.
 createFrameStorage ∷ Recording q inst msgr phys dev cmd → TargetId → Natural → IO (Either Refusal FrameStorage)
 createFrameStorage recording target slot = do
-  existing ← Map.lookup (target, slot) <$> readTVarIO (recordingStorages recording)
+  existing ← Map.lookup (StorageOfFrame target slot) <$> readTVarIO (recordingStorages recording)
   model ← atomically (stateRootsModel (recordingRoots recording) (\current → (current, current)))
   let limit = frameSlotLimit (modelBudgets model)
       unusable = case Model.targetView target model of
@@ -210,10 +214,34 @@ createFrameStorage recording target slot = do
               0
               2
               "vkCreateCommandPool"
-              (\ops device _ _ → (\(pool, commands) → Right (NativeStorage target slot pool commands)) <$> opsCreateStorage ops device queueFamily)
+              (\ops device _ _ → (\(pool, commands) → Right (NativeStorage (StorageOfFrame target slot) pool commands)) <$> opsCreateStorage ops device queueFamily)
               Nothing
-          for_ made (\resource → atomically (modifyTVar' (recordingStorages recording) (Map.insert (target, slot) resource)))
+          for_ made (\resource → atomically (modifyTVar' (recordingStorages recording) (Map.insert (StorageOfFrame target slot) resource)))
           pure (FrameStorage <$> made)
+
+-- | A frame-less slot's command storage (GRS-12), made the first time a
+-- frame-less batch is opened in the slot and reused, like a frame slot's, by
+-- every later batch of that slot. It is named, released and destroyed like a
+-- frame storage. A slot has at most one.
+createFramelessStorage ∷ Recording q inst msgr phys dev cmd → Natural → IO (Either Refusal FrameStorage)
+createFramelessStorage recording slot =
+  owned recording $ do
+    existing ← Map.lookup (StorageOfFrameless slot) <$> readTVarIO (recordingStorages recording)
+    family ← fmap (planQueueFamily . fst) <$> atomically (readRootsDevice (recordingRoots recording))
+    case (existing, family) of
+      (Just _, _) → pure (Left (RefusedMisuse (DuplicateSubject BatchIdentity)))
+      (_, Nothing) → pure (Left RefusedDeviceAbsent)
+      (Nothing, Just queueFamily) → do
+        made ←
+          construct
+            recording
+            0
+            2
+            "vkCreateCommandPool"
+            (\ops device _ _ → (\(pool, commands) → Right (NativeStorage (StorageOfFrameless slot) pool commands)) <$> opsCreateStorage ops device queueFamily)
+            Nothing
+        for_ made (\resource → atomically (modifyTVar' (recordingStorages recording) (Map.insert (StorageOfFrameless slot) resource)))
+        pure (FrameStorage <$> made)
 
 -- | A readback buffer of this many bytes, its memory from the device's
 -- allocator under the readback usage — host-visible, cached where the device
@@ -536,9 +564,13 @@ managedNames ∷ Recording q inst msgr phys dev cmd → ResourceId → NativeRes
 managedNames recording resource = \case
   NativeLayout handle → [(ObjectPipelineLayout, handle, pipelineLayoutName resource)]
   NativePipeline handle _ _ → [(ObjectPipeline, handle, pipelineName resource)]
-  NativeStorage target slot pool commands →
+  NativeStorage (StorageOfFrame target slot) pool commands →
     [ (ObjectCommandPool, pool, commandPoolName resource target slot)
     , (ObjectCommandBuffer, opsCommandBufferHandle (recordingOps recording) commands, commandBufferName resource target slot)
+    ]
+  NativeStorage (StorageOfFrameless slot) pool commands →
+    [ (ObjectCommandPool, pool, framelessPoolName resource slot)
+    , (ObjectCommandBuffer, opsCommandBufferHandle (recordingOps recording) commands, framelessBufferName resource slot)
     ]
   NativeReadback allocation _ → [(ObjectBuffer, allocationBuffer allocation, readbackBufferName resource)]
   NativeBuffer _ _ allocated → [(ObjectBuffer, memoryResource (allocatedMemory allocated), bufferName resource)]

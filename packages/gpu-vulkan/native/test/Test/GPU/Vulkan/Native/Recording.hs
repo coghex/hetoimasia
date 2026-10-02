@@ -1514,7 +1514,7 @@ spec = describe "Recording" $ do
       -- Submitted, not completed: initialized, and the other batch may use it.
       _ ← submitInModel rig first
       initializationOf rig resource `shouldReturn` Just Initialized
-      [other] ← map viewBatch . filter ((== second) . viewBatchFrame) <$> atomically (readBatches (rigRecording rig))
+      [other] ← map viewBatch . filter ((== Just second) . viewBatchFrame) <$> atomically (readBatches (rigRecording rig))
       ok (discardBatch (rigRecording rig) other)
       _ ← recorded rig second $ \recorder → ok (transitionResource recorder image (FromUse ColorAttachment) TransferRead) >> ok (transitionResource recorder image (FromUse TransferRead) ColorAttachment)
       pure ()

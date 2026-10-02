@@ -112,6 +112,12 @@ module Hetoimasia.GPU.Model
   , acquireImage
   , recordBatch
   , extendBatch
+
+    -- * Frame-less batches (GRS-12)
+  , openFramelessBatch
+  , submitFramelessBatch
+  , FramelessView (..)
+  , framelessSlots
   , discardBatch
   , resetRecorder
   , resetSubmissionFence
@@ -207,9 +213,11 @@ import Hetoimasia.GPU.Model.Internal.Observation
   , HoldView (..)
   , TargetView (..)
   , Usage (..)
+  , FramelessView (..)
   , disposalEligible
   , frameView
   , holdView
+  , framelessSlots
   , liveRecordCount
   , presentationImage
   , targetView
@@ -224,7 +232,7 @@ import Hetoimasia.GPU.Model.Internal.Presentation
   )
 import Hetoimasia.GPU.Model.Internal.Progress (NextTurn (..), TurnReport (..), nextDeadline, progressDeadline, runProgressTurn)
 import Hetoimasia.GPU.Model.Internal.Records (FramePhase (..), GenerationPhase (..), TargetPhase (..))
-import Hetoimasia.GPU.Model.Internal.Recording (discardBatch, extendBatch, recordBatch, resetRecorder)
+import Hetoimasia.GPU.Model.Internal.Recording (discardBatch, extendBatch, openFramelessBatch, recordBatch, resetRecorder)
 import Hetoimasia.GPU.Model.Internal.Resources
   ( abandonAllocation
   , beginAllocation
@@ -265,6 +273,7 @@ import Hetoimasia.GPU.Model.Internal.Submission
   , resetSubmissionFence
   , submissionCarries
   , submitFrames
+  , submitFramelessBatch
   )
 import Hetoimasia.GPU.Model.Internal.TargetRecovery
   ( RecoveryAnswer (..)

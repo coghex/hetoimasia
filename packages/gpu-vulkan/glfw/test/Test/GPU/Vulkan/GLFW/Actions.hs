@@ -36,6 +36,9 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , PipelineLayout
   , PipelineShaders (..)
   , Refusal
+  , TicketState (..)
+  , awaitTicket
+  , readTicket
   )
 import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost (..), GraphicsSessionFailed (..), RootStanding (..), RootsView (..), TerminalCause (..))
 import Hetoimasia.Runtime.GLFW
@@ -76,6 +79,10 @@ spec = describe "Vulkan surface-free sessions and owner-thread actions" $ do
     it "are refused once the owner's exit begins, including one queued behind a running action, which finishes" (bounded testExitRefusal)
     it "never run beside a frame's rendering: a frame asked for meanwhile follows the action" (bounded testSerialization)
     it "create a buffer and an image of every kind through the lent construction on the owner's thread, and release them for the owner to destroy, each view before its image" (bounded testBuffersAndImages)
+
+  describe "frame-less batches (GRS-12)" $ do
+    it "are recorded inside an action with no target, submitted in seal order when it returns, and complete their tickets only on fence evidence, waited on with a deadline" (bounded testFramelessBatches)
+    it "are discarded when their action raises, submitting nothing" (bounded testFramelessRaising)
 
   describe "zero-target progress" $ do
     it "disposes of a released resource with no target, recording no frame, before the host exits" (bounded testZeroTargetDisposal)
@@ -398,6 +405,59 @@ testBuffersAndImages = do
 
 -- ---------------------------------------------------------------------------
 -- Zero-target progress
+
+-- | Two frame-less batches recorded in one action with no target, submitted
+-- when it returns — the inner one, sealed first, first — and their tickets
+-- pending, under a deadline that passes, until the fences answer signalled,
+-- and complete only once the owner's own progress has observed that.
+testFramelessBatches ∷ IO ()
+testFramelessBatches = do
+  rig ← surfaceFreeRig 0
+  submissionsComplete rig False
+  (tickets, pending, complete, submitted, recorded) ← runRig rig $ \host _ → do
+    awaitReady host
+    tickets ← returned =<< act host (VulkanAction (\construction → nested construction))
+    submitted ← (\events → [handle | QueueSubmitted handle ← events]) <$> journal rig
+    pending ← mapM (\ticket → awaitTicket ticket (millisecondsOf 1)) tickets
+    submissionsComplete rig True
+    complete ← mapM (\ticket → awaitTicket ticket (millisecondsOf 30000)) tickets
+    recorded ← commandsRecorded rig
+    pure (tickets, pending, complete, submitted, recorded)
+  length tickets `shouldBe` 2
+  pending `shouldBe` [Right TicketPending, Right TicketPending]
+  complete `shouldBe` [Right TicketComplete, Right TicketComplete]
+  length submitted `shouldBe` 2
+  -- Nothing but the two empty batches was recorded, and no image acquired.
+  recorded `shouldBe` []
+  events ← journal rig
+  [() | ImageAcquired {} ← events] `shouldBe` []
+  Just verdict ← readTVarIO (rigVerdict rig)
+  verdictIssues verdict `shouldBe` []
+  where
+    nested construction =
+      constructFramelessBatch construction (\_ → constructFramelessBatch construction (\_ → pure ())) >>= \case
+        Right (outer, Right (inner, ())) → pure [inner, outer]
+        other → failWith ("the frame-less batches were refused: " <> show (fmap (fmap (fmap fst)) other))
+
+-- | An action that seals a frame-less batch and then raises submits nothing:
+-- the batch is discarded, and its ticket says so.
+testFramelessRaising ∷ IO ()
+testFramelessRaising = do
+  rig ← surfaceFreeRig 0
+  (outcome, ticket) ← runRig rig $ \host _ → do
+    awaitReady host
+    held ← newTVarIO Nothing
+    outcome ← act host (VulkanAction (\construction → do
+      constructFramelessBatch construction (\_ → pure ()) >>= \case
+        Right (ticket, ()) → atomically (writeTVar held (Just ticket))
+        Left refusal → failWith (show refusal)
+      throwIO (userError "the action failed")))
+    ticket ← readTVarIO held >>= maybe (failWith "no batch was recorded") pure
+    pure (outcome, ticket)
+  either (const True) (const False) (outcomeValue (outcome ∷ ActionOutcome ())) `shouldBe` True
+  atomically (readTicket ticket) >>= (`shouldBe` TicketDiscarded)
+  events ← journal rig
+  [handle | QueueSubmitted handle ← events] `shouldBe` []
 
 testZeroTargetDisposal ∷ IO ()
 testZeroTargetDisposal = do

@@ -82,7 +82,7 @@ skipFrame frames frame =
       Left refusal → pure (Left refusal)
       Right (sync, device, family) → do
         batches ← Map.elems <$> readTVarIO (recordingBatches recording)
-        let unsubmitted = [() | record ← batches, batchFrame record == frame, not (submitted (batchStanding record))]
+        let unsubmitted = [() | record ← batches, batchFrame record == Just frame, not (submitted (batchStanding record))]
         -- After the device's loss nothing is reset against it: the model's
         -- skip lets go of the unsubmitted recording, whose records go with it.
         lost ← atomically (lossObserved frames)

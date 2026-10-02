@@ -21,6 +21,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Recorder
   ( Recorder
   , recorderBatch
   , recordFrame
+  , recordFrameless
   , transitionImage
   , transitionResource
   , beginRendering
@@ -33,11 +34,12 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Recorder
   , readbackBytesFor
   ) where
 
-import Control.Concurrent.STM (STM, atomically, modifyTVar', readTVar)
+import Control.Concurrent.STM (STM, atomically, modifyTVar', readTVar, readTVarIO)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, displayException, mask, mask_, rethrowIO, tryWithContext)
 import Control.Applicative ((<|>))
 import Control.Monad (when)
 import Data.Bits ((.&.))
+import Data.ByteString (ByteString)
 import Data.Foldable (for_)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import qualified Data.Map.Strict as Map
@@ -56,6 +58,9 @@ import Hetoimasia.GPU.Model
   , Outcome (..)
   , enterResource
   , extendBatch
+  , framelessSlots
+  , modelBudgets
+  , openFramelessBatch
   , frameView
   , holdView
   , recordBatch
@@ -75,7 +80,8 @@ import Hetoimasia.GPU.Model.Identity
   , imageIndex
   )
 import Hetoimasia.GPU.Vulkan.Native.Generations (GenerationView (..), TargetGenerationsView (..), readTargetGenerations)
-import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Batches (retireCompleted)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Batches (retireCompleted, retireCompletedOn)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Construction (createFramelessStorage)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   ( ClearColor
   , ImageLayout (..)
@@ -91,6 +97,8 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   ( BatchRecord (..)
   , BatchStanding (..)
+  , BatchTicket (..)
+  , FrameStorage (..)
   , Managed (managedResource)
   , ManagedRecord (..)
   , ManagedStanding (..)
@@ -101,17 +109,20 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , ReadbackContents (..)
   , Recording (..)
   , Refusal (..)
+  , StorageOwner (..)
   , editBatch
   , editManaged
   , isAsynchronous
   , liveNative
+  , newTicket
   , checkpointed
   , modelAnswer
   , orderedObject
   , owned
   , tshow
   )
-import Hetoimasia.GPU.Vulkan.Native.Naming (batchLabel, passLabel)
+import Hetoimasia.GPU.Model.Budget (BudgetKind (FramelessBatchBudget), framelessBatchLimit)
+import Hetoimasia.GPU.Vulkan.Native.Naming (batchLabel, framelessBatchLabel, passLabel)
 import Hetoimasia.GPU.Vulkan.Native.Presentation (GenerationPlan (..), SurfaceExtent (..), SurfaceFormat (..), imageUsageTransferSource)
 import Hetoimasia.GPU.Vulkan.Native.Roots (Roots, readRootsInstrumentation, rootsCall, stateRootsModel)
 
@@ -148,7 +159,9 @@ data Recorder q inst msgr phys dev cmd = Recorder
   , recorderBatch ∷ !BatchId
     -- ^ The batch this recorder records into.
   , recorderCommands ∷ !cmd
-  , recorderFrame ∷ !FrameImage
+  , recorderFrame ∷ !(Maybe FrameImage)
+    -- ^ The frame's image, or 'Nothing' for a frame-less batch, which has no
+    -- swapchain image and refuses every command that needs one.
   , recorderOpen ∷ !(IORef Bool)
   , recorderState ∷ !(IORef RecorderState)
   , recorderLabelled ∷ !Bool
@@ -187,95 +200,185 @@ recordFrame recording frame consumer =
             admitted ← atomically $ do
               answer ← modelAnswer roots (recordBatch frame [storage])
               for_ answer $ \batch →
-                modifyTVar' (recordingBatches recording) (Map.insert batch (BatchRecord frame storage BatchRecording 0 []))
+                modifyTVar' (recordingBatches recording) (Map.insert batch (BatchRecord (Just frame) Nothing storage BatchRecording 0 []))
               pure answer
             case admitted of
               Left refusal → pure (Left refusal)
-              Right batch → do
-                opened ← newIORef True
-                state ← newIORef (RecorderState LayoutUndefined False Nothing False False emptyAccess Map.empty)
-                labelled ← isJust <$> readRootsInstrumentation roots
-                labels ← newIORef 0
-                let recorder = Recorder recording batch commands image opened state labelled labels
-                    partial reason = atomically (editBatch recording batch (\entry → entry {batchStanding = BatchPartial reason}))
-                    recording' = atomically (fmap batchStanding . Map.lookup batch <$> readTVar (recordingBatches recording))
-                    -- Close every open label. One whose closing raised leaves
-                    -- the batch partial, and its failure is answered, not
-                    -- raised, so the caller keeps the failure it already has.
-                    balance =
-                      balanceLabels recorder >>= \case
-                        Right () → pure Nothing
-                        Left failure@(ExceptionWithContext _ exception) → do
-                          partial ("the batch's labels could not be balanced: " <> Text.pack (displayException exception))
-                          pure (Just failure)
-                began ← tryWithContext @SomeException (rootsCall roots "vkBeginCommandBuffer" (opsBeginCommands (recordingOps recording) commands))
-                case began of
-                  Left failure@(ExceptionWithContext _ exception) → do
-                    writeIORef opened False
-                    partial ("beginning the command buffer raised: " <> Text.pack (displayException exception))
-                    rethrowIO failure
-                  Right () → do
-                    opening ←
-                      if labelled
-                        then tryWithContext @SomeException (recordLabel recorder (CommandBeginLabel (batchLabel batch (frameImageGeneration image))))
-                        else pure (Right ())
-                    ran ← case opening of
-                      Left failure → pure (Left failure)
-                      Right () → tryWithContext @SomeException (restore (consumer recorder))
-                    writeIORef opened False
-                    case ran of
-                      Left failure@(ExceptionWithContext _ exception) → do
-                        -- A command that failed has already said why the batch
-                        -- is partial; that reason stands.
-                        standing ← recording'
-                        when (standing == Just BatchRecording) $
-                          partial
-                            ( (if isAsynchronous exception then "a cancellation ended the consumer: " else "the consumer raised: ")
-                                <> Text.pack (displayException exception)
-                            )
-                        _ ← balance
-                        rethrowIO failure
-                      Right value → do
-                        rendering ← stateRendering <$> readIORef state
-                        standing ← recording'
-                        if standing /= Just BatchRecording
-                          then do
-                            _ ← balance
-                            pure (Left (RefusedIllegal "a command failed during recording, so the batch was not sealed"))
-                          else if rendering
-                          then do
-                            partial "the consumer left rendering open"
-                            _ ← balance
-                            pure (Left (RefusedIllegal "the consumer left rendering open, so the batch was not sealed"))
-                          else do
-                            ended ← readIORef state
-                            case Access.sealAccess (stateAccess ended) of
-                              Left refusal → do
-                                let reason = describeAccess refusal
-                                partial ("the consumer left " <> reason)
-                                _ ← balance
-                                pure (Left (RefusedIllegal ("the consumer left " <> reason <> ", so the batch was not sealed")))
-                              -- The exit barriers, inside the batch's label:
-                              -- one that raised leaves the batch partial, as
-                              -- any command's failure does, and is raised once
-                              -- the labels are balanced.
-                              Right exits →
-                                tryWithContext @SomeException (for_ (exitBarriers (stateObjects ended) exits) (recordLabel recorder)) >>= \case
-                                  Left failure → balance >> rethrowIO failure
-                                  Right () →
-                                    balance >>= \case
-                                      Just failure → rethrowIO failure
-                                      Nothing →
-                                        tryWithContext @SomeException (rootsCall roots "vkEndCommandBuffer" (opsEndCommands (recordingOps recording) commands)) >>= \case
-                                          Left failure@(ExceptionWithContext _ exception) → do
-                                            partial ("ending the command buffer raised: " <> Text.pack (displayException exception))
-                                            rethrowIO failure
-                                          Right () → do
-                                            atomically (editBatch recording batch (\entry → entry {batchStanding = BatchSealed}))
-                                            pure (Right (batch, value))
+              Right batch → recordAdmitted recording batch commands (Just image) (batchLabel batch (frameImageGeneration image)) restore consumer
   where
     roots = recordingRoots recording
 
+
+-- | Record one frame-less batch (GRS-12): a batch that belongs to no frame,
+-- with no swapchain image, recorded with the same commands and checks as a
+-- frame's — #335's transitions and boundary barriers included — into the
+-- command storage of the lowest free frame-less slot.
+--
+-- Before anything native is recorded the slot needs a live storage — made
+-- the first time it is used, and reset of a batch whose submission has
+-- completed before it is used again — and the model must admit the batch,
+-- which counts the slot against the frame-less batch budget, reserves its
+-- objects and retains the storage. A refusal there opens nothing. Once the
+-- model has admitted it, the batch is announced to the caller with its
+-- ticket, before the consumer runs, so whatever becomes of it — sealed,
+-- partial or raised — the caller can submit or discard it. It is sealed, or
+-- left partial and owned, exactly as a frame's batch is; it is submitted only
+-- by its owner's frame-less submission, and never with a frame.
+recordFrameless
+  ∷ Recording q inst msgr phys dev cmd
+  → (BatchTicket → IO ())
+  → (Recorder q inst msgr phys dev cmd → IO a)
+  → IO (Either Refusal (BatchTicket, a))
+recordFrameless recording announce consumer =
+  owned recording . checkpointed recording $ do
+    model ← atomically (stateRootsModel roots (\current → (current, current)))
+    let limit = framelessBatchLimit (modelBudgets model)
+        taken = map fst (framelessSlots model)
+    case [slot | slot ← [0 .. limit - 1], slot `notElem` taken] of
+      [] → pure (Left (RefusedBackpressure FramelessBatchBudget))
+      slot : _ →
+        storageFor slot >>= \case
+          Left refusal → pure (Left refusal)
+          Right (storage, commands) → mask $ \restore → do
+            admitted ← atomically $ do
+              answer ← modelAnswer roots (openFramelessBatch [storage])
+              case answer of
+                Left refusal → pure (Left refusal)
+                Right (batch, opened)
+                  -- One owner decides every opening, so the model takes the
+                  -- slot found free above.
+                  | opened /= slot → pure (Left (RefusedIllegal "the model opened another frame-less slot than the one prepared"))
+                  | otherwise → do
+                      ticket ← newTicket
+                      modifyTVar' (recordingBatches recording) (Map.insert batch (BatchRecord Nothing (Just ticket) storage BatchRecording 0 []))
+                      pure (Right (BatchTicket batch ticket (recordingOwner recording)))
+            case admitted of
+              Left refusal → pure (Left refusal)
+              Right ticket → do
+                announce ticket
+                fmap (\(_, value) → (ticket, value)) <$> recordAdmitted recording (ticketBatch ticket) commands Nothing (framelessBatchLabel (ticketBatch ticket)) restore consumer
+  where
+    roots = recordingRoots recording
+    -- The slot's live storage, made if it has none, and reset of a batch
+    -- whose submission completed.
+    storageFor slot = do
+      existing ← Map.lookup (StorageOfFrameless slot) <$> readTVarIO (recordingStorages recording)
+      made ← case existing of
+        Just resource → pure (Right resource)
+        Nothing → fmap (\(FrameStorage resource) → resource) <$> createFramelessStorage recording slot
+      case made of
+        Left refusal → pure (Left refusal)
+        Right resource →
+          retireCompletedOn recording (StorageOfFrameless slot) >>= \case
+            Left refusal → pure (Left refusal)
+            Right () → atomically $ do
+              managed ← readTVar (recordingManaged recording)
+              batches ← readTVar (recordingBatches recording)
+              pure $ case Map.lookup resource managed of
+                Just (ManagedRecord (NativeStorage _ _ commands) ManagedLive)
+                  | any ((== resource) . batchStorage) (Map.elems batches) → Left (RefusedMisuse (DuplicateSubject BatchIdentity))
+                  | otherwise → Right (resource, commands)
+                _ → Left RefusedNoStorage
+
+-- | Run one admitted batch's recording: begin its command buffer and label
+-- it, run the consumer exactly once with a recorder that is closed when it
+-- returns or raises, and seal the batch — recording the exit barriers it
+-- owes — or leave it partial and owned, re-raising whatever the consumer
+-- raised. A frame batch has its frame's image; a frame-less one has none.
+recordAdmitted
+  ∷ Recording q inst msgr phys dev cmd
+  → BatchId
+  → cmd
+  → Maybe FrameImage
+  → ByteString
+  → (∀ b. IO b → IO b)
+  → (Recorder q inst msgr phys dev cmd → IO a)
+  → IO (Either Refusal (BatchId, a))
+recordAdmitted recording batch commands image label restore consumer = do
+  opened ← newIORef True
+  state ← newIORef (RecorderState LayoutUndefined False Nothing False False emptyAccess Map.empty)
+  labelled ← isJust <$> readRootsInstrumentation roots
+  labels ← newIORef 0
+  let recorder = Recorder recording batch commands image opened state labelled labels
+      partial reason = atomically (editBatch recording batch (\entry → entry {batchStanding = BatchPartial reason}))
+      recording' = atomically (fmap batchStanding . Map.lookup batch <$> readTVar (recordingBatches recording))
+      -- Close every open label. One whose closing raised leaves
+      -- the batch partial, and its failure is answered, not
+      -- raised, so the caller keeps the failure it already has.
+      balance =
+        balanceLabels recorder >>= \case
+          Right () → pure Nothing
+          Left failure@(ExceptionWithContext _ exception) → do
+            partial ("the batch's labels could not be balanced: " <> Text.pack (displayException exception))
+            pure (Just failure)
+  began ← tryWithContext @SomeException (rootsCall roots "vkBeginCommandBuffer" (opsBeginCommands (recordingOps recording) commands))
+  case began of
+    Left failure@(ExceptionWithContext _ exception) → do
+      writeIORef opened False
+      partial ("beginning the command buffer raised: " <> Text.pack (displayException exception))
+      rethrowIO failure
+    Right () → do
+      opening ←
+        if labelled
+          then tryWithContext @SomeException (recordLabel recorder (CommandBeginLabel label))
+          else pure (Right ())
+      ran ← case opening of
+        Left failure → pure (Left failure)
+        Right () → tryWithContext @SomeException (restore (consumer recorder))
+      writeIORef opened False
+      case ran of
+        Left failure@(ExceptionWithContext _ exception) → do
+          -- A command that failed has already said why the batch
+          -- is partial; that reason stands.
+          standing ← recording'
+          when (standing == Just BatchRecording) $
+            partial
+              ( (if isAsynchronous exception then "a cancellation ended the consumer: " else "the consumer raised: ")
+                  <> Text.pack (displayException exception)
+              )
+          _ ← balance
+          rethrowIO failure
+        Right value → do
+          rendering ← stateRendering <$> readIORef state
+          standing ← recording'
+          if standing /= Just BatchRecording
+            then do
+              _ ← balance
+              pure (Left (RefusedIllegal "a command failed during recording, so the batch was not sealed"))
+            else if rendering
+            then do
+              partial "the consumer left rendering open"
+              _ ← balance
+              pure (Left (RefusedIllegal "the consumer left rendering open, so the batch was not sealed"))
+            else do
+              ended ← readIORef state
+              case Access.sealAccess (stateAccess ended) of
+                Left refusal → do
+                  let reason = describeAccess refusal
+                  partial ("the consumer left " <> reason)
+                  _ ← balance
+                  pure (Left (RefusedIllegal ("the consumer left " <> reason <> ", so the batch was not sealed")))
+                -- The exit barriers, inside the batch's label:
+                -- one that raised leaves the batch partial, as
+                -- any command's failure does, and is raised once
+                -- the labels are balanced.
+                Right exits →
+                  tryWithContext @SomeException (for_ (exitBarriers (stateObjects ended) exits) (recordLabel recorder)) >>= \case
+                    Left failure → balance >> rethrowIO failure
+                    Right () →
+                      balance >>= \case
+                        Just failure → rethrowIO failure
+                        Nothing →
+                          tryWithContext @SomeException (rootsCall roots "vkEndCommandBuffer" (opsEndCommands (recordingOps recording) commands)) >>= \case
+                            Left failure@(ExceptionWithContext _ exception) → do
+                              partial ("ending the command buffer raised: " <> Text.pack (displayException exception))
+                              rethrowIO failure
+                            Right () → do
+                              atomically (editBatch recording batch (\entry → entry {batchStanding = BatchSealed}))
+                              pure (Right (batch, value))
+
+  where
+    roots = recordingRoots recording
 
 -- | Whether the model holds this frame acquired: its identity resolves —
 -- this session's, this slot's current use — and it has an image. Any other
@@ -308,9 +411,9 @@ checkFrame recording frame = atomically $ do
             batches ← readTVar (recordingBatches recording)
             generations ← readTargetGenerations (recordingGenerations recording) (generationTarget (imageGeneration image))
             let located = do
-                  storage ← maybe (Left RefusedNoStorage) Right (Map.lookup (frameTarget frame, frameSlotNumber frame) storages)
+                  storage ← maybe (Left RefusedNoStorage) Right (Map.lookup (StorageOfFrame (frameTarget frame) (frameSlotNumber frame)) storages)
                   commands ← case Map.lookup storage managed of
-                    Just (ManagedRecord (NativeStorage _ _ _ commands) ManagedLive) → Right commands
+                    Just (ManagedRecord (NativeStorage _ _ commands) ManagedLive) → Right commands
                     _ → Left RefusedNoStorage
                   -- One storage, one outstanding batch: the slot's previous
                   -- batch must be discarded or reset first.
@@ -337,6 +440,13 @@ checkFrame recording frame = atomically $ do
     nth index list = case drop index list of
       entry : _ | index >= 0 → Just entry
       _ → Nothing
+
+-- | Run a command that needs the frame's swapchain image, which a frame-less
+-- batch has not: refused there before anything else is asked.
+withImage ∷ Recorder q inst msgr phys dev cmd → (FrameImage → IO (Either Refusal a)) → IO (Either Refusal a)
+withImage recorder continue = case recorderFrame recorder of
+  Nothing → pure (Left (RefusedUnsupported "a command that needs a swapchain image, in a frame-less batch"))
+  Just image → continue image
 
 -- | Run one command: check the recorder is open and on the owner's thread,
 -- decide the command against the recorder's state and the handles it names,
@@ -455,14 +565,14 @@ balanceLabels recorder =
 -- transitions 'supportedTransition' names are supported, and none inside
 -- rendering.
 transitionImage ∷ Recorder q inst msgr phys dev cmd → ImageLayout → ImageLayout → IO (Either Refusal ())
-transitionImage recorder from to = command recorder $ \state →
+transitionImage recorder from to = withImage recorder $ \image → command recorder $ \state →
   if not (supportedTransition from to)
     then Left (RefusedUnsupported ("the image transition " <> tshow from <> " to " <> tshow to))
     else
       -- The transfer-source layout is valid only for an image created as a
       -- transfer source, which only a generation built for a verification
       -- capture makes.
-      if LayoutTransferSource `elem` [from, to] && not (frameImageCapturable (recorderFrame recorder))
+      if LayoutTransferSource `elem` [from, to] && not (frameImageCapturable image)
         then Left (RefusedUnsupported "a transfer-source transition of an image its generation did not make a transfer source")
         else
       if stateRendering state
@@ -470,7 +580,7 @@ transitionImage recorder from to = command recorder $ \state →
         else
           if stateLayout state /= from
             then Left (RefusedIllegal ("the image is " <> tshow (stateLayout state) <> ", not " <> tshow from))
-            else Right (state {stateLayout = to}, [], CommandImageBarrier (frameImageHandle (recorderFrame recorder)) from to)
+            else Right (state {stateLayout = to}, [], CommandImageBarrier (frameImageHandle image) from to)
 
 -- | Move a managed buffer or image from one use to another within the batch
 -- (GRS-3): from the use the batch left it in, or from undefined contents,
@@ -541,20 +651,19 @@ describeAccess = \case
 -- color, across the whole extent. The image must be a color attachment. On a
 -- labelled batch the pass's label opens first.
 beginRendering ∷ Recorder q inst msgr phys dev cmd → ClearColor → IO (Either Refusal ())
-beginRendering recorder clear = commandSequence recorder $ \state →
+beginRendering recorder clear = withImage recorder $ \frame → commandSequence recorder $ \state →
   if stateRendering state
     then Left (RefusedIllegal "rendering has already begun")
     else
       if stateLayout state /= LayoutColorAttachment
         then Left (RefusedIllegal ("rendering into an image that is " <> tshow (stateLayout state)))
         else
-          let frame = recorderFrame recorder
-           in Right
-                ( state {stateRendering = True}
-                , []
-                , [CommandBeginLabel (passLabel (recorderBatch recorder) (frameImageGeneration frame)) | recorderLabelled recorder]
-                    <> [CommandBeginRendering (frameImageView frame) (frameImageExtent frame) clear]
-                )
+          Right
+            ( state {stateRendering = True}
+            , []
+            , [CommandBeginLabel (passLabel (recorderBatch recorder) (frameImageGeneration frame)) | recorderLabelled recorder]
+                <> [CommandBeginRendering (frameImageView frame) (frameImageExtent frame) clear]
+            )
 
 -- | End dynamic rendering. On a labelled batch the pass's label closes after it.
 endRendering ∷ Recorder q inst msgr phys dev cmd → IO (Either Refusal ())
@@ -567,11 +676,11 @@ endRendering recorder = commandSequence recorder $ \state →
 -- retains the pipeline's generation and, transitively, its layout's.
 bindPipeline ∷ Recorder q inst msgr phys dev cmd → Pipeline → IO (Either Refusal ())
 bindPipeline recorder (Pipeline pipeline) =
-  liveNative (recorderRecording recorder) pipeline >>= \case
+  withImage recorder $ \image → liveNative (recorderRecording recorder) pipeline >>= \case
     Left refusal → pure (Left refusal)
     Right (NativePipeline handle layout format)
-      | format /= frameImageFormat (recorderFrame recorder) →
-          pure (Left (RefusedIncompatible ("a pipeline for format " <> tshow format <> " and an image of format " <> tshow (frameImageFormat (recorderFrame recorder)))))
+      | format /= frameImageFormat image →
+          pure (Left (RefusedIncompatible ("a pipeline for format " <> tshow format <> " and an image of format " <> tshow (frameImageFormat image))))
       | otherwise → command recorder $ \state →
           Right (state {statePipeline = Just pipeline}, [pipeline, layout], CommandBindPipeline handle)
     Right _ → pure (Left RefusedWrongKind)
@@ -580,8 +689,8 @@ bindPipeline recorder (Pipeline pipeline) =
 -- frame's image — which Vulkan guarantees is within every device's viewport
 -- dimension and bounds limits, so no device limit needs reading here.
 setViewport ∷ Recorder q inst msgr phys dev cmd → Viewport → IO (Either Refusal ())
-setViewport recorder viewport = command recorder $ \state →
-  let extent = frameImageExtent (recorderFrame recorder)
+setViewport recorder viewport = withImage recorder $ \image → command recorder $ \state →
+  let extent = frameImageExtent image
       values = [viewportX viewport, viewportY viewport, viewportWidth viewport, viewportHeight viewport]
    in if any (\value → isNaN value || isInfinite value) values
         then Left (RefusedIllegal "a viewport that is not finite")
@@ -599,8 +708,8 @@ setViewport recorder viewport = command recorder $ \state →
 -- | Set the scissor, which must lie within the frame's image, so its offset
 -- and extent never overflow.
 setScissor ∷ Recorder q inst msgr phys dev cmd → Rect → IO (Either Refusal ())
-setScissor recorder rect = command recorder $ \state →
-  let extent = frameImageExtent (recorderFrame recorder)
+setScissor recorder rect = withImage recorder $ \image → command recorder $ \state →
+  let extent = frameImageExtent image
       reach offset size = toInteger offset + toInteger size
    in if rectX rect < 0 || rectY rect < 0
         then Left (RefusedIllegal "a scissor with a negative offset")
@@ -643,11 +752,10 @@ readbackBytesFor extent = fromIntegral (extentWidth extent) * fromIntegral (exte
 -- are undefined until that batch's submission has completed.
 copyToReadback ∷ Recorder q inst msgr phys dev cmd → Readback → IO (Either Refusal ())
 copyToReadback recorder (Readback readback) =
-  liveNative recording readback >>= \case
+  withImage recorder $ \frame → liveNative recording readback >>= \case
     Left refusal → pure (Left refusal)
     Right (NativeReadback allocation _) → do
-      let frame = recorderFrame recorder
-          needed = readbackBytesFor (frameImageExtent frame)
+      let needed = readbackBytesFor (frameImageExtent frame)
           unfit
             | not (frameImageCapturable frame) = Just (RefusedUnsupported "a copy from an image its generation did not make a transfer source")
             | needed > allocationSize allocation = Just (RefusedOutOfBounds needed (allocationSize allocation))

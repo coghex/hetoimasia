@@ -20,6 +20,8 @@ module Hetoimasia.GPU.Model.Internal.Records
   , Target (..)
   , Cycle (..)
   , Batch (..)
+  , BatchOwner (..)
+  , FramelessSlot (..)
   , Submission (..)
   , Resource (..)
   , InitializationState (..)
@@ -169,10 +171,30 @@ data Cycle = Cycle
   deriving (Eq, Show)
 
 data Batch = Batch
-  { batchTargetNumber ∷ !Natural
-  , batchSlot ∷ !Natural
+  { batchOwner ∷ !BatchOwner
   , batchSubjects ∷ !(Set SubjectKey)
   }
+  deriving (Eq, Show)
+
+-- | What a batch belongs to: a target's frame slot, or a frame-less slot of
+-- the session (GRS-12).
+data BatchOwner
+  = FrameOwner !Natural !Natural
+    -- ^ The target's number and the frame slot.
+  | FramelessOwner !Natural
+    -- ^ The frame-less slot.
+  deriving (Eq, Show)
+
+-- | What one frame-less slot holds while it is in use. A slot is free — absent
+-- — until a batch is opened in it, and free again once that batch is dropped
+-- or its submission's completion is recorded.
+data FramelessSlot
+  = SlotRecording !Natural
+    -- ^ Its batch, by number: being recorded, sealed or partial, and never
+    -- submitted.
+  | SlotSubmitted !Natural
+    -- ^ The submission that consumed its batch, until its completion is
+    -- recorded or the device's loss releases it.
   deriving (Eq, Show)
 
 data Submission = Submission

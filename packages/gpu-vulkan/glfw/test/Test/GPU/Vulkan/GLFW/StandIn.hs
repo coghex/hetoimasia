@@ -47,6 +47,7 @@ module Test.GPU.Vulkan.GLFW.StandIn
     -- * The rendering layers
   , Rendering
   , submissionsComplete
+  , millisecondsOf
   , presentationsRetire
   , scriptPresentStatus
   , slowNativeCalls

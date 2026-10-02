@@ -22,6 +22,8 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Frames.State
   , SubmissionRecord (..)
   , PresentStanding (..)
   , PresentationRecord (..)
+  , FramelessSync (..)
+  , FramelessRecord (..)
 
     -- * The frames
   , Frames (..)
@@ -40,6 +42,8 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Frames.State
   , FrameCleanupFailed (..)
   , FramesRetained (..)
   , PresentationUncertain (..)
+  , FramelessEffectUncertain (..)
+  , FramelessRetained (..)
 
     -- * Observation
   , FrameStanding (..)
@@ -51,6 +55,9 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Frames.State
   , readPool
   , PresentationStanding (..)
   , readPresentations
+  , FramelessSlotView (..)
+  , readFramelessSlots
+  , readFramelessSubmissions
 
     -- * Shared steps
   , framesRoots
@@ -79,10 +86,10 @@ import Numeric.Natural (Natural)
 
 import Hetoimasia.GPU.Model (GpuModel, Outcome (..), PresentOutcome, SessionFailureCause, deviceLossObserved, frameView)
 import Hetoimasia.GPU.Model.Budget (BudgetKind)
-import Hetoimasia.GPU.Model.Identity (FrameSlotId, IdentityKind (..), ImageId, Misuse (..), PresentationId, SubmissionId, TargetId, frameSlotNumber, frameTarget)
+import Hetoimasia.GPU.Model.Identity (BatchId, FrameSlotId, IdentityKind (..), ImageId, Misuse (..), PresentationId, SubmissionId, TargetId, frameSlotNumber, frameTarget)
 import Hetoimasia.GPU.Vulkan.Native.Generations (Generations)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Layer (FrameOps)
-import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State (Recording (..))
+import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State (Recording (..), TicketState)
 import Hetoimasia.GPU.Vulkan.Native.Profile (DevicePlan (..))
 import Hetoimasia.GPU.Vulkan.Native.Roots (Roots, failRootsSessionBecause, readRootsDevice, stateRootsModel)
 
@@ -250,6 +257,25 @@ data PresentationRecord = PresentationRecord
   }
   deriving (Eq, Show)
 
+-- | One frame-less slot's fence (GRS-12): made the first time a batch of the
+-- slot is submitted, signalled by each of its submissions in turn, and
+-- destroyed at the owner's retirement.
+data FramelessSync = FramelessSync
+  { framelessFence ∷ !Word64
+  , framelessFenceState ∷ !FenceState
+  , framelessDestruction ∷ !(Maybe Text)
+    -- ^ Destroying it raised: what raised. It is never destroyed again.
+  }
+  deriving (Eq, Show)
+
+-- | One frame-less submission this owner made: its slot, whose fence it
+-- signals, the batch it carried, and that batch's ticket.
+data FramelessRecord = FramelessRecord
+  { framelessSlot ∷ !Natural
+  , framelessBatch ∷ !BatchId
+  , framelessTicket ∷ !(Maybe (TVar TicketState))
+  }
+
 -- ---------------------------------------------------------------------------
 -- The frames
 
@@ -266,6 +292,10 @@ data Frames q inst msgr phys dev cmd = Frames
   , framesCursor ∷ !(TVar Natural)
     -- ^ Where the owner's next progress step starts in its work, so a small
     -- action budget reaches every piece of work in turn.
+  , framesFrameless ∷ !(TVar (Map Natural FramelessSync))
+    -- ^ Each frame-less slot's fence, by slot (GRS-12).
+  , framesFramelessSubmissions ∷ !(TVar (Map SubmissionId FramelessRecord))
+    -- ^ Each outstanding frame-less submission.
   }
 
 -- | The frames over this recording, owned by the thread that owns it — the
@@ -279,6 +309,8 @@ newFrames ops recording =
     <*> newTVarIO Map.empty
     <*> newTVarIO Map.empty
     <*> newTVarIO 0
+    <*> newTVarIO Map.empty
+    <*> newTVarIO Map.empty
 
 framesRoots ∷ Frames q inst msgr phys dev cmd → Roots q inst msgr phys dev
 framesRoots = recordingRoots . framesRecording
@@ -413,6 +445,26 @@ instance Exception PresentationUncertain where
   displayException (PresentationUncertain presentation reason) =
     "whether " <> show presentation <> " retired is uncertain: " <> Text.unpack reason
 
+-- | A frame-less submission whose outcome is unknown, or whose bookkeeping
+-- could not be committed: its batch, storage and resources are retained for
+-- ever, admission has stopped and the session has failed (GRS-12).
+data FramelessEffectUncertain = FramelessEffectUncertain !BatchId !Text
+  deriving (Eq, Show)
+
+instance Exception FramelessEffectUncertain where
+  displayException (FramelessEffectUncertain batch reason) =
+    "the outcome for frame-less " <> show batch <> " is uncertain: " <> Text.unpack reason
+
+-- | The frame-less slots could not be retired: submissions whose completion
+-- has not been observed, or fences still pending or uncertain. They are
+-- retained, and so is the device.
+data FramelessRetained = FramelessRetained ![SubmissionId] ![Natural]
+  deriving (Eq, Show)
+
+instance Exception FramelessRetained where
+  displayException (FramelessRetained submissions slots) =
+    "the frame-less submissions " <> show submissions <> " and the fences of slots " <> show slots <> " are retained"
+
 -- ---------------------------------------------------------------------------
 -- Observation
 
@@ -470,6 +522,20 @@ readPresentations frames =
     )
     . Map.toAscList
     <$> readTVar (framesPresentations frames)
+
+data FramelessSlotView = FramelessSlotView
+  { viewFramelessSlot ∷ !Natural
+  , viewFramelessSync ∷ !FramelessSync
+  }
+  deriving (Eq, Show)
+
+-- | Every frame-less slot's fence.
+readFramelessSlots ∷ Frames q inst msgr phys dev cmd → STM [FramelessSlotView]
+readFramelessSlots frames = map (uncurry FramelessSlotView) . Map.toAscList <$> readTVar (framesFrameless frames)
+
+-- | Every frame-less submission whose completion has not been observed.
+readFramelessSubmissions ∷ Frames q inst msgr phys dev cmd → STM [SubmissionId]
+readFramelessSubmissions frames = Map.keys <$> readTVar (framesFramelessSubmissions frames)
 
 -- ---------------------------------------------------------------------------
 -- Shared steps

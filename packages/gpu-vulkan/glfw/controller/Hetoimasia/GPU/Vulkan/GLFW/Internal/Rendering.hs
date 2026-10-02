@@ -100,7 +100,9 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
   , constructBuffer
   , constructImage
   , releaseConstructed
+  , constructFramelessBatch
   , lendConstruction
+  , framelessScoped
   , constructionEscaped
 
     -- * Observing frames
@@ -201,9 +203,16 @@ import Hetoimasia.GPU.Vulkan.Native.Frames
   , Presented (..)
   , Progress (..)
   , Submitted (..)
+  , FramelessScope
+  , awaitFrames
   , closeTargetFrames
   , closeUnpresentedFrame
+  , drainWaitLimit
   , newFrames
+  , readFramelessSubmissions
+  , recordFramelessIn
+  , retireFrameless
+  , withFramelessScope
   , presentFrame
   , progressFrames
   , readFrameStandings
@@ -236,6 +245,7 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , Pipeline
   , PipelineLayout
   , PipelineShaders
+  , BatchTicket
   , Readback
   , Recorder
   , Recording
@@ -376,6 +386,9 @@ data Construction q inst msgr phys dev cmd = Construction
     -- one that committed a generation, or that the session latched — rather
     -- than answering it. An owner-thread action's runner raises it on however
     -- the action handled it.
+  , constructionFrameless ∷ !(Maybe (FramelessScope q inst msgr phys dev cmd))
+    -- ^ The owner-thread action's frame-less scope (GRS-12): 'Nothing' for a
+    -- renderer's frame, which records no frame-less batch.
   }
 
 -- | What the renderer can release: the handles it can construct.
@@ -432,6 +445,28 @@ constructImage construction description = confined construction (createImage (co
 releaseConstructed ∷ Constructed handle ⇒ Construction q inst msgr phys dev cmd → handle → IO (Either Refusal ())
 releaseConstructed construction handle = confined construction (release (constructionRecording construction) handle)
 
+-- | Record one frame-less batch (GRS-12) inside an owner-thread action: a
+-- batch that belongs to no frame, recorded with the same recorder and checks
+-- as a frame's — transitions and boundary barriers included — but with no
+-- swapchain image, and answered with its 'BatchTicket'. It is submitted, with
+-- the action's other sealed frame-less batches in the order they were sealed,
+-- when the action returns, and discarded if the action raises; one left
+-- partial is discarded. The ticket reports its completion. A renderer's
+-- frame records none: it is refused there as unsupported. Like every
+-- construction it is refused once the session has failed; what the consumer
+-- raises is the action's to handle.
+constructFramelessBatch
+  ∷ Construction q inst msgr phys dev cmd
+  → (Recorder q inst msgr phys dev cmd → IO a)
+  → IO (Either Refusal (BatchTicket, a))
+constructFramelessBatch construction consumer = case constructionFrameless construction of
+  Nothing → pure (Left (RefusedUnsupported "a frame-less batch outside an owner-thread action"))
+  Just scope →
+    checkpointRoots (constructionRoots construction) >>= \case
+      CheckpointFailed primary → pure (Left (RefusedSessionFailed primary))
+      CheckpointPending → pure (Left RefusedDiagnosticPending)
+      CheckpointClear → recordFramelessIn scope consumer
+
 -- | Run one construction behind the session's checkpoint, answering a
 -- synchronous failure that left nothing as the refusal it is. Only a failure
 -- that committed no new generation, and that the checkpoint finds nothing
@@ -484,7 +519,20 @@ lendConstruction rendering =
 
 -- | The construction over the session's recording.
 construct ∷ Rendering q inst msgr phys dev cmd → Live q inst msgr phys dev cmd → Construction q inst msgr phys dev cmd
-construct rendering made = Construction (liveRecording made) (renderingRoots rendering) (renderingEscape rendering)
+construct rendering made = Construction (liveRecording made) (renderingRoots rendering) (renderingEscape rendering) Nothing
+
+-- | Run an owner-thread action's body with the construction it was lent and a
+-- frame-less scope over the session's frames (GRS-12): the frame-less batches
+-- it records are submitted when it returns, and discarded if it raises.
+framelessScoped
+  ∷ Rendering q inst msgr phys dev cmd
+  → Construction q inst msgr phys dev cmd
+  → (Construction q inst msgr phys dev cmd → IO r)
+  → IO r
+framelessScoped rendering construction body =
+  readTVarIO (renderingLive rendering) >>= \case
+    Nothing → body construction
+    Just made → withFramelessScope (liveFrames made) (\scope → body construction {constructionFrameless = Just scope})
 
 -- ---------------------------------------------------------------------------
 -- Observing frames
@@ -1188,11 +1236,39 @@ endCaptures rendering = do
 -- | Retire the recording, releasing and destroying every managed resource
 -- left, before the device is destroyed. Raises, retaining them, if any
 -- remains.
+--
+-- Frame-less submissions (GRS-12) are settled first: the owner waits, in the
+-- frames' finite drain steps and for at most 'framelessDrainSteps' of them,
+-- for each outstanding one's fence, observing each completion it proves, and
+-- then destroys the frame-less slots' fences. Once the device is lost they
+-- are let go of under the device-loss rule without waiting. One still
+-- outstanding at the end is retained, and so is the device: nothing is
+-- certified complete to finish the teardown.
 retireRendering ∷ Rendering q inst msgr phys dev cmd → Instant → IO ()
 retireRendering rendering now =
   readTVarIO (renderingLive rendering) >>= \case
     Nothing → pure ()
-    Just made → retireRecording (liveRecording made) now
+    Just made → do
+      drain (liveFrames made) (0 ∷ Natural)
+      retireFrameless (liveFrames made)
+      retireRecording (liveRecording made) now
+  where
+    drain frames steps = do
+      pending ← atomically (readFramelessSubmissions frames)
+      lost ← deviceLossObserved <$> atomically (readRootsModel (renderingRoots rendering))
+      unless (null pending || lost || steps >= framelessDrainSteps) $
+        -- A step that raised has latched its failure with the session; the
+        -- retirement below decides what it retains.
+        tryWithContext (awaitFrames frames now drainWaitLimit) >>= \case
+          Left failure@(ExceptionWithContext _ exception)
+            | isAsynchronous exception → rethrowIO (failure ∷ ExceptionWithContext SomeException)
+            | otherwise → pure ()
+          Right _ → drain frames (steps + 1)
+
+-- | How many finite drain steps the owner's retirement waits for frame-less
+-- submissions to complete: a hundred of the frames' 10 ms waits.
+framelessDrainSteps ∷ Natural
+framelessDrainSteps = 100
 
 -- ---------------------------------------------------------------------------
 -- Helpers

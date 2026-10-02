@@ -17,6 +17,14 @@
 --   over one mapped window, whose surface is admitted against the device's
 --   queue family, presents one frame of it and sees that presentation retire
 --   on its own present fence, and exits.
+-- * @grs12-frameless@ opens no window either (GRS-12). One owner-thread
+--   action builds a color target and a vertex buffer and records a
+--   frame-less batch that initializes the target and moves the buffer into a
+--   copy's use and back; a second action, while the first batch's submission
+--   may still be pending, records one that moves the target into a copy's
+--   source and back and the buffer again. Each batch is submitted when its
+--   action returns, with #335's boundary barriers; the main thread waits for
+--   both tickets with a deadline, and the host exits.
 --
 -- Each asserts where the device came from — enumerated and created with no
 -- surface query — the order of the roots' destruction, that every Vulkan call
@@ -26,16 +34,20 @@ module Test.GPU.Vulkan.Native.SurfaceFree
   ( SurfaceFreeOutcome (..)
   , runSurfaceFree
   , runLaterWindow
+  , runFrameless
   , surfaceFreeSection
   , laterWindowSection
+  , framelessSection
   , surfaceFreeSpec
   , laterWindowSpec
+  , framelessSpec
   ) where
 
 import Control.Concurrent (ThreadId, myThreadId)
 import Control.Concurrent.STM (STM, TVar, atomically, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, registerDelay, retry)
 import Control.Exception (SomeException, displayException, throwIO, try)
 import Control.Monad (void, when)
+import Data.Functor ((<&>))
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.List (elemIndex, nub)
 import qualified Data.Map.Strict as Map
@@ -54,27 +66,43 @@ import Hetoimasia.Foundation.Log
   , mkLogger
   )
 import Hetoimasia.Foundation.Messaging.Payload (prepare)
+import Hetoimasia.Foundation.Time (DurationRequirement (AllowZero), durationFromNanoseconds)
 import Hetoimasia.GLFW.Session (Backend)
 import Hetoimasia.GLFW.Vulkan (withLoaderIntegration)
 import Hetoimasia.GLFW.Window (WindowConfig (..), hiddenTestWindowConfig)
-import Hetoimasia.GPU.Model.Budget (defaultBudgetRequest, validateBudgets)
+import Hetoimasia.GPU.Model.Budget (BudgetRequest (..), defaultBudgetRequest, validateBudgets)
 import Hetoimasia.GPU.Model.Identity (TargetClass (..))
 import Hetoimasia.GPU.Vulkan.Diagnostics (CaptureConfig (..), DiagnosticVerdict (..), defaultCaptureConfig, verdictIssues)
 import Hetoimasia.GPU.Vulkan.GLFW
   ( ActionOutcome (..)
+  , BatchTicket
+  , Buffer
+  , BufferDescription (..)
+  , BufferKind (..)
   , Construction
   , FrameEvent (..)
+  , Image
+  , ImageDescription (..)
+  , ImageFormat (..)
+  , ImageKind (..)
   , NativeObserver (..)
   , Pipeline
   , PipelineLayout
   , Readiness (..)
   , Refusal
+  , ResourceUse (..)
+  , TicketState (..)
+  , TransitionSource (..)
   , VulkanAction (..)
   , VulkanDeviceStart (..)
   , VulkanHandover (..)
   , VulkanHost (..)
   , VulkanHostConfig (..)
+  , awaitTicket
   , awaitVulkanAction
+  , constructBuffer
+  , constructFramelessBatch
+  , constructImage
   , constructPipeline
   , constructPipelineLayout
   , handOverVulkanTarget
@@ -84,6 +112,7 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , releaseConstructed
   , runVulkanOwnerLoop
   , submitVulkanAction
+  , transitionResource
   , vulkanHostConfig
   , withVulkanOwnerHost
   )
@@ -125,6 +154,8 @@ data SurfaceFreeFacts = SurfaceFreeFacts
     -- ^ The roots as the body last saw them.
   , factsStanding ∷ !(Maybe TargetStanding)
   , factsEvents ∷ ![FrameEvent]
+  , factsTickets ∷ ![Either Refusal TicketState]
+    -- ^ What waiting for each frame-less batch's ticket answered.
   , factsVerdict ∷ !(Maybe DiagnosticVerdict)
   , factsErrors ∷ ![Text]
   , factsSeconds ∷ !Double
@@ -141,6 +172,7 @@ data Seen = Seen
   , seenWindows ∷ !Int
   , seenRoots ∷ !(Maybe RootsView)
   , seenStanding ∷ !(Maybe TargetStanding)
+  , seenTickets ∷ ![Either Refusal TicketState]
   }
 
 -- | The case with no window, on the calling thread, which must be the process
@@ -148,7 +180,7 @@ data Seen = Seen
 runSurfaceFree ∷ Maybe Backend → Journal → IO SurfaceFreeOutcome
 runSurfaceFree backend journal = do
   heading journal "GRS-15: a surface-free session with no window acts on its device through the owner's thread"
-  runCase backend [] "vulkan-native-grs15-surface-free" $ \vulkan _ names _ → do
+  runCase backend defaultBudgetRequest [] "vulkan-native-grs15-surface-free" $ \vulkan _ names _ → do
     (threads, answers) ← actOnDevice vulkan
     -- What the second action released is destroyed by the owner's own
     -- progress, with no target, while the host still runs.
@@ -158,14 +190,14 @@ runSurfaceFree backend journal = do
     windows ← length <$> atomically (hostWindowIdentities (vulkanWindowHost vulkan))
     roots ← atomically (readVulkanRoots (vulkanController vulkan))
     note journal ("the actions answered " <> Text.intercalate "; " answers)
-    pure (Seen threads answers windows (Just roots) Nothing)
+    pure (Seen threads answers windows (Just roots) Nothing [])
 
 -- | The case that admits a window after the device exists.
 runLaterWindow ∷ Maybe Backend → Journal → IO SurfaceFreeOutcome
 runLaterWindow backend journal = do
   heading journal "GRS-15: a surface-free session admits a window after its device exists, and presents to it"
   let window = (hiddenTestWindowConfig "hetoimasia GRS-15 later window" 160 120) {windowVisible = True}
-  runCase backend [window] "vulkan-native-grs15-surface-free-window" $ \vulkan control _ events → do
+  runCase backend defaultBudgetRequest [window] "vulkan-native-grs15-surface-free-window" $ \vulkan control _ events → do
     [identity] ← atomically (hostWindowIdentities (vulkanWindowHost vulkan))
     service ←
       handOverVulkanTarget vulkan identity RequiredTarget >>= \case
@@ -190,9 +222,90 @@ runLaterWindow backend journal = do
       pure (if any (`elem` retired) presented then FinishWith () else ContinueWith NoUpdateDemand)
     note journal "presented a frame to the later window and saw its presentation retire"
     roots ← atomically (readVulkanRoots (vulkanController vulkan))
-    pure (Seen [] [] 1 (Just roots) (Just standing))
+    pure (Seen [] [] 1 (Just roots) (Just standing) [])
   where
     quiet = recordingLogger (\_ → pure ())
+
+-- | The case that records frame-less batches with no window (GRS-12).
+runFrameless ∷ Maybe Backend → Journal → IO SurfaceFreeOutcome
+runFrameless backend journal = do
+  heading journal "GRS-12: a surface-free session records frame-less batches through owner-thread actions and waits for their tickets"
+  -- Each memory usage opens a VMA block of its own, as VK-11's case explains,
+  -- so the byte budget is VK-11's 2 GiB rather than the default 256 MiB.
+  runCase backend defaultBudgetRequest {requestedBytes = 2 * 1024 * 1024 * 1024} [] "vulkan-native-grs12-frameless" $ \vulkan _ _ _ → do
+    first ← act vulkan (VulkanAction framelessInitializing) >>= \case
+      ActionReturned (ran, Right made) → pure (ran, made)
+      ActionReturned (_, Left refusal) → stopWith ("the first frame-less batch was refused: " <> tshow refusal)
+      other → stopWith ("the first action did not return: " <> outcomeText other)
+    let (firstOn, (target, buffer, firstTicket)) = first
+    -- Submitted when the first action returned; the second is recorded
+    -- without waiting for it to complete.
+    second ← act vulkan (VulkanAction (framelessCopying target buffer)) >>= \case
+      ActionReturned (ran, Right ticket) → pure (ran, ticket)
+      ActionReturned (_, Left refusal) → stopWith ("the second frame-less batch was refused: " <> tshow refusal)
+      other → stopWith ("the second action did not return: " <> outcomeText other)
+    tickets ← mapM (\ticket → awaitTicket ticket deadline) [firstTicket, snd second]
+    note journal ("the tickets answered " <> tshow tickets)
+    roots ← atomically (readVulkanRoots (vulkanController vulkan))
+    pure (Seen [firstOn, fst second] ["recorded an initializing frame-less batch", "recorded a second frame-less batch"] 0 (Just roots) Nothing tickets)
+  where
+    deadline = either (error . show) id (durationFromNanoseconds AllowZero 10000000000)
+
+-- | A color target and a vertex buffer, and a frame-less batch that
+-- initializes the target and moves the buffer into a copy's use and back,
+-- answering the thread it ran on.
+framelessInitializing ∷ Construction q inst msgr phys dev cmd → IO (ThreadId, Either Refusal (Image, Buffer, BatchTicket))
+framelessInitializing construction = do
+  ran ← myThreadId
+  answer ←
+    constructImage construction (ImageDescription ColorTarget Rgba8Srgb 16 16 1) >>= \case
+      Left refusal → pure (Left refusal)
+      Right target →
+        constructBuffer construction (BufferDescription VertexBuffer 256) >>= \case
+          Left refusal → pure (Left refusal)
+          Right buffer →
+            constructFramelessBatch
+              construction
+              ( \recorder →
+                  inOrder
+                    [ transitionResource recorder target FromUndefined ColorAttachment
+                    , transitionResource recorder buffer (FromUse GeometryRead) TransferWrite
+                    , transitionResource recorder buffer (FromUse TransferWrite) GeometryRead
+                    ]
+              )
+              <&> \case
+                Left refusal → Left refusal
+                Right (_, Left refusal) → Left refusal
+                Right (ticket, Right ()) → Right (target, buffer, ticket)
+  pure (ran, answer)
+
+-- | A frame-less batch that moves the target into a copy's source and back,
+-- and the buffer into a copy's use and back, answering the thread it ran on.
+framelessCopying ∷ Image → Buffer → Construction q inst msgr phys dev cmd → IO (ThreadId, Either Refusal BatchTicket)
+framelessCopying target buffer construction = do
+  ran ← myThreadId
+  answer ←
+    constructFramelessBatch
+      construction
+      ( \recorder →
+          inOrder
+            [ transitionResource recorder target (FromUse ColorAttachment) TransferRead
+            , transitionResource recorder target (FromUse TransferRead) ColorAttachment
+            , transitionResource recorder buffer (FromUse GeometryRead) TransferWrite
+            , transitionResource recorder buffer (FromUse TransferWrite) GeometryRead
+            ]
+      )
+      <&> \case
+        Left refusal → Left refusal
+        Right (_, Left refusal) → Left refusal
+        Right (ticket, Right ()) → Right ticket
+  pure (ran, answer)
+
+-- | Run the commands in order, stopping at the first refusal.
+inOrder ∷ [IO (Either Refusal ())] → IO (Either Refusal ())
+inOrder = \case
+  [] → pure (Right ())
+  command : rest → command >>= either (pure . Left) (const (inOrder rest))
 
 -- | Build a layout and a pipeline through one owner-thread action, and
 -- release both through another, answering the thread each ran on and what
@@ -209,15 +322,19 @@ actOnDevice vulkan = do
     ActionReturned (releasedOn, (Right (), Right ())) → pure ([builtOn, releasedOn], ["built a pipeline layout and a pipeline", "released both"])
     ActionReturned (_, answers) → stopWith ("a release was refused: " <> tshow answers)
     other → stopWith ("the releasing action did not return: " <> outcomeText other)
-  where
-    act host action =
-      atomically (submitVulkanAction host action) >>= \case
-        Left refusal → stopWith ("an action was refused: " <> tshow refusal)
-        Right ticket → atomically (awaitVulkanAction ticket)
-    outcomeText = \case
-      ActionReturned _ → "returned"
-      ActionRaised failure → "raised " <> Text.pack (displayException failure)
-      ActionRefused refusal → "refused " <> tshow refusal
+
+-- | Submit an owner-thread action and wait for its outcome.
+act ∷ VulkanHost () → VulkanAction r → IO (ActionOutcome r)
+act host action =
+  atomically (submitVulkanAction host action) >>= \case
+    Left refusal → stopWith ("an action was refused: " <> tshow refusal)
+    Right ticket → atomically (awaitVulkanAction ticket)
+
+outcomeText ∷ ActionOutcome r → Text
+outcomeText = \case
+  ActionReturned _ → "returned"
+  ActionRaised failure → "raised " <> Text.pack (displayException failure)
+  ActionRefused refusal → "refused " <> tshow refusal
 
 -- | Build a layout and a pipeline over the verification shaders, answering the
 -- thread it ran on.
@@ -242,11 +359,12 @@ releasing (layout, pipeline) construction = do
 -- surface, over these windows.
 runCase
   ∷ Maybe Backend
+  → BudgetRequest
   → [WindowConfig]
   → Text
   → (VulkanHost () → RuntimeControl → TVar [Text] → TVar [FrameEvent] → IO Seen)
   → IO SurfaceFreeOutcome
-runCase backend windows label body = do
+runCase backend request windows label body = do
   started ← getCurrentTime
   recorded ← newIORef []
   names ← newTVarIO []
@@ -255,7 +373,7 @@ runCase backend windows label body = do
   verdictHeld ← newIORef Nothing
   partial ← newIORef Nothing
   scene ← prepare ()
-  budgets ← either (stopWith . tshow) pure (validateBudgets defaultBudgetRequest)
+  budgets ← either (stopWith . tshow) pure (validateBudgets request)
   let host = requestingBackend backend (defaultHostConfig windows)
       logger = recordingLogger (\entry → atomically (modifyTVar' logged (entry :)))
       config =
@@ -313,6 +431,7 @@ runCase backend windows label body = do
               , factsWindows = seenWindows seen
               , factsRoots = seenRoots seen
               , factsStanding = seenStanding seen
+              , factsTickets = seenTickets seen
               , factsEvents = seenEvents
               , factsVerdict = verdict
               , factsErrors = errors
@@ -333,6 +452,18 @@ surfaceFreeSection = section "A surface-free session with no window, acting on i
 
 laterWindowSection ∷ SurfaceFreeOutcome → [Text]
 laterWindowSection = section "A surface-free session that admits a window later"
+
+framelessSection ∷ SurfaceFreeOutcome → [Text]
+framelessSection outcome =
+  section "A surface-free session recording frame-less batches" outcome
+    <> case outcome of
+      SurfaceFreeRecorded facts →
+        [ "- frame-less tickets waited for: " <> tshow (factsTickets facts)
+        , "- submissions: " <> tshow (length (filter (== "vkQueueSubmit2") (callNames facts)))
+            <> ", command buffers begun: " <> tshow (length (filter (== "vkBeginCommandBuffer") (callNames facts)))
+            <> ", completions observed: " <> tshow (length [() | SubmissionCompleted _ ← factsEvents facts])
+        ]
+      SurfaceFreeFailed _ → []
 
 section ∷ Text → SurfaceFreeOutcome → [Text]
 section title = \case
@@ -403,6 +534,37 @@ surfaceFreeSpec outcome = describe "GRS-15 surface-free session" $ do
       oneOwnerThread facts
 
   it "reached a verdict after the last callback with no issue and no error" $
+    on outcome clean
+
+framelessSpec ∷ SurfaceFreeOutcome → Spec
+framelessSpec outcome = describe "GRS-12 frame-less batches in a surface-free session" $ do
+  it "opened no window, created no surface and acquired no image" $
+    on outcome $ \facts → do
+      factsWindows facts `shouldBe` 0
+      callNames facts `shouldSatisfy` notElem "glfwCreateWindowSurface"
+      callNames facts `shouldSatisfy` notElem "vkAcquireNextImageKHR"
+      deviceFirst facts
+
+  it "recorded both frame-less batches through owner-thread actions on the owner's thread, each begun and ended in a frame-less slot's own command buffer" $
+    on outcome $ \facts → do
+      ownerThread facts $ \owner → factsActionThreads facts `shouldBe` [owner, owner]
+      -- Recorded commands are not observed one by one; their barriers are the
+      -- headless examples', and their synchronization the verdict's.
+      length (filter (== "vkBeginCommandBuffer") (callNames facts)) `shouldBe` 2
+      length (filter (== "vkEndCommandBuffer") (callNames facts)) `shouldBe` 2
+
+  it "submitted each batch by itself when its action returned, and completed both tickets on their fences, waited for with a deadline off the owner's thread" $
+    on outcome $ \facts → do
+      factsRunning facts `shouldSatisfy` ordered ["vkQueueSubmit2", "vkQueueSubmit2"]
+      factsTickets facts `shouldBe` [Right TicketComplete, Right TicketComplete]
+      length [() | SubmissionCompleted _ ← factsEvents facts] `shouldBe` 2
+
+  it "retired cleanly: the frame-less fences before the device, then the messenger, then the instance, with every Vulkan call on the owner's thread" $
+    on outcome $ \facts → do
+      callNames facts `shouldSatisfy` ordered ["vkDestroyFence", "vkDestroyDevice", "vkDestroyDebugUtilsMessengerEXT", "vkDestroyInstance"]
+      oneOwnerThread facts
+
+  it "reached a verdict after the last callback with no issue and no error, synchronization validation included" $
     on outcome clean
 
 laterWindowSpec ∷ SurfaceFreeOutcome → Spec
