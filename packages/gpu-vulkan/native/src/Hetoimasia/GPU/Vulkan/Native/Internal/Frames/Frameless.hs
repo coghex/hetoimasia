@@ -61,7 +61,7 @@ import Hetoimasia.GPU.Model.Identity (BatchId, IdentityKind (..), Misuse (..), b
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Layer (FrameOps (..), SubmitBatch (..), WaitStage (..))
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Loss (releaseFramesToDeviceLoss)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.State
-import Hetoimasia.GPU.Vulkan.Native.Internal.Reclamation (recoverAllocation, withAllocationAttempt)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Reclamation (recoverAllocation, recoveringCreation, withAllocationAttempt)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Batches (discardBatch, noteBatchSubmitted)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Recorder (Recorder, recordFrameless)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
@@ -146,22 +146,26 @@ withFramelessScope frames body = mask $ \restore → do
               Right _ → pure (Right (reverse accepted))
               Left failure → pure (Left (reverse accepted, failure))
 
--- | Discard every batch named that the recording still holds unsubmitted —
--- or, once the device is lost, let go of every unsubmitted frame-less batch
--- under the device-loss rule, with no native call. A discard that raised is
--- kept as the recording keeps it, and the rest are still settled.
+-- | Discard every batch named that the recording still holds unsubmitted.
+-- Before each discard the device's loss is asked again: once it is lost —
+-- before the first, or by an earlier discard's reset — every unsubmitted
+-- frame-less batch left is let go of under the device-loss rule, with no
+-- native call, its ticket lost. A discard that raised is kept as the
+-- recording keeps it, and the rest are still settled.
 settle ∷ Frames q inst msgr phys dev cmd → [BatchId] → IO ()
-settle frames batches = do
-  lost ← atomically (lossObserved frames)
-  if lost
-    then () <$ releaseFramesToDeviceLoss frames
-    else for_ batches $ \batch → do
-      held ← Map.lookup batch <$> readTVarIO (recordingBatches (framesRecording frames))
-      case batchStanding <$> held of
-        Just (BatchSubmitted _) → pure ()
-        Just (BatchUncertain _) → pure ()
-        Just _ → () <$ tryWithContext @SomeException (discardBatch (framesRecording frames) batch)
-        Nothing → pure ()
+settle frames = \case
+  [] → pure ()
+  batch : rest →
+    atomically (lossObserved frames) >>= \case
+      True → () <$ releaseFramesToDeviceLoss frames
+      False → do
+        held ← Map.lookup batch <$> readTVarIO (recordingBatches (framesRecording frames))
+        case batchStanding <$> held of
+          Just (BatchSubmitted _) → pure ()
+          Just (BatchUncertain _) → pure ()
+          Just _ → () <$ tryWithContext @SomeException (discardBatch (framesRecording frames) batch)
+          Nothing → pure ()
+        settle frames rest
 
 -- | Record one frame-less batch in the scope: see
 -- 'Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Recorder.recordFrameless'.
@@ -260,7 +264,9 @@ submitFrameless frames batch =
       sync ← case existing of
         Just held → pure held
         Nothing → do
-          fence ← rootsCall roots "vkCreateFence" (opsCreateFence ops device)
+          -- An out-of-memory creation made nothing, and is recovered once
+          -- (VK-14), as a frame slot's fences are.
+          fence ← recoveringCreation roots "vkCreateFence" Nothing (rootsCall roots "vkCreateFence" (opsCreateFence ops device))
           let made = FramelessSync fence FenceIdle Nothing
           atomically (modifyTVar' (framesFrameless frames) (Map.insert slot made))
           pure made

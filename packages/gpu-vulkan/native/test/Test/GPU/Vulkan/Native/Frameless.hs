@@ -33,7 +33,8 @@ import Hetoimasia.GPU.Vulkan.Native.Frames
 import Hetoimasia.GPU.Vulkan.Native.Recording
 import Test.GPU.Vulkan.Native.FramesRig
 import Test.GPU.Vulkan.Native.FramesStandIn
-import Test.GPU.Vulkan.Native.RecordingStandIn (RecordingCall (..), RecordingStep (AtResetStorage), failAt, recordingCalls)
+import Test.GPU.Vulkan.Native.RecordingStandIn (RecordingCall (..), RecordingStep (AtResetStorage), duringReset, failAt, recordingCalls)
+import Test.GPU.Vulkan.Native.StandIn (StandInLoss (..), Step (AtFrameCall))
 
 type Scope = FramelessScope () Int Int Text Int Word64
 
@@ -116,6 +117,46 @@ spec = describe "Frame-less batches" $ do
       states `shouldBe` [TicketPending, TicketPending, TicketDiscarded]
       sessionState <$> modelOf rig `shouldReturn` SessionFailed UnknownSubmissionEffect
 
+    it "lets go of every batch left under the device-loss rule once an earlier discard's reset lost the device, resetting nothing more" $ do
+      rig ← newRig
+      attempts ← newIORef (0 ∷ Int)
+      duringReset (rigRecordingStandIn rig) $ do
+        modifyIORef' attempts (+ 1)
+        markDeviceLost (rigStandIn rig)
+        throwIO (StandInLoss AtFrameCall)
+      tickets ← newIORef []
+      outcome ← try @ErrorCall $ scoped rig $ \scope → do
+        mapM_ (const (sealedIn scope >>= \ticket → modifyIORef' tickets (ticket :))) [1 ∷ Int, 2]
+        throwIO (ErrorCall "the action failed")
+      fmap (const ()) outcome `shouldBe` Left (ErrorCall "the action failed")
+      -- One reset was attempted, and it lost the device: none was made after.
+      readIORef attempts `shouldReturn` 1
+      readIORef tickets >>= mapM (atomically . readTicket) . reverse >>= (`shouldBe` [TicketLost, TicketLost])
+      framelessSlots <$> modelOf rig `shouldReturn` []
+
+    it "recovers a frame-less fence's creation that ran out of memory by reclaiming once and retrying, and gives up without recording again" $ do
+      rig ← newRig
+      layout ← createPipelineLayout (rigRecording rig) >>= either (fail . show) pure
+      ok (releaseManaged (rigRecording rig) layout)
+      outOfMemoryAtFrame (rigStandIn rig) AtCreateFence 1
+      recovered ← scoped rig sealedIn
+      atomically (readTicket recovered) `shouldReturn` TicketPending
+      recordingCalls (rigRecordingStandIn rig) >>= \calls → [() | DestroyedLayout _ ← calls] `shouldBe` [()]
+      length . filter isSubmission <$> frameCalls (rigStandIn rig) `shouldReturn` 1
+      -- With nothing left to reclaim the retry is never made: the batch is
+      -- discarded, its consumer run once, and the failure raised.
+      exhausted ← newRigOver 1 defaultBudgetRequest
+      outOfMemoryAtFrame (rigStandIn exhausted) AtCreateFence 2
+      runs ← newIORef (0 ∷ Int)
+      tickets ← newIORef []
+      outcome ← try @AllocationNotRecovered $ scoped exhausted $ \scope → do
+        answer ← recordFramelessIn scope (\_ → modifyIORef' runs (+ 1))
+        either (fail . show) (\(ticket, ()) → modifyIORef' tickets (ticket :)) answer
+      fmap (const ()) outcome `shouldSatisfy` either (const True) (const False)
+      readIORef runs `shouldReturn` 1
+      readIORef tickets >>= mapM (atomically . readTicket) >>= (`shouldBe` [TicketDiscarded])
+      filter isSubmission <$> frameCalls (rigStandIn exhausted) `shouldReturn` []
+
   describe "slots" $ do
     it "reuses a slot's storage only after its submission completed, or its batch was discarded" $ do
       rig ← newRigOver 1 defaultBudgetRequest {requestedFramelessBatches = 1}
@@ -191,6 +232,25 @@ spec = describe "Frame-less batches" $ do
       retireFrameless (rigFrames rig)
       mapM (atomically . readTicket) tickets `shouldReturn` [TicketComplete, TicketLost]
       atomically (readFramelessSlots (rigFrames rig)) `shouldReturn` []
+
+    it "keeps a submission whose fence could not be asked, uncertain and never asked again, so a later loss still reports its ticket lost" $ do
+      rig ← newRigWithActions 2 1
+      tickets ← scoped rig (\scope → mapM (const (sealedIn scope)) [1 ∷ Int, 2])
+      failFrameStep (rigStandIn rig) AtQueryFence
+      _ ← try @SomeException (progress rig)
+      clearFrameStep (rigStandIn rig) AtQueryFence
+      sessionState <$> modelOf rig `shouldReturn` SessionFailed CleanupFailed
+      atomically (readFramelessSubmissions (rigFrames rig)) >>= (`shouldSatisfy` ((== 2) . length))
+      -- The uncertain one is never asked again: the next query is the other's,
+      -- and it loses the device.
+      queriesBefore ← length . filter (\case QueriedFence _ → True; _ → False) <$> frameCalls (rigStandIn rig)
+      loseFrameStep (rigStandIn rig) AtQueryFence
+      _ ← try @SomeException (progress rig)
+      _ ← try @SomeException (progress rig)
+      queriesAfter ← length . filter (\case QueriedFence _ → True; _ → False) <$> frameCalls (rigStandIn rig)
+      queriesAfter `shouldBe` queriesBefore + 1
+      retireFrameless (rigFrames rig)
+      mapM (atomically . readTicket) tickets `shouldReturn` [TicketLost, TicketLost]
 
     it "observes a ready frame-less submission in a one-action step even behind one that has not signalled" $ do
       rig ← newRigWithActions 2 1

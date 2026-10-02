@@ -149,11 +149,13 @@ progressFrames frames now = owner recording $ do
                   -- The device's loss lets go of the submission under its own
                   -- rule, which settles its ticket as lost.
                   | isLoss exception → note failures exception
+                  -- The submission is kept, with its ticket, so a later loss
+                  -- can still let it go; its uncertain fence is never asked
+                  -- again, and retains it, and the device, otherwise.
                   | otherwise → do
                       let reason = "vkGetFenceStatus raised: " <> describe failure
                       atomically $ do
                         modifyTVar' (framesFrameless frames) (Map.adjust (\entry → entry {framelessFenceState = FenceUncertain reason}) (framelessSlot record))
-                        modifyTVar' (framesFramelessSubmissions frames) (Map.delete submission)
                         failRootsSessionBecause roots CleanupFailed (Text.pack (show submission) <> ": " <> reason)
                       note failures (toException (FramelessEffectUncertain (framelessBatch record) reason))
                 Right False → pure ()
@@ -472,11 +474,15 @@ stepWork ∷ Frames q inst msgr phys dev cmd → STM [Work]
 stepWork frames = do
   submissions ← readTVar (framesSubmissions frames)
   frameless ← readTVar (framesFramelessSubmissions frames)
+  fences ← readTVar (framesFrameless frames)
   presentations ← readTVar (framesPresentations frames)
   live ← readTVar (framesLive frames)
   pure $
     [ObserveSubmission submission record | (submission, record) ← Map.toAscList submissions]
-      <> [ObserveFrameless submission record | (submission, record) ← Map.toAscList frameless]
+      <> [ ObserveFrameless submission record
+         | (submission, record) ← Map.toAscList frameless
+         , fmap framelessFenceState (Map.lookup (framelessSlot record) fences) == Just FencePending
+         ]
       <> [ ObservePresentation presentation record
          | (presentation, record) ← Map.toAscList presentations
          , presentedStanding record == PresentPending

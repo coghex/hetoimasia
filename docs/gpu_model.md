@@ -572,9 +572,11 @@ device, and a second release releases nothing.
 ## Owner progress
 
 One turn performs at most `progressActionLimit` completion or disposal actions,
-taken round-robin across targets and then the session's own managed resources.
-The lead rotates every turn, so no target starves behind a busy neighbour, and
-the report names the order it visited.
+taken round-robin across the targets and the session's own place — its
+frame-less completions and its managed resources. The lead rotates every turn,
+the session's place with the targets', so neither a target nor the session
+starves behind a busy neighbour, and the report names the order it visited the
+targets.
 
 The turn answers the absolute instant of the next one:
 
@@ -718,7 +720,8 @@ leaves the slot held by that submission. Recording a completion
 (`SubmissionCompleted`) discharges those uses, gives back the record's object
 and frees the slot; `runProgressTurn` offers frame-less completions in the
 session's own place, before its disposals, so one submission that has not
-signalled never holds back another that has.
+signalled never holds back another that has. The session's place rotates with
+the targets' places, so a target with ready work every turn cannot starve it.
 
 **Failure.** `SubmissionFailedWithoutEffect` changes nothing: the batch stays
 held and submittable. `SubmissionEffectUncertain` records the submission

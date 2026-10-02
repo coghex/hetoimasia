@@ -2659,7 +2659,9 @@ discarded. A batch left partial is never submitted and is discarded, as only a
 discard ends one. An action that raised, or was cancelled, submits nothing and
 discards every batch it opened; a discard whose storage reset raised keeps the
 batch, its references and its slot, uncertain, fails the session, and the
-action's own failure is still the one raised.
+action's own failure is still the one raised. The device's loss is asked again
+before each discard: once lost, every batch left is let go of under the
+device-loss rule instead, its ticket lost, with no native call.
 
 **Tickets.** A `BatchTicket` names one batch, whatever slot or storage later
 serves another. `readTicket` reads it from any thread without a native call:
@@ -2677,7 +2679,13 @@ step, among its other work and on the same rotation, so one that has not
 signalled never holds back another — in windowed and zero-target sessions
 alike, since a pending submission is owed work the model's poll schedule
 counts. A signalled fence is recorded as the submission's completion, which
-discharges its holds and frees its slot, and completes its ticket.
+discharges its holds and frees its slot, and completes its ticket. A fence
+whose query raised without losing the device is uncertain: the session fails,
+the fence is never asked again, and the submission is kept with its ticket
+pending — retaining it and the device, and letting a later loss report it
+lost. A slot's fence is made at its first submission; one whose creation ran
+out of memory is recovered once, as a frame slot's are (VK-14), and one that
+is not recovered discards the batch without recording it again.
 
 **Device loss and retirement.** After the device's loss no fence is asked or
 waited on: the device-loss release lets go of every frame-less submission,

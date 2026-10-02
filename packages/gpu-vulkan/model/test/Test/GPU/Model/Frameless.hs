@@ -142,6 +142,23 @@ spec = describe "frame-less batches" $ do
       turnFacts report `shouldBe` 1
       framelessSlots after `shouldBe` [(0, FramelessSubmitted stalled)]
 
+    it "completes a ready frame-less submission within one turn per place while a target's ready work would fill every turn" $ do
+      model ← freshModelWith defaultBudgetRequest {requestedProgressActions = 1}
+      (active, target, _) ← activeTarget 3 model
+      (one, first) ← acquiredFrame target active
+      (two, second) ← acquiredFrame target one
+      (framed, _) ← admitted "the first frame's submission" (submitFrames [first] SubmissionAccepted two)
+      (bothFramed, _) ← admitted "the second frame's submission" (submitFrames [second] SubmissionAccepted framed)
+      (opened, (batch, _)) ← admitted "a frame-less batch" (openFramelessBatch [] bothFramed)
+      (submitted, _) ← submittedAs batch opened
+      let everything = silentEvidence {submissionEvidence = const True}
+          (afterOne, _) = runProgressTurn everything (atMilliseconds 1) submitted
+          (afterTwo, _) = runProgressTurn everything (atMilliseconds 2) afterOne
+      -- Two places, the target and the session, one action a turn: the
+      -- frame-less completion comes within two turns, with frame work left.
+      framelessSlots afterTwo `shouldBe` []
+      usageSubmissions (usage afterTwo) `shouldBe` 1
+
   describe "identities" $ do
     it "resolves a frame-less batch through its session alone, refusing a stranger's, a consumed one and a frame batch" $ do
       model ← freshModel

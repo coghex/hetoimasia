@@ -59,11 +59,13 @@ runProgressTurn ∷ EvidenceSource → Instant → GpuModel → (GpuModel, TurnR
 runProgressTurn source now model = (finished, report)
   where
     budget = progressActionLimit (gpuBudgets model)
-    order = rotated (gpuCursor model) (Map.keys (gpuTargets model))
-    -- Each pass visits every target once, then the session itself, so managed
-    -- resources are reclaimed under the same action budget as target work
-    -- rather than through a second unbounded sweep.
-    visits = map Just order ++ [Nothing]
+    -- Each pass visits every target once and the session itself once, so
+    -- managed resources are reclaimed, and frame-less submissions completed,
+    -- under the same action budget as target work rather than through a
+    -- second unbounded sweep. The session's place rotates with the targets',
+    -- so busy targets can no more starve it than one another.
+    visits = rotated (gpuCursor model) (map Just (Map.keys (gpuTargets model)) ++ [Nothing])
+    order = [number | Just number ← visits]
     (worked, actions, facts, disposed, failures) = passes model 0 0 [] []
     passes current used factCount disposedSoFar failed
       | used >= budget = (current, used, factCount, disposedSoFar, failed)
