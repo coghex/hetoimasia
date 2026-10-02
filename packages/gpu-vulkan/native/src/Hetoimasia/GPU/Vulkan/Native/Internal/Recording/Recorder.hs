@@ -8,9 +8,11 @@
 -- before 'recordFrame' returns or raises.
 --
 -- This module owns each 'Recorder' and its mutable references — whether it is
--- open, the image layout and bindings it tracks, and its count of open label
--- regions — for one consumer action on the graphics owner's thread. It
--- inserts batch records into the recording's state
+-- open, the image layout and bindings it tracks, the use each managed buffer
+-- and image it has touched is in (GRS-3), and its count of open label regions
+-- — for one consumer action on the graphics owner's thread. It records each
+-- batch's entry barriers as their transitions are recorded, and its exit
+-- barriers as it seals. It inserts batch records into the recording's state
 -- ("Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State") and advances them
 -- while recording, and marks a readback buffer as copied into; ending a batch
 -- afterwards is the batch lifecycle's
@@ -20,6 +22,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Recorder
   , recorderBatch
   , recordFrame
   , transitionImage
+  , transitionResource
   , beginRendering
   , endRendering
   , bindPipeline
@@ -43,12 +46,15 @@ import qualified Data.Text as Text
 import Data.Word (Word32, Word64)
 import Numeric.Natural (Natural)
 
+import Hetoimasia.GPU.Model.Access (BatchAccess, Barrier (..), BarrierRole (EntryBarrier), Contents (..), ResourceUse, TransitionSource, emptyAccess)
+import qualified Hetoimasia.GPU.Model.Access as Access
 import Hetoimasia.GPU.Model
   ( FramePhase (..)
   , FrameView (..)
   , HoldKind (..)
   , HoldView (..)
   , Outcome (..)
+  , enterResource
   , extendBatch
   , frameView
   , holdView
@@ -79,14 +85,17 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   , Rect (..)
   , Viewport (..)
   , nativeName
+  , resourceBarrier
   , supportedTransition
   )
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   ( BatchRecord (..)
   , BatchStanding (..)
+  , Managed (managedResource)
   , ManagedRecord (..)
   , ManagedStanding (..)
   , NativeResource (..)
+  , Ordered
   , Pipeline (..)
   , Readback (..)
   , ReadbackContents (..)
@@ -98,12 +107,13 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , liveNative
   , checkpointed
   , modelAnswer
+  , orderedObject
   , owned
   , tshow
   )
 import Hetoimasia.GPU.Vulkan.Native.Naming (batchLabel, passLabel)
 import Hetoimasia.GPU.Vulkan.Native.Presentation (GenerationPlan (..), SurfaceExtent (..), SurfaceFormat (..), imageUsageTransferSource)
-import Hetoimasia.GPU.Vulkan.Native.Roots (readRootsInstrumentation, rootsCall, stateRootsModel)
+import Hetoimasia.GPU.Vulkan.Native.Roots (Roots, readRootsInstrumentation, rootsCall, stateRootsModel)
 
 data RecorderState = RecorderState
   { stateLayout ∷ !ImageLayout
@@ -111,6 +121,12 @@ data RecorderState = RecorderState
   , statePipeline ∷ !(Maybe ResourceId)
   , stateViewport ∷ !Bool
   , stateScissor ∷ !Bool
+  , stateAccess ∷ !(BatchAccess ResourceId)
+    -- ^ The use each managed buffer and image the batch has touched is in
+    -- (GRS-3).
+  , stateObjects ∷ !(Map.Map ResourceId (Word64, Maybe (Word32, Word32)))
+    -- ^ The native handle of each of them, and an image's aspect and mip
+    -- levels, for the exit barriers the seal records.
   }
 
 -- | The frame a recorder renders into, as the generation that owns its image
@@ -177,7 +193,7 @@ recordFrame recording frame consumer =
               Left refusal → pure (Left refusal)
               Right batch → do
                 opened ← newIORef True
-                state ← newIORef (RecorderState LayoutUndefined False Nothing False False)
+                state ← newIORef (RecorderState LayoutUndefined False Nothing False False emptyAccess Map.empty)
                 labelled ← isJust <$> readRootsInstrumentation roots
                 labels ← newIORef 0
                 let recorder = Recorder recording batch commands image opened state labelled labels
@@ -231,17 +247,32 @@ recordFrame recording frame consumer =
                             partial "the consumer left rendering open"
                             _ ← balance
                             pure (Left (RefusedIllegal "the consumer left rendering open, so the batch was not sealed"))
-                          else
-                            balance >>= \case
-                              Just failure → rethrowIO failure
-                              Nothing →
-                                tryWithContext @SomeException (rootsCall roots "vkEndCommandBuffer" (opsEndCommands (recordingOps recording) commands)) >>= \case
-                                  Left failure@(ExceptionWithContext _ exception) → do
-                                    partial ("ending the command buffer raised: " <> Text.pack (displayException exception))
-                                    rethrowIO failure
-                                  Right () → do
-                                    atomically (editBatch recording batch (\entry → entry {batchStanding = BatchSealed}))
-                                    pure (Right (batch, value))
+                          else do
+                            ended ← readIORef state
+                            case Access.sealAccess (stateAccess ended) of
+                              Left refusal → do
+                                let reason = describeAccess refusal
+                                partial ("the consumer left " <> reason)
+                                _ ← balance
+                                pure (Left (RefusedIllegal ("the consumer left " <> reason <> ", so the batch was not sealed")))
+                              -- The exit barriers, inside the batch's label:
+                              -- one that raised leaves the batch partial, as
+                              -- any command's failure does, and is raised once
+                              -- the labels are balanced.
+                              Right exits →
+                                tryWithContext @SomeException (for_ (exitBarriers (stateObjects ended) exits) (recordLabel recorder)) >>= \case
+                                  Left failure → balance >> rethrowIO failure
+                                  Right () →
+                                    balance >>= \case
+                                      Just failure → rethrowIO failure
+                                      Nothing →
+                                        tryWithContext @SomeException (rootsCall roots "vkEndCommandBuffer" (opsEndCommands (recordingOps recording) commands)) >>= \case
+                                          Left failure@(ExceptionWithContext _ exception) → do
+                                            partial ("ending the command buffer raised: " <> Text.pack (displayException exception))
+                                            rethrowIO failure
+                                          Right () → do
+                                            atomically (editBatch recording batch (\entry → entry {batchStanding = BatchSealed}))
+                                            pure (Right (batch, value))
   where
     roots = recordingRoots recording
 
@@ -326,7 +357,18 @@ commandSequence
   ∷ Recorder q inst msgr phys dev cmd
   → (RecorderState → Either Refusal (RecorderState, [ResourceId], [NativeCommand]))
   → IO (Either Refusal ())
-commandSequence recorder decide =
+commandSequence recorder decide = orderedSequence recorder (fmap (\(next, references, natives) → (next, references, [], natives)) . decide)
+
+-- | 'commandSequence' for a decision that is also a batch's first touch of
+-- managed resources (GRS-3): each is entered in the model, keeping or
+-- discarding its contents, in the same transaction that retains it, so an
+-- image that awaits initialization is refused before anything is retained or
+-- recorded.
+orderedSequence
+  ∷ Recorder q inst msgr phys dev cmd
+  → (RecorderState → Either Refusal (RecorderState, [ResourceId], [(ResourceId, Contents)], [NativeCommand]))
+  → IO (Either Refusal ())
+orderedSequence recorder decide =
   owned recording $
     readIORef (recorderOpen recorder) >>= \case
       False → pure (Left RefusedRecorderClosed)
@@ -334,11 +376,11 @@ commandSequence recorder decide =
         state ← readIORef (recorderState recorder)
         case decide state of
           Left refusal → pure (Left refusal)
-          Right (next, references, natives) → mask_ $ do
+          Right (next, references, entries, natives) → mask_ $ do
             retained ←
               if null references
                 then pure (Right ())
-                else atomically (modelAnswer roots (fmap (\model → (model, ())) . extendBatch batch (unique references)))
+                else atomically (retain roots batch (unique references) entries)
             case retained of
               Left refusal → pure (Left refusal)
               Right () → do
@@ -350,6 +392,23 @@ commandSequence recorder decide =
     roots = recordingRoots recording
     batch = recorderBatch recorder
     unique = Map.keys . Map.fromList . map (\resource → (resource, ()))
+
+-- | Retain the references in the batch, then enter each first touch, as one
+-- edit of the model: any refusal leaves it as it was.
+retain ∷ Roots q inst msgr phys dev → BatchId → [ResourceId] → [(ResourceId, Contents)] → STM (Either Refusal ())
+retain roots batch references entries = stateRootsModel roots $ \model →
+  case answered (extendBatch batch references model) >>= \extended → foldl' enter (Right extended) entries of
+    Left refusal → (Left refusal, model)
+    Right next → (Right (), next)
+  where
+    enter current (resource, contents) =
+      current >>= \model → case enterResource batch resource contents model of
+        Rejected (WrongPhase ResourceIdentity) → Left RefusedUninitialized
+        answer → answered answer
+    answered = \case
+      Admitted next → Right next
+      Backpressure kind → Left (RefusedBackpressure kind)
+      Rejected misuse → Left (RefusedMisuse misuse)
 
 -- | Record one native command into the batch and count it, keeping the count
 -- of open label regions. A call that raised may or may not have reached the
@@ -412,6 +471,71 @@ transitionImage recorder from to = command recorder $ \state →
           if stateLayout state /= from
             then Left (RefusedIllegal ("the image is " <> tshow (stateLayout state) <> ", not " <> tshow from))
             else Right (state {stateLayout = to}, [], CommandImageBarrier (frameImageHandle (recorderFrame recorder)) from to)
+
+-- | Move a managed buffer or image from one use to another within the batch
+-- (GRS-3): from the use the batch left it in, or from undefined contents,
+-- which only an image has. The ordering rules
+-- ("Hetoimasia.GPU.Model.Access") decide the move. On the batch's first touch
+-- the resource is at rest, and the recorder first records the entry barrier
+-- out of its resting use — or, from undefined, that barrier is the move
+-- itself, and initializes an image that awaits it.
+--
+-- Like every command it checks the owner's thread, the handle — this
+-- session's, still managed, live, a buffer or an image — the recorder and its
+-- state, and that rendering is not open; and it retains the exact generation
+-- before its first barrier. An illegal move, one that does not start from the
+-- use the batch left the resource in, or a first touch of an image another
+-- unsubmitted batch initializes or that this one does not, is refused before
+-- anything is retained or recorded.
+transitionResource ∷ Ordered handle ⇒ Recorder q inst msgr phys dev cmd → handle → TransitionSource → ResourceUse → IO (Either Refusal ())
+transitionResource recorder handle from to =
+  owned recording $
+    liveNative recording resource >>= \case
+      Left refusal → pure (Left refusal)
+      Right native → case orderedObject native of
+        Nothing → pure (Left RefusedWrongKind)
+        Just (kind, object, image) → orderedSequence recorder $ \state →
+          if stateRendering state
+            then Left (RefusedIllegal "a resource transition inside rendering")
+            else case Access.transition resource kind from to (stateAccess state) of
+              Left refusal → Left (accessRefused refusal)
+              Right (access, barriers) →
+                Right
+                  ( state {stateAccess = access, stateObjects = Map.insert resource (object, image) (stateObjects state)}
+                  , [resource]
+                  , [ (resource, if barrierDiscards barrier then DiscardsContents else KeepsContents)
+                    | barrier ← barriers
+                    , barrierRole barrier == EntryBarrier
+                    ]
+                  , map (resourceBarrier object image) barriers
+                  )
+  where
+    recording = recorderRecording recorder
+    resource = managedResource handle
+
+-- | The native commands of the exit barriers the batch owes. Every touched
+-- resource's native handle was noted when it was touched, so none is missing.
+exitBarriers ∷ Map.Map ResourceId (Word64, Maybe (Word32, Word32)) → [Barrier ResourceId] → [NativeCommand]
+exitBarriers objects barriers =
+  [ resourceBarrier object image barrier
+  | barrier ← barriers
+  , Just (object, image) ← [Map.lookup (barrierResource barrier) objects]
+  ]
+
+-- | An ordering refusal, as the recording answers it.
+accessRefused ∷ Access.AccessRefusal ResourceId → Refusal
+accessRefused refusal = case refusal of
+  Access.UseNotLegal {} → RefusedUnsupported (describeAccess refusal)
+  Access.DiscardNotLegal {} → RefusedUnsupported (describeAccess refusal)
+  _ → RefusedIllegal (describeAccess refusal)
+
+describeAccess ∷ Access.AccessRefusal ResourceId → Text.Text
+describeAccess = \case
+  Access.UseNotLegal kind use → "the use " <> tshow use <> " of a " <> tshow kind
+  Access.DiscardNotLegal kind → "discarding the contents of a " <> tshow kind
+  Access.UseMismatch current asked → "a resource that is " <> tshow current <> ", not " <> tshow asked
+  Access.KindMismatch recorded named → "a " <> tshow recorded <> " named as a " <> tshow named
+  Access.AwayFromRest resource kind use → tshow resource <> ", a " <> tshow kind <> ", " <> tshow use <> " rather than at rest"
 
 -- | Begin dynamic rendering into the frame's image view, cleared to the
 -- color, across the whole extent. The image must be a color attachment. On a

@@ -910,6 +910,7 @@ shape = \case
   CommandHostReadBarrier {} → "host read barrier"
   CommandBeginLabel _ → "label"
   CommandEndLabel → "end label"
+  CommandResourceBarrier {} → "resource barrier"
 
 verdictClean ∷ DiagnosticVerdict → Bool
 verdictClean = null . verdictIssues

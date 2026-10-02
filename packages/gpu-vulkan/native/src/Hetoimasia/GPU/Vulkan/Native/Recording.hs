@@ -112,9 +112,37 @@
 -- support it for the kind's use or at that size. Each image owns one view of
 -- its whole resource, created, named and destroyed with it. Their memory is the
 -- device allocator's, charged as its blocks; each reserves its objects — two
--- for a buffer, three for an image — and no bytes. Nothing records through
--- them yet, and nothing writes them. Disposal destroys an image's view, then
--- the image, then its allocation.
+-- for a buffer, three for an image — and no bytes. Nothing writes them yet,
+-- and the only thing a batch records over them is a barrier (see Ordering).
+-- Disposal destroys an image's view, then the image, then its allocation.
+--
+-- = Ordering
+--
+-- 'transitionResource' (GRS-3) moves a managed buffer or image between the
+-- uses of its kind within a batch, under the GPU model's pure ordering rules
+-- ("Hetoimasia.GPU.Model.Access"); 'useScope' and 'useLayout' map each use
+-- onto Vulkan's stages, accesses and layouts. Every resource rests, between
+-- batches, in its kind's resting use. A batch's first touch of a resource
+-- records an entry barrier out of that resting use, and its seal an exit
+-- barrier back into it for every resource it touched — mechanical barriers no
+-- consumer records, which on the one graphics queue chain each batch's
+-- accesses to the batches submitted before it. Between them the consumer moves
+-- a resource only by an explicit transition, from the use the batch left it
+-- in: anything else is refused with no native call. A batch that leaves a
+-- resource away from rest is refused its seal and left partial, as one that
+-- leaves rendering open is; its exit barriers never stand in for a
+-- transition the consumer omitted. A barrier that raised, at entry, in a
+-- transition or at the seal, leaves the batch partial with every reference it
+-- took, until a discard or reset invalidates it.
+--
+-- A new image awaits initialization. The first batch that touches it must
+-- initialize it, by a transition from undefined contents; any other first
+-- touch, or one by another batch before the initializing batch has been
+-- submitted, is 'RefusedUninitialized'. Only a submission the queue accepted
+-- publishes the initialization: recording, sealing, a fence reset, a no-effect
+-- failure, an unknown effect, a discard and a reset never do, and a dropped
+-- initializing batch leaves its image awaiting initialization again. Swapchain
+-- images keep 'transitionImage' and 'supportedTransition' unchanged.
 --
 -- = State
 --
@@ -164,6 +192,8 @@ module Hetoimasia.GPU.Vulkan.Native.Recording
   , ImageQuery (..)
   , ImageLimits (..)
   , ViewRequest (..)
+  , AccessScope (..)
+  , BarrierObject (..)
 
     -- * The recording
   , Recording
@@ -200,6 +230,16 @@ module Hetoimasia.GPU.Vulkan.Native.Recording
   , ImageDescription (..)
   , fullMipChain
   , createImage
+
+    -- * Ordering (GRS-3)
+  , Ordered
+  , ResourceUse (..)
+  , TransitionSource (..)
+  , bufferResourceKind
+  , imageResourceKind
+  , useScope
+  , useLayout
+  , transitionResource
 
     -- * Recording
   , Recorder
@@ -248,6 +288,7 @@ module Hetoimasia.GPU.Vulkan.Native.Recording
   , RecoveryEnd (..)
   ) where
 
+import Hetoimasia.GPU.Model.Access (ResourceUse (..), TransitionSource (..))
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Batches (discardBatch, noteBatchSubmitted, resetFrameRecorder)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Construction
   ( createBuffer
@@ -262,7 +303,9 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Construction
 import Hetoimasia.GPU.Vulkan.Native.Internal.Reclamation (AllocationNotRecovered (..), RecoveryEnd (..))
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Disposal (disposeResources, newRecording, retireRecording)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
-  ( BufferDescription (..)
+  ( AccessScope (..)
+  , BarrierObject (..)
+  , BufferDescription (..)
   , BufferKind (..)
   , ClearColor (..)
   , ImageDescription (..)
@@ -286,7 +329,11 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   , RecordingOps (..)
   , Rect (..)
   , Viewport (..)
+  , bufferResourceKind
+  , imageResourceKind
   , supportedTransition
+  , useLayout
+  , useScope
   )
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Readback (fillReadback, readReadback)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Recorder
@@ -302,6 +349,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Recorder
   , setScissor
   , setViewport
   , transitionImage
+  , transitionResource
   )
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   ( BatchInvalidationFailed (..)
@@ -313,6 +361,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , Managed (managedResource)
   , ManagedStanding (..)
   , ManagedView (..)
+  , Ordered
   , Pipeline
   , PipelineLayout
   , Readback

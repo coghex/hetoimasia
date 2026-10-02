@@ -94,6 +94,12 @@ module Hetoimasia.GPU.Model
   , releaseResource
   , endResourceCpuUse
 
+    -- * Initialization
+  , Initialization (..)
+  , requireInitialization
+  , enterResource
+  , resourceInitialization
+
     -- * Frames
   , FramePhase (..)
   , AcquireOutcome (..)
@@ -188,6 +194,7 @@ import Hetoimasia.GPU.Model.Internal.Generations
   , publishGeneration
   , retireGeneration
   )
+import Hetoimasia.GPU.Model.Internal.Initialization (Initialization (..), enterResource, requireInitialization, resourceInitialization)
 import Hetoimasia.GPU.Model.Internal.Memory
   ( MemoryEffect (..)
   , MemorySettlement (..)

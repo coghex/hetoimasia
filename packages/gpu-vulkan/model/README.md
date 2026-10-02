@@ -39,8 +39,9 @@ CPU scope exit are none of them evidence. Which native mechanism proved a fact i
 deliberately absent from the fact.
 
 The public API is `Hetoimasia.GPU.Model`, with the identities in
-`Hetoimasia.GPU.Model.Identity` and the configuration in
-`Hetoimasia.GPU.Model.Budget`. The implementation modules under
+`Hetoimasia.GPU.Model.Identity`, the configuration in
+`Hetoimasia.GPU.Model.Budget`, and the pure ordering rules for managed
+resources (GRS-3) in `Hetoimasia.GPU.Model.Access`. The implementation modules under
 `Hetoimasia.GPU.Model.Internal` are hidden, which is what makes an identity
 unforgeable: no client can build one. They divide one immutable model value by
 responsibility — its representation, shared resolution and accounting, the

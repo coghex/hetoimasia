@@ -44,8 +44,8 @@ registered as the CPU validation group `test.vulkan`, whose command runs through
 `cabal.project.cpu`. A developer with no Vulkan SDK can therefore build and run
 it, and that is a permanent property rather than a convenience.
 
-Only `Hetoimasia.GPU.Model`, `Hetoimasia.GPU.Model.Budget` and
-`Hetoimasia.GPU.Model.Identity` are exposed. The implementation lives in hidden
+Only `Hetoimasia.GPU.Model`, `Hetoimasia.GPU.Model.Access`,
+`Hetoimasia.GPU.Model.Budget` and `Hetoimasia.GPU.Model.Identity` are exposed. The implementation lives in hidden
 `Hetoimasia.GPU.Model.Internal` modules, which is what makes an identity
 unforgeable: no client can build one, so every value a model is handed was issued
 by some model, and the model it reaches can say whether that model was this one.
@@ -61,12 +61,12 @@ are all under `Hetoimasia.GPU.Model.Internal`.
 
 | Layer                  | Modules | Owns |
 | ---------------------- | ------- | ---- |
-| Value types            | `Identity`, `Hold`, `Budget`, `Recovery` | Identities and misuse, the hold ledger, validated budgets, and per-episode recovery and backoff policy |
+| Value types            | `Identity`, `Hold`, `Budget`, `Recovery`, `Access` | Identities and misuse, the hold ledger, validated budgets, per-episode recovery and backoff policy, and the ordering rules for managed resources |
 | Representation         | `Records`, `State` | The records a session holds; the `GpuModel` value, its construction, `Outcome`, and the session state that gates admission |
 | Shared building blocks | `Resolve`, `Accounting` | Identity resolution and misuse classification; record edits, object and byte accounting, and freeing a frame slot whose obligations have ended |
 | Read-only queries      | `Work` | The work summary, the one disposal-eligibility rule, replacements owed, and recovery deadlines |
 | Scheduling             | `Scheduling` | The one scheduling rule and the wrappers every transition applies it through |
-| Transitions            | `Session`, `Targets`, `Generations`, `Resources`, `Memory`, `Frames`, `Recording`, `Submission`, `Presentation`, `Completion`, `TargetRecovery`, `Disposal` | Escalation and device loss; target, generation, managed-resource and allocation lifecycles; device-memory reservation and settlement; reservation and acquisition; recorded batches; submission; presentation and abandonment; injected evidence; recovery transitions; disposal and reclamation |
+| Transitions            | `Session`, `Targets`, `Generations`, `Resources`, `Initialization`, `Memory`, `Frames`, `Recording`, `Submission`, `Presentation`, `Completion`, `TargetRecovery`, `Disposal` | Escalation and device loss; target, generation, managed-resource and allocation lifecycles; image initialization; device-memory reservation and settlement; reservation and acquisition; recorded batches; submission; presentation and abandonment; injected evidence; recovery transitions; disposal and reclamation |
 | Composition            | `Progress` | Owner turns and the deadline of the next one |
 | Views                  | `Observation` | Hold, frame and target views, usage, and the live record count |
 
@@ -80,8 +80,9 @@ all read it. The public `disposalEligible` is a narrower observation: it answers
 only whether a live subject still owes a hold, and never authorizes a disposal or
 a retry after one failed. `Recovery` is the episode policy as values;
 `TargetRecovery` applies it to the model's targets. Within the transition layer,
-`Presentation` builds on `Recording`'s batch discard and `Disposal` on
-`Completion`'s evidence interface, and nothing imports back.
+`Presentation` builds on `Recording`'s batch discard, `Recording` and
+`Submission` on `Initialization`'s withdrawal and publication, and `Disposal`
+on `Completion`'s evidence interface, and nothing imports back.
 
 ## Answers
 
@@ -684,6 +685,91 @@ Time enters only as an `Instant` the caller read from the foundation's injected
 clock. The model reads no clock, and a scripted clock is therefore enough to
 prove the whole schedule.
 
+## Ordering managed resources
+
+GRS-3 (#335; resource services design D-18 and D-26) orders every access a
+batch makes to a managed buffer or image. The legality rules are pure and
+stated in engine terms — a resource's kind and the use a command makes of it —
+in `Hetoimasia.GPU.Model.Access`, which names no native type. The backend maps
+each use onto its own layouts, stages and accesses
+([the backend contract](gpu_backend.md#ordering-managed-resources)).
+
+**Kinds and resting uses.** Every kind has legal uses, and one of them is its
+resting use: what every batch finds the resource in and must leave it in.
+
+| `ResourceKind` | Resting use | Other legal uses |
+| --- | --- | --- |
+| `TextureResource` | `ShaderSampled` | `TransferWrite` |
+| `DepthTargetResource` | `DepthAttachment` | — |
+| `ColorTargetResource` | `ColorAttachment` | `TransferRead` |
+| `VertexResource`, `IndexResource` | `GeometryRead` | `TransferWrite` |
+| `InstanceResource` | `InstanceRead` | — |
+| `LookupResource` | `StorageRead` | — |
+| `StagingResource` | `TransferRead` | — |
+
+`restingUse` and `legalUses` state the table; each other use is one the kind's
+usage provides for — a texture is uploaded into, a color target copied out of,
+static geometry staged into. Only an image kind (`isImageKind`) has contents
+that can be undefined. No layout or access state is kept across batches, so
+recording order and submission order can never disagree about it.
+
+**A batch's accesses.** A `BatchAccess` is the use each resource a batch has
+touched is in, keyed by whatever identifies a resource to its recorder, which
+threads it while the batch records. An untouched resource is at rest. Three
+pure steps advance it, each answering the barriers the batch then owes, or an
+`AccessRefusal` that changes nothing:
+
+- `touch` is a command using a resource in the use it is already in. The first
+  touch finds it at rest and owes the **entry barrier** from the resting use
+  into it; a command that discards the contents (`DiscardsContents`, an
+  attachment pass that clears) takes that barrier from undefined. Any later
+  touch must name the use the batch left the resource in, and owes nothing.
+- `transition` is an explicit move, from a use (`FromUse`) or from undefined
+  contents (`FromUndefined`, images only), into another legal use of the kind
+  — or into the same use, which orders the batch's earlier accesses in it
+  before its later ones. It must start from the use the batch left the
+  resource in, which on the first touch is the resting use. The first touch's
+  transition is itself the entry barrier, one barrier from the resting use
+  straight into its destination; a later one is an explicit
+  `TransitionBarrier`.
+- `sealAccess` decides whether the batch may seal. A batch that leaves any
+  resource away from its resting use is refused (`AwayFromRest`): the
+  consumer's explicit transition back is required, and the exit barriers never
+  stand in for it. Otherwise it owes one **exit barrier** per resource touched,
+  from the resting use back to it — a same-use barrier, still owed.
+
+Refusals are `UseNotLegal` (a use the kind never takes), `DiscardNotLegal` (a
+buffer's contents), `UseMismatch` (the resource is in another use) and
+`KindMismatch` (the batch touched it as another kind). A `Barrier` carries the
+resource, its kind, its role (`EntryBarrier`, `TransitionBarrier`,
+`ExitBarrier`), the use it waits for, the use it makes ready, and whether it
+discards; its first scope is always the use the resource was in, even when it
+discards. On the one graphics queue an entry barrier's first scope covers every
+earlier submission, so each batch's entry barriers chain to earlier batches'
+exit barriers: write-after-write, read-after-write and write-after-read between
+batches are ordered even when no layout changes.
+
+**Initialization.** The model tracks whether each resource generation's
+contents are usable. `requireInitialization` marks a new image, before any
+batch or submission has named it, as `Uninitialized`. `enterResource` admits a
+batch's first touch of a resource the batch already retains, keeping or
+discarding its contents:
+
+- a resource that needs no initialization, or is `Initialized`, admits any
+  first touch;
+- an `Uninitialized` image admits only a touch that discards its contents, and
+  the batch is then `InitializingIn` it;
+- an image another unsubmitted batch is initializing admits none.
+
+A refusal is `WrongPhase` of the resource. Only `submitFrames` with
+`SubmissionAccepted` publishes the initialization of what its batches
+initialized. Recording, sealing, `resetSubmissionFence`,
+`SubmissionFailedWithoutEffect` and `SubmissionEffectUncertain` never do; an
+uncertain submission, a discarded batch, a reset recorder and a skipped frame
+leave what their batch was initializing `Uninitialized` again, so another batch
+may initialize it. Nothing here changes a resting use, which is the kind's.
+`resourceInitialization` reads where a generation stands.
+
 ## State
 
 | State             | Owner              | Readers and writers       | Thread | Lifetime     | Reset or disposal                          |
@@ -691,6 +777,8 @@ prove the whole schedule.
 | The `GpuModel`    | The owning boundary| Whoever threads the value | Any    | The session  | A record leaves only when every hold has ended |
 | Escalation notices| The owning boundary| The model raises; `takeEscalations` drains | Any | Until taken | Dropped oldest-first past the window, and counted |
 | Device-memory charges | The owning boundary | Reserved per attempt by `reserveDeviceMemory`; settled by `settleDeviceMemory` after every allocator call | Any | The session | Released only as the boundary reports memory freed |
+| A resource generation's initialization | The owning boundary | Marked by `requireInitialization`; claimed by `enterResource`; published by an accepted `submitFrames`; withdrawn when its batch is dropped or its submission's effect is unknown; read by `resourceInitialization` | Any | The generation's record | Leaves with the record |
+| A batch's accesses (`BatchAccess`) | The batch's recorder | The recorder threads it through `touch`, `transition` and `sealAccess` | The recorder's | One batch's recording | Dropped with the recorder; never kept across batches |
 
 Nothing accumulates as history. A disposed resource's current-generation entry is
 removed, a settled frame gives back the reservations it never used, and a
@@ -778,6 +866,18 @@ phase before that enqueue; two records of one image settling independently in
 either retirement order; a pool one generation exhausted by repeated acquisition;
 and a logical resource forgotten after its last generation is disposed of while a
 retained identity for it is still called stale.
+
+Its `access` group covers GRS-3's ordering rules: every kind's legal and
+illegal uses and transitions, a transition from undefined admitted for an image
+only, a use or transition that does not match the use the batch left the
+resource in; the entry barrier owed on the first touch only and an exit barrier
+for every resource touched; a seal refused for every kind left in each of its
+non-resting uses; an image's first touch refused unless it initializes it, and
+any other batch's refused until the initializing batch is submitted; the
+initialization published by an accepted submission before anything completed,
+and by the retry after a no-effect failure, but by no fence reset, no-effect
+failure or unknown effect; and an image left uninitialized by a discard, a
+recorder reset and a skipped frame.
 
 It covers the same class of edge for the transitions themselves: a still-
 constructing candidate refused as an `oldSwapchain` predecessor without mutating

@@ -18,6 +18,7 @@ import qualified Data.Set as Set
 import Hetoimasia.GPU.Model.Internal.Accounting (chargeObjects, editFrame, editHolds, holdsOf, releaseObjects)
 import Hetoimasia.GPU.Model.Internal.Hold (Holds (cpuUseEnded, logicalReleased), dischargeRecorded, retainRecorded)
 import Hetoimasia.GPU.Model.Internal.Identity
+import Hetoimasia.GPU.Model.Internal.Initialization (withdrawInitialization)
 import Hetoimasia.GPU.Model.Internal.Records
 import Hetoimasia.GPU.Model.Internal.Resolve (resolveBatch, resolveFrame, resolveResource)
 import Hetoimasia.GPU.Model.Internal.Scheduling (scheduling, scheduling_)
@@ -122,8 +123,10 @@ discardBatch identity model =
   resolved (resolveBatch model identity) $ \(number, batch) →
     Admitted (dropBatch number batch model)
 
+-- | Drop a batch that was never submitted, discharging its own references.
+-- Whatever it was initializing awaits initialization again.
 dropBatch ∷ Natural → Batch → GpuModel → GpuModel
-dropBatch number batch model =
+dropBatch number batch unwithdrawn =
   releaseObjects 1 $
     editFrame
       (batchTargetNumber batch)
@@ -131,6 +134,8 @@ dropBatch number batch model =
       (\entry → entry {frameBatches = Set.delete number (frameBatches entry)})
       (foldl' (\current key → editHolds key (dischargeRecorded number) current) model (Set.toList (batchSubjects batch)))
         {gpuBatches = Map.delete number (gpuBatches model)}
+  where
+    model = withdrawInitialization number batch unwithdrawn
 
 -- | Reset a frame's recorder: every one of its unsubmitted batches is
 -- discarded, and nothing else is.
