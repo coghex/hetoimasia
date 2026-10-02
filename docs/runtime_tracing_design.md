@@ -1,13 +1,28 @@
 # Runtime tracing: proposed first contract
 
-Design state: `exploring`.
+Design state: `exploring`
 
 This is the proposed contract for RTC-1 in the
 [runtime capability report](runtime_capabilities_findings.md#rtc-1-runtime-performance-evidence-lacks-a-correlated-engine-timeline).
 The owner requested a documentation-only design discussion on 2026-09-23:
 no issue drafts, tracker changes, implementation, or delivery decomposition.
 The recommendations below are proposals, not approved behavior or delivered
-capabilities. No new epic is proposed.
+capabilities. The processing ledger below tracks only resolution of the design
+questions; it authorizes no issue drafting, tracker changes, or implementation.
+
+Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]` reviewed and deliberately not tracked separately · `[deferred]` blocked on a concrete precondition
+
+## Processing status
+
+- [ ] EPIC. Resolve the proposed first runtime tracing contract
+- [ ] RTC-1. Decide the capture backend, inspection route, and initial bounds
+
+## Epic contract
+
+- **Goal:** settle whether the proposed opt-in tracing contract is suitable for a first implementation arc.
+- **Done when:** the owner has dispositioned Q-1 through Q-3 and this document records those decisions or an explicit no-issue disposition. Implementation details and any further slices remain out of scope until separately authorized.
+- **Scope:** the current RTC-1 proposal and its three open design questions only.
+- **Boundary:** this exploratory design ledger does not authorize issue drafting, tracker changes, or implementation.
 
 ## Purpose and recommendation
 
@@ -235,3 +250,10 @@ RTC-1 remains unprocessed in the report; this proposal is not its completion.
 - `Debug.Trace` in the locally installed GHC 9.14.1 / base 4.22.0.0 documentation: `traceEventIO` sequencing and `flushEventLog`. Exact installed HTML was inspected; no backend implementation has been qualified by this document.
 - [Perfetto supported external formats](https://perfetto.dev/docs/getting-started/other-formats): Chrome Trace Event JSON import.
 - [Current logging contract](logging.md), [time contract](time.md), and [runtime capability findings](runtime_capabilities_findings.md).
+
+
+## Delivery plan
+
+### RTC-1. Decide the capture backend, inspection route, and initial bounds
+
+Resolve Q-1 through Q-3 in this document. Until the owner records those choices, the proposal remains exploratory and no implementation breakdown is in scope.

@@ -30,14 +30,16 @@ completes the original foundation epic.
 
 ## Status
 
-- [ ] FND-3. Render and capture a minimal 3D scene through a public contract
-- [ ] FND-4. Add an independent 2D consumer over the same GPU infrastructure
+- [ ] FND-3. Render and capture a minimal 3D scene through a public contract — [deferred]: #349 and #350 land
+- [ ] FND-4. Add an independent 2D consumer over the same GPU infrastructure — [deferred]: #345 and #346 land
 
 ---
 
 ## Minimal reusable rendering consumers
 
-### FND-3. Render and capture a minimal 3D scene through a public contract
+### [deferred] FND-3. Render and capture a minimal 3D scene through a public contract
+
+> **Deferred:** Blocked on sequencing — `render-3d` must be designed over the public depth, buffer and recording vocabulary that epic #330 delivers (D-2, D-3), none of whose 3D slices has landed; a contract written now would specify interfaces that do not exist. Precondition: #349 (GRS-10, offscreen depth and the 3D scaffolding sample) and #350 (GRS-13, windowed depth per swapchain generation) are both closed as completed; then take FND-3 to `/design-epic` as the `render-3d` arc.
 
 The accepted triangle exercises the backend but does not establish a reusable
 contract for camera-driven, depth-tested scene geometry. A small external
@@ -76,7 +78,9 @@ drawing game managers into the engine.
 - PBR, animation, shadows, general asset import and Synarchy migration remain
   outside this concern.
 
-### FND-4. Add an independent 2D consumer over the same GPU infrastructure
+### [deferred] FND-4. Add an independent 2D consumer over the same GPU infrastructure
+
+> **Deferred:** Blocked on sequencing — `render-2d` must be designed over the textured-quad, blending and texture-handle vocabulary that epic #330 delivers (D-2, D-3; D-8 leaves `render-api` to this arc), and its 2D scaffolding has not landed; a contract written now would specify interfaces that do not exist. Precondition: #345 (GRS-8, the 2D scaffolding sample) and #346 (GRS-9, swapping a texture's image under the same handle) are both closed as completed; then take FND-4 to `/design-epic` as the `render-2d` arc.
 
 A small textured 2D consumer is needed early to check that GPU services are
 reusable without constructing a 3D renderer. This was an explicit foundation
