@@ -4247,6 +4247,16 @@ on which failure it is, and the split is deliberate:
 | A target's construction or retirement, which the owner caught and carried on from | `readOwnerFailures`, with the context it propagated with | Retained beside whatever else the exit found |
 | The owner's own startup, step, or deadline, which ended its run | The worker's own outcome | Read back from the joined group's report |
 | Its whole-owner retirement or destruction, which its drain absorbed | The worker's own outcome, through the drain it settles into | Read back from the same report |
+| Its final wake — the one post-drain `wakeGraphicsHost` that tells the main thread its run has ended — when that raises rather than degrading | The worker's own outcome, folded into the drain's failures after them, in attempt order | Read back from the same report |
+
+The worker's outcome keeps a run failure primary and retains each distinct
+drain failure, and then the final wake's, beside it under the owner's
+retirement cleanup label. After a successful run the first of them in attempt
+order is primary, and a wake failure alone is reported as itself. The wake is
+attempted once and never retried, and its notification obligation is
+discharged before it can raise, so the exit never waits on it. A wake that
+degrades with the expected platform error raises nothing and is reported only
+by the host's own wake report, as before.
 
 A failure that ends the run is not put in the retained store, because the run
 ending is how it is already reported: the worker's outcome carries it, the
@@ -4272,7 +4282,7 @@ the one store entry that is that same failure:
 | The latch came from | What the exit leaves out once the sentinel has delivered |
 |---|---|
 | A target failure the owner survived | The first entry of `readOwnerFailures`, which is that failure — `retainFailure` latches only when nothing is latched yet and appends in the same transaction. Every later retained failure is still reported. |
-| The failure that ended the run | The whole of the worker's outcome, which is that failure. Nothing distinct goes with it: whatever the drain found is retained inside that same outcome, and the owner group's own scope — which closes after the exit, outside the protected host lifetime — reports it there. |
+| The failure that ended the run | The whole of the worker's outcome, which is that failure. Nothing distinct goes with it: whatever the drain found, and a failure of the final wake, is retained inside that same outcome, and the owner group's own scope — which closes after the exit, outside the protected host lifetime — reports it there. |
 
 Re-raising either would retain a second copy under a fresh identity that
 inspection cannot fold together with the first. A composition that registers
