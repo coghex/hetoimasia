@@ -21,10 +21,11 @@ import Control.Concurrent.STM
   , modifyTVar'
   , newTVarIO
   , readTVar
+  , readTVarIO
   , retry
   , writeTVar
   )
-import Control.Exception (SomeException, try)
+import Control.Exception (SomeException, finally, try)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import qualified Data.Text as Text
 import Hetoimasia.Foundation.Log (Logger)
@@ -32,6 +33,7 @@ import Hetoimasia.Foundation.Messaging.Payload (prepare)
 import Hetoimasia.Foundation.Time (MonotonicSource, scriptedSource)
 import Hetoimasia.GLFW.Internal.Seam
   ( NativeCall (..)
+  , Reporter
   , Seam
   , SeamScript (..)
   , asProcessMainThread
@@ -61,8 +63,13 @@ countingClock = do
 -- | A seam that journals its own destroy and terminate calls, records the
 -- thread each native call was made from, and whose finite wait returns at once
 -- so the main thread's housekeeping keeps turning.
-ownerSeam ∷ TVar [Note] → IO (Seam, TVar [(ThreadId, NativeCall)])
-ownerSeam journal = do
+--
+-- Each empty-event post first runs whatever the cell holds, which is how an
+-- example makes a wake report an error or raise. It still posts afterwards:
+-- this wait ignores its bound, so the post stands in for the bound a real
+-- finite wait would end by, and a failed wake never strands the main thread.
+ownerSeam ∷ TVar [Note] → TVar (Reporter → IO ()) → IO (Seam, TVar [(ThreadId, NativeCall)])
+ownerSeam journal waking = do
   threaded ← newTVarIO []
   posts ← newTVarIO (0 ∷ Int)
   held ← newIORef Nothing
@@ -87,9 +94,9 @@ ownerSeam journal = do
             atomically $
               readTVar posts >>= \pending →
                 if pending <= 0 then retry else writeTVar posts (pending - 1)
-        , scriptPostEmptyEvent = \_ → do
+        , scriptPostEmptyEvent = \reporter → do
             recordFrom PostEmptyEvent
-            atomically (modifyTVar' posts (+ 1))
+            (readTVarIO waking >>= ($ reporter)) `finally` atomically (modifyTVar' posts (+ 1))
         , scriptCreateWindow = \_ → True <$ recordFrom (CreateWindow 0 0 (Text.pack "window"))
         }
   atomicModifyIORef' held (\_ → (Just seam, ()))
@@ -203,6 +210,9 @@ data Rig = Rig
   , rigTimer ∷ !ScriptedTimer
   , rigHostConfig ∷ !HostConfig
   , rigOwnerConfig ∷ !(GraphicsOwnerConfig Scene)
+  , rigWake ∷ !(TVar (Reporter → IO ()))
+    -- ^ What every later empty-event post does before it posts: nothing, until
+    -- an example scripts a wake that reports an error or raises.
   }
 
 newRig ∷ IO Rig
@@ -211,7 +221,8 @@ newRig = newRigWith id
 newRigWith ∷ (GraphicsOwnerConfig Scene → GraphicsOwnerConfig Scene) → IO Rig
 newRigWith adjust = do
   journal ← newTVarIO []
-  (seam, threaded) ← ownerSeam journal
+  waking ← newTVarIO (\_ → pure ())
+  (seam, threaded) ← ownerSeam journal waking
   fake ← newFake journal
   (timer, injected) ← newScriptedTimer
   clock ← countingClock
@@ -220,4 +231,4 @@ newRigWith adjust = do
         adjust
           (graphicsOwnerConfig (fakeOperations fake) scene)
             {ownerClockTimer = injected}
-  pure (Rig seam threaded journal fake timer (ownerSettings clock) ownerConfig)
+  pure (Rig seam threaded journal fake timer (ownerSettings clock) ownerConfig waking)
