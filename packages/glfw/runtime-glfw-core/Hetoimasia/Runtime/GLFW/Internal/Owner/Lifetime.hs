@@ -3,10 +3,14 @@
 -- them, and the supervision sentinel.
 --
 -- It runs on the main thread, except the sentinel, which is one ordinary
--- supervised service in the application's worker group. It owns no state of
--- its own: the owner's worker group is scoped here, the host's lifetime is the
--- host's, and the two are joined only through the protected exit's two
--- interposition points, so their ordering stays visible at this composition.
+-- supervised service in the application's worker group, and the quiescence
+-- step, which commits inside whichever thread's transaction quiesces the
+-- host. It owns no state of
+-- its own beyond the cells its exit reads the owner from: the owner's worker
+-- group is scoped here, the host's lifetime is the host's, and the two are
+-- joined only through the protected exit's three interposition points — its
+-- quiescence, before the drain, and after it — so their ordering stays visible
+-- at this composition.
 -- Host attachment retirement stays the host's, and whole-owner destruction and
 -- join stay the owner's, in "Hetoimasia.Runtime.GLFW.Internal.Owner.Exit".
 --
@@ -16,7 +20,11 @@
 -- so that a whole-session exit runs in this order:
 --
 -- 1. quiescence closes the host's admission — commands, demand, input, and new
---    graphics use — and then the owner's own lifetime port;
+--    graphics use — and then, in the same transaction, the owner's own
+--    publications: its lifetime port, its demand and scene snapshots, and every
+--    observation slot. That is the host's 'quiesceWindowHost', so the
+--    application's pre-drain quiescence does it before any ordinary worker is
+--    asked to stop, and it stops, retires, and joins nothing;
 -- 2. ordinary application workers stop and drain, which is the runtime's own
 --    ordering and touches the owner's group not at all;
 -- 3. the owner stays alive and retires each target and then itself through its
@@ -43,11 +51,10 @@ module Hetoimasia.Runtime.GLFW.Internal.Owner.Lifetime
   , superviseGraphicsOwner
   ) where
 
-import Control.Concurrent.STM (atomically, check, readTVar, writeTVar)
+import Control.Concurrent.STM (atomically, check, newTVarIO, readTVar, readTVarIO, writeTVar)
 import Control.Exception (mask_, rethrowIO)
 import Control.Monad (when)
 import Data.Foldable (traverse_)
-import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Maybe (isJust)
 import Data.Text (Text)
 import Hetoimasia.Foundation.Log (Logger)
@@ -143,12 +150,24 @@ withGraphicsOwnerHostAll hooks logger sessionScope config ownerConfig use = do
   -- a cell the consumer filled rather than from a value it could be given. An
   -- exit that finds none is a host whose owner never started, which still
   -- quiesces, drains, and unwinds exactly as an owner-less protected host does.
-  pending ← newIORef Nothing
+  pending ← newTVarIO Nothing
+  -- Whether the host's quiescence has committed. The owner is published after
+  -- the host exists, so a quiescence that committed first must still close it:
+  -- the publication reads this in the same transaction that fills the cell,
+  -- and no order of the two leaves an owner admitting after quiescence.
+  quiesced ← newTVarIO False
   let exit =
         ProtectedExit
-          { exitBeforeDrain = \_ _ → readIORef pending >>= traverse_ beginOwnerExit
-          , exitAfterDrain = \host restore → readIORef pending >>= traverse_ (finishOwnerExit (afterDestructionSnapshot hooks) restore logger host)
+          { exitQuiescence = do
+              writeTVar quiesced True
+              readTVar pending >>= traverse_ (closeOwnerPublications . ownerHandoff')
+          , exitBeforeDrain = \_ _ → readTVarIO pending >>= traverse_ beginOwnerExit
+          , exitAfterDrain = \host restore → readTVarIO pending >>= traverse_ (finishOwnerExit (afterDestructionSnapshot hooks) restore logger host)
           }
+      publish owner = atomically $ do
+        writeTVar pending (Just owner)
+        closed ← readTVar quiesced
+        when closed (closeOwnerPublications (ownerHandoff' owner))
   -- The group's own scope sits outside the protected host lifetime
   -- deliberately: D-33 forbids an automatic join that could run before the
   -- main thread has serviced retirement, and the exit's own
@@ -157,16 +176,19 @@ withGraphicsOwnerHostAll hooks logger sessionScope config ownerConfig use = do
   -- has already drained, so its automatic join finds it settled.
   withWorkerGroup $ \group →
     withProtectedWindowHostOver hooks exit logger sessionScope config $ \host → do
-      owner ← startGraphicsOwner group host (afterOwnerOperation hooks) ownerConfig (writeIORef pending . Just)
+      owner ← startGraphicsOwner group host (afterOwnerOperation hooks) ownerConfig publish
       use host owner
 
 -- | 'Hetoimasia.Runtime.GLFW.runProtectedWindowApplication' over a host that
 -- owns a graphics owner.
 --
 -- Every step keeps the runner's order, thread, and labels. The application's
--- own quiescence still runs before the ordinary worker drain, supervision
--- still drains the ordinary group, and the owner's group is untouched by
--- either: its exit is the protected boundary's, in D-33's order.
+-- own quiescence still runs before the ordinary worker drain, and because the
+-- host's quiescence closes the owner's publications too, every escaped owner
+-- endpoint refuses from that transaction on, before an ordinary worker is
+-- asked to stop. Supervision still drains the ordinary group, and the owner's
+-- group is untouched by either: the owner keeps running, and its stop,
+-- retirement, and join are the protected boundary's, in D-33's order.
 runGraphicsOwnerApplication
   ∷ (∀ r. (LoggingLifetime → IO r) → IO r)
   → Text
@@ -233,7 +255,9 @@ superviseGraphicsOwner control owner = startSupervised control policy definition
 --
 -- The order matters: the host's own quiescence has already closed attachment
 -- admission, so nothing can reserve a port slot after this closes the port,
--- and an attachment that got past admission always found the port open.
+-- and an attachment that got past admission always found the port open. The
+-- close is idempotent: that same quiescence has normally closed every
+-- publication already, and this adds only the stop.
 beginOwnerExit ∷ GraphicsOwner scene → IO ()
 beginOwnerExit owner = atomically $ do
   closeOwnerPublications (ownerHandoff' owner)

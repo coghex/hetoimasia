@@ -9,7 +9,8 @@
 -- which constructs it, runs its owner loops, and releases it. That thread is
 -- the only writer of every cell, with three exceptions that commit in STM and
 -- may come from any thread: the host's quiescence transaction, which closes the
--- admission recorded in the registry and the demand slots; a worker's demand
+-- admission recorded in the registry and the demand slots, and whatever an
+-- interposed lifetime closes beside them; a worker's demand
 -- publication; and a completion notice's publication. The 'IORef' cells —
 -- borrows, surfaced close requests, and the two rotation cursors — are read
 -- and written by the owner thread alone. Any thread may read the 'TVar' cells.
@@ -40,7 +41,7 @@ module Hetoimasia.Runtime.GLFW.Internal.Host.State
   , noRetirementDemand
   ) where
 
-import Control.Concurrent.STM (TVar)
+import Control.Concurrent.STM (STM, TVar)
 import Data.IORef (IORef)
 import Data.Map.Strict (Map)
 import Data.Text (Text)
@@ -93,6 +94,11 @@ data WindowHost = WindowHost
     -- yet finished with: never more than one per live window, so repeated
     -- detaching and reattaching grows nothing the host owns. A retained
     -- 'GraphicsService' keeps its own cell after the host drops it.
+  , hostInterposedQuiescence ∷ STM ()
+    -- ^ What a lifetime interposed on the protected exit closes in the host's
+    -- own quiescence transaction, after the host's admission: the graphics
+    -- owner's publications. Fixed at construction; every other host does
+    -- nothing here.
   }
 
 -- | Where the private examples interrupt a host. Production passes

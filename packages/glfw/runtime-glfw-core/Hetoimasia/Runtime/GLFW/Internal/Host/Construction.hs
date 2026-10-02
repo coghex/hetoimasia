@@ -97,13 +97,18 @@ allocWindowHostIn = allocWindowHostWith noHostHooks
 
 -- | 'allocWindowHostIn' with the private examples' hooks.
 allocWindowHostWith ∷ HasCallStack ⇒ HostHooks → Scoped Session → HostConfig → Scoped WindowHost
-allocWindowHostWith = allocHostOver Unprotected
+allocWindowHostWith hooks = allocHostOver Unprotected hooks (pure ())
 
 
 -- | The one host construction both lifetimes use. The protected one differs in
 -- exactly one thing: it owns the retirement state its exit boundary drains.
-allocHostOver ∷ HasCallStack ⇒ HostProtection → HostHooks → Scoped Session → HostConfig → Scoped WindowHost
-allocHostOver protection hooks sessionScope config = do
+--
+-- The 'STM' action is what an interposed lifetime closes in the host's own
+-- quiescence transaction, after the host's admission; an ordinary host and a
+-- protected host with nothing interposed pass @'pure' ()@.
+allocHostOver
+  ∷ HasCallStack ⇒ HostProtection → HostHooks → STM () → Scoped Session → HostConfig → Scoped WindowHost
+allocHostOver protection hooks interposed sessionScope config = do
   liftIO (either (throwFailure hostComponent constructOperation []) pure (validateHostConfig config))
   session ← sessionScope
   entries ← liftIO (newTVarIO Map.empty)
@@ -141,6 +146,7 @@ allocHostOver protection hooks sessionScope config = do
         <*> newIORef Nothing
         <*> pure owed
         <*> pure cells
+        <*> pure interposed
   liftIO (mapM_ (registerWindow host) (hostWindowConfigs config))
   pure host
 
@@ -172,8 +178,14 @@ hostActivity = readTVar . hostActivityState
 -- every queued command as not executed, and close every window's input feed, in
 -- the calling transaction. Finite, non-retrying, and idempotent; it destroys
 -- nothing, pumps nothing, waits on nothing, and awaits no input acknowledgement.
+--
+-- A host composed with a graphics owner closes the owner's publications in the
+-- same transaction, after its own admission: the lifetime port, the demand and
+-- scene snapshots, and every observation slot. That stops, retires, and joins
+-- nothing; it is what lets the application's pre-drain quiescence refuse the
+-- owner's escaped endpoints before an ordinary worker drains.
 quiesceWindowHost ∷ WindowHost → STM ()
-quiesceWindowHost host =
+quiesceWindowHost host = do
   closeAdmission
     (hostCommands host)
     (hostEntries host)
@@ -181,6 +193,7 @@ quiesceWindowHost host =
     (hostRetirementState host)
     (hostGraphicsCells host)
     (hostRetirementDemandState host)
+  hostInterposedQuiescence host
 
 closeAdmission
   ∷ WindowCommandHost
