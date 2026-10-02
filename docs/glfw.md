@@ -2994,7 +2994,9 @@ closes every window's input feed, ending its reads even while a reset waits for
 an acknowledgement, and closes the application's demand slot and every window's.
 On a protected host the same step also ends new graphics use: no later
 attachment is admitted, and every attachment still registering or active begins
-retiring. It destroys nothing, pumps nothing, makes no GPU call, waits on
+retiring. On a host composed with a graphics owner it then closes the owner's
+publications too ([The exit, which is D-33's](#the-exit-which-is-d-33s), step
+1). It destroys nothing, pumps nothing, makes no GPU call, waits on
 nothing, and repeating it changes nothing. A window's close protocol closes that window's feed and its demand slot
 in its closing transaction the same way.
 
@@ -4140,8 +4142,18 @@ this layer's; the Vulkan backend's is in
 A whole-session exit runs in this order:
 
 1. quiescence closes the host's admission — commands, demand, input and new
-   graphics use — and then the owner's own lifetime port, in that order, so an
-   attachment that got past admission always found the port open;
+   graphics use — and then the owner's own publications: its lifetime port,
+   its demand and scene snapshots and every observation slot. Both close in the
+   host's one `quiesceWindowHost` transaction, the host's first, so an
+   attachment that got past admission always found the port open. That is the
+   transaction the application's pre-drain quiescence commits, so from it on
+   every escaped owner endpoint refuses, `targetEventsOpen` reads `False`, and
+   the gate a backend derives from it refuses, before any ordinary worker is
+   asked to stop and without waiting for the owner. It stops, retires and joins
+   nothing: the owner keeps running, events already queued on the port stay for
+   it to account for, completion evidence stays publishable, and the protected
+   exit's own close, in step 3's drain, finds the publications already closed
+   and only asks the owner to stop;
 2. ordinary application workers stop and drain, which is the runtime's own
    ordering. The owner's worker group is the component's, separate from the
    application's ordinary group and from the diagnostics worker, so the

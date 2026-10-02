@@ -54,7 +54,10 @@ supplies the Vulkan ones.
 constructor D-6 describes, beside `withProtectedWindowHost`, which keeps its
 signature and its behaviour, as does every other window-only entry point. Under
 it, a whole-session exit runs D-6's four steps exactly: quiescence closes the
-host's admission and then the owner's own bounded lifetime port; ordinary
+host's admission and then, in the same transaction, the owner's publications —
+its bounded lifetime port, its demand and scene snapshots and every observation
+slot — which the application's pre-drain quiescence commits before any ordinary
+worker is asked to stop, and which stops, retires and joins nothing; ordinary
 workers stop and drain, untouched by the owner's separate worker group; the
 owner stays alive and retires each target and then itself through its injected
 operations, publishing each certified fact through the existing completion

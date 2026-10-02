@@ -16,14 +16,25 @@ import Control.Concurrent.STM
   , writeTVar
   )
 import Control.Exception (finally, throwIO)
-import Control.Monad (forM_, void)
+import Control.Monad (forM_, void, when)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (isJust)
+import Data.Maybe (isJust, isNothing)
 import qualified Data.Text as Text
+import Hetoimasia.Foundation.Log (Component, unsafeComponent)
 import Hetoimasia.Foundation.Messaging.Payload (prepare)
 import Hetoimasia.Foundation.Messaging.Snapshot (Publication (..))
+import Hetoimasia.Foundation.Recovery (Disposition (Required))
+import Hetoimasia.Foundation.Worker (awaitStopRequest, workerDefinition)
+import qualified Hetoimasia.Foundation.Worker as Worker
 import Hetoimasia.Runtime.GLFW
-import Hetoimasia.Runtime.Supervision (SupervisedStart (..), checkRuntime)
+import Hetoimasia.Runtime.Supervision
+  ( Recognition (Unrecognized)
+  , Role (Service)
+  , SupervisedStart (..)
+  , WorkerPolicy (..)
+  , checkRuntime
+  , startSupervised
+  )
 import Test.GLFW.Owner.Fixture.Drive
   ( awaitDiagnostic
   , awaitRound
@@ -31,8 +42,11 @@ import Test.GLFW.Owner.Fixture.Drive
   , awaitTerminal
   , describeHandover
   , describeStart
+  , awaitConstructed
   , handedOver
+  , observed
   , pumpUntilRetired
+  , sampledObservation
   , theWindow
   )
 import Test.GLFW.Owner.Fixture.Fake (Fake (..), script)
@@ -41,6 +55,7 @@ import Test.GLFW.Owner.Fixture.Rig
   ( Rig (..)
   , countingClock
   , newRig
+  , newRigWith
   , ownedHost
   , ownedHostWith
   , ownerSettings
@@ -74,6 +89,8 @@ spec = do
     (boundedExample testUnverifiedDestructionRetains)
   it "refuses every publication into the handoff once the owner has quiesced"
     (boundedExample testPublicationsClosedAtExit)
+  it "refuses every publication at the application's pre-drain quiescence, while a worker drains and the owner is held"
+    (boundedExample testPublicationsClosedAtQuiescence)
   it "refuses every one of them as soon as the owner's own run has failed"
     (boundedExample testPublicationsClosedOnFailure)
   it "reports a whole-owner retirement that failed even though the destruction after it did not"
@@ -353,6 +370,116 @@ testPublicationsClosedAtExit = do
   atomically (publishOwnerDemand handoff demand) `shouldReturn` PublicationClosed
   atomically (publishOwnerScene handoff scene) `shouldReturn` ScenePublication PublicationClosed
   atomically (targetEventsOpen handoff) `shouldReturn` False
+
+-- | The application's own pre-drain quiescence closes every publication into
+-- the handoff, before an ordinary worker is asked to stop, and without
+-- waiting for the owner.
+--
+-- The owner is held inside a step from before the quiescence until after the
+-- check, with a second target's ownership queued on its lifetime port, so
+-- nothing the owner does could account for what the worker observes. The
+-- worker is an ordinary supervised service, held in the supervision drain
+-- while it looks: on the far side of the quiescence transaction and on this
+-- side of every owner stop, retirement and join. Only once it has looked does
+-- it let the owner go, and the exit then accounts for the queued ownership,
+-- retires each target, destroys the owner and joins it, in D-33's order.
+testPublicationsClosedAtQuiescence ∷ IO ()
+testPublicationsClosedAtQuiescence = do
+  rig ← newRigWith id
+  clock ← countingClock
+  let config =
+        (ownerSettings clock)
+          { hostWindowConfigs = [windowNamed (Text.pack "first"), windowNamed (Text.pack "second")]
+          }
+  holding ← newTVarIO False
+  held ← newTVarIO False
+  released ← newTVarIO False
+  stepped ← readTVarIO (fakeStep (rigFake rig))
+  script (fakeStep (rigFake rig)) $ \step → do
+    armed ← readTVarIO holding
+    when armed $ do
+      atomically (writeTVar held True)
+      atomically (readTVar released >>= check)
+    stepped step
+  evidence ← newEmptyMVar
+  escaped ← newEmptyMVar
+  ownedHost (rigSeam rig) config (rigOwnerConfig rig) $ \host owner control → do
+    windows ← atomically (hostWindowIdentities host)
+    (first, second) ← case windows of
+      [first, second] → pure (first, second)
+      other → unexpected ("the host created " <> show (length other) <> " windows")
+    service ← handedOver host owner first
+    awaitConstructed rig (Text.pack (show first))
+    -- The first target has a retained observation slot, which a fresh
+    -- revision reaches now. A stale revision or an unknown target would be
+    -- refused before any quiescence, so only a fresh one proves the slot
+    -- itself closed.
+    seen ← sampledObservation host first
+    observed owner service 1 seen `shouldReturn` ObservationAccepted 1
+    -- Hold the owner inside its next step: a scene publication asks for one.
+    atomically (writeTVar holding True)
+    _ ← atomically . publishOwnerScene (ownerHandoff owner) =<< prepare (Scene 1)
+    atomically (readTVar held >>= check)
+    -- The second target's ownership is queued, and the held owner cannot take
+    -- it.
+    _ ← handedOver host owner second
+    putMVar escaped owner
+    let watcher =
+          workerDefinition
+            (Text.pack "quiescence watcher")
+            (\_ → pure ())
+            ( \token () → do
+                atomically (awaitStopRequest token)
+                let handoff = ownerHandoff owner
+                demand ← prepare (OwnerDemand True Nothing)
+                scene ← prepare (Scene 2)
+                demanded ← atomically (publishOwnerDemand handoff demand)
+                published ← atomically (publishOwnerScene handoff scene)
+                slot ← observed owner service 2 seen
+                open ← atomically (targetEventsOpen handoff)
+                -- What the owner had done by the time every refusal was read:
+                -- still held in the step, never stopped or joined, and the
+                -- queued ownership untaken.
+                stillHeld ← not <$> readTVarIO released
+                running ← isNothing <$> atomically (Worker.pollCompletion (graphicsOwnerWorker owner))
+                notes ← journalled (rigJournal rig)
+                putMVar evidence (demanded, published, slot, open, stillHeld, running, notes)
+                atomically (writeTVar released True)
+            )
+    _ ← startSupervised control (WorkerPolicy Service Required ownerExampleComponent (\_ → pure Unrecognized)) watcher
+    pure ()
+  (demanded, published, slot, open, stillHeld, running, notesAtQuiescence) ← takeMVar evidence
+  demanded `shouldBe` PublicationClosed
+  published `shouldBe` ScenePublication PublicationClosed
+  slot `shouldBe` ObservationSlotClosed
+  open `shouldBe` False
+  stillHeld `shouldBe` True
+  running `shouldBe` True
+  notesAtQuiescence `shouldSatisfy` all (`notElem` [Constructed (Text.pack "WindowId 2"), OwnerRetirement, OwnerDestruction])
+  notesAtQuiescence `shouldSatisfy` all (not . retiring)
+  -- Released, the owner accounts for the ownership that stayed queued, retires
+  -- each target, and is destroyed and joined before any window is released.
+  owner ← takeMVar escaped
+  (isJust <$> atomically (Worker.pollCompletion (graphicsOwnerWorker owner))) `shouldReturn` True
+  notes ← journalled (rigJournal rig)
+  ordered
+    notes
+    [ Constructed (Text.pack "WindowId 1")
+    , TargetRetirement (Text.pack "WindowId 1")
+    , TargetRetirement (Text.pack "WindowId 2")
+    , OwnerRetirement
+    , OwnerDestruction
+    , WindowGone 2
+    , WindowGone 1
+    , SessionEnded
+    ]
+  where
+    retiring = \case
+      TargetRetirement _ → True
+      _ → False
+
+ownerExampleComponent ∷ Component
+ownerExampleComponent = unsafeComponent "test.graphics-owner"
 
 -- | An owner whose run has failed refuses every publication, not only the
 -- lifetime port: it reads none of them again.
