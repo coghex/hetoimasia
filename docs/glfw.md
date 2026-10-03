@@ -779,7 +779,10 @@ The remaining gaps are stated rather than estimated:
   graphics owner withhold its presentation before the hide's native call
   ([Hiding an attached window](#hiding-an-attached-window)), and the target
   resumes on a replacement swapchain. VK-16's hide-and-show case runs and
-  passes under the group. Minimizing a presenting window on Wayland is not
+  passes under the group. It hides through the host's command port; the
+  direct route through a lent window takes the same hold
+  ([#368](https://github.com/coghex/hetoimasia/issues/368)), and is covered
+  by headless examples, not by a run under the group. Minimizing a presenting window on Wayland is not
   covered by that hold and stays unqualified, as minimization does below.
   Hardware drivers, desktop compositors and macOS stay unqualified for
   rendering on Wayland: no hardware driver, no compositor but packaged
@@ -3507,6 +3510,32 @@ still publishes — and one that raised keeps it too. A hide that made no native
 call — refused, or unsupported by the platform — changed nothing, and the host
 lifts the hold at once. A window with no attachment, and every other control,
 is executed exactly as before.
+
+Two routes reach a host window's native hide, and both take that hold
+([#368](https://github.com/coghex/hetoimasia/issues/368)):
+
+- **Through the host's ports** — the host's command port or a window's own.
+  The host's command executor takes the hold before the command's checks run
+  and lifts it when no native call was made, as above.
+- **Directly, through a lent window.** `withHostWindow` lends a copy of the
+  window carrying a hide guard (`guardWindowHide`, in the model's
+  `Hetoimasia.GLFW.Internal.Window.State`), so a hide made on it — by
+  `performWindowCommand` with a command host the application built over the
+  session it gave `withGraphicsOwnerHostIn`, or by any other control route —
+  takes the hold through the same protocol. The guard runs after every check
+  has admitted the hide and immediately before its native call, so a hide
+  refused, unsupported or not attempted takes no hold, and one that was made
+  keeps it until the hidden window's observation is folded. The model package
+  learns nothing of attachments: the guard is an opaque owner-thread action
+  the host supplies.
+
+On both, the hold is asked of whichever attachment occupies the window's slot
+when it is taken, whatever its phase: an attachment that is retiring is still
+asked, a window whose slot has been freed hides as an unattached one does, and
+a window detached and reattached is protected by its new attachment alone.
+Neither route changes the command's owner, liveness, closure and scope checks
+or their answers. A window `withWindow` lends belongs to no host and can hold
+no attachment, so it is hidden exactly as before.
 
 The graphics owner's protocol implements it with a **presentation hold**
 (`Hetoimasia.Runtime.GLFW.Internal.Owner.Withhold`): the hold is recorded

@@ -2395,10 +2395,13 @@ swapchain creation per resume on every platform. The old generation is
 retired as any replaced one is: held until its presentations have retired on
 their own present fences, then destroyed.
 
-**Hiding a presenting window.** A hide command's native call is itself the
+**Hiding a presenting window.** A hide's native call is itself the
 hazard, because the owner learns a window was hidden only from the observation
 published after it. So the host has the window's graphics owner withhold its
-presentation first ([glfw.md](glfw.md#hiding-an-attached-window)): the main
+presentation first ([glfw.md](glfw.md#hiding-an-attached-window)), whether the
+hide came through the host's command ports or was made directly on a window
+`withHostWindow` lends
+([#368](https://github.com/coghex/hetoimasia/issues/368)): the main
 thread waits while the owner's step in flight may present to the target, and
 every later step views the target as suspended until the hidden window's
 observation is folded. The step view's withdrawal count (`viewWithdrawals`)
@@ -3218,7 +3221,12 @@ the shown window presenting on a replacement handed that swapchain and never on
 the old one — an example that fails with the hold or the replacement removed
 (#357); a window whose target is already suspended hidden again while the other
 target's presentation holds, whose hide makes its native call without waiting
-for that step;
+for that step; the same presentation hold with the hide and the show made
+directly, from the main thread's update opportunity, on the window
+`withHostWindow` lends, and a direct hide and show of a presenting window made
+in one update opportunity while no owner round completes, followed by a frame
+on a replacement handed the old swapchain and none on the old one — examples
+that fail without the lent window's hide guard (#368);
 a renderer refusing every frame, with the owner's deadline one backoff interval
 ahead of a still clock and no second attempt until the clock reaches it; a
 fresh request, made while such a retry is pending, rendered at once with the
@@ -3839,7 +3847,10 @@ hide settled. The first is then shown again; once that command has settled as
 attempted and the window has been observed visible, the first presents again,
 on a replacement swapchain; and the loop finishes, so the host exits through
 D-33. On Wayland it is what shows that a hide never blocks the owner and that
-a shown window never presents on its old swapchain (#357). It passes only if every Vulkan call ran on one thread, the graphics
+a shown window never presents on its old swapchain (#357). The case hides and
+shows through the command port; a hide made directly on a window
+`withHostWindow` lends takes the same hold (#368), and is covered by the
+headless `integration-tests` examples rather than by this case. It passes only if every Vulkan call ran on one thread, the graphics
 owner's, and every surface was created on the main thread; if every
 presentation's retirement was observed through its own present fence, no
 presentation was made after the device's destruction began, and both surfaces,
