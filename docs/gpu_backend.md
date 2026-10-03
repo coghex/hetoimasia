@@ -3564,6 +3564,34 @@ VK-18's D-33 order and releases nothing early.
   was, the built pipeline reused for every later frame of its format, nothing
   held after a refused layout, and one layout and one pipeline per color format.
 
+Every `integration-tests` example runs under a fixture-aware bound
+(`Test.GPU.Vulkan.GLFW.Bound`): a minute, or thirty seconds for those under
+`Vulkan controller`, for the whole example rather than for each rig run. A
+plain timeout cannot end a rig example: `runRig` runs its body on a bound thread
+through `runInBoundThread`, so an exception for the example's own thread waits
+for the whole run, and the owner's protected exit absorbs cancellation until it
+has destruction evidence that a scripted rig withholds. On expiry the bound
+starts a cleanup watchdog first, then rescues every rig the example made — from
+then on every fence answers signalled, every scripted hold already entered or
+entered later passes, no call is slowed, no frame refused and no event pump
+held, and every wait the owner arms on a scripted clock comes due at once and
+moves the clock to its deadline; an irreversible scripted failure stays, and
+nothing publishes destruction evidence the stand-ins did not produce — and only
+then cancels each rig run's bound thread and the example's own. The owner's
+protected exit completes on the stand-ins' real destruction evidence, and the
+example fails as not having finished within its bound, even if it caught the
+cancellation. A synchronous failure, or that cancellation, escaping a rig's
+body rescues the rig before the protected teardown begins, so an example that
+fails before it releases its gates reports its own failure. The last resort: if
+the example's thread has not ended ten seconds after rescue began, the suite
+prints the example's name on standard error and ends the test process with a
+failure status, unwinding nothing — operator termination is the protected
+exit's documented escape. The production teardown is unchanged; all of this is
+the fixture's. `the fixture-aware example bound` covers a blocked example, one
+that fails before releasing its gates, a hold the owner had already entered,
+and the last resort, with bounds and a grace that expire only when the example
+says, and finds no thread of the example still running afterwards.
+
 VK-19's examples are in `integration-tests`, under `Vulkan consumer rendering
 and capture`, over the same stand-ins, extended to journal every command the
 recording layer is asked to record and every pipeline, layout and readback
@@ -3620,8 +3648,8 @@ stand-in frame and recording layers — every swapchain three images, a
 submission's fence and a present fence pending until asked and then signalled
 if the example allows it, a present fence's image given back when it signals —
 and, where a schedule is asserted, a scripted clock the host and the owner
-share, whose owner timer expires only once the clock passes the instant it was
-armed for. They cover: the adapter publishing each window's observation and
+share, whose owner timer expires once the clock reaches the deadline the owner
+gave it. They cover: the adapter publishing each window's observation and
 captured demand with nothing published by hand, and the owner presenting a
 frame of its own; the owner's deadline folded into the main loop's schedule —
 `NoUpdateDemand` and a later `UpdateBy` become it, an earlier one and
@@ -3639,7 +3667,12 @@ timer beyond the first pending-work interval; the backoff through 5, 10, 20,
 millisecond before a poll moving neither the fence queries nor the deadline,
 and new demand, an observed completion and a close each restarting it at 5 ms;
 no fence asked on an unrelated early wake, and a poll whose work consumed the
-next interval followed by the next poll with no timer armed between them; a
+next interval followed by the next poll with no timer armed between them; the
+clock reaching the owner's published deadline inside its timer's arming, after
+the owner read the clock, and the owner still waking at that deadline to poll,
+and the same window in the exit drain's wait, the drain still waking and
+arming again — examples that fail with a timer that measures its interval from
+a reading of its own (#386); a
 suspended target keeping a finite deadline with its presentation pending, not
 spinning while the clock stands still, and polling when it comes; one target
 presenting five more frames while another's acquisitions all answer not ready;
