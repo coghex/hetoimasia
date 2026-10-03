@@ -25,10 +25,22 @@ spec = describe "The reader's whitelist" $ do
   mapM_ row rows
   describe "an exact operand count for every opcode it supports" $
     mapM_ operandRow operandRows
+  it "refuses an id beyond the header's bound" $ do
+    (header, instructions) ← load descriptors
+    reflect (assemble (setOperand 2 5 header, instructions)) `shouldSatisfy` failedWith "beyond its header's bound of 5"
+  it "reads an Output variable whose initializer is a null constant of its own type, exactly as without one" $ do
+    (header, instructions) ← load interface
+    let outputs = [words' | words' ← instructions, opcodeOfWords words' == 59, operand 2 words' == 3]
+        nulls = [(operand 1 words', fresh + index, pointeeOf (operand 0 words') instructions) | (index, words') ← zip [0 ..] outputs]
+        initialize words' = case [constant | (variable, constant, _) ← nulls, opcodeOfWords words' == 59, variable == operand 1 words'] of
+          constant : _ → withWords (words' <> [constant])
+          [] → words'
+        mutated = insertBeforeFirst 59 [instruction 46 [pointee', constant] | (_, constant, pointee') ← nulls] (map initialize instructions)
+    reflect (assemble (withRoom header, mutated)) `shouldBe` reflect (assemble (header, instructions))
   where
     row (rule, fixture, mutation, expected) = it rule $ do
       (header, instructions) ← load fixture
-      reflect (assemble (header, mutation instructions)) `shouldSatisfy` failedWith expected
+      reflect (assemble (withRoom header, mutation instructions)) `shouldSatisfy` failedWith expected
     operandRow (opcode, fixture, extra) = do
       it ("refuses an " <> name opcode <> " with one operand too many") $ do
         (header, instructions) ← load fixture
@@ -291,6 +303,141 @@ rows =
     , \instructions → instruction 20 [fresh] : onOpcode 30 (setOperand 1 fresh) instructions
     , "an OpTypeBool, which the"
     )
+  , -- Decorations the reader reads: literal counts, duplicates, targets
+    ( "refuses a Location decoration with an extra literal"
+    , descriptors
+    , onDecoration 71 30 (\words' → withWords (words' <> [0]))
+    , "Location decoration carries 2 literals, where the reader requires 1"
+    )
+  , ( "refuses a Binding decoration with no literal"
+    , descriptors
+    , onDecoration 71 33 (\words' → withWords (take (length words' - 1) words'))
+    , "Binding decoration carries 0 literals, where the reader requires 1"
+    )
+  , ( "refuses an Offset decoration with no literal, rather than reading it as 0"
+    , interface
+    , onDecoration 72 35 (\words' → withWords (take (length words' - 1) words'))
+    , "Offset decoration carries 0 literals, where the reader requires 1"
+    )
+  , ( "refuses an Offset decoration with an extra literal"
+    , interface
+    , onDecoration 72 35 (\words' → withWords (words' <> [0]))
+    , "Offset decoration carries 2 literals, where the reader requires 1"
+    )
+  , ( "refuses a Block decoration carrying a literal"
+    , descriptors
+    , onDecoration 71 2 (\words' → withWords (words' <> [0]))
+    , "Block decoration carries 1 literals, where the reader requires 0"
+    )
+  , ( "refuses a decoration of a kind it reads given twice"
+    , descriptors
+    , \instructions → instructions <> [words' | words' ← instructions, decorates 71 30 words']
+    , "is decorated with Location more than once"
+    )
+  , ( "refuses an ArrayStride of 0"
+    , interface
+    , onDecoration 71 6 (setOperand 2 0)
+    , "ArrayStride is 0, where the reader requires a positive stride"
+    )
+  , ( "refuses a MatrixStride of 0"
+    , interface
+    , onDecoration 72 7 (setOperand 3 0)
+    , "MatrixStride is 0, where the reader requires a positive stride"
+    )
+  , ( "refuses a member both RowMajor and ColMajor"
+    , interface
+    , \instructions → instructions <> [setOperand 2 4 words' | words' ← instructions, decorates 72 5 words']
+    , "is decorated both RowMajor and ColMajor"
+    )
+  , ( "refuses a member decoration naming a member its struct does not have"
+    , interface
+    , onDecoration 72 35 (setOperand 1 9)
+    , "member 9 of id"
+    )
+  , ( "refuses a member decoration whose target is not a struct"
+    , interface
+    , \instructions → onDecoration 72 35 (setOperand 0 (firstType 22 instructions)) instructions
+    , "which is not a struct the module declares"
+    )
+  , ( "refuses a decoration of a kind it reads whose target the module does not declare"
+    , descriptors
+    , onDecoration 71 33 (setOperand 0 unknown)
+    , "but declares no type, constant or variable of that id"
+    )
+  , -- The explicit layout a buffer or push-constant block requires
+    ( "refuses a buffer member with no Offset"
+    , descriptors
+    , filter (not . decorates 72 35)
+    , "has no Offset"
+    )
+  , ( "refuses a push-constant member with no Offset"
+    , interface
+    , filter (not . decorates 72 35)
+    , "has no Offset"
+    )
+  , ( "refuses a buffer's runtime-sized array with no ArrayStride"
+    , descriptors
+    , filter (not . decorates 71 6)
+    , "which has no ArrayStride"
+    )
+  , ( "refuses a push-constant array with no ArrayStride"
+    , interface
+    , filter (not . decorates 71 6)
+    , "which has no ArrayStride"
+    )
+  , ( "refuses a push-constant matrix with no MatrixStride"
+    , interface
+    , filter (not . decorates 72 7)
+    , "is a matrix with no MatrixStride"
+    )
+  , ( "refuses a push-constant matrix neither RowMajor nor ColMajor"
+    , interface
+    , filter (not . decorates 72 5)
+    , "is a matrix that is neither RowMajor nor ColMajor"
+    )
+  , -- Interface variables' declarations
+    ( "refuses an OpVariable with extra operands"
+    , interface
+    , onOpcode 59 (\words' → withWords (words' <> [0, 0]))
+    , "is an OpVariable with 5 operands, where the reader requires 3 or 4"
+    )
+  , ( "refuses an initializer on an Input variable"
+    , interface
+    , \instructions → map (\words' → if opcodeOfWords words' == 59 && operand 2 words' == 1 then withWords (words' <> [firstConstant instructions]) else words') instructions
+    , "has an initializer, which the Input storage class does not take"
+    )
+  , ( "refuses an initializer the module does not declare"
+    , interface
+    , map (\words' → if opcodeOfWords words' == 59 && operand 2 words' == 3 then withWords (words' <> [unknown]) else words')
+    , "as its initializer, which the module does not declare as a type or constant"
+    )
+  , ( "refuses an initializer of another type than its variable's"
+    , interface
+    , \instructions →
+        insertBeforeFirst 59 [instruction 43 [firstType 21 instructions, fresh, 7]] $
+          map (\words' → if opcodeOfWords words' == 59 && operand 2 words' == 3 then withWords (words' <> [fresh]) else words') instructions
+    , "is not the type it must have"
+    )
+  , ( "refuses a composite initializer of fewer constituents than its type has"
+    , interface
+    , \instructions →
+        let vector = firstVector 4 instructions
+            float = firstType 22 instructions
+         in insertBeforeFirst 59 [instruction 43 [float, fresh, 0], instruction 44 [vector, fresh + 1, fresh, fresh, fresh]] $
+              map (\words' → if opcodeOfWords words' == 59 && operand 2 words' == 3 && pointeeOf (operand 0 words') instructions == vector then withWords (words' <> [fresh + 1]) else words') instructions
+    , "of 3 constituents, where its type has 4"
+    )
+  , -- The entry point
+    ( "refuses an entry point listing an interface id twice"
+    , descriptors
+    , onOpcode 15 (\words' → withWords (words' <> [lastWord words']))
+    , "more than once"
+    )
+  , ( "refuses an entry point whose name is not terminated within it"
+    , descriptors
+    , onOpcode 15 (\words' → withWords (take 4 words'))
+    , "the entry point's name is not terminated within its instruction"
+    )
   ]
 
 -- | Every opcode on the whitelist with a fixed operand count, the fixture
@@ -336,6 +483,11 @@ fresh = 0xFFFF0
 
 -- ---------------------------------------------------------------------------
 -- Instruction words
+
+-- | A header whose id bound leaves room for the ids rows declare, so that
+-- only the rule a row breaks is broken.
+withRoom ∷ [Word32] → [Word32]
+withRoom header = setOperand 2 (max (operand 2 header) (fresh + 16)) header
 
 -- | A fixture's header words and its instructions, each with its leading
 -- word count and opcode word, in this host's byte order.
@@ -401,6 +553,36 @@ firstType ∷ Word32 → [[Word32]] → Word32
 firstType opcode instructions = case [resultOfType words' | words' ← instructions, opcodeOfWords words' == opcode] of
   found : _ → found
   [] → unknown
+
+-- | Whether this is an OpDecorate (71) or an OpMemberDecorate (72) of this
+-- decoration kind.
+decorates ∷ Word32 → Word32 → [Word32] → Bool
+decorates opcode kind words' = opcodeOfWords words' == opcode && operand (if opcode == 71 then 1 else 2) words' == kind
+
+onDecoration ∷ Word32 → Word32 → ([Word32] → [Word32]) → [[Word32]] → [[Word32]]
+onDecoration opcode kind change = map (\words' → if decorates opcode kind words' then change words' else words')
+
+-- | These instructions inserted just before the first of this opcode.
+insertBeforeFirst ∷ Word32 → [[Word32]] → [[Word32]] → [[Word32]]
+insertBeforeFirst opcode inserted instructions =
+  let (earlier, rest) = break ((== opcode) . opcodeOfWords) instructions in earlier <> inserted <> rest
+
+-- | The type a pointer of this id points to.
+pointeeOf ∷ Word32 → [[Word32]] → Word32
+pointeeOf pointer instructions = case [operand 2 words' | words' ← instructions, opcodeOfWords words' == 32, operand 0 words' == pointer] of
+  found : _ → found
+  [] → unknown
+
+-- | The first vector type of this many components.
+firstVector ∷ Word32 → [[Word32]] → Word32
+firstVector components instructions = case [operand 0 words' | words' ← instructions, opcodeOfWords words' == 23, operand 2 words' == components] of
+  found : _ → found
+  [] → unknown
+
+lastWord ∷ [Word32] → Word32
+lastWord = \case
+  [] → 0
+  words' → last words'
 
 firstConstant ∷ [[Word32]] → Word32
 firstConstant instructions = case [operand 1 words' | words' ← instructions, opcodeOfWords words' == 43] of

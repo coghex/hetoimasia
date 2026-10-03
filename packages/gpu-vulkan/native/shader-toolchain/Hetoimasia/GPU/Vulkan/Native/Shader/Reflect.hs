@@ -59,7 +59,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import Data.List (sortOn)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (isJust)
+import Data.Maybe (isJust, isNothing)
 import qualified Data.Set as Set
 import Data.Word (Word32)
 
@@ -139,10 +139,13 @@ data Module = Module
     -- ^ Every type and constant, by result id.
   , moduleVariables ∷ !(Map.Map Word32 (Word32, Word32))
     -- ^ Every global variable, by id: its pointer type and storage class.
+  , moduleVariableOperands ∷ !(Map.Map Word32 [Word32])
+    -- ^ Every global variable's complete operands, by id, so its whole
+    -- declaration is validated before any of it is read.
   , moduleDecorations ∷ !(Map.Map Word32 [(Word32, [Word32])])
   , moduleMemberDecorations ∷ !(Map.Map (Word32, Word32) [(Word32, [Word32])])
-  , moduleEntries ∷ ![(Word32, [Word32])]
-    -- ^ Each entry point's execution model and interface ids.
+  , moduleEntries ∷ ![[Word32]]
+    -- ^ Each entry point's complete operands.
   , modulePositions ∷ !(Map.Map Word32 Int)
     -- ^ Where in the module each type, constant and global variable is
     -- declared, by result id.
@@ -155,9 +158,16 @@ reflect ∷ ByteString → Either String Reflection
 reflect bytes = do
   words' ← moduleWords bytes
   instructions ← decode words'
-  let parsed = foldl collect (Module Map.empty Map.empty Map.empty Map.empty [] Map.empty []) (zip [0 ..] instructions)
+  let parsed = foldl collect (Module Map.empty Map.empty Map.empty Map.empty Map.empty [] Map.empty []) (zip [0 ..] instructions)
+      bound = case drop 3 words' of
+        value : _ → value
+        [] → 0
+  -- Every id the reader records is below the header's bound.
+  case [declared | declared ← Map.keys (modulePositions parsed), declared >= bound] of
+    beyond : _ → Left ("the module declares id " <> show beyond <> ", beyond its header's bound of " <> show bound)
+    [] → pure ()
   (model, interface) ← case moduleEntries parsed of
-    [entry] → Right entry
+    [entry] → entryPoint entry
     [] → Left "the module has no entry point"
     entries → Left ("the module has " <> show (length entries) <> " entry points, not one")
   let stage = case model of
@@ -167,9 +177,13 @@ reflect bytes = do
   globals ← forM interface $ \variable → case Map.lookup variable (moduleVariables parsed) of
     Just held → Right (variable, held)
     Nothing → Left ("the entry point's interface names id " <> show variable <> ", which the module defines no variable for")
-  -- Every type and constant an interface variable reaches is on the
-  -- whitelist before anything is read from it.
+  -- Every decoration the reader reads, every interface variable's
+  -- declaration, and every type and constant one reaches, is on the
+  -- whitelist before anything is read from it; so are the explicit layout
+  -- decorations a buffer or push-constant block requires.
+  validateDecorations parsed
   validateInterface parsed globals
+  validateLayout parsed globals
   push ← pushBlock parsed [(variable, pointer) | (variable, (pointer, storage)) ← globals, storage == storagePushConstant]
   inputs ←
     if stage == ReflectedVertex
@@ -216,11 +230,12 @@ decode words' = go (drop 5 words')
 
 collect ∷ Module → (Int, Instruction) → Module
 collect parsed (position, instruction@(Instruction opcode operands)) = case (opcode, operands) of
-  (15, model : _ : rest) → parsed {moduleEntries = moduleEntries parsed <> [(model, drop (stringWords rest) rest)]}
+  (15, _) → parsed {moduleEntries = moduleEntries parsed <> [operands]}
   (71, target : decorated : values) → parsed {moduleDecorations = Map.insertWith (flip (<>)) target [(decorated, values)] (moduleDecorations parsed)}
   (72, target : member : decorated : values) →
     parsed {moduleMemberDecorations = Map.insertWith (flip (<>)) (target, member) [(decorated, values)] (moduleMemberDecorations parsed)}
-  (59, pointer : result : storage : _) → declared result (parsed {moduleVariables = Map.insert result (pointer, storage) (moduleVariables parsed)})
+  (59, pointer : result : storage : _) →
+    declared result (parsed {moduleVariables = Map.insert result (pointer, storage) (moduleVariables parsed), moduleVariableOperands = Map.insert result operands (moduleVariableOperands parsed)})
   _
     | opcode `elem` typeOpcodes, result : _ ← operands → declared result (parsed {moduleTypes = Map.insert result instruction (moduleTypes parsed)})
     | opcode `elem` constantOpcodes, _ : result : _ ← operands → declared result (parsed {moduleTypes = Map.insert result instruction (moduleTypes parsed)})
@@ -229,10 +244,25 @@ collect parsed (position, instruction@(Instruction opcode operands)) = case (opc
     declared result held
       | Map.member result (modulePositions held) = held {moduleDuplicates = moduleDuplicates held <> [result]}
       | otherwise = held {modulePositions = Map.insert result position (modulePositions held)}
-    -- A literal string occupies the words up to and including the one whose
-    -- last byte is a terminating zero.
-    stringWords rest = 1 + length (takeWhile (not . terminated) rest)
-    terminated word = any (\shift → (word `shiftR` shift) .&. 0xFF == 0) [0, 8, 16, 24]
+
+-- | The one entry point's execution model and interface ids, from its
+-- complete operands: a model, a function, a name that ends within the
+-- instruction — its last word holding a terminating zero and only zeros
+-- after it — and then interface ids, none listed twice.
+entryPoint ∷ [Word32] → Either String (Word32, [Word32])
+entryPoint = \case
+  model : _ : rest@(_ : _) → case break terminated rest of
+    (_, final : interface)
+      | not (padded final) → Left "the entry point's name is not padded with zeros after its terminator"
+      | otherwise → case [repeated | (index, repeated) ← zip [0 ∷ Int ..] interface, repeated `elem` take index interface] of
+          repeated : _ → Left ("the entry point's interface lists id " <> show repeated <> " more than once")
+          [] → Right (model, interface)
+    (_, []) → Left "the entry point's name is not terminated within its instruction"
+  operands → Left ("the entry point has " <> show (length operands) <> " operands, where the reader requires a model, a function and a name")
+  where
+    bytesOf word = [(word `shiftR` shift) .&. 0xFF | shift ← [0, 8, 16, 24]]
+    terminated word = 0 `elem` bytesOf word
+    padded word = all (== 0) (dropWhile (/= 0) (bytesOf word))
 
 -- ---------------------------------------------------------------------------
 -- Push constants
@@ -424,15 +454,29 @@ validateInterface parsed globals = do
         Just name → Right name
         Nothing → Left (named <> " has storage class " <> show storage <> ", which the reader does not support")
       let position = Map.findWithDefault 0 variable (modulePositions parsed)
-          context = if storage `elem` hostVisible then Just held else Nothing
+          -- A built-in is the device's, not the host's: what it holds is
+          -- the built-in's own, a boolean included.
+          context
+            | storage `elem` hostVisible && not (hasDecoration parsed variable decorationBuiltIn) = Just held
+            | otherwise = Nothing
       Instruction opcode operands ← refer named variable position "its pointer type" pointer
       unless (opcode == 32) $ Left (wrongKind named pointer "its pointer type" opcode "an OpTypePointer")
       seen' ← wellFormed named context seen pointer
-      case operands of
-        [_, declared, _]
+      pointee' ← case operands of
+        [_, declared, pointee']
           | declared /= storage →
               Left (named <> " has storage class " <> show storage <> ", but its pointer type (id " <> show pointer <> ") has storage class " <> show declared)
-        _ → pure seen'
+          | otherwise → Right pointee'
+        _ → Left (named <> " has a pointer type (id " <> show pointer <> ") the reader cannot read")
+      -- The declaration itself: its result type, its result, its storage
+      -- class, and an initializer only where its storage class takes one.
+      case Map.findWithDefault [] variable (moduleVariableOperands parsed) of
+        [_, _, _] → pure seen'
+        [_, _, _, initializer]
+          | storage `notElem` initialized →
+              Left (named <> " has an initializer, which the " <> held <> " storage class does not take")
+          | otherwise → constantOf named variable position "its initializer" initializer pointee' seen'
+        found → Left (named <> " is an OpVariable with " <> show (length found) <> " operands, where the reader requires 3 or 4")
 
     -- Resolve an id named by the instruction declared at this position.
     refer named user position role target = case (Map.lookup target (moduleTypes parsed), Map.lookup target (modulePositions parsed)) of
@@ -458,15 +502,16 @@ validateInterface parsed globals = do
               literal what allowed = Left (named <> " reaches type id " <> show typeId <> ", an " <> opcodeName opcode <> " " <> what <> ", where the reader requires " <> allowed)
               -- Resolve a named type, require its kind, refuse what this
               -- storage class cannot hold, then check it in turn.
-              child role requirement allowed target through = do
+              child = childIn context
+              childIn within role requirement allowed target through = do
                 Instruction childOpcode childOperands ← refer named typeId position role target
                 unless (childOpcode `elem` allowed) $ Left (wrongKind named target role childOpcode requirement)
-                case context of
+                case within of
                   Just name
                     | childOpcode `elem` [20, 25, 26, 27] →
                         Left (named <> " reaches id " <> show target <> " as " <> role <> ", an " <> opcodeName childOpcode <> ", which the " <> name <> " storage class cannot hold")
                   _ → pure ()
-                checked ← wellFormed named context through target
+                checked ← wellFormed named within through target
                 pure (checked, childOpcode, childOperands)
           case opcode of
             _ | opcode `elem` [19, 20, 26] → if length operands == 1 then pure marked else count "1"
@@ -528,7 +573,10 @@ validateInterface parsed globals = do
                       let lastMember = index == length members - 1
                           allowed = if lastMember then 29 : memberOpcodes else memberOpcodes
                           role = "struct member " <> show index
-                      (checked, memberOpcode, _) ← child role "a sized type, or a runtime-sized array as the last member" allowed member through
+                          -- A built-in member, as of gl_PerVertex, is the
+                          -- device's too.
+                          within = if isJust (memberDecoration parsed typeId index decorationBuiltIn) then Nothing else context
+                      (checked, memberOpcode, _) ← childIn within role "a sized type, or a runtime-sized array as the last member" allowed member through
                       when (memberOpcode == 29 && not lastMember) $ Left (wrongKind named member role memberOpcode "a sized type, or a runtime-sized array as the last member")
                       pure checked
                   )
@@ -568,6 +616,137 @@ validateInterface parsed globals = do
             _ → Left (named <> " reaches id " <> show constant <> " as an array length, an OpConstant with " <> show (length operands) <> " operands, where the reader requires 3")
         _ → Left (wrongKind named constant "an array length" opcode "an OpConstant of a 32-bit integer type")
 
+    -- A constant of exactly this type, declared before the instruction that
+    -- names it: a boolean, a scalar of as many words as its width, a null, or
+    -- a composite of as many constituents as its type has, each in turn a
+    -- constant of that constituent's type.
+    constantOf named user position role constant expected seen = do
+      Instruction opcode operands ← refer named user position role constant
+      let constantPosition = Map.findWithDefault 0 constant (modulePositions parsed)
+          resultType = case operands of
+            found : _ → found
+            [] → 0
+          mismatch ∷ Either String a
+          mismatch = Left (named <> " reaches id " <> show constant <> " as " <> role <> ", an " <> opcodeName opcode <> " whose type (id " <> show resultType <> ") is not the type it must have (id " <> show expected <> ")")
+          counted ∷ String → Either String a
+          counted required = Left (named <> " reaches id " <> show constant <> " as " <> role <> ", an " <> opcodeName opcode <> " with " <> show (length operands) <> " operands, where the reader requires " <> required)
+          expectedType = Map.lookup expected (moduleTypes parsed)
+      when (resultType /= expected) mismatch
+      case opcode of
+        _
+          | opcode `elem` [41, 42, 48, 49] → case expectedType of
+              Just (Instruction 20 _) | length operands == 2 → pure seen
+              Just (Instruction 20 _) → counted "2"
+              _ → mismatch
+          | opcode `elem` [43, 50] → case expectedType of
+              Just (Instruction typeOpcode (_ : width : _))
+                | typeOpcode `elem` [21, 22] →
+                    let required = if width > 32 then 4 else 3
+                     in if length operands == required then pure seen else counted (show required)
+              _ → mismatch
+          | opcode == 46 → if length operands == 2 then pure seen else counted "2"
+          | opcode `elem` [44, 51] → do
+              let constituents = drop 2 operands
+              elements ← case expectedType of
+                Just (Instruction 23 [_, component, components]) → Right (replicate (fromIntegral components) component)
+                Just (Instruction 24 [_, column, columns]) → Right (replicate (fromIntegral columns) column)
+                Just (Instruction 28 [_, element, length']) → (\value → replicate (fromIntegral value) element) <$> constantValue parsed length'
+                Just (Instruction 30 (_ : members)) → Right members
+                _ → mismatch
+              unless (length constituents == length elements) $
+                Left (named <> " reaches id " <> show constant <> " as " <> role <> ", an " <> opcodeName opcode <> " of " <> show (length constituents) <> " constituents, where its type has " <> show (length elements))
+              foldM
+                (\through (index, (constituent, element)) → constantOf named constant constantPosition ("constituent " <> show index <> " of " <> role) constituent element through)
+                seen
+                (zip [0 ∷ Int ..] (zip constituents elements))
+          | otherwise → Left (wrongKind named constant role opcode "a constant of a boolean, scalar, null or composite kind")
+
+-- ---------------------------------------------------------------------------
+-- Decorations
+
+-- | Every decoration of a kind the reader reads, wherever it is: its target
+-- declared, as a struct with that member where it decorates a member; its
+-- literals exactly as many as its kind takes — none for Block, BufferBlock,
+-- RowMajor and ColMajor, one for ArrayStride, MatrixStride, BuiltIn,
+-- Location, Component, Binding, DescriptorSet and Offset; a stride positive;
+-- no kind twice on one target or member; and never both RowMajor and
+-- ColMajor. Nothing is read from a decoration until all of them pass, so no
+-- missing literal can stand for a default.
+validateDecorations ∷ Module → Either String ()
+validateDecorations parsed = do
+  forM_' (Map.toList (moduleDecorations parsed)) $ \(target, found) → do
+    let consumed = [(kind, values) | (kind, values) ← found, isJust (lookup kind decorationLiterals)]
+        subject = "id " <> show target
+    unless (null consumed || Map.member target (modulePositions parsed)) $
+      Left ("the module decorates " <> subject <> " with " <> decorationName (fst (head' consumed)) <> ", but declares no type, constant or variable of that id")
+    validateKinds subject consumed
+  forM_' (Map.toList (moduleMemberDecorations parsed)) $ \((target, member), found) → do
+    let consumed = [(kind, values) | (kind, values) ← found, isJust (lookup kind decorationLiterals)]
+        subject = "member " <> show member <> " of id " <> show target
+    unless (null consumed) $ case Map.lookup target (moduleTypes parsed) of
+      Just (Instruction 30 (_ : members))
+        | fromIntegral member < length members → pure ()
+        | otherwise → Left ("the module decorates " <> subject <> ", a struct of " <> show (length members) <> " members")
+      _ → Left ("the module decorates " <> subject <> ", which is not a struct the module declares")
+    validateKinds subject consumed
+    when (all (`elem` map fst consumed) [decorationRowMajor, decorationColMajor]) $
+      Left (subject <> " is decorated both RowMajor and ColMajor")
+  where
+    forM_' = flip mapM_
+    head' = \case
+      first : _ → first
+      [] → (0, [])
+    validateKinds subject consumed =
+      forM_' (zip [0 ∷ Int ..] consumed) $ \(index, (kind, values)) → do
+        when (kind `elem` map fst (take index consumed)) $
+          Left (subject <> " is decorated with " <> decorationName kind <> " more than once")
+        let required = maybe 0 id (lookup kind decorationLiterals)
+        unless (length values == required) $
+          Left (subject <> "'s " <> decorationName kind <> " decoration carries " <> show (length values) <> " literals, where the reader requires " <> show required)
+        when (kind `elem` [decorationArrayStride, decorationMatrixStride] && values == [0]) $
+          Left (subject <> "'s " <> decorationName kind <> " is 0, where the reader requires a positive stride")
+
+-- | The explicit layout a Uniform, StorageBuffer or PushConstant block
+-- requires, from its struct down — through a descriptor array of blocks,
+-- which is not memory and takes no stride: every member of every struct it
+-- reaches has an Offset; every array and runtime-sized array it reaches has
+-- an ArrayStride; and every member that is a matrix, or an array of them,
+-- has a MatrixStride and is RowMajor or ColMajor.
+validateLayout ∷ Module → [(Word32, (Word32, Word32))] → Either String ()
+validateLayout parsed globals =
+  mapM_ block [(variable, pointer) | (variable, (pointer, storage)) ← globals, storage `elem` [storageUniform, storagePushConstant, storageStorageBuffer]]
+  where
+    block (variable, pointer) = do
+      let named = "the interface variable (id " <> show variable <> ")"
+      typeId ← pointee parsed pointer
+      let struct = case typeOf parsed typeId of
+            Just (Instruction opcode (_ : element : _)) | opcode `elem` [28, 29] → element
+            _ → typeId
+      case typeOf parsed struct of
+        Just (Instruction 30 _) → layoutStruct named struct
+        _ → pure ()
+    layoutStruct named struct = case typeOf parsed struct of
+      Just (Instruction 30 (_ : members)) →
+        forM_' (zip [0 ..] members) $ \(index, member) → do
+          when (isNothing (memberDecoration parsed struct index decorationOffset)) $
+            Left (named <> " reaches struct id " <> show struct <> ", whose member " <> show index <> " has no Offset")
+          layoutMember named struct index member
+      _ → pure ()
+    layoutMember named struct index typeId = case typeOf parsed typeId of
+      Just (Instruction 24 _) → do
+        let decorations = Map.findWithDefault [] (struct, fromIntegral index) (moduleMemberDecorations parsed)
+            subject = named <> " reaches struct id " <> show struct <> ", whose member " <> show index <> " is a matrix"
+        unless (isJust (lookup decorationMatrixStride decorations)) $ Left (subject <> " with no MatrixStride")
+        unless (any (isJust . (`lookup` decorations)) [decorationRowMajor, decorationColMajor]) $ Left (subject <> " that is neither RowMajor nor ColMajor")
+      Just (Instruction opcode (_ : element : _))
+        | opcode `elem` [28, 29] → do
+            unless (hasDecoration parsed typeId decorationArrayStride) $
+              Left (named <> " reaches array id " <> show typeId <> ", member " <> show index <> " of struct id " <> show struct <> ", which has no ArrayStride")
+            layoutMember named struct index element
+      Just (Instruction 30 _) → layoutStruct named typeId
+      _ → pure ()
+    forM_' = flip mapM_
+
 -- ---------------------------------------------------------------------------
 -- Shared lookups
 
@@ -595,8 +774,7 @@ hasDecoration parsed target wanted = isJust (lookup wanted (Map.findWithDefault 
 memberDecoration ∷ Module → Word32 → Int → Word32 → Maybe Word32
 memberDecoration parsed struct member wanted = case lookup wanted (Map.findWithDefault [] (struct, fromIntegral member) (moduleMemberDecorations parsed)) of
   Just (value : _) → Just value
-  Just [] → Just 0
-  Nothing → Nothing
+  _ → Nothing
 
 -- ---------------------------------------------------------------------------
 -- Numbers
@@ -635,6 +813,32 @@ storageClasses =
 hostVisible ∷ [Word32]
 hostVisible = [1, 2, 3, 9, 12]
 
+-- | The storage classes whose variables may carry an initializer: Output and
+-- Private.
+initialized ∷ [Word32]
+initialized = [3, 6]
+
+-- | Every decoration kind the reader reads, with how many literals it
+-- takes, and its name.
+decorationLiterals ∷ [(Word32, Int)]
+decorationLiterals = [(2, 0), (3, 0), (4, 0), (5, 0), (6, 1), (7, 1), (11, 1), (30, 1), (31, 1), (33, 1), (34, 1), (35, 1)]
+
+decorationName ∷ Word32 → String
+decorationName = \case
+  2 → "Block"
+  3 → "BufferBlock"
+  4 → "RowMajor"
+  5 → "ColMajor"
+  6 → "ArrayStride"
+  7 → "MatrixStride"
+  11 → "BuiltIn"
+  30 → "Location"
+  31 → "Component"
+  33 → "Binding"
+  34 → "DescriptorSet"
+  35 → "Offset"
+  other → "decoration " <> show other
+
 opcodeName ∷ Word32 → String
 opcodeName opcode = case lookup opcode names of
   Just name → name
@@ -652,10 +856,11 @@ storageUniform = 2
 storagePushConstant = 9
 storageStorageBuffer = 12
 
-decorationBlock, decorationBufferBlock, decorationRowMajor, decorationArrayStride, decorationMatrixStride, decorationBuiltIn, decorationLocation, decorationComponent, decorationBinding, decorationDescriptorSet, decorationOffset ∷ Word32
+decorationBlock, decorationBufferBlock, decorationRowMajor, decorationColMajor, decorationArrayStride, decorationMatrixStride, decorationBuiltIn, decorationLocation, decorationComponent, decorationBinding, decorationDescriptorSet, decorationOffset ∷ Word32
 decorationBlock = 2
 decorationBufferBlock = 3
 decorationRowMajor = 4
+decorationColMajor = 5
 decorationArrayStride = 6
 decorationMatrixStride = 7
 decorationBuiltIn = 11

@@ -20,6 +20,7 @@ import Test.Hspec
 import Hetoimasia.GPU.Vulkan.Native.Shader.Interface
 import Hetoimasia.GPU.Vulkan.Native.Shader.Reflect
 import Hetoimasia.GPU.Vulkan.Native.Shader.Toolchain (fingerprintPath)
+import Test.Shader.BuiltIns (builtInFragment)
 import Test.Shader.Checked (matchingFragment, matchingVertex)
 import Test.Shader.Fragment (verificationFragment)
 import Test.Shader.Interfaces (checkedFragmentInterface, checkedVertexInterface)
@@ -89,9 +90,9 @@ spec = describe "Shader interfaces" $ do
             _ → False
       -- Every Block (2) decoration removed: the uniform block is refused.
       reflect (without (decorating 2) bytes) `shouldSatisfy` failedWith "whose struct is not a Block"
-      -- Every struct definition removed: the buffers' pointers reach types no
-      -- longer defined.
-      reflect (without (\instruction → opcodeOf instruction == 30) bytes) `shouldSatisfy` failedWith "which the module does not declare"
+      -- Every struct definition removed: their Block decorations now name
+      -- ids the module does not declare.
+      reflect (without (\instruction → opcodeOf instruction == 30) bytes) `shouldSatisfy` failedWith "but declares no type, constant or variable of that id"
       -- Every image type removed: the first descriptor, a combined image
       -- sampler, reaches one no longer defined.
       reflect (without (\instruction → opcodeOf instruction == 25) bytes) `shouldSatisfy` failedWith "which the module does not declare"
@@ -117,6 +118,12 @@ spec = describe "Shader interfaces" $ do
       -- The header, and the first word of the first instruction, a capability
       -- two words long.
       reflect (ByteString.take 24 bytes) `shouldSatisfy` failedWith "ends inside an instruction"
+
+    it "reads boolean built-ins, gl_FrontFacing and gl_HelperInvocation, as no interface, from the compiled fixture and through an unchecked splice" $ do
+      bytes ← ByteString.readFile "test/fixtures/spirv/builtins.frag.spv"
+      fmap foundInterface (reflect bytes) `shouldBe` Right []
+      fmap foundInterface (reflect builtInFragment) `shouldBe` Right []
+      fmap reflectionStage (reflect builtInFragment) `shouldBe` Right ReflectedFragment
 
     it "finds no interface in the interface-free verification pair, whose built-in and varyings it does not report" $ do
       fmap foundInterface (reflect verificationVertex) `shouldBe` Right []

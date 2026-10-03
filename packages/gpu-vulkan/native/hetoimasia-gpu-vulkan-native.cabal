@@ -249,6 +249,7 @@ test-suite shader-tests
     hs-source-dirs: test
     main-is: Main.hs
     other-modules:
+        Test.Shader.BuiltIns
         Test.Shader.Checked
         Test.Shader.Constants
         Test.Shader.Fragment
