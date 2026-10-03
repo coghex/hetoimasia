@@ -136,6 +136,12 @@ spec = describe "Shader interfaces" $ do
       fmap (compareInterface checkedVertexInterface) (reflect (checkedSpirv matchingVertex)) `shouldBe` Right []
       fmap (compareInterface checkedFragmentInterface) (reflect (checkedSpirv matchingFragment)) `shouldBe` Right []
 
+    it "report a stage mismatch, in both directions, when a description is for the other stage" $ do
+      fmap (compareInterface (interfaceFor VertexInterface)) (reflect verificationFragment) `shouldBe` Right [StageMismatch VertexInterface ReflectedFragment]
+      fmap (compareInterface (interfaceFor FragmentInterface)) (reflect verificationVertex) `shouldBe` Right [StageMismatch FragmentInterface ReflectedVertex]
+      renderMismatch (StageMismatch VertexInterface ReflectedFragment) `shouldBe` "the description is for the vertex stage, but the shader is a fragment shader"
+      renderMismatch (StageMismatch FragmentInterface ReflectedVertex) `shouldBe` "the description is for the fragment stage, but the shader is a vertex shader"
+
     it "compare in both directions, naming each mismatch" $ do
       bytes ← ByteString.readFile "test/fixtures/spirv/descriptors.frag.spv"
       let declared =
@@ -216,6 +222,12 @@ spec = describe "Shader interfaces" $ do
       "interfaceFor FragmentInterface"
       tintBlock
       "a push-constant block of 2 members is present in the shader but undeclared"
+
+    it "fails a checked splice given the other stage's description, naming both stages" $
+      withClient (checkedClient "interfaceFor VertexInterface" "layout(location = 0) out vec4 colour;\nvoid main() { colour = vec4(1.0); }") $ \built → do
+        built `rejectedBecause` "the fragment shader spliced at Client.hs:"
+        built `rejectedBecause` "in module Client does not match its interface description"
+        built `rejectedBecause` "the description is for the vertex stage, but the shader is a fragment shader"
 
     it "fails on a vertex input's location" $
       withClient (checkedVertexClient "VertexAttribute 0 0 VertexFloat2 0" "layout(location = 1) in vec2 position;") $ \built → do

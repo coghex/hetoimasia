@@ -16,7 +16,7 @@ import Data.List (isInfixOf, partition)
 import Data.Word (Word32)
 import Test.Hspec
 
-import Hetoimasia.GPU.Vulkan.Native.Shader.Reflect (reflect)
+import Hetoimasia.GPU.Vulkan.Native.Shader.Reflect (Reflection (..), reflect)
 
 spec ∷ Spec
 spec = describe "The reader's whitelist" $ do
@@ -28,6 +28,22 @@ spec = describe "The reader's whitelist" $ do
   it "refuses an id beyond the header's bound" $ do
     (header, instructions) ← load descriptors
     reflect (assemble (setOperand 2 5 header, instructions)) `shouldSatisfy` failedWith "beyond its header's bound of 5"
+  it "reads a legal relaxed block layout: a float at offset 0 and then a vec3 at offset 4, aligned only to its scalar" $ do
+    (header, instructions) ← load layout
+    -- The push-constant block's struct: the one whose member 1 is at 12.
+    let pushed = case [operand 0 words' | words' ← instructions, decorates 72 35 words', operand 1 words' == 1, operand 3 words' == 12] of
+          found : _ → found
+          [] → unknown
+        offset member value words'
+          | decorates 72 35 words' && operand 0 words' == pushed && operand 1 words' == member = setOperand 3 value words'
+          | otherwise = words'
+        -- The vec3, member 0, moved to 4, and the float, member 1, to 0: the
+        -- vector straddles no 16-byte boundary, so the relaxed block layout
+        -- takes it, though std430's base alignment would put it at 16.
+        relaxed = map (offset 0 4 . offset 1 0) instructions
+    fmap reflectionPushMembers (reflect (assemble (header, instructions))) `shouldBe` Right (Just [(0, 12), (12, 4), (16, 16), (32, 8)])
+    fmap reflectionPushMembers (reflect (assemble (header, relaxed))) `shouldBe` Right (Just [(4, 12), (0, 4), (16, 16), (32, 8)])
+
   it "reads an Output variable whose initializer is a null constant of its own type, exactly as without one" $ do
     (header, instructions) ← load interface
     let outputs = [words' | words' ← instructions, opcodeOfWords words' == 59, operand 2 words' == 3]
