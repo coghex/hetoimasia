@@ -35,7 +35,7 @@ spec = describe "The reader's whitelist" $ do
         initialize words' = case [constant | (variable, constant, _) ← nulls, opcodeOfWords words' == 59, variable == operand 1 words'] of
           constant : _ → withWords (words' <> [constant])
           [] → words'
-        mutated = insertBeforeFirst 59 [instruction 46 [pointee', constant] | (_, constant, pointee') ← nulls] (map initialize instructions)
+        mutated = foldr (\(_, constant, pointee') → insertAfterDeclaration pointee' [instruction 46 [pointee', constant]]) (map initialize instructions) nulls
     reflect (assemble (withRoom header, mutated)) `shouldBe` reflect (assemble (header, instructions))
   where
     row (rule, fixture, mutation, expected) = it rule $ do
@@ -364,6 +364,16 @@ rows =
     , onDecoration 71 33 (setOperand 0 unknown)
     , "but declares no type, constant or variable of that id"
     )
+  , ( "refuses a variable decorated both BuiltIn and Location, rather than excluding it as a built-in"
+    , interface
+    , \instructions → instructions <> [instruction 71 [operand 0 words', 11, 0] | words' ← instructions, decorates 71 30 words', operand 2 words' == 2]
+    , "is decorated both BuiltIn and Location, which a built-in does not take"
+    )
+  , ( "refuses a built-in variable decorated with a Component"
+    , interface
+    , \instructions → instructions <> [instruction 71 [operand 0 words', 31, 0] | words' ← instructions, decorates 71 11 words']
+    , "is decorated both BuiltIn and Component, which a built-in does not take"
+    )
   , -- The explicit layout a buffer or push-constant block requires
     ( "refuses a buffer member with no Offset"
     , descriptors
@@ -414,8 +424,9 @@ rows =
   , ( "refuses an initializer of another type than its variable's"
     , interface
     , \instructions →
-        insertBeforeFirst 59 [instruction 43 [firstType 21 instructions, fresh, 7]] $
-          map (\words' → if opcodeOfWords words' == 59 && operand 2 words' == 3 then withWords (words' <> [fresh]) else words') instructions
+        let float = firstType 22 instructions
+         in insertAfterDeclaration float [instruction 43 [float, fresh, 0]] $
+              map (\words' → if opcodeOfWords words' == 59 && operand 2 words' == 3 then withWords (words' <> [fresh]) else words') instructions
     , "is not the type it must have"
     )
   , ( "refuses a composite initializer of fewer constituents than its type has"
@@ -426,6 +437,16 @@ rows =
          in insertBeforeFirst 59 [instruction 43 [float, fresh, 0], instruction 44 [vector, fresh + 1, fresh, fresh, fresh]] $
               map (\words' → if opcodeOfWords words' == 59 && operand 2 words' == 3 && pointeeOf (operand 0 words') instructions == vector then withWords (words' <> [fresh + 1]) else words') instructions
     , "of 3 constituents, where its type has 4"
+    )
+  , ( "refuses an initializer whose constant names its type before the type is declared"
+    , interface
+    , \instructions →
+        let vector = firstVector 4 instructions
+            declaresVector words' = opcodeOfWords words' == 23 && operand 0 words' == vector
+            (earlier, rest) = break declaresVector instructions
+         in map (\words' → if opcodeOfWords words' == 59 && operand 2 words' == 3 && pointeeOf (operand 0 words') instructions == vector then withWords (words' <> [fresh]) else words') $
+              earlier <> [instruction 46 [vector, fresh]] <> rest
+    , "which is not declared before the instruction (id " <> show fresh <> ") that refers to it"
     )
   , -- The entry point
     ( "refuses an entry point listing an interface id twice"
@@ -566,6 +587,15 @@ onDecoration opcode kind change = map (\words' → if decorates opcode kind word
 insertBeforeFirst ∷ Word32 → [[Word32]] → [[Word32]] → [[Word32]]
 insertBeforeFirst opcode inserted instructions =
   let (earlier, rest) = break ((== opcode) . opcodeOfWords) instructions in earlier <> inserted <> rest
+
+-- | These instructions inserted just after the type declaring this id, so
+-- they may name it.
+insertAfterDeclaration ∷ Word32 → [[Word32]] → [[Word32]] → [[Word32]]
+insertAfterDeclaration typeId inserted instructions =
+  let (earlier, rest) = break (\words' → opcodeOfWords words' `elem` [19 .. 38] && operand 0 words' == typeId) instructions
+   in case rest of
+        declaration : later → earlier <> [declaration] <> inserted <> later
+        [] → earlier <> inserted
 
 -- | The type a pointer of this id points to.
 pointeeOf ∷ Word32 → [[Word32]] → Word32

@@ -631,6 +631,9 @@ validateInterface parsed globals = do
           counted ∷ String → Either String a
           counted required = Left (named <> " reaches id " <> show constant <> " as " <> role <> ", an " <> opcodeName opcode <> " with " <> show (length operands) <> " operands, where the reader requires " <> required)
           expectedType = Map.lookup expected (moduleTypes parsed)
+      -- The constant's own type is a reference like any other: declared
+      -- before the constant.
+      _ ← refer named constant constantPosition ("the type of " <> role) resultType
       when (resultType /= expected) mismatch
       case opcode of
         _
@@ -670,8 +673,9 @@ validateInterface parsed globals = do
 -- RowMajor and ColMajor, one for ArrayStride, MatrixStride, BuiltIn,
 -- Location, Component, Binding, DescriptorSet and Offset; a stride positive;
 -- no kind twice on one target or member; and never both RowMajor and
--- ColMajor. Nothing is read from a decoration until all of them pass, so no
--- missing literal can stand for a default.
+-- ColMajor, nor BuiltIn with Location or Component. Nothing is read from a
+-- decoration until all of them pass, so no missing literal can stand for a
+-- default.
 validateDecorations ∷ Module → Either String ()
 validateDecorations parsed = do
   forM_' (Map.toList (moduleDecorations parsed)) $ \(target, found) → do
@@ -705,6 +709,11 @@ validateDecorations parsed = do
           Left (subject <> "'s " <> decorationName kind <> " decoration carries " <> show (length values) <> " literals, where the reader requires " <> show required)
         when (kind `elem` [decorationArrayStride, decorationMatrixStride] && values == [0]) $
           Left (subject <> "'s " <> decorationName kind <> " is 0, where the reader requires a positive stride")
+        -- A built-in is located by the device, not by a Location or a
+        -- Component: the combination is refused before any built-in is
+        -- excluded from what the host declares.
+        when (kind `elem` [decorationLocation, decorationComponent] && decorationBuiltIn `elem` map fst consumed) $
+          Left (subject <> " is decorated both BuiltIn and " <> decorationName kind <> ", which a built-in does not take")
 
 -- | The explicit layout a Uniform, StorageBuffer or PushConstant block
 -- requires, from its struct down — through a descriptor array of blocks,
