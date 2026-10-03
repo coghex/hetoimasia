@@ -208,6 +208,56 @@ spec = describe "Drawing from buffers" $ do
       fmap ringViewBytes <$> atomically (readRing (rigRecording rig)) `shouldReturn` Just 256
       clean rig
 
+    it "refuses an invalid claim or write before anything is held, written, flushed or recorded, a claim padding makes too large included" $ do
+      rig ← newRig
+      allowTypes (standAllocator (rigRootsStandIn rig)) (2 ^ deviceLocalType + 2 ^ nonCoherentType)
+      ringed rig 100
+      fmap ringViewAtom <$> atomically (readRing (rigRecording rig)) `shouldReturn` Just 64
+      before ← recordingCalls (rigRecordingStandIn rig)
+      allocatorBefore ← allocatorCalls (standAllocator (rigRootsStandIn rig))
+      answers ← framelessOnce rig $ \recorder →
+        mapM
+          (\(size', alignment) → fmap (const ()) <$> claimRegion recorder size' alignment)
+          [ (0, 4)
+          , (16, 0)
+          , (16, 3)
+          , (16, 12)
+          , (2 ^ (64 ∷ Int), 4)
+          , (2 ^ (64 ∷ Int) + 1, 4)
+          , (101, 4)
+          , -- Within the ring's 100 bytes, but padded to the 64-byte atom it
+            -- is 128: it can never fit, so it is not backpressure.
+            (65, 4)
+          ]
+      answers
+        `shouldBe` [ Left (RefusedIllegal "a claim of no bytes")
+                   , Left (RefusedIllegal "a claim alignment that is not a power of two")
+                   , Left (RefusedIllegal "a claim alignment that is not a power of two")
+                   , Left (RefusedIllegal "a claim alignment that is not a power of two")
+                   , Left (RefusedOutOfBounds (2 ^ (64 ∷ Int)) 100)
+                   , Left (RefusedOutOfBounds (2 ^ (64 ∷ Int) + 64) 100)
+                   , Left (RefusedOutOfBounds 128 100)
+                   , Left (RefusedOutOfBounds 128 100)
+                   ]
+      -- Nothing was claimed, and nothing native happened beyond the empty
+      -- batch's own beginning and end.
+      offsets rig `shouldReturn` []
+      after ← recordingCalls (rigRecordingStandIn rig)
+      [() | Recorded _ (CommandResourceBarrier {}) ← drop (length before) after] `shouldBe` []
+      [() | WroteMapped {} ← drop (length before) after] `shouldBe` []
+      allocatorAfter ← allocatorCalls (standAllocator (rigRootsStandIn rig))
+      [() | Flushed {} ← drop (length allocatorBefore) allocatorAfter] `shouldBe` []
+      -- A write at an offset past the claim's bytes, however far, writes
+      -- nothing.
+      writes ← framelessOnce rig $ \recorder → do
+        claim ← claimed recorder 16
+        sequence [writeClaim recorder claim (2 ^ (64 ∷ Int)) (bytes 4), writeClaim recorder claim 16 (bytes 1)]
+      writes `shouldBe` [Left (RefusedOutOfBounds (2 ^ (64 ∷ Int) + 4) 16), Left (RefusedOutOfBounds 17 16)]
+      final ← recordingCalls (rigRecordingStandIn rig)
+      [() | WroteMapped {} ← drop (length before) final] `shouldBe` []
+      settleAll rig
+      clean rig
+
     it "reclaims a region only when its batch completes or is discarded, wrapping round, and answers a full ring as backpressure" $ do
       rig ← newRig
       ringed rig 256
