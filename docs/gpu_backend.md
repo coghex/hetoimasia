@@ -1510,6 +1510,37 @@ native image is owned and nothing can settle it — is an uncertain effect: the
 slot is retained for ever, admission closes, the session fails with
 `CleanupFailed`, and `FrameEffectUncertain` is raised.
 
+The slot's synchronization and a presentation-pool record are each built
+before they are published: a slot's acquisition semaphore, submission fence and
+cleanup fence, and a record's render-finished semaphore and present fence, each
+created and then named. A creation that ran out of memory created nothing and
+is recovered as an allocation, once ([Allocation recovery](#allocation-recovery)).
+Any other creation or naming that raises after something was made is rolled
+back:
+
+- every object made is destroyed exactly once, newest first — the dependency
+  order — and a destruction that raised does not stop the ones after it;
+- the construction's failure stays primary, and every destruction that raised
+  is retained beside it, in the order attempted, under the
+  `vulkan frame synchronization rollback` label, as
+  [the failure table](resources.md#the-failure-table) requires;
+- when every destruction returned, nothing is retained and nothing else
+  changes: the reservation goes back as for any acquisition that raised, the
+  session is not failed, and synchronization published before — the complete
+  slot a failed pool record was being built for — stays;
+- when one raised, the object it named may still exist. The slot or record is
+  published anyway, held by no frame, with each object standing as its
+  rollback left it: uncertain (`FenceUncertain`, `SemaphoreUncertain`) if its
+  destruction raised, `FenceDestroyed` or `SemaphoreDestroyed` if it returned,
+  and `FenceNeverCreated` or `SemaphoreNeverCreated` — its handle naming
+  nothing — if the construction never made it. Its `syncDestruction` or
+  `poolDestruction` records why. Admission closes and the session fails with
+  `CleanupFailed`, without replacing an earlier terminal primary, before the
+  failure is raised. Like a published record whose destruction raised, it is
+  never destroyed again under any rule, the device-loss rule included, so the
+  target's frame retirement keeps it and raises `FramesRetained` rather than
+  certifying anything.
+
 ### Submission
 
 `submitFrames` refuses before any native call: a batch of another session; a
