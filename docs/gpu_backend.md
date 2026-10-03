@@ -2275,7 +2275,10 @@ table's size.
   raises, is cancelled or refuses, the handle is never handed out, so the
   registration is undone first (`unregisterTexture`): its index and slot are
   free again, the image is the caller's again, and it may be registered
-  again.
+  again. The undo is refused only when a version maps the handle itself (its
+  index at its generation), which a handle never handed out cannot be; a
+  version naming the slot for an earlier occupant is no obstacle. A refused
+  undo raises `RegistrationNotUndone`, which carries the live handle.
 
 `releaseTexture recording handle` ends a handle. Its index may be issued
 again at once under the next generation, and its slot retires. Its image
@@ -2467,7 +2470,8 @@ cover:
 - a cancellation during the refresh that reclaims a slot leaving its image
   released, or still retiring for the next refresh;
 - a registration whose descriptor write fails, or is cancelled, undone,
-  with the texture registered again afterwards.
+  into a slot an earlier, bound and released texture left, with the texture
+  registered again afterwards.
 
 A mutation check that ignored version holds failed the three hold-dependent
 examples, and one that left the version's images out of the batch's
