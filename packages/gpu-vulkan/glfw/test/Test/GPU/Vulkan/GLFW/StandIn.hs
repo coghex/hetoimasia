@@ -1139,7 +1139,7 @@ renderingLayers rescued events rendering clock =
     creating kind = atomically (stateTVar (renderingCreations rendering) (\held → (Map.lookup kind held, Map.delete kind held))) >>= maybe (pure ()) throwIO
     recordingLayer =
       RecordingOps
-        { opsCreatePipelineLayout = \_ _ → do
+        { opsCreatePipelineLayout = \_ _ _ → do
             creating CreateLayout
             handle ← fresh
             handle <$ record events (LayoutMade handle)
@@ -1161,11 +1161,19 @@ renderingLayers rescued events rendering clock =
         , opsImageSupport = \_ → pure (Just (ImageLimits 16384 16384 15 (2 ^ (31 ∷ Int))))
         , opsMaxBufferSize = pure (1024 * 1024 * 1024)
         , opsMaxFramebuffer = pure (16384, 16384)
-        , opsRecordingLimits = pure (RecordingLimits 128 16 16 2048 2047 64 16384)
+        , opsRecordingLimits = pure (RecordingLimits 128 16 16 2048 2047 64 16384 500000 500000 500000 4 256 134217728)
         , opsCreateView = \_ request → do
             handle ← fresh
             handle <$ record events (OwnedViewMade handle (requestViewImage request))
         , opsDestroyView = \_ handle → record events (OwnedViewGone handle)
+        , opsCreateSampler = \_ _ → fresh
+        , opsDestroySampler = \_ _ → pure ()
+        , opsCreateSetLayout = \_ _ → fresh
+        , opsDestroySetLayout = \_ _ → pure ()
+        , opsCreateDescriptorPool = \_ _ → fresh
+        , opsDestroyDescriptorPool = \_ _ → pure ()
+        , opsAllocateSet = \_ _ _ _ → fresh
+        , opsWriteDescriptors = \_ _ → pure ()
         }
     frameLayer =
       FrameOps

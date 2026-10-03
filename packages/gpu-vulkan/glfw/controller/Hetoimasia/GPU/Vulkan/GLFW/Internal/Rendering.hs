@@ -109,6 +109,11 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
   , constructFramelessBatch
   , constructReadback
   , readConstructedReadback
+  , constructTextureTable
+  , constructTablePipelineLayout
+  , registerConstructedTexture
+  , releaseConstructedTexture
+  , readConstructedTable
   , lendConstruction
   , framelessScoped
   , constructionEscaped
@@ -135,6 +140,7 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
   , UploadsUnavailable (..)
   , makeRenderingUploads
   , progressRenderingUploads
+  , refreshRenderingTable
   , renderingUploadsWaiting
   , submitRenderingUpload
   , cancelRenderingUpload
@@ -307,6 +313,17 @@ import Hetoimasia.GPU.Vulkan.Native.Roots
   , readRootsTerminal
   , stateRootsModel
   )
+import Hetoimasia.GPU.Vulkan.Native.TextureTable
+  ( TableConfig
+  , TableView
+  , TextureHandle
+  , createTablePipelineLayout
+  , createTextureTable
+  , readTable
+  , refreshTextureTable
+  , registerTexture
+  , releaseTexture
+  )
 import Hetoimasia.GPU.Vulkan.Native.Uploads
   ( CancelRefusal (CancelUnknown)
   , UploadConfig
@@ -431,6 +448,9 @@ data Construction q inst msgr phys dev cmd = Construction
   , constructionFrameless ∷ !(Maybe (FramelessScope q inst msgr phys dev cmd))
     -- ^ The owner-thread action's frame-less scope (GRS-12): 'Nothing' for a
     -- renderer's frame, which records no frame-less batch.
+  , constructionUploads ∷ !(TVar (UploadsStanding q inst msgr phys dev cmd))
+    -- ^ The session's uploads, which the texture table's placeholder is
+    -- uploaded through (GRS-7).
   }
 
 -- | What the renderer can release: the handles it can construct.
@@ -540,6 +560,38 @@ constructReadback construction bytes = confined construction (createReadback (co
 readConstructedReadback ∷ Construction q inst msgr phys dev cmd → Readback → Natural → Natural → IO (Either Refusal ByteString.ByteString)
 readConstructedReadback construction readback offset size = confined construction (readReadback (constructionRecording construction) readback offset size)
 
+-- | Make the session's texture table (GRS-7) from a validated
+-- configuration: its samplers, its two descriptor sets, its version ring and
+-- slot 0's placeholder, whose upload goes through the session's uploads — so
+-- the host must configure them ('vulkanUploads'), and the table binds once
+-- that upload completes. A second is refused.
+constructTextureTable ∷ Construction q inst msgr phys dev cmd → TableConfig → IO (Either Refusal ())
+constructTextureTable construction config =
+  readTVarIO (constructionUploads construction) >>= \case
+    UploadsMade uploads → confined construction (createTextureTable (constructionRecording construction) uploads config)
+    _ → pure (Left (RefusedIllegal "a texture table in a session whose uploads are not made: the host configures them with vulkanUploads"))
+
+-- | A pipeline layout holding the texture table: both of its sets, the
+-- checked shaders' push-constant ranges, and the offset of the sampler index
+-- 'selectSampler' pushes.
+constructTablePipelineLayout ∷ Construction q inst msgr phys dev cmd → CheckedShaders → Word32 → IO (Either Refusal PipelineLayout)
+constructTablePipelineLayout construction shaders offset = confined construction (createTablePipelineLayout (constructionRecording construction) shaders offset)
+
+-- | Register an uploaded texture with the table and answer its stable
+-- handle: slot 0's placeholder until its upload completes, its own slot in
+-- versions published after that. The table holds the image from now on.
+registerConstructedTexture ∷ Construction q inst msgr phys dev cmd → Image → IO (Either Refusal TextureHandle)
+registerConstructedTexture construction image = confined construction (registerTexture (constructionRecording construction) image)
+
+-- | Release a texture's handle: versions published from now on no longer
+-- map it, and its image is released once no batch's version does.
+releaseConstructedTexture ∷ Construction q inst msgr phys dev cmd → TextureHandle → IO (Either Refusal ())
+releaseConstructedTexture construction handle = confined construction (releaseTexture (constructionRecording construction) handle)
+
+-- | The texture table as it stands, if the session made one.
+readConstructedTable ∷ Construction q inst msgr phys dev cmd → IO (Maybe TableView)
+readConstructedTable construction = atomically (readTable (constructionRecording construction))
+
 -- | Release a handle the renderer constructed: nothing records it again, and a
 -- batch that recorded it keeps it until that batch's references end. The
 -- owner destroys it once nothing holds it.
@@ -620,7 +672,7 @@ lendConstruction rendering =
 
 -- | The construction over the session's recording.
 construct ∷ Rendering q inst msgr phys dev cmd → Live q inst msgr phys dev cmd → Construction q inst msgr phys dev cmd
-construct rendering made = Construction (liveRecording made) (renderingRoots rendering) (renderingEscape rendering) Nothing
+construct rendering made = Construction (liveRecording made) (renderingRoots rendering) (renderingEscape rendering) Nothing (renderingUploads rendering)
 
 -- | Run an owner-thread action's body with the construction it was lent and a
 -- frame-less scope over the session's frames (GRS-12): the frame-less batches
@@ -1394,6 +1446,17 @@ progressRenderingUploads rendering open =
       progressUploads uploads >>= \case
         Right step → pure (progressAdvanced step)
         Left _ → pure False
+
+-- | Bring the texture table up to date after the step's uploads (GRS-7):
+-- write the descriptors of textures whose uploads completed, and release the
+-- images of released textures no batch's version maps any longer. A session
+-- with no table, or no recording, has nothing to do; a refusal leaves the
+-- table as it was, for the next step.
+refreshRenderingTable ∷ Rendering q inst msgr phys dev cmd → IO ()
+refreshRenderingTable rendering =
+  readTVarIO (renderingLive rendering) >>= \case
+    Nothing → pure ()
+    Just made → void (refreshTextureTable (liveRecording made))
 
 -- | Whether an upload waits for the owner: any thread may ask, and the
 -- owner's wake does.

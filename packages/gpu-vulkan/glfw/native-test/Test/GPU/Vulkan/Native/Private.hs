@@ -75,6 +75,14 @@
 --   vertex, instance-offset and index buffers, admitted off the owner's thread
 --   and waited for with a deadline; every level copied back and compared
 --   exactly, and the quad drawn from the uploaded buffers and probed (#342);
+-- * @grs7-texture-table@ — the same device start with no window, then the
+--   session's texture table: a texture registered before its upload drawn as
+--   the transparent placeholder, two uploaded textures drawn through their
+--   handles with a sampler each, a batch recorded with a texture's handle
+--   that is then released and another texture registered before the batch
+--   is submitted, which still draws the original, and the new texture drawn
+--   beside the released handle, which resolves to the placeholder; every
+--   batch read back and probed (#343);
 -- * @grs3-ordering@ — GRS-3's managed depth target and buffer written by an
 --   initializing batch, then by two batches submitted in order with no
 --   completion wait between and no layout change, ordered only by the
@@ -357,6 +365,14 @@ scenarios =
       $ \consent journal _ → do
         outcome ← SurfaceFree.runUploads (consentBackend consent) journal
         pure (SurfaceFree.uploadsSpec outcome, section "The GRS-6 uploads record" (SurfaceFree.uploadsSection outcome))
+  , Scenario
+      "grs7-texture-table"
+      "samples textures through bindless handles in frame-less batches of a surface-free session: the transparent placeholder before an upload, two uploaded textures each with its own sampler, and a batch recorded before its texture's release and submitted after it drawing the original, whose slot is reused only once that batch completes, with validation reporting nothing"
+      False
+      Nothing
+      $ \consent journal _ → do
+        outcome ← SurfaceFree.runTable (consentBackend consent) journal
+        pure (SurfaceFree.tableSpec outcome, section "The GRS-7 texture table record" (SurfaceFree.tableSection outcome))
   , Scenario
       "synchronization-hazard"
       "observes a deliberate synchronization hazard, proving synchronization validation active"

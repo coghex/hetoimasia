@@ -129,6 +129,25 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , cancelVulkanUpload
   , CancelRefusal (..)
 
+    -- * The bindless texture table (GRS-7)
+  , TableConfig
+  , validateTableConfig
+  , TableConfigRefused (..)
+  , defaultVersionCount
+  , constructTextureTable
+  , constructTablePipelineLayout
+  , textureTableDescriptors
+  , TextureHandle (..)
+  , LookupEntry (..)
+  , registerConstructedTexture
+  , releaseConstructedTexture
+  , TableView (..)
+  , readConstructedTable
+  , TableSampler (..)
+  , tableSamplerIndex
+  , bindTable
+  , selectSampler
+
     -- * Drawing from buffers with push constants (GRS-4)
   , constructPipelineLayoutWith
   , constructPipelineWith
@@ -270,6 +289,11 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , constructImage
   , constructReadback
   , readConstructedReadback
+  , constructTextureTable
+  , constructTablePipelineLayout
+  , registerConstructedTexture
+  , releaseConstructedTexture
+  , readConstructedTable
   , constructPipeline
   , constructPipelineLayout
   , constructPipelineLayoutWith
@@ -383,6 +407,20 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   )
 import Hetoimasia.GPU.Vulkan.Native.Profile (ValidationFeature (..))
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering (UploadsUnavailable (..))
+import Hetoimasia.GPU.Vulkan.Native.TextureTable
+  ( LookupEntry (..)
+  , TableConfig
+  , TableConfigRefused (..)
+  , TableSampler (..)
+  , TableView (..)
+  , TextureHandle (..)
+  , bindTable
+  , defaultVersionCount
+  , selectSampler
+  , tableSamplerIndex
+  , textureTableDescriptors
+  , validateTableConfig
+  )
 import Hetoimasia.GPU.Vulkan.Native.Uploads
   ( CancelRefusal (..)
   , UploadConfig
