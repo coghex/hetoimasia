@@ -1720,11 +1720,13 @@ against one explicit whitelist, the subset it supports:
   DescriptorSet, Offset — decorates a declared type, constant or variable, or a
   member a declared struct has; carries exactly the literals its kind takes;
   is not given twice to one target or member; has a positive stride where it is
-  one; and is never RowMajor and ColMajor on one member. No missing literal
-  stands for a default;
+  one; is never RowMajor and ColMajor on one member; and is never BuiltIn
+  together with Location or Component, which is refused before any built-in is
+  left out of what the host declares. No missing literal stands for a default;
 - each interface variable's `OpVariable` has three operands, or four with an
   initializer, which only Output and Private variables take, and which must be
-  a constant of the variable's own type, declared before it: a boolean, a
+  a constant of the variable's own type, declared before it and naming a type
+  declared before itself: a boolean, a
   scalar of as many words as its width, a null, or a composite of as many
   constituents as its type has, each a constant of its constituent's type;
 - each variable's storage class is one it knows — UniformConstant, Input,
