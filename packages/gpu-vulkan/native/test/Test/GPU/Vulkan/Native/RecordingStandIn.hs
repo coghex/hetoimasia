@@ -33,6 +33,8 @@ module Test.GPU.Vulkan.Native.RecordingStandIn
   , standInMaxBufferSize
   , limitFramebuffer
   , standInMaxFramebuffer
+  , limitRecording
+  , standInRecordingLimits
   ) where
 
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
@@ -57,9 +59,13 @@ import Test.GPU.Vulkan.Native.StandIn (StandInResult (..))
 -- | One native call the recording made, in the order it made it.
 data RecordingCall
   = CreatedLayout !Word64
+  | DeclaredRanges !Word64 ![PushConstantRange]
+    -- ^ The push-constant ranges a layout was created with, when it has any.
   | DestroyedLayout !Word64
   | CreatedPipeline !Word64 !Word64 !Word32
     -- ^ The pipeline, the layout it was built over, and its color format.
+  | DeclaredInput !Word64 !VertexInput
+    -- ^ The vertex input a pipeline was created with, when it has any.
   | DestroyedPipeline !Word64
   | CreatedStorage !Word64 !Word64
     -- ^ The pool and its command buffer.
@@ -116,6 +122,7 @@ data RecordingStandIn = RecordingStandIn
   , recordingSupport ∷ !(TVar (ImageQuery → Maybe ImageLimits))
   , recordingMaxBuffer ∷ !(TVar Natural)
   , recordingMaxFramebuffer ∷ !(TVar (Word32, Word32))
+  , recordingLimits ∷ !(TVar RecordingLimits)
   }
 
 newRecordingStandIn ∷ IO RecordingStandIn
@@ -132,6 +139,7 @@ newRecordingStandIn =
     <*> newTVarIO (const (Just standInImageLimits))
     <*> newTVarIO standInMaxBufferSize
     <*> newTVarIO standInMaxFramebuffer
+    <*> newTVarIO standInRecordingLimits
 
 -- | What every image is supported up to unless an example says otherwise.
 standInImageLimits ∷ ImageLimits
@@ -145,6 +153,16 @@ standInMaxBufferSize = 1024 * 1024 * 1024
 -- image is supported up to.
 standInMaxFramebuffer ∷ (Word32, Word32)
 standInMaxFramebuffer = (16384, 16384)
+
+-- | What the device allows pipeline interfaces and mapped memory unless an
+-- example says otherwise: Vulkan's required minimums, and a 64-byte atom.
+standInRecordingLimits ∷ RecordingLimits
+standInRecordingLimits = RecordingLimits 128 16 16 2048 2047 64
+
+-- | Have the device allow pipeline interfaces and mapped memory this from now
+-- on.
+limitRecording ∷ RecordingStandIn → RecordingLimits → IO ()
+limitRecording standIn limits = atomically (writeTVar (recordingLimits standIn) limits)
 
 -- | Have the device render into no area wider or taller than this from now on.
 limitFramebuffer ∷ RecordingStandIn → (Word32, Word32) → IO ()
@@ -218,9 +236,11 @@ fresh standIn = atomically $ do
 recordingStandInOps ∷ RecordingStandIn → RecordingOps Int Word64
 recordingStandInOps standIn =
   RecordingOps
-    { opsCreatePipelineLayout = \_ → do
+    { opsCreatePipelineLayout = \_ ranges → do
         handle ← fresh standIn
-        handle <$ step standIn AtCreateLayout (CreatedLayout handle)
+        step standIn AtCreateLayout (CreatedLayout handle)
+        when (not (null ranges)) (journal standIn (DeclaredRanges handle ranges))
+        pure handle
     , opsDestroyPipelineLayout = \_ handle → step standIn AtDestroyLayout (DestroyedLayout handle)
     , opsCreatePipeline = \_ request name → do
         -- Its shader modules are numbers too, named as the production layer
@@ -230,7 +250,9 @@ recordingStandInOps standIn =
         fragment ← fresh standIn
         name FragmentStage fragment
         handle ← fresh standIn
-        handle <$ step standIn AtCreatePipeline (CreatedPipeline handle (requestLayout request) (requestColorFormat request))
+        step standIn AtCreatePipeline (CreatedPipeline handle (requestLayout request) (requestColorFormat request))
+        when (requestVertexInput request /= noVertexInput) (journal standIn (DeclaredInput handle (requestVertexInput request)))
+        pure handle
     , opsDestroyPipeline = \_ handle → step standIn AtDestroyPipeline (DestroyedPipeline handle)
     , opsCreateStorage = \_ _ → do
         pool ← fresh standIn
@@ -274,6 +296,7 @@ recordingStandInOps standIn =
         ($ query) <$> readTVarIO (recordingSupport standIn)
     , opsMaxBufferSize = readTVarIO (recordingMaxBuffer standIn)
     , opsMaxFramebuffer = readTVarIO (recordingMaxFramebuffer standIn)
+    , opsRecordingLimits = readTVarIO (recordingLimits standIn)
     , opsCreateView = \_ request → do
         handle ← fresh standIn
         handle <$ step standIn AtCreateView (CreatedView handle request)

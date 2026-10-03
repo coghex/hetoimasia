@@ -110,6 +110,34 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , readConstructedReadback
   , Readback
 
+    -- * Drawing from buffers with push constants (GRS-4)
+  , constructPipelineLayoutWith
+  , constructPipelineWith
+  , PushStage (..)
+  , PushConstantRange (..)
+  , InputRate (..)
+  , VertexFormat (..)
+  , VertexBinding (..)
+  , VertexAttribute (..)
+  , VertexInput (..)
+  , noVertexInput
+  , pushConstants
+  , IndexType (..)
+  , BufferSource (..)
+  , bindVertexBuffer
+  , bindIndexBuffer
+  , drawIndexed
+
+    -- * The shared ring (GRS-4)
+  , RingSize
+  , validateRingSize
+  , RingSizeRefused (..)
+  , constructRing
+  , RingClaim
+  , claimSize
+  , claimRegion
+  , writeClaim
+
     -- * Frame-less batches (GRS-12)
   , constructFramelessBatch
   , BatchTicket
@@ -217,6 +245,9 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , readConstructedReadback
   , constructPipeline
   , constructPipelineLayout
+  , constructPipelineLayoutWith
+  , constructPipelineWith
+  , constructRing
   , replaceConstructedPipeline
   , releaseConstructed
   , InstanceExtensionsMissing (..)
@@ -265,7 +296,28 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , Buffer
   , BufferDescription (..)
   , BufferKind (..)
+  , BufferSource (..)
   , ClearColor (..)
+  , IndexType (..)
+  , InputRate (..)
+  , PushConstantRange (..)
+  , PushStage (..)
+  , RingClaim
+  , RingSize
+  , RingSizeRefused (..)
+  , VertexAttribute (..)
+  , VertexBinding (..)
+  , VertexFormat (..)
+  , VertexInput (..)
+  , bindIndexBuffer
+  , bindVertexBuffer
+  , claimRegion
+  , claimSize
+  , drawIndexed
+  , noVertexInput
+  , pushConstants
+  , validateRingSize
+  , writeClaim
   , Image
   , ImageDescription (..)
   , ImageFormat (..)

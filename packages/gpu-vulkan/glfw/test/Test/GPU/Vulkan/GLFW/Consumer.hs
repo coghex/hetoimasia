@@ -911,6 +911,10 @@ shape = \case
   CommandBeginLabel _ → "label"
   CommandEndLabel → "end label"
   CommandResourceBarrier {} → "resource barrier"
+  CommandPushConstants {} → "push constants"
+  CommandBindVertexBuffer binding _ _ → "bind vertex " <> show binding
+  CommandBindIndexBuffer {} → "bind index"
+  CommandDrawIndexed indices instances → "draw indexed " <> show indices <> " " <> show instances
 
 verdictClean ∷ DiagnosticVerdict → Bool
 verdictClean = null . verdictIssues

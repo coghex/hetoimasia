@@ -49,12 +49,14 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , Recording (..)
   , ResourceDestructionFailed (..)
   , ResourcesRetained (..)
+  , RingState (..)
   , destroyNative
   , editManaged
   , isAsynchronous
   , makeRecording
   , modelEdit
   , owner
+  , releaseClaims
   )
 import Hetoimasia.GPU.Vulkan.Native.Generations (Generations)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer (RecordingOps)
@@ -104,7 +106,7 @@ disposeResources recording now = owner recording (go [])
       NativeReadback {} → 2
       NativeBuffer {} → 2
       NativeImage {} → 2
-      NativeLayout _ → 3
+      NativeLayout {} → 3
 
 -- | Whether a generation may be destroyed natively now, as far as the
 -- recording knows: it was released or replaced, and a pipeline layout has no
@@ -112,7 +114,7 @@ disposeResources recording now = owner recording (go [])
 destroyableNow ∷ Map.Map ResourceId (ManagedRecord cmd) → ResourceId → ManagedRecord cmd → Bool
 destroyableNow managed resource record =
   releasedStanding (managedStanding record) && case managedNative record of
-    NativeLayout _ → null [() | ManagedRecord (NativePipeline _ over _) standing ← Map.elems managed, over == resource, standing /= ManagedDestroyedPending]
+    NativeLayout {} → null [() | ManagedRecord (NativePipeline _ over _ _) standing ← Map.elems managed, over == resource, standing /= ManagedDestroyedPending]
     _ → True
   where
     releasedStanding = \case
@@ -163,12 +165,18 @@ disposer recording =
     }
 
 -- | Forget the records of generations the model recorded as disposed: each
--- managed record, its frame storage, and the batch records of a destroyed
--- storage — submitted batches whose submission completed.
+-- managed record, its frame storage, the batch records of a destroyed
+-- storage — submitted batches whose submission completed — and the shared
+-- ring, once its buffer is disposed of.
 forget ∷ Recording q inst msgr phys dev cmd → [ResourceId] → STM ()
 forget recording disposed = do
+  modifyTVar' (recordingRing recording) (\ring → ring >>= \held → if ringResource held `elem` disposed then Nothing else Just held)
   modifyTVar' (recordingManaged recording) (\held → foldr Map.delete held disposed)
   modifyTVar' (recordingStorages recording) (Map.filter (`notElem` disposed))
+  -- A batch record that goes with its storage is a submitted batch whose
+  -- submission completed: its ring regions go too.
+  completed ← Map.keys . Map.filter ((`elem` disposed) . batchStorage) <$> readTVar (recordingBatches recording)
+  releaseClaims recording completed
   modifyTVar' (recordingBatches recording) (Map.filter ((`notElem` disposed) . batchStorage))
 
 -- | One model progress turn answering for this recording's resources only,

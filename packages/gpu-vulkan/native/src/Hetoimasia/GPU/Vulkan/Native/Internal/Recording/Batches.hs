@@ -67,6 +67,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , isAsynchronous
   , modelAnswer
   , owned
+  , releaseClaims
   , settleTicket
   )
 import Hetoimasia.GPU.Vulkan.Native.Roots (failRootsSessionBecause, readRootsDevice, rootsCall, stateRootsModel)
@@ -225,6 +226,9 @@ invalidate recording storage batches discharge =
           editManaged recording readback $ \entry → case managedNative entry of
             NativeReadback held (ContentsCopyRecorded writer) | writer == batch → entry {managedNative = NativeReadback held ContentsUndefined}
             _ → entry
+      -- Their ring regions go with them: a batch dropped here was invalidated
+      -- without a submission, or its submission completed.
+      releaseClaims recording batches
       modifyTVar' (recordingBatches recording) (\held → foldr Map.delete held batches)
       pure (Right ())
 

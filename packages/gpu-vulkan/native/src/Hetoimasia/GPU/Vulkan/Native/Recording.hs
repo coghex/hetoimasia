@@ -134,9 +134,47 @@
 -- support it for the kind's use or at that size. Each image owns one view of
 -- its whole resource, created, named and destroyed with it. Their memory is the
 -- device allocator's, charged as its blocks; each reserves its objects — two
--- for a buffer, three for an image — and no bytes. Nothing writes them yet,
--- and the only thing a batch records over them is a barrier (see Ordering).
--- Disposal destroys an image's view, then the image, then its allocation.
+-- for a buffer, three for an image — and no bytes. Nothing writes a managed
+-- buffer from the host yet; a batch records barriers over both (see
+-- Ordering), and binds a vertex, index or instance buffer (see Drawing from
+-- buffers). Disposal destroys an image's view, then the image, then its
+-- allocation.
+--
+-- = Drawing from buffers (GRS-4)
+--
+-- A pipeline layout may declare push-constant ranges
+-- ('createPipelineLayoutWith'), and a pipeline a vertex input
+-- ('createPipelineWith'): bindings that advance per vertex or per instance
+-- with a stride, and the attributes read from them. Each is validated against
+-- the device's limits ('RecordingLimits') and Vulkan's rules before any native
+-- call, and the pipeline keeps what it declares with its generation, so a
+-- batch checks what it pushes, binds and draws against the pipeline it has
+-- bound now. 'pushConstants' pushes bytes into the bound layout's declared
+-- ranges. 'bindVertexBuffer' and 'bindIndexBuffer' bind data from a managed
+-- buffer of a fitting kind, or from a region of the session's shared ring the
+-- batch claimed; a bind is a use of the buffer under the ordering rules, and
+-- the batch's first touch of a buffer — its entry barrier — cannot be inside
+-- rendering. 'draw' and 'drawIndexed' draw instanced, and indexed and
+-- instanced, once every binding the pipeline declares is bound with enough
+-- data, at an offset its attributes can be read from, from a buffer still
+-- recordable and still in the use it was bound in. An indexed draw bounds
+-- per-vertex reads by the largest index in the ring region it reads, which
+-- the batch can then no longer write, and refuses per-vertex reads through
+-- index data the recording cannot read. Every bind retains exactly its
+-- buffer's generation, or the ring's.
+--
+-- = The shared ring (GRS-4, D-33)
+--
+-- A session has at most one ring ('createRing'): a host-visible buffer of the
+-- size the application configured, validated once ('validateRingSize') and
+-- never clamped. While a batch records it claims regions ('claimRegion'),
+-- aligned as asked and, on non-coherent memory, to the device's atom and
+-- padded to it, and writes them ('writeClaim'), flushing what it wrote on
+-- non-coherent memory; its submission makes the writes visible. A region is
+-- the batch's until its submission completes or it is discarded or reset; a
+-- claim that does not fit now is backpressure ('RingBudget'), and one larger
+-- than the ring is refused for good. A claim's number is never reissued, so a
+-- claim whose region was reclaimed is refused, not mistaken for the new one.
 --
 -- = Ordering
 --
@@ -168,8 +206,8 @@
 --
 -- = State
 --
--- The recording's state is three maps the 'Recording' holds, and each
--- recorder's own references. Module names below are relative to
+-- The recording's state is three maps the 'Recording' holds, the shared ring
+-- once it is made, and each recorder's own references. Module names below are relative to
 -- @Hetoimasia.GPU.Vulkan.Native.Internal.Recording@, the package's private
 -- implementation of this module, which clients cannot import.
 --
@@ -190,6 +228,13 @@
 -- |                   | which        | and advances; @Batches@ advances,  |        |                             | invalidation returned       |
 -- |                   | creates them | and removes on discard and reset;  |        |                             |                             |
 -- |                   |              | @Disposal@ removes with a storage  |        |                             |                             |
+-- +-------------------+--------------+------------------------------------+--------+-----------------------------+-----------------------------+
+-- | The shared ring   | @State@,     | @Construction@'s 'createRing'      | Owner  | From 'createRing' until its | Its generation released by  |
+-- | and its regions   | which        | makes it; @Recorder@ adds a        |        | buffer is disposed of;      | 'retireRecording', and the  |
+-- |                   | creates it   | batch's claims, and reclaims those |        | each region from its claim  | ring forgotten with its     |
+-- |                   |              | of completed batches for room;     |        | until its batch completes   | disposal; regions released  |
+-- |                   |              | @Batches@ and @Disposal@ release a |        | or is invalidated           | with their batch's record   |
+-- |                   |              | dropped batch's                    |        |                             |                             |
 -- +-------------------+--------------+------------------------------------+--------+-----------------------------+-----------------------------+
 -- | A recorder        | @Recorder@'s | The consumer, inside 'recordFrame' | Owner  | One consumer action         | Closed when the action ends |
 -- |                   | 'recordFrame'|                                    |        |                             |                             |
@@ -216,6 +261,7 @@ module Hetoimasia.GPU.Vulkan.Native.Recording
   , ViewRequest (..)
   , AccessScope (..)
   , BarrierObject (..)
+  , RecordingLimits (..)
 
     -- * The recording
   , Recording
@@ -281,6 +327,44 @@ module Hetoimasia.GPU.Vulkan.Native.Recording
   , copyTargetToReadback
   , readbackBytesFor
 
+    -- * Pipeline interfaces and drawing from buffers (GRS-4)
+  , PushStage (..)
+  , pushStageBit
+  , PushConstantRange (..)
+  , createPipelineLayoutWith
+  , InputRate (..)
+  , VertexFormat (..)
+  , vertexFormatCode
+  , vertexFormatBytes
+  , vertexFormatComponentBytes
+  , VertexBinding (..)
+  , VertexAttribute (..)
+  , VertexInput (..)
+  , noVertexInput
+  , createPipelineWith
+  , replacePipelineWith
+  , pushConstants
+  , IndexType (..)
+  , indexTypeBytes
+  , BufferSource (..)
+  , bindVertexBuffer
+  , bindIndexBuffer
+  , drawIndexed
+
+    -- * The shared ring (GRS-4)
+  , RingSize
+  , ringSizeBytes
+  , RingSizeRefused (..)
+  , validateRingSize
+  , createRing
+  , RingClaim
+  , claimSize
+  , claimRegion
+  , writeClaim
+  , ClaimRecord (..)
+  , RingView (..)
+  , readRing
+
     -- * Tickets (GRS-12)
   , BatchTicket
   , ticketBatch
@@ -328,9 +412,13 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Construction
   , createImage
   , createPipeline
   , createPipelineLayout
+  , createPipelineLayoutWith
+  , createPipelineWith
   , createReadback
+  , createRing
   , releaseManaged
   , replacePipeline
+  , replacePipelineWith
   )
 import Hetoimasia.GPU.Vulkan.Native.Internal.Reclamation (AllocationNotRecovered (..), RecoveryEnd (..))
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Disposal (disposeResources, newRecording, retireRecording)
@@ -347,7 +435,22 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   , ImageLimits (..)
   , ImageQuery (..)
   , ImageUse (..)
+  , IndexType (..)
+  , InputRate (..)
+  , PushConstantRange (..)
+  , PushStage (..)
+  , RecordingLimits (..)
+  , VertexAttribute (..)
+  , VertexBinding (..)
+  , VertexFormat (..)
+  , VertexInput (..)
   , ViewRequest (..)
+  , indexTypeBytes
+  , noVertexInput
+  , pushStageBit
+  , vertexFormatBytes
+  , vertexFormatCode
+  , vertexFormatComponentBytes
   , bufferKindUse
   , formatCode
   , formatNeedsCompressionBC
@@ -370,8 +473,15 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Readback (fillReadback, readReadback)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Recorder
   ( Recorder
+  , BufferSource (..)
   , PassStart (..)
   , beginRendering
+  , bindIndexBuffer
+  , bindVertexBuffer
+  , claimRegion
+  , drawIndexed
+  , pushConstants
+  , writeClaim
   , beginRenderingInto
   , bindPipeline
   , copyTargetToReadback
@@ -392,6 +502,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , BatchTicket (ticketBatch)
   , BatchView (..)
   , Buffer
+  , ClaimRecord (..)
   , FrameStorage
   , Image
   , Managed (managedResource)
@@ -405,8 +516,16 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , Refusal (..)
   , ResourceDestructionFailed (..)
   , ResourcesRetained (..)
+  , RingClaim
+  , RingSize
+  , RingSizeRefused (..)
+  , RingView (..)
   , TicketState (..)
   , awaitTicket
+  , claimSize
+  , readRing
+  , ringSizeBytes
+  , validateRingSize
   , readTicket
   , readBatch
   , readBatches

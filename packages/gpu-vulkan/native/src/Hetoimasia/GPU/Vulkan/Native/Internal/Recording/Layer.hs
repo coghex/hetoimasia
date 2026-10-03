@@ -3,8 +3,10 @@
 -- the open record 'RecordingOps', and the vocabulary of commands, layouts and
 -- requests those calls are given — including the engine-defined kinds of
 -- managed buffer and image (GRS-2), and the usage flags and memory usage each
--- kind fixes; and how each use the GPU model's ordering rules name (GRS-3)
--- maps onto Vulkan's layouts, stages and accesses.
+-- kind fixes; how each use the GPU model's ordering rules name (GRS-3)
+-- maps onto Vulkan's layouts, stages and accesses; and what a pipeline layout
+-- and a pipeline declare of their interface, push-constant ranges and vertex
+-- input (GRS-4).
 --
 -- This module holds no state and makes no call: it is the shape of the layer,
 -- which "Hetoimasia.GPU.Vulkan.Native.Recording.Vulkan" implements over the
@@ -17,6 +19,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   , PipelineRequest (..)
   , PipelineShaders (..)
   , ReadbackAllocation (..)
+  , RecordingLimits (..)
   , NativeCommand (..)
   , nativeName
   , ImageLayout (..)
@@ -41,6 +44,22 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   , ImageQuery (..)
   , ImageLimits (..)
   , ViewRequest (..)
+
+    -- * Pipeline interfaces (GRS-4)
+  , PushStage (..)
+  , pushStageBit
+  , PushConstantRange (..)
+  , InputRate (..)
+  , VertexFormat (..)
+  , vertexFormatCode
+  , vertexFormatBytes
+  , vertexFormatComponentBytes
+  , VertexBinding (..)
+  , VertexAttribute (..)
+  , VertexInput (..)
+  , noVertexInput
+  , IndexType (..)
+  , indexTypeBytes
 
     -- * Ordering managed resources (GRS-3)
   , AccessScope (..)
@@ -132,6 +151,17 @@ data NativeCommand
   | CommandResourceBarrier !BarrierObject !AccessScope !AccessScope
     -- ^ One managed buffer or image, the scope its barrier waits for, and the
     -- scope it makes ready (GRS-3).
+  | CommandPushConstants !Word64 ![PushStage] !Word32 !ByteString
+    -- ^ The pipeline layout, the stages the bytes are for, the offset, and
+    -- the bytes (GRS-4).
+  | CommandBindVertexBuffer !Word32 !Word64 !Word64
+    -- ^ A vertex input binding, the buffer bound to it and the offset into
+    -- that buffer.
+  | CommandBindIndexBuffer !Word64 !Word64 !IndexType
+    -- ^ The buffer, the offset into it, and the indices' type.
+  | CommandDrawIndexed !Word32 !Word32
+    -- ^ Index count and instance count, from the first index, vertex offset
+    -- and instance zero.
   deriving (Eq, Show)
 
 -- | The shaders of a graphics pipeline, as SPIR-V.
@@ -142,17 +172,19 @@ data PipelineShaders = PipelineShaders
   deriving (Eq, Show)
 
 -- | One graphics pipeline for dynamic rendering into one color format:
--- triangle lists, no vertex input, dynamic viewport and scissor.
+-- triangle lists, the vertex input it declares, dynamic viewport and scissor.
 data PipelineRequest = PipelineRequest
   { requestLayout ∷ !Word64
   , requestShaders ∷ !PipelineShaders
   , requestColorFormat ∷ !Word32
+  , requestVertexInput ∷ !VertexInput
   }
   deriving (Eq, Show)
 
--- | A readback buffer's native objects: the buffer, its allocation from the
--- device's allocator ("Hetoimasia.GPU.Vulkan.Native.Allocator"), and where
--- that allocation is mapped.
+-- | A mapped buffer's native objects — a readback buffer's, or the session's
+-- shared ring's (GRS-4): the buffer, its allocation from the device's
+-- allocator ("Hetoimasia.GPU.Vulkan.Native.Allocator"), and where that
+-- allocation is mapped.
 data ReadbackAllocation = ReadbackAllocation
   { allocationBuffer ∷ !Word64
   , allocationMemory ∷ !BoundMemory
@@ -165,6 +197,133 @@ data ReadbackAllocation = ReadbackAllocation
     -- ^ Where the allocation is mapped, from its own start, for its lifetime.
   }
   deriving (Eq, Show)
+
+-- | What the device allows the recording's pipeline interfaces and mapped
+-- memory, read once from its properties.
+data RecordingLimits = RecordingLimits
+  { limitPushConstantBytes ∷ !Word32
+    -- ^ @maxPushConstantsSize@: how far a push-constant range may reach.
+  , limitVertexBindings ∷ !Word32
+    -- ^ @maxVertexInputBindings@.
+  , limitVertexAttributes ∷ !Word32
+    -- ^ @maxVertexInputAttributes@.
+  , limitVertexStride ∷ !Word32
+    -- ^ @maxVertexInputBindingStride@.
+  , limitVertexAttributeOffset ∷ !Word32
+    -- ^ @maxVertexInputAttributeOffset@.
+  , limitNonCoherentAtom ∷ !Natural
+    -- ^ @nonCoherentAtomSize@: the granularity of flushing non-coherent
+    -- memory.
+  }
+  deriving (Eq, Show)
+
+-- ---------------------------------------------------------------------------
+-- Pipeline interfaces (GRS-4)
+
+-- | A shader stage push constants may be declared for and pushed to: the two
+-- stages every pipeline has.
+data PushStage = PushVertex | PushFragment
+  deriving (Eq, Ord, Show, Enum, Bounded)
+
+-- | The stage's @VkShaderStageFlagBits@ value.
+pushStageBit ∷ PushStage → Word32
+pushStageBit = \case
+  PushVertex → 0x00000001
+  PushFragment → 0x00000010
+
+-- | One push-constant range a pipeline layout declares: the stages it is
+-- visible to, and its offset and size in bytes.
+data PushConstantRange = PushConstantRange
+  { rangeStages ∷ ![PushStage]
+  , rangeOffset ∷ !Word32
+  , rangeSize ∷ !Word32
+  }
+  deriving (Eq, Show)
+
+-- | Whether a vertex binding advances per vertex or per instance.
+data InputRate = PerVertex | PerInstance
+  deriving (Eq, Ord, Show, Enum, Bounded)
+
+-- | The formats a vertex attribute may have: every one of them is one Vulkan
+-- requires every device to support as a vertex buffer format, so no device
+-- is asked.
+data VertexFormat
+  = VertexFloat
+  | VertexFloat2
+  | VertexFloat3
+  | VertexFloat4
+  | VertexUint
+  | VertexRgba8Unorm
+    -- ^ Four normalized bytes, read as four floats.
+  deriving (Eq, Ord, Show, Enum, Bounded)
+
+-- | The format's @VkFormat@ value.
+vertexFormatCode ∷ VertexFormat → Word32
+vertexFormatCode = \case
+  VertexRgba8Unorm → 37
+  VertexUint → 98
+  VertexFloat → 100
+  VertexFloat2 → 103
+  VertexFloat3 → 106
+  VertexFloat4 → 109
+
+-- | The bytes one attribute of the format occupies.
+vertexFormatBytes ∷ VertexFormat → Word32
+vertexFormatBytes = \case
+  VertexFloat → 4
+  VertexFloat2 → 8
+  VertexFloat3 → 12
+  VertexFloat4 → 16
+  VertexUint → 4
+  VertexRgba8Unorm → 4
+
+-- | The bytes one component of an attribute of the format occupies: what the
+-- attribute's address in its buffer must be a multiple of.
+vertexFormatComponentBytes ∷ VertexFormat → Natural
+vertexFormatComponentBytes = \case
+  VertexRgba8Unorm → 1
+  _ → 4
+
+-- | One vertex input binding a pipeline declares: its number, its stride in
+-- bytes, and whether it advances per vertex or per instance.
+data VertexBinding = VertexBinding
+  { bindingNumber ∷ !Word32
+  , bindingStride ∷ !Word32
+  , bindingRate ∷ !InputRate
+  }
+  deriving (Eq, Show)
+
+-- | One vertex attribute a pipeline declares: its shader location, the
+-- binding it reads, its format, and its offset into each element.
+data VertexAttribute = VertexAttribute
+  { attributeLocation ∷ !Word32
+  , attributeBinding ∷ !Word32
+  , attributeFormat ∷ !VertexFormat
+  , attributeOffset ∷ !Word32
+  }
+  deriving (Eq, Show)
+
+-- | A pipeline's vertex input: its bindings and the attributes read from
+-- them, for the triangle-list topology.
+data VertexInput = VertexInput
+  { inputBindings ∷ ![VertexBinding]
+  , inputAttributes ∷ ![VertexAttribute]
+  }
+  deriving (Eq, Show)
+
+-- | No vertex input: the shader makes its own vertices.
+noVertexInput ∷ VertexInput
+noVertexInput = VertexInput [] []
+
+-- | The type of the indices an indexed draw reads.
+data IndexType = Index16 | Index32
+  deriving (Eq, Ord, Show, Enum, Bounded)
+
+-- | The bytes one index of the type occupies.
+indexTypeBytes ∷ IndexType → Natural
+indexTypeBytes = \case
+  Index16 → 2
+  Index32 → 4
 
 -- ---------------------------------------------------------------------------
 -- Buffers and images
@@ -351,7 +510,9 @@ data ViewRequest = ViewRequest
 -- | Every native call the recording makes, over an open device type @dev@ and
 -- an open command-buffer type @cmd@.
 data RecordingOps dev cmd = RecordingOps
-  { opsCreatePipelineLayout ∷ dev → IO Word64
+  { opsCreatePipelineLayout ∷ dev → [PushConstantRange] → IO Word64
+    -- ^ A pipeline layout with no descriptor sets and these push-constant
+    -- ranges, which the recording has already validated.
   , opsDestroyPipelineLayout ∷ dev → Word64 → IO ()
   , opsCreatePipeline ∷ dev → PipelineRequest → (ShaderStage → Word64 → IO ()) → IO Word64
     -- ^ Builds and destroys its own shader modules; the pipeline is the only
@@ -390,6 +551,8 @@ data RecordingOps dev cmd = RecordingOps
     -- ^ The widest and tallest render area the device may render into
     -- (@maxFramebufferWidth@, @maxFramebufferHeight@), which an image's own
     -- limits do not bound (GRS-5).
+  , opsRecordingLimits ∷ IO RecordingLimits
+    -- ^ What the device allows pipeline interfaces and mapped memory (GRS-4).
   , opsCreateView ∷ dev → ViewRequest → IO Word64
     -- ^ An image's one owned view.
   , opsDestroyView ∷ dev → Word64 → IO ()
@@ -410,6 +573,10 @@ nativeName = \case
   CommandBeginLabel _ → "vkCmdBeginDebugUtilsLabelEXT"
   CommandEndLabel → "vkCmdEndDebugUtilsLabelEXT"
   CommandResourceBarrier {} → "vkCmdPipelineBarrier2"
+  CommandPushConstants {} → "vkCmdPushConstants"
+  CommandBindVertexBuffer {} → "vkCmdBindVertexBuffers"
+  CommandBindIndexBuffer {} → "vkCmdBindIndexBuffer"
+  CommandDrawIndexed {} → "vkCmdDrawIndexed"
 
 -- ---------------------------------------------------------------------------
 -- Ordering managed resources (GRS-3)

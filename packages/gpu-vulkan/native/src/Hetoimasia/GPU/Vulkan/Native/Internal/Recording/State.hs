@@ -1,6 +1,7 @@
 -- | The state of the managed recording
 -- ("Hetoimasia.GPU.Vulkan.Native.Recording"): the 'Recording' itself and the
 -- three maps it owns — managed records, frame storages and batch records —
+-- and the session's shared ring (GRS-4), if it has made one,
 -- with the handles, refusals and failures every part of the recording
 -- answers in, the checks each operation begins with, and the read-only views
 -- of that state.
@@ -19,6 +20,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   ( -- * Records
     ManagedStanding (..)
   , NativeResource (..)
+  , PipelineInterface (..)
   , ReadbackContents (..)
   , ManagedRecord (..)
   , BatchStanding (..)
@@ -37,6 +39,19 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , Recording (..)
   , makeRecording
   , Refusal (..)
+
+    -- * The shared ring (GRS-4)
+  , RingSize
+  , ringSizeBytes
+  , RingSizeRefused (..)
+  , validateRingSize
+  , RingState (..)
+  , ClaimRecord (..)
+  , RingClaim (..)
+  , claimSize
+  , RingView (..)
+  , readRing
+  , releaseClaims
 
     -- * Handles
   , PipelineLayout (..)
@@ -113,8 +128,10 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   , ImageFormat
   , ImageKind (..)
   , ImageUse (..)
+  , PushConstantRange
   , ReadbackAllocation (..)
   , RecordingOps (..)
+  , VertexInput
   , bufferResourceKind
   , imageKindUse
   , imageResourceKind
@@ -139,10 +156,11 @@ data ManagedStanding
   deriving (Eq, Show)
 
 data NativeResource cmd
-  = NativeLayout !Word64
-  | NativePipeline !Word64 !ResourceId !Word32
-    -- ^ The pipeline, the layout generation it was built over, and the color
-    -- format it renders to.
+  = NativeLayout !Word64 ![PushConstantRange]
+    -- ^ The layout, and the push-constant ranges it declares.
+  | NativePipeline !Word64 !ResourceId !Word32 !PipelineInterface
+    -- ^ The pipeline, the layout generation it was built over, the color
+    -- format it renders to, and what it declares of its interface.
   | NativeStorage !StorageOwner !Word64 !cmd
     -- ^ The slot it serves, its pool and its command buffer.
   | NativeReadback !ReadbackAllocation !ReadbackContents
@@ -151,6 +169,17 @@ data NativeResource cmd
   | NativeImage !ImageDescription !BoundMemory !Word64
     -- ^ What the image was created as, the image with its allocation, and
     -- its one owned view.
+
+-- | What a pipeline declares of its interface (GRS-4), kept with its
+-- generation so a batch checks what it binds, pushes and draws against the
+-- pipeline it bound: its layout's native handle and push-constant ranges, and
+-- its vertex input.
+data PipelineInterface = PipelineInterface
+  { interfaceLayout ∷ !Word64
+  , interfacePushConstants ∷ ![PushConstantRange]
+  , interfaceVertexInput ∷ !VertexInput
+  }
+  deriving (Eq, Show)
 
 -- | What a readback buffer's bytes are.
 data ReadbackContents
@@ -214,6 +243,8 @@ data Recording q inst msgr phys dev cmd = Recording
   , recordingManaged ∷ !(TVar (Map ResourceId (ManagedRecord cmd)))
   , recordingStorages ∷ !(TVar (Map StorageOwner ResourceId))
   , recordingBatches ∷ !(TVar (Map BatchId BatchRecord))
+  , recordingRing ∷ !(TVar (Maybe RingState))
+    -- ^ The session's shared ring (GRS-4), once made.
   }
 
 -- | The recording's state, owned by the calling thread. The public
@@ -227,7 +258,7 @@ makeRecording
   → IO (Recording q inst msgr phys dev cmd)
 makeRecording ops roots generations = do
   thread ← myThreadId
-  Recording ops roots generations thread <$> newTVarIO Map.empty <*> newTVarIO Map.empty <*> newTVarIO Map.empty
+  Recording ops roots generations thread <$> newTVarIO Map.empty <*> newTVarIO Map.empty <*> newTVarIO Map.empty <*> newTVarIO Nothing
 
 -- | Why an operation made no native call.
 data Refusal
@@ -281,6 +312,101 @@ data Refusal
     -- integration's consumer construction — answers it as this refusal, with
     -- what was raised.
   deriving (Eq, Show)
+
+-- ---------------------------------------------------------------------------
+-- The shared ring (GRS-4)
+
+-- | The size of the session's shared ring, in bytes, as the application
+-- configures it: validated once ('validateRingSize') and never clamped.
+newtype RingSize = RingSize Natural
+  deriving (Eq, Ord, Show)
+
+ringSizeBytes ∷ RingSize → Natural
+ringSizeBytes (RingSize bytes) = bytes
+
+-- | Why a configured ring size was refused.
+data RingSizeRefused
+  = RingSizeNotPositive !Integer
+  | RingSizeUnrepresentable !Integer
+    -- ^ Larger than any Vulkan size can hold.
+  deriving (Eq, Show)
+
+-- | Validate a configured ring size: zero and negative sizes, and ones no
+-- @VkDeviceSize@ can hold, are refused, never clamped. Whether the device
+-- can make a buffer that large is asked when the ring is made.
+validateRingSize ∷ Integer → Either RingSizeRefused RingSize
+validateRingSize requested
+  | requested <= 0 = Left (RingSizeNotPositive requested)
+  | requested > 2 ^ (64 ∷ Int) - 1 = Left (RingSizeUnrepresentable requested)
+  | otherwise = Right (RingSize (fromInteger requested))
+
+-- | The session's shared ring: its managed generation and mapping, its size,
+-- the granularity its claims are padded to, and the regions batches hold.
+data RingState = RingState
+  { ringResource ∷ !ResourceId
+    -- ^ The ring buffer's managed generation, which a batch binding one of
+    -- its regions retains.
+  , ringMapping ∷ !ReadbackAllocation
+  , ringBytes ∷ !Natural
+  , ringAtom ∷ !Natural
+    -- ^ One for coherent memory; the device's @nonCoherentAtomSize@
+    -- otherwise, so no two claims share an atom a flush covers.
+  , ringClaims ∷ !(Map Natural ClaimRecord)
+    -- ^ Every region a batch holds, by its claim's number.
+  , ringNextClaim ∷ !Natural
+    -- ^ The number the next claim is issued: never reissued.
+  , ringHead ∷ !Natural
+    -- ^ Where the next claim is first tried: the end of the last one.
+  }
+
+-- | One region a batch holds.
+data ClaimRecord = ClaimRecord
+  { claimRecordBatch ∷ !BatchId
+  , claimRecordOffset ∷ !Natural
+    -- ^ Its start in the ring, aligned as it asked and to the atom.
+  , claimRecordSpan ∷ !Natural
+    -- ^ The bytes it holds: its size, padded to the atom.
+  , claimRecordSize ∷ !Natural
+    -- ^ The bytes it asked for, which are all that may be written or bound.
+  }
+  deriving (Eq, Show)
+
+-- | A claim of one region of the session's ring by one batch. Its number is
+-- never reissued, so a claim whose region was reclaimed and handed to
+-- another is refused rather than mistaken for the new one.
+data RingClaim = RingClaim
+  { claimNumber ∷ !Natural
+  , claimRing ∷ !ResourceId
+  , claimBytes ∷ !Natural
+  }
+  deriving (Eq, Ord, Show)
+
+-- | The bytes a claim may be written and bound over.
+claimSize ∷ RingClaim → Natural
+claimSize = claimBytes
+
+-- | The ring as an observer sees it.
+data RingView = RingView
+  { ringViewResource ∷ !ResourceId
+  , ringViewBytes ∷ !Natural
+  , ringViewAtom ∷ !Natural
+  , ringViewClaims ∷ ![(Natural, ClaimRecord)]
+    -- ^ Every region a batch holds, by its claim's number, in order.
+  }
+  deriving (Eq, Show)
+
+readRing ∷ Recording q inst msgr phys dev cmd → STM (Maybe RingView)
+readRing recording =
+  fmap (\ring → RingView (ringResource ring) (ringBytes ring) (ringAtom ring) (Map.toAscList (ringClaims ring)))
+    <$> readTVar (recordingRing recording)
+
+-- | Reclaim every region these batches hold: for batches whose submission
+-- has completed, or that were invalidated without one. Nothing else frees a
+-- region.
+releaseClaims ∷ Recording q inst msgr phys dev cmd → [BatchId] → STM ()
+releaseClaims recording batches =
+  modifyTVar' (recordingRing recording) $
+    fmap (\ring → ring {ringClaims = Map.filter ((`notElem` batches) . claimRecordBatch) (ringClaims ring)})
 
 -- ---------------------------------------------------------------------------
 -- Handles
@@ -459,8 +585,8 @@ readManaged recording =
   where
     view (resource, record) =
       let (kind, handles) = case managedNative record of
-            NativeLayout handle → ("pipeline layout", [handle])
-            NativePipeline handle _ _ → ("pipeline", [handle])
+            NativeLayout handle _ → ("pipeline layout", [handle])
+            NativePipeline handle _ _ _ → ("pipeline", [handle])
             NativeStorage (StorageOfFrame _ _) pool _ → ("frame storage", [pool])
             NativeStorage (StorageOfFrameless _) pool _ → ("frame-less storage", [pool])
             NativeReadback allocation _ → ("readback", [allocationBuffer allocation, memoryAllocation (allocationMemory allocation)])
@@ -580,8 +706,8 @@ readbackBuffer allocation = AllocatedBuffer (allocationMemory allocation) (alloc
 -- made from.
 destroyNative ∷ Recording q inst msgr phys dev cmd → dev → NativeResource cmd → IO ()
 destroyNative recording device = \case
-  NativeLayout handle → rootsCall roots "vkDestroyPipelineLayout" (opsDestroyPipelineLayout ops device handle)
-  NativePipeline handle _ _ → rootsCall roots "vkDestroyPipeline" (opsDestroyPipeline ops device handle)
+  NativeLayout handle _ → rootsCall roots "vkDestroyPipelineLayout" (opsDestroyPipelineLayout ops device handle)
+  NativePipeline handle _ _ _ → rootsCall roots "vkDestroyPipeline" (opsDestroyPipeline ops device handle)
   NativeStorage _ pool _ → rootsCall roots "vkDestroyCommandPool" (opsDestroyStorage ops device pool)
   NativeReadback allocation _ → freeBuffer roots (readbackBuffer allocation)
   NativeBuffer _ _ allocated → freeBuffer roots allocated

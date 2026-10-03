@@ -29,7 +29,7 @@ import Data.Word (Word64)
 import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (Ptr, WordPtr (..), castPtr, plusPtr, ptrToWordPtr, wordPtrToPtr)
 import Vulkan.CStruct.Extends (SomeStruct (..))
-import Vulkan.Core10 hiding (ImageLayout, Viewport (..))
+import Vulkan.Core10 hiding (ImageLayout, IndexType (..), PushConstantRange (..), Viewport (..))
 import qualified Vulkan.Core10 as Core10
 import Vulkan.Core11 (PhysicalDeviceProperties2 (..), getPhysicalDeviceProperties2)
 import Vulkan.Core13
@@ -58,14 +58,24 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , ImageLayout (..)
   , ImageLimits (..)
   , ImageQuery (..)
+  , IndexType (..)
+  , InputRate (..)
   , NativeCommand (..)
   , PipelineRequest (..)
   , PipelineShaders (..)
+  , PushConstantRange (..)
+  , PushStage
   , ReadbackAllocation (..)
   , Rect (..)
+  , RecordingLimits (..)
   , RecordingOps (..)
+  , VertexAttribute (..)
+  , VertexBinding (..)
+  , VertexInput (..)
   , ViewRequest (..)
   , Viewport (..)
+  , pushStageBit
+  , vertexFormatCode
   )
 
 
@@ -74,18 +84,37 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
 -- allocator's ("Hetoimasia.GPU.Vulkan.Native.Allocator.Vulkan"); this layer
 -- only copies bytes through the mapping it is handed. Of the physical device
 -- it reads the largest buffer it may create and the largest render area it may
--- render into, once, and whether it supports an image before one is created.
+-- render into, once, what it allows pipeline interfaces and mapped memory, and
+-- whether it supports an image before one is created.
 vulkanRecordingOps ∷ PhysicalDevice → IO (RecordingOps Device CommandBuffer)
 vulkanRecordingOps physical = do
   properties ∷ PhysicalDeviceProperties2 '[PhysicalDeviceVulkan13Properties] ← getPhysicalDeviceProperties2 physical
   let (thirteen, ()) = properties.next
       largest = fromIntegral thirteen.maxBufferSize
-      framebuffer = (properties.properties.limits.maxFramebufferWidth, properties.properties.limits.maxFramebufferHeight)
+      deviceLimits = properties.properties.limits
+      framebuffer = (deviceLimits.maxFramebufferWidth, deviceLimits.maxFramebufferHeight)
+      recording =
+        RecordingLimits
+          { limitPushConstantBytes = deviceLimits.maxPushConstantsSize
+          , limitVertexBindings = deviceLimits.maxVertexInputBindings
+          , limitVertexAttributes = deviceLimits.maxVertexInputAttributes
+          , limitVertexStride = deviceLimits.maxVertexInputBindingStride
+          , limitVertexAttributeOffset = deviceLimits.maxVertexInputAttributeOffset
+          , limitNonCoherentAtom = fromIntegral deviceLimits.nonCoherentAtomSize
+          }
   pure
     RecordingOps
-      { opsCreatePipelineLayout = \device →
+      { opsCreatePipelineLayout = \device ranges →
           (\(PipelineLayout created) → created)
-            <$> createPipelineLayout device (PipelineLayoutCreateInfo {flags = zero, setLayouts = Vector.empty, pushConstantRanges = Vector.empty}) Nothing
+            <$> createPipelineLayout
+              device
+              ( PipelineLayoutCreateInfo
+                  { flags = zero
+                  , setLayouts = Vector.empty
+                  , pushConstantRanges = Vector.fromList [Core10.PushConstantRange (pushStageFlags (rangeStages range)) (rangeOffset range) (rangeSize range) | range ← ranges]
+                  }
+              )
+              Nothing
       , opsDestroyPipelineLayout = \device handle → destroyPipelineLayout device (PipelineLayout handle) Nothing
       , opsCreatePipeline = createPipeline'
       , opsDestroyPipeline = \device handle → destroyPipeline device (Pipeline handle) Nothing
@@ -116,6 +145,7 @@ vulkanRecordingOps physical = do
       , opsImageSupport = imageSupport physical
       , opsMaxBufferSize = pure largest
       , opsMaxFramebuffer = pure framebuffer
+      , opsRecordingLimits = pure recording
       , opsCreateView = \device request →
           (\(ImageView created) → created)
             <$> createImageView
@@ -189,7 +219,24 @@ createPipeline' device request name = do
           , flags = zero
           , stageCount = 2
           , stages = Vector.fromList [stage SHADER_STAGE_VERTEX_BIT vertex, stage SHADER_STAGE_FRAGMENT_BIT fragment]
-          , vertexInputState = Just (SomeStruct PipelineVertexInputStateCreateInfo {next = (), flags = zero, vertexBindingDescriptions = Vector.empty, vertexAttributeDescriptions = Vector.empty})
+          , vertexInputState =
+              Just
+                ( SomeStruct
+                    PipelineVertexInputStateCreateInfo
+                      { next = ()
+                      , flags = zero
+                      , vertexBindingDescriptions =
+                          Vector.fromList
+                            [ VertexInputBindingDescription binding.bindingNumber binding.bindingStride (vertexRate binding.bindingRate)
+                            | binding ← request.requestVertexInput.inputBindings
+                            ]
+                      , vertexAttributeDescriptions =
+                          Vector.fromList
+                            [ VertexInputAttributeDescription attribute.attributeLocation attribute.attributeBinding (Format (fromIntegral (vertexFormatCode attribute.attributeFormat))) attribute.attributeOffset
+                            | attribute ← request.requestVertexInput.inputAttributes
+                            ]
+                      }
+                )
           , inputAssemblyState = Just PipelineInputAssemblyStateCreateInfo {flags = zero, topology = PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, primitiveRestartEnable = False}
           , tessellationState = Nothing
           , viewportState = Just (SomeStruct PipelineViewportStateCreateInfo {next = (), flags = zero, viewportCount = 1, viewports = Vector.empty, scissorCount = 1, scissors = Vector.empty})
@@ -257,6 +304,15 @@ createPipeline' device request name = do
   case Vector.toList (snd created) of
     [Pipeline handle] → pure handle
     _ → fail "the device created no pipeline"
+
+-- | The stage flags of a push-constant range or a push.
+pushStageFlags ∷ [PushStage] → ShaderStageFlags
+pushStageFlags = ShaderStageFlagBits . foldr ((.|.) . pushStageBit) 0
+
+vertexRate ∷ InputRate → VertexInputRate
+vertexRate = \case
+  PerVertex → VERTEX_INPUT_RATE_VERTEX
+  PerInstance → VERTEX_INPUT_RATE_INSTANCE
 
 -- | The stages and accesses each supported image transition synchronizes: the
 -- source scope, then the destination scope. Entering rendering waits on the
@@ -451,5 +507,12 @@ recordCommand commands = \case
                 )
             BarrierBuffer _ → Vector.empty
         }
+  CommandPushConstants layout stages offset bytes → pushConstantsUnsafe commands (PipelineLayout layout) (pushStageFlags stages) offset bytes
+  CommandBindVertexBuffer binding buffer offset → bindVertexBufferUnsafe commands binding (Buffer buffer) offset
+  CommandBindIndexBuffer buffer offset kind →
+    bindIndexBufferUnsafe commands (Buffer buffer) offset $ case kind of
+      Index16 → Core10.INDEX_TYPE_UINT16
+      Index32 → Core10.INDEX_TYPE_UINT32
+  CommandDrawIndexed indices instances → drawIndexedUnsafe commands indices instances 0 0 0
   CommandBeginLabel name → beginLabelUnsafe commands DebugUtilsLabelEXT {labelName = name, color = (0, 0, 0, 0)}
   CommandEndLabel → endLabelUnsafe commands
