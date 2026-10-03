@@ -1581,10 +1581,25 @@ is `RefusedIllegal`. `draw recorder vertices instances` draws instanced and
 vertex, index and instance, with `draw`'s existing checks; every binding the
 bound pipeline declares must be bound, a per-vertex one with data for every
 vertex `draw` reads and a per-instance one for every instance either reads, and
-an indexed draw needs index data holding every index it reads. The vertices an
-index names are the index data's to say, which the recording does not read, so
-an indexed draw checks a per-vertex binding is bound but not how far its reads
-reach.
+an indexed draw needs index data holding every index it reads. A binding's
+offset must let every attribute reading it be read, each attribute's address a
+multiple of its format's component size, as Vulkan requires: a bind checks it
+against the pipeline bound then, and every draw again against the pipeline
+bound now, since a binding outlives a pipeline switch. Every draw also checks
+each buffer it reads again: a managed buffer still recordable — not released,
+replaced or stale since its bind — and every buffer still in the use it was
+bound in, so a transition between passes that moved it elsewhere refuses the
+draw.
+
+**Indexed reads.** The vertices an index names are the index data's to say.
+For index data in a ring region the batch wrote, the recording reads the
+indices from the ring's mapping when the draw is recorded, bounds every
+per-vertex binding's reads by the largest index, and from then on refuses any
+write of the batch into the bytes it read (`RefusedIllegal`), so the indices
+the device reads are the ones checked. Index data the recording cannot read —
+a managed index buffer's, which no host write fills before GRS-6 — cannot bound
+those reads, so an indexed draw through it that reads per-vertex data is
+`RefusedUnsupported`; one whose bindings are all per-instance is not.
 
 Before any native call a bind, push or draw is refused, recording nothing, when
 it has no bound pipeline (`bindPipeline` itself needs none); when its buffer's
@@ -1592,9 +1607,11 @@ kind does not fit the use; when a managed buffer is released or not this
 session's, or a claim was reclaimed or is another batch's — a managed buffer
 is the session's, and several batches may bind it; when its offset falls
 outside the buffer or the bytes claimed (`RefusedOutOfBounds`), or an index
-offset is not a multiple of the index's size; or when a draw needs a binding or
-index data that is not bound, or more of either than is bound
-(`RefusedOutOfBounds`). Every bind retains exactly what it references through
+offset is not a multiple of the index's size; when a vertex source's offset is
+one its attributes cannot be read from; or when a draw needs a binding or index
+data that is not bound, more of either than is bound (`RefusedOutOfBounds`), a
+vertex an index names beyond what is bound (`RefusedOutOfBounds`), or a buffer
+released or moved out of its use since its bind. Every bind retains exactly what it references through
 the transitive retention above: the managed buffer's generation, or the ring's.
 Binding a binding again releases nothing an earlier command captured, and a
 resource or claim no command references gains no binding retention.
@@ -1612,13 +1629,19 @@ and outside the ranges and their stage coverage; a pipeline switch changing
 what is checked while bindings stay bound; the ring's size validation, its one
 per session and a claim with none; claims reclaimed only on completion or
 discard, wrapping round, backpressure, and an oversized claim refused; regions
-kept through an invalidation that raised; atom padding and flushes on
+kept through an invalidation that raised, a partial and a cancelled recording
+until their discard, and a submission whose effect is unknown, and released for
+batches a no-effect submission failure discarded; atom padding and flushes on
 non-coherent memory; claims distinct across reuse, another batch's refused, a
 write past a claim and one after recording refused; the first claim refused
 inside rendering; indexed and instanced draws from ring regions with 16-bit
-indices and from managed vertex and 32-bit index buffers, with how far each
-read reaches; binds retaining exactly their references; and every refusal
-above with no native call. The surface-free native case `grs4-drawing` makes
+indices and from a managed vertex buffer with 32-bit indices, with how far each
+read reaches; 16-bit and 32-bit indices naming a vertex beyond the region
+bound, managed index data refused for per-vertex reads, and a write into
+indices a draw read refused; a vertex source its attributes cannot be read
+from, at its bind and after a pipeline switch; a draw through a buffer
+released or moved out of its use since its bind; binds retaining exactly their
+references; and every refusal above with no native call, no draw recorded. The surface-free native case `grs4-drawing` makes
 the ring, writes a quad's four vertices, its six 16-bit indices and two
 instance offsets into ring regions of a frame-less batch, pushes magenta as a
 fragment push constant, draws indexed and instanced into an `R8G8B8A8_SRGB`
