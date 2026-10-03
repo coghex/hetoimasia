@@ -26,9 +26,9 @@ import System.Timeout (timeout)
 
 import Hetoimasia.Foundation.Messaging.Payload (prepare)
 import Hetoimasia.Foundation.Time (Duration, DurationRequirement (AllowZero), Instant, addDuration, durationFromNanoseconds, elapsedBetween, readInstant, scriptedInstant, zeroDuration)
-import Hetoimasia.GLFW.Command (WaitedSubmission (..), WindowCommand, awaitCompletion, awaitSubmitWindowCommand, clientDemandPublisher, hideWindowCommand, setWindowSizeCommand, showWindowCommand)
+import Hetoimasia.GLFW.Command (Disposition (Attempted), WaitedSubmission (..), WindowCommand, awaitCompletion, awaitSubmitWindowCommand, clientDemandPublisher, hideWindowCommand, newWindowCommandHost, performWindowCommand, setWindowSizeCommand, showWindowCommand)
 import Hetoimasia.GLFW.Demand (deadlineDemand, immediateDemand, publishDemand)
-import Hetoimasia.GLFW.Window (Extent (..), WindowId)
+import Hetoimasia.GLFW.Window (Extent (..), WindowId, WindowResult (..))
 import Hetoimasia.GPU.Model (TargetPhase (..), TargetView (..), targetView)
 import Hetoimasia.GPU.Model.Budget (BudgetRequest (..), defaultBudgetRequest)
 import Hetoimasia.GPU.Model.Identity (TargetClass (..))
@@ -58,6 +58,7 @@ import Hetoimasia.Runtime.GLFW
   , hostWindowIdentities
   , ownerHandoff
   , publishOwnerDemand
+  , withHostWindow
   , readOwnerDemandTaken
   , readOwnerStatusNow
   , readTargetTerminalsNow
@@ -93,6 +94,10 @@ spec = describe "Vulkan loop adapter" $ do
   describe "hiding a presenting window (#357)" $ do
     it "makes the hide's native call only once the presentation in flight has returned, keeps the other target presenting, keeps the old swapchain while its presentations are unretired, and resumes the shown window on a replacement" (bounded testHideWhilePresenting)
     it "makes the native call of a hide whose window's target is suspended while another target's presentation holds, waiting for no step" (bounded testHideSuspendedWhileOtherPresents)
+
+  describe "hiding a presenting window directly, through a lent window (#368)" $ do
+    it "makes the direct hide's native call only once the presentation in flight has returned, presents nothing to the hidden window, and resumes it on a replacement" (bounded testDirectHideWhilePresenting)
+    it "withdraws and replaces the generation of a window hidden and shown directly wholly between two owner steps" (bounded testDirectHideShowBetweenSteps)
 
   describe "a stalled main thread" $ do
     it "keeps the owner rendering while the native event call is held, and serves a window command once it returns" (bounded testStalledMainThread)
@@ -568,6 +573,170 @@ testHideSuspendedWhileOtherPresents = do
     composedUntil rig host control "the second hide's native call" (\_ → pure ()) (isJust <$> readTVarIO result)
     readTVarIO result
   settledWhileHeld `shouldBe` Just True
+  where
+    isHidden = \case
+      WindowHidden _ → True
+      _ → False
+
+-- | Perform one command directly, on the main thread, on the window the host
+-- lends: the public composition #368 names, a command host over the session
+-- the application gave the host, and 'withHostWindow'. Answers whether the
+-- control's native calls were made.
+directCommand ∷ Rig → VulkanHost Scene → WindowId → WindowCommand → IO Bool
+directCommand rig host window command = do
+  session ← readTVarIO (rigSession rig) >>= maybe (failWith "the rig kept no session") pure
+  commands ← newWindowCommandHost session 4
+  withHostWindow (vulkanWindowHost host) window (\lent → performWindowCommand commands [lent] command) >>= \case
+    WindowAvailable (Attempted _) → pure True
+    WindowAvailable _ → pure False
+    WindowEnded _ → failWith "the lent window had ended"
+
+-- | 'testHideWhilePresenting', with the hide and the show made directly, from
+-- the main thread's update opportunity, on the window 'withHostWindow' lends,
+-- rather than through the host's command port. Before #368 nothing withheld
+-- the presentation on this route: the hide's native call was made while the
+-- presentation to that window still held.
+testDirectHideWhilePresenting ∷ IO ()
+testDirectHideWhilePresenting = do
+  rig ← visibleRigOf 2
+  (heldHide, hiddenPresents, afterHide, resumed) ← runRig rig $ \host control → do
+    [first, second] ← windowsOf host
+    one ← firstFrame rig host control first
+    two ← firstFrame rig host control second
+    let a = graphicsAttachment one
+        b = graphicsAttachment two
+    old ← activeSwapchain host one
+    gate ← newTVarIO False
+    presenting ← holdPresentations rig gate
+    asked ← newTVarIO False
+    early ← newTVarIO Nothing
+    hidden ← newTVarIO False
+    let hiddenYet = any (isHidden . snd) <$> readTVar (rigJournal rig)
+    -- The test's own thread: once the main thread is about to hide, it gives
+    -- the hide's native call the one bounded wait for something not to
+    -- happen, then lets the presentation return.
+    _ ← forkIO $ do
+      atomically (readTVar asked >>= check)
+      expired ← registerDelay 50000
+      made ← atomically ((True <$ (hiddenYet >>= check)) `orElse` (False <$ (readTVar expired >>= check)))
+      atomically (writeTVar early (Just made))
+      atomically (writeTVar gate True)
+    demandFrame host first
+    -- The main thread: once the owner is inside its presentation to the first
+    -- window, it hides that window directly, from its update opportunity.
+    composedUntil
+      rig
+      host
+      control
+      "the direct hide"
+      ( \_ → do
+          ready ← atomically ((&&) <$> presenting <*> (not <$> readTVar asked))
+          when ready $ do
+            atomically (writeTVar asked True)
+            directCommand rig host first (hideWindowCommand first) >>= atomically . writeTVar hidden
+      )
+      (readTVarIO hidden)
+    firstAt ← presentsOf rig a
+    secondAt ← presentsOf rig b
+    wanted ← newTVarIO secondAt
+    composedUntil
+      rig
+      host
+      control
+      "three frames on the second target while the first is hidden"
+      ( \_ → do
+          demandFrame host first
+          presented ← presentsOf rig b
+          due ← readTVarIO wanted
+          when (presented >= due) $ do
+            demandFrame host second
+            atomically (writeTVar wanted (presented + 1))
+      )
+      ((>= secondAt + 3) <$> presentsOf rig b)
+    hiddenCount ← subtract firstAt <$> presentsOf rig a
+    shown ← newTVarIO False
+    composedUntil
+      rig
+      host
+      control
+      "a frame on the first target once shown directly"
+      ( \_ → do
+          done ← readTVarIO shown
+          unless done (directCommand rig host first (showWindowCommand first) >>= atomically . writeTVar shown)
+          demandFrame host first
+      )
+      ((&&) <$> readTVarIO shown <*> ((> firstAt + hiddenCount) <$> presentsOf rig a))
+    resumedCount ← subtract (firstAt + hiddenCount) <$> presentsOf rig a
+    events ← journal rig
+    let sinceHide = drop 1 (dropWhile (not . isHidden) events)
+        onOld = length [() | ImagePresented swapchain _ ← sinceHide, swapchain == old]
+        handedOld = length [() | SwapchainCreated _ _ (Just handed) ← sinceHide, handed == old]
+    held ← readTVarIO early
+    pure (held, hiddenCount, (onOld, handedOld), resumedCount)
+  heldHide `shouldBe` Just False
+  hiddenPresents `shouldBe` 0
+  afterHide `shouldBe` (0, 1)
+  resumed `shouldSatisfy` (>= 1)
+  where
+    isHidden = \case
+      WindowHidden _ → True
+      _ → False
+
+-- | A direct hide and show of a presenting window, both made in one update
+-- opportunity on the main thread while the owner waits between two steps, so
+-- no step ever views the window hidden. The step that follows still withdraws
+-- the window's generation, and the window is next presented on a replacement
+-- handed the old swapchain, never on the old one: a presentation made to it
+-- before the hide may never be answered. Before #368 nothing withheld anything
+-- on this route, the step saw only an eligible window, and the next frame was
+-- presented on the old swapchain.
+testDirectHideShowBetweenSteps ∷ IO ()
+testDirectHideShowBetweenSteps = do
+  rig ← scriptedRigOf 1
+  (between, afterHide) ← runRig rig $ \host control → do
+    [window] ← windowsOf host
+    service ← firstFrame rig host control window
+    let owner = vulkanGraphicsOwner host
+    -- The round that presented has completed. The scripted clock moves only
+    -- when this example moves it, so no deadline of the owner's comes, and
+    -- nothing the update opportunity below does wakes it.
+    presentedIn ← last . (0 :) <$> presentRounds rig
+    _ ← atomically (awaitOwnerRound owner presentedIn)
+    old ← activeSwapchain host service
+    rounds ← newTVarIO Nothing
+    composedUntil
+      rig
+      host
+      control
+      "the direct hide and show"
+      ( \_ → do
+          done ← isJust <$> readTVarIO rounds
+          unless done $ do
+            before ← statusRounds <$> atomically (readOwnerStatusNow owner)
+            hidden ← directCommand rig host window (hideWindowCommand window)
+            shown ← directCommand rig host window (showWindowCommand window)
+            after ← statusRounds <$> atomically (readOwnerStatusNow owner)
+            atomically (writeTVar rounds (Just (hidden && shown, before == after)))
+      )
+      (isJust <$> readTVarIO rounds)
+    presented ← presentsOf rig (graphicsAttachment service)
+    composedUntil
+      rig
+      host
+      control
+      "a frame once shown"
+      (\_ → advanceClock rig 1 >> demandFrame host window)
+      ((> presented) <$> presentsOf rig (graphicsAttachment service))
+    letExitFinish rig
+    events ← journal rig
+    let sinceHide = drop 1 (dropWhile (not . isHidden) events)
+        onOld = length [() | ImagePresented swapchain _ ← sinceHide, swapchain == old]
+        handedOld = length [() | SwapchainCreated _ _ (Just handed) ← sinceHide, handed == old]
+    (,) <$> readTVarIO rounds <*> pure (onOld, handedOld)
+  -- Both controls' native calls were made, and no owner round completed
+  -- between the first and the last.
+  between `shouldBe` Just (True, True)
+  afterHide `shouldBe` (0, 1)
   where
     isHidden = \case
       WindowHidden _ → True
