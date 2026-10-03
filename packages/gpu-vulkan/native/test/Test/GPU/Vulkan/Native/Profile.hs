@@ -50,6 +50,10 @@ spec = describe "Profile" $ do
                        , (ObjectDeviceMemory, OBJECT_TYPE_DEVICE_MEMORY)
                        , (ObjectSemaphore, OBJECT_TYPE_SEMAPHORE)
                        , (ObjectFence, OBJECT_TYPE_FENCE)
+                       , (ObjectDescriptorSetLayout, OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT)
+                       , (ObjectSampler, OBJECT_TYPE_SAMPLER)
+                       , (ObjectDescriptorPool, OBJECT_TYPE_DESCRIPTOR_POOL)
+                       , (ObjectDescriptorSet, OBJECT_TYPE_DESCRIPTOR_SET)
                        ]
                    ]
 

@@ -40,6 +40,9 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , makeRecording
   , Refusal (..)
 
+    -- * The texture table (GRS-7)
+  , TableState (..)
+
     -- * The shared ring (GRS-4)
   , RingSize
   , ringSizeBytes
@@ -96,6 +99,7 @@ import Control.Concurrent (ThreadId, myThreadId)
 import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVar, newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import Control.Exception (Exception (displayException), SomeAsyncException, SomeException, fromException, throwIO)
 import Data.ByteString (ByteString)
+import Data.Foldable (for_)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
@@ -112,6 +116,7 @@ import Hetoimasia.GPU.Model (GpuModel, Outcome (..))
 import qualified Hetoimasia.GPU.Model as Model
 import Hetoimasia.GPU.Model.Access (ResourceKind)
 import Hetoimasia.GPU.Model.Budget (BudgetKind)
+import Hetoimasia.GPU.Model.TextureTable (TextureHandle, TextureTable)
 import Hetoimasia.GPU.Model.Identity
   ( BatchId
   , FrameSlotId
@@ -159,8 +164,10 @@ data ManagedStanding
   deriving (Eq, Show)
 
 data NativeResource cmd
-  = NativeLayout !Word64 ![PushConstantRange]
-    -- ^ The layout, and the push-constant ranges it declares.
+  = NativeLayout !Word64 ![PushConstantRange] !(Maybe Word32)
+    -- ^ The layout, the push-constant ranges it declares, and, for a layout
+    -- that holds the texture table's two sets (GRS-7), the push-constant
+    -- offset its draws' sampler index is at.
   | NativePipeline !Word64 !ResourceId !Word32 !PipelineInterface
     -- ^ The pipeline, the layout generation it was built over, the color
     -- format it renders to, and what it declares of its interface.
@@ -172,6 +179,18 @@ data NativeResource cmd
   | NativeImage !ImageDescription !BoundMemory !Word64
     -- ^ What the image was created as, the image with its allocation, and
     -- its one owned view.
+  | NativeSamplers ![Word64]
+    -- ^ The texture table's four shared samplers, in 'TableSampler' order
+    -- (GRS-7).
+  | NativeSetLayouts !Word64 !Word64
+    -- ^ The texture table's two descriptor-set layouts: set 0's, the
+    -- samplers and the sampled-image array; set 1's, the lookup buffer.
+  | NativeDescriptorPools !Word64 !Word64 !Word64 !Word64
+    -- ^ Set 0's pool and the one set allocated from it, then set 1's.
+  | NativeVersion !Word32
+    -- ^ One lookup version of the texture table: its entry in the version
+    -- ring, which is part of the ring's buffer and no native object of its
+    -- own. A batch that binds the table at this version retains it.
 
 -- | What a pipeline declares of its interface (GRS-4), kept with its
 -- generation so a batch checks what it binds, pushes and draws against the
@@ -181,6 +200,9 @@ data PipelineInterface = PipelineInterface
   { interfaceLayout ∷ !Word64
   , interfacePushConstants ∷ ![PushConstantRange]
   , interfaceVertexInput ∷ !VertexInput
+  , interfaceTable ∷ !(Maybe Word32)
+    -- ^ For a pipeline over a layout holding the texture table (GRS-7), the
+    -- push-constant offset of its draws' sampler index.
   }
   deriving (Eq, Show)
 
@@ -265,6 +287,45 @@ data Recording q inst msgr phys dev cmd = Recording
     -- ^ The buffers an upload has been admitted into (GRS-6), never fresh
     -- for another upload — whichever uploads admit it — unless that upload
     -- was cancelled before any copy. Forgotten with the buffer's disposal.
+  , recordingTable ∷ !(TVar (Maybe TableState))
+    -- ^ The session's texture table (GRS-7), once made.
+  }
+
+-- | The session's texture table (GRS-7): the pure bookkeeping of its
+-- handles, slots and versions, keeping each texture's image, and the managed
+-- generations and native handles behind it. Every generation here is one the
+-- recording owns: a batch that binds the table retains the samplers, the
+-- layouts, the pools, the version ring and the version it binds, and each is
+-- released with every other live generation when the recording retires.
+data TableState = TableState
+  { tableBook ∷ !(TextureTable ResourceId)
+  , tableSamplers ∷ !ResourceId
+  , tableLayouts ∷ !ResourceId
+  , tablePools ∷ !ResourceId
+  , tableRing ∷ !ResourceId
+  , tableVersions ∷ !(Map Word32 ResourceId)
+    -- ^ Each ring entry's managed version.
+  , tableSetLayoutHandles ∷ ![Word64]
+    -- ^ Set 0's layout, then set 1's, as a pipeline layout declares them.
+  , tableSets ∷ ![Word64]
+    -- ^ Set 0, then set 1, as a binding binds them.
+  , tableMapping ∷ !ReadbackAllocation
+    -- ^ Where the version ring is mapped.
+  , tableStride ∷ !Natural
+    -- ^ The bytes between two versions: one version's entries, padded to
+    -- the device's storage-buffer offset alignment and flush granularity.
+  , tableEntries ∷ !Word32
+    -- ^ How many lookup entries one version holds.
+  , tableAtom ∷ !Natural
+    -- ^ The flush granularity of the ring's memory: one on coherent memory.
+  , tablePlaceholder ∷ !ResourceId
+    -- ^ Slot 0's transparent-black image.
+  , tablePlaceholderWritten ∷ !Bool
+    -- ^ Whether slot 0's descriptor is written: until it is, the table is
+    -- not bound.
+  , tableTextures ∷ !(Set ResourceId)
+    -- ^ Every image a live handle or a retiring slot holds: none is released
+    -- but through the table.
   }
 
 -- | The recording's state, owned by the calling thread. The public
@@ -287,6 +348,7 @@ makeRecording ops roots generations = do
     <*> newTVarIO Set.empty
     <*> newTVarIO Map.empty
     <*> newTVarIO Set.empty
+    <*> newTVarIO Nothing
 
 -- | Why an operation made no native call.
 data Refusal
@@ -332,6 +394,9 @@ data Refusal
   | RefusedOwnerWait
     -- ^ A blocking wait on the graphics owner's thread, whose own return and
     -- progress are what the wait is for (GRS-12).
+  | RefusedStaleHandle !TextureHandle
+    -- ^ A texture handle released, of an older generation, or never issued
+    -- (GRS-7).
   | RefusedConstructionFailed !Text
     -- ^ A construction raised, with the session still running, after settling
     -- everything it made: its reservation given back, or the generation it
@@ -613,7 +678,8 @@ readManaged recording =
   where
     view (resource, record) =
       let (kind, handles) = case managedNative record of
-            NativeLayout handle _ → ("pipeline layout", [handle])
+            NativeLayout handle _ Nothing → ("pipeline layout", [handle])
+            NativeLayout handle _ (Just _) → ("table pipeline layout", [handle])
             NativePipeline handle _ _ _ → ("pipeline", [handle])
             NativeStorage (StorageOfFrame _ _) pool _ → ("frame storage", [pool])
             NativeStorage (StorageOfFrameless _) pool _ → ("frame-less storage", [pool])
@@ -622,6 +688,10 @@ readManaged recording =
               (bufferKindText purpose, [memoryResource (allocatedMemory allocated), memoryAllocation (allocatedMemory allocated)])
             NativeImage description memory imageView →
               (imageKindText (imageKind description), [memoryResource memory, imageView, memoryAllocation memory])
+            NativeSamplers samplers → ("table samplers", samplers)
+            NativeSetLayouts textures lookups → ("table set layouts", [textures, lookups])
+            NativeDescriptorPools texturePool textureSet lookupPool lookupSet → ("table sets", [texturePool, textureSet, lookupPool, lookupSet])
+            NativeVersion entry → ("lookup version", [fromIntegral entry])
        in ManagedView resource (managedStanding record) kind handles
     bufferKindText = \case
       VertexBuffer → "vertex buffer"
@@ -734,7 +804,7 @@ readbackBuffer allocation = AllocatedBuffer (allocationMemory allocation) (alloc
 -- made from.
 destroyNative ∷ Recording q inst msgr phys dev cmd → dev → NativeResource cmd → IO ()
 destroyNative recording device = \case
-  NativeLayout handle _ → rootsCall roots "vkDestroyPipelineLayout" (opsDestroyPipelineLayout ops device handle)
+  NativeLayout handle _ _ → rootsCall roots "vkDestroyPipelineLayout" (opsDestroyPipelineLayout ops device handle)
   NativePipeline handle _ _ _ → rootsCall roots "vkDestroyPipeline" (opsDestroyPipeline ops device handle)
   NativeStorage _ pool _ → rootsCall roots "vkDestroyCommandPool" (opsDestroyStorage ops device pool)
   NativeReadback allocation _ → freeBuffer roots (readbackBuffer allocation)
@@ -743,6 +813,15 @@ destroyNative recording device = \case
   NativeImage _ memory imageView → do
     rootsCall roots "vkDestroyImageView" (opsDestroyView ops device imageView)
     freeImage roots memory
+  NativeSamplers samplers → for_ samplers (rootsCall roots "vkDestroySampler" . opsDestroySampler ops device)
+  NativeSetLayouts textures lookups → do
+    rootsCall roots "vkDestroyDescriptorSetLayout" (opsDestroySetLayout ops device textures)
+    rootsCall roots "vkDestroyDescriptorSetLayout" (opsDestroySetLayout ops device lookups)
+  -- Each pool frees the set allocated from it.
+  NativeDescriptorPools texturePool _ lookupPool _ → do
+    rootsCall roots "vkDestroyDescriptorPool" (opsDestroyDescriptorPool ops device texturePool)
+    rootsCall roots "vkDestroyDescriptorPool" (opsDestroyDescriptorPool ops device lookupPool)
+  NativeVersion _ → pure ()
   where
     roots = recordingRoots recording
     ops = recordingOps recording

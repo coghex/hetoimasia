@@ -109,16 +109,26 @@ spec = describe "texture table" $ do
       bindVersion everything changedAgain `shouldBe` Left TableVersionsHeld
 
   describe "slots" $ do
-    it "reuses a released slot only once no live version maps it: not while the current or a held version does" $ do
+    it "frees a released texture's slot at once when no batch holds a version mapping it: the release made the current version unbindable" $ do
+      let table = fresh 3 2
+      (registered, handle) ← expectRight (registerTexture "a" table)
+      (completed, (slot, _)) ← expectRight (completeTexture handle registered)
+      (bound, _) ← expectRight (bindVersion none completed)
+      released ← expectRight (releaseTexture handle bound)
+      snd (reclaimSlots none released) `shouldBe` [(slot, "a")]
+
+    it "reuses a released slot only once no live version maps it: not while a batch holds a version mapping it, nor while the current version is still bindable" $ do
       let table = fresh 3 2
       (registered, handle) ← expectRight (registerTexture "a" table)
       (completed, (slot, _)) ← expectRight (completeTexture handle registered)
       (bound, mapping) ← expectRight (bindVersion none completed)
+      -- The current version maps the slot and is still bindable: live.
+      mappedSlots none bound `shouldSatisfy` Set.member slot
       released ← expectRight (releaseTexture handle bound)
-      -- The current version still maps the slot, so it stays retiring.
+      -- A batch holds the version that maps it, so it stays retiring, with
+      -- or without a new version published.
       let held = heldBy [bindingVersion mapping]
-      fst (reclaimSlots none released) `shouldSatisfy` ((== [slot]) . retiringSlots)
-      -- A new version no longer maps it, but a batch still holds the old one.
+      retiringSlots (fst (reclaimSlots held released)) `shouldBe` [slot]
       (republished, _) ← expectRight (bindVersion held released)
       let (stillHeld, none') = reclaimSlots held republished
       none' `shouldBe` []

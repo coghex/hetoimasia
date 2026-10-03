@@ -271,6 +271,14 @@ module Hetoimasia.GPU.Vulkan.Native.Recording
   , AccessScope (..)
   , BarrierObject (..)
   , RecordingLimits (..)
+  , TableSampler (..)
+  , tableSamplerIndex
+  , tableSamplerBinding
+  , tableTextureBinding
+  , lookupBinding
+  , SetLayoutRequest (..)
+  , PoolRequest (..)
+  , DescriptorWrite (..)
 
     -- * The recording
   , Recording
@@ -452,6 +460,14 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Disposal (disposeResource
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   ( AccessScope (..)
   , BarrierObject (..)
+  , DescriptorWrite (..)
+  , PoolRequest (..)
+  , SetLayoutRequest (..)
+  , TableSampler (..)
+  , lookupBinding
+  , tableSamplerBinding
+  , tableSamplerIndex
+  , tableTextureBinding
   , BufferDescription (..)
   , BufferKind (..)
   , ClearColor (..)

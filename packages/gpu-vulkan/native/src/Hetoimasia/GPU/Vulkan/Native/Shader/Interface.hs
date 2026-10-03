@@ -37,6 +37,7 @@ module Hetoimasia.GPU.Vulkan.Native.Shader.Interface
   , DescriptorKind (..)
   , DescriptorCount (..)
   , DescriptorDeclaration (..)
+  , textureTableDescriptors
 
     -- * Vertex input, as a pipeline binds it
   , VertexInput (..)
@@ -132,6 +133,18 @@ data DescriptorDeclaration = DescriptorDeclaration
   , descriptorCount ∷ !DescriptorCount
   }
   deriving (Eq, Ord, Show, Lift)
+
+-- | The texture table's bindings (GRS-7; resource services design D-22,
+-- D-31, D-35), as a shader that reads the table declares them: set 0's four
+-- samplers at binding 0 and its runtime-sized sampled-image array at binding
+-- 1, and set 1's lookup buffer at binding 0. A stage declares those it reads;
+-- a pipeline layout holding the table admits no other binding.
+textureTableDescriptors ∷ [DescriptorDeclaration]
+textureTableDescriptors =
+  [ DescriptorDeclaration 0 0 Sampler (DescriptorCount 4)
+  , DescriptorDeclaration 0 1 SampledImage RuntimeSized
+  , DescriptorDeclaration 1 0 StorageBuffer (DescriptorCount 1)
+  ]
 
 -- | A shader whose interface was checked against its description while the
 -- package built: its SPIR-V, and that description. The checked splices make

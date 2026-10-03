@@ -4,7 +4,12 @@
 module Hetoimasia.GPU.Vulkan.Native.Recording.ShaderInterfaces
   ( quadVertexInterface
   , quadFragmentInterface
+  , tableVertexInterface
+  , tableFragmentInterface
+  , tableSamplerOffset
   ) where
+
+import Data.Word (Word32)
 
 import Hetoimasia.GPU.Vulkan.Native.Shader.Interface
 
@@ -23,3 +28,22 @@ quadVertexInterface =
 -- | A four-float color, the fragment stage's push constants at offset 0.
 quadFragmentInterface ∷ ShaderInterface
 quadFragmentInterface = (interfaceFor FragmentInterface) {interfacePushConstants = [PushMember 0 16]}
+
+-- | No vertex input and no push constants: the corners and coordinates are
+-- the shader's own.
+tableVertexInterface ∷ ShaderInterface
+tableVertexInterface = interfaceFor VertexInterface
+
+-- | The texture table's bindings (GRS-7), and in the push constants a
+-- texture handle — its lookup index and generation — at offset 0 and the
+-- sampler index at 'tableSamplerOffset'.
+tableFragmentInterface ∷ ShaderInterface
+tableFragmentInterface =
+  (interfaceFor FragmentInterface)
+    { interfacePushConstants = [PushMember 0 8, PushMember tableSamplerOffset 4]
+    , interfaceDescriptors = textureTableDescriptors
+    }
+
+-- | Where the table shaders read the sampler index 'selectSampler' pushes.
+tableSamplerOffset ∷ Word32
+tableSamplerOffset = 8

@@ -108,7 +108,13 @@ disposeResources recording now = owner recording (go [])
       NativeReadback {} → 2
       NativeBuffer {} → 2
       NativeImage {} → 2
+      NativeVersion {} → 2
+      -- A pool frees its sets before the layouts they were made of, and the
+      -- layouts go before the immutable samplers they name.
+      NativeDescriptorPools {} → 2
       NativeLayout {} → 3
+      NativeSetLayouts {} → 3
+      NativeSamplers {} → 4
 
 -- | Whether a generation may be destroyed natively now, as far as the
 -- recording knows: it was released or replaced, it is the target of no

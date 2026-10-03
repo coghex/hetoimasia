@@ -1,0 +1,457 @@
+-- | The bindless texture table (GRS-7) over the frames', the recording's and
+-- the allocator's stand-in native layers: making it — its samplers, set
+-- layouts declared at the cap, pools, sets at the initial size, version ring
+-- and placeholder — and every limit it is checked against first; the table's
+-- pipeline layouts; binding it and selecting a sampler; every refusal, each
+-- making no native call; descriptor writes only into slots no live version
+-- maps; versions held through completion and backpressure when none is free;
+-- and the record-then-release case, whose batch keeps its version and whose
+-- slot is not reused until it completes.
+--
+-- The shaders' bytes are stand-ins: their descriptions are what is checked.
+-- Nothing here creates a Vulkan object.
+module Test.GPU.Vulkan.Native.Table (spec) where
+
+import Control.Concurrent.STM (atomically)
+import Control.Exception (ErrorCall (..), throwIO, try)
+import Control.Monad (when)
+import qualified Data.ByteString as ByteString
+import qualified Data.Map.Strict as Map
+import Data.Text (Text)
+import Data.Word (Word32, Word64)
+import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldReturn, shouldSatisfy)
+
+import Hetoimasia.GPU.Model.Budget (BudgetKind (LookupVersionBudget, TextureSlotBudget))
+import Hetoimasia.GPU.Model.Identity (IdentityKind (..), Misuse (..))
+import Hetoimasia.GPU.Vulkan.Native.Frames
+import Hetoimasia.GPU.Vulkan.Native.Recording
+import Hetoimasia.GPU.Vulkan.Native.Shader.Interface
+  ( DescriptorCount (..)
+  , DescriptorDeclaration (..)
+  , DescriptorKind (..)
+  , InterfaceStage (..)
+  , PushMember (..)
+  , ShaderInterface (..)
+  , interfaceFor
+  )
+import Hetoimasia.GPU.Vulkan.Native.TextureTable
+import Hetoimasia.GPU.Vulkan.Native.Uploads
+import Test.GPU.Vulkan.Native.FramesRig
+import Test.GPU.Vulkan.Native.FramesStandIn (completeAll)
+import Test.GPU.Vulkan.Native.RecordingStandIn (RecordingCall (..), limitRecording, recordingCalls, standInRecordingLimits)
+
+type Ups = Uploads () Int Int Text Int Word64
+
+type Rec = Recorder () Int Int Text Int Word64
+
+spec ∷ Spec
+spec = describe "Texture table" $ do
+  describe "making it" $ do
+    it "makes four samplers, set 0's layout over them declared at the cap and set 1's, a pool and a set for each, the version ring with one version per entry, writes set 1 once, and admits the placeholder's upload" $ do
+      (rig, uploads) ← uploadRig
+      ok (createTextureTable (rigRecording rig) uploads (tableConfig 16 4 2))
+      calls ← recordingCalls (rigRecordingStandIn rig)
+      let samplers = [handle | CreatedSampler handle _ ← calls]
+      [sampler | CreatedSampler _ sampler ← calls] `shouldBe` [NearestClamp, NearestRepeat, LinearClamp, LinearRepeat]
+      [request | CreatedSetLayout _ request ← calls] `shouldBe` [TextureSetLayout samplers 16, LookupSetLayout]
+      [request | CreatedPool _ request ← calls] `shouldBe` [TexturePool 4 4, LookupPool]
+      [count | AllocatedSet _ _ _ count ← calls] `shouldBe` [Just 4, Nothing]
+      -- One version is four entries of eight bytes, padded to the device's
+      -- 256-byte storage alignment; the ring holds two.
+      [(range, 1) | WroteDescriptors [WriteLookupBuffer _ _ range] ← calls] `shouldBe` [(32, 1 ∷ Int)]
+      Just view ← atomically (readTable (rigRecording rig))
+      tableViewStride view `shouldBe` 256
+      Map.size (tableViewVersions view) `shouldBe` 2
+      managedCount rig "lookup buffer" `shouldReturn` 1
+      managedCount rig "lookup version" `shouldReturn` 2
+      -- The placeholder is not written until its upload completes.
+      tableViewPlaceholderWritten view `shouldBe` False
+      settle rig uploads
+      ok (refreshTextureTable (rigRecording rig))
+      writtenSlots rig `shouldReturn` [0]
+      clean rig
+
+    it "checks the cap, the samplers, a stage's resources, the bindable sets, one version's range and the ring against the device first, making nothing, and makes one table per session" $ do
+      (rig, uploads) ← uploadRig
+      let limits = standInRecordingLimits {limitImageDimension = 16}
+          refusedUnder changed configured = do
+            limitRecording (rigRecordingStandIn rig) changed
+            answer ← createTextureTable (rigRecording rig) uploads configured
+            limitRecording (rigRecordingStandIn rig) limits
+            pure answer
+      refusedUnder limits {limitTableSampledImages = 15} (tableConfig 16 4 2) `shouldReturn` Left (RefusedOutOfBounds 16 15)
+      refusedUnder limits {limitTableSamplers = 3} (tableConfig 16 4 2) `shouldReturn` Left (RefusedOutOfBounds 4 3)
+      refusedUnder limits {limitTableResources = 20} (tableConfig 16 4 2) `shouldReturn` Left (RefusedOutOfBounds 21 20)
+      refusedUnder limits {limitBoundSets = 1} (tableConfig 16 4 2) `shouldReturn` Left (RefusedOutOfBounds 2 1)
+      refusedUnder limits {limitStorageRange = 31} (tableConfig 16 4 2) `shouldReturn` Left (RefusedOutOfBounds 32 31)
+      calls ← recordingCalls (rigRecordingStandIn rig)
+      [() | CreatedSampler {} ← calls] `shouldBe` []
+      ok (createTextureTable (rigRecording rig) uploads (tableConfig 16 4 2))
+      createTextureTable (rigRecording rig) uploads (tableConfig 16 4 2) `shouldReturn` Left (RefusedMisuse (DuplicateSubject ResourceIdentity))
+      clean rig
+
+  describe "pipeline layouts" $ do
+    it "declares both of the table's set layouts and the shaders' ranges, admits the table's bindings and no other, and the sampler index only inside a fragment range" $ do
+      (rig, _, kit) ← tableRig 4 2
+      calls ← recordingCalls (rigRecordingStandIn rig)
+      let layouts = [handle | CreatedSetLayout handle _ ← calls]
+      [declared | DeclaredSetLayouts _ declared ← calls] `shouldBe` [layouts]
+      -- The fragment stage's range is bytes 0 to 12: an index at 12 lies
+      -- outside it, and one at 6 is unaligned.
+      createTablePipelineLayout (rigRecording rig) tableShaders 12 `shouldReturn'` refused (RefusedIllegal "a sampler index outside every push-constant range the fragment stage sees")
+      createTablePipelineLayout (rigRecording rig) tableShaders 6 `shouldReturn'` refused (RefusedIllegal "a sampler index outside every push-constant range the fragment stage sees")
+      createTablePipelineLayout (rigRecording rig) (shadersWith [DescriptorDeclaration 2 0 StorageBuffer (DescriptorCount 1)]) 8
+        `shouldReturn'` refused (RefusedIncompatible "a shader declaring a descriptor binding the texture table does not hold")
+      -- A layout without the table admits no binding at all.
+      createPipelineLayoutFor (rigRecording rig) tableShaders `shouldReturn'` refused (RefusedUnsupported "a shader declaring descriptor bindings, which only a pipeline layout holding the texture table declares")
+      calls' ← recordingCalls (rigRecordingStandIn rig)
+      [() | CreatedLayout {} ← calls'] `shouldBe` [() | CreatedLayout {} ← calls]
+      kitTarget kit `seq` clean rig
+
+  describe "binding and drawing" $ do
+    it "binds both sets under the pipeline's layout with the batch's version offset, selects a sampler by a push at the declared offset, and draws" $ do
+      (rig, _, kit) ← tableRig 4 2
+      framelessOnce rig $ \recorder → inPass kit recorder $ do
+        ok (bindTable recorder)
+        ok (selectSampler recorder 2)
+        ok (draw recorder 3 1)
+      calls ← recordingCalls (rigRecordingStandIn rig)
+      let sets = [set | AllocatedSet set _ _ _ ← calls]
+          commands' = [command | Recorded _ command ← calls]
+      [(handles, offsets) | CommandBindDescriptorSets _ handles offsets ← commands'] `shouldBe` [(sets, [0])]
+      [(stages, offset, bytes) | CommandPushConstants _ stages offset bytes ← commands'] `shouldBe` [([PushFragment], 8, ByteString.pack [2, 0, 0, 0])]
+      [() | CommandDraw {} ← commands'] `shouldBe` [()]
+      clean rig
+
+    it "refuses, making no native call: binding with no pipeline or under one whose layout does not hold the table, a sampler past the four, a push over the sampler index, and drawing before the table is bound compatibly or a sampler selected" $ do
+      (rig, _, kit) ← tableRig 4 2
+      answers ← framelessOnce rig $ \recorder → do
+        ok (beginRenderingInto recorder (kitTarget kit) ClearFromUndefined (ClearColor 0 0 0 1))
+        noPipeline ← bindTable recorder
+        ok (bindPipeline recorder (kitPlain kit))
+        plain ← bindTable recorder
+        plainSampler ← selectSampler recorder 0
+        ok (bindPipeline recorder (kitPipeline kit))
+        ok (setViewport recorder (Viewport 0 0 32 16))
+        ok (setScissor recorder (Rect 0 0 32 16))
+        before ← commandCount rig
+        unbound ← draw recorder 3 1
+        ok (bindTable recorder)
+        unselected ← draw recorder 3 1
+        beyond ← selectSampler recorder 4
+        over ← pushConstants recorder [PushFragment] 8 (ByteString.pack [1, 0, 0, 0])
+        after ← commandCount rig
+        ok (selectSampler recorder 1)
+        -- A pipeline whose layout does not hold the table disturbs the
+        -- binding; the table's pipeline again needs it bound again.
+        ok (bindPipeline recorder (kitPlain kit))
+        ok (bindPipeline recorder (kitPipeline kit))
+        disturbed ← draw recorder 3 1
+        ok (endRendering recorder)
+        pure ([noPipeline, plain, plainSampler, unbound, unselected, beyond, over, disturbed], after - before)
+      fst answers
+        `shouldBe` [ Left (RefusedIllegal "binding the texture table with no pipeline bound")
+                   , Left (RefusedIllegal "binding the texture table under a pipeline whose layout does not hold it")
+                   , Left (RefusedIllegal "selecting a sampler under a pipeline whose layout does not hold the texture table")
+                   , Left (RefusedIllegal "a draw with a pipeline holding the texture table before the table is bound under a compatible layout")
+                   , Left (RefusedIllegal "a draw with a pipeline holding the texture table before a sampler is selected")
+                   , Left (RefusedOutOfBounds 4 3)
+                   , Left (RefusedIllegal "a push over the sampler index, which selectSampler sets")
+                   , Left (RefusedIllegal "a draw with a pipeline holding the texture table before the table is bound under a compatible layout")
+                   ]
+      -- Between those two counts only the one bind reached the native layer.
+      snd answers `shouldBe` 1
+      clean rig
+
+    it "keeps a batch's version through a later change and a rebind, and refuses a bind before the placeholder's upload completes" $ do
+      (rig, uploads) ← uploadRig
+      ok (createTextureTable (rigRecording rig) uploads (tableConfig 16 4 2))
+      kit ← newKit rig
+      early ← framelessOnce rig $ \recorder → inPass kit recorder (bindTable recorder)
+      early `shouldBe` Left (RefusedNotWritten "the texture table's placeholder has not finished uploading")
+      settle rig uploads
+      texture ← uploadedTexture rig uploads
+      framelessOnce rig $ \recorder → inPass kit recorder $ do
+        ok (bindTable recorder)
+        -- A registration changes a mapping, but this batch keeps its version.
+        _ ← registered rig texture
+        ok (bindTable recorder)
+      calls ← recordingCalls (rigRecordingStandIn rig)
+      [offset | Recorded _ (CommandBindDescriptorSets _ _ [offset]) ← calls] `shouldBe` [0, 0]
+      clean rig
+
+  describe "versions and slots" $ do
+    it "writes a texture's descriptor only into a slot no live version maps, and reuses a released texture's slot only once the batches that bound it complete" $ do
+      (rig, uploads, kit) ← tableRig 3 2
+      first ← uploadedTexture rig uploads
+      second ← uploadedTexture rig uploads
+      third ← uploadedTexture rig uploads
+      handle ← registered rig first
+      writtenSlots rig `shouldReturn` [0, 1]
+      -- A batch binds a version mapping the first texture's slot, and is
+      -- submitted; it has not completed.
+      recordDrawing rig kit
+      ok (releaseTexture (rigRecording rig) handle)
+      -- Its slot stays mapped by the held version: the first texture is not
+      -- released, and the second takes the other free slot.
+      Just held ← atomically (readTable (rigRecording rig))
+      tableViewRetiring held `shouldBe` [1]
+      standing rig first `shouldReturn` Just ManagedLive
+      _ ← registered rig second
+      writtenSlots rig `shouldReturn` [0, 1, 2]
+      -- A third has no slot until the first completes.
+      registerTexture (rigRecording rig) third `shouldReturn'` refused (RefusedBackpressure TextureSlotBudget)
+      completed rig
+      ok (refreshTextureTable (rigRecording rig))
+      standing rig first `shouldReturn` Just ManagedReleased
+      _ ← registered rig third
+      writtenSlots rig `shouldReturn` [0, 1, 2, 1]
+      clean rig
+
+    it "holds a version through its batch's completion, answers backpressure when a new one is owed and none is free, and binds again once one is" $ do
+      (rig, uploads, kit) ← tableRig 4 2
+      one ← uploadedTexture rig uploads
+      two ← uploadedTexture rig uploads
+      -- Two batches, each binding a different version, both submitted and
+      -- pending.
+      recordDrawing rig kit
+      _ ← registered rig one
+      recordDrawing rig kit
+      _ ← registered rig two
+      answer ← framelessOnce rig $ \recorder → inPass kit recorder (bindTable recorder)
+      answer `shouldBe` Left (RefusedBackpressure LookupVersionBudget)
+      completed rig
+      recordDrawing rig kit
+      calls ← recordingCalls (rigRecordingStandIn rig)
+      [offset | Recorded _ (CommandBindDescriptorSets _ _ [offset]) ← calls] `shouldBe` [0, 256, 0]
+      clean rig
+
+    it "keeps the original image for a batch recorded before its texture's release and submitted after it, and reuses its slot only once that batch completes" $ do
+      (rig, uploads, kit) ← tableRig 3 2
+      first ← uploadedTexture rig uploads
+      replacement ← uploadedTexture rig uploads
+      handle ← registered rig first
+      firstView ← viewOf rig first
+      -- Recorded, then the handle released and the texture re-registered,
+      -- then submitted: the scope submits once its body returns.
+      withFramelessScope (rigFrames rig) $ \scope → do
+        _ ← recordFramelessIn scope $ \recorder → inPass kit recorder $ do
+          ok (bindTable recorder)
+          ok (selectSampler recorder 0)
+          ok (draw recorder 3 1)
+        ok (releaseTexture (rigRecording rig) handle)
+        _ ← registered rig replacement
+        pure ()
+      -- The batch's version still maps the first image's slot: it was not
+      -- released, and no descriptor was written over it.
+      standing rig first `shouldReturn` Just ManagedLive
+      writes ← imageWrites rig
+      [element | (element, view) ← writes, view == firstView] `shouldBe` [1]
+      [element | (element, _) ← writes] `shouldBe` [0, 1, 2]
+      completed rig
+      ok (refreshTextureTable (rigRecording rig))
+      standing rig first `shouldReturn` Just ManagedReleased
+      clean rig
+
+    it "binds a batch at the current version while every ring entry is held, when no mapping changed since it was published" $ do
+      (rig, uploads, kit) ← tableRig 4 2
+      one ← uploadedTexture rig uploads
+      recordDrawing rig kit
+      _ ← registered rig one
+      recordDrawing rig kit
+      -- Both entries are held by pending batches, and nothing changed since
+      -- the second was published.
+      recordDrawing rig kit
+      calls ← recordingCalls (rigRecordingStandIn rig)
+      [offset | Recorded _ (CommandBindDescriptorSets _ _ [offset]) ← calls] `shouldBe` [0, 256, 256]
+      clean rig
+
+  describe "handles" $ do
+    it "refuses a released handle wherever it is used, and issues its index again only under a new generation" $ do
+      (rig, uploads, _) ← tableRig 4 2
+      first ← uploadedTexture rig uploads
+      second ← uploadedTexture rig uploads
+      handle ← registered rig first
+      ok (releaseTexture (rigRecording rig) handle)
+      releaseTexture (rigRecording rig) handle `shouldReturn` Left (RefusedStaleHandle handle)
+      reissued ← registered rig second
+      handleIndex reissued `shouldBe` handleIndex handle
+      handleGeneration reissued `shouldSatisfy` (/= handleGeneration handle)
+      releaseTexture (rigRecording rig) handle `shouldReturn` Left (RefusedStaleHandle handle)
+      Just view ← atomically (readTable (rigRecording rig))
+      -- The stale handle resolves to the placeholder, the new one to its slot.
+      resolveHandle 4 (tableViewMapping view) handle `shouldBe` 0
+      resolveHandle 4 (tableViewMapping view) reissued `shouldSatisfy` (/= 0)
+      clean rig
+
+    it "resolves a handle to the placeholder until its upload completes, and a release before then writes no descriptor and frees the image once its upload settles" $ do
+      (rig, uploads, _) ← tableRig 4 2
+      texture ← createImage (rigRecording rig) (ImageDescription TextureImage Rgba8Linear 2 2 1) >>= either (fail . show) pure
+      _ ← submitUpload uploads (UploadImage texture [ByteString.replicate 16 255]) >>= either (fail . show) pure
+      handle ← registered rig texture
+      Just pending ← atomically (readTable (rigRecording rig))
+      resolveHandle 4 (tableViewMapping pending) handle `shouldBe` 0
+      ok (releaseTexture (rigRecording rig) handle)
+      settle rig uploads
+      ok (refreshTextureTable (rigRecording rig))
+      writtenSlots rig `shouldReturn` [0]
+      standing rig texture `shouldReturn` Just ManagedReleased
+      clean rig
+
+    it "frees a version a discarded batch bound, so a texture it mapped is released once its handle is" $ do
+      (rig, uploads, kit) ← tableRig 4 2
+      first ← uploadedTexture rig uploads
+      handle ← registered rig first
+      discarded ← try @ErrorCall @() $ withFramelessScope (rigFrames rig) $ \scope → do
+        _ ← recordFramelessIn scope $ \recorder → inPass kit recorder $ do
+          ok (bindTable recorder)
+          ok (selectSampler recorder 0)
+          ok (draw recorder 3 1)
+        throwIO (ErrorCall "the consumer gave up")
+      discarded `shouldBe` Left (ErrorCall "the consumer gave up")
+      ok (releaseTexture (rigRecording rig) handle)
+      ok (refreshTextureTable (rigRecording rig))
+      standing rig first `shouldReturn` Just ManagedReleased
+      clean rig
+  where
+    refused refusal answer = case answer of
+      Left actual → actual `shouldBe` refusal
+      Right _ → expectationFailure ("expected " <> show refusal)
+
+-- ---------------------------------------------------------------------------
+-- The rig
+
+uploadRig ∷ IO (Rig, Ups)
+uploadRig = do
+  rig ← newRig
+  limitRecording (rigRecordingStandIn rig) standInRecordingLimits {limitImageDimension = 16}
+  uploads ← newUploads (rigFrames rig) (either (error . show) id (validateUploadConfig 4096 1024 8)) >>= either (fail . show) pure
+  pure (rig, uploads)
+
+tableConfig ∷ Integer → Integer → Integer → TableConfig
+tableConfig capacity initial versions = either (error . show) id (validateTableConfig capacity initial versions)
+
+-- | A session with a table of this many slots and versions whose placeholder
+-- is written, and a kit to draw with.
+tableRig ∷ Integer → Integer → IO (Rig, Ups, Kit)
+tableRig slots versions = do
+  (rig, uploads) ← uploadRig
+  ok (createTextureTable (rigRecording rig) uploads (tableConfig 16 slots versions))
+  settle rig uploads
+  ok (refreshTextureTable (rigRecording rig))
+  kit ← newKit rig
+  pure (rig, uploads, kit)
+
+-- | Turn and complete until every upload has settled.
+settle ∷ Rig → Ups → IO ()
+settle rig uploads = go (32 ∷ Int)
+  where
+    go 0 = expectationFailure "the uploads did not settle in 32 turns"
+    go remaining = do
+      _ ← progressUploads uploads >>= either (fail . show) pure
+      completed rig
+      _ ← progressUploads uploads >>= either (fail . show) pure
+      left ← uploadsUnsettled <$> atomically (readUploads uploads)
+      when (not (null left)) (go (remaining - 1))
+
+-- | Complete every pending fence and observe it.
+completed ∷ Rig → IO ()
+completed rig = completeAll (rigStandIn rig) >> () <$ progress rig
+
+-- | A two-by-two RGBA8 texture whose upload has completed.
+uploadedTexture ∷ Rig → Ups → IO Image
+uploadedTexture rig uploads = do
+  texture ← createImage (rigRecording rig) (ImageDescription TextureImage Rgba8Linear 2 2 1) >>= either (fail . show) pure
+  _ ← submitUpload uploads (UploadImage texture [ByteString.replicate 16 255]) >>= either (fail . show) pure
+  settle rig uploads
+  pure texture
+
+registered ∷ Rig → Image → IO TextureHandle
+registered rig texture = registerTexture (rigRecording rig) texture >>= either (fail . show) pure
+
+-- | A color target, a pipeline over a layout holding the table, and one
+-- over a layout without it.
+data Kit = Kit
+  { kitTarget ∷ !Image
+  , kitPipeline ∷ !Pipeline
+  , kitPlain ∷ !Pipeline
+  }
+
+newKit ∷ Rig → IO Kit
+newKit rig = do
+  target ← createImage (rigRecording rig) (ImageDescription ColorTarget Rgba8Srgb 32 16 1) >>= either (fail . show) pure
+  layout ← createTablePipelineLayout (rigRecording rig) tableShaders 8 >>= either (fail . show) pure
+  pipeline ← createCheckedPipeline (rigRecording rig) layout tableShaders (formatCode Rgba8Srgb) >>= either (fail . show) pure
+  plainLayout ← createPipelineLayoutFor (rigRecording rig) plainShaders >>= either (fail . show) pure
+  plain ← createCheckedPipeline (rigRecording rig) plainLayout plainShaders (formatCode Rgba8Srgb) >>= either (fail . show) pure
+  pure (Kit target pipeline plain)
+
+-- | A fragment stage reading the table, with a handle at offset 0 and its
+-- sampler index at 8.
+tableShaders ∷ CheckedShaders
+tableShaders = shadersWith textureTableDescriptors
+
+shadersWith ∷ [DescriptorDeclaration] → CheckedShaders
+shadersWith descriptors =
+  CheckedShaders
+    (CheckedShader (ByteString.pack [1, 2, 3, 4]) (interfaceFor VertexInterface))
+    (CheckedShader (ByteString.pack [5, 6, 7, 8]) (interfaceFor FragmentInterface) {interfacePushConstants = [PushMember 0 8, PushMember 8 4], interfaceDescriptors = descriptors})
+
+plainShaders ∷ CheckedShaders
+plainShaders =
+  CheckedShaders
+    (CheckedShader (ByteString.pack [1, 2, 3, 4]) (interfaceFor VertexInterface))
+    (CheckedShader (ByteString.pack [5, 6, 7, 8]) (interfaceFor FragmentInterface))
+
+inPass ∷ Kit → Rec → IO a → IO a
+inPass kit recorder action = do
+  ok (beginRenderingInto recorder (kitTarget kit) ClearFromUndefined (ClearColor 0 0 0 1))
+  ok (bindPipeline recorder (kitPipeline kit))
+  ok (setViewport recorder (Viewport 0 0 32 16))
+  ok (setScissor recorder (Rect 0 0 32 16))
+  value ← action
+  ok (endRendering recorder)
+  pure value
+
+-- | Record one frame-less batch in a scope of its own, which submits it.
+framelessOnce ∷ Rig → (Rec → IO a) → IO a
+framelessOnce rig consumer =
+  withFramelessScope (rigFrames rig) $ \scope → recordFramelessIn scope consumer >>= either (fail . show) (pure . snd)
+
+-- | One submitted, uncompleted batch that binds the table and draws.
+recordDrawing ∷ Rig → Kit → IO ()
+recordDrawing rig kit = framelessOnce rig $ \recorder → inPass kit recorder $ do
+  ok (bindTable recorder)
+  ok (selectSampler recorder 0)
+  ok (draw recorder 3 1)
+
+-- ---------------------------------------------------------------------------
+-- Observation
+
+-- | Every slot a sampled-image descriptor was written into, in order.
+writtenSlots ∷ Rig → IO [Word32]
+writtenSlots rig = map fst <$> imageWrites rig
+
+imageWrites ∷ Rig → IO [(Word32, Word64)]
+imageWrites rig = (\calls → [(element, view) | WroteDescriptors writes ← calls, WriteSampledImage _ element view ← writes]) <$> recordingCalls (rigRecordingStandIn rig)
+
+commandCount ∷ Rig → IO Int
+commandCount rig = (\calls → length [() | Recorded {} ← calls]) <$> recordingCalls (rigRecordingStandIn rig)
+
+-- | How many managed generations of this kind the recording holds.
+managedCount ∷ Rig → Text → IO Int
+managedCount rig kind' = (\views → length [() | ManagedView _ _ named _ ← views, named == kind']) <$> atomically (readManaged (rigRecording rig))
+
+viewOf ∷ Rig → Image → IO Word64
+viewOf rig texture =
+  (\views → case [handles | ManagedView viewed _ _ handles ← views, viewed == managedResource texture] of
+      (_ : view : _) : _ → view
+      _ → error "the image has no view")
+    <$> atomically (readManaged (rigRecording rig))
+
+standing ∷ Rig → Image → IO (Maybe ManagedStanding)
+standing rig texture =
+  (\views → case [held | ManagedView viewed held _ _ ← views, viewed == managedResource texture] of
+      held : _ → Just held
+      [] → Nothing)
+    <$> atomically (readManaged (rigRecording rig))

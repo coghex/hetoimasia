@@ -45,6 +45,10 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Recorder
   , UploadCopy (..)
   , recordUploadCopies
 
+    -- * The texture table (GRS-7)
+  , bindTable
+  , selectSampler
+
     -- * Push constants, vertex input and the ring (GRS-4)
   , pushConstants
   , claimRegion
@@ -59,7 +63,7 @@ import Control.Concurrent.STM (STM, atomically, modifyTVar', readTVar, readTVarI
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, displayException, mask, mask_, rethrowIO, tryWithContext)
 import Control.Applicative ((<|>))
 import Control.Monad (unless, when)
-import Data.Bits ((.&.))
+import Data.Bits (shiftR, (.&.))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import Data.List (nub, sortOn)
@@ -117,7 +121,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   , IndexType
   , InputRate (..)
   , PushConstantRange (..)
-  , PushStage
+  , PushStage (..)
   , VertexAttribute (..)
   , VertexBinding (..)
   , VertexInput (..)
@@ -146,8 +150,10 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   , useLayout
   , useScope
   )
+import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Lookup (TakenVersion (..), takeVersion)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
-  ( BatchRecord (..)
+  ( TableState (..)
+  , BatchRecord (..)
   , BatchStanding (..)
   , BatchTicket (..)
   , Buffer (..)
@@ -207,6 +213,23 @@ data RecorderState = RecorderState
   , stateObjects ∷ !(Map.Map ResourceId (Word64, Maybe (Word32, Word32)))
     -- ^ The native handle of each of them, and an image's aspect and mip
     -- levels, for the exit barriers the seal records.
+  , stateTable ∷ !(Maybe TableBinding)
+    -- ^ The texture table's binding (GRS-7), from the batch's first bind of
+    -- it on.
+  , stateSampler ∷ !(Maybe Word32)
+    -- ^ The sampler index selected, while the push constants that hold it
+    -- stand.
+  }
+
+-- | A batch's binding of the texture table (GRS-7): the version it took at
+-- its first bind, which it keeps for the rest of its life, and the
+-- push-constant ranges of the layout the sets are bound under while that
+-- binding stands — a pipeline whose layout holds the table with the same
+-- ranges keeps it, and any other disturbs it, so the next draw needs the
+-- table bound again.
+data TableBinding = TableBinding
+  { bindingTaken ∷ !TakenVersion
+  , bindingRanges ∷ !(Maybe [PushConstantRange])
   }
 
 -- | The pipeline a recorder has bound: its generation, the color format it was
@@ -388,7 +411,7 @@ recordAdmitted
   → IO (Either Refusal (BatchId, a))
 recordAdmitted recording batch commands image label restore consumer = do
   opened ← newIORef True
-  state ← newIORef (RecorderState LayoutUndefined Nothing Nothing Map.empty Nothing [] Nothing Nothing emptyAccess Map.empty)
+  state ← newIORef (RecorderState LayoutUndefined Nothing Nothing Map.empty Nothing [] Nothing Nothing emptyAccess Map.empty Nothing Nothing)
   labelled ← isJust <$> readRootsInstrumentation roots
   labels ← newIORef 0
   let recorder = Recorder recording batch commands image opened state labelled labels
@@ -892,7 +915,16 @@ bindPipeline recorder (Pipeline pipeline) =
     Right (NativePipeline handle layout format interface) → command recorder $ \state → do
       attachment ← checkedAgainst recorder state
       incompatible format attachment
-      Right (state {statePipeline = Just (BoundPipeline pipeline format layout interface)}, [pipeline, layout], CommandBindPipeline handle)
+      let ranges = interfacePushConstants interface
+          -- The table's sets stay bound only under a layout that holds the
+          -- table with the same push-constant ranges (GRS-7); and pushed
+          -- constants, the sampler index among them, only under a layout with
+          -- the same ranges.
+          table = fmap (\binding → if isJust (interfaceTable interface) && bindingRanges binding == Just ranges then binding else binding {bindingRanges = Nothing}) (stateTable state)
+          sampler = case statePipeline state of
+            Just previous | interfacePushConstants (boundInterface previous) == ranges && interfaceTable (boundInterface previous) == interfaceTable interface → stateSampler state
+            _ → Nothing
+      Right (state {statePipeline = Just (BoundPipeline pipeline format layout interface), stateTable = table, stateSampler = sampler}, [pipeline, layout], CommandBindPipeline handle)
     Right _ → pure (Left RefusedWrongKind)
 
 -- | A pipeline built for another format than the attachment's.
@@ -996,6 +1028,88 @@ drawIndexed recorder indices instances =
                 Nothing → []
           Right (state {stateFrozen = frozen <> stateFrozen state}, CommandDrawIndexed indices instances)
 
+-- | A draw with a pipeline whose layout holds the texture table needs the
+-- table bound compatibly — under a layout with the same push-constant ranges
+-- — and a sampler selected (GRS-7).
+tableReady ∷ RecorderState → BoundPipeline → Either Refusal ()
+tableReady state bound = case interfaceTable (boundInterface bound) of
+  Nothing → Right ()
+  Just _
+    | (stateTable state >>= bindingRanges) /= Just (interfacePushConstants (boundInterface bound)) →
+        Left (RefusedIllegal "a draw with a pipeline holding the texture table before the table is bound under a compatible layout")
+    | isNothing (stateSampler state) → Left (RefusedIllegal "a draw with a pipeline holding the texture table before a sampler is selected")
+    | otherwise → Right ()
+
+-- | Bind the texture table (GRS-7) under the bound pipeline's layout, which
+-- must hold it: set 0 and set 1, with set 1's dynamic offset selecting the
+-- batch's version. The batch's first bind takes the version
+-- ("Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Lookup"'s 'takeVersion',
+-- which may publish a new one) and retains it, the samplers, the set
+-- layouts, the pools and the version ring until its references end; every
+-- later bind of the batch binds that same version again, whatever has been
+-- published since. Refused with no native call: a closed recorder; no
+-- pipeline bound, or one whose layout does not hold the table; and whatever
+-- taking a version refuses — no table, its placeholder not yet uploaded, or
+-- every version held while a new one is owed.
+bindTable ∷ Recorder q inst msgr phys dev cmd → IO (Either Refusal ())
+bindTable recorder =
+  owned recording $
+    readIORef (recorderOpen recorder) >>= \case
+      False → pure (Left RefusedRecorderClosed)
+      True → do
+        state ← readIORef (recorderState recorder)
+        case statePipeline state of
+          Nothing → pure (Left (RefusedIllegal "binding the texture table with no pipeline bound"))
+          Just bound
+            | isNothing (interfaceTable (boundInterface bound)) →
+                pure (Left (RefusedIllegal "binding the texture table under a pipeline whose layout does not hold it"))
+            | otherwise → do
+                taken ← case stateTable state of
+                  Just binding → pure (Right (bindingTaken binding))
+                  Nothing → takeVersion recording
+                table ← readTVarIO (recordingTable recording)
+                case (taken, table) of
+                  (Left refusal, _) → pure (Left refusal)
+                  (_, Nothing) → pure (Left (RefusedIllegal "binding a texture table this session has not made"))
+                  (Right version, Just held) → command recorder $ \current → case statePipeline current of
+                    Just now →
+                      let ranges = interfacePushConstants (boundInterface now)
+                       in Right
+                            ( current {stateTable = Just (TableBinding version (Just ranges))}
+                            , [tableSamplers held, tableLayouts held, tablePools held, tableRing held, takenResource version, boundLayout now]
+                            , CommandBindDescriptorSets (interfaceLayout (boundInterface now)) (tableSets held) [takenOffset version]
+                            )
+                    Nothing → Left (RefusedIllegal "binding the texture table with no pipeline bound")
+  where
+    recording = recorderRecording recorder
+
+-- | Select the sampler the next draws sample the table with (GRS-7): its
+-- index, pushed at the offset the bound pipeline's layout declared for it,
+-- to every stage of the push-constant range holding it. Refused with no
+-- native call: a closed recorder; no pipeline bound, or one whose layout does
+-- not hold the table; and an index beyond the table's four samplers, as
+-- 'RefusedOutOfBounds'.
+selectSampler ∷ Recorder q inst msgr phys dev cmd → Word32 → IO (Either Refusal ())
+selectSampler recorder index = command recorder $ \state → case statePipeline state of
+  Nothing → Left (RefusedIllegal "selecting a sampler with no pipeline bound")
+  Just bound → case interfaceTable (boundInterface bound) of
+    Nothing → Left (RefusedIllegal "selecting a sampler under a pipeline whose layout does not hold the texture table")
+    Just offset
+      | index > 3 → Left (RefusedOutOfBounds (fromIntegral index) 3)
+      | otherwise →
+          let stages = case [rangeStages range | range ← interfacePushConstants (boundInterface bound), rangeOffset range <= offset, toInteger offset + 4 <= toInteger (rangeOffset range) + toInteger (rangeSize range)] of
+                found : _ → found
+                [] → [PushFragment]
+           in Right
+                ( state {stateSampler = Just index}
+                , [boundLayout bound]
+                , CommandPushConstants (interfaceLayout (boundInterface bound)) stages offset (word32Bytes index)
+                )
+
+-- | Four little-endian bytes.
+word32Bytes ∷ Word32 → ByteString
+word32Bytes value = ByteString.pack [fromIntegral (value `shiftR` shift) | shift ← [0, 8, 16, 24]]
+
 -- | The largest index an indexed draw of this many indices would read, when
 -- its index data is bytes the recording can read: a ring region, read from
 -- the ring's mapping, which only this batch has written since the region was
@@ -1069,6 +1183,7 @@ drawChecked recorder indexed count instances decide = do
                 incompatible (boundFormat bound) attachment
                 viewportFits viewport attachment
                 scissorFits rect attachment
+                tableReady current bound
                 (next, native) ← decide current bound
                 Right (next, [boundPipeline bound, boundLayout bound], native)
           _ → Left (RefusedIllegal "a draw before the viewport and scissor are set")
@@ -1370,6 +1485,10 @@ pushConstants recorder stages offset bytes = command recorder $ \state → case 
       let (low, high) = extent range
        in when (low < reach && start < high && any (`notElem` stages) (rangeStages range)) $
             Left (RefusedIllegal "a push that leaves out a stage of a range its bytes overlap")
+    -- The texture table's sampler index is the recorder's to push (GRS-7).
+    for_ (interfaceTable (boundInterface bound)) $ \sampler →
+      when (toInteger sampler < reach && start < toInteger sampler + 4) $
+        Left (RefusedIllegal "a push over the sampler index, which selectSampler sets")
     Right (state, [boundLayout bound], CommandPushConstants (interfaceLayout (boundInterface bound)) (nub stages) offset bytes)
 
 -- | Claim a region of the session's shared ring for this batch (D-33): this

@@ -3,7 +3,7 @@
 -- slots they resolve to, and the lookup versions batches freeze them in.
 --
 -- Nothing here makes a native call or reads a clock. The native table
--- ("Hetoimasia.GPU.Vulkan.Native.Recording") owns the descriptor sets, the
+-- ("Hetoimasia.GPU.Vulkan.Native.TextureTable") owns the descriptor sets, the
 -- version ring's memory and the images, and asks this module what to write
 -- and when; whether a version is still held by a batch comes from the GPU
 -- model's own holds, passed in as a predicate, so these rules run unchanged
@@ -35,8 +35,11 @@
 -- = Slots
 --
 -- A released texture's slot is reused, and its descriptor rewritten, only
--- once no live version — the current one, or one a batch holds — maps it
--- ('reclaimSlots'). A slot a texture is registered into was free, so no live
+-- once no live version maps it ('reclaimSlots'). A version is live while a
+-- batch holds it, and the current version also while no mapping has changed
+-- since it was published — the only time a batch can still bind it. A
+-- release always changes a mapping, so the slot of a texture no batch ever
+-- bound is free at once. A slot a texture is registered into was free, so no live
 -- version maps it: the descriptor written into it when its upload completes
 -- can be sampled by no recorded or pending batch.
 module Hetoimasia.GPU.Model.TextureTable
@@ -69,6 +72,7 @@ module Hetoimasia.GPU.Model.TextureTable
     -- * Observation
   , HandleStanding (..)
   , handleStanding
+  , pendingTextures
   , currentMapping
   , currentVersion
   , versionMapping
@@ -349,9 +353,8 @@ bindVersion held table = case tableCurrent table of
       first : _ → first
       [] → 0
 
--- | Free every retiring slot no live version maps — the current version, and
--- every version a batch holds — and answer each with what was kept for it,
--- which nothing can still sample.
+-- | Free every retiring slot no live version maps ('liveVersions') and answer
+-- each with what was kept for it, which nothing can still sample.
 reclaimSlots ∷ (Word32 → Bool) → TextureTable a → (TextureTable a, [(Word32, a)])
 reclaimSlots held table =
   ( table
@@ -383,6 +386,15 @@ handleStanding handle table = case live handle table of
   Right (_, HolderReady slot) → HandleReady slot
   Left _ → HandleStale
 
+-- | Every live handle whose texture's upload has not completed, with what
+-- was kept for it, in index order.
+pendingTextures ∷ TextureTable a → [(TextureHandle, a)]
+pendingTextures table =
+  [ (TextureHandle index generation, kept)
+  | (index, IndexState generation (Just (HolderPending slot))) ← Map.toList (tableIndices table)
+  , Just kept ← [Map.lookup slot (tableTextures table)]
+  ]
+
 -- | The mapping a version published now would hold: every index a live
 -- handle holds, to its own slot once complete and to slot 0 until then, with
 -- its generation. An index no live handle holds is absent, which reads as
@@ -405,10 +417,16 @@ currentVersion = tableCurrent
 versionMapping ∷ Word32 → TextureTable a → Maybe (Map Word32 LookupEntry)
 versionMapping entry = Map.lookup entry . tableVersions
 
--- | The ring entries whose versions are live: the current one, and every one
--- a batch holds.
+-- | The ring entries whose versions are live: every one a batch holds, and
+-- the current one while no mapping has changed since it was published — once
+-- one has, the next binding publishes a new version, so no batch can take it
+-- again.
 liveVersions ∷ (Word32 → Bool) → TextureTable a → [Word32]
-liveVersions held table = [entry | entry ← Map.keys (tableVersions table), held entry || Just entry == tableCurrent table]
+liveVersions held table =
+  [ entry
+  | entry ← Map.keys (tableVersions table)
+  , held entry || (Just entry == tableCurrent table && not (tableDirty table))
+  ]
 
 -- | The slots any live version maps.
 mappedSlots ∷ (Word32 → Bool) → TextureTable a → Set Word32

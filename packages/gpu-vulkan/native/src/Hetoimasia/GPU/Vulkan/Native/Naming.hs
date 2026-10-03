@@ -49,6 +49,10 @@ module Hetoimasia.GPU.Vulkan.Native.Naming
   , bufferName
   , imageName
   , ownedViewName
+  , tableSamplerName
+  , tableSetLayoutName
+  , tablePoolName
+  , tableSetName
   , SlotObject (..)
   , slotObjectName
   , PoolObject (..)
@@ -111,6 +115,10 @@ data NativeObjectKind
   | ObjectDeviceMemory
   | ObjectSemaphore
   | ObjectFence
+  | ObjectDescriptorSetLayout
+  | ObjectSampler
+  | ObjectDescriptorPool
+  | ObjectDescriptorSet
   deriving (Eq, Ord, Show, Enum, Bounded)
 
 -- | The kind's @VkObjectType@ value.
@@ -128,6 +136,10 @@ objectTypeCode = \case
   ObjectShaderModule → 15
   ObjectPipelineLayout → 17
   ObjectPipeline → 19
+  ObjectDescriptorSetLayout → 20
+  ObjectSampler → 21
+  ObjectDescriptorPool → 22
+  ObjectDescriptorSet → 23
   ObjectCommandPool → 25
   ObjectSurface → 1000000000
   ObjectSwapchain → 1000001000
@@ -227,6 +239,18 @@ imageName resource = boundedName (resourceText resource <> " image")
 -- | A managed image's one owned view.
 ownedViewName ∷ ResourceId → ByteString
 ownedViewName resource = boundedName (resourceText resource <> " image view")
+
+-- | One of the texture table's shared samplers (GRS-7): its resource, and
+-- the sampler's index.
+tableSamplerName ∷ ResourceId → Natural → ByteString
+tableSamplerName resource index = boundedName (resourceText resource <> " table sampler " <> shown index)
+
+-- | One of the texture table's set layouts, pools or sets: its resource, and
+-- the set's number.
+tableSetLayoutName, tablePoolName, tableSetName ∷ ResourceId → Natural → ByteString
+tableSetLayoutName resource set = boundedName (resourceText resource <> " table set " <> shown set <> " layout")
+tablePoolName resource set = boundedName (resourceText resource <> " table set " <> shown set <> " pool")
+tableSetName resource set = boundedName (resourceText resource <> " table set " <> shown set)
 
 -- | One of the synchronization objects a frame slot owns (VK-12).
 data SlotObject

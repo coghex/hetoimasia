@@ -17,6 +17,8 @@ import System.Directory (createDirectoryIfMissing)
 import System.FilePath (takeDirectory, (</>))
 import Test.Hspec
 
+import Hetoimasia.GPU.Vulkan.Native.Recording.ShaderInterfaces (tableFragmentInterface, tableVertexInterface)
+import Hetoimasia.GPU.Vulkan.Native.Recording.Shaders (tableShaders)
 import Hetoimasia.GPU.Vulkan.Native.Shader.Interface
 import Hetoimasia.GPU.Vulkan.Native.Shader.Reflect
 import Hetoimasia.GPU.Vulkan.Native.Shader.Toolchain (fingerprintPath)
@@ -135,6 +137,23 @@ spec = describe "Shader interfaces" $ do
       checkedInterface matchingFragment `shouldBe` checkedFragmentInterface
       fmap (compareInterface checkedVertexInterface) (reflect (checkedSpirv matchingVertex)) `shouldBe` Right []
       fmap (compareInterface checkedFragmentInterface) (reflect (checkedSpirv matchingFragment)) `shouldBe` Right []
+
+    it "include the texture table's: four samplers and a runtime-sized image array in set 0, one storage buffer in set 1, declared and matched (GRS-7)" $ do
+      let CheckedShaders vertex fragment = tableShaders
+      checkedInterface vertex `shouldBe` tableVertexInterface
+      checkedInterface fragment `shouldBe` tableFragmentInterface
+      interfaceDescriptors tableFragmentInterface `shouldBe` textureTableDescriptors
+      fmap reflectionDescriptors (reflect (checkedSpirv fragment))
+        `shouldBe` Right
+          [ ReflectedDescriptor 0 0 ReflectedSampler (ReflectedFixed 4)
+          , ReflectedDescriptor 0 1 ReflectedSampledImage ReflectedRuntime
+          , ReflectedDescriptor 1 0 ReflectedStorageBuffer (ReflectedFixed 1)
+          ]
+      fmap (compareInterface tableFragmentInterface) (reflect (checkedSpirv fragment)) `shouldBe` Right []
+      fmap (compareInterface tableVertexInterface) (reflect (checkedSpirv vertex)) `shouldBe` Right []
+      -- Any other binding beside them is a mismatch the build names.
+      fmap (map renderMismatch . compareInterface tableFragmentInterface {interfaceDescriptors = take 2 textureTableDescriptors}) (reflect (checkedSpirv fragment))
+        `shouldBe` Right ["descriptor set 1, binding 0 (StorageBuffer) is present in the shader but undeclared"]
 
     it "report a stage mismatch, in both directions, when a description is for the other stage" $ do
       fmap (compareInterface (interfaceFor VertexInterface)) (reflect verificationFragment) `shouldBe` Right [StageMismatch VertexInterface ReflectedFragment]

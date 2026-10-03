@@ -79,6 +79,18 @@ data RecordingCall
   | QueriedSupport !ImageQuery
   | CreatedView !Word64 !ViewRequest
   | DestroyedView !Word64
+  | DeclaredSetLayouts !Word64 ![Word64]
+    -- ^ The descriptor-set layouts a pipeline layout was created with, when
+    -- it holds the texture table (GRS-7).
+  | CreatedSampler !Word64 !TableSampler
+  | DestroyedSampler !Word64
+  | CreatedSetLayout !Word64 !SetLayoutRequest
+  | DestroyedSetLayout !Word64
+  | CreatedPool !Word64 !PoolRequest
+  | DestroyedPool !Word64
+  | AllocatedSet !Word64 !Word64 !Word64 !(Maybe Word32)
+    -- ^ The set, its pool, its layout, and its variable count.
+  | WroteDescriptors ![DescriptorWrite]
   deriving (Eq, Show)
 
 -- | A step the stand-in can be made to fail at.
@@ -100,6 +112,11 @@ data RecordingStep
   | AtDestroyView
   | AtWriteMapped
     -- ^ A write into mapped memory: one that fails writes nothing.
+  | AtCreateSampler
+  | AtCreateSetLayout
+  | AtCreatePool
+  | AtAllocateSet
+  | AtWriteDescriptors
   deriving (Eq, Ord, Show)
 
 -- | What a failing step raises, after recording the call.
@@ -157,9 +174,12 @@ standInMaxFramebuffer ∷ (Word32, Word32)
 standInMaxFramebuffer = (16384, 16384)
 
 -- | What the device allows pipeline interfaces and mapped memory unless an
--- example says otherwise: Vulkan's required minimums, and a 64-byte atom.
+-- example says otherwise: Vulkan's required minimums — with the descriptor
+-- indexing the profile requires for the texture table's update-after-bind
+-- limits, and the largest minimum storage-buffer offset alignment Vulkan
+-- permits — and a 64-byte atom.
 standInRecordingLimits ∷ RecordingLimits
-standInRecordingLimits = RecordingLimits 128 16 16 2048 2047 64 16384
+standInRecordingLimits = RecordingLimits 128 16 16 2048 2047 64 16384 500000 500000 500000 4 256 134217728
 
 -- | Have the device allow pipeline interfaces and mapped memory this from now
 -- on.
@@ -238,9 +258,10 @@ fresh standIn = atomically $ do
 recordingStandInOps ∷ RecordingStandIn → RecordingOps Int Word64
 recordingStandInOps standIn =
   RecordingOps
-    { opsCreatePipelineLayout = \_ ranges → do
+    { opsCreatePipelineLayout = \_ layouts ranges → do
         handle ← fresh standIn
         step standIn AtCreateLayout (CreatedLayout handle)
+        when (not (null layouts)) (journal standIn (DeclaredSetLayouts handle layouts))
         when (not (null ranges)) (journal standIn (DeclaredRanges handle ranges))
         pure handle
     , opsDestroyPipelineLayout = \_ handle → step standIn AtDestroyLayout (DestroyedLayout handle)
@@ -303,4 +324,20 @@ recordingStandInOps standIn =
         handle ← fresh standIn
         handle <$ step standIn AtCreateView (CreatedView handle request)
     , opsDestroyView = \_ handle → step standIn AtDestroyView (DestroyedView handle)
+    , opsCreateSampler = \_ sampler → do
+        handle ← fresh standIn
+        handle <$ step standIn AtCreateSampler (CreatedSampler handle sampler)
+    , opsDestroySampler = \_ handle → journal standIn (DestroyedSampler handle)
+    , opsCreateSetLayout = \_ request → do
+        handle ← fresh standIn
+        handle <$ step standIn AtCreateSetLayout (CreatedSetLayout handle request)
+    , opsDestroySetLayout = \_ handle → journal standIn (DestroyedSetLayout handle)
+    , opsCreateDescriptorPool = \_ request → do
+        handle ← fresh standIn
+        handle <$ step standIn AtCreatePool (CreatedPool handle request)
+    , opsDestroyDescriptorPool = \_ handle → journal standIn (DestroyedPool handle)
+    , opsAllocateSet = \_ pool layout count → do
+        handle ← fresh standIn
+        handle <$ step standIn AtAllocateSet (AllocatedSet handle pool layout count)
+    , opsWriteDescriptors = \_ writes → step standIn AtWriteDescriptors (WroteDescriptors writes)
     }
