@@ -287,6 +287,9 @@
 -- every queued command as 'Hetoimasia.GLFW.Command.NotExecuted', closes every
 -- window's input feed, ending its reads without awaiting any reset
 -- acknowledgement, and closes the application's demand slot and every window's.
+-- On a host composed with a graphics owner the same transaction then closes the
+-- owner's publications — its lifetime port, its demand and scene snapshots, and
+-- every observation slot — and stops, retires, and joins nothing.
 -- It does not disable wake support: a retained port or publisher answers a typed
 -- rejection and makes no native call, while the progress that still has to
 -- happen keeps its own capability. A window whose creation was claimed before

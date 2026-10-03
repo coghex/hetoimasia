@@ -191,14 +191,14 @@ These instructions are also the authority for Claude sessions through CLAUDE.md.
   target repository; never mistake `~/work/kanban` for this project's tracker.
 - Existing authorization carries across turns. Complete authorized local work
   before asking for any additional decision needed to publish it.
-- Keep each issue's implementation, required docs, evidence, and validation in
-  the same worktree and PR. Use `Closes #N` when that PR completes the issue.
-- Standalone documentation may use a `docs-wip` worktree, resolved by branch.
-  This is separate from documentation accompanying implementation.
-- User-requested standalone documentation lands through the vendored
-  `tools/docs_land.sh` and the installed `kanban:push-docs` skill. Inventory and
-  dry-run the selection first; stop on warnings or refusals. Never use this
-  lane for documentation required by a code change. See workflow.md.
+- Keep each issue's implementation and validation in its worktree and PR. Use
+  `Closes #N` when that PR completes the issue.
+- Documentation is tracked but never gated on CI or review: land it on
+  `master` with `docs-push [-m "message"] <paths...>` from any worktree,
+  including the docs, evidence write-ups and verdicts an issue requires. Link
+  them from the PR and finish them before its final review. Markdown that
+  tests or tools read (`MEMORY.md`, the Vulkan records) stays in the PR;
+  `docs-push` refuses it. See workflow.md.
 - Follow the selected Kanban workflow's claim and opposite-agent review gates.
   A label alone is not proof of a fresh approval. Do not self-approve or merge
   on your own initiative; the installed drainer or explicitly requested

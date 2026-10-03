@@ -118,8 +118,9 @@ finishOwnerExit observed restore logger host owner = do
     (True, Just LatchedByRunEnd) →
       -- The sentinel raised the failure that ended the run, which is exactly
       -- what the worker's outcome carries, so this exit reports none of that
-      -- outcome. Nothing distinct is lost with it: whatever the drain found
-      -- is retained inside that same outcome, and the group's own scope —
+      -- outcome. Nothing distinct is lost with it: whatever the drain found,
+      -- and a failure of the run's final wake, is retained inside that same
+      -- outcome, and the group's own scope —
       -- which closes after this exit, outside the protected host lifetime —
       -- reports it there. Re-raising it here would retain a second copy of
       -- each, under a fresh identity that inspection cannot fold together.

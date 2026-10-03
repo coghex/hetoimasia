@@ -11,6 +11,7 @@
 module Hetoimasia.Runtime.GLFW.Internal.Owner.Drain
   ( OwnerDrain
   , ownerDrain
+  , absorbOwnerFailure
   , settleOwnerOutcome
   , raiseRetainingOwner
   ) where
@@ -170,6 +171,9 @@ owedRetirementFallback = either (error . show) id (durationFromNanoseconds Requi
 
 -- | Keep a synchronous failure; defer the first cancellation and absorb the
 -- rest, so repeated cancellation cannot cut the drain short.
+--
+-- The run action folds its final wake's failure in through this too, after the
+-- drain's own, so the wake follows the same policy as every drain operation.
 absorbOwnerFailure ∷ ExceptionWithContext SomeException → OwnerDrain → OwnerDrain
 absorbOwnerFailure caught@(ExceptionWithContext _ failure) accumulated
   | isAsynchronous failure =

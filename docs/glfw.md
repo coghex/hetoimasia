@@ -2994,7 +2994,9 @@ closes every window's input feed, ending its reads even while a reset waits for
 an acknowledgement, and closes the application's demand slot and every window's.
 On a protected host the same step also ends new graphics use: no later
 attachment is admitted, and every attachment still registering or active begins
-retiring. It destroys nothing, pumps nothing, makes no GPU call, waits on
+retiring. On a host composed with a graphics owner it then closes the owner's
+publications too ([The exit, which is D-33's](#the-exit-which-is-d-33s), step
+1). It destroys nothing, pumps nothing, makes no GPU call, waits on
 nothing, and repeating it changes nothing. A window's close protocol closes that window's feed and its demand slot
 in its closing transaction the same way.
 
@@ -4140,8 +4142,18 @@ this layer's; the Vulkan backend's is in
 A whole-session exit runs in this order:
 
 1. quiescence closes the host's admission — commands, demand, input and new
-   graphics use — and then the owner's own lifetime port, in that order, so an
-   attachment that got past admission always found the port open;
+   graphics use — and then the owner's own publications: its lifetime port,
+   its demand and scene snapshots and every observation slot. Both close in the
+   host's one `quiesceWindowHost` transaction, the host's first, so an
+   attachment that got past admission always found the port open. That is the
+   transaction the application's pre-drain quiescence commits, so from it on
+   every escaped owner endpoint refuses, `targetEventsOpen` reads `False`, and
+   the gate a backend derives from it refuses, before any ordinary worker is
+   asked to stop and without waiting for the owner. It stops, retires and joins
+   nothing: the owner keeps running, events already queued on the port stay for
+   it to account for, completion evidence stays publishable, and the protected
+   exit's own close, in step 3's drain, finds the publications already closed
+   and only asks the owner to stop;
 2. ordinary application workers stop and drain, which is the runtime's own
    ordering. The owner's worker group is the component's, separate from the
    application's ordinary group and from the diagnostics worker, so the
@@ -4235,6 +4247,16 @@ on which failure it is, and the split is deliberate:
 | A target's construction or retirement, which the owner caught and carried on from | `readOwnerFailures`, with the context it propagated with | Retained beside whatever else the exit found |
 | The owner's own startup, step, or deadline, which ended its run | The worker's own outcome | Read back from the joined group's report |
 | Its whole-owner retirement or destruction, which its drain absorbed | The worker's own outcome, through the drain it settles into | Read back from the same report |
+| Its final wake — the one post-drain `wakeGraphicsHost` that tells the main thread its run has ended — when that raises rather than degrading | The worker's own outcome, folded into the drain's failures after them, in attempt order | Read back from the same report |
+
+The worker's outcome keeps a run failure primary and retains each distinct
+drain failure, and then the final wake's, beside it under the owner's
+retirement cleanup label. After a successful run the first of them in attempt
+order is primary, and a wake failure alone is reported as itself. The wake is
+attempted once and never retried, and its notification obligation is
+discharged before it can raise, so the exit never waits on it. A wake that
+degrades with the expected platform error raises nothing and is reported only
+by the host's own wake report, as before.
 
 A failure that ends the run is not put in the retained store, because the run
 ending is how it is already reported: the worker's outcome carries it, the
@@ -4260,7 +4282,7 @@ the one store entry that is that same failure:
 | The latch came from | What the exit leaves out once the sentinel has delivered |
 |---|---|
 | A target failure the owner survived | The first entry of `readOwnerFailures`, which is that failure — `retainFailure` latches only when nothing is latched yet and appends in the same transaction. Every later retained failure is still reported. |
-| The failure that ended the run | The whole of the worker's outcome, which is that failure. Nothing distinct goes with it: whatever the drain found is retained inside that same outcome, and the owner group's own scope — which closes after the exit, outside the protected host lifetime — reports it there. |
+| The failure that ended the run | The whole of the worker's outcome, which is that failure. Nothing distinct goes with it: whatever the drain found, and a failure of the final wake, is retained inside that same outcome, and the owner group's own scope — which closes after the exit, outside the protected host lifetime — reports it there. |
 
 Re-raising either would retain a second copy under a fresh identity that
 inspection cannot fold together with the first. A composition that registers

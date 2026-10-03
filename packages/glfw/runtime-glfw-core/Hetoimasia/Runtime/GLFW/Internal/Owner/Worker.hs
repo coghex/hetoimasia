@@ -25,7 +25,7 @@ import qualified Data.Set as Set
 import Hetoimasia.Foundation.Time (Instant, deadlineReached, readInstant, remainingUntil)
 import Hetoimasia.Foundation.Worker (StopToken, stopRequested)
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Config (GraphicsOwnerConfig (..), OwnerTimer (..))
-import Hetoimasia.Runtime.GLFW.Internal.Owner.Drain (ownerDrain, settleOwnerOutcome)
+import Hetoimasia.Runtime.GLFW.Internal.Owner.Drain (absorbOwnerFailure, ownerDrain, settleOwnerOutcome)
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Evidence (HasEvidence (..))
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Handoff
   ( OwnerPhase (OwnerRunning)
@@ -95,8 +95,14 @@ runOwnerAction owner token = mask $ \restore → do
   started ← readTVarIO (ownerStarted owner)
   drained ← ownerDrain owner restore started
   atomically (recordOwnerEnded (ownerHandoff' owner))
-  wakeGraphicsHost owner
-  settleOwnerOutcome outcome drained
+  -- The final wake is the last thing the run attempts, so a failure of its own
+  -- joins the drain's, after them, rather than replacing the outcome they
+  -- settle into: the body's failure stays primary and every distinct failure
+  -- is retained beside it. A cancellation that lands here is deferred exactly
+  -- as the drain defers one. It is attempted once and never retried, and its
+  -- notification obligation is discharged before it can raise.
+  woke ← tryWithContext (wakeGraphicsHost owner)
+  settleOwnerOutcome outcome (either (`absorbOwnerFailure` drained) (const drained) woke)
 
 -- | The owner's own body: start the backend, then take rounds until a stop.
 ownerRun ∷ GraphicsOwner scene → StopToken → IO ()

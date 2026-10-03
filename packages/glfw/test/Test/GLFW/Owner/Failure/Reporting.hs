@@ -5,6 +5,7 @@ module Test.GLFW.Owner.Failure.Reporting (spec) where
 import Control.Concurrent.STM
   ( atomically
   , check
+  , modifyTVar'
   , newTVarIO
   , readTVarIO
   , writeTVar
@@ -15,12 +16,14 @@ import Control.Exception
   , fromException
   , throwIO
   )
-import Control.Monad (forM_, void)
+import Control.Monad (forM_, void, when)
 import Data.Maybe (isJust)
 import qualified Data.Text as Text
 import Hetoimasia.Foundation.Messaging.Payload (prepare)
 import Hetoimasia.Foundation.Resource (cleanupFailureException, cleanupFailures)
 import qualified Hetoimasia.Foundation.Worker as Worker
+import Hetoimasia.GLFW.Internal.Seam (Reporter, reportError)
+import Hetoimasia.GLFW.Session (NativeError (..), NativeFailure (..), Reports (..))
 import Hetoimasia.Runtime.GLFW
 import Hetoimasia.Runtime.Supervision
   ( SupervisedStart (..)
@@ -40,7 +43,7 @@ import Test.GLFW.Owner.Fixture.Fake (Fake (..), script)
 import Test.GLFW.Owner.Fixture.Journal (Scripted (..))
 import Test.GLFW.Owner.Fixture.Rig (Rig (..), newRig, ownedHostCaught)
 import Test.GLFW.Support (boundedExample, unexpected)
-import Test.Hspec (Spec, it, shouldBe, shouldReturn)
+import Test.Hspec (Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy)
 
 spec ∷ Spec
 spec = do
@@ -54,6 +57,20 @@ spec = do
     (boundedExample testSupervisedRetainedFailureReportedOnce)
   it "suppresses nothing for a sentinel that was cancelled before it delivered"
     (boundedExample testUndeliveredSentinelSuppressesNothing)
+  describe "when the owner's final wake raises" $ do
+    forM_ [(False, "without supervision"), (True, "under supervision")] $ \(supervised, how) → do
+      it ("keeps the body's failure primary and retains the retirement and an unexpected wake failure, " <> how)
+        (boundedExample (testFinalWake supervised (failedRun unexpectedWake)))
+      it ("keeps them when the seam's own wake raises an exception of its own, " <> how)
+        (boundedExample (testFinalWake supervised (failedRun raisingWake)))
+      it ("makes a drain failure primary after a successful body and retains the wake's, " <> how)
+        (boundedExample (testFinalWake supervised (succeededRun True unexpectedWake)))
+      it ("reports the wake's failure itself when it is the only one, " <> how)
+        (boundedExample (testFinalWake supervised (succeededRun False raisingWake)))
+      it ("changes nothing when the final wake is healthy, " <> how)
+        (boundedExample (testFinalWake supervised (failedRun healthyWake)))
+      it ("changes nothing when the final wake degrades with the expected platform error, " <> how)
+        (boundedExample (testFinalWake supervised (failedRun degradedWake)))
 
 -- | A failure the owner retained while it kept running is reported exactly
 -- once, not once as the exit's own primary and again as its retained cleanup.
@@ -221,14 +238,138 @@ testUndeliveredSentinelSuppressesNothing = do
   fromException caught `shouldBe` Just (Scripted (Text.pack "fatal step"))
   occurrencesOf (Scripted (Text.pack "fatal step")) caught `shouldBe` 1
 
+-- | One final-wake case: what the run, the drain and the owner's last wake do,
+-- and what the reported failures must then hold.
+data FinalWake = FinalWake
+  { wakeBodyFails ∷ !Bool
+    -- ^ Whether the owner's own run fails, at startup.
+  , wakeRetirementFails ∷ !Bool
+    -- ^ Whether whole-owner retirement fails in the drain.
+  , wakeScript ∷ !(Reporter → IO ())
+    -- ^ What the final wake's empty-event post does.
+  , wakePrimary ∷ !(SomeException → Bool)
+  , wakeCounted ∷ ![(String, SomeException → Bool, Int)]
+    -- ^ Each original failure, and how many times it must be reported.
+  }
+
+-- | A run that fails at startup and a whole-owner retirement that fails, with
+-- destruction succeeding and no target attached, ending in this final wake.
+failedRun ∷ (Reporter → IO (), Maybe (String, SomeException → Bool)) → FinalWake
+failedRun (wake, wakeFailure) =
+  FinalWake
+    { wakeBodyFails = True
+    , wakeRetirementFails = True
+    , wakeScript = wake
+    , wakePrimary = is startupFailure
+    , wakeCounted =
+        [("startup", is startupFailure, 1), ("retire owner", is retirementFailure, 1)]
+          <> maybe [] (\(name, matches) → [(name, matches, 1)]) wakeFailure
+    }
+
+-- | A run that succeeds, optionally a whole-owner retirement that fails, and
+-- this final wake, which fails.
+succeededRun ∷ Bool → (Reporter → IO (), Maybe (String, SomeException → Bool)) → FinalWake
+succeededRun retirement (wake, wakeFailure) =
+  FinalWake
+    { wakeBodyFails = False
+    , wakeRetirementFails = retirement
+    , wakeScript = wake
+    , wakePrimary = if retirement then is retirementFailure else maybe (const False) snd wakeFailure
+    , wakeCounted =
+        [("startup", is startupFailure, 0), ("retire owner", is retirementFailure, if retirement then 1 else 0)]
+          <> maybe [] (\(name, matches) → [(name, matches, 1)]) wakeFailure
+    }
+
+startupFailure, retirementFailure, seamWakeFailure ∷ Scripted
+startupFailure = Scripted (Text.pack "startup")
+retirementFailure = Scripted (Text.pack "retire owner")
+seamWakeFailure = Scripted (Text.pack "wake")
+
+-- | A wake that posts and reports nothing.
+healthyWake ∷ (Reporter → IO (), Maybe (String, SomeException → Bool))
+healthyWake = (\_ → pure (), Nothing)
+
+-- | The expected platform failure, which the classifier degrades rather than
+-- raises.
+degradedWake ∷ (Reporter → IO (), Maybe (String, SomeException → Bool))
+degradedWake = (\reporter → reportError reporter 0x00010008 "final wake degraded", Nothing)
+
+-- | An error the classifier does not expect, which it raises as the wake's
+-- 'NativeFailure'.
+unexpectedWake ∷ (Reporter → IO (), Maybe (String, SomeException → Bool))
+unexpectedWake =
+  ( \reporter → reportError reporter notInitialized "final wake not initialized"
+  , Just ("the wake's NativeFailure", notInitializedWake)
+  )
+  where
+    notInitializedWake caught = case fromException caught of
+      Just (NativeFailure _ reports) → any ((== notInitialized) . nativeErrorCode) (reportedErrors reports)
+      Nothing → False
+
+-- | GLFW_NOT_INITIALIZED.
+notInitialized ∷ Int
+notInitialized = 0x00010001
+
+-- | A native operation that raises an exception of its own, which the session
+-- propagates as it is.
+raisingWake ∷ (Reporter → IO (), Maybe (String, SomeException → Bool))
+raisingWake = (\_ → throwIO seamWakeFailure, Just ("the seam's own wake failure", is seamWakeFailure))
+
+is ∷ Scripted → SomeException → Bool
+is wanted = (== Just wanted) . fromException
+
+-- | The owner's final wake fails, or is a control, and every original failure
+-- is reported exactly as often as the case says — with no sentinel, where the
+-- exit reports the worker's outcome, and with one, where the sentinel raises a
+-- failure that ended the run and the exit leaves that outcome to the group.
+--
+-- Only the final wake is scripted: whole-owner destruction, the last operation
+-- the drain attempts, arms it, and nothing posts between that and the run
+-- action's own last wake.
+testFinalWake ∷ Bool → FinalWake → IO ()
+testFinalWake supervised expected = do
+  rig ← newRig
+  when (wakeBodyFails expected) $
+    script (fakeStart (rigFake rig)) (\_ → throwIO startupFailure)
+  when (wakeRetirementFails expected) $
+    script (fakeRetireOwner (rigFake rig)) (\_ → throwIO retirementFailure)
+  woke ← newTVarIO (0 ∷ Int)
+  script (fakeDestroy (rigFake rig)) $ \_ → do
+    atomically . writeTVar (rigWake rig) $ \reporter → do
+      atomically (modifyTVar' woke (+ 1))
+      wakeScript expected reporter
+    pure (ownerDestroyed (Text.pack "destroyed"))
+  outcome ← ownedHostCaught (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \_host owner control →
+    when supervised $ do
+      started ← superviseGraphicsOwner control owner
+      case started of
+        WorkerStarted _ → pure ()
+        other → unexpected ("the sentinel did not start: " <> describeStart other)
+      when (wakeBodyFails expected) $ do
+        -- The startup failure is latched before the application's own startup,
+        -- so the sentinel delivers it at this checkpoint, as the composition's
+        -- primary failure.
+        atomically (readOwnerFailure owner >>= check . isJust)
+        checkRuntime control
+  caught ← raisedBy outcome
+  -- The scripted wake is the run action's final one, and it is attempted once.
+  readTVarIO woke `shouldReturn` 1
+  caught `shouldSatisfy` wakePrimary expected
+  forM_ (wakeCounted expected) $ \(name, matches, times) →
+    (name, occurrencesWhere matches caught) `shouldBe` (name, times)
+
 -- | How many times one failure appears in a raised exception: as the
 -- exception itself, and in every cleanup failure retained beside it.
 occurrencesOf ∷ Scripted → SomeException → Int
-occurrencesOf wanted caught =
-  length (filter (== Just wanted) (fromException caught : retained))
+occurrencesOf = occurrencesWhere . is
+
+-- | 'occurrencesOf' for any failure this recognizes.
+occurrencesWhere ∷ (SomeException → Bool) → SomeException → Int
+occurrencesWhere matches caught =
+  length (filter matches (caught : retained))
   where
     retained =
-      [ fromException (exceptionOf (cleanupFailureException failure))
+      [ exceptionOf (cleanupFailureException failure)
       | failure ← cleanupFailures caught
       ]
 

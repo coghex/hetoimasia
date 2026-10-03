@@ -20,7 +20,7 @@ module Hetoimasia.Runtime.GLFW.Internal.Host.Lifetime
   , retirementEnvironmentOf
   ) where
 
-import Control.Concurrent.STM (atomically)
+import Control.Concurrent.STM (STM, atomically)
 import Control.Exception
   ( Exception
   , ExceptionWithContext (ExceptionWithContext)
@@ -124,8 +124,9 @@ withProtectedWindowHostWith hooks = withProtectedHostOver hooks noProtectedExit
 -- retire for it.
 --
 -- It is the one extension point the protected exit has, and it is deliberately
--- narrow: an interposed lifetime is given the host and the boundary's own
--- @restore@, at exactly two points in an order it cannot change.
+-- narrow: an interposed lifetime closes its own admission inside the host's
+-- quiescence transaction, and is given the host and the boundary's own
+-- @restore@ at exactly two later points, in an order it cannot change.
 -- "Hetoimasia.Runtime.GLFW.Internal.Owner.Lifetime" is its only production
 -- caller, for the graphics owner D-33 keeps alive across the attachment drain.
 --
@@ -165,7 +166,7 @@ withProtectedHostOver hooks exit logger sessionScope config use =
   -- 'allocWindowHost', which already acquires under a mask of its own, and the
   -- consumer is lent the restore.
   mask $ \restore →
-    withScoped (allocHostOver Protected hooks sessionScope config) $ \host → do
+    withScoped (allocHostOver Protected hooks (exitQuiescence exit) sessionScope config) $ \host → do
       -- Inside the handler, so an attachment this makes is drained however it
       -- then fails; the consumer follows it on the same protected path.
       outcome ← tryWithContext (restore (beforeConsumer hooks host >> use host))
@@ -173,17 +174,25 @@ withProtectedHostOver hooks exit logger sessionScope config use =
 
 -- | What an additive lifetime interposes on the protected host's exit.
 --
--- Both run on the owner thread, inside the boundary's own mask and after the
--- host's quiescence, and both are given the boundary's @restore@ so the parts
--- of them that must stay interruptible can be. Neither may release a window,
--- the session, or a parent: the boundary still owns that, and still does it
--- last.
+-- The quiescence step commits inside 'quiesceWindowHost', on whichever thread
+-- runs it. The other two run on the owner thread, inside the boundary's own
+-- mask and after the host's quiescence, and both are given the boundary's
+-- @restore@ so the parts of them that must stay interruptible can be. None may
+-- release a window, the session, or a parent: the boundary still owns that,
+-- and still does it last.
 --
--- A failure either raises is retained beside the drain's own, under the same
--- @glfw protected retirement@ label, and never replaces a failure the body
--- already raised.
+-- A failure either IO step raises is retained beside the drain's own, under
+-- the same @glfw protected retirement@ label, and never replaces a failure the
+-- body already raised.
 data ProtectedExit = ProtectedExit
-  { exitBeforeDrain ∷ WindowHost → (∀ a. IO a → IO a) → IO ()
+  { exitQuiescence ∷ STM ()
+    -- ^ In the host's own quiescence transaction, after the host's admission
+    -- has closed. It runs wherever that transaction runs — at the
+    -- application's pre-drain quiescence, before any ordinary worker is asked
+    -- to stop, and again, idempotently, at this boundary — so it must be
+    -- finite, non-retrying, and idempotent, and it may only close admission:
+    -- it stops, retires, and joins nothing.
+  , exitBeforeDrain ∷ WindowHost → (∀ a. IO a → IO a) → IO ()
     -- ^ After the host's quiescence has closed every admission, and before the
     -- attachment drain begins. This is where an interposed lifetime closes its
     -- own admission and asks its own workers to stop.
@@ -197,7 +206,7 @@ data ProtectedExit = ProtectedExit
 -- | An exit that interposes nothing, which is what every existing constructor
 -- passes.
 noProtectedExit ∷ ProtectedExit
-noProtectedExit = ProtectedExit (\_ _ → pure ()) (\_ _ → pure ())
+noProtectedExit = ProtectedExit (pure ()) (\_ _ → pure ()) (\_ _ → pure ())
 
 -- | 'runWindowApplication' over a protected host lifetime.
 --

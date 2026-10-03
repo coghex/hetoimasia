@@ -19,6 +19,9 @@ import Data.List (isSubsequenceOf)
 import Data.Maybe (isJust, isNothing)
 import System.Timeout (timeout)
 
+import Hetoimasia.Foundation.Log (unsafeComponent)
+import Hetoimasia.Foundation.Recovery (Disposition (Required))
+import Hetoimasia.Foundation.Worker (awaitStopRequest, workerDefinition)
 import Hetoimasia.GLFW.Command (clientDemandPublisher)
 import Hetoimasia.GLFW.Demand (immediateDemand, publishDemand)
 import Hetoimasia.GLFW.Window (WindowId)
@@ -57,7 +60,14 @@ import Hetoimasia.Runtime.GLFW
   , releaseGraphicsTarget
   , superviseGraphicsOwner
   )
-import Hetoimasia.Runtime.Supervision (RuntimeControl, checkRuntime)
+import Hetoimasia.Runtime.Supervision
+  ( Recognition (Unrecognized)
+  , Role (Service)
+  , RuntimeControl
+  , WorkerPolicy (..)
+  , checkRuntime
+  , startSupervised
+  )
 import Test.GPU.Vulkan.GLFW.StandIn
 import Test.Hspec (Expectation, Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
 
@@ -77,6 +87,7 @@ spec = describe "Vulkan surface-free sessions and owner-thread actions" $ do
     it "settle the ticket with a failure setting the construction up before that failure ends the owner's run" (bounded testSetupFailure)
     it "are refused after the session's terminal failure, including one queued before it that never started" (bounded testTerminalRefusal)
     it "are refused once the owner's exit begins, including one queued behind a running action, which finishes" (bounded testExitRefusal)
+    it "are refused at the application's pre-drain quiescence, while a worker drains, a queued one without waiting for the owner, and a running one finishes" (bounded testQuiescenceRefusal)
     it "never run beside a frame's rendering: a frame asked for meanwhile follows the action" (bounded testSerialization)
     it "create a buffer and an image of every kind through the lent construction on the owner's thread, and release them for the owner to destroy, each view before its image" (bounded testBuffersAndImages)
 
@@ -328,6 +339,46 @@ testExitRefusal = do
   fmap outcomeValue finished `shouldBe` Just (Right ())
   after ← atomically (submitVulkanAction (vulkanController host) (VulkanAction (\_ → pure ())))
   refusalOf after `shouldBe` Just ActionOwnerClosed
+
+-- | The application's own pre-drain quiescence is the boundary that refuses
+-- owner-thread actions, not the protected exit after the ordinary drain.
+--
+-- An ordinary supervised worker looks while it is held in the supervision
+-- drain, with a running action holding the owner's thread: the action queued
+-- behind it already reads as refused — the worker reads its ticket and does
+-- not wait — and a new one is refused at admission, while the running one has
+-- still not returned. Only then does the worker let it finish.
+testQuiescenceRefusal ∷ IO ()
+testQuiescenceRefusal = do
+  rig ← surfaceFreeRig 0
+  answers ← newTVarIO Nothing
+  (gate, running, holding) ← holdingAction
+  ticket ← runRig rig $ \host control → do
+    awaitReady host
+    held ← admitted =<< atomically (submitVulkanAction (vulkanController host) holding)
+    atomically (readTVar running >>= check)
+    behind ← admitted =<< atomically (submitVulkanAction (vulkanController host) (VulkanAction (\_ → pure ())))
+    let watcher =
+          workerDefinition
+            "quiescence watcher"
+            (\_ → pure ())
+            ( \token () → do
+                atomically (awaitStopRequest token)
+                queued ← atomically (readVulkanAction behind)
+                late ← atomically (submitVulkanAction (vulkanController host) (VulkanAction (\_ → pure ())))
+                stillRunning ← isNothing <$> atomically (readVulkanAction held)
+                atomically $ do
+                  writeTVar answers (Just (fmap outcomeText queued, refusalOf late, stillRunning))
+                  writeTVar gate True
+            )
+    _ ← startSupervised control (WorkerPolicy Service Required (unsafeComponent "test.vulkan-actions") (\_ → pure Unrecognized)) watcher
+    pure held
+  readTVarIO answers
+    `shouldReturnValue` Just (Just (outcomeText (ActionRefused @() ActionOwnerClosed)), Just ActionOwnerClosed, True)
+  finished ← atomically (readVulkanAction ticket)
+  fmap outcomeValue finished `shouldBe` Just (Right ())
+  events ← journal rig
+  events `shouldSatisfy` isSubsequenceOf [DeviceDestroyed, MessengerDestroyed, InstanceDestroyed, SessionEnded]
 
 testSerialization ∷ IO ()
 testSerialization = do

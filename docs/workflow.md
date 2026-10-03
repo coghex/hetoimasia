@@ -11,7 +11,8 @@ Use them from interactive CLI sessions as the owner requests.
 The owner authorized the initial bootstrap on `master`. `origin` is
 `https://github.com/coghex/hetoimasia.git`, matching the local project name.
 The owner corrected the repository-name typo during setup; the new target was empty.
-Local standalone design work uses a `docs-wip` worktree.
+Documentation lands directly on `master` with `docs-push` (see "Worktrees and
+documentation").
 GitHub Actions runs the validation pipeline described in
 [validation.md](validation.md): `plan` resolves the candidate's groups,
 `haskell-engine`, `haskell-workflow`, and `glfw-native` execute the selected ones, and
@@ -101,36 +102,31 @@ the installed `kanban:drain-prs` skill owns drainer control. Always target
 ## Worktrees and documentation
 
 After the initial commit, keep the primary checkout clean and implement in
-isolated worktrees. Resolve an existing docs worktree by its `docs-wip` branch.
-Standalone design/report work may accumulate there. Documentation accompanying
-code belongs in the code worktree and PR, regardless of its extension.
+isolated worktrees.
 
-The repository vendors `tools/docs_land.sh` and its Python path checker from
-Kanban; [the provenance and local adaptation](../tools/README.md) are tracked
-with them. `AGENTS.md` remains a regular authoritative document; `CLAUDE.md`
-continues to direct Claude sessions to it.
+Documentation is tracked but never gated on CI or review. Land it on `master`
+with `docs-push [-m "message"] <paths...>` from any worktree as soon as it is
+ready: design and report work, guide and project-review ledgers, and the
+documentation, evidence write-ups and verdicts that go with a code change. A
+pull request links its documentation (`Docs: docs/x.md @ <commit>`) instead of
+containing it, so a documentation fix never costs a re-review or a CI run.
 
-After the owner requests standalone documentation publication, use the installed
-`kanban:push-docs` skill. The helper resolves `docs-wip` and `master` by branch,
-lands only named Markdown paths, verifies publication to `origin/master`, and
-fast-forwards the clean primary checkout. A refusal or warning needs resolution
-before publication. For inspection from the primary checkout:
+Markdown that tests or tools read is code and stays in the pull request: here
+the Vulkan records (`docs/vulkan/`, `docs/vulkan_compatibility_record.md`,
+`tools/vulkan-proof/README.md`), which `VulkanProof.hs` checks, and
+`MEMORY.md`, which the validation plan step reads. `docs-push` refuses those and
+says why.
 
-```sh
-tools/docs_land.sh -h
-tools/docs_land.sh -l
-tools/docs_land.sh -n -m "docs: describe the selected change" docs/example_design.md
-```
+`docs-push` merges a stale copy with newer upstream edits and publishes nothing
+on a real conflict: run `docs-push --get <path>`, redo the edit on that copy,
+and push again. A `docs-wip` worktree is optional scratch for drafts that are
+not ready; nothing needs to accumulate there.
 
-The last command illustrates a selection; replace the example path with the
-actual approved document. Remove `-n` only after the dry run succeeds.
-The helper accepts Markdown paths when no publication classification contract
-exists, as here; callers must still enforce the standalone-task boundary.
-
-Design-processing and report helpers ship inside the plugins. Locate those
-installed copies as the skills instruct; do not expect copies in this project's
-`tools/` directory. No unattended document-publication path is configured here;
-approved ledger changes can accumulate in `docs-wip` for a requested batch landing.
+`AGENTS.md` remains a regular authoritative document; `CLAUDE.md` continues to
+direct Claude sessions to it. The vendored `tools/docs_land.sh` and its path
+checker ([provenance](../tools/README.md)) are superseded by `docs-push` and
+kept only until they are removed. Design-processing and report helpers ship
+inside the plugins; locate those installed copies as the skills instruct.
 
 ## Local checks
 

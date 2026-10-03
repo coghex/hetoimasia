@@ -2434,7 +2434,11 @@ quiescence, never left waiting. Nor does anything wait for an owner-thread
 action the exit will never run: quiescence's closing of the owner's
 publications is also what refuses every queued action that has not started,
 before ordinary workers drain, so a worker awaiting one is answered and can
-drain ([Owner-thread actions](#owner-thread-actions)).
+drain ([Owner-thread actions](#owner-thread-actions)). That closing is part of
+the host's own quiescence transaction, which the application's pre-drain
+quiescence commits ([The exit, which is D-33's](glfw.md#the-exit-which-is-d-33s)),
+so the action gate, which follows the owner's lifetime port, closes there and
+not at the protected exit after the ordinary drain.
 
 ### During a main-thread stall
 
