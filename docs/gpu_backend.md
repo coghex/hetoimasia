@@ -2210,9 +2210,14 @@ asked for and the limit, and nothing is made:
   buffer) against `maxPerStageUpdateAfterBindResources`;
 - the two sets against `maxBoundDescriptorSets`;
 - one version's bytes against `maxStorageBufferRange`;
+- the last version's dynamic offset against what 32 bits hold;
 - the whole ring against the largest buffer the device makes.
 
-Then, in order, it makes:
+Like all new work, making the table is refused once the session has failed.
+
+Then, in order, it makes the following. Each sampler, set layout and pool
+is a managed generation of its own, made by one creation that never rolls
+anything else back:
 
 1. **Four immutable samplers**, in index order: nearest/clamp-to-edge,
    nearest/repeat, linear/clamp-to-edge and linear/repeat (`TableSampler`).
@@ -2226,8 +2231,9 @@ Then, in order, it makes:
    update-after-bind set may not hold a dynamic buffer
    (`VUID-VkDescriptorSetLayoutCreateInfo-flags-03000`), which is D-35's
    reason for a second set.
-4. **A pool and a set for each.** Set 0's pool is update-after-bind, and its
-   set is allocated with the initial size as its variable count.
+4. **A pool for each set, then the set.** Set 0's pool is update-after-bind,
+   and its set is allocated with the initial size as its variable count.
+   Each set is allocated after its pool exists and is freed with it.
 5. **The version ring**: one host-visible lookup buffer, made and mapped as
    the uploads' staging buffer is (`createMapped`). One version is the
    initial size's lookup entries of eight bytes each, a little-endian slot
@@ -2239,8 +2245,10 @@ Then, in order, it makes:
 7. **Slot 0's placeholder**: a one-by-one transparent-black RGBA8 texture,
    whose upload is admitted through the session's uploads.
 
-If any step is refused or raises, everything made so far is released. The
-table can be bound once the placeholder's upload has completed and its
+If any step is refused or raises, every generation made so far is
+released, and the ordinary disposal destroys it. A destruction that raises
+is retained, never retried, and fails the session with `CleanupFailed`, as
+for any managed resource. The table can be bound once the placeholder's upload has completed and its
 descriptor has been written; until then binding is `RefusedNotWritten`.
 
 **Handles.** `registerTexture recording image` takes a live `TextureImage`
@@ -2300,14 +2308,20 @@ only a slot that no recorded or pending batch can sample:
 
 So a batch recorded before a texture is released or replaced still samples
 the original image when it is submitted later. The image, its view and its
-allocation stay held until that batch completes, because its version keeps
-the slot retiring and the image unreleased. A texture released before its
+allocation stay held until that batch completes: its version keeps the slot
+retiring, and the batch itself retains every image its version maps
+([Binding and drawing](#the-texture-table)), so not even retirement destroys
+them while it is outstanding. A texture released before its
 upload completes was never written into a version, so its slot is reclaimed
 at once. Its image is released after that upload settles.
 
 **Bringing it up to date.** `refreshTable` writes the placeholder once its
 upload completes and writes each newly complete texture into its slot. It
 then reclaims every retiring slot no live version maps, releasing its image.
+Once the session has failed, or while a diagnostic failure is pending, it
+writes nothing, since that is new work. Reclamation still runs, since that
+is cleanup. `registerTexture` and `createTablePipelineLayout` are refused
+then too, while `releaseTexture` is not.
 It runs:
 
 - before every binding;
@@ -2322,7 +2336,9 @@ makes a pipeline layout holding both of the table's set layouts, from set 0
 on, and exactly the checked shaders' push-constant ranges. Its shaders may
 declare the table's own bindings (`textureTableDescriptors`): set 0's four
 samplers at binding 0 and runtime-sized image array at binding 1, and set
-1's storage buffer at binding 0. They may declare no other binding. A layout
+1's storage buffer at binding 0. They may declare no other binding. Set 0
+is visible to the fragment stage alone, so a vertex shader declaring set 0's
+samplers or images is refused; set 1 is visible to both stages. A layout
 from `createPipelineLayoutFor` declares no set, so a shader declaring any
 descriptor binding is refused there. The sampler offset must be a multiple
 of four and lie whole within a fragment-stage range. Refused before any
@@ -2336,8 +2352,9 @@ native call:
 pipeline's layout, with the dynamic offset of the batch's version, through
 `vkCmdBindDescriptorSets`. A batch takes its version at its first binding
 and keeps it: a later binding in the same batch, after any change, binds the
-same version. The batch retains the version generation and the table's
-samplers, set layouts, pools and lookup buffer. `selectSampler recorder n`
+same version. The batch retains the version generation, the table's
+samplers, set layouts, pools and lookup buffer, the placeholder and every
+image its version maps. `selectSampler recorder n`
 pushes `n` at the layout's declared sampler offset. Binding a pipeline whose
 layout does not hold the table disturbs the binding and the sampler, so the
 table's pipeline needs both again. Refused with no native call:
@@ -2348,7 +2365,11 @@ table's pipeline needs both again. Refused with no native call:
   under a pipeline without the table;
 - a push over the sampler index's four bytes;
 - a draw with a table pipeline before the table is bound under a compatible
-  layout, or before a sampler is selected.
+  layout, or before a sampler is selected;
+- a draw through the table while the batch holds an image its version maps
+  in a use other than sampling, for example after moving a texture to a
+  transfer use, until the batch moves it back;
+- any binding once the session has failed.
 
 **The shaders.** `tableShaders` (in `Recording.Shaders`) are the reference
 pair the native case draws with. The vertex shader covers the render area
@@ -2411,10 +2432,21 @@ cover:
 - stale handles;
 - a release before the upload completes;
 - a discarded batch's version freed;
-- the record-then-release case.
+- the record-then-release case;
+- every image a batch's version maps kept through retirement, with the
+  batch recorded and with it submitted;
+- a draw refused while a mapped texture is in a transfer use;
+- a vertex shader declaring set 0 refused, and one declaring set 1
+  admitted;
+- the largest dynamic offset checked before anything is made;
+- new table work refused, and nothing written, after the session fails,
+  while a release still completes;
+- a construction failing part-way leaving only whole generations, whose
+  failed destruction is retained and fails the session.
 
 A mutation check that ignored version holds failed the three hold-dependent
-examples. The device-profile examples refuse a device missing any of the six
+examples, and one that left the version's images out of the batch's
+references failed the retirement example. The device-profile examples refuse a device missing any of the six
 features, by name. The shader suite checks that `tableShaders`' SPIR-V
 declares exactly the table's three bindings and matches its descriptions.
 
