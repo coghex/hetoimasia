@@ -42,7 +42,7 @@ import qualified Data.Set as Set
 import Data.Set (Set)
 import Hetoimasia.GPU.Model.Internal.Budget (BudgetKind, Budgets)
 import Hetoimasia.GPU.Model.Internal.Identity
-import Hetoimasia.GPU.Model.Internal.Records (Batch, Resource, Submission, SubjectKey, Target)
+import Hetoimasia.GPU.Model.Internal.Records (Batch, FramelessSlot, Resource, Submission, SubjectKey, Target)
 import Hetoimasia.GPU.Model.Internal.Recovery (AllocationAttempt, BackoffState, freshBackoff)
 import Numeric.Natural (Natural)
 
@@ -124,6 +124,10 @@ data GpuModel = GpuModel
   , gpuNextTarget ∷ !Natural
   , gpuBatches ∷ !(Map Natural Batch)
   , gpuNextBatch ∷ !Natural
+  , gpuFramelessSlots ∷ !(Map Natural FramelessSlot)
+    -- ^ The frame-less slots in use, each until its batch is dropped or its
+    -- submission's completion is recorded (GRS-12). Their number is bounded
+    -- by the frame-less batch budget.
   , gpuSubmissions ∷ !(Map Natural Submission)
   , gpuNextSubmission ∷ !Natural
   , gpuNextPresentation ∷ !Natural
@@ -173,6 +177,7 @@ newGpuModel session budgets = (model, device)
         , gpuNextTarget = 0
         , gpuBatches = Map.empty
         , gpuNextBatch = 0
+        , gpuFramelessSlots = Map.empty
         , gpuSubmissions = Map.empty
         , gpuNextSubmission = 0
         , gpuNextPresentation = 0

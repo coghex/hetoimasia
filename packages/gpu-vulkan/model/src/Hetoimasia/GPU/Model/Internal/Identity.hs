@@ -39,6 +39,7 @@ module Hetoimasia.GPU.Model.Internal.Identity
   , frameUse
   , BatchId (..)
   , batchTarget
+  , batchSession
   , batchNumber
   , SubmissionId (..)
   , submissionSession
@@ -180,20 +181,39 @@ frameSlotNumber (FrameSlotId _ slot _) = slot
 frameUse ∷ FrameSlotId → Natural
 frameUse (FrameSlotId _ _ use) = use
 
--- | One recorded batch of commands, belonging to one target.
-data BatchId = BatchId !TargetId !Natural
+-- | One recorded batch of commands: a frame's, belonging to one target, or a
+-- frame-less one, belonging to the session alone (GRS-12). Batch numbers are
+-- session-wide and never reissued, so the number identifies the batch within
+-- its session whichever it is.
+data BatchId
+  = BatchId !TargetId !Natural
+  | FramelessBatchId !SessionIdentity !Natural
   deriving (Eq, Ord)
 
 instance Show BatchId where
-  showsPrec precedence (BatchId target number) =
-    showParen (precedence > 10) $
-      showString "BatchId " . showsPrec 11 target . showChar ' ' . showsPrec 11 number
+  showsPrec precedence = \case
+    BatchId target number →
+      showParen (precedence > 10) $
+        showString "BatchId " . showsPrec 11 target . showChar ' ' . showsPrec 11 number
+    FramelessBatchId _ number →
+      showParen (precedence > 10) (showString "FramelessBatchId " . showsPrec 11 number)
 
-batchTarget ∷ BatchId → TargetId
-batchTarget (BatchId target _) = target
+-- | The target a frame batch belongs to; a frame-less batch belongs to none.
+batchTarget ∷ BatchId → Maybe TargetId
+batchTarget = \case
+  BatchId target _ → Just target
+  FramelessBatchId _ _ → Nothing
+
+-- | The session the batch belongs to.
+batchSession ∷ BatchId → SessionIdentity
+batchSession = \case
+  BatchId target _ → targetSession target
+  FramelessBatchId session _ → session
 
 batchNumber ∷ BatchId → Natural
-batchNumber (BatchId _ number) = number
+batchNumber = \case
+  BatchId _ number → number
+  FramelessBatchId _ number → number
 
 -- | One submission record. It is a session-wide identity because one call may
 -- submit frames of several targets, and they then share exactly one record.

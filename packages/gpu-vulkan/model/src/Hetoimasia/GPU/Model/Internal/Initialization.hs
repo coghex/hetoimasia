@@ -23,7 +23,7 @@ import Hetoimasia.GPU.Model.Internal.Access (Contents (..))
 import Hetoimasia.GPU.Model.Internal.Hold (Holds (..))
 import Hetoimasia.GPU.Model.Internal.Identity
 import Hetoimasia.GPU.Model.Internal.Records
-import Hetoimasia.GPU.Model.Internal.Resolve (resolveBatch, resolveResource, targetIdOf)
+import Hetoimasia.GPU.Model.Internal.Resolve (batchIdOf, resolveBatch, resolveResource)
 import Hetoimasia.GPU.Model.Internal.Scheduling (scheduling_)
 import Hetoimasia.GPU.Model.Internal.State
 import Numeric.Natural (Natural)
@@ -89,11 +89,9 @@ resourceInitialization identity model = case resolveResource model identity of
     NoInitialization → InitializationNotRequired
     AwaitingInitialization → Uninitialized
     InitializationSubmitted → Initialized
-    InitializingBatch number → case Map.lookup number (gpuBatches model) of
-      Just batch
-        | Just target ← Map.lookup (batchTargetNumber batch) (gpuTargets model) →
-            InitializingIn (BatchId (targetIdOf model (batchTargetNumber batch) target) number)
-      _ → Uninitialized
+    InitializingBatch number → case Map.lookup number (gpuBatches model) >>= batchIdOf model number of
+      Just batch → InitializingIn batch
+      Nothing → Uninitialized
 
 -- | A batch is dropped without being submitted — discarded, reset or skipped
 -- — or its submission's effect is unknown: whatever it was initializing awaits

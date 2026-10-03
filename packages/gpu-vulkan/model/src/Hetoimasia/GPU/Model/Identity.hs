@@ -35,6 +35,7 @@ module Hetoimasia.GPU.Model.Identity
   , frameUse
   , BatchId
   , batchTarget
+  , batchSession
   , batchNumber
   , SubmissionId
   , submissionSession

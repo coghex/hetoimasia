@@ -36,6 +36,7 @@ module Hetoimasia.GPU.Model.Internal.Budget
   , targetRecordLimit
   , frameSlotLimit
   , aggregateFrameSlotLimit
+  , framelessBatchLimit
   , generationLimit
   , imageTrackingLimit
   , presentationPoolCapacity
@@ -73,6 +74,10 @@ data BudgetKind
     -- ^ Frame slots of one target.
   | AggregateFrameSlotBudget
     -- ^ Frame slots across every target of the session.
+  | FramelessBatchBudget
+    -- ^ Frame-less batches in flight across the session: each from its
+    -- opening until a discard ends it or its submission's completion is
+    -- observed (GRS-12).
   | GenerationBudget
     -- ^ Live generations of one target, counting active, constructing and
     -- retired generations together.
@@ -102,6 +107,7 @@ data BudgetRequest = BudgetRequest
   { requestedTargetRecords ∷ !Integer
   , requestedFrameSlots ∷ !Integer
   , requestedAggregateFrameSlots ∷ !Integer
+  , requestedFramelessBatches ∷ !Integer
   , requestedGenerations ∷ !Integer
   , requestedImageTracking ∷ !Integer
   , requestedBytes ∷ !Integer
@@ -113,7 +119,8 @@ data BudgetRequest = BudgetRequest
   deriving (Eq, Show)
 
 -- | The starter values P-15 proposes: 16 target records, 2 frame slots per
--- target within an aggregate of 32, 2 live generations per target, 16 tracked
+-- target within an aggregate of 32, 4 frame-less batches in flight (GRS-12), 2
+-- live generations per target, 16 tracked
 -- images per generation, 256 MiB and 4,096 accounted objects, 64 examined
 -- records per reclaim pass, 32 progress actions per turn, and a 100 ms idle
 -- backoff cap.
@@ -123,6 +130,7 @@ defaultBudgetRequest =
     { requestedTargetRecords = 16
     , requestedFrameSlots = 2
     , requestedAggregateFrameSlots = 32
+    , requestedFramelessBatches = 4
     , requestedGenerations = 2
     , requestedImageTracking = 16
     , requestedBytes = 256 * 1024 * 1024
@@ -165,7 +173,7 @@ budgetCeiling = 2 ^ (32 ∷ Int) - 1
 -- equal to the sum it is defined as.
 --
 -- The labels are kept rather than dropped for a positional constructor because
--- eleven adjacent limits, ten of them 'Natural', are exactly the shape a
+-- twelve adjacent limits, eleven of them 'Natural', are exactly the shape a
 -- positional construction transposes silently; 'validateBudgets' names each one
 -- as it builds it. They are private to this module, which is what closes the
 -- boundary, and 'BudgetRequest' above stays an ordinary editable record so a
@@ -178,6 +186,7 @@ data Budgets = Budgets
   { budgetsTargetRecordLimit ∷ !Natural
   , budgetsFrameSlotLimit ∷ !Natural
   , budgetsAggregateFrameSlotLimit ∷ !Natural
+  , budgetsFramelessBatchLimit ∷ !Natural
   , budgetsGenerationLimit ∷ !Natural
   , budgetsImageTrackingLimit ∷ !Natural
   , budgetsPresentationPoolCapacity ∷ !Natural
@@ -202,6 +211,12 @@ frameSlotLimit = budgetsFrameSlotLimit
 -- | The frame slots the whole session may have live at once.
 aggregateFrameSlotLimit ∷ Budgets → Natural
 aggregateFrameSlotLimit = budgetsAggregateFrameSlotLimit
+
+-- | The frame-less batches the session may have in flight at once, each from
+-- its opening until a discard ends it or its submission's completion is
+-- observed.
+framelessBatchLimit ∷ Budgets → Natural
+framelessBatchLimit = budgetsFramelessBatchLimit
 
 -- | The live generations one target may hold, counting active, constructing and
 -- retired generations together.
@@ -259,6 +274,7 @@ validateBudgets request = do
   targets ← bounded TargetRecordBudget (requestedTargetRecords request)
   slots ← bounded FrameSlotBudget (requestedFrameSlots request)
   aggregate ← bounded AggregateFrameSlotBudget (requestedAggregateFrameSlots request)
+  frameless ← bounded FramelessBatchBudget (requestedFramelessBatches request)
   generations ← bounded GenerationBudget (requestedGenerations request)
   images ← bounded ImageTrackingBudget (requestedImageTracking request)
   bytes ← bounded ByteBudget (requestedBytes request)
@@ -277,6 +293,7 @@ validateBudgets request = do
       { budgetsTargetRecordLimit = targets
       , budgetsFrameSlotLimit = slots
       , budgetsAggregateFrameSlotLimit = aggregate
+      , budgetsFramelessBatchLimit = frameless
       , budgetsGenerationLimit = generations
       , budgetsImageTrackingLimit = images
       , budgetsPresentationPoolCapacity = pool

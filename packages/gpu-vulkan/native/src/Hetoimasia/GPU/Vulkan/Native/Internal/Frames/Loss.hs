@@ -5,25 +5,37 @@
 -- complete.
 --
 -- This module skips acquired frames — through 'skipFrame', which makes no
--- cleanup submission once the loss is recorded — removes frame, submission and
--- presentation records, frees presentation-pool records, and marks pending
--- fences and owed semaphores lost, in the frames' state
+-- cleanup submission once the loss is recorded — forgets unsubmitted
+-- frame-less batches, removes frame, submission, frame-less submission and
+-- presentation records, frees presentation-pool records, marks pending fences
+-- and owed semaphores lost, and settles the tickets of frame-less batches it
+-- let go of as lost, in the frames' state
 -- ("Hetoimasia.GPU.Vulkan.Native.Internal.Frames.State"). It owns no state of
 -- its own.
 module Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Loss
   ( releaseFramesToDeviceLoss
   ) where
 
-import Control.Concurrent.STM (atomically, modifyTVar', readTVarIO)
+import Control.Concurrent.STM (atomically, modifyTVar', readTVar, readTVarIO)
 import Control.Exception (mask_)
 import Data.Foldable (for_)
 import qualified Data.Map.Strict as Map
+import Data.Maybe (isNothing)
 import qualified Data.Set as Set
 
 import Hetoimasia.GPU.Model (DeviceLossRelease (..), Outcome (..), releaseToDeviceLoss)
+import qualified Hetoimasia.GPU.Model as Model
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Abandonment (skipFrame)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.State
-import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State (Refusal (..), owned)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
+  ( BatchRecord (..)
+  , BatchStanding (..)
+  , Recording (..)
+  , Refusal (..)
+  , TicketState (..)
+  , owned
+  , settleTicket
+  )
 import Hetoimasia.GPU.Vulkan.Native.Roots (stateRootsModel)
 
 -- | Let go, under the specification's device-loss rule, of every obligation
@@ -52,6 +64,17 @@ releaseFramesToDeviceLoss frames =
         live ← Map.toAscList <$> readTVarIO (framesLive frames)
         for_ [frame | (frame, record) ← live, recordStage record == StageAcquired] (skipFrame frames)
         mask_ . atomically $ do
+          -- An unsubmitted frame-less batch can never run on the lost device:
+          -- the model lets go of its references, its record goes with no
+          -- native invalidation — its storage's destruction frees its
+          -- commands under the device-loss rule — and its ticket is lost.
+          batches ← Map.toList <$> readTVar (recordingBatches recording)
+          for_ [(batch, record) | (batch, record) ← batches, isNothing (batchFrame record), not (submitted (batchStanding record))] $ \(batch, record) → do
+            stateRootsModel (framesRoots frames) $ \model → case Model.discardBatch batch model of
+              Admitted next → ((), next)
+              _ → ((), model)
+            for_ (batchTicket record) (`settleTicket` TicketLost)
+            modifyTVar' (recordingBatches recording) (Map.delete batch)
           answer ← stateRootsModel (framesRoots frames) $ \model → case releaseToDeviceLoss model of
             Admitted (next, report) → (Right report, next)
             Rejected misuse → (Left (RefusedMisuse misuse), model)
@@ -66,6 +89,11 @@ releaseFramesToDeviceLoss frames =
                   PoolFree → False
             modifyTVar' (framesLive frames) (Map.filterWithKey (\frame _ → frame `Set.notMember` released))
             modifyTVar' (framesSubmissions frames) (Map.filterWithKey (\submission _ → submission `Set.notMember` submissions))
+            framelessHeld ← readTVar (framesFramelessSubmissions frames)
+            for_ [record | (submission, record) ← Map.toList framelessHeld, submission `Set.member` submissions] $ \record →
+              for_ (framelessTicket record) (`settleTicket` TicketLost)
+            modifyTVar' (framesFramelessSubmissions frames) (Map.filterWithKey (\submission _ → submission `Set.notMember` submissions))
+            modifyTVar' (framesFrameless frames) (Map.map (\sync → sync {framelessFenceState = lostFence (framelessFenceState sync)}))
             modifyTVar' (framesPresentations frames) (Map.filterWithKey (\presentation _ → presentation `Set.notMember` presentations))
             modifyTVar' (framesSlots frames) . Map.map $ \sync →
               sync
@@ -89,3 +117,6 @@ releaseFramesToDeviceLoss frames =
       SemaphoreSignalOwed → SemaphoreLost
       SemaphoreWaitOwed → SemaphoreLost
       other → other
+    submitted = \case
+      BatchSubmitted _ → True
+      _ → False

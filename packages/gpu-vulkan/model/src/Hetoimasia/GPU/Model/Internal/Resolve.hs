@@ -19,6 +19,7 @@ module Hetoimasia.GPU.Model.Internal.Resolve
 
     -- * Naming
   , targetIdOf
+  , batchIdOf
   , subjectIdentity
   ) where
 
@@ -85,15 +86,29 @@ resolveFrame model identity = do
         | use <= highest → Left (StaleIdentity FrameIdentity)
       _ → Left (UnknownIdentity FrameIdentity)
 
+-- | A frame batch resolves through its target; a frame-less batch through its
+-- session alone. Either must name a record of its own kind: a frame-less
+-- identity for a frame batch's number, or the reverse, is 'WrongParent'.
 resolveBatch ∷ GpuModel → BatchId → Either Misuse (Natural, Batch)
 resolveBatch model identity = do
-  _ ← asKind BatchIdentity (resolveTarget model (batchTarget identity))
+  case identity of
+    BatchId target _ → () <$ asKind BatchIdentity (resolveTarget model target)
+    FramelessBatchId session _
+      | session /= gpuSession model → Left (ForeignIdentity BatchIdentity)
+      | otherwise → Right ()
   let number = batchNumber identity
   case Map.lookup number (gpuBatches model) of
-    Just record → Right (number, record)
+    Just record
+      | ownedBy (batchOwner record) → Right (number, record)
+      | otherwise → Left (WrongParent BatchIdentity)
     Nothing
       | number < gpuNextBatch model → Left (AlreadyConsumed BatchIdentity)
       | otherwise → Left (UnknownIdentity BatchIdentity)
+  where
+    ownedBy owner = case (identity, owner) of
+      (BatchId target _, FrameOwner number _) → number == targetNumber target
+      (FramelessBatchId _ _, FramelessOwner _) → True
+      _ → False
 
 resolveSubmission ∷ GpuModel → SubmissionId → Either Misuse (Natural, Submission)
 resolveSubmission model identity
@@ -162,6 +177,12 @@ resolveSubject model = \case
 targetIdOf ∷ GpuModel → Natural → Target → TargetId
 targetIdOf model number target =
   TargetId (gpuSession model) number (targetIncarnationNumber target)
+
+-- | A batch record's identity, while its owner exists.
+batchIdOf ∷ GpuModel → Natural → Batch → Maybe BatchId
+batchIdOf model number record = case batchOwner record of
+  FrameOwner owner _ → (\target → BatchId (targetIdOf model owner target) number) <$> Map.lookup owner (gpuTargets model)
+  FramelessOwner _ → Just (FramelessBatchId (gpuSession model) number)
 
 subjectIdentity ∷ GpuModel → SubjectKey → Maybe HoldSubject
 subjectIdentity model = \case

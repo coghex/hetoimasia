@@ -40,6 +40,14 @@
 -- 'CleanupFailed', and 'BatchInvalidationFailed' is raised. Neither settles
 -- any acquisition or presentation obligation of the frame.
 --
+-- A frame-less batch (GRS-12) is recorded the same way, through the frames'
+-- scope ('Hetoimasia.GPU.Vulkan.Native.Frames.recordFramelessIn'), into the
+-- storage of a frame-less slot of the session, with no swapchain image: every
+-- command that needs one is refused. Its 'BatchTicket' reports it pending,
+-- complete, discarded or lost; 'readTicket' reads it from any thread, and
+-- 'awaitTicket' waits for it with a deadline anywhere but the graphics
+-- owner's thread. A discard settles it as discarded.
+--
 -- = Names and labels
 --
 -- When the roots offer naming ('readRootsInstrumentation'), every managed
@@ -256,6 +264,13 @@ module Hetoimasia.GPU.Vulkan.Native.Recording
   , copyToReadback
   , readbackBytesFor
 
+    -- * Tickets (GRS-12)
+  , BatchTicket
+  , ticketBatch
+  , TicketState (..)
+  , readTicket
+  , awaitTicket
+
     -- * Batches
   , discardBatch
   , resetFrameRecorder
@@ -354,6 +369,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Recorder
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   ( BatchInvalidationFailed (..)
   , BatchStanding (..)
+  , BatchTicket (ticketBatch)
   , BatchView (..)
   , Buffer
   , FrameStorage
@@ -369,6 +385,9 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , Refusal (..)
   , ResourceDestructionFailed (..)
   , ResourcesRetained (..)
+  , TicketState (..)
+  , awaitTicket
+  , readTicket
   , readBatch
   , readBatches
   , readManaged

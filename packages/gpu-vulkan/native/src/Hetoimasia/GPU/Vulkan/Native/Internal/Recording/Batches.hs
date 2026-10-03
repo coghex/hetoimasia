@@ -18,6 +18,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Batches
   , forgetUnsubmittedBatches
   , noteBatchSubmitted
   , retireCompleted
+  , retireCompletedOn
   ) where
 
 import Control.Concurrent.STM (STM, atomically, modifyTVar', readTVar, readTVarIO)
@@ -58,12 +59,15 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , ReadbackContents (..)
   , Recording (..)
   , Refusal (..)
+  , StorageOwner (..)
+  , TicketState (..)
   , batchHeld
   , editBatch
   , editManaged
   , isAsynchronous
   , modelAnswer
   , owned
+  , settleTicket
   )
 import Hetoimasia.GPU.Vulkan.Native.Roots (failRootsSessionBecause, readRootsDevice, rootsCall, stateRootsModel)
 
@@ -75,7 +79,11 @@ import Hetoimasia.GPU.Vulkan.Native.Roots (failRootsSessionBecause, readRootsDev
 -- the buffer can be begun again, and the record goes. A readback the batch
 -- copied into keeps its own evidence ('ContentsCopySubmitted').
 retireCompleted ∷ Recording q inst msgr phys dev cmd → FrameSlotId → IO (Either Refusal ())
-retireCompleted recording frame = do
+retireCompleted recording frame = retireCompletedOn recording (StorageOfFrame (frameTarget frame) (frameSlotNumber frame))
+
+-- | 'retireCompleted' for the storage of any slot, a frame-less one included.
+retireCompletedOn ∷ Recording q inst msgr phys dev cmd → StorageOwner → IO (Either Refusal ())
+retireCompletedOn recording slot = do
   (storage, completed) ← atomically $ do
     model ← stateRootsModel roots (\current → (current, current))
     batches ← Map.toList <$> readTVar (recordingBatches recording)
@@ -84,10 +92,10 @@ retireCompleted recording frame = do
     -- before anything native happens, and its completed batches go when it is
     -- destroyed.
     storage ←
-      (\slot → slot >>= \resource → case managedStanding <$> Map.lookup resource managed of
+      (\found → found >>= \resource → case managedStanding <$> Map.lookup resource managed of
           Just ManagedLive → Just resource
           _ → Nothing)
-        . Map.lookup (frameTarget frame, frameSlotNumber frame)
+        . Map.lookup slot
         <$> readTVar (recordingStorages recording)
     pure
       ( storage
@@ -131,7 +139,7 @@ resetFrameRecorder recording frame =
   owned recording $ do
     batches ← Map.toList <$> readTVarIO (recordingBatches recording)
     phase ← atomically (fmap viewFramePhase . frameView frame <$> stateRootsModel roots (\model → (model, model)))
-    let ours = [(batch, record) | (batch, record) ← batches, batchFrame record == frame]
+    let ours = [(batch, record) | (batch, record) ← batches, batchFrame record == Just frame]
     case phase of
       Nothing → pure (Left (RefusedMisuse (StaleIdentity FrameIdentity)))
       Just current
@@ -140,7 +148,7 @@ resetFrameRecorder recording frame =
         -- An invalidation that raised is never retried, by either path.
         | any (uncertain . batchStanding . snd) ours → pure (Left (RefusedMisuse (WrongPhase BatchIdentity)))
         | otherwise → do
-            storage ← Map.lookup (frameTarget frame, frameSlotNumber frame) <$> readTVarIO (recordingStorages recording)
+            storage ← Map.lookup (StorageOfFrame (frameTarget frame) (frameSlotNumber frame)) <$> readTVarIO (recordingStorages recording)
             case storage of
               Nothing → pure (Left RefusedNoStorage)
               Just resource → invalidate recording resource (map fst ours) (resetRecorder frame)
@@ -160,7 +168,7 @@ resetFrameRecorder recording frame =
 -- in the same transaction, which is what discharges the batches' references.
 forgetUnsubmittedBatches ∷ Recording q inst msgr phys dev cmd → FrameSlotId → STM ()
 forgetUnsubmittedBatches recording frame =
-  modifyTVar' (recordingBatches recording) (Map.filter (\record → batchFrame record /= frame || submitted (batchStanding record)))
+  modifyTVar' (recordingBatches recording) (Map.filter (\record → batchFrame record /= Just frame || submitted (batchStanding record)))
   where
     submitted = \case
       BatchSubmitted _ → True
@@ -201,10 +209,17 @@ invalidate recording storage batches discharge =
   where
     roots = recordingRoots recording
     storagePool managed = case managedNative <$> Map.lookup storage managed of
-      Just (NativeStorage _ _ handle _) → Just handle
+      Just (NativeStorage _ handle _) → Just handle
       _ → Nothing
     dropRecords = do
       records ← readTVar (recordingBatches recording)
+      -- A frame-less batch dropped before it was submitted is discarded; one
+      -- whose submission completed keeps the outcome its ticket already has.
+      for_ batches $ \batch → for_ (Map.lookup batch records) $ \record →
+        case (batchTicket record, batchStanding record) of
+          (_, BatchSubmitted _) → pure ()
+          (Just ticket, _) → settleTicket ticket TicketDiscarded
+          (Nothing, _) → pure ()
       for_ batches $ \batch → for_ (Map.lookup batch records) $ \record →
         for_ (batchReadbacks record) $ \readback →
           editManaged recording readback $ \entry → case managedNative entry of

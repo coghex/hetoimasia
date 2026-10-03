@@ -118,7 +118,7 @@ an accepted submission are refused.
 | `GenerationId`   | One swapchain generation of one target                                    |
 | `ImageId`        | One tracked image record of one generation, at its index                  |
 | `FrameSlotId`    | One use of one frame slot: the target, the slot, and the use it is on     |
-| `BatchId`        | One recorded batch of commands                                            |
+| `BatchId`        | One recorded batch of commands: a frame's, of its target, or a frame-less one, of the session alone |
 | `SubmissionId`   | One submission record, shared by every frame one call submitted           |
 | `PresentationId` | One record of the target's finite presentation pool                       |
 | `ResourceId`     | One generation of one managed resource                                    |
@@ -315,6 +315,7 @@ never clamped; there is no unbounded sentinel.
 | Target records         | 16        | Retiring targets too                                                 |
 | Frame slots per target | 2 (1 supported) | Every live frame of the target                                 |
 | Aggregate frame slots  | 32        | Every live frame of the session                                      |
+| Frame-less batches     | 4         | Every frame-less slot in use, from its batch's opening until a discard or its submission's observed completion ([Frame-less batches](#frame-less-batches)) |
 | Live generations       | 2         | Active, constructing and retired together                            |
 | Image tracking limit   | 16        | Tracked image records of one generation                              |
 | Presentation pool      | 18 (derived) | Reserved, unpresented and pending records, shared by the target's active and retired generations |
@@ -333,7 +334,7 @@ configuration whose derived sum would not fit is rejected as
 A validated configuration is **read-only to clients**. `BudgetRequest` is an
 ordinary record, so a small configuration is stated by editing one and
 validating it; `Budgets` is not. Its constructor is unexported, its field labels
-are private to the package, and the eleven limits are read through ordinary
+are private to the package, and the twelve limits are read through ordinary
 functions, so record construction and record-update syntax reach no label. There
 is no way for a client to replace a validated limit, and in particular no way to
 set the derived presentation pool to anything but the checked sum it is defined
@@ -571,9 +572,11 @@ device, and a second release releases nothing.
 ## Owner progress
 
 One turn performs at most `progressActionLimit` completion or disposal actions,
-taken round-robin across targets and then the session's own managed resources.
-The lead rotates every turn, so no target starves behind a busy neighbour, and
-the report names the order it visited.
+taken round-robin across the targets and the session's own place — its
+frame-less completions and its managed resources. The lead rotates every turn,
+the session's place with the targets', so neither a target nor the session
+starves behind a busy neighbour, and the report names the order it visited the
+targets.
 
 The turn answers the absolute instant of the next one:
 
@@ -685,6 +688,57 @@ Time enters only as an `Instant` the caller read from the foundation's injected
 clock. The model reads no clock, and a scripted clock is therefore enough to
 prove the whole schedule.
 
+## Frame-less batches
+
+GRS-12 (#337; resource services design D-12) admits batches that belong to no
+frame: offscreen rendering and uploads, recorded with no swapchain image and
+submitted by themselves. They hold exactly what a frame's batch holds, under
+the same rules, and differ only in what they belong to.
+
+**Admission.** `openFramelessBatch` admits one in the lowest free frame-less
+slot of the session, naming the resource generations it retains, and answers
+its `BatchId` — a frame-less one, resolved through the session alone, with no
+target, synthetic or otherwise — and its slot. It needs a running session, and
+the references follow `recordBatch`'s rules: no duplicate, nothing whose release
+or end of CPU use is certified. A slot counts against the frame-less batch
+budget (default 4) from the opening until a discard drops the batch or the
+completion of its submission is recorded; with every slot taken the answer is
+`Backpressure FramelessBatchBudget`. The opening reserves two objects before
+any native call — the batch's record and the submission record its submission
+will need — so object exhaustion is `Backpressure ObjectBudget` with nothing
+changed, and a submission the queue already accepted can never be refused for
+want of accounting.
+
+**Holds.** A frame-less batch's references are recorded-reference holds keyed
+by its number, as a frame batch's are: `extendBatch` extends them,
+`discardBatch` drops the batch and discharges exactly its own, freeing its slot
+and giving back both objects, and a frame's `resetRecorder` touches none of
+them. `submitFramelessBatch` with `SubmissionAccepted` promotes them to
+submitted uses under a submission record of its own, which carries no frame,
+gives back the batch's object, keeps the reserved one for the record, and
+leaves the slot held by that submission. Recording a completion
+(`SubmissionCompleted`) discharges those uses, gives back the record's object
+and frees the slot; `runProgressTurn` offers frame-less completions in the
+session's own place, before its disposals, so one submission that has not
+signalled never holds back another that has. The session's place rotates with
+the targets' places, so a target with ready work every turn cannot starve it.
+
+**Failure.** `SubmissionFailedWithoutEffect` changes nothing: the batch stays
+held and submittable. `SubmissionEffectUncertain` records the submission
+uncertain — its holds and slot retained for ever, its completion refused — and
+fails the session, as a frame's does.
+
+**Initialization.** An image a frame-less batch initializes is initialized when
+the model records that batch's accepted submission, before anything has
+completed; sealing, a discard, a no-effect failure and an unknown effect never
+publish it ([Ordering managed resources](#ordering-managed-resources)).
+
+**Device loss.** `releaseToDeviceLoss` releases frame-less submissions with
+every other submission, discharging their uses and freeing their slots without
+recording a completion. An unsubmitted frame-less batch is not the loss's to
+release: the boundary discards it, which discharges its references and frees
+its slot. `framelessSlots` reads each slot in use and what holds it.
+
 ## Ordering managed resources
 
 GRS-3 (#335; resource services design D-18 and D-26) orders every access a
@@ -779,6 +833,7 @@ may initialize it. Nothing here changes a resting use, which is the kind's.
 | Device-memory charges | The owning boundary | Reserved per attempt by `reserveDeviceMemory`; settled by `settleDeviceMemory` after every allocator call | Any | The session | Released only as the boundary reports memory freed |
 | A resource generation's initialization | The owning boundary | Marked by `requireInitialization`; claimed by `enterResource`; published by an accepted `submitFrames`; withdrawn when its batch is dropped or its submission's effect is unknown; read by `resourceInitialization` | Any | The generation's record | Leaves with the record |
 | A batch's accesses (`BatchAccess`) | The batch's recorder | The recorder threads it through `touch`, `transition` and `sealAccess` | The recorder's | One batch's recording | Dropped with the recorder; never kept across batches |
+| Frame-less slots | The owning boundary | `openFramelessBatch` takes one; `discardBatch`, a completion and the device-loss release free it; `framelessSlots` reads them | Any | From a batch's opening until its discard or its submission's completion or release | Bounded by the frame-less batch budget |
 
 Nothing accumulates as history. A disposed resource's current-generation entry is
 removed, a settled frame gives back the reservations it never used, and a
@@ -878,6 +933,19 @@ initialization published by an accepted submission before anything completed,
 and by the retry after a no-effect failure, but by no fence reset, no-effect
 failure or unknown effect; and an image left uninitialized by a discard, a
 recorder reset and a skipped frame.
+
+Its `frame-less batches` group covers GRS-12: the budget's default, its
+validation and its backpressure; a frame-less batch in a session with no
+target, and none after failure; object backpressure with nothing changed, and
+the reserved objects given back on a discard, a submission and a completion;
+holds discharged exactly by discard, a frame's reset, submission and
+completion; a record of its own for each submission; a slot kept until its
+submission's completion and freed by a discard; a no-effect failure keeping the
+batch, and an uncertain one retaining everything; a ready frame-less completion
+taken in a one-action turn behind one that has not signalled; identities
+resolved through the session, refusing a stranger's, a consumed one and a frame
+batch; initialization published only by an accepted submission; and release on
+device loss without completion.
 
 It covers the same class of edge for the transitions themselves: a still-
 constructing candidate refused as an `oldSwapchain` predecessor without mutating

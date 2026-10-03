@@ -168,7 +168,9 @@ releaseToDeviceLoss model
                   current
                   (Set.toList (submissionSubjects submission))
               )
-              {gpuSubmissions = Map.delete number (gpuSubmissions current)}
+              { gpuSubmissions = Map.delete number (gpuSubmissions current)
+              , gpuFramelessSlots = Map.filter (/= SlotSubmitted number) (gpuFramelessSlots current)
+              }
         )
         model
         submissions

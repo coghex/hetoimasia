@@ -101,6 +101,17 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , ImageFormat (..)
   , ImageDescription (..)
 
+    -- * Frame-less batches (GRS-12)
+  , constructFramelessBatch
+  , BatchTicket
+  , ticketBatch
+  , TicketState (..)
+  , readTicket
+  , awaitTicket
+  , transitionResource
+  , ResourceUse (..)
+  , TransitionSource (..)
+
     -- * Owner-thread actions (GRS-15)
   , VulkanAction (..)
   , submitVulkanAction
@@ -191,6 +202,7 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , readVulkanAction
   , Constructed
   , constructBuffer
+  , constructFramelessBatch
   , constructImage
   , constructPipeline
   , constructPipelineLayout
@@ -238,7 +250,8 @@ import qualified Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller as Controller
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Loop (publishVulkanScene, runVulkanOwnerLoop)
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Production (withVulkanOwnerHostAs)
 import Hetoimasia.GPU.Vulkan.Native.Recording
-  ( Buffer
+  ( BatchTicket
+  , Buffer
   , BufferDescription (..)
   , BufferKind (..)
   , ClearColor (..)
@@ -252,13 +265,20 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , Recorder
   , Rect (..)
   , Refusal (..)
+  , ResourceUse (..)
+  , TicketState (..)
+  , TransitionSource (..)
   , Viewport (..)
+  , awaitTicket
   , beginRendering
   , bindPipeline
   , draw
   , endRendering
+  , readTicket
   , setScissor
   , setViewport
+  , ticketBatch
+  , transitionResource
   )
 import Hetoimasia.GPU.Vulkan.Native.Profile (ValidationFeature (..))
 import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsSessionFailed (..), TeardownEvidence (..), TerminalCause (..), TerminalReport (..))

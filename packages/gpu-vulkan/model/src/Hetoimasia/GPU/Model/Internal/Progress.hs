@@ -59,11 +59,13 @@ runProgressTurn ∷ EvidenceSource → Instant → GpuModel → (GpuModel, TurnR
 runProgressTurn source now model = (finished, report)
   where
     budget = progressActionLimit (gpuBudgets model)
-    order = rotated (gpuCursor model) (Map.keys (gpuTargets model))
-    -- Each pass visits every target once, then the session itself, so managed
-    -- resources are reclaimed under the same action budget as target work
-    -- rather than through a second unbounded sweep.
-    visits = map Just order ++ [Nothing]
+    -- Each pass visits every target once and the session itself once, so
+    -- managed resources are reclaimed, and frame-less submissions completed,
+    -- under the same action budget as target work rather than through a
+    -- second unbounded sweep. The session's place rotates with the targets',
+    -- so busy targets can no more starve it than one another.
+    visits = rotated (gpuCursor model) (map Just (Map.keys (gpuTargets model)) ++ [Nothing])
+    order = [number | Just number ← visits]
     (worked, actions, facts, disposed, failures) = passes model 0 0 [] []
     passes current used factCount disposedSoFar failed
       | used >= budget = (current, used, factCount, disposedSoFar, failed)
@@ -121,12 +123,20 @@ data PendingAction
 -- reclaiming managed resources every hold of which has ended.
 nextAction ∷ EvidenceSource → GpuModel → Maybe Natural → Maybe PendingAction
 nextAction source model place = case place of
+  -- The session's own work: frame-less submissions' completions (GRS-12),
+  -- then the managed resources every hold of which has ended.
   Nothing →
     firstOf
-      [ DisposeSubject key
-      | key@(ResourceKey _ _) ← eligibleSubjects model
-      , offered key
+      [ ApplySubmission (SubmissionId (gpuSession model) submission)
+      | SlotSubmitted submission ← Map.elems (gpuFramelessSlots model)
+      , maybe False (not . submissionUncertain) (Map.lookup submission (gpuSubmissions model))
+      , submissionEvidence source (SubmissionId (gpuSession model) submission)
       ]
+      `orElse` firstOf
+        [ DisposeSubject key
+        | key@(ResourceKey _ _) ← eligibleSubjects model
+        , offered key
+        ]
   Just number → case Map.lookup number (gpuTargets model) of
     Nothing → Nothing
     Just target →

@@ -131,6 +131,7 @@ library
         Hetoimasia.GPU.Vulkan.Native.Internal.Commands
         Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Abandonment
         Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Acquisition
+        Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Frameless
         Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Layer
         Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Loss
         Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Presentation
@@ -273,6 +274,7 @@ test-suite native-tests
         Test.GPU.Vulkan.Native.Allocation
         Test.GPU.Vulkan.Native.AllocatorStandIn
         Test.GPU.Vulkan.Native.AllocatorVisibility
+        Test.GPU.Vulkan.Native.Frameless
         Test.GPU.Vulkan.Native.Frames
         Test.GPU.Vulkan.Native.FramesPresentation
         Test.GPU.Vulkan.Native.FramesRig
