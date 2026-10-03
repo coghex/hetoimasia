@@ -230,6 +230,10 @@ data RecorderState = RecorderState
 -- table bound again.
 data TableBinding = TableBinding
   { bindingTaken ∷ !TakenVersion
+  , bindingImages ∷ ![ResourceId]
+    -- ^ Every image the version can sample: the placeholder, and each
+    -- texture it maps. A draw through the table needs each in its sampled
+    -- use.
   , bindingRanges ∷ !(Maybe [PushConstantRange])
   }
 
@@ -1031,7 +1035,10 @@ drawIndexed recorder indices instances =
 
 -- | A draw with a pipeline whose layout holds the texture table needs the
 -- table bound compatibly — under a layout with the same push-constant ranges
--- — and a sampler selected (GRS-7).
+-- — a sampler selected, and every image the batch's version can sample in
+-- its sampled use: untouched by the batch, resting there, or returned to it
+-- (GRS-7). A texture the batch has moved to another use cannot be sampled
+-- through its descriptor's layout until it is moved back.
 tableReady ∷ RecorderState → BoundPipeline → Either Refusal ()
 tableReady state bound = case interfaceTable (boundInterface bound) of
   Nothing → Right ()
@@ -1039,7 +1046,11 @@ tableReady state bound = case interfaceTable (boundInterface bound) of
     | (stateTable state >>= bindingRanges) /= Just (interfacePushConstants (boundInterface bound)) →
         Left (RefusedIllegal "a draw with a pipeline holding the texture table before the table is bound under a compatible layout")
     | isNothing (stateSampler state) → Left (RefusedIllegal "a draw with a pipeline holding the texture table before a sampler is selected")
+    | any elsewhere (maybe [] bindingImages (stateTable state)) →
+        Left (RefusedIllegal "a draw through the texture table while the batch holds an image its version maps in a use other than sampling")
     | otherwise → Right ()
+  where
+    elsewhere image = maybe False (/= ShaderSampled) (Access.accessUse image (stateAccess state))
 
 -- | Bind the texture table (GRS-7) under the bound pipeline's layout, which
 -- must hold it: set 0 and set 1, with set 1's dynamic offset selecting the
@@ -1069,20 +1080,21 @@ bindTable recorder =
                 pure (Left (RefusedIllegal "binding the texture table under a pipeline whose layout does not hold it"))
             | otherwise → do
                 taken ← case stateTable state of
-                  Just binding → pure (Right (bindingTaken binding))
-                  Nothing → takeVersion recording
+                  Just binding → pure (Right (bindingTaken binding, Just (bindingImages binding)))
+                  Nothing → fmap (\version → (version, Nothing)) <$> takeVersion recording
                 table ← readTVarIO (recordingTable recording)
                 case (taken, table) of
                   (Left refusal, _) → pure (Left refusal)
                   (_, Nothing) → pure (Left (RefusedIllegal "binding a texture table this session has not made"))
-                  (Right version, Just held) → command recorder $ \current → case statePipeline current of
+                  (Right (version, kept), Just held) → command recorder $ \current → case statePipeline current of
                     Just now →
                       let ranges = interfacePushConstants (boundInterface now)
+                          images = fromMaybe (tablePlaceholder held : Book.versionTextures (takenEntry version) (tableBook held)) kept
                        in Right
-                            ( current {stateTable = Just (TableBinding version (Just ranges))}
+                            ( current {stateTable = Just (TableBinding version images (Just ranges))}
                             , tableObjects held
-                                <> [tableRing held, takenResource version, tablePlaceholder held]
-                                <> Book.versionTextures (takenEntry version) (tableBook held)
+                                <> [tableRing held, takenResource version]
+                                <> images
                                 <> [boundLayout now]
                             , CommandBindDescriptorSets (interfaceLayout (boundInterface now)) (tableSets held) [takenOffset version]
                             )

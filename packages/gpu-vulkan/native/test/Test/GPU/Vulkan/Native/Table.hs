@@ -198,6 +198,27 @@ spec = describe "Texture table" $ do
       [offset | Recorded _ (CommandBindDescriptorSets _ _ [offset]) ← calls] `shouldBe` [0, 0]
       clean rig
 
+    it "refuses a draw through the table, making no native call, while the batch holds a texture its version maps in another use, and draws once it is back" $ do
+      (rig, uploads, kit) ← tableRig 4 2
+      texture ← uploadedTexture rig uploads
+      _ ← registered rig texture
+      answers ← framelessOnce rig $ \recorder → do
+        ok (transitionResource recorder texture (FromUse ShaderSampled) TransferRead)
+        moved ← inPass kit recorder $ do
+          ok (bindTable recorder)
+          ok (selectSampler recorder 0)
+          draw recorder 3 1
+        ok (transitionResource recorder texture (FromUse TransferRead) ShaderSampled)
+        back ← inPass kit recorder $ do
+          ok (bindTable recorder)
+          ok (selectSampler recorder 0)
+          draw recorder 3 1
+        pure [moved, back]
+      answers `shouldBe` [Left (RefusedIllegal "a draw through the texture table while the batch holds an image its version maps in a use other than sampling"), Right ()]
+      calls ← recordingCalls (rigRecordingStandIn rig)
+      length [() | Recorded _ CommandDraw {} ← calls] `shouldBe` 1
+      clean rig
+
   describe "versions and slots" $ do
     it "writes a texture's descriptor only into a slot no live version maps, and reuses a released texture's slot only once the batches that bound it complete" $ do
       (rig, uploads, kit) ← tableRig 3 2
@@ -329,6 +350,24 @@ spec = describe "Texture table" $ do
       calls ← recordingCalls (rigRecordingStandIn rig)
       [view | DestroyedView view ← calls] `shouldBe` []
       standing rig texture `shouldReturn` Just ManagedReleased
+
+    it "keeps them through retirement while the batch is only recorded, too" $ do
+      (rig, uploads, kit) ← tableRig 4 2
+      texture ← uploadedTexture rig uploads
+      _ ← registered rig texture
+      retired ← newIORef Nothing
+      _ ← try @SomeException $ withFramelessScope (rigFrames rig) $ \scope → do
+        _ ← recordFramelessIn scope $ \recorder → inPass kit recorder $ do
+          ok (bindTable recorder)
+          ok (selectSampler recorder 0)
+          ok (draw recorder 3 1)
+        answer ← try @ResourcesRetained (retireRecording (rigRecording rig) (at 1))
+        writeIORef retired (Just answer)
+      readIORef retired >>= \case
+        Just (Left (ResourcesRetained remaining)) → remaining `shouldSatisfy` elem (managedResource texture)
+        other → expectationFailure ("retirement answered " <> show (fmap (fmap (const ())) other))
+      calls ← recordingCalls (rigRecordingStandIn rig)
+      [view | DestroyedView view ← calls] `shouldBe` []
 
     it "refuses new table work once the session has failed, writing nothing, and still lets a released texture go" $ do
       (rig, uploads, kit) ← tableRig 4 2
