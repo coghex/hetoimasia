@@ -371,8 +371,10 @@ descriptor parsed variable pointer storage =
 -- a pointer's pointee, a struct's members, an array's element and length, a
 -- vector's component, a matrix's column, an image's sampled type, a sampled
 -- image's image — is one the module defines with the operands its opcode
--- needs. The first reference that is not is an error naming it and the
--- variable.
+-- needs: an integer of 8, 16, 32 or 64 bits and a signedness of 0 or 1, a float
+-- of 16, 32 or 64 bits, an array length that is a constant of a defined 32-bit
+-- integer type, an image's sampled type that is void or such a scalar. The
+-- first reference that is not is an error naming it and the variable.
 definedType ∷ Module → Word32 → Word32 → Either String ()
 definedType parsed variable = go []
   where
@@ -392,18 +394,29 @@ definedType parsed variable = go []
                   (24, [_, column, _]) → next column
                   (25, _ : sampledType : _ : _ : _ : _ : _ : _) → scalarOrVoid sampledType
                   (27, [_, image]) → next image
-                  (21, [_, _, _]) → Right ()
-                  (22, _ : _ : _) → Right ()
+                  (21, [_, width, signedness])
+                    | width `elem` [8, 16, 32, 64] && signedness `elem` [0, 1] → Right ()
+                  (22, [_, width])
+                    | width `elem` [16, 32, 64] → Right ()
+                  (22, [_, width, _encoding])
+                    | width `elem` [16, 32, 64] → Right ()
                   (19, [_]) → Right ()
                   (20, [_]) → Right ()
                   (26, [_]) → Right ()
                   (43, _) → Right ()
                   _ → Left (named <> " reaches type id " <> show typeId <> ", whose opcode " <> show opcode <> " has operands the reader cannot read")
+    -- An array length is a constant whose own result type is followed: a
+    -- defined, well-formed integer of exactly the one word its value has.
     constantOf constant = case typeOf parsed constant of
-      Just (Instruction 43 [_, _, _]) → Right ()
+      Just (Instruction 43 [resultType, _, _]) → case typeOf parsed resultType of
+        Just (Instruction 21 [_, 32, signedness]) | signedness `elem` [0, 1] → Right ()
+        Just _ → Left (named <> " reaches an array length (id " <> show constant <> ") whose type (id " <> show resultType <> ") is not a 32-bit integer")
+        Nothing → Left (named <> " reaches an array length (id " <> show constant <> ") whose type (id " <> show resultType <> ") the module does not declare")
       _ → Left (named <> " reaches an array length (id " <> show constant <> ") that is not a defined 32-bit constant")
+    -- A sampled type is void or a scalar, its operands validated as any other
+    -- reached type's are.
     scalarOrVoid typeId = case typeOf parsed typeId of
-      Just (Instruction opcode _) | opcode `elem` [19, 21, 22] → Right ()
+      Just (Instruction opcode _) | opcode `elem` [19, 21, 22] → go [] typeId
       Just _ → Left (named <> " reaches an image whose sampled type (id " <> show typeId <> ") is not a scalar or void")
       Nothing → Left (named <> " reaches an image whose sampled type (id " <> show typeId <> ") the module does not declare")
 
