@@ -151,6 +151,19 @@ On every run, configuration and device, D-40's mechanism held:
   and at the end.
 - Nothing was held once the allocator was destroyed.
 
+**The probe's `MAPPED` classes are not the production flags** (#367). The
+class tables in the retained reports — for example
+[run 1, unsafe](gpu_vma_qualification/run-1-2026-10-01-unsafe.md) — list the
+staging and readback classes with VMA flags `MAPPED`: the measurement probe
+asked VMA to map those allocations inside the allocating call. That was the
+probe's configuration, kept here as measured. It is not what D-40 permits in
+production: the allocating call asks VMA to map nothing, and the production
+shim maps a host-visible buffer afterwards with `vmaMapMemory`. The bound
+above is what these runs observed, in which no mapping failed. It is not a
+guarantee for `MAPPED` requests in general: when the mapping fails, VMA 3.3.0
+can retain the freshly opened block and fall back to a dedicated allocation in
+the same call, which D-40's preconditions exist to rule out.
+
 The block events the callbacks recorded, identical for every driver:
 
 | Workload | Device-memory objects opened | Freed during the trace | Peak held | Retained once all freed |

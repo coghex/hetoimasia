@@ -719,7 +719,15 @@ allocation attempt in this order; the two differ only in VMA's calls
    (`reserveDeviceMemory`): the larger of the type's preferred block size —
    VMA's `CalcPreferredBlockSize`, an eighth of a heap of at most 1 GiB and
    otherwise the configured 256 MiB, aligned to 32 bytes (`preferredBlockSize`)
-   — and the requirements' size. A reservation the byte budget cannot hold is
+   — and the requirements' size. The bound holds only under
+   [D-40](designs/gpu_resource_services_design.md#d-40-the-byte-budget-charges-vmas-blocks-reserved-before-one-can-open)'s
+   preconditions: the allocating call asks VMA to map nothing — no
+   `VMA_ALLOCATION_CREATE_MAPPED_BIT`, nor any other mapping inside the call;
+   the shim passes `VMA_ALLOCATION_CREATE_NEVER_ALLOCATE_BIT` in step 2 and no
+   flags at all here — and `VMA_DEBUG_MARGIN` is zero in the VMA the engine
+   links. Without them VMA can retain a freshly opened block whose commit
+   failed and open a dedicated allocation as well, in one call
+   (#367). A reservation the byte budget cannot hold is
    `RefusedBackpressure`, answered before the call that could open memory, and
    never enters recovery. A reservation the model rejects — the session failed,
    or the attempt may no longer allocate — is refused with its misuse
@@ -731,8 +739,9 @@ allocation attempt in this order; the two differ only in VMA's calls
    nothing if it opened nothing, the rest returned at once, and what it freed
    released.
 5. An effect that disagrees with the accounting is a defect
-   (`AccountingFinding`): opening more than was reserved, which contradicts
-   VMA's sizing; freeing more than was charged as held, after which the charge
+   (`AccountingFinding`): opening more than was reserved, which under step
+   3's preconditions cannot happen and so shows one of them was broken;
+   freeing more than was charged as held, after which the charge
    would no longer bound the memory; or an effect the model refused to settle
    under the attempt, which is then settled under no reservation so nothing
    held goes uncharged. The resource is destroyed before its allocation is
@@ -742,8 +751,13 @@ allocation attempt in this order; the two differ only in VMA's calls
    unless the defect is memory opened beyond a reservation that the budget
    still holds.
 6. A buffer's host-visible allocation is mapped for its lifetime
-   (`vmaMapMemory`). An image's is not: it is optimally tiled, and the host
-   never writes it directly (D-16).
+   (`vmaMapMemory`), by this separate call after the allocating call has been
+   settled — never by the allocating call itself, which is step 3's first
+   precondition — so a failed mapping never enters that call's accounting.
+   Persistent mapping for any later buffer or image kind, the host-visible
+   staging ring among them, follows the same rule. An image's allocation is
+   not mapped: it is optimally tiled, and the host never writes it directly
+   (D-16).
 
 Every later call that can free memory — a destruction, the allocator's own —
 is settled the same way before anything else is admitted, and a defect there
