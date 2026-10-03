@@ -100,6 +100,9 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
   , constructPipelineWith
   , replaceConstructedPipeline
   , constructRing
+  , constructPipelineLayoutFor
+  , constructCheckedPipeline
+  , replaceConstructedCheckedPipeline
   , constructBuffer
   , constructImage
   , releaseConstructed
@@ -270,6 +273,10 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , createPipelineWith
   , createReadback
   , createRing
+  , CheckedShaders
+  , createCheckedPipeline
+  , createPipelineLayoutFor
+  , replaceCheckedPipeline
   , disposeResources
   , endRendering
   , newRecording
@@ -446,6 +453,27 @@ constructPipelineWith construction layout shaders format input =
 -- releases it with everything else; no handle to it is lent.
 constructRing ∷ Construction q inst msgr phys dev cmd → RingSize → IO (Either Refusal ())
 constructRing construction size = confined construction (createRing (constructionRecording construction) size)
+
+-- | A pipeline layout with exactly the push-constant ranges these checked
+-- shaders' descriptions need (GRS-16).
+constructPipelineLayoutFor ∷ Construction q inst msgr phys dev cmd → CheckedShaders → IO (Either Refusal PipelineLayout)
+constructPipelineLayoutFor construction shaders = confined construction (createPipelineLayoutFor (constructionRecording construction) shaders)
+
+-- | A graphics pipeline from checked shaders (GRS-16): its vertex input is the
+-- vertex shader's description's, and a layout declaring other ranges than
+-- the descriptions need, or stages whose descriptions disagree, is refused
+-- before anything is created.
+constructCheckedPipeline
+  ∷ Construction q inst msgr phys dev cmd → PipelineLayout → CheckedShaders → Word32 → IO (Either Refusal Pipeline)
+constructCheckedPipeline construction layout shaders format =
+  confined construction (createCheckedPipeline (constructionRecording construction) layout shaders format)
+
+-- | A new generation of a pipeline from checked shaders, checked as
+-- 'constructCheckedPipeline' checks them; the old one is released.
+replaceConstructedCheckedPipeline
+  ∷ Construction q inst msgr phys dev cmd → Pipeline → PipelineLayout → CheckedShaders → Word32 → IO (Either Refusal Pipeline)
+replaceConstructedCheckedPipeline construction old layout shaders format =
+  confined construction (replaceCheckedPipeline (constructionRecording construction) old layout shaders format)
 
 -- | A graphics pipeline over the layout for dynamic rendering into this color
 -- format — a frame's 'requestFormat' — drawing triangle lists with no vertex

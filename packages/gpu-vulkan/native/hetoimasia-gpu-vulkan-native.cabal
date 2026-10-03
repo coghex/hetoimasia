@@ -53,6 +53,9 @@ extra-source-files:
     **/*.fingerprint
     test/shaders/*.frag
     test/shaders/**/*.glsl
+    test/fixtures/spirv/*.spv
+    test/fixtures/spirv/*.vert
+    test/fixtures/spirv/*.frag
 
 source-repository head
     type: git
@@ -79,10 +82,12 @@ library
         Hetoimasia.GPU.Vulkan.Native.Profile
         Hetoimasia.GPU.Vulkan.Native.Recording
         Hetoimasia.GPU.Vulkan.Native.Recording.Shaders
+        Hetoimasia.GPU.Vulkan.Native.Recording.ShaderInterfaces
         Hetoimasia.GPU.Vulkan.Native.Recording.Vulkan
         Hetoimasia.GPU.Vulkan.Native.Roots
         Hetoimasia.GPU.Vulkan.Native.Roots.Vulkan
         Hetoimasia.GPU.Vulkan.Native.Shader
+        Hetoimasia.GPU.Vulkan.Native.Shader.Interface
     -- VK-11's audited recording subset: the package's only genuine `unsafe`
     -- Vulkan imports. Private, so nothing outside the package can record
     -- through them; see the module and docs/gpu_backend.md, "The FFI audit".
@@ -201,12 +206,14 @@ library shader-toolchain
     ghc-options: -Wall -Wcompat -Wincomplete-uni-patterns -Wincomplete-record-updates
     hs-source-dirs: shader-toolchain
     exposed-modules:
+        Hetoimasia.GPU.Vulkan.Native.Shader.Reflect
         Hetoimasia.GPU.Vulkan.Native.Shader.Toolchain
     other-modules:
         Hetoimasia.GPU.Vulkan.Native.Shader.Json
     build-depends:
         base >=4.22 && <4.23,
         bytestring >=0.12 && <0.13,
+        containers >=0.8 && <0.9,
         cryptohash-sha256 >=0.11.102 && <0.12,
         directory >=1.3 && <1.4,
         filepath >=1.5 && <1.6,
@@ -240,8 +247,11 @@ test-suite shader-tests
     hs-source-dirs: test
     main-is: Main.hs
     other-modules:
+        Test.Shader.Checked
         Test.Shader.Constants
         Test.Shader.Fragment
+        Test.Shader.InterfaceSpec
+        Test.Shader.Interfaces
         Test.Shader.Spec
         Test.Shader.Vertex
     build-depends:
@@ -274,6 +284,7 @@ test-suite native-tests
         Test.GPU.Vulkan.Native.Allocation
         Test.GPU.Vulkan.Native.AllocatorStandIn
         Test.GPU.Vulkan.Native.AllocatorVisibility
+        Test.GPU.Vulkan.Native.Checked
         Test.GPU.Vulkan.Native.Drawing
         Test.GPU.Vulkan.Native.Frameless
         Test.GPU.Vulkan.Native.Frames

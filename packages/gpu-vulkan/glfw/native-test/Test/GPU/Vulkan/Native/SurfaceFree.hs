@@ -164,18 +164,12 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , withVulkanOwnerHost
   , BufferSource (..)
   , IndexType (..)
-  , InputRate (..)
-  , PushConstantRange (..)
   , PushStage (..)
-  , VertexAttribute (..)
-  , VertexBinding (..)
-  , VertexFormat (..)
-  , VertexInput (..)
   , bindIndexBuffer
   , bindVertexBuffer
   , claimRegion
-  , constructPipelineLayoutWith
-  , constructPipelineWith
+  , constructPipelineLayoutFor
+  , constructCheckedPipeline
   , constructRing
   , drawIndexed
   , pushConstants
@@ -434,10 +428,6 @@ drawingBatch ∷ Construction q inst msgr phys dev cmd → IO (Either Refusal (R
 drawingBatch construction = do
   let side = fromIntegral offscreenSide
       ringSize = either (error . show) id (validateRingSize 4096)
-      input =
-        VertexInput
-          [VertexBinding 0 8 PerVertex, VertexBinding 1 8 PerInstance]
-          [VertexAttribute 0 0 VertexFloat2 0, VertexAttribute 1 1 VertexFloat2 0]
       magenta = floatBytes [(1, 0), (1, 1)]
       claimedWith recorder contents = do
         claimed ← claimRegion recorder (fromIntegral (ByteString.length contents)) 4
@@ -476,10 +466,10 @@ drawingBatch construction = do
       constructImage construction (ImageDescription ColorTarget Rgba8Srgb side side 1) >>= \case
         Left refusal → pure (Left refusal)
         Right target →
-          constructPipelineLayoutWith construction [PushConstantRange [PushFragment] 0 16] >>= \case
+          constructPipelineLayoutFor construction quadShaders >>= \case
             Left refusal → pure (Left refusal)
             Right layout →
-              constructPipelineWith construction layout quadShaders (formatCode Rgba8Srgb) input >>= \case
+              constructCheckedPipeline construction layout quadShaders (formatCode Rgba8Srgb) >>= \case
                 Left refusal → pure (Left refusal)
                 Right pipeline →
                   constructReadback construction offscreenBytes >>= \case

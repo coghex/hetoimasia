@@ -21,6 +21,10 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Construction
   , createPipelineWith
   , replacePipeline
   , replacePipelineWith
+  , checkedRanges
+  , createPipelineLayoutFor
+  , createCheckedPipeline
+  , replaceCheckedPipeline
   , createRing
   , createFrameStorage
   , createFramelessStorage
@@ -36,7 +40,7 @@ import Control.Monad (when)
 import qualified Data.Text as Text
 import Data.ByteString (ByteString)
 import Data.Foldable (for_)
-import Data.List (nub)
+import Data.List (nub, sort)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import Data.Word (Word32, Word64)
@@ -78,8 +82,9 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   , ImageQuery (..)
   , ImageUse (..)
   , PipelineRequest (..)
-  , PipelineShaders
+  , PipelineShaders (..)
   , PushConstantRange (..)
+  , PushStage (..)
   , ReadbackAllocation (..)
   , RecordingLimits (..)
   , RecordingOps (..)
@@ -126,6 +131,13 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , ringSizeBytes
   )
 import Hetoimasia.GPU.Vulkan.Native.Internal.Reclamation (failingAgain, recoverAllocation)
+import Hetoimasia.GPU.Vulkan.Native.Shader.Interface
+  ( CheckedShader (..)
+  , CheckedShaders (..)
+  , InterfaceStage (..)
+  , PushMember (..)
+  )
+import qualified Hetoimasia.GPU.Vulkan.Native.Shader.Interface as Interface
 import Hetoimasia.GPU.Vulkan.Native.Naming
   ( NativeObjectKind (..)
   , ShaderStage
@@ -383,6 +395,91 @@ createReadback recording bytes
                     fail "the readback buffer's memory is not mapped"
           )
           Nothing
+
+-- | The push-constant ranges a pipeline over these checked shaders needs, from
+-- their descriptions (GRS-16): one for each stage that declares a block, or
+-- one for both when both declare the same block, each spanning its members.
+-- A stage that declares none needs none. Refused, before anything native: a
+-- vertex shader that is not a vertex description's, or a fragment one that is
+-- not a fragment description's, and two stages whose blocks disagree on any
+-- member's offset or size, as 'RefusedIncompatible'; and a shader declaring a
+-- descriptor binding, which no pipeline layout declares yet, as
+-- 'RefusedUnsupported'.
+checkedRanges ∷ CheckedShaders → Either Refusal [PushConstantRange]
+checkedRanges (CheckedShaders vertex fragment)
+  | Interface.interfaceStage vertexInterface /= VertexInterface = Left (RefusedIncompatible "a vertex stage whose shader is not a vertex shader's")
+  | Interface.interfaceStage fragmentInterface /= FragmentInterface = Left (RefusedIncompatible "a fragment stage whose shader is not a fragment shader's")
+  | not (null (Interface.interfaceDescriptors vertexInterface) && null (Interface.interfaceDescriptors fragmentInterface)) =
+      Left (RefusedUnsupported "a shader declaring descriptor bindings, which no pipeline layout declares yet")
+  | otherwise = case (Interface.interfacePushConstants vertexInterface, Interface.interfacePushConstants fragmentInterface) of
+      ([], []) → Right []
+      (members, []) → Right [spanning [PushVertex] members]
+      ([], members) → Right [spanning [PushFragment] members]
+      (vertexMembers, fragmentMembers)
+        | vertexMembers == fragmentMembers → Right [spanning [PushVertex, PushFragment] vertexMembers]
+        | otherwise → Left (RefusedIncompatible "vertex and fragment stages whose push-constant blocks disagree")
+  where
+    vertexInterface = checkedInterface vertex
+    fragmentInterface = checkedInterface fragment
+    spanning stages members =
+      let low = minimum (map pushMemberOffset members)
+          high = maximum [pushMemberOffset member + pushMemberSize member | member ← members]
+       in PushConstantRange stages low (high - low)
+
+-- | A pipeline layout with exactly the push-constant ranges these checked
+-- shaders need ('checkedRanges'), validated as 'createPipelineLayoutWith'
+-- validates any.
+createPipelineLayoutFor ∷ Recording q inst msgr phys dev cmd → CheckedShaders → IO (Either Refusal PipelineLayout)
+createPipelineLayoutFor recording shaders = case checkedRanges shaders of
+  Left refusal → owned recording (pure (Left refusal))
+  Right ranges → createPipelineLayoutWith recording ranges
+
+-- | A graphics pipeline over the layout from checked shaders (GRS-16): its
+-- vertex input is the vertex shader's description's, and the layout must
+-- declare exactly the push-constant ranges the shaders' descriptions need
+-- ('checkedRanges'), compared without regard to order. A layout that
+-- declares any other ranges is 'RefusedIncompatible', and every refusal
+-- 'checkedRanges' makes is made too, each before any native call; the vertex
+-- input is then validated as 'createPipelineWith' validates any. The
+-- descriptions stay authoritative: nothing else the caller supplies can give
+-- the pipeline other ranges or another input.
+createCheckedPipeline
+  ∷ Recording q inst msgr phys dev cmd → PipelineLayout → CheckedShaders → Word32 → IO (Either Refusal Pipeline)
+createCheckedPipeline recording layout shaders format = checkedPipeline recording layout shaders format Nothing
+
+-- | 'replacePipeline' from checked shaders, checked as 'createCheckedPipeline'
+-- checks them.
+replaceCheckedPipeline
+  ∷ Recording q inst msgr phys dev cmd → Pipeline → PipelineLayout → CheckedShaders → Word32 → IO (Either Refusal Pipeline)
+replaceCheckedPipeline recording (Pipeline old) layout shaders format = checkedPipeline recording layout shaders format (Just old)
+
+checkedPipeline
+  ∷ Recording q inst msgr phys dev cmd
+  → PipelineLayout
+  → CheckedShaders
+  → Word32
+  → Maybe ResourceId
+  → IO (Either Refusal Pipeline)
+checkedPipeline recording held@(PipelineLayout layout) shaders format replacing =
+  owned recording $ case checkedRanges shaders of
+    Left refusal → pure (Left refusal)
+    Right needed →
+      liveNative recording layout >>= \case
+        Left refusal → pure (Left refusal)
+        Right (NativeLayout _ declared)
+          | normalized declared /= normalized needed →
+              pure (Left (RefusedIncompatible "a pipeline layout whose push-constant ranges are not the ones its checked shaders declare"))
+          | otherwise →
+              buildPipeline
+                recording
+                held
+                (PipelineShaders (checkedSpirv (checkedVertex shaders)) (checkedSpirv (checkedFragment shaders)))
+                format
+                (Interface.interfaceVertexInput (checkedInterface (checkedVertex shaders)))
+                replacing
+        Right _ → pure (Left RefusedWrongKind)
+  where
+    normalized ranges = sort [(sort (rangeStages range), rangeOffset range, rangeSize range) | range ← ranges]
 
 -- | Make the session's shared ring (GRS-4, D-33): one host-visible buffer of
 -- the configured size, placed through the device's allocator under the

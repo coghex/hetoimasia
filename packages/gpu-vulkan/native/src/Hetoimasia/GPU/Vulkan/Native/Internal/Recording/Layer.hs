@@ -1,3 +1,5 @@
+{-# LANGUAGE DeriveLift #-}
+
 -- | The native layer of the managed recording
 -- ("Hetoimasia.GPU.Vulkan.Native.Recording"): every native call it makes, as
 -- the open record 'RecordingOps', and the vocabulary of commands, layouts and
@@ -76,6 +78,7 @@ import Data.ByteString (ByteString)
 import Data.Int (Int32)
 import Data.Text (Text)
 import Data.Word (Word32, Word64)
+import Language.Haskell.TH.Syntax (Lift)
 import Numeric.Natural (Natural)
 
 import Hetoimasia.GPU.Model.Access (Barrier (..), ResourceKind (..), ResourceUse (..))
@@ -242,7 +245,7 @@ data PushConstantRange = PushConstantRange
 
 -- | Whether a vertex binding advances per vertex or per instance.
 data InputRate = PerVertex | PerInstance
-  deriving (Eq, Ord, Show, Enum, Bounded)
+  deriving (Eq, Ord, Show, Enum, Bounded, Lift)
 
 -- | The formats a vertex attribute may have: every one of them is one Vulkan
 -- requires every device to support as a vertex buffer format, so no device
@@ -255,7 +258,7 @@ data VertexFormat
   | VertexUint
   | VertexRgba8Unorm
     -- ^ Four normalized bytes, read as four floats.
-  deriving (Eq, Ord, Show, Enum, Bounded)
+  deriving (Eq, Ord, Show, Enum, Bounded, Lift)
 
 -- | The format's @VkFormat@ value.
 vertexFormatCode ∷ VertexFormat → Word32
@@ -291,7 +294,7 @@ data VertexBinding = VertexBinding
   , bindingStride ∷ !Word32
   , bindingRate ∷ !InputRate
   }
-  deriving (Eq, Show)
+  deriving (Eq, Show, Lift)
 
 -- | One vertex attribute a pipeline declares: its shader location, the
 -- binding it reads, its format, and its offset into each element.
@@ -301,7 +304,7 @@ data VertexAttribute = VertexAttribute
   , attributeFormat ∷ !VertexFormat
   , attributeOffset ∷ !Word32
   }
-  deriving (Eq, Show)
+  deriving (Eq, Show, Lift)
 
 -- | A pipeline's vertex input: its bindings and the attributes read from
 -- them, for the triangle-list topology.
@@ -309,7 +312,7 @@ data VertexInput = VertexInput
   { inputBindings ∷ ![VertexBinding]
   , inputAttributes ∷ ![VertexAttribute]
   }
-  deriving (Eq, Show)
+  deriving (Eq, Show, Lift)
 
 -- | No vertex input: the shader makes its own vertices.
 noVertexInput ∷ VertexInput

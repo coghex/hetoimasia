@@ -163,6 +163,15 @@
 -- index data the recording cannot read. Every bind retains exactly its
 -- buffer's generation, or the ring's.
 --
+-- = Pipelines from checked shaders (GRS-16)
+--
+-- A pipeline over shaders compiled by the checked splices of
+-- "Hetoimasia.GPU.Vulkan.Native.Shader" takes its push-constant ranges and its
+-- vertex input from their descriptions: 'createPipelineLayoutFor' makes the
+-- layout the descriptions need ('checkedRanges'), and 'createCheckedPipeline'
+-- and 'replaceCheckedPipeline' refuse a layout that declares anything else,
+-- and stages whose descriptions disagree, before any native call.
+--
 -- = The shared ring (GRS-4, D-33)
 --
 -- A session has at most one ring ('createRing'): a host-visible buffer of the
@@ -351,6 +360,14 @@ module Hetoimasia.GPU.Vulkan.Native.Recording
   , bindIndexBuffer
   , drawIndexed
 
+    -- * Pipelines from checked shaders (GRS-16)
+  , CheckedShader (..)
+  , CheckedShaders (..)
+  , checkedRanges
+  , createPipelineLayoutFor
+  , createCheckedPipeline
+  , replaceCheckedPipeline
+
     -- * The shared ring (GRS-4)
   , RingSize
   , ringSizeBytes
@@ -416,6 +433,10 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Construction
   , createPipelineWith
   , createReadback
   , createRing
+  , checkedRanges
+  , createPipelineLayoutFor
+  , createCheckedPipeline
+  , replaceCheckedPipeline
   , releaseManaged
   , replacePipeline
   , replacePipelineWith
@@ -471,6 +492,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   , useScope
   )
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Readback (fillReadback, readReadback)
+import Hetoimasia.GPU.Vulkan.Native.Shader.Interface (CheckedShader (..), CheckedShaders (..))
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Recorder
   ( Recorder
   , BufferSource (..)
