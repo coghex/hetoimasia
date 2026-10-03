@@ -866,26 +866,27 @@ only home of the `unsafe` subset.
 | --- | --- | --- |
 | Managed rendering resources | `createPipelineLayout`; `createPipeline` over a layout, VK-9's embedded shaders and a color format; `replacePipeline`; `createFrameStorage` for a target's frame slot; `createReadback` of a byte size; `createBuffer` and `createImage` of an engine-defined kind ([Buffers and images](#buffers-and-images)); `releaseManaged` | The native objects, their accounting reserved with `beginAllocation` before each creation, and the exact generation each handle names |
 | Checked frame | `recordFrame` takes a `FrameSlotId` the model holds acquired, and resolves its image, view, extent and format through the generation that owns them | The frame's generation, retained by the batch |
-| Scoped recorder | `transitionImage`, `transitionResource` ([Ordering](#ordering-managed-resources)), `beginRendering`, `bindPipeline`, `setViewport`, `setScissor`, `draw`, `endRendering`, `copyToReadback` | The slot's command storage, the batch's recorded references, and its managed resources' uses |
+| Scoped recorder | `transitionImage`, `transitionResource` ([Ordering](#ordering-managed-resources)), `beginRendering`, `beginRenderingInto` ([Offscreen color targets](#offscreen-color-targets)), `bindPipeline`, `setViewport`, `setScissor`, `draw`, `endRendering`, `copyToReadback`, `copyTargetToReadback` | The slot's command storage, the batch's recorded references, and its managed resources' uses |
 | Recorded batch | `discardBatch`; `resetFrameRecorder`; `noteBatchSubmitted`, which VK-12's `submitFrames` calls | Sealed commands and references, whether or not the caller keeps the `BatchId` |
 | Readback | `readReadback`, `fillReadback` | The buffer's allocation, its mapping, and what last wrote it |
 | Disposal | `disposeResources`, `retireRecording` | Destruction on the owner, only once the model reports every hold ended |
 
 The supported vocabulary is exactly the triangle and its verification: dynamic
-rendering into the frame's one color view, a graphics pipeline compatible with
-the frame's format, dynamic viewport and scissor, whole-triangle draws, the four
-image transitions below, one bounded copy of the whole image into a readback
-buffer, and GRS-3's checked transitions and boundary barriers of managed
-buffers and images. There is no raw command buffer, no callback escape hatch,
-no descriptor, no binding of a managed buffer or image — GRS-4 and GRS-5
-record through them — and no render graph. A command outside that vocabulary — an
+rendering into the frame's one color view or a managed color target's
+([below](#offscreen-color-targets)), a graphics pipeline compatible with the
+attachment's format, dynamic viewport and scissor, whole-triangle draws, the four
+image transitions below, one bounded copy of the whole frame image or color
+target into a readback buffer, and GRS-3's checked transitions and boundary
+barriers of managed buffers and images. There is no raw command buffer, no
+callback escape hatch, no descriptor, no binding of a managed buffer, no
+sampling of an image — GRS-4 records through them — and no render graph. A command outside that vocabulary — an
 unsupported transition, a draw that is not whole triangles, a transition into or
 out of the transfer-source layout or a copy of an image that is not a transfer
 source — is `RefusedUnsupported`; one the recorder's state
 does not admit — a draw outside rendering or before a pipeline, viewport and
 scissor, a transition inside rendering or from a layout the image is not in,
 rendering into an image that is not a color attachment, a viewport that is not
-finite or has no area, a viewport or scissor that leaves the frame's image — is
+finite or has no area, a viewport or scissor that leaves the attachment — is
 `RefusedIllegal`. Keeping both within the image keeps them within every
 device's viewport limits, which Vulkan requires to cover any image a
 framebuffer can hold, so no device limit is read.
@@ -1045,6 +1046,7 @@ the batch's `BatchId` and its frame's target and generation:
 | --- | --- | --- | --- |
 | The batch | `batch <b> target <t> generation <g>` | Right after `vkBeginCommandBuffer` | Right before `vkEndCommandBuffer` |
 | A dynamic-rendering pass | `pass batch <b> target <t> generation <g>` | Right before `vkCmdBeginRendering`, in the same masked step | Right after `vkCmdEndRendering`, in the same masked step |
+| A pass into a managed color target ([GRS-5](#offscreen-color-targets)), in a frame or frame-less batch | `pass batch <b> into resource <n>.<g>` | Right before `vkCmdBeginRendering`, after the target's entry barrier, in the same masked step | Right after `vkCmdEndRendering`, in the same masked step |
 
 The recorder counts the regions open, each from the moment its opening call
 returned. Whatever else happens — a consumer that raised, a cancellation,
@@ -1353,6 +1355,104 @@ again. Nothing changes a resting state, which is the kind's.
 | --- | --- | --- | --- | --- | --- |
 | The batch's accesses, and each touched resource's native handle | The recorder (`Recorder`) | `transitionResource` advances them; `recordFrame`'s seal reads them for the exit barriers | The graphics owner | One consumer action | Dropped with the recorder |
 | An image's initialization | The model (`Internal.Initialization`) | `createImage` marks it; a first touch claims it; an accepted submission publishes it; a dropped batch or an unknown effect withdraws it | The graphics owner, through the roots' model | The generation's record | Leaves with the record |
+
+### Offscreen color targets
+
+GRS-5 (#338) renders into a managed `ColorTarget` image
+([Buffers and images](#buffers-and-images)) and reads it back, in a frame batch
+and a [frame-less batch](#frame-less-batches) alike. It obeys GRS-3's contract
+above: the target's uses are `ColorAttachment` at rest and `TransferRead` to
+copy it, every entry and exit barrier is the recorder's, and the consumer's own
+transitions are explicit.
+
+**The pass.** `beginRenderingInto recorder image start clear` begins dynamic
+rendering with the target's owned view as the one color attachment, cleared to
+the color across the target's whole extent, which is the render area. It needs
+no swapchain image, so a frame-less batch records it. How the pass begins is
+the consumer's `PassStart`:
+
+- `ClearTarget` is a use of the target in its color-attachment use, keeping its
+  contents: the batch's first touch records the entry barrier, and a target
+  another touch in this batch moved elsewhere is `RefusedIllegal`. Its
+  contents must be initialized.
+- `ClearFromUndefined` is a transition from undefined into that use: its
+  barrier discards whatever the target held, and is the initialization a new
+  target awaits ([Initialization](#ordering-managed-resources)).
+
+Before any native call the handle must be this session's (otherwise
+`RefusedMisuse ForeignIdentity`), live (a released or stale one is
+`RefusedMisuse WrongPhase`), and a `ColorTarget` (otherwise
+`RefusedWrongKind`); no pass may be open; and a `ClearTarget` pass into a
+target that awaits initialization, or into one another batch is still
+initializing, is `RefusedUninitialized`. The batch retains the target before
+its barrier and the pass are recorded. `endRendering` ends either kind of pass,
+and `beginRendering` keeps rendering into the frame's image exactly as before.
+
+**The attachment governs.** The open pass's attachment — the target's extent
+and format, or the frame image's — is what a pipeline, a viewport and a
+scissor are checked against; outside rendering a frame batch checks them
+against its frame's image, and a frame-less batch, which has no image to
+check them against, refuses them, `RefusedIllegal`. A draw checks the bound
+pipeline's format, the viewport and the scissor again against the pass it is
+drawn in, so state bound for one attachment never reaches another's draw: a
+pipeline built for another format is `RefusedIncompatible`, naming both
+formats, and a viewport or scissor beyond the target is `RefusedIllegal`.
+Either way nothing native happens.
+
+**Formats.** A color target is RGBA8 or BGRA8, each sRGB or linear
+(`R8G8B8A8_SRGB`, `R8G8B8A8_UNORM`, `B8G8R8A8_SRGB`, `B8G8R8A8_UNORM`); a
+pipeline renders into it only when built for that same format
+(`createPipeline … (formatCode format)`). An sRGB target encodes what the
+fragment shader writes on store, as Vulkan specifies, and a linear one stores
+it as it is.
+
+**The copy.** `copyTargetToReadback recorder image readback` copies the whole
+target, mip level 0 of its color aspect, into a readback buffer, then records
+the same buffer barrier from the copy's transfer write to host reads that
+`copyToReadback` does ([Readback memory](#readback-memory)). The target must be
+in its `TransferRead` use within the batch — the consumer's explicit
+`transitionResource image (FromUse ColorAttachment) TransferRead` — and the
+consumer returns it to rest after the copy, or the seal refuses the batch and
+leaves it partial. Before any native call the target is checked as for a pass
+and so is the buffer: this session's and live; recorded outside rendering
+(inside it is `RefusedIllegal`); large enough for four bytes a pixel of the whole target
+(`readbackBytesFor`, otherwise `RefusedOutOfBounds`); and written by no other
+copy any batch or submission still holds (`RefusedInUse`). A copy before the
+transition is `RefusedIllegal`, naming the use the target is in. The batch
+retains both before the copy is recorded.
+
+**The bytes.** A readback's bytes are the target's rows, top row first, each
+pixel four bytes in the target's own format's component order — R, G, B, A for
+RGBA8 and B, G, R, A for BGRA8 — tightly packed, with no padding between rows
+and no conversion: an sRGB target's bytes are its encoded values. They are
+exposed exactly as a frame image's are: only once the batch that recorded the
+copy was recorded as submitted and its submission has completed, and a copy
+discarded with its batch, or the completion of any other batch, exposes
+nothing. The window integration lends a readback buffer to an owner-thread
+action or a renderer with `constructReadback`, reads it with
+`readConstructedReadback`, and releases it with `releaseConstructed`.
+
+**Release.** A target or buffer released after its copy was recorded is held
+by its batch, and destroyed only once that batch's holds have ended.
+
+**Proof.** The stand-in suite (`Test.GPU.Vulkan.Native.Offscreen`) renders into
+a target and copies it in both batch kinds, checks pipeline, viewport and
+scissor state left from the frame's pass against a target of another format
+and extent, and covers every refusal above, the seal's refusal of a target left
+in its transfer-source use, a discarded copy and an unrelated completion
+exposing nothing, and initialization published only by submission. The
+surface-free native case `grs5-offscreen` clears an `R8G8B8A8_SRGB` target and
+an `R8G8B8A8_UNORM` one to blue from undefined in frame-less batches, draws a
+pipeline-only yellow triangle (`endpointShaders`, every channel 0 or 1, so
+exact in either encoding), copies each into a readback buffer, waits on its
+ticket, and reads exact bytes at probe points well inside and outside the
+triangle, with validation, synchronization validation included, reporting
+nothing. It writes each readback as a PNG to a temporary path its record
+prints; no reference image is committed.
+
+| State | Owner | Readers and writers | Thread | Lifetime | Reset or disposal |
+| --- | --- | --- | --- | --- | --- |
+| The open pass's attachment, and the bound pipeline's format, viewport and scissor | The recorder (`Recorder`) | `beginRendering` and `beginRenderingInto` set the attachment and `endRendering` clears it; `bindPipeline`, `setViewport` and `setScissor` set the rest; `draw` reads all of it | The graphics owner | One consumer action | Dropped with the recorder |
 
 ### Destruction
 
@@ -2690,8 +2790,11 @@ a consumer a `Recorder` for one frame-less batch and answers its
 has — the owner's thread, the handles, retention before each native call,
 #335's transitions, boundary barriers and sealing rules — but no swapchain
 image: every command that needs one (`transitionImage`, `beginRendering`,
-`bindPipeline`, `setViewport`, `setScissor`, `copyToReadback`) is
-`RefusedUnsupported` before anything native. The batch is recorded into the
+`copyToReadback`) is `RefusedUnsupported` before anything native. It renders
+into a managed color target instead ([Offscreen color
+targets](#offscreen-color-targets)): `bindPipeline`, `setViewport` and
+`setScissor` are checked against the open pass's target, and outside a pass,
+with no image to check them against, are `RefusedIllegal`. The batch is recorded into the
 command storage of the lowest free frame-less slot: made the first time the
 slot is used — named, released and destroyed like a frame storage — and reused
 by later batches of the slot only after its batch was discarded or its
