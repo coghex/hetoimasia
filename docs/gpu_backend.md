@@ -1715,7 +1715,9 @@ matching interface; so is an interface naming an id the module defines no
 variable for, any type an interface variable reaches — through pointers,
 struct members, array elements and lengths, vector components, matrix columns,
 image sampled types and sampled images' images — that the module does not
-define or defines malformed, a descriptor variable lacking its `DescriptorSet`
+define or defines malformed (an integer or float of a width SPIR-V does not
+allow, an array length whose constant is not of a defined 32-bit integer type,
+an image sampled type that is not void or a well-formed scalar), a descriptor variable lacking its `DescriptorSet`
 or `Binding`, a
 buffer whose element is not a defined struct decorated as its storage class
 requires, and a combined image sampler over anything but a defined, sampled
