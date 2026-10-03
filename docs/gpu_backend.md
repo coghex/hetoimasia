@@ -1471,8 +1471,9 @@ GRS-4 (#340) draws from vertex, index and instance data with push constants,
 and gives each session one shared ring of host-visible memory that batches
 claim regions of (D-33). It obeys GRS-3's contract: a bind is a use of a
 buffer, its entry and exit barriers are the recorder's, and the consumer's own
-transitions are explicit. The shader-interface check — that a shader declares
-what its pipeline does — is GRS-16's, not this.
+transitions are explicit. That a shader declares what its pipeline does is
+checked when it is compiled ([Checked shader interfaces](#checked-shader-interfaces),
+GRS-16).
 
 **Push constants.** `createPipelineLayoutWith recording ranges` makes a layout
 with no descriptor sets and these `PushConstantRange`s, each naming the stages
@@ -1661,6 +1662,105 @@ the readback as a PNG to a temporary path its record prints.
 | The shared ring: its generation, mapping, size, atom, next claim number and head | The recording (`Internal.Recording.State`) | `createRing` makes it; every claim reads it and advances the number and head | The graphics owner | From `createRing` until its buffer's disposal | Its generation released by `retireRecording` with every other live one; forgotten once the model records that disposal |
 | The ring's regions | The recording | `claimRegion` adds one for its batch and reclaims completed batches' to make room; a discard, reset or completed slot's invalidation, and a storage's disposal, release a dropped batch's | The graphics owner | From the claim until its batch's submission completes or its invalidation returns | Kept through an invalidation that raised, an unknown effect and a device loss; never reissued |
 | The bound pipeline's interface, and the vertex and index data bound | The recorder (`Recorder`) | `bindPipeline` sets the pipeline; `bindVertexBuffer` and `bindIndexBuffer` set the bindings; `pushConstants`, `draw` and `drawIndexed` read them | The graphics owner | One consumer action | Dropped with the recorder |
+
+### Checked shader interfaces
+
+GRS-16 (#341) checks every shader that reads anything from the host against a
+Haskell description of that interface while the package builds, with no native
+tool (D-19, D-34), and builds pipelines from the descriptions.
+
+**Descriptions.** A `ShaderInterface`
+(`Hetoimasia.GPU.Vulkan.Native.Shader.Interface`) names its stage
+(`VertexInterface` or `FragmentInterface`) and what the host supplies:
+
+- its push-constant block, as each member's offset and size in bytes
+  (`PushMember`), in declaration order — empty for a shader with none;
+- for a vertex shader, its vertex input as the pipeline binds it — the
+  `VertexInput` of [Drawing from buffers](#drawing-from-buffers). SPIR-V cannot
+  say whether a binding advances per vertex or per instance, its stride, or an
+  attribute's binding, byte offset or storage format, so those are the
+  description's, and only each attribute's location and the shader type its
+  format is read as are compared: one to four 32-bit floats for the float
+  formats and for four normalized bytes, a 32-bit unsigned integer for the
+  unsigned one;
+- its descriptor bindings (`DescriptorDeclaration`): set, binding, kind
+  (`CombinedImageSampler`, `SampledImage`, `StorageImage`, `Sampler`,
+  `UniformBuffer`, `StorageBuffer`) and count — `DescriptorCount n`, compared
+  exactly, or `RuntimeSized`, a runtime-sized array whose capacity is the
+  layout's and whose filled count the allocation's, neither of which a shader
+  states.
+
+A description is a value a splice runs, so it is defined in another module, or
+written whole in the splice's argument.
+
+**The reader.** `Hetoimasia.GPU.Vulkan.Native.Shader.Reflect`, in the private
+`shader-toolchain` library, reads a module's interface from its words: its one
+entry point and the global variables its interface lists — every global the
+shader uses, from SPIR-V 1.4 — through their storage classes, types and
+decorations. It reports the push-constant block's members, their sizes computed
+from scalars, vectors, matrices under their stride and majority, and arrays
+under their stride; a vertex shader's inputs that are not built-ins, by
+location and scalar or vector type; and each descriptor's set, binding, kind and
+count. A fragment shader's inputs and outputs and a vertex shader's outputs are
+varyings, which the validation layer checks at pipeline creation, and built-ins
+are the device's: it reports neither. A module it cannot read, or a construct
+it does not support — a nested push-constant struct, a matrix or array vertex
+input, a texel buffer — is an error naming it, never an empty or a matching
+interface.
+
+**The checked splices.** `checkedVertexShader` and `checkedFragmentShader` take
+a description and source text, and `checkedVertexShaderFile` and
+`checkedFragmentShaderFile` a description and a file, compiling exactly as the
+other splices do. They read the SPIR-V's interface and compare it with the
+description in both directions: something declared but absent from the shader,
+something present but undeclared, and a stage, push-constant member offset or
+size, vertex input location or format, or descriptor set, binding, kind or
+count that disagrees each fail the build, naming the module, the splice's
+position, the stage and every mismatch. A shader that passes is a
+`CheckedShader`: its SPIR-V beside its description.
+
+**Unchecked splices.** `vertexShader`, `fragmentShader`, their file forms, and
+`compileShaderQ` and `compileShaderFileQ` for those stages compile only
+interface-free shaders: one declaring a push-constant block, a vertex input or a
+descriptor binding fails the build, naming each and the checked splice to use.
+Built-ins and varyings are no interface of the host's, so the triangle's
+shaders and the verification shaders compile unchanged. Compute shaders are out
+of scope and compile as before.
+
+**Pipelines.** `CheckedShaders` pairs a checked vertex and fragment shader.
+`checkedRanges` derives the push-constant ranges a pipeline over them needs:
+one for each stage that declares a block, one for both stages when both declare
+the same block, none for a stage that declares none; stages whose blocks
+disagree on any member's offset or size are `RefusedIncompatible`, a stage given
+the other stage's shader is too, and a shader declaring a descriptor binding is
+`RefusedUnsupported`, since no layout declares descriptor sets yet (GRS-7).
+`createPipelineLayoutFor` makes the layout with exactly those ranges.
+`createCheckedPipeline` and `replaceCheckedPipeline` build a pipeline whose
+vertex input is the vertex description's, and refuse a supplied layout that
+declares any other ranges, `RefusedIncompatible`, so the descriptions stay
+authoritative on creation and replacement alike; every refusal is made before
+any native call. The window integration lends them as
+`constructPipelineLayoutFor`, `constructCheckedPipeline` and
+`replaceConstructedCheckedPipeline`. The `quadShaders` of
+`Hetoimasia.GPU.Vulkan.Native.Recording.Shaders`, which `grs4-drawing` draws
+with, are checked shaders over the descriptions in
+`Hetoimasia.GPU.Vulkan.Native.Recording.ShaderInterfaces`.
+
+**Proof.** `shader-tests` reads committed SPIR-V fixtures
+(`test/fixtures/spirv/`, each beside its GLSL): a vertex shader's push-constant
+matrix, vector and array and its inputs, but not its built-in or varying; every
+descriptor kind with a fixed and a runtime-sized array; refusals of a nested
+push-constant struct, a matrix input and malformed modules; and no interface in
+the interface-free verification pair. Matching checked shaders in the source
+and file forms, with vertex and instance host layouts and fixed and
+runtime-sized arrays, compile with the suite. External clients, each compiled
+against the built package, fail their build naming a push-constant member's
+offset and size, a vertex input's location and format, a descriptor's set,
+binding number, type and count, a block declared but absent and one present but
+undeclared, and an unchecked splice over a shader with an interface. In
+`native-tests`, `Test.GPU.Vulkan.Native.Checked` derives layouts from checked
+shaders, takes the vertex input from the description, and refuses each
+disagreement above with no native call, through a replacement too.
 
 ### Destruction
 
