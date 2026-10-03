@@ -89,11 +89,21 @@ spec = describe "Shader interfaces" $ do
             _ → False
       -- Every Block (2) decoration removed: the uniform block is refused.
       reflect (without (decorating 2) bytes) `shouldSatisfy` failedWith "whose struct is not a Block"
-      -- Every struct definition removed.
-      reflect (without (\instruction → opcodeOf instruction == 30) bytes) `shouldSatisfy` failedWith "is a buffer whose struct the module does not declare"
+      -- Every struct definition removed: the buffers' pointers reach types no
+      -- longer defined.
+      reflect (without (\instruction → opcodeOf instruction == 30) bytes) `shouldSatisfy` failedWith "which the module does not declare"
       -- Every image type removed: the first descriptor, a combined image
-      -- sampler, names one no longer defined.
-      reflect (without (\instruction → opcodeOf instruction == 25) bytes) `shouldSatisfy` failedWith "is a combined image sampler over an image type the module does not declare"
+      -- sampler, reaches one no longer defined.
+      reflect (without (\instruction → opcodeOf instruction == 25) bytes) `shouldSatisfy` failedWith "which the module does not declare"
+
+    it "refuses any type an interface variable reaches that the module does not define: a buffer member's runtime array, an image's sampled type" $ do
+      bytes ← ByteString.readFile "test/fixtures/spirv/descriptors.frag.spv"
+      -- Every runtime-array type removed: the storage buffer's member, and
+      -- the table's, now name types no longer defined.
+      reflect (without (\instruction → opcodeOf instruction == 29) bytes) `shouldSatisfy` failedWith "which the module does not declare"
+      -- Every image's sampled type replaced by an id the module never defines.
+      reflect (rewriting (\instruction → if opcodeOf instruction == 25 then replaceWord 2 0xFFFFF instruction else instruction) bytes)
+        `shouldSatisfy` failedWith "reaches an image whose sampled type (id 1048575) the module does not declare"
 
     it "refuses a vertex input that starts past its location's first component" $ do
       bytes ← ByteString.readFile "test/fixtures/spirv/component.vert.spv"
@@ -239,6 +249,26 @@ without removed bytes = ByteString.concat (header : [instruction | instruction �
           let count = fromIntegral (firstWord rest `shiftR` 16) * 4
               (instruction, remaining) = ByteString.splitAt count rest
            in instruction : instructions remaining
+
+-- | A module with every instruction passed through the function, its header
+-- kept.
+rewriting ∷ (ByteString.ByteString → ByteString.ByteString) → ByteString.ByteString → ByteString.ByteString
+rewriting change bytes = ByteString.concat (header : map change (split body))
+  where
+    (header, body) = ByteString.splitAt 20 bytes
+    split rest
+      | ByteString.null rest = []
+      | otherwise =
+          let (instruction, remaining) = ByteString.splitAt (fromIntegral (firstWord rest `shiftR` 16) * 4) rest
+           in instruction : split remaining
+
+-- | An instruction with its word at this index — the opcode word is 0 —
+-- replaced, in this host's byte order.
+replaceWord ∷ Int → Word32 → ByteString.ByteString → ByteString.ByteString
+replaceWord index value instruction =
+  ByteString.take (index * 4) instruction
+    <> ByteString.pack [fromIntegral (value `shiftR` shift) | shift ← [0, 8, 16, 24]]
+    <> ByteString.drop ((index + 1) * 4) instruction
 
 -- | An instruction's words, in this host's byte order, and its opcode.
 wordsOf ∷ ByteString.ByteString → [Word32]

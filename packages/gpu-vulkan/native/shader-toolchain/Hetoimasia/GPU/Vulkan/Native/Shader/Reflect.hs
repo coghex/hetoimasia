@@ -25,7 +25,9 @@
 -- texel buffer, an input attachment, a vertex input that starts past its
 -- location's first component — is an error naming it, never an empty or a
 -- matching interface; so is an interface naming an id the module defines no
--- variable for, a descriptor variable lacking its DescriptorSet or Binding, and a push-constant member whose extent is beyond what 32
+-- variable for, a type any interface variable reaches that the module does not
+-- define or defines malformed, a descriptor variable lacking its DescriptorSet
+-- or Binding, and a push-constant member whose extent is beyond what 32
 -- bits can hold, computed without bound and never wrapped.
 --
 -- The module's words are read in the byte order the compiler wrote them,
@@ -150,6 +152,9 @@ reflect bytes = do
   globals ← forM interface $ \variable → case Map.lookup variable (moduleVariables parsed) of
     Just held → Right (variable, held)
     Nothing → Left ("the entry point's interface names id " <> show variable <> ", which the module defines no variable for")
+  -- Every type an interface variable reaches is defined and well-formed
+  -- before anything is read from it.
+  mapM_ (\(variable, (pointer, _)) → definedType parsed variable pointer) globals
   push ← pushBlock parsed [(variable, pointer) | (variable, (pointer, storage)) ← globals, storage == storagePushConstant]
   inputs ←
     if stage == ReflectedVertex
@@ -358,6 +363,49 @@ descriptor parsed variable pointer storage =
         | otherwise → Left "an image whose use is unknown until run time, which the reader does not support"
       Just _ → Left "a type that is not an image"
       Nothing → Left "an image type the module does not declare"
+
+-- ---------------------------------------------------------------------------
+-- Well-formed types
+
+-- | Whether the type a variable is declared with, and every type it reaches —
+-- a pointer's pointee, a struct's members, an array's element and length, a
+-- vector's component, a matrix's column, an image's sampled type, a sampled
+-- image's image — is one the module defines with the operands its opcode
+-- needs. The first reference that is not is an error naming it and the
+-- variable.
+definedType ∷ Module → Word32 → Word32 → Either String ()
+definedType parsed variable = go []
+  where
+    named = "the interface variable (id " <> show variable <> ")"
+    go seen typeId
+      | typeId `elem` seen = Right ()
+      | otherwise = case typeOf parsed typeId of
+          Nothing → Left (named <> " reaches type id " <> show typeId <> ", which the module does not declare")
+          Just (Instruction opcode operands) →
+            let next = go (typeId : seen)
+             in case (opcode, operands) of
+                  (32, [_, _, pointee']) → next pointee'
+                  (30, _ : members) → mapM_ next members
+                  (28, [_, element, length']) → next element >> constantOf length'
+                  (29, [_, element]) → next element
+                  (23, [_, component, _]) → next component
+                  (24, [_, column, _]) → next column
+                  (25, _ : sampledType : _ : _ : _ : _ : _ : _) → scalarOrVoid sampledType
+                  (27, [_, image]) → next image
+                  (21, [_, _, _]) → Right ()
+                  (22, _ : _ : _) → Right ()
+                  (19, [_]) → Right ()
+                  (20, [_]) → Right ()
+                  (26, [_]) → Right ()
+                  (43, _) → Right ()
+                  _ → Left (named <> " reaches type id " <> show typeId <> ", whose opcode " <> show opcode <> " has operands the reader cannot read")
+    constantOf constant = case typeOf parsed constant of
+      Just (Instruction 43 [_, _, _]) → Right ()
+      _ → Left (named <> " reaches an array length (id " <> show constant <> ") that is not a defined 32-bit constant")
+    scalarOrVoid typeId = case typeOf parsed typeId of
+      Just (Instruction opcode _) | opcode `elem` [19, 21, 22] → Right ()
+      Just _ → Left (named <> " reaches an image whose sampled type (id " <> show typeId <> ") is not a scalar or void")
+      Nothing → Left (named <> " reaches an image whose sampled type (id " <> show typeId <> ") the module does not declare")
 
 -- ---------------------------------------------------------------------------
 -- Shared lookups
