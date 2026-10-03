@@ -88,6 +88,7 @@ library
         Hetoimasia.GPU.Vulkan.Native.Roots.Vulkan
         Hetoimasia.GPU.Vulkan.Native.Shader
         Hetoimasia.GPU.Vulkan.Native.Shader.Interface
+        Hetoimasia.GPU.Vulkan.Native.Uploads
     -- VK-11's audited recording subset: the package's only genuine `unsafe`
     -- Vulkan imports. Private, so nothing outside the package can record
     -- through them; see the module and docs/gpu_backend.md, "The FFI audit".
@@ -159,6 +160,7 @@ library
         Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Readback
         Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Recorder
         Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
+        Hetoimasia.GPU.Vulkan.Native.Internal.Uploads
         Hetoimasia.GPU.Vulkan.Native.Internal.Vma
     -- The messenger callback, and the compile-time check that the diagnostics
     -- package's layout mirror is the Vulkan headers' layout. The headers come
@@ -306,6 +308,7 @@ test-suite native-tests
         Test.GPU.Vulkan.Native.Roots
         Test.GPU.Vulkan.Native.StandIn
         Test.GPU.Vulkan.Native.Terminal
+        Test.GPU.Vulkan.Native.Uploads
     ghc-options: -threaded -rtsopts
     build-depends:
         base >=4.22 && <4.23,

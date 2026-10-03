@@ -306,6 +306,11 @@ module Hetoimasia.GPU.Vulkan.Native.Recording
   , kindFormats
   , ImageDescription (..)
   , fullMipChain
+  , FormatBlock (..)
+  , formatBlock
+  , levelExtent
+  , levelRows
+  , levelBytes
   , createImage
 
     -- * Ordering (GRS-3)
@@ -334,6 +339,7 @@ module Hetoimasia.GPU.Vulkan.Native.Recording
   , draw
   , copyToReadback
   , copyTargetToReadback
+  , copyLevelToReadback
   , readbackBytesFor
 
     -- * Pipeline interfaces and drawing from buffers (GRS-4)
@@ -476,6 +482,11 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   , formatCode
   , formatNeedsCompressionBC
   , fullMipChain
+  , FormatBlock (..)
+  , formatBlock
+  , levelBytes
+  , levelExtent
+  , levelRows
   , imageKindUse
   , kindFormats
   , NativeCommand (..)
@@ -507,6 +518,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Recorder
   , beginRenderingInto
   , bindPipeline
   , copyTargetToReadback
+  , copyLevelToReadback
   , copyToReadback
   , draw
   , endRendering

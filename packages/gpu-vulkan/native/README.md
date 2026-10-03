@@ -269,6 +269,34 @@ private `shader-toolchain` library, holds `loadToolchain`, `compileShader` and
 the fingerprint. That library depends on neither the binding nor Template
 Haskell.
 
+### Shader interfaces (GRS-16)
+
+A shader that reads anything from the host — a push-constant block, vertex
+inputs, descriptor bindings — is compiled by a checked splice given its
+`ShaderInterface` (`Hetoimasia.GPU.Vulkan.Native.Shader.Interface`), defined in
+another module:
+
+```haskell
+quad ∷ CheckedShader
+quad = $(checkedVertexShader quadVertex [glsl|
+  #version 450
+  layout(location = 0) in vec2 position;
+  void main() { gl_Position = vec4(position, 0.0, 1.0); }
+|])
+```
+
+`checkedVertexShader`, `checkedFragmentShader` and their file forms compile as
+the other splices do, read the SPIR-V's interface with the pure reader in
+`shader-toolchain` (`Hetoimasia.GPU.Vulkan.Native.Shader.Reflect`), and fail
+the build on any disagreement with the description in either direction, naming
+the module, the splice, the stage and each mismatch. A shader that passes is a
+`CheckedShader`, whose description a pipeline takes its push-constant ranges and
+vertex input from (`createPipelineLayoutFor`, `createCheckedPipeline`). The
+unchecked vertex and fragment splices compile only interface-free shaders, and
+fail the build naming any interface they find; built-ins and varyings are not
+one. [gpu_backend.md](../../../docs/gpu_backend.md#checked-shader-interfaces)
+states what is compared and how pipelines use descriptions.
+
 ### The fingerprint
 
 GHC does not notice an executable changing because a splice once ran it, so the

@@ -85,6 +85,7 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , newRigOf
   , surfaceFreeRig
   , withActionCapacity
+  , withUploads
   , capturingRigOf
   , visibleRig
   , visibleRigOf
@@ -195,6 +196,7 @@ import Hetoimasia.GPU.Vulkan.Native.Allocator
   )
 import qualified Hetoimasia.GPU.Vulkan.Native.Allocator as Allocator
 import Hetoimasia.GPU.Vulkan.Native.Recording (ImageLimits (..), NativeCommand (..), PipelineRequest (..), RecordingLimits (..), RecordingOps (..), Refusal (..), ViewRequest (..))
+import Hetoimasia.GPU.Vulkan.Native.Uploads (UploadConfig)
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   ( CaptureMode (..)
   , FrameEvent (..)
@@ -1132,7 +1134,7 @@ renderingLayers events rendering clock =
         , opsImageSupport = \_ → pure (Just (ImageLimits 16384 16384 15 (2 ^ (31 ∷ Int))))
         , opsMaxBufferSize = pure (1024 * 1024 * 1024)
         , opsMaxFramebuffer = pure (16384, 16384)
-        , opsRecordingLimits = pure (RecordingLimits 128 16 16 2048 2047 64)
+        , opsRecordingLimits = pure (RecordingLimits 128 16 16 2048 2047 64 16384)
         , opsCreateView = \_ request → do
             handle ← fresh
             handle <$ record events (OwnedViewMade handle (requestViewImage request))
@@ -1286,6 +1288,8 @@ data Rig = Rig
     -- ^ When the host creates the session's device.
   , rigActionCapacity ∷ !Natural
     -- ^ How many owner-thread actions may be queued at once.
+  , rigUploads ∷ !(Maybe UploadConfig)
+    -- ^ The session's uploads, if any (GRS-6).
   , rigSession ∷ !(TVar (Maybe Session))
     -- ^ The session the host was given, once it has been made: what a direct
     -- command host is built over, as an application that supplies its own
@@ -1320,6 +1324,10 @@ surfaceFreeRig count = (\rig → rig {rigDeviceStart = DeviceSurfaceFree}) <$> n
 -- | The same rig with this many owner-thread actions queued at once.
 withActionCapacity ∷ Natural → Rig → Rig
 withActionCapacity capacity rig = rig {rigActionCapacity = capacity}
+
+-- | The same rig with the session's uploads configured (GRS-6).
+withUploads ∷ UploadConfig → Rig → Rig
+withUploads configured rig = rig {rigUploads = Just configured}
 
 -- | How many surface creations the bridge has admitted, held ones included.
 creationsBegun ∷ Rig → STM Word64
@@ -1521,6 +1529,7 @@ newRigClocked visible windows clock = do
       , rigFrameHook = frameHook
       , rigDeviceStart = DeviceAtFirstSurface
       , rigActionCapacity = defaultActionCapacity
+      , rigUploads = Nothing
       , rigSession = session
       }
 
@@ -1549,6 +1558,7 @@ runRigHere rig body = do
                   renderScene chosen current request construction recorder
           , vulkanDeviceStart = rigDeviceStart rig
           , vulkanActionCapacity = rigActionCapacity rig
+          , vulkanUploads = rigUploads rig
           , vulkanFrameObserver = \event → do
               atomically $ do
                 modifyTVar' (rigFrameEvents rig) (<> [event])

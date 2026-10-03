@@ -4116,7 +4116,16 @@ wait, because a timeout is not evidence; a cancellation ends it, leaving what
 is still owed with the owner, unverified, and named to whole-owner retirement.
 
 The owner schedules its own waits from its own deadlines and its own demand, on
-the host's injected `hostClock` and an injected `OwnerTimer`. It wakes for a
+the host's injected `hostClock` and an injected `OwnerTimer`. The timer is
+given the owner's absolute deadline: for every wait it arms — the owner's own
+and its exit drain's — the owner reads its clock once and hands the timer the
+deadline, an instant of that clock, beside the duration that remained until it
+at that reading. The drain's fallback, when the backend names no deadline, is
+the fallback interval after the drain's reading. A timer that reads a clock
+decides expiry by comparing that clock with the deadline; it never measures the
+duration again from a later reading, which would end after the owner's deadline
+whenever the clock moved in between. The process's `realtimeOwnerTimer` waits
+the remaining duration in real time, at least a microsecond. It wakes for a
 stop, a latched terminal failure, a lifetime event, a fresher observation, a
 newly published demand or scene, a record it may now forget, or its own
 deadline. Publications are in that list for a reason worth saying plainly: an

@@ -15,7 +15,8 @@
 -- except for an object the model refused to record, which nothing can
 -- reference and which is destroyed here at once.
 module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Construction
-  ( createPipelineLayout
+  ( createStaging
+  , createPipelineLayout
   , createPipelineLayoutWith
   , createPipeline
   , createPipelineWith
@@ -42,6 +43,7 @@ import Data.ByteString (ByteString)
 import Data.Foldable (for_)
 import Data.List (nub, sort)
 import qualified Data.Map.Strict as Map
+import qualified Data.Set as Set
 import Data.Text (Text)
 import Data.Word (Word32, Word64)
 import Numeric.Natural (Natural)
@@ -92,7 +94,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   , VertexBinding (..)
   , VertexInput (..)
   , ViewRequest (..)
-  , BufferKind (InstanceBuffer)
+  , BufferKind (InstanceBuffer, StagingBuffer)
   , bufferKindUse
   , noVertexInput
   , vertexFormatBytes
@@ -546,6 +548,58 @@ createRing recording size =
     bytes = ringSizeBytes size
     (flags, usage) = bufferKindUse InstanceBuffer
 
+-- | Make a staging buffer for the session's uploads (GRS-6): one host-visible
+-- buffer of the configured size, of the staging kind — a transfer source in
+-- staging memory — placed through the device's allocator and mapped for its
+-- lifetime by a map of its own after the allocating call (D-40), charged as
+-- the allocator holds it. A size larger than the device's @maxBufferSize@ is
+-- 'RefusedOutOfBounds' before anything is made; a block the byte budget
+-- cannot hold is 'RefusedBackpressure', having allocated nothing.
+--
+-- It is a managed generation the recording owns, as the shared ring is: no
+-- handle to it is returned, and it is released with every other live
+-- generation when the recording retires. Answers it, its mapping, and the
+-- granularity its regions must be padded to: one on coherent memory, and the
+-- device's @nonCoherentAtomSize@ otherwise.
+createStaging ∷ Recording q inst msgr phys dev cmd → Natural → IO (Either Refusal (ResourceId, ReadbackAllocation, Natural))
+createStaging recording bytes =
+  owned recording $ do
+    most ← opsMaxBufferSize (recordingOps recording)
+    if bytes > most
+      then pure (Left (RefusedOutOfBounds bytes most))
+      else do
+        limits ← opsRecordingLimits (recordingOps recording)
+        made ←
+          construct
+            recording
+            0
+            2
+            "vmaCreateBuffer"
+            ( \_ _ attempt _ →
+                allocateBuffer (recordingRoots recording) attempt usage (BufferRequest bytes flags) >>= \case
+                  Left refusal → pure (Left (allocationRefused refusal))
+                  Right allocated
+                    | Just _ ← allocatedMapped allocated → pure (Right (NativeBuffer StagingBuffer bytes allocated))
+                    -- Staging memory is host-visible, and so always mapped.
+                    | otherwise → do
+                        freeBuffer (recordingRoots recording) allocated
+                        fail "the staging buffer's memory is not mapped"
+            )
+            Nothing
+        case made of
+          Left refusal → pure (Left refusal)
+          Right resource → atomically $ do
+            managed ← readTVar (recordingManaged recording)
+            pure $ case managedNative <$> Map.lookup resource managed of
+              Just (NativeBuffer _ _ allocated)
+                | Just mapped ← allocatedMapped allocated →
+                    let mapping = ReadbackAllocation (memoryResource (allocatedMemory allocated)) (allocatedMemory allocated) bytes (allocatedCoherent allocated) mapped
+                        atom = if allocatedCoherent allocated then 1 else max 1 (limitNonCoherentAtom limits)
+                     in Right (resource, mapping, atom)
+              _ → Left (RefusedMisuse (StaleIdentity ResourceIdentity))
+  where
+    (flags, usage) = bufferKindUse StagingBuffer
+
 -- | @VK_BUFFER_USAGE_TRANSFER_DST_BIT@: what a readback buffer is used as.
 transferDestination ∷ Word32
 transferDestination = 0x00000002
@@ -848,19 +902,31 @@ managedNames recording resource = \case
 -- | Release a handle: nothing records through it again, and its CPU use —
 -- reading a readback included — ends with it. Batches that already recorded
 -- it keep it until their own references end.
+--
+-- The target of an upload still settling (GRS-6) is recordable no longer at
+-- once, but released in the model only once its upload settles: an upload
+-- not yet started is then cancelled, and one already copying finishes, so its
+-- later copies are never stranded and it is never destroyed under them.
 releaseManaged ∷ Managed handle ⇒ Recording q inst msgr phys dev cmd → handle → IO (Either Refusal ())
 releaseManaged recording handle =
   owned recording $
     liveNative recording resource >>= \case
       Left refusal → pure (Left refusal)
       Right _ → atomically $ do
-        released ← modelAnswer roots (fmap (\next → (next, ())) . releaseResource resource)
-        case released of
-          Left refusal → pure (Left refusal)
-          Right () → do
-            modelEdit roots (endResourceCpuUse resource)
+        uploading ← Set.member resource <$> readTVar (recordingUploading recording)
+        if uploading
+          then do
+            modifyTVar' (recordingReleaseDeferred recording) (Set.insert resource)
             editManaged recording resource (\entry → entry {managedStanding = ManagedReleased})
             pure (Right ())
+          else do
+            released ← modelAnswer roots (fmap (\next → (next, ())) . releaseResource resource)
+            case released of
+              Left refusal → pure (Left refusal)
+              Right () → do
+                modelEdit roots (endResourceCpuUse resource)
+                editManaged recording resource (\entry → entry {managedStanding = ManagedReleased})
+                pure (Right ())
   where
     resource = managedResource handle
     roots = recordingRoots recording

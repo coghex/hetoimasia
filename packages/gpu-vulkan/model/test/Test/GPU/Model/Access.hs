@@ -49,7 +49,7 @@ spec = describe "access" $ do
 
     it "gives each kind exactly the uses its usage provides for" $
       map (legalUses . kindOf) [minBound .. maxBound]
-        `shouldBe` [ [ShaderSampled, TransferWrite]
+        `shouldBe` [ [ShaderSampled, TransferWrite, TransferRead]
                    , [DepthAttachment]
                    , [ColorAttachment, TransferRead]
                    , [GeometryRead, TransferWrite]

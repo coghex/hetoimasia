@@ -290,6 +290,14 @@ work retained by a future loading pipeline.
   policy, identity and persistence choices, numeric budgets, and whether RTC-3
   is a prerequisite. No virtual filesystem or generic asset manager design
   was approved. This is outside the first effort.
+- **Upload staging since delivered:** GRS-6 (#342) gives the GPU end of this
+  pipeline its own bounds. A session's uploads admit bytes from any thread
+  into one configured staging buffer, charging each upload its padded bytes,
+  with a queue capacity, a per-turn byte budget, backpressure distinct from a
+  permanent oversized refusal, cancellation before the first copy, and a
+  ticket per upload ([Uploads](gpu_backend.md#uploads)). Loading, decoding,
+  content identity and the memory those hold before admission stay this
+  finding's.
 
 ## Application composition and input
 

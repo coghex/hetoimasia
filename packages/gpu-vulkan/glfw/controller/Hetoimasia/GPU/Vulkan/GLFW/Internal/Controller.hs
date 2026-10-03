@@ -192,6 +192,11 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , ActionOutcome (..)
   , ActionTicket
   , submitVulkanAction
+
+    -- * Uploads (GRS-6)
+  , VulkanUploadRefusal (..)
+  , submitVulkanUpload
+  , cancelVulkanUpload
   , readVulkanAction
   , awaitVulkanAction
 
@@ -268,7 +273,7 @@ import qualified Data.ByteString.Char8 as Char8
 import Data.Foldable (for_)
 import Data.Functor ((<&>))
 import Data.IORef (newIORef, readIORef, writeIORef)
-import Data.Maybe (isJust)
+import Data.Maybe (isJust, isNothing)
 import Data.List (nubBy)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -364,6 +369,13 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Capture
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
 import Hetoimasia.GPU.Vulkan.Native.Frames (FrameOps (..))
 import Hetoimasia.GPU.Vulkan.Native.Recording (ClearColor (..), RecordingOps (..))
+import Hetoimasia.GPU.Vulkan.Native.Uploads
+  ( CancelRefusal
+  , UploadConfig
+  , UploadRefusal (UploadClosed, UploadSessionFailed)
+  , UploadRequest
+  , UploadTicket
+  )
 import Hetoimasia.GPU.Vulkan.Native.Generations
   ( GenerationUse
   , Generations
@@ -608,8 +620,9 @@ data Replacement obligation
 -- | A controller over a native layer and a surface bridge.
 --
 -- The device start says whether the owner's startup creates the device
--- without a surface, and the capacity bounds the owner-thread actions queued
--- at once. The layers are the ones the instance is asked to enable, each of
+-- without a surface, the capacity bounds the owner-thread actions queued at
+-- once, and the upload configuration, if any, is the session's uploads'
+-- (GRS-6). The layers are the ones the instance is asked to enable, each of
 -- which the loader must offer, and the validation features are the ones its
 -- create info enables through them. The clock is the one the roots' model and the owner's
 -- deadlines read, which must be the host's; the period is how soon the owner
@@ -618,6 +631,7 @@ newVulkanController
   ∷ CaptureMode
   → VulkanDeviceStart
   → Natural
+  → Maybe UploadConfig
   → RootOps Quiesced inst msgr phys dev
   → RenderingOps phys dev cmd
   → FrameObserver
@@ -637,6 +651,7 @@ newVulkanControllerWith
   → CaptureMode
   → VulkanDeviceStart
   → Natural
+  → Maybe UploadConfig
   → RootOps Quiesced inst msgr phys dev
   → RenderingOps phys dev cmd
   → FrameObserver
@@ -648,7 +663,7 @@ newVulkanControllerWith
   → MonotonicSource
   → Duration
   → IO VulkanController
-newVulkanControllerWith hooks capture deviceStart capacity ops rendering observer pointer bridge layers validation budgets clock poll = do
+newVulkanControllerWith hooks capture deviceStart capacity uploads ops rendering observer pointer bridge layers validation budgets clock poll = do
   roots ← newRoots ops budgets clock
   ownerOpen ← newTVarIO (pure True)
   actions ← newActions capacity (actionGate roots ownerOpen)
@@ -658,7 +673,7 @@ newVulkanControllerWith hooks capture deviceStart capacity ops rendering observe
     CaptureOff → newGenerations roots
     CaptureOn → newGenerationsCapturing roots
   captures ← newCaptures capture
-  rendered ← newRendering roots generations rendering observer captures
+  rendered ← newRendering roots generations rendering observer captures uploads
   fmap VulkanController $
     State roots generations rendered pointer bridge layers validation
       <$> newTVarIO Nothing
@@ -822,6 +837,9 @@ controllerOperations (VulkanController state) renderer =
             [ join (readTVar (stateWake state))
             , capturesRequested (stateCaptures state)
             , (&&) <$> actionsWaiting (stateActions state) <*> (not <$> readTVar (stateDiagnosticPending state))
+            , -- An admitted upload with copies to record asks for the round
+              -- that records them, as an admitted action does (GRS-6).
+              (&&) <$> renderingUploadsWaiting (stateRendering state) <*> (not <$> readTVar (stateDiagnosticPending state))
             ]
     , graphicsPrepareRetirement = \retiring → retaining state (prepareRetirement state retiring)
     , graphicsRetireTarget = \retiring → retaining state (retireTarget state retiring)
@@ -833,6 +851,10 @@ controllerOperations (VulkanController state) renderer =
         -- Owner-thread actions first, each alone on this thread: none runs
         -- beside a frame's rendering, and what they release is reclaimed by
         -- this same step.
+        -- The session's uploads are made first (GRS-6), the first round the
+        -- device exists, so they exist before any action of the session's
+        -- runs.
+        madeUploads ← makeRenderingUploads (stateRendering state)
         served ← serviceActions state
         settled ← settleUnannounced state
         mapped ← readTVarIO (stateTargets state)
@@ -891,12 +913,53 @@ controllerOperations (VulkanController state) renderer =
         -- observed it, and what the renderer or a capture released is
         -- destroyed once nothing holds it.
         captured ← settleCaptures (stateRendering state)
+        -- Uploads after the step's poll (GRS-6), so a completion it observed
+        -- settles its upload in this same step: each round records the copies
+        -- of those waiting, up to the turn's budget, in a frame-less batch of
+        -- their own, and settles those whose final batch completed; once the
+        -- owner's admission has closed, those not yet started are cancelled.
+        open ← isNothing <$> atomically (actionGate (stateRoots state) (stateOwnerOpen state))
+        uploaded ← (madeUploads ||) <$> progressRenderingUploads (stateRendering state) open
         reclaimReleased (stateRendering state) now
         asked ← askReplacements state (summarySurfacesWanted summary)
         replaced ← settleReplacements state now (stepTargets step)
         noticeUnavailable state
         failRequired state
-        pure (if served || settled || summaryAdvanced summary || asked || replaced || presented || captured then noStepWork {stepAdvanced = True} else noStepWork)
+        pure (if served || uploaded || settled || summaryAdvanced summary || asked || replaced || presented || captured then noStepWork {stepAdvanced = True} else noStepWork)
+
+-- | Why an upload was not admitted through the controller (GRS-6).
+data VulkanUploadRefusal
+  = VulkanUploadsUnavailable !UploadsUnavailable
+    -- ^ The session takes no upload: none configured, the device not yet
+    -- made, or the device refused the configuration.
+  | VulkanUploadRefused !UploadRefusal
+    -- ^ The uploads refused it, as 'submitUpload' says; once the session has
+    -- failed or the owner's admission has closed, as 'UploadSessionFailed'
+    -- or 'UploadClosed'.
+  deriving (Eq, Show)
+
+-- | Admit an upload from any thread (GRS-6): refused once the session has
+-- failed, with its primary, or once the owner's admission has closed, as an
+-- owner-thread action is — read in the same transactions that reserve and
+-- queue it — and otherwise answered as the session's uploads answer it. Admission makes an idle owner runnable: its wake asks for the round
+-- that records the upload's first copies.
+submitVulkanUpload ∷ VulkanController → UploadRequest → IO (Either VulkanUploadRefusal UploadTicket)
+submitVulkanUpload (VulkanController state) request =
+  either (Left . either VulkanUploadsUnavailable VulkanUploadRefused) Right
+    <$> submitRenderingUpload (stateRendering state) gate request
+  where
+    -- The owner's own gate, read in the transactions that reserve and queue
+    -- the upload, so none is queued once quiescence has closed the owner.
+    gate =
+      actionGate (stateRoots state) (stateOwnerOpen state) <&> \case
+        Just (ActionSessionFailed primary) → Just (UploadSessionFailed primary)
+        Just _ → Just UploadClosed
+        Nothing → Nothing
+
+-- | Cancel an upload from any thread, before its first copies are recorded
+-- ('cancelUpload').
+cancelVulkanUpload ∷ VulkanController → UploadTicket → STM (Either CancelRefusal ())
+cancelVulkanUpload (VulkanController state) = cancelRenderingUpload (stateRendering state)
 
 -- | Whether an owner-thread action may be admitted or started now: refused
 -- once the session has failed, with its primary, and once the owner's
@@ -2072,6 +2135,11 @@ data VulkanHostConfig scene = VulkanHostConfig
   , vulkanActionCapacity ∷ !Natural
     -- ^ How many owner-thread actions may be queued at once; one more is
     -- refused, never waited for.
+  , vulkanUploads ∷ !(Maybe UploadConfig)
+    -- ^ The session's uploads (GRS-6): its staging buffer's size, the bytes
+    -- its owner records into upload copies in one turn, and how many uploads
+    -- may wait at once, validated by 'validateUploadConfig'. 'Nothing', by
+    -- default, takes no upload.
   }
 
 -- | When the session's one device is selected and created.
@@ -2094,10 +2162,10 @@ defaultActionCapacity = 64
 -- | A configuration with the given capture configuration and budgets, no
 -- layers or validation features, the owner's defaults, no observer, a
 -- renderer that clears every frame to opaque black, the device created at the
--- first window's admission, and 'defaultActionCapacity'.
+-- first window's admission, 'defaultActionCapacity', and no uploads.
 vulkanHostConfig ∷ HostConfig → CaptureConfig → Budgets → Prepared scene → VulkanHostConfig scene
 vulkanHostConfig host capture budgets scene =
-  VulkanHostConfig host capture [] [] budgets scene id (const noObserver) (clearRenderer (\_ _ → ClearColor 0 0 0 1)) noFrameObserver DeviceAtFirstSurface defaultActionCapacity
+  VulkanHostConfig host capture [] [] budgets scene id (const noObserver) (clearRenderer (\_ _ → ClearColor 0 0 0 1)) noFrameObserver DeviceAtFirstSurface defaultActionCapacity Nothing
 
 -- | A running Vulkan graphics host.
 data VulkanHost scene = VulkanHost
@@ -2159,6 +2227,7 @@ withVulkanOwnerHostHooked hooks capturing logger layer rendering pointer bridge 
         capturing
         (vulkanDeviceStart config)
         (vulkanActionCapacity config)
+        (vulkanUploads config)
         (observeRoots observer (layer capture))
         (observeRendering observer rendering)
         (vulkanFrameObserver config)
