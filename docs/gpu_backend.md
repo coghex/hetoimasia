@@ -2384,7 +2384,11 @@ pair the native case draws with. The vertex shader covers the render area
 with one triangle. The fragment shader resolves the pushed handle: an index
 past the version's `entries.length()`, or an entry whose generation differs
 from the handle's, resolves to slot 0 before any descriptor is read. It then
-samples that slot (`nonuniformEXT`) with the pushed sampler, clamped to 3.
+samples that slot with the pushed sampler, clamped to 3. The profile
+enables non-uniform sampled-image indexing and not dynamic indexing, so both
+indices and the combined sampled image the sample consumes carry
+`nonuniformEXT`; the shader suite checks that the compiled SPIR-V decorates
+them `NonUniform`.
 Their interface descriptions are `tableVertexInterface` and
 `tableFragmentInterface`: the handle at push offset 0 and the sampler index
 at `tableSamplerOffset` (8).
