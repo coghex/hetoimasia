@@ -20,15 +20,24 @@
 -- A fragment shader's inputs and outputs and a vertex shader's outputs are
 -- varyings, which the pipeline's own validation checks, and built-ins are the
 -- device's: neither is part of what the host declares, and the reader reports
--- neither. A module it cannot read, or an interface construct it does not
--- support — a nested push-constant struct, a matrix or array vertex input, a
--- texel buffer, an input attachment, a vertex input that starts past its
--- location's first component — is an error naming it, never an empty or a
--- matching interface; so is an interface naming an id the module defines no
--- variable for, a type any interface variable reaches that the module does not
--- define or defines malformed, a descriptor variable lacking its DescriptorSet
--- or Binding, and a push-constant member whose extent is beyond what 32
--- bits can hold, computed without bound and never wrapped.
+-- neither.
+--
+-- Before anything is read, every type and constant an interface variable
+-- reaches is checked against one explicit whitelist, the subset the reader
+-- supports ('validateInterface'): its opcode is one its position allows — a
+-- type where a type is required, of the kinds that position may hold, and an
+-- 'OpConstant' where an array length is required — its operand count is exact,
+-- its literals are in range, every id it names resolves to an instruction of
+-- the required kind declared before it, so a cycle or a forward reference
+-- cannot pass, and no id is declared twice. A module it cannot read, an
+-- interface construct it does not support — a nested push-constant struct, a
+-- matrix or array vertex input, a texel buffer, an input attachment, a vertex
+-- input that starts past its location's first component — or one that fails
+-- that whitelist is an error naming it, never an empty or a matching
+-- interface; so is an interface naming an id the module defines no variable
+-- for, a descriptor variable lacking its DescriptorSet or Binding, and a
+-- push-constant member whose extent is beyond what 32 bits can hold, computed
+-- without bound and never wrapped.
 --
 -- The module's words are read in the byte order the compiler wrote them,
 -- which the magic number says.
@@ -44,13 +53,14 @@ module Hetoimasia.GPU.Vulkan.Native.Shader.Reflect
   , renderReflectedType
   ) where
 
-import Control.Monad (forM, unless, when)
+import Control.Monad (foldM, foldM_, forM, unless, when)
 import Data.Bits (shiftL, shiftR, (.&.), (.|.))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import Data.List (sortOn)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust)
+import qualified Data.Set as Set
 import Data.Word (Word32)
 
 -- | What a shader's SPIR-V says it reads from the host.
@@ -133,6 +143,11 @@ data Module = Module
   , moduleMemberDecorations ∷ !(Map.Map (Word32, Word32) [(Word32, [Word32])])
   , moduleEntries ∷ ![(Word32, [Word32])]
     -- ^ Each entry point's execution model and interface ids.
+  , modulePositions ∷ !(Map.Map Word32 Int)
+    -- ^ Where in the module each type, constant and global variable is
+    -- declared, by result id.
+  , moduleDuplicates ∷ ![Word32]
+    -- ^ Every such result id declared more than once.
   }
 
 -- | Read a module's interface, or say why it cannot be read.
@@ -140,7 +155,7 @@ reflect ∷ ByteString → Either String Reflection
 reflect bytes = do
   words' ← moduleWords bytes
   instructions ← decode words'
-  let parsed = foldl collect (Module Map.empty Map.empty Map.empty Map.empty []) instructions
+  let parsed = foldl collect (Module Map.empty Map.empty Map.empty Map.empty [] Map.empty []) (zip [0 ..] instructions)
   (model, interface) ← case moduleEntries parsed of
     [entry] → Right entry
     [] → Left "the module has no entry point"
@@ -152,9 +167,9 @@ reflect bytes = do
   globals ← forM interface $ \variable → case Map.lookup variable (moduleVariables parsed) of
     Just held → Right (variable, held)
     Nothing → Left ("the entry point's interface names id " <> show variable <> ", which the module defines no variable for")
-  -- Every type an interface variable reaches is defined and well-formed
-  -- before anything is read from it.
-  mapM_ (\(variable, (pointer, _)) → definedType parsed variable pointer) globals
+  -- Every type and constant an interface variable reaches is on the
+  -- whitelist before anything is read from it.
+  validateInterface parsed globals
   push ← pushBlock parsed [(variable, pointer) | (variable, (pointer, storage)) ← globals, storage == storagePushConstant]
   inputs ←
     if stage == ReflectedVertex
@@ -199,18 +214,21 @@ decode words' = go (drop 5 words')
                 then Left "the module ends inside an instruction"
                 else (Instruction opcode (take (count - 1) rest) :) <$> go (drop (count - 1) rest)
 
-collect ∷ Module → Instruction → Module
-collect parsed instruction@(Instruction opcode operands) = case (opcode, operands) of
+collect ∷ Module → (Int, Instruction) → Module
+collect parsed (position, instruction@(Instruction opcode operands)) = case (opcode, operands) of
   (15, model : _ : rest) → parsed {moduleEntries = moduleEntries parsed <> [(model, drop (stringWords rest) rest)]}
   (71, target : decorated : values) → parsed {moduleDecorations = Map.insertWith (flip (<>)) target [(decorated, values)] (moduleDecorations parsed)}
   (72, target : member : decorated : values) →
     parsed {moduleMemberDecorations = Map.insertWith (flip (<>)) (target, member) [(decorated, values)] (moduleMemberDecorations parsed)}
-  (59, pointer : result : storage : _) → parsed {moduleVariables = Map.insert result (pointer, storage) (moduleVariables parsed)}
+  (59, pointer : result : storage : _) → declared result (parsed {moduleVariables = Map.insert result (pointer, storage) (moduleVariables parsed)})
   _
-    | opcode `elem` typeOpcodes, result : _ ← operands → parsed {moduleTypes = Map.insert result instruction (moduleTypes parsed)}
-    | opcode `elem` constantOpcodes, _ : result : _ ← operands → parsed {moduleTypes = Map.insert result instruction (moduleTypes parsed)}
+    | opcode `elem` typeOpcodes, result : _ ← operands → declared result (parsed {moduleTypes = Map.insert result instruction (moduleTypes parsed)})
+    | opcode `elem` constantOpcodes, _ : result : _ ← operands → declared result (parsed {moduleTypes = Map.insert result instruction (moduleTypes parsed)})
     | otherwise → parsed
   where
+    declared result held
+      | Map.member result (modulePositions held) = held {moduleDuplicates = moduleDuplicates held <> [result]}
+      | otherwise = held {modulePositions = Map.insert result position (modulePositions held)}
     -- A literal string occupies the words up to and including the one whose
     -- last byte is a terminating zero.
     stringWords rest = 1 + length (takeWhile (not . terminated) rest)
@@ -365,60 +383,190 @@ descriptor parsed variable pointer storage =
       Nothing → Left "an image type the module does not declare"
 
 -- ---------------------------------------------------------------------------
--- Well-formed types
+-- The whitelist
 
--- | Whether the type a variable is declared with, and every type it reaches —
--- a pointer's pointee, a struct's members, an array's element and length, a
--- vector's component, a matrix's column, an image's sampled type, a sampled
--- image's image — is one the module defines with the operands its opcode
--- needs: an integer of 8, 16, 32 or 64 bits and a signedness of 0 or 1, a float
--- of 16, 32 or 64 bits, an array length that is a constant of a defined 32-bit
--- integer type, an image's sampled type that is void or such a scalar. The
--- first reference that is not is an error naming it and the variable.
-definedType ∷ Module → Word32 → Word32 → Either String ()
-definedType parsed variable = go []
+-- | Whether every type and constant the interface variables reach is one the
+-- reader supports, structurally:
+--
+-- * each variable's storage class is one the reader knows, and its type is an
+--   'OpTypePointer' of that same storage class declared before it;
+-- * each id an instruction names resolves to a type or constant declared
+--   before that instruction — so a forward reference, a self-reference and a
+--   cycle are all refused — and no such id is declared twice;
+-- * each id names an instruction of the kind its position requires: a
+--   pointer's pointee, an array's or runtime array's element, a struct's
+--   members (a runtime array only as the last), a vector's scalar component,
+--   a matrix's float-vector column, an image's sampled type (a 32-bit float or
+--   a 32- or 64-bit integer), a sampled image's image, and an array's length,
+--   an 'OpConstant' of a 32-bit integer type with a positive value;
+-- * each instruction has exactly the operands its opcode takes, with literals
+--   in range: an integer of 8, 16, 32 or 64 bits and a signedness of 0 or 1, a
+--   float of 16, 32 or 64 bits, a vector of 2, 3 or 4 components, a matrix of
+--   2, 3 or 4 columns, an image's dimension, depth, arrayed, multisampled,
+--   sampled, format and access operands within their enumerations, and a
+--   pointer's storage class one the reader knows;
+-- * nothing an Input, Output, Uniform, PushConstant or StorageBuffer variable
+--   reaches is a boolean or an opaque image, sampler or sampled image, which
+--   those storage classes cannot hold.
+--
+-- The first instruction that is not is an error naming it, the rule it
+-- breaks, and the variable that reaches it.
+validateInterface ∷ Module → [(Word32, (Word32, Word32))] → Either String ()
+validateInterface parsed globals = do
+  case moduleDuplicates parsed of
+    duplicate : _ → Left ("the module defines id " <> show duplicate <> " more than once")
+    [] → pure ()
+  foldM_ variableOk Set.empty globals
   where
-    named = "the interface variable (id " <> show variable <> ")"
-    go seen typeId
-      | typeId `elem` seen = Right ()
-      | otherwise = case typeOf parsed typeId of
-          Nothing → Left (named <> " reaches type id " <> show typeId <> ", which the module does not declare")
-          Just (Instruction opcode operands) →
-            let next = go (typeId : seen)
-             in case (opcode, operands) of
-                  (32, [_, _, pointee']) → next pointee'
-                  (30, _ : members) → mapM_ next members
-                  (28, [_, element, length']) → next element >> constantOf length'
-                  (29, [_, element]) → next element
-                  (23, [_, component, _]) → next component
-                  (24, [_, column, _]) → next column
-                  (25, _ : sampledType : _ : _ : _ : _ : _ : _) → scalarOrVoid sampledType
-                  (27, [_, image]) → next image
-                  (21, [_, width, signedness])
-                    | width `elem` [8, 16, 32, 64] && signedness `elem` [0, 1] → Right ()
-                  (22, [_, width])
-                    | width `elem` [16, 32, 64] → Right ()
-                  (22, [_, width, _encoding])
-                    | width `elem` [16, 32, 64] → Right ()
-                  (19, [_]) → Right ()
-                  (20, [_]) → Right ()
-                  (26, [_]) → Right ()
-                  (43, _) → Right ()
-                  _ → Left (named <> " reaches type id " <> show typeId <> ", whose opcode " <> show opcode <> " has operands the reader cannot read")
-    -- An array length is a constant whose own result type is followed: a
-    -- defined, well-formed integer of exactly the one word its value has.
-    constantOf constant = case typeOf parsed constant of
-      Just (Instruction 43 [resultType, _, _]) → case typeOf parsed resultType of
-        Just (Instruction 21 [_, 32, signedness]) | signedness `elem` [0, 1] → Right ()
-        Just _ → Left (named <> " reaches an array length (id " <> show constant <> ") whose type (id " <> show resultType <> ") is not a 32-bit integer")
-        Nothing → Left (named <> " reaches an array length (id " <> show constant <> ") whose type (id " <> show resultType <> ") the module does not declare")
-      _ → Left (named <> " reaches an array length (id " <> show constant <> ") that is not a defined 32-bit constant")
-    -- A sampled type is void or a scalar, its operands validated as any other
-    -- reached type's are.
-    scalarOrVoid typeId = case typeOf parsed typeId of
-      Just (Instruction opcode _) | opcode `elem` [19, 21, 22] → go [] typeId
-      Just _ → Left (named <> " reaches an image whose sampled type (id " <> show typeId <> ") is not a scalar or void")
-      Nothing → Left (named <> " reaches an image whose sampled type (id " <> show typeId <> ") the module does not declare")
+    variableOk seen (variable, (pointer, storage)) = do
+      let named = "the interface variable (id " <> show variable <> ")"
+      held ← case lookup storage storageClasses of
+        Just name → Right name
+        Nothing → Left (named <> " has storage class " <> show storage <> ", which the reader does not support")
+      let position = Map.findWithDefault 0 variable (modulePositions parsed)
+          context = if storage `elem` hostVisible then Just held else Nothing
+      Instruction opcode operands ← refer named variable position "its pointer type" pointer
+      unless (opcode == 32) $ Left (wrongKind named pointer "its pointer type" opcode "an OpTypePointer")
+      seen' ← wellFormed named context seen pointer
+      case operands of
+        [_, declared, _]
+          | declared /= storage →
+              Left (named <> " has storage class " <> show storage <> ", but its pointer type (id " <> show pointer <> ") has storage class " <> show declared)
+        _ → pure seen'
+
+    -- Resolve an id named by the instruction declared at this position.
+    refer named user position role target = case (Map.lookup target (moduleTypes parsed), Map.lookup target (modulePositions parsed)) of
+      (Just instruction, Just declared)
+        | declared < position → Right instruction
+        | otherwise → Left (named <> " reaches id " <> show target <> " as " <> role <> ", which is not declared before the instruction (id " <> show user <> ") that refers to it")
+      _ → Left (named <> " reaches id " <> show target <> " as " <> role <> ", which the module does not declare as a type or constant")
+
+    wrongKind named target role opcode requirement =
+      named <> " reaches id " <> show target <> " as " <> role <> ", an " <> opcodeName opcode <> ", where the reader requires " <> requirement
+
+    -- Check one type's own operands, then each type it names; a type already
+    -- checked in the same storage-class context is not checked again.
+    wellFormed named context seen typeId
+      | Set.member (context, typeId) seen = Right seen
+      | otherwise = do
+          let marked = Set.insert (context, typeId) seen
+              position = Map.findWithDefault 0 typeId (modulePositions parsed)
+          Instruction opcode operands ← maybe (Left (named <> " reaches id " <> show typeId <> ", which the module does not declare as a type or constant")) Right (Map.lookup typeId (moduleTypes parsed))
+          let count ∷ String → Either String a
+              count expected = Left (named <> " reaches type id " <> show typeId <> ", an " <> opcodeName opcode <> " with " <> show (length operands) <> " operands, where the reader requires " <> expected)
+              literal ∷ String → String → Either String a
+              literal what allowed = Left (named <> " reaches type id " <> show typeId <> ", an " <> opcodeName opcode <> " " <> what <> ", where the reader requires " <> allowed)
+              -- Resolve a named type, require its kind, refuse what this
+              -- storage class cannot hold, then check it in turn.
+              child role requirement allowed target through = do
+                Instruction childOpcode childOperands ← refer named typeId position role target
+                unless (childOpcode `elem` allowed) $ Left (wrongKind named target role childOpcode requirement)
+                case context of
+                  Just name
+                    | childOpcode `elem` [20, 25, 26, 27] →
+                        Left (named <> " reaches id " <> show target <> " as " <> role <> ", an " <> opcodeName childOpcode <> ", which the " <> name <> " storage class cannot hold")
+                  _ → pure ()
+                checked ← wellFormed named context through target
+                pure (checked, childOpcode, childOperands)
+          case opcode of
+            _ | opcode `elem` [19, 20, 26] → if length operands == 1 then pure marked else count "1"
+            21 → case operands of
+              [_, width, signedness]
+                | width `notElem` [8, 16, 32, 64] → literal ("of width " <> show width) "8, 16, 32 or 64"
+                | signedness `notElem` [0, 1] → literal ("of signedness " <> show signedness) "0 or 1"
+                | otherwise → pure marked
+              _ → count "3"
+            22 → case operands of
+              [_, width]
+                | width `notElem` [16, 32, 64] → literal ("of width " <> show width) "16, 32 or 64"
+                | otherwise → pure marked
+              _ → count "2"
+            23 → case operands of
+              [_, component, components] → do
+                (checked, _, _) ← child "a vector's component" "a scalar" [20, 21, 22] component marked
+                if components `elem` [2, 3, 4] then pure checked else literal ("of " <> show components <> " components") "2, 3 or 4"
+              _ → count "3"
+            24 → case operands of
+              [_, column, columns] → do
+                (checked, _, columnOperands) ← child "a matrix's column" "a float vector" [23] column marked
+                case columnOperands of
+                  [_, component, _] → case Map.lookup component (moduleTypes parsed) of
+                    Just (Instruction 22 _) → pure ()
+                    Just (Instruction other _) → literal ("whose column is a vector of " <> opcodeName other) "a float vector"
+                    Nothing → pure ()
+                  _ → pure ()
+                if columns `elem` [2, 3, 4] then pure checked else literal ("of " <> show columns <> " columns") "2, 3 or 4"
+              _ → count "3"
+            25 → case operands of
+              _ : sampledType : dimension : depth : arrayed : multisampled : sampled : format : access
+                | length access <= 1 → do
+                    (checked, sampledOpcode, sampledOperands) ← child "an image's sampled type" "a 32-bit float or a 32- or 64-bit integer" [21, 22] sampledType marked
+                    case (sampledOpcode, sampledOperands) of
+                      (21, [_, width, _]) | width `elem` [32, 64] → pure ()
+                      (22, [_, 32]) → pure ()
+                      _ → Left (named <> " reaches id " <> show sampledType <> " as an image's sampled type, an " <> opcodeName sampledOpcode <> " of width " <> show (widthOf sampledOperands) <> ", where the reader requires a 32-bit float or a 32- or 64-bit integer")
+                    let ranges = [("dimension", dimension, 6), ("depth", depth, 2), ("arrayed", arrayed, 1), ("multisampled", multisampled, 1), ("sampled", sampled, 2), ("format", format, 41)] <> [("access qualifier", qualifier, 2) | qualifier ← access]
+                    case [(what, value, most) | (what, value, most) ← ranges, value > most] of
+                      (what, value, most) : _ → literal ("of " <> what <> " " <> show value) ("at most " <> show most)
+                      [] → pure checked
+              _ → count "8 or 9"
+            27 → case operands of
+              [_, image] → (\(checked, _, _) → checked) <$> child "a sampled image's image" "an OpTypeImage" [25] image marked
+              _ → count "2"
+            28 → case operands of
+              [_, element, length'] → do
+                (checked, _, _) ← child "an array element" "a sized or opaque type" elementOpcodes element marked
+                arrayLength named typeId position length' checked
+              _ → count "3"
+            29 → case operands of
+              [_, element] → (\(checked, _, _) → checked) <$> child "a runtime array's element" "a sized or opaque type" elementOpcodes element marked
+              _ → count "2"
+            30 → case operands of
+              _ : members →
+                foldM
+                  ( \through (index, member) → do
+                      let lastMember = index == length members - 1
+                          allowed = if lastMember then 29 : memberOpcodes else memberOpcodes
+                          role = "struct member " <> show index
+                      (checked, memberOpcode, _) ← child role "a sized type, or a runtime-sized array as the last member" allowed member through
+                      when (memberOpcode == 29 && not lastMember) $ Left (wrongKind named member role memberOpcode "a sized type, or a runtime-sized array as the last member")
+                      pure checked
+                  )
+                  marked
+                  (zip [0 ∷ Int ..] members)
+              [] → count "at least 1"
+            32 → case operands of
+              [_, storage, pointee']
+                | Nothing ← lookup storage storageClasses → literal ("of storage class " <> show storage) ("one of storage classes " <> show (map fst storageClasses))
+                | otherwise → (\(checked, _, _) → checked) <$> child "a pointer's pointee" "a type other than void or a pointer" pointeeOpcodes pointee' marked
+              _ → count "3"
+            _ → Left (named <> " reaches type id " <> show typeId <> ", an " <> opcodeName opcode <> ", which the reader does not support")
+      where
+        widthOf = \case
+          _ : width : _ → width
+          _ → 0
+
+    -- An array's length: an OpConstant, declared before the array, of exactly
+    -- its three operands, whose type is a 32-bit integer declared before it
+    -- and whose value is positive.
+    arrayLength named array position constant seen = do
+      Instruction opcode operands ← refer named array position "an array length" constant
+      case (opcode, operands) of
+        (43, resultType : rest) → do
+          let constantPosition = Map.findWithDefault 0 constant (modulePositions parsed)
+          Instruction typeOpcode typeOperands ← refer named constant constantPosition "an array length's type" resultType
+          checked ← wellFormed named Nothing seen resultType
+          signed ← case (typeOpcode, typeOperands) of
+            (21, [_, 32, signedness]) → Right (signedness == 1)
+            _ → Left (named <> " reaches id " <> show constant <> " as an array length, an OpConstant whose type (id " <> show resultType <> ") is not a 32-bit integer")
+          case rest of
+            [_, value]
+              | value == 0 → Left (named <> " reaches id " <> show constant <> " as an array length, an OpConstant of 0, where the reader requires a positive length")
+              | signed && value >= 0x80000000 →
+                  Left (named <> " reaches id " <> show constant <> " as an array length, an OpConstant of " <> show (toInteger value - 0x100000000) <> ", where the reader requires a positive length")
+              | otherwise → pure checked
+            _ → Left (named <> " reaches id " <> show constant <> " as an array length, an OpConstant with " <> show (length operands) <> " operands, where the reader requires 3")
+        _ → Left (wrongKind named constant "an array length" opcode "an OpConstant of a 32-bit integer type")
 
 -- ---------------------------------------------------------------------------
 -- Shared lookups
@@ -456,9 +604,46 @@ memberDecoration parsed struct member wanted = case lookup wanted (Map.findWithD
 spirvMagic ∷ Word32
 spirvMagic = 0x07230203
 
+-- | Every type declaration with a result id, and every constant, so a
+-- position requiring one kind can name the other it found. Only some are on
+-- the whitelist.
 typeOpcodes, constantOpcodes ∷ [Word32]
-typeOpcodes = [19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 32]
-constantOpcodes = [43]
+typeOpcodes = [19 .. 38]
+constantOpcodes = [41, 42, 43, 44, 45, 46, 48, 49, 50, 51, 52]
+
+-- | What an array's or runtime array's element, a struct's member and a
+-- pointer's pointee may be.
+elementOpcodes, memberOpcodes, pointeeOpcodes ∷ [Word32]
+elementOpcodes = [20, 21, 22, 23, 24, 25, 26, 27, 28, 30]
+memberOpcodes = [20, 21, 22, 23, 24, 28, 30]
+pointeeOpcodes = [20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30]
+
+-- | The storage classes the reader knows, by number, and those whose
+-- contents the host or the pipeline's fixed function supplies or receives.
+storageClasses ∷ [(Word32, String)]
+storageClasses =
+  [ (0, "UniformConstant")
+  , (1, "Input")
+  , (2, "Uniform")
+  , (3, "Output")
+  , (4, "Workgroup")
+  , (6, "Private")
+  , (9, "PushConstant")
+  , (12, "StorageBuffer")
+  ]
+
+hostVisible ∷ [Word32]
+hostVisible = [1, 2, 3, 9, 12]
+
+opcodeName ∷ Word32 → String
+opcodeName opcode = case lookup opcode names of
+  Just name → name
+  Nothing → "instruction of opcode " <> show opcode
+  where
+    names =
+      zip [19 ..] ["OpTypeVoid", "OpTypeBool", "OpTypeInt", "OpTypeFloat", "OpTypeVector", "OpTypeMatrix", "OpTypeImage", "OpTypeSampler", "OpTypeSampledImage", "OpTypeArray", "OpTypeRuntimeArray", "OpTypeStruct", "OpTypeOpaque", "OpTypePointer", "OpTypeFunction", "OpTypeEvent", "OpTypeDeviceEvent", "OpTypeReserveId", "OpTypeQueue", "OpTypePipe"]
+        <> zip [41 ..] ["OpConstantTrue", "OpConstantFalse", "OpConstant", "OpConstantComposite", "OpConstantSampler", "OpConstantNull"]
+        <> zip [48 ..] ["OpSpecConstantTrue", "OpSpecConstantFalse", "OpSpecConstant", "OpSpecConstantComposite", "OpSpecConstantOp"]
 
 storageUniformConstant, storageInput, storageUniform, storagePushConstant, storageStorageBuffer ∷ Word32
 storageUniformConstant = 0

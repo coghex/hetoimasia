@@ -11,7 +11,7 @@ module Test.Shader.InterfaceSpec (spec) where
 
 import Data.Bits (shiftL, shiftR, (.&.), (.|.))
 import Data.ByteString qualified as ByteString
-import Data.Word (Word32, Word8)
+import Data.Word (Word32)
 import Data.List (isInfixOf)
 import System.Directory (createDirectoryIfMissing)
 import System.FilePath (takeDirectory, (</>))
@@ -95,32 +95,6 @@ spec = describe "Shader interfaces" $ do
       -- Every image type removed: the first descriptor, a combined image
       -- sampler, reaches one no longer defined.
       reflect (without (\instruction → opcodeOf instruction == 25) bytes) `shouldSatisfy` failedWith "which the module does not declare"
-
-    it "refuses any type an interface variable reaches that the module does not define: a buffer member's runtime array, an image's sampled type" $ do
-      bytes ← ByteString.readFile "test/fixtures/spirv/descriptors.frag.spv"
-      -- Every runtime-array type removed: the storage buffer's member, and
-      -- the table's, now name types no longer defined.
-      reflect (without (\instruction → opcodeOf instruction == 29) bytes) `shouldSatisfy` failedWith "which the module does not declare"
-      -- Every image's sampled type replaced by an id the module never defines.
-      reflect (rewriting (\instruction → if opcodeOf instruction == 25 then replaceWord 2 0xFFFFF instruction else instruction) bytes)
-        `shouldSatisfy` failedWith "reaches an image whose sampled type (id 1048575) the module does not declare"
-
-    it "refuses an array length whose constant's type is undefined or not a 32-bit integer" $ do
-      bytes ← ByteString.readFile "test/fixtures/spirv/descriptors.frag.spv"
-      -- Every constant's result type replaced by an id the module never defines.
-      reflect (rewriting (\instruction → if opcodeOf instruction == 43 then replaceWord 1 0xFFFFF instruction else instruction) bytes)
-        `shouldSatisfy` failedWith "whose type (id 1048575) the module does not declare"
-      -- Every constant's result type redirected to a well-formed 32-bit float.
-      reflect (rewriting (\instruction → if opcodeOf instruction == 43 then floatType 0xFFFFE 32 <> replaceWord 1 0xFFFFE instruction else instruction) bytes)
-        `shouldSatisfy` failedWith "whose type (id 1048574) is not a 32-bit integer"
-
-    it "refuses an image whose sampled type is a malformed scalar" $ do
-      bytes ← ByteString.readFile "test/fixtures/spirv/descriptors.frag.spv"
-      -- Every image's sampled type redirected to a new OpTypeFloat carrying
-      -- only its result id, with no width.
-      let malformed = ByteString.pack (concatMap littleEndian [2 `shiftL` 16 .|. 22, 0xFFFFE])
-      reflect (rewriting (\instruction → if opcodeOf instruction == 25 then malformed <> replaceWord 2 0xFFFFE instruction else instruction) bytes)
-        `shouldSatisfy` failedWith "reaches type id 1048574, whose opcode 22 has operands the reader cannot read"
 
     it "refuses a vertex input that starts past its location's first component" $ do
       bytes ← ByteString.readFile "test/fixtures/spirv/component.vert.spv"
@@ -266,33 +240,6 @@ without removed bytes = ByteString.concat (header : [instruction | instruction �
           let count = fromIntegral (firstWord rest `shiftR` 16) * 4
               (instruction, remaining) = ByteString.splitAt count rest
            in instruction : instructions remaining
-
--- | A module with every instruction passed through the function, its header
--- kept.
-rewriting ∷ (ByteString.ByteString → ByteString.ByteString) → ByteString.ByteString → ByteString.ByteString
-rewriting change bytes = ByteString.concat (header : map change (split body))
-  where
-    (header, body) = ByteString.splitAt 20 bytes
-    split rest
-      | ByteString.null rest = []
-      | otherwise =
-          let (instruction, remaining) = ByteString.splitAt (fromIntegral (firstWord rest `shiftR` 16) * 4) rest
-           in instruction : split remaining
-
--- | An instruction with its word at this index — the opcode word is 0 —
--- replaced, in this host's byte order.
-replaceWord ∷ Int → Word32 → ByteString.ByteString → ByteString.ByteString
-replaceWord index value instruction =
-  ByteString.take (index * 4) instruction
-    <> ByteString.pack (littleEndian value)
-    <> ByteString.drop ((index + 1) * 4) instruction
-
--- | A well-formed OpTypeFloat of this id and width.
-floatType ∷ Word32 → Word32 → ByteString.ByteString
-floatType result width = ByteString.pack (concatMap littleEndian [3 `shiftL` 16 .|. 22, result, width])
-
-littleEndian ∷ Word32 → [Word8]
-littleEndian value = [fromIntegral (value `shiftR` shift) | shift ← [0, 8, 16, 24]]
 
 -- | An instruction's words, in this host's byte order, and its opcode.
 wordsOf ∷ ByteString.ByteString → [Word32]

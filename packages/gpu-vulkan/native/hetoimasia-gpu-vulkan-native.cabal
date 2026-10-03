@@ -252,6 +252,7 @@ test-suite shader-tests
         Test.Shader.Fragment
         Test.Shader.InterfaceSpec
         Test.Shader.Interfaces
+        Test.Shader.Malformed
         Test.Shader.Spec
         Test.Shader.Vertex
     build-depends:
