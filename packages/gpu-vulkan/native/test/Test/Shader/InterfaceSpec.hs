@@ -151,6 +151,12 @@ spec = describe "Shader interfaces" $ do
           ]
       fmap (compareInterface tableFragmentInterface) (reflect (checkedSpirv fragment)) `shouldBe` Right []
       fmap (compareInterface tableVertexInterface) (reflect (checkedSpirv vertex)) `shouldBe` Right []
+      -- The profile enables non-uniform indexing and not dynamic indexing,
+      -- so the sampled image every sample consumes, and the image and
+      -- sampler it combines, are decorated NonUniform.
+      let sampled = nonUniformSampling (checkedSpirv fragment)
+      sampled `shouldSatisfy` (not . null)
+      sampled `shouldSatisfy` all id
       -- Any other binding beside them is a mismatch the build names.
       fmap (map renderMismatch . compareInterface tableFragmentInterface {interfaceDescriptors = take 2 textureTableDescriptors}) (reflect (checkedSpirv fragment))
         `shouldBe` Right ["descriptor set 1, binding 0 (StorageBuffer) is present in the shader but undeclared"]
@@ -357,3 +363,26 @@ uncheckedClient body =
            , "shader = $(fragmentShader " <> show ("#version 450\n" <> body <> "\n") <> ")"
            ]
     )
+
+-- | For every implicit-LOD sample in a module: whether its sampled-image
+-- operand, and the image and sampler that operand's OpSampledImage combines,
+-- are each decorated NonUniform.
+nonUniformSampling ∷ ByteString.ByteString → [Bool]
+nonUniformSampling bytes =
+  [ all (`elem` nonUniform) (operand : maybe [] id (lookup operand combined))
+  | (87, _ : _ : operand : _) ← instructions
+  ]
+  where
+    words' = [littleEndian (ByteString.take 4 (ByteString.drop (4 * index) bytes)) | index ← [0 .. ByteString.length bytes `div` 4 - 1]]
+    littleEndian chunk = foldr (\byte acc → acc `shiftL` 8 .|. fromIntegral byte) 0 (ByteString.unpack chunk) ∷ Word32
+    instructions = go (drop 5 words')
+    go = \case
+      [] → []
+      first : rest →
+        let count = fromIntegral (first `shiftR` 16)
+            opcode = first .&. 0xffff
+         in (opcode, take (count - 1) rest) : go (drop (max 0 (count - 1)) rest)
+    -- OpDecorate target NonUniform (5300).
+    nonUniform = [target | (71, [target, 5300]) ← instructions]
+    -- OpSampledImage result-type result image sampler.
+    combined = [(result, [image, sampler]) | (86, [_, result, image, sampler]) ← instructions]

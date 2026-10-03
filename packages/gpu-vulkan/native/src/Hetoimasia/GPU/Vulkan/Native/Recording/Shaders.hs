@@ -183,7 +183,10 @@ tableShaders =
 
           void main() {
               uint slot = resolve(pushed.handle);
-              colour = texture(sampler2D(textures[nonuniformEXT(slot)], samplers[min(pushed.filtering, 3u)]), at);
+              // The profile enables non-uniform sampled-image indexing, not
+              // dynamic indexing, so every index and the combined operand the
+              // sample consumes are marked non-uniform.
+              colour = texture(nonuniformEXT(sampler2D(textures[nonuniformEXT(slot)], samplers[nonuniformEXT(min(pushed.filtering, 3u))])), at);
           }
         |]
          )
