@@ -12,6 +12,8 @@
 -- Nothing here creates a Vulkan object, and nothing waits on a clock.
 module Test.GPU.Vulkan.Native.Drawing (spec) where
 
+import Control.Concurrent (forkIO)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (atomically)
 import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall), throwIO, try)
 import Control.Monad (when)
@@ -472,6 +474,61 @@ spec = describe "Drawing from buffers" $ do
       settleAll rig
       clean rig
 
+    it "reads no index before the owner's thread and an open recorder are checked" $ do
+      rig ← newRig
+      kit ← newKit rig
+      ringed rig 256
+      kept ← newIORef Nothing
+      offThread ← newEmptyMVar
+      before ← readsOf rig
+      framelessOnce rig $ \recorder → do
+        vertices ← claimed recorder 32
+        instances ← claimed recorder 16
+        indices ← claimed recorder 12
+        ok (writeClaim recorder indices 0 (indices16 [0, 1, 2, 2, 3, 0]))
+        writeIORef kept (Just recorder)
+        inPass kit recorder $ do
+          ok (bindVertexBuffer recorder 0 (FromClaim vertices 0))
+          ok (bindVertexBuffer recorder 1 (FromClaim instances 0))
+          ok (bindIndexBuffer recorder (FromClaim indices 0) Index16)
+          _ ← forkIO (drawIndexed recorder 6 1 >>= putMVar offThread)
+          takeMVar offThread `shouldReturn` Left RefusedNotOwner
+      stale ← readIORef kept >>= maybe (fail "no recorder") pure
+      drawIndexed stale 6 1 `shouldReturn` Left RefusedRecorderClosed
+      readsOf rig `shouldReturn` before
+      settleAll rig
+      clean rig
+
+    it "checks only what the draw reads: no index data for a draw that is not indexed, and no binding the pipeline bound now does not declare" $ do
+      rig ← newRig
+      kit ← newKit rig
+      ringed rig 256
+      noInput ← createPipelineLayoutWith (rigRecording rig) pushRanges >>= either (fail . show) pure
+      plain ← createPipeline (rigRecording rig) noInput shaders (formatCode Rgba8Srgb) >>= either (fail . show) pure
+      indexBuffer ← createBuffer (rigRecording rig) (BufferDescription IndexBuffer 24) >>= either (fail . show) pure
+      vertexBuffer ← createBuffer (rigRecording rig) (BufferDescription VertexBuffer 64) >>= either (fail . show) pure
+      answers ← framelessOnce rig $ \recorder → do
+        instances ← claimed recorder 16
+        ok (transitionResource recorder indexBuffer (FromUse GeometryRead) GeometryRead)
+        ok (transitionResource recorder vertexBuffer (FromUse GeometryRead) GeometryRead)
+        inPass kit recorder $ do
+          ok (bindVertexBuffer recorder 0 (FromBuffer vertexBuffer 0))
+          ok (bindVertexBuffer recorder 1 (FromClaim instances 0))
+          ok (bindIndexBuffer recorder (FromBuffer indexBuffer 0) Index32)
+        -- The index buffer moves elsewhere; a draw that is not indexed reads
+        -- none of it.
+        ok (transitionResource recorder indexBuffer (FromUse GeometryRead) TransferWrite)
+        notIndexed ← inPass kit recorder (draw recorder 3 1)
+        ok (transitionResource recorder indexBuffer (FromUse TransferWrite) GeometryRead)
+        -- The vertex buffer is released; a pipeline with no vertex input
+        -- reads none of it.
+        ok (releaseManaged (rigRecording rig) vertexBuffer)
+        noVertices ← inPass kit recorder (ok (bindPipeline recorder plain) >> draw recorder 3 1)
+        pure [notIndexed, noVertices]
+      answers `shouldBe` [Right (), Right ()]
+      settleAll rig
+      clean rig
+
     it "keeps a partial or cancelled batch's regions, closing its writes, until its discard releases them" $ do
       rig ← newRig
       ringed rig 256
@@ -697,6 +754,10 @@ shaders = PipelineShaders (ByteString.pack [1, 2, 3, 4]) (ByteString.pack [5, 6,
 
 commandsOf' ∷ Rig → IO [NativeCommand]
 commandsOf' rig = (\calls → [command | Recorded _ command ← calls]) <$> recordingCalls (rigRecordingStandIn rig)
+
+-- | How many reads of mapped memory the recording made.
+readsOf ∷ Rig → IO Int
+readsOf rig = (\calls → length [() | ReadMapped {} ← calls]) <$> recordingCalls (rigRecordingStandIn rig)
 
 layoutCalls, pipelineCalls ∷ Rig → IO Int
 layoutCalls rig = (\calls → length [() | CreatedLayout _ ← calls]) <$> recordingCalls (rigRecordingStandIn rig)

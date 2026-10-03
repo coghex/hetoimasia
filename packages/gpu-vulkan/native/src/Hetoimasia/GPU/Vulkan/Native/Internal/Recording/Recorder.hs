@@ -930,7 +930,7 @@ scissorFits rect attachment
 -- already holds.
 draw ∷ Recorder q inst msgr phys dev cmd → Word32 → Word32 → IO (Either Refusal ())
 draw recorder vertices instances =
-  drawChecked recorder vertices instances $ \state bound → do
+  drawChecked recorder False vertices instances $ \state bound → do
     vertexReads state bound (Just (toInteger vertices)) instances
     Right (state, CommandDraw vertices instances 0 0)
 
@@ -944,18 +944,29 @@ draw recorder vertices instances =
 -- data is 'RefusedUnsupported'. A per-instance binding is checked as 'draw'
 -- checks it.
 drawIndexed ∷ Recorder q inst msgr phys dev cmd → Word32 → Word32 → IO (Either Refusal ())
-drawIndexed recorder indices instances = do
-  largest ← largestIndex recorder indices
-  drawChecked recorder indices instances $ \state bound → case stateIndex state of
-    Nothing → Left (RefusedIllegal "an indexed draw with no index data bound")
-    Just (kind, held) → do
-      let needed = fromIntegral indices * indexTypeBytes kind
-      when (needed > boundBytes held) (Left (RefusedOutOfBounds needed (boundBytes held)))
-      vertexReads state bound (fmap (+ 1) largest) instances
-      let frozen = case boundClaim held of
-            Just _ → [(boundOffset held, boundOffset held + needed)]
-            Nothing → []
-      Right (state {stateFrozen = frozen <> stateFrozen state}, CommandDrawIndexed indices instances)
+drawIndexed recorder indices instances =
+  owned (recorderRecording recorder) $
+    readIORef (recorderOpen recorder) >>= \case
+      False → pure (Left RefusedRecorderClosed)
+      True → do
+        -- Only now, on the owner's thread and with the batch still being
+        -- recorded — so its claims are still its own and the ring still
+        -- mapped — are the indices read.
+        largest ← largestIndex recorder indices
+        indexedDraw largest
+  where
+    indexedDraw largest =
+      drawChecked recorder True indices instances $ \state bound → case stateIndex state of
+        Nothing → Left (RefusedIllegal "an indexed draw with no index data bound")
+        Just (kind, held) → do
+          stillInUse state held
+          let needed = fromIntegral indices * indexTypeBytes kind
+          when (needed > boundBytes held) (Left (RefusedOutOfBounds needed (boundBytes held)))
+          vertexReads state bound (fmap (+ 1) largest) instances
+          let frozen = case boundClaim held of
+                Just _ → [(boundOffset held, boundOffset held + needed)]
+                Nothing → []
+          Right (state {stateFrozen = frozen <> stateFrozen state}, CommandDrawIndexed indices instances)
 
 -- | The largest index an indexed draw of this many indices would read, when
 -- its index data is a ring region whose bytes the recording can read: read
@@ -968,7 +979,8 @@ largestIndex recorder indices = do
   ring ← readTVarIO (recordingRing (recorderRecording recorder))
   case (stateIndex state, ring) of
     (Just (kind, held), Just held')
-      | Just _ ← boundClaim held
+      | Just number ← boundClaim held
+      , fmap claimRecordBatch (Map.lookup number (ringClaims held')) == Just (recorderBatch recorder)
       , needed ← fromIntegral indices * indexTypeBytes kind
       , needed <= boundBytes held
       , indices > 0 → do
@@ -988,16 +1000,22 @@ decodeIndices kind bytes = map value (chunks (ByteString.unpack bytes))
 -- | What every draw checks before its own checks decide its command: a bound
 -- pipeline, an open pass, the viewport and scissor set, whole triangles, the
 -- pipeline, viewport and scissor against the pass's attachment, and every
--- managed buffer bound still recordable — not released, replaced or stale.
+-- managed buffer the draw reads still recordable — not released, replaced or
+-- stale. A draw reads the data bound to the bindings the bound pipeline
+-- declares, and an indexed one the index data too; nothing else bound is
+-- checked, and nothing an earlier command captured is released.
 drawChecked
   ∷ Recorder q inst msgr phys dev cmd
+  → Bool
   → Word32
   → Word32
   → (RecorderState → BoundPipeline → Either Refusal (RecorderState, NativeCommand))
   → IO (Either Refusal ())
-drawChecked recorder count instances decide = do
+drawChecked recorder indexed count instances decide = do
   state ← readIORef (recorderState recorder)
-  let managed = [boundResource held | held ← Map.elems (stateVertex state) <> map snd (maybe [] pure (stateIndex state)), Nothing ← [boundClaim held]]
+  let declared = maybe [] (map bindingNumber . inputBindings . interfaceVertexInput . boundInterface) (statePipeline state)
+      read' = [held | (binding, held) ← Map.toList (stateVertex state), binding `elem` declared] <> (if indexed then map snd (maybe [] pure (stateIndex state)) else [])
+      managed = [boundResource held | held ← read', Nothing ← [boundClaim held]]
   recordable ← mapM (liveNative (recorderRecording recorder)) managed
   case [refusal | Left refusal ← recordable] of
     refusal : _ → command recorder (const (Left refusal))
@@ -1013,7 +1031,6 @@ drawChecked recorder count instances decide = do
                 incompatible (boundFormat bound) attachment
                 viewportFits viewport attachment
                 scissorFits rect attachment
-                for_ (map snd (maybe [] pure (stateIndex current))) (stillInUse current)
                 (next, native) ← decide current bound
                 Right (next, [boundPipeline bound, boundLayout bound], native)
           _ → Left (RefusedIllegal "a draw before the viewport and scissor are set")
