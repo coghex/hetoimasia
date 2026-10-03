@@ -16,12 +16,13 @@
 module Test.GPU.Vulkan.Native.Uploads (spec) where
 
 import Control.Concurrent (forkIO)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar)
-import Control.Concurrent.STM (atomically)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
+import Control.Concurrent.STM (atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
 import Control.Exception (try)
 import Control.Monad (forM, replicateM_, when)
 import qualified Data.ByteString as ByteString
 import Data.Either (isRight)
+import Data.Functor ((<&>))
 import Data.Text (Text)
 import Data.Word (Word32, Word64, Word8)
 import Numeric.Natural (Natural)
@@ -41,8 +42,10 @@ import Test.GPU.Vulkan.Native.RecordingStandIn
   ( RecordingCall (..)
   , RecordingFailure (..)
   , RecordingStep (AtWriteMapped)
+  , duringRecord
   , failAt
   , limitRecording
+  , onceAt
   , recordingCalls
   , standInRecordingLimits
   , succeedAt
@@ -199,6 +202,37 @@ spec = describe "Uploads" $ do
       length (filter isRight outcomes) `shouldBe` 1
       [refusal | Left refusal ← outcomes] `shouldBe` [UploadAlreadyTargeted]
       length . uploadsUnsettled <$> atomically (readUploads uploads) `shouldReturn` 1
+
+    it "refuses an upload under a gate closed before it, or closing while its bytes are copied, giving back every reservation" $ do
+      rig ← newUploadRig
+      uploads ← made rig (config 64 64 4)
+      texture ← textureOf rig Rgba8Linear 4 4 1
+      open ← newTVarIO False
+      let gate = readTVar open <&> \opened → if opened then Nothing else Just UploadClosed
+      fmap (const ()) <$> submitUploadGated gate uploads (UploadImage texture [level 64 1]) `shouldReturn` Left UploadClosed
+      writes rig `shouldReturn` []
+      atomically (writeTVar open True)
+      onceAt (rigRecordingStandIn rig) AtWriteMapped (atomically (writeTVar open False))
+      fmap (const ()) <$> submitUploadGated gate uploads (UploadImage texture [level 64 1]) `shouldReturn` Left UploadClosed
+      uploadsUnsettled <$> atomically (readUploads uploads) `shouldReturn` []
+      -- The target, the place in the queue and the whole staging buffer are
+      -- all free again.
+      atomically (writeTVar open True)
+      _ ← admitted uploads (UploadImage texture [level 64 1])
+      clean rig
+
+    it "refuses a buffer an upload filled as not fresh, through any uploads over the same recording" $ do
+      rig ← newUploadRig
+      first ← made rig (config 1024 64 4)
+      second ← made rig (config 1024 64 4)
+      vertices ← bufferOf rig VertexBuffer 16
+      ticket ← admitted first (UploadBuffer vertices (level 16 1))
+      settleUploads rig first
+      settleAll rig
+      atomically (readUploadTicket ticket) `shouldReturn` UploadComplete
+      fmap (const ()) <$> submitUpload second (UploadBuffer vertices (level 16 2)) `shouldReturn` Left UploadNotFresh
+      fmap (const ()) <$> submitUpload first (UploadBuffer vertices (level 16 2)) `shouldReturn` Left UploadNotFresh
+      clean rig
 
     it "reports BC7 unsupported on a device without BC compression, where a BC7 texture is refused at its creation" $ do
       rig ← newRigOn (\standIn → standIn {standOffers = [standInDevice {offerTextureCompressionBC = False}]})
@@ -360,6 +394,30 @@ spec = describe "Uploads" $ do
       atomically (readUploadTicket again) `shouldReturn` UploadComplete
       clean rig
 
+    it "refuses a cancellation, and holds the staging region, while the owner records an upload's first copies, which then complete" $ do
+      rig ← newUploadRig
+      uploads ← made rig (config 64 64 4)
+      texture ← textureOf rig Rgba8Linear 4 4 1
+      rival ← textureOf rig Rgba8Linear 4 4 1
+      ticket ← admitted uploads (UploadImage texture [level 64 1])
+      seen ← newEmptyMVar
+      -- Inside the copy's recording, on the owner's thread, as another
+      -- thread's cancellation and admission could land.
+      duringRecord (rigRecordingStandIn rig) $ \case
+        CommandCopyBufferToImage {} → do
+          cancelling ← atomically (cancelUpload uploads ticket)
+          admittedNow ← fmap (const ()) <$> submitUpload uploads (UploadImage rival [level 64 2])
+          () <$ tryPutMVar seen (cancelling, admittedNow)
+        _ → pure ()
+      _ ← turned uploads
+      duringRecord (rigRecordingStandIn rig) (const (pure ()))
+      takeMVar seen `shouldReturn` (Left CancelStarted, Left (UploadBackpressure StagingFull))
+      atomically (readUploadTicket ticket) `shouldReturn` UploadUploading
+      settleUploads rig uploads
+      atomically (readUploadTicket ticket) `shouldReturn` UploadComplete
+      resourceInitialization (managedResource texture) <$> modelOf rig `shouldReturn` Just Initialized
+      clean rig
+
     it "completes a ticket only on its final batch's fence, refuses a wait on the owner, and lets a deadline pass without cancelling anything" $ do
       rig ← newUploadRig
       uploads ← made rig (config 1024 64 4)
@@ -390,6 +448,49 @@ spec = describe "Uploads" $ do
       mapM (atomically . readUploadTicket) [first, second] `shouldReturn` [UploadLost, UploadLost]
 
   describe "exit and release" $ do
+    it "keeps an admitting caller's staging region through device loss until it finishes, then loses its upload" $ do
+      rig ← newUploadRig
+      uploads ← made rig (config 1024 64 4)
+      texture ← textureOf rig Rgba8Linear 4 4 1
+      entered ← newEmptyMVar
+      release ← newEmptyMVar
+      onceAt (rigRecordingStandIn rig) AtWriteMapped (putMVar entered () >> takeMVar release)
+      answer ← newEmptyMVar
+      _ ← forkIO (submitUpload uploads (UploadImage texture [level 64 1]) >>= putMVar answer)
+      takeMVar entered
+      inModel rig (Admitted . noteDeviceLoss)
+      _ ← turned uploads
+      -- Still its caller's: the loss settles nothing it is writing into.
+      map uploadPhase . uploadsUnsettled <$> atomically (readUploads uploads) `shouldReturn` [PhaseAdmitting]
+      putMVar release ()
+      ticket ← takeMVar answer >>= either (fail . ("the upload was refused: " <>) . show) pure
+      _ ← turned uploads
+      atomically (readUploadTicket ticket) `shouldReturn` UploadLost
+      uploadsUnsettled <$> atomically (readUploads uploads) `shouldReturn` []
+
+    it "retires only once a caller still copying its bytes into staging has finished, which then finds admission closed" $ do
+      rig ← newUploadRig
+      uploads ← made rig (config 1024 64 4)
+      texture ← textureOf rig Rgba8Linear 4 4 1
+      entered ← newEmptyMVar
+      release ← newEmptyMVar
+      order ← newTVarIO []
+      let note' event = atomically (modifyTVar' order (event :))
+      onceAt (rigRecordingStandIn rig) AtWriteMapped (putMVar entered () >> takeMVar release >> note' "written")
+      answer ← newEmptyMVar
+      _ ← forkIO (submitUpload uploads (UploadImage texture [level 64 1]) >>= putMVar answer . fmap (const ()))
+      takeMVar entered
+      -- The caller is let go only once retirement has closed admission.
+      _ ← forkIO $ do
+        atomically (readUploads uploads >>= check . not . uploadsAdmitting)
+        note' "released"
+        putMVar release ()
+      ok (retireUploads uploads)
+      note' "retired"
+      takeMVar answer `shouldReturn` Left UploadClosed
+      reverse <$> readTVarIO order `shouldReturn` ["released", "written", "retired" ∷ Text]
+      uploadsUnsettled <$> atomically (readUploads uploads) `shouldReturn` []
+
     it "cancels every upload not started when the owner's exit begins, refuses new ones, and settles started ones with their batches" $ do
       rig ← newUploadRig
       uploads ← made rig (config 1024 64 4)

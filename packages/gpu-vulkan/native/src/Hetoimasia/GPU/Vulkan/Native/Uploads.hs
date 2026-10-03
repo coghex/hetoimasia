@@ -39,6 +39,7 @@ module Hetoimasia.GPU.Vulkan.Native.Uploads
   , UploadRefusal (..)
   , UploadPressure (..)
   , submitUpload
+  , submitUploadGated
 
     -- * Tickets
   , UploadTicket

@@ -261,6 +261,10 @@ data Recording q inst msgr phys dev cmd = Recording
     -- ^ What a completed upload wrote into each managed index buffer, so an
     -- indexed draw through one can bound its vertex reads (GRS-6). Kept with
     -- the generation, and forgotten with its disposal.
+  , recordingFilled ∷ !(TVar (Set ResourceId))
+    -- ^ The buffers an upload has been admitted into (GRS-6), never fresh
+    -- for another upload — whichever uploads admit it — unless that upload
+    -- was cancelled before any copy. Forgotten with the buffer's disposal.
   }
 
 -- | The recording's state, owned by the calling thread. The public
@@ -282,6 +286,7 @@ makeRecording ops roots generations = do
     <*> newTVarIO Set.empty
     <*> newTVarIO Set.empty
     <*> newTVarIO Map.empty
+    <*> newTVarIO Set.empty
 
 -- | Why an operation made no native call.
 data Refusal

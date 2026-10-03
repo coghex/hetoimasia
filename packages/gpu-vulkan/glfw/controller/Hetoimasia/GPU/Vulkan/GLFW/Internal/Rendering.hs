@@ -313,7 +313,7 @@ import Hetoimasia.GPU.Vulkan.Native.Uploads
   , newUploads
   , progressUploads
   , retireUploads
-  , submitUpload
+  , submitUploadGated
   , uploadsWaiting
   )
 import Hetoimasia.Runtime.GLFW (AttachmentId, OwnerDemand (..))
@@ -1375,12 +1375,17 @@ renderingUploadsWaiting rendering =
     UploadsMade uploads → uploadsWaiting uploads
     _ → pure False
 
--- | Admit an upload from any thread ('submitUpload'), once the session's
--- uploads exist.
-submitRenderingUpload ∷ Rendering q inst msgr phys dev cmd → UploadRequest → IO (Either (Either UploadsUnavailable UploadRefusal) UploadTicket)
-submitRenderingUpload rendering request =
+-- | Admit an upload from any thread ('submitUploadGated'), once the
+-- session's uploads exist, under the caller's gate, read in the transactions
+-- that reserve and queue it.
+submitRenderingUpload
+  ∷ Rendering q inst msgr phys dev cmd
+  → STM (Maybe UploadRefusal)
+  → UploadRequest
+  → IO (Either (Either UploadsUnavailable UploadRefusal) UploadTicket)
+submitRenderingUpload rendering gate request =
   readTVarIO (renderingUploads rendering) >>= \case
-    UploadsMade uploads → either (Left . Right) Right <$> submitUpload uploads request
+    UploadsMade uploads → either (Left . Right) Right <$> submitUploadGated gate uploads request
     UploadsUnconfigured → pure (Left (Left UploadsNotConfigured))
     UploadsPending _ → pure (Left (Left UploadsNotReady))
     UploadsRefused refusal → pure (Left (Left (UploadsRefusedBy refusal)))

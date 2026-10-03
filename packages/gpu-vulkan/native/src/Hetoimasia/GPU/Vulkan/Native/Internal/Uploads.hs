@@ -45,6 +45,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Uploads
   , UploadRefusal (..)
   , UploadPressure (..)
   , submitUpload
+  , submitUploadGated
 
     -- * Tickets
   , UploadTicket
@@ -218,8 +219,6 @@ data UploadsState = UploadsState
     -- ^ Where the next region is first tried: the end of the last one.
   , stateEntries ∷ !(Map Natural Entry)
     -- ^ Every upload not yet settled, by its number, so in admission order.
-  , stateFilled ∷ !(Set.Set ResourceId)
-    -- ^ The buffers an upload has been admitted into: never fresh again.
   , stateStalled ∷ !Bool
     -- ^ Whether the last turn could not open a frame-less batch for its
     -- copies: no upload then wakes the owner, whose later turns — the ones
@@ -242,6 +241,11 @@ data Entry = Entry
   , entryFlight ∷ !(Maybe Flight)
     -- ^ The batch carrying its latest copies, until that batch's completion
     -- or discard is observed.
+  , entryClaimed ∷ !Bool
+    -- ^ Whether the owner is recording its copies now: claimed in the
+    -- transaction that plans the turn, so no cancellation, close or release
+    -- can settle it — freeing its staging — while copies from that staging
+    -- are being recorded and submitted.
   , entryTicket ∷ !(TVar UploadState)
   , entryIndices ∷ !(Maybe ByteString)
     -- ^ What it writes into an index buffer, which a completed upload leaves
@@ -295,7 +299,7 @@ newUploads frames config =
             createStaging recording (uploadStagingBytes config) >>= \case
               Left refusal → pure (Left refusal)
               Right (resource, mapping, atom) → do
-                state ← newTVarIO (UploadsState True 0 0 Map.empty Set.empty False)
+                state ← newTVarIO (UploadsState True 0 0 Map.empty False)
                 pure (Right (Uploads frames config (Staging resource mapping (uploadStagingBytes config) (max 16 atom)) (planTextureCompressionBC devicePlan) state))
   where
     recording = framesRecording frames
@@ -368,8 +372,20 @@ data UploadPressure = QueueFull | StagingFull
 -- re-raised; one that finished after the owner's exit began gives them back
 -- too, answering 'UploadClosed'.
 submitUpload ∷ Uploads q inst msgr phys dev cmd → UploadRequest → IO (Either UploadRefusal UploadTicket)
-submitUpload uploads request = mask $ \restore →
-  atomically (admit uploads request) >>= \case
+submitUpload = submitUploadGated (pure Nothing)
+
+-- | 'submitUpload' under a caller's gate, read in the transaction that
+-- reserves the upload and again in the one that queues it: a refusal it
+-- answers in either refuses the upload, giving back every reservation. The
+-- window integration gates admission on its owner's, so no upload is queued
+-- once the owner's admission has closed.
+submitUploadGated
+  ∷ STM (Maybe UploadRefusal)
+  → Uploads q inst msgr phys dev cmd
+  → UploadRequest
+  → IO (Either UploadRefusal UploadTicket)
+submitUploadGated gate uploads request = mask $ \restore →
+  atomically (gate >>= maybe (admit uploads request) (pure . Left)) >>= \case
     Left refusal → pure (Left refusal)
     Right (number, ticket, offset, pieces) → do
       written ← tryWithContext @SomeException (restore (writePieces uploads offset pieces))
@@ -380,11 +396,14 @@ submitUpload uploads request = mask $ \restore →
         Right () →
           atomically $ do
             state ← readTVar (uploadsState uploads)
-            if stateOpen state
-              then do
-                modifyTVar' (uploadsState uploads) (\current → current {stateEntries = Map.adjust (\entry → entry {entryPhase = PhaseQueued}) number (stateEntries current)})
-                pure (Right ticket)
-              else Left UploadClosed <$ forget uploads number
+            refused ← gate
+            case refused of
+              Just refusal → Left refusal <$ forget uploads number
+              Nothing
+                | stateOpen state → do
+                    modifyTVar' (uploadsState uploads) (\current → current {stateEntries = Map.adjust (\entry → entry {entryPhase = PhaseQueued}) number (stateEntries current)})
+                    pure (Right ticket)
+                | otherwise → Left UploadClosed <$ forget uploads number
 
 -- | Copy the request's bytes into the staging buffer, level after level.
 writePieces ∷ Uploads q inst msgr phys dev cmd → Natural → [ByteString] → IO ()
@@ -403,6 +422,7 @@ admit uploads request = do
   primary ← reportPrimary <$> readRootsTerminal roots
   managed ← readTVar (recordingManaged recording)
   uploading ← readTVar (recordingUploading recording)
+  filled ← readTVar (recordingFilled recording)
   model ← readRootsModel roots
   let decided = do
         whenLeft (fmap UploadSessionFailed primary)
@@ -416,7 +436,7 @@ admit uploads request = do
           ShapeImage {}
             | resourceInitialization target model /= Just Uninitialized → Left UploadNotFresh
           ShapeBuffer {}
-            | Set.member target (stateFilled state) → Left UploadNotFresh
+            | Set.member target filled → Left UploadNotFresh
             | any (`elem` [RecordedReferenceOwed, SubmittedUseOwed]) (maybe [] viewOutstanding (holdView (ResourceSubject target) model)) → Left UploadNotFresh
           _ → Right ()
         let padded = roundUp total (stagingGranule staging)
@@ -432,7 +452,7 @@ admit uploads request = do
           cursor = case shape of
             ShapeBuffer {} → CursorBytes 0
             ShapeImage {} → CursorRows 0 0
-          entry = Entry target shape (offset, padded) PhaseAdmitting cursor False Nothing ticket indices
+          entry = Entry target shape (offset, padded) PhaseAdmitting cursor False Nothing False ticket indices
           next = offset + padded
       writeTVar
         (uploadsState uploads)
@@ -440,10 +460,10 @@ admit uploads request = do
           { stateNext = number + 1
           , stateHead = if next >= stagingBytes staging then 0 else next
           , stateEntries = Map.insert number entry (stateEntries state)
-          , stateFilled = case shape of
-              ShapeBuffer {} → Set.insert target (stateFilled state)
-              ShapeImage {} → stateFilled state
           }
+      case shape of
+        ShapeBuffer {} → modifyTVar' (recordingFilled recording) (Set.insert target)
+        ShapeImage {} → pure ()
       modifyTVar' (recordingUploading recording) (Set.insert target)
       pure (Right (number, UploadTicket number ticket (recordingOwner recording), offset, pieces))
   where
@@ -500,12 +520,8 @@ forget ∷ Uploads q inst msgr phys dev cmd → Natural → STM ()
 forget uploads number = do
   state ← readTVar (uploadsState uploads)
   for' (Map.lookup number (stateEntries state)) $ \entry → do
-    writeTVar
-      (uploadsState uploads)
-      state
-        { stateEntries = Map.delete number (stateEntries state)
-        , stateFilled = Set.delete (entryTarget entry) (stateFilled state)
-        }
+    writeTVar (uploadsState uploads) state {stateEntries = Map.delete number (stateEntries state)}
+    modifyTVar' (recordingFilled (framesRecording (uploadsFrames uploads))) (Set.delete (entryTarget entry))
     unhold uploads (entryTarget entry)
 
 -- ---------------------------------------------------------------------------
@@ -582,8 +598,8 @@ data CancelRefusal
 -- | Cancel an upload, from any thread, before its first copies are recorded:
 -- its bytes and its staging region are freed, its ticket answers
 -- 'UploadCancelled', and its target is left as it was — uninitialized, and
--- free for another upload. After that it is refused, and the upload
--- completes.
+-- free for another upload. Once the owner has claimed it to record its first
+-- copies, it is refused, and the upload completes.
 cancelUpload ∷ Uploads q inst msgr phys dev cmd → UploadTicket → STM (Either CancelRefusal ())
 cancelUpload uploads ticket = do
   state ← readTVar (uploadsState uploads)
@@ -593,7 +609,7 @@ cancelUpload uploads ticket = do
     Nothing → pure (Left CancelUnknown)
     Just entry
       | entryTicket entry /= ticketCell ticket → pure (Left CancelUnknown)
-      | entryStarted entry || isFlying entry → pure (Left CancelStarted)
+      | entryStarted entry || isFlying entry || entryClaimed entry → pure (Left CancelStarted)
       | otherwise → Right () <$ settle uploads (ticketUpload ticket) UploadCancelled
   where
     isFlying = maybe False (const True) . entryFlight
@@ -607,15 +623,9 @@ settle uploads number outcome = do
   state ← readTVar (uploadsState uploads)
   for' (Map.lookup number (stateEntries state)) $ \entry → do
     writeTVar (entryTicket entry) outcome
-    writeTVar
-      (uploadsState uploads)
-      state
-        { stateEntries = Map.delete number (stateEntries state)
-        , stateFilled =
-            if outcome == UploadCancelled && not (entryStarted entry)
-              then Set.delete (entryTarget entry) (stateFilled state)
-              else stateFilled state
-        }
+    writeTVar (uploadsState uploads) state {stateEntries = Map.delete number (stateEntries state)}
+    when (outcome == UploadCancelled && not (entryStarted entry)) $
+      modifyTVar' (recordingFilled recording) (Set.delete (entryTarget entry))
     when (outcome == UploadComplete) $
       for' (entryIndices entry) $ \indices → modifyTVar' (recordingIndexData recording) (Map.insert (entryTarget entry) indices)
     unhold uploads (entryTarget entry)
@@ -696,11 +706,15 @@ recordable entry =
   entryPhase entry `elem` [PhaseQueued, PhaseUploading]
     && entryCursor entry /= CursorDone
     && maybe True (const False) (entryFlight entry)
+    && not (entryClaimed entry)
 
--- | Settle every upload not yet settled as lost.
+-- | Settle every upload not yet settled as lost — except those whose caller
+-- is still copying its bytes into staging, whose region stays its own until
+-- that caller finishes; it is lost on a later turn.
 loseAll ∷ Uploads q inst msgr phys dev cmd → STM Bool
 loseAll uploads = do
-  numbers ← Map.keys . stateEntries <$> readTVar (uploadsState uploads)
+  entries ← Map.toList . stateEntries <$> readTVar (uploadsState uploads)
+  let numbers = [number | (number, entry) ← entries, entryPhase entry /= PhaseAdmitting]
   forM_ numbers (\number → settle uploads number UploadLost)
   pure (not (null numbers))
 
@@ -734,6 +748,7 @@ cancelReleased uploads = do
         , entryPhase entry == PhaseQueued
         , not (entryStarted entry)
         , maybe True (const False) (entryFlight entry)
+        , not (entryClaimed entry)
         , Set.member (entryTarget entry) deferred
         ]
   forM_ released (\number → settle uploads number UploadCancelled)
@@ -752,9 +767,18 @@ data Planned = Planned
 -- | Plan and record this turn's copies, as step 4 of 'progressUploads' says.
 recordTurn ∷ Uploads q inst msgr phys dev cmd → IO Bool
 recordTurn uploads = do
-  (state, primary) ← atomically ((,) <$> readTVar (uploadsState uploads) <*> (reportPrimary <$> readRootsTerminal roots))
-  let candidates = [(number, entry) | stateOpen state, Nothing ← [primary], (number, entry) ← Map.toList (stateEntries state), recordable entry]
-      planned = plan (uploadTurnBudget (uploadsConfig uploads)) candidates
+  -- Planned and claimed in one transaction, so nothing settles a planned
+  -- upload, freeing its staging, while its copies are recorded and
+  -- submitted. A recording that raised leaves its uploads claimed: what it
+  -- recorded or submitted is unknown, so their staging stays held until the
+  -- owner's retirement settles them.
+  planned ← atomically $ do
+    state ← readTVar (uploadsState uploads)
+    primary ← reportPrimary <$> readRootsTerminal roots
+    let candidates = [(number, entry) | stateOpen state, Nothing ← [primary], (number, entry) ← Map.toList (stateEntries state), recordable entry]
+        chosen = plan (uploadTurnBudget (uploadsConfig uploads)) candidates
+    forM_ chosen (\item → edit (plannedNumber item) (\held → held {entryClaimed = True}))
+    pure chosen
   if null planned
     then pure False
     else do
@@ -769,7 +793,9 @@ recordTurn uploads = do
                 first = entryCursor entry == startCursor (entryShape entry)
                 final = plannedNext item == CursorDone
              in (,) item <$> recordUploadCopies recorder (entryTarget entry) object kind image (stagingResource staging) (allocationBuffer (stagingMapping staging)) first final (plannedCopies item)
-      atomically (modifyTVar' (uploadsState uploads) (\current → current {stateStalled = either (const True) (const False) outcome}))
+      atomically $ do
+        modifyTVar' (uploadsState uploads) (\current → current {stateStalled = either (const True) (const False) outcome})
+        forM_ planned (\item → edit (plannedNumber item) (\held → held {entryClaimed = False}))
       case outcome of
         Left _ → pure False
         Right (ticket, results) → do
@@ -796,12 +822,15 @@ recordTurn uploads = do
                       }
           atomically $
             forM_ [item | (item, Right ()) ← results, accepted] $ \item →
-              writeTVar (entryTicket (plannedEntry item)) UploadUploading
+              -- Only a ticket still unsettled: a ticket only advances.
+              readTVar (entryTicket (plannedEntry item)) >>= \current →
+                when (current == UploadQueued) (writeTVar (entryTicket (plannedEntry item)) UploadUploading)
           pure accepted
   where
     frames = uploadsFrames uploads
     roots = recordingRoots (framesRecording frames)
     staging = uploadsStaging uploads
+    edit number change = modifyTVar' (uploadsState uploads) (\state → state {stateEntries = Map.adjust change number (stateEntries state)})
     -- Make the bytes a planned upload's copies read visible to the device on
     -- non-coherent memory: aligned to the atom, never beyond its region.
     flush item =
@@ -882,17 +911,24 @@ closeUploads ∷ Uploads q inst msgr phys dev cmd → STM ()
 closeUploads uploads = do
   modifyTVar' (uploadsState uploads) (\state → state {stateOpen = False})
   entries ← Map.toList . stateEntries <$> readTVar (uploadsState uploads)
-  forM_ [number | (number, entry) ← entries, entryPhase entry == PhaseQueued, not (entryStarted entry), maybe True (const False) (entryFlight entry)] $ \number →
+  forM_ [number | (number, entry) ← entries, entryPhase entry == PhaseQueued, not (entryStarted entry), maybe True (const False) (entryFlight entry), not (entryClaimed entry)] $ \number →
     settle uploads number UploadCancelled
 
 -- | Settle every upload at the owner's retirement, once its frame-less work
--- has drained: admission closes; each batch in flight is observed once more;
--- and every upload still unsettled is lost if the device was lost, and
+-- has drained: admission closes; every caller still copying its bytes into
+-- staging is waited for, so the staging buffer, released with the recording
+-- after this, is never unmapped under a writer — each finds admission closed
+-- and gives its reservations back; each batch in flight is observed once
+-- more; and every upload still unsettled is lost if the device was lost, and
 -- otherwise cancelled — left unfinished by the exit, its target released
--- with the rest of the recording.
+-- with the rest of the recording. The wait is for copies into mapped memory
+-- already under way, which no other thread's progress holds up.
 retireUploads ∷ Uploads q inst msgr phys dev cmd → IO (Either Refusal ())
 retireUploads uploads = owned (framesRecording (uploadsFrames uploads)) . fmap Right $ do
   atomically (closeUploads uploads)
+  atomically $ do
+    entries ← Map.elems . stateEntries <$> readTVar (uploadsState uploads)
+    when (any ((== PhaseAdmitting) . entryPhase) entries) retry
   lost ← atomically (lossObserved (uploadsFrames uploads))
   atomically $ do
     unless lost (() <$ observeFlights uploads)

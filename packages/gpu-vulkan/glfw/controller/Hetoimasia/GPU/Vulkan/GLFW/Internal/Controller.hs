@@ -937,15 +937,21 @@ data VulkanUploadRefusal
 
 -- | Admit an upload from any thread (GRS-6): refused once the session has
 -- failed, with its primary, or once the owner's admission has closed, as an
--- owner-thread action is; otherwise answered as the session's uploads answer
--- it. Admission makes an idle owner runnable: its wake asks for the round
+-- owner-thread action is — read in the same transactions that reserve and
+-- queue it — and otherwise answered as the session's uploads answer it. Admission makes an idle owner runnable: its wake asks for the round
 -- that records the upload's first copies.
 submitVulkanUpload ∷ VulkanController → UploadRequest → IO (Either VulkanUploadRefusal UploadTicket)
 submitVulkanUpload (VulkanController state) request =
-  atomically (actionGate (stateRoots state) (stateOwnerOpen state)) >>= \case
-    Just (ActionSessionFailed primary) → pure (Left (VulkanUploadRefused (UploadSessionFailed primary)))
-    Just _ → pure (Left (VulkanUploadRefused UploadClosed))
-    Nothing → either (Left . either VulkanUploadsUnavailable VulkanUploadRefused) Right <$> submitRenderingUpload (stateRendering state) request
+  either (Left . either VulkanUploadsUnavailable VulkanUploadRefused) Right
+    <$> submitRenderingUpload (stateRendering state) gate request
+  where
+    -- The owner's own gate, read in the transactions that reserve and queue
+    -- the upload, so none is queued once quiescence has closed the owner.
+    gate =
+      actionGate (stateRoots state) (stateOwnerOpen state) <&> \case
+        Just (ActionSessionFailed primary) → Just (UploadSessionFailed primary)
+        Just _ → Just UploadClosed
+        Nothing → Nothing
 
 -- | Cancel an upload from any thread, before its first copies are recorded
 -- ('cancelUpload').
