@@ -14,14 +14,16 @@ module Test.GPU.Vulkan.GLFW.Loop (spec) where
 
 import Control.Concurrent (forkIO)
 import Control.Concurrent.STM (atomically, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, registerDelay, retry, writeTVar)
-import Control.Exception (Exception (..), SomeException, throwIO, toException)
+import Control.Exception (Exception (..), SomeException, throwIO, toException, try)
 import Control.Monad (forM, forM_, unless, void, when)
-import Data.List (isSubsequenceOf)
+import Data.List (isInfixOf, isSubsequenceOf)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust, isNothing)
 import Data.Word (Word32, Word64)
 import qualified Data.Text as Text
 import Numeric.Natural (Natural)
+import GHC.Clock (getMonotonicTime)
+import Numeric (showFFloat)
 import System.Timeout (timeout)
 
 import Hetoimasia.Foundation.Messaging.Payload (prepare)
@@ -79,6 +81,8 @@ spec = describe "Vulkan loop adapter" $ do
     itBounded "serves both parts of demand captured in one turn: one window's now, and another's later deadline once it comes" testCombinedDemand
     itBounded "keeps a redraw the owner took before any target was constructed, and renders it once one is" testRedrawBeforeTarget
     itBounded "keeps a closed window's retirement observable while the owner's step is held and demand waits" testCloseWhileSaturated
+    itBounded "returns as soon as its condition holds, offering the update opportunity first on every turn, and fails nothing" testComposedUntilReturns
+    itBounded "fails at its turn bound naming what it waited for, with the phase's elapsed time and turns, the render owner's rounds and next deadline, and the journal's last entries" testComposedUntilDiagnosed
 
   describe "the owner's pacing" $ do
     itBounded "keeps a quiet continuous scene with demand out of the idle backoff" testContinuousDemand
@@ -123,8 +127,17 @@ demandFrame host window = do
 
 -- | Run the composed loop until the condition holds, offering the
 -- application's update opportunity each turn to this action first.
+--
+-- Past 20000 turns without the condition it fails with a 'StandInFailure'
+-- naming what it waited for and the last frame events, and, gathered only
+-- then, what tells an owner that is merely slower than the turns from one that
+-- has stalled ('boundDiagnostics'). A run that reaches its condition takes one
+-- clock reading and one owner status read on entry, changes nothing the loop
+-- schedules, and prints nothing.
 composedUntil ∷ Rig → VulkanHost Scene → RuntimeControl → String → (ScheduledTurn → IO ()) → IO Bool → IO ()
-composedUntil rig host control what each done =
+composedUntil rig host control what each done = do
+  started ← getMonotonicTime
+  before ← atomically (readOwnerStatusNow (vulkanGraphicsOwner host))
   runVulkanOwnerLoop host control $
     defaultScheduledHooks quietLogger $ \turn → do
       each turn
@@ -135,8 +148,49 @@ composedUntil rig host control what each done =
           if turnNumber (scheduledTurn turn) > 20000
             then do
               events ← frameEvents rig
-              throwIO (StandInFailure (Text.pack ("the composed loop never reached " <> what <> "; the last frame events: " <> show (drop (length events - 12) events))))
+              diagnosed ← boundDiagnostics rig host started before turn
+              throwIO (StandInFailure (Text.pack ("the composed loop never reached " <> what <> "; the last frame events: " <> show (drop (length events - 12) events) <> diagnosed)))
             else pure (ContinueWith NoUpdateDemand)
+
+-- | What 'composedUntil' adds to its failure: the phase's elapsed wall time
+-- and turns; the render owner's phase, completed and advanced rounds at the
+-- phase's start and now, whether its last step owed more work at once, and its
+-- next deadline beside the failing turn's now, in the same clock; and the
+-- native journal's last 'journalTail' entries. Rounds that kept advancing over
+-- a short phase point at turns outrunning the owner; rounds that stopped, or
+-- that advanced with no acquisition in the journal, at an owner that stalled.
+boundDiagnostics ∷ Rig → VulkanHost Scene → Double → OwnerStatus → ScheduledTurn → IO String
+boundDiagnostics rig host started before turn = do
+  ended ← getMonotonicTime
+  after ← atomically (readOwnerStatusNow (vulkanGraphicsOwner host))
+  entries ← journal rig
+  let recent = drop (length entries - journalTail) entries
+      rounds status = show (statusRounds status) <> " rounds (" <> show (statusAdvanced status) <> " advanced, phase " <> show (statusPhase status) <> ")"
+  pure $
+    "; elapsed "
+      <> showFFloat (Just 3) (ended - started) " s"
+      <> " over "
+      <> show (turnNumber (scheduledTurn turn))
+      <> " turns; the render owner: "
+      <> rounds before
+      <> " at the phase's start, "
+      <> rounds after
+      <> " at the failure, immediate "
+      <> show (statusImmediate after)
+      <> ", next deadline "
+      <> maybe "none" show (statusNextDeadline after)
+      <> " against the turn's now "
+      <> show (scheduledNow turn)
+      <> "; the last "
+      <> show (length recent)
+      <> " of "
+      <> show (length entries)
+      <> " journal entries: "
+      <> show recent
+
+-- | How many of the journal's latest entries a bound failure shows.
+journalTail ∷ Int
+journalTail = 20
 
 -- | Hand the host's window over, wait until its owner has built it a
 -- generation, and present one frame through the composed loop.
@@ -147,6 +201,53 @@ firstFrame rig host control window = do
   demandFrame host window
   composedUntil rig host control "a first presented frame" (\_ → pure ()) ((>= 1) <$> presentsOf rig (graphicsAttachment service))
   pure service
+
+-- | A condition that holds on the fifth turn ends the run there: every turn
+-- offers the update opportunity before asking the condition, and nothing
+-- fails.
+testComposedUntilReturns ∷ IO ()
+testComposedUntilReturns = do
+  rig ← visibleRig
+  (offered, asked) ← runRig rig $ \host control → do
+    [window] ← windowsOf host
+    _ ← firstFrame rig host control window
+    offers ← newTVarIO (0 ∷ Int)
+    questions ← newTVarIO (0 ∷ Int)
+    composedUntil
+      rig
+      host
+      control
+      "a fifth turn"
+      (\_ → demandFrame host window >> atomically (modifyTVar' offers (+ 1)))
+      (atomically (modifyTVar' questions (+ 1) >> (>= 5) <$> readTVar questions))
+    (,) <$> readTVarIO offers <*> readTVarIO questions
+  (offered, asked) `shouldBe` (5, 5)
+
+-- | A condition that never holds, under the same demand on every turn as the
+-- direct hide's frames while hidden, meets the unchanged bound of 20000 turns,
+-- and the failure carries each diagnostic beside the frame events it always
+-- named.
+testComposedUntilDiagnosed ∷ IO ()
+testComposedUntilDiagnosed = do
+  rig ← visibleRig
+  (outcome, entries) ← runRig rig $ \host control → do
+    [window] ← windowsOf host
+    _ ← firstFrame rig host control window
+    outcome ← try (composedUntil rig host control "a condition that never holds" (\_ → demandFrame host window) (pure False))
+    (,) outcome . length <$> journal rig
+  StandInFailure message ← either pure (const (failWith "the composed loop returned instead of failing at its bound")) outcome
+  let text = Text.unpack message
+  text `shouldSatisfy` isInfixOf "the composed loop never reached a condition that never holds; the last frame events: ["
+  text `shouldSatisfy` isInfixOf "; elapsed "
+  text `shouldSatisfy` isInfixOf " s over 20001 turns; the render owner: "
+  text `shouldSatisfy` isInfixOf " at the phase's start, "
+  text `shouldSatisfy` isInfixOf " at the failure, immediate "
+  text `shouldSatisfy` isInfixOf ", next deadline "
+  text `shouldSatisfy` isInfixOf " against the turn's now "
+  -- The journal had more entries than the tail shows, and the tail is
+  -- bounded.
+  entries `shouldSatisfy` (> journalTail)
+  text `shouldSatisfy` isInfixOf ("; the last " <> show journalTail <> " of ")
 
 testComposedPresent ∷ IO ()
 testComposedPresent = do
