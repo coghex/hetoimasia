@@ -2404,6 +2404,9 @@ cover:
 - binding refused before the placeholder is written;
 - descriptor writes only into slots no live version maps;
 - versions held to completion, with backpressure;
+- each new version written whole into an entry no batch holds before the
+  batch that binds it records, and flushed to the atom on non-coherent
+  memory;
 - the current version bound while every entry is held;
 - stale handles;
 - a release before the upload completes;
