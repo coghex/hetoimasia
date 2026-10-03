@@ -56,7 +56,13 @@ and the suites' verification capture.
   records a frame-less batch (GRS-12), submitted with the action's other
   sealed ones when it returns and discarded if it raises, and answers a
   ticket its caller can read, or wait for with a deadline, from any other
-  thread. A session with no target keeps polling
+  thread. An action makes the session's one shared ring, of the size the
+  application configured (`constructRing`), and layouts with push-constant
+  ranges and pipelines with vertex input (`constructPipelineLayoutWith`,
+  `constructPipelineWith`); a batch then claims and writes ring regions, binds
+  them and managed buffers as vertex, index and instance data, pushes
+  constants, and draws indexed and instanced through the re-exported recorder
+  (GRS-4). A session with no target keeps polling
   completion and disposing of released resources until it is ended, and
   retires through the same protected exit.
 - The private `controller` sublibrary holds the controller —
