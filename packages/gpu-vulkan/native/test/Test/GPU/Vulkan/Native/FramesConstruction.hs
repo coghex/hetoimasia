@@ -15,7 +15,19 @@
 module Test.GPU.Vulkan.Native.FramesConstruction (spec) where
 
 import Control.Concurrent.STM (atomically)
-import Control.Exception (Exception, ExceptionWithContext (ExceptionWithContext), SomeException, fromException, throwIO, try)
+import Control.Exception
+  ( Exception
+  , ExceptionWithContext (ExceptionWithContext)
+  , SomeException
+  , fromException
+  , rethrowIO
+  , someExceptionContext
+  , throwIO
+  , toException
+  , try
+  )
+import Control.Exception.Annotation (ExceptionAnnotation (displayExceptionAnnotation))
+import Control.Exception.Context (addExceptionAnnotation, emptyExceptionContext, getExceptionAnnotations)
 import Control.Monad (forM)
 import Data.IORef (atomicModifyIORef', newIORef)
 import qualified Data.Map.Strict as Map
@@ -38,6 +50,19 @@ newtype Scripted = Scripted Text
   deriving (Eq, Show)
 
 instance Exception Scripted
+
+-- | A mark attached to a construction failure's context where it is raised,
+-- so an example can tell that context survived.
+newtype ConstructionOrigin = ConstructionOrigin Text
+  deriving (Eq, Show)
+
+instance ExceptionAnnotation ConstructionOrigin where
+  displayExceptionAnnotation (ConstructionOrigin origin) = "raised at " <> Text.unpack origin
+
+-- | Raise this with that mark in its context.
+throwAnnotated ∷ ConstructionOrigin → Scripted → IO a
+throwAnnotated origin failure =
+  rethrowIO (ExceptionWithContext (addExceptionAnnotation origin emptyExceptionContext) (toException failure))
 
 spec ∷ Spec
 spec = describe "Frames construction rollback" $ do
@@ -76,26 +101,29 @@ spec = describe "Frames construction rollback" $ do
       syncCleanupState sync `shouldSatisfy` fenceUncertain
       retainedAfter rig [DestroyedFence 9002, DestroyedFence 9001, DestroyedSemaphore 9000] (\(FramesRetained _ _ slots _ _) → slots == [0])
 
-    it "retains every destruction that raised, in the order attempted, and attempts each object exactly once" $ do
+    it "retains every destruction that raised, in the order attempted, attempts each object exactly once, and keeps the construction failure's own context" $ do
       rig ← newRig
-      offerNaming (rigRootsStandIn rig)
-      failNaming (rigRootsStandIn rig) ObjectFence
       faults rig
-        [ (isDestruction, 0, throwIO (Scripted "destroy cleanup fence"))
-        , (isDestruction, 2, throwIO (Scripted "destroy acquisition semaphore"))
+        [ (createdFence, 1, throwAnnotated (ConstructionOrigin "the cleanup fence's creation") (Scripted "create cleanup fence"))
+        , (isDestruction, 0, throwIO (Scripted "destroy submission fence"))
+        , (isDestruction, 1, throwIO (Scripted "destroy acquisition semaphore"))
         ]
       failure ← acquisitionFailure rig
-      fromException failure `shouldBe` Just (NamingFailure ObjectFence)
-      retainedOf failure `shouldBe` [Just (Scripted "destroy cleanup fence"), Just (Scripted "destroy acquisition semaphore")]
-      destructions rig `shouldReturn` [DestroyedFence 9002, DestroyedFence 9001, DestroyedSemaphore 9000]
+      primaryOf failure `shouldBe` Just (Scripted "create cleanup fence")
+      -- The context the construction failure was raised with is still the
+      -- primary's, after both destructions raised beside it.
+      getExceptionAnnotations (someExceptionContext failure) `shouldBe` [ConstructionOrigin "the cleanup fence's creation"]
+      retainedOf failure `shouldBe` [Just (Scripted "destroy submission fence"), Just (Scripted "destroy acquisition semaphore")]
+      destructions rig `shouldReturn` [DestroyedFence 9001, DestroyedSemaphore 9000]
       [SlotView _ 0 sync] ← atomically (readSlots (rigFrames rig))
+      (syncAcquire sync, syncFence sync) `shouldBe` (9000, 9001)
       syncAcquireState sync `shouldSatisfy` semaphoreUncertain
-      syncFenceState sync `shouldBe` FenceDestroyed
-      syncCleanupState sync `shouldSatisfy` fenceUncertain
+      syncFenceState sync `shouldSatisfy` fenceUncertain
+      (syncCleanup sync, syncCleanupState sync) `shouldBe` (0, FenceNeverCreated)
       -- Retirement keeps it under the device-loss rule too: nothing it holds
       -- is destroyed again, whatever was owed.
       inModel rig (Admitted . noteDeviceLoss)
-      retainedAfter rig [DestroyedFence 9002, DestroyedFence 9001, DestroyedSemaphore 9000] (\(FramesRetained _ _ slots _ _) → slots == [0])
+      retainedAfter rig [DestroyedFence 9001, DestroyedSemaphore 9000] (\(FramesRetained _ _ slots _ _) → slots == [0])
 
     it "rolls back completely, retaining nothing and failing nothing, when every destruction returns" $ do
       rig ← newRig
