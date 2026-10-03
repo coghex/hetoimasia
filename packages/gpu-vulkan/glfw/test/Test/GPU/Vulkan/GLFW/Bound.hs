@@ -17,13 +17,14 @@
 --    ("Test.GPU.Vulkan.GLFW.StandIn" documents what that releases);
 -- 3. only then cancels each rig run's bound thread, and the example's own
 --    thread, with 'BoundExpired';
--- 4. waits for the example's thread to end, which the owner's protected exit
---    allows once it has completed on real destruction evidence; and
+-- 4. waits for the example to settle — its own thread ended, every rig run it
+--    started ended, every cancellation delivered — which the owner's protected
+--    exit allows once it has completed on real destruction evidence; and
 -- 5. fails the example, whatever the example's thread ended with.
 --
 -- The budget is the whole example's: it does not restart at each rig run. The
--- hard total is the bound plus the grace. If the example's thread has not
--- ended when the grace expires, the last resort names the example on standard
+-- hard total is the bound plus the grace. If the example has not settled
+-- when the grace expires, the last resort names the example on standard
 -- error and ends the test process with a failure status, without unwinding
 -- anything: operator termination is the protected exit's documented escape,
 -- and this suite takes it rather than waiting for ever.
@@ -170,9 +171,16 @@ runBounded settings name test = do
     enter scope = atomically (stateTVar currentCell (\enclosing → (enclosing, Just scope)))
     leave enclosing = atomically (writeTVar currentCell enclosing)
 
--- | Rescue the example's rigs, then cancel its threads, then wait for it to
--- end — under a watchdog started first, so nothing here can keep the grace
--- from expiring — and settle every thread this started before returning.
+-- | Rescue the example's rigs, then cancel its threads, then wait for the
+-- example to settle — under a watchdog started first, so nothing here can keep
+-- the grace from expiring — and join every thread this started before
+-- returning.
+--
+-- The example has settled only once its own thread has ended, every rig run it
+-- started has ended, and every cancellation has been delivered: a rig run on a
+-- thread of the example's own can outlive the example's thread, its
+-- cancellation held off by an uninterruptible call, and the watchdog stays
+-- armed until it too is over.
 rescue ∷ BoundSettings → String → BoundScope → ThreadId → STM () → IO ()
 rescue settings name scope worker ended = do
   settled ← newTVarIO False
@@ -189,11 +197,14 @@ rescue settings name scope worker ended = do
   -- Each delivery from a thread of its own: one held off by an
   -- uninterruptible call must not hold up the others, or this thread.
   cancellers ← mapM (\thread → started settings (throwTo thread BoundExpired)) (runs <> [worker])
-  uninterruptibleMask_ (atomically ended)
+  uninterruptibleMask_ . atomically $ do
+    ended
+    mapM_ joined cancellers
+    readTVar (scopeThreads scope) >>= check . Map.null
   atomically (writeTVar settled True)
-  mapM_ joined (watchdog : cancellers)
+  atomically (joined watchdog)
   where
-    joined done = atomically (readTVar done >>= check)
+    joined done = readTVar done >>= check
 
 -- | Start a thread, tell the settings of it, and answer a cell that becomes
 -- true once it has ended.

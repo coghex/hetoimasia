@@ -8,7 +8,7 @@
 -- journal and from the threads involved, never from timing.
 module Test.GPU.Vulkan.GLFW.Rescue (spec) where
 
-import Control.Concurrent (ThreadId, forkIO, yield)
+import Control.Concurrent (ThreadId, forkIO, myThreadId, yield)
 import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import Control.Exception (SomeException, displayException, throwIO, try, uninterruptibleMask_)
 import Control.Monad (void)
@@ -21,15 +21,17 @@ import Hetoimasia.GPU.Model.Identity (TargetClass (..))
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Loop (runVulkanOwnerLoop)
 import Hetoimasia.Runtime.GLFW
-  ( ScheduledStep (..)
+  ( OwnerStatus (..)
+  , ScheduledStep (..)
   , TargetStanding (..)
   , UpdateSchedule (..)
   , defaultScheduledHooks
   , graphicsAttachment
   , hostWindowClient
+  , readOwnerStatusNow
   )
 import Hetoimasia.Runtime.Supervision (RuntimeControl)
-import Test.GPU.Vulkan.GLFW.Bound (BoundSettings (..), boundOf, boundedIt, runBounded)
+import Test.GPU.Vulkan.GLFW.Bound (BoundSettings (..), boundOf, boundedIt, currentBound, runBounded, withBoundThread)
 import Test.GPU.Vulkan.GLFW.StandIn
 import Test.Hspec (Spec, describe, expectationFailure, shouldBe, shouldReturn, shouldSatisfy)
 
@@ -39,6 +41,8 @@ spec = describe "the fixture-aware example bound" $ do
   itBounded "reports an example's own failure raised before it released the rig's gates, once the owner's exit has completed, leaving no thread of it running" testFailureBeforeRelease
   itBounded "opens a native hold the owner had already entered, uninterruptibly, before the run is cancelled" testEnteredHoldRescued
   itBounded "names the example to its last resort when it has not ended within the grace, a blocked cancellation notwithstanding, and settles every thread it started" testLastResort
+  itBounded "keeps its last resort armed while a rig run on a thread of the example's own outlives the example's thread, its cancellation held off" testRunOutlivesExample
+  itBounded "keeps a timer hook installed while an earlier one was running, when the earlier one answers" testHookReplacedWhileRunning
 
 -- | A blocked example: a frame presented, its presentation never retired, the
 -- scripted clock never moved, and the body then waiting on something nothing
@@ -150,8 +154,87 @@ testLastResort = do
   -- The example's thread, the watchdog and the one cancellation.
   length (nub started) `shouldBe` 3
 
+-- | The example's own thread ends as soon as it is cancelled, but a rig run it
+-- started on a thread of its own is inside an uninterruptible call, so that
+-- run's cancellation waits. The example has not settled until the run has
+-- ended too, and its last resort stays armed meanwhile: here it is given the
+-- example's name, and only then is the run let go.
+testRunOutlivesExample ∷ IO ()
+testRunOutlivesExample = do
+  (controls, settings) ← scriptedBound
+  enlisted ← newTVarIO False
+  stuck ← newTVarIO False
+  helper ← newTVarIO Nothing
+  never ← newTVarIO False
+  -- The grace expires only once the example's own thread has ended, so a
+  -- bound that took that end for settlement would already have disarmed its
+  -- last resort.
+  void . forkIO $ do
+    atomically (readTVar enlisted >>= check)
+    expire controls
+    worker ← atomically (readTVar (controlThreads controls) >>= \case
+      first : _ → pure first
+      [] → retry)
+    awaitEnded worker
+    atomically (writeTVar (controlGrace controls) True)
+    atomically (readTVar (controlTerminated controls) >>= maybe retry (const (pure ())))
+    atomically (writeTVar stuck True)
+  outcome ← try . runBounded settings "an example with a run of its own" $ do
+    bound ← currentBound
+    thread ← forkIO $ do
+      self ← myThreadId
+      void . try @SomeException . withBoundThread bound self $ do
+        atomically (writeTVar enlisted True)
+        uninterruptibleMask_ (atomically (readTVar stuck >>= check))
+    atomically (writeTVar helper (Just thread))
+    atomically (readTVar never >>= check)
+  failedWith "the example did not finish within its bound" outcome
+  readTVarIO (controlTerminated controls) `shouldReturn` Just "an example with a run of its own"
+  started ← readTVarIO (controlThreads controls)
+  run ← readTVarIO helper
+  mapM_ awaitEnded (maybe id (:) run started)
+  atomically (writeTVar never True)
+
+-- | A hook installed while an earlier one is running inside an arming stays
+-- installed when the earlier one answers, and runs at a later arming.
+testHookReplacedWhileRunning ∷ IO ()
+testHookReplacedWhileRunning = do
+  rig ← scriptedRigOf 1
+  presentationsRetire rig False
+  firstRan ← newTVarIO False
+  secondRan ← newTVarIO False
+  runRig rig $ \host control → do
+    presentOne rig host control
+    onTimerArmed rig $ \_ → do
+      onTimerArmed rig (\_ → True <$ atomically (writeTVar secondRan True))
+      True <$ atomically (writeTVar firstRan True)
+    pollUntil rig host firstRan
+    pollUntil rig host secondRan
+    retireNextPresentations rig Nothing
+    presentationsRetire rig True
+    advanceClock rig 60000
+  readTVarIO secondRan `shouldReturn` True
+
 -- ---------------------------------------------------------------------------
 -- Helpers
+
+-- | Move the scripted clock to each deadline the owner publishes, one at a
+-- time, until this cell is set. With a presentation unretired, each poll at a
+-- deadline publishes a later one and arms the owner's timer for it.
+pollUntil ∷ Rig → VulkanHost Scene → TVar Bool → IO ()
+pollUntil rig host done = do
+  now ← clockNow rig
+  next ← atomically $ do
+    finished ← readTVar done
+    if finished
+      then pure Nothing
+      else
+        readOwnerStatusNow (vulkanGraphicsOwner host) >>= \status → case statusNextDeadline status of
+          Just due | due > now → pure (Just due)
+          _ → retry
+  case next of
+    Nothing → pure ()
+    Just due → setClock rig due >> pollUntil rig host done
 
 -- | What an example drives its own bound with.
 data Controls = Controls

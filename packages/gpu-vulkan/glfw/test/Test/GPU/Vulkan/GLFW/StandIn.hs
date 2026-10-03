@@ -164,6 +164,7 @@ import Data.Maybe (isJust)
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
+import Data.Unique (Unique, newUnique)
 import qualified Data.Text as Text
 import Data.Word (Word32, Word64, Word8)
 import Foreign.C.Types (CInt (..))
@@ -1296,10 +1297,11 @@ data Rig = Rig
     -- it, never at an interval of its own measured from a later reading.
   , rigArmings ∷ !(TVar [Duration])
     -- ^ Every duration the owner armed its timer for, with a scripted clock.
-  , rigArmHook ∷ !(TVar (Instant → IO Bool))
+  , rigArmHook ∷ !(TVar (Maybe (Unique, Instant → IO Bool)))
     -- ^ Run on the owner's thread inside each arming of its timer, with the
     -- arming's deadline, after the owner's clock reading and before the
-    -- timer is armed, until it answers 'True'.
+    -- timer is armed, until it answers 'True'; each installation has an
+    -- identity, so one that answers clears only itself.
   , rigBound ∷ !(Maybe BoundScope)
     -- ^ The bound of the example that made the rig, if it was made under one.
   , rigRescued ∷ !(TVar Bool)
@@ -1445,8 +1447,13 @@ clockNow rig = maybe (throwIO (StandInFailure "the rig has no scripted clock")) 
 -- thread, with the deadline the owner gave it — after the owner read its clock
 -- and before the timer is armed — until it answers 'True'. It is how an
 -- example moves the scripted clock inside the window between the two.
+--
+-- It replaces any hook installed before it, even one running now, which then
+-- leaves this one in place when it answers.
 onTimerArmed ∷ Rig → (Instant → IO Bool) → IO ()
-onTimerArmed rig = atomically . writeTVar (rigArmHook rig)
+onTimerArmed rig hook = do
+  key ← newUnique
+  atomically (writeTVar (rigArmHook rig) (Just (key, hook)))
 
 -- | Stop the rig withholding anything an exit needs, from now on (see the
 -- module's account of rescue).
@@ -1554,7 +1561,7 @@ newRigClocked visible windows clock = do
   frameLog ← newTVarIO []
   presentRounds' ← newTVarIO []
   armings ← newTVarIO []
-  armHook ← newTVarIO (\_ → pure True)
+  armHook ← newTVarIO Nothing
   let defaults = (defaultHostConfig windows) {hostIdleWait = 0.005}
   pure
     Rig
@@ -1641,9 +1648,11 @@ runRigHere rig body = myThreadId >>= \self → withBoundThread (rigBound rig) se
             { ownerClockTimer = ownerTimer $ \due duration → do
                 atomically (modifyTVar' (rigArmings rig) (<> [duration]))
                 record (rigJournal rig) OwnerTimerArmed
-                hook ← readTVarIO (rigArmHook rig)
-                done ← hook due
-                when done (atomically (writeTVar (rigArmHook rig) (\_ → pure True)))
+                installed ← readTVarIO (rigArmHook rig)
+                for_ installed $ \(key, hook) → do
+                  done ← hook due
+                  when done . atomically . modifyTVar' (rigArmHook rig) $ \current →
+                    if fmap fst current == Just key then Nothing else current
                 -- Expiry is the scripted clock reaching the owner's deadline,
                 -- never an interval from a reading of its own: the clock may
                 -- have moved since the owner read it. Rescued, every wait
