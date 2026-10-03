@@ -21,10 +21,10 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Lookup
   , TakenVersion (..)
   , versionHeld
   , encodeVersion
-  , releaseTableImage
   ) where
 
-import Control.Concurrent.STM (STM, atomically, modifyTVar', readTVar, readTVarIO, writeTVar)
+import Control.Concurrent.STM (STM, atomically, catchSTM, modifyTVar', readTVar, readTVarIO, throwSTM, writeTVar)
+import Control.Exception (Exception)
 import Control.Monad (unless, when)
 import Data.Functor ((<&>))
 import qualified Data.ByteString as ByteString
@@ -42,15 +42,14 @@ import Hetoimasia.GPU.Model.Budget (BudgetKind (LookupVersionBudget))
 import Hetoimasia.GPU.Model.Identity (HoldSubject (..), ResourceId)
 import qualified Hetoimasia.GPU.Model.TextureTable as Book
 import Hetoimasia.GPU.Vulkan.Native.Internal.Allocation (AllocatedBuffer (..), flushBuffer)
-import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Construction (releaseManaged)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Construction (releaseLive)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   ( DescriptorWrite (..)
   , ReadbackAllocation (..)
   , RecordingOps (..)
   )
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
-  ( Image (..)
-  , ManagedRecord (..)
+  ( ManagedRecord (..)
   , ManagedStanding (..)
   , NativeResource (..)
   , Recording (..)
@@ -100,18 +99,29 @@ refreshTable recording =
               CheckpointClear → True
               _ → False
           when clear (writeCompleted table device)
-          -- Slots no live version maps any longer.
-          freed ← atomically $ do
-            held ← readTVar (recordingTable recording)
-            case held of
-              Nothing → pure []
-              Just state → do
-                isHeld ← versionHeld roots state
-                let (reclaimed, slots) = Book.reclaimSlots isHeld (tableBook state)
-                writeTVar (recordingTable recording) (Just state {tableBook = reclaimed})
-                pure (map snd slots)
-          results ← traverse (releaseTableImage recording) freed
-          pure (sequence_ results)
+          -- Slots no live version maps any longer, and their images released,
+          -- in one transaction: no cancellation can leave an image the table
+          -- has let go of unreleased, and a refusal leaves everything as it
+          -- was, still retiring for the next refresh.
+          atomically $
+            ( do
+                held ← readTVar (recordingTable recording)
+                case held of
+                  Nothing → pure (Right ())
+                  Just state → do
+                    isHeld ← versionHeld roots state
+                    let (reclaimed, slots) = Book.reclaimSlots isHeld (tableBook state)
+                        images = map snd slots
+                    writeTVar
+                      (recordingTable recording)
+                      (Just state {tableBook = reclaimed, tableTextures = foldr Set.delete (tableTextures state) images})
+                    for_ images $ \image →
+                      releaseLive recording image >>= \case
+                        Left refusal → throwSTM (ReclaimRefused refusal)
+                        Right () → pure ()
+                    pure (Right ())
+            )
+              `catchSTM` \(ReclaimRefused refusal) → pure (Left refusal)
   where
     roots = recordingRoots recording
     ops = recordingOps recording
@@ -149,13 +159,11 @@ refreshTable recording =
           | not uploading → Just view
         _ → Nothing
 
--- | Release an image the table held, once no live version maps its slot: it
--- leaves the table's holdings, and is released as any managed image is,
--- deferred while an upload still holds it.
-releaseTableImage ∷ Recording q inst msgr phys dev cmd → ResourceId → IO (Either Refusal ())
-releaseTableImage recording image = do
-  atomically (modifyTVar' (recordingTable recording) (fmap (\table → table {tableTextures = Set.delete image (tableTextures table)})))
-  releaseManaged recording (Image image)
+-- | A reclaimed image's release was refused: the reclamation is rolled back.
+newtype ReclaimRefused = ReclaimRefused Refusal
+  deriving (Show)
+
+instance Exception ReclaimRefused
 
 -- | The version a batch binds the table at: its ring entry, that entry's
 -- managed version generation, which the batch retains, and the dynamic

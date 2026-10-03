@@ -37,9 +37,10 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Construction
   , createBuffer
   , createImage
   , releaseManaged
+  , releaseLive
   ) where
 
-import Control.Concurrent.STM (atomically, modifyTVar', readTVar, readTVarIO, writeTVar)
+import Control.Concurrent.STM (STM, atomically, modifyTVar', readTVar, readTVarIO, writeTVar)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, displayException, mask_, onException, rethrowIO, throwIO, tryWithContext)
 import Control.Monad (when)
 import qualified Data.Text as Text
@@ -955,25 +956,34 @@ releaseManaged recording handle =
     liveNative recording resource >>= \case
       Left refusal → pure (Left refusal)
       Right _ → atomically $ do
-        uploading ← Set.member resource <$> readTVar (recordingUploading recording)
         -- An image the texture table holds is released through its handle,
         -- and only once no live version maps its slot (GRS-7).
         tabled ← maybe False (Set.member resource . tableTextures) <$> readTVar (recordingTable recording)
         if tabled
           then pure (Left (RefusedIllegal "an image the texture table holds: release its handle instead"))
-          else if uploading
-          then do
-            modifyTVar' (recordingReleaseDeferred recording) (Set.insert resource)
-            editManaged recording resource (\entry → entry {managedStanding = ManagedReleased})
-            pure (Right ())
-          else do
-            released ← modelAnswer roots (fmap (\next → (next, ())) . releaseResource resource)
-            case released of
-              Left refusal → pure (Left refusal)
-              Right () → do
-                modelEdit roots (endResourceCpuUse resource)
-                editManaged recording resource (\entry → entry {managedStanding = ManagedReleased})
-                pure (Right ())
+          else releaseLive recording resource
   where
     resource = managedResource handle
+
+-- | Release a live generation, in the transaction the caller is in:
+-- deferred while an upload still holds it, and otherwise released in the
+-- model at once. The texture table releases the images it reclaims this
+-- way, in the same transaction that lets them go (GRS-7).
+releaseLive ∷ Recording q inst msgr phys dev cmd → ResourceId → STM (Either Refusal ())
+releaseLive recording resource = do
+  uploading ← Set.member resource <$> readTVar (recordingUploading recording)
+  if uploading
+    then do
+      modifyTVar' (recordingReleaseDeferred recording) (Set.insert resource)
+      editManaged recording resource (\entry → entry {managedStanding = ManagedReleased})
+      pure (Right ())
+    else do
+      released ← modelAnswer roots (fmap (\next → (next, ())) . releaseResource resource)
+      case released of
+        Left refusal → pure (Left refusal)
+        Right () → do
+          modelEdit roots (endResourceCpuUse resource)
+          editManaged recording resource (\entry → entry {managedStanding = ManagedReleased})
+          pure (Right ())
+  where
     roots = recordingRoots recording

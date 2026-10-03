@@ -438,6 +438,34 @@ spec = describe "Texture table" $ do
         Nothing → standings `shouldSatisfy` all (== ManagedReleased)
         Just _ → standings `shouldSatisfy` all (== ManagedLive)
 
+    it "never strands a reclaimed image when a cancellation arrives during the refresh that reclaims it: it is released, or still retiring for the next refresh" $ do
+      (rig, uploads, kit) ← tableRig 4 2
+      first ← uploadedTexture rig uploads
+      handle ← registered rig first
+      recordDrawing rig kit
+      ok (releaseTexture (rigRecording rig) handle)
+      -- A second texture whose upload completes before the refresh, so the
+      -- refresh writes its descriptor first and then reclaims the first's
+      -- slot, whose batch has completed by then.
+      second ← createImage (rigRecording rig) (ImageDescription TextureImage Rgba8Linear 2 2 1) >>= either (fail . show) pure
+      _ ← submitUpload uploads (UploadImage second [ByteString.replicate 16 255]) >>= either (fail . show) pure
+      _ ← registered rig second
+      settle rig uploads
+      owner ← myThreadId
+      onceAt (rigRecordingStandIn rig) AtWriteDescriptors $ do
+        killer ← forkIO (killThread owner)
+        awaitThrowing killer
+      outcome ← try @SomeException (refreshTextureTable (rigRecording rig))
+      fmap (const ()) outcome `shouldSatisfy` either ((== Just ThreadKilled) . fromException) (const False)
+      Just view ← atomically (readTable (rigRecording rig))
+      standing rig first >>= \case
+        Just ManagedReleased → tableViewRetiring view `shouldBe` []
+        _ → tableViewRetiring view `shouldBe` [1]
+      -- Either way the next refresh leaves nothing stranded.
+      ok (refreshTextureTable (rigRecording rig))
+      standing rig first `shouldReturn` Just ManagedReleased
+      clean rig
+
   describe "handles" $ do
     it "refuses a released handle wherever it is used, and issues its index again only under a new generation" $ do
       (rig, uploads, _) ← tableRig 4 2
