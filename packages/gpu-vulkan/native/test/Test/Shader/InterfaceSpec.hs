@@ -80,7 +80,20 @@ spec = describe "Shader interfaces" $ do
     it "refuses an interface naming an id the module defines no variable for, rather than reading it as empty" $ do
       bytes ← ByteString.readFile "test/fixtures/spirv/descriptors.frag.spv"
       -- Every variable's definition removed, its entry point's references kept.
-      reflect (withoutOpcode 59 bytes) `shouldSatisfy` failedWith "which the module defines no variable for"
+      reflect (without (\instruction → opcodeOf instruction == 59) bytes) `shouldSatisfy` failedWith "which the module defines no variable for"
+
+    it "refuses a vertex input that starts past its location's first component" $ do
+      bytes ← ByteString.readFile "test/fixtures/spirv/component.vert.spv"
+      reflect bytes `shouldSatisfy` failedWith "the vertex input at location 0 starts at component 1, which the reader does not support"
+
+    it "refuses a descriptor variable lacking its DescriptorSet and Binding, rather than dropping it" $ do
+      bytes ← ByteString.readFile "test/fixtures/spirv/descriptors.frag.spv"
+      -- Every DescriptorSet (34) and Binding (33) decoration removed.
+      let decorates which instruction = case wordsOf instruction of
+            first : _ : decorated : _ → first .&. 0xFFFF == 71 && decorated `elem` which
+            _ → False
+      reflect (without (decorates [33, 34]) bytes) `shouldSatisfy` failedWith "has neither a DescriptorSet nor a Binding"
+      reflect (without (decorates [33]) bytes) `shouldSatisfy` failedWith "has a DescriptorSet or a Binding but not both"
 
     it "refuses a module that is not well-formed SPIR-V" $ do
       bytes ← ByteString.readFile "test/fixtures/spirv/interface.vert.spv"
@@ -201,20 +214,34 @@ spec = describe "Shader interfaces" $ do
   where
     failedWith fragment = either (fragment `isInfixOf`) (const False)
 
--- | A module with every instruction of this opcode removed, its header and
--- every other instruction kept.
-withoutOpcode ∷ Word32 → ByteString.ByteString → ByteString.ByteString
-withoutOpcode removed bytes = ByteString.concat (header : [instruction | instruction ← instructions body, opcodeOf instruction /= removed])
+-- | A module with every instruction the predicate selects removed, its header
+-- and every other instruction kept.
+without ∷ (ByteString.ByteString → Bool) → ByteString.ByteString → ByteString.ByteString
+without removed bytes = ByteString.concat (header : [instruction | instruction ← instructions body, not (removed instruction)])
   where
     (header, body) = ByteString.splitAt 20 bytes
-    wordAt chunk = foldr (\byte acc → (acc `shiftL` 8) .|. fromIntegral byte) 0 (ByteString.unpack (ByteString.take 4 chunk)) ∷ Word32
-    opcodeOf instruction = wordAt instruction .&. 0xFFFF
     instructions rest
       | ByteString.null rest = []
       | otherwise =
-          let count = fromIntegral (wordAt rest `shiftR` 16) * 4
+          let count = fromIntegral (firstWord rest `shiftR` 16) * 4
               (instruction, remaining) = ByteString.splitAt count rest
            in instruction : instructions remaining
+
+-- | An instruction's words, in this host's byte order, and its opcode.
+wordsOf ∷ ByteString.ByteString → [Word32]
+wordsOf chunk
+  | ByteString.null chunk = []
+  | otherwise =
+      let (word, rest) = ByteString.splitAt 4 chunk
+       in foldr (\byte acc → (acc `shiftL` 8) .|. fromIntegral byte) 0 (ByteString.unpack word) : wordsOf rest
+
+opcodeOf ∷ ByteString.ByteString → Word32
+opcodeOf instruction = firstWord instruction .&. 0xFFFF
+
+firstWord ∷ ByteString.ByteString → Word32
+firstWord chunk = case wordsOf (ByteString.take 4 chunk) of
+  word : _ → word
+  [] → 0
 
 -- | Compile one client against the built package with a copy of this
 -- package's fingerprint, and hand its outcome to the example. The first

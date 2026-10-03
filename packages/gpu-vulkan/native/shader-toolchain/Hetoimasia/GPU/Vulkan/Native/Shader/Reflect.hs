@@ -22,9 +22,10 @@
 -- device's: neither is part of what the host declares, and the reader reports
 -- neither. A module it cannot read, or an interface construct it does not
 -- support — a nested push-constant struct, a matrix or array vertex input, a
--- texel buffer, an input attachment — is an error naming it, never an empty or
--- a matching interface; so is an interface naming an id the module defines no
--- variable for, and a push-constant member whose extent is beyond what 32
+-- texel buffer, an input attachment, a vertex input that starts past its
+-- location's first component — is an error naming it, never an empty or a
+-- matching interface; so is an interface naming an id the module defines no
+-- variable for, a descriptor variable lacking its DescriptorSet or Binding, and a push-constant member whose extent is beyond what 32
 -- bits can hold, computed without bound and never wrapped.
 --
 -- The module's words are read in the byte order the compiler wrote them,
@@ -280,6 +281,11 @@ vertexInput parsed variable pointer
         Just (Instruction 30 (_ : members)) | any (\member → isJust (memberDecoration parsed typeId member decorationBuiltIn)) [0 .. length members - 1] → Right []
         _ → do
           location ← maybe (Left ("a vertex input " <> name <> " has no Location")) Right (decoration parsed variable decorationLocation)
+          case decoration parsed variable decorationComponent of
+            Just component
+              | component /= 0 →
+                  Left ("the vertex input at location " <> show location <> " starts at component " <> show component <> ", which the reader does not support")
+            _ → pure ()
           kind ← inputType typeId
           pure [(location, kind)]
   where
@@ -299,7 +305,7 @@ vertexInput parsed variable pointer
 descriptor ∷ Module → Word32 → Word32 → Word32 → Either String [ReflectedDescriptor]
 descriptor parsed variable pointer storage =
   case (decoration parsed variable decorationDescriptorSet, decoration parsed variable decorationBinding) of
-    (Nothing, Nothing) → Right []
+    (Nothing, Nothing) → Left ("the descriptor variable (id " <> show variable <> ") has neither a DescriptorSet nor a Binding")
     (Just set, Just binding) → do
       typeId ← pointee parsed pointer
       (element, count) ← case typeOf parsed typeId of
@@ -378,7 +384,7 @@ storageUniform = 2
 storagePushConstant = 9
 storageStorageBuffer = 12
 
-decorationBlock, decorationBufferBlock, decorationRowMajor, decorationArrayStride, decorationMatrixStride, decorationBuiltIn, decorationLocation, decorationBinding, decorationDescriptorSet, decorationOffset ∷ Word32
+decorationBlock, decorationBufferBlock, decorationRowMajor, decorationArrayStride, decorationMatrixStride, decorationBuiltIn, decorationLocation, decorationComponent, decorationBinding, decorationDescriptorSet, decorationOffset ∷ Word32
 decorationBlock = 2
 decorationBufferBlock = 3
 decorationRowMajor = 4
@@ -386,6 +392,7 @@ decorationArrayStride = 6
 decorationMatrixStride = 7
 decorationBuiltIn = 11
 decorationLocation = 30
+decorationComponent = 31
 decorationBinding = 33
 decorationDescriptorSet = 34
 decorationOffset = 35
