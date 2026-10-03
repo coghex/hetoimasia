@@ -121,9 +121,20 @@ spec = describe "texture table" $ do
       handleIndex again `shouldBe` handleIndex handle
       handleGeneration again `shouldSatisfy` (/= handleGeneration handle)
       -- A handle a version maps was handed out, and is not undone.
-      (completed, _) ← expectRight (completeTexture handle registered)
+      (completed, (slot, _)) ← expectRight (completeTexture handle registered)
       (bound, _) ← expectRight (bindVersion (const False) completed)
       unregisterTexture handle bound `shouldBe` Left (TableStaleHandle handle)
+      -- A version naming the slot for an earlier occupant is no obstacle:
+      -- once that texture is released and its slot reclaimed, a registration
+      -- reusing the slot is undone.
+      released ← expectRight (releaseTexture handle bound)
+      let (reclaimed, freed) = reclaimSlots (const False) released
+      map fst freed `shouldBe` [slot]
+      (reused, replacement) ← expectRight (registerTexture "b" reclaimed)
+      (completedAgain, (reusedSlot, _)) ← expectRight (completeTexture replacement reused)
+      reusedSlot `shouldBe` slot
+      undoneAgain ← expectRight (unregisterTexture replacement completedAgain)
+      freeSlots undoneAgain `shouldBe` freeSlots reclaimed
 
     it "frees a released texture's slot at once when no batch holds a version mapping it: the release made the current version unbindable" $ do
       let table = fresh 3 2

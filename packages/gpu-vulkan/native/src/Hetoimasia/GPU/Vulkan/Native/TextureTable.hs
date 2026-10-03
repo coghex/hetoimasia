@@ -68,6 +68,7 @@ module Hetoimasia.GPU.Vulkan.Native.TextureTable
   , Book.LookupEntry (..)
   , Book.resolveHandle
   , registerTexture
+  , RegistrationNotUndone (..)
   , releaseTexture
 
     -- * Pipelines and draws
@@ -83,7 +84,8 @@ import qualified Hetoimasia.GPU.Model.TextureTable as Book
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer (TableSampler (..), tableSamplerIndex)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Recorder (bindTable, selectSampler)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Table
-  ( TableView (..)
+  ( RegistrationNotUndone (..)
+  , TableView (..)
   , createTablePipelineLayout
   , createTextureTable
   , readTable

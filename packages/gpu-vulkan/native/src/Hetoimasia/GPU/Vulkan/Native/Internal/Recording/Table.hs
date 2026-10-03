@@ -23,10 +23,13 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Table
   , createTablePipelineLayout
   , TableView (..)
   , readTable
+  , RegistrationNotUndone (..)
   ) where
 
-import Control.Concurrent.STM (STM, atomically, modifyTVar', readTVar, readTVarIO, writeTVar)
-import Control.Exception (Exception, SomeException, mask, mask_, onException, rethrowIO, throwIO, try, tryWithContext)
+import Control.Concurrent.STM (STM, atomically, readTVar, readTVarIO, writeTVar)
+import Control.Exception (Exception, ExceptionWithContext (ExceptionWithContext), SomeException, displayException, mask, mask_, onException, rethrowIO, throwIO, try, tryWithContext)
+import Data.Text (Text)
+import qualified Data.Text as Text
 import qualified Data.ByteString as ByteString
 import Data.Foldable (for_)
 import Data.IORef (modifyIORef', newIORef, readIORef)
@@ -281,20 +284,43 @@ registerTexture recording (Image image) =
               -- An image whose upload already completed completes now. If
               -- that refresh raises, is cancelled or refuses, the handle is
               -- never handed out, so the registration is undone first: the
-              -- caller keeps its image, and may register it again.
+              -- caller keeps its image, and may register it again. An undo
+              -- that is itself refused raises 'RegistrationNotUndone', which
+              -- carries the live handle, so it is never lost.
               Right handle →
                 tryWithContext @SomeException (restore (refreshTable recording)) >>= \case
                   Right (Right ()) → pure (Right handle)
-                  Right (Left refusal) → unregister recording image handle >> pure (Left refusal)
-                  Left failure → unregister recording image handle >> rethrowIO failure
+                  Right (Left refusal) → do
+                    undone handle (tshow refusal) =<< unregister recording image handle
+                    pure (Left refusal)
+                  Left failure@(ExceptionWithContext _ exception) → do
+                    undone handle (Text.pack (displayException exception)) =<< unregister recording image handle
+                    rethrowIO failure
       Right _ → pure (Left RefusedWrongKind)
 
--- | Undo a registration whose handle was never handed out.
-unregister ∷ Recording q inst msgr phys dev cmd → ResourceId → Book.TextureHandle → IO ()
+-- | Undo a registration whose handle was never handed out, answering
+-- whether it was undone.
+unregister ∷ Recording q inst msgr phys dev cmd → ResourceId → Book.TextureHandle → IO Bool
 unregister recording image handle =
-  atomically . modifyTVar' (recordingTable recording) . fmap $ \table → case Book.unregisterTexture handle (tableBook table) of
-    Right book → table {tableBook = book, tableTextures = Set.delete image (tableTextures table)}
-    Left _ → table
+  atomically $
+    readTVar (recordingTable recording) >>= \case
+      Nothing → pure False
+      Just table → case Book.unregisterTexture handle (tableBook table) of
+        Right book → True <$ writeTVar (recordingTable recording) (Just table {tableBook = book, tableTextures = Set.delete image (tableTextures table)})
+        Left _ → pure False
+
+-- | Raise 'RegistrationNotUndone' unless the undo happened.
+undone ∷ Book.TextureHandle → Text → Bool → IO ()
+undone handle cause = \case
+  True → pure ()
+  False → throwIO (RegistrationNotUndone handle cause)
+
+-- | A registration whose refresh failed — for the reason given — could not
+-- be undone: the handle is live, and is the caller's to release.
+data RegistrationNotUndone = RegistrationNotUndone !Book.TextureHandle !Text
+  deriving (Show)
+
+instance Exception RegistrationNotUndone
 
 -- | Release a handle: it resolves to nothing from the next version on, its
 -- index may be issued again under a new generation, and its slot retires.

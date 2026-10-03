@@ -468,8 +468,18 @@ spec = describe "Texture table" $ do
       clean rig
 
   describe "handles" $ do
-    it "undoes a registration whose refresh raises or is cancelled before its handle is handed out: nothing stays registered, and registering again succeeds" $ do
-      (rig, uploads, _) ← tableRig 4 2
+    it "undoes a registration whose refresh raises or is cancelled before its handle is handed out, into a slot an earlier, bound and released texture left: nothing stays registered, and registering again succeeds" $ do
+      (rig, uploads, kit) ← tableRig 4 2
+      -- An earlier texture takes slot 1, is bound by a batch that completes,
+      -- and is released; its slot is reclaimed, while that obsolete version
+      -- still names it.
+      earlier ← uploadedTexture rig uploads
+      earlierHandle ← registered rig earlier
+      recordDrawing rig kit
+      ok (releaseTexture (rigRecording rig) earlierHandle)
+      completed rig
+      ok (refreshTextureTable (rigRecording rig))
+      standing rig earlier `shouldReturn` Just ManagedReleased
       texture ← uploadedTexture rig uploads
       let standIn = rigRecordingStandIn rig
           unregistered = do

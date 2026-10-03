@@ -310,13 +310,16 @@ releaseTexture handle table = do
 -- | Undo a registration whose handle was never handed out: its index holds
 -- no texture again, and its slot is free at once, with nothing kept for it,
 -- since the caller still owns what it registered. Refused for a stale handle,
--- and for one whose slot a version maps — which a handle never handed out
--- cannot have been bound into.
+-- and for one a version maps — its index at its generation — which a handle
+-- never handed out cannot have been bound into. A version naming the slot for
+-- an earlier occupant is no obstacle: the slot was free when this handle took
+-- it, so no live version maps it.
 unregisterTexture ∷ TextureHandle → TextureTable a → Either TableRefusal (TextureTable a)
 unregisterTexture handle table = do
   (index, holder) ← live handle table
   let slot = holderSlot holder
-  if any (any ((== slot) . entrySlot)) (tableVersions table)
+      mapsHandle = maybe False ((== handleGeneration handle) . entryGeneration) . Map.lookup index
+  if any mapsHandle (tableVersions table)
     then Left (TableStaleHandle handle)
     else
       Right
