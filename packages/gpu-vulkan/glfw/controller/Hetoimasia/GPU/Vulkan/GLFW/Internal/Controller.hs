@@ -204,6 +204,8 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , constructBuffer
   , constructImage
   , constructFramelessBatch
+  , constructReadback
+  , readConstructedReadback
   , releaseConstructed
 
     -- * Verification capture (VK-19)

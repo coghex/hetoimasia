@@ -73,13 +73,14 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
 -- readback buffer's memory, its mapping and its maintenance are the device
 -- allocator's ("Hetoimasia.GPU.Vulkan.Native.Allocator.Vulkan"); this layer
 -- only copies bytes through the mapping it is handed. Of the physical device
--- it reads the largest buffer it may create, once, and whether it supports an
--- image before one is created.
+-- it reads the largest buffer it may create and the largest render area it may
+-- render into, once, and whether it supports an image before one is created.
 vulkanRecordingOps ∷ PhysicalDevice → IO (RecordingOps Device CommandBuffer)
 vulkanRecordingOps physical = do
   properties ∷ PhysicalDeviceProperties2 '[PhysicalDeviceVulkan13Properties] ← getPhysicalDeviceProperties2 physical
   let (thirteen, ()) = properties.next
       largest = fromIntegral thirteen.maxBufferSize
+      framebuffer = (properties.properties.limits.maxFramebufferWidth, properties.properties.limits.maxFramebufferHeight)
   pure
     RecordingOps
       { opsCreatePipelineLayout = \device →
@@ -114,6 +115,7 @@ vulkanRecordingOps physical = do
       , opsCommandBufferHandle = fromIntegral . ptrToWordPtr . commandBufferHandle
       , opsImageSupport = imageSupport physical
       , opsMaxBufferSize = pure largest
+      , opsMaxFramebuffer = pure framebuffer
       , opsCreateView = \device request →
           (\(ImageView created) → created)
             <$> createImageView

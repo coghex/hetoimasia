@@ -59,6 +59,10 @@
 --   batches over a managed color target and buffer recorded through
 --   owner-thread actions, submitted when each returns, and their tickets
 --   waited for (#337);
+-- * @grs5-offscreen@ — the same device start with no window, then managed
+--   RGBA8 color targets, sRGB and linear, rendered into by frame-less batches,
+--   copied to readback buffers and probed for exact bytes, each written as a
+--   PNG to a temporary path that is printed and never committed (#338);
 -- * @grs3-ordering@ — GRS-3's managed depth target and buffer written by an
 --   initializing batch, then by two batches submitted in order with no
 --   completion wait between and no layout change, ordered only by the
@@ -317,6 +321,14 @@ scenarios =
       $ \consent journal _ → do
         outcome ← SurfaceFree.runFrameless (consentBackend consent) journal
         pure (SurfaceFree.framelessSpec outcome, section "The GRS-12 frame-less batches record" (SurfaceFree.framelessSection outcome))
+  , Scenario
+      "grs5-offscreen"
+      "renders into managed RGBA8 color targets, sRGB and linear, in frame-less batches of a surface-free session, copies each to a readback buffer after its transition, and reads exact bytes inside and outside the triangle, with validation reporting nothing"
+      False
+      Nothing
+      $ \consent journal _ → do
+        outcome ← SurfaceFree.runOffscreen (consentBackend consent) journal
+        pure (SurfaceFree.offscreenSpec outcome, section "The GRS-5 offscreen color targets record" (SurfaceFree.offscreenSection outcome))
   , Scenario
       "synchronization-hazard"
       "observes a deliberate synchronization hazard, proving synchronization validation active"

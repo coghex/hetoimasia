@@ -43,10 +43,24 @@
 -- A frame-less batch (GRS-12) is recorded the same way, through the frames'
 -- scope ('Hetoimasia.GPU.Vulkan.Native.Frames.recordFramelessIn'), into the
 -- storage of a frame-less slot of the session, with no swapchain image: every
--- command that needs one is refused. Its 'BatchTicket' reports it pending,
+-- command that needs one is refused, and it renders into a managed color
+-- target instead. Its 'BatchTicket' reports it pending,
 -- complete, discarded or lost; 'readTicket' reads it from any thread, and
 -- 'awaitTicket' waits for it with a deadline anywhere but the graphics
 -- owner's thread. A discard settles it as discarded.
+--
+-- = Offscreen color targets
+--
+-- GRS-5 renders into a managed 'ColorTarget' image, in a frame batch or a
+-- frame-less one: 'beginRenderingInto' begins a pass with the target's owned
+-- view as its one color attachment, cleared across its whole extent, either
+-- keeping its color-attachment use ('ClearTarget') or transitioning it from
+-- undefined ('ClearFromUndefined'), which initializes a new target. The open
+-- pass's attachment governs the pipeline, viewport and scissor checks, and a
+-- draw checks them again against it. 'copyTargetToReadback' copies a target
+-- the consumer moved to its 'TransferRead' use whole into a readback buffer,
+-- four bytes a pixel in the target's own byte order, tightly packed and
+-- unconverted, readable once the copying batch's submission has completed.
 --
 -- = Names and labels
 --
@@ -256,12 +270,15 @@ module Hetoimasia.GPU.Vulkan.Native.Recording
   , transitionImage
   , supportedTransition
   , beginRendering
+  , PassStart (..)
+  , beginRenderingInto
   , endRendering
   , bindPipeline
   , setViewport
   , setScissor
   , draw
   , copyToReadback
+  , copyTargetToReadback
   , readbackBytesFor
 
     -- * Tickets (GRS-12)
@@ -353,8 +370,11 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Readback (fillReadback, readReadback)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Recorder
   ( Recorder
+  , PassStart (..)
   , beginRendering
+  , beginRenderingInto
   , bindPipeline
+  , copyTargetToReadback
   , copyToReadback
   , draw
   , endRendering

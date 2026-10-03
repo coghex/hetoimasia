@@ -99,7 +99,16 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , Image
   , ImageKind (..)
   , ImageFormat (..)
+  , formatCode
   , ImageDescription (..)
+
+    -- * Offscreen color targets (GRS-5)
+  , PassStart (..)
+  , beginRenderingInto
+  , copyTargetToReadback
+  , constructReadback
+  , readConstructedReadback
+  , Readback
 
     -- * Frame-less batches (GRS-12)
   , constructFramelessBatch
@@ -204,6 +213,8 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , constructBuffer
   , constructFramelessBatch
   , constructImage
+  , constructReadback
+  , readConstructedReadback
   , constructPipeline
   , constructPipelineLayout
   , replaceConstructedPipeline
@@ -259,9 +270,11 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , ImageDescription (..)
   , ImageFormat (..)
   , ImageKind (..)
+  , formatCode
   , Pipeline
   , PipelineLayout
   , PipelineShaders (..)
+  , Readback
   , Recorder
   , Rect (..)
   , Refusal (..)
@@ -269,8 +282,11 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , TicketState (..)
   , TransitionSource (..)
   , Viewport (..)
+  , PassStart (..)
   , awaitTicket
   , beginRendering
+  , beginRenderingInto
+  , copyTargetToReadback
   , bindPipeline
   , draw
   , endRendering

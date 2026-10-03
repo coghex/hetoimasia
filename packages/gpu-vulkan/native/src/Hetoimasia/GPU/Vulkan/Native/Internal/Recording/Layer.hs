@@ -386,6 +386,10 @@ data RecordingOps dev cmd = RecordingOps
     -- It asks the device and creates nothing.
   , opsMaxBufferSize ∷ IO Natural
     -- ^ The largest buffer the device may create (@maxBufferSize@).
+  , opsMaxFramebuffer ∷ IO (Word32, Word32)
+    -- ^ The widest and tallest render area the device may render into
+    -- (@maxFramebufferWidth@, @maxFramebufferHeight@), which an image's own
+    -- limits do not bound (GRS-5).
   , opsCreateView ∷ dev → ViewRequest → IO Word64
     -- ^ An image's one owned view.
   , opsDestroyView ∷ dev → Word64 → IO ()

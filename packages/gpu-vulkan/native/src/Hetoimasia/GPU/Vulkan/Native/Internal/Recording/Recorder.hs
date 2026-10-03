@@ -25,12 +25,15 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Recorder
   , transitionImage
   , transitionResource
   , beginRendering
+  , PassStart (..)
+  , beginRenderingInto
   , endRendering
   , bindPipeline
   , setViewport
   , setScissor
   , draw
   , copyToReadback
+  , copyTargetToReadback
   , readbackBytesFor
   ) where
 
@@ -43,12 +46,12 @@ import Data.ByteString (ByteString)
 import Data.Foldable (for_)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (isJust)
+import Data.Maybe (isJust, isNothing)
 import qualified Data.Text as Text
 import Data.Word (Word32, Word64)
 import Numeric.Natural (Natural)
 
-import Hetoimasia.GPU.Model.Access (BatchAccess, Barrier (..), BarrierRole (EntryBarrier), Contents (..), ResourceUse, TransitionSource, emptyAccess)
+import Hetoimasia.GPU.Model.Access (BatchAccess, Barrier (..), BarrierRole (EntryBarrier), Contents (..), ResourceUse (..), TransitionSource (..), emptyAccess)
 import qualified Hetoimasia.GPU.Model.Access as Access
 import Hetoimasia.GPU.Model
   ( FramePhase (..)
@@ -82,8 +85,15 @@ import Hetoimasia.GPU.Model.Identity
 import Hetoimasia.GPU.Vulkan.Native.Generations (GenerationView (..), TargetGenerationsView (..), readTargetGenerations)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Batches (retireCompleted, retireCompletedOn)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Construction (createFramelessStorage)
+import Hetoimasia.GPU.Vulkan.Native.Allocator (BoundMemory (memoryResource))
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   ( ClearColor
+  , ImageDescription (..)
+  , ImageKind (..)
+  , ImageUse (..)
+  , formatCode
+  , imageKindUse
+  , imageResourceKind
   , ImageLayout (..)
   , NativeCommand (..)
   , ReadbackAllocation (..)
@@ -99,6 +109,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , BatchStanding (..)
   , BatchTicket (..)
   , FrameStorage (..)
+  , Image (..)
   , Managed (managedResource)
   , ManagedRecord (..)
   , ManagedStanding (..)
@@ -122,16 +133,18 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , tshow
   )
 import Hetoimasia.GPU.Model.Budget (BudgetKind (FramelessBatchBudget), framelessBatchLimit)
-import Hetoimasia.GPU.Vulkan.Native.Naming (batchLabel, framelessBatchLabel, passLabel)
+import Hetoimasia.GPU.Vulkan.Native.Naming (batchLabel, framelessBatchLabel, passLabel, targetPassLabel)
 import Hetoimasia.GPU.Vulkan.Native.Presentation (GenerationPlan (..), SurfaceExtent (..), SurfaceFormat (..), imageUsageTransferSource)
 import Hetoimasia.GPU.Vulkan.Native.Roots (Roots, readRootsInstrumentation, rootsCall, stateRootsModel)
 
 data RecorderState = RecorderState
   { stateLayout ∷ !ImageLayout
-  , stateRendering ∷ !Bool
-  , statePipeline ∷ !(Maybe ResourceId)
-  , stateViewport ∷ !Bool
-  , stateScissor ∷ !Bool
+  , stateRendering ∷ !(Maybe Attachment)
+    -- ^ The attachment of the pass that is open, if one is.
+  , statePipeline ∷ !(Maybe (ResourceId, Word32))
+    -- ^ The bound pipeline, and the color format it was built for.
+  , stateViewport ∷ !(Maybe Viewport)
+  , stateScissor ∷ !(Maybe Rect)
   , stateAccess ∷ !(BatchAccess ResourceId)
     -- ^ The use each managed buffer and image the batch has touched is in
     -- (GRS-3).
@@ -296,7 +309,7 @@ recordAdmitted
   → IO (Either Refusal (BatchId, a))
 recordAdmitted recording batch commands image label restore consumer = do
   opened ← newIORef True
-  state ← newIORef (RecorderState LayoutUndefined False Nothing False False emptyAccess Map.empty)
+  state ← newIORef (RecorderState LayoutUndefined Nothing Nothing Nothing Nothing emptyAccess Map.empty)
   labelled ← isJust <$> readRootsInstrumentation roots
   labels ← newIORef 0
   let recorder = Recorder recording batch commands image opened state labelled labels
@@ -339,7 +352,7 @@ recordAdmitted recording batch commands image label restore consumer = do
           _ ← balance
           rethrowIO failure
         Right value → do
-          rendering ← stateRendering <$> readIORef state
+          rendering ← isJust . stateRendering <$> readIORef state
           standing ← recording'
           if standing /= Just BatchRecording
             then do
@@ -575,7 +588,7 @@ transitionImage recorder from to = withImage recorder $ \image → command recor
       if LayoutTransferSource `elem` [from, to] && not (frameImageCapturable image)
         then Left (RefusedUnsupported "a transfer-source transition of an image its generation did not make a transfer source")
         else
-      if stateRendering state
+      if isJust (stateRendering state)
         then Left (RefusedIllegal "an image transition inside rendering")
         else
           if stateLayout state /= from
@@ -605,7 +618,7 @@ transitionResource recorder handle from to =
       Right native → case orderedObject native of
         Nothing → pure (Left RefusedWrongKind)
         Just (kind, object, image) → orderedSequence recorder $ \state →
-          if stateRendering state
+          if isJust (stateRendering state)
             then Left (RefusedIllegal "a resource transition inside rendering")
             else case Access.transition resource kind from to (stateAccess state) of
               Left refusal → Left (accessRefused refusal)
@@ -647,95 +660,222 @@ describeAccess = \case
   Access.KindMismatch recorded named → "a " <> tshow recorded <> " named as a " <> tshow named
   Access.AwayFromRest resource kind use → tshow resource <> ", a " <> tshow kind <> ", " <> tshow use <> " rather than at rest"
 
+-- | What a dynamic-rendering pass renders into: the frame's image, or a
+-- managed color target (GRS-5).
+data Attachment = Attachment
+  { attachmentExtent ∷ !SurfaceExtent
+  , attachmentFormat ∷ !Word32
+  , attachmentTarget ∷ !(Maybe ResourceId)
+    -- ^ The color target, or 'Nothing' for the frame's image.
+  }
+
+-- | The frame's image as an attachment.
+frameAttachment ∷ FrameImage → Attachment
+frameAttachment frame = Attachment (frameImageExtent frame) (frameImageFormat frame) Nothing
+
+-- | What a pipeline, a viewport or a scissor is checked against: the open
+-- pass's attachment, or, outside rendering, the frame's image. A frame-less
+-- batch outside rendering has neither.
+checkedAgainst ∷ Recorder q inst msgr phys dev cmd → RecorderState → Either Refusal Attachment
+checkedAgainst recorder state = case stateRendering state of
+  Just attachment → Right attachment
+  Nothing → maybe (Left (RefusedIllegal "dynamic state outside rendering in a frame-less batch, with no attachment to check it against")) (Right . frameAttachment) (recorderFrame recorder)
+
+-- | How an attachment is named in a refusal.
+attachmentName ∷ Attachment → Text.Text
+attachmentName attachment = maybe "the frame's image" (const "the color target") (attachmentTarget attachment)
+
 -- | Begin dynamic rendering into the frame's image view, cleared to the
 -- color, across the whole extent. The image must be a color attachment. On a
 -- labelled batch the pass's label opens first.
 beginRendering ∷ Recorder q inst msgr phys dev cmd → ClearColor → IO (Either Refusal ())
 beginRendering recorder clear = withImage recorder $ \frame → commandSequence recorder $ \state →
-  if stateRendering state
+  if isJust (stateRendering state)
     then Left (RefusedIllegal "rendering has already begun")
     else
       if stateLayout state /= LayoutColorAttachment
         then Left (RefusedIllegal ("rendering into an image that is " <> tshow (stateLayout state)))
         else
           Right
-            ( state {stateRendering = True}
+            ( state {stateRendering = Just (frameAttachment frame)}
             , []
             , [CommandBeginLabel (passLabel (recorderBatch recorder) (frameImageGeneration frame)) | recorderLabelled recorder]
                 <> [CommandBeginRendering (frameImageView frame) (frameImageExtent frame) clear]
             )
 
+-- | How a pass into a managed color target begins (GRS-5). Either way the
+-- pass clears the whole target to its color.
+data PassStart
+  = ClearTarget
+    -- ^ The target is in its color-attachment use — at rest, on the batch's
+    -- first touch — and keeps its layout. Its contents must be initialized.
+  | ClearFromUndefined
+    -- ^ Whatever the target held is discarded: the pass's barrier leaves the
+    -- undefined layout, which initializes a target that awaits it.
+  deriving (Eq, Show)
+
+-- | Begin dynamic rendering into a managed color target (GRS-5), in a frame
+-- batch or a frame-less one alike: its owned view is the one color
+-- attachment, cleared to the color, and its extent is the render area.
+--
+-- Like every command it checks the owner's thread and the handle — this
+-- session's, live, a 'ColorTarget' image — and that no pass is open; under
+-- #335's rules the pass is a use of the target in its color-attachment use:
+-- 'ClearTarget' requires it to be in that use already, and 'ClearFromUndefined'
+-- is a transition from undefined into it. The batch's first touch records the
+-- entry barrier, and a target that awaits initialization admits only a
+-- 'ClearFromUndefined' pass, or none while another batch initializes it. A
+-- dynamic-rendering attachment's view covers exactly one mip level, and the
+-- target's owned view covers them all, so a target of more than one mip level
+-- is 'RefusedUnsupported'. The target's extent, the render area, must lie
+-- within the device's framebuffer limits, which its image limits do not bound:
+-- a wider or taller one is 'RefusedOutOfBounds', naming its size and the
+-- limit. Every refusal makes no native call. Pipelines, viewports and scissors are checked
+-- against the target while the pass is open.
+beginRenderingInto ∷ Recorder q inst msgr phys dev cmd → Image → PassStart → ClearColor → IO (Either Refusal ())
+beginRenderingInto recorder (Image resource) start clear =
+  owned recording $
+    liveNative recording resource >>= \case
+      Left refusal → pure (Left refusal)
+      Right (NativeImage description memory view)
+        | imageKind description /= ColorTarget → pure (Left RefusedWrongKind)
+        | imageMipLevels description /= 1 → pure (Left (RefusedUnsupported "rendering into a color target of more than one mip level"))
+        | otherwise →
+          opsMaxFramebuffer (recordingOps recording) >>= \case
+            (widest, _)
+              | imageWidth description > widest → pure (Left (RefusedOutOfBounds (fromIntegral (imageWidth description)) (fromIntegral widest)))
+            (_, tallest)
+              | imageHeight description > tallest → pure (Left (RefusedOutOfBounds (fromIntegral (imageHeight description)) (fromIntegral tallest)))
+            _ → orderedSequence recorder $ \state →
+              if isJust (stateRendering state)
+                then Left (RefusedIllegal "rendering has already begun")
+                else
+                  let kind = imageResourceKind ColorTarget
+                      stepped = case start of
+                        ClearTarget → Access.touch resource kind ColorAttachment KeepsContents (stateAccess state)
+                        ClearFromUndefined → Access.transition resource kind FromUndefined ColorAttachment (stateAccess state)
+                      extent = SurfaceExtent (imageWidth description) (imageHeight description)
+                      object = memoryResource memory
+                      image = Just (useAspect (imageKindUse ColorTarget), imageMipLevels description)
+                   in case stepped of
+                        Left refusal → Left (accessRefused refusal)
+                        Right (access, barriers) →
+                          Right
+                            ( state
+                                { stateAccess = access
+                                , stateObjects = Map.insert resource (object, image) (stateObjects state)
+                                , stateRendering = Just (Attachment extent (formatCode (imageFormat description)) (Just resource))
+                                }
+                            , [resource]
+                            , [ (resource, if barrierDiscards barrier then DiscardsContents else KeepsContents)
+                              | barrier ← barriers
+                              , barrierRole barrier == EntryBarrier
+                              ]
+                            , map (resourceBarrier object image) barriers
+                                <> [CommandBeginLabel (targetPassLabel (recorderBatch recorder) resource) | recorderLabelled recorder]
+                                <> [CommandBeginRendering view extent clear]
+                            )
+      Right _ → pure (Left RefusedWrongKind)
+  where
+    recording = recorderRecording recorder
+
 -- | End dynamic rendering. On a labelled batch the pass's label closes after it.
 endRendering ∷ Recorder q inst msgr phys dev cmd → IO (Either Refusal ())
 endRendering recorder = commandSequence recorder $ \state →
-  if not (stateRendering state)
+  if isNothing (stateRendering state)
     then Left (RefusedIllegal "ending rendering that has not begun")
-    else Right (state {stateRendering = False}, [], CommandEndRendering : [CommandEndLabel | recorderLabelled recorder])
+    else Right (state {stateRendering = Nothing}, [], CommandEndRendering : [CommandEndLabel | recorderLabelled recorder])
 
--- | Bind a live pipeline built for the frame's color format. The batch
--- retains the pipeline's generation and, transitively, its layout's.
+-- | Bind a live pipeline built for the color format of the attachment it is
+-- checked against: the open pass's, or, outside rendering, the frame's image.
+-- The batch retains the pipeline's generation and, transitively, its layout's.
+-- A draw checks the format again against the pass it is drawn in.
 bindPipeline ∷ Recorder q inst msgr phys dev cmd → Pipeline → IO (Either Refusal ())
 bindPipeline recorder (Pipeline pipeline) =
-  withImage recorder $ \image → liveNative (recorderRecording recorder) pipeline >>= \case
+  liveNative (recorderRecording recorder) pipeline >>= \case
     Left refusal → pure (Left refusal)
-    Right (NativePipeline handle layout format)
-      | format /= frameImageFormat image →
-          pure (Left (RefusedIncompatible ("a pipeline for format " <> tshow format <> " and an image of format " <> tshow (frameImageFormat image))))
-      | otherwise → command recorder $ \state →
-          Right (state {statePipeline = Just pipeline}, [pipeline, layout], CommandBindPipeline handle)
+    Right (NativePipeline handle layout format) → command recorder $ \state → do
+      attachment ← checkedAgainst recorder state
+      incompatible format attachment
+      Right (state {statePipeline = Just (pipeline, format)}, [pipeline, layout], CommandBindPipeline handle)
     Right _ → pure (Left RefusedWrongKind)
 
--- | Set the viewport. It must be finite, have area, and lie within the
--- frame's image — which Vulkan guarantees is within every device's viewport
--- dimension and bounds limits, so no device limit needs reading here.
-setViewport ∷ Recorder q inst msgr phys dev cmd → Viewport → IO (Either Refusal ())
-setViewport recorder viewport = withImage recorder $ \image → command recorder $ \state →
-  let extent = frameImageExtent image
-      values = [viewportX viewport, viewportY viewport, viewportWidth viewport, viewportHeight viewport]
-   in if any (\value → isNaN value || isInfinite value) values
-        then Left (RefusedIllegal "a viewport that is not finite")
-        else
-          if viewportWidth viewport <= 0 || viewportHeight viewport <= 0
-            then Left (RefusedIllegal "a viewport with no area")
-            else
-              if viewportX viewport < 0
-                || viewportY viewport < 0
-                || viewportX viewport + viewportWidth viewport > fromIntegral (extentWidth extent)
-                || viewportY viewport + viewportHeight viewport > fromIntegral (extentHeight extent)
-                then Left (RefusedIllegal "a viewport outside the frame's image")
-                else Right (state {stateViewport = True}, [], CommandSetViewport viewport)
+-- | A pipeline built for another format than the attachment's.
+incompatible ∷ Word32 → Attachment → Either Refusal ()
+incompatible format attachment
+  | format /= attachmentFormat attachment =
+      Left (RefusedIncompatible ("a pipeline for format " <> tshow format <> " and an image of format " <> tshow (attachmentFormat attachment)))
+  | otherwise = Right ()
 
--- | Set the scissor, which must lie within the frame's image, so its offset
--- and extent never overflow.
+-- | Set the viewport. It must be finite, have area, and lie within the
+-- attachment it is checked against — which Vulkan guarantees is within every
+-- device's viewport dimension and bounds limits, so no device limit needs
+-- reading here. A draw checks it again against the pass it is drawn in.
+setViewport ∷ Recorder q inst msgr phys dev cmd → Viewport → IO (Either Refusal ())
+setViewport recorder viewport = command recorder $ \state → do
+  attachment ← checkedAgainst recorder state
+  viewportFits viewport attachment
+  Right (state {stateViewport = Just viewport}, [], CommandSetViewport viewport)
+
+viewportFits ∷ Viewport → Attachment → Either Refusal ()
+viewportFits viewport attachment
+  | any (\value → isNaN value || isInfinite value) values = Left (RefusedIllegal "a viewport that is not finite")
+  | viewportWidth viewport <= 0 || viewportHeight viewport <= 0 = Left (RefusedIllegal "a viewport with no area")
+  | viewportX viewport < 0
+      || viewportY viewport < 0
+      || viewportX viewport + viewportWidth viewport > fromIntegral (extentWidth extent)
+      || viewportY viewport + viewportHeight viewport > fromIntegral (extentHeight extent) =
+      Left (RefusedIllegal ("a viewport outside " <> attachmentName attachment))
+  | otherwise = Right ()
+  where
+    extent = attachmentExtent attachment
+    values = [viewportX viewport, viewportY viewport, viewportWidth viewport, viewportHeight viewport]
+
+-- | Set the scissor, which must lie within the attachment it is checked
+-- against, so its offset and extent never overflow. A draw checks it again
+-- against the pass it is drawn in.
 setScissor ∷ Recorder q inst msgr phys dev cmd → Rect → IO (Either Refusal ())
-setScissor recorder rect = withImage recorder $ \image → command recorder $ \state →
-  let extent = frameImageExtent image
-      reach offset size = toInteger offset + toInteger size
-   in if rectX rect < 0 || rectY rect < 0
-        then Left (RefusedIllegal "a scissor with a negative offset")
-        else
-          if reach (rectX rect) (rectWidth rect) > toInteger (extentWidth extent)
-            || reach (rectY rect) (rectHeight rect) > toInteger (extentHeight extent)
-            then Left (RefusedIllegal "a scissor outside the frame's image")
-            else Right (state {stateScissor = True}, [], CommandSetScissor rect)
+setScissor recorder rect = command recorder $ \state → do
+  attachment ← checkedAgainst recorder state
+  scissorFits rect attachment
+  Right (state {stateScissor = Just rect}, [], CommandSetScissor rect)
+
+scissorFits ∷ Rect → Attachment → Either Refusal ()
+scissorFits rect attachment
+  | rectX rect < 0 || rectY rect < 0 = Left (RefusedIllegal "a scissor with a negative offset")
+  | reach (rectX rect) (rectWidth rect) > toInteger (extentWidth extent)
+      || reach (rectY rect) (rectHeight rect) > toInteger (extentHeight extent) =
+      Left (RefusedIllegal ("a scissor outside " <> attachmentName attachment))
+  | otherwise = Right ()
+  where
+    extent = attachmentExtent attachment
+    reach offset size = toInteger offset + toInteger size
 
 -- | Draw triangles with the bound pipeline, inside rendering, once the
--- viewport and scissor have been set. The batch retains the bound pipeline
--- and its layout again, which it already holds.
+-- viewport and scissor have been set. The pipeline, the viewport and the
+-- scissor are checked again against the open pass's attachment: whatever an
+-- earlier pass, or the frame outside rendering, left bound must fit this one.
+-- The batch retains the bound pipeline and its layout again, which it already
+-- holds.
 draw ∷ Recorder q inst msgr phys dev cmd → Word32 → Word32 → IO (Either Refusal ())
 draw recorder vertices instances = do
   bound ← statePipeline <$> readIORef (recorderState recorder)
   layout ← case bound of
     Nothing → pure []
-    Just pipeline → either (const []) dependency <$> liveNative (recorderRecording recorder) pipeline
-  command recorder $ \state → case statePipeline state of
-    Nothing → Left (RefusedIllegal "a draw with no pipeline bound")
-    Just pipeline
-      | not (stateRendering state) → Left (RefusedIllegal "a draw outside rendering")
-      | not (stateViewport state && stateScissor state) → Left (RefusedIllegal "a draw before the viewport and scissor are set")
-      | vertices == 0 || instances == 0 → Left (RefusedIllegal "a draw of nothing")
-      | vertices `mod` 3 /= 0 → Left (RefusedUnsupported "a draw that is not whole triangles")
-      | otherwise → Right (state, pipeline : layout, CommandDraw vertices instances 0 0)
+    Just (pipeline, _) → either (const []) dependency <$> liveNative (recorderRecording recorder) pipeline
+  command recorder $ \state → case (statePipeline state, stateRendering state) of
+    (Nothing, _) → Left (RefusedIllegal "a draw with no pipeline bound")
+    (_, Nothing) → Left (RefusedIllegal "a draw outside rendering")
+    (Just (pipeline, format), Just attachment) → case (stateViewport state, stateScissor state) of
+      (Just viewport, Just rect)
+        | vertices == 0 || instances == 0 → Left (RefusedIllegal "a draw of nothing")
+        | vertices `mod` 3 /= 0 → Left (RefusedUnsupported "a draw that is not whole triangles")
+        | otherwise → do
+            incompatible format attachment
+            viewportFits viewport attachment
+            scissorFits rect attachment
+            Right (state, pipeline : layout, CommandDraw vertices instances 0 0)
+      _ → Left (RefusedIllegal "a draw before the viewport and scissor are set")
   where
     dependency = \case
       NativePipeline _ layout _ → [layout]
@@ -751,33 +891,84 @@ readbackBytesFor extent = fromIntegral (extentWidth extent) * fromIntegral (exte
 -- be large enough for the whole image; the batch retains it, and its bytes
 -- are undefined until that batch's submission has completed.
 copyToReadback ∷ Recorder q inst msgr phys dev cmd → Readback → IO (Either Refusal ())
-copyToReadback recorder (Readback readback) =
-  withImage recorder $ \frame → liveNative recording readback >>= \case
+copyToReadback recorder readback =
+  withImage recorder $ \frame →
+    copyInto recorder readback (frameImageExtent frame) (if frameImageCapturable frame then Nothing else Just (RefusedUnsupported "a copy from an image its generation did not make a transfer source")) $ \state buffer →
+      if stateLayout state /= LayoutTransferSource
+        then Left (RefusedIllegal ("copying an image that is " <> tshow (stateLayout state)))
+        else Right (state, [], [], [CommandCopyImageToBuffer (frameImageHandle frame) (frameImageExtent frame) buffer])
+
+-- | Copy a managed color target (GRS-5), whole, into the readback buffer, and
+-- make the write visible to host reads, as 'copyToReadback' does the frame's
+-- image. The target must be this session's, live, a 'ColorTarget', and in its
+-- transfer-source use within the batch — an explicit transition out of its
+-- color-attachment use (#335); the buffer must hold the whole target, four
+-- bytes a pixel, tightly packed in its own format's byte order, with no
+-- conversion. The batch retains both, and the buffer's bytes are exposed only
+-- once that batch's submission has completed. A refusal makes no native call.
+copyTargetToReadback ∷ Recorder q inst msgr phys dev cmd → Image → Readback → IO (Either Refusal ())
+copyTargetToReadback recorder (Image resource) readback =
+  owned recording $
+    liveNative recording resource >>= \case
+      Left refusal → pure (Left refusal)
+      Right (NativeImage description memory _)
+        | imageKind description /= ColorTarget → pure (Left RefusedWrongKind)
+        | otherwise →
+            let extent = SurfaceExtent (imageWidth description) (imageHeight description)
+                kind = imageResourceKind ColorTarget
+                object = memoryResource memory
+                image = Just (useAspect (imageKindUse ColorTarget), imageMipLevels description)
+             in copyInto recorder readback extent Nothing $ \state buffer →
+                  case Access.touch resource kind TransferRead KeepsContents (stateAccess state) of
+                    Left refusal → Left (accessRefused refusal)
+                    Right (access, barriers) →
+                      Right
+                        ( state {stateAccess = access, stateObjects = Map.insert resource (object, image) (stateObjects state)}
+                        , [resource]
+                        , [ (resource, if barrierDiscards barrier then DiscardsContents else KeepsContents)
+                          | barrier ← barriers
+                          , barrierRole barrier == EntryBarrier
+                          ]
+                        , map (resourceBarrier object image) barriers <> [CommandCopyImageToBuffer object extent buffer]
+                        )
+      Right _ → pure (Left RefusedWrongKind)
+  where
+    recording = recorderRecording recorder
+
+-- | Copy an image of this extent into the readback buffer: the buffer's own
+-- checks, the decision that records the copy, and after it the barrier that
+-- makes the write visible to host reads. One writer at a time: a buffer
+-- another batch — or an earlier copy in this one — or a submission still
+-- holds would be written again with no ordering between the two writes, and
+-- its contents misattributed.
+copyInto
+  ∷ Recorder q inst msgr phys dev cmd
+  → Readback
+  → SurfaceExtent
+  → Maybe Refusal
+  → (RecorderState → Word64 → Either Refusal (RecorderState, [ResourceId], [(ResourceId, Contents)], [NativeCommand]))
+  → IO (Either Refusal ())
+copyInto recorder (Readback readback) extent refused decide =
+  liveNative recording readback >>= \case
     Left refusal → pure (Left refusal)
     Right (NativeReadback allocation _) → do
-      let needed = readbackBytesFor (frameImageExtent frame)
+      let needed = readbackBytesFor extent
           unfit
-            | not (frameImageCapturable frame) = Just (RefusedUnsupported "a copy from an image its generation did not make a transfer source")
+            | Just refusal ← refused = Just refusal
             | needed > allocationSize allocation = Just (RefusedOutOfBounds needed (allocationSize allocation))
             | otherwise = Nothing
-      -- One writer at a time: a buffer another batch — or an earlier copy in
-      -- this one — or a submission still holds would be written again with no
-      -- ordering between the two writes, and its contents misattributed.
       holds ← atomically $ do
         model ← stateRootsModel (recordingRoots recording) (\current → (current, current))
         pure (maybe [] viewOutstanding (holdView (ResourceSubject readback) model))
       let busy = any (`elem` [RecordedReferenceOwed, SubmittedUseOwed]) holds
       case unfit <|> (if busy then Just RefusedInUse else Nothing) of
-        Just refused → pure (Left refused)
+        Just refusal → pure (Left refusal)
         Nothing → do
           copied ←
-            command recorder $ \state →
-              if stateRendering state
+            orderedSequence recorder $ \state →
+              if isJust (stateRendering state)
                 then Left (RefusedIllegal "a copy inside rendering")
-                else
-                  if stateLayout state /= LayoutTransferSource
-                    then Left (RefusedIllegal ("copying an image that is " <> tshow (stateLayout state)))
-                    else Right (state, [readback], CommandCopyImageToBuffer (frameImageHandle frame) (frameImageExtent frame) (allocationBuffer allocation))
+                else (\(next, references, entries, natives) → (next, readback : references, entries, natives)) <$> decide state (allocationBuffer allocation)
           case copied of
             Left refusal → pure (Left refusal)
             Right () → do
