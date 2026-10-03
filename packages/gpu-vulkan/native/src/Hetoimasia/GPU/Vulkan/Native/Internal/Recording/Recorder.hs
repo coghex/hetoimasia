@@ -724,8 +724,10 @@ data PassStart
 -- 'ClearTarget' requires it to be in that use already, and 'ClearFromUndefined'
 -- is a transition from undefined into it. The batch's first touch records the
 -- entry barrier, and a target that awaits initialization admits only a
--- 'ClearFromUndefined' pass, or none while another batch initializes it. Every
--- refusal makes no native call. Pipelines, viewports and scissors are checked
+-- 'ClearFromUndefined' pass, or none while another batch initializes it. A
+-- dynamic-rendering attachment's view covers exactly one mip level, and the
+-- target's owned view covers them all, so a target of more than one mip level
+-- is 'RefusedUnsupported'. Every refusal makes no native call. Pipelines, viewports and scissors are checked
 -- against the target while the pass is open.
 beginRenderingInto ∷ Recorder q inst msgr phys dev cmd → Image → PassStart → ClearColor → IO (Either Refusal ())
 beginRenderingInto recorder (Image resource) start clear =
@@ -734,6 +736,7 @@ beginRenderingInto recorder (Image resource) start clear =
       Left refusal → pure (Left refusal)
       Right (NativeImage description memory view)
         | imageKind description /= ColorTarget → pure (Left RefusedWrongKind)
+        | imageMipLevels description /= 1 → pure (Left (RefusedUnsupported "rendering into a color target of more than one mip level"))
         | otherwise → orderedSequence recorder $ \state →
             if isJust (stateRendering state)
               then Left (RefusedIllegal "rendering has already begun")

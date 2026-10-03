@@ -115,7 +115,7 @@ spec = describe "Offscreen color targets" $ do
       answers `shouldBe` replicate 2 (Left (RefusedIllegal "dynamic state outside rendering in a frame-less batch, with no attachment to check it against"))
 
   describe "refusals before any native effect" $ do
-    it "refuses an uninitialized target a pass keeps, a released target, an image of another kind and another session's target, recording nothing" $ do
+    it "refuses an uninitialized target a pass keeps, a released target, an image of another kind, a target of more than one mip level and another session's target, recording nothing" $ do
       rig ← newRig
       kit ← newKit rig Rgba8Srgb
       foreignRig ← newRig
@@ -125,6 +125,7 @@ spec = describe "Offscreen color targets" $ do
       releasedReadback ← createReadback (rigRecording rig) (32 * 16 * 4) >>= either (fail . show) pure
       ok (releaseManaged (rigRecording rig) releasedReadback)
       texture ← createImage (rigRecording rig) (ImageDescription TextureImage Rgba8Srgb 8 8 1) >>= either (fail . show) pure
+      mipmapped ← createImage (rigRecording rig) (ImageDescription ColorTarget Rgba8Srgb 32 16 2) >>= either (fail . show) pure
       frame ← owned rig
       before ← commandCount rig
       answer ← recordFrame (rigRecording rig) (ownedFrame frame) $ \recorder →
@@ -132,6 +133,7 @@ spec = describe "Offscreen color targets" $ do
           [ beginRenderingInto recorder (kitTarget kit) ClearTarget (ClearColor 0 0 0 1)
           , beginRenderingInto recorder released ClearFromUndefined (ClearColor 0 0 0 1)
           , beginRenderingInto recorder texture ClearFromUndefined (ClearColor 0 0 0 1)
+          , beginRenderingInto recorder mipmapped ClearFromUndefined (ClearColor 0 0 0 1)
           , beginRenderingInto recorder (kitTarget foreignKit) ClearFromUndefined (ClearColor 0 0 0 1)
           , copyTargetToReadback recorder (kitTarget foreignKit) (kitReadback kit)
           , copyTargetToReadback recorder texture (kitReadback kit)
@@ -143,6 +145,7 @@ spec = describe "Offscreen color targets" $ do
           [ Left RefusedUninitialized
           , Left (RefusedMisuse (WrongPhase ResourceIdentity))
           , Left RefusedWrongKind
+          , Left (RefusedUnsupported "rendering into a color target of more than one mip level")
           , Left (RefusedMisuse (ForeignIdentity ResourceIdentity))
           , Left (RefusedMisuse (ForeignIdentity ResourceIdentity))
           , Left RefusedWrongKind
