@@ -3583,20 +3583,23 @@ entered later passes, no call is slowed, no frame refused and no event pump
 held, and every wait the owner arms on a scripted clock comes due at once and
 moves the clock to its deadline; an irreversible scripted failure stays, and
 nothing publishes destruction evidence the stand-ins did not produce — and only
-then cancels each rig run's bound thread and the example's own. The owner's
-protected exit completes on the stand-ins' real destruction evidence, and the
+then cancels each rig run's bound thread and the example's own, and waits for
+the example to settle: its own thread, every rig run it started, and every
+cancellation's delivery. The owner's protected exit completes on the stand-ins' real destruction evidence, and the
 example fails as not having finished within its bound, even if it caught the
 cancellation. A synchronous failure, or that cancellation, escaping a rig's
 body rescues the rig before the protected teardown begins, so an example that
 fails before it releases its gates reports its own failure. The last resort: if
-the example's thread has not ended ten seconds after rescue began, the suite
+the example has not settled ten seconds after rescue began, the suite
 prints the example's name on standard error and ends the test process with a
 failure status, unwinding nothing — operator termination is the protected
 exit's documented escape. The production teardown is unchanged; all of this is
 the fixture's. `the fixture-aware example bound` covers a blocked example, one
 that fails before releasing its gates, a hold the owner had already entered,
-and the last resort, with bounds and a grace that expire only when the example
-says, and finds no thread of the example still running afterwards.
+the last resort — also while a rig run on a thread of the example's own outlives
+the example's thread — and a timer hook replaced while an earlier one runs,
+with bounds and a grace that expire only when the example says, and finds no
+thread of the example still running afterwards.
 
 VK-19's examples are in `integration-tests`, under `Vulkan consumer rendering
 and capture`, over the same stand-ins, extended to journal every command the
