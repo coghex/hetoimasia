@@ -17,6 +17,7 @@ import Data.List (isSubsequenceOf, nub)
 import Data.Maybe (isJust)
 import Hetoimasia.Foundation.Messaging.Payload (prepare)
 import Hetoimasia.Foundation.Messaging.Snapshot (Publication (..))
+import Hetoimasia.Foundation.Time (elapsedBetween, scriptedSource)
 import Hetoimasia.GLFW.Command
   ( CommandResult (ObservationPublished)
   , Disposition (Performed)
@@ -29,7 +30,7 @@ import Hetoimasia.Runtime.GLFW
 import Test.GLFW.Owner.Fixture.Drive (awaitIdle, awaitRound, handedOver, pumpUntil, theWindow)
 import Test.GLFW.Owner.Fixture.Fake (Fake (..), ScriptedTimer (..), fireTimer, script)
 import Test.GLFW.Owner.Fixture.Journal (Note (..), Scene (..), journalled)
-import Test.GLFW.Owner.Fixture.Rig (Rig (..), newRig, ownedHost)
+import Test.GLFW.Owner.Fixture.Rig (Rig (..), newRig, ownedHost, ownerSettings)
 import Test.GLFW.Support (at, boundedExample, millis, unexpected)
 import Test.Hspec (Spec, it, shouldBe, shouldSatisfy)
 
@@ -43,6 +44,8 @@ spec = do
     (boundedExample testWakeWithheld)
   it "meets a deadline of its own from its own timer, with nothing else waking it"
     (boundedExample testOwnDeadline)
+  it "hands its timer the deadline it published, with the duration that remained at its own reading"
+    (boundedExample testTimerGivenDeadline)
   it "wakes an idle owner for newly published demand and a newer scene"
     (boundedExample testPublicationWakesIdleOwner)
   it "hands its step each publication's revision, so equal publications stay distinct, and says when demand was taken"
@@ -140,6 +143,26 @@ testOwnDeadline = do
   before `shouldSatisfy` (>= 1)
   after `shouldSatisfy` (> before)
   armings `shouldSatisfy` (not . null)
+
+-- | The owner's timer is given the deadline the owner published, an instant of
+-- the owner's own clock, beside the duration that remained until it at the
+-- owner's reading. The clock stands still here, so every reading is the same
+-- instant and the remaining duration is known exactly.
+testTimerGivenDeadline ∷ IO ()
+testTimerGivenDeadline = do
+  base ← newRig
+  let reading = at (millis 7)
+      due = at (millis 1000000)
+      rig = base {rigHostConfig = ownerSettings (scriptedSource (pure reading))}
+  script (fakeDeadline (rigFake rig)) (pure (OwnerDeadline due))
+  (published, armings) ← ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \_ owner _control → do
+    atomically (check . not . null =<< readTVar (timerArmings (rigTimer rig)))
+    status ← atomically (readOwnerStatusNow owner)
+    armings ← readTVarIO (timerArmings (rigTimer rig))
+    pure (statusNextDeadline status, armings)
+  published `shouldBe` Just due
+  armings `shouldSatisfy` (not . null)
+  armings `shouldSatisfy` all (== (due, elapsedBetween reading due))
 
 -- | An idle owner wakes for demand and for a scene, not only for an event, an
 -- observation or its own timer.

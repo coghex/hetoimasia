@@ -14,6 +14,7 @@ module Hetoimasia.Runtime.GLFW.Internal.Owner.Drain
   , absorbOwnerFailure
   , settleOwnerOutcome
   , raiseRetainingOwner
+  , owedRetirementFallback
   ) where
 
 import Control.Concurrent.STM (atomically, check, readTVarIO)
@@ -33,6 +34,7 @@ import Hetoimasia.Foundation.Resource (withResourceLabelled)
 import Hetoimasia.Foundation.Time
   ( Duration
   , DurationRequirement (RequirePositive)
+  , addDuration
   , deadlineReached
   , durationFromNanoseconds
   , readInstant
@@ -148,8 +150,10 @@ ownerDrain owner restore started = do
 -- | Wait, in the exit drain, until the backend's own next deadline has come,
 -- with no round in between: the drain is the owner's last work, and nothing
 -- else it could do is owed. A backend that names no deadline is asked again
--- after 'owedRetirementFallback'. The backend's wake is not read here: it asks
--- for a round, and the drain takes none.
+-- 'owedRetirementFallback' after the drain's clock reading; an instant so late
+-- that nothing later can be represented leaves nothing to wait for. The
+-- backend's wake is not read here: it asks for a round, and the drain takes
+-- none.
 awaitOwedRetirement ∷ GraphicsOwner scene → IO ()
 awaitOwedRetirement owner = do
   deadline ← graphicsNextDeadline operations >>= evaluate
@@ -157,8 +161,10 @@ awaitOwedRetirement owner = do
   expired ← case deadline of
     OwnerDeadline due
       | deadlineReached now due → pure (pure True)
-      | otherwise → arm (remainingUntil now due)
-    NoOwnerDemand → arm owedRetirementFallback
+      | otherwise → arm due (remainingUntil now due)
+    NoOwnerDemand → case addDuration now owedRetirementFallback of
+      Right due → arm due owedRetirementFallback
+      Left _ → pure (pure True)
   atomically (expired >>= check)
   where
     operations = ownerOperations (ownerSettings owner)

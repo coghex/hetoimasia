@@ -105,6 +105,7 @@ module Hetoimasia.Runtime.GLFW.Internal.Owner
   , OwnerTimer
   , ownerTimer
   , realtimeOwnerTimer
+  , owedRetirementFallback
   , graphicsOwnerComponent
 
     -- * The owner
@@ -159,6 +160,7 @@ module Hetoimasia.Runtime.GLFW.Internal.Owner
 
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Config
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Custody (custodyOf, readOwnerCustody)
+import Hetoimasia.Runtime.GLFW.Internal.Owner.Drain (owedRetirementFallback)
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Evidence
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Exit
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Handover

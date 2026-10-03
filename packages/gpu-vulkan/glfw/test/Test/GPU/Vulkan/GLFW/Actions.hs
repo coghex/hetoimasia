@@ -68,37 +68,38 @@ import Hetoimasia.Runtime.Supervision
   , checkRuntime
   , startSupervised
   )
+import Test.GPU.Vulkan.GLFW.Bound (boundOf, boundedIt)
 import Test.GPU.Vulkan.GLFW.StandIn
-import Test.Hspec (Expectation, Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
+import Test.Hspec (Expectation, Spec, describe, expectationFailure, shouldBe, shouldSatisfy)
 
 spec ∷ Spec
 spec = describe "Vulkan surface-free sessions and owner-thread actions" $ do
   describe "surface-free startup" $ do
-    it "creates the device in the owner's startup with no surface and no window, and retires it, the messenger and the instance in order" (bounded testSurfaceFreeTeardown)
-    it "admits a window handed over later that the chosen family presents to, and refuses one it cannot, with one device" (bounded testLaterSurfaces)
+    itBounded "creates the device in the owner's startup with no surface and no window, and retires it, the messenger and the instance in order" testSurfaceFreeTeardown
+    itBounded "admits a window handed over later that the chosen family presents to, and refuses one it cannot, with one device" testLaterSurfaces
 
   describe "owner-thread actions" $ do
-    it "run on the owner's thread with the session's construction, and return their results" (bounded testActionOnOwner)
-    it "are refused as device-not-ready before the first window's admission by default, creating nothing, and run after it" (bounded testDeviceNotReady)
-    it "are refused at once when the queue is full, never waiting for room" (bounded testQueueFull)
-    it "return a raising action's failure to the caller, keep what it constructed managed, and let the owner go on" (bounded testRaisingAction)
-    it "end the owner's run when a construction inside one loses the device, never answering it as the action's own failure alone" (bounded testEscapedConstruction)
-    it "end the owner's run with a construction's loss that the action caught and returned from, answering the ticket with the loss" (bounded testCaughtEscape)
-    it "settle the ticket with a failure setting the construction up before that failure ends the owner's run" (bounded testSetupFailure)
-    it "are refused after the session's terminal failure, including one queued before it that never started" (bounded testTerminalRefusal)
-    it "are refused once the owner's exit begins, including one queued behind a running action, which finishes" (bounded testExitRefusal)
-    it "are refused at the application's pre-drain quiescence, while a worker drains, a queued one without waiting for the owner, and a running one finishes" (bounded testQuiescenceRefusal)
-    it "never run beside a frame's rendering: a frame asked for meanwhile follows the action" (bounded testSerialization)
-    it "create a buffer and an image of every kind through the lent construction on the owner's thread, and release them for the owner to destroy, each view before its image" (bounded testBuffersAndImages)
+    itBounded "run on the owner's thread with the session's construction, and return their results" testActionOnOwner
+    itBounded "are refused as device-not-ready before the first window's admission by default, creating nothing, and run after it" testDeviceNotReady
+    itBounded "are refused at once when the queue is full, never waiting for room" testQueueFull
+    itBounded "return a raising action's failure to the caller, keep what it constructed managed, and let the owner go on" testRaisingAction
+    itBounded "end the owner's run when a construction inside one loses the device, never answering it as the action's own failure alone" testEscapedConstruction
+    itBounded "end the owner's run with a construction's loss that the action caught and returned from, answering the ticket with the loss" testCaughtEscape
+    itBounded "settle the ticket with a failure setting the construction up before that failure ends the owner's run" testSetupFailure
+    itBounded "are refused after the session's terminal failure, including one queued before it that never started" testTerminalRefusal
+    itBounded "are refused once the owner's exit begins, including one queued behind a running action, which finishes" testExitRefusal
+    itBounded "are refused at the application's pre-drain quiescence, while a worker drains, a queued one without waiting for the owner, and a running one finishes" testQuiescenceRefusal
+    itBounded "never run beside a frame's rendering: a frame asked for meanwhile follows the action" testSerialization
+    itBounded "create a buffer and an image of every kind through the lent construction on the owner's thread, and release them for the owner to destroy, each view before its image" testBuffersAndImages
 
   describe "frame-less batches (GRS-12)" $ do
-    it "are recorded inside an action with no target, submitted in seal order when it returns, and complete their tickets only on fence evidence, waited on with a deadline" (bounded testFramelessBatches)
-    it "are discarded when their action raises, submitting nothing" (bounded testFramelessRaising)
+    itBounded "are recorded inside an action with no target, submitted in seal order when it returns, and complete their tickets only on fence evidence, waited on with a deadline" testFramelessBatches
+    itBounded "are discarded when their action raises, submitting nothing" testFramelessRaising
 
   describe "zero-target progress" $ do
-    it "disposes of a released resource with no target, recording no frame, before the host exits" (bounded testZeroTargetDisposal)
-    it "keeps making progress after the last target closes, the device serving later actions" (bounded testAfterLastTarget)
-    it "names no deadline once nothing is owed, sleeping until an action wakes it rather than polling" (bounded testIdleSleeps)
+    itBounded "disposes of a released resource with no target, recording no frame, before the host exits" testZeroTargetDisposal
+    itBounded "keeps making progress after the last target closes, the device serving later actions" testAfterLastTarget
+    itBounded "names no deadline once nothing is owed, sleeping until an action wakes it rather than polling" testIdleSleeps
 
 -- ---------------------------------------------------------------------------
 -- Surface-free startup
@@ -663,11 +664,10 @@ composedUntil host control what done =
 shouldReturnValue ∷ (Eq a, Show a) ⇒ IO a → a → Expectation
 shouldReturnValue action expected = action >>= (`shouldBe` expected)
 
-bounded ∷ IO () → Expectation
-bounded action =
-  timeout (60 * 1000 * 1000) action >>= \case
-    Just () → pure ()
-    Nothing → expectationFailure "the example did not finish within its bound"
+-- | One example under the suite's fixture-aware bound of a minute
+-- ("Test.GPU.Vulkan.GLFW.Bound").
+itBounded ∷ String → IO () → Spec
+itBounded = boundedIt (boundOf 60)
 
 raisedAs ∷ ∀ e a. Exception e ⇒ Either SomeException a → IO e
 raisedAs = \case
