@@ -483,20 +483,24 @@ generates none. Container decoding such as KTX2 stays in the content arc
 
 Owner decision 2026-09-29; resolves Q-6.
 
-- The engine owns one descriptor-set layout holding the variable-count,
-  update-after-bind array of texture slots (D-1) and a small fixed array of
-  shared samplers (for example nearest or linear, clamp or repeat).
-- A consumer asks for the table when creating a pipeline layout; D-19's
-  build-time check verifies each shader declares it at the expected set and
-  binding.
+- The engine owns two fixed descriptor-set layouts (D-35). Set 0 is the
+  table: a small fixed array of shared samplers (nearest and linear, each
+  clamp-to-edge and repeat), then the variable-count, update-after-bind array
+  of texture slots (D-1). Set 1 is the lookup: one dynamic storage buffer
+  over the version ring (D-27).
+- A consumer asks for the table when creating a pipeline layout, which then
+  holds both sets; D-19's build-time check verifies each shader declares the
+  table's bindings at the expected sets and bindings, and no other.
 - A draw chooses its sampler by an index in its push constants; the shader
   combines the slot's image with that sampler.
 - Growth to D-11's cap creates a larger set, copies the existing entries,
   and binds the new set in later frames; the old set retires on completion
   evidence like any other managed resource.
 
-Amended by D-27 (lookup versions) and D-31 (binding order, declared cap and
-growth).
+Amended by D-27 (lookup versions), D-31 (binding order, declared cap and
+growth) and D-35 (the lookup buffer's own set). Reconciled with D-35 on
+2026-10-03, as GRS-7 (#343) builds it: the bullets above describe the two
+sets.
 
 ### D-23. Instances carry stable handles, resolved through a per-frame lookup
 
@@ -620,20 +624,23 @@ Owner decision 2026-09-29; resolves Q-15 and amends D-20.
 
 Owner decision 2026-09-29; resolves Q-16 and amends D-22.
 
-- The layout's bindings are fixed: the shared samplers, then the lookup
-  buffer, then the variable-count texture array as the highest binding
-  number, which Vulkan requires.
-- The layout declares D-11's validated cap as the texture array's upper
+- The layouts' bindings are fixed (D-35). Set 0 holds the shared samplers
+  at binding 0, then the variable-count texture array at binding 1, the
+  highest binding number, as Vulkan requires. Set 1 holds the lookup buffer
+  at binding 0.
+- Set 0's layout declares D-11's validated cap as the texture array's upper
   bound, checked at configuration against the device's update-after-bind
   limits.
 - Each set allocates its current count. Growth allocates a larger set while
   the old one is still retained (D-27), so descriptor pools are sized for
   both, or a fresh pool serves each growth.
-- The layout never changes, so every pipeline layout stays compatible, and
+- The layouts never change, so every pipeline layout stays compatible, and
   D-19's check covers the lookup binding as well as the array.
 
+Amended by D-35: the lookup buffer moves to its own set. Reconciled with D-35
+on 2026-10-03, as GRS-7 (#343) builds it: the bullets above describe the two
+sets.
 
-Amended by D-35: the lookup buffer moves to its own set.
 ### D-32. Parity with VMA is measured for placement and on the device
 
 Owner decision 2026-09-29; resolves Q-17 and amends D-14. D-14's virtual-block
