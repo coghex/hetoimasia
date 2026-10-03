@@ -4,7 +4,8 @@
 -- submitted; an action that raised submitting nothing; an accepted prefix
 -- kept when a later submission fails; slot storage reused only after a
 -- completion or a discard; tickets completed only on fence evidence and lost
--- on device loss; waits with a deadline; initialization; and retirement.
+-- on device loss; waits with a deadline; initialization; retirement; and
+-- naming each slot's fence once, rolling it back when its naming raised.
 --
 -- Nothing here creates a Vulkan object, and nothing waits on a clock.
 module Test.GPU.Vulkan.Native.Frameless (spec) where
@@ -12,29 +13,47 @@ module Test.GPU.Vulkan.Native.Frameless (spec) where
 import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (atomically)
-import Control.Exception (ErrorCall (ErrorCall), SomeException, throwIO, try)
-import Data.IORef (modifyIORef', newIORef, readIORef)
+import Control.Exception (ErrorCall (ErrorCall), ExceptionWithContext (ExceptionWithContext), SomeException, fromException, throwIO, try)
+import Data.ByteString (ByteString)
+import qualified Data.ByteString.Char8 as ByteString8
+import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List.NonEmpty (NonEmpty ((:|)))
 import Data.Text (Text)
+import qualified Data.Text as Text
 import Data.Word (Word64)
+import Numeric.Natural (Natural)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldReturn, shouldSatisfy)
 
+import Hetoimasia.Foundation.Resource (cleanupFailureException, cleanupFailureLabel, cleanupFailures)
 import Hetoimasia.Foundation.Time (Duration, DurationRequirement (AllowZero), durationFromNanoseconds)
 import Hetoimasia.GPU.Model
   ( Initialization (..)
+  , Outcome (Admitted)
   , SessionFailureCause (..)
   , SessionState (..)
   , framelessSlots
+  , noteDeviceLoss
   , resourceInitialization
   , sessionState
   )
 import Hetoimasia.GPU.Model.Budget (BudgetKind (..), BudgetRequest (..), defaultBudgetRequest)
 import Hetoimasia.GPU.Vulkan.Native.Frames
+import Hetoimasia.GPU.Vulkan.Native.Naming (NativeObjectKind (ObjectFence))
 import Hetoimasia.GPU.Vulkan.Native.Recording
+import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost (..), TerminalCause (TerminalDeviceLost))
 import Test.GPU.Vulkan.Native.FramesRig
 import Test.GPU.Vulkan.Native.FramesStandIn
 import Test.GPU.Vulkan.Native.RecordingStandIn (RecordingCall (..), RecordingStep (AtResetStorage), duringReset, failAt, recordingCalls)
-import Test.GPU.Vulkan.Native.StandIn (StandInLoss (..), Step (AtFrameCall))
+import Test.GPU.Vulkan.Native.StandIn
+  ( NamingFailure (..)
+  , StandInLoss (..)
+  , Step (AtFrameCall)
+  , failNaming
+  , loseNaming
+  , namesGiven
+  , offerNaming
+  , restoreNaming
+  )
 
 type Scope = FramelessScope () Int Int Text Int Word64
 
@@ -291,6 +310,113 @@ spec = describe "Frame-less batches" $ do
       atomically (readFramelessSlots (rigFrames rig)) `shouldReturn` []
       clean rig
 
+  describe "naming" $ do
+    it "names a slot's new fence with its slot, once it is made and before the submission" $ do
+      rig ← newRig
+      offerNaming (rigRootsStandIn rig)
+      atSubmission ← newIORef []
+      duringFrameCall (rigStandIn rig) $ \case
+        Submitted {} → fenceNames rig >>= writeIORef atSubmission
+        _ → pure ()
+      _ ← scoped rig sealedIn
+      [FramelessSlotView slot sync] ← atomically (readFramelessSlots (rigFrames rig))
+      createdFences rig `shouldReturn` [framelessFence sync]
+      readIORef atSubmission `shouldReturn` [(framelessFence sync, fenceName slot)]
+      fenceNames rig `shouldReturn` [(framelessFence sync, fenceName slot)]
+      clean rig
+
+    it "makes no naming call when the device offers no naming, and submits as before" $ do
+      rig ← newRig
+      _ ← scoped rig sealedIn
+      namesGiven (rigRootsStandIn rig) `shouldReturn` []
+      length . filter isSubmission <$> frameCalls (rigStandIn rig) `shouldReturn` 1
+      clean rig
+
+    it "names a slot's fence once, not again when a later submission reuses it" $ do
+      rig ← newRigOver 1 defaultBudgetRequest {requestedFramelessBatches = 1}
+      offerNaming (rigRootsStandIn rig)
+      _ ← scoped rig sealedIn
+      completeAll (rigStandIn rig)
+      _ ← progress rig
+      _ ← scoped rig sealedIn
+      length . filter isSubmission <$> frameCalls (rigStandIn rig) `shouldReturn` 2
+      [fence] ← createdFences rig
+      fenceNames rig `shouldReturn` [(fence, fenceName 0)]
+      clean rig
+
+    it "destroys a fence whose naming raised once, records and fails nothing, raises the naming failure, and names a new fence on the slot's next submission" $ do
+      rig ← newRigOver 1 defaultBudgetRequest {requestedFramelessBatches = 1}
+      offerNaming (rigRootsStandIn rig)
+      failNaming (rigRootsStandIn rig) ObjectFence
+      tickets ← newIORef []
+      outcome ← try @SomeException $ scoped rig $ \scope → sealedIn scope >>= \ticket → modifyIORef' tickets (ticket :)
+      failure ← either pure (\() → fail "the scope did not raise") outcome
+      fromException failure `shouldBe` Just (NamingFailure ObjectFence)
+      length (cleanupFailures failure) `shouldBe` 0
+      [first] ← createdFences rig
+      filter isDestruction <$> frameCalls (rigStandIn rig) `shouldReturn` [DestroyedFence first]
+      atomically (readFramelessSlots (rigFrames rig)) `shouldReturn` []
+      filter isSubmission <$> frameCalls (rigStandIn rig) `shouldReturn` []
+      sessionState <$> modelOf rig `shouldReturn` SessionRunning
+      readIORef tickets >>= mapM (atomically . readTicket) >>= (`shouldBe` [TicketDiscarded])
+      restoreNaming (rigRootsStandIn rig) ObjectFence
+      _ ← scoped rig sealedIn
+      [_, second] ← createdFences rig
+      [FramelessSlotView 0 sync] ← atomically (readFramelessSlots (rigFrames rig))
+      framelessFence sync `shouldBe` second
+      fenceNames rig `shouldReturn` [(first, fenceName 0), (second, fenceName 0)]
+      length . filter isSubmission <$> frameCalls (rigStandIn rig) `shouldReturn` 1
+      clean rig
+
+    it "keeps a fence whose naming and then destruction raised, uncertain and never destroyed again, failing the session and retaining the destruction beside the naming failure" $ do
+      rig ← newRig
+      offerNaming (rigRootsStandIn rig)
+      failNaming (rigRootsStandIn rig) ObjectFence
+      duringFrameCall (rigStandIn rig) $ \case
+        DestroyedFence _ → throwIO (ErrorCall "destroying the fence raised")
+        _ → pure ()
+      outcome ← try @SomeException (scoped rig sealedIn)
+      failure ← either pure (\_ → fail "the scope did not raise") outcome
+      fromException failure `shouldBe` Just (NamingFailure ObjectFence)
+      map cleanupFailureLabel (cleanupFailures failure) `shouldBe` ["vulkan frame synchronization rollback"]
+      [fromException inner | ExceptionWithContext _ inner ← map cleanupFailureException (cleanupFailures failure)]
+        `shouldBe` [Just (ErrorCall "destroying the fence raised")]
+      [fence] ← createdFences rig
+      [FramelessSlotView _ sync] ← atomically (readFramelessSlots (rigFrames rig))
+      framelessFence sync `shouldBe` fence
+      case (framelessFenceState sync, framelessDestruction sync) of
+        (FenceUncertain reason, Just destruction) → do
+          destruction `shouldBe` reason
+          reason `shouldSatisfy` Text.isInfixOf "NamingFailure ObjectFence"
+          reason `shouldSatisfy` Text.isInfixOf "destroying the fence raised"
+        other → expectationFailure ("the fence was kept as " <> show other)
+      sessionState <$> modelOf rig `shouldReturn` SessionFailed CleanupFailed
+      filter isSubmission <$> frameCalls (rigStandIn rig) `shouldReturn` []
+      -- Retirement keeps it, under the device-loss rule too, and nothing asks
+      -- it, resets it or destroys it again.
+      retireFrameless (rigFrames rig) `raises` (== FramelessRetained [] [0])
+      inModel rig (Admitted . noteDeviceLoss)
+      retireFrameless (rigFrames rig) `raises` (== FramelessRetained [] [0])
+      touching fence <$> frameCalls (rigStandIn rig) `shouldReturn` [CreatedFence fence, DestroyedFence fence]
+
+    it "raises a naming that lost the device as the loss, latched, after destroying the fence once, and loses the scope's pending batches" $ do
+      rig ← newRig
+      offerNaming (rigRootsStandIn rig)
+      loseNaming (rigRootsStandIn rig) ObjectFence
+      tickets ← newIORef []
+      outcome ← try @GraphicsDeviceLost $ scoped rig $ \scope →
+        mapM_ (const (sealedIn scope >>= \ticket → modifyIORef' tickets (ticket :))) [1 ∷ Int, 2]
+      fmap lostDuring (either Just (const Nothing) outcome) `shouldBe` Just "vkSetDebugUtilsObjectNameEXT"
+      refusedPrimary rig `shouldReturn'` \case
+        Just (TerminalDeviceLost loss) → lostDuring loss `shouldBe` "vkSetDebugUtilsObjectNameEXT"
+        other → expectationFailure ("the loss was not latched: " <> show other)
+      [fence] ← createdFences rig
+      filter isDestruction <$> frameCalls (rigStandIn rig) `shouldReturn` [DestroyedFence fence]
+      atomically (readFramelessSlots (rigFrames rig)) `shouldReturn` []
+      filter isSubmission <$> frameCalls (rigStandIn rig) `shouldReturn` []
+      readIORef tickets >>= mapM (atomically . readTicket) >>= (`shouldBe` [TicketLost, TicketLost])
+      clean rig
+
 -- | Run a scope over the rig's frames.
 scoped ∷ Rig → (Scope → IO a) → IO a
 scoped rig = withFramelessScope (rigFrames rig)
@@ -314,6 +440,31 @@ failSubmission rig nth step' = do
       count ← readIORef seen
       if count == nth then failFrameStep (rigStandIn rig) step' else pure ()
     _ → pure ()
+
+-- | Every fence the frames made, oldest first.
+createdFences ∷ Rig → IO [Word64]
+createdFences rig = (\made → [fence | CreatedFence fence ← made]) <$> frameCalls (rigStandIn rig)
+
+-- | Every naming of a fence so far, oldest first.
+fenceNames ∷ Rig → IO [(Word64, ByteString)]
+fenceNames rig = (\names → [(handle, name) | (ObjectFence, handle, name) ← names]) <$> namesGiven (rigRootsStandIn rig)
+
+-- | The name a frame-less slot's fence is given, spelled out.
+fenceName ∷ Natural → ByteString
+fenceName slot = "frame-less slot " <> ByteString8.pack (show slot) <> " submission fence"
+
+-- | The calls that touched this fence.
+touching ∷ Word64 → [FrameCall] → [FrameCall]
+touching fence = filter (\call → fence `elem` fencesOf call)
+  where
+    fencesOf = \case
+      CreatedFence handle → [handle]
+      DestroyedFence handle → [handle]
+      ResetFence handle → [handle]
+      QueriedFence handle → [handle]
+      Submitted _ handle → [handle]
+      WaitedFence handle _ _ → [handle]
+      _ → []
 
 -- | How many storage resets the recording made.
 resets ∷ Rig → IO Int
