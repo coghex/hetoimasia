@@ -106,9 +106,28 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , PassStart (..)
   , beginRenderingInto
   , copyTargetToReadback
+  , copyLevelToReadback
   , constructReadback
   , readConstructedReadback
   , Readback
+
+    -- * Uploads (GRS-6)
+  , UploadConfig
+  , validateUploadConfig
+  , UploadConfigRefused (..)
+  , UploadRequest (..)
+  , submitVulkanUpload
+  , VulkanUploadRefusal (..)
+  , UploadsUnavailable (..)
+  , UploadRefusal (..)
+  , UploadPressure (..)
+  , UploadTicket
+  , ticketUpload
+  , UploadState (..)
+  , readUploadTicket
+  , awaitUploadTicket
+  , cancelVulkanUpload
+  , CancelRefusal (..)
 
     -- * Drawing from buffers with push constants (GRS-4)
   , constructPipelineLayoutWith
@@ -228,6 +247,7 @@ import Hetoimasia.GPU.Model.Identity (TargetClass)
 import Hetoimasia.GPU.Vulkan.Diagnostics (DiagnosticVerdict)
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   ( ActionOutcome (..)
+  , VulkanUploadRefusal (..)
   , ActionRefusal (..)
   , ActionTicket
   , CaptureMode (CaptureOff)
@@ -339,6 +359,7 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , beginRendering
   , beginRenderingInto
   , copyTargetToReadback
+  , copyLevelToReadback
   , bindPipeline
   , draw
   , endRendering
@@ -349,6 +370,21 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , transitionResource
   )
 import Hetoimasia.GPU.Vulkan.Native.Profile (ValidationFeature (..))
+import Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering (UploadsUnavailable (..))
+import Hetoimasia.GPU.Vulkan.Native.Uploads
+  ( CancelRefusal (..)
+  , UploadConfig
+  , UploadConfigRefused (..)
+  , UploadPressure (..)
+  , UploadRefusal (..)
+  , UploadRequest (..)
+  , UploadState (..)
+  , UploadTicket
+  , awaitUploadTicket
+  , readUploadTicket
+  , ticketUpload
+  , validateUploadConfig
+  )
 import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsSessionFailed (..), TeardownEvidence (..), TerminalCause (..), TerminalReport (..))
 
 -- | Run a Vulkan graphics host over this loader capability, and answer the
@@ -364,6 +400,16 @@ withVulkanOwnerHost = withVulkanOwnerHostAs CaptureOff
 -- session's 'Construction', from any thread, or have it refused at once.
 submitVulkanAction ∷ VulkanHost scene → VulkanAction r → STM (Either ActionRefusal (ActionTicket r))
 submitVulkanAction host = Controller.submitVulkanAction (vulkanController host)
+
+-- | Admit an upload into this host's session from any thread (GRS-6):
+-- answered at once, its bytes copied into the session's staging buffer before
+-- this returns, and its ticket read or waited on with a deadline.
+submitVulkanUpload ∷ VulkanHost scene → UploadRequest → IO (Either VulkanUploadRefusal UploadTicket)
+submitVulkanUpload host = Controller.submitVulkanUpload (vulkanController host)
+
+-- | Cancel an upload, from any thread, before its first copies are recorded.
+cancelVulkanUpload ∷ VulkanHost scene → UploadTicket → STM (Either CancelRefusal ())
+cancelVulkanUpload host = Controller.cancelVulkanUpload (vulkanController host)
 
 -- | Create one window's surface on the main thread, under its attachment, and
 -- hand it to this host's owner as a required or optional target.

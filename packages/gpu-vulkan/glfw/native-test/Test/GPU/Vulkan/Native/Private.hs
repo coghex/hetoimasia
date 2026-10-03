@@ -69,6 +69,12 @@
 --   two instance offsets into ring regions, pushes a color, draws indexed and
 --   instanced into an RGBA8 color target and reads it back, probed for exact
 --   bytes inside each quad and outside both (#340);
+-- * @grs6-uploads@ — the same device start with no window, then an RGBA8
+--   texture of two levels uploaded over several turns, a BC7 one where the
+--   device takes it — reported unsupported where it does not — and a quad's
+--   vertex, instance-offset and index buffers, admitted off the owner's thread
+--   and waited for with a deadline; every level copied back and compared
+--   exactly, and the quad drawn from the uploaded buffers and probed (#342);
 -- * @grs3-ordering@ — GRS-3's managed depth target and buffer written by an
 --   initializing batch, then by two batches submitted in order with no
 --   completion wait between and no layout change, ordered only by the
@@ -343,6 +349,14 @@ scenarios =
       $ \consent journal _ → do
         outcome ← SurfaceFree.runDrawing (consentBackend consent) journal
         pure (SurfaceFree.drawingSpec outcome, section "The GRS-4 drawing record" (SurfaceFree.drawingSection outcome))
+  , Scenario
+      "grs6-uploads"
+      "uploads an RGBA8 texture of two levels over several turns, a BC7 one where the device takes it, and vertex, offset and index buffers through bounded staging in a surface-free session, admitted off the owner's thread and waited for with a deadline; copies every level back exactly and draws from the buffers, with validation reporting nothing"
+      False
+      Nothing
+      $ \consent journal _ → do
+        outcome ← SurfaceFree.runUploads (consentBackend consent) journal
+        pure (SurfaceFree.uploadsSpec outcome, section "The GRS-6 uploads record" (SurfaceFree.uploadsSection outcome))
   , Scenario
       "synchronization-hazard"
       "observes a deliberate synchronization hazard, proving synchronization validation active"

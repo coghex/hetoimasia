@@ -98,6 +98,8 @@ data RecordingStep
   | AtEndLabel
   | AtCreateView
   | AtDestroyView
+  | AtWriteMapped
+    -- ^ A write into mapped memory: one that fails writes nothing.
   deriving (Eq, Ord, Show)
 
 -- | What a failing step raises, after recording the call.
@@ -157,7 +159,7 @@ standInMaxFramebuffer = (16384, 16384)
 -- | What the device allows pipeline interfaces and mapped memory unless an
 -- example says otherwise: Vulkan's required minimums, and a 64-byte atom.
 standInRecordingLimits ∷ RecordingLimits
-standInRecordingLimits = RecordingLimits 128 16 16 2048 2047 64
+standInRecordingLimits = RecordingLimits 128 16 16 2048 2047 64 16384
 
 -- | Have the device allow pipeline interfaces and mapped memory this from now
 -- on.
@@ -268,7 +270,7 @@ recordingStandInOps standIn =
         bytes ← Map.findWithDefault ByteString.empty (allocationMapped allocation) <$> readTVarIO (recordingMemory standIn)
         pure (ByteString.take (fromIntegral size) (ByteString.drop (fromIntegral offset) bytes))
     , opsWriteMapped = \allocation offset bytes → do
-        journal standIn (WroteMapped offset (fromIntegral (ByteString.length bytes)))
+        step standIn AtWriteMapped (WroteMapped offset (fromIntegral (ByteString.length bytes)))
         atomically $ modifyTVar' (recordingMemory standIn) $
           Map.alter
             ( \held →
