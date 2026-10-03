@@ -256,12 +256,15 @@ module Hetoimasia.GPU.Vulkan.Native.Recording
   , transitionImage
   , supportedTransition
   , beginRendering
+  , PassStart (..)
+  , beginRenderingInto
   , endRendering
   , bindPipeline
   , setViewport
   , setScissor
   , draw
   , copyToReadback
+  , copyTargetToReadback
   , readbackBytesFor
 
     -- * Tickets (GRS-12)
@@ -353,8 +356,11 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Readback (fillReadback, readReadback)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Recorder
   ( Recorder
+  , PassStart (..)
   , beginRendering
+  , beginRenderingInto
   , bindPipeline
+  , copyTargetToReadback
   , copyToReadback
   , draw
   , endRendering

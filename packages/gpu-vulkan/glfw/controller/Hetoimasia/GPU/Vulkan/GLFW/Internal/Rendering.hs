@@ -101,6 +101,8 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
   , constructImage
   , releaseConstructed
   , constructFramelessBatch
+  , constructReadback
+  , readConstructedReadback
   , lendConstruction
   , framelessScoped
   , constructionEscaped
@@ -407,6 +409,9 @@ instance Constructed Buffer where
 instance Constructed Image where
   release = releaseManaged
 
+instance Constructed Readback where
+  release = releaseManaged
+
 -- | A pipeline layout with no descriptor sets and no push constants.
 constructPipelineLayout ∷ Construction q inst msgr phys dev cmd → IO (Either Refusal PipelineLayout)
 constructPipelineLayout construction = confined construction (createPipelineLayout (constructionRecording construction))
@@ -438,6 +443,19 @@ constructBuffer construction description = confined construction (createBuffer (
 -- it is refused before anything is created; nothing writes it yet.
 constructImage ∷ Construction q inst msgr phys dev cmd → ImageDescription → IO (Either Refusal Image)
 constructImage construction description = confined construction (createImage (constructionRecording construction) description)
+
+-- | A host-visible readback buffer of this many bytes, which a batch can copy
+-- a color target into (GRS-5) and the owner reads once that batch's
+-- submission has completed ('readConstructedReadback').
+constructReadback ∷ Construction q inst msgr phys dev cmd → Natural → IO (Either Refusal Readback)
+constructReadback construction bytes = confined construction (createReadback (constructionRecording construction) bytes)
+
+-- | Read bytes out of a readback buffer, from an offset: exposed only with
+-- completion evidence — the batch that copied into it was submitted, and that
+-- submission has completed — and never while a batch or a submission still
+-- holds it.
+readConstructedReadback ∷ Construction q inst msgr phys dev cmd → Readback → Natural → Natural → IO (Either Refusal ByteString.ByteString)
+readConstructedReadback construction readback offset size = confined construction (readReadback (constructionRecording construction) readback offset size)
 
 -- | Release a handle the renderer constructed: nothing records it again, and a
 -- batch that recorded it keeps it until that batch's references end. The

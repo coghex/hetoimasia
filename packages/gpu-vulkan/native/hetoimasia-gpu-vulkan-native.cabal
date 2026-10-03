@@ -283,6 +283,7 @@ test-suite native-tests
         Test.GPU.Vulkan.Native.FramesVisibility
         Test.GPU.Vulkan.Native.Generations
         Test.GPU.Vulkan.Native.GenerationsVisibility
+        Test.GPU.Vulkan.Native.Offscreen
         Test.GPU.Vulkan.Native.Presentation
         Test.GPU.Vulkan.Native.Profile
         Test.GPU.Vulkan.Native.Reclamation

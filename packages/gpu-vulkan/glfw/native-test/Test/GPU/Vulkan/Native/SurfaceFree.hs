@@ -17,6 +17,14 @@
 --   over one mapped window, whose surface is admitted against the device's
 --   queue family, presents one frame of it and sees that presentation retire
 --   on its own present fence, and exits.
+-- * @grs5-offscreen@ opens no window either (GRS-5). One owner-thread action
+--   builds an RGBA8 color target of each format, sRGB and linear, a pipeline
+--   for each over the endpoint shaders and a readback buffer, and records a
+--   frame-less batch per target that clears it blue from undefined, draws the
+--   yellow triangle, moves it to its transfer-source use, copies it into the
+--   readback and returns it to rest. The main thread waits for both tickets;
+--   a second action reads both readbacks, which are probed for exact bytes
+--   inside and outside the triangle and written as PNGs to temporary paths.
 -- * @grs12-frameless@ opens no window either (GRS-12). One owner-thread
 --   action builds a color target and a vertex buffer and records a
 --   frame-less batch that initializes the target and moves the buffer into a
@@ -35,12 +43,15 @@ module Test.GPU.Vulkan.Native.SurfaceFree
   , runSurfaceFree
   , runLaterWindow
   , runFrameless
+  , runOffscreen
   , surfaceFreeSection
   , laterWindowSection
   , framelessSection
+  , offscreenSection
   , surfaceFreeSpec
   , laterWindowSpec
   , framelessSpec
+  , offscreenSpec
   ) where
 
 import Control.Concurrent (ThreadId, myThreadId)
@@ -48,12 +59,17 @@ import Control.Concurrent.STM (STM, TVar, atomically, check, modifyTVar', newTVa
 import Control.Exception (SomeException, displayException, throwIO, try)
 import Control.Monad (void, when)
 import Data.Functor ((<&>))
+import qualified Data.ByteString as ByteString
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.List (elemIndex, nub)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Time.Clock (addUTCTime, diffUTCTime, getCurrentTime)
+import Data.Word (Word8)
+import Numeric.Natural (Natural)
+import System.Directory (getTemporaryDirectory)
+import System.IO (hClose, openBinaryTempFile)
 import Test.Hspec (Expectation, Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
 
 import Hetoimasia.Foundation.Log
@@ -79,6 +95,7 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , Buffer
   , BufferDescription (..)
   , BufferKind (..)
+  , ClearColor (..)
   , Construction
   , FrameEvent (..)
   , Image
@@ -86,9 +103,12 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , ImageFormat (..)
   , ImageKind (..)
   , NativeObserver (..)
+  , PassStart (..)
   , Pipeline
   , PipelineLayout
+  , Readback
   , Readiness (..)
+  , Rect (..)
   , Refusal
   , ResourceUse (..)
   , TicketState (..)
@@ -98,26 +118,37 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , VulkanHandover (..)
   , VulkanHost (..)
   , VulkanHostConfig (..)
+  , Viewport (..)
   , awaitTicket
   , awaitVulkanAction
+  , beginRenderingInto
+  , bindPipeline
   , constructBuffer
   , constructFramelessBatch
   , constructImage
   , constructPipeline
   , constructPipelineLayout
+  , constructReadback
+  , copyTargetToReadback
+  , draw
+  , endRendering
+  , formatCode
   , handOverVulkanTarget
   , publishVulkanScene
+  , readConstructedReadback
   , readReadiness
   , readVulkanRoots
   , releaseConstructed
   , runVulkanOwnerLoop
+  , setScissor
+  , setViewport
   , submitVulkanAction
   , transitionResource
   , vulkanHostConfig
   , withVulkanOwnerHost
   )
 import Hetoimasia.GPU.Vulkan.Native.Presentation (formatB8G8R8A8Srgb)
-import Hetoimasia.GPU.Vulkan.Native.Recording.Shaders (verificationShaders)
+import Hetoimasia.GPU.Vulkan.Native.Recording.Shaders (endpointShaders, verificationShaders)
 import Hetoimasia.GPU.Vulkan.Native.Roots (RootStanding (..), RootsView (..))
 import Hetoimasia.Runtime.GLFW
   ( ScheduledStep (..)
@@ -134,6 +165,7 @@ import Hetoimasia.Runtime.Logging (withLoggingLifetime)
 import Hetoimasia.Runtime.Supervision (RuntimeControl)
 import Test.GPU.Vulkan.Native.Environment (validationFeatures)
 import Test.GPU.Vulkan.Native.Platform (requestingBackend)
+import Test.GPU.Vulkan.Native.Png (encodeRgba)
 import Test.Vulkan.Proof.Journal (Journal, heading, note)
 import Test.Vulkan.Proof.Roots (NativeCall (..), nativeCallObserver)
 
@@ -155,6 +187,8 @@ data SurfaceFreeFacts = SurfaceFreeFacts
   , factsStanding ∷ !(Maybe TargetStanding)
   , factsEvents ∷ ![FrameEvent]
   , factsTickets ∷ ![Either Refusal TicketState]
+  , factsShots ∷ ![Shot]
+    -- ^ The offscreen readbacks, one a format.
     -- ^ What waiting for each frame-less batch's ticket answered.
   , factsVerdict ∷ !(Maybe DiagnosticVerdict)
   , factsErrors ∷ ![Text]
@@ -173,6 +207,17 @@ data Seen = Seen
   , seenRoots ∷ !(Maybe RootsView)
   , seenStanding ∷ !(Maybe TargetStanding)
   , seenTickets ∷ ![Either Refusal TicketState]
+  , seenShots ∷ ![Shot]
+  }
+
+-- | One offscreen readback (GRS-5): its format, what waiting for its batch's
+-- ticket answered, each probe's point and bytes, and where its PNG was
+-- written.
+data Shot = Shot
+  { shotFormat ∷ !ImageFormat
+  , shotTicket ∷ !(Either Refusal TicketState)
+  , shotProbes ∷ ![((Int, Int), [Word8])]
+  , shotPng ∷ !FilePath
   }
 
 -- | The case with no window, on the calling thread, which must be the process
@@ -190,7 +235,7 @@ runSurfaceFree backend journal = do
     windows ← length <$> atomically (hostWindowIdentities (vulkanWindowHost vulkan))
     roots ← atomically (readVulkanRoots (vulkanController vulkan))
     note journal ("the actions answered " <> Text.intercalate "; " answers)
-    pure (Seen threads answers windows (Just roots) Nothing [])
+    pure (Seen threads answers windows (Just roots) Nothing [] [])
 
 -- | The case that admits a window after the device exists.
 runLaterWindow ∷ Maybe Backend → Journal → IO SurfaceFreeOutcome
@@ -222,7 +267,7 @@ runLaterWindow backend journal = do
       pure (if any (`elem` retired) presented then FinishWith () else ContinueWith NoUpdateDemand)
     note journal "presented a frame to the later window and saw its presentation retire"
     roots ← atomically (readVulkanRoots (vulkanController vulkan))
-    pure (Seen [] [] 1 (Just roots) (Just standing) [])
+    pure (Seen [] [] 1 (Just roots) (Just standing) [] [])
   where
     quiet = recordingLogger (\_ → pure ())
 
@@ -247,9 +292,100 @@ runFrameless backend journal = do
     tickets ← mapM (\ticket → awaitTicket ticket deadline) [firstTicket, snd second]
     note journal ("the tickets answered " <> tshow tickets)
     roots ← atomically (readVulkanRoots (vulkanController vulkan))
-    pure (Seen [firstOn, fst second] ["recorded an initializing frame-less batch", "recorded a second frame-less batch"] 0 (Just roots) Nothing tickets)
+    pure (Seen [firstOn, fst second] ["recorded an initializing frame-less batch", "recorded a second frame-less batch"] 0 (Just roots) Nothing tickets [])
   where
     deadline = either (error . show) id (durationFromNanoseconds AllowZero 10000000000)
+
+-- | The case that renders into offscreen color targets and reads them back
+-- (GRS-5).
+runOffscreen ∷ Maybe Backend → Journal → IO SurfaceFreeOutcome
+runOffscreen backend journal = do
+  heading journal "GRS-5: a surface-free session renders into managed color targets and reads them back"
+  runCase backend defaultBudgetRequest {requestedBytes = 2 * 1024 * 1024 * 1024} [] "vulkan-native-grs5-offscreen" $ \vulkan _ _ _ → do
+    recorded ← act vulkan (VulkanAction (\construction → (,) <$> myThreadId <*> mapM (offscreenBatch construction) offscreenFormats)) >>= \case
+      ActionReturned (ran, made) → pure (ran, made)
+      other → stopWith ("the rendering action did not return: " <> outcomeText other)
+    let (renderedOn, made) = recorded
+    batches ← mapM (either (\refusal → stopWith ("an offscreen batch was refused: " <> tshow refusal)) pure) made
+    tickets ← mapM (\(_, _, ticket) → awaitTicket ticket deadline) batches
+    read' ← act vulkan (VulkanAction (\construction → (,) <$> myThreadId <*> mapM (\(_, readback, _) → readConstructedReadback construction readback 0 offscreenBytes) batches)) >>= \case
+      ActionReturned (ran, bytes) → pure (ran, bytes)
+      other → stopWith ("the reading action did not return: " <> outcomeText other)
+    let (readOn, readings) = read'
+    shots ← sequence
+      [ case reading of
+          Left refusal → stopWith ("the readback of " <> tshow format <> " was refused: " <> tshow refusal)
+          Right bytes → do
+            directory ← getTemporaryDirectory
+            (path, handle) ← openBinaryTempFile directory ("hetoimasia-grs5-offscreen-" <> show format <> ".png")
+            ByteString.hPut handle (encodeRgba offscreenSide offscreenSide bytes)
+            hClose handle
+            note journal ("the " <> tshow format <> " readback is at " <> Text.pack path)
+            pure (Shot format ticket [(point, pixelAt bytes point) | point ← offscreenProbes] path)
+      | ((format, _, _), ticket, reading) ← zip3 batches tickets readings
+      ]
+    roots ← atomically (readVulkanRoots (vulkanController vulkan))
+    pure (Seen [renderedOn, readOn] ["rendered and copied both targets", "read both readbacks"] 0 (Just roots) Nothing tickets shots)
+  where
+    deadline = either (error . show) id (durationFromNanoseconds AllowZero 10000000000)
+    pixelAt bytes (x, y) = ByteString.unpack (ByteString.take 4 (ByteString.drop ((y * offscreenSide + x) * 4) bytes))
+
+-- | The formats the case renders into.
+offscreenFormats ∷ [ImageFormat]
+offscreenFormats = [Rgba8Srgb, Rgba8Linear]
+
+-- | The targets' side, in pixels.
+offscreenSide ∷ Int
+offscreenSide = 64
+
+offscreenBytes ∷ Natural
+offscreenBytes = fromIntegral (offscreenSide * offscreenSide * 4)
+
+-- | Probe points, each well away from the triangle's edges: the first inside
+-- it, near its centroid, the rest outside it.
+offscreenProbes ∷ [(Int, Int)]
+offscreenProbes = [(32, 38), (4, 4), (60, 4), (32, 60)]
+
+-- | What each probe must read: yellow inside the triangle, blue outside,
+-- every channel an endpoint, so exact in either format.
+expectedProbes ∷ [[Word8]]
+expectedProbes = [[255, 255, 0, 255], [0, 0, 255, 255], [0, 0, 255, 255], [0, 0, 255, 255]]
+
+-- | One color target of the format, a pipeline for it over the endpoint
+-- shaders, a readback buffer its size, and a frame-less batch that clears the
+-- target blue from undefined, draws the triangle, copies the target into the
+-- readback after its transition, and returns it to rest.
+offscreenBatch ∷ Construction q inst msgr phys dev cmd → ImageFormat → IO (Either Refusal (ImageFormat, Readback, BatchTicket))
+offscreenBatch construction format = do
+  let side = fromIntegral offscreenSide
+      steps target pipeline readback recorder =
+        inOrder
+          [ beginRenderingInto recorder target ClearFromUndefined (ClearColor 0 0 1 1)
+          , bindPipeline recorder pipeline
+          , setViewport recorder (Viewport 0 0 (fromIntegral side) (fromIntegral side))
+          , setScissor recorder (Rect 0 0 side side)
+          , draw recorder 3 1
+          , endRendering recorder
+          , transitionResource recorder target (FromUse ColorAttachment) TransferRead
+          , copyTargetToReadback recorder target readback
+          , transitionResource recorder target (FromUse TransferRead) ColorAttachment
+          ]
+  constructImage construction (ImageDescription ColorTarget format side side 1) >>= \case
+    Left refusal → pure (Left refusal)
+    Right target →
+      constructPipelineLayout construction >>= \case
+        Left refusal → pure (Left refusal)
+        Right layout →
+          constructPipeline construction layout endpointShaders (formatCode format) >>= \case
+            Left refusal → pure (Left refusal)
+            Right pipeline →
+              constructReadback construction offscreenBytes >>= \case
+                Left refusal → pure (Left refusal)
+                Right readback →
+                  constructFramelessBatch construction (steps target pipeline readback) <&> \case
+                    Left refusal → Left refusal
+                    Right (_, Left refusal) → Left refusal
+                    Right (ticket, Right ()) → Right (format, readback, ticket)
 
 -- | A color target and a vertex buffer, and a frame-less batch that
 -- initializes the target and moves the buffer into a copy's use and back,
@@ -432,6 +568,7 @@ runCase backend request windows label body = do
               , factsRoots = seenRoots seen
               , factsStanding = seenStanding seen
               , factsTickets = seenTickets seen
+              , factsShots = seenShots seen
               , factsEvents = seenEvents
               , factsVerdict = verdict
               , factsErrors = errors
@@ -534,6 +671,46 @@ surfaceFreeSpec outcome = describe "GRS-15 surface-free session" $ do
       oneOwnerThread facts
 
   it "reached a verdict after the last callback with no issue and no error" $
+    on outcome clean
+
+offscreenSection ∷ SurfaceFreeOutcome → [Text]
+offscreenSection outcome =
+  section "A surface-free session rendering into color targets and reading them back" outcome
+    <> case outcome of
+      SurfaceFreeRecorded facts →
+        concat
+          [ [ "- " <> tshow (shotFormat shot) <> ": ticket " <> tshow (shotTicket shot) <> ", PNG at " <> Text.pack (shotPng shot)
+            , "  probes: " <> Text.intercalate "; " [tshow point <> " " <> tshow bytes | (point, bytes) ← shotProbes shot]
+            ]
+          | shot ← factsShots facts
+          ]
+      SurfaceFreeFailed _ → []
+
+offscreenSpec ∷ SurfaceFreeOutcome → Spec
+offscreenSpec outcome = describe "GRS-5 offscreen color targets in a surface-free session" $ do
+  it "opened no window, created no surface and acquired no image" $
+    on outcome $ \facts → do
+      factsWindows facts `shouldBe` 0
+      callNames facts `shouldSatisfy` notElem "glfwCreateWindowSurface"
+      callNames facts `shouldSatisfy` notElem "vkAcquireNextImageKHR"
+      deviceFirst facts
+
+  it "rendered into an RGBA8 target of each format and copied it, its batch's ticket complete, on the owner's thread" $
+    on outcome $ \facts → do
+      map shotFormat (factsShots facts) `shouldBe` offscreenFormats
+      map shotTicket (factsShots facts) `shouldBe` replicate 2 (Right TicketComplete)
+      ownerThread facts $ \owner → factsActionThreads facts `shouldBe` [owner, owner]
+
+  it "read back exact bytes: yellow well inside the triangle, the blue clear well outside it, in both formats" $
+    on outcome $ \facts →
+      [map snd (shotProbes shot) | shot ← factsShots facts] `shouldBe` replicate 2 expectedProbes
+
+  it "retired cleanly, with every Vulkan call on the owner's thread" $
+    on outcome $ \facts → do
+      callNames facts `shouldSatisfy` ordered ["vkDestroyDevice", "vkDestroyDebugUtilsMessengerEXT", "vkDestroyInstance"]
+      oneOwnerThread facts
+
+  it "reached a verdict after the last callback with no issue and no error, synchronization validation included" $
     on outcome clean
 
 framelessSpec ∷ SurfaceFreeOutcome → Spec

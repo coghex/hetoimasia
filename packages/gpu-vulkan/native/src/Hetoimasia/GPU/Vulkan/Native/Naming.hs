@@ -57,6 +57,7 @@ module Hetoimasia.GPU.Vulkan.Native.Naming
   , batchLabel
   , framelessBatchLabel
   , passLabel
+  , targetPassLabel
   ) where
 
 import Data.ByteString (ByteString)
@@ -271,6 +272,11 @@ framelessBatchLabel batch = boundedName (batchText batch <> " frame-less")
 -- | The label around one dynamic-rendering pass of that batch.
 passLabel ∷ BatchId → GenerationId → ByteString
 passLabel batch generation = boundedName ("pass " <> batchText batch <> " " <> generationText generation)
+
+-- | The label around one dynamic-rendering pass of that batch into a managed
+-- color target (GRS-5).
+targetPassLabel ∷ BatchId → ResourceId → ByteString
+targetPassLabel batch resource = boundedName ("pass " <> batchText batch <> " into " <> resourceText resource)
 
 -- ---------------------------------------------------------------------------
 -- Identities as text

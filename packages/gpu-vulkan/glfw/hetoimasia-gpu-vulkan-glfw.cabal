@@ -164,6 +164,7 @@ test-suite vulkan-native-tests
         Test.GPU.Vulkan.Native.Private
         Test.GPU.Vulkan.Native.Recording
         Test.GPU.Vulkan.Native.Shared
+        Test.GPU.Vulkan.Native.Png
         Test.GPU.Vulkan.Native.SurfaceFree
         Test.GPU.Vulkan.Native.Spec
         Test.GPU.Vulkan.Native.Terminal
