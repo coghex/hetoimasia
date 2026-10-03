@@ -19,6 +19,7 @@ import Data.IORef (newIORef, readIORef, writeIORef)
 import Control.Monad (when)
 import qualified Data.ByteString as ByteString
 import qualified Data.Map.Strict as Map
+import qualified Data.Set as Set
 import Data.Text (Text)
 import Data.Word (Word32, Word64)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldReturn, shouldSatisfy)
@@ -45,7 +46,7 @@ import Test.GPU.Vulkan.Native.AllocatorStandIn (AllocatorCall (Flushed), allocat
 import Test.GPU.Vulkan.Native.FramesRig
 import Test.GPU.Vulkan.Native.FramesStandIn (completeAll)
 import Test.GPU.Vulkan.Native.StandIn (StandIn (standAllocator))
-import Test.GPU.Vulkan.Native.RecordingStandIn (RecordingCall (..), RecordingFailure (..), RecordingStep (..), failAt, limitBuffers, limitRecording, onceAt, recordingCalls, standInRecordingLimits)
+import Test.GPU.Vulkan.Native.RecordingStandIn (RecordingCall (..), RecordingFailure (..), RecordingStep (..), failAt, limitBuffers, limitRecording, onceAt, recordingCalls, standInRecordingLimits, succeedAt)
 
 type Ups = Uploads () Int Int Text Int Word64
 
@@ -467,6 +468,35 @@ spec = describe "Texture table" $ do
       clean rig
 
   describe "handles" $ do
+    it "undoes a registration whose refresh raises or is cancelled before its handle is handed out: nothing stays registered, and registering again succeeds" $ do
+      (rig, uploads, _) ← tableRig 4 2
+      texture ← uploadedTexture rig uploads
+      let standIn = rigRecordingStandIn rig
+          unregistered = do
+            Just view ← atomically (readTable (rigRecording rig))
+            tableViewMapping view `shouldBe` Map.empty
+            tableViewFree view `shouldBe` Set.fromList [1, 2, 3]
+      -- The texture's upload has completed, so registering it writes its
+      -- descriptor, which fails.
+      failAt standIn AtWriteDescriptors
+      raised ← try @RecordingFailure (registerTexture (rigRecording rig) texture)
+      fmap (const ()) raised `shouldBe` Left (RecordingFailure AtWriteDescriptors)
+      unregistered
+      succeedAt standIn AtWriteDescriptors
+      -- A cancellation aimed at the owner from inside that write.
+      owner ← myThreadId
+      onceAt standIn AtWriteDescriptors $ do
+        killer ← forkIO (killThread owner)
+        awaitThrowing killer
+      interrupted ← try @SomeException (registerTexture (rigRecording rig) texture)
+      fmap (const ()) interrupted `shouldSatisfy` either ((== Just ThreadKilled) . fromException) (const False)
+      unregistered
+      -- The caller still owns the image, and registers it again.
+      handle ← registered rig texture
+      Just view ← atomically (readTable (rigRecording rig))
+      resolveHandle 4 (tableViewMapping view) handle `shouldSatisfy` (/= 0)
+      clean rig
+
     it "refuses a released handle wherever it is used, and issues its index again only under a new generation" $ do
       (rig, uploads, _) ← tableRig 4 2
       first ← uploadedTexture rig uploads

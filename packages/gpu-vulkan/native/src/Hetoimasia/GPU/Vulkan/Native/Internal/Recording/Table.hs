@@ -25,8 +25,8 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Table
   , readTable
   ) where
 
-import Control.Concurrent.STM (STM, atomically, readTVar, readTVarIO, writeTVar)
-import Control.Exception (Exception, mask_, onException, throwIO, try)
+import Control.Concurrent.STM (STM, atomically, modifyTVar', readTVar, readTVarIO, writeTVar)
+import Control.Exception (Exception, SomeException, mask, mask_, onException, rethrowIO, throwIO, try, tryWithContext)
 import qualified Data.ByteString as ByteString
 import Data.Foldable (for_)
 import Data.IORef (modifyIORef', newIORef, readIORef)
@@ -265,7 +265,7 @@ registerTexture recording (Image image) =
       Left refusal → pure (Left refusal)
       Right (NativeImage description _ _)
         | imageKind description /= TextureImage → pure (Left RefusedWrongKind)
-        | otherwise → do
+        | otherwise → mask $ \restore → do
             registered ← atomically $
               readTVar (recordingTable recording) >>= \case
                 Nothing → pure (Left (RefusedIllegal "registering a texture with a session that has made no texture table"))
@@ -278,9 +278,23 @@ registerTexture recording (Image image) =
                         pure (Right handle)
             case registered of
               Left refusal → pure (Left refusal)
-              -- An image whose upload already completed completes now.
-              Right handle → fmap (const handle) <$> refreshTable recording
+              -- An image whose upload already completed completes now. If
+              -- that refresh raises, is cancelled or refuses, the handle is
+              -- never handed out, so the registration is undone first: the
+              -- caller keeps its image, and may register it again.
+              Right handle →
+                tryWithContext @SomeException (restore (refreshTable recording)) >>= \case
+                  Right (Right ()) → pure (Right handle)
+                  Right (Left refusal) → unregister recording image handle >> pure (Left refusal)
+                  Left failure → unregister recording image handle >> rethrowIO failure
       Right _ → pure (Left RefusedWrongKind)
+
+-- | Undo a registration whose handle was never handed out.
+unregister ∷ Recording q inst msgr phys dev cmd → ResourceId → Book.TextureHandle → IO ()
+unregister recording image handle =
+  atomically . modifyTVar' (recordingTable recording) . fmap $ \table → case Book.unregisterTexture handle (tableBook table) of
+    Right book → table {tableBook = book, tableTextures = Set.delete image (tableTextures table)}
+    Left _ → table
 
 -- | Release a handle: it resolves to nothing from the next version on, its
 -- index may be issued again under a new generation, and its slot retires.

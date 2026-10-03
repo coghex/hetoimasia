@@ -65,6 +65,7 @@ module Hetoimasia.GPU.Model.TextureTable
   , registerTexture
   , completeTexture
   , releaseTexture
+  , unregisterTexture
   , bindVersion
   , VersionBinding (..)
   , reclaimSlots
@@ -305,6 +306,26 @@ releaseTexture handle table = do
       , tableRetiring = maybe id (Map.insert slot) (Map.lookup slot (tableTextures table)) (tableRetiring table)
       , tableDirty = True
       }
+
+-- | Undo a registration whose handle was never handed out: its index holds
+-- no texture again, and its slot is free at once, with nothing kept for it,
+-- since the caller still owns what it registered. Refused for a stale handle,
+-- and for one whose slot a version maps — which a handle never handed out
+-- cannot have been bound into.
+unregisterTexture ∷ TextureHandle → TextureTable a → Either TableRefusal (TextureTable a)
+unregisterTexture handle table = do
+  (index, holder) ← live handle table
+  let slot = holderSlot holder
+  if any (any ((== slot) . entrySlot)) (tableVersions table)
+    then Left (TableStaleHandle handle)
+    else
+      Right
+        table
+          { tableIndices = Map.adjust (\state → state {indexHolder = Nothing}) index (tableIndices table)
+          , tableTextures = Map.delete slot (tableTextures table)
+          , tableFree = Set.insert slot (tableFree table)
+          , tableDirty = True
+          }
 
 -- | The index and holder of a live handle, or its refusal.
 live ∷ TextureHandle → TextureTable a → Either TableRefusal (Word32, Holder)
