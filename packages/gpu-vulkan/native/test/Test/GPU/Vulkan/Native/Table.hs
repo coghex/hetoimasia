@@ -36,8 +36,11 @@ import Hetoimasia.GPU.Vulkan.Native.Shader.Interface
   )
 import Hetoimasia.GPU.Vulkan.Native.TextureTable
 import Hetoimasia.GPU.Vulkan.Native.Uploads
+import Data.Functor ((<&>))
+import Test.GPU.Vulkan.Native.AllocatorStandIn (AllocatorCall (Flushed), allocatorCalls, allowTypes, deviceLocalType, nonCoherentType)
 import Test.GPU.Vulkan.Native.FramesRig
 import Test.GPU.Vulkan.Native.FramesStandIn (completeAll)
+import Test.GPU.Vulkan.Native.StandIn (StandIn (standAllocator))
 import Test.GPU.Vulkan.Native.RecordingStandIn (RecordingCall (..), limitRecording, recordingCalls, standInRecordingLimits)
 
 type Ups = Uploads () Int Int Text Int Word64
@@ -253,6 +256,36 @@ spec = describe "Texture table" $ do
       standing rig first `shouldReturn` Just ManagedReleased
       clean rig
 
+    it "writes each new version whole into an entry no batch holds before the batch that binds it records, flushed on non-coherent memory to the atom" $ do
+      rig ← newRig
+      limitRecording (rigRecordingStandIn rig) standInRecordingLimits {limitImageDimension = 16}
+      allowTypes (standAllocator (rigRootsStandIn rig)) (2 ^ deviceLocalType + 2 ^ nonCoherentType)
+      uploads ← newUploads (rigFrames rig) (either (error . show) id (validateUploadConfig 4096 1024 8)) >>= either (fail . show) pure
+      ok (createTextureTable (rigRecording rig) uploads (tableConfig 16 4 2))
+      settle rig uploads
+      ok (refreshTextureTable (rigRecording rig))
+      kit ← newKit rig
+      texture ← uploadedTexture rig uploads
+      -- The first batch holds entry 0; the registration owes a new version,
+      -- which goes into entry 1 at the 256-byte stride.
+      recordDrawing rig kit
+      _ ← registered rig texture
+      recordDrawing rig kit
+      calls ← recordingCalls (rigRecordingStandIn rig)
+      let versionWrites = [(offset, count) | WroteMapped offset count ← calls, count == 32]
+          beforeBind = takeWhile (not . isBind) calls
+          isBind = \case
+            Recorded _ CommandBindDescriptorSets {} → True
+            _ → False
+      versionWrites `shouldBe` [(0, 32), (256, 32)]
+      [() | WroteMapped _ 32 ← beforeBind] `shouldBe` [()]
+      lookupAllocation ← managedHandles rig "lookup buffer" <&> \case
+        [_, allocation] → allocation
+        other → error ("the lookup buffer's handles: " <> show other)
+      flushes ← (\made → [range | Flushed allocation range ← made, allocation == lookupAllocation]) <$> allocatorCalls (standAllocator (rigRootsStandIn rig))
+      flushes `shouldBe` [(0, 64), (256, 64)]
+      clean rig
+
     it "binds a batch at the current version while every ring entry is held, when no mapping changed since it was published" $ do
       (rig, uploads, kit) ← tableRig 4 2
       one ← uploadedTexture rig uploads
@@ -437,6 +470,11 @@ imageWrites rig = (\calls → [(element, view) | WroteDescriptors writes ← cal
 
 commandCount ∷ Rig → IO Int
 commandCount rig = (\calls → length [() | Recorded {} ← calls]) <$> recordingCalls (rigRecordingStandIn rig)
+
+-- | The native handles of the one managed generation of this kind.
+managedHandles ∷ Rig → Text → IO [Word64]
+managedHandles rig kind' =
+  (\views → concat [handles | ManagedView _ _ named handles ← views, named == kind']) <$> atomically (readManaged (rigRecording rig))
 
 -- | How many managed generations of this kind the recording holds.
 managedCount ∷ Rig → Text → IO Int
