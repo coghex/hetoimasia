@@ -21,7 +21,7 @@ import Hetoimasia.GPU.Vulkan.Native.Shader.Reflect (reflect)
 spec ∷ Spec
 spec = describe "The reader's whitelist" $ do
   it "reads every fixture the rows mutate, unmutated" $
-    mapM_ (\fixture → load fixture >>= \parts → either (expectationFailure . ((fixture <> ": ") <>)) (const (pure ())) (reflect (assemble parts))) [descriptors, interface]
+    mapM_ (\fixture → load fixture >>= \parts → either (expectationFailure . ((fixture <> ": ") <>)) (const (pure ())) (reflect (assemble parts))) [descriptors, interface, layout]
   mapM_ row rows
   describe "an exact operand count for every opcode it supports" $
     mapM_ operandRow operandRows
@@ -405,6 +405,54 @@ rows =
     , filter (not . decorates 72 5)
     , "is a matrix that is neither RowMajor nor ColMajor"
     )
+  , -- Layout values, matched to the device profile: std140 for a uniform
+    -- block, std430 for a storage buffer or push-constant block, each with
+    -- Vulkan's relaxed block layout
+    ( "refuses a MatrixStride that is not a multiple of its matrix's alignment"
+    , interface
+    , onDecoration 72 7 (setOperand 3 1)
+    , "has a MatrixStride of 1, which is not a multiple of its matrix's alignment 16 under std430"
+    )
+  , ( "refuses an ArrayStride that is not a multiple of its array's alignment"
+    , interface
+    , onDecoration 71 6 (setOperand 2 1)
+    , "whose ArrayStride of 1 is not a multiple of its alignment 4 under std430"
+    )
+  , ( "refuses a member offset that is not a multiple of its alignment"
+    , interface
+    , map (\words' → if decorates 72 35 words' && operand 3 words' == 64 then setOperand 3 66 words' else words')
+    , "at offset 66 is not a multiple of its alignment 4 under std430"
+    )
+  , ( "refuses a vector that improperly straddles a 16-byte boundary"
+    , interface
+    , map (\words' → if decorates 72 35 words' && operand 3 words' == 64 then setOperand 3 68 words' else words')
+    , "a vector of 16 bytes at offset 68, improperly straddles a 16-byte boundary under std430"
+    )
+  , ( "refuses a member that overlaps the one before it"
+    , layout
+    , map (\words' → if decorates 72 35 words' && operand 3 words' == 12 then setOperand 3 8 words' else words')
+    , "overlaps member 0, which ends at byte 12"
+    )
+  , ( "refuses a member placed between the end of a struct and the next multiple of its alignment"
+    , layout
+    , map (\words' → if decorates 72 35 words' && operand 3 words' == 48 then setOperand 3 40 words' else words')
+    , "lies between the end of member 1, at byte 36, and the next multiple of its alignment 16"
+    )
+  , ( "refuses a uniform block's float array of stride 4, which std140 aligns to 16, though std430 takes it"
+    , layout
+    , map (\words' → if decorates 71 6 words' && operand 2 words' == 16 then setOperand 2 4 words' else words')
+    , "whose ArrayStride of 4 is not a multiple of its alignment 16 under std140"
+    )
+  , ( "refuses a uniform block's array at an offset std140 does not align, though std430 would"
+    , layout
+    , map (\words' → if decorates 72 35 words' && operand 3 words' == 128 then setOperand 3 132 words' else words')
+    , "at offset 132 is not a multiple of its alignment 16 under std140"
+    )
+  , ( "refuses an ArrayStride smaller than its element"
+    , layout
+    , map (\words' → if decorates 71 6 words' && operand 2 words' == 32 then setOperand 2 16 words' else words')
+    , "is smaller than its element's 20 bytes"
+    )
   , -- Interface variables' declarations
     ( "refuses an OpVariable with extra operands"
     , interface
@@ -492,9 +540,10 @@ name = \case
   32 → "OpTypePointer"
   other → "instruction of opcode " <> show other
 
-descriptors, interface ∷ FilePath
+descriptors, interface, layout ∷ FilePath
 descriptors = "test/fixtures/spirv/descriptors.frag.spv"
 interface = "test/fixtures/spirv/interface.vert.spv"
+layout = "test/fixtures/spirv/layout.frag.spv"
 
 -- | Ids no fixture uses: one never declared, and the first of those the rows
 -- declare.

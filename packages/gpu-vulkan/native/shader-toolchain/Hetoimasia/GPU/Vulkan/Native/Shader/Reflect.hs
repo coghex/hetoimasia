@@ -22,6 +22,12 @@
 -- device's: neither is part of what the host declares, and the reader reports
 -- neither.
 --
+-- Its input is SPIR-V from the pinned compiler, which is what every splice
+-- hands it (owner amendment, 2026-10-03). What it checks it checks
+-- completely; exhaustive semantic validation of arbitrary SPIR-V — all a
+-- validator such as spirv-val checks — is out of its scope, a disclosed
+-- narrowing of the guarantee that any malformed interface is refused.
+--
 -- Before anything is read, every type and constant an interface variable
 -- reaches is checked against one explicit whitelist, the subset the reader
 -- supports ('validateInterface'): its opcode is one its position allows — a
@@ -715,35 +721,76 @@ validateDecorations parsed = do
         when (kind `elem` [decorationLocation, decorationComponent] && decorationBuiltIn `elem` map fst consumed) $
           Left (subject <> " is decorated both BuiltIn and " <> decorationName kind <> ", which a built-in does not take")
 
+-- | Which block layout a block's values are checked against: matched to the
+-- device profile the roots create, which enables Vulkan 1.1's relaxed block
+-- layout, always on, and neither scalarBlockLayout nor
+-- uniformBufferStandardLayout. A Uniform block is std140; a StorageBuffer
+-- block, a Uniform BufferBlock and a PushConstant block are std430.
+data Profile = Std140 | Std430
+  deriving (Eq)
+
+profileRules ∷ Profile → String
+profileRules = \case
+  Std140 → "std140, a uniform block's layout with Vulkan's relaxed block layout"
+  Std430 → "std430, a storage buffer's or push-constant block's layout with Vulkan's relaxed block layout"
+
 -- | The explicit layout a Uniform, StorageBuffer or PushConstant block
 -- requires, from its struct down — through a descriptor array of blocks,
--- which is not memory and takes no stride: every member of every struct it
--- reaches has an Offset; every array and runtime-sized array it reaches has
--- an ArrayStride; and every member that is a matrix, or an array of them,
--- has a MatrixStride and is RowMajor or ColMajor.
+-- which is not memory and takes no stride.
+--
+-- Present: every member of every struct it reaches has an Offset; every
+-- array and runtime-sized array it reaches has an ArrayStride; and every
+-- member that is a matrix, or an array of them, has a MatrixStride and is
+-- RowMajor or ColMajor.
+--
+-- Valued, under the block's 'Profile' and Vulkan's alignment rules: a
+-- vector member is aligned to its scalar, and every other member to its
+-- base alignment, or under std140 its extended alignment — an array's,
+-- struct's or matrix's rounded up to 16; a vector of at most 16 bytes does
+-- not straddle a 16-byte boundary, and a larger one starts on one; an
+-- ArrayStride is a multiple of its array's alignment and holds its element;
+-- a MatrixStride is a multiple of its matrix's alignment; no member overlaps
+-- another; and no member starts between the end of a struct, array or
+-- matrix and the next multiple of that one's alignment.
 validateLayout ∷ Module → [(Word32, (Word32, Word32))] → Either String ()
 validateLayout parsed globals =
-  mapM_ block [(variable, pointer) | (variable, (pointer, storage)) ← globals, storage `elem` [storageUniform, storagePushConstant, storageStorageBuffer]]
+  mapM_ block [(variable, held) | (variable, held@(_, storage)) ← globals, storage `elem` [storageUniform, storagePushConstant, storageStorageBuffer]]
   where
-    block (variable, pointer) = do
+    block (variable, (pointer, storage)) = do
       let named = "the interface variable (id " <> show variable <> ")"
       typeId ← pointee parsed pointer
       let struct = case typeOf parsed typeId of
             Just (Instruction opcode (_ : element : _)) | opcode `elem` [28, 29] → element
             _ → typeId
+          profile
+            | storage == storageUniform && not (hasDecoration parsed struct decorationBufferBlock) = Std140
+            | otherwise = Std430
       case typeOf parsed struct of
-        Just (Instruction 30 _) → layoutStruct named struct
+        Just (Instruction 30 _) → layoutStruct named profile struct
         _ → pure ()
-    layoutStruct named struct = case typeOf parsed struct of
-      Just (Instruction 30 (_ : members)) →
+
+    memberDecorations struct index = Map.findWithDefault [] (struct, fromIntegral index) (moduleMemberDecorations parsed)
+    rowMajorOf struct index = isJust (lookup decorationRowMajor (memberDecorations struct index))
+    matrixStrideOf struct index = case lookup decorationMatrixStride (memberDecorations struct index) of
+      Just (value : _) → toInteger value
+      _ → 0
+    arrayStrideOf array = maybe 0 toInteger (decoration parsed array decorationArrayStride)
+
+    -- Every struct's members are present first, then their values.
+    layoutStruct named profile struct = case typeOf parsed struct of
+      Just (Instruction 30 (_ : members)) → do
         forM_' (zip [0 ..] members) $ \(index, member) → do
           when (isNothing (memberDecoration parsed struct index decorationOffset)) $
             Left (named <> " reaches struct id " <> show struct <> ", whose member " <> show index <> " has no Offset")
-          layoutMember named struct index member
+          present named struct index member
+        let placed = [(index, member, maybe 0 toInteger (memberDecoration parsed struct index decorationOffset)) | (index, member) ← zip [0 ∷ Int ..] members]
+        forM_' placed $ \(index, member, offset) → valued named profile struct index member offset
+        ordered named profile struct (sortOn (\(_, _, offset) → offset) placed)
       _ → pure ()
-    layoutMember named struct index typeId = case typeOf parsed typeId of
+
+    present named struct index typeId = case typeOf parsed typeId of
       Just (Instruction 24 _) → do
-        let decorations = Map.findWithDefault [] (struct, fromIntegral index) (moduleMemberDecorations parsed)
+        let decorations = memberDecorations struct index
             subject = named <> " reaches struct id " <> show struct <> ", whose member " <> show index <> " is a matrix"
         unless (isJust (lookup decorationMatrixStride decorations)) $ Left (subject <> " with no MatrixStride")
         unless (any (isJust . (`lookup` decorations)) [decorationRowMajor, decorationColMajor]) $ Left (subject <> " that is neither RowMajor nor ColMajor")
@@ -751,9 +798,132 @@ validateLayout parsed globals =
         | opcode `elem` [28, 29] → do
             unless (hasDecoration parsed typeId decorationArrayStride) $
               Left (named <> " reaches array id " <> show typeId <> ", member " <> show index <> " of struct id " <> show struct <> ", which has no ArrayStride")
-            layoutMember named struct index element
-      Just (Instruction 30 _) → layoutStruct named typeId
+            present named struct index element
       _ → pure ()
+
+    -- One member's own values: its offset's alignment, a vector's straddle,
+    -- and the strides of the matrices and arrays it is or holds.
+    valued named profile struct index typeId offset = do
+      let rowMajor = rowMajorOf struct index
+          alignment = alignOf profile rowMajor typeId
+          subject = named <> " reaches struct id " <> show struct <> ", whose member " <> show index
+          rules = profileRules profile
+      unless (offset `mod` alignment == 0) $
+        Left (subject <> " at offset " <> show offset <> " is not a multiple of its alignment " <> show alignment <> " under " <> rules)
+      case typeOf parsed typeId of
+        Just (Instruction 23 _) → do
+          let size = maybe 0 id (sizeOf rowMajor 0 typeId)
+              straddles
+                | size <= 16 = offset `div` 16 /= (offset + size - 1) `div` 16
+                | otherwise = offset `mod` 16 /= 0
+          when straddles $
+            Left (subject <> ", a vector of " <> show size <> " bytes at offset " <> show offset <> ", improperly straddles a 16-byte boundary under " <> rules)
+        _ → pure ()
+      strides named profile struct index typeId
+
+    strides named profile struct index typeId = case typeOf parsed typeId of
+      Just (Instruction 24 _) → do
+        let rowMajor = rowMajorOf struct index
+            stride = matrixStrideOf struct index
+            alignment = matrixAlignment profile rowMajor typeId
+        unless (stride `mod` alignment == 0) $
+          Left (named <> " reaches struct id " <> show struct <> ", whose member " <> show index <> " has a MatrixStride of " <> show stride <> ", which is not a multiple of its matrix's alignment " <> show alignment <> " under " <> profileRules profile)
+      Just (Instruction opcode (_ : element : _))
+        | opcode `elem` [28, 29] → do
+            let rowMajor = rowMajorOf struct index
+                stride = arrayStrideOf typeId
+                alignment = arrayAlignment profile rowMajor typeId
+                subject = named <> " reaches array id " <> show typeId <> ", member " <> show index <> " of struct id " <> show struct <> ", whose ArrayStride of " <> show stride
+            unless (stride `mod` alignment == 0) $
+              Left (subject <> " is not a multiple of its alignment " <> show alignment <> " under " <> profileRules profile)
+            case sizeOf rowMajor (matrixStrideOf struct index) element of
+              Just size | stride < size → Left (subject <> " is smaller than its element's " <> show size <> " bytes")
+              _ → pure ()
+            strides named profile struct index element
+      Just (Instruction 30 _) → layoutStruct named profile typeId
+      _ → pure ()
+
+    -- In offset order: no member overlaps the one before it, and none starts
+    -- between the end of a struct, array or matrix and the next multiple of
+    -- that one's alignment.
+    ordered named profile struct = \case
+      (index, typeId, offset) : rest@((nextIndex, _, nextOffset) : _) → do
+        let rowMajor = rowMajorOf struct index
+            subject = named <> " reaches struct id " <> show struct <> ", whose member " <> show nextIndex <> " at offset " <> show nextOffset
+        case sizeOf rowMajor (matrixStrideOf struct index) typeId of
+          Just size → do
+            let end = offset + size
+                alignment = alignOf profile rowMajor typeId
+                padded = roundUp end alignment
+            when (nextOffset < end) $
+              Left (subject <> " overlaps member " <> show index <> ", which ends at byte " <> show end)
+            when (aggregate typeId && nextOffset < padded) $
+              Left (subject <> " lies between the end of member " <> show index <> ", at byte " <> show end <> ", and the next multiple of its alignment " <> show alignment <> ", byte " <> show padded <> ", under " <> profileRules profile)
+          Nothing → pure ()
+        ordered named profile struct rest
+      _ → pure ()
+
+    aggregate typeId = case typeOf parsed typeId of
+      Just (Instruction opcode _) → opcode `elem` [24, 28, 29, 30]
+      Nothing → False
+
+    -- Vulkan's alignments. A vector member is aligned to its scalar under
+    -- the relaxed block layout; every other member to its base alignment,
+    -- or under std140 its extended alignment.
+    alignOf profile rowMajor typeId = case typeOf parsed typeId of
+      Just (Instruction 23 [_, component, _]) → scalarSize component
+      _ → case profile of
+        Std140 → extendedAlignment rowMajor typeId
+        Std430 → baseAlignment rowMajor typeId
+    arrayAlignment profile rowMajor typeId = case profile of
+      Std140 → extendedAlignment rowMajor typeId
+      Std430 → baseAlignment rowMajor typeId
+    matrixAlignment = arrayAlignment
+
+    scalarSize typeId = case typeOf parsed typeId of
+      Just (Instruction opcode (_ : width : _)) | opcode `elem` [21, 22] → toInteger width `div` 8
+      _ → 1
+    vectorAlignment component count = (if count == 2 then 2 else 4) * scalarSize component
+
+    baseAlignment rowMajor typeId = case typeOf parsed typeId of
+      Just (Instruction 23 [_, component, count]) → vectorAlignment component count
+      Just (Instruction 24 [_, column, columns]) → case typeOf parsed column of
+        Just (Instruction 23 [_, component, _])
+          | rowMajor → vectorAlignment component columns
+        _ → baseAlignment rowMajor column
+      Just (Instruction opcode (_ : element : _)) | opcode `elem` [28, 29] → baseAlignment rowMajor element
+      Just (Instruction 30 (_ : members)) → maximum (1 : [baseAlignment (rowMajorOf typeId index) member | (index, member) ← zip [0 ∷ Int ..] members])
+      _ → scalarSize typeId
+    extendedAlignment rowMajor typeId = case typeOf parsed typeId of
+      Just (Instruction 24 _) → roundUp (baseAlignment rowMajor typeId) 16
+      Just (Instruction opcode (_ : element : _)) | opcode `elem` [28, 29] → roundUp (extendedAlignment rowMajor element) 16
+      Just (Instruction 30 (_ : members)) → roundUp (maximum (1 : [extendedAlignment (rowMajorOf typeId index) member | (index, member) ← zip [0 ∷ Int ..] members])) 16
+      _ → baseAlignment rowMajor typeId
+
+    -- The bytes a type occupies from its offset; a runtime-sized array, and
+    -- so a struct ending in one, has no fixed size.
+    sizeOf rowMajor matrixStride typeId = case typeOf parsed typeId of
+      Just (Instruction 23 [_, component, count]) → Just (toInteger count * scalarSize component)
+      Just (Instruction 24 [_, column, columns]) → case typeOf parsed column of
+        Just (Instruction 23 [_, component, rows])
+          | rowMajor → Just ((toInteger rows - 1) * matrixStride + toInteger columns * scalarSize component)
+          | otherwise → Just ((toInteger columns - 1) * matrixStride + toInteger rows * scalarSize component)
+        _ → Nothing
+      Just (Instruction 28 [_, element, length']) → do
+        count ← either (const Nothing) (Just . toInteger) (constantValue parsed length')
+        each ← sizeOf rowMajor matrixStride element
+        pure ((count - 1) * arrayStrideOf typeId + each)
+      Just (Instruction 29 _) → Nothing
+      Just (Instruction 30 (_ : members)) →
+        fmap (maximum . (0 :)) . sequence $
+          [ (+ maybe 0 toInteger (memberDecoration parsed typeId index decorationOffset))
+              <$> sizeOf (rowMajorOf typeId index) (matrixStrideOf typeId index) member
+          | (index, member) ← zip [0 ∷ Int ..] members
+          ]
+      Just (Instruction opcode _) | opcode `elem` [21, 22] → Just (scalarSize typeId)
+      _ → Nothing
+
+    roundUp value alignment = ((value + alignment - 1) `div` alignment) * alignment
     forM_' = flip mapM_
 
 -- ---------------------------------------------------------------------------
