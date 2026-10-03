@@ -6,7 +6,9 @@
 -- Handles are small numbers, so a record says which object each call touched.
 -- Every image is supported up to 'standInImageLimits' unless an example says
 -- otherwise ('supportImages'), and a buffer may be as large as
--- 'standInMaxBufferSize' unless it says otherwise ('limitBuffers').
+-- 'standInMaxBufferSize' unless it says otherwise ('limitBuffers'), and a
+-- render area as large as 'standInMaxFramebuffer' unless it says otherwise
+-- ('limitFramebuffer').
 -- A readback buffer's memory, and its mapping, are the stand-in allocator's
 -- ("Test.GPU.Vulkan.Native.AllocatorStandIn"); the bytes behind a mapping are
 -- a byte string this stand-in keeps under the mapped address, made on the
@@ -29,6 +31,8 @@ module Test.GPU.Vulkan.Native.RecordingStandIn
   , standInImageLimits
   , limitBuffers
   , standInMaxBufferSize
+  , limitFramebuffer
+  , standInMaxFramebuffer
   ) where
 
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
@@ -111,6 +115,7 @@ data RecordingStandIn = RecordingStandIn
     -- of memory.
   , recordingSupport ∷ !(TVar (ImageQuery → Maybe ImageLimits))
   , recordingMaxBuffer ∷ !(TVar Natural)
+  , recordingMaxFramebuffer ∷ !(TVar (Word32, Word32))
   }
 
 newRecordingStandIn ∷ IO RecordingStandIn
@@ -126,6 +131,7 @@ newRecordingStandIn =
     <*> newTVarIO Map.empty
     <*> newTVarIO (const (Just standInImageLimits))
     <*> newTVarIO standInMaxBufferSize
+    <*> newTVarIO standInMaxFramebuffer
 
 -- | What every image is supported up to unless an example says otherwise.
 standInImageLimits ∷ ImageLimits
@@ -134,6 +140,15 @@ standInImageLimits = ImageLimits 16384 16384 15 (2 ^ (31 ∷ Int))
 -- | The largest buffer unless an example says otherwise: 1 GiB.
 standInMaxBufferSize ∷ Natural
 standInMaxBufferSize = 1024 * 1024 * 1024
+
+-- | The largest render area unless an example says otherwise: what every
+-- image is supported up to.
+standInMaxFramebuffer ∷ (Word32, Word32)
+standInMaxFramebuffer = (16384, 16384)
+
+-- | Have the device render into no area wider or taller than this from now on.
+limitFramebuffer ∷ RecordingStandIn → (Word32, Word32) → IO ()
+limitFramebuffer standIn most = atomically (writeTVar (recordingMaxFramebuffer standIn) most)
 
 -- | Answer every later image support query with this.
 supportImages ∷ RecordingStandIn → (ImageQuery → Maybe ImageLimits) → IO ()
@@ -258,6 +273,7 @@ recordingStandInOps standIn =
         journal standIn (QueriedSupport query)
         ($ query) <$> readTVarIO (recordingSupport standIn)
     , opsMaxBufferSize = readTVarIO (recordingMaxBuffer standIn)
+    , opsMaxFramebuffer = readTVarIO (recordingMaxFramebuffer standIn)
     , opsCreateView = \_ request → do
         handle ← fresh standIn
         handle <$ step standIn AtCreateView (CreatedView handle request)

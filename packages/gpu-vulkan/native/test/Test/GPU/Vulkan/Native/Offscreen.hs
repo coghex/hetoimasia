@@ -25,7 +25,7 @@ import Hetoimasia.GPU.Vulkan.Native.Presentation (SurfaceExtent (..), formatB8G8
 import Hetoimasia.GPU.Vulkan.Native.Recording
 import Test.GPU.Vulkan.Native.FramesRig
 import Test.GPU.Vulkan.Native.FramesStandIn
-import Test.GPU.Vulkan.Native.RecordingStandIn (RecordingCall (..), recordingCalls)
+import Test.GPU.Vulkan.Native.RecordingStandIn (RecordingCall (..), limitFramebuffer, recordingCalls)
 
 type Rec = Recorder () Int Int Text Int Word64
 
@@ -152,6 +152,22 @@ spec = describe "Offscreen color targets" $ do
           , Left (RefusedMisuse (WrongPhase ResourceIdentity))
           , Left (RefusedMisuse (ForeignIdentity ResourceIdentity))
           ]
+      after ← commandCount rig
+      after `shouldBe` before
+
+    it "refuses a target its image limits allow but the device's framebuffer limits do not, in width and in height, recording nothing" $ do
+      rig ← newRig
+      wide ← createImage (rigRecording rig) (ImageDescription ColorTarget Rgba8Srgb 8192 16 1) >>= either (fail . show) pure
+      tall ← createImage (rigRecording rig) (ImageDescription ColorTarget Rgba8Srgb 16 8192 1) >>= either (fail . show) pure
+      limitFramebuffer (rigRecordingStandIn rig) (4096, 4096)
+      frame ← owned rig
+      before ← commandCount rig
+      answer ← recordFrame (rigRecording rig) (ownedFrame frame) $ \recorder →
+        sequence
+          [ beginRenderingInto recorder wide ClearFromUndefined (ClearColor 0 0 0 1)
+          , beginRenderingInto recorder tall ClearFromUndefined (ClearColor 0 0 0 1)
+          ]
+      fmap snd answer `shouldBe` Right [Left (RefusedOutOfBounds 8192 4096), Left (RefusedOutOfBounds 8192 4096)]
       after ← commandCount rig
       after `shouldBe` before
 

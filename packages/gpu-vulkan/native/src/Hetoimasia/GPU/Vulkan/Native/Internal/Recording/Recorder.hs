@@ -727,7 +727,10 @@ data PassStart
 -- 'ClearFromUndefined' pass, or none while another batch initializes it. A
 -- dynamic-rendering attachment's view covers exactly one mip level, and the
 -- target's owned view covers them all, so a target of more than one mip level
--- is 'RefusedUnsupported'. Every refusal makes no native call. Pipelines, viewports and scissors are checked
+-- is 'RefusedUnsupported'. The target's extent, the render area, must lie
+-- within the device's framebuffer limits, which its image limits do not bound:
+-- a wider or taller one is 'RefusedOutOfBounds', naming its size and the
+-- limit. Every refusal makes no native call. Pipelines, viewports and scissors are checked
 -- against the target while the pass is open.
 beginRenderingInto ∷ Recorder q inst msgr phys dev cmd → Image → PassStart → ClearColor → IO (Either Refusal ())
 beginRenderingInto recorder (Image resource) start clear =
@@ -737,35 +740,41 @@ beginRenderingInto recorder (Image resource) start clear =
       Right (NativeImage description memory view)
         | imageKind description /= ColorTarget → pure (Left RefusedWrongKind)
         | imageMipLevels description /= 1 → pure (Left (RefusedUnsupported "rendering into a color target of more than one mip level"))
-        | otherwise → orderedSequence recorder $ \state →
-            if isJust (stateRendering state)
-              then Left (RefusedIllegal "rendering has already begun")
-              else
-                let kind = imageResourceKind ColorTarget
-                    stepped = case start of
-                      ClearTarget → Access.touch resource kind ColorAttachment KeepsContents (stateAccess state)
-                      ClearFromUndefined → Access.transition resource kind FromUndefined ColorAttachment (stateAccess state)
-                    extent = SurfaceExtent (imageWidth description) (imageHeight description)
-                    object = memoryResource memory
-                    image = Just (useAspect (imageKindUse ColorTarget), imageMipLevels description)
-                 in case stepped of
-                      Left refusal → Left (accessRefused refusal)
-                      Right (access, barriers) →
-                        Right
-                          ( state
-                              { stateAccess = access
-                              , stateObjects = Map.insert resource (object, image) (stateObjects state)
-                              , stateRendering = Just (Attachment extent (formatCode (imageFormat description)) (Just resource))
-                              }
-                          , [resource]
-                          , [ (resource, if barrierDiscards barrier then DiscardsContents else KeepsContents)
-                            | barrier ← barriers
-                            , barrierRole barrier == EntryBarrier
-                            ]
-                          , map (resourceBarrier object image) barriers
-                              <> [CommandBeginLabel (targetPassLabel (recorderBatch recorder) resource) | recorderLabelled recorder]
-                              <> [CommandBeginRendering view extent clear]
-                          )
+        | otherwise →
+          opsMaxFramebuffer (recordingOps recording) >>= \case
+            (widest, _)
+              | imageWidth description > widest → pure (Left (RefusedOutOfBounds (fromIntegral (imageWidth description)) (fromIntegral widest)))
+            (_, tallest)
+              | imageHeight description > tallest → pure (Left (RefusedOutOfBounds (fromIntegral (imageHeight description)) (fromIntegral tallest)))
+            _ → orderedSequence recorder $ \state →
+              if isJust (stateRendering state)
+                then Left (RefusedIllegal "rendering has already begun")
+                else
+                  let kind = imageResourceKind ColorTarget
+                      stepped = case start of
+                        ClearTarget → Access.touch resource kind ColorAttachment KeepsContents (stateAccess state)
+                        ClearFromUndefined → Access.transition resource kind FromUndefined ColorAttachment (stateAccess state)
+                      extent = SurfaceExtent (imageWidth description) (imageHeight description)
+                      object = memoryResource memory
+                      image = Just (useAspect (imageKindUse ColorTarget), imageMipLevels description)
+                   in case stepped of
+                        Left refusal → Left (accessRefused refusal)
+                        Right (access, barriers) →
+                          Right
+                            ( state
+                                { stateAccess = access
+                                , stateObjects = Map.insert resource (object, image) (stateObjects state)
+                                , stateRendering = Just (Attachment extent (formatCode (imageFormat description)) (Just resource))
+                                }
+                            , [resource]
+                            , [ (resource, if barrierDiscards barrier then DiscardsContents else KeepsContents)
+                              | barrier ← barriers
+                              , barrierRole barrier == EntryBarrier
+                              ]
+                            , map (resourceBarrier object image) barriers
+                                <> [CommandBeginLabel (targetPassLabel (recorderBatch recorder) resource) | recorderLabelled recorder]
+                                <> [CommandBeginRendering view extent clear]
+                            )
       Right _ → pure (Left RefusedWrongKind)
   where
     recording = recorderRecording recorder

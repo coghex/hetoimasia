@@ -1131,6 +1131,7 @@ renderingLayers events rendering clock =
         , opsCommandBufferHandle = id
         , opsImageSupport = \_ → pure (Just (ImageLimits 16384 16384 15 (2 ^ (31 ∷ Int))))
         , opsMaxBufferSize = pure (1024 * 1024 * 1024)
+        , opsMaxFramebuffer = pure (16384, 16384)
         , opsCreateView = \_ request → do
             handle ← fresh
             handle <$ record events (OwnedViewMade handle (requestViewImage request))
