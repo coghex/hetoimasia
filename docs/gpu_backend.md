@@ -2208,6 +2208,8 @@ asked for and the limit, and nothing is made:
 - the four samplers against `maxDescriptorSetUpdateAfterBindSamplers`;
 - a stage's every table binding (the cap, four samplers and the lookup
   buffer) against `maxPerStageUpdateAfterBindResources`;
+- set 0's pool, the four samplers and the initial images, against
+  `maxUpdateAfterBindDescriptorsInAllPools`;
 - the two sets against `maxBoundDescriptorSets`;
 - one version's bytes against `maxStorageBufferRange`;
 - the last version's dynamic offset against what 32 bits hold;
@@ -2246,7 +2248,10 @@ anything else back:
    whose upload is admitted through the session's uploads.
 
 If any step is refused or raises, every generation made so far is
-released, and the ordinary disposal destroys it. A destruction that raises
+released, and the ordinary disposal destroys it. The construction runs
+masked from the first creation to the table's publication, so a
+cancellation lands only inside a step, after which the unwinding sees every
+generation made before, or once the table holds them all. A destruction that raises
 is retained, never retried, and fails the session with `CleanupFailed`, as
 for any managed resource. The table can be bound once the placeholder's upload has completed and its
 descriptor has been written; until then binding is `RefusedNotWritten`.
@@ -2442,11 +2447,15 @@ cover:
 - new table work refused, and nothing written, after the session fails,
   while a release still completes;
 - a construction failing part-way leaving only whole generations, whose
-  failed destruction is retained and fails the session.
+  failed destruction is retained and fails the session;
+- a cancellation aimed at the owner during the first sampler's creation
+  leaving every generation released or held by the published table;
+- the total update-after-bind pool limit checked before anything is made.
 
 A mutation check that ignored version holds failed the three hold-dependent
 examples, and one that left the version's images out of the batch's
-references failed the retirement example. The device-profile examples refuse a device missing any of the six
+references failed the retirement example, and one that ran the
+construction unmasked failed the cancellation example. The device-profile examples refuse a device missing any of the six
 features, by name. The shader suite checks that `tableShaders`' SPIR-V
 declares exactly the table's three bindings and matches its descriptions.
 
