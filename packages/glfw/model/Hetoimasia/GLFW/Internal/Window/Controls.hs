@@ -33,6 +33,10 @@
 -- promises nothing about the window manager's convergence. A control changes no
 -- mode and never changes the window's mode transition marker.
 --
+-- A hide runs the window's hide guard ('guardWindowHide') after every check
+-- above has admitted it and immediately before its native call, so the guard
+-- runs exactly when the call is about to be made.
+--
 -- A constraint update marks the window's preserved windowed constraints
 -- indeterminate before its first call and known only after every call returned
 -- without a report. A size is validated against those constraints only while
@@ -121,7 +125,7 @@ applyControl window control = case control of
   PositionControl x y → single (nativeSetWindowPosition native handle (fromIntegral x) (fromIntegral y))
   ConstraintsControl constraints → applyConstraints window constraints
   ShowControl → single (nativeShowWindow native handle)
-  HideControl → single (nativeHideWindow native handle)
+  HideControl → windowBeforeHide window >> single (nativeHideWindow native handle)
   FocusControl → single (nativeFocusWindow native handle)
   AttentionControl → single (nativeRequestWindowAttention native handle)
   MinimizeControl → single (nativeIconifyWindow native handle)

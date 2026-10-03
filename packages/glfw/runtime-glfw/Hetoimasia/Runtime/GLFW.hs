@@ -112,7 +112,10 @@
 -- and neither warns about nor resumes a feed; native input and that owner-loop
 -- integration arrive with GLFW-12. 'withHostWindow' lends a window to an owner-thread callback it
 -- must not escape; no public operation returns a window or reaches the
--- collection.
+-- collection. A hide made through a lent window, as by
+-- 'Hetoimasia.GLFW.Command.performWindowCommand', withholds the presentation of
+-- the window's graphics attachment before its native call, exactly as a hide
+-- through the host's ports does (#368).
 --
 -- A creation command, admitted only through 'hostCommandPort', checks the
 -- configuration, the limit, and poisoning before any native effect, each a typed

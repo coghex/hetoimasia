@@ -130,6 +130,7 @@ import Control.Concurrent.STM
   )
 import Control.Exception (Exception, ExceptionWithContext (ExceptionWithContext), SomeException, fromException, rethrowIO, throwIO, try, tryWithContext, uninterruptibleMask_)
 import Control.Monad (void, when)
+import Control.Monad.IO.Class (liftIO)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import qualified Data.Vector as Vector
@@ -153,6 +154,7 @@ import Foreign.Ptr (Ptr, nullPtr, plusPtr)
 import Hetoimasia.Foundation.Log (Logger, callbackSink, defaultLogFilter, mkLoggerWith, systemMetadata)
 import Hetoimasia.Foundation.Messaging.Payload (prepare)
 import qualified Hetoimasia.Foundation.Worker as Worker
+import Hetoimasia.GLFW.Session (Session)
 import Hetoimasia.GLFW.Seam
   ( NativeCall (HideWindow, ShowWindow)
   , Seam
@@ -1281,6 +1283,10 @@ data Rig = Rig
     -- ^ When the host creates the session's device.
   , rigActionCapacity ∷ !Natural
     -- ^ How many owner-thread actions may be queued at once.
+  , rigSession ∷ !(TVar (Maybe Session))
+    -- ^ The session the host was given, once it has been made: what a direct
+    -- command host is built over, as an application that supplies its own
+    -- session to 'Hetoimasia.Runtime.GLFW.withGraphicsOwnerHostIn' holds it.
   }
 
 -- | Make the capture's sink raise on every record it is given from now on.
@@ -1427,6 +1433,7 @@ newRigClocked visible windows clock = do
   nudges ← newTVarIO 0
   events ← newTVarIO []
   owner ← newTVarIO Nothing
+  session ← newTVarIO Nothing
   posts ← newTVarIO (0 ∷ Int)
   seam ←
     newSeam
@@ -1511,6 +1518,7 @@ newRigClocked visible windows clock = do
       , rigFrameHook = frameHook
       , rigDeviceStart = DeviceAtFirstSurface
       , rigActionCapacity = defaultActionCapacity
+      , rigSession = session
       }
 
 -- | Run a whole Vulkan graphics host under the application runner, on a bound
@@ -1576,7 +1584,11 @@ runRigHere rig body = do
             (renderingLayers (rigJournal rig) (rigRendering rig) (rigClock rig))
             instanceAddress
             (surfaceBridge (rigJournal rig) (rigBridge rig))
-            (seamIntegratedSession (rigSeam rig) integration)
+            ( \settings → do
+                session ← seamIntegratedSession (rigSeam rig) integration settings
+                liftIO (atomically (writeTVar (rigSession rig) (Just session)))
+                pure session
+            )
             requiredInstanceExtensions
             config {vulkanOwner = \owner → timed (maybe owner (\capacity → owner {ownerEventCapacity = capacity}) (rigPortCapacity rig))}
             (\host → atomically (writeTVar (rigOwner rig) (Just (vulkanGraphicsOwner host))) >> use host)

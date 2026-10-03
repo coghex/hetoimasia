@@ -65,6 +65,17 @@
 -- +---------------------+---------------+----------------------------+-------------+---------------------+--------------------------+
 --
 -- None of this is application state.
+--
+-- = The hide guard
+--
+-- One field is not a cell: 'windowBeforeHide', an owner-thread action a hide
+-- control runs immediately before its native call. A handle built by
+-- "Hetoimasia.GLFW.Internal.Window.Construction" carries none. A component
+-- that knows more about the window than this package does — the protected
+-- host's graphics attachments (#368) — lends a copy carrying its own action
+-- with 'guardWindowHide'. The copy shares every cell above, so it is the same
+-- window in every respect but this one, and the action is the lender's, not
+-- the window's: a lender that installs none leaves hides exactly as they are.
 module Hetoimasia.GLFW.Internal.Window.State
   ( -- * The window handle
     Window (..)
@@ -75,6 +86,7 @@ module Hetoimasia.GLFW.Internal.Window.State
   , windowNativeHandle
   , attachWindowInputFeed
   , windowInputFeed
+  , guardWindowHide
 
     -- * The owner's state
   , OwnerState (..)
@@ -123,6 +135,9 @@ data Window = Window
   , windowControl ∷ !(IORef ControlState)
   , windowPublisher ∷ !(SnapshotPublisher WindowObservation)
   , windowFeed ∷ !(IORef (Maybe InputFeed))
+  , windowBeforeHide ∷ !(IO ())
+    -- ^ Run on the owner thread immediately before a hide control's native
+    -- call, once every check has admitted it; see 'guardWindowHide'.
   }
 
 -- | What an operation through a handle produced.
@@ -154,6 +169,15 @@ attachWindowInputFeed window = atomicWriteIORef (windowFeed window) . Just
 -- | The feed last attached, if any.
 windowInputFeed ∷ Window → IO (Maybe InputFeed)
 windowInputFeed window = readIORef (windowFeed window)
+
+-- | The same window, whose hide controls run this action, on the owner thread,
+-- immediately before their native call and after every check that could refuse
+-- them. A control refused, unsupported, or not attempted runs nothing; one
+-- that raises out of the action makes no native call, and the failure
+-- propagates. The action replaces any the handle already carried. It must
+-- return finitely and pump no native events.
+guardWindowHide ∷ IO () → Window → Window
+guardWindowHide action window = window {windowBeforeHide = action}
 
 -- | The owner's current observation and the last close request number issued.
 data OwnerState = OwnerState !WindowObservation !Natural

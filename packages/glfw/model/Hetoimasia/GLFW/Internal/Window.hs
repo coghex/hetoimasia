@@ -126,6 +126,7 @@ module Hetoimasia.GLFW.Internal.Window
   , windowCallbackOperation
   , attachWindowInputFeed
   , windowInputFeed
+  , guardWindowHide
   , inputStagingCapacity
   ) where
 
@@ -179,6 +180,7 @@ import Hetoimasia.GLFW.Internal.Window.State
   ( Window
   , WindowResult (..)
   , attachWindowInputFeed
+  , guardWindowHide
   , inputStagingCapacity
   , setModeTransition
   , windowCallbackOperation

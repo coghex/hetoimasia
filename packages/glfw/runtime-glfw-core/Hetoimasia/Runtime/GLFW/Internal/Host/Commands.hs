@@ -11,7 +11,9 @@
 -- A hide is the one control that consults a window's graphics attachment
 -- first: the attachment's protocol withholds its presentation before the
 -- native call ('protocolBeforeHide'), so no owner presents to a window the
--- compositor has unmapped (#357).
+-- compositor has unmapped (#357). A hide made directly, through a window
+-- 'Hetoimasia.Runtime.GLFW.Internal.Host.Windows.withHostWindow' lends, takes
+-- the same hold through the lent window's hide guard (#368).
 module Hetoimasia.Runtime.GLFW.Internal.Host.Commands
   ( dispatchCommands
   , queuedCommands
@@ -51,8 +53,7 @@ import Hetoimasia.GLFW.Session (SessionMisuse (SessionPoisoned))
 import Hetoimasia.GLFW.Window (WindowConfig, WindowId, validateWindowConfig)
 import Hetoimasia.Runtime.GLFW.Internal.Host.Config (HostConfig (..))
 import Hetoimasia.Runtime.GLFW.Internal.Host.State (HostEntry (..), PortKey (..), WindowHost (..))
-import Hetoimasia.Runtime.GLFW.Internal.Host.Windows (CloseStart (..), beginClose, borrowWindow, registerWindow)
-import Hetoimasia.Runtime.GLFW.Internal.Retirement (AttachmentProtocol (..), windowAttachmentProtocol)
+import Hetoimasia.Runtime.GLFW.Internal.Host.Windows (CloseStart (..), beginClose, borrowWindow, registerWindow, withholdBeforeHide)
 import Numeric.Natural (Natural)
 
 bookkeepingOperation ∷ Operation
@@ -169,17 +170,14 @@ executeHostCommand host _ = \case
 -- window was unmapped is unknown. Any other control, and a window with no
 -- attachment, runs unchanged.
 beforeUnmapping ∷ WindowHost → WindowId → WindowControl → IO Disposition → IO Disposition
-beforeUnmapping host target control run = case (control, hostRetirementState host) of
-  (HideControl, Just retirement) →
-    atomically (windowAttachmentProtocol retirement target) >>= \case
-      Nothing → run
-      Just (attachment, protocol) → do
-        lift ← protocolBeforeHide protocol attachment
-        disposition ← run
-        case disposition of
-          Attempted _ → pure ()
-          _ → lift
-        pure disposition
+beforeUnmapping host target control run = case control of
+  HideControl → do
+    lift ← withholdBeforeHide host target
+    disposition ← run
+    case disposition of
+      Attempted _ → pure ()
+      _ → lift
+    pure disposition
   _ → run
 
 -- | What the host holds, for bounding checks: every count is proportional to the

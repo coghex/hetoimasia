@@ -210,6 +210,7 @@ windowAssembly session config = do
           , windowControl = control
           , windowPublisher = publisher
           , windowFeed = feed
+          , windowBeforeHide = pure ()
           }
   forM_ (windowStartupMode config) (restoredStep . startWindowMode window)
   pure window

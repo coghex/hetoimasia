@@ -16,6 +16,7 @@ module Hetoimasia.Runtime.GLFW.Internal.Host.Windows
     -- * Borrowing
   , withHostWindow
   , borrowWindow
+  , withholdBeforeHide
 
     -- * Registration
   , registerWindow
@@ -55,6 +56,7 @@ import Hetoimasia.GLFW.Internal.Session (ownerOperation)
 import Hetoimasia.GLFW.Internal.Window
   ( attachWindowInputFeed
   , beginWindowClosing
+  , guardWindowHide
   , reconcileWindowEvents
   , rejectCloseRequest
   , windowAssembly
@@ -77,9 +79,11 @@ import Hetoimasia.Runtime.GLFW.Internal.Host.Config (HostConfig (..))
 import Hetoimasia.Runtime.GLFW.Internal.Host.Progress (markRetirementImmediate, refreshGraphicsCells)
 import Hetoimasia.Runtime.GLFW.Internal.Host.State (HostEntry (..), HostHooks (..), WindowHost (..), windowIdentifiers)
 import Hetoimasia.Runtime.GLFW.Internal.Retirement
-  ( forgetRetiredWindow
+  ( AttachmentProtocol (..)
+  , forgetRetiredWindow
   , recordClosingWindow
   , recordRegisteredWindow
+  , windowAttachmentProtocol
   , windowRetirementVeto
   )
 
@@ -109,12 +113,38 @@ hostWindowClient host target = fmap entryClient . Map.lookup target <$> readTVar
 -- retired: a close protocol begun meanwhile defers retirement until every
 -- borrow has ended. Refuses other threads with
 -- 'Hetoimasia.GLFW.Session.NotSessionOwner'.
+--
+-- A hide made through the lent window — 'Hetoimasia.GLFW.Command.performWindowCommand'
+-- with 'Hetoimasia.GLFW.Command.hideWindowCommand', or any other control route
+-- — withholds the presentation of the window's graphics attachment before its
+-- native call, as a hide through the host's ports does ('withholdBeforeHide',
+-- #368). The attachment is the one occupying the window's slot when the hide
+-- is about to be made, whatever its phase, so a window detached or reattached
+-- while lent is protected by the attachment it has then.
 withHostWindow ∷ WindowHost → WindowId → (Window → IO r) → IO (WindowResult r)
 withHostWindow host target action =
   ownerOperation (hostSession host) borrowOperation (windowIdentifiers target) $
     readTVarIO (hostEntries host) >>= \entries → case Map.lookup target entries of
       Nothing → pure (WindowEnded target)
-      Just entry → WindowAvailable <$> borrowWindow host target entry action
+      Just entry → WindowAvailable <$> borrowWindow host target entry (action . guarded)
+  where
+    guarded = guardWindowHide (void (withholdBeforeHide host target))
+
+-- | Have the graphics attachment occupying a window's slot, if any, withhold
+-- its presentation before the window is hidden natively, on the owner thread,
+-- and answer the action that lifts that hold again for a hide that made no
+-- native call. The hold outlives the native call: the owner presents to the
+-- window again only once an observation newer than the one it had when the
+-- hold began is published, and the hidden window's is (#357). A window with no
+-- attachment, and every window of an ordinary host, hold nothing, and the
+-- answer lifts nothing.
+withholdBeforeHide ∷ WindowHost → WindowId → IO (IO ())
+withholdBeforeHide host target = case hostRetirementState host of
+  Nothing → pure (pure ())
+  Just retirement →
+    atomically (windowAttachmentProtocol retirement target) >>= \case
+      Nothing → pure (pure ())
+      Just (attachment, protocol) → protocolBeforeHide protocol attachment
 
 borrowWindow ∷ WindowHost → WindowId → HostEntry → (Window → IO r) → IO r
 borrowWindow host target entry action =
