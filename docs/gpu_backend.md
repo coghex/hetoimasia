@@ -1709,6 +1709,16 @@ count. A fragment shader's inputs and outputs and a vertex shader's outputs are
 varyings, which the validation layer checks at pipeline creation, and built-ins
 are the device's: it reports neither.
 
+**What the reader guarantees (owner amendment, 2026-10-03).** The reader's
+input is SPIR-V from the pinned compiler, which is what every splice hands it.
+Over that input it retains every structural check below, every regression that
+proves one, and the compile-time match of a shader's interface against its
+description. Exhaustive semantic validation of arbitrary SPIR-V — everything a
+validator such as spirv-val checks — is explicitly out of scope: that is a
+disclosed narrowing of the earlier guarantee that any malformed interface is
+refused. What the reader does check, it checks completely, and a module it
+does not support is refused with a diagnostic, never read as empty or matching.
+
 Before it reads anything, the reader checks every instruction it consumes
 against one explicit whitelist, the subset it supports:
 
@@ -1754,7 +1764,20 @@ against one explicit whitelist, the subset it supports:
   it requires, from its struct down through a descriptor array of blocks:
   every struct member an Offset, every array and runtime-sized array an
   ArrayStride, and every matrix member, or array of them, a MatrixStride and
-  RowMajor or ColMajor.
+  RowMajor or ColMajor;
+- and those layout values obey the block layout matched to the device profile
+  the roots create, which enables Vulkan 1.1's relaxed block layout (always
+  on) and neither `scalarBlockLayout` nor `uniformBufferStandardLayout`: a
+  Uniform block is std140, and a StorageBuffer block, a Uniform `BufferBlock`
+  and a PushConstant block are std430. A vector member is aligned to its
+  scalar; every other member to its base alignment, or under std140 its
+  extended alignment (an array's, struct's or matrix's, rounded up to 16). A
+  vector of at most 16 bytes does not straddle a 16-byte boundary and a larger
+  one starts on one; an ArrayStride is a multiple of its array's alignment and
+  holds its element; a MatrixStride is a multiple of its matrix's alignment;
+  no member overlaps another; and none starts between the end of a struct,
+  array or matrix and the next multiple of that one's alignment. Enabling
+  either layout feature would be a new device requirement, and is not one.
 
 The first instruction that fails is an error naming it, the rule it breaks and
 the variable that reaches it. A module the reader cannot read, or a supported
@@ -1820,7 +1843,11 @@ rejecting mutation of a valid fixture for every whitelist rule — types,
 constants, decorations, layout, variable declarations, the entry point and the
 id bound — with a too-many and a too-few operand count for every fixed-count
 opcode, and an Output variable with a null initializer of its own type read
-exactly as without one; a fragment shader reading gl_FrontFacing and
+exactly as without one; a fixture holding std430 push constants beside a
+std140 uniform block and a std430 storage buffer, read as the compiler laid
+them out, and refused at each layout rule its mutations break — including a
+float array of stride 4 and an array at offset 132, which std430 takes and
+std140 does not; a fragment shader reading gl_FrontFacing and
 gl_HelperInvocation read as interface-free from its compiled fixture and
 through an unchecked splice; and no interface in
 the interface-free verification pair. Matching checked shaders in the source
