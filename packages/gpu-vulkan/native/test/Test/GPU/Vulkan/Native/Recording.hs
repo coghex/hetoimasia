@@ -971,7 +971,7 @@ spec = describe "Recording" $ do
                    , (0x01, UsageStaging)
                    ]
       map imageKindUse [minBound .. maxBound]
-        `shouldBe` [ ImageUse (0x04 .|. 0x02) (0x0001 .|. 0x8000) UsageTexture 0x1
+        `shouldBe` [ ImageUse (0x04 .|. 0x02 .|. 0x01) (0x0001 .|. 0x8000 .|. 0x4000) UsageTexture 0x1
                    , ImageUse 0x20 0x0200 UsageTexture 0x2
                    , ImageUse (0x10 .|. 0x01) (0x0080 .|. 0x4000) UsageTexture 0x1
                    ]
@@ -1301,6 +1301,7 @@ spec = describe "Recording" $ do
       [scope (imageResourceKind kind) use | kind ← [minBound .. maxBound], use ← legalUses (imageResourceKind kind)]
         `shouldBe` [ (0x80, 0x100000000, Just 5)
                    , (0x1000, 0x1000, Just 7)
+                   , (0x1000, 0x800, Just 6)
                    , (0x300, 0x600, Just 1000241000)
                    , (0x400, 0x180, Just 2)
                    , (0x1000, 0x800, Just 6)

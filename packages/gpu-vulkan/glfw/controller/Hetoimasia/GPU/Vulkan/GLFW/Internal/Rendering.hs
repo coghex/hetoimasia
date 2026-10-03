@@ -128,6 +128,14 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
   , renderingDeadline
   , pollDue
 
+    -- * Uploads (GRS-6)
+  , UploadsUnavailable (..)
+  , makeRenderingUploads
+  , progressRenderingUploads
+  , renderingUploadsWaiting
+  , submitRenderingUpload
+  , cancelRenderingUpload
+
     -- * Retirement
   , prepareTargetRetirement
   , retireTargetRendering
@@ -291,6 +299,22 @@ import Hetoimasia.GPU.Vulkan.Native.Roots
   , readRootsModel
   , readRootsTerminal
   , stateRootsModel
+  )
+import Hetoimasia.GPU.Vulkan.Native.Uploads
+  ( CancelRefusal (CancelUnknown)
+  , UploadConfig
+  , UploadProgress (..)
+  , UploadRefusal
+  , UploadRequest
+  , UploadTicket
+  , Uploads
+  , cancelUpload
+  , closeUploads
+  , newUploads
+  , progressUploads
+  , retireUploads
+  , submitUpload
+  , uploadsWaiting
   )
 import Hetoimasia.Runtime.GLFW (AttachmentId, OwnerDemand (..))
 
@@ -671,7 +695,21 @@ data Rendering q inst msgr phys dev cmd = Rendering
     -- this module makes, releases and destroys.
   , renderingEscape ∷ !(TVar (Maybe (ExceptionWithContext SomeException)))
     -- ^ The lent construction's record of a failure that escaped it.
+  , renderingUploads ∷ !(TVar (UploadsStanding q inst msgr phys dev cmd))
+    -- ^ The session's uploads (GRS-6): made by the owner's progress once the
+    -- recording and the frames exist; any thread admits into them.
   }
+
+-- | Where the session's uploads stand.
+data UploadsStanding q inst msgr phys dev cmd
+  = UploadsUnconfigured
+    -- ^ The host configured none.
+  | UploadsPending !UploadConfig
+    -- ^ Configured, and not yet made: the device does not exist yet.
+  | UploadsMade !(Uploads q inst msgr phys dev cmd)
+  | UploadsRefused !Refusal
+    -- ^ The device refused them: the turn budget holds no block row of its
+    -- widest level, or the staging buffer could not be made.
 
 newRendering
   ∷ Roots q inst msgr phys dev
@@ -679,8 +717,9 @@ newRendering
   → RenderingOps phys dev cmd
   → FrameObserver
   → Captures
+  → Maybe UploadConfig
   → IO (Rendering q inst msgr phys dev cmd)
-newRendering roots generations ops observer captures =
+newRendering roots generations ops observer captures uploads =
   Rendering roots generations ops
     <$> newTVarIO Nothing
     <*> newTVarIO Map.empty
@@ -690,6 +729,7 @@ newRendering roots generations ops observer captures =
     <*> pure observer
     <*> pure captures
     <*> newTVarIO Nothing
+    <*> newTVarIO (maybe UploadsUnconfigured UploadsPending uploads)
 
 -- | The recording and the frames, made the first time they are needed once
 -- the device exists, on the owner's thread, which is what makes it their
@@ -1282,6 +1322,76 @@ endCaptures rendering = do
   where
     captures = renderingCaptures rendering
 
+-- ---------------------------------------------------------------------------
+-- Uploads (GRS-6)
+
+-- | Why the session takes no upload now.
+data UploadsUnavailable
+  = UploadsNotConfigured
+    -- ^ The host configured no uploads.
+  | UploadsNotReady
+    -- ^ Configured, and not yet made: the device does not exist yet.
+  | UploadsRefusedBy !Refusal
+    -- ^ The device refused them when they were made.
+  deriving (Eq, Show)
+
+-- | Make the session's uploads, on the owner's thread, the first time the
+-- recording and the frames exist, if configured: an owner step does this
+-- before it runs any owner-thread action, so an action's uploads find them.
+-- Answers whether it made, or was refused, them now.
+makeRenderingUploads ∷ Rendering q inst msgr phys dev cmd → IO Bool
+makeRenderingUploads rendering =
+  readTVarIO (renderingUploads rendering) >>= \case
+    UploadsPending config →
+      live rendering >>= \case
+        Nothing → pure False
+        Just made → do
+          made' ← newUploads (liveFrames made) config
+          True <$ atomically (writeTVar (renderingUploads rendering) (either UploadsRefused UploadsMade made'))
+    _ → pure False
+
+-- | One owner step's uploads, on the owner's thread, after the step has
+-- polled the fences, so a completion it observed settles its upload in the
+-- same step: closed — every upload not yet started cancelled — once the
+-- owner's admission has, and otherwise progressed ('progressUploads').
+-- Answers whether anything was recorded or settled.
+progressRenderingUploads ∷ Rendering q inst msgr phys dev cmd → Bool → IO Bool
+progressRenderingUploads rendering open =
+  readTVarIO (renderingUploads rendering) >>= \case
+    UploadsMade uploads → progressMade uploads
+    _ → pure False
+  where
+    progressMade uploads = do
+      unless open (atomically (closeUploads uploads))
+      progressUploads uploads >>= \case
+        Right step → pure (progressAdvanced step)
+        Left _ → pure False
+
+-- | Whether an upload waits for the owner: any thread may ask, and the
+-- owner's wake does.
+renderingUploadsWaiting ∷ Rendering q inst msgr phys dev cmd → STM Bool
+renderingUploadsWaiting rendering =
+  readTVar (renderingUploads rendering) >>= \case
+    UploadsMade uploads → uploadsWaiting uploads
+    _ → pure False
+
+-- | Admit an upload from any thread ('submitUpload'), once the session's
+-- uploads exist.
+submitRenderingUpload ∷ Rendering q inst msgr phys dev cmd → UploadRequest → IO (Either (Either UploadsUnavailable UploadRefusal) UploadTicket)
+submitRenderingUpload rendering request =
+  readTVarIO (renderingUploads rendering) >>= \case
+    UploadsMade uploads → either (Left . Right) Right <$> submitUpload uploads request
+    UploadsUnconfigured → pure (Left (Left UploadsNotConfigured))
+    UploadsPending _ → pure (Left (Left UploadsNotReady))
+    UploadsRefused refusal → pure (Left (Left (UploadsRefusedBy refusal)))
+
+-- | Cancel an upload from any thread ('cancelUpload').
+cancelRenderingUpload ∷ Rendering q inst msgr phys dev cmd → UploadTicket → STM (Either CancelRefusal ())
+cancelRenderingUpload rendering ticket =
+  readTVar (renderingUploads rendering) >>= \case
+    UploadsMade uploads → cancelUpload uploads ticket
+    _ → pure (Left CancelUnknown)
+
 -- | Retire the recording, releasing and destroying every managed resource
 -- left, before the device is destroyed. Raises, retaining them, if any
 -- remains.
@@ -1298,7 +1408,16 @@ retireRendering rendering now =
   readTVarIO (renderingLive rendering) >>= \case
     Nothing → pure ()
     Just made → do
+      uploads ← readTVarIO (renderingUploads rendering)
+      -- Uploads not yet started are cancelled before the drain, and those
+      -- started are settled with the frame-less work it drains (GRS-6).
+      case uploads of
+        UploadsMade held → atomically (closeUploads held)
+        _ → pure ()
       drain (liveFrames made) (0 ∷ Natural)
+      case uploads of
+        UploadsMade held → void (retireUploads held)
+        _ → pure ()
       retireFrameless (liveFrames made)
       retireRecording (liveRecording made) now
   where

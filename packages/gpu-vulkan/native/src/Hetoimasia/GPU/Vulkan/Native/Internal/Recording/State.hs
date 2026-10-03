@@ -95,8 +95,11 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
 import Control.Concurrent (ThreadId, myThreadId)
 import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVar, newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import Control.Exception (Exception (displayException), SomeAsyncException, SomeException, fromException, throwIO)
+import Data.ByteString (ByteString)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
+import Data.Set (Set)
+import qualified Data.Set as Set
 import Data.Maybe (isJust)
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -245,6 +248,19 @@ data Recording q inst msgr phys dev cmd = Recording
   , recordingBatches ∷ !(TVar (Map BatchId BatchRecord))
   , recordingRing ∷ !(TVar (Maybe RingState))
     -- ^ The session's shared ring (GRS-4), once made.
+  , recordingUploading ∷ !(TVar (Set ResourceId))
+    -- ^ The targets of uploads not yet complete (GRS-6): no batch but their
+    -- uploads' own may touch one, and none is destroyed, until its upload
+    -- has settled. The session's uploads add and remove them; any thread
+    -- may read them.
+  , recordingReleaseDeferred ∷ !(TVar (Set ResourceId))
+    -- ^ Upload targets their owners released while an upload still held them
+    -- (GRS-6): already recordable no longer, and released in the model once
+    -- that upload settles, so its later copies are not stranded.
+  , recordingIndexData ∷ !(TVar (Map ResourceId ByteString))
+    -- ^ What a completed upload wrote into each managed index buffer, so an
+    -- indexed draw through one can bound its vertex reads (GRS-6). Kept with
+    -- the generation, and forgotten with its disposal.
   }
 
 -- | The recording's state, owned by the calling thread. The public
@@ -258,7 +274,14 @@ makeRecording
   → IO (Recording q inst msgr phys dev cmd)
 makeRecording ops roots generations = do
   thread ← myThreadId
-  Recording ops roots generations thread <$> newTVarIO Map.empty <*> newTVarIO Map.empty <*> newTVarIO Map.empty <*> newTVarIO Nothing
+  Recording ops roots generations thread
+    <$> newTVarIO Map.empty
+    <*> newTVarIO Map.empty
+    <*> newTVarIO Map.empty
+    <*> newTVarIO Nothing
+    <*> newTVarIO Set.empty
+    <*> newTVarIO Set.empty
+    <*> newTVarIO Map.empty
 
 -- | Why an operation made no native call.
 data Refusal
