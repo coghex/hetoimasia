@@ -84,6 +84,7 @@ import Control.Exception
   , asyncExceptionToException
   , bracket
   , bracket_
+  , mask
   , mask_
   , rethrowIO
   , tryWithContext
@@ -147,25 +148,41 @@ boundedIt settings requirement test = do
 -- | Run one example under this bound, on a thread of its own, failing it with
 -- "the example did not finish within its bound" if the bound expires first.
 --
--- If the calling thread is itself interrupted while it waits — an enclosing
--- bound cancelling it — this example is rescued and cancelled the same way
--- before the interruption is rethrown.
+-- The whole lifetime is masked from the moment the example's thread exists,
+-- and only the waits are interruptible, so every way out passes through
+-- rescue when anything of the example's may still be running:
+--
+-- * the bound expires: rescue, then fail as not having finished;
+-- * the calling thread is interrupted — an enclosing bound cancelling it,
+--   while this bound is starting or waiting: rescue, then rethrow the
+--   interruption;
+-- * the example's thread ends while a rig run it started on a thread of its
+--   own is still under way: rescue, then report the example's own failure,
+--   or, if it returned, that it left a run behind.
 runBounded ∷ BoundSettings → String → IO () → IO ()
 runBounded settings name test = do
   scope ← BoundScope <$> newTVarIO False <*> newTVarIO Map.empty
   expired ← boundExpiry settings
-  bracket (enter scope) leave $ \_ → do
+  bracket (enter scope) leave $ \_ → mask $ \restore → do
     result ← newEmptyTMVarIO
-    worker ← mask_ $ forkIOWithUnmask (\unmask → tryWithContext @SomeException (unmask test) >>= atomically . putTMVar result)
-    boundStarted settings worker
-    waited ← tryWithContext (atomically ((Just <$> readTMVar result) `orElse` (Nothing <$ expired)))
+    worker ← forkIOWithUnmask (\unmask → tryWithContext @SomeException (unmask test) >>= atomically . putTMVar result)
+    let settle = rescue settings name scope worker (void (readTMVar result))
+    waited ← tryWithContext . restore $ do
+      boundStarted settings worker
+      atomically ((Just <$> readTMVar result) `orElse` (Nothing <$ expired))
     case waited of
-      Right (Just finished) → either rethrowIO pure finished
+      Right (Just finished) → do
+        outstanding ← not . Map.null <$> readTVarIO (scopeThreads scope)
+        if not outstanding
+          then either rethrowIO pure finished
+          else do
+            settle
+            either rethrowIO (\() → expectationFailure "the example ended with a rig run of its own still under way") finished
       Right Nothing → do
-        rescue settings name scope worker (void (readTMVar result))
+        settle
         expectationFailure "the example did not finish within its bound"
       Left interrupted → do
-        rescue settings name scope worker (void (readTMVar result))
+        settle
         rethrowIO (interrupted ∷ ExceptionWithContext SomeException)
   where
     enter scope = atomically (stateTVar currentCell (\enclosing → (enclosing, Just scope)))
@@ -202,7 +219,7 @@ rescue settings name scope worker ended = do
     mapM_ joined cancellers
     readTVar (scopeThreads scope) >>= check . Map.null
   atomically (writeTVar settled True)
-  atomically (joined watchdog)
+  uninterruptibleMask_ (atomically (joined watchdog))
   where
     joined done = readTVar done >>= check
 

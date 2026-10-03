@@ -8,10 +8,12 @@
 -- journal and from the threads involved, never from timing.
 module Test.GPU.Vulkan.GLFW.Rescue (spec) where
 
-import Control.Concurrent (ThreadId, forkIO, myThreadId, yield)
-import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, writeTVar)
-import Control.Exception (SomeException, displayException, throwIO, try, uninterruptibleMask_)
-import Control.Monad (void)
+import Control.Concurrent (ThreadId, forkIO, killThread, myThreadId, yield)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, stateTVar, writeTVar)
+import Control.Exception (AsyncException (ThreadKilled), SomeException, displayException, fromException, throwIO, try, uninterruptibleMask_)
+import Control.Monad (void, when)
+import Data.Maybe (fromMaybe, isNothing)
 import Data.List (isInfixOf, isSubsequenceOf, nub)
 import GHC.Conc (ThreadStatus (..), threadStatus)
 
@@ -43,6 +45,8 @@ spec = describe "the fixture-aware example bound" $ do
   itBounded "names the example to its last resort when it has not ended within the grace, a blocked cancellation notwithstanding, and settles every thread it started" testLastResort
   itBounded "keeps its last resort armed while a rig run on a thread of the example's own outlives the example's thread, its cancellation held off" testRunOutlivesExample
   itBounded "keeps a timer hook installed while an earlier one was running, when the earlier one answers" testHookReplacedWhileRunning
+  itBounded "rescues and settles an example whose bound is cancelled while it is still starting, before rethrowing the cancellation" testCancelledWhileStarting
+  itBounded "rescues and settles a rig run of the example's own before reporting the example's own failure" testFailureWithRunOutstanding
 
 -- | A blocked example: a frame presented, its presentation never retired, the
 -- scripted clock never moved, and the body then waiting on something nothing
@@ -214,6 +218,63 @@ testHookReplacedWhileRunning = do
     presentationsRetire rig True
     advanceClock rig 60000
   readTVarIO secondRan `shouldReturn` True
+
+-- | An enclosing cancellation reaches the bound while it is still reporting
+-- the example's thread, before it waits. The example is still rescued and
+-- cancelled, and has ended by the time the cancellation is rethrown.
+testCancelledWhileStarting ∷ IO ()
+testCancelledWhileStarting = do
+  (controls, base) ← scriptedBound
+  reported ← newTVarIO Nothing
+  starting ← newTVarIO False
+  release ← newTVarIO False
+  never ← newTVarIO False
+  done ← newEmptyMVar
+  let settings =
+        base
+          { boundStarted = \thread → do
+              boundStarted base thread
+              first ← atomically (stateTVar reported (\held → (isNothing held, Just (fromMaybe thread held))))
+              -- Only the example's own thread is held up here.
+              when first $ do
+                atomically (writeTVar starting True)
+                atomically (readTVar release >>= check)
+          }
+  coordinator ← forkIO $
+    try (runBounded settings "an example cancelled while its bound starts" (atomically (readTVar never >>= check))) >>= putMVar done
+  atomically (readTVar starting >>= check)
+  killThread coordinator
+  outcome ← takeMVar done
+  either (\caught → fromException caught `shouldBe` Just ThreadKilled) (\() → failWith "the cancelled bound returned") outcome
+  readTVarIO (controlTerminated controls) `shouldReturn` Nothing
+  readTVarIO (controlThreads controls) >>= mapM_ awaitEnded
+  atomically (writeTVar never True >> writeTVar release True)
+
+-- | The example fails while a rig run it started on a thread of its own is
+-- still under way. That run is rescued, cancelled and settled before the
+-- example's own failure is reported.
+testFailureWithRunOutstanding ∷ IO ()
+testFailureWithRunOutstanding = do
+  (controls, settings) ← scriptedBound
+  helper ← newTVarIO Nothing
+  enlisted ← newTVarIO False
+  never ← newTVarIO False
+  outcome ← try . runBounded settings "an example failing with a run of its own" $ do
+    bound ← currentBound
+    thread ← forkIO $ do
+      self ← myThreadId
+      void . try @SomeException . withBoundThread bound self $ do
+        atomically (writeTVar enlisted True)
+        atomically (readTVar never >>= check)
+    atomically (writeTVar helper (Just thread))
+    atomically (readTVar enlisted >>= check)
+    expectationFailure "the example's own failure"
+  failedWith "the example's own failure" outcome
+  readTVarIO (controlTerminated controls) `shouldReturn` Nothing
+  started ← readTVarIO (controlThreads controls)
+  run ← readTVarIO helper
+  mapM_ awaitEnded (maybe id (:) run started)
+  atomically (writeTVar never True)
 
 -- ---------------------------------------------------------------------------
 -- Helpers
