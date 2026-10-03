@@ -194,7 +194,7 @@ import Hetoimasia.GPU.Vulkan.Native.Allocator
   , noMemoryEvents
   )
 import qualified Hetoimasia.GPU.Vulkan.Native.Allocator as Allocator
-import Hetoimasia.GPU.Vulkan.Native.Recording (ImageLimits (..), NativeCommand (..), PipelineRequest (..), RecordingOps (..), Refusal (..), ViewRequest (..))
+import Hetoimasia.GPU.Vulkan.Native.Recording (ImageLimits (..), NativeCommand (..), PipelineRequest (..), RecordingLimits (..), RecordingOps (..), Refusal (..), ViewRequest (..))
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   ( CaptureMode (..)
   , FrameEvent (..)
@@ -1110,7 +1110,7 @@ renderingLayers events rendering clock =
     creating kind = atomically (stateTVar (renderingCreations rendering) (\held → (Map.lookup kind held, Map.delete kind held))) >>= maybe (pure ()) throwIO
     recordingLayer =
       RecordingOps
-        { opsCreatePipelineLayout = \_ → do
+        { opsCreatePipelineLayout = \_ _ → do
             creating CreateLayout
             handle ← fresh
             handle <$ record events (LayoutMade handle)
@@ -1132,6 +1132,7 @@ renderingLayers events rendering clock =
         , opsImageSupport = \_ → pure (Just (ImageLimits 16384 16384 15 (2 ^ (31 ∷ Int))))
         , opsMaxBufferSize = pure (1024 * 1024 * 1024)
         , opsMaxFramebuffer = pure (16384, 16384)
+        , opsRecordingLimits = pure (RecordingLimits 128 16 16 2048 2047 64)
         , opsCreateView = \_ request → do
             handle ← fresh
             handle <$ record events (OwnedViewMade handle (requestViewImage request))

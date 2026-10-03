@@ -63,6 +63,12 @@
 --   RGBA8 color targets, sRGB and linear, rendered into by frame-less batches,
 --   copied to readback buffers and probed for exact bytes, each written as a
 --   PNG to a temporary path that is printed and never committed (#338);
+-- * @grs4-drawing@ — the same device start with no window, then the
+--   session's shared ring, a pipeline with vertex input and a push-constant
+--   range, and a frame-less batch that writes a quad, its 16-bit indices and
+--   two instance offsets into ring regions, pushes a color, draws indexed and
+--   instanced into an RGBA8 color target and reads it back, probed for exact
+--   bytes inside each quad and outside both (#340);
 -- * @grs3-ordering@ — GRS-3's managed depth target and buffer written by an
 --   initializing batch, then by two batches submitted in order with no
 --   completion wait between and no layout change, ordered only by the
@@ -329,6 +335,14 @@ scenarios =
       $ \consent journal _ → do
         outcome ← SurfaceFree.runOffscreen (consentBackend consent) journal
         pure (SurfaceFree.offscreenSpec outcome, section "The GRS-5 offscreen color targets record" (SurfaceFree.offscreenSection outcome))
+  , Scenario
+      "grs4-drawing"
+      "draws an indexed, instanced quad from the shared ring's regions with a pushed color into an RGBA8 color target in a frame-less batch of a surface-free session, and reads exact bytes inside each quad and outside both, with validation reporting nothing"
+      False
+      Nothing
+      $ \consent journal _ → do
+        outcome ← SurfaceFree.runDrawing (consentBackend consent) journal
+        pure (SurfaceFree.drawingSpec outcome, section "The GRS-4 drawing record" (SurfaceFree.drawingSection outcome))
   , Scenario
       "synchronization-hazard"
       "observes a deliberate synchronization hazard, proving synchronization validation active"

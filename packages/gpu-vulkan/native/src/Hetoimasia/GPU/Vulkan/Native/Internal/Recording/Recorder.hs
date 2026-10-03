@@ -8,15 +8,19 @@
 -- before 'recordFrame' returns or raises.
 --
 -- This module owns each 'Recorder' and its mutable references — whether it is
--- open, the image layout and bindings it tracks, the use each managed buffer
--- and image it has touched is in (GRS-3), and its count of open label regions
+-- open, the image layout and bindings it tracks — the bound pipeline's
+-- interface, and the vertex and index data bound (GRS-4) — the use each
+-- managed buffer and image it has touched is in (GRS-3), and its count of open
+-- label regions
 -- — for one consumer action on the graphics owner's thread. It records each
 -- batch's entry barriers as their transitions are recorded, and its exit
 -- barriers as it seals. It inserts batch records into the recording's state
 -- ("Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State") and advances them
 -- while recording, and marks a readback buffer as copied into; ending a batch
 -- afterwards is the batch lifecycle's
--- ("Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Batches").
+-- ("Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Batches"). It adds the
+-- regions a batch claims to the session's shared ring, and reclaims those of
+-- batches whose submission completed when a claim needs the room (GRS-4).
 module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Recorder
   ( Recorder
   , recorderBatch
@@ -35,14 +39,25 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Recorder
   , copyToReadback
   , copyTargetToReadback
   , readbackBytesFor
+
+    -- * Push constants, vertex input and the ring (GRS-4)
+  , pushConstants
+  , claimRegion
+  , writeClaim
+  , BufferSource (..)
+  , bindVertexBuffer
+  , bindIndexBuffer
+  , drawIndexed
   ) where
 
-import Control.Concurrent.STM (STM, atomically, modifyTVar', readTVar, readTVarIO)
+import Control.Concurrent.STM (STM, atomically, modifyTVar', readTVar, readTVarIO, writeTVar)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, displayException, mask, mask_, rethrowIO, tryWithContext)
 import Control.Applicative ((<|>))
-import Control.Monad (when)
+import Control.Monad (unless, when)
 import Data.Bits ((.&.))
 import Data.ByteString (ByteString)
+import qualified Data.ByteString as ByteString
+import Data.List (nub, sortOn)
 import Data.Foldable (for_)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import qualified Data.Map.Strict as Map
@@ -51,10 +66,11 @@ import qualified Data.Text as Text
 import Data.Word (Word32, Word64)
 import Numeric.Natural (Natural)
 
-import Hetoimasia.GPU.Model.Access (BatchAccess, Barrier (..), BarrierRole (EntryBarrier), Contents (..), ResourceUse (..), TransitionSource (..), emptyAccess)
+import Hetoimasia.GPU.Model.Access (BatchAccess, Barrier (..), BarrierRole (EntryBarrier), Contents (..), ResourceKind (..), ResourceUse (..), TransitionSource (..), emptyAccess)
 import qualified Hetoimasia.GPU.Model.Access as Access
 import Hetoimasia.GPU.Model
   ( FramePhase (..)
+  , submissionCarries
   , FrameView (..)
   , HoldKind (..)
   , HoldView (..)
@@ -81,14 +97,26 @@ import Hetoimasia.GPU.Model.Identity
   , generationTarget
   , imageGeneration
   , imageIndex
+  , resourceSession
   )
 import Hetoimasia.GPU.Vulkan.Native.Generations (GenerationView (..), TargetGenerationsView (..), readTargetGenerations)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Batches (retireCompleted, retireCompletedOn)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Construction (createFramelessStorage)
 import Hetoimasia.GPU.Vulkan.Native.Allocator (BoundMemory (memoryResource))
+import Hetoimasia.GPU.Vulkan.Native.Internal.Allocation (AllocatedBuffer (..), flushBuffer)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
-  ( ClearColor
+  ( BufferKind (..)
+  , ClearColor
   , ImageDescription (..)
+  , IndexType
+  , InputRate (..)
+  , PushConstantRange (..)
+  , PushStage
+  , VertexAttribute (..)
+  , VertexBinding (..)
+  , VertexInput (..)
+  , indexTypeBytes
+  , vertexFormatBytes
   , ImageKind (..)
   , ImageUse (..)
   , formatCode
@@ -96,6 +124,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   , imageResourceKind
   , ImageLayout (..)
   , NativeCommand (..)
+  , bufferResourceKind
   , ReadbackAllocation (..)
   , RecordingOps (..)
   , Rect (..)
@@ -108,6 +137,8 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   ( BatchRecord (..)
   , BatchStanding (..)
   , BatchTicket (..)
+  , Buffer (..)
+  , ClaimRecord (..)
   , FrameStorage (..)
   , Image (..)
   , Managed (managedResource)
@@ -116,10 +147,13 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , NativeResource (..)
   , Ordered
   , Pipeline (..)
+  , PipelineInterface (..)
   , Readback (..)
   , ReadbackContents (..)
   , Recording (..)
   , Refusal (..)
+  , RingClaim (..)
+  , RingState (..)
   , StorageOwner (..)
   , editBatch
   , editManaged
@@ -130,19 +164,25 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , modelAnswer
   , orderedObject
   , owned
+  , releaseClaims
   , tshow
   )
-import Hetoimasia.GPU.Model.Budget (BudgetKind (FramelessBatchBudget), framelessBatchLimit)
+import Hetoimasia.GPU.Model.Budget (BudgetKind (FramelessBatchBudget, RingBudget), framelessBatchLimit)
 import Hetoimasia.GPU.Vulkan.Native.Naming (batchLabel, framelessBatchLabel, passLabel, targetPassLabel)
 import Hetoimasia.GPU.Vulkan.Native.Presentation (GenerationPlan (..), SurfaceExtent (..), SurfaceFormat (..), imageUsageTransferSource)
-import Hetoimasia.GPU.Vulkan.Native.Roots (Roots, readRootsInstrumentation, rootsCall, stateRootsModel)
+import Hetoimasia.GPU.Vulkan.Native.Roots (Roots, readRootsInstrumentation, rootsCall, rootsSessionIdentity, stateRootsModel)
 
 data RecorderState = RecorderState
   { stateLayout ∷ !ImageLayout
   , stateRendering ∷ !(Maybe Attachment)
     -- ^ The attachment of the pass that is open, if one is.
-  , statePipeline ∷ !(Maybe (ResourceId, Word32))
-    -- ^ The bound pipeline, and the color format it was built for.
+  , statePipeline ∷ !(Maybe BoundPipeline)
+    -- ^ The bound pipeline.
+  , stateVertex ∷ !(Map.Map Word32 BoundData)
+    -- ^ The vertex data bound to each vertex input binding (GRS-4). A
+    -- binding stays bound when another pipeline is bound, as Vulkan keeps it.
+  , stateIndex ∷ !(Maybe (IndexType, BoundData))
+    -- ^ The index data bound, and its type.
   , stateViewport ∷ !(Maybe Viewport)
   , stateScissor ∷ !(Maybe Rect)
   , stateAccess ∷ !(BatchAccess ResourceId)
@@ -152,6 +192,19 @@ data RecorderState = RecorderState
     -- ^ The native handle of each of them, and an image's aspect and mip
     -- levels, for the exit barriers the seal records.
   }
+
+-- | The pipeline a recorder has bound: its generation, the color format it was
+-- built for, its layout's generation, and what it declares of its interface.
+data BoundPipeline = BoundPipeline
+  { boundPipeline ∷ !ResourceId
+  , boundFormat ∷ !Word32
+  , boundLayout ∷ !ResourceId
+  , boundInterface ∷ !PipelineInterface
+  }
+
+-- | Vertex or index data bound: the bytes of the buffer or claimed region from
+-- the bound offset to its end.
+newtype BoundData = BoundData {boundBytes ∷ Natural}
 
 -- | The frame a recorder renders into, as the generation that owns its image
 -- describes it.
@@ -309,7 +362,7 @@ recordAdmitted
   → IO (Either Refusal (BatchId, a))
 recordAdmitted recording batch commands image label restore consumer = do
   opened ← newIORef True
-  state ← newIORef (RecorderState LayoutUndefined Nothing Nothing Nothing Nothing emptyAccess Map.empty)
+  state ← newIORef (RecorderState LayoutUndefined Nothing Nothing Map.empty Nothing Nothing Nothing emptyAccess Map.empty)
   labelled ← isJust <$> readRootsInstrumentation roots
   labels ← newIORef 0
   let recorder = Recorder recording batch commands image opened state labelled labels
@@ -794,10 +847,10 @@ bindPipeline ∷ Recorder q inst msgr phys dev cmd → Pipeline → IO (Either R
 bindPipeline recorder (Pipeline pipeline) =
   liveNative (recorderRecording recorder) pipeline >>= \case
     Left refusal → pure (Left refusal)
-    Right (NativePipeline handle layout format) → command recorder $ \state → do
+    Right (NativePipeline handle layout format interface) → command recorder $ \state → do
       attachment ← checkedAgainst recorder state
       incompatible format attachment
-      Right (state {statePipeline = Just (pipeline, format)}, [pipeline, layout], CommandBindPipeline handle)
+      Right (state {statePipeline = Just (BoundPipeline pipeline format layout interface)}, [pipeline, layout], CommandBindPipeline handle)
     Right _ → pure (Left RefusedWrongKind)
 
 -- | A pipeline built for another format than the attachment's.
@@ -851,35 +904,83 @@ scissorFits rect attachment
     extent = attachmentExtent attachment
     reach offset size = toInteger offset + toInteger size
 
--- | Draw triangles with the bound pipeline, inside rendering, once the
--- viewport and scissor have been set. The pipeline, the viewport and the
--- scissor are checked again against the open pass's attachment: whatever an
--- earlier pass, or the frame outside rendering, left bound must fit this one.
--- The batch retains the bound pipeline and its layout again, which it already
--- holds.
+-- | Draw triangles, instanced, with the bound pipeline, inside rendering,
+-- once the viewport and scissor have been set. The pipeline, the viewport and
+-- the scissor are checked again against the open pass's attachment: whatever
+-- an earlier pass, or the frame outside rendering, left bound must fit this
+-- one. Every vertex input binding the bound pipeline declares must have data
+-- bound, enough for every vertex a per-vertex binding is read for and every
+-- instance a per-instance one is (GRS-4). The batch retains the bound
+-- pipeline and its layout again, which it already holds.
 draw ∷ Recorder q inst msgr phys dev cmd → Word32 → Word32 → IO (Either Refusal ())
-draw recorder vertices instances = do
-  bound ← statePipeline <$> readIORef (recorderState recorder)
-  layout ← case bound of
-    Nothing → pure []
-    Just (pipeline, _) → either (const []) dependency <$> liveNative (recorderRecording recorder) pipeline
+draw recorder vertices instances =
+  drawChecked recorder vertices instances $ \state bound → do
+    vertexReads state bound (Just vertices) instances
+    Right (CommandDraw vertices instances 0 0)
+
+-- | Draw indexed triangles, instanced, with the bound pipeline (GRS-4): what
+-- 'draw' checks, and that index data is bound, holding every index read from
+-- the first. The vertices an index names are the index data's to say, which
+-- the recording does not read, so a per-vertex binding is checked to be
+-- bound but not how far its reads reach; a per-instance one is checked as
+-- 'draw' checks it.
+drawIndexed ∷ Recorder q inst msgr phys dev cmd → Word32 → Word32 → IO (Either Refusal ())
+drawIndexed recorder indices instances =
+  drawChecked recorder indices instances $ \state bound → case stateIndex state of
+    Nothing → Left (RefusedIllegal "an indexed draw with no index data bound")
+    Just (kind, held) → do
+      let needed = fromIntegral indices * indexTypeBytes kind
+      when (needed > boundBytes held) (Left (RefusedOutOfBounds needed (boundBytes held)))
+      vertexReads state bound Nothing instances
+      Right (CommandDrawIndexed indices instances)
+
+-- | What every draw checks before its own checks decide its command: a bound
+-- pipeline, an open pass, the viewport and scissor set, whole triangles, and
+-- the pipeline, viewport and scissor against the pass's attachment.
+drawChecked
+  ∷ Recorder q inst msgr phys dev cmd
+  → Word32
+  → Word32
+  → (RecorderState → BoundPipeline → Either Refusal NativeCommand)
+  → IO (Either Refusal ())
+drawChecked recorder count instances decide =
   command recorder $ \state → case (statePipeline state, stateRendering state) of
     (Nothing, _) → Left (RefusedIllegal "a draw with no pipeline bound")
     (_, Nothing) → Left (RefusedIllegal "a draw outside rendering")
-    (Just (pipeline, format), Just attachment) → case (stateViewport state, stateScissor state) of
+    (Just bound, Just attachment) → case (stateViewport state, stateScissor state) of
       (Just viewport, Just rect)
-        | vertices == 0 || instances == 0 → Left (RefusedIllegal "a draw of nothing")
-        | vertices `mod` 3 /= 0 → Left (RefusedUnsupported "a draw that is not whole triangles")
+        | count == 0 || instances == 0 → Left (RefusedIllegal "a draw of nothing")
+        | count `mod` 3 /= 0 → Left (RefusedUnsupported "a draw that is not whole triangles")
         | otherwise → do
-            incompatible format attachment
+            incompatible (boundFormat bound) attachment
             viewportFits viewport attachment
             scissorFits rect attachment
-            Right (state, pipeline : layout, CommandDraw vertices instances 0 0)
+            native ← decide state bound
+            Right (state, [boundPipeline bound, boundLayout bound], native)
       _ → Left (RefusedIllegal "a draw before the viewport and scissor are set")
+
+-- | Whether every vertex input binding the bound pipeline declares has data
+-- bound, enough for what a draw reads of it: for a per-vertex binding, every
+-- vertex — when the draw says how many, which an indexed one does not — and
+-- for a per-instance one, every instance. A binding no attribute reads is read
+-- for nothing.
+vertexReads ∷ RecorderState → BoundPipeline → Maybe Word32 → Word32 → Either Refusal ()
+vertexReads state bound vertices instances =
+  for_ bindings $ \binding → case Map.lookup (bindingNumber binding) (stateVertex state) of
+    Nothing → Left (RefusedIllegal ("a draw that needs vertex binding " <> tshow (bindingNumber binding) <> ", which is not bound"))
+    Just held → case (bindingRate binding, vertices) of
+      (PerVertex, Nothing) → Right ()
+      (PerVertex, Just count) → fits binding held count
+      (PerInstance, _) → fits binding held instances
   where
-    dependency = \case
-      NativePipeline _ layout _ → [layout]
-      _ → []
+    VertexInput bindings attributes = interfaceVertexInput (boundInterface bound)
+    reach binding = maximum (0 : [toInteger (attributeOffset attribute) + toInteger (vertexFormatBytes (attributeFormat attribute)) | attribute ← attributes, attributeBinding attribute == bindingNumber binding])
+    fits binding held count
+      | reach binding == 0 = Right ()
+      | needed > toInteger (boundBytes held) = Left (RefusedOutOfBounds (fromInteger needed) (boundBytes held))
+      | otherwise = Right ()
+      where
+        needed = (toInteger count - 1) * toInteger (bindingStride binding) + reach binding
 
 -- | The bytes one copy of an image of this extent needs: four per pixel,
 -- tightly packed.
@@ -982,3 +1083,339 @@ copyInto recorder (Readback readback) extent refused decide =
     Right _ → pure (Left RefusedWrongKind)
   where
     recording = recorderRecording recorder
+
+-- ---------------------------------------------------------------------------
+-- Push constants, vertex input and the ring (GRS-4)
+
+-- | Push bytes into the bound pipeline's push constants, for these stages at
+-- this offset. Under Vulkan's rules, checked against the bound pipeline's
+-- layout before anything is recorded: a pipeline must be bound; the push
+-- names at least one stage, has bytes, and has an offset and size that are
+-- multiples of four; every stage it names has a range in the layout that
+-- holds every byte pushed; and every range those bytes overlap is pushed for
+-- every stage it declares. A push beyond the range of a stage it names is
+-- 'RefusedOutOfBounds', naming how far it reaches and where that range ends;
+-- anything else is 'RefusedIllegal'. Each refusal makes no native call. A
+-- push may be made inside rendering or outside it. The batch retains the
+-- layout, which it already holds through the bound pipeline.
+pushConstants ∷ Recorder q inst msgr phys dev cmd → [PushStage] → Word32 → ByteString → IO (Either Refusal ())
+pushConstants recorder stages offset bytes = command recorder $ \state → case statePipeline state of
+  Nothing → Left (RefusedIllegal "a push with no pipeline bound")
+  Just bound → do
+    let size = toInteger (ByteString.length bytes)
+        start = toInteger offset
+        reach = start + size
+        ranges = interfacePushConstants (boundInterface bound)
+        extent range = (toInteger (rangeOffset range), toInteger (rangeOffset range) + toInteger (rangeSize range))
+    when (null stages) (Left (RefusedIllegal "a push for no stage"))
+    when (size == 0) (Left (RefusedIllegal "a push of no bytes"))
+    when (start `mod` 4 /= 0 || size `mod` 4 /= 0) (Left (RefusedIllegal "a push whose offset or size is not a multiple of four"))
+    for_ (nub stages) $ \stage → case [range | range ← ranges, stage `elem` rangeStages range] of
+      [] → Left (RefusedIllegal ("a push to the " <> tshow stage <> " stage, for which the bound pipeline's layout declares no range"))
+      range : _ →
+        let (low, high) = extent range
+         in when (start < low || reach > high) (Left (RefusedOutOfBounds (fromInteger reach) (fromInteger high)))
+    for_ ranges $ \range →
+      let (low, high) = extent range
+       in when (low < reach && start < high && any (`notElem` stages) (rangeStages range)) $
+            Left (RefusedIllegal "a push that leaves out a stage of a range its bytes overlap")
+    Right (state, [boundLayout bound], CommandPushConstants (interfaceLayout (boundInterface bound)) (nub stages) offset bytes)
+
+-- | Claim a region of the session's shared ring for this batch (D-33): this
+-- many bytes, aligned as asked — a power of two — and, on non-coherent
+-- memory, to the device's @nonCoherentAtomSize@, and padded to it. The
+-- region is the batch's from now on, bound or not, until its submission
+-- completes or it is discarded or reset; nothing else reclaims it. Before
+-- anything is held: a recorder that is closed, a session with no ring, a
+-- claim of no bytes and an alignment that is not a power of two are refused;
+-- a claim larger than the whole ring, padded, is 'RefusedOutOfBounds' — it
+-- can never fit; and one that does not fit now is 'RefusedBackpressure'
+-- 'RingBudget', once the regions of batches whose submission has completed
+-- have been reclaimed to make room. The first region is tried where the last
+-- claim ended, then from the ring's start.
+--
+-- The batch's first claim is its first touch of the ring: its entry barrier
+-- is recorded, and the batch retains the ring's generation, which the barrier
+-- names. A barrier cannot be recorded inside rendering, so a batch's first
+-- claim inside rendering is refused; later ones are not.
+claimRegion ∷ Recorder q inst msgr phys dev cmd → Natural → Natural → IO (Either Refusal RingClaim)
+claimRegion recorder size alignment =
+  owned recording $
+    readIORef (recorderOpen recorder) >>= \case
+      False → pure (Left RefusedRecorderClosed)
+      True →
+        readTVarIO (recordingRing recording) >>= \case
+          Nothing → pure (Left (RefusedIllegal "a claim in a session with no ring"))
+          Just ring → claimIn ring
+  where
+    recording = recorderRecording recorder
+    claimIn ring
+      | size == 0 = pure (Left (RefusedIllegal "a claim of no bytes"))
+      | alignment == 0 || alignment .&. (alignment - 1) /= 0 = pure (Left (RefusedIllegal "a claim alignment that is not a power of two"))
+      | held > ringBytes ring = pure (Left (RefusedOutOfBounds held (ringBytes ring)))
+      | otherwise =
+          atomically (placeClaim recording (max alignment (ringAtom ring)) held) >>= \case
+            Nothing → pure (Left (RefusedBackpressure RingBudget))
+            Just offset →
+              orderedSequence recorder (touchRing ring) >>= \case
+                Left refusal → pure (Left refusal)
+                Right () → Right <$> atomically (commitClaim recording (recorderBatch recorder) offset held size)
+      where
+        held = roundUp size (ringAtom ring)
+    -- The batch's first claim enters the ring: its entry barrier, and the
+    -- ring's generation retained.
+    touchRing ring state =
+      case Access.touch resource InstanceResource InstanceRead KeepsContents (stateAccess state) of
+        Left refusal → Left (accessRefused refusal)
+        Right (access, []) → Right (state {stateAccess = access}, [], [], [])
+        Right (access, barriers)
+          | isJust (stateRendering state) → Left (RefusedIllegal "the batch's first ring claim inside rendering, where its entry barrier cannot be recorded")
+          | otherwise →
+              Right
+                ( state {stateAccess = access, stateObjects = Map.insert resource (handle, Nothing) (stateObjects state)}
+                , [resource]
+                , [(resource, KeepsContents)]
+                , map (resourceBarrier handle Nothing) barriers
+                )
+      where
+        resource = ringResource ring
+        handle = allocationBuffer (ringMapping ring)
+
+-- | Round up to a multiple of a positive granule.
+roundUp ∷ Natural → Natural → Natural
+roundUp value granule = ((value + granule - 1) `div` granule) * granule
+
+-- | Round down to a multiple of a positive granule.
+roundDown ∷ Natural → Natural → Natural
+roundDown value granule = (value `div` granule) * granule
+
+-- | Where a region of this span, at this alignment, fits in the ring now: the
+-- first gap between the regions batches hold, tried from where the last claim
+-- ended and then from the ring's start. When none fits, the regions of
+-- batches whose submission has completed are reclaimed first and the ring is
+-- tried again. Nothing is claimed.
+placeClaim ∷ Recording q inst msgr phys dev cmd → Natural → Natural → STM (Maybe Natural)
+placeClaim recording alignment held =
+  fit >>= \case
+    Just offset → pure (Just offset)
+    Nothing → do
+      model ← stateRootsModel (recordingRoots recording) (\current → (current, current))
+      batches ← Map.toList <$> readTVar (recordingBatches recording)
+      releaseClaims
+        recording
+        [batch | (batch, record) ← batches, BatchSubmitted submission ← [batchStanding record], submissionCarries submission batch model == Nothing]
+      fit
+  where
+    fit = (>>= place) <$> readTVar (recordingRing recording)
+    place ring =
+      let taken = sortOn fst [(claimRecordOffset record, claimRecordOffset record + claimRecordSpan record) | record ← Map.elems (ringClaims ring)]
+          ends = map snd taken
+          gaps = zip (0 : ends) (map fst taken <> [ringBytes ring])
+          start = ringHead ring
+          ahead = [(max low start, high) | (low, high) ← gaps, high > start]
+          candidates = ahead <> gaps
+          fits (low, high) = let offset = roundUp low alignment in if offset + held <= high then Just offset else Nothing
+       in case [offset | Just offset ← map fits candidates] of
+            offset : _ → Just offset
+            [] → Nothing
+
+-- | Record a claim at the place 'placeClaim' found, under a number never
+-- issued before, and move the ring's head past it.
+commitClaim ∷ Recording q inst msgr phys dev cmd → BatchId → Natural → Natural → Natural → STM RingClaim
+commitClaim recording batch offset held size =
+  readTVar (recordingRing recording) >>= \case
+    Nothing → error "the ring went away while a claim was made in it"
+    Just ring → do
+      let number = ringNextClaim ring
+          next = offset + held
+      writeTVar
+        (recordingRing recording)
+        ( Just
+            ring
+              { ringClaims = Map.insert number (ClaimRecord batch offset held size) (ringClaims ring)
+              , ringNextClaim = number + 1
+              , ringHead = if next >= ringBytes ring then 0 else next
+              }
+        )
+      pure (RingClaim number (ringResource ring) size)
+
+-- | A claim, checked against this recorder's batch: the session's ring's,
+-- still held — not reclaimed and handed on — and this batch's.
+claimed ∷ Recorder q inst msgr phys dev cmd → RingClaim → STM (Either Refusal (RingState, ClaimRecord))
+claimed recorder claim =
+  readTVar (recordingRing recording) >>= \case
+    _ | resourceSession (claimRing claim) /= rootsSessionIdentity (recordingRoots recording) → pure (Left (RefusedMisuse (ForeignIdentity ResourceIdentity)))
+    Nothing → pure (Left (RefusedMisuse (StaleIdentity ResourceIdentity)))
+    Just ring
+      | claimRing claim /= ringResource ring → pure (Left (RefusedMisuse (StaleIdentity ResourceIdentity)))
+      | otherwise → pure $ case Map.lookup (claimNumber claim) (ringClaims ring) of
+          Nothing → Left (RefusedMisuse (StaleIdentity ResourceIdentity))
+          Just record
+            | claimRecordBatch record /= recorderBatch recorder → Left (RefusedMisuse (WrongParent BatchIdentity))
+            | otherwise → Right (ring, record)
+  where
+    recording = recorderRecording recorder
+
+-- | Write bytes into a claimed region, at an offset into it, while the batch
+-- that claimed it is being recorded (GRS-4). Its submission makes them
+-- visible to the device, so no barrier is recorded (D-26); on non-coherent
+-- memory the bytes written are flushed at once, over a range aligned to the
+-- atom that never leaves the claim's own padded region. Refused, with
+-- nothing written: a recorder that is closed — the batch sealed, or left
+-- partial — another session's claim, one whose region was reclaimed, another
+-- batch's, and a write past the bytes it claimed, which is
+-- 'RefusedOutOfBounds'. A write or flush that raised leaves the batch
+-- partial, as a command that raised does, and is re-raised.
+writeClaim ∷ Recorder q inst msgr phys dev cmd → RingClaim → Natural → ByteString → IO (Either Refusal ())
+writeClaim recorder claim offset bytes =
+  owned recording $
+    readIORef (recorderOpen recorder) >>= \case
+      False → pure (Left RefusedRecorderClosed)
+      True →
+        atomically (claimed recorder claim) >>= \case
+          Left refusal → pure (Left refusal)
+          Right (ring, record)
+            | offset + count > claimRecordSize record → pure (Left (RefusedOutOfBounds (offset + count) (claimRecordSize record)))
+            | count == 0 → pure (Right ())
+            | otherwise → do
+                let mapping = ringMapping ring
+                    atom = ringAtom ring
+                    start = claimRecordOffset record + offset
+                    low = roundDown start atom
+                    high = min (claimRecordOffset record + claimRecordSpan record) (roundUp (start + count) atom)
+                    write = do
+                      opsWriteMapped (recordingOps recording) mapping start bytes
+                      unless (allocationCoherent mapping) $
+                        flushBuffer (recordingRoots recording) (AllocatedBuffer (allocationMemory mapping) False (Just (allocationMapped mapping))) (low, high - low)
+                mask_ (tryWithContext @SomeException write) >>= \case
+                  Right () → pure (Right ())
+                  Left failure@(ExceptionWithContext _ exception) → do
+                    writeIORef (recorderOpen recorder) False
+                    atomically $
+                      editBatch recording (recorderBatch recorder) $ \entry →
+                        entry {batchStanding = BatchPartial ("writing a ring region raised: " <> Text.pack (displayException exception))}
+                    rethrowIO failure
+  where
+    recording = recorderRecording recorder
+    count = fromIntegral (ByteString.length bytes)
+
+-- | Where vertex or index data is bound from: a managed buffer, or a region
+-- the batch claimed, each at an offset into it.
+data BufferSource
+  = FromBuffer !Buffer !Natural
+  | FromClaim !RingClaim !Natural
+  deriving (Eq, Show)
+
+-- | A source, resolved: its managed generation, its buffer's kind, its native
+-- buffer, the offset into that buffer, and the bytes from there to the end of
+-- the buffer or the claimed region.
+data Source = Source
+  { sourceResource ∷ !ResourceId
+  , sourceKind ∷ !BufferKind
+  , sourceHandle ∷ !Word64
+  , sourceOffset ∷ !Natural
+  , sourceBytes ∷ !Natural
+  }
+
+-- | Resolve a source: a managed buffer this session's, live, the offset
+-- inside it; or a claim this batch holds, the offset inside what it claimed.
+resolveSource ∷ Recorder q inst msgr phys dev cmd → BufferSource → IO (Either Refusal Source)
+resolveSource recorder = \case
+  FromBuffer (Buffer resource) offset →
+    liveNative recording resource >>= \case
+      Left refusal → pure (Left refusal)
+      Right (NativeBuffer kind bytes allocated)
+        | offset >= bytes → pure (Left (RefusedOutOfBounds offset bytes))
+        | otherwise → pure (Right (Source resource kind (memoryResource (allocatedMemory allocated)) offset (bytes - offset)))
+      Right _ → pure (Left RefusedWrongKind)
+  FromClaim claim offset →
+    atomically (claimed recorder claim) >>= \case
+      Left refusal → pure (Left refusal)
+      Right (ring, record)
+        | offset >= claimRecordSize record → pure (Left (RefusedOutOfBounds offset (claimRecordSize record)))
+        | otherwise →
+            pure (Right (Source (ringResource ring) InstanceBuffer (allocationBuffer (ringMapping ring)) (claimRecordOffset record + offset) (claimRecordSize record - offset)))
+  where
+    recording = recorderRecording recorder
+
+-- | Bind vertex or instance data to a vertex input binding the bound
+-- pipeline declares (GRS-4), from a managed vertex or instance buffer or from
+-- a region the batch claimed. Before anything is recorded: the owner's thread,
+-- the recorder, a bound pipeline, the binding among the pipeline's, the source
+-- — a managed buffer this session's and live, or a claim of the session's
+-- ring this batch still holds — its offset inside the buffer or the bytes
+-- claimed, and its kind: vertex input reads a vertex buffer as geometry and an
+-- instance buffer, the ring included, as instance data, and any other kind is
+-- 'RefusedWrongKind'. The bind is a use of the buffer under #335's rules: the
+-- batch's first touch records the buffer's entry barrier, which cannot be
+-- recorded inside rendering, so a first touch there is refused — a consumer
+-- binds before the pass, or moves the buffer to its use there first. The batch
+-- retains exactly the buffer's generation, or the ring's. A binding stays
+-- bound until it is bound again, whichever pipeline is bound.
+bindVertexBuffer ∷ Recorder q inst msgr phys dev cmd → Word32 → BufferSource → IO (Either Refusal ())
+bindVertexBuffer recorder binding source =
+  bindData recorder source vertexUse $ \state bound resolved → do
+    unless (binding `elem` map bindingNumber (inputBindings (interfaceVertexInput (boundInterface bound)))) $
+      Left (RefusedIllegal ("vertex binding " <> tshow binding <> ", which the bound pipeline does not declare"))
+    Right
+      ( state {stateVertex = Map.insert binding (BoundData (sourceBytes resolved)) (stateVertex state)}
+      , CommandBindVertexBuffer binding (sourceHandle resolved) (fromIntegral (sourceOffset resolved))
+      )
+  where
+    vertexUse = \case
+      VertexBuffer → Just GeometryRead
+      InstanceBuffer → Just InstanceRead
+      _ → Nothing
+
+-- | Bind index data, 16-bit or 32-bit, from a managed index or instance
+-- buffer or from a region the batch claimed (GRS-4), checked as
+-- 'bindVertexBuffer' checks vertex data — an index buffer is read as
+-- geometry, an instance buffer as instance data — and at an offset that is a
+-- multiple of the index's size.
+bindIndexBuffer ∷ Recorder q inst msgr phys dev cmd → BufferSource → IndexType → IO (Either Refusal ())
+bindIndexBuffer recorder source kind =
+  bindData recorder source indexUse $ \state _ resolved → do
+    when (sourceOffset resolved `mod` indexTypeBytes kind /= 0) $
+      Left (RefusedIllegal "index data at an offset that is not a multiple of the index's size")
+    Right
+      ( state {stateIndex = Just (kind, BoundData (sourceBytes resolved))}
+      , CommandBindIndexBuffer (sourceHandle resolved) (fromIntegral (sourceOffset resolved)) kind
+      )
+  where
+    indexUse = \case
+      IndexBuffer → Just GeometryRead
+      InstanceBuffer → Just InstanceRead
+      _ → Nothing
+
+-- | A bind of vertex or index data: the source resolved, then, in one
+-- decision, a bound pipeline, the kind's use, the bind's own checks, and the
+-- buffer's touch — its entry barrier on the batch's first, outside rendering
+-- only — before the bind command.
+bindData
+  ∷ Recorder q inst msgr phys dev cmd
+  → BufferSource
+  → (BufferKind → Maybe ResourceUse)
+  → (RecorderState → BoundPipeline → Source → Either Refusal (RecorderState, NativeCommand))
+  → IO (Either Refusal ())
+bindData recorder source useOf decide =
+  owned (recorderRecording recorder) $
+    resolveSource recorder source >>= \case
+      Left refusal → pure (Left refusal)
+      Right resolved → orderedSequence recorder $ \state → do
+        bound ← maybe (Left (RefusedIllegal "a buffer bound with no pipeline bound")) Right (statePipeline state)
+        use ← maybe (Left RefusedWrongKind) Right (useOf (sourceKind resolved))
+        (next, native) ← decide state bound resolved
+        let resource = sourceResource resolved
+            handle = sourceHandle resolved
+        case Access.touch resource (bufferResourceKind (sourceKind resolved)) use KeepsContents (stateAccess state) of
+          Left refusal → Left (accessRefused refusal)
+          Right (access, barriers)
+            | not (null barriers) && isJust (stateRendering state) →
+                Left (RefusedIllegal "the batch's first use of a buffer inside rendering, where its entry barrier cannot be recorded")
+            | otherwise →
+                Right
+                  ( next {stateAccess = access, stateObjects = Map.insert resource (handle, Nothing) (stateObjects state)}
+                  , [resource]
+                  , [(resource, KeepsContents) | barrier ← barriers, barrierRole barrier == EntryBarrier]
+                  , map (resourceBarrier handle Nothing) barriers <> [native]
+                  )

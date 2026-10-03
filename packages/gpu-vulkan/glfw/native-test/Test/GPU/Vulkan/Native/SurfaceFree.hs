@@ -25,6 +25,17 @@
 --   readback and returns it to rest. The main thread waits for both tickets;
 --   a second action reads both readbacks, which are probed for exact bytes
 --   inside and outside the triangle and written as PNGs to temporary paths.
+-- * @grs4-drawing@ opens no window either (GRS-4). One owner-thread action
+--   makes the session's shared ring, an RGBA8 color target, a layout
+--   declaring a fragment push-constant range, a pipeline over the quad
+--   shaders reading a per-vertex position and a per-instance offset, and a
+--   readback buffer, and records a frame-less batch that claims ring regions
+--   for a quad's four vertices, its six 16-bit indices and two instance
+--   offsets, writes them, clears the target blue from undefined, pushes
+--   magenta, draws indexed and instanced, and copies the target into the
+--   readback. The main thread waits for its ticket; a second action reads
+--   the readback, which is probed for exact bytes inside each quad and
+--   outside both, and written as a PNG to a temporary path.
 -- * @grs12-frameless@ opens no window either (GRS-12). One owner-thread
 --   action builds a color target and a vertex buffer and records a
 --   frame-less batch that initializes the target and moves the buffer into a
@@ -44,14 +55,17 @@ module Test.GPU.Vulkan.Native.SurfaceFree
   , runLaterWindow
   , runFrameless
   , runOffscreen
+  , runDrawing
   , surfaceFreeSection
   , laterWindowSection
   , framelessSection
   , offscreenSection
+  , drawingSection
   , surfaceFreeSpec
   , laterWindowSpec
   , framelessSpec
   , offscreenSpec
+  , drawingSpec
   ) where
 
 import Control.Concurrent (ThreadId, myThreadId)
@@ -66,7 +80,9 @@ import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Time.Clock (addUTCTime, diffUTCTime, getCurrentTime)
-import Data.Word (Word8)
+import Data.Bits (shiftR)
+import Data.Word (Word16, Word32, Word8)
+import GHC.Float (castFloatToWord32)
 import Numeric.Natural (Natural)
 import System.Directory (getTemporaryDirectory)
 import System.IO (hClose, openBinaryTempFile)
@@ -109,7 +125,7 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , Readback
   , Readiness (..)
   , Rect (..)
-  , Refusal
+  , Refusal (..)
   , ResourceUse (..)
   , TicketState (..)
   , TransitionSource (..)
@@ -146,9 +162,28 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , transitionResource
   , vulkanHostConfig
   , withVulkanOwnerHost
+  , BufferSource (..)
+  , IndexType (..)
+  , InputRate (..)
+  , PushConstantRange (..)
+  , PushStage (..)
+  , VertexAttribute (..)
+  , VertexBinding (..)
+  , VertexFormat (..)
+  , VertexInput (..)
+  , bindIndexBuffer
+  , bindVertexBuffer
+  , claimRegion
+  , constructPipelineLayoutWith
+  , constructPipelineWith
+  , constructRing
+  , drawIndexed
+  , pushConstants
+  , validateRingSize
+  , writeClaim
   )
 import Hetoimasia.GPU.Vulkan.Native.Presentation (formatB8G8R8A8Srgb)
-import Hetoimasia.GPU.Vulkan.Native.Recording.Shaders (endpointShaders, verificationShaders)
+import Hetoimasia.GPU.Vulkan.Native.Recording.Shaders (endpointShaders, quadShaders, verificationShaders)
 import Hetoimasia.GPU.Vulkan.Native.Roots (RootStanding (..), RootsView (..))
 import Hetoimasia.Runtime.GLFW
   ( ScheduledStep (..)
@@ -329,6 +364,131 @@ runOffscreen backend journal = do
   where
     deadline = either (error . show) id (durationFromNanoseconds AllowZero 10000000000)
     pixelAt bytes (x, y) = ByteString.unpack (ByteString.take 4 (ByteString.drop ((y * offscreenSide + x) * 4) bytes))
+
+-- | The case that draws an indexed, instanced quad from ring regions with a
+-- pushed color (GRS-4).
+runDrawing ∷ Maybe Backend → Journal → IO SurfaceFreeOutcome
+runDrawing backend journal = do
+  heading journal "GRS-4: a surface-free session draws an indexed, instanced quad from its shared ring with a pushed color, and reads it back"
+  runCase backend defaultBudgetRequest {requestedBytes = 2 * 1024 * 1024 * 1024} [] "vulkan-native-grs4-drawing" $ \vulkan _ _ _ → do
+    recorded ← act vulkan (VulkanAction (\construction → (,) <$> myThreadId <*> drawingBatch construction)) >>= \case
+      ActionReturned (ran, Right made) → pure (ran, made)
+      ActionReturned (_, Left refusal) → stopWith ("the drawing batch was refused: " <> tshow refusal)
+      other → stopWith ("the drawing action did not return: " <> outcomeText other)
+    let (drawnOn, (readback, ticket)) = recorded
+    waited ← awaitTicket ticket deadline
+    read' ← act vulkan (VulkanAction (\construction → (,) <$> myThreadId <*> readConstructedReadback construction readback 0 offscreenBytes)) >>= \case
+      ActionReturned (ran, Right bytes) → pure (ran, bytes)
+      ActionReturned (_, Left refusal) → stopWith ("the readback was refused: " <> tshow refusal)
+      other → stopWith ("the reading action did not return: " <> outcomeText other)
+    let (readOn, bytes) = read'
+    directory ← getTemporaryDirectory
+    (path, handle) ← openBinaryTempFile directory "hetoimasia-grs4-drawing.png"
+    ByteString.hPut handle (encodeRgba offscreenSide offscreenSide bytes)
+    hClose handle
+    note journal ("the readback is at " <> Text.pack path)
+    let shot = Shot Rgba8Srgb waited [(point, pixelAt bytes point) | point ← drawingProbes] path
+    roots ← atomically (readVulkanRoots (vulkanController vulkan))
+    pure (Seen [drawnOn, readOn] ["drew the quad and copied the target", "read the readback"] 0 (Just roots) Nothing [waited] [shot])
+  where
+    deadline = either (error . show) id (durationFromNanoseconds AllowZero 10000000000)
+    pixelAt bytes (x, y) = ByteString.unpack (ByteString.take 4 (ByteString.drop ((y * offscreenSide + x) * 4) bytes))
+
+-- | Probe points well away from every edge: the first two at the centers of
+-- the two instances' quads, the rest outside both.
+drawingProbes ∷ [(Int, Int)]
+drawingProbes = [(16, 32), (48, 32), (32, 32), (4, 4), (60, 60)]
+
+-- | What each probe must read: the pushed magenta inside each quad, the blue
+-- clear outside them, every channel an endpoint.
+expectedDrawingProbes ∷ [[Word8]]
+expectedDrawingProbes = [[255, 0, 255, 255], [255, 0, 255, 255], [0, 0, 255, 255], [0, 0, 255, 255], [0, 0, 255, 255]]
+
+-- | The quad's corners, a quarter of the target's side across, centered on
+-- the origin; its two triangles' indices; and each instance's offset, a
+-- quarter of the target to either side.
+quadCorners, instanceOffsets ∷ [(Float, Float)]
+quadCorners = [(-0.25, -0.25), (0.25, -0.25), (0.25, 0.25), (-0.25, 0.25)]
+instanceOffsets = [(-0.5, 0), (0.5, 0)]
+
+quadIndices ∷ [Word16]
+quadIndices = [0, 1, 2, 2, 3, 0]
+
+-- | Little-endian bytes of floats and of 16-bit indices, as the device reads
+-- them.
+floatBytes ∷ [(Float, Float)] → ByteString.ByteString
+floatBytes pairs = ByteString.pack (concat [word (castFloatToWord32 value) | (x, y) ← pairs, value ← [x, y]])
+  where
+    word ∷ Word32 → [Word8]
+    word value = [fromIntegral (value `shiftR` shift) | shift ← [0, 8, 16, 24]]
+
+indexBytes ∷ [Word16] → ByteString.ByteString
+indexBytes indices = ByteString.pack (concat [[fromIntegral index, fromIntegral (index `shiftR` 8)] | index ← indices])
+
+-- | The session's ring, a color target, a layout declaring the fragment
+-- stage's color, a pipeline over the quad shaders, a readback buffer, and a
+-- frame-less batch that writes the quad into ring regions, clears the target
+-- blue from undefined, pushes magenta, draws indexed and instanced, copies the
+-- target into the readback after its transition, and returns it to rest.
+drawingBatch ∷ Construction q inst msgr phys dev cmd → IO (Either Refusal (Readback, BatchTicket))
+drawingBatch construction = do
+  let side = fromIntegral offscreenSide
+      ringSize = either (error . show) id (validateRingSize 4096)
+      input =
+        VertexInput
+          [VertexBinding 0 8 PerVertex, VertexBinding 1 8 PerInstance]
+          [VertexAttribute 0 0 VertexFloat2 0, VertexAttribute 1 1 VertexFloat2 0]
+      magenta = floatBytes [(1, 0), (1, 1)]
+      claimedWith recorder contents = do
+        claimed ← claimRegion recorder (fromIntegral (ByteString.length contents)) 4
+        case claimed of
+          Left refusal → pure (Left refusal)
+          Right claim → fmap (const claim) <$> writeClaim recorder claim 0 contents
+      steps target pipeline readback recorder = do
+        regions ←
+          sequence
+            [ claimedWith recorder (floatBytes quadCorners)
+            , claimedWith recorder (indexBytes quadIndices)
+            , claimedWith recorder (floatBytes instanceOffsets)
+            ]
+        case sequence regions of
+          Left refusal → pure (Left refusal)
+          Right [vertices, indices, instances] →
+            inOrder
+              [ beginRenderingInto recorder target ClearFromUndefined (ClearColor 0 0 1 1)
+              , bindPipeline recorder pipeline
+              , setViewport recorder (Viewport 0 0 (fromIntegral side) (fromIntegral side))
+              , setScissor recorder (Rect 0 0 side side)
+              , bindVertexBuffer recorder 0 (FromClaim vertices 0)
+              , bindVertexBuffer recorder 1 (FromClaim instances 0)
+              , bindIndexBuffer recorder (FromClaim indices 0) Index16
+              , pushConstants recorder [PushFragment] 0 magenta
+              , drawIndexed recorder (fromIntegral (length quadIndices)) (fromIntegral (length instanceOffsets))
+              , endRendering recorder
+              , transitionResource recorder target (FromUse ColorAttachment) TransferRead
+              , copyTargetToReadback recorder target readback
+              , transitionResource recorder target (FromUse TransferRead) ColorAttachment
+              ]
+          Right _ → pure (Left (RefusedIllegal "the case claimed other than three regions"))
+  constructRing construction ringSize >>= \case
+    Left refusal → pure (Left refusal)
+    Right () →
+      constructImage construction (ImageDescription ColorTarget Rgba8Srgb side side 1) >>= \case
+        Left refusal → pure (Left refusal)
+        Right target →
+          constructPipelineLayoutWith construction [PushConstantRange [PushFragment] 0 16] >>= \case
+            Left refusal → pure (Left refusal)
+            Right layout →
+              constructPipelineWith construction layout quadShaders (formatCode Rgba8Srgb) input >>= \case
+                Left refusal → pure (Left refusal)
+                Right pipeline →
+                  constructReadback construction offscreenBytes >>= \case
+                    Left refusal → pure (Left refusal)
+                    Right readback →
+                      constructFramelessBatch construction (steps target pipeline readback) <&> \case
+                        Left refusal → Left refusal
+                        Right (_, Left refusal) → Left refusal
+                        Right (ticket, Right ()) → Right (readback, ticket)
 
 -- | The formats the case renders into.
 offscreenFormats ∷ [ImageFormat]
@@ -706,6 +866,46 @@ offscreenSpec outcome = describe "GRS-5 offscreen color targets in a surface-fre
       [map snd (shotProbes shot) | shot ← factsShots facts] `shouldBe` replicate 2 expectedProbes
 
   it "retired cleanly, with every Vulkan call on the owner's thread" $
+    on outcome $ \facts → do
+      callNames facts `shouldSatisfy` ordered ["vkDestroyDevice", "vkDestroyDebugUtilsMessengerEXT", "vkDestroyInstance"]
+      oneOwnerThread facts
+
+  it "reached a verdict after the last callback with no issue and no error, synchronization validation included" $
+    on outcome clean
+
+drawingSection ∷ SurfaceFreeOutcome → [Text]
+drawingSection outcome =
+  section "A surface-free session drawing an indexed, instanced quad from its shared ring with a pushed color" outcome
+    <> case outcome of
+      SurfaceFreeRecorded facts →
+        concat
+          [ [ "- ticket " <> tshow (shotTicket shot) <> ", PNG at " <> Text.pack (shotPng shot)
+            , "  probes: " <> Text.intercalate "; " [tshow point <> " " <> tshow bytes | (point, bytes) ← shotProbes shot]
+            ]
+          | shot ← factsShots facts
+          ]
+      SurfaceFreeFailed _ → []
+
+drawingSpec ∷ SurfaceFreeOutcome → Spec
+drawingSpec outcome = describe "GRS-4 drawing from the shared ring with push constants in a surface-free session" $ do
+  it "opened no window, created no surface and acquired no image" $
+    on outcome $ \facts → do
+      factsWindows facts `shouldBe` 0
+      callNames facts `shouldSatisfy` notElem "glfwCreateWindowSurface"
+      callNames facts `shouldSatisfy` notElem "vkAcquireNextImageKHR"
+      deviceFirst facts
+
+  it "made a layout with a push-constant range and a pipeline with vertex input, and drew in one frame-less batch whose ticket completed, on the owner's thread" $
+    on outcome $ \facts → do
+      factsRunning facts `shouldSatisfy` ordered ["vkCreatePipelineLayout", "vkCreateGraphicsPipelines", "vkBeginCommandBuffer", "vkQueueSubmit2"]
+      map shotTicket (factsShots facts) `shouldBe` [Right TicketComplete]
+      ownerThread facts $ \owner → factsActionThreads facts `shouldBe` [owner, owner]
+
+  it "read back exact bytes: the pushed magenta inside each instance's quad, the blue clear outside both" $
+    on outcome $ \facts →
+      [map snd (shotProbes shot) | shot ← factsShots facts] `shouldBe` [expectedDrawingProbes]
+
+  it "retired cleanly, the ring with every other managed resource before the device, with every Vulkan call on the owner's thread" $
     on outcome $ \facts → do
       callNames facts `shouldSatisfy` ordered ["vkDestroyDevice", "vkDestroyDebugUtilsMessengerEXT", "vkDestroyInstance"]
       oneOwnerThread facts

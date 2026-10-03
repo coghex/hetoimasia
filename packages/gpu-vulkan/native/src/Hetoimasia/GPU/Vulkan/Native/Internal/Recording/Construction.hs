@@ -1,7 +1,8 @@
 -- | Managed-resource construction and release for the managed recording
 -- ("Hetoimasia.GPU.Vulkan.Native.Recording"): pipeline layouts, pipelines and
--- their replacements, frame storages, readback buffers, and buffers and
--- images of the engine's kinds (GRS-2), each made in one
+-- their replacements, frame storages, readback buffers, buffers and images of
+-- the engine's kinds (GRS-2), and the session's shared ring (GRS-4), each made
+-- in one
 -- masked step that reserves the model's accounting, makes the native object,
 -- turns the reservation into a managed generation and names that generation
 -- before its handle is returned; and 'releaseManaged', which ends a handle's
@@ -15,8 +16,12 @@
 -- reference and which is destroyed here at once.
 module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Construction
   ( createPipelineLayout
+  , createPipelineLayoutWith
   , createPipeline
+  , createPipelineWith
   , replacePipeline
+  , replacePipelineWith
+  , createRing
   , createFrameStorage
   , createFramelessStorage
   , createReadback
@@ -25,12 +30,13 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Construction
   , releaseManaged
   ) where
 
-import Control.Concurrent.STM (atomically, modifyTVar', readTVarIO)
+import Control.Concurrent.STM (atomically, modifyTVar', readTVar, readTVarIO, writeTVar)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, displayException, mask_, onException, rethrowIO, throwIO, tryWithContext)
 import Control.Monad (when)
 import qualified Data.Text as Text
 import Data.ByteString (ByteString)
 import Data.Foldable (for_)
+import Data.List (nub)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import Data.Word (Word32, Word64)
@@ -73,10 +79,18 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   , ImageUse (..)
   , PipelineRequest (..)
   , PipelineShaders
+  , PushConstantRange (..)
   , ReadbackAllocation (..)
+  , RecordingLimits (..)
   , RecordingOps (..)
+  , VertexAttribute (..)
+  , VertexBinding (..)
+  , VertexInput (..)
   , ViewRequest (..)
+  , BufferKind (InstanceBuffer)
   , bufferKindUse
+  , noVertexInput
+  , vertexFormatBytes
   , formatCode
   , formatNeedsCompressionBC
   , fullMipChain
@@ -91,12 +105,15 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , ManagedStanding (..)
   , NativeResource (..)
   , Pipeline (..)
+  , PipelineInterface (..)
   , PipelineLayout (..)
   , FrameStorage (..)
   , Readback (..)
   , ReadbackContents (..)
   , Recording (..)
   , Refusal (..)
+  , RingSize
+  , RingState (..)
   , StorageOwner (..)
   , destroyNative
   , editManaged
@@ -106,6 +123,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , modelEdit
   , owned
   , readbackBuffer
+  , ringSizeBytes
   )
 import Hetoimasia.GPU.Vulkan.Native.Internal.Reclamation (failingAgain, recoverAllocation)
 import Hetoimasia.GPU.Vulkan.Native.Naming
@@ -139,47 +157,136 @@ import Hetoimasia.GPU.Vulkan.Native.Roots
 
 -- | A pipeline layout with no descriptor sets and no push constants.
 createPipelineLayout ∷ Recording q inst msgr phys dev cmd → IO (Either Refusal PipelineLayout)
-createPipelineLayout recording =
-  fmap PipelineLayout
-    <$> construct recording 0 1 "vkCreatePipelineLayout" (\ops device _ _ → Right . NativeLayout <$> opsCreatePipelineLayout ops device) Nothing
+createPipelineLayout recording = createPipelineLayoutWith recording []
 
--- | A graphics pipeline over the layout, rendering to the color format. The
--- layout must be live; the pipeline depends on that exact generation, which
--- every batch binding the pipeline retains with it.
+-- | A pipeline layout with no descriptor sets and these push-constant ranges
+-- (GRS-4). Before any native call the ranges are validated against the
+-- device's @maxPushConstantsSize@ and Vulkan's rules: each names at least one
+-- stage, none twice, has a size, and has an offset and size that are
+-- multiples of four; and no stage is named by two ranges. A range that
+-- reaches past the device's limit is 'RefusedOutOfBounds', naming how far it
+-- reaches and the limit; any other invalid range is 'RefusedIllegal'.
+createPipelineLayoutWith ∷ Recording q inst msgr phys dev cmd → [PushConstantRange] → IO (Either Refusal PipelineLayout)
+createPipelineLayoutWith recording ranges =
+  owned recording $ do
+    limits ← opsRecordingLimits (recordingOps recording)
+    case validatePushRanges (limitPushConstantBytes limits) ranges of
+      Left refusal → pure (Left refusal)
+      Right () →
+        fmap PipelineLayout
+          <$> construct recording 0 1 "vkCreatePipelineLayout" (\ops device _ _ → Right . (`NativeLayout` ranges) <$> opsCreatePipelineLayout ops device ranges) Nothing
+
+-- | Whether push-constant ranges are ones a layout may declare.
+validatePushRanges ∷ Word32 → [PushConstantRange] → Either Refusal ()
+validatePushRanges most ranges = do
+  for_ ranges $ \range → do
+    let stages = rangeStages range
+        reach = toInteger (rangeOffset range) + toInteger (rangeSize range)
+    when (null stages) (Left (RefusedIllegal "a push-constant range for no stage"))
+    when (length (nub stages) /= length stages) (Left (RefusedIllegal "a push-constant range naming a stage twice"))
+    when (rangeSize range == 0) (Left (RefusedIllegal "a push-constant range of no bytes"))
+    when (rangeOffset range `mod` 4 /= 0 || rangeSize range `mod` 4 /= 0) $
+      Left (RefusedIllegal "a push-constant range whose offset or size is not a multiple of four")
+    when (reach > toInteger most) (Left (RefusedOutOfBounds (fromInteger reach) (fromIntegral most)))
+  let named = concatMap rangeStages ranges
+  when (length (nub named) /= length named) (Left (RefusedIllegal "two push-constant ranges for one stage"))
+
+-- | Whether a vertex input is one a pipeline may declare.
+validateVertexInput ∷ RecordingLimits → VertexInput → Either Refusal ()
+validateVertexInput limits (VertexInput bindings attributes) = do
+  when (length bindings > fromIntegral (limitVertexBindings limits)) $
+    Left (RefusedOutOfBounds (fromIntegral (length bindings)) (fromIntegral (limitVertexBindings limits)))
+  when (length attributes > fromIntegral (limitVertexAttributes limits)) $
+    Left (RefusedOutOfBounds (fromIntegral (length attributes)) (fromIntegral (limitVertexAttributes limits)))
+  let numbers = map bindingNumber bindings
+      locations = map attributeLocation attributes
+  when (length (nub numbers) /= length numbers) (Left (RefusedIllegal "a vertex binding declared twice"))
+  when (length (nub locations) /= length locations) (Left (RefusedIllegal "a vertex attribute location declared twice"))
+  for_ bindings $ \binding → do
+    when (bindingNumber binding >= limitVertexBindings limits) $
+      Left (RefusedOutOfBounds (fromIntegral (bindingNumber binding)) (fromIntegral (limitVertexBindings limits)))
+    when (bindingStride binding == 0 || bindingStride binding `mod` 4 /= 0) $
+      Left (RefusedIllegal "a vertex binding whose stride is not a positive multiple of four")
+    when (bindingStride binding > limitVertexStride limits) $
+      Left (RefusedOutOfBounds (fromIntegral (bindingStride binding)) (fromIntegral (limitVertexStride limits)))
+  for_ attributes $ \attribute → do
+    when (attributeLocation attribute >= limitVertexAttributes limits) $
+      Left (RefusedOutOfBounds (fromIntegral (attributeLocation attribute)) (fromIntegral (limitVertexAttributes limits)))
+    when (attributeOffset attribute > limitVertexAttributeOffset limits) $
+      Left (RefusedOutOfBounds (fromIntegral (attributeOffset attribute)) (fromIntegral (limitVertexAttributeOffset limits)))
+    when (attributeOffset attribute `mod` 4 /= 0) (Left (RefusedIllegal "a vertex attribute whose offset is not a multiple of four"))
+    case [binding | binding ← bindings, bindingNumber binding == attributeBinding attribute] of
+      [binding]
+        | toInteger (attributeOffset attribute) + toInteger (vertexFormatBytes (attributeFormat attribute)) > toInteger (bindingStride binding) →
+            Left (RefusedIllegal "a vertex attribute that does not fit its binding's stride")
+        | otherwise → Right ()
+      _ → Left (RefusedIllegal "a vertex attribute reading a binding the pipeline does not declare")
+
+-- | A graphics pipeline over the layout, rendering to the color format, with
+-- no vertex input. The layout must be live; the pipeline depends on that
+-- exact generation, which every batch binding the pipeline retains with it.
 createPipeline
   ∷ Recording q inst msgr phys dev cmd → PipelineLayout → PipelineShaders → Word32 → IO (Either Refusal Pipeline)
-createPipeline recording layout shaders format = buildPipeline recording layout shaders format Nothing
+createPipeline recording layout shaders format = createPipelineWith recording layout shaders format noVertexInput
 
--- | Publish a new generation of a pipeline, over the given layout. The old
--- generation is released: nothing records it again, and every batch that
--- recorded it keeps it, and its layout, until the batch's references end.
+-- | 'createPipeline' with a vertex input (GRS-4): bindings, each advancing
+-- per vertex or per instance with a stride, and the attributes read from
+-- them, for triangle lists. Before any native call it is validated against
+-- the device's vertex input limits and Vulkan's rules: binding numbers and
+-- attribute locations are each unique and within the device's counts, every
+-- attribute reads a declared binding and fits within its stride, and strides
+-- and offsets are multiples of four. A value past a device limit is
+-- 'RefusedOutOfBounds', naming it and the limit; anything else invalid is
+-- 'RefusedIllegal'. Every format offered is one Vulkan requires every device
+-- to support for vertex input.
+createPipelineWith
+  ∷ Recording q inst msgr phys dev cmd → PipelineLayout → PipelineShaders → Word32 → VertexInput → IO (Either Refusal Pipeline)
+createPipelineWith recording layout shaders format input = buildPipeline recording layout shaders format input Nothing
+
+-- | Publish a new generation of a pipeline, over the given layout, with no
+-- vertex input. The old generation is released: nothing records it again,
+-- and every batch that recorded it keeps it, and its layout, until the
+-- batch's references end.
 replacePipeline
   ∷ Recording q inst msgr phys dev cmd → Pipeline → PipelineLayout → PipelineShaders → Word32 → IO (Either Refusal Pipeline)
-replacePipeline recording (Pipeline old) layout shaders format = buildPipeline recording layout shaders format (Just old)
+replacePipeline recording old layout shaders format = replacePipelineWith recording old layout shaders format noVertexInput
+
+-- | 'replacePipeline' with a vertex input, validated as 'createPipelineWith'
+-- validates one.
+replacePipelineWith
+  ∷ Recording q inst msgr phys dev cmd → Pipeline → PipelineLayout → PipelineShaders → Word32 → VertexInput → IO (Either Refusal Pipeline)
+replacePipelineWith recording (Pipeline old) layout shaders format input = buildPipeline recording layout shaders format input (Just old)
 
 buildPipeline
   ∷ Recording q inst msgr phys dev cmd
   → PipelineLayout
   → PipelineShaders
   → Word32
+  → VertexInput
   → Maybe ResourceId
   → IO (Either Refusal Pipeline)
-buildPipeline recording (PipelineLayout layout) shaders format replacing =
-  liveNative recording layout >>= \case
-    Left refusal → pure (Left refusal)
-    Right (NativeLayout handle) →
-      fmap Pipeline
-        <$> construct
-          recording
-          0
-          1
-          "vkCreateGraphicsPipelines"
-          ( \ops device _ issued → do
-              naming ← shaderNaming recording issued
-              (\created → Right (NativePipeline created layout format)) <$> opsCreatePipeline ops device (PipelineRequest handle shaders format) naming
-          )
-          replacing
-    Right _ → pure (Left RefusedWrongKind)
+buildPipeline recording (PipelineLayout layout) shaders format input replacing =
+  owned recording $
+    liveNative recording layout >>= \case
+      Left refusal → pure (Left refusal)
+      Right (NativeLayout handle ranges) → do
+        limits ← opsRecordingLimits (recordingOps recording)
+        case validateVertexInput limits input of
+          Left refusal → pure (Left refusal)
+          Right () →
+            fmap Pipeline
+              <$> construct
+                recording
+                0
+                1
+                "vkCreateGraphicsPipelines"
+                ( \ops device _ issued → do
+                    naming ← shaderNaming recording issued
+                    (\created → Right (NativePipeline created layout format (PipelineInterface handle ranges input)))
+                      <$> opsCreatePipeline ops device (PipelineRequest handle shaders format input) naming
+                )
+                replacing
+      Right _ → pure (Left RefusedWrongKind)
 
 -- | A frame slot's command storage: a pool on the session's queue family and
 -- its one primary command buffer. A slot has at most one; 'recordFrame'
@@ -276,6 +383,68 @@ createReadback recording bytes
                     fail "the readback buffer's memory is not mapped"
           )
           Nothing
+
+-- | Make the session's shared ring (GRS-4, D-33): one host-visible buffer of
+-- the configured size, placed through the device's allocator under the
+-- instance buffer's usage — vertex and index reads, the frame ring's memory
+-- usage — and mapped for its lifetime. A session has at most one: a second
+-- is 'RefusedMisuse' with 'DuplicateSubject'. A size larger than the
+-- device's @maxBufferSize@ is 'RefusedOutOfBounds' before anything is made;
+-- the ring is never made smaller than configured. Its memory is charged as
+-- the allocator holds it (D-40), and a block the byte budget cannot hold is
+-- 'RefusedBackpressure', having allocated nothing.
+--
+-- On coherent memory claims are padded to nothing; on non-coherent memory
+-- every claim starts on, and is padded to, the device's
+-- @nonCoherentAtomSize@, so flushing one claim's writes never reaches into
+-- another's. The ring is a managed generation the recording owns: no handle
+-- to it is returned, a batch that binds one of its regions retains it, and
+-- it is released with every other live generation when the recording
+-- retires.
+createRing ∷ Recording q inst msgr phys dev cmd → RingSize → IO (Either Refusal ())
+createRing recording size =
+  owned recording $ do
+    existing ← readTVarIO (recordingRing recording)
+    most ← opsMaxBufferSize (recordingOps recording)
+    case existing of
+      Just _ → pure (Left (RefusedMisuse (DuplicateSubject ResourceIdentity)))
+      Nothing
+        | bytes > most → pure (Left (RefusedOutOfBounds bytes most))
+        | otherwise → do
+            limits ← opsRecordingLimits (recordingOps recording)
+            made ←
+              construct
+                recording
+                0
+                2
+                "vmaCreateBuffer"
+                ( \_ _ attempt _ →
+                    allocateBuffer (recordingRoots recording) attempt usage (BufferRequest bytes flags) >>= \case
+                      Left refusal → pure (Left (allocationRefused refusal))
+                      Right allocated
+                        | Just _ ← allocatedMapped allocated → pure (Right (NativeBuffer InstanceBuffer bytes allocated))
+                        -- The frame ring's usage requires host-visible memory,
+                        -- which is always mapped.
+                        | otherwise → do
+                            freeBuffer (recordingRoots recording) allocated
+                            fail "the ring's memory is not mapped"
+                )
+                Nothing
+            case made of
+              Left refusal → pure (Left refusal)
+              Right resource → atomically $ do
+                managed ← readTVar (recordingManaged recording)
+                case managedNative <$> Map.lookup resource managed of
+                  Just (NativeBuffer _ _ allocated)
+                    | Just mapped ← allocatedMapped allocated → do
+                        let mapping = ReadbackAllocation (memoryResource (allocatedMemory allocated)) (allocatedMemory allocated) bytes (allocatedCoherent allocated) mapped
+                            atom = if allocatedCoherent allocated then 1 else max 1 (limitNonCoherentAtom limits)
+                        writeTVar (recordingRing recording) (Just (RingState resource mapping bytes atom Map.empty 0 0))
+                        pure (Right ())
+                  _ → pure (Left (RefusedMisuse (StaleIdentity ResourceIdentity)))
+  where
+    bytes = ringSizeBytes size
+    (flags, usage) = bufferKindUse InstanceBuffer
 
 -- | @VK_BUFFER_USAGE_TRANSFER_DST_BIT@: what a readback buffer is used as.
 transferDestination ∷ Word32
@@ -562,8 +731,8 @@ nameManaged recording resource native =
 -- | What each of a generation's native objects is named.
 managedNames ∷ Recording q inst msgr phys dev cmd → ResourceId → NativeResource cmd → [(NativeObjectKind, Word64, ByteString)]
 managedNames recording resource = \case
-  NativeLayout handle → [(ObjectPipelineLayout, handle, pipelineLayoutName resource)]
-  NativePipeline handle _ _ → [(ObjectPipeline, handle, pipelineName resource)]
+  NativeLayout handle _ → [(ObjectPipelineLayout, handle, pipelineLayoutName resource)]
+  NativePipeline handle _ _ _ → [(ObjectPipeline, handle, pipelineName resource)]
   NativeStorage (StorageOfFrame target slot) pool commands →
     [ (ObjectCommandPool, pool, commandPoolName resource target slot)
     , (ObjectCommandBuffer, opsCommandBufferHandle (recordingOps recording) commands, commandBufferName resource target slot)

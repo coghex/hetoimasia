@@ -95,8 +95,11 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
   , Construction
   , Constructed
   , constructPipelineLayout
+  , constructPipelineLayoutWith
   , constructPipeline
+  , constructPipelineWith
   , replaceConstructedPipeline
+  , constructRing
   , constructBuffer
   , constructImage
   , releaseConstructed
@@ -247,6 +250,9 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , Pipeline
   , PipelineLayout
   , PipelineShaders
+  , PushConstantRange
+  , RingSize
+  , VertexInput
   , BatchTicket
   , Readback
   , Recorder
@@ -260,7 +266,10 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , createImage
   , createPipeline
   , createPipelineLayout
+  , createPipelineLayoutWith
+  , createPipelineWith
   , createReadback
+  , createRing
   , disposeResources
   , endRendering
   , newRecording
@@ -415,6 +424,28 @@ instance Constructed Readback where
 -- | A pipeline layout with no descriptor sets and no push constants.
 constructPipelineLayout ∷ Construction q inst msgr phys dev cmd → IO (Either Refusal PipelineLayout)
 constructPipelineLayout construction = confined construction (createPipelineLayout (constructionRecording construction))
+
+-- | A pipeline layout with no descriptor sets and these push-constant ranges
+-- (GRS-4), validated against the device and Vulkan's rules before anything is
+-- created.
+constructPipelineLayoutWith ∷ Construction q inst msgr phys dev cmd → [PushConstantRange] → IO (Either Refusal PipelineLayout)
+constructPipelineLayoutWith construction ranges = confined construction (createPipelineLayoutWith (constructionRecording construction) ranges)
+
+-- | A graphics pipeline over the layout, as 'constructPipeline' makes one, with
+-- this vertex input (GRS-4), validated against the device and Vulkan's rules
+-- before anything is created.
+constructPipelineWith
+  ∷ Construction q inst msgr phys dev cmd → PipelineLayout → PipelineShaders → Word32 → VertexInput → IO (Either Refusal Pipeline)
+constructPipelineWith construction layout shaders format input =
+  confined construction (createPipelineWith (constructionRecording construction) layout shaders format input)
+
+-- | Make the session's one shared ring (GRS-4, D-33), of the size the
+-- application configured and validated once: a host-visible buffer batches
+-- claim regions of while they record, write, and bind as vertex, index or
+-- instance data. A second is refused. The ring lives until the host's exit
+-- releases it with everything else; no handle to it is lent.
+constructRing ∷ Construction q inst msgr phys dev cmd → RingSize → IO (Either Refusal ())
+constructRing construction size = confined construction (createRing (constructionRecording construction) size)
 
 -- | A graphics pipeline over the layout for dynamic rendering into this color
 -- format — a frame's 'requestFormat' — drawing triangle lists with no vertex

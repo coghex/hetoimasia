@@ -199,8 +199,11 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , Construction
   , Constructed
   , constructPipelineLayout
+  , constructPipelineLayoutWith
   , constructPipeline
+  , constructPipelineWith
   , replaceConstructedPipeline
+  , constructRing
   , constructBuffer
   , constructImage
   , constructFramelessBatch
@@ -2012,7 +2015,7 @@ observeRendering (NativeObserver observe) ops =
   where
     recording layer =
       layer
-        { opsCreatePipelineLayout = observe "vkCreatePipelineLayout" . opsCreatePipelineLayout layer
+        { opsCreatePipelineLayout = \device ranges → observe "vkCreatePipelineLayout" (opsCreatePipelineLayout layer device ranges)
         , opsDestroyPipelineLayout = \device handle → observe "vkDestroyPipelineLayout" (opsDestroyPipelineLayout layer device handle)
         , opsCreatePipeline = \device request name → observe "vkCreateGraphicsPipelines" (opsCreatePipeline layer device request name)
         , opsDestroyPipeline = \device handle → observe "vkDestroyPipeline" (opsDestroyPipeline layer device handle)

@@ -34,6 +34,10 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Commands
   , setViewportUnsafe
   , setScissorUnsafe
   , drawUnsafe
+  , pushConstantsUnsafe
+  , bindVertexBufferUnsafe
+  , bindIndexBufferUnsafe
+  , drawIndexedUnsafe
   , copyImageToBufferUnsafe
   , beginLabelUnsafe
   , endLabelUnsafe
@@ -41,9 +45,13 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Commands
 
 import Control.Exception (throwIO)
 import Control.Monad (unless, when)
+import Data.ByteString (ByteString)
+import qualified Data.ByteString.Unsafe as Unsafe
+import Data.Int (Int32)
 import Data.Text (Text)
-import Data.Word (Word32)
-import Foreign.Ptr (FunPtr, Ptr, nullFunPtr)
+import Data.Word (Word32, Word64)
+import Foreign.Marshal.Utils (with)
+import Foreign.Ptr (FunPtr, Ptr, castPtr, nullFunPtr)
 import Vulkan.CStruct (withCStruct)
 import Vulkan.CStruct.Extends (SomeStruct, forgetExtensions)
 import Vulkan.Core10
@@ -52,8 +60,11 @@ import Vulkan.Core10
   , CommandBufferBeginInfo
   , Image (..)
   , ImageLayout (..)
+  , IndexType (..)
   , Pipeline (..)
   , PipelineBindPoint (..)
+  , PipelineLayout (..)
+  , ShaderStageFlagBits (..)
   , Rect2D
   , Result (..)
   , Viewport
@@ -79,6 +90,10 @@ unsafeImports =
   , "vkCmdSetViewport"
   , "vkCmdSetScissor"
   , "vkCmdDraw"
+  , "vkCmdPushConstants"
+  , "vkCmdBindVertexBuffers"
+  , "vkCmdBindIndexBuffer"
+  , "vkCmdDrawIndexed"
   , "vkCmdCopyImageToBuffer"
   , "vkCmdBeginDebugUtilsLabelEXT"
   , "vkCmdEndDebugUtilsLabelEXT"
@@ -144,6 +159,47 @@ foreign import ccall unsafe "dynamic"
     → Word32
     → Word32
     → Word32
+    → Word32
+    → IO ()
+
+foreign import ccall unsafe "dynamic"
+  mkCmdPushConstants
+    ∷ FunPtr (Ptr CommandBuffer_T → PipelineLayout → ShaderStageFlagBits → Word32 → Word32 → Ptr () → IO ())
+    → Ptr CommandBuffer_T
+    → PipelineLayout
+    → ShaderStageFlagBits
+    → Word32
+    → Word32
+    → Ptr ()
+    → IO ()
+
+foreign import ccall unsafe "dynamic"
+  mkCmdBindVertexBuffers
+    ∷ FunPtr (Ptr CommandBuffer_T → Word32 → Word32 → Ptr Buffer → Ptr Word64 → IO ())
+    → Ptr CommandBuffer_T
+    → Word32
+    → Word32
+    → Ptr Buffer
+    → Ptr Word64
+    → IO ()
+
+foreign import ccall unsafe "dynamic"
+  mkCmdBindIndexBuffer
+    ∷ FunPtr (Ptr CommandBuffer_T → Buffer → Word64 → IndexType → IO ())
+    → Ptr CommandBuffer_T
+    → Buffer
+    → Word64
+    → IndexType
+    → IO ()
+
+foreign import ccall unsafe "dynamic"
+  mkCmdDrawIndexed
+    ∷ FunPtr (Ptr CommandBuffer_T → Word32 → Word32 → Word32 → Int32 → Word32 → IO ())
+    → Ptr CommandBuffer_T
+    → Word32
+    → Word32
+    → Word32
+    → Int32
     → Word32
     → IO ()
 
@@ -227,6 +283,30 @@ drawUnsafe ∷ CommandBuffer → Word32 → Word32 → Word32 → Word32 → IO 
 drawUnsafe buffer vertices instances firstVertex firstInstance = do
   entry ← resolved "vkCmdDraw" (pVkCmdDraw (commands buffer))
   mkCmdDraw entry (handle buffer) vertices instances firstVertex firstInstance
+
+-- | Push the bytes, which the caller has checked are a non-empty multiple of
+-- four, through a pointer into them that lives only for the call.
+pushConstantsUnsafe ∷ CommandBuffer → PipelineLayout → ShaderStageFlagBits → Word32 → ByteString → IO ()
+pushConstantsUnsafe buffer layout stages offset bytes = do
+  entry ← resolved "vkCmdPushConstants" (pVkCmdPushConstants (commands buffer))
+  Unsafe.unsafeUseAsCStringLen bytes $ \(pointer, count) →
+    mkCmdPushConstants entry (handle buffer) layout stages offset (fromIntegral count) (castPtr pointer)
+
+-- | Bind one buffer, at one offset, to one vertex input binding.
+bindVertexBufferUnsafe ∷ CommandBuffer → Word32 → Buffer → Word64 → IO ()
+bindVertexBufferUnsafe buffer binding vertices offset = do
+  entry ← resolved "vkCmdBindVertexBuffers" (pVkCmdBindVertexBuffers (commands buffer))
+  with vertices $ \buffers → with offset $ \offsets → mkCmdBindVertexBuffers entry (handle buffer) binding 1 buffers offsets
+
+bindIndexBufferUnsafe ∷ CommandBuffer → Buffer → Word64 → IndexType → IO ()
+bindIndexBufferUnsafe buffer indices offset kind = do
+  entry ← resolved "vkCmdBindIndexBuffer" (pVkCmdBindIndexBuffer (commands buffer))
+  mkCmdBindIndexBuffer entry (handle buffer) indices offset kind
+
+drawIndexedUnsafe ∷ CommandBuffer → Word32 → Word32 → Word32 → Int32 → Word32 → IO ()
+drawIndexedUnsafe buffer indices instances firstIndex vertexOffset firstInstance = do
+  entry ← resolved "vkCmdDrawIndexed" (pVkCmdDrawIndexed (commands buffer))
+  mkCmdDrawIndexed entry (handle buffer) indices instances firstIndex vertexOffset firstInstance
 
 copyImageToBufferUnsafe ∷ CommandBuffer → Image → ImageLayout → Buffer → BufferImageCopy → IO ()
 copyImageToBufferUnsafe buffer image layout destination region = do

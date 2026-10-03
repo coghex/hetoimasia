@@ -97,6 +97,11 @@ data BudgetKind
     -- ^ Completion or disposal actions one owner turn may perform.
   | IdleBackoffBudget
     -- ^ The configured finite cap of the idle polling backoff.
+  | RingBudget
+    -- ^ The bytes of the session's shared ring (D-33) that batches' regions
+    -- hold. The native recording admits its claims against the ring's
+    -- configured size; no configuration here sets it, and no operation of
+    -- this model answers it.
   deriving (Eq, Ord, Show)
 
 -- ---------------------------------------------------------------------------
