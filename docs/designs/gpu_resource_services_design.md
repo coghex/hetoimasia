@@ -837,20 +837,47 @@ before the call and reconciled after it:
    bound on what the allocating call could open: the larger of that memory
    type's preferred block size and the request's own size. The engine sets
    the preferred block size in the allocator's configuration and computes it
-   exactly as VMA does. VMA opens no block larger than that, and a dedicated
-   allocation of exactly the request's size. A reservation the budget cannot
-   hold is typed `Backpressure`, answered on the owner's thread before any
-   native call.
+   exactly as VMA does. Under the preconditions below, VMA opens no block
+   larger than that, and a dedicated allocation of exactly the request's
+   size, and never both in one call. A reservation the budget cannot hold is
+   typed `Backpressure`, answered on the owner's thread before any native
+   call.
 4. **Allocate and reconcile.** VMA's device-memory callbacks run inside the
    allocating call on the owner's thread and record exactly what it opened.
    Afterwards the reservation is replaced by that amount — nothing if it
    opened nothing — and the rest is returned at once.
-   - More than was reserved would contradict VMA's sizing. It is never
-     silently carried over budget: the allocation is freed, and the request
-     fails as an accounting defect.
+   - More than was reserved means one of the preconditions below was broken.
+     It is never silently carried over budget: the allocation is freed, and
+     the request fails as an accounting defect.
 5. **Freeing.** The callbacks uncharge a block when VMA frees it. VMA's own
    retained empty block therefore stays charged, like any other block, until
    VMA frees it.
+
+**The bound's preconditions.** Step 3's bound is a property of how the engine
+calls VMA, not of VMA in general (#367). It holds only while:
+
+- **the allocating call never asks VMA to map** — no
+  `VMA_ALLOCATION_CREATE_MAPPED_BIT`, nor any other mapping inside the call. A
+  host-visible allocation is mapped by a separate call after the allocating
+  call has been reconciled; and
+- **VMA's debug margin is zero** — `VMA_DEBUG_MARGIN` in the VMA
+  implementation the engine links, the one the pinned `VulkanMemoryAllocator`
+  package compiles. That compilation defines no margin and so keeps the
+  header's default of zero; the shim's own include of the header, for
+  declarations only, does not decide it.
+
+The reason is one sequence in the pinned VMA 3.3.0.
+`VmaBlockVector::AllocatePage` opens a new block, then commits the request
+into it. If that commit fails it returns failure without destroying the new
+block, and a fresh block at least the request's size fails the commit only
+when the request asked for mapping and the mapping failed
+(`CommitAllocationRequest`), or under a nonzero debug margin.
+`VmaAllocator_T::AllocateMemoryOfType` then falls back to a dedicated
+allocation of the request's own size, which can succeed. One call has then
+opened a block and a dedicated allocation — more than step 3 reserved — and
+the empty block stays retained. Under the preconditions the sequence cannot
+occur. In-call mapping under some other, sound bound is not supported; a slice
+that needs it amends this decision first.
 
 The bound is conservative. Near the budget, a request may be refused that a
 smaller block VMA would have chosen could have served; below it, the charge
