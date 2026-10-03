@@ -1709,10 +1709,24 @@ count. A fragment shader's inputs and outputs and a vertex shader's outputs are
 varyings, which the validation layer checks at pipeline creation, and built-ins
 are the device's: it reports neither.
 
-Before it reads anything, the reader checks every type and constant an
-interface variable reaches against one explicit whitelist, the subset it
-supports:
+Before it reads anything, the reader checks every instruction it consumes
+against one explicit whitelist, the subset it supports:
 
+- the module's header bounds every id it declares, and its one entry point has
+  a model, a function, a name terminated and zero-padded within the
+  instruction, and no interface id listed twice;
+- every decoration of a kind it reads — Block, BufferBlock, RowMajor,
+  ColMajor, ArrayStride, MatrixStride, BuiltIn, Location, Component, Binding,
+  DescriptorSet, Offset — decorates a declared type, constant or variable, or a
+  member a declared struct has; carries exactly the literals its kind takes;
+  is not given twice to one target or member; has a positive stride where it is
+  one; and is never RowMajor and ColMajor on one member. No missing literal
+  stands for a default;
+- each interface variable's `OpVariable` has three operands, or four with an
+  initializer, which only Output and Private variables take, and which must be
+  a constant of the variable's own type, declared before it: a boolean, a
+  scalar of as many words as its width, a null, or a composite of as many
+  constituents as its type has, each a constant of its constituent's type;
 - each variable's storage class is one it knows — UniformConstant, Input,
   Uniform, Output, Workgroup, Private, PushConstant or StorageBuffer — and its
   type is an `OpTypePointer` of that same storage class;
@@ -1731,7 +1745,14 @@ supports:
   of 16, 32 or 64, vectors of 2–4 components, matrices of 2–4 columns, image
   operands within their enumerations, and a known pointer storage class;
 - nothing an Input, Output, Uniform, PushConstant or StorageBuffer variable
-  reaches is a boolean or an opaque type.
+  reaches is a boolean or an opaque type, unless the variable or the struct
+  member reaching it is a built-in — gl_FrontFacing and gl_HelperInvocation
+  are booleans the device supplies;
+- every Uniform, StorageBuffer and PushConstant block has the explicit layout
+  it requires, from its struct down through a descriptor array of blocks:
+  every struct member an Offset, every array and runtime-sized array an
+  ArrayStride, and every matrix member, or array of them, a MatrixStride and
+  RowMajor or ColMajor.
 
 The first instruction that fails is an error naming it, the rule it breaks and
 the variable that reaches it. A module the reader cannot read, or a supported
@@ -1793,8 +1814,13 @@ push-constant struct, a matrix input, an input attachment, a push-constant
 member beyond 32 bits, an interface naming an undefined id, a component-offset
 vertex input, descriptors stripped of their set and binding, buffers stripped of
 their `Block`, and malformed modules; and, in `Test.Shader.Malformed`, one
-rejecting mutation of a valid fixture for every whitelist rule, with a
-too-many and a too-few operand count for every fixed-count opcode; and no interface in
+rejecting mutation of a valid fixture for every whitelist rule — types,
+constants, decorations, layout, variable declarations, the entry point and the
+id bound — with a too-many and a too-few operand count for every fixed-count
+opcode, and an Output variable with a null initializer of its own type read
+exactly as without one; a fragment shader reading gl_FrontFacing and
+gl_HelperInvocation read as interface-free from its compiled fixture and
+through an unchecked splice; and no interface in
 the interface-free verification pair. Matching checked shaders in the source
 and file forms, with vertex and instance host layouts and fixed and
 runtime-sized arrays, compile with the suite. External clients, each compiled
