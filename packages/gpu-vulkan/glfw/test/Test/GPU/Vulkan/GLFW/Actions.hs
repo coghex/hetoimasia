@@ -12,9 +12,11 @@
 module Test.GPU.Vulkan.GLFW.Actions (spec) where
 
 import Control.Concurrent (forkIO, myThreadId)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
 import Control.Exception (Exception (..), ExceptionWithContext (..), SomeException, throwIO, toException, try)
 import Control.Monad (void, when)
+import qualified Data.ByteString as ByteString
 import Data.List (isSubsequenceOf)
 import Data.Maybe (isJust, isNothing)
 import System.Timeout (timeout)
@@ -32,17 +34,19 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Loop (runVulkanOwnerLoop)
 import Hetoimasia.GPU.Vulkan.Native.Profile (TargetRejection (..))
 import Hetoimasia.GPU.Vulkan.Native.Recording
   ( BufferDescription (..)
+  , BufferKind (..)
   , ImageDescription (..)
   , ImageFormat (..)
   , ImageKind (..)
   , Pipeline
   , PipelineLayout
   , PipelineShaders (..)
-  , Refusal
+  , Refusal (RefusedOwnerWait)
   , TicketState (..)
   , awaitTicket
   , readTicket
   )
+import Hetoimasia.GPU.Vulkan.Native.Uploads (UploadRequest (..), UploadState (..), awaitUploadTicket, validateUploadConfig)
 import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost (..), GraphicsSessionFailed (..), RootStanding (..), RootsView (..), TerminalCause (..))
 import Hetoimasia.Runtime.GLFW
   ( ScheduledStep (..)
@@ -97,6 +101,7 @@ spec = describe "Vulkan surface-free sessions and owner-thread actions" $ do
     itBounded "are discarded when their action raises, submitting nothing" testFramelessRaising
 
   describe "zero-target progress" $ do
+    itBounded "admits uploads from another thread into an idle owner with no target, keeps them uploading past a wait's deadline while their batches are pending, and completes them on fence evidence" testUploads
     itBounded "disposes of a released resource with no target, recording no frame, before the host exits" testZeroTargetDisposal
     itBounded "keeps making progress after the last target closes, the device serving later actions" testAfterLastTarget
     itBounded "names no deadline once nothing is owed, sleeping until an action wakes it rather than polling" testIdleSleeps
@@ -490,6 +495,48 @@ testFramelessBatches = do
       constructFramelessBatch construction (\_ → constructFramelessBatch construction (\_ → pure ())) >>= \case
         Right (outer, Right (inner, ())) → pure [inner, outer]
         other → failWith ("the frame-less batches were refused: " <> show (fmap (fmap (fmap fst)) other))
+
+-- | Uploads (GRS-6) admitted from a thread other than the owner's into a
+-- zero-target session whose owner is idle: admission wakes it, it records
+-- their copies into a frame-less batch, and their tickets wait — through a
+-- wait whose deadline passes, which cancels nothing — until the batch's fence
+-- answers signalled and the owner's own progress observes that. A wait on
+-- the owner's thread is refused.
+testUploads ∷ IO ()
+testUploads = do
+  rig ← withUploads (either (error . show) id (validateUploadConfig (1024 * 1024) 65536 4)) <$> surfaceFreeRig 0
+  submissionsComplete rig False
+  (early, late, owner') ← runRig rig $ \host _ → do
+    awaitReady host
+    (texture, vertices) ← returned =<< act host (VulkanAction (\construction → do
+      texture ← constructImage construction (ImageDescription TextureImage Rgba8Linear 64 64 2) >>= either (failWith . show) pure
+      vertices ← constructBuffer construction (BufferDescription VertexBuffer 4096) >>= either (failWith . show) pure
+      pure (texture, vertices)))
+    answers ← newEmptyMVar
+    _ ← forkIO $ do
+      admitted' ←
+        mapM
+          (submitVulkanUpload (vulkanController host))
+          [ UploadImage texture [ByteString.replicate 16384 1, ByteString.replicate 4096 2]
+          , UploadBuffer vertices (ByteString.replicate 4096 3)
+          ]
+      case sequence admitted' of
+        Left refusal → putMVar answers (Left refusal)
+        Right tickets → do
+          early ← mapM (\ticket → awaitUploadTicket ticket (millisecondsOf 20)) tickets
+          putMVar answers (Right (tickets, early))
+    (tickets, early) ← takeMVar answers >>= either (failWith . ("the upload was refused: " <>) . show) pure
+    submissionsComplete rig True
+    late ← mapM (\ticket → awaitUploadTicket ticket (millisecondsOf 30000)) tickets
+    owner' ← returned =<< act host (VulkanAction (\_ → mapM (\ticket → awaitUploadTicket ticket (millisecondsOf 1)) tickets))
+    pure (early, late, owner')
+  -- Past the first deadline neither has settled: each is still queued or
+  -- uploading, never complete while its batch's fence has not answered.
+  early `shouldSatisfy` all (`elem` [Right UploadQueued, Right UploadUploading])
+  late `shouldBe` replicate 2 (Right UploadComplete)
+  owner' `shouldBe` replicate 2 (Left RefusedOwnerWait)
+  Just verdict ← readTVarIO (rigVerdict rig)
+  verdictIssues verdict `shouldBe` []
 
 -- | An action that seals a frame-less batch and then raises submits nothing:
 -- the batch is discarded, and its ticket says so.

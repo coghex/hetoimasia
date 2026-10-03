@@ -915,6 +915,9 @@ shape = \case
   CommandBindVertexBuffer binding _ _ → "bind vertex " <> show binding
   CommandBindIndexBuffer {} → "bind index"
   CommandDrawIndexed indices instances → "draw indexed " <> show indices <> " " <> show instances
+  CommandCopyBuffer {} → "copy buffer"
+  CommandCopyBufferToImage {} → "copy buffer to image"
+  CommandCopyImageLevelToBuffer {} → "copy level"
 
 verdictClean ∷ DiagnosticVerdict → Bool
 verdictClean = null . verdictIssues

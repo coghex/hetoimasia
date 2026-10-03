@@ -1010,6 +1010,7 @@ No caller-supplied text reaches a name.
 | A pipeline layout, a pipeline | `resource <n>.<generation> pipeline layout`, `… pipeline` | After the model issues the `ResourceId`, before the handle is returned |
 | A pipeline's vertex and fragment shader modules | `resource <n>.<g> pipeline vertex shader`, `… fragment shader` | Each right after it is created and before the pipeline is built from it, under the `ResourceId` the model is about to issue the pipeline; the modules are destroyed once it is built |
 | A frame storage's pool and command buffer | `resource <n>.<g> command pool target <t> slot <s>`, `… command buffer …` | The same |
+| A frame-less slot's fence | `frame-less slot <s> submission fence` | Right after it is created at the slot's first submission, before it is recorded |
 | A readback's buffer | `resource <n>.<g> readback buffer` | The same. Its allocation is named the same inside the allocator, through VMA, whether or not the device offers naming; the device memory it lies in, which other allocations share, is named nowhere |
 | A managed buffer | `resource <n>.<g> buffer` | The same, its allocation named the same inside the allocator, as a readback's is |
 | A managed image, and its owned view | `resource <n>.<g> image`, `… image view` | The same, the image's allocation named as the image inside the allocator |
@@ -1172,8 +1173,9 @@ renderer and to an owner-thread action alike, behind the same owner check,
 checkpoint and construction-failure handling as its pipelines. A batch orders
 and transitions them through GRS-3's checked operations
 ([below](#ordering-managed-resources)), and binds vertex, index and instance
-buffers ([Drawing from buffers](#drawing-from-buffers), GRS-4); uploads and CPU
-writes into managed buffers are GRS-6's.
+buffers ([Drawing from buffers](#drawing-from-buffers), GRS-4); bytes reach a
+fresh texture, vertex buffer or index buffer through the session's uploads
+([Uploads](#uploads), GRS-6).
 
 **Kinds.** A creation names an engine-defined kind, never raw usage flags.
 Each kind fixes the resource's Vulkan usage flags and the memory usage its
@@ -1189,7 +1191,7 @@ allocation is made under ([Usages and memory types](#usages-and-memory-types)):
 
 | Image kind | Usage flags | Format features required | Memory usage | View aspect | Formats |
 | --- | --- | --- | --- | --- | --- |
-| `TextureImage` | sampled, transfer destination | sampled image, transfer destination | `UsageTexture` | color | RGBA8 and BC7, each sRGB and linear (D-21) |
+| `TextureImage` | sampled, transfer destination, transfer source | sampled image, transfer destination, transfer source | `UsageTexture` | color | RGBA8 and BC7, each sRGB and linear (D-21) |
 | `DepthTarget` | depth-stencil attachment | depth-stencil attachment | `UsageTexture` | depth | `D32_SFLOAT`, `X8_D24_UNORM_PACK32`, `D16_UNORM`: depth-only (D-36) |
 | `ColorTarget` | color attachment, transfer source | color attachment, transfer source | `UsageTexture` | color | RGBA8 and BGRA8, each sRGB and linear |
 
@@ -1601,9 +1603,11 @@ write of the batch into the bytes it read (`RefusedIllegal`), so the indices
 the device reads are the ones checked. The indices are read only after the
 draw's thread is found to be the owner's and its recorder open, so no read
 reaches a region that may have been reclaimed or a mapping that may be
-gone. Index data the recording cannot read —
-a managed index buffer's, which no host write fills before GRS-6 — cannot bound
-those reads, so an indexed draw through it that reads per-vertex data is
+gone. A managed index buffer an upload filled ([Uploads](#uploads)) bounds
+those reads the same way, by the indices its completed upload wrote, which the
+recording keeps until the buffer is forgotten. Index data the recording cannot
+read — a managed index buffer no upload has completed into — cannot bound
+them, so an indexed draw through it that reads per-vertex data is
 `RefusedUnsupported`; one whose bindings are all per-instance is not.
 
 Before any native call a bind, push or draw is refused, recording nothing, when
@@ -1703,10 +1707,68 @@ under their stride; a vertex shader's inputs that are not built-ins, by
 location and scalar or vector type; and each descriptor's set, binding, kind and
 count. A fragment shader's inputs and outputs and a vertex shader's outputs are
 varyings, which the validation layer checks at pipeline creation, and built-ins
-are the device's: it reports neither. A module it cannot read, or a construct
-it does not support — a nested push-constant struct, a matrix or array vertex
-input, a texel buffer — is an error naming it, never an empty or a matching
-interface.
+are the device's: it reports neither.
+
+Before it reads anything, the reader checks every instruction it consumes
+against one explicit whitelist, the subset it supports:
+
+- the module's header bounds every id it declares, and its one entry point has
+  a model, a function, a name terminated and zero-padded within the
+  instruction, and no interface id listed twice;
+- every decoration of a kind it reads — Block, BufferBlock, RowMajor,
+  ColMajor, ArrayStride, MatrixStride, BuiltIn, Location, Component, Binding,
+  DescriptorSet, Offset — decorates a declared type, constant or variable, or a
+  member a declared struct has; carries exactly the literals its kind takes;
+  is not given twice to one target or member; has a positive stride where it is
+  one; is never RowMajor and ColMajor on one member; and is never BuiltIn
+  together with Location or Component, which is refused before any built-in is
+  left out of what the host declares. No missing literal stands for a default;
+- each interface variable's `OpVariable` has three operands, or four with an
+  initializer, which only Output and Private variables take, and which must be
+  a constant of the variable's own type, declared before it and naming a type
+  declared before itself: a boolean, a
+  scalar of as many words as its width, a null, or a composite of as many
+  constituents as its type has, each a constant of its constituent's type;
+- each variable's storage class is one it knows — UniformConstant, Input,
+  Uniform, Output, Workgroup, Private, PushConstant or StorageBuffer — and its
+  type is an `OpTypePointer` of that same storage class;
+- every id an instruction names resolves to a type or constant declared before
+  that instruction, so forward references, self-references and cycles are
+  refused, and no id is declared twice;
+- every id names the kind its position requires: a pointer's pointee is a type
+  other than void or a pointer; an array's or runtime array's element is a
+  sized or opaque type; a struct's members are sized types, with a runtime
+  array only as the last; a vector's component is a scalar; a matrix's column
+  is a float vector; an image's sampled type is a 32-bit float or a 32- or
+  64-bit integer; a sampled image's image is an image; and an array's length is
+  an `OpConstant` of a 32-bit integer type with a positive value;
+- every instruction has exactly the operands its opcode takes, with literals in
+  range: integer widths of 8, 16, 32 or 64 and signedness 0 or 1, float widths
+  of 16, 32 or 64, vectors of 2–4 components, matrices of 2–4 columns, image
+  operands within their enumerations, and a known pointer storage class;
+- nothing an Input, Output, Uniform, PushConstant or StorageBuffer variable
+  reaches is a boolean or an opaque type, unless the variable or the struct
+  member reaching it is a built-in — gl_FrontFacing and gl_HelperInvocation
+  are booleans the device supplies;
+- every Uniform, StorageBuffer and PushConstant block has the explicit layout
+  it requires, from its struct down through a descriptor array of blocks:
+  every struct member an Offset, every array and runtime-sized array an
+  ArrayStride, and every matrix member, or array of them, a MatrixStride and
+  RowMajor or ColMajor.
+
+The first instruction that fails is an error naming it, the rule it breaks and
+the variable that reaches it. A module the reader cannot read, or a supported
+shape it does not read — a nested push-constant struct, a matrix or array
+vertex input, a texel buffer, an input attachment, a vertex input starting past
+its location's first component — is likewise an error naming it, never an
+empty or a matching interface. So are an interface naming an id the module
+defines no variable for, a descriptor variable lacking its `DescriptorSet` or
+`Binding`, a buffer whose struct is not decorated as its storage class
+requires, and a combined image sampler over an image that is not sampled or
+not of a supported dimension. Push-constant extents are computed without
+bound, so a member reaching beyond what 32 bits can hold is refused rather than
+wrapped, and `checkedRanges` refuses such members in a description the same way
+(`RefusedOutOfBounds`).
 
 **The checked splices.** `checkedVertexShader` and `checkedFragmentShader` take
 a description and source text, and `checkedVertexShaderFile` and
@@ -1750,7 +1812,17 @@ with, are checked shaders over the descriptions in
 (`test/fixtures/spirv/`, each beside its GLSL): a vertex shader's push-constant
 matrix, vector and array and its inputs, but not its built-in or varying; every
 descriptor kind with a fixed and a runtime-sized array; refusals of a nested
-push-constant struct, a matrix input and malformed modules; and no interface in
+push-constant struct, a matrix input, an input attachment, a push-constant
+member beyond 32 bits, an interface naming an undefined id, a component-offset
+vertex input, descriptors stripped of their set and binding, buffers stripped of
+their `Block`, and malformed modules; and, in `Test.Shader.Malformed`, one
+rejecting mutation of a valid fixture for every whitelist rule — types,
+constants, decorations, layout, variable declarations, the entry point and the
+id bound — with a too-many and a too-few operand count for every fixed-count
+opcode, and an Output variable with a null initializer of its own type read
+exactly as without one; a fragment shader reading gl_FrontFacing and
+gl_HelperInvocation read as interface-free from its compiled fixture and
+through an unchecked splice; and no interface in
 the interface-free verification pair. Matching checked shaders in the source
 and file forms, with vertex and instance host layouts and fixed and
 runtime-sized arrays, compile with the suite. External clients, each compiled
@@ -1761,6 +1833,293 @@ undeclared, and an unchecked splice over a shader with an interface. In
 `native-tests`, `Test.GPU.Vulkan.Native.Checked` derives layouts from checked
 shaders, takes the vertex input from the description, and refuses each
 disagreement above with no native call, through a replacement too.
+
+### Uploads
+
+GRS-6 (#342) moves bytes into a fresh texture, vertex buffer or index buffer.
+Its design is D-9, D-11, D-20, D-21 and D-30 of the
+[resource services design](designs/gpu_resource_services_design.md). Bytes go
+through one bounded, host-visible staging buffer that the graphics owner holds.
+The owner records copies from it into frame-less batches
+([Batches](#batches), GRS-12), in chunks under a per-turn byte budget. Each
+upload has a ticket, which completes only when the batch carrying the upload's
+final copies completes. The private `Internal.Uploads` module owns the uploads'
+state; `Hetoimasia.GPU.Vulkan.Native.Uploads` is its public surface.
+
+**Configuration.** `validateUploadConfig staging budget queue` validates three
+values once, in that order, and never clamps them:
+
+- the staging buffer's size in bytes;
+- the bytes the owner records into upload copies in one turn;
+- how many uploads may be unsettled at once.
+
+Zero, negative, larger than a `VkDeviceSize` holds, or (for the capacity) more
+than an `Int` counts is refused, naming the value. `newUploads` then checks the
+configuration against the device, on the owner's thread:
+
+- The turn budget must hold one block row of the widest level any image may
+  have: four bytes for each texel of `maxImageDimension2D` (read as
+  `limitImageDimension` in `RecordingLimits`, D-30). A smaller budget is
+  `RefusedOutOfBounds`, naming that row and the budget, and nothing is made.
+- The staging buffer is then made as a `StagingBuffer`-kind managed buffer of
+  the configured size (`createStaging`). It is placed through the allocator
+  like every other buffer, so its own refusals reach the caller as they are.
+  Following D-40, its memory is mapped by a separate `vmaMapMemory` after the
+  allocation, never inside the allocating call.
+
+`uploadsSupportBC7` reports whether the device takes BC7, as its
+`textureCompressionBC` feature says (D-21). Nothing assumes it: on a device
+without BC7, a BC7 texture is already refused when it is created
+([Buffers and images](#buffers-and-images)).
+
+The window integration takes the configuration as `vulkanUploads` in
+`VulkanHostConfig`. The default is `Nothing`, which takes no uploads. The
+owner's step makes the uploads the first round in which the device exists,
+before it runs any owner-thread action, so an action's uploads find them.
+
+**Admission.** `submitUpload uploads request` runs on any thread (D-20).
+`UploadImage image levels` carries every mip level of a texture, base level
+first, each tightly packed in its format's blocks. `UploadBuffer buffer bytes`
+carries the whole contents of a vertex or index buffer. One STM transaction
+decides the request, in this order:
+
+1. The session must be running (`UploadSessionFailed` with its primary
+   otherwise), and admission open (`UploadClosed` otherwise).
+2. The target must be this session's, still managed and not released
+   (`UploadMisuse`).
+3. No other unsettled upload may write into it (`UploadAlreadyTargeted`).
+4. It must be a `TextureImage`, a `VertexBuffer` or an `IndexBuffer`
+   (`UploadWrongKind`). A BC7 texture on a device without BC7 is
+   `UploadUnsupportedFormat`.
+5. It must be fresh (`UploadNotFresh`):
+   - a texture the model still records as uninitialized, so neither one
+     already initialized nor one another batch is initializing;
+   - a buffer that no upload has been admitted into — through any uploads
+     over the recording, which keeps that set (`recordingFilled`) — and that
+     no recorded or submitted batch still holds.
+6. The bytes must initialize the target exactly (`UploadMalformed`, saying
+   what differs). A texture needs every level it declares, each the size its
+   format's blocks and that level's extent need (`levelBytes`). A buffer needs
+   its whole size.
+7. The upload's size, padded to the staging granule, must fit in the whole
+   staging buffer. Otherwise it is `UploadOversized`, naming the padded size
+   and the buffer's. This refusal is permanent: no amount of waiting admits it.
+8. The queue must have room, and the staging buffer a free region for the
+   padded size. Either missing is `UploadBackpressure`, as `QueueFull` or
+   `StagingFull`, distinct from the permanent refusal above, and answered at
+   once.
+
+The staging granule is the larger of 16 bytes and the device's non-coherent
+atom. So every region starts where any format's block and any flush can begin,
+and staging is charged for that alignment and padding. A region is the first
+free gap that holds it, searched from where the last region ended and then
+from the start, so regions wrap round the buffer.
+
+The same transaction reserves the target in the recording's upload-held set
+(`recordingUploading`), the queue place and the region, and makes the ticket.
+The caller's thread then copies the bytes into the region through the mapping,
+so the caller's bytes are free when admission returns. The copy runs
+interruptibly; if it raises or is cancelled, every reservation is given back
+and the exception is re-raised. If the owner's exit began during the copy, the
+reservations are given back too and the answer is `UploadClosed`. Otherwise the
+upload is queued. `submitUploadGated` reads a caller's gate in both
+transactions, the one that reserves and the one that queues: a refusal in
+either gives every reservation back. The window integration's
+`submitVulkanUpload` gates on the owner's own admission, so it refuses as an
+owner-thread action is refused — once the session has failed, with its
+primary, or once the owner's admission has closed — and no upload is queued
+after quiescence closes the owner. Its wake asks whether an upload is waiting
+(`uploadsWaiting`), so admission makes an idle owner runnable.
+
+**The exclusive target.** From admission until its upload settles, a target
+belongs to the upload alone. Every other batch's ordered use of it is
+`RefusedUninitialized` (`orderedSequence`). Disposal does not destroy it
+(`destroyableNow`). Releasing it is deferred: `releaseManaged` marks it
+released at once, so nothing more can use it, but the model's release and the
+end of its CPU use wait until the upload settles (`recordingReleaseDeferred`).
+A released target whose upload had not started is cancelled on the owner's
+next turn. One already started completes first; only then is the target
+released and later destroyed like any other.
+
+**Progress and chunking.** `progressUploads` runs on the owner's thread. The
+window integration calls it once per owner step, after the step's fence poll,
+so an upload whose final batch that poll observed complete settles in the same
+step. Each call:
+
+1. After the device's loss, settles every unsettled upload as lost, except
+   one whose caller is still copying its bytes into staging: its region stays
+   that caller's until it finishes, and the upload is lost on a later turn.
+2. Observes each batch in flight:
+   - one complete moves its upload on, or completes the upload if it carried
+     the final copies;
+   - one discarded, and so never submitted, returns its upload to where those
+     copies began, to be recorded again from the same staging bytes;
+   - one lost loses its upload.
+3. Cancels each upload not yet started whose target was released.
+4. Records the next copies of every queued or uploading upload that has
+   copies left and no batch in flight. It takes them in admission order, into
+   one frame-less batch, up to the turn's budget, while admission is open and
+   the session is running. The transaction that plans the turn also claims
+   each planned upload, so no cancellation, close or release can settle it,
+   freeing its staging, while its copies are recorded and submitted. One
+   transaction after the submission publishes each carried upload's flight,
+   cursor and ticket as it releases that upload's claim, so a submitted copy's
+   staging is never left unheld in between; an upload whose copies no
+   submitted batch carries — the batch refused, discarded, or its recording
+   refused — releases its claim without a flight. A recording that raised
+   leaves its uploads claimed, their staging held until retirement:
+   - a texture's copies are whole block rows of one level at a time
+     (`CommandCopyBufferToImage`), so a BC7 level's last, partial block row
+     reaches the level's edge;
+   - a buffer's copies are byte ranges (`CommandCopyBuffer`);
+   - one upload may carry several levels in a turn while the budget lasts;
+   - the first upload whose next row or byte does not fit ends the turn's
+     plan.
+
+An upload has at most one batch in flight: its next chunk waits for the last
+one's completion. On non-coherent memory, the bytes a turn's copies read are
+flushed before recording, aligned to the atom and never past the upload's own
+region. Each upload's copies are bracketed by the recorder's barriers:
+
+- the staging buffer is read under transfer read;
+- on its first chunk, the target enters transfer write from its resting use,
+  from the undefined layout, discarding what it held;
+- between chunks it rests in transfer write, in the transfer-destination
+  layout;
+- after its final chunk it moves to its kind's resting use and layout.
+
+If the batch cannot be opened now (no frame-less slot, or its budget refused),
+nothing is recorded that turn. A stall flag then keeps `uploadsWaiting` from
+waking the owner, so it does not spin; the next step it runs for another
+reason, such as a fence poll that completes a batch, tries again. A batch the queue did not accept moves nothing on.
+
+**Staging lifetime.** A region is freed only when its upload settles: complete,
+cancelled or lost. It is never freed while the upload's copies are recorded or
+in flight, and a discarded batch frees nothing for its copies.
+
+**Tickets.** `UploadTicket` reads without a native call (`readUploadTicket`,
+STM). Its state only advances:
+
+- `UploadQueued`: admitted, with none of its copies recorded;
+- `UploadUploading`: its first copies are recorded;
+- `UploadComplete`: its final batch was observed complete, so its target is
+  initialized and at rest, and other batches may use it;
+- `UploadCancelled`;
+- `UploadLost`.
+
+The last three are terminal. `awaitUploadTicket ticket duration` waits at most
+that long and answers the state then, which may still be queued or uploading.
+The wait belongs to the caller alone: its expiry or cancellation cancels
+nothing and completes nothing. It is `RefusedOwnerWait` on the owner's thread,
+whose own progress the upload needs.
+
+**Cancellation.** `cancelUpload` runs on any thread, in STM, and works only
+before the owner claims an upload to record its first copies. It frees the
+staging region, answers `UploadCancelled`, and leaves the target as it was:
+uninitialized and free for another upload. Once the upload is claimed, it
+completes; cancelling then is `CancelStarted`. A settled upload is `CancelSettled`, and
+a ticket these uploads did not issue is `CancelUnknown`.
+
+**Exit.** At the owner's exit, `closeUploads` closes admission before the
+drain and cancels every upload not yet started. Uploads already started go on
+with the other frame-less work the drain waits for. After the drain,
+`retireUploads` first waits for every caller still copying its bytes into
+staging, each of which then finds admission closed and gives its reservations
+back, so the staging buffer is never unmapped under a writer; that wait is for
+copies into mapped memory already under way. It then observes the batches in
+flight once more, and settles each still
+unsettled upload as lost after a device loss, and otherwise as cancelled (left
+unfinished by the exit), its target released with the rest of the recording.
+The staging buffer is a managed buffer like any other, destroyed by
+`retireRecording` before the device.
+
+**What an upload leaves behind.**
+
+- **Index data.** A completed index-buffer upload stores the indices it wrote
+  in the recording (`recordingIndexData`). An indexed draw through that buffer
+  is then bounded by those indices, as it is for a ring region
+  ([Drawing from buffers](#drawing-from-buffers)). The data is forgotten with
+  the buffer.
+- **Level readback.** `copyLevelToReadback recorder image level readback`
+  copies one mip level of a texture into a readback buffer
+  (`CommandCopyImageLevelToBuffer`), tightly packed in its blocks. The texture
+  must be in its transfer-read use after a checked transition. To support this
+  copy, the texture kind's usage gains transfer source, required of the
+  format's features like the rest. Another kind is `RefusedWrongKind`; a level
+  the texture lacks is `RefusedOutOfBounds`, naming the level count; and a
+  readback too small for the level is `RefusedOutOfBounds`, naming the bytes
+  needed and the readback's size.
+  It lets a consumer compare what it uploaded.
+- **Observation.** `readUploads` shows each unsettled upload's number,
+  target, phase, staging region, and whether it has started, has a batch in
+  flight, has every copy recorded, or is claimed by the owner's recording. It also shows whether admission is
+  open, and the staging buffer's identity and size.
+
+**Proof.** The stand-in suite (`Test.GPU.Vulkan.Native.Uploads`) covers:
+
+- configuration refusals, never clamped;
+- a budget below one widest block row, and staging the device cannot make;
+- staging made as a staging-kind buffer, with BC7 support reported;
+- admission copying the caller's bytes before it returns;
+- every admission refusal, each reserving and copying nothing;
+- oversized refused distinctly from full-queue and full-staging backpressure;
+- targets not fresh or already targeted;
+- reservations given back when the caller's copy raised;
+- one winner of two uploads racing for one target;
+- a gate closed before admission, or closing while the bytes are copied,
+  refusing the upload with every reservation given back;
+- a buffer an upload filled refused as not fresh through a second uploads
+  over the same recording;
+- BC7 reported unsupported on a device without it;
+- copies at block-row boundaries under the budget, with the target resting
+  in transfer write between batches, completing on the final batch's fence;
+- a BC7 level's partial last row, and a buffer's byte ranges;
+- the target refused to every other batch until its upload completes;
+- staging freed only at settlement;
+- a discarded batch re-recorded from the same bytes;
+- non-coherent flushes aligned to the atom and kept within the region;
+- cancellation before and after the first copies, and a cancellation and a
+  rival admission inside the recording of an upload's first copies and inside
+  its batch's submission, refused and backpressured while its staging stays
+  held; the flight published as the claim is released; and a discarded
+  batch's claim released without a flight, the upload then cancellable;
+- tickets completing only on the final fence, a wait refused on the owner,
+  and a deadline that cancels nothing;
+- every unsettled upload lost after device loss, except one whose caller is
+  still copying, which keeps its region until it finishes and is lost then;
+- exit cancelling uploads not yet started and settling started ones;
+- retirement returning only after a caller still copying has finished;
+- a released target destroyed only after its upload settles;
+- an indexed draw bounded by uploaded indices;
+- level readback, with its refusals.
+
+The integration suite admits uploads from another thread into an idle owner
+with no target. It keeps them uploading past a wait's deadline while their
+batches are pending, and completes them on fence evidence.
+
+The surface-free native case `grs6-uploads` makes:
+
+- an RGBA8 texture of two levels, 256 by 256, whose 320 KiB need three turns
+  of a 128 KiB budget;
+- a BC7 texture of two levels where the device takes BC7 (reported
+  unsupported where it does not);
+- the quad's vertex, instance-offset and index buffers.
+
+It admits each upload from the main thread, not the owner's, and waits for
+each ticket with a deadline. Then, in one frame-less batch, it copies every
+level back with `copyLevelToReadback` and draws the quad from the uploaded
+buffers into a color target. It compares every level byte for byte and probes
+the drawing's pixels. Validation, synchronization validation included, reports
+nothing.
+
+| State | Owner | Readers and writers | Thread | Lifetime | Reset or disposal |
+| --- | --- | --- | --- | --- | --- |
+| The upload queue: each unsettled upload's entry, its phase, cursor, batch in flight and whether the owner has claimed it, the next upload number, the staging head, whether admission is open, and the stall flag | The uploads (`Internal.Uploads`) | `submitUpload` adds an entry; `progressUploads` claims, advances and settles them; `cancelUpload`, `closeUploads` and `retireUploads` settle them, never a claimed one or, but at retirement after its caller finishes, an admitting one | Admission and cancellation on any thread, in STM; everything else on the graphics owner's | From `newUploads` until `retireUploads` | Each entry removed when its upload settles; the numbers are never reissued |
+| The staging buffer and its regions | The uploads, over a managed buffer of the recording's | Admission reserves a region and its caller writes it; the owner flushes and copies from it | Writes on the admitting thread, into its own region only; copies on the owner's | Each region from admission until its upload settles; the buffer from `newUploads` until `retireRecording` | Regions freed at settlement only; the buffer destroyed with every other managed resource |
+| Each ticket's state | The uploads | The owner and cancellation advance it; any thread reads it | Any | From admission; kept by the caller after settlement | Never reset; terminal once settled |
+| The upload-held targets and their deferred releases | The recording (`recordingUploading`, `recordingReleaseDeferred`) | Admission adds a target; settlement removes it and performs a deferred release; `orderedSequence` and `destroyableNow` read it | Any, in STM | From admission until its upload settles | Emptied as uploads settle |
+| Uploaded index data | The recording (`recordingIndexData`) | A completed index-buffer upload stores it; indexed draws read it | The graphics owner | From completion until the buffer is forgotten | Deleted by `forget` |
+| The buffers uploads have filled | The recording (`recordingFilled`) | Admission adds a buffer and reads the set for freshness; a cancellation before any copy, and an admission given back, remove it | Any, in STM | From admission until the buffer is forgotten | Deleted by `forget` |
 
 ### Destruction
 
@@ -1785,7 +2144,7 @@ image, then frees its allocation (`vmaDestroyImage`), settling that too.
 
 D-28's production split, as built. The binding is compiled with
 `+safe-foreign-calls`, so every import of its own is `safe`; the package's only
-genuine `unsafe` Vulkan imports are the sixteen `dynamic` imports in the private
+genuine `unsafe` Vulkan imports are the eighteen `dynamic` imports in the private
 `Hetoimasia.GPU.Vulkan.Native.Internal.Commands`, each calling the function
 pointer the binding's own device dispatch table (`DeviceCmds`) resolved for the
 command buffer's device, with structures marshalled by the binding's
@@ -1808,6 +2167,8 @@ its calling convention.
 | `vkCmdBindIndexBuffer` | Records an already-created buffer bound as index data at an offset (GRS-4). |
 | `vkCmdDrawIndexed` | Records an indexed draw (GRS-4). |
 | `vkCmdCopyImageToBuffer` | Records a copy; it does not perform one. |
+| `vkCmdCopyBuffer` | Records one region's copy from the staging buffer into a buffer; it does not perform one (GRS-6). |
+| `vkCmdCopyBufferToImage` | Records one band of whole block rows' copy from the staging buffer into a mip level; it does not perform one (GRS-6). |
 | `vkCmdBeginDebugUtilsLabelEXT` | Records the opening of a label region; the label's name is marshalled for the call and not kept. |
 | `vkCmdEndDebugUtilsLabelEXT` | Records its closing. |
 
@@ -1838,7 +2199,7 @@ alone, under the same masked steps as the accounting around them.
 `ffiAllocatorImports`), the binding's flags, the allocator, and the C-only
 callback; the native case's record prints it, so it is part of the evidence
 identity beside the build's source digest. The headless suite reads the
-package's own import declarations and requires exactly those sixteen `dynamic`
+package's own import declarations and requires exactly those eighteen `dynamic`
 imports and, besides them, only the capture callback's address import and the
 allocator shim's entries.
 
@@ -3152,7 +3513,17 @@ the fence is never asked again, and the submission is kept with its ticket
 pending — retaining it and the device, and letting a later loss report it
 lost. A slot's fence is made at its first submission; one whose creation ran
 out of memory is recovered once, as a frame slot's are (VK-14), and one that
-is not recovered discards the batch without recording it again.
+is not recovered discards the batch without recording it again. Once made,
+the fence is named `frame-less slot <s> submission fence` when the device
+offers naming, before it is recorded and never again, and a naming that raised
+destroys it once: when that returns nothing is recorded and the rollback fails
+nothing itself — a loss the naming reported stays latched — the naming failure
+is raised, and the slot's next submission makes and names a new fence while
+the session runs; when that destruction raised too, the fence is kept,
+uncertain, and never passed to another native call, under the device-loss rule
+too, the session fails with `CleanupFailed`, and the destruction is retained
+beside the naming failure under the `vulkan frame synchronization rollback`
+label.
 
 **Device loss and retirement.** After the device's loss no fence is asked or
 waited on: the device-loss release lets go of every frame-less submission,
@@ -3577,20 +3948,23 @@ entered later passes, no call is slowed, no frame refused and no event pump
 held, and every wait the owner arms on a scripted clock comes due at once and
 moves the clock to its deadline; an irreversible scripted failure stays, and
 nothing publishes destruction evidence the stand-ins did not produce — and only
-then cancels each rig run's bound thread and the example's own. The owner's
-protected exit completes on the stand-ins' real destruction evidence, and the
+then cancels each rig run's bound thread and the example's own, and waits for
+the example to settle: its own thread, every rig run it started, and every
+cancellation's delivery. The owner's protected exit completes on the stand-ins' real destruction evidence, and the
 example fails as not having finished within its bound, even if it caught the
 cancellation. A synchronous failure, or that cancellation, escaping a rig's
 body rescues the rig before the protected teardown begins, so an example that
 fails before it releases its gates reports its own failure. The last resort: if
-the example's thread has not ended ten seconds after rescue began, the suite
+the example has not settled ten seconds after rescue began, the suite
 prints the example's name on standard error and ends the test process with a
 failure status, unwinding nothing — operator termination is the protected
 exit's documented escape. The production teardown is unchanged; all of this is
 the fixture's. `the fixture-aware example bound` covers a blocked example, one
 that fails before releasing its gates, a hold the owner had already entered,
-and the last resort, with bounds and a grace that expire only when the example
-says, and finds no thread of the example still running afterwards.
+the last resort — also while a rig run on a thread of the example's own outlives
+the example's thread — and a timer hook replaced while an earlier one runs,
+with bounds and a grace that expire only when the example says, and finds no
+thread of the example still running afterwards.
 
 VK-19's examples are in `integration-tests`, under `Vulkan consumer rendering
 and capture`, over the same stand-ins, extended to journal every command the

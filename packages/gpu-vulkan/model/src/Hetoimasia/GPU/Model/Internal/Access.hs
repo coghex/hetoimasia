@@ -97,11 +97,12 @@ restingUse = \case
   StagingResource → TransferRead
 
 -- | Every use a resource of this kind may be put to, its resting use first.
--- Each is one its kind's usage provides for: a texture is uploaded into, a
--- color target copied out of, and static geometry staged into.
+-- Each is one its kind's usage provides for: a texture is uploaded into and
+-- copied out of (GRS-6, for verification), a color target copied out of, and
+-- static geometry staged into.
 legalUses ∷ ResourceKind → [ResourceUse]
 legalUses = \case
-  TextureResource → [ShaderSampled, TransferWrite]
+  TextureResource → [ShaderSampled, TransferWrite, TransferRead]
   DepthTargetResource → [DepthAttachment]
   ColorTargetResource → [ColorAttachment, TransferRead]
   VertexResource → [GeometryRead, TransferWrite]

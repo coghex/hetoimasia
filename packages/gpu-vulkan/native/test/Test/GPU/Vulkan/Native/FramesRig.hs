@@ -12,6 +12,7 @@ module Test.GPU.Vulkan.Native.FramesRig
   , newRigWithActions
   , newRigOver
   , newRigClassed
+  , newRigOn
   , geometries
   , commandsOf
 
@@ -152,8 +153,16 @@ newRigOver count = newRigClassed (replicate count OptionalTarget)
 
 -- | 'newRigOver' with a target of each of these designations, in order.
 newRigClassed ∷ [TargetClass] → BudgetRequest → IO Rig
-newRigClassed classes request = do
-  rootsStandIn ← newStandIn
+newRigClassed = newRigClassedOn id
+
+-- | 'newRig' over a roots stand-in this adjusts first: a device offering
+-- something else, for instance.
+newRigOn ∷ (StandIn → StandIn) → IO Rig
+newRigOn adjust = newRigClassedOn adjust [OptionalTarget] defaultBudgetRequest {requestedFrameSlots = 2, requestedProgressActions = 32}
+
+newRigClassedOn ∷ (StandIn → StandIn) → [TargetClass] → BudgetRequest → IO Rig
+newRigClassedOn adjust classes request = do
+  rootsStandIn ← adjust <$> newStandIn
   roots ← newStandInRoots rootsStandIn (either (error . show) id (validateBudgets request))
   _ ← startRoots roots standardRequest
   targets ← mapM (\(classification, surface) → admitRootTarget roots classification (surfaceNumbered rootsStandIn surface) >>= either (fail . show) pure) (zip classes [10 ..])
