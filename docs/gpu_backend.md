@@ -874,12 +874,14 @@ only home of the `unsafe` subset.
 The supported vocabulary is exactly the triangle and its verification: dynamic
 rendering into the frame's one color view or a managed color target's
 ([below](#offscreen-color-targets)), a graphics pipeline compatible with the
-attachment's format, dynamic viewport and scissor, whole-triangle draws, the four
-image transitions below, one bounded copy of the whole frame image or color
-target into a readback buffer, and GRS-3's checked transitions and boundary
-barriers of managed buffers and images. There is no raw command buffer, no
-callback escape hatch, no descriptor, no binding of a managed buffer, no
-sampling of an image — GRS-4 records through them — and no render graph. A command outside that vocabulary — an
+attachment's format, dynamic viewport and scissor, whole-triangle draws —
+instanced, and indexed and instanced, from vertex, index and instance data bound
+from managed buffers and the session's shared ring, with push constants
+([Drawing from buffers](#drawing-from-buffers), GRS-4) — the four image
+transitions below, one bounded copy of the whole frame image or color target
+into a readback buffer, and GRS-3's checked transitions and boundary barriers of
+managed buffers and images. There is no raw command buffer, no callback escape
+hatch, no descriptor, no sampling of an image, and no render graph. A command outside that vocabulary — an
 unsupported transition, a draw that is not whole triangles, a transition into or
 out of the transfer-source layout or a copy of an image that is not a transfer
 source — is `RefusedUnsupported`; one the recorder's state
@@ -1169,8 +1171,9 @@ through the host's `Construction` (`constructBuffer`, `constructImage`), to a
 renderer and to an owner-thread action alike, behind the same owner check,
 checkpoint and construction-failure handling as its pipelines. A batch orders
 and transitions them through GRS-3's checked operations
-([below](#ordering-managed-resources)); binding, uploads and CPU writes are
-GRS-4 and GRS-6's.
+([below](#ordering-managed-resources)), and binds vertex, index and instance
+buffers ([Drawing from buffers](#drawing-from-buffers), GRS-4); uploads and CPU
+writes into managed buffers are GRS-6's.
 
 **Kinds.** A creation names an engine-defined kind, never raw usage flags.
 Each kind fixes the resource's Vulkan usage flags and the memory usage its
@@ -1462,6 +1465,174 @@ prints; no reference image is committed.
 | --- | --- | --- | --- | --- | --- |
 | The open pass's attachment, and the bound pipeline's format, viewport and scissor | The recorder (`Recorder`) | `beginRendering` and `beginRenderingInto` set the attachment and `endRendering` clears it; `bindPipeline`, `setViewport` and `setScissor` set the rest; `draw` reads all of it | The graphics owner | One consumer action | Dropped with the recorder |
 
+### Drawing from buffers
+
+GRS-4 (#340) draws from vertex, index and instance data with push constants,
+and gives each session one shared ring of host-visible memory that batches
+claim regions of (D-33). It obeys GRS-3's contract: a bind is a use of a
+buffer, its entry and exit barriers are the recorder's, and the consumer's own
+transitions are explicit. The shader-interface check — that a shader declares
+what its pipeline does — is GRS-16's, not this.
+
+**Push constants.** `createPipelineLayoutWith recording ranges` makes a layout
+with no descriptor sets and these `PushConstantRange`s, each naming the stages
+it is visible to — `PushVertex`, `PushFragment`, the two every pipeline has —
+and an offset and size in bytes; `createPipelineLayout` is the same with none.
+Before any native call each range must name at least one stage and none twice,
+have a size, have an offset and size that are multiples of four, and end within
+the device's `maxPushConstantsSize`; and no stage may be named by two ranges.
+A range past the limit is `RefusedOutOfBounds`, naming how far it reaches and
+the limit; anything else invalid is `RefusedIllegal`. `pushConstants recorder
+stages offset bytes` pushes into the bound pipeline's layout, inside a pass or
+outside one: a pipeline must be bound, the push must name a stage and have
+bytes, its offset and size must be multiples of four, every stage it names must
+have a range holding every byte pushed, and every range those bytes overlap
+must be pushed for all its stages, as Vulkan requires. A push beyond a named
+stage's range is `RefusedOutOfBounds`; anything else is `RefusedIllegal`. The
+batch retains the layout, which it already holds through the pipeline.
+
+**Vertex input.** `createPipelineWith recording layout shaders format input`
+makes a pipeline that reads a `VertexInput`: `VertexBinding`s, each a number, a
+stride and an `InputRate` (`PerVertex` or `PerInstance`), and
+`VertexAttribute`s, each a location, the binding it reads, a `VertexFormat`
+and an offset, for triangle lists. `createPipeline` is the same with no vertex
+input, and such a pipeline works exactly as before. Before any native call the
+input is checked against the device's `maxVertexInputBindings`,
+`maxVertexInputAttributes`, `maxVertexInputBindingStride` and
+`maxVertexInputAttributeOffset` — a value past one is `RefusedOutOfBounds` —
+and against Vulkan's rules: binding numbers and locations each unique, every
+attribute reading a declared binding and fitting within its stride, strides
+positive and, like offsets, multiples of four, which every device's vertex
+fetch admits; any other violation is `RefusedIllegal`. The formats offered —
+one to four 32-bit floats, a 32-bit unsigned integer, and four normalized
+bytes — are ones Vulkan requires every device to support for vertex input, so
+none is asked of the device. The device's limits are read once, with the
+non-coherent atom, as `RecordingLimits`. A pipeline keeps what its layout and
+input declare with its generation, and a batch checks every push, bind and
+draw against the pipeline it has bound now: binding another pipeline changes
+what is checked, and leaves bound data bound, as Vulkan does.
+
+**The ring.** `validateRingSize` validates the application's configured ring
+size once: zero, negative and sizes no `VkDeviceSize` can hold are refused,
+never clamped. `createRing recording size` makes the session's one ring — a
+second is `RefusedMisuse DuplicateSubject` — as a buffer placed through the
+device's allocator under the instance buffer's usage, vertex and index reads in
+the frame ring's host-visible memory, mapped for its lifetime and charged as
+the allocator holds it (D-40). A size beyond the device's `maxBufferSize` is
+`RefusedOutOfBounds` before anything is made, and a block the byte budget cannot
+hold is `RefusedBackpressure`. The ring is a managed generation the recording
+owns: no handle to it is returned, and it is released with every other live
+generation when the recording retires. The window integration makes it with
+`constructRing` in an owner-thread action.
+
+**Claims.** While a batch records, frame or frame-less alike,
+`claimRegion recorder size alignment` claims a region of the ring for it, and
+`writeClaim recorder claim offset bytes` writes into it — the backend's first
+CPU write path for drawing data:
+
+- A claim's alignment must be a power of two. On coherent memory the region
+  starts where asked; on non-coherent memory it also starts on the device's
+  `nonCoherentAtomSize` and is padded to a multiple of it, so no two claims
+  share an atom.
+- A claim that does not fit now is `RefusedBackpressure RingBudget`, once the
+  regions of batches whose submission has completed have been reclaimed to make
+  room. One larger than the whole ring, padded, can never fit and is
+  `RefusedOutOfBounds`, a distinct, permanent refusal. A claim of no bytes, an
+  alignment that is not a power of two and a session with no ring are
+  `RefusedIllegal`. The next region is tried where the last claim ended, then
+  from the ring's start, so claims wrap round.
+- A region is the batch's from its claim, bound or not, until the batch's
+  submission completes — observed through the model's completion fact — or the
+  batch is discarded or reset, its storage's invalidation having returned.
+  Nothing else reclaims it: an invalidation that raised, an unknown submission
+  effect and a device loss reclaim nothing, and a device loss reports no
+  completion.
+- A claim's number is never reissued: a claim whose region was reclaimed, and
+  perhaps handed to another, is `RefusedMisuse StaleIdentity`; another batch's
+  is `RefusedMisuse WrongParent`; another session's is
+  `RefusedMisuse ForeignIdentity`.
+- Writes are admitted only while the batch records: once its consumer returns
+  — sealed, partial or raised — its recorder is closed and a write is
+  `RefusedRecorderClosed`. A write past the bytes claimed is
+  `RefusedOutOfBounds`. The batch's submission makes its writes visible to the
+  device, as #335's resting use for host-written buffers records, so no barrier
+  is recorded; on non-coherent memory each write is flushed at once, over a
+  range aligned to the atom that never leaves its claim's padded region. A write
+  or flush that raised leaves the batch partial.
+- The batch's first claim is its first touch of the ring: it records the ring's
+  entry barrier, and the batch retains the ring's generation, which the barrier
+  names. A barrier cannot be recorded inside rendering, so a batch's first claim
+  inside a pass is `RefusedIllegal`; later claims may be made there.
+
+**Binding and drawing.** `bindVertexBuffer recorder binding source` binds vertex
+or instance data to a binding the bound pipeline declares, and
+`bindIndexBuffer recorder source indexType` binds 16-bit or 32-bit index data,
+each from a `BufferSource`: `FromBuffer` a managed buffer, or `FromClaim` a
+region the batch claimed, at an offset into it. Vertex input reads a
+`VertexBuffer` or an `IndexBuffer` in its `GeometryRead` use and an
+`InstanceBuffer` — the ring included — in its `InstanceRead` use; a vertex bind
+takes a vertex or instance buffer, an index bind an index or instance buffer,
+and any other kind is `RefusedWrongKind`. The bind touches the buffer in that
+use: the batch's first touch records its entry barrier, so a first touch
+inside a pass is `RefusedIllegal` — a consumer binds before the pass, or moves
+the buffer to its use before it — and a buffer this batch moved to another use
+is `RefusedIllegal`. `draw recorder vertices instances` draws instanced and
+`drawIndexed recorder indices instances` indexed and instanced, from the first
+vertex, index and instance, with `draw`'s existing checks; every binding the
+bound pipeline declares must be bound, a per-vertex one with data for every
+vertex `draw` reads and a per-instance one for every instance either reads, and
+an indexed draw needs index data holding every index it reads. The vertices an
+index names are the index data's to say, which the recording does not read, so
+an indexed draw checks a per-vertex binding is bound but not how far its reads
+reach.
+
+Before any native call a bind, push or draw is refused, recording nothing, when
+it has no bound pipeline (`bindPipeline` itself needs none); when its buffer's
+kind does not fit the use; when a managed buffer is released or not this
+session's, or a claim was reclaimed or is another batch's — a managed buffer
+is the session's, and several batches may bind it; when its offset falls
+outside the buffer or the bytes claimed (`RefusedOutOfBounds`), or an index
+offset is not a multiple of the index's size; or when a draw needs a binding or
+index data that is not bound, or more of either than is bound
+(`RefusedOutOfBounds`). Every bind retains exactly what it references through
+the transitive retention above: the managed buffer's generation, or the ring's.
+Binding a binding again releases nothing an earlier command captured, and a
+resource or claim no command references gains no binding retention.
+
+**The commands.** The native layer records `CommandPushConstants`,
+`CommandBindVertexBuffer`, `CommandBindIndexBuffer` and `CommandDrawIndexed`
+through the audited unsafe subset ([The FFI audit](#the-ffi-audit)), and
+creates layouts with their ranges and pipelines with their vertex input. The
+window integration lends the layout and pipeline constructions as
+`constructPipelineLayoutWith` and `constructPipelineWith`.
+
+**Proof.** The stand-in suite (`Test.GPU.Vulkan.Native.Drawing`) covers range
+and vertex-input validation, each refused with no native call; pushes inside
+and outside the ranges and their stage coverage; a pipeline switch changing
+what is checked while bindings stay bound; the ring's size validation, its one
+per session and a claim with none; claims reclaimed only on completion or
+discard, wrapping round, backpressure, and an oversized claim refused; regions
+kept through an invalidation that raised; atom padding and flushes on
+non-coherent memory; claims distinct across reuse, another batch's refused, a
+write past a claim and one after recording refused; the first claim refused
+inside rendering; indexed and instanced draws from ring regions with 16-bit
+indices and from managed vertex and 32-bit index buffers, with how far each
+read reaches; binds retaining exactly their references; and every refusal
+above with no native call. The surface-free native case `grs4-drawing` makes
+the ring, writes a quad's four vertices, its six 16-bit indices and two
+instance offsets into ring regions of a frame-less batch, pushes magenta as a
+fragment push constant, draws indexed and instanced into an `R8G8B8A8_SRGB`
+target cleared blue, copies it into a readback, waits on its ticket and reads
+exact bytes at probe points inside each instance's quad and outside both, with
+validation, synchronization validation included, reporting nothing. It writes
+the readback as a PNG to a temporary path its record prints.
+
+| State | Owner | Readers and writers | Thread | Lifetime | Reset or disposal |
+| --- | --- | --- | --- | --- | --- |
+| The shared ring: its generation, mapping, size, atom, next claim number and head | The recording (`Internal.Recording.State`) | `createRing` makes it; every claim reads it and advances the number and head | The graphics owner | From `createRing` until its buffer's disposal | Its generation released by `retireRecording` with every other live one; forgotten once the model records that disposal |
+| The ring's regions | The recording | `claimRegion` adds one for its batch and reclaims completed batches' to make room; a discard, reset or completed slot's invalidation, and a storage's disposal, release a dropped batch's | The graphics owner | From the claim until its batch's submission completes or its invalidation returns | Kept through an invalidation that raised, an unknown effect and a device loss; never reissued |
+| The bound pipeline's interface, and the vertex and index data bound | The recorder (`Recorder`) | `bindPipeline` sets the pipeline; `bindVertexBuffer` and `bindIndexBuffer` set the bindings; `pushConstants`, `draw` and `drawIndexed` read them | The graphics owner | One consumer action | Dropped with the recorder |
+
 ### Destruction
 
 `disposeResources` destroys, on the owner, every released generation the model
@@ -1485,7 +1656,7 @@ image, then frees its allocation (`vmaDestroyImage`), settling that too.
 
 D-28's production split, as built. The binding is compiled with
 `+safe-foreign-calls`, so every import of its own is `safe`; the package's only
-genuine `unsafe` Vulkan imports are the twelve `dynamic` imports in the private
+genuine `unsafe` Vulkan imports are the sixteen `dynamic` imports in the private
 `Hetoimasia.GPU.Vulkan.Native.Internal.Commands`, each calling the function
 pointer the binding's own device dispatch table (`DeviceCmds`) resolved for the
 command buffer's device, with structures marshalled by the binding's
@@ -1503,6 +1674,10 @@ its calling convention.
 | `vkCmdSetViewport` | Records dynamic state. |
 | `vkCmdSetScissor` | Records dynamic state. |
 | `vkCmdDraw` | Records a draw. |
+| `vkCmdPushConstants` | Records push-constant bytes, which the recording has checked fit the bound layout's ranges; they are copied into the command buffer during the call and not kept (GRS-4). |
+| `vkCmdBindVertexBuffers` | Records one buffer, already created, bound to one vertex input binding at an offset (GRS-4). |
+| `vkCmdBindIndexBuffer` | Records an already-created buffer bound as index data at an offset (GRS-4). |
+| `vkCmdDrawIndexed` | Records an indexed draw (GRS-4). |
 | `vkCmdCopyImageToBuffer` | Records a copy; it does not perform one. |
 | `vkCmdBeginDebugUtilsLabelEXT` | Records the opening of a label region; the label's name is marshalled for the call and not kept. |
 | `vkCmdEndDebugUtilsLabelEXT` | Records its closing. |
@@ -1534,7 +1709,7 @@ alone, under the same masked steps as the accounting around them.
 `ffiAllocatorImports`), the binding's flags, the allocator, and the C-only
 callback; the native case's record prints it, so it is part of the evidence
 identity beside the build's source digest. The headless suite reads the
-package's own import declarations and requires exactly those twelve `dynamic`
+package's own import declarations and requires exactly those sixteen `dynamic`
 imports and, besides them, only the capture callback's address import and the
 allocator shim's entries.
 
@@ -3179,6 +3354,7 @@ VK-18's D-33 order and releases nothing early.
 | Managed records | The recording | Construction inserts; release, replacement and disposal advance each one's standing | The owner | From construction until the model records the disposal | Removed once the model records it; kept, explicitly uncertain, when a destruction raised; never retried |
 | Frame storages | The recording | Construction inserts one per target frame slot; disposal removes it | The owner | As its managed record | As its managed record |
 | Batch records | The recording | `recordFrame` inserts; a discard or reset removes one after the invalidation returned | The owner | From admission until invalidated | Kept, explicitly uncertain, when an invalidation raised; never retried |
+| The shared ring and its regions | The recording | `createRing` makes it; a recorder's claims add regions and reclaim completed batches'; a dropped batch's go with its record | The owner | From `createRing` until its buffer's disposal; each region until its batch completes or is invalidated | Released at retirement with every live generation; regions never reissued, kept through an invalidation that raised |
 | A recorder | Its `recordFrame` | The consumer action | The owner | One consumer action | Closed when the action returns or raises |
 | Slot synchronization | The frames | `Acquisition` creates a slot's three objects and marks its acquisition; `Submission`, `Abandonment` and `Progress` advance each object's state; `Loss` marks what was owed lost; `Progress` destroys them | The owner | From the slot's first reservation until the target's frames retire | Destroyed once idle, or after the device's loss whatever they were owed; kept, explicitly uncertain, when a call on them raised, and never destroyed again once a destruction raised |
 | Presentation pool | The frames | `Acquisition` creates a record and binds it to a frame; `Submission`, `Presentation`, `Abandonment` and `Progress` advance its semaphore and fence; `Presentation` rebinds it to its presentation; `Loss` frees what the loss released; `Progress` frees and destroys it | The owner | From the first reservation that needs it until the target's frames retire | Freed by the retirement or settlement the model recorded, or by the device-loss release; destroyed once free and idle; kept, explicitly uncertain, when a call on it raised |
