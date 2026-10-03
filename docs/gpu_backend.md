@@ -1711,7 +1711,11 @@ it does not support — a nested push-constant struct, a matrix or array vertex
 input, a texel buffer, an input attachment, a vertex input starting past its
 location's first component — is an error naming it, never an empty or a
 matching interface; so is an interface naming an id the module defines no
-variable for, a descriptor variable lacking its `DescriptorSet` or `Binding`, a
+variable for, any type an interface variable reaches — through pointers,
+struct members, array elements and lengths, vector components, matrix columns,
+image sampled types and sampled images' images — that the module does not
+define or defines malformed, a descriptor variable lacking its `DescriptorSet`
+or `Binding`, a
 buffer whose element is not a defined struct decorated as its storage class
 requires, and a combined image sampler over anything but a defined, sampled
 image of a supported dimension. Push-constant extents are computed without bound, so a
