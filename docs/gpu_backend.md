@@ -1010,6 +1010,7 @@ No caller-supplied text reaches a name.
 | A pipeline layout, a pipeline | `resource <n>.<generation> pipeline layout`, `… pipeline` | After the model issues the `ResourceId`, before the handle is returned |
 | A pipeline's vertex and fragment shader modules | `resource <n>.<g> pipeline vertex shader`, `… fragment shader` | Each right after it is created and before the pipeline is built from it, under the `ResourceId` the model is about to issue the pipeline; the modules are destroyed once it is built |
 | A frame storage's pool and command buffer | `resource <n>.<g> command pool target <t> slot <s>`, `… command buffer …` | The same |
+| A frame-less slot's fence | `frame-less slot <s> submission fence` | Right after it is created at the slot's first submission, before it is recorded |
 | A readback's buffer | `resource <n>.<g> readback buffer` | The same. Its allocation is named the same inside the allocator, through VMA, whether or not the device offers naming; the device memory it lies in, which other allocations share, is named nowhere |
 | A managed buffer | `resource <n>.<g> buffer` | The same, its allocation named the same inside the allocator, as a readback's is |
 | A managed image, and its owned view | `resource <n>.<g> image`, `… image view` | The same, the image's allocation named as the image inside the allocator |
@@ -3431,7 +3432,17 @@ the fence is never asked again, and the submission is kept with its ticket
 pending — retaining it and the device, and letting a later loss report it
 lost. A slot's fence is made at its first submission; one whose creation ran
 out of memory is recovered once, as a frame slot's are (VK-14), and one that
-is not recovered discards the batch without recording it again.
+is not recovered discards the batch without recording it again. Once made,
+the fence is named `frame-less slot <s> submission fence` when the device
+offers naming, before it is recorded and never again, and a naming that raised
+destroys it once: when that returns nothing is recorded and the rollback fails
+nothing itself — a loss the naming reported stays latched — the naming failure
+is raised, and the slot's next submission makes and names a new fence while
+the session runs; when that destruction raised too, the fence is kept,
+uncertain, and never passed to another native call, under the device-loss rule
+too, the session fails with `CleanupFailed`, and the destruction is retained
+beside the naming failure under the `vulkan frame synchronization rollback`
+label.
 
 **Device loss and retirement.** After the device's loss no fence is asked or
 waited on: the device-loss release lets go of every frame-less submission,
