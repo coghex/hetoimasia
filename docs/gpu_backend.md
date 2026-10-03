@@ -387,8 +387,14 @@ The owner's construction takes the deposit:
   is the bootstrap:
   every physical device is queried with each queue family's presentation
   support for that surface, `selectDevice` takes the first satisfying the
-  profile — Vulkan 1.3, `dynamicRendering`, `synchronization2`,
-  `VK_KHR_swapchain`, `VK_EXT_swapchain_maintenance1` and its
+  profile — Vulkan 1.3, `dynamicRendering`, `synchronization2`, the texture
+  table's six descriptor-indexing features (`runtimeDescriptorArray`, `descriptorBindingPartiallyBound`,
+  `descriptorBindingSampledImageUpdateAfterBind`,
+  `shaderSampledImageArrayNonUniformIndexing`,
+  `descriptorBindingVariableDescriptorCount` and
+  `descriptorBindingUpdateUnusedWhilePending`,
+  [The texture table](#the-texture-table)), `VK_KHR_swapchain`,
+  `VK_EXT_swapchain_maintenance1` and its
   `swapchainMaintenance1` feature, and one queue family answering both
   graphics and presentation — and the device is created with that family's one
   queue and `VK_KHR_portability_subset` exactly where the device advertises
@@ -2148,6 +2154,295 @@ nothing.
 | Uploaded index data | The recording (`recordingIndexData`) | A completed index-buffer upload stores it; indexed draws read it | The graphics owner | From completion until the buffer is forgotten | Deleted by `forget` |
 | The buffers uploads have filled | The recording (`recordingFilled`) | Admission adds a buffer and reads the set for freshness; a cancellation before any copy, and an admission given back, remove it | Any, in STM | From admission until the buffer is forgotten | Deleted by `forget` |
 
+### The texture table
+
+GRS-7 (#343) is the bindless texture table. Its design is D-1, D-11, D-22,
+D-23, D-27, D-31 and D-35 of the
+[resource services design](designs/gpu_resource_services_design.md). A
+texture registered with the table gets a stable handle. Shaders resolve the
+handle through a lookup version that each batch freezes when it first binds
+the table, then sample one update-after-bind array of images with one of four
+shared samplers. The pure rules — handles, versions and slot reuse — live in
+`Hetoimasia.GPU.Model.TextureTable` and run without a device. The native
+table lives in the private `Internal.Recording.Table` and
+`Internal.Recording.Lookup` modules, and `Hetoimasia.GPU.Vulkan.Native.TextureTable`
+is its public surface.
+
+**The profile.** The table needs six Vulkan 1.2 descriptor-indexing
+features:
+
+- `runtimeDescriptorArray`;
+- `descriptorBindingPartiallyBound`;
+- `descriptorBindingSampledImageUpdateAfterBind`;
+- `shaderSampledImageArrayNonUniformIndexing`;
+- `descriptorBindingVariableDescriptorCount`;
+- `descriptorBindingUpdateUnusedWhilePending`.
+
+The roots read them from `VkPhysicalDeviceVulkan12Features` (`BindlessFeatures`
+in `DeviceOffer`) and enable all six when they create the device. Device
+selection refuses a device missing any of them with `DeviceFeatureMissing`,
+naming each missing feature, so `NoCompatibleDevice` lists everything each
+candidate lacks. MoltenVK 1.4.2 on an Apple M3 Max offers all six, and an
+update-after-bind sampled-image limit of 1,000,000 per stage and per set.
+
+**Configuration.** `validateTableConfig capacity initial versions` validates
+three values once and never clamps them:
+
+- the cap: how many texture slots the layout declares;
+- the initial size: how many slots the set allocates, slot 0 included, so at
+  least two, and no more than the cap;
+- the length of the version ring, `defaultVersionCount` (8) unless the
+  application chooses otherwise.
+
+Zero, negative and unrepresentable values are refused, naming the value
+(`TableConfigRefused`). The table is fixed-size: it allocates its initial
+size, and growth up to the declared cap is GRS-14's.
+
+**Making it.** `createTextureTable recording uploads config` makes the
+session's one table, on the owner's thread. A second is `RefusedMisuse`
+`DuplicateSubject`. Before anything is made, the table is checked against
+the device; each check that fails is `RefusedOutOfBounds`, naming what was
+asked for and the limit, and nothing is made:
+
+- the cap against `maxDescriptorSetUpdateAfterBindSampledImages`;
+- the four samplers against `maxDescriptorSetUpdateAfterBindSamplers`;
+- a stage's every table binding (the cap, four samplers and the lookup
+  buffer) against `maxPerStageUpdateAfterBindResources`;
+- the two sets against `maxBoundDescriptorSets`;
+- one version's bytes against `maxStorageBufferRange`;
+- the whole ring against the largest buffer the device makes.
+
+Then, in order, it makes:
+
+1. **Four immutable samplers**, in index order: nearest/clamp-to-edge,
+   nearest/repeat, linear/clamp-to-edge and linear/repeat (`TableSampler`).
+   Linear samplers filter mips linearly; none is anisotropic.
+2. **Set 0's layout.** Binding 0 is the four samplers. Binding 1 is the
+   sampled-image array, declared at the cap and flagged update-after-bind,
+   partially bound, update-unused-while-pending and variable-count. It is the
+   highest binding, as Vulkan requires of a variable-count binding. The
+   layout is created with the update-after-bind pool flag.
+3. **Set 1's layout**: one dynamic storage buffer at binding 0. An
+   update-after-bind set may not hold a dynamic buffer
+   (`VUID-VkDescriptorSetLayoutCreateInfo-flags-03000`), which is D-35's
+   reason for a second set.
+4. **A pool and a set for each.** Set 0's pool is update-after-bind, and its
+   set is allocated with the initial size as its variable count.
+5. **The version ring**: one host-visible lookup buffer, made and mapped as
+   the uploads' staging buffer is (`createMapped`). One version is the
+   initial size's lookup entries of eight bytes each, a little-endian slot
+   then generation. Versions sit at a stride rounded up to both the device's
+   `minStorageBufferOffsetAlignment` and its non-coherent atom. Set 1's
+   descriptor is written once, over one version's range.
+6. **One managed version generation for each ring entry.** It owns no
+   native object; a batch that binds the table at that entry retains it.
+7. **Slot 0's placeholder**: a one-by-one transparent-black RGBA8 texture,
+   whose upload is admitted through the session's uploads.
+
+If any step is refused or raises, everything made so far is released. The
+table can be bound once the placeholder's upload has completed and its
+descriptor has been written; until then binding is `RefusedNotWritten`.
+
+**Handles.** `registerTexture recording image` takes a live `TextureImage`
+of this session and answers a `TextureHandle`: a lookup index and a
+generation, which is never zero and never persisted. It reserves a free
+index and a free slot. Slot 0 is never issued and counts against the
+table's size.
+
+- Until the image's upload has completed, the handle resolves to slot 0. A
+  texture counts as complete once the model holds it initialized and no
+  upload holds it any longer.
+- Its descriptor is written into its slot when the owner next brings the
+  table up to date. Versions published after that map the handle to its
+  slot.
+- From registration on, the table holds the image. `releaseManaged` on it is
+  refused; the handle is released instead.
+
+`releaseTexture recording handle` ends a handle. Its index may be issued
+again at once under the next generation, and its slot retires. Its image
+stays held until no live version maps the slot, and is then released as any
+managed image is (deferred while an upload still holds it).
+
+`registerTexture` refuses:
+
+- an image that is not a live texture of this session;
+- an image already registered (`DuplicateSubject`);
+- a full table (`RefusedBackpressure` `TextureSlotBudget`), until a slot is
+  reclaimed.
+
+A handle released, of an older generation, or never issued is
+`RefusedStaleHandle` wherever it is used.
+
+**Versions.** A version is a whole-table copy: every lookup index's slot and
+generation. An index no live handle holds reads as slot 0 with generation 0.
+
+- A new version is published only when a mapping has changed since the
+  current one: a texture completed, or a handle released. It is written into
+  a ring entry that no batch holds and that is not the current version, then
+  flushed when its memory is not coherent. The submission that follows makes
+  the write visible to the device (D-26).
+- When nothing changed, every batch binds the current version, however many
+  entries are held.
+- When a new version is owed and every other entry is held, binding is
+  `RefusedBackpressure` `LookupVersionBudget`.
+- An entry is held while its version generation has a recorded reference or
+  a submitted use in the model. Those holds end when the batch completes, or
+  when it is discarded, as every managed resource's do.
+
+**Slot reuse.** A slot is reused, and its descriptor rewritten, only once no
+live version maps it. A version is live while a batch holds it, and the
+current version also while no mapping has changed since it was published,
+the only time a batch can still bind it. Descriptor writes therefore target
+only a slot that no recorded or pending batch can sample:
+
+- a slot just reserved for a registration, which was free;
+- slot 0 before the table is first bound.
+
+So a batch recorded before a texture is released or replaced still samples
+the original image when it is submitted later. The image, its view and its
+allocation stay held until that batch completes, because its version keeps
+the slot retiring and the image unreleased. A texture released before its
+upload completes was never written into a version, so its slot is reclaimed
+at once. Its image is released after that upload settles.
+
+**Bringing it up to date.** `refreshTable` writes the placeholder once its
+upload completes and writes each newly complete texture into its slot. It
+then reclaims every retiring slot no live version maps, releasing its image.
+It runs:
+
+- before every binding;
+- after every registration;
+- once in every owner step of the window integration, after the step's
+  uploads (`refreshRenderingTable`), so a released texture's image goes even
+  when nothing binds the table again;
+- whenever the owner calls `refreshTextureTable`.
+
+**Pipelines.** `createTablePipelineLayout recording shaders samplerOffset`
+makes a pipeline layout holding both of the table's set layouts, from set 0
+on, and exactly the checked shaders' push-constant ranges. Its shaders may
+declare the table's own bindings (`textureTableDescriptors`): set 0's four
+samplers at binding 0 and runtime-sized image array at binding 1, and set
+1's storage buffer at binding 0. They may declare no other binding. A layout
+from `createPipelineLayoutFor` declares no set, so a shader declaring any
+descriptor binding is refused there. The sampler offset must be a multiple
+of four and lie whole within a fragment-stage range. Refused before any
+native call:
+
+- a session with no table;
+- an offset that is unaligned or outside every fragment range;
+- whatever the checked-range and push-range validation refuse.
+
+**Binding and drawing.** `bindTable recorder` binds both sets under the bound
+pipeline's layout, with the dynamic offset of the batch's version, through
+`vkCmdBindDescriptorSets`. A batch takes its version at its first binding
+and keeps it: a later binding in the same batch, after any change, binds the
+same version. The batch retains the version generation and the table's
+samplers, set layouts, pools and lookup buffer. `selectSampler recorder n`
+pushes `n` at the layout's declared sampler offset. Binding a pipeline whose
+layout does not hold the table disturbs the binding and the sampler, so the
+table's pipeline needs both again. Refused with no native call:
+
+- binding with no pipeline bound, under a pipeline whose layout does not
+  hold the table, or in a session with no table;
+- a sampler index above 3 (`RefusedOutOfBounds`), or a sampler selected
+  under a pipeline without the table;
+- a push over the sampler index's four bytes;
+- a draw with a table pipeline before the table is bound under a compatible
+  layout, or before a sampler is selected.
+
+**The shaders.** `tableShaders` (in `Recording.Shaders`) are the reference
+pair the native case draws with. The vertex shader covers the render area
+with one triangle. The fragment shader resolves the pushed handle: an index
+past the version's `entries.length()`, or an entry whose generation differs
+from the handle's, resolves to slot 0 before any descriptor is read. It then
+samples that slot (`nonuniformEXT`) with the pushed sampler, clamped to 3.
+Their interface descriptions are `tableVertexInterface` and
+`tableFragmentInterface`: the handle at push offset 0 and the sampler index
+at `tableSamplerOffset` (8).
+
+**The window integration.** An owner-thread action has:
+
+- `constructTextureTable`, over the session's uploads; the host must
+  configure `vulkanUploads`, or it is refused;
+- `constructTablePipelineLayout`;
+- `registerConstructedTexture` and `releaseConstructedTexture`;
+- `readConstructedTable`.
+
+A renderer or a frame-less batch records `bindTable` and `selectSampler` as
+it records any command.
+
+**Observation.** `readTable` shows:
+
+- the mapping a version published now would hold;
+- the current version and the live ones;
+- the slots live versions map, the free slots and the retiring slots;
+- whether the placeholder is written;
+- the stride and each ring entry's version generation.
+
+**Proof.** The pure examples (`Test.GPU.Model.TextureTable`, in
+`gpu-model-tests`) cover:
+
+- configuration refusals;
+- the placeholder before completion and stale handles after release;
+- index reuse under a new generation;
+- versions published only on change, and the current one bindable while
+  every entry is held;
+- backpressure with no partial registration or version;
+- slots reused only once no live version maps them;
+- a released, never-bound texture's slot freed at once;
+- `resolveHandle`'s bounds and generation checks.
+
+The stand-in examples (`Test.GPU.Vulkan.Native.Table`, in `native-tests`)
+cover:
+
+- the table's native objects, and the sizes it asks for;
+- every device-limit refusal before anything is made;
+- the table's pipeline layouts and their refusals;
+- binding both sets with the version's offset, and the sampler push;
+- every recorder refusal with exactly one native call between them;
+- a batch's version kept through a later change and a rebind;
+- binding refused before the placeholder is written;
+- descriptor writes only into slots no live version maps;
+- versions held to completion, with backpressure;
+- the current version bound while every entry is held;
+- stale handles;
+- a release before the upload completes;
+- a discarded batch's version freed;
+- the record-then-release case.
+
+A mutation check that ignored version holds failed the three hold-dependent
+examples. The device-profile examples refuse a device missing any of the six
+features, by name. The shader suite checks that `tableShaders`' SPIR-V
+declares exactly the table's three bindings and matches its descriptions.
+
+The surface-free native case `grs7-texture-table` makes a table of sixteen
+slots, eight at first, over the session's uploads. It then draws four
+frame-less batches, each into a 64-by-64 RGBA8 target that is copied back
+and probed:
+
+1. a texture registered before its upload reads as transparent black, the
+   placeholder;
+2. after red, green and blue two-by-two textures upload, red and green are
+   drawn side by side with different samplers;
+3. a batch is recorded with red's handle. Before it is submitted (when its
+   action returns), the handle is released and blue is registered. The batch
+   still draws red; blue took a different slot, and red's slot is the only
+   one retiring;
+4. blue is drawn beside red's released handle, which the shader resolves to
+   the placeholder.
+
+Once every batch has completed, the owner's step reclaims red's slot. A
+second release of red's handle is `RefusedStaleHandle`. Validation, with
+synchronization validation, reports nothing.
+
+| State | Owner | Readers and writers | Thread | Lifetime | Reset or disposal |
+| --- | --- | --- | --- | --- | --- |
+| The table's book: handles, generations, the slot map, the current version, the free and retiring slots | The recording (`recordingTable`, `tableBook`) | Registration, release, completion, binding and reclamation, all through the pure rules | The graphics owner; observers read it in STM | From `createTextureTable` until the recording retires | Never reset; the recording's retirement releases what it holds |
+| The samplers, set layouts, pools and sets | The recording, as managed generations the table names | Made once; bound by batches, which retain them | The graphics owner | Until `retireRecording` | Destroyed with every other managed resource, pools before set layouts before samplers |
+| The version ring's buffer and mapping | The recording, as a managed lookup buffer | The owner writes a version into an entry no batch holds; the device reads the entry a batch bound | The graphics owner | Until `retireRecording` | Destroyed with every other managed resource |
+| Each ring entry's version generation | The recording | Batches retain it through the model's holds; `versionHeld` reads them | The graphics owner | Until `retireRecording` | Destroyed with every other managed resource |
+| The images the table holds | The recording (`tableTextures`) | Registration adds; reclamation removes and releases | The graphics owner | From registration until no live version maps the image's slot | Released then; destroyed once nothing holds it |
+
 ### Destruction
 
 `disposeResources` destroys, on the owner, every released generation the model
@@ -2171,7 +2466,7 @@ image, then frees its allocation (`vmaDestroyImage`), settling that too.
 
 D-28's production split, as built. The binding is compiled with
 `+safe-foreign-calls`, so every import of its own is `safe`; the package's only
-genuine `unsafe` Vulkan imports are the eighteen `dynamic` imports in the private
+genuine `unsafe` Vulkan imports are the nineteen `dynamic` imports in the private
 `Hetoimasia.GPU.Vulkan.Native.Internal.Commands`, each calling the function
 pointer the binding's own device dispatch table (`DeviceCmds`) resolved for the
 command buffer's device, with structures marshalled by the binding's
@@ -2193,6 +2488,7 @@ its calling convention.
 | `vkCmdBindVertexBuffers` | Records one buffer, already created, bound to one vertex input binding at an offset (GRS-4). |
 | `vkCmdBindIndexBuffer` | Records an already-created buffer bound as index data at an offset (GRS-4). |
 | `vkCmdDrawIndexed` | Records an indexed draw (GRS-4). |
+| `vkCmdBindDescriptorSets` | Records a binding of the texture table's two already-written sets under an already-created layout, with one dynamic offset; the set and offset arrays are marshalled for the call and not kept (GRS-7). |
 | `vkCmdCopyImageToBuffer` | Records a copy; it does not perform one. |
 | `vkCmdCopyBuffer` | Records one region's copy from the staging buffer into a buffer; it does not perform one (GRS-6). |
 | `vkCmdCopyBufferToImage` | Records one band of whole block rows' copy from the staging buffer into a mip level; it does not perform one (GRS-6). |
@@ -2226,7 +2522,7 @@ alone, under the same masked steps as the accounting around them.
 `ffiAllocatorImports`), the binding's flags, the allocator, and the C-only
 callback; the native case's record prints it, so it is part of the evidence
 identity beside the build's source digest. The headless suite reads the
-package's own import declarations and requires exactly those eighteen `dynamic`
+package's own import declarations and requires exactly those nineteen `dynamic`
 imports and, besides them, only the capture callback's address import and the
 allocator shim's entries.
 
@@ -3357,7 +3653,8 @@ always, then — before it leases the instance to the surface bridge — the roo
    family as not presenting);
 2. `selectSurfaceFreeDevice` takes the first device satisfying the whole
    profile except the presentation requirement: Vulkan 1.3,
-   `dynamicRendering`, `synchronization2`, `VK_KHR_swapchain`,
+   `dynamicRendering`, `synchronization2`, the texture table's six
+   descriptor-indexing features, `VK_KHR_swapchain`,
    `VK_EXT_swapchain_maintenance1` and its `swapchainMaintenance1` feature,
    `VK_KHR_portability_subset` where advertised, and one queue family that
    answers graphics. Dropping only presentation keeps every extension and
@@ -4501,7 +4798,7 @@ companions — and adds the Vulkan owner's:
 | Main thread | Hspec runs on a thread of its own; the process main thread owns one shared production graphics session: `withLoaderIntegration`, then `runGraphicsOwnerApplication` over `withVulkanOwnerHost`, with the production native layer and surface bridge. An example that needs the main thread — to hand a window's surface over, which GLFW creates there, or to close a window — submits an operation (`onMain`); the main thread runs it between two turns of the host's owner loop and returns its result or rethrows its failure. Windows are created through the host's command port from the example's own thread, which the owner loop executes, as an application's worker would. |
 | Identities | Every dispatched operation is checked, before it runs, to be on the bound process main thread that entered the session — the Haskell thread, the bound flag, and the OS thread read through `pthread_self` — and a failed check fails the operation and the run. Every native call the session makes is recorded where it runs by a `NativeObserver`, so an example shows from the calls themselves that the instance, its messenger, the device and every surface's destruction ran on the graphics owner's thread and every surface's creation on the main thread — never from the name of an Hspec hook. |
 | Sharing | The roots — the instance, its explicit messenger, and the one device — are acquired lazily, by the first dispatched operation, at most once, and shared by every later example. Each example's windows and targets are its own and are closed inside it. |
-| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, `vk12-frames`, `vk13-presentation`, `vk14-recovery`, `vk15-validation-stop`, `vk15-retention`, `vk16-composed`, `vk17-one-slot`, `vk17-two-slots`, `vk19-capture`, `grs15-surface-free`, `grs15-surface-free-window`, `grs12-frameless`, `grs3-ordering`, `synchronization-hazard`, `debug-names`, and, under the isolated compositor's consent only, `wayland-connection-loss`. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. Each child runs in a process group of its own under an external 20-second deadline covering its exit and the end of its output; one still running at it is terminated with its group and fails its example as expired. |
+| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, `vk12-frames`, `vk13-presentation`, `vk14-recovery`, `vk15-validation-stop`, `vk15-retention`, `vk16-composed`, `vk17-one-slot`, `vk17-two-slots`, `vk19-capture`, `grs15-surface-free`, `grs15-surface-free-window`, `grs12-frameless`, `grs3-ordering`, `grs7-texture-table`, `synchronization-hazard`, `debug-names`, and, under the isolated compositor's consent only, `wayland-connection-loss`. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. Each child runs in a process group of its own under an external 20-second deadline covering its exit and the end of its output; one still running at it is terminated with its group and fails its example as expired. |
 | Selection | Building, listing and filtering the tree, a `--dry-run`, and a selection that dispatches nothing acquire nothing and start no child. A selection matching no example fails. `--complete`, which the catalog group passes, runs the whole tree with Hspec's configuration reading left out and then fails unless the shared session was acquired once and every private scenario the run's consent requires ran and passed — every one, except that `wayland-connection-loss` is required under the isolated compositor's consent and pending under any other — so no ambient setting can turn the group's receipt into a pass for a subset. The consent rules and the migrated proof's pure release, construction, publication and loader-selection examples need no session and run without consent. |
 | Consent | Read once, at startup, from `HETOIMASIA_NATIVE_SESSION`, with the GLFW suite's rules for `desktop`, `isolated-x11:<display>` and `isolated-wayland:<socket>`: the last only on Linux, only when `WAYLAND_DISPLAY` names that socket, and never beside a `DISPLAY`. Under the Wayland consent every session requests Wayland by name — the shared host, each child's host, the VK-5 bridge's loader-aware session, and the proof shim's raw initialization, which sets `GLFW_PLATFORM` and fails one that selected another platform — so no X11 or XWayland session stands in; under the others every session requests nothing, as before. The first shared example asserts the platform GLFW selected before any example renders. Without consent every native example is refused before its body, the session is never acquired, and the run ends with the refusal on stderr and a non-zero exit. |
 | Environment | Before any Vulkan call, the suite clears every ambient discovery override and every validation-layer setting it finds and records which, disables implicit layers, and points the layer's settings file at an empty one; a child inherits and re-establishes the same environment. |
