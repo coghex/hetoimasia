@@ -1707,23 +1707,44 @@ under their stride; a vertex shader's inputs that are not built-ins, by
 location and scalar or vector type; and each descriptor's set, binding, kind and
 count. A fragment shader's inputs and outputs and a vertex shader's outputs are
 varyings, which the validation layer checks at pipeline creation, and built-ins
-are the device's: it reports neither. A module it cannot read, or a construct
-it does not support — a nested push-constant struct, a matrix or array vertex
-input, a texel buffer, an input attachment, a vertex input starting past its
-location's first component — is an error naming it, never an empty or a
-matching interface; so is an interface naming an id the module defines no
-variable for, any type an interface variable reaches — through pointers,
-struct members, array elements and lengths, vector components, matrix columns,
-image sampled types and sampled images' images — that the module does not
-define or defines malformed (an integer or float of a width SPIR-V does not
-allow, an array length whose constant is not of a defined 32-bit integer type,
-an image sampled type that is not void or a well-formed scalar), a descriptor variable lacking its `DescriptorSet`
-or `Binding`, a
-buffer whose element is not a defined struct decorated as its storage class
-requires, and a combined image sampler over anything but a defined, sampled
-image of a supported dimension. Push-constant extents are computed without bound, so a
-member reaching beyond what 32 bits can hold is refused rather than wrapped,
-and `checkedRanges` refuses such members in a description the same way
+are the device's: it reports neither.
+
+Before it reads anything, the reader checks every type and constant an
+interface variable reaches against one explicit whitelist, the subset it
+supports:
+
+- each variable's storage class is one it knows — UniformConstant, Input,
+  Uniform, Output, Workgroup, Private, PushConstant or StorageBuffer — and its
+  type is an `OpTypePointer` of that same storage class;
+- every id an instruction names resolves to a type or constant declared before
+  that instruction, so forward references, self-references and cycles are
+  refused, and no id is declared twice;
+- every id names the kind its position requires: a pointer's pointee is a type
+  other than void or a pointer; an array's or runtime array's element is a
+  sized or opaque type; a struct's members are sized types, with a runtime
+  array only as the last; a vector's component is a scalar; a matrix's column
+  is a float vector; an image's sampled type is a 32-bit float or a 32- or
+  64-bit integer; a sampled image's image is an image; and an array's length is
+  an `OpConstant` of a 32-bit integer type with a positive value;
+- every instruction has exactly the operands its opcode takes, with literals in
+  range: integer widths of 8, 16, 32 or 64 and signedness 0 or 1, float widths
+  of 16, 32 or 64, vectors of 2–4 components, matrices of 2–4 columns, image
+  operands within their enumerations, and a known pointer storage class;
+- nothing an Input, Output, Uniform, PushConstant or StorageBuffer variable
+  reaches is a boolean or an opaque type.
+
+The first instruction that fails is an error naming it, the rule it breaks and
+the variable that reaches it. A module the reader cannot read, or a supported
+shape it does not read — a nested push-constant struct, a matrix or array
+vertex input, a texel buffer, an input attachment, a vertex input starting past
+its location's first component — is likewise an error naming it, never an
+empty or a matching interface. So are an interface naming an id the module
+defines no variable for, a descriptor variable lacking its `DescriptorSet` or
+`Binding`, a buffer whose struct is not decorated as its storage class
+requires, and a combined image sampler over an image that is not sampled or
+not of a supported dimension. Push-constant extents are computed without
+bound, so a member reaching beyond what 32 bits can hold is refused rather than
+wrapped, and `checkedRanges` refuses such members in a description the same way
 (`RefusedOutOfBounds`).
 
 **The checked splices.** `checkedVertexShader` and `checkedFragmentShader` take
@@ -1771,8 +1792,9 @@ descriptor kind with a fixed and a runtime-sized array; refusals of a nested
 push-constant struct, a matrix input, an input attachment, a push-constant
 member beyond 32 bits, an interface naming an undefined id, a component-offset
 vertex input, descriptors stripped of their set and binding, buffers stripped of
-their struct or `Block`, a combined image sampler over an undefined image, and
-malformed modules; and no interface in
+their `Block`, and malformed modules; and, in `Test.Shader.Malformed`, one
+rejecting mutation of a valid fixture for every whitelist rule, with a
+too-many and a too-few operand count for every fixed-count opcode; and no interface in
 the interface-free verification pair. Matching checked shaders in the source
 and file forms, with vertex and instance host layouts and fixed and
 runtime-sized arrays, compile with the suite. External clients, each compiled
