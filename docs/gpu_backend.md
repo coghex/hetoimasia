@@ -1842,8 +1842,9 @@ decides the request, in this order:
 5. It must be fresh (`UploadNotFresh`):
    - a texture the model still records as uninitialized, so neither one
      already initialized nor one another batch is initializing;
-   - a buffer that no upload has been admitted into, and that no recorded or
-     submitted batch still holds.
+   - a buffer that no upload has been admitted into — through any uploads
+     over the recording, which keeps that set (`recordingFilled`) — and that
+     no recorded or submitted batch still holds.
 6. The bytes must initialize the target exactly (`UploadMalformed`, saying
    what differs). A texture needs every level it declares, each the size its
    format's blocks and that level's extent need (`levelBytes`). A buffer needs
@@ -1869,11 +1870,14 @@ so the caller's bytes are free when admission returns. The copy runs
 interruptibly; if it raises or is cancelled, every reservation is given back
 and the exception is re-raised. If the owner's exit began during the copy, the
 reservations are given back too and the answer is `UploadClosed`. Otherwise the
-upload is queued. The window integration's `submitVulkanUpload` first refuses
-as an owner-thread action is refused: once the session has failed, with its
-primary, or once the owner's admission has closed. Its wake asks whether an
-upload is waiting (`uploadsWaiting`), so admission makes an idle owner
-runnable.
+upload is queued. `submitUploadGated` reads a caller's gate in both
+transactions, the one that reserves and the one that queues: a refusal in
+either gives every reservation back. The window integration's
+`submitVulkanUpload` gates on the owner's own admission, so it refuses as an
+owner-thread action is refused — once the session has failed, with its
+primary, or once the owner's admission has closed — and no upload is queued
+after quiescence closes the owner. Its wake asks whether an upload is waiting
+(`uploadsWaiting`), so admission makes an idle owner runnable.
 
 **The exclusive target.** From admission until its upload settles, a target
 belongs to the upload alone. Every other batch's ordered use of it is
@@ -1890,7 +1894,9 @@ window integration calls it once per owner step, after the step's fence poll,
 so an upload whose final batch that poll observed complete settles in the same
 step. Each call:
 
-1. After the device's loss, settles every unsettled upload as lost.
+1. After the device's loss, settles every unsettled upload as lost, except
+   one whose caller is still copying its bytes into staging: its region stays
+   that caller's until it finishes, and the upload is lost on a later turn.
 2. Observes each batch in flight:
    - one complete moves its upload on, or completes the upload if it carried
      the final copies;
@@ -1901,7 +1907,11 @@ step. Each call:
 4. Records the next copies of every queued or uploading upload that has
    copies left and no batch in flight. It takes them in admission order, into
    one frame-less batch, up to the turn's budget, while admission is open and
-   the session is running:
+   the session is running. The transaction that plans the turn also claims
+   each planned upload, so no cancellation, close or release can settle it,
+   freeing its staging, while its copies are recorded and submitted; a
+   recording that raised leaves its uploads claimed, their staging held until
+   retirement:
    - a texture's copies are whole block rows of one level at a time
      (`CommandCopyBufferToImage`), so a BC7 level's last, partial block row
      reaches the level's edge;
@@ -1948,16 +1958,20 @@ nothing and completes nothing. It is `RefusedOwnerWait` on the owner's thread,
 whose own progress the upload needs.
 
 **Cancellation.** `cancelUpload` runs on any thread, in STM, and works only
-before an upload's first copies are recorded. It frees the staging region,
-answers `UploadCancelled`, and leaves the target as it was: uninitialized and
-free for another upload. Once copies are recorded, the upload completes;
-cancelling then is `CancelStarted`. A settled upload is `CancelSettled`, and
+before the owner claims an upload to record its first copies. It frees the
+staging region, answers `UploadCancelled`, and leaves the target as it was:
+uninitialized and free for another upload. Once the upload is claimed, it
+completes; cancelling then is `CancelStarted`. A settled upload is `CancelSettled`, and
 a ticket these uploads did not issue is `CancelUnknown`.
 
 **Exit.** At the owner's exit, `closeUploads` closes admission before the
 drain and cancels every upload not yet started. Uploads already started go on
 with the other frame-less work the drain waits for. After the drain,
-`retireUploads` observes their batches once more. It settles each still
+`retireUploads` first waits for every caller still copying its bytes into
+staging, each of which then finds admission closed and gives its reservations
+back, so the staging buffer is never unmapped under a writer; that wait is for
+copies into mapped memory already under way. It then observes the batches in
+flight once more, and settles each still
 unsettled upload as lost after a device loss, and otherwise as cancelled (left
 unfinished by the exit), its target released with the rest of the recording.
 The staging buffer is a managed buffer like any other, destroyed by
@@ -1996,6 +2010,10 @@ The staging buffer is a managed buffer like any other, destroyed by
 - targets not fresh or already targeted;
 - reservations given back when the caller's copy raised;
 - one winner of two uploads racing for one target;
+- a gate closed before admission, or closing while the bytes are copied,
+  refusing the upload with every reservation given back;
+- a buffer an upload filled refused as not fresh through a second uploads
+  over the same recording;
 - BC7 reported unsupported on a device without it;
 - copies at block-row boundaries under the budget, with the target resting
   in transfer write between batches, completing on the final batch's fence;
@@ -2004,11 +2022,15 @@ The staging buffer is a managed buffer like any other, destroyed by
 - staging freed only at settlement;
 - a discarded batch re-recorded from the same bytes;
 - non-coherent flushes aligned to the atom and kept within the region;
-- cancellation before and after the first copies;
+- cancellation before and after the first copies, and a cancellation and a
+  rival admission inside the recording of an upload's first copies, refused
+  and backpressured while its staging stays held;
 - tickets completing only on the final fence, a wait refused on the owner,
   and a deadline that cancels nothing;
-- every unsettled upload lost after device loss;
+- every unsettled upload lost after device loss, except one whose caller is
+  still copying, which keeps its region until it finishes and is lost then;
 - exit cancelling uploads not yet started and settling started ones;
+- retirement returning only after a caller still copying has finished;
 - a released target destroyed only after its upload settles;
 - an indexed draw bounded by uploaded indices;
 - level readback, with its refusals.
@@ -2034,11 +2056,12 @@ nothing.
 
 | State | Owner | Readers and writers | Thread | Lifetime | Reset or disposal |
 | --- | --- | --- | --- | --- | --- |
-| The upload queue: each unsettled upload's entry, its phase, cursor and batch in flight, the next upload number, the staging head, whether admission is open, and the stall flag | The uploads (`Internal.Uploads`) | `submitUpload` adds an entry; `progressUploads` advances and settles them; `cancelUpload`, `closeUploads` and `retireUploads` settle them | Admission and cancellation on any thread, in STM; everything else on the graphics owner's | From `newUploads` until `retireUploads` | Each entry removed when its upload settles; the numbers are never reissued |
+| The upload queue: each unsettled upload's entry, its phase, cursor, batch in flight and whether the owner has claimed it, the next upload number, the staging head, whether admission is open, and the stall flag | The uploads (`Internal.Uploads`) | `submitUpload` adds an entry; `progressUploads` claims, advances and settles them; `cancelUpload`, `closeUploads` and `retireUploads` settle them, never a claimed one or, but at retirement after its caller finishes, an admitting one | Admission and cancellation on any thread, in STM; everything else on the graphics owner's | From `newUploads` until `retireUploads` | Each entry removed when its upload settles; the numbers are never reissued |
 | The staging buffer and its regions | The uploads, over a managed buffer of the recording's | Admission reserves a region and its caller writes it; the owner flushes and copies from it | Writes on the admitting thread, into its own region only; copies on the owner's | Each region from admission until its upload settles; the buffer from `newUploads` until `retireRecording` | Regions freed at settlement only; the buffer destroyed with every other managed resource |
 | Each ticket's state | The uploads | The owner and cancellation advance it; any thread reads it | Any | From admission; kept by the caller after settlement | Never reset; terminal once settled |
 | The upload-held targets and their deferred releases | The recording (`recordingUploading`, `recordingReleaseDeferred`) | Admission adds a target; settlement removes it and performs a deferred release; `orderedSequence` and `destroyableNow` read it | Any, in STM | From admission until its upload settles | Emptied as uploads settle |
 | Uploaded index data | The recording (`recordingIndexData`) | A completed index-buffer upload stores it; indexed draws read it | The graphics owner | From completion until the buffer is forgotten | Deleted by `forget` |
+| The buffers uploads have filled | The recording (`recordingFilled`) | Admission adds a buffer and reads the set for freshness; a cancellation before any copy, and an admission given back, remove it | Any, in STM | From admission until the buffer is forgotten | Deleted by `forget` |
 
 ### Destruction
 
