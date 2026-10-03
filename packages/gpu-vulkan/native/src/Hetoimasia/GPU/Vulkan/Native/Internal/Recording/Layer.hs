@@ -8,7 +8,8 @@
 -- kind fixes; how each use the GPU model's ordering rules name (GRS-3)
 -- maps onto Vulkan's layouts, stages and accesses; and what a pipeline layout
 -- and a pipeline declare of their interface, push-constant ranges and vertex
--- input (GRS-4).
+-- input (GRS-4); and the texture table's samplers, descriptor-set layouts,
+-- pools, sets and writes (GRS-7).
 --
 -- This module holds no state and makes no call: it is the shape of the layer,
 -- which "Hetoimasia.GPU.Vulkan.Native.Recording.Vulkan" implements over the
@@ -67,6 +68,16 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   , noVertexInput
   , IndexType (..)
   , indexTypeBytes
+
+    -- * The texture table (GRS-7)
+  , TableSampler (..)
+  , tableSamplerIndex
+  , tableSamplerBinding
+  , tableTextureBinding
+  , lookupBinding
+  , SetLayoutRequest (..)
+  , PoolRequest (..)
+  , DescriptorWrite (..)
 
     -- * Ordering managed resources (GRS-3)
   , AccessScope (..)
@@ -183,6 +194,9 @@ data NativeCommand
     -- ^ One whole mip level of a color image in the transfer-source layout —
     -- the image, the level, and its width and height in texels — tightly
     -- packed into the buffer at offset zero (GRS-6).
+  | CommandBindDescriptorSets !Word64 ![Word64] ![Word32]
+    -- ^ The pipeline layout, the descriptor sets bound from set 0 on, and
+    -- their dynamic offsets in order (GRS-7).
   deriving (Eq, Show)
 
 -- | The shaders of a graphics pipeline, as SPIR-V.
@@ -238,6 +252,27 @@ data RecordingLimits = RecordingLimits
   , limitImageDimension ∷ !Word32
     -- ^ @maxImageDimension2D@: the widest level any two-dimensional image
     -- may have, which bounds one block row of an upload (GRS-6).
+  , limitTableSampledImages ∷ !Word32
+    -- ^ The fewer of @maxPerStageDescriptorUpdateAfterBindSampledImages@ and
+    -- @maxDescriptorSetUpdateAfterBindSampledImages@: the most the texture
+    -- table's array may be declared at (GRS-7).
+  , limitTableSamplers ∷ !Word32
+    -- ^ The fewer of @maxPerStageDescriptorUpdateAfterBindSamplers@ and
+    -- @maxDescriptorSetUpdateAfterBindSamplers@.
+  , limitTableResources ∷ !Word32
+    -- ^ @maxPerStageUpdateAfterBindResources@: what one stage of a pipeline
+    -- whose layout holds the table may reach, every binding counted.
+  , limitBoundSets ∷ !Word32
+    -- ^ @maxBoundDescriptorSets@.
+  , limitStorageAlignment ∷ !Natural
+    -- ^ @minStorageBufferOffsetAlignment@: what the lookup versions' offsets
+    -- must be multiples of.
+  , limitStorageRange ∷ !Natural
+    -- ^ @maxStorageBufferRange@: the most one version may span.
+  , limitTablePoolDescriptors ∷ !Word32
+    -- ^ @maxUpdateAfterBindDescriptorsInAllPools@: the most descriptors all
+    -- update-after-bind pools together may hold — the texture table's set 0
+    -- pool, its samplers and its initial images.
   }
   deriving (Eq, Show)
 
@@ -581,8 +616,9 @@ data ViewRequest = ViewRequest
 -- | Every native call the recording makes, over an open device type @dev@ and
 -- an open command-buffer type @cmd@.
 data RecordingOps dev cmd = RecordingOps
-  { opsCreatePipelineLayout ∷ dev → [PushConstantRange] → IO Word64
-    -- ^ A pipeline layout with no descriptor sets and these push-constant
+  { opsCreatePipelineLayout ∷ dev → [Word64] → [PushConstantRange] → IO Word64
+    -- ^ A pipeline layout with these descriptor-set layouts, from set 0 on —
+    -- none, or the texture table's two (GRS-7) — and these push-constant
     -- ranges, which the recording has already validated.
   , opsDestroyPipelineLayout ∷ dev → Word64 → IO ()
   , opsCreatePipeline ∷ dev → PipelineRequest → (ShaderStage → Word64 → IO ()) → IO Word64
@@ -627,6 +663,19 @@ data RecordingOps dev cmd = RecordingOps
   , opsCreateView ∷ dev → ViewRequest → IO Word64
     -- ^ An image's one owned view.
   , opsDestroyView ∷ dev → Word64 → IO ()
+  , opsCreateSampler ∷ dev → TableSampler → IO Word64
+    -- ^ One of the texture table's four shared samplers (GRS-7).
+  , opsDestroySampler ∷ dev → Word64 → IO ()
+  , opsCreateSetLayout ∷ dev → SetLayoutRequest → IO Word64
+  , opsDestroySetLayout ∷ dev → Word64 → IO ()
+  , opsCreateDescriptorPool ∷ dev → PoolRequest → IO Word64
+  , opsDestroyDescriptorPool ∷ dev → Word64 → IO ()
+    -- ^ Destroying a pool frees every set allocated from it.
+  , opsAllocateSet ∷ dev → Word64 → Word64 → Maybe Word32 → IO Word64
+    -- ^ One set from the pool, of the layout, with this many descriptors in
+    -- its variable-count binding, if it has one.
+  , opsWriteDescriptors ∷ dev → [DescriptorWrite] → IO ()
+    -- ^ Update descriptors, which no recorded or pending batch can read.
   }
 
 -- | The entry point a command is recorded by, as failures name it.
@@ -651,6 +700,68 @@ nativeName = \case
   CommandCopyBuffer {} → "vkCmdCopyBuffer"
   CommandCopyBufferToImage {} → "vkCmdCopyBufferToImage"
   CommandCopyImageLevelToBuffer {} → "vkCmdCopyImageToBuffer"
+  CommandBindDescriptorSets {} → "vkCmdBindDescriptorSets"
+
+-- ---------------------------------------------------------------------------
+-- The texture table (GRS-7)
+
+-- | The table's four shared samplers, each chosen per draw by its index
+-- ('tableSamplerIndex'): nearest and linear filtering, each with
+-- clamp-to-edge and repeat addressing. Linear filters between mip levels and
+-- nearest takes the nearest level; none is anisotropic.
+data TableSampler
+  = NearestClamp
+  | NearestRepeat
+  | LinearClamp
+  | LinearRepeat
+  deriving (Eq, Ord, Show, Enum, Bounded)
+
+-- | The sampler's index in the table's sampler array, which a draw selects.
+tableSamplerIndex ∷ TableSampler → Word32
+tableSamplerIndex = fromIntegral . fromEnum
+
+-- | Set 0's bindings: the four immutable samplers, then the variable-count,
+-- update-after-bind sampled-image array, which Vulkan requires to be the
+-- highest.
+tableSamplerBinding, tableTextureBinding ∷ Word32
+tableSamplerBinding = 0
+tableTextureBinding = 1
+
+-- | Set 1's one binding: the lookup ring's dynamic storage buffer.
+lookupBinding ∷ Word32
+lookupBinding = 0
+
+-- | One of the table's two descriptor-set layouts.
+data SetLayoutRequest
+  = TextureSetLayout ![Word64] !Word32
+    -- ^ Set 0: these samplers, immutable, at 'tableSamplerBinding', then a
+    -- partially bound, update-after-bind, variable-count sampled-image array
+    -- declared at this cap at 'tableTextureBinding'; the layout is made for
+    -- an update-after-bind pool, and its array may be updated while unused
+    -- by pending work.
+  | LookupSetLayout
+    -- ^ Set 1: one dynamic storage buffer at 'lookupBinding', visible to the
+    -- vertex and fragment stages.
+  deriving (Eq, Show)
+
+-- | A pool for one of the table's sets.
+data PoolRequest
+  = TexturePool !Word32 !Word32
+    -- ^ One update-after-bind set of this many samplers and this many
+    -- sampled images.
+  | LookupPool
+    -- ^ One set of one dynamic storage buffer.
+  deriving (Eq, Show)
+
+-- | One descriptor update.
+data DescriptorWrite
+  = WriteSampledImage !Word64 !Word32 !Word64
+    -- ^ Set 0's array, at this element, to this view, in the shader-read
+    -- layout.
+  | WriteLookupBuffer !Word64 !Word64 !Natural
+    -- ^ Set 1's buffer: this buffer, from offset zero, over this range; each
+    -- binding's dynamic offset selects a version within it.
+  deriving (Eq, Show)
 
 -- ---------------------------------------------------------------------------
 -- Ordering managed resources (GRS-3)

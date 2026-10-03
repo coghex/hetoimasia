@@ -16,6 +16,8 @@
 -- reference and which is destroyed here at once.
 module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Construction
   ( createStaging
+  , createMapped
+  , construct
   , createPipelineLayout
   , createPipelineLayoutWith
   , createPipeline
@@ -23,6 +25,8 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Construction
   , replacePipeline
   , replacePipelineWith
   , checkedRanges
+  , checkedTableRanges
+  , validatePushRanges
   , createPipelineLayoutFor
   , createCheckedPipeline
   , replaceCheckedPipeline
@@ -33,9 +37,10 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Construction
   , createBuffer
   , createImage
   , releaseManaged
+  , releaseLive
   ) where
 
-import Control.Concurrent.STM (atomically, modifyTVar', readTVar, readTVarIO, writeTVar)
+import Control.Concurrent.STM (STM, atomically, modifyTVar', readTVar, readTVarIO, writeTVar)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, displayException, mask_, onException, rethrowIO, throwIO, tryWithContext)
 import Control.Monad (when)
 import qualified Data.Text as Text
@@ -43,6 +48,7 @@ import Data.ByteString (ByteString)
 import Data.Foldable (for_)
 import Data.List (nub, sort)
 import qualified Data.Map.Strict as Map
+import Data.Maybe (isJust)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import Data.Word (Word32, Word64)
@@ -93,6 +99,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   , VertexAttribute (..)
   , VertexBinding (..)
   , VertexInput (..)
+  , tableSamplerIndex
   , ViewRequest (..)
   , BufferKind (InstanceBuffer, StagingBuffer)
   , bufferKindUse
@@ -106,6 +113,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   )
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   ( Buffer (..)
+  , TableState (..)
   , Image (..)
   , Managed (..)
   , ManagedRecord (..)
@@ -154,6 +162,9 @@ import Hetoimasia.GPU.Vulkan.Native.Naming
   , pipelineName
   , readbackBufferName
   , shaderModuleName
+  , tablePoolName
+  , tableSamplerName
+  , tableSetLayoutName
   )
 import Hetoimasia.GPU.Vulkan.Native.Profile (DevicePlan (..))
 import Hetoimasia.GPU.Vulkan.Native.Roots
@@ -188,7 +199,7 @@ createPipelineLayoutWith recording ranges =
       Left refusal → pure (Left refusal)
       Right () →
         fmap PipelineLayout
-          <$> construct recording 0 1 "vkCreatePipelineLayout" (\ops device _ _ → Right . (`NativeLayout` ranges) <$> opsCreatePipelineLayout ops device ranges) Nothing
+          <$> construct recording 0 1 "vkCreatePipelineLayout" (\ops device _ _ → Right . (\handle → NativeLayout handle ranges Nothing) <$> opsCreatePipelineLayout ops device [] ranges) Nothing
 
 -- | Whether push-constant ranges are ones a layout may declare.
 validatePushRanges ∷ Word32 → [PushConstantRange] → Either Refusal ()
@@ -283,7 +294,7 @@ buildPipeline recording (PipelineLayout layout) shaders format input replacing =
   owned recording $
     liveNative recording layout >>= \case
       Left refusal → pure (Left refusal)
-      Right (NativeLayout handle ranges) → do
+      Right (NativeLayout handle ranges table) → do
         limits ← opsRecordingLimits (recordingOps recording)
         case validateVertexInput limits input of
           Left refusal → pure (Left refusal)
@@ -296,7 +307,7 @@ buildPipeline recording (PipelineLayout layout) shaders format input replacing =
                 "vkCreateGraphicsPipelines"
                 ( \ops device _ issued → do
                     naming ← shaderNaming recording issued
-                    (\created → Right (NativePipeline created layout format (PipelineInterface handle ranges input)))
+                    (\created → Right (NativePipeline created layout format (PipelineInterface handle ranges input table)))
                       <$> opsCreatePipeline ops device (PipelineRequest handle shaders format input) naming
                 )
                 replacing
@@ -405,15 +416,32 @@ createReadback recording bytes
 -- vertex shader that is not a vertex description's, or a fragment one that is
 -- not a fragment description's, and two stages whose blocks disagree on any
 -- member's offset or size, as 'RefusedIncompatible'; a shader declaring a
--- descriptor binding, which no pipeline layout declares yet, as
--- 'RefusedUnsupported'; and members reaching beyond what 32 bits can hold,
--- computed without bound, as 'RefusedOutOfBounds'.
+-- descriptor binding, which only a pipeline layout holding the texture table
+-- declares ('checkedTableRanges'), as 'RefusedUnsupported'; and members
+-- reaching beyond what 32 bits can hold, computed without bound, as
+-- 'RefusedOutOfBounds'.
 checkedRanges ∷ CheckedShaders → Either Refusal [PushConstantRange]
-checkedRanges (CheckedShaders vertex fragment)
+checkedRanges = checkedRangesWith False
+
+-- | 'checkedRanges' for a pipeline layout holding the texture table (GRS-7):
+-- each stage may declare any of the table's own bindings
+-- ('Interface.textureTableDescriptors'), and any other binding is
+-- 'RefusedIncompatible'.
+checkedTableRanges ∷ CheckedShaders → Either Refusal [PushConstantRange]
+checkedTableRanges = checkedRangesWith True
+
+checkedRangesWith ∷ Bool → CheckedShaders → Either Refusal [PushConstantRange]
+checkedRangesWith table (CheckedShaders vertex fragment)
   | Interface.interfaceStage vertexInterface /= VertexInterface = Left (RefusedIncompatible "a vertex stage whose shader is not a vertex shader's")
   | Interface.interfaceStage fragmentInterface /= FragmentInterface = Left (RefusedIncompatible "a fragment stage whose shader is not a fragment shader's")
-  | not (null (Interface.interfaceDescriptors vertexInterface) && null (Interface.interfaceDescriptors fragmentInterface)) =
-      Left (RefusedUnsupported "a shader declaring descriptor bindings, which no pipeline layout declares yet")
+  | not table && not (null declared) =
+      Left (RefusedUnsupported "a shader declaring descriptor bindings, which only a pipeline layout holding the texture table declares")
+  | table && any (`notElem` Interface.textureTableDescriptors) declared =
+      Left (RefusedIncompatible "a shader declaring a descriptor binding the texture table does not hold")
+  -- Set 0's samplers and images are visible to the fragment stage alone;
+  -- set 1's lookup buffer to both.
+  | table && any ((== 0) . Interface.descriptorSet) (Interface.interfaceDescriptors vertexInterface) =
+      Left (RefusedIncompatible "a vertex shader declaring the texture table's samplers or images, which only the fragment stage sees")
   | otherwise = case (Interface.interfacePushConstants vertexInterface, Interface.interfacePushConstants fragmentInterface) of
       ([], []) → Right []
       (members, []) → sequence [spanning [PushVertex] members]
@@ -424,6 +452,7 @@ checkedRanges (CheckedShaders vertex fragment)
   where
     vertexInterface = checkedInterface vertex
     fragmentInterface = checkedInterface fragment
+    declared = Interface.interfaceDescriptors vertexInterface <> Interface.interfaceDescriptors fragmentInterface
     spanning stages members =
       let low = minimum (map pushMemberOffset members)
           high = maximum [toInteger (pushMemberOffset member) + toInteger (pushMemberSize member) | member ← members]
@@ -466,12 +495,14 @@ checkedPipeline
   → Maybe ResourceId
   → IO (Either Refusal Pipeline)
 checkedPipeline recording held@(PipelineLayout layout) shaders format replacing =
-  owned recording $ case checkedRanges shaders of
-    Left refusal → pure (Left refusal)
-    Right needed →
-      liveNative recording layout >>= \case
+  owned recording $
+    liveNative recording layout >>= \case
+      Left refusal → pure (Left refusal)
+      -- A layout holding the texture table admits the table's bindings
+      -- (GRS-7); any other admits none.
+      Right (NativeLayout _ declared table) → case checkedRangesWith (isJust table) shaders of
         Left refusal → pure (Left refusal)
-        Right (NativeLayout _ declared)
+        Right needed
           | normalized declared /= normalized needed →
               pure (Left (RefusedIncompatible "a pipeline layout whose push-constant ranges are not the ones its checked shaders declare"))
           | otherwise →
@@ -482,7 +513,7 @@ checkedPipeline recording held@(PipelineLayout layout) shaders format replacing 
                 format
                 (Interface.interfaceVertexInput (checkedInterface (checkedVertex shaders)))
                 replacing
-        Right _ → pure (Left RefusedWrongKind)
+      Right _ → pure (Left RefusedWrongKind)
   where
     normalized ranges = sort [(sort (rangeStages range), rangeOffset range, rangeSize range) | range ← ranges]
 
@@ -562,7 +593,14 @@ createRing recording size =
 -- granularity its regions must be padded to: one on coherent memory, and the
 -- device's @nonCoherentAtomSize@ otherwise.
 createStaging ∷ Recording q inst msgr phys dev cmd → Natural → IO (Either Refusal (ResourceId, ReadbackAllocation, Natural))
-createStaging recording bytes =
+createStaging recording = createMapped recording StagingBuffer
+
+-- | 'createStaging' for any host-visible kind: one buffer of the kind's usage
+-- and memory usage, of this size, mapped for its lifetime — the staging
+-- buffer (GRS-6), or the texture table's version ring (GRS-7), a lookup
+-- buffer. Answers it, its mapping, and its flush granularity.
+createMapped ∷ Recording q inst msgr phys dev cmd → BufferKind → Natural → IO (Either Refusal (ResourceId, ReadbackAllocation, Natural))
+createMapped recording kind bytes =
   owned recording $ do
     most ← opsMaxBufferSize (recordingOps recording)
     if bytes > most
@@ -579,11 +617,12 @@ createStaging recording bytes =
                 allocateBuffer (recordingRoots recording) attempt usage (BufferRequest bytes flags) >>= \case
                   Left refusal → pure (Left (allocationRefused refusal))
                   Right allocated
-                    | Just _ ← allocatedMapped allocated → pure (Right (NativeBuffer StagingBuffer bytes allocated))
-                    -- Staging memory is host-visible, and so always mapped.
+                    | Just _ ← allocatedMapped allocated → pure (Right (NativeBuffer kind bytes allocated))
+                    -- Staging and frame-ring memory is host-visible, and so
+                    -- always mapped.
                     | otherwise → do
                         freeBuffer (recordingRoots recording) allocated
-                        fail "the staging buffer's memory is not mapped"
+                        fail "a mapped buffer's memory is not mapped"
             )
             Nothing
         case made of
@@ -598,7 +637,7 @@ createStaging recording bytes =
                      in Right (resource, mapping, atom)
               _ → Left (RefusedMisuse (StaleIdentity ResourceIdentity))
   where
-    (flags, usage) = bufferKindUse StagingBuffer
+    (flags, usage) = bufferKindUse kind
 
 -- | @VK_BUFFER_USAGE_TRANSFER_DST_BIT@: what a readback buffer is used as.
 transferDestination ∷ Word32
@@ -885,7 +924,7 @@ nameManaged recording resource native =
 -- | What each of a generation's native objects is named.
 managedNames ∷ Recording q inst msgr phys dev cmd → ResourceId → NativeResource cmd → [(NativeObjectKind, Word64, ByteString)]
 managedNames recording resource = \case
-  NativeLayout handle _ → [(ObjectPipelineLayout, handle, pipelineLayoutName resource)]
+  NativeLayout handle _ _ → [(ObjectPipelineLayout, handle, pipelineLayoutName resource)]
   NativePipeline handle _ _ _ → [(ObjectPipeline, handle, pipelineName resource)]
   NativeStorage (StorageOfFrame target slot) pool commands →
     [ (ObjectCommandPool, pool, commandPoolName resource target slot)
@@ -898,6 +937,10 @@ managedNames recording resource = \case
   NativeReadback allocation _ → [(ObjectBuffer, allocationBuffer allocation, readbackBufferName resource)]
   NativeBuffer _ _ allocated → [(ObjectBuffer, memoryResource (allocatedMemory allocated), bufferName resource)]
   NativeImage _ memory view → [(ObjectImage, memoryResource memory, imageName resource), (ObjectImageView, view, ownedViewName resource)]
+  NativeSampler sampler handle → [(ObjectSampler, handle, tableSamplerName resource (fromIntegral (tableSamplerIndex sampler)))]
+  NativeSetLayout set layout → [(ObjectDescriptorSetLayout, layout, tableSetLayoutName resource (fromIntegral set))]
+  NativeDescriptorPool set pool → [(ObjectDescriptorPool, pool, tablePoolName resource (fromIntegral set))]
+  NativeVersion _ → []
 
 -- | Release a handle: nothing records through it again, and its CPU use —
 -- reading a readback included — ends with it. Batches that already recorded
@@ -913,20 +956,34 @@ releaseManaged recording handle =
     liveNative recording resource >>= \case
       Left refusal → pure (Left refusal)
       Right _ → atomically $ do
-        uploading ← Set.member resource <$> readTVar (recordingUploading recording)
-        if uploading
-          then do
-            modifyTVar' (recordingReleaseDeferred recording) (Set.insert resource)
-            editManaged recording resource (\entry → entry {managedStanding = ManagedReleased})
-            pure (Right ())
-          else do
-            released ← modelAnswer roots (fmap (\next → (next, ())) . releaseResource resource)
-            case released of
-              Left refusal → pure (Left refusal)
-              Right () → do
-                modelEdit roots (endResourceCpuUse resource)
-                editManaged recording resource (\entry → entry {managedStanding = ManagedReleased})
-                pure (Right ())
+        -- An image the texture table holds is released through its handle,
+        -- and only once no live version maps its slot (GRS-7).
+        tabled ← maybe False (Set.member resource . tableTextures) <$> readTVar (recordingTable recording)
+        if tabled
+          then pure (Left (RefusedIllegal "an image the texture table holds: release its handle instead"))
+          else releaseLive recording resource
   where
     resource = managedResource handle
+
+-- | Release a live generation, in the transaction the caller is in:
+-- deferred while an upload still holds it, and otherwise released in the
+-- model at once. The texture table releases the images it reclaims this
+-- way, in the same transaction that lets them go (GRS-7).
+releaseLive ∷ Recording q inst msgr phys dev cmd → ResourceId → STM (Either Refusal ())
+releaseLive recording resource = do
+  uploading ← Set.member resource <$> readTVar (recordingUploading recording)
+  if uploading
+    then do
+      modifyTVar' (recordingReleaseDeferred recording) (Set.insert resource)
+      editManaged recording resource (\entry → entry {managedStanding = ManagedReleased})
+      pure (Right ())
+    else do
+      released ← modelAnswer roots (fmap (\next → (next, ())) . releaseResource resource)
+      case released of
+        Left refusal → pure (Left refusal)
+        Right () → do
+          modelEdit roots (endResourceCpuUse resource)
+          editManaged recording resource (\entry → entry {managedStanding = ManagedReleased})
+          pure (Right ())
+  where
     roots = recordingRoots recording

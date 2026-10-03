@@ -218,6 +218,11 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , constructReadback
   , readConstructedReadback
   , releaseConstructed
+  , constructTextureTable
+  , constructTablePipelineLayout
+  , registerConstructedTexture
+  , releaseConstructedTexture
+  , readConstructedTable
 
     -- * Verification capture (VK-19)
   , CaptureMode (..)
@@ -920,6 +925,10 @@ controllerOperations (VulkanController state) renderer =
         -- owner's admission has closed, those not yet started are cancelled.
         open ← isNothing <$> atomically (actionGate (stateRoots state) (stateOwnerOpen state))
         uploaded ← (madeUploads ||) <$> progressRenderingUploads (stateRendering state) open
+        -- The texture table after the uploads (GRS-7): a texture whose upload
+        -- just completed is written into its slot, and a released texture
+        -- whose slot no batch's version maps any longer is let go.
+        refreshRenderingTable (stateRendering state)
         reclaimReleased (stateRendering state) now
         asked ← askReplacements state (summarySurfacesWanted summary)
         replaced ← settleReplacements state now (stepTargets step)
@@ -2081,7 +2090,7 @@ observeRendering (NativeObserver observe) ops =
   where
     recording layer =
       layer
-        { opsCreatePipelineLayout = \device ranges → observe "vkCreatePipelineLayout" (opsCreatePipelineLayout layer device ranges)
+        { opsCreatePipelineLayout = \device layouts ranges → observe "vkCreatePipelineLayout" (opsCreatePipelineLayout layer device layouts ranges)
         , opsDestroyPipelineLayout = \device handle → observe "vkDestroyPipelineLayout" (opsDestroyPipelineLayout layer device handle)
         , opsCreatePipeline = \device request name → observe "vkCreateGraphicsPipelines" (opsCreatePipeline layer device request name)
         , opsDestroyPipeline = \device handle → observe "vkDestroyPipeline" (opsDestroyPipeline layer device handle)
@@ -2090,6 +2099,14 @@ observeRendering (NativeObserver observe) ops =
         , opsDestroyStorage = \device pool → observe "vkDestroyCommandPool" (opsDestroyStorage layer device pool)
         , opsBeginCommands = observe "vkBeginCommandBuffer" . opsBeginCommands layer
         , opsEndCommands = observe "vkEndCommandBuffer" . opsEndCommands layer
+        , opsCreateSampler = \device sampler → observe "vkCreateSampler" (opsCreateSampler layer device sampler)
+        , opsDestroySampler = \device handle → observe "vkDestroySampler" (opsDestroySampler layer device handle)
+        , opsCreateSetLayout = \device request → observe "vkCreateDescriptorSetLayout" (opsCreateSetLayout layer device request)
+        , opsDestroySetLayout = \device handle → observe "vkDestroyDescriptorSetLayout" (opsDestroySetLayout layer device handle)
+        , opsCreateDescriptorPool = \device request → observe "vkCreateDescriptorPool" (opsCreateDescriptorPool layer device request)
+        , opsDestroyDescriptorPool = \device handle → observe "vkDestroyDescriptorPool" (opsDestroyDescriptorPool layer device handle)
+        , opsAllocateSet = \device pool setLayout count → observe "vkAllocateDescriptorSets" (opsAllocateSet layer device pool setLayout count)
+        , opsWriteDescriptors = \device writes → observe "vkUpdateDescriptorSets" (opsWriteDescriptors layer device writes)
         }
     frames layer =
       layer

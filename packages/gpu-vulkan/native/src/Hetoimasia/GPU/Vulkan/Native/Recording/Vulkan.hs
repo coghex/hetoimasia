@@ -25,13 +25,19 @@ import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Unsafe as Unsafe
 import Data.Bits ((.&.), (.|.))
 import qualified Data.Vector as Vector
-import Data.Word (Word64)
+import Data.Word (Word32, Word64)
 import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (Ptr, WordPtr (..), castPtr, plusPtr, ptrToWordPtr, wordPtrToPtr)
 import Vulkan.CStruct.Extends (SomeStruct (..))
 import Vulkan.Core10 hiding (ImageLayout, IndexType (..), PushConstantRange (..), Viewport (..))
 import qualified Vulkan.Core10 as Core10
 import Vulkan.Core11 (PhysicalDeviceProperties2 (..), getPhysicalDeviceProperties2)
+import Vulkan.Core12
+  ( DescriptorSetLayoutBindingFlagsCreateInfo (..)
+  , DescriptorSetVariableDescriptorCountAllocateInfo (..)
+  , PhysicalDeviceVulkan12Properties (..)
+  )
+import Vulkan.Core12.Enums.DescriptorBindingFlagBits
 import Vulkan.Core13
   ( DependencyInfo (..)
   , PhysicalDeviceVulkan13Properties (..)
@@ -55,6 +61,13 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   ( AccessScope (..)
   , BarrierObject (..)
   , ClearColor (..)
+  , DescriptorWrite (..)
+  , PoolRequest (..)
+  , SetLayoutRequest (..)
+  , TableSampler (..)
+  , lookupBinding
+  , tableSamplerBinding
+  , tableTextureBinding
   , ImageLayout (..)
   , ImageLimits (..)
   , ImageQuery (..)
@@ -88,8 +101,8 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
 -- whether it supports an image before one is created.
 vulkanRecordingOps ∷ PhysicalDevice → IO (RecordingOps Device CommandBuffer)
 vulkanRecordingOps physical = do
-  properties ∷ PhysicalDeviceProperties2 '[PhysicalDeviceVulkan13Properties] ← getPhysicalDeviceProperties2 physical
-  let (thirteen, ()) = properties.next
+  properties ∷ PhysicalDeviceProperties2 '[PhysicalDeviceVulkan12Properties, PhysicalDeviceVulkan13Properties] ← getPhysicalDeviceProperties2 physical
+  let (twelve, (thirteen, ())) = properties.next
       largest = fromIntegral thirteen.maxBufferSize
       deviceLimits = properties.properties.limits
       framebuffer = (deviceLimits.maxFramebufferWidth, deviceLimits.maxFramebufferHeight)
@@ -102,16 +115,23 @@ vulkanRecordingOps physical = do
           , limitVertexAttributeOffset = deviceLimits.maxVertexInputAttributeOffset
           , limitNonCoherentAtom = fromIntegral deviceLimits.nonCoherentAtomSize
           , limitImageDimension = deviceLimits.maxImageDimension2D
+          , limitTableSampledImages = min twelve.maxPerStageDescriptorUpdateAfterBindSampledImages twelve.maxDescriptorSetUpdateAfterBindSampledImages
+          , limitTableSamplers = min twelve.maxPerStageDescriptorUpdateAfterBindSamplers twelve.maxDescriptorSetUpdateAfterBindSamplers
+          , limitTableResources = twelve.maxPerStageUpdateAfterBindResources
+          , limitBoundSets = deviceLimits.maxBoundDescriptorSets
+          , limitStorageAlignment = fromIntegral deviceLimits.minStorageBufferOffsetAlignment
+          , limitStorageRange = fromIntegral deviceLimits.maxStorageBufferRange
+          , limitTablePoolDescriptors = twelve.maxUpdateAfterBindDescriptorsInAllPools
           }
   pure
     RecordingOps
-      { opsCreatePipelineLayout = \device ranges →
+      { opsCreatePipelineLayout = \device layouts ranges →
           (\(PipelineLayout created) → created)
             <$> createPipelineLayout
               device
               ( PipelineLayoutCreateInfo
                   { flags = zero
-                  , setLayouts = Vector.empty
+                  , setLayouts = Vector.fromList (map DescriptorSetLayout layouts)
                   , pushConstantRanges = Vector.fromList [Core10.PushConstantRange (pushStageFlags (rangeStages range)) (rangeOffset range) (rangeSize range) | range ← ranges]
                   }
               )
@@ -164,7 +184,184 @@ vulkanRecordingOps physical = do
               )
               Nothing
       , opsDestroyView = \device view → destroyImageView device (ImageView view) Nothing
+      , opsCreateSampler = \device sampler → (\(Sampler created) → created) <$> createSampler device (samplerInfo sampler) Nothing
+      , opsDestroySampler = \device sampler → destroySampler device (Sampler sampler) Nothing
+      , opsCreateSetLayout = createSetLayout
+      , opsDestroySetLayout = \device layout → destroyDescriptorSetLayout device (DescriptorSetLayout layout) Nothing
+      , opsCreateDescriptorPool = \device request →
+          (\(DescriptorPool created) → created) <$> createDescriptorPool device (poolInfo request) Nothing
+      , opsDestroyDescriptorPool = \device pool → destroyDescriptorPool device (DescriptorPool pool) Nothing
+      , opsAllocateSet = allocateSet
+      , opsWriteDescriptors = \device writes → updateDescriptorSets device (Vector.fromList (map descriptorWrite writes)) Vector.empty
       }
+
+-- | One of the texture table's samplers (GRS-7): nearest or linear, clamping
+-- to the edge or repeating, linear also between mip levels, never
+-- anisotropic, over every level an image has.
+samplerInfo ∷ TableSampler → SamplerCreateInfo '[]
+samplerInfo sampler =
+  (zero ∷ SamplerCreateInfo '[])
+    { magFilter = texel
+    , minFilter = texel
+    , mipmapMode = if linear then SAMPLER_MIPMAP_MODE_LINEAR else SAMPLER_MIPMAP_MODE_NEAREST
+    , addressModeU = addressing
+    , addressModeV = addressing
+    , addressModeW = addressing
+    , anisotropyEnable = False
+    , maxAnisotropy = 1
+    , compareEnable = False
+    , minLod = 0
+    , maxLod = LOD_CLAMP_NONE
+    , borderColor = BORDER_COLOR_FLOAT_TRANSPARENT_BLACK
+    , unnormalizedCoordinates = False
+    }
+  where
+    linear = sampler `elem` [LinearClamp, LinearRepeat]
+    texel = if linear then FILTER_LINEAR else FILTER_NEAREST
+    addressing = if sampler `elem` [NearestRepeat, LinearRepeat] then SAMPLER_ADDRESS_MODE_REPEAT else SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE
+
+-- | One of the table's set layouts: set 0's immutable samplers, then its
+-- partially bound, update-after-bind, variable-count array, which may be
+-- updated while unused by pending work, in a layout for an update-after-bind
+-- pool; or set 1's one dynamic storage buffer.
+createSetLayout ∷ Device → SetLayoutRequest → IO Word64
+createSetLayout device = \case
+  TextureSetLayout samplers capacity →
+    (\(DescriptorSetLayout created) → created)
+      <$> createDescriptorSetLayout
+        device
+        ( DescriptorSetLayoutCreateInfo
+            { next =
+                ( DescriptorSetLayoutBindingFlagsCreateInfo
+                    { bindingFlags =
+                        Vector.fromList
+                          [ zero
+                          , DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT
+                              .|. DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT
+                              .|. DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT
+                              .|. DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT
+                          ]
+                    }
+                , ()
+                )
+            , flags = DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT
+            , bindings =
+                Vector.fromList
+                  [ DescriptorSetLayoutBinding
+                      { binding = tableSamplerBinding
+                      , descriptorType = DESCRIPTOR_TYPE_SAMPLER
+                      , descriptorCount = fromIntegral (length samplers)
+                      , stageFlags = SHADER_STAGE_FRAGMENT_BIT
+                      , immutableSamplers = Vector.fromList (map Sampler samplers)
+                      }
+                  , DescriptorSetLayoutBinding
+                      { binding = tableTextureBinding
+                      , descriptorType = DESCRIPTOR_TYPE_SAMPLED_IMAGE
+                      , descriptorCount = capacity
+                      , stageFlags = SHADER_STAGE_FRAGMENT_BIT
+                      , immutableSamplers = Vector.empty
+                      }
+                  ]
+            }
+            ∷ DescriptorSetLayoutCreateInfo '[DescriptorSetLayoutBindingFlagsCreateInfo]
+        )
+        Nothing
+  LookupSetLayout →
+    (\(DescriptorSetLayout created) → created)
+      <$> createDescriptorSetLayout
+        device
+        ( DescriptorSetLayoutCreateInfo
+            { next = ()
+            , flags = zero
+            , bindings =
+                Vector.singleton
+                  DescriptorSetLayoutBinding
+                    { binding = lookupBinding
+                    , descriptorType = DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC
+                    , descriptorCount = 1
+                    , stageFlags = SHADER_STAGE_VERTEX_BIT .|. SHADER_STAGE_FRAGMENT_BIT
+                    , immutableSamplers = Vector.empty
+                    }
+            }
+            ∷ DescriptorSetLayoutCreateInfo '[]
+        )
+        Nothing
+
+-- | A pool for exactly one of the table's sets.
+poolInfo ∷ PoolRequest → DescriptorPoolCreateInfo '[]
+poolInfo = \case
+  TexturePool samplers images →
+    DescriptorPoolCreateInfo
+      { next = ()
+      , flags = DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT
+      , maxSets = 1
+      , poolSizes = Vector.fromList [DescriptorPoolSize DESCRIPTOR_TYPE_SAMPLER samplers, DescriptorPoolSize DESCRIPTOR_TYPE_SAMPLED_IMAGE images]
+      }
+  LookupPool →
+    DescriptorPoolCreateInfo
+      { next = ()
+      , flags = zero
+      , maxSets = 1
+      , poolSizes = Vector.singleton (DescriptorPoolSize DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC 1)
+      }
+
+-- | One set from the pool, of the layout, with its variable-count binding's
+-- count when it has one.
+allocateSet ∷ Device → Word64 → Word64 → Maybe Word32 → IO Word64
+allocateSet device pool layout variable = do
+  sets ← case variable of
+    Just count →
+      allocateDescriptorSets
+        device
+        ( DescriptorSetAllocateInfo
+            { next = (DescriptorSetVariableDescriptorCountAllocateInfo {descriptorCounts = Vector.singleton count}, ())
+            , descriptorPool = DescriptorPool pool
+            , setLayouts = Vector.singleton (DescriptorSetLayout layout)
+            }
+            ∷ DescriptorSetAllocateInfo '[DescriptorSetVariableDescriptorCountAllocateInfo]
+        )
+    Nothing →
+      allocateDescriptorSets
+        device
+        (DescriptorSetAllocateInfo {next = (), descriptorPool = DescriptorPool pool, setLayouts = Vector.singleton (DescriptorSetLayout layout)} ∷ DescriptorSetAllocateInfo '[])
+  case Vector.toList sets of
+    [DescriptorSet created] → pure created
+    _ → fail "the pool allocated no descriptor set"
+
+-- | One descriptor update: a texture's view into set 0's array, sampled in
+-- the shader-read layout textures rest in; or the version ring into set 1.
+descriptorWrite ∷ DescriptorWrite → SomeStruct WriteDescriptorSet
+descriptorWrite = \case
+  WriteSampledImage set element view →
+    SomeStruct
+      ( WriteDescriptorSet
+          { next = ()
+          , dstSet = DescriptorSet set
+          , dstBinding = tableTextureBinding
+          , dstArrayElement = element
+          , descriptorCount = 1
+          , descriptorType = DESCRIPTOR_TYPE_SAMPLED_IMAGE
+          , imageInfo = Vector.singleton (DescriptorImageInfo NULL_HANDLE (ImageView view) IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+          , bufferInfo = Vector.empty
+          , texelBufferView = Vector.empty
+          }
+          ∷ WriteDescriptorSet '[]
+      )
+  WriteLookupBuffer set buffer range →
+    SomeStruct
+      ( WriteDescriptorSet
+          { next = ()
+          , dstSet = DescriptorSet set
+          , dstBinding = lookupBinding
+          , dstArrayElement = 0
+          , descriptorCount = 1
+          , descriptorType = DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC
+          , imageInfo = Vector.empty
+          , bufferInfo = Vector.singleton (DescriptorBufferInfo (Buffer buffer) 0 (fromIntegral range))
+          , texelBufferView = Vector.empty
+          }
+          ∷ WriteDescriptorSet '[]
+      )
 
 -- | Whether the physical device supports an optimally tiled two-dimensional
 -- image of the query: its format offers every format feature asked for, and
@@ -539,6 +736,7 @@ recordCommand commands = \case
             BarrierBuffer _ → Vector.empty
         }
   CommandPushConstants layout stages offset bytes → pushConstantsUnsafe commands (PipelineLayout layout) (pushStageFlags stages) offset bytes
+  CommandBindDescriptorSets layout sets offsets → bindDescriptorSetsUnsafe commands (PipelineLayout layout) sets offsets
   CommandBindVertexBuffer binding buffer offset → bindVertexBufferUnsafe commands binding (Buffer buffer) offset
   CommandBindIndexBuffer buffer offset kind →
     bindIndexBufferUnsafe commands (Buffer buffer) offset $ case kind of

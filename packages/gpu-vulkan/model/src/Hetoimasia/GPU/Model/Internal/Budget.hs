@@ -102,6 +102,14 @@ data BudgetKind
     -- hold. The native recording admits its claims against the ring's
     -- configured size; no configuration here sets it, and no operation of
     -- this model answers it.
+  | TextureSlotBudget
+    -- ^ The slots of the session's texture table (GRS-7): a registration
+    -- with none free until a released texture's slot is reclaimed. The native
+    -- recording answers it; no operation of this model does.
+  | LookupVersionBudget
+    -- ^ The texture table's lookup versions (GRS-7): a binding that owes a
+    -- new version while every ring entry is held. The native recording
+    -- answers it; no operation of this model does.
   deriving (Eq, Ord, Show)
 
 -- ---------------------------------------------------------------------------

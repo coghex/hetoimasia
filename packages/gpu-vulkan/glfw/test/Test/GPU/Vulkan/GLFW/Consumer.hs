@@ -918,6 +918,7 @@ shape = \case
   CommandCopyBuffer {} → "copy buffer"
   CommandCopyBufferToImage {} → "copy buffer to image"
   CommandCopyImageLevelToBuffer {} → "copy level"
+  CommandBindDescriptorSets {} → "bind descriptor sets"
 
 verdictClean ∷ DiagnosticVerdict → Bool
 verdictClean = null . verdictIssues

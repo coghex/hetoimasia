@@ -58,7 +58,7 @@ spec = describe "Pipelines from checked shaders" $ do
     answers
       `shouldBe` [ Left (RefusedIncompatible "vertex and fragment stages whose push-constant blocks disagree")
                  , Left (RefusedIncompatible "vertex and fragment stages whose push-constant blocks disagree")
-                 , Left (RefusedUnsupported "a shader declaring descriptor bindings, which no pipeline layout declares yet")
+                 , Left (RefusedUnsupported "a shader declaring descriptor bindings, which only a pipeline layout holding the texture table declares")
                  , Left (RefusedIncompatible "a vertex stage whose shader is not a vertex shader's")
                  , Left (RefusedIncompatible "a pipeline layout whose push-constant ranges are not the ones its checked shaders declare")
                  ]

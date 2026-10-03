@@ -10,6 +10,13 @@
 -- (@docs/vulkan_compatibility_record.md@) and D-12 accepted:
 --
 -- * Vulkan 1.3, with the @dynamicRendering@ and @synchronization2@ features;
+-- * the six descriptor-indexing features the bindless texture table needs
+--   (GRS-7; resource services design D-1 and D-27, 'BindlessFeatures'):
+--   @runtimeDescriptorArray@, @descriptorBindingPartiallyBound@,
+--   @descriptorBindingSampledImageUpdateAfterBind@,
+--   @shaderSampledImageArrayNonUniformIndexing@,
+--   @descriptorBindingVariableDescriptorCount@ and
+--   @descriptorBindingUpdateUnusedWhilePending@;
 -- * @VK_EXT_swapchain_maintenance1@ and its @swapchainMaintenance1@ feature,
 --   with its dependencies — @VK_KHR_swapchain@ on the device, and
 --   @VK_EXT_surface_maintenance1@ and @VK_KHR_get_surface_capabilities2@ on
@@ -62,6 +69,9 @@ module Hetoimasia.GPU.Vulkan.Native.Profile
   , planInstance
 
     -- * The device
+  , BindlessFeatures (..)
+  , allBindlessFeatures
+  , missingBindless
   , QueueFamilyOffer (..)
   , DeviceOffer (..)
   , DeviceRejection (..)
@@ -278,6 +288,40 @@ data QueueFamilyOffer = QueueFamilyOffer
   }
   deriving (Eq, Show)
 
+-- | The descriptor-indexing features the bindless texture table needs (GRS-7;
+-- D-1, D-27), each as a device offers it. Every one is required: a device
+-- missing any is refused by name, and the device is created with all six
+-- enabled.
+data BindlessFeatures = BindlessFeatures
+  { featureRuntimeDescriptorArray ∷ !Bool
+  , featurePartiallyBound ∷ !Bool
+  , featureSampledImageUpdateAfterBind ∷ !Bool
+  , featureSampledImageNonUniformIndexing ∷ !Bool
+  , featureVariableDescriptorCount ∷ !Bool
+  , featureUpdateUnusedWhilePending ∷ !Bool
+  }
+  deriving (Eq, Show)
+
+-- | All six offered.
+allBindlessFeatures ∷ BindlessFeatures
+allBindlessFeatures = BindlessFeatures True True True True True True
+
+-- | The Vulkan names of the features not offered, in the order the profile
+-- lists them.
+missingBindless ∷ BindlessFeatures → [Text]
+missingBindless offered =
+  [ name
+  | (name, present) ←
+      [ ("runtimeDescriptorArray", featureRuntimeDescriptorArray offered)
+      , ("descriptorBindingPartiallyBound", featurePartiallyBound offered)
+      , ("descriptorBindingSampledImageUpdateAfterBind", featureSampledImageUpdateAfterBind offered)
+      , ("shaderSampledImageArrayNonUniformIndexing", featureSampledImageNonUniformIndexing offered)
+      , ("descriptorBindingVariableDescriptorCount", featureVariableDescriptorCount offered)
+      , ("descriptorBindingUpdateUnusedWhilePending", featureUpdateUnusedWhilePending offered)
+      ]
+  , not present
+  ]
+
 -- | What one physical device offers. The device handle is the native layer's.
 data DeviceOffer device = DeviceOffer
   { offerDevice ∷ !device
@@ -287,6 +331,8 @@ data DeviceOffer device = DeviceOffer
   , offerDynamicRendering ∷ !Bool
   , offerSynchronization2 ∷ !Bool
   , offerSwapchainMaintenance1 ∷ !Bool
+  , offerBindless ∷ !BindlessFeatures
+    -- ^ The texture table's descriptor-indexing features (GRS-7).
   , offerTextureCompressionBC ∷ !Bool
     -- ^ Whether it offers the @textureCompressionBC@ feature, which BC7
     -- textures need. Optional: a device without it is still selected.
@@ -390,6 +436,7 @@ examine presenting offer = case (rejections, family) of
         <> [DeviceFeatureMissing "dynamicRendering" | not (offerDynamicRendering offer)]
         <> [DeviceFeatureMissing "synchronization2" | not (offerSynchronization2 offer)]
         <> [DeviceFeatureMissing "swapchainMaintenance1" | not (offerSwapchainMaintenance1 offer)]
+        <> [DeviceFeatureMissing name | name ← missingBindless (offerBindless offer)]
         <> [(if presenting then DeviceNoPresentingGraphicsFamily else DeviceNoGraphicsFamily) | family == Nothing]
 
 -- ---------------------------------------------------------------------------

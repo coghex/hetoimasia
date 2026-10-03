@@ -64,6 +64,7 @@ import Hetoimasia.Foundation.Time (scriptedInstant, scriptedSource, zeroDuration
 import Hetoimasia.GPU.Model.Budget (BudgetRequest (..), Budgets, defaultBudgetRequest, validateBudgets)
 import Hetoimasia.GPU.Vulkan.Native.Profile
   ( DeviceOffer (..)
+  , allBindlessFeatures
   , DevicePlan (..)
   , InstanceOffer (..)
   , InstancePlan (..)
@@ -274,6 +275,7 @@ standInDevice =
     , offerDynamicRendering = True
     , offerSynchronization2 = True
     , offerSwapchainMaintenance1 = True
+    , offerBindless = allBindlessFeatures
     , offerTextureCompressionBC = True
     , offerQueueFamilies = [QueueFamilyOffer 0 True True]
     }

@@ -57,21 +57,24 @@ module Test.GPU.Vulkan.Native.SurfaceFree
   , runOffscreen
   , runDrawing
   , runUploads
+  , runTable
   , surfaceFreeSection
   , laterWindowSection
   , framelessSection
   , offscreenSection
   , drawingSection
   , uploadsSection
+  , tableSection
   , surfaceFreeSpec
   , laterWindowSpec
   , framelessSpec
   , offscreenSpec
   , drawingSpec
   , uploadsSpec
+  , tableSpec
   ) where
 
-import Control.Concurrent (ThreadId, myThreadId)
+import Control.Concurrent (ThreadId, myThreadId, threadDelay)
 import Control.Concurrent.STM (STM, TVar, atomically, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, registerDelay, retry)
 import Control.Exception (SomeException, displayException, throwIO, try)
 import Control.Monad (void, when)
@@ -185,9 +188,24 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , copyLevelToReadback
   , submitVulkanUpload
   , validateUploadConfig
+  , LookupEntry (..)
+  , TableSampler (..)
+  , TableView (..)
+  , TextureHandle (..)
+  , bindTable
+  , constructTablePipelineLayout
+  , constructTextureTable
+  , defaultVersionCount
+  , readConstructedTable
+  , registerConstructedTexture
+  , releaseConstructedTexture
+  , selectSampler
+  , tableSamplerIndex
+  , validateTableConfig
   )
 import Hetoimasia.GPU.Vulkan.Native.Presentation (formatB8G8R8A8Srgb)
-import Hetoimasia.GPU.Vulkan.Native.Recording.Shaders (endpointShaders, quadShaders, verificationShaders)
+import Hetoimasia.GPU.Vulkan.Native.Recording.ShaderInterfaces (tableSamplerOffset)
+import Hetoimasia.GPU.Vulkan.Native.Recording.Shaders (endpointShaders, quadShaders, tableShaders, verificationShaders)
 import Hetoimasia.GPU.Vulkan.Native.Roots (RootStanding (..), RootsView (..))
 import Hetoimasia.Runtime.GLFW
   ( ScheduledStep (..)
@@ -233,6 +251,7 @@ data SurfaceFreeFacts = SurfaceFreeFacts
   , factsErrors ∷ ![Text]
   , factsSeconds ∷ !Double
   , factsUploads ∷ !(Maybe UploadFacts)
+  , factsTable ∷ !(Maybe TableFacts)
   }
 
 data SurfaceFreeOutcome
@@ -249,6 +268,7 @@ data Seen = Seen
   , seenTickets ∷ ![Either Refusal TicketState]
   , seenShots ∷ ![Shot]
   , seenUploads ∷ !(Maybe UploadFacts)
+  , seenTable ∷ !(Maybe TableFacts)
   }
 
 -- | What the uploads case (GRS-6) found: each upload's ticket, waited for
@@ -286,7 +306,7 @@ runSurfaceFree backend journal = do
     windows ← length <$> atomically (hostWindowIdentities (vulkanWindowHost vulkan))
     roots ← atomically (readVulkanRoots (vulkanController vulkan))
     note journal ("the actions answered " <> Text.intercalate "; " answers)
-    pure (Seen threads answers windows (Just roots) Nothing [] [] Nothing)
+    pure (Seen threads answers windows (Just roots) Nothing [] [] Nothing Nothing)
 
 -- | The case that admits a window after the device exists.
 runLaterWindow ∷ Maybe Backend → Journal → IO SurfaceFreeOutcome
@@ -318,7 +338,7 @@ runLaterWindow backend journal = do
       pure (if any (`elem` retired) presented then FinishWith () else ContinueWith NoUpdateDemand)
     note journal "presented a frame to the later window and saw its presentation retire"
     roots ← atomically (readVulkanRoots (vulkanController vulkan))
-    pure (Seen [] [] 1 (Just roots) (Just standing) [] [] Nothing)
+    pure (Seen [] [] 1 (Just roots) (Just standing) [] [] Nothing Nothing)
   where
     quiet = recordingLogger (\_ → pure ())
 
@@ -343,7 +363,7 @@ runFrameless backend journal = do
     tickets ← mapM (\ticket → awaitTicket ticket deadline) [firstTicket, snd second]
     note journal ("the tickets answered " <> tshow tickets)
     roots ← atomically (readVulkanRoots (vulkanController vulkan))
-    pure (Seen [firstOn, fst second] ["recorded an initializing frame-less batch", "recorded a second frame-less batch"] 0 (Just roots) Nothing tickets [] Nothing)
+    pure (Seen [firstOn, fst second] ["recorded an initializing frame-less batch", "recorded a second frame-less batch"] 0 (Just roots) Nothing tickets [] Nothing Nothing)
   where
     deadline = either (error . show) id (durationFromNanoseconds AllowZero 10000000000)
 
@@ -376,7 +396,7 @@ runOffscreen backend journal = do
       | ((format, _, _), ticket, reading) ← zip3 batches tickets readings
       ]
     roots ← atomically (readVulkanRoots (vulkanController vulkan))
-    pure (Seen [renderedOn, readOn] ["rendered and copied both targets", "read both readbacks"] 0 (Just roots) Nothing tickets shots Nothing)
+    pure (Seen [renderedOn, readOn] ["rendered and copied both targets", "read both readbacks"] 0 (Just roots) Nothing tickets shots Nothing Nothing)
   where
     deadline = either (error . show) id (durationFromNanoseconds AllowZero 10000000000)
     pixelAt bytes (x, y) = ByteString.unpack (ByteString.take 4 (ByteString.drop ((y * offscreenSide + x) * 4) bytes))
@@ -405,7 +425,7 @@ runDrawing backend journal = do
     note journal ("the readback is at " <> Text.pack path)
     let shot = Shot Rgba8Srgb waited [(point, pixelAt bytes point) | point ← drawingProbes] path
     roots ← atomically (readVulkanRoots (vulkanController vulkan))
-    pure (Seen [drawnOn, readOn] ["drew the quad and copied the target", "read the readback"] 0 (Just roots) Nothing [waited] [shot] Nothing)
+    pure (Seen [drawnOn, readOn] ["drew the quad and copied the target", "read the readback"] 0 (Just roots) Nothing [waited] [shot] Nothing Nothing)
   where
     deadline = either (error . show) id (durationFromNanoseconds AllowZero 10000000000)
     pixelAt bytes (x, y) = ByteString.unpack (ByteString.take 4 (ByteString.drop ((y * offscreenSide + x) * 4) bytes))
@@ -479,6 +499,7 @@ runUploads backend journal = do
             [waited]
             [shot]
             (Just facts)
+            Nothing
         )
   where
     deadline = either (error . show) id (durationFromNanoseconds AllowZero 30000000000)
@@ -816,6 +837,254 @@ framelessCopying target buffer construction = do
         Right (ticket, Right ()) → Right ticket
   pure (ran, answer)
 
+-- | What the texture table case (GRS-7) found.
+data TableFacts = TableFacts
+  { tableTickets ∷ ![Either Text UploadState]
+    -- ^ Each texture's upload, waited for with a deadline off the owner's
+    -- thread.
+  , tableReplacedSlot ∷ !(Maybe Word32)
+    -- ^ The first texture's slot, which the record-then-replace batch's
+    -- version maps.
+  , tableReplacementSlot ∷ !(Maybe Word32)
+    -- ^ The slot the texture registered after its release took.
+  , tableRetiringAtRelease ∷ ![Word32]
+    -- ^ The slots retiring right after the release, before that batch was
+    -- submitted.
+  , tableRetiringAtEnd ∷ ![Word32]
+    -- ^ The slots retiring once every batch completed.
+  , tableStaleRelease ∷ !(Either Refusal ())
+    -- ^ What releasing the released handle again answered.
+  }
+  deriving (Show)
+
+-- | The texture table case (GRS-7): a table made over the session's uploads;
+-- one texture registered before its upload, drawn as slot 0's transparent
+-- placeholder; two textures, each uploaded and drawn through its handle with
+-- a sampler of its own; a batch recorded with the first texture's handle, the
+-- handle then released and a third texture registered before the batch is
+-- submitted, which still draws the first; and the third drawn beside the
+-- released handle, which a shader resolves to the placeholder. Each batch
+-- draws into a color target of its own, copied into a readback and probed.
+runTable ∷ Maybe Backend → Journal → IO SurfaceFreeOutcome
+runTable backend journal = do
+  heading journal "GRS-7: a surface-free session samples textures through bindless handles: the placeholder before an upload, two textures with selected samplers, and a batch recorded before its texture's release still drawing the original"
+  runCaseWith
+    (\config → config {vulkanUploads = Just uploadConfig})
+    backend
+    defaultBudgetRequest {requestedBytes = 2 * 1024 * 1024 * 1024}
+    []
+    "vulkan-native-grs7-texture-table"
+    $ \vulkan _ _ _ → do
+      (madeOn, made) ← acted vulkan "the table and its targets" tableTargets
+      -- The table binds once its placeholder's upload has completed.
+      awaitTable vulkan "the placeholder written" tableViewPlaceholderWritten
+      (firstOn, (red, ticket1)) ←
+        acted vulkan "the placeholder batch" $ \construction →
+          registerConstructedTexture construction (tableRed made) >>= \case
+            Left refusal → pure (Left refusal)
+            Right red → fmap ((,) red) <$> tableBatch construction made 0 [(wholeRect, red, LinearClamp)]
+      waited1 ← awaitTicket ticket1 deadline
+      admitted ←
+        mapM
+          (submitVulkanUpload vulkan)
+          [UploadImage (tableRed made) [solid [255, 0, 0, 255]], UploadImage (tableGreen made) [solid [0, 255, 0, 255]], UploadImage (tableBlue made) [solid [0, 0, 255, 255]]]
+      states ←
+        mapM
+          ( \case
+              Left refusal → pure (Left (tshow refusal))
+              Right ticket → either (Left . tshow) Right <$> awaitUploadTicket ticket deadline
+          )
+          admitted
+      (secondOn, (replaced, ticket2)) ←
+        acted vulkan "the two-texture batch" $ \construction →
+          registerConstructedTexture construction (tableGreen made) >>= \case
+            Left refusal → pure (Left refusal)
+            Right green → do
+              batch ← tableBatch construction made 1 [(leftRect, red, NearestClamp), (rightRect, green, LinearRepeat)]
+              view ← readConstructedTable construction
+              pure (fmap ((,) (view >>= slotOf red)) batch)
+      waited2 ← awaitTicket ticket2 deadline
+      -- Recorded with the first texture's handle; the handle released and
+      -- another texture registered before the action returns, which is when
+      -- the batch is submitted.
+      (thirdOn, (ticket3, retiring, blue, replacement, stale)) ←
+        acted vulkan "the record-then-replace batch" $ \construction →
+          tableBatch construction made 2 [(wholeRect, red, LinearClamp)] >>= \case
+            Left refusal → pure (Left refusal)
+            Right ticket → do
+              released ← releaseConstructedTexture construction red
+              atRelease ← maybe [] tableViewRetiring <$> readConstructedTable construction
+              registered ← registerConstructedTexture construction (tableBlue made)
+              stale ← releaseConstructedTexture construction red
+              view ← readConstructedTable construction
+              pure $ case (released, registered) of
+                (Left refusal, _) → Left refusal
+                (_, Left refusal) → Left refusal
+                (Right (), Right blue) → Right (ticket, atRelease, blue, view >>= slotOf blue, stale)
+      waited3 ← awaitTicket ticket3 deadline
+      (fourthOn, ticket4) ←
+        acted vulkan "the replacement batch" $ \construction →
+          tableBatch construction made 3 [(leftRect, blue, NearestRepeat), (rightRect, red, NearestClamp)]
+      waited4 ← awaitTicket ticket4 deadline
+      -- Once every batch has completed, the owner's step lets the released
+      -- texture's slot go.
+      awaitTable vulkan "the released texture's slot reclaimed" (null . tableViewRetiring)
+      (readOn, (targets, atEnd)) ←
+        acted vulkan "the readbacks" $ \construction → do
+          bytes ← mapM (\readback → readConstructedReadback construction readback 0 offscreenBytes) (tableReadbacks made)
+          view ← readConstructedTable construction
+          pure (fmap (\read' → (read', maybe [] tableViewRetiring view)) (sequence bytes))
+      directory ← getTemporaryDirectory
+      shots ←
+        mapM
+          ( \(index, (waited, bytes)) → do
+              (path, handle) ← openBinaryTempFile directory ("hetoimasia-grs7-table-" <> show (index ∷ Int) <> ".png")
+              ByteString.hPut handle (encodeRgba offscreenSide offscreenSide bytes)
+              hClose handle
+              note journal ("readback " <> tshow index <> " is at " <> Text.pack path)
+              pure (Shot Rgba8Srgb waited [(point, pixelAt bytes point) | point ← tableProbes] path)
+          )
+          (zip [0 ..] (zip [waited1, waited2, waited3, waited4] targets))
+      roots ← atomically (readVulkanRoots (vulkanController vulkan))
+      let facts = TableFacts states replaced replacement retiring atEnd stale
+      note journal ("table: " <> tshow facts)
+      pure
+        ( Seen
+            [madeOn, firstOn, secondOn, thirdOn, fourthOn, readOn]
+            [ "made the table, the targets, the pipeline and the readbacks"
+            , "drew a texture registered before its upload"
+            , "drew two uploaded textures with a sampler each"
+            , "recorded a batch, released its texture and registered another"
+            , "drew the new texture beside the released handle"
+            , "read every readback"
+            ]
+            0
+            (Just roots)
+            Nothing
+            [waited1, waited2, waited3, waited4]
+            shots
+            Nothing
+            (Just facts)
+        )
+  where
+    deadline = either (error . show) id (durationFromNanoseconds AllowZero 30000000000)
+    pixelAt bytes (x, y) = ByteString.unpack (ByteString.take 4 (ByteString.drop ((y * offscreenSide + x) * 4) bytes))
+    solid = ByteString.pack . concat . replicate 4
+    slotOf handle view = case Map.lookup (handleIndex handle) (tableViewMapping view) of
+      Just entry | entryGeneration entry == handleGeneration handle → Just (entrySlot entry)
+      _ → Nothing
+
+-- | Run one owner-thread action, answering the thread it ran on and what it
+-- answered, or stop the case naming it.
+acted ∷ VulkanHost () → Text → (∀ q inst msgr phys dev cmd. Construction q inst msgr phys dev cmd → IO (Either Refusal a)) → IO (ThreadId, a)
+acted vulkan what body =
+  act vulkan (VulkanAction (\construction → (,) <$> myThreadId <*> body construction)) >>= \case
+    ActionReturned (ran, Right answer) → pure (ran, answer)
+    ActionReturned (_, Left refusal) → stopWith (what <> " was refused: " <> tshow refusal)
+    other → stopWith (what <> "'s action did not return: " <> outcomeText other)
+
+-- | Wait, for at most ten seconds, for the texture table to stand as the
+-- predicate asks, reading it through owner-thread actions.
+awaitTable ∷ VulkanHost () → Text → (TableView → Bool) → IO ()
+awaitTable vulkan what wanted = go (500 ∷ Int)
+  where
+    go 0 = stopWith (what <> " did not happen within ten seconds")
+    go remaining =
+      act vulkan (VulkanAction readConstructedTable) >>= \case
+        ActionReturned (Just view) | wanted view → pure ()
+        ActionReturned _ → threadDelay 20000 >> go (remaining - 1)
+        other → stopWith ("reading the texture table did not return: " <> outcomeText other)
+
+-- | What the texture table case draws into and reads back from.
+data TableTargets = TableTargets
+  { tableRed ∷ !Image
+  , tableGreen ∷ !Image
+  , tableBlue ∷ !Image
+  , tableColorTargets ∷ ![Image]
+  , tablePipeline ∷ !Pipeline
+  , tableReadbacks ∷ ![Readback]
+  }
+
+-- | The session's texture table, of sixteen slots with eight at first, and
+-- three two-by-two RGBA8 textures; four RGBA8 color targets and a readback
+-- for each; and a pipeline over the table shaders.
+tableTargets ∷ Construction q inst msgr phys dev cmd → IO (Either Refusal TableTargets)
+tableTargets construction =
+  constructTextureTable construction (either (error . show) id (validateTableConfig 16 8 (toInteger defaultVersionCount))) >>= \case
+    Left refusal → pure (Left refusal)
+    Right () → do
+      let side = fromIntegral offscreenSide
+          texture = constructImage construction (ImageDescription TextureImage Rgba8Linear 2 2 1)
+      red ← texture
+      green ← texture
+      blue ← texture
+      targets ← mapM (const (constructImage construction (ImageDescription ColorTarget Rgba8Srgb side side 1))) [1 ∷ Int .. 4]
+      pipeline ←
+        constructTablePipelineLayout construction tableShaders tableSamplerOffset >>= \case
+          Left refusal → pure (Left refusal)
+          Right layout → constructCheckedPipeline construction layout tableShaders (formatCode Rgba8Srgb)
+      readbacks ← mapM (const (constructReadback construction offscreenBytes)) [1 ∷ Int .. 4]
+      pure (TableTargets <$> red <*> green <*> blue <*> sequence targets <*> pipeline <*> sequence readbacks)
+
+-- | One frame-less batch into the color target of this index: cleared to
+-- opaque black from undefined, then each draw — over the scissor, through
+-- the handle, with the sampler — covering it; copied into its readback.
+tableBatch ∷ Construction q inst msgr phys dev cmd → TableTargets → Int → [(Rect, TextureHandle, TableSampler)] → IO (Either Refusal BatchTicket)
+tableBatch construction made index draws =
+  constructFramelessBatch construction steps <&> \case
+    Left refusal → Left refusal
+    Right (_, Left refusal) → Left refusal
+    Right (ticket, Right ()) → Right ticket
+  where
+    side = fromIntegral offscreenSide ∷ Float
+    target = tableColorTargets made !! index
+    steps recorder =
+      inOrder $
+        [ beginRenderingInto recorder target ClearFromUndefined (ClearColor 0 0 0 1)
+        , bindPipeline recorder (tablePipeline made)
+        , setViewport recorder (Viewport 0 0 side side)
+        , bindTable recorder
+        ]
+          <> concat
+            [ [ setScissor recorder rect
+              , selectSampler recorder (tableSamplerIndex sampler)
+              , pushConstants recorder [PushFragment] 0 (handleBytes handle)
+              , draw recorder 3 1
+              ]
+            | (rect, handle, sampler) ← draws
+            ]
+          <> [ endRendering recorder
+             , transitionResource recorder target (FromUse ColorAttachment) TransferRead
+             , copyTargetToReadback recorder target (tableReadbacks made !! index)
+             , transitionResource recorder target (FromUse TransferRead) ColorAttachment
+             ]
+    handleBytes handle = ByteString.pack (concatMap word [handleIndex handle, handleGeneration handle])
+    word ∷ Word32 → [Word8]
+    word value = [fromIntegral (value `shiftR` shift) | shift ← [0, 8, 16, 24]]
+
+wholeRect, leftRect, rightRect ∷ Rect
+wholeRect = Rect 0 0 (fromIntegral offscreenSide) (fromIntegral offscreenSide)
+leftRect = Rect 0 0 (fromIntegral offscreenSide `div` 2) (fromIntegral offscreenSide)
+rightRect = Rect (fromIntegral offscreenSide `div` 2) 0 (fromIntegral offscreenSide `div` 2) (fromIntegral offscreenSide)
+
+-- | Probe points well inside each half.
+tableProbes ∷ [(Int, Int)]
+tableProbes = [(16, 32), (48, 32)]
+
+-- | What each readback's probes must read: the transparent placeholder
+-- across both halves; red and green; red across both halves, the released
+-- texture its batch was recorded with; and blue beside the placeholder the
+-- released handle resolves to.
+expectedTableProbes ∷ [[[Word8]]]
+expectedTableProbes =
+  [ [transparent, transparent]
+  , [[255, 0, 0, 255], [0, 255, 0, 255]]
+  , [[255, 0, 0, 255], [255, 0, 0, 255]]
+  , [[0, 0, 255, 255], transparent]
+  ]
+  where
+    transparent = [0, 0, 0, 0]
+
 -- | Run the commands in order, stopping at the first refusal.
 inOrder ∷ [IO (Either Refusal ())] → IO (Either Refusal ())
 inOrder = \case
@@ -966,6 +1235,7 @@ runCaseWith adjust backend request windows label body = do
               , factsErrors = errors
               , factsSeconds = realToFrac (diffUTCTime finished started)
               , factsUploads = seenUploads seen
+              , factsTable = seenTable seen
               }
   where
     -- Every call's name, as it returns, where a transaction can wait for it.
@@ -1200,6 +1470,68 @@ uploadsSpec outcome = describe "GRS-6 uploads through bounded staging in a surfa
 
   it "reached a verdict after the last callback with no issue and no error, synchronization validation included" $
     on outcome clean
+
+tableSection ∷ SurfaceFreeOutcome → [Text]
+tableSection outcome =
+  section "A surface-free session sampling textures through the bindless texture table" outcome
+    <> case outcome of
+      SurfaceFreeRecorded facts →
+        concat
+          [ ["- table: " <> maybe "no facts" tshow (factsTable facts)]
+          , [ "- " <> tshow (map snd (shotProbes shot)) <> ", ticket " <> tshow (shotTicket shot) <> ", PNG at " <> Text.pack (shotPng shot)
+            | shot ← factsShots facts
+            ]
+          ]
+      SurfaceFreeFailed _ → []
+
+tableSpec ∷ SurfaceFreeOutcome → Spec
+tableSpec outcome = describe "GRS-7 the bindless texture table in a surface-free session" $ do
+  it "opened no window, created no surface and acquired no image" $
+    on outcome $ \facts → do
+      factsWindows facts `shouldBe` 0
+      callNames facts `shouldSatisfy` notElem "glfwCreateWindowSurface"
+      callNames facts `shouldSatisfy` notElem "vkAcquireNextImageKHR"
+      deviceFirst facts
+
+  it "made the table's four samplers, two set layouts, two pools and two sets, wrote its descriptors, and drew in four frame-less batches whose tickets completed, on the owner's thread" $
+    on outcome $ \facts → do
+      length (filter (== "vkCreateSampler") (callNames facts)) `shouldBe` 4
+      length (filter (== "vkCreateDescriptorSetLayout") (callNames facts)) `shouldBe` 2
+      length (filter (== "vkCreateDescriptorPool") (callNames facts)) `shouldBe` 2
+      length (filter (== "vkAllocateDescriptorSets") (callNames facts)) `shouldBe` 2
+      factsRunning facts `shouldSatisfy` ordered ["vkCreateSampler", "vkCreateDescriptorSetLayout", "vkCreateDescriptorPool", "vkAllocateDescriptorSets", "vkUpdateDescriptorSets", "vkCreatePipelineLayout", "vkCreateGraphicsPipelines"]
+      map shotTicket (factsShots facts) `shouldBe` replicate 4 (Right TicketComplete)
+      fmap tableTickets (factsTable facts) `shouldBe` Just (replicate 3 (Right UploadComplete))
+      ownerThread facts $ \owner → factsActionThreads facts `shouldBe` replicate 6 owner
+
+  it "drew the transparent placeholder through a handle whose texture had not uploaded, and each uploaded texture through its own handle and sampler" $
+    on outcome $ \facts →
+      take 2 [map snd (shotProbes shot) | shot ← factsShots facts] `shouldBe` take 2 expectedTableProbes
+
+  it "drew the released texture in a batch recorded before its release and submitted after it, gave the next texture another slot, and let the slot go once that batch completed" $
+    on outcome $ \facts → do
+      drop 2 [map snd (shotProbes shot) | shot ← factsShots facts] `shouldBe` drop 2 expectedTableProbes
+      case factsTable facts of
+        Nothing → expectationFailure "no table facts"
+        Just table → do
+          tableReplacedSlot table `shouldSatisfy` maybe False (/= 0)
+          tableReplacementSlot table `shouldSatisfy` maybe False (/= 0)
+          tableReplacementSlot table `shouldSatisfy` (/= tableReplacedSlot table)
+          Just (tableRetiringAtRelease table) `shouldBe` fmap pure (tableReplacedSlot table)
+          tableRetiringAtEnd table `shouldBe` []
+          tableStaleRelease table `shouldSatisfy` either isStale (const False)
+
+  it "retired cleanly, the table's pools, set layouts and samplers before the device, with every Vulkan call on the owner's thread" $
+    on outcome $ \facts → do
+      callNames facts `shouldSatisfy` ordered ["vkDestroyDescriptorPool", "vkDestroyDescriptorSetLayout", "vkDestroySampler", "vkDestroyDevice", "vkDestroyDebugUtilsMessengerEXT", "vkDestroyInstance"]
+      oneOwnerThread facts
+
+  it "reached a verdict after the last callback with no issue and no error, synchronization validation included" $
+    on outcome clean
+  where
+    isStale = \case
+      RefusedStaleHandle _ → True
+      _ → False
 
 framelessSpec ∷ SurfaceFreeOutcome → Spec
 framelessSpec outcome = describe "GRS-12 frame-less batches in a surface-free session" $ do

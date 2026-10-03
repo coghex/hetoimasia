@@ -35,6 +35,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Commands
   , setScissorUnsafe
   , drawUnsafe
   , pushConstantsUnsafe
+  , bindDescriptorSetsUnsafe
   , bindVertexBufferUnsafe
   , bindIndexBufferUnsafe
   , drawIndexedUnsafe
@@ -52,6 +53,7 @@ import qualified Data.ByteString.Unsafe as Unsafe
 import Data.Int (Int32)
 import Data.Text (Text)
 import Data.Word (Word32, Word64)
+import Foreign.Marshal.Array (withArrayLen)
 import Foreign.Marshal.Utils (with)
 import Foreign.Ptr (FunPtr, Ptr, castPtr, nullFunPtr)
 import Vulkan.CStruct (withCStruct)
@@ -61,6 +63,7 @@ import Vulkan.Core10
   , BufferCopy
   , BufferImageCopy
   , CommandBufferBeginInfo
+  , DescriptorSet (..)
   , Image (..)
   , ImageLayout (..)
   , IndexType (..)
@@ -94,6 +97,7 @@ unsafeImports =
   , "vkCmdSetScissor"
   , "vkCmdDraw"
   , "vkCmdPushConstants"
+  , "vkCmdBindDescriptorSets"
   , "vkCmdBindVertexBuffers"
   , "vkCmdBindIndexBuffer"
   , "vkCmdDrawIndexed"
@@ -176,6 +180,19 @@ foreign import ccall unsafe "dynamic"
     → Word32
     → Word32
     → Ptr ()
+    → IO ()
+
+foreign import ccall unsafe "dynamic"
+  mkCmdBindDescriptorSets
+    ∷ FunPtr (Ptr CommandBuffer_T → PipelineBindPoint → PipelineLayout → Word32 → Word32 → Ptr DescriptorSet → Word32 → Ptr Word32 → IO ())
+    → Ptr CommandBuffer_T
+    → PipelineBindPoint
+    → PipelineLayout
+    → Word32
+    → Word32
+    → Ptr DescriptorSet
+    → Word32
+    → Ptr Word32
     → IO ()
 
 foreign import ccall unsafe "dynamic"
@@ -317,6 +334,15 @@ pushConstantsUnsafe buffer layout stages offset bytes = do
   entry ← resolved "vkCmdPushConstants" (pVkCmdPushConstants (commands buffer))
   Unsafe.unsafeUseAsCStringLen bytes $ \(pointer, count) →
     mkCmdPushConstants entry (handle buffer) layout stages offset (fromIntegral count) (castPtr pointer)
+
+-- | Bind descriptor sets for graphics, from set 0 on, with their dynamic
+-- offsets in order (GRS-7), through arrays that live only for the call.
+bindDescriptorSetsUnsafe ∷ CommandBuffer → PipelineLayout → [Word64] → [Word32] → IO ()
+bindDescriptorSetsUnsafe buffer layout sets offsets = do
+  entry ← resolved "vkCmdBindDescriptorSets" (pVkCmdBindDescriptorSets (commands buffer))
+  withArrayLen (map DescriptorSet sets) $ \setCount setPointer →
+    withArrayLen offsets $ \offsetCount offsetPointer →
+      mkCmdBindDescriptorSets entry (handle buffer) PIPELINE_BIND_POINT_GRAPHICS layout 0 (fromIntegral setCount) setPointer (fromIntegral offsetCount) offsetPointer
 
 -- | Bind one buffer, at one offset, to one vertex input binding.
 bindVertexBufferUnsafe ∷ CommandBuffer → Word32 → Buffer → Word64 → IO ()
