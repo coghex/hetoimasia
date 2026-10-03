@@ -98,6 +98,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   , VertexAttribute (..)
   , VertexBinding (..)
   , VertexInput (..)
+  , tableSamplerIndex
   , ViewRequest (..)
   , BufferKind (InstanceBuffer, StagingBuffer)
   , bufferKindUse
@@ -163,7 +164,6 @@ import Hetoimasia.GPU.Vulkan.Native.Naming
   , tablePoolName
   , tableSamplerName
   , tableSetLayoutName
-  , tableSetName
   )
 import Hetoimasia.GPU.Vulkan.Native.Profile (DevicePlan (..))
 import Hetoimasia.GPU.Vulkan.Native.Roots
@@ -437,6 +437,10 @@ checkedRangesWith table (CheckedShaders vertex fragment)
       Left (RefusedUnsupported "a shader declaring descriptor bindings, which only a pipeline layout holding the texture table declares")
   | table && any (`notElem` Interface.textureTableDescriptors) declared =
       Left (RefusedIncompatible "a shader declaring a descriptor binding the texture table does not hold")
+  -- Set 0's samplers and images are visible to the fragment stage alone;
+  -- set 1's lookup buffer to both.
+  | table && any ((== 0) . Interface.descriptorSet) (Interface.interfaceDescriptors vertexInterface) =
+      Left (RefusedIncompatible "a vertex shader declaring the texture table's samplers or images, which only the fragment stage sees")
   | otherwise = case (Interface.interfacePushConstants vertexInterface, Interface.interfacePushConstants fragmentInterface) of
       ([], []) → Right []
       (members, []) → sequence [spanning [PushVertex] members]
@@ -932,14 +936,9 @@ managedNames recording resource = \case
   NativeReadback allocation _ → [(ObjectBuffer, allocationBuffer allocation, readbackBufferName resource)]
   NativeBuffer _ _ allocated → [(ObjectBuffer, memoryResource (allocatedMemory allocated), bufferName resource)]
   NativeImage _ memory view → [(ObjectImage, memoryResource memory, imageName resource), (ObjectImageView, view, ownedViewName resource)]
-  NativeSamplers samplers → [(ObjectSampler, sampler, tableSamplerName resource index) | (index, sampler) ← zip [0 ..] samplers]
-  NativeSetLayouts textures lookups → [(ObjectDescriptorSetLayout, textures, tableSetLayoutName resource 0), (ObjectDescriptorSetLayout, lookups, tableSetLayoutName resource 1)]
-  NativeDescriptorPools texturePool textureSet lookupPool lookupSet →
-    [ (ObjectDescriptorPool, texturePool, tablePoolName resource 0)
-    , (ObjectDescriptorSet, textureSet, tableSetName resource 0)
-    , (ObjectDescriptorPool, lookupPool, tablePoolName resource 1)
-    , (ObjectDescriptorSet, lookupSet, tableSetName resource 1)
-    ]
+  NativeSampler sampler handle → [(ObjectSampler, handle, tableSamplerName resource (fromIntegral (tableSamplerIndex sampler)))]
+  NativeSetLayout set layout → [(ObjectDescriptorSetLayout, layout, tableSetLayoutName resource (fromIntegral set))]
+  NativeDescriptorPool set pool → [(ObjectDescriptorPool, pool, tablePoolName resource (fromIntegral set))]
   NativeVersion _ → []
 
 -- | Release a handle: nothing records through it again, and its CPU use —

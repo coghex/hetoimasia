@@ -99,7 +99,6 @@ import Control.Concurrent (ThreadId, myThreadId)
 import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVar, newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import Control.Exception (Exception (displayException), SomeAsyncException, SomeException, fromException, throwIO)
 import Data.ByteString (ByteString)
-import Data.Foldable (for_)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
@@ -139,6 +138,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   , PushConstantRange
   , ReadbackAllocation (..)
   , RecordingOps (..)
+  , TableSampler
   , VertexInput
   , bufferResourceKind
   , imageKindUse
@@ -179,14 +179,18 @@ data NativeResource cmd
   | NativeImage !ImageDescription !BoundMemory !Word64
     -- ^ What the image was created as, the image with its allocation, and
     -- its one owned view.
-  | NativeSamplers ![Word64]
-    -- ^ The texture table's four shared samplers, in 'TableSampler' order
-    -- (GRS-7).
-  | NativeSetLayouts !Word64 !Word64
-    -- ^ The texture table's two descriptor-set layouts: set 0's, the
-    -- samplers and the sampled-image array; set 1's, the lookup buffer.
-  | NativeDescriptorPools !Word64 !Word64 !Word64 !Word64
-    -- ^ Set 0's pool and the one set allocated from it, then set 1's.
+  | NativeSampler !TableSampler !Word64
+    -- ^ One of the texture table's four shared samplers (GRS-7). Each of the
+    -- table's native objects is a generation of its own, so a construction
+    -- that fails part-way leaves only whole generations, released and
+    -- destroyed by the ordinary rules.
+  | NativeSetLayout !Word32 !Word64
+    -- ^ One of the texture table's descriptor-set layouts, by set number:
+    -- set 0's, the samplers and the sampled-image array; set 1's, the lookup
+    -- buffer.
+  | NativeDescriptorPool !Word32 !Word64
+    -- ^ The pool of one of the texture table's sets, by set number. The set
+    -- itself is allocated from it afterwards, and freed with it.
   | NativeVersion !Word32
     -- ^ One lookup version of the texture table: its entry in the version
     -- ring, which is part of the ring's buffer and no native object of its
@@ -299,9 +303,9 @@ data Recording q inst msgr phys dev cmd = Recording
 -- released with every other live generation when the recording retires.
 data TableState = TableState
   { tableBook ∷ !(TextureTable ResourceId)
-  , tableSamplers ∷ !ResourceId
-  , tableLayouts ∷ !ResourceId
-  , tablePools ∷ !ResourceId
+  , tableObjects ∷ ![ResourceId]
+    -- ^ The samplers, the set layouts and the pools, which every batch that
+    -- binds the table retains.
   , tableRing ∷ !ResourceId
   , tableVersions ∷ !(Map Word32 ResourceId)
     -- ^ Each ring entry's managed version.
@@ -688,9 +692,9 @@ readManaged recording =
               (bufferKindText purpose, [memoryResource (allocatedMemory allocated), memoryAllocation (allocatedMemory allocated)])
             NativeImage description memory imageView →
               (imageKindText (imageKind description), [memoryResource memory, imageView, memoryAllocation memory])
-            NativeSamplers samplers → ("table samplers", samplers)
-            NativeSetLayouts textures lookups → ("table set layouts", [textures, lookups])
-            NativeDescriptorPools texturePool textureSet lookupPool lookupSet → ("table sets", [texturePool, textureSet, lookupPool, lookupSet])
+            NativeSampler _ sampler → ("table sampler", [sampler])
+            NativeSetLayout _ layout → ("table set layout", [layout])
+            NativeDescriptorPool _ pool → ("table pool", [pool])
             NativeVersion entry → ("lookup version", [fromIntegral entry])
        in ManagedView resource (managedStanding record) kind handles
     bufferKindText = \case
@@ -813,14 +817,10 @@ destroyNative recording device = \case
   NativeImage _ memory imageView → do
     rootsCall roots "vkDestroyImageView" (opsDestroyView ops device imageView)
     freeImage roots memory
-  NativeSamplers samplers → for_ samplers (rootsCall roots "vkDestroySampler" . opsDestroySampler ops device)
-  NativeSetLayouts textures lookups → do
-    rootsCall roots "vkDestroyDescriptorSetLayout" (opsDestroySetLayout ops device textures)
-    rootsCall roots "vkDestroyDescriptorSetLayout" (opsDestroySetLayout ops device lookups)
-  -- Each pool frees the set allocated from it.
-  NativeDescriptorPools texturePool _ lookupPool _ → do
-    rootsCall roots "vkDestroyDescriptorPool" (opsDestroyDescriptorPool ops device texturePool)
-    rootsCall roots "vkDestroyDescriptorPool" (opsDestroyDescriptorPool ops device lookupPool)
+  NativeSampler _ sampler → rootsCall roots "vkDestroySampler" (opsDestroySampler ops device sampler)
+  NativeSetLayout _ layout → rootsCall roots "vkDestroyDescriptorSetLayout" (opsDestroySetLayout ops device layout)
+  -- A pool frees the set allocated from it.
+  NativeDescriptorPool _ pool → rootsCall roots "vkDestroyDescriptorPool" (opsDestroyDescriptorPool ops device pool)
   NativeVersion _ → pure ()
   where
     roots = recordingRoots recording

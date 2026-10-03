@@ -150,6 +150,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   , useLayout
   , useScope
   )
+import qualified Hetoimasia.GPU.Model.TextureTable as Book
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Lookup (TakenVersion (..), takeVersion)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   ( TableState (..)
@@ -1045,15 +1046,18 @@ tableReady state bound = case interfaceTable (boundInterface bound) of
 -- batch's version. The batch's first bind takes the version
 -- ("Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Lookup"'s 'takeVersion',
 -- which may publish a new one) and retains it, the samplers, the set
--- layouts, the pools and the version ring until its references end; every
--- later bind of the batch binds that same version again, whatever has been
--- published since. Refused with no native call: a closed recorder; no
--- pipeline bound, or one whose layout does not hold the table; and whatever
--- taking a version refuses — no table, its placeholder not yet uploaded, or
--- every version held while a new one is owed.
+-- layouts, the pools, the version ring, the placeholder and every image the
+-- version maps until its references end, so none of them — an image's view
+-- and allocation included — is destroyed while the batch can still sample
+-- it, even at retirement; every later bind of the batch binds that same
+-- version again, whatever has been published since. Refused with no native
+-- call: a session that has failed; a closed recorder; no pipeline bound, or
+-- one whose layout does not hold the table; and whatever taking a version
+-- refuses — no table, its placeholder not yet uploaded, or every version held
+-- while a new one is owed.
 bindTable ∷ Recorder q inst msgr phys dev cmd → IO (Either Refusal ())
 bindTable recorder =
-  owned recording $
+  owned recording . checkpointed recording $
     readIORef (recorderOpen recorder) >>= \case
       False → pure (Left RefusedRecorderClosed)
       True → do
@@ -1076,7 +1080,10 @@ bindTable recorder =
                       let ranges = interfacePushConstants (boundInterface now)
                        in Right
                             ( current {stateTable = Just (TableBinding version (Just ranges))}
-                            , [tableSamplers held, tableLayouts held, tablePools held, tableRing held, takenResource version, boundLayout now]
+                            , tableObjects held
+                                <> [tableRing held, takenResource version, tablePlaceholder held]
+                                <> Book.versionTextures (takenEntry version) (tableBook held)
+                                <> [boundLayout now]
                             , CommandBindDescriptorSets (interfaceLayout (boundInterface now)) (tableSets held) [takenOffset version]
                             )
                     Nothing → Left (RefusedIllegal "binding the texture table with no pipeline bound")

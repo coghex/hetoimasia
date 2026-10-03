@@ -33,7 +33,7 @@ import Data.IORef (modifyIORef', newIORef, readIORef)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Set (Set)
-import Data.Word (Word32, Word64)
+import Data.Word (Word32)
 import Numeric.Natural (Natural)
 
 import Hetoimasia.GPU.Model.Budget (BudgetKind (TextureSlotBudget))
@@ -70,12 +70,14 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , Recording (..)
   , Refusal (..)
   , TableState (..)
+  , checkpointed
   , liveNative
   , owned
   , tshow
   )
 import Hetoimasia.GPU.Vulkan.Native.Internal.Uploads (UploadRequest (..), Uploads, submitUpload)
-import Hetoimasia.GPU.Vulkan.Native.Roots (readRootsDevice, rootsCall)
+import Hetoimasia.GPU.Vulkan.Native.Naming (NativeObjectKind (ObjectDescriptorSet), tableSetName)
+import Hetoimasia.GPU.Vulkan.Native.Roots (nameRootsObject, readRootsDevice, readRootsInstrumentation, rootsCall)
 import Hetoimasia.GPU.Vulkan.Native.Shader.Interface (CheckedShaders)
 
 -- | Make the session's texture table from a validated configuration (D-11):
@@ -89,17 +91,20 @@ import Hetoimasia.GPU.Vulkan.Native.Shader.Interface (CheckedShaders)
 -- a cap beyond its update-after-bind sampled-image limits, the four samplers
 -- beyond its update-after-bind sampler limits, a stage's every binding
 -- beyond its update-after-bind resource limit, fewer than two bindable sets,
--- one version's entries beyond its storage-buffer range, and a ring beyond
--- its buffer size, are each 'RefusedOutOfBounds', naming what was asked for
--- and the limit. Versions are placed at a stride that is a multiple of the
--- device's storage-buffer offset alignment and flush granularity. A
--- construction that is refused or raises releases everything already made.
+-- one version's entries beyond its storage-buffer range, the last version's
+-- dynamic offset beyond what 32 bits hold, and a ring beyond its buffer size,
+-- are each 'RefusedOutOfBounds', naming what was asked for and the limit.
+-- Versions are placed at a stride that is a multiple of the device's
+-- storage-buffer offset alignment and flush granularity. A construction that
+-- is refused or raises releases every generation already made, whose
+-- destruction follows the ordinary rules. Refused, like all new work, once
+-- the session has failed.
 --
 -- The table is bound only once the placeholder's upload has completed and
 -- its descriptor is written, which the owner's next refresh does.
 createTextureTable ∷ Recording q inst msgr phys dev cmd → Uploads q inst msgr phys dev cmd → Book.TableConfig → IO (Either Refusal ())
 createTextureTable recording uploads config =
-  owned recording $ do
+  owned recording . checkpointed recording $ do
     existing ← readTVarIO (recordingTable recording)
     limits ← opsRecordingLimits ops
     most ← opsMaxBufferSize ops
@@ -117,6 +122,7 @@ createTextureTable recording uploads config =
           , (toInteger capacity + 5, toInteger (limitTableResources limits))
           , (2, toInteger (limitBoundSets limits))
           , (entryBytes, toInteger (limitStorageRange limits))
+          , (toInteger stride * (toInteger versions - 1), toInteger (maxBound ∷ Word32))
           , (toInteger ringBytes, toInteger most)
           ]
     case existing of
@@ -140,41 +146,31 @@ createTextureTable recording uploads config =
     ops = recordingOps recording
     initialSlots = Book.tableInitialSlots config
     build made step stride ringBytes = do
-      samplers ← step $
-        construct
-          recording
-          0
-          4
-          "vkCreateSampler"
-          (\layer device _ _ → Right . NativeSamplers <$> allOrNothing (opsDestroySampler layer device) [opsCreateSampler layer device sampler | sampler ← [minBound .. maxBound]])
-          Nothing
-      samplerHandles ← nativeOf samplers >>= \case
-        NativeSamplers handles → pure handles
-        _ → throwIO (Abandon RefusedWrongKind)
-      layouts ← step $
-        construct
-          recording
-          0
-          2
-          "vkCreateDescriptorSetLayout"
-          ( \layer device _ _ →
-              ( \case
-                  [textures, lookups] → Right (NativeSetLayouts textures lookups)
-                  _ → Left RefusedWrongKind
-              )
-                <$> allOrNothing
-                  (opsDestroySetLayout layer device)
-                  [opsCreateSetLayout layer device (TextureSetLayout samplerHandles (Book.tableCapacity config)), opsCreateSetLayout layer device LookupSetLayout]
-          )
-          Nothing
-      (textureLayout, lookupLayout) ← nativeOf layouts >>= \case
-        NativeSetLayouts textures lookups → pure (textures, lookups)
-        _ → throwIO (Abandon RefusedWrongKind)
-      pools ← step $
-        construct recording 0 4 "vkCreateDescriptorPool" (makePools textureLayout lookupLayout) Nothing
-      sets ← nativeOf pools >>= \case
-        NativeDescriptorPools _ textureSet _ lookupSet → pure [textureSet, lookupSet]
-        _ → throwIO (Abandon RefusedWrongKind)
+      -- Each native object is a generation of its own, made by one creation
+      -- that rolls nothing back: a failure part-way leaves only whole
+      -- generations, which the unwinding releases and the ordinary disposal
+      -- destroys.
+      samplers ←
+        traverse
+          (\sampler → step (construct recording 0 1 "vkCreateSampler" (\layer device _ _ → Right . NativeSampler sampler <$> opsCreateSampler layer device sampler) Nothing))
+          [minBound .. maxBound]
+      samplerHandles ← traverse handleOf samplers
+      let setLayout set request = step (construct recording 0 1 "vkCreateDescriptorSetLayout" (\layer device _ _ → Right . NativeSetLayout set <$> opsCreateSetLayout layer device request) Nothing)
+          pool set request = step (construct recording 0 1 "vkCreateDescriptorPool" (\layer device _ _ → Right . NativeDescriptorPool set <$> opsCreateDescriptorPool layer device request) Nothing)
+      textureLayout ← setLayout 0 (TextureSetLayout samplerHandles (Book.tableCapacity config))
+      lookupLayout ← setLayout 1 LookupSetLayout
+      textureLayoutHandle ← handleOf textureLayout
+      lookupLayoutHandle ← handleOf lookupLayout
+      texturePool ← pool 0 (TexturePool 4 initialSlots)
+      lookupPool ← pool 1 LookupPool
+      device ←
+        atomically (readRootsDevice (recordingRoots recording)) >>= \case
+          Nothing → throwIO (Abandon RefusedDeviceAbsent)
+          Just (_, handle) → pure handle
+      -- Each set is allocated from its pool, which frees it: a failed
+      -- allocation leaves the pool, a generation, to the unwinding.
+      textureSet ← allocated device 0 texturePool textureLayoutHandle (Just initialSlots)
+      lookupSet ← allocated device 1 lookupPool lookupLayoutHandle Nothing
       (ring, mapping, atom) ←
         createMapped recording LookupBuffer ringBytes >>= \case
           Left refusal → throwIO (Abandon refusal)
@@ -183,12 +179,8 @@ createTextureTable recording uploads config =
         traverse
           (\entry → (,) entry <$> step (construct recording 0 1 "the texture table's lookup version" (\_ _ _ _ → pure (Right (NativeVersion entry))) Nothing))
           [0 .. Book.tableVersionCount config - 1]
-      device ←
-        atomically (readRootsDevice (recordingRoots recording)) >>= \case
-          Nothing → throwIO (Abandon RefusedDeviceAbsent)
-          Just (_, handle) → pure handle
       rootsCall (recordingRoots recording) "vkUpdateDescriptorSets" $
-        opsWriteDescriptors ops device [WriteLookupBuffer (lookupSetOf sets) (allocationBuffer mapping) (fromIntegral initialSlots * 8)]
+        opsWriteDescriptors ops device [WriteLookupBuffer lookupSet (allocationBuffer mapping) (fromIntegral initialSlots * 8)]
       Image placeholder ←
         createImage recording (ImageDescription TextureImage Rgba8Linear 1 1 1) >>= \case
           Left refusal → throwIO (Abandon refusal)
@@ -199,13 +191,11 @@ createTextureTable recording uploads config =
       pure
         TableState
           { tableBook = Book.newTextureTable config
-          , tableSamplers = samplers
-          , tableLayouts = layouts
-          , tablePools = pools
+          , tableObjects = samplers <> [textureLayout, lookupLayout, texturePool, lookupPool]
           , tableRing = ring
           , tableVersions = Map.fromList versions
-          , tableSetLayoutHandles = [textureLayout, lookupLayout]
-          , tableSets = sets
+          , tableSetLayoutHandles = [textureLayoutHandle, lookupLayoutHandle]
+          , tableSets = [textureSet, lookupSet]
           , tableMapping = mapping
           , tableStride = stride
           , tableEntries = initialSlots
@@ -214,27 +204,26 @@ createTextureTable recording uploads config =
           , tablePlaceholderWritten = False
           , tableTextures = Set.empty
           }
-    -- Set 0's pool and set, then set 1's: a failure destroys every pool made
-    -- so far, which frees its set.
-    makePools textureLayout lookupLayout layer device _ _ = do
-      texturePool ← opsCreateDescriptorPool layer device (TexturePool 4 initialSlots)
-      ( do
-          textureSet ← opsAllocateSet layer device texturePool textureLayout (Just initialSlots)
-          lookupPool ← opsCreateDescriptorPool layer device LookupPool
-          ( do
-              lookupSet ← opsAllocateSet layer device lookupPool lookupLayout Nothing
-              pure (Right (NativeDescriptorPools texturePool textureSet lookupPool lookupSet))
-            )
-            `onException` opsDestroyDescriptorPool layer device lookupPool
-        )
-        `onException` opsDestroyDescriptorPool layer device texturePool
+    -- A set allocated from a pool the table made, named as the pool's set
+    -- when the roots offer naming.
+    allocated device set poolResource layout count = do
+      poolHandle ← handleOf poolResource
+      handle ← rootsCall (recordingRoots recording) "vkAllocateDescriptorSets" (opsAllocateSet ops device poolHandle layout count)
+      readRootsInstrumentation (recordingRoots recording) >>= \case
+        Nothing → pure ()
+        Just (_, instrumentation) → nameRootsObject (recordingRoots recording) instrumentation ObjectDescriptorSet handle (tableSetName poolResource set)
+      pure handle
+    -- A table generation's one native handle.
+    handleOf resource =
+      nativeOf resource >>= \case
+        NativeSampler _ handle → pure handle
+        NativeSetLayout _ handle → pure handle
+        NativeDescriptorPool _ handle → pure handle
+        _ → throwIO (Abandon RefusedWrongKind)
     nativeOf resource =
       liveNative recording resource >>= \case
         Left refusal → throwIO (Abandon refusal)
         Right native → pure native
-    lookupSetOf = \case
-      [_, lookups] → lookups
-      _ → 0
     -- Release everything made so far, newest first.
     unwind made = do
       resources ← readIORef made
@@ -252,17 +241,6 @@ newtype Made = Made ResourceId
 instance Managed Made where
   managedResource (Made resource) = resource
 
--- | Run creations in order; if one raises, destroy those already made, newest
--- first, and re-raise.
-allOrNothing ∷ (Word64 → IO ()) → [IO Word64] → IO [Word64]
-allOrNothing destroy = go []
-  where
-    go made = \case
-      [] → pure (reverse made)
-      create : rest → do
-        handle ← create `onException` for_ made destroy
-        go (handle : made) rest
-
 -- | Register an uploaded texture (#342) with the table: answer its stable
 -- handle, which resolves to slot 0's placeholder until the image's upload has
 -- completed and to the image's own slot in versions published after that.
@@ -274,7 +252,7 @@ allOrNothing destroy = go []
 -- 'TextureSlotBudget', until a released texture's slot is reclaimed.
 registerTexture ∷ Recording q inst msgr phys dev cmd → Image → IO (Either Refusal Book.TextureHandle)
 registerTexture recording (Image image) =
-  owned recording $
+  owned recording . checkpointed recording $
     liveNative recording image >>= \case
       Left refusal → pure (Left refusal)
       Right (NativeImage description _ _)
@@ -332,7 +310,7 @@ refreshTextureTable recording = owned recording (refreshTable recording)
 -- refuse.
 createTablePipelineLayout ∷ Recording q inst msgr phys dev cmd → CheckedShaders → Word32 → IO (Either Refusal PipelineLayout)
 createTablePipelineLayout recording shaders samplerOffset =
-  owned recording $
+  owned recording . checkpointed recording $
     readTVarIO (recordingTable recording) >>= \case
       Nothing → pure (Left (RefusedIllegal "a pipeline layout holding a texture table this session has not made"))
       Just table → case checkedTableRanges shaders of

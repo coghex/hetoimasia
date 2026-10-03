@@ -76,12 +76,14 @@ module Hetoimasia.GPU.Model.TextureTable
   , currentMapping
   , currentVersion
   , versionMapping
+  , versionTextures
   , liveVersions
   , freeSlots
   , retiringSlots
   , mappedSlots
   ) where
 
+import Control.Applicative ((<|>))
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import qualified Data.Set as Set
@@ -416,6 +418,17 @@ currentVersion = tableCurrent
 -- | The mapping a ring entry holds, once written.
 versionMapping ∷ Word32 → TextureTable a → Maybe (Map Word32 LookupEntry)
 versionMapping entry = Map.lookup entry . tableVersions
+
+-- | What was kept for every texture a version maps — each slot but the
+-- placeholder's — which a batch binding that version must keep alive: the
+-- slot's texture while a handle holds it, or while it retires.
+versionTextures ∷ Word32 → TextureTable a → [a]
+versionTextures entry table =
+  [ kept
+  | slot ← Set.toList (Set.fromList (map entrySlot (maybe [] Map.elems (Map.lookup entry (tableVersions table)))))
+  , slot /= 0
+  , Just kept ← [Map.lookup slot (tableTextures table) <|> Map.lookup slot (tableRetiring table)]
+  ]
 
 -- | The ring entries whose versions are live: every one a batch holds, and
 -- the current one while no mapping has changed since it was published — once

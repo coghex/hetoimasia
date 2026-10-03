@@ -13,7 +13,8 @@
 module Test.GPU.Vulkan.Native.Table (spec) where
 
 import Control.Concurrent.STM (atomically)
-import Control.Exception (ErrorCall (..), throwIO, try)
+import Control.Exception (ErrorCall (..), SomeException, throwIO, try)
+import Data.IORef (newIORef, readIORef, writeIORef)
 import Control.Monad (when)
 import qualified Data.ByteString as ByteString
 import qualified Data.Map.Strict as Map
@@ -22,7 +23,9 @@ import Data.Word (Word32, Word64)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldReturn, shouldSatisfy)
 
 import Hetoimasia.GPU.Model.Budget (BudgetKind (LookupVersionBudget, TextureSlotBudget))
+import Hetoimasia.GPU.Model (SessionFailureCause (CleanupFailed), SessionState (SessionFailed), sessionState)
 import Hetoimasia.GPU.Model.Identity (IdentityKind (..), Misuse (..))
+import Hetoimasia.GPU.Vulkan.Native.Roots (failRootsSessionBecause, readRootsModel)
 import Hetoimasia.GPU.Vulkan.Native.Frames
 import Hetoimasia.GPU.Vulkan.Native.Recording
 import Hetoimasia.GPU.Vulkan.Native.Shader.Interface
@@ -41,7 +44,7 @@ import Test.GPU.Vulkan.Native.AllocatorStandIn (AllocatorCall (Flushed), allocat
 import Test.GPU.Vulkan.Native.FramesRig
 import Test.GPU.Vulkan.Native.FramesStandIn (completeAll)
 import Test.GPU.Vulkan.Native.StandIn (StandIn (standAllocator))
-import Test.GPU.Vulkan.Native.RecordingStandIn (RecordingCall (..), limitRecording, recordingCalls, standInRecordingLimits)
+import Test.GPU.Vulkan.Native.RecordingStandIn (RecordingCall (..), RecordingFailure (..), RecordingStep (..), failAt, limitBuffers, limitRecording, onceAt, recordingCalls, standInRecordingLimits)
 
 type Ups = Uploads () Int Int Text Int Word64
 
@@ -87,6 +90,11 @@ spec = describe "Texture table" $ do
       refusedUnder limits {limitTableResources = 20} (tableConfig 16 4 2) `shouldReturn` Left (RefusedOutOfBounds 21 20)
       refusedUnder limits {limitBoundSets = 1} (tableConfig 16 4 2) `shouldReturn` Left (RefusedOutOfBounds 2 1)
       refusedUnder limits {limitStorageRange = 31} (tableConfig 16 4 2) `shouldReturn` Left (RefusedOutOfBounds 32 31)
+      -- 262144 entries of eight bytes are a 2 MiB stride, so the 2049th
+      -- version's dynamic offset is 4 GiB, which no 32-bit offset holds, on a
+      -- device whose buffers could hold the whole ring.
+      limitBuffers (rigRecordingStandIn rig) (8 * 1024 * 1024 * 1024)
+      refusedUnder limits (tableConfig 262144 262144 2049) `shouldReturn` Left (RefusedOutOfBounds 4294967296 4294967295)
       calls ← recordingCalls (rigRecordingStandIn rig)
       [() | CreatedSampler {} ← calls] `shouldBe` []
       ok (createTextureTable (rigRecording rig) uploads (tableConfig 16 4 2))
@@ -105,10 +113,17 @@ spec = describe "Texture table" $ do
       createTablePipelineLayout (rigRecording rig) tableShaders 6 `shouldReturn'` refused (RefusedIllegal "a sampler index outside every push-constant range the fragment stage sees")
       createTablePipelineLayout (rigRecording rig) (shadersWith [DescriptorDeclaration 2 0 StorageBuffer (DescriptorCount 1)]) 8
         `shouldReturn'` refused (RefusedIncompatible "a shader declaring a descriptor binding the texture table does not hold")
+      -- Set 0 is visible to the fragment stage alone; set 1 to both.
+      createTablePipelineLayout (rigRecording rig) (vertexDeclaring [DescriptorDeclaration 0 1 SampledImage RuntimeSized]) 8
+        `shouldReturn'` refused (RefusedIncompatible "a vertex shader declaring the texture table's samplers or images, which only the fragment stage sees")
+      createTablePipelineLayout (rigRecording rig) (vertexDeclaring [DescriptorDeclaration 0 0 Sampler (DescriptorCount 4)]) 8
+        `shouldReturn'` refused (RefusedIncompatible "a vertex shader declaring the texture table's samplers or images, which only the fragment stage sees")
+      fmap (const ()) <$> createTablePipelineLayout (rigRecording rig) (vertexDeclaring [DescriptorDeclaration 1 0 StorageBuffer (DescriptorCount 1)]) 8 `shouldReturn` Right ()
       -- A layout without the table admits no binding at all.
       createPipelineLayoutFor (rigRecording rig) tableShaders `shouldReturn'` refused (RefusedUnsupported "a shader declaring descriptor bindings, which only a pipeline layout holding the texture table declares")
       calls' ← recordingCalls (rigRecordingStandIn rig)
-      [() | CreatedLayout {} ← calls'] `shouldBe` [() | CreatedLayout {} ← calls]
+      -- Only the admitted vertex stage's layout was made.
+      length [() | CreatedLayout {} ← calls'] `shouldBe` length [() | CreatedLayout {} ← calls] + 1
       kitTarget kit `seq` clean rig
 
   describe "binding and drawing" $ do
@@ -299,6 +314,69 @@ spec = describe "Texture table" $ do
       [offset | Recorded _ (CommandBindDescriptorSets _ _ [offset]) ← calls] `shouldBe` [0, 256, 256]
       clean rig
 
+  describe "failure" $ do
+    it "keeps every image a pending batch's version maps, and the placeholder, through retirement: none is destroyed, and each is named as retained" $ do
+      (rig, uploads, kit) ← tableRig 4 2
+      texture ← uploadedTexture rig uploads
+      _ ← registered rig texture
+      recordDrawing rig kit
+      retired ← try @ResourcesRetained (retireRecording (rigRecording rig) (at 1))
+      case retired of
+        Left (ResourcesRetained remaining) → remaining `shouldSatisfy` elem (managedResource texture)
+        Right () → expectationFailure "retirement claimed images a pending batch samples"
+      -- The texture, the placeholder and the batch's color target are every
+      -- image there is, and the batch holds all three.
+      calls ← recordingCalls (rigRecordingStandIn rig)
+      [view | DestroyedView view ← calls] `shouldBe` []
+      standing rig texture `shouldReturn` Just ManagedReleased
+
+    it "refuses new table work once the session has failed, writing nothing, and still lets a released texture go" $ do
+      (rig, uploads, kit) ← tableRig 4 2
+      texture ← uploadedTexture rig uploads
+      other ← uploadedTexture rig uploads
+      handle ← registered rig texture
+      bound ← newIORef Nothing
+      _ ← try @SomeException $ withFramelessScope (rigFrames rig) $ \scope →
+        recordFramelessIn scope $ \recorder → do
+          ok (beginRenderingInto recorder (kitTarget kit) ClearFromUndefined (ClearColor 0 0 0 1))
+          ok (bindPipeline recorder (kitPipeline kit))
+          atomically (failRootsSessionBecause (rigRoots rig) CleanupFailed "a later cleanup failed")
+          before ← length <$> recordingCalls (rigRecordingStandIn rig)
+          answer ← bindTable recorder
+          writeIORef bound (Just (answer, before))
+      Just (answer, before) ← readIORef bound
+      answer `shouldSatisfy` sessionFailed
+      registerTexture (rigRecording rig) other `shouldReturn'` (`shouldSatisfy` sessionFailed)
+      createTablePipelineLayout (rigRecording rig) tableShaders 8 `shouldReturn'` (`shouldSatisfy` sessionFailed)
+      ok (refreshTextureTable (rigRecording rig))
+      after ← drop before <$> recordingCalls (rigRecordingStandIn rig)
+      [() | WroteDescriptors _ ← after] `shouldBe` []
+      [() | WroteMapped {} ← after] `shouldBe` []
+      [() | Recorded _ CommandBindDescriptorSets {} ← after] `shouldBe` []
+      -- Releasing is cleanup: the texture no batch bound goes at once.
+      ok (releaseTexture (rigRecording rig) handle)
+      standing rig texture `shouldReturn` Just ManagedReleased
+
+    it "leaves only whole generations when its construction fails part-way, released at once and destroyed by the ordinary rules, which retain one whose destruction raised and fail the session" $ do
+      (rig, uploads) ← uploadRig
+      let standIn = rigRecordingStandIn rig
+          next = onceAt standIn AtCreateSampler
+      -- The fourth sampler's creation raises.
+      next (next (next (next (throwIO (RecordingFailure AtCreateSampler)))))
+      failAt standIn AtDestroySampler
+      raised ← try @RecordingFailure (createTextureTable (rigRecording rig) uploads (tableConfig 16 4 2))
+      raised `shouldBe` Left (RecordingFailure AtCreateSampler)
+      atomically (readTable (rigRecording rig)) `shouldReturn` Nothing
+      samplerStandings rig `shouldReturn` replicate 3 ManagedReleased
+      destroyed ← try @ResourceDestructionFailed (disposeResources (rigRecording rig) (at 1))
+      fmap (const ()) destroyed `shouldSatisfy` either (const True) (const False)
+      samplerStandings rig `shouldReturn'` (`shouldSatisfy` all uncertain)
+      sessionState <$> atomically (readRootsModel (rigRoots rig)) `shouldReturn` SessionFailed CleanupFailed
+      -- Never retried.
+      _ ← try @ResourceDestructionFailed (disposeResources (rigRecording rig) (at 2))
+      calls ← recordingCalls standIn
+      length [() | DestroyedSampler _ ← calls] `shouldBe` 3
+
   describe "handles" $ do
     it "refuses a released handle wherever it is used, and issues its index again only under a new generation" $ do
       (rig, uploads, _) ← tableRig 4 2
@@ -347,6 +425,12 @@ spec = describe "Texture table" $ do
       standing rig first `shouldReturn` Just ManagedReleased
       clean rig
   where
+    sessionFailed = \case
+      Left (RefusedSessionFailed _) → True
+      _ → False
+    uncertain = \case
+      ManagedUncertain _ → True
+      _ → False
     refused refusal answer = case answer of
       Left actual → actual `shouldBe` refusal
       Right _ → expectationFailure ("expected " <> show refusal)
@@ -475,6 +559,17 @@ commandCount rig = (\calls → length [() | Recorded {} ← calls]) <$> recordin
 managedHandles ∷ Rig → Text → IO [Word64]
 managedHandles rig kind' =
   (\views → concat [handles | ManagedView _ _ named handles ← views, named == kind']) <$> atomically (readManaged (rigRecording rig))
+
+-- | Where each of the table's samplers stands.
+samplerStandings ∷ Rig → IO [ManagedStanding]
+samplerStandings rig = (\views → [held | ManagedView _ held "table sampler" _ ← views]) <$> atomically (readManaged (rigRecording rig))
+
+-- | The table shaders with this vertex stage's descriptors.
+vertexDeclaring ∷ [DescriptorDeclaration] → CheckedShaders
+vertexDeclaring descriptors =
+  CheckedShaders
+    (CheckedShader (ByteString.pack [1, 2, 3, 4]) (interfaceFor VertexInterface) {interfaceDescriptors = descriptors})
+    (CheckedShader (ByteString.pack [5, 6, 7, 8]) (interfaceFor FragmentInterface) {interfacePushConstants = [PushMember 0 8, PushMember 8 4], interfaceDescriptors = textureTableDescriptors})
 
 -- | How many managed generations of this kind the recording holds.
 managedCount ∷ Rig → Text → IO Int

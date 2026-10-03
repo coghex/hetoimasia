@@ -25,7 +25,8 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Lookup
   ) where
 
 import Control.Concurrent.STM (STM, atomically, modifyTVar', readTVar, readTVarIO, writeTVar)
-import Control.Monad (unless)
+import Control.Monad (unless, when)
+import Data.Functor ((<&>))
 import qualified Data.ByteString as ByteString
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Builder as Builder
@@ -56,7 +57,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , Refusal (..)
   , TableState (..)
   )
-import Hetoimasia.GPU.Vulkan.Native.Roots (Roots, readRootsDevice, rootsCall, stateRootsModel)
+import Hetoimasia.GPU.Vulkan.Native.Roots (Checkpoint (..), Roots, checkpointRoots, readRootsDevice, rootsCall, stateRootsModel)
 
 -- | Whether each ring entry's version is held by a batch: its managed
 -- generation still has a recorded reference or a submitted use in the model.
@@ -83,7 +84,9 @@ encodeVersion entries mapping =
 -- and reclaim every retiring slot no live version maps, releasing its image.
 -- A texture is complete once the model holds it initialized and no upload
 -- holds it any longer, which is its upload's completion. A session with no
--- table has nothing to do.
+-- table has nothing to do. Once the session has failed, or while a
+-- diagnostic failure is pending, no descriptor is written — that is new work
+-- — but released textures are still reclaimed, which is cleanup.
 refreshTable ∷ Recording q inst msgr phys dev cmd → IO (Either Refusal ())
 refreshTable recording =
   readTVarIO (recordingTable recording) >>= \case
@@ -92,6 +95,27 @@ refreshTable recording =
       atomically (readRootsDevice roots) >>= \case
         Nothing → pure (Left RefusedDeviceAbsent)
         Just (_, device) → do
+          clear ←
+            checkpointRoots roots <&> \case
+              CheckpointClear → True
+              _ → False
+          when clear (writeCompleted table device)
+          -- Slots no live version maps any longer.
+          freed ← atomically $ do
+            held ← readTVar (recordingTable recording)
+            case held of
+              Nothing → pure []
+              Just state → do
+                isHeld ← versionHeld roots state
+                let (reclaimed, slots) = Book.reclaimSlots isHeld (tableBook state)
+                writeTVar (recordingTable recording) (Just state {tableBook = reclaimed})
+                pure (map snd slots)
+          results ← traverse (releaseTableImage recording) freed
+          pure (sequence_ results)
+  where
+    roots = recordingRoots recording
+    ops = recordingOps recording
+    writeCompleted table device = do
           -- Slot 0 first: until it is written, no batch binds the table.
           unless (tablePlaceholderWritten table) $
             ready (tablePlaceholder table) >>= \case
@@ -111,21 +135,6 @@ refreshTable recording =
                   Right (completed, (slot, _)) → do
                     rootsCall roots "vkUpdateDescriptorSets" (opsWriteDescriptors ops device [WriteSampledImage (textureSet table) slot view])
                     atomically (modifyTVar' (recordingTable recording) (fmap (\held → held {tableBook = completed})))
-          -- Slots no live version maps any longer.
-          freed ← atomically $ do
-            held ← readTVar (recordingTable recording)
-            case held of
-              Nothing → pure []
-              Just state → do
-                isHeld ← versionHeld roots state
-                let (reclaimed, slots) = Book.reclaimSlots isHeld (tableBook state)
-                writeTVar (recordingTable recording) (Just state {tableBook = reclaimed})
-                pure (map snd slots)
-          results ← traverse (releaseTableImage recording) freed
-          pure (sequence_ results)
-  where
-    roots = recordingRoots recording
-    ops = recordingOps recording
     current = maybe (fail "the texture table vanished") pure =<< readTVarIO (recordingTable recording)
     textureSet table = case tableSets table of
       set : _ → set

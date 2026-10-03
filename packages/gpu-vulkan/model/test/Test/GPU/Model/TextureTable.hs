@@ -159,6 +159,11 @@ spec = describe "texture table" $ do
       resolveHandle 4 current old `shouldBe` 0
       resolveHandle 4 current new `shouldBe` 0
       resolveHandle 4 frozen new `shouldBe` 0
+      -- The earlier version still names the released texture as one a batch
+      -- binding it must keep; the later one maps no texture yet.
+      (afterLater, later') ← expectRight (bindVersion (heldBy [bindingVersion earlier]) reused)
+      versionTextures (bindingVersion earlier) afterLater `shouldBe` ["a"]
+      versionTextures (bindingVersion later') afterLater `shouldBe` []
   where
     fresh ∷ Integer → Integer → TextureTable String
     fresh slots versions = newTextureTable (either (error . show) id (validateTableConfig 16 slots versions))

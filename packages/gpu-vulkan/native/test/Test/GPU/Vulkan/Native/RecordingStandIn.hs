@@ -113,6 +113,7 @@ data RecordingStep
   | AtWriteMapped
     -- ^ A write into mapped memory: one that fails writes nothing.
   | AtCreateSampler
+  | AtDestroySampler
   | AtCreateSetLayout
   | AtCreatePool
   | AtAllocateSet
@@ -327,7 +328,7 @@ recordingStandInOps standIn =
     , opsCreateSampler = \_ sampler → do
         handle ← fresh standIn
         handle <$ step standIn AtCreateSampler (CreatedSampler handle sampler)
-    , opsDestroySampler = \_ handle → journal standIn (DestroyedSampler handle)
+    , opsDestroySampler = \_ handle → step standIn AtDestroySampler (DestroyedSampler handle)
     , opsCreateSetLayout = \_ request → do
         handle ← fresh standIn
         handle <$ step standIn AtCreateSetLayout (CreatedSetLayout handle request)
