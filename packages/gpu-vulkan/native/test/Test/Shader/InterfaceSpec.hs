@@ -9,7 +9,9 @@
 -- broken-client example does.
 module Test.Shader.InterfaceSpec (spec) where
 
+import Data.Bits (shiftL, shiftR, (.&.), (.|.))
 import Data.ByteString qualified as ByteString
+import Data.Word (Word32)
 import Data.List (isInfixOf)
 import System.Directory (createDirectoryIfMissing)
 import System.FilePath (takeDirectory, (</>))
@@ -66,6 +68,19 @@ spec = describe "Shader interfaces" $ do
       matrix ← ByteString.readFile "test/fixtures/spirv/matrix.vert.spv"
       reflect nested `shouldSatisfy` failedWith "push-constant member 0 is a nested struct"
       reflect matrix `shouldSatisfy` failedWith "is neither a scalar nor a vector"
+
+    it "refuses an input attachment rather than reading it as a storage image" $ do
+      bytes ← ByteString.readFile "test/fixtures/spirv/subpass.frag.spv"
+      reflect bytes `shouldSatisfy` failedWith "is an input attachment, which the reader does not support"
+
+    it "refuses a push-constant member whose extent is beyond what 32 bits can hold, rather than wrapping it" $ do
+      bytes ← ByteString.readFile "test/fixtures/spirv/overflow.frag.spv"
+      reflect bytes `shouldSatisfy` failedWith "push-constant member 0 reaches byte 4294967300, beyond what 32 bits can hold"
+
+    it "refuses an interface naming an id the module defines no variable for, rather than reading it as empty" $ do
+      bytes ← ByteString.readFile "test/fixtures/spirv/descriptors.frag.spv"
+      -- Every variable's definition removed, its entry point's references kept.
+      reflect (withoutOpcode 59 bytes) `shouldSatisfy` failedWith "which the module defines no variable for"
 
     it "refuses a module that is not well-formed SPIR-V" $ do
       bytes ← ByteString.readFile "test/fixtures/spirv/interface.vert.spv"
@@ -185,6 +200,21 @@ spec = describe "Shader interfaces" $ do
         built `rejectedBecause` "a push-constant block of 2 members"
   where
     failedWith fragment = either (fragment `isInfixOf`) (const False)
+
+-- | A module with every instruction of this opcode removed, its header and
+-- every other instruction kept.
+withoutOpcode ∷ Word32 → ByteString.ByteString → ByteString.ByteString
+withoutOpcode removed bytes = ByteString.concat (header : [instruction | instruction ← instructions body, opcodeOf instruction /= removed])
+  where
+    (header, body) = ByteString.splitAt 20 bytes
+    wordAt chunk = foldr (\byte acc → (acc `shiftL` 8) .|. fromIntegral byte) 0 (ByteString.unpack (ByteString.take 4 chunk)) ∷ Word32
+    opcodeOf instruction = wordAt instruction .&. 0xFFFF
+    instructions rest
+      | ByteString.null rest = []
+      | otherwise =
+          let count = fromIntegral (wordAt rest `shiftR` 16) * 4
+              (instruction, remaining) = ByteString.splitAt count rest
+           in instruction : instructions remaining
 
 -- | Compile one client against the built package with a copy of this
 -- package's fingerprint, and hand its outcome to the example. The first

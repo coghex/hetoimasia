@@ -402,9 +402,10 @@ createReadback recording bytes
 -- A stage that declares none needs none. Refused, before anything native: a
 -- vertex shader that is not a vertex description's, or a fragment one that is
 -- not a fragment description's, and two stages whose blocks disagree on any
--- member's offset or size, as 'RefusedIncompatible'; and a shader declaring a
+-- member's offset or size, as 'RefusedIncompatible'; a shader declaring a
 -- descriptor binding, which no pipeline layout declares yet, as
--- 'RefusedUnsupported'.
+-- 'RefusedUnsupported'; and members reaching beyond what 32 bits can hold,
+-- computed without bound, as 'RefusedOutOfBounds'.
 checkedRanges ∷ CheckedShaders → Either Refusal [PushConstantRange]
 checkedRanges (CheckedShaders vertex fragment)
   | Interface.interfaceStage vertexInterface /= VertexInterface = Left (RefusedIncompatible "a vertex stage whose shader is not a vertex shader's")
@@ -413,18 +414,20 @@ checkedRanges (CheckedShaders vertex fragment)
       Left (RefusedUnsupported "a shader declaring descriptor bindings, which no pipeline layout declares yet")
   | otherwise = case (Interface.interfacePushConstants vertexInterface, Interface.interfacePushConstants fragmentInterface) of
       ([], []) → Right []
-      (members, []) → Right [spanning [PushVertex] members]
-      ([], members) → Right [spanning [PushFragment] members]
+      (members, []) → sequence [spanning [PushVertex] members]
+      ([], members) → sequence [spanning [PushFragment] members]
       (vertexMembers, fragmentMembers)
-        | vertexMembers == fragmentMembers → Right [spanning [PushVertex, PushFragment] vertexMembers]
+        | vertexMembers == fragmentMembers → sequence [spanning [PushVertex, PushFragment] vertexMembers]
         | otherwise → Left (RefusedIncompatible "vertex and fragment stages whose push-constant blocks disagree")
   where
     vertexInterface = checkedInterface vertex
     fragmentInterface = checkedInterface fragment
     spanning stages members =
       let low = minimum (map pushMemberOffset members)
-          high = maximum [pushMemberOffset member + pushMemberSize member | member ← members]
-       in PushConstantRange stages low (high - low)
+          high = maximum [toInteger (pushMemberOffset member) + toInteger (pushMemberSize member) | member ← members]
+       in if high > toInteger (maxBound ∷ Word32)
+            then Left (RefusedOutOfBounds (fromInteger high) (fromIntegral (maxBound ∷ Word32)))
+            else Right (PushConstantRange stages low (fromInteger high - low))
 
 -- | A pipeline layout with exactly the push-constant ranges these checked
 -- shaders need ('checkedRanges'), validated as 'createPipelineLayoutWith'

@@ -27,6 +27,8 @@ spec = describe "Pipelines from checked shaders" $ do
     checkedRanges (shaders (vertexWith tint) (fragmentWith tint)) `shouldBe` Right [PushConstantRange [PushVertex, PushFragment] 0 16]
     checkedRanges (shaders vertexPlain fragmentPlain) `shouldBe` Right []
     checkedRanges (shaders (vertexWith [PushMember 16 16, PushMember 32 4]) fragmentPlain) `shouldBe` Right [PushConstantRange [PushVertex] 16 20]
+    -- An extent beyond what 32 bits can hold is refused, never wrapped.
+    checkedRanges (shaders (vertexWith [PushMember 4294967292 8]) fragmentPlain) `shouldBe` Left (RefusedOutOfBounds 4294967300 4294967295)
 
   it "makes the layout the descriptions need, and a pipeline whose vertex input is the vertex description's" $ do
     rig ← newRig

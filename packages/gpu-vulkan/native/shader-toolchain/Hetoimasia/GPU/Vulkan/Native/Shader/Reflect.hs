@@ -22,8 +22,10 @@
 -- device's: neither is part of what the host declares, and the reader reports
 -- neither. A module it cannot read, or an interface construct it does not
 -- support — a nested push-constant struct, a matrix or array vertex input, a
--- texel buffer — is an error naming it, never an empty or a matching
--- interface.
+-- texel buffer, an input attachment — is an error naming it, never an empty or
+-- a matching interface; so is an interface naming an id the module defines no
+-- variable for, and a push-constant member whose extent is beyond what 32
+-- bits can hold, computed without bound and never wrapped.
 --
 -- The module's words are read in the byte order the compiler wrote them,
 -- which the magic number says.
@@ -39,7 +41,7 @@ module Hetoimasia.GPU.Vulkan.Native.Shader.Reflect
   , renderReflectedType
   ) where
 
-import Control.Monad (forM, unless)
+import Control.Monad (forM, unless, when)
 import Data.Bits (shiftL, shiftR, (.&.), (.|.))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
@@ -144,7 +146,9 @@ reflect bytes = do
         0 → ReflectedVertex
         4 → ReflectedFragment
         other → ReflectedOther other
-      globals = [(variable, held) | variable ← interface, Just held ← [Map.lookup variable (moduleVariables parsed)]]
+  globals ← forM interface $ \variable → case Map.lookup variable (moduleVariables parsed) of
+    Just held → Right (variable, held)
+    Nothing → Left ("the entry point's interface names id " <> show variable <> ", which the module defines no variable for")
   push ← pushBlock parsed [(variable, pointer) | (variable, (pointer, storage)) ← globals, storage == storagePushConstant]
   inputs ←
     if stage == ReflectedVertex
@@ -220,7 +224,11 @@ pushBlock parsed = \case
         Just <$> forM (zip [0 ..] members) (\(index, member) → do
           offset ← maybe (Left ("push-constant member " <> show index <> " has no Offset")) Right (memberDecoration parsed struct index decorationOffset)
           size ← memberSize parsed struct index member
-          pure (offset, size))
+          -- Computed without bound, and refused rather than narrowed when its
+          -- end is beyond what 32 bits, and so any push-constant range, hold.
+          when (toInteger offset + size > toInteger (maxBound ∷ Word32)) $
+            Left ("push-constant member " <> show index <> " reaches byte " <> show (toInteger offset + size) <> ", beyond what 32 bits can hold")
+          pure (offset, fromInteger size))
       _ → Left "the push-constant variable is not a struct"
   variables → Left ("the shader has " <> show (length variables) <> " push-constant variables, not one")
 
@@ -228,16 +236,16 @@ pushBlock parsed = \case
 -- or vector's own size; a matrix's columns, or rows, apart by its stride and
 -- the last one's own size; an array's elements apart by its stride and the
 -- last one's own size.
-memberSize ∷ Module → Word32 → Int → Word32 → Either String Word32
+memberSize ∷ Module → Word32 → Int → Word32 → Either String Integer
 memberSize parsed struct index member = sized member
   where
     named what = Left ("push-constant member " <> show index <> " is " <> what <> ", which the reader does not support")
     rowMajor = isJust (memberDecoration' decorationRowMajor)
     memberDecoration' wanted = lookup wanted (Map.findWithDefault [] (struct, fromIntegral index) (moduleMemberDecorations parsed))
     sized typeId = case typeOf parsed typeId of
-      Just (Instruction 21 [_, width, _]) → Right (width `div` 8)
-      Just (Instruction 22 (_ : width : _)) → Right (width `div` 8)
-      Just (Instruction 23 [_, component, count]) → (* count) <$> sized component
+      Just (Instruction 21 [_, width, _]) → Right (toInteger width `div` 8)
+      Just (Instruction 22 (_ : width : _)) → Right (toInteger width `div` 8)
+      Just (Instruction 23 [_, component, count]) → (* toInteger count) <$> sized component
       Just (Instruction 24 [_, column, columns]) → do
         stride ← case memberDecoration' decorationMatrixStride of
           Just (value : _) → Right value
@@ -247,14 +255,14 @@ memberSize parsed struct index member = sized member
             scalar ← sized component
             pure $
               if rowMajor
-                then (rows - 1) * stride + columns * scalar
-                else (columns - 1) * stride + rows * scalar
+                then (toInteger rows - 1) * toInteger stride + toInteger columns * scalar
+                else (toInteger columns - 1) * toInteger stride + toInteger rows * scalar
           _ → named "a matrix of an unsupported column type"
       Just (Instruction 28 [_, element, length']) → do
         count ← constantValue parsed length'
         stride ← maybe (Left ("push-constant member " <> show index <> " is an array with no ArrayStride")) Right (decoration parsed typeId decorationArrayStride)
         each ← sized element
-        pure (if count == 0 then 0 else (count - 1) * stride + each)
+        pure (if count == 0 then 0 else (toInteger count - 1) * toInteger stride + each)
       Just (Instruction 30 _) → named "a nested struct"
       Just (Instruction 29 _) → named "a runtime-sized array"
       Just (Instruction opcode _) → named ("a type of opcode " <> show opcode)
@@ -316,6 +324,8 @@ descriptor parsed variable pointer storage =
           Just (Instruction 26 _) → Right ReflectedSampler
           Just (Instruction 25 (_ : _ : dimension : _ : _ : _ : sampled : _))
             | dimension == dimensionBuffer → Left ("the descriptor variable (id " <> show variable <> ") is a texel buffer, which the reader does not support")
+            | dimension == dimensionSubpassData → Left ("the descriptor variable (id " <> show variable <> ") is an input attachment, which the reader does not support")
+            | dimension > dimensionRect → Left ("the descriptor variable (id " <> show variable <> ") is an image of dimension " <> show dimension <> ", which the reader does not support")
             | sampled == 1 → Right ReflectedSampledImage
             | sampled == 2 → Right ReflectedStorageImage
           Just (Instruction opcode _) → Left ("the descriptor variable (id " <> show variable <> ") is of a type of opcode " <> show opcode <> ", which the reader does not support")
@@ -380,5 +390,7 @@ decorationBinding = 33
 decorationDescriptorSet = 34
 decorationOffset = 35
 
-dimensionBuffer ∷ Word32
+dimensionRect, dimensionBuffer, dimensionSubpassData ∷ Word32
+dimensionRect = 4
 dimensionBuffer = 5
+dimensionSubpassData = 6
