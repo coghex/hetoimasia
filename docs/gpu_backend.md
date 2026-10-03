@@ -1911,9 +1911,13 @@ step. Each call:
    one frame-less batch, up to the turn's budget, while admission is open and
    the session is running. The transaction that plans the turn also claims
    each planned upload, so no cancellation, close or release can settle it,
-   freeing its staging, while its copies are recorded and submitted; a
-   recording that raised leaves its uploads claimed, their staging held until
-   retirement:
+   freeing its staging, while its copies are recorded and submitted. One
+   transaction after the submission publishes each carried upload's flight,
+   cursor and ticket as it releases that upload's claim, so a submitted copy's
+   staging is never left unheld in between; an upload whose copies no
+   submitted batch carries — the batch refused, discarded, or its recording
+   refused — releases its claim without a flight. A recording that raised
+   leaves its uploads claimed, their staging held until retirement:
    - a texture's copies are whole block rows of one level at a time
      (`CommandCopyBufferToImage`), so a BC7 level's last, partial block row
      reaches the level's edge;
@@ -1998,7 +2002,7 @@ The staging buffer is a managed buffer like any other, destroyed by
   It lets a consumer compare what it uploaded.
 - **Observation.** `readUploads` shows each unsettled upload's number,
   target, phase, staging region, and whether it has started, has a batch in
-  flight, or has every copy recorded. It also shows whether admission is
+  flight, has every copy recorded, or is claimed by the owner's recording. It also shows whether admission is
   open, and the staging buffer's identity and size.
 
 **Proof.** The stand-in suite (`Test.GPU.Vulkan.Native.Uploads`) covers:
@@ -2025,8 +2029,10 @@ The staging buffer is a managed buffer like any other, destroyed by
 - a discarded batch re-recorded from the same bytes;
 - non-coherent flushes aligned to the atom and kept within the region;
 - cancellation before and after the first copies, and a cancellation and a
-  rival admission inside the recording of an upload's first copies, refused
-  and backpressured while its staging stays held;
+  rival admission inside the recording of an upload's first copies and inside
+  its batch's submission, refused and backpressured while its staging stays
+  held; the flight published as the claim is released; and a discarded
+  batch's claim released without a flight, the upload then cancellable;
 - tickets completing only on the final fence, a wait refused on the owner,
   and a deadline that cancels nothing;
 - every unsettled upload lost after device loss, except one whose caller is
