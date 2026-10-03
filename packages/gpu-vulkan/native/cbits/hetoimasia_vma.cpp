@@ -164,6 +164,13 @@ int32_t hetoimasia_vma_create_buffer(hetoimasia_vma_allocator* state, uint64_t s
   buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   VmaAllocationCreateInfo request;
   std::memset(&request, 0, sizeof request);
+  // D-40's reservation bound holds only while this allocating call asks VMA
+  // to map nothing: never add VMA_ALLOCATION_CREATE_MAPPED_BIT or any other
+  // in-call mapping here. A failed in-call map leaves VMA's freshly opened
+  // block retained and falls back to a dedicated allocation, opening more than
+  // was reserved. Map afterwards with hetoimasia_vma_map. The compiled VMA's
+  // VMA_DEBUG_MARGIN must stay zero too. See D-40's preconditions in
+  // docs/designs/gpu_resource_services_design.md.
   request.flags = never_allocate != 0 ? VMA_ALLOCATION_CREATE_NEVER_ALLOCATE_BIT : 0;
   request.usage = VMA_MEMORY_USAGE_UNKNOWN;
   request.memoryTypeBits = 1u << memory_type;
@@ -218,6 +225,7 @@ int32_t hetoimasia_vma_create_image(hetoimasia_vma_allocator* state, uint32_t fo
   image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
   VmaAllocationCreateInfo request;
   std::memset(&request, 0, sizeof request);
+  // The same D-40 precondition as hetoimasia_vma_create_buffer: no in-call mapping.
   request.flags = never_allocate != 0 ? VMA_ALLOCATION_CREATE_NEVER_ALLOCATE_BIT : 0;
   request.usage = VMA_MEMORY_USAGE_UNKNOWN;
   request.memoryTypeBits = 1u << memory_type;
