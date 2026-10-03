@@ -121,6 +121,7 @@ vulkanRecordingOps physical = do
           , limitBoundSets = deviceLimits.maxBoundDescriptorSets
           , limitStorageAlignment = fromIntegral deviceLimits.minStorageBufferOffsetAlignment
           , limitStorageRange = fromIntegral deviceLimits.maxStorageBufferRange
+          , limitTablePoolDescriptors = twelve.maxUpdateAfterBindDescriptorsInAllPools
           }
   pure
     RecordingOps

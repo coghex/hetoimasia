@@ -26,7 +26,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Table
   ) where
 
 import Control.Concurrent.STM (STM, atomically, readTVar, readTVarIO, writeTVar)
-import Control.Exception (Exception, onException, throwIO, try)
+import Control.Exception (Exception, mask_, onException, throwIO, try)
 import qualified Data.ByteString as ByteString
 import Data.Foldable (for_)
 import Data.IORef (modifyIORef', newIORef, readIORef)
@@ -90,7 +90,9 @@ import Hetoimasia.GPU.Vulkan.Native.Shader.Interface (CheckedShaders)
 -- Before anything is made, the configuration is checked against the device:
 -- a cap beyond its update-after-bind sampled-image limits, the four samplers
 -- beyond its update-after-bind sampler limits, a stage's every binding
--- beyond its update-after-bind resource limit, fewer than two bindable sets,
+-- beyond its update-after-bind resource limit, set 0's pool — the samplers
+-- and the initial images — beyond the update-after-bind descriptors all pools
+-- may hold, fewer than two bindable sets,
 -- one version's entries beyond its storage-buffer range, the last version's
 -- dynamic offset beyond what 32 bits hold, and a ring beyond its buffer size,
 -- are each 'RefusedOutOfBounds', naming what was asked for and the limit.
@@ -120,6 +122,7 @@ createTextureTable recording uploads config =
           [ (toInteger capacity, toInteger (limitTableSampledImages limits))
           , (4, toInteger (limitTableSamplers limits))
           , (toInteger capacity + 5, toInteger (limitTableResources limits))
+          , (toInteger initial + 4, toInteger (limitTablePoolDescriptors limits))
           , (2, toInteger (limitBoundSets limits))
           , (entryBytes, toInteger (limitStorageRange limits))
           , (toInteger stride * (toInteger versions - 1), toInteger (maxBound ∷ Word32))
@@ -129,7 +132,12 @@ createTextureTable recording uploads config =
       Just _ → pure (Left (RefusedMisuse (DuplicateSubject ResourceIdentity)))
       Nothing → case [(asked, limit) | (asked, limit) ← checks, exceeds asked limit] of
         (asked, limit) : _ → pure (Left (RefusedOutOfBounds (fromInteger asked) (fromInteger limit)))
-        [] → do
+        -- Masked from the first creation to the table's publication, so a
+        -- cancellation can arrive only at an interruptible point inside a
+        -- step — which the unwinding then sees every generation made before —
+        -- or once the table holds them all: never between a generation's
+        -- creation and its recording here, nor before publication.
+        [] → mask_ $ do
           made ← newIORef []
           let step action =
                 action >>= \case

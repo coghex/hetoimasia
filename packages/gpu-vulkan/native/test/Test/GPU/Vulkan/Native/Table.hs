@@ -13,7 +13,8 @@
 module Test.GPU.Vulkan.Native.Table (spec) where
 
 import Control.Concurrent.STM (atomically)
-import Control.Exception (ErrorCall (..), SomeException, throwIO, try)
+import Control.Concurrent (forkIO, killThread, myThreadId)
+import Control.Exception (AsyncException (ThreadKilled), ErrorCall (..), SomeException, fromException, throwIO, try)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Control.Monad (when)
 import qualified Data.ByteString as ByteString
@@ -88,6 +89,8 @@ spec = describe "Texture table" $ do
       refusedUnder limits {limitTableSampledImages = 15} (tableConfig 16 4 2) `shouldReturn` Left (RefusedOutOfBounds 16 15)
       refusedUnder limits {limitTableSamplers = 3} (tableConfig 16 4 2) `shouldReturn` Left (RefusedOutOfBounds 4 3)
       refusedUnder limits {limitTableResources = 20} (tableConfig 16 4 2) `shouldReturn` Left (RefusedOutOfBounds 21 20)
+      -- Set 0's pool holds the four samplers and the four initial images.
+      refusedUnder limits {limitTablePoolDescriptors = 7} (tableConfig 16 4 2) `shouldReturn` Left (RefusedOutOfBounds 8 7)
       refusedUnder limits {limitBoundSets = 1} (tableConfig 16 4 2) `shouldReturn` Left (RefusedOutOfBounds 2 1)
       refusedUnder limits {limitStorageRange = 31} (tableConfig 16 4 2) `shouldReturn` Left (RefusedOutOfBounds 32 31)
       -- 262144 entries of eight bytes are a 2 MiB stride, so the 2049th
@@ -415,6 +418,25 @@ spec = describe "Texture table" $ do
       _ ← try @ResourceDestructionFailed (disposeResources (rigRecording rig) (at 2))
       calls ← recordingCalls standIn
       length [() | DestroyedSampler _ ← calls] `shouldBe` 3
+
+    it "leaves no generation unowned when a cancellation arrives as its construction makes one: each is released, or held by the published table" $ do
+      (rig, uploads) ← uploadRig
+      owner ← myThreadId
+      -- Aimed at the owner from inside the first sampler's creation, which
+      -- runs masked: it can be delivered only once that creation returns.
+      onceAt (rigRecordingStandIn rig) AtCreateSampler $ do
+        killer ← forkIO (killThread owner)
+        awaitThrowing killer
+      outcome ← try @SomeException (createTextureTable (rigRecording rig) uploads (tableConfig 16 4 2))
+      fmap (const ()) outcome `shouldSatisfy` either ((== Just ThreadKilled) . fromException) (const False)
+      published ← atomically (readTable (rigRecording rig))
+      standings ← samplerStandings rig
+      calls ← recordingCalls (rigRecordingStandIn rig)
+      length [() | CreatedSampler {} ← calls] `shouldSatisfy` (>= 1)
+      length standings `shouldBe` length [() | CreatedSampler {} ← calls]
+      case published of
+        Nothing → standings `shouldSatisfy` all (== ManagedReleased)
+        Just _ → standings `shouldSatisfy` all (== ManagedLive)
 
   describe "handles" $ do
     it "refuses a released handle wherever it is used, and issues its index again only under a new generation" $ do

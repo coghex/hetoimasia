@@ -269,6 +269,10 @@ data RecordingLimits = RecordingLimits
     -- must be multiples of.
   , limitStorageRange ∷ !Natural
     -- ^ @maxStorageBufferRange@: the most one version may span.
+  , limitTablePoolDescriptors ∷ !Word32
+    -- ^ @maxUpdateAfterBindDescriptorsInAllPools@: the most descriptors all
+    -- update-after-bind pools together may hold — the texture table's set 0
+    -- pool, its samplers and its initial images.
   }
   deriving (Eq, Show)
 
