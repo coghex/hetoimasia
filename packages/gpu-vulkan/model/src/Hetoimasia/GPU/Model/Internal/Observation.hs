@@ -17,6 +17,8 @@ module Hetoimasia.GPU.Model.Internal.Observation
   , Usage (..)
   , usage
   , liveRecordCount
+  , FramelessView (..)
+  , framelessSlots
   ) where
 
 import qualified Data.Map.Strict as Map
@@ -31,7 +33,7 @@ import Hetoimasia.GPU.Model.Internal.Hold
 import Hetoimasia.GPU.Model.Internal.Identity
 import Hetoimasia.GPU.Model.Internal.Records
 import Hetoimasia.GPU.Model.Internal.Recovery (RecoveryEpisode (episodeAttempts))
-import Hetoimasia.GPU.Model.Internal.Resolve (resolveFrame, resolvePresentation, resolveSubject, resolveTarget, targetIdOf)
+import Hetoimasia.GPU.Model.Internal.Resolve (batchIdOf, resolveFrame, resolvePresentation, resolveSubject, resolveTarget, targetIdOf)
 import Hetoimasia.GPU.Model.Internal.State
 import Numeric.Natural (Natural)
 
@@ -54,16 +56,11 @@ holdView subject model = do
   pure
     HoldView
       { viewOutstanding = outstandingHolds holds
-      , viewRecorded = mapMaybe (\number → BatchId <$> batchOwner number <*> pure number) (Set.toList (recordedReferences holds))
+      , viewRecorded = mapMaybe (\number → Map.lookup number (gpuBatches model) >>= batchIdOf model number) (Set.toList (recordedReferences holds))
       , viewSubmitted = [SubmissionId (gpuSession model) number | number ← Set.toList (submittedUses holds)]
       , viewPresentations =
           [PresentationId target number | Just target ← [owner], number ← Set.toList (presentationObligations holds)]
       }
-  where
-    batchOwner number = do
-      batch ← Map.lookup number (gpuBatches model)
-      target ← Map.lookup (batchTargetNumber batch) (gpuTargets model)
-      pure (targetIdOf model (batchTargetNumber batch) target)
 
 -- | Whether a live subject has no outstanding holds; an unresolved identity
 -- answers 'False'. This is necessary for disposal, but does not check generation
@@ -179,6 +176,8 @@ recoveryAttemptsOf = episodeAttempts . targetRecovery
 data Usage = Usage
   { usageTargets ∷ !Natural
   , usageFrames ∷ !Natural
+  , usageFramelessSlots ∷ !Natural
+    -- ^ The frame-less slots in use, which the frame-less batch budget bounds.
   , usageBatches ∷ !Natural
   , usageSubmissions ∷ !Natural
   , usageBytes ∷ !Natural
@@ -195,6 +194,7 @@ usage model =
   Usage
     { usageTargets = fromIntegral (Map.size (gpuTargets model))
     , usageFrames = liveFrames model
+    , usageFramelessSlots = fromIntegral (Map.size (gpuFramelessSlots model))
     , usageBatches = fromIntegral (Map.size (gpuBatches model))
     , usageSubmissions = fromIntegral (Map.size (gpuSubmissions model))
     , usageBytes = gpuBytes model
@@ -209,6 +209,7 @@ usage model =
 liveRecordCount ∷ GpuModel → Natural
 liveRecordCount model =
   usageFrames use
+    + usageFramelessSlots use
     + usageBatches use
     + usageSubmissions use
     + usageAllocations use
@@ -220,3 +221,24 @@ liveRecordCount model =
   where
     use = usage model
     targets = Map.elems (gpuTargets model)
+
+-- | What one frame-less slot in use holds (GRS-12).
+data FramelessView
+  = FramelessRecording !BatchId
+    -- ^ Its batch, never submitted.
+  | FramelessSubmitted !SubmissionId
+    -- ^ The submission that consumed its batch, until its completion is
+    -- recorded.
+  deriving (Eq, Show)
+
+-- | Every frame-less slot in use, by slot.
+framelessSlots ∷ GpuModel → [(Natural, FramelessView)]
+framelessSlots model =
+  [ (slot, view)
+  | (slot, held) ← Map.toAscList (gpuFramelessSlots model)
+  , Just view ← [viewOf held]
+  ]
+  where
+    viewOf = \case
+      SlotRecording number → FramelessRecording <$> (Map.lookup number (gpuBatches model) >>= batchIdOf model number)
+      SlotSubmitted number → Just (FramelessSubmitted (SubmissionId (gpuSession model) number))

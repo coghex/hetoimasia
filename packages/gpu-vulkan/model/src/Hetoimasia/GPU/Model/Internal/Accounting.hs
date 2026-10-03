@@ -25,6 +25,7 @@ module Hetoimasia.GPU.Model.Internal.Accounting
   , reservedSubmission
   , settleFrames
   , frameSettled
+  , freeFramelessSlot
   ) where
 
 import qualified Data.Map.Strict as Map
@@ -121,6 +122,12 @@ reservedSubmission frame
 -- the slot. A frame that was never presented has handed its record to nobody, so
 -- it keeps it — and therefore keeps its slot — until the owner supplies explicit
 -- settlement evidence.
+-- | Free the frame-less slot whose batch this submission consumed, now that
+-- the submission is gone: completed, or released to the device's loss.
+freeFramelessSlot ∷ Natural → GpuModel → GpuModel
+freeFramelessSlot submission model =
+  model {gpuFramelessSlots = Map.filter (/= SlotSubmitted submission) (gpuFramelessSlots model)}
+
 settleFrames ∷ [(Natural, Natural)] → GpuModel → GpuModel
 settleFrames frames model = foldl' settle model frames
   where

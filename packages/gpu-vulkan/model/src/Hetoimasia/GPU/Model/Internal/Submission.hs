@@ -1,5 +1,6 @@
 -- | Submission: resetting a frame's submission fence, submitting acquired
--- frames under one shared record, and asking which batches an outstanding
+-- frames under one shared record, submitting one frame-less batch under a
+-- record of its own (GRS-12), and asking which batches an outstanding
 -- submission consumed.
 --
 -- This module owns the promotion of recorded references to submitted uses and
@@ -12,6 +13,7 @@ module Hetoimasia.GPU.Model.Internal.Submission
   , SubmitAnswer (..)
   , resetSubmissionFence
   , submitFrames
+  , submitFramelessBatch
   , submissionCarries
   ) where
 
@@ -22,7 +24,7 @@ import Hetoimasia.GPU.Model.Internal.Hold (dischargeRecorded, retainSubmitted)
 import Hetoimasia.GPU.Model.Internal.Identity
 import Hetoimasia.GPU.Model.Internal.Initialization (publishInitialization, withdrawInitialization)
 import Hetoimasia.GPU.Model.Internal.Records
-import Hetoimasia.GPU.Model.Internal.Resolve (resolveFrame, resolveSubmission, targetIdOf)
+import Hetoimasia.GPU.Model.Internal.Resolve (batchIdOf, resolveBatch, resolveFrame, resolveSubmission)
 import Hetoimasia.GPU.Model.Internal.Scheduling (scheduling, scheduling_)
 import Hetoimasia.GPU.Model.Internal.Session (escalateSession)
 import Hetoimasia.GPU.Model.Internal.State
@@ -160,10 +162,10 @@ submitFrames identities outcome model
                         { submissionFrames = [(number, slot) | (number, slot, _) ← frames]
                         , submissionBatches =
                             Set.fromList
-                              [ BatchId (targetIdOf charged (batchTargetNumber record) target) number
+                              [ identity
                               | number ← batches
                               , Just record ← [Map.lookup number (gpuBatches charged)]
-                              , Just target ← [Map.lookup (batchTargetNumber record) (gpuTargets charged)]
+                              , Just identity ← [batchIdOf charged number record]
                               ]
                         , submissionSubjects = subjects
                         , submissionUncertain = uncertain
@@ -174,6 +176,53 @@ submitFrames identities outcome model
          in if uncertain
               then Admitted (escalateSession UnknownSubmissionEffect recorded, EffectUncertain)
               else Admitted (recorded, SubmissionRecorded (SubmissionId (gpuSession recorded) submission))
+
+-- | Submit one frame-less batch, as a native submission of its own. Its
+-- record answers like a frame submission's: an accepted one promotes the
+-- batch's recorded references to submitted uses under a new submission
+-- record, which the slot then holds until its completion is recorded, and
+-- publishes what the batch initializes; one that failed with no effect
+-- changes nothing, and the batch stays held and submittable; one whose effect
+-- is unknown is recorded uncertain, retains everything, publishes nothing and
+-- fails the session. The submission record uses the object the batch reserved
+-- when it was opened, so committing one can never be refused for want of
+-- accounting.
+submitFramelessBatch ∷ BatchId → SubmitOutcome → GpuModel → Outcome (GpuModel, SubmitAnswer)
+submitFramelessBatch identity outcome model =
+  scheduling model $
+  resolved (if outcome == SubmissionAccepted then running model else Right ()) $ \() →
+    resolved (resolveBatch model identity) $ \(number, batch) → case batchOwner batch of
+      FrameOwner _ _ → Rejected (WrongParent BatchIdentity)
+      FramelessOwner slot → case outcome of
+        SubmissionFailedWithoutEffect → Admitted (model, AcquisitionRetained)
+        SubmissionAccepted → accept number batch slot False
+        SubmissionEffectUncertain → accept number batch slot True
+  where
+    accept number batch slot uncertain =
+      let submission = gpuNextSubmission model
+          subjects = batchSubjects batch
+          settled = (if uncertain then withdrawInitialization else publishInitialization) number batch model
+          promoted = foldl' (\current key → editHolds key (retainSubmitted submission) current) settled (Set.toList subjects)
+          discharged = foldl' (\current key → editHolds key (dischargeRecorded number) current) promoted (Set.toList subjects)
+          recorded =
+            (releaseObjects 1 discharged)
+              { gpuBatches = Map.delete number (gpuBatches discharged)
+              , gpuFramelessSlots = Map.insert slot (SlotSubmitted submission) (gpuFramelessSlots discharged)
+              , gpuSubmissions =
+                  Map.insert
+                    submission
+                    Submission
+                      { submissionFrames = []
+                      , submissionBatches = Set.singleton identity
+                      , submissionSubjects = subjects
+                      , submissionUncertain = uncertain
+                      }
+                    (gpuSubmissions discharged)
+              , gpuNextSubmission = submission + 1
+              }
+       in if uncertain
+            then Admitted (escalateSession UnknownSubmissionEffect recorded, EffectUncertain)
+            else Admitted (recorded, SubmissionRecorded (SubmissionId (gpuSession recorded) submission))
 
 -- | Whether an outstanding submission consumed this exact batch — this
 -- session's, this target incarnation's, this number: the positive evidence

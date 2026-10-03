@@ -29,7 +29,7 @@ spec = describe "identities" $ do
     -- one above it, so nothing can be read as belonging to another target.
     generationTarget generation `shouldBe` target
     frameTarget frame `shouldBe` target
-    batchTarget batch `shouldBe` target
+    batchTarget batch `shouldBe` Just target
     presentationTarget presentation `shouldBe` target
     submissionSession submission `shouldBe` modelSessionIdentity presented
     resourceSession resource `shouldBe` modelSessionIdentity presented

@@ -10,7 +10,7 @@
 -- __A validated configuration is read-only to clients.__ 'BudgetRequest' is an
 -- ordinary record, so a caller states a small configuration by editing one and
 -- validating it; 'Budgets' is not. This module exports the type without its
--- constructor, and the eleven names below are ordinary reader functions rather
+-- constructor, and the twelve names below are ordinary reader functions rather
 -- than field selectors, so record construction and record-update syntax reach
 -- no label. There is therefore no way for a client to replace a validated
 -- limit, and in particular no way to set 'presentationPoolCapacity', which is
@@ -36,6 +36,7 @@ module Hetoimasia.GPU.Model.Budget
   , targetRecordLimit
   , frameSlotLimit
   , aggregateFrameSlotLimit
+  , framelessBatchLimit
   , generationLimit
   , imageTrackingLimit
   , presentationPoolCapacity

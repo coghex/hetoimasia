@@ -1,4 +1,5 @@
--- | Recorded batches: recording against an acquired frame, extending a batch's
+-- | Recorded batches: recording against an acquired frame, opening a
+-- frame-less batch in a slot of the session (GRS-12), extending a batch's
 -- references, discarding one, and resetting a frame's recorder.
 --
 -- This module owns the recorded-reference hold and the rule that a subject
@@ -7,6 +8,7 @@
 -- "Hetoimasia.GPU.Model.Internal.Submission".
 module Hetoimasia.GPU.Model.Internal.Recording
   ( recordBatch
+  , openFramelessBatch
   , extendBatch
   , discardBatch
   , dropBatch
@@ -15,6 +17,7 @@ module Hetoimasia.GPU.Model.Internal.Recording
 
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
+import Hetoimasia.GPU.Model.Internal.Budget (BudgetKind (FramelessBatchBudget), framelessBatchLimit)
 import Hetoimasia.GPU.Model.Internal.Accounting (chargeObjects, editFrame, editHolds, holdsOf, releaseObjects)
 import Hetoimasia.GPU.Model.Internal.Hold (Holds (cpuUseEnded, logicalReleased), dischargeRecorded, retainRecorded)
 import Hetoimasia.GPU.Model.Internal.Identity
@@ -68,8 +71,7 @@ recordBatch identity references model =
                                     Map.insert
                                       batch
                                       Batch
-                                        { batchTargetNumber = number
-                                        , batchSlot = slot
+                                        { batchOwner = FrameOwner number slot
                                         , batchSubjects = subjects
                                         }
                                       (gpuBatches retained)
@@ -77,6 +79,45 @@ recordBatch identity references model =
                                 }
                           , BatchId (frameTarget identity) batch
                           )
+
+-- | Open a frame-less batch: one that belongs to no frame, in the lowest free
+-- frame-less slot of the session. It retains exactly the resource generations
+-- it names, as a frame batch does, under the same rules.
+--
+-- A slot is counted against the frame-less batch budget from its opening until
+-- a discard drops its batch or its submission's completion is recorded, and
+-- exhaustion is 'Backpressure' naming that budget. Two objects are reserved
+-- here, before any native call: the batch's record and the submission record
+-- its submission will need, so a submission the queue already accepted can
+-- never be refused for want of accounting. Answers the batch and its slot.
+openFramelessBatch ∷ [ResourceId] → GpuModel → Outcome (GpuModel, (BatchId, Natural))
+openFramelessBatch references model =
+  scheduling model $
+  resolved (running model) $ \() →
+    resolved (traverse (resolveResource model) references) $ \resolvedResources →
+      let keys = map (uncurry ResourceKey . fst) resolvedResources
+       in if Set.size (Set.fromList keys) /= length keys
+            then Rejected (DuplicateSubject ResourceIdentity)
+            else
+              if any (sealed model) keys
+                then Rejected (WrongPhase ResourceIdentity)
+                else case [slot | slot ← [0 .. limit - 1], not (Map.member slot (gpuFramelessSlots model))] of
+                  [] → Backpressure FramelessBatchBudget
+                  slot : _ → case chargeObjects 2 model of
+                    Left kind → Backpressure kind
+                    Right charged →
+                      let batch = gpuNextBatch charged
+                          retained = foldl' (\current key → editHolds key (retainRecorded batch) current) charged keys
+                       in Admitted
+                            ( retained
+                                { gpuBatches = Map.insert batch (Batch (FramelessOwner slot) (Set.fromList keys)) (gpuBatches retained)
+                                , gpuNextBatch = batch + 1
+                                , gpuFramelessSlots = Map.insert slot (SlotRecording batch) (gpuFramelessSlots retained)
+                                }
+                            , (FramelessBatchId (gpuSession model) batch, slot)
+                            )
+  where
+    limit = framelessBatchLimit (gpuBudgets model)
 
 -- | Extend a recorded batch's references before the next command that names
 -- them is recorded into it. The batch keeps its one identity; each subject is
@@ -124,18 +165,21 @@ discardBatch identity model =
     Admitted (dropBatch number batch model)
 
 -- | Drop a batch that was never submitted, discharging its own references.
--- Whatever it was initializing awaits initialization again.
+-- Whatever it was initializing awaits initialization again. A frame batch
+-- leaves its frame; a frame-less one frees its slot and gives back the
+-- submission record it reserved as well as its own.
 dropBatch ∷ Natural → Batch → GpuModel → GpuModel
-dropBatch number batch unwithdrawn =
-  releaseObjects 1 $
-    editFrame
-      (batchTargetNumber batch)
-      (batchSlot batch)
-      (\entry → entry {frameBatches = Set.delete number (frameBatches entry)})
-      (foldl' (\current key → editHolds key (dischargeRecorded number) current) model (Set.toList (batchSubjects batch)))
-        {gpuBatches = Map.delete number (gpuBatches model)}
+dropBatch number batch unwithdrawn = case batchOwner batch of
+  FrameOwner target slot →
+    releaseObjects 1 $
+      editFrame target slot (\entry → entry {frameBatches = Set.delete number (frameBatches entry)}) discharged
+  FramelessOwner slot →
+    releaseObjects 2 discharged {gpuFramelessSlots = Map.delete slot (gpuFramelessSlots discharged)}
   where
     model = withdrawInitialization number batch unwithdrawn
+    discharged =
+      (foldl' (\current key → editHolds key (dischargeRecorded number) current) model (Set.toList (batchSubjects batch)))
+        {gpuBatches = Map.delete number (gpuBatches model)}
 
 -- | Reset a frame's recorder: every one of its unsubmitted batches is
 -- discarded, and nothing else is.

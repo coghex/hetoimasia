@@ -53,7 +53,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Abandonment (cleanupSubmissi
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Layer (FrameOps (..))
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Loss (releaseFramesToDeviceLoss)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.State
-import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State (owner)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State (TicketState (..), owner, settleTicket)
 import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost, failRootsSessionBecause, rootsCall, stateRootsModel)
 
 -- | One bounded owner step: at most the model's progress-action limit of native
@@ -63,7 +63,8 @@ import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost, failRootsSessionB
 --   pending — is asked, without waiting, whether it has signalled; one that
 --   has is recorded as that submission's completion in the model, which
 --   discharges every hold it carried and frees each frame slot that owed
---   nothing else. It frees no presentation-pool record: rendering completion
+--   nothing else. A frame-less submission's (GRS-12) frees its frame-less slot
+--   instead, and completes its batch's ticket. It frees no presentation-pool record: rendering completion
 --   is not presentation retirement.
 -- * Each enqueued presentation's present fence is asked the same way; one that
 --   has signalled is recorded as that presentation's retirement, which
@@ -140,6 +141,29 @@ progressFrames frames now = owner recording $ do
                   if recorded
                     then modifyIORef' completed (submission :)
                     else note failures (toException (FrameEffectUncertain (submissionFrames record) "the model refused a completion its fence proved"))
+          ObserveFrameless submission record → do
+            sync ← Map.lookup (framelessSlot record) <$> readTVarIO (framesFrameless frames)
+            for_ sync $ \held →
+              observe handle (framelessFence held) $ \case
+                Left failure@(ExceptionWithContext _ exception)
+                  -- The device's loss lets go of the submission under its own
+                  -- rule, which settles its ticket as lost.
+                  | isLoss exception → note failures exception
+                  -- The submission is kept, with its ticket, so a later loss
+                  -- can still let it go; its uncertain fence is never asked
+                  -- again, and retains it, and the device, otherwise.
+                  | otherwise → do
+                      let reason = "vkGetFenceStatus raised: " <> describe failure
+                      atomically $ do
+                        modifyTVar' (framesFrameless frames) (Map.adjust (\entry → entry {framelessFenceState = FenceUncertain reason}) (framelessSlot record))
+                        failRootsSessionBecause roots CleanupFailed (Text.pack (show submission) <> ": " <> reason)
+                      note failures (toException (FramelessEffectUncertain (framelessBatch record) reason))
+                Right False → pure ()
+                Right True → do
+                  recorded ← atomically (completeFrameless submission record)
+                  if recorded
+                    then modifyIORef' completed (submission :)
+                    else note failures (toException (FramelessEffectUncertain (framelessBatch record) "the model refused a completion its fence proved"))
           ObservePresentation presentation record → do
             let key = (presentationTarget presentation, presentedPool record)
             pool ← Map.lookup key <$> readTVarIO (framesPool frames)
@@ -193,7 +217,13 @@ progressFrames frames now = owner recording $ do
   -- Whatever was not reached this step still has its fences pending.
   slots ← Map.elems <$> readTVarIO (framesSlots frames)
   pool ← Map.elems <$> readTVarIO (framesPool frames)
-  let pending = length (filter pendingFence (concatMap (\sync → [syncFenceState sync, syncCleanupState sync]) slots <> map poolFenceState pool))
+  frameless ← Map.elems <$> readTVarIO (framesFrameless frames)
+  let pending =
+        length
+          ( filter
+              pendingFence
+              (concatMap (\sync → [syncFenceState sync, syncCleanupState sync]) slots <> map poolFenceState pool <> map framelessFenceState frameless)
+          )
   released ← readIORef settled
   raised ← reverse <$> readIORef failures
   case [failure | failure ← raised, isLoss failure] <> raised of
@@ -223,6 +253,22 @@ progressFrames frames now = owner recording $ do
       for_ (submissionFrames record) $ \frame → editSlot frames (slotOf frame) (\sync → sync {syncAcquireState = SemaphoreUnsignalled})
       unless applied $
         uncertain frames CleanupFailed (submissionFrames record) "the model refused a completion its fence proved"
+      pure applied
+    -- A frame-less submission's fence signalled: its completion frees its
+    -- slot in the model, and its ticket is complete.
+    completeFrameless submission record = do
+      applied ← stateRootsModel roots $ \model → case recordCompletion now (SubmissionCompleted submission) model of
+        Admitted next → (True, next)
+        _ → (False, model)
+      modifyTVar' (framesFramelessSubmissions frames) (Map.delete submission)
+      if applied
+        then do
+          modifyTVar' (framesFrameless frames) (Map.adjust (\entry → entry {framelessFenceState = FenceSignalled}) (framelessSlot record))
+          for_ (framelessTicket record) (`settleTicket` TicketComplete)
+        else do
+          let reason = "the model refused a completion its fence proved"
+          modifyTVar' (framesFrameless frames) (Map.adjust (\entry → entry {framelessFenceState = FenceUncertain reason}) (framelessSlot record))
+          failRootsSessionBecause roots CleanupFailed (Text.pack (show submission) <> ": " <> reason)
       pure applied
     -- The present fence signalled: the presentation engine has finished with
     -- the semaphore the presentation waited on, so the record is free, and
@@ -312,8 +358,10 @@ awaitFrames frames now timeout = do
         work ← rotated cursor <$> stepWork frames
         slots ← readTVar (framesSlots frames)
         pool ← readTVar (framesPool frames)
+        frameless ← readTVar (framesFrameless frames)
         let fenceOf = \case
               ObserveSubmission _ record → syncFence <$> Map.lookup (submissionSlot record) slots
+              ObserveFrameless _ record → framelessFence <$> Map.lookup (framelessSlot record) frameless
               ObservePresentation presentation record → poolFence <$> Map.lookup (presentationTarget presentation, presentedPool record) pool
               ObserveCleanup frame _ → case Map.lookup (slotOf frame) slots of
                 Just sync | syncCleanupState sync == FencePending → Just (syncCleanup sync)
@@ -406,6 +454,8 @@ retireTargetFrames frames target = owner (framesRecording frames) $ do
 -- | One piece of a progress step's work.
 data Work
   = ObserveSubmission !SubmissionId !SubmissionRecord
+  | ObserveFrameless !SubmissionId !FramelessRecord
+    -- ^ A frame-less submission's fence (GRS-12).
   | ObservePresentation !PresentationId !PresentationRecord
   | MakeCleanup !FrameSlotId !FrameRecord
   | ObserveCleanup !FrameSlotId !FrameRecord
@@ -414,6 +464,7 @@ data Work
 workKey ∷ Work → Either (Either SubmissionId PresentationId) (FrameSlotId, Bool)
 workKey = \case
   ObserveSubmission submission _ → Left (Left submission)
+  ObserveFrameless submission _ → Left (Left submission)
   ObservePresentation presentation _ → Left (Right presentation)
   MakeCleanup frame _ → Right (frame, False)
   ObserveCleanup frame _ → Right (frame, True)
@@ -422,10 +473,16 @@ workKey = \case
 stepWork ∷ Frames q inst msgr phys dev cmd → STM [Work]
 stepWork frames = do
   submissions ← readTVar (framesSubmissions frames)
+  frameless ← readTVar (framesFramelessSubmissions frames)
+  fences ← readTVar (framesFrameless frames)
   presentations ← readTVar (framesPresentations frames)
   live ← readTVar (framesLive frames)
   pure $
     [ObserveSubmission submission record | (submission, record) ← Map.toAscList submissions]
+      <> [ ObserveFrameless submission record
+         | (submission, record) ← Map.toAscList frameless
+         , fmap framelessFenceState (Map.lookup (framelessSlot record) fences) == Just FencePending
+         ]
       <> [ ObservePresentation presentation record
          | (presentation, record) ← Map.toAscList presentations
          , presentedStanding record == PresentPending

@@ -46,8 +46,7 @@ import Hetoimasia.GPU.Model.Identity
   , IdentityKind (..)
   , Misuse (..)
   , TargetId
-  , batchTarget
-  , targetSession
+  , batchSession
   )
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Layer (FrameOps (..), SubmitBatch (..), WaitStage (..))
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.State
@@ -141,7 +140,7 @@ submitFrames frames request =
     batches = NonEmpty.toList request
 
     validate
-      | any ((/= rootsSessionIdentity roots) . targetSession . batchTarget) batches = pure (Left (RefusedMisuse (ForeignIdentity BatchIdentity)))
+      | any ((/= rootsSessionIdentity roots) . batchSession) batches = pure (Left (RefusedMisuse (ForeignIdentity BatchIdentity)))
       | length (nub batches) /= length batches = pure (Left (RefusedMisuse (DuplicateSubject BatchIdentity)))
       | otherwise = do
           records ← readTVar (recordingBatches recording)
@@ -160,7 +159,8 @@ submitFrames frames request =
                 BatchSealed
                   | not held → Left (RefusedMisuse (AlreadyConsumed BatchIdentity))
                   | otherwise → do
-                      let frame = batchFrame record
+                      -- A frame-less batch is submitted by itself, never with frames.
+                      frame ← maybe (Left (RefusedMisuse (WrongParent BatchIdentity))) Right (batchFrame record)
                       frameRecord ← case Map.lookup frame live of
                         Just acquired@FrameRecord {recordStage = StageAcquired} → Right acquired
                         Just _ → Left (RefusedMisuse (WrongPhase FrameIdentity))
@@ -169,7 +169,7 @@ submitFrames frames request =
                         Just FrameAcquired → Right ()
                         _ → Left (RefusedMisuse (WrongPhase FrameIdentity))
                       commands ← case managedNative <$> Map.lookup (batchStorage record) managed of
-                        Just (NativeStorage _ _ _ buffer) → Right buffer
+                        Just (NativeStorage _ _ buffer) → Right buffer
                         _ → Left RefusedNoStorage
                       sync ← maybe (Left (RefusedIllegal "the frame's slot has no synchronization")) Right (Map.lookup (slotOf frame) slots)
                       unless (syncAcquireState sync == SemaphoreSignalOwed) $

@@ -55,6 +55,10 @@
 --   #336);
 -- * @grs15-surface-free-window@ — the same device start, then a window admitted
 --   against its queue family and presented to (#336);
+-- * @grs12-frameless@ — the same device start with no window, then frame-less
+--   batches over a managed color target and buffer recorded through
+--   owner-thread actions, submitted when each returns, and their tickets
+--   waited for (#337);
 -- * @grs3-ordering@ — GRS-3's managed depth target and buffer written by an
 --   initializing batch, then by two batches submitted in order with no
 --   completion wait between and no layout change, ordered only by the
@@ -305,6 +309,14 @@ scenarios =
       $ \consent journal _ → do
         outcome ← Ordering.runOrdering (consentBackend consent) journal
         pure (Ordering.spec outcome, section "The GRS-3 ordering record" (Ordering.orderingSection outcome))
+  , Scenario
+      "grs12-frameless"
+      "records frame-less batches through owner-thread actions in a surface-free session, submits each when its action returns, waits for their tickets and retires cleanly, with validation reporting nothing"
+      False
+      Nothing
+      $ \consent journal _ → do
+        outcome ← SurfaceFree.runFrameless (consentBackend consent) journal
+        pure (SurfaceFree.framelessSpec outcome, section "The GRS-12 frame-less batches record" (SurfaceFree.framelessSection outcome))
   , Scenario
       "synchronization-hazard"
       "observes a deliberate synchronization hazard, proving synchronization validation active"

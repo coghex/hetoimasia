@@ -203,6 +203,7 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , replaceConstructedPipeline
   , constructBuffer
   , constructImage
+  , constructFramelessBatch
   , releaseConstructed
 
     -- * Verification capture (VK-19)
@@ -939,7 +940,9 @@ serviceActions state = do
         -- round; this is only what a missing one would mean.
         Right Nothing → atomically (settle (ActionRefused ActionDeviceNotReady))
         Right (Just construction) → do
-          outcome ← tryWithContext (restore (runVulkanAction action construction))
+          -- The action's frame-less batches are submitted when it returns, in
+          -- the order they were sealed, and discarded if it raises (GRS-12).
+          outcome ← tryWithContext (restore (framelessScoped (stateRendering state) construction (runVulkanAction action)))
           escaped ← atomically (constructionEscaped construction)
           case (outcome, escaped) of
             (Left failure@(ExceptionWithContext _ exception), _)

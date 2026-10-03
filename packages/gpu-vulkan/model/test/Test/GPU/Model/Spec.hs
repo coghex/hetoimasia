@@ -9,6 +9,7 @@ module Test.GPU.Model.Spec (spec) where
 import qualified Test.GPU.Model.Access as Access
 import qualified Test.GPU.Model.Budgets as Budgets
 import qualified Test.GPU.Model.DeviceLoss as DeviceLoss
+import qualified Test.GPU.Model.Frameless as Frameless
 import qualified Test.GPU.Model.Frames as Frames
 import qualified Test.GPU.Model.Holds as Holds
 import qualified Test.GPU.Model.Identities as Identities
@@ -33,4 +34,5 @@ spec = describe "GPU model" $ do
   Progress.spec
   Sequences.spec
   Access.spec
+  Frameless.spec
   Placement.spec

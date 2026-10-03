@@ -112,7 +112,12 @@ destroys it.
   fence, settles a closed frame's render-finished semaphore through a cleanup
   submission once its rendering completed, and returns images through
   `vkReleaseSwapchainImagesEXT`; and `awaitFrames` is that step after a finite
-  drain wait of at most 10 ms, which is never evidence. Each frame slot's
+  drain wait of at most 10 ms, which is never evidence. `withFramelessScope`
+  and `recordFramelessIn` record GRS-12's frame-less batches, each into a
+  frame-less slot's own storage with no swapchain image, submit an action's
+  sealed ones by themselves in seal order when it ends, and discard the rest;
+  their `BatchTicket`s complete only on their fences, observed by
+  `progressFrames`, and `retireFrameless` destroys their fences. Each frame slot's
   acquisition semaphore and two fences are made before its first acquisition,
   and each target's presentation pool — a render-finished semaphore and a
   present fence per record, bounded by the model's derived pool capacity —
@@ -128,7 +133,7 @@ destroys it.
   synchronization whatever it was owed. It is the entry point only: its code
   lives in private modules under `Hetoimasia.GPU.Vulkan.Native.Internal.Frames`
   — `Layer`, `State`, `Acquisition`, `Submission`, `Presentation`,
-  `Abandonment`, `Loss` and `Progress` — which it re-exports unchanged (see
+  `Abandonment`, `Loss`, `Progress` and `Frameless` — which it re-exports unchanged (see
   [the backend contract](../../../docs/gpu_backend.md#frames-acquisition-submission-and-abandonment)).
   `Hetoimasia.GPU.Vulkan.Native.Frames.Vulkan` is its production layer, the
   binding's own `safe` calls.

@@ -23,6 +23,15 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , ManagedRecord (..)
   , BatchStanding (..)
   , BatchRecord (..)
+  , StorageOwner (..)
+
+    -- * Tickets (GRS-12)
+  , TicketState (..)
+  , BatchTicket (..)
+  , newTicket
+  , readTicket
+  , awaitTicket
+  , settleTicket
 
     -- * The recording
   , Recording (..)
@@ -69,7 +78,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   ) where
 
 import Control.Concurrent (ThreadId, myThreadId)
-import Control.Concurrent.STM (STM, TVar, modifyTVar', newTVarIO, readTVar, readTVarIO)
+import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVar, newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import Control.Exception (Exception (displayException), SomeAsyncException, SomeException, fromException, throwIO)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -78,7 +87,9 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word32, Word64)
 import Numeric.Natural (Natural)
+import System.Timeout (timeout)
 
+import Hetoimasia.Foundation.Time (Duration, durationNanoseconds)
 import Hetoimasia.GPU.Model (GpuModel, Outcome (..))
 import qualified Hetoimasia.GPU.Model as Model
 import Hetoimasia.GPU.Model.Access (ResourceKind)
@@ -132,8 +143,8 @@ data NativeResource cmd
   | NativePipeline !Word64 !ResourceId !Word32
     -- ^ The pipeline, the layout generation it was built over, and the color
     -- format it renders to.
-  | NativeStorage !TargetId !Natural !Word64 !cmd
-    -- ^ The target and frame slot it serves, its pool and its command buffer.
+  | NativeStorage !StorageOwner !Word64 !cmd
+    -- ^ The slot it serves, its pool and its command buffer.
   | NativeReadback !ReadbackAllocation !ReadbackContents
   | NativeBuffer !BufferKind !Natural !AllocatedBuffer
     -- ^ The buffer's kind, its size, and the buffer with its allocation.
@@ -173,8 +184,19 @@ data BatchStanding
     -- never reset or discarded by the recording again.
   deriving (Eq, Show)
 
+-- | The slot a command storage serves: a target's frame slot, or a frame-less
+-- slot of the session (GRS-12).
+data StorageOwner
+  = StorageOfFrame !TargetId !Natural
+  | StorageOfFrameless !Natural
+  deriving (Eq, Ord, Show)
+
 data BatchRecord = BatchRecord
-  { batchFrame ∷ !FrameSlotId
+  { batchFrame ∷ !(Maybe FrameSlotId)
+    -- ^ The frame it renders, or 'Nothing' for a frame-less batch.
+  , batchTicket ∷ !(Maybe (TVar TicketState))
+    -- ^ A frame-less batch's completion ticket, which its owner's operations
+    -- settle.
   , batchStorage ∷ !ResourceId
   , batchStanding ∷ !BatchStanding
   , batchCommands ∷ !Natural
@@ -190,7 +212,7 @@ data Recording q inst msgr phys dev cmd = Recording
   , recordingGenerations ∷ !(Generations q inst msgr phys dev)
   , recordingOwner ∷ !ThreadId
   , recordingManaged ∷ !(TVar (Map ResourceId (ManagedRecord cmd)))
-  , recordingStorages ∷ !(TVar (Map (TargetId, Natural) ResourceId))
+  , recordingStorages ∷ !(TVar (Map StorageOwner ResourceId))
   , recordingBatches ∷ !(TVar (Map BatchId BatchRecord))
   }
 
@@ -248,6 +270,9 @@ data Refusal
   | RefusedUninitialized
     -- ^ An image that awaits initialization was touched by a batch that does
     -- not initialize it, or before the batch that does was submitted (GRS-3).
+  | RefusedOwnerWait
+    -- ^ A blocking wait on the graphics owner's thread, whose own return and
+    -- progress are what the wait is for (GRS-12).
   | RefusedConstructionFailed !Text
     -- ^ A construction raised, with the session still running, after settling
     -- everything it made: its reservation given back, or the generation it
@@ -325,6 +350,69 @@ orderedObject = \case
   _ → Nothing
 
 -- ---------------------------------------------------------------------------
+-- Tickets
+
+-- | Where a frame-less batch stands, as its ticket reports it (GRS-12). It
+-- only ever leaves 'TicketPending', and once terminal it never changes.
+data TicketState
+  = TicketPending
+    -- ^ Recording, sealed, or submitted and not yet observed complete.
+  | TicketComplete
+    -- ^ Its submission's fence was observed signalled and recorded with the
+    -- model.
+  | TicketDiscarded
+    -- ^ It was discarded without being submitted.
+  | TicketLost
+    -- ^ The device was lost while it was pending.
+  deriving (Eq, Show)
+
+-- | A frame-less batch's completion ticket: it names the batch, whatever
+-- slot or storage later serves another, and is read from any thread without a
+-- native call. Its outcome outlives the batch's record, its storage's reuse
+-- and the session.
+data BatchTicket = BatchTicket
+  { ticketBatch ∷ !BatchId
+  , ticketState ∷ !(TVar TicketState)
+  , ticketOwner ∷ !ThreadId
+    -- ^ The graphics owner's thread, on which no wait may block.
+  }
+
+instance Eq BatchTicket where
+  left == right = ticketBatch left == ticketBatch right
+
+instance Show BatchTicket where
+  showsPrec precedence ticket = showParen (precedence > 10) (showString "BatchTicket " . showsPrec 11 (ticketBatch ticket))
+
+newTicket ∷ STM (TVar TicketState)
+newTicket = newTVar TicketPending
+
+-- | The ticket's state now. It never waits.
+readTicket ∷ BatchTicket → STM TicketState
+readTicket = readTVar . ticketState
+
+-- | Wait, at most this long, for the ticket to leave 'TicketPending', and
+-- answer its state then — still pending if the deadline passed first. The
+-- wait is the caller's alone: its expiry, or its cancellation, discards
+-- nothing, releases nothing and completes nothing. It is refused on the
+-- graphics owner's thread, whose return and progress the batch needs.
+awaitTicket ∷ BatchTicket → Duration → IO (Either Refusal TicketState)
+awaitTicket ticket limit = do
+  current ← myThreadId
+  if current == ticketOwner ticket
+    then pure (Left RefusedOwnerWait)
+    else do
+      _ ← timeout microseconds (atomically (readTicket ticket >>= \state → if state == TicketPending then retry else pure state))
+      Right <$> atomically (readTicket ticket)
+  where
+    microseconds = fromInteger (min (toInteger (maxBound ∷ Int)) (toInteger (durationNanoseconds limit) `div` 1000))
+
+-- | Settle a ticket that is still pending; a terminal one is left as it is.
+settleTicket ∷ TVar TicketState → TicketState → STM ()
+settleTicket ticket state = readTVar ticket >>= \case
+  TicketPending → writeTVar ticket state
+  _ → pure ()
+
+-- ---------------------------------------------------------------------------
 -- Failures
 
 -- | Resetting a batch's storage raised. The batch, its commands and every
@@ -373,7 +461,8 @@ readManaged recording =
       let (kind, handles) = case managedNative record of
             NativeLayout handle → ("pipeline layout", [handle])
             NativePipeline handle _ _ → ("pipeline", [handle])
-            NativeStorage _ _ pool _ → ("frame storage", [pool])
+            NativeStorage (StorageOfFrame _ _) pool _ → ("frame storage", [pool])
+            NativeStorage (StorageOfFrameless _) pool _ → ("frame-less storage", [pool])
             NativeReadback allocation _ → ("readback", [allocationBuffer allocation, memoryAllocation (allocationMemory allocation)])
             NativeBuffer purpose _ allocated →
               (bufferKindText purpose, [memoryResource (allocatedMemory allocated), memoryAllocation (allocatedMemory allocated)])
@@ -393,7 +482,8 @@ readManaged recording =
 
 data BatchView = BatchView
   { viewBatch ∷ !BatchId
-  , viewBatchFrame ∷ !FrameSlotId
+  , viewBatchFrame ∷ !(Maybe FrameSlotId)
+    -- ^ 'Nothing' for a frame-less batch.
   , viewBatchStanding ∷ !BatchStanding
   , viewBatchCommands ∷ !Natural
   }
@@ -492,7 +582,7 @@ destroyNative ∷ Recording q inst msgr phys dev cmd → dev → NativeResource 
 destroyNative recording device = \case
   NativeLayout handle → rootsCall roots "vkDestroyPipelineLayout" (opsDestroyPipelineLayout ops device handle)
   NativePipeline handle _ _ → rootsCall roots "vkDestroyPipeline" (opsDestroyPipeline ops device handle)
-  NativeStorage _ _ pool _ → rootsCall roots "vkDestroyCommandPool" (opsDestroyStorage ops device pool)
+  NativeStorage _ pool _ → rootsCall roots "vkDestroyCommandPool" (opsDestroyStorage ops device pool)
   NativeReadback allocation _ → freeBuffer roots (readbackBuffer allocation)
   NativeBuffer _ _ allocated → freeBuffer roots allocated
   -- The view, then the image, then its allocation.

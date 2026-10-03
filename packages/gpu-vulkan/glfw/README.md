@@ -52,7 +52,11 @@ and the suites' verification capture.
   thread with the same `Construction`, never beside a frame; admission refuses
   at once — a full queue, no device yet, a failed session, a closed owner —
   and an action still queued when the owner's exit or the session's failure
-  begins is refused, never run. A session with no target keeps polling
+  begins is refused, never run. Inside an action, `constructFramelessBatch`
+  records a frame-less batch (GRS-12), submitted with the action's other
+  sealed ones when it returns and discarded if it raises, and answers a
+  ticket its caller can read, or wait for with a deadline, from any other
+  thread. A session with no target keeps polling
   completion and disposing of released resources until it is ended, and
   retires through the same protected exit.
 - The private `controller` sublibrary holds the controller —

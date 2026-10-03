@@ -123,9 +123,27 @@
 -- and marking no fence signalled — and 'retireTargetFrames' then destroys the
 -- target's synchronization whatever it was owed.
 --
+-- = Frame-less batches
+--
+-- GRS-12's batches belong to no frame. 'withFramelessScope' runs one consumer
+-- action — an owner-thread action — with a 'FramelessScope', in which
+-- 'recordFramelessIn' records a batch into the command storage of a
+-- frame-less slot of the session, with no swapchain image, and answers a
+-- 'BatchTicket'. When the action returns, its sealed batches are submitted,
+-- each as a native submission of its own with no wait and no signal but its
+-- slot's fence, in the order they were sealed, before anything else the owner
+-- submits; a refused or no-effect submission discards it and every later one,
+-- and partial batches are discarded. An action that raised or was cancelled
+-- submits nothing, and discards everything it opened. A ticket is complete
+-- only once 'progressFrames' observed its submission's fence signalled and
+-- recorded that with the model, which frees the slot; discarded once its
+-- batch was discarded; and lost when the device was lost while it was
+-- pending. 'retireFrameless' destroys the slots' fences at the owner's
+-- retirement, once nothing is outstanding.
+--
 -- = State
 --
--- The frames' state is five maps the 'Frames' holds. Module names are
+-- The frames' state is seven maps the 'Frames' holds. Module names are
 -- relative to @Hetoimasia.GPU.Vulkan.Native.Internal.Frames@, the package's
 -- private implementation of this module, which clients cannot import.
 --
@@ -157,6 +175,15 @@
 -- |                        |              | removes                               |        | until its present fence     | fence signalled; kept,      |
 -- |                        |              |                                       |        | signalled                   | uncertain, when asking it   |
 -- |                        |              |                                       |        |                             | raised                      |
+-- +------------------------+--------------+---------------------------------------+--------+-----------------------------+-----------------------------+
+-- | Frame-less fences      | @State@      | @Frameless@ creates one at its slot's | Owner  | The slot's first submission | Destroyed by                |
+-- |                        |              | first submission and destroys it;     |        | until the owner retires     | 'retireFrameless' once      |
+-- |                        |              | @Frameless@, @Progress@ and @Loss@    |        |                             | idle; kept, uncertain,      |
+-- |                        |              | advance it                            |        |                             | otherwise                   |
+-- +------------------------+--------------+---------------------------------------+--------+-----------------------------+-----------------------------+
+-- | Frame-less submission  | @State@      | @Frameless@ inserts; @Progress@ and   | Owner  | The native submission until | Removed once its fence      |
+-- | records                |              | @Loss@ remove, settling its ticket    |        | its fence signalled         | signalled, or the device    |
+-- |                        |              |                                       |        |                             | was lost                    |
 -- +------------------------+--------------+---------------------------------------+--------+-----------------------------+-----------------------------+
 --
 -- @Layer@ is the native layer's shape and holds no state. No other state
@@ -202,6 +229,16 @@ module Hetoimasia.GPU.Vulkan.Native.Frames
   , Progress (..)
   , retireTargetFrames
 
+    -- * Frame-less batches (GRS-12)
+  , FramelessScope
+  , withFramelessScope
+  , recordFramelessIn
+  , retireFrameless
+  , FramelessSync (..)
+  , FramelessSlotView (..)
+  , readFramelessSlots
+  , readFramelessSubmissions
+
     -- * Device loss
   , releaseFramesToDeviceLoss
 
@@ -228,6 +265,8 @@ module Hetoimasia.GPU.Vulkan.Native.Frames
   , FrameCleanupFailed (..)
   , FramesRetained (..)
   , PresentationUncertain (..)
+  , FramelessEffectUncertain (..)
+  , FramelessRetained (..)
   ) where
 
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Abandonment
@@ -236,6 +275,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Abandonment
   , skipFrame
   )
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Acquisition (tryAcquireFrame)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Frameless (FramelessScope, recordFramelessIn, retireFrameless, withFramelessScope)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Loss (releaseFramesToDeviceLoss)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Layer
   ( AcquireResult (..)
@@ -256,6 +296,12 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.State
   , FrameStanding (..)
   , Frames
   , FramesRetained (..)
+  , FramelessEffectUncertain (..)
+  , FramelessRetained (..)
+  , FramelessSlotView (..)
+  , FramelessSync (..)
+  , readFramelessSlots
+  , readFramelessSubmissions
   , OwnedFrame (..)
   , PendingReason (..)
   , PoolHolder (..)

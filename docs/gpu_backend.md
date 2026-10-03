@@ -2563,7 +2563,7 @@ same one each frame's renderer is lent
 ([Consumer construction](#consumer-construction)) — whose result the caller
 takes back from the `ActionTicket` it is given, with `readVulkanAction` or
 `awaitVulkanAction`. It works with or without targets. GRS-12 extends it with
-frame-less batch recording.
+frame-less batch recording ([Frame-less batches](#frame-less-batches)).
 
 - **Admission** is one `STM` transaction that never waits. It refuses at
   once, with the reason, when the session has failed (`ActionSessionFailed`,
@@ -2629,12 +2629,104 @@ idle session with no target naming no deadline until an action wakes it;
 the native suite's `grs15-surface-free` and `grs15-surface-free-window` run
 them against the device ([The native suite](#the-native-suite)).
 
+## Frame-less batches
+
+GRS-12 (#337; resource services design D-12) records batches that belong to
+no frame — offscreen rendering and uploads, which later issues build on —
+with their own submission and completion. The model's rules are
+[gpu_model.md's](gpu_model.md#frame-less-batches).
+
+**Recording.** Inside an owner-thread action, `constructFramelessBatch` lends
+a consumer a `Recorder` for one frame-less batch and answers its
+`BatchTicket`. The recorder is the frame's, with every check a frame's batch
+has — the owner's thread, the handles, retention before each native call,
+#335's transitions, boundary barriers and sealing rules — but no swapchain
+image: every command that needs one (`transitionImage`, `beginRendering`,
+`bindPipeline`, `setViewport`, `setScissor`, `copyToReadback`) is
+`RefusedUnsupported` before anything native. The batch is recorded into the
+command storage of the lowest free frame-less slot: made the first time the
+slot is used — named, released and destroyed like a frame storage — and reused
+by later batches of the slot only after its batch was discarded or its
+submission's completion observed, its pool reset first. A renderer's frame
+records no frame-less batch: the construction it is lent refuses one.
+
+**Submission order.** When the action returns, its sealed frame-less batches
+are submitted in the order they were sealed, each as a `vkQueueSubmit2` of its
+own on the one graphics queue, with no wait and no signal but its slot's
+fence — before anything else the owner submits after the action, so before
+any later frame's submission. One the queue accepted stays accepted whatever
+follows. The first that is refused, or fails with no effect after its one
+reclamation and retry (VK-14), is discarded with every batch sealed after it;
+one whose effect is unknown fails the session with
+`FramelessEffectUncertain`, retaining what it held, and the rest are
+discarded. A batch left partial is never submitted and is discarded, as only a
+discard ends one. An action that raised, or was cancelled, submits nothing and
+discards every batch it opened; a discard whose storage reset raised keeps the
+batch, its references and its slot, uncertain, fails the session, and the
+action's own failure is still the one raised. The device's loss is asked again
+before each discard: once lost, every batch left is let go of under the
+device-loss rule instead, its ticket lost, with no native call.
+
+**Tickets.** A `BatchTicket` names one batch, whatever slot or storage later
+serves another. `readTicket` reads it from any thread without a native call:
+`TicketPending` until its submission's fence has been observed signalled and
+recorded with the model, then `TicketComplete`; `TicketDiscarded` once its
+batch was discarded; `TicketLost` if the device was lost while it was pending.
+Once terminal it never changes, after the slot's reuse and the session's end
+alike. `awaitTicket` waits for a terminal state at most the given duration and
+answers the state then; its expiry, or its cancellation, discards nothing,
+releases nothing and completes nothing. It is refused on the graphics owner's
+thread (`RefusedOwnerWait`), whose own return and progress the batch needs.
+
+**Progress.** The owner observes frame-less fences in its bounded progress
+step, among its other work and on the same rotation, so one that has not
+signalled never holds back another — in windowed and zero-target sessions
+alike, since a pending submission is owed work the model's poll schedule
+counts. A signalled fence is recorded as the submission's completion, which
+discharges its holds and frees its slot, and completes its ticket. A fence
+whose query raised without losing the device is uncertain: the session fails,
+the fence is never asked again, and the submission is kept with its ticket
+pending — retaining it and the device, and letting a later loss report it
+lost. A slot's fence is made at its first submission; one whose creation ran
+out of memory is recovered once, as a frame slot's are (VK-14), and one that
+is not recovered discards the batch without recording it again.
+
+**Device loss and retirement.** After the device's loss no fence is asked or
+waited on: the device-loss release lets go of every frame-less submission,
+completing none and settling each pending ticket as lost, and forgets every
+unsubmitted frame-less batch with no native call, discarding it in the model.
+At whole-owner retirement the owner waits, in the frames' finite drain steps
+and for at most a hundred of them, for each outstanding frame-less
+submission's fence, then destroys the frame-less fences. One still outstanding
+without device-loss evidence is retained (`FramelessRetained`), and so is the
+device: nothing is certified complete to finish the teardown.
+
+| State | Owner | Readers and writers | Thread | Lifetime | Reset or disposal |
+| --- | --- | --- | --- | --- | --- |
+| A frame-less slot's command storage | The recording's managed records and storages (`State`) | `Recorder`'s frame-less recording makes it through `Construction`, resets it before reuse through `Batches`; `Disposal` destroys it | The graphics owner | Its slot's first batch until the owner retires the recording | Destroyed once released and no batch holds it; kept, uncertain, if its reset or destruction raised |
+| A frame-less slot's fence | The frames (`Frames.State`) | `Frameless` makes it at its slot's first submission, resets it before each later one and destroys it at retirement; `Progress` and `Loss` advance it | The graphics owner | Its slot's first submission until the owner retires | Destroyed by `retireFrameless` once idle, or under the device-loss rule; kept, uncertain, otherwise |
+| A frame-less submission's record | The frames (`Frames.State`) | `Frameless` inserts it; `Progress` removes it on its fence's signal, `Loss` on the device's loss | The graphics owner | The submission until its completion is observed or the device is lost | Removed with its ticket settled |
+| A ticket's state | The ticket (a `TVar` in `Recording.State`) | The recording settles it on a discard, the frames on a completion or the device's loss; any thread reads it | Any, in STM | From the batch's opening for as long as the caller keeps the ticket | Only ever leaves pending, once |
+| An action's frame-less scope | `Frameless`'s `withFramelessScope` | The action's recording notes each batch it opens and seals; the scope submits and discards them when the action ends | The graphics owner | One owner-thread action | Ends with the action |
+
+The headless examples cover each case over the stand-in native layers — seal
+order before a later frame, swapchain commands refused, a partial batch
+discarded, an action raising after sealing, an accepted prefix kept when a
+later submission fails with no effect or an unknown effect, slot reuse only
+after completion or discard, a discard whose reset raised, tickets completed
+only on fence evidence, lost on device loss and waited for with a deadline,
+a ready submission observed behind one that has not signalled,
+initialization, and retirement — and the integration examples record
+frame-less batches inside owner-thread actions of a zero-target session; the
+native suite's `grs12-frameless` runs them against the device
+([The native suite](#the-native-suite)).
+
 ## Destruction order
 
 | Exit | What is destroyed, in order, on the owner's thread |
 | --- | --- |
 | A window closed or a target released | That target's swapchain generations — each one's image views, newest first, then its swapchain — and then its surface. The owner writes its terminal record only after the destructions returned, and the main thread then certifies the attachment's facts and releases the window. The device, the instance, the owner and every other target stay live, and nothing is joined. A generation still held retains the surface, and with it everything above. |
-| Whole-host exit (D-33), with or without targets | Every remaining target's surface, if any remains; then — whole-owner retirement — every surface the lease still owes that no target held (an attachment whose announcement never reached the owner), every owner-thread action still queued is refused, every managed resource the recording still holds — the consumer's pipelines before their layouts, whether its renderer or an owner-thread action built them, and any capture's readback buffer, each once no batch holds it (VK-19) — then the device's allocator, once no allocation made from it remains, and the device; then — whole-owner destruction — any surface a creation still in its native call left, the explicit messenger, and the instance, the last call that can reach the capture's callback. Only after that evidence is the owner joined, and only then are windows, the session and the capability released. |
+| Whole-host exit (D-33), with or without targets | Every remaining target's surface, if any remains; then — whole-owner retirement — every surface the lease still owes that no target held (an attachment whose announcement never reached the owner), every owner-thread action still queued is refused, every frame-less submission still outstanding is waited for in the frames' finite drain steps and then every frame-less slot's fence destroyed (GRS-12), every managed resource the recording still holds — the consumer's pipelines before their layouts, whether its renderer or an owner-thread action built them, and any capture's readback buffer, each once no batch holds it (VK-19) — then the device's allocator, once no allocation made from it remains, and the device; then — whole-owner destruction — any surface a creation still in its native call left, the explicit messenger, and the instance, the last call that can reach the capture's callback. Only after that evidence is the owner joined, and only then are windows, the session and the capability released. |
 
 Each step is refused rather than reordered when something that must go first
 has not verifiably gone. A destruction that raised is uncertain: it is recorded,
@@ -3506,7 +3598,7 @@ companions — and adds the Vulkan owner's:
 | Main thread | Hspec runs on a thread of its own; the process main thread owns one shared production graphics session: `withLoaderIntegration`, then `runGraphicsOwnerApplication` over `withVulkanOwnerHost`, with the production native layer and surface bridge. An example that needs the main thread — to hand a window's surface over, which GLFW creates there, or to close a window — submits an operation (`onMain`); the main thread runs it between two turns of the host's owner loop and returns its result or rethrows its failure. Windows are created through the host's command port from the example's own thread, which the owner loop executes, as an application's worker would. |
 | Identities | Every dispatched operation is checked, before it runs, to be on the bound process main thread that entered the session — the Haskell thread, the bound flag, and the OS thread read through `pthread_self` — and a failed check fails the operation and the run. Every native call the session makes is recorded where it runs by a `NativeObserver`, so an example shows from the calls themselves that the instance, its messenger, the device and every surface's destruction ran on the graphics owner's thread and every surface's creation on the main thread — never from the name of an Hspec hook. |
 | Sharing | The roots — the instance, its explicit messenger, and the one device — are acquired lazily, by the first dispatched operation, at most once, and shared by every later example. Each example's windows and targets are its own and are closed inside it. |
-| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, `vk12-frames`, `vk13-presentation`, `vk14-recovery`, `vk15-validation-stop`, `vk15-retention`, `vk16-composed`, `vk17-one-slot`, `vk17-two-slots`, `vk19-capture`, `grs15-surface-free`, `grs15-surface-free-window`, `grs3-ordering`, `synchronization-hazard`, `debug-names`, and, under the isolated compositor's consent only, `wayland-connection-loss`. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. Each child runs in a process group of its own under an external 20-second deadline covering its exit and the end of its output; one still running at it is terminated with its group and fails its example as expired. |
+| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, `vk12-frames`, `vk13-presentation`, `vk14-recovery`, `vk15-validation-stop`, `vk15-retention`, `vk16-composed`, `vk17-one-slot`, `vk17-two-slots`, `vk19-capture`, `grs15-surface-free`, `grs15-surface-free-window`, `grs12-frameless`, `grs3-ordering`, `synchronization-hazard`, `debug-names`, and, under the isolated compositor's consent only, `wayland-connection-loss`. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. Each child runs in a process group of its own under an external 20-second deadline covering its exit and the end of its output; one still running at it is terminated with its group and fails its example as expired. |
 | Selection | Building, listing and filtering the tree, a `--dry-run`, and a selection that dispatches nothing acquire nothing and start no child. A selection matching no example fails. `--complete`, which the catalog group passes, runs the whole tree with Hspec's configuration reading left out and then fails unless the shared session was acquired once and every private scenario the run's consent requires ran and passed — every one, except that `wayland-connection-loss` is required under the isolated compositor's consent and pending under any other — so no ambient setting can turn the group's receipt into a pass for a subset. The consent rules and the migrated proof's pure release, construction, publication and loader-selection examples need no session and run without consent. |
 | Consent | Read once, at startup, from `HETOIMASIA_NATIVE_SESSION`, with the GLFW suite's rules for `desktop`, `isolated-x11:<display>` and `isolated-wayland:<socket>`: the last only on Linux, only when `WAYLAND_DISPLAY` names that socket, and never beside a `DISPLAY`. Under the Wayland consent every session requests Wayland by name — the shared host, each child's host, the VK-5 bridge's loader-aware session, and the proof shim's raw initialization, which sets `GLFW_PLATFORM` and fails one that selected another platform — so no X11 or XWayland session stands in; under the others every session requests nothing, as before. The first shared example asserts the platform GLFW selected before any example renders. Without consent every native example is refused before its body, the session is never acquired, and the run ends with the refusal on stderr and a non-zero exit. |
 | Environment | Before any Vulkan call, the suite clears every ambient discovery override and every validation-layer setting it finds and records which, disables implicit layers, and points the layer's settings file at an empty one; a child inherits and re-establishes the same environment. |
@@ -3816,6 +3908,23 @@ write-after-write at the third submission, but nothing for the depth target's
 load-op clear across submissions: for the depth target the case shows the
 barriers recorded and their layouts accepted, not a hazard the layer could
 have seen.
+
+GRS-12's case, `grs12-frameless`, runs the same surface-free composition with
+no window, under a 2 GiB byte budget, as VK-11's case does. One owner-thread
+action builds a color target and a vertex buffer and records a frame-less
+batch that initializes the target and moves the buffer into a copy's use and
+back; a second records one that moves the target into a copy's source and back
+and the buffer again, with no wait for the first's completion. Each is
+submitted when its action returns. It passes only if no window, surface or
+image acquisition was made and the device came first; if both actions ran on
+the owner's thread, each beginning and ending one command buffer; if two
+submissions were made, two completions observed, and both tickets, waited for
+with a deadline from the main thread, answered complete; if the frame-less
+fences were destroyed before the device, then the messenger and the instance,
+with every Vulkan call on the owner's thread; and if the verdict after the
+last teardown callback has no issue and no error was reported. Recorded
+commands are not observed one by one there, so its barriers are the headless
+examples', and their synchronization the verdict's.
 
 #250's case, `debug-names`, is VK-11's on private roots of its own, with one
 destructive seam only the fixture holds: it wraps the production recording

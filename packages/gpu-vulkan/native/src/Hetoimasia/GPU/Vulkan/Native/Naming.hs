@@ -41,6 +41,8 @@ module Hetoimasia.GPU.Vulkan.Native.Naming
   , shaderModuleName
   , commandPoolName
   , commandBufferName
+  , framelessPoolName
+  , framelessBufferName
   , readbackBufferName
   , readbackMemoryName
   , bufferName
@@ -53,6 +55,7 @@ module Hetoimasia.GPU.Vulkan.Native.Naming
 
     -- * Recording labels
   , batchLabel
+  , framelessBatchLabel
   , passLabel
   ) where
 
@@ -191,6 +194,13 @@ commandPoolName resource target slot = boundedName (resourceText resource <> " c
 commandBufferName ∷ ResourceId → TargetId → Natural → ByteString
 commandBufferName resource target slot = boundedName (resourceText resource <> " command buffer " <> targetText target <> " slot " <> shown slot)
 
+-- | A frame-less slot's command pool and buffer (GRS-12).
+framelessPoolName ∷ ResourceId → Natural → ByteString
+framelessPoolName resource slot = boundedName (resourceText resource <> " command pool frame-less slot " <> shown slot)
+
+framelessBufferName ∷ ResourceId → Natural → ByteString
+framelessBufferName resource slot = boundedName (resourceText resource <> " command buffer frame-less slot " <> shown slot)
+
 readbackBufferName ∷ ResourceId → ByteString
 readbackBufferName resource = boundedName (resourceText resource <> " readback buffer")
 
@@ -253,6 +263,10 @@ poolObjectName target record object =
 -- of the frame it records.
 batchLabel ∷ BatchId → GenerationId → ByteString
 batchLabel batch generation = boundedName (batchText batch <> " " <> generationText generation)
+
+-- | The label around one frame-less batch, which renders no generation.
+framelessBatchLabel ∷ BatchId → ByteString
+framelessBatchLabel batch = boundedName (batchText batch <> " frame-less")
 
 -- | The label around one dynamic-rendering pass of that batch.
 passLabel ∷ BatchId → GenerationId → ByteString
