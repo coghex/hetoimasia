@@ -1586,7 +1586,8 @@ offset must let every attribute reading it be read, each attribute's address a
 multiple of its format's component size, as Vulkan requires: a bind checks it
 against the pipeline bound then, and every draw again against the pipeline
 bound now, since a binding outlives a pipeline switch. Every draw also checks
-each buffer it reads again: a managed buffer still recordable — not released,
+each buffer it reads again — the data bound to the bindings the pipeline bound
+now declares, and for an indexed draw the index data, nothing else bound: a managed buffer still recordable — not released,
 replaced or stale since its bind — and every buffer still in the use it was
 bound in, so a transition between passes that moved it elsewhere refuses the
 draw.
@@ -1596,7 +1597,10 @@ For index data in a ring region the batch wrote, the recording reads the
 indices from the ring's mapping when the draw is recorded, bounds every
 per-vertex binding's reads by the largest index, and from then on refuses any
 write of the batch into the bytes it read (`RefusedIllegal`), so the indices
-the device reads are the ones checked. Index data the recording cannot read —
+the device reads are the ones checked. The indices are read only after the
+draw's thread is found to be the owner's and its recorder open, so no read
+reaches a region that may have been reclaimed or a mapping that may be
+gone. Index data the recording cannot read —
 a managed index buffer's, which no host write fills before GRS-6 — cannot bound
 those reads, so an indexed draw through it that reads per-vertex data is
 `RefusedUnsupported`; one whose bindings are all per-instance is not.
@@ -1640,8 +1644,10 @@ read reaches; 16-bit and 32-bit indices naming a vertex beyond the region
 bound, managed index data refused for per-vertex reads, and a write into
 indices a draw read refused; a vertex source its attributes cannot be read
 from, at its bind and after a pipeline switch; a draw through a buffer
-released or moved out of its use since its bind; binds retaining exactly their
-references; and every refusal above with no native call, no draw recorded. The surface-free native case `grs4-drawing` makes
+released or moved out of its use since its bind; a draw that is not indexed
+reading no index data, and a pipeline with no vertex input reading no binding;
+indices read only on the owner's thread and by an open recorder; binds
+retaining exactly their references; and every refusal above with no native call, no draw recorded. The surface-free native case `grs4-drawing` makes
 the ring, writes a quad's four vertices, its six 16-bit indices and two
 instance offsets into ring regions of a frame-less batch, pushes magenta as a
 fragment push constant, draws indexed and instanced into an `R8G8B8A8_SRGB`
