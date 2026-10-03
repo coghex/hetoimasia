@@ -793,39 +793,39 @@ recordTurn uploads = do
                 first = entryCursor entry == startCursor (entryShape entry)
                 final = plannedNext item == CursorDone
              in (,) item <$> recordUploadCopies recorder (entryTarget entry) object kind image (stagingResource staging) (allocationBuffer (stagingMapping staging)) first final (plannedCopies item)
+      -- One transaction publishes what the turn did and releases its claims:
+      -- an upload whose copies a submitted batch carries has its flight, its
+      -- cursor and its ticket published as its claim is released, so nothing
+      -- can settle it — freeing staging the batch may still read — in
+      -- between. An upload releases its claim without a flight only when no
+      -- submitted work reads its bytes: the batch was refused, discarded, or
+      -- carried none of its copies.
       atomically $ do
+        accepted ← case outcome of
+          Left _ → pure False
+          Right (ticket, _) → (/= TicketDiscarded) <$> readTicket ticket
         modifyTVar' (uploadsState uploads) (\current → current {stateStalled = either (const True) (const False) outcome})
-        forM_ planned (\item → edit (plannedNumber item) (\held → held {entryClaimed = False}))
-      case outcome of
-        Left _ → pure False
-        Right (ticket, results) → do
-          accepted ← (/= TicketDiscarded) <$> atomically (readTicket ticket)
-          atomically $
-            forM_ [item | (item, Right ()) ← results, accepted] $ \item →
-              let entry = plannedEntry item
-                  first = entryCursor entry == startCursor (entryShape entry)
-                  final = plannedNext item == CursorDone
-               in modifyTVar' (uploadsState uploads) $ \current →
-                    current
-                      { stateEntries =
-                          Map.adjust
-                            ( \held →
-                                held
-                                  { entryPhase = PhaseUploading
-                                  , entryCursor = plannedNext item
-                                  , entryStarted = True
-                                  , entryFlight = Just (Flight ticket (entryCursor held) first final)
-                                  }
-                            )
-                            (plannedNumber item)
-                            (stateEntries current)
-                      }
-          atomically $
-            forM_ [item | (item, Right ()) ← results, accepted] $ \item →
-              -- Only a ticket still unsettled: a ticket only advances.
-              readTVar (entryTicket (plannedEntry item)) >>= \current →
-                when (current == UploadQueued) (writeTVar (entryTicket (plannedEntry item)) UploadUploading)
-          pure accepted
+        let carried = case outcome of
+              Right (ticket, results) | accepted → [(plannedNumber item, (item, ticket)) | (item, Right ()) ← results]
+              _ → []
+        forM_ planned $ \item → case lookup (plannedNumber item) carried of
+          Nothing → edit (plannedNumber item) (\held → held {entryClaimed = False})
+          Just (_, ticket) → do
+            let entry = plannedEntry item
+                first = entryCursor entry == startCursor (entryShape entry)
+                final = plannedNext item == CursorDone
+            edit (plannedNumber item) $ \held →
+              held
+                { entryPhase = PhaseUploading
+                , entryCursor = plannedNext item
+                , entryStarted = True
+                , entryFlight = Just (Flight ticket (entryCursor held) first final)
+                , entryClaimed = False
+                }
+            -- A ticket only advances.
+            current ← readTVar (entryTicket entry)
+            when (current == UploadQueued) (writeTVar (entryTicket entry) UploadUploading)
+        pure accepted
   where
     frames = uploadsFrames uploads
     roots = recordingRoots (framesRecording frames)
@@ -959,6 +959,9 @@ data UploadView = UploadView
     -- ^ Whether a batch carrying its copies is in flight.
   , uploadCopied ∷ !Bool
     -- ^ Whether every copy is recorded.
+  , uploadClaimed ∷ !Bool
+    -- ^ Whether the owner is recording its copies now, so that no
+    -- cancellation can settle it.
   }
   deriving (Eq, Show)
 
@@ -982,7 +985,7 @@ readUploads uploads = do
       , uploadsStagingBuffer = stagingResource (uploadsStaging uploads)
       , uploadsStagingSize = stagingBytes (uploadsStaging uploads)
       , uploadsUnsettled =
-          [ UploadView number (entryTarget entry) (entryPhase entry) (entryRegion entry) (entryStarted entry) (maybe False (const True) (entryFlight entry)) (entryCursor entry == CursorDone)
+          [ UploadView number (entryTarget entry) (entryPhase entry) (entryRegion entry) (entryStarted entry) (maybe False (const True) (entryFlight entry)) (entryCursor entry == CursorDone) (entryClaimed entry)
           | (number, entry) ← Map.toList (stateEntries state)
           ]
       }

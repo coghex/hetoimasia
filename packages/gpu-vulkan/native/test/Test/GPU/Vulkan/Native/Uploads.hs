@@ -16,7 +16,7 @@
 module Test.GPU.Vulkan.Native.Uploads (spec) where
 
 import Control.Concurrent (forkIO)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar, tryTakeMVar)
 import Control.Concurrent.STM (atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
 import Control.Exception (try)
 import Control.Monad (forM, replicateM_, when)
@@ -37,7 +37,7 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
 import Hetoimasia.GPU.Vulkan.Native.Uploads
 import Test.GPU.Vulkan.Native.AllocatorStandIn (AllocatorCall (..), allocatorCalls, allowTypes, deviceLocalType, nonCoherentType)
 import Test.GPU.Vulkan.Native.FramesRig
-import Test.GPU.Vulkan.Native.FramesStandIn (FrameStep (AtSubmitNoEffect), clearFrameStep, completeAll, failFrameStep)
+import Test.GPU.Vulkan.Native.FramesStandIn (FrameCall (Submitted), FrameStep (AtSubmitNoEffect), clearFrameStep, completeAll, duringFrameCall, failFrameStep)
 import Test.GPU.Vulkan.Native.RecordingStandIn
   ( RecordingCall (..)
   , RecordingFailure (..)
@@ -416,6 +416,47 @@ spec = describe "Uploads" $ do
       settleUploads rig uploads
       atomically (readUploadTicket ticket) `shouldReturn` UploadComplete
       resourceInitialization (managedResource texture) <$> modelOf rig `shouldReturn` Just Initialized
+      clean rig
+
+    it "refuses a cancellation and a rival admission at the batch's submission, and publishes its flight as it releases the claim" $ do
+      rig ← newUploadRig
+      uploads ← made rig (config 64 64 4)
+      texture ← textureOf rig Rgba8Linear 4 4 1
+      rival ← textureOf rig Rgba8Linear 4 4 1
+      ticket ← admitted uploads (UploadImage texture [level 64 1])
+      seen ← newEmptyMVar
+      -- Inside the submission of the batch carrying its first copies, the
+      -- last instant before the turn publishes what it submitted.
+      duringFrameCall (rigStandIn rig) $ \case
+        Submitted {} → do
+          cancelling ← atomically (cancelUpload uploads ticket)
+          admittedNow ← fmap (const ()) <$> submitUpload uploads (UploadImage rival [level 64 2])
+          () <$ tryPutMVar seen (cancelling, admittedNow)
+        _ → pure ()
+      _ ← turned uploads
+      duringFrameCall (rigStandIn rig) (const (pure ()))
+      tryTakeMVar seen `shouldReturn` Just (Left CancelStarted, Left (UploadBackpressure StagingFull))
+      -- The claim was released with the flight published in the same
+      -- transaction: in flight, claimed no longer, and still held.
+      fmap (\view → (uploadStarted view, uploadInFlight view, uploadClaimed view)) . uploadsUnsettled <$> atomically (readUploads uploads) `shouldReturn` [(True, True, False)]
+      atomically (cancelUpload uploads ticket) `shouldReturn` Left CancelStarted
+      fmap (const ()) <$> submitUpload uploads (UploadImage rival [level 64 2]) `shouldReturn` Left (UploadBackpressure StagingFull)
+      settleUploads rig uploads
+      atomically (readUploadTicket ticket) `shouldReturn` UploadComplete
+      clean rig
+
+    it "releases the claim without a flight when the batch was discarded, so no submitted work holds the upload and it may be cancelled" $ do
+      rig ← newUploadRig
+      uploads ← made rig (config 1024 64 4)
+      vertices ← bufferOf rig VertexBuffer 16
+      ticket ← admitted uploads (UploadBuffer vertices (level 16 1))
+      failNextSubmission rig
+      _ ← turned uploads
+      clearSubmissionFailure rig
+      fmap (\view → (uploadStarted view, uploadInFlight view, uploadClaimed view)) . uploadsUnsettled <$> atomically (readUploads uploads) `shouldReturn` [(False, False, False)]
+      atomically (cancelUpload uploads ticket) `shouldReturn` Right ()
+      atomically (readUploadTicket ticket) `shouldReturn` UploadCancelled
+      uploadsUnsettled <$> atomically (readUploads uploads) `shouldReturn` []
       clean rig
 
     it "completes a ticket only on its final batch's fence, refuses a wait on the owner, and lets a deadline pass without cancelling anything" $ do
