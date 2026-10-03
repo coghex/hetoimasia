@@ -8,8 +8,13 @@
 -- presentation-pool records, and binds and frees pool records in the frames'
 -- state ("Hetoimasia.GPU.Vulkan.Native.Internal.Frames.State"), and marks a
 -- slot's acquisition semaphore owed a signal. It owns no state of its own.
+--
+-- 'rollBack' is shared with the frame-less submission
+-- ("Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Frameless"), whose slot fence
+-- is rolled back the same way when its naming raises.
 module Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Acquisition
   ( tryAcquireFrame
+  , rollBack
   ) where
 
 import Control.Concurrent.STM (STM, atomically, modifyTVar', readTVar, readTVarIO)

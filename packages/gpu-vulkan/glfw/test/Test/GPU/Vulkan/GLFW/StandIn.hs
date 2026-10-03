@@ -11,6 +11,20 @@
 -- Every call is journalled with the thread that made it, and the seam's own
 -- window and session releases are journalled into the same place, so an
 -- example can read one order across all of them.
+--
+-- __Rescue.__ A rig withholds things an exit needs: presentations and
+-- submissions it does not let complete, holds it has not opened, slowed calls,
+-- refused frames, a held event pump, and a scripted clock that moves only when
+-- the example moves it. Once a rig is rescued ('rescueRig') it withholds none
+-- of them, from then on: every fence answers signalled, every hold already
+-- entered or entered later passes, no call is slowed, no frame refused, and
+-- every wait the owner arms on the scripted clock comes due at once, moving
+-- the clock to its deadline. Irreversible scripted failures stay as they were,
+-- and nothing publishes destruction evidence the stand-ins did not produce.
+-- A rig is rescued when a synchronous failure, or the example bound's
+-- cancellation, escapes its body — before the protected teardown begins — and
+-- when the bound of the example that made it expires
+-- ("Test.GPU.Vulkan.GLFW.Bound").
 module Test.GPU.Vulkan.GLFW.StandIn
   ( -- * The journal
     Event (..)
@@ -93,6 +107,8 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , advanceClock
   , setClock
   , clockNow
+  , onTimerArmed
+  , rescueRig
   , holdPump
   , pumpHeld
   , setVisible
@@ -130,7 +146,7 @@ import Control.Concurrent.STM
   , stateTVar
   , writeTVar
   )
-import Control.Exception (Exception, ExceptionWithContext (ExceptionWithContext), SomeException, fromException, rethrowIO, throwIO, try, tryWithContext, uninterruptibleMask_)
+import Control.Exception (Exception, ExceptionWithContext (ExceptionWithContext), SomeAsyncException, SomeException, fromException, mask, rethrowIO, throwIO, try, tryWithContext, uninterruptibleMask_)
 import Control.Monad (void, when)
 import Control.Monad.IO.Class (liftIO)
 import Data.ByteString (ByteString)
@@ -149,6 +165,7 @@ import Data.Maybe (isJust)
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
+import Data.Unique (Unique, newUnique)
 import qualified Data.Text as Text
 import Data.Word (Word32, Word64, Word8)
 import Foreign.C.Types (CInt (..))
@@ -272,6 +289,7 @@ import Hetoimasia.Runtime.GLFW
   )
 import Hetoimasia.Runtime.Logging (withLoggingLifetime)
 import Hetoimasia.Runtime.Supervision (RuntimeControl)
+import Test.GPU.Vulkan.GLFW.Bound (BoundScope, boundRescuing, currentBound, isBoundExpiry, withBoundThread)
 
 -- ---------------------------------------------------------------------------
 -- The journal
@@ -498,13 +516,13 @@ offerUsage rig usage = atomically (writeTVar (nativeUsage (rigNative rig)) usage
 declareUnsupported ∷ Rig → Word64 → IO ()
 declareUnsupported rig surface = atomically (modifyTVar' (nativeUnsupported (rigNative rig)) (Set.insert surface))
 
-stepWith ∷ DiagnosticCapture → Journal → Native → Step → Event → IO ()
-stepWith capture events native at event = do
+stepWith ∷ STM Bool → DiagnosticCapture → Journal → Native → Step → Event → IO ()
+stepWith rescued capture events native at event = do
   scripted ← Map.lookup at <$> readTVarIO (nativeScript native)
   case scripted of
     Just (HoldsUntil gate) → uninterruptibleMask_ $ do
       atomically (modifyTVar' (nativeHeld native) (Set.insert at))
-      atomically (readTVar gate >>= check)
+      atomically (passed rescued gate)
       atomically (modifyTVar' (nativeHeld native) (Set.delete at))
     Just (ReportsError text) → report capture severityError text
     Just (ReportsWarning text) → report capture severityWarning text
@@ -549,11 +567,18 @@ report capture severity text =
         }
         ∷ DebugUtilsMessengerCallbackDataEXT '[]
 
+-- | Wait until this gate is open, or the rig has been rescued.
+passed ∷ STM Bool → TVar Bool → STM ()
+passed rescued gate = do
+  open ← readTVar gate
+  rescuedNow ← rescued
+  check (open || rescuedNow)
+
 -- | The stand-in native layer. The instance is 1, the messenger 2 and the
 -- device 3; one device, one queue family, presenting to every surface but the
 -- ones declared unsupported.
-nativeLayer ∷ Journal → Native → AllocatorOps → DiagnosticCapture → RootOps Quiesced Int Int Text Int
-nativeLayer events native allocator capture =
+nativeLayer ∷ STM Bool → Journal → Native → AllocatorOps → DiagnosticCapture → RootOps Quiesced Int Int Text Int
+nativeLayer rescued events native allocator capture =
   RootOps
     { opsInstanceOffer = do
         atomically (writeTVar (nativeCapture native) (Just capture))
@@ -645,7 +670,7 @@ nativeLayer events native allocator capture =
     }
   where
     fresh = atomically (stateTVar (nativeHandles native) (\next → (next, next + 1)))
-    step = stepWith capture
+    step = stepWith rescued capture
 
 -- ---------------------------------------------------------------------------
 -- The surface bridge
@@ -724,8 +749,8 @@ standing lease = do
       then LeaseInFlight
       else if Map.null owed then LeaseReleasable else LeaseOwed
 
-surfaceBridge ∷ Journal → Bridge → SurfaceBridge Lease Obligation
-surfaceBridge events bridge =
+surfaceBridge ∷ STM Bool → Journal → Bridge → SurfaceBridge Lease Obligation
+surfaceBridge rescued events bridge =
   SurfaceBridge
     { bridgeLease = \_ → do
         lease ← Lease <$> newTVarIO True <*> newTVarIO 0 <*> newTVarIO Map.empty
@@ -768,7 +793,7 @@ surfaceBridge events bridge =
         Just surface → do
           scripted ← scriptsFor surface
           uninterruptibleMask_ $ do
-            sequence_ [atomically (readTVar gate >>= check) | CreateHolds gate ← scripted]
+            sequence_ [atomically (passed rescued gate) | CreateHolds gate ← scripted]
             if any isCreateFails scripted
               then do
                 atomically (modifyTVar' (leaseInFlight lease) (subtract 1))
@@ -797,7 +822,7 @@ surfaceBridge events bridge =
         else do
           scripted ← scriptsFor (obligationKey obligation)
           sequence_
-            [ record events (SurfaceDestroyStarted (obligationSurface obligation)) >> atomically (readTVar gate >>= check)
+            [ record events (SurfaceDestroyStarted (obligationSurface obligation)) >> atomically (passed rescued gate)
             | DestroyHolds gate ← scripted
             ]
           record events (SurfaceDestroyed (obligationSurface obligation))
@@ -1099,8 +1124,8 @@ renderingAllocator events rendering =
     fresh = atomically (stateTVar (renderingHandles rendering) (\next → (next, next + 1)))
     imageBytes request = fromIntegral (requestImageWidth request) * fromIntegral (requestImageHeight request) * 4
 
-renderingLayers ∷ Journal → Rendering → Maybe (TVar Instant) → RenderingOps Text Int Word64
-renderingLayers events rendering clock =
+renderingLayers ∷ STM Bool → Journal → Rendering → Maybe (TVar Instant) → RenderingOps Text Int Word64
+renderingLayers rescued events rendering clock =
   RenderingOps
     { renderingRecordingOps = \_ → recordingLayer <$ creating CreateRecording
     , renderingFrameOps = frameLayer
@@ -1159,11 +1184,12 @@ renderingLayers events rendering clock =
               counted ← readTVar (renderingRetireCount rendering)
               kept ← readTVar (renderingKept rendering)
               presentedTo ← fmap fst . Map.lookup handle <$> readTVar (renderingPresented rendering)
+              rescuedNow ← rescued
               let keeping = maybe False (`Set.member` kept) presentedTo
               case kind of
                 Just FenceDone → pure True
-                Just FenceSubmission | submissions → True <$ modifyTVar' (renderingFences rendering) (Map.insert handle FenceDone)
-                Just FencePresent | presentations && not keeping && maybe True (> 0) counted → do
+                Just FenceSubmission | submissions || rescuedNow → True <$ modifyTVar' (renderingFences rendering) (Map.insert handle FenceDone)
+                Just FencePresent | rescuedNow || (presentations && not keeping && maybe True (> 0) counted) → do
                   writeTVar (renderingRetireCount rendering) (subtract 1 <$> counted)
                   modifyTVar' (renderingFences rendering) (Map.insert handle FenceDone)
                   held ← Map.lookup handle <$> readTVar (renderingPresented rendering)
@@ -1177,7 +1203,7 @@ renderingLayers events rendering clock =
               Nothing → pure ()
               Just gate → uninterruptibleMask_ $ do
                 atomically (writeTVar (renderingHolding rendering) True)
-                atomically (readTVar gate >>= check)
+                atomically (passed rescued gate)
                 atomically (writeTVar (renderingHolding rendering) False)
             taken ← atomically $ do
               busy ← Map.findWithDefault Set.empty swapchain <$> readTVar (renderingBusy rendering)
@@ -1200,7 +1226,7 @@ renderingLayers events rendering clock =
               Nothing → pure ()
               Just gate → uninterruptibleMask_ $ do
                 atomically (writeTVar (renderingPresentHolding rendering) True)
-                atomically (readTVar gate >>= check)
+                atomically (passed rescued gate)
                 atomically (writeTVar (renderingPresentHolding rendering) False)
             answer ← stale (presentSwapchain request) >>= maybe (readTVarIO (renderingStatus rendering)) pure
             writeIORef status answer
@@ -1221,8 +1247,11 @@ renderingLayers events rendering clock =
           pure $ case (reported, [size | (_, SwapchainCreated handle size _) ← built, handle == swapchain]) of
             (Just (SurfaceExtent width height), size : _) | size /= (width, height) → Just PresentStatusSuboptimal
             _ → Nothing
+    -- A rescued rig's calls are slow no longer.
     slow = do
-      advance ← readTVarIO (renderingAdvance rendering)
+      advance ← atomically $ do
+        rescuedNow ← rescued
+        if rescuedNow then pure Nothing else readTVar (renderingAdvance rendering)
       for_ ((,) <$> advance <*> clock) $ \(milliseconds, cell) →
         atomically (modifyTVar' cell (\now → either (const now) id (addDuration now (millisecondsOf milliseconds))))
 
@@ -1266,9 +1295,20 @@ data Rig = Rig
   , rigClock ∷ !(Maybe (TVar Instant))
     -- ^ The scripted clock the host and the owner read, when the example
     -- scripts one: it moves only when the example moves it, and the owner's
-    -- timer expires only when it has passed the instant it was armed for.
+    -- timer expires once the clock has reached the deadline the owner gave
+    -- it, never at an interval of its own measured from a later reading.
   , rigArmings ∷ !(TVar [Duration])
     -- ^ Every duration the owner armed its timer for, with a scripted clock.
+  , rigArmHook ∷ !(TVar (Maybe (Unique, Instant → IO Bool)))
+    -- ^ Run on the owner's thread inside each arming of its timer, with the
+    -- arming's deadline, after the owner's clock reading and before the
+    -- timer is armed, until it answers 'True'; each installation has an
+    -- identity, so one that answers clears only itself.
+  , rigBound ∷ !(Maybe BoundScope)
+    -- ^ The bound of the example that made the rig, if it was made under one.
+  , rigRescued ∷ !(TVar Bool)
+    -- ^ Whether the rig has been rescued on its own account; it is rescued
+    -- also once its bound is.
   , rigPumpHold ∷ !(TVar Bool)
     -- ^ While set, the native event wait holds, whatever wakes it, as a
     -- platform modal loop inside it does.
@@ -1411,6 +1451,32 @@ setClock rig instant = case rigClock rig of
 clockNow ∷ Rig → IO Instant
 clockNow rig = maybe (throwIO (StandInFailure "the rig has no scripted clock")) readTVarIO (rigClock rig)
 
+-- | Run this inside each later arming of the owner's timer, on the owner's
+-- thread, with the deadline the owner gave it — after the owner read its clock
+-- and before the timer is armed — until it answers 'True'. It is how an
+-- example moves the scripted clock inside the window between the two.
+--
+-- It replaces any hook installed before it, even one running now, which then
+-- leaves this one in place when it answers.
+onTimerArmed ∷ Rig → (Instant → IO Bool) → IO ()
+onTimerArmed rig hook = do
+  key ← newUnique
+  atomically (writeTVar (rigArmHook rig) (Just (key, hook)))
+
+-- | Stop the rig withholding anything an exit needs, from now on (see the
+-- module's account of rescue).
+rescueRig ∷ Rig → IO ()
+rescueRig rig = atomically (writeTVar (rigRescued rig) True)
+
+-- | Whether the rig has been rescued, on its own account or its bound's.
+rescuing ∷ Rig → STM Bool
+rescuing rig = rescuedBy (rigRescued rig) (rigBound rig)
+
+rescuedBy ∷ TVar Bool → Maybe BoundScope → STM Bool
+rescuedBy own bound = do
+  rescued ← readTVar own
+  if rescued then pure True else maybe (pure False) boundRescuing bound
+
 -- | Hold the main thread's next native event wait until 'holdPump' is given
 -- 'False', as a platform modal loop inside the call would; or release it.
 holdPump ∷ Rig → Bool → IO ()
@@ -1436,6 +1502,8 @@ setVisible rig host window shown = do
 
 newRigClocked ∷ Bool → [WindowConfig] → Maybe (TVar Instant) → IO Rig
 newRigClocked visible windows clock = do
+  enclosing ← currentBound
+  rescued ← newTVarIO False
   pumpHold ← newTVarIO False
   heldNow ← newTVarIO False
   visibility ← newTVarIO visible
@@ -1458,7 +1526,10 @@ newRigClocked visible windows clock = do
             held ← readTVarIO pumpHold
             when held $ do
               atomically (writeTVar heldNow True)
-              atomically (readTVar pumpHold >>= check . not)
+              atomically $ do
+                holding ← readTVar pumpHold
+                rescuedNow ← rescuedBy rescued enclosing
+                check (not holding || rescuedNow)
               atomically (writeTVar heldNow False)
             expired ← registerDelay (max 1 (round (bound * 1e6)))
             atomically $
@@ -1498,6 +1569,7 @@ newRigClocked visible windows clock = do
   frameLog ← newTVarIO []
   presentRounds' ← newTVarIO []
   armings ← newTVarIO []
+  armHook ← newTVarIO Nothing
   let defaults = (defaultHostConfig windows) {hostIdleWait = 0.005}
   pure
     Rig
@@ -1520,6 +1592,9 @@ newRigClocked visible windows clock = do
       , rigPresentRounds = presentRounds'
       , rigClock = clock
       , rigArmings = armings
+      , rigArmHook = armHook
+      , rigBound = enclosing
+      , rigRescued = rescued
       , rigPumpHold = pumpHold
       , rigPumpHeld = heldNow
       , rigVisible = visibility
@@ -1535,6 +1610,12 @@ newRigClocked visible windows clock = do
 
 -- | Run a whole Vulkan graphics host under the application runner, on a bound
 -- thread the seam designates as the process main thread.
+--
+-- That bound thread is the one the example's bound cancels, once it has
+-- rescued the rig; and a synchronous failure or the bound's cancellation
+-- escaping the body rescues the rig before the protected teardown begins, so
+-- the teardown completes on the stand-ins' real destruction evidence and the
+-- failure is the run's.
 runRig ∷ Rig → (VulkanHost Scene → RuntimeControl → IO a) → IO a
 runRig rig body = asProcessMainThread (rigSeam rig) (runRigHere rig body)
 
@@ -1543,7 +1624,7 @@ runRigCaught ∷ Rig → (VulkanHost Scene → RuntimeControl → IO a) → IO (
 runRigCaught rig body = asProcessMainThread (rigSeam rig) (try (runRigHere rig body))
 
 runRigHere ∷ Rig → (VulkanHost Scene → RuntimeControl → IO a) → IO a
-runRigHere rig body = do
+runRigHere rig body = myThreadId >>= \self → withBoundThread (rigBound rig) self $ do
   integration ← seamIntegration (rigSeam rig) defaultIntegrationScript
   scene ← prepare ()
   budgets ← either (throwIO . StandInFailure . Text.pack . show) pure (validateBudgets (rigBudgets rig))
@@ -1551,7 +1632,7 @@ runRigHere rig body = do
       config =
         base
           { vulkanRenderer = VulkanRenderer $ \current request construction recorder →
-              readTVarIO (renderingRefusing (rigRendering rig)) >>= \case
+              atomically ((&&) <$> readTVar (renderingRefusing (rigRendering rig)) <*> (not <$> rescuing rig)) >>= \case
                 True → pure (Left (RefusedIllegal (Text.pack "the stand-in renderer refuses this frame")))
                 False → do
                   chosen ← maybe (vulkanRenderer base) id <$> readTVarIO (rigRenderer rig)
@@ -1574,13 +1655,23 @@ runRigHere rig body = do
         Nothing → owner
         Just cell →
           owner
-            { ownerClockTimer = ownerTimer $ \duration → do
+            { ownerClockTimer = ownerTimer $ \due duration → do
                 atomically (modifyTVar' (rigArmings rig) (<> [duration]))
                 record (rigJournal rig) OwnerTimerArmed
-                start ← readTVarIO cell
-                pure $ case addDuration start duration of
-                  Left _ → pure False
-                  Right due → (`deadlineReached` due) <$> readTVar cell
+                installed ← readTVarIO (rigArmHook rig)
+                for_ installed $ \(key, hook) → do
+                  done ← hook due
+                  when done . atomically . modifyTVar' (rigArmHook rig) $ \current →
+                    if fmap fst current == Just key then Nothing else current
+                -- Expiry is the scripted clock reaching the owner's deadline,
+                -- never an interval from a reading of its own: the clock may
+                -- have moved since the owner read it. Rescued, every wait
+                -- comes due at once and moves the clock to its deadline.
+                pure $ do
+                  rescuedNow ← rescuing rig
+                  if rescuedNow
+                    then True <$ modifyTVar' cell (max due)
+                    else (`deadlineReached` due) <$> readTVar cell
             }
   runGraphicsOwnerApplication
     (withLoggingLifetime quietLogger)
@@ -1593,10 +1684,10 @@ runRigHere rig body = do
             (ControllerHooks (\attachment → readTVarIO (rigAfterRefusal rig) >>= ($ attachment)))
             (rigCaptureMode rig)
             (captureLogger rig)
-            (nativeLayer (rigJournal rig) (rigNative rig) (renderingAllocator (rigJournal rig) (rigRendering rig)))
-            (renderingLayers (rigJournal rig) (rigRendering rig) (rigClock rig))
+            (nativeLayer (rescuing rig) (rigJournal rig) (rigNative rig) (renderingAllocator (rigJournal rig) (rigRendering rig)))
+            (renderingLayers (rescuing rig) (rigJournal rig) (rigRendering rig) (rigClock rig))
             instanceAddress
-            (surfaceBridge (rigJournal rig) (rigBridge rig))
+            (surfaceBridge (rescuing rig) (rigJournal rig) (rigBridge rig))
             ( \settings → do
                 session ← seamIntegratedSession (rigSeam rig) integration settings
                 liftIO (atomically (writeTVar (rigSession rig) (Just session)))
@@ -1610,8 +1701,17 @@ runRigHere rig body = do
     )
     vulkanWindowHost
     (\host _ → pure host)
-    body
+    guarded
   where
+    guarded host control = mask $ \restore →
+      tryWithContext (restore (body host control)) >>= \case
+        Right value → pure value
+        Left escaped@(ExceptionWithContext _ raised) → do
+          when (rescuesOn raised) (rescueRig rig)
+          rethrowIO (escaped ∷ ExceptionWithContext SomeException)
+    -- Another cancellation is the example's own, and its teardown keeps
+    -- whatever the example arranged for it.
+    rescuesOn raised = isBoundExpiry raised || not (isJust (fromException raised ∷ Maybe SomeAsyncException))
     keepVerdict ∷ IO (b, DiagnosticVerdict) → IO (b, DiagnosticVerdict)
     keepVerdict action =
       tryWithContext action >>= \case

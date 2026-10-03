@@ -18,23 +18,41 @@ import Control.Concurrent.STM (STM, readTVar, registerDelay)
 import Data.Text (Text)
 import Hetoimasia.Foundation.Log (Component, unsafeComponent)
 import Hetoimasia.Foundation.Messaging.Payload (Prepared)
-import Hetoimasia.Foundation.Time (Duration, durationNanoseconds)
+import Hetoimasia.Foundation.Time (Duration, Instant, durationNanoseconds)
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Operations (GraphicsOperations)
 
 -- | How the owner waits for an absolute instant nothing else will wake it for.
 --
 -- It is injected for the same reason the host's clock is: an example must be
--- able to script when a deadline comes due instead of sleeping for it. The
--- action arms a timer for the duration and answers a transaction that becomes
--- true once it has elapsed.
-newtype OwnerTimer = OwnerTimer (Duration → IO (STM Bool))
+-- able to script when a deadline comes due instead of sleeping for it.
+--
+-- The owner reads its clock once for each arming, and gives the action two
+-- things from that one reading: the deadline it is waiting for, an instant of
+-- the owner's own clock, and the duration that remained until it at that
+-- reading. Both its own wait and its exit drain's wait arm it this way; the
+-- drain's fallback deadline, when the backend names none, is the fallback
+-- interval after the drain's reading. The action arms a timer and answers a
+-- transaction that becomes true once the deadline has come.
+--
+-- A timer that reads a clock decides expiry by comparing that clock with the
+-- deadline it was given. It never reads the clock again to start an interval
+-- of the given duration: the clock may have moved since the owner's reading,
+-- and an interval started from a later reading ends after the owner's
+-- deadline, so the owner sleeps past it. A timer with no clock of its own
+-- uses the duration, as the process's timer does.
+newtype OwnerTimer = OwnerTimer (Instant → Duration → IO (STM Bool))
 
-ownerTimer ∷ (Duration → IO (STM Bool)) → OwnerTimer
+-- | A timer from an action given each arming's deadline and the duration that
+-- remained until it at the owner's reading.
+ownerTimer ∷ (Instant → Duration → IO (STM Bool)) → OwnerTimer
 ownerTimer = OwnerTimer
 
--- | The process's own timer, which is what production uses.
+-- | The process's own timer, which is what production uses: one real-time
+-- delay of the remaining duration, of at least a microsecond. Real time keeps
+-- moving after the owner's reading, so the delay ends at most the time the
+-- owner took to arm it after its deadline.
 realtimeOwnerTimer ∷ OwnerTimer
-realtimeOwnerTimer = OwnerTimer $ \duration →
+realtimeOwnerTimer = OwnerTimer $ \_ duration →
   readTVar <$> registerDelay (max 1 (fromIntegral (durationNanoseconds duration `div` 1000)))
 
 -- | What one graphics owner is built from.

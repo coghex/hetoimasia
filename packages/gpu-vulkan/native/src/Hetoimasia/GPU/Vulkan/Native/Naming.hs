@@ -43,6 +43,7 @@ module Hetoimasia.GPU.Vulkan.Native.Naming
   , commandBufferName
   , framelessPoolName
   , framelessBufferName
+  , framelessFenceName
   , readbackBufferName
   , readbackMemoryName
   , bufferName
@@ -201,6 +202,11 @@ framelessPoolName resource slot = boundedName (resourceText resource <> " comman
 
 framelessBufferName ∷ ResourceId → Natural → ByteString
 framelessBufferName resource slot = boundedName (resourceText resource <> " command buffer frame-less slot " <> shown slot)
+
+-- | A frame-less slot's submission fence (GRS-12), which belongs to the slot
+-- rather than to its storage's resource.
+framelessFenceName ∷ Natural → ByteString
+framelessFenceName slot = boundedName ("frame-less slot " <> shown slot <> " submission fence")
 
 readbackBufferName ∷ ResourceId → ByteString
 readbackBufferName resource = boundedName (resourceText resource <> " readback buffer")

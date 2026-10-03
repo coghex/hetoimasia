@@ -24,7 +24,6 @@ import Data.List (isInfixOf, isPrefixOf, isSubsequenceOf)
 import Data.Maybe (isJust, isNothing)
 import qualified Data.Text as Text
 import Data.Word (Word32, Word64)
-import System.Timeout (timeout)
 
 import Hetoimasia.GLFW.Command (clientDemandPublisher)
 import Hetoimasia.GLFW.Demand (immediateDemand, publishDemand)
@@ -79,36 +78,37 @@ import Hetoimasia.Runtime.GLFW
   , superviseGraphicsOwner
   )
 import Hetoimasia.Runtime.Supervision (RuntimeControl, checkRuntime)
+import Test.GPU.Vulkan.GLFW.Bound (boundOf, boundedIt)
 import Test.GPU.Vulkan.GLFW.StandIn
-import Test.Hspec (Expectation, Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
+import Test.Hspec (Spec, describe, expectationFailure, shouldBe, shouldSatisfy)
 
 spec ∷ Spec
 spec = describe "Vulkan consumer rendering and capture" $ do
   describe "consumer construction" $ do
-    it "describes each frame's format and extent, and binds and draws a pipeline the consumer built in the host's frame" (bounded testConsumerTriangle)
-    it "refuses construction and release off the owner's thread before any native call, buffers and images included" (bounded testOffOwnerThread)
-    it "refuses a pipeline built for another format at its binding, recording nothing of it" (bounded testIncompatibleFormat)
-    it "skips only the frame whose construction was refused or raised with no effect, never calling the renderer again for it, and the session continues" (bounded testRefusedConstruction)
-    it "fails the session through the terminal latch, keeping the loss primary, when a construction loses the device" (bounded testTerminalConstruction)
-    it "keeps a replaced pipeline and its layout while a submitted batch still holds them, and destroys it only on that batch's completion" (bounded testReplacedInFlight)
-    it "ends the owner's run, never answering a refusal, when a replacement's new pipeline cannot be named after it was committed" (bounded testReplacementUnnamed)
+    itBounded "describes each frame's format and extent, and binds and draws a pipeline the consumer built in the host's frame" testConsumerTriangle
+    itBounded "refuses construction and release off the owner's thread before any native call, buffers and images included" testOffOwnerThread
+    itBounded "refuses a pipeline built for another format at its binding, recording nothing of it" testIncompatibleFormat
+    itBounded "skips only the frame whose construction was refused or raised with no effect, never calling the renderer again for it, and the session continues" testRefusedConstruction
+    itBounded "fails the session through the terminal latch, keeping the loss primary, when a construction loses the device" testTerminalConstruction
+    itBounded "keeps a replaced pipeline and its layout while a submitted batch still holds them, and destroys it only on that batch's completion" testReplacedInFlight
+    itBounded "ends the owner's run, never answering a refusal, when a replacement's new pipeline cannot be named after it was committed" testReplacementUnnamed
 
   describe "consumer teardown" $ do
-    it "destroys what the consumer built, pipeline before layout, before the device on the host's normal exit, with a clean verdict" (bounded testNormalTeardown)
-    it "destroys what the consumer built before the device on a terminal exit, with the validation error primary" (bounded testTerminalTeardown)
+    itBounded "destroys what the consumer built, pipeline before layout, before the device on the host's normal exit, with a clean verdict" testNormalTeardown
+    itBounded "destroys what the consumer built before the device on a terminal exit, with the validation error primary" testTerminalTeardown
 
   describe "verification capture" $ do
-    it "leaves a host without capture exactly as before: clipped, no transfer-source usage, and every request refused" (bounded testCaptureOff)
-    it "builds a capturing host's generations unclipped, and transfer sources where the surface offers it" (bounded testCaptureOn)
-    it "copies after the consumer's commands in the same batch, and delivers the bytes once, only after the batch's completion" (bounded testCaptureDelivered)
-    it "delivers nothing for a captured frame the renderer refused, naming why, and destroys its readback buffer" (bounded testCaptureSkipped)
-    it "admits a surface offering no transfer-source usage, presents its frame, and refuses its capture with a typed reason" (bounded testCaptureUnsupported)
-    it "settles a capture outstanding when its target retires, without bytes" (bounded testCaptureRetired)
-    it "refuses a capture once its target's retirement has begun, while that retirement is still owed, and settles the one it already had" (bounded testCaptureWhileRetiring)
-    it "keeps every admitted outcome until it is taken, refusing further requests at the limit as backpressure" (bounded testCaptureBacklog)
-    it "gives a request made from a frame's acquisition report a later frame, never the one already reported" (bounded testCaptureFromAcquisition)
-    it "gives a request admitted while an acquisition is under way a later frame, never the one being acquired" (bounded testCaptureDuringAcquisition)
-    it "settles a presented capture without bytes when the session fails before its completion, naming the primary, and never delivers it" (bounded testCaptureTerminal)
+    itBounded "leaves a host without capture exactly as before: clipped, no transfer-source usage, and every request refused" testCaptureOff
+    itBounded "builds a capturing host's generations unclipped, and transfer sources where the surface offers it" testCaptureOn
+    itBounded "copies after the consumer's commands in the same batch, and delivers the bytes once, only after the batch's completion" testCaptureDelivered
+    itBounded "delivers nothing for a captured frame the renderer refused, naming why, and destroys its readback buffer" testCaptureSkipped
+    itBounded "admits a surface offering no transfer-source usage, presents its frame, and refuses its capture with a typed reason" testCaptureUnsupported
+    itBounded "settles a capture outstanding when its target retires, without bytes" testCaptureRetired
+    itBounded "refuses a capture once its target's retirement has begun, while that retirement is still owed, and settles the one it already had" testCaptureWhileRetiring
+    itBounded "keeps every admitted outcome until it is taken, refusing further requests at the limit as backpressure" testCaptureBacklog
+    itBounded "gives a request made from a frame's acquisition report a later frame, never the one already reported" testCaptureFromAcquisition
+    itBounded "gives a request admitted while an acquisition is under way a later frame, never the one being acquired" testCaptureDuringAcquisition
+    itBounded "settles a presented capture without bytes when the session fails before its completion, naming the primary, and never delivers it" testCaptureTerminal
 
 -- ---------------------------------------------------------------------------
 -- The consumer
@@ -922,11 +922,10 @@ shape = \case
 verdictClean ∷ DiagnosticVerdict → Bool
 verdictClean = null . verdictIssues
 
-bounded ∷ IO () → Expectation
-bounded action =
-  timeout (60 * 1000 * 1000) action >>= \case
-    Just () → pure ()
-    Nothing → expectationFailure "the example did not finish within its bound"
+-- | One example under the suite's fixture-aware bound of a minute
+-- ("Test.GPU.Vulkan.GLFW.Bound").
+itBounded ∷ String → IO () → Spec
+itBounded = boundedIt (boundOf 60)
 
 raisedAs ∷ ∀ e a. Exception e ⇒ Either SomeException a → IO e
 raisedAs = \case

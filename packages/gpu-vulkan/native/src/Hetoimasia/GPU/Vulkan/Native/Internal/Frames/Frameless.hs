@@ -10,8 +10,8 @@
 -- ("Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Progress"), and released on
 -- device loss by "Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Loss".
 --
--- This module creates and destroys frame-less fences and inserts frame-less
--- submission records, in the frames' state
+-- This module creates, names and destroys frame-less fences and inserts
+-- frame-less submission records, in the frames' state
 -- ("Hetoimasia.GPU.Vulkan.Native.Internal.Frames.State"), and records each
 -- batch as submitted with the recording. A scope's own record of the batches
 -- opened and sealed in it lives as long as the scope, on the owner's thread.
@@ -58,6 +58,7 @@ import Hetoimasia.GPU.Model
   , submitFramelessBatch
   )
 import Hetoimasia.GPU.Model.Identity (BatchId, IdentityKind (..), Misuse (..), batchSession)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Acquisition (rollBack)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Layer (FrameOps (..), SubmitBatch (..), WaitStage (..))
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Loss (releaseFramesToDeviceLoss)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.State
@@ -77,7 +78,16 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , owned
   , owner
   )
-import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost, failRootsSessionBecause, rootsCall, rootsSessionIdentity, stateRootsModel)
+import Hetoimasia.GPU.Vulkan.Native.Naming (NativeObjectKind (ObjectFence), framelessFenceName)
+import Hetoimasia.GPU.Vulkan.Native.Roots
+  ( GraphicsDeviceLost
+  , failRootsSessionBecause
+  , nameRootsObject
+  , readRootsInstrumentation
+  , rootsCall
+  , rootsSessionIdentity
+  , stateRootsModel
+  )
 
 -- ---------------------------------------------------------------------------
 -- Scopes
@@ -192,11 +202,23 @@ recordFramelessIn scope consumer =
 -- batch — this session's, frame-less, sealed, held by the model and never
 -- submitted — its slot's live storage, and the model's acceptance, asked of a
 -- copy it then discards. Then, in one masked step, the slot's fence is made
--- if it has none yet, or reset if a submission signalled it, the batch is
--- submitted, and what the call did is recorded, as a frame submission's is:
+-- — and named, when the device offers naming — if it has none yet, or reset
+-- if a submission signalled it, the batch is submitted, and what the call did
+-- is recorded, as a frame submission's is:
 --
 -- * it returned: the model's submission record, the batch recorded as
 --   submitted, and the fence pending;
+-- * the new fence's naming raised: nothing was submitted, and the fence is
+--   destroyed, once. When that returned nothing is recorded for the slot, the
+--   rollback fails nothing itself, and the naming failure is raised with its
+--   own context — as 'GraphicsDeviceLost' if it lost the device, which stays
+--   latched — so a later submission on the slot makes and names a new fence
+--   while the session runs. When the destruction raised too, the fence is
+--   retained as uncertain with its destruction failed, and never passed to
+--   another native call — retirement keeps it, under the device-loss rule
+--   too — the session fails with 'CleanupFailed', and the naming failure is
+--   raised with the destruction's failure retained beside it, as a frame
+--   slot's synchronization rollback retains it;
 -- * the fence's reset raised: nothing was submitted, the fence is retained
 --   as uncertain, and the session fails;
 -- * a specified no-effect failure: nothing is pending and the batch is still
@@ -267,9 +289,14 @@ submitFrameless frames batch =
           -- An out-of-memory creation made nothing, and is recovered once
           -- (VK-14), as a frame slot's fences are.
           fence ← recoveringCreation roots "vkCreateFence" Nothing (rootsCall roots "vkCreateFence" (opsCreateFence ops device))
-          let made = FramelessSync fence FenceIdle Nothing
-          atomically (modifyTVar' (framesFrameless frames) (Map.insert slot made))
-          pure made
+          -- Named once, before it is recorded; a naming that raised is
+          -- rolled back as a frame slot's synchronization is.
+          tryWithContext @SomeException (name slot fence) >>= \case
+            Left failure → rollBack roots ("the fence of frame-less slot " <> Text.pack (show slot)) failure (\() → destroyFence device) (retain slot fence) [((), fence)]
+            Right () → do
+              let made = FramelessSync fence FenceIdle Nothing
+              atomically (modifyTVar' (framesFrameless frames) (Map.insert slot made))
+              pure made
       let fence = framelessFence sync
           edit change = modifyTVar' (framesFrameless frames) (Map.adjust change slot)
       reset ←
@@ -330,6 +357,14 @@ submitFrameless frames batch =
     answered outcome = stateRootsModel roots $ \model → case outcomeModel (submitFramelessBatch batch outcome model) of
       Admitted next → ((), next)
       _ → ((), model)
+
+    name slot fence =
+      readRootsInstrumentation roots >>= \case
+        Nothing → pure ()
+        Just (_, instrumentation) → nameRootsObject roots instrumentation ObjectFence fence (framelessFenceName slot)
+    destroyFence device handle = rootsCall roots "vkDestroyFence" (opsDestroyFence ops device handle)
+    -- A fence whose destruction raised is kept, never destroyed again.
+    retain slot fence reason _ = modifyTVar' (framesFrameless frames) (Map.insert slot (FramelessSync fence (FenceUncertain reason) (Just reason)))
 
 -- ---------------------------------------------------------------------------
 -- Retirement

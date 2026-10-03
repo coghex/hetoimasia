@@ -66,48 +66,51 @@ import Hetoimasia.Runtime.GLFW
   , superviseGraphicsOwner
   )
 import Hetoimasia.Runtime.Supervision (RuntimeControl)
+import Test.GPU.Vulkan.GLFW.Bound (boundOf, boundedIt)
 import Test.GPU.Vulkan.GLFW.StandIn
-import Test.Hspec (Expectation, Spec, describe, expectationFailure, it, shouldBe, shouldReturn, shouldSatisfy)
+import Test.Hspec (Spec, describe, expectationFailure, shouldBe, shouldReturn, shouldSatisfy)
 
 spec ∷ Spec
 spec = describe "Vulkan loop adapter" $ do
   describe "the composed loop" $ do
-    it "publishes each attached window's observation and captured demand, and the owner presents a frame of its own" (bounded testComposedPresent)
-    it "folds the owner's deadline into the main loop's wait, shortening it and never lengthening it" (bounded testDeadlineFolded)
-    it "keeps demand captured before the owner took it, whatever newer demand is published over it" (bounded testDemandKeptUntilTaken)
-    it "serves both parts of demand captured in one turn: one window's now, and another's later deadline once it comes" (bounded testCombinedDemand)
-    it "keeps a redraw the owner took before any target was constructed, and renders it once one is" (bounded testRedrawBeforeTarget)
-    it "keeps a closed window's retirement observable while the owner's step is held and demand waits" (bounded testCloseWhileSaturated)
+    itBounded "publishes each attached window's observation and captured demand, and the owner presents a frame of its own" testComposedPresent
+    itBounded "folds the owner's deadline into the main loop's wait, shortening it and never lengthening it" testDeadlineFolded
+    itBounded "keeps demand captured before the owner took it, whatever newer demand is published over it" testDemandKeptUntilTaken
+    itBounded "serves both parts of demand captured in one turn: one window's now, and another's later deadline once it comes" testCombinedDemand
+    itBounded "keeps a redraw the owner took before any target was constructed, and renders it once one is" testRedrawBeforeTarget
+    itBounded "keeps a closed window's retirement observable while the owner's step is held and demand waits" testCloseWhileSaturated
 
   describe "the owner's pacing" $ do
-    it "keeps a quiet continuous scene with demand out of the idle backoff" (bounded testContinuousDemand)
-    it "backs completion polls off through 5, 10, 20, 40, 80 and 100 ms, and restarts on new demand, an observed completion and a close" (bounded testBackoffSchedule)
-    it "polls no fence on an unrelated early wake, and takes a round whose deadline its work consumed without sleeping again" (bounded testEarlyWakeAndWorkDuration)
-    it "keeps a finite progress deadline for a suspended target, without spinning" (bounded testSuspendedTarget)
-    it "keeps presenting to one target while another's acquisitions cannot be answered" (bounded testBusyTargetFairness)
-    it "tries a frame the renderer refused again at the backoff's first interval, not on every round" (bounded testRefusedFramePaced)
-    it "lets a fresh request supersede a retry still pending, rendering at once" (bounded testFreshRequestSupersedesRetry)
-    it "asks a frame of a generation a target moved to once, so an unrelated wake does not retry it early" (bounded testGenerationAskedOnce)
-    it "renders a quiet target's replacement published in the step that disposed of its only generation, with nothing published" (bounded testQuietReplacementRendered)
-    it "records the replacement a due target is offered as asked, so an unrelated wake does not retry its refused frame early" (bounded testDueTargetReplacementAsked)
+    itBounded "keeps a quiet continuous scene with demand out of the idle backoff" testContinuousDemand
+    itBounded "backs completion polls off through 5, 10, 20, 40, 80 and 100 ms, and restarts on new demand, an observed completion and a close" testBackoffSchedule
+    itBounded "polls no fence on an unrelated early wake, and takes a round whose deadline its work consumed without sleeping again" testEarlyWakeAndWorkDuration
+    itBounded "keeps a finite progress deadline for a suspended target, without spinning" testSuspendedTarget
+    itBounded "keeps presenting to one target while another's acquisitions cannot be answered" testBusyTargetFairness
+    itBounded "tries a frame the renderer refused again at the backoff's first interval, not on every round" testRefusedFramePaced
+    itBounded "lets a fresh request supersede a retry still pending, rendering at once" testFreshRequestSupersedesRetry
+    itBounded "asks a frame of a generation a target moved to once, so an unrelated wake does not retry it early" testGenerationAskedOnce
+    itBounded "renders a quiet target's replacement published in the step that disposed of its only generation, with nothing published" testQuietReplacementRendered
+    itBounded "records the replacement a due target is offered as asked, so an unrelated wake does not retry its refused frame early" testDueTargetReplacementAsked
+    itBounded "wakes at its published deadline when the clock reaches it between the owner's reading and its timer's arming" testWakeAcrossArming
+    itBounded "wakes its exit drain at a deadline the clock reaches between the drain's reading and its timer's arming" testDrainWakeAcrossArming
 
   describe "hiding a presenting window (#357)" $ do
-    it "makes the hide's native call only once the presentation in flight has returned, keeps the other target presenting, keeps the old swapchain while its presentations are unretired, and resumes the shown window on a replacement" (bounded testHideWhilePresenting)
-    it "makes the native call of a hide whose window's target is suspended while another target's presentation holds, waiting for no step" (bounded testHideSuspendedWhileOtherPresents)
+    itBounded "makes the hide's native call only once the presentation in flight has returned, keeps the other target presenting, keeps the old swapchain while its presentations are unretired, and resumes the shown window on a replacement" testHideWhilePresenting
+    itBounded "makes the native call of a hide whose window's target is suspended while another target's presentation holds, waiting for no step" testHideSuspendedWhileOtherPresents
 
   describe "hiding a presenting window directly, through a lent window (#368)" $ do
-    it "makes the direct hide's native call only once the presentation in flight has returned, presents nothing to the hidden window, and resumes it on a replacement" (bounded testDirectHideWhilePresenting)
-    it "withdraws and replaces the generation of a window hidden and shown directly wholly between two owner steps" (bounded testDirectHideShowBetweenSteps)
+    itBounded "makes the direct hide's native call only once the presentation in flight has returned, presents nothing to the hidden window, and resumes it on a replacement" testDirectHideWhilePresenting
+    itBounded "withdraws and replaces the generation of a window hidden and shown directly wholly between two owner steps" testDirectHideShowBetweenSteps
 
   describe "a stalled main thread" $ do
-    it "keeps the owner rendering while the native event call is held, and serves a window command once it returns" (bounded testStalledMainThread)
-    it "keeps the owner rendering and rebuilding through a live resize that never pauses while the native event call is held" (bounded testStalledLiveResize)
+    itBounded "keeps the owner rendering while the native event call is held, and serves a window command once it returns" testStalledMainThread
+    itBounded "keeps the owner rendering and rebuilding through a live resize that never pauses while the native event call is held" testStalledLiveResize
 
   describe "status and exit" $ do
-    it "brings a presentation's device loss to the application's next checkpoint" (bounded testLossAtCheckpoint)
-    it "waits for owed presentations in the exit drain, retires in dependency order, and leaves no worker awaiting the ended loop" (bounded testExitWithOwedPresentations)
-    it "keeps the exit drain waiting on its own deadlines once a demand deadline no frame can serve has passed" (bounded testDrainPastDemand)
-    it "keeps the exit drain waiting on its own deadlines once a closing target's settling replacement is past due" (bounded testDrainPastSettling)
+    itBounded "brings a presentation's device loss to the application's next checkpoint" testLossAtCheckpoint
+    itBounded "waits for owed presentations in the exit drain, retires in dependency order, and leaves no worker awaiting the ended loop" testExitWithOwedPresentations
+    itBounded "keeps the exit drain waiting on its own deadlines once a demand deadline no frame can serve has passed" testDrainPastDemand
+    itBounded "keeps the exit drain waiting on its own deadlines once a closing target's settling replacement is past due" testDrainPastSettling
 
 -- ---------------------------------------------------------------------------
 -- The composed loop
@@ -297,6 +300,75 @@ testBackoffSchedule = do
   afterDemand `shouldBe` map millis [5, 10]
   afterCompletion `shouldBe` millis 5
   afterClose `shouldSatisfy` (<= millis 5)
+
+-- | The lost-wake window in the owner's wait. The owner publishes its next
+-- deadline, reads the clock, and only then arms its timer; here the scripted
+-- clock reaches that deadline inside the arming, after the reading. The owner
+-- still wakes at the deadline and takes its poll, because its timer compares
+-- the clock with the deadline it was given. A timer that measured the
+-- remaining duration from a reading of its own would wait that duration
+-- beyond the deadline, with nothing left to move the clock, and the owner
+-- would sleep for ever.
+testWakeAcrossArming ∷ IO ()
+testWakeAcrossArming = do
+  rig ← scriptedRigOf 1
+  presentationsRetire rig False
+  moved ← newTVarIO Nothing
+  (published, due, next) ← runRig rig $ \host control → do
+    [window] ← windowsOf host
+    _ ← firstFrame rig host control window
+    let owner = vulkanGraphicsOwner host
+    first ← awaitAnchoredAfterPresent rig host
+    -- The next arming for a deadline still ahead of the clock: the poll after
+    -- this one, armed once the poll at the first deadline has been taken.
+    onTimerArmed rig $ \armed → do
+      now ← clockNow rig
+      if armed <= now
+        then pure False
+        else do
+          status ← atomically (readOwnerStatusNow owner)
+          setClock rig armed
+          atomically (writeTVar moved (Just (statusNextDeadline status, armed)))
+          pure True
+    setClock rig first
+    (published, due) ← atomically (readTVar moved >>= maybe retry pure)
+    next ← awaitDeadlineAfter host due
+    letExitFinish rig
+    pure (published, due, next)
+  published `shouldBe` Just due
+  next `shouldSatisfy` (> due)
+
+-- | The same window in the exit drain's wait. Once the owner is retiring with
+-- a presentation still owed, the clock reaches the deadline of the drain's
+-- next arming inside it, after the drain's reading. The drain still wakes at
+-- that deadline, asks again, and arms for a later one.
+testDrainWakeAcrossArming ∷ IO ()
+testDrainWakeAcrossArming = do
+  rig ← scriptedRigOf 1
+  presentationsRetire rig False
+  moved ← newTVarIO Nothing
+  paced ← newTVarIO False
+  runRig rig $ \host control → do
+    [window] ← windowsOf host
+    _ ← firstFrame rig host control window
+    let owner = vulkanGraphicsOwner host
+    onTimerArmed rig $ \armed → do
+      phase ← statusPhase <$> atomically (readOwnerStatusNow owner)
+      now ← clockNow rig
+      if phase /= OwnerRetiring || armed <= now
+        then pure False
+        else do
+          setClock rig armed
+          armings ← length <$> readTVarIO (rigArmings rig)
+          atomically (writeTVar moved (Just armings))
+          pure True
+    _ ← forkIO $ do
+      armings ← atomically (readTVar moved >>= maybe retry pure)
+      atomically (readTVar (rigArmings rig) >>= check . (> armings) . length)
+      atomically (writeTVar paced True)
+      letExitFinish rig
+    pure ()
+  readTVarIO paced `shouldReturn` True
 
 testEarlyWakeAndWorkDuration ∷ IO ()
 testEarlyWakeAndWorkDuration = do
@@ -1466,11 +1538,10 @@ activeSwapchain host service = do
     handle : _ → pure handle
     [] → failWith "the target's active generation has no swapchain"
 
-bounded ∷ IO () → Expectation
-bounded action =
-  timeout (60 * 1000 * 1000) action >>= \case
-    Just () → pure ()
-    Nothing → expectationFailure "the example did not finish within its bound"
+-- | One example under the suite's fixture-aware bound of a minute
+-- ("Test.GPU.Vulkan.GLFW.Bound").
+itBounded ∷ String → IO () → Spec
+itBounded = boundedIt (boundOf 60)
 
 raisedAs ∷ ∀ e a. Exception e ⇒ Either SomeException a → IO e
 raisedAs = \case
