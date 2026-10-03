@@ -1381,8 +1381,10 @@ the consumer's `PassStart`:
 
 Before any native call the handle must be this session's (otherwise
 `RefusedMisuse ForeignIdentity`), live (a released or stale one is
-`RefusedMisuse WrongPhase`), and a `ColorTarget` (otherwise
-`RefusedWrongKind`); no pass may be open; and a `ClearTarget` pass into a
+`RefusedMisuse WrongPhase`), a `ColorTarget` (otherwise
+`RefusedWrongKind`), and of one mip level: a dynamic-rendering attachment's
+view must cover exactly one, and the target's owned view covers every level,
+so a target of more than one is `RefusedUnsupported`. No pass may be open; and a `ClearTarget` pass into a
 target that awaits initialization, or into one another batch is still
 initializing, is `RefusedUninitialized`. The batch retains the target before
 its barrier and the pass are recorded. `endRendering` ends either kind of pass,
@@ -1438,7 +1440,7 @@ by its batch, and destroyed only once that batch's holds have ended.
 **Proof.** The stand-in suite (`Test.GPU.Vulkan.Native.Offscreen`) renders into
 a target and copies it in both batch kinds, checks pipeline, viewport and
 scissor state left from the frame's pass against a target of another format
-and extent, and covers every refusal above, the seal's refusal of a target left
+and extent, and covers every refusal above, a target of two mip levels included, the seal's refusal of a target left
 in its transfer-source use, a discarded copy and an unrelated completion
 exposing nothing, and initialization published only by submission. The
 surface-free native case `grs5-offscreen` clears an `R8G8B8A8_SRGB` target and
