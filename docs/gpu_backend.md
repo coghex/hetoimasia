@@ -1708,8 +1708,10 @@ it does not support — a nested push-constant struct, a matrix or array vertex
 input, a texel buffer, an input attachment, a vertex input starting past its
 location's first component — is an error naming it, never an empty or a
 matching interface; so is an interface naming an id the module defines no
-variable for, and a descriptor variable lacking its `DescriptorSet` or
-`Binding`. Push-constant extents are computed without bound, so a
+variable for, a descriptor variable lacking its `DescriptorSet` or `Binding`, a
+buffer whose element is not a defined struct decorated as its storage class
+requires, and a combined image sampler over anything but a defined, sampled
+image of a supported dimension. Push-constant extents are computed without bound, so a
 member reaching beyond what 32 bits can hold is refused rather than wrapped,
 and `checkedRanges` refuses such members in a description the same way
 (`RefusedOutOfBounds`).
@@ -1758,8 +1760,9 @@ matrix, vector and array and its inputs, but not its built-in or varying; every
 descriptor kind with a fixed and a runtime-sized array; refusals of a nested
 push-constant struct, a matrix input, an input attachment, a push-constant
 member beyond 32 bits, an interface naming an undefined id, a component-offset
-vertex input, descriptors stripped of their set and binding, and malformed
-modules; and no interface in
+vertex input, descriptors stripped of their set and binding, buffers stripped of
+their struct or `Block`, a combined image sampler over an undefined image, and
+malformed modules; and no interface in
 the interface-free verification pair. Matching checked shaders in the source
 and file forms, with vertex and instance host layouts and fixed and
 runtime-sized arrays, compile with the suite. External clients, each compiled
