@@ -38,7 +38,12 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Recorder
   , draw
   , copyToReadback
   , copyTargetToReadback
+  , copyLevelToReadback
   , readbackBytesFor
+
+    -- * Upload copies (GRS-6), for the session's uploads alone
+  , UploadCopy (..)
+  , recordUploadCopies
 
     -- * Push constants, vertex input and the ring (GRS-4)
   , pushConstants
@@ -61,12 +66,13 @@ import Data.List (nub, sortOn)
 import Data.Foldable (for_)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (isJust, isNothing)
+import Data.Maybe (fromMaybe, isJust, isNothing)
+import qualified Data.Set as Set
 import qualified Data.Text as Text
 import Data.Word (Word32, Word64)
 import Numeric.Natural (Natural)
 
-import Hetoimasia.GPU.Model.Access (BatchAccess, Barrier (..), BarrierRole (EntryBarrier), Contents (..), ResourceKind (..), ResourceUse (..), TransitionSource (..), emptyAccess)
+import Hetoimasia.GPU.Model.Access (BatchAccess, Barrier (..), BarrierRole (EntryBarrier), Contents (..), ResourceKind (..), ResourceUse (..), TransitionSource (..), emptyAccess, restingUse)
 import qualified Hetoimasia.GPU.Model.Access as Access
 import Hetoimasia.GPU.Model
   ( FramePhase (..)
@@ -133,6 +139,12 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   , nativeName
   , resourceBarrier
   , supportedTransition
+  , BarrierObject (..)
+  , formatBlock
+  , levelBytes
+  , levelExtent
+  , useLayout
+  , useScope
   )
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   ( BatchRecord (..)
@@ -558,7 +570,19 @@ orderedSequence
   ∷ Recorder q inst msgr phys dev cmd
   → (RecorderState → Either Refusal (RecorderState, [ResourceId], [(ResourceId, Contents)], [NativeCommand]))
   → IO (Either Refusal ())
-orderedSequence recorder decide =
+orderedSequence = orderedSequenceAs False
+
+-- | 'orderedSequence', for an upload's own command when the flag is set
+-- (GRS-6): every other command is refused, as 'RefusedUninitialized', a
+-- reference to the target of an upload still settling, in the same
+-- transaction that would retain it, since its contents are not yet the
+-- upload's and no batch but the upload's may use it.
+orderedSequenceAs
+  ∷ Bool
+  → Recorder q inst msgr phys dev cmd
+  → (RecorderState → Either Refusal (RecorderState, [ResourceId], [(ResourceId, Contents)], [NativeCommand]))
+  → IO (Either Refusal ())
+orderedSequenceAs uploading recorder decide =
   owned recording $
     readIORef (recorderOpen recorder) >>= \case
       False → pure (Left RefusedRecorderClosed)
@@ -570,7 +594,11 @@ orderedSequence recorder decide =
             retained ←
               if null references
                 then pure (Right ())
-                else atomically (retain roots batch (unique references) entries)
+                else atomically $ do
+                  held ← readTVar (recordingUploading recording)
+                  if not uploading && any (`Set.member` held) references
+                    then pure (Left RefusedUninitialized)
+                    else retain roots batch (unique references) entries
             case retained of
               Left refusal → pure (Left refusal)
               Right () → do
@@ -969,15 +997,25 @@ drawIndexed recorder indices instances =
           Right (state {stateFrozen = frozen <> stateFrozen state}, CommandDrawIndexed indices instances)
 
 -- | The largest index an indexed draw of this many indices would read, when
--- its index data is a ring region whose bytes the recording can read: read
--- from the ring's mapping, which only this batch has written since the region
--- was claimed. 'Nothing' for index data in a managed buffer, for none, and for
--- a draw reading more than is bound, which its own checks refuse.
+-- its index data is bytes the recording can read: a ring region, read from
+-- the ring's mapping, which only this batch has written since the region was
+-- claimed; or a managed index buffer an upload filled (GRS-6), read from what
+-- that upload wrote, which nothing can change afterwards. 'Nothing' for any
+-- other managed index buffer, for none, and for a draw reading more than is
+-- bound, which its own checks refuse.
 largestIndex ∷ Recorder q inst msgr phys dev cmd → Word32 → IO (Maybe Integer)
 largestIndex recorder indices = do
   state ← readIORef (recorderState recorder)
   ring ← readTVarIO (recordingRing (recorderRecording recorder))
+  uploaded ← readTVarIO (recordingIndexData (recorderRecording recorder))
   case (stateIndex state, ring) of
+    (Just (kind, held), _)
+      | Nothing ← boundClaim held
+      , Just contents ← Map.lookup (boundResource held) uploaded
+      , needed ← fromIntegral indices * indexTypeBytes kind
+      , needed <= boundBytes held
+      , indices > 0 →
+          pure (Just (maximum (decodeIndices kind (ByteString.take (fromIntegral needed) (ByteString.drop (fromIntegral (boundOffset held)) contents)))))
     (Just (kind, held), Just held')
       | Just number ← boundClaim held
       , fmap claimRecordBatch (Map.lookup number (ringClaims held')) == Just (recorderBatch recorder)
@@ -1095,7 +1133,7 @@ readbackBytesFor extent = fromIntegral (extentWidth extent) * fromIntegral (exte
 copyToReadback ∷ Recorder q inst msgr phys dev cmd → Readback → IO (Either Refusal ())
 copyToReadback recorder readback =
   withImage recorder $ \frame →
-    copyInto recorder readback (frameImageExtent frame) (if frameImageCapturable frame then Nothing else Just (RefusedUnsupported "a copy from an image its generation did not make a transfer source")) $ \state buffer →
+    copyInto recorder readback (readbackBytesFor (frameImageExtent frame)) (if frameImageCapturable frame then Nothing else Just (RefusedUnsupported "a copy from an image its generation did not make a transfer source")) $ \state buffer →
       if stateLayout state /= LayoutTransferSource
         then Left (RefusedIllegal ("copying an image that is " <> tshow (stateLayout state)))
         else Right (state, [], [], [CommandCopyImageToBuffer (frameImageHandle frame) (frameImageExtent frame) buffer])
@@ -1120,7 +1158,7 @@ copyTargetToReadback recorder (Image resource) readback =
                 kind = imageResourceKind ColorTarget
                 object = memoryResource memory
                 image = Just (useAspect (imageKindUse ColorTarget), imageMipLevels description)
-             in copyInto recorder readback extent Nothing $ \state buffer →
+             in copyInto recorder readback (readbackBytesFor extent) Nothing $ \state buffer →
                   case Access.touch resource kind TransferRead KeepsContents (stateAccess state) of
                     Left refusal → Left (accessRefused refusal)
                     Right (access, barriers) →
@@ -1137,25 +1175,65 @@ copyTargetToReadback recorder (Image resource) readback =
   where
     recording = recorderRecording recorder
 
--- | Copy an image of this extent into the readback buffer: the buffer's own
--- checks, the decision that records the copy, and after it the barrier that
--- makes the write visible to host reads. One writer at a time: a buffer
+-- | Copy one whole mip level of a managed texture (GRS-6) into the readback
+-- buffer, and make the write visible to host reads, as 'copyTargetToReadback'
+-- does a color target: for verifying what an upload wrote. The texture must be
+-- this session's, live, a 'TextureImage', and in its transfer-source use
+-- within the batch — an explicit transition out of its shader-read use; the
+-- level must be one it has (otherwise 'RefusedOutOfBounds', naming the level
+-- count it would need and the one it has); and the buffer must hold the level
+-- tightly packed in its format's blocks — four bytes a texel for RGBA8, sixteen
+-- a four-by-four block for BC7, a partial block at an edge counted whole.
+-- The batch retains both, and the buffer's bytes are exposed only once that
+-- batch's submission has completed. A refusal makes no native call.
+copyLevelToReadback ∷ Recorder q inst msgr phys dev cmd → Image → Word32 → Readback → IO (Either Refusal ())
+copyLevelToReadback recorder (Image resource) level readback =
+  owned recording $
+    liveNative recording resource >>= \case
+      Left refusal → pure (Left refusal)
+      Right (NativeImage description memory _)
+        | imageKind description /= TextureImage → pure (Left RefusedWrongKind)
+        | level >= imageMipLevels description → pure (Left (RefusedOutOfBounds (fromIntegral level + 1) (fromIntegral (imageMipLevels description))))
+        | Just block ← formatBlock (imageFormat description) →
+            let (width, height) = levelExtent (imageWidth description) (imageHeight description) level
+                kind = imageResourceKind TextureImage
+                object = memoryResource memory
+                image = Just (useAspect (imageKindUse TextureImage), imageMipLevels description)
+             in copyInto recorder readback (levelBytes block (width, height)) Nothing $ \state buffer →
+                  case Access.touch resource kind TransferRead KeepsContents (stateAccess state) of
+                    Left refusal → Left (accessRefused refusal)
+                    Right (access, barriers) →
+                      Right
+                        ( state {stateAccess = access, stateObjects = Map.insert resource (object, image) (stateObjects state)}
+                        , [resource]
+                        , [ (resource, if barrierDiscards barrier then DiscardsContents else KeepsContents)
+                          | barrier ← barriers
+                          , barrierRole barrier == EntryBarrier
+                          ]
+                        , map (resourceBarrier object image) barriers <> [CommandCopyImageLevelToBuffer object level width height buffer]
+                        )
+      Right _ → pure (Left RefusedWrongKind)
+  where
+    recording = recorderRecording recorder
+
+-- | Copy this many bytes of an image into the readback buffer: the buffer's
+-- own checks, the decision that records the copy, and after it the barrier
+-- that makes the write visible to host reads. One writer at a time: a buffer
 -- another batch — or an earlier copy in this one — or a submission still
 -- holds would be written again with no ordering between the two writes, and
 -- its contents misattributed.
 copyInto
   ∷ Recorder q inst msgr phys dev cmd
   → Readback
-  → SurfaceExtent
+  → Natural
   → Maybe Refusal
   → (RecorderState → Word64 → Either Refusal (RecorderState, [ResourceId], [(ResourceId, Contents)], [NativeCommand]))
   → IO (Either Refusal ())
-copyInto recorder (Readback readback) extent refused decide =
+copyInto recorder (Readback readback) needed refused decide =
   liveNative recording readback >>= \case
     Left refusal → pure (Left refusal)
     Right (NativeReadback allocation _) → do
-      let needed = readbackBytesFor extent
-          unfit
+      let unfit
             | Just refusal ← refused = Just refusal
             | needed > allocationSize allocation = Just (RefusedOutOfBounds needed (allocationSize allocation))
             | otherwise = Nothing
@@ -1184,6 +1262,78 @@ copyInto recorder (Readback readback) extent refused decide =
     Right _ → pure (Left RefusedWrongKind)
   where
     recording = recorderRecording recorder
+
+-- ---------------------------------------------------------------------------
+-- Upload copies (GRS-6)
+
+-- | One copy an upload records out of the staging ring: bytes into a buffer —
+-- where they start in the staging buffer, where they go in the target, and
+-- how many — or a band of whole block rows of one mip level of an image —
+-- where the band starts in the staging buffer, the level, its first texel row,
+-- and its width and height in texels.
+data UploadCopy
+  = CopyBytes !Natural !Natural !Natural
+  | CopyRows !Natural !Word32 !Word32 !Word32 !Word32
+  deriving (Eq, Show)
+
+-- | Record one upload's copies into this batch (GRS-6): only the session's
+-- uploads call this, for a target whose upload holds it, which no other
+-- batch may use ('orderedSequenceAs').
+--
+-- The target is entered — its contents discarded on its upload's first
+-- copies, the touch that initializes an image, and kept afterwards — and
+-- retained with the staging buffer, in the same transaction, before any
+-- native call. The copies record their own barriers, outside the batch's
+-- accesses, since the target rests in its transfer-destination use between
+-- an upload's batches (D-30) rather than in its kind's resting use:
+--
+-- * the staging buffer's entry and exit barriers, in its resting
+--   transfer-read use;
+-- * the target's entry barrier — from its kind's resting scope, discarding,
+--   on the upload's first copies, and otherwise from the transfer write it
+--   rests in — then the copies, then its exit barrier: into its kind's resting
+--   use on the upload's final copies, and otherwise back into the transfer
+--   write it rests in until the next batch.
+recordUploadCopies
+  ∷ Recorder q inst msgr phys dev cmd
+  → ResourceId
+  → Word64
+  → ResourceKind
+  → Maybe (Word32, Word32)
+  → ResourceId
+  → Word64
+  → Bool
+  → Bool
+  → [UploadCopy]
+  → IO (Either Refusal ())
+recordUploadCopies recorder target object kind image staging buffer first final copies =
+  orderedSequenceAs True recorder $ \state →
+    if isJust (stateRendering state)
+      then Left (RefusedIllegal "an upload copy inside rendering")
+      else
+        Right
+          ( state
+          , [target, staging]
+          , [(target, if first then DiscardsContents else KeepsContents), (staging, KeepsContents)]
+          , [stagingBarrier, entry] <> map copy copies <> [exit, stagingBarrier]
+          )
+  where
+    resting = restingUse kind
+    writing = useScope kind TransferWrite
+    layout = fromMaybe 0 . useLayout
+    barrier from to (fromLayout, toLayout) =
+      CommandResourceBarrier (maybe (BarrierBuffer object) (\(aspect, levels) → BarrierImage object aspect levels fromLayout toLayout) image) from to
+    entry
+      | first = barrier (useScope kind resting) writing (0, layout TransferWrite)
+      | otherwise = barrier writing writing (layout TransferWrite, layout TransferWrite)
+    exit
+      | final = barrier writing (useScope kind resting) (layout TransferWrite, layout resting)
+      | otherwise = barrier writing writing (layout TransferWrite, layout TransferWrite)
+    stagingScope = useScope StagingResource TransferRead
+    stagingBarrier = CommandResourceBarrier (BarrierBuffer buffer) stagingScope stagingScope
+    copy = \case
+      CopyBytes from to count → CommandCopyBuffer buffer (fromIntegral from) object (fromIntegral to) (fromIntegral count)
+      CopyRows from level row width height → CommandCopyBufferToImage buffer (fromIntegral from) object level row width height
 
 -- ---------------------------------------------------------------------------
 -- Push constants, vertex input and the ring (GRS-4)

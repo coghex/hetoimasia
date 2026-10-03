@@ -1707,21 +1707,67 @@ under their stride; a vertex shader's inputs that are not built-ins, by
 location and scalar or vector type; and each descriptor's set, binding, kind and
 count. A fragment shader's inputs and outputs and a vertex shader's outputs are
 varyings, which the validation layer checks at pipeline creation, and built-ins
-are the device's: it reports neither. A module it cannot read, or a construct
-it does not support — a nested push-constant struct, a matrix or array vertex
-input, a texel buffer, an input attachment, a vertex input starting past its
-location's first component — is an error naming it, never an empty or a
-matching interface; so is an interface naming an id the module defines no
-variable for, any type an interface variable reaches — through pointers,
-struct members, array elements and lengths, vector components, matrix columns,
-image sampled types and sampled images' images — that the module does not
-define or defines malformed, a descriptor variable lacking its `DescriptorSet`
-or `Binding`, a
-buffer whose element is not a defined struct decorated as its storage class
-requires, and a combined image sampler over anything but a defined, sampled
-image of a supported dimension. Push-constant extents are computed without bound, so a
-member reaching beyond what 32 bits can hold is refused rather than wrapped,
-and `checkedRanges` refuses such members in a description the same way
+are the device's: it reports neither.
+
+Before it reads anything, the reader checks every instruction it consumes
+against one explicit whitelist, the subset it supports:
+
+- the module's header bounds every id it declares, and its one entry point has
+  a model, a function, a name terminated and zero-padded within the
+  instruction, and no interface id listed twice;
+- every decoration of a kind it reads — Block, BufferBlock, RowMajor,
+  ColMajor, ArrayStride, MatrixStride, BuiltIn, Location, Component, Binding,
+  DescriptorSet, Offset — decorates a declared type, constant or variable, or a
+  member a declared struct has; carries exactly the literals its kind takes;
+  is not given twice to one target or member; has a positive stride where it is
+  one; is never RowMajor and ColMajor on one member; and is never BuiltIn
+  together with Location or Component, which is refused before any built-in is
+  left out of what the host declares. No missing literal stands for a default;
+- each interface variable's `OpVariable` has three operands, or four with an
+  initializer, which only Output and Private variables take, and which must be
+  a constant of the variable's own type, declared before it and naming a type
+  declared before itself: a boolean, a
+  scalar of as many words as its width, a null, or a composite of as many
+  constituents as its type has, each a constant of its constituent's type;
+- each variable's storage class is one it knows — UniformConstant, Input,
+  Uniform, Output, Workgroup, Private, PushConstant or StorageBuffer — and its
+  type is an `OpTypePointer` of that same storage class;
+- every id an instruction names resolves to a type or constant declared before
+  that instruction, so forward references, self-references and cycles are
+  refused, and no id is declared twice;
+- every id names the kind its position requires: a pointer's pointee is a type
+  other than void or a pointer; an array's or runtime array's element is a
+  sized or opaque type; a struct's members are sized types, with a runtime
+  array only as the last; a vector's component is a scalar; a matrix's column
+  is a float vector; an image's sampled type is a 32-bit float or a 32- or
+  64-bit integer; a sampled image's image is an image; and an array's length is
+  an `OpConstant` of a 32-bit integer type with a positive value;
+- every instruction has exactly the operands its opcode takes, with literals in
+  range: integer widths of 8, 16, 32 or 64 and signedness 0 or 1, float widths
+  of 16, 32 or 64, vectors of 2–4 components, matrices of 2–4 columns, image
+  operands within their enumerations, and a known pointer storage class;
+- nothing an Input, Output, Uniform, PushConstant or StorageBuffer variable
+  reaches is a boolean or an opaque type, unless the variable or the struct
+  member reaching it is a built-in — gl_FrontFacing and gl_HelperInvocation
+  are booleans the device supplies;
+- every Uniform, StorageBuffer and PushConstant block has the explicit layout
+  it requires, from its struct down through a descriptor array of blocks:
+  every struct member an Offset, every array and runtime-sized array an
+  ArrayStride, and every matrix member, or array of them, a MatrixStride and
+  RowMajor or ColMajor.
+
+The first instruction that fails is an error naming it, the rule it breaks and
+the variable that reaches it. A module the reader cannot read, or a supported
+shape it does not read — a nested push-constant struct, a matrix or array
+vertex input, a texel buffer, an input attachment, a vertex input starting past
+its location's first component — is likewise an error naming it, never an
+empty or a matching interface. So are an interface naming an id the module
+defines no variable for, a descriptor variable lacking its `DescriptorSet` or
+`Binding`, a buffer whose struct is not decorated as its storage class
+requires, and a combined image sampler over an image that is not sampled or
+not of a supported dimension. Push-constant extents are computed without
+bound, so a member reaching beyond what 32 bits can hold is refused rather than
+wrapped, and `checkedRanges` refuses such members in a description the same way
 (`RefusedOutOfBounds`).
 
 **The checked splices.** `checkedVertexShader` and `checkedFragmentShader` take
@@ -1769,8 +1815,14 @@ descriptor kind with a fixed and a runtime-sized array; refusals of a nested
 push-constant struct, a matrix input, an input attachment, a push-constant
 member beyond 32 bits, an interface naming an undefined id, a component-offset
 vertex input, descriptors stripped of their set and binding, buffers stripped of
-their struct or `Block`, a combined image sampler over an undefined image, and
-malformed modules; and no interface in
+their `Block`, and malformed modules; and, in `Test.Shader.Malformed`, one
+rejecting mutation of a valid fixture for every whitelist rule — types,
+constants, decorations, layout, variable declarations, the entry point and the
+id bound — with a too-many and a too-few operand count for every fixed-count
+opcode, and an Output variable with a null initializer of its own type read
+exactly as without one; a fragment shader reading gl_FrontFacing and
+gl_HelperInvocation read as interface-free from its compiled fixture and
+through an unchecked splice; and no interface in
 the interface-free verification pair. Matching checked shaders in the source
 and file forms, with vertex and instance host layouts and fixed and
 runtime-sized arrays, compile with the suite. External clients, each compiled
@@ -1842,8 +1894,9 @@ decides the request, in this order:
 5. It must be fresh (`UploadNotFresh`):
    - a texture the model still records as uninitialized, so neither one
      already initialized nor one another batch is initializing;
-   - a buffer that no upload has been admitted into, and that no recorded or
-     submitted batch still holds.
+   - a buffer that no upload has been admitted into — through any uploads
+     over the recording, which keeps that set (`recordingFilled`) — and that
+     no recorded or submitted batch still holds.
 6. The bytes must initialize the target exactly (`UploadMalformed`, saying
    what differs). A texture needs every level it declares, each the size its
    format's blocks and that level's extent need (`levelBytes`). A buffer needs
@@ -1869,11 +1922,14 @@ so the caller's bytes are free when admission returns. The copy runs
 interruptibly; if it raises or is cancelled, every reservation is given back
 and the exception is re-raised. If the owner's exit began during the copy, the
 reservations are given back too and the answer is `UploadClosed`. Otherwise the
-upload is queued. The window integration's `submitVulkanUpload` first refuses
-as an owner-thread action is refused: once the session has failed, with its
-primary, or once the owner's admission has closed. Its wake asks whether an
-upload is waiting (`uploadsWaiting`), so admission makes an idle owner
-runnable.
+upload is queued. `submitUploadGated` reads a caller's gate in both
+transactions, the one that reserves and the one that queues: a refusal in
+either gives every reservation back. The window integration's
+`submitVulkanUpload` gates on the owner's own admission, so it refuses as an
+owner-thread action is refused — once the session has failed, with its
+primary, or once the owner's admission has closed — and no upload is queued
+after quiescence closes the owner. Its wake asks whether an upload is waiting
+(`uploadsWaiting`), so admission makes an idle owner runnable.
 
 **The exclusive target.** From admission until its upload settles, a target
 belongs to the upload alone. Every other batch's ordered use of it is
@@ -1890,7 +1946,9 @@ window integration calls it once per owner step, after the step's fence poll,
 so an upload whose final batch that poll observed complete settles in the same
 step. Each call:
 
-1. After the device's loss, settles every unsettled upload as lost.
+1. After the device's loss, settles every unsettled upload as lost, except
+   one whose caller is still copying its bytes into staging: its region stays
+   that caller's until it finishes, and the upload is lost on a later turn.
 2. Observes each batch in flight:
    - one complete moves its upload on, or completes the upload if it carried
      the final copies;
@@ -1901,7 +1959,15 @@ step. Each call:
 4. Records the next copies of every queued or uploading upload that has
    copies left and no batch in flight. It takes them in admission order, into
    one frame-less batch, up to the turn's budget, while admission is open and
-   the session is running:
+   the session is running. The transaction that plans the turn also claims
+   each planned upload, so no cancellation, close or release can settle it,
+   freeing its staging, while its copies are recorded and submitted. One
+   transaction after the submission publishes each carried upload's flight,
+   cursor and ticket as it releases that upload's claim, so a submitted copy's
+   staging is never left unheld in between; an upload whose copies no
+   submitted batch carries — the batch refused, discarded, or its recording
+   refused — releases its claim without a flight. A recording that raised
+   leaves its uploads claimed, their staging held until retirement:
    - a texture's copies are whole block rows of one level at a time
      (`CommandCopyBufferToImage`), so a BC7 level's last, partial block row
      reaches the level's edge;
@@ -1948,16 +2014,20 @@ nothing and completes nothing. It is `RefusedOwnerWait` on the owner's thread,
 whose own progress the upload needs.
 
 **Cancellation.** `cancelUpload` runs on any thread, in STM, and works only
-before an upload's first copies are recorded. It frees the staging region,
-answers `UploadCancelled`, and leaves the target as it was: uninitialized and
-free for another upload. Once copies are recorded, the upload completes;
-cancelling then is `CancelStarted`. A settled upload is `CancelSettled`, and
+before the owner claims an upload to record its first copies. It frees the
+staging region, answers `UploadCancelled`, and leaves the target as it was:
+uninitialized and free for another upload. Once the upload is claimed, it
+completes; cancelling then is `CancelStarted`. A settled upload is `CancelSettled`, and
 a ticket these uploads did not issue is `CancelUnknown`.
 
 **Exit.** At the owner's exit, `closeUploads` closes admission before the
 drain and cancels every upload not yet started. Uploads already started go on
 with the other frame-less work the drain waits for. After the drain,
-`retireUploads` observes their batches once more. It settles each still
+`retireUploads` first waits for every caller still copying its bytes into
+staging, each of which then finds admission closed and gives its reservations
+back, so the staging buffer is never unmapped under a writer; that wait is for
+copies into mapped memory already under way. It then observes the batches in
+flight once more, and settles each still
 unsettled upload as lost after a device loss, and otherwise as cancelled (left
 unfinished by the exit), its target released with the rest of the recording.
 The staging buffer is a managed buffer like any other, destroyed by
@@ -1982,7 +2052,7 @@ The staging buffer is a managed buffer like any other, destroyed by
   It lets a consumer compare what it uploaded.
 - **Observation.** `readUploads` shows each unsettled upload's number,
   target, phase, staging region, and whether it has started, has a batch in
-  flight, or has every copy recorded. It also shows whether admission is
+  flight, has every copy recorded, or is claimed by the owner's recording. It also shows whether admission is
   open, and the staging buffer's identity and size.
 
 **Proof.** The stand-in suite (`Test.GPU.Vulkan.Native.Uploads`) covers:
@@ -1996,6 +2066,10 @@ The staging buffer is a managed buffer like any other, destroyed by
 - targets not fresh or already targeted;
 - reservations given back when the caller's copy raised;
 - one winner of two uploads racing for one target;
+- a gate closed before admission, or closing while the bytes are copied,
+  refusing the upload with every reservation given back;
+- a buffer an upload filled refused as not fresh through a second uploads
+  over the same recording;
 - BC7 reported unsupported on a device without it;
 - copies at block-row boundaries under the budget, with the target resting
   in transfer write between batches, completing on the final batch's fence;
@@ -2004,11 +2078,17 @@ The staging buffer is a managed buffer like any other, destroyed by
 - staging freed only at settlement;
 - a discarded batch re-recorded from the same bytes;
 - non-coherent flushes aligned to the atom and kept within the region;
-- cancellation before and after the first copies;
+- cancellation before and after the first copies, and a cancellation and a
+  rival admission inside the recording of an upload's first copies and inside
+  its batch's submission, refused and backpressured while its staging stays
+  held; the flight published as the claim is released; and a discarded
+  batch's claim released without a flight, the upload then cancellable;
 - tickets completing only on the final fence, a wait refused on the owner,
   and a deadline that cancels nothing;
-- every unsettled upload lost after device loss;
+- every unsettled upload lost after device loss, except one whose caller is
+  still copying, which keeps its region until it finishes and is lost then;
 - exit cancelling uploads not yet started and settling started ones;
+- retirement returning only after a caller still copying has finished;
 - a released target destroyed only after its upload settles;
 - an indexed draw bounded by uploaded indices;
 - level readback, with its refusals.
@@ -2034,11 +2114,12 @@ nothing.
 
 | State | Owner | Readers and writers | Thread | Lifetime | Reset or disposal |
 | --- | --- | --- | --- | --- | --- |
-| The upload queue: each unsettled upload's entry, its phase, cursor and batch in flight, the next upload number, the staging head, whether admission is open, and the stall flag | The uploads (`Internal.Uploads`) | `submitUpload` adds an entry; `progressUploads` advances and settles them; `cancelUpload`, `closeUploads` and `retireUploads` settle them | Admission and cancellation on any thread, in STM; everything else on the graphics owner's | From `newUploads` until `retireUploads` | Each entry removed when its upload settles; the numbers are never reissued |
+| The upload queue: each unsettled upload's entry, its phase, cursor, batch in flight and whether the owner has claimed it, the next upload number, the staging head, whether admission is open, and the stall flag | The uploads (`Internal.Uploads`) | `submitUpload` adds an entry; `progressUploads` claims, advances and settles them; `cancelUpload`, `closeUploads` and `retireUploads` settle them, never a claimed one or, but at retirement after its caller finishes, an admitting one | Admission and cancellation on any thread, in STM; everything else on the graphics owner's | From `newUploads` until `retireUploads` | Each entry removed when its upload settles; the numbers are never reissued |
 | The staging buffer and its regions | The uploads, over a managed buffer of the recording's | Admission reserves a region and its caller writes it; the owner flushes and copies from it | Writes on the admitting thread, into its own region only; copies on the owner's | Each region from admission until its upload settles; the buffer from `newUploads` until `retireRecording` | Regions freed at settlement only; the buffer destroyed with every other managed resource |
 | Each ticket's state | The uploads | The owner and cancellation advance it; any thread reads it | Any | From admission; kept by the caller after settlement | Never reset; terminal once settled |
 | The upload-held targets and their deferred releases | The recording (`recordingUploading`, `recordingReleaseDeferred`) | Admission adds a target; settlement removes it and performs a deferred release; `orderedSequence` and `destroyableNow` read it | Any, in STM | From admission until its upload settles | Emptied as uploads settle |
 | Uploaded index data | The recording (`recordingIndexData`) | A completed index-buffer upload stores it; indexed draws read it | The graphics owner | From completion until the buffer is forgotten | Deleted by `forget` |
+| The buffers uploads have filled | The recording (`recordingFilled`) | Admission adds a buffer and reads the set for freshness; a cancellation before any copy, and an admission given back, remove it | Any, in STM | From admission until the buffer is forgotten | Deleted by `forget` |
 
 ### Destruction
 

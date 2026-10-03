@@ -56,16 +56,19 @@ module Test.GPU.Vulkan.Native.SurfaceFree
   , runFrameless
   , runOffscreen
   , runDrawing
+  , runUploads
   , surfaceFreeSection
   , laterWindowSection
   , framelessSection
   , offscreenSection
   , drawingSection
+  , uploadsSection
   , surfaceFreeSpec
   , laterWindowSpec
   , framelessSpec
   , offscreenSpec
   , drawingSpec
+  , uploadsSpec
   ) where
 
 import Control.Concurrent (ThreadId, myThreadId)
@@ -181,6 +184,13 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , pushConstants
   , validateRingSize
   , writeClaim
+  , UploadConfig
+  , UploadRequest (..)
+  , UploadState (..)
+  , awaitUploadTicket
+  , copyLevelToReadback
+  , submitVulkanUpload
+  , validateUploadConfig
   )
 import Hetoimasia.GPU.Vulkan.Native.Presentation (formatB8G8R8A8Srgb)
 import Hetoimasia.GPU.Vulkan.Native.Recording.Shaders (endpointShaders, quadShaders, verificationShaders)
@@ -228,6 +238,7 @@ data SurfaceFreeFacts = SurfaceFreeFacts
   , factsVerdict ∷ !(Maybe DiagnosticVerdict)
   , factsErrors ∷ ![Text]
   , factsSeconds ∷ !Double
+  , factsUploads ∷ !(Maybe UploadFacts)
   }
 
 data SurfaceFreeOutcome
@@ -243,6 +254,17 @@ data Seen = Seen
   , seenStanding ∷ !(Maybe TargetStanding)
   , seenTickets ∷ ![Either Refusal TicketState]
   , seenShots ∷ ![Shot]
+  , seenUploads ∷ !(Maybe UploadFacts)
+  }
+
+-- | What the uploads case (GRS-6) found: each upload's ticket, waited for
+-- with a deadline off the owner's thread, or why it was refused; whether each
+-- RGBA8 level read back exactly as uploaded; and whether each BC7 level did,
+-- or 'Nothing' where the device takes no BC7, as reported.
+data UploadFacts = UploadFacts
+  { uploadTickets ∷ ![Either Text UploadState]
+  , uploadRgbaLevels ∷ ![Bool]
+  , uploadBc7Levels ∷ !(Maybe [Bool])
   }
 
 -- | One offscreen readback (GRS-5): its format, what waiting for its batch's
@@ -270,7 +292,7 @@ runSurfaceFree backend journal = do
     windows ← length <$> atomically (hostWindowIdentities (vulkanWindowHost vulkan))
     roots ← atomically (readVulkanRoots (vulkanController vulkan))
     note journal ("the actions answered " <> Text.intercalate "; " answers)
-    pure (Seen threads answers windows (Just roots) Nothing [] [])
+    pure (Seen threads answers windows (Just roots) Nothing [] [] Nothing)
 
 -- | The case that admits a window after the device exists.
 runLaterWindow ∷ Maybe Backend → Journal → IO SurfaceFreeOutcome
@@ -302,7 +324,7 @@ runLaterWindow backend journal = do
       pure (if any (`elem` retired) presented then FinishWith () else ContinueWith NoUpdateDemand)
     note journal "presented a frame to the later window and saw its presentation retire"
     roots ← atomically (readVulkanRoots (vulkanController vulkan))
-    pure (Seen [] [] 1 (Just roots) (Just standing) [] [])
+    pure (Seen [] [] 1 (Just roots) (Just standing) [] [] Nothing)
   where
     quiet = recordingLogger (\_ → pure ())
 
@@ -327,7 +349,7 @@ runFrameless backend journal = do
     tickets ← mapM (\ticket → awaitTicket ticket deadline) [firstTicket, snd second]
     note journal ("the tickets answered " <> tshow tickets)
     roots ← atomically (readVulkanRoots (vulkanController vulkan))
-    pure (Seen [firstOn, fst second] ["recorded an initializing frame-less batch", "recorded a second frame-less batch"] 0 (Just roots) Nothing tickets [])
+    pure (Seen [firstOn, fst second] ["recorded an initializing frame-less batch", "recorded a second frame-less batch"] 0 (Just roots) Nothing tickets [] Nothing)
   where
     deadline = either (error . show) id (durationFromNanoseconds AllowZero 10000000000)
 
@@ -360,7 +382,7 @@ runOffscreen backend journal = do
       | ((format, _, _), ticket, reading) ← zip3 batches tickets readings
       ]
     roots ← atomically (readVulkanRoots (vulkanController vulkan))
-    pure (Seen [renderedOn, readOn] ["rendered and copied both targets", "read both readbacks"] 0 (Just roots) Nothing tickets shots)
+    pure (Seen [renderedOn, readOn] ["rendered and copied both targets", "read both readbacks"] 0 (Just roots) Nothing tickets shots Nothing)
   where
     deadline = either (error . show) id (durationFromNanoseconds AllowZero 10000000000)
     pixelAt bytes (x, y) = ByteString.unpack (ByteString.take 4 (ByteString.drop ((y * offscreenSide + x) * 4) bytes))
@@ -389,10 +411,220 @@ runDrawing backend journal = do
     note journal ("the readback is at " <> Text.pack path)
     let shot = Shot Rgba8Srgb waited [(point, pixelAt bytes point) | point ← drawingProbes] path
     roots ← atomically (readVulkanRoots (vulkanController vulkan))
-    pure (Seen [drawnOn, readOn] ["drew the quad and copied the target", "read the readback"] 0 (Just roots) Nothing [waited] [shot])
+    pure (Seen [drawnOn, readOn] ["drew the quad and copied the target", "read the readback"] 0 (Just roots) Nothing [waited] [shot] Nothing)
   where
     deadline = either (error . show) id (durationFromNanoseconds AllowZero 10000000000)
     pixelAt bytes (x, y) = ByteString.unpack (ByteString.take 4 (ByteString.drop ((y * offscreenSide + x) * 4) bytes))
+
+-- | The uploads case (GRS-6): textures and buffers filled through the
+-- session's uploads, admitted from this thread — the main thread, never the
+-- owner's — and waited for with a deadline; every texture level copied back
+-- and compared exactly; and the uploaded buffers drawn from.
+runUploads ∷ Maybe Backend → Journal → IO SurfaceFreeOutcome
+runUploads backend journal = do
+  heading journal "GRS-6: a surface-free session uploads textures over several turns and buffers through bounded staging, copies every level back, and draws from the buffers"
+  runCaseWith
+    (\config → config {vulkanUploads = Just uploadConfig})
+    backend
+    defaultBudgetRequest {requestedBytes = 2 * 1024 * 1024 * 1024}
+    []
+    "vulkan-native-grs6-uploads"
+    $ \vulkan _ _ _ → do
+      (madeOn, made) ←
+        act vulkan (VulkanAction (\construction → (,) <$> myThreadId <*> uploadTargets construction)) >>= \case
+          ActionReturned (ran, Right made) → pure (ran, made)
+          ActionReturned (_, Left refusal) → stopWith ("the upload targets were refused: " <> tshow refusal)
+          other → stopWith ("the upload targets' action did not return: " <> outcomeText other)
+      let requests =
+            [UploadImage (targetsRgba made) rgbaLevels]
+              <> [UploadImage texture bc7Levels | Just texture ← [targetsBc7 made]]
+              <> [ UploadBuffer (targetsVertices made) (floatBytes quadCorners)
+                 , UploadBuffer (targetsOffsets made) (floatBytes instanceOffsets)
+                 , UploadBuffer (targetsIndices made) (indexBytes quadIndices)
+                 ]
+      admitted ← mapM (submitVulkanUpload vulkan) requests
+      states ←
+        mapM
+          ( \case
+              Left refusal → pure (Left (tshow refusal))
+              Right ticket → either (Left . tshow) Right <$> awaitUploadTicket ticket deadline
+          )
+          admitted
+      (verifiedOn, ticket) ←
+        act vulkan (VulkanAction (\construction → (,) <$> myThreadId <*> verifyBatch construction made)) >>= \case
+          ActionReturned (ran, Right batch) → pure (ran, batch)
+          ActionReturned (_, Left refusal) → stopWith ("the verifying batch was refused: " <> tshow refusal)
+          other → stopWith ("the verifying action did not return: " <> outcomeText other)
+      waited ← awaitTicket ticket deadline
+      (readOn, (levels, target)) ←
+        act vulkan (VulkanAction (\construction → (,) <$> myThreadId <*> readBack construction made)) >>= \case
+          ActionReturned (ran, Right bytes) → pure (ran, bytes)
+          ActionReturned (_, Left refusal) → stopWith ("the readbacks were refused: " <> tshow refusal)
+          other → stopWith ("the reading action did not return: " <> outcomeText other)
+      directory ← getTemporaryDirectory
+      (path, handle) ← openBinaryTempFile directory "hetoimasia-grs6-uploads.png"
+      ByteString.hPut handle (encodeRgba offscreenSide offscreenSide target)
+      hClose handle
+      note journal ("the drawing readback is at " <> Text.pack path)
+      let (rgbaRead, bc7Read) = splitAt (length rgbaLevels) levels
+          facts =
+            UploadFacts
+              states
+              (zipWith (==) rgbaLevels rgbaRead)
+              (fmap (const (zipWith (==) bc7Levels bc7Read)) (targetsBc7 made))
+          shot = Shot Rgba8Srgb waited [(point, pixelAt target point) | point ← drawingProbes] path
+      note journal ("BC7 " <> maybe "is not supported by the device, as it reports" (const "is supported, and was uploaded") (targetsBc7 made))
+      roots ← atomically (readVulkanRoots (vulkanController vulkan))
+      pure
+        ( Seen
+            [madeOn, verifiedOn, readOn]
+            ["made the textures, buffers and readbacks", "copied every level back and drew from the uploaded buffers", "read every readback"]
+            0
+            (Just roots)
+            Nothing
+            [waited]
+            [shot]
+            (Just facts)
+        )
+  where
+    deadline = either (error . show) id (durationFromNanoseconds AllowZero 30000000000)
+    pixelAt bytes (x, y) = ByteString.unpack (ByteString.take 4 (ByteString.drop ((y * offscreenSide + x) * 4) bytes))
+
+-- | The uploads' configuration: a 1 MiB staging buffer, every upload of the
+-- case at once; a 128 KiB turn budget, one block row of a 32768-texel level,
+-- as wide as any device the suite runs on allows (D-30) — so the RGBA8
+-- texture's 320 KiB take several turns; and a queue of eight.
+uploadConfig ∷ UploadConfig
+uploadConfig = either (error . show) id (validateUploadConfig (1024 * 1024) uploadBudget 8)
+
+uploadBudget ∷ Integer
+uploadBudget = 128 * 1024
+
+-- | The turns the RGBA8 texture needs at least, each a batch of its own.
+rgbaTurns ∷ Int
+rgbaTurns = fromIntegral ((sum (map (toInteger . ByteString.length) rgbaLevels) + uploadBudget - 1) `div` uploadBudget)
+
+-- | The RGBA8 texture's side, and its two levels' bytes: a pattern no level
+-- repeats at any offset a misplaced row or level would land on.
+uploadSide ∷ Word32
+uploadSide = 256
+
+rgbaLevels ∷ [ByteString.ByteString]
+rgbaLevels = [levelPattern 1 (256 * 256 * 4), levelPattern 2 (128 * 128 * 4)]
+
+-- | The BC7 texture's two levels: 64 by 64 and 32 by 32 blocks of sixteen
+-- bytes. A copy moves blocks as they are, so any bytes compare.
+bc7Levels ∷ [ByteString.ByteString]
+bc7Levels = [levelPattern 3 (64 * 64 * 16), levelPattern 4 (32 * 32 * 16)]
+
+levelPattern ∷ Int → Int → ByteString.ByteString
+levelPattern seed count = fst (ByteString.unfoldrN count (\index → Just (fromIntegral ((index * 7 + seed * 13 + index `div` 251) `mod` 251), index + 1)) 0)
+
+-- | What the case uploads into and reads back from.
+data UploadTargets = UploadTargets
+  { targetsRgba ∷ !Image
+  , targetsBc7 ∷ !(Maybe Image)
+    -- ^ 'Nothing' where the device takes no BC7: its creation was refused.
+  , targetsVertices ∷ !Buffer
+  , targetsOffsets ∷ !Buffer
+  , targetsIndices ∷ !Buffer
+  , targetsTarget ∷ !Image
+  , targetsPipeline ∷ !Pipeline
+  , targetsLevelReadbacks ∷ ![(Readback, Natural)]
+    -- ^ One a level, RGBA8 first, then BC7's, with its size.
+  , targetsReadback ∷ !Readback
+  }
+
+-- | Two textures of two levels each — RGBA8, and BC7 where the device takes
+-- it — the quad's vertex, instance-offset and index buffers, an RGBA8 color
+-- target, a pipeline over the quad shaders, and a readback for every level
+-- and for the target.
+uploadTargets ∷ Construction q inst msgr phys dev cmd → IO (Either Refusal UploadTargets)
+uploadTargets construction = do
+  let side = fromIntegral offscreenSide
+      input =
+        VertexInput
+          [VertexBinding 0 8 PerVertex, VertexBinding 1 8 PerInstance]
+          [VertexAttribute 0 0 VertexFloat2 0, VertexAttribute 1 1 VertexFloat2 0]
+  rgba ← constructImage construction (ImageDescription TextureImage Rgba8Linear uploadSide uploadSide 2)
+  bc7 ←
+    constructImage construction (ImageDescription TextureImage Bc7Linear uploadSide uploadSide 2) <&> \case
+      Right texture → Right (Just texture)
+      Left (RefusedImageUnsupported _ _) → Right Nothing
+      Left refusal → Left refusal
+  vertices ← constructBuffer construction (BufferDescription VertexBuffer (fromIntegral (ByteString.length (floatBytes quadCorners))))
+  offsets ← constructBuffer construction (BufferDescription VertexBuffer (fromIntegral (ByteString.length (floatBytes instanceOffsets))))
+  indices ← constructBuffer construction (BufferDescription IndexBuffer (fromIntegral (ByteString.length (indexBytes quadIndices))))
+  target ← constructImage construction (ImageDescription ColorTarget Rgba8Srgb side side 1)
+  pipeline ←
+    constructPipelineLayoutWith construction [PushConstantRange [PushFragment] 0 16] >>= \case
+      Left refusal → pure (Left refusal)
+      Right layout → constructPipelineWith construction layout quadShaders (formatCode Rgba8Srgb) input
+  let sizes = map (fromIntegral . ByteString.length) (rgbaLevels <> either (const []) (maybe [] (const bc7Levels)) bc7)
+  levelReadbacks ← mapM (\size → fmap (\readback → (readback, size)) <$> constructReadback construction size) sizes
+  readback ← constructReadback construction offscreenBytes
+  pure $
+    UploadTargets
+      <$> rgba
+      <*> bc7
+      <*> vertices
+      <*> offsets
+      <*> indices
+      <*> target
+      <*> pipeline
+      <*> sequence levelReadbacks
+      <*> readback
+
+-- | One frame-less batch that copies every level of every uploaded texture
+-- back, each after its checked transition and returned to rest, then draws
+-- the quad indexed and instanced from the uploaded buffers into the color
+-- target, cleared blue, with magenta pushed, and copies the target back.
+verifyBatch ∷ Construction q inst msgr phys dev cmd → UploadTargets → IO (Either Refusal BatchTicket)
+verifyBatch construction made =
+  constructFramelessBatch construction steps <&> \case
+    Left refusal → Left refusal
+    Right (_, Left refusal) → Left refusal
+    Right (ticket, Right ()) → Right ticket
+  where
+    side = fromIntegral offscreenSide
+    textures = (targetsRgba made, 2) : [(texture, 2) | Just texture ← [targetsBc7 made]]
+    levelCopies recorder =
+      concat
+        [ [transitionResource recorder texture (FromUse ShaderSampled) TransferRead]
+            <> [copyLevelToReadback recorder texture level readback | (level, (readback, _)) ← zip [0 ..] levelReadbacks]
+            <> [transitionResource recorder texture (FromUse TransferRead) ShaderSampled]
+        | ((texture, _ ∷ Int), levelReadbacks) ← zip textures (chunked (targetsLevelReadbacks made))
+        ]
+    chunked [] = []
+    chunked held = take 2 held : chunked (drop 2 held)
+    magenta = floatBytes [(1, 0), (1, 1)]
+    steps recorder =
+      inOrder $
+        levelCopies recorder
+          <> [ transitionResource recorder (targetsVertices made) (FromUse GeometryRead) GeometryRead
+             , transitionResource recorder (targetsOffsets made) (FromUse GeometryRead) GeometryRead
+             , transitionResource recorder (targetsIndices made) (FromUse GeometryRead) GeometryRead
+             , beginRenderingInto recorder (targetsTarget made) ClearFromUndefined (ClearColor 0 0 1 1)
+             , bindPipeline recorder (targetsPipeline made)
+             , setViewport recorder (Viewport 0 0 (fromIntegral side) (fromIntegral side))
+             , setScissor recorder (Rect 0 0 side side)
+             , bindVertexBuffer recorder 0 (FromBuffer (targetsVertices made) 0)
+             , bindVertexBuffer recorder 1 (FromBuffer (targetsOffsets made) 0)
+             , bindIndexBuffer recorder (FromBuffer (targetsIndices made) 0) Index16
+             , pushConstants recorder [PushFragment] 0 magenta
+             , drawIndexed recorder (fromIntegral (length quadIndices)) (fromIntegral (length instanceOffsets))
+             , endRendering recorder
+             , transitionResource recorder (targetsTarget made) (FromUse ColorAttachment) TransferRead
+             , copyTargetToReadback recorder (targetsTarget made) (targetsReadback made)
+             , transitionResource recorder (targetsTarget made) (FromUse TransferRead) ColorAttachment
+             ]
+
+-- | Every level readback's bytes, in order, and the color target's.
+readBack ∷ Construction q inst msgr phys dev cmd → UploadTargets → IO (Either Refusal ([ByteString.ByteString], ByteString.ByteString))
+readBack construction made = do
+  levels ← mapM (\(readback, size) → readConstructedReadback construction readback 0 size) (targetsLevelReadbacks made)
+  target ← readConstructedReadback construction (targetsReadback made) 0 offscreenBytes
+  pure ((,) <$> sequence levels <*> target)
 
 -- | Probe points well away from every edge: the first two at the centers of
 -- the two instances' quads, the rest outside both.
@@ -660,7 +892,19 @@ runCase
   → Text
   → (VulkanHost () → RuntimeControl → TVar [Text] → TVar [FrameEvent] → IO Seen)
   → IO SurfaceFreeOutcome
-runCase backend request windows label body = do
+runCase = runCaseWith id
+
+-- | 'runCase' with the host's configuration adjusted, as the uploads case
+-- configures the session's uploads.
+runCaseWith
+  ∷ (VulkanHostConfig () → VulkanHostConfig ())
+  → Maybe Backend
+  → BudgetRequest
+  → [WindowConfig]
+  → Text
+  → (VulkanHost () → RuntimeControl → TVar [Text] → TVar [FrameEvent] → IO Seen)
+  → IO SurfaceFreeOutcome
+runCaseWith adjust backend request windows label body = do
   started ← getCurrentTime
   recorded ← newIORef []
   names ← newTVarIO []
@@ -673,13 +917,14 @@ runCase backend request windows label body = do
   let host = requestingBackend backend (defaultHostConfig windows)
       logger = recordingLogger (\entry → atomically (modifyTVar' logged (entry :)))
       config =
-        (vulkanHostConfig host defaultCaptureConfig {captureTextBudget = 16384} budgets scene)
-          { vulkanLayers = ["VK_LAYER_KHRONOS_validation"]
-          , vulkanValidationFeatures = validationFeatures
-          , vulkanObserver = \capture → naming names (nativeCallObserver recorded capture)
-          , vulkanFrameObserver = \event → atomically (modifyTVar' events (event :))
-          , vulkanDeviceStart = DeviceSurfaceFree
-          }
+        adjust
+          (vulkanHostConfig host defaultCaptureConfig {captureTextBudget = 16384} budgets scene)
+            { vulkanLayers = ["VK_LAYER_KHRONOS_validation"]
+            , vulkanValidationFeatures = validationFeatures
+            , vulkanObserver = \capture → naming names (nativeCallObserver recorded capture)
+            , vulkanFrameObserver = \event → atomically (modifyTVar' events (event :))
+            , vulkanDeviceStart = DeviceSurfaceFree
+            }
   outcome ←
     try @SomeException $
       withLoaderIntegration $ \integration →
@@ -733,6 +978,7 @@ runCase backend request windows label body = do
               , factsVerdict = verdict
               , factsErrors = errors
               , factsSeconds = realToFrac (diffUTCTime finished started)
+              , factsUploads = seenUploads seen
               }
   where
     -- Every call's name, as it returns, where a transaction can wait for it.
@@ -906,6 +1152,61 @@ drawingSpec outcome = describe "GRS-4 drawing from the shared ring with push con
       [map snd (shotProbes shot) | shot ← factsShots facts] `shouldBe` [expectedDrawingProbes]
 
   it "retired cleanly, the ring with every other managed resource before the device, with every Vulkan call on the owner's thread" $
+    on outcome $ \facts → do
+      callNames facts `shouldSatisfy` ordered ["vkDestroyDevice", "vkDestroyDebugUtilsMessengerEXT", "vkDestroyInstance"]
+      oneOwnerThread facts
+
+  it "reached a verdict after the last callback with no issue and no error, synchronization validation included" $
+    on outcome clean
+
+uploadsSection ∷ SurfaceFreeOutcome → [Text]
+uploadsSection outcome =
+  section "A surface-free session uploading textures and buffers through bounded staging" outcome
+    <> case outcome of
+      SurfaceFreeRecorded facts →
+        concat
+          [ [ "- upload tickets: " <> tshow (maybe [] uploadTickets (factsUploads facts))
+            , "- RGBA8 levels read back exactly: " <> tshow (maybe [] uploadRgbaLevels (factsUploads facts))
+            , "- BC7 levels read back exactly: " <> maybe "BC7 is not supported by the device, as it reports" tshow (factsUploads facts >>= uploadBc7Levels)
+            , "- submissions: " <> tshow (length (filter (== "vkQueueSubmit2") (callNames facts)))
+            ]
+          , concat
+              [ [ "- drawing ticket " <> tshow (shotTicket shot) <> ", PNG at " <> Text.pack (shotPng shot)
+                , "  probes: " <> Text.intercalate "; " [tshow point <> " " <> tshow bytes | (point, bytes) ← shotProbes shot]
+                ]
+              | shot ← factsShots facts
+              ]
+          ]
+      SurfaceFreeFailed _ → []
+
+uploadsSpec ∷ SurfaceFreeOutcome → Spec
+uploadsSpec outcome = describe "GRS-6 uploads through bounded staging in a surface-free session" $ do
+  it "opened no window, created no surface and acquired no image" $
+    on outcome $ \facts → do
+      factsWindows facts `shouldBe` 0
+      callNames facts `shouldSatisfy` notElem "glfwCreateWindowSurface"
+      callNames facts `shouldSatisfy` notElem "vkAcquireNextImageKHR"
+      deviceFirst facts
+
+  it "completed every upload, admitted and waited for with a deadline off the owner's thread, the RGBA8 texture over more than one turn's budget" $
+    on outcome $ \facts → do
+      fmap uploadTickets (factsUploads facts) `shouldSatisfy` maybe False (\tickets → not (null tickets) && all (== Right UploadComplete) tickets)
+      -- The RGBA8 texture's 320 KiB need three turns of 128 KiB, each its own
+      -- submission; the verifying batch is one more.
+      length (filter (== "vkQueueSubmit2") (callNames facts)) `shouldSatisfy` (>= rgbaTurns + 1)
+
+  it "copied every RGBA8 level back exactly as uploaded" $
+    on outcome $ \facts → fmap uploadRgbaLevels (factsUploads facts) `shouldBe` Just [True, True]
+
+  it "copied every BC7 level back block for block where the device takes BC7, and reported it unsupported where it does not" $
+    on outcome $ \facts → (factsUploads facts >>= uploadBc7Levels) `shouldSatisfy` maybe True and
+
+  it "drew from the uploaded vertex, offset and index buffers: magenta inside each instance's quad, the blue clear outside both" $
+    on outcome $ \facts → do
+      map shotTicket (factsShots facts) `shouldBe` [Right TicketComplete]
+      [map snd (shotProbes shot) | shot ← factsShots facts] `shouldBe` [expectedDrawingProbes]
+
+  it "retired cleanly, the staging buffer with every other managed resource before the device, with every Vulkan call on the owner's thread" $
     on outcome $ \facts → do
       callNames facts `shouldSatisfy` ordered ["vkDestroyDevice", "vkDestroyDebugUtilsMessengerEXT", "vkDestroyInstance"]
       oneOwnerThread facts

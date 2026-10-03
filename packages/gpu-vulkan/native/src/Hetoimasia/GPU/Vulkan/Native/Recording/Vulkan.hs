@@ -101,6 +101,7 @@ vulkanRecordingOps physical = do
           , limitVertexStride = deviceLimits.maxVertexInputBindingStride
           , limitVertexAttributeOffset = deviceLimits.maxVertexInputAttributeOffset
           , limitNonCoherentAtom = fromIntegral deviceLimits.nonCoherentAtomSize
+          , limitImageDimension = deviceLimits.maxImageDimension2D
           }
   pure
     RecordingOps
@@ -436,6 +437,36 @@ recordCommand commands = \case
         , imageSubresource = ImageSubresourceLayers {aspectMask = IMAGE_ASPECT_COLOR_BIT, mipLevel = 0, baseArrayLayer = 0, layerCount = 1}
         , imageOffset = Offset3D 0 0 0
         , imageExtent = Extent3D extent.extentWidth extent.extentHeight 1
+        }
+  CommandCopyBuffer source sourceOffset destination destinationOffset size →
+    copyBufferUnsafe commands (Buffer source) (Buffer destination) BufferCopy {srcOffset = sourceOffset, dstOffset = destinationOffset, size = size}
+  CommandCopyBufferToImage source offset image level row width height →
+    copyBufferToImageUnsafe
+      commands
+      (Buffer source)
+      (Image image)
+      IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+      BufferImageCopy
+        { bufferOffset = offset
+        , bufferRowLength = 0
+        , bufferImageHeight = 0
+        , imageSubresource = ImageSubresourceLayers {aspectMask = IMAGE_ASPECT_COLOR_BIT, mipLevel = level, baseArrayLayer = 0, layerCount = 1}
+        , imageOffset = Offset3D 0 (fromIntegral row) 0
+        , imageExtent = Extent3D width height 1
+        }
+  CommandCopyImageLevelToBuffer image level width height buffer →
+    copyImageToBufferUnsafe
+      commands
+      (Image image)
+      IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+      (Buffer buffer)
+      BufferImageCopy
+        { bufferOffset = 0
+        , bufferRowLength = 0
+        , bufferImageHeight = 0
+        , imageSubresource = ImageSubresourceLayers {aspectMask = IMAGE_ASPECT_COLOR_BIT, mipLevel = level, baseArrayLayer = 0, layerCount = 1}
+        , imageOffset = Offset3D 0 0 0
+        , imageExtent = Extent3D width height 1
         }
   CommandHostReadBarrier buffer size →
     pipelineBarrier2Unsafe

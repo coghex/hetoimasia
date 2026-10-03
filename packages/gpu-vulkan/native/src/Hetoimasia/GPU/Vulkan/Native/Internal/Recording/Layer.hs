@@ -38,6 +38,11 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   , ImageFormat (..)
   , formatCode
   , formatNeedsCompressionBC
+  , FormatBlock (..)
+  , formatBlock
+  , levelExtent
+  , levelRows
+  , levelBytes
   , kindFormats
   , ImageDescription (..)
   , fullMipChain
@@ -71,7 +76,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   , resourceBarrier
   ) where
 
-import Data.Bits (finiteBitSize, countLeadingZeros, (.|.))
+import Data.Bits (countLeadingZeros, finiteBitSize, shiftR, (.|.))
 import Data.ByteString (ByteString)
 import Data.Int (Int32)
 import Data.Text (Text)
@@ -162,6 +167,19 @@ data NativeCommand
   | CommandDrawIndexed !Word32 !Word32
     -- ^ Index count and instance count, from the first index, vertex offset
     -- and instance zero.
+  | CommandCopyBuffer !Word64 !Word64 !Word64 !Word64 !Word64
+    -- ^ One region from one buffer into another: the source buffer and the
+    -- offset into it, the destination buffer and the offset into it, and the
+    -- byte count (GRS-6).
+  | CommandCopyBufferToImage !Word64 !Word64 !Word64 !Word32 !Word32 !Word32 !Word32
+    -- ^ Tightly packed bytes of one buffer into one band of rows of one mip
+    -- level of a color image in the transfer-destination layout: the buffer
+    -- and the offset into it, the image, the mip level, the band's first row,
+    -- and its width and height in texels (GRS-6).
+  | CommandCopyImageLevelToBuffer !Word64 !Word32 !Word32 !Word32 !Word64
+    -- ^ One whole mip level of a color image in the transfer-source layout —
+    -- the image, the level, and its width and height in texels — tightly
+    -- packed into the buffer at offset zero (GRS-6).
   deriving (Eq, Show)
 
 -- | The shaders of a graphics pipeline, as SPIR-V.
@@ -214,6 +232,9 @@ data RecordingLimits = RecordingLimits
   , limitNonCoherentAtom ∷ !Natural
     -- ^ @nonCoherentAtomSize@: the granularity of flushing non-coherent
     -- memory.
+  , limitImageDimension ∷ !Word32
+    -- ^ @maxImageDimension2D@: the widest level any two-dimensional image
+    -- may have, which bounds one block row of an upload (GRS-6).
   }
   deriving (Eq, Show)
 
@@ -397,7 +418,7 @@ data ImageUse = ImageUse
 
 imageKindUse ∷ ImageKind → ImageUse
 imageKindUse = \case
-  TextureImage → ImageUse (usageSampled .|. usageTransferDestination) (featureSampled .|. featureTransferDestination) UsageTexture aspectColor
+  TextureImage → ImageUse (usageSampled .|. usageTransferDestination .|. usageTransferSource) (featureSampled .|. featureTransferDestination .|. featureTransferSource) UsageTexture aspectColor
   DepthTarget → ImageUse usageDepthAttachment featureDepthAttachment UsageTexture aspectDepth
   ColorTarget → ImageUse (usageColorAttachment .|. usageTransferSource) (featureColorAttachment .|. featureTransferSource) UsageTexture aspectColor
   where
@@ -455,6 +476,53 @@ kindFormats = \case
   TextureImage → [Rgba8Srgb, Rgba8Linear, Bc7Srgb, Bc7Linear]
   DepthTarget → [Depth32Float, Depth24, Depth16]
   ColorTarget → [Rgba8Srgb, Rgba8Linear, Bgra8Srgb, Bgra8Linear]
+
+-- | How a color format's texels are stored: the width and height of one
+-- block of texels, and the bytes one block takes. An uncompressed format's
+-- block is one texel.
+data FormatBlock = FormatBlock
+  { blockWidth ∷ !Word32
+  , blockHeight ∷ !Word32
+  , blockBytes ∷ !Natural
+  }
+  deriving (Eq, Show)
+
+-- | The block a color format stores its texels in: one texel of four bytes
+-- for RGBA8 and BGRA8, and four by four texels in sixteen bytes for BC7.
+-- 'Nothing' for a depth format, which nothing uploads into or copies out of.
+formatBlock ∷ ImageFormat → Maybe FormatBlock
+formatBlock = \case
+  Rgba8Srgb → Just texel
+  Rgba8Linear → Just texel
+  Bgra8Srgb → Just texel
+  Bgra8Linear → Just texel
+  Bc7Srgb → Just bc7
+  Bc7Linear → Just bc7
+  Depth32Float → Nothing
+  Depth24 → Nothing
+  Depth16 → Nothing
+  where
+    texel = FormatBlock 1 1 4
+    bc7 = FormatBlock 4 4 16
+
+-- | One mip level's extent: the base extent halved per level, never below
+-- one texel.
+levelExtent ∷ Word32 → Word32 → Word32 → (Word32, Word32)
+levelExtent width height level = (max 1 (width `shiftR` fromIntegral level), max 1 (height `shiftR` fromIntegral level))
+
+-- | One mip level's rows of blocks, and the bytes one row of them takes: a
+-- partial block at the right or bottom edge is a whole one.
+levelRows ∷ FormatBlock → (Word32, Word32) → (Natural, Natural)
+levelRows block (width, height) =
+  ( ceilingOf (fromIntegral height) (fromIntegral (blockHeight block))
+  , ceilingOf (fromIntegral width) (fromIntegral (blockWidth block)) * blockBytes block
+  )
+  where
+    ceilingOf value granule = (value + granule - 1) `div` granule
+
+-- | The bytes one mip level takes, tightly packed: every row of blocks.
+levelBytes ∷ FormatBlock → (Word32, Word32) → Natural
+levelBytes block extent = let (rows, row) = levelRows block extent in rows * row
 
 -- | A managed image to create: its kind, its format, its extent, and how many
 -- mip levels it has. It is two-dimensional, of one layer and one sample.
@@ -577,6 +645,9 @@ nativeName = \case
   CommandBindVertexBuffer {} → "vkCmdBindVertexBuffers"
   CommandBindIndexBuffer {} → "vkCmdBindIndexBuffer"
   CommandDrawIndexed {} → "vkCmdDrawIndexed"
+  CommandCopyBuffer {} → "vkCmdCopyBuffer"
+  CommandCopyBufferToImage {} → "vkCmdCopyBufferToImage"
+  CommandCopyImageLevelToBuffer {} → "vkCmdCopyImageToBuffer"
 
 -- ---------------------------------------------------------------------------
 -- Ordering managed resources (GRS-3)

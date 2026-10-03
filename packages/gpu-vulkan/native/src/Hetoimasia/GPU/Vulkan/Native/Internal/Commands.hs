@@ -39,6 +39,8 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Commands
   , bindIndexBufferUnsafe
   , drawIndexedUnsafe
   , copyImageToBufferUnsafe
+  , copyBufferUnsafe
+  , copyBufferToImageUnsafe
   , beginLabelUnsafe
   , endLabelUnsafe
   ) where
@@ -56,6 +58,7 @@ import Vulkan.CStruct (withCStruct)
 import Vulkan.CStruct.Extends (SomeStruct, forgetExtensions)
 import Vulkan.Core10
   ( Buffer (..)
+  , BufferCopy
   , BufferImageCopy
   , CommandBufferBeginInfo
   , Image (..)
@@ -95,6 +98,8 @@ unsafeImports =
   , "vkCmdBindIndexBuffer"
   , "vkCmdDrawIndexed"
   , "vkCmdCopyImageToBuffer"
+  , "vkCmdCopyBuffer"
+  , "vkCmdCopyBufferToImage"
   , "vkCmdBeginDebugUtilsLabelEXT"
   , "vkCmdEndDebugUtilsLabelEXT"
   ]
@@ -215,6 +220,27 @@ foreign import ccall unsafe "dynamic"
     → IO ()
 
 foreign import ccall unsafe "dynamic"
+  mkCmdCopyBuffer
+    ∷ FunPtr (Ptr CommandBuffer_T → Buffer → Buffer → Word32 → Ptr BufferCopy → IO ())
+    → Ptr CommandBuffer_T
+    → Buffer
+    → Buffer
+    → Word32
+    → Ptr BufferCopy
+    → IO ()
+
+foreign import ccall unsafe "dynamic"
+  mkCmdCopyBufferToImage
+    ∷ FunPtr (Ptr CommandBuffer_T → Buffer → Image → ImageLayout → Word32 → Ptr BufferImageCopy → IO ())
+    → Ptr CommandBuffer_T
+    → Buffer
+    → Image
+    → ImageLayout
+    → Word32
+    → Ptr BufferImageCopy
+    → IO ()
+
+foreign import ccall unsafe "dynamic"
   mkCmdBeginDebugUtilsLabelEXT
     ∷ FunPtr (Ptr CommandBuffer_T → Ptr DebugUtilsLabelEXT → IO ())
     → Ptr CommandBuffer_T
@@ -312,6 +338,16 @@ copyImageToBufferUnsafe ∷ CommandBuffer → Image → ImageLayout → Buffer �
 copyImageToBufferUnsafe buffer image layout destination region = do
   entry ← resolved "vkCmdCopyImageToBuffer" (pVkCmdCopyImageToBuffer (commands buffer))
   withCStruct region $ \pointer → mkCmdCopyImageToBuffer entry (handle buffer) image layout destination 1 pointer
+
+copyBufferUnsafe ∷ CommandBuffer → Buffer → Buffer → BufferCopy → IO ()
+copyBufferUnsafe buffer source destination region = do
+  entry ← resolved "vkCmdCopyBuffer" (pVkCmdCopyBuffer (commands buffer))
+  withCStruct region $ \pointer → mkCmdCopyBuffer entry (handle buffer) source destination 1 pointer
+
+copyBufferToImageUnsafe ∷ CommandBuffer → Buffer → Image → ImageLayout → BufferImageCopy → IO ()
+copyBufferToImageUnsafe buffer source image layout region = do
+  entry ← resolved "vkCmdCopyBufferToImage" (pVkCmdCopyBufferToImage (commands buffer))
+  withCStruct region $ \pointer → mkCmdCopyBufferToImage entry (handle buffer) source image layout 1 pointer
 
 beginLabelUnsafe ∷ CommandBuffer → DebugUtilsLabelEXT → IO ()
 beginLabelUnsafe buffer label = do

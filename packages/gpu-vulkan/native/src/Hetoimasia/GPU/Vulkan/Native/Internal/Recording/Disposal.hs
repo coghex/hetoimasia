@@ -26,6 +26,7 @@ import Control.Monad (forM, unless)
 import Data.Foldable (for_)
 import Data.List (sortOn)
 import qualified Data.Map.Strict as Map
+import qualified Data.Set as Set
 import qualified Data.Text as Text
 
 import Hetoimasia.Foundation.Time (Instant)
@@ -91,10 +92,11 @@ disposeResources recording now = owner recording (go [])
     pass = do
       (candidates, device) ← atomically $ do
         managed ← readTVar (recordingManaged recording)
+        uploading ← readTVar (recordingUploading recording)
         model ← stateRootsModel roots (\model → (model, model))
         device ← readRootsDevice roots
         let eligible resource record =
-              disposalEligible (ResourceSubject resource) model && destroyableNow managed resource record
+              disposalEligible (ResourceSubject resource) model && destroyableNow uploading managed resource record
         pure (sortOn (kindOrder . managedNative . snd) (Map.toList (Map.filterWithKey eligible managed)), snd <$> device)
       results ← case device of
         Nothing → pure []
@@ -109,11 +111,13 @@ disposeResources recording now = owner recording (go [])
       NativeLayout {} → 3
 
 -- | Whether a generation may be destroyed natively now, as far as the
--- recording knows: it was released or replaced, and a pipeline layout has no
--- pipeline left that was built over it. The model decides its holds.
-destroyableNow ∷ Map.Map ResourceId (ManagedRecord cmd) → ResourceId → ManagedRecord cmd → Bool
-destroyableNow managed resource record =
-  releasedStanding (managedStanding record) && case managedNative record of
+-- recording knows: it was released or replaced, it is the target of no
+-- upload still settling (GRS-6) — which holds it between the batches that
+-- copy into it, when no batch does — and a pipeline layout has no pipeline
+-- left that was built over it. The model decides its holds.
+destroyableNow ∷ Set.Set ResourceId → Map.Map ResourceId (ManagedRecord cmd) → ResourceId → ManagedRecord cmd → Bool
+destroyableNow uploading managed resource record =
+  releasedStanding (managedStanding record) && resource `Set.notMember` uploading && case managedNative record of
     NativeLayout {} → null [() | ManagedRecord (NativePipeline _ over _ _) standing ← Map.elems managed, over == resource, standing /= ManagedDestroyedPending]
     _ → True
   where
@@ -154,10 +158,11 @@ disposer recording =
   SubjectDisposer
     { disposerDispose = \case
         ResourceSubject resource → do
-          (managed, device) ← atomically ((,) <$> readTVar (recordingManaged recording) <*> readRootsDevice (recordingRoots recording))
+          (managed, uploading, device) ←
+            atomically ((,,) <$> readTVar (recordingManaged recording) <*> readTVar (recordingUploading recording) <*> readRootsDevice (recordingRoots recording))
           case (Map.lookup resource managed, device) of
             (Just record, Just (_, handle))
-              | destroyableNow managed resource record →
+              | destroyableNow uploading managed resource record →
                   Just . maybe DisposalCompleted (const DisposalFailed) <$> destroyOne recording handle resource record
             _ → pure Nothing
         _ → pure Nothing
@@ -172,6 +177,8 @@ forget ∷ Recording q inst msgr phys dev cmd → [ResourceId] → STM ()
 forget recording disposed = do
   modifyTVar' (recordingRing recording) (\ring → ring >>= \held → if ringResource held `elem` disposed then Nothing else Just held)
   modifyTVar' (recordingManaged recording) (\held → foldr Map.delete held disposed)
+  modifyTVar' (recordingIndexData recording) (\held → foldr Map.delete held disposed)
+  modifyTVar' (recordingFilled recording) (\held → foldr Set.delete held disposed)
   modifyTVar' (recordingStorages recording) (Map.filter (`notElem` disposed))
   -- A batch record that goes with its storage is a submitted batch whose
   -- submission completed: its ring regions go too.
