@@ -8,6 +8,8 @@ import Data.ByteString.Lazy.Char8 qualified as LazyChar8
 import Test.Hspec.Runner (Config (configFailOnEmpty), defaultConfig, hspecWith)
 
 import Test.Shader.Fragment (verificationFragment)
+import Test.Shader.InterfaceSpec qualified as Interface
+import Test.Shader.Malformed qualified as Malformed
 import Test.Shader.Spec qualified as Shader
 import Test.Shader.Vertex (verificationVertex)
 
@@ -20,7 +22,7 @@ import Test.Shader.Vertex (verificationVertex)
 main ∷ IO ()
 main = do
   mapM_ identify [("vertex", verificationVertex), ("fragment", verificationFragment)]
-  hspecWith defaultConfig {configFailOnEmpty = True} Shader.spec
+  hspecWith defaultConfig {configFailOnEmpty = True} (Shader.spec >> Interface.spec >> Malformed.spec)
   where
     identify ∷ (String, ByteString) → IO ()
     identify (stage, spirv) =

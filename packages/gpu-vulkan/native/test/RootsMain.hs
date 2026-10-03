@@ -12,6 +12,7 @@ module Main (main) where
 import qualified Test.GPU.Vulkan.Native.Allocation as Allocation
 import qualified Test.GPU.Vulkan.Native.AllocatorVisibility as AllocatorVisibility
 import qualified Test.GPU.Vulkan.Native.Frameless as Frameless
+import qualified Test.GPU.Vulkan.Native.Checked as Checked
 import qualified Test.GPU.Vulkan.Native.Drawing as Drawing
 import qualified Test.GPU.Vulkan.Native.Frames as Frames
 import qualified Test.GPU.Vulkan.Native.FramesConstruction as FramesConstruction
@@ -49,6 +50,7 @@ main =
       Frameless.spec
       Offscreen.spec
       Drawing.spec
+      Checked.spec
       Reclamation.spec
       Allocation.spec
       AllocatorVisibility.spec

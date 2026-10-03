@@ -209,6 +209,9 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , constructPipelineWith
   , replaceConstructedPipeline
   , constructRing
+  , constructPipelineLayoutFor
+  , constructCheckedPipeline
+  , replaceConstructedCheckedPipeline
   , constructBuffer
   , constructImage
   , constructFramelessBatch

@@ -147,6 +147,13 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , bindIndexBuffer
   , drawIndexed
 
+    -- * Pipelines from checked shaders (GRS-16)
+  , CheckedShader (..)
+  , CheckedShaders (..)
+  , constructPipelineLayoutFor
+  , constructCheckedPipeline
+  , replaceConstructedCheckedPipeline
+
     -- * The shared ring (GRS-4)
   , RingSize
   , validateRingSize
@@ -268,6 +275,9 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , constructPipelineLayoutWith
   , constructPipelineWith
   , constructRing
+  , constructPipelineLayoutFor
+  , constructCheckedPipeline
+  , replaceConstructedCheckedPipeline
   , replaceConstructedPipeline
   , releaseConstructed
   , InstanceExtensionsMissing (..)
@@ -317,6 +327,8 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , BufferDescription (..)
   , BufferKind (..)
   , BufferSource (..)
+  , CheckedShader (..)
+  , CheckedShaders (..)
   , ClearColor (..)
   , IndexType (..)
   , InputRate (..)

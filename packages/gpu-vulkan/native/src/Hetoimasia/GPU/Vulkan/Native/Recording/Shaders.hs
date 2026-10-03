@@ -14,7 +14,10 @@
 -- 'quadShaders' take their geometry from vertex input and their color from a
 -- push constant (GRS-4): a two-float position per vertex at location 0, a
 -- two-float offset per instance at location 1, added together, and a
--- four-float color in the fragment stage's push constants at offset 0.
+-- four-float color in the fragment stage's push constants at offset 0. They
+-- declare an interface, so they are checked shaders (GRS-16), compiled against
+-- the descriptions in "Hetoimasia.GPU.Vulkan.Native.Recording.ShaderInterfaces",
+-- and a pipeline takes its layout's range and its vertex input from them.
 module Hetoimasia.GPU.Vulkan.Native.Recording.Shaders
   ( verificationShaders
   , endpointShaders
@@ -22,7 +25,8 @@ module Hetoimasia.GPU.Vulkan.Native.Recording.Shaders
   ) where
 
 import Hetoimasia.GPU.Vulkan.Native.Recording (PipelineShaders (..))
-import Hetoimasia.GPU.Vulkan.Native.Shader (fragmentShader, glsl, vertexShader)
+import Hetoimasia.GPU.Vulkan.Native.Recording.ShaderInterfaces (quadFragmentInterface, quadVertexInterface)
+import Hetoimasia.GPU.Vulkan.Native.Shader (CheckedShaders (..), checkedFragmentShader, checkedVertexShader, fragmentShader, glsl, vertexShader)
 
 verificationShaders ∷ PipelineShaders
 verificationShaders =
@@ -82,11 +86,12 @@ endpointShaders =
          )
     }
 
-quadShaders ∷ PipelineShaders
+quadShaders ∷ CheckedShaders
 quadShaders =
-  PipelineShaders
-    { shaderVertex =
-        $( vertexShader
+  CheckedShaders
+    { checkedVertex =
+        $( checkedVertexShader
+             quadVertexInterface
              [glsl|
           #version 450
 
@@ -98,8 +103,9 @@ quadShaders =
           }
         |]
          )
-    , shaderFragment =
-        $( fragmentShader
+    , checkedFragment =
+        $( checkedFragmentShader
+             quadFragmentInterface
              [glsl|
           #version 450
 
