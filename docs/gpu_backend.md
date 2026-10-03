@@ -2323,7 +2323,10 @@ at once. Its image is released after that upload settles.
 **Bringing it up to date.** `refreshTable` writes the placeholder once its
 upload completes and writes each newly complete texture into its slot. It
 then reclaims every retiring slot no live version maps, releasing its image.
-Once the session has failed, or while a diagnostic failure is pending, it
+The reclamation, the images' removal from the table's holdings and their
+releases commit in one transaction. A cancellation therefore never strands
+an image the table let go of, and a refused release rolls the reclamation
+back for the next refresh. Once the session has failed, or while a diagnostic failure is pending, it
 writes nothing, since that is new work. Reclamation still runs, since that
 is cleanup. `registerTexture` and `createTablePipelineLayout` are refused
 then too, while `releaseTexture` is not.
@@ -2450,7 +2453,9 @@ cover:
   failed destruction is retained and fails the session;
 - a cancellation aimed at the owner during the first sampler's creation
   leaving every generation released or held by the published table;
-- the total update-after-bind pool limit checked before anything is made.
+- the total update-after-bind pool limit checked before anything is made;
+- a cancellation during the refresh that reclaims a slot leaving its image
+  released, or still retiring for the next refresh.
 
 A mutation check that ignored version holds failed the three hold-dependent
 examples, and one that left the version's images out of the batch's
