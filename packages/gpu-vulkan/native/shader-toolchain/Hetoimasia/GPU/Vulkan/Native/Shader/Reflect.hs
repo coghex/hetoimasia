@@ -316,26 +316,48 @@ descriptor parsed variable pointer storage =
       pure [ReflectedDescriptor set binding kind count]
     _ → Left ("the descriptor variable (id " <> show variable <> ") has a DescriptorSet or a Binding but not both")
   where
+    named = "the descriptor variable (id " <> show variable <> ")"
+    -- A buffer's element must be a defined struct decorated as its storage
+    -- class requires: a Block for a storage buffer and a uniform buffer, or a
+    -- BufferBlock for a storage buffer in the Uniform class.
     kindOf element
-      | storage == storageStorageBuffer = Right ReflectedStorageBuffer
-      | storage == storageUniform =
+      | storage == storageStorageBuffer = do
+          bufferStruct element
+          if hasDecoration parsed element decorationBlock
+            then Right ReflectedStorageBuffer
+            else Left (named <> " is a storage buffer whose struct is not a Block")
+      | storage == storageUniform = do
+          bufferStruct element
           if hasDecoration parsed element decorationBufferBlock
             then Right ReflectedStorageBuffer
             else
               if hasDecoration parsed element decorationBlock
                 then Right ReflectedUniformBuffer
-                else Left ("the uniform variable (id " <> show variable <> ") is not a Block")
+                else Left (named <> " is a uniform buffer whose struct is not a Block")
       | otherwise = case typeOf parsed element of
-          Just (Instruction 27 _) → Right ReflectedCombinedImageSampler
+          Just (Instruction 27 [_, image]) → case imageKind image of
+            Right ReflectedSampledImage → Right ReflectedCombinedImageSampler
+            Right _ → Left (named <> " is a combined image sampler over an image that is not sampled")
+            Left reason → Left (named <> " is a combined image sampler over " <> reason)
           Just (Instruction 26 _) → Right ReflectedSampler
-          Just (Instruction 25 (_ : _ : dimension : _ : _ : _ : sampled : _))
-            | dimension == dimensionBuffer → Left ("the descriptor variable (id " <> show variable <> ") is a texel buffer, which the reader does not support")
-            | dimension == dimensionSubpassData → Left ("the descriptor variable (id " <> show variable <> ") is an input attachment, which the reader does not support")
-            | dimension > dimensionRect → Left ("the descriptor variable (id " <> show variable <> ") is an image of dimension " <> show dimension <> ", which the reader does not support")
-            | sampled == 1 → Right ReflectedSampledImage
-            | sampled == 2 → Right ReflectedStorageImage
-          Just (Instruction opcode _) → Left ("the descriptor variable (id " <> show variable <> ") is of a type of opcode " <> show opcode <> ", which the reader does not support")
-          Nothing → Left ("the descriptor variable (id " <> show variable <> ") names a type the module does not declare")
+          Just (Instruction 25 _) → either (Left . ((named <> " is ") <>)) Right (imageKind element)
+          Just (Instruction opcode _) → Left (named <> " is of a type of opcode " <> show opcode <> ", which the reader does not support")
+          Nothing → Left (named <> " names a type the module does not declare")
+    bufferStruct element = case typeOf parsed element of
+      Just (Instruction 30 _) → Right ()
+      Just _ → Left (named <> " is a buffer whose element is not a struct")
+      Nothing → Left (named <> " is a buffer whose struct the module does not declare")
+    -- A defined image of a supported dimension, sampled or storage.
+    imageKind image = case typeOf parsed image of
+      Just (Instruction 25 (_ : _ : dimension : _ : _ : _ : sampled : _))
+        | dimension == dimensionBuffer → Left "a texel buffer, which the reader does not support"
+        | dimension == dimensionSubpassData → Left "an input attachment, which the reader does not support"
+        | dimension > dimensionRect → Left ("an image of dimension " <> show dimension <> ", which the reader does not support")
+        | sampled == 1 → Right ReflectedSampledImage
+        | sampled == 2 → Right ReflectedStorageImage
+        | otherwise → Left "an image whose use is unknown until run time, which the reader does not support"
+      Just _ → Left "a type that is not an image"
+      Nothing → Left "an image type the module does not declare"
 
 -- ---------------------------------------------------------------------------
 -- Shared lookups

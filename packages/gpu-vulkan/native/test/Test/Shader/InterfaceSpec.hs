@@ -82,6 +82,19 @@ spec = describe "Shader interfaces" $ do
       -- Every variable's definition removed, its entry point's references kept.
       reflect (without (\instruction → opcodeOf instruction == 59) bytes) `shouldSatisfy` failedWith "which the module defines no variable for"
 
+    it "refuses a buffer whose struct is undefined or not a Block, and a combined image sampler over an undefined image" $ do
+      bytes ← ByteString.readFile "test/fixtures/spirv/descriptors.frag.spv"
+      let decorating which instruction = case wordsOf instruction of
+            first : _ : decorated : _ → first .&. 0xFFFF == 71 && decorated == which
+            _ → False
+      -- Every Block (2) decoration removed: the uniform block is refused.
+      reflect (without (decorating 2) bytes) `shouldSatisfy` failedWith "whose struct is not a Block"
+      -- Every struct definition removed.
+      reflect (without (\instruction → opcodeOf instruction == 30) bytes) `shouldSatisfy` failedWith "is a buffer whose struct the module does not declare"
+      -- Every image type removed: the first descriptor, a combined image
+      -- sampler, names one no longer defined.
+      reflect (without (\instruction → opcodeOf instruction == 25) bytes) `shouldSatisfy` failedWith "is a combined image sampler over an image type the module does not declare"
+
     it "refuses a vertex input that starts past its location's first component" $ do
       bytes ← ByteString.readFile "test/fixtures/spirv/component.vert.spv"
       reflect bytes `shouldSatisfy` failedWith "the vertex input at location 0 starts at component 1, which the reader does not support"
