@@ -2270,6 +2270,12 @@ table's size.
   slot.
 - From registration on, the table holds the image. `releaseManaged` on it is
   refused; the handle is released instead.
+- Registration refreshes the table before it returns, which writes the
+  descriptor of a texture whose upload already completed. If that refresh
+  raises, is cancelled or refuses, the handle is never handed out, so the
+  registration is undone first (`unregisterTexture`): its index and slot are
+  free again, the image is the caller's again, and it may be registered
+  again.
 
 `releaseTexture recording handle` ends a handle. Its index may be issued
 again at once under the next generation, and its slot retires. Its image
@@ -2459,7 +2465,9 @@ cover:
   leaving every generation released or held by the published table;
 - the total update-after-bind pool limit checked before anything is made;
 - a cancellation during the refresh that reclaims a slot leaving its image
-  released, or still retiring for the next refresh.
+  released, or still retiring for the next refresh;
+- a registration whose descriptor write fails, or is cancelled, undone,
+  with the texture registered again afterwards.
 
 A mutation check that ignored version holds failed the three hold-dependent
 examples, and one that left the version's images out of the batch's
