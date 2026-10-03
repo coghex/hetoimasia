@@ -19,6 +19,7 @@ import qualified Test.GPU.Model.Placement as Placement
 import qualified Test.GPU.Model.Progress as Progress
 import qualified Test.GPU.Model.Recovery as Recovery
 import qualified Test.GPU.Model.Sequences as Sequences
+import qualified Test.GPU.Model.TextureTable as TextureTable
 import Test.Hspec (Spec, describe)
 
 spec ∷ Spec
@@ -36,3 +37,4 @@ spec = describe "GPU model" $ do
   Access.spec
   Frameless.spec
   Placement.spec
+  TextureTable.spec

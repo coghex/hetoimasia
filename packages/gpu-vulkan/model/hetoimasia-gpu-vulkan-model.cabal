@@ -49,6 +49,7 @@ library
         Hetoimasia.GPU.Model.Access
         Hetoimasia.GPU.Model.Budget
         Hetoimasia.GPU.Model.Identity
+        Hetoimasia.GPU.Model.TextureTable
     -- The identity constructors, the hold ledger, the admission arithmetic, the
     -- recovery accounting, and the state machine itself: its representation
     -- (Records, State), the shared resolution and accounting it is edited
@@ -137,6 +138,7 @@ test-suite gpu-model-tests
         Test.GPU.Model.Progress
         Test.GPU.Model.Recovery
         Test.GPU.Model.Sequences
+        Test.GPU.Model.TextureTable
         Test.GPU.Model.Spec
         Test.GPU.Model.Support
     build-depends:
