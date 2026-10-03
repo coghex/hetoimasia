@@ -276,6 +276,7 @@ test-suite native-tests
         Test.GPU.Vulkan.Native.AllocatorVisibility
         Test.GPU.Vulkan.Native.Frameless
         Test.GPU.Vulkan.Native.Frames
+        Test.GPU.Vulkan.Native.FramesConstruction
         Test.GPU.Vulkan.Native.FramesPresentation
         Test.GPU.Vulkan.Native.FramesRig
         Test.GPU.Vulkan.Native.FramesStandIn

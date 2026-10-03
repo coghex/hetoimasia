@@ -113,6 +113,14 @@ data FenceState
     -- ^ It was pending when the device was lost. It may never signal, it is
     -- never asked or waited on again, and it was not signalled: only the
     -- device-loss rule lets it be destroyed.
+  | FenceDestroyed
+    -- ^ The construction that made it failed, and destroying it while rolling
+    -- that construction back returned: it no longer exists. Only a record
+    -- retained because another of its objects' destruction raised holds one,
+    -- and nothing destroys it again.
+  | FenceNeverCreated
+    -- ^ The construction failed before making it: the record's handle names
+    -- nothing, and nothing destroys it.
   deriving (Eq, Show)
 
 -- | Where one binary semaphore stands. It is waited on only while a signal is
@@ -129,6 +137,11 @@ data SemaphoreState
   | SemaphoreLost
     -- ^ A signal or a wait was owed when the device was lost; neither will be
     -- observed, and only the device-loss rule lets it be destroyed.
+  | SemaphoreDestroyed
+    -- ^ Destroyed while its failed construction was rolled back, as
+    -- 'FenceDestroyed'.
+  | SemaphoreNeverCreated
+    -- ^ Never made by its failed construction, as 'FenceNeverCreated'.
   deriving (Eq, Show)
 
 -- | One frame slot's synchronization: its acquisition semaphore, the fence of
@@ -147,7 +160,10 @@ data SlotSync = SlotSync
   , syncCleanupState ∷ !FenceState
   , syncDestruction ∷ !(Maybe Text)
     -- ^ Destroying the three raised: what raised. They may already be gone, so
-    -- they are never destroyed again, under any rule.
+    -- they are never destroyed again, under any rule. A slot whose
+    -- construction failed, and whose rollback could not destroy everything it
+    -- had made, is published with this set too: each object's state then says
+    -- whether its destruction raised, returned, or was never needed.
   }
   deriving (Eq, Show)
 
@@ -181,7 +197,8 @@ data PoolSync = PoolSync
   , poolHolder ∷ !PoolHolder
   , poolDestruction ∷ !(Maybe Text)
     -- ^ Destroying the two raised: what raised. They are never destroyed
-    -- again, under any rule.
+    -- again, under any rule. Set too, as 'syncDestruction' is, on a record
+    -- whose failed construction could not be rolled back in full.
   }
   deriving (Eq, Show)
 -- | Where one frame this owner acquired stands.

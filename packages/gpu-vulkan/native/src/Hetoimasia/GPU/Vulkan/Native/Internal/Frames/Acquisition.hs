@@ -12,10 +12,19 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Acquisition
   ( tryAcquireFrame
   ) where
 
-import Control.Concurrent.STM (atomically, modifyTVar', readTVar, readTVarIO)
-import Control.Exception (SomeException, mask_, onException, rethrowIO, throwIO, tryWithContext)
-import Control.Monad (void, when)
+import Control.Concurrent.STM (STM, atomically, modifyTVar', readTVar, readTVarIO)
+import Control.Exception
+  ( ExceptionWithContext (ExceptionWithContext)
+  , SomeException
+  , displayException
+  , mask_
+  , rethrowIO
+  , throwIO
+  , tryWithContext
+  )
+import Control.Monad (forM, unless, void, when)
 import Data.Foldable (for_)
+import Data.IORef (modifyIORef', newIORef, readIORef)
 import Data.List (find)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
@@ -23,6 +32,7 @@ import qualified Data.Text as Text
 import Data.Word (Word64)
 import Numeric.Natural (Natural)
 
+import Hetoimasia.Foundation.Resource (withResourceLabelled)
 import Hetoimasia.GPU.Model
   ( AcquireAnswer (..)
   , AcquireOutcome (..)
@@ -63,7 +73,8 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Reclamation (recoveringCreation)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State (Refusal (..), checkpointed, modelAnswer, modelEdit, owned)
 import Hetoimasia.GPU.Vulkan.Native.Naming (NativeObjectKind (..), PoolObject (..), SlotObject (..), poolObjectName, slotObjectName)
 import Hetoimasia.GPU.Vulkan.Native.Roots
-  ( failRootsSessionBecause
+  ( Roots
+  , failRootsSessionBecause
   , nameRootsObject
   , readRootsInstrumentation
   , rootsCall
@@ -250,12 +261,12 @@ acquiredSomething = \case
 
 -- | The slot's synchronization, made now if the slot has none: a binary
 -- semaphore and two fences, each unsignalled, named when the device offers
--- naming. A creation or a naming that raised destroys what was made before it
--- raises, so the slot is either complete or absent; a creation that ran out of
--- memory created nothing, and is recovered as an allocation, once (VK-14). An
--- existing slot must be
--- idle: the model frees a slot only once its own obligations have ended, so
--- anything else is refused.
+-- naming. A creation that ran out of memory created nothing, and is recovered
+-- as an allocation, once (VK-14). A creation or a naming that raised is rolled
+-- back ('rollBack'): what was made is destroyed, and the slot is absent unless
+-- a destruction raised, when it is retained as uncertain. An existing slot
+-- must be idle: the model frees a slot only once its own obligations have
+-- ended, so anything else is refused.
 prepareSlot ∷ Frames q inst msgr phys dev cmd → dev → FrameSlotId → IO (Either Refusal SlotSync)
 prepareSlot frames device frame =
   (Map.lookup key <$> readTVarIO (framesSlots frames)) >>= \case
@@ -263,15 +274,49 @@ prepareSlot frames device frame =
       | reusable sync → pure (Right sync)
       | otherwise → pure (Left (RefusedIllegal ("the frame slot's synchronization is still in use: " <> Text.pack (show sync))))
     Nothing → do
-      acquisition ← semaphore
-      fence ← create "vkCreateFence" (opsCreateFence ops device) `onException` destroySemaphore acquisition
-      cleanup ← create "vkCreateFence" (opsCreateFence ops device) `onException` (destroyFence fence >> destroySemaphore acquisition)
-      name [(ObjectSemaphore, acquisition, AcquisitionSemaphore), (ObjectFence, fence, SubmissionFence), (ObjectFence, cleanup, CleanupFence)]
-        `onException` (destroyFence cleanup >> destroyFence fence >> destroySemaphore acquisition)
-      let sync = SlotSync acquisition SemaphoreUnsignalled fence FenceIdle cleanup FenceIdle Nothing
-      atomically (modifyTVar' (framesSlots frames) (Map.insert key sync))
-      pure (Right sync)
+      made ← newIORef []
+      let making object call = do
+            handle ← call
+            modifyIORef' made ((object, handle) :)
+            pure handle
+      built ← tryWithContext @SomeException $ do
+        acquisition ← making AcquisitionSemaphore semaphore
+        fence ← making SubmissionFence (create "vkCreateFence" (opsCreateFence ops device))
+        cleanup ← making CleanupFence (create "vkCreateFence" (opsCreateFence ops device))
+        name [(ObjectSemaphore, acquisition, AcquisitionSemaphore), (ObjectFence, fence, SubmissionFence), (ObjectFence, cleanup, CleanupFence)]
+        pure (SlotSync acquisition SemaphoreUnsignalled fence FenceIdle cleanup FenceIdle Nothing)
+      case built of
+        Right sync → do
+          atomically (modifyTVar' (framesSlots frames) (Map.insert key sync))
+          pure (Right sync)
+        Left failure →
+          readIORef made >>= rollBack roots ("the synchronization of slot " <> Text.pack (show key)) failure destroy retain
   where
+    destroy object handle = case object of
+      AcquisitionSemaphore → destroySemaphore handle
+      _ → destroyFence handle
+    -- Each object stands as its rollback left it: one whose destruction raised
+    -- is uncertain, one destroyed is gone, and one never made names nothing.
+    retain reason outcomes =
+      let standing object = lookup object outcomes
+          handle object = maybe 0 fst (standing object)
+          fenceState object = case standing object of
+            Nothing → FenceNeverCreated
+            Just (_, Nothing) → FenceDestroyed
+            Just (_, Just raised) → FenceUncertain raised
+          semaphoreState = case standing AcquisitionSemaphore of
+            Nothing → SemaphoreNeverCreated
+            Just (_, Nothing) → SemaphoreDestroyed
+            Just (_, Just raised) → SemaphoreUncertain raised
+       in modifyTVar' (framesSlots frames) . Map.insert key $
+            SlotSync
+              (handle AcquisitionSemaphore)
+              semaphoreState
+              (handle SubmissionFence)
+              (fenceState SubmissionFence)
+              (handle CleanupFence)
+              (fenceState CleanupFence)
+              (Just reason)
     key@(target, slot) = slotOf frame
     ops = framesOps frames
     roots = framesRoots frames
@@ -296,10 +341,11 @@ prepareSlot frames device frame =
 -- when the device offers naming — while the target holds fewer than the
 -- model's pool capacity. The model reserved the frame's pool record already,
 -- and binds no more records than that capacity, so a target with no record to
--- bind is refused as illegal rather than grown. A creation or a naming that
--- raised destroys what was made before it raises, so a record is either
--- complete or absent; a creation that ran out of memory created nothing, and
--- is recovered as an allocation, once (VK-14).
+-- bind is refused as illegal rather than grown. A creation that ran out of
+-- memory created nothing, and is recovered as an allocation, once (VK-14). A
+-- creation or a naming that raised is rolled back ('rollBack'): the record is
+-- absent unless a destruction raised, when it is retained as uncertain, held
+-- by nobody.
 preparePool ∷ Frames q inst msgr phys dev cmd → dev → FrameSlotId → IO (Either Refusal Natural)
 preparePool frames device frame = do
   (held, capacity) ← atomically $ do
@@ -316,14 +362,40 @@ preparePool frames device frame = do
               unused candidate
                 | candidate `elem` map fst held = unused (candidate + 1)
                 | otherwise = candidate
-          rendered ← create "vkCreateSemaphore" (opsCreateSemaphore ops device)
-          fence ← create "vkCreateFence" (opsCreateFence ops device) `onException` destroySemaphore rendered
-          name number [(ObjectSemaphore, rendered, RenderFinishedSemaphore), (ObjectFence, fence, PresentFence)]
-            `onException` (destroyFence fence >> destroySemaphore rendered)
-          atomically $
-            modifyTVar' (framesPool frames) (Map.insert (target, number) (PoolSync rendered SemaphoreUnsignalled fence FenceIdle (PoolHeldByFrame frame) Nothing))
-          pure (Right number)
+          made ← newIORef []
+          let making object call = do
+                handle ← call
+                modifyIORef' made ((object, handle) :)
+                pure handle
+          built ← tryWithContext @SomeException $ do
+            rendered ← making RenderFinishedSemaphore (create "vkCreateSemaphore" (opsCreateSemaphore ops device))
+            fence ← making PresentFence (create "vkCreateFence" (opsCreateFence ops device))
+            name number [(ObjectSemaphore, rendered, RenderFinishedSemaphore), (ObjectFence, fence, PresentFence)]
+            pure (PoolSync rendered SemaphoreUnsignalled fence FenceIdle (PoolHeldByFrame frame) Nothing)
+          case built of
+            Right sync → do
+              atomically (modifyTVar' (framesPool frames) (Map.insert (target, number) sync))
+              pure (Right number)
+            Left failure →
+              readIORef made
+                >>= rollBack roots ("the presentation-pool record " <> Text.pack (show (target, number))) failure destroy (retain number)
   where
+    destroy object handle = case object of
+      RenderFinishedSemaphore → destroySemaphore handle
+      _ → destroyFence handle
+    retain number reason outcomes =
+      let standing object = lookup object outcomes
+          handle object = maybe 0 fst (standing object)
+          fenceState = case standing PresentFence of
+            Nothing → FenceNeverCreated
+            Just (_, Nothing) → FenceDestroyed
+            Just (_, Just raised) → FenceUncertain raised
+          semaphoreState = case standing RenderFinishedSemaphore of
+            Nothing → SemaphoreNeverCreated
+            Just (_, Nothing) → SemaphoreDestroyed
+            Just (_, Just raised) → SemaphoreUncertain raised
+       in modifyTVar' (framesPool frames) . Map.insert (target, number) $
+            PoolSync (handle RenderFinishedSemaphore) semaphoreState (handle PresentFence) fenceState PoolFree (Just reason)
     target = frameTarget frame
     ops = framesOps frames
     roots = framesRoots frames
@@ -338,3 +410,48 @@ preparePool frames device frame = do
         Nothing → pure ()
         Just (_, instrumentation) →
           for_ objects $ \(kind, handle, object) → nameRootsObject roots instrumentation kind handle (poolObjectName target number object)
+
+-- | Roll back a synchronization construction that raised: destroy every object
+-- it made, newest first — the dependency order — each exactly once, whatever
+-- the destructions before it did.
+--
+-- When every destruction returns, nothing is retained and the construction's
+-- failure propagates as it was. When one raises, the object it named may
+-- still exist and is never destroyed again: @retain@ publishes the record,
+-- every object in it standing as its destruction left it, where retirement
+-- sees and keeps it, and the session fails with 'CleanupFailed' — without
+-- replacing an earlier terminal primary — before anything is raised. Either
+-- way the construction's failure stays primary, and each destruction that
+-- raised is retained beside it in the order it was attempted, under the
+-- @vulkan frame synchronization rollback@ label.
+rollBack
+  ∷ Eq object
+  ⇒ Roots q inst msgr phys dev
+  → Text
+  → ExceptionWithContext SomeException
+  → (object → Word64 → IO ())
+  → (Text → [(object, (Word64, Maybe Text))] → STM ())
+  → [(object, Word64)]
+  → IO a
+rollBack roots what failure destroy retain made = do
+  attempts ← forM made $ \(object, handle) → (,) (object, handle) <$> tryWithContext @SomeException (destroy object handle)
+  let raised = [caught | (_, Left caught) ← attempts]
+      outcomes = [(object, (handle, either (Just . describe) (const Nothing) attempt)) | ((object, handle), attempt) ← attempts]
+      reason =
+        "constructing "
+          <> what
+          <> " raised ("
+          <> describe failure
+          <> "), and destroying what it had made raised: "
+          <> Text.intercalate "; " (map describe raised)
+  unless (null raised) . atomically $ do
+    retain reason outcomes
+    failRootsSessionBecause roots CleanupFailed reason
+  foldr retainOne (rethrowIO failure) (reverse raised)
+  where
+    describe (ExceptionWithContext _ exception) = Text.pack (displayException exception)
+    retainOne cleanup rest = withResourceLabelled rollbackLabel (pure ()) (\() → rethrowIO cleanup) (\() → rest)
+
+-- | The cleanup label a rollback's failed destructions are retained under.
+rollbackLabel ∷ Text
+rollbackLabel = "vulkan frame synchronization rollback"
