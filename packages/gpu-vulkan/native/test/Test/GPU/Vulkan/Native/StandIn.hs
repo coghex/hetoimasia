@@ -27,6 +27,7 @@ module Test.GPU.Vulkan.Native.StandIn
   , offerNaming
   , failNaming
   , restoreNaming
+  , loseNaming
   , NamingFailure (..)
   , namesGiven
 
@@ -145,6 +146,8 @@ data Step
   | AtFrameCall
     -- ^ Never scripted here: the frames' stand-in names a loss one of its own
     -- calls raised with it.
+  | AtNaming
+    -- ^ Never scripted here: a naming 'loseNaming' made lose the device.
   deriving (Eq, Ord, Show, Enum, Bounded)
 
 -- | What a scripted step does instead of succeeding.
@@ -198,6 +201,8 @@ data StandIn = StandIn
     -- ^ Whether the device offers naming; off unless an example turns it on.
   , standNameFails ∷ !(TVar [NativeObjectKind])
     -- ^ Kinds whose naming raises 'NamingFailure'.
+  , standNameLosses ∷ !(TVar [NativeObjectKind])
+    -- ^ Kinds whose naming loses the device.
   , standAllocator ∷ !AllocatorStandIn
     -- ^ The allocator every device of this stand-in is given.
   }
@@ -212,6 +217,7 @@ newStandIn = do
     <*> newTVarIO (pure ())
     <*> newTVarIO 100
     <*> newTVarIO False
+    <*> newTVarIO []
     <*> newTVarIO []
     <*> newAllocatorStandIn
 
@@ -288,6 +294,11 @@ failNaming standIn kind = atomically (modifyTVar' (standNameFails standIn) (kind
 -- | Have naming of this kind succeed again.
 restoreNaming ∷ StandIn → NativeObjectKind → IO ()
 restoreNaming standIn kind = atomically (modifyTVar' (standNameFails standIn) (filter (/= kind)))
+
+-- | Have every later naming of an object of this kind raise 'StandInLoss'
+-- once it is recorded, which the stand-in classifies as device loss.
+loseNaming ∷ StandIn → NativeObjectKind → IO ()
+loseNaming standIn kind = atomically (modifyTVar' (standNameLosses standIn) (kind :))
 
 -- | A naming call the stand-in was told to fail.
 newtype NamingFailure = NamingFailure NativeObjectKind
@@ -394,6 +405,8 @@ standInOps standIn =
             then Nothing
             else Just $ Instrumentation $ \kind handle name → do
               record standIn (Named kind handle name)
+              losing ← elem kind <$> readTVarIO (standNameLosses standIn)
+              if losing then throwIO (StandInLoss AtNaming) else pure ()
               failing ← elem kind <$> readTVarIO (standNameFails standIn)
               if failing then throwIO (NamingFailure kind) else pure ()
     , opsGenerations =
