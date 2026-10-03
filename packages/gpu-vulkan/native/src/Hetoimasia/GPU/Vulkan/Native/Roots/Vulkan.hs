@@ -44,6 +44,7 @@ import Foreign.Ptr (FunPtr, Ptr, castFunPtr, castPtr, nullFunPtr, ptrToWordPtr)
 import Vulkan.CStruct.Extends (Chain, SomeStruct (..))
 import Vulkan.Core10
 import Vulkan.Core11 (PhysicalDeviceFeatures2 (..), enumerateInstanceVersion, getPhysicalDeviceFeatures2)
+import Vulkan.Core12 (PhysicalDeviceVulkan12Features (..))
 import Vulkan.Core13 (PhysicalDeviceVulkan13Features (..))
 import Vulkan.Exception (VulkanException (..))
 import Vulkan.Dynamic (DeviceCmds (..))
@@ -85,7 +86,8 @@ import Hetoimasia.GPU.Vulkan.Native.Diagnostics
 import Hetoimasia.GPU.Vulkan.Native.Allocator.Vulkan (vmaAllocatorOps)
 import Hetoimasia.GPU.Vulkan.Native.Naming (Instrumentation (..), objectTypeCode)
 import Hetoimasia.GPU.Vulkan.Native.Profile
-  ( DeviceOffer (..)
+  ( BindlessFeatures (..)
+  , DeviceOffer (..)
   , DevicePlan (..)
   , InstanceOffer (..)
   , InstancePlan (..)
@@ -310,7 +312,7 @@ deviceOffers created bootstrap = do
   (_, devices) ← enumeratePhysicalDevices created
   forM (Vector.toList devices) $ \physical → do
     properties ← getPhysicalDeviceProperties physical
-    features ∷ PhysicalDeviceFeatures2 '[PhysicalDeviceVulkan13Features, PhysicalDeviceSwapchainMaintenance1FeaturesKHR] ←
+    features ∷ PhysicalDeviceFeatures2 '[PhysicalDeviceVulkan12Features, PhysicalDeviceVulkan13Features, PhysicalDeviceSwapchainMaintenance1FeaturesKHR] ←
       getPhysicalDeviceFeatures2 physical
     (_, extensions) ← enumerateDeviceExtensionProperties physical Nothing
     families ← getPhysicalDeviceQueueFamilyProperties physical
@@ -322,7 +324,7 @@ deviceOffers created bootstrap = do
           , familyGraphics = family.queueFlags .&. QUEUE_GRAPHICS_BIT /= zero
           , familyPresents = presents
           }
-    let (thirteen, (maintenance, ())) = features.next
+    let (twelve, (thirteen, (maintenance, ()))) = features.next
     pure
       DeviceOffer
         { offerDevice = physical
@@ -332,21 +334,40 @@ deviceOffers created bootstrap = do
         , offerDynamicRendering = thirteen.dynamicRendering
         , offerSynchronization2 = thirteen.synchronization2
         , offerSwapchainMaintenance1 = maintenance.swapchainMaintenance1
+        , offerBindless =
+            BindlessFeatures
+              { featureRuntimeDescriptorArray = twelve.runtimeDescriptorArray
+              , featurePartiallyBound = twelve.descriptorBindingPartiallyBound
+              , featureSampledImageUpdateAfterBind = twelve.descriptorBindingSampledImageUpdateAfterBind
+              , featureSampledImageNonUniformIndexing = twelve.shaderSampledImageArrayNonUniformIndexing
+              , featureVariableDescriptorCount = twelve.descriptorBindingVariableDescriptorCount
+              , featureUpdateUnusedWhilePending = twelve.descriptorBindingUpdateUnusedWhilePending
+              }
         , offerTextureCompressionBC = features.features.textureCompressionBC
         , offerQueueFamilies = offered
         }
 
--- | One queue from the chosen family, the profile's features, and its
--- extensions; and @textureCompressionBC@ when the plan enables it, which is
--- the one optional feature.
+-- | One queue from the chosen family, the profile's features — the texture
+-- table's six descriptor-indexing features among them — and its extensions;
+-- and @textureCompressionBC@ when the plan enables it, which is the one
+-- optional feature.
 deviceCreateInfo
   ∷ DevicePlan PhysicalDevice
-  → DeviceCreateInfo '[PhysicalDeviceVulkan13Features, PhysicalDeviceSwapchainMaintenance1FeaturesKHR]
+  → DeviceCreateInfo '[PhysicalDeviceVulkan12Features, PhysicalDeviceVulkan13Features, PhysicalDeviceSwapchainMaintenance1FeaturesKHR]
 deviceCreateInfo plan =
   DeviceCreateInfo
     { next =
-        ( (zero ∷ PhysicalDeviceVulkan13Features) {dynamicRendering = True, synchronization2 = True}
-        , (PhysicalDeviceSwapchainMaintenance1FeaturesKHR {swapchainMaintenance1 = True}, ())
+        ( (zero ∷ PhysicalDeviceVulkan12Features)
+            { runtimeDescriptorArray = True
+            , descriptorBindingPartiallyBound = True
+            , descriptorBindingSampledImageUpdateAfterBind = True
+            , shaderSampledImageArrayNonUniformIndexing = True
+            , descriptorBindingVariableDescriptorCount = True
+            , descriptorBindingUpdateUnusedWhilePending = True
+            }
+        , ( (zero ∷ PhysicalDeviceVulkan13Features) {dynamicRendering = True, synchronization2 = True}
+          , (PhysicalDeviceSwapchainMaintenance1FeaturesKHR {swapchainMaintenance1 = True}, ())
+          )
         )
     , flags = zero
     , queueCreateInfos =

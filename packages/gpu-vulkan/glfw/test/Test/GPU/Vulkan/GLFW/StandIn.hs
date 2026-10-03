@@ -232,6 +232,7 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   )
 import Hetoimasia.GPU.Vulkan.Native.Profile
   ( DeviceOffer (..)
+  , allBindlessFeatures
   , DevicePlan (..)
   , InstanceOffer (..)
   , QueueFamilyOffer (..)
@@ -608,6 +609,7 @@ nativeLayer rescued events native allocator capture =
               , offerDynamicRendering = True
               , offerSynchronization2 = True
               , offerSwapchainMaintenance1 = True
+              , offerBindless = allBindlessFeatures
               , offerTextureCompressionBC = True
               , -- Without a surface, nothing is asked about presentation.
                 offerQueueFamilies = [QueueFamilyOffer 0 True (maybe False (`Set.notMember` unsupported) bootstrap)]

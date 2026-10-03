@@ -2,7 +2,10 @@
 -- the session takes.
 module Test.GPU.Vulkan.Native.Profile (spec) where
 
+import Control.Exception (displayException)
 import qualified Data.ByteString as ByteString
+import Data.Foldable (for_)
+import Data.Text (Text)
 import qualified Data.Text as Text
 import Hetoimasia.GPU.Vulkan.Native.Naming
   ( NativeObjectKind (..)
@@ -134,6 +137,7 @@ spec = describe "Profile" $ do
               , offerDynamicRendering = False
               , offerSynchronization2 = False
               , offerSwapchainMaintenance1 = False
+              , offerBindless = BindlessFeatures False False False False False False
               , offerQueueFamilies = []
               }
       selectDevice [poor]
@@ -148,11 +152,33 @@ spec = describe "Profile" $ do
                   , DeviceFeatureMissing "dynamicRendering"
                   , DeviceFeatureMissing "synchronization2"
                   , DeviceFeatureMissing "swapchainMaintenance1"
+                  , DeviceFeatureMissing "runtimeDescriptorArray"
+                  , DeviceFeatureMissing "descriptorBindingPartiallyBound"
+                  , DeviceFeatureMissing "descriptorBindingSampledImageUpdateAfterBind"
+                  , DeviceFeatureMissing "shaderSampledImageArrayNonUniformIndexing"
+                  , DeviceFeatureMissing "descriptorBindingVariableDescriptorCount"
+                  , DeviceFeatureMissing "descriptorBindingUpdateUnusedWhilePending"
                   , DeviceNoPresentingGraphicsFamily
                   ]
                 )
               ]
           )
+
+    it "refuses a device missing any of the texture table's descriptor-indexing features, naming each it lacks (GRS-7)" $ do
+      let lacking = standInDevice {offerBindless = allBindlessFeatures {featureVariableDescriptorCount = False, featureUpdateUnusedWhilePending = False}}
+          refusal =
+            NoCompatibleDevice
+              [ ( "stand-in device"
+                , [DeviceFeatureMissing "descriptorBindingVariableDescriptorCount", DeviceFeatureMissing "descriptorBindingUpdateUnusedWhilePending"]
+                )
+              ]
+      selectDevice [lacking] `shouldBe'` Left refusal
+      selectSurfaceFreeDevice [lacking] `shouldBe'` Left refusal
+      displayException refusal
+        `shouldBe` "no physical device satisfies the Vulkan profile: stand-in device (no descriptorBindingVariableDescriptorCount, no descriptorBindingUpdateUnusedWhilePending)"
+      -- Every one of the six is required, one at a time.
+      for_ allMissing $ \(missing, name) →
+        selectDevice [standInDevice {offerBindless = missing}] `shouldBe'` Left (NoCompatibleDevice [("stand-in device", [DeviceFeatureMissing name])])
 
     it "fails structurally when no device was enumerated at all" $
       selectDevice ([] ∷ [DeviceOffer ()]) `shouldBe'` Left (NoCompatibleDevice [])
@@ -191,3 +217,14 @@ rightOf = either (\refused → fail ("expected a plan, but: " <> show refused)) 
 -- the native layer's device handle.
 shouldBe' ∷ Either NoCompatibleDevice (DevicePlan device) → Either NoCompatibleDevice () → IO ()
 shouldBe' actual expected = fmap (const ()) actual `shouldBe` expected
+
+-- | The six texture-table features, each alone missing, with its name.
+allMissing ∷ [(BindlessFeatures, Text)]
+allMissing =
+  [ (allBindlessFeatures {featureRuntimeDescriptorArray = False}, "runtimeDescriptorArray")
+  , (allBindlessFeatures {featurePartiallyBound = False}, "descriptorBindingPartiallyBound")
+  , (allBindlessFeatures {featureSampledImageUpdateAfterBind = False}, "descriptorBindingSampledImageUpdateAfterBind")
+  , (allBindlessFeatures {featureSampledImageNonUniformIndexing = False}, "shaderSampledImageArrayNonUniformIndexing")
+  , (allBindlessFeatures {featureVariableDescriptorCount = False}, "descriptorBindingVariableDescriptorCount")
+  , (allBindlessFeatures {featureUpdateUnusedWhilePending = False}, "descriptorBindingUpdateUnusedWhilePending")
+  ]
