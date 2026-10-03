@@ -23,10 +23,19 @@ receipt is in that run's `validation-receipts-glfw-native` artifact as
 under `tools/display/x11.sh`, with 113 examples, 0 failures, and 23 pending —
 this tree's 21 examples and the two optional probes.
 
-Only this record, which is Markdown no group consumes, changes after that
-commit, so the run stays input-equivalent to the head it ships with:
-`plan.py --base 22e966a --head HEAD` reports `test.glfw-wayland` unaffected.
-That has to be rechecked whenever the head moves for any other reason.
+Input equivalence holds only between the tested commit `22e966a` and the
+documentation-only commit `b82c3e0` that retains this record: both resolve to
+input identity `bba4281597797e82c96f326173ab8ac7d0861eea4ddbc684f52c2df829faf773`,
+and `plan.py --base 22e966a --head b82c3e0` reports `test.glfw-wayland` unaffected. The pull
+request's final head `dc9e7e5`, a merge of master, changed inputs `test.glfw-wayland`
+consumes and resolves to
+`892f379cc67d1426b1ca0ec68094c3182d05d324c2ea510455195ce3e196e45a`, as does its
+merge `2c0d9be`; the run above does not answer for them. Validation run
+[36278468804](https://github.com/coghex/hetoimasia/actions/runs/36278468804) ran `test.glfw-wayland`
+at `dc9e7e5`'s merge candidate `ae1a71f`, under identity
+`892f379cc67d1426b1ca0ec68094c3182d05d324c2ea510455195ce3e196e45a`, and passed. That
+run's output is not retained in this record and qualifies nothing beyond that
+candidate.
 
 ## Identity
 
@@ -196,10 +205,19 @@ preparation. The same job's `test.vulkan-native` passed unchanged under
 passed `test.glfw-wayland`. Attempt 1 of the same run, at the same candidate,
 had passed all three as well.
 
-Only this record, which is Markdown no group consumes, changes after that
-commit, so the run stays input-equivalent to the head it ships with:
-`plan.py --base a629bcb --head HEAD` reports `test.vulkan-wayland` unaffected.
-That has to be rechecked whenever the head moves for any other reason.
+Input equivalence holds only between the tested commit `a629bcb` and the
+documentation-only commit `8221b49` that retains this record: both resolve to
+input identity `a9289558af2bf4615bd590f1ea6449abc511115d1ef6f3fe8ba8bf5507350e8f`,
+and `plan.py --base a629bcb --head 8221b49` reports `test.vulkan-wayland` unaffected. The pull
+request's final head `bf4d9c6`, a merge of master, changed inputs `test.vulkan-wayland`
+consumes (the integration also changed the catalog and the validation workflow) and resolves to
+`8e405cc68c702b3421f8067d499ada961fc01c9e6154bc4fd5bd341532ccb33a`, as does its
+merge `32eb02e`; the run above does not answer for them. Validation run
+[36732679086](https://github.com/coghex/hetoimasia/actions/runs/36732679086) ran `test.vulkan-wayland`
+at `bf4d9c6`'s merge candidate `e4b59d3`, under identity
+`8e405cc68c702b3421f8067d499ada961fc01c9e6154bc4fd5bd341532ccb33a`, and passed. That
+run's output is not retained in this record and qualifies nothing beyond that
+candidate.
 
 ### Identity
 
@@ -524,10 +542,19 @@ that run's `validation-receipts-vulkan` artifact. An earlier run of the same
 case at `ac0b65c`, before review narrowed which step a hide waits for
 (run 36742775061), passed with the same VK-16 counts.
 
-Only this record, which is Markdown no group consumes, changes after that
-commit, so the run stays input-equivalent to the head it ships with:
-`plan.py --base 1cd3c3f --head HEAD` reports `test.vulkan-wayland` unaffected.
-That has to be rechecked whenever the head moves for any other reason.
+Input equivalence holds only between the tested commit `1cd3c3f` and the
+documentation-only commit `d290a26` that retains this record: both resolve to
+input identity `24e84bd58a620fbc0a1956545c001d787ce492a193dc7afd9d23758436007564`,
+and `plan.py --base 1cd3c3f --head d290a26` reports `test.vulkan-wayland` unaffected. The pull
+request's final head `d7950bd`, a merge of master, changed inputs `test.vulkan-wayland`
+consumes and resolves to
+`4e08e5381fa0c9bf6b6508aa8c8eba96149be5e94cae46c920b4e4d05bd987b1`, as does its
+merge `beaa883`; the run above does not answer for them. Validation run
+[36777858887](https://github.com/coghex/hetoimasia/actions/runs/36777858887) ran `test.vulkan-wayland`
+at `d7950bd`'s merge candidate `ec02817`, under identity
+`4e08e5381fa0c9bf6b6508aa8c8eba96149be5e94cae46c920b4e4d05bd987b1`, and passed. That
+run's output is not retained in this record and qualifies nothing beyond that
+candidate.
 
 ### Identity
 
