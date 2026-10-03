@@ -239,7 +239,7 @@ ownerWait owner token = do
     Nothing → pure (pure False)
     Just due → do
       now ← readInstant (ownerClock owner)
-      if deadlineReached now due then pure (pure True) else arm (remainingUntil now due)
+      if deadlineReached now due then pure (pure True) else arm due (remainingUntil now due)
   atomically $ do
     stopping ← stopRequested token
     failing ← isJust <$> readTVar (ownerLatch owner)

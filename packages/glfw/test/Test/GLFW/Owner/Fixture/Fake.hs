@@ -29,7 +29,7 @@ import Control.Concurrent.STM
 import Control.Exception (SomeException, throwIO, try)
 import Data.Text (Text)
 import qualified Data.Text as Text
-import Hetoimasia.Foundation.Time (Duration)
+import Hetoimasia.Foundation.Time (Duration, Instant, deadlineReached, scriptedInstant, zeroDuration)
 import Hetoimasia.Runtime.GLFW
 import Test.GLFW.Owner.Fixture.Journal (Note (..), Scene, note)
 
@@ -136,24 +136,37 @@ script cell = atomically . writeTVar cell
 -- ---------------------------------------------------------------------------
 -- The timer
 
--- | A timer nothing but the example fires. Arming it records the duration
--- asked for; firing it releases every wait armed so far.
+-- | A timer nothing but the example fires.
+--
+-- Arming it records the deadline and the remaining duration the owner gave
+-- it. It decides expiry by comparing a scripted clock of its own with that
+-- deadline, and only 'fireTimer' moves that clock. It does not read the
+-- owner's counting clock: that clock advances on every reading, so a deadline
+-- compared with it would come due by however often the owner and the main
+-- thread happened to read it, not when the example says.
 data ScriptedTimer = ScriptedTimer
-  { timerArmings ∷ !(TVar [Duration])
-  , timerFired ∷ !(TVar Bool)
+  { timerArmings ∷ !(TVar [(Instant, Duration)])
+    -- ^ Every arming's deadline and the duration that remained until it at
+    -- the owner's reading, oldest first.
+  , timerNow ∷ !(TVar Instant)
+    -- ^ The timer's clock, from the script's origin.
   }
 
 newScriptedTimer ∷ IO (ScriptedTimer, OwnerTimer)
 newScriptedTimer = do
   armings ← newTVarIO []
-  fired ← newTVarIO False
-  let timer = ScriptedTimer armings fired
+  now ← newTVarIO (scriptedInstant zeroDuration)
+  let timer = ScriptedTimer armings now
   pure
     ( timer
-    , ownerTimer $ \duration → do
-        atomically (modifyTVar' armings (<> [duration]))
-        pure (readTVar fired)
+    , ownerTimer $ \due remaining → do
+        atomically (modifyTVar' armings (<> [(due, remaining)]))
+        pure ((`deadlineReached` due) <$> readTVar now)
     )
 
+-- | Move the timer's clock to the latest deadline armed so far, which releases
+-- every wait armed so far and any later one for a deadline no later than it.
 fireTimer ∷ ScriptedTimer → IO ()
-fireTimer timer = atomically (writeTVar (timerFired timer) True)
+fireTimer timer = atomically $ do
+  armed ← readTVar (timerArmings timer)
+  modifyTVar' (timerNow timer) (\now → maximum (now : map fst armed))

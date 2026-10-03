@@ -21,10 +21,12 @@ import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust, isNothing)
 import qualified Data.Text as Text
 import Hetoimasia.Foundation.Messaging.Payload (prepare)
+import Hetoimasia.Foundation.Time (addDuration, elapsedBetween, scriptedSource)
 import qualified Hetoimasia.Foundation.Worker as Worker
 import Hetoimasia.GLFW.Internal.Seam (NativeCall (..))
 import Hetoimasia.Runtime.GLFW
 import qualified Hetoimasia.Runtime.GLFW.Internal as Private
+import qualified Hetoimasia.Runtime.GLFW.Internal.Owner as Private (owedRetirementFallback)
 import Test.GLFW.Owner.Fixture.Drive
   ( awaitConstructed
   , awaitIdle
@@ -49,7 +51,7 @@ import Test.GLFW.Owner.Fixture.Rig
   , ownedHostHooked
   , ownerSettings
   )
-import Test.GLFW.Support (boundedExample, quietLogger, unexpected, windowNamed)
+import Test.GLFW.Support (at, boundedExample, millis, quietLogger, unexpected, windowNamed)
 import Test.Hspec (Spec, it, shouldBe, shouldReturn, shouldSatisfy)
 
 spec ∷ Spec
@@ -62,6 +64,8 @@ spec = do
     (boundedExample testOwedRetirementRetried)
   it "waits in its exit drain for a retirement still owed, and retires the target before the owner"
     (boundedExample testOwedRetirementDrained)
+  it "hands its exit drain's timer the backend's deadline, or its fallback interval after the drain's own reading"
+    (boundedExample testDrainTimerGivenDeadline)
   it "leaves a retirement owed, not failed, when a cancellation lands in its preparation, and retires it in the drain"
     (boundedExample testPreparationCancelled)
   it "retires the target of a window closed through its own port, with no detach at all"
@@ -205,6 +209,52 @@ testOwedRetirementDrained = do
   readTVarIO asked `shouldReturn` 2
   armings ← readTVarIO (timerArmings (rigTimer rig))
   armings `shouldSatisfy` (not . null)
+
+-- | The exit drain gives its timer the deadline the backend asked for, and,
+-- when the backend names none, the instant 'Private.owedRetirementFallback'
+-- after the drain's own reading — each beside the duration that remained until
+-- it at that reading. The clock stands still here, so every reading is the
+-- same instant.
+testDrainTimerGivenDeadline ∷ IO ()
+testDrainTimerGivenDeadline = do
+  base ← newRig
+  let reading = at (millis 7)
+      asked = at (millis 47)
+      rig = base {rigHostConfig = ownerSettings (scriptedSource (pure reading))}
+  ownerCell ← newTVarIO Nothing
+  prepared ← newTVarIO (0 ∷ Int)
+  deadlines ← newTVarIO (0 ∷ Int)
+  let draining = readTVar ownerCell >>= fmap (== Just OwnerRetiring) . traverse (fmap statusPhase . readOwnerStatusNow)
+  -- Owed until the drain's third ask, so it waits twice: first for the
+  -- backend's own deadline, then, with none named, for its fallback.
+  script (fakePrepare (rigFake rig)) $ \_ → atomically $ do
+    inDrain ← draining
+    when inDrain (modifyTVar' prepared (+ 1))
+    count ← readTVar prepared
+    pure (if inDrain && count > 2 then RetirementReady else RetirementOwed (Text.pack "a present fence is pending"))
+  script (fakeDeadline (rigFake rig)) $ atomically $ do
+    inDrain ← draining
+    when inDrain (modifyTVar' deadlines (+ 1))
+    count ← readTVar deadlines
+    pure (if inDrain && count == 1 then OwnerDeadline asked else NoOwnerDemand)
+  ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control → do
+    atomically (writeTVar ownerCell (Just owner))
+    window ← theWindow host
+    _ ← handedOver host owner window
+    awaitConstructed rig (Text.pack (show window))
+    _ ← forkIO $ do
+      atomically (readTVar (timerArmings (rigTimer rig)) >>= check . (>= 1) . length)
+      fireTimer (rigTimer rig)
+      atomically (readTVar (timerArmings (rigTimer rig)) >>= check . (>= 2) . length)
+      fireTimer (rigTimer rig)
+    pure ()
+  readTVarIO prepared `shouldReturn` 3
+  armings ← readTVarIO (timerArmings (rigTimer rig))
+  let fallback = either (error . show) id (addDuration reading Private.owedRetirementFallback)
+  armings
+    `shouldBe` [ (asked, elapsedBetween reading asked)
+               , (fallback, Private.owedRetirementFallback)
+               ]
 
 -- | A cancellation delivered inside a retirement's preparation ends the
 -- owner's run as any cancellation does, but it is not a failed retirement:

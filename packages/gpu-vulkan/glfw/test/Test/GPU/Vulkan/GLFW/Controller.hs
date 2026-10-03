@@ -22,7 +22,6 @@ import Data.List (isSubsequenceOf, nub)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust, isNothing)
 import qualified Data.Text
-import System.Timeout (timeout)
 import Hetoimasia.GPU.Model (SessionFailureCause (DeviceLost), SessionState (..), TargetPhase (..), TargetView (..), sessionState, targetView)
 import Hetoimasia.Foundation.Time (Instant)
 import Hetoimasia.GPU.Model.Identity (TargetClass (..))
@@ -78,80 +77,81 @@ import Hetoimasia.Runtime.GLFW
   , windowGraphicsService
   )
 import Hetoimasia.Runtime.Supervision (checkRuntime)
+import Test.GPU.Vulkan.GLFW.Bound (boundOf, boundedIt)
 import Test.GPU.Vulkan.GLFW.StandIn
-import Test.Hspec (Expectation, Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
+import Test.Hspec (Spec, describe, expectationFailure, shouldBe, shouldSatisfy)
 
 spec ∷ Spec
 spec = describe "Vulkan controller" $ do
   describe "handing targets over" $ do
-    it "creates each surface on the main thread, and every root and destruction on the owner's thread" (bounded testThreadPlacement)
-    it "selects the device against the first surface and shares it with the second, recording each designation" (bounded testSharedDevice)
-    it "attaches nothing before the owner has leased an instance" (bounded testNotReady)
-    it "rejects a surface the session's queue family cannot present to, leaving the device and the other target as they were" (bounded testIncompatible)
-    it "destroys an unusable surface on the owner's thread and rolls its target back" (bounded testUnusable)
-    it "rolls back a target whose surface was never created, destroying nothing" (bounded testNotCreated)
+    itBounded "creates each surface on the main thread, and every root and destruction on the owner's thread" testThreadPlacement
+    itBounded "selects the device against the first surface and shares it with the second, recording each designation" testSharedDevice
+    itBounded "attaches nothing before the owner has leased an instance" testNotReady
+    itBounded "rejects a surface the session's queue family cannot present to, leaving the device and the other target as they were" testIncompatible
+    itBounded "destroys an unusable surface on the owner's thread and rolls its target back" testUnusable
+    itBounded "rolls back a target whose surface was never created, destroying nothing" testNotCreated
 
   describe "construction rollback" $ do
-    it "at the instance: destroys nothing" (bounded (testStartupFails AtCreateInstance []))
-    it "at the messenger: destroys the instance" (bounded (testStartupFails AtCreateMessenger [InstanceDestroyed]))
-    it "at the device query: destroys the bootstrap surface, the messenger and the instance" (bounded (testBootstrapFails AtQueryDevices))
-    it "at the device: destroys the bootstrap surface, the messenger and the instance" (bounded (testBootstrapFails AtCreateDevice))
-    it "with no compatible device: fails structurally and destroys the same" (bounded testNoCompatibleDevice)
+    itBounded "at the instance: destroys nothing" (testStartupFails AtCreateInstance [])
+    itBounded "at the messenger: destroys the instance" (testStartupFails AtCreateMessenger [InstanceDestroyed])
+    itBounded "at the device query: destroys the bootstrap surface, the messenger and the instance" (testBootstrapFails AtQueryDevices)
+    itBounded "at the device: destroys the bootstrap surface, the messenger and the instance" (testBootstrapFails AtCreateDevice)
+    itBounded "with no compatible device: fails structurally and destroys the same" testNoCompatibleDevice
 
   describe "cancellation" $ do
-    it "during the handoff's surface creation leaves the attachment announced and the instance retained until the owner settles it" (bounded testCancelledHandoff)
-    it "delivered repeatedly during the exit changes neither the destruction order nor the join" (bounded testRepeatedCancellation)
+    itBounded "during the handoff's surface creation leaves the attachment announced and the instance retained until the owner settles it" testCancelledHandoff
+    itBounded "delivered repeatedly during the exit changes neither the destruction order nor the join" testRepeatedCancellation
 
   describe "a full owner port" $ do
-    it "leaves a deferred attachment the owner destroys on its own thread once it is released" (bounded testDeferredReleased)
-    it "lets a deferred attachment be announced again and admitted" (bounded testDeferredAnnounced)
-    it "reports a deferred surface whose destruction failed at a checkpoint, never retries it, and retains its parents" (bounded testDeferredUncertain)
-    it "watches an attachment whose answer a cancellation lost after publication, when its recovered announcement finds the port full" (bounded testRecoveredDeferred)
-    it "watches a refused attachment even when the owner drains its port and goes idle before the handover answers" (bounded testRefusalThenIdle)
+    itBounded "leaves a deferred attachment the owner destroys on its own thread once it is released" testDeferredReleased
+    itBounded "lets a deferred attachment be announced again and admitted" testDeferredAnnounced
+    itBounded "reports a deferred surface whose destruction failed at a checkpoint, never retries it, and retains its parents" testDeferredUncertain
+    itBounded "watches an attachment whose answer a cancellation lost after publication, when its recovered announcement finds the port full" testRecoveredDeferred
+    itBounded "watches a refused attachment even when the owner drains its port and goes idle before the handover answers" testRefusalThenIdle
 
   describe "close and exit" $ do
-    it "closing the first-created window retires its target alone, leaving the shared roots and the second target live" (bounded testCloseFirst)
-    it "releasing one target destroys its surface before its terminal record, with the owner and the other target live" (bounded testRelease)
-    it "a whole-host exit destroys every surface, the device, the messenger and the instance, then joins the owner before any window goes" (bounded testExitOrder)
-    it "a destruction still pending certifies nothing" (bounded testPendingDestruction)
+    itBounded "closing the first-created window retires its target alone, leaving the shared roots and the second target live" testCloseFirst
+    itBounded "releasing one target destroys its surface before its terminal record, with the owner and the other target live" testRelease
+    itBounded "a whole-host exit destroys every surface, the device, the messenger and the instance, then joins the owner before any window goes" testExitOrder
+    itBounded "a destruction still pending certifies nothing" testPendingDestruction
 
   describe "device loss" $ do
-    it "closes admission at once and reaches an application checkpoint while retirement is still pending" (bounded testLossReachesCheckpoint)
-    it "keeps the loss primary, never retries a failed destruction, and retains its parents without certifying the attachment" (bounded testLossWithFailedCleanup)
-    it "treats an unknown outcome as neither device loss nor destruction" (bounded testUnknownOutcome)
+    itBounded "closes admission at once and reaches an application checkpoint while retirement is still pending" testLossReachesCheckpoint
+    itBounded "keeps the loss primary, never retries a failed destruction, and retains its parents without certifying the attachment" testLossWithFailedCleanup
+    itBounded "treats an unknown outcome as neither device loss nor destruction" testUnknownOutcome
 
   describe "terminal failure" $ do
-    it "latches a validation error reported inside a native call as the primary at the owner's next checkpoint, refusing every later handover naming it" (bounded testValidationStops)
-    it "latches an error whose record a full capture dropped, since the latch is set before the record is admitted" (bounded testDroppedErrorStops)
-    it "latches a sink failure as a terminal status of its own, with the capture's verdict saying so" (bounded testSinkFailure)
-    it "wakes an idle owner when the capture's worker records a sink failure, with nothing else published" (bounded testIdleSinkWakes)
-    it "keeps a sink failure that came first as the primary when a validation error arrives before the next checkpoint" (bounded testSinkThenError)
-    it "refuses a handover while a sink failure has claimed the order but not yet published, latching nothing until it has" (bounded testClaimedSinkPending)
-    it "admits no target whose construction begins after a validation error arrived, making no native call for it" (bounded testQueuedConstructionStops)
-    it "reports what an exit could not verify as retained, beside the cleanup failure that is its primary" (bounded testRetentionReported)
-    it "keeps the dependency order and the loss when cancellation is delivered repeatedly during the drain that follows it" (bounded testCancelledAfterLoss)
-    it "latches the failed destruction of a surface created while the lease closed, beside the earlier primary, and retains the instance" (bounded testLateSurfaceFails)
-    it "latches each surface destruction that fails in one pass as a cleanup failure of its own, naming its surface" (bounded testSeveralDischargesFail)
-    it "latches the failed destructions of two distinct surfaces that share a handle, each with its own attachment" (bounded testReusedHandleFails)
+    itBounded "latches a validation error reported inside a native call as the primary at the owner's next checkpoint, refusing every later handover naming it" testValidationStops
+    itBounded "latches an error whose record a full capture dropped, since the latch is set before the record is admitted" testDroppedErrorStops
+    itBounded "latches a sink failure as a terminal status of its own, with the capture's verdict saying so" testSinkFailure
+    itBounded "wakes an idle owner when the capture's worker records a sink failure, with nothing else published" testIdleSinkWakes
+    itBounded "keeps a sink failure that came first as the primary when a validation error arrives before the next checkpoint" testSinkThenError
+    itBounded "refuses a handover while a sink failure has claimed the order but not yet published, latching nothing until it has" testClaimedSinkPending
+    itBounded "admits no target whose construction begins after a validation error arrived, making no native call for it" testQueuedConstructionStops
+    itBounded "reports what an exit could not verify as retained, beside the cleanup failure that is its primary" testRetentionReported
+    itBounded "keeps the dependency order and the loss when cancellation is delivered repeatedly during the drain that follows it" testCancelledAfterLoss
+    itBounded "latches the failed destruction of a surface created while the lease closed, beside the earlier primary, and retains the instance" testLateSurfaceFails
+    itBounded "latches each surface destruction that fails in one pass as a cleanup failure of its own, naming its surface" testSeveralDischargesFail
+    itBounded "latches the failed destructions of two distinct surfaces that share a handle, each with its own attachment" testReusedHandleFails
 
   describe "progress" $
-    it "reports no work and no deadline while nothing is deferred and no frame is wanted" (bounded testNoDemand)
+    itBounded "reports no work and no deadline while nothing is deferred and no frame is wanted" testNoDemand
 
   describe "recovering a lost surface (VK-14)" $ do
-    it "replaces it on the main thread under the same attachment, after its generation and then the lost surface went on the owner's thread, and leaves the other target alone" (bounded testSurfaceReplaced)
-    it "lets a close defeat a replacement still asked for: nothing is created, and the target retires" (bounded testReplacementAfterClose)
-    it "asks the main thread once for a replacement whose attempt another target's retirement admitted, and settles it" (bounded testReplacementAdmittedByRetirement)
-    it "reports an optional target whose episode was spent unavailable, while the other target keeps its generation" (bounded testOptionalSpent)
-    it "fails the session at a checkpoint when a required target's episode is spent" (bounded testRequiredSpent)
-    it "disposes of an optional target whose replacement the device cannot present to, destroying that surface on the owner's thread, with no second device" (bounded testUnsupportedOptional)
-    it "fails the session when a required target's replacement cannot be presented to" (bounded testUnsupportedRequired)
-    it "spends no attempt for an ordinary resize, and one for each out-of-date result at unchanged geometry" (bounded testResizeVersusFailure)
+    itBounded "replaces it on the main thread under the same attachment, after its generation and then the lost surface went on the owner's thread, and leaves the other target alone" testSurfaceReplaced
+    itBounded "lets a close defeat a replacement still asked for: nothing is created, and the target retires" testReplacementAfterClose
+    itBounded "asks the main thread once for a replacement whose attempt another target's retirement admitted, and settles it" testReplacementAdmittedByRetirement
+    itBounded "reports an optional target whose episode was spent unavailable, while the other target keeps its generation" testOptionalSpent
+    itBounded "fails the session at a checkpoint when a required target's episode is spent" testRequiredSpent
+    itBounded "disposes of an optional target whose replacement the device cannot present to, destroying that surface on the owner's thread, with no second device" testUnsupportedOptional
+    itBounded "fails the session when a required target's replacement cannot be presented to" testUnsupportedRequired
+    itBounded "spends no attempt for an ordinary resize, and one for each out-of-date result at unchanged geometry" testResizeVersusFailure
 
   describe "swapchain generations" $ do
-    it "builds a visible target's generation on the owner's thread, from the framebuffer the owner last observed, and the exit destroys it" (bounded testGenerationBuilt)
-    it "replaces it after a resize the owner observed, handing the old one over, and destroys the old one only once its hold ends" (bounded testGenerationReplaced)
-    it "builds nothing for a hidden target, and asks its surface nothing" (bounded testHiddenSuspended)
-    it "destroys a closing window's views and swapchain on the owner's thread before its surface" (bounded testGenerationClosed)
+    itBounded "builds a visible target's generation on the owner's thread, from the framebuffer the owner last observed, and the exit destroys it" testGenerationBuilt
+    itBounded "replaces it after a resize the owner observed, handing the old one over, and destroys the old one only once its hold ends" testGenerationReplaced
+    itBounded "builds nothing for a hidden target, and asks its surface nothing" testHiddenSuspended
+    itBounded "destroys a closing window's views and swapchain on the owner's thread before its surface" testGenerationClosed
 
 -- ---------------------------------------------------------------------------
 -- Handing targets over
@@ -1815,11 +1815,10 @@ awaitThrowing thrower =
 ownerEnded ∷ VulkanHost Scene → IO ()
 ownerEnded host = atomically (readOwnerTerminalNow (vulkanGraphicsOwner host) >>= check . ownerRunEnded)
 
-bounded ∷ IO () → Expectation
-bounded action =
-  timeout (30 * 1000 * 1000) action >>= \case
-    Just () → pure ()
-    Nothing → expectationFailure "the example did not finish within its bound"
+-- | One example under the suite's fixture-aware bound of thirty seconds
+-- ("Test.GPU.Vulkan.GLFW.Bound").
+itBounded ∷ String → IO () → Spec
+itBounded = boundedIt (boundOf 30)
 
 destruction ∷ Event → Bool
 destruction = \case
