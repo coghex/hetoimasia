@@ -50,19 +50,26 @@ import Hetoimasia.Foundation.Worker (WorkerDefinition, awaitStopRequest, workerD
 import Hetoimasia.Foundation.Time (Instant, MonotonicSource)
 import Hetoimasia.GLFW.Command
   ( SubmitResult (..)
+  , WindowCommand
   , clientCommandPort
   , closeWindowCommand
+  , hideWindowCommand
+  , newWindowCommandHost
   , observeWindowCommand
+  , performWindowCommand
   , pollCompletion
+  , setWindowTitleCommand
+  , showWindowCommand
   , submitWindowCommand
   )
+import qualified Hetoimasia.GLFW.Command as Command
 import Hetoimasia.GLFW.Internal.Attachment
   ( AttachmentEvidence (evidenceFirstFailure)
   , AttachmentFailure (DisposalFailure)
   , AttachmentView (viewEvidence)
   )
 import Hetoimasia.GLFW.Internal.Seam
-  ( NativeCall (CreateWindow, DestroyWindow)
+  ( NativeCall (CreateWindow, DestroyWindow, HideWindow)
   , Seam
   , SeamScript (..)
   , asProcessMainThread
@@ -211,6 +218,14 @@ spec = describe "GLFW window attachments" $ do
     it "drops that instant even when the completing certification is the only thing between the two turns"
       (boundedExample testDirectRetirementDropsTheInstantAlone)
 
+  describe "hiding a lent window directly (#368)" $ do
+    it "withholds the attachment's presentation before the native hide, and asks no hold for any other control"
+      (boundedExample testDirectHideWithholds)
+    it "hides a window with no attachment exactly as before, asking no hold"
+      (boundedExample testDirectHideUnattached)
+    it "follows the slot's occupant: the retiring owner, then none once it retired, then only the new owner"
+      (boundedExample testDirectHideFollowsOccupant)
+
   describe "the application exit" $
     it "retires every attached owner, then destroys the windows and ends the session"
       (boundedExample testExitWithOwners)
@@ -230,6 +245,11 @@ data Note
     -- ^ One scripted render an owner's service admitted.
   | WindowGone !Int
     -- ^ The seam's own destroy call, named by the window's creation order.
+  | HoldAsked !Text !Int
+    -- ^ An owner was asked to withhold its presentation before a hide, when
+    -- the seam had recorded this many native hide calls.
+  | HoldLifted !Text
+    -- ^ The hold it answered was lifted again.
   | SessionEnded
   deriving (Eq, Show)
 
@@ -333,6 +353,24 @@ protocolFor journal host owner script =
         atomically (note journal (Certified (ownerName owner) fact))
         void (certifyGraphicsFact host acknowledgement fact)
         pure RetirementAdvanced
+
+-- | 'attachedOwner', whose protocol journals every presentation hold it is
+-- asked for before a hide, with the native hide calls the seam had recorded
+-- by then, and every lift of one.
+attachedHolding
+  ∷ TVar [Note] → Seam → WindowHost → WindowId → OwnerScript → IO (Owner, GraphicsService)
+attachedHolding journal seam host window script = do
+  owner ← newOwner script
+  let protocol =
+        (protocolFor journal host owner script)
+          { protocolBeforeHide = \_ → do
+              hides ← hideCalls seam
+              atomically (note journal (HoldAsked (scriptName script) hides))
+              pure (atomically (note journal (HoldLifted (scriptName script))))
+          }
+  attachWindowGraphics host window protocol >>= \case
+    GraphicsAttached service → pure (owner, service)
+    other → unexpected ("the attachment was not established: " <> show other)
 
 -- | The owner's own completion authority, once its construction has stored it.
 heldAcknowledgement ∷ Owner → IO Acknowledgement
@@ -524,6 +562,9 @@ destroyCalls seam = (\calls → [key | DestroyWindow key ← calls]) <$> seamCal
 
 createCalls ∷ Seam → IO Int
 createCalls seam = (\calls → length [() | CreateWindow{} ← calls]) <$> seamCalls seam
+
+hideCalls ∷ Seam → IO Int
+hideCalls seam = (\calls → length [() | HideWindow _ ← calls]) <$> seamCalls seam
 
 -- ---------------------------------------------------------------------------
 -- Attaching
@@ -2711,6 +2752,95 @@ testDirectRetirementDropsTheInstantAlone = do
       -- than being paced by a deadline nobody is waiting for.
       afterTurn `shouldSatisfy` waitedTheBound
     other → unexpected ("the scheduled loop paced too few turns: " <> show other)
+
+-- ---------------------------------------------------------------------------
+-- Hiding a lent window directly
+
+-- | Perform one command directly on the owner thread, on the window the host
+-- lends: the public composition #368 names, a command host over the host's
+-- own session and 'withHostWindow'.
+direct ∷ WindowHost → WindowId → WindowCommand → IO Command.Disposition
+direct host window command = do
+  commands ← newWindowCommandHost (Private.hostSessionOf host) 4
+  withHostWindow host window (\lent → performWindowCommand commands [lent] command) >>= \case
+    WindowAvailable disposition → pure disposition
+    WindowEnded _ → unexpected "the lent window had ended"
+
+attempted ∷ Command.Disposition → Bool
+attempted = \case
+  Command.Attempted _ → True
+  _ → False
+
+-- | The presentation holds the journal recorded, and their lifts, in order.
+holdsOf ∷ TVar [Note] → IO [Note]
+holdsOf journal = (\entries → [entry | entry ← entries, holding entry]) <$> readTVarIO journal
+  where
+    holding = \case
+      HoldAsked{} → True
+      HoldLifted{} → True
+      _ → False
+
+-- | A hide through a lent window asks the attached owner to withhold its
+-- presentation before the native call — the seam has recorded no hide when
+-- it is asked — and keeps the hold once the call was made. A title and a show
+-- ask nothing. Before #368 the lent window hid with no hold at all.
+testDirectHideWithholds ∷ Expectation
+testDirectHideWithholds = do
+  journal ← newTVarIO []
+  seam ← pollingSeam journal
+  answers ← newIORef []
+  protectedRun seam (settings [windowNamed "alpha"]) (\_ → pure ()) $ \host _ → do
+    window ← onlyWindow host
+    void (attachedHolding journal seam host window (ownerNamed "alpha"))
+    titled ← direct host window (setWindowTitleCommand window "renamed")
+    hidden ← direct host window (hideWindowCommand window)
+    shown ← direct host window (showWindowCommand window)
+    writeIORef answers (map attempted [titled, hidden, shown])
+  readIORef answers `shouldReturn` [True, True, True]
+  holdsOf journal `shouldReturn` [HoldAsked "alpha" 0]
+  hideCalls seam `shouldReturn` 1
+
+-- | A window of a protected host with no attachment hides through a lent
+-- window exactly as it always has: one native call, attempted, no hold.
+testDirectHideUnattached ∷ Expectation
+testDirectHideUnattached = do
+  journal ← newTVarIO []
+  seam ← pollingSeam journal
+  answer ← newIORef Nothing
+  protectedRun seam (settings [windowNamed "alpha"]) (\_ → pure ()) $ \host _ → do
+    window ← onlyWindow host
+    atomically (windowGraphicsStatus host window) `shouldReturn` GraphicsAbsent
+    hidden ← direct host window (hideWindowCommand window)
+    writeIORef answer (Just (attempted hidden))
+  readIORef answer `shouldReturn` Just True
+  holdsOf journal `shouldReturn` []
+  hideCalls seam `shouldReturn` 1
+
+-- | The hold is asked of whichever attachment occupies the window's slot when
+-- the hide is made: the first owner while it retires, nobody once its slot is
+-- free, and then only the second owner, never the first's protocol again.
+testDirectHideFollowsOccupant ∷ Expectation
+testDirectHideFollowsOccupant = do
+  journal ← newTVarIO []
+  seam ← pollingSeam journal
+  protectedRun seam (settings [windowNamed "alpha"]) (\_ → pure ()) $ \host control → do
+    window ← onlyWindow host
+    let hideThenShow = do
+          hidden ← direct host window (hideWindowCommand window)
+          shown ← direct host window (showWindowCommand window)
+          map attempted [hidden, shown] `shouldBe` [True, True]
+    (_, firstService) ← attachedHolding journal seam host window (ownerNamed "first")
+    detachWindowGraphics host firstService `shouldReturn` DetachBegun
+    -- Retiring, and still occupying the slot: it is still the one asked.
+    slotOccupied host window `shouldReturn` True
+    hideThenShow
+    turnsUntil host control "the first owner's retirement" (not <$> slotOccupied host window)
+    -- The slot is free: an ordinary hide.
+    hideThenShow
+    void (attachedHolding journal seam host window (ownerNamed "second"))
+    hideThenShow
+  holdsOf journal `shouldReturn` [HoldAsked "first" 0, HoldAsked "second" 2]
+  hideCalls seam `shouldReturn` 3
 
 -- ---------------------------------------------------------------------------
 -- The application exit
