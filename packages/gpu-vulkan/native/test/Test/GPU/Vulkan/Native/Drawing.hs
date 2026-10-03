@@ -13,13 +13,14 @@
 module Test.GPU.Vulkan.Native.Drawing (spec) where
 
 import Control.Concurrent.STM (atomically)
-import Control.Exception (ErrorCall (ErrorCall), throwIO, try)
+import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall), throwIO, try)
+import Control.Monad (when)
 import qualified Data.ByteString as ByteString
-import Data.IORef (newIORef, readIORef, writeIORef)
+import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Text (Text)
 import Data.Word (Word64)
 import Numeric.Natural (Natural)
-import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldReturn)
+import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldReturn, shouldSatisfy)
 
 import Hetoimasia.GPU.Model (HoldKind (..), HoldView (..), holdView)
 import Hetoimasia.GPU.Model.Budget (BudgetKind (RingBudget))
@@ -324,7 +325,7 @@ spec = describe "Drawing from buffers" $ do
         indices ← claimed recorder 12
         instances ← claimed recorder 16
         ok (writeClaim recorder vertices 0 (bytes 32))
-        ok (writeClaim recorder indices 0 (bytes 12))
+        ok (writeClaim recorder indices 0 (indices16 [0, 1, 2, 2, 3, 0]))
         ok (writeClaim recorder instances 0 (bytes 16))
         inPass kit recorder $ do
           ok (bindVertexBuffer recorder 0 (FromClaim vertices 0))
@@ -344,7 +345,7 @@ spec = describe "Drawing from buffers" $ do
       settleAll rig
       clean rig
 
-    it "binds managed vertex and 32-bit index buffers moved to their use before the pass, and checks how far each read reaches" $ do
+    it "binds a managed vertex buffer moved to its use before the pass and 32-bit indices from a region, checks how far each read reaches, and freezes the indices read" $ do
       rig ← newRig
       kit ← newKit rig
       ringed rig 256
@@ -352,28 +353,176 @@ spec = describe "Drawing from buffers" $ do
       indexBuffer ← createBuffer (rigRecording rig) (BufferDescription IndexBuffer 24) >>= either (fail . show) pure
       answers ← framelessOnce rig $ \recorder → do
         instances ← claimed recorder 16
+        indices ← claimed recorder 24
+        ok (writeClaim recorder indices 0 (indices32 [0, 1, 2, 2, 3, 0]))
         ok (transitionResource recorder vertexBuffer (FromUse GeometryRead) GeometryRead)
         ok (transitionResource recorder indexBuffer (FromUse GeometryRead) GeometryRead)
-        inPass kit recorder $ do
+        drawn ← inPass kit recorder $ do
           ok (bindVertexBuffer recorder 0 (FromBuffer vertexBuffer 0))
           ok (bindVertexBuffer recorder 1 (FromClaim instances 0))
+          ok (bindIndexBuffer recorder (FromClaim indices 0) Index32)
+          drawn ←
+            sequence
+              [ drawIndexed recorder 6 2
+              , drawIndexed recorder 9 2
+              , drawIndexed recorder 6 3
+              , draw recorder 6 1
+              , draw recorder 3 2
+              ]
+          -- Index data the recording cannot read cannot bound per-vertex reads.
           ok (bindIndexBuffer recorder (FromBuffer indexBuffer 0) Index32)
-          sequence
-            [ drawIndexed recorder 6 2
-            , drawIndexed recorder 9 2
-            , drawIndexed recorder 6 3
-            , draw recorder 6 1
-            , draw recorder 3 2
-            ]
+          unreadable ← drawIndexed recorder 6 1
+          pure (drawn <> [unreadable])
+        -- The indices the first draw read can no longer be changed.
+        rewritten ← writeClaim recorder indices 0 (indices32 [5])
+        pure (drawn <> [rewritten])
       answers
         `shouldBe` [ Right ()
                    , Left (RefusedOutOfBounds 36 24)
                    , Left (RefusedOutOfBounds 24 16)
                    , Left (RefusedOutOfBounds 48 32)
                    , Right ()
+                   , Left (RefusedUnsupported "an indexed draw reading per-vertex data through index data the recording cannot read")
+                   , Left (RefusedIllegal "a write into index data a recorded draw has read")
                    ]
       settleAll rig
       clean rig
+
+    it "refuses an indexed draw whose 16-bit or 32-bit indices name a vertex beyond the region bound, recording no draw" $ do
+      rig ← newRig
+      kit ← newKit rig
+      ringed rig 256
+      before ← length <$> commandsOf' rig
+      answers ← framelessOnce rig $ \recorder → do
+        vertices ← claimed recorder 16
+        instances ← claimed recorder 16
+        short ← claimed recorder 6
+        long ← claimed recorder 12
+        ok (writeClaim recorder short 0 (indices16 [0, 1, 2]))
+        ok (writeClaim recorder long 0 (indices32 [1, 0, 7]))
+        inPass kit recorder $ do
+          ok (bindVertexBuffer recorder 0 (FromClaim vertices 0))
+          ok (bindVertexBuffer recorder 1 (FromClaim instances 0))
+          ok (bindIndexBuffer recorder (FromClaim short 0) Index16)
+          sixteen ← drawIndexed recorder 3 1
+          ok (bindIndexBuffer recorder (FromClaim long 0) Index32)
+          thirtyTwo ← drawIndexed recorder 3 1
+          pure [sixteen, thirtyTwo]
+      answers `shouldBe` [Left (RefusedOutOfBounds 24 16), Left (RefusedOutOfBounds 64 16)]
+      commands ← drop before <$> commandsOf' rig
+      [() | CommandDrawIndexed {} ← commands] `shouldBe` []
+      settleAll rig
+      clean rig
+
+    it "refuses a vertex source its attributes cannot be read from, at its bind and at a draw after a pipeline switch, recording no draw" $ do
+      rig ← newRig
+      kit ← newKit rig
+      ringed rig 256
+      bytesLayout ← createPipelineLayout (rigRecording rig) >>= either (fail . show) pure
+      byteWise ←
+        createPipelineWith (rigRecording rig) bytesLayout shaders (formatCode Rgba8Srgb) (VertexInput [VertexBinding 0 4 PerVertex] [VertexAttribute 0 0 VertexRgba8Unorm 0])
+          >>= either (fail . show) pure
+      before ← length <$> commandsOf' rig
+      answers ← framelessOnce rig $ \recorder → do
+        vertices ← claimed recorder 64
+        instances ← claimed recorder 16
+        inPass kit recorder $ do
+          misaligned ← bindVertexBuffer recorder 0 (FromClaim vertices 1)
+          ok (bindVertexBuffer recorder 1 (FromClaim instances 0))
+          -- Bytes are read a byte at a time: offset one suits this pipeline.
+          ok (bindPipeline recorder byteWise)
+          ok (bindVertexBuffer recorder 0 (FromClaim vertices 1))
+          ok (bindPipeline recorder (kitPipeline kit))
+          switched ← draw recorder 3 1
+          pure [misaligned, switched]
+      answers
+        `shouldBe` replicate 2 (Left (RefusedIllegal "vertex data for binding 0 at an offset its attributes cannot be read from"))
+      commands ← drop before <$> commandsOf' rig
+      [() | CommandDraw {} ← commands] `shouldBe` []
+      settleAll rig
+      clean rig
+
+    it "refuses a draw through a buffer released since its bind, or moved out of the use it was bound in, recording no draw" $ do
+      rig ← newRig
+      kit ← newKit rig
+      ringed rig 256
+      released ← createBuffer (rigRecording rig) (BufferDescription VertexBuffer 64) >>= either (fail . show) pure
+      moved ← createBuffer (rigRecording rig) (BufferDescription VertexBuffer 64) >>= either (fail . show) pure
+      before ← length <$> commandsOf' rig
+      answers ← framelessOnce rig $ \recorder → do
+        instances ← claimed recorder 16
+        ok (transitionResource recorder released (FromUse GeometryRead) GeometryRead)
+        ok (transitionResource recorder moved (FromUse GeometryRead) GeometryRead)
+        afterRelease ← inPass kit recorder $ do
+          ok (bindVertexBuffer recorder 0 (FromBuffer released 0))
+          ok (bindVertexBuffer recorder 1 (FromClaim instances 0))
+          ok (releaseManaged (rigRecording rig) released)
+          draw recorder 3 1
+        inPass kit recorder (ok (bindVertexBuffer recorder 0 (FromBuffer moved 0)))
+        ok (transitionResource recorder moved (FromUse GeometryRead) TransferWrite)
+        afterMove ← inPass kit recorder (draw recorder 3 1)
+        ok (transitionResource recorder moved (FromUse TransferWrite) GeometryRead)
+        pure [afterRelease, afterMove]
+      answers
+        `shouldBe` [ Left (RefusedMisuse (WrongPhase ResourceIdentity))
+                   , Left (RefusedIllegal "a draw reading a buffer that is TransferWrite, not GeometryRead")
+                   ]
+      commands ← drop before <$> commandsOf' rig
+      [() | CommandDraw {} ← commands] `shouldBe` []
+      settleAll rig
+      clean rig
+
+    it "keeps a partial or cancelled batch's regions, closing its writes, until its discard releases them" $ do
+      rig ← newRig
+      ringed rig 256
+      kept ← newIORef Nothing
+      let raising ∷ IO () → Rec → IO ()
+          raising failure recorder = do
+            claim ← claimed recorder 32
+            writeIORef kept (Just (recorder, claim))
+            failure
+      frame ← owned rig
+      raised ← try @ErrorCall (recordFrame (rigRecording rig) (ownedFrame frame) (raising (throwIO (ErrorCall "the consumer failed"))))
+      fmap (const ()) raised `shouldBe` Left (ErrorCall "the consumer failed")
+      offsets rig `shouldReturn` [0]
+      (recorder, claim) ← readIORef kept >>= maybe (fail "no claim") pure
+      writeClaim recorder claim 0 (bytes 4) `shouldReturn` Left RefusedRecorderClosed
+      partialBatches ← filter (partialStanding . viewBatchStanding) <$> atomically (readBatches (rigRecording rig))
+      mapM_ (ok . discardBatch (rigRecording rig) . viewBatch) partialBatches
+      offsets rig `shouldReturn` []
+      -- A cancellation leaves the batch partial the same way.
+      cancelledFrame ← owned rig
+      killed ← try @AsyncException (recordFrame (rigRecording rig) (ownedFrame cancelledFrame) (raising (throwIO ThreadKilled)))
+      fmap (const ()) killed `shouldBe` Left ThreadKilled
+      offsets rig `shouldReturn` [32]
+      partialAgain ← filter (partialStanding . viewBatchStanding) <$> atomically (readBatches (rigRecording rig))
+      mapM_ (ok . discardBatch (rigRecording rig) . viewBatch) partialAgain
+      offsets rig `shouldReturn` []
+
+    it "keeps an accepted batch's regions when a later submission fails with no effect, releasing only the discarded ones, then the rest on completion" $ do
+      rig ← newRig
+      ringed rig 128
+      failSubmission rig 2 AtSubmitNoEffect
+      tickets ← withFramelessScope (rigFrames rig) $ \scope →
+        mapM (\_ → recordFramelessIn scope (\recorder → () <$ claimed recorder 64) >>= either (fail . show) (pure . fst)) [1 ∷ Int, 2]
+      mapM (atomically . readTicket) tickets `shouldReturn` [TicketPending, TicketDiscarded]
+      offsets rig `shouldReturn` [0]
+      clearFrameStep (rigStandIn rig) AtSubmitNoEffect
+      completeAll (rigStandIn rig)
+      _ ← progress rig
+      -- The whole ring is free once the accepted batch has completed.
+      framelessOnce rig (\recorder → () <$ claimed recorder 128)
+      settleAll rig
+      clean rig
+
+    it "keeps every region of batches whose submission's effect is unknown" $ do
+      rig ← newRig
+      ringed rig 128
+      failSubmission rig 2 AtSubmit
+      outcome ← try @FramelessEffectUncertain $ withFramelessScope (rigFrames rig) $ \scope →
+        mapM_ (\_ → recordFramelessIn scope (\recorder → () <$ claimed recorder 64) >>= either (fail . show) (pure . fst)) [1 ∷ Int, 2]
+      fmap (const ()) outcome `shouldSatisfy` either (const True) (const False)
+      offsets rig `shouldReturn` [0, 64]
 
     it "retains exactly what each bind references, and a rebinding releases nothing an earlier bind captured" $ do
       rig ← newRig
@@ -524,6 +673,21 @@ recordedBy ∷ Rig → ResourceId → IO Bool
 recordedBy rig resource = atomically $ do
   model ← stateRootsModel (rigRoots rig) (\current → (current, current))
   pure (maybe False ((RecordedReferenceOwed `elem`) . viewOutstanding) (holdView (ResourceSubject resource) model))
+
+-- | Little-endian 16-bit and 32-bit indices.
+indices16, indices32 ∷ [Integer] → ByteString.ByteString
+indices16 = ByteString.pack . concatMap (\index → [fromIntegral index, fromIntegral (index `div` 256)])
+indices32 = ByteString.pack . concatMap (\index → [fromIntegral (index `div` 256 ^ place) | place ← [0 ∷ Int .. 3]])
+
+-- | Fail the nth frame-less submission with this step.
+failSubmission ∷ Rig → Int → FrameStep → IO ()
+failSubmission rig nth step' = do
+  seen ← newIORef (0 ∷ Int)
+  duringFrameCall (rigStandIn rig) $ \case
+    Submitted {} → do
+      count ← atomicModifyIORef' seen (\held → (held + 1, held + 1))
+      when (count == nth) (failFrameStep (rigStandIn rig) step')
+    _ → pure ()
 
 bytes ∷ Int → ByteString.ByteString
 bytes count = ByteString.replicate count 0x5A

@@ -117,6 +117,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   , VertexInput (..)
   , indexTypeBytes
   , vertexFormatBytes
+  , vertexFormatComponentBytes
   , ImageKind (..)
   , ImageUse (..)
   , formatCode
@@ -183,6 +184,9 @@ data RecorderState = RecorderState
     -- binding stays bound when another pipeline is bound, as Vulkan keeps it.
   , stateIndex ∷ !(Maybe (IndexType, BoundData))
     -- ^ The index data bound, and its type.
+  , stateFrozen ∷ ![(Natural, Natural)]
+    -- ^ Ring bytes an indexed draw read its indices from, as start and end
+    -- offsets in the ring: no later write of the batch may change them.
   , stateViewport ∷ !(Maybe Viewport)
   , stateScissor ∷ !(Maybe Rect)
   , stateAccess ∷ !(BatchAccess ResourceId)
@@ -202,9 +206,19 @@ data BoundPipeline = BoundPipeline
   , boundInterface ∷ !PipelineInterface
   }
 
--- | Vertex or index data bound: the bytes of the buffer or claimed region from
--- the bound offset to its end.
-newtype BoundData = BoundData {boundBytes ∷ Natural}
+-- | Vertex or index data bound: the buffer's managed generation or the ring's,
+-- the use the bind touched it in, the claim it came from if it came from the
+-- ring, the offset into the native buffer, and the bytes from there to the end
+-- of the buffer or the claimed region. A draw checks each again: the buffer
+-- still recordable and still in that use, and its offset still readable by the
+-- bound pipeline's attributes.
+data BoundData = BoundData
+  { boundResource ∷ !ResourceId
+  , boundUse ∷ !ResourceUse
+  , boundClaim ∷ !(Maybe Natural)
+  , boundOffset ∷ !Natural
+  , boundBytes ∷ !Natural
+  }
 
 -- | The frame a recorder renders into, as the generation that owns its image
 -- describes it.
@@ -362,7 +376,7 @@ recordAdmitted
   → IO (Either Refusal (BatchId, a))
 recordAdmitted recording batch commands image label restore consumer = do
   opened ← newIORef True
-  state ← newIORef (RecorderState LayoutUndefined Nothing Nothing Map.empty Nothing Nothing Nothing emptyAccess Map.empty)
+  state ← newIORef (RecorderState LayoutUndefined Nothing Nothing Map.empty Nothing [] Nothing Nothing emptyAccess Map.empty)
   labelled ← isJust <$> readRootsInstrumentation roots
   labels ← newIORef 0
   let recorder = Recorder recording batch commands image opened state labelled labels
@@ -910,68 +924,129 @@ scissorFits rect attachment
 -- an earlier pass, or the frame outside rendering, left bound must fit this
 -- one. Every vertex input binding the bound pipeline declares must have data
 -- bound, enough for every vertex a per-vertex binding is read for and every
--- instance a per-instance one is (GRS-4). The batch retains the bound
--- pipeline and its layout again, which it already holds.
+-- instance a per-instance one is, at an offset each attribute can be read
+-- from, from a buffer still recordable and still in the use it was bound in
+-- (GRS-4). The batch retains the bound pipeline and its layout again, which it
+-- already holds.
 draw ∷ Recorder q inst msgr phys dev cmd → Word32 → Word32 → IO (Either Refusal ())
 draw recorder vertices instances =
   drawChecked recorder vertices instances $ \state bound → do
-    vertexReads state bound (Just vertices) instances
-    Right (CommandDraw vertices instances 0 0)
+    vertexReads state bound (Just (toInteger vertices)) instances
+    Right (state, CommandDraw vertices instances 0 0)
 
 -- | Draw indexed triangles, instanced, with the bound pipeline (GRS-4): what
 -- 'draw' checks, and that index data is bound, holding every index read from
--- the first. The vertices an index names are the index data's to say, which
--- the recording does not read, so a per-vertex binding is checked to be
--- bound but not how far its reads reach; a per-instance one is checked as
--- 'draw' checks it.
+-- the first. A per-vertex binding must hold every vertex an index names:
+-- index data in a ring region the batch wrote is read, its largest index
+-- bounds those reads, and the bytes read can no longer be written by the
+-- batch; index data the recording cannot read — a managed buffer's, which no
+-- host write fills — cannot bound them, so such a draw that reads per-vertex
+-- data is 'RefusedUnsupported'. A per-instance binding is checked as 'draw'
+-- checks it.
 drawIndexed ∷ Recorder q inst msgr phys dev cmd → Word32 → Word32 → IO (Either Refusal ())
-drawIndexed recorder indices instances =
+drawIndexed recorder indices instances = do
+  largest ← largestIndex recorder indices
   drawChecked recorder indices instances $ \state bound → case stateIndex state of
     Nothing → Left (RefusedIllegal "an indexed draw with no index data bound")
     Just (kind, held) → do
       let needed = fromIntegral indices * indexTypeBytes kind
       when (needed > boundBytes held) (Left (RefusedOutOfBounds needed (boundBytes held)))
-      vertexReads state bound Nothing instances
-      Right (CommandDrawIndexed indices instances)
+      vertexReads state bound (fmap (+ 1) largest) instances
+      let frozen = case boundClaim held of
+            Just _ → [(boundOffset held, boundOffset held + needed)]
+            Nothing → []
+      Right (state {stateFrozen = frozen <> stateFrozen state}, CommandDrawIndexed indices instances)
+
+-- | The largest index an indexed draw of this many indices would read, when
+-- its index data is a ring region whose bytes the recording can read: read
+-- from the ring's mapping, which only this batch has written since the region
+-- was claimed. 'Nothing' for index data in a managed buffer, for none, and for
+-- a draw reading more than is bound, which its own checks refuse.
+largestIndex ∷ Recorder q inst msgr phys dev cmd → Word32 → IO (Maybe Integer)
+largestIndex recorder indices = do
+  state ← readIORef (recorderState recorder)
+  ring ← readTVarIO (recordingRing (recorderRecording recorder))
+  case (stateIndex state, ring) of
+    (Just (kind, held), Just held')
+      | Just _ ← boundClaim held
+      , needed ← fromIntegral indices * indexTypeBytes kind
+      , needed <= boundBytes held
+      , indices > 0 → do
+          bytes ← opsReadMapped (recordingOps (recorderRecording recorder)) (ringMapping held') (boundOffset held) needed
+          pure (Just (maximum (decodeIndices kind bytes)))
+    _ → pure Nothing
+
+-- | Little-endian indices of the type.
+decodeIndices ∷ IndexType → ByteString → [Integer]
+decodeIndices kind bytes = map value (chunks (ByteString.unpack bytes))
+  where
+    size = fromIntegral (indexTypeBytes kind)
+    chunks [] = []
+    chunks rest = take size rest : chunks (drop size rest)
+    value chunk = sum [toInteger byte * 256 ^ place | (byte, place) ← zip chunk [0 ∷ Int ..]]
 
 -- | What every draw checks before its own checks decide its command: a bound
--- pipeline, an open pass, the viewport and scissor set, whole triangles, and
--- the pipeline, viewport and scissor against the pass's attachment.
+-- pipeline, an open pass, the viewport and scissor set, whole triangles, the
+-- pipeline, viewport and scissor against the pass's attachment, and every
+-- managed buffer bound still recordable — not released, replaced or stale.
 drawChecked
   ∷ Recorder q inst msgr phys dev cmd
   → Word32
   → Word32
-  → (RecorderState → BoundPipeline → Either Refusal NativeCommand)
+  → (RecorderState → BoundPipeline → Either Refusal (RecorderState, NativeCommand))
   → IO (Either Refusal ())
-drawChecked recorder count instances decide =
-  command recorder $ \state → case (statePipeline state, stateRendering state) of
-    (Nothing, _) → Left (RefusedIllegal "a draw with no pipeline bound")
-    (_, Nothing) → Left (RefusedIllegal "a draw outside rendering")
-    (Just bound, Just attachment) → case (stateViewport state, stateScissor state) of
-      (Just viewport, Just rect)
-        | count == 0 || instances == 0 → Left (RefusedIllegal "a draw of nothing")
-        | count `mod` 3 /= 0 → Left (RefusedUnsupported "a draw that is not whole triangles")
-        | otherwise → do
-            incompatible (boundFormat bound) attachment
-            viewportFits viewport attachment
-            scissorFits rect attachment
-            native ← decide state bound
-            Right (state, [boundPipeline bound, boundLayout bound], native)
-      _ → Left (RefusedIllegal "a draw before the viewport and scissor are set")
+drawChecked recorder count instances decide = do
+  state ← readIORef (recorderState recorder)
+  let managed = [boundResource held | held ← Map.elems (stateVertex state) <> map snd (maybe [] pure (stateIndex state)), Nothing ← [boundClaim held]]
+  recordable ← mapM (liveNative (recorderRecording recorder)) managed
+  case [refusal | Left refusal ← recordable] of
+    refusal : _ → command recorder (const (Left refusal))
+    [] →
+      command recorder $ \current → case (statePipeline current, stateRendering current) of
+        (Nothing, _) → Left (RefusedIllegal "a draw with no pipeline bound")
+        (_, Nothing) → Left (RefusedIllegal "a draw outside rendering")
+        (Just bound, Just attachment) → case (stateViewport current, stateScissor current) of
+          (Just viewport, Just rect)
+            | count == 0 || instances == 0 → Left (RefusedIllegal "a draw of nothing")
+            | count `mod` 3 /= 0 → Left (RefusedUnsupported "a draw that is not whole triangles")
+            | otherwise → do
+                incompatible (boundFormat bound) attachment
+                viewportFits viewport attachment
+                scissorFits rect attachment
+                for_ (map snd (maybe [] pure (stateIndex current))) (stillInUse current)
+                (next, native) ← decide current bound
+                Right (next, [boundPipeline bound, boundLayout bound], native)
+          _ → Left (RefusedIllegal "a draw before the viewport and scissor are set")
+
+-- | Whether bound data's buffer is still in the use it was bound in: a
+-- transition since moves it out of the use the draw would read it in.
+stillInUse ∷ RecorderState → BoundData → Either Refusal ()
+stillInUse state held = case Access.accessUse (boundResource held) (stateAccess state) of
+  Just current
+    | current == boundUse held → Right ()
+    | otherwise → Left (RefusedIllegal ("a draw reading a buffer that is " <> tshow current <> ", not " <> tshow (boundUse held)))
+  Nothing → Left (RefusedIllegal "a draw reading a buffer the batch has not touched")
 
 -- | Whether every vertex input binding the bound pipeline declares has data
--- bound, enough for what a draw reads of it: for a per-vertex binding, every
--- vertex — when the draw says how many, which an indexed one does not — and
--- for a per-instance one, every instance. A binding no attribute reads is read
+-- bound, readable and enough for what a draw reads of it: for a per-vertex
+-- binding, every vertex — this many, when the draw can say, and otherwise a
+-- draw that reads one is refused — and for a per-instance one, every instance;
+-- each from a buffer still in the use it was bound in, at an offset every
+-- attribute reading it can be read from. A binding no attribute reads is read
 -- for nothing.
-vertexReads ∷ RecorderState → BoundPipeline → Maybe Word32 → Word32 → Either Refusal ()
+vertexReads ∷ RecorderState → BoundPipeline → Maybe Integer → Word32 → Either Refusal ()
 vertexReads state bound vertices instances =
   for_ bindings $ \binding → case Map.lookup (bindingNumber binding) (stateVertex state) of
     Nothing → Left (RefusedIllegal ("a draw that needs vertex binding " <> tshow (bindingNumber binding) <> ", which is not bound"))
-    Just held → case (bindingRate binding, vertices) of
-      (PerVertex, Nothing) → Right ()
-      (PerVertex, Just count) → fits binding held count
-      (PerInstance, _) → fits binding held instances
+    Just held → do
+      stillInUse state held
+      attributesAligned (interfaceVertexInput (boundInterface bound)) (bindingNumber binding) (boundOffset held)
+      case (bindingRate binding, vertices) of
+        (PerVertex, Nothing)
+          | reach binding == 0 → Right ()
+          | otherwise → Left (RefusedUnsupported "an indexed draw reading per-vertex data through index data the recording cannot read")
+        (PerVertex, Just count) → fits binding held count
+        (PerInstance, _) → fits binding held (toInteger instances)
   where
     VertexInput bindings attributes = interfaceVertexInput (boundInterface bound)
     reach binding = maximum (0 : [toInteger (attributeOffset attribute) + toInteger (vertexFormatBytes (attributeFormat attribute)) | attribute ← attributes, attributeBinding attribute == bindingNumber binding])
@@ -980,7 +1055,16 @@ vertexReads state bound vertices instances =
       | needed > toInteger (boundBytes held) = Left (RefusedOutOfBounds (fromInteger needed) (boundBytes held))
       | otherwise = Right ()
       where
-        needed = (toInteger count - 1) * toInteger (bindingStride binding) + reach binding
+        needed = (count - 1) * toInteger (bindingStride binding) + reach binding
+
+-- | Whether data bound to a binding at this offset in its buffer can be read
+-- by every attribute reading the binding: each attribute's address, the offset
+-- plus its own, a multiple of its format's component size, as Vulkan requires.
+attributesAligned ∷ VertexInput → Word32 → Natural → Either Refusal ()
+attributesAligned (VertexInput _ attributes) binding offset =
+  for_ [attribute | attribute ← attributes, attributeBinding attribute == binding] $ \attribute →
+    when ((offset + fromIntegral (attributeOffset attribute)) `mod` vertexFormatComponentBytes (attributeFormat attribute) /= 0) $
+      Left (RefusedIllegal ("vertex data for binding " <> tshow binding <> " at an offset its attributes cannot be read from"))
 
 -- | The bytes one copy of an image of this extent needs: four per pixel,
 -- tightly packed.
@@ -1278,6 +1362,11 @@ writeClaim recorder claim offset bytes =
             | offset + count > claimRecordSize record → pure (Left (RefusedOutOfBounds (offset + count) (claimRecordSize record)))
             | count == 0 → pure (Right ())
             | otherwise → do
+              frozen ← stateFrozen <$> readIORef (recorderState recorder)
+              let begin = claimRecordOffset record + offset
+              if any (\(low, high) → low < begin + count && begin < high) frozen
+                then pure (Left (RefusedIllegal "a write into index data a recorded draw has read"))
+                else do
                 let mapping = ringMapping ring
                     atom = ringAtom ring
                     start = claimRecordOffset record + offset
@@ -1315,7 +1404,15 @@ data Source = Source
   , sourceHandle ∷ !Word64
   , sourceOffset ∷ !Natural
   , sourceBytes ∷ !Natural
+  , sourceClaim ∷ !(Maybe Natural)
+    -- ^ The claim's number, for a region of the ring.
+  , sourceUse ∷ !ResourceUse
+    -- ^ The use the bind reads the buffer in, once the bind has chosen it.
   }
+
+-- | What a bind leaves bound.
+boundFrom ∷ Source → BoundData
+boundFrom resolved = BoundData (sourceResource resolved) (sourceUse resolved) (sourceClaim resolved) (sourceOffset resolved) (sourceBytes resolved)
 
 -- | Resolve a source: a managed buffer this session's, live, the offset
 -- inside it; or a claim this batch holds, the offset inside what it claimed.
@@ -1326,7 +1423,7 @@ resolveSource recorder = \case
       Left refusal → pure (Left refusal)
       Right (NativeBuffer kind bytes allocated)
         | offset >= bytes → pure (Left (RefusedOutOfBounds offset bytes))
-        | otherwise → pure (Right (Source resource kind (memoryResource (allocatedMemory allocated)) offset (bytes - offset)))
+        | otherwise → pure (Right (Source resource kind (memoryResource (allocatedMemory allocated)) offset (bytes - offset) Nothing GeometryRead))
       Right _ → pure (Left RefusedWrongKind)
   FromClaim claim offset →
     atomically (claimed recorder claim) >>= \case
@@ -1334,7 +1431,7 @@ resolveSource recorder = \case
       Right (ring, record)
         | offset >= claimRecordSize record → pure (Left (RefusedOutOfBounds offset (claimRecordSize record)))
         | otherwise →
-            pure (Right (Source (ringResource ring) InstanceBuffer (allocationBuffer (ringMapping ring)) (claimRecordOffset record + offset) (claimRecordSize record - offset)))
+            pure (Right (Source (ringResource ring) InstanceBuffer (allocationBuffer (ringMapping ring)) (claimRecordOffset record + offset) (claimRecordSize record - offset) (Just (claimNumber claim)) InstanceRead))
   where
     recording = recorderRecording recorder
 
@@ -1357,8 +1454,9 @@ bindVertexBuffer recorder binding source =
   bindData recorder source vertexUse $ \state bound resolved → do
     unless (binding `elem` map bindingNumber (inputBindings (interfaceVertexInput (boundInterface bound)))) $
       Left (RefusedIllegal ("vertex binding " <> tshow binding <> ", which the bound pipeline does not declare"))
+    attributesAligned (interfaceVertexInput (boundInterface bound)) binding (sourceOffset resolved)
     Right
-      ( state {stateVertex = Map.insert binding (BoundData (sourceBytes resolved)) (stateVertex state)}
+      ( state {stateVertex = Map.insert binding (boundFrom resolved) (stateVertex state)}
       , CommandBindVertexBuffer binding (sourceHandle resolved) (fromIntegral (sourceOffset resolved))
       )
   where
@@ -1378,7 +1476,7 @@ bindIndexBuffer recorder source kind =
     when (sourceOffset resolved `mod` indexTypeBytes kind /= 0) $
       Left (RefusedIllegal "index data at an offset that is not a multiple of the index's size")
     Right
-      ( state {stateIndex = Just (kind, BoundData (sourceBytes resolved))}
+      ( state {stateIndex = Just (kind, boundFrom resolved)}
       , CommandBindIndexBuffer (sourceHandle resolved) (fromIntegral (sourceOffset resolved)) kind
       )
   where
@@ -1404,7 +1502,7 @@ bindData recorder source useOf decide =
       Right resolved → orderedSequence recorder $ \state → do
         bound ← maybe (Left (RefusedIllegal "a buffer bound with no pipeline bound")) Right (statePipeline state)
         use ← maybe (Left RefusedWrongKind) Right (useOf (sourceKind resolved))
-        (next, native) ← decide state bound resolved
+        (next, native) ← decide state bound resolved {sourceUse = use}
         let resource = sourceResource resolved
             handle = sourceHandle resolved
         case Access.touch resource (bufferResourceKind (sourceKind resolved)) use KeepsContents (stateAccess state) of

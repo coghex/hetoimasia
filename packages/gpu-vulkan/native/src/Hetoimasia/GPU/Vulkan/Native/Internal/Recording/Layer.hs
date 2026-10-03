@@ -53,6 +53,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   , VertexFormat (..)
   , vertexFormatCode
   , vertexFormatBytes
+  , vertexFormatComponentBytes
   , VertexBinding (..)
   , VertexAttribute (..)
   , VertexInput (..)
@@ -275,6 +276,13 @@ vertexFormatBytes = \case
   VertexFloat4 → 16
   VertexUint → 4
   VertexRgba8Unorm → 4
+
+-- | The bytes one component of an attribute of the format occupies: what the
+-- attribute's address in its buffer must be a multiple of.
+vertexFormatComponentBytes ∷ VertexFormat → Natural
+vertexFormatComponentBytes = \case
+  VertexRgba8Unorm → 1
+  _ → 4
 
 -- | One vertex input binding a pipeline declares: its number, its stride in
 -- bytes, and whether it advances per vertex or per instance.

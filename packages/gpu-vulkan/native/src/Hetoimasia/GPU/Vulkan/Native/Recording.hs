@@ -156,7 +156,12 @@
 -- the batch's first touch of a buffer — its entry barrier — cannot be inside
 -- rendering. 'draw' and 'drawIndexed' draw instanced, and indexed and
 -- instanced, once every binding the pipeline declares is bound with enough
--- data. Every bind retains exactly its buffer's generation, or the ring's.
+-- data, at an offset its attributes can be read from, from a buffer still
+-- recordable and still in the use it was bound in. An indexed draw bounds
+-- per-vertex reads by the largest index in the ring region it reads, which
+-- the batch can then no longer write, and refuses per-vertex reads through
+-- index data the recording cannot read. Every bind retains exactly its
+-- buffer's generation, or the ring's.
 --
 -- = The shared ring (GRS-4, D-33)
 --
@@ -331,6 +336,7 @@ module Hetoimasia.GPU.Vulkan.Native.Recording
   , VertexFormat (..)
   , vertexFormatCode
   , vertexFormatBytes
+  , vertexFormatComponentBytes
   , VertexBinding (..)
   , VertexAttribute (..)
   , VertexInput (..)
@@ -444,6 +450,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   , pushStageBit
   , vertexFormatBytes
   , vertexFormatCode
+  , vertexFormatComponentBytes
   , bufferKindUse
   , formatCode
   , formatNeedsCompressionBC
