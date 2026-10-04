@@ -137,9 +137,9 @@ describes the case.
 | Captures | [`swap-before-macos.png`](swap-before-macos.png), [`swap-delayed-macos.png`](swap-delayed-macos.png), [`swap-after-macos.png`](swap-after-macos.png) | [`swap-before-linux.png`](swap-before-linux.png), [`swap-delayed-linux.png`](swap-delayed-linux.png), [`swap-after-linux.png`](swap-after-linux.png) |
 | Before and delayed PNG SHA-256 | `b0fc8bbe9c49b504d1f51968878e9e5ad137e1c0c17ed0948808c25d80fec119` | `b0fc8bbe9c49b504d1f51968878e9e5ad137e1c0c17ed0948808c25d80fec119` |
 | After PNG SHA-256 | `afea3c4720c1b056e12edec754464793f8efa94a583f1f3706c5ab12f8581db2` | `afea3c4720c1b056e12edec754464793f8efa94a583f1f3706c5ab12f8581db2` |
-| Producer | `test.vulkan-native` (`--complete`, `grs9-swap` case), run locally with `HETOIMASIA_VALIDATION_EVIDENCE` set | `test.vulkan-native` in workflow run [37232046608](https://github.com/coghex/hetoimasia/actions/runs/37232046608) (attempt 1; attempt 2 reran only an unrelated `test.glfw` flake), artifact `validation-receipts-vulkan` (id 11313788522), files `evidence/test.vulkan-native/swap/` |
-| Revision run | `ddb034072707842647ac46acb75016b727c5b6cb`, the pull request's head after review round 4 | `ce698f2a6cb9f07a884823f01a3901e792224243`, CI's merge of the head `ddb034072707842647ac46acb75016b727c5b6cb` (tree `fae952be40f9facc19ad4ee9d1cdf0c5f2738324`) |
-| Native source digest | `1cdc6e6625b9fc4a2a8f50ad9b599049125b86d5f3c08a73c4385c7419f8244b` | `1cdc6e6625b9fc4a2a8f50ad9b599049125b86d5f3c08a73c4385c7419f8244b` |
+| Producer | `test.vulkan-native` (`--complete`, `grs9-swap` case), run locally with `HETOIMASIA_VALIDATION_EVIDENCE` set | `test.vulkan-native` in workflow run [37233377231](https://github.com/coghex/hetoimasia/actions/runs/37233377231) (attempt 1), artifact `validation-receipts-vulkan` (id 11314053463), files `evidence/test.vulkan-native/swap/` |
+| Revision run | `67875a99c4cf6eaaa9b9d9ec03bd3a97ba9b9b9d`, the pull request's head after review round 5 | `fba6fa9e6a7ab919ca5100cecbb9e72e46847da1`, CI's merge of the head `67875a99c4cf6eaaa9b9d9ec03bd3a97ba9b9b9d` (tree `8067e4fa42023c9f850666ee768d2d8bde33a5d9`) |
+| Native source digest | `925c0b4725853351ffd6708dd1833e9201d54bbe736fc363678ac9cbada0c3d0` | `925c0b4725853351ffd6708dd1833e9201d54bbe736fc363678ac9cbada0c3d0` |
 | Platform | macOS 26.7.1 (25G313), Apple M3 Max, arm64 | GitHub Actions Linux X64, the CI image's isolated X11 display |
 | Device and driver | Apple M3 Max; MoltenVK, device API 1.3.357 | `llvmpipe (LLVM 20.1.2, 256 bits)`; pinned Mesa Lavapipe (`lvp_icd.json`) |
 | Validation | Synchronization validation enabled; clean verdict after the last teardown | Synchronization validation enabled; clean verdict after the last teardown |
@@ -147,10 +147,11 @@ describes the case.
 | BC7 | supported and exercised | supported and exercised |
 | Readbacks | three of 262,144 bytes, complete | three of 262,144 bytes, complete |
 
-This record was regenerated at head `ddb03407` after review rounds 1 to 4
-changed the native backend and the window integration (a pending swap's
-ticket failing the moment the session fails, and around the owner's whole
-teardown; a swap's replacement refusing further uploads). The native source digest moved from
+This record was regenerated at head `67875a99` after review rounds 1 to 5
+changed the native backend and the window integration (a swap's ticket
+settled once, failing the moment the session fails and around the owner's
+whole teardown; no publication into a failed session; a swap's replacement
+refusing further uploads). The native source digest moved from
 `abeed0830233c28a4d3aef995b8b8e4bd3d1fe12da9a56a6af8e416abfcd5ee5` (head
 `ac75a7cf`, workflow run 37215778595), through
 `a0e21578a103177c5050b881151661731a80d7c47b3944a4c1974de8539f6d72` (head
@@ -158,8 +159,10 @@ teardown; a swap's replacement refusing further uploads). The native source dige
 `533b462d9cc2acad9b9613ff383da61667863063e901a6552afc0c591b7d0ca2` (head
 `690929e5`, run 37227971623) and
 `e98e974a93d4b03ac61a47e74048878605152e00b855d847bd98d956e1a42651` (head
-`517ec862`, run 37229117196), to the one above. Every capture on both
-platforms is byte-identical at all five heads, since the drawing did not
+`517ec862`, run 37229117196) and
+`1cdc6e6625b9fc4a2a8f50ad9b599049125b86d5f3c08a73c4385c7419f8244b` (head
+`ddb03407`, run 37232046608), to the one above. Every capture on both
+platforms is byte-identical at all six heads, since the drawing did not
 change.
 
 CI's `test.vulkan-wayland` group ran the same case under the isolated headless
