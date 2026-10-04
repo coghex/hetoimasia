@@ -2471,9 +2471,16 @@ native call and from any thread, where the swap stands.
   swap at once: a failed session writes no descriptor, so no swap can take
   effect, and a pending swap's ticket reads `SwapFailed` from the moment the
   failure is latched (`readSwapTicket` consults the session's terminal
-  report). That is before any drain, wait or teardown step, however long a
-  target's drain waits on a fence, and a device loss is never reported as
-  success. Settling the ticket is separate from releasing images, which
+  report), and the read stores it. That is before any drain, wait or
+  teardown step, however long a target's drain waits on a fence, and a
+  device loss is never reported as success. A ticket is settled once: every
+  write of it goes through `settleSwap`, which writes only a pending ticket
+  and writes `SwapFailed` once the session has failed, so a release,
+  supersession or refresh after a failure never reports anything else, and a
+  published swap stays published. The refresh's publication checks the
+  session's terminal report in the transaction that commits it, so a failure
+  latched during the replacement's descriptor write publishes nothing and
+  releases nothing. Settling the ticket is separate from releasing images, which
   still waits for completion evidence. The session's terminal behavior is
   unchanged. For an exit that is not a failure, the host's teardown fails
   every pending swap (`failPendingSwaps`, touching no native object) before
