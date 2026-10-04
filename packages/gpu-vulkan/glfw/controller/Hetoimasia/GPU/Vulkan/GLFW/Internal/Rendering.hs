@@ -113,6 +113,7 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
   , constructTextureTable
   , constructTablePipelineLayout
   , registerConstructedTexture
+  , swapConstructedTexture
   , releaseConstructedTexture
   , readConstructedTable
   , lendConstruction
@@ -326,6 +327,8 @@ import Hetoimasia.GPU.Vulkan.Native.TextureTable
   , refreshTextureTable
   , registerTexture
   , releaseTexture
+  , SwapTicket
+  , swapTexture
   )
 import Hetoimasia.GPU.Vulkan.Native.Uploads
   ( CancelRefusal (CancelUnknown)
@@ -592,6 +595,14 @@ constructTablePipelineLayout construction shaders offset = confined construction
 -- versions published after that. The table holds the image from now on.
 registerConstructedTexture ∷ Construction q inst msgr phys dev cmd → Image → IO (Either Refusal TextureHandle)
 registerConstructedTexture construction image = confined construction (registerTexture (constructionRecording construction) image)
+
+-- | Ask a live handle to show a replacement texture, filled by an admitted
+-- or completed upload (GRS-9): the handle keeps resolving to what it shows
+-- until that upload completes, and to the replacement in versions published
+-- after; the replaced texture is released then. The table holds the
+-- replacement from now on, and the ticket reports where the swap stands.
+swapConstructedTexture ∷ Construction q inst msgr phys dev cmd → TextureHandle → Image → IO (Either Refusal SwapTicket)
+swapConstructedTexture construction handle image = confined construction (swapTexture (constructionRecording construction) handle image)
 
 -- | Release a texture's handle: versions published from now on no longer
 -- map it, and its image is released once no batch's version does.

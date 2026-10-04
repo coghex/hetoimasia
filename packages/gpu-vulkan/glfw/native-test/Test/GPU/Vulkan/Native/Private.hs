@@ -89,6 +89,13 @@
 --   read back after completion, checked against the sample's independent
 --   oracle, and written as a lossless PNG and a probe record under the
 --   validation runner's evidence directory (#345);
+-- * @grs9-swap@ — the same device start with no window, then the sprites
+--   sample's swap case (GRS-9): the atlas's handle redirected to a
+--   replacement between a frame's recording and its submission, the frames
+--   before, across and after the swap read back and checked against the
+--   oracle, and the atlas's slot reused only once the delayed frame
+--   completes, written as PNGs and a record under the validation runner's
+--   evidence directory (#346);
 -- * @grs14-table-growth@ — the same device start with no window, then a
 --   texture table of five slots at most, two at first, grown twice by
 --   registration; a batch recorded before a growth and submitted after it,
@@ -393,6 +400,14 @@ scenarios =
       $ \consent journal _ → do
         outcome ← SurfaceFree.runSprites (consentBackend consent) journal
         pure (SurfaceFree.spritesSpec outcome, section "The GRS-8 sprites evidence record" (SurfaceFree.spritesSection outcome))
+  , Scenario
+      "grs9-swap"
+      "swaps the sprites sample's atlas under its texture handle in a surface-free session: the frame before the swap and a frame recorded before it and submitted after it sample the atlas, the frame after it samples the replacement from the same instance data, every probe passes the independent oracle, and the atlas's slot is reused only once the delayed frame completes, with validation reporting nothing"
+      False
+      Nothing
+      $ \consent journal _ → do
+        outcome ← SurfaceFree.runSwap (consentBackend consent) journal
+        pure (SurfaceFree.swapSpec outcome, section "The GRS-9 texture swap evidence record" (SurfaceFree.swapSection outcome))
   , Scenario
       "grs14-table-growth"
       "grows the texture table of a surface-free session twice to a cap that is no power of two, samples correctly from a batch recorded before a growth and submitted after it, draws textures registered before and after growth with a pipeline built before it, and answers backpressure at the cap, with validation reporting nothing"

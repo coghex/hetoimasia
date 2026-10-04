@@ -50,9 +50,11 @@ module Hetoimasia.Sample.Sprites
   , Sprites
   , registerSprites
   , spritesWithBc7
+  , spritesHandle
   , pipelineFor
     -- * Recording
   , SceneTarget (..)
+  , sceneInstanceBytes
   , recordScene
     -- * Configuration
   , spritesRingSize
@@ -101,7 +103,9 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   )
 import Hetoimasia.GPU.Vulkan.Native.Shader (CheckedShaders)
 import Hetoimasia.GPU.Vulkan.Native.TextureTable
-  ( TableConfig
+  ( SwapTicket
+  , TableConfig
+  , TableView
   , TextureHandle (..)
   , bindTable
   , selectSampler
@@ -135,6 +139,11 @@ data Builders q inst msgr phys dev cmd = Builders
   , buildPipeline ∷ PipelineLayout → CheckedShaders → Word32 → PipelineBlend → IO (Either Refusal Pipeline)
   , buildReadback ∷ Natural → IO (Either Refusal Readback)
   , registerImage ∷ Image → IO (Either Refusal TextureHandle)
+  , swapImage ∷ TextureHandle → Image → IO (Either Refusal SwapTicket)
+    -- ^ Ask a handle to show a replacement whose upload is admitted or
+    -- complete (GRS-9).
+  , inspectTable ∷ IO (Maybe TableView)
+    -- ^ The texture table as it stands now.
   }
 
 -- | The session's shared ring: room for the scene's instance data many times
@@ -201,6 +210,10 @@ registerSprites builders made = do
     Left refusal → pure (Left refusal)
     Right registered → Right . Sprites (madeLayout made) (Map.fromList registered) <$> newIORef Map.empty
 
+-- | The handle a fixture's texture was registered under, if it was made.
+spritesHandle ∷ FixtureName → Sprites → Maybe TextureHandle
+spritesHandle name = Map.lookup name . spritesHandles
+
 -- | Whether the BC7 fixture was made, and so is drawn.
 spritesWithBc7 ∷ Sprites → Bool
 spritesWithBc7 = Map.member Bc7Block . spritesHandles
@@ -228,7 +241,7 @@ data SceneTarget
 recordScene ∷ Sprites → Pipeline → SceneTarget → Recorder q inst msgr phys dev cmd → IO (Either Refusal ())
 recordScene sprites pipeline target recorder = do
   let draws = sceneDraws (spritesWithBc7 sprites)
-      instanceBytes = encodeInstances handleOf (concatMap drawInstances draws)
+      instanceBytes = sceneInstanceBytes sprites
       (width, height) = case target of
         Offscreen _ _ → (fromIntegral targetSide, fromIntegral targetSide)
         Frame w h → (w, h)
@@ -266,6 +279,13 @@ recordScene sprites pipeline target recorder = do
               ]
             Frame _ _ → []
     Right _ → pure (Left (RefusedIllegal "the scene's three ring regions were not all claimed"))
+
+-- | The scene's instance data, every draw's in order, each instance carrying
+-- its texture's handle. It depends on the handles alone, so it is the same
+-- bytes before and after a swap (GRS-9), which redirects a handle without
+-- changing it.
+sceneInstanceBytes ∷ Sprites → ByteString.ByteString
+sceneInstanceBytes sprites = encodeInstances handleOf (concatMap drawInstances (sceneDraws (spritesWithBc7 sprites)))
   where
     handleOf name = maybe (0, 0) (\handle → (handleIndex handle, handleGeneration handle)) (Map.lookup name (spritesHandles sprites))
 

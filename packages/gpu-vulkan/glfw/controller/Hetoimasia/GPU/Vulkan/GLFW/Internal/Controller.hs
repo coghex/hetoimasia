@@ -222,6 +222,7 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , constructTextureTable
   , constructTablePipelineLayout
   , registerConstructedTexture
+  , swapConstructedTexture
   , releaseConstructedTexture
   , readConstructedTable
 

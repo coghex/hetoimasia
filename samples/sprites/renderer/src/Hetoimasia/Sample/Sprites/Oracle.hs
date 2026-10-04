@@ -19,8 +19,10 @@
 module Hetoimasia.Sample.Sprites.Oracle
   ( Expectation (..)
   , expectation
+  , expectationWith
   , ProbeResult (..)
   , evaluateProbes
+  , evaluateProbesWith
   , probesPassed
   , pixelAt
   , within
@@ -31,7 +33,7 @@ import Data.ByteString (ByteString)
 import Data.List (foldl')
 
 import Hetoimasia.GPU.Vulkan.Native.Recording (TableSampler (..))
-import Hetoimasia.Sample.Sprites.Fixtures (Fixture (..), Rgba (..), UvRect (..), fixture, texelAt, transparent)
+import Hetoimasia.Sample.Sprites.Fixtures (Fixture (..), FixtureName, Rgba (..), UvRect (..), fixture, texelAt, transparent)
 import Hetoimasia.Sample.Sprites.Scene (Draw (..), Instance (..), Probe (..), sceneDraws, sceneProbes, targetSide)
 
 -- | What a probe must read, and by how much each channel may differ.
@@ -48,7 +50,12 @@ data Accumulated = Accumulated !Double !Double !Double !Double !Bool
 -- | The probe's expectation in the scene drawn with or without the BC7
 -- draw.
 expectation ∷ Bool → Probe → Expectation
-expectation withBc7 probe =
+expectation = expectationWith fixture
+
+-- | 'expectation' with each fixture name drawing this texture: the swap case
+-- (GRS-9) draws the atlas's handle with its replacement after the swap.
+expectationWith ∷ (FixtureName → Fixture) → Bool → Probe → Expectation
+expectationWith textureOf withBc7 probe =
   let Accumulated r g b a inexact = foldl' over (Accumulated 0 0 0 0 False) covering
    in Expectation (Rgba (byte r) (byte g) (byte b) (byte a)) (if inexact then 1 else 0)
   where
@@ -56,7 +63,7 @@ expectation withBc7 probe =
     centre = (fromIntegral x + 0.5, fromIntegral y + 0.5)
     covering = [(drawFilter draw, item) | draw ← sceneDraws withBc7, item ← drawInstances draw, covers item centre]
     over (Accumulated r g b a inexact) (sampler, item) =
-      let (Sampled sr sg sb sa linear) = sampleInstance sampler item centre
+      let (Sampled sr sg sb sa linear) = sampleInstance textureOf sampler item centre
           keep = 1 - sa / 255
           mixed = sa /= 255 && sa /= 0 && (r, g, b, a) /= (0, 0, 0, 0)
        in Accumulated (sr + r * keep) (sg + g * keep) (sb + b * keep) (sa + a * keep) (inexact || linear || mixed)
@@ -73,13 +80,13 @@ data Sampled = Sampled !Double !Double !Double !Double !Bool
 
 -- | The instance's texture sampled at the coordinate its rectangle maps the
 -- centre to.
-sampleInstance ∷ TableSampler → Instance → (Double, Double) → Sampled
-sampleInstance sampler item (cx, cy) =
+sampleInstance ∷ (FixtureName → Fixture) → TableSampler → Instance → (Double, Double) → Sampled
+sampleInstance textureOf sampler item (cx, cy) =
   let (left, top, width, height) = instanceRect item
       UvRect u0 v0 u1 v1 = instanceUv item
       u = u0 + (cx - left) / width * (u1 - u0)
       v = v0 + (cy - top) / height * (v1 - v0)
-      texture = fixture (instanceTexture item)
+      texture = textureOf (instanceTexture item)
       w = fromIntegral (fixtureWidth texture)
       h = fromIntegral (fixtureHeight texture)
    in case sampler of
@@ -126,10 +133,14 @@ data ProbeResult = ProbeResult
 -- | Every probe of the scene, drawn with or without the BC7 draw, against a
 -- readback of the target.
 evaluateProbes ∷ Bool → ByteString → [ProbeResult]
-evaluateProbes withBc7 bytes =
+evaluateProbes = evaluateProbesWith fixture
+
+-- | 'evaluateProbes' with each fixture name drawing this texture.
+evaluateProbesWith ∷ (FixtureName → Fixture) → Bool → ByteString → [ProbeResult]
+evaluateProbesWith textureOf withBc7 bytes =
   [ ProbeResult probe expected observed (within expected observed)
   | probe ← sceneProbes withBc7
-  , let expected = expectation withBc7 probe
+  , let expected = expectationWith textureOf withBc7 probe
         observed = pixelAt bytes (probePixel probe)
   ]
 

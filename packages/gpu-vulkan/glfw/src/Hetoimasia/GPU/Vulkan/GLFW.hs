@@ -140,6 +140,10 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , TextureHandle (..)
   , LookupEntry (..)
   , registerConstructedTexture
+  , swapConstructedTexture
+  , SwapTicket
+  , SwapState (..)
+  , readSwapTicket
   , releaseConstructedTexture
   , TableView (..)
   , readConstructedTable
@@ -294,6 +298,7 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , constructTextureTable
   , constructTablePipelineLayout
   , registerConstructedTexture
+  , swapConstructedTexture
   , releaseConstructedTexture
   , readConstructedTable
   , constructPipeline
@@ -418,6 +423,9 @@ import Hetoimasia.GPU.Vulkan.Native.TextureTable
   , TableSampler (..)
   , TableView (..)
   , TextureHandle (..)
+  , SwapTicket
+  , SwapState (..)
+  , readSwapTicket
   , bindTable
   , defaultVersionCount
   , selectSampler
