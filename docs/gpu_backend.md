@@ -2402,7 +2402,12 @@ set allocation or descriptor copy fails destroys the pool natively before
 the creation raises. It leaves the current set and the bookkeeping as they
 were, and no handle or slot changes. The rollback is therefore complete
 before any retry, and nothing the attempt made is left for a reclamation
-pass to find or miss.
+pass to find or miss. The grown set is named inside the creation too, under
+the identity the model is about to issue its pool. Naming the pool comes
+after the creation has committed it, and a failure there releases the pool
+for disposal rather than destroying it. So an out of memory there is raised
+as itself, with no recovery, and a retry never runs beside a pool not yet
+destroyed.
 
 A native out of memory then enters #333's single reclamation pass and at
 most one retry of the whole growth; no step obtains a separate retry. A
