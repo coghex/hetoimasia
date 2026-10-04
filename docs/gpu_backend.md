@@ -2467,21 +2467,20 @@ native call and from any thread, where the swap stands.
 - **Failure.** A replacement whose upload is cancelled or lost — it is no
   longer uploading and was never initialized — ends the swap at the next
   refresh. The handle keeps what it showed, the replacement is released,
-  and the ticket reads `SwapFailed`. Once the session has failed, or while a
-  diagnostic failure is pending, no swap can take effect, since writing its
-  descriptor is new work: each pending swap fails once its upload has
-  settled, and a device loss is never reported as success. The session's
-  terminal behavior is unchanged. A host's teardown fails every swap still
-  pending (`failPendingSwaps`, which touches no native object) before any
-  step that may raise or retain, and again however it ends. The window
-  integration's owner ends only through its two teardown hooks, its
-  retirement and its destruction, and runs each with the swaps failed first
-  and again in a `finally` (`settlingSwaps`). So no failure in a surface's
-  discharge, an upload's or a frame-less batch's retirement, or the
-  recording's, can leave a ticket pending. `retireRecording` does the same
-  for hosts that retire the native layer themselves. So a session that
-  fails before the table is next brought up to date, or an owner's exit,
-  leaves no ticket pending, however the rest of the teardown ends.
+  and the ticket reads `SwapFailed`. A session that fails ends every pending
+  swap at once: a failed session writes no descriptor, so no swap can take
+  effect, and a pending swap's ticket reads `SwapFailed` from the moment the
+  failure is latched (`readSwapTicket` consults the session's terminal
+  report). That is before any drain, wait or teardown step, however long a
+  target's drain waits on a fence, and a device loss is never reported as
+  success. Settling the ticket is separate from releasing images, which
+  still waits for completion evidence. The session's terminal behavior is
+  unchanged. For an exit that is not a failure, the host's teardown fails
+  every pending swap (`failPendingSwaps`, touching no native object) before
+  any step that may raise or retain, and again however it ends: the window
+  integration runs its owner's two teardown hooks, its retirement and its
+  destruction, under `settlingSwaps`, and `retireRecording` does the same
+  for hosts that retire the native layer themselves.
 - **One upload.** Only the upload the swap accepted fills its replacement:
   admission refuses any further upload into a pending swap's replacement
   (`UploadMisuse` `WrongPhase`). A cancelled upload therefore fails the swap,
