@@ -137,9 +137,9 @@ describes the case.
 | Captures | [`swap-before-macos.png`](swap-before-macos.png), [`swap-delayed-macos.png`](swap-delayed-macos.png), [`swap-after-macos.png`](swap-after-macos.png) | [`swap-before-linux.png`](swap-before-linux.png), [`swap-delayed-linux.png`](swap-delayed-linux.png), [`swap-after-linux.png`](swap-after-linux.png) |
 | Before and delayed PNG SHA-256 | `b0fc8bbe9c49b504d1f51968878e9e5ad137e1c0c17ed0948808c25d80fec119` | `b0fc8bbe9c49b504d1f51968878e9e5ad137e1c0c17ed0948808c25d80fec119` |
 | After PNG SHA-256 | `afea3c4720c1b056e12edec754464793f8efa94a583f1f3706c5ab12f8581db2` | `afea3c4720c1b056e12edec754464793f8efa94a583f1f3706c5ab12f8581db2` |
-| Producer | `test.vulkan-native` (`--complete`, `grs9-swap` case), run locally with `HETOIMASIA_VALIDATION_EVIDENCE` set | `test.vulkan-native` in workflow run [37226749524](https://github.com/coghex/hetoimasia/actions/runs/37226749524) (attempt 1), artifact `validation-receipts-vulkan` (id 11311374962), files `evidence/test.vulkan-native/swap/` |
-| Revision run | `8aef998510ffd3dbfe15fb06dc24a825f3d5d2f6`, the pull request's head after review round 1 | `4062de710e828756a4e65b78773b23d698d8a5ed`, CI's merge of the head `8aef998510ffd3dbfe15fb06dc24a825f3d5d2f6` (tree `bf8ceb1f84c5c0a0c87c6a2baeb69d32dc30e122`) |
-| Native source digest | `a0e21578a103177c5050b881151661731a80d7c47b3944a4c1974de8539f6d72` | `a0e21578a103177c5050b881151661731a80d7c47b3944a4c1974de8539f6d72` |
+| Producer | `test.vulkan-native` (`--complete`, `grs9-swap` case), run locally with `HETOIMASIA_VALIDATION_EVIDENCE` set | `test.vulkan-native` in workflow run [37227971623](https://github.com/coghex/hetoimasia/actions/runs/37227971623) (attempt 1), artifact `validation-receipts-vulkan` (id 11312507973), files `evidence/test.vulkan-native/swap/` |
+| Revision run | `690929e5dc64ae90fc9b04f98f763c0fd0f9a5b6`, the pull request's head after review round 2 | `dc867c03d0b499390075ee3a98283d568ee86f02`, CI's merge of the head `690929e5dc64ae90fc9b04f98f763c0fd0f9a5b6` (tree `ca49f8cf03a4b6992f20ad6c23ad8c48946047a0`) |
+| Native source digest | `533b462d9cc2acad9b9613ff383da61667863063e901a6552afc0c591b7d0ca2` | `533b462d9cc2acad9b9613ff383da61667863063e901a6552afc0c591b7d0ca2` |
 | Platform | macOS 26.7.1 (25G313), Apple M3 Max, arm64 | GitHub Actions Linux X64, the CI image's isolated X11 display |
 | Device and driver | Apple M3 Max; MoltenVK, device API 1.3.357 | `llvmpipe (LLVM 20.1.2, 256 bits)`; pinned Mesa Lavapipe (`lvp_icd.json`) |
 | Validation | Synchronization validation enabled; clean verdict after the last teardown | Synchronization validation enabled; clean verdict after the last teardown |
@@ -147,12 +147,15 @@ describes the case.
 | BC7 | supported and exercised | supported and exercised |
 | Readbacks | three of 262,144 bytes, complete | three of 262,144 bytes, complete |
 
-This record was regenerated at head `8aef9985` after review round 1 changed
-the native backend (pending swaps failed at retirement; a swap's replacement
-refusing further uploads). That moved the native source digest from
+This record was regenerated at head `690929e5` after review rounds 1 and 2
+changed the native backend and the window integration (pending swaps failed
+first in a host's retirement; a swap's replacement refusing further
+uploads). The native source digest moved from
 `abeed0830233c28a4d3aef995b8b8e4bd3d1fe12da9a56a6af8e416abfcd5ee5` (head
-`ac75a7cf`, workflow run 37215778595) to the one above. Every capture on both
-platforms is byte-identical to the earlier head's, since the drawing did not
+`ac75a7cf`, workflow run 37215778595) through
+`a0e21578a103177c5050b881151661731a80d7c47b3944a4c1974de8539f6d72` (head
+`8aef9985`, run 37226749524) to the one above. Every capture on both
+platforms is byte-identical at all three heads, since the drawing did not
 change.
 
 CI's `test.vulkan-wayland` group ran the same case under the isolated headless
