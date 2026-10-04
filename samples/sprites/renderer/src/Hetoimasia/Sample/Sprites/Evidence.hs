@@ -213,11 +213,20 @@ renderRecord failure bc7 readbackBytes probes =
     list items = "[" <> intercalate ", " items <> "]"
     str ∷ String → String
     str value = "\"" <> concatMap escape value <> "\""
+    -- JSON's required escapes: the quote, the backslash, and every control
+    -- character below U+0020, which a failure's message may carry.
     escape ∷ Char → String
     escape = \case
       '"' → "\\\""
       '\\' → "\\\\"
-      c → [c]
+      '\n' → "\\n"
+      '\r' → "\\r"
+      '\t' → "\\t"
+      '\b' → "\\b"
+      '\f' → "\\f"
+      c
+        | c < ' ' → let digits = showHex (fromEnum c) "" in "\\u" <> replicate (4 - length digits) '0' <> digits
+        | otherwise → [c]
     bool ∷ Bool → String
     bool value = if value then "true" else "false"
     rgba ∷ Rgba → String

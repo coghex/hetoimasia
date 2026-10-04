@@ -12,7 +12,8 @@ module Main (main) where
 import qualified Test.Sample.Sprites.Fixtures as Fixtures
 import qualified Test.Sample.Sprites.Oracle as Oracle
 import qualified Test.Sample.Sprites.Png as Png
+import qualified Test.Sample.Sprites.Record as Record
 import Test.Hspec.Runner (Config (configFailOnEmpty), defaultConfig, hspecWith)
 
 main ∷ IO ()
-main = hspecWith defaultConfig {configFailOnEmpty = True} (Fixtures.spec >> Oracle.spec >> Png.spec)
+main = hspecWith defaultConfig {configFailOnEmpty = True} (Fixtures.spec >> Oracle.spec >> Png.spec >> Record.spec)
