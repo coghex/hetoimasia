@@ -32,11 +32,13 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.ByteString as ByteString
 import Data.Foldable (for_)
+import Control.Monad (unless)
 import Data.IORef (modifyIORef', newIORef, readIORef)
+import Data.Maybe (fromMaybe, listToMaybe)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Set (Set)
-import Data.Word (Word32)
+import Data.Word (Word32, Word64)
 import Numeric.Natural (Natural)
 
 import Hetoimasia.GPU.Model.Budget (BudgetKind (TextureSlotBudget))
@@ -45,8 +47,10 @@ import qualified Hetoimasia.GPU.Model.TextureTable as Book
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Construction
   ( checkedTableRanges
   , construct
+  , constructOnce
   , createImage
   , createMapped
+  , releaseLive
   , releaseManaged
   , validatePushRanges
   )
@@ -74,13 +78,15 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , Refusal (..)
   , TableState (..)
   , checkpointed
+  , isAsynchronous
   , liveNative
   , owned
   , tshow
   )
+import Hetoimasia.GPU.Vulkan.Native.Internal.Reclamation (failingAgain, recoverAllocation, withAllocationAttempt)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Uploads (UploadRequest (..), Uploads, submitUpload)
 import Hetoimasia.GPU.Vulkan.Native.Naming (NativeObjectKind (ObjectDescriptorSet), tableSetName)
-import Hetoimasia.GPU.Vulkan.Native.Roots (nameRootsObject, readRootsDevice, readRootsInstrumentation, rootsCall)
+import Hetoimasia.GPU.Vulkan.Native.Roots (NativeFailure (FailedOutOfMemory), nameRootsObject, readRootsDevice, readRootsInstrumentation, rootsCall, rootsNativeFailure)
 import Hetoimasia.GPU.Vulkan.Native.Shader.Interface (CheckedShaders)
 
 -- | Make the session's texture table from a validated configuration (D-11):
@@ -116,7 +122,15 @@ createTextureTable recording uploads config =
     let capacity = Book.tableCapacity config
         initial = Book.tableInitialSlots config
         versions = Book.tableVersionCount config
-        entryBytes = toInteger initial * 8
+        -- Set 1 and the version ring are sized for the cap from the start
+        -- and never rebuilt (GRS-14): one version is the cap's lookup
+        -- entries, eight bytes each, the slot and the generation.
+        entryBytes = toInteger capacity * 8
+        -- Set 0's generations, from the initial size doubling to the cap;
+        -- each pool holds the four samplers and its set's images, and in the
+        -- worst case every generation's pool is still held at once.
+        generations = setGenerations initial capacity
+        poolDescriptors = sum [toInteger count + 4 | count ← generations]
         granule = lcm (max 1 (limitStorageAlignment limits)) (max 1 (limitNonCoherentAtom limits))
         stride = roundUp (fromInteger entryBytes) granule
         ringBytes = stride * fromIntegral versions
@@ -125,7 +139,7 @@ createTextureTable recording uploads config =
           [ (toInteger capacity, toInteger (limitTableSampledImages limits))
           , (4, toInteger (limitTableSamplers limits))
           , (toInteger capacity + 5, toInteger (limitTableResources limits))
-          , (toInteger initial + 4, toInteger (limitTablePoolDescriptors limits))
+          , (poolDescriptors, toInteger (limitTablePoolDescriptors limits))
           , (2, toInteger (limitBoundSets limits))
           , (entryBytes, toInteger (limitStorageRange limits))
           , (toInteger stride * (toInteger versions - 1), toInteger (maxBound ∷ Word32))
@@ -191,7 +205,7 @@ createTextureTable recording uploads config =
           (\entry → (,) entry <$> step (construct recording 0 1 "the texture table's lookup version" (\_ _ _ _ → pure (Right (NativeVersion entry))) Nothing))
           [0 .. Book.tableVersionCount config - 1]
       rootsCall (recordingRoots recording) "vkUpdateDescriptorSets" $
-        opsWriteDescriptors ops device [WriteLookupBuffer lookupSet (allocationBuffer mapping) (fromIntegral initialSlots * 8)]
+        opsWriteDescriptors ops device [WriteLookupBuffer lookupSet (allocationBuffer mapping) (fromIntegral (Book.tableCapacity config) * 8)]
       Image placeholder ←
         createImage recording (ImageDescription TextureImage Rgba8Linear 1 1 1) >>= \case
           Left refusal → throwIO (Abandon refusal)
@@ -202,14 +216,15 @@ createTextureTable recording uploads config =
       pure
         TableState
           { tableBook = Book.newTextureTable config
-          , tableObjects = samplers <> [textureLayout, lookupLayout, texturePool, lookupPool]
+          , tableObjects = samplers <> [textureLayout, lookupLayout, lookupPool]
+          , tableTexturePool = texturePool
           , tableRing = ring
           , tableVersions = Map.fromList versions
           , tableSetLayoutHandles = [textureLayoutHandle, lookupLayoutHandle]
           , tableSets = [textureSet, lookupSet]
           , tableMapping = mapping
           , tableStride = stride
-          , tableEntries = initialSlots
+          , tableEntries = Book.tableCapacity config
           , tableAtom = atom
           , tablePlaceholder = placeholder
           , tablePlaceholderWritten = False
@@ -240,6 +255,108 @@ createTextureTable recording uploads config =
       resources ← readIORef made
       for_ resources (\resource → releaseManaged recording (Made resource))
 
+-- | Grow set 0 (GRS-14), on the graphics owner's thread: a pool of its own
+-- for a set of twice the allocated slots, never past the cap; that set,
+-- allocated at the new count over the same layout; and every written slot's
+-- descriptor copied into it at the same element, slot 0's placeholder
+-- included once written. The immutable samplers are the layout's, so nothing
+-- is copied into their binding. Then, in one transaction, the larger set
+-- becomes current for every batch that binds the table afterwards and the
+-- old set's pool is released: a batch that bound the old set retains its
+-- pool, so it is destroyed only once no live batch holds it. Set 1, the
+-- version ring, slots, handles and versions are unchanged, and so is every
+-- pipeline layout, whose set 0 layout declared the cap.
+--
+-- A table at its cap is 'RefusedBackpressure' 'TextureSlotBudget'. A growth
+-- whose pool or set allocation, or descriptor copy, fails gives back what it
+-- made and leaves the current set and the bookkeeping as they were. A native
+-- out of memory, once that rollback is complete, enters one reclamation pass
+-- and at most one retry of the whole growth — the pool's creation obtains no
+-- retry of its own — and a growth not recovered raises
+-- 'AllocationNotRecovered'.
+growSet ∷ Recording q inst msgr phys dev cmd → IO (Either Refusal ())
+growSet recording =
+  readTVarIO (recordingTable recording) >>= \case
+    Nothing → pure (Left (RefusedIllegal "growing a texture table this session has not made"))
+    Just table → case Book.growTable (tableBook table) of
+      Left Book.TableAtCapacity → pure (Left (RefusedBackpressure TextureSlotBudget))
+      Left refusal → pure (Left (RefusedIllegal ("growing the texture table: " <> tshow refusal)))
+      Right (_, count) →
+        atomically (readRootsDevice roots) >>= \case
+          Nothing → pure (Left RefusedDeviceAbsent)
+          Just (_, device) →
+            tryWithContext @SomeException (attempt table device count) >>= \case
+              Right (Left refusal) → pure (Left refusal)
+              Right (Right made) → commit made
+              Left failure@(ExceptionWithContext _ exception)
+                | not (isAsynchronous exception)
+                , rootsNativeFailure roots exception == Just FailedOutOfMemory →
+                    withAllocationAttempt roots (\allocation → recoverAllocation roots "growing the texture table" allocation Nothing (Text.pack (displayException exception)) (failingAgain roots (attempt table device count))) >>= \case
+                      Right (Right (Right made)) → commit made
+                      Right (Right (Left refusal)) → pure (Left refusal)
+                      Right (Left notRecovered) → throwIO notRecovered
+                      Left _ → rethrowIO failure
+                | otherwise → rethrowIO failure
+  where
+    roots = recordingRoots recording
+    ops = recordingOps recording
+    -- One whole attempt: the pool, the set and the copy, rolled back if any
+    -- step raises — the pool, a generation, is released, so the
+    -- reclamation pass that follows can destroy it.
+    attempt table device count =
+      constructOnce recording 0 1 "vkCreateDescriptorPool" (\layer device' _ _ → Right . NativeDescriptorPool 0 <$> opsCreateDescriptorPool layer device' (TexturePool 4 count)) Nothing >>= \case
+        Left refusal → pure (Left refusal)
+        Right pool →
+          ( do
+              poolHandle ←
+                liveNative recording pool >>= \case
+                  Right (NativeDescriptorPool _ handle) → pure handle
+                  _ → throwIO (Abandon RefusedWrongKind)
+              layoutHandle ← case tableSetLayoutHandles table of
+                layout : _ → pure layout
+                [] → throwIO (Abandon RefusedWrongKind)
+              set ← rootsCall roots "vkAllocateDescriptorSets" (opsAllocateSet ops device poolHandle layoutHandle (Just count))
+              readRootsInstrumentation roots >>= \case
+                Nothing → pure ()
+                Just (_, instrumentation) → nameRootsObject roots instrumentation ObjectDescriptorSet set (tableSetName pool 0)
+              current ← maybe (throwIO (Abandon RefusedWrongKind)) pure (listToMaybe (tableSets table))
+              let written = Set.toAscList (Set.union (Book.writtenSlots (tableBook table)) (if tablePlaceholderWritten table then Set.singleton 0 else Set.empty))
+              unless (null written) $
+                rootsCall roots "vkUpdateDescriptorSets" (opsWriteDescriptors ops device [CopySampledImages current set (runs written)])
+              pure (Right (pool, set))
+          )
+            `onException` releaseManaged recording (Made pool)
+    -- The larger set becomes current, and the old set's pool is released, in
+    -- one transaction: no cancellation leaves both live or neither current.
+    commit (pool, set) = atomically $ do
+      held ← readTVar (recordingTable recording)
+      case held of
+        Nothing → pure (Left (RefusedIllegal "the texture table vanished while it grew"))
+        Just table → case Book.growTable (tableBook table) of
+          Left refusal → pure (Left (RefusedIllegal ("growing the texture table: " <> tshow refusal)))
+          Right (book, _) → do
+            writeTVar
+              (recordingTable recording)
+              (Just table {tableBook = book, tableTexturePool = pool, tableSets = set : drop 1 (tableSets table)})
+            fmap (const ()) <$> releaseLive recording (tableTexturePool table)
+
+-- | Consecutive slots as runs: a first slot and a count.
+runs ∷ [Word32] → [(Word32, Word32)]
+runs = \case
+  [] → []
+  first : rest →
+    let (following, after) = span' (first + 1) rest
+     in (first, 1 + fromIntegral (length following)) : runs after
+  where
+    span' next = \case
+      slot : more | slot == next → let (taken, left) = span' (next + 1) more in (slot : taken, left)
+      remaining → ([], remaining)
+
+-- | Set 0's slot counts, generation by generation: the initial size, doubled
+-- until the cap.
+setGenerations ∷ Word32 → Word32 → [Word32]
+setGenerations initial cap = initial : if initial >= cap then [] else setGenerations (min cap (initial * 2)) cap
+
 -- | A construction step's refusal, carried out of the steps to undo them.
 newtype Abandon = Abandon Refusal
   deriving (Show)
@@ -269,16 +386,27 @@ registerTexture recording (Image image) =
       Right (NativeImage description _ _)
         | imageKind description /= TextureImage → pure (Left RefusedWrongKind)
         | otherwise → mask $ \restore → do
-            registered ← atomically $
-              readTVar (recordingTable recording) >>= \case
-                Nothing → pure (Left (RefusedIllegal "registering a texture with a session that has made no texture table"))
-                Just table
-                  | Set.member image (tableTextures table) → pure (Left (RefusedMisuse (DuplicateSubject ResourceIdentity)))
-                  | otherwise → case Book.registerTexture image (tableBook table) of
-                      Left _ → pure (Left (RefusedBackpressure TextureSlotBudget))
-                      Right (book, handle) → do
-                        writeTVar (recordingTable recording) (Just table {tableBook = book, tableTextures = Set.insert image (tableTextures table)})
-                        pure (Right handle)
+            let reserve = atomically $
+                  readTVar (recordingTable recording) >>= \case
+                    Nothing → pure (Left (Just (RefusedIllegal "registering a texture with a session that has made no texture table")))
+                    Just table
+                      | Set.member image (tableTextures table) → pure (Left (Just (RefusedMisuse (DuplicateSubject ResourceIdentity))))
+                      | otherwise → case Book.registerTexture image (tableBook table) of
+                          Left _ → pure (Left Nothing)
+                          Right (book, handle) → do
+                            writeTVar (recordingTable recording) (Just table {tableBook = book, tableTextures = Set.insert image (tableTextures table)})
+                            pure (Right handle)
+            -- No free slot: the table grows at once (GRS-14), even while
+            -- released slots are still retiring, and the registration is
+            -- made in the larger set. At the cap it is backpressure.
+            registered ←
+              reserve >>= \case
+                Right handle → pure (Right handle)
+                Left (Just refusal) → pure (Left refusal)
+                Left Nothing →
+                  growSet recording >>= \case
+                    Left refusal → pure (Left refusal)
+                    Right () → either (Left . fromMaybe (RefusedBackpressure TextureSlotBudget)) Right <$> reserve
             case registered of
               Left refusal → pure (Left refusal)
               -- An image whose upload already completed completes now. If
@@ -401,6 +529,10 @@ data TableView = TableView
   , tableViewPlaceholderWritten ∷ !Bool
   , tableViewStride ∷ !Natural
   , tableViewVersions ∷ !(Map.Map Word32 ResourceId)
+  , tableViewAllocated ∷ !Word32
+    -- ^ How many slots the current set 0 holds, slot 0 included (GRS-14).
+  , tableViewSets ∷ ![Word64]
+    -- ^ The current set 0, then set 1.
   }
   deriving (Eq, Show)
 
@@ -422,6 +554,8 @@ readTable recording =
           , tableViewPlaceholderWritten = tablePlaceholderWritten table
           , tableViewStride = tableStride table
           , tableViewVersions = tableVersions table
+          , tableViewAllocated = Book.allocatedSlots book
+          , tableViewSets = tableSets table
           }
 
 roundUp ∷ Natural → Natural → Natural

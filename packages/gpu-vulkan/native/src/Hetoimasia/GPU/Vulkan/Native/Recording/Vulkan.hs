@@ -21,6 +21,7 @@ module Hetoimasia.GPU.Vulkan.Native.Recording.Vulkan
   , transitionScopes
   ) where
 
+import Data.Maybe (mapMaybe)
 import Control.Exception (catch, onException, throwIO)
 import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Unsafe as Unsafe
@@ -194,7 +195,8 @@ vulkanRecordingOps physical = do
           (\(DescriptorPool created) → created) <$> createDescriptorPool device (poolInfo request) Nothing
       , opsDestroyDescriptorPool = \device pool → destroyDescriptorPool device (DescriptorPool pool) Nothing
       , opsAllocateSet = allocateSet
-      , opsWriteDescriptors = \device writes → updateDescriptorSets device (Vector.fromList (map descriptorWrite writes)) Vector.empty
+      , opsWriteDescriptors = \device updates →
+          updateDescriptorSets device (Vector.fromList (mapMaybe descriptorWrite updates)) (Vector.fromList (concatMap descriptorCopies updates))
       }
 
 -- | One of the texture table's samplers (GRS-7): nearest or linear, clamping
@@ -332,10 +334,11 @@ allocateSet device pool layout variable = do
 
 -- | One descriptor update: a texture's view into set 0's array, sampled in
 -- the shader-read layout textures rest in; or the version ring into set 1.
-descriptorWrite ∷ DescriptorWrite → SomeStruct WriteDescriptorSet
+descriptorWrite ∷ DescriptorWrite → Maybe (SomeStruct WriteDescriptorSet)
 descriptorWrite = \case
+  CopySampledImages {} → Nothing
   WriteSampledImage set element view →
-    SomeStruct
+    Just . SomeStruct $
       ( WriteDescriptorSet
           { next = ()
           , dstSet = DescriptorSet set
@@ -350,7 +353,7 @@ descriptorWrite = \case
           ∷ WriteDescriptorSet '[]
       )
   WriteLookupBuffer set buffer range →
-    SomeStruct
+    Just . SomeStruct $
       ( WriteDescriptorSet
           { next = ()
           , dstSet = DescriptorSet set
@@ -364,6 +367,24 @@ descriptorWrite = \case
           }
           ∷ WriteDescriptorSet '[]
       )
+
+-- | A growth's copies of set 0's array into the larger set (GRS-14): one per
+-- run, at the same elements.
+descriptorCopies ∷ DescriptorWrite → [CopyDescriptorSet]
+descriptorCopies = \case
+  CopySampledImages from to runs →
+    [ CopyDescriptorSet
+        { srcSet = DescriptorSet from
+        , srcBinding = tableTextureBinding
+        , srcArrayElement = first
+        , dstSet = DescriptorSet to
+        , dstBinding = tableTextureBinding
+        , dstArrayElement = first
+        , descriptorCount = count
+        }
+    | (first, count) ← runs
+    ]
+  _ → []
 
 -- | Whether the physical device supports an optimally tiled two-dimensional
 -- image of the query: its format offers every format feature asked for, and

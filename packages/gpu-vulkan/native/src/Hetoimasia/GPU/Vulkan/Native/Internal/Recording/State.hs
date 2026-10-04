@@ -304,15 +304,20 @@ data Recording q inst msgr phys dev cmd = Recording
 data TableState = TableState
   { tableBook ∷ !(TextureTable ResourceId)
   , tableObjects ∷ ![ResourceId]
-    -- ^ The samplers, the set layouts and the pools, which every batch that
-    -- binds the table retains.
+    -- ^ The samplers, the set layouts and set 1's pool, which every batch
+    -- that binds the table retains.
+  , tableTexturePool ∷ !ResourceId
+    -- ^ The pool of the current set 0 (GRS-14): a growth replaces it with the
+    -- larger set's and releases it, and a batch that bound the table retains
+    -- the one it bound, so an older set is destroyed only when no batch
+    -- holds it.
   , tableRing ∷ !ResourceId
   , tableVersions ∷ !(Map Word32 ResourceId)
     -- ^ Each ring entry's managed version.
   , tableSetLayoutHandles ∷ ![Word64]
     -- ^ Set 0's layout, then set 1's, as a pipeline layout declares them.
   , tableSets ∷ ![Word64]
-    -- ^ Set 0, then set 1, as a binding binds them.
+    -- ^ The current set 0, then set 1, as a binding binds them.
   , tableMapping ∷ !ReadbackAllocation
     -- ^ Where the version ring is mapped.
   , tableStride ∷ !Natural

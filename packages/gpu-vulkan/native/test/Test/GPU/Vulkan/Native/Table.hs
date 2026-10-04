@@ -46,7 +46,7 @@ import Test.GPU.Vulkan.Native.AllocatorStandIn (AllocatorCall (Flushed), allocat
 import Test.GPU.Vulkan.Native.FramesRig
 import Test.GPU.Vulkan.Native.FramesStandIn (completeAll)
 import Test.GPU.Vulkan.Native.StandIn (StandIn (standAllocator))
-import Test.GPU.Vulkan.Native.RecordingStandIn (RecordingCall (..), RecordingFailure (..), RecordingStep (..), failAt, limitBuffers, limitRecording, onceAt, recordingCalls, standInRecordingLimits, succeedAt)
+import Test.GPU.Vulkan.Native.RecordingStandIn (RecordingCall (..), RecordingFailure (..), RecordingStep (..), failAt, limitBuffers, limitRecording, onceAt, outOfMemoryAt, recordingCalls, standInRecordingLimits, succeedAt)
 
 type Ups = Uploads () Int Int Text Int Word64
 
@@ -64,9 +64,10 @@ spec = describe "Texture table" $ do
       [request | CreatedSetLayout _ request ← calls] `shouldBe` [TextureSetLayout samplers 16, LookupSetLayout]
       [request | CreatedPool _ request ← calls] `shouldBe` [TexturePool 4 4, LookupPool]
       [count | AllocatedSet _ _ _ count ← calls] `shouldBe` [Just 4, Nothing]
-      -- One version is four entries of eight bytes, padded to the device's
-      -- 256-byte storage alignment; the ring holds two.
-      [(range, 1) | WroteDescriptors [WriteLookupBuffer _ _ range] ← calls] `shouldBe` [(32, 1 ∷ Int)]
+      -- One version is the cap's sixteen entries of eight bytes, padded to
+      -- the device's 256-byte storage alignment; the ring holds two. Set 1
+      -- and the ring are sized for the cap from the start (GRS-14).
+      [(range, 1) | WroteDescriptors [WriteLookupBuffer _ _ range] ← calls] `shouldBe` [(128, 1 ∷ Int)]
       Just view ← atomically (readTable (rigRecording rig))
       tableViewStride view `shouldBe` 256
       Map.size (tableViewVersions view) `shouldBe` 2
@@ -91,9 +92,11 @@ spec = describe "Texture table" $ do
       refusedUnder limits {limitTableSamplers = 3} (tableConfig 16 4 2) `shouldReturn` Left (RefusedOutOfBounds 4 3)
       refusedUnder limits {limitTableResources = 20} (tableConfig 16 4 2) `shouldReturn` Left (RefusedOutOfBounds 21 20)
       -- Set 0's pool holds the four samplers and the four initial images.
-      refusedUnder limits {limitTablePoolDescriptors = 7} (tableConfig 16 4 2) `shouldReturn` Left (RefusedOutOfBounds 8 7)
+      -- Set 0's pools, generation by generation — 4, 8 and 16 images, each
+      -- with the four samplers — may all be held at once.
+      refusedUnder limits {limitTablePoolDescriptors = 39} (tableConfig 16 4 2) `shouldReturn` Left (RefusedOutOfBounds 40 39)
       refusedUnder limits {limitBoundSets = 1} (tableConfig 16 4 2) `shouldReturn` Left (RefusedOutOfBounds 2 1)
-      refusedUnder limits {limitStorageRange = 31} (tableConfig 16 4 2) `shouldReturn` Left (RefusedOutOfBounds 32 31)
+      refusedUnder limits {limitStorageRange = 127} (tableConfig 16 4 2) `shouldReturn` Left (RefusedOutOfBounds 128 127)
       -- 262144 entries of eight bytes are a 2 MiB stride, so the 2049th
       -- version's dynamic offset is 4 GiB, which no 32-bit offset holds, on a
       -- device whose buffers could hold the whole ring.
@@ -223,9 +226,130 @@ spec = describe "Texture table" $ do
       length [() | Recorded _ CommandDraw {} ← calls] `shouldBe` 1
       clean rig
 
+  describe "growth" $ do
+    it "grows set 0 when no slot is free — twice, to a cap that is no power of two — copying every written slot into each larger set, which later batches bind; at the cap it is backpressure, and a retired slot is reused" $ do
+      (rig, uploads, kit) ← tableRigWith 5 2 2
+      t1 ← uploadedTexture rig uploads
+      t2 ← uploadedTexture rig uploads
+      t3 ← uploadedTexture rig uploads
+      t4 ← uploadedTexture rig uploads
+      t5 ← uploadedTexture rig uploads
+      h1 ← registered rig t1
+      set0 ← currentSet rig
+      -- A batch binds the first set and is submitted; it has not completed.
+      recordDrawing rig kit
+      _ ← registered rig t2
+      set1 ← currentSet rig
+      allocated rig `shouldReturn` 4
+      calls ← recordingCalls (rigRecordingStandIn rig)
+      [request | CreatedPool _ request ← calls] `shouldBe` [TexturePool 4 2, LookupPool, TexturePool 4 4]
+      [count | AllocatedSet _ _ _ count ← calls] `shouldBe` [Just 2, Nothing, Just 4]
+      copies rig `shouldReturn` [(set0, set1, [(0, 2)])]
+      _ ← registered rig t3
+      _ ← registered rig t4
+      set2 ← currentSet rig
+      allocated rig `shouldReturn` 5
+      copies rig `shouldReturn` [(set0, set1, [(0, 2)]), (set1, set2, [(0, 4)])]
+      registerTexture (rigRecording rig) t5 `shouldReturn'` refused (RefusedBackpressure TextureSlotBudget)
+      -- A later batch binds the largest set; the earlier one bound the first.
+      recordDrawing rig kit
+      bound ← recordingCalls (rigRecordingStandIn rig)
+      [head' sets | Recorded _ (CommandBindDescriptorSets _ sets _) ← bound] `shouldBe` [set0, set2]
+      -- The first set's pool is held by the earlier batch until it
+      -- completes; the second's, which no batch bound, goes at the next
+      -- disposal; the current one stays.
+      final' ← recordingCalls (rigRecordingStandIn rig)
+      let pools = [handle | CreatedPool handle (TexturePool _ _) ← final']
+          (pool0, pool1, pool2) = (head' pools, head' (drop 1 pools), head' (drop 2 pools))
+      _ ← disposeResources (rigRecording rig) (at 1)
+      destroyedPools rig >>= (`shouldSatisfy` (\destroyed → pool0 `notElem` destroyed && pool1 `elem` destroyed && pool2 `notElem` destroyed))
+      completed rig
+      _ ← disposeResources (rigRecording rig) (at 2)
+      destroyedPools rig >>= (`shouldSatisfy` (\destroyed → pool0 `elem` destroyed && pool1 `elem` destroyed && pool2 `notElem` destroyed))
+      -- At the cap, a released texture's slot is reused once retired, with
+      -- no further growth.
+      ok (releaseTexture (rigRecording rig) h1)
+      completed rig
+      ok (refreshTextureTable (rigRecording rig))
+      _ ← registered rig t5
+      allocated rig `shouldReturn` 5
+      final ← recordingCalls (rigRecordingStandIn rig)
+      length [() | CreatedPool _ (TexturePool _ _) ← final] `shouldBe` 3
+      clean rig
+
+    it "pins a batch's set and version at its first bind: a growth between two binds of one batch leaves both binding the old set, and discarding that unsubmitted batch lets the old set go" $ do
+      (rig, uploads, kit) ← tableRigWith 4 2 2
+      t1 ← uploadedTexture rig uploads
+      t2 ← uploadedTexture rig uploads
+      _ ← registered rig t1
+      set0 ← currentSet rig
+      discarded ← try @ErrorCall @() $ withFramelessScope (rigFrames rig) $ \scope → do
+        _ ← recordFramelessIn scope $ \recorder → inPass kit recorder $ do
+          ok (bindTable recorder)
+          _ ← registered rig t2
+          ok (bindTable recorder)
+        throwIO (ErrorCall "the consumer gave up")
+      discarded `shouldBe` Left (ErrorCall "the consumer gave up")
+      set1 ← currentSet rig
+      set1 `shouldSatisfy` (/= set0)
+      calls ← recordingCalls (rigRecordingStandIn rig)
+      [(head' sets, offsets) | Recorded _ (CommandBindDescriptorSets _ sets offsets) ← calls] `shouldBe` [(set0, [0]), (set0, [0])]
+      let pool0 = head' [handle | CreatedPool handle (TexturePool _ 2) ← calls]
+      completed rig
+      _ ← disposeResources (rigRecording rig) (at 1)
+      destroyedPools rig >>= (`shouldSatisfy` elem pool0)
+      clean rig
+
+    it "leaves the current set and the table as they were when the larger pool's creation runs out of memory with nothing to reclaim: no retry, and a later registration grows" $ do
+      (rig, uploads, _) ← tableRigWith 4 2 2
+      t1 ← uploadedTexture rig uploads
+      t2 ← uploadedTexture rig uploads
+      _ ← registered rig t1
+      set0 ← currentSet rig
+      before ← poolAttempts rig
+      outOfMemoryAt (rigRecordingStandIn rig) AtCreatePool 1
+      raised ← try @AllocationNotRecovered (registerTexture (rigRecording rig) t2)
+      fmap (const ()) raised `shouldSatisfy` either (const True) (const False)
+      poolAttempts rig `shouldReturn` before + 1
+      currentSet rig `shouldReturn` set0
+      allocated rig `shouldReturn` 2
+      Just view ← atomically (readTable (rigRecording rig))
+      Map.size (tableViewMapping view) `shouldBe` 1
+      _ ← registered rig t2
+      allocated rig `shouldReturn` 4
+      clean rig
+
+    it "rolls a growth back when its set's allocation runs out of memory, reclaims the rolled-back pool, and retries the whole growth once; a second failure is not retried" $ do
+      (rig, uploads, _) ← tableRigWith 8 2 2
+      t1 ← uploadedTexture rig uploads
+      t2 ← uploadedTexture rig uploads
+      t3 ← uploadedTexture rig uploads
+      t4 ← uploadedTexture rig uploads
+      _ ← registered rig t1
+      before ← poolAttempts rig
+      outOfMemoryAt (rigRecordingStandIn rig) AtAllocateSet 1
+      _ ← registered rig t2
+      allocated rig `shouldReturn` 4
+      calls ← recordingCalls (rigRecordingStandIn rig)
+      let attempts = drop before [handle | CreatedPool handle (TexturePool _ _) ← calls]
+      length attempts `shouldBe` 2
+      destroyedPools rig >>= (`shouldSatisfy` elem (head' attempts))
+      -- Both allocations of the next growth fail: the retry is the only one.
+      _ ← registered rig t3
+      set1 ← currentSet rig
+      before' ← poolAttempts rig
+      outOfMemoryAt (rigRecordingStandIn rig) AtAllocateSet 2
+      raised ← try @AllocationNotRecovered (registerTexture (rigRecording rig) t4)
+      fmap (const ()) raised `shouldSatisfy` either (const True) (const False)
+      poolAttempts rig `shouldReturn` before' + 2
+      currentSet rig `shouldReturn` set1
+      allocated rig `shouldReturn` 4
+      clean rig
+
   describe "versions and slots" $ do
     it "writes a texture's descriptor only into a slot no live version maps, and reuses a released texture's slot only once the batches that bound it complete" $ do
-      (rig, uploads, kit) ← tableRig 3 2
+      -- A table at its cap, so a third texture waits for a slot.
+      (rig, uploads, kit) ← tableRigWith 3 3 2
       first ← uploadedTexture rig uploads
       second ← uploadedTexture rig uploads
       third ← uploadedTexture rig uploads
@@ -312,18 +436,18 @@ spec = describe "Texture table" $ do
       _ ← registered rig texture
       recordDrawing rig kit
       calls ← recordingCalls (rigRecordingStandIn rig)
-      let versionWrites = [(offset, count) | WroteMapped offset count ← calls, count == 32]
+      let versionWrites = [(offset, count) | WroteMapped offset count ← calls, count == 128]
           beforeBind = takeWhile (not . isBind) calls
           isBind = \case
             Recorded _ CommandBindDescriptorSets {} → True
             _ → False
-      versionWrites `shouldBe` [(0, 32), (256, 32)]
-      [() | WroteMapped _ 32 ← beforeBind] `shouldBe` [()]
+      versionWrites `shouldBe` [(0, 128), (256, 128)]
+      [() | WroteMapped _ 128 ← beforeBind] `shouldBe` [()]
       lookupAllocation ← managedHandles rig "lookup buffer" <&> \case
         [_, allocation] → allocation
         other → error ("the lookup buffer's handles: " <> show other)
       flushes ← (\made → [range | Flushed allocation range ← made, allocation == lookupAllocation]) <$> allocatorCalls (standAllocator (rigRootsStandIn rig))
-      flushes `shouldBe` [(0, 64), (256, 64)]
+      flushes `shouldBe` [(0, 128), (256, 128)]
       clean rig
 
     it "binds a batch at the current version while every ring entry is held, when no mapping changed since it was published" $ do
@@ -580,9 +704,13 @@ tableConfig capacity initial versions = either (error . show) id (validateTableC
 -- | A session with a table of this many slots and versions whose placeholder
 -- is written, and a kit to draw with.
 tableRig ∷ Integer → Integer → IO (Rig, Ups, Kit)
-tableRig slots versions = do
+tableRig = tableRigWith 16
+
+-- | 'tableRig' with this cap.
+tableRigWith ∷ Integer → Integer → Integer → IO (Rig, Ups, Kit)
+tableRigWith cap slots versions = do
   (rig, uploads) ← uploadRig
-  ok (createTextureTable (rigRecording rig) uploads (tableConfig 16 slots versions))
+  ok (createTextureTable (rigRecording rig) uploads (tableConfig cap slots versions))
   settle rig uploads
   ok (refreshTextureTable (rigRecording rig))
   kit ← newKit rig
@@ -699,6 +827,33 @@ vertexDeclaring descriptors =
   CheckedShaders
     (CheckedShader (ByteString.pack [1, 2, 3, 4]) (interfaceFor VertexInterface) {interfaceDescriptors = descriptors})
     (CheckedShader (ByteString.pack [5, 6, 7, 8]) (interfaceFor FragmentInterface) {interfacePushConstants = [PushMember 0 8, PushMember 8 4], interfaceDescriptors = textureTableDescriptors})
+
+-- | The current set 0.
+currentSet ∷ Rig → IO Word64
+currentSet rig = atomically (readTable (rigRecording rig)) <&> \case
+  Just view → head' (tableViewSets view)
+  Nothing → error "no table"
+
+-- | How many slots the current set holds.
+allocated ∷ Rig → IO Word32
+allocated rig = atomically (readTable (rigRecording rig)) <&> maybe 0 tableViewAllocated
+
+-- | Every growth's copy: the old set, the new one, and the runs copied.
+copies ∷ Rig → IO [(Word64, Word64, [(Word32, Word32)])]
+copies rig = (\calls → [(from, to, copied) | WroteDescriptors writes ← calls, CopySampledImages from to copied ← writes]) <$> recordingCalls (rigRecordingStandIn rig)
+
+-- | Every descriptor pool destroyed so far.
+destroyedPools ∷ Rig → IO [Word64]
+destroyedPools rig = (\calls → [pool | DestroyedPool pool ← calls]) <$> recordingCalls (rigRecordingStandIn rig)
+
+-- | How many set 0 pools were asked for so far, made or not.
+poolAttempts ∷ Rig → IO Int
+poolAttempts rig = (\calls → length [() | CreatedPool _ (TexturePool _ _) ← calls]) <$> recordingCalls (rigRecordingStandIn rig)
+
+head' ∷ [a] → a
+head' = \case
+  x : _ → x
+  [] → error "empty"
 
 -- | How many managed generations of this kind the recording holds.
 managedCount ∷ Rig → Text → IO Int

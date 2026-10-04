@@ -774,6 +774,11 @@ data DescriptorWrite
   | WriteLookupBuffer !Word64 !Word64 !Natural
     -- ^ Set 1's buffer: this buffer, from offset zero, over this range; each
     -- binding's dynamic offset selects a version within it.
+  | CopySampledImages !Word64 !Word64 ![(Word32, Word32)]
+    -- ^ Copy set 0's array from the first set into the second, run by run —
+    -- each run a first element and a count — at the same elements: a
+    -- growth's copy of every written slot into the larger set (GRS-14). The
+    -- immutable samplers' binding is the layout's, and is not copied.
   deriving (Eq, Show)
 
 -- ---------------------------------------------------------------------------
