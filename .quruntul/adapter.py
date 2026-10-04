@@ -47,7 +47,7 @@ import sys
 
 # What ghcup installs for each GHC version, as `<tool>-<version>`.
 GHC_TOOLS = ("ghc", "ghc-pkg", "ghci", "haddock", "hp2ps", "hpc", "hsc2hs", "runghc", "runhaskell")
-VULKAN_PACKAGES = {"hetoimasia-gpu-vulkan-native", "hetoimasia-gpu-vulkan-glfw", "hetoimasia-sample-triangle"}
+VULKAN_PACKAGES = {"hetoimasia-gpu-vulkan-native", "hetoimasia-gpu-vulkan-glfw", "hetoimasia-sample-triangle", "hetoimasia-sample-sprites"}
 GLFW_PACKAGES = {"hetoimasia-glfw"}
 BUILD_SECONDS = 3600
 # Exact per-test selection must supersede a profile's --match (quruntul 0.2.0).

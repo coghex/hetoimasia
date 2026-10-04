@@ -143,13 +143,14 @@ siblingSourcesAbsent =
   "the Vulkan packages' sources are checkout-only and absent here, as in an unpacked source \
   \distribution; this check runs from a checkout, which is where the workflow group runs it"
 
--- | The mains of the four suites the headless group runs.
+-- | The mains of the five suites the headless group runs.
 headlessMains ∷ [FilePath]
 headlessMains =
   [ nativePackage </> "test/RootsMain.hs"
   , nativePackage </> "test/Main.hs"
   , integrationPackage </> "test/Main.hs"
   , "samples/triangle/renderer/test/Main.hs"
+  , "samples/sprites/renderer/test/Main.hs"
   ]
 
 -- | The three validation groups that run through the Vulkan project: the
@@ -182,17 +183,18 @@ glfwPackage = "packages/glfw"
 interopFlag ∷ String
 interopFlag = "vulkan-interop"
 
--- | The triangle sample's two packages (VK-17): its drawing, which the
--- integration's native suite depends on, and its executable. Like the native
--- and integration packages, only the Vulkan project names them.
+-- | The samples' packages: the triangle sample's (VK-17) and the sprites
+-- sample's (GRS-8), each a drawing the integration's native suite depends on
+-- and an executable. Like the native and integration packages, only the
+-- Vulkan project names them.
 samplePackages ∷ [String]
-samplePackages = ["samples/triangle/renderer", "samples/triangle/app"]
+samplePackages = ["samples/triangle/renderer", "samples/triangle/app", "samples/sprites/renderer", "samples/sprites/app"]
 
 -- | Everything the Vulkan project names: the native package, the window
--- integration package, the triangle sample's two packages, the GLFW package
+-- integration package, the samples' packages, the GLFW package
 -- whose interop component it enables, the local dependency closure of the
 -- native package and that component, and the test-only support library the
--- native package's shader suite uses. All but the first four are ordinary
+-- native package's shader suite uses. All but the first six are ordinary
 -- packages the other projects list too, and with the interop flag off none of
 -- them depends on the binding.
 vulkanProject ∷ [String]
@@ -345,6 +347,7 @@ spec = describe "The Vulkan project boundary" $ do
                  , "hetoimasia-gpu-vulkan-native:test:shader-tests"
                  , "hetoimasia-gpu-vulkan-glfw:test:integration-tests"
                  , "hetoimasia-sample-triangle:test:triangle-tests"
+                 , "hetoimasia-sample-sprites:test:sprites-tests"
                  ]
     -- And the runner's test mode starts no display: the only display it
     -- ever starts is the native mode's.
@@ -354,7 +357,7 @@ spec = describe "The Vulkan project boundary" $ do
     filter ("x11.sh" `isInfixOf`) testMode `shouldBe` []
 
   it "fails each headless suite on a selection that matches none of its examples" $ do
-    -- The group runs four suites under one command, so one of them passing
+    -- The group runs five suites under one command, so one of them passing
     -- empty — every example filtered away by a selector or an ambient Hspec
     -- setting — would leave a passing receipt that asserted nothing for it.
     -- Each suite's main has to refuse an empty selection itself.
@@ -384,11 +387,11 @@ spec = describe "The Vulkan project boundary" $ do
         suite `shouldContain` "completeFlag = \"--complete\""
         suite `shouldContain` "evalSpec defaultConfig {configFailOnEmpty = True} examples"
         suite `shouldContain` "completenessProblems consent report children"
-    -- The triangle sample's executable is compiled beside it, so a sample that
-    -- no longer builds against the host fails the group rather than waiting
-    -- for someone to launch it; nothing runs it.
+    -- The samples' executables are compiled beside it, so a sample that no
+    -- longer builds against the host fails the group rather than waiting for
+    -- someone to launch it; nothing runs them.
     (group >>= field "preparation" >>= stringsAt "command")
-      `shouldBe` Just ["bash", runner, "build", "hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests", "hetoimasia-sample-triangle-app:exe:hetoimasia-triangle"]
+      `shouldBe` Just ["bash", runner, "build", "hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests", "hetoimasia-sample-triangle-app:exe:hetoimasia-triangle", "hetoimasia-sample-sprites-app:exe:hetoimasia-sprites"]
     -- The execution builds nothing: the runner's native mode names an
     -- executable Cabal already built and refuses one that was not.
     script ← map trim . lines <$> readFile runner
