@@ -89,6 +89,12 @@
 --   read back after completion, checked against the sample's independent
 --   oracle, and written as a lossless PNG and a probe record under the
 --   validation runner's evidence directory (#345);
+-- * @grs14-table-growth@ — the same device start with no window, then a
+--   texture table of five slots at most, two at first, grown twice by
+--   registration; a batch recorded before a growth and submitted after it,
+--   and one drawing textures registered before and after growth with a
+--   pipeline built before it, both read back and probed; and backpressure at
+--   the cap (#344);
 -- * @grs3-ordering@ — GRS-3's managed depth target and buffer written by an
 --   initializing batch, then by two batches submitted in order with no
 --   completion wait between and no layout change, ordered only by the
@@ -387,6 +393,14 @@ scenarios =
       $ \consent journal _ → do
         outcome ← SurfaceFree.runSprites (consentBackend consent) journal
         pure (SurfaceFree.spritesSpec outcome, section "The GRS-8 sprites evidence record" (SurfaceFree.spritesSection outcome))
+  , Scenario
+      "grs14-table-growth"
+      "grows the texture table of a surface-free session twice to a cap that is no power of two, samples correctly from a batch recorded before a growth and submitted after it, draws textures registered before and after growth with a pipeline built before it, and answers backpressure at the cap, with validation reporting nothing"
+      False
+      Nothing
+      $ \consent journal _ → do
+        outcome ← SurfaceFree.runGrowth (consentBackend consent) journal
+        pure (SurfaceFree.growthSpec outcome, section "The GRS-14 texture table growth record" (SurfaceFree.growthSection outcome))
   , Scenario
       "synchronization-hazard"
       "observes a deliberate synchronization hazard, proving synchronization validation active"

@@ -230,6 +230,12 @@ data RecorderState = RecorderState
 -- table bound again.
 data TableBinding = TableBinding
   { bindingTaken ∷ !TakenVersion
+  , bindingSets ∷ ![Word64]
+    -- ^ The sets the first bind bound — set 0 of the generation current then,
+    -- and set 1 — which every later bind of the batch binds again, whatever
+    -- has grown since (GRS-14): with the version, a coherent pair.
+  , bindingPool ∷ !ResourceId
+    -- ^ That set 0's pool, which the batch retains.
   , bindingImages ∷ ![ResourceId]
     -- ^ Every image the version can sample: the placeholder, and each
     -- texture it maps. A draw through the table needs each in its sampled
@@ -1080,7 +1086,7 @@ bindTable recorder =
                 pure (Left (RefusedIllegal "binding the texture table under a pipeline whose layout does not hold it"))
             | otherwise → do
                 taken ← case stateTable state of
-                  Just binding → pure (Right (bindingTaken binding, Just (bindingImages binding)))
+                  Just binding → pure (Right (bindingTaken binding, Just binding))
                   Nothing → fmap (\version → (version, Nothing)) <$> takeVersion recording
                 table ← readTVarIO (recordingTable recording)
                 case (taken, table) of
@@ -1089,14 +1095,25 @@ bindTable recorder =
                   (Right (version, kept), Just held) → command recorder $ \current → case statePipeline current of
                     Just now →
                       let ranges = interfacePushConstants (boundInterface now)
-                          images = fromMaybe (tablePlaceholder held : Book.versionTextures (takenEntry version) (tableBook held)) kept
+                          -- The first bind pins the current set 0 and its
+                          -- pool with the version; a later bind binds them
+                          -- again.
+                          images = maybe (tablePlaceholder held : Book.versionTextures (takenEntry version) (tableBook held)) bindingImages kept
+                          sets = maybe (tableSets held) bindingSets kept
+                          pool = maybe (tableTexturePool held) bindingPool kept
                        in Right
-                            ( current {stateTable = Just (TableBinding version images (Just ranges))}
-                            , tableObjects held
-                                <> [tableRing held, takenResource version]
-                                <> images
-                                <> [boundLayout now]
-                            , CommandBindDescriptorSets (interfaceLayout (boundInterface now)) (tableSets held) [takenOffset version]
+                            ( current {stateTable = Just (TableBinding version sets pool images (Just ranges))}
+                            -- The first bind retains the table's objects, its
+                            -- set 0's pool, the ring, the version and every
+                            -- image the version maps; a later bind of the
+                            -- batch, which binds the same sets, retains only
+                            -- the layout it binds them under, so a pool or an
+                            -- image released since stays held but is never
+                            -- retained again.
+                            , case kept of
+                                Nothing → tableObjects held <> [pool, tableRing held, takenResource version] <> images <> [boundLayout now]
+                                Just _ → [boundLayout now]
+                            , CommandBindDescriptorSets (interfaceLayout (boundInterface now)) sets [takenOffset version]
                             )
                     Nothing → Left (RefusedIllegal "binding the texture table with no pipeline bound")
   where

@@ -28,6 +28,7 @@ module Test.GPU.Vulkan.Native.StandIn
   , failNaming
   , restoreNaming
   , loseNaming
+  , outOfMemoryNaming
   , NamingFailure (..)
   , namesGiven
 
@@ -204,6 +205,8 @@ data StandIn = StandIn
     -- ^ Kinds whose naming raises 'NamingFailure'.
   , standNameLosses ∷ !(TVar [NativeObjectKind])
     -- ^ Kinds whose naming loses the device.
+  , standNameOutOfMemory ∷ !(TVar [NativeObjectKind])
+    -- ^ Kinds whose next naming runs out of memory, once each.
   , standAllocator ∷ !AllocatorStandIn
     -- ^ The allocator every device of this stand-in is given.
   }
@@ -218,6 +221,7 @@ newStandIn = do
     <*> newTVarIO (pure ())
     <*> newTVarIO 100
     <*> newTVarIO False
+    <*> newTVarIO []
     <*> newTVarIO []
     <*> newTVarIO []
     <*> newAllocatorStandIn
@@ -301,6 +305,11 @@ restoreNaming standIn kind = atomically (modifyTVar' (standNameFails standIn) (f
 -- once it is recorded, which the stand-in classifies as device loss.
 loseNaming ∷ StandIn → NativeObjectKind → IO ()
 loseNaming standIn kind = atomically (modifyTVar' (standNameLosses standIn) (kind :))
+
+-- | Have the next naming of an object of this kind, once it is recorded, raise
+-- 'StandInResult' out of memory.
+outOfMemoryNaming ∷ StandIn → NativeObjectKind → IO ()
+outOfMemoryNaming standIn kind = atomically (modifyTVar' (standNameOutOfMemory standIn) (kind :))
 
 -- | A naming call the stand-in was told to fail.
 newtype NamingFailure = NamingFailure NativeObjectKind
@@ -411,6 +420,10 @@ standInOps standIn =
               if losing then throwIO (StandInLoss AtNaming) else pure ()
               failing ← elem kind <$> readTVarIO (standNameFails standIn)
               if failing then throwIO (NamingFailure kind) else pure ()
+              exhausted ← atomically $ do
+                pending ← readTVar (standNameOutOfMemory standIn)
+                if kind `elem` pending then True <$ writeTVar (standNameOutOfMemory standIn) (filter (/= kind) pending) else pure False
+              if exhausted then throwIO (StandInResult "naming" FailedOutOfMemory) else pure ()
     , opsGenerations =
         GenerationOps
           { opsSurfaceOffer = \_ surface → do

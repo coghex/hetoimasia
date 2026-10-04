@@ -59,6 +59,7 @@ module Test.GPU.Vulkan.Native.SurfaceFree
   , runUploads
   , runTable
   , runSprites
+  , runGrowth
   , surfaceFreeSection
   , laterWindowSection
   , framelessSection
@@ -67,6 +68,7 @@ module Test.GPU.Vulkan.Native.SurfaceFree
   , uploadsSection
   , tableSection
   , spritesSection
+  , growthSection
   , surfaceFreeSpec
   , laterWindowSpec
   , framelessSpec
@@ -75,6 +77,7 @@ module Test.GPU.Vulkan.Native.SurfaceFree
   , uploadsSpec
   , tableSpec
   , spritesSpec
+  , growthSpec
   ) where
 
 import Control.Concurrent (ThreadId, myThreadId, threadDelay)
@@ -88,13 +91,13 @@ import Data.List (elemIndex, nub)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as Text
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, listToMaybe)
 import Data.Time.Clock (UTCTime, addUTCTime, diffUTCTime, getCurrentTime)
 import Data.Time.Clock.POSIX (utcTimeToPOSIXSeconds)
 import System.Environment (lookupEnv)
 import System.FilePath ((</>))
 import Data.Bits (shiftR)
-import Data.Word (Word16, Word32, Word8)
+import Data.Word (Word16, Word32, Word64, Word8)
 import GHC.Float (castFloatToWord32)
 import Numeric.Natural (Natural)
 import System.Directory (doesFileExist, getTemporaryDirectory)
@@ -115,7 +118,7 @@ import Hetoimasia.Foundation.Time (DurationRequirement (AllowZero), durationFrom
 import Hetoimasia.GLFW.Session (Backend)
 import Hetoimasia.GLFW.Vulkan (withLoaderIntegration)
 import Hetoimasia.GLFW.Window (WindowConfig (..), hiddenTestWindowConfig)
-import Hetoimasia.GPU.Model.Budget (BudgetRequest (..), defaultBudgetRequest, validateBudgets)
+import Hetoimasia.GPU.Model.Budget (BudgetKind (TextureSlotBudget), BudgetRequest (..), defaultBudgetRequest, validateBudgets)
 import Hetoimasia.GPU.Model.Identity (TargetClass (..))
 import Hetoimasia.GPU.Vulkan.Diagnostics (CaptureConfig (..), DiagnosticVerdict (..), defaultCaptureConfig, verdictIssues)
 import Hetoimasia.GPU.Vulkan.GLFW
@@ -266,6 +269,7 @@ data SurfaceFreeFacts = SurfaceFreeFacts
   , factsUploads ∷ !(Maybe UploadFacts)
   , factsTable ∷ !(Maybe TableFacts)
   , factsSprites ∷ !(Maybe Evidence)
+  , factsGrowth ∷ !(Maybe GrowthFacts)
   }
 
 data SurfaceFreeOutcome
@@ -284,6 +288,7 @@ data Seen = Seen
   , seenUploads ∷ !(Maybe UploadFacts)
   , seenTable ∷ !(Maybe TableFacts)
   , seenSprites ∷ !(Maybe Evidence)
+  , seenGrowth ∷ !(Maybe GrowthFacts)
   }
 
 -- | What the uploads case (GRS-6) found: each upload's ticket, waited for
@@ -321,7 +326,7 @@ runSurfaceFree backend journal = do
     windows ← length <$> atomically (hostWindowIdentities (vulkanWindowHost vulkan))
     roots ← atomically (readVulkanRoots (vulkanController vulkan))
     note journal ("the actions answered " <> Text.intercalate "; " answers)
-    pure (Seen threads answers windows (Just roots) Nothing [] [] Nothing Nothing Nothing)
+    pure (Seen threads answers windows (Just roots) Nothing [] [] Nothing Nothing Nothing Nothing)
 
 -- | The case that admits a window after the device exists.
 runLaterWindow ∷ Maybe Backend → Journal → IO SurfaceFreeOutcome
@@ -353,7 +358,7 @@ runLaterWindow backend journal = do
       pure (if any (`elem` retired) presented then FinishWith () else ContinueWith NoUpdateDemand)
     note journal "presented a frame to the later window and saw its presentation retire"
     roots ← atomically (readVulkanRoots (vulkanController vulkan))
-    pure (Seen [] [] 1 (Just roots) (Just standing) [] [] Nothing Nothing Nothing)
+    pure (Seen [] [] 1 (Just roots) (Just standing) [] [] Nothing Nothing Nothing Nothing)
   where
     quiet = recordingLogger (\_ → pure ())
 
@@ -378,7 +383,7 @@ runFrameless backend journal = do
     tickets ← mapM (\ticket → awaitTicket ticket deadline) [firstTicket, snd second]
     note journal ("the tickets answered " <> tshow tickets)
     roots ← atomically (readVulkanRoots (vulkanController vulkan))
-    pure (Seen [firstOn, fst second] ["recorded an initializing frame-less batch", "recorded a second frame-less batch"] 0 (Just roots) Nothing tickets [] Nothing Nothing Nothing)
+    pure (Seen [firstOn, fst second] ["recorded an initializing frame-less batch", "recorded a second frame-less batch"] 0 (Just roots) Nothing tickets [] Nothing Nothing Nothing Nothing)
   where
     deadline = either (error . show) id (durationFromNanoseconds AllowZero 10000000000)
 
@@ -411,7 +416,7 @@ runOffscreen backend journal = do
       | ((format, _, _), ticket, reading) ← zip3 batches tickets readings
       ]
     roots ← atomically (readVulkanRoots (vulkanController vulkan))
-    pure (Seen [renderedOn, readOn] ["rendered and copied both targets", "read both readbacks"] 0 (Just roots) Nothing tickets shots Nothing Nothing Nothing)
+    pure (Seen [renderedOn, readOn] ["rendered and copied both targets", "read both readbacks"] 0 (Just roots) Nothing tickets shots Nothing Nothing Nothing Nothing)
   where
     deadline = either (error . show) id (durationFromNanoseconds AllowZero 10000000000)
     pixelAt bytes (x, y) = ByteString.unpack (ByteString.take 4 (ByteString.drop ((y * offscreenSide + x) * 4) bytes))
@@ -440,7 +445,7 @@ runDrawing backend journal = do
     note journal ("the readback is at " <> Text.pack path)
     let shot = Shot Rgba8Srgb waited [(point, pixelAt bytes point) | point ← drawingProbes] path
     roots ← atomically (readVulkanRoots (vulkanController vulkan))
-    pure (Seen [drawnOn, readOn] ["drew the quad and copied the target", "read the readback"] 0 (Just roots) Nothing [waited] [shot] Nothing Nothing Nothing)
+    pure (Seen [drawnOn, readOn] ["drew the quad and copied the target", "read the readback"] 0 (Just roots) Nothing [waited] [shot] Nothing Nothing Nothing Nothing)
   where
     deadline = either (error . show) id (durationFromNanoseconds AllowZero 10000000000)
     pixelAt bytes (x, y) = ByteString.unpack (ByteString.take 4 (ByteString.drop ((y * offscreenSide + x) * 4) bytes))
@@ -514,6 +519,7 @@ runUploads backend journal = do
             [waited]
             [shot]
             (Just facts)
+            Nothing
             Nothing
             Nothing
         )
@@ -982,6 +988,7 @@ runTable backend journal = do
             Nothing
             (Just facts)
             Nothing
+            Nothing
         )
   where
     deadline = either (error . show) id (durationFromNanoseconds AllowZero 30000000000)
@@ -1124,7 +1131,7 @@ runSprites backend journal = do
       note journal ("sprites capture: " <> maybe "not written" Text.pack (evidencePng outcome) <> "; probe record: " <> Text.pack (evidenceRecord outcome))
       mapM_ (\failure → note journal ("sprites evidence failed: " <> failure)) (evidenceFailure outcome)
       roots ← atomically (readVulkanRoots (vulkanController vulkan))
-      pure (Seen [] ["ran the sprites evidence"] 0 (Just roots) Nothing [] [] Nothing Nothing (Just outcome))
+      pure (Seen [] ["ran the sprites evidence"] 0 (Just roots) Nothing [] [] Nothing Nothing (Just outcome) Nothing)
   where
     spritesDirectory =
       lookupEnv "HETOIMASIA_VALIDATION_EVIDENCE" >>= \case
@@ -1194,6 +1201,155 @@ spritesBuilders construction =
     , buildReadback = constructReadback construction
     , registerImage = registerConstructedTexture construction
     }
+
+-- | What the growth case (GRS-14) found.
+data GrowthFacts = GrowthFacts
+  { growthAllocated ∷ ![Word32]
+    -- ^ The slots set 0 held: at first, after the first growth, after the
+    -- second.
+  , growthSets ∷ ![Word64]
+    -- ^ The current set 0 at each of those points: a new set at each growth.
+  , growthBackpressure ∷ !(Either Refusal ())
+    -- ^ What registering one texture past the cap answered.
+  , growthTickets ∷ ![Either Text UploadState]
+  }
+  deriving (Show)
+
+-- | The growth case (GRS-14): a table of five slots at most, two at first,
+-- over the session's uploads, and a pipeline built over it before any
+-- growth. A batch is recorded with the first texture's handle, the second
+-- texture's registration then grows the table — the batch is submitted after,
+-- when its action returns — and the batch still samples the first texture
+-- from the set it bound. The third and fourth textures grow the table to its
+-- cap, not to a power of two, a fifth is backpressure, and a batch draws a
+-- texture registered before both growths beside one registered after them,
+-- with the pipeline built before them. Both batches are read back and probed.
+runGrowth ∷ Maybe Backend → Journal → IO SurfaceFreeOutcome
+runGrowth backend journal = do
+  heading journal "GRS-14: a surface-free session grows its texture table twice to a cap that is no power of two, a batch recorded before a growth and submitted after it samples correctly, handles from before and after growth draw with a pipeline built before it, and the cap is backpressure"
+  runCaseWith
+    (\config → config {vulkanUploads = Just uploadConfig})
+    backend
+    defaultBudgetRequest {requestedBytes = 2 * 1024 * 1024 * 1024}
+    []
+    "vulkan-native-grs14-table-growth"
+    $ \vulkan _ _ _ → do
+      (madeOn, (made, textures)) ← acted vulkan "the table, its textures and its pipeline" growthTargets
+      awaitTable vulkan "the placeholder written" tableViewPlaceholderWritten
+      initial ← tableNow vulkan
+      admitted ← mapM (submitVulkanUpload vulkan) [UploadImage texture [solid colour] | (texture, colour) ← zip textures growthColours]
+      states ←
+        mapM
+          ( \case
+              Left refusal → pure (Left (tshow refusal))
+              Right ticket → either (Left . tshow) Right <$> awaitUploadTicket ticket deadline
+          )
+          admitted
+      (firstOn, (first, ticket1)) ←
+        acted vulkan "the batch recorded before the first growth" $ \construction →
+          registerConstructedTexture construction (textures !! 0) >>= \case
+            Left refusal → pure (Left refusal)
+            Right first → do
+              batch ← tableBatch construction made 0 [(wholeRect, first, NearestClamp)]
+              -- The second texture finds no free slot: the table grows
+              -- before this action returns, which is when the batch is
+              -- submitted.
+              grown ← registerConstructedTexture construction (textures !! 1)
+              pure ((,) first <$> (grown >> batch))
+      waited1 ← awaitTicket ticket1 deadline
+      afterFirst ← tableNow vulkan
+      (secondOn, (backpressure, ticket2)) ←
+        acted vulkan "the second growth, the cap and the batch over both" $ \construction → do
+          _ ← registerConstructedTexture construction (textures !! 2)
+          fourth ← registerConstructedTexture construction (textures !! 3)
+          capped ← registerConstructedTexture construction (textures !! 4)
+          case fourth of
+            Left refusal → pure (Left refusal)
+            Right latest →
+              fmap ((,) (fmap (const ()) capped)) <$> tableBatch construction made 1 [(leftRect, first, NearestClamp), (rightRect, latest, NearestClamp)]
+      waited2 ← awaitTicket ticket2 deadline
+      afterSecond ← tableNow vulkan
+      (readOn, targets) ←
+        acted vulkan "the readbacks" $ \construction →
+          sequence <$> mapM (\readback → readConstructedReadback construction readback 0 offscreenBytes) (tableReadbacks made)
+      directory ← getTemporaryDirectory
+      shots ←
+        mapM
+          ( \(index, (waited, bytes)) → do
+              (path, handle) ← openBinaryTempFile directory ("hetoimasia-grs14-growth-" <> show (index ∷ Int) <> ".png")
+              ByteString.hPut handle (encodeRgba offscreenSide offscreenSide bytes)
+              hClose handle
+              note journal ("readback " <> tshow index <> " is at " <> Text.pack path)
+              pure (Shot Rgba8Srgb waited [(point, pixelAt bytes point) | point ← tableProbes] path)
+          )
+          (zip [0 ..] (zip [waited1, waited2] targets))
+      roots ← atomically (readVulkanRoots (vulkanController vulkan))
+      let facts =
+            GrowthFacts
+              (map (maybe 0 tableViewAllocated) [initial, afterFirst, afterSecond])
+              (map (maybe 0 (headOr 0 . tableViewSets)) [initial, afterFirst, afterSecond])
+              backpressure
+              states
+      note journal ("growth: " <> tshow facts)
+      pure
+        ( Seen
+            [madeOn, firstOn, secondOn, readOn]
+            ["made the table, the textures, the targets and the pipeline", "recorded a batch, then grew the table", "grew the table to its cap and drew over both growths", "read both readbacks"]
+            0
+            (Just roots)
+            Nothing
+            [waited1, waited2]
+            shots
+            Nothing
+            Nothing
+            Nothing
+            (Just facts)
+        )
+  where
+    deadline = either (error . show) id (durationFromNanoseconds AllowZero 30000000000)
+    pixelAt bytes (x, y) = ByteString.unpack (ByteString.take 4 (ByteString.drop ((y * offscreenSide + x) * 4) bytes))
+    solid = ByteString.pack . concat . replicate 4
+    tableNow vulkan =
+      act vulkan (VulkanAction readConstructedTable) >>= \case
+        ActionReturned view → pure view
+        other → stopWith ("reading the texture table did not return: " <> outcomeText other)
+    headOr fallback = \case
+      x : _ → x
+      [] → fallback
+
+-- | The growth case's textures' colours: red, green, blue, yellow and white.
+growthColours ∷ [[Word8]]
+growthColours = [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255], [255, 255, 0, 255], [255, 255, 255, 255]]
+
+-- | A table of five slots at most, two at first; five two-by-two RGBA8
+-- textures; two RGBA8 color targets with a readback each; and a pipeline
+-- over the table shaders, built before any growth.
+growthTargets ∷ Construction q inst msgr phys dev cmd → IO (Either Refusal (TableTargets, [Image]))
+growthTargets construction =
+  constructTextureTable construction (either (error . show) id (validateTableConfig 5 2 (toInteger defaultVersionCount))) >>= \case
+    Left refusal → pure (Left refusal)
+    Right () → do
+      let side = fromIntegral offscreenSide
+      textures ← mapM (const (constructImage construction (ImageDescription TextureImage Rgba8Linear 2 2 1))) growthColours
+      targets ← mapM (const (constructImage construction (ImageDescription ColorTarget Rgba8Srgb side side 1))) [1 ∷ Int .. 2]
+      pipeline ←
+        constructTablePipelineLayout construction tableShaders tableSamplerOffset >>= \case
+          Left refusal → pure (Left refusal)
+          Right layout → constructCheckedPipeline construction layout tableShaders (formatCode Rgba8Srgb)
+      readbacks ← mapM (const (constructReadback construction offscreenBytes)) [1 ∷ Int .. 2]
+      pure $ do
+        made ← sequence textures
+        colour ← sequence targets
+        built ← pipeline
+        read' ← sequence readbacks
+        first ← maybe (Left (RefusedIllegal "no textures")) Right (listToMaybe made)
+        pure (TableTargets first first first colour built read', made)
+
+-- | What each growth readback's probes must read: the first texture across
+-- the batch recorded before the first growth; the first texture beside the
+-- fourth, registered after both growths.
+expectedGrowthProbes ∷ [[[Word8]]]
+expectedGrowthProbes = [[[255, 0, 0, 255], [255, 0, 0, 255]], [[255, 0, 0, 255], [255, 255, 0, 255]]]
 
 -- | Run the commands in order, stopping at the first refusal.
 inOrder ∷ [IO (Either Refusal ())] → IO (Either Refusal ())
@@ -1347,6 +1503,7 @@ runCaseWith adjust backend request windows label body = do
               , factsUploads = seenUploads seen
               , factsTable = seenTable seen
               , factsSprites = seenSprites seen
+              , factsGrowth = seenGrowth seen
               }
   where
     -- Every call's name, as it returns, where a transaction can wait for it.
@@ -1691,6 +1848,51 @@ spritesSpec outcome = describe "GRS-8 the sprites sample's window-free evidence"
   it "retired cleanly, with every Vulkan call on the owner's thread" $
     on outcome $ \facts → do
       callNames facts `shouldSatisfy` ordered ["vkDestroyDevice", "vkDestroyDebugUtilsMessengerEXT", "vkDestroyInstance"]
+      oneOwnerThread facts
+
+  it "reached a verdict after the last callback with no issue and no error, synchronization validation included" $
+    on outcome clean
+
+growthSection ∷ SurfaceFreeOutcome → [Text]
+growthSection outcome =
+  section "A surface-free session growing its texture table" outcome
+    <> case outcome of
+      SurfaceFreeRecorded facts →
+        ["- growth: " <> maybe "no facts" tshow (factsGrowth facts)]
+          <> [ "- " <> tshow (map snd (shotProbes shot)) <> ", ticket " <> tshow (shotTicket shot) <> ", PNG at " <> Text.pack (shotPng shot)
+             | shot ← factsShots facts
+             ]
+      SurfaceFreeFailed _ → []
+
+growthSpec ∷ SurfaceFreeOutcome → Spec
+growthSpec outcome = describe "GRS-14 texture table growth in a surface-free session" $ do
+  it "opened no window, created no surface and acquired no image" $
+    on outcome $ \facts → do
+      factsWindows facts `shouldBe` 0
+      callNames facts `shouldSatisfy` notElem "glfwCreateWindowSurface"
+      callNames facts `shouldSatisfy` notElem "vkAcquireNextImageKHR"
+      deviceFirst facts
+
+  it "grew set 0 twice, from two slots to four to the cap of five, each time into a new set from a pool of its own, and answered backpressure at the cap" $
+    on outcome $ \facts → case factsGrowth facts of
+      Nothing → expectationFailure "no growth facts"
+      Just growth → do
+        growthAllocated growth `shouldBe` [2, 4, 5]
+        length (nub (growthSets growth)) `shouldBe` 3
+        growthBackpressure growth `shouldBe` Left (RefusedBackpressure TextureSlotBudget)
+        growthTickets growth `shouldBe` replicate 5 (Right UploadComplete)
+        length (filter (== "vkCreateDescriptorPool") (callNames facts)) `shouldBe` 4
+        length (filter (== "vkAllocateDescriptorSets") (callNames facts)) `shouldBe` 4
+
+  it "sampled the first texture in a batch recorded before a growth and submitted after it, and textures registered before and after growth with a pipeline built before it" $
+    on outcome $ \facts → do
+      map shotTicket (factsShots facts) `shouldBe` replicate 2 (Right TicketComplete)
+      [map snd (shotProbes shot) | shot ← factsShots facts] `shouldBe` expectedGrowthProbes
+      length (filter (== "vkCreateGraphicsPipelines") (callNames facts)) `shouldBe` 1
+
+  it "retired cleanly, every set's pool before the device, with every Vulkan call on the owner's thread" $
+    on outcome $ \facts → do
+      callNames facts `shouldSatisfy` ordered ["vkDestroyDescriptorPool", "vkDestroyDevice", "vkDestroyDebugUtilsMessengerEXT", "vkDestroyInstance"]
       oneOwnerThread facts
 
   it "reached a verdict after the last callback with no issue and no error, synchronization validation included" $

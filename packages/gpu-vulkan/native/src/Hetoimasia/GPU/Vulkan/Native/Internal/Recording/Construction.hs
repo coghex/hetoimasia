@@ -18,6 +18,8 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Construction
   ( createStaging
   , createMapped
   , construct
+  , constructOnce
+  , undoing
   , createPipelineLayout
   , createPipelineLayoutWith
   , createPipeline
@@ -816,7 +818,34 @@ construct
   → (RecordingOps dev cmd → dev → AllocationId → Maybe ResourceId → IO (Either Refusal (NativeResource cmd)))
   → Maybe ResourceId
   → IO (Either Refusal ResourceId)
-construct recording bytes objects name create replacing =
+construct = constructWith True
+
+-- | 'construct' with out-of-memory recovery left to the caller: a creation
+-- that raises out of memory gives its reservation back and re-raises at once,
+-- with no reclamation pass and no retry. For one step of a composite
+-- construction — the texture table's growth (GRS-14) — whose single recovery
+-- covers the whole composite, after its rollback, so no step obtains a retry
+-- of its own.
+constructOnce
+  ∷ Recording q inst msgr phys dev cmd
+  → Natural
+  → Natural
+  → Text
+  → (RecordingOps dev cmd → dev → AllocationId → Maybe ResourceId → IO (Either Refusal (NativeResource cmd)))
+  → Maybe ResourceId
+  → IO (Either Refusal ResourceId)
+constructOnce = constructWith False
+
+constructWith
+  ∷ Bool
+  → Recording q inst msgr phys dev cmd
+  → Natural
+  → Natural
+  → Text
+  → (RecordingOps dev cmd → dev → AllocationId → Maybe ResourceId → IO (Either Refusal (NativeResource cmd)))
+  → Maybe ResourceId
+  → IO (Either Refusal ResourceId)
+constructWith recovering recording bytes objects name create replacing =
   owned recording $
     atomically (readRootsDevice roots) >>= \case
       Nothing → pure (Left RefusedDeviceAbsent)
@@ -853,6 +882,7 @@ construct recording bytes objects name create replacing =
                   -- model permits the attempt's retry (VK-14). Nothing else is.
                   Left (ExceptionWithContext _ exception)
                     | not (isAsynchronous exception)
+                    , recovering
                     , rootsNativeFailure roots exception == Just FailedOutOfMemory →
                         tryWithContext @SomeException (recoverAllocation roots name (Just allocation) Nothing (Text.pack (displayException exception)) (failingAgain roots creation)) >>= \case
                           Right (Right native) → pure native
