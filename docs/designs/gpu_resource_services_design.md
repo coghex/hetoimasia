@@ -1405,6 +1405,16 @@ pull request.
 > old image; the replacement may change format and size; the handle owns its
 > current texture, so the old one is released automatically and retires on
 > completion; a second pending swap supersedes the first.
+>
+> As delivered (#346): `swapTexture` names the replacement image an admitted
+> or completed upload fills, and answers a ticket reporting where the swap
+> stands. The swap reserves a slot and changes no mapping until the upload
+> completes; the first version after that resolves the handle to the
+> replacement. The old texture is released when the swap takes effect and
+> destroyed once no batch retains it, its slot reused once no live version
+> maps it. A superseded or abandoned replacement is released at once; a
+> cancelled or lost one, or a failed session, ends the swap as failed with
+> the handle unchanged. The sprites sample's swap case is the evidence.
 
 - **Outcome:** a handle's image is replaced; later frames sample the new one
   and the old retires after the submissions that sampled it complete.
