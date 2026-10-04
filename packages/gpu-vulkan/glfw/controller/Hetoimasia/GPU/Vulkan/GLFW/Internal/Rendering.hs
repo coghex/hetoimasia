@@ -151,6 +151,7 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
   , prepareTargetRetirement
   , retireTargetRendering
   , endCaptures
+  , failRenderingSwaps
   , retireRendering
 
     -- * Failures
@@ -1521,15 +1522,17 @@ cancelRenderingUpload rendering ticket =
 -- are let go of under the device-loss rule without waiting. One still
 -- outstanding at the end is retained, and so is the device: nothing is
 -- certified complete to finish the teardown.
+-- | Fail every texture swap still pending in the rendering's recording
+-- (GRS-9), touching no native object. The owner's teardown hooks run it
+-- before and after everything else ("settlingSwaps").
+failRenderingSwaps ∷ Rendering q inst msgr phys dev cmd → STM ()
+failRenderingSwaps rendering = readTVar (renderingLive rendering) >>= maybe (pure ()) (failPendingSwaps . liveRecording)
+
 retireRendering ∷ Rendering q inst msgr phys dev cmd → Instant → IO ()
 retireRendering rendering now =
   readTVarIO (renderingLive rendering) >>= \case
     Nothing → pure ()
     Just made → do
-      -- Texture swaps still pending can never take effect (GRS-9): each
-      -- fails first, touching no native object, so no ticket stays pending
-      -- whatever a later step raises or retains.
-      atomically (failPendingSwaps (liveRecording made))
       uploads ← readTVarIO (renderingUploads rendering)
       -- Uploads not yet started are cancelled before the drain, and those
       -- started are settled with the frame-less work it drains (GRS-6).

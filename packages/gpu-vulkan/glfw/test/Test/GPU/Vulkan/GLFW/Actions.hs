@@ -60,6 +60,8 @@ import Hetoimasia.Runtime.GLFW
   , hostPendingAttachments
   , ownerDestroyed
   , publishOwnerDestruction
+  , custodyOf
+  , Stage (..)
   , hostWindowClient
   , OwnerStatus (..)
   , readOwnerFailure
@@ -103,6 +105,7 @@ spec = describe "Vulkan surface-free sessions and owner-thread actions" $ do
     itBounded "are recorded inside an action with no target, submitted in seal order when it returns, and complete their tickets only on fence evidence, waited on with a deadline" testFramelessBatches
     itBounded "are discarded when their action raises, submitting nothing" testFramelessRaising
     itBounded "fail a texture swap still pending at the owner's exit before frame-less retirement, which retains a batch that never completed (GRS-9)" testSwapAtRetirement
+    itBounded "fail a texture swap still pending at the owner's exit before an orphaned surface's destruction fails, which ends the retirement early (GRS-9)" testSwapAtOrphanFailure
 
   describe "zero-target progress" $ do
     itBounded "admits uploads from another thread into an idle owner with no target, keeps them uploading past a wait's deadline while their batches are pending, and completes them on fence evidence" testUploads
@@ -571,6 +574,55 @@ testSwapAtRetirement = do
     bound ← registerDelay 15000000
     void . forkIO $ do
       atomically ((readSwapTicket ticket >>= check . (== SwapFailed)) `orElse` (readTVar bound >>= check))
+      publishOwnerDestruction owner (ownerDestroyed "published independently by the example")
+  ticket ← readTVarIO held >>= maybe (failWith "the swap was not accepted") pure
+  atomically (readSwapTicket ticket) >>= (`shouldBe` SwapFailed)
+
+-- | A texture swap accepted before the owner's exit fails at the exit even
+-- when the exit's first cleanup step raises: a deferred window's surface,
+-- never announced, fails its destruction, so the owner's retirement ends
+-- with its orphaned surfaces uncertain before it reaches the rendering, and
+-- the drain goes on to the owner's destruction.
+testSwapAtOrphanFailure ∷ IO ()
+testSwapAtOrphanFailure = do
+  base ← newRigOf 3
+  let rig = withUploads (either (error . show) id (validateUploadConfig (1024 * 1024) 65536 4)) base {rigPortCapacity = Just 1}
+  scriptSurface rig 102 DestroyFails
+  submissionsComplete rig False
+  held ← newTVarIO Nothing
+  _ ← runRigCaught rig $ \host _ → do
+    let owner = vulkanGraphicsOwner host
+        windows = vulkanWindowHost host
+    -- The owner holds inside the first construction while the second
+    -- attachment fills its port, so the third is deferred.
+    gate ← newTVarIO False
+    scriptNative rig AtQueryDevices (HoldsUntil gate)
+    [first, second, third] ← windowsOf host
+    one ← handedOver host first RequiredTarget
+    atomically (custodyOf owner (graphicsAttachment one) >>= check . (== Just CustodyOwned))
+    _ ← handedOver host second RequiredTarget
+    handOverVulkanTarget (vulkanController host) windows owner third RequiredTarget >>= \case
+      VulkanAnnouncementDeferred _ → pure ()
+      other → failWith ("the third window was not deferred: " <> show other)
+    atomically (writeTVar gate True)
+    _ ← awaitStanding host one
+    (handle, replacement) ← returned =<< act host (VulkanAction (\construction → do
+      constructTextureTable construction (either (error . show) id (validateTableConfig 16 4 2)) >>= either (failWith . show) pure
+      old ← constructImage construction (ImageDescription TextureImage Rgba8Linear 2 2 1) >>= either (failWith . show) pure
+      replacement ← constructImage construction (ImageDescription TextureImage Rgba8Linear 2 2 1) >>= either (failWith . show) pure
+      handle ← registerConstructedTexture construction old >>= either (failWith . show) pure
+      pure (handle, replacement)))
+    _ ← submitVulkanUpload (vulkanController host) (UploadImage replacement [ByteString.replicate 16 1]) >>= either (failWith . show) pure
+    ticket ← returned =<< act host (VulkanAction (\construction → swapConstructedTexture construction handle replacement >>= either (failWith . show) pure))
+    atomically (writeTVar held (Just ticket))
+    -- The failed surface lets the instance go no further: independent
+    -- evidence of the owner's destruction ends the exit, published once the
+    -- swap has failed — or after a bound, so a ticket left pending fails the
+    -- example rather than hanging it.
+    bound ← registerDelay 15000000
+    void . forkIO $ do
+      atomically ((readSwapTicket ticket >>= check . (== SwapFailed)) `orElse` (readTVar bound >>= check))
+      atomically (check . null =<< hostPendingAttachments windows)
       publishOwnerDestruction owner (ownerDestroyed "published independently by the example")
   ticket ← readTVarIO held >>= maybe (failWith "the swap was not accepted") pure
   atomically (readSwapTicket ticket) >>= (`shouldBe` SwapFailed)
