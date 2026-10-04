@@ -865,7 +865,7 @@ spec = describe "Texture table" $ do
       _ ← disposeResources (rigRecording rig) (at 2)
       standing rig old `shouldReturn` Nothing
       _ ← registered rig later
-      (final' <$> writtenSlots rig) `shouldReturn` oldSlot
+      (lastOf <$> writtenSlots rig) `shouldReturn` oldSlot
       clean rig
 
     it "keeps a swapped handle on its current image — never the placeholder — until the replacement's upload completes, growing the table for the replacement's slot, and then publishes a replacement of another format, extent and mip count" $ do
@@ -1215,8 +1215,8 @@ queuedTexture rig uploads description levels = do
   ticket ← submitUpload uploads (UploadImage texture levels) >>= either (fail . show) pure
   pure (texture, ticket)
 
-final' ∷ [a] → a
-final' = head' . reverse
+lastOf ∷ [a] → a
+lastOf = head' . reverse
 
 head' ∷ [a] → a
 head' = \case
