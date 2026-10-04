@@ -66,6 +66,7 @@ module Hetoimasia.GPU.Model.TextureTable
   , completeTexture
   , releaseTexture
   , unregisterTexture
+  , growTable
   , bindVersion
   , VersionBinding (..)
   , reclaimSlots
@@ -80,6 +81,8 @@ module Hetoimasia.GPU.Model.TextureTable
   , versionTextures
   , liveVersions
   , freeSlots
+  , allocatedSlots
+  , writtenSlots
   , retiringSlots
   , mappedSlots
   ) where
@@ -197,6 +200,12 @@ data TextureTable a = TextureTable
     -- ^ The ring entry of the current version, once one is published.
   , tableDirty ∷ !Bool
     -- ^ Whether a mapping changed since the current version was published.
+  , tableAllocated ∷ !Word32
+    -- ^ How many slots the current set holds, slot 0 included: the initial
+    -- size, doubled by each growth up to the cap (GRS-14).
+  , tableWritten ∷ !(Set Word32)
+    -- ^ The slots whose descriptor holds a texture the table still keeps: a
+    -- completed texture's, until its slot is freed. What a growth copies.
   }
   deriving (Eq, Show)
 
@@ -230,6 +239,8 @@ newTextureTable config =
     , tableVersions = Map.empty
     , tableCurrent = Nothing
     , tableDirty = True
+    , tableAllocated = tableInitialSlots config
+    , tableWritten = Set.empty
     }
 
 -- | Why an operation on the table changed nothing.
@@ -244,6 +255,12 @@ data TableRefusal
     -- is held or current.
   | TableAlreadyComplete !TextureHandle
     -- ^ The handle's texture already completed.
+  | TableHasFreeSlot
+    -- ^ A growth was asked for while a slot is free: the table grows only
+    -- when registration finds none.
+  | TableAtCapacity
+    -- ^ Backpressure: the table holds its cap and no slot is free, until a
+    -- released texture's slot is reclaimed.
   deriving (Eq, Show)
 
 -- | Register one texture: reserve a free index and a free slot, and answer
@@ -266,7 +283,9 @@ registerTexture kept table = case (Set.lookupMin (tableFree table), freeIndex) o
   _ → Left TableFull
   where
     -- The lookup array has as many entries as the table has slots.
-    freeIndex = case [index | index ← [0 .. tableInitialSlots (tableConfig table) - 1], maybe True (null . indexHolder) (Map.lookup index (tableIndices table))] of
+    -- The lookup array has an entry for every slot the cap allows, so an
+    -- index is never what runs out first.
+    freeIndex = case [index | index ← [0 .. tableCapacity (tableConfig table) - 1], maybe True (null . indexHolder) (Map.lookup index (tableIndices table))] of
       index : _ → Just index
       [] → Nothing
     -- A generation never wraps to zero, which no handle may have.
@@ -288,6 +307,7 @@ completeTexture handle table = do
           ( table
               { tableIndices = Map.adjust (\state → state {indexHolder = Just (HolderReady slot)}) index (tableIndices table)
               , tableDirty = True
+              , tableWritten = Set.insert slot (tableWritten table)
               }
           , (slot, kept)
           )
@@ -327,8 +347,34 @@ unregisterTexture handle table = do
           { tableIndices = Map.adjust (\state → state {indexHolder = Nothing}) index (tableIndices table)
           , tableTextures = Map.delete slot (tableTextures table)
           , tableFree = Set.insert slot (tableFree table)
+          , tableWritten = Set.delete slot (tableWritten table)
           , tableDirty = True
           }
+
+-- | Grow the table (GRS-14): double the slots its current set holds, never
+-- past the cap, and add the new slots to the free ones, answering the new
+-- count. The caller makes the larger set, copies the written slots into it
+-- ('writtenSlots') and makes it current; slots, handles and versions are
+-- unchanged. Only a registration that found no free slot grows the table —
+-- even while released slots are still retiring — so a free slot is
+-- 'TableHasFreeSlot'; and a table at its cap is 'TableAtCapacity', which is
+-- backpressure.
+growTable ∷ TextureTable a → Either TableRefusal (TextureTable a, Word32)
+growTable table
+  | not (Set.null (tableFree table)) = Left TableHasFreeSlot
+  | allocated >= cap = Left TableAtCapacity
+  | otherwise =
+      Right
+        ( table
+            { tableAllocated = grown
+            , tableFree = Set.union (tableFree table) (Set.fromList [allocated .. grown - 1])
+            }
+        , grown
+        )
+  where
+    allocated = tableAllocated table
+    cap = tableCapacity (tableConfig table)
+    grown = min cap (allocated * 2)
 
 -- | The index and holder of a live handle, or its refusal.
 live ∷ TextureHandle → TextureTable a → Either TableRefusal (Word32, Holder)
@@ -386,6 +432,7 @@ reclaimSlots held table =
   ( table
       { tableRetiring = Map.withoutKeys (tableRetiring table) (Set.fromList (map fst freed))
       , tableFree = Set.union (tableFree table) (Set.fromList (map fst freed))
+      , tableWritten = Set.difference (tableWritten table) (Set.fromList (map fst freed))
       }
   , freed
   )
@@ -476,6 +523,15 @@ mappedSlots held table =
 
 freeSlots ∷ TextureTable a → Set Word32
 freeSlots = tableFree
+
+-- | How many slots the current set holds, slot 0 included.
+allocatedSlots ∷ TextureTable a → Word32
+allocatedSlots = tableAllocated
+
+-- | The slots whose descriptor holds a texture the table still keeps: those
+-- a growth copies into the larger set, beside slot 0's placeholder.
+writtenSlots ∷ TextureTable a → Set Word32
+writtenSlots = tableWritten
 
 retiringSlots ∷ TextureTable a → [Word32]
 retiringSlots = Map.keys . tableRetiring

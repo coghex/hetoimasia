@@ -9,6 +9,9 @@ import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Word (Word32)
 import Hetoimasia.GPU.Model.TextureTable
+import Hetoimasia.GPU.Model
+import Hetoimasia.GPU.Model.Identity (HoldSubject (ResourceSubject))
+import Test.GPU.Model.Support
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
 
 spec ∷ Spec
@@ -107,6 +110,81 @@ spec = describe "texture table" $ do
       shared `shouldBe` VersionBinding (bindingVersion two) Nothing
       (changedAgain, _) ← expectRight (registerTexture "b" second)
       bindVersion everything changedAgain `shouldBe` Left TableVersionsHeld
+
+  describe "growth" $ do
+    it "grows only when no slot is free, doubling the allocated slots and never past a non-power-of-two cap, which is backpressure" $ do
+      let table = newTextureTable (either (error . show) id (validateTableConfig 10 3 8)) ∷ TextureTable String
+      allocatedSlots table `shouldBe` 3
+      growTable table `shouldBe` Left TableHasFreeSlot
+      (one, _) ← expectRight (registerTexture "a" table)
+      (two, _) ← expectRight (registerTexture "b" one)
+      registerTexture "c" two `shouldBe` Left TableFull
+      (grown, count) ← expectRight (growTable two)
+      (count, allocatedSlots grown, freeSlots grown) `shouldBe` (6, 6, Set.fromList [3, 4, 5])
+      full ← foldr (\name next → next >>= \t → fst <$> expectRight (registerTexture name t)) (pure grown) ["c", "d", "e"]
+      (atCap, capped) ← expectRight (growTable full)
+      (capped, allocatedSlots atCap, freeSlots atCap) `shouldBe` (10, 10, Set.fromList [6 .. 9])
+      filled ← foldr (\name next → next >>= \t → fst <$> expectRight (registerTexture name t)) (pure atCap) ["f", "g", "h", "i"]
+      registerTexture "j" filled `shouldBe` Left TableFull
+      growTable filled `shouldBe` Left TableAtCapacity
+
+    it "grows while released slots are still retiring, leaving them retiring and every handle and version as it was" $ do
+      let table = fresh 3 2
+      (one, first) ← expectRight (registerTexture "a" table)
+      (completed, (slot, _)) ← expectRight (completeTexture first one)
+      (two, second) ← expectRight (registerTexture "b" completed)
+      (bound, binding) ← expectRight (bindVersion none two)
+      released ← expectRight (releaseTexture first bound)
+      -- The batch that bound the version still maps the first slot, so it
+      -- retires rather than frees: no slot is free, and the table grows.
+      let held = heldBy [bindingVersion binding]
+      freeSlots (fst (reclaimSlots held released)) `shouldBe` Set.empty
+      (grown, count) ← expectRight (growTable (fst (reclaimSlots held released)))
+      -- Three slots (the fixture's cap is 16) double to six.
+      count `shouldBe` 6
+      retiringSlots grown `shouldBe` [slot]
+      handleStanding second grown `shouldBe` handleStanding second released
+      versionMapping (bindingVersion binding) grown `shouldBe` versionMapping (bindingVersion binding) released
+      -- The retiring slot is freed, and reused, once that batch's version is
+      -- no longer live.
+      let (reclaimed, freed) = reclaimSlots none grown
+      map fst freed `shouldBe` [slot]
+      Set.member slot (freeSlots reclaimed) `shouldBe` True
+
+    it "names the written slots a growth copies: completed textures', until their slots are freed or their registration undone" $ do
+      let table = fresh 4 2
+      (one, first) ← expectRight (registerTexture "a" table)
+      (two, second) ← expectRight (registerTexture "b" one)
+      writtenSlots two `shouldBe` Set.empty
+      (completed, (slot, _)) ← expectRight (completeTexture first two)
+      (completedBoth, (other, _)) ← expectRight (completeTexture second completed)
+      writtenSlots completedBoth `shouldBe` Set.fromList [slot, other]
+      released ← expectRight (releaseTexture first completedBoth)
+      writtenSlots released `shouldBe` Set.fromList [slot, other]
+      writtenSlots (fst (reclaimSlots none released)) `shouldBe` Set.fromList [other]
+      undone ← expectRight (unregisterTexture second completedBoth)
+      writtenSlots undone `shouldBe` Set.fromList [slot]
+
+    it "keeps a superseded set's pool until the batch that bound it completes, and the current set's regardless (the model's holds)" $ do
+      model ← freshModel
+      (active, target, _) ← activeTarget 2 model
+      (withOld, oldPool) ← aResource 1024 active
+      (withNew, newPool) ← aResource 2048 withOld
+      (framed, frame) ← acquiredFrame target withNew
+      (recorded, _) ← admitted "recording a batch that bound the old set" (recordBatch frame [oldPool] framed)
+      -- Growth supersedes the old set: its pool is released and its CPU use
+      -- ends, but the batch's recorded reference still holds it.
+      released ← admitted_ "releasing the old set's pool" (releaseResource oldPool recorded)
+      ended ← admitted_ "ending its CPU use" (endResourceCpuUse oldPool released)
+      disposalEligible (ResourceSubject oldPool) ended `shouldBe` False
+      (submitted, answer) ← admitted "submitting" (submitFrames [frame] SubmissionAccepted ended)
+      submission ← case answer of
+        SubmissionRecorded identity → pure identity
+        other → fail ("expected a submission record, got " <> show other)
+      disposalEligible (ResourceSubject oldPool) submitted `shouldBe` False
+      completedModel ← admitted_ "completing the submission" (recordCompletion (atMilliseconds 1) (SubmissionCompleted submission) submitted)
+      disposalEligible (ResourceSubject oldPool) completedModel `shouldBe` True
+      disposalEligible (ResourceSubject newPool) completedModel `shouldBe` False
 
   describe "slots" $ do
     it "undoes a registration whose handle was never handed out: its slot is free at once, nothing retires, and its index is issued again" $ do
