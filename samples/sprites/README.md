@@ -232,6 +232,60 @@ bash tools/vulkan/run.sh test hetoimasia-sample-sprites:test:sprites-tests
 HETOIMASIA_NATIVE_SESSION=desktop bash tools/vulkan/run.sh native hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests -- --complete
 ```
 
+## The swap case
+
+The swap case (GRS-9, #346; `Hetoimasia.Sample.Sprites.Swap`) shows a texture
+handle redirected to a replacement while the scene's instance data — which
+carries the handle, not the texture — stays the same bytes. It runs in a
+surface-free session of its own, since a session holds one texture table:
+
+```bash
+HETOIMASIA_NATIVE_SESSION=desktop bash tools/vulkan/run.sh native \
+  hetoimasia-sample-sprites-app:exe:hetoimasia-sprites -- --evidence --swap --output-dir DIRECTORY --validation
+```
+
+The replacement is `swappedAtlasFixture`: the atlas's 8×8 linear RGBA8 layout
+with each region's colour rotated — green upper-left, blue upper-right,
+yellow lower-left, red lower-right. Keeping the layout keeps every UV
+rectangle and the linear probe's sub-texel margin; a changed format, extent
+or mip count is the native suite's stand-in coverage.
+
+The case:
+
+1. Makes the scene as evidence mode does, with three 256×256 linear RGBA8
+   targets and readbacks, the replacement, and two 2×2 textures to register
+   later; uploads all of them and waits for each.
+2. Records the scene into the first target — the frame before the swap — and
+   reads it back once it completes.
+3. Records the scene into the second target. After the recording binds the
+   table, and before the batch is submitted, it swaps the atlas's handle to
+   the replacement, whose upload has completed, and registers one of the
+   small textures. This is the delayed frame, read back once it completes.
+4. Records the scene into the third target — the frame after the swap — and
+   reads it back once it completes.
+5. Registers the other small texture.
+
+It writes `swap-before.png`, `swap-delayed.png`, `swap-after.png` and
+`swap-probes.json`: the facts, the ordering, and every probe of each capture.
+It passes only when all of these hold:
+
+- the before and delayed captures pass every probe of the oracle over the
+  original fixtures;
+- the after capture passes every probe of the oracle with the replacement
+  drawn for the atlas (`evaluateProbesWith swappedTextures`);
+- the swap took effect (`SwapPublished`) by the time the delayed frame
+  completed, in a slot of the replacement's own;
+- while the delayed frame held the old version, the atlas's slot was
+  retiring, and the texture registered then took another slot;
+- the texture registered after the delayed frame completed took the atlas's
+  old slot;
+- the instance data was the same bytes before and after the swap.
+
+The native suite runs it as its `grs9-swap` private case, writing beneath
+`HETOIMASIA_VALIDATION_EVIDENCE/swap/` when the runner names an evidence
+directory. The retained record is in
+[docs/evidence/gpu_2d/](../../docs/evidence/gpu_2d/README.md).
+
 ## Owned state
 
 | State | Owner | Construction | Readers and writers | Thread | Lifetime | Disposal |

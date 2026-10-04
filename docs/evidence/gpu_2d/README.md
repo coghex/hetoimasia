@@ -120,3 +120,125 @@ An image viewer composites the translucent regions over its own background, so
 they appear lighter there than their stored bytes. The two captures are
 byte-identical, as is the Wayland capture. Whole-image equality across
 platforms is not required, and is recorded here only as observed.
+
+# GRS-9 2D evidence: a texture swap under a stable handle
+
+The retained evidence for #346: the sprites sample's swap case
+(`Hetoimasia.Sample.Sprites.Swap`), which the native suite runs as
+`grs9-swap` and the sample's executable as `--evidence --swap`. The atlas's
+handle is redirected to a replacement between a frame's recording and its
+submission. The sample's [README](../../../samples/sprites/README.md#the-swap-case)
+describes the case.
+
+## Identities
+
+| | macOS | Linux (CI) |
+| --- | --- | --- |
+| Captures | [`swap-before-macos.png`](swap-before-macos.png), [`swap-delayed-macos.png`](swap-delayed-macos.png), [`swap-after-macos.png`](swap-after-macos.png) | [`swap-before-linux.png`](swap-before-linux.png), [`swap-delayed-linux.png`](swap-delayed-linux.png), [`swap-after-linux.png`](swap-after-linux.png) |
+| Before and delayed PNG SHA-256 | `b0fc8bbe9c49b504d1f51968878e9e5ad137e1c0c17ed0948808c25d80fec119` | `b0fc8bbe9c49b504d1f51968878e9e5ad137e1c0c17ed0948808c25d80fec119` |
+| After PNG SHA-256 | `afea3c4720c1b056e12edec754464793f8efa94a583f1f3706c5ab12f8581db2` | `afea3c4720c1b056e12edec754464793f8efa94a583f1f3706c5ab12f8581db2` |
+| Producer | `test.vulkan-native` (`--complete`, `grs9-swap` case), run locally with `HETOIMASIA_VALIDATION_EVIDENCE` set | `test.vulkan-native` in workflow run [37215778595](https://github.com/coghex/hetoimasia/actions/runs/37215778595) (attempt 1), artifact `validation-receipts-vulkan` (id 11308815828), files `evidence/test.vulkan-native/swap/` |
+| Revision run | `ac75a7cf0958d2312c43c67ef1811a21b42ad144`, the pull request's head | `134f1c0ad78249cbac19b9d70706dcb31d57eba2`, CI's merge of the head `ac75a7cf0958d2312c43c67ef1811a21b42ad144` (tree `7232e1c828831510592abb1783decb150459954c`, the head's own) |
+| Native source digest | `abeed0830233c28a4d3aef995b8b8e4bd3d1fe12da9a56a6af8e416abfcd5ee5` | `abeed0830233c28a4d3aef995b8b8e4bd3d1fe12da9a56a6af8e416abfcd5ee5` |
+| Platform | macOS 26.7.1 (25G313), Apple M3 Max, arm64 | GitHub Actions Linux X64, the CI image's isolated X11 display |
+| Device and driver | Apple M3 Max; MoltenVK, device API 1.3.357 | `llvmpipe (LLVM 20.1.2, 256 bits)`; pinned Mesa Lavapipe (`lvp_icd.json`) |
+| Validation | Synchronization validation enabled; clean verdict after the last teardown | Synchronization validation enabled; clean verdict after the last teardown |
+| Suite | 136 examples, 0 failures, 2 pending (by design); `grs9-swap` exited successfully | 136 examples, 0 failures, 2 pending; `grs9-swap` exited successfully |
+| BC7 | supported and exercised | supported and exercised |
+| Readbacks | three of 262,144 bytes, complete | three of 262,144 bytes, complete |
+
+CI's `test.vulkan-wayland` group ran the same case under the isolated headless
+Wayland compositor (`evidence/test.vulkan-wayland/swap/` in the same
+artifact). Its captures have the same SHA-256s, and all its checks passed.
+
+The before and delayed captures are byte-identical to GRS-8's
+[`sprites-macos.png`](sprites-macos.png) and
+[`sprites-linux.png`](sprites-linux.png): they draw the same scene with the
+original atlas.
+
+## The replacement
+
+`swappedAtlasFixture`: Rgba8Linear, 8×8, one mip level, 256 bytes. It keeps
+the atlas's layout, so every UV rectangle and the linear probe's sub-texel
+margin hold unchanged, and rotates each region's colour: green upper-left,
+blue upper-right, yellow lower-left, red lower-right. Its upload completed
+before the swap was requested. A changed format, extent and mip count are
+covered by the native suite's stand-in examples rather than here.
+
+## Facts and ordering
+
+The same on both platforms (and under Wayland):
+
+| Fact | Observed |
+| --- | --- |
+| The atlas's slot before the swap | 1 |
+| The replacement's slot | 4 |
+| The swap's ticket once the delayed frame completed | `SwapPublished` |
+| Retiring slots while the delayed frame, recorded and not yet submitted, held the old version | `[1]` |
+| The slot a texture registered then took | 5 |
+| The slot a texture registered once the delayed frame completed took | 1, the atlas's old slot |
+| The instance data before and after the swap | the same 41,400 bytes |
+
+The order, as the record states it:
+
+1. the frame before the swap completed;
+2. the delayed frame was recorded, binding the table; then the atlas's handle
+   was swapped and a texture registered; then the frame was submitted;
+3. the delayed frame completed;
+4. the frame after the swap completed;
+5. a texture was registered once the delayed frame had completed.
+
+## Checks
+
+The before and delayed captures are checked against GRS-8's oracle over the
+original fixtures: all 25 probes passed on every platform, with the values in
+[GRS-8's checks](#checks) above. The after capture is checked against the same
+oracle with the replacement drawn for the atlas (`evaluateProbesWith
+swappedTextures`). Probe names keep the original atlas regions' names; the
+expected colour is the replacement's.
+
+| Check | Pixel | Expected | Tolerance | macOS observed | Linux observed | Linux Wayland observed |
+| --- | --- | --- | --- | --- | --- | --- |
+| grid red region (0,0) | (1,1) | (0,255,0,255) | exact | (0,255,0,255) pass | (0,255,0,255) pass | (0,255,0,255) pass |
+| grid green region (1,0) | (5,1) | (0,0,255,255) | exact | (0,0,255,255) pass | (0,0,255,255) pass | (0,0,255,255) pass |
+| grid blue region (2,0) | (9,1) | (255,255,0,255) | exact | (255,255,0,255) pass | (255,255,0,255) pass | (255,255,0,255) pass |
+| grid yellow region (3,0) | (13,1) | (255,0,0,255) | exact | (255,0,0,255) pass | (255,0,0,255) pass | (255,0,0,255) pass |
+| grid translucent red (7,3) | (29,13) | (128,0,0,128) | exact | (128,0,0,128) pass | (128,0,0,128) pass | (128,0,0,128) pass |
+| grid blue region (14,16) | (57,65) | (255,255,0,255) | exact | (255,255,0,255) pass | (255,255,0,255) pass | (255,255,0,255) pass |
+| grid green region (30,31) | (121,125) | (0,0,255,255) | exact | (0,0,255,255) pass | (0,0,255,255) pass | (0,0,255,255) pass |
+| atlas red region | (147,19) | (0,255,0,255) | exact | (0,255,0,255) pass | (0,255,0,255) pass | (0,255,0,255) pass |
+| atlas green region | (187,19) | (0,0,255,255) | exact | (0,0,255,255) pass | (0,0,255,255) pass | (0,0,255,255) pass |
+| atlas blue region | (147,59) | (255,255,0,255) | exact | (255,255,0,255) pass | (255,255,0,255) pass | (255,255,0,255) pass |
+| atlas yellow region | (187,59) | (255,0,0,255) | exact | (255,0,0,255) pass | (255,0,0,255) pass | (255,0,0,255) pass |
+| red/green boundary, nearest | (232,24) | (0,255,0,255) | exact | (0,255,0,255) pass | (0,255,0,255) pass | (0,255,0,255) pass |
+| red/green boundary, linear | (232,64) | (0,191,64,255) | ±1 | (0,191,64,255) pass | (0,191,64,255) pass | (0,191,64,255) pass |
+| translucent red alone | (144,112) | (128,0,0,128) | exact | (128,0,0,128) pass | (128,0,0,128) pass | (128,0,0,128) pass |
+| red then blue, one draw | (172,112) | (64,0,128,192) | ±1 | (64,0,128,192) pass | (64,0,128,192) pass | (64,0,128,192) pass |
+| translucent blue alone | (196,112) | (0,0,128,128) | exact | (0,0,128,128) pass | (0,0,128,128) pass | (0,0,128,128) pass |
+| translucent red alone, before the boundary | (144,176) | (128,0,0,128) | exact | (128,0,0,128) pass | (128,0,0,128) pass | (128,0,0,128) pass |
+| red then blue, across the draw boundary | (172,176) | (64,0,128,192) | ±1 | (64,0,128,192) pass | (64,0,128,192) pass | (64,0,128,192) pass |
+| translucent blue alone, after the boundary | (196,176) | (0,0,128,128) | ±1 | (0,0,128,128) pass | (0,0,128,128) pass | (0,0,128,128) pass |
+| clear, between the grid and the atlas | (130,130) | (0,0,0,0) | exact | (0,0,0,0) pass | (0,0,0,0) pass | (0,0,0,0) pass |
+| clear, lower right | (250,250) | (0,0,0,0) | exact | (0,0,0,0) pass | (0,0,0,0) pass | (0,0,0,0) pass |
+| clear, lower left | (100,200) | (0,0,0,0) | exact | (0,0,0,0) pass | (0,0,0,0) pass | (0,0,0,0) pass |
+| clear, right edge | (250,140) | (0,0,0,0) | exact | (0,0,0,0) pass | (0,0,0,0) pass | (0,0,0,0) pass |
+| BC7 left endpoint | (21,224) | (255,1,1,255) | exact | (255,1,1,255) pass | (255,1,1,255) pass | (255,1,1,255) pass |
+| BC7 right endpoint | (43,224) | (1,1,255,255) | exact | (1,1,255,255) pass | (1,1,255,255) pass | (1,1,255,255) pass |
+
+Every check passed on every platform: before 25/25, delayed 25/25 and after
+25/25 on macOS, Linux and Linux Wayland.
+
+## Inspection (D-6)
+
+The before and after PNGs were opened and inspected; the delayed PNG and the
+other platform's are byte-identical to them:
+
+- before and delayed: GRS-8's scene, unchanged;
+- after: the same scene, with every atlas region in its rotated colour — the
+  grid's cells cycling green, blue, yellow and red; the four atlas regions
+  green, blue, yellow and red; the nearest boundary sample green and the
+  linear one a green-blue mix — while the translucent rows, their overlaps,
+  the BC7 block and the clear are as before.
+
+The captures are byte-identical across platforms, as observed; whole-image
+equality is not required.
