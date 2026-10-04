@@ -2395,16 +2395,24 @@ then made in the larger set. At the cap with no free slot, registration is
 `RefusedBackpressure` `TextureSlotBudget` until a released slot is
 reclaimed, and a reclaimed slot at the cap is reused with no further growth.
 
-A growth whose pool creation, set allocation or descriptor copy fails gives
-back what it made — the new pool generation is released — and leaves the
-current set and the bookkeeping as they were. No handle or slot changes. A
-native out of memory, once that rollback is complete, enters #333's single
-reclamation pass and at most one retry of the whole growth.
-`constructOnce`, a construction with no recovery of its own, makes the pool,
-so neither step obtains a separate retry. A growth not recovered raises
-`AllocationNotRecovered`, which is what the registration answers with. As
-everywhere, the retry is permitted only after the pass disposed of something
-and while the session is healthy.
+The pool, the set and the copy are one creation, made with `constructOnce`,
+a construction with no recovery of its own, so the model knows the pool as
+a generation only once all three succeeded. A growth whose pool creation,
+set allocation or descriptor copy fails destroys the pool natively before
+the creation raises. It leaves the current set and the bookkeeping as they
+were, and no handle or slot changes. The rollback is therefore complete
+before any retry, and nothing the attempt made is left for a reclamation
+pass to find or miss.
+
+A native out of memory then enters #333's single reclamation pass and at
+most one retry of the whole growth; no step obtains a separate retry. A
+growth not recovered raises `AllocationNotRecovered`, which is what the
+registration answers with. As everywhere, the retry is permitted only after
+the pass disposed of something and while the session is healthy.
+
+The doubling (`grownSlots`) is computed wider than 32 bits, both for the
+growth and for the pool-limit check's generations, so a count past 2^31
+reaches the cap rather than wrapping.
 
 **Bringing it up to date.** `refreshTable` writes the placeholder once its
 upload completes and writes each newly complete texture into its slot. It
