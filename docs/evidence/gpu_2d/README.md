@@ -12,14 +12,14 @@ regions, scene, sampler assignments and probe oracle.
 | --- | --- | --- |
 | Capture | [`sprites-macos.png`](sprites-macos.png) | [`sprites-linux.png`](sprites-linux.png) |
 | PNG SHA-256 | `b0fc8bbe9c49b504d1f51968878e9e5ad137e1c0c17ed0948808c25d80fec119` | `b0fc8bbe9c49b504d1f51968878e9e5ad137e1c0c17ed0948808c25d80fec119` |
-| Producer | `test.vulkan-native` (`--complete`, `grs8-sprites` case), run locally with `HETOIMASIA_VALIDATION_EVIDENCE` set | `test.vulkan-native` in workflow run [37164798768](https://github.com/coghex/hetoimasia/actions/runs/37164798768) (attempt 1), artifact `validation-receipts-vulkan` (id 11289466308), file `evidence/test.vulkan-native/sprites/sprites.png` |
-| Revision run | `bf92adacfeb4306b1261d8aafe0a89583bee7c6a` (tree identical to the pull request head `cac6f18d8c44e5d38121e2ecf52e9927d80bface`) | `982cbf8d1dce47dfc8a5e86a75227f14ed90844d`, CI's merge of the pull request head `cac6f18d8c44e5d38121e2ecf52e9927d80bface` (tree `f945e48dd19119af6597c573fc012829dff8aed1`) |
-| Native source digest | `f7d30fad98a5a4c18c2defaf15c39f87e384cb8107411d58e0378f03d92f9dad` | `f7d30fad98a5a4c18c2defaf15c39f87e384cb8107411d58e0378f03d92f9dad` |
+| Producer | `test.vulkan-native` (`--complete`, `grs8-sprites` case), run locally with `HETOIMASIA_VALIDATION_EVIDENCE` set | `test.vulkan-native` in workflow run [37165815897](https://github.com/coghex/hetoimasia/actions/runs/37165815897) (attempt 1), artifact `validation-receipts-vulkan` (id 11288474608), file `evidence/test.vulkan-native/sprites/sprites.png` |
+| Revision run | `e0d98da955d97f796b9ffa37aaf0f53f3a4468f2`, the pull request's final head | `7d205d39785b69b2bc7a73654e45890120b017d5`, CI's merge of the pull request's final head `e0d98da955d97f796b9ffa37aaf0f53f3a4468f2` (tree `125d956528e5ddf6ffc8c625436aa446eb9cbe75`) |
+| Native source digest | `ca7784d8805b3fb7b5bd0c7feff604d5456501e5227ddbda1d03ac24ba89b4db` | `ca7784d8805b3fb7b5bd0c7feff604d5456501e5227ddbda1d03ac24ba89b4db` |
 | Platform | macOS 26.7.1 (25G313), Apple M3 Max, arm64 | GitHub Actions Linux X64, the CI image's isolated X11 display |
 | Device and driver | Apple M3 Max; MoltenVK 1.4.2, device API 1.3.357 | `llvmpipe (LLVM 20.1.2, 256 bits)`; pinned Mesa 25.2.8 Lavapipe (`lvp_icd.json`) |
 | Loader and layers | The provisioned prefix's loader and `VK_LAYER_KHRONOS_validation`; implicit layers disabled (`VK_LOADER_LAYERS_DISABLE=~implicit~`), no layer settings file | The same configuration from the CI image's prefix |
 | Validation | Synchronization validation enabled; clean verdict after the last teardown | Synchronization validation enabled; clean verdict after the last teardown |
-| Suite | 134 examples, 0 failures, 2 pending (by design); process ran 5.5 s | 134 examples, 0 failures, 2 pending; `grs8-sprites` exited successfully |
+| Suite | 134 examples, 0 failures, 2 pending (by design); process ran 5.3 s | 134 examples, 0 failures, 2 pending; `grs8-sprites` exited successfully |
 | BC7 | supported and exercised | supported and exercised |
 | Readback | 262,144 bytes, complete | 262,144 bytes, complete |
 
@@ -29,6 +29,13 @@ record changes the Git revision but not that digest, since `docs/` lies outside
 it: both captures describe the delivered implementation sources. The pull
 request head and the commit CI merged differ only by master's documentation
 landings.
+
+This record was regenerated at the pull request's final head `e0d98da9`, after
+round 1 of its review changed `samples/sprites/renderer` (the probe record's
+JSON escaping). That moved the native source digest from
+`f7d30fad98a5a4c18c2defaf15c39f87e384cb8107411d58e0378f03d92f9dad` (head
+`cac6f18d`) to the one above. Both platforms' captures are byte-identical to
+those of the earlier head, since the drawing did not change.
 
 CI's `test.vulkan-wayland` group ran the same case under the isolated headless
 Wayland compositor. Its capture, `evidence/test.vulkan-wayland/sprites/sprites.png`
