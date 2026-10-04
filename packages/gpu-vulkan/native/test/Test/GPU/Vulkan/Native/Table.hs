@@ -45,7 +45,8 @@ import Data.Functor ((<&>))
 import Test.GPU.Vulkan.Native.AllocatorStandIn (AllocatorCall (Flushed), allocatorCalls, allowTypes, deviceLocalType, nonCoherentType)
 import Test.GPU.Vulkan.Native.FramesRig
 import Test.GPU.Vulkan.Native.FramesStandIn (completeAll)
-import Test.GPU.Vulkan.Native.StandIn (StandIn (standAllocator))
+import Test.GPU.Vulkan.Native.StandIn (StandIn (standAllocator), StandInResult (..), offerNaming, outOfMemoryNaming)
+import Hetoimasia.GPU.Vulkan.Native.Naming (NativeObjectKind (ObjectDescriptorPool, ObjectDescriptorSet))
 import Test.GPU.Vulkan.Native.RecordingStandIn (RecordingCall (..), RecordingFailure (..), RecordingStep (..), failAt, limitBuffers, limitRecording, onceAt, outOfMemoryAt, recordingCalls, standInRecordingLimits, succeedAt)
 
 type Ups = Uploads () Int Int Text Int Word64
@@ -365,6 +366,56 @@ spec = describe "Texture table" $ do
       -- Two attempts, each pool destroyed natively before the next step.
       map (either (const 'c') (const 'd')) (poolSteps failed) `shouldBe` "cdcd"
       currentSet rig `shouldReturn` set1
+      allocated rig `shouldReturn` 4
+      clean rig
+
+    it "names the grown set inside the growth's creation, so a naming that runs out of memory is rolled back natively before the pass and the single retry" $ do
+      (rig, uploads, _) ← tableRigWith 8 2 2
+      t1 ← uploadedTexture rig uploads
+      t2 ← uploadedTexture rig uploads
+      _ ← registered rig t1
+      layout ← createPipelineLayoutFor (rigRecording rig) plainShaders >>= either (fail . show) pure
+      ok (releaseManaged (rigRecording rig) layout)
+      offerNaming (rigRootsStandIn rig)
+      mark ← length <$> recordingCalls (rigRecordingStandIn rig)
+      outOfMemoryNaming (rigRootsStandIn rig) ObjectDescriptorSet
+      _ ← registered rig t2
+      allocated rig `shouldReturn` 4
+      grown ← drop mark <$> recordingCalls (rigRecordingStandIn rig)
+      let indexed = zip [0 ∷ Int ..] grown
+      case [(index, pool) | (index, CreatedPool pool (TexturePool _ _)) ← indexed] of
+        [(made, failedPool), (retried, _)] → do
+          let destroyedAt = [index | (index, DestroyedPool pool) ← indexed, pool == failedPool]
+              reclaimedAt = [index | (index, DestroyedLayout _) ← indexed]
+          destroyedAt `shouldSatisfy` \case
+            [destroyed] → made < destroyed && all (destroyed <) reclaimedAt && destroyed < retried
+            _ → False
+          reclaimedAt `shouldSatisfy` \case
+            [reclaimed] → reclaimed < retried
+            _ → False
+        other → expectationFailure ("expected two pools, a failed one and a retried one: " <> show other)
+      clean rig
+
+    it "raises an out of memory naming the grown pool, after its creation committed, as itself, with no recovery and no retry, leaving the current set" $ do
+      (rig, uploads, _) ← tableRigWith 8 2 2
+      t1 ← uploadedTexture rig uploads
+      t2 ← uploadedTexture rig uploads
+      _ ← registered rig t1
+      layout ← createPipelineLayoutFor (rigRecording rig) plainShaders >>= either (fail . show) pure
+      ok (releaseManaged (rigRecording rig) layout)
+      set0 ← currentSet rig
+      offerNaming (rigRootsStandIn rig)
+      mark ← length <$> recordingCalls (rigRecordingStandIn rig)
+      outOfMemoryNaming (rigRootsStandIn rig) ObjectDescriptorPool
+      raised ← try @StandInResult (registerTexture (rigRecording rig) t2)
+      fmap (const ()) raised `shouldSatisfy` either (const True) (const False)
+      after ← drop mark <$> recordingCalls (rigRecordingStandIn rig)
+      -- One attempt, and no reclamation pass reclaimed the layout.
+      length [() | CreatedPool _ (TexturePool _ _) ← after] `shouldBe` 1
+      [() | DestroyedLayout _ ← after] `shouldBe` []
+      currentSet rig `shouldReturn` set0
+      allocated rig `shouldReturn` 2
+      _ ← registered rig t2
       allocated rig `shouldReturn` 4
       clean rig
 

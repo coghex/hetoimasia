@@ -27,7 +27,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Table
   ) where
 
 import Control.Concurrent.STM (STM, atomically, readTVar, readTVarIO, writeTVar)
-import Control.Exception (Exception, ExceptionWithContext (ExceptionWithContext), SomeException, displayException, mask, mask_, onException, rethrowIO, throwIO, try, tryWithContext)
+import Control.Exception (Exception, ExceptionWithContext (ExceptionWithContext), SomeException, displayException, fromException, mask, mask_, onException, rethrowIO, throwIO, try, tryWithContext)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.ByteString as ByteString
@@ -289,6 +289,8 @@ growSet recording =
             tryWithContext @SomeException (attempt table count) >>= \case
               Right (Left refusal) → pure (Left refusal)
               Right (Right made) → commit made
+              Left (ExceptionWithContext _ exception)
+                | Just (AfterCommit committed) ← fromException exception → throwIO committed
               Left failure@(ExceptionWithContext _ exception)
                 | not (isAsynchronous exception)
                 , rootsNativeFailure roots exception == Just FailedOutOfMemory →
@@ -309,28 +311,42 @@ growSet recording =
       (layoutHandle : _, Just current) → do
         made ← newIORef Nothing
         let written = Set.toAscList (Set.union (Book.writtenSlots (tableBook table)) (if tablePlaceholderWritten table then Set.singleton 0 else Set.empty))
-            create layer device _ _ = do
+            create layer device _ issued = do
               poolHandle ← opsCreateDescriptorPool layer device (TexturePool 4 count)
               ( do
                   set ← rootsCall roots "vkAllocateDescriptorSets" (opsAllocateSet layer device poolHandle layoutHandle (Just count))
                   unless (null written) $
                     rootsCall roots "vkUpdateDescriptorSets" (opsWriteDescriptors layer device [CopySampledImages current set (runs written)])
+                  -- The set is named here, under the identity the model is
+                  -- about to issue its pool, so a naming that raises is
+                  -- rolled back natively like every other step.
+                  for_ issued $ \pool →
+                    readRootsInstrumentation roots >>= \case
+                      Nothing → pure ()
+                      Just (_, instrumentation) → nameRootsObject roots instrumentation ObjectDescriptorSet set (tableSetName pool 0)
                   writeIORef made (Just set)
                   pure (Right (NativeDescriptorPool 0 poolHandle))
                 )
                 `onException` undoing roots "destroying a texture table growth's pool" (rootsCall roots "vkDestroyDescriptorPool" (opsDestroyDescriptorPool layer device poolHandle))
-        constructOnce recording 0 1 "vkCreateDescriptorPool" create Nothing >>= \case
-          Left refusal → pure (Left refusal)
-          Right pool →
-            ( readIORef made >>= \case
-                Nothing → throwIO (Abandon RefusedWrongKind)
-                Just set → do
-                  readRootsInstrumentation roots >>= \case
-                    Nothing → pure ()
-                    Just (_, instrumentation) → nameRootsObject roots instrumentation ObjectDescriptorSet set (tableSetName pool 0)
-                  pure (Right (pool, set))
-            )
-              `onException` releaseManaged recording (Made pool)
+        tryWithContext @SomeException (constructOnce recording 0 1 "vkCreateDescriptorPool" create Nothing) >>= \case
+          -- Once the creation returned, the model holds the pool, and what
+          -- raises after it — naming the pool — releases it for disposal
+          -- rather than destroying it. An out of memory there is no failure
+          -- of the growth's allocations, whose rollback was native, so it
+          -- is raised as itself, with no recovery: a retry could otherwise
+          -- run beside a pool not yet destroyed.
+          Left failure@(ExceptionWithContext _ exception) →
+            readIORef made >>= \case
+              Just _
+                | not (isAsynchronous exception)
+                , rootsNativeFailure roots exception == Just FailedOutOfMemory →
+                    throwIO (AfterCommit exception)
+              _ → rethrowIO failure
+          Right (Left refusal) → pure (Left refusal)
+          Right (Right pool) →
+            readIORef made >>= \case
+              Just set → pure (Right (pool, set))
+              Nothing → Left RefusedWrongKind <$ releaseManaged recording (Made pool)
       _ → pure (Left RefusedWrongKind)
     -- The larger set becomes current, and the old set's pool is released, in
     -- one transaction: no cancellation leaves both live or neither current.
@@ -362,6 +378,13 @@ runs = \case
 -- until the cap.
 setGenerations ∷ Word32 → Word32 → [Word32]
 setGenerations initial cap = initial : if initial >= cap then [] else setGenerations (Book.grownSlots initial cap) cap
+
+-- | A failure raised after a growth's creation committed its pool, which no
+-- allocation recovery covers.
+newtype AfterCommit = AfterCommit SomeException
+  deriving (Show)
+
+instance Exception AfterCommit
 
 -- | A construction step's refusal, carried out of the steps to undo them.
 newtype Abandon = Abandon Refusal
