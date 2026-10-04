@@ -19,6 +19,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Construction
   , createMapped
   , construct
   , constructOnce
+  , undoing
   , createPipelineLayout
   , createPipelineLayoutWith
   , createPipeline

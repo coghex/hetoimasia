@@ -33,7 +33,7 @@ import qualified Data.Text as Text
 import qualified Data.ByteString as ByteString
 import Data.Foldable (for_)
 import Control.Monad (unless)
-import Data.IORef (modifyIORef', newIORef, readIORef)
+import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe, listToMaybe)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
@@ -48,6 +48,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Construction
   ( checkedTableRanges
   , construct
   , constructOnce
+  , undoing
   , createImage
   , createMapped
   , releaseLive
@@ -284,14 +285,14 @@ growSet recording =
       Right (_, count) →
         atomically (readRootsDevice roots) >>= \case
           Nothing → pure (Left RefusedDeviceAbsent)
-          Just (_, device) →
-            tryWithContext @SomeException (attempt table device count) >>= \case
+          Just _ →
+            tryWithContext @SomeException (attempt table count) >>= \case
               Right (Left refusal) → pure (Left refusal)
               Right (Right made) → commit made
               Left failure@(ExceptionWithContext _ exception)
                 | not (isAsynchronous exception)
                 , rootsNativeFailure roots exception == Just FailedOutOfMemory →
-                    withAllocationAttempt roots (\allocation → recoverAllocation roots "growing the texture table" allocation Nothing (Text.pack (displayException exception)) (failingAgain roots (attempt table device count))) >>= \case
+                    withAllocationAttempt roots (\allocation → recoverAllocation roots "growing the texture table" allocation Nothing (Text.pack (displayException exception)) (failingAgain roots (attempt table count))) >>= \case
                       Right (Right (Right made)) → commit made
                       Right (Right (Left refusal)) → pure (Left refusal)
                       Right (Left notRecovered) → throwIO notRecovered
@@ -299,33 +300,38 @@ growSet recording =
                 | otherwise → rethrowIO failure
   where
     roots = recordingRoots recording
-    ops = recordingOps recording
-    -- One whole attempt: the pool, the set and the copy, rolled back if any
-    -- step raises — the pool, a generation, is released, so the
-    -- reclamation pass that follows can destroy it.
-    attempt table device count =
-      constructOnce recording 0 1 "vkCreateDescriptorPool" (\layer device' _ _ → Right . NativeDescriptorPool 0 <$> opsCreateDescriptorPool layer device' (TexturePool 4 count)) Nothing >>= \case
-        Left refusal → pure (Left refusal)
-        Right pool →
-          ( do
-              poolHandle ←
-                liveNative recording pool >>= \case
-                  Right (NativeDescriptorPool _ handle) → pure handle
-                  _ → throwIO (Abandon RefusedWrongKind)
-              layoutHandle ← case tableSetLayoutHandles table of
-                layout : _ → pure layout
-                [] → throwIO (Abandon RefusedWrongKind)
-              set ← rootsCall roots "vkAllocateDescriptorSets" (opsAllocateSet ops device poolHandle layoutHandle (Just count))
-              readRootsInstrumentation roots >>= \case
-                Nothing → pure ()
-                Just (_, instrumentation) → nameRootsObject roots instrumentation ObjectDescriptorSet set (tableSetName pool 0)
-              current ← maybe (throwIO (Abandon RefusedWrongKind)) pure (listToMaybe (tableSets table))
-              let written = Set.toAscList (Set.union (Book.writtenSlots (tableBook table)) (if tablePlaceholderWritten table then Set.singleton 0 else Set.empty))
-              unless (null written) $
-                rootsCall roots "vkUpdateDescriptorSets" (opsWriteDescriptors ops device [CopySampledImages current set (runs written)])
-              pure (Right (pool, set))
-          )
-            `onException` releaseManaged recording (Made pool)
+    -- One whole attempt: the pool, the set and the copy are one creation, so
+    -- the model knows the pool as a generation only once all three succeeded.
+    -- A step that raises destroys the pool natively before the creation
+    -- raises, so the rollback is complete — nothing the attempt made is left
+    -- for a reclamation pass to find or miss — before any retry.
+    attempt table count = case (tableSetLayoutHandles table, listToMaybe (tableSets table)) of
+      (layoutHandle : _, Just current) → do
+        made ← newIORef Nothing
+        let written = Set.toAscList (Set.union (Book.writtenSlots (tableBook table)) (if tablePlaceholderWritten table then Set.singleton 0 else Set.empty))
+            create layer device _ _ = do
+              poolHandle ← opsCreateDescriptorPool layer device (TexturePool 4 count)
+              ( do
+                  set ← rootsCall roots "vkAllocateDescriptorSets" (opsAllocateSet layer device poolHandle layoutHandle (Just count))
+                  unless (null written) $
+                    rootsCall roots "vkUpdateDescriptorSets" (opsWriteDescriptors layer device [CopySampledImages current set (runs written)])
+                  writeIORef made (Just set)
+                  pure (Right (NativeDescriptorPool 0 poolHandle))
+                )
+                `onException` undoing roots "destroying a texture table growth's pool" (rootsCall roots "vkDestroyDescriptorPool" (opsDestroyDescriptorPool layer device poolHandle))
+        constructOnce recording 0 1 "vkCreateDescriptorPool" create Nothing >>= \case
+          Left refusal → pure (Left refusal)
+          Right pool →
+            ( readIORef made >>= \case
+                Nothing → throwIO (Abandon RefusedWrongKind)
+                Just set → do
+                  readRootsInstrumentation roots >>= \case
+                    Nothing → pure ()
+                    Just (_, instrumentation) → nameRootsObject roots instrumentation ObjectDescriptorSet set (tableSetName pool 0)
+                  pure (Right (pool, set))
+            )
+              `onException` releaseManaged recording (Made pool)
+      _ → pure (Left RefusedWrongKind)
     -- The larger set becomes current, and the old set's pool is released, in
     -- one transaction: no cancellation leaves both live or neither current.
     commit (pool, set) = atomically $ do
@@ -355,7 +361,7 @@ runs = \case
 -- | Set 0's slot counts, generation by generation: the initial size, doubled
 -- until the cap.
 setGenerations ∷ Word32 → Word32 → [Word32]
-setGenerations initial cap = initial : if initial >= cap then [] else setGenerations (min cap (initial * 2)) cap
+setGenerations initial cap = initial : if initial >= cap then [] else setGenerations (Book.grownSlots initial cap) cap
 
 -- | A construction step's refusal, carried out of the steps to undo them.
 newtype Abandon = Abandon Refusal

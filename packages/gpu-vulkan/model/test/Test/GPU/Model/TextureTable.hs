@@ -112,6 +112,14 @@ spec = describe "texture table" $ do
       bindVersion everything changedAgain `shouldBe` Left TableVersionsHeld
 
   describe "growth" $ do
+    it "doubles past 2^31 to the cap, never wrapping" $ do
+      grownSlots 2147483648 2147483649 `shouldBe` 2147483649
+      grownSlots 2147483648 maxBound `shouldBe` maxBound
+      grownSlots 2147483647 maxBound `shouldBe` 4294967294
+      grownSlots maxBound maxBound `shouldBe` maxBound
+      grownSlots 3 10 `shouldBe` 6
+      grownSlots 6 10 `shouldBe` 10
+
     it "grows only when no slot is free, doubling the allocated slots and never past a non-power-of-two cap, which is backpressure" $ do
       let table = newTextureTable (either (error . show) id (validateTableConfig 10 3 8)) ∷ TextureTable String
       allocatedSlots table `shouldBe` 3

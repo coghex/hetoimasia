@@ -67,6 +67,7 @@ module Hetoimasia.GPU.Model.TextureTable
   , releaseTexture
   , unregisterTexture
   , growTable
+  , grownSlots
   , bindVersion
   , VersionBinding (..)
   , reclaimSlots
@@ -374,7 +375,13 @@ growTable table
   where
     allocated = tableAllocated table
     cap = tableCapacity (tableConfig table)
-    grown = min cap (allocated * 2)
+    grown = grownSlots allocated cap
+
+-- | The slots a growth from this many reaches under this cap: twice as many,
+-- never past the cap. The doubling is computed wider than 32 bits, so a count
+-- past 2^31 reaches the cap rather than wrapping.
+grownSlots ∷ Word32 → Word32 → Word32
+grownSlots allocated cap = fromInteger (min (toInteger cap) (2 * toInteger allocated))
 
 -- | The index and holder of a live handle, or its refusal.
 live ∷ TextureHandle → TextureTable a → Either TableRefusal (Word32, Holder)

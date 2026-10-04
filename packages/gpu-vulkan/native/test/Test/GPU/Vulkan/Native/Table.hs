@@ -91,10 +91,12 @@ spec = describe "Texture table" $ do
       refusedUnder limits {limitTableSampledImages = 15} (tableConfig 16 4 2) `shouldReturn` Left (RefusedOutOfBounds 16 15)
       refusedUnder limits {limitTableSamplers = 3} (tableConfig 16 4 2) `shouldReturn` Left (RefusedOutOfBounds 4 3)
       refusedUnder limits {limitTableResources = 20} (tableConfig 16 4 2) `shouldReturn` Left (RefusedOutOfBounds 21 20)
-      -- Set 0's pool holds the four samplers and the four initial images.
       -- Set 0's pools, generation by generation — 4, 8 and 16 images, each
       -- with the four samplers — may all be held at once.
       refusedUnder limits {limitTablePoolDescriptors = 39} (tableConfig 16 4 2) `shouldReturn` Left (RefusedOutOfBounds 40 39)
+      -- Doubling past 2^31 reaches the cap rather than wrapping: two
+      -- generations, of 2^31 and 2^31 + 1 images.
+      refusedUnder limits {limitTableSampledImages = maxBound, limitTableResources = maxBound, limitTablePoolDescriptors = maxBound} (tableConfig 2147483649 2147483648 2) `shouldReturn` Left (RefusedOutOfBounds 4294967305 4294967295)
       refusedUnder limits {limitBoundSets = 1} (tableConfig 16 4 2) `shouldReturn` Left (RefusedOutOfBounds 2 1)
       refusedUnder limits {limitStorageRange = 127} (tableConfig 16 4 2) `shouldReturn` Left (RefusedOutOfBounds 128 127)
       -- 262144 entries of eight bytes are a 2 MiB stride, so the 2049th
@@ -319,30 +321,68 @@ spec = describe "Texture table" $ do
       allocated rig `shouldReturn` 4
       clean rig
 
-    it "rolls a growth back when its set's allocation runs out of memory, reclaims the rolled-back pool, and retries the whole growth once; a second failure is not retried" $ do
+    it "destroys a failed growth's pool natively before raising — no reclamation pass ever sees it — and retries the whole growth once only after the pass reclaims something else; a second failure is not retried" $ do
       (rig, uploads, _) ← tableRigWith 8 2 2
       t1 ← uploadedTexture rig uploads
       t2 ← uploadedTexture rig uploads
       t3 ← uploadedTexture rig uploads
       t4 ← uploadedTexture rig uploads
       _ ← registered rig t1
-      before ← poolAttempts rig
+      -- An unrelated released layout is the only thing a reclamation pass
+      -- can dispose of.
+      let unrelated = do
+            layout ← createPipelineLayoutFor (rigRecording rig) plainShaders >>= either (fail . show) pure
+            ok (releaseManaged (rigRecording rig) layout)
+      unrelated
+      mark ← length <$> recordingCalls (rigRecordingStandIn rig)
       outOfMemoryAt (rigRecordingStandIn rig) AtAllocateSet 1
       _ ← registered rig t2
       allocated rig `shouldReturn` 4
-      calls ← recordingCalls (rigRecordingStandIn rig)
-      let attempts = drop before [handle | CreatedPool handle (TexturePool _ _) ← calls]
-      length attempts `shouldBe` 2
-      destroyedPools rig >>= (`shouldSatisfy` elem (head' attempts))
+      grown ← drop mark <$> recordingCalls (rigRecordingStandIn rig)
+      -- The failed attempt's pool is destroyed before the pass reclaims the
+      -- layout, and both before the retry makes its pool.
+      let indexed = zip [0 ∷ Int ..] grown
+      case [(index, pool) | (index, CreatedPool pool (TexturePool _ _)) ← indexed] of
+        [(made, failedPool), (retried, _)] → do
+          let destroyedAt = [index | (index, DestroyedPool pool) ← indexed, pool == failedPool]
+              reclaimedAt = [index | (index, DestroyedLayout _) ← indexed]
+          destroyedAt `shouldSatisfy` \case
+            [destroyed] → made < destroyed && all (destroyed <) reclaimedAt
+            _ → False
+          reclaimedAt `shouldSatisfy` \case
+            [reclaimed] → reclaimed < retried
+            _ → False
+        other → expectationFailure ("expected two pools, a failed one and a retried one: " <> show other)
       -- Both allocations of the next growth fail: the retry is the only one.
       _ ← registered rig t3
       set1 ← currentSet rig
-      before' ← poolAttempts rig
+      unrelated
+      mark' ← length <$> recordingCalls (rigRecordingStandIn rig)
       outOfMemoryAt (rigRecordingStandIn rig) AtAllocateSet 2
       raised ← try @AllocationNotRecovered (registerTexture (rigRecording rig) t4)
       fmap (const ()) raised `shouldSatisfy` either (const True) (const False)
-      poolAttempts rig `shouldReturn` before' + 2
+      failed ← drop mark' <$> recordingCalls (rigRecordingStandIn rig)
+      -- Two attempts, each pool destroyed natively before the next step.
+      map (either (const 'c') (const 'd')) (poolSteps failed) `shouldBe` "cdcd"
       currentSet rig `shouldReturn` set1
+      allocated rig `shouldReturn` 4
+      clean rig
+
+    it "leaves the current set as it was, with no retry, when a growth's set allocation runs out of memory and nothing else is reclaimable" $ do
+      (rig, uploads, _) ← tableRigWith 8 2 2
+      t1 ← uploadedTexture rig uploads
+      t2 ← uploadedTexture rig uploads
+      _ ← registered rig t1
+      set0 ← currentSet rig
+      mark ← length <$> recordingCalls (rigRecordingStandIn rig)
+      outOfMemoryAt (rigRecordingStandIn rig) AtAllocateSet 1
+      raised ← try @AllocationNotRecovered (registerTexture (rigRecording rig) t2)
+      fmap (const ()) raised `shouldSatisfy` either (const True) (const False)
+      failed ← drop mark <$> recordingCalls (rigRecordingStandIn rig)
+      map (either (const 'c') (const 'd')) (poolSteps failed) `shouldBe` "cd"
+      currentSet rig `shouldReturn` set0
+      allocated rig `shouldReturn` 2
+      _ ← registered rig t2
       allocated rig `shouldReturn` 4
       clean rig
 
@@ -841,6 +881,20 @@ allocated rig = atomically (readTable (rigRecording rig)) <&> maybe 0 tableViewA
 -- | Every growth's copy: the old set, the new one, and the runs copied.
 copies ∷ Rig → IO [(Word64, Word64, [(Word32, Word32)])]
 copies rig = (\calls → [(from, to, copied) | WroteDescriptors writes ← calls, CopySampledImages from to copied ← writes]) <$> recordingCalls (rigRecordingStandIn rig)
+
+-- | In order: each set 0 pool these calls made ('Left') and each of those
+-- they destroyed ('Right').
+poolSteps ∷ [RecordingCall] → [Either Word64 Word64]
+poolSteps calls =
+  [ step
+  | call ← calls
+  , step ← case call of
+      CreatedPool pool (TexturePool _ _) → [Left pool]
+      DestroyedPool pool | pool `Set.member` made → [Right pool]
+      _ → []
+  ]
+  where
+    made = Set.fromList [pool | CreatedPool pool (TexturePool _ _) ← calls]
 
 -- | Every descriptor pool destroyed so far.
 destroyedPools ∷ Rig → IO [Word64]
