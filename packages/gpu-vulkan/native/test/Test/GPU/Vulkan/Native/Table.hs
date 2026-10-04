@@ -993,14 +993,15 @@ spec = describe "Texture table" $ do
       resolvedNow rig handle `shouldReturn` oldSlot
       clean rig
 
-    it "fails a pending swap at retirement when the session failed before the table was next brought up to date" $ do
+    it "fails a pending swap the moment the session fails, before any refresh, drain or retirement, and keeps it failed through retirement" $ do
       (rig, uploads, _) ← tableRig 4 2
       old ← uploadedTexture rig uploads
       handle ← registered rig old
       (replacement, _) ← queuedTexture rig uploads (ImageDescription TextureImage Rgba8Linear 2 2 1) [ByteString.replicate 16 8]
       ticket ← swapped rig handle replacement
-      atomically (failRootsSessionBecause (rigRoots rig) CleanupFailed "a later cleanup failed")
       swapStanding ticket `shouldReturn` SwapPending
+      atomically (failRootsSessionBecause (rigRoots rig) CleanupFailed "a later cleanup failed")
+      swapStanding ticket `shouldReturn` SwapFailed
       _ ← try @ResourcesRetained (retireRecording (rigRecording rig) (at 1))
       swapStanding ticket `shouldReturn` SwapFailed
 

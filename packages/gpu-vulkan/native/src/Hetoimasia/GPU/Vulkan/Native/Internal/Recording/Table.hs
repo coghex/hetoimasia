@@ -35,7 +35,7 @@ import qualified Data.ByteString as ByteString
 import Data.Foldable (for_)
 import Control.Monad (unless)
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
-import Data.Maybe (fromMaybe, listToMaybe)
+import Data.Maybe (fromMaybe, isJust, listToMaybe)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Set (Set)
@@ -91,7 +91,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
 import Hetoimasia.GPU.Vulkan.Native.Internal.Reclamation (failingAgain, recoverAllocation, withAllocationAttempt)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Uploads (UploadRequest (..), Uploads, submitUpload)
 import Hetoimasia.GPU.Vulkan.Native.Naming (NativeObjectKind (ObjectDescriptorSet), tableSetName)
-import Hetoimasia.GPU.Vulkan.Native.Roots (NativeFailure (FailedOutOfMemory), nameRootsObject, readRootsDevice, readRootsInstrumentation, rootsCall, rootsNativeFailure, stateRootsModel)
+import Hetoimasia.GPU.Vulkan.Native.Roots (NativeFailure (FailedOutOfMemory), TerminalReport (reportPrimary), nameRootsObject, readRootsDevice, readRootsInstrumentation, readRootsTerminal, rootsCall, rootsNativeFailure, stateRootsModel)
 import Hetoimasia.GPU.Vulkan.Native.Shader.Interface (CheckedShaders)
 
 -- | Make the session's texture table from a validated configuration (D-11):
@@ -524,7 +524,7 @@ swapTexture recording handle (Image image) =
                                         , tableSwapTickets = Map.insert image cell (maybe id Map.delete superseded (tableSwapTickets table))
                                         }
                                   )
-                                pure (Right (SwapTicket cell))
+                                pure (Right (SwapTicket cell sessionFailed))
             -- No free slot: the table grows at once, as for a registration.
             accept >>= \case
               Right ticket → pure (Right ticket)
@@ -536,6 +536,8 @@ swapTexture recording handle (Image image) =
       Right _ → pure (Left RefusedWrongKind)
   where
     roots = recordingRoots recording
+    -- Whether the session has failed: its terminal report names a primary.
+    sessionFailed = isJust . reportPrimary <$> readRootsTerminal roots
 
 -- | Undo a registration whose handle was never handed out, answering
 -- whether it was undone.

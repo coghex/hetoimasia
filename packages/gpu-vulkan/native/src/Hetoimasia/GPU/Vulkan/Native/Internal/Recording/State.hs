@@ -367,15 +367,24 @@ data SwapState
     -- replacement was released.
   deriving (Eq, Show)
 
--- | An accepted swap's report, read from any thread without a native call.
-newtype SwapTicket = SwapTicket (TVar SwapState)
+-- | An accepted swap's report, read from any thread without a native call:
+-- its own state, and whether the session has failed.
+data SwapTicket = SwapTicket !(TVar SwapState) !(STM Bool)
 
 instance Show SwapTicket where
   show _ = "SwapTicket"
 
--- | Where the swap stands now. It never waits.
+-- | Where the swap stands now. It never waits. A swap still pending in a
+-- session that has failed reads 'SwapFailed' from the moment the failure is
+-- latched (GRS-9): a failed session writes no descriptor, so no swap can take
+-- effect, and the ticket settles before any drain, wait or cleanup the
+-- session's teardown goes on to. Releasing its images still waits for their
+-- completion evidence, as ever.
 readSwapTicket ∷ SwapTicket → STM SwapState
-readSwapTicket (SwapTicket cell) = readTVar cell
+readSwapTicket (SwapTicket cell failed) =
+  readTVar cell >>= \case
+    SwapPending → (\gone → if gone then SwapFailed else SwapPending) <$> failed
+    settled → pure settled
 
 -- | Fail every texture swap still pending (GRS-9), touching no native object:
 -- none can take effect once the session retires. A host's retirement does
