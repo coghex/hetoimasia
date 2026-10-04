@@ -1334,6 +1334,17 @@ pull request.
 > retirement, doubling to the cap; the lookup version ring is sized for the
 > cap from the start, so only set 0 grows; each grown set has its own
 > descriptor pool, destroyed with it on completion.
+>
+> As delivered (#344): a registration that finds no free slot grows set 0 at
+> once, doubling to the cap (a cap that is no power of two is reached
+> exactly). Each growth makes a pool of its own and a set over the unchanged
+> layout, copies every written slot with `vkCopyDescriptorSet`, and makes the
+> new set current while releasing the old pool. A batch pins its set and
+> version at its first bind and retains that set's pool, so an older set and
+> its pool are destroyed together only once no batch holds them. A failed
+> growth rolls back, with one reclamation pass and at most one retry of the
+> whole growth. #343's lookup entries are eight bytes (slot and generation),
+> so the cap-sized ring holds the cap × 8 bytes per version.
 
 - **Outcome:** the table doubles up to D-11's application-configured cap by
   building a larger set, copying existing entries and binding it in later
