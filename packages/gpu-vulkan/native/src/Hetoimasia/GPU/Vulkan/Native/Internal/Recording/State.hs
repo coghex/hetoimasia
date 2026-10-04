@@ -45,6 +45,8 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , SwapState (..)
   , SwapTicket (..)
   , readSwapTicket
+  , settleSwap
+  , sessionHasFailed
   , failPendingSwaps
 
     -- * The shared ring (GRS-4)
@@ -149,7 +151,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   , imageKindUse
   , imageResourceKind
   )
-import Hetoimasia.GPU.Vulkan.Native.Roots (Checkpoint (..), Roots, TerminalCause, checkpointRoots, rootsCall, rootsSessionIdentity, stateRootsModel)
+import Hetoimasia.GPU.Vulkan.Native.Roots (Checkpoint (..), Roots, TerminalCause, TerminalReport (reportPrimary), checkpointRoots, readRootsTerminal, rootsCall, rootsSessionIdentity, stateRootsModel)
 
 -- ---------------------------------------------------------------------------
 -- Records
@@ -376,15 +378,33 @@ instance Show SwapTicket where
 
 -- | Where the swap stands now. It never waits. A swap still pending in a
 -- session that has failed reads 'SwapFailed' from the moment the failure is
--- latched (GRS-9): a failed session writes no descriptor, so no swap can take
--- effect, and the ticket settles before any drain, wait or cleanup the
--- session's teardown goes on to. Releasing its images still waits for their
--- completion evidence, as ever.
+-- latched (GRS-9), and the read stores it: a failed session writes no
+-- descriptor, so no swap can take effect, and the ticket settles before any
+-- drain, wait or cleanup the session's teardown goes on to. Releasing its
+-- images still waits for their completion evidence, as ever.
 readSwapTicket ∷ SwapTicket → STM SwapState
 readSwapTicket (SwapTicket cell failed) =
   readTVar cell >>= \case
-    SwapPending → (\gone → if gone then SwapFailed else SwapPending) <$> failed
+    SwapPending →
+      failed >>= \case
+        True → SwapFailed <$ writeTVar cell SwapFailed
+        False → pure SwapPending
     settled → pure settled
+
+-- | Settle a swap's ticket, once (GRS-9): a ticket already settled keeps its
+-- outcome, whatever comes after, and once the session has failed every
+-- outcome is 'SwapFailed' — a release, a supersession or a refresh after the
+-- failure never reports anything else. Every write of a ticket goes through
+-- this.
+settleSwap ∷ Recording q inst msgr phys dev cmd → TVar SwapState → SwapState → STM ()
+settleSwap recording cell outcome =
+  readTVar cell >>= \case
+    SwapPending → sessionHasFailed recording >>= \gone → writeTVar cell (if gone then SwapFailed else outcome)
+    _ → pure ()
+
+-- | Whether the session has failed: its terminal report names a primary.
+sessionHasFailed ∷ Recording q inst msgr phys dev cmd → STM Bool
+sessionHasFailed recording = isJust . reportPrimary <$> readRootsTerminal (recordingRoots recording)
 
 -- | Fail every texture swap still pending (GRS-9), touching no native object:
 -- none can take effect once the session retires. A host's retirement does
@@ -396,7 +416,7 @@ failPendingSwaps recording =
   readTVar (recordingTable recording) >>= \case
     Nothing → pure ()
     Just table → do
-      for_ (tableSwapTickets table) (`writeTVar` SwapFailed)
+      for_ (tableSwapTickets table) (\cell → settleSwap recording cell SwapFailed)
       writeTVar (recordingTable recording) (Just table {tableSwapTickets = Map.empty})
 
 -- | The recording's state, owned by the calling thread. The public

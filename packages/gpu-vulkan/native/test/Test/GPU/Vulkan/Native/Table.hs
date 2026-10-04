@@ -47,7 +47,7 @@ import Test.GPU.Vulkan.Native.FramesRig
 import Test.GPU.Vulkan.Native.FramesStandIn (FrameStep (AtQueryFence), completeAll, completeFence, loseFrameStep, pendingFences)
 import Test.GPU.Vulkan.Native.StandIn (StandIn (standAllocator), StandInResult (..), offerNaming, outOfMemoryNaming)
 import Hetoimasia.GPU.Vulkan.Native.Naming (NativeObjectKind (ObjectDescriptorPool, ObjectDescriptorSet))
-import Test.GPU.Vulkan.Native.RecordingStandIn (RecordingCall (..), RecordingFailure (..), RecordingStep (..), failAt, limitBuffers, limitRecording, onceAt, outOfMemoryAt, recordingCalls, standInRecordingLimits, succeedAt)
+import Test.GPU.Vulkan.Native.RecordingStandIn (RecordingCall (..), RecordingFailure (..), RecordingStep (..), duringWrite, failAt, limitBuffers, limitRecording, onceAt, outOfMemoryAt, recordingCalls, standInRecordingLimits, succeedAt)
 
 type Ups = Uploads () Int Int Text Int Word64
 
@@ -1029,6 +1029,52 @@ spec = describe "Texture table" $ do
       resolvedNow rig handle `shouldReturn` oldSlot
       writes ← imageWrites rig
       [() | (_, written) ← writes, written == replacementView] `shouldBe` []
+
+    it "keeps a failure it reported: a swap read failed once the session fails stays failed when its handle is then released before retirement" $ do
+      (rig, uploads, _) ← tableRig 4 2
+      old ← uploadedTexture rig uploads
+      handle ← registered rig old
+      (replacement, _) ← queuedTexture rig uploads (ImageDescription TextureImage Rgba8Linear 2 2 1) [ByteString.replicate 16 10]
+      ticket ← swapped rig handle replacement
+      atomically (failRootsSessionBecause (rigRoots rig) CleanupFailed "a later cleanup failed")
+      swapStanding ticket `shouldReturn` SwapFailed
+      ok (releaseTexture (rigRecording rig) handle)
+      swapStanding ticket `shouldReturn` SwapFailed
+      _ ← try @ResourcesRetained (retireRecording (rigRecording rig) (at 1))
+      swapStanding ticket `shouldReturn` SwapFailed
+
+    it "keeps a success it reported: a published swap stays published when the session then fails, its handle is released and the recording retires" $ do
+      (rig, uploads, _) ← tableRig 4 2
+      old ← uploadedTexture rig uploads
+      replacement ← uploadedTexture rig uploads
+      handle ← registered rig old
+      ticket ← swapped rig handle replacement
+      ok (refreshTextureTable (rigRecording rig))
+      swapStanding ticket `shouldReturn` SwapPublished
+      atomically (failRootsSessionBecause (rigRoots rig) CleanupFailed "a later cleanup failed")
+      swapStanding ticket `shouldReturn` SwapPublished
+      ok (releaseTexture (rigRecording rig) handle)
+      _ ← try @ResourcesRetained (retireRecording (rigRecording rig) (at 1))
+      swapStanding ticket `shouldReturn` SwapPublished
+
+    it "publishes nothing when the session fails during the replacement's descriptor write: the handle keeps its image, the old texture stays held, and the swap fails" $ do
+      (rig, uploads, _) ← tableRig 4 2
+      old ← uploadedTexture rig uploads
+      replacement ← uploadedTexture rig uploads
+      handle ← registered rig old
+      oldSlot ← resolvedNow rig handle
+      replacementView ← viewOf rig replacement
+      ticket ← swapped rig handle replacement
+      -- The failure is latched from inside the write of the replacement's
+      -- descriptor, as a diagnostic failure from another thread can be.
+      duringWrite (rigRecordingStandIn rig) $ \writes →
+        when (any (\case WriteSampledImage _ _ view → view == replacementView; _ → False) writes) $
+          atomically (failRootsSessionBecause (rigRoots rig) CleanupFailed "failed during the descriptor's write")
+      _ ← refreshTextureTable (rigRecording rig)
+      imageWrites rig >>= (`shouldSatisfy` any ((== replacementView) . snd))
+      swapStanding ticket `shouldReturn` SwapFailed
+      resolvedNow rig handle `shouldReturn` oldSlot
+      standing rig old `shouldReturn` Just ManagedLive
 
     it "refuses a swap that cannot be made — a stale handle, an image the table already holds, one no upload fills, one that is no texture, and a table full at its cap — changing neither the mapping nor a pending swap, and leaving the image the caller's" $ do
       -- Four slots, all the cap allows: slot 0, two textures and a pending

@@ -35,7 +35,7 @@ import qualified Data.ByteString as ByteString
 import Data.Foldable (for_)
 import Control.Monad (unless)
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
-import Data.Maybe (fromMaybe, isJust, listToMaybe)
+import Data.Maybe (fromMaybe, listToMaybe)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Set (Set)
@@ -82,6 +82,8 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , SwapState (..)
   , SwapTicket (..)
   , TableState (..)
+  , sessionHasFailed
+  , settleSwap
   , checkpointed
   , isAsynchronous
   , liveNative
@@ -91,7 +93,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
 import Hetoimasia.GPU.Vulkan.Native.Internal.Reclamation (failingAgain, recoverAllocation, withAllocationAttempt)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Uploads (UploadRequest (..), Uploads, submitUpload)
 import Hetoimasia.GPU.Vulkan.Native.Naming (NativeObjectKind (ObjectDescriptorSet), tableSetName)
-import Hetoimasia.GPU.Vulkan.Native.Roots (NativeFailure (FailedOutOfMemory), TerminalReport (reportPrimary), nameRootsObject, readRootsDevice, readRootsInstrumentation, readRootsTerminal, rootsCall, rootsNativeFailure, stateRootsModel)
+import Hetoimasia.GPU.Vulkan.Native.Roots (NativeFailure (FailedOutOfMemory), nameRootsObject, readRootsDevice, readRootsInstrumentation, rootsCall, rootsNativeFailure, stateRootsModel)
 import Hetoimasia.GPU.Vulkan.Native.Shader.Interface (CheckedShaders)
 
 -- | Make the session's texture table from a validated configuration (D-11):
@@ -514,7 +516,7 @@ swapTexture recording handle (Image image) =
                               Left refusal → pure (Left (Just refusal))
                               Right () → do
                                 cell ← newTVar SwapPending
-                                for_ superseded $ \old → for_ (Map.lookup old (tableSwapTickets table)) (`writeTVar` SwapSuperseded)
+                                for_ superseded $ \old → for_ (Map.lookup old (tableSwapTickets table)) (\settled → settleSwap recording settled SwapSuperseded)
                                 writeTVar
                                   (recordingTable recording)
                                   ( Just
@@ -524,7 +526,7 @@ swapTexture recording handle (Image image) =
                                         , tableSwapTickets = Map.insert image cell (maybe id Map.delete superseded (tableSwapTickets table))
                                         }
                                   )
-                                pure (Right (SwapTicket cell sessionFailed))
+                                pure (Right (SwapTicket cell (sessionHasFailed recording)))
             -- No free slot: the table grows at once, as for a registration.
             accept >>= \case
               Right ticket → pure (Right ticket)
@@ -536,8 +538,6 @@ swapTexture recording handle (Image image) =
       Right _ → pure (Left RefusedWrongKind)
   where
     roots = recordingRoots recording
-    -- Whether the session has failed: its terminal report names a primary.
-    sessionFailed = isJust . reportPrimary <$> readRootsTerminal roots
 
 -- | Undo a registration whose handle was never handed out, answering
 -- whether it was undone.
@@ -584,7 +584,7 @@ releaseTexture recording handle =
             maybe (pure (Right ())) (releaseLive recording) pending >>= \case
               Left refusal → pure (Left refusal)
               Right () → do
-                for_ pending $ \replacement → for_ (Map.lookup replacement (tableSwapTickets table)) (`writeTVar` SwapAbandoned)
+                for_ pending $ \replacement → for_ (Map.lookup replacement (tableSwapTickets table)) (\settled → settleSwap recording settled SwapAbandoned)
                 Right ()
                   <$ writeTVar
                     (recordingTable recording)

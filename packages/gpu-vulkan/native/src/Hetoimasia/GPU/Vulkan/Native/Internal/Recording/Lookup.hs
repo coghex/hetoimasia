@@ -56,6 +56,8 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , Refusal (..)
   , SwapState (..)
   , TableState (..)
+  , sessionHasFailed
+  , settleSwap
   )
 import Hetoimasia.GPU.Vulkan.Native.Roots (Checkpoint (..), Roots, checkpointRoots, readRootsDevice, rootsCall, stateRootsModel)
 
@@ -133,7 +135,7 @@ refreshTable recording =
                         -- An image a swap released when it took effect is
                         -- not released again.
                         images = filter (`Set.member` tableTextures state) (map snd slots) <> replacements
-                    for_ replacements $ \image → for_ (Map.lookup image (tableSwapTickets state)) (`writeTVar` SwapFailed)
+                    for_ replacements $ \image → for_ (Map.lookup image (tableSwapTickets state)) (\cell → settleSwap recording cell SwapFailed)
                     writeTVar
                       (recordingTable recording)
                       ( Just
@@ -190,23 +192,32 @@ refreshTable recording =
                   Left _ → pure ()
                   Right (swapped, (slot, _, replaced)) → do
                     rootsCall roots "vkUpdateDescriptorSets" (opsWriteDescriptors ops device [WriteSampledImage (textureSet table) slot view])
+                    -- The session may have failed during the descriptor's
+                    -- write — a diagnostic failure latched from another
+                    -- thread, say. The commit checks in its own transaction:
+                    -- a failed session publishes nothing and releases
+                    -- nothing, and the swap fails, to be ended by the
+                    -- cleanup that follows.
                     atomically $
                       readTVar (recordingTable recording) >>= \case
                         Nothing → pure ()
-                        Just held → do
-                          released ← case replaced of
-                            Nothing → pure Nothing
-                            Just old → either (const Nothing) (const (Just old)) <$> releaseLive recording old
-                          for_ (Map.lookup image (tableSwapTickets held)) (`writeTVar` SwapPublished)
-                          writeTVar
-                            (recordingTable recording)
-                            ( Just
-                                held
-                                  { tableBook = swapped
-                                  , tableTextures = maybe id Set.delete released (tableTextures held)
-                                  , tableSwapTickets = Map.delete image (tableSwapTickets held)
-                                  }
-                            )
+                        Just held →
+                          sessionHasFailed recording >>= \case
+                            True → for_ (Map.lookup image (tableSwapTickets held)) (\cell → settleSwap recording cell SwapFailed)
+                            False → do
+                              released ← case replaced of
+                                Nothing → pure Nothing
+                                Just old → either (const Nothing) (const (Just old)) <$> releaseLive recording old
+                              for_ (Map.lookup image (tableSwapTickets held)) (\cell → settleSwap recording cell SwapPublished)
+                              writeTVar
+                                (recordingTable recording)
+                                ( Just
+                                    held
+                                      { tableBook = swapped
+                                      , tableTextures = maybe id Set.delete released (tableTextures held)
+                                      , tableSwapTickets = Map.delete image (tableSwapTickets held)
+                                      }
+                                )
     current = maybe (fail "the texture table vanished") pure =<< readTVarIO (recordingTable recording)
     textureSet table = case tableSets table of
       set : _ → set

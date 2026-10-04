@@ -26,6 +26,7 @@ module Test.GPU.Vulkan.Native.RecordingStandIn
   , onceAt
   , duringReset
   , duringRecord
+  , duringWrite
   , RecordingFailure (..)
   , supportImages
   , standInImageLimits
@@ -136,6 +137,7 @@ data RecordingStandIn = RecordingStandIn
   , recordingMemory ∷ !(TVar (Map Word64 ByteString))
   , recordingDuringReset ∷ !(TVar (IO ()))
   , recordingDuringRecord ∷ !(TVar (NativeCommand → IO ()))
+  , recordingDuringWrite ∷ !(TVar ([DescriptorWrite] → IO ()))
   , recordingOutOfMemory ∷ !(TVar (Map RecordingStep Int))
     -- ^ How many more calls at each step answer out of memory (VK-14).
   , recordingOnce ∷ !(TVar (Map RecordingStep (IO ())))
@@ -155,6 +157,7 @@ newRecordingStandIn =
     <*> newTVarIO 500
     <*> newTVarIO Map.empty
     <*> newTVarIO (pure ())
+    <*> newTVarIO (\_ → pure ())
     <*> newTVarIO (\_ → pure ())
     <*> newTVarIO Map.empty
     <*> newTVarIO Map.empty
@@ -225,6 +228,10 @@ onceAt standIn at action = atomically (modifyTVar' (recordingOnce standIn) (Map.
 -- | Run this inside every storage reset, before it is recorded.
 duringReset ∷ RecordingStandIn → IO () → IO ()
 duringReset standIn action = atomically (writeTVar (recordingDuringReset standIn) action)
+
+-- | Run this inside every descriptor write, before it is made.
+duringWrite ∷ RecordingStandIn → ([DescriptorWrite] → IO ()) → IO ()
+duringWrite standIn action = atomically (writeTVar (recordingDuringWrite standIn) action)
 
 -- | Run this inside every recorded command, before it is recorded.
 duringRecord ∷ RecordingStandIn → (NativeCommand → IO ()) → IO ()
@@ -343,5 +350,8 @@ recordingStandInOps standIn =
     , opsAllocateSet = \_ pool layout count → do
         handle ← fresh standIn
         handle <$ step standIn AtAllocateSet (AllocatedSet handle pool layout count)
-    , opsWriteDescriptors = \_ writes → step standIn AtWriteDescriptors (WroteDescriptors writes)
+    , opsWriteDescriptors = \_ writes → do
+        action ← readTVarIO (recordingDuringWrite standIn)
+        action writes
+        step standIn AtWriteDescriptors (WroteDescriptors writes)
     }
