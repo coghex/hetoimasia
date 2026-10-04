@@ -17,6 +17,7 @@
 -- ('Hetoimasia.GPU.Vulkan.Native.Recording.useScope').
 module Hetoimasia.GPU.Vulkan.Native.Recording.Vulkan
   ( vulkanRecordingOps
+  , colorBlendAttachment
   , transitionScopes
   ) where
 
@@ -74,6 +75,7 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , IndexType (..)
   , InputRate (..)
   , NativeCommand (..)
+  , PipelineBlend (..)
   , PipelineRequest (..)
   , PipelineShaders (..)
   , PushConstantRange (..)
@@ -482,7 +484,7 @@ createPipeline' device request name = do
                       , attachmentCount = 1
                       , attachments =
                           Vector.singleton
-                            (zero {colorWriteMask = COLOR_COMPONENT_R_BIT .|. COLOR_COMPONENT_G_BIT .|. COLOR_COMPONENT_B_BIT .|. COLOR_COMPONENT_A_BIT} ∷ PipelineColorBlendAttachmentState)
+                            (colorBlendAttachment request.requestBlend)
                       , blendConstants = (0, 0, 0, 0)
                       }
                 )
@@ -745,3 +747,24 @@ recordCommand commands = \case
   CommandDrawIndexed indices instances → drawIndexedUnsafe commands indices instances 0 0 0
   CommandBeginLabel name → beginLabelUnsafe commands DebugUtilsLabelEXT {labelName = name, color = (0, 0, 0, 0)}
   CommandEndLabel → endLabelUnsafe commands
+
+-- | The one colour attachment's blend state for a pipeline's declared blend
+-- (GRS-8): every channel written; no blending, or premultiplied-alpha
+-- blending — @ONE@ and @ONE_MINUS_SRC_ALPHA@ for colour and alpha alike,
+-- added.
+colorBlendAttachment ∷ PipelineBlend → PipelineColorBlendAttachmentState
+colorBlendAttachment = \case
+  BlendNone → zero {colorWriteMask = allChannels}
+  BlendPremultipliedAlpha →
+    zero
+      { blendEnable = True
+      , srcColorBlendFactor = BLEND_FACTOR_ONE
+      , dstColorBlendFactor = BLEND_FACTOR_ONE_MINUS_SRC_ALPHA
+      , colorBlendOp = BLEND_OP_ADD
+      , srcAlphaBlendFactor = BLEND_FACTOR_ONE
+      , dstAlphaBlendFactor = BLEND_FACTOR_ONE_MINUS_SRC_ALPHA
+      , alphaBlendOp = BLEND_OP_ADD
+      , colorWriteMask = allChannels
+      }
+  where
+    allChannels = COLOR_COMPONENT_R_BIT .|. COLOR_COMPONENT_G_BIT .|. COLOR_COMPONENT_B_BIT .|. COLOR_COMPONENT_A_BIT

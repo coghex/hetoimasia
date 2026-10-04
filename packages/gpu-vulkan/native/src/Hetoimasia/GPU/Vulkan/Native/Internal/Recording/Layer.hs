@@ -20,6 +20,7 @@
 module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   ( RecordingOps (..)
   , PipelineRequest (..)
+  , PipelineBlend (..)
   , PipelineShaders (..)
   , ReadbackAllocation (..)
   , RecordingLimits (..)
@@ -213,8 +214,20 @@ data PipelineRequest = PipelineRequest
   , requestShaders ∷ !PipelineShaders
   , requestColorFormat ∷ !Word32
   , requestVertexInput ∷ !VertexInput
+  , requestBlend ∷ !PipelineBlend
   }
   deriving (Eq, Show)
+
+-- | How a pipeline's color output combines with what its attachment holds
+-- (GRS-8).
+data PipelineBlend
+  = BlendNone
+    -- ^ The output replaces the attachment's contents: every pipeline's
+    -- behaviour unless it declares otherwise.
+  | BlendPremultipliedAlpha
+    -- ^ Additive blending of premultiplied colour: source factor @ONE@ and
+    -- destination factor @ONE_MINUS_SRC_ALPHA@, for colour and alpha alike.
+  deriving (Eq, Ord, Show, Enum, Bounded)
 
 -- | A mapped buffer's native objects — a readback buffer's, or the session's
 -- shared ring's (GRS-4): the buffer, its allocation from the device's

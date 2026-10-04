@@ -211,6 +211,7 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , constructRing
   , constructPipelineLayoutFor
   , constructCheckedPipeline
+  , constructBlendedCheckedPipeline
   , replaceConstructedCheckedPipeline
   , constructBuffer
   , constructImage
