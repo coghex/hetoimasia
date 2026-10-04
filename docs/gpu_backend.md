@@ -1951,7 +1951,8 @@ decides the request, in this order:
 1. The session must be running (`UploadSessionFailed` with its primary
    otherwise), and admission open (`UploadClosed` otherwise).
 2. The target must be this session's, still managed and not released
-   (`UploadMisuse`).
+   (`UploadMisuse`), and not a pending texture swap's replacement, which only
+   the upload the swap accepted fills (`UploadMisuse` `WrongPhase`; GRS-9).
 3. No other unsettled upload may write into it (`UploadAlreadyTargeted`).
 4. It must be a `TextureImage`, a `VertexBuffer` or an `IndexBuffer`
    (`UploadWrongKind`). A BC7 texture on a device without BC7 is
@@ -2470,7 +2471,13 @@ native call and from any thread, where the swap stands.
   diagnostic failure is pending, no swap can take effect, since writing its
   descriptor is new work: each pending swap fails once its upload has
   settled, and a device loss is never reported as success. The session's
-  terminal behavior is unchanged.
+  terminal behavior is unchanged. `retireRecording` fails every swap still
+  pending, so a session that fails before the table is next brought up to
+  date, or an owner's exit, leaves no ticket pending.
+- **One upload.** Only the upload the swap accepted fills its replacement:
+  admission refuses any further upload into a pending swap's replacement
+  (`UploadMisuse` `WrongPhase`). A cancelled upload therefore fails the swap,
+  however the image is later uploaded into.
 
 `swapTexture` refuses, changing nothing — the mapping, a swap already
 pending on the handle, and the image, which stays the caller's:
