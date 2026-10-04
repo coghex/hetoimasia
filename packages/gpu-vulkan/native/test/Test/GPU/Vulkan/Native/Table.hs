@@ -44,7 +44,7 @@ import Hetoimasia.GPU.Vulkan.Native.Uploads
 import Data.Functor ((<&>))
 import Test.GPU.Vulkan.Native.AllocatorStandIn (AllocatorCall (Flushed), allocatorCalls, allowTypes, deviceLocalType, nonCoherentType)
 import Test.GPU.Vulkan.Native.FramesRig
-import Test.GPU.Vulkan.Native.FramesStandIn (completeAll)
+import Test.GPU.Vulkan.Native.FramesStandIn (completeAll, completeFence, pendingFences)
 import Test.GPU.Vulkan.Native.StandIn (StandIn (standAllocator), StandInResult (..), offerNaming, outOfMemoryNaming)
 import Hetoimasia.GPU.Vulkan.Native.Naming (NativeObjectKind (ObjectDescriptorPool, ObjectDescriptorSet))
 import Test.GPU.Vulkan.Native.RecordingStandIn (RecordingCall (..), RecordingFailure (..), RecordingStep (..), failAt, limitBuffers, limitRecording, onceAt, outOfMemoryAt, recordingCalls, standInRecordingLimits, succeedAt)
@@ -301,6 +301,56 @@ spec = describe "Texture table" $ do
       completed rig
       _ ← disposeResources (rigRecording rig) (at 1)
       destroyedPools rig >>= (`shouldSatisfy` elem pool0)
+      clean rig
+
+    it "keeps each superseded set's pool for exactly the batch that bound it, across successive growths: each retires independently, on its own batch's discard or completion, in any order" $ do
+      -- Each pending batch holds a lookup version, so the ring has room.
+      (rig, uploads, kit) ← tableRigWith 16 2 8
+      textures ← mapM (const (uploadedTexture rig uploads)) [1 ∷ Int .. 8]
+      let texture n = textures !! (n - 1)
+          pools = (\calls → [pool | CreatedPool pool (TexturePool _ _) ← calls]) <$> recordingCalls (rigRecordingStandIn rig)
+          disposed n = () <$ disposeResources (rigRecording rig) (at n)
+      -- Batch A binds the first set, and is submitted and pending.
+      _ ← registered rig (texture 1)
+      set0 ← currentSet rig
+      recordDrawing rig kit
+      [fenceA] ← pendingFences (rigStandIn rig)
+      -- The table grows; batch B binds the second set, submitted and pending.
+      _ ← registered rig (texture 2)
+      set1 ← currentSet rig
+      recordDrawing rig kit
+      [fenceB] ← filter (/= fenceA) <$> pendingFences (rigStandIn rig)
+      -- The table grows again; batch C binds the third set, and the table
+      -- grows a third time while C is still being recorded, which then
+      -- discards it, unsubmitted.
+      _ ← registered rig (texture 3)
+      _ ← registered rig (texture 4)
+      set2 ← currentSet rig
+      discarded ← try @ErrorCall @() $ withFramelessScope (rigFrames rig) $ \scope → do
+        _ ← recordFramelessIn scope $ \recorder → inPass kit recorder $ do
+          ok (bindTable recorder)
+          mapM_ (registered rig . texture) [5 .. 8]
+        throwIO (ErrorCall "the consumer gave up")
+      discarded `shouldBe` Left (ErrorCall "the consumer gave up")
+      allocated rig `shouldReturn` 16
+      set3 ← currentSet rig
+      [pool0, pool1, pool2, pool3] ← pools
+      bound ← recordingCalls (rigRecordingStandIn rig)
+      [head' sets | Recorded _ (CommandBindDescriptorSets _ sets _) ← bound] `shouldBe` [set0, set1, set2]
+      Set.size (Set.fromList [set0, set1, set2, set3]) `shouldBe` 4
+      -- C's discard lets the third set's pool go; A and B still hold theirs.
+      disposed 1
+      destroyedPools rig >>= (`shouldSatisfy` \destroyed → pool2 `elem` destroyed && all (`notElem` destroyed) [pool0, pool1, pool3])
+      -- B completes before A: the second set's pool goes, the first stays.
+      completeFence (rigStandIn rig) fenceB
+      _ ← progress rig
+      disposed 2
+      destroyedPools rig >>= (`shouldSatisfy` \destroyed → pool1 `elem` destroyed && all (`notElem` destroyed) [pool0, pool3])
+      -- A completes: the first set's pool goes; the current one stays.
+      completeFence (rigStandIn rig) fenceA
+      _ ← progress rig
+      disposed 3
+      destroyedPools rig >>= (`shouldSatisfy` \destroyed → pool0 `elem` destroyed && pool3 `notElem` destroyed)
       clean rig
 
     it "leaves the current set and the table as they were when the larger pool's creation runs out of memory with nothing to reclaim: no retry, and a later registration grows" $ do
