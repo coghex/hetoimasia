@@ -10,7 +10,8 @@ the one authority for what exists.
 from __future__ import annotations
 
 import ast
-from dataclasses import dataclass, field
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, field
 import hashlib
 import importlib.util
 import json
@@ -121,6 +122,37 @@ def wayland_groups():
     workflow = (ROOT / ".github" / "workflows" / "validation.yml").read_text()
     wrapped = set(re.findall(r'if \[ "\$group" = "([\w.-]+)" \]; then\s+helper=tools/display/wayland\.sh', workflow))
     return wrapped | {g["id"] for g in CATALOG["groups"] if own_compositor(g)}
+
+
+@contextmanager
+def overlay(catalog=None, workflow=None):
+    """The checkout as the adapter reads it, with a temporary catalog or validation workflow; nothing on disk changes."""
+    replaced = {}
+    if catalog is not None:
+        replaced[ROOT / "tools" / "validation" / "catalog.json"] = json.dumps(catalog)
+    if workflow is not None:
+        replaced[ROOT / ".github" / "workflows" / "validation.yml"] = workflow
+    original = Path.read_text
+
+    def read_text(path, *args, **kwargs):
+        return replaced[path] if path in replaced else original(path, *args, **kwargs)
+
+    with mock.patch.object(Path, "read_text", read_text):
+        yield
+
+
+def with_group(group_id, change):
+    """A copy of the catalog with one group's fields changed."""
+    catalog = json.loads(json.dumps(CATALOG))
+    group = next(g for g in catalog["groups"] if g["id"] == group_id)
+    group.update(change)
+    return catalog
+
+
+def emitted(suite):
+    """Every field a suite carries except its identity, its data flattened as `data.<key>`."""
+    fields = {k: v for k, v in asdict(suite).items() if k not in ("identity", "data")}
+    return fields | {f"data.{k}": v for k, v in suite.data.items()}
 
 
 class AdapterChecks(unittest.TestCase):
@@ -271,6 +303,115 @@ class AdapterChecks(unittest.TestCase):
         again = {s.id: s.identity for s in self.module.adapter().suites(Context())}
         self.assertEqual(again, {k: s.identity for k, s in self.suites.items()})
         self.assertEqual(len(set(again.values())), len(again))
+
+    def overlaid(self, catalog=None, workflow=None):
+        """The adapter's suites with a temporary catalog or validation workflow in place of the real one."""
+        with overlay(catalog, workflow):
+            return {s.id: s for s in self.module.adapter().suites(Context())}
+
+    def assert_policy_change(self, suites, group_id, changed):
+        """Exactly `group_id`'s suites change identity, and only the `changed` fields with it."""
+        affected = {k for k, s in self.suites.items() if s.data["group"] == group_id}
+        self.assertTrue(affected, group_id)
+        self.assertEqual(sorted(suites), sorted(self.suites))
+        for suite_id, suite in suites.items():
+            before = self.suites[suite_id]
+            if suite_id in affected:
+                self.assertNotEqual(suite.identity, before.identity, suite_id)
+                self.assertEqual(sorted(k for k, v in emitted(suite).items() if emitted(before)[k] != v),
+                                 sorted(changed), suite_id)
+            else:
+                self.assertEqual(suite.identity, before.identity, suite_id)
+                self.assertEqual(emitted(suite), emitted(before), suite_id)
+        self.assertEqual(len({s.identity for s in suites.values()}), len(suites))
+        return affected
+
+    def test_each_execution_policy_change_changes_the_affected_identities(self):
+        workflow = (ROOT / ".github" / "workflows" / "validation.yml").read_text()
+        wrapped = 'if [ "$group" = "test.glfw-wayland" ]; then'
+        routed = '"haskell-workflow=cpu:test.workflow"'
+        for count in (workflow.count(wrapped), workflow.count(routed)):
+            self.assertEqual(count, 1, "validation.yml changed shape; update these overlays")
+        native = ["bash", "tools/vulkan/run.sh", "native"]
+        cases = [
+            ("timeout", "test.x11-helper", dict(timeout_seconds=300), None, ["trial_seconds"]),
+            ("preparation", "test.x11-helper",
+             dict(preparation=dict(command=["cabal", "build", "--project-file", "cabal.project.cpu",
+                                            "--ghc-options=-O0", "hetoimasia:test:x11-helper-tests"])),
+             None, ["data.preparation"]),
+            # The desktop requirement follows the display: a display runner is both.
+            ("display runner and desktop", "test.x11-helper", dict(runner="display"), None,
+             ["desktop", "data.display"]),
+            ("workflow compositor wrapping", "test.x11-helper", {},
+             workflow.replace(wrapped, 'if [ "$group" = "test.x11-helper" ]; then\n'
+                                       '              helper=tools/display/wayland.sh\n'
+                                       '            fi\n            ' + wrapped),
+             ["platforms", "data.display"]),
+            ("launch path", "test.vulkan-headless",
+             dict(command=native + self.group("test.vulkan-headless")["command"][3:]),
+             None, ["data.launch"]),
+            ("platforms", "test.x11-helper", dict(platforms=["Linux"]), None, ["platforms"]),
+            ("catalog classification", "test.x11-helper", dict(optional=False), None, ["kind"]),
+            ("workflow routing classification", "test.x11-helper", {},
+             workflow.replace(routed, '"haskell-workflow=cpu:test.workflow,test.x11-helper"'), ["kind"]),
+            # A narrowed profile and a compositor profile change apart from
+            # the unnarrowed suite of the executable they share.
+            ("narrowed profile timeout", "test.glfw-wayland", dict(timeout_seconds=900), None, ["trial_seconds"]),
+            ("compositor profile timeout", "test.vulkan-wayland", dict(timeout_seconds=600), None, ["trial_seconds"]),
+            ("unnarrowed suite timeout", "test.vulkan-native", dict(timeout_seconds=600), None, ["trial_seconds"]),
+        ]
+        for name, group_id, change, edited, changed in cases:
+            with self.subTest(name):
+                self.assert_policy_change(self.overlaid(with_group(group_id, change), edited), group_id, changed)
+
+    def test_a_policy_change_invalidates_every_suite_of_a_multi_component_group(self):
+        suites = self.overlaid(with_group("test.vulkan-headless", dict(timeout_seconds=1200)))
+        affected = self.assert_policy_change(suites, "test.vulkan-headless", ["trial_seconds"])
+        self.assertEqual(len(affected), 5, sorted(affected))
+
+    def test_a_policy_edit_that_leaves_execution_unchanged_keeps_the_identity(self):
+        # Both timeouts fall below the trial floor, so both run 60-second trials.
+        short = self.overlaid(with_group("test.x11-helper", dict(timeout_seconds=30)))
+        shorter = self.overlaid(with_group("test.x11-helper", dict(timeout_seconds=45)))
+        self.assertEqual({k: s.identity for k, s in short.items()}, {k: s.identity for k, s in shorter.items()})
+        self.assertNotEqual(short["x11-helper-tests"].identity, self.suites["x11-helper-tests"].identity)
+        # A required group unrouted is still a CI suite.
+        workflow = (ROOT / ".github" / "workflows" / "validation.yml").read_text()
+        routing = "cpu+display:test.vulkan-headless,"
+        self.assertEqual(workflow.count(routing), 1, "validation.yml changed shape; update this overlay")
+        unrouted = self.overlaid(workflow=workflow.replace(routing, "cpu+display:"))
+        self.assertEqual({k: (s.kind, s.identity) for k, s in unrouted.items()},
+                         {k: (s.kind, s.identity) for k, s in self.suites.items()})
+
+    def test_an_unrelated_catalog_or_workflow_edit_keeps_every_identity(self):
+        catalog = json.loads(json.dumps(CATALOG))
+        for group in catalog["groups"]:
+            group["description"] += " Edited."
+        catalog["groups"].append(dict(id="smoke.overlay", description="An added group.", command=["true"],
+                                      inputs=[], framework="none", runner="cpu", timeout_seconds=60,
+                                      category="smoke", optional=False))
+        workflow = (ROOT / ".github" / "workflows" / "validation.yml").read_text() + "# An unrelated edit.\n"
+        suites = self.overlaid(catalog, workflow)
+        self.assertEqual({k: s.identity for k, s in suites.items()}, {k: s.identity for k, s in self.suites.items()})
+        # Another group's policy changing leaves this one's suites alone too.
+        suites = self.overlaid(with_group("test.wayland-helper", dict(timeout_seconds=300)))
+        self.assertEqual(suites["x11-helper-tests"].identity, self.suites["x11-helper-tests"].identity)
+
+    def test_a_changed_probe_no_longer_matches_its_recent_observation(self):
+        # quruntul's $test runs a probe whose identity differs from the one its
+        # last observation recorded, however recent; this is that comparison's
+        # input, not a copy of quruntul's selector.
+        observed = self.suites["x11-helper-tests"]
+        self.assertEqual(observed.kind, "probe")
+        for change in (dict(timeout_seconds=300), dict(platforms=["Linux"]), dict(runner="display"),
+                       dict(preparation=dict(command=["cabal", "build", "--ghc-options=-O0",
+                                                      "hetoimasia:test:x11-helper-tests"]))):
+            changed = self.overlaid(with_group("test.x11-helper", change))["x11-helper-tests"]
+            self.assertEqual(changed.kind, "probe", change)
+            self.assertNotEqual(changed.identity, observed.identity, change)
+
+    def group(self, group_id):
+        return next(g for g in CATALOG["groups"] if g["id"] == group_id)
 
     def test_desktop_consent_is_per_command_on_macos_and_an_isolated_display_on_linux(self):
         adapter = self.module.adapter()

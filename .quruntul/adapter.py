@@ -17,7 +17,11 @@ own, `<suite>:<group>`, beside the executable's unnarrowed suite, and is launche
 inside that compositor the same way. A group that declares a
 `preparation` command is prepared by exactly that command, as CI prepares it
 (test.vulkan-native also builds the triangle sample app, so an app that no
-longer builds fails the suite here too). It imports nothing
+longer builds fails the suite here too). A suite's identity, which quruntul
+compares to decide what changed since it last ran, covers that execution
+policy as well as the suite's sources: its kind, platforms, desktop
+requirement, trial deadline, display, launch path and preparation, as the
+suite carries them. It imports nothing
 from quruntul — the context supplies `Suite`, `Prepared` and `digest` — so
 `tools/test/QuruntulAdapter.hs` can check it without quruntul installed.
 
@@ -209,32 +213,41 @@ class Hetoimasia:
                 inputs = set(cabal.component_inputs(packages, component)) | set(group.get("inputs", []))
                 inputs |= {"cabal.project", "cabal.project.cpu", "cabal.project.common", "cabal.project.vulkan",
                            "tools/ci-image/toolchain.pin", "tools/toolchain/binding.pin"}
-                # A profile under a compositor its own command starts shares its
-                # executable and options with the unnarrowed suite, so it says
-                # so; every other identity is unchanged.
-                identity = ctx.digest(dict(
-                    adapter=adapter_hash, component=component, options=options,
-                    entries=[e for e in entries if any(repository.matches_input(e[0], x) for x in inputs)],
-                    **({"compositor": group["id"]} if _own_compositor(group) else {})))
-                route = "vulkan" if package in VULKAN_PACKAGES else "glfw" if package in GLFW_PACKAGES else "cpu"
-                suites[suite_name] = ctx.Suite(
-                    id=suite_name,
+                # How the suite runs, as the catalog and CI decide it: the
+                # effective values only, so a policy edit that leaves them as
+                # they were (a timeout either side of the trial floor, a routing
+                # change that keeps the kind) leaves the identity alone.
+                policy = dict(
                     kind="probe" if probe else "ci",
-                    framework="hspec",
-                    description=group["description"],
-                    area=group["id"].removeprefix("test."),
                     # The isolated compositor exists only on Linux; on Darwin every
                     # Wayland case is pending (Test.GLFW.Native.Wayland.onlyWayland).
                     platforms=["Linux"] if display == "wayland" else list(group.get("platforms", _platforms(group["id"]))),
                     # A Wayland session is private to its run and opens nothing on the desktop.
                     desktop=display == "desktop",
                     trial_seconds=max(60, min(int(group.get("timeout_seconds", 1800)), 3600)),
+                    display=display, launch=launch, preparation=(group.get("preparation") or {}).get("command"))
+                # A profile under a compositor its own command starts shares its
+                # executable and options with the unnarrowed suite, so it says so.
+                identity = ctx.digest(dict(
+                    adapter=adapter_hash, component=component, options=options, policy=policy,
+                    entries=[e for e in entries if any(repository.matches_input(e[0], x) for x in inputs)],
+                    **({"compositor": group["id"]} if _own_compositor(group) else {})))
+                route = "vulkan" if package in VULKAN_PACKAGES else "glfw" if package in GLFW_PACKAGES else "cpu"
+                suites[suite_name] = ctx.Suite(
+                    id=suite_name,
+                    kind=policy["kind"],
+                    framework="hspec",
+                    description=group["description"],
+                    area=group["id"].removeprefix("test."),
+                    platforms=policy["platforms"],
+                    desktop=policy["desktop"],
+                    trial_seconds=policy["trial_seconds"],
                     batch_seconds=14400,
                     identity=identity,
                     priority=10,
                     data=dict(component=component, package=package, route=route, group=group["id"],
                               directory=packages[package].directory, options=options, display=display,
-                              launch=launch, preparation=(group.get("preparation") or {}).get("command")),
+                              launch=launch, preparation=policy["preparation"]),
                 )
         return list(suites.values())
 
