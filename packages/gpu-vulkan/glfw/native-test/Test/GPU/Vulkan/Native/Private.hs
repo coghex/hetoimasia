@@ -83,6 +83,12 @@
 --   is submitted, which still draws the original, and the new texture drawn
 --   beside the released handle, which resolves to the placeholder; every
 --   batch read back and probed (#343);
+-- * @grs8-sprites@ — the same device start with no window, then the sprites
+--   sample's window-free evidence (GRS-8): its scene of indexed, instanced
+--   textured quads through texture handles with premultiplied-alpha blending,
+--   read back after completion, checked against the sample's independent
+--   oracle, and written as a lossless PNG and a probe record under the
+--   validation runner's evidence directory (#345);
 -- * @grs3-ordering@ — GRS-3's managed depth target and buffer written by an
 --   initializing batch, then by two batches submitted in order with no
 --   completion wait between and no layout change, ordered only by the
@@ -373,6 +379,14 @@ scenarios =
       $ \consent journal _ → do
         outcome ← SurfaceFree.runTable (consentBackend consent) journal
         pure (SurfaceFree.tableSpec outcome, section "The GRS-7 texture table record" (SurfaceFree.tableSection outcome))
+  , Scenario
+      "grs8-sprites"
+      "draws the sprites sample's scene of instanced textured quads through texture handles with premultiplied-alpha blending in a frame-less batch of a surface-free session, reads the target back after completion, passes every probe of the independent oracle and writes a lossless PNG and a probe record, with validation reporting nothing"
+      False
+      Nothing
+      $ \consent journal _ → do
+        outcome ← SurfaceFree.runSprites (consentBackend consent) journal
+        pure (SurfaceFree.spritesSpec outcome, section "The GRS-8 sprites evidence record" (SurfaceFree.spritesSection outcome))
   , Scenario
       "synchronization-hazard"
       "observes a deliberate synchronization hazard, proving synchronization validation active"

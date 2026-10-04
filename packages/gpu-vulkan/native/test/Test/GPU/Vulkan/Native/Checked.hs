@@ -15,6 +15,9 @@ import qualified Data.ByteString as ByteString
 import Test.Hspec (Spec, describe, it, shouldBe, shouldReturn)
 
 import Hetoimasia.GPU.Vulkan.Native.Recording
+import Hetoimasia.GPU.Vulkan.Native.Recording.Vulkan (colorBlendAttachment)
+import Data.Bits ((.|.))
+import Vulkan.Core10 (BlendFactor (..), BlendOp (..), ColorComponentFlagBits (..), PipelineColorBlendAttachmentState (..))
 import Hetoimasia.GPU.Vulkan.Native.Shader.Interface (DescriptorCount (..), DescriptorDeclaration (..), DescriptorKind (..), InterfaceStage (..), PushMember (..), ShaderInterface (..), interfaceFor)
 import Test.GPU.Vulkan.Native.FramesRig
 import Test.GPU.Vulkan.Native.RecordingStandIn (RecordingCall (..), recordingCalls)
@@ -40,6 +43,35 @@ spec = describe "Pipelines from checked shaders" $ do
     [input | DeclaredInput _ input ← calls] `shouldBe` [quadInput]
     length [() | CreatedPipeline {} ← calls] `shouldBe` 1
     clean rig
+
+  it "declares premultiplied-alpha blending to the native layer only for a pipeline that asks for it, and none by default (GRS-8)" $ do
+    rig ← newRig
+    let checked = shaders (vertexWith tint) (fragmentWith tint)
+    layout ← createPipelineLayoutFor (rigRecording rig) checked >>= either (fail . show) pure
+    plain ← createCheckedPipeline (rigRecording rig) layout checked 37 >>= either (fail . show) pure
+    blended ← createBlendedCheckedPipeline (rigRecording rig) layout checked 37 BlendPremultipliedAlpha >>= either (fail . show) pure
+    unblended ← createBlendedCheckedPipeline (rigRecording rig) layout checked 37 BlendNone >>= either (fail . show) pure
+    calls ← recordingCalls (rigRecordingStandIn rig)
+    let made = [handle | CreatedPipeline handle _ _ ← calls]
+    length made `shouldBe` 3
+    [(handle, blend) | DeclaredBlend handle blend ← calls] `shouldBe` [(made !! 1, BlendPremultipliedAlpha)]
+    (plain, blended, unblended) `seq` clean rig
+
+  it "builds the colour attachment's blend state for each declared blend: every channel written, and blending only as declared" $ do
+    let channels = COLOR_COMPONENT_R_BIT .|. COLOR_COMPONENT_G_BIT .|. COLOR_COMPONENT_B_BIT .|. COLOR_COMPONENT_A_BIT
+        none = colorBlendAttachment BlendNone
+        premultiplied = colorBlendAttachment BlendPremultipliedAlpha
+    (blendEnable none, colorWriteMask none) `shouldBe` (False, channels)
+    ( blendEnable premultiplied
+      , srcColorBlendFactor premultiplied
+      , dstColorBlendFactor premultiplied
+      , colorBlendOp premultiplied
+      , srcAlphaBlendFactor premultiplied
+      , dstAlphaBlendFactor premultiplied
+      , alphaBlendOp premultiplied
+      , colorWriteMask premultiplied
+      )
+      `shouldBe` (True, BLEND_FACTOR_ONE, BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, BLEND_OP_ADD, BLEND_FACTOR_ONE, BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, BLEND_OP_ADD, channels)
 
   it "refuses disagreeing stages, descriptor bindings, a misassigned stage and a layout with other ranges, making no native call" $ do
     rig ← newRig

@@ -1,11 +1,12 @@
 -- The Vulkan project: the native backend package, the window integration
--- package with its native suite, the triangle sample (VK-17), and the GLFW
--- package with its Vulkan interop component enabled — the only project file
--- that names the first three or turns that component on.
+-- package with its native suite, the triangle sample (VK-17), the sprites
+-- sample (GRS-8), and the GLFW package with its Vulkan interop component
+-- enabled — the only project file that names the first four or turns that
+-- component on.
 --
 -- `cabal.project` and `cabal.project.cpu` deliberately do not list
--- `packages/gpu-vulkan/native`, `packages/gpu-vulkan/glfw` or the triangle
--- sample's packages under `samples/triangle`, and neither sets
+-- `packages/gpu-vulkan/native`, `packages/gpu-vulkan/glfw` or the samples'
+-- packages under `samples/triangle` and `samples/sprites`, and neither sets
 -- the GLFW package's manual `vulkan-interop` flag, so neither resolves nor links
 -- the Vulkan binding and neither `cabal build all` nor `cabal build all
 -- --project-file cabal.project.cpu` needs a loader or the Vulkan headers. Every
@@ -35,6 +36,8 @@ packages:
   packages/gpu-vulkan/glfw
   samples/triangle/renderer
   samples/triangle/app
+  samples/sprites/renderer
+  samples/sprites/app
   packages/glfw
   packages/gpu-vulkan/diagnostics
   packages/gpu-vulkan/model

@@ -1,0 +1,84 @@
+cabal-version: 3.16
+name: hetoimasia-sample-sprites
+version: 0.1.0.0
+synopsis: The sprites sample's drawing for Hetoimasia's Vulkan host
+description:
+    GRS-8's consumer drawing: indexed, instanced textured quads through stable
+    texture handles, with premultiplied-alpha blending, in a fixed 2D scene,
+    and the scene's independent probe oracle and window-free evidence. It
+    depends on the native backend alone and names nothing of the window
+    integration, so the integration's native suite can exercise it unchanged,
+    and the sample's executable (`hetoimasia-sample-sprites-app`) hands it to
+    the host. Nothing in the engine depends on it.
+    .
+    It is selected only by `cabal.project.vulkan`, so neither `cabal.project`
+    nor `cabal.project.cpu` resolves the binding, the Vulkan headers or a
+    loader, and only `tools/vulkan/run.sh` builds it.
+license: GPL-3.0-only
+license-file: LICENSE
+author: Vincent Coghlan
+maintainer: Vincent Coghlan
+category: Game
+build-type: Simple
+tested-with: GHC ==9.14.1
+-- The shader toolchain fingerprint every splice here checks and registers,
+-- which `tools/vulkan/run.sh` generates at `shaders/toolchain.fingerprint`
+-- before every build and removes afterwards. Cabal decides whether to run GHC
+-- from the files a package lists, never from the ones a splice registers, so
+-- it is listed here; see packages/gpu-vulkan/native/README.md.
+extra-source-files:
+    **/*.fingerprint
+
+source-repository head
+    type: git
+    location: https://github.com/coghex/hetoimasia.git
+    subdir: samples/sprites/renderer
+
+library
+    default-language: GHC2024
+    default-extensions: UnicodeSyntax OverloadedStrings
+    ghc-options: -Wall -Wcompat -Wincomplete-uni-patterns -Wincomplete-record-updates
+    hs-source-dirs: src
+    exposed-modules:
+        Hetoimasia.Sample.Sprites
+        Hetoimasia.Sample.Sprites.Evidence
+        Hetoimasia.Sample.Sprites.Fixtures
+        Hetoimasia.Sample.Sprites.Oracle
+        Hetoimasia.Sample.Sprites.Png
+        Hetoimasia.Sample.Sprites.Scene
+        Hetoimasia.Sample.Sprites.ShaderInterfaces
+        Hetoimasia.Sample.Sprites.Shaders
+    build-depends:
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        containers >=0.8 && <0.9,
+        directory >=1.3 && <1.4,
+        filepath >=1.5 && <1.6,
+        text >=2.1 && <2.2,
+        hetoimasia-gpu-vulkan-native ==0.1.0.0
+
+-- The sample's headless examples: the scene's structure and its oracle, the
+-- fixtures, and the PNG writer, with no device, display or GLFW session. The
+-- executable links the loader only because the native backend does, so it is
+-- built and run through `tools/vulkan/run.sh test` — the group
+-- `test.vulkan-headless`.
+test-suite sprites-tests
+    type: exitcode-stdio-1.0
+    default-language: GHC2024
+    default-extensions: UnicodeSyntax OverloadedStrings
+    ghc-options: -Wall -Wcompat -Wincomplete-uni-patterns -Wincomplete-record-updates -threaded -rtsopts
+    hs-source-dirs: test
+    main-is: Main.hs
+    other-modules:
+        Test.Sample.Sprites.Fixtures
+        Test.Sample.Sprites.Oracle
+        Test.Sample.Sprites.Png
+        Test.Sample.Sprites.Record
+    build-depends:
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        containers >=0.8 && <0.9,
+        hspec >=2.11 && <3,
+        text >=2.1 && <2.2,
+        hetoimasia-gpu-vulkan-native ==0.1.0.0,
+        hetoimasia-sample-sprites

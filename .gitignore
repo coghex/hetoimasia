@@ -44,3 +44,4 @@ config/*.local.yaml
 # this machine's native prefix.
 /packages/gpu-vulkan/native/shaders/toolchain.fingerprint
 /samples/triangle/renderer/shaders/toolchain.fingerprint
+/samples/sprites/renderer/shaders/toolchain.fingerprint

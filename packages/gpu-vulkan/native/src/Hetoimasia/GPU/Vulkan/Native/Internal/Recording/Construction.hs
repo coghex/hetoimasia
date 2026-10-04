@@ -29,6 +29,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Construction
   , validatePushRanges
   , createPipelineLayoutFor
   , createCheckedPipeline
+  , createBlendedCheckedPipeline
   , replaceCheckedPipeline
   , createRing
   , createFrameStorage
@@ -90,6 +91,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   , ImageQuery (..)
   , ImageUse (..)
   , PipelineRequest (..)
+  , PipelineBlend (..)
   , PipelineShaders (..)
   , PushConstantRange (..)
   , PushStage (..)
@@ -266,7 +268,7 @@ createPipeline recording layout shaders format = createPipelineWith recording la
 -- to support for vertex input.
 createPipelineWith
   ∷ Recording q inst msgr phys dev cmd → PipelineLayout → PipelineShaders → Word32 → VertexInput → IO (Either Refusal Pipeline)
-createPipelineWith recording layout shaders format input = buildPipeline recording layout shaders format input Nothing
+createPipelineWith recording layout shaders format input = buildPipeline recording layout shaders format input BlendNone Nothing
 
 -- | Publish a new generation of a pipeline, over the given layout, with no
 -- vertex input. The old generation is released: nothing records it again,
@@ -280,7 +282,7 @@ replacePipeline recording old layout shaders format = replacePipelineWith record
 -- validates one.
 replacePipelineWith
   ∷ Recording q inst msgr phys dev cmd → Pipeline → PipelineLayout → PipelineShaders → Word32 → VertexInput → IO (Either Refusal Pipeline)
-replacePipelineWith recording (Pipeline old) layout shaders format input = buildPipeline recording layout shaders format input (Just old)
+replacePipelineWith recording (Pipeline old) layout shaders format input = buildPipeline recording layout shaders format input BlendNone (Just old)
 
 buildPipeline
   ∷ Recording q inst msgr phys dev cmd
@@ -288,9 +290,10 @@ buildPipeline
   → PipelineShaders
   → Word32
   → VertexInput
+  → PipelineBlend
   → Maybe ResourceId
   → IO (Either Refusal Pipeline)
-buildPipeline recording (PipelineLayout layout) shaders format input replacing =
+buildPipeline recording (PipelineLayout layout) shaders format input blend replacing =
   owned recording $
     liveNative recording layout >>= \case
       Left refusal → pure (Left refusal)
@@ -308,7 +311,7 @@ buildPipeline recording (PipelineLayout layout) shaders format input replacing =
                 ( \ops device _ issued → do
                     naming ← shaderNaming recording issued
                     (\created → Right (NativePipeline created layout format (PipelineInterface handle ranges input table)))
-                      <$> opsCreatePipeline ops device (PipelineRequest handle shaders format input) naming
+                      <$> opsCreatePipeline ops device (PipelineRequest handle shaders format input blend) naming
                 )
                 replacing
       Right _ → pure (Left RefusedWrongKind)
@@ -479,22 +482,30 @@ createPipelineLayoutFor recording shaders = case checkedRanges shaders of
 -- the pipeline other ranges or another input.
 createCheckedPipeline
   ∷ Recording q inst msgr phys dev cmd → PipelineLayout → CheckedShaders → Word32 → IO (Either Refusal Pipeline)
-createCheckedPipeline recording layout shaders format = checkedPipeline recording layout shaders format Nothing
+createCheckedPipeline recording layout shaders format = checkedPipeline recording layout shaders format BlendNone Nothing
+
+-- | 'createCheckedPipeline' with a declared blend (GRS-8): checked exactly
+-- as it checks, and differing only in how the pipeline's output combines with
+-- its attachment.
+createBlendedCheckedPipeline
+  ∷ Recording q inst msgr phys dev cmd → PipelineLayout → CheckedShaders → Word32 → PipelineBlend → IO (Either Refusal Pipeline)
+createBlendedCheckedPipeline recording layout shaders format blend = checkedPipeline recording layout shaders format blend Nothing
 
 -- | 'replacePipeline' from checked shaders, checked as 'createCheckedPipeline'
 -- checks them.
 replaceCheckedPipeline
   ∷ Recording q inst msgr phys dev cmd → Pipeline → PipelineLayout → CheckedShaders → Word32 → IO (Either Refusal Pipeline)
-replaceCheckedPipeline recording (Pipeline old) layout shaders format = checkedPipeline recording layout shaders format (Just old)
+replaceCheckedPipeline recording (Pipeline old) layout shaders format = checkedPipeline recording layout shaders format BlendNone (Just old)
 
 checkedPipeline
   ∷ Recording q inst msgr phys dev cmd
   → PipelineLayout
   → CheckedShaders
   → Word32
+  → PipelineBlend
   → Maybe ResourceId
   → IO (Either Refusal Pipeline)
-checkedPipeline recording held@(PipelineLayout layout) shaders format replacing =
+checkedPipeline recording held@(PipelineLayout layout) shaders format blend replacing =
   owned recording $
     liveNative recording layout >>= \case
       Left refusal → pure (Left refusal)
@@ -512,6 +523,7 @@ checkedPipeline recording held@(PipelineLayout layout) shaders format replacing 
                 (PipelineShaders (checkedSpirv (checkedVertex shaders)) (checkedSpirv (checkedFragment shaders)))
                 format
                 (Interface.interfaceVertexInput (checkedInterface (checkedVertex shaders)))
+                blend
                 replacing
       Right _ → pure (Left RefusedWrongKind)
   where

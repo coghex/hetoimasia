@@ -102,6 +102,7 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
   , constructRing
   , constructPipelineLayoutFor
   , constructCheckedPipeline
+  , constructBlendedCheckedPipeline
   , replaceConstructedCheckedPipeline
   , constructBuffer
   , constructImage
@@ -302,6 +303,8 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , replacePipeline
   , retireRecording
   , transitionImage
+  , createBlendedCheckedPipeline
+  , PipelineBlend
   )
 import Hetoimasia.GPU.Vulkan.Native.Roots
   ( Checkpoint (..)
@@ -511,6 +514,13 @@ constructCheckedPipeline
   ∷ Construction q inst msgr phys dev cmd → PipelineLayout → CheckedShaders → Word32 → IO (Either Refusal Pipeline)
 constructCheckedPipeline construction layout shaders format =
   confined construction (createCheckedPipeline (constructionRecording construction) layout shaders format)
+
+-- | A graphics pipeline from checked shaders with a declared blend (GRS-8),
+-- checked as 'constructCheckedPipeline' checks them.
+constructBlendedCheckedPipeline
+  ∷ Construction q inst msgr phys dev cmd → PipelineLayout → CheckedShaders → Word32 → PipelineBlend → IO (Either Refusal Pipeline)
+constructBlendedCheckedPipeline construction layout shaders format blend =
+  confined construction (createBlendedCheckedPipeline (constructionRecording construction) layout shaders format blend)
 
 -- | A new generation of a pipeline from checked shaders, checked as
 -- 'constructCheckedPipeline' checks them; the old one is released.

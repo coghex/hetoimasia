@@ -58,6 +58,7 @@ module Test.GPU.Vulkan.Native.SurfaceFree
   , runDrawing
   , runUploads
   , runTable
+  , runSprites
   , surfaceFreeSection
   , laterWindowSection
   , framelessSection
@@ -65,6 +66,7 @@ module Test.GPU.Vulkan.Native.SurfaceFree
   , drawingSection
   , uploadsSection
   , tableSection
+  , spritesSection
   , surfaceFreeSpec
   , laterWindowSpec
   , framelessSpec
@@ -72,6 +74,7 @@ module Test.GPU.Vulkan.Native.SurfaceFree
   , drawingSpec
   , uploadsSpec
   , tableSpec
+  , spritesSpec
   ) where
 
 import Control.Concurrent (ThreadId, myThreadId, threadDelay)
@@ -85,12 +88,16 @@ import Data.List (elemIndex, nub)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as Text
-import Data.Time.Clock (addUTCTime, diffUTCTime, getCurrentTime)
+import Data.Maybe (fromMaybe)
+import Data.Time.Clock (UTCTime, addUTCTime, diffUTCTime, getCurrentTime)
+import Data.Time.Clock.POSIX (utcTimeToPOSIXSeconds)
+import System.Environment (lookupEnv)
+import System.FilePath ((</>))
 import Data.Bits (shiftR)
 import Data.Word (Word16, Word32, Word8)
 import GHC.Float (castFloatToWord32)
 import Numeric.Natural (Natural)
-import System.Directory (getTemporaryDirectory)
+import System.Directory (doesFileExist, getTemporaryDirectory)
 import System.IO (hClose, openBinaryTempFile)
 import Test.Hspec (Expectation, Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
 
@@ -202,9 +209,15 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , selectSampler
   , tableSamplerIndex
   , validateTableConfig
+  , constructBlendedCheckedPipeline
   )
 import Hetoimasia.GPU.Vulkan.Native.Presentation (formatB8G8R8A8Srgb)
 import Hetoimasia.GPU.Vulkan.Native.Recording.ShaderInterfaces (tableSamplerOffset)
+import Hetoimasia.Sample.Sprites (Builders (..))
+import Hetoimasia.Sample.Sprites.Evidence (Evidence (..), Host (..), runEvidence)
+import Hetoimasia.Sample.Sprites.Oracle (ProbeResult (..))
+import qualified Hetoimasia.Sample.Sprites.Scene as Sprites
+import Hetoimasia.Sample.Sprites.Scene (Probe (..))
 import Hetoimasia.GPU.Vulkan.Native.Recording.Shaders (endpointShaders, quadShaders, tableShaders, verificationShaders)
 import Hetoimasia.GPU.Vulkan.Native.Roots (RootStanding (..), RootsView (..))
 import Hetoimasia.Runtime.GLFW
@@ -252,6 +265,7 @@ data SurfaceFreeFacts = SurfaceFreeFacts
   , factsSeconds ∷ !Double
   , factsUploads ∷ !(Maybe UploadFacts)
   , factsTable ∷ !(Maybe TableFacts)
+  , factsSprites ∷ !(Maybe Evidence)
   }
 
 data SurfaceFreeOutcome
@@ -269,6 +283,7 @@ data Seen = Seen
   , seenShots ∷ ![Shot]
   , seenUploads ∷ !(Maybe UploadFacts)
   , seenTable ∷ !(Maybe TableFacts)
+  , seenSprites ∷ !(Maybe Evidence)
   }
 
 -- | What the uploads case (GRS-6) found: each upload's ticket, waited for
@@ -306,7 +321,7 @@ runSurfaceFree backend journal = do
     windows ← length <$> atomically (hostWindowIdentities (vulkanWindowHost vulkan))
     roots ← atomically (readVulkanRoots (vulkanController vulkan))
     note journal ("the actions answered " <> Text.intercalate "; " answers)
-    pure (Seen threads answers windows (Just roots) Nothing [] [] Nothing Nothing)
+    pure (Seen threads answers windows (Just roots) Nothing [] [] Nothing Nothing Nothing)
 
 -- | The case that admits a window after the device exists.
 runLaterWindow ∷ Maybe Backend → Journal → IO SurfaceFreeOutcome
@@ -338,7 +353,7 @@ runLaterWindow backend journal = do
       pure (if any (`elem` retired) presented then FinishWith () else ContinueWith NoUpdateDemand)
     note journal "presented a frame to the later window and saw its presentation retire"
     roots ← atomically (readVulkanRoots (vulkanController vulkan))
-    pure (Seen [] [] 1 (Just roots) (Just standing) [] [] Nothing Nothing)
+    pure (Seen [] [] 1 (Just roots) (Just standing) [] [] Nothing Nothing Nothing)
   where
     quiet = recordingLogger (\_ → pure ())
 
@@ -363,7 +378,7 @@ runFrameless backend journal = do
     tickets ← mapM (\ticket → awaitTicket ticket deadline) [firstTicket, snd second]
     note journal ("the tickets answered " <> tshow tickets)
     roots ← atomically (readVulkanRoots (vulkanController vulkan))
-    pure (Seen [firstOn, fst second] ["recorded an initializing frame-less batch", "recorded a second frame-less batch"] 0 (Just roots) Nothing tickets [] Nothing Nothing)
+    pure (Seen [firstOn, fst second] ["recorded an initializing frame-less batch", "recorded a second frame-less batch"] 0 (Just roots) Nothing tickets [] Nothing Nothing Nothing)
   where
     deadline = either (error . show) id (durationFromNanoseconds AllowZero 10000000000)
 
@@ -396,7 +411,7 @@ runOffscreen backend journal = do
       | ((format, _, _), ticket, reading) ← zip3 batches tickets readings
       ]
     roots ← atomically (readVulkanRoots (vulkanController vulkan))
-    pure (Seen [renderedOn, readOn] ["rendered and copied both targets", "read both readbacks"] 0 (Just roots) Nothing tickets shots Nothing Nothing)
+    pure (Seen [renderedOn, readOn] ["rendered and copied both targets", "read both readbacks"] 0 (Just roots) Nothing tickets shots Nothing Nothing Nothing)
   where
     deadline = either (error . show) id (durationFromNanoseconds AllowZero 10000000000)
     pixelAt bytes (x, y) = ByteString.unpack (ByteString.take 4 (ByteString.drop ((y * offscreenSide + x) * 4) bytes))
@@ -425,7 +440,7 @@ runDrawing backend journal = do
     note journal ("the readback is at " <> Text.pack path)
     let shot = Shot Rgba8Srgb waited [(point, pixelAt bytes point) | point ← drawingProbes] path
     roots ← atomically (readVulkanRoots (vulkanController vulkan))
-    pure (Seen [drawnOn, readOn] ["drew the quad and copied the target", "read the readback"] 0 (Just roots) Nothing [waited] [shot] Nothing Nothing)
+    pure (Seen [drawnOn, readOn] ["drew the quad and copied the target", "read the readback"] 0 (Just roots) Nothing [waited] [shot] Nothing Nothing Nothing)
   where
     deadline = either (error . show) id (durationFromNanoseconds AllowZero 10000000000)
     pixelAt bytes (x, y) = ByteString.unpack (ByteString.take 4 (ByteString.drop ((y * offscreenSide + x) * 4) bytes))
@@ -499,6 +514,7 @@ runUploads backend journal = do
             [waited]
             [shot]
             (Just facts)
+            Nothing
             Nothing
         )
   where
@@ -965,6 +981,7 @@ runTable backend journal = do
             shots
             Nothing
             (Just facts)
+            Nothing
         )
   where
     deadline = either (error . show) id (durationFromNanoseconds AllowZero 30000000000)
@@ -1084,6 +1101,99 @@ expectedTableProbes =
   ]
   where
     transparent = [0, 0, 0, 0]
+
+-- | The sprites case (GRS-8): the sprites sample's window-free evidence over
+-- this suite's surface-free session — the sample's own scene, renderer,
+-- oracle, PNG and probe record ("Hetoimasia.Sample.Sprites.Evidence") — with
+-- the files written under the validation runner's evidence directory when it
+-- names one, and otherwise into a directory of their own that is kept and
+-- reported.
+runSprites ∷ Maybe Backend → Journal → IO SurfaceFreeOutcome
+runSprites backend journal = do
+  heading journal "GRS-8: a surface-free session draws the sprites sample's scene of instanced textured quads through texture handles with premultiplied-alpha blending, checks every probe against the independent oracle, and writes a lossless PNG and a probe record"
+  directory ← spritesDirectory
+  note journal ("the sprites evidence is written into " <> Text.pack directory)
+  runCaseWith
+    (\config → config {vulkanUploads = Just uploadConfig})
+    backend
+    defaultBudgetRequest {requestedBytes = 2 * 1024 * 1024 * 1024}
+    []
+    "vulkan-native-grs8-sprites"
+    $ \vulkan _ _ _ → do
+      outcome ← runEvidence (spritesHost vulkan) directory
+      note journal ("sprites capture: " <> maybe "not written" Text.pack (evidencePng outcome) <> "; probe record: " <> Text.pack (evidenceRecord outcome))
+      mapM_ (\failure → note journal ("sprites evidence failed: " <> failure)) (evidenceFailure outcome)
+      roots ← atomically (readVulkanRoots (vulkanController vulkan))
+      pure (Seen [] ["ran the sprites evidence"] 0 (Just roots) Nothing [] [] Nothing Nothing (Just outcome))
+  where
+    spritesDirectory =
+      lookupEnv "HETOIMASIA_VALIDATION_EVIDENCE" >>= \case
+        Just evidence | not (null evidence) → pure (evidence </> "sprites")
+        _ → do
+          temporary ← getTemporaryDirectory
+          stamp ← (round . (* 1000) . utcTimeToPOSIXSeconds ∷ UTCTime → Integer) <$> getCurrentTime
+          pure (temporary </> ("hetoimasia-sprites-" <> show stamp))
+
+-- | The sprites evidence's host over this suite's session: owner-thread
+-- actions over its constructions, uploads admitted from the main thread and
+-- waited for, and batches waited for, each wait bounded by a deadline.
+spritesHost ∷ VulkanHost () → Host
+spritesHost vulkan =
+  Host
+    { hostAct = \what body → acting what (VulkanAction (body . spritesBuilders))
+    , hostRecord = \what body →
+        acting
+          what
+          ( VulkanAction
+              ( \construction →
+                  body (spritesBuilders construction) >>= \case
+                    Left refusal → pure (Left refusal)
+                    Right recording →
+                      constructFramelessBatch construction recording >>= \case
+                        Left refusal → pure (Left refusal)
+                        Right (_, Left refusal) → pure (Left refusal)
+                        Right (ticket, Right ()) → pure (Right ticket)
+              )
+          )
+    , hostUpload = \request →
+        submitVulkanUpload vulkan request >>= \case
+          Left refusal → pure (Left (tshow refusal))
+          Right ticket →
+            awaitUploadTicket ticket deadline >>= \case
+              Right UploadComplete → pure (Right ())
+              other → pure (Left (tshow other))
+    , hostAwait = \ticket →
+        awaitTicket ticket deadline >>= \case
+          Right TicketComplete → pure (Right ())
+          other → pure (Left (tshow other))
+    , hostReadTable = acting "reading the texture table" (VulkanAction (fmap Right . readConstructedTable))
+    , hostRead = \readback → acting "reading the readback" (VulkanAction (\construction → readConstructedReadback construction readback 0 spritesTargetBytes))
+    }
+  where
+    deadline = either (error . show) id (durationFromNanoseconds AllowZero 30000000000)
+    acting ∷ Text → VulkanAction (Either Refusal a) → IO (Either Text a)
+    acting what action =
+      atomically (submitVulkanAction vulkan action) >>= \case
+        Left refusal → pure (Left (what <> " was refused: " <> tshow refusal))
+        Right ticket →
+          atomically (awaitVulkanAction ticket) >>= \case
+            ActionReturned (Right value) → pure (Right value)
+            ActionReturned (Left refusal) → pure (Left (what <> " was refused: " <> tshow refusal))
+            ActionRaised failure → pure (Left (what <> " raised: " <> tshow failure))
+            ActionRefused refusal → pure (Left (what <> " was refused before it ran: " <> tshow refusal))
+
+-- | The sample's constructions, from the host's.
+spritesBuilders ∷ Construction q inst msgr phys dev cmd → Builders q inst msgr phys dev cmd
+spritesBuilders construction =
+  Builders
+    { buildRing = constructRing construction
+    , buildTable = constructTextureTable construction
+    , buildImage = constructImage construction
+    , buildTableLayout = constructTablePipelineLayout construction
+    , buildPipeline = constructBlendedCheckedPipeline construction
+    , buildReadback = constructReadback construction
+    , registerImage = registerConstructedTexture construction
+    }
 
 -- | Run the commands in order, stopping at the first refusal.
 inOrder ∷ [IO (Either Refusal ())] → IO (Either Refusal ())
@@ -1236,6 +1346,7 @@ runCaseWith adjust backend request windows label body = do
               , factsSeconds = realToFrac (diffUTCTime finished started)
               , factsUploads = seenUploads seen
               , factsTable = seenTable seen
+              , factsSprites = seenSprites seen
               }
   where
     -- Every call's name, as it returns, where a transaction can wait for it.
@@ -1533,6 +1644,58 @@ tableSpec outcome = describe "GRS-7 the bindless texture table in a surface-free
       RefusedStaleHandle _ → True
       _ → False
 
+spritesSection ∷ SurfaceFreeOutcome → [Text]
+spritesSection outcome =
+  section "A surface-free session drawing the sprites sample's evidence scene" outcome
+    <> case outcome of
+      SurfaceFreeRecorded facts → case factsSprites facts of
+        Nothing → ["- no sprites evidence"]
+        Just evidence →
+          [ "- capture: " <> maybe "not written" Text.pack (evidencePng evidence) <> "; probe record: " <> Text.pack (evidenceRecord evidence)
+          , "- BC7: " <> maybe "not reached" (\drawn → if drawn then "supported and drawn" else "not supported by the device, as it reports; skipped") (evidenceBc7 evidence)
+          , "- readback bytes: " <> tshow (evidenceReadback evidence)
+          , "- failure: " <> fromMaybe "none" (evidenceFailure evidence)
+          ]
+            <> [ "- " <> (if resultPassed result then "pass " else "FAIL ") <> probeName (resultProbe result) <> ": observed " <> tshow (resultObserved result) <> ", expected " <> tshow (resultExpected result)
+               | result ← evidenceProbes evidence
+               ]
+      SurfaceFreeFailed _ → []
+
+spritesSpec ∷ SurfaceFreeOutcome → Spec
+spritesSpec outcome = describe "GRS-8 the sprites sample's window-free evidence" $ do
+  it "opened no window, created no surface and acquired no image" $
+    on outcome $ \facts → do
+      factsWindows facts `shouldBe` 0
+      callNames facts `shouldSatisfy` notElem "glfwCreateWindowSurface"
+      callNames facts `shouldSatisfy` notElem "vkAcquireNextImageKHR"
+      deviceFirst facts
+
+  it "rendered the scene and read back the whole target once its batch had completed, every probe passing the independent oracle — the BC7 fixture's only where the device takes BC7" $
+    on outcome $ \facts → case factsSprites facts of
+      Nothing → expectationFailure "no sprites evidence"
+      Just evidence → do
+        evidenceFailure evidence `shouldBe` Nothing
+        evidenceReadback evidence `shouldBe` fromIntegral spritesTargetBytes
+        [probeName (resultProbe result) | result ← evidenceProbes evidence, not (resultPassed result)] `shouldBe` []
+        evidenceProbes evidence `shouldSatisfy` (not . null)
+        evidencePassed evidence `shouldBe` True
+
+  it "wrote the lossless PNG and the probe record where they are kept" $
+    on outcome $ \facts → case factsSprites facts of
+      Nothing → expectationFailure "no sprites evidence"
+      Just evidence → do
+        png ← maybe (pure False) doesFileExist (evidencePng evidence)
+        record ← doesFileExist (evidenceRecord evidence)
+        (png, record) `shouldBe` (True, True)
+
+  it "retired cleanly, with every Vulkan call on the owner's thread" $
+    on outcome $ \facts → do
+      callNames facts `shouldSatisfy` ordered ["vkDestroyDevice", "vkDestroyDebugUtilsMessengerEXT", "vkDestroyInstance"]
+      oneOwnerThread facts
+
+  it "reached a verdict after the last callback with no issue and no error, synchronization validation included" $
+    on outcome clean
+
 framelessSpec ∷ SurfaceFreeOutcome → Spec
 framelessSpec outcome = describe "GRS-12 frame-less batches in a surface-free session" $ do
   it "opened no window, created no surface and acquired no image" $
@@ -1660,3 +1823,6 @@ recordingLogger keep =
 
 tshow ∷ Show a ⇒ a → Text
 tshow = Text.pack . show
+
+spritesTargetBytes ∷ Natural
+spritesTargetBytes = Sprites.targetBytes

@@ -153,6 +153,7 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , constructPipelineWith
   , PushStage (..)
   , PushConstantRange (..)
+  , PipelineBlend (..)
   , InputRate (..)
   , VertexFormat (..)
   , VertexBinding (..)
@@ -171,6 +172,7 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , CheckedShaders (..)
   , constructPipelineLayoutFor
   , constructCheckedPipeline
+  , constructBlendedCheckedPipeline
   , replaceConstructedCheckedPipeline
 
     -- * The shared ring (GRS-4)
@@ -301,6 +303,7 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , constructRing
   , constructPipelineLayoutFor
   , constructCheckedPipeline
+  , constructBlendedCheckedPipeline
   , replaceConstructedCheckedPipeline
   , replaceConstructedPipeline
   , releaseConstructed
@@ -357,6 +360,7 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , IndexType (..)
   , InputRate (..)
   , PushConstantRange (..)
+  , PipelineBlend (..)
   , PushStage (..)
   , RingClaim
   , RingSize

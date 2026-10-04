@@ -258,6 +258,7 @@ module Hetoimasia.GPU.Vulkan.Native.Recording
   ( -- * The native layer
     RecordingOps (..)
   , PipelineRequest (..)
+  , PipelineBlend (..)
   , PipelineShaders (..)
   , ReadbackAllocation (..)
   , NativeCommand (..)
@@ -380,6 +381,7 @@ module Hetoimasia.GPU.Vulkan.Native.Recording
   , checkedRanges
   , createPipelineLayoutFor
   , createCheckedPipeline
+  , createBlendedCheckedPipeline
   , replaceCheckedPipeline
 
     -- * The shared ring (GRS-4)
@@ -450,6 +452,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Construction
   , checkedRanges
   , createPipelineLayoutFor
   , createCheckedPipeline
+  , createBlendedCheckedPipeline
   , replaceCheckedPipeline
   , releaseManaged
   , replacePipeline
@@ -507,6 +510,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   , kindFormats
   , NativeCommand (..)
   , PipelineRequest (..)
+  , PipelineBlend (..)
   , PipelineShaders (..)
   , ReadbackAllocation (..)
   , RecordingOps (..)
