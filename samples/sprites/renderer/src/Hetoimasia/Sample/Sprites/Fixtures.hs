@@ -19,6 +19,11 @@
 --   for the right two: weights 0 and 64, which reproduce the endpoints
 --   exactly. 'bc7Decoded' is that oracle, established independently of any
 --   device; the sample's suite decodes the bytes again to check it.
+-- * 'swappedAtlasFixture': the swap case's replacement for the atlas
+--   (GRS-9), of the same 8×8 linear RGBA8 layout — so every UV rectangle
+--   and the linear probe's sub-texel margin hold unchanged — with its
+--   regions' colours rotated: green upper-left, blue upper-right, yellow
+--   lower-left, red lower-right. Every region differs from the atlas's.
 module Hetoimasia.Sample.Sprites.Fixtures
   ( -- * Texels
     Rgba (..)
@@ -28,6 +33,7 @@ module Hetoimasia.Sample.Sprites.Fixtures
   , FixtureName (..)
   , fixture
   , atlasFixture
+  , swappedAtlasFixture
   , translucentFixture
   , bc7Fixture
   , bc7Block
@@ -86,6 +92,18 @@ atlasFixture = rgba8 Atlas 8 8 [[atlasTexel x y | x ← [0 .. 7]] | y ← [0 .. 
       (False, True) → Rgba 0 255 0 255
       (True, False) → Rgba 0 0 255 255
       (False, False) → Rgba 255 255 0 255
+
+-- | The swap case's replacement atlas: the atlas's layout, each region's
+-- colour rotated to the next.
+swappedAtlasFixture ∷ Fixture
+swappedAtlasFixture = rgba8 Atlas 8 8 [[swappedTexel x y | x ← [0 .. 7]] | y ← [0 .. 7]]
+  where
+    swappedTexel ∷ Int → Int → Rgba
+    swappedTexel x y = case (x < 4, y < 4) of
+      (True, True) → Rgba 0 255 0 255
+      (False, True) → Rgba 0 0 255 255
+      (True, False) → Rgba 255 255 0 255
+      (False, False) → Rgba 255 0 0 255
 
 translucentFixture ∷ Fixture
 translucentFixture = rgba8 Translucent 2 2 (replicate 2 [Rgba 128 0 0 128, Rgba 0 0 128 128])

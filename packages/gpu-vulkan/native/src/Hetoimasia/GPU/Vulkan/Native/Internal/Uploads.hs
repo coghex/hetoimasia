@@ -131,6 +131,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , NativeResource (..)
   , Recording (..)
   , Refusal (..)
+  , TableState (..)
   , TicketState (..)
   , modelEdit
   , owned
@@ -343,7 +344,9 @@ data UploadRefusal
   | UploadUnsupportedFormat !ImageFormat
     -- ^ BC7, on a device that cannot take it.
   | UploadMisuse !Misuse
-    -- ^ The target is another session's, no longer managed, or released.
+    -- ^ The target is another session's, no longer managed, or released; or
+    -- a pending texture swap's replacement (GRS-9), which the table holds
+    -- and only the upload the swap accepted fills.
   | UploadClosed
     -- ^ The owner's exit has begun: nothing more is admitted.
   | UploadSessionFailed !TerminalCause
@@ -423,6 +426,7 @@ admit uploads request = do
   managed ← readTVar (recordingManaged recording)
   uploading ← readTVar (recordingUploading recording)
   filled ← readTVar (recordingFilled recording)
+  swapping ← maybe Set.empty (Map.keysSet . tableSwapTickets) <$> readTVar (recordingTable recording)
   model ← readRootsModel roots
   let decided = do
         whenLeft (fmap UploadSessionFailed primary)
@@ -430,6 +434,10 @@ admit uploads request = do
         when (resourceSession target /= rootsSessionIdentity roots) (Left (UploadMisuse (ForeignIdentity ResourceIdentity)))
         record ← maybe (Left (UploadMisuse (StaleIdentity ResourceIdentity))) Right (Map.lookup target managed)
         unless (managedStanding record == ManagedLive) (Left (UploadMisuse (WrongPhase ResourceIdentity)))
+        -- A pending swap's replacement is the table's (GRS-9), filled only
+        -- by the upload the swap accepted: once that one is cancelled, no
+        -- other may fill it in its place.
+        when (Set.member target swapping) (Left (UploadMisuse (WrongPhase ResourceIdentity)))
         when (Set.member target uploading) (Left UploadAlreadyTargeted)
         (shape, indices) ← shapeOf (managedNative record)
         case shape of

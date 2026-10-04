@@ -53,6 +53,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , RingState (..)
   , destroyNative
   , editManaged
+  , failPendingSwaps
   , isAsynchronous
   , makeRecording
   , modelEdit
@@ -220,6 +221,10 @@ progress recording now = do
 -- remains. A batch still outstanding retains what it references.
 retireRecording ∷ Recording q inst msgr phys dev cmd → Instant → IO ()
 retireRecording recording now = owner recording $ do
+  -- A texture swap still pending can never take effect now (GRS-9): its
+  -- ticket fails here, if the host's retirement has not failed it already.
+  -- The replacement is released with every other live generation below.
+  atomically (failPendingSwaps recording)
   live ← Map.keys . Map.filter ((== ManagedLive) . managedStanding) <$> readTVarIO (recordingManaged recording)
   for_ live $ \resource → atomically $ do
     modelEdit roots (releaseResource resource)

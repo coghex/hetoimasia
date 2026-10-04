@@ -25,6 +25,19 @@
 -- bounds and generation check its lookup makes ('resolveHandle' states it) —
 -- reads the placeholder, never another texture or an unwritten descriptor.
 --
+-- = Swaps
+--
+-- 'swapTexture' asks a live handle to show a replacement texture, the image
+-- an admitted or completed upload fills (GRS-9). The handle keeps resolving
+-- to what it shows until that upload completes; the first version published
+-- after completion resolves it to the replacement, and the texture it
+-- replaced is released then, to be destroyed once no batch retains it, its
+-- slot reused once no live version maps it. A batch that took an earlier
+-- version keeps sampling the old texture through submission and completion.
+-- A second swap on the handle while one is pending supersedes it, and
+-- releasing the handle ends it; either releases the pending replacement,
+-- which is never shown. The 'SwapTicket' reports where a swap stands.
+--
 -- = Versions
 --
 -- A batch takes the current version when it first binds the table
@@ -71,6 +84,13 @@ module Hetoimasia.GPU.Vulkan.Native.TextureTable
   , RegistrationNotUndone (..)
   , releaseTexture
 
+    -- * Swaps (GRS-9)
+  , swapTexture
+  , SwapTicket
+  , SwapState (..)
+  , readSwapTicket
+  , failPendingSwaps
+
     -- * Pipelines and draws
   , textureTableDescriptors
   , createTablePipelineLayout
@@ -92,5 +112,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Table
   , refreshTextureTable
   , registerTexture
   , releaseTexture
+  , swapTexture
   )
+import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State (SwapState (..), SwapTicket, failPendingSwaps, readSwapTicket)
 import Hetoimasia.GPU.Vulkan.Native.Shader.Interface (textureTableDescriptors)
