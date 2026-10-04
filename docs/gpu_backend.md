@@ -2471,11 +2471,15 @@ native call and from any thread, where the swap stands.
   diagnostic failure is pending, no swap can take effect, since writing its
   descriptor is new work: each pending swap fails once its upload has
   settled, and a device loss is never reported as success. The session's
-  terminal behavior is unchanged. A host's retirement fails every swap still
-  pending first (`failPendingSwaps`, which touches no native object), before
-  any step that may raise or retain; the window integration's
-  `retireRendering` does so before it retires uploads and frame-less batches,
-  and `retireRecording` does so again for hosts of its own. So a session that
+  terminal behavior is unchanged. A host's teardown fails every swap still
+  pending (`failPendingSwaps`, which touches no native object) before any
+  step that may raise or retain, and again however it ends. The window
+  integration's owner ends only through its two teardown hooks, its
+  retirement and its destruction, and runs each with the swaps failed first
+  and again in a `finally` (`settlingSwaps`). So no failure in a surface's
+  discharge, an upload's or a frame-less batch's retirement, or the
+  recording's, can leave a ticket pending. `retireRecording` does the same
+  for hosts that retire the native layer themselves. So a session that
   fails before the table is next brought up to date, or an owner's exit,
   leaves no ticket pending, however the rest of the teardown ends.
 - **One upload.** Only the upload the swap accepted fills its replacement:
