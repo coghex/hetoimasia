@@ -42,6 +42,22 @@
 -- bound is free at once. A slot a texture is registered into was free, so no live
 -- version maps it: the descriptor written into it when its upload completes
 -- can be sampled by no recorded or pending batch.
+--
+-- = Swaps
+--
+-- 'swapTexture' asks a live handle to show a replacement texture (GRS-9): it
+-- reserves a free slot for the replacement and changes no mapping, so the
+-- handle keeps resolving to what it shows now — its own texture, or slot 0
+-- while that is still pending — until 'completeSwap'. Completion is a mapping
+-- change like any other: the next version published resolves the handle to
+-- the replacement's slot, and the old texture's slot retires exactly as a
+-- released texture's does. A handle holds at most one pending swap: a second
+-- supersedes the first, whose slot — never published, never written — is
+-- free at once, its replacement answered for the caller to release.
+-- 'cancelSwap' undoes a pending swap whose replacement failed, and
+-- 'releaseTexture' ends a pending swap with its handle, freeing its slot the
+-- same way. A completion for a handle released since is refused as stale,
+-- whatever generation now holds its index.
 module Hetoimasia.GPU.Model.TextureTable
   ( -- * Configuration
     TableConfig
@@ -66,6 +82,9 @@ module Hetoimasia.GPU.Model.TextureTable
   , completeTexture
   , releaseTexture
   , unregisterTexture
+  , swapTexture
+  , completeSwap
+  , cancelSwap
   , growTable
   , grownSlots
   , bindVersion
@@ -76,6 +95,8 @@ module Hetoimasia.GPU.Model.TextureTable
   , HandleStanding (..)
   , handleStanding
   , pendingTextures
+  , pendingSwaps
+  , pendingSwap
   , currentMapping
   , currentVersion
   , versionMapping
@@ -213,6 +234,9 @@ data TextureTable a = TextureTable
 data IndexState = IndexState
   { indexGeneration ∷ !Word32
   , indexHolder ∷ !(Maybe Holder)
+  , indexSwap ∷ !(Maybe Word32)
+    -- ^ The slot reserved for the live handle's pending replacement (GRS-9),
+    -- if a swap is pending; no version maps it.
   }
   deriving (Eq, Show)
 
@@ -262,6 +286,8 @@ data TableRefusal
   | TableAtCapacity
     -- ^ Backpressure: the table holds its cap and no slot is free, until a
     -- released texture's slot is reclaimed.
+  | TableNoSwap !TextureHandle
+    -- ^ The live handle has no pending swap to complete or cancel.
   deriving (Eq, Show)
 
 -- | Register one texture: reserve a free index and a free slot, and answer
@@ -274,7 +300,7 @@ registerTexture kept table = case (Set.lookupMin (tableFree table), freeIndex) o
         handle = TextureHandle index generation
      in Right
           ( table
-              { tableIndices = Map.insert index (IndexState generation (Just (HolderPending slot))) (tableIndices table)
+              { tableIndices = Map.insert index (IndexState generation (Just (HolderPending slot)) Nothing) (tableIndices table)
               , tableFree = Set.delete slot (tableFree table)
               , tableTextures = Map.insert slot kept (tableTextures table)
               , tableDirty = True
@@ -316,15 +342,20 @@ completeTexture handle table = do
 -- | End a handle: its index holds no texture from now on, and may be issued
 -- again under the next generation; its slot retires, and is free once no
 -- live version maps it ('reclaimSlots'). A stale handle is refused.
+--
+-- A swap still pending ends with it: its replacement's slot, which no
+-- version maps, is free at once, and what was kept for it is the caller's to
+-- release ('pendingSwap' names it beforehand). No completion can publish it.
 releaseTexture ∷ TextureHandle → TextureTable a → Either TableRefusal (TextureTable a)
 releaseTexture handle table = do
   (index, holder) ← live handle table
   let slot = holderSlot holder
+      withoutSwap = dropSwap index table
   Right
-    table
-      { tableIndices = Map.adjust (\state → state {indexHolder = Nothing}) index (tableIndices table)
-      , tableTextures = Map.delete slot (tableTextures table)
-      , tableRetiring = maybe id (Map.insert slot) (Map.lookup slot (tableTextures table)) (tableRetiring table)
+    withoutSwap
+      { tableIndices = Map.adjust (\state → state {indexHolder = Nothing}) index (tableIndices withoutSwap)
+      , tableTextures = Map.delete slot (tableTextures withoutSwap)
+      , tableRetiring = maybe id (Map.insert slot) (Map.lookup slot (tableTextures withoutSwap)) (tableRetiring withoutSwap)
       , tableDirty = True
       }
 
@@ -345,12 +376,84 @@ unregisterTexture handle table = do
     else
       Right
         table
-          { tableIndices = Map.adjust (\state → state {indexHolder = Nothing}) index (tableIndices table)
+          { tableIndices = Map.adjust (\state → state {indexHolder = Nothing, indexSwap = Nothing}) index (tableIndices table)
           , tableTextures = Map.delete slot (tableTextures table)
           , tableFree = Set.insert slot (tableFree table)
           , tableWritten = Set.delete slot (tableWritten table)
           , tableDirty = True
           }
+
+-- | Ask a live handle to show a replacement (GRS-9), keeping this for it:
+-- reserve a free slot for the replacement, which no version maps until
+-- 'completeSwap'. No mapping changes, so the handle keeps resolving to what
+-- it shows now. A swap already pending on the handle is superseded first:
+-- its slot is free at once, and what was kept for it is answered, for the
+-- caller to release; it is never shown. Refused, changing nothing: a stale
+-- handle, and 'TableFull' when no slot is free — the caller may grow the
+-- table and ask again.
+swapTexture ∷ TextureHandle → a → TextureTable a → Either TableRefusal (TextureTable a, Maybe a)
+swapTexture handle kept table = do
+  (index, _) ← live handle table
+  let superseded = Map.lookup index (tableIndices table) >>= indexSwap >>= \slot → Map.lookup slot (tableTextures table)
+      cleared = dropSwap index table
+  case Set.lookupMin (tableFree cleared) of
+    Nothing → Left TableFull
+    Just slot →
+      Right
+        ( cleared
+            { tableIndices = Map.adjust (\state → state {indexSwap = Just slot}) index (tableIndices cleared)
+            , tableFree = Set.delete slot (tableFree cleared)
+            , tableTextures = Map.insert slot kept (tableTextures cleared)
+            }
+        , superseded
+        )
+
+-- | The handle's pending replacement finished its upload: the handle shows
+-- it from the next version published on. Answer its slot and what was kept
+-- for it, so its descriptor can be written there first — nothing live maps
+-- that slot — and what was kept for the texture it replaces, whose slot
+-- retires as a released texture's does: free once no live version maps it.
+-- Refused: a stale handle, and one with no pending swap ('TableNoSwap').
+completeSwap ∷ TextureHandle → TextureTable a → Either TableRefusal (TextureTable a, (Word32, a, Maybe a))
+completeSwap handle table = do
+  (index, holder) ← live handle table
+  slot ← maybe (Left (TableNoSwap handle)) Right (Map.lookup index (tableIndices table) >>= indexSwap)
+  kept ← maybe (Left (TableNoSwap handle)) Right (Map.lookup slot (tableTextures table))
+  let old = holderSlot holder
+      replaced = Map.lookup old (tableTextures table)
+  Right
+    ( table
+        { tableIndices = Map.adjust (\state → state {indexHolder = Just (HolderReady slot), indexSwap = Nothing}) index (tableIndices table)
+        , tableTextures = Map.delete old (tableTextures table)
+        , tableRetiring = maybe id (Map.insert old) replaced (tableRetiring table)
+        , tableWritten = Set.insert slot (tableWritten table)
+        , tableDirty = True
+        }
+    , (slot, kept, replaced)
+    )
+
+-- | Undo the handle's pending swap, whose replacement will never complete:
+-- its slot is free at once, and what was kept for it is answered, for the
+-- caller to release. The handle keeps what it shows; no mapping changes.
+-- Refused: a stale handle, and one with no pending swap ('TableNoSwap').
+cancelSwap ∷ TextureHandle → TextureTable a → Either TableRefusal (TextureTable a, a)
+cancelSwap handle table = do
+  (index, _) ← live handle table
+  slot ← maybe (Left (TableNoSwap handle)) Right (Map.lookup index (tableIndices table) >>= indexSwap)
+  kept ← maybe (Left (TableNoSwap handle)) Right (Map.lookup slot (tableTextures table))
+  Right (dropSwap index table, kept)
+
+-- | End the pending swap at this index, if any: its slot, never published
+-- and never written, is free at once, with nothing kept for it.
+dropSwap ∷ Word32 → TextureTable a → TextureTable a
+dropSwap index table = case Map.lookup index (tableIndices table) >>= indexSwap of
+  Nothing → table
+  Just slot →
+    table
+      { tableIndices = Map.adjust (\state → state {indexSwap = Nothing}) index (tableIndices table)
+      , tableTextures = Map.delete slot (tableTextures table)
+      , tableFree = Set.insert slot (tableFree table)
+      }
 
 -- | Grow the table (GRS-14): double the slots its current set holds, never
 -- past the cap, and add the new slots to the free ones, answering the new
@@ -386,7 +489,7 @@ grownSlots allocated cap = fromInteger (min (toInteger cap) (2 * toInteger alloc
 -- | The index and holder of a live handle, or its refusal.
 live ∷ TextureHandle → TextureTable a → Either TableRefusal (Word32, Holder)
 live handle table = case Map.lookup (handleIndex handle) (tableIndices table) of
-  Just (IndexState generation (Just holder))
+  Just (IndexState generation (Just holder) _)
     | generation == handleGeneration handle → Right (handleIndex handle, holder)
   _ → Left (TableStaleHandle handle)
 
@@ -471,9 +574,27 @@ handleStanding handle table = case live handle table of
 pendingTextures ∷ TextureTable a → [(TextureHandle, a)]
 pendingTextures table =
   [ (TextureHandle index generation, kept)
-  | (index, IndexState generation (Just (HolderPending slot))) ← Map.toList (tableIndices table)
+  | (index, IndexState generation (Just (HolderPending slot)) _) ← Map.toList (tableIndices table)
   , Just kept ← [Map.lookup slot (tableTextures table)]
   ]
+
+-- | Every live handle with a pending swap, with what was kept for its
+-- replacement, in index order.
+pendingSwaps ∷ TextureTable a → [(TextureHandle, a)]
+pendingSwaps table =
+  [ (TextureHandle index generation, kept)
+  | (index, IndexState generation (Just _) (Just slot)) ← Map.toList (tableIndices table)
+  , Just kept ← [Map.lookup slot (tableTextures table)]
+  ]
+
+-- | The live handle's pending replacement: its reserved slot, and what was
+-- kept for it. 'Nothing' for a stale handle or one with no pending swap.
+pendingSwap ∷ TextureHandle → TextureTable a → Maybe (Word32, a)
+pendingSwap handle table = case live handle table of
+  Left _ → Nothing
+  Right (index, _) → do
+    slot ← Map.lookup index (tableIndices table) >>= indexSwap
+    (,) slot <$> Map.lookup slot (tableTextures table)
 
 -- | The mapping a version published now would hold: every index a live
 -- handle holds, to its own slot once complete and to slot 0 until then, with
@@ -483,7 +604,7 @@ currentMapping ∷ TextureTable a → Map Word32 LookupEntry
 currentMapping table =
   Map.fromList
     [ (index, LookupEntry slot generation)
-    | (index, IndexState generation (Just holder)) ← Map.toList (tableIndices table)
+    | (index, IndexState generation (Just holder) _) ← Map.toList (tableIndices table)
     , let slot = case holder of
             HolderPending _ → 0
             HolderReady ready → ready
