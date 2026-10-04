@@ -1673,6 +1673,38 @@ the readback as a PNG to a temporary path its record prints.
 | The ring's regions | The recording | `claimRegion` adds one for its batch and reclaims completed batches' to make room; a discard, reset or completed slot's invalidation, and a storage's disposal, release a dropped batch's | The graphics owner | From the claim until its batch's submission completes or its invalidation returns | Kept through an invalidation that raised, an unknown effect and a device loss; never reissued |
 | The bound pipeline's interface, and the vertex and index data bound | The recorder (`Recorder`) | `bindPipeline` sets the pipeline; `bindVertexBuffer` and `bindIndexBuffer` set the bindings; `pushConstants`, `draw` and `drawIndexed` read them | The graphics owner | One consumer action | Dropped with the recorder |
 
+### Blending
+
+GRS-8 (#345) adds pipeline blending, with premultiplied alpha as its only mode.
+A `PipelineRequest` carries a `PipelineBlend`:
+
+- `BlendNone`: the output replaces the attachment's contents. Every pipeline
+  that declares nothing behaves this way, as before; `createPipeline`,
+  `createPipelineWith`, `createCheckedPipeline` and their replacements all
+  declare it.
+- `BlendPremultipliedAlpha`: additive blending of premultiplied colour, with
+  source factor `ONE`, destination factor `ONE_MINUS_SRC_ALPHA` and operation
+  `ADD`, for colour and alpha alike. The result is
+  `source + destination × (1 − source alpha)`.
+
+`createBlendedCheckedPipeline recording layout shaders format blend`, and the
+window integration's `constructBlendedCheckedPipeline`, make a pipeline from
+checked shaders with a declared blend. They are checked exactly as
+`createCheckedPipeline` is. The Vulkan layer builds the one colour attachment's
+blend state from the request (`colorBlendAttachment`): every channel is written
+in both modes, and only the premultiplied mode enables blending. No other blend
+mode exists; GRS-8 needs none.
+
+Proof:
+
+- The stand-in journals a pipeline's declared blend (`DeclaredBlend`). Its
+  examples check that the premultiplied mode reaches the native layer only for
+  a pipeline that asks for it, and that an unblended pipeline declares none.
+- `colorBlendAttachment` is checked for both modes, factor by factor.
+- The sprites sample's evidence (`grs8-sprites`, below) checks the composition
+  on the device. Red over blue and blue over red differ, and the expected
+  overlaps are computed from the blend equation.
+
 ### Checked shader interfaces
 
 GRS-16 (#341) checks every shader that reads anything from the host against a
@@ -4863,7 +4895,7 @@ companions — and adds the Vulkan owner's:
 | Main thread | Hspec runs on a thread of its own; the process main thread owns one shared production graphics session: `withLoaderIntegration`, then `runGraphicsOwnerApplication` over `withVulkanOwnerHost`, with the production native layer and surface bridge. An example that needs the main thread — to hand a window's surface over, which GLFW creates there, or to close a window — submits an operation (`onMain`); the main thread runs it between two turns of the host's owner loop and returns its result or rethrows its failure. Windows are created through the host's command port from the example's own thread, which the owner loop executes, as an application's worker would. |
 | Identities | Every dispatched operation is checked, before it runs, to be on the bound process main thread that entered the session — the Haskell thread, the bound flag, and the OS thread read through `pthread_self` — and a failed check fails the operation and the run. Every native call the session makes is recorded where it runs by a `NativeObserver`, so an example shows from the calls themselves that the instance, its messenger, the device and every surface's destruction ran on the graphics owner's thread and every surface's creation on the main thread — never from the name of an Hspec hook. |
 | Sharing | The roots — the instance, its explicit messenger, and the one device — are acquired lazily, by the first dispatched operation, at most once, and shared by every later example. Each example's windows and targets are its own and are closed inside it. |
-| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, `vk12-frames`, `vk13-presentation`, `vk14-recovery`, `vk15-validation-stop`, `vk15-retention`, `vk16-composed`, `vk17-one-slot`, `vk17-two-slots`, `vk19-capture`, `grs15-surface-free`, `grs15-surface-free-window`, `grs12-frameless`, `grs3-ordering`, `grs7-texture-table`, `synchronization-hazard`, `debug-names`, and, under the isolated compositor's consent only, `wayland-connection-loss`. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. Each child runs in a process group of its own under an external 20-second deadline covering its exit and the end of its output; one still running at it is terminated with its group and fails its example as expired. |
+| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, `vk12-frames`, `vk13-presentation`, `vk14-recovery`, `vk15-validation-stop`, `vk15-retention`, `vk16-composed`, `vk17-one-slot`, `vk17-two-slots`, `vk19-capture`, `grs15-surface-free`, `grs15-surface-free-window`, `grs12-frameless`, `grs3-ordering`, `grs7-texture-table`, `grs8-sprites`, `synchronization-hazard`, `debug-names`, and, under the isolated compositor's consent only, `wayland-connection-loss`. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. Each child runs in a process group of its own under an external 20-second deadline covering its exit and the end of its output; one still running at it is terminated with its group and fails its example as expired. |
 | Selection | Building, listing and filtering the tree, a `--dry-run`, and a selection that dispatches nothing acquire nothing and start no child. A selection matching no example fails. `--complete`, which the catalog group passes, runs the whole tree with Hspec's configuration reading left out and then fails unless the shared session was acquired once and every private scenario the run's consent requires ran and passed — every one, except that `wayland-connection-loss` is required under the isolated compositor's consent and pending under any other — so no ambient setting can turn the group's receipt into a pass for a subset. The consent rules and the migrated proof's pure release, construction, publication and loader-selection examples need no session and run without consent. |
 | Consent | Read once, at startup, from `HETOIMASIA_NATIVE_SESSION`, with the GLFW suite's rules for `desktop`, `isolated-x11:<display>` and `isolated-wayland:<socket>`: the last only on Linux, only when `WAYLAND_DISPLAY` names that socket, and never beside a `DISPLAY`. Under the Wayland consent every session requests Wayland by name — the shared host, each child's host, the VK-5 bridge's loader-aware session, and the proof shim's raw initialization, which sets `GLFW_PLATFORM` and fails one that selected another platform — so no X11 or XWayland session stands in; under the others every session requests nothing, as before. The first shared example asserts the platform GLFW selected before any example renders. Without consent every native example is refused before its body, the session is never acquired, and the run ends with the refusal on stderr and a non-zero exit. |
 | Environment | Before any Vulkan call, the suite clears every ambient discovery override and every validation-layer setting it finds and records which, disables implicit layers, and points the layer's settings file at an empty one; a child inherits and re-establishes the same environment. |
@@ -5176,6 +5208,26 @@ write-after-write at the third submission, but nothing for the depth target's
 load-op clear across submissions: for the depth target the case shows the
 barriers recorded and their layouts accepted, not a hazard the layer could
 have seen.
+
+GRS-8's case, `grs8-sprites`, runs the sprites sample's window-free evidence
+([samples/sprites/README.md](../samples/sprites/README.md)) over the same
+surface-free composition, with the session's uploads configured. It uses the
+sample's own scene, renderer, oracle, PNG writer and probe record, through a
+host record over this suite's session. The PNG and the probe record go beneath
+`HETOIMASIA_VALIDATION_EVIDENCE/sprites/` when the runner names an evidence
+directory, so the receipt lists them, and into a kept temporary directory the
+journal names otherwise.
+
+It passes only if all of these hold:
+
+- no window, surface or image acquisition was made, and the device came first;
+- the scene was rendered and the whole target read back after its batch
+  completed;
+- every probe passed the independent oracle, the BC7 fixture's only where the
+  device takes BC7;
+- both files were written;
+- the roots retired in order, with every Vulkan call on the owner's thread;
+- the verdict, with synchronization validation, is clean.
 
 GRS-12's case, `grs12-frameless`, runs the same surface-free composition with
 no window, under a 2 GiB byte budget, as VK-11's case does. One owner-thread
