@@ -157,7 +157,7 @@ the audited suite inventory, and which optional probes are local-only.
 | `test.macos-confinement` | `cabal test hetoimasia-scripting-lua:macos-confinement-probe --test-show-details=direct` | yes | no | any (component Darwin-only) |
 | `test.glfw-native` | `cabal test glfw-native-tests --test-show-details=direct` | no | no | any |
 | `test.glfw-wayland` | `cabal test glfw-native-tests --test-show-details=direct --test-option=--match --test-option=/GLFW native/on an isolated Wayland session/` | no | no | any |
-| `test.vulkan-headless` | `bash tools/vulkan/run.sh test hetoimasia-gpu-vulkan-native:test:native-tests hetoimasia-gpu-vulkan-native:test:shader-tests hetoimasia-gpu-vulkan-glfw:test:integration-tests hetoimasia-sample-triangle:test:triangle-tests` | no | no | any |
+| `test.vulkan-headless` | `bash tools/vulkan/run.sh test hetoimasia-gpu-vulkan-native:test:native-tests hetoimasia-gpu-vulkan-native:test:shader-tests hetoimasia-gpu-vulkan-glfw:test:integration-tests hetoimasia-sample-triangle:test:triangle-tests hetoimasia-sample-sprites:test:sprites-tests` | no | no | any |
 | `test.vulkan-native` | `bash tools/vulkan/run.sh native hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests -- --complete` | no | no | any |
 | `test.vulkan-wayland` | `bash tools/display/wayland.sh -- bash tools/vulkan/run.sh native hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests -- --complete` | no | no | any |
 
@@ -276,8 +276,10 @@ rather than only building them: the native backend's profile and roots decisions
 over a stand-in native layer (`native-tests`), its shader contract against the
 provisioned compiler (`shader-tests`, which regenerates the toolchain
 fingerprint first), the window integration's controller over the GLFW
-package's scripted seam (`integration-tests`), and the triangle sample's
-pipeline cache over stand-in builders (`triangle-tests`). Headless means that none of them
+package's scripted seam (`integration-tests`), the triangle sample's
+pipeline cache over stand-in builders (`triangle-tests`), and the sprites
+sample's scene, probe oracle, fixtures and PNG writer (`sprites-tests`).
+Headless means that none of them
 acquires a display, a GLFW session, or a device, and none reads desktop
 consent; the Vulkan headers and loader are build and link prerequisites and
 nothing more, which is why the group needs a provisioned worker and not a
@@ -287,7 +289,7 @@ command is [`tools/vulkan/run.sh`](../tools/vulkan/run.sh)'s test mode:
 ```bash
 bash tools/vulkan/run.sh test hetoimasia-gpu-vulkan-native:test:native-tests \
   hetoimasia-gpu-vulkan-native:test:shader-tests hetoimasia-gpu-vulkan-glfw:test:integration-tests \
-  hetoimasia-sample-triangle:test:triangle-tests
+  hetoimasia-sample-triangle:test:triangle-tests hetoimasia-sample-sprites:test:sprites-tests
 ```
 
 Its component is the integration suite, whose closure reaches the native
@@ -297,9 +299,9 @@ a `test/` source directory no single component's closure reaches, beside
 `cabal.project.vulkan`, `cabal.project.common`, `tools/native/`,
 `tools/ci-image/`, `tools/vulkan/`, `tools/toolchain/binding.pin`, and
 `tools/test-support/`, the test-only library the shader suite compiles its
-external clients through, and `samples/triangle/renderer/`, the triangle
-sample's drawing and its suite; the declared component's closure reaches
-neither. Later
+external clients through, and `samples/triangle/renderer/` and
+`samples/sprites/renderer/`, the samples' drawings and their suites; the
+declared component's closure reaches none of them. Later
 backend slices extend its coverage and inputs as their suites grow. It stays
 apart from `test.vulkan-native`'s measured native execution on purpose: these
 examples are deterministic, need no permission, and are never optional probes.
@@ -308,22 +310,23 @@ examples are deterministic, need no permission, and are never optional probes.
 ([docs/gpu_backend.md](gpu_backend.md#the-native-suite)): the package-native
 fixture's shared roots under the graphics owner, and the migrated VK-2, VK-5,
 VK-6 and VK-7 cases, VK-17's required profile over the triangle sample's
-drawing, and the synchronization-validation control in child processes of
-their own. It requires the `display` class, is mandatory outside
+drawing, the sprites sample's window-free evidence case (`grs8-sprites`, which
+writes its PNG and probe record beneath the group's evidence directory), and
+the synchronization-validation control in child processes of their own. It requires the `display` class, is mandatory outside
 the floor, and is the one group with a [preparation](#preparation-and-the-watchdog):
 
 ```json
 "command": ["bash", "tools/vulkan/run.sh", "native", "hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests", "--", "--complete"],
 "preparation": {
-  "command": ["bash", "tools/vulkan/run.sh", "build", "hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests", "hetoimasia-sample-triangle-app:exe:hetoimasia-triangle"],
+  "command": ["bash", "tools/vulkan/run.sh", "build", "hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests", "hetoimasia-sample-triangle-app:exe:hetoimasia-triangle", "hetoimasia-sample-sprites-app:exe:hetoimasia-sprites"],
   "timeout_seconds": 3600
 },
 "timeout_seconds": 30
 ```
 
-The preparation compiles the suite, and the triangle sample's executable
-beside it so a sample that no longer builds against the host fails the group;
-nothing runs the sample. The command builds nothing — it asks Cabal
+The preparation compiles the suite, and the triangle and sprites samples'
+executables beside it so a sample that no longer builds against the host fails
+the group; nothing runs either executable. The command builds nothing — it asks Cabal
 for the built executable and refuses one that was not prepared. `--complete`
 makes the receipt speak for the whole profile: the suite runs every example
 through Hspec's own primitives with the configuration-reading step left out, so

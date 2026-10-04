@@ -1361,6 +1361,18 @@ pull request.
 > at nearest-sampled texel centres and ±1 per channel where filtering or
 > blending contributes. The slice also adds premultiplied-alpha pipeline
 > blending, its first user.
+>
+> Owner decision at #345's revision: **per-draw sampler selection is
+> retained** under D-1 and D-22, and #343's contract is unchanged. The scene
+> uses separate draws for nearest and linear sampling, keeps painter order
+> across draws, and keeps one draw of at least 1,000 instances using one
+> sampler; instances carry no sampler index. As delivered (#345): a
+> 1,032-instance nearest-clamp draw over both RGBA8 fixtures, a separate
+> linear-clamp draw whose first instance overlaps the previous draw's last, and
+> a nearest-clamp BC7 draw where the device takes BC7. The linear probe samples
+> `u = 0.46875 + 1/8192`, whose filter weight every conformant sub-texel
+> precision quantizes to within 1/1024 of 0.25, so its ±1 tolerance holds on
+> any device. The evidence lives in `docs/evidence/gpu_2d/`.
 
 - **Outcome:** a fixture draws instanced textured quads from several slots
   and proves them by offscreen readback.
