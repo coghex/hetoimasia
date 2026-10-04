@@ -18,6 +18,7 @@
 module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Table
   ( createTextureTable
   , registerTexture
+  , swapTexture
   , releaseTexture
   , refreshTextureTable
   , createTablePipelineLayout
@@ -26,7 +27,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Table
   , RegistrationNotUndone (..)
   ) where
 
-import Control.Concurrent.STM (STM, atomically, readTVar, readTVarIO, writeTVar)
+import Control.Concurrent.STM (STM, atomically, newTVar, readTVar, readTVarIO, writeTVar)
 import Control.Exception (Exception, ExceptionWithContext (ExceptionWithContext), SomeException, displayException, fromException, mask, mask_, onException, rethrowIO, throwIO, try, tryWithContext)
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -41,6 +42,7 @@ import Data.Set (Set)
 import Data.Word (Word32, Word64)
 import Numeric.Natural (Natural)
 
+import Hetoimasia.GPU.Model (Initialization (Initialized), resourceInitialization)
 import Hetoimasia.GPU.Model.Budget (BudgetKind (TextureSlotBudget))
 import Hetoimasia.GPU.Model.Identity (IdentityKind (..), Misuse (..), ResourceId)
 import qualified Hetoimasia.GPU.Model.TextureTable as Book
@@ -77,6 +79,8 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , PipelineLayout (..)
   , Recording (..)
   , Refusal (..)
+  , SwapState (..)
+  , SwapTicket (..)
   , TableState (..)
   , checkpointed
   , isAsynchronous
@@ -87,7 +91,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
 import Hetoimasia.GPU.Vulkan.Native.Internal.Reclamation (failingAgain, recoverAllocation, withAllocationAttempt)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Uploads (UploadRequest (..), Uploads, submitUpload)
 import Hetoimasia.GPU.Vulkan.Native.Naming (NativeObjectKind (ObjectDescriptorSet), tableSetName)
-import Hetoimasia.GPU.Vulkan.Native.Roots (NativeFailure (FailedOutOfMemory), nameRootsObject, readRootsDevice, readRootsInstrumentation, rootsCall, rootsNativeFailure)
+import Hetoimasia.GPU.Vulkan.Native.Roots (NativeFailure (FailedOutOfMemory), nameRootsObject, readRootsDevice, readRootsInstrumentation, rootsCall, rootsNativeFailure, stateRootsModel)
 import Hetoimasia.GPU.Vulkan.Native.Shader.Interface (CheckedShaders)
 
 -- | Make the session's texture table from a validated configuration (D-11):
@@ -230,6 +234,7 @@ createTextureTable recording uploads config =
           , tablePlaceholder = placeholder
           , tablePlaceholderWritten = False
           , tableTextures = Set.empty
+          , tableSwapTickets = Map.empty
           }
     -- A set allocated from a pool the table made, named as the pool's set
     -- when the roots offer naming.
@@ -455,6 +460,83 @@ registerTexture recording (Image image) =
                     rethrowIO failure
       Right _ → pure (Left RefusedWrongKind)
 
+-- | Ask a live handle to show a replacement texture (GRS-9): the image an
+-- admitted upload (#342) is filling, or one whose upload completed. The
+-- table holds the replacement from now on, as it holds a registered image.
+-- Until the replacement's upload completes, the handle keeps resolving to
+-- what it shows now; in the first version published after completion it
+-- resolves to the replacement, whose descriptor is written first into a slot
+-- no live version maps, and the texture it replaced is released then — it is
+-- destroyed only once no batch retains it, and its slot reused only once no
+-- live version maps it. The replacement may differ from the old texture in
+-- format, extent and mip count.
+--
+-- A swap still pending on the handle is superseded: its replacement is
+-- released at once — an upload not yet started is cancelled, one copying
+-- finishes first — and never shown. The answered 'SwapTicket' reports where
+-- the swap stands; a replacement whose upload is cancelled or lost, or a
+-- session that fails first, leaves the handle on what it showed and reports
+-- 'SwapFailed'.
+--
+-- Refused, changing nothing — the mapping, a pending swap, and the
+-- replacement, which stays the caller's: a stale handle, as
+-- 'RefusedStaleHandle'; a session with no table; an image that is not this
+-- session's live texture; one the table already holds — registered, or
+-- another swap's replacement — as 'DuplicateSubject'; one no upload fills, as
+-- 'RefusedNotWritten'; and a full table at its cap, as
+-- 'RefusedBackpressure' 'TextureSlotBudget', until a released texture's slot
+-- is reclaimed. Below the cap, the table grows first (GRS-14). Like all new
+-- work, refused once the session has failed.
+swapTexture ∷ Recording q inst msgr phys dev cmd → Book.TextureHandle → Image → IO (Either Refusal SwapTicket)
+swapTexture recording handle (Image image) =
+  owned recording . checkpointed recording $
+    liveNative recording image >>= \case
+      Left refusal → pure (Left refusal)
+      Right (NativeImage description _ _)
+        | imageKind description /= TextureImage → pure (Left RefusedWrongKind)
+        | otherwise → do
+            let accept = atomically $ do
+                  model ← stateRootsModel roots (\held → (held, held))
+                  uploading ← Set.member image <$> readTVar (recordingUploading recording)
+                  readTVar (recordingTable recording) >>= \case
+                    Nothing → pure (Left (Just (RefusedIllegal "swapping a texture in a session that has made no texture table")))
+                    Just table
+                      | Set.member image (tableTextures table) → pure (Left (Just (RefusedMisuse (DuplicateSubject ResourceIdentity))))
+                      | not uploading && resourceInitialization image model /= Just Initialized →
+                          pure (Left (Just (RefusedNotWritten "no upload fills the replacement: admit one first, or name a texture whose upload completed")))
+                      | otherwise → case Book.swapTexture handle image (tableBook table) of
+                          Left Book.TableFull → pure (Left Nothing)
+                          Left _ → pure (Left (Just (RefusedStaleHandle handle)))
+                          Right (book, superseded) →
+                            -- The superseded replacement is released first:
+                            -- a refusal changes nothing.
+                            maybe (pure (Right ())) (releaseLive recording) superseded >>= \case
+                              Left refusal → pure (Left (Just refusal))
+                              Right () → do
+                                cell ← newTVar SwapPending
+                                for_ superseded $ \old → for_ (Map.lookup old (tableSwapTickets table)) (`writeTVar` SwapSuperseded)
+                                writeTVar
+                                  (recordingTable recording)
+                                  ( Just
+                                      table
+                                        { tableBook = book
+                                        , tableTextures = Set.insert image (maybe id Set.delete superseded (tableTextures table))
+                                        , tableSwapTickets = Map.insert image cell (maybe id Map.delete superseded (tableSwapTickets table))
+                                        }
+                                  )
+                                pure (Right (SwapTicket cell))
+            -- No free slot: the table grows at once, as for a registration.
+            accept >>= \case
+              Right ticket → pure (Right ticket)
+              Left (Just refusal) → pure (Left refusal)
+              Left Nothing →
+                growSet recording >>= \case
+                  Left refusal → pure (Left refusal)
+                  Right () → either (Left . fromMaybe (RefusedBackpressure TextureSlotBudget)) Right <$> accept
+      Right _ → pure (Left RefusedWrongKind)
+  where
+    roots = recordingRoots recording
+
 -- | Undo a registration whose handle was never handed out, answering
 -- whether it was undone.
 unregister ∷ Recording q inst msgr phys dev cmd → ResourceId → Book.TextureHandle → IO Bool
@@ -483,7 +565,10 @@ instance Exception RegistrationNotUndone
 -- index may be issued again under a new generation, and its slot retires.
 -- The image is released once no live version maps the slot — at once if the
 -- texture never completed, or once every batch that bound a version mapping
--- it has completed. A stale handle is 'RefusedStaleHandle'.
+-- it has completed. A swap still pending on the handle (GRS-9) ends with it:
+-- its replacement is released at once — an upload not yet started is
+-- cancelled, one copying finishes first — and never shown, and its ticket
+-- reports 'SwapAbandoned'. A stale handle is 'RefusedStaleHandle'.
 releaseTexture ∷ Recording q inst msgr phys dev cmd → Book.TextureHandle → IO (Either Refusal ())
 releaseTexture recording handle =
   owned recording $ do
@@ -492,7 +577,22 @@ releaseTexture recording handle =
         Nothing → pure (Left (RefusedStaleHandle handle))
         Just table → case Book.releaseTexture handle (tableBook table) of
           Left _ → pure (Left (RefusedStaleHandle handle))
-          Right book → Right () <$ writeTVar (recordingTable recording) (Just table {tableBook = book})
+          Right book → do
+            let pending = snd <$> Book.pendingSwap handle (tableBook table)
+            maybe (pure (Right ())) (releaseLive recording) pending >>= \case
+              Left refusal → pure (Left refusal)
+              Right () → do
+                for_ pending $ \replacement → for_ (Map.lookup replacement (tableSwapTickets table)) (`writeTVar` SwapAbandoned)
+                Right ()
+                  <$ writeTVar
+                    (recordingTable recording)
+                    ( Just
+                        table
+                          { tableBook = book
+                          , tableTextures = maybe id Set.delete pending (tableTextures table)
+                          , tableSwapTickets = maybe id Map.delete pending (tableSwapTickets table)
+                          }
+                    )
     case released of
       Left refusal → pure (Left refusal)
       Right () → refreshTable recording
@@ -561,6 +661,9 @@ data TableView = TableView
   , tableViewAllocated ∷ !Word32
     -- ^ How many slots the current set 0 holds, slot 0 included (GRS-14).
   , tableViewSets ∷ ![Word64]
+  , tableViewSwaps ∷ ![(Book.TextureHandle, Word32, ResourceId)]
+    -- ^ Each pending swap (GRS-9): the handle, its replacement's reserved
+    -- slot, and the replacement.
     -- ^ The current set 0, then set 1.
   }
   deriving (Eq, Show)
@@ -585,6 +688,7 @@ readTable recording =
           , tableViewVersions = tableVersions table
           , tableViewAllocated = Book.allocatedSlots book
           , tableViewSets = tableSets table
+          , tableViewSwaps = [(handle, slot, image) | (handle, _) ← Book.pendingSwaps book, Just (slot, image) ← [Book.pendingSwap handle book]]
           }
 
 roundUp ∷ Natural → Natural → Natural

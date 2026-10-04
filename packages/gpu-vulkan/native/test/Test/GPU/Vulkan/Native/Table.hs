@@ -818,6 +818,193 @@ spec = describe "Texture table" $ do
       ok (refreshTextureTable (rigRecording rig))
       standing rig first `shouldReturn` Just ManagedReleased
       clean rig
+
+  describe "swaps" $ do
+    it "publishes a swap to an already uploaded replacement in the next version and releases the old texture then, which a batch recorded before the swap and submitted after it keeps sampling: the old texture is destroyed, and its slot reused, only once that batch completes" $ do
+      (rig, uploads, kit) ← tableRig 4 2
+      old ← uploadedTexture rig uploads
+      replacement ← uploadedTexture rig uploads
+      later ← uploadedTexture rig uploads
+      handle ← registered rig old
+      oldView ← viewOf rig old
+      replacementView ← viewOf rig replacement
+      oldSlot ← resolvedNow rig handle
+      -- Recorded, then the swap requested, then submitted: the scope
+      -- submits once its body returns.
+      ticket ← withFramelessScope (rigFrames rig) $ \scope → do
+        _ ← recordFramelessIn scope $ \recorder → inPass kit recorder $ do
+          ok (bindTable recorder)
+          ok (selectSampler recorder 0)
+          ok (draw recorder 3 1)
+        swapped rig handle replacement
+      swapStanding ticket `shouldReturn` SwapPending
+      resolvedNow rig handle `shouldReturn` oldSlot
+      ok (refreshTextureTable (rigRecording rig))
+      swapStanding ticket `shouldReturn` SwapPublished
+      newSlot ← resolvedNow rig handle
+      newSlot `shouldSatisfy` (`notElem` [0, oldSlot])
+      imageWrites rig >>= (`shouldSatisfy` elem (newSlot, replacementView))
+      -- Released at publication, not destroyed: the earlier batch retains
+      -- the old texture, and its slot still retires.
+      standing rig old `shouldReturn` Just ManagedReleased
+      _ ← disposeResources (rigRecording rig) (at 1)
+      standing rig old `shouldReturn` Just ManagedReleased
+      Just afterSwap ← atomically (readTable (rigRecording rig))
+      tableViewRetiring afterSwap `shouldBe` [oldSlot]
+      -- A later batch binds a new version, which maps the replacement.
+      recordDrawing rig kit
+      calls ← recordingCalls (rigRecordingStandIn rig)
+      [offset | Recorded _ (CommandBindDescriptorSets _ _ [offset]) ← calls] `shouldBe` [0, 256]
+      writes ← imageWrites rig
+      [element | (element, view) ← writes, view == oldView] `shouldBe` [oldSlot]
+      [() | (element, _) ← writes, element == oldSlot] `shouldBe` [()]
+      -- Once the earlier batch completes, the old texture is destroyed and
+      -- its slot reused.
+      completed rig
+      ok (refreshTextureTable (rigRecording rig))
+      _ ← disposeResources (rigRecording rig) (at 2)
+      standing rig old `shouldReturn` Nothing
+      _ ← registered rig later
+      (final' <$> writtenSlots rig) `shouldReturn` oldSlot
+      clean rig
+
+    it "keeps a swapped handle on its current image — never the placeholder — until the replacement's upload completes, growing the table for the replacement's slot, and then publishes a replacement of another format, extent and mip count" $ do
+      (rig, uploads, kit) ← tableRigWith 16 2 2
+      old ← uploadedTexture rig uploads
+      handle ← registered rig old
+      oldSlot ← resolvedNow rig handle
+      (replacement, upload) ← queuedTexture rig uploads (ImageDescription TextureImage Rgba8Srgb 4 4 3) [ByteString.replicate 64 7, ByteString.replicate 16 7, ByteString.replicate 4 7]
+      ticket ← swapped rig handle replacement
+      -- No slot was free: the table grew for the replacement.
+      allocated rig `shouldReturn` 4
+      ok (refreshTextureTable (rigRecording rig))
+      swapStanding ticket `shouldReturn` SwapPending
+      resolvedNow rig handle `shouldReturn` oldSlot
+      Just pending ← atomically (readTable (rigRecording rig))
+      [(swappedHandle, image) | (swappedHandle, _, image) ← tableViewSwaps pending] `shouldBe` [(handle, managedResource replacement)]
+      recordDrawing rig kit
+      settle rig uploads
+      atomically (readUploadTicket upload) `shouldReturn` UploadComplete
+      ok (refreshTextureTable (rigRecording rig))
+      swapStanding ticket `shouldReturn` SwapPublished
+      resolvedNow rig handle >>= (`shouldSatisfy` (`notElem` [0, oldSlot]))
+      clean rig
+
+    it "supersedes a pending swap with a later one: a replacement whose upload had not started is cancelled and released, one whose upload had started is released and destroyed once it finishes, and neither is ever written or shown" $ do
+      (rig, uploads, _) ← tableRig 4 2
+      old ← uploadedTexture rig uploads
+      last' ← uploadedTexture rig uploads
+      handle ← registered rig old
+      oldSlot ← resolvedNow rig handle
+      (unstarted, unstartedUpload) ← queuedTexture rig uploads (ImageDescription TextureImage Rgba8Linear 2 2 1) [ByteString.replicate 16 1]
+      unstartedView ← viewOf rig unstarted
+      first ← swapped rig handle unstarted
+      (started, startedUpload) ← queuedTexture rig uploads (ImageDescription TextureImage Rgba8Linear 2 2 1) [ByteString.replicate 16 2]
+      startedView ← viewOf rig started
+      second ← swapped rig handle started
+      swapStanding first `shouldReturn` SwapSuperseded
+      standing rig unstarted `shouldReturn` Just ManagedReleased
+      -- The next turn cancels the released, unstarted upload and starts the
+      -- other, which then may not be cancelled.
+      _ ← progressUploads uploads >>= either (fail . show) pure
+      atomically (readUploadTicket unstartedUpload) `shouldReturn` UploadCancelled
+      atomically (readUploadTicket startedUpload) `shouldReturn` UploadUploading
+      third ← swapped rig handle last'
+      swapStanding second `shouldReturn` SwapSuperseded
+      standing rig started `shouldReturn` Just ManagedReleased
+      ok (refreshTextureTable (rigRecording rig))
+      swapStanding third `shouldReturn` SwapPublished
+      resolvedNow rig handle >>= (`shouldSatisfy` (`notElem` [0, oldSlot]))
+      -- The started upload finishes; then its target is destroyed with the
+      -- cancelled one, and neither was ever written.
+      settle rig uploads
+      atomically (readUploadTicket startedUpload) `shouldReturn` UploadComplete
+      ok (refreshTextureTable (rigRecording rig))
+      _ ← disposeResources (rigRecording rig) (at 1)
+      standing rig unstarted `shouldReturn` Nothing
+      standing rig started `shouldReturn` Nothing
+      writes ← imageWrites rig
+      [() | (_, view) ← writes, view `elem` [unstartedView, startedView]] `shouldBe` []
+      clean rig
+
+    it "ends a pending swap with its handle: the replacement is released, never written, and its upload's later completion publishes nothing, even once the handle's index is issued again" $ do
+      (rig, uploads, _) ← tableRig 4 2
+      old ← uploadedTexture rig uploads
+      next ← uploadedTexture rig uploads
+      handle ← registered rig old
+      (replacement, upload) ← queuedTexture rig uploads (ImageDescription TextureImage Rgba8Linear 2 2 1) [ByteString.replicate 16 3]
+      replacementView ← viewOf rig replacement
+      -- Started, so it cannot be cancelled.
+      _ ← progressUploads uploads >>= either (fail . show) pure
+      atomically (readUploadTicket upload) `shouldReturn` UploadUploading
+      ticket ← swapped rig handle replacement
+      ok (releaseTexture (rigRecording rig) handle)
+      swapStanding ticket `shouldReturn` SwapAbandoned
+      standing rig replacement `shouldReturn` Just ManagedReleased
+      reissued ← registered rig next
+      handleIndex reissued `shouldBe` handleIndex handle
+      settle rig uploads
+      atomically (readUploadTicket upload) `shouldReturn` UploadComplete
+      ok (refreshTextureTable (rigRecording rig))
+      swapStanding ticket `shouldReturn` SwapAbandoned
+      Just view ← atomically (readTable (rigRecording rig))
+      tableViewSwaps view `shouldBe` []
+      writes ← imageWrites rig
+      [() | (_, written) ← writes, written == replacementView] `shouldBe` []
+      _ ← disposeResources (rigRecording rig) (at 1)
+      standing rig replacement `shouldReturn` Nothing
+      clean rig
+
+    it "leaves the handle on its current image and reports the failure when the replacement's upload is cancelled, releasing the replacement; the handle then accepts another swap" $ do
+      (rig, uploads, _) ← tableRig 4 2
+      old ← uploadedTexture rig uploads
+      handle ← registered rig old
+      oldSlot ← resolvedNow rig handle
+      (replacement, upload) ← queuedTexture rig uploads (ImageDescription TextureImage Rgba8Linear 2 2 1) [ByteString.replicate 16 4]
+      ticket ← swapped rig handle replacement
+      atomically (cancelUpload uploads upload) >>= either (fail . show) pure
+      ok (refreshTextureTable (rigRecording rig))
+      swapStanding ticket `shouldReturn` SwapFailed
+      resolvedNow rig handle `shouldReturn` oldSlot
+      standing rig replacement `shouldReturn` Just ManagedReleased
+      Just view ← atomically (readTable (rigRecording rig))
+      tableViewSwaps view `shouldBe` []
+      again ← uploadedTexture rig uploads
+      retried ← swapped rig handle again
+      ok (refreshTextureTable (rigRecording rig))
+      swapStanding retried `shouldReturn` SwapPublished
+      clean rig
+
+    it "refuses a swap that cannot be made — a stale handle, an image the table already holds, one no upload fills, one that is no texture, and a table full at its cap — changing neither the mapping nor a pending swap, and leaving the image the caller's" $ do
+      -- Four slots, all the cap allows: slot 0, two textures and a pending
+      -- replacement.
+      (rig, uploads, _) ← tableRigWith 4 4 2
+      old ← uploadedTexture rig uploads
+      other ← uploadedTexture rig uploads
+      spare ← uploadedTexture rig uploads
+      handle ← registered rig old
+      otherHandle ← registered rig other
+      (pending, _) ← queuedTexture rig uploads (ImageDescription TextureImage Rgba8Linear 2 2 1) [ByteString.replicate 16 5]
+      _ ← swapped rig handle pending
+      Just before ← atomically (readTable (rigRecording rig))
+      fresh ← createImage (rigRecording rig) (ImageDescription TextureImage Rgba8Linear 2 2 1) >>= either (fail . show) pure
+      target ← createImage (rigRecording rig) (ImageDescription ColorTarget Rgba8Srgb 2 2 1) >>= either (fail . show) pure
+      swapTexture (rigRecording rig) (TextureHandle 9 1) spare `shouldReturn'` refused (RefusedStaleHandle (TextureHandle 9 1))
+      swapTexture (rigRecording rig) otherHandle old `shouldReturn'` refused (RefusedMisuse (DuplicateSubject ResourceIdentity))
+      swapTexture (rigRecording rig) otherHandle pending `shouldReturn'` refused (RefusedMisuse (DuplicateSubject ResourceIdentity))
+      swapTexture (rigRecording rig) otherHandle fresh `shouldReturn'` \case
+        Left (RefusedNotWritten _) → pure ()
+        _ → expectationFailure "expected RefusedNotWritten"
+      swapTexture (rigRecording rig) otherHandle target `shouldReturn'` refused RefusedWrongKind
+      swapTexture (rigRecording rig) otherHandle spare `shouldReturn'` refused (RefusedBackpressure TextureSlotBudget)
+      Just after ← atomically (readTable (rigRecording rig))
+      tableViewMapping after `shouldBe` tableViewMapping before
+      tableViewSwaps after `shouldBe` tableViewSwaps before
+      standing rig spare `shouldReturn` Just ManagedLive
+      -- The caller still owns it: releasing it directly is not refused.
+      ok (releaseManaged (rigRecording rig) spare)
+      clean rig
+
   where
     sessionFailed = \case
       Left (RefusedSessionFailed _) → True
@@ -1004,6 +1191,32 @@ destroyedPools rig = (\calls → [pool | DestroyedPool pool ← calls]) <$> reco
 -- | How many set 0 pools were asked for so far, made or not.
 poolAttempts ∷ Rig → IO Int
 poolAttempts rig = (\calls → length [() | CreatedPool _ (TexturePool _ _) ← calls]) <$> recordingCalls (rigRecordingStandIn rig)
+
+-- | Swap the handle's texture, requiring the swap's acceptance.
+swapped ∷ Rig → TextureHandle → Image → IO SwapTicket
+swapped rig handle texture = swapTexture (rigRecording rig) handle texture >>= either (fail . show) pure
+
+-- | Where a swap stands now.
+swapStanding ∷ SwapTicket → IO SwapState
+swapStanding = atomically . readSwapTicket
+
+-- | The slot a version published now would resolve the handle to.
+resolvedNow ∷ Rig → TextureHandle → IO Word32
+resolvedNow rig handle =
+  atomically (readTable (rigRecording rig)) <&> \case
+    Just view → resolveHandle maxBound (tableViewMapping view) handle
+    Nothing → 0
+
+-- | A texture of this description whose upload is admitted and not yet
+-- progressed, and the upload's ticket.
+queuedTexture ∷ Rig → Ups → ImageDescription → [ByteString.ByteString] → IO (Image, UploadTicket)
+queuedTexture rig uploads description levels = do
+  texture ← createImage (rigRecording rig) description >>= either (fail . show) pure
+  ticket ← submitUpload uploads (UploadImage texture levels) >>= either (fail . show) pure
+  pure (texture, ticket)
+
+final' ∷ [a] → a
+final' = head' . reverse
 
 head' ∷ [a] → a
 head' = \case

@@ -54,6 +54,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , NativeResource (..)
   , Recording (..)
   , Refusal (..)
+  , SwapState (..)
   , TableState (..)
   )
 import Hetoimasia.GPU.Vulkan.Native.Roots (Checkpoint (..), Roots, checkpointRoots, readRootsDevice, rootsCall, stateRootsModel)
@@ -80,12 +81,18 @@ encodeVersion entries mapping =
 -- | Bring the table up to date, on the graphics owner's thread: write slot
 -- 0's placeholder once its upload has completed; complete every registered
 -- texture whose upload has, writing its descriptor into its reserved slot;
--- and reclaim every retiring slot no live version maps, releasing its image.
--- A texture is complete once the model holds it initialized and no upload
--- holds it any longer, which is its upload's completion. A session with no
--- table has nothing to do. Once the session has failed, or while a
--- diagnostic failure is pending, no descriptor is written — that is new work
--- — but released textures are still reclaimed, which is cleanup.
+-- complete every pending swap whose replacement's upload has (GRS-9),
+-- writing the replacement's descriptor into its reserved slot and releasing
+-- the texture it replaces; end every pending swap whose replacement's upload
+-- ended without completing, releasing the replacement; and reclaim every
+-- retiring slot no live version maps, releasing its image unless a swap
+-- released it already. A texture is complete once the model holds it
+-- initialized and no upload holds it any longer, which is its upload's
+-- completion. A session with no table has nothing to do. Once the session
+-- has failed, or while a diagnostic failure is pending, no descriptor is
+-- written — that is new work — so no swap completes: each fails once its
+-- upload has settled. Released textures are still reclaimed, which is
+-- cleanup.
 refreshTable ∷ Recording q inst msgr phys dev cmd → IO (Either Refusal ())
 refreshTable recording =
   readTVarIO (recordingTable recording) >>= \case
@@ -99,10 +106,11 @@ refreshTable recording =
               CheckpointClear → True
               _ → False
           when clear (writeCompleted table device)
-          -- Slots no live version maps any longer, and their images released,
-          -- in one transaction: no cancellation can leave an image the table
-          -- has let go of unreleased, and a refusal leaves everything as it
-          -- was, still retiring for the next refresh.
+          -- Swaps whose replacements' uploads ended without completing, then
+          -- slots no live version maps any longer, and their images
+          -- released, in one transaction: no cancellation can leave an image
+          -- the table has let go of unreleased, and a refusal leaves
+          -- everything as it was, for the next refresh.
           atomically $
             ( do
                 held ← readTVar (recordingTable recording)
@@ -110,11 +118,31 @@ refreshTable recording =
                   Nothing → pure (Right ())
                   Just state → do
                     isHeld ← versionHeld roots state
-                    let (reclaimed, slots) = Book.reclaimSlots isHeld (tableBook state)
-                        images = map snd slots
+                    model ← stateRootsModel roots (\current' → (current', current'))
+                    uploading ← readTVar (recordingUploading recording)
+                    -- A replacement no upload holds any longer that is not
+                    -- initialized was cancelled or lost; once no descriptor
+                    -- may be written, none still pending can take effect.
+                    let ended (_, image) =
+                          not (Set.member image uploading)
+                            && (not clear || resourceInitialization image model /= Just Initialized)
+                        failed = filter ended (Book.pendingSwaps (tableBook state))
+                        cancelled = foldl (\book (handle, _) → either (const book) fst (Book.cancelSwap handle book)) (tableBook state) failed
+                        replacements = map snd failed
+                        (reclaimed, slots) = Book.reclaimSlots isHeld cancelled
+                        -- An image a swap released when it took effect is
+                        -- not released again.
+                        images = filter (`Set.member` tableTextures state) (map snd slots) <> replacements
+                    for_ replacements $ \image → for_ (Map.lookup image (tableSwapTickets state)) (`writeTVar` SwapFailed)
                     writeTVar
                       (recordingTable recording)
-                      (Just state {tableBook = reclaimed, tableTextures = foldr Set.delete (tableTextures state) images})
+                      ( Just
+                          state
+                            { tableBook = reclaimed
+                            , tableTextures = foldr Set.delete (tableTextures state) images
+                            , tableSwapTickets = foldr Map.delete (tableSwapTickets state) replacements
+                            }
+                      )
                     for_ images $ \image →
                       releaseLive recording image >>= \case
                         Left refusal → throwSTM (ReclaimRefused refusal)
@@ -145,6 +173,40 @@ refreshTable recording =
                   Right (completed, (slot, _)) → do
                     rootsCall roots "vkUpdateDescriptorSets" (opsWriteDescriptors ops device [WriteSampledImage (textureSet table) slot view])
                     atomically (modifyTVar' (recordingTable recording) (fmap (\held → held {tableBook = completed})))
+          -- Each pending swap whose replacement's upload completed (GRS-9):
+          -- its descriptor is written into its reserved slot, which no live
+          -- version maps, and the swap takes effect in the next version.
+          -- The texture it replaces is released now, in the same
+          -- transaction — destroyed once no batch retains it — and its slot
+          -- retires; a release the model refuses leaves it for the slot's
+          -- reclaim to release.
+          swaps ← Book.pendingSwaps . tableBook <$> current
+          for_ swaps $ \(handle, image) →
+            ready image >>= \case
+              Nothing → pure ()
+              Just view → do
+                book ← tableBook <$> current
+                case Book.completeSwap handle book of
+                  Left _ → pure ()
+                  Right (swapped, (slot, _, replaced)) → do
+                    rootsCall roots "vkUpdateDescriptorSets" (opsWriteDescriptors ops device [WriteSampledImage (textureSet table) slot view])
+                    atomically $
+                      readTVar (recordingTable recording) >>= \case
+                        Nothing → pure ()
+                        Just held → do
+                          released ← case replaced of
+                            Nothing → pure Nothing
+                            Just old → either (const Nothing) (const (Just old)) <$> releaseLive recording old
+                          for_ (Map.lookup image (tableSwapTickets held)) (`writeTVar` SwapPublished)
+                          writeTVar
+                            (recordingTable recording)
+                            ( Just
+                                held
+                                  { tableBook = swapped
+                                  , tableTextures = maybe id Set.delete released (tableTextures held)
+                                  , tableSwapTickets = Map.delete image (tableSwapTickets held)
+                                  }
+                            )
     current = maybe (fail "the texture table vanished") pure =<< readTVarIO (recordingTable recording)
     textureSet table = case tableSets table of
       set : _ → set

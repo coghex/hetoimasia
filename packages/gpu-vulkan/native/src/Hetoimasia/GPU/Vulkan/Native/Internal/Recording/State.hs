@@ -42,6 +42,9 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
 
     -- * The texture table (GRS-7)
   , TableState (..)
+  , SwapState (..)
+  , SwapTicket (..)
+  , readSwapTicket
 
     -- * The shared ring (GRS-4)
   , RingSize
@@ -333,9 +336,44 @@ data TableState = TableState
     -- ^ Whether slot 0's descriptor is written: until it is, the table is
     -- not bound.
   , tableTextures ∷ !(Set ResourceId)
-    -- ^ Every image a live handle or a retiring slot holds: none is released
-    -- but through the table.
+    -- ^ Every image a live handle, a pending swap or a retiring slot holds
+    -- and the table has not yet released: none is released but through the
+    -- table.
+  , tableSwapTickets ∷ !(Map ResourceId (TVar SwapState))
+    -- ^ Each pending swap's report, by its replacement image (GRS-9).
   }
+
+-- | Where an accepted texture swap stands (GRS-9). It only advances, from
+-- 'SwapPending' to exactly one of the others.
+data SwapState
+  = SwapPending
+    -- ^ Accepted: the handle still resolves to what it showed, until the
+    -- replacement's upload completes.
+  | SwapPublished
+    -- ^ The replacement's upload completed: every version published from
+    -- now on resolves the handle to it, and the texture it replaced is
+    -- released, to be destroyed once no batch retains it.
+  | SwapSuperseded
+    -- ^ A later swap on the handle replaced this one before it took effect:
+    -- the replacement was released and is never shown.
+  | SwapAbandoned
+    -- ^ The handle was released first: the replacement was released and is
+    -- never shown.
+  | SwapFailed
+    -- ^ The replacement's upload was cancelled or lost, or the session
+    -- failed, before it completed: the handle keeps what it showed, and the
+    -- replacement was released.
+  deriving (Eq, Show)
+
+-- | An accepted swap's report, read from any thread without a native call.
+newtype SwapTicket = SwapTicket (TVar SwapState)
+
+instance Show SwapTicket where
+  show _ = "SwapTicket"
+
+-- | Where the swap stands now. It never waits.
+readSwapTicket ∷ SwapTicket → STM SwapState
+readSwapTicket (SwapTicket cell) = readTVar cell
 
 -- | The recording's state, owned by the calling thread. The public
 -- constructor is "Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Disposal"'s
