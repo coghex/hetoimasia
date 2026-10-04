@@ -1951,7 +1951,8 @@ decides the request, in this order:
 1. The session must be running (`UploadSessionFailed` with its primary
    otherwise), and admission open (`UploadClosed` otherwise).
 2. The target must be this session's, still managed and not released
-   (`UploadMisuse`).
+   (`UploadMisuse`), and not a pending texture swap's replacement, which only
+   the upload the swap accepted fills (`UploadMisuse` `WrongPhase`; GRS-9).
 3. No other unsettled upload may write into it (`UploadAlreadyTargeted`).
 4. It must be a `TextureImage`, a `VertexBuffer` or an `IndexBuffer`
    (`UploadWrongKind`). A BC7 texture on a device without BC7 is
@@ -2336,7 +2337,8 @@ A handle released, of an older generation, or never issued is
 generation. An index no live handle holds reads as slot 0 with generation 0.
 
 - A new version is published only when a mapping has changed since the
-  current one: a texture completed, or a handle released. It is written into
+  current one: a texture completed, a handle released, or a swap took
+  effect. It is written into
   a ring entry that no batch holds and that is not the current version, then
   flushed when its memory is not coherent. The submission that follows makes
   the write visible to the device (D-26).
@@ -2355,6 +2357,7 @@ the only time a batch can still bind it. Descriptor writes therefore target
 only a slot that no recorded or pending batch can sample:
 
 - a slot just reserved for a registration, which was free;
+- a slot just reserved for a swap's replacement, which was free too;
 - slot 0 before the table is first bound.
 
 So a batch recorded before a texture is released or replaced still samples
@@ -2419,11 +2422,101 @@ The doubling (`grownSlots`) is computed wider than 32 bits, both for the
 growth and for the pool-limit check's generations, so a count past 2^31
 reaches the cap rather than wrapping.
 
+**Swaps.** GRS-9 (#346) lets a live handle show a replacement texture
+without changing the handle, for hot reload's GPU half (D-1, D-5, D-23,
+D-27). `swapTexture recording handle image` names the replacement: an image
+whose upload (#342) is admitted and not yet settled, or one whose upload
+completed. It answers a `SwapTicket`; `readSwapTicket` reports, without a
+native call and from any thread, where the swap stands.
+
+- **Acceptance.** The swap reserves a free slot for the replacement and
+  changes no mapping, so it publishes no version. From then on the table
+  holds the replacement, as it holds a registered texture: releasing it
+  directly is refused, and the caller releases nothing. With no slot free
+  the table grows first, as for a registration; at the cap the request is
+  backpressure.
+- **Taking effect.** Until the replacement's upload completes, the handle
+  keeps resolving to what it showed. That is its own texture once that
+  completed, never the placeholder. The refresh after completion writes the
+  replacement's descriptor into its reserved slot, which no live version
+  maps. The first version published after that resolves the handle to the
+  replacement, and the ticket reads `SwapPublished`. The replacement may
+  differ from the old texture in format, extent and mip count, among the
+  formats uploads support; keeping texture coordinates right for a changed
+  layout is the application's concern.
+- **Earlier batches.** A batch that took an earlier version keeps it, so it
+  samples the old texture through submission and completion, even when it
+  was recorded before the swap and submitted after it.
+- **Retiring the old texture.** The handle owns whichever texture it shows.
+  When the swap takes effect, the old texture is released in the model at
+  once, in the transaction that publishes the change. It is destroyed only
+  once every batch that retained it — each one that bound a version mapping
+  it — has completed or been discarded. Its slot retires as a released
+  texture's does and is reused only once no live version maps it; the
+  refresh that reclaims it does not release it again.
+- **Supersession.** A second swap on a handle whose first is still pending
+  supersedes it. The first replacement's slot, never published and never
+  written, is free at once. The replacement is released at once and never
+  shown: an upload not yet started is cancelled, and one already copying
+  finishes first, its target destroyed once it settles. Its ticket reads
+  `SwapSuperseded`.
+- **Release.** Releasing the handle ends a pending swap the same way, and its
+  ticket reads `SwapAbandoned`. A later completion of the replacement's
+  upload publishes nothing, even once the handle's index is issued again
+  under a new generation. Versions earlier batches hold keep their mappings.
+- **Failure.** A replacement whose upload is cancelled or lost — it is no
+  longer uploading and was never initialized — ends the swap at the next
+  refresh. The handle keeps what it showed, the replacement is released,
+  and the ticket reads `SwapFailed`. A session that fails ends every pending
+  swap at once: a failed session writes no descriptor, so no swap can take
+  effect, and a pending swap's ticket reads `SwapFailed` from the moment the
+  failure is latched (`readSwapTicket` consults the session's terminal
+  report), and the read stores it. That is before any drain, wait or
+  teardown step, however long a target's drain waits on a fence, and a
+  device loss is never reported as success. A ticket is settled once: every
+  write of it goes through `settleSwap`, which writes only a pending ticket
+  and writes `SwapFailed` once the session has failed, so a release,
+  supersession or refresh after a failure never reports anything else, and a
+  published swap stays published. The refresh's publication checks the
+  session's terminal report in the transaction that commits it, so a failure
+  latched during the replacement's descriptor write publishes nothing and
+  releases nothing. Settling the ticket is separate from releasing images, which
+  still waits for completion evidence. The session's terminal behavior is
+  unchanged. For an exit that is not a failure, the host's teardown fails
+  every pending swap (`failPendingSwaps`, touching no native object) before
+  any step that may raise or retain, and again however it ends: the window
+  integration runs its owner's two teardown hooks, its retirement and its
+  destruction, under `settlingSwaps`, and `retireRecording` does the same
+  for hosts that retire the native layer themselves.
+- **One upload.** Only the upload the swap accepted fills its replacement:
+  admission refuses any further upload into a pending swap's replacement
+  (`UploadMisuse` `WrongPhase`). A cancelled upload therefore fails the swap,
+  however the image is later uploaded into.
+
+`swapTexture` refuses, changing nothing — the mapping, a swap already
+pending on the handle, and the image, which stays the caller's:
+
+- a stale handle (`RefusedStaleHandle`);
+- an image that is not a live texture of this session, as registration
+  refuses it;
+- an image the table already holds — a registered texture, or another
+  swap's replacement — (`DuplicateSubject`);
+- an image no upload fills: not uploading, and not initialized
+  (`RefusedNotWritten`);
+- a full table at its cap (`RefusedBackpressure` `TextureSlotBudget`), until
+  a released texture's slot is reclaimed.
+
+Like all new work, a swap is refused once the session has failed.
+
 **Bringing it up to date.** `refreshTable` writes the placeholder once its
 upload completes and writes each newly complete texture into its slot. It
-then reclaims every retiring slot no live version maps, releasing its image.
-The reclamation, the images' removal from the table's holdings and their
-releases commit in one transaction. A cancellation therefore never strands
+then makes every swap whose replacement's upload completed take effect,
+writing the replacement into its slot and releasing the texture it replaces
+in one transaction. It ends every swap whose replacement's upload ended without
+completing, releasing the replacement. It then reclaims every retiring slot
+no live version maps, releasing its image unless a swap already released it.
+The failed swaps, the reclamation, the images' removal from the table's
+holdings and their releases commit in one transaction. A cancellation therefore never strands
 an image the table let go of, and a refused release rolls the reclamation
 back for the next refresh. Once the session has failed, or while a diagnostic failure is pending, it
 writes nothing, since that is new work. Reclamation still runs, since that
@@ -2602,6 +2695,7 @@ synchronization validation, reports nothing.
 | --- | --- | --- | --- | --- | --- |
 | The table's book: handles, generations, the slot map, the current version, the free and retiring slots | The recording (`recordingTable`, `tableBook`) | Registration, release, completion, binding and reclamation, all through the pure rules | The graphics owner; observers read it in STM | From `createTextureTable` until the recording retires | Never reset; the recording's retirement releases what it holds |
 | The samplers, set layouts, set 1's pool and sets | The recording, as managed generations the table names | Made once; bound by batches, which retain them | The graphics owner | Until `retireRecording` | Destroyed with every other managed resource, pools before set layouts before samplers |
+| Pending swaps (GRS-9) | The table: each handle's replacement slot in the bookkeeping, the replacement among the images it holds, and its ticket (`tableSwapTickets`) | `swapTexture` accepts one; the refresh completes or fails it; a later swap supersedes it; `releaseTexture` abandons it | The graphics owner; any thread reads a ticket | From acceptance until it takes effect, is superseded, is abandoned or fails | The replacement is released at once unless the swap took effect, when the replaced texture is released instead; a ticket keeps its final state for whoever holds it |
 | Set 0's generations and their pools | The recording (`tableTexturePool`, the current one; each older one only through the batches that hold it) | Construction makes the first; each growth makes the next, copies into it, makes it current and releases the previous one; each batch's first bind pins and retains the current one | The graphics owner | A generation from its making until it is superseded and no batch holds it; the current one until `retireRecording` | A superseded pool is destroyed, freeing its set, once no live batch holds it; the current one with every other managed resource |
 | The version ring's buffer and mapping | The recording, as a managed lookup buffer | The owner writes a version into an entry no batch holds; the device reads the entry a batch bound | The graphics owner | Until `retireRecording` | Destroyed with every other managed resource |
 | Each ring entry's version generation | The recording | Batches retain it through the model's holds; `versionHeld` reads them | The graphics owner | Until `retireRecording` | Destroyed with every other managed resource |
@@ -4962,7 +5056,7 @@ companions — and adds the Vulkan owner's:
 | Main thread | Hspec runs on a thread of its own; the process main thread owns one shared production graphics session: `withLoaderIntegration`, then `runGraphicsOwnerApplication` over `withVulkanOwnerHost`, with the production native layer and surface bridge. An example that needs the main thread — to hand a window's surface over, which GLFW creates there, or to close a window — submits an operation (`onMain`); the main thread runs it between two turns of the host's owner loop and returns its result or rethrows its failure. Windows are created through the host's command port from the example's own thread, which the owner loop executes, as an application's worker would. |
 | Identities | Every dispatched operation is checked, before it runs, to be on the bound process main thread that entered the session — the Haskell thread, the bound flag, and the OS thread read through `pthread_self` — and a failed check fails the operation and the run. Every native call the session makes is recorded where it runs by a `NativeObserver`, so an example shows from the calls themselves that the instance, its messenger, the device and every surface's destruction ran on the graphics owner's thread and every surface's creation on the main thread — never from the name of an Hspec hook. |
 | Sharing | The roots — the instance, its explicit messenger, and the one device — are acquired lazily, by the first dispatched operation, at most once, and shared by every later example. Each example's windows and targets are its own and are closed inside it. |
-| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, `vk12-frames`, `vk13-presentation`, `vk14-recovery`, `vk15-validation-stop`, `vk15-retention`, `vk16-composed`, `vk17-one-slot`, `vk17-two-slots`, `vk19-capture`, `grs15-surface-free`, `grs15-surface-free-window`, `grs12-frameless`, `grs3-ordering`, `grs7-texture-table`, `grs8-sprites`, `grs14-table-growth`, `synchronization-hazard`, `debug-names`, and, under the isolated compositor's consent only, `wayland-connection-loss`. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. Each child runs in a process group of its own under an external 20-second deadline covering its exit and the end of its output; one still running at it is terminated with its group and fails its example as expired. |
+| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, `vk12-frames`, `vk13-presentation`, `vk14-recovery`, `vk15-validation-stop`, `vk15-retention`, `vk16-composed`, `vk17-one-slot`, `vk17-two-slots`, `vk19-capture`, `grs15-surface-free`, `grs15-surface-free-window`, `grs12-frameless`, `grs3-ordering`, `grs7-texture-table`, `grs8-sprites`, `grs9-swap`, `grs14-table-growth`, `synchronization-hazard`, `debug-names`, and, under the isolated compositor's consent only, `wayland-connection-loss`. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. Each child runs in a process group of its own under an external 20-second deadline covering its exit and the end of its output; one still running at it is terminated with its group and fails its example as expired. |
 | Selection | Building, listing and filtering the tree, a `--dry-run`, and a selection that dispatches nothing acquire nothing and start no child. A selection matching no example fails. `--complete`, which the catalog group passes, runs the whole tree with Hspec's configuration reading left out and then fails unless the shared session was acquired once and every private scenario the run's consent requires ran and passed — every one, except that `wayland-connection-loss` is required under the isolated compositor's consent and pending under any other — so no ambient setting can turn the group's receipt into a pass for a subset. The consent rules and the migrated proof's pure release, construction, publication and loader-selection examples need no session and run without consent. |
 | Consent | Read once, at startup, from `HETOIMASIA_NATIVE_SESSION`, with the GLFW suite's rules for `desktop`, `isolated-x11:<display>` and `isolated-wayland:<socket>`: the last only on Linux, only when `WAYLAND_DISPLAY` names that socket, and never beside a `DISPLAY`. Under the Wayland consent every session requests Wayland by name — the shared host, each child's host, the VK-5 bridge's loader-aware session, and the proof shim's raw initialization, which sets `GLFW_PLATFORM` and fails one that selected another platform — so no X11 or XWayland session stands in; under the others every session requests nothing, as before. The first shared example asserts the platform GLFW selected before any example renders. Without consent every native example is refused before its body, the session is never acquired, and the run ends with the refusal on stderr and a non-zero exit. |
 | Environment | Before any Vulkan call, the suite clears every ambient discovery override and every validation-layer setting it finds and records which, disables implicit layers, and points the layer's settings file at an empty one; a child inherits and re-establishes the same environment. |
@@ -5301,6 +5395,38 @@ It passes only if all of these hold:
 - every pool was destroyed before the device, with every call on the owner's
   thread;
 - the verdict, with synchronization validation, is clean.
+
+GRS-9's case, `grs9-swap`, runs the sprites sample's swap case
+([samples/sprites/README.md](../samples/sprites/README.md)) over the same
+surface-free composition and host. It draws the sample's scene three times,
+each into a target of its own read back after completion:
+
+1. a frame before the swap;
+2. a frame recorded before the swap and submitted after it. After its
+   recording bound the table, the atlas's handle is swapped to a replacement
+   whose upload completed, of the atlas's layout with each region's colour
+   rotated, and a texture is registered; then the frame is submitted;
+3. a frame after the delayed frame completed, from the same instance data.
+
+A second texture is registered once the delayed frame has completed. It
+passes only if all of these hold:
+
+- no window, surface or image acquisition was made, and the device came
+  first;
+- the before and delayed captures pass every probe of the oracle over the
+  original fixtures, and the after capture every probe of the oracle with
+  the replacement drawn for the atlas;
+- the instance data was the same bytes before and after the swap, the swap
+  took effect (`SwapPublished`), and the replacement has a slot of its own;
+- while the delayed frame held the old version, the atlas's slot was
+  retiring and the texture registered then took another; the texture
+  registered once that frame completed took the atlas's slot;
+- the three PNGs and the record were written;
+- every call ran on the owner's thread, and the verdict, with
+  synchronization validation, is clean.
+
+The PNGs and the record go beneath `HETOIMASIA_VALIDATION_EVIDENCE/swap/`
+when the runner names an evidence directory.
 
 GRS-8's case, `grs8-sprites`, runs the sprites sample's window-free evidence
 ([samples/sprites/README.md](../samples/sprites/README.md)) over the same

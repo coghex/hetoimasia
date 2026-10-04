@@ -151,6 +151,24 @@ links to ghcup's versioned binaries (`ghc-9.14.1` and its siblings) first on
 that run's `PATH`, and refuses when they are not installed. The `workflow-tests` examples under
 `Quruntul adapter` check that it still agrees with the catalog.
 
+A suite counts as "changed since it last ran" when its identity differs from
+the one its last observation recorded. That identity covers the suite's
+sources (the adapter, the component's and group's declared inputs, and its
+selector options) and how the suite runs, as the catalog and
+`.github/workflows/validation.yml` decide it: its trial deadline (the group's
+`timeout_seconds`, held between 60 and 3600 seconds), its `preparation`
+command, its display (a Wayland compositor from the workflow or the group's own
+command, an isolated desktop display from a `display` runner, or none) and with
+it whether the suite needs the desktop, its launch path (direct or through
+`tools/vulkan/run.sh native`), its platforms, and whether it is a probe or a CI
+suite. A change to any of those for a group changes the identity of every
+suite derived from it, so `$test` runs the probe again however recently it last
+ran. Only the effective values count: a timeout edit that leaves the trial
+deadline where it was, or a routing edit that leaves the suite's kind, changes
+nothing, and neither does an edit to another group or to text the adapter does
+not read. `test.workflow` still reads the catalog and workflow as inputs, so
+any edit to them changes its own suite.
+
 - **`$test`** runs one due probe: never run, changed since it last ran, or last
   observed more than a week ago. It never runs a CI suite. `$test N` runs N in
   sequence (this replaces `$autotest`). Each run leaves a report whose
