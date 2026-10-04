@@ -212,6 +212,7 @@ cd "$root"
 fingerprints=(
   "packages/gpu-vulkan/native/shaders/toolchain.fingerprint"
   "samples/triangle/renderer/shaders/toolchain.fingerprint"
+  "samples/sprites/renderer/shaders/toolchain.fingerprint"
 )
 cleanup=""
 generate_fingerprint() {
@@ -270,6 +271,7 @@ root = sys.argv[1]
 roots = ["tools/vulkan", "tools/native", "tools/display",
          "packages/gpu-vulkan/native", "packages/gpu-vulkan/glfw", "packages/glfw",
          "samples/triangle/renderer", "samples/triangle/app",
+         "samples/sprites/renderer", "samples/sprites/app",
          "packages/gpu-vulkan/diagnostics", "packages/gpu-vulkan/model",
          "packages/runtime", "packages/foundation", "tools/test-support"]
 files = ["cabal.project.vulkan", "cabal.project.common",

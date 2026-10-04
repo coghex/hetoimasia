@@ -1,0 +1,49 @@
+cabal-version: 3.16
+name: hetoimasia-sample-sprites-app
+version: 0.1.0.0
+synopsis: The sprites sample's 2D scene through Hetoimasia's Vulkan host
+description:
+    GRS-8's sample executable, `hetoimasia-sprites`: the sprites sample's
+    drawing (`hetoimasia-sample-sprites`) handed to the window integration's
+    public host, either window-free — rendering the scene into an offscreen
+    target, checking it against its probe oracle and writing a PNG and a probe
+    record (`--evidence`) — or in one window until it is closed
+    (`--windowed`). It uses public interfaces only, nothing depends on it, and
+    it is launched explicitly: no routine check runs it.
+    .
+    It is selected only by `cabal.project.vulkan`, so neither `cabal.project`
+    nor `cabal.project.cpu` resolves the binding, the Vulkan headers or a
+    loader, and only `tools/vulkan/run.sh` builds it.
+license: GPL-3.0-only
+license-file: LICENSE
+author: Vincent Coghlan
+maintainer: Vincent Coghlan
+category: Game
+build-type: Simple
+tested-with: GHC ==9.14.1
+
+source-repository head
+    type: git
+    location: https://github.com/coghex/hetoimasia.git
+    subdir: samples/sprites/app
+
+executable hetoimasia-sprites
+    default-language: GHC2024
+    default-extensions: UnicodeSyntax OverloadedStrings
+    ghc-options: -Wall -Wcompat -Wincomplete-uni-patterns -Wincomplete-record-updates -threaded -rtsopts
+    main-is: Main.hs
+    hs-source-dirs: .
+    build-depends:
+        base >=4.22 && <4.23,
+        stm >=2.5.3 && <2.6,
+        text >=2.1 && <2.2,
+        hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-runtime ==0.1.0.0,
+        hetoimasia-glfw ==0.1.0.0,
+        hetoimasia-glfw:runtime-glfw ==0.1.0.0,
+        hetoimasia-glfw:vulkan-interop ==0.1.0.0,
+        hetoimasia-gpu-vulkan-model ==0.1.0.0,
+        hetoimasia-gpu-vulkan-diagnostics ==0.1.0.0,
+        hetoimasia-gpu-vulkan-native ==0.1.0.0,
+        hetoimasia-gpu-vulkan-glfw ==0.1.0.0,
+        hetoimasia-sample-sprites ==0.1.0.0

@@ -237,4 +237,8 @@ test-suite vulkan-native-tests
         -- the sample's drawing an input of `test.vulkan-native`. It depends on
         -- the native backend alone, so this is no cycle, and only this suite
         -- depends on it, never an engine library.
-        hetoimasia-sample-triangle ==0.1.0.0
+        hetoimasia-sample-triangle ==0.1.0.0,
+        -- The sprites sample's drawing and window-free evidence (GRS-8),
+        -- which the sprites case runs over this suite's own session; it too
+        -- depends on the native backend alone.
+        hetoimasia-sample-sprites ==0.1.0.0
