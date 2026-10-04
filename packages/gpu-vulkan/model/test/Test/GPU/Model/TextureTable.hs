@@ -277,6 +277,138 @@ spec = describe "texture table" $ do
       (afterLater, later') ← expectRight (bindVersion (heldBy [bindingVersion earlier]) reused)
       versionTextures (bindingVersion earlier) afterLater `shouldBe` ["a"]
       versionTextures (bindingVersion later') afterLater `shouldBe` []
+
+  describe "swaps" $ do
+    it "keeps a pending swap's handle on its current image — never the placeholder — until the replacement completes, then resolves it to the replacement's slot in the next version, while an earlier batch's version keeps the old slot" $ do
+      let table = fresh 4 2
+      (registered, handle) ← expectRight (registerTexture "old" table)
+      (completed, (oldSlot, _)) ← expectRight (completeTexture handle registered)
+      (bound, earlier) ← expectRight (bindVersion none completed)
+      (swapping, superseded) ← expectRight (swapTexture handle "new" bound)
+      superseded `shouldBe` Nothing
+      Just (newSlot, "new") ← pure (pendingSwap handle swapping)
+      newSlot `shouldSatisfy` (/= oldSlot)
+      pendingSwaps swapping `shouldBe` [(handle, "new")]
+      -- Nothing changed: the current version is still bound, and resolves
+      -- the handle to its old slot.
+      currentMapping swapping `shouldBe` currentMapping bound
+      (stillCurrent, same) ← expectRight (bindVersion none swapping)
+      bindingWrite same `shouldBe` Nothing
+      bindingVersion same `shouldBe` bindingVersion earlier
+      (swapped, (slotWritten, kept, replaced)) ← expectRight (completeSwap handle stillCurrent)
+      (slotWritten, kept, replaced) `shouldBe` (newSlot, "new", Just "old")
+      handleStanding handle swapped `shouldBe` HandleReady newSlot
+      pendingSwaps swapped `shouldBe` []
+      Set.member newSlot (writtenSlots swapped) `shouldBe` True
+      -- The next version resolves the handle to the replacement; the earlier
+      -- batch's version still resolves it to the old slot.
+      (_, later) ← expectRight (bindVersion (heldBy [bindingVersion earlier]) swapped)
+      let frozen = maybe Map.empty id (bindingWrite earlier)
+          current = maybe Map.empty id (bindingWrite later)
+      resolveHandle 4 frozen handle `shouldBe` oldSlot
+      resolveHandle 4 current handle `shouldBe` newSlot
+
+    it "retires the replaced texture's slot only once no live version maps it, and answers what was kept for it" $ do
+      let table = fresh 4 2
+      (registered, handle) ← expectRight (registerTexture "old" table)
+      (completed, (oldSlot, _)) ← expectRight (completeTexture handle registered)
+      (bound, earlier) ← expectRight (bindVersion none completed)
+      (swapping, _) ← expectRight (swapTexture handle "new" bound)
+      (swapped, _) ← expectRight (completeSwap handle swapping)
+      retiringSlots swapped `shouldBe` [oldSlot]
+      let held = heldBy [bindingVersion earlier]
+      (republished, _) ← expectRight (bindVersion held swapped)
+      -- A batch holds the version mapping the old slot: it stays retiring.
+      let (stillHeld, none') = reclaimSlots held republished
+      none' `shouldBe` []
+      retiringSlots stillHeld `shouldBe` [oldSlot]
+      -- Once that batch completes, it is free, with the old texture.
+      let (reclaimed, freed) = reclaimSlots none stillHeld
+      freed `shouldBe` [(oldSlot, "old")]
+      Set.member oldSlot (freeSlots reclaimed) `shouldBe` True
+      Set.member oldSlot (writtenSlots reclaimed) `shouldBe` False
+
+    it "lets a swap requested before the handle's own upload completes take effect, resolving to the placeholder until either completes" $ do
+      let table = fresh 4 2
+      (registered, handle) ← expectRight (registerTexture "old" table)
+      (swapping, _) ← expectRight (swapTexture handle "new" registered)
+      Map.lookup (handleIndex handle) (currentMapping swapping) `shouldBe` Just (LookupEntry 0 (handleGeneration handle))
+      Just (newSlot, _) ← pure (pendingSwap handle swapping)
+      (swapped, (_, _, replaced)) ← expectRight (completeSwap handle swapping)
+      replaced `shouldBe` Just "old"
+      resolveHandle 4 (currentMapping swapped) handle `shouldBe` newSlot
+      -- The replaced texture never completed: nothing is pending for it, and
+      -- no version maps its slot, so it is free at the next reclaim.
+      pendingTextures swapped `shouldBe` []
+      map snd (snd (reclaimSlots none swapped)) `shouldBe` ["old"]
+
+    it "supersedes a pending swap with a second: the first's slot is free at once and its replacement answered, never shown" $ do
+      let table = fresh 4 2
+      (registered, handle) ← expectRight (registerTexture "old" table)
+      (completed, _) ← expectRight (completeTexture handle registered)
+      (first, _) ← expectRight (swapTexture handle "first" completed)
+      Just (firstSlot, _) ← pure (pendingSwap handle first)
+      (second, superseded) ← expectRight (swapTexture handle "second" first)
+      superseded `shouldBe` Just "first"
+      pendingSwaps second `shouldBe` [(handle, "second")]
+      Just (secondSlot, _) ← pure (pendingSwap handle second)
+      -- The first's slot, never published, was free for the second.
+      secondSlot `shouldBe` firstSlot
+      currentMapping second `shouldBe` currentMapping completed
+      (swapped, (_, kept, _)) ← expectRight (completeSwap handle second)
+      kept `shouldBe` "second"
+      resolveHandle 4 (currentMapping swapped) handle `shouldBe` secondSlot
+
+    it "leaves the handle on its current image when its replacement fails, freeing the replacement's slot, which is never written" $ do
+      let table = fresh 4 2
+      (registered, handle) ← expectRight (registerTexture "old" table)
+      (completed, (oldSlot, _)) ← expectRight (completeTexture handle registered)
+      (swapping, _) ← expectRight (swapTexture handle "new" completed)
+      Just (newSlot, _) ← pure (pendingSwap handle swapping)
+      (cancelled, kept) ← expectRight (cancelSwap handle swapping)
+      kept `shouldBe` "new"
+      pendingSwap handle cancelled `shouldBe` Nothing
+      currentMapping cancelled `shouldBe` currentMapping completed
+      handleStanding handle cancelled `shouldBe` HandleReady oldSlot
+      Set.member newSlot (freeSlots cancelled) `shouldBe` True
+      Set.member newSlot (writtenSlots cancelled) `shouldBe` False
+      completeSwap handle cancelled `shouldBe` Left (TableNoSwap handle)
+      cancelSwap handle cancelled `shouldBe` Left (TableNoSwap handle)
+
+    it "refuses a swap on a stale handle, and ends a pending swap with its handle: the replacement's slot is free at once, and no later completion publishes it, even once the index is issued again" $ do
+      let table = fresh 4 2
+      (registered, handle) ← expectRight (registerTexture "old" table)
+      (completed, _) ← expectRight (completeTexture handle registered)
+      (swapping, _) ← expectRight (swapTexture handle "new" completed)
+      Just (newSlot, "new") ← pure (pendingSwap handle swapping)
+      released ← expectRight (releaseTexture handle swapping)
+      Set.member newSlot (freeSlots released) `shouldBe` True
+      pendingSwaps released `shouldBe` []
+      swapTexture handle "again" released `shouldBe` Left (TableStaleHandle handle)
+      completeSwap handle released `shouldBe` Left (TableStaleHandle handle)
+      cancelSwap handle released `shouldBe` Left (TableStaleHandle handle)
+      (reissued, next) ← expectRight (registerTexture "next" released)
+      handleIndex next `shouldBe` handleIndex handle
+      completeSwap handle reissued `shouldBe` Left (TableStaleHandle handle)
+      completeSwap next reissued `shouldBe` Left (TableNoSwap next)
+      pendingSwaps reissued `shouldBe` []
+      swapTexture (TextureHandle 9 1) "foreign" reissued `shouldBe` Left (TableStaleHandle (TextureHandle 9 1))
+
+    it "refuses a swap when no slot is free, changing nothing — not even another handle's pending swap — while a second swap on a handle reuses its pending swap's slot" $ do
+      -- Slot 0 and one more at first; the growth makes four.
+      let table = fresh 2 2
+      (one, first) ← expectRight (registerTexture "a" table)
+      (grown, _) ← expectRight (growTable one)
+      (two, second) ← expectRight (registerTexture "b" grown)
+      (full, _) ← expectRight (swapTexture first "a2" two)
+      freeSlots full `shouldBe` Set.empty
+      swapTexture second "b2" full `shouldBe` Left TableFull
+      pendingSwaps full `shouldBe` [(first, "a2")]
+      (resupplied, superseded) ← expectRight (swapTexture first "a3" full)
+      superseded `shouldBe` Just "a2"
+      pendingSwaps resupplied `shouldBe` [(first, "a3")]
+      freeSlots resupplied `shouldBe` Set.empty
+
   where
     fresh ∷ Integer → Integer → TextureTable String
     fresh slots versions = newTextureTable (either (error . show) id (validateTableConfig 16 slots versions))

@@ -3,15 +3,19 @@
 -- premultiplied-alpha blending — through the window integration's public
 -- host (GRS-8).
 --
--- > hetoimasia-sprites --evidence --output-dir DIRECTORY [--validation]
+-- > hetoimasia-sprites --evidence [--swap] --output-dir DIRECTORY [--validation]
 -- > hetoimasia-sprites --windowed [--validation]
 --
 -- @--evidence@ starts a surface-free session, opens no window, waits for the
 -- textures' uploads, renders the scene into a 256×256 linear RGBA8 target,
 -- reads it back once its batch has completed, checks every probe against the
 -- independent oracle, and writes @sprites.png@ and @sprites-probes.json@ into
--- the directory ("Hetoimasia.Sample.Sprites.Evidence"). It exits 0 only when
--- every probe passed and the diagnostic verdict is clean.
+-- the directory ("Hetoimasia.Sample.Sprites.Evidence"). With @--swap@ it runs
+-- the swap case instead (GRS-9, "Hetoimasia.Sample.Sprites.Swap"): the
+-- atlas's handle is redirected to a replacement between a batch's recording
+-- and its submission, and @swap-before.png@, @swap-delayed.png@,
+-- @swap-after.png@ and @swap-probes.json@ are written. It exits 0 only when
+-- every probe and check passed and the diagnostic verdict is clean.
 --
 -- @--windowed@ opens one window and renders the same scene until the window
 -- is closed, then exits; it is the owner-visible path, launched explicitly
@@ -74,6 +78,7 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , readConstructedTable
   , readReadiness
   , registerConstructedTexture
+  , swapConstructedTexture
   , runVulkanOwnerLoop
   , submitVulkanAction
   , submitVulkanUpload
@@ -108,36 +113,41 @@ import Hetoimasia.Sample.Sprites
   , uploadRequests
   )
 import Hetoimasia.Sample.Sprites.Evidence (Evidence (..), Host (..), runEvidence)
+import Hetoimasia.Sample.Sprites.Swap (SwapEvidence (..), SwapFacts (..), runSwapEvidence)
 import Hetoimasia.Sample.Sprites.Oracle (ProbeResult (..))
 import Hetoimasia.Sample.Sprites.Scene (Probe (..), targetBytes)
 
-data Mode = EvidenceMode !FilePath | WindowedMode
+-- | The evidence mode's directory, and whether it runs the swap case.
+data Mode = EvidenceMode !FilePath !Bool | WindowedMode
 
 data Options = Options
   { optionMode ∷ !(Maybe Mode)
   , optionOutput ∷ !(Maybe FilePath)
   , optionEvidence ∷ !Bool
+  , optionSwap ∷ !Bool
   , optionValidation ∷ !Bool
   }
 
 parseOptions ∷ [String] → Either String (Mode, Bool)
-parseOptions arguments = go (Options Nothing Nothing False False) arguments >>= finish
+parseOptions arguments = go (Options Nothing Nothing False False False) arguments >>= finish
   where
     go options = \case
       [] → Right options
       "--evidence" : rest → go options {optionEvidence = True} rest
+      "--swap" : rest → go options {optionSwap = True} rest
       "--output-dir" : directory : rest → go options {optionOutput = Just directory} rest
       "--windowed" : rest → go options {optionMode = Just WindowedMode} rest
       "--validation" : rest → go options {optionValidation = True} rest
       other : _ → Left ("unknown argument " <> other)
     finish options = case (optionEvidence options, optionMode options, optionOutput options) of
-      (True, Nothing, Just directory) → Right (EvidenceMode directory, optionValidation options)
+      _ | optionSwap options && not (optionEvidence options) → Left "--swap is an evidence case: use it with --evidence"
+      (True, Nothing, Just directory) → Right (EvidenceMode directory (optionSwap options), optionValidation options)
       (True, Nothing, Nothing) → Left "--evidence needs --output-dir DIRECTORY"
       (False, Just WindowedMode, Nothing) → Right (WindowedMode, optionValidation options)
       _ → Left "choose exactly one of --evidence --output-dir DIRECTORY and --windowed"
 
 usage ∷ String
-usage = "usage: hetoimasia-sprites --evidence --output-dir DIRECTORY [--validation]\n       hetoimasia-sprites --windowed [--validation]"
+usage = "usage: hetoimasia-sprites --evidence [--swap] --output-dir DIRECTORY [--validation]\n       hetoimasia-sprites --windowed [--validation]"
 
 main ∷ IO ()
 main =
@@ -159,7 +169,7 @@ run mode validation = do
   ready ← newTVarIO Nothing
   presented ← newTVarIO (0 ∷ Int)
   let windows = case mode of
-        EvidenceMode _ → []
+        EvidenceMode _ _ → []
         WindowedMode → [(defaultWindowConfig "hetoimasia sprites" 512 512) {windowFocused = False, windowFocusOnShow = False}]
       capture = if validation then defaultCaptureConfig {captureTextBudget = 16384} else defaultCaptureConfig
       config =
@@ -191,10 +201,14 @@ run mode validation = do
       ( \vulkan control → do
           awaitReadiness vulkan
           case mode of
-            EvidenceMode directory → do
+            EvidenceMode directory False → do
               outcome ← runEvidence (hostOf vulkan) directory
               summarize outcome
               atomically (writeTVar passed (evidencePassed outcome))
+            EvidenceMode directory True → do
+              outcome ← runSwapEvidence (hostOf vulkan) directory
+              summarizeSwap outcome
+              atomically (writeTVar passed (swapPassed outcome))
             WindowedMode → do
               _ ← superviseGraphicsOwner control (vulkanGraphicsOwner vulkan)
               logger ← readTVarIO loggerHeld >>= maybe (hPutStrLn stderr "the logging lifetime was never opened" >> exitFailure) pure
@@ -206,7 +220,7 @@ run mode validation = do
   ok ← readTVarIO passed
   case mode of
     WindowedMode → readTVarIO presented >>= \count → putStrLn (show count <> " frames presented")
-    EvidenceMode _ → pure ()
+    EvidenceMode _ _ → pure ()
   report verdict
   unless ok exitFailure
 
@@ -232,6 +246,8 @@ buildersOf construction =
     , buildPipeline = constructBlendedCheckedPipeline construction
     , buildReadback = constructReadback construction
     , registerImage = registerConstructedTexture construction
+    , swapImage = swapConstructedTexture construction
+    , inspectTable = readConstructedTable construction
     }
 
 -- | The evidence's host: owner-thread actions over the session's
@@ -283,6 +299,21 @@ hostOf vulkan =
 
 deadline ∷ Duration
 deadline = either (error . show) id (durationFromNanoseconds AllowZero 30000000000)
+
+-- | Print the swap case's outcome: where it was written, its facts, each
+-- failed probe, and the verdict.
+summarizeSwap ∷ SwapEvidence → IO ()
+summarizeSwap outcome = do
+  forM_ (swapPngs outcome) (\path → putStrLn ("capture: " <> path))
+  putStrLn ("swap record: " <> swapRecord outcome)
+  forM_ (swapFailure outcome) (\failure → hPutStrLn stderr ("swap evidence failed: " <> Text.unpack failure))
+  forM_ (swapFacts outcome) $ \facts → do
+    putStrLn ("old slot " <> show (factsOldSlot facts) <> ", new slot " <> show (factsNewSlot facts) <> ", swap " <> show (factsSwapState facts))
+    putStrLn ("retiring while the delayed frame held the old version: " <> show (factsRetiringDuringDelay facts) <> "; registered then into slot " <> show (factsSlotDuringDelay facts) <> ", after its completion into slot " <> show (factsSlotAfterCompletion facts))
+    putStrLn ("instance data unchanged across the swap: " <> show (factsInstancesUnchanged facts))
+  forM_ [(name, result) | (name, results) ← [("before", swapBefore outcome), ("delayed", swapDelayed outcome), ("after", swapAfter outcome)], result ← results, not (resultPassed result)] $ \(name, result) →
+    hPutStrLn stderr ("failed " <> name <> " probe " <> Text.unpack (probeName (resultProbe result)) <> ": observed " <> show (resultObserved result))
+  putStrLn ("swap evidence: " <> if swapPassed outcome then "every probe and check passed" else "failed")
 
 -- | Print the evidence's outcome: where it was written, each probe, and the
 -- verdict.

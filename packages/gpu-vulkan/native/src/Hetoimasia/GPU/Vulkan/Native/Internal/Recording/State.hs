@@ -42,6 +42,12 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
 
     -- * The texture table (GRS-7)
   , TableState (..)
+  , SwapState (..)
+  , SwapTicket (..)
+  , readSwapTicket
+  , settleSwap
+  , sessionHasFailed
+  , failPendingSwaps
 
     -- * The shared ring (GRS-4)
   , RingSize
@@ -99,6 +105,7 @@ import Control.Concurrent (ThreadId, myThreadId)
 import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVar, newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import Control.Exception (Exception (displayException), SomeAsyncException, SomeException, fromException, throwIO)
 import Data.ByteString (ByteString)
+import Data.Foldable (for_)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
@@ -144,7 +151,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   , imageKindUse
   , imageResourceKind
   )
-import Hetoimasia.GPU.Vulkan.Native.Roots (Checkpoint (..), Roots, TerminalCause, checkpointRoots, rootsCall, rootsSessionIdentity, stateRootsModel)
+import Hetoimasia.GPU.Vulkan.Native.Roots (Checkpoint (..), Roots, TerminalCause, TerminalReport (reportPrimary), checkpointRoots, readRootsTerminal, rootsCall, rootsSessionIdentity, stateRootsModel)
 
 -- ---------------------------------------------------------------------------
 -- Records
@@ -333,9 +340,84 @@ data TableState = TableState
     -- ^ Whether slot 0's descriptor is written: until it is, the table is
     -- not bound.
   , tableTextures ∷ !(Set ResourceId)
-    -- ^ Every image a live handle or a retiring slot holds: none is released
-    -- but through the table.
+    -- ^ Every image a live handle, a pending swap or a retiring slot holds
+    -- and the table has not yet released: none is released but through the
+    -- table.
+  , tableSwapTickets ∷ !(Map ResourceId (TVar SwapState))
+    -- ^ Each pending swap's report, by its replacement image (GRS-9).
   }
+
+-- | Where an accepted texture swap stands (GRS-9). It only advances, from
+-- 'SwapPending' to exactly one of the others.
+data SwapState
+  = SwapPending
+    -- ^ Accepted: the handle still resolves to what it showed, until the
+    -- replacement's upload completes.
+  | SwapPublished
+    -- ^ The replacement's upload completed: every version published from
+    -- now on resolves the handle to it, and the texture it replaced is
+    -- released, to be destroyed once no batch retains it.
+  | SwapSuperseded
+    -- ^ A later swap on the handle replaced this one before it took effect:
+    -- the replacement was released and is never shown.
+  | SwapAbandoned
+    -- ^ The handle was released first: the replacement was released and is
+    -- never shown.
+  | SwapFailed
+    -- ^ The replacement's upload was cancelled or lost, or the session
+    -- failed, before it completed: the handle keeps what it showed, and the
+    -- replacement was released.
+  deriving (Eq, Show)
+
+-- | An accepted swap's report, read from any thread without a native call:
+-- its own state, and whether the session has failed.
+data SwapTicket = SwapTicket !(TVar SwapState) !(STM Bool)
+
+instance Show SwapTicket where
+  show _ = "SwapTicket"
+
+-- | Where the swap stands now. It never waits. A swap still pending in a
+-- session that has failed reads 'SwapFailed' from the moment the failure is
+-- latched (GRS-9), and the read stores it: a failed session writes no
+-- descriptor, so no swap can take effect, and the ticket settles before any
+-- drain, wait or cleanup the session's teardown goes on to. Releasing its
+-- images still waits for their completion evidence, as ever.
+readSwapTicket ∷ SwapTicket → STM SwapState
+readSwapTicket (SwapTicket cell failed) =
+  readTVar cell >>= \case
+    SwapPending →
+      failed >>= \case
+        True → SwapFailed <$ writeTVar cell SwapFailed
+        False → pure SwapPending
+    settled → pure settled
+
+-- | Settle a swap's ticket, once (GRS-9): a ticket already settled keeps its
+-- outcome, whatever comes after, and once the session has failed every
+-- outcome is 'SwapFailed' — a release, a supersession or a refresh after the
+-- failure never reports anything else. Every write of a ticket goes through
+-- this.
+settleSwap ∷ Recording q inst msgr phys dev cmd → TVar SwapState → SwapState → STM ()
+settleSwap recording cell outcome =
+  readTVar cell >>= \case
+    SwapPending → sessionHasFailed recording >>= \gone → writeTVar cell (if gone then SwapFailed else outcome)
+    _ → pure ()
+
+-- | Whether the session has failed: its terminal report names a primary.
+sessionHasFailed ∷ Recording q inst msgr phys dev cmd → STM Bool
+sessionHasFailed recording = isJust . reportPrimary <$> readRootsTerminal (recordingRoots recording)
+
+-- | Fail every texture swap still pending (GRS-9), touching no native object:
+-- none can take effect once the session retires. A host's retirement does
+-- this first, before any step that may raise or retain, so no ticket is left
+-- pending whatever happens to the rest of the teardown; the replacements are
+-- released with every other live generation. Doing it again changes nothing.
+failPendingSwaps ∷ Recording q inst msgr phys dev cmd → STM ()
+failPendingSwaps recording =
+  readTVar (recordingTable recording) >>= \case
+    Nothing → pure ()
+    Just table → do
+      for_ (tableSwapTickets table) (\cell → settleSwap recording cell SwapFailed)
+      writeTVar (recordingTable recording) (Just table {tableSwapTickets = Map.empty})
 
 -- | The recording's state, owned by the calling thread. The public
 -- constructor is "Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Disposal"'s

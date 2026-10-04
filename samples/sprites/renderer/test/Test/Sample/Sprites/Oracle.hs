@@ -14,6 +14,7 @@ import Hetoimasia.GPU.Vulkan.Native.Recording (TableSampler (..))
 import Hetoimasia.Sample.Sprites.Fixtures
 import Hetoimasia.Sample.Sprites.Oracle
 import Hetoimasia.Sample.Sprites.Scene
+import Hetoimasia.Sample.Sprites.Swap (swappedTextures)
 
 spec ∷ Spec
 spec = describe "Sprites scene and oracle" $ do
@@ -64,6 +65,24 @@ spec = describe "Sprites scene and oracle" $ do
     let atlas = head' [probePixel p | p ← probes, probeName p == "atlas red region"]
     probesPassed (evaluateProbes True (paint ((atlas, Rgba 253 0 0 255) : [(probePixel p, expectedRgba (expectation True p)) | p ← probes, probePixel p /= atlas]))) `shouldBe` False
     probesPassed (evaluateProbes True (ByteString.take 1024 image)) `shouldBe` False
+
+  it "expects the swap case's replacement atlas, of the same layout, in every atlas region and grid cell it reaches, and the other fixtures unchanged (GRS-9)" $ do
+    let swapped name = case [p | p ← sceneProbes False, probeName p == name] of
+          p : _ → expectationWith swappedTextures False p
+          [] → error ("no probe named " <> show name)
+    map (expectedRgba . swapped) ["atlas red region", "atlas green region", "atlas blue region", "atlas yellow region"]
+      `shouldBe` [Rgba 0 255 0 255, Rgba 0 0 255 255, Rgba 255 255 0 255, Rgba 255 0 0 255]
+    map (expectedRgba . swapped) ["grid red region (0,0)", "grid translucent red (7,3)"] `shouldBe` [Rgba 0 255 0 255, Rgba 128 0 0 128]
+    -- Every probe the atlas reaches differs, and no other probe does.
+    let probes = sceneProbes True
+        differs p = expectationWith swappedTextures True p /= expectation True p
+    [probePurpose p | p ← probes, differs p] `shouldSatisfy` all (`elem` [AtlasSelection, FilterDistinction, LargeDraw])
+    [probeName p | p ← probes, probePurpose p == AtlasSelection, not (differs p)] `shouldBe` []
+    [probeName p | p ← probes, probePurpose p `elem` [Translucency, PainterOrder, Clear, Bc7Texels], differs p] `shouldBe` []
+    -- The replacement keeps the atlas's layout, so the linear probe keeps
+    -- its margin: a quarter of the next region, within one.
+    expectationWith swappedTextures False (head' [p | p ← probes, probeName p == "red/green boundary, linear"]) `shouldBe` Expectation (Rgba 0 191 64 255) 1
+    (fixtureWidth swappedAtlasFixture, fixtureHeight swappedAtlasFixture, fixtureFormat swappedAtlasFixture) `shouldBe` (fixtureWidth atlasFixture, fixtureHeight atlasFixture, fixtureFormat atlasFixture)
 
   it "encodes 40 bytes an instance, its handle's index and generation last" $ do
     let item = Instance Atlas (UvRect 0 0 1 1) (1, 2, 3, 4)

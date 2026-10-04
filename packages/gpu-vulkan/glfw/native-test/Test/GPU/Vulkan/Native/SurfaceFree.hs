@@ -60,6 +60,7 @@ module Test.GPU.Vulkan.Native.SurfaceFree
   , runTable
   , runSprites
   , runGrowth
+  , runSwap
   , surfaceFreeSection
   , laterWindowSection
   , framelessSection
@@ -69,6 +70,7 @@ module Test.GPU.Vulkan.Native.SurfaceFree
   , tableSection
   , spritesSection
   , growthSection
+  , swapSection
   , surfaceFreeSpec
   , laterWindowSpec
   , framelessSpec
@@ -78,6 +80,7 @@ module Test.GPU.Vulkan.Native.SurfaceFree
   , tableSpec
   , spritesSpec
   , growthSpec
+  , swapSpec
   ) where
 
 import Control.Concurrent (ThreadId, myThreadId, threadDelay)
@@ -209,6 +212,8 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , readConstructedTable
   , registerConstructedTexture
   , releaseConstructedTexture
+  , swapConstructedTexture
+  , SwapState (..)
   , selectSampler
   , tableSamplerIndex
   , validateTableConfig
@@ -219,6 +224,7 @@ import Hetoimasia.GPU.Vulkan.Native.Recording.ShaderInterfaces (tableSamplerOffs
 import Hetoimasia.Sample.Sprites (Builders (..))
 import Hetoimasia.Sample.Sprites.Evidence (Evidence (..), Host (..), runEvidence)
 import Hetoimasia.Sample.Sprites.Oracle (ProbeResult (..))
+import Hetoimasia.Sample.Sprites.Swap (SwapEvidence (..), SwapFacts (..), runSwapEvidence)
 import qualified Hetoimasia.Sample.Sprites.Scene as Sprites
 import Hetoimasia.Sample.Sprites.Scene (Probe (..))
 import Hetoimasia.GPU.Vulkan.Native.Recording.Shaders (endpointShaders, quadShaders, tableShaders, verificationShaders)
@@ -270,6 +276,7 @@ data SurfaceFreeFacts = SurfaceFreeFacts
   , factsTable ∷ !(Maybe TableFacts)
   , factsSprites ∷ !(Maybe Evidence)
   , factsGrowth ∷ !(Maybe GrowthFacts)
+  , factsSwap ∷ !(Maybe SwapEvidence)
   }
 
 data SurfaceFreeOutcome
@@ -289,6 +296,7 @@ data Seen = Seen
   , seenTable ∷ !(Maybe TableFacts)
   , seenSprites ∷ !(Maybe Evidence)
   , seenGrowth ∷ !(Maybe GrowthFacts)
+  , seenSwap ∷ !(Maybe SwapEvidence)
   }
 
 -- | What the uploads case (GRS-6) found: each upload's ticket, waited for
@@ -326,7 +334,7 @@ runSurfaceFree backend journal = do
     windows ← length <$> atomically (hostWindowIdentities (vulkanWindowHost vulkan))
     roots ← atomically (readVulkanRoots (vulkanController vulkan))
     note journal ("the actions answered " <> Text.intercalate "; " answers)
-    pure (Seen threads answers windows (Just roots) Nothing [] [] Nothing Nothing Nothing Nothing)
+    pure (Seen threads answers windows (Just roots) Nothing [] [] Nothing Nothing Nothing Nothing Nothing)
 
 -- | The case that admits a window after the device exists.
 runLaterWindow ∷ Maybe Backend → Journal → IO SurfaceFreeOutcome
@@ -358,7 +366,7 @@ runLaterWindow backend journal = do
       pure (if any (`elem` retired) presented then FinishWith () else ContinueWith NoUpdateDemand)
     note journal "presented a frame to the later window and saw its presentation retire"
     roots ← atomically (readVulkanRoots (vulkanController vulkan))
-    pure (Seen [] [] 1 (Just roots) (Just standing) [] [] Nothing Nothing Nothing Nothing)
+    pure (Seen [] [] 1 (Just roots) (Just standing) [] [] Nothing Nothing Nothing Nothing Nothing)
   where
     quiet = recordingLogger (\_ → pure ())
 
@@ -383,7 +391,7 @@ runFrameless backend journal = do
     tickets ← mapM (\ticket → awaitTicket ticket deadline) [firstTicket, snd second]
     note journal ("the tickets answered " <> tshow tickets)
     roots ← atomically (readVulkanRoots (vulkanController vulkan))
-    pure (Seen [firstOn, fst second] ["recorded an initializing frame-less batch", "recorded a second frame-less batch"] 0 (Just roots) Nothing tickets [] Nothing Nothing Nothing Nothing)
+    pure (Seen [firstOn, fst second] ["recorded an initializing frame-less batch", "recorded a second frame-less batch"] 0 (Just roots) Nothing tickets [] Nothing Nothing Nothing Nothing Nothing)
   where
     deadline = either (error . show) id (durationFromNanoseconds AllowZero 10000000000)
 
@@ -416,7 +424,7 @@ runOffscreen backend journal = do
       | ((format, _, _), ticket, reading) ← zip3 batches tickets readings
       ]
     roots ← atomically (readVulkanRoots (vulkanController vulkan))
-    pure (Seen [renderedOn, readOn] ["rendered and copied both targets", "read both readbacks"] 0 (Just roots) Nothing tickets shots Nothing Nothing Nothing Nothing)
+    pure (Seen [renderedOn, readOn] ["rendered and copied both targets", "read both readbacks"] 0 (Just roots) Nothing tickets shots Nothing Nothing Nothing Nothing Nothing)
   where
     deadline = either (error . show) id (durationFromNanoseconds AllowZero 10000000000)
     pixelAt bytes (x, y) = ByteString.unpack (ByteString.take 4 (ByteString.drop ((y * offscreenSide + x) * 4) bytes))
@@ -445,7 +453,7 @@ runDrawing backend journal = do
     note journal ("the readback is at " <> Text.pack path)
     let shot = Shot Rgba8Srgb waited [(point, pixelAt bytes point) | point ← drawingProbes] path
     roots ← atomically (readVulkanRoots (vulkanController vulkan))
-    pure (Seen [drawnOn, readOn] ["drew the quad and copied the target", "read the readback"] 0 (Just roots) Nothing [waited] [shot] Nothing Nothing Nothing Nothing)
+    pure (Seen [drawnOn, readOn] ["drew the quad and copied the target", "read the readback"] 0 (Just roots) Nothing [waited] [shot] Nothing Nothing Nothing Nothing Nothing)
   where
     deadline = either (error . show) id (durationFromNanoseconds AllowZero 10000000000)
     pixelAt bytes (x, y) = ByteString.unpack (ByteString.take 4 (ByteString.drop ((y * offscreenSide + x) * 4) bytes))
@@ -519,6 +527,7 @@ runUploads backend journal = do
             [waited]
             [shot]
             (Just facts)
+            Nothing
             Nothing
             Nothing
             Nothing
@@ -989,6 +998,7 @@ runTable backend journal = do
             (Just facts)
             Nothing
             Nothing
+            Nothing
         )
   where
     deadline = either (error . show) id (durationFromNanoseconds AllowZero 30000000000)
@@ -1131,7 +1141,7 @@ runSprites backend journal = do
       note journal ("sprites capture: " <> maybe "not written" Text.pack (evidencePng outcome) <> "; probe record: " <> Text.pack (evidenceRecord outcome))
       mapM_ (\failure → note journal ("sprites evidence failed: " <> failure)) (evidenceFailure outcome)
       roots ← atomically (readVulkanRoots (vulkanController vulkan))
-      pure (Seen [] ["ran the sprites evidence"] 0 (Just roots) Nothing [] [] Nothing Nothing (Just outcome) Nothing)
+      pure (Seen [] ["ran the sprites evidence"] 0 (Just roots) Nothing [] [] Nothing Nothing (Just outcome) Nothing Nothing)
   where
     spritesDirectory =
       lookupEnv "HETOIMASIA_VALIDATION_EVIDENCE" >>= \case
@@ -1140,6 +1150,40 @@ runSprites backend journal = do
           temporary ← getTemporaryDirectory
           stamp ← (round . (* 1000) . utcTimeToPOSIXSeconds ∷ UTCTime → Integer) <$> getCurrentTime
           pure (temporary </> ("hetoimasia-sprites-" <> show stamp))
+
+-- | The swap case (GRS-9): the sprites sample's swap evidence over this
+-- suite's surface-free session — the atlas's handle redirected to a
+-- replacement between a batch's recording and its submission, with the
+-- frames before, across and after the swap read back and checked — with the
+-- files written under the validation runner's evidence directory when it
+-- names one, and otherwise into a directory of their own that is kept and
+-- reported.
+runSwap ∷ Maybe Backend → Journal → IO SurfaceFreeOutcome
+runSwap backend journal = do
+  heading journal "GRS-9: a surface-free session swaps the sprites sample's atlas under its texture handle: a frame before the swap samples the atlas, a frame recorded before the swap and submitted after it still does, a frame after it samples the replacement from the same instance data, and the atlas's slot is reused only once the delayed frame completes"
+  directory ← swapDirectory
+  note journal ("the swap evidence is written into " <> Text.pack directory)
+  runCaseWith
+    (\config → config {vulkanUploads = Just uploadConfig})
+    backend
+    defaultBudgetRequest {requestedBytes = 2 * 1024 * 1024 * 1024}
+    []
+    "vulkan-native-grs9-swap"
+    $ \vulkan _ _ _ → do
+      outcome ← runSwapEvidence (spritesHost vulkan) directory
+      note journal ("swap captures: " <> Text.intercalate ", " (map Text.pack (swapPngs outcome)) <> "; record: " <> Text.pack (swapRecord outcome))
+      mapM_ (\facts → note journal ("swap facts: " <> tshow facts)) (swapFacts outcome)
+      mapM_ (\failure → note journal ("swap evidence failed: " <> failure)) (swapFailure outcome)
+      roots ← atomically (readVulkanRoots (vulkanController vulkan))
+      pure (Seen [] ["ran the swap evidence"] 0 (Just roots) Nothing [] [] Nothing Nothing Nothing Nothing (Just outcome))
+  where
+    swapDirectory =
+      lookupEnv "HETOIMASIA_VALIDATION_EVIDENCE" >>= \case
+        Just evidence | not (null evidence) → pure (evidence </> "swap")
+        _ → do
+          temporary ← getTemporaryDirectory
+          stamp ← (round . (* 1000) . utcTimeToPOSIXSeconds ∷ UTCTime → Integer) <$> getCurrentTime
+          pure (temporary </> ("hetoimasia-swap-" <> show stamp))
 
 -- | The sprites evidence's host over this suite's session: owner-thread
 -- actions over its constructions, uploads admitted from the main thread and
@@ -1200,6 +1244,8 @@ spritesBuilders construction =
     , buildPipeline = constructBlendedCheckedPipeline construction
     , buildReadback = constructReadback construction
     , registerImage = registerConstructedTexture construction
+    , swapImage = swapConstructedTexture construction
+    , inspectTable = readConstructedTable construction
     }
 
 -- | What the growth case (GRS-14) found.
@@ -1304,6 +1350,7 @@ runGrowth backend journal = do
             Nothing
             Nothing
             (Just facts)
+            Nothing
         )
   where
     deadline = either (error . show) id (durationFromNanoseconds AllowZero 30000000000)
@@ -1504,6 +1551,7 @@ runCaseWith adjust backend request windows label body = do
               , factsTable = seenTable seen
               , factsSprites = seenSprites seen
               , factsGrowth = seenGrowth seen
+              , factsSwap = seenSwap seen
               }
   where
     -- Every call's name, as it returns, where a transaction can wait for it.
@@ -1852,6 +1900,72 @@ spritesSpec outcome = describe "GRS-8 the sprites sample's window-free evidence"
 
   it "reached a verdict after the last callback with no issue and no error, synchronization validation included" $
     on outcome clean
+
+swapSection ∷ SurfaceFreeOutcome → [Text]
+swapSection outcome =
+  section "A surface-free session swapping the sprites sample's atlas under its handle" outcome
+    <> case outcome of
+      SurfaceFreeRecorded facts → case factsSwap facts of
+        Nothing → ["- no swap evidence"]
+        Just evidence →
+          [ "- captures: " <> Text.intercalate ", " (map Text.pack (swapPngs evidence)) <> "; record: " <> Text.pack (swapRecord evidence)
+          , "- BC7: " <> maybe "not reached" (\drawn → if drawn then "supported and drawn" else "not supported by the device, as it reports; skipped") (swapBc7 evidence)
+          , "- facts: " <> maybe "none" tshow (swapFacts evidence)
+          , "- failure: " <> fromMaybe "none" (swapFailure evidence)
+          ]
+            <> [ "- " <> name <> " " <> (if resultPassed result then "pass " else "FAIL ") <> probeName (resultProbe result) <> ": observed " <> tshow (resultObserved result) <> ", expected " <> tshow (resultExpected result)
+               | (name, results) ← [("before", swapBefore evidence), ("delayed", swapDelayed evidence), ("after", swapAfter evidence)]
+               , result ← results
+               ]
+      SurfaceFreeFailed _ → []
+
+swapSpec ∷ SurfaceFreeOutcome → Spec
+swapSpec outcome = describe "GRS-9 a texture swap under a stable handle, in the sprites sample's window-free evidence" $ do
+  it "opened no window, created no surface and acquired no image" $
+    on outcome $ \facts → do
+      factsWindows facts `shouldBe` 0
+      callNames facts `shouldSatisfy` notElem "glfwCreateWindowSurface"
+      callNames facts `shouldSatisfy` notElem "vkAcquireNextImageKHR"
+      deviceFirst facts
+
+  it "sampled the atlas in the frame before the swap and in the frame recorded before it and submitted after it, and the replacement in the frame after it, every probe passing the independent oracle" $
+    on outcome $ \facts → withSwap facts $ \evidence → do
+      swapFailure evidence `shouldBe` Nothing
+      [(name, probeName (resultProbe result)) | (name, results) ← [("before", swapBefore evidence), ("delayed", swapDelayed evidence), ("after", swapAfter evidence)], result ← results, not (resultPassed result)] `shouldBe` ([] ∷ [(Text, Text)])
+      map length [swapBefore evidence, swapDelayed evidence, swapAfter evidence] `shouldSatisfy` all (> 0)
+
+  it "drew the same instance data before and after the swap, which took effect, in a slot of the replacement's own" $
+    on outcome $ \facts → withSwap facts $ \evidence → case swapFacts evidence of
+      Nothing → expectationFailure "no swap facts"
+      Just held → do
+        factsInstancesUnchanged held `shouldBe` True
+        factsSwapState held `shouldBe` SwapPublished
+        factsNewSlot held `shouldSatisfy` (`notElem` [0, factsOldSlot held])
+
+  it "kept the atlas's slot retiring, and gave it to no texture, while the delayed frame held it, and reused it only once that frame completed" $
+    on outcome $ \facts → withSwap facts $ \evidence → case swapFacts evidence of
+      Nothing → expectationFailure "no swap facts"
+      Just held → do
+        factsRetiringDuringDelay held `shouldSatisfy` elem (factsOldSlot held)
+        factsSlotDuringDelay held `shouldSatisfy` (`notElem` [0, factsOldSlot held])
+        factsSlotAfterCompletion held `shouldBe` factsOldSlot held
+        swapPassed evidence `shouldBe` True
+
+  it "wrote the before, delayed and after PNGs and the record where they are kept" $
+    on outcome $ \facts → withSwap facts $ \evidence → do
+      pngs ← mapM doesFileExist (swapPngs evidence)
+      record ← doesFileExist (swapRecord evidence)
+      (pngs, record) `shouldBe` ([True, True, True], True)
+
+  it "retired cleanly, with every Vulkan call on the owner's thread" $
+    on outcome $ \facts → do
+      callNames facts `shouldSatisfy` ordered ["vkDestroyDevice", "vkDestroyDebugUtilsMessengerEXT", "vkDestroyInstance"]
+      oneOwnerThread facts
+
+  it "reached a verdict after the last callback with no issue and no error, synchronization validation included" $
+    on outcome clean
+  where
+    withSwap facts body = maybe (expectationFailure "no swap evidence") body (factsSwap facts)
 
 growthSection ∷ SurfaceFreeOutcome → [Text]
 growthSection outcome =

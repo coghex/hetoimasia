@@ -222,6 +222,7 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , constructTextureTable
   , constructTablePipelineLayout
   , registerConstructedTexture
+  , swapConstructedTexture
   , releaseConstructedTexture
   , readConstructedTable
 
@@ -265,6 +266,7 @@ import Control.Exception
   , ExceptionWithContext (ExceptionWithContext)
   , SomeAsyncException
   , SomeException
+  , finally
   , fromException
   , mask
   , mask_
@@ -849,8 +851,8 @@ controllerOperations (VulkanController state) renderer =
             ]
     , graphicsPrepareRetirement = \retiring → retaining state (prepareRetirement state retiring)
     , graphicsRetireTarget = \retiring → retaining state (retireTarget state retiring)
-    , graphicsRetireOwner = retaining state . retireOwner state
-    , graphicsDestroyOwner = \_ → retaining state (destroyOwner state)
+    , graphicsRetireOwner = settlingSwaps state . retaining state . retireOwner state
+    , graphicsDestroyOwner = \_ → settlingSwaps state (retaining state (destroyOwner state))
     }
   where
     progress step = do
@@ -1051,6 +1053,17 @@ serviceActions state = do
 -- which retains its evidence and manufactures no acknowledgement. The report
 -- says what was retained; it releases nothing. A cancellation is not a
 -- retention and is left as it is.
+-- | Run one of the owner's teardown hooks — its retirement or its
+-- destruction, the only ways an owner ends — with every texture swap still
+-- pending failed first and again however the hook ends (GRS-9). Settling
+-- touches no native object and is idempotent, so it precedes every step that
+-- may raise or retain — a surface's discharge, an upload's or a frame-less
+-- batch's retirement, the recording's — and no ticket is ever left pending.
+settlingSwaps ∷ State inst msgr phys dev cmd lease obligation → IO a → IO a
+settlingSwaps state action = (settle >> action) `finally` settle
+  where
+    settle = atomically (failRenderingSwaps (stateRendering state))
+
 retaining ∷ State inst msgr phys dev cmd lease obligation → IO a → IO a
 retaining state action =
   tryWithContext action >>= \case
