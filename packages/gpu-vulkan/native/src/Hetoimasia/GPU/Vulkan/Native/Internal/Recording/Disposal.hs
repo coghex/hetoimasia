@@ -20,7 +20,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Disposal
   , retireRecording
   ) where
 
-import Control.Concurrent.STM (STM, atomically, modifyTVar', readTVar, readTVarIO)
+import Control.Concurrent.STM (STM, atomically, modifyTVar', readTVar, readTVarIO, writeTVar)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, displayException, mask_, rethrowIO, throwIO, tryWithContext)
 import Control.Monad (forM, unless)
 import Data.Foldable (for_)
@@ -51,6 +51,8 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , ResourceDestructionFailed (..)
   , ResourcesRetained (..)
   , RingState (..)
+  , SwapState (..)
+  , TableState (..)
   , destroyNative
   , editManaged
   , isAsynchronous
@@ -220,6 +222,16 @@ progress recording now = do
 -- remains. A batch still outstanding retains what it references.
 retireRecording ∷ Recording q inst msgr phys dev cmd → Instant → IO ()
 retireRecording recording now = owner recording $ do
+  -- A texture swap still pending can never take effect now (GRS-9): its
+  -- ticket fails here, whether the session failed before the table was next
+  -- brought up to date or the owner is exiting. The replacement is released
+  -- with every other live generation below.
+  atomically $
+    readTVar (recordingTable recording) >>= \case
+      Nothing → pure ()
+      Just table → do
+        for_ (tableSwapTickets table) (`writeTVar` SwapFailed)
+        writeTVar (recordingTable recording) (Just table {tableSwapTickets = Map.empty})
   live ← Map.keys . Map.filter ((== ManagedLive) . managedStanding) <$> readTVarIO (recordingManaged recording)
   for_ live $ \resource → atomically $ do
     modelEdit roots (releaseResource resource)

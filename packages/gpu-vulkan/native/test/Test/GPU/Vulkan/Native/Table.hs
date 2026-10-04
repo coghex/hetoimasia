@@ -44,7 +44,7 @@ import Hetoimasia.GPU.Vulkan.Native.Uploads
 import Data.Functor ((<&>))
 import Test.GPU.Vulkan.Native.AllocatorStandIn (AllocatorCall (Flushed), allocatorCalls, allowTypes, deviceLocalType, nonCoherentType)
 import Test.GPU.Vulkan.Native.FramesRig
-import Test.GPU.Vulkan.Native.FramesStandIn (completeAll, completeFence, pendingFences)
+import Test.GPU.Vulkan.Native.FramesStandIn (FrameStep (AtQueryFence), completeAll, completeFence, loseFrameStep, pendingFences)
 import Test.GPU.Vulkan.Native.StandIn (StandIn (standAllocator), StandInResult (..), offerNaming, outOfMemoryNaming)
 import Hetoimasia.GPU.Vulkan.Native.Naming (NativeObjectKind (ObjectDescriptorPool, ObjectDescriptorSet))
 import Test.GPU.Vulkan.Native.RecordingStandIn (RecordingCall (..), RecordingFailure (..), RecordingStep (..), failAt, limitBuffers, limitRecording, onceAt, outOfMemoryAt, recordingCalls, standInRecordingLimits, succeedAt)
@@ -974,6 +974,60 @@ spec = describe "Texture table" $ do
       ok (refreshTextureTable (rigRecording rig))
       swapStanding retried `shouldReturn` SwapPublished
       clean rig
+
+    it "refuses another upload into a pending swap's replacement once its accepted upload is cancelled, so the cancellation fails the swap and the handle keeps its image" $ do
+      (rig, uploads, _) ← tableRig 4 2
+      old ← uploadedTexture rig uploads
+      handle ← registered rig old
+      oldSlot ← resolvedNow rig handle
+      (replacement, first) ← queuedTexture rig uploads (ImageDescription TextureImage Rgba8Linear 2 2 1) [ByteString.replicate 16 6]
+      ticket ← swapped rig handle replacement
+      atomically (cancelUpload uploads first) >>= either (fail . show) pure
+      -- Between owner turns, before any refresh: the same image again.
+      submitUpload uploads (UploadImage replacement [ByteString.replicate 16 7]) `shouldReturn'` \case
+        Left (UploadMisuse (WrongPhase ResourceIdentity)) → pure ()
+        other → expectationFailure ("expected the re-upload refused, not " <> either show (const "admitted") other)
+      settle rig uploads
+      ok (refreshTextureTable (rigRecording rig))
+      swapStanding ticket `shouldReturn` SwapFailed
+      resolvedNow rig handle `shouldReturn` oldSlot
+      clean rig
+
+    it "fails a pending swap at retirement when the session failed before the table was next brought up to date" $ do
+      (rig, uploads, _) ← tableRig 4 2
+      old ← uploadedTexture rig uploads
+      handle ← registered rig old
+      (replacement, _) ← queuedTexture rig uploads (ImageDescription TextureImage Rgba8Linear 2 2 1) [ByteString.replicate 16 8]
+      ticket ← swapped rig handle replacement
+      atomically (failRootsSessionBecause (rigRoots rig) CleanupFailed "a later cleanup failed")
+      swapStanding ticket `shouldReturn` SwapPending
+      _ ← try @ResourcesRetained (retireRecording (rigRecording rig) (at 1))
+      swapStanding ticket `shouldReturn` SwapFailed
+
+    it "never publishes a swap whose replacement's upload the device's loss ended, and fails it" $ do
+      (rig, uploads, _) ← tableRig 4 2
+      old ← uploadedTexture rig uploads
+      handle ← registered rig old
+      oldSlot ← resolvedNow rig handle
+      (replacement, upload) ← queuedTexture rig uploads (ImageDescription TextureImage Rgba8Linear 2 2 1) [ByteString.replicate 16 9]
+      replacementView ← viewOf rig replacement
+      -- Started: its copies are submitted when the device is lost.
+      _ ← progressUploads uploads >>= either (fail . show) pure
+      ticket ← swapped rig handle replacement
+      -- Observing the upload's fence loses the device.
+      loseFrameStep (rigStandIn rig) AtQueryFence
+      _ ← try @SomeException (progress rig)
+      _ ← try @SomeException (progressUploads uploads)
+      _ ← try @SomeException (refreshTextureTable (rigRecording rig))
+      -- The loss ended the upload, and the refresh after it, which may write
+      -- nothing, failed the swap.
+      atomically (readUploadTicket upload) `shouldReturn` UploadLost
+      swapStanding ticket `shouldReturn` SwapFailed
+      _ ← try @SomeException (retireRecording (rigRecording rig) (at 1))
+      swapStanding ticket `shouldReturn` SwapFailed
+      resolvedNow rig handle `shouldReturn` oldSlot
+      writes ← imageWrites rig
+      [() | (_, written) ← writes, written == replacementView] `shouldBe` []
 
     it "refuses a swap that cannot be made — a stale handle, an image the table already holds, one no upload fills, one that is no texture, and a table full at its cap — changing neither the mapping nor a pending swap, and leaving the image the caller's" $ do
       -- Four slots, all the cap allows: slot 0, two textures and a pending
