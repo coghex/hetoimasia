@@ -328,6 +328,7 @@ import Hetoimasia.GPU.Vulkan.Native.TextureTable
   , registerTexture
   , releaseTexture
   , SwapTicket
+  , failPendingSwaps
   , swapTexture
   )
 import Hetoimasia.GPU.Vulkan.Native.Uploads
@@ -1525,6 +1526,10 @@ retireRendering rendering now =
   readTVarIO (renderingLive rendering) >>= \case
     Nothing → pure ()
     Just made → do
+      -- Texture swaps still pending can never take effect (GRS-9): each
+      -- fails first, touching no native object, so no ticket stays pending
+      -- whatever a later step raises or retains.
+      atomically (failPendingSwaps (liveRecording made))
       uploads ← readTVarIO (renderingUploads rendering)
       -- Uploads not yet started are cancelled before the drain, and those
       -- started are settled with the frame-less work it drains (GRS-6).

@@ -13,7 +13,7 @@ module Test.GPU.Vulkan.GLFW.Actions (spec) where
 
 import Control.Concurrent (forkIO, myThreadId)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
+import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, registerDelay, writeTVar)
 import Control.Exception (Exception (..), ExceptionWithContext (..), SomeException, throwIO, toException, try)
 import Control.Monad (void, when)
 import qualified Data.ByteString as ByteString
@@ -47,6 +47,7 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , readTicket
   )
 import Hetoimasia.GPU.Vulkan.Native.Uploads (UploadRequest (..), UploadState (..), awaitUploadTicket, validateUploadConfig)
+import Hetoimasia.GPU.Vulkan.Native.TextureTable (SwapState (..), readSwapTicket, validateTableConfig)
 import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost (..), GraphicsSessionFailed (..), RootStanding (..), RootsView (..), TerminalCause (..))
 import Hetoimasia.Runtime.GLFW
   ( ScheduledStep (..)
@@ -57,6 +58,8 @@ import Hetoimasia.Runtime.GLFW
   , defaultScheduledHooks
   , graphicsAttachment
   , hostPendingAttachments
+  , ownerDestroyed
+  , publishOwnerDestruction
   , hostWindowClient
   , OwnerStatus (..)
   , readOwnerFailure
@@ -99,6 +102,7 @@ spec = describe "Vulkan surface-free sessions and owner-thread actions" $ do
   describe "frame-less batches (GRS-12)" $ do
     itBounded "are recorded inside an action with no target, submitted in seal order when it returns, and complete their tickets only on fence evidence, waited on with a deadline" testFramelessBatches
     itBounded "are discarded when their action raises, submitting nothing" testFramelessRaising
+    itBounded "fail a texture swap still pending at the owner's exit before frame-less retirement, which retains a batch that never completed (GRS-9)" testSwapAtRetirement
 
   describe "zero-target progress" $ do
     itBounded "admits uploads from another thread into an idle owner with no target, keeps them uploading past a wait's deadline while their batches are pending, and completes them on fence evidence" testUploads
@@ -537,6 +541,39 @@ testUploads = do
   owner' `shouldBe` replicate 2 (Left RefusedOwnerWait)
   Just verdict ← readTVarIO (rigVerdict rig)
   verdictIssues verdict `shouldBe` []
+
+-- | A texture swap accepted before the owner's exit, whose replacement's
+-- upload never completes because no submission does, fails at the exit: the
+-- retirement fails every pending swap before it retires the frame-less
+-- batches, which retain the batch that never completed, so the swap's ticket
+-- is settled however the rest of the teardown ends.
+testSwapAtRetirement ∷ IO ()
+testSwapAtRetirement = do
+  rig ← withUploads (either (error . show) id (validateUploadConfig (1024 * 1024) 65536 4)) <$> surfaceFreeRig 0
+  submissionsComplete rig False
+  held ← newTVarIO Nothing
+  _ ← runRigCaught rig $ \host _ → do
+    awaitReady host
+    (handle, replacement) ← returned =<< act host (VulkanAction (\construction → do
+      constructTextureTable construction (either (error . show) id (validateTableConfig 16 4 2)) >>= either (failWith . show) pure
+      old ← constructImage construction (ImageDescription TextureImage Rgba8Linear 2 2 1) >>= either (failWith . show) pure
+      replacement ← constructImage construction (ImageDescription TextureImage Rgba8Linear 2 2 1) >>= either (failWith . show) pure
+      handle ← registerConstructedTexture construction old >>= either (failWith . show) pure
+      pure (handle, replacement)))
+    _ ← submitVulkanUpload (vulkanController host) (UploadImage replacement [ByteString.replicate 16 1]) >>= either (failWith . show) pure
+    ticket ← returned =<< act host (VulkanAction (\construction → swapConstructedTexture construction handle replacement >>= either (failWith . show) pure))
+    atomically (writeTVar held (Just ticket))
+    -- The exit retains the batch that never completed, and finishes only on
+    -- independent evidence of the owner's destruction, which this publishes
+    -- once the swap has failed — or after a bound, so a ticket left pending
+    -- fails the example rather than hanging it.
+    let owner = vulkanGraphicsOwner host
+    bound ← registerDelay 15000000
+    void . forkIO $ do
+      atomically ((readSwapTicket ticket >>= check . (== SwapFailed)) `orElse` (readTVar bound >>= check))
+      publishOwnerDestruction owner (ownerDestroyed "published independently by the example")
+  ticket ← readTVarIO held >>= maybe (failWith "the swap was not accepted") pure
+  atomically (readSwapTicket ticket) >>= (`shouldBe` SwapFailed)
 
 -- | An action that seals a frame-less batch and then raises submits nothing:
 -- the batch is discarded, and its ticket says so.

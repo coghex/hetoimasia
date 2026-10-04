@@ -89,6 +89,7 @@ module Hetoimasia.GPU.Vulkan.Native.TextureTable
   , SwapTicket
   , SwapState (..)
   , readSwapTicket
+  , failPendingSwaps
 
     -- * Pipelines and draws
   , textureTableDescriptors
@@ -113,5 +114,5 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Table
   , releaseTexture
   , swapTexture
   )
-import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State (SwapState (..), SwapTicket, readSwapTicket)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State (SwapState (..), SwapTicket, failPendingSwaps, readSwapTicket)
 import Hetoimasia.GPU.Vulkan.Native.Shader.Interface (textureTableDescriptors)

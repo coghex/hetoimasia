@@ -45,6 +45,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , SwapState (..)
   , SwapTicket (..)
   , readSwapTicket
+  , failPendingSwaps
 
     -- * The shared ring (GRS-4)
   , RingSize
@@ -102,6 +103,7 @@ import Control.Concurrent (ThreadId, myThreadId)
 import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVar, newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import Control.Exception (Exception (displayException), SomeAsyncException, SomeException, fromException, throwIO)
 import Data.ByteString (ByteString)
+import Data.Foldable (for_)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
@@ -374,6 +376,19 @@ instance Show SwapTicket where
 -- | Where the swap stands now. It never waits.
 readSwapTicket ∷ SwapTicket → STM SwapState
 readSwapTicket (SwapTicket cell) = readTVar cell
+
+-- | Fail every texture swap still pending (GRS-9), touching no native object:
+-- none can take effect once the session retires. A host's retirement does
+-- this first, before any step that may raise or retain, so no ticket is left
+-- pending whatever happens to the rest of the teardown; the replacements are
+-- released with every other live generation. Doing it again changes nothing.
+failPendingSwaps ∷ Recording q inst msgr phys dev cmd → STM ()
+failPendingSwaps recording =
+  readTVar (recordingTable recording) >>= \case
+    Nothing → pure ()
+    Just table → do
+      for_ (tableSwapTickets table) (`writeTVar` SwapFailed)
+      writeTVar (recordingTable recording) (Just table {tableSwapTickets = Map.empty})
 
 -- | The recording's state, owned by the calling thread. The public
 -- constructor is "Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Disposal"'s
