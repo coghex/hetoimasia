@@ -2227,8 +2227,9 @@ three values once and never clamps them:
   application chooses otherwise.
 
 Zero, negative and unrepresentable values are refused, naming the value
-(`TableConfigRefused`). The table is fixed-size: it allocates its initial
-size, and growth up to the declared cap is GRS-14's.
+(`TableConfigRefused`). The table allocates its initial size, and grows
+toward the declared cap as registrations need slots
+([Growth](#the-texture-table), below).
 
 **Making it.** `createTextureTable recording uploads config` makes the
 session's one table, on the owner's thread. A second is `RefusedMisuse`
@@ -2240,10 +2241,12 @@ asked for and the limit, and nothing is made:
 - the four samplers against `maxDescriptorSetUpdateAfterBindSamplers`;
 - a stage's every table binding (the cap, four samplers and the lookup
   buffer) against `maxPerStageUpdateAfterBindResources`;
-- set 0's pool, the four samplers and the initial images, against
-  `maxUpdateAfterBindDescriptorsInAllPools`;
+- set 0's pools against `maxUpdateAfterBindDescriptorsInAllPools`. That is
+  every generation's pool at once, from the initial size doubling to the cap,
+  each holding the four samplers and its set's images, since in the worst case
+  batches still hold every older generation's pool;
 - the two sets against `maxBoundDescriptorSets`;
-- one version's bytes against `maxStorageBufferRange`;
+- one version's bytes, the cap's entries, against `maxStorageBufferRange`;
 - the last version's dynamic offset against what 32 bits hold;
 - the whole ring against the largest buffer the device makes.
 
@@ -2270,8 +2273,10 @@ anything else back:
    Each set is allocated after its pool exists and is freed with it.
 5. **The version ring**: one host-visible lookup buffer, made and mapped as
    the uploads' staging buffer is (`createMapped`). One version is the
-   initial size's lookup entries of eight bytes each, a little-endian slot
-   then generation. Versions sit at a stride rounded up to both the device's
+   **cap's** lookup entries of eight bytes each, a little-endian slot then
+   generation. Set 1 and the ring are sized for the cap from the start and
+   never rebuilt, so only set 0 grows (GRS-14); lookup indices span the
+   whole cap. Versions sit at a stride rounded up to both the device's
    `minStorageBufferOffsetAlignment` and its non-coherent atom. Set 1's
    descriptor is written once, over one version's range.
 6. **One managed version generation for each ring entry.** It owns no
@@ -2361,6 +2366,59 @@ them while it is outstanding. A texture released before its
 upload completes was never written into a version, so its slot is reclaimed
 at once. Its image is released after that upload settles.
 
+**Growth.** GRS-14 (#344) lets set 0 grow, by D-22 and D-31's rule.
+
+When `registerTexture` finds no free slot, the table grows at once, even
+while released slots are still retiring. The pure rule is `growTable`: it
+doubles the slots set 0 holds, never past the cap, so a cap that is no power
+of two is reached exactly. `growSet` then does the native work:
+
+1. A descriptor pool of its own, for the four samplers and the new count of
+   images, is made as a managed generation.
+2. A set is allocated from it over the same set 0 layout, at the new
+   variable count. The layout declared the cap, so every pipeline layout and
+   pipeline built before the growth stays compatible and is not rebuilt, and
+   #341's interface check is unaffected.
+3. Every written slot's descriptor — each completed texture's, and slot 0's
+   placeholder once written (`writtenSlots`) — is copied into the new set at
+   the same element, with `vkCopyDescriptorSet` (`CopySampledImages`). The
+   immutable samplers belong to the layout, so nothing is copied into their
+   binding.
+4. In one transaction, the new set becomes current for every batch that
+   binds the table afterwards, and the old set's pool is released. A batch
+   that bound the old set retains its pool, so the old set and its pool are
+   destroyed together only once no live batch holds them. A batch discarded
+   unsubmitted lets its holds go the same way.
+
+Slots, handles and versions are unchanged by growth. The registration is
+then made in the larger set. At the cap with no free slot, registration is
+`RefusedBackpressure` `TextureSlotBudget` until a released slot is
+reclaimed, and a reclaimed slot at the cap is reused with no further growth.
+
+The pool, the set and the copy are one creation, made with `constructOnce`,
+a construction with no recovery of its own, so the model knows the pool as
+a generation only once all three succeeded. A growth whose pool creation,
+set allocation or descriptor copy fails destroys the pool natively before
+the creation raises. It leaves the current set and the bookkeeping as they
+were, and no handle or slot changes. The rollback is therefore complete
+before any retry, and nothing the attempt made is left for a reclamation
+pass to find or miss. The grown set is named inside the creation too, under
+the identity the model is about to issue its pool. Naming the pool comes
+after the creation has committed it, and a failure there releases the pool
+for disposal rather than destroying it. So an out of memory there is raised
+as itself, with no recovery, and a retry never runs beside a pool not yet
+destroyed.
+
+A native out of memory then enters #333's single reclamation pass and at
+most one retry of the whole growth; no step obtains a separate retry. A
+growth not recovered raises `AllocationNotRecovered`, which is what the
+registration answers with. As everywhere, the retry is permitted only after
+the pass disposed of something and while the session is healthy.
+
+The doubling (`grownSlots`) is computed wider than 32 bits, both for the
+growth and for the pool-limit check's generations, so a count past 2^31
+reaches the cap rather than wrapping.
+
 **Bringing it up to date.** `refreshTable` writes the placeholder once its
 upload completes and writes each newly complete texture into its slot. It
 then reclaims every retiring slot no live version maps, releasing its image.
@@ -2399,11 +2457,19 @@ native call:
 
 **Binding and drawing.** `bindTable recorder` binds both sets under the bound
 pipeline's layout, with the dynamic offset of the batch's version, through
-`vkCmdBindDescriptorSets`. A batch takes its version at its first binding
-and keeps it: a later binding in the same batch, after any change, binds the
-same version. The batch retains the version generation, the table's
-samplers, set layouts, pools and lookup buffer, the placeholder and every
-image its version maps. `selectSampler recorder n`
+`vkCmdBindDescriptorSets`.
+
+- A batch's first binding pins the current set 0, its pool and the version,
+  a coherent pair; a later binding in the same batch, after any change or
+  growth, binds the same sets and version.
+- The first binding retains the version generation, the table's samplers,
+  set layouts, lookup pool and lookup buffer, the pinned set 0's pool, the
+  placeholder and every image its version maps. A later binding retains only
+  the layout it binds under, so a pool or an image released since the first
+  binding stays held but is never retained again.
+
+Any version published before a growth is valid in the larger set, which
+holds every slot it maps. `selectSampler recorder n`
 pushes `n` at the layout's declared sampler offset. Binding a pipeline whose
 layout does not hold the table disturbs the binding and the sampler, so the
 table's pipeline needs both again. Refused with no native call:
@@ -2535,7 +2601,8 @@ synchronization validation, reports nothing.
 | State | Owner | Readers and writers | Thread | Lifetime | Reset or disposal |
 | --- | --- | --- | --- | --- | --- |
 | The table's book: handles, generations, the slot map, the current version, the free and retiring slots | The recording (`recordingTable`, `tableBook`) | Registration, release, completion, binding and reclamation, all through the pure rules | The graphics owner; observers read it in STM | From `createTextureTable` until the recording retires | Never reset; the recording's retirement releases what it holds |
-| The samplers, set layouts, pools and sets | The recording, as managed generations the table names | Made once; bound by batches, which retain them | The graphics owner | Until `retireRecording` | Destroyed with every other managed resource, pools before set layouts before samplers |
+| The samplers, set layouts, set 1's pool and sets | The recording, as managed generations the table names | Made once; bound by batches, which retain them | The graphics owner | Until `retireRecording` | Destroyed with every other managed resource, pools before set layouts before samplers |
+| Set 0's generations and their pools | The recording (`tableTexturePool`, the current one; each older one only through the batches that hold it) | Construction makes the first; each growth makes the next, copies into it, makes it current and releases the previous one; each batch's first bind pins and retains the current one | The graphics owner | A generation from its making until it is superseded and no batch holds it; the current one until `retireRecording` | A superseded pool is destroyed, freeing its set, once no live batch holds it; the current one with every other managed resource |
 | The version ring's buffer and mapping | The recording, as a managed lookup buffer | The owner writes a version into an entry no batch holds; the device reads the entry a batch bound | The graphics owner | Until `retireRecording` | Destroyed with every other managed resource |
 | Each ring entry's version generation | The recording | Batches retain it through the model's holds; `versionHeld` reads them | The graphics owner | Until `retireRecording` | Destroyed with every other managed resource |
 | The images the table holds | The recording (`tableTextures`) | Registration adds; reclamation removes and releases | The graphics owner | From registration until no live version maps the image's slot | Released then; destroyed once nothing holds it |
@@ -4895,7 +4962,7 @@ companions — and adds the Vulkan owner's:
 | Main thread | Hspec runs on a thread of its own; the process main thread owns one shared production graphics session: `withLoaderIntegration`, then `runGraphicsOwnerApplication` over `withVulkanOwnerHost`, with the production native layer and surface bridge. An example that needs the main thread — to hand a window's surface over, which GLFW creates there, or to close a window — submits an operation (`onMain`); the main thread runs it between two turns of the host's owner loop and returns its result or rethrows its failure. Windows are created through the host's command port from the example's own thread, which the owner loop executes, as an application's worker would. |
 | Identities | Every dispatched operation is checked, before it runs, to be on the bound process main thread that entered the session — the Haskell thread, the bound flag, and the OS thread read through `pthread_self` — and a failed check fails the operation and the run. Every native call the session makes is recorded where it runs by a `NativeObserver`, so an example shows from the calls themselves that the instance, its messenger, the device and every surface's destruction ran on the graphics owner's thread and every surface's creation on the main thread — never from the name of an Hspec hook. |
 | Sharing | The roots — the instance, its explicit messenger, and the one device — are acquired lazily, by the first dispatched operation, at most once, and shared by every later example. Each example's windows and targets are its own and are closed inside it. |
-| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, `vk12-frames`, `vk13-presentation`, `vk14-recovery`, `vk15-validation-stop`, `vk15-retention`, `vk16-composed`, `vk17-one-slot`, `vk17-two-slots`, `vk19-capture`, `grs15-surface-free`, `grs15-surface-free-window`, `grs12-frameless`, `grs3-ordering`, `grs7-texture-table`, `grs8-sprites`, `synchronization-hazard`, `debug-names`, and, under the isolated compositor's consent only, `wayland-connection-loss`. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. Each child runs in a process group of its own under an external 20-second deadline covering its exit and the end of its output; one still running at it is terminated with its group and fails its example as expired. |
+| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, `vk12-frames`, `vk13-presentation`, `vk14-recovery`, `vk15-validation-stop`, `vk15-retention`, `vk16-composed`, `vk17-one-slot`, `vk17-two-slots`, `vk19-capture`, `grs15-surface-free`, `grs15-surface-free-window`, `grs12-frameless`, `grs3-ordering`, `grs7-texture-table`, `grs8-sprites`, `grs14-table-growth`, `synchronization-hazard`, `debug-names`, and, under the isolated compositor's consent only, `wayland-connection-loss`. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. Each child runs in a process group of its own under an external 20-second deadline covering its exit and the end of its output; one still running at it is terminated with its group and fails its example as expired. |
 | Selection | Building, listing and filtering the tree, a `--dry-run`, and a selection that dispatches nothing acquire nothing and start no child. A selection matching no example fails. `--complete`, which the catalog group passes, runs the whole tree with Hspec's configuration reading left out and then fails unless the shared session was acquired once and every private scenario the run's consent requires ran and passed — every one, except that `wayland-connection-loss` is required under the isolated compositor's consent and pending under any other — so no ambient setting can turn the group's receipt into a pass for a subset. The consent rules and the migrated proof's pure release, construction, publication and loader-selection examples need no session and run without consent. |
 | Consent | Read once, at startup, from `HETOIMASIA_NATIVE_SESSION`, with the GLFW suite's rules for `desktop`, `isolated-x11:<display>` and `isolated-wayland:<socket>`: the last only on Linux, only when `WAYLAND_DISPLAY` names that socket, and never beside a `DISPLAY`. Under the Wayland consent every session requests Wayland by name — the shared host, each child's host, the VK-5 bridge's loader-aware session, and the proof shim's raw initialization, which sets `GLFW_PLATFORM` and fails one that selected another platform — so no X11 or XWayland session stands in; under the others every session requests nothing, as before. The first shared example asserts the platform GLFW selected before any example renders. Without consent every native example is refused before its body, the session is never acquired, and the run ends with the refusal on stderr and a non-zero exit. |
 | Environment | Before any Vulkan call, the suite clears every ambient discovery override and every validation-layer setting it finds and records which, disables implicit layers, and points the layer's settings file at an empty one; a child inherits and re-establishes the same environment. |
@@ -5208,6 +5275,32 @@ write-after-write at the third submission, but nothing for the depth target's
 load-op clear across submissions: for the depth target the case shows the
 barriers recorded and their layouts accepted, not a hazard the layer could
 have seen.
+
+GRS-14's case, `grs14-table-growth`, runs the same surface-free composition
+with a table of five slots at most, two at first, and a pipeline built over
+it before any growth. Its steps:
+
+1. A batch is recorded with the first texture's handle.
+2. The second texture's registration then grows the table to four slots
+   before the batch is submitted.
+3. The third and fourth textures grow it to its cap of five, and a fifth is
+   backpressure.
+4. A second batch draws the first texture beside the fourth, with the
+   pipeline built before both growths.
+
+It passes only if all of these hold:
+
+- no window, surface or image acquisition was made, and the device came
+  first;
+- set 0 held 2, 4 and then 5 slots, in three distinct sets, from four
+  descriptor pools in all;
+- the fifth registration was `RefusedBackpressure` `TextureSlotBudget`;
+- one pipeline served every draw;
+- both readbacks probe exactly: the first batch the first texture, the second
+  batch both textures;
+- every pool was destroyed before the device, with every call on the owner's
+  thread;
+- the verdict, with synchronization validation, is clean.
 
 GRS-8's case, `grs8-sprites`, runs the sprites sample's window-free evidence
 ([samples/sprites/README.md](../samples/sprites/README.md)) over the same
