@@ -34,6 +34,10 @@ module Test.Vulkan.Proof.Diagnostics
   , DiagnosticsFacts (..)
   , PhaseReports (..)
   , runDiagnostics
+  , stoppedSession
+  , instanceScope
+  , instanceLabel
+  , messengerLabel
   , submittedMessageId
   , provokedValidationId
   , unsafeImportNames
@@ -45,7 +49,7 @@ module Test.Vulkan.Proof.Diagnostics
   ) where
 
 import Control.Concurrent.STM (atomically, modifyTVar', newTVarIO, readTVarIO)
-import Control.Exception (SomeException, displayException, mask, onException, throwIO, try)
+import Control.Exception (SomeException, displayException, throwIO, try)
 import Control.Monad (forM, unless)
 import Data.Bits ((.&.))
 import Data.ByteString (ByteString)
@@ -105,6 +109,7 @@ import Hetoimasia.GPU.Vulkan.Native.Diagnostics
   )
 import Hetoimasia.GPU.Vulkan.Native.Roots.Vulkan (validationFeaturesInfo)
 import Test.GPU.Vulkan.Native.Environment (validationFeatures)
+import Test.GPU.Vulkan.Native.InstanceScope (InstanceOps (..), withInstanceScope)
 import Test.Vulkan.Proof.Interop (Provenance (..), provenanceOf)
 import Test.Vulkan.Proof.Journal (Journal, heading, note)
 
@@ -224,7 +229,7 @@ runDiagnostics journal = do
   case outcome of
     Left failure → do
       note journal ("the capture session stopped: " <> Text.pack (displayException failure))
-      pure (DiagnosticsStopped (Text.pack (displayException failure)) (diagnosticVerdict failure) seen)
+      pure (stoppedSession failure seen)
     Right ((device, located), verdict) → do
       executable ← Text.pack <$> (getExecutablePath >>= canonicalizePath)
       -- The image the dynamic linker names can be the path the program was
@@ -250,6 +255,27 @@ runDiagnostics journal = do
               , factsUnsafeImports = unsafeImportNames
               }
         )
+
+-- | What a session that raised reports: the reason is the exception that left
+-- the capture lifetime, and the verdict the one the lifetime attached to it.
+-- When the body failed, that exception is the body's own, whatever its
+-- teardown raised after it.
+stoppedSession ∷ SomeException → [PhaseReports] → DiagnosticsOutcome
+stoppedSession failure = DiagnosticsStopped (Text.pack (displayException failure)) (diagnosticVerdict failure)
+
+-- | The cleanup labels of the session's instance and explicit messenger.
+instanceLabel, messengerLabel ∷ Text
+instanceLabel = "the VK-6 instance"
+messengerLabel = "the VK-6 explicit messenger"
+
+-- | The session's instance scope: the instance, then the explicit messenger,
+-- around everything else, destroyed in the reverse order on every exit. When
+-- the body fails, its failure leaves the scope even if a destruction raises
+-- too, and the stopped session's reason and verdict are the body's. A
+-- destruction that raised is retained under its label and issues no
+-- 'Quiesced' evidence. See "Test.GPU.Vulkan.Native.InstanceScope".
+instanceScope ∷ InstanceOps inst msgr q → (inst → IO r) → IO (r, q)
+instanceScope = withInstanceScope instanceLabel messengerLabel
 
 -- | Hand each phase the delivered records its reports became. The worker
 -- delivers in admission order, so when every report was admitted the phases'
@@ -341,12 +367,8 @@ session journal phases cursor capture = do
   -- lifetime closes admission. It is destroyed through the native package's
   -- quiescing destroy on both the returning and the unwinding path, and its
   -- return is the evidence the lifetime needs that no callback can still run.
-  let inside vulkan =
-        withResourceLabelled
-          "the VK-6 explicit messenger"
-          (step "vkCreateDebugUtilsMessengerEXT" (createCaptureMessenger vulkan capture))
-          (step "vkDestroyDebugUtilsMessengerEXT" . destroyCaptureMessenger vulkan)
-          $ \_ → do
+  -- A destroy that raises returns none, and never replaces a body failure.
+  let inside vulkan = do
             heading journal "VK-6: a message submitted through an unsafe import"
             step submitPhase (submitUnsafely vulkan)
             note journal "vkSubmitDebugUtilsMessageEXT returned from its unsafe import"
@@ -436,12 +458,14 @@ session journal phases cursor capture = do
             heading journal "VK-6: teardown"
             note journal "the device and its pool are gone; the explicit messenger is destroyed next, then the instance"
             pure (deviceName, callback)
-  mask $ \restore → do
-    vulkan ← step creationPhase (createInstance createInfo Nothing)
-    let quiesce = step destructionPhase (destroyInstanceQuiesced capture vulkan)
-    result ← restore (inside vulkan) `onException` quiesce
-    token ← quiesce
-    pure (result, token)
+  instanceScope
+    InstanceOps
+      { instanceCreate = step creationPhase (createInstance createInfo Nothing)
+      , instanceDestroy = step destructionPhase . destroyInstanceQuiesced capture
+      , messengerCreate = \vulkan → step "vkCreateDebugUtilsMessengerEXT" (createCaptureMessenger vulkan capture)
+      , messengerDestroy = \vulkan → step "vkDestroyDebugUtilsMessengerEXT" . destroyCaptureMessenger vulkan
+      }
+    inside
   where
     describe provenance =
       maybe "an unnamed address" id provenance.provenanceSymbol
