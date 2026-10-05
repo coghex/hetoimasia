@@ -9,7 +9,7 @@ static-image milestone (render-2d D-14). Each kind of codec lives in its own
 package, so audio, video and later formats never drag image code along and
 CI stays light.
 
-Design state: `exploring`
+Design state: `ready for issue processing`
 
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
 reviewed and deliberately not tracked separately · `[deferred]` blocked on a
@@ -19,6 +19,7 @@ concrete precondition
 
 - [ ] EPIC. Asset: establish decoding packages, starting with images
 - [ ] AST-1. Decode PNG into premultiplied RGBA8 levels in `asset` and `asset-image`
+- [ ] AST-4. Generate mip chains for decoded images
 - [ ] AST-3. Decode BC7 to RGBA8 in software for devices without BC support
 - [ ] AST-2. Read KTX2 files carrying BC7 or RGBA8 levels in `asset-image`
 
@@ -250,6 +251,8 @@ Owner decision 2026-10-05, delegating ordering and splitting: AST-3, the
 BC7 decoder, moves before AST-2, so KTX2 can compute BC7's mark (D-10). The
 decoder decodes raw blocks as a pure function; choosing it for a device
 without BC7 (D-7) is the caller's, from the device's reported BC support.
+Mip generation (D-6, D-10) moves from AST-1 into its own slice, AST-4, so
+each pull request stays reviewable.
 
 ## Open questions
 
@@ -276,6 +279,9 @@ Resolved by D-5.
   layouts, including premultiplication, sRGB and linear variants, and
   malformed or unsupported inputs that must be refused.
 - BC7 levels checked against an independent decode, never a GPU readback.
+- Each slice updates the packages' READMEs in the same pull request (owned
+  state, threads and lifetimes, as AGENTS.md requires). Decoding is pure and
+  deterministic; nothing here is persisted beyond the input files.
 - End to end, `render-2d`'s R2D-8 sample shows a decoded image.
 
 ## Delivery plan
@@ -285,19 +291,33 @@ Resolved by D-5.
 - **Outcome:** an application turns PNG bytes into upload-ready levels.
 - **Scope:** the `asset` core (identity, decoded types, decoder interface,
   provenance); PNG decoding through JuicyPixels into premultiplied RGBA8,
-  sRGB or linear; the binary-alpha mark; requested mip chains, preserving
-  coverage for cutout-marked textures.
+  sRGB or linear, as a single level; the binary-alpha mark.
 - **Phase:** 1
 - **Depends on:** `none`
 - **Ordering:** can land first
-- **Relevant decisions:** D-1, D-2, D-3, D-4, D-5, D-6, D-10
+- **Relevant decisions:** D-1, D-2, D-3, D-4, D-5, D-10
 - **Acceptance signals:** Hspec decodes fixture PNGs to known texels,
   including linear-space premultiplication of sRGB colour and untouched data
-  textures, reports the binary-alpha mark correctly, generates requested mip
-  chains matching an independent linear premultiplied downsample, preserves
-  cutout coverage at 0.5 in every generated level, and refuses malformed
+  textures, reports the binary-alpha mark correctly, and refuses malformed
   input; the packages build in the CPU project.
-- **Out of scope:** KTX2, background loading, mod assets.
+- **Out of scope:** mip generation (AST-4), KTX2, background loading, mod
+  assets.
+- **Open questions:** None
+
+### AST-4. Generate mip chains for decoded images
+
+- **Outcome:** smoothly zoomed art gets correct mip levels on request.
+- **Scope:** full mip chains generated on the caller's request, downsampled
+  in linear premultiplied space; coverage preserved at 0.5 for
+  cutout-marked textures.
+- **Phase:** 1
+- **Depends on:** AST-1
+- **Ordering:** independent
+- **Relevant decisions:** D-6, D-10
+- **Acceptance signals:** Hspec shows generated levels match an independent
+  linear premultiplied downsample, and that every generated level of a
+  cutout-marked fixture keeps level 0's coverage at 0.5.
+- **Out of scope:** mips for KTX2 files, which carry their own.
 - **Open questions:** None
 
 ### AST-3. Decode BC7 to RGBA8 in software for devices without BC support

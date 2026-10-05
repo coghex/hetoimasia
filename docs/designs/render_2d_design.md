@@ -12,7 +12,7 @@ a 3D renderer (foundation D-2). This arc carries FND-4 of the
 left to it. Synarchy (`~/work/synarchy`) is prior experience to improve on,
 not a compatibility target.
 
-Design state: `exploring`
+Design state: `ready for issue processing`
 
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
 reviewed and deliberately not tracked separately · `[deferred]` blocked on a
@@ -734,6 +734,13 @@ Resolved by D-17: a configurable list, with smooth zoom kept available.
   sample. Evidence runs are window-free (GRS D-6) and fit
   `test.vulkan-native`'s 30-second budget, on macOS locally and Linux CI,
   with clean validation or an honestly reported limitation.
+- Each slice updates its owning contract in the same pull request: the new
+  packages' READMEs (owned state, threads, lifetimes, as AGENTS.md
+  requires) and `gpu_backend.md` for backend and window-host extensions.
+- Compatibility: Synarchy source compatibility is not promised (V-1);
+  texture handles are never persisted (GRS D-1), so no save format depends
+  on this arc; ordering is total and repeatable, so identical snapshots
+  render identical images on one device.
 - The oracle stays independent where it matters: analytically known camera,
   overlap, alpha, equal-key and mip fixtures complement calculations shared
   with `render-2d`, so a shared mistake in mapping or ordering cannot pass
@@ -872,33 +879,41 @@ Moved to the [asset design](asset_design.md) as AST-2 (D-15).
 
 - **Outcome:** a publication for one window requests a frame of that
   window's target alone.
-- **Scope:** a window-integration extension in `hetoimasia-gpu-vulkan-glfw`:
-  scene publication and revisions per target, so the owner's step asks only
-  the published window for a frame; snapshot adoption with the holds and
-  release ordering of D-28; contract updates in `gpu_backend.md`.
+- **Scope:** a generic window-integration extension in
+  `hetoimasia-gpu-vulkan-glfw`, knowing nothing of `render-2d`: scene
+  publication and revisions per target, so the owner's step asks only the
+  published window for a frame; notifications to the renderer when it
+  adopts and supersedes a target's scene; and owner-thread release requests
+  that take effect only once every target has adopted the revision current
+  at the request (D-28); contract updates in `gpu_backend.md`.
 - **Phase:** 1
 - **Depends on:** `none`
 - **Ordering:** can land first
 - **Relevant decisions:** D-18, D-28, D-30
-- **Acceptance signals:** native-suite evidence with two windows in which a
-  publication for one renders only that window; a release requested while
-  the current snapshot shows the object takes effect only after a later
-  snapshot is adopted.
-- **Out of scope:** `render-2d` snapshot types.
+- **Acceptance signals:** native-suite evidence, with a test renderer, of two
+  windows in which a publication for one renders only that window, and of a
+  release request deferred until a later revision is adopted.
+- **Out of scope:** `render-2d` snapshot types, and taking holds on the
+  objects a 2D snapshot references (R2D-8).
 - **Open questions:** None
 
 ### R2D-8. Show a decoded image in a window through published snapshots
 
 - **Outcome:** the milestone: an image file shown in a window.
-- **Scope:** a 2D sample that decodes a PNG with `asset-image`, uploads and
-  registers it, and publishes snapshots to the host renderer per window; UI
-  scale and content scale visible.
+- **Scope:** `render-2d-vulkan`'s host adapter, which on adoption holds
+  every object a window's snapshot references and releases them when it is
+  superseded and its recordings complete (D-28), through R2D-14's
+  notifications; a 2D sample that decodes a PNG with `asset-image`, uploads
+  and registers it, and publishes snapshots per window; UI scale and content
+  scale visible.
 - **Phase:** 1
 - **Depends on:** R2D-7, R2D-14; external: the asset epic's AST-1
 - **Ordering:** critical path
 - **Relevant decisions:** D-7, D-13, D-14, D-15, D-18, D-20, D-28
 - **Acceptance signals:** offscreen evidence of the same frame matches the
-  oracle; the owner launches the windowed mode and sees the image.
+  oracle; a texture released while the current snapshot shows it keeps
+  rendering until a snapshot without it is adopted; the owner launches the
+  windowed mode and sees the image.
 - **Out of scope:** KTX2 in the sample unless the asset epic's AST-2 has
   landed; the software BC7 decoder (AST-3).
 - **Open questions:** None
