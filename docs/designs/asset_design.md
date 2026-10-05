@@ -19,8 +19,8 @@ concrete precondition
 
 - [ ] EPIC. Asset: establish decoding packages, starting with images
 - [ ] AST-1. Decode PNG into premultiplied RGBA8 levels in `asset` and `asset-image`
-- [ ] AST-2. Read KTX2 files carrying BC7 or RGBA8 levels in `asset-image`
 - [ ] AST-3. Decode BC7 to RGBA8 in software for devices without BC support
+- [ ] AST-2. Read KTX2 files carrying BC7 or RGBA8 levels in `asset-image`
 
 ## Epic contract
 
@@ -190,6 +190,67 @@ Owner decision 2026-10-05: P-1 (pure decoders refusing with the asset and
 the reason, file reading left to the caller) and P-2 (levels shaped exactly
 as GRS D-21 accepts) are accepted as written.
 
+### Review of 2026-10-05
+
+An independent review found gaps in the KTX2 profile, cutout content, atlas
+filtering and AST-2's dependency on alpha decoding. D-9 to D-11 are recorded
+under the owner's standing instruction of 2026-10-05 to take the correct
+approach without asking, after being listed to the owner; D-12 is an owner
+decision delegating delivery order.
+
+### D-9. The accepted KTX2 profile
+
+A KTX2 file is accepted only when all of these hold, and otherwise refused
+with the reason:
+
+- `vkFormat` is `R8G8B8A8_SRGB`, `R8G8B8A8_UNORM`, `BC7_SRGB_BLOCK` or
+  `BC7_UNORM_BLOCK`, and the data format descriptor's transfer function
+  agrees with it (sRGB with the `_SRGB` formats, linear otherwise);
+- it is two-dimensional, with one layer and one face, no supercompression,
+  and at least one level stored (a level count of 0, asking the loader to
+  generate levels, is refused);
+- `KTXorientation` is absent or `rd`, and `KTXswizzle` is absent or `rgba`;
+- for a colour texture with alpha, the descriptor's premultiplied-alpha flag
+  is set for BC7, since straight-alpha BC7 cannot be premultiplied without
+  re-encoding its blocks; straight-alpha RGBA8 is premultiplied at load,
+  correctly (D-4);
+- for a data texture, the premultiplied-alpha flag is not set.
+
+### D-10. Cutout content: the mark and coverage-preserving mips
+
+- The mark (D-5) is computed from level 0's alpha: binary means every texel's
+  alpha is 0 or 255.
+- For BC7, the mark is computed by decoding the alpha of level 0's blocks,
+  which needs AST-3's decoder (D-12).
+- Generated mip levels (D-6) of a cutout-marked texture preserve coverage at
+  `render-2d`'s discard threshold of 0.5 (render-2d D-26): each level's
+  alpha is scaled so the fraction of texels at or above the threshold
+  matches level 0's. Coverage in BC7 levels is the encoder's obligation, and
+  is part of the stitcher's output contract (D-11).
+
+### D-11. The atlas content contract
+
+Clamp-to-edge clamps the whole image, not a region, and whole-sheet mips mix
+neighbouring regions. So atlases have an output contract the later stitcher
+must meet:
+
+- each region is padded by extruding its edge texels by at least 2ᴸ texels,
+  where L is the deepest mip level shipped;
+- for BC7, region origins and padded extents are multiples of 4 × 2ᴸ
+  texels, so every level's blocks hold one region;
+- a sheet ships only the mip levels its padding supports;
+- cutout sheets preserve coverage per D-10.
+
+Until the stitcher exists, supported content is single-image textures, or
+atlases drawn with nearest filtering and no mips.
+
+### D-12. Delivery order revised after the review
+
+Owner decision 2026-10-05, delegating ordering and splitting: AST-3, the
+BC7 decoder, moves before AST-2, so KTX2 can compute BC7's mark (D-10). The
+decoder decodes raw blocks as a pure function; choosing it for a device
+without BC7 (D-7) is the caller's, from the device's reported BC support.
+
 ## Open questions
 
 ### Q-1. Colour space and premultiplication
@@ -224,46 +285,53 @@ Resolved by D-5.
 - **Outcome:** an application turns PNG bytes into upload-ready levels.
 - **Scope:** the `asset` core (identity, decoded types, decoder interface,
   provenance); PNG decoding through JuicyPixels into premultiplied RGBA8,
-  sRGB or linear.
+  sRGB or linear; the binary-alpha mark; requested mip chains, preserving
+  coverage for cutout-marked textures.
 - **Phase:** 1
 - **Depends on:** `none`
 - **Ordering:** can land first
-- **Relevant decisions:** D-1, D-2, D-3, D-4, D-5, D-6
+- **Relevant decisions:** D-1, D-2, D-3, D-4, D-5, D-6, D-10
 - **Acceptance signals:** Hspec decodes fixture PNGs to known texels,
   including linear-space premultiplication of sRGB colour and untouched data
   textures, reports the binary-alpha mark correctly, generates requested mip
-  chains matching an independent linear premultiplied downsample, and
-  refuses malformed input; the packages build in the CPU project.
+  chains matching an independent linear premultiplied downsample, preserves
+  cutout coverage at 0.5 in every generated level, and refuses malformed
+  input; the packages build in the CPU project.
 - **Out of scope:** KTX2, background loading, mod assets.
+- **Open questions:** None
+
+### AST-3. Decode BC7 to RGBA8 in software for devices without BC support
+
+- **Outcome:** BC7 content works on devices that cannot sample it, and BC7
+  alpha can be classified.
+- **Scope:** a pure software BC7 decoder over raw blocks, covering every
+  mode, producing RGBA8 in the same colour space; binary-alpha
+  classification of decoded blocks; the caller chooses the decoder from the
+  device's reported BC support (GRS D-21), and its use is logged once.
+- **Phase:** 1
+- **Depends on:** AST-1
+- **Ordering:** not on the critical path
+- **Relevant decisions:** D-1, D-7, D-10, D-12
+- **Acceptance signals:** Hspec shows the decoder matches independently
+  established texels for every BC7 mode, including the sprites sample's
+  mode-6 fixture, and classifies alpha correctly.
+- **Out of scope:** KTX2, encoding BC7.
 - **Open questions:** None
 
 ### AST-2. Read KTX2 files carrying BC7 or RGBA8 levels in `asset-image`
 
 - **Outcome:** compressed textures load alongside PNG.
-- **Scope:** a pure Haskell KTX2 reader without supercompression; BC7 and
-  RGBA8 levels, sRGB and linear; refusal of unsupported files.
+- **Scope:** a pure Haskell KTX2 reader enforcing the accepted profile;
+  BC7 and RGBA8 levels, sRGB and linear; premultiplying straight-alpha
+  RGBA8; the mark, through AST-3's decoder for BC7.
 - **Phase:** 1
-- **Depends on:** AST-1
+- **Depends on:** AST-3
 - **Ordering:** independent
-- **Relevant decisions:** D-1, D-3, D-4, D-5
+- **Relevant decisions:** D-1, D-3, D-4, D-5, D-9, D-10, D-12
 - **Acceptance signals:** Hspec reads fixture KTX2 files to the expected
-  levels and binary-alpha mark.
-- **Out of scope:** decoding BC7 in software (AST-3), encoding BC7, the
-  sheet stitcher.
-- **Open questions:** None
-
-### AST-3. Decode BC7 to RGBA8 in software for devices without BC support
-
-- **Outcome:** BC7 content works on devices that cannot sample it.
-- **Scope:** a software BC7 decoder covering every mode, producing RGBA8
-  levels in the same colour space; selecting it when the device's BC query
-  (GRS D-21) finds no BC7; one diagnostic when it is used.
-- **Phase:** 1
-- **Depends on:** AST-2
-- **Ordering:** not on the critical path
-- **Relevant decisions:** D-1, D-7
-- **Acceptance signals:** Hspec shows the decoder matches independently
-  established texels for every BC7 mode, including the sprites sample's
-  mode-6 fixture.
-- **Out of scope:** encoding BC7.
+  levels and mark, and refuses each case outside the profile:
+  supercompression, other dimensionality, orientation or swizzle,
+  straight-alpha BC7, and a transfer function that disagrees with the
+  format.
+- **Out of scope:** encoding BC7, the sheet stitcher.
 - **Open questions:** None

@@ -514,8 +514,9 @@ sets.
 For `render-2d`, the [2D renderer design](render_2d_design.md)'s D-4
 (2026-10-05) moves the sampler choice from the push constants into each
 instance's flags word, so mixed filtering stays in one draw. The table and
-its samplers are unchanged; this concerns only how a consumer's shader picks
-a sampler.
+its samplers are unchanged, but the recorder today refuses a table draw
+before a pushed sampler selection; the 2D design's R2D-16 extends the
+backend with table pipelines that choose samplers in the shader.
 
 ### D-23. Instances carry stable handles, resolved through a per-frame lookup
 

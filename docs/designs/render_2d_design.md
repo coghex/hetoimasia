@@ -27,10 +27,14 @@ concrete precondition
 - [ ] R2D-4. Compute expected pixels from a snapshot in `render-2d-oracle`
 - [no-issue] R2D-5. Decode PNG into premultiplied RGBA8 levels — moved to the asset epic as AST-1 (D-15)
 - [no-issue] R2D-6. Read KTX2 files carrying BC7 or RGBA8 levels — moved to the asset epic as AST-2 (D-15)
-- [ ] R2D-7. Record the translucent path in `render-2d-vulkan`, proven by offscreen readback
+- [ ] R2D-16. Let table pipelines choose samplers in the shader
+- [ ] R2D-7. Record the ordered path in `render-2d-vulkan`, proven by offscreen readback
+- [ ] R2D-14. Publish scenes per window in the window host
 - [ ] R2D-8. Show a decoded image in a window through published snapshots
+- [ ] R2D-17. Clear a depth attachment within a rectangle
 - [ ] R2D-9. Draw cutout sprites depth-tested in world layers
 - [ ] R2D-10. Retain static instance content across frames
+- [ ] R2D-15. Bind per-batch storage tables from the ring
 - [ ] R2D-11. Accept application materials as checked fragment functions
 - [ ] R2D-12. Clip instances by index in the shader
 - [ ] R2D-13. Sample an offscreen pass's target in later passes
@@ -150,7 +154,10 @@ ran for this document.
   translucent and cutout paths, material wrapping, clipping.
 - Retained static instance content.
 - A windowed sample and offscreen evidence.
-- The backend extension that lets an offscreen target be sampled (R2D-13).
+- The backend and window-host extensions these need (D-30): shader-chosen
+  samplers (R2D-16), per-window publication (R2D-14), depth clears within a
+  rectangle (R2D-17), per-batch storage tables (R2D-15) and sampled
+  offscreen targets (R2D-13).
 
 ### Out of scope
 
@@ -185,13 +192,15 @@ The decisions below govern. The owner accepted these proposals as written on
 - **P-3. Depth keys.** The adapter supplies an unsigned integer; the renderer
   maps it to depth exactly, using the 2²⁴ evenly spaced values a 32-bit float
   holds in [0, 1). Equal keys in the cutout pass resolve by draw order under
-  less-or-equal compare.
+  less-or-equal compare. D-23 makes the domain, direction, formula, format
+  and equal-key rule exact.
 - **P-4. The instance's flags word** holds the sampler choice (default,
-  nearest, linear; 2 bits), the translucent override (1 bit) and the clip
-  index (16 bits), with the rest reserved (D-4, D-11).
+  nearest, linear; 2 bits), the translucent override (1 bit), the additive
+  flag (1 bit, D-24) and the clip index (16 bits), with 12 bits reserved
+  (D-4, D-11).
 - **P-5. Per-batch tables** — clip rectangles (D-11) and material data
   (D-5) — are written to ring regions the batch claims (GRS D-33) and bound
-  for that batch.
+  for that batch, through the storage tables R2D-15 adds (D-30).
 - **P-6. Material wrapping.** The engine generates each material's cutout
   and translucent variants and applies tint, the cutout discard or the blend
   output, and the view's brightness around the material's colour, so no
@@ -238,7 +247,9 @@ A texture marked cutout-safe defaults to the cutout pass. An instance whose
 tint alpha is below 1, or that sets the translucent flag, goes to the sorted
 pass, so fading sprites blend correctly. The renderer splits the dynamic
 snapshot by pass; retained content fixes its pass when built. Where the mark
-comes from is D-19.
+comes from is D-19. Routing is refined by D-22 (where no depth exists), D-24
+(additive instances), D-25 (material capability) and D-27 (the mark is fixed
+at registration).
 
 ### D-4. One 64-byte instance format
 
@@ -250,8 +261,8 @@ Both passes share one instance format:
 | UV rectangle; the adapter resolves sheet regions | 16 |
 | Texture handle (lookup index and generation) | 8 |
 | Integer depth key | 4 |
-| Premultiplied RGBA8 tint; alpha 0 gives additive | 4 |
-| Flags (sampler choice, translucent override, clip index) | 4 |
+| RGBA8 tint, a componentwise multiplier (D-24) | 4 |
+| Flags (sampler choice, translucent override, additive, clip index) | 4 |
 | Material parameter word (D-5) | 4 |
 
 The sampler choice moves into the instance, so mixed filtering stays in one
@@ -271,9 +282,9 @@ and supplies a built-in default material. An application material is a
 fragment function checked at build time through the Template Haskell
 interface check (GRS D-19). The engine builds each material's cutout and
 translucent variants. Parameters arrive in a small push-constant block per
-draw and in the per-instance parameter word, which can carry, for example, a
-second texture's lookup index or an index into per-batch material data.
-Draws split by material.
+draw and in the per-instance parameter word, which indexes a material data
+record; any further texture a material samples is a full handle in that
+record, never a bare lookup index (D-25). Draws split by material.
 
 Materials come only from the application's build: there is no live shader
 loading, and mods choose among the materials the game provides. This is
@@ -486,6 +497,149 @@ order within a world layer, exact integer depth-key mapping, the flags-word
 layout, per-batch tables in the ring, engine-applied material wrapping, and
 picking left to the game.
 
+### Review of 2026-10-05
+
+An independent review of this design, the asset design and the GPU services
+pointers found gaps which D-22 to D-30 close. Its code claims were verified
+against `master@22688297`:
+
+- the host publishes one scene revision that requests every eligible target
+  (`packages/gpu-vulkan/glfw/controller/Hetoimasia/GPU/Vulkan/GLFW/Internal/Loop.hs:190`);
+- a table draw is refused before a pushed sampler selection, and while any
+  image the bound version maps is in a use other than sampling
+  (`tableReady` in
+  `packages/gpu-vulkan/native/src/Hetoimasia/GPU/Vulkan/Native/Internal/Recording/Recorder.hs`);
+- the ring's `InstanceBuffer` has vertex and index usage only
+  (`.../Internal/Recording/Layer.hs:428`);
+- table pipelines may declare no binding beyond the table's
+  (`docs/gpu_backend.md`, *The texture table*);
+- the recorder has no clear of an attachment within a rectangle;
+- a batch's first table bind retains every image its version maps.
+
+D-22 to D-29 are recorded under the owner's standing instruction of
+2026-10-05 to take the correct approach without asking, after being listed
+to the owner; D-27 and D-30 are explicit owner decisions.
+
+### D-22. Without depth, every instance takes the ordered path
+
+Routing to the cutout pass happens only in a world layer whose depth is
+enabled. Before R2D-9, and in every UI or overlay layer, all instances,
+cutout-marked or not, draw in the ordered path, sorted by depth key and then
+submission sequence, with the premultiplied blend, which reproduces opaque
+texels exactly. So the first milestone renders an ordinary default frame
+with no routing override.
+
+### D-23. Depth keys: domain, direction, mapping and format
+
+- Keys lie in [0, 2²⁴); a larger key is refused at validation, never
+  wrapped or collapsed.
+- A larger key is nearer.
+- Depth is `(2²⁴ − 1 − k) / 2²⁴`, exactly representable in a 32-bit float
+  and constant across a quad; depth is cleared to 1.0 and compared
+  less-or-equal.
+- World-layer depth requires `D32_SFLOAT`; a device or configuration
+  without it is refused for depth-enabled world layers and reported, never
+  degraded to a lower-precision format. GRS D-36's per-pass compare and
+  clear make this possible without backend changes.
+- Equal keys: among cutouts, the later draw in run order wins, where runs
+  are ordered by material and instances within a run by submission
+  sequence; adapters that need a guaranteed winner give distinct keys. At an
+  equal key, translucent instances always draw over cutouts. Both rules are
+  tested.
+
+### D-24. Tint, brightness and additive output
+
+With `t` the sampled texel (premultiplied, linear after sRGB decoding), `m`
+the material's premultiplied output (`m = t` for the default material), `c`
+the tint and `b` the view's brightness:
+
+- `s = m × c`, componentwise; the tint is a linear multiplier per channel,
+  so a fade is `c = (f, f, f, f)` and an invisible sprite is `c = 0`;
+- `s.rgb ← s.rgb × b`, leaving alpha unchanged;
+- the **additive** flag sets `s.a ← 0` after both, so the premultiplied
+  blend `result = s + destination × (1 − s.a)` adds `s.rgb`;
+- additive instances, and instances with tint alpha below 1, always take the
+  ordered path.
+
+This replaces D-4's earlier "alpha 0 gives additive", which was wrong: a
+premultiplied tint with alpha 0 has zero colour and contributes nothing.
+
+### D-25. Material texture references and material capability
+
+- A material data record holds a full handle (lookup index and generation)
+  for every texture a material samples beyond the instance's own; the
+  parameter word indexes the record. Every texture a material samples
+  resolves through the same generation check, so a released and reused
+  index samples the placeholder, never an unrelated texture. Retained
+  content carries its own records (Q-2).
+- A material declares whether it is cutout-capable: its output alpha is
+  binary wherever its primary texture's is. Only cutout-capable materials
+  route to the cutout pass; others always take the ordered path.
+
+### D-26. The cutout fragment rule
+
+The cutout variant discards a fragment whose alpha (before brightness) is
+below 0.5. A surviving fragment writes its colour un-premultiplied, then
+brightened, with alpha 1: a filtered edge sample `(0.6, 0.6, 0.6, 0.6)`
+writes white, not grey. Mip levels of cutout-marked textures preserve
+coverage at this threshold (asset D-10).
+
+### D-27. A texture's mark is fixed when its handle is registered
+
+Owner decision 2026-10-05. The cutout mark, computed or overridden (D-19),
+is fixed at registration. A swap (GRS-9) to an image whose computed mark
+differs is refused unless the application explicitly keeps the registered
+mark; a genuine change of rendering semantics takes a new handle. Retained
+content therefore stays coherent across swaps without rebuilding.
+
+Rejected: allowing every swap and rebuilding retained content that
+references the handle.
+
+### D-28. What a published snapshot holds, and pressure
+
+- When the graphics owner adopts a published snapshot, it holds every
+  object the snapshot references — texture handles, retained content,
+  materials and offscreen targets — until the snapshot is superseded and
+  its last recording completes, through the GPU model's holds.
+- An application's release of such an object takes effect only once the
+  owner has adopted, for every window, the snapshot revision current when
+  the release was requested, or a later one. So releasing something the
+  current snapshot still shows cannot race its rendering.
+- Publishing a snapshot that references an object already released is
+  refused, naming the object.
+- Pressure — a full ring, or every lookup version held — skips the frame,
+  keeps the window's demand and retries at the host's backoff, as refused
+  frames already do; publication itself never waits. A texture whose upload
+  has not completed is not pressure: it samples the placeholder (GRS D-1).
+
+### D-29. Coordinate equations and the picking promise
+
+- A cursor position in window coordinates maps to framebuffer pixels by the
+  ratio of framebuffer extent to window extent, per axis; content scale is
+  not used for this.
+- UI space maps to framebuffer pixels by UI scale × content scale, so UI has
+  the same physical size on any display.
+- World space maps through the view's camera, zoom mode and viewport.
+- Picking receives the unsnapped inverse mapping and, separately, the pure
+  snapping function, so a consumer can reproduce a snapped sprite's
+  placement; the unsnapped inverse differs from a snapped sprite's drawn
+  position by at most half a device pixel per axis, and this is documented.
+
+### D-30. Delivery plan revised after the review
+
+Owner decision 2026-10-05: the owner delegated ordering and splitting.
+Backend extensions become their own slices, so each pull request stays
+reviewable:
+
+- R2D-14 publishes scenes per window in the window host, before R2D-8
+  (D-18);
+- R2D-16 lets table pipelines choose samplers in the shader, before R2D-7
+  (D-4);
+- R2D-17 clears a depth attachment within a rectangle, before R2D-9 (D-10);
+- R2D-15 binds per-batch storage tables from the ring, before R2D-11 and
+  R2D-12 (P-5);
+- R2D-13 additionally owns read eligibility per pass (Q-10).
+
 ## Open questions
 
 ### Q-1. Integer zoom as a per-view setting
@@ -503,8 +657,11 @@ Q-10 when a consumer requests sampled offscreen targets.
 Retained content could live in device-local buffers filled through staging
 uploads, or in host-visible memory. Its handle could be owned by the
 application with explicit release, retired on completion evidence like other
-managed resources. Updates could be whole rebuilds or range writes. Affects
-R2D-10. Resolves before R2D-10 is drafted.
+managed resources. Updates could be whole rebuilds or range writes. Chunk
+granularity matters too: retaining instances removes rebuilding but not
+off-view vertex work, so retained content should be chunked so that views
+can skip chunks outside them. Retained content carries its own material
+records (D-25). Affects R2D-10. Resolves before R2D-10 is drafted.
 
 ### Q-3. Animated content inside retained buffers
 
@@ -551,6 +708,14 @@ R2D-13 needs a colour target that can also be registered in the texture
 table. It could be a slice here or a follow-up to the GPU services arc, and
 it may wait for a named consumer. Affects R2D-13.
 
+Whatever is chosen must also solve read eligibility. Today `tableReady`
+refuses every table draw while any image the bound version maps is in a use
+other than sampling, so a registered target being drawn into would block
+all textured draws into it, even those sampling other images. The design
+needs a checked mechanism — for example a version or pass whose lookup maps
+the target to the placeholder while it is an attachment — and must refuse
+outright a pass that samples the target it writes.
+
 ### Q-11. Lua bindings
 
 Resolved by D-20: the Lua arc owns them.
@@ -569,10 +734,21 @@ Resolved by D-17: a configurable list, with smooth zoom kept available.
   sample. Evidence runs are window-free (GRS D-6) and fit
   `test.vulkan-native`'s 30-second budget, on macOS locally and Linux CI,
   with clean validation or an honestly reported limitation.
+- The oracle stays independent where it matters: analytically known camera,
+  overlap, alpha, equal-key and mip fixtures complement calculations shared
+  with `render-2d`, so a shared mistake in mapping or ordering cannot pass
+  both.
 - The windowed sample is the owner-visible milestone, launched explicitly
   and never by tests.
 - Performance claims (draw counts, batching, retained content) require
-  retained measurements.
+  retained measurements. The performance plan measures:
+  - frame cost against table size separately from sprite count, since a
+    batch's first bind retains every image its version maps;
+  - bytes written per frame (64 bytes per dynamic instance: 6.4 MB at
+    100,000) and the effect of per-view culling of dynamic instances, which
+    pure `render-2d` should provide once measured to matter;
+  - shader clipping (D-11) against scissor-based runs on representative
+    clipped UI, since shader clipping still rasterizes clipped areas.
 
 ## Delivery plan
 
@@ -583,13 +759,16 @@ Resolved by D-17: a configurable list, with smooth zoom kept available.
 - **Scope:** `render-api` with the opaque texture handle; pure `render-2d`
   with pass, target, view, layer, camera and instance types; per-view settings
   with validation that refuses rather than clamps; the 64-byte instance
-  encoding and flags word. Both packages build in the CPU project.
+  encoding, tint and flags word including the additive bit; the depth-key
+  domain. Both packages build in the CPU project.
 - **Phase:** 1, static-texture milestone
 - **Depends on:** `none`
 - **Ordering:** critical path
-- **Relevant decisions:** D-1, D-4, D-7, D-9, D-10, D-12, D-16, D-17, D-18
-- **Acceptance signals:** Hspec covers validation refusals, the encoding's
-  byte layout and flag packing; the packages build without the Vulkan SDK.
+- **Relevant decisions:** D-1, D-4, D-7, D-9, D-10, D-12, D-16, D-17, D-18,
+  D-23, D-24
+- **Acceptance signals:** Hspec covers validation refusals (including keys
+  at and beyond 2²⁴), the encoding's byte layout and flag packing; the
+  packages build without the Vulkan SDK.
 - **Out of scope:** view mapping, sorting, recording.
 - **Open questions:** None
 
@@ -597,13 +776,14 @@ Resolved by D-17: a configurable list, with smooth zoom kept available.
 
 - **Outcome:** one pure mapping per view, used for both drawing and picking.
 - **Scope:** projections for both zoom modes and rotation; UI scale ×
-  content scale; window point to world or UI point and back; pixel-snap
-  arithmetic; discrete step zoom; degenerate viewports and non-finite
-  cameras.
+  content scale; window coordinates to framebuffer pixels by the extent
+  ratio; window point to world or UI point and back; pixel-snap arithmetic,
+  exposed as its own function for picking; discrete step zoom; degenerate
+  viewports and non-finite cameras.
 - **Phase:** 1
 - **Depends on:** R2D-1
 - **Ordering:** critical path
-- **Relevant decisions:** D-7, D-8, D-9, D-16, D-17
+- **Relevant decisions:** D-7, D-8, D-9, D-16, D-17, D-29
 - **Acceptance signals:** Hspec round trips between spaces, and covers every
   combination of pixel snap, zoom mode and smooth or discrete step zoom
   across window resizes and content scales.
@@ -614,28 +794,31 @@ Resolved by D-17: a configurable list, with smooth zoom kept available.
 
 - **Outcome:** a pure function turns a frame into ordered passes, views and
   draw runs.
-- **Scope:** layer order, pass routing by mark and instance override, back to
-  front translucent sorting by depth key and sequence, run splitting by
-  pipeline and material.
+- **Scope:** layer order; pass routing by mark, instance override, tint
+  alpha, the additive flag and material capability, with everything taking
+  the ordered path where depth is disabled; ordered sorting by depth key and
+  sequence; run splitting by pipeline and material; the equal-key rules.
 - **Phase:** 1
 - **Depends on:** R2D-1
 - **Ordering:** critical path
-- **Relevant decisions:** D-2, D-3, D-10, D-19
-- **Acceptance signals:** Hspec shows total, repeatable orders and the
-  expected runs for interleaved inputs.
+- **Relevant decisions:** D-2, D-3, D-10, D-19, D-22, D-23, D-24, D-25
+- **Acceptance signals:** Hspec shows total, repeatable orders, the expected
+  runs for interleaved inputs, and the documented equal-key outcomes.
 - **Out of scope:** retained content (R2D-10).
 - **Open questions:** None
 
 ### R2D-4. Compute expected pixels from a snapshot in `render-2d-oracle`
 
 - **Outcome:** every rendering slice has an independent oracle.
-- **Scope:** nearest and linear sampling, the premultiplied blend in order,
-  view mapping and snapping, probes with exact or tolerance verdicts; reuses
-  the sprites sample's oracle reasoning.
+- **Scope:** nearest and linear sampling with sRGB decoding, the tint,
+  brightness and additive equations, the premultiplied blend in order, view
+  mapping and snapping, probes with exact or tolerance verdicts, and
+  analytically known fixtures beside shared calculations; reuses the sprites
+  sample's oracle reasoning.
 - **Phase:** 1
 - **Depends on:** R2D-2, R2D-3
 - **Ordering:** critical path
-- **Relevant decisions:** D-2, D-7, D-9, D-12
+- **Relevant decisions:** D-2, D-7, D-9, D-12, D-24
 - **Acceptance signals:** Hspec shows the oracle rejects reversed overlap, an
   off-by-two channel and a wrong snap.
 - **Out of scope:** depth and clipping expectations, added by their slices.
@@ -649,49 +832,106 @@ Moved to the [asset design](asset_design.md) as AST-1 (D-15).
 
 Moved to the [asset design](asset_design.md) as AST-2 (D-15).
 
-### R2D-7. Record the translucent path in `render-2d-vulkan`, proven by offscreen readback
+### R2D-16. Let table pipelines choose samplers in the shader
+
+- **Outcome:** a texture-table pipeline can draw with the sampler chosen per
+  instance in its shader, with no pushed sampler selection.
+- **Scope:** a backend extension in `hetoimasia-gpu-vulkan-native`: a table
+  pipeline layout that declares shader-chosen sampling, for which the
+  recorder's draw check does not require `selectSampler`; the checked
+  shader interface for it; the window integration's equivalent; contract
+  updates in `gpu_backend.md`.
+- **Phase:** 1
+- **Depends on:** `none`
+- **Ordering:** can land first
+- **Relevant decisions:** D-4, D-30
+- **Acceptance signals:** native-suite evidence of one draw sampling with
+  two samplers chosen per instance; the existing pushed-sampler path is
+  unchanged.
+- **Out of scope:** `render-2d` recording.
+- **Open questions:** None
+
+### R2D-7. Record the ordered path in `render-2d-vulkan`, proven by offscreen readback
 
 - **Outcome:** a frame's pass list renders through the default material.
 - **Scope:** recording passes and views (viewport and scissor), the built-in
-  default material, per-instance sampler choice, brightness and snapping in
-  shaders, the translucent sorted path, offscreen targets and evidence.
+  default material, per-instance sampler choice, tint, brightness, additive
+  output and snapping in shaders, the ordered path for every instance,
+  offscreen targets and evidence.
 - **Phase:** 1
-- **Depends on:** R2D-3, R2D-4
+- **Depends on:** R2D-3, R2D-4, R2D-16
 - **Ordering:** critical path
-- **Relevant decisions:** D-2, D-4, D-5, D-9, D-10, D-12
+- **Relevant decisions:** D-2, D-4, D-5, D-9, D-10, D-12, D-22, D-24
 - **Acceptance signals:** offscreen readback matches the oracle at several
   zoom modes, snap settings and filters, with clean validation on macOS and
   Linux.
 - **Out of scope:** depth, application materials, clipping.
 - **Open questions:** None
 
+### R2D-14. Publish scenes per window in the window host
+
+- **Outcome:** a publication for one window requests a frame of that
+  window's target alone.
+- **Scope:** a window-integration extension in `hetoimasia-gpu-vulkan-glfw`:
+  scene publication and revisions per target, so the owner's step asks only
+  the published window for a frame; snapshot adoption with the holds and
+  release ordering of D-28; contract updates in `gpu_backend.md`.
+- **Phase:** 1
+- **Depends on:** `none`
+- **Ordering:** can land first
+- **Relevant decisions:** D-18, D-28, D-30
+- **Acceptance signals:** native-suite evidence with two windows in which a
+  publication for one renders only that window; a release requested while
+  the current snapshot shows the object takes effect only after a later
+  snapshot is adopted.
+- **Out of scope:** `render-2d` snapshot types.
+- **Open questions:** None
+
 ### R2D-8. Show a decoded image in a window through published snapshots
 
 - **Outcome:** the milestone: an image file shown in a window.
 - **Scope:** a 2D sample that decodes a PNG with `asset-image`, uploads and
-  registers it, and publishes snapshots to the host renderer; UI scale and
-  content scale visible.
+  registers it, and publishes snapshots to the host renderer per window; UI
+  scale and content scale visible.
 - **Phase:** 1
-- **Depends on:** R2D-7; external: the asset epic's AST-1
+- **Depends on:** R2D-7, R2D-14; external: the asset epic's AST-1
 - **Ordering:** critical path
-- **Relevant decisions:** D-7, D-13, D-14, D-15, D-18, D-20
+- **Relevant decisions:** D-7, D-13, D-14, D-15, D-18, D-20, D-28
 - **Acceptance signals:** offscreen evidence of the same frame matches the
   oracle; the owner launches the windowed mode and sees the image.
 - **Out of scope:** KTX2 in the sample unless the asset epic's AST-2 has
   landed; the software BC7 decoder (AST-3).
 - **Open questions:** None
 
+### R2D-17. Clear a depth attachment within a rectangle
+
+- **Outcome:** a pass can clear its depth attachment within one viewport.
+- **Scope:** a recorder operation in `hetoimasia-gpu-vulkan-native` that
+  clears the bound depth attachment within a rectangle inside a pass
+  (`vkCmdClearAttachments`), checked against the render area and the
+  attachment, with its contract in `gpu_backend.md`.
+- **Phase:** 2
+- **Depends on:** external: #349
+- **Ordering:** independent
+- **Relevant decisions:** D-10, D-30
+- **Acceptance signals:** readback shows depth cleared inside the rectangle
+  and kept outside it.
+- **Out of scope:** colour clears within a rectangle, unless trivially
+  shared.
+- **Open questions:** None
+
 ### R2D-9. Draw cutout sprites depth-tested in world layers
 
 - **Outcome:** opaque and cutout art interleaves freely in few draws.
-- **Scope:** per-layer depth clears, depth-key mapping, the cutout variant
-  with discard, translucent instances tested against depth.
+- **Scope:** per-layer depth clears, the `D32_SFLOAT` requirement and its
+  refusal, depth-key mapping, the cutout variant with its fragment rule,
+  translucent instances tested against depth, the equal-key outcomes.
 - **Phase:** 2
-- **Depends on:** R2D-7; external: #349 and #350
+- **Depends on:** R2D-7, R2D-17; external: #349 and #350
 - **Ordering:** critical path
-- **Relevant decisions:** D-2, D-3, D-10, D-19
+- **Relevant decisions:** D-2, D-3, D-10, D-19, D-22, D-23, D-26, D-27
 - **Acceptance signals:** readback matches the oracle for interleaved cutout
-  and translucent instances.
+  and translucent instances, equal keys and filtered cutout edges.
 - **Out of scope:** alpha-to-coverage.
 - **Open questions:** None
 
@@ -704,25 +944,46 @@ Moved to the [asset design](asset_design.md) as AST-2 (D-15).
 - **Phase:** 3
 - **Depends on:** R2D-9
 - **Ordering:** not on the critical path
-- **Relevant decisions:** D-1, D-2
+- **Relevant decisions:** D-1, D-2, D-25, D-27, D-28
 - **Acceptance signals:** readback over several frames with only dynamic
-  content republished; a texture swap shows through retained content.
+  content republished; a texture swap shows through retained content, and
+  a swap that changes the mark is refused.
 - **Out of scope:** GPU animation, unless Q-3 decides otherwise.
 - **Open questions:** Q-2, Q-3
+
+### R2D-15. Bind per-batch storage tables from the ring
+
+- **Outcome:** a batch can bind tables it wrote to the ring as storage
+  buffers beside the texture table.
+- **Scope:** a backend extension in `hetoimasia-gpu-vulkan-native`: storage
+  usage for the ring, a third engine-owned descriptor set selected by a
+  dynamic offset, regions aligned to `minStorageBufferOffsetAlignment`,
+  retention with the batch's claims, limits checked against the device,
+  and the checked shader interface admitting the set; contract updates in
+  `gpu_backend.md`.
+- **Phase:** 3
+- **Depends on:** `none`
+- **Ordering:** can land first
+- **Relevant decisions:** D-11, D-25, D-30
+- **Acceptance signals:** native-suite evidence of a draw reading a
+  per-batch table at a dynamic offset, with clean validation; misaligned or
+  oversized regions are refused.
+- **Out of scope:** clip and material semantics.
+- **Open questions:** None
 
 ### R2D-11. Accept application materials as checked fragment functions
 
 - **Outcome:** adapters supply effects without engine changes.
-- **Scope:** material registration, generated cutout and translucent
-  variants, per-draw push block, per-instance parameter word, per-batch
-  material data.
+- **Scope:** material registration, cutout capability, generated cutout and
+  translucent variants, per-draw push block, per-instance parameter word,
+  material data records holding full handles.
 - **Phase:** 3
-- **Depends on:** R2D-9
+- **Depends on:** R2D-9, R2D-15
 - **Ordering:** independent
-- **Relevant decisions:** D-4, D-5
+- **Relevant decisions:** D-4, D-5, D-25, D-26
 - **Acceptance signals:** a sample material using a second texture through
-  the parameter word matches the oracle; a misdeclared material fails to
-  compile.
+  a material record matches the oracle; a released and reused second
+  texture samples the placeholder; a misdeclared material fails to compile.
 - **Out of scope:** live shader loading.
 - **Open questions:** Q-3
 
@@ -732,7 +993,7 @@ Moved to the [asset design](asset_design.md) as AST-2 (D-15).
 - **Scope:** the clip table, nested intersection, view-space rectangles,
   clipping under rotation.
 - **Phase:** 3
-- **Depends on:** R2D-7
+- **Depends on:** R2D-7, R2D-15
 - **Ordering:** independent
 - **Relevant decisions:** D-11
 - **Acceptance signals:** readback matches the oracle for nested and rotated
@@ -744,11 +1005,13 @@ Moved to the [asset design](asset_design.md) as AST-2 (D-15).
 
 - **Outcome:** render-to-texture through the pass list.
 - **Scope:** a colour target registrable in the texture table, its
-  transitions between passes, and `render-2d` support.
+  transitions between passes, checked read eligibility so drawing into a
+  registered target does not block draws sampling other images, refusal of
+  a pass sampling its own target, and `render-2d` support.
 - **Phase:** 4
 - **Depends on:** R2D-7
 - **Ordering:** not on the critical path
-- **Relevant decisions:** D-10
+- **Relevant decisions:** D-10, D-30
 - **Acceptance signals:** readback of a pass sampling an earlier pass's
   target matches the oracle.
 - **Out of scope:** post-processing effects themselves.
