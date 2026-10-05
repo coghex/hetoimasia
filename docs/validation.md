@@ -273,8 +273,9 @@ native prerequisite. See [the package's contract](../packages/math/README.md).
 
 `test.asset-image` runs the asset-image package's own suite: committed fixture
 PNGs — every colour type at every bit depth, 16-bit files, palette `tRNS`
-alpha, Adam7 interlacing, and colour-space chunks and `tRNS` colour keys that
-change no texel — decoded to texels the suite states by hand; colour images
+alpha, Adam7 interlacing, greyscale and RGB `tRNS` colour keys at every bit
+depth, malformed `tRNS` chunks, and colour-space chunks that change no texel —
+decoded to texels the suite states by hand; colour images
 premultiplied in linear light within one code value of an independent
 reference for every (channel, alpha) pair, exact at alpha 0 and 255, and data
 images byte-for-byte unchanged; the format, extent and single-level layout the

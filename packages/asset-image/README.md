@@ -26,8 +26,18 @@ Every PNG colour type — greyscale, greyscale with alpha, palette (with `tRNS`
 alpha), RGB and RGBA — at every bit depth, interlaced or not, decodes to one
 RGBA8 level at the image's width and height, top row first:
 
-- A missing alpha channel becomes 255. A `tRNS` colour key on a greyscale or
-  RGB image is not applied.
+- A greyscale or RGB image's `tRNS` colour key is honoured, at every bit depth
+  (greyscale 1, 2, 4, 8 and 16; RGB 8 and 16): a texel whose stored samples
+  exactly equal the key's, compared at the file's own bit depth before any
+  reduction to 8 bits, has alpha 0, and every other texel alpha 255. A 16-bit
+  sample that shares only the key's high byte is not keyed. A malformed `tRNS`
+  chunk — a length the colour type does not take, one on a colour type with
+  its own alpha channel, or a second `tRNS` — is ignored, as JuicyPixels
+  decodes such files without complaint. JuicyPixels itself applies no colour
+  key, and misreads a 1-, 2- or 4-bit greyscale key as a table of palette
+  alphas; this decoder applies the key to the stored sample instead.
+- Any other missing alpha channel becomes 255. Palette `tRNS` alpha is applied
+  as JuicyPixels reads it.
 - 16-bit components, alpha included, round to nearest:
   nearest(v × 255 ÷ 65535), so 129 becomes 1, not 0.
 - Colour-space chunks (`gAMA`, `cHRM`, `sRGB`, `iCCP`) never change a texel.
@@ -51,7 +61,9 @@ file never decides.
 ### The cutout mark
 
 Every decoded image, of either kind, carries `decodedBinaryAlpha`: true exactly
-when every texel's alpha is 0 or 255. A 16-bit alpha of 129 rounds to 1, so it
+when every texel's alpha is 0 or 255. A texel keyed out by `tRNS` has alpha 0,
+so an image whose only transparency is a colour key is binary; in a colour
+image that texel is premultiplied to zero. A 16-bit alpha of 129 rounds to 1, so it
 is not binary.
 
 ### Refusals
