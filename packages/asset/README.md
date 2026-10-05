@@ -10,7 +10,7 @@ on this core and only the codec packages it needs
 | Module | Contents |
 | --- | --- |
 | `Hetoimasia.Asset` | `AssetId`, `Provenance` (`FromFile`, `FromMemory`), `Asset`; `Decoder` (`runDecoder`) and `AssetRefusal` (`refusedAsset`, `refusalReason`) |
-| `Hetoimasia.Asset.Image` | `ImageKind` (`ColourImage`, `DataImage`), `TexelFormat` (`TexelRgba8Srgb`, `TexelRgba8Linear`), `DecodedImage` |
+| `Hetoimasia.Asset.Image` | `ImageKind` (`ColourImage`, `DataImage`), `TexelFormat` (`TexelRgba8Srgb`, `TexelRgba8Linear`, `TexelBc7Srgb`, `TexelBc7Linear`), `DecodedImage` |
 
 ## Boundary
 
@@ -39,19 +39,23 @@ A `DecodedImage` is shaped for the GPU upload endpoint (#342), with no
 conversion layer between them: its format, its width and height as `Word32`,
 its levels as the endpoint's `UploadImage` takes them — every mip level, base
 level first, each a strict `ByteString` tightly packed in the format's blocks,
-rows top row first with no padding — and its cutout mark. A consumer passes
+rows of blocks top row first with no padding — and its cutout mark. A block is
+one texel for RGBA8, and 4 × 4 texels in sixteen bytes for BC7, a block that
+crosses a level's right or bottom edge stored whole. A consumer passes
 `decodedLevels` to the endpoint unchanged and maps only the format:
 
 | `TexelFormat` | Endpoint `ImageFormat` | Texels |
 | --- | --- | --- |
 | `TexelRgba8Srgb` | `Rgba8Srgb` | R, G, B, A bytes; colour sRGB-encoded and premultiplied in linear light |
 | `TexelRgba8Linear` | `Rgba8Linear` | R, G, B, A bytes; linear UNORM, not premultiplied |
+| `TexelBc7Srgb` | `Bc7Srgb` | BC7 blocks decoding to sRGB-encoded RGBA8; colour with alpha premultiplied when encoded |
+| `TexelBc7Linear` | `Bc7Linear` | BC7 blocks decoding to linear UNORM RGBA8 |
 
 This package does not import `hetoimasia-gpu-vulkan-native`, which builds only
 through `cabal.project.vulkan`, so the mapping is the consumer's.
 
 `decodedBinaryAlpha` is true exactly when every texel of level 0 has alpha 0
-or 255. The 2D renderer takes it as a texture's default cutout mark (design
+or 255; for BC7, of level 0 decoded, inside its extent. The 2D renderer takes it as a texture's default cutout mark (design
 D-5, D-10).
 
 ## Owned state, threads and lifetimes
