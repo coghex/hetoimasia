@@ -67,18 +67,43 @@ instance NFData Bc7Format where
   rnf format = format `seq` ()
 
 -- | A BC7 image whose shape 'bc7Image' has checked, and its cutout mark.
+--
+-- Its constructor and fields are private: a client reads it through the
+-- accessor functions below and cannot update it, so every value has the
+-- shape 'bc7Image' checked and the mark it computed.
 data Bc7Image = Bc7Image
-  { bc7Asset ∷ !Asset
-    -- ^ The asset the image was constructed for.
-  , bc7Format ∷ !Bc7Format
-  , bc7Width ∷ !Word32
-  , bc7Height ∷ !Word32
-  , bc7Levels ∷ ![ByteString]
-    -- ^ Every level, base level first, in the endpoint's layout.
-  , bc7BinaryAlpha ∷ !Bool
-    -- ^ Whether every texel of level 0, decoded, has alpha 0 or 255.
+  { imageAsset ∷ !Asset
+  , imageFormat ∷ !Bc7Format
+  , imageWidth ∷ !Word32
+  , imageHeight ∷ !Word32
+  , imageLevels ∷ ![ByteString]
+  , imageBinaryAlpha ∷ !Bool
   }
   deriving (Eq, Show)
+
+-- | The asset the image was constructed for.
+bc7Asset ∷ Bc7Image → Asset
+bc7Asset = imageAsset
+
+bc7Format ∷ Bc7Image → Bc7Format
+bc7Format = imageFormat
+
+-- | Level 0's width in texels.
+bc7Width ∷ Bc7Image → Word32
+bc7Width = imageWidth
+
+-- | Level 0's height in texels.
+bc7Height ∷ Bc7Image → Word32
+bc7Height = imageHeight
+
+-- | Every level, base level first, in the endpoint's layout.
+bc7Levels ∷ Bc7Image → [ByteString]
+bc7Levels = imageLevels
+
+-- | Whether every texel of level 0 inside its extent, decoded, has alpha 0
+-- or 255.
+bc7BinaryAlpha ∷ Bc7Image → Bool
+bc7BinaryAlpha = imageBinaryAlpha
 
 instance NFData Bc7Image where
   rnf (Bc7Image asset format width height levels binary) =
@@ -107,12 +132,12 @@ bc7Image asset format width height levels = either (Left . AssetRefusal asset) R
       "BC7 level " <> tshow level <> " (" <> extent size <> ") needs " <> tshow needed <> " bytes; " <> tshow actual <> " were supplied"
   Right
     Bc7Image
-      { bc7Asset = asset
-      , bc7Format = format
-      , bc7Width = width
-      , bc7Height = height
-      , bc7Levels = levels
-      , bc7BinaryAlpha = binaryAlpha width height base
+      { imageAsset = asset
+      , imageFormat = format
+      , imageWidth = width
+      , imageHeight = height
+      , imageLevels = levels
+      , imageBinaryAlpha = binaryAlpha width height base
       }
   where
     supplied = length levels

@@ -75,6 +75,7 @@ test-suite asset-image-tests
     hs-source-dirs: test
     other-modules:
         Test.Asset.Image.Bc7
+        Test.Asset.Image.Bc7Opacity
         Test.Asset.Image.Fixtures
         Test.Asset.Image.Png
         Test.Asset.Image.Premultiply
@@ -90,6 +91,8 @@ test-suite asset-image-tests
         hspec >=2.11 && <3,
         hetoimasia-asset ==0.1.0.0,
         hetoimasia-asset-image ==0.1.0.0,
+        hetoimasia-test-support ==0.1.0.0,
         JuicyPixels ==3.3.9,
+        process >=1.6 && <1.7,
         text >=2.1 && <2.2,
         zlib >=0.7.1 && <0.8
