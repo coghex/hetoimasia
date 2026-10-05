@@ -5,11 +5,13 @@ interface. PNG decodes through JuicyPixels into one tightly packed RGBA8 level
 the GPU upload endpoint (#342) takes unchanged
 ([asset design](../../docs/designs/asset_design.md), AST-1). BC7 levels are
 checked, marked, and decoded to RGBA8 in software for devices that cannot
-sample BC7 (AST-3).
+sample BC7 (AST-3). A decoded image gets a full mip chain only when its caller
+asks for one (AST-4).
 
 | Module | Contents |
 | --- | --- |
 | `Hetoimasia.Asset.Image.Png` | `pngDecoder ∷ ImageKind → Decoder DecodedImage`; `decodePng ∷ ImageKind → Asset → ByteString → Either AssetRefusal DecodedImage` |
+| `Hetoimasia.Asset.Image.Mips` | `MipRequest` (`mipCoverage`), `Coverage` (`CoverageFromMark`, `PreserveCoverage`, `PlainAverages`), `mipRequest`; `generateMips ∷ MipRequest → DecodedImage → Either Text DecodedImage`; `mipmapped ∷ MipRequest → Decoder DecodedImage → Decoder DecodedImage` |
 | `Hetoimasia.Asset.Image.Bc7` | `Bc7Format` (`Bc7Srgb`, `Bc7Linear`); `Bc7Image` and `bc7Image ∷ Asset → Bc7Format → Word32 → Word32 → [ByteString] → Either AssetRefusal Bc7Image`, `bc7DecodedImage`; `decodeBc7 ∷ Bc7Image → DecodedImage`; `Bc7Support`, `bc7Fallback ∷ Bc7Support → Bc7Image → Bc7Fallback`, `fallbackImage`, `fallbackSoftwareDecode` |
 
 ## Boundary
@@ -162,12 +164,97 @@ fully populated 4 × 4 blocks, 4 × w × h bytes for RGBA8 against
 blocks and small mips have a lower ratio, and the device's allocation is
 its own.
 
+## Mip chains
+
+Mips are optional (design D-6). Pixel art drawn with nearest filtering needs
+none; smoothly zoomed art does. Generating them is a separate step a caller
+applies to an image it has already decoded:
+
+```haskell
+decodePng ColourImage asset bytes >>= first (AssetRefusal asset) . generateMips mipRequest
+-- or, as one decoder:
+mipmapped mipRequest (pngDecoder ColourImage)
+```
+
+A caller that does not ask calls the PNG decoder exactly as before: the
+decoder never reaches `Hetoimasia.Asset.Image.Mips`, and its image keeps one
+level. Nothing is computed, allocated or retained for mips that were not
+requested.
+
+### The chain
+
+A generated chain holds level 0 unchanged, followed by every level down to
+1 × 1. Level `L` is `max 1 (width >> L)` by `max 1 (height >> L)`, as the
+upload endpoint (#342) takes them, so the levels upload unchanged. The
+format, extent and cutout mark stay as decoded; the mark is level 0's. Any
+levels after level 0 are replaced, so generating twice gives the same chain.
+An image whose level 0 does not hold width × height four-byte texels, or
+that has no level, is refused with the reason; `mipmapped` refuses it naming
+the asset, and passes the decoder's own refusals through.
+
+### The filter
+
+Every level is computed from level 0 directly, never from the level above
+it. Output texel (x, y) of a w × h level is the area-weighted average of
+level 0's rectangle [x·W/w, (x+1)·W/w) × [y·H/h, (y+1)·H/h), each level 0
+texel weighted by its overlap. Every level 0 texel contributes, at odd
+extents too: a texel straddling two output texels is shared between them.
+
+### The colour-space rule
+
+- **Colour images** (`TexelRgba8Srgb`): level 0's colour bytes already
+  encode linear premultiplied values, so they are decoded with the sRGB
+  transfer function and not multiplied by alpha again. The linear colour
+  and alpha are averaged, and colour is re-encoded with the inverse
+  function.
+- **Data images** (`TexelRgba8Linear`): all four channels are averaged as
+  stored, with no premultiplication.
+
+Every channel is rounded to nearest, halves up. Alpha, which is linear in
+both kinds, is averaged, scaled and rounded in exact integer arithmetic.
+
+### Coverage preservation
+
+The 2D renderer's cutout variant discards a fragment whose alpha is below 0.5
+(render-2d D-26). A texel counts as covered when its alpha byte is at least
+128, the 8-bit form of that threshold. When coverage is preserved, each
+generated level's alpha is multiplied by one scale for the whole level, so
+that the level's covered fraction is as close as any scale allows to level
+0's (design D-10). Level 0 is never altered.
+
+- **Which requests.** `mipCoverage` says: `PreserveCoverage` always,
+  `PlainAverages` never, and `CoverageFromMark` (the default, `mipRequest`)
+  exactly when the image's cutout mark, `decodedBinaryAlpha`, is true.
+- **What is achievable.** Coverage is counted on the final, rounded and
+  clamped alpha bytes. A texel whose averaged alpha is zero stays zero and
+  is never covered, and texels with equal averaged alpha are covered
+  together, so only some counts are achievable.
+- **Which scale.** If the unscaled level already has a closest achievable
+  count, it is left unscaled. Otherwise, of two equally close counts the one
+  nearer the unscaled count is taken; the scale then puts the least opaque
+  covered texel exactly on the threshold (127.5 before rounding, so 128),
+  or, when the closest count is 0, the most opaque texel at 127.
+- **Saturation.** Scaled alpha is clamped to 255. A colour image's
+  premultiplied colour is multiplied by the factor alpha actually changed by
+  after the clamp (scaled ÷ averaged alpha, before rounding), so the
+  un-premultiplied colour, and its hue, are unchanged. A data image's colour
+  is not scaled.
+
+### Atlases
+
+Whole-image mips mix neighbouring regions of an atlas. Until the sheet
+stitcher exists (design D-11), atlases are drawn with nearest filtering and
+no mips; supported mipmapped content is single-image textures.
+
+KTX2 files bring their own levels and are out of this step's scope (AST-2).
+
 ## Owned state, threads and lifetimes
 
 None. Decoding is pure: it reads only the caller's bytes, writes no file,
 starts no thread and keeps nothing between calls. The premultiplication table
 and the BC7 partition and weight tables are constants shared by every decode.
-BC7 checking, decoding, the mark and the fallback step are pure too, and the
+BC7 checking, decoding, the mark and the fallback step are pure too, as is mip
+generation: the same image and request always give the same levels. The
 package holds no logger. A decoded image's bytes are the caller's.
 
 ## Tests
@@ -197,3 +284,9 @@ byte-for-byte deterministic. Two expectations are stated in the suite
 instead: the sprites sample's mode-6 block and its `bc7Decoded` oracle, and a
 block with no valid mode decoding to zeros, as the BC7 format defines it
 (Pillow 12.2.0 gives that block alpha 255).
+
+The mip examples' expected texels come from `test/fixtures/mip_reference.py`,
+an independent reference using only Python's standard library, with exact
+rational footprints; run `python3 mip_reference.py` in that directory to
+print them. Their coverage and colour properties are checked against the
+suite's own exact-rational reference averages.
