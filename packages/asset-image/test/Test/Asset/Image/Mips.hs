@@ -190,6 +190,18 @@ spec = describe "Mips" $ do
   describe "refusals" $ do
     it "refuses an image whose level 0 does not match its extent" $
       generated mipRequest (blank 2 2) {decodedLevels = [ByteString.replicate 12 0]} `shouldSatisfy` either (const True) (const False)
+    it "refuses an image with a zero width or height, through either API" $ do
+      let asset = fixtureAsset "rgba8.png"
+      forM_ [(0, 2), (2, 0), (0, 0)] $ \(w, h) → do
+        let empty = (blank 1 1) {decodedFormat = TexelRgba8Linear, decodedWidth = w, decodedHeight = h, decodedLevels = [ByteString.empty]}
+        generated mipRequest empty `shouldSatisfy` either (const True) (const False)
+        case runDecoder (mipmapped mipRequest (Decoder (\_ _ → Right empty))) asset ByteString.empty of
+          Left refusal → refusedAsset refusal `shouldBe` asset
+          Right _ → expectationFailure ("a " <> show w <> " × " <> show h <> " image was accepted")
+    it "refuses an extent whose byte count overflows Int rather than wrapping to the level's length" $
+      -- 2³¹ × 2³¹ × 4 is 2⁶⁴, which wraps to 0 as an Int.
+      generated mipRequest (blank 1 1) {decodedWidth = 2147483648, decodedHeight = 2147483648, decodedLevels = [ByteString.empty]}
+        `shouldSatisfy` either (const True) (const False)
     it "refuses an image with no level" $
       generated mipRequest (blank 2 2) {decodedLevels = []} `shouldSatisfy` either (const True) (const False)
     it "names the asset when a mipmapped decoder refuses an image" $ do

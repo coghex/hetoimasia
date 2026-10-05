@@ -73,19 +73,24 @@ mipRequest ∷ MipRequest
 mipRequest = MipRequest {mipCoverage = CoverageFromMark}
 
 -- | The image with its full mip chain, generated from level 0. Any levels
--- after level 0 are replaced. An image whose level 0 does not hold width ×
--- height four-byte texels is refused with the reason.
+-- after level 0 are replaced. An image with a zero width or height, or whose
+-- level 0 does not hold width × height four-byte texels, is refused with the
+-- reason.
 generateMips ∷ MipRequest → DecodedImage → Either Text DecodedImage
-generateMips request image = case decodedLevels image of
-  base : _
-    | ByteString.length base == expected →
-        Right image {decodedLevels = base : generatedLevels channels preserve width height base}
-    | otherwise → Left (misshapen (ByteString.length base))
-  [] → Left "the image has no level 0"
+generateMips request image
+  | decodedWidth image == 0 || decodedHeight image == 0 =
+      Left ("the image is " <> tshow (decodedWidth image) <> " × " <> tshow (decodedHeight image) <> ", with no texel to generate levels from")
+  | otherwise = case decodedLevels image of
+      base : _
+        -- Compared as Integer: the extent's byte count can exceed Int.
+        | toInteger (ByteString.length base) == expected →
+            Right image {decodedLevels = base : generatedLevels channels preserve width height base}
+        | otherwise → Left (misshapen (ByteString.length base))
+      [] → Left "the image has no level 0"
   where
     width = fromIntegral (decodedWidth image)
     height = fromIntegral (decodedHeight image)
-    expected = width * height * 4
+    expected = toInteger (decodedWidth image) * toInteger (decodedHeight image) * 4
     channels = case decodedFormat image of
       TexelRgba8Srgb → SrgbPremultiplied
       TexelRgba8Linear → LinearStraight
@@ -96,7 +101,7 @@ generateMips request image = case decodedLevels image of
     misshapen ∷ Int → Text
     misshapen actual =
       "level 0 holds " <> tshow actual <> " bytes, not the " <> tshow expected <> " that "
-        <> tshow width <> " × " <> tshow height <> " four-byte texels take"
+        <> tshow (decodedWidth image) <> " × " <> tshow (decodedHeight image) <> " four-byte texels take"
 
 -- | A decoder whose images carry the requested mip chain. A refusal of the
 -- underlying decoder passes through; an image 'generateMips' refuses is
