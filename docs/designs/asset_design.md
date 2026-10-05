@@ -17,7 +17,7 @@ concrete precondition
 
 ## Processing status
 
-- [ ] EPIC. Asset: establish decoding packages, starting with images
+- [x] EPIC. Asset: establish decoding packages, starting with images — [#398]
 - [ ] AST-1. Decode PNG into premultiplied RGBA8 levels in `asset` and `asset-image`
 - [ ] AST-4. Generate mip chains for decoded images
 - [ ] AST-3. Decode BC7 to RGBA8 in software for devices without BC support
