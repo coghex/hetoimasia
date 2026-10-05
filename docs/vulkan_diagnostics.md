@@ -503,7 +503,17 @@ instance of its own in a child process; see
 are retained as `docs/vulkan/linux-vk6.md` and `docs/vulkan/macos-vk6.md`. Every
 validation-enabled instance there, and the shared roots', also enables
 synchronization validation through its create info, and the suite's
-`synchronization-hazard` case proves the capture receives its reports. The
+`synchronization-hazard` case proves the capture receives its reports. Both
+cases own their instance and explicit messenger through one failure-preserving
+scope (`Test.GPU.Vulkan.Native.InstanceScope`), keeping the failure table in
+[resources.md](resources.md#the-failure-table). When the body fails, its
+exception leaves the lifetime with its own type, value and context, and so
+supplies the stopped session's reason and verdict. That holds even when
+`vkDestroyInstance` then raises; the destruction's failure is kept beside it
+under the instance's label. A destruction that raised issues no `Quiesced`
+evidence. The suite's session-free examples, selected by `--match "instance
+scope"`, inject both failures into each case's own scope and the production
+lifetime. The
 `debug-names` case provokes one validation error on a named managed resource
 inside a labelled batch and requires the delivered record to carry that
 resource's name and, where the pinned layer reports them, the batch's label.
