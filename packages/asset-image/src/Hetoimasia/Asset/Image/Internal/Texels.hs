@@ -4,8 +4,10 @@
 -- image or palette types and leaves as four bytes per texel, R, G, B, A, top
 -- row first:
 --
--- * a missing alpha channel becomes 255, including on a greyscale or truecolour
---   image carrying a @tRNS@ colour key, which this decoder does not apply;
+-- * a greyscale or truecolour image with a @tRNS@ colour key gives alpha 0 to
+--   every texel whose stored samples equal the key's, compared at the image's
+--   own bit depth before any reduction to 8 bits, and alpha 255 to the rest;
+-- * any other missing alpha channel becomes 255;
 -- * a 16-bit component, alpha included, becomes nearest(v × 255 ÷ 65535);
 -- * a palette index must name an entry of the palette;
 -- * a colour image's channels are then premultiplied in linear light, and a
@@ -17,6 +19,7 @@ module Hetoimasia.Asset.Image.Internal.Texels
 where
 
 import Codec.Picture.Png.Internal.Type (PngImageType (PngGreyscale))
+import Hetoimasia.Asset.Image.Internal.PngStructure (ColourKey (..))
 import Codec.Picture.Types
   ( DynamicImage (..)
   , Image (imageData, imageHeight, imageWidth)
@@ -42,30 +45,50 @@ data Texel = Texel !Word8 !Word8 !Word8 !Word8
 -- | The decoded image as one RGBA8 level of the given kind, with its width
 -- and height; or the reason it cannot be one. The PNG colour type is the
 -- header's, which tells a low-bit greyscale image (that JuicyPixels returns
--- as a palette) from an indexed one.
-rgba8Level ∷ ImageKind → PngImageType → PalettedImage → Either Text (Int, Int, ByteString)
-rgba8Level kind colourType = \case
+-- as a palette) from an indexed one; the colour key is the file's, if any.
+rgba8Level ∷ ImageKind → PngImageType → Maybe ColourKey → PalettedImage → Either Text (Int, Int, ByteString)
+rgba8Level kind colourType key = \case
   TrueColorImage dynamic → case dynamic of
-    ImageY8 image → direct image 1 (\v i → let y = v ! i in Texel y y y 255)
-    ImageY16 image → direct image 1 (\v i → let y = narrow (v ! i) in Texel y y y 255)
+    ImageY8 image → direct image 1 (\v i → let y = v ! i in Texel y y y (greyAlpha (fromIntegral y)))
+    ImageY16 image → direct image 1 (\v i → let y = narrow (v ! i) in Texel y y y (greyAlpha (v ! i)))
     ImageYA8 image → direct image 2 (\v i → let y = v ! i in Texel y y y (v ! (i + 1)))
     ImageYA16 image → direct image 2 (\v i → let y = narrow (v ! i) in Texel y y y (narrow (v ! (i + 1))))
-    ImageRGB8 image → direct image 3 (\v i → Texel (v ! i) (v ! (i + 1)) (v ! (i + 2)) 255)
-    ImageRGB16 image → direct image 3 (\v i → Texel (narrow (v ! i)) (narrow (v ! (i + 1))) (narrow (v ! (i + 2))) 255)
+    ImageRGB8 image →
+      direct image 3 $ \v i →
+        Texel (v ! i) (v ! (i + 1)) (v ! (i + 2)) (rgbAlpha (fromIntegral (v ! i)) (fromIntegral (v ! (i + 1))) (fromIntegral (v ! (i + 2))))
+    ImageRGB16 image →
+      direct image 3 $ \v i →
+        Texel (narrow (v ! i)) (narrow (v ! (i + 1))) (narrow (v ! (i + 2))) (rgbAlpha (v ! i) (v ! (i + 1)) (v ! (i + 2)))
     ImageRGBA8 image → direct image 4 (\v i → Texel (v ! i) (v ! (i + 1)) (v ! (i + 2)) (v ! (i + 3)))
     ImageRGBA16 image →
       direct image 4 (\v i → Texel (narrow (v ! i)) (narrow (v ! (i + 1))) (narrow (v ! (i + 2))) (narrow (v ! (i + 3))))
     _ → Left "JuicyPixels returned a pixel type no PNG decodes to"
-  PalettedRGB8 indices palette → paletted indices palette 3 (\p j → Texel (p ! j) (p ! (j + 1)) (p ! (j + 2)) 255)
+  -- A 1-, 2- or 4-bit greyscale image arrives as indices into a generated
+  -- grey palette, and each index is the stored sample. Its tRNS chunk is a
+  -- two-byte colour key, which JuicyPixels applies to that palette as if it
+  -- were a table of alphas; the key is applied to the index instead.
+  PalettedRGB8 indices palette
+    | PngGreyscale ← colourType → paletted indices palette 3 (\p x → let j = 3 * x in Texel (p ! j) (p ! (j + 1)) (p ! (j + 2)) (greyAlpha (fromIntegral x)))
+    | otherwise → paletted indices palette 3 (\p x → let j = 3 * x in Texel (p ! j) (p ! (j + 1)) (p ! (j + 2)) 255)
   PalettedRGBA8 indices palette
-    -- A greyscale tRNS chunk is a two-byte colour key, which JuicyPixels
-    -- applies to its generated grey palette as if it were a table of alphas.
-    | PngGreyscale ← colourType → paletted indices palette 4 (\p j → Texel (p ! j) (p ! (j + 1)) (p ! (j + 2)) 255)
-    | otherwise → paletted indices palette 4 (\p j → Texel (p ! j) (p ! (j + 1)) (p ! (j + 2)) (p ! (j + 3)))
+    | PngGreyscale ← colourType → paletted indices palette 4 (\p x → let j = 4 * x in Texel (p ! j) (p ! (j + 1)) (p ! (j + 2)) (greyAlpha (fromIntegral x)))
+    | otherwise → paletted indices palette 4 (\p x → let j = 4 * x in Texel (p ! j) (p ! (j + 1)) (p ! (j + 2)) (p ! (j + 3)))
   _ → Left "JuicyPixels returned a palette type no PNG decodes to"
   where
     (!) ∷ Vector.Storable a ⇒ Vector.Vector a → Int → a
     (!) = Vector.unsafeIndex
+
+    -- Alpha for a greyscale or truecolour texel's stored samples, at the
+    -- image's own bit depth.
+    greyAlpha ∷ Word16 → Word8
+    greyAlpha y = case key of
+      Just (GreyKey k) | y == k → 0
+      _ → 255
+
+    rgbAlpha ∷ Word16 → Word16 → Word16 → Word8
+    rgbAlpha r g b = case key of
+      Just (RgbKey kr kg kb) | r == kr && g == kg && b == kb → 0
+      _ → 255
 
     direct
       ∷ Vector.Storable (PixelBaseComponent p)
@@ -86,7 +109,7 @@ rgba8Level kind colourType = \case
       | not (Vector.null chosen) && fromIntegral (Vector.maximum chosen) >= size =
           Left ("a palette index " <> tshow (Vector.maximum chosen) <> " is outside the " <> tshow size <> "-entry palette")
       | otherwise =
-          Right (imageWidth indices, imageHeight indices, level kind count (\n → texel entries (fromIntegral (chosen ! n) * components)))
+          Right (imageWidth indices, imageHeight indices, level kind count (\n → texel entries (fromIntegral (chosen ! n))))
       where
         count = imageWidth indices * imageHeight indices
         chosen = imageData indices

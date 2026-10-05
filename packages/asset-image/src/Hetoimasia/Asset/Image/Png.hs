@@ -11,8 +11,11 @@
 --   nearest. Alpha is unchanged.
 -- * 'DataImage' yields 'TexelRgba8Linear', with texels exactly as decoded.
 --
--- A missing alpha channel becomes 255, and 16-bit components, alpha included,
--- are rounded to the nearest 8-bit value before anything else. Either kind
+-- A greyscale or truecolour image's @tRNS@ colour key is honoured: a texel
+-- whose stored samples exactly equal the key, compared at the file's own bit
+-- depth (1, 2, 4, 8 or 16) before any reduction, has alpha 0, and every other
+-- texel alpha 255. Any other missing alpha channel becomes 255. 16-bit
+-- components, alpha included, are then rounded to the nearest 8-bit value. Either kind
 -- carries whether the level's alpha is binary.
 module Hetoimasia.Asset.Image.Png
   ( pngDecoder
@@ -46,9 +49,9 @@ decodePng kind asset bytes = either (Left . AssetRefusal asset) Right (contained
 
 decode ∷ ImageKind → ByteString → Either Text DecodedImage
 decode kind bytes = do
-  ihdr ← checkStructure bytes
+  (ihdr, key) ← checkStructure bytes
   (paletted, _) ← either (Left . ("JuicyPixels cannot decode the PNG: " <>) . Text.pack) Right (decodePngWithPaletteAndMetadata bytes)
-  (w, h, texels) ← rgba8Level kind (colourType ihdr) paletted
+  (w, h, texels) ← rgba8Level kind (colourType ihdr) key paletted
   Right
     DecodedImage
       { decodedFormat = case kind of

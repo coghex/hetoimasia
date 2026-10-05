@@ -124,6 +124,16 @@ def grey(rows):
     return [[(v,) for v in row] for row in rows]
 
 
+def grey_key(value):
+    """A greyscale tRNS colour key: one big-endian 16-bit sample."""
+    return chunk(b"tRNS", struct.pack(">H", value))
+
+
+def rgb_key(red, green, blue):
+    """A truecolour tRNS colour key: three big-endian 16-bit samples."""
+    return chunk(b"tRNS", struct.pack(">HHH", red, green, blue))
+
+
 def s15(value):
     return struct.pack(">i", round(value * 65536))
 
@@ -169,6 +179,10 @@ def icc_profile():
     return header + struct.pack(">I", len(tags)) + table + body
 
 
+GREY1 = grey([[0, 1, 0, 1, 1, 0, 0, 1, 1, 1], [1, 0, 1, 0, 0, 1, 1, 0, 0, 0]])
+GREY2 = grey([[0, 1, 2, 3, 0], [3, 2, 1, 0, 1]])
+GREY4 = grey([[0, 7, 15], [1, 8, 14]])
+GREY8 = grey([[0, 128, 255], [17, 64, 200]])
 RGB8 = [[(255, 0, 0), (0, 255, 0)], [(0, 0, 255), (12, 34, 56)]]
 RGBA8 = [[(255, 0, 0, 255), (0, 255, 0, 128), (0, 0, 255, 0)],
          [(200, 100, 50, 64), (255, 255, 255, 255), (1, 2, 3, 4)]]
@@ -191,10 +205,10 @@ def fixtures():
     corrupt = good[:2] + bytes([0xFF]) + good[3:]
 
     return {
-        "grey1.png": png(grey([[0, 1, 0, 1, 1, 0, 0, 1, 1, 1], [1, 0, 1, 0, 0, 1, 1, 0, 0, 0]]), 1, GREY),
-        "grey2.png": png(grey([[0, 1, 2, 3, 0], [3, 2, 1, 0, 1]]), 2, GREY),
-        "grey4.png": png(grey([[0, 7, 15], [1, 8, 14]]), 4, GREY),
-        "grey8.png": png(grey([[0, 128, 255], [17, 64, 200]]), 8, GREY),
+        "grey1.png": png(GREY1, 1, GREY),
+        "grey2.png": png(GREY2, 2, GREY),
+        "grey4.png": png(GREY4, 4, GREY),
+        "grey8.png": png(GREY8, 8, GREY),
         "grey16.png": png(grey([[0, 129, 383], [386, 32896, 65535]]), 16, GREY),
         "grey-alpha8.png": png([[(10, 0), (128, 127), (255, 255)]], 8, GREY_ALPHA),
         "grey-alpha16.png": png([[(65535, 129), (32896, 386), (129, 65535)]], 16, GREY_ALPHA),
@@ -217,10 +231,39 @@ def fixtures():
                                     interlace=1, idat_pieces=3),
         "interlaced-grey1.png": png(grey([[(x + y) % 2 for x in range(5)] for y in range(5)]), 1, GREY,
                                     interlace=1),
-        # Colour-key transparency on a type without an alpha channel.
-        "grey2-trns.png": png(grey([[0, 1, 2, 3, 0], [3, 2, 1, 0, 1]]), 2, GREY,
-                              before_idat=[chunk(b"tRNS", struct.pack(">H", 1))]),
-        "rgb8-trns.png": png(RGB8, 8, RGB, before_idat=[chunk(b"tRNS", struct.pack(">HHH", 255, 0, 0))]),
+        # tRNS colour keys on greyscale and RGB: a texel whose stored samples
+        # equal the key, at the file's own bit depth, is transparent.
+        "grey1-trns.png": png(GREY1, 1, GREY, before_idat=[grey_key(1)]),
+        "grey2-trns.png": png(GREY2, 2, GREY, before_idat=[grey_key(1)]),
+        "grey4-trns.png": png(GREY4, 4, GREY, before_idat=[grey_key(7)]),
+        "grey8-trns.png": png(GREY8, 8, GREY, before_idat=[grey_key(128)]),
+        # 0x1299 shares only the key's high byte, 0x5534 only its low byte.
+        "grey16-trns.png": png(grey([[0x1234, 0x1299, 0x5534], [0x1234, 0, 65535]]), 16, GREY,
+                               before_idat=[grey_key(0x1234)]),
+        "rgb8-trns.png": png(RGB8, 8, RGB, before_idat=[rgb_key(255, 0, 0)]),
+        # (0x12ff, 0x56ff, 0x9aff) shares only the key's high bytes, and
+        # (0x1234, 0x5678, 0x9abd) differs in one low byte.
+        "rgb16-trns.png": png([[(0x1234, 0x5678, 0x9ABC), (0x12FF, 0x56FF, 0x9AFF)],
+                               [(0x1234, 0x5678, 0x9ABD), (0x1234, 0x5678, 0x9ABC)]], 16, RGB,
+                              before_idat=[rgb_key(0x1234, 0x5678, 0x9ABC)]),
+        "interlaced-grey2-trns.png": png(grey([[(x + 2 * y) % 4 for x in range(5)] for y in range(5)]), 2, GREY,
+                                         interlace=1, before_idat=[grey_key(2)]),
+        "interlaced-rgb8-trns.png": png([[(x % 2 * 100, y % 2 * 100, 7) for x in range(5)] for y in range(5)], 8, RGB,
+                                        interlace=1, before_idat=[rgb_key(100, 0, 7)]),
+        # Keys no texel matches: absent from the image, beyond the 2-bit
+        # range, and sharing an 8-bit texel's low byte but not the high byte.
+        "grey8-trns-unmatched.png": png(GREY8, 8, GREY, before_idat=[grey_key(77)]),
+        "grey2-trns-out-of-range.png": png(GREY2, 2, GREY, before_idat=[grey_key(5)]),
+        "grey8-trns-high-byte.png": png(GREY8, 8, GREY, before_idat=[grey_key(0x0180)]),
+        # Malformed tRNS chunks, which JuicyPixels decodes without complaint:
+        # a length the colour type does not take, a colour type with its own
+        # alpha, and a second tRNS chunk.
+        "grey8-trns-rgb-length.png": png(GREY8, 8, GREY, before_idat=[rgb_key(128, 128, 128)]),
+        "grey1-trns-rgb-length.png": png(GREY1, 1, GREY, before_idat=[rgb_key(1, 1, 1)]),
+        "rgb8-trns-grey-length.png": png(RGB8, 8, RGB, before_idat=[grey_key(255)]),
+        "rgba8-trns.png": png(RGBA8, 8, RGBA, before_idat=[rgb_key(255, 0, 0)]),
+        "grey-alpha8-trns.png": png([[(10, 0), (128, 127), (255, 255)]], 8, GREY_ALPHA, before_idat=[grey_key(128)]),
+        "grey8-two-trns.png": png(GREY8, 8, GREY, before_idat=[grey_key(128), grey_key(128)]),
         # Colour-space chunks over the same texels as rgba8.png and rgb8.png.
         "rgba8-colour-chunks.png": png(RGBA8, 8, RGBA, before_idat=[gama_one, chrm, srgb]),
         "rgb8-iccp.png": png(RGB8, 8, RGB, before_idat=[gama_srgb, iccp]),

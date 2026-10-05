@@ -37,6 +37,16 @@ spec = describe "PNG" $ do
     it "is false when one texel holds alpha 1" $ mapM_ (\kind → marks kind "alpha-one.png" False) [ColourImage, DataImage]
     it "is false when one texel holds alpha 254" $ mapM_ (\kind → marks kind "alpha-254.png" False) [ColourImage, DataImage]
     it "is false for 16-bit alpha that rounds to 1" $ mapM_ (\kind → marks kind "grey-alpha16.png" False) [ColourImage, DataImage]
+    it "is true for an image whose only transparency is a tRNS colour key" $
+      mapM_ (\(kind, name) → marks kind name True) [(kind, name) | kind ← [ColourImage, DataImage], name ← ["grey16-trns.png", "rgb16-trns.png"]]
+
+  describe "a texel keyed out by tRNS" $ do
+    it "keeps its colour channels and has alpha 0 in a data image" $
+      decoded DataImage "rgb8-trns.png" $ \image →
+        ByteString.take 4 (mconcat (decodedLevels image)) `shouldBe` ByteString.pack [255, 0, 0, 0]
+    it "is premultiplied to zero in a colour image" $
+      decoded ColourImage "rgb8-trns.png" $ \image →
+        ByteString.take 4 (mconcat (decodedLevels image)) `shouldBe` ByteString.pack [0, 0, 0, 0]
 
   describe "determinism" $
     it "gives the same result for the same bytes and kind" $

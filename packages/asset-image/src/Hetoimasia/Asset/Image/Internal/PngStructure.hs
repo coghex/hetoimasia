@@ -8,8 +8,12 @@
 -- refused here, before it runs, so what it returns is always the image the
 -- file describes. Palette indices are checked where the palette is applied
 -- ('Hetoimasia.Asset.Image.Internal.Texels').
+--
+-- The same pass reads a greyscale or truecolour image's @tRNS@ colour key,
+-- which JuicyPixels does not apply.
 module Hetoimasia.Asset.Image.Internal.PngStructure
   ( checkStructure
+  , ColourKey (..)
   )
 where
 
@@ -23,6 +27,7 @@ import Codec.Picture.Png.Internal.Type
   , iDATSignature
   , pngComputeCrc
   , pngSignature
+  , tRNSSignature
   )
 import Data.Binary (get)
 import Data.Binary.Get (runGetOrFail)
@@ -31,11 +36,20 @@ import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Lazy as Lazy
 import Data.Text (Text)
 import qualified Data.Text as Text
-import Data.Word (Word8)
+import Data.Word (Word16, Word8)
+
+-- | A greyscale or truecolour image's @tRNS@ colour key: the sample values,
+-- at the image's own bit depth, of the one colour that is fully transparent.
+-- A texel whose stored samples all equal the key's has alpha 0; every other
+-- texel has alpha 255.
+data ColourKey
+  = GreyKey !Word16
+  | RgbKey !Word16 !Word16 !Word16
+  deriving (Eq, Show)
 
 -- | The header of a PNG whose framing, header and image data stream are
--- sound, or the reason they are not.
-checkStructure ∷ ByteString → Either Text PngIHdr
+-- sound, with its colour key if it has one; or the reason they are not.
+checkStructure ∷ ByteString → Either Text (PngIHdr, Maybe ColourKey)
 checkStructure bytes
   | ByteString.null bytes = Left "the bytes are empty"
   | bytes `ByteString.isPrefixOf` signature = Left "the PNG is truncated within its signature"
@@ -48,9 +62,26 @@ checkStructure bytes
       let ihdr = header raw
       checkHeader ihdr
       checkImageData ihdr (Lazy.concat [chunkData c | c ← chunks raw, chunkType c == iDATSignature])
-      Right ihdr
+      Right (ihdr, colourKey (colourType ihdr) [chunkData c | c ← chunks raw, chunkType c == tRNSSignature])
   where
     signature = Lazy.toStrict pngSignature
+
+-- | The colour key of a greyscale or truecolour image: its one @tRNS@ chunk,
+-- two big-endian bytes for greyscale and six for truecolour. A @tRNS@ chunk of
+-- another length, a second @tRNS@ chunk, or one on a colour type with an
+-- alpha channel is malformed. JuicyPixels decodes such a file without
+-- complaint; so does this decoder, ignoring the chunk, as JuicyPixels ignores
+-- a palette image's @tRNS@ when there is more than one. A palette image's
+-- @tRNS@ is JuicyPixels' to apply.
+colourKey ∷ PngImageType → [Lazy.ByteString] → Maybe ColourKey
+colourKey colour = \case
+  [key] → case (colour, map fromIntegral (Lazy.unpack key) ∷ [Word16]) of
+    (PngGreyscale, [hi, lo]) → Just (GreyKey (sample hi lo))
+    (PngTrueColour, [rh, rl, gh, gl, bh, bl]) → Just (RgbKey (sample rh rl) (sample gh gl) (sample bh bl))
+    _ → Nothing
+  _ → Nothing
+  where
+    sample hi lo = hi * 256 + lo
 
 -- | JuicyPixels skips the header chunk's length and CRC; every other chunk's
 -- CRC it checks itself.
