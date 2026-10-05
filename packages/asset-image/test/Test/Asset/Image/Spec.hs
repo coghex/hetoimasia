@@ -3,6 +3,7 @@
 module Test.Asset.Image.Spec (spec) where
 
 import qualified Test.Asset.Image.Fixtures as Fixtures
+import qualified Test.Asset.Image.Mips as Mips
 import qualified Test.Asset.Image.Png as Png
 import qualified Test.Asset.Image.Premultiply as Premultiply
 import qualified Test.Asset.Image.Refusals as Refusals
@@ -14,3 +15,4 @@ spec = describe "AssetImage" $ do
   Premultiply.spec
   Png.spec
   Refusals.spec
+  Mips.spec
