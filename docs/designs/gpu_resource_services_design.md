@@ -247,6 +247,11 @@ handles; its consumers are scaffolding fixtures, not `render-2d` or
 concurrency and budgets are a later content-loading arc (RTC-4). Work
 proceeds slowly and methodically, one layer at a time.
 
+Revised on 2026-10-05 by the owner's decisions in the
+[asset design](asset_design.md) (D-2, D-3): decoding PNG and KTX2/BC7 comes
+forward into its own `asset` epic, ahead of `render-2d`. Build tooling, file
+watching, loader concurrency and budgets remain the content-loading arc's.
+
 ### D-4. Write an owned allocator, proven by measurement
 
 Owner decision 2026-09-29, conditional on performance parity with VMA for
@@ -288,6 +293,10 @@ Owner decision 2026-09-29. New services live in
 `hetoimasia-gpu-vulkan-native` beside `Recording`; the texture handle is
 Vulkan-side. `render-api` is not created until `render-2d` needs a
 backend-independent handle, decided in the FND-4 arc.
+
+Answered on 2026-10-05 by the [2D renderer design](render_2d_design.md)'s
+D-12: `render-2d` needs one, so `render-api` starts with only the
+backend-independent texture handle.
 
 ### D-9. Uploads copy into engine-owned staging at admission
 
@@ -501,6 +510,12 @@ Amended by D-27 (lookup versions), D-31 (binding order, declared cap and
 growth) and D-35 (the lookup buffer's own set). Reconciled with D-35 on
 2026-10-03, as GRS-7 (#343) builds it: the bullets above describe the two
 sets.
+
+For `render-2d`, the [2D renderer design](render_2d_design.md)'s D-4
+(2026-10-05) moves the sampler choice from the push constants into each
+instance's flags word, so mixed filtering stays in one draw. The table and
+its samplers are unchanged; this concerns only how a consumer's shader picks
+a sampler.
 
 ### D-23. Instances carry stable handles, resolved through a per-frame lookup
 
