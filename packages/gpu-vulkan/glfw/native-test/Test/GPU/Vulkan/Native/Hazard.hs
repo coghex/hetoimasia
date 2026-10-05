@@ -28,13 +28,18 @@ module Test.GPU.Vulkan.Native.Hazard
   , HazardFacts (..)
   , HazardStep (..)
   , runHazard
+  , stoppedSession
+  , hazardCaptureConfig
+  , instanceScope
+  , instanceLabel
+  , messengerLabel
   , hazardMessageId
   , hazardSection
   , spec
   ) where
 
 import Control.Concurrent.STM (atomically, modifyTVar', newTVarIO, readTVarIO)
-import Control.Exception (SomeException, displayException, mask, onException, throwIO, try)
+import Control.Exception (SomeException, displayException, throwIO, try)
 import Data.Bits ((.&.), (.|.))
 import qualified Data.ByteString as ByteString
 import Data.Foldable (for_)
@@ -80,6 +85,7 @@ import Hetoimasia.GPU.Vulkan.Native.Profile (InstancePlan (..), InstanceRequest 
 import Hetoimasia.GPU.Vulkan.Native.Roots (RootOps (..))
 import Hetoimasia.GPU.Vulkan.Native.Roots.Vulkan (vulkanRootOps)
 import Test.GPU.Vulkan.Native.Environment (validationFeatures)
+import Test.GPU.Vulkan.Native.InstanceScope (InstanceOps (..), withInstanceScope)
 import Test.Vulkan.Proof.Journal (Journal, heading, note)
 
 -- | One native step, and what the capture received during it.
@@ -143,10 +149,17 @@ runHazard journal = do
   case outcome of
     Left failure → do
       note journal ("the hazard session stopped: " <> Text.pack (displayException failure))
-      pure (HazardStopped (Text.pack (displayException failure)) (diagnosticVerdict failure) seen)
+      pure (stoppedSession failure seen)
     Right (device, verdict) → do
       note journal ("the lifetime delivered " <> tshow (verdictDelivered verdict) <> " records")
       pure (HazardRecorded HazardFacts {hazardSteps = seen, hazardEntries = entries, hazardDevice = device, hazardVerdict = verdict})
+
+-- | What a session that raised reports: the reason is the exception that left
+-- the capture lifetime, and the verdict the one the lifetime attached to it.
+-- When the body failed, that exception is the body's own, whatever its
+-- teardown raised after it.
+stoppedSession ∷ SomeException → [HazardStep] → HazardOutcome
+stoppedSession failure = HazardStopped (Text.pack (displayException failure)) (diagnosticVerdict failure)
 
 -- | Count what the capture received during one step.
 measure ∷ DiagnosticCapture → IORef [HazardStep] → Text → IO a → IO a
@@ -169,20 +182,28 @@ session journal steps capture = do
     either (stopWith . Text.pack . displayException) pure $
       planInstance (InstanceRequest ["VK_KHR_surface"] ["VK_LAYER_KHRONOS_validation"] validationFeatures) offer
   note journal ("the production layer enables " <> tshow plan.planValidationFeatures <> " through the instance's create info")
-  mask $ \restore → do
-    vulkan ← step "vkCreateInstance" (opsCreateInstance ops plan)
-    let quiesce = step "vkDestroyInstance" (opsDestroyInstance ops vulkan)
-    device ←
-      restore
-        ( withResourceLabelled
-            "the hazard's explicit messenger"
-            (step "vkCreateDebugUtilsMessengerEXT" (opsCreateMessenger ops vulkan))
-            (step "vkDestroyDebugUtilsMessengerEXT" . opsDestroyMessenger ops vulkan)
-            (\_ → hazard journal step vulkan)
-        )
-        `onException` quiesce
-    token ← quiesce
-    pure (device, token)
+  instanceScope
+    InstanceOps
+      { instanceCreate = step "vkCreateInstance" (opsCreateInstance ops plan)
+      , instanceDestroy = step "vkDestroyInstance" . opsDestroyInstance ops
+      , messengerCreate = step "vkCreateDebugUtilsMessengerEXT" . opsCreateMessenger ops
+      , messengerDestroy = \vulkan → step "vkDestroyDebugUtilsMessengerEXT" . opsDestroyMessenger ops vulkan
+      }
+    (hazard journal step)
+
+-- | The cleanup labels of the hazard's instance and explicit messenger.
+instanceLabel, messengerLabel ∷ Text
+instanceLabel = "the hazard's instance"
+messengerLabel = "the hazard's explicit messenger"
+
+-- | The hazard's instance scope: the instance, then the explicit messenger,
+-- around the device and everything else, destroyed in the reverse order on
+-- every exit. When the body fails, its failure leaves the scope even if a
+-- destruction raises too, and the stopped session reports it. A destruction
+-- that raised is retained under its label and issues no 'Quiesced' evidence.
+-- See "Test.GPU.Vulkan.Native.InstanceScope".
+instanceScope ∷ InstanceOps inst msgr q → (inst → IO r) → IO (r, q)
+instanceScope = withInstanceScope instanceLabel messengerLabel
 
 -- | The device, the buffer, and the two writes.
 hazard ∷ Journal → (∀ a. Text → IO a → IO a) → Instance → IO Text
