@@ -75,6 +75,7 @@ cabal test hetoimasia-scripting-lua:lua-host-tests --test-show-details=direct
 cabal test hetoimasia-gpu-vulkan-model:gpu-model-tests --test-show-details=direct
 cabal test hetoimasia-gpu-vulkan-diagnostics:diagnostics-tests --test-show-details=direct
 cabal test --project-file cabal.project.cpu hetoimasia-math:math-tests --test-show-details=direct
+cabal test --project-file cabal.project.cpu hetoimasia-asset-image:asset-image-tests --test-show-details=direct
 cabal test hetoimasia-tests --test-show-details=direct
 ```
 
@@ -163,6 +164,8 @@ uses, and releases both resources and still exits 0 — it just says nothing.
 | `packages/foundation/` | Logging, CPU scopes/collections, failures, recovery, workers and messaging | Buildable |
 | `packages/runtime/` | Application composition, reporting, supervision and inbox services | Buildable |
 | `packages/math/` | Vectors, 4×4 matrices, transforms, look-at and perspective; depends on `base` alone | Buildable |
+| `packages/asset/` | Asset identity and provenance, decoded-asset types and the pure decoder interface; no codecs | Buildable |
+| `packages/asset-image/` | Image codecs: PNG to upload-ready RGBA8, premultiplied in linear light for colour, with the cutout mark | Buildable |
 | `packages/glfw/` | Private binding, windows, monitors, input and separate runtime adapter components | Buildable; original arc and repairs complete |
 | `packages/render-api/` | Backend-independent rendering contracts | Planned |
 | `packages/gpu-vulkan/model/` | Pure GPU retention, frame-ownership and recovery model | Buildable without a Vulkan SDK |
@@ -175,7 +178,7 @@ uses, and releases both resources and still exits 0 — it just says nothing.
 | `integrations/` | Game adapters | Planned |
 | `packages/foundation/test/` | Foundation-owned headless Hspec contracts | Buildable without GLFW through `cabal.project.cpu` |
 | `packages/runtime/test/`, `packages/glfw/test/` | Package-owned runtime and headless GLFW contracts | Buildable |
-| `packages/scripting-lua/test/`, `packages/gpu-vulkan/model/test/`, `packages/math/test/` | Package-owned Lua, GPU model and math contracts | Buildable without GLFW through `cabal.project.cpu` |
+| `packages/scripting-lua/test/`, `packages/gpu-vulkan/model/test/`, `packages/math/test/`, `packages/asset-image/test/` | Package-owned Lua, GPU model, math and image-decoding contracts | Buildable without GLFW through `cabal.project.cpu` |
 | `test/` | Root console composition only | Buildable |
 | `packages/glfw/native-tests/` | Shared native Hspec fixture and platform verification | Cocoa locally; Linux X11 in CI |
 | `tools/test/` | Workflow, validation and provisioning Hspec examples | Buildable |

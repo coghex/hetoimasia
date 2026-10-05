@@ -134,7 +134,8 @@ Use `cabal build all`, the console smoke, and the focused
 `hetoimasia-foundation:foundation-tests`, `hetoimasia-runtime:runtime-tests`,
 `hetoimasia-glfw:glfw-tests`, `hetoimasia-scripting-lua:lua-host-tests`,
 `hetoimasia-gpu-vulkan-model:gpu-model-tests`,
-`hetoimasia-gpu-vulkan-diagnostics:diagnostics-tests`, `hetoimasia-math:math-tests`, and
+`hetoimasia-gpu-vulkan-diagnostics:diagnostics-tests`, `hetoimasia-math:math-tests`,
+`hetoimasia-asset-image:asset-image-tests`, and
 `hetoimasia-tests` Hspec suites for
 the current components. Prefer Hspec for future integration and
 resource tests too; use Python probes only where Hspec cannot reasonably exercise

@@ -149,6 +149,7 @@ the audited suite inventory, and which optional probes are local-only.
 | `test.vulkan` | `cabal test --project-file cabal.project.cpu hetoimasia-gpu-vulkan-model:gpu-model-tests --test-show-details=direct` | no | no | any |
 | `test.vulkan-diagnostics` | `cabal test --project-file cabal.project.cpu hetoimasia-gpu-vulkan-diagnostics:diagnostics-tests --test-show-details=direct` | no | no | any |
 | `test.math` | `cabal test --project-file cabal.project.cpu hetoimasia-math:math-tests --test-show-details=direct` | no | no | any |
+| `test.asset-image` | `cabal test --project-file cabal.project.cpu hetoimasia-asset-image:asset-image-tests --test-show-details=direct` | no | no | any |
 | `smoke.console` | `cabal run exe:hetoimasia -- --smoke` | no | yes | any |
 | `test.workflow` | `cabal test workflow-tests --test-show-details=direct` | no | no | any |
 | `test.x11-helper` | `cabal test x11-helper-tests --test-show-details=direct` | yes | no | any |
@@ -269,6 +270,21 @@ and like `test.vulkan` its command names `cabal.project.cpu` and the group
 declares that file beside `cabal.project.common`: the library depends on `base`
 alone, and running its suite through the CPU project is what shows it needs no
 native prerequisite. See [the package's contract](../packages/math/README.md).
+
+`test.asset-image` runs the asset-image package's own suite: committed fixture
+PNGs — every colour type at every bit depth, 16-bit files, palette `tRNS`
+alpha, Adam7 interlacing, and colour-space chunks and `tRNS` colour keys that
+change no texel — decoded to texels the suite states by hand; colour images
+premultiplied in linear light within one code value of an independent
+reference for every (channel, alpha) pair, exact at alpha 0 and 255, and data
+images byte-for-byte unchanged; the format, extent and single-level layout the
+upload endpoint takes; the binary-alpha cutout mark; and the refusal of empty,
+foreign, truncated, corrupt-stream and undecodable bytes, each result fully
+evaluated. It is mandatory but outside the floor, like `test.math`, and runs
+through `cabal.project.cpu` for the same reason. Its fixtures sit under the
+suite's own source directory, `packages/asset-image/test/`, so they are inputs
+derived from its component and a fixture-only change selects it. See
+[the package's contract](../packages/asset-image/README.md).
 
 `test.vulkan-headless` runs the Vulkan-linked headless suites through
 `cabal.project.vulkan`, against the provisioned native prefix, and executes them
@@ -778,7 +794,7 @@ Each worker is declared once, to the planner:
 
 ```bash
 python3 tools/validation/plan.py --base origin/master --head HEAD \
-  --worker haskell-engine=cpu:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.vulkan,test.vulkan-diagnostics,test.math,smoke.console \
+  --worker haskell-engine=cpu:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.vulkan,test.vulkan-diagnostics,test.math,test.asset-image,smoke.console \
   --worker haskell-workflow=cpu:test.workflow \
   --worker glfw-native=display:test.glfw-native,test.glfw-wayland \
   --worker vulkan=cpu+display:test.vulkan-headless,test.vulkan-native,test.vulkan-wayland
@@ -943,7 +959,7 @@ class to every execution:
 
 | Job | Runner class | Groups, in order |
 | --- | --- | --- |
-| `haskell-engine` | `cpu` | `build.all`, `test.engine`, `test.foundation`, `test.runtime`, `test.glfw`, `test.scripting-lua`, `test.vulkan`, `test.vulkan-diagnostics`, `test.math`, `smoke.console` |
+| `haskell-engine` | `cpu` | `build.all`, `test.engine`, `test.foundation`, `test.runtime`, `test.glfw`, `test.scripting-lua`, `test.vulkan`, `test.vulkan-diagnostics`, `test.math`, `test.asset-image`, `smoke.console` |
 | `haskell-workflow` | `cpu` | `test.workflow` |
 | `glfw-native` | `display` | `test.glfw-native`, `test.glfw-wayland` |
 | `vulkan` | `cpu`, `display` | `test.vulkan-headless`, `test.vulkan-native`, `test.vulkan-wayland` |
@@ -2202,7 +2218,7 @@ contributes, one `--toolchain` each:
 toolchain=(--toolchain "ghc=$(ghc --numeric-version)" --toolchain "cabal=$(cabal --numeric-version)")
 while IFS= read -r entry; do toolchain+=(--toolchain "$entry"); done < <(python3 tools/native/native.py toolchain)
 python3 tools/validation/plan.py --base origin/master --head HEAD --runner-os Darwin "${toolchain[@]}" \
-  --worker local=cpu+display:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.vulkan,test.vulkan-diagnostics,test.math,test.vulkan-headless,test.vulkan-native,smoke.console,test.workflow,test.glfw-native \
+  --worker local=cpu+display:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.vulkan,test.vulkan-diagnostics,test.math,test.asset-image,test.vulkan-headless,test.vulkan-native,smoke.console,test.workflow,test.glfw-native \
   --json > plan.json
 python3 -I tools/validation/run.py test.workflow --plan plan.json --receipts receipts \
   --worker local --runner-class cpu --runner-class display \
@@ -2326,7 +2342,7 @@ REQUEST
 python3 tools/validation/plan.py --base origin/master --head HEAD --runner-os Darwin \
   --toolchain "ghc=$(ghc --numeric-version)" --toolchain "cabal=$(cabal --numeric-version)" \
   --request-file request.txt \
-  --worker local=cpu+display:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.vulkan,test.vulkan-diagnostics,test.math,test.vulkan-headless,test.vulkan-native,smoke.console,test.workflow,test.glfw-native,test.macos-confinement \
+  --worker local=cpu+display:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.vulkan,test.vulkan-diagnostics,test.math,test.asset-image,test.vulkan-headless,test.vulkan-native,smoke.console,test.workflow,test.glfw-native,test.macos-confinement \
   --json > plan.json
 python3 -I tools/validation/run.py test.macos-confinement --plan plan.json --receipts receipts \
   --worker local --runner-class cpu --runner-class display \

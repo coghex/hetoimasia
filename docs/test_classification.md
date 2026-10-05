@@ -40,6 +40,7 @@ execute every buildable probe. Use named suites and selectors instead.
 | `gpu-model-tests` / `test.vulkan` | Conditional: pure retention/frame model with scripted time; no Vulkan device |
 | `diagnostics-tests` / `test.vulkan-diagnostics` | Conditional: the production C validation capture and its diagnostic lifetime, with injected sinks and explicit coordination; no Vulkan device |
 | `math-tests` / `test.math` | Conditional: pure vector, matrix, transform and projection contracts, with generated inputs and every degenerate case; no native prerequisite |
+| `asset-image-tests` / `test.asset-image` | Conditional: PNG decoding of committed fixtures to hand-stated texels, linear-light premultiplication over every (channel, alpha) pair, the cutout mark, and every refusal; pure, no native prerequisite |
 | `workflow-tests` / `test.workflow` | Conditional: planner, receipts, review gate, image/toolchain/native recipes, packaging, and documentation workflow contracts |
 | `glfw-native-tests` / `test.glfw-native` | Conditional: real session, event wake, window, control, modes, monitors, host, input, and private lifetime integration on isolated X11 in CI |
 | Native Wayland selection / `test.glfw-wayland` | Required-when-affected CI integration on the isolated headless compositor since WL-3 (#207); excluded from coordinated local testing because CI owns that signal |
