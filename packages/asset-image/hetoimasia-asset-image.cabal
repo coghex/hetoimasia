@@ -1,0 +1,86 @@
+cabal-version: 3.16
+name: hetoimasia-asset-image
+version: 0.1.0.0
+synopsis: Image codecs for Hetoimasia's asset packages
+description:
+    Pure image decoders implementing hetoimasia-asset's decoder interface. PNG
+    decodes through JuicyPixels into one tightly packed RGBA8 level shaped for
+    the GPU upload endpoint: colour images in sRGB, premultiplied in linear
+    light; data images linear and untouched. Every decoded image carries
+    whether its alpha is binary. Decoding is pure, owns no state, starts no
+    thread and reads no file; the library depends on no GPU, GLFW, render or
+    runtime package.
+license: GPL-3.0-only
+license-file: LICENSE
+author: Vincent Coghlan
+maintainer: Vincent Coghlan
+category: Graphics
+build-type: Simple
+tested-with: GHC ==9.14.1
+extra-doc-files: README.md
+-- The suite's fixtures and the script that writes them. They sit under the
+-- suite's own source directory, so the validation planner counts them as
+-- test.asset-image's inputs; listing them here ships them with the package.
+extra-source-files:
+    test/fixtures/*.png
+    test/fixtures/make_fixtures.py
+
+source-repository head
+    type: git
+    location: https://github.com/coghex/hetoimasia.git
+    subdir: packages/asset-image
+
+common language
+    default-language: GHC2024
+    default-extensions: UnicodeSyntax OverloadedStrings
+    ghc-options: -Wall -Wcompat -Wincomplete-uni-patterns -Wincomplete-record-updates
+
+library
+    import: language
+    hs-source-dirs: src
+    exposed-modules:
+        Hetoimasia.Asset.Image.Png
+    -- The premultiplication table, the structural checks that run before
+    -- JuicyPixels, and the conversion of its output to RGBA8.
+    other-modules:
+        Hetoimasia.Asset.Image.Internal.PngStructure
+        Hetoimasia.Asset.Image.Internal.Premultiply
+        Hetoimasia.Asset.Image.Internal.Texels
+    build-depends:
+        base >=4.22 && <4.23,
+        binary >=0.8.9 && <0.9,
+        bytestring >=0.12 && <0.13,
+        deepseq >=1.5.1 && <1.6,
+        hetoimasia-asset ==0.1.0.0,
+        JuicyPixels ==3.3.9,
+        text >=2.1 && <2.2,
+        vector >=0.13 && <0.14,
+        zlib >=0.7.1 && <0.8
+
+-- This package's own contracts, registered as the CPU validation group
+-- `test.asset-image`. The fixtures in test/fixtures are read from the package
+-- directory, where `cabal test` runs the suite.
+test-suite asset-image-tests
+    import: language
+    type: exitcode-stdio-1.0
+    main-is: Main.hs
+    hs-source-dirs: test
+    other-modules:
+        Test.Asset.Image.Fixtures
+        Test.Asset.Image.Png
+        Test.Asset.Image.Premultiply
+        Test.Asset.Image.Refusals
+        Test.Asset.Image.Spec
+        Test.Asset.Image.Support
+    build-depends:
+        base >=4.22 && <4.23,
+        binary >=0.8.9 && <0.9,
+        bytestring >=0.12 && <0.13,
+        deepseq >=1.5.1 && <1.6,
+        filepath >=1.5 && <1.6,
+        hspec >=2.11 && <3,
+        hetoimasia-asset ==0.1.0.0,
+        hetoimasia-asset-image ==0.1.0.0,
+        JuicyPixels ==3.3.9,
+        text >=2.1 && <2.2,
+        zlib >=0.7.1 && <0.8

@@ -19,6 +19,12 @@ package hetoimasia-foundation
 package hetoimasia-math
   ghc-options: -Werror -j
 
+package hetoimasia-asset
+  ghc-options: -Werror -j
+
+package hetoimasia-asset-image
+  ghc-options: -Werror -j
+
 package hetoimasia-runtime
   ghc-options: -Werror -j
 
@@ -53,3 +59,11 @@ package hetoimasia-scripting-lua
 -- See packages/scripting-lua/README.md for the audit these settings come from.
 package lua
   flags: -system-lua -pkg-config -allow-unsafe-gc
+
+-- The C zlib that JuicyPixels reaches through the `zlib` binding is the copy
+-- the `zlib-clib` package bundles, pinned by the index state above, never one
+-- found on the machine: `pkg-config` (on by default) would link whichever
+-- libz the developer's PATH happens to offer, a different version per
+-- machine, which vision V-11 rules out for native inputs, as for Lua above.
+package zlib
+  flags: +bundled-c-zlib -pkg-config

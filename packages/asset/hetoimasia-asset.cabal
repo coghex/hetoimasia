@@ -1,0 +1,41 @@
+cabal-version: 3.16
+name: hetoimasia-asset
+version: 0.1.0.0
+synopsis: Asset identity, decoded-asset types and the decoder interface for Hetoimasia
+description:
+    The core every Hetoimasia codec package builds on: an asset's identity and
+    provenance, both supplied by the caller; the decoded-asset types, starting
+    with images shaped for the GPU upload endpoint; and the decoder interface, a
+    pure function from an asset and its bytes to a decoded value or a refusal
+    naming the asset and the reason. It holds no codec, reads no file and
+    performs no IO, and depends on no GPU, GLFW, render or runtime package.
+license: GPL-3.0-only
+license-file: LICENSE
+author: Vincent Coghlan
+maintainer: Vincent Coghlan
+category: Graphics
+build-type: Simple
+tested-with: GHC ==9.14.1
+extra-doc-files: README.md
+
+source-repository head
+    type: git
+    location: https://github.com/coghex/hetoimasia.git
+    subdir: packages/asset
+
+common language
+    default-language: GHC2024
+    default-extensions: UnicodeSyntax
+    ghc-options: -Wall -Wcompat -Wincomplete-uni-patterns -Wincomplete-record-updates
+
+library
+    import: language
+    hs-source-dirs: src
+    exposed-modules:
+        Hetoimasia.Asset
+        Hetoimasia.Asset.Image
+    build-depends:
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        deepseq >=1.5.1 && <1.6,
+        text >=2.1 && <2.2

@@ -264,6 +264,28 @@
       "optional": false
     },
     {
+      "id": "test.asset-image",
+      "description": "Portable Hspec contracts for the asset-image package's PNG decoder over committed fixture files whose texels the suite states by hand: every colour type at every bit depth, 16-bit components rounded to nearest, palette tRNS alpha, Adam7 interlacing, greyscale and RGB tRNS colour keys honoured at every bit depth by comparing stored samples before any reduction (malformed keys ignored), and colour-space chunks that change no texel; colour images premultiplied in linear light within one code value of an independent reference for every (channel, alpha) pair, exact at alpha 0 and 255, and data images byte-for-byte unchanged; the format, extent and single-level layout the GPU upload endpoint takes; the binary-alpha cutout mark; and the refusal, naming the asset, of empty, foreign, truncated, corrupt-stream and undecodable bytes, each result fully evaluated. It runs through the CPU project and needs no GPU.",
+      "command": [
+        "cabal",
+        "test",
+        "--project-file",
+        "cabal.project.cpu",
+        "hetoimasia-asset-image:asset-image-tests",
+        "--test-show-details=direct"
+      ],
+      "component": "hetoimasia-asset-image:test:asset-image-tests",
+      "inputs": [
+        "cabal.project.common",
+        "cabal.project.cpu"
+      ],
+      "framework": "hspec",
+      "runner": "cpu",
+      "timeout_seconds": 1800,
+      "category": "test",
+      "optional": false
+    },
+    {
       "id": "test.vulkan-headless",
       "description": "Vulkan-linked headless Hspec contracts, executed rather than only built, through cabal.project.vulkan against the provisioned native prefix: the native backend's profile and roots decisions over a stand-in native layer (native-tests), its shader contract against the provisioned compiler (shader-tests), the window integration's controller over the GLFW package's scripted seam (integration-tests), the triangle sample's pipeline cache over stand-in builders (triangle-tests), and the sprites sample's scene, probe oracle, fixtures and PNG writer (sprites-tests). None acquires a display, a GLFW session, or a device, and none reads desktop consent; the headers and loader are build and link prerequisites only.",
       "command": [
