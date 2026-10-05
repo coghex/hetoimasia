@@ -21,7 +21,7 @@ concrete precondition
 - [x] AST-1. Decode PNG into premultiplied RGBA8 levels in `asset` and `asset-image` — [#399]
 - [x] AST-4. Generate mip chains for decoded images — [#400]
 - [x] AST-3. Decode BC7 to RGBA8 in software for devices without BC support — [#401]
-- [ ] AST-2. Read KTX2 files carrying BC7 or RGBA8 levels in `asset-image`
+- [x] AST-2. Read KTX2 files carrying BC7 or RGBA8 levels in `asset-image` — [#402]
 
 ## Epic contract
 
