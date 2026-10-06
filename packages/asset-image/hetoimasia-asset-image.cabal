@@ -10,12 +10,13 @@ description:
     whether its alpha is binary. BC7 levels are checked against the
     endpoint's layout, marked by decoding level 0's alpha, and decoded to RGBA8
     in software, every mode, where the caller reports a device without BC7.
-    KTX2 files carrying RGBA8 or BC7 levels are read by pure code inside an
-    accepted profile, with their own levels: straight-alpha colour RGBA8 is
-    premultiplied at load, and BC7 blocks are returned as stored.
-    Decoding is pure, owns no state, starts no thread, reads no file and logs
-    nothing; the library depends on no foundation, GPU, GLFW, render or
-    runtime package.
+    A full mip chain is generated for an RGBA8 image only on request, as a
+    separate step on an already decoded image. KTX2 files carrying RGBA8 or
+    BC7 levels are read by pure code inside an accepted profile, with their
+    own levels: straight-alpha colour RGBA8 is premultiplied at load, and BC7
+    blocks are returned as stored. Decoding is pure, owns no state, starts no
+    thread, reads no file and logs nothing; the library depends on no
+    foundation, GPU, GLFW, render or runtime package.
 license: GPL-3.0-only
 license-file: LICENSE
 author: Vincent Coghlan
@@ -24,8 +25,9 @@ category: Graphics
 build-type: Simple
 tested-with: GHC ==9.14.1
 extra-doc-files: README.md
--- The suite's fixtures and the script that writes them. They sit under the
--- suite's own source directory, so the validation planner counts them as
+-- The suite's fixtures, the script that writes them, and the reference that
+-- computed the mip examples' expected texels. They sit under the suite's own
+-- source directory, so the validation planner counts them as
 -- test.asset-image's inputs; listing them here ships them with the package.
 extra-source-files:
     test/fixtures/*.png
@@ -35,6 +37,7 @@ extra-source-files:
     test/fixtures/make_fixtures.py
     test/fixtures/make_bc7_fixtures.py
     test/fixtures/make_ktx2_fixtures.py
+    test/fixtures/mip_reference.py
 
 source-repository head
     type: git
@@ -52,12 +55,15 @@ library
     exposed-modules:
         Hetoimasia.Asset.Image.Bc7
         Hetoimasia.Asset.Image.Ktx2
+        Hetoimasia.Asset.Image.Mips
         Hetoimasia.Asset.Image.Png
     -- One BC7 block's texels, the premultiplication table and its
     -- application to RGBA8 levels, the structural checks that run before
-    -- JuicyPixels, and the conversion of its output to RGBA8.
+    -- JuicyPixels, and the conversion of its output to RGBA8; and the mip
+    -- chain's filter and coverage scaling, which only Mips imports.
     other-modules:
         Hetoimasia.Asset.Image.Internal.Bc7Block
+        Hetoimasia.Asset.Image.Internal.MipChain
         Hetoimasia.Asset.Image.Internal.PngStructure
         Hetoimasia.Asset.Image.Internal.Premultiply
         Hetoimasia.Asset.Image.Internal.Texels
@@ -85,6 +91,7 @@ test-suite asset-image-tests
         Test.Asset.Image.Bc7Opacity
         Test.Asset.Image.Fixtures
         Test.Asset.Image.Ktx2
+        Test.Asset.Image.Mips
         Test.Asset.Image.Png
         Test.Asset.Image.Premultiply
         Test.Asset.Image.Refusals
