@@ -7,8 +7,11 @@ description:
     decodes through JuicyPixels into one tightly packed RGBA8 level shaped for
     the GPU upload endpoint: colour images in sRGB, premultiplied in linear
     light; data images linear and untouched. Every decoded image carries
-    whether its alpha is binary. Decoding is pure, owns no state, starts no
-    thread and reads no file; the library depends on no GPU, GLFW, render or
+    whether its alpha is binary. BC7 levels are checked against the
+    endpoint's layout, marked by decoding level 0's alpha, and decoded to RGBA8
+    in software, every mode, where the caller reports a device without BC7.
+    Decoding is pure, owns no state, starts no thread, reads no file and logs
+    nothing; the library depends on no foundation, GPU, GLFW, render or
     runtime package.
 license: GPL-3.0-only
 license-file: LICENSE
@@ -23,7 +26,9 @@ extra-doc-files: README.md
 -- test.asset-image's inputs; listing them here ships them with the package.
 extra-source-files:
     test/fixtures/*.png
+    test/fixtures/bc7-reference.txt
     test/fixtures/make_fixtures.py
+    test/fixtures/make_bc7_fixtures.py
 
 source-repository head
     type: git
@@ -39,10 +44,13 @@ library
     import: language
     hs-source-dirs: src
     exposed-modules:
+        Hetoimasia.Asset.Image.Bc7
         Hetoimasia.Asset.Image.Png
-    -- The premultiplication table, the structural checks that run before
-    -- JuicyPixels, and the conversion of its output to RGBA8.
+    -- One BC7 block's texels, the premultiplication table, the structural
+    -- checks that run before JuicyPixels, and the conversion of its output
+    -- to RGBA8.
     other-modules:
+        Hetoimasia.Asset.Image.Internal.Bc7Block
         Hetoimasia.Asset.Image.Internal.PngStructure
         Hetoimasia.Asset.Image.Internal.Premultiply
         Hetoimasia.Asset.Image.Internal.Texels
@@ -66,6 +74,8 @@ test-suite asset-image-tests
     main-is: Main.hs
     hs-source-dirs: test
     other-modules:
+        Test.Asset.Image.Bc7
+        Test.Asset.Image.Bc7Opacity
         Test.Asset.Image.Fixtures
         Test.Asset.Image.Png
         Test.Asset.Image.Premultiply
@@ -81,6 +91,8 @@ test-suite asset-image-tests
         hspec >=2.11 && <3,
         hetoimasia-asset ==0.1.0.0,
         hetoimasia-asset-image ==0.1.0.0,
+        hetoimasia-test-support ==0.1.0.0,
         JuicyPixels ==3.3.9,
+        process >=1.6 && <1.7,
         text >=2.1 && <2.2,
         zlib >=0.7.1 && <0.8
