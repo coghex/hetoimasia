@@ -22,8 +22,11 @@ refuse-dfd-total.ktx2	make_ktx2_fixtures.py 1	dfdTotalSize 4 bytes more than dfd
 refuse-format.ktx2	make_ktx2_fixtures.py 1	vkFormat B8G8R8A8_UNORM
 refuse-ktx1.ktx2	make_ktx2_fixtures.py 1	the KTX 1 identifier
 refuse-kv-duplicate.ktx2	make_ktx2_fixtures.py 1	KTXwriter twice
+refuse-kv-empty-key.ktx2	make_ktx2_fixtures.py 1	a key/value entry whose key is empty
 refuse-kv-length.ktx2	make_ktx2_fixtures.py 1	a key/value entry 8 bytes longer than its section
 refuse-kv-no-nul.ktx2	make_ktx2_fixtures.py 1	a key/value entry with no NUL
+refuse-kv-padding.ktx2	make_ktx2_fixtures.py 1	a key/value entry, key x, with padding bytes FF FF
+refuse-kv-short.ktx2	make_ktx2_fixtures.py 1	a 1-byte key/value entry holding only a NUL
 refuse-kv-unterminated.ktx2	make_ktx2_fixtures.py 1	a KTXorientation value of rd with no terminating NUL
 refuse-kvd-outside.ktx2	make_ktx2_fixtures.py 1	kvdByteLength past the end of the file
 refuse-level-count-chain.ktx2	make_ktx2_fixtures.py 1	levelCount 3 at 2 × 2, whose full chain is 2

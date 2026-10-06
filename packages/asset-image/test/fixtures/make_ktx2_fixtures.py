@@ -390,6 +390,13 @@ def refused():
             patched(rgba, ("<I", kvd_at, len(WRITER[0][0]) + 1 + len(WRITER[0][1]) + 8)))
     fixture("refuse-kv-no-nul.ktx2", "a key/value entry with no NUL",
             ktx2(R8G8B8A8_SRGB, 2, 2, [rgba8(SINGLE)], kv=[b"abcd"]))
+    fixture("refuse-kv-short.ktx2", "a 1-byte key/value entry holding only a NUL",
+            ktx2(R8G8B8A8_SRGB, 2, 2, [rgba8(SINGLE)], kv=[b"\0"]))
+    fixture("refuse-kv-empty-key.ktx2", "a key/value entry whose key is empty",
+            ktx2(R8G8B8A8_SRGB, 2, 2, [rgba8(SINGLE)], kv=[b"\0value\0"]))
+    kv_padding = ktx2(R8G8B8A8_SRGB, 2, 2, [rgba8(SINGLE)], kv=[b"x\0"])
+    fixture("refuse-kv-padding.ktx2", "a key/value entry, key x, with padding bytes FF FF",
+            patched(kv_padding, ("<H", struct.unpack_from("<I", kv_padding, KVD_OFFSET)[0] + 6, 0xFFFF)))
     fixture("refuse-kv-duplicate.ktx2", "KTXwriter twice",
             ktx2(R8G8B8A8_SRGB, 2, 2, [rgba8(SINGLE)], kv=WRITER + WRITER))
     fixture("refuse-kv-unterminated.ktx2", "a KTXorientation value of rd with no terminating NUL",

@@ -356,7 +356,8 @@ checkTransfer format transfer = unless (transfer == expected) $
 
 -- | The key/value entries, once their framing is consistent: each entry's
 -- length and padding lie inside the section, the entries fill it exactly,
--- each key is NUL-terminated, and no key appears twice.
+-- each entry holds at least a one-byte key and its NUL, its padding bytes are
+-- zero, and no key appears twice.
 readKeyValues ∷ ByteString → Either Text [(ByteString, ByteString)]
 readKeyValues kvd = reverse <$> go 0 []
   where
@@ -369,10 +370,17 @@ readKeyValues kvd = reverse <$> go 0 []
           let padded = size + (negate size `mod` 4)
           unless (toInteger at + 4 + padded <= fileLength kvd) $
             Left ("the key/value entry at key/value byte " <> tshow at <> " of " <> tshow size <> " bytes, with its padding, runs past the key/value data's end")
+          unless (size >= 2) $
+            Left ("the key/value entry at key/value byte " <> tshow at <> " is " <> tshow size <> " bytes, shorter than a one-byte key and its NUL")
           entry ← maybe (Left "a key/value entry lies outside its section") Right (slice kvd (toInteger at + 4) size)
+          padding ← maybe (Left "a key/value entry's padding lies outside its section") Right (slice kvd (toInteger at + 4 + size) (padded - size))
           let (key, rest) = ByteString.break (== 0) entry
           when (ByteString.null rest) $
             Left ("the key/value entry at key/value byte " <> tshow at <> " has no NUL-terminated key")
+          when (ByteString.null key) $
+            Left ("the key/value entry at key/value byte " <> tshow at <> " has an empty key")
+          unless (ByteString.all (== 0) padding) $
+            Left ("the key/value entry at key/value byte " <> tshow at <> " has nonzero padding")
           when (key `elem` map fst entries) $
             Left ("the key " <> keyText key <> " appears more than once")
           go (at + 4 + fromInteger padded) ((key, ByteString.drop 1 rest) : entries)
