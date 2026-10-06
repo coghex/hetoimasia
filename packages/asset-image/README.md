@@ -231,7 +231,8 @@ rather than read past or partly returned:
   block is not a basic descriptor block, or whose basic block is shorter
   than its 24 bytes of fields or is not 24 bytes plus whole 16-byte samples;
 - key/value data whose entries, with their padding, do not fill it exactly,
-  an entry with no NUL-terminated key, a key that appears twice, or a
+  an entry shorter than two bytes, an entry with no NUL-terminated key or
+  with an empty key, padding that is not zero, a key that appears twice, or a
   `KTXorientation` or `KTXswizzle` value that is not a NUL-terminated
   string. Other values may be binary;
 - a level whose `byteLength` differs from its `uncompressedByteLength`, or
