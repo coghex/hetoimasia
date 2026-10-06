@@ -227,7 +227,8 @@ rather than read past or partly returned:
   supercompression global data or level range that lies outside the file,
   and any two occupied ranges that overlap;
 - a data format descriptor with no bytes, whose `dfdTotalSize` differs from
-  its `dfdByteLength`, whose blocks do not fill it exactly, whose first
+  its `dfdByteLength`, whose blocks do not fill it exactly or have a size
+  that is not a multiple of four, whose first
   block is not a basic descriptor block, or whose basic block is shorter
   than its 24 bytes of fields or is not 24 bytes plus whole 16-byte samples;
 - key/value data whose entries, with their padding, do not fill it exactly,
