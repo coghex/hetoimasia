@@ -6,12 +6,14 @@ the GPU upload endpoint (#342) takes unchanged
 ([asset design](../../docs/designs/asset_design.md), AST-1). BC7 levels are
 checked, marked, and decoded to RGBA8 in software for devices that cannot
 sample BC7 (AST-3). A decoded image gets a full mip chain only when its caller
-asks for one (AST-4).
+asks for one (AST-4). KTX2 files carrying RGBA8 or BC7 levels are read by pure
+Haskell code, with their own levels (AST-2).
 
 | Module | Contents |
 | --- | --- |
 | `Hetoimasia.Asset.Image.Png` | `pngDecoder ∷ ImageKind → Decoder DecodedImage`; `decodePng ∷ ImageKind → Asset → ByteString → Either AssetRefusal DecodedImage` |
 | `Hetoimasia.Asset.Image.Mips` | `MipRequest` (`mipCoverage`), `Coverage` (`CoverageFromMark`, `PreserveCoverage`, `PlainAverages`), `mipRequest`; `generateMips ∷ MipRequest → DecodedImage → Either Text DecodedImage`; `mipmapped ∷ MipRequest → Decoder DecodedImage → Decoder DecodedImage` |
+| `Hetoimasia.Asset.Image.Ktx2` | `Ktx2Image` (`Ktx2Rgba8`, `Ktx2Bc7`), `ktx2DecodedImage`; `ktx2Decoder ∷ ImageKind → Decoder Ktx2Image`; `decodeKtx2 ∷ ImageKind → Asset → ByteString → Either AssetRefusal Ktx2Image` |
 | `Hetoimasia.Asset.Image.Bc7` | `Bc7Format` (`Bc7Srgb`, `Bc7Linear`); `Bc7Image` and `bc7Image ∷ Asset → Bc7Format → Word32 → Word32 → [ByteString] → Either AssetRefusal Bc7Image`, `bc7DecodedImage`; `decodeBc7 ∷ Bc7Image → DecodedImage`; `Bc7Support`, `bc7Fallback ∷ Bc7Support → Bc7Image → Bc7Fallback`, `fallbackImage`, `fallbackSoftwareDecode` |
 
 ## Boundary
@@ -164,6 +166,115 @@ fully populated 4 × 4 blocks, 4 × w × h bytes for RGBA8 against
 blocks and small mips have a lower ratio, and the device's allocation is
 its own.
 
+## KTX2
+
+`decodeKtx2` reads a KTX2 file's bytes, with the asset's identity and the
+caller's stated kind, as a pure function. It reads no file, performs no IO,
+and uses no KTX or codec library. It returns either `Ktx2Rgba8`, an RGBA8
+`DecodedImage`, or `Ktx2Bc7`, a `Bc7Image`. Either way the result has the
+file's width and height and every stored level, level 0 first, in the upload
+endpoint's layout. Otherwise it refuses the file, naming the asset and the
+reason. The same bytes and kind always give the same result, no exception
+escapes, and no part of an image comes with a refusal. KTX2 files bring their
+own levels; nothing is generated for them.
+
+### The accepted profile
+
+A file is read only when all of these hold (design D-9):
+
+- `vkFormat` is `R8G8B8A8_SRGB` (43), `R8G8B8A8_UNORM` (37), `BC7_SRGB_BLOCK`
+  (146) or `BC7_UNORM_BLOCK` (145), and `typeSize` is 1;
+- the data format descriptor's transfer function agrees with the format:
+  sRGB (2) for the `_SRGB` formats, linear (1) for the `_UNORM` ones;
+- the texture is two-dimensional, with one layer and one face: `pixelWidth`
+  and `pixelHeight` are positive, `pixelDepth` is 0, `layerCount` is 0 or 1,
+  and `faceCount` is 1;
+- `supercompressionScheme` is 0;
+- `levelCount` is between 1 and the extent's full chain,
+  `floor (log2 (max width height)) + 1`. A partial chain is valid. A count of
+  0, which asks the loader to generate levels, is refused;
+- `KTXorientation` is absent or `rd`, and `KTXswizzle` is absent or `rgba`;
+- a data file does not carry the descriptor's premultiplied-alpha flag;
+- a colour BC7 file carries the premultiplied-alpha flag, or, without it, is
+  opaque: every texel of every stored level, decoded with the BC7 decoder,
+  has alpha 255. Texels a block holds outside its level's extent do not
+  count. One non-opaque texel at any level refuses the file.
+
+Only those descriptor fields and key/value entries are read for the profile.
+The colour model, the colour primaries, any further descriptor block, and
+every other key/value entry are not checked.
+
+Each refusal names the condition that failed: a format outside the four, a
+`typeSize` other than 1, a transfer function that disagrees with the format,
+a zero width, a 1D, 3D, array or cube-map file, supercompression, a level
+count of 0, an orientation or a swizzle that is not accepted, a data file
+with the premultiplied-alpha flag, or a colour BC7 file without the flag
+that is not opaque in every level.
+
+### The kind and the format
+
+A colour read (`ColourImage`) requires an `_SRGB` format, and a data read
+(`DataImage`) a `_UNORM` format. A mismatch is refused, naming the kind and
+the format. The kind decides the colour space; the file must agree with it.
+
+### Structure
+
+The whole file is checked before anything is returned, and these are refused
+rather than read past or partly returned:
+
+- bytes that do not begin with the KTX2 identifier, KTX 1 files included;
+- a header, level index, data format descriptor, key/value data,
+  supercompression global data or level range that lies outside the file,
+  and any two occupied ranges that overlap;
+- a data format descriptor with no bytes, whose `dfdTotalSize` differs from
+  its `dfdByteLength`, whose blocks do not fill it exactly, whose first
+  block is not a basic descriptor block, or whose basic block is shorter
+  than its 24 bytes of fields or is not 24 bytes plus whole 16-byte samples;
+- key/value data whose entries, with their padding, do not fill it exactly,
+  an entry with no NUL-terminated key, a key that appears twice, or a
+  `KTXorientation` or `KTXswizzle` value that is not a NUL-terminated
+  string. Other values may be binary;
+- a level whose `byteLength` differs from its `uncompressedByteLength`, or
+  from its format's size at its extent: `4 × w × h` bytes for RGBA8 and
+  `16 × ceil (w / 4) × ceil (h / 4)` for BC7, at `w = max 1 (width >> L)` and
+  `h = max 1 (height >> L)`;
+- a level count beyond the full chain.
+
+Offsets, lengths and level sizes are compared as exact integers, so a field
+near its type's maximum is refused, never wrapped. Nothing is indexed,
+sliced or allocated until its range is known to lie inside the file. Levels
+are returned in the level index's order, level 0 first, whatever order the
+file stores them in (KTX2 stores the smallest first). The padding between
+levels is not returned.
+
+### Levels
+
+- **RGBA8**, tightly packed, top row first. A colour file without the
+  premultiplied-alpha flag is straight alpha, and every level is
+  premultiplied in linear light at load, exactly as a PNG is (see the
+  colour-kind rule above). With the flag, colour texels are returned as
+  stored. A data file's texels are returned unchanged.
+- **BC7**, every level exactly as the file stores it, in a `Bc7Image`. The
+  blocks are never altered or replaced by decoded texels. BC7 content for a
+  colour texture with alpha must be premultiplied when it is encoded, and the
+  file must carry the premultiplied-alpha flag; straight-alpha BC7 cannot be
+  premultiplied without re-encoding its blocks. A colour BC7 file without
+  the flag is accepted only when it is opaque in every level, as above. BC7
+  is decoded only to check that opacity and to compute the mark.
+
+On a device without BC7, a `Ktx2Bc7` result goes through the BC7 fallback
+like any other `Bc7Image`. The caller passes it to `bc7Fallback` with the
+device's reported support, and logs the software decode. `ktx2DecodedImage`
+gives the result as a `DecodedImage` for a device that takes BC7.
+
+### The cutout mark
+
+Every result carries the mark computed from level 0's alpha: true exactly
+when every texel's alpha is 0 or 255. For RGBA8 it is read from level 0 as
+returned, since premultiplication leaves alpha unchanged. For BC7,
+`bc7Image` decodes level 0 to compute it, counting only texels inside the
+level's extent. The mark does not depend on the device.
+
 ## Mip chains
 
 Mips are optional (design D-6). Pixel art drawn with nearest filtering needs
@@ -256,8 +367,9 @@ KTX2 files bring their own levels and are out of this step's scope (AST-2).
 None. Decoding is pure: it reads only the caller's bytes, writes no file,
 starts no thread and keeps nothing between calls. The premultiplication table
 and the BC7 partition and weight tables are constants shared by every decode.
-BC7 checking, decoding, the mark and the fallback step are pure too, as is mip
-generation: the same image and request always give the same levels. The
+BC7 checking, decoding, the mark and the fallback step are pure too, as are
+KTX2 reading and mip generation: the same bytes and kind always give the same
+result, and the same image and request always give the same levels. The
 package holds no logger. A decoded image's bytes are the caller's.
 
 ## Tests
@@ -293,3 +405,14 @@ an independent reference using only Python's standard library, with exact
 rational footprints; run `python3 mip_reference.py` in that directory to
 print them. Their coverage and colour properties are checked against the
 suite's own exact-rational reference averages.
+
+Its KTX2 fixtures, `test/fixtures/*.ktx2`, come from `make_ktx2_fixtures.py`.
+It assembles each file byte by byte using only Python's standard library, and
+shares no code with the reader. `ktx2-fixtures.txt` records each fixture's
+producer and version beside it, and each file except the one without
+key/value data names them in a `KTXwriter` entry. The BC7 fixtures are mode-6
+blocks with constant endpoints, so every texel's alpha follows from the
+block's construction. The suite states every expected level, and the expected
+premultiplied RGBA8 texels are computed independently of the reader. Run
+`python3 make_ktx2_fixtures.py` in that directory to regenerate them; the
+output is byte-for-byte deterministic.
