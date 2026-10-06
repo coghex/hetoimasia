@@ -188,9 +188,11 @@ A generated chain holds level 0 unchanged, followed by every level down to
 upload endpoint (#342) takes them, so the levels upload unchanged. The
 format, extent and cutout mark stay as decoded; the mark is level 0's. Any
 levels after level 0 are replaced, so generating twice gives the same chain.
-An image with a zero width or height, one whose level 0 does not hold
-width × height four-byte texels (compared without overflow), or one with no
-level, is refused with the reason; `mipmapped` refuses it naming
+Mips are generated only for RGBA8 images: a BC7 image (`TexelBc7Srgb`,
+`TexelBc7Linear`) brings its own levels and is refused. An image with a zero
+width or height, one whose level 0 does not hold width × height four-byte
+texels (compared without overflow), or one with no level, is refused too.
+Each refusal gives the reason; `mipmapped` refuses it naming
 the asset, and passes the decoder's own refusals through.
 
 ### The filter
