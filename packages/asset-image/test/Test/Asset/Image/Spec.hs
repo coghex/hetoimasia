@@ -5,6 +5,7 @@ module Test.Asset.Image.Spec (spec) where
 import qualified Test.Asset.Image.Bc7 as Bc7
 import qualified Test.Asset.Image.Bc7Opacity as Bc7Opacity
 import qualified Test.Asset.Image.Fixtures as Fixtures
+import qualified Test.Asset.Image.Ktx2 as Ktx2
 import qualified Test.Asset.Image.Mips as Mips
 import qualified Test.Asset.Image.Png as Png
 import qualified Test.Asset.Image.Premultiply as Premultiply
@@ -20,3 +21,4 @@ spec = describe "AssetImage" $ do
   Bc7.spec
   Bc7Opacity.spec
   Mips.spec
+  Ktx2.spec

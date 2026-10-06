@@ -1,0 +1,65 @@
+# The KTX2 fixtures, each assembled byte by byte by its producer, using
+# only Python's standard library. The suite states every expected level.
+# fixture	producer	contents
+bc7-linear.ktx2	make_ktx2_fixtures.py 1	data BC7, 8 × 4, full chain of 4, level 0 alpha 128 and 255
+bc7-srgb-premultiplied-translucent.ktx2	make_ktx2_fixtures.py 1	colour BC7, 4 × 4, one level, premultiplied-alpha flag, level 0 alpha 128
+bc7-srgb-premultiplied.ktx2	make_ktx2_fixtures.py 1	colour BC7, 8 × 8, full chain of 4, premultiplied-alpha flag, level 0 alpha 0 and 255 only
+bc7-srgb-straight-deep-translucent.ktx2	make_ktx2_fixtures.py 1	colour BC7, 8 × 8, full chain of 4, no flag, opaque but for one level 2 texel with alpha 0
+bc7-srgb-straight-opaque.ktx2	make_ktx2_fixtures.py 1	colour BC7, 5 × 3, full chain of 3, no flag, alpha 255 in every texel inside each level's extent and 188 in the edge blocks' texels outside it
+bc7-srgb-straight-translucent.ktx2	make_ktx2_fixtures.py 1	colour BC7, 4 × 4, one level, no flag, level 0 alpha 128
+refuse-1d.ktx2	make_ktx2_fixtures.py 1	pixelHeight 0
+refuse-3d.ktx2	make_ktx2_fixtures.py 1	pixelDepth 2
+refuse-array.ktx2	make_ktx2_fixtures.py 1	layerCount 2
+refuse-cube.ktx2	make_ktx2_fixtures.py 1	faceCount 6
+refuse-data-premultiplied.ktx2	make_ktx2_fixtures.py 1	R8G8B8A8_UNORM with the premultiplied-alpha flag
+refuse-dfd-block-size.ktx2	make_ktx2_fixtures.py 1	a basic descriptor block 4 bytes longer than the descriptor holds
+refuse-dfd-empty.ktx2	make_ktx2_fixtures.py 1	dfdByteLength 0
+refuse-dfd-later-block-size.ktx2	make_ktx2_fixtures.py 1	a basic descriptor block followed by vendor blocks of 9 and 11 bytes
+refuse-dfd-not-basic.ktx2	make_ktx2_fixtures.py 1	a vendor-specific first descriptor block
+refuse-dfd-outside.ktx2	make_ktx2_fixtures.py 1	dfdByteOffset past the end of the file
+refuse-dfd-samples.ktx2	make_ktx2_fixtures.py 1	a basic descriptor block of 24 bytes and 8 bytes of a sample
+refuse-dfd-short-basic.ktx2	make_ktx2_fixtures.py 1	a 16-byte basic descriptor block
+refuse-dfd-total.ktx2	make_ktx2_fixtures.py 1	dfdTotalSize 4 bytes more than dfdByteLength
+refuse-format.ktx2	make_ktx2_fixtures.py 1	vkFormat B8G8R8A8_UNORM
+refuse-ktx1.ktx2	make_ktx2_fixtures.py 1	the KTX 1 identifier
+refuse-kv-duplicate.ktx2	make_ktx2_fixtures.py 1	KTXwriter twice
+refuse-kv-empty-key.ktx2	make_ktx2_fixtures.py 1	a key/value entry whose key is empty
+refuse-kv-length.ktx2	make_ktx2_fixtures.py 1	a key/value entry 8 bytes longer than its section
+refuse-kv-no-nul.ktx2	make_ktx2_fixtures.py 1	a key/value entry with no NUL
+refuse-kv-padding.ktx2	make_ktx2_fixtures.py 1	a key/value entry, key x, with padding bytes FF FF
+refuse-kv-short.ktx2	make_ktx2_fixtures.py 1	a 1-byte key/value entry holding only a NUL
+refuse-kv-unterminated.ktx2	make_ktx2_fixtures.py 1	a KTXorientation value of rd with no terminating NUL
+refuse-kvd-outside.ktx2	make_ktx2_fixtures.py 1	kvdByteLength past the end of the file
+refuse-level-count-chain.ktx2	make_ktx2_fixtures.py 1	levelCount 3 at 2 × 2, whose full chain is 2
+refuse-level-count-zero.ktx2	make_ktx2_fixtures.py 1	levelCount 0
+refuse-level-index-outside.ktx2	make_ktx2_fixtures.py 1	rgba8-srgb-mips.ktx2 cut inside its level index
+refuse-level-length.ktx2	make_ktx2_fixtures.py 1	a 2 × 2 RGBA8 level of 12 bytes
+refuse-level-outside.ktx2	make_ktx2_fixtures.py 1	level 0's byteOffset past the end of the file
+refuse-not-ktx2.ktx2	make_ktx2_fixtures.py 1	bytes without the KTX2 identifier
+refuse-orientation.ktx2	make_ktx2_fixtures.py 1	KTXorientation ru
+refuse-overflow-dfd.ktx2	make_ktx2_fixtures.py 1	dfdByteOffset and dfdByteLength 2^32 - 16
+refuse-overflow-extent.ktx2	make_ktx2_fixtures.py 1	pixelWidth and pixelHeight 2^32 - 1, one 16-byte level
+refuse-overflow-kv-entry.ktx2	make_ktx2_fixtures.py 1	a keyAndValueByteLength of 2^32 - 1
+refuse-overflow-level-length.ktx2	make_ktx2_fixtures.py 1	level 0's byteLength and uncompressedByteLength 2^64 - 1
+refuse-overflow-level-offset.ktx2	make_ktx2_fixtures.py 1	level 0's byteOffset 2^64 - 8
+refuse-overlap-header.ktx2	make_ktx2_fixtures.py 1	the data format descriptor inside the level index
+refuse-overlap-levels.ktx2	make_ktx2_fixtures.py 1	level 1 inside level 0's bytes
+refuse-supercompressed.ktx2	make_ktx2_fixtures.py 1	supercompressionScheme 2 (Zstandard)
+refuse-swizzle.ktx2	make_ktx2_fixtures.py 1	KTXswizzle bgra
+refuse-transfer-srgb.ktx2	make_ktx2_fixtures.py 1	R8G8B8A8_SRGB with a linear transfer function
+refuse-transfer-unorm.ktx2	make_ktx2_fixtures.py 1	BC7_UNORM_BLOCK with an sRGB transfer function
+refuse-truncated-header.ktx2	make_ktx2_fixtures.py 1	the first 60 bytes of rgba8-srgb.ktx2
+refuse-type-size.ktx2	make_ktx2_fixtures.py 1	typeSize 4
+refuse-uncompressed-length.ktx2	make_ktx2_fixtures.py 1	level 0's uncompressedByteLength 32, its byteLength 16
+refuse-zero-width.ktx2	make_ktx2_fixtures.py 1	pixelWidth 0
+rgba8-linear-explicit-metadata.ktx2	make_ktx2_fixtures.py 1	data RGBA8, 2 × 2, KTXorientation rd and KTXswizzle rgba
+rgba8-linear-ignored.ktx2	make_ktx2_fixtures.py 1	data RGBA8, 2 × 2, unspecified colour model and primaries, a second vendor block, and unknown keys, one with a binary value
+rgba8-linear-layer-one.ktx2	make_ktx2_fixtures.py 1	data RGBA8, 2 × 2, layerCount 1
+rgba8-linear-mips.ktx2	make_ktx2_fixtures.py 1	data RGBA8, 4 × 2, full chain of 3
+rgba8-linear-no-metadata.ktx2	make_ktx2_fixtures.py 1	data RGBA8, 2 × 2, no key/value data at all
+rgba8-linear-partial.ktx2	make_ktx2_fixtures.py 1	data RGBA8, 8 × 4, 2 levels of a full chain of 4
+rgba8-linear.ktx2	make_ktx2_fixtures.py 1	data RGBA8, 2 × 2, one level
+rgba8-srgb-mips.ktx2	make_ktx2_fixtures.py 1	colour RGBA8, 4 × 2, full chain of 3, straight alpha
+rgba8-srgb-premultiplied-mips.ktx2	make_ktx2_fixtures.py 1	colour RGBA8, 4 × 2, full chain of 3, premultiplied-alpha flag
+rgba8-srgb-premultiplied.ktx2	make_ktx2_fixtures.py 1	colour RGBA8, 2 × 2, one level, premultiplied-alpha flag
+rgba8-srgb.ktx2	make_ktx2_fixtures.py 1	colour RGBA8, 2 × 2, one level, straight alpha
