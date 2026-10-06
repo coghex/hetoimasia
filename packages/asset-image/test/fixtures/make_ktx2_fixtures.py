@@ -385,6 +385,14 @@ def refused():
     part_sample = patched(basic_block(R8G8B8A8_SRGB, TRANSFER_SRGB, 0)[:32], ("<H", 6, 32))
     fixture("refuse-dfd-samples.ktx2", "a basic descriptor block of 24 bytes and 8 bytes of a sample",
             ktx2(R8G8B8A8_SRGB, 2, 2, [rgba8(SINGLE)], dfd=descriptor([bytes(part_sample)])))
+    fixture("refuse-dfd-later-block-size.ktx2",
+            "a basic descriptor block followed by vendor blocks of 9 and 11 bytes",
+            ktx2(R8G8B8A8_SRGB, 2, 2, [rgba8(SINGLE)],
+                 dfd=descriptor([
+                     basic_block(R8G8B8A8_SRGB, TRANSFER_SRGB, 0),
+                     struct.pack("<IHH", 0x1234, 0, 9) + bytes(1),
+                     struct.pack("<IHH", 0x1234, 0, 11) + bytes(3),
+                 ])))
     fixture("refuse-dfd-empty.ktx2", "dfdByteLength 0", patched(rgba, ("<I", DFD_LENGTH, 0)))
     fixture("refuse-kv-length.ktx2", "a key/value entry 8 bytes longer than its section",
             patched(rgba, ("<I", kvd_at, len(WRITER[0][0]) + 1 + len(WRITER[0][1]) + 8)))

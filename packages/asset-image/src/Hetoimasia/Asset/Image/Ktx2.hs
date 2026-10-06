@@ -301,8 +301,9 @@ checkOverlaps regions = zipWithM_ disjoint ordered (drop 1 ordered)
 
 -- | The basic descriptor block's transfer function and whether its
 -- premultiplied-alpha flag is set, once the descriptor's framing is
--- consistent: its total size is its section's length, its blocks fill it
--- exactly, and its first block is a whole basic descriptor block.
+-- consistent: its total size is its section's length, its blocks, each a
+-- multiple of four bytes, fill it exactly, and its first block is a whole
+-- basic descriptor block.
 readDescriptor ∷ ByteString → Either Text (Word8, Bool)
 readDescriptor dfd = do
   total ← word32 dfd 0
@@ -331,6 +332,8 @@ readDescriptor dfd = do
           size ← fromIntegral <$> word16 dfd (at + 6)
           when (size < 8) $
             Left ("a descriptor block at descriptor byte " <> tshow at <> " has descriptorBlockSize " <> tshow size <> ", shorter than its own header")
+          unless (size `mod` 4 == 0) $
+            Left ("a descriptor block at descriptor byte " <> tshow at <> " has descriptorBlockSize " <> tshow size <> ", not a multiple of four")
           when (toInteger at + toInteger size > fileLength dfd) $
             Left ("a descriptor block at descriptor byte " <> tshow at <> " of " <> tshow size <> " bytes runs past the descriptor's end")
           ((at, header, size) :) <$> walk (at + size)

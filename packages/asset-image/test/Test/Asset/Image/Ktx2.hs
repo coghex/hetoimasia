@@ -218,6 +218,7 @@ refusals =
   , ("refuse-dfd-not-basic.ktx2", ColourImage, ["the data format descriptor's first block is not a basic descriptor block"])
   , ("refuse-dfd-short-basic.ktx2", ColourImage, ["the basic descriptor block is 16 bytes, too short for its 24 bytes of fields"])
   , ("refuse-dfd-samples.ktx2", ColourImage, ["the basic descriptor block is 32 bytes, not 24 bytes and whole 16-byte samples"])
+  , ("refuse-dfd-later-block-size.ktx2", ColourImage, ["a descriptor block at descriptor byte 92 has descriptorBlockSize 9, not a multiple of four"])
   , ("refuse-dfd-empty.ktx2", ColourImage, ["the file has no data format descriptor"])
   , ("refuse-kv-length.ktx2", ColourImage, ["the key/value entry at key/value byte 0 of 42 bytes, with its padding, runs past the key/value data's end"])
   , ("refuse-kv-no-nul.ktx2", ColourImage, ["the key/value entry at key/value byte 0 has no NUL-terminated key"])
