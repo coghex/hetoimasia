@@ -15,6 +15,7 @@ import qualified Data.ByteString as ByteString
 import Data.Bits (shiftR)
 import Data.List (nub)
 import Data.Ratio ((%))
+import qualified Data.Text as Text
 import Hetoimasia.Asset (AssetRefusal (..), Decoder (..))
 import Hetoimasia.Asset.Image (DecodedImage (..), ImageKind (..), TexelFormat (..))
 import Hetoimasia.Asset.Image.Mips (Coverage (..), MipRequest (..), generateMips, mipRequest, mipmapped)
@@ -202,6 +203,18 @@ spec = describe "Mips" $ do
       -- 2³¹ × 2³¹ × 4 is 2⁶⁴, which wraps to 0 as an Int.
       generated mipRequest (blank 1 1) {decodedWidth = 2147483648, decodedHeight = 2147483648, decodedLevels = [ByteString.empty]}
         `shouldSatisfy` either (const True) (const False)
+    it "refuses a BC7 image, which brings its own levels, through either API" $ do
+      -- One 4 × 4 BC7 block: sixteen bytes, a level the RGBA8 size check
+      -- would also reject, so the format is what is refused.
+      let asset = fixtureAsset "rgba8.png"
+      forM_ [TexelBc7Srgb, TexelBc7Linear] $ \format → do
+        let bc7 = (blank 4 4) {decodedFormat = format, decodedLevels = [ByteString.replicate 16 0]}
+        case generateMips mipRequest bc7 of
+          Left reason → reason `shouldBe` ("mips are generated only for RGBA8 images; a " <> Text.pack (show format) <> " image brings its own levels")
+          Right _ → expectationFailure (show format <> " was given generated levels")
+        case runDecoder (mipmapped (MipRequest PreserveCoverage) (Decoder (\_ _ → Right bc7))) asset ByteString.empty of
+          Left refusal → refusedAsset refusal `shouldBe` asset
+          Right _ → expectationFailure (show format <> " was accepted by a mipmapped decoder")
     it "refuses an image with no level" $
       generated mipRequest (blank 2 2) {decodedLevels = []} `shouldSatisfy` either (const True) (const False)
     it "names the asset when a mipmapped decoder refuses an image" $ do
@@ -309,7 +322,9 @@ referenceAverages image w h =
       let v = [r, g, b] !! c
        in case decodedFormat image of
             TexelRgba8Srgb → toLinear (fromIntegral v / 255)
-            TexelRgba8Linear → fromIntegral v
+            -- Only RGBA8 fixtures reach the reference; every other format
+            -- is a stored value.
+            _ → fromIntegral v
     alphaOf (_, _, _, a) = a
 
 -- | Each generated level's covered count is as close to its share of level

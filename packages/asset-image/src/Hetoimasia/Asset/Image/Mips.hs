@@ -73,11 +73,23 @@ mipRequest ∷ MipRequest
 mipRequest = MipRequest {mipCoverage = CoverageFromMark}
 
 -- | The image with its full mip chain, generated from level 0. Any levels
--- after level 0 are replaced. An image with a zero width or height, or whose
--- level 0 does not hold width × height four-byte texels, is refused with the
--- reason.
+-- after level 0 are replaced. Mips are generated only for an RGBA8 image: a
+-- BC7 image brings its own levels (asset design D-6) and is refused, as is an
+-- image with a zero width or height, or whose level 0 does not hold width ×
+-- height four-byte texels; each refusal gives the reason.
 generateMips ∷ MipRequest → DecodedImage → Either Text DecodedImage
-generateMips request image
+generateMips request image = case decodedFormat image of
+  TexelRgba8Srgb → rgba8 SrgbPremultiplied
+  TexelRgba8Linear → rgba8 LinearStraight
+  format@TexelBc7Srgb → Left (blockCompressed format)
+  format@TexelBc7Linear → Left (blockCompressed format)
+  where
+    blockCompressed format =
+      "mips are generated only for RGBA8 images; a " <> tshow format <> " image brings its own levels"
+    rgba8 channels = rgba8Mips request channels image
+
+rgba8Mips ∷ MipRequest → Channels → DecodedImage → Either Text DecodedImage
+rgba8Mips request channels image
   | decodedWidth image == 0 || decodedHeight image == 0 =
       Left ("the image is " <> tshow (decodedWidth image) <> " × " <> tshow (decodedHeight image) <> ", with no texel to generate levels from")
   | otherwise = case decodedLevels image of
@@ -91,9 +103,6 @@ generateMips request image
     width = fromIntegral (decodedWidth image)
     height = fromIntegral (decodedHeight image)
     expected = toInteger (decodedWidth image) * toInteger (decodedHeight image) * 4
-    channels = case decodedFormat image of
-      TexelRgba8Srgb → SrgbPremultiplied
-      TexelRgba8Linear → LinearStraight
     preserve = case mipCoverage request of
       CoverageFromMark → decodedBinaryAlpha image
       PreserveCoverage → True

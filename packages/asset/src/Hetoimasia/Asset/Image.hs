@@ -8,6 +8,8 @@
 --
 -- > TexelRgba8Srgb   ↦ Rgba8Srgb
 -- > TexelRgba8Linear ↦ Rgba8Linear
+-- > TexelBc7Srgb     ↦ Bc7Srgb
+-- > TexelBc7Linear   ↦ Bc7Linear
 module Hetoimasia.Asset.Image
   ( ImageKind (..)
   , TexelFormat (..)
@@ -40,6 +42,13 @@ data TexelFormat
   | -- | Four bytes per texel, R, G, B, A in that order, all linear UNORM and
     -- not premultiplied.
     TexelRgba8Linear
+  | -- | BC7 blocks: four by four texels in sixteen bytes, decoding to RGBA8
+    -- with sRGB-encoded colour channels. Colour content with alpha is
+    -- premultiplied when it is encoded, never at load.
+    TexelBc7Srgb
+  | -- | BC7 blocks: four by four texels in sixteen bytes, decoding to linear
+    -- UNORM RGBA8.
+    TexelBc7Linear
   deriving (Eq, Ord, Show, Enum, Bounded)
 
 instance NFData TexelFormat where
@@ -47,8 +56,11 @@ instance NFData TexelFormat where
 
 -- | A decoded image.
 --
--- Level 0 is 'decodedWidth' × 'decodedHeight' texels; each level holds its
--- rows top row first, with no padding between them, in 'decodedFormat'.
+-- Level 0 is 'decodedWidth' × 'decodedHeight' texels, and level @L@ is
+-- @max 1 (width >> L)@ × @max 1 (height >> L)@. Each level holds its rows of
+-- blocks top row first, with no padding between them, in 'decodedFormat': a
+-- block is one texel for RGBA8, and four by four texels for BC7, where a
+-- block that crosses the level's right or bottom edge is stored whole.
 data DecodedImage = DecodedImage
   { decodedFormat ∷ !TexelFormat
   , decodedWidth ∷ !Word32
