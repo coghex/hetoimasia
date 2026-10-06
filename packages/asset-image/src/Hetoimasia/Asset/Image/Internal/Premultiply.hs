@@ -14,13 +14,17 @@
 -- any difference between C libraries' @pow@, so no entry can round differently.
 module Hetoimasia.Asset.Image.Internal.Premultiply
   ( premultiplyChannel
+  , premultiplyRgba8
   )
 where
 
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
+import qualified Data.ByteString.Internal as ByteString (unsafeCreate)
 import qualified Data.ByteString.Unsafe as ByteString
+import Data.Foldable (for_)
 import Data.Word (Word8)
+import Foreign.Storable (pokeByteOff)
 
 -- | A colour channel premultiplied by an alpha, both as stored bytes. Alpha
 -- 255 leaves the channel unchanged and alpha 0 makes it zero, exactly.
@@ -28,6 +32,20 @@ premultiplyChannel ∷ Word8 → Word8 → Word8
 premultiplyChannel alpha channel =
   ByteString.unsafeIndex table (fromIntegral alpha * 256 + fromIntegral channel)
 {-# INLINE premultiplyChannel #-}
+
+-- | A tightly packed RGBA8 level of straight-alpha sRGB texels, each colour
+-- channel premultiplied by its texel's alpha and alpha unchanged. Trailing
+-- bytes short of a whole texel are not texels and are dropped.
+premultiplyRgba8 ∷ ByteString → ByteString
+premultiplyRgba8 bytes = ByteString.unsafeCreate (4 * count) $ \pointer →
+  for_ [0 .. count - 1] $ \n → do
+    let at = 4 * n
+        alpha = ByteString.unsafeIndex bytes (at + 3)
+    for_ [0 .. 2] $ \channel →
+      pokeByteOff pointer (at + channel) (premultiplyChannel alpha (ByteString.unsafeIndex bytes (at + channel)))
+    pokeByteOff pointer (at + 3) alpha
+  where
+    count = ByteString.length bytes `div` 4
 
 -- | Indexed by alpha × 256 + channel.
 table ∷ ByteString

@@ -10,6 +10,9 @@ description:
     whether its alpha is binary. BC7 levels are checked against the
     endpoint's layout, marked by decoding level 0's alpha, and decoded to RGBA8
     in software, every mode, where the caller reports a device without BC7.
+    KTX2 files carrying RGBA8 or BC7 levels are read by pure code inside an
+    accepted profile, with their own levels: straight-alpha colour RGBA8 is
+    premultiplied at load, and BC7 blocks are returned as stored.
     Decoding is pure, owns no state, starts no thread, reads no file and logs
     nothing; the library depends on no foundation, GPU, GLFW, render or
     runtime package.
@@ -27,8 +30,11 @@ extra-doc-files: README.md
 extra-source-files:
     test/fixtures/*.png
     test/fixtures/bc7-reference.txt
+    test/fixtures/*.ktx2
+    test/fixtures/ktx2-fixtures.txt
     test/fixtures/make_fixtures.py
     test/fixtures/make_bc7_fixtures.py
+    test/fixtures/make_ktx2_fixtures.py
 
 source-repository head
     type: git
@@ -45,10 +51,11 @@ library
     hs-source-dirs: src
     exposed-modules:
         Hetoimasia.Asset.Image.Bc7
+        Hetoimasia.Asset.Image.Ktx2
         Hetoimasia.Asset.Image.Png
-    -- One BC7 block's texels, the premultiplication table, the structural
-    -- checks that run before JuicyPixels, and the conversion of its output
-    -- to RGBA8.
+    -- One BC7 block's texels, the premultiplication table and its
+    -- application to RGBA8 levels, the structural checks that run before
+    -- JuicyPixels, and the conversion of its output to RGBA8.
     other-modules:
         Hetoimasia.Asset.Image.Internal.Bc7Block
         Hetoimasia.Asset.Image.Internal.PngStructure
@@ -77,6 +84,7 @@ test-suite asset-image-tests
         Test.Asset.Image.Bc7
         Test.Asset.Image.Bc7Opacity
         Test.Asset.Image.Fixtures
+        Test.Asset.Image.Ktx2
         Test.Asset.Image.Png
         Test.Asset.Image.Premultiply
         Test.Asset.Image.Refusals
