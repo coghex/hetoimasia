@@ -49,6 +49,7 @@ import Test.Hspec
   , shouldNotContain
   , shouldReturn
   , shouldSatisfy
+  , pendingWith
   )
 
 data Fixture = Fixture
@@ -300,13 +301,25 @@ spec = describe "Validation execution" $ do
           -- last only goes when it is killed, and the cleanup has to say so.
           handoffStage fixture "expiry" handoffs `shouldReturn` ["timeout", "True", "gone"]
 
-    it "empties a session of descendants that fork replacements as fast as they can" $
+    forM_ [("the platform's table", "default"), ("the ps fallback's table", "ps")] $ \(label, mode) →
+      it ("completes an empty stage promptly while unrelated processes are created as fast as they can, reading " ++ label) $
+        withFixture $ \fixture → do
+          -- Something outside the stage forks and reaps in a tight loop for
+          -- the whole run. A completion check that needed a moment with
+          -- nothing created anywhere would never get one and would hold the
+          -- stage to its deadline; this one asks about what was created.
+          answer ← churnStage fixture mode
+          if answer == ["no-ps"]
+            then pendingWith "this machine has no ps to fall back on"
+            else answer `shouldBe` ["passed", "True"]
+
+    it "empties a session of descendants that keep forking replacements" $
       withFixture $ \fixture →
         -- A chain of processes, each exiting as soon as it has forked the
         -- next and none answering the termination signal, is not something to
         -- chase one sweep at a time: cleanup stops what it finds, finds what
         -- the stopped could no longer fork, and only then kills.
-        breederStage fixture `shouldReturn` ["timeout", "True", "empty"]
+        breederStage fixture `shouldReturn` ["timeout", "empty"]
 
     it "keeps measuring a command whose descendant moved to another process group" $
       withFixture $ \fixture → do
@@ -1918,6 +1931,9 @@ handoffStage fixture mode handoffs = do
           , "leader = '''"
           , "import os, signal, sys"
           , "ready, go, result, mode, handoffs = sys.argv[1:6]"
+          , "null = os.open(os.devnull, os.O_RDWR)"
+          , "os.dup2(null, 1)"
+          , "os.dup2(null, 2)"
           , "def relay(remaining):"
           , "    with open(go) as handle:"
           , "        handle.read()"
@@ -2002,12 +2018,68 @@ handoffStage fixture mode handoffs = do
   (result, errors) `shouldBe` (ExitSuccess, "")
   pure (lines output)
 
+-- | Drive the real runner's stage execution of a command that exits at once
+-- while a process outside the stage creates and reaps children in a tight loop,
+-- and report the stage's outcome and whether it was measured as finishing well
+-- inside its five-second budget. @ps@ makes the runner read its table from the
+-- @ps@ fallback, whose own subprocess is one more creation inside every pass.
+-- Reports @no-ps@ where there is no @ps@ to fall back on. The churn is stopped
+-- whether or not the example held.
+churnStage ∷ Fixture → String → IO [String]
+churnStage fixture mode = do
+  (result, output, errors) ←
+    run
+      (environment fixture)
+      (root fixture)
+      "python3"
+      [ "-I"
+      , "-c"
+      , unlines
+          [ "import importlib.util, os, shutil, signal, subprocess, sys"
+          , "sys.dont_write_bytecode = True"
+          , "path, root, mode = sys.argv[1:4]"
+          , "specification = importlib.util.spec_from_file_location('runner_under_test', path)"
+          , "runner = importlib.util.module_from_spec(specification)"
+          , "specification.loader.exec_module(runner)"
+          , "if mode == 'ps':"
+          , "    if shutil.which('ps') is None:"
+          , "        print('no-ps')"
+          , "        sys.exit(0)"
+          , "    runner.process_table = runner.ps_process_table"
+          , "churn = '''"
+          , "import os"
+          , "while True:"
+          , "    child = os.fork()"
+          , "    if child == 0:"
+          , "        os._exit(0)"
+          , "    os.waitpid(child, 0)"
+          , "'''"
+          , "producer = subprocess.Popen(['python3', '-c', churn], start_new_session=True)"
+          , "try:"
+          , "    stage = runner.execute(['true'], root, 5, dict(os.environ))"
+          , "    print(stage['outcome'])"
+          , "    print(stage['duration_seconds'] < 2)"
+          , "finally:"
+          , "    producer.kill()"
+          , "    producer.wait()"
+          ]
+      , tools fixture </> "run.py"
+      , root fixture
+      , mode
+      ]
+  (result, errors) `shouldBe` (ExitSuccess, "")
+  pure (lines output)
+
 -- | Drive the real runner's stage execution against a chain of processes that
--- fork their successor as fast as they can and exit, none answering the
--- termination signal, and report the stage's outcome, whether cleanup killed
--- anything, and whether the session was empty (confirmed the way the runner
--- confirms it) once the stage returned. A watchdog that gave up would leave
--- the chain running, so the driver ends it either way.
+-- fork their successor and exit a few milliseconds later, none answering the
+-- termination signal, beside a leader that stays until it is stopped so that the
+-- stage expires. Report the stage's outcome and whether the group the command
+-- was launched in was empty (asked of the kernel, which a pass over the table
+-- cannot be trusted to answer for a chain this short-lived) within a few
+-- seconds of the stage returning. Cleanup has to end the chain whether or not a
+-- pass ever sees it, and killing it is not something the receipt claims. A
+-- watchdog that gave up would leave the chain running, so the driver ends it
+-- either way.
 breederStage ∷ Fixture → IO [String]
 breederStage fixture = do
   (result, output, errors) ←
@@ -2026,30 +2098,44 @@ breederStage fixture = do
           , "specification.loader.exec_module(runner)"
           , "runner.TERMINATION_GRACE_SECONDS = 1"
           , "leader = '''"
-          , "import os, signal, sys"
+          , "import os, signal, sys, time"
           , "record = sys.argv[1]"
+          , "null = os.open(os.devnull, os.O_RDWR)"
+          , "os.dup2(null, 1)"
+          , "os.dup2(null, 2)"
           , "if os.fork() == 0:"
           , "    signal.signal(signal.SIGTERM, signal.SIG_IGN)"
           , "    while True:"
           , "        if os.fork() != 0:"
+          , "            time.sleep(0.005)"
           , "            os._exit(0)"
           , "with open(record, 'w') as handle:"
           , "    handle.write(str(os.getpid()))"
+          , "while True:"
+          , "    signal.pause()"
           , "'''"
           , "scratch = tempfile.mkdtemp()"
           , "record = os.path.join(scratch, 'session')"
           , "try:"
           , "    stage = runner.execute(['python3', '-c', leader, record], root, 1, dict(os.environ))"
           , "    session = int(open(record).read())"
-          , "    members = runner.session_members(session)"
+          , "    gone = False"
+          , "    patience = time.monotonic() + 5"
+          , "    while time.monotonic() < patience:"
+          , "        try:"
+          , "            os.killpg(session, 0)"
+          , "        except (ProcessLookupError, PermissionError):"
+          , "            gone = True"
+          , "            break"
+          , "        time.sleep(0.05)"
           , "    print(stage['outcome'])"
-          , "    print(stage['expiry'] is not None and stage['expiry']['killed'])"
-          , "    print('empty' if members == {} else 'running')"
+          , "    print('empty' if gone else 'running')"
           , "finally:"
           , "    try:"
           , "        session = int(open(record).read())"
-          , "        for pid in runner.observe_session(session) or ():"
-          , "            os.kill(pid, signal.SIGKILL)"
+          , "        # Whatever the stage left, stopped and then killed by group."
+          , "        os.killpg(session, signal.SIGSTOP)"
+          , "        os.killpg(session, signal.SIGKILL)"
           , "    except (OSError, ValueError):"
           , "        pass"
           ]

@@ -206,10 +206,13 @@ sanitize_git_environment()
 TERMINATION_GRACE_SECONDS = 10
 
 # How long freezing and then killing what survived the grace may take, and how
-# long an empty-looking session is given to produce a pass nothing was created
-# during, before it is reported as not known to be empty.
+# long an empty-looking session is given to produce a pass whose bracket held,
+# before it is reported as not known to be empty.
 KILLING_SECONDS = 10
 SETTLING_SECONDS = 2
+# The most identifiers a pass's bracket may span and still have each asked
+# about directly.
+MAX_BRACKET = 4096
 
 
 def timestamp() -> str:
@@ -689,8 +692,8 @@ def source_run_url() -> str:
 def darwin_process_table() -> list[tuple[int, str]] | None:
     """Every process, from libproc, with ``Z`` for those that have stopped.
 
-    One call lists them, so a pass over the table is quick enough for
-    :func:`settled_observation` to find a quiet moment on a busy machine.
+    One call lists them, so a pass over the table is quick and the identifiers
+    :func:`bracketed_observation` has to ask about directly stay few.
     """
     try:
         import ctypes
@@ -749,8 +752,8 @@ def process_table() -> list[tuple[int, str]] | None:
 
     This is the first half of observing a session — which processes exist — and
     the second half asks each one which session it is in. The two are not one
-    atomic step, which is why :func:`session_members` does not trust a pass
-    that finds nobody unless nothing was created during it.
+    atomic step, which is why :func:`session_members` asks directly about every
+    process created during a pass that finds nobody.
     """
     if sys.platform.startswith("linux"):
         try:
@@ -820,9 +823,10 @@ def observe_session(session: int) -> dict[int, int] | None:
 def newest_pid() -> int | None:
     """The identifier of a process created and reaped just now.
 
-    Identifiers are handed out in sequence, so two of these taken one after the
-    other differ by exactly one when nothing else was created between them,
-    wherever on the machine and whether it was a process or a thread.
+    Identifiers are handed out in sequence, so every process created between
+    two of these taken one after the other holds an identifier strictly between
+    theirs, wherever on the machine it was created and whether it was a process
+    or a thread.
     """
     try:
         pid = os.fork()
@@ -837,21 +841,41 @@ def newest_pid() -> int | None:
     return pid
 
 
-def settled_observation(session: int) -> tuple[dict[int, int] | None, bool]:
-    """One pass, and whether no process was created while it ran.
+def bracketed_observation(session: int) -> tuple[dict[int, int] | None, bool]:
+    """One pass, with every process created during it asked directly.
 
     A pass lists the processes and then asks each its session, so a member that
     forks a replacement and exits in between is gone when asked while the
-    replacement was never listed. If nothing at all was created during a pass,
-    every process in the session at its end was already there when it began and
-    stayed throughout, so the listing holds it. The two processes bracketing the
-    pass say whether that held: consecutive identifiers mean nothing was created
-    between them.
+    replacement was never listed. Two throwaway processes bracket the pass, and
+    identifiers are handed out in sequence, so every process created while it
+    ran holds an identifier between theirs: each is asked its session directly,
+    whether or not the listing saw it. Unrelated creations are only more
+    identifiers to ask about, not a reason to wait for quiet.
+
+    The second value is whether the bracket could be trusted at all: it cannot
+    when the identifiers wrapped, when a marker could not be made, or when more
+    were created than ``MAX_BRACKET`` allows asking about.
     """
     before = newest_pid()
     members = observe_session(session)
     after = newest_pid()
-    return members, before is not None and after is not None and after == before + 1
+    if members is None:
+        return None, False
+    if before is None or after is None or not before < after <= before + MAX_BRACKET:
+        return members, False
+    for pid in range(before + 1, after):
+        if pid in members:
+            continue
+        try:
+            found = process_session(pid, "")
+        except OSError:
+            return None, False
+        if found is None:
+            continue
+        member_session, state, group = found
+        if member_session == session and state[:1] not in ("Z", "X"):
+            members[pid] = group
+    return members, True
 
 
 def session_members(session: int) -> dict[int, int] | None:
@@ -861,19 +885,22 @@ def session_members(session: int) -> dict[int, int] | None:
     command's own process id and no descendant can leave it without a ``setsid``
     of its own. ``None`` is *not knowing*: it is never an empty session.
 
-    Finding a member is reliable. Finding nobody is believed only from a pass
-    nothing was created during (:func:`settled_observation`), however many
-    passes that takes, bounded by ``SETTLING_SECONDS``: a fork-and-exit handoff
-    that hides a member from one pass is a creation, so it spoils that pass and
-    no count of passes can be beaten by a longer chain of them.
+    Finding a member is reliable. Finding nobody is believed from a pass whose
+    bracket held (:func:`bracketed_observation`), repeated for at most
+    ``SETTLING_SECONDS`` until one does. That closes every handoff that happens
+    during the pass and the queries it makes. It does not close one that happens
+    after the closing marker: a member alive at the marker that forks a
+    replacement and exits before its own query leaves a replacement nothing
+    asked about, so an empty answer can be early. That residual is accepted and
+    documented (docs/validation.md); expiry cleanup does not rely on it.
     """
     members = observe_session(session)
     if members != {}:
         return members
     limit = time.monotonic() + SETTLING_SECONDS
     while time.monotonic() < limit:
-        members, settled = settled_observation(session)
-        if members is None or members or settled:
+        members, complete = bracketed_observation(session)
+        if members is None or members or complete:
             return members
     return None
 
@@ -909,7 +936,11 @@ def signal_member(pid: int, session: int, number: int) -> None:
 
 
 def signal_members(
-    members: dict[int, int], session: int, number: int, groups: bool = False
+    members: dict[int, int],
+    session: int,
+    number: int,
+    groups: bool = False,
+    initial: int | None = None,
 ) -> None:
     """Signal what a pass found: each member, and with ``groups`` each member's
     process group first.
@@ -924,7 +955,18 @@ def signal_members(
     ``SIGSTOP`` and ``SIGKILL``: ``SIGTERM`` is delivered once to each process,
     because a handler that answers it by resetting the disposition and cleaning
     up would be killed by the second.
+
+    ``initial`` is the group the command was launched in, whose identifier is
+    the session's. It is signalled whether or not a pass found anyone in it: a
+    chain of descendants that each live for microseconds is rarely caught by a
+    pass, yet every one of them is in that group and a group signal reaches
+    whichever is alive. It is the group this runner has always signalled.
     """
+    if initial is not None and groups:
+        try:
+            os.killpg(initial, number)
+        except OSError:
+            pass
     for group in sorted(set(members.values()) if groups else ()):
         for pid, member_group in members.items():
             if member_group != group:
@@ -958,27 +1000,39 @@ def signal_session(
         except (OSError, ValueError):
             pass
         return None
-    signal_members(members, session, number, groups=number != signal.SIGTERM)
+    signal_members(
+        members, session, number, groups=number != signal.SIGTERM, initial=group
+    )
     return members
 
 
-def freeze_session(session: int, limit: float) -> None:
+def sweep_group(group: int | None) -> None:
+    """Kill whatever is left in the group the command was launched in."""
+    if group is None:
+        return
+    try:
+        os.killpg(group, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def freeze_session(session: int, group: int | None, limit: float) -> None:
     """Stop every member of the session where it stands, until none is new.
 
-    A stopped process cannot fork, so once a pass nothing was created during
-    finds only members already stopped, the session cannot grow and what is in
-    it can be killed in one sweep rather than chased. A session that cannot be
+    A stopped process cannot fork, so once a bracketed pass finds only members
+    already stopped, the session cannot grow and what is in it can be killed in
+    one sweep rather than chased. A session that cannot be
     observed cannot be frozen, and is simply killed.
     """
     frozen: set[int] = set()
     while time.monotonic() < limit:
-        members, settled = settled_observation(session)
+        members, complete = bracketed_observation(session)
         if members is None:
             return
         fresh = set(members) - frozen
-        signal_members(members, session, signal.SIGSTOP, groups=True)
+        signal_members(members, session, signal.SIGSTOP, groups=True, initial=group)
         frozen |= fresh
-        if not fresh and settled:
+        if not fresh and complete:
             return
 
 
@@ -1013,6 +1067,11 @@ def terminate_session(process: subprocess.Popen, session: int, group: int | None
         # The leader going is not the session going: its descendants get
         # whatever is left of the same grace before anything is killed.
         if leader_exited and members == {}:
+            # Nothing was seen, which a chain of descendants that live for
+            # microseconds also looks like. Whatever is still in the group the
+            # command was launched in goes now, unreported: an observation that
+            # was right finds nothing there to signal.
+            sweep_group(group)
             return False
         if time.monotonic() >= grace:
             break
@@ -1022,7 +1081,7 @@ def terminate_session(process: subprocess.Popen, session: int, group: int | None
         seen |= fresh
         time.sleep(TEARDOWN_POLL_SECONDS)
     reach = time.monotonic() + KILLING_SECONDS
-    freeze_session(session, reach)
+    freeze_session(session, group, reach)
     while True:
         members = signal_session(process, session, group, signal.SIGKILL)
         if process.poll() is not None and members == {}:
