@@ -2028,7 +2028,7 @@ breederStage fixture = do
           , "    members = runner.session_members(session)"
           , "    print(stage['outcome'])"
           , "    print(stage['expiry'] is not None and stage['expiry']['killed'])"
-          , "    print('empty' if members == set() else 'running')"
+          , "    print('empty' if members == {} else 'running')"
           , "finally:"
           , "    try:"
           , "        session = int(open(record).read())"

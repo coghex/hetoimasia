@@ -765,8 +765,9 @@ def process_table() -> list[tuple[int, str]] | None:
     return ps_process_table()
 
 
-def process_session(pid: int, state: str) -> tuple[int, str] | None:
-    """One listed process's session and state; ``None`` when it has gone.
+def process_session(pid: int, state: str) -> tuple[int, str, int] | None:
+    """One listed process's session, state and process group; ``None`` when it
+    has gone.
 
     Raises ``OSError`` when it cannot be asked, which the caller must not read
     as an answer.
@@ -782,17 +783,18 @@ def process_session(pid: int, state: str) -> tuple[int, str] | None:
         # state, parent, group, session.
         try:
             fields = record[record.rindex(b")") + 2 :].split()
-            return int(fields[3]), fields[0].decode("ascii")
+            return int(fields[3]), fields[0].decode("ascii"), int(fields[2])
         except (ValueError, IndexError) as error:
             raise OSError(f"unreadable process record for {pid}") from error
     try:
-        return os.getsid(pid), state
+        return os.getsid(pid), state, os.getpgid(pid)
     except ProcessLookupError:
         return None
 
 
-def observe_session(session: int) -> set[int] | None:
-    """One pass over the process table: who is in ``session`` and still running.
+def observe_session(session: int) -> dict[int, int] | None:
+    """One pass over the process table: who is in ``session`` and still running,
+    each with its process group.
 
     ``None`` means the table could not be read, which is not an empty session.
     A process that exits during the pass is simply gone, and a zombie has
@@ -801,7 +803,7 @@ def observe_session(session: int) -> set[int] | None:
     table = process_table()
     if table is None:
         return None
-    members: set[int] = set()
+    members: dict[int, int] = {}
     for pid, listed_state in table:
         try:
             found = process_session(pid, listed_state)
@@ -809,9 +811,9 @@ def observe_session(session: int) -> set[int] | None:
             return None
         if found is None:
             continue
-        member_session, state = found
+        member_session, state, group = found
         if member_session == session and state[:1] not in ("Z", "X"):
-            members.add(pid)
+            members[pid] = group
     return members
 
 
@@ -835,7 +837,7 @@ def newest_pid() -> int | None:
     return pid
 
 
-def settled_observation(session: int) -> tuple[set[int] | None, bool]:
+def settled_observation(session: int) -> tuple[dict[int, int] | None, bool]:
     """One pass, and whether no process was created while it ran.
 
     A pass lists the processes and then asks each its session, so a member that
@@ -852,7 +854,7 @@ def settled_observation(session: int) -> tuple[set[int] | None, bool]:
     return members, before is not None and after is not None and after == before + 1
 
 
-def session_members(session: int) -> set[int] | None:
+def session_members(session: int) -> dict[int, int] | None:
     """Every live process in the stage's session, whichever group it is in.
 
     A command's session is the one its launch created, so its identifier is the
@@ -866,7 +868,7 @@ def session_members(session: int) -> set[int] | None:
     no count of passes can be beaten by a longer chain of them.
     """
     members = observe_session(session)
-    if members != set():
+    if members != {}:
         return members
     limit = time.monotonic() + SETTLING_SECONDS
     while time.monotonic() < limit:
@@ -906,9 +908,33 @@ def signal_member(pid: int, session: int, number: int) -> None:
         pass
 
 
+def signal_members(members: dict[int, int], session: int, number: int) -> None:
+    """Signal what a pass found: each member's process group, then each member.
+
+    A group signal is delivered to every process in the group at once, and a
+    process forked into the group at that moment is either reached or forked by
+    one that was, so it reaches descendants that live too briefly for their own
+    identifiers to be signalled one by one. A process group lies wholly inside
+    one session, so signalling a member's group stays inside the stage's; the
+    session and group are asked again immediately before.
+    """
+    for group in sorted(set(members.values())):
+        for pid, member_group in members.items():
+            if member_group != group:
+                continue
+            try:
+                if os.getsid(pid) == session and os.getpgid(pid) == group:
+                    os.killpg(group, number)
+                    break
+            except OSError:
+                continue
+    for pid in sorted(members):
+        signal_member(pid, session, number)
+
+
 def signal_session(
     process: subprocess.Popen, session: int, group: int | None, number: int
-) -> set[int] | None:
+) -> dict[int, int] | None:
     """Signal every live member of the stage's session; return who was seen.
 
     ``None`` means the session could not be observed, in which case the signal
@@ -925,8 +951,7 @@ def signal_session(
         except (OSError, ValueError):
             pass
         return None
-    for pid in sorted(members):
-        signal_member(pid, session, number)
+    signal_members(members, session, number)
     return members
 
 
@@ -943,9 +968,8 @@ def freeze_session(session: int, limit: float) -> None:
         members, settled = settled_observation(session)
         if members is None:
             return
-        fresh = members - frozen
-        for pid in sorted(fresh):
-            signal_member(pid, session, signal.SIGSTOP)
+        fresh = set(members) - frozen
+        signal_members(members, session, signal.SIGSTOP)
         frozen |= fresh
         if not fresh and settled:
             return
@@ -974,26 +998,27 @@ def terminate_session(process: subprocess.Popen, session: int, group: int | None
     What survives the grace is first stopped in place, so that nothing can keep
     forking replacements faster than they are found, and then killed.
     """
-    seen = signal_session(process, session, group, signal.SIGTERM) or set()
+    seen = set(signal_session(process, session, group, signal.SIGTERM) or ())
     grace = time.monotonic() + TERMINATION_GRACE_SECONDS
     while True:
         members = session_members(session)
         leader_exited = process.poll() is not None
         # The leader going is not the session going: its descendants get
         # whatever is left of the same grace before anything is killed.
-        if leader_exited and members == set():
+        if leader_exited and members == {}:
             return False
         if time.monotonic() >= grace:
             break
-        for pid in sorted((members or set()) - seen):
-            signal_member(pid, session, signal.SIGTERM)
-        seen |= members or set()
+        fresh = set(members or ()) - seen
+        if fresh:
+            signal_members({pid: members[pid] for pid in fresh}, session, signal.SIGTERM)
+        seen |= fresh
         time.sleep(TEARDOWN_POLL_SECONDS)
     reach = time.monotonic() + KILLING_SECONDS
     freeze_session(session, reach)
     while True:
         members = signal_session(process, session, group, signal.SIGKILL)
-        if process.poll() is not None and members == set():
+        if process.poll() is not None and members == {}:
             break
         if time.monotonic() >= reach:
             break
