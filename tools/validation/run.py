@@ -908,17 +908,24 @@ def signal_member(pid: int, session: int, number: int) -> None:
         pass
 
 
-def signal_members(members: dict[int, int], session: int, number: int) -> None:
-    """Signal what a pass found: each member's process group, then each member.
+def signal_members(
+    members: dict[int, int], session: int, number: int, groups: bool = False
+) -> None:
+    """Signal what a pass found: each member, and with ``groups`` each member's
+    process group first.
 
     A group signal is delivered to every process in the group at once, and a
     process forked into the group at that moment is either reached or forked by
     one that was, so it reaches descendants that live too briefly for their own
     identifiers to be signalled one by one. A process group lies wholly inside
     one session, so signalling a member's group stays inside the stage's; the
-    session and group are asked again immediately before.
+    session and group are asked again immediately before. It also reaches every
+    process already in the group, so it is for signals that can be repeated,
+    ``SIGSTOP`` and ``SIGKILL``: ``SIGTERM`` is delivered once to each process,
+    because a handler that answers it by resetting the disposition and cleaning
+    up would be killed by the second.
     """
-    for group in sorted(set(members.values())):
+    for group in sorted(set(members.values()) if groups else ()):
         for pid, member_group in members.items():
             if member_group != group:
                 continue
@@ -951,7 +958,7 @@ def signal_session(
         except (OSError, ValueError):
             pass
         return None
-    signal_members(members, session, number)
+    signal_members(members, session, number, groups=number != signal.SIGTERM)
     return members
 
 
@@ -969,7 +976,7 @@ def freeze_session(session: int, limit: float) -> None:
         if members is None:
             return
         fresh = set(members) - frozen
-        signal_members(members, session, signal.SIGSTOP)
+        signal_members(members, session, signal.SIGSTOP, groups=True)
         frozen |= fresh
         if not fresh and settled:
             return

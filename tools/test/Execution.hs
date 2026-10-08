@@ -381,6 +381,22 @@ spec = describe "Validation execution" $ do
           `shouldBe` Just ["evidence/probe.evidence/display.log", "evidence/probe.evidence/setup.log"]
         readFile (receiptsDirectory fixture </> "evidence/probe.evidence/display.log") `shouldReturn` "retained\n"
 
+    it "lets a termination handler finish cleanup that starts a subprocess" $
+      withFixture $ \fixture → do
+        -- The handler puts SIGTERM back to its default, as the display helpers
+        -- do, and runs a cleanup child. That child is a member the watchdog
+        -- finds only after the signal: it is told to stop on its own, and the
+        -- handler, already signalled once, is not signalled again — a second
+        -- SIGTERM would kill it before it retained anything.
+        plan ← planRequesting fixture ["probe.cleanup"]
+        (result, _, _) ← runGroup fixture "probe.cleanup" plan []
+        result `shouldBe` ExitFailure 1
+        receipt ← readReceipt fixture "probe.cleanup"
+        stringField receipt "outcome" `shouldBe` Just "timeout"
+        numberField receipt "exit_status" `shouldBe` Just 0
+        (receipt >>= field "expiry" >>= field "killed" >>= asBool) `shouldBe` Just False
+        readFile' (receiptsDirectory fixture </> "evidence/probe.cleanup/cleaned") `shouldReturn` "cleaned\n"
+
     it "binds the preparation into the plan's identity and the receipt's comparison" $
       withFixture $ \fixture → do
         plan ← planRequesting fixture ["probe.prepared"]
@@ -2433,6 +2449,27 @@ stagedGroupDocuments =
       "1"
       ["sh", "-c", "echo ran > \"$HETOIMASIA_VALIDATION_EVIDENCE/ran\""]
       "30"
+  , -- A stalled command whose termination handler runs a cleanup subprocess
+    -- under the default disposition and only then retains its evidence.
+    stagedGroupDocument
+      "probe.cleanup"
+      [ "python3"
+      , "-c"
+      , unlines
+          [ "import os, signal, subprocess, sys"
+          , "evidence = os.environ['HETOIMASIA_VALIDATION_EVIDENCE']"
+          , "def handler(number, frame):"
+          , "    signal.signal(signal.SIGTERM, signal.SIG_DFL)"
+          , "    subprocess.run(['sleep', '0.3'])"
+          , "    with open(evidence + '/cleaned', 'w') as record:"
+          , "        record.write('cleaned\\n')"
+          , "    sys.exit(0)"
+          , "signal.signal(signal.SIGTERM, handler)"
+          , "while True:"
+          , "    signal.pause()"
+          ]
+      ]
+      "1"
   , -- A stalled command that keeps its diagnostics only in its own cleanup.
     stagedGroupDocument
       "probe.evidence"
@@ -2457,6 +2494,7 @@ stagedGroups =
   , "probe.regrouped-term"
   , "probe.regrouped-stubborn"
   , "probe.regrouped-prepared"
+  , "probe.cleanup"
   , "probe.evidence"
   ]
 
