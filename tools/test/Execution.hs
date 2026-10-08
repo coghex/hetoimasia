@@ -9,7 +9,8 @@
 module Execution (spec) where
 
 import Control.Concurrent (threadDelay)
-import Control.Monad (forM_, void)
+import Control.Exception (bracket, finally)
+import Control.Monad (forM_, void, when)
 import Data.List (intercalate, isPrefixOf, stripPrefix)
 import Data.Maybe (isNothing)
 import Json (Json (..), asArray, asBool, asString, entryFor, field, parseJson)
@@ -36,7 +37,9 @@ import System.Directory
   )
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
+import System.IO (readFile')
 import System.IO.Temp (withSystemTempDirectory)
+import System.Process (getPid, spawnProcess, terminateProcess, waitForProcess)
 import Test.Hspec
   ( Spec
   , describe
@@ -271,6 +274,75 @@ spec = describe "Validation execution" $ do
         -- one its own session made, so the child is still watched and the
         -- deadline still expires on it.
         watchdogStage fixture "gone-leader" `shouldReturn` "timeout"
+
+    it "does not read a session it cannot observe as an empty one" $
+      withFixture $ \fixture → do
+        -- The command is gone at once, so only an answer of "nobody is left"
+        -- could end the stage early. Not knowing is not that answer: the stage
+        -- stays open to its deadline, and expires rather than passes.
+        watchdogStage fixture "unobservable" `shouldReturn` "timeout"
+
+    it "keeps measuring a command whose descendant moved to another process group" $
+      withFixture $ \fixture → do
+        -- The descendant moves into a group of its own inside the command's
+        -- session, proves it has, and only then lets the shell go. It outlives
+        -- the shell by half a second and records that it finished, so a stage
+        -- that ended with the shell would end before the record exists.
+        plan ← planRequesting fixture ["probe.regrouped"]
+        withRegrouped fixture "probe.regrouped" $ do
+          (result, _, _) ← runGroup fixture "probe.regrouped" plan []
+          result `shouldBe` ExitSuccess
+          receipt ← readReceipt fixture "probe.regrouped"
+          stringField receipt "outcome" `shouldBe` Just "passed"
+          fieldIsNull receipt "expiry" `shouldBe` True
+          numberField receipt "duration_seconds" `shouldSatisfy` maybe False (>= 0.5)
+          readFile' (receiptsDirectory fixture </> "evidence/probe.regrouped/child.done")
+            `shouldReturn` "done\n"
+
+    it "ends a descendant in another process group at expiry, sparing what is outside the stage" $
+      withFixture $ \fixture → do
+        plan ← planRequesting fixture ["probe.regrouped-term"]
+        withOutsider $ \outsider → withRegrouped fixture "probe.regrouped-term" $ do
+          (result, _, _) ← runGroup fixture "probe.regrouped-term" plan []
+          result `shouldBe` ExitFailure 1
+          receipt ← readReceipt fixture "probe.regrouped-term"
+          stringField receipt "outcome" `shouldBe` Just "timeout"
+          numberField receipt "duration_seconds" `shouldSatisfy` maybe False (\seconds → seconds >= 1 && seconds < 1.5)
+          -- It answered the termination signal, so nothing had to be killed.
+          (receipt >>= field "expiry" >>= field "killed" >>= asBool) `shouldBe` Just False
+          (receipt >>= field "expiry" >>= field "cleanup_seconds" >>= asNumber) `shouldSatisfy` maybe False (< 5)
+          regroupedChild fixture "probe.regrouped-term" >>= \child → reaped fixture child 50 `shouldReturn` True
+          running fixture outsider `shouldReturn` True
+
+    it "kills a descendant in another process group that ignores the termination signal" $
+      withFixture $ \fixture → do
+        plan ← planRequesting fixture ["probe.regrouped-stubborn"]
+        withOutsider $ \outsider → withRegrouped fixture "probe.regrouped-stubborn" $ do
+          (result, _, _) ← runGroup fixture "probe.regrouped-stubborn" plan []
+          result `shouldBe` ExitFailure 1
+          receipt ← readReceipt fixture "probe.regrouped-stubborn"
+          stringField receipt "outcome" `shouldBe` Just "timeout"
+          -- The measurement stops at the deadline; the grace the descendant
+          -- spent ignoring the signal is the cleanup's.
+          numberField receipt "duration_seconds" `shouldSatisfy` maybe False (\seconds → seconds >= 1 && seconds < 1.5)
+          (receipt >>= field "expiry" >>= field "killed" >>= asBool) `shouldBe` Just True
+          (receipt >>= field "expiry" >>= field "cleanup_seconds" >>= asNumber) `shouldSatisfy` maybe False (>= 5)
+          regroupedChild fixture "probe.regrouped-stubborn" >>= \child → reaped fixture child 50 `shouldReturn` True
+          running fixture outsider `shouldReturn` True
+
+    it "ends a preparation's descendant in another process group, and never starts the command" $
+      withFixture $ \fixture → do
+        plan ← planRequesting fixture ["probe.regrouped-prepared"]
+        withOutsider $ \outsider → withRegrouped fixture "probe.regrouped-prepared" $ do
+          (result, _, _) ← runGroup fixture "probe.regrouped-prepared" plan []
+          result `shouldBe` ExitFailure 1
+          receipt ← readReceipt fixture "probe.regrouped-prepared"
+          stringField receipt "outcome" `shouldBe` Just "timeout"
+          boolField receipt "executed" `shouldBe` Just False
+          nestedString receipt "preparation" "outcome" `shouldBe` Just "timeout"
+          doesFileExist (receiptsDirectory fixture </> "evidence/probe.regrouped-prepared/ran") `shouldReturn` False
+          regroupedChild fixture "probe.regrouped-prepared" >>= \child → reaped fixture child 50 `shouldReturn` True
+          running fixture outsider `shouldReturn` True
 
     it "retains the evidence a stopped command writes in its own cleanup" $
       withFixture $ \fixture → do
@@ -1750,6 +1822,10 @@ watchdogStage fixture mode = do
           , "        return original(*arguments, **options)"
           , "    runner.subprocess.Popen = slow"
           , "    stage = runner.execute(['sh', '-c', 'sleep 0.7'], root, 1, dict(os.environ))"
+          , "elif mode == 'unobservable':"
+          , "    runner.session_members = lambda session: None"
+          , "    runner.TERMINATION_GRACE_SECONDS = 1"
+          , "    stage = runner.execute(['true'], root, 1, dict(os.environ))"
           , "else:"
           , "    def gone(pid):"
           , "        raise OSError('the leader has already exited')"
@@ -1898,6 +1974,86 @@ reaped fixture pid attempts = do
   case result of
     ExitFailure _ → pure True
     ExitSuccess → threadDelay 100000 >> reaped fixture pid (attempts - 1)
+
+-- | Whether a process identifier still names a running process.
+running ∷ Fixture → String → IO Bool
+running fixture pid = do
+  (result, _, _) ← run (environment fixture) (root fixture) "kill" ["-0", pid]
+  pure (result == ExitSuccess)
+
+-- | Start a process outside any stage, as a control that no cleanup may touch,
+-- and stop it again whether or not the example held.
+withOutsider ∷ (String → IO a) → IO a
+withOutsider =
+  bracket
+    (spawnProcess "sleep" ["300"])
+    (\control → terminateProcess control >> void (waitForProcess control))
+    . (\action control → getPid control >>= maybe (fail "the control exited at once") (action . show))
+
+-- | The descendant a regrouping command recorded, by the group's evidence.
+regroupedChild ∷ Fixture → String → IO String
+regroupedChild fixture group =
+  takeWhile (/= '\n') <$> readFile' (receiptsDirectory fixture </> "evidence" </> group </> "child.pid")
+
+-- | Run an example about a descendant that left the command's process group,
+-- and stop whatever it left running even when an assertion fails.
+withRegrouped ∷ Fixture → String → IO a → IO a
+withRegrouped fixture group action = action `finally` stopDescendant
+  where
+    stopDescendant = do
+      let record = receiptsDirectory fixture </> "evidence" </> group </> "child.pid"
+      present ← doesFileExist record
+      when present $ do
+        child ← regroupedChild fixture group
+        void (run (environment fixture) (root fixture) "kill" ["-9", child])
+
+-- | A command whose shell leaves a descendant behind in another process group
+-- of the same session. The descendant moves, checks that it did and that its
+-- session is unchanged, and tells the shell over a pipe; the shell records the
+-- descendant's process id only after that handshake, then exits.
+--
+-- The mode decides what the descendant does next. @release@ waits for the
+-- shell to go (its end of a second pipe closes), takes half a second, records
+-- that it finished, and exits. @term@ waits to be signalled. @ignore@ ignores
+-- @SIGTERM@ and waits to be killed.
+regroupCommand ∷ String → [String]
+regroupCommand mode =
+  [ "python3"
+  , "-c"
+  , unlines
+      [ "import os, signal, sys, time"
+      , "mode = sys.argv[1]"
+      , "evidence = os.environ['HETOIMASIA_VALIDATION_EVIDENCE']"
+      , "ready_read, ready_write = os.pipe()"
+      , "hold_read, hold_write = os.pipe()"
+      , "leader_group, leader_session = os.getpgid(0), os.getsid(0)"
+      , "child = os.fork()"
+      , "if child == 0:"
+      , "    os.close(ready_read)"
+      , "    os.close(hold_write)"
+      , "    os.setpgid(0, 0)"
+      , "    moved = os.getpgid(0) != leader_group and os.getsid(0) == leader_session"
+      , "    if mode == 'ignore':"
+      , "        signal.signal(signal.SIGTERM, signal.SIG_IGN)"
+      , "    os.write(ready_write, b'moved' if moved else b'stayed')"
+      , "    os.close(ready_write)"
+      , "    if mode == 'release':"
+      , "        os.read(hold_read, 1)"
+      , "        time.sleep(0.5)"
+      , "        with open(evidence + '/child.done', 'w') as done:"
+      , "            done.write('done\\n')"
+      , "        os._exit(0)"
+      , "    while True:"
+      , "        signal.pause()"
+      , "os.close(ready_write)"
+      , "os.close(hold_read)"
+      , "if os.read(ready_read, 16) != b'moved':"
+      , "    sys.exit(3)"
+      , "with open(evidence + '/child.pid', 'w') as record:"
+      , "    record.write(str(child) + '\\n')"
+      ]
+  , mode
+  ]
 
 -- ---------------------------------------------------------------------------
 -- The fixture repository
@@ -2059,6 +2215,21 @@ stagedGroupDocuments =
       "probe.graceful"
       ["sh", "-c", "trap 'exit 0' TERM; sleep 300 & wait"]
       "1"
+  , -- A command whose descendant moves to another process group and outlives
+    -- the shell, then finishes inside the budget.
+    stagedGroupDocument "probe.regrouped" (regroupCommand "release") "30"
+  , -- The same descendant, left waiting for a signal it will honor.
+    stagedGroupDocument "probe.regrouped-term" (regroupCommand "term") "1"
+  , -- And one that ignores the termination signal.
+    stagedGroupDocument "probe.regrouped-stubborn" (regroupCommand "ignore") "1"
+  , -- A preparation that leaves such a descendant behind, before a command that
+    -- would leave a mark.
+    preparedGroupDocument
+      "probe.regrouped-prepared"
+      (regroupCommand "term")
+      "1"
+      ["sh", "-c", "echo ran > \"$HETOIMASIA_VALIDATION_EVIDENCE/ran\""]
+      "30"
   , -- A stalled command that keeps its diagnostics only in its own cleanup.
     stagedGroupDocument
       "probe.evidence"
@@ -2074,7 +2245,17 @@ stagedGroupDocuments =
 -- them.
 stagedGroups ∷ [String]
 stagedGroups =
-  ["probe.prepared", "probe.unprepared", "probe.overbuilt", "probe.lingering", "probe.graceful", "probe.evidence"]
+  [ "probe.prepared"
+  , "probe.unprepared"
+  , "probe.overbuilt"
+  , "probe.lingering"
+  , "probe.graceful"
+  , "probe.regrouped"
+  , "probe.regrouped-term"
+  , "probe.regrouped-stubborn"
+  , "probe.regrouped-prepared"
+  , "probe.evidence"
+  ]
 
 -- | An optional CPU group consuming a directory named after it.
 stagedGroupDocument ∷ String → [String] → String → String
@@ -2101,6 +2282,7 @@ jsonList entries = "[" ++ intercalate ", " (map quoted entries) ++ "]"
     quoted entry = "\"" ++ concatMap escape entry ++ "\""
     escape '"' = "\\\""
     escape '\\' = "\\\\"
+    escape '\n' = "\\n"
     escape character = [character]
 
 -- | A catalog that consumes a document the committed one leaves as harmless
