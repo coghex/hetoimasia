@@ -326,6 +326,24 @@ spec = describe "Validation execution" $ do
           -- found, killed and reported.
           handoffStage fixture "expiry-late" handoffs `shouldReturn` ["timeout", "True", "gone"]
 
+    it "ends cross-group descendants that keep handing off through the escalation as well" $
+      withFixture $ \fixture →
+        -- The handoffs begin when escalation does, so every scan of it is blind
+        -- and none confirms the session empty. Cleanup still reaches the group
+        -- the relays live in, which it remembered from before, stops it,
+        -- kills it, and reports the kill with the cleanup apart from the
+        -- measurement.
+        handoffStage fixture "expiry-escalate" 400 `shouldReturn` ["timeout", "True", "gone", "separate"]
+
+    forM_ [("could not be confirmed empty", "unconfirmed"), ("could not be read", "uncertain")] $ \(label, mode) →
+      it ("stays within its cap, as a kill, when the session " ++ label) $
+        withFixture $ \fixture →
+          -- The observation is replaced, not waited out: with the confirmation
+          -- never coming, cleanup runs to its caps (shrunk here), ends the
+          -- stage, and reports a kill rather than a clean exit. The outcome
+          -- stays a timeout and the cleanup is not part of the measurement.
+          capStage fixture mode `shouldReturn` ["timeout", "True", "separate", "gone"]
+
     forM_
       [ ("the first observation of the session failed", 1, False)
       , ("the session stayed unreadable past the retries of the first signal", 30, False)
@@ -1970,9 +1988,13 @@ handoffStage fixture mode handoffs = do
           , "runner = importlib.util.module_from_spec(specification)"
           , "specification.loader.exec_module(runner)"
           , "runner.TERMINATION_GRACE_SECONDS = 1"
+          , "if mode == 'expiry-escalate':"
+          , "    # A chain far longer than the escalation is given, so only reaching the"
+          , "    # group the relays live in can end it before the cap."
+          , "    runner.KILLING_SECONDS = 1"
           , "leader = '''"
           , "import os, signal, sys"
-          , "ready, go, result, mode, handoffs = sys.argv[1:6]"
+          , "ready, go, result, mode, handoffs, pidfile = sys.argv[1:7]"
           , "null = os.open(os.devnull, os.O_RDWR)"
           , "os.dup2(null, 1)"
           , "os.dup2(null, 2)"
@@ -1995,6 +2017,8 @@ handoffStage fixture mode handoffs = do
           , "    os.setpgid(0, 0)"
           , "    if mode.startswith('expiry'):"
           , "        signal.signal(signal.SIGTERM, signal.SIG_IGN)"
+          , "    with open(pidfile, 'w') as handle:"
+          , "        handle.write(str(os.getpid()))"
           , "    with open(ready, 'w') as handle:"
           , "        handle.write('ready')"
           , "    relay(int(handoffs))"
@@ -2002,7 +2026,7 @@ handoffStage fixture mode handoffs = do
           , "    handle.read()"
           , "'''"
           , "scratch = tempfile.mkdtemp()"
-          , "ready, go, result = (os.path.join(scratch, name) for name in ('ready', 'go', 'result'))"
+          , "ready, go, result, pidfile = (os.path.join(scratch, name) for name in ('ready', 'go', 'result', 'pid'))"
           , "for fifo in (ready, go, result):"
           , "    os.mkfifo(fifo)"
           , "# expiry-late: one handoff in a plain pass (the session looks empty), then,"
@@ -2014,10 +2038,36 @@ handoffStage fixture mode handoffs = do
           , "listing = runner.process_table"
           , "def release():"
           , "    state['next'] += 1"
-          , "    with open(go, 'w') as handle:"
-          , "        handle.write('go')"
-          , "    with open(result) as handle:"
-          , "        relay, replacement = map(int, handle.read().split())"
+          , "    # A relay the cleanup has stopped cannot hand off: give up on it rather"
+          , "    # than wait for an answer that will not come."
+          , "    opened = None"
+          , "    for _ in range(40):"
+          , "        try:"
+          , "            opened = os.open(go, os.O_WRONLY | os.O_NONBLOCK)"
+          , "            break"
+          , "        except OSError:"
+          , "            time.sleep(0.05)"
+          , "    if opened is None:"
+          , "        return"
+          , "    os.write(opened, b'go')"
+          , "    os.close(opened)"
+          , "    reading = os.open(result, os.O_RDONLY | os.O_NONBLOCK)"
+          , "    data = b''"
+          , "    end = time.monotonic() + 2"
+          , "    while time.monotonic() < end:"
+          , "        try:"
+          , "            chunk = os.read(reading, 64)"
+          , "        except BlockingIOError:"
+          , "            chunk = None"
+          , "        if chunk:"
+          , "            data += chunk"
+          , "        elif chunk == b'' and data:"
+          , "            break"
+          , "        time.sleep(0.002)"
+          , "    os.close(reading)"
+          , "    if not data:"
+          , "        return"
+          , "    relay, replacement = map(int, data.split())"
           , "    state['replacement'] = replacement"
           , "    # The relay has gone before the pass goes on."
           , "    patience = time.monotonic() + 10"
@@ -2047,19 +2097,33 @@ handoffStage fixture mode handoffs = do
           , "    state['opened'] = not state['opened']"
           , "    return pid"
           , "runner.newest_pid = marking"
-          , "signalling = runner.signal_session"
-          , "def signalling_first(*arguments):"
-          , "    members = signalling(*arguments)"
+          , "telling = runner.first_termination"
+          , "def telling_first(*arguments):"
+          , "    told = telling(*arguments)"
+          , "    state['armed'] = mode != 'expiry-escalate'"
+          , "    return told"
+          , "freezing = runner.freeze_session"
+          , "def freezing_first(*arguments):"
+          , "    # expiry-escalate: the handoffs begin only once escalation has."
           , "    state['armed'] = True"
-          , "    return members"
+          , "    return freezing(*arguments)"
           , "if mode.startswith('expiry'):"
-          , "    runner.signal_session = signalling_first"
+          , "    runner.first_termination = telling_first"
+          , "    runner.freeze_session = freezing_first"
           , "try:"
-          , "    stage = runner.execute(['python3', '-c', leader, ready, go, result, mode, str(handoffs)], root, 1, dict(os.environ))"
+          , "    stage = runner.execute(['python3', '-c', leader, ready, go, result, mode, str(handoffs), pidfile], root, 1, dict(os.environ))"
           , "    replacement = state['replacement']"
           , "    gone = False"
           , "    patience = time.monotonic() + 5"
-          , "    while replacement is not None and time.monotonic() < patience:"
+          , "    while mode == 'expiry-escalate' and time.monotonic() < patience:"
+          , "        # Every relay and replacement lives in the group the first relay made."
+          , "        try:"
+          , "            os.killpg(int(open(pidfile).read()), 0)"
+          , "        except (ProcessLookupError, PermissionError):"
+          , "            gone = True"
+          , "            break"
+          , "        time.sleep(0.05)"
+          , "    while mode != 'expiry-escalate' and replacement is not None and time.monotonic() < patience:"
           , "        try:"
           , "            os.kill(replacement, 0)"
           , "        except ProcessLookupError:"
@@ -2069,17 +2133,90 @@ handoffStage fixture mode handoffs = do
           , "    print(stage['outcome'])"
           , "    print(stage['expiry'] is not None and stage['expiry']['killed'])"
           , "    print('gone' if gone else 'running')"
+          , "    if mode == 'expiry-escalate':"
+          , "        print('separate' if stage['duration_seconds'] < 2 and stage['expiry']['cleanup_seconds'] >= 0 else 'mixed')"
           , "finally:"
           , "    if state['replacement'] is not None:"
           , "        try:"
           , "            os.kill(state['replacement'], signal.SIGKILL)"
           , "        except OSError:"
           , "            pass"
+          , "    try:"
+          , "        os.killpg(int(open(pidfile).read()), signal.SIGKILL)"
+          , "    except (OSError, ValueError):"
+          , "        pass"
           ]
       , tools fixture </> "run.py"
       , root fixture
       , mode
       , show handoffs
+      ]
+  (result, errors) `shouldBe` (ExitSuccess, "")
+  pure (lines output)
+
+-- | Drive the real runner's stage execution of a command that outlives its
+-- budget, with the observation cleanup depends on replaced: @unconfirmed@
+-- always answers that the session is empty but never that nothing was created
+-- while it looked, and @uncertain@ never answers at all. The caps are shrunk so
+-- that running into them costs a second or two. Reports the outcome, whether
+-- cleanup reported a kill, whether the measurement and the cleanup stayed
+-- apart, and whether the command's descendant was gone afterwards.
+capStage ∷ Fixture → String → IO [String]
+capStage fixture mode = do
+  (result, output, errors) ←
+    run
+      (environment fixture)
+      (root fixture)
+      "python3"
+      [ "-I"
+      , "-c"
+      , unlines
+          [ "import importlib.util, os, signal, sys, tempfile, time"
+          , "sys.dont_write_bytecode = True"
+          , "signal.alarm(120)"
+          , "path, root, mode = sys.argv[1:4]"
+          , "specification = importlib.util.spec_from_file_location('runner_under_test', path)"
+          , "runner = importlib.util.module_from_spec(specification)"
+          , "specification.loader.exec_module(runner)"
+          , "runner.TERMINATION_GRACE_SECONDS = 0.3"
+          , "runner.CONFIRMING_SECONDS = 0.3"
+          , "runner.KILLING_SECONDS = 0.5"
+          , "runner.FIRST_TERMINATION_ATTEMPTS = 2"
+          , "if mode == 'unconfirmed':"
+          , "    runner.strict_observation = lambda session: ({}, False)"
+          , "else:"
+          , "    runner.observe_session = lambda session: None"
+          , "scratch = tempfile.mkdtemp()"
+          , "record = os.path.join(scratch, 'child')"
+          , "child = None"
+          , "try:"
+          , "    started = time.monotonic()"
+          , "    stage = runner.execute(['sh', '-c', 'sleep 300 & echo $! > \"$0\"; wait', record], root, 1, dict(os.environ))"
+          , "    took = time.monotonic() - started"
+          , "    child = int(open(record).read())"
+          , "    gone = False"
+          , "    patience = time.monotonic() + 5"
+          , "    while time.monotonic() < patience:"
+          , "        try:"
+          , "            os.kill(child, 0)"
+          , "        except ProcessLookupError:"
+          , "            gone = True"
+          , "            break"
+          , "        time.sleep(0.05)"
+          , "    print(stage['outcome'])"
+          , "    print(stage['expiry']['killed'])"
+          , "    print('separate' if stage['duration_seconds'] < 2 and stage['expiry']['cleanup_seconds'] < 6 and took < 8 else 'mixed')"
+          , "    print('gone' if gone else 'running')"
+          , "finally:"
+          , "    if child is not None:"
+          , "        try:"
+          , "            os.kill(child, signal.SIGKILL)"
+          , "        except OSError:"
+          , "            pass"
+          ]
+      , tools fixture </> "run.py"
+      , root fixture
+      , mode
       ]
   (result, errors) `shouldBe` (ExitSuccess, "")
   pure (lines output)

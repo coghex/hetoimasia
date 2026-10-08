@@ -1061,47 +1061,71 @@ def signal_session(
     return members
 
 
-def sweep_group(group: int | None) -> None:
-    """Kill whatever is left in the group the command was launched in."""
-    if group is None:
-        return
-    try:
-        os.killpg(group, signal.SIGKILL)
-    except OSError:
-        pass
+def signal_known_groups(known: set[int], session: int, number: int) -> None:
+    """Signal every process group this cleanup has seen a member of the session in.
+
+    A group is remembered from the pass that found someone in it and signalled
+    again whether or not a later pass finds anyone there: descendants that hand
+    off into one another faster than a pass can list them still live in a group
+    that is known, and a group signal reaches whichever of them is alive. A
+    process group lies wholly inside one session, so this stays inside the
+    stage's. The group's identifier is the process id of its first process, which
+    stays reserved while any member lives, so a group whose first process is
+    still alive is signalled only if that process is in the session; one whose
+    first process has gone has only the members it was seen to have.
+    """
+    for group in sorted(known):
+        try:
+            if os.getsid(group) != session:
+                continue
+        except ProcessLookupError:
+            pass
+        except OSError:
+            continue
+        try:
+            os.killpg(group, number)
+        except OSError:
+            pass
 
 
-def freeze_session(session: int, group: int | None, limit: float) -> bool:
+def freeze_session(
+    session: int, group: int | None, known: set[int], limit: float
+) -> bool:
     """Stop every member of the session where it stands, until none is new.
 
     A stopped process cannot fork, so once a pass nothing was created during
     finds only members already stopped, the session cannot grow and what is in
-    it can be killed in one sweep rather than chased. Returns whether that fixed
-    point was reached before ``limit``; a session that cannot be observed cannot
-    be frozen and is simply killed.
+    it can be killed in one sweep rather than chased. Every group seen so far is
+    stopped as well, whether or not this pass sees anyone in it. Returns whether
+    that fixed point was reached before ``limit``; a session that cannot be
+    observed cannot be frozen and is simply killed.
     """
     frozen: set[int] = set()
     while time.monotonic() < limit:
         members, strict = strict_observation(session)
         if members is None:
+            signal_known_groups(known, session, signal.SIGSTOP)
             return False
+        known |= set(members.values())
         fresh = set(members) - frozen
-        signal_members(members, session, signal.SIGSTOP, groups=True, initial=group)
+        signal_known_groups(known, session, signal.SIGSTOP)
+        signal_members(members, session, signal.SIGSTOP)
         frozen |= fresh
         if not fresh and strict:
             return True
     return False
 
 
-def first_termination(process: subprocess.Popen, session: int) -> set[int]:
+def first_termination(process: subprocess.Popen, session: int) -> tuple[set[int], dict[int, int]]:
     """Tell every member of the session to terminate, and say whom.
 
-    The recipients are exactly the processes named in the returned set, each
-    told once: that is what lets later polls tell only processes that were not,
-    and never one that is already running its cleanup. A session that cannot be
-    read is asked again for as long as a second; if it still cannot be, only the
-    process this runner launched is told, since a signal to a group would reach
-    processes nobody can name, and the rest are told when they are first seen.
+    The recipients are exactly the processes named in the first returned value,
+    each told once: that is what lets later polls tell only processes that were
+    not, and never one that is already running its cleanup. A session that
+    cannot be read is asked again for as long as a second; if it still cannot be,
+    only the process this runner launched is told, since a signal to a group
+    would reach processes nobody can name, and the rest are told when they are
+    first seen. The second value is what was observed.
     """
     members = None
     for _ in range(FIRST_TERMINATION_ATTEMPTS):
@@ -1114,9 +1138,9 @@ def first_termination(process: subprocess.Popen, session: int) -> set[int]:
             process.send_signal(signal.SIGTERM)
         except (OSError, ValueError):
             pass
-        return {process.pid}
+        return {process.pid}, {}
     signal_members(members, session, signal.SIGTERM)
-    return set(members)
+    return set(members), members
 
 
 def terminate_session(process: subprocess.Popen, session: int, group: int | None) -> bool:
@@ -1142,39 +1166,46 @@ def terminate_session(process: subprocess.Popen, session: int, group: int | None
     gone. What survives the grace is first stopped in place, so that nothing can
     keep forking replacements faster than they are found, and then killed.
 
-    The guarantee here is stronger than completion's. A session is believed empty
-    only from a pass during which nothing was created on the machine
-    (:func:`cleanup_observation`), so a replacement handed off while a pass was
-    running cannot hide a member; host activity only delays the confirmation.
-    The wait is capped, and when it runs out the cleanup is not reported clean:
-    it reports that it killed.
+    The guarantee is that the group the command was launched in, every member
+    observed in the session and every process group any of them was observed in
+    are told to terminate, given the grace, and then stopped and killed again and
+    again until a pass during which nothing was created on the machine finds the
+    session empty (:func:`cleanup_observation`), or until the cap. It is not a guarantee about
+    every process in the session: a descendant that keeps handing off into
+    fresh groups faster than they are observed can outlive it. When the cap
+    runs out the cleanup is not reported clean: it reports that it killed.
     """
-    seen = first_termination(process, session)
+    seen, observed = first_termination(process, session)
+    known: set[int] = set(observed.values())
+    if group is not None:
+        known.add(group)
     grace = time.monotonic() + TERMINATION_GRACE_SECONDS
     while True:
         members, confirmed = cleanup_observation(
             session, min(grace, time.monotonic() + CONFIRMING_SECONDS)
         )
         leader_exited = process.poll() is not None
+        found = members or {}
+        known |= set(found.values())
         # The leader going is not the session going: its descendants get
         # whatever is left of the same grace before anything is killed.
         if leader_exited and members == {} and confirmed:
-            sweep_group(group)
             return False
         if time.monotonic() >= grace:
             break
-        found = members or {}
         fresh = set(found) - seen
         if fresh:
             signal_members({pid: found[pid] for pid in fresh}, session, signal.SIGTERM)
         seen |= fresh
         time.sleep(TEARDOWN_POLL_SECONDS)
     reach = time.monotonic() + KILLING_SECONDS
-    freeze_session(session, group, reach)
+    freeze_session(session, group, known, reach)
     while True:
         members, confirmed = cleanup_observation(session, reach)
+        known |= set((members or {}).values())
+        signal_known_groups(known, session, signal.SIGKILL)
         if members:
-            signal_members(members, session, signal.SIGKILL, groups=True, initial=group)
+            signal_members(members, session, signal.SIGKILL)
         elif members is None:
             signal_session(process, session, group, signal.SIGKILL)
         if process.poll() is not None and members == {} and confirmed:
@@ -1185,7 +1216,6 @@ def terminate_session(process: subprocess.Popen, session: int, group: int | None
     if process.poll() is None:
         process.kill()
         process.wait()
-    sweep_group(group)
     return True
 
 
