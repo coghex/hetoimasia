@@ -1451,14 +1451,15 @@ no later run can attribute is not reusable evidence.
 
 `outcome` is `passed`, `failed`, or `timeout`. A timeout is distinct because an
 exhausted budget and a disagreeing test are different obstacles. The runner
-gives the command its own process group and reaps that whole group on timeout,
-so a backgrounded build server or test child cannot outlive the budget it was
-launched under. Liveness is probed on the *group*, never inferred from the
+gives the command its own session, and so its own process group, and ends every
+process left in that **session** on timeout, so a backgrounded build server or
+test child cannot outlive the budget it was launched under, whichever process
+group it moved into. Liveness is asked of the session, never inferred from the
 process the runner launched: a descendant that ignores `SIGTERM` keeps running
-under the same group identifier after the shell that started it has gone, so
-anything still there once the grace period expires is killed outright. The runner exits `0` when the group passed, `1` when it failed
-or timed out — the receipt is still written — and `2` for a diagnostic that
-prevented any execution.
+after the shell that started it has gone, so anything still there once the grace
+period expires is killed outright. The runner exits `0` when the group passed,
+`1` when it failed or timed out — the receipt is still written — and `2` for a
+diagnostic that prevented any execution.
 
 #### Preparation and the watchdog
 
@@ -1466,14 +1467,34 @@ Receipts are schema 4 and plans schema 4: a group may declare a `preparation`,
 and a stage's measurement is kept apart from the cleanup after its deadline.
 
 A stage — the preparation, then the command — is measured from its start until
-the command **and every descendant it started** have gone, or until its
-deadline, whichever comes first. A command whose leader exits while something it
-started is still running has not finished its teardown, so the runner keeps
-measuring, and a teardown that never finishes expires the deadline like a
-stalled setup does. At expiry the runner signals the whole group with `SIGTERM`
-first, so a command that keeps its diagnostics in its own cleanup — the display
-helper's server log, say — can retain them, then kills whatever survives the
-grace period. That cleanup is recorded as `expiry` —
+the command **and every descendant it started in its session** have gone, or
+until its deadline, whichever comes first. A command whose leader exits while
+something it started is still running has not finished its teardown, so the
+runner keeps measuring, and a teardown that never finishes expires the deadline
+like a stalled setup does. At expiry the runner signals every process in the
+stage's session with `SIGTERM` first, so a command that keeps its diagnostics in
+its own cleanup — the display helper's server log, say — can retain them, then
+kills whatever survives the grace period.
+
+The boundary is the **session**, which the runner creates for the stage and
+whose identifier is the command's own process id. A descendant that moves into
+another process group — as both native test launchers' children do, to be
+signalled on their own — is still in it, so it holds the measurement open and is
+ended at expiry like any other. Membership is read from the kernel, from
+`/proc` on Linux and from `ps` with `getsid` on macOS, and asked again on every
+poll, so a process created during the grace period is told to stop as well.
+Zombies are not members: they have already stopped, and their adopter reaps
+them. The runner signals a process only after confirming it is still in the
+stage's session, and never itself, so nothing outside the stage — unrelated user
+processes included — is reached. A session that cannot be read is not an empty
+one: the stage is treated as still running, so it expires instead of passing,
+and expiry falls back to signalling the command's own process group.
+
+What this cannot follow is a descendant that starts a session of its own with
+`setsid`. It leaves the stage's session, so it neither holds a measurement open
+nor is signalled at expiry; a command that starts one owns ending it.
+
+That cleanup is recorded as `expiry` —
 `{"expired_at", "cleanup_seconds", "killed"}` — and never counted in
 `duration_seconds`, and an expired stage's outcome is `timeout` whatever its
 process reports once it has been stopped: a command that answers the watchdog's
