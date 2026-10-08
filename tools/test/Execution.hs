@@ -282,6 +282,21 @@ spec = describe "Validation execution" $ do
         -- stays open to its deadline, and expires rather than passes.
         watchdogStage fixture "unobservable" `shouldReturn` "timeout"
 
+    it "does not read a session as empty when its last member hands off to a replacement mid-scan" $
+      withFixture $ \fixture →
+        -- The last member forks a replacement and exits after the scan has
+        -- listed it and before it was asked its session. That scan finds
+        -- nobody in a session that still has a member, and a stage that
+        -- believed it would pass with the replacement running.
+        handoffStage fixture "completion" `shouldReturn` ["timeout", "False", "gone"]
+
+    it "does not stop cleaning up when the last member hands off during the grace period" $
+      withFixture $ \fixture →
+        -- The same handoff while the stage is being stopped: the replacement
+        -- inherits the termination signal's disposition, so it only goes when
+        -- it is killed, and the cleanup has to say so.
+        handoffStage fixture "expiry" `shouldReturn` ["timeout", "True", "gone"]
+
     it "keeps measuring a command whose descendant moved to another process group" $
       withFixture $ \fixture → do
         -- The descendant moves into a group of its own inside the command's
@@ -1839,6 +1854,119 @@ watchdogStage fixture mode = do
       ]
   (result, errors) `shouldBe` (ExitSuccess, "")
   pure (takeWhile (/= '\n') output)
+
+-- | Drive the real runner's stage execution through a handoff its session scan
+-- cannot see. The command's leader exits leaving a relay that waits on a named
+-- pipe; when the runner's first scan after the chosen instant has listed the
+-- processes, the relay is released, forks a replacement, and exits, and only
+-- then is that scan's stale listing handed back. The instants are chosen by
+-- patching the one function that lists processes, so the relay and its
+-- replacement are real processes and nothing is slept for. Returns the stage's
+-- outcome, whether its cleanup killed anything, and whether the replacement was
+-- gone once the stage returned; whatever the stage left running is killed
+-- either way.
+--
+-- In @completion@ the handoff happens at the first scan after the leader
+-- exits. In @expiry@ the relay ignores the termination signal, and the handoff
+-- happens at the first scan after the cleanup has begun.
+handoffStage ∷ Fixture → String → IO [String]
+handoffStage fixture mode = do
+  (result, output, errors) ←
+    run
+      (environment fixture)
+      (root fixture)
+      "python3"
+      [ "-I"
+      , "-c"
+      , unlines
+          [ "import importlib.util, os, signal, sys, tempfile, time"
+          , "sys.dont_write_bytecode = True"
+          , "path, root, mode = sys.argv[1:4]"
+          , "specification = importlib.util.spec_from_file_location('runner_under_test', path)"
+          , "runner = importlib.util.module_from_spec(specification)"
+          , "specification.loader.exec_module(runner)"
+          , "leader = \"\"\""
+          , "import os, signal, sys"
+          , "ready, go, result, mode = sys.argv[1:5]"
+          , "relay = os.fork()"
+          , "if relay == 0:"
+          , "    if mode == 'expiry':"
+          , "        signal.signal(signal.SIGTERM, signal.SIG_IGN)"
+          , "    with open(ready, 'w') as handle:"
+          , "        handle.write('ready')"
+          , "    with open(go) as handle:"
+          , "        handle.read()"
+          , "    replacement = os.fork()"
+          , "    if replacement == 0:"
+          , "        while True:"
+          , "            signal.pause()"
+          , "    with open(result, 'w') as handle:"
+          , "        handle.write('%d %d' % (os.getpid(), replacement))"
+          , "    os._exit(0)"
+          , "with open(ready) as handle:"
+          , "    handle.read()"
+          , "\"\"\""
+          , "scratch = tempfile.mkdtemp()"
+          , "ready, go, result = (os.path.join(scratch, name) for name in ('ready', 'go', 'result'))"
+          , "for fifo in (ready, go, result):"
+          , "    os.mkfifo(fifo)"
+          , "state = {'armed': mode == 'completion', 'fired': False, 'replacement': None}"
+          , "listing = runner.process_table"
+          , "def handing_off():"
+          , "    table = listing()"
+          , "    if not state['armed'] or state['fired'] or table is None:"
+          , "        return table"
+          , "    state['fired'] = True"
+          , "    with open(go, 'w') as handle:"
+          , "        handle.write('go')"
+          , "    with open(result) as handle:"
+          , "        relay, replacement = map(int, handle.read().split())"
+          , "    state['replacement'] = replacement"
+          , "    # The relay has gone before the stale listing is returned."
+          , "    patience = time.monotonic() + 10"
+          , "    while time.monotonic() < patience:"
+          , "        found = runner.process_session(relay, '')"
+          , "        if found is None or found[1][:1] in ('Z', 'X'):"
+          , "            break"
+          , "        time.sleep(0.01)"
+          , "    return table"
+          , "runner.process_table = handing_off"
+          , "signalling = runner.signal_session"
+          , "def signalling_first(*arguments):"
+          , "    members = signalling(*arguments)"
+          , "    state['armed'] = True"
+          , "    return members"
+          , "if mode == 'expiry':"
+          , "    runner.signal_session = signalling_first"
+          , "replacement = None"
+          , "try:"
+          , "    stage = runner.execute(['python3', '-c', leader, ready, go, result, mode], root, 1, dict(os.environ))"
+          , "    replacement = state['replacement']"
+          , "    gone = False"
+          , "    patience = time.monotonic() + 5"
+          , "    while replacement is not None and time.monotonic() < patience:"
+          , "        try:"
+          , "            os.kill(replacement, 0)"
+          , "        except ProcessLookupError:"
+          , "            gone = True"
+          , "            break"
+          , "        time.sleep(0.05)"
+          , "    print(stage['outcome'])"
+          , "    print(stage['expiry'] is not None and stage['expiry']['killed'])"
+          , "    print('gone' if gone else 'running')"
+          , "finally:"
+          , "    if state['replacement'] is not None:"
+          , "        try:"
+          , "            os.kill(state['replacement'], signal.SIGKILL)"
+          , "        except OSError:"
+          , "            pass"
+          ]
+      , tools fixture </> "run.py"
+      , root fixture
+      , mode
+      ]
+  (result, errors) `shouldBe` (ExitSuccess, "")
+  pure (lines output)
 
 -- | Replace a receipt's recorded preparation command.
 patchPreparation ∷ Fixture → FilePath → String → IO ()

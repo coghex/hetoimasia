@@ -680,49 +680,21 @@ def source_run_url() -> str:
     return f"{server}/{repository}/actions/runs/{run_id}/attempts/{attempt}"
 
 
-def linux_session_members(session: int) -> set[int] | None:
-    """The live processes whose session is ``session``, read from ``/proc``.
+def process_table() -> list[tuple[int, str]] | None:
+    """Every process the platform lists, as its identifier and, where the
+    listing says, its state; ``None`` when the table cannot be read.
 
-    ``None`` means the table could not be read, which is not the same as an
-    empty session. A process that exits while the table is being read is simply
-    gone, and a zombie has already stopped: neither is a member.
+    This is the first half of observing a session — which processes exist — and
+    the second half asks each one which session it is in. The two are not one
+    atomic step, which is why :func:`session_members` does not trust a single
+    pass that finds nobody.
     """
-    try:
-        names = os.listdir("/proc")
-    except OSError:
-        return None
-    members: set[int] = set()
-    for name in names:
-        if not name.isdigit():
-            continue
+    if sys.platform.startswith("linux"):
         try:
-            with open(f"/proc/{name}/stat", "rb") as handle:
-                record = handle.read()
-        except (FileNotFoundError, ProcessLookupError):
-            continue
+            names = os.listdir("/proc")
         except OSError:
             return None
-        # The command name is parenthesised and may itself contain spaces and
-        # parentheses, so the fields that follow are found from the last one:
-        # state, parent, group, session.
-        try:
-            fields = record[record.rindex(b")") + 2 :].split()
-            state, member_session = fields[0], int(fields[3])
-        except (ValueError, IndexError):
-            return None
-        if member_session == session and state not in (b"Z", b"X"):
-            members.add(int(name))
-    return members
-
-
-def ps_session_members(session: int) -> set[int] | None:
-    """The same, for a platform without ``/proc``, from ``ps`` and ``getsid``.
-
-    ``ps`` only lists the processes, and the kernel's own answer to
-    ``getsid`` decides which of them belong to the session. A process that
-    exits between the two is gone; any other failure to ask leaves the question
-    unanswered.
-    """
+        return [(int(name), "") for name in names if name.isdigit()]
     try:
         listing = subprocess.run(
             ["ps", "-A", "-o", "pid=,stat="],
@@ -735,24 +707,64 @@ def ps_session_members(session: int) -> set[int] | None:
         return None
     if listing.returncode != 0:
         return None
-    members: set[int] = set()
+    table: list[tuple[int, str]] = []
     for line in listing.stdout.splitlines():
         fields = line.split()
         if not fields:
             continue
         try:
-            pid = int(fields[0])
+            table.append((int(fields[0]), fields[1] if len(fields) > 1 else ""))
         except ValueError:
             return None
-        if len(fields) > 1 and fields[1].startswith("Z"):
-            continue
+    return table
+
+
+def process_session(pid: int, state: str) -> tuple[int, str] | None:
+    """One listed process's session and state; ``None`` when it has gone.
+
+    Raises ``OSError`` when it cannot be asked, which the caller must not read
+    as an answer.
+    """
+    if sys.platform.startswith("linux"):
         try:
-            member_session = os.getsid(pid)
-        except ProcessLookupError:
-            continue
+            with open(f"/proc/{pid}/stat", "rb") as handle:
+                record = handle.read()
+        except (FileNotFoundError, ProcessLookupError):
+            return None
+        # The command name is parenthesised and may itself contain spaces and
+        # parentheses, so the fields that follow are found from the last one:
+        # state, parent, group, session.
+        try:
+            fields = record[record.rindex(b")") + 2 :].split()
+            return int(fields[3]), fields[0].decode("ascii")
+        except (ValueError, IndexError) as error:
+            raise OSError(f"unreadable process record for {pid}") from error
+    try:
+        return os.getsid(pid), state
+    except ProcessLookupError:
+        return None
+
+
+def observe_session(session: int) -> set[int] | None:
+    """One pass over the process table: who is in ``session`` and still running.
+
+    ``None`` means the table could not be read, which is not an empty session.
+    A process that exits during the pass is simply gone, and a zombie has
+    already stopped: neither is a member.
+    """
+    table = process_table()
+    if table is None:
+        return None
+    members: set[int] = set()
+    for pid, listed_state in table:
+        try:
+            found = process_session(pid, listed_state)
         except OSError:
             return None
-        if member_session == session:
+        if found is None:
+            continue
+        member_session, state = found
+        if member_session == session and state[:1] not in ("Z", "X"):
             members.add(pid)
     return members
 
@@ -763,10 +775,18 @@ def session_members(session: int) -> set[int] | None:
     A command's session is the one its launch created, so its identifier is the
     command's own process id and no descendant can leave it without a ``setsid``
     of its own. ``None`` is *not knowing*: it is never an empty session.
+
+    A pass lists the processes and then asks each one its session, and a
+    process can fork a replacement and exit in between: the old one is gone
+    when asked and the new one was not yet listed, so that pass finds nobody in
+    a session that still has a member. Finding someone is reliable; finding
+    nobody is only believed when a second pass, which starts after the first has
+    ended, agrees — a replacement the first pass missed is listed by it.
     """
-    if sys.platform.startswith("linux"):
-        return linux_session_members(session)
-    return ps_session_members(session)
+    members = observe_session(session)
+    if members == set():
+        members = observe_session(session)
+    return members
 
 
 def stage_alive(session: int) -> bool:
