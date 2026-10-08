@@ -213,6 +213,9 @@ SETTLING_SECONDS = 2
 # The most identifiers a pass's bracket may span and still have each asked
 # about directly.
 MAX_BRACKET = 4096
+# How many times the first termination asks again for a session it could not
+# read, before it tells only the process it launched.
+FIRST_TERMINATION_ATTEMPTS = 20
 # How long expiry cleanup waits for a pass during which nothing was created on
 # the machine, before it reports that it could not confirm the session empty.
 CONFIRMING_SECONDS = 10
@@ -723,8 +726,14 @@ def darwin_process_table() -> list[tuple[int, str]] | None:
         return None
 
 
+# Processes this runner's own observation has created, which a pass must not
+# mistake for the machine's: each ``ps`` it starts is one identifier handed out.
+observer_creations = 0
+
+
 def ps_process_table() -> list[tuple[int, str]] | None:
     """The same, from ``ps``, where libproc is not to be had."""
+    global observer_creations
     try:
         listing = subprocess.run(
             ["ps", "-A", "-o", "pid=,stat="],
@@ -735,6 +744,7 @@ def ps_process_table() -> list[tuple[int, str]] | None:
         )
     except (OSError, subprocess.SubprocessError):
         return None
+    observer_creations += 1
     if listing.returncode != 0:
         return None
     table: list[tuple[int, str]] = []
@@ -891,10 +901,14 @@ def strict_observation(session: int) -> tuple[dict[int, int] | None, bool]:
     nothing was created between them. Unrelated activity spoils it, which is why
     only expiry cleanup, whose guarantee this serves, asks for it.
     """
+    own = observer_creations
     before = newest_pid()
     members = observe_session(session)
     after = newest_pid()
-    return members, before is not None and after is not None and after == before + 1
+    # The observer's own processes — each ``ps`` it started — are accounted for;
+    # anything beyond them spoils the pass.
+    expected = 1 + observer_creations - own
+    return members, before is not None and after is not None and after == before + expected
 
 
 def cleanup_observation(
@@ -1079,6 +1093,32 @@ def freeze_session(session: int, group: int | None, limit: float) -> bool:
     return False
 
 
+def first_termination(process: subprocess.Popen, session: int) -> set[int]:
+    """Tell every member of the session to terminate, and say whom.
+
+    The recipients are exactly the processes named in the returned set, each
+    told once: that is what lets later polls tell only processes that were not,
+    and never one that is already running its cleanup. A session that cannot be
+    read is asked again for as long as a second; if it still cannot be, only the
+    process this runner launched is told, since a signal to a group would reach
+    processes nobody can name, and the rest are told when they are first seen.
+    """
+    members = None
+    for _ in range(FIRST_TERMINATION_ATTEMPTS):
+        members = session_members(session)
+        if members is not None:
+            break
+        time.sleep(TEARDOWN_POLL_SECONDS)
+    if members is None:
+        try:
+            process.send_signal(signal.SIGTERM)
+        except (OSError, ValueError):
+            pass
+        return {process.pid}
+    signal_members(members, session, signal.SIGTERM)
+    return set(members)
+
+
 def terminate_session(process: subprocess.Popen, session: int, group: int | None) -> bool:
     """End the command and every descendant it started; say whether any was killed.
 
@@ -1109,13 +1149,7 @@ def terminate_session(process: subprocess.Popen, session: int, group: int | None
     The wait is capped, and when it runs out the cleanup is not reported clean:
     it reports that it killed.
     """
-    delivered = signal_session(process, session, group, signal.SIGTERM)
-    seen = set(delivered or ())
-    # When the session could not be read, the signal went to the launch group
-    # and the launched process: everything in that group already created has
-    # been told, and must not be told again. Identifiers are handed out in
-    # sequence, so what is newer than this was created afterwards.
-    told = newest_pid() if delivered is None else None
+    seen = first_termination(process, session)
     grace = time.monotonic() + TERMINATION_GRACE_SECONDS
     while True:
         members, confirmed = cleanup_observation(
@@ -1130,8 +1164,6 @@ def terminate_session(process: subprocess.Popen, session: int, group: int | None
         if time.monotonic() >= grace:
             break
         found = members or {}
-        if told is not None:
-            seen |= {pid for pid, home in found.items() if home == group and pid <= told}
         fresh = set(found) - seen
         if fresh:
             signal_members({pid: found[pid] for pid in fresh}, session, signal.SIGTERM)

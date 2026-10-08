@@ -326,13 +326,32 @@ spec = describe "Validation execution" $ do
           -- found, killed and reported.
           handoffStage fixture "expiry-late" handoffs `shouldReturn` ["timeout", "True", "gone"]
 
-    it "lets a termination handler finish when the first observation of the session failed" $
-      withFixture $ \fixture →
-        -- The first signal falls back to the launch group because the session
-        -- could not be read. The handler it reached is already told, and the
-        -- next successful observation must not tell it again; a second SIGTERM
-        -- would end it before it retained anything.
-        transientStage fixture `shouldReturn` ["timeout", "0", "cleaned", "False"]
+    forM_
+      [ ("the first observation of the session failed", 1, False)
+      , ("the session stayed unreadable past the retries of the first signal", 30, False)
+      , ("the session stayed unreadable and the handler changed its process group", 30, True)
+      ]
+      $ \(label, failures, regroup) →
+        it ("lets a termination handler finish when " ++ label) $
+          withFixture $ \fixture →
+            -- Whatever the first signal could not name, it did not send: only
+            -- the launched process is told, and exactly that process is
+            -- remembered as told, so the next successful observation tells
+            -- the cleanup child it finds and never the handler again, whether
+            -- or not the handler moved to another group meanwhile. A second
+            -- SIGTERM would end it before it retained anything.
+            transientStage fixture failures regroup `shouldReturn` ["timeout", "0", "cleaned", "False"]
+
+    it "reports no kill for a command that exits on the termination signal, reading the ps fallback's table" $
+      withFixture $ \fixture → do
+        -- The fallback starts a ps inside every pass, which a check that
+        -- nothing was created during the pass would take for activity on the
+        -- machine and never confirm, holding cleanup to its cap and reporting
+        -- a kill that was never needed.
+        answer ← psGracefulStage fixture
+        if answer == ["no-ps"]
+          then pendingWith "this machine has no ps to fall back on"
+          else answer `shouldBe` ["timeout", "False", "True"]
 
     it "empties a session of descendants that keep forking replacements" $
       withFixture $ \fixture →
@@ -2070,8 +2089,8 @@ handoffStage fixture mode handoffs = do
 -- retains its evidence, with the first observation of the session failing.
 -- Reports the outcome, the exit status the handler reached, what it retained
 -- and whether cleanup reported killing.
-transientStage ∷ Fixture → IO [String]
-transientStage fixture = do
+transientStage ∷ Fixture → Int → Bool → IO [String]
+transientStage fixture failures regroup = do
   (result, output, errors) ←
     run
       (environment fixture)
@@ -2083,7 +2102,8 @@ transientStage fixture = do
           [ "import importlib.util, os, signal, sys, tempfile"
           , "sys.dont_write_bytecode = True"
           , "signal.alarm(120)"
-          , "path, root = sys.argv[1:3]"
+          , "path, root, failures, regroup = sys.argv[1:5]"
+          , "failures = int(failures)"
           , "specification = importlib.util.spec_from_file_location('runner_under_test', path)"
           , "runner = importlib.util.module_from_spec(specification)"
           , "specification.loader.exec_module(runner)"
@@ -2095,10 +2115,20 @@ transientStage fixture = do
           , "evidence = os.environ['HETOIMASIA_VALIDATION_EVIDENCE']"
           , "def handler(number, frame):"
           , "    signal.signal(signal.SIGTERM, signal.SIG_DFL)"
+          , "    if sys.argv[1] == 'regroup':"
+          , "        os.setpgid(0, 0)"
           , "    subprocess.run(['sleep', '0.3'])"
           , "    with open(evidence + '/cleaned', 'w') as record:"
           , "        record.write('cleaned')"
           , "    sys.exit(0)"
+          , "if sys.argv[1] == 'regroup':"
+          , "    # The handler runs in a descendant that moves to a group of its own;"
+          , "    # the launched process ignores the signal and waits for it."
+          , "    child = os.fork()"
+          , "    if child != 0:"
+          , "        signal.signal(signal.SIGTERM, signal.SIG_IGN)"
+          , "        os.waitpid(child, 0)"
+          , "        sys.exit(0)"
           , "signal.signal(signal.SIGTERM, handler)"
           , "while True:"
           , "    signal.pause()"
@@ -2107,14 +2137,53 @@ transientStage fixture = do
           , "calls = []"
           , "def flaky(session):"
           , "    calls.append(session)"
-          , "    return None if len(calls) == 1 else real(session)"
+          , "    return None if len(calls) <= failures else real(session)"
           , "runner.session_members = flaky"
-          , "stage = runner.execute(['python3', '-c', handler], root, 1, environment)"
+          , "stage = runner.execute(['python3', '-c', handler, regroup], root, 1, environment)"
           , "kept = os.path.join(evidence, 'cleaned')"
           , "print(stage['outcome'])"
           , "print(stage['exit_status'])"
           , "print(open(kept).read() if os.path.exists(kept) else 'missing')"
           , "print(stage['expiry']['killed'])"
+          ]
+      , tools fixture </> "run.py"
+      , root fixture
+      , show failures
+      , if regroup then "regroup" else "stay"
+      ]
+  (result, errors) `shouldBe` (ExitSuccess, "")
+  pure (lines output)
+
+-- | Drive the real runner's stage execution, reading the process table from the
+-- @ps@ fallback, of a command that answers the termination signal by exiting
+-- zero. Reports the outcome, whether cleanup reported killing, and whether
+-- cleanup took well under the grace period. Reports @no-ps@ where there is no
+-- @ps@ to fall back on.
+psGracefulStage ∷ Fixture → IO [String]
+psGracefulStage fixture = do
+  (result, output, errors) ←
+    run
+      (environment fixture)
+      (root fixture)
+      "python3"
+      [ "-I"
+      , "-c"
+      , unlines
+          [ "import importlib.util, os, shutil, signal, sys"
+          , "sys.dont_write_bytecode = True"
+          , "signal.alarm(120)"
+          , "path, root = sys.argv[1:3]"
+          , "specification = importlib.util.spec_from_file_location('runner_under_test', path)"
+          , "runner = importlib.util.module_from_spec(specification)"
+          , "specification.loader.exec_module(runner)"
+          , "if shutil.which('ps') is None:"
+          , "    print('no-ps')"
+          , "    sys.exit(0)"
+          , "runner.process_table = runner.ps_process_table"
+          , "stage = runner.execute(['sh', '-c', 'trap \"exit 0\" TERM; sleep 300 & wait'], root, 1, dict(os.environ))"
+          , "print(stage['outcome'])"
+          , "print(stage['expiry']['killed'])"
+          , "print(stage['expiry']['cleanup_seconds'] < 5)"
           ]
       , tools fixture </> "run.py"
       , root fixture
