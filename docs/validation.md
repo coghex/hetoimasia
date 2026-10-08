@@ -1460,6 +1460,10 @@ after the shell that started it has gone, so anything still there once the grace
 period expires is killed outright. The runner exits `0` when the group passed,
 `1` when it failed or timed out — the receipt is still written — and `2` for a
 diagnostic that prevented any execution.
+A descendant that hands off to a replacement faster than completion's membership
+query can follow can make the stage look finished early, so `duration_seconds`
+and `outcome` of such a stage describe what was observed, not a proof that
+nothing ran on (see "Preparation and the watchdog" for the exact residual).
 
 #### Preparation and the watchdog
 
