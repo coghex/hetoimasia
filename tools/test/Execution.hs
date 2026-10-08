@@ -282,20 +282,31 @@ spec = describe "Validation execution" $ do
         -- stays open to its deadline, and expires rather than passes.
         watchdogStage fixture "unobservable" `shouldReturn` "timeout"
 
-    it "does not read a session as empty when its last member hands off to a replacement mid-scan" $
-      withFixture $ \fixture →
-        -- The last member forks a replacement and exits after the scan has
-        -- listed it and before it was asked its session. That scan finds
-        -- nobody in a session that still has a member, and a stage that
-        -- believed it would pass with the replacement running.
-        handoffStage fixture "completion" `shouldReturn` ["timeout", "False", "gone"]
+    forM_ [1, 2, 3, 5] $ \handoffs →
+      it ("does not read a session as empty while its members keep handing off to replacements (" ++ show handoffs ++ " in a row)") $
+        withFixture $ \fixture →
+          -- The last member forks a replacement and exits after a scan has
+          -- listed it and before it was asked its session, again and again.
+          -- Each such scan finds nobody in a session that still has a member,
+          -- so a stage that believed one would pass with a replacement running,
+          -- however many scans it took before it believed.
+          handoffStage fixture "completion" handoffs `shouldReturn` ["timeout", "False", "gone"]
 
-    it "does not stop cleaning up when the last member hands off during the grace period" $
+    forM_ [1, 3] $ \handoffs →
+      it ("does not stop cleaning up while the last member hands off during the grace period (" ++ show handoffs ++ " in a row)") $
+        withFixture $ \fixture →
+          -- The same handoffs while the stage is being stopped: every
+          -- replacement inherits the termination signal's disposition, so the
+          -- last only goes when it is killed, and the cleanup has to say so.
+          handoffStage fixture "expiry" handoffs `shouldReturn` ["timeout", "True", "gone"]
+
+    it "empties a session of descendants that fork replacements as fast as they can" $
       withFixture $ \fixture →
-        -- The same handoff while the stage is being stopped: the replacement
-        -- inherits the termination signal's disposition, so it only goes when
-        -- it is killed, and the cleanup has to say so.
-        handoffStage fixture "expiry" `shouldReturn` ["timeout", "True", "gone"]
+        -- A chain of processes, each exiting as soon as it has forked the
+        -- next and none answering the termination signal, is not something to
+        -- chase one sweep at a time: cleanup stops what it finds, finds what
+        -- the stopped could no longer fork, and only then kills.
+        breederStage fixture `shouldReturn` ["timeout", "True", "empty"]
 
     it "keeps measuring a command whose descendant moved to another process group" $
       withFixture $ \fixture → do
@@ -1840,6 +1851,7 @@ watchdogStage fixture mode = do
           , "elif mode == 'unobservable':"
           , "    runner.session_members = lambda session: None"
           , "    runner.TERMINATION_GRACE_SECONDS = 1"
+          , "    runner.KILLING_SECONDS = 1"
           , "    stage = runner.execute(['true'], root, 1, dict(os.environ))"
           , "else:"
           , "    def gone(pid):"
@@ -1855,22 +1867,22 @@ watchdogStage fixture mode = do
   (result, errors) `shouldBe` (ExitSuccess, "")
   pure (takeWhile (/= '\n') output)
 
--- | Drive the real runner's stage execution through a handoff its session scan
+-- | Drive the real runner's stage execution through handoffs its session scan
 -- cannot see. The command's leader exits leaving a relay that waits on a named
--- pipe; when the runner's first scan after the chosen instant has listed the
--- processes, the relay is released, forks a replacement, and exits, and only
--- then is that scan's stale listing handed back. The instants are chosen by
--- patching the one function that lists processes, so the relay and its
--- replacement are real processes and nothing is slept for. Returns the stage's
--- outcome, whether its cleanup killed anything, and whether the replacement was
--- gone once the stage returned; whatever the stage left running is killed
--- either way.
+-- pipe. Each time the runner lists the processes, and while handoffs remain,
+-- the relay is released, forks a replacement that is the next relay (the last
+-- is the one that stays), and exits, and only then is that scan's stale
+-- listing handed back. The listing is the one function patched, so the relays
+-- and the replacement are real processes and nothing is slept for. Returns the
+-- stage's outcome, whether its cleanup killed anything, and whether the last
+-- replacement was gone once the stage returned; whatever the stage left
+-- running is killed either way.
 --
--- In @completion@ the handoff happens at the first scan after the leader
--- exits. In @expiry@ the relay ignores the termination signal, and the handoff
--- happens at the first scan after the cleanup has begun.
-handoffStage ∷ Fixture → String → IO [String]
-handoffStage fixture mode = do
+-- In @completion@ the handoffs begin at the first scan after the leader exits.
+-- In @expiry@ the relays ignore the termination signal and the handoffs begin
+-- at the first scan after the cleanup has started.
+handoffStage ∷ Fixture → String → Int → IO [String]
+handoffStage fixture mode handoffs = do
   (result, output, errors) ←
     run
       (environment fixture)
@@ -1881,42 +1893,48 @@ handoffStage fixture mode = do
       , unlines
           [ "import importlib.util, os, signal, sys, tempfile, time"
           , "sys.dont_write_bytecode = True"
-          , "path, root, mode = sys.argv[1:4]"
+          , "path, root, mode, handoffs = sys.argv[1:5]"
+          , "handoffs = int(handoffs)"
           , "specification = importlib.util.spec_from_file_location('runner_under_test', path)"
           , "runner = importlib.util.module_from_spec(specification)"
           , "specification.loader.exec_module(runner)"
-          , "leader = \"\"\""
+          , "runner.TERMINATION_GRACE_SECONDS = 1"
+          , "leader = '''"
           , "import os, signal, sys"
-          , "ready, go, result, mode = sys.argv[1:5]"
-          , "relay = os.fork()"
-          , "if relay == 0:"
-          , "    if mode == 'expiry':"
-          , "        signal.signal(signal.SIGTERM, signal.SIG_IGN)"
-          , "    with open(ready, 'w') as handle:"
-          , "        handle.write('ready')"
+          , "ready, go, result, mode, handoffs = sys.argv[1:6]"
+          , "def relay(remaining):"
           , "    with open(go) as handle:"
           , "        handle.read()"
           , "    replacement = os.fork()"
           , "    if replacement == 0:"
+          , "        if remaining > 1:"
+          , "            relay(remaining - 1)"
           , "        while True:"
           , "            signal.pause()"
           , "    with open(result, 'w') as handle:"
           , "        handle.write('%d %d' % (os.getpid(), replacement))"
           , "    os._exit(0)"
+          , "first = os.fork()"
+          , "if first == 0:"
+          , "    if mode == 'expiry':"
+          , "        signal.signal(signal.SIGTERM, signal.SIG_IGN)"
+          , "    with open(ready, 'w') as handle:"
+          , "        handle.write('ready')"
+          , "    relay(int(handoffs))"
           , "with open(ready) as handle:"
           , "    handle.read()"
-          , "\"\"\""
+          , "'''"
           , "scratch = tempfile.mkdtemp()"
           , "ready, go, result = (os.path.join(scratch, name) for name in ('ready', 'go', 'result'))"
           , "for fifo in (ready, go, result):"
           , "    os.mkfifo(fifo)"
-          , "state = {'armed': mode == 'completion', 'fired': False, 'replacement': None}"
+          , "state = {'armed': mode == 'completion', 'fired': 0, 'replacement': None}"
           , "listing = runner.process_table"
           , "def handing_off():"
           , "    table = listing()"
-          , "    if not state['armed'] or state['fired'] or table is None:"
+          , "    if not state['armed'] or state['fired'] >= handoffs or table is None:"
           , "        return table"
-          , "    state['fired'] = True"
+          , "    state['fired'] += 1"
           , "    with open(go, 'w') as handle:"
           , "        handle.write('go')"
           , "    with open(result) as handle:"
@@ -1938,9 +1956,8 @@ handoffStage fixture mode = do
           , "    return members"
           , "if mode == 'expiry':"
           , "    runner.signal_session = signalling_first"
-          , "replacement = None"
           , "try:"
-          , "    stage = runner.execute(['python3', '-c', leader, ready, go, result, mode], root, 1, dict(os.environ))"
+          , "    stage = runner.execute(['python3', '-c', leader, ready, go, result, mode, str(handoffs)], root, 1, dict(os.environ))"
           , "    replacement = state['replacement']"
           , "    gone = False"
           , "    patience = time.monotonic() + 5"
@@ -1964,6 +1981,64 @@ handoffStage fixture mode = do
       , tools fixture </> "run.py"
       , root fixture
       , mode
+      , show handoffs
+      ]
+  (result, errors) `shouldBe` (ExitSuccess, "")
+  pure (lines output)
+
+-- | Drive the real runner's stage execution against a chain of processes that
+-- fork their successor as fast as they can and exit, none answering the
+-- termination signal, and report the stage's outcome, whether cleanup killed
+-- anything, and whether the session was empty (confirmed the way the runner
+-- confirms it) once the stage returned. A watchdog that gave up would leave
+-- the chain running, so the driver ends it either way.
+breederStage ∷ Fixture → IO [String]
+breederStage fixture = do
+  (result, output, errors) ←
+    run
+      (environment fixture)
+      (root fixture)
+      "python3"
+      [ "-I"
+      , "-c"
+      , unlines
+          [ "import importlib.util, os, signal, sys, tempfile, time"
+          , "sys.dont_write_bytecode = True"
+          , "path, root = sys.argv[1:3]"
+          , "specification = importlib.util.spec_from_file_location('runner_under_test', path)"
+          , "runner = importlib.util.module_from_spec(specification)"
+          , "specification.loader.exec_module(runner)"
+          , "runner.TERMINATION_GRACE_SECONDS = 1"
+          , "leader = '''"
+          , "import os, signal, sys"
+          , "record = sys.argv[1]"
+          , "if os.fork() == 0:"
+          , "    signal.signal(signal.SIGTERM, signal.SIG_IGN)"
+          , "    while True:"
+          , "        if os.fork() != 0:"
+          , "            os._exit(0)"
+          , "with open(record, 'w') as handle:"
+          , "    handle.write(str(os.getpid()))"
+          , "'''"
+          , "scratch = tempfile.mkdtemp()"
+          , "record = os.path.join(scratch, 'session')"
+          , "try:"
+          , "    stage = runner.execute(['python3', '-c', leader, record], root, 1, dict(os.environ))"
+          , "    session = int(open(record).read())"
+          , "    members = runner.session_members(session)"
+          , "    print(stage['outcome'])"
+          , "    print(stage['expiry'] is not None and stage['expiry']['killed'])"
+          , "    print('empty' if members == set() else 'running')"
+          , "finally:"
+          , "    try:"
+          , "        session = int(open(record).read())"
+          , "        for pid in runner.observe_session(session) or ():"
+          , "            os.kill(pid, signal.SIGKILL)"
+          , "    except (OSError, ValueError):"
+          , "        pass"
+          ]
+      , tools fixture </> "run.py"
+      , root fixture
       ]
   (result, errors) `shouldBe` (ExitSuccess, "")
   pure (lines output)

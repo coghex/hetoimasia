@@ -201,9 +201,15 @@ def sanitize_git_environment() -> None:
 
 sanitize_git_environment()
 
-# How long a timed-out process group is given to exit on SIGTERM before it is
-# killed outright.
+# How long a timed-out stage is given to exit on SIGTERM before it is killed
+# outright.
 TERMINATION_GRACE_SECONDS = 10
+
+# How long freezing and then killing what survived the grace may take, and how
+# long an empty-looking session is given to produce a pass nothing was created
+# during, before it is reported as not known to be empty.
+KILLING_SECONDS = 10
+SETTLING_SECONDS = 2
 
 
 def timestamp() -> str:
@@ -680,21 +686,39 @@ def source_run_url() -> str:
     return f"{server}/{repository}/actions/runs/{run_id}/attempts/{attempt}"
 
 
-def process_table() -> list[tuple[int, str]] | None:
-    """Every process the platform lists, as its identifier and, where the
-    listing says, its state; ``None`` when the table cannot be read.
+def darwin_process_table() -> list[tuple[int, str]] | None:
+    """Every process, from libproc, with ``Z`` for those that have stopped.
 
-    This is the first half of observing a session — which processes exist — and
-    the second half asks each one which session it is in. The two are not one
-    atomic step, which is why :func:`session_members` does not trust a single
-    pass that finds nobody.
+    One call lists them, so a pass over the table is quick enough for
+    :func:`settled_observation` to find a quiet moment on a busy machine.
     """
-    if sys.platform.startswith("linux"):
-        try:
-            names = os.listdir("/proc")
-        except OSError:
+    try:
+        import ctypes
+
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib")
+        wanted = libproc.proc_listpids(1, 0, None, 0)  # PROC_ALL_PIDS
+        if wanted <= 0:
             return None
-        return [(int(name), "") for name in names if name.isdigit()]
+        pids = (ctypes.c_int * (wanted // 4 + 128))()
+        written = libproc.proc_listpids(1, 0, pids, ctypes.sizeof(pids))
+        if written <= 0:
+            return None
+        info = ctypes.create_string_buffer(256)
+        table: list[tuple[int, str]] = []
+        for pid in pids[: written // 4]:
+            if pid <= 0:
+                continue
+            # PROC_PIDTBSDINFO: the status follows the flags in struct proc_bsdinfo.
+            got = libproc.proc_pidinfo(pid, 3, 0, info, 256)
+            status = int.from_bytes(info.raw[4:8], "little") if got > 0 else 0
+            table.append((pid, "Z" if status == 5 else ""))  # SZOMB
+        return table
+    except (OSError, AttributeError):
+        return None
+
+
+def ps_process_table() -> list[tuple[int, str]] | None:
+    """The same, from ``ps``, where libproc is not to be had."""
     try:
         listing = subprocess.run(
             ["ps", "-A", "-o", "pid=,stat="],
@@ -717,6 +741,28 @@ def process_table() -> list[tuple[int, str]] | None:
         except ValueError:
             return None
     return table
+
+
+def process_table() -> list[tuple[int, str]] | None:
+    """Every process the platform lists, as its identifier and, where the
+    listing says, its state; ``None`` when the table cannot be read.
+
+    This is the first half of observing a session — which processes exist — and
+    the second half asks each one which session it is in. The two are not one
+    atomic step, which is why :func:`session_members` does not trust a pass
+    that finds nobody unless nothing was created during it.
+    """
+    if sys.platform.startswith("linux"):
+        try:
+            names = os.listdir("/proc")
+        except OSError:
+            return None
+        return [(int(name), "") for name in names if name.isdigit()]
+    if sys.platform == "darwin":
+        table = darwin_process_table()
+        if table is not None:
+            return table
+    return ps_process_table()
 
 
 def process_session(pid: int, state: str) -> tuple[int, str] | None:
@@ -769,6 +815,43 @@ def observe_session(session: int) -> set[int] | None:
     return members
 
 
+def newest_pid() -> int | None:
+    """The identifier of a process created and reaped just now.
+
+    Identifiers are handed out in sequence, so two of these taken one after the
+    other differ by exactly one when nothing else was created between them,
+    wherever on the machine and whether it was a process or a thread.
+    """
+    try:
+        pid = os.fork()
+    except OSError:
+        return None
+    if pid == 0:
+        os._exit(0)
+    try:
+        os.waitpid(pid, 0)
+    except OSError:
+        pass
+    return pid
+
+
+def settled_observation(session: int) -> tuple[set[int] | None, bool]:
+    """One pass, and whether no process was created while it ran.
+
+    A pass lists the processes and then asks each its session, so a member that
+    forks a replacement and exits in between is gone when asked while the
+    replacement was never listed. If nothing at all was created during a pass,
+    every process in the session at its end was already there when it began and
+    stayed throughout, so the listing holds it. The two processes bracketing the
+    pass say whether that held: consecutive identifiers mean nothing was created
+    between them.
+    """
+    before = newest_pid()
+    members = observe_session(session)
+    after = newest_pid()
+    return members, before is not None and after is not None and after == before + 1
+
+
 def session_members(session: int) -> set[int] | None:
     """Every live process in the stage's session, whichever group it is in.
 
@@ -776,17 +859,21 @@ def session_members(session: int) -> set[int] | None:
     command's own process id and no descendant can leave it without a ``setsid``
     of its own. ``None`` is *not knowing*: it is never an empty session.
 
-    A pass lists the processes and then asks each one its session, and a
-    process can fork a replacement and exit in between: the old one is gone
-    when asked and the new one was not yet listed, so that pass finds nobody in
-    a session that still has a member. Finding someone is reliable; finding
-    nobody is only believed when a second pass, which starts after the first has
-    ended, agrees — a replacement the first pass missed is listed by it.
+    Finding a member is reliable. Finding nobody is believed only from a pass
+    nothing was created during (:func:`settled_observation`), however many
+    passes that takes, bounded by ``SETTLING_SECONDS``: a fork-and-exit handoff
+    that hides a member from one pass is a creation, so it spoils that pass and
+    no count of passes can be beaten by a longer chain of them.
     """
     members = observe_session(session)
-    if members == set():
-        members = observe_session(session)
-    return members
+    if members != set():
+        return members
+    limit = time.monotonic() + SETTLING_SECONDS
+    while time.monotonic() < limit:
+        members, settled = settled_observation(session)
+        if members is None or members or settled:
+            return members
+    return None
 
 
 def stage_alive(session: int) -> bool:
@@ -843,6 +930,27 @@ def signal_session(
     return members
 
 
+def freeze_session(session: int, limit: float) -> None:
+    """Stop every member of the session where it stands, until none is new.
+
+    A stopped process cannot fork, so once a pass nothing was created during
+    finds only members already stopped, the session cannot grow and what is in
+    it can be killed in one sweep rather than chased. A session that cannot be
+    observed cannot be frozen, and is simply killed.
+    """
+    frozen: set[int] = set()
+    while time.monotonic() < limit:
+        members, settled = settled_observation(session)
+        if members is None:
+            return
+        fresh = members - frozen
+        for pid in sorted(fresh):
+            signal_member(pid, session, signal.SIGSTOP)
+        frozen |= fresh
+        if not fresh and settled:
+            return
+
+
 def terminate_session(process: subprocess.Popen, session: int, group: int | None) -> bool:
     """End the command and every descendant it started; say whether any was killed.
 
@@ -863,6 +971,8 @@ def terminate_session(process: subprocess.Popen, session: int, group: int | None
     the measurement, and nothing it reports can turn the expiry into a pass.
     Membership is asked again on every poll, so a process created during the
     grace period is told to stop too, and a survivor is never reported as gone.
+    What survives the grace is first stopped in place, so that nothing can keep
+    forking replacements faster than they are found, and then killed.
     """
     seen = signal_session(process, session, group, signal.SIGTERM) or set()
     grace = time.monotonic() + TERMINATION_GRACE_SECONDS
@@ -879,7 +989,8 @@ def terminate_session(process: subprocess.Popen, session: int, group: int | None
             signal_member(pid, session, signal.SIGTERM)
         seen |= members or set()
         time.sleep(TEARDOWN_POLL_SECONDS)
-    reach = time.monotonic() + TERMINATION_GRACE_SECONDS
+    reach = time.monotonic() + KILLING_SECONDS
+    freeze_session(session, reach)
     while True:
         members = signal_session(process, session, group, signal.SIGKILL)
         if process.poll() is not None and members == set():
