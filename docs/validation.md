@@ -1483,6 +1483,10 @@ signalled on their own — is still in it, so it holds the measurement open and 
 ended at expiry like any other. Membership is read from the kernel, from
 `/proc` on Linux and from `ps` with `getsid` on macOS, and asked again on every
 poll, so a process created during the grace period is told to stop as well.
+A pass lists the processes and then asks each one its session, so a member that
+forks a replacement and exits between the two is missed by that pass; finding
+nobody is therefore believed only when a second pass, begun after the first,
+agrees.
 Zombies are not members: they have already stopped, and their adopter reaps
 them. The runner signals a process only after confirming it is still in the
 stage's session, and never itself, so nothing outside the stage — unrelated user
