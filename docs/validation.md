@@ -1498,7 +1498,10 @@ as they are on Linux and macOS.
 What survives the grace period is first stopped in place — a stopped process
 cannot fork — and the stopping repeats until a pass nothing was created during
 finds no member that is not already stopped; only then is everything killed, so
-descendants that keep forking replacements cannot outrun the cleanup.
+descendants that keep forking replacements cannot outrun the cleanup. Every
+signal goes to each member's process group as well as to the member: a group
+signal reaches descendants that live too briefly to be signalled one by one, and
+a process group lies wholly inside one session, so it stays inside the stage.
 Zombies are not members: they have already stopped, and their adopter reaps
 them. The runner signals a process only after confirming it is still in the
 stage's session, and never itself, so nothing outside the stage — unrelated user
