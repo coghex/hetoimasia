@@ -213,6 +213,9 @@ SETTLING_SECONDS = 2
 # The most identifiers a pass's bracket may span and still have each asked
 # about directly.
 MAX_BRACKET = 4096
+# How long expiry cleanup waits for a pass during which nothing was created on
+# the machine, before it reports that it could not confirm the session empty.
+CONFIRMING_SECONDS = 10
 
 
 def timestamp() -> str:
@@ -878,6 +881,44 @@ def bracketed_observation(session: int) -> tuple[dict[int, int] | None, bool]:
     return members, True
 
 
+def strict_observation(session: int) -> tuple[dict[int, int] | None, bool]:
+    """One pass, and whether nothing was created anywhere while it ran.
+
+    If nothing at all was created during a pass, every process in the session at
+    its end was already there when it began and stayed throughout, so the
+    listing holds it, and an empty answer is exact. The two throwaway processes
+    bracketing the pass say whether that held: consecutive identifiers mean
+    nothing was created between them. Unrelated activity spoils it, which is why
+    only expiry cleanup, whose guarantee this serves, asks for it.
+    """
+    before = newest_pid()
+    members = observe_session(session)
+    after = newest_pid()
+    return members, before is not None and after is not None and after == before + 1
+
+
+def cleanup_observation(
+    session: int, limit: float
+) -> tuple[dict[int, int] | None, bool]:
+    """What is in the session, and whether that answer is exact.
+
+    A member found is reliable, so a pass that finds one answers at once. Finding
+    nobody is exact only from a pass nothing was created during
+    (:func:`strict_observation`), so passes are repeated until one is or
+    ``limit`` passes. A session that could not be read is ``(None, False)``; one
+    whose emptiness could not be confirmed in time is ``({}, False)``, and the
+    caller must not treat it as clean.
+    """
+    while True:
+        members, strict = strict_observation(session)
+        if members is None:
+            return None, False
+        if members or strict:
+            return members, True
+        if time.monotonic() >= limit:
+            return members, False
+
+
 def session_members(session: int) -> dict[int, int] | None:
     """Every live process in the stage's session, whichever group it is in.
 
@@ -1016,24 +1057,26 @@ def sweep_group(group: int | None) -> None:
         pass
 
 
-def freeze_session(session: int, group: int | None, limit: float) -> None:
+def freeze_session(session: int, group: int | None, limit: float) -> bool:
     """Stop every member of the session where it stands, until none is new.
 
-    A stopped process cannot fork, so once a bracketed pass finds only members
-    already stopped, the session cannot grow and what is in it can be killed in
-    one sweep rather than chased. A session that cannot be
-    observed cannot be frozen, and is simply killed.
+    A stopped process cannot fork, so once a pass nothing was created during
+    finds only members already stopped, the session cannot grow and what is in
+    it can be killed in one sweep rather than chased. Returns whether that fixed
+    point was reached before ``limit``; a session that cannot be observed cannot
+    be frozen and is simply killed.
     """
     frozen: set[int] = set()
     while time.monotonic() < limit:
-        members, complete = bracketed_observation(session)
+        members, strict = strict_observation(session)
         if members is None:
-            return
+            return False
         fresh = set(members) - frozen
         signal_members(members, session, signal.SIGSTOP, groups=True, initial=group)
         frozen |= fresh
-        if not fresh and complete:
-            return
+        if not fresh and strict:
+            return True
+    return False
 
 
 def terminate_session(process: subprocess.Popen, session: int, group: int | None) -> bool:
@@ -1055,36 +1098,54 @@ def terminate_session(process: subprocess.Popen, session: int, group: int | None
     can handle lets it retain them before it goes. That cleanup is not part of
     the measurement, and nothing it reports can turn the expiry into a pass.
     Membership is asked again on every poll, so a process created during the
-    grace period is told to stop too, and a survivor is never reported as gone.
-    What survives the grace is first stopped in place, so that nothing can keep
-    forking replacements faster than they are found, and then killed.
+    grace period is told to stop too, once, and a survivor is never reported as
+    gone. What survives the grace is first stopped in place, so that nothing can
+    keep forking replacements faster than they are found, and then killed.
+
+    The guarantee here is stronger than completion's. A session is believed empty
+    only from a pass during which nothing was created on the machine
+    (:func:`cleanup_observation`), so a replacement handed off while a pass was
+    running cannot hide a member; host activity only delays the confirmation.
+    The wait is capped, and when it runs out the cleanup is not reported clean:
+    it reports that it killed.
     """
-    seen = set(signal_session(process, session, group, signal.SIGTERM) or ())
+    delivered = signal_session(process, session, group, signal.SIGTERM)
+    seen = set(delivered or ())
+    # When the session could not be read, the signal went to the launch group
+    # and the launched process: everything in that group already created has
+    # been told, and must not be told again. Identifiers are handed out in
+    # sequence, so what is newer than this was created afterwards.
+    told = newest_pid() if delivered is None else None
     grace = time.monotonic() + TERMINATION_GRACE_SECONDS
     while True:
-        members = session_members(session)
+        members, confirmed = cleanup_observation(
+            session, min(grace, time.monotonic() + CONFIRMING_SECONDS)
+        )
         leader_exited = process.poll() is not None
         # The leader going is not the session going: its descendants get
         # whatever is left of the same grace before anything is killed.
-        if leader_exited and members == {}:
-            # Nothing was seen, which a chain of descendants that live for
-            # microseconds also looks like. Whatever is still in the group the
-            # command was launched in goes now, unreported: an observation that
-            # was right finds nothing there to signal.
+        if leader_exited and members == {} and confirmed:
             sweep_group(group)
             return False
         if time.monotonic() >= grace:
             break
-        fresh = set(members or ()) - seen
+        found = members or {}
+        if told is not None:
+            seen |= {pid for pid, home in found.items() if home == group and pid <= told}
+        fresh = set(found) - seen
         if fresh:
-            signal_members({pid: members[pid] for pid in fresh}, session, signal.SIGTERM)
+            signal_members({pid: found[pid] for pid in fresh}, session, signal.SIGTERM)
         seen |= fresh
         time.sleep(TEARDOWN_POLL_SECONDS)
     reach = time.monotonic() + KILLING_SECONDS
     freeze_session(session, group, reach)
     while True:
-        members = signal_session(process, session, group, signal.SIGKILL)
-        if process.poll() is not None and members == {}:
+        members, confirmed = cleanup_observation(session, reach)
+        if members:
+            signal_members(members, session, signal.SIGKILL, groups=True, initial=group)
+        elif members is None:
+            signal_session(process, session, group, signal.SIGKILL)
+        if process.poll() is not None and members == {} and confirmed:
             break
         if time.monotonic() >= reach:
             break
@@ -1092,6 +1153,7 @@ def terminate_session(process: subprocess.Popen, session: int, group: int | None
     if process.poll() is None:
         process.kill()
         process.wait()
+    sweep_group(group)
     return True
 
 

@@ -313,6 +313,27 @@ spec = describe "Validation execution" $ do
             then pendingWith "this machine has no ps to fall back on"
             else answer `shouldBe` ["passed", "True"]
 
+    forM_ [3, 5] $ \handoffs →
+      it ("still ends the last member at expiry when its replacement is handed off after the closing marker (" ++ show handoffs ++ " handoffs)") $
+        withFixture $ \fixture →
+          -- One handoff in a plain scan makes the session look empty, so the
+          -- next pass is a bracketed one; during it the member that scan lists
+          -- hands off after the listing, and its replacement hands off again
+          -- after the closing marker and before it is asked its session, all in
+          -- another process group than the command's. Completion accepts this
+          -- race; the cleanup that follows an expiry does not, so the last
+          -- replacement, which ignores the termination signal, must still be
+          -- found, killed and reported.
+          handoffStage fixture "expiry-late" handoffs `shouldReturn` ["timeout", "True", "gone"]
+
+    it "lets a termination handler finish when the first observation of the session failed" $
+      withFixture $ \fixture →
+        -- The first signal falls back to the launch group because the session
+        -- could not be read. The handler it reached is already told, and the
+        -- next successful observation must not tell it again; a second SIGTERM
+        -- would end it before it retained anything.
+        transientStage fixture `shouldReturn` ["timeout", "0", "cleaned", "False"]
+
     it "empties a session of descendants that keep forking replacements" $
       withFixture $ \fixture →
         -- A chain of processes, each exiting as soon as it has forked the
@@ -1863,9 +1884,10 @@ watchdogStage fixture mode = do
       [ "-I"
       , "-c"
       , unlines
-          [ "import importlib.util, os, sys, time"
+          [ "import importlib.util, os, signal, sys, time"
           , "# Loading the runner by path must not leave its bytecode in the checkout."
           , "sys.dont_write_bytecode = True"
+          , "signal.alarm(120)"
           , "path, root, mode = sys.argv[1:4]"
           , "specification = importlib.util.spec_from_file_location('runner_under_test', path)"
           , "runner = importlib.util.module_from_spec(specification)"
@@ -1922,6 +1944,7 @@ handoffStage fixture mode handoffs = do
       , unlines
           [ "import importlib.util, os, signal, sys, tempfile, time"
           , "sys.dont_write_bytecode = True"
+          , "signal.alarm(120)"
           , "path, root, mode, handoffs = sys.argv[1:5]"
           , "handoffs = int(handoffs)"
           , "specification = importlib.util.spec_from_file_location('runner_under_test', path)"
@@ -1935,12 +1958,14 @@ handoffStage fixture mode handoffs = do
           , "os.dup2(null, 1)"
           , "os.dup2(null, 2)"
           , "def relay(remaining):"
+          , "    signal.alarm(150)"
           , "    with open(go) as handle:"
           , "        handle.read()"
           , "    replacement = os.fork()"
           , "    if replacement == 0:"
           , "        if remaining > 1:"
           , "            relay(remaining - 1)"
+          , "        signal.alarm(150)"
           , "        while True:"
           , "            signal.pause()"
           , "    with open(result, 'w') as handle:"
@@ -1948,7 +1973,8 @@ handoffStage fixture mode handoffs = do
           , "    os._exit(0)"
           , "first = os.fork()"
           , "if first == 0:"
-          , "    if mode == 'expiry':"
+          , "    os.setpgid(0, 0)"
+          , "    if mode.startswith('expiry'):"
           , "        signal.signal(signal.SIGTERM, signal.SIG_IGN)"
           , "    with open(ready, 'w') as handle:"
           , "        handle.write('ready')"
@@ -1960,33 +1986,54 @@ handoffStage fixture mode handoffs = do
           , "ready, go, result = (os.path.join(scratch, name) for name in ('ready', 'go', 'result'))"
           , "for fifo in (ready, go, result):"
           , "    os.mkfifo(fifo)"
-          , "state = {'armed': mode == 'completion', 'fired': 0, 'replacement': None}"
+          , "# expiry-late: one handoff in a plain pass (the session looks empty), then,"
+          , "# in the bracketed pass that follows, one while it lists and one after"
+          , "# its closing marker, so the last replacement is created past the bracket."
+          , "late = (['plain'] + ['table', 'close'] * handoffs)[:handoffs]"
+          , "events = late if mode == 'expiry-late' else ['plain'] * handoffs"
+          , "state = {'armed': mode == 'completion', 'next': 0, 'replacement': None, 'opened': False}"
           , "listing = runner.process_table"
-          , "def handing_off():"
-          , "    table = listing()"
-          , "    if not state['armed'] or state['fired'] >= handoffs or table is None:"
-          , "        return table"
-          , "    state['fired'] += 1"
+          , "def release():"
+          , "    state['next'] += 1"
           , "    with open(go, 'w') as handle:"
           , "        handle.write('go')"
           , "    with open(result) as handle:"
           , "        relay, replacement = map(int, handle.read().split())"
           , "    state['replacement'] = replacement"
-          , "    # The relay has gone before the stale listing is returned."
+          , "    # The relay has gone before the pass goes on."
           , "    patience = time.monotonic() + 10"
           , "    while time.monotonic() < patience:"
           , "        found = runner.process_session(relay, '')"
           , "        if found is None or found[1][:1] in ('Z', 'X'):"
           , "            break"
           , "        time.sleep(0.01)"
+          , "def due(kind):"
+          , "    return state['armed'] and state['next'] < len(events) and events[state['next']] == kind"
+          , "def handing_off():"
+          , "    table = listing()"
+          , "    if table is not None and due('plain'):"
+          , "        release()"
+          , "    elif table is not None and state['opened'] and due('table'):"
+          , "        release()"
           , "    return table"
           , "runner.process_table = handing_off"
+          , "marker = runner.newest_pid"
+          , "def marking():"
+          , "    pid = marker()"
+          , "    # Markers come in pairs around a pass; the second closes it. A"
+          , "    # close event hands off right after the closing marker, before"
+          , "    # any process the pass listed is asked its session."
+          , "    if state['opened'] and due('close'):"
+          , "        release()"
+          , "    state['opened'] = not state['opened']"
+          , "    return pid"
+          , "runner.newest_pid = marking"
           , "signalling = runner.signal_session"
           , "def signalling_first(*arguments):"
           , "    members = signalling(*arguments)"
           , "    state['armed'] = True"
           , "    return members"
-          , "if mode == 'expiry':"
+          , "if mode.startswith('expiry'):"
           , "    runner.signal_session = signalling_first"
           , "try:"
           , "    stage = runner.execute(['python3', '-c', leader, ready, go, result, mode, str(handoffs)], root, 1, dict(os.environ))"
@@ -2018,6 +2065,63 @@ handoffStage fixture mode handoffs = do
   (result, errors) `shouldBe` (ExitSuccess, "")
   pure (lines output)
 
+-- | Drive the real runner's stage execution of a termination handler that
+-- resets @SIGTERM@ to its default and runs a cleanup subprocess before it
+-- retains its evidence, with the first observation of the session failing.
+-- Reports the outcome, the exit status the handler reached, what it retained
+-- and whether cleanup reported killing.
+transientStage ∷ Fixture → IO [String]
+transientStage fixture = do
+  (result, output, errors) ←
+    run
+      (environment fixture)
+      (root fixture)
+      "python3"
+      [ "-I"
+      , "-c"
+      , unlines
+          [ "import importlib.util, os, signal, sys, tempfile"
+          , "sys.dont_write_bytecode = True"
+          , "signal.alarm(120)"
+          , "path, root = sys.argv[1:3]"
+          , "specification = importlib.util.spec_from_file_location('runner_under_test', path)"
+          , "runner = importlib.util.module_from_spec(specification)"
+          , "specification.loader.exec_module(runner)"
+          , "runner.TERMINATION_GRACE_SECONDS = 5"
+          , "evidence = tempfile.mkdtemp()"
+          , "environment = dict(os.environ, HETOIMASIA_VALIDATION_EVIDENCE=evidence)"
+          , "handler = '''"
+          , "import os, signal, subprocess, sys"
+          , "evidence = os.environ['HETOIMASIA_VALIDATION_EVIDENCE']"
+          , "def handler(number, frame):"
+          , "    signal.signal(signal.SIGTERM, signal.SIG_DFL)"
+          , "    subprocess.run(['sleep', '0.3'])"
+          , "    with open(evidence + '/cleaned', 'w') as record:"
+          , "        record.write('cleaned')"
+          , "    sys.exit(0)"
+          , "signal.signal(signal.SIGTERM, handler)"
+          , "while True:"
+          , "    signal.pause()"
+          , "'''"
+          , "real = runner.session_members"
+          , "calls = []"
+          , "def flaky(session):"
+          , "    calls.append(session)"
+          , "    return None if len(calls) == 1 else real(session)"
+          , "runner.session_members = flaky"
+          , "stage = runner.execute(['python3', '-c', handler], root, 1, environment)"
+          , "kept = os.path.join(evidence, 'cleaned')"
+          , "print(stage['outcome'])"
+          , "print(stage['exit_status'])"
+          , "print(open(kept).read() if os.path.exists(kept) else 'missing')"
+          , "print(stage['expiry']['killed'])"
+          ]
+      , tools fixture </> "run.py"
+      , root fixture
+      ]
+  (result, errors) `shouldBe` (ExitSuccess, "")
+  pure (lines output)
+
 -- | Drive the real runner's stage execution of a command that exits at once
 -- while a process outside the stage creates and reaps children in a tight loop,
 -- and report the stage's outcome and whether it was measured as finishing well
@@ -2037,6 +2141,7 @@ churnStage fixture mode = do
       , unlines
           [ "import importlib.util, os, shutil, signal, subprocess, sys"
           , "sys.dont_write_bytecode = True"
+          , "signal.alarm(120)"
           , "path, root, mode = sys.argv[1:4]"
           , "specification = importlib.util.spec_from_file_location('runner_under_test', path)"
           , "runner = importlib.util.module_from_spec(specification)"
@@ -2092,6 +2197,7 @@ breederStage fixture = do
       , unlines
           [ "import importlib.util, os, signal, sys, tempfile, time"
           , "sys.dont_write_bytecode = True"
+          , "signal.alarm(120)"
           , "path, root = sys.argv[1:3]"
           , "specification = importlib.util.spec_from_file_location('runner_under_test', path)"
           , "runner = importlib.util.module_from_spec(specification)"
@@ -2106,6 +2212,7 @@ breederStage fixture = do
           , "if os.fork() == 0:"
           , "    signal.signal(signal.SIGTERM, signal.SIG_IGN)"
           , "    while True:"
+          , "        signal.alarm(150)"
           , "        if os.fork() != 0:"
           , "            time.sleep(0.005)"
           , "            os._exit(0)"
