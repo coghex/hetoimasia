@@ -1451,19 +1451,25 @@ no later run can attribute is not reusable evidence.
 
 `outcome` is `passed`, `failed`, or `timeout`. A timeout is distinct because an
 exhausted budget and a disagreeing test are different obstacles. The runner
-gives the command its own session, and so its own process group, and ends every
-process left in that **session** on timeout, so a backgrounded build server or
-test child cannot outlive the budget it was launched under, whichever process
-group it moved into. Liveness is asked of the session, never inferred from the
-process the runner launched: a descendant that ignores `SIGTERM` keeps running
-after the shell that started it has gone, so anything still there once the grace
-period expires is killed outright. The runner exits `0` when the group passed,
+gives the command its own session, and so its own process group. On timeout it
+tells the group the command was launched in, every member it observes in that
+**session** and every process group any of them is observed in to terminate, and
+then kills them, so a backgrounded build server or test child cannot outlive the
+budget it was launched under, whichever process group it moved into. Liveness is
+asked of the session, never inferred from the process the runner launched: a
+descendant that ignores `SIGTERM` keeps running after the shell that started it
+has gone, so what is still there once the grace period expires is killed
+outright. The runner exits `0` when the group passed,
 `1` when it failed or timed out — the receipt is still written — and `2` for a
 diagnostic that prevented any execution.
-A descendant that hands off to a replacement faster than completion's membership
-query can follow can make the stage look finished early, so `duration_seconds`
-and `outcome` of such a stage describe what was observed, not a proof that
-nothing ran on (see "Preparation and the watchdog" for the exact residual).
+Two residuals bound what the watchdog promises, and both are stated under
+"Preparation and the watchdog". A descendant that hands off to a replacement
+faster than completion's membership query can follow can make a stage look
+finished early, so `duration_seconds` and `outcome` of such a stage describe what
+was observed, not a proof that nothing ran on. And a descendant that keeps
+handing off into fresh process groups faster than they are observed can survive
+expiry cleanup, which is why a cleanup that could not confirm the session empty
+within its cap reports `killed: true` rather than a clean exit.
 
 #### Preparation and the watchdog
 
@@ -1476,9 +1482,10 @@ until its deadline, whichever comes first. A command whose leader exits while
 something it started is still running has not finished its teardown, so the
 runner keeps measuring, and a teardown that never finishes expires the deadline
 like a stalled setup does. At expiry the runner signals every process in the
-stage's session with `SIGTERM` first, so a command that keeps its diagnostics in
-its own cleanup — the display helper's server log, say — can retain them, then
-kills whatever survives the grace period.
+stage's session that it observes, and the group it was launched in, with
+`SIGTERM` first, so a command that keeps its diagnostics in its own cleanup — the
+display helper's server log, say — can retain them, then kills what survives the
+grace period, as the cleanup guarantee below states.
 
 The boundary is the **session**, which the runner creates for the stage and
 whose identifier is the command's own process id. A descendant that moves into
@@ -1515,43 +1522,65 @@ shorter than the time the descendant actually ran, and the descendant is left
 running unreported. A descendant that does this on every generation within
 microseconds is the pathological case. Only completion is weakened this way.
 
-**Expiry cleanup has its own, separate guarantee, and it is not weakened.**
-Cleanup never believes an empty session from the pass completion believes. It
-believes it only from a pass during which nothing at all was created on the
-machine — the two throwaway processes bracketing the pass have consecutive
-identifiers — because then every process in the session at the end of the pass
-was already there when it began and was listed, so a replacement handed off
-while the pass ran cannot hide a member. A pass spoiled by an unrelated creation
-is repeated, for at most ten seconds; host activity therefore only delays the
-confirmation. If the cap runs out first, cleanup is not reported clean: it
-reports that it killed. A member found is acted on at once, however the pass
-went. What survives the grace period is first stopped in place — a stopped
-process cannot fork — and the stopping repeats, each time signalling every member
-found and the group the command was launched in whether or not anyone was found
-in it, until a strict pass finds no member that is not already stopped; only then
-is everything killed, and the killing repeats until a strict pass finds the
-session empty or ten seconds have passed. A final sweep kills whatever remains in
-the launch group before cleanup returns. Every signal except `SIGTERM` goes to
-each member's process group as well as to the member: a group signal reaches
-descendants that live too briefly to be signalled one by one, and a process
-group lies wholly inside one session, so it stays inside the stage. `SIGTERM`
-goes individually, once, to each process, found at expiry or during the grace
-period: a handler that resets the disposition and runs a cleanup child must not
-be signalled again. When the session could not be read at the first signal, the
-signal goes to the launch group and the launched process instead, and everything
-in that group older than the delivery counts as told, so recovering the
-observation does not tell it again while descendants created afterwards still
-are.
+**Expiry cleanup has its own, separate guarantee (owner decision on #370,
+requirement 2, narrowing it).** At expiry the runner sends `SIGTERM`, waits the
+grace period, and then stops and kills the group the command was launched in,
+**every member it observed in the stage's session, and every process group any
+of those members was observed in**, repeating until it reaches a fixed point or
+its cap. A group is remembered from the pass that found someone in it and is
+signalled again whether or not a later pass finds anyone there, because
+descendants that hand off into one another faster than a pass can list them
+still live in a group that is known, and a group signal reaches whichever of
+them is alive. This is not a guarantee about every surviving process in the
+session. **The expiry residual:** a descendant that keeps handing off into fresh
+process groups faster than observation finds them may survive cleanup. It is
+distinct from the completion residual above. Cleanup does not borrow completion's
+weaker check:
+
+- It believes an empty session only from a pass during which nothing at all was
+  created on the machine — the two throwaway processes bracketing the pass have
+  consecutive identifiers, discounting the processes the observer itself starts,
+  such as the `ps` of the fallback — because then every process in the session at
+  the end of the pass was already there when it began and was listed. A pass
+  spoiled by an unrelated creation is repeated, for at most ten seconds; host
+  activity only delays the confirmation. A member found is acted on at once.
+- What survives the grace period is first stopped in place — a stopped process
+  cannot fork — and the stopping repeats, signalling every remembered group and
+  every member found, until a strict pass finds no member that is not already
+  stopped. Only then is everything killed, and the killing repeats until a
+  strict pass finds the session empty or ten seconds have passed.
+- **If the cap runs out before the session is confirmed empty — including when
+  observation was uncertain throughout — cleanup is not reported clean: it
+  returns `killed: true`**, the outcome stays `timeout`, `cleanup_seconds` is
+  recorded apart from `duration_seconds`, and the runner returns within its
+  bound. `killed: true` therefore means that something was killed or that the
+  runner could not confirm nothing needed to be.
+- `SIGTERM` is the one signal that is never repeated to a process: it goes
+  individually, once, to each process found at expiry and to each process created
+  in the grace period, because a handler that resets the disposition and runs a
+  cleanup child must not be signalled again. The processes told are tracked by
+  identifier, exactly, so one that changes its process group while it cleans up
+  is not told again and one created after the first signal is still told. When
+  the session could not be read at the first signal, it is asked again for up to
+  a second, and failing that only the launched process is told; the rest are told
+  when they are first observed.
+- Every other signal also goes to each remembered group. A process group lies
+  wholly inside one session, so signalling it stays inside the stage; a group
+  whose first process is still alive is signalled only if that process is in the
+  session.
+
 Zombies are not members: they have already stopped, and their adopter reaps
 them. The runner signals an individual process only after confirming it is still
 in the stage's session, and never itself, so nothing outside the stage —
 unrelated user processes included — is reached. A session that cannot be read is
 not an empty one: the stage is treated as still running, so it expires instead
-of passing, and expiry falls back to signalling the command's own process group.
+of passing, and expiry's kill falls back to signalling the command's own process
+group and every remembered one.
 
 What this cannot follow is a descendant that starts a session of its own with
 `setsid`. It leaves the stage's session, so it neither holds a measurement open
-nor is signalled at expiry; a command that starts one owns ending it.
+nor is signalled at expiry; a command that starts one owns ending it. Nothing
+outside the stage's session is ever signalled.
 
 That cleanup is recorded as `expiry` —
 `{"expired_at", "cleanup_seconds", "killed"}` — and never counted in
