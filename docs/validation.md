@@ -1515,20 +1515,33 @@ shorter than the time the descendant actually ran, and the descendant is left
 running unreported. A descendant that does this on every generation within
 microseconds is the pathological case. Only completion is weakened this way.
 
-**Expiry cleanup has its own, separate guarantee.** What survives the grace
-period is first stopped in place — a stopped process cannot fork — and the
-stopping repeats, each time signalling every member found and the group the
-command was launched in whether or not anyone was found in it, until a bracketed
-pass finds no member that is not already stopped; only then is everything killed,
-and the killing repeats until the session is observed empty or ten seconds have
-passed. A final sweep kills whatever remains in the launch group before cleanup
-reports nothing to do. Every signal except the first `SIGTERM` goes to each
-member's process group as well as to the member: a group signal reaches
+**Expiry cleanup has its own, separate guarantee, and it is not weakened.**
+Cleanup never believes an empty session from the pass completion believes. It
+believes it only from a pass during which nothing at all was created on the
+machine — the two throwaway processes bracketing the pass have consecutive
+identifiers — because then every process in the session at the end of the pass
+was already there when it began and was listed, so a replacement handed off
+while the pass ran cannot hide a member. A pass spoiled by an unrelated creation
+is repeated, for at most ten seconds; host activity therefore only delays the
+confirmation. If the cap runs out first, cleanup is not reported clean: it
+reports that it killed. A member found is acted on at once, however the pass
+went. What survives the grace period is first stopped in place — a stopped
+process cannot fork — and the stopping repeats, each time signalling every member
+found and the group the command was launched in whether or not anyone was found
+in it, until a strict pass finds no member that is not already stopped; only then
+is everything killed, and the killing repeats until a strict pass finds the
+session empty or ten seconds have passed. A final sweep kills whatever remains in
+the launch group before cleanup returns. Every signal except `SIGTERM` goes to
+each member's process group as well as to the member: a group signal reaches
 descendants that live too briefly to be signalled one by one, and a process
 group lies wholly inside one session, so it stays inside the stage. `SIGTERM`
-itself goes individually, once, to each process, found at expiry or during the
-grace period: a handler that resets the disposition and runs a cleanup child
-must not be signalled again.
+goes individually, once, to each process, found at expiry or during the grace
+period: a handler that resets the disposition and runs a cleanup child must not
+be signalled again. When the session could not be read at the first signal, the
+signal goes to the launch group and the launched process instead, and everything
+in that group older than the delivery counts as told, so recovering the
+observation does not tell it again while descendants created afterwards still
+are.
 Zombies are not members: they have already stopped, and their adopter reaps
 them. The runner signals an individual process only after confirming it is still
 in the stage's session, and never itself, so nothing outside the stage —
