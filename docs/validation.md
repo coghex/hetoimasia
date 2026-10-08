@@ -1484,9 +1484,21 @@ ended at expiry like any other. Membership is read from the kernel, from
 `/proc` on Linux and from `ps` with `getsid` on macOS, and asked again on every
 poll, so a process created during the grace period is told to stop as well.
 A pass lists the processes and then asks each one its session, so a member that
-forks a replacement and exits between the two is missed by that pass; finding
-nobody is therefore believed only when a second pass, begun after the first,
-agrees.
+forks a replacement and exits between the two is missed by that pass, however
+many passes there are. Finding a member is reliable; finding nobody is believed
+only from a pass during which nothing at all was created on the machine, because
+then every process in the session at the end of the pass was already there when
+it began and was listed. The runner knows by bracketing the pass with two
+throwaway child processes: process identifiers are handed out in sequence, so
+consecutive ones mean nothing was created between them. A pass that was spoiled
+by a creation is repeated, for at most two seconds; a session that never gives a
+clean pass is reported as not known to be empty, which, like an unreadable one,
+holds the stage open. This relies on identifiers being allocated sequentially,
+as they are on Linux and macOS.
+What survives the grace period is first stopped in place — a stopped process
+cannot fork — and the stopping repeats until a pass nothing was created during
+finds no member that is not already stopped; only then is everything killed, so
+descendants that keep forking replacements cannot outrun the cleanup.
 Zombies are not members: they have already stopped, and their adopter reaps
 them. The runner signals a process only after confirming it is still in the
 stage's session, and never itself, so nothing outside the stage — unrelated user
