@@ -1460,6 +1460,10 @@ after the shell that started it has gone, so anything still there once the grace
 period expires is killed outright. The runner exits `0` when the group passed,
 `1` when it failed or timed out — the receipt is still written — and `2` for a
 diagnostic that prevented any execution.
+A descendant that hands off to a replacement faster than completion's membership
+query can follow can make the stage look finished early, so `duration_seconds`
+and `outcome` of such a stage describe what was observed, not a proof that
+nothing ran on (see "Preparation and the watchdog" for the exact residual).
 
 #### Preparation and the watchdog
 
@@ -1484,30 +1488,53 @@ ended at expiry like any other. Membership is read from the kernel, from
 `/proc` on Linux and from `ps` with `getsid` on macOS, and asked again on every
 poll, so a process created during the grace period is told to stop as well.
 A pass lists the processes and then asks each one its session, so a member that
-forks a replacement and exits between the two is missed by that pass, however
-many passes there are. Finding a member is reliable; finding nobody is believed
-only from a pass during which nothing at all was created on the machine, because
-then every process in the session at the end of the pass was already there when
-it began and was listed. The runner knows by bracketing the pass with two
-throwaway child processes: process identifiers are handed out in sequence, so
-consecutive ones mean nothing was created between them. A pass that was spoiled
-by a creation is repeated, for at most two seconds; a session that never gives a
-clean pass is reported as not known to be empty, which, like an unreadable one,
-holds the stage open. This relies on identifiers being allocated sequentially,
-as they are on Linux and macOS.
-What survives the grace period is first stopped in place — a stopped process
-cannot fork — and the stopping repeats until a pass nothing was created during
-finds no member that is not already stopped; only then is everything killed, so
-descendants that keep forking replacements cannot outrun the cleanup. Every
-signal goes to each member's process group as well as to the member: a group
-signal reaches descendants that live too briefly to be signalled one by one, and
-a process group lies wholly inside one session, so it stays inside the stage.
+forks a replacement and exits between the two would be missed by that pass.
+Finding a member is reliable; finding nobody is believed only from a pass whose
+bracket held. The runner brackets the pass with two throwaway child processes.
+Process identifiers are handed out in sequence, so every process created while
+the pass ran — by a member or by anything else on the machine — holds an
+identifier between theirs, and each of those is asked its session directly,
+listed or not. Unrelated activity is therefore only more identifiers to ask
+about; it neither spoils a pass nor delays completion, and the `ps` fallback's
+own subprocess is one more such identifier. A pass is repeated, for at most two
+seconds, when its bracket cannot be trusted (identifiers wrapped, a marker could
+not be made, or more than 4096 were created); a session that never gives a
+trustworthy pass is reported as not known to be empty, which, like an
+unreadable one, holds the stage open. This relies on identifiers being
+allocated sequentially, as they are on Linux and macOS.
+
+**What this does not guarantee (owner decision on #370, requirement 1).**
+Completion is believed from that pass, not proved. The residual race is a
+same-session member that is alive at the closing marker, forks a replacement
+after it, and exits before its own membership query: the replacement holds an
+identifier past the bracket and nothing asked about it. The pass then reports an
+empty session while a member runs. The effect is on completion and on the
+measurement: the stage can be reported finished early — as `passed`, or as
+`failed` by the exit status the leader reported — with `duration_seconds`
+shorter than the time the descendant actually ran, and the descendant is left
+running unreported. A descendant that does this on every generation within
+microseconds is the pathological case. Only completion is weakened this way.
+
+**Expiry cleanup has its own, separate guarantee.** What survives the grace
+period is first stopped in place — a stopped process cannot fork — and the
+stopping repeats, each time signalling every member found and the group the
+command was launched in whether or not anyone was found in it, until a bracketed
+pass finds no member that is not already stopped; only then is everything killed,
+and the killing repeats until the session is observed empty or ten seconds have
+passed. A final sweep kills whatever remains in the launch group before cleanup
+reports nothing to do. Every signal except the first `SIGTERM` goes to each
+member's process group as well as to the member: a group signal reaches
+descendants that live too briefly to be signalled one by one, and a process
+group lies wholly inside one session, so it stays inside the stage. `SIGTERM`
+itself goes individually, once, to each process, found at expiry or during the
+grace period: a handler that resets the disposition and runs a cleanup child
+must not be signalled again.
 Zombies are not members: they have already stopped, and their adopter reaps
-them. The runner signals a process only after confirming it is still in the
-stage's session, and never itself, so nothing outside the stage — unrelated user
-processes included — is reached. A session that cannot be read is not an empty
-one: the stage is treated as still running, so it expires instead of passing,
-and expiry falls back to signalling the command's own process group.
+them. The runner signals an individual process only after confirming it is still
+in the stage's session, and never itself, so nothing outside the stage —
+unrelated user processes included — is reached. A session that cannot be read is
+not an empty one: the stage is treated as still running, so it expires instead
+of passing, and expiry falls back to signalling the command's own process group.
 
 What this cannot follow is a descendant that starts a session of its own with
 `setsid`. It leaves the stage's session, so it neither holds a measurement open
