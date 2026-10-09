@@ -1454,7 +1454,8 @@ exhausted budget and a disagreeing test are different obstacles. The runner
 gives the command its own session, and so its own process group. On timeout it
 tells the group the command was launched in, every member it observes in that
 **session** and every process group any of them is observed in to terminate, and
-then kills them, so a backgrounded build server or test child cannot outlive the
+then kills them — each observed process by its own identifier, wherever it has
+moved since — so a backgrounded build server or test child cannot outlive the
 budget it was launched under, whichever process group it moved into. Liveness is
 asked of the session, never inferred from the process the runner launched: a
 descendant that ignores `SIGTERM` keeps running after the shell that started it
@@ -1531,7 +1532,10 @@ its cap. A group is remembered from the pass that found someone in it and is
 signalled again whether or not a later pass finds anyone there, because
 descendants that hand off into one another faster than a pass can list them
 still live in a group that is known, and a group signal reaches whichever of
-them is alive. This is not a guarantee about every surviving process in the
+them is alive. A process is remembered the same way, by its identifier, and is
+signalled again by that identifier whether or not a later pass sees it — which
+is what reaches a descendant that was observed, then moved into a process group
+of its own, when observation has since become unavailable. This is not a guarantee about every surviving process in the
 session. **The expiry residual:** a descendant that keeps handing off into fresh
 process groups faster than observation finds them may survive cleanup. It is
 distinct from the completion residual above. Cleanup does not borrow completion's
@@ -1545,8 +1549,8 @@ weaker check:
   spoiled by an unrelated creation is repeated, for at most ten seconds; host
   activity only delays the confirmation. A member found is acted on at once.
 - What survives the grace period is first stopped in place — a stopped process
-  cannot fork — and the stopping repeats, signalling every remembered group and
-  every member found, until a strict pass finds no member that is not already
+  cannot fork — and the stopping repeats, signalling every remembered group,
+  every remembered process and every member found, until a strict pass finds no member that is not already
   stopped. Only then is everything killed, and the killing repeats until a
   strict pass finds the session empty or ten seconds have passed.
 - **If the cap runs out before the session is confirmed empty — including when
@@ -1561,13 +1565,23 @@ weaker check:
   cleanup child must not be signalled again. The processes told are tracked by
   identifier, exactly, so one that changes its process group while it cleans up
   is not told again and one created after the first signal is still told. When
-  the session could not be read at the first signal, it is asked again for up to
-  a second, and failing that only the launched process is told; the rest are told
-  when they are first observed.
-- Every other signal also goes to each remembered group. A process group lies
-  wholly inside one session, so signalling it stays inside the stage; a group
-  whose first process is still alive is signalled only if that process is in the
-  session.
+  the session could not be read at the first signal, it is asked again for one
+  second of elapsed time — not a count of attempts — and failing that only the
+  launched process is told; the rest are told when they are first observed.
+- Every other signal also goes to each remembered group and each remembered
+  process. A process group lies wholly inside one session, so signalling it stays
+  inside the stage; a group whose first process is still alive is signalled only
+  if that process is in the session. A remembered process is asked its session
+  immediately before every `SIGSTOP` and `SIGKILL`, and is signalled only if it is
+  still in the stage's: an identifier that has gone, or been reused outside the
+  stage, is not reached.
+- **No observation outlasts the deadline of whoever asked.** The `ps` fallback is
+  killed when its caller's remaining time runs out, and none is started once it
+  has: the first termination's one second, the cleanup passes' own caps and the
+  stage's own deadline each bound the observations made inside them, instead of
+  each observation having thirty seconds of its own. A table that could not be
+  read in time is not knowing — never an empty session — so the stage expires,
+  cleanup falls back to what it remembers, and the cap rules above apply.
 
 Zombies are not members: they have already stopped, and their adopter reaps
 them. The runner signals an individual process only after confirming it is still
