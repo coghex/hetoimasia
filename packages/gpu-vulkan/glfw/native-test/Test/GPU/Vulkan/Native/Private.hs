@@ -96,6 +96,13 @@
 --   oracle, and the atlas's slot reused only once the delayed frame
 --   completes, written as PNGs and a record under the validation runner's
 --   evidence directory (#346);
+-- * @grs10-scene3d@ — the same device start with no window, then the scene3d
+--   sample's window-free evidence (GRS-10): two flat-coloured cubes drawn with
+--   a depth test from two camera poses into a colour target and a depth
+--   target, each pose read back after completion, checked against the
+--   sample's independent oracle — the nearer cube, drawn first, showing where
+--   the cubes overlap — and written as a lossless PNG a pose and a probe
+--   record under the validation runner's evidence directory (#349);
 -- * @grs14-table-growth@ — the same device start with no window, then a
 --   texture table of five slots at most, two at first, grown twice by
 --   registration; a batch recorded before a growth and submitted after it,
@@ -408,6 +415,14 @@ scenarios =
       $ \consent journal _ → do
         outcome ← SurfaceFree.runSwap (consentBackend consent) journal
         pure (SurfaceFree.swapSpec outcome, section "The GRS-9 texture swap evidence record" (SurfaceFree.swapSection outcome))
+  , Scenario
+      "grs10-scene3d"
+      "draws the scene3d sample's two flat-coloured cubes with a depth test from two camera poses into a colour target and a depth target in frame-less batches of a surface-free session, reads each pose back after completion, passes every probe of the independent oracle — the nearer cube, drawn first, showing where the cubes overlap — and writes a lossless PNG a pose and a probe record, with validation reporting nothing"
+      False
+      Nothing
+      $ \consent journal _ → do
+        outcome ← SurfaceFree.runScene3d (consentBackend consent) journal
+        pure (SurfaceFree.scene3dSpec outcome, section "The GRS-10 scene3d evidence record" (SurfaceFree.scene3dSection outcome))
   , Scenario
       "grs14-table-growth"
       "grows the texture table of a surface-free session twice to a cap that is no power of two, samples correctly from a batch recorded before a growth and submitted after it, draws textures registered before and after growth with a pipeline built before it, and answers backpressure at the cap, with validation reporting nothing"

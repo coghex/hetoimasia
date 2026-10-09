@@ -24,6 +24,8 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Construction
   , createPipelineLayoutWith
   , createPipeline
   , createPipelineWith
+  , createPipelineWithDepth
+  , selectDepthFormat
   , replacePipeline
   , replacePipelineWith
   , checkedRanges
@@ -32,6 +34,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Construction
   , createPipelineLayoutFor
   , createCheckedPipeline
   , createBlendedCheckedPipeline
+  , createDepthCheckedPipeline
   , replaceCheckedPipeline
   , createRing
   , createFrameStorage
@@ -89,9 +92,12 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Allocation
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   ( BufferDescription (..)
   , ImageDescription (..)
+  , ImageFormat (..)
+  , ImageKind (DepthTarget)
   , ImageLimits (..)
   , ImageQuery (..)
   , ImageUse (..)
+  , PipelineDepth (..)
   , PipelineRequest (..)
   , PipelineBlend (..)
   , PipelineShaders (..)
@@ -107,6 +113,8 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   , ViewRequest (..)
   , BufferKind (InstanceBuffer, StagingBuffer)
   , bufferKindUse
+  , depthFormatPreference
+  , depthImageQuery
   , noVertexInput
   , vertexFormatBytes
   , formatCode
@@ -270,7 +278,49 @@ createPipeline recording layout shaders format = createPipelineWith recording la
 -- to support for vertex input.
 createPipelineWith
   ∷ Recording q inst msgr phys dev cmd → PipelineLayout → PipelineShaders → Word32 → VertexInput → IO (Either Refusal Pipeline)
-createPipelineWith recording layout shaders format input = buildPipeline recording layout shaders format input BlendNone Nothing
+createPipelineWith recording layout shaders format input = buildPipeline recording layout shaders format input BlendNone Nothing Nothing
+
+-- | 'createPipelineWith' for a pipeline that declares depth (GRS-10): the
+-- depth-only format of the attachment it renders with, whether it tests and
+-- writes depth, and the comparison its test makes ('depthTested' is the usual
+-- declaration). Before any native call the declaration is checked: a format
+-- that is not a depth-only one ('RefusedImageUnsupported', naming it), a
+-- pipeline that writes depth without testing it ('RefusedIllegal'), and a
+-- format the device does not support as a depth attachment
+-- ('RefusedImageUnsupported'), which the device is asked about and never
+-- assumed to support. The pipeline is drawn only in a pass whose depth
+-- attachment has exactly that format.
+createPipelineWithDepth
+  ∷ Recording q inst msgr phys dev cmd → PipelineLayout → PipelineShaders → Word32 → VertexInput → PipelineDepth → IO (Either Refusal Pipeline)
+createPipelineWithDepth recording layout shaders format input depth = buildPipeline recording layout shaders format input BlendNone (Just depth) Nothing
+
+-- | The depth-only format the backend will use for depth targets and the
+-- pipelines that render with them (GRS-10, D-36): the first of
+-- 'depthFormatPreference' — 32-bit floating point, then the other depth-only
+-- formats — that the device supports as a depth attachment. The device is
+-- asked about each in turn and none is assumed; no format with a stencil
+-- aspect is ever offered. A device that supports none is
+-- 'RefusedImageUnsupported'.
+selectDepthFormat ∷ Recording q inst msgr phys dev cmd → IO (Either Refusal ImageFormat)
+selectDepthFormat recording = owned recording (choose depthFormatPreference)
+  where
+    choose = \case
+      [] → pure (Left (RefusedImageUnsupported DepthTarget Depth32Float))
+      format : rest →
+        opsImageSupport (recordingOps recording) (depthImageQuery format) >>= \case
+          Just _ → pure (Right format)
+          Nothing → choose rest
+
+-- | Whether a pipeline's depth declaration is one the device can render with
+-- (GRS-10); see 'createPipelineWithDepth'.
+validateDepth ∷ Recording q inst msgr phys dev cmd → PipelineDepth → IO (Either Refusal ())
+validateDepth recording depth
+  | format `notElem` kindFormats DepthTarget = pure (Left unsupported)
+  | depthWrite depth && not (depthTest depth) = pure (Left (RefusedIllegal "a pipeline that writes depth without testing it"))
+  | otherwise = maybe (Left unsupported) (const (Right ())) <$> opsImageSupport (recordingOps recording) (depthImageQuery format)
+  where
+    format = depthAttachmentFormat depth
+    unsupported = RefusedImageUnsupported DepthTarget format
 
 -- | Publish a new generation of a pipeline, over the given layout, with no
 -- vertex input. The old generation is released: nothing records it again,
@@ -284,7 +334,7 @@ replacePipeline recording old layout shaders format = replacePipelineWith record
 -- validates one.
 replacePipelineWith
   ∷ Recording q inst msgr phys dev cmd → Pipeline → PipelineLayout → PipelineShaders → Word32 → VertexInput → IO (Either Refusal Pipeline)
-replacePipelineWith recording (Pipeline old) layout shaders format input = buildPipeline recording layout shaders format input BlendNone (Just old)
+replacePipelineWith recording (Pipeline old) layout shaders format input = buildPipeline recording layout shaders format input BlendNone Nothing (Just old)
 
 buildPipeline
   ∷ Recording q inst msgr phys dev cmd
@@ -293,9 +343,10 @@ buildPipeline
   → Word32
   → VertexInput
   → PipelineBlend
+  → Maybe PipelineDepth
   → Maybe ResourceId
   → IO (Either Refusal Pipeline)
-buildPipeline recording (PipelineLayout layout) shaders format input blend replacing =
+buildPipeline recording (PipelineLayout layout) shaders format input blend depth replacing =
   owned recording $
     liveNative recording layout >>= \case
       Left refusal → pure (Left refusal)
@@ -304,18 +355,21 @@ buildPipeline recording (PipelineLayout layout) shaders format input blend repla
         case validateVertexInput limits input of
           Left refusal → pure (Left refusal)
           Right () →
-            fmap Pipeline
-              <$> construct
-                recording
-                0
-                1
-                "vkCreateGraphicsPipelines"
-                ( \ops device _ issued → do
-                    naming ← shaderNaming recording issued
-                    (\created → Right (NativePipeline created layout format (PipelineInterface handle ranges input table)))
-                      <$> opsCreatePipeline ops device (PipelineRequest handle shaders format input blend) naming
-                )
-                replacing
+            maybe (pure (Right ())) (validateDepth recording) depth >>= \case
+              Left refusal → pure (Left refusal)
+              Right () →
+                fmap Pipeline
+                  <$> construct
+                    recording
+                    0
+                    1
+                    "vkCreateGraphicsPipelines"
+                    ( \ops device _ issued → do
+                        naming ← shaderNaming recording issued
+                        (\created → Right (NativePipeline created layout format (PipelineInterface handle ranges input table depth)))
+                          <$> opsCreatePipeline ops device (PipelineRequest handle shaders format input blend depth) naming
+                    )
+                    replacing
       Right _ → pure (Left RefusedWrongKind)
 
 -- | A frame slot's command storage: a pool on the session's queue family and
@@ -484,20 +538,27 @@ createPipelineLayoutFor recording shaders = case checkedRanges shaders of
 -- the pipeline other ranges or another input.
 createCheckedPipeline
   ∷ Recording q inst msgr phys dev cmd → PipelineLayout → CheckedShaders → Word32 → IO (Either Refusal Pipeline)
-createCheckedPipeline recording layout shaders format = checkedPipeline recording layout shaders format BlendNone Nothing
+createCheckedPipeline recording layout shaders format = checkedPipeline recording layout shaders format BlendNone Nothing Nothing
 
 -- | 'createCheckedPipeline' with a declared blend (GRS-8): checked exactly
 -- as it checks, and differing only in how the pipeline's output combines with
 -- its attachment.
 createBlendedCheckedPipeline
   ∷ Recording q inst msgr phys dev cmd → PipelineLayout → CheckedShaders → Word32 → PipelineBlend → IO (Either Refusal Pipeline)
-createBlendedCheckedPipeline recording layout shaders format blend = checkedPipeline recording layout shaders format blend Nothing
+createBlendedCheckedPipeline recording layout shaders format blend = checkedPipeline recording layout shaders format blend Nothing Nothing
+
+-- | 'createBlendedCheckedPipeline' for a pipeline that declares depth
+-- (GRS-10), checked as 'createCheckedPipeline' checks it and its declaration
+-- as 'createPipelineWithDepth' checks one, each before any native call.
+createDepthCheckedPipeline
+  ∷ Recording q inst msgr phys dev cmd → PipelineLayout → CheckedShaders → Word32 → PipelineBlend → PipelineDepth → IO (Either Refusal Pipeline)
+createDepthCheckedPipeline recording layout shaders format blend depth = checkedPipeline recording layout shaders format blend (Just depth) Nothing
 
 -- | 'replacePipeline' from checked shaders, checked as 'createCheckedPipeline'
 -- checks them.
 replaceCheckedPipeline
   ∷ Recording q inst msgr phys dev cmd → Pipeline → PipelineLayout → CheckedShaders → Word32 → IO (Either Refusal Pipeline)
-replaceCheckedPipeline recording (Pipeline old) layout shaders format = checkedPipeline recording layout shaders format BlendNone (Just old)
+replaceCheckedPipeline recording (Pipeline old) layout shaders format = checkedPipeline recording layout shaders format BlendNone Nothing (Just old)
 
 checkedPipeline
   ∷ Recording q inst msgr phys dev cmd
@@ -505,9 +566,10 @@ checkedPipeline
   → CheckedShaders
   → Word32
   → PipelineBlend
+  → Maybe PipelineDepth
   → Maybe ResourceId
   → IO (Either Refusal Pipeline)
-checkedPipeline recording held@(PipelineLayout layout) shaders format blend replacing =
+checkedPipeline recording held@(PipelineLayout layout) shaders format blend depth replacing =
   owned recording $
     liveNative recording layout >>= \case
       Left refusal → pure (Left refusal)
@@ -526,6 +588,7 @@ checkedPipeline recording held@(PipelineLayout layout) shaders format blend repl
                 format
                 (Interface.interfaceVertexInput (checkedInterface (checkedVertex shaders)))
                 blend
+                depth
                 replacing
       Right _ → pure (Left RefusedWrongKind)
   where

@@ -61,6 +61,7 @@ module Test.GPU.Vulkan.Native.SurfaceFree
   , runSprites
   , runGrowth
   , runSwap
+  , runScene3d
   , surfaceFreeSection
   , laterWindowSection
   , framelessSection
@@ -71,6 +72,7 @@ module Test.GPU.Vulkan.Native.SurfaceFree
   , spritesSection
   , growthSection
   , swapSection
+  , scene3dSection
   , surfaceFreeSpec
   , laterWindowSpec
   , framelessSpec
@@ -81,6 +83,7 @@ module Test.GPU.Vulkan.Native.SurfaceFree
   , spritesSpec
   , growthSpec
   , swapSpec
+  , scene3dSpec
   ) where
 
 import Control.Concurrent (ThreadId, myThreadId, threadDelay)
@@ -218,10 +221,17 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , tableSamplerIndex
   , validateTableConfig
   , constructBlendedCheckedPipeline
+  , constructDepthCheckedPipeline
+  , constructDepthFormat
+  , depthFormatPreference
   )
 import Hetoimasia.GPU.Vulkan.Native.Presentation (formatB8G8R8A8Srgb)
 import Hetoimasia.GPU.Vulkan.Native.Recording.ShaderInterfaces (tableSamplerOffset)
 import Hetoimasia.Sample.Sprites (Builders (..))
+import qualified Hetoimasia.Sample.Scene3d as Scene3d
+import qualified Hetoimasia.Sample.Scene3d.Evidence as Scene3dEvidence
+import qualified Hetoimasia.Sample.Scene3d.Oracle as Scene3dOracle
+import qualified Hetoimasia.Sample.Scene3d.Scene as Scene3dScene
 import Hetoimasia.Sample.Sprites.Evidence (Evidence (..), Host (..), runEvidence)
 import Hetoimasia.Sample.Sprites.Oracle (ProbeResult (..))
 import Hetoimasia.Sample.Sprites.Swap (SwapEvidence (..), SwapFacts (..), runSwapEvidence)
@@ -277,6 +287,7 @@ data SurfaceFreeFacts = SurfaceFreeFacts
   , factsSprites ∷ !(Maybe Evidence)
   , factsGrowth ∷ !(Maybe GrowthFacts)
   , factsSwap ∷ !(Maybe SwapEvidence)
+  , factsScene3d ∷ !(Maybe Scene3dEvidence.Evidence)
   }
 
 data SurfaceFreeOutcome
@@ -297,6 +308,7 @@ data Seen = Seen
   , seenSprites ∷ !(Maybe Evidence)
   , seenGrowth ∷ !(Maybe GrowthFacts)
   , seenSwap ∷ !(Maybe SwapEvidence)
+  , seenScene3d ∷ !(Maybe Scene3dEvidence.Evidence)
   }
 
 -- | What the uploads case (GRS-6) found: each upload's ticket, waited for
@@ -334,7 +346,7 @@ runSurfaceFree backend journal = do
     windows ← length <$> atomically (hostWindowIdentities (vulkanWindowHost vulkan))
     roots ← atomically (readVulkanRoots (vulkanController vulkan))
     note journal ("the actions answered " <> Text.intercalate "; " answers)
-    pure (Seen threads answers windows (Just roots) Nothing [] [] Nothing Nothing Nothing Nothing Nothing)
+    pure (Seen threads answers windows (Just roots) Nothing [] [] Nothing Nothing Nothing Nothing Nothing Nothing)
 
 -- | The case that admits a window after the device exists.
 runLaterWindow ∷ Maybe Backend → Journal → IO SurfaceFreeOutcome
@@ -366,7 +378,7 @@ runLaterWindow backend journal = do
       pure (if any (`elem` retired) presented then FinishWith () else ContinueWith NoUpdateDemand)
     note journal "presented a frame to the later window and saw its presentation retire"
     roots ← atomically (readVulkanRoots (vulkanController vulkan))
-    pure (Seen [] [] 1 (Just roots) (Just standing) [] [] Nothing Nothing Nothing Nothing Nothing)
+    pure (Seen [] [] 1 (Just roots) (Just standing) [] [] Nothing Nothing Nothing Nothing Nothing Nothing)
   where
     quiet = recordingLogger (\_ → pure ())
 
@@ -391,7 +403,7 @@ runFrameless backend journal = do
     tickets ← mapM (\ticket → awaitTicket ticket deadline) [firstTicket, snd second]
     note journal ("the tickets answered " <> tshow tickets)
     roots ← atomically (readVulkanRoots (vulkanController vulkan))
-    pure (Seen [firstOn, fst second] ["recorded an initializing frame-less batch", "recorded a second frame-less batch"] 0 (Just roots) Nothing tickets [] Nothing Nothing Nothing Nothing Nothing)
+    pure (Seen [firstOn, fst second] ["recorded an initializing frame-less batch", "recorded a second frame-less batch"] 0 (Just roots) Nothing tickets [] Nothing Nothing Nothing Nothing Nothing Nothing)
   where
     deadline = either (error . show) id (durationFromNanoseconds AllowZero 10000000000)
 
@@ -424,7 +436,7 @@ runOffscreen backend journal = do
       | ((format, _, _), ticket, reading) ← zip3 batches tickets readings
       ]
     roots ← atomically (readVulkanRoots (vulkanController vulkan))
-    pure (Seen [renderedOn, readOn] ["rendered and copied both targets", "read both readbacks"] 0 (Just roots) Nothing tickets shots Nothing Nothing Nothing Nothing Nothing)
+    pure (Seen [renderedOn, readOn] ["rendered and copied both targets", "read both readbacks"] 0 (Just roots) Nothing tickets shots Nothing Nothing Nothing Nothing Nothing Nothing)
   where
     deadline = either (error . show) id (durationFromNanoseconds AllowZero 10000000000)
     pixelAt bytes (x, y) = ByteString.unpack (ByteString.take 4 (ByteString.drop ((y * offscreenSide + x) * 4) bytes))
@@ -453,7 +465,7 @@ runDrawing backend journal = do
     note journal ("the readback is at " <> Text.pack path)
     let shot = Shot Rgba8Srgb waited [(point, pixelAt bytes point) | point ← drawingProbes] path
     roots ← atomically (readVulkanRoots (vulkanController vulkan))
-    pure (Seen [drawnOn, readOn] ["drew the quad and copied the target", "read the readback"] 0 (Just roots) Nothing [waited] [shot] Nothing Nothing Nothing Nothing Nothing)
+    pure (Seen [drawnOn, readOn] ["drew the quad and copied the target", "read the readback"] 0 (Just roots) Nothing [waited] [shot] Nothing Nothing Nothing Nothing Nothing Nothing)
   where
     deadline = either (error . show) id (durationFromNanoseconds AllowZero 10000000000)
     pixelAt bytes (x, y) = ByteString.unpack (ByteString.take 4 (ByteString.drop ((y * offscreenSide + x) * 4) bytes))
@@ -527,6 +539,7 @@ runUploads backend journal = do
             [waited]
             [shot]
             (Just facts)
+            Nothing
             Nothing
             Nothing
             Nothing
@@ -999,6 +1012,7 @@ runTable backend journal = do
             Nothing
             Nothing
             Nothing
+            Nothing
         )
   where
     deadline = either (error . show) id (durationFromNanoseconds AllowZero 30000000000)
@@ -1141,7 +1155,7 @@ runSprites backend journal = do
       note journal ("sprites capture: " <> maybe "not written" Text.pack (evidencePng outcome) <> "; probe record: " <> Text.pack (evidenceRecord outcome))
       mapM_ (\failure → note journal ("sprites evidence failed: " <> failure)) (evidenceFailure outcome)
       roots ← atomically (readVulkanRoots (vulkanController vulkan))
-      pure (Seen [] ["ran the sprites evidence"] 0 (Just roots) Nothing [] [] Nothing Nothing (Just outcome) Nothing Nothing)
+      pure (Seen [] ["ran the sprites evidence"] 0 (Just roots) Nothing [] [] Nothing Nothing (Just outcome) Nothing Nothing Nothing)
   where
     spritesDirectory =
       lookupEnv "HETOIMASIA_VALIDATION_EVIDENCE" >>= \case
@@ -1175,7 +1189,7 @@ runSwap backend journal = do
       mapM_ (\facts → note journal ("swap facts: " <> tshow facts)) (swapFacts outcome)
       mapM_ (\failure → note journal ("swap evidence failed: " <> failure)) (swapFailure outcome)
       roots ← atomically (readVulkanRoots (vulkanController vulkan))
-      pure (Seen [] ["ran the swap evidence"] 0 (Just roots) Nothing [] [] Nothing Nothing Nothing Nothing (Just outcome))
+      pure (Seen [] ["ran the swap evidence"] 0 (Just roots) Nothing [] [] Nothing Nothing Nothing Nothing (Just outcome) Nothing)
   where
     swapDirectory =
       lookupEnv "HETOIMASIA_VALIDATION_EVIDENCE" >>= \case
@@ -1184,6 +1198,87 @@ runSwap backend journal = do
           temporary ← getTemporaryDirectory
           stamp ← (round . (* 1000) . utcTimeToPOSIXSeconds ∷ UTCTime → Integer) <$> getCurrentTime
           pure (temporary </> ("hetoimasia-swap-" <> show stamp))
+
+-- | The scene3d case (GRS-10): the scene3d sample's window-free evidence over
+-- this suite's surface-free session — its two cubes drawn with a depth test
+-- from two camera poses into a colour target and a depth target, each pose
+-- read back after completion and checked against the sample's own
+-- independent oracle ("Hetoimasia.Sample.Scene3d.Evidence") — with the files
+-- written under the validation runner's evidence directory when it names
+-- one, and otherwise into a directory of their own that is kept and
+-- reported.
+runScene3d ∷ Maybe Backend → Journal → IO SurfaceFreeOutcome
+runScene3d backend journal = do
+  heading journal "GRS-10: a surface-free session draws the scene3d sample's two flat-coloured cubes with a depth test from two camera poses into a colour target and a depth target, reads each pose back after completion, checks every probe against the independent oracle, and writes a lossless PNG a pose and a probe record"
+  directory ← scene3dDirectory
+  note journal ("the scene3d evidence is written into " <> Text.pack directory)
+  runCase backend defaultBudgetRequest {requestedBytes = 2 * 1024 * 1024 * 1024} [] "vulkan-native-grs10-scene3d" $ \vulkan _ _ _ → do
+    outcome ← Scene3dEvidence.runEvidence (scene3dHost vulkan) directory
+    note journal ("scene3d depth format: " <> maybe "not chosen" tshow (Scene3dEvidence.evidenceDepthFormat outcome))
+    note journal ("scene3d captures: " <> Text.intercalate ", " [Text.pack path | pose ← Scene3dEvidence.evidencePoses outcome, Just path ← [Scene3dEvidence.poseEvidencePng pose]] <> "; probe record: " <> Text.pack (Scene3dEvidence.evidenceRecord outcome))
+    mapM_ (\failure → note journal ("scene3d evidence failed: " <> failure)) (Scene3dEvidence.evidenceFailure outcome)
+    roots ← atomically (readVulkanRoots (vulkanController vulkan))
+    pure (Seen [] ["ran the scene3d evidence"] 0 (Just roots) Nothing [] [] Nothing Nothing Nothing Nothing Nothing (Just outcome))
+  where
+    scene3dDirectory =
+      lookupEnv "HETOIMASIA_VALIDATION_EVIDENCE" >>= \case
+        Just evidence | not (null evidence) → pure (evidence </> "scene3d")
+        _ → do
+          temporary ← getTemporaryDirectory
+          stamp ← (round . (* 1000) . utcTimeToPOSIXSeconds ∷ UTCTime → Integer) <$> getCurrentTime
+          pure (temporary </> ("hetoimasia-scene3d-" <> show stamp))
+
+-- | The scene3d evidence's host over this suite's session: owner-thread
+-- actions over its constructions, and batches waited for, each wait bounded
+-- by a deadline.
+scene3dHost ∷ VulkanHost () → Scene3dEvidence.Host
+scene3dHost vulkan =
+  Scene3dEvidence.Host
+    { Scene3dEvidence.hostAct = \what body → acting what (VulkanAction (body . scene3dBuilders))
+    , Scene3dEvidence.hostRecord = \what body →
+        acting
+          what
+          ( VulkanAction
+              ( \construction →
+                  body (scene3dBuilders construction) >>= \case
+                    Left refusal → pure (Left refusal)
+                    Right recording →
+                      constructFramelessBatch construction recording >>= \case
+                        Left refusal → pure (Left refusal)
+                        Right (_, Left refusal) → pure (Left refusal)
+                        Right (ticket, Right ()) → pure (Right ticket)
+              )
+          )
+    , Scene3dEvidence.hostAwait = \ticket →
+        awaitTicket ticket deadline >>= \case
+          Right TicketComplete → pure (Right ())
+          other → pure (Left (tshow other))
+    , Scene3dEvidence.hostRead = \readback → acting "reading the readback" (VulkanAction (\construction → readConstructedReadback construction readback 0 Scene3dScene.targetBytes))
+    }
+  where
+    deadline = either (error . show) id (durationFromNanoseconds AllowZero 30000000000)
+    acting ∷ Text → VulkanAction (Either Refusal a) → IO (Either Text a)
+    acting what action =
+      atomically (submitVulkanAction vulkan action) >>= \case
+        Left refusal → pure (Left (what <> " was refused: " <> tshow refusal))
+        Right ticket →
+          atomically (awaitVulkanAction ticket) >>= \case
+            ActionReturned (Right value) → pure (Right value)
+            ActionReturned (Left refusal) → pure (Left (what <> " was refused: " <> tshow refusal))
+            ActionRaised failure → pure (Left (what <> " raised: " <> tshow failure))
+            ActionRefused refusal → pure (Left (what <> " was refused before it ran: " <> tshow refusal))
+
+-- | The scene3d sample's constructions, from the host's.
+scene3dBuilders ∷ Construction q inst msgr phys dev cmd → Scene3d.Builders q inst msgr phys dev cmd
+scene3dBuilders construction =
+  Scene3d.Builders
+    { Scene3d.buildRing = constructRing construction
+    , Scene3d.buildImage = constructImage construction
+    , Scene3d.buildLayout = constructPipelineLayoutFor construction
+    , Scene3d.buildPipeline = constructDepthCheckedPipeline construction
+    , Scene3d.buildReadback = constructReadback construction
+    , Scene3d.chooseDepthFormat = constructDepthFormat construction
+    }
 
 -- | The sprites evidence's host over this suite's session: owner-thread
 -- actions over its constructions, uploads admitted from the main thread and
@@ -1350,6 +1445,7 @@ runGrowth backend journal = do
             Nothing
             Nothing
             (Just facts)
+            Nothing
             Nothing
         )
   where
@@ -1552,6 +1648,7 @@ runCaseWith adjust backend request windows label body = do
               , factsSprites = seenSprites seen
               , factsGrowth = seenGrowth seen
               , factsSwap = seenSwap seen
+              , factsScene3d = seenScene3d seen
               }
   where
     -- Every call's name, as it returns, where a transaction can wait for it.
@@ -2011,6 +2108,70 @@ growthSpec outcome = describe "GRS-14 texture table growth in a surface-free ses
 
   it "reached a verdict after the last callback with no issue and no error, synchronization validation included" $
     on outcome clean
+
+scene3dSection ∷ SurfaceFreeOutcome → [Text]
+scene3dSection outcome =
+  section "A surface-free session drawing the scene3d sample's two cubes with a depth test" outcome
+    <> case outcome of
+      SurfaceFreeRecorded facts → case factsScene3d facts of
+        Nothing → ["- no scene3d evidence"]
+        Just evidence →
+          ["- depth format: " <> maybe "not chosen" tshow (Scene3dEvidence.evidenceDepthFormat evidence), "- probe record: " <> Text.pack (Scene3dEvidence.evidenceRecord evidence), "- failure: " <> fromMaybe "none" (Scene3dEvidence.evidenceFailure evidence)]
+            <> concat
+              [ [ "- " <> tshow (Scene3dEvidence.poseEvidenceName pose) <> " capture: " <> maybe "not written" Text.pack (Scene3dEvidence.poseEvidencePng pose)
+                , "- " <> tshow (Scene3dEvidence.poseEvidenceName pose) <> " readback bytes: " <> tshow (Scene3dEvidence.poseEvidenceBytes pose)
+                ]
+                  <> [ "- " <> tshow (Scene3dEvidence.poseEvidenceName pose) <> " " <> (if Scene3dOracle.resultPassed result then "pass " else "FAIL ") <> Scene3dScene.probeName (Scene3dOracle.resultProbe result) <> ": observed " <> tshow (Scene3dOracle.resultObserved result) <> ", expected " <> tshow (Scene3dOracle.resultExpected result) <> ", covered by " <> tshow (Scene3dOracle.resultCovered result)
+                     | result ← Scene3dEvidence.poseEvidenceProbes pose
+                     ]
+              | pose ← Scene3dEvidence.evidencePoses evidence
+              ]
+      SurfaceFreeFailed _ → []
+
+scene3dSpec ∷ SurfaceFreeOutcome → Spec
+scene3dSpec outcome = describe "GRS-10 the scene3d sample's window-free evidence" $ do
+  it "opened no window, created no surface and acquired no image" $
+    on outcome $ \facts → do
+      factsWindows facts `shouldBe` 0
+      callNames facts `shouldSatisfy` notElem "glfwCreateWindowSurface"
+      callNames facts `shouldSatisfy` notElem "vkAcquireNextImageKHR"
+      deviceFirst facts
+
+  it "chose a depth-only format, rendered both poses and read back each whole once its batch had completed, every probe passing the independent oracle" $
+    on outcome $ \facts → withScene3d facts $ \evidence → do
+      Scene3dEvidence.evidenceFailure evidence `shouldBe` Nothing
+      Scene3dEvidence.evidenceDepthFormat evidence `shouldSatisfy` maybe False (`elem` depthFormatPreference)
+      map Scene3dEvidence.poseEvidenceName (Scene3dEvidence.evidencePoses evidence) `shouldBe` [Scene3dScene.FrontPose, Scene3dScene.SidePose]
+      map Scene3dEvidence.poseEvidenceBytes (Scene3dEvidence.evidencePoses evidence) `shouldBe` replicate 2 (fromIntegral Scene3dScene.targetBytes)
+      [(Scene3dEvidence.poseEvidenceName pose, Scene3dScene.probeName (Scene3dOracle.resultProbe result)) | pose ← Scene3dEvidence.evidencePoses evidence, result ← Scene3dEvidence.poseEvidenceProbes pose, not (Scene3dOracle.resultPassed result)] `shouldBe` []
+      map (length . Scene3dEvidence.poseEvidenceProbes) (Scene3dEvidence.evidencePoses evidence) `shouldSatisfy` all (> 0)
+      Scene3dEvidence.evidencePassed evidence `shouldBe` True
+
+  it "showed the nearer cube, drawn first, where the cubes overlap in each pose, so depth testing and not draw order decided the pixel, and showed that the camera moved" $
+    on outcome $ \facts → withScene3d facts $ \evidence →
+      forM_' [Scene3dScene.Occlusion, Scene3dScene.CameraMovedFace, Scene3dScene.CameraMovedPlace, Scene3dScene.FaceColour, Scene3dScene.Clear] $ \purpose → do
+        let results = [result | pose ← Scene3dEvidence.evidencePoses evidence, result ← Scene3dEvidence.poseEvidenceProbes pose, Scene3dScene.probePurpose (Scene3dOracle.resultProbe result) == purpose]
+        results `shouldSatisfy` (not . null)
+        all Scene3dOracle.resultPassed results `shouldBe` True
+        when (purpose == Scene3dScene.Occlusion) $
+          [Scene3dOracle.resultCovered result | result ← results] `shouldBe` replicate (length results) [Scene3dScene.NearCube, Scene3dScene.FarCube]
+
+  it "wrote a lossless PNG a pose and the probe record where they are kept" $
+    on outcome $ \facts → withScene3d facts $ \evidence → do
+      pngs ← mapM (maybe (pure False) doesFileExist . Scene3dEvidence.poseEvidencePng) (Scene3dEvidence.evidencePoses evidence)
+      record ← doesFileExist (Scene3dEvidence.evidenceRecord evidence)
+      (pngs, record) `shouldBe` ([True, True], True)
+
+  it "retired cleanly, with every Vulkan call on the owner's thread" $
+    on outcome $ \facts → do
+      callNames facts `shouldSatisfy` ordered ["vkDestroyDevice", "vkDestroyDebugUtilsMessengerEXT", "vkDestroyInstance"]
+      oneOwnerThread facts
+
+  it "reached a verdict after the last callback with no issue and no error, synchronization validation included" $
+    on outcome clean
+  where
+    withScene3d facts body = maybe (expectationFailure "no scene3d evidence") body (factsScene3d facts)
+    forM_' items action = mapM_ action items
 
 framelessSpec ∷ SurfaceFreeOutcome → Spec
 framelessSpec outcome = describe "GRS-12 frame-less batches in a surface-free session" $ do

@@ -1,12 +1,13 @@
 -- The Vulkan project: the native backend package, the window integration
 -- package with its native suite, the triangle sample (VK-17), the sprites
--- sample (GRS-8), and the GLFW package with its Vulkan interop component
--- enabled — the only project file that names the first four or turns that
--- component on.
+-- sample (GRS-8), the scene3d sample (GRS-10), and the GLFW package with its
+-- Vulkan interop component enabled — the only project file that names the first
+-- five or turns that component on.
 --
 -- `cabal.project` and `cabal.project.cpu` deliberately do not list
 -- `packages/gpu-vulkan/native`, `packages/gpu-vulkan/glfw` or the samples'
--- packages under `samples/triangle` and `samples/sprites`, and neither sets
+-- packages under `samples/triangle`, `samples/sprites` and `samples/scene3d`,
+-- and neither sets
 -- the GLFW package's manual `vulkan-interop` flag, so neither resolves nor links
 -- the Vulkan binding and neither `cabal build all` nor `cabal build all
 -- --project-file cabal.project.cpu` needs a loader or the Vulkan headers. Every
@@ -14,8 +15,9 @@
 -- never builds this. The other packages here are the local dependency closure
 -- of the native package and of the interop component — the diagnostics package
 -- whose C capture the native package installs, the GPU model, the runtime the
--- GLFW package's runtime integration uses, the foundation, and the test-only
--- support library the native package's shader suite uses — which the ordinary
+-- GLFW package's runtime integration uses, the foundation, the math package the
+-- scene3d sample builds its cameras with, and the test-only support library the
+-- native package's shader suite uses — which the ordinary
 -- projects list too; `cabal.project` lists the GLFW package itself, with the
 -- flag off. Selecting this project is an explicit act, and one command makes
 -- it:
@@ -38,11 +40,14 @@ packages:
   samples/triangle/app
   samples/sprites/renderer
   samples/sprites/app
+  samples/scene3d/renderer
+  samples/scene3d/app
   packages/glfw
   packages/gpu-vulkan/diagnostics
   packages/gpu-vulkan/model
   packages/runtime
   packages/foundation
+  packages/math
   tools/test-support
 
 -- The GLFW package's Vulkan interop component: the shared loader capability and

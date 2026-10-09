@@ -1,3 +1,5 @@
+{-# LANGUAGE OverloadedRecordDot #-}
+
 -- | Pipelines from checked shaders (GRS-16) over the recording's stand-in
 -- native layer: a layout with exactly the push-constant ranges the shaders'
 -- descriptions need — one stage's, the other's, or both stages' alike — a
@@ -15,9 +17,11 @@ import qualified Data.ByteString as ByteString
 import Test.Hspec (Spec, describe, it, shouldBe, shouldReturn)
 
 import Hetoimasia.GPU.Vulkan.Native.Recording
-import Hetoimasia.GPU.Vulkan.Native.Recording.Vulkan (colorBlendAttachment)
+import Hetoimasia.GPU.Vulkan.Native.Recording.Vulkan (colorBlendAttachment, depthAttachmentInfo, nativeDepthState)
 import Data.Bits ((.|.))
-import Vulkan.Core10 (BlendFactor (..), BlendOp (..), ColorComponentFlagBits (..), PipelineColorBlendAttachmentState (..))
+import Vulkan.Core10 (BlendFactor (..), BlendOp (..), ColorComponentFlagBits (..), CompareOp (..), PipelineColorBlendAttachmentState (..), PipelineDepthStencilStateCreateInfo (..))
+import qualified Vulkan.Core10 as Core10
+import Vulkan.Core13 (RenderingAttachmentInfo (..))
 import Hetoimasia.GPU.Vulkan.Native.Shader.Interface (DescriptorCount (..), DescriptorDeclaration (..), DescriptorKind (..), InterfaceStage (..), PushMember (..), ShaderInterface (..), interfaceFor)
 import Test.GPU.Vulkan.Native.FramesRig
 import Test.GPU.Vulkan.Native.RecordingStandIn (RecordingCall (..), recordingCalls)
@@ -72,6 +76,54 @@ spec = describe "Pipelines from checked shaders" $ do
       , colorWriteMask premultiplied
       )
       `shouldBe` (True, BLEND_FACTOR_ONE, BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, BLEND_OP_ADD, BLEND_FACTOR_ONE, BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, BLEND_OP_ADD, channels)
+
+  it "declares a checked pipeline's depth to the native layer only when it asks for it, and checks its layout and shaders as it checks any (GRS-10)" $ do
+    rig ← newRig
+    let checked = shaders (vertexWith tint) (fragmentWith tint)
+        reversed = PipelineDepth Depth32Float True False CompareGreaterOrEqual
+    layout ← createPipelineLayoutFor (rigRecording rig) checked >>= either (fail . show) pure
+    other ← createPipelineLayout (rigRecording rig) >>= either (fail . show) pure
+    plain ← createCheckedPipeline (rigRecording rig) layout checked 37 >>= either (fail . show) pure
+    tested ← createDepthCheckedPipeline (rigRecording rig) layout checked 37 BlendNone (depthTested Depth32Float) >>= either (fail . show) pure
+    blended ← createDepthCheckedPipeline (rigRecording rig) layout checked 37 BlendPremultipliedAlpha reversed >>= either (fail . show) pure
+    calls ← recordingCalls (rigRecordingStandIn rig)
+    let made = [handle | CreatedPipeline handle _ _ ← calls]
+    length made `shouldBe` 3
+    [(handle, depth) | DeclaredDepth handle depth ← calls] `shouldBe` [(made !! 1, depthTested Depth32Float), (made !! 2, reversed)]
+    [(handle, blend) | DeclaredBlend handle blend ← calls] `shouldBe` [(made !! 2, BlendPremultipliedAlpha)]
+    -- The shaders and the layout are checked first, and a refusal makes no
+    -- native call.
+    before ← nativeCalls rig
+    refused ← createDepthCheckedPipeline (rigRecording rig) other checked 37 BlendNone (depthTested Depth32Float)
+    fmap (const ()) refused `shouldBe` Left (RefusedIncompatible "a pipeline layout whose push-constant ranges are not the ones its checked shaders declare")
+    unsupported ← createDepthCheckedPipeline (rigRecording rig) layout checked 37 BlendNone (PipelineDepth Depth32Float False True CompareLess)
+    fmap (const ()) unsupported `shouldBe` Left (RefusedIllegal "a pipeline that writes depth without testing it")
+    nativeCalls rig `shouldReturn` before
+    (plain, tested, blended) `seq` clean rig
+
+  it "builds the native depth state and depth attachment from what is declared: the test, the write, the comparison, a view cleared and stored in the depth-attachment layout, and no bounds and no stencil (GRS-10)" $ do
+    let state = nativeDepthState (depthTested Depth32Float)
+    (depthTestEnable state, depthWriteEnable state, depthCompareOp state) `shouldBe` (True, True, COMPARE_OP_LESS_OR_EQUAL)
+    (depthBoundsTestEnable state, stencilTestEnable state) `shouldBe` (False, False)
+    let reversed = nativeDepthState (PipelineDepth Depth32Float True False CompareGreaterOrEqual)
+    (depthTestEnable reversed, depthWriteEnable reversed, depthCompareOp reversed) `shouldBe` (True, False, COMPARE_OP_GREATER_OR_EQUAL)
+    -- Each comparison is the Vulkan operation of the same name.
+    map (depthCompareOp . nativeDepthState . PipelineDepth Depth16 True True) [minBound .. maxBound]
+      `shouldBe` [ COMPARE_OP_NEVER
+                 , COMPARE_OP_LESS
+                 , COMPARE_OP_EQUAL
+                 , COMPARE_OP_LESS_OR_EQUAL
+                 , COMPARE_OP_GREATER
+                 , COMPARE_OP_NOT_EQUAL
+                 , COMPARE_OP_GREATER_OR_EQUAL
+                 , COMPARE_OP_ALWAYS
+                 ]
+    let info = depthAttachmentInfo (DepthClear 77 0.5)
+    (info.imageView, info.imageLayout) `shouldBe` (Core10.ImageView 77, Core10.IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL)
+    (info.loadOp, info.storeOp) `shouldBe` (Core10.ATTACHMENT_LOAD_OP_CLEAR, Core10.ATTACHMENT_STORE_OP_STORE)
+    case info.clearValue of
+      Core10.DepthStencil (Core10.ClearDepthStencilValue depth stencil) → (depth, stencil) `shouldBe` (0.5, 0)
+      other → fail ("the attachment clears to " <> show other)
 
   it "refuses disagreeing stages, descriptor bindings, a misassigned stage and a layout with other ranges, making no native call" $ do
     rig ← newRig

@@ -111,6 +111,18 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , readConstructedReadback
   , Readback
 
+    -- * Depth attachments (GRS-10)
+  , DepthPass (..)
+  , clearedDepth
+  , defaultDepthClear
+  , beginRenderingWithDepth
+  , CompareOp (..)
+  , PipelineDepth (..)
+  , depthTested
+  , depthFormatPreference
+  , constructDepthFormat
+  , constructDepthCheckedPipeline
+
     -- * Uploads (GRS-6)
   , UploadConfig
   , validateUploadConfig
@@ -309,6 +321,8 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , constructPipelineLayoutFor
   , constructCheckedPipeline
   , constructBlendedCheckedPipeline
+  , constructDepthCheckedPipeline
+  , constructDepthFormat
   , replaceConstructedCheckedPipeline
   , replaceConstructedPipeline
   , releaseConstructed
@@ -362,10 +376,13 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , CheckedShader (..)
   , CheckedShaders (..)
   , ClearColor (..)
+  , CompareOp (..)
+  , DepthPass (..)
   , IndexType (..)
   , InputRate (..)
   , PushConstantRange (..)
   , PipelineBlend (..)
+  , PipelineDepth (..)
   , PushStage (..)
   , RingClaim
   , RingSize
@@ -403,9 +420,14 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , awaitTicket
   , beginRendering
   , beginRenderingInto
+  , beginRenderingWithDepth
   , copyTargetToReadback
   , copyLevelToReadback
   , bindPipeline
+  , defaultDepthClear
+  , depthFormatPreference
+  , clearedDepth
+  , depthTested
   , draw
   , endRendering
   , readTicket

@@ -62,6 +62,24 @@
 -- four bytes a pixel in the target's own byte order, tightly packed and
 -- unconverted, readable once the copying batch's submission has completed.
 --
+-- = Depth attachments (GRS-10)
+--
+-- A pass into a managed color target can take a managed 'DepthTarget' image of
+-- the same extent as its depth attachment: 'beginRenderingWithDepth' clears it
+-- to a value ('defaultDepthClear', 1.0, unless the 'DepthPass' names another)
+-- under #335's rules, in its depth-attachment use, which it rests in, with its
+-- own 'PassStart'. A pipeline declares the depth it renders with
+-- ('createPipelineWithDepth', 'createDepthCheckedPipeline', 'PipelineDepth'):
+-- the depth-only format of the attachment, whether it tests and writes depth,
+-- and the comparison ('depthTested', less-or-equal). A pipeline is drawn only
+-- in a pass whose depth attachment has exactly the format it declares, and one
+-- that declares none only in a pass that has none, checked when it is bound and
+-- again by every draw. The depth-only format the backend uses is the device's
+-- first supported of 'depthFormatPreference', which 'selectDepthFormat' asks of
+-- it; no format has a stencil aspect. Depth is Vulkan's convention (D-36):
+-- clip-space Y points down and depth runs 0 to 1. Every refusal makes no native
+-- call.
+--
 -- = Names and labels
 --
 -- When the roots offer naming ('readRootsInstrumentation'), every managed
@@ -264,6 +282,7 @@ module Hetoimasia.GPU.Vulkan.Native.Recording
   , NativeCommand (..)
   , ImageLayout (..)
   , ClearColor (..)
+  , DepthClear (..)
   , Viewport (..)
   , Rect (..)
   , ImageQuery (..)
@@ -285,6 +304,19 @@ module Hetoimasia.GPU.Vulkan.Native.Recording
   , Recording
   , newRecording
   , Refusal (..)
+
+    -- * Depth (GRS-10)
+  , CompareOp (..)
+  , compareOpCode
+  , PipelineDepth (..)
+  , depthTested
+  , depthFormatPreference
+  , selectDepthFormat
+  , DepthPass (..)
+  , clearedDepth
+  , defaultDepthClear
+  , createPipelineWithDepth
+  , createDepthCheckedPipeline
 
     -- * Managed resources
   , PipelineLayout
@@ -341,6 +373,7 @@ module Hetoimasia.GPU.Vulkan.Native.Recording
   , beginRendering
   , PassStart (..)
   , beginRenderingInto
+  , beginRenderingWithDepth
   , endRendering
   , bindPipeline
   , setViewport
@@ -447,6 +480,9 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Construction
   , createPipelineLayout
   , createPipelineLayoutWith
   , createPipelineWith
+  , createPipelineWithDepth
+  , createDepthCheckedPipeline
+  , selectDepthFormat
   , createReadback
   , createRing
   , checkedRanges
@@ -474,6 +510,12 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   , BufferDescription (..)
   , BufferKind (..)
   , ClearColor (..)
+  , CompareOp (..)
+  , DepthClear (..)
+  , PipelineDepth (..)
+  , compareOpCode
+  , depthFormatPreference
+  , depthTested
   , ImageDescription (..)
   , ImageFormat (..)
   , ImageKind (..)
@@ -527,8 +569,10 @@ import Hetoimasia.GPU.Vulkan.Native.Shader.Interface (CheckedShader (..), Checke
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Recorder
   ( Recorder
   , BufferSource (..)
+  , DepthPass (..)
   , PassStart (..)
   , beginRendering
+  , beginRenderingWithDepth
   , bindIndexBuffer
   , bindVertexBuffer
   , claimRegion
@@ -540,6 +584,8 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Recorder
   , copyTargetToReadback
   , copyLevelToReadback
   , copyToReadback
+  , defaultDepthClear
+  , clearedDepth
   , draw
   , endRendering
   , readbackBytesFor

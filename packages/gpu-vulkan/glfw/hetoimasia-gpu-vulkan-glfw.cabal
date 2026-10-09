@@ -243,4 +243,8 @@ test-suite vulkan-native-tests
         -- The sprites sample's drawing and window-free evidence (GRS-8),
         -- which the sprites case runs over this suite's own session; it too
         -- depends on the native backend alone.
-        hetoimasia-sample-sprites ==0.1.0.0
+        hetoimasia-sample-sprites ==0.1.0.0,
+        -- The scene3d sample's drawing and window-free evidence (GRS-10),
+        -- which the scene3d case runs over this suite's own session; it
+        -- depends on the native backend and the math package alone.
+        hetoimasia-sample-scene3d ==0.1.0.0

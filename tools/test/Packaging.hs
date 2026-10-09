@@ -102,6 +102,7 @@ checkoutOnly =
   , ("packages/gpu-vulkan/glfw/test/Main.hs", "VulkanProof.hs checks the integration suite fails an empty selection, as a sibling package's source")
   , ("samples/triangle/renderer/test/Main.hs", "VulkanProof.hs checks the triangle sample's suite fails an empty selection, as a sibling package's source")
   , ("samples/sprites/renderer/test/Main.hs", "VulkanProof.hs checks the sprites sample's suite fails an empty selection, as a sibling package's source")
+  , ("samples/scene3d/renderer/test/Main.hs", "VulkanProof.hs checks the scene3d sample's suite fails an empty selection, as a sibling package's source")
   , ("packages/gpu-vulkan/glfw/native-test/Main.hs", "VulkanProof.hs checks the native suite's complete profile, as a sibling package's source")
   , ( "packages/glfw/hetoimasia-glfw.cabal"
     , "VulkanProof.hs reads the GLFW package's interop flag and dependencies beside the ordinary projects, as a sibling package"

@@ -142,6 +142,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   , ImageFormat
   , ImageKind (..)
   , ImageUse (..)
+  , PipelineDepth
   , PushConstantRange
   , ReadbackAllocation (..)
   , RecordingOps (..)
@@ -205,8 +206,8 @@ data NativeResource cmd
 
 -- | What a pipeline declares of its interface (GRS-4), kept with its
 -- generation so a batch checks what it binds, pushes and draws against the
--- pipeline it bound: its layout's native handle and push-constant ranges, and
--- its vertex input.
+-- pipeline it bound: its layout's native handle and push-constant ranges, its
+-- vertex input and its depth.
 data PipelineInterface = PipelineInterface
   { interfaceLayout ∷ !Word64
   , interfacePushConstants ∷ ![PushConstantRange]
@@ -214,6 +215,10 @@ data PipelineInterface = PipelineInterface
   , interfaceTable ∷ !(Maybe Word32)
     -- ^ For a pipeline over a layout holding the texture table (GRS-7), the
     -- push-constant offset of its draws' sampler index.
+  , interfaceDepth ∷ !(Maybe PipelineDepth)
+    -- ^ What the pipeline declares of depth (GRS-10), if it declares any: the
+    -- attachment format it renders with, which every draw checks against the
+    -- pass it is drawn in.
   }
   deriving (Eq, Show)
 

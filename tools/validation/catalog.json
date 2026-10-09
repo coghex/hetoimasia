@@ -287,7 +287,7 @@
     },
     {
       "id": "test.vulkan-headless",
-      "description": "Vulkan-linked headless Hspec contracts, executed rather than only built, through cabal.project.vulkan against the provisioned native prefix: the native backend's profile and roots decisions over a stand-in native layer (native-tests), its shader contract against the provisioned compiler (shader-tests), the window integration's controller over the GLFW package's scripted seam (integration-tests), the triangle sample's pipeline cache over stand-in builders (triangle-tests), and the sprites sample's scene, probe oracle, fixtures and PNG writer (sprites-tests). None acquires a display, a GLFW session, or a device, and none reads desktop consent; the headers and loader are build and link prerequisites only.",
+      "description": "Vulkan-linked headless Hspec contracts, executed rather than only built, through cabal.project.vulkan against the provisioned native prefix: the native backend's profile and roots decisions over a stand-in native layer (native-tests), its shader contract against the provisioned compiler (shader-tests), the window integration's controller over the GLFW package's scripted seam (integration-tests), the triangle sample's pipeline cache over stand-in builders (triangle-tests), the sprites sample's scene, probe oracle, fixtures and PNG writer (sprites-tests), and the scene3d sample's scene, cameras built with the math package, independent probe oracle and PNG writer (scene3d-tests). None acquires a display, a GLFW session, or a device, and none reads desktop consent; the headers and loader are build and link prerequisites only.",
       "command": [
         "bash",
         "tools/vulkan/run.sh",
@@ -296,7 +296,8 @@
         "hetoimasia-gpu-vulkan-native:test:shader-tests",
         "hetoimasia-gpu-vulkan-glfw:test:integration-tests",
         "hetoimasia-sample-triangle:test:triangle-tests",
-        "hetoimasia-sample-sprites:test:sprites-tests"
+        "hetoimasia-sample-sprites:test:sprites-tests",
+        "hetoimasia-sample-scene3d:test:scene3d-tests"
       ],
       "component": "hetoimasia-gpu-vulkan-glfw:test:integration-tests",
       "inputs": [
@@ -305,6 +306,8 @@
         "packages/gpu-vulkan/native/",
         "samples/triangle/renderer/",
         "samples/sprites/renderer/",
+        "samples/scene3d/renderer/",
+        "packages/math/",
         "tools/ci-image/",
         "tools/native/",
         "tools/toolchain/binding.pin",
@@ -319,7 +322,7 @@
     },
     {
       "id": "test.vulkan-native",
-      "description": "The Vulkan native suite: the package-native fixture's shared roots under the graphics owner, with GLFW's session on the process main thread, and the migrated VK-2, VK-5, VK-6 and VK-7 cases, VK-17's required profile over the triangle sample's drawing, the sprites sample's window-free evidence case (GRS-8), which writes its PNG and probe record into the group's evidence directory, and the synchronization-validation control in private child processes, all with the validation layer and synchronization validation enabled, failing on any validation error or incomplete diagnostic capture after the last teardown. Its executable, and the triangle and sprites samples', are built in a separate preparation stage; its native execution — test-owned display, fixtures, examples, retirement, diagnostic finalization and teardown — is measured alone under a 30-second watchdog. On Linux the command starts its own isolated X11 display; on macOS it needs the desktop opt-in on its own command, given under the owner's standing approval for runs an issue or pull request needs.",
+      "description": "The Vulkan native suite: the package-native fixture's shared roots under the graphics owner, with GLFW's session on the process main thread, and the migrated VK-2, VK-5, VK-6 and VK-7 cases, VK-17's required profile over the triangle sample's drawing, the sprites sample's window-free evidence case (GRS-8), which writes its PNG and probe record into the group's evidence directory, the scene3d sample's window-free depth-tested evidence case (GRS-10), which writes a PNG a camera pose and its probe record into the same directory, and the synchronization-validation control in private child processes, all with the validation layer and synchronization validation enabled, failing on any validation error or incomplete diagnostic capture after the last teardown. Its executable, and the triangle, sprites and scene3d samples', are built in a separate preparation stage; its native execution — test-owned display, fixtures, examples, retirement, diagnostic finalization and teardown — is measured alone under a 30-second watchdog. On Linux the command starts its own isolated X11 display; on macOS it needs the desktop opt-in on its own command, given under the owner's standing approval for runs an issue or pull request needs.",
       "command": [
         "bash",
         "tools/vulkan/run.sh",
@@ -335,7 +338,8 @@
           "build",
           "hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests",
           "hetoimasia-sample-triangle-app:exe:hetoimasia-triangle",
-          "hetoimasia-sample-sprites-app:exe:hetoimasia-sprites"
+          "hetoimasia-sample-sprites-app:exe:hetoimasia-sprites",
+          "hetoimasia-sample-scene3d-app:exe:hetoimasia-scene3d"
         ],
         "timeout_seconds": 3600
       },
@@ -346,6 +350,7 @@
         "tools/ci-image/",
         "samples/triangle/app/",
         "samples/sprites/app/",
+        "samples/scene3d/app/",
         "tools/display/",
         "tools/native/",
         "tools/toolchain/binding.pin",
@@ -378,7 +383,8 @@
           "build",
           "hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests",
           "hetoimasia-sample-triangle-app:exe:hetoimasia-triangle",
-          "hetoimasia-sample-sprites-app:exe:hetoimasia-sprites"
+          "hetoimasia-sample-sprites-app:exe:hetoimasia-sprites",
+          "hetoimasia-sample-scene3d-app:exe:hetoimasia-scene3d"
         ],
         "timeout_seconds": 3600
       },
@@ -389,6 +395,7 @@
         "tools/ci-image/",
         "samples/triangle/app/",
         "samples/sprites/app/",
+        "samples/scene3d/app/",
         "tools/display/",
         "tools/native/",
         "tools/toolchain/binding.pin",
@@ -441,7 +448,8 @@
         "packages/gpu-vulkan/glfw/",
         "packages/glfw/hetoimasia-glfw.cabal",
         "samples/triangle/renderer/test/Main.hs",
-        "samples/sprites/renderer/test/Main.hs"
+        "samples/sprites/renderer/test/Main.hs",
+        "samples/scene3d/renderer/test/Main.hs"
       ],
       "framework": "hspec",
       "runner": "cpu",

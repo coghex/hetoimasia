@@ -18,6 +18,8 @@
 module Hetoimasia.GPU.Vulkan.Native.Recording.Vulkan
   ( vulkanRecordingOps
   , colorBlendAttachment
+  , nativeDepthState
+  , depthAttachmentInfo
   , transitionScopes
   ) where
 
@@ -63,6 +65,7 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   ( AccessScope (..)
   , BarrierObject (..)
   , ClearColor (..)
+  , DepthClear (..)
   , DescriptorWrite (..)
   , PoolRequest (..)
   , SetLayoutRequest (..)
@@ -77,6 +80,7 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , InputRate (..)
   , NativeCommand (..)
   , PipelineBlend (..)
+  , PipelineDepth (..)
   , PipelineRequest (..)
   , PipelineShaders (..)
   , PushConstantRange (..)
@@ -90,6 +94,8 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , VertexInput (..)
   , ViewRequest (..)
   , Viewport (..)
+  , compareOpCode
+  , formatCode
   , pushStageBit
   , vertexFormatCode
   )
@@ -436,7 +442,15 @@ createPipeline' device request name = do
           PipelineShaderStageCreateInfo {next = (), flags = zero, stage = kind, module' = shader, name = "main", specializationInfo = Nothing}
       info =
         GraphicsPipelineCreateInfo
-          { next = (PipelineRenderingCreateInfo {viewMask = 0, colorAttachmentFormats = Vector.singleton (Format (fromIntegral request.requestColorFormat)), depthAttachmentFormat = FORMAT_UNDEFINED, stencilAttachmentFormat = FORMAT_UNDEFINED}, ())
+          { next =
+              ( PipelineRenderingCreateInfo
+                  { viewMask = 0
+                  , colorAttachmentFormats = Vector.singleton (Format (fromIntegral request.requestColorFormat))
+                  , depthAttachmentFormat = maybe FORMAT_UNDEFINED (\depth → Format (fromIntegral (formatCode depth.depthAttachmentFormat))) request.requestDepth
+                  , stencilAttachmentFormat = FORMAT_UNDEFINED
+                  }
+              , ()
+              )
           , flags = zero
           , stageCount = 2
           , stages = Vector.fromList [stage SHADER_STAGE_VERTEX_BIT vertex, stage SHADER_STAGE_FRAGMENT_BIT fragment]
@@ -493,7 +507,7 @@ createPipeline' device request name = do
                       , alphaToOneEnable = False
                       }
                 )
-          , depthStencilState = Nothing
+          , depthStencilState = fmap nativeDepthState request.requestDepth
           , colorBlendState =
               Just
                 ( SomeStruct
@@ -525,6 +539,40 @@ createPipeline' device request name = do
   case Vector.toList (snd created) of
     [Pipeline handle] → pure handle
     _ → fail "the device created no pipeline"
+
+-- | A pipeline's depth-stencil state (GRS-10): the declared test, write and
+-- comparison, and no depth bounds and no stencil, which no pipeline declares.
+nativeDepthState ∷ PipelineDepth → PipelineDepthStencilStateCreateInfo
+nativeDepthState depth =
+  PipelineDepthStencilStateCreateInfo
+    { flags = zero
+    , depthTestEnable = depth.depthTest
+    , depthWriteEnable = depth.depthWrite
+    , depthCompareOp = CompareOp (fromIntegral (compareOpCode depth.depthCompare))
+    , depthBoundsTestEnable = False
+    , stencilTestEnable = False
+    , front = zero
+    , back = zero
+    , minDepthBounds = 0
+    , maxDepthBounds = 1
+    }
+
+-- | A pass's depth attachment (GRS-10): the target's view in the
+-- depth-attachment layout, cleared to the pass's value and stored, so the
+-- target's contents after the pass are defined for the next one.
+depthAttachmentInfo ∷ DepthClear → RenderingAttachmentInfo '[]
+depthAttachmentInfo (DepthClear view value) =
+  RenderingAttachmentInfo
+    { next = ()
+    , imageView = ImageView view
+    , imageLayout = IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL
+    , resolveMode = RESOLVE_MODE_NONE
+    , resolveImageView = NULL_HANDLE
+    , resolveImageLayout = IMAGE_LAYOUT_UNDEFINED
+    , loadOp = ATTACHMENT_LOAD_OP_CLEAR
+    , storeOp = ATTACHMENT_STORE_OP_STORE
+    , clearValue = DepthStencil (ClearDepthStencilValue value 0)
+    }
 
 -- | The stage flags of a push-constant range or a push.
 pushStageFlags ∷ [PushStage] → ShaderStageFlags
@@ -601,7 +649,7 @@ recordCommand commands = \case
                       }
                 )
           }
-  CommandBeginRendering view extent (ClearColor red green blue alpha) →
+  CommandBeginRendering view extent (ClearColor red green blue alpha) depth →
     beginRenderingUnsafe
       commands
       RenderingInfo
@@ -625,7 +673,7 @@ recordCommand commands = \case
                     , clearValue = Color (Float32 red green blue alpha)
                     }
               )
-        , depthAttachment = Nothing
+        , depthAttachment = fmap (SomeStruct . depthAttachmentInfo) depth
         , stencilAttachment = Nothing
         }
   CommandEndRendering → endRenderingUnsafe commands
