@@ -213,9 +213,13 @@ SETTLING_SECONDS = 2
 # The most identifiers a pass's bracket may span and still have each asked
 # about directly.
 MAX_BRACKET = 4096
-# How many times the first termination asks again for a session it could not
-# read, before it tells only the process it launched.
-FIRST_TERMINATION_ATTEMPTS = 20
+# How long the first termination keeps asking for a session it could not read,
+# before it tells only the process it launched. Counted in elapsed time: no
+# single observation may outlast it either.
+FIRST_TERMINATION_SECONDS = 1.0
+# The longest one ``ps`` of the fallback may take when its caller has no sooner
+# deadline.
+PS_SECONDS = 30
 # How long expiry cleanup waits for a pass during which nothing was created on
 # the machine, before it reports that it could not confirm the session empty.
 CONFIRMING_SECONDS = 10
@@ -731,20 +735,37 @@ def darwin_process_table() -> list[tuple[int, str]] | None:
 observer_creations = 0
 
 
-def ps_process_table() -> list[tuple[int, str]] | None:
-    """The same, from ``ps``, where libproc is not to be had."""
+def remaining_seconds(deadline: float | None, most: float) -> float:
+    """How long a call may take: ``most``, or less when ``deadline`` is sooner."""
+    if deadline is None:
+        return most
+    return min(most, deadline - time.monotonic())
+
+
+def ps_process_table(deadline: float | None = None) -> list[tuple[int, str]] | None:
+    """The same, from ``ps``, where libproc is not to be had.
+
+    It never outlasts ``deadline``: a ``ps`` that has not answered by then is
+    killed and the table is unknown, and none is started once the deadline has
+    passed.
+    """
     global observer_creations
+    seconds = remaining_seconds(deadline, PS_SECONDS)
+    if seconds <= 0:
+        return None
+    # Counted as soon as it is started, whether or not it answers: it takes an
+    # identifier either way.
+    observer_creations += 1
     try:
         listing = subprocess.run(
             ["ps", "-A", "-o", "pid=,stat="],
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=seconds,
         )
     except (OSError, subprocess.SubprocessError):
         return None
-    observer_creations += 1
     if listing.returncode != 0:
         return None
     table: list[tuple[int, str]] = []
@@ -759,9 +780,10 @@ def ps_process_table() -> list[tuple[int, str]] | None:
     return table
 
 
-def process_table() -> list[tuple[int, str]] | None:
+def process_table(deadline: float | None = None) -> list[tuple[int, str]] | None:
     """Every process the platform lists, as its identifier and, where the
-    listing says, its state; ``None`` when the table cannot be read.
+    listing says, its state; ``None`` when the table cannot be read, including
+    when it could not be read by ``deadline``.
 
     This is the first half of observing a session — which processes exist — and
     the second half asks each one which session it is in. The two are not one
@@ -778,7 +800,7 @@ def process_table() -> list[tuple[int, str]] | None:
         table = darwin_process_table()
         if table is not None:
             return table
-    return ps_process_table()
+    return ps_process_table(deadline)
 
 
 def process_session(pid: int, state: str) -> tuple[int, str, int] | None:
@@ -808,7 +830,7 @@ def process_session(pid: int, state: str) -> tuple[int, str, int] | None:
         return None
 
 
-def observe_session(session: int) -> dict[int, int] | None:
+def observe_session(session: int, deadline: float | None = None) -> dict[int, int] | None:
     """One pass over the process table: who is in ``session`` and still running,
     each with its process group.
 
@@ -816,7 +838,7 @@ def observe_session(session: int) -> dict[int, int] | None:
     A process that exits during the pass is simply gone, and a zombie has
     already stopped: neither is a member.
     """
-    table = process_table()
+    table = process_table(deadline)
     if table is None:
         return None
     members: dict[int, int] = {}
@@ -854,7 +876,9 @@ def newest_pid() -> int | None:
     return pid
 
 
-def bracketed_observation(session: int) -> tuple[dict[int, int] | None, bool]:
+def bracketed_observation(
+    session: int, deadline: float | None = None
+) -> tuple[dict[int, int] | None, bool]:
     """One pass, with every process created during it asked directly.
 
     A pass lists the processes and then asks each its session, so a member that
@@ -870,7 +894,7 @@ def bracketed_observation(session: int) -> tuple[dict[int, int] | None, bool]:
     were created than ``MAX_BRACKET`` allows asking about.
     """
     before = newest_pid()
-    members = observe_session(session)
+    members = observe_session(session, deadline)
     after = newest_pid()
     if members is None:
         return None, False
@@ -891,7 +915,9 @@ def bracketed_observation(session: int) -> tuple[dict[int, int] | None, bool]:
     return members, True
 
 
-def strict_observation(session: int) -> tuple[dict[int, int] | None, bool]:
+def strict_observation(
+    session: int, deadline: float | None = None
+) -> tuple[dict[int, int] | None, bool]:
     """One pass, and whether nothing was created anywhere while it ran.
 
     If nothing at all was created during a pass, every process in the session at
@@ -903,7 +929,7 @@ def strict_observation(session: int) -> tuple[dict[int, int] | None, bool]:
     """
     own = observer_creations
     before = newest_pid()
-    members = observe_session(session)
+    members = observe_session(session, deadline)
     after = newest_pid()
     # The observer's own processes — each ``ps`` it started — are accounted for;
     # anything beyond them spoils the pass.
@@ -921,10 +947,10 @@ def cleanup_observation(
     (:func:`strict_observation`), so passes are repeated until one is or
     ``limit`` passes. A session that could not be read is ``(None, False)``; one
     whose emptiness could not be confirmed in time is ``({}, False)``, and the
-    caller must not treat it as clean.
+    caller must not treat it as clean. No pass outlasts ``limit``.
     """
     while True:
-        members, strict = strict_observation(session)
+        members, strict = strict_observation(session, limit)
         if members is None:
             return None, False
         if members or strict:
@@ -933,7 +959,7 @@ def cleanup_observation(
             return members, False
 
 
-def session_members(session: int) -> dict[int, int] | None:
+def session_members(session: int, deadline: float | None = None) -> dict[int, int] | None:
     """Every live process in the stage's session, whichever group it is in.
 
     A command's session is the one its launch created, so its identifier is the
@@ -948,26 +974,31 @@ def session_members(session: int) -> dict[int, int] | None:
     replacement and exits before its own query leaves a replacement nothing
     asked about, so an empty answer can be early. That residual is accepted and
     documented (docs/validation.md); expiry cleanup does not rely on it.
+
+    Nothing here outlasts ``deadline``, the caller's own: a table that cannot be
+    read by then is not knowing, as ever.
     """
-    members = observe_session(session)
+    members = observe_session(session, deadline)
     if members != {}:
         return members
     limit = time.monotonic() + SETTLING_SECONDS
+    if deadline is not None:
+        limit = min(limit, deadline)
     while time.monotonic() < limit:
-        members, complete = bracketed_observation(session)
+        members, complete = bracketed_observation(session, limit)
         if members is None or members or complete:
             return members
     return None
 
 
-def stage_alive(session: int) -> bool:
+def stage_alive(session: int, deadline: float | None = None) -> bool:
     """Whether anything the stage started still runs in its session.
 
     A session that cannot be observed is reported alive, like a group this
     runner may not signal: a survivor must not be reported as gone, and the
-    next poll asks again.
+    next poll asks again. ``deadline`` is the stage's own.
     """
-    members = session_members(session)
+    members = session_members(session, deadline)
     if members is None:
         return True
     return bool(members)
@@ -1037,7 +1068,11 @@ def signal_members(
 
 
 def signal_session(
-    process: subprocess.Popen, session: int, group: int | None, number: int
+    process: subprocess.Popen,
+    session: int,
+    group: int | None,
+    number: int,
+    deadline: float | None = None,
 ) -> dict[int, int] | None:
     """Signal every live member of the stage's session; return who was seen.
 
@@ -1045,7 +1080,7 @@ def signal_session(
     goes to the group the command made and the process the runner holds — the
     most that can be named without looking — rather than to nobody.
     """
-    members = session_members(session)
+    members = session_members(session, deadline)
     if members is None:
         try:
             if group is None:
@@ -1061,20 +1096,41 @@ def signal_session(
     return members
 
 
-def signal_known_groups(known: set[int], session: int, number: int) -> None:
-    """Signal every process group this cleanup has seen a member of the session in.
+class Remembered:
+    """What expiry cleanup has seen of the session: every process in it and every
+    process group any of them was in.
 
-    A group is remembered from the pass that found someone in it and signalled
-    again whether or not a later pass finds anyone there: descendants that hand
-    off into one another faster than a pass can list them still live in a group
-    that is known, and a group signal reaches whichever of them is alive. A
-    process group lies wholly inside one session, so this stays inside the
-    stage's. The group's identifier is the process id of its first process, which
-    stays reserved while any member lives, so a group whose first process is
-    still alive is signalled only if that process is in the session; one whose
-    first process has gone has only the members it was seen to have.
+    Both are kept because observation can fail or be outpaced. A group is
+    signalled again whether or not a later pass finds anyone there, which reaches
+    descendants that hand off into one another faster than a pass can list them;
+    a process is signalled again by its own identifier, which reaches it
+    wherever it has moved to since, a group of its own included.
     """
-    for group in sorted(known):
+
+    def __init__(self, group: int | None) -> None:
+        self.groups: set[int] = set() if group is None else {group}
+        self.pids: set[int] = set()
+
+    def note(self, members: dict[int, int] | None) -> None:
+        if members:
+            self.groups |= set(members.values())
+            self.pids |= set(members)
+
+
+def signal_remembered(known: Remembered, session: int, number: int) -> None:
+    """Signal everything cleanup has seen of the session, and nothing outside it.
+
+    Each process group is signalled; a process group lies wholly inside one
+    session, so this stays inside the stage's. The group's identifier is the
+    process id of its first process, which stays reserved while any member
+    lives, so a group whose first process is still alive is signalled only if
+    that process is in the session; one whose first process has gone has only
+    the members it was seen to have. Each remembered process is signalled by
+    its identifier, and only if it is still in the session when asked: one that
+    has gone, or whose identifier has been reused outside the stage, is not
+    reached.
+    """
+    for group in sorted(known.groups):
         try:
             if os.getsid(group) != session:
                 continue
@@ -1086,29 +1142,32 @@ def signal_known_groups(known: set[int], session: int, number: int) -> None:
             os.killpg(group, number)
         except OSError:
             pass
+    for pid in sorted(known.pids):
+        signal_member(pid, session, number)
 
 
 def freeze_session(
-    session: int, group: int | None, known: set[int], limit: float
+    session: int, group: int | None, known: Remembered, limit: float
 ) -> bool:
     """Stop every member of the session where it stands, until none is new.
 
     A stopped process cannot fork, so once a pass nothing was created during
     finds only members already stopped, the session cannot grow and what is in
-    it can be killed in one sweep rather than chased. Every group seen so far is
-    stopped as well, whether or not this pass sees anyone in it. Returns whether
-    that fixed point was reached before ``limit``; a session that cannot be
-    observed cannot be frozen and is simply killed.
+    it can be killed in one sweep rather than chased. Every group and process
+    seen so far is stopped as well, whether or not this pass sees them. Returns
+    whether that fixed point was reached before ``limit``; a session that cannot
+    be observed cannot be frozen and is simply stopped as far as it is
+    remembered, and killed.
     """
     frozen: set[int] = set()
     while time.monotonic() < limit:
-        members, strict = strict_observation(session)
+        members, strict = strict_observation(session, limit)
         if members is None:
-            signal_known_groups(known, session, signal.SIGSTOP)
+            signal_remembered(known, session, signal.SIGSTOP)
             return False
-        known |= set(members.values())
+        known.note(members)
         fresh = set(members) - frozen
-        signal_known_groups(known, session, signal.SIGSTOP)
+        signal_remembered(known, session, signal.SIGSTOP)
         signal_members(members, session, signal.SIGSTOP)
         frozen |= fresh
         if not fresh and strict:
@@ -1122,17 +1181,18 @@ def first_termination(process: subprocess.Popen, session: int) -> tuple[set[int]
     The recipients are exactly the processes named in the first returned value,
     each told once: that is what lets later polls tell only processes that were
     not, and never one that is already running its cleanup. A session that
-    cannot be read is asked again for as long as a second; if it still cannot be,
-    only the process this runner launched is told, since a signal to a group
+    cannot be read is asked again for ``FIRST_TERMINATION_SECONDS`` of elapsed
+    time, and no single observation may outlast that either; if it still cannot
+    be, only the process this runner launched is told, since a signal to a group
     would reach processes nobody can name, and the rest are told when they are
     first seen. The second value is what was observed.
     """
-    members = None
-    for _ in range(FIRST_TERMINATION_ATTEMPTS):
-        members = session_members(session)
-        if members is not None:
+    deadline = time.monotonic() + FIRST_TERMINATION_SECONDS
+    while True:
+        members = session_members(session, deadline)
+        if members is not None or time.monotonic() >= deadline:
             break
-        time.sleep(TEARDOWN_POLL_SECONDS)
+        time.sleep(min(TEARDOWN_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
     if members is None:
         try:
             process.send_signal(signal.SIGTERM)
@@ -1169,16 +1229,19 @@ def terminate_session(process: subprocess.Popen, session: int, group: int | None
     The guarantee is that the group the command was launched in, every member
     observed in the session and every process group any of them was observed in
     are told to terminate, given the grace, and then stopped and killed again and
-    again until a pass during which nothing was created on the machine finds the
-    session empty (:func:`cleanup_observation`), or until the cap. It is not a guarantee about
+    again — each observed process by its own identifier, after asking whether it
+    is still in the session, and each group — until a pass during which nothing
+    was created on the machine finds the session empty
+    (:func:`cleanup_observation`), or until the cap. It is not a guarantee about
     every process in the session: a descendant that keeps handing off into
     fresh groups faster than they are observed can outlive it. When the cap
     runs out the cleanup is not reported clean: it reports that it killed.
+    Every observation is bounded by the deadline of the phase asking, so a table
+    that cannot be read in time costs that phase no more than its own cap.
     """
     seen, observed = first_termination(process, session)
-    known: set[int] = set(observed.values())
-    if group is not None:
-        known.add(group)
+    known = Remembered(group)
+    known.note(observed)
     grace = time.monotonic() + TERMINATION_GRACE_SECONDS
     while True:
         members, confirmed = cleanup_observation(
@@ -1186,7 +1249,7 @@ def terminate_session(process: subprocess.Popen, session: int, group: int | None
         )
         leader_exited = process.poll() is not None
         found = members or {}
-        known |= set(found.values())
+        known.note(found)
         # The leader going is not the session going: its descendants get
         # whatever is left of the same grace before anything is killed.
         if leader_exited and members == {} and confirmed:
@@ -1202,12 +1265,12 @@ def terminate_session(process: subprocess.Popen, session: int, group: int | None
     freeze_session(session, group, known, reach)
     while True:
         members, confirmed = cleanup_observation(session, reach)
-        known |= set((members or {}).values())
-        signal_known_groups(known, session, signal.SIGKILL)
+        known.note(members)
+        signal_remembered(known, session, signal.SIGKILL)
         if members:
             signal_members(members, session, signal.SIGKILL)
         elif members is None:
-            signal_session(process, session, group, signal.SIGKILL)
+            signal_session(process, session, group, signal.SIGKILL, reach)
         if process.poll() is not None and members == {} and confirmed:
             break
         if time.monotonic() >= reach:
@@ -1258,7 +1321,7 @@ def execute(command: list[str], root: str, timeout_seconds: int, environment: di
         # The deadline is absolute, fixed before the command was started, so
         # whatever starting it cost is spent from the same budget.
         process.wait(timeout=max(0.0, deadline - time.monotonic()))
-        while stage_alive(session):
+        while stage_alive(session, deadline):
             if time.monotonic() >= deadline:
                 expired = True
                 break

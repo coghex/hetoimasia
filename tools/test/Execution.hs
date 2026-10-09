@@ -335,6 +335,47 @@ spec = describe "Validation execution" $ do
         -- measurement.
         handoffStage fixture "expiry-escalate" 400 `shouldReturn` ["timeout", "True", "gone", "separate"]
 
+    it "kills a descendant that moved to a group of its own after it was observed, when the session can no longer be read" $
+      withFixture $ \fixture →
+        -- The descendant was observed at the first signal, in the launch group;
+        -- it then moved to a group of its own and ignores the signal, and from
+        -- then on nothing can be observed. Only its remembered identifier
+        -- reaches it, so cleanup must signal remembered processes as well as
+        -- remembered groups.
+        observedStage fixture `shouldReturn` ["timeout", "True", "gone"]
+
+    it "signals a remembered process only while it is in the session" $
+      withFixture $ \fixture →
+        -- An identifier cleanup remembered may since have been reused outside the
+        -- stage: it is asked its session before every signal, and a process or
+        -- group outside it is neither stopped nor killed.
+        rememberedStage fixture `shouldReturn` ["untouched", "reached"]
+
+    it "bounds a ps that never answers by the deadline it was given" $
+      withFixture $ \fixture → do
+        answer ← hungObserverStage fixture "unit"
+        if answer == ["no-ps"]
+          then pendingWith "this machine has no ps to fall back on"
+          else answer `shouldBe` ["bounded", "counted", "skipped"]
+
+    forM_
+      [ ("expiry", ["timeout", "True", "gone", "prompt", "told-promptly"])
+      , ("completion", ["timeout", "True", "gone", "prompt"])
+      , ("slow", ["timeout", "True", "gone", "prompt", "told-promptly"])
+      ]
+      $ \(mode, expected) →
+        it ("keeps every observation inside its caller's deadline, in the " ++ mode ++ " case") $
+          withFixture $ \fixture → do
+            -- ps never answers (or answers after a pause), where an observation
+            -- allowed its own thirty seconds would postpone the first
+            -- termination and every cap by minutes. The first termination goes
+            -- out within its own bound, the descendant is ended through the
+            -- launch group, and the cleanup reports that it killed.
+            answer ← hungObserverStage fixture mode
+            if answer == ["no-ps"]
+              then pendingWith "this machine has no ps to fall back on"
+              else answer `shouldBe` expected
+
     forM_ [("could not be confirmed empty", "unconfirmed"), ("could not be read", "uncertain")] $ \(label, mode) →
       it ("stays within its cap, as a kill, when the session " ++ label) $
         withFixture $ \fixture →
@@ -1937,7 +1978,7 @@ watchdogStage fixture mode = do
           , "    runner.subprocess.Popen = slow"
           , "    stage = runner.execute(['sh', '-c', 'sleep 0.7'], root, 1, dict(os.environ))"
           , "elif mode == 'unobservable':"
-          , "    runner.session_members = lambda session: None"
+          , "    runner.session_members = lambda session, deadline=None: None"
           , "    runner.TERMINATION_GRACE_SECONDS = 1"
           , "    runner.KILLING_SECONDS = 1"
           , "    stage = runner.execute(['true'], root, 1, dict(os.environ))"
@@ -2078,8 +2119,8 @@ handoffStage fixture mode handoffs = do
           , "        time.sleep(0.01)"
           , "def due(kind):"
           , "    return state['armed'] and state['next'] < len(events) and events[state['next']] == kind"
-          , "def handing_off():"
-          , "    table = listing()"
+          , "def handing_off(deadline=None):"
+          , "    table = listing(deadline)"
           , "    if table is not None and due('plain'):"
           , "        release()"
           , "    elif table is not None and state['opened'] and due('table'):"
@@ -2154,6 +2195,285 @@ handoffStage fixture mode handoffs = do
   (result, errors) `shouldBe` (ExitSuccess, "")
   pure (lines output)
 
+-- | Drive the real runner's stage execution of a command whose descendant,
+-- told to terminate, moves into a process group of its own and ignores the
+-- signal, while the session can no longer be observed. Cleanup has only what it
+-- remembers: the descendant was observed at the first signal, so it must be
+-- reached by its own identifier, wherever it has moved. Reports the outcome,
+-- whether cleanup reported a kill, and whether the descendant was gone.
+observedStage ∷ Fixture → IO [String]
+observedStage fixture = do
+  (result, output, errors) ←
+    run
+      (environment fixture)
+      (root fixture)
+      "python3"
+      [ "-I"
+      , "-c"
+      , unlines
+          [ "import importlib.util, os, signal, sys, tempfile, time"
+          , "sys.dont_write_bytecode = True"
+          , "signal.alarm(120)"
+          , "path, root = sys.argv[1:3]"
+          , "specification = importlib.util.spec_from_file_location('runner_under_test', path)"
+          , "runner = importlib.util.module_from_spec(specification)"
+          , "specification.loader.exec_module(runner)"
+          , "runner.TERMINATION_GRACE_SECONDS = 1"
+          , "runner.CONFIRMING_SECONDS = 1"
+          , "runner.KILLING_SECONDS = 2"
+          , "scratch = tempfile.mkdtemp()"
+          , "ready, moved, pidfile = (os.path.join(scratch, name) for name in ('ready', 'moved', 'pid'))"
+          , "leader = '''"
+          , "import os, signal, sys, time"
+          , "ready, moved, pidfile = sys.argv[1:4]"
+          , "# Nothing here may hold the driver's pipes open if it fails."
+          , "devnull = os.open(os.devnull, os.O_RDWR)"
+          , "for descriptor in (0, 1, 2):"
+          , "    os.dup2(devnull, descriptor)"
+          , "child = os.fork()"
+          , "if child == 0:"
+          , "    def handler(number, frame):"
+          , "        os.setpgid(0, 0)"
+          , "        signal.signal(signal.SIGTERM, signal.SIG_IGN)"
+          , "        with open(moved, 'w') as handle:"
+          , "            handle.write('moved')"
+          , "    signal.signal(signal.SIGTERM, handler)"
+          , "    with open(pidfile, 'w') as handle:"
+          , "        handle.write(str(os.getpid()))"
+          , "    with open(ready, 'w') as handle:"
+          , "        handle.write('ready')"
+          , "    end = time.monotonic() + 90"
+          , "    while time.monotonic() < end:"
+          , "        time.sleep(0.05)"
+          , "    os._exit(0)"
+          , "signal.signal(signal.SIGTERM, signal.SIG_IGN)"
+          , "os.waitpid(child, 0)"
+          , "'''"
+          , "def waiting(file):"
+          , "    end = time.monotonic() + 20"
+          , "    while not os.path.exists(file) and time.monotonic() < end:"
+          , "        time.sleep(0.02)"
+          , "state = {'dark': False}"
+          , "telling = runner.first_termination"
+          , "def telling_first(process, session):"
+          , "    # The descendant has its handler in place before it is told, and has"
+          , "    # moved before the session goes dark, so what it was observed in is"
+          , "    # the group it has left."
+          , "    waiting(ready)"
+          , "    told = telling(process, session)"
+          , "    waiting(moved)"
+          , "    state['dark'] = True"
+          , "    return told"
+          , "runner.first_termination = telling_first"
+          , "observing = runner.observe_session"
+          , "def observe(session, *rest):"
+          , "    return None if state['dark'] else observing(session, *rest)"
+          , "runner.observe_session = observe"
+          , "descendant = None"
+          , "try:"
+          , "    stage = runner.execute(['python3', '-c', leader, ready, moved, pidfile], root, 1, dict(os.environ))"
+          , "    descendant = int(open(pidfile).read())"
+          , "    gone = False"
+          , "    patience = time.monotonic() + 5"
+          , "    while time.monotonic() < patience:"
+          , "        try:"
+          , "            os.kill(descendant, 0)"
+          , "        except ProcessLookupError:"
+          , "            gone = True"
+          , "            break"
+          , "        time.sleep(0.05)"
+          , "    print(stage['outcome'])"
+          , "    print(stage['expiry']['killed'])"
+          , "    print('gone' if gone else 'running')"
+          , "finally:"
+          , "    if descendant is not None:"
+          , "        try:"
+          , "            os.kill(descendant, signal.SIGKILL)"
+          , "        except OSError:"
+          , "            pass"
+          ]
+      , tools fixture </> "run.py"
+      , root fixture
+      ]
+  (result, errors) `shouldBe` (ExitSuccess, "")
+  pure (lines output)
+
+-- | Drive the runner's signalling of what it remembers, with one process in the
+-- session and one outside it, each remembered by identifier and group. Reports
+-- whether the one outside was left alone, stopped or killed, and whether the
+-- one inside was reached.
+rememberedStage ∷ Fixture → IO [String]
+rememberedStage fixture = do
+  (result, output, errors) ←
+    run
+      (environment fixture)
+      (root fixture)
+      "python3"
+      [ "-I"
+      , "-c"
+      , unlines
+          [ "import importlib.util, os, signal, subprocess, sys, time"
+          , "sys.dont_write_bytecode = True"
+          , "signal.alarm(60)"
+          , "path = sys.argv[1]"
+          , "specification = importlib.util.spec_from_file_location('runner_under_test', path)"
+          , "runner = importlib.util.module_from_spec(specification)"
+          , "specification.loader.exec_module(runner)"
+          , "outside = subprocess.Popen(['sleep', '300'], start_new_session=True)"
+          , "inside = subprocess.Popen(['sleep', '300'])"
+          , "try:"
+          , "    known = runner.Remembered(None)"
+          , "    known.pids |= {outside.pid, inside.pid}"
+          , "    known.groups.add(outside.pid)"
+          , "    session = os.getsid(0)"
+          , "    runner.signal_remembered(known, session, signal.SIGSTOP)"
+          , "    time.sleep(0.3)"
+          , "    stopped = os.waitpid(outside.pid, os.WUNTRACED | os.WNOHANG)[0] != 0"
+          , "    runner.signal_remembered(known, session, signal.SIGKILL)"
+          , "    time.sleep(0.3)"
+          , "    print('untouched' if not stopped and outside.poll() is None else 'reached')"
+          , "    print('reached' if inside.poll() is not None else 'untouched')"
+          , "finally:"
+          , "    for process in (outside, inside):"
+          , "        try:"
+          , "            process.kill()"
+          , "        except OSError:"
+          , "            pass"
+          , "        process.wait()"
+          ]
+      , tools fixture </> "run.py"
+      ]
+  (result, errors) `shouldBe` (ExitSuccess, "")
+  pure (lines output)
+
+-- | Drive the real runner's stage execution with the process table read through
+-- @ps@, which is made to hang for good (@hung@) or to answer slowly (@slow@).
+-- @unit@ asks the fallback itself for a table against a short deadline, then
+-- against one already passed. @expiry@ is a command that outlives its budget,
+-- @completion@ one whose leader exits at once leaving a descendant, and @slow@
+-- the first with a @ps@ that answers after a pause. The caps are shrunk. Reports
+-- what each case's bound shows: the outcome, whether cleanup reported a kill,
+-- that the descendant was gone, that the whole run returned promptly and, for
+-- @expiry@, that the first termination was sent promptly.
+hungObserverStage ∷ Fixture → String → IO [String]
+hungObserverStage fixture mode = do
+  (result, output, errors) ←
+    run
+      (environment fixture)
+      (root fixture)
+      "python3"
+      [ "-I"
+      , "-c"
+      , unlines
+          [ "import importlib.util, os, shutil, signal, sys, tempfile, time"
+          , "sys.dont_write_bytecode = True"
+          , "signal.alarm(120)"
+          , "path, root, mode = sys.argv[1:4]"
+          , "real = shutil.which('ps')"
+          , "if real is None:"
+          , "    print('no-ps')"
+          , "    sys.exit(0)"
+          , "specification = importlib.util.spec_from_file_location('runner_under_test', path)"
+          , "runner = importlib.util.module_from_spec(specification)"
+          , "specification.loader.exec_module(runner)"
+          , "scratch = tempfile.mkdtemp()"
+          , "if mode != 'slow':"
+          , "    # A ps that never answers; exec keeps it one process, so killing it"
+          , "    # leaves nothing behind."
+          , "    bindir = os.path.join(scratch, 'bin')"
+          , "    os.mkdir(bindir)"
+          , "    fake = os.path.join(bindir, 'ps')"
+          , "    with open(fake, 'w') as handle:"
+          , "        handle.write('#!/bin/sh\\nexec sleep 300\\n')"
+          , "    os.chmod(fake, 0o755)"
+          , "    os.environ['PATH'] = bindir + os.pathsep + os.environ['PATH']"
+          , "if mode == 'unit':"
+          , "    started = time.monotonic()"
+          , "    table = runner.ps_process_table(started + 0.3)"
+          , "    took = time.monotonic() - started"
+          , "    created = runner.observer_creations"
+          , "    past = runner.ps_process_table(time.monotonic() - 1)"
+          , "    print('bounded' if table is None and took < 5 else 'unbounded')"
+          , "    print('counted' if created == 1 else 'uncounted')"
+          , "    print('skipped' if past is None and runner.observer_creations == created else 'started')"
+          , "    sys.exit(0)"
+          , "runner.TERMINATION_GRACE_SECONDS = 1"
+          , "runner.KILLING_SECONDS = 1"
+          , "runner.CONFIRMING_SECONDS = 1"
+          , "runner.FIRST_TERMINATION_SECONDS = 0.5"
+          , "real_table = runner.ps_process_table"
+          , "if mode == 'slow':"
+          , "    def slow(deadline=None):"
+          , "        pause = 0.2 if deadline is None else min(0.2, deadline - time.monotonic())"
+          , "        if pause > 0:"
+          , "            time.sleep(pause)"
+          , "        return real_table(deadline)"
+          , "    runner.process_table = slow"
+          , "else:"
+          , "    runner.process_table = real_table"
+          , "record, told = (os.path.join(scratch, name) for name in ('child', 'told'))"
+          , "leader = '''"
+          , "import os, signal, subprocess, sys, time"
+          , "record, told, role = sys.argv[1:4]"
+          , "# Nothing here may hold the driver's pipes open if it fails."
+          , "devnull = os.open(os.devnull, os.O_RDWR)"
+          , "for descriptor in (0, 1, 2):"
+          , "    os.dup2(devnull, descriptor)"
+          , "child = subprocess.Popen(['python3', '-c', 'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(90)'])"
+          , "with open(record, 'w') as handle:"
+          , "    handle.write(str(child.pid))"
+          , "if role == 'exit':"
+          , "    sys.exit(0)"
+          , "def handler(number, frame):"
+          , "    with open(told, 'w') as handle:"
+          , "        handle.write(repr(time.time()))"
+          , "signal.signal(signal.SIGTERM, handler)"
+          , "end = time.monotonic() + 90"
+          , "while time.monotonic() < end:"
+          , "    time.sleep(0.05)"
+          , "'''"
+          , "entered = []"
+          , "telling = runner.first_termination"
+          , "def telling_first(process, session):"
+          , "    entered.append(time.time())"
+          , "    return telling(process, session)"
+          , "runner.first_termination = telling_first"
+          , "child = None"
+          , "try:"
+          , "    started = time.monotonic()"
+          , "    stage = runner.execute(['python3', '-c', leader, record, told, 'exit' if mode == 'completion' else 'stay'], root, 1, dict(os.environ))"
+          , "    took = time.monotonic() - started"
+          , "    child = int(open(record).read())"
+          , "    gone = False"
+          , "    patience = time.monotonic() + 5"
+          , "    while time.monotonic() < patience:"
+          , "        try:"
+          , "            os.kill(child, 0)"
+          , "        except ProcessLookupError:"
+          , "            gone = True"
+          , "            break"
+          , "        time.sleep(0.05)"
+          , "    print(stage['outcome'])"
+          , "    print(stage['expiry']['killed'])"
+          , "    print('gone' if gone else 'running')"
+          , "    print('prompt' if took < 15 else 'slow')"
+          , "    if mode != 'completion':"
+          , "        delay = float(open(told).read()) - entered[0] if os.path.exists(told) else None"
+          , "        print('told-promptly' if delay is not None and delay < 3 else 'told-late')"
+          , "finally:"
+          , "    if child is not None:"
+          , "        try:"
+          , "            os.kill(child, signal.SIGKILL)"
+          , "        except OSError:"
+          , "            pass"
+          ]
+      , tools fixture </> "run.py"
+      , root fixture
+      , mode
+      ]
+  (result, errors) `shouldBe` (ExitSuccess, "")
+  pure (lines output)
+
 -- | Drive the real runner's stage execution of a command that outlives its
 -- budget, with the observation cleanup depends on replaced: @unconfirmed@
 -- always answers that the session is empty but never that nothing was created
@@ -2181,11 +2501,11 @@ capStage fixture mode = do
           , "runner.TERMINATION_GRACE_SECONDS = 0.3"
           , "runner.CONFIRMING_SECONDS = 0.3"
           , "runner.KILLING_SECONDS = 0.5"
-          , "runner.FIRST_TERMINATION_ATTEMPTS = 2"
+          , "runner.FIRST_TERMINATION_SECONDS = 0.1"
           , "if mode == 'unconfirmed':"
-          , "    runner.strict_observation = lambda session: ({}, False)"
+          , "    runner.strict_observation = lambda session, deadline=None: ({}, False)"
           , "else:"
-          , "    runner.observe_session = lambda session: None"
+          , "    runner.observe_session = lambda session, deadline=None: None"
           , "scratch = tempfile.mkdtemp()"
           , "record = os.path.join(scratch, 'child')"
           , "child = None"
@@ -2272,9 +2592,9 @@ transientStage fixture failures regroup = do
           , "'''"
           , "real = runner.session_members"
           , "calls = []"
-          , "def flaky(session):"
+          , "def flaky(session, deadline=None):"
           , "    calls.append(session)"
-          , "    return None if len(calls) <= failures else real(session)"
+          , "    return None if len(calls) <= failures else real(session, deadline)"
           , "runner.session_members = flaky"
           , "stage = runner.execute(['python3', '-c', handler, regroup], root, 1, environment)"
           , "kept = os.path.join(evidence, 'cleaned')"
