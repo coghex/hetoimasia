@@ -62,6 +62,24 @@
 -- four bytes a pixel in the target's own byte order, tightly packed and
 -- unconverted, readable once the copying batch's submission has completed.
 --
+-- = Depth attachments (GRS-10)
+--
+-- A pass into a managed color target can take a managed 'DepthTarget' image of
+-- the same extent as its depth attachment: 'beginRenderingWithDepth' clears it
+-- to a value ('defaultDepthClear', 1.0, unless the 'DepthPass' names another)
+-- under #335's rules, in its depth-attachment use, which it rests in, with its
+-- own 'PassStart'. A pipeline declares the depth it renders with
+-- ('createPipelineWithDepth', 'createDepthCheckedPipeline', 'PipelineDepth'):
+-- the depth-only format of the attachment, whether it tests and writes depth,
+-- and the comparison ('depthTested', less-or-equal). A pipeline is drawn only
+-- in a pass whose depth attachment has exactly the format it declares, and one
+-- that declares none only in a pass that has none, checked when it is bound and
+-- again by every draw. The depth-only format the backend uses is the device's
+-- first supported of 'depthFormatPreference', which 'selectDepthFormat' asks of
+-- it; no format has a stencil aspect. Depth is Vulkan's convention (D-36):
+-- clip-space Y points down and depth runs 0 to 1. Every refusal makes no native
+-- call.
+--
 -- = Names and labels
 --
 -- When the roots offer naming ('readRootsInstrumentation'), every managed
