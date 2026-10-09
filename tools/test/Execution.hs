@@ -358,17 +358,28 @@ spec = describe "Validation execution" $ do
           then pendingWith "this machine has no ps to fall back on"
           else answer `shouldBe` ["bounded", "counted", "skipped"]
 
+    it "reads nothing from the platform's own table once the deadline has passed" $
+      withFixture $ \fixture →
+        -- An exhausted deadline is not met with a scan that runs on: every
+        -- observation, native or ps, answers unknown at once, never a partial
+        -- set and never an empty session.
+        hungObserverStage fixture "native-unit" `shouldReturn` ["unknown"]
+
     forM_
       [ ("expiry", ["timeout", "True", "gone", "prompt", "told-promptly"])
       , ("completion", ["timeout", "True", "gone", "prompt"])
       , ("slow", ["timeout", "True", "gone", "prompt", "told-promptly"])
+      , ("native-expiry", ["timeout", "True", "gone", "prompt", "capped", "told-promptly"])
+      , ("native-completion", ["timeout", "True", "gone", "prompt", "capped"])
       ]
       $ \(mode, expected) →
         it ("keeps every observation inside its caller's deadline, in the " ++ mode ++ " case") $
           withFixture $ \fixture → do
-            -- ps never answers (or answers after a pause), where an observation
-            -- allowed its own thirty seconds would postpone the first
-            -- termination and every cap by minutes. The first termination goes
+            -- ps never answers (or answers after a pause), or the platform's own
+            -- table is long and every query in it slow (the native cases:
+            -- hundreds of queries at a few milliseconds each, against caps of
+            -- fifty milliseconds), where an observation allowed its own time
+            -- would postpone the first termination and every cap by minutes. The first termination goes
             -- out within its own bound, the descendant is ended through the
             -- launch group, and the cleanup reports that it killed.
             answer ← hungObserverStage fixture mode
@@ -2369,15 +2380,16 @@ hungObserverStage fixture mode = do
           , "sys.dont_write_bytecode = True"
           , "signal.alarm(120)"
           , "path, root, mode = sys.argv[1:4]"
+          , "native = mode.startswith('native')"
           , "real = shutil.which('ps')"
-          , "if real is None:"
+          , "if real is None and not native:"
           , "    print('no-ps')"
           , "    sys.exit(0)"
           , "specification = importlib.util.spec_from_file_location('runner_under_test', path)"
           , "runner = importlib.util.module_from_spec(specification)"
           , "specification.loader.exec_module(runner)"
           , "scratch = tempfile.mkdtemp()"
-          , "if mode != 'slow':"
+          , "if mode in ('unit', 'expiry', 'completion'):"
           , "    # A ps that never answers; exec keeps it one process, so killing it"
           , "    # leaves nothing behind."
           , "    bindir = os.path.join(scratch, 'bin')"
@@ -2397,12 +2409,41 @@ hungObserverStage fixture mode = do
           , "    print('counted' if created == 1 else 'uncounted')"
           , "    print('skipped' if past is None and runner.observer_creations == created else 'started')"
           , "    sys.exit(0)"
-          , "runner.TERMINATION_GRACE_SECONDS = 1"
-          , "runner.KILLING_SECONDS = 1"
-          , "runner.CONFIRMING_SECONDS = 1"
-          , "runner.FIRST_TERMINATION_SECONDS = 0.5"
+          , "if mode == 'native-unit':"
+          , "    # An expired deadline is not answered from the platform's own table"
+          , "    # either: nothing is read, and the answer is unknown, not empty."
+          , "    past = time.monotonic() - 1"
+          , "    session = os.getsid(0)"
+          , "    answers = [runner.process_table(past), runner.observe_session(session, past), runner.bracketed_observation(session, past)[0], runner.strict_observation(session, past)[0]]"
+          , "    print('unknown' if all(answer is None for answer in answers) else 'answered')"
+          , "    sys.exit(0)"
+          , "if native:"
+          , "    caps = 0.05"
+          , "    runner.TERMINATION_GRACE_SECONDS = caps"
+          , "    runner.KILLING_SECONDS = caps"
+          , "    runner.CONFIRMING_SECONDS = caps"
+          , "    runner.FIRST_TERMINATION_SECONDS = caps"
+          , "else:"
+          , "    runner.TERMINATION_GRACE_SECONDS = 1"
+          , "    runner.KILLING_SECONDS = 1"
+          , "    runner.CONFIRMING_SECONDS = 1"
+          , "    runner.FIRST_TERMINATION_SECONDS = 0.5"
           , "real_table = runner.ps_process_table"
-          , "if mode == 'slow':"
+          , "if native:"
+          , "    # The platform's own table, made long enough that asking everyone takes"
+          , "    # seconds whatever the host: every query costs a few milliseconds, and"
+          , "    # four hundred identifiers beyond any real one are listed as well."
+          , "    listing = runner.process_table"
+          , "    asking = runner.process_session"
+          , "    def long_table(deadline=None):"
+          , "        table = listing(deadline)"
+          , "        return None if table is None else table + [(pid, '') for pid in range(4000000, 4000400)]"
+          , "    def slow_query(pid, state):"
+          , "        time.sleep(0.005)"
+          , "        return asking(pid, state)"
+          , "    runner.process_table = long_table"
+          , "    runner.process_session = slow_query"
+          , "elif mode == 'slow':"
           , "    def slow(deadline=None):"
           , "        pause = 0.2 if deadline is None else min(0.2, deadline - time.monotonic())"
           , "        if pause > 0:"
@@ -2441,7 +2482,7 @@ hungObserverStage fixture mode = do
           , "child = None"
           , "try:"
           , "    started = time.monotonic()"
-          , "    stage = runner.execute(['python3', '-c', leader, record, told, 'exit' if mode == 'completion' else 'stay'], root, 1, dict(os.environ))"
+          , "    stage = runner.execute(['python3', '-c', leader, record, told, 'exit' if mode in ('completion', 'native-completion') else 'stay'], root, 1, dict(os.environ))"
           , "    took = time.monotonic() - started"
           , "    child = int(open(record).read())"
           , "    gone = False"
@@ -2456,10 +2497,12 @@ hungObserverStage fixture mode = do
           , "    print(stage['outcome'])"
           , "    print(stage['expiry']['killed'])"
           , "    print('gone' if gone else 'running')"
-          , "    print('prompt' if took < 15 else 'slow')"
-          , "    if mode != 'completion':"
+          , "    print('prompt' if took < (4 if native else 15) else 'slow')"
+          , "    if native:"
+          , "        print('capped' if stage['expiry']['cleanup_seconds'] < 1.5 else 'overran')"
+          , "    if mode in ('expiry', 'slow', 'native-expiry'):"
           , "        delay = float(open(told).read()) - entered[0] if os.path.exists(told) else None"
-          , "        print('told-promptly' if delay is not None and delay < 3 else 'told-late')"
+          , "        print('told-promptly' if delay is not None and delay < (1 if native else 3) else 'told-late')"
           , "finally:"
           , "    if child is not None:"
           , "        try:"

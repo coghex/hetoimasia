@@ -699,12 +699,21 @@ def source_run_url() -> str:
     return f"{server}/{repository}/actions/runs/{run_id}/attempts/{attempt}"
 
 
-def darwin_process_table() -> list[tuple[int, str]] | None:
+def expired(deadline: float | None) -> bool:
+    """Whether the caller's deadline has passed."""
+    return deadline is not None and time.monotonic() >= deadline
+
+
+def darwin_process_table(deadline: float | None = None) -> list[tuple[int, str]] | None:
     """Every process, from libproc, with ``Z`` for those that have stopped.
 
     One call lists them, so a pass over the table is quick and the identifiers
-    :func:`bracketed_observation` has to ask about directly stay few.
+    :func:`bracketed_observation` has to ask about directly stay few. A table
+    that is not complete by ``deadline`` is not a table: ``None``, never the part
+    that was read.
     """
+    if expired(deadline):
+        return None
     try:
         import ctypes
 
@@ -721,6 +730,8 @@ def darwin_process_table() -> list[tuple[int, str]] | None:
         for pid in pids[: written // 4]:
             if pid <= 0:
                 continue
+            if expired(deadline):
+                return None
             # PROC_PIDTBSDINFO: the status follows the flags in struct proc_bsdinfo.
             got = libproc.proc_pidinfo(pid, 3, 0, info, 256)
             status = int.from_bytes(info.raw[4:8], "little") if got > 0 else 0
@@ -790,6 +801,8 @@ def process_table(deadline: float | None = None) -> list[tuple[int, str]] | None
     atomic step, which is why :func:`session_members` asks directly about every
     process created during a pass that finds nobody.
     """
+    if expired(deadline):
+        return None
     if sys.platform.startswith("linux"):
         try:
             names = os.listdir("/proc")
@@ -797,7 +810,7 @@ def process_table(deadline: float | None = None) -> list[tuple[int, str]] | None
             return None
         return [(int(name), "") for name in names if name.isdigit()]
     if sys.platform == "darwin":
-        table = darwin_process_table()
+        table = darwin_process_table(deadline)
         if table is not None:
             return table
     return ps_process_table(deadline)
@@ -834,15 +847,19 @@ def observe_session(session: int, deadline: float | None = None) -> dict[int, in
     """One pass over the process table: who is in ``session`` and still running,
     each with its process group.
 
-    ``None`` means the table could not be read, which is not an empty session.
-    A process that exits during the pass is simply gone, and a zombie has
-    already stopped: neither is a member.
+    ``None`` means the table could not be read, which is not an empty session,
+    and neither is a pass that ran out of time before it had asked everyone:
+    ``deadline`` is checked before every query, and what was found so far is
+    never returned as the answer. A process that exits during the pass is simply
+    gone, and a zombie has already stopped: neither is a member.
     """
     table = process_table(deadline)
     if table is None:
         return None
     members: dict[int, int] = {}
     for pid, listed_state in table:
+        if expired(deadline):
+            return None
         try:
             found = process_session(pid, listed_state)
         except OSError:
@@ -891,7 +908,8 @@ def bracketed_observation(
 
     The second value is whether the bracket could be trusted at all: it cannot
     when the identifiers wrapped, when a marker could not be made, or when more
-    were created than ``MAX_BRACKET`` allows asking about.
+    were created than ``MAX_BRACKET`` allows asking about, and the pass is
+    unknown, not partial, when ``deadline`` passes before everyone was asked.
     """
     before = newest_pid()
     members = observe_session(session, deadline)
@@ -903,6 +921,8 @@ def bracketed_observation(
     for pid in range(before + 1, after):
         if pid in members:
             continue
+        if expired(deadline):
+            return None, False
         try:
             found = process_session(pid, "")
         except OSError:
