@@ -17,5 +17,11 @@ library depends on a sample, and nothing routine launches one.
   suite's `grs8-sprites` case runs; its executable (`sprites/app`,
   `hetoimasia-sprites`) writes the same evidence (`--evidence`) or shows the
   scene in a window (`--windowed`), launched by hand.
-
-A minimal 3D scene using the same infrastructure is still to come.
+- [`scene3d/`](scene3d/README.md) — GRS-10's 3D scaffolding scene: two
+  flat-coloured cubes, one in front of the other, drawn indexed with a depth
+  test from two camera poses built with `hetoimasia-math`, checked against an
+  independent ray-cast probe oracle. Its drawing and window-free evidence
+  (`scene3d/renderer`) are what the native suite's `grs10-scene3d` case runs;
+  its executable (`scene3d/app`, `hetoimasia-scene3d`) writes the same evidence
+  (`--evidence`), launched by hand. Its windowed mode arrives with windowed
+  depth (GRS-13).
