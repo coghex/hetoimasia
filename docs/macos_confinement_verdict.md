@@ -101,12 +101,69 @@ evidence only: it can never satisfy a Linux plan.
 
 `executed_commit` is `8ad27556f586fd8f55995ee8094dc929b422e2d7`, the commit that
 contains the corrected helper. The earlier receipt named `3911226` and does not
-answer for this helper. This document is a later Markdown commit. Markdown is
-[harmless prose](validation.md#harmless-prose), so it is excluded from
-`input_identity`, and the head's `input_identity` is still
-`10d1f256e65f2b4d68cf7c5ad0e83f101a2069d318e22a3afa6eea7d1c9eaddd`, the value
-the receipt carries. The receipt answers for the corrected helper this pull
-request merges.
+answer for this helper. The receipt records one execution, of that commit. It is
+not relabelled as an execution of any later one.
+
+#### Which revisions the receipt's identities equal
+
+The receipt's `input_identity` and `policy_version` are the planner's values for
+the revision it executed. The table gives the planner's values for four named
+revisions, recomputed with the planner at a fixed snapshot:
+`tools/validation/plan.py` and its helpers at
+`506bfce0c72395d9a2f4a370d06505d540583fa7`. The snapshot is named because the
+planner imports its helpers from its own checkout before it reads the candidate
+it is given, so naming the candidate alone does not fix the computation. With
+that snapshot checked out, for each `REV` in the table:
+
+```bash
+python3 tools/validation/plan.py --base REV --head REV --runner-os Darwin \
+  --toolchain ghc=9.14.1 --toolchain cabal=3.18.1.0 --json
+```
+
+| Revision | What it is | `input_identity` | `policy_version` |
+| --- | --- | --- | --- |
+| `8ad27556f586fd8f55995ee8094dc929b422e2d7` | the receipt's execution | `10d1f256e65f2b4d68cf7c5ad0e83f101a2069d318e22a3afa6eea7d1c9eaddd` | `fd8d341bab0f5f522d2b448d20717922ae00b4481ebce83a26dacb8144e41a8b` |
+| `8aceaf099e6171cea127c54dbb5feca264888531` | its Markdown-only successor, which changes only this document | `10d1f256e65f2b4d68cf7c5ad0e83f101a2069d318e22a3afa6eea7d1c9eaddd` | `fd8d341bab0f5f522d2b448d20717922ae00b4481ebce83a26dacb8144e41a8b` |
+| `de43df6c11d81ea92b1b760745c8b5f868a61bec` | the final head of [PR #243](https://github.com/coghex/hetoimasia/pull/243) | `3028a0d234a19150f906d42b08cdba388eaa55c06c0c52799008e3fb9a9554fb` | `564f93dbc87fa33be0f4ea268d8984e2245f478431c41c4c5a98dddafe6a9226` |
+| `9cd2a591af945a2245116a4f3466f8b0b632096e` | the merge that landed PR #243, with the tree of `de43df6` | `3028a0d234a19150f906d42b08cdba388eaa55c06c0c52799008e3fb9a9554fb` | `564f93dbc87fa33be0f4ea268d8984e2245f478431c41c4c5a98dddafe6a9226` |
+
+- The receipt's `input_identity` and `policy_version` equal the planner's values
+  at `8ad27556f586fd8f55995ee8094dc929b422e2d7` and at
+  `8aceaf099e6171cea127c54dbb5feca264888531`. The second is Markdown-only
+  relative to the first, which is why its identity did not move.
+- **They do not equal the planner's values at
+  `de43df6c11d81ea92b1b760745c8b5f868a61bec` or at
+  `9cd2a591af945a2245116a4f3466f8b0b632096e`.** `de43df6` merged `master` into
+  `8aceaf0` before PR #243 landed as `9cd2a591`, and that merge changed 61
+  files, among them `tools/validation/catalog.json`,
+  `tools/validation/plan.py`, `tools/validation/ci_image.py`,
+  `tools/toolchain/binding.pin` and the `tools/native/` recipes. The receipt
+  therefore does not answer for the integrated candidate at either revision.
+
+#### Historical workload evidence, and what it does not show
+
+The measured results above are observations of the source at
+`8ad27556f586fd8f55995ee8094dc929b422e2d7`. The `packages/scripting-lua/macos`
+subtree, which holds the macOS helper, its private probe and their tests, is the
+same git tree, `75a52a45860738d93399fdeec54fea625f164276`, at `8ad2755`,
+`8aceaf0`, `de43df6`, `9cd2a591` and at PR #243's review pin
+`5b56b17d5eb1af5ec10a1a5a28510f096096c825`. The one change the integration made
+to that package's description, `hetoimasia-scripting-lua.cabal`, adds the
+unrelated `lua-hazard-probes` test suite. So the observations describe helper,
+probe and test sources that merged.
+
+That is a statement about sources, and it is all this document claims from it.
+It does not make the receipt an execution of the integrated candidate. It does
+not show that a run there would give the same result. It says nothing about what
+the subtree does not contain: the toolchain pin, the native recipes, the
+validation tooling and the rest of what the merge changed.
+
+#### Integrated-candidate receipt evidence
+
+None is retained here. A receipt for the integrated candidate would be a fresh
+execution of `test.macos-confinement` at that candidate, recording its own
+`executed_commit` and identities, and would be kept as separate evidence. This
+document runs no probe and adds no receipt.
 
 ### Exclusion off Darwin, checked rather than assumed
 

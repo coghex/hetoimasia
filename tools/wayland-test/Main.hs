@@ -2,7 +2,8 @@
 -- deadline. All display programs are stubs; no desktop session is initialized.
 module Main (main) where
 
-import Control.Monad (forM_)
+import Control.Exception (onException)
+import Control.Monad (forM_, void, when)
 import Data.List (isInfixOf, isPrefixOf)
 import System.Directory
   ( createDirectory
@@ -22,6 +23,7 @@ import System.Process (CreateProcess (cwd, env), proc, readCreateProcessWithExit
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
+import System.Timeout (timeout)
 import Test.Hspec
   ( Spec
   , describe
@@ -207,6 +209,40 @@ waylandSpec = describe "Isolated headless Wayland session" $ do
       doesFileExist (directory session </> "environment.txt") `shouldReturn` False
       cleanedUp session
 
+  forM_ [("TERM", 143), ("INT", 130), ("HUP", 129)] $ \(name, status) →
+    it ("stops and reaps a readiness client that is in flight when SIG" ++ name ++ " ends the startup") $
+      withSession $ \session → do
+        -- The signal must reach the helper while one connection attempt is
+        -- running, and the example must not let anything but the helper end
+        -- that attempt. So the signal is not the client's: the helper's own
+        -- tick signals it, after the client has recorded itself and while it is
+        -- parked on a barrier nothing ever releases. Nothing here waits for a
+        -- time, and the ten-second readiness budget is never reached.
+        real ← findExecutable "sleep" >>= maybe (fail "sleep is not on PATH") pure
+        (made, _, _) ← run [] "/" "mkfifo" [directory session </> "entered.fifo", directory session </> "barrier.fifo"]
+        made `shouldBe` ExitSuccess
+        writeFile (directory session </> "signal.txt") name
+        installStubs
+          session
+          [ ("sleep", signallingTick real)
+          , ("weston", idleCompositor)
+          , ("wayland-info", parkedClient)
+          ]
+        stoppingStubs session $ do
+          (result, _, errors) ← watched (signalledHelper session ["--", "sh", "-c", recordSession session])
+          -- The client had recorded itself and was still alive, parked on its
+          -- barrier, when the helper was signalled.
+          readFile (directory session </> "client-at-signal.txt") `shouldReturn` "alive\n"
+          -- Everything signal handling already promised is unchanged.
+          result `shouldBe` ExitFailure status
+          errors `shouldContain` ("terminated by SIG" ++ name)
+          doesFileExist (directory session </> "environment.txt") `shouldReturn` False
+          cleanedUp session
+          -- And the client is gone by the time the helper has returned, with its
+          -- barrier still closed and no cleanup of this example run: only the
+          -- helper can have ended it.
+          pidIn session "client.pid" >>= \client → stopped client `shouldReturn` True
+
   it "stops the command and the compositor and removes the runtime directory when a signal ends the run" $
     withSession $ \session → do
       installStubs session waylandStubs
@@ -224,13 +260,51 @@ waylandSpec = describe "Isolated headless Wayland session" $ do
 withSession ∷ (Display → IO a) → IO a
 withSession = withHelper "tools/display/wayland.sh"
 
+-- | A bound on a helper run that must return. It only turns a helper that hangs
+-- into a failure; an example that passes never depends on it.
+watched ∷ IO a → IO a
+watched action =
+  timeout (30 * 1000 * 1000) action
+    >>= maybe (fail "the helper did not return within the failure watchdog") pure
+
+-- | Run an example's body, and stop the stubs it started if it fails or is
+-- cancelled, so that a failure never leaves a parked process behind.
+stoppingStubs ∷ Display → IO a → IO a
+stoppingStubs session body = body `onException` stopStubs session
+
+-- | Kill the stubs that park on a barrier, if each is still the process that
+-- recorded itself: an identifier is only signalled while its arguments still
+-- name this example's toolbox.
+stopStubs ∷ Display → IO ()
+stopStubs session =
+  forM_ ["client.pid", "sleeper.pid"] $ \name → do
+    recordedHere ← doesFileExist (directory session </> name)
+    when recordedHere $ do
+      pid ← pidIn session name
+      (_, arguments, _) ← run [] "/" "ps" ["-o", "args=", "-p", pid]
+      when (directory session `isInfixOf` arguments) $
+        void (run [] "/" "kill" ["-KILL", pid])
+
 -- | Run the Wayland helper in an environment that already carries both an X11
 -- display and someone else's Wayland session, and a runtime directory and
 -- compositor configuration of its own, whatever the developer's own shell
 -- holds. Everything the command and the compositor then see can only have come
 -- from the helper.
 sessionHelper ∷ Display → [String] → IO (ExitCode, String, String)
-sessionHelper session arguments = do
+sessionHelper = helperRun False
+
+-- | 'sessionHelper' for an example that signals the helper with @SIGHUP@ or
+-- @SIGINT@. A shell cannot trap a signal that was ignored when it started, and
+-- a suite started under @nohup@ or from a background job inherits exactly that,
+-- so the helper would never see the signal and the example would end by
+-- exhausting the readiness budget instead. The helper is therefore started
+-- through a Perl that puts both dispositions back to their defaults first,
+-- which makes the example the same wherever the suite was launched.
+signalledHelper ∷ Display → [String] → IO (ExitCode, String, String)
+signalledHelper = helperRun True
+
+helperRun ∷ Bool → Display → [String] → IO (ExitCode, String, String)
+helperRun defaultSignals session arguments = do
   inherited ← getEnvironment
   let overrides =
         [ ("LC_ALL", "C")
@@ -247,7 +321,15 @@ sessionHelper session arguments = do
       removed = "HETOIMASIA_NATIVE_SESSION" : map fst overrides
       settings = overrides ++ filter ((`notElem` removed) . fst) inherited
   bash ← findExecutable "bash" >>= maybe (fail "bash is not on PATH") pure
-  run settings (directory session) bash (script session : arguments)
+  if defaultSignals
+    then do
+      perl ← findExecutable "perl" >>= maybe (fail "perl is not on PATH") pure
+      run
+        settings
+        (directory session)
+        perl
+        (["-e", "$SIG{HUP} = 'DEFAULT'; $SIG{INT} = 'DEFAULT'; exec @ARGV", bash, script session] ++ arguments)
+    else run settings (directory session) bash (script session : arguments)
 
 -- | A shell command that records the Wayland environment the helper gave it.
 -- The socket the helper named is not predictable, so what is asserted is the
@@ -330,6 +412,39 @@ signallingClient =
     , "echo \"${WAYLAND_DISPLAY-unset} ${XDG_RUNTIME_DIR-unset}\" > probe.txt"
     , "kill -TERM \"${WAYLAND_DISPLAY#hetoimasia-}\" 2>/dev/null"
     , "exit 1"
+    ]
+
+-- | A readiness client that records itself and then parks on a barrier the
+-- example never releases, so the attempt stays in flight until something ends
+-- it. It first meets the signalling tick at a rendezvous, which is how that
+-- tick knows the client has recorded itself.
+parkedClient ∷ String
+parkedClient =
+  unlines
+    [ "#!/bin/sh"
+    , "echo \"${WAYLAND_DISPLAY-unset} ${XDG_RUNTIME_DIR-unset}\" > probe.txt"
+    , "echo $$ > client.pid"
+    , "echo entered > entered.fifo"
+    , "read line < barrier.fifo"
+    , "exit 1"
+    ]
+
+-- | A @sleep@ that is the helper's own tick the first time it is asked for a
+-- tenth of a second, and the real one every other time, the compositor stub's
+-- included. The first tick falls while the readiness client is in flight, so
+-- this waits at the rendezvous for that client to have recorded itself, notes
+-- whether it is still alive, and then sends the helper the signal the example
+-- chose. The helper acts on it once this returns, before its next command.
+signallingTick ∷ FilePath → String
+signallingTick real =
+  unlines
+    [ "#!/bin/sh"
+    , "if [ \"$1\" != 0.1 ] || [ -f ticked ]; then exec '" ++ real ++ "' \"$@\"; fi"
+    , ": > ticked"
+    , "echo $$ > sleeper.pid"
+    , "read line < entered.fifo"
+    , "if kill -0 \"$(cat client.pid)\" 2>/dev/null; then echo alive; else echo gone; fi > client-at-signal.txt"
+    , "kill -\"$(cat signal.txt)\" \"$PPID\""
     ]
 
 -- | What the helper leaves behind once it has returned, for any outcome that

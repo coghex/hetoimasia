@@ -1205,10 +1205,17 @@ socket within the bound each end the helper with status `1` before the command
 starts; a usage error exits `2`; otherwise the command's own status is
 returned. The compositor is stopped and reaped and the runtime directory
 removed on every exit path the helper can handle, including a failed start and
-a catchable signal, which ends it with `128+N`. Cleanup and the signal traps
-are installed **before** the private directories are created, so the setup
-window — the runtime directory exists, the compositor does not — is covered
-like any other; a signal or a failure there leaves nothing behind.
+a catchable signal, which ends it with `128+N`. So is a readiness client that is
+mid-attempt when the signal arrives: cleanup stops and waits for every job the
+shell still lists as running — the compositor, the command if it is somehow
+still there, and that client — and takes them from the job table, not from a
+recorded process id, for the reason the X11 helper does. A client the signal
+outran the recording of is not abandoned, a client that already finished and
+was reaped is not a stale target, and nothing the helper did not start is
+signalled or waited for. Cleanup and the signal traps are installed **before**
+the private directories are created, so the setup window — the runtime
+directory exists, the compositor does not — is covered like any other; a signal
+or a failure there leaves nothing behind.
 
 ### Receipts
 
@@ -3330,7 +3337,13 @@ probe, which the helper runs only while it is waiting, and by the command once
 it is running, so the moment is the helper's own rather than an elapsed time —
 ends the helper with
 the compositor stopped and reaped, the command stopped, and the runtime
-directory removed. The setup window has its own two: a `mkdir` that terminates
+directory removed. A readiness client that is in flight when `TERM` or `HUP`
+arrives has its own pair: a stub parks on a barrier nothing releases, the
+helper's own tick signals the helper once the stub has recorded itself and is
+still alive, and the stub must be gone when the helper returns, with the
+barrier still closed and none of the example's cleanup run, so only the helper
+can have ended it. Nothing there waits for a time, and the ten-second budget is
+never reached. The setup window has its own two: a `mkdir` that terminates
 the helper as it returns, which puts the signal between creating the runtime
 directory and starting the compositor, and a `mkdir` that fails outright. Both
 require the helper's own scratch directory to be gone from its `TMPDIR`
