@@ -1483,6 +1483,19 @@ pull request.
   sample's windowed mode (GRS-13).
 - **Open questions:** none.
 
+> As delivered (#349): `selectDepthFormat` chooses the first of `D32_SFLOAT`,
+> `X8_D24_UNORM_PACK32` and `D16_UNORM` the device supports as a depth
+> attachment, asked of it; a pipeline declares a `PipelineDepth` (format, test,
+> write, comparison) and a pass takes a `DepthPass` (target, start, clear
+> value) beside its colour target, and a pipeline is drawn only in a pass whose
+> depth attachment has exactly the format it declares, however the commands
+> were ordered. `samples/scene3d/` draws two cubes — the nearer first, so only
+> the depth test can show it over the farther — from two poses built with
+> `hetoimasia-math`, and its probes are exact against an oracle that ray-casts
+> the scene without the math package. See
+> [the backend's contract](../gpu_backend.md#depth-attachments) and
+> [the retained evidence](../evidence/gpu_3d/README.md).
+
 ### GRS-13. Give each target generation a managed depth attachment
 
 > Filed as #350. Owner clarifications at filing, 2026-09-29: one depth image

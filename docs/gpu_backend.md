@@ -1473,6 +1473,153 @@ prints; no reference image is committed.
 | --- | --- | --- | --- | --- | --- |
 | The open pass's attachment, and the bound pipeline's format, viewport and scissor | The recorder (`Recorder`) | `beginRendering` and `beginRenderingInto` set the attachment and `endRendering` clears it; `bindPipeline`, `setViewport` and `setScissor` set the rest; `draw` reads all of it | The graphics owner | One consumer action | Dropped with the recorder |
 
+### Depth attachments
+
+GRS-10 (#349) lets a pass render with depth. A managed `DepthTarget` image
+([Buffers and images](#buffers-and-images)) is the depth attachment of a
+dynamic-rendering pass into a managed color target, in a frame batch and a
+[frame-less batch](#frame-less-batches) alike, and a pipeline declares the
+depth it renders with. It obeys GRS-3's contract
+([above](#ordering-managed-resources)): the target's one use is
+`DepthAttachment`, in which it rests, every entry and exit barrier is the
+recorder's, and a new target awaits an initializing pass. Windowed depth —
+a depth image that follows each swapchain generation — is
+[not here](#out-of-scope-for-depth): it is GRS-13's (#350).
+
+**Conventions (D-36).** Coordinates follow Vulkan's, not OpenGL's: clip-space
+Y points down, and depth runs 0 at the near plane to 1 at the far plane. A
+depth attachment is depth-only, and no stencil format exists anywhere in the
+vocabulary. A pass clears depth to 1.0 unless it is given another value, and a
+pipeline compares less-or-equal unless it declares another operation. The
+backend takes the comparison and the clear value per use, so a renderer that
+reverses depth — clearing to 0 and comparing greater-or-equal — needs nothing
+more from it; nothing here makes that the default. A matrix that reaches these
+conventions comes from `hetoimasia-math`'s `perspective ZeroToOne YDown`
+([its contract](../packages/math/README.md)), which promises no byte layout:
+the renderer packs what it pushes itself.
+
+**The depth format.** `selectDepthFormat` (`constructDepthFormat` through the
+host's `Construction`) answers the depth-only format the backend will use,
+asking the device and never assuming one: the first of `depthFormatPreference`
+that the device supports as a depth attachment.
+
+| Order | Format | Vulkan format |
+| --- | --- | --- |
+| 1 | `Depth32Float` | `D32_SFLOAT` |
+| 2 | `Depth24` | `X8_D24_UNORM_PACK32` |
+| 3 | `Depth16` | `D16_UNORM` |
+
+The question is `depthImageQuery`'s: the format, a depth/stencil-attachment
+usage and the depth/stencil-attachment format feature under optimal tiling —
+the very question a `DepthTarget`'s creation asks. A device that supports none
+is `RefusedImageUnsupported`, naming the first. Creating a depth target of a
+format the device does not support, or of any format that is not depth-only
+(`kindFormats DepthTarget` lists only the three above), is refused before
+anything is created, as any image's creation is.
+
+**Pipelines.** A pipeline declares depth with `createPipelineWithDepth`, or,
+from checked shaders, `createDepthCheckedPipeline` (`constructDepthCheckedPipeline`
+through the host), given a `PipelineDepth`:
+
+| Field | Meaning |
+| --- | --- |
+| `depthAttachmentFormat` | the depth-only format of the attachment it renders with |
+| `depthTest` | whether fragments are tested against the attachment |
+| `depthWrite` | whether passing fragments write it; Vulkan writes depth only for tested fragments, so writing without testing is `RefusedIllegal` |
+| `depthCompare` | the comparison a test makes, one of the eight Vulkan compare operations (`CompareOp`) |
+
+`depthTested format` is the usual declaration: testing, writing, less-or-equal.
+The declaration is checked before any pipeline is created: a format that is
+not depth-only is `RefusedImageUnsupported`, and so is one the device does not
+support as a depth attachment, which is asked of the device, never assumed.
+The native layer receives the format in the pipeline's rendering information
+and the test, write and comparison in its depth-stencil state, with depth
+bounds and stencil off. A pipeline that declares no depth — every pipeline
+that existed before depth, and each of `createPipeline`, `createPipelineWith`,
+`createCheckedPipeline` and `createBlendedCheckedPipeline` — declares none to
+the native layer, as before. `replacePipeline` and its variants build a pipeline
+that declares no depth, as they build one that declares no blend.
+
+**Passes.** `beginRenderingWithDepth recorder color start clear depth` is
+`beginRenderingInto` with a `DepthPass` — `DepthPass target start value`, or
+`clearedDepth target start` for `defaultDepthClear` (1.0) — as the pass's depth
+attachment: the depth target's owned view, cleared to the value, stored, in the
+depth-attachment layout. Under #335's rules the pass is a use of the depth
+target in its depth-attachment use, with its own `PassStart`:
+`ClearTarget` requires the target to be initialized and keeps its layout;
+`ClearFromUndefined` discards what it held, and initializes a new target once
+the pass's batch has been submitted. The color target and the depth target are
+entered, and retained, in one transaction: a refusal of either leaves neither
+touched. Before any native call the depth target must be this session's (otherwise
+`RefusedMisuse ForeignIdentity`), live (a released or stale one is `RefusedMisuse
+WrongPhase`), a `DepthTarget` (otherwise `RefusedWrongKind`), of one mip level
+(otherwise `RefusedUnsupported`) and of the color target's extent, which is the
+render area (otherwise `RefusedIncompatible`, naming both); and the clear value
+must be finite and between 0 and 1, as Vulkan requires without its
+unrestricted-range extension (otherwise `RefusedIllegal`). A `ClearTarget` pass
+over an uninitialized depth target, or one another batch is still
+initializing, is `RefusedUninitialized`. The initialization is published
+exactly as a color target's is: only by the submission of the batch that made
+it, never by recording, sealing, a discard or a reset, and a discarded
+initializing batch leaves the target awaiting initialization again. A released
+depth target is held by every batch that recorded a pass with it until that
+batch has completed or been discarded, and destroyed only then.
+
+**Pipeline and pass agree.** A pipeline is drawn only in a pass whose depth
+attachment has exactly the format it declares, and one that declares none only
+in a pass that has none — which is what Vulkan requires of dynamic rendering.
+The open pass's attachment, or the frame's image outside rendering — which has
+no depth attachment — is checked when a pipeline is bound and again by every
+draw, so a pipeline bound before its pass began, or retained across passes
+that change or omit the depth attachment, never reaches a draw it was not built
+for: `RefusedIncompatible`, naming what the pipeline declares and what the
+pass has, with no native call. `beginRendering` into the frame's image has no
+depth attachment, and a colour-only pass into a color target begins exactly as
+it did before depth.
+
+**The native commands.** `CommandBeginRendering` carries the pass's optional
+`DepthClear`, and a pipeline request its optional `PipelineDepth`; the
+production layer builds the attachment (`depthAttachmentInfo`) and the
+depth-stencil state (`nativeDepthState`) from them, and the stand-in journals
+a declared depth (`DeclaredDepth`). The depth target's barriers are those of
+`DepthAttachment`: early and late fragment tests, depth-stencil attachment
+read and write, the depth-attachment layout, over the depth aspect.
+
+**Out of scope for depth.** Windowed depth that follows swapchain generations
+and the sample's windowed mode (GRS-13, #350); a depth attachment for the
+frame's own image; `render-3d`, camera policy, lighting and materials;
+reversed-Z as a default; stencil; multisampling; and more than one color
+attachment.
+
+**Proof.** The stand-in suite (`Test.GPU.Vulkan.Native.Depth`) chooses the
+depth format and falls back through the other two, refuses a depth target of an unsupported or
+non-depth format before the device creates anything, checks that a pipeline's
+declared test, write and comparison reach pipeline construction and that a
+colour-only pipeline declares none, and refuses a depth declaration the device
+cannot render with. It begins passes in both batch kinds with the depth
+attachment, its default and its given clear value, checks the depth target's
+entry barrier out of undefined and exit barrier back to rest around the
+pass, and covers every pass refusal above — extent, released, foreign, wrong-kind and
+multi-level targets and clear values outside zero to one — with nothing
+recorded and neither target entered. It checks initialization published only by submission and
+not by a discarded batch, a depth target released after its pass was recorded
+kept until its batch completes and destroyed at once after a discard, and the
+agreement between a pipeline and the pass it is drawn in for every ordering:
+a pipeline of another depth format, one declaring none in a depth pass, one
+declaring depth in a pass without, bound outside rendering in a frame batch
+and retained across passes. `Test.GPU.Vulkan.Native.Checked` covers
+`createDepthCheckedPipeline` and checks `nativeDepthState` and
+`depthAttachmentInfo` field by field. The surface-free native case
+`grs10-scene3d` ([below](#the-native-suite)) draws two depth-tested cubes from
+two camera poses on the device and reads them back
+([samples/scene3d/README.md](../samples/scene3d/README.md)); its captures are
+retained in [`docs/evidence/gpu_3d/`](evidence/gpu_3d/README.md).
+
+| State | Owner | Readers and writers | Thread | Lifetime | Reset or disposal |
+| --- | --- | --- | --- | --- | --- |
+| The open pass's depth-attachment format, beside its color attachment's | The recorder (`Recorder`) | `beginRenderingWithDepth` sets it, `beginRendering` and `beginRenderingInto` leave none, and `endRendering` clears it; `bindPipeline` and `draw` read it | The graphics owner | One consumer action | Dropped with the recorder |
+| A pipeline's declared depth | Its managed generation (`PipelineInterface`) | `createPipelineWithDepth` and `createDepthCheckedPipeline` set it; `bindPipeline` and `draw` read it | The graphics owner | The pipeline generation's | Dropped with its disposal |
+
 ### Drawing from buffers
 
 GRS-4 (#340) draws from vertex, index and instance data with push constants,
@@ -5056,7 +5203,7 @@ companions — and adds the Vulkan owner's:
 | Main thread | Hspec runs on a thread of its own; the process main thread owns one shared production graphics session: `withLoaderIntegration`, then `runGraphicsOwnerApplication` over `withVulkanOwnerHost`, with the production native layer and surface bridge. An example that needs the main thread — to hand a window's surface over, which GLFW creates there, or to close a window — submits an operation (`onMain`); the main thread runs it between two turns of the host's owner loop and returns its result or rethrows its failure. Windows are created through the host's command port from the example's own thread, which the owner loop executes, as an application's worker would. |
 | Identities | Every dispatched operation is checked, before it runs, to be on the bound process main thread that entered the session — the Haskell thread, the bound flag, and the OS thread read through `pthread_self` — and a failed check fails the operation and the run. Every native call the session makes is recorded where it runs by a `NativeObserver`, so an example shows from the calls themselves that the instance, its messenger, the device and every surface's destruction ran on the graphics owner's thread and every surface's creation on the main thread — never from the name of an Hspec hook. |
 | Sharing | The roots — the instance, its explicit messenger, and the one device — are acquired lazily, by the first dispatched operation, at most once, and shared by every later example. Each example's windows and targets are its own and are closed inside it. |
-| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, `vk12-frames`, `vk13-presentation`, `vk14-recovery`, `vk15-validation-stop`, `vk15-retention`, `vk16-composed`, `vk17-one-slot`, `vk17-two-slots`, `vk19-capture`, `grs15-surface-free`, `grs15-surface-free-window`, `grs12-frameless`, `grs3-ordering`, `grs7-texture-table`, `grs8-sprites`, `grs9-swap`, `grs14-table-growth`, `synchronization-hazard`, `debug-names`, and, under the isolated compositor's consent only, `wayland-connection-loss`. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. Each child runs in a process group of its own under an external 20-second deadline covering its exit and the end of its output; one still running at it is terminated with its group and fails its example as expired. |
+| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, `vk12-frames`, `vk13-presentation`, `vk14-recovery`, `vk15-validation-stop`, `vk15-retention`, `vk16-composed`, `vk17-one-slot`, `vk17-two-slots`, `vk19-capture`, `grs15-surface-free`, `grs15-surface-free-window`, `grs12-frameless`, `grs3-ordering`, `grs7-texture-table`, `grs8-sprites`, `grs9-swap`, `grs10-scene3d`, `grs14-table-growth`, `synchronization-hazard`, `debug-names`, and, under the isolated compositor's consent only, `wayland-connection-loss`. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. Each child runs in a process group of its own under an external 20-second deadline covering its exit and the end of its output; one still running at it is terminated with its group and fails its example as expired. |
 | Selection | Building, listing and filtering the tree, a `--dry-run`, and a selection that dispatches nothing acquire nothing and start no child. A selection matching no example fails. `--complete`, which the catalog group passes, runs the whole tree with Hspec's configuration reading left out and then fails unless the shared session was acquired once and every private scenario the run's consent requires ran and passed — every one, except that `wayland-connection-loss` is required under the isolated compositor's consent and pending under any other — so no ambient setting can turn the group's receipt into a pass for a subset. The consent rules and the migrated proof's pure release, construction, publication and loader-selection examples need no session and run without consent. |
 | Consent | Read once, at startup, from `HETOIMASIA_NATIVE_SESSION`, with the GLFW suite's rules for `desktop`, `isolated-x11:<display>` and `isolated-wayland:<socket>`: the last only on Linux, only when `WAYLAND_DISPLAY` names that socket, and never beside a `DISPLAY`. Under the Wayland consent every session requests Wayland by name — the shared host, each child's host, the VK-5 bridge's loader-aware session, and the proof shim's raw initialization, which sets `GLFW_PLATFORM` and fails one that selected another platform — so no X11 or XWayland session stands in; under the others every session requests nothing, as before. The first shared example asserts the platform GLFW selected before any example renders. Without consent every native example is refused before its body, the session is never acquired, and the run ends with the refusal on stderr and a non-zero exit. |
 | Environment | Before any Vulkan call, the suite clears every ambient discovery override and every validation-layer setting it finds and records which, disables implicit layers, and points the layer's settings file at an empty one; a child inherits and re-establishes the same environment. |
@@ -5427,6 +5574,31 @@ passes only if all of these hold:
 
 The PNGs and the record go beneath `HETOIMASIA_VALIDATION_EVIDENCE/swap/`
 when the runner names an evidence directory.
+
+GRS-10's case, `grs10-scene3d`, runs the scene3d sample's window-free evidence
+([samples/scene3d/README.md](../samples/scene3d/README.md)) over the same
+surface-free composition and host, with no uploads. It uses the sample's own
+scene, renderer, oracle, PNG writer and probe record, through a host record over
+this suite's session. The backend chooses the depth format; an owner-thread
+action builds the ring, the RGBA8 target, a depth target of that format, a
+readback buffer a pose, the layout and the depth-tested pipeline, and a
+frame-less batch a pose draws the two cubes — the nearer first — copies the
+target out and returns it to rest, the second pose's only after the first's
+batch has completed. The PNGs and the probe record go beneath
+`HETOIMASIA_VALIDATION_EVIDENCE/scene3d/` when the runner names an evidence
+directory, and into a kept temporary directory the journal names otherwise.
+
+It passes only if all of these hold:
+
+- no window, surface or image acquisition was made, and the device came first;
+- a depth-only format was chosen, and both poses were rendered and read back
+  whole after their batches completed;
+- every probe passed the independent oracle in both poses — the occlusion
+  probes, where the nearer cube drawn first showed over the farther, the
+  camera-moved probes, the face probes and the clear probes alike;
+- both PNGs and the record were written;
+- the roots retired in order, with every Vulkan call on the owner's thread;
+- the verdict, with synchronization validation, is clean.
 
 GRS-8's case, `grs8-sprites`, runs the sprites sample's window-free evidence
 ([samples/sprites/README.md](../samples/sprites/README.md)) over the same
