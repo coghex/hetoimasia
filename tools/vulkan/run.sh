@@ -213,6 +213,7 @@ fingerprints=(
   "packages/gpu-vulkan/native/shaders/toolchain.fingerprint"
   "samples/triangle/renderer/shaders/toolchain.fingerprint"
   "samples/sprites/renderer/shaders/toolchain.fingerprint"
+  "samples/scene3d/renderer/shaders/toolchain.fingerprint"
 )
 cleanup=""
 generate_fingerprint() {
@@ -272,8 +273,9 @@ roots = ["tools/vulkan", "tools/native", "tools/display",
          "packages/gpu-vulkan/native", "packages/gpu-vulkan/glfw", "packages/glfw",
          "samples/triangle/renderer", "samples/triangle/app",
          "samples/sprites/renderer", "samples/sprites/app",
+         "samples/scene3d/renderer", "samples/scene3d/app",
          "packages/gpu-vulkan/diagnostics", "packages/gpu-vulkan/model",
-         "packages/runtime", "packages/foundation", "tools/test-support"]
+         "packages/runtime", "packages/foundation", "packages/math", "tools/test-support"]
 files = ["cabal.project.vulkan", "cabal.project.common",
          "tools/toolchain/binding.pin", "tools/ci-image/toolchain.pin"]
 

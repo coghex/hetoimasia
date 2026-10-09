@@ -252,6 +252,7 @@ class AdapterChecks(unittest.TestCase):
         adapter.prepare(native, self.suites["vulkan-native-tests"])
         self.assertIn("hetoimasia-sample-triangle-app:exe:hetoimasia-triangle", native.calls[0]["argv"])
         self.assertIn("hetoimasia-sample-sprites-app:exe:hetoimasia-sprites", native.calls[0]["argv"])
+        self.assertIn("hetoimasia-sample-scene3d-app:exe:hetoimasia-scene3d", native.calls[0]["argv"])
 
     def test_an_unnarrowed_suite_skips_every_narrowed_profile_of_its_executable(self):
         profiles = hspec_profiles()

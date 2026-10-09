@@ -1,0 +1,87 @@
+cabal-version: 3.16
+name: hetoimasia-sample-scene3d
+version: 0.1.0.0
+synopsis: The scene3d sample's drawing for Hetoimasia's Vulkan host
+description:
+    GRS-10's consumer drawing: two flat-coloured cubes, one in front of the
+    other, drawn indexed with a depth test from two camera poses, the cameras
+    built with `hetoimasia-math`, and the scene's independent probe oracle and
+    window-free evidence. It depends on the native backend and the math
+    package alone and names nothing of the window integration, so the
+    integration's native suite can exercise it unchanged, and the sample's
+    executable (`hetoimasia-sample-scene3d-app`) hands it to the host. Nothing
+    in the engine depends on it.
+    .
+    It is selected only by `cabal.project.vulkan`, so neither `cabal.project`
+    nor `cabal.project.cpu` resolves the binding, the Vulkan headers or a
+    loader, and only `tools/vulkan/run.sh` builds it.
+license: GPL-3.0-only
+license-file: LICENSE
+author: Vincent Coghlan
+maintainer: Vincent Coghlan
+category: Game
+build-type: Simple
+tested-with: GHC ==9.14.1
+-- The shader toolchain fingerprint every splice here checks and registers,
+-- which `tools/vulkan/run.sh` generates at `shaders/toolchain.fingerprint`
+-- before every build and removes afterwards. Cabal decides whether to run GHC
+-- from the files a package lists, never from the ones a splice registers, so
+-- it is listed here; see packages/gpu-vulkan/native/README.md.
+extra-source-files:
+    **/*.fingerprint
+
+source-repository head
+    type: git
+    location: https://github.com/coghex/hetoimasia.git
+    subdir: samples/scene3d/renderer
+
+library
+    default-language: GHC2024
+    default-extensions: UnicodeSyntax OverloadedStrings
+    ghc-options: -Wall -Wcompat -Wincomplete-uni-patterns -Wincomplete-record-updates
+    hs-source-dirs: src
+    exposed-modules:
+        Hetoimasia.Sample.Scene3d
+        Hetoimasia.Sample.Scene3d.Camera
+        Hetoimasia.Sample.Scene3d.Evidence
+        Hetoimasia.Sample.Scene3d.Oracle
+        Hetoimasia.Sample.Scene3d.Png
+        Hetoimasia.Sample.Scene3d.Scene
+        Hetoimasia.Sample.Scene3d.ShaderInterfaces
+        Hetoimasia.Sample.Scene3d.Shaders
+    build-depends:
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        directory >=1.3 && <1.4,
+        filepath >=1.5 && <1.6,
+        text >=2.1 && <2.2,
+        hetoimasia-gpu-vulkan-native ==0.1.0.0,
+        hetoimasia-math ==0.1.0.0
+
+-- The sample's headless examples: the scene and its geometry, the cameras
+-- built with the math package against the independent oracle, the PNG writer
+-- and the probe record, with no device, display or GLFW session. The
+-- executable links the loader only because the native backend does, so it is
+-- built and run through `tools/vulkan/run.sh test` — the group
+-- `test.vulkan-headless`.
+test-suite scene3d-tests
+    type: exitcode-stdio-1.0
+    default-language: GHC2024
+    default-extensions: UnicodeSyntax OverloadedStrings
+    ghc-options: -Wall -Wcompat -Wincomplete-uni-patterns -Wincomplete-record-updates -threaded -rtsopts
+    hs-source-dirs: test
+    main-is: Main.hs
+    other-modules:
+        Test.Sample.Scene3d.Camera
+        Test.Sample.Scene3d.Oracle
+        Test.Sample.Scene3d.Png
+        Test.Sample.Scene3d.Record
+        Test.Sample.Scene3d.Scene
+    build-depends:
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        hspec >=2.11 && <3,
+        text >=2.1 && <2.2,
+        hetoimasia-gpu-vulkan-native ==0.1.0.0,
+        hetoimasia-math ==0.1.0.0,
+        hetoimasia-sample-scene3d

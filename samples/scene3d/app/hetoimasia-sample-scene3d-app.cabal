@@ -1,0 +1,50 @@
+cabal-version: 3.16
+name: hetoimasia-sample-scene3d-app
+version: 0.1.0.0
+synopsis: The scene3d sample's depth-tested 3D scene through Hetoimasia's Vulkan host
+description:
+    GRS-10's sample executable, `hetoimasia-scene3d`: the scene3d sample's
+    drawing (`hetoimasia-sample-scene3d`) handed to the window integration's
+    public host, window-free — rendering two cubes from two camera poses into
+    an offscreen colour target with a depth target, checking each pose against
+    its probe oracle and writing a PNG each and a probe record (`--evidence`).
+    A windowed mode arrives with windowed depth (GRS-13). It uses public
+    interfaces only, nothing depends on it, and it is launched explicitly: no
+    routine check runs it.
+    .
+    It is selected only by `cabal.project.vulkan`, so neither `cabal.project`
+    nor `cabal.project.cpu` resolves the binding, the Vulkan headers or a
+    loader, and only `tools/vulkan/run.sh` builds it.
+license: GPL-3.0-only
+license-file: LICENSE
+author: Vincent Coghlan
+maintainer: Vincent Coghlan
+category: Game
+build-type: Simple
+tested-with: GHC ==9.14.1
+
+source-repository head
+    type: git
+    location: https://github.com/coghex/hetoimasia.git
+    subdir: samples/scene3d/app
+
+executable hetoimasia-scene3d
+    default-language: GHC2024
+    default-extensions: UnicodeSyntax OverloadedStrings
+    ghc-options: -Wall -Wcompat -Wincomplete-uni-patterns -Wincomplete-record-updates -threaded -rtsopts
+    main-is: Main.hs
+    hs-source-dirs: .
+    build-depends:
+        base >=4.22 && <4.23,
+        stm >=2.5.3 && <2.6,
+        text >=2.1 && <2.2,
+        hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-runtime ==0.1.0.0,
+        hetoimasia-glfw ==0.1.0.0,
+        hetoimasia-glfw:runtime-glfw ==0.1.0.0,
+        hetoimasia-glfw:vulkan-interop ==0.1.0.0,
+        hetoimasia-gpu-vulkan-model ==0.1.0.0,
+        hetoimasia-gpu-vulkan-diagnostics ==0.1.0.0,
+        hetoimasia-gpu-vulkan-native ==0.1.0.0,
+        hetoimasia-gpu-vulkan-glfw ==0.1.0.0,
+        hetoimasia-sample-scene3d ==0.1.0.0

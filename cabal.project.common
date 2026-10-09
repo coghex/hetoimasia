@@ -46,6 +46,14 @@ package hetoimasia-gpu-vulkan-native
 package hetoimasia-gpu-vulkan-glfw
   ghc-options: -Werror -j
 
+-- The scene3d sample (GRS-10) is held to the same policy. Like the native and
+-- integration packages above, it is named only by `cabal.project.vulkan`.
+package hetoimasia-sample-scene3d
+  ghc-options: -Werror -j
+
+package hetoimasia-sample-scene3d-app
+  ghc-options: -Werror -j
+
 package hetoimasia-scripting-lua
   ghc-options: -Werror -j
 

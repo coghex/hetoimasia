@@ -113,7 +113,7 @@ module Hetoimasia.GPU.Vulkan.GLFW
 
     -- * Depth attachments (GRS-10)
   , DepthPass (..)
-  , depthPass
+  , clearedDepth
   , defaultDepthClear
   , beginRenderingWithDepth
   , CompareOp (..)
@@ -426,7 +426,7 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , bindPipeline
   , defaultDepthClear
   , depthFormatPreference
-  , depthPass
+  , clearedDepth
   , depthTested
   , draw
   , endRendering

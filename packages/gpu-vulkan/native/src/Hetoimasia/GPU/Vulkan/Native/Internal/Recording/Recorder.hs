@@ -32,7 +32,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Recorder
   , PassStart (..)
   , beginRenderingInto
   , DepthPass (..)
-  , depthPass
+  , clearedDepth
   , defaultDepthClear
   , beginRenderingWithDepth
   , endRendering
@@ -883,8 +883,8 @@ data DepthPass = DepthPass
   }
 
 -- | A depth pass that clears to 'defaultDepthClear'.
-depthPass ∷ Image → PassStart → DepthPass
-depthPass target start = DepthPass target start defaultDepthClear
+clearedDepth ∷ Image → PassStart → DepthPass
+clearedDepth target start = DepthPass target start defaultDepthClear
 
 -- | The value a depth pass clears to unless it is given another (D-36): 1.0,
 -- the far plane of a depth range of 0 to 1 compared less-or-equal. A renderer

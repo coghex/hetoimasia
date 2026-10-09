@@ -152,7 +152,7 @@ spec = describe "Depth attachments" $ do
       before ← commandCount rig
       _ ← withFramelessScope (rigFrames rig) $ \scope →
         recordFramelessIn scope $ \recorder → do
-          ok (beginRenderingWithDepth recorder (kitColor kit) ClearFromUndefined clearBlue (depthPass (kitDepth kit) ClearFromUndefined))
+          ok (beginRenderingWithDepth recorder (kitColor kit) ClearFromUndefined clearBlue (clearedDepth (kitDepth kit) ClearFromUndefined))
           ok (endRendering recorder)
       commands ← drop before <$> commandsOf' rig
       let rest = useScope (imageResourceKind DepthTarget) DepthAttachment
@@ -184,7 +184,7 @@ spec = describe "Depth attachments" $ do
       let begin depth recorder = beginRenderingWithDepth recorder (kitColor kit) ClearFromUndefined clearBlue depth
       answer ← recordFrame (rigRecording rig) (ownedFrame frame) $ \recorder →
         sequence $
-          [begin (depthPass target ClearFromUndefined) recorder | target ← [small, released, kitDepth foreignKit, texture, kitColor kit, mipmapped]]
+          [begin (clearedDepth target ClearFromUndefined) recorder | target ← [small, released, kitDepth foreignKit, texture, kitColor kit, mipmapped]]
             <> [begin (DepthPass (kitDepth kit) ClearFromUndefined value) recorder | value ← [nan, infinity, 1.5, -0.25]]
             -- The color target was never entered by any of those: it still
             -- awaits initialization.
@@ -210,7 +210,7 @@ spec = describe "Depth attachments" $ do
       answer ← withFramelessScope (rigFrames rig) $ \scope →
         recordFramelessIn scope $ \recorder →
           sequence
-            [ beginRenderingWithDepth recorder (kitColor kit) ClearFromUndefined clearBlue (depthPass (kitDepth kit) ClearTarget)
+            [ beginRenderingWithDepth recorder (kitColor kit) ClearFromUndefined clearBlue (clearedDepth (kitDepth kit) ClearTarget)
             , beginRenderingInto recorder (kitColor kit) ClearTarget clearBlue
             ]
       fmap snd answer `shouldBe` Right [Left RefusedUninitialized, Left RefusedUninitialized]
@@ -223,12 +223,12 @@ spec = describe "Depth attachments" $ do
       withFramelessScope (rigFrames rig) $ \scope → do
         _ ← recordFramelessIn scope (\recorder → ok (clearingPass kit recorder) >> ok (endRendering recorder))
         -- Recorded, not submitted: another batch may not keep its contents.
-        other ← recordFramelessIn scope (\recorder → beginRenderingWithDepth recorder (kitColor kit) ClearFromUndefined clearBlue (depthPass (kitDepth kit) ClearTarget))
+        other ← recordFramelessIn scope (\recorder → beginRenderingWithDepth recorder (kitColor kit) ClearFromUndefined clearBlue (clearedDepth (kitDepth kit) ClearTarget))
         modifyIORef' refusedBefore (fmap snd other :)
       readIORef refusedBefore `shouldReturn` [Right (Left RefusedUninitialized)]
       -- Submitted when the action returned: now any batch may keep them.
       later ← withFramelessScope (rigFrames rig) $ \scope →
-        recordFramelessIn scope (\recorder → beginRenderingWithDepth recorder (kitColor kit) ClearTarget clearBlue (depthPass (kitDepth kit) ClearTarget) <* endRendering recorder)
+        recordFramelessIn scope (\recorder → beginRenderingWithDepth recorder (kitColor kit) ClearTarget clearBlue (clearedDepth (kitDepth kit) ClearTarget) <* endRendering recorder)
       fmap snd later `shouldBe` Right (Right ())
       clean rig
 
@@ -239,7 +239,7 @@ spec = describe "Depth attachments" $ do
         _ ← recordFramelessIn scope (\recorder → ok (clearingPass kit recorder) >> ok (endRendering recorder))
         throwIO (ErrorCall "the action failed")
       later ← withFramelessScope (rigFrames rig) $ \scope →
-        recordFramelessIn scope (\recorder → beginRenderingWithDepth recorder (kitColor kit) ClearFromUndefined clearBlue (depthPass (kitDepth kit) ClearTarget))
+        recordFramelessIn scope (\recorder → beginRenderingWithDepth recorder (kitColor kit) ClearFromUndefined clearBlue (clearedDepth (kitDepth kit) ClearTarget))
       fmap snd later `shouldBe` Right (Left RefusedUninitialized)
 
   describe "retention and disposal" $ do
@@ -305,7 +305,7 @@ spec = describe "Depth attachments" $ do
           ok (draw recorder 3 1)
           ok (endRendering recorder)
           -- And the colour-only pipeline stays bound into a pass with one.
-          ok (beginRenderingWithDepth recorder (kitColor kit) ClearTarget clearBlue (depthPass (kitDepth kit) ClearTarget))
+          ok (beginRenderingWithDepth recorder (kitColor kit) ClearTarget clearBlue (clearedDepth (kitDepth kit) ClearTarget))
           retainedIntoDepth ← draw recorder 3 1
           ok (bindPipeline recorder (kitTested kit))
           ok (draw recorder 3 1)
@@ -338,7 +338,7 @@ spec = describe "Depth attachments" $ do
         -- with a depth attachment, where it cannot be drawn.
         refusedOutside ← bindPipeline recorder framedWithDepth
         ok (bindPipeline recorder (kitPlain kit))
-        ok (beginRenderingWithDepth recorder (kitColor kit) ClearFromUndefined clearBlue (depthPass (kitDepth kit) ClearFromUndefined))
+        ok (beginRenderingWithDepth recorder (kitColor kit) ClearFromUndefined clearBlue (clearedDepth (kitDepth kit) ClearFromUndefined))
         dynamicState recorder
         refusedInside ← draw recorder 3 1
         ok (bindPipeline recorder framedWithDepth)
@@ -437,7 +437,7 @@ infinity = 1 / 0
 
 -- | The pass the examples share: both targets cleared from undefined.
 clearingPass ∷ Kit → Rec → IO (Either Refusal ())
-clearingPass kit recorder = beginRenderingWithDepth recorder (kitColor kit) ClearFromUndefined clearBlue (depthPass (kitDepth kit) ClearFromUndefined)
+clearingPass kit recorder = beginRenderingWithDepth recorder (kitColor kit) ClearFromUndefined clearBlue (clearedDepth (kitDepth kit) ClearFromUndefined)
 
 -- | A pass that clears both from undefined, one that keeps both and clears
 -- the depth to 0, and one with no depth attachment.

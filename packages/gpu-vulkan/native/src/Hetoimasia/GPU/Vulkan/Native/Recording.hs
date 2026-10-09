@@ -295,7 +295,7 @@ module Hetoimasia.GPU.Vulkan.Native.Recording
   , depthFormatPreference
   , selectDepthFormat
   , DepthPass (..)
-  , depthPass
+  , clearedDepth
   , defaultDepthClear
   , createPipelineWithDepth
   , createDepthCheckedPipeline
@@ -567,7 +567,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Recorder
   , copyLevelToReadback
   , copyToReadback
   , defaultDepthClear
-  , depthPass
+  , clearedDepth
   , draw
   , endRendering
   , readbackBytesFor

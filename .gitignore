@@ -45,3 +45,4 @@ config/*.local.yaml
 /packages/gpu-vulkan/native/shaders/toolchain.fingerprint
 /samples/triangle/renderer/shaders/toolchain.fingerprint
 /samples/sprites/renderer/shaders/toolchain.fingerprint
+/samples/scene3d/renderer/shaders/toolchain.fingerprint
