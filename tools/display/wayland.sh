@@ -31,11 +31,12 @@
 #
 # Exit status: the command's own once it ran; 1 when the compositor could not be
 # established, with the command never started; 2 for a usage error; 128+N when
-# the helper itself was terminated by signal N. The compositor is stopped and
-# the private runtime directory removed on every exit path the helper can
-# handle, from before that directory exists: cleanup and the signal traps are
-# installed first, so the setup window in which the directory is there and the
-# compositor is not is covered like any other. See docs/validation.md.
+# the helper itself was terminated by signal N. The compositor, and a readiness
+# client still running when the helper ends, are stopped and reaped and the
+# private runtime directory removed on every exit path the helper can handle,
+# from before that directory exists: cleanup and the signal traps are installed
+# first, so the setup window in which the directory is there and the compositor
+# is not is covered like any other. See docs/validation.md.
 set -uo pipefail
 
 usage() {
@@ -89,11 +90,21 @@ alive() {
   return 1
 }
 
+# Stop everything this script started and still has running, and wait for it to
+# be gone before the scratch directory goes: the compositor, the command if it
+# is somehow still there, and a readiness client that was in flight when the
+# helper was ended. What to signal is taken from the job table rather than from
+# a recorded process id. A job the table still lists as running has not been
+# reaped, so that number is still that process's own, while a number kept in a
+# variable may by then name a process this script never started, and no variable
+# can name a client that a signal outran the recording of. The table holds only
+# this shell's own children, so nothing else is signalled or waited for.
 stop() {
-  if [ -n "$compositor" ]; then
-    kill "$compositor" 2>/dev/null
-    wait "$compositor" 2>/dev/null
-  fi
+  local job
+  for job in $(jobs -pr); do
+    kill "$job" 2>/dev/null
+  done
+  wait 2>/dev/null
   if [ -n "$scratch" ]; then
     rm -rf "$scratch"
   fi
@@ -102,9 +113,9 @@ trap stop EXIT
 
 # A signal the helper can catch ends it through the same cleanup as any other
 # exit: the command it started is stopped first, then the EXIT trap stops the
-# compositor and removes the runtime directory. Waiting on the command rather
-# than running it in the foreground is what lets a signal be handled while it
-# runs instead of after it.
+# compositor and any readiness client still in flight, and removes the runtime
+# directory. Waiting on the command rather than running it in the foreground is
+# what lets a signal be handled while it runs instead of after it.
 terminate() {
   trap - TERM INT HUP
   if [ -n "$command_pid" ]; then
