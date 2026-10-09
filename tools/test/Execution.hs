@@ -9,7 +9,8 @@
 module Execution (spec) where
 
 import Control.Concurrent (threadDelay)
-import Control.Monad (forM_, void)
+import Control.Exception (bracket, finally)
+import Control.Monad (forM_, void, when)
 import Data.List (intercalate, isPrefixOf, stripPrefix)
 import Data.Maybe (isNothing)
 import Json (Json (..), asArray, asBool, asString, entryFor, field, parseJson)
@@ -36,7 +37,9 @@ import System.Directory
   )
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
+import System.IO (readFile')
 import System.IO.Temp (withSystemTempDirectory)
+import System.Process (getPid, spawnProcess, terminateProcess, waitForProcess)
 import Test.Hspec
   ( Spec
   , describe
@@ -46,6 +49,7 @@ import Test.Hspec
   , shouldNotContain
   , shouldReturn
   , shouldSatisfy
+  , pendingWith
   )
 
 data Fixture = Fixture
@@ -272,6 +276,223 @@ spec = describe "Validation execution" $ do
         -- deadline still expires on it.
         watchdogStage fixture "gone-leader" `shouldReturn` "timeout"
 
+    it "does not read a session it cannot observe as an empty one" $
+      withFixture $ \fixture → do
+        -- The command is gone at once, so only an answer of "nobody is left"
+        -- could end the stage early. Not knowing is not that answer: the stage
+        -- stays open to its deadline, and expires rather than passes.
+        watchdogStage fixture "unobservable" `shouldReturn` "timeout"
+
+    forM_ [1, 2, 3, 5] $ \handoffs →
+      it ("does not read a session as empty while its members keep handing off to replacements (" ++ show handoffs ++ " in a row)") $
+        withFixture $ \fixture →
+          -- The last member forks a replacement and exits after a scan has
+          -- listed it and before it was asked its session, again and again.
+          -- Each such scan finds nobody in a session that still has a member,
+          -- so a stage that believed one would pass with a replacement running,
+          -- however many scans it took before it believed.
+          handoffStage fixture "completion" handoffs `shouldReturn` ["timeout", "False", "gone"]
+
+    forM_ [1, 3] $ \handoffs →
+      it ("does not stop cleaning up while the last member hands off during the grace period (" ++ show handoffs ++ " in a row)") $
+        withFixture $ \fixture →
+          -- The same handoffs while the stage is being stopped: every
+          -- replacement inherits the termination signal's disposition, so the
+          -- last only goes when it is killed, and the cleanup has to say so.
+          handoffStage fixture "expiry" handoffs `shouldReturn` ["timeout", "True", "gone"]
+
+    forM_ [("the platform's table", "default"), ("the ps fallback's table", "ps")] $ \(label, mode) →
+      it ("completes an empty stage promptly while unrelated processes are created as fast as they can, reading " ++ label) $
+        withFixture $ \fixture → do
+          -- Something outside the stage forks and reaps in a tight loop for
+          -- the whole run. A completion check that needed a moment with
+          -- nothing created anywhere would never get one and would hold the
+          -- stage to its deadline; this one asks about what was created.
+          answer ← churnStage fixture mode
+          if answer == ["no-ps"]
+            then pendingWith "this machine has no ps to fall back on"
+            else answer `shouldBe` ["passed", "True"]
+
+    forM_ [3, 5] $ \handoffs →
+      it ("still ends the last member at expiry when its replacement is handed off after the closing marker (" ++ show handoffs ++ " handoffs)") $
+        withFixture $ \fixture →
+          -- One handoff in a plain scan makes the session look empty, so the
+          -- next pass is a bracketed one; during it the member that scan lists
+          -- hands off after the listing, and its replacement hands off again
+          -- after the closing marker and before it is asked its session, all in
+          -- another process group than the command's. Completion accepts this
+          -- race; the cleanup that follows an expiry does not, so the last
+          -- replacement, which ignores the termination signal, must still be
+          -- found, killed and reported.
+          handoffStage fixture "expiry-late" handoffs `shouldReturn` ["timeout", "True", "gone"]
+
+    it "ends cross-group descendants that keep handing off through the escalation as well" $
+      withFixture $ \fixture →
+        -- The handoffs begin when escalation does, so every scan of it is blind
+        -- and none confirms the session empty. Cleanup still reaches the group
+        -- the relays live in, which it remembered from before, stops it,
+        -- kills it, and reports the kill with the cleanup apart from the
+        -- measurement.
+        handoffStage fixture "expiry-escalate" 400 `shouldReturn` ["timeout", "True", "gone", "separate"]
+
+    it "kills a descendant that moved to a group of its own after it was observed, when the session can no longer be read" $
+      withFixture $ \fixture →
+        -- The descendant was observed at the first signal, in the launch group;
+        -- it then moved to a group of its own and ignores the signal, and from
+        -- then on nothing can be observed. Only its remembered identifier
+        -- reaches it, so cleanup must signal remembered processes as well as
+        -- remembered groups.
+        observedStage fixture `shouldReturn` ["timeout", "True", "gone"]
+
+    it "signals a remembered process only while it is in the session" $
+      withFixture $ \fixture →
+        -- An identifier cleanup remembered may since have been reused outside the
+        -- stage: it is asked its session before every signal, and a process or
+        -- group outside it is neither stopped nor killed.
+        rememberedStage fixture `shouldReturn` ["untouched", "reached"]
+
+    it "bounds a ps that never answers by the deadline it was given" $
+      withFixture $ \fixture → do
+        answer ← hungObserverStage fixture "unit"
+        if answer == ["no-ps"]
+          then pendingWith "this machine has no ps to fall back on"
+          else answer `shouldBe` ["bounded", "counted", "skipped"]
+
+    it "reads nothing from the platform's own table once the deadline has passed" $
+      withFixture $ \fixture →
+        -- An exhausted deadline is not met with a scan that runs on: every
+        -- observation, native or ps, answers unknown at once, never a partial
+        -- set and never an empty session.
+        hungObserverStage fixture "native-unit" `shouldReturn` ["unknown"]
+
+    forM_
+      [ ("expiry", ["timeout", "True", "gone", "prompt", "told-promptly"])
+      , ("completion", ["timeout", "True", "gone", "prompt"])
+      , ("slow", ["timeout", "True", "gone", "prompt", "told-promptly"])
+      , ("native-expiry", ["timeout", "True", "gone", "prompt", "capped", "told-promptly"])
+      , ("native-completion", ["timeout", "True", "gone", "prompt", "capped"])
+      ]
+      $ \(mode, expected) →
+        it ("keeps every observation inside its caller's deadline, in the " ++ mode ++ " case") $
+          withFixture $ \fixture → do
+            -- ps never answers (or answers after a pause), or the platform's own
+            -- table is long and every query in it slow (the native cases:
+            -- hundreds of queries at a few milliseconds each, against caps of
+            -- fifty milliseconds), where an observation allowed its own time
+            -- would postpone the first termination and every cap by minutes. The first termination goes
+            -- out within its own bound, the descendant is ended through the
+            -- launch group, and the cleanup reports that it killed.
+            answer ← hungObserverStage fixture mode
+            if answer == ["no-ps"]
+              then pendingWith "this machine has no ps to fall back on"
+              else answer `shouldBe` expected
+
+    forM_ [("could not be confirmed empty", "unconfirmed"), ("could not be read", "uncertain")] $ \(label, mode) →
+      it ("stays within its cap, as a kill, when the session " ++ label) $
+        withFixture $ \fixture →
+          -- The observation is replaced, not waited out: with the confirmation
+          -- never coming, cleanup runs to its caps (shrunk here), ends the
+          -- stage, and reports a kill rather than a clean exit. The outcome
+          -- stays a timeout and the cleanup is not part of the measurement.
+          capStage fixture mode `shouldReturn` ["timeout", "True", "separate", "gone"]
+
+    forM_
+      [ ("the first observation of the session failed", 1, False)
+      , ("the session stayed unreadable past the retries of the first signal", 30, False)
+      , ("the session stayed unreadable and the handler changed its process group", 30, True)
+      ]
+      $ \(label, failures, regroup) →
+        it ("lets a termination handler finish when " ++ label) $
+          withFixture $ \fixture →
+            -- Whatever the first signal could not name, it did not send: only
+            -- the launched process is told, and exactly that process is
+            -- remembered as told, so the next successful observation tells
+            -- the cleanup child it finds and never the handler again, whether
+            -- or not the handler moved to another group meanwhile. A second
+            -- SIGTERM would end it before it retained anything.
+            transientStage fixture failures regroup `shouldReturn` ["timeout", "0", "cleaned", "False"]
+
+    it "reports no kill for a command that exits on the termination signal, reading the ps fallback's table" $
+      withFixture $ \fixture → do
+        -- The fallback starts a ps inside every pass, which a check that
+        -- nothing was created during the pass would take for activity on the
+        -- machine and never confirm, holding cleanup to its cap and reporting
+        -- a kill that was never needed.
+        answer ← psGracefulStage fixture
+        if answer == ["no-ps"]
+          then pendingWith "this machine has no ps to fall back on"
+          else answer `shouldBe` ["timeout", "False", "True"]
+
+    it "empties a session of descendants that keep forking replacements" $
+      withFixture $ \fixture →
+        -- A chain of processes, each exiting as soon as it has forked the
+        -- next and none answering the termination signal, is not something to
+        -- chase one sweep at a time: cleanup stops what it finds, finds what
+        -- the stopped could no longer fork, and only then kills.
+        breederStage fixture `shouldReturn` ["timeout", "empty"]
+
+    it "keeps measuring a command whose descendant moved to another process group" $
+      withFixture $ \fixture → do
+        -- The descendant moves into a group of its own inside the command's
+        -- session, proves it has, and only then lets the shell go. It outlives
+        -- the shell by half a second and records that it finished, so a stage
+        -- that ended with the shell would end before the record exists.
+        plan ← planRequesting fixture ["probe.regrouped"]
+        withRegrouped fixture "probe.regrouped" $ do
+          (result, _, _) ← runGroup fixture "probe.regrouped" plan []
+          result `shouldBe` ExitSuccess
+          receipt ← readReceipt fixture "probe.regrouped"
+          stringField receipt "outcome" `shouldBe` Just "passed"
+          fieldIsNull receipt "expiry" `shouldBe` True
+          numberField receipt "duration_seconds" `shouldSatisfy` maybe False (>= 0.5)
+          readFile' (receiptsDirectory fixture </> "evidence/probe.regrouped/child.done")
+            `shouldReturn` "done\n"
+
+    it "ends a descendant in another process group at expiry, sparing what is outside the stage" $
+      withFixture $ \fixture → do
+        plan ← planRequesting fixture ["probe.regrouped-term"]
+        withOutsider $ \outsider → withRegrouped fixture "probe.regrouped-term" $ do
+          (result, _, _) ← runGroup fixture "probe.regrouped-term" plan []
+          result `shouldBe` ExitFailure 1
+          receipt ← readReceipt fixture "probe.regrouped-term"
+          stringField receipt "outcome" `shouldBe` Just "timeout"
+          numberField receipt "duration_seconds" `shouldSatisfy` maybe False (\seconds → seconds >= 1 && seconds < 1.5)
+          -- It answered the termination signal, so nothing had to be killed.
+          (receipt >>= field "expiry" >>= field "killed" >>= asBool) `shouldBe` Just False
+          (receipt >>= field "expiry" >>= field "cleanup_seconds" >>= asNumber) `shouldSatisfy` maybe False (< 5)
+          regroupedChild fixture "probe.regrouped-term" >>= \child → reaped fixture child 50 `shouldReturn` True
+          running fixture outsider `shouldReturn` True
+
+    it "kills a descendant in another process group that ignores the termination signal" $
+      withFixture $ \fixture → do
+        plan ← planRequesting fixture ["probe.regrouped-stubborn"]
+        withOutsider $ \outsider → withRegrouped fixture "probe.regrouped-stubborn" $ do
+          (result, _, _) ← runGroup fixture "probe.regrouped-stubborn" plan []
+          result `shouldBe` ExitFailure 1
+          receipt ← readReceipt fixture "probe.regrouped-stubborn"
+          stringField receipt "outcome" `shouldBe` Just "timeout"
+          -- The measurement stops at the deadline; the grace the descendant
+          -- spent ignoring the signal is the cleanup's.
+          numberField receipt "duration_seconds" `shouldSatisfy` maybe False (\seconds → seconds >= 1 && seconds < 1.5)
+          (receipt >>= field "expiry" >>= field "killed" >>= asBool) `shouldBe` Just True
+          (receipt >>= field "expiry" >>= field "cleanup_seconds" >>= asNumber) `shouldSatisfy` maybe False (>= 5)
+          regroupedChild fixture "probe.regrouped-stubborn" >>= \child → reaped fixture child 50 `shouldReturn` True
+          running fixture outsider `shouldReturn` True
+
+    it "ends a preparation's descendant in another process group, and never starts the command" $
+      withFixture $ \fixture → do
+        plan ← planRequesting fixture ["probe.regrouped-prepared"]
+        withOutsider $ \outsider → withRegrouped fixture "probe.regrouped-prepared" $ do
+          (result, _, _) ← runGroup fixture "probe.regrouped-prepared" plan []
+          result `shouldBe` ExitFailure 1
+          receipt ← readReceipt fixture "probe.regrouped-prepared"
+          stringField receipt "outcome" `shouldBe` Just "timeout"
+          boolField receipt "executed" `shouldBe` Just False
+          nestedString receipt "preparation" "outcome" `shouldBe` Just "timeout"
+          doesFileExist (receiptsDirectory fixture </> "evidence/probe.regrouped-prepared/ran") `shouldReturn` False
+          regroupedChild fixture "probe.regrouped-prepared" >>= \child → reaped fixture child 50 `shouldReturn` True
+          running fixture outsider `shouldReturn` True
+
     it "retains the evidence a stopped command writes in its own cleanup" $
       withFixture $ \fixture → do
         plan ← planRequesting fixture ["probe.evidence"]
@@ -282,6 +503,22 @@ spec = describe "Validation execution" $ do
         stringsField receipt "evidence"
           `shouldBe` Just ["evidence/probe.evidence/display.log", "evidence/probe.evidence/setup.log"]
         readFile (receiptsDirectory fixture </> "evidence/probe.evidence/display.log") `shouldReturn` "retained\n"
+
+    it "lets a termination handler finish cleanup that starts a subprocess" $
+      withFixture $ \fixture → do
+        -- The handler puts SIGTERM back to its default, as the display helpers
+        -- do, and runs a cleanup child. That child is a member the watchdog
+        -- finds only after the signal: it is told to stop on its own, and the
+        -- handler, already signalled once, is not signalled again — a second
+        -- SIGTERM would kill it before it retained anything.
+        plan ← planRequesting fixture ["probe.cleanup"]
+        (result, _, _) ← runGroup fixture "probe.cleanup" plan []
+        result `shouldBe` ExitFailure 1
+        receipt ← readReceipt fixture "probe.cleanup"
+        stringField receipt "outcome" `shouldBe` Just "timeout"
+        numberField receipt "exit_status" `shouldBe` Just 0
+        (receipt >>= field "expiry" >>= field "killed" >>= asBool) `shouldBe` Just False
+        readFile' (receiptsDirectory fixture </> "evidence/probe.cleanup/cleaned") `shouldReturn` "cleaned\n"
 
     it "binds the preparation into the plan's identity and the receipt's comparison" $
       withFixture $ \fixture → do
@@ -1736,9 +1973,10 @@ watchdogStage fixture mode = do
       [ "-I"
       , "-c"
       , unlines
-          [ "import importlib.util, os, sys, time"
+          [ "import importlib.util, os, signal, sys, time"
           , "# Loading the runner by path must not leave its bytecode in the checkout."
           , "sys.dont_write_bytecode = True"
+          , "signal.alarm(120)"
           , "path, root, mode = sys.argv[1:4]"
           , "specification = importlib.util.spec_from_file_location('runner_under_test', path)"
           , "runner = importlib.util.module_from_spec(specification)"
@@ -1750,6 +1988,11 @@ watchdogStage fixture mode = do
           , "        return original(*arguments, **options)"
           , "    runner.subprocess.Popen = slow"
           , "    stage = runner.execute(['sh', '-c', 'sleep 0.7'], root, 1, dict(os.environ))"
+          , "elif mode == 'unobservable':"
+          , "    runner.session_members = lambda session, deadline=None: None"
+          , "    runner.TERMINATION_GRACE_SECONDS = 1"
+          , "    runner.KILLING_SECONDS = 1"
+          , "    stage = runner.execute(['true'], root, 1, dict(os.environ))"
           , "else:"
           , "    def gone(pid):"
           , "        raise OSError('the leader has already exited')"
@@ -1763,6 +2006,820 @@ watchdogStage fixture mode = do
       ]
   (result, errors) `shouldBe` (ExitSuccess, "")
   pure (takeWhile (/= '\n') output)
+
+-- | Drive the real runner's stage execution through handoffs its session scan
+-- cannot see. The command's leader exits leaving a relay that waits on a named
+-- pipe. Each time the runner lists the processes, and while handoffs remain,
+-- the relay is released, forks a replacement that is the next relay (the last
+-- is the one that stays), and exits, and only then is that scan's stale
+-- listing handed back. The listing is the one function patched, so the relays
+-- and the replacement are real processes and nothing is slept for. Returns the
+-- stage's outcome, whether its cleanup killed anything, and whether the last
+-- replacement was gone once the stage returned; whatever the stage left
+-- running is killed either way.
+--
+-- In @completion@ the handoffs begin at the first scan after the leader exits.
+-- In @expiry@ the relays ignore the termination signal and the handoffs begin
+-- at the first scan after the cleanup has started.
+handoffStage ∷ Fixture → String → Int → IO [String]
+handoffStage fixture mode handoffs = do
+  (result, output, errors) ←
+    run
+      (environment fixture)
+      (root fixture)
+      "python3"
+      [ "-I"
+      , "-c"
+      , unlines
+          [ "import importlib.util, os, signal, sys, tempfile, time"
+          , "sys.dont_write_bytecode = True"
+          , "signal.alarm(120)"
+          , "path, root, mode, handoffs = sys.argv[1:5]"
+          , "handoffs = int(handoffs)"
+          , "specification = importlib.util.spec_from_file_location('runner_under_test', path)"
+          , "runner = importlib.util.module_from_spec(specification)"
+          , "specification.loader.exec_module(runner)"
+          , "runner.TERMINATION_GRACE_SECONDS = 1"
+          , "if mode == 'expiry-escalate':"
+          , "    # A chain far longer than the escalation is given, so only reaching the"
+          , "    # group the relays live in can end it before the cap."
+          , "    runner.KILLING_SECONDS = 1"
+          , "leader = '''"
+          , "import os, signal, sys"
+          , "ready, go, result, mode, handoffs, pidfile = sys.argv[1:7]"
+          , "null = os.open(os.devnull, os.O_RDWR)"
+          , "os.dup2(null, 1)"
+          , "os.dup2(null, 2)"
+          , "def relay(remaining):"
+          , "    signal.alarm(150)"
+          , "    with open(go) as handle:"
+          , "        handle.read()"
+          , "    replacement = os.fork()"
+          , "    if replacement == 0:"
+          , "        if remaining > 1:"
+          , "            relay(remaining - 1)"
+          , "        signal.alarm(150)"
+          , "        while True:"
+          , "            signal.pause()"
+          , "    with open(result, 'w') as handle:"
+          , "        handle.write('%d %d' % (os.getpid(), replacement))"
+          , "    os._exit(0)"
+          , "first = os.fork()"
+          , "if first == 0:"
+          , "    os.setpgid(0, 0)"
+          , "    if mode.startswith('expiry'):"
+          , "        signal.signal(signal.SIGTERM, signal.SIG_IGN)"
+          , "    with open(pidfile, 'w') as handle:"
+          , "        handle.write(str(os.getpid()))"
+          , "    with open(ready, 'w') as handle:"
+          , "        handle.write('ready')"
+          , "    relay(int(handoffs))"
+          , "with open(ready) as handle:"
+          , "    handle.read()"
+          , "'''"
+          , "scratch = tempfile.mkdtemp()"
+          , "ready, go, result, pidfile = (os.path.join(scratch, name) for name in ('ready', 'go', 'result', 'pid'))"
+          , "for fifo in (ready, go, result):"
+          , "    os.mkfifo(fifo)"
+          , "# expiry-late: one handoff in a plain pass (the session looks empty), then,"
+          , "# in the bracketed pass that follows, one while it lists and one after"
+          , "# its closing marker, so the last replacement is created past the bracket."
+          , "late = (['plain'] + ['table', 'close'] * handoffs)[:handoffs]"
+          , "events = late if mode == 'expiry-late' else ['plain'] * handoffs"
+          , "state = {'armed': mode == 'completion', 'next': 0, 'replacement': None, 'opened': False}"
+          , "listing = runner.process_table"
+          , "def release():"
+          , "    state['next'] += 1"
+          , "    # A relay the cleanup has stopped cannot hand off: give up on it rather"
+          , "    # than wait for an answer that will not come."
+          , "    opened = None"
+          , "    for _ in range(40):"
+          , "        try:"
+          , "            opened = os.open(go, os.O_WRONLY | os.O_NONBLOCK)"
+          , "            break"
+          , "        except OSError:"
+          , "            time.sleep(0.05)"
+          , "    if opened is None:"
+          , "        return"
+          , "    os.write(opened, b'go')"
+          , "    os.close(opened)"
+          , "    reading = os.open(result, os.O_RDONLY | os.O_NONBLOCK)"
+          , "    data = b''"
+          , "    end = time.monotonic() + 2"
+          , "    while time.monotonic() < end:"
+          , "        try:"
+          , "            chunk = os.read(reading, 64)"
+          , "        except BlockingIOError:"
+          , "            chunk = None"
+          , "        if chunk:"
+          , "            data += chunk"
+          , "        elif chunk == b'' and data:"
+          , "            break"
+          , "        time.sleep(0.002)"
+          , "    os.close(reading)"
+          , "    if not data:"
+          , "        return"
+          , "    relay, replacement = map(int, data.split())"
+          , "    state['replacement'] = replacement"
+          , "    # The relay has gone before the pass goes on."
+          , "    patience = time.monotonic() + 10"
+          , "    while time.monotonic() < patience:"
+          , "        found = runner.process_session(relay, '')"
+          , "        if found is None or found[1][:1] in ('Z', 'X'):"
+          , "            break"
+          , "        time.sleep(0.01)"
+          , "def due(kind):"
+          , "    return state['armed'] and state['next'] < len(events) and events[state['next']] == kind"
+          , "def handing_off(deadline=None):"
+          , "    table = listing(deadline)"
+          , "    if table is not None and due('plain'):"
+          , "        release()"
+          , "    elif table is not None and state['opened'] and due('table'):"
+          , "        release()"
+          , "    return table"
+          , "runner.process_table = handing_off"
+          , "marker = runner.newest_pid"
+          , "def marking():"
+          , "    pid = marker()"
+          , "    # Markers come in pairs around a pass; the second closes it. A"
+          , "    # close event hands off right after the closing marker, before"
+          , "    # any process the pass listed is asked its session."
+          , "    if state['opened'] and due('close'):"
+          , "        release()"
+          , "    state['opened'] = not state['opened']"
+          , "    return pid"
+          , "runner.newest_pid = marking"
+          , "telling = runner.first_termination"
+          , "def telling_first(*arguments):"
+          , "    told = telling(*arguments)"
+          , "    state['armed'] = mode != 'expiry-escalate'"
+          , "    return told"
+          , "freezing = runner.freeze_session"
+          , "def freezing_first(*arguments):"
+          , "    # expiry-escalate: the handoffs begin only once escalation has."
+          , "    state['armed'] = True"
+          , "    return freezing(*arguments)"
+          , "if mode.startswith('expiry'):"
+          , "    runner.first_termination = telling_first"
+          , "    runner.freeze_session = freezing_first"
+          , "try:"
+          , "    stage = runner.execute(['python3', '-c', leader, ready, go, result, mode, str(handoffs), pidfile], root, 1, dict(os.environ))"
+          , "    replacement = state['replacement']"
+          , "    gone = False"
+          , "    patience = time.monotonic() + 5"
+          , "    while mode == 'expiry-escalate' and time.monotonic() < patience:"
+          , "        # Every relay and replacement lives in the group the first relay made."
+          , "        try:"
+          , "            os.killpg(int(open(pidfile).read()), 0)"
+          , "        except (ProcessLookupError, PermissionError):"
+          , "            gone = True"
+          , "            break"
+          , "        time.sleep(0.05)"
+          , "    while mode != 'expiry-escalate' and replacement is not None and time.monotonic() < patience:"
+          , "        try:"
+          , "            os.kill(replacement, 0)"
+          , "        except ProcessLookupError:"
+          , "            gone = True"
+          , "            break"
+          , "        time.sleep(0.05)"
+          , "    print(stage['outcome'])"
+          , "    print(stage['expiry'] is not None and stage['expiry']['killed'])"
+          , "    print('gone' if gone else 'running')"
+          , "    if mode == 'expiry-escalate':"
+          , "        print('separate' if stage['duration_seconds'] < 2 and stage['expiry']['cleanup_seconds'] >= 0 else 'mixed')"
+          , "finally:"
+          , "    if state['replacement'] is not None:"
+          , "        try:"
+          , "            os.kill(state['replacement'], signal.SIGKILL)"
+          , "        except OSError:"
+          , "            pass"
+          , "    try:"
+          , "        os.killpg(int(open(pidfile).read()), signal.SIGKILL)"
+          , "    except (OSError, ValueError):"
+          , "        pass"
+          ]
+      , tools fixture </> "run.py"
+      , root fixture
+      , mode
+      , show handoffs
+      ]
+  (result, errors) `shouldBe` (ExitSuccess, "")
+  pure (lines output)
+
+-- | Drive the real runner's stage execution of a command whose descendant,
+-- told to terminate, moves into a process group of its own and ignores the
+-- signal, while the session can no longer be observed. Cleanup has only what it
+-- remembers: the descendant was observed at the first signal, so it must be
+-- reached by its own identifier, wherever it has moved. Reports the outcome,
+-- whether cleanup reported a kill, and whether the descendant was gone.
+observedStage ∷ Fixture → IO [String]
+observedStage fixture = do
+  (result, output, errors) ←
+    run
+      (environment fixture)
+      (root fixture)
+      "python3"
+      [ "-I"
+      , "-c"
+      , unlines
+          [ "import importlib.util, os, signal, sys, tempfile, time"
+          , "sys.dont_write_bytecode = True"
+          , "signal.alarm(120)"
+          , "path, root = sys.argv[1:3]"
+          , "specification = importlib.util.spec_from_file_location('runner_under_test', path)"
+          , "runner = importlib.util.module_from_spec(specification)"
+          , "specification.loader.exec_module(runner)"
+          , "runner.TERMINATION_GRACE_SECONDS = 1"
+          , "runner.CONFIRMING_SECONDS = 1"
+          , "runner.KILLING_SECONDS = 2"
+          , "scratch = tempfile.mkdtemp()"
+          , "ready, moved, pidfile = (os.path.join(scratch, name) for name in ('ready', 'moved', 'pid'))"
+          , "leader = '''"
+          , "import os, signal, sys, time"
+          , "ready, moved, pidfile = sys.argv[1:4]"
+          , "# Nothing here may hold the driver's pipes open if it fails."
+          , "devnull = os.open(os.devnull, os.O_RDWR)"
+          , "for descriptor in (0, 1, 2):"
+          , "    os.dup2(devnull, descriptor)"
+          , "child = os.fork()"
+          , "if child == 0:"
+          , "    def handler(number, frame):"
+          , "        os.setpgid(0, 0)"
+          , "        signal.signal(signal.SIGTERM, signal.SIG_IGN)"
+          , "        with open(moved, 'w') as handle:"
+          , "            handle.write('moved')"
+          , "    signal.signal(signal.SIGTERM, handler)"
+          , "    with open(pidfile, 'w') as handle:"
+          , "        handle.write(str(os.getpid()))"
+          , "    with open(ready, 'w') as handle:"
+          , "        handle.write('ready')"
+          , "    end = time.monotonic() + 90"
+          , "    while time.monotonic() < end:"
+          , "        time.sleep(0.05)"
+          , "    os._exit(0)"
+          , "signal.signal(signal.SIGTERM, signal.SIG_IGN)"
+          , "os.waitpid(child, 0)"
+          , "'''"
+          , "def waiting(file):"
+          , "    end = time.monotonic() + 20"
+          , "    while not os.path.exists(file) and time.monotonic() < end:"
+          , "        time.sleep(0.02)"
+          , "state = {'dark': False}"
+          , "telling = runner.first_termination"
+          , "def telling_first(process, session):"
+          , "    # The descendant has its handler in place before it is told, and has"
+          , "    # moved before the session goes dark, so what it was observed in is"
+          , "    # the group it has left."
+          , "    waiting(ready)"
+          , "    told = telling(process, session)"
+          , "    waiting(moved)"
+          , "    state['dark'] = True"
+          , "    return told"
+          , "runner.first_termination = telling_first"
+          , "observing = runner.observe_session"
+          , "def observe(session, *rest):"
+          , "    return None if state['dark'] else observing(session, *rest)"
+          , "runner.observe_session = observe"
+          , "descendant = None"
+          , "try:"
+          , "    stage = runner.execute(['python3', '-c', leader, ready, moved, pidfile], root, 1, dict(os.environ))"
+          , "    descendant = int(open(pidfile).read())"
+          , "    gone = False"
+          , "    patience = time.monotonic() + 5"
+          , "    while time.monotonic() < patience:"
+          , "        try:"
+          , "            os.kill(descendant, 0)"
+          , "        except ProcessLookupError:"
+          , "            gone = True"
+          , "            break"
+          , "        time.sleep(0.05)"
+          , "    print(stage['outcome'])"
+          , "    print(stage['expiry']['killed'])"
+          , "    print('gone' if gone else 'running')"
+          , "finally:"
+          , "    if descendant is not None:"
+          , "        try:"
+          , "            os.kill(descendant, signal.SIGKILL)"
+          , "        except OSError:"
+          , "            pass"
+          ]
+      , tools fixture </> "run.py"
+      , root fixture
+      ]
+  (result, errors) `shouldBe` (ExitSuccess, "")
+  pure (lines output)
+
+-- | Drive the runner's signalling of what it remembers, with one process in the
+-- session and one outside it, each remembered by identifier and group. Reports
+-- whether the one outside was left alone, stopped or killed, and whether the
+-- one inside was reached.
+rememberedStage ∷ Fixture → IO [String]
+rememberedStage fixture = do
+  (result, output, errors) ←
+    run
+      (environment fixture)
+      (root fixture)
+      "python3"
+      [ "-I"
+      , "-c"
+      , unlines
+          [ "import importlib.util, os, signal, subprocess, sys, time"
+          , "sys.dont_write_bytecode = True"
+          , "signal.alarm(60)"
+          , "path = sys.argv[1]"
+          , "specification = importlib.util.spec_from_file_location('runner_under_test', path)"
+          , "runner = importlib.util.module_from_spec(specification)"
+          , "specification.loader.exec_module(runner)"
+          , "outside = subprocess.Popen(['sleep', '300'], start_new_session=True)"
+          , "inside = subprocess.Popen(['sleep', '300'])"
+          , "try:"
+          , "    known = runner.Remembered(None)"
+          , "    known.pids |= {outside.pid, inside.pid}"
+          , "    known.groups.add(outside.pid)"
+          , "    session = os.getsid(0)"
+          , "    runner.signal_remembered(known, session, signal.SIGSTOP)"
+          , "    time.sleep(0.3)"
+          , "    stopped = os.waitpid(outside.pid, os.WUNTRACED | os.WNOHANG)[0] != 0"
+          , "    runner.signal_remembered(known, session, signal.SIGKILL)"
+          , "    time.sleep(0.3)"
+          , "    print('untouched' if not stopped and outside.poll() is None else 'reached')"
+          , "    print('reached' if inside.poll() is not None else 'untouched')"
+          , "finally:"
+          , "    for process in (outside, inside):"
+          , "        try:"
+          , "            process.kill()"
+          , "        except OSError:"
+          , "            pass"
+          , "        process.wait()"
+          ]
+      , tools fixture </> "run.py"
+      ]
+  (result, errors) `shouldBe` (ExitSuccess, "")
+  pure (lines output)
+
+-- | Drive the real runner's stage execution with the process table read through
+-- @ps@, which is made to hang for good (@hung@) or to answer slowly (@slow@).
+-- @unit@ asks the fallback itself for a table against a short deadline, then
+-- against one already passed. @expiry@ is a command that outlives its budget,
+-- @completion@ one whose leader exits at once leaving a descendant, and @slow@
+-- the first with a @ps@ that answers after a pause. The caps are shrunk. Reports
+-- what each case's bound shows: the outcome, whether cleanup reported a kill,
+-- that the descendant was gone, that the whole run returned promptly and, for
+-- @expiry@, that the first termination was sent promptly.
+hungObserverStage ∷ Fixture → String → IO [String]
+hungObserverStage fixture mode = do
+  (result, output, errors) ←
+    run
+      (environment fixture)
+      (root fixture)
+      "python3"
+      [ "-I"
+      , "-c"
+      , unlines
+          [ "import importlib.util, os, shutil, signal, sys, tempfile, time"
+          , "sys.dont_write_bytecode = True"
+          , "signal.alarm(120)"
+          , "path, root, mode = sys.argv[1:4]"
+          , "native = mode.startswith('native')"
+          , "real = shutil.which('ps')"
+          , "if real is None and not native:"
+          , "    print('no-ps')"
+          , "    sys.exit(0)"
+          , "specification = importlib.util.spec_from_file_location('runner_under_test', path)"
+          , "runner = importlib.util.module_from_spec(specification)"
+          , "specification.loader.exec_module(runner)"
+          , "scratch = tempfile.mkdtemp()"
+          , "if mode in ('unit', 'expiry', 'completion'):"
+          , "    # A ps that never answers; exec keeps it one process, so killing it"
+          , "    # leaves nothing behind."
+          , "    bindir = os.path.join(scratch, 'bin')"
+          , "    os.mkdir(bindir)"
+          , "    fake = os.path.join(bindir, 'ps')"
+          , "    with open(fake, 'w') as handle:"
+          , "        handle.write('#!/bin/sh\\nexec sleep 300\\n')"
+          , "    os.chmod(fake, 0o755)"
+          , "    os.environ['PATH'] = bindir + os.pathsep + os.environ['PATH']"
+          , "if mode == 'unit':"
+          , "    started = time.monotonic()"
+          , "    table = runner.ps_process_table(started + 0.3)"
+          , "    took = time.monotonic() - started"
+          , "    created = runner.observer_creations"
+          , "    past = runner.ps_process_table(time.monotonic() - 1)"
+          , "    print('bounded' if table is None and took < 5 else 'unbounded')"
+          , "    print('counted' if created == 1 else 'uncounted')"
+          , "    print('skipped' if past is None and runner.observer_creations == created else 'started')"
+          , "    sys.exit(0)"
+          , "if mode == 'native-unit':"
+          , "    # An expired deadline is not answered from the platform's own table"
+          , "    # either: nothing is read, and the answer is unknown, not empty."
+          , "    past = time.monotonic() - 1"
+          , "    session = os.getsid(0)"
+          , "    answers = [runner.process_table(past), runner.observe_session(session, past), runner.bracketed_observation(session, past)[0], runner.strict_observation(session, past)[0]]"
+          , "    print('unknown' if all(answer is None for answer in answers) else 'answered')"
+          , "    sys.exit(0)"
+          , "if native:"
+          , "    caps = 0.05"
+          , "    runner.TERMINATION_GRACE_SECONDS = caps"
+          , "    runner.KILLING_SECONDS = caps"
+          , "    runner.CONFIRMING_SECONDS = caps"
+          , "    runner.FIRST_TERMINATION_SECONDS = caps"
+          , "else:"
+          , "    runner.TERMINATION_GRACE_SECONDS = 1"
+          , "    runner.KILLING_SECONDS = 1"
+          , "    runner.CONFIRMING_SECONDS = 1"
+          , "    runner.FIRST_TERMINATION_SECONDS = 0.5"
+          , "real_table = runner.ps_process_table"
+          , "if native:"
+          , "    # The platform's own table, made long enough that asking everyone takes"
+          , "    # seconds whatever the host: every query costs a few milliseconds, and"
+          , "    # four hundred identifiers beyond any real one are listed as well."
+          , "    listing = runner.process_table"
+          , "    asking = runner.process_session"
+          , "    def long_table(deadline=None):"
+          , "        table = listing(deadline)"
+          , "        return None if table is None else table + [(pid, '') for pid in range(4000000, 4000400)]"
+          , "    def slow_query(pid, state):"
+          , "        time.sleep(0.005)"
+          , "        return asking(pid, state)"
+          , "    runner.process_table = long_table"
+          , "    runner.process_session = slow_query"
+          , "elif mode == 'slow':"
+          , "    def slow(deadline=None):"
+          , "        pause = 0.2 if deadline is None else min(0.2, deadline - time.monotonic())"
+          , "        if pause > 0:"
+          , "            time.sleep(pause)"
+          , "        return real_table(deadline)"
+          , "    runner.process_table = slow"
+          , "else:"
+          , "    runner.process_table = real_table"
+          , "record, told = (os.path.join(scratch, name) for name in ('child', 'told'))"
+          , "leader = '''"
+          , "import os, signal, subprocess, sys, time"
+          , "record, told, role = sys.argv[1:4]"
+          , "# Nothing here may hold the driver's pipes open if it fails."
+          , "devnull = os.open(os.devnull, os.O_RDWR)"
+          , "for descriptor in (0, 1, 2):"
+          , "    os.dup2(devnull, descriptor)"
+          , "child = subprocess.Popen(['python3', '-c', 'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(90)'])"
+          , "with open(record, 'w') as handle:"
+          , "    handle.write(str(child.pid))"
+          , "if role == 'exit':"
+          , "    sys.exit(0)"
+          , "def handler(number, frame):"
+          , "    with open(told, 'w') as handle:"
+          , "        handle.write(repr(time.time()))"
+          , "signal.signal(signal.SIGTERM, handler)"
+          , "end = time.monotonic() + 90"
+          , "while time.monotonic() < end:"
+          , "    time.sleep(0.05)"
+          , "'''"
+          , "entered = []"
+          , "telling = runner.first_termination"
+          , "def telling_first(process, session):"
+          , "    entered.append(time.time())"
+          , "    return telling(process, session)"
+          , "runner.first_termination = telling_first"
+          , "child = None"
+          , "try:"
+          , "    started = time.monotonic()"
+          , "    stage = runner.execute(['python3', '-c', leader, record, told, 'exit' if mode in ('completion', 'native-completion') else 'stay'], root, 1, dict(os.environ))"
+          , "    took = time.monotonic() - started"
+          , "    child = int(open(record).read())"
+          , "    gone = False"
+          , "    patience = time.monotonic() + 5"
+          , "    while time.monotonic() < patience:"
+          , "        try:"
+          , "            os.kill(child, 0)"
+          , "        except ProcessLookupError:"
+          , "            gone = True"
+          , "            break"
+          , "        time.sleep(0.05)"
+          , "    print(stage['outcome'])"
+          , "    print(stage['expiry']['killed'])"
+          , "    print('gone' if gone else 'running')"
+          , "    print('prompt' if took < (4 if native else 15) else 'slow')"
+          , "    if native:"
+          , "        print('capped' if stage['expiry']['cleanup_seconds'] < 1.5 else 'overran')"
+          , "    if mode in ('expiry', 'slow', 'native-expiry'):"
+          , "        delay = float(open(told).read()) - entered[0] if os.path.exists(told) else None"
+          , "        print('told-promptly' if delay is not None and delay < (1 if native else 3) else 'told-late')"
+          , "finally:"
+          , "    if child is not None:"
+          , "        try:"
+          , "            os.kill(child, signal.SIGKILL)"
+          , "        except OSError:"
+          , "            pass"
+          ]
+      , tools fixture </> "run.py"
+      , root fixture
+      , mode
+      ]
+  (result, errors) `shouldBe` (ExitSuccess, "")
+  pure (lines output)
+
+-- | Drive the real runner's stage execution of a command that outlives its
+-- budget, with the observation cleanup depends on replaced: @unconfirmed@
+-- always answers that the session is empty but never that nothing was created
+-- while it looked, and @uncertain@ never answers at all. The caps are shrunk so
+-- that running into them costs a second or two. Reports the outcome, whether
+-- cleanup reported a kill, whether the measurement and the cleanup stayed
+-- apart, and whether the command's descendant was gone afterwards.
+capStage ∷ Fixture → String → IO [String]
+capStage fixture mode = do
+  (result, output, errors) ←
+    run
+      (environment fixture)
+      (root fixture)
+      "python3"
+      [ "-I"
+      , "-c"
+      , unlines
+          [ "import importlib.util, os, signal, sys, tempfile, time"
+          , "sys.dont_write_bytecode = True"
+          , "signal.alarm(120)"
+          , "path, root, mode = sys.argv[1:4]"
+          , "specification = importlib.util.spec_from_file_location('runner_under_test', path)"
+          , "runner = importlib.util.module_from_spec(specification)"
+          , "specification.loader.exec_module(runner)"
+          , "runner.TERMINATION_GRACE_SECONDS = 0.3"
+          , "runner.CONFIRMING_SECONDS = 0.3"
+          , "runner.KILLING_SECONDS = 0.5"
+          , "runner.FIRST_TERMINATION_SECONDS = 0.1"
+          , "if mode == 'unconfirmed':"
+          , "    runner.strict_observation = lambda session, deadline=None: ({}, False)"
+          , "else:"
+          , "    runner.observe_session = lambda session, deadline=None: None"
+          , "scratch = tempfile.mkdtemp()"
+          , "record = os.path.join(scratch, 'child')"
+          , "child = None"
+          , "try:"
+          , "    started = time.monotonic()"
+          , "    stage = runner.execute(['sh', '-c', 'sleep 300 & echo $! > \"$0\"; wait', record], root, 1, dict(os.environ))"
+          , "    took = time.monotonic() - started"
+          , "    child = int(open(record).read())"
+          , "    gone = False"
+          , "    patience = time.monotonic() + 5"
+          , "    while time.monotonic() < patience:"
+          , "        try:"
+          , "            os.kill(child, 0)"
+          , "        except ProcessLookupError:"
+          , "            gone = True"
+          , "            break"
+          , "        time.sleep(0.05)"
+          , "    print(stage['outcome'])"
+          , "    print(stage['expiry']['killed'])"
+          , "    print('separate' if stage['duration_seconds'] < 2 and stage['expiry']['cleanup_seconds'] < 6 and took < 8 else 'mixed')"
+          , "    print('gone' if gone else 'running')"
+          , "finally:"
+          , "    if child is not None:"
+          , "        try:"
+          , "            os.kill(child, signal.SIGKILL)"
+          , "        except OSError:"
+          , "            pass"
+          ]
+      , tools fixture </> "run.py"
+      , root fixture
+      , mode
+      ]
+  (result, errors) `shouldBe` (ExitSuccess, "")
+  pure (lines output)
+
+-- | Drive the real runner's stage execution of a termination handler that
+-- resets @SIGTERM@ to its default and runs a cleanup subprocess before it
+-- retains its evidence, with the first observation of the session failing.
+-- Reports the outcome, the exit status the handler reached, what it retained
+-- and whether cleanup reported killing.
+transientStage ∷ Fixture → Int → Bool → IO [String]
+transientStage fixture failures regroup = do
+  (result, output, errors) ←
+    run
+      (environment fixture)
+      (root fixture)
+      "python3"
+      [ "-I"
+      , "-c"
+      , unlines
+          [ "import importlib.util, os, signal, sys, tempfile"
+          , "sys.dont_write_bytecode = True"
+          , "signal.alarm(120)"
+          , "path, root, failures, regroup = sys.argv[1:5]"
+          , "failures = int(failures)"
+          , "specification = importlib.util.spec_from_file_location('runner_under_test', path)"
+          , "runner = importlib.util.module_from_spec(specification)"
+          , "specification.loader.exec_module(runner)"
+          , "runner.TERMINATION_GRACE_SECONDS = 5"
+          , "evidence = tempfile.mkdtemp()"
+          , "environment = dict(os.environ, HETOIMASIA_VALIDATION_EVIDENCE=evidence)"
+          , "handler = '''"
+          , "import os, signal, subprocess, sys"
+          , "evidence = os.environ['HETOIMASIA_VALIDATION_EVIDENCE']"
+          , "def handler(number, frame):"
+          , "    signal.signal(signal.SIGTERM, signal.SIG_DFL)"
+          , "    if sys.argv[1] == 'regroup':"
+          , "        os.setpgid(0, 0)"
+          , "    subprocess.run(['sleep', '0.3'])"
+          , "    with open(evidence + '/cleaned', 'w') as record:"
+          , "        record.write('cleaned')"
+          , "    sys.exit(0)"
+          , "if sys.argv[1] == 'regroup':"
+          , "    # The handler runs in a descendant that moves to a group of its own;"
+          , "    # the launched process ignores the signal and waits for it."
+          , "    child = os.fork()"
+          , "    if child != 0:"
+          , "        signal.signal(signal.SIGTERM, signal.SIG_IGN)"
+          , "        os.waitpid(child, 0)"
+          , "        sys.exit(0)"
+          , "signal.signal(signal.SIGTERM, handler)"
+          , "while True:"
+          , "    signal.pause()"
+          , "'''"
+          , "real = runner.session_members"
+          , "calls = []"
+          , "def flaky(session, deadline=None):"
+          , "    calls.append(session)"
+          , "    return None if len(calls) <= failures else real(session, deadline)"
+          , "runner.session_members = flaky"
+          , "stage = runner.execute(['python3', '-c', handler, regroup], root, 1, environment)"
+          , "kept = os.path.join(evidence, 'cleaned')"
+          , "print(stage['outcome'])"
+          , "print(stage['exit_status'])"
+          , "print(open(kept).read() if os.path.exists(kept) else 'missing')"
+          , "print(stage['expiry']['killed'])"
+          ]
+      , tools fixture </> "run.py"
+      , root fixture
+      , show failures
+      , if regroup then "regroup" else "stay"
+      ]
+  (result, errors) `shouldBe` (ExitSuccess, "")
+  pure (lines output)
+
+-- | Drive the real runner's stage execution, reading the process table from the
+-- @ps@ fallback, of a command that answers the termination signal by exiting
+-- zero. Reports the outcome, whether cleanup reported killing, and whether
+-- cleanup took well under the grace period. Reports @no-ps@ where there is no
+-- @ps@ to fall back on.
+psGracefulStage ∷ Fixture → IO [String]
+psGracefulStage fixture = do
+  (result, output, errors) ←
+    run
+      (environment fixture)
+      (root fixture)
+      "python3"
+      [ "-I"
+      , "-c"
+      , unlines
+          [ "import importlib.util, os, shutil, signal, sys"
+          , "sys.dont_write_bytecode = True"
+          , "signal.alarm(120)"
+          , "path, root = sys.argv[1:3]"
+          , "specification = importlib.util.spec_from_file_location('runner_under_test', path)"
+          , "runner = importlib.util.module_from_spec(specification)"
+          , "specification.loader.exec_module(runner)"
+          , "if shutil.which('ps') is None:"
+          , "    print('no-ps')"
+          , "    sys.exit(0)"
+          , "runner.process_table = runner.ps_process_table"
+          , "stage = runner.execute(['sh', '-c', 'trap \"exit 0\" TERM; sleep 300 & wait'], root, 1, dict(os.environ))"
+          , "print(stage['outcome'])"
+          , "print(stage['expiry']['killed'])"
+          , "print(stage['expiry']['cleanup_seconds'] < 5)"
+          ]
+      , tools fixture </> "run.py"
+      , root fixture
+      ]
+  (result, errors) `shouldBe` (ExitSuccess, "")
+  pure (lines output)
+
+-- | Drive the real runner's stage execution of a command that exits at once
+-- while a process outside the stage creates and reaps children in a tight loop,
+-- and report the stage's outcome and whether it was measured as finishing well
+-- inside its five-second budget. @ps@ makes the runner read its table from the
+-- @ps@ fallback, whose own subprocess is one more creation inside every pass.
+-- Reports @no-ps@ where there is no @ps@ to fall back on. The churn is stopped
+-- whether or not the example held.
+churnStage ∷ Fixture → String → IO [String]
+churnStage fixture mode = do
+  (result, output, errors) ←
+    run
+      (environment fixture)
+      (root fixture)
+      "python3"
+      [ "-I"
+      , "-c"
+      , unlines
+          [ "import importlib.util, os, shutil, signal, subprocess, sys"
+          , "sys.dont_write_bytecode = True"
+          , "signal.alarm(120)"
+          , "path, root, mode = sys.argv[1:4]"
+          , "specification = importlib.util.spec_from_file_location('runner_under_test', path)"
+          , "runner = importlib.util.module_from_spec(specification)"
+          , "specification.loader.exec_module(runner)"
+          , "if mode == 'ps':"
+          , "    if shutil.which('ps') is None:"
+          , "        print('no-ps')"
+          , "        sys.exit(0)"
+          , "    runner.process_table = runner.ps_process_table"
+          , "churn = '''"
+          , "import os"
+          , "while True:"
+          , "    child = os.fork()"
+          , "    if child == 0:"
+          , "        os._exit(0)"
+          , "    os.waitpid(child, 0)"
+          , "'''"
+          , "producer = subprocess.Popen(['python3', '-c', churn], start_new_session=True)"
+          , "try:"
+          , "    stage = runner.execute(['true'], root, 5, dict(os.environ))"
+          , "    print(stage['outcome'])"
+          , "    print(stage['duration_seconds'] < 2)"
+          , "finally:"
+          , "    producer.kill()"
+          , "    producer.wait()"
+          ]
+      , tools fixture </> "run.py"
+      , root fixture
+      , mode
+      ]
+  (result, errors) `shouldBe` (ExitSuccess, "")
+  pure (lines output)
+
+-- | Drive the real runner's stage execution against a chain of processes that
+-- fork their successor and exit a few milliseconds later, none answering the
+-- termination signal, beside a leader that stays until it is stopped so that the
+-- stage expires. Report the stage's outcome and whether the group the command
+-- was launched in was empty (asked of the kernel, which a pass over the table
+-- cannot be trusted to answer for a chain this short-lived) within a few
+-- seconds of the stage returning. Cleanup has to end the chain whether or not a
+-- pass ever sees it, and killing it is not something the receipt claims. A
+-- watchdog that gave up would leave the chain running, so the driver ends it
+-- either way.
+breederStage ∷ Fixture → IO [String]
+breederStage fixture = do
+  (result, output, errors) ←
+    run
+      (environment fixture)
+      (root fixture)
+      "python3"
+      [ "-I"
+      , "-c"
+      , unlines
+          [ "import importlib.util, os, signal, sys, tempfile, time"
+          , "sys.dont_write_bytecode = True"
+          , "signal.alarm(120)"
+          , "path, root = sys.argv[1:3]"
+          , "specification = importlib.util.spec_from_file_location('runner_under_test', path)"
+          , "runner = importlib.util.module_from_spec(specification)"
+          , "specification.loader.exec_module(runner)"
+          , "runner.TERMINATION_GRACE_SECONDS = 1"
+          , "leader = '''"
+          , "import os, signal, sys, time"
+          , "record = sys.argv[1]"
+          , "null = os.open(os.devnull, os.O_RDWR)"
+          , "os.dup2(null, 1)"
+          , "os.dup2(null, 2)"
+          , "if os.fork() == 0:"
+          , "    signal.signal(signal.SIGTERM, signal.SIG_IGN)"
+          , "    while True:"
+          , "        signal.alarm(150)"
+          , "        if os.fork() != 0:"
+          , "            time.sleep(0.005)"
+          , "            os._exit(0)"
+          , "with open(record, 'w') as handle:"
+          , "    handle.write(str(os.getpid()))"
+          , "while True:"
+          , "    signal.pause()"
+          , "'''"
+          , "scratch = tempfile.mkdtemp()"
+          , "record = os.path.join(scratch, 'session')"
+          , "try:"
+          , "    stage = runner.execute(['python3', '-c', leader, record], root, 1, dict(os.environ))"
+          , "    session = int(open(record).read())"
+          , "    gone = False"
+          , "    patience = time.monotonic() + 5"
+          , "    while time.monotonic() < patience:"
+          , "        try:"
+          , "            os.killpg(session, 0)"
+          , "        except (ProcessLookupError, PermissionError):"
+          , "            gone = True"
+          , "            break"
+          , "        time.sleep(0.05)"
+          , "    print(stage['outcome'])"
+          , "    print('empty' if gone else 'running')"
+          , "finally:"
+          , "    try:"
+          , "        session = int(open(record).read())"
+          , "        # Whatever the stage left, stopped and then killed by group."
+          , "        os.killpg(session, signal.SIGSTOP)"
+          , "        os.killpg(session, signal.SIGKILL)"
+          , "    except (OSError, ValueError):"
+          , "        pass"
+          ]
+      , tools fixture </> "run.py"
+      , root fixture
+      ]
+  (result, errors) `shouldBe` (ExitSuccess, "")
+  pure (lines output)
 
 -- | Replace a receipt's recorded preparation command.
 patchPreparation ∷ Fixture → FilePath → String → IO ()
@@ -1898,6 +2955,86 @@ reaped fixture pid attempts = do
   case result of
     ExitFailure _ → pure True
     ExitSuccess → threadDelay 100000 >> reaped fixture pid (attempts - 1)
+
+-- | Whether a process identifier still names a running process.
+running ∷ Fixture → String → IO Bool
+running fixture pid = do
+  (result, _, _) ← run (environment fixture) (root fixture) "kill" ["-0", pid]
+  pure (result == ExitSuccess)
+
+-- | Start a process outside any stage, as a control that no cleanup may touch,
+-- and stop it again whether or not the example held.
+withOutsider ∷ (String → IO a) → IO a
+withOutsider =
+  bracket
+    (spawnProcess "sleep" ["300"])
+    (\control → terminateProcess control >> void (waitForProcess control))
+    . (\action control → getPid control >>= maybe (fail "the control exited at once") (action . show))
+
+-- | The descendant a regrouping command recorded, by the group's evidence.
+regroupedChild ∷ Fixture → String → IO String
+regroupedChild fixture group =
+  takeWhile (/= '\n') <$> readFile' (receiptsDirectory fixture </> "evidence" </> group </> "child.pid")
+
+-- | Run an example about a descendant that left the command's process group,
+-- and stop whatever it left running even when an assertion fails.
+withRegrouped ∷ Fixture → String → IO a → IO a
+withRegrouped fixture group action = action `finally` stopDescendant
+  where
+    stopDescendant = do
+      let record = receiptsDirectory fixture </> "evidence" </> group </> "child.pid"
+      present ← doesFileExist record
+      when present $ do
+        child ← regroupedChild fixture group
+        void (run (environment fixture) (root fixture) "kill" ["-9", child])
+
+-- | A command whose shell leaves a descendant behind in another process group
+-- of the same session. The descendant moves, checks that it did and that its
+-- session is unchanged, and tells the shell over a pipe; the shell records the
+-- descendant's process id only after that handshake, then exits.
+--
+-- The mode decides what the descendant does next. @release@ waits for the
+-- shell to go (its end of a second pipe closes), takes half a second, records
+-- that it finished, and exits. @term@ waits to be signalled. @ignore@ ignores
+-- @SIGTERM@ and waits to be killed.
+regroupCommand ∷ String → [String]
+regroupCommand mode =
+  [ "python3"
+  , "-c"
+  , unlines
+      [ "import os, signal, sys, time"
+      , "mode = sys.argv[1]"
+      , "evidence = os.environ['HETOIMASIA_VALIDATION_EVIDENCE']"
+      , "ready_read, ready_write = os.pipe()"
+      , "hold_read, hold_write = os.pipe()"
+      , "leader_group, leader_session = os.getpgid(0), os.getsid(0)"
+      , "child = os.fork()"
+      , "if child == 0:"
+      , "    os.close(ready_read)"
+      , "    os.close(hold_write)"
+      , "    os.setpgid(0, 0)"
+      , "    moved = os.getpgid(0) != leader_group and os.getsid(0) == leader_session"
+      , "    if mode == 'ignore':"
+      , "        signal.signal(signal.SIGTERM, signal.SIG_IGN)"
+      , "    os.write(ready_write, b'moved' if moved else b'stayed')"
+      , "    os.close(ready_write)"
+      , "    if mode == 'release':"
+      , "        os.read(hold_read, 1)"
+      , "        time.sleep(0.5)"
+      , "        with open(evidence + '/child.done', 'w') as done:"
+      , "            done.write('done\\n')"
+      , "        os._exit(0)"
+      , "    while True:"
+      , "        signal.pause()"
+      , "os.close(ready_write)"
+      , "os.close(hold_read)"
+      , "if os.read(ready_read, 16) != b'moved':"
+      , "    sys.exit(3)"
+      , "with open(evidence + '/child.pid', 'w') as record:"
+      , "    record.write(str(child) + '\\n')"
+      ]
+  , mode
+  ]
 
 -- ---------------------------------------------------------------------------
 -- The fixture repository
@@ -2059,6 +3196,42 @@ stagedGroupDocuments =
       "probe.graceful"
       ["sh", "-c", "trap 'exit 0' TERM; sleep 300 & wait"]
       "1"
+  , -- A command whose descendant moves to another process group and outlives
+    -- the shell, then finishes inside the budget.
+    stagedGroupDocument "probe.regrouped" (regroupCommand "release") "30"
+  , -- The same descendant, left waiting for a signal it will honor.
+    stagedGroupDocument "probe.regrouped-term" (regroupCommand "term") "1"
+  , -- And one that ignores the termination signal.
+    stagedGroupDocument "probe.regrouped-stubborn" (regroupCommand "ignore") "1"
+  , -- A preparation that leaves such a descendant behind, before a command that
+    -- would leave a mark.
+    preparedGroupDocument
+      "probe.regrouped-prepared"
+      (regroupCommand "term")
+      "1"
+      ["sh", "-c", "echo ran > \"$HETOIMASIA_VALIDATION_EVIDENCE/ran\""]
+      "30"
+  , -- A stalled command whose termination handler runs a cleanup subprocess
+    -- under the default disposition and only then retains its evidence.
+    stagedGroupDocument
+      "probe.cleanup"
+      [ "python3"
+      , "-c"
+      , unlines
+          [ "import os, signal, subprocess, sys"
+          , "evidence = os.environ['HETOIMASIA_VALIDATION_EVIDENCE']"
+          , "def handler(number, frame):"
+          , "    signal.signal(signal.SIGTERM, signal.SIG_DFL)"
+          , "    subprocess.run(['sleep', '0.3'])"
+          , "    with open(evidence + '/cleaned', 'w') as record:"
+          , "        record.write('cleaned\\n')"
+          , "    sys.exit(0)"
+          , "signal.signal(signal.SIGTERM, handler)"
+          , "while True:"
+          , "    signal.pause()"
+          ]
+      ]
+      "1"
   , -- A stalled command that keeps its diagnostics only in its own cleanup.
     stagedGroupDocument
       "probe.evidence"
@@ -2074,7 +3247,18 @@ stagedGroupDocuments =
 -- them.
 stagedGroups ∷ [String]
 stagedGroups =
-  ["probe.prepared", "probe.unprepared", "probe.overbuilt", "probe.lingering", "probe.graceful", "probe.evidence"]
+  [ "probe.prepared"
+  , "probe.unprepared"
+  , "probe.overbuilt"
+  , "probe.lingering"
+  , "probe.graceful"
+  , "probe.regrouped"
+  , "probe.regrouped-term"
+  , "probe.regrouped-stubborn"
+  , "probe.regrouped-prepared"
+  , "probe.cleanup"
+  , "probe.evidence"
+  ]
 
 -- | An optional CPU group consuming a directory named after it.
 stagedGroupDocument ∷ String → [String] → String → String
@@ -2101,6 +3285,7 @@ jsonList entries = "[" ++ intercalate ", " (map quoted entries) ++ "]"
     quoted entry = "\"" ++ concatMap escape entry ++ "\""
     escape '"' = "\\\""
     escape '\\' = "\\\\"
+    escape '\n' = "\\n"
     escape character = [character]
 
 -- | A catalog that consumes a document the committed one leaves as harmless
