@@ -39,7 +39,7 @@ spec = describe "Offscreen color targets" $ do
       before ← commandCount rig
       (batch, ()) ← recordFrame (rigRecording rig) (ownedFrame frame) (renderAndCopy kit) >>= either (fail . show) pure
       commands ← drop before <$> commandsOf' rig
-      [() | CommandBeginRendering view extent _ ← commands, view == kitView kit, extent == SurfaceExtent 32 16] `shouldBe` [()]
+      [() | CommandBeginRendering view extent _ Nothing ← commands, view == kitView kit, extent == SurfaceExtent 32 16] `shouldBe` [()]
       [() | CommandCopyImageToBuffer image extent buffer ← commands, image == kitImageHandle kit, extent == SurfaceExtent 32 16, buffer == kitBuffer kit] `shouldBe` [()]
       [size | CommandHostReadBarrier buffer size ← commands, buffer == kitBuffer kit] `shouldBe` [32 * 16 * 4]
       [() | CommandImageBarrier {} ← commands] `shouldBe` []

@@ -264,6 +264,7 @@ module Hetoimasia.GPU.Vulkan.Native.Recording
   , NativeCommand (..)
   , ImageLayout (..)
   , ClearColor (..)
+  , DepthClear (..)
   , Viewport (..)
   , Rect (..)
   , ImageQuery (..)
@@ -285,6 +286,19 @@ module Hetoimasia.GPU.Vulkan.Native.Recording
   , Recording
   , newRecording
   , Refusal (..)
+
+    -- * Depth (GRS-10)
+  , CompareOp (..)
+  , compareOpCode
+  , PipelineDepth (..)
+  , depthTested
+  , depthFormatPreference
+  , selectDepthFormat
+  , DepthPass (..)
+  , depthPass
+  , defaultDepthClear
+  , createPipelineWithDepth
+  , createDepthCheckedPipeline
 
     -- * Managed resources
   , PipelineLayout
@@ -341,6 +355,7 @@ module Hetoimasia.GPU.Vulkan.Native.Recording
   , beginRendering
   , PassStart (..)
   , beginRenderingInto
+  , beginRenderingWithDepth
   , endRendering
   , bindPipeline
   , setViewport
@@ -447,6 +462,9 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Construction
   , createPipelineLayout
   , createPipelineLayoutWith
   , createPipelineWith
+  , createPipelineWithDepth
+  , createDepthCheckedPipeline
+  , selectDepthFormat
   , createReadback
   , createRing
   , checkedRanges
@@ -474,6 +492,12 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   , BufferDescription (..)
   , BufferKind (..)
   , ClearColor (..)
+  , CompareOp (..)
+  , DepthClear (..)
+  , PipelineDepth (..)
+  , compareOpCode
+  , depthFormatPreference
+  , depthTested
   , ImageDescription (..)
   , ImageFormat (..)
   , ImageKind (..)
@@ -527,8 +551,10 @@ import Hetoimasia.GPU.Vulkan.Native.Shader.Interface (CheckedShader (..), Checke
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Recorder
   ( Recorder
   , BufferSource (..)
+  , DepthPass (..)
   , PassStart (..)
   , beginRendering
+  , beginRenderingWithDepth
   , bindIndexBuffer
   , bindVertexBuffer
   , claimRegion
@@ -540,6 +566,8 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Recorder
   , copyTargetToReadback
   , copyLevelToReadback
   , copyToReadback
+  , defaultDepthClear
+  , depthPass
   , draw
   , endRendering
   , readbackBytesFor

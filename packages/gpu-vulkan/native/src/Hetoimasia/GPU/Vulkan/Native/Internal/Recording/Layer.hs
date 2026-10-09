@@ -29,8 +29,17 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   , ImageLayout (..)
   , supportedTransition
   , ClearColor (..)
+  , DepthClear (..)
   , Viewport (..)
   , Rect (..)
+
+    -- * Depth (GRS-10)
+  , CompareOp (..)
+  , compareOpCode
+  , PipelineDepth (..)
+  , depthTested
+  , depthFormatPreference
+  , depthImageQuery
 
     -- * Buffers and images
   , BufferKind (..)
@@ -129,6 +138,12 @@ supportedTransition from to =
 data ClearColor = ClearColor !Float !Float !Float !Float
   deriving (Eq, Show)
 
+-- | A pass's depth attachment (GRS-10): the depth target's owned view, and
+-- the value the pass clears it to. The attachment is in its depth-attachment
+-- layout, loaded by clearing and stored.
+data DepthClear = DepthClear !Word64 !Float
+  deriving (Eq, Show)
+
 data Viewport = Viewport
   { viewportX ∷ !Float
   , viewportY ∷ !Float
@@ -151,8 +166,10 @@ data Rect = Rect
 data NativeCommand
   = CommandImageBarrier !Word64 !ImageLayout !ImageLayout
     -- ^ The image, and the layouts it leaves and enters.
-  | CommandBeginRendering !Word64 !SurfaceExtent !ClearColor
-    -- ^ Dynamic rendering into one color view, cleared, across the extent.
+  | CommandBeginRendering !Word64 !SurfaceExtent !ClearColor !(Maybe DepthClear)
+    -- ^ Dynamic rendering into one color view, cleared, across the extent,
+    -- and into a depth view cleared to a value, if the pass has one
+    -- (GRS-10).
   | CommandEndRendering
   | CommandBindPipeline !Word64
   | CommandSetViewport !Viewport
@@ -208,15 +225,70 @@ data PipelineShaders = PipelineShaders
   deriving (Eq, Show)
 
 -- | One graphics pipeline for dynamic rendering into one color format:
--- triangle lists, the vertex input it declares, dynamic viewport and scissor.
+-- triangle lists, the vertex input it declares, dynamic viewport and scissor,
+-- and, if it declares depth, the depth-only format it renders with and how it
+-- tests and writes depth (GRS-10).
 data PipelineRequest = PipelineRequest
   { requestLayout ∷ !Word64
   , requestShaders ∷ !PipelineShaders
   , requestColorFormat ∷ !Word32
   , requestVertexInput ∷ !VertexInput
   , requestBlend ∷ !PipelineBlend
+  , requestDepth ∷ !(Maybe PipelineDepth)
   }
   deriving (Eq, Show)
+
+-- | How a depth test compares a fragment's depth with the attachment's.
+data CompareOp
+  = CompareNever
+  | CompareLess
+  | CompareEqual
+  | CompareLessOrEqual
+  | CompareGreater
+  | CompareNotEqual
+  | CompareGreaterOrEqual
+  | CompareAlways
+  deriving (Eq, Ord, Show, Enum, Bounded)
+
+-- | The operation's @VkCompareOp@ value, which is its position here.
+compareOpCode ∷ CompareOp → Word32
+compareOpCode = fromIntegral . fromEnum
+
+-- | What a pipeline declares of depth (GRS-10): the depth-only format of the
+-- attachment it renders with — it is drawn only in a pass whose depth
+-- attachment has exactly that format — whether it tests depth and whether it
+-- writes it, and the comparison a test makes. Writing needs testing: Vulkan
+-- writes depth only for fragments that were tested. A pipeline that declares
+-- none renders without a depth attachment, and is drawn only in a pass that
+-- has none.
+data PipelineDepth = PipelineDepth
+  { depthAttachmentFormat ∷ !ImageFormat
+  , depthTest ∷ !Bool
+  , depthWrite ∷ !Bool
+  , depthCompare ∷ !CompareOp
+  }
+  deriving (Eq, Show)
+
+-- | The usual declaration for a depth format: testing and writing, a
+-- fragment passing when its depth is less than or equal to the attachment's
+-- (D-36). A renderer that wants another comparison, such as a reversed-Z
+-- one, sets 'depthCompare'.
+depthTested ∷ ImageFormat → PipelineDepth
+depthTested format = PipelineDepth format True True CompareLessOrEqual
+
+-- | The depth-only formats a depth target may have, in the order the backend
+-- prefers them (D-36): 32-bit floating point where the device supports it as
+-- a depth attachment, otherwise another the device supports. None has a
+-- stencil aspect, and none is ever assumed supported.
+depthFormatPreference ∷ [ImageFormat]
+depthFormatPreference = [Depth32Float, Depth24, Depth16]
+
+-- | What the device is asked about a depth format before it is chosen: the
+-- format, and the usage and format features a depth target needs.
+depthImageQuery ∷ ImageFormat → ImageQuery
+depthImageQuery format = ImageQuery (formatCode format) (useImageFlags use) (useFormatFeatures use)
+  where
+    use = imageKindUse DepthTarget
 
 -- | How a pipeline's color output combines with what its attachment holds
 -- (GRS-8).

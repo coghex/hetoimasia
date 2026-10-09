@@ -292,6 +292,7 @@ test-suite native-tests
         Test.GPU.Vulkan.Native.AllocatorStandIn
         Test.GPU.Vulkan.Native.AllocatorVisibility
         Test.GPU.Vulkan.Native.Checked
+        Test.GPU.Vulkan.Native.Depth
         Test.GPU.Vulkan.Native.Drawing
         Test.GPU.Vulkan.Native.Frameless
         Test.GPU.Vulkan.Native.Frames

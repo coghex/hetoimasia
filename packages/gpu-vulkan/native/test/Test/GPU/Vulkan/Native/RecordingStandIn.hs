@@ -69,6 +69,9 @@ data RecordingCall
     -- ^ The vertex input a pipeline was created with, when it has any.
   | DeclaredBlend !Word64 !PipelineBlend
     -- ^ The blend a pipeline was created with, when it declares one (GRS-8).
+  | DeclaredDepth !Word64 !PipelineDepth
+    -- ^ The depth a pipeline was created with, when it declares any
+    -- (GRS-10).
   | DestroyedPipeline !Word64
   | CreatedStorage !Word64 !Word64
     -- ^ The pool and its command buffer.
@@ -286,6 +289,7 @@ recordingStandInOps standIn =
         step standIn AtCreatePipeline (CreatedPipeline handle (requestLayout request) (requestColorFormat request))
         when (requestVertexInput request /= noVertexInput) (journal standIn (DeclaredInput handle (requestVertexInput request)))
         when (requestBlend request /= BlendNone) (journal standIn (DeclaredBlend handle (requestBlend request)))
+        mapM_ (journal standIn . DeclaredDepth handle) (requestDepth request)
         pure handle
     , opsDestroyPipeline = \_ handle → step standIn AtDestroyPipeline (DestroyedPipeline handle)
     , opsCreateStorage = \_ _ → do

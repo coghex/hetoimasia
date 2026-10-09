@@ -103,6 +103,8 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
   , constructPipelineLayoutFor
   , constructCheckedPipeline
   , constructBlendedCheckedPipeline
+  , constructDepthCheckedPipeline
+  , constructDepthFormat
   , replaceConstructedCheckedPipeline
   , constructBuffer
   , constructImage
@@ -306,7 +308,11 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , retireRecording
   , transitionImage
   , createBlendedCheckedPipeline
+  , createDepthCheckedPipeline
+  , selectDepthFormat
+  , ImageFormat
   , PipelineBlend
+  , PipelineDepth
   )
 import Hetoimasia.GPU.Vulkan.Native.Roots
   ( Checkpoint (..)
@@ -526,6 +532,23 @@ constructBlendedCheckedPipeline
   ∷ Construction q inst msgr phys dev cmd → PipelineLayout → CheckedShaders → Word32 → PipelineBlend → IO (Either Refusal Pipeline)
 constructBlendedCheckedPipeline construction layout shaders format blend =
   confined construction (createBlendedCheckedPipeline (constructionRecording construction) layout shaders format blend)
+
+-- | A graphics pipeline from checked shaders that declares depth (GRS-10): the
+-- depth-only format of the attachment it renders with, whether it tests and
+-- writes depth, and the comparison its test makes, checked against the device
+-- as 'createDepthCheckedPipeline' checks it, besides everything
+-- 'constructBlendedCheckedPipeline' checks.
+constructDepthCheckedPipeline
+  ∷ Construction q inst msgr phys dev cmd → PipelineLayout → CheckedShaders → Word32 → PipelineBlend → PipelineDepth → IO (Either Refusal Pipeline)
+constructDepthCheckedPipeline construction layout shaders format blend depth =
+  confined construction (createDepthCheckedPipeline (constructionRecording construction) layout shaders format blend depth)
+
+-- | The depth-only format the backend uses for depth targets and the
+-- pipelines that render with them (GRS-10, D-36): 32-bit floating point where
+-- the device supports it as a depth attachment, otherwise another supported
+-- depth-only format, asked of the device and never assumed.
+constructDepthFormat ∷ Construction q inst msgr phys dev cmd → IO (Either Refusal ImageFormat)
+constructDepthFormat construction = confined construction (selectDepthFormat (constructionRecording construction))
 
 -- | A new generation of a pipeline from checked shaders, checked as
 -- 'constructCheckedPipeline' checks them; the old one is released.

@@ -31,6 +31,10 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Recorder
   , beginRendering
   , PassStart (..)
   , beginRenderingInto
+  , DepthPass (..)
+  , depthPass
+  , defaultDepthClear
+  , beginRenderingWithDepth
   , endRendering
   , bindPipeline
   , setViewport
@@ -117,7 +121,10 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Allocation (AllocatedBuffer (..), f
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   ( BufferKind (..)
   , ClearColor
+  , DepthClear (..)
   , ImageDescription (..)
+  , ImageFormat
+  , PipelineDepth (..)
   , IndexType
   , InputRate (..)
   , PushConstantRange (..)
@@ -796,11 +803,14 @@ data Attachment = Attachment
   , attachmentFormat ∷ !Word32
   , attachmentTarget ∷ !(Maybe ResourceId)
     -- ^ The color target, or 'Nothing' for the frame's image.
+  , attachmentDepth ∷ !(Maybe ImageFormat)
+    -- ^ The format of the pass's depth attachment (GRS-10), if it has one:
+    -- never the frame's image, which windowed depth will give one.
   }
 
 -- | The frame's image as an attachment.
 frameAttachment ∷ FrameImage → Attachment
-frameAttachment frame = Attachment (frameImageExtent frame) (frameImageFormat frame) Nothing
+frameAttachment frame = Attachment (frameImageExtent frame) (frameImageFormat frame) Nothing Nothing
 
 -- | What a pipeline, a viewport or a scissor is checked against: the open
 -- pass's attachment, or, outside rendering, the frame's image. A frame-less
@@ -829,7 +839,7 @@ beginRendering recorder clear = withImage recorder $ \frame → commandSequence 
             ( state {stateRendering = Just (frameAttachment frame)}
             , []
             , [CommandBeginLabel (passLabel (recorderBatch recorder) (frameImageGeneration frame)) | recorderLabelled recorder]
-                <> [CommandBeginRendering (frameImageView frame) (frameImageExtent frame) clear]
+                <> [CommandBeginRendering (frameImageView frame) (frameImageExtent frame) clear Nothing]
             )
 
 -- | How a pass into a managed color target begins (GRS-5). Either way the
@@ -862,7 +872,99 @@ data PassStart
 -- limit. Every refusal makes no native call. Pipelines, viewports and scissors are checked
 -- against the target while the pass is open.
 beginRenderingInto ∷ Recorder q inst msgr phys dev cmd → Image → PassStart → ClearColor → IO (Either Refusal ())
-beginRenderingInto recorder (Image resource) start clear =
+beginRenderingInto recorder color start clear = beginTargetPass recorder color start clear Nothing
+
+-- | A managed depth target a pass renders with (GRS-10), how its pass starts
+-- on it, and the value it clears the target to.
+data DepthPass = DepthPass
+  { depthPassTarget ∷ !Image
+  , depthPassStart ∷ !PassStart
+  , depthPassClear ∷ !Float
+  }
+
+-- | A depth pass that clears to 'defaultDepthClear'.
+depthPass ∷ Image → PassStart → DepthPass
+depthPass target start = DepthPass target start defaultDepthClear
+
+-- | The value a depth pass clears to unless it is given another (D-36): 1.0,
+-- the far plane of a depth range of 0 to 1 compared less-or-equal. A renderer
+-- that reverses depth clears to 0 and declares another comparison.
+defaultDepthClear ∷ Float
+defaultDepthClear = 1
+
+-- | 'beginRenderingInto' with a managed depth target as the pass's depth
+-- attachment (GRS-10): in a frame batch or a frame-less one alike, the
+-- target's owned view cleared to the pass's value and stored, in the
+-- depth-attachment layout. Under #335's rules the pass is a use of the depth
+-- target in its depth-attachment use, the use it rests in: 'ClearTarget'
+-- requires the target to be initialized and keeps its layout,
+-- 'ClearFromUndefined' discards what it held and, as it does a color target,
+-- initializes a new one once its batch has been submitted. The depth target
+-- is entered in the same transaction as the color target and retained with
+-- it, so a refusal of either leaves neither retained nor touched.
+--
+-- Refused with no native call, in addition to what 'beginRenderingInto'
+-- refuses: a depth target that is released, replaced, another session's or
+-- of the wrong kind (not a 'DepthTarget'), as the color target's own
+-- refusals; one of more than one mip level, as 'RefusedUnsupported'; one of
+-- another extent than the color target's, as 'RefusedIncompatible', naming
+-- both; and a clear value that is not finite or lies outside zero to one, as
+-- 'RefusedIllegal'. While the pass is open, a pipeline is drawn only if it
+-- declares the format of this depth attachment, and the pass's depth
+-- attachment is the only one a draw tests against.
+beginRenderingWithDepth ∷ Recorder q inst msgr phys dev cmd → Image → PassStart → ClearColor → DepthPass → IO (Either Refusal ())
+beginRenderingWithDepth recorder color start clear depth = beginTargetPass recorder color start clear (Just depth)
+
+-- | A pass's depth target once its checks have passed.
+data ResolvedDepth = ResolvedDepth
+  { resolvedResource ∷ !ResourceId
+  , resolvedFormat ∷ !ImageFormat
+  , resolvedObject ∷ !Word64
+  , resolvedView ∷ !Word64
+  , resolvedImage ∷ !(Maybe (Word32, Word32))
+  , resolvedStart ∷ !PassStart
+  , resolvedClear ∷ !Float
+  }
+
+-- | Check a pass's depth target against the color target it renders beside.
+resolveDepth ∷ Recording q inst msgr phys dev cmd → ImageDescription → DepthPass → IO (Either Refusal ResolvedDepth)
+resolveDepth recording colour (DepthPass (Image resource) start value) =
+  liveNative recording resource >>= \case
+    Left refusal → pure (Left refusal)
+    Right (NativeImage description memory view)
+      | imageKind description /= DepthTarget → pure (Left RefusedWrongKind)
+      | imageMipLevels description /= 1 → pure (Left (RefusedUnsupported "rendering with a depth target of more than one mip level"))
+      | (imageWidth description, imageHeight description) /= (imageWidth colour, imageHeight colour) →
+          pure
+            ( Left
+                ( RefusedIncompatible
+                    ( "a depth target of extent "
+                        <> extentText description
+                        <> " and a color target of extent "
+                        <> extentText colour
+                    )
+                )
+            )
+      | isNaN value || isInfinite value || value < 0 || value > 1 → pure (Left (RefusedIllegal "a depth clear value that is not between zero and one"))
+      | otherwise →
+          pure
+            ( Right
+                ( ResolvedDepth
+                    resource
+                    (imageFormat description)
+                    (memoryResource memory)
+                    view
+                    (Just (useAspect (imageKindUse DepthTarget), imageMipLevels description))
+                    start
+                    value
+                )
+            )
+    Right _ → pure (Left RefusedWrongKind)
+  where
+    extentText description = tshow (imageWidth description) <> "x" <> tshow (imageHeight description)
+
+beginTargetPass ∷ Recorder q inst msgr phys dev cmd → Image → PassStart → ClearColor → Maybe DepthPass → IO (Either Refusal ())
+beginTargetPass recorder (Image resource) start clear depth =
   owned recording $
     liveNative recording resource >>= \case
       Left refusal → pure (Left refusal)
@@ -875,35 +977,48 @@ beginRenderingInto recorder (Image resource) start clear =
               | imageWidth description > widest → pure (Left (RefusedOutOfBounds (fromIntegral (imageWidth description)) (fromIntegral widest)))
             (_, tallest)
               | imageHeight description > tallest → pure (Left (RefusedOutOfBounds (fromIntegral (imageHeight description)) (fromIntegral tallest)))
-            _ → orderedSequence recorder $ \state →
-              if isJust (stateRendering state)
-                then Left (RefusedIllegal "rendering has already begun")
-                else
-                  let kind = imageResourceKind ColorTarget
-                      stepped = case start of
-                        ClearTarget → Access.touch resource kind ColorAttachment KeepsContents (stateAccess state)
-                        ClearFromUndefined → Access.transition resource kind FromUndefined ColorAttachment (stateAccess state)
-                      extent = SurfaceExtent (imageWidth description) (imageHeight description)
-                      object = memoryResource memory
-                      image = Just (useAspect (imageKindUse ColorTarget), imageMipLevels description)
-                   in case stepped of
-                        Left refusal → Left (accessRefused refusal)
-                        Right (access, barriers) →
-                          Right
-                            ( state
-                                { stateAccess = access
-                                , stateObjects = Map.insert resource (object, image) (stateObjects state)
-                                , stateRendering = Just (Attachment extent (formatCode (imageFormat description)) (Just resource))
-                                }
-                            , [resource]
-                            , [ (resource, if barrierDiscards barrier then DiscardsContents else KeepsContents)
-                              | barrier ← barriers
-                              , barrierRole barrier == EntryBarrier
-                              ]
-                            , map (resourceBarrier object image) barriers
-                                <> [CommandBeginLabel (targetPassLabel (recorderBatch recorder) resource) | recorderLabelled recorder]
-                                <> [CommandBeginRendering view extent clear]
-                            )
+            _ →
+              maybe (pure (Right Nothing)) (fmap (fmap Just) . resolveDepth recording description) depth >>= \case
+                Left refusal → pure (Left refusal)
+                Right resolved → orderedSequence recorder $ \state →
+                  if isJust (stateRendering state)
+                    then Left (RefusedIllegal "rendering has already begun")
+                    else
+                      let kind = imageResourceKind ColorTarget
+                          stepped = case start of
+                            ClearTarget → Access.touch resource kind ColorAttachment KeepsContents (stateAccess state)
+                            ClearFromUndefined → Access.transition resource kind FromUndefined ColorAttachment (stateAccess state)
+                          extent = SurfaceExtent (imageWidth description) (imageHeight description)
+                          object = memoryResource memory
+                          image = Just (useAspect (imageKindUse ColorTarget), imageMipLevels description)
+                          depthKind = imageResourceKind DepthTarget
+                          -- The depth target is entered after the color target,
+                          -- from the access the color target's step leaves.
+                          steppedDepth access = case resolved of
+                            Nothing → Right (access, [])
+                            Just held → case resolvedStart held of
+                              ClearTarget → Access.touch (resolvedResource held) depthKind DepthAttachment KeepsContents access
+                              ClearFromUndefined → Access.transition (resolvedResource held) depthKind FromUndefined DepthAttachment access
+                       in case stepped of
+                            Left refusal → Left (accessRefused refusal)
+                            Right (access, barriers) → case steppedDepth access of
+                              Left refusal → Left (accessRefused refusal)
+                              Right (accessWithDepth, depthBarriers) →
+                                let entries from owner = [(owner, if barrierDiscards barrier then DiscardsContents else KeepsContents) | barrier ← from, barrierRole barrier == EntryBarrier]
+                                    held = [(resolvedResource target, resolvedObject target, resolvedImage target) | target ← maybe [] pure resolved]
+                                 in Right
+                                      ( state
+                                          { stateAccess = accessWithDepth
+                                          , stateObjects = foldl' (\objects (name, native, shape) → Map.insert name (native, shape) objects) (stateObjects state) ((resource, object, image) : held)
+                                          , stateRendering = Just (Attachment extent (formatCode (imageFormat description)) (Just resource) (fmap resolvedFormat resolved))
+                                          }
+                                      , resource : [resolvedResource target | target ← maybe [] pure resolved]
+                                      , entries barriers resource <> concat [entries depthBarriers (resolvedResource target) | target ← maybe [] pure resolved]
+                                      , map (resourceBarrier object image) barriers
+                                          <> concat [map (resourceBarrier (resolvedObject target) (resolvedImage target)) depthBarriers | target ← maybe [] pure resolved]
+                                          <> [CommandBeginLabel (targetPassLabel (recorderBatch recorder) resource) | recorderLabelled recorder]
+                                          <> [CommandBeginRendering view extent clear (fmap (\target → DepthClear (resolvedView target) (resolvedClear target)) resolved)]
+                                      )
       Right _ → pure (Left RefusedWrongKind)
   where
     recording = recorderRecording recorder
@@ -925,7 +1040,7 @@ bindPipeline recorder (Pipeline pipeline) =
     Left refusal → pure (Left refusal)
     Right (NativePipeline handle layout format interface) → command recorder $ \state → do
       attachment ← checkedAgainst recorder state
-      incompatible format attachment
+      incompatible format (interfaceDepth interface) attachment
       let ranges = interfacePushConstants interface
           -- The table's sets stay bound only under a layout that holds the
           -- table with the same push-constant ranges (GRS-7); and pushed
@@ -938,11 +1053,24 @@ bindPipeline recorder (Pipeline pipeline) =
       Right (state {statePipeline = Just (BoundPipeline pipeline format layout interface), stateTable = table, stateSampler = sampler}, [pipeline, layout], CommandBindPipeline handle)
     Right _ → pure (Left RefusedWrongKind)
 
--- | A pipeline built for another format than the attachment's.
-incompatible ∷ Word32 → Attachment → Either Refusal ()
-incompatible format attachment
+-- | A pipeline built for another color format than the attachment's, or
+-- declaring another depth than the pass has (GRS-10): a pipeline that declares
+-- a depth format is drawn only in a pass whose depth attachment has exactly
+-- it, and one that declares none only in a pass with no depth attachment —
+-- which is what Vulkan requires of dynamic rendering, so no pipeline reaches
+-- a draw in a pass it was not built for.
+incompatible ∷ Word32 → Maybe PipelineDepth → Attachment → Either Refusal ()
+incompatible format depth attachment
   | format /= attachmentFormat attachment =
       Left (RefusedIncompatible ("a pipeline for format " <> tshow format <> " and an image of format " <> tshow (attachmentFormat attachment)))
+  | fmap depthAttachmentFormat depth /= attachmentDepth attachment =
+      Left
+        ( RefusedIncompatible
+            ( maybe "a pipeline that declares no depth" (\declared → "a pipeline for depth format " <> tshow declared) (fmap depthAttachmentFormat depth)
+                <> " and "
+                <> maybe "a pass with no depth attachment" (\held → "a pass with a depth attachment of format " <> tshow held) (attachmentDepth attachment)
+            )
+        )
   | otherwise = Right ()
 
 -- | Set the viewport. It must be finite, have area, and lie within the
@@ -1216,7 +1344,7 @@ drawChecked recorder indexed count instances decide = do
             | count == 0 || instances == 0 → Left (RefusedIllegal "a draw of nothing")
             | count `mod` 3 /= 0 → Left (RefusedUnsupported "a draw that is not whole triangles")
             | otherwise → do
-                incompatible (boundFormat bound) attachment
+                incompatible (boundFormat bound) (interfaceDepth (boundInterface bound)) attachment
                 viewportFits viewport attachment
                 scissorFits rect attachment
                 tableReady current bound
