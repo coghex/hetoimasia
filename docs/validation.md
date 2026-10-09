@@ -1577,11 +1577,17 @@ weaker check:
   stage, is not reached.
 - **No observation outlasts the deadline of whoever asked.** The `ps` fallback is
   killed when its caller's remaining time runs out, and none is started once it
-  has: the first termination's one second, the cleanup passes' own caps and the
-  stage's own deadline each bound the observations made inside them, instead of
-  each observation having thirty seconds of its own. A table that could not be
-  read in time is not knowing — never an empty session — so the stage expires,
-  cleanup falls back to what it remembers, and the cap rules above apply.
+  has; the platform's own table is held to the same deadline — it is not read at
+  all once the deadline has passed, and the deadline is checked before every
+  process listed by `libproc` is asked about, before every process a pass asks its
+  session, and before every identifier of a bracket is asked directly. The first
+  termination's one second, the cleanup passes' own caps and the stage's own
+  deadline each bound the observations made inside them, instead of each
+  observation having its own time. A pass that runs out of time before it has
+  asked everyone is not a partial answer and not an empty session: it is
+  unknown, so the stage expires, cleanup falls back to what it remembers, and the
+  cap rules above apply. What can still run past a deadline is one query already
+  in flight and the short poll sleep between passes.
 
 Zombies are not members: they have already stopped, and their adopter reaps
 them. The runner signals an individual process only after confirming it is still
