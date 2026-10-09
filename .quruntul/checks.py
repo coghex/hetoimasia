@@ -368,7 +368,9 @@ class AdapterChecks(unittest.TestCase):
     def test_a_policy_change_invalidates_every_suite_of_a_multi_component_group(self):
         suites = self.overlaid(with_group("test.vulkan-headless", dict(timeout_seconds=1200)))
         affected = self.assert_policy_change(suites, "test.vulkan-headless", ["trial_seconds"])
-        self.assertEqual(len(affected), 5, sorted(affected))
+        # One suite for each component the group's command names: the native
+        # backend's two, the integration's, and the three samples'.
+        self.assertEqual(len(affected), 6, sorted(affected))
 
     def test_a_policy_edit_that_leaves_execution_unchanged_keeps_the_identity(self):
         # Both timeouts fall below the trial floor, so both run 60-second trials.

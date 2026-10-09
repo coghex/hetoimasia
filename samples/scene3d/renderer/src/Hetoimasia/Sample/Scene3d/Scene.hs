@@ -58,7 +58,6 @@ module Hetoimasia.Sample.Scene3d.Scene
   , sceneProbes
   ) where
 
-import qualified Data.ByteString as ByteString
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Builder as Builder
 import qualified Data.ByteString.Lazy as Lazy

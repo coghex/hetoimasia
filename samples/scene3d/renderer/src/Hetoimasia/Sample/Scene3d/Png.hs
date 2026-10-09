@@ -16,7 +16,6 @@ import qualified Data.ByteString as ByteString
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Builder as Builder
 import qualified Data.ByteString.Lazy as Lazy
-import Data.List (foldl')
 import Data.Word (Word32, Word8)
 
 -- | A PNG of an image this wide and high from its tightly packed RGBA8 rows,
