@@ -209,7 +209,7 @@ waylandSpec = describe "Isolated headless Wayland session" $ do
       doesFileExist (directory session </> "environment.txt") `shouldReturn` False
       cleanedUp session
 
-  forM_ [("TERM", 143), ("HUP", 129)] $ \(name, status) →
+  forM_ [("TERM", 143), ("INT", 130), ("HUP", 129)] $ \(name, status) →
     it ("stops and reaps a readiness client that is in flight when SIG" ++ name ++ " ends the startup") $
       withSession $ \session → do
         -- The signal must reach the helper while one connection attempt is
@@ -229,7 +229,7 @@ waylandSpec = describe "Isolated headless Wayland session" $ do
           , ("wayland-info", parkedClient)
           ]
         stoppingStubs session $ do
-          (result, _, errors) ← watched (sessionHelper session ["--", "sh", "-c", recordSession session])
+          (result, _, errors) ← watched (signalledHelper session ["--", "sh", "-c", recordSession session])
           -- The client had recorded itself and was still alive, parked on its
           -- barrier, when the helper was signalled.
           readFile (directory session </> "client-at-signal.txt") `shouldReturn` "alive\n"
@@ -291,7 +291,20 @@ stopStubs session =
 -- holds. Everything the command and the compositor then see can only have come
 -- from the helper.
 sessionHelper ∷ Display → [String] → IO (ExitCode, String, String)
-sessionHelper session arguments = do
+sessionHelper = helperRun False
+
+-- | 'sessionHelper' for an example that signals the helper with @SIGHUP@ or
+-- @SIGINT@. A shell cannot trap a signal that was ignored when it started, and
+-- a suite started under @nohup@ or from a background job inherits exactly that,
+-- so the helper would never see the signal and the example would end by
+-- exhausting the readiness budget instead. The helper is therefore started
+-- through a Perl that puts both dispositions back to their defaults first,
+-- which makes the example the same wherever the suite was launched.
+signalledHelper ∷ Display → [String] → IO (ExitCode, String, String)
+signalledHelper = helperRun True
+
+helperRun ∷ Bool → Display → [String] → IO (ExitCode, String, String)
+helperRun defaultSignals session arguments = do
   inherited ← getEnvironment
   let overrides =
         [ ("LC_ALL", "C")
@@ -308,7 +321,15 @@ sessionHelper session arguments = do
       removed = "HETOIMASIA_NATIVE_SESSION" : map fst overrides
       settings = overrides ++ filter ((`notElem` removed) . fst) inherited
   bash ← findExecutable "bash" >>= maybe (fail "bash is not on PATH") pure
-  run settings (directory session) bash (script session : arguments)
+  if defaultSignals
+    then do
+      perl ← findExecutable "perl" >>= maybe (fail "perl is not on PATH") pure
+      run
+        settings
+        (directory session)
+        perl
+        (["-e", "$SIG{HUP} = 'DEFAULT'; $SIG{INT} = 'DEFAULT'; exec @ARGV", bash, script session] ++ arguments)
+    else run settings (directory session) bash (script session : arguments)
 
 -- | A shell command that records the Wayland environment the helper gave it.
 -- The socket the helper named is not predictable, so what is asserted is the
