@@ -1501,7 +1501,9 @@ pull request.
 > Filed as #350. Owner clarifications at filing, 2026-09-29: one depth image
 > per swapchain generation, shared by its frames in flight; windowed depth is
 > an opt-in host setting; `samples/scene3d/`'s windowed mode orbits the
-> camera around the evidence scene.
+> camera around the evidence scene. Delivered by #350: see
+> [the backend's contract](../gpu_backend.md#windowed-depth) and
+> [the retained evidence](../evidence/gpu_3d_windowed/README.md).
 
 - **Outcome:** windowed frames can render with depth images that follow
   their swapchain generation through construction, resize, replacement and

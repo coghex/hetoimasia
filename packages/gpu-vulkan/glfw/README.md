@@ -44,6 +44,16 @@ and the suites' verification capture.
   with that primary. What the renderer did not release is destroyed with the
   session's other managed resources before the device, on normal and terminal
   exits alike. The module re-exports the recording vocabulary a renderer needs.
+- A host configured with `vulkanWindowDepth` (GRS-13) gives every swapchain
+  generation of its windows one managed depth image of the generation's extent,
+  shared by its frames in flight, made with the generation and replaced with it
+  on resize and surface recovery, and destroyed only once the batches that
+  recorded it have completed. Each `FrameRequest` names it (`requestDepth`), and
+  the renderer begins its pass into the frame's image with it
+  (`beginFrameRenderingWithDepth`). A generation whose depth image cannot be
+  made fails its construction as any native call does. A host that did not ask
+  has none, and nothing about its frames changes
+  ([Windowed depth](../../../docs/gpu_backend.md#windowed-depth)).
 - A host configured with `DeviceSurfaceFree` (`vulkanDeviceStart`) creates
   the session's device in the owner's startup, with no surface and before any
   window; a window handed over later is admitted only if the chosen queue
