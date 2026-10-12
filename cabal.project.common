@@ -31,6 +31,9 @@ package hetoimasia-render-api
 package hetoimasia-render-2d
   ghc-options: -Werror -j
 
+package hetoimasia-render-2d-oracle
+  ghc-options: -Werror -j
+
 package hetoimasia-runtime
   ghc-options: -Werror -j
 

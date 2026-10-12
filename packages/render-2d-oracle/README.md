@@ -160,17 +160,31 @@ s     = clamp s to [0, 1]         a fixed-point attachment clamps the source
 result = s + destination × (1 − s.a)      clamped to [0, 1]
 ```
 
-- **Every store is rounded.** The result of each blended fragment is encoded to
-  the target's 8-bit storage and rounded half up; the next fragment reads that
-  stored byte, decoding the colour channels on an sRGB target. Eight identical
-  UNORM sources of byte 4 over transparent black give 32, not 30.
+- **Every store is rounded, and a tie is a range.** The result of each blended
+  fragment is encoded to the target's 8-bit storage before the next fragment
+  reads it, decoding the colour channels on an sRGB target. Eight identical UNORM
+  sources of byte 4 over transparent black give 32, not 30. Vulkan requires the
+  conversion to round to nearest but does not fix the direction of a tie, and a
+  device's floating-point arithmetic can fall either side of a value within a
+  hair of one, so a store holds *every byte within half a step plus 1/1024 of
+  the value*: usually one, two for a tie. The next blend reads that range, and
+  because a blend is monotone in its destination the range carries through every
+  store as its lowest and highest bytes. A channel is determinate when the bytes
+  it could hold at the end span at most three (so one tolerance of 1 covers them
+  all) and is reported at the middle, or, for a range of two, at the upper byte; a
+  channel whose range is wider makes the probe **indeterminate**
+  (`RoundingNotBounded`), never given a wider tolerance. Eight additive sources
+  of exactly 2.5 channel steps are the standard case: rounding half up at every
+  store would say 24, and a device may hold anything from 16 to 24.
 - An sRGB target decodes the destination before blending and encodes the result
   on store; a UNORM target stores linear values; alpha is linear in every format.
   The encode and decode are the standard piecewise sRGB transfer function.
 - A pass starts from its clear colour, a linear value encoded like any other.
 - The result is reported in RGBA order whatever the target's channel order.
-- Everything the target stores is an 8-bit channel; the oracle's only
-  floating-point arithmetic is this colour pipeline, in double precision.
+- Everything the target stores is an 8-bit channel. The pipeline is exact
+  rational arithmetic; the sRGB transfer function, which is irrational, is
+  evaluated in double precision and converted exactly, so no tie can come from
+  its rounding.
 
 ## Order
 
@@ -225,6 +239,7 @@ Each names where: the view as `AtView pass view`, or an instance as
 | `MinifiedNotAxisAligned` | A minified probe, on a texture with more than one level, whose derivatives are sheared or rotated by other than a quarter turn. |
 | `MinifiedFractionalLevel` | A minified, axis-aligned probe whose level of detail is between two levels. |
 | `NearTexelBoundary` | A nearest-filtered coordinate within 1/16 texel of an interior boundary between texels that differ. |
+| `RoundingNotBounded` | After the last draw, a channel's possible stored bytes (the stores' rounding, where a value is a tie or within 1/1024 of a byte of one) span more than three, which no tolerance of 1 can cover. |
 
 If a probe is both indeterminate and unevaluable it is unevaluable: a defect in
 the inputs is what to repair first.
