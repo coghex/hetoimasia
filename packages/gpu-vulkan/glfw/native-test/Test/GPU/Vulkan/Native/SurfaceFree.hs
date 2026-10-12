@@ -58,6 +58,7 @@ module Test.GPU.Vulkan.Native.SurfaceFree
   , runDrawing
   , runUploads
   , runTable
+  , runShaderSamplers
   , runSprites
   , runGrowth
   , runSwap
@@ -69,6 +70,7 @@ module Test.GPU.Vulkan.Native.SurfaceFree
   , drawingSection
   , uploadsSection
   , tableSection
+  , shaderSamplersSection
   , spritesSection
   , growthSection
   , swapSection
@@ -80,6 +82,7 @@ module Test.GPU.Vulkan.Native.SurfaceFree
   , drawingSpec
   , uploadsSpec
   , tableSpec
+  , shaderSamplersSpec
   , spritesSpec
   , growthSpec
   , swapSpec
@@ -210,6 +213,7 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , TextureHandle (..)
   , bindTable
   , constructTablePipelineLayout
+  , constructShaderSampledTablePipelineLayout
   , constructTextureTable
   , defaultVersionCount
   , readConstructedTable
@@ -237,7 +241,7 @@ import Hetoimasia.Sample.Sprites.Oracle (ProbeResult (..))
 import Hetoimasia.Sample.Sprites.Swap (SwapEvidence (..), SwapFacts (..), runSwapEvidence)
 import qualified Hetoimasia.Sample.Sprites.Scene as Sprites
 import Hetoimasia.Sample.Sprites.Scene (Probe (..))
-import Hetoimasia.GPU.Vulkan.Native.Recording.Shaders (endpointShaders, quadShaders, tableShaders, verificationShaders)
+import Hetoimasia.GPU.Vulkan.Native.Recording.Shaders (endpointShaders, quadShaders, tableInstanceShaders, tableShaders, verificationShaders)
 import Hetoimasia.GPU.Vulkan.Native.Roots (RootStanding (..), RootsView (..))
 import Hetoimasia.Runtime.GLFW
   ( ScheduledStep (..)
@@ -1133,6 +1137,160 @@ expectedTableProbes =
   where
     transparent = [0, 0, 0, 0]
 
+-- | The shader-sampled table case (R2D-16): a table over the session's
+-- uploads, one two-texel texture — a red texel then a blue one — uploaded and
+-- registered, and a pipeline over a shader-sampled layout and the table's
+-- instance shaders. One frame-less batch binds the table and draws four
+-- instances in one draw call, with no sampler selected: the texture through
+-- nearest/clamp-to-edge (index 0), through linear/clamp-to-edge (index 2),
+-- through an index of 7, and through index 3. Each instance fills a quadrant
+-- of the color target, which is copied into a readback and probed.
+runShaderSamplers ∷ Maybe Backend → Journal → IO SurfaceFreeOutcome
+runShaderSamplers backend journal = do
+  heading journal "R2D-16: a surface-free session draws instances of one texture through a shader-sampled table layout, each choosing its own sampler in one draw call with no sampler selected"
+  runCaseWith
+    (\config → config {vulkanUploads = Just uploadConfig})
+    backend
+    defaultBudgetRequest {requestedBytes = 2 * 1024 * 1024 * 1024}
+    []
+    "vulkan-native-r2d16-shader-samplers"
+    $ \vulkan _ _ _ → do
+      (madeOn, made) ← acted vulkan "the table, the target and the pipeline" shaderSamplerTargets
+      awaitTable vulkan "the placeholder written" tableViewPlaceholderWritten
+      admitted ← submitVulkanUpload vulkan (UploadImage (samplerTexture made) [ByteString.pack [255, 0, 0, 255, 0, 0, 255, 255]])
+      state ← either (pure . Left . tshow) (fmap (either (Left . tshow) Right) . (`awaitUploadTicket` deadline)) admitted
+      (drawnOn, ticket) ← acted vulkan "the shader-sampled batch" (shaderSamplerBatch made)
+      waited ← awaitTicket ticket deadline
+      (readOn, bytes) ← acted vulkan "the readback" $ \construction → readConstructedReadback construction (samplerReadback made) 0 offscreenBytes
+      directory ← getTemporaryDirectory
+      (path, handle) ← openBinaryTempFile directory "hetoimasia-r2d16-shader-samplers.png"
+      ByteString.hPut handle (encodeRgba offscreenSide offscreenSide bytes)
+      hClose handle
+      note journal ("the readback is at " <> Text.pack path)
+      note journal ("the upload: " <> tshow state)
+      roots ← atomically (readVulkanRoots (vulkanController vulkan))
+      let shot = Shot Rgba8Srgb waited [(point, pixelAt bytes point) | point ← shaderSamplerProbes] path
+      pure
+        ( Seen
+            [madeOn, drawnOn, readOn]
+            ["made the table, the target, the pipeline and the readback", "drew four instances in one draw call", "read the readback"]
+            0
+            (Just roots)
+            Nothing
+            [waited]
+            [shot]
+            Nothing
+            (Just (TableFacts [state] Nothing Nothing [] [] (Right ())))
+            Nothing
+            Nothing
+            Nothing
+            Nothing
+        )
+  where
+    deadline = either (error . show) id (durationFromNanoseconds AllowZero 30000000000)
+    pixelAt bytes (x, y) = ByteString.unpack (ByteString.take 4 (ByteString.drop ((y * offscreenSide + x) * 4) bytes))
+
+-- | What the shader-sampled case draws with and reads back from.
+data SamplerTargets = SamplerTargets
+  { samplerTexture ∷ !Image
+  , samplerTarget ∷ !Image
+  , samplerPipeline ∷ !Pipeline
+  , samplerReadback ∷ !Readback
+  }
+
+-- | The session's texture table, a two-by-one RGBA8 texture, an RGBA8 sRGB
+-- color target, the shared ring, a pipeline over a shader-sampled table layout
+-- and the table's instance shaders, and a readback for the target.
+shaderSamplerTargets ∷ Construction q inst msgr phys dev cmd → IO (Either Refusal SamplerTargets)
+shaderSamplerTargets construction =
+  constructTextureTable construction (either (error . show) id (validateTableConfig 16 8 (toInteger defaultVersionCount))) >>= \case
+    Left refusal → pure (Left refusal)
+    Right () →
+      constructRing construction (either (error . show) id (validateRingSize 4096)) >>= \case
+        Left refusal → pure (Left refusal)
+        Right () → do
+          let side = fromIntegral offscreenSide
+          texture ← constructImage construction (ImageDescription TextureImage Rgba8Linear 2 1 1)
+          target ← constructImage construction (ImageDescription ColorTarget Rgba8Srgb side side 1)
+          pipeline ←
+            constructShaderSampledTablePipelineLayout construction tableInstanceShaders >>= \case
+              Left refusal → pure (Left refusal)
+              Right layout → constructCheckedPipeline construction layout tableInstanceShaders (formatCode Rgba8Srgb)
+          readback ← constructReadback construction offscreenBytes
+          pure (SamplerTargets <$> texture <*> target <*> pipeline <*> readback)
+
+-- | The four instances, in clip space: a quadrant of the target each, in
+-- reading order, drawing the registered texture with sampler indices 0, 2, 7
+-- and 3. Each is the rectangle's four floats, the handle's index and
+-- generation, and the sampler index.
+shaderSamplerInstances ∷ TextureHandle → ByteString.ByteString
+shaderSamplerInstances handle =
+  ByteString.pack . concat $
+    [ concatMap (word . castFloatToWord32) [x0, y0, x0 + 1, y0 + 1] <> word (handleIndex handle) <> word (handleGeneration handle) <> word sampler
+    | ((x0, y0), sampler) ← zip [(-1, -1), (0, -1), (-1, 0), (0, 0)] [0, 2, 7, 3]
+    ]
+  where
+    word ∷ Word32 → [Word8]
+    word value = [fromIntegral (value `shiftR` shift) | shift ← [0, 8, 16, 24]]
+
+-- | One frame-less batch: the instances written into a ring region, the
+-- target cleared to opaque black, the table bound, and one draw of six
+-- vertices for the four instances, with no sampler selected; copied into the
+-- readback.
+shaderSamplerBatch ∷ SamplerTargets → Construction q inst msgr phys dev cmd → IO (Either Refusal BatchTicket)
+shaderSamplerBatch made construction =
+  registerConstructedTexture construction (samplerTexture made) >>= \case
+    Left refusal → pure (Left refusal)
+    Right handle →
+      constructFramelessBatch construction (steps (shaderSamplerInstances handle)) <&> \case
+        Left refusal → Left refusal
+        Right (_, Left refusal) → Left refusal
+        Right (ticket, Right ()) → Right ticket
+  where
+    side = fromIntegral offscreenSide ∷ Float
+    target = samplerTarget made
+    steps contents recorder =
+      claimRegion recorder (fromIntegral (ByteString.length contents)) 4 >>= \case
+        Left refusal → pure (Left refusal)
+        Right claim →
+          writeClaim recorder claim 0 contents >>= \case
+            Left refusal → pure (Left refusal)
+            Right () →
+              inOrder
+                [ beginRenderingInto recorder target ClearFromUndefined (ClearColor 0 0 0 1)
+                , bindPipeline recorder (samplerPipeline made)
+                , setViewport recorder (Viewport 0 0 side side)
+                , setScissor recorder (Rect 0 0 (fromIntegral offscreenSide) (fromIntegral offscreenSide))
+                , bindTable recorder
+                , bindVertexBuffer recorder 0 (FromClaim claim 0)
+                , draw recorder 6 4
+                , endRendering recorder
+                , transitionResource recorder target (FromUse ColorAttachment) TransferRead
+                , copyTargetToReadback recorder target (samplerReadback made)
+                , transitionResource recorder target (FromUse TransferRead) ColorAttachment
+                ]
+
+-- | The probe points, in the quadrants' reading order of the case's
+-- instances. The quadrants are 32 pixels across and the texture two texels
+-- wide, so a pixel at offset @i@ reads at @(i + 0.5) / 32@ across it: offset
+-- 12 reads 0.390625, where nearest takes the red texel and linear blends in
+-- 0.28125 of the blue one; offset 3 reads 0.109375, where linear/repeat
+-- wraps 0.28125 of the blue texel in from the left and linear/clamp-to-edge
+-- takes the red texel alone. The probes: nearest at 12, linear/clamp at 12,
+-- index 7 at 3, index 3 at 3, and linear/clamp at 3.
+shaderSamplerProbes ∷ [(Int, Int)]
+shaderSamplerProbes = [(12, 16), (44, 16), (3, 48), (35, 48), (35, 16)]
+
+-- | What each probe must read: the first exactly, the rest within one step of
+-- the sRGB encoding of the weighted blend they sample.
+expectedShaderSamplerProbes ∷ [[Word8]]
+expectedShaderSamplerProbes = [[255, 0, 0, 255], blend, blend, blend, [255, 0, 0, 255]]
+  where
+    weight = 0.28125 ∷ Double
+    blend = [encode (1 - weight), 0, encode weight, 255]
+    encode linear =
+      round . (* 255) $ if linear <= 0.0031308 then 12.92 * linear else 1.055 * linear ** (1 / 2.4) - 0.055
+
 -- | The sprites case (GRS-8): the sprites sample's window-free evidence over
 -- this suite's surface-free session — the sample's own scene, renderer,
 -- oracle, PNG and probe record ("Hetoimasia.Sample.Sprites.Evidence") — with
@@ -1945,6 +2103,63 @@ tableSpec outcome = describe "GRS-7 the bindless texture table in a surface-free
     isStale = \case
       RefusedStaleHandle _ → True
       _ → False
+
+shaderSamplersSection ∷ SurfaceFreeOutcome → [Text]
+shaderSamplersSection outcome =
+  section "A surface-free session drawing instances through a shader-sampled table layout" outcome
+    <> case outcome of
+      SurfaceFreeRecorded facts →
+        concat
+          [ ["- upload: " <> maybe "no facts" (tshow . tableTickets) (factsTable facts)]
+          , [ "- " <> tshow (zip (map fst (shotProbes shot)) (map snd (shotProbes shot))) <> ", ticket " <> tshow (shotTicket shot) <> ", PNG at " <> Text.pack (shotPng shot)
+            | shot ← factsShots facts
+            ]
+          ]
+      SurfaceFreeFailed _ → []
+
+shaderSamplersSpec ∷ SurfaceFreeOutcome → Spec
+shaderSamplersSpec outcome = describe "R2D-16 shader-chosen samplers in a surface-free session" $ do
+  it "opened no window, created no surface and acquired no image" $
+    on outcome $ \facts → do
+      factsWindows facts `shouldBe` 0
+      callNames facts `shouldSatisfy` notElem "glfwCreateWindowSurface"
+      callNames facts `shouldSatisfy` notElem "vkAcquireNextImageKHR"
+      deviceFirst facts
+
+  it "made the table, a pipeline layout holding its two set layouts and no push-constant range, and drew in one batch whose ticket completed, on the owner's thread" $
+    on outcome $ \facts → do
+      length (filter (== "vkCreateSampler") (callNames facts)) `shouldBe` 4
+      length (filter (== "vkCreatePipelineLayout") (callNames facts)) `shouldBe` 1
+      factsRunning facts `shouldSatisfy` ordered ["vkCreateSampler", "vkCreateDescriptorSetLayout", "vkCreateDescriptorPool", "vkAllocateDescriptorSets", "vkUpdateDescriptorSets", "vkCreatePipelineLayout", "vkCreateGraphicsPipelines"]
+      map shotTicket (factsShots facts) `shouldBe` [Right TicketComplete]
+      fmap tableTickets (factsTable facts) `shouldBe` Just [Right UploadComplete]
+      ownerThread facts $ \owner → factsActionThreads facts `shouldBe` replicate 3 owner
+
+  it "drew, in one call with no selected sampler, the nearest instance's texel exactly and the linear one's blend within one step, so the two differ, and an index of 7 as sampler 3" $
+    on outcome $ \facts → case [map snd (shotProbes shot) | shot ← factsShots facts] of
+      [[nearest, linear, seven, three, clamped]] → do
+        nearest `shouldBe` (expectedShaderSamplerProbes !! 0)
+        withinOne linear (expectedShaderSamplerProbes !! 1)
+        withinOne seven (expectedShaderSamplerProbes !! 2)
+        withinOne three (expectedShaderSamplerProbes !! 3)
+        withinOne clamped (expectedShaderSamplerProbes !! 4)
+        -- The two filters read different bytes at the same offset.
+        linear `shouldSatisfy` (/= nearest)
+        -- Index 7 reads as sampler 3, the repeating one, not as 2: at the
+        -- left edge the red channels differ by far more than a step.
+        abs (fromIntegral (seven !! 0) - fromIntegral (clamped !! 0) ∷ Int) `shouldSatisfy` (> 8)
+      other → expectationFailure ("expected one readback of five probes, got " <> show other)
+
+  it "retired cleanly, the table's pools, set layouts and samplers before the device, with every Vulkan call on the owner's thread" $
+    on outcome $ \facts → do
+      callNames facts `shouldSatisfy` ordered ["vkDestroyDescriptorPool", "vkDestroyDescriptorSetLayout", "vkDestroySampler", "vkDestroyDevice", "vkDestroyDebugUtilsMessengerEXT", "vkDestroyInstance"]
+      oneOwnerThread facts
+
+  it "reached a verdict after the last callback with no issue and no error, synchronization validation included" $
+    on outcome clean
+  where
+    withinOne actual expected =
+      (zipWith (\a b → abs (fromIntegral a - fromIntegral b ∷ Int)) actual expected) `shouldSatisfy` all (<= 1)
 
 spritesSection ∷ SurfaceFreeOutcome → [Text]
 spritesSection outcome =

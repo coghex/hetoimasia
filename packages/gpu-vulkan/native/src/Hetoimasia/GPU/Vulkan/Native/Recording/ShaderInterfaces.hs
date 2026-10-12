@@ -7,6 +7,9 @@ module Hetoimasia.GPU.Vulkan.Native.Recording.ShaderInterfaces
   , tableVertexInterface
   , tableFragmentInterface
   , tableSamplerOffset
+  , tableInstanceVertexInterface
+  , tableInstanceFragmentInterface
+  , tableInstanceStride
   ) where
 
 import Data.Word (Word32)
@@ -47,3 +50,32 @@ tableFragmentInterface =
 -- | Where the table shaders read the sampler index 'selectSampler' pushes.
 tableSamplerOffset ∷ Word32
 tableSamplerOffset = 8
+
+-- | One binding of 'tableInstanceStride' bytes a step per instance, and no
+-- per-vertex input — the rectangle's corners are the shader's own. In each
+-- instance, from the binding's start: the rectangle in clip space as four
+-- floats (left, top, right, bottom) at location 0; the texture handle's
+-- lookup index at location 1 and its generation at location 2; and the
+-- sampler index at location 3, each a 32-bit unsigned integer.
+tableInstanceVertexInterface ∷ ShaderInterface
+tableInstanceVertexInterface =
+  (interfaceFor VertexInterface)
+    { interfaceVertexInput =
+        VertexInput
+          [VertexBinding 0 tableInstanceStride PerInstance]
+          [ VertexAttribute 0 0 VertexFloat4 0
+          , VertexAttribute 1 0 VertexUint 16
+          , VertexAttribute 2 0 VertexUint 20
+          , VertexAttribute 3 0 VertexUint 24
+          ]
+    }
+
+-- | The texture table's bindings (GRS-7) and no push constants: the handle
+-- and the sampler index arrive from the vertex stage.
+tableInstanceFragmentInterface ∷ ShaderInterface
+tableInstanceFragmentInterface = (interfaceFor FragmentInterface) {interfaceDescriptors = textureTableDescriptors}
+
+-- | The bytes of one instance 'tableInstanceVertexInterface' reads: four
+-- floats and three unsigned integers.
+tableInstanceStride ∷ Word32
+tableInstanceStride = 28

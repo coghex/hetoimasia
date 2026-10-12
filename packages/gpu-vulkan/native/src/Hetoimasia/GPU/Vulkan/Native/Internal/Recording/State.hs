@@ -21,6 +21,8 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
     ManagedStanding (..)
   , NativeResource (..)
   , PipelineInterface (..)
+  , TableUse (..)
+  , tableShaderSampled
   , ReadbackContents (..)
   , ManagedRecord (..)
   , BatchStanding (..)
@@ -172,10 +174,10 @@ data ManagedStanding
   deriving (Eq, Show)
 
 data NativeResource cmd
-  = NativeLayout !Word64 ![PushConstantRange] !(Maybe Word32)
+  = NativeLayout !Word64 ![PushConstantRange] !(Maybe TableUse)
     -- ^ The layout, the push-constant ranges it declares, and, for a layout
-    -- that holds the texture table's two sets (GRS-7), the push-constant
-    -- offset its draws' sampler index is at.
+    -- that holds the texture table's two sets (GRS-7), how its draws choose a
+    -- sampler.
   | NativePipeline !Word64 !ResourceId !Word32 !PipelineInterface
     -- ^ The pipeline, the layout generation it was built over, the color
     -- format it renders to, and what it declares of its interface.
@@ -204,6 +206,20 @@ data NativeResource cmd
     -- ring, which is part of the ring's buffer and no native object of its
     -- own. A batch that binds the table at this version retains it.
 
+-- | How draws through a layout holding the texture table choose their
+-- sampler (GRS-7; render-2d D-4). The pushed kind, the original, has the
+-- recorder push the index at the offset the layout declared; the other
+-- reserves no bytes and has the shaders choose, per instance.
+data TableUse
+  = TablePushedSampler !Word32
+    -- ^ The push-constant offset of the draws' sampler index.
+  | TableShaderSampler
+  deriving (Eq, Show)
+
+-- | Whether a pipeline's table use leaves the sampler to its shaders.
+tableShaderSampled ∷ Maybe TableUse → Bool
+tableShaderSampled = (== Just TableShaderSampler)
+
 -- | What a pipeline declares of its interface (GRS-4), kept with its
 -- generation so a batch checks what it binds, pushes and draws against the
 -- pipeline it bound: its layout's native handle and push-constant ranges, its
@@ -212,9 +228,9 @@ data PipelineInterface = PipelineInterface
   { interfaceLayout ∷ !Word64
   , interfacePushConstants ∷ ![PushConstantRange]
   , interfaceVertexInput ∷ !VertexInput
-  , interfaceTable ∷ !(Maybe Word32)
-    -- ^ For a pipeline over a layout holding the texture table (GRS-7), the
-    -- push-constant offset of its draws' sampler index.
+  , interfaceTable ∷ !(Maybe TableUse)
+    -- ^ For a pipeline over a layout holding the texture table (GRS-7), how
+    -- its draws choose a sampler.
   , interfaceDepth ∷ !(Maybe PipelineDepth)
     -- ^ What the pipeline declares of depth (GRS-10), if it declares any: the
     -- attachment format it renders with, which every draw checks against the
