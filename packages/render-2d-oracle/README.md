@@ -240,8 +240,8 @@ readback, so the oracle does:
 A malformed texture is refused only for a probe an instance covers. A readback
 fault is reported by the reader:
 
-- `readPixel format extent bytes x y` returns the pixel at a column and row of a
-  tightly packed readback (level 0, rows top first, four bytes a pixel, in the
+- `readPixel format extent bytes x y`, and `readProbe` at a `Probe`'s column and
+  row, return the pixel at a column and row of a tightly packed readback (level 0, rows top first, four bytes a pixel, in the
   target's own format with no conversion), swizzling `B8G8R8A8` to RGBA and
   leaving every byte as stored, an sRGB-encoded one included.
 - `ReadbackSizeWrong` (the bytes needed, then supplied; compared in `Integer`),
