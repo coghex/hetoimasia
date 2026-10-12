@@ -88,7 +88,11 @@ and the suites' verification capture.
   `constructPipelineWith`); a batch then claims and writes ring regions, binds
   them and managed buffers as vertex, index and instance data, pushes
   constants, and draws indexed and instanced through the re-exported recorder
-  (GRS-4). A session with no target keeps polling
+  (GRS-4). An action may make the ring with a storage-table window
+  (`constructRingWith`), the storage table over it (`constructStorageTable`) and
+  table layouts that hold it (`constructTablePipelineLayoutWith`); a batch then
+  claims a table's region (`claimTable`), writes it and binds it for a draw
+  (`bindStorageTable`) (R2D-15). A session with no target keeps polling
   completion and disposing of released resources until it is ended, and
   retires through the same protected exit.
 - The private `controller` sublibrary holds the controller —
