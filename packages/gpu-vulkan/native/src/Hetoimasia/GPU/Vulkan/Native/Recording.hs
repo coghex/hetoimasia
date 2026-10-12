@@ -78,7 +78,9 @@
 -- first supported of 'depthFormatPreference', which 'selectDepthFormat' asks of
 -- it; no format has a stencil aspect. Depth is Vulkan's convention (D-36):
 -- clip-space Y points down and depth runs 0 to 1. Every refusal makes no native
--- call.
+-- call. 'clearDepthRect' clears the open pass's depth attachment to a value
+-- within a rectangle of the render area, leaving depth outside it as it was, in
+-- either kind of depth pass (R2D-17).
 --
 -- = Windowed depth (GRS-13)
 --
@@ -394,6 +396,7 @@ module Hetoimasia.GPU.Vulkan.Native.Recording
   , beginRenderingInto
   , beginRenderingWithDepth
   , beginFrameRenderingWithDepth
+  , clearDepthRect
   , endRendering
   , bindPipeline
   , setViewport
@@ -611,6 +614,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Recorder
   , copyToReadback
   , defaultDepthClear
   , clearedDepth
+  , clearDepthRect
   , draw
   , endRendering
   , readbackBytesFor

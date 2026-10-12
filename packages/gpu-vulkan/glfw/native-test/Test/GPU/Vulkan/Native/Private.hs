@@ -111,6 +111,13 @@
 --   sample's independent oracle — the nearer cube, drawn first, showing where
 --   the cubes overlap — and written as a lossless PNG a pose and a probe
 --   record under the validation runner's evidence directory (#349);
+-- * @r2d17-depth-rect@ — the same device start with no window, then a pass
+--   into an RGBA8 color target and a @D32_SFLOAT@ depth target that clears
+--   the depth to 0.0, clears a rectangle touching none of the target's edges
+--   to 1.0, and draws a quad covering the target at depth 0.5 with a
+--   less-or-equal test; the quad's color read back exactly inside the
+--   rectangle and the pass's clear color exactly outside it, on both sides of
+--   each edge, with synchronization validation reporting nothing (#425);
 -- * @grs13-window-depth@ — a window whose host asked for windowed depth: the
 --   scene3d sample's two cubes drawn with a depth test into the window's own
 --   image with the depth image of its swapchain generation, a frame captured
@@ -449,6 +456,14 @@ scenarios =
       $ \consent journal _ → do
         outcome ← SurfaceFree.runScene3d (consentBackend consent) journal
         pure (SurfaceFree.scene3dSpec outcome, section "The GRS-10 scene3d evidence record" (SurfaceFree.scene3dSection outcome))
+  , Scenario
+      "r2d17-depth-rect"
+      "clears a rectangle of a D32_SFLOAT depth attachment to 1.0 inside a pass that cleared it to 0.0, draws a full-target quad at depth 0.5 with a less-or-equal test in a frame-less batch of a surface-free session, and reads exact bytes: the quad inside the rectangle and the pass's clear outside it, on both sides of each edge, with synchronization validation reporting nothing"
+      False
+      Nothing
+      $ \consent journal _ → do
+        outcome ← SurfaceFree.runDepthRect (consentBackend consent) journal
+        pure (SurfaceFree.depthRectSpec outcome, section "The R2D-17 depth rectangle record" (SurfaceFree.depthRectSection outcome))
   , Scenario
       "grs13-window-depth"
       "draws the scene3d sample's two flat-coloured cubes with a depth test into a window's own image with the depth image of its swapchain generation, captures a frame and passes every probe of the independent oracle — the nearer cube, drawn first, showing where the cubes overlap — resizes the window and captures a frame of the generation built at the new size, which gave itself a depth image of its own, with synchronization validation reporting nothing"
