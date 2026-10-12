@@ -23,7 +23,7 @@ concrete precondition
 - [x] EPIC. Establish an independent 2D renderer over the shared GPU services — [#413]
 - [x] R2D-1. Create `render-api`'s texture handle and `render-2d`'s snapshot, settings and instance encoding — [#414]
 - [x] R2D-2. Map cameras and views between window, UI and world space — [#415]
-- [ ] R2D-3. Build ordered draw runs from a snapshot
+- [x] R2D-3. Build ordered draw runs from a snapshot — [#416]
 - [ ] R2D-4. Compute expected pixels from a snapshot in `render-2d-oracle`
 - [x] R2D-5. Decode PNG into premultiplied RGBA8 levels — [no-issue]: moved to the asset epic as AST-1 (D-15)
 - [x] R2D-6. Read KTX2 files carrying BC7 or RGBA8 levels — [no-issue]: moved to the asset epic as AST-2 (D-15)
@@ -187,8 +187,8 @@ The decisions below govern. The owner accepted these proposals as written on
 - **P-2. Within a world layer.** Depth is cleared within the view's viewport
   (D-10); cutout runs draw first, one draw per material, depth-tested and
   written; translucent instances follow, sorted back to front by depth key
-  and then submission sequence, depth-tested and not written. UI layers are
-  painter-only in submission order.
+  and then submission sequence, depth-tested and not written. UI layers draw
+  in the ordered path, by depth key and then submission sequence (D-22).
 - **P-3. Depth keys.** The adapter supplies an unsigned integer; the renderer
   maps it to depth exactly, using the 2²⁴ evenly spaced values a 32-bit float
   holds in [0, 1). Equal keys in the cutout pass resolve by draw order under
@@ -230,7 +230,8 @@ command protocol and renderer state for everything.
 World layers use a depth buffer for opaque and cutout art and sort only
 translucent instances. The adapter supplies an integer depth key; the
 renderer never computes isometric depth. Coarse layers draw in a fixed
-order, and UI and overlay layers are painter-only.
+order, and UI and overlay layers draw in the ordered path, by depth key and
+then submission sequence (D-22).
 
 - The sorted translucent path needs no depth attachment, so it is delivered
   first (R2D-7) while #349 and #350 land; the cutout pass follows (R2D-9).
