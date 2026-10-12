@@ -2935,7 +2935,11 @@ by how its draws choose a sampler.
   range. The window integration's `constructShaderSampledTablePipelineLayout
   construction shaders` is the confined equivalent, exported from
   `Hetoimasia.GPU.Vulkan.GLFW` beside `constructTablePipelineLayout`; the
-  native package's facade `TextureTable` exports the first.
+  native package's facade `TextureTable` exports the first. Its consumer is
+  the 2D renderer's recorder
+  ([`hetoimasia-render-2d-vulkan`](../packages/render-2d-vulkan/README.md)),
+  whose shaders read each instance's sampler choice and index the table's
+  samplers `nonuniformEXT`.
 
 **Binding and drawing.** `bindTable recorder` binds both sets under the bound
 pipeline's layout, with the dynamic offset of the batch's version, through
@@ -5951,7 +5955,7 @@ companions — and adds the Vulkan owner's:
 | Main thread | Hspec runs on a thread of its own; the process main thread owns one shared production graphics session: `withLoaderIntegration`, then `runGraphicsOwnerApplication` over `withVulkanOwnerHost`, with the production native layer and surface bridge. An example that needs the main thread — to hand a window's surface over, which GLFW creates there, or to close a window — submits an operation (`onMain`); the main thread runs it between two turns of the host's owner loop and returns its result or rethrows its failure. Windows are created through the host's command port from the example's own thread, which the owner loop executes, as an application's worker would. |
 | Identities | Every dispatched operation is checked, before it runs, to be on the bound process main thread that entered the session — the Haskell thread, the bound flag, and the OS thread read through `pthread_self` — and a failed check fails the operation and the run. Every native call the session makes is recorded where it runs by a `NativeObserver`, so an example shows from the calls themselves that the instance, its messenger, the device and every surface's destruction ran on the graphics owner's thread and every surface's creation on the main thread — never from the name of an Hspec hook. |
 | Sharing | The roots — the instance, its explicit messenger, and the one device — are acquired lazily, by the first dispatched operation, at most once, and shared by every later example. Each example's windows and targets are its own and are closed inside it. |
-| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, `vk12-frames`, `vk13-presentation`, `vk14-recovery`, `vk15-validation-stop`, `vk15-retention`, `vk16-composed`, `vk17-one-slot`, `vk17-two-slots`, `vk19-capture`, `grs15-surface-free`, `grs15-surface-free-window`, `grs12-frameless`, `grs3-ordering`, `grs7-texture-table`, `grs8-sprites`, `grs9-swap`, `grs10-scene3d`, `grs13-window-depth`, `grs14-table-growth`, `r2d17-depth-rect`, `r2d14-window-scenes`, `synchronization-hazard`, `debug-names`, and, under the isolated compositor's consent only, `wayland-connection-loss`. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. Each child runs in a process group of its own under an external 20-second deadline covering its exit and the end of its output; one still running at it is terminated with its group and fails its example as expired. |
+| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, `vk12-frames`, `vk13-presentation`, `vk14-recovery`, `vk15-validation-stop`, `vk15-retention`, `vk16-composed`, `vk17-one-slot`, `vk17-two-slots`, `vk19-capture`, `grs15-surface-free`, `grs15-surface-free-window`, `grs12-frameless`, `grs3-ordering`, `grs7-texture-table`, `grs8-sprites`, `grs9-swap`, `grs10-scene3d`, `grs13-window-depth`, `grs14-table-growth`, `r2d17-depth-rect`, `r2d14-window-scenes`, `r2d7-ordered-path`, `synchronization-hazard`, `debug-names`, and, under the isolated compositor's consent only, `wayland-connection-loss`. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. Each child runs in a process group of its own under an external 20-second deadline covering its exit and the end of its output; one still running at it is terminated with its group and fails its example as expired. |
 | Selection | Building, listing and filtering the tree, a `--dry-run`, and a selection that dispatches nothing acquire nothing and start no child. A selection matching no example fails. `--complete`, which the catalog group passes, runs the whole tree with Hspec's configuration reading left out and then fails unless the shared session was acquired once and every private scenario the run's consent requires ran and passed — every one, except that `wayland-connection-loss` is required under the isolated compositor's consent and pending under any other — so no ambient setting can turn the group's receipt into a pass for a subset. The consent rules and the migrated proof's pure release, construction, publication and loader-selection examples need no session and run without consent. |
 | Consent | Read once, at startup, from `HETOIMASIA_NATIVE_SESSION`, with the GLFW suite's rules for `desktop`, `isolated-x11:<display>` and `isolated-wayland:<socket>`: the last only on Linux, only when `WAYLAND_DISPLAY` names that socket, and never beside a `DISPLAY`. Under the Wayland consent every session requests Wayland by name — the shared host, each child's host, the VK-5 bridge's loader-aware session, and the proof shim's raw initialization, which sets `GLFW_PLATFORM` and fails one that selected another platform — so no X11 or XWayland session stands in; under the others every session requests nothing, as before. The first shared example asserts the platform GLFW selected before any example renders. Without consent every native example is refused before its body, the session is never acquired, and the run ends with the refusal on stderr and a non-zero exit. |
 | Environment | Before any Vulkan call, the suite clears every ambient discovery override and every validation-layer setting it finds and records which, disables implicit layers, and points the layer's settings file at an empty one; a child inherits and re-establishes the same environment. |
@@ -6409,6 +6413,71 @@ path the journal names. It passes only if all of these hold:
   endpoint and so exact;
 - the roots retired in order, with every Vulkan call on the owner's thread;
 - the verdict, with synchronization validation, is clean.
+
+R2D-7's case, `r2d7-ordered-path`, runs the same surface-free composition and
+host, with the session's uploads, to prove the 2D renderer's recorder
+([`hetoimasia-render-2d-vulkan`](../packages/render-2d-vulkan/README.md)) on the
+device against [`hetoimasia-render-2d-oracle`](../packages/render-2d-oracle/README.md).
+One owner-thread action makes the renderer through the recorder's `Builders`
+over the host's constructions — the ring, a table of 16 slots, the
+shader-sampled layout — and four textures: a 2 × 2 linear checker, a 2 × 2 sRGB
+grey, a 1 × 1 white and a 2 × 2 binary-alpha art texture. Their uploads are
+admitted off the owner's thread and waited for, the table's placeholder is
+awaited, and the textures are registered. Then, for each of ten fixtures, an
+action makes the fixture's offscreen colour targets and readbacks, and one
+frame-less batch records the fixture's `render-2d` snapshot through
+`prepareSnapshot` — planned with no cutout marks, as the oracle is — and copies
+every target out after its transition and back to rest; its ticket is waited
+for, and the readbacks are read once it completed. The fixtures, each a
+snapshot with its own targets (an `R8G8B8A8_UNORM` one unless it says
+otherwise):
+
+1. *placement*: both zoom modes, each with pixel snap off and on, in four views
+   of one target, with sprite origins that make the camera's rounding and the
+   vertex shader's each move a column across a pixel centre;
+2. *samplers*: nearest, linear and default choices mixed in one draw, under a
+   nearest and a linear view default;
+3. *rotation*: a quarter-turn camera;
+4. *colour*: tint, brightness above and below 1, a half-transparent tint over a
+   non-black clear and an additive instance;
+5. *overlap*: translucent instances overlapping in key order, with equal keys in
+   submission order and a larger key over a later submission;
+6. *content-scale*: a UI layer in two passes into two targets, the second with
+   the metrics of a window of logical extent 16 × 16 at content scale 2,
+   supplied to the recorder and the oracle alike;
+7. *fractional-views*: two views with separate viewports in one pass, the second
+   starting at x = 16.5;
+8. *formats*: an `R8G8B8A8_SRGB` target and a UNORM one in two passes of one
+   frame, drawing the same sRGB texture;
+9. *cutout-art*: a depth-enabled world layer holding binary-alpha art, drawn
+   ordered because nothing is marked;
+10. *placeholders*: a handle whose index no texture holds and one whose
+    generation is stale, beside a registered texture.
+
+Every pixel of every target is probed. A probe the oracle gives a determinate
+expectation must read within its tolerance; one it cannot decide — within 1/16
+pixel of a fractional viewport edge, for instance — is listed with its reason in
+the record and counted for nothing. Each fixture must have determinate probes
+and **named** probes, each standing for one behaviour, each determinate and
+read back correctly and each *differing from its contrast*: the same question
+asked where the behaviour is absent, in another view, pass or instance of the
+same frame. So a fixture whose picture was only background would fail, and so
+would one whose probe read the same with the behaviour switched off. The case
+passes only if all of these hold:
+
+- no window, surface or image acquisition was made, and the device came first;
+- every fixture passed, as above;
+- the PNG of every target and the probe record exist where they are kept —
+  each fixture's targets with their formats, extents and metrics, the named
+  probes with their behaviour, expectation, tolerance, observed value, contrast
+  and verdict, the counts of what passed, failed and was indeterminate, and
+  every indeterminate probe with its reason;
+- the roots retired in order, with every Vulkan call on the owner's thread;
+- the verdict, with synchronization validation, is clean.
+
+The PNGs and the record go beneath `HETOIMASIA_VALIDATION_EVIDENCE/ordered-path/`
+when the runner names an evidence directory. The whole child runs under the
+suite's 20-second deadline; it takes well under a second.
 
 GRS-10's case, `grs10-scene3d`, runs the scene3d sample's window-free evidence
 ([samples/scene3d/README.md](../samples/scene3d/README.md)) over the same

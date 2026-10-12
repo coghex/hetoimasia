@@ -161,7 +161,7 @@ the audited suite inventory, and which optional probes are local-only.
 | `test.macos-confinement` | `cabal test hetoimasia-scripting-lua:macos-confinement-probe --test-show-details=direct` | yes | no | any (component Darwin-only) |
 | `test.glfw-native` | `cabal test glfw-native-tests --test-show-details=direct` | no | no | any |
 | `test.glfw-wayland` | `cabal test glfw-native-tests --test-show-details=direct --test-option=--match --test-option=/GLFW native/on an isolated Wayland session/` | no | no | any |
-| `test.vulkan-headless` | `bash tools/vulkan/run.sh test hetoimasia-gpu-vulkan-native:test:native-tests hetoimasia-gpu-vulkan-native:test:shader-tests hetoimasia-gpu-vulkan-glfw:test:integration-tests hetoimasia-sample-triangle:test:triangle-tests hetoimasia-sample-sprites:test:sprites-tests hetoimasia-sample-scene3d:test:scene3d-tests` | no | no | any |
+| `test.vulkan-headless` | `bash tools/vulkan/run.sh test hetoimasia-gpu-vulkan-native:test:native-tests hetoimasia-gpu-vulkan-native:test:shader-tests hetoimasia-gpu-vulkan-glfw:test:integration-tests hetoimasia-sample-triangle:test:triangle-tests hetoimasia-sample-sprites:test:sprites-tests hetoimasia-sample-scene3d:test:scene3d-tests hetoimasia-render-2d-vulkan:test:render-2d-vulkan-tests` | no | no | any |
 | `test.vulkan-native` | `bash tools/vulkan/run.sh native hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests -- --complete` | no | no | any |
 | `test.vulkan-wayland` | `bash tools/display/wayland.sh -- bash tools/vulkan/run.sh native hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests -- --complete` | no | no | any |
 
@@ -345,7 +345,8 @@ package's scripted seam (`integration-tests`), the triangle sample's
 pipeline cache over stand-in builders (`triangle-tests`), the sprites
 sample's scene, probe oracle, fixtures and PNG writer (`sprites-tests`), and
 the scene3d sample's scene, cameras built with the math package, independent
-probe oracle and PNG writer (`scene3d-tests`).
+probe oracle and PNG writer (`scene3d-tests`), and the 2D renderer's Vulkan
+recorder over a stand-in native layer (`render-2d-vulkan-tests`).
 Headless means that none of them
 acquires a display, a GLFW session, or a device, and none reads desktop
 consent; the Vulkan headers and loader are build and link prerequisites and
@@ -357,7 +358,8 @@ command is [`tools/vulkan/run.sh`](../tools/vulkan/run.sh)'s test mode:
 bash tools/vulkan/run.sh test hetoimasia-gpu-vulkan-native:test:native-tests \
   hetoimasia-gpu-vulkan-native:test:shader-tests hetoimasia-gpu-vulkan-glfw:test:integration-tests \
   hetoimasia-sample-triangle:test:triangle-tests hetoimasia-sample-sprites:test:sprites-tests \
-  hetoimasia-sample-scene3d:test:scene3d-tests
+  hetoimasia-sample-scene3d:test:scene3d-tests \
+  hetoimasia-render-2d-vulkan:test:render-2d-vulkan-tests
 ```
 
 Its component is the integration suite, whose closure reaches the native
