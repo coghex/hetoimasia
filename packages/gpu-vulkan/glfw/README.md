@@ -29,6 +29,22 @@ and the suites' verification capture.
   replacement surfaces the owner asked for, and bounds its wait by the owner's
   deadline; `publishVulkanScene` publishes the scene the owner renders, from
   any application thread, with the configuration's `VulkanRenderer`.
+- A host configured with `vulkanSceneMode = PerWindowScenes` (R2D-14) carries
+  one scene for each window instead of one for the whole owner, which is the
+  default and unchanged. `publishVulkanWindowScene` publishes a window's scene
+  from any application thread as a latest-value snapshot for that window
+  (revisions rising independently, surviving the window's surface being
+  recreated, answered naming the window when the host does not hold it),
+  asking that window's target alone for a frame; `publishVulkanScene` is
+  refused. The owner tells the host's `vulkanSceneLifecycle` when a target
+  adopts a revision — with the exact scene — and when a superseded or ended
+  revision may be let go, only once every frame recorded with it has been
+  discarded or its submission has completed, exactly once and in adoption order
+  for each window. `requestVulkanRelease` queues an owner-thread action that
+  runs only once the owner has adopted, for every window it named when it was
+  made, the revision then current; `readVulkanSceneState` reads each window's
+  published and adopted revisions, those awaiting release, and the requests
+  still queued ([A scene for each window](../../../docs/gpu_backend.md#a-scene-for-each-window)).
 - The renderer is the consumer's (VK-19). Each frame's `FrameRequest` names
   its target, slot and image and the image's extent and color format before
   anything of the renderer's is recorded, and the renderer is lent the
