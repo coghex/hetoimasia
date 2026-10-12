@@ -408,7 +408,7 @@ several passes, views and layers kept with their metadata, and, over generated
 snapshots, that planning twice gives the same plan, that each layer's order is
 a permutation of its submission indices and its runs partition it with maximal
 path grouping, that the order meets an independent characterisation, and that
-shuffled equal-key inputs keep their new submission order on each path. For the
+shuffled equal-key inputs keep their new submission order on each path; and, by walking the heap, that the closures reachable from a planned layer do not grow with its instance count, so only the permutation is retained. For the
 view mapping it checks the equations against hand-computed values (the camera
 at the viewport's centre, whole-number zoom spacing, a fixed half-height at two
 window sizes, a quarter-turn rotation with its signed basis vectors, UI at the
