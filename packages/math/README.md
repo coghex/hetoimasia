@@ -1,7 +1,7 @@
 # hetoimasia-math
 
-Vectors, 4×4 matrices, affine transforms, a look-at view matrix and a
-perspective projection, in 32-bit `Float`. The boundary this package keeps is
+Vectors, 4×4 matrices, affine transforms, 2×3 affine transforms of the plane, a
+look-at view matrix and a perspective projection, in 32-bit `Float`. The boundary this package keeps is
 recorded in [module conventions](../../docs/module_conventions.md#an-independent-math-package):
 its library depends on `base` alone — no other local package, no graphics
 package, no foundation or runtime — and it chooses no graphics API's
@@ -12,6 +12,7 @@ conventions.
 | `Hetoimasia.Math.Vector` | `V2`, `V3`, `V4`; `add`, `sub`, `scale`, `dot`, `cross`, `norm`; checked `normalize` |
 | `Hetoimasia.Math.Matrix` | `M44`; `identity`, `fromColumns`, `fromRows`, `columns`, `rows`, `element`, `toColumnMajor`, `multiply`, `apply`, `transpose` |
 | `Hetoimasia.Math.Transform` | `translation`, `scaling`, checked `rotation` |
+| `Hetoimasia.Math.Affine2` | `Affine2`; `identity`, `fromColumns`, `translation`, `scaling`, checked `rotation`; `columns`, `toColumnMajor`; `compose`, `applyPoint`; checked `inverse` |
 | `Hetoimasia.Math.Projection` | checked `lookAt`; `DepthRange`, `ClipY`, `Frustum` and checked `perspective` |
 
 There is no collecting `Math` module or prelude: import the module that owns
@@ -40,9 +41,37 @@ what you use.
   over height. Which depth range and Y direction a graphics API needs is the
   renderer's choice, never this package's.
 
+## Affine2
+
+`Hetoimasia.Math.Affine2` is a 2×3 affine transform of the plane, for the 2D
+renderer's instance placement. It follows the conventions above:
+
+- **Coefficients.** A transform maps a point `(x, y)` to
+  `(a·x + c·y + tx, b·x + d·y + ty)`. Its columns are `(a, b)`, `(c, d)` and the
+  translation `(tx, ty)`; `fromColumns` takes them in that order, and
+  `toColumnMajor` lists `[a, b, c, d, tx, ty]`. A renderer that uploads a
+  transform builds its own buffer from those six numbers; the type promises no
+  byte layout.
+- **Composition.** In `compose f g` the transform `g` applies first, as in
+  `multiply`, and the result is the transform whose matrix is the product of the
+  two 3×3 matrices with the implicit bottom row `(0, 0, 1)`.
+- **Angles.** `rotation` takes radians, and a positive angle takes +X toward
+  +Y: a quarter turn takes `(1, 0)` to `(0, 1)`. The module chooses no
+  handedness for the plane, so whether +Y is up or down on a screen is the
+  caller's convention.
+- **Inversion.** `inverse` returns `Nothing` for a singular transform, for a
+  NaN or infinite coefficient, and whenever a coefficient of the inverse cannot
+  be represented as a finite `Float`. Every other transform inverts: the
+  determinant and the inverse are calculated in double precision, whose range
+  holds every product of two `Float` values and whose subtraction of the two
+  products is zero only for an exactly singular transform. So `scaling (V2 1e30
+  1e30)` and `scaling (V2 1e-30 1e-30)` invert although a `Float` determinant
+  would overflow or underflow, and `scaling (V2 1e-39 1)` does not, because its
+  inverse is too large.
+
 ## Degenerate and non-finite input
 
-Four operations are checked, and return `Maybe`. A `Just` result never
+Six operations are checked, and return `Maybe`. A `Just` result never
 contains NaN or an infinity; each returns `Nothing` for a NaN or infinite
 input, when the result it would calculate is not finite, and in these cases:
 
@@ -50,6 +79,8 @@ input, when the result it would calculate is not finite, and in these cases:
 | --- | --- |
 | `normalize` | the vector has zero length |
 | `rotation axis angle` | the axis has zero length |
+| `Affine2.rotation angle` | no further case: only a NaN or infinite angle |
+| `Affine2.inverse` | the transform is singular, or an inverse coefficient is not finite as a `Float` |
 | `lookAt eye target up` | the target is the eye; `up` has zero length; `up` is parallel to the view direction, in either sense — the sine of the angle between them is below `parallelTolerance` (`1e-5`) |
 | `perspective range clipY frustum` | the field of view is not strictly between 0 and π; the aspect ratio is not positive; the near plane is not positive; the far plane is not beyond the near plane |
 
@@ -61,14 +92,15 @@ unless an element of the matrix itself would: for a finite, non-degenerate
 input they return `Nothing` only when the result cannot be represented.
 
 Everything else — `add`, `sub`, `scale`, `dot`, `cross`, `norm`, the matrix
-operations, `translation` and `scaling` — is ordinary IEEE `Float` arithmetic:
+operations, `translation` and `scaling`, and the `Affine2` construction,
+`compose` and `applyPoint` — is ordinary IEEE `Float` arithmetic:
 it overflows to an infinity and propagates NaN and infinities as its component
 arithmetic does, and a caller that must exclude them checks its own inputs.
 
 ## No storage guarantee
 
 The package promises no byte layout, alignment, packing or memory order for any
-type. `M44`'s representation is private; `toColumnMajor` is a mathematical view
+type. `M44`'s and `Affine2`'s representations are private; `toColumnMajor` is a mathematical view
 of its sixteen elements, column by column — element `(r, c)` is at position
 `4c + r` — and not a description of how a matrix is stored. A backend that
 uploads a matrix builds its own buffer from the elements; that packing, like
@@ -84,7 +116,9 @@ cabal test --project-file cabal.project.cpu hetoimasia-math:math-tests --test-sh
 ```
 
 It combines hand-written examples with QuickCheck properties over a stated
-domain (components in [−100, 100], angles in [−2π, 2π]) and a tolerance of
+domain (components in [−100, 100], angles in [−2π, 2π]; the affine round trips
+use well-conditioned transforms near the origin, documented in
+`Test.Math.Affine2`) and a tolerance of
 `1e-4` relative, absolute near zero; `Test.Math.Support` documents both. A
 separate generator biased to signed zeros, subnormals, the largest finite
 values, infinities and NaN checks that no checked operation returns a
