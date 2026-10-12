@@ -38,6 +38,7 @@ executable hetoimasia-scene3d
         base >=4.22 && <4.23,
         stm >=2.5.3 && <2.6,
         text >=2.1 && <2.2,
+        time >=1.15 && <1.16,
         hetoimasia-foundation ==0.1.0.0,
         hetoimasia-runtime ==0.1.0.0,
         hetoimasia-glfw ==0.1.0.0,

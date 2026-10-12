@@ -13,6 +13,9 @@ module Test.GPU.Vulkan.Native.FramesRig
   , newRigOver
   , newRigClassed
   , newRigOn
+  , WindowDepthSetup (..)
+  , newRigWindowDepth
+  , newRigWindowDepthOver
   , geometries
   , commandsOf
 
@@ -69,7 +72,7 @@ module Test.GPU.Vulkan.Native.FramesRig
 import Control.Concurrent (ThreadId, forkIO, killThread, myThreadId, yield)
 import Control.Concurrent.STM (atomically)
 import Control.Exception (AsyncException (ThreadKilled), Exception, SomeException, fromException, try)
-import Control.Monad (unless, when)
+import Control.Monad (unless, void, when)
 import Data.Functor ((<&>))
 import Data.IORef (atomicModifyIORef', newIORef)
 import Data.List.NonEmpty (NonEmpty)
@@ -161,16 +164,43 @@ newRigOn ∷ (StandIn → StandIn) → IO Rig
 newRigOn adjust = newRigClassedOn adjust [OptionalTarget] defaultBudgetRequest {requestedFrameSlots = 2, requestedProgressActions = 32}
 
 newRigClassedOn ∷ (StandIn → StandIn) → [TargetClass] → BudgetRequest → IO Rig
-newRigClassedOn adjust classes request = do
+newRigClassedOn adjust = newRigWith' PlainDepth adjust
+
+-- | Whether the rig's session asked for windowed depth (GRS-13), and how far
+-- the rig takes it before the first step.
+data WindowDepthSetup
+  = PlainDepth
+    -- ^ The default: no generation has a depth image.
+  | WindowedDepth
+    -- ^ Asked for, and supplied by the recording before the first step.
+  | WindowedDepthPending
+    -- ^ Asked for and not supplied, and the first step not taken: the rig has
+    -- no generation until an example supplies the recording's depth and steps.
+  deriving (Eq, Show)
+
+-- | 'newRig' for a session that asked for windowed depth: every generation,
+-- the first included, owns a depth image.
+newRigWindowDepth ∷ WindowDepthSetup → IO Rig
+newRigWindowDepth setup = newRigWith' setup id [OptionalTarget] defaultBudgetRequest {requestedFrameSlots = 3, requestedProgressActions = 32}
+
+-- | 'newRigWindowDepth' 'WindowedDepth' with a target of each of these
+-- designations, in order.
+newRigWindowDepthOver ∷ [TargetClass] → IO Rig
+newRigWindowDepthOver classes = newRigWith' WindowedDepth id classes defaultBudgetRequest {requestedFrameSlots = 3, requestedProgressActions = 32}
+
+newRigWith' ∷ WindowDepthSetup → (StandIn → StandIn) → [TargetClass] → BudgetRequest → IO Rig
+newRigWith' setup adjust classes request = do
   rootsStandIn ← adjust <$> newStandIn
   roots ← newStandInRoots rootsStandIn (either (error . show) id (validateBudgets request))
   _ ← startRoots roots standardRequest
   targets ← mapM (\(classification, surface) → admitRootTarget roots classification (surfaceNumbered rootsStandIn surface) >>= either (fail . show) pure) (zip classes [10 ..])
   generations ← newGenerations roots
   mapM_ (\(classification, target, surface) → atomically (trackTarget generations target classification surface)) (zip3 classes targets [10 ..])
-  _ ← stepGenerations generations (at 0) (geometries targets (SurfaceExtent 640 480))
+  when (setup /= PlainDepth) (atomically (requireWindowDepth generations))
   recordingStandIn ← newRecordingStandIn
   recording ← newRecording (recordingStandInOps recordingStandIn) roots generations
+  when (setup == WindowedDepth) (atomically (supplyRecordingWindowDepth recording))
+  when (setup /= WindowedDepthPending) (void (stepGenerations generations (at 0) (geometries targets (SurfaceExtent 640 480))))
   standIn ← newFramesStandIn
   frames ← newFrames (framesStandInOps standIn) recording
   storages ←

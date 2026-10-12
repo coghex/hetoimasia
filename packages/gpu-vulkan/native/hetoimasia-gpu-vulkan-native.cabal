@@ -163,6 +163,7 @@ library
         Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Recorder
         Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
         Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Table
+        Hetoimasia.GPU.Vulkan.Native.Internal.Recording.WindowDepth
         Hetoimasia.GPU.Vulkan.Native.Internal.Uploads
         Hetoimasia.GPU.Vulkan.Native.Internal.Vma
     -- The messenger callback, and the compile-time check that the diagnostics
@@ -315,6 +316,7 @@ test-suite native-tests
         Test.GPU.Vulkan.Native.Terminal
         Test.GPU.Vulkan.Native.Table
         Test.GPU.Vulkan.Native.Uploads
+        Test.GPU.Vulkan.Native.WindowDepth
     ghc-options: -threaded -rtsopts
     build-depends:
         base >=4.22 && <4.23,

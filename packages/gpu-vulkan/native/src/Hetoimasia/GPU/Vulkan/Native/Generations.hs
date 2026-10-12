@@ -100,6 +100,31 @@
 -- made. A swapchain or view creation that ran out of memory created nothing,
 -- and is recovered once, as an allocation (VK-14).
 --
+-- = Windowed depth (GRS-13)
+--
+-- A session can ask for a depth image with every generation
+-- ('requireWindowDepth'); the recording, which owns managed images and sits
+-- above these generations, supplies what makes and releases one
+-- ('supplyWindowDepth', 'WindowDepth'). Until it does, no generation is
+-- constructed. Each generation then owns one depth image of its extent, shared
+-- by its frames in flight: a construction makes it last, after its views, so a
+-- swapchain that cannot be built or an image count that is refused spends none,
+-- and records it the moment it exists. A depth image that cannot be made —
+-- the allocation charged and, when the device is out of memory, recovered as
+-- any allocation is (VK-14) — fails the construction as any other of its
+-- native calls does: the candidate is retired and never published, and its
+-- depth, if it had one, is released with it. A cancellation inside the image's
+-- creation leaves unknown whether it made anything, as one inside a swapchain's
+-- does, so the candidate is retained uncertain and the session fails. A
+-- replacement makes its own depth of its own extent. The old generation's is
+-- released when the generation is destroyed — only once every hold on the
+-- generation has ended, which is the evidence that retires it, and after its
+-- swapchain and views — whether it was replaced, retired by a lost surface or by
+-- a close, or its construction failed; the model destroys it once every batch
+-- that recorded it has completed, never earlier. A generation kept uncertain
+-- keeps its depth image too. Teardown releases what remains with the
+-- recording. A depth image is read through 'viewDepth'.
+--
 -- = Close
 --
 -- Close wins: a target the model has closed begins no construction, admits no
@@ -194,6 +219,11 @@ module Hetoimasia.GPU.Vulkan.Native.Generations
   , noteSwapchainResult
   , withdrawGeneration
 
+    -- * Windowed depth (GRS-13)
+  , WindowDepth (..)
+  , requireWindowDepth
+  , supplyWindowDepth
+
     -- * CPU use
   , GenerationUse
   , UseRefusal (..)
@@ -219,6 +249,7 @@ module Hetoimasia.GPU.Vulkan.Native.Generations
   , GenerationDestructionFailed (..)
   , GenerationEffectUncertain (..)
   , GenerationsRetained (..)
+  , WindowDepthRefused (..)
   , AllocationNotRecovered (..)
   , RecoveryEnd (..)
   ) where
@@ -238,7 +269,11 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Generations.State
   , GenerationsRetained (..)
   , SwapchainResult (..)
   , TargetCondition (..)
+  , WindowDepth (..)
+  , WindowDepthRefused (..)
+  , requireWindowDepth
   , settlingPeriod
+  , supplyWindowDepth
   , trackTarget
   )
 import Hetoimasia.GPU.Vulkan.Native.Internal.Generations.Disposal

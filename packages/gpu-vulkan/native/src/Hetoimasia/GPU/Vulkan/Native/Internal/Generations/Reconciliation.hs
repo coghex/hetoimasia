@@ -87,11 +87,14 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Reclamation (recoveringCreation)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Generations.State
   ( GenerationEffectUncertain (..)
   , GenerationStanding (..)
+  , DepthStanding (..)
   , Generations (..)
   , NativeGeneration (..)
   , SwapchainResult (..)
   , TargetCondition (..)
   , TargetRecord (..)
+  , WindowDepth (..)
+  , WindowDepthRefused (..)
   , editGeneration
   , endCpuUse
   , isAsynchronous
@@ -299,7 +302,12 @@ reconcile generations now target geometry = do
             ]
     construct planned = do
       blocked ← atomically unretiredRemains
-      if blocked
+      -- A session that asked for windowed depth builds no generation before
+      -- what makes it is supplied (GRS-13), so none is published without it.
+      awaiting ← atomically $ readTVar (generationsDepth generations) >>= \case
+        DepthAwaiting → pure True
+        _ → pure False
+      if blocked || awaiting
         then pure Nothing
         else begin planned
     -- Admission through the construction's settlement is one masked region:
@@ -327,7 +335,7 @@ reconcile generations now target geometry = do
                 , recordLastPlanned = Just (planExtent planned, geometry)
                 , recordConstructions = recordConstructions entry + 1
                 , recordGenerations =
-                    Map.insert candidate (NativeGeneration planned GenerationBuilding Nothing [] [] False 0 False geometry) (recordGenerations entry)
+                    Map.insert candidate (NativeGeneration planned GenerationBuilding Nothing [] [] False 0 False geometry Nothing) (recordGenerations entry)
                 }
             handedHandle ← case handed of
               Nothing → pure Nothing
@@ -424,6 +432,23 @@ reconcile generations now target geometry = do
                       editGeneration generations candidate (\entry → entry {genViews = genViews entry <> [created]})
                   name ObjectImageView view (imageViewName candidate index)
                   allowInterrupt
+                -- The generation's depth image (GRS-13), when the session asked
+                -- for one: made last, so a swapchain that cannot be built or an
+                -- image count that is refused spends none, and recorded the
+                -- moment it exists, so a construction that fails after it
+                -- releases it with the candidate once that is destroyed.
+                depth ← atomically (readTVar (generationsDepth generations))
+                case depth of
+                  DepthDisabled → pure ()
+                  DepthAwaiting → throwIO (WindowDepthRefused candidate "what makes it was not supplied")
+                  DepthSupplied supplied → do
+                    -- A cancellation inside the image's or its view's creation
+                    -- leaves unknown whether either was made, as one inside a
+                    -- swapchain's does: the candidate is retained uncertain.
+                    writeIORef inCreation (Just "the depth image's creation")
+                    made ← windowDepthCreate supplied candidate (planExtent planned)
+                    atomically (editGeneration generations candidate (\entry → entry {genDepth = Just made}))
+                    writeIORef inCreation Nothing
                 pure count
           case outcome of
             Right count → publish candidate count

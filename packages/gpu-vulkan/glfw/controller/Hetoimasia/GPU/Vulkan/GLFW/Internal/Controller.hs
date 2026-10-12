@@ -403,6 +403,7 @@ import Hetoimasia.GPU.Vulkan.Native.Generations
   , offerReplacementSurface
   , readTargetGenerations
   , replacementSurfaceFailed
+  , requireWindowDepth
   , retireTargetGenerations
   , stepGenerations
   , trackTarget
@@ -642,6 +643,7 @@ newVulkanController
   → VulkanDeviceStart
   → Natural
   → Maybe UploadConfig
+  → Bool
   → RootOps Quiesced inst msgr phys dev
   → RenderingOps phys dev cmd
   → FrameObserver
@@ -662,6 +664,7 @@ newVulkanControllerWith
   → VulkanDeviceStart
   → Natural
   → Maybe UploadConfig
+  → Bool
   → RootOps Quiesced inst msgr phys dev
   → RenderingOps phys dev cmd
   → FrameObserver
@@ -673,7 +676,7 @@ newVulkanControllerWith
   → MonotonicSource
   → Duration
   → IO VulkanController
-newVulkanControllerWith hooks capture deviceStart capacity uploads ops rendering observer pointer bridge layers validation budgets clock poll = do
+newVulkanControllerWith hooks capture deviceStart capacity uploads windowDepth ops rendering observer pointer bridge layers validation budgets clock poll = do
   roots ← newRoots ops budgets clock
   ownerOpen ← newTVarIO (pure True)
   actions ← newActions capacity (actionGate roots ownerOpen)
@@ -682,8 +685,11 @@ newVulkanControllerWith hooks capture deviceStart capacity uploads ops rendering
   generations ← case capture of
     CaptureOff → newGenerations roots
     CaptureOn → newGenerationsCapturing roots
+  -- A host that asked for windowed depth (GRS-13) has its generations build
+  -- nothing until the recording supplies what makes their depth images.
+  when windowDepth (atomically (requireWindowDepth generations))
   captures ← newCaptures capture
-  rendered ← newRendering roots generations rendering observer captures uploads
+  rendered ← newRendering roots generations rendering observer captures uploads windowDepth
   fmap VulkanController $
     State roots generations rendered pointer bridge layers validation
       <$> newTVarIO Nothing
@@ -913,6 +919,9 @@ controllerOperations (VulkanController state) renderer =
           if moved || owed || planPolled plan || not (null (planDue plan))
             then do
               atomically (writeTVar (stateSeen state) observed)
+              -- The recording that makes the generations' depth images exists
+              -- before they are built, when the host asked for them.
+              prepareRendering (stateRendering state)
               stepGenerations (stateGenerations state) now geometries
             else pure (StepSummary [] [] False [])
         -- A replacement the generations' step just published is asked for a
@@ -2173,6 +2182,17 @@ data VulkanHostConfig scene = VulkanHostConfig
     -- its owner records into upload copies in one turn, and how many uploads
     -- may wait at once, validated by 'validateUploadConfig'. 'Nothing', by
     -- default, takes no upload.
+  , vulkanWindowDepth ∷ !Bool
+    -- ^ Whether every swapchain generation of every window owns a depth image
+    -- (GRS-13). 'False', by default: no generation has one, and nothing
+    -- changes for a renderer that draws without depth. When it is 'True' each
+    -- generation is built with one managed depth image of its extent, shared
+    -- by its frames in flight, replaced with the generation on resize and
+    -- recovery and destroyed once the batches that recorded it have completed;
+    -- a generation whose depth image cannot be made fails its construction as
+    -- any other native call does. Each 'FrameRequest' names the image
+    -- ('requestDepth'), so the renderer can begin its pass into the frame's
+    -- image with it.
   }
 
 -- | When the session's one device is selected and created.
@@ -2195,10 +2215,11 @@ defaultActionCapacity = 64
 -- | A configuration with the given capture configuration and budgets, no
 -- layers or validation features, the owner's defaults, no observer, a
 -- renderer that clears every frame to opaque black, the device created at the
--- first window's admission, 'defaultActionCapacity', and no uploads.
+-- first window's admission, 'defaultActionCapacity', no uploads and no windowed
+-- depth.
 vulkanHostConfig ∷ HostConfig → CaptureConfig → Budgets → Prepared scene → VulkanHostConfig scene
 vulkanHostConfig host capture budgets scene =
-  VulkanHostConfig host capture [] [] budgets scene id (const noObserver) (clearRenderer (\_ _ → ClearColor 0 0 0 1)) noFrameObserver DeviceAtFirstSurface defaultActionCapacity Nothing
+  VulkanHostConfig host capture [] [] budgets scene id (const noObserver) (clearRenderer (\_ _ → ClearColor 0 0 0 1)) noFrameObserver DeviceAtFirstSurface defaultActionCapacity Nothing False
 
 -- | A running Vulkan graphics host.
 data VulkanHost scene = VulkanHost
@@ -2261,6 +2282,7 @@ withVulkanOwnerHostHooked hooks capturing logger layer rendering pointer bridge 
         (vulkanDeviceStart config)
         (vulkanActionCapacity config)
         (vulkanUploads config)
+        (vulkanWindowDepth config)
         (observeRoots observer (layer capture))
         (observeRendering observer rendering)
         (vulkanFrameObserver config)

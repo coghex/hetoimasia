@@ -25,10 +25,14 @@ module Hetoimasia.Sample.Scene3d.Oracle
   ( -- * Rays and hits
     Hit (..)
   , hitsAt
+  , hitsAtIn
   , nearestHit
+  , nearestHitIn
   , expectedColour
+  , expectedColourIn
   , withoutDepthTest
   , interior
+  , interiorIn
   , interiorMargin
     -- * Probes
   , ProbeResult (..)
@@ -63,32 +67,44 @@ data Hit = Hit
 interiorMargin ∷ Int
 interiorMargin = 3
 
--- | The pose's ray through a pixel's centre: its origin and unit direction.
-rayFor ∷ Pose → (Int, Int) → (Vec3, Vec3)
-rayFor pose (x, y) = (poseEye pose, unit (add forward (add (scale sx right) (scale sy upward))))
+-- | The pose's ray through a pixel's centre of a target of this width and
+-- height in pixels, which the windowed mode's frames have.
+rayForIn ∷ (Int, Int) → Pose → (Int, Int) → (Vec3, Vec3)
+rayForIn (width, height) pose (x, y) = (poseEye pose, unit (add forward (add (scale sx right) (scale sy upward))))
   where
     forward = unit (sub (poseTarget pose) (poseEye pose))
     right = unit (cross forward (poseUp pose))
     upward = unit (cross right forward)
     tangent = tan (poseFovDegrees pose * pi / 360)
-    aspect = fromIntegral targetWidth / fromIntegral targetHeight
-    sx = (2 * (fromIntegral x + 0.5) / fromIntegral targetWidth - 1) * aspect * tangent
-    sy = (1 - 2 * (fromIntegral y + 0.5) / fromIntegral targetHeight) * tangent
+    aspect = fromIntegral width / fromIntegral height
+    sx = (2 * (fromIntegral x + 0.5) / fromIntegral width - 1) * aspect * tangent
+    sy = (1 - 2 * (fromIntegral y + 0.5) / fromIntegral height) * tangent
 
 -- | The cubes a pixel's ray strikes, nearest first.
 hitsAt ∷ Pose → (Int, Int) → [Hit]
-hitsAt pose pixel = sortOn hitDistance [hit | cube ← cubes, Just hit ← [strike cube origin direction]]
+hitsAt = hitsAtIn (targetWidth, targetHeight)
+
+-- | 'hitsAt' for a target of this width and height.
+hitsAtIn ∷ (Int, Int) → Pose → (Int, Int) → [Hit]
+hitsAtIn extent pose pixel = sortOn hitDistance [hit | cube ← cubes, Just hit ← [strike cube origin direction]]
   where
-    (origin, direction) = rayFor pose pixel
+    (origin, direction) = rayForIn extent pose pixel
 
 -- | The hit a depth test keeps.
 nearestHit ∷ Pose → (Int, Int) → Maybe Hit
-nearestHit pose = listToMaybe . hitsAt pose
+nearestHit = nearestHitIn (targetWidth, targetHeight)
+
+nearestHitIn ∷ (Int, Int) → Pose → (Int, Int) → Maybe Hit
+nearestHitIn extent pose = listToMaybe . hitsAtIn extent pose
 
 -- | What the pixel must read: the nearest hit's face colour, or the clear
 -- colour.
 expectedColour ∷ Pose → (Int, Int) → Rgba
-expectedColour pose pixel = maybe clearColour (\hit → faceColour (hitCube hit) (hitFace hit)) (nearestHit pose pixel)
+expectedColour = expectedColourIn (targetWidth, targetHeight)
+
+-- | 'expectedColour' for a target of this width and height.
+expectedColourIn ∷ (Int, Int) → Pose → (Int, Int) → Rgba
+expectedColourIn extent pose pixel = maybe clearColour (\hit → faceColour (hitCube hit) (hitFace hit)) (nearestHitIn extent pose pixel)
 
 -- | The cube a pixel would show with depth testing disabled: the last of the
 -- draw order that covers it.
@@ -99,11 +115,15 @@ withoutDepthTest pose pixel = listToMaybe (reverse [name | name ← drawOrder, n
 -- target, strikes the same face of the same cube as it does — or misses both
 -- cubes as it does.
 interior ∷ Pose → (Int, Int) → Bool
-interior pose (x, y) = all inside neighbours && all (== signature (x, y)) (map signature neighbours)
+interior = interiorIn (targetWidth, targetHeight)
+
+-- | 'interior' for a target of this width and height.
+interiorIn ∷ (Int, Int) → Pose → (Int, Int) → Bool
+interiorIn extent@(width, height) pose (x, y) = all inside neighbours && all (== signature (x, y)) (map signature neighbours)
   where
     neighbours = [(x + dx, y + dy) | dx ← [-interiorMargin .. interiorMargin], dy ← [-interiorMargin .. interiorMargin]]
-    inside (px, py) = px >= 0 && py >= 0 && px < targetWidth && py < targetHeight
-    signature pixel = fmap (\hit → (hitCube hit, hitFace hit)) (nearestHit pose pixel)
+    inside (px, py) = px >= 0 && py >= 0 && px < width && py < height
+    signature pixel = fmap (\hit → (hitCube hit, hitFace hit)) (nearestHitIn extent pose pixel)
 
 -- | The entry of a ray into a cube, if it has one in front of the origin.
 strike ∷ Cube → Vec3 → Vec3 → Maybe Hit

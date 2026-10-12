@@ -305,6 +305,10 @@ data Recording q inst msgr phys dev cmd = Recording
     -- was cancelled before any copy. Forgotten with the buffer's disposal.
   , recordingTable ∷ !(TVar (Maybe TableState))
     -- ^ The session's texture table (GRS-7), once made.
+  , recordingWindowDepths ∷ !(TVar (Set ResourceId))
+    -- ^ The depth images swapchain generations own (GRS-13): made with their
+    -- generation and released with it, so no handle releases one. Added by the
+    -- generation's construction, forgotten with the image's disposal.
   }
 
 -- | The session's texture table (GRS-7): the pure bookkeeping of its
@@ -445,6 +449,7 @@ makeRecording ops roots generations = do
     <*> newTVarIO Map.empty
     <*> newTVarIO Set.empty
     <*> newTVarIO Nothing
+    <*> newTVarIO Set.empty
 
 -- | Why an operation made no native call.
 data Refusal

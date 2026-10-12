@@ -31,6 +31,7 @@ import qualified Test.GPU.Vulkan.Native.Roots as Roots
 import qualified Test.GPU.Vulkan.Native.Terminal as Terminal
 import qualified Test.GPU.Vulkan.Native.Table as Table
 import qualified Test.GPU.Vulkan.Native.Uploads as Uploads
+import qualified Test.GPU.Vulkan.Native.WindowDepth as WindowDepth
 import Test.Hspec (describe)
 import Test.Hspec.Runner (Config (configFailOnEmpty), defaultConfig, hspecWith)
 
@@ -52,6 +53,7 @@ main =
       Frameless.spec
       Offscreen.spec
       Depth.spec
+      WindowDepth.spec
       Drawing.spec
       Checked.spec
       Reclamation.spec

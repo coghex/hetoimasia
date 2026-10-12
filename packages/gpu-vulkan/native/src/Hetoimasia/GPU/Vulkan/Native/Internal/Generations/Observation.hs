@@ -17,7 +17,7 @@ import qualified Data.Map.Strict as Map
 import Data.Word (Word64)
 import Numeric.Natural (Natural)
 
-import Hetoimasia.GPU.Model.Identity (GenerationId, TargetId)
+import Hetoimasia.GPU.Model.Identity (GenerationId, ResourceId, TargetId)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Generations.State
   ( GenerationStanding
   , Generations (..)
@@ -37,6 +37,9 @@ data GenerationView = GenerationView
   , viewImageViews ∷ ![Word64]
   , viewHandedOver ∷ !Bool
   , viewUses ∷ !Natural
+  , viewDepth ∷ !(Maybe ResourceId)
+    -- ^ The managed depth image the generation owns, if the session asked for
+    -- windowed depth (GRS-13) and the generation has made it.
   }
   deriving (Eq, Show)
 
@@ -67,6 +70,7 @@ readTargetGenerations generations target = do
               , viewImageViews = genViews native
               , viewHandedOver = genHandedOver native
               , viewUses = genUses native
+              , viewDepth = genDepth native
               }
           | (generation, native) ← Map.toAscList (recordGenerations entry)
           ]

@@ -35,6 +35,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Recorder
   , clearedDepth
   , defaultDepthClear
   , beginRenderingWithDepth
+  , beginFrameRenderingWithDepth
   , endRendering
   , bindPipeline
   , setViewport
@@ -804,8 +805,9 @@ data Attachment = Attachment
   , attachmentTarget ∷ !(Maybe ResourceId)
     -- ^ The color target, or 'Nothing' for the frame's image.
   , attachmentDepth ∷ !(Maybe ImageFormat)
-    -- ^ The format of the pass's depth attachment (GRS-10), if it has one:
-    -- never the frame's image, which windowed depth will give one.
+    -- ^ The format of the pass's depth attachment (GRS-10), if it has one: a
+    -- managed color target's, or, for the frame's image, a windowed frame's
+    -- (GRS-13).
   }
 
 -- | The frame's image as an attachment.
@@ -915,6 +917,66 @@ defaultDepthClear = 1
 beginRenderingWithDepth ∷ Recorder q inst msgr phys dev cmd → Image → PassStart → ClearColor → DepthPass → IO (Either Refusal ())
 beginRenderingWithDepth recorder color start clear depth = beginTargetPass recorder color start clear (Just depth)
 
+-- | 'beginRendering' into the frame's image with a managed depth target as the
+-- pass's depth attachment (GRS-13): the frame's image cleared to the color and
+-- the depth target cleared to the pass's value and stored, in the
+-- depth-attachment layout, across the whole extent. A windowed frame's request
+-- names the depth image of its generation, which every frame of that
+-- generation shares; under #335's rules the pass is a use of it in its
+-- depth-attachment use, the use it rests in, entered in the same transaction
+-- that retains it, so a refusal leaves it neither retained nor touched.
+-- 'ClearTarget' requires it to be initialized and keeps its layout;
+-- 'ClearFromUndefined' discards what it held and initializes a new one once the
+-- pass's batch has been submitted — a batch abandoned or refused before that
+-- publishes nothing, and a later pass that clears from undefined can
+-- initialize it. Batches of frames in flight that share the target are ordered
+-- by their boundary barriers (D-26).
+--
+-- Refused with no native call, in addition to what 'beginRendering' refuses, as
+-- 'beginRenderingWithDepth' refuses a depth target: one that is released,
+-- replaced, another session's or not a 'DepthTarget'; of more than one mip
+-- level; of another extent than the frame's image, as 'RefusedIncompatible';
+-- or cleared to a value that is not finite or lies outside zero to one. While
+-- the pass is open, a pipeline is drawn only if it declares the format of this
+-- depth attachment.
+beginFrameRenderingWithDepth ∷ Recorder q inst msgr phys dev cmd → ClearColor → DepthPass → IO (Either Refusal ())
+beginFrameRenderingWithDepth recorder clear depth = withImage recorder $ \frame →
+  let extent = frameImageExtent frame
+   in owned recording $
+        resolveDepth recording "the frame's image" (extentWidth extent, extentHeight extent) depth >>= \case
+          Left refusal → pure (Left refusal)
+          Right held → orderedSequence recorder $ \state →
+            if isJust (stateRendering state)
+              then Left (RefusedIllegal "rendering has already begun")
+              else
+                if stateLayout state /= LayoutColorAttachment
+                  then Left (RefusedIllegal ("rendering into an image that is " <> tshow (stateLayout state)))
+                  else
+                    let kind = imageResourceKind DepthTarget
+                        stepped = case resolvedStart held of
+                          ClearTarget → Access.touch (resolvedResource held) kind DepthAttachment KeepsContents (stateAccess state)
+                          ClearFromUndefined → Access.transition (resolvedResource held) kind FromUndefined DepthAttachment (stateAccess state)
+                     in case stepped of
+                          Left refusal → Left (accessRefused refusal)
+                          Right (access, barriers) →
+                            Right
+                              ( state
+                                  { stateAccess = access
+                                  , stateObjects = Map.insert (resolvedResource held) (resolvedObject held, resolvedImage held) (stateObjects state)
+                                  , stateRendering = Just (Attachment extent (frameImageFormat frame) Nothing (Just (resolvedFormat held)))
+                                  }
+                              , [resolvedResource held]
+                              , [ (resolvedResource held, if barrierDiscards barrier then DiscardsContents else KeepsContents)
+                                | barrier ← barriers
+                                , barrierRole barrier == EntryBarrier
+                                ]
+                              , map (resourceBarrier (resolvedObject held) (resolvedImage held)) barriers
+                                  <> [CommandBeginLabel (passLabel (recorderBatch recorder) (frameImageGeneration frame)) | recorderLabelled recorder]
+                                  <> [CommandBeginRendering (frameImageView frame) extent clear (Just (DepthClear (resolvedView held) (resolvedClear held)))]
+                              )
+  where
+    recording = recorderRecording recorder
+
 -- | A pass's depth target once its checks have passed.
 data ResolvedDepth = ResolvedDepth
   { resolvedResource ∷ !ResourceId
@@ -927,20 +989,22 @@ data ResolvedDepth = ResolvedDepth
   }
 
 -- | Check a pass's depth target against the color target it renders beside.
-resolveDepth ∷ Recording q inst msgr phys dev cmd → ImageDescription → DepthPass → IO (Either Refusal ResolvedDepth)
-resolveDepth recording colour (DepthPass (Image resource) start value) =
+resolveDepth ∷ Recording q inst msgr phys dev cmd → Text.Text → (Word32, Word32) → DepthPass → IO (Either Refusal ResolvedDepth)
+resolveDepth recording colourName colour (DepthPass (Image resource) start value) =
   liveNative recording resource >>= \case
     Left refusal → pure (Left refusal)
     Right (NativeImage description memory view)
       | imageKind description /= DepthTarget → pure (Left RefusedWrongKind)
       | imageMipLevels description /= 1 → pure (Left (RefusedUnsupported "rendering with a depth target of more than one mip level"))
-      | (imageWidth description, imageHeight description) /= (imageWidth colour, imageHeight colour) →
+      | (imageWidth description, imageHeight description) /= colour →
           pure
             ( Left
                 ( RefusedIncompatible
                     ( "a depth target of extent "
-                        <> extentText description
-                        <> " and a color target of extent "
+                        <> extentText (imageWidth description, imageHeight description)
+                        <> " and "
+                        <> colourName
+                        <> " of extent "
                         <> extentText colour
                     )
                 )
@@ -961,7 +1025,7 @@ resolveDepth recording colour (DepthPass (Image resource) start value) =
             )
     Right _ → pure (Left RefusedWrongKind)
   where
-    extentText description = tshow (imageWidth description) <> "x" <> tshow (imageHeight description)
+    extentText (width, height) = tshow width <> "x" <> tshow height
 
 beginTargetPass ∷ Recorder q inst msgr phys dev cmd → Image → PassStart → ClearColor → Maybe DepthPass → IO (Either Refusal ())
 beginTargetPass recorder (Image resource) start clear depth =
@@ -978,7 +1042,7 @@ beginTargetPass recorder (Image resource) start clear depth =
             (_, tallest)
               | imageHeight description > tallest → pure (Left (RefusedOutOfBounds (fromIntegral (imageHeight description)) (fromIntegral tallest)))
             _ →
-              maybe (pure (Right Nothing)) (fmap (fmap Just) . resolveDepth recording description) depth >>= \case
+              maybe (pure (Right Nothing)) (fmap (fmap Just) . resolveDepth recording "a color target" (imageWidth description, imageHeight description)) depth >>= \case
                 Left refusal → pure (Left refusal)
                 Right resolved → orderedSequence recorder $ \state →
                   if isJust (stateRendering state)

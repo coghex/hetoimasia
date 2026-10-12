@@ -100,6 +100,7 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , surfaceFreeRig
   , withActionCapacity
   , withUploads
+  , withWindowDepth
   , capturingRigOf
   , visibleRig
   , visibleRigOf
@@ -1339,6 +1340,8 @@ data Rig = Rig
   , rigActionCapacity ∷ !Natural
     -- ^ How many owner-thread actions may be queued at once.
   , rigUploads ∷ !(Maybe UploadConfig)
+  , rigWindowDepth ∷ !Bool
+    -- ^ Whether the host asked for windowed depth (GRS-13).
     -- ^ The session's uploads, if any (GRS-6).
   , rigSession ∷ !(TVar (Maybe Session))
     -- ^ The session the host was given, once it has been made: what a direct
@@ -1378,6 +1381,11 @@ withActionCapacity capacity rig = rig {rigActionCapacity = capacity}
 -- | The same rig with the session's uploads configured (GRS-6).
 withUploads ∷ UploadConfig → Rig → Rig
 withUploads configured rig = rig {rigUploads = Just configured}
+
+-- | The same rig with the host asking for a depth image with every swapchain
+-- generation (GRS-13).
+withWindowDepth ∷ Rig → Rig
+withWindowDepth rig = rig {rigWindowDepth = True}
 
 -- | How many surface creations the bridge has admitted, held ones included.
 creationsBegun ∷ Rig → STM Word64
@@ -1615,6 +1623,7 @@ newRigClocked visible windows clock = do
       , rigDeviceStart = DeviceAtFirstSurface
       , rigActionCapacity = defaultActionCapacity
       , rigUploads = Nothing
+      , rigWindowDepth = False
       , rigSession = session
       }
 
@@ -1650,6 +1659,7 @@ runRigHere rig body = myThreadId >>= \self → withBoundThread (rigBound rig) se
           , vulkanDeviceStart = rigDeviceStart rig
           , vulkanActionCapacity = rigActionCapacity rig
           , vulkanUploads = rigUploads rig
+          , vulkanWindowDepth = rigWindowDepth rig
           , vulkanFrameObserver = \event → do
               atomically $ do
                 modifyTVar' (rigFrameEvents rig) (<> [event])

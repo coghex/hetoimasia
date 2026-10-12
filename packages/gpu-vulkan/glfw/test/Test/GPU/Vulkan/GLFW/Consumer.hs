@@ -43,6 +43,7 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , ImageKind (..)
   , ImageLayout (..)
   , NativeCommand (..)
+  , PassStart (..)
   , Pipeline
   , PipelineLayout
   , PipelineShaders (..)
@@ -50,10 +51,13 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , Rect (..)
   , Refusal (..)
   , Viewport (..)
+  , beginFrameRenderingWithDepth
   , beginRendering
   , bindPipeline
+  , clearedDepth
   , draw
   , endRendering
+  , formatCode
   , readbackBytesFor
   , setScissor
   , setViewport
@@ -92,6 +96,10 @@ spec = describe "Vulkan consumer rendering and capture" $ do
     itBounded "fails the session through the terminal latch, keeping the loss primary, when a construction loses the device" testTerminalConstruction
     itBounded "keeps a replaced pipeline and its layout while a submitted batch still holds them, and destroys it only on that batch's completion" testReplacedInFlight
     itBounded "ends the owner's run, never answering a refusal, when a replacement's new pipeline cannot be named after it was committed" testReplacementUnnamed
+
+  describe "windowed depth (GRS-13)" $ do
+    itBounded "names no depth image in any frame's request and makes none when the host did not ask" testNoWindowDepth
+    itBounded "names each frame's generation's depth image in its request, the same one for a generation's frames, gives a replacement its own and destroys each with its generation" testWindowDepth
 
   describe "consumer teardown" $ do
     itBounded "destroys what the consumer built, pipeline before layout, before the device on the host's normal exit, with a clean verdict" testNormalTeardown
@@ -164,6 +172,75 @@ chain = \case
 
 -- | A construction lent to the renderer, kept past its frame.
 data Lent = ∀ q inst msgr phys dev cmd. Lent (Construction q inst msgr phys dev cmd)
+
+-- ---------------------------------------------------------------------------
+-- Windowed depth (GRS-13)
+
+testNoWindowDepth ∷ IO ()
+testNoWindowDepth = do
+  rig ← visibleRig
+  triangle ← newTriangle
+  renderWith rig (triangleRenderer triangle)
+  runRig rig $ \host control → do
+    [window] ← windowsOf host
+    _ ← firstFrame rig host control window
+    pure ()
+  requests ← readTVarIO (triangleRequests triangle)
+  requests `shouldSatisfy` (not . null)
+  map requestDepth requests `shouldSatisfy` all isNothing
+  events ← journal rig
+  [() | ImageMade {} ← events] `shouldBe` []
+
+testWindowDepth ∷ IO ()
+testWindowDepth = do
+  rig ← withWindowDepth <$> visibleRig
+  seen ← newTVarIO []
+  renderWith rig $ VulkanRenderer $ \_ request _ recorder → do
+    atomically (modifyTVar' seen (<> [request]))
+    case requestDepth request of
+      Nothing → pure (Left (RefusedIllegal "the request names no depth image"))
+      Just depth →
+        chain
+          [ beginFrameRenderingWithDepth recorder (ClearColor 0 0 0 1) (clearedDepth depth ClearFromUndefined)
+          , endRendering recorder
+          ]
+  runRig rig $ \host control → do
+    [window] ← windowsOf host
+    service ← firstFrame rig host control window
+    demandFrame host window
+    composedUntil rig host control "a second frame" (\_ → pure ()) ((>= 2) <$> presentsOf rig (graphicsAttachment service))
+    resizeFramebuffer rig host window (800, 600)
+    demandFrame host window
+    composedUntil rig host control "a frame of the replacement generation" (\_ → demandFrame host window) $
+      any ((== SurfaceExtent 800 600) . requestExtent) <$> readTVarIO seen
+    pure ()
+  requests ← readTVarIO seen
+  -- Every frame of the session was rendered with a depth image.
+  map requestDepth requests `shouldSatisfy` all isJust
+  let generationOf = imageGeneration . requestImage
+      depths = nubOrdered [(generationOf request, requestDepth request) | request ← requests]
+  -- One depth image per generation, two generations: 640 by 480, then 800 by 600.
+  map fst depths `shouldBe` nubOrdered (map generationOf requests)
+  length depths `shouldBe` 2
+  case depths of
+    [(firstGeneration, first), (_, second)] → do
+      first `shouldSatisfy` (/= second)
+      [requestExtent request | request ← requests, generationOf request == firstGeneration] `shouldSatisfy` all (== SurfaceExtent 640 480)
+    other → failWith ("the generations' depth images were " <> show other)
+  events ← journal rig
+  -- Two depth images were made, in the depth format, and both were destroyed:
+  -- the first with its generation, the second at the host's exit.
+  let made = [(image, format) | ImageMade image format ← events]
+      gone = [image | ImageGone image ← events]
+  length made `shouldBe` 2
+  map snd made `shouldSatisfy` all (== formatCode Depth32Float)
+  map fst made `shouldSatisfy` all (`elem` gone)
+  commands ← map snd <$> commandsRecorded rig
+  [clear | CommandBeginRendering _ _ _ (Just clear) ← commands] `shouldSatisfy` (not . null)
+
+-- | The distinct items, in the order they first appear.
+nubOrdered ∷ Eq a ⇒ [a] → [a]
+nubOrdered = foldr (\item kept → item : filter (/= item) kept) []
 
 -- ---------------------------------------------------------------------------
 -- Consumer construction

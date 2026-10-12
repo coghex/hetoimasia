@@ -103,6 +103,15 @@
 --   sample's independent oracle — the nearer cube, drawn first, showing where
 --   the cubes overlap — and written as a lossless PNG a pose and a probe
 --   record under the validation runner's evidence directory (#349);
+-- * @grs13-window-depth@ — a window whose host asked for windowed depth: the
+--   scene3d sample's two cubes drawn with a depth test into the window's own
+--   image with the depth image of its swapchain generation, a frame captured
+--   and checked against the sample's independent oracle — the nearer cube,
+--   drawn first, showing where the cubes overlap — then the window resized and
+--   a frame of the generation built at the new size captured and checked the
+--   same, with synchronization validation reporting nothing, written as
+--   lossless PNGs and a probe record under the validation runner's evidence
+--   directory (#350);
 -- * @grs14-table-growth@ — the same device start with no window, then a
 --   texture table of five slots at most, two at first, grown twice by
 --   registration; a batch recorded before a growth and submitted after it,
@@ -191,6 +200,7 @@ import qualified Test.GPU.Vulkan.Native.Recording as Recording
 import qualified Test.GPU.Vulkan.Native.SurfaceFree as SurfaceFree
 import qualified Test.GPU.Vulkan.Native.Terminal as Terminal
 import qualified Test.GPU.Vulkan.Native.Triangle as Triangle
+import qualified Test.GPU.Vulkan.Native.WindowedDepth as WindowedDepth
 import qualified Test.Vulkan.Proof.Bridge as Bridge
 import qualified Test.Vulkan.Proof.BridgeSpec as BridgeSpec
 import qualified Test.Vulkan.Proof.Diagnostics as Diagnostics
@@ -423,6 +433,14 @@ scenarios =
       $ \consent journal _ → do
         outcome ← SurfaceFree.runScene3d (consentBackend consent) journal
         pure (SurfaceFree.scene3dSpec outcome, section "The GRS-10 scene3d evidence record" (SurfaceFree.scene3dSection outcome))
+  , Scenario
+      "grs13-window-depth"
+      "draws the scene3d sample's two flat-coloured cubes with a depth test into a window's own image with the depth image of its swapchain generation, captures a frame and passes every probe of the independent oracle — the nearer cube, drawn first, showing where the cubes overlap — resizes the window and captures a frame of the generation built at the new size, which gave itself a depth image of its own, with synchronization validation reporting nothing"
+      False
+      Nothing
+      $ \consent journal _ → do
+        outcome ← WindowedDepth.runWindowDepth (consentBackend consent) journal
+        pure (WindowedDepth.spec outcome, section "The GRS-13 windowed depth record" (WindowedDepth.windowDepthSection outcome))
   , Scenario
       "grs14-table-growth"
       "grows the texture table of a surface-free session twice to a cap that is no power of two, samples correctly from a batch recorded before a growth and submitted after it, draws textures registered before and after growth with a pipeline built before it, and answers backpressure at the cap, with validation reporting nothing"

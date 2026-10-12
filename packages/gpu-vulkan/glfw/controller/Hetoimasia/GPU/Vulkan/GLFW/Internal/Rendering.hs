@@ -130,6 +130,7 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
     -- * The rendering
   , Rendering
   , newRendering
+  , prepareRendering
   , StepInputs (..)
   , StepPlan (..)
   , planStep
@@ -307,6 +308,8 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , replacePipeline
   , retireRecording
   , transitionImage
+  , supplyRecordingWindowDepth
+  , windowDepthOf
   , createBlendedCheckedPipeline
   , createDepthCheckedPipeline
   , selectDepthFormat
@@ -386,6 +389,16 @@ data FrameRequest = FrameRequest
   , requestSceneRevision ∷ !Natural
     -- ^ The revision of the scene being rendered, zero for the owner's
     -- initial one.
+  , requestDepth ∷ !(Maybe Image)
+    -- ^ The depth image of the image's generation (GRS-13), when the host's
+    -- configuration asked for windowed depth ('Nothing' otherwise, the
+    -- default): one managed 'Hetoimasia.GPU.Vulkan.Native.Recording.DepthTarget'
+    -- image of the generation's extent, shared by every frame of that
+    -- generation and owned by it, so a renderer neither makes, releases nor
+    -- keeps it past the frame. The renderer begins its pass into the frame's
+    -- image with it ('Hetoimasia.GPU.Vulkan.Native.Recording.beginFrameRenderingWithDepth')
+    -- and binds only pipelines that declare the depth format
+    -- ('constructDepthFormat').
   }
   deriving (Eq, Show)
 
@@ -824,6 +837,10 @@ data Rendering q inst msgr phys dev cmd = Rendering
   , renderingUploads ∷ !(TVar (UploadsStanding q inst msgr phys dev cmd))
     -- ^ The session's uploads (GRS-6): made by the owner's progress once the
     -- recording and the frames exist; any thread admits into them.
+  , renderingWindowDepth ∷ !Bool
+    -- ^ Whether the host asked for a depth image with every generation
+    -- (GRS-13). The generations were asked at construction; the recording
+    -- supplies what makes the images when it is made ('live').
   }
 
 -- | Where the session's uploads stand.
@@ -844,8 +861,9 @@ newRendering
   → FrameObserver
   → Captures
   → Maybe UploadConfig
+  → Bool
   → IO (Rendering q inst msgr phys dev cmd)
-newRendering roots generations ops observer captures uploads =
+newRendering roots generations ops observer captures uploads windowDepth =
   Rendering roots generations ops
     <$> newTVarIO Nothing
     <*> newTVarIO Map.empty
@@ -856,6 +874,7 @@ newRendering roots generations ops observer captures uploads =
     <*> pure captures
     <*> newTVarIO Nothing
     <*> newTVarIO (maybe UploadsUnconfigured UploadsPending uploads)
+    <*> pure windowDepth
 
 -- | The recording and the frames, made the first time they are needed once
 -- the device exists, on the owner's thread, which is what makes it their
@@ -872,8 +891,19 @@ live rendering =
           recording ← newRecording ops (renderingRoots rendering) (renderingGenerations rendering)
           frames ← newFrames (renderingFrameOps (renderingOps rendering)) recording
           let made = Live recording frames
-          atomically (writeTVar (renderingLive rendering) (Just made))
+          -- The generations built from now on carry the depth image the host
+          -- asked for (GRS-13).
+          atomically $ do
+            when (renderingWindowDepth rendering) (supplyRecordingWindowDepth recording)
+            writeTVar (renderingLive rendering) (Just made)
           pure (Just made)
+
+-- | Make the recording ready before the generations' step, when the host asked
+-- for windowed depth (GRS-13): the generations build nothing before the
+-- recording supplies what makes their depth images, and the recording exists
+-- only once the device does. A host that did not ask makes it lazily, as ever.
+prepareRendering ∷ Rendering q inst msgr phys dev cmd → IO ()
+prepareRendering rendering = when (renderingWindowDepth rendering) (void (live rendering))
 
 -- | A frame storage could not be made for a target's slot. It is raised, and
 -- ends the owner's run like any other owner failure: a target whose slots
@@ -1109,9 +1139,9 @@ renderDue rendering renderer now scene revision due =
                 Nothing → pure False
                 Just ticket → atomically (associateCapture captures attachment ticket (ownedFrame owned))
               observe (FrameAcquired attachment (ownedFrame owned) (ownedImage owned))
-              described ← describeImage target (ownedImage owned)
+              described ← describeImage made target (ownedImage owned)
               case described of
-                Nothing → False <$ abandon made attachment owned (Captured asked Nothing) "its generation is no longer tracked"
+                Nothing → False <$ abandon made attachment owned (Captured asked Nothing) "its generation is no longer tracked, or has no depth image the session asked for"
                 Just image → do
                   capture ← if asked then prepareCapture made attachment owned image else pure (Captured False Nothing)
                   recordOne made target attachment owned image capture
@@ -1140,13 +1170,17 @@ renderDue rendering renderer now scene revision due =
               Left refusal → throwIO (FrameStorageRefused target slot refusal)
           atomically (editTarget rendering target (\record → record {targetStorages = made'}))
           pure True
-    describeImage target image = do
-      view ← atomically (readTargetGenerations (renderingGenerations rendering) target)
+    describeImage made target image = do
+      (view, depth) ← atomically ((,) <$> readTargetGenerations (renderingGenerations rendering) target <*> windowDepthOf (liveRecording made) (imageGeneration image))
       pure $ do
         generations ← viewGenerations <$> view
         generation ← find ((== imageGeneration image) . viewGeneration) generations
         let plan = viewPlan generation
-        pure (FrameImage (planExtent plan) (surfaceFormat (planFormat plan)) (planUsage plan .&. imageUsageTransferSource /= 0))
+        -- A generation of a session that asked for windowed depth always has
+        -- it; one that somehow does not is not rendered into.
+        if renderingWindowDepth rendering && not (isJust depth)
+          then Nothing
+          else pure (FrameImage (planExtent plan) (surfaceFormat (planFormat plan)) (planUsage plan .&. imageUsageTransferSource /= 0) depth)
     -- A readback buffer for the capture, or the capture settled without bytes
     -- and the frame recorded as any other — no longer a capture's, so nothing
     -- that later becomes of it can settle a newer request.
@@ -1159,7 +1193,7 @@ renderDue rendering renderer now scene revision due =
             Right readback → pure (Captured True (Just (readback, bytes)))
     withhold attachment reason = atomically (settleCapture captures attachment (CaptureWithheld attachment reason))
     recordOne made target attachment owned image capture = do
-      let request = FrameRequest attachment target (ownedFrame owned) (ownedImage owned) (imageExtent image) (imageFormat image) revision
+      let request = FrameRequest attachment target (ownedFrame owned) (ownedImage owned) (imageExtent image) (imageFormat image) revision (imageDepth image)
           construction = construct rendering made
           finish recorder = case capturedWork capture of
             Nothing → transitionImage recorder LayoutColorAttachment LayoutPresentSource
@@ -1238,6 +1272,8 @@ data FrameImage = FrameImage
   , imageFormat ∷ !Word32
   , imageCapturable ∷ !Bool
     -- ^ Whether its generation made it a transfer source.
+  , imageDepth ∷ !(Maybe Image)
+    -- ^ Its generation's depth image, if the session asked for one (GRS-13).
   }
 
 -- | Whether a frame is still an outstanding capture's, and the readback

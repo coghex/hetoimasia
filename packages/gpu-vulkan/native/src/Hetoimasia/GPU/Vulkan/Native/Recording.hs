@@ -80,6 +80,21 @@
 -- clip-space Y points down and depth runs 0 to 1. Every refusal makes no native
 -- call.
 --
+-- = Windowed depth (GRS-13)
+--
+-- A session can ask for a depth image with every swapchain generation of its
+-- windows ('supplyRecordingWindowDepth', which the host calls when its
+-- configuration asked for windowed depth). The generation's construction makes
+-- it, of the generation's extent and in 'selectDepthFormat''s format, as an
+-- ordinary managed 'DepthTarget' image, and releases it with the generation;
+-- no handle releases it, and a recorded batch that used it keeps it until the
+-- batch has completed. A frame of the generation takes it through
+-- 'windowDepthOf', and 'beginFrameRenderingWithDepth' begins rendering into
+-- the frame's image with it as the depth attachment, with the rules
+-- 'beginRenderingWithDepth' has for a managed color target: the frames in
+-- flight of the generation share the one image, and #335's boundary barriers
+-- order them.
+--
 -- = Names and labels
 --
 -- When the roots offer naming ('readRootsInstrumentation'), every managed
@@ -318,6 +333,10 @@ module Hetoimasia.GPU.Vulkan.Native.Recording
   , createPipelineWithDepth
   , createDepthCheckedPipeline
 
+    -- * Windowed depth (GRS-13)
+  , supplyRecordingWindowDepth
+  , windowDepthOf
+
     -- * Managed resources
   , PipelineLayout
   , Pipeline
@@ -374,6 +393,7 @@ module Hetoimasia.GPU.Vulkan.Native.Recording
   , PassStart (..)
   , beginRenderingInto
   , beginRenderingWithDepth
+  , beginFrameRenderingWithDepth
   , endRendering
   , bindPipeline
   , setViewport
@@ -566,6 +586,10 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   )
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Readback (fillReadback, readReadback)
 import Hetoimasia.GPU.Vulkan.Native.Shader.Interface (CheckedShader (..), CheckedShaders (..))
+import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.WindowDepth
+  ( supplyRecordingWindowDepth
+  , windowDepthOf
+  )
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Recorder
   ( Recorder
   , BufferSource (..)
@@ -573,6 +597,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Recorder
   , PassStart (..)
   , beginRendering
   , beginRenderingWithDepth
+  , beginFrameRenderingWithDepth
   , bindIndexBuffer
   , bindVertexBuffer
   , claimRegion
