@@ -127,6 +127,7 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , defaultDepthClear
   , beginRenderingWithDepth
   , beginFrameRenderingWithDepth
+  , clearDepthRect
   , CompareOp (..)
   , PipelineDepth (..)
   , depthTested
@@ -439,6 +440,7 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , defaultDepthClear
   , depthFormatPreference
   , clearedDepth
+  , clearDepthRect
   , depthTested
   , draw
   , endRendering

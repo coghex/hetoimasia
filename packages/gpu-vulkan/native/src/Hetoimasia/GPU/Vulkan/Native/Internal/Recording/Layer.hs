@@ -176,6 +176,10 @@ data NativeCommand
   | CommandSetScissor !Rect
   | CommandDraw !Word32 !Word32 !Word32 !Word32
     -- ^ Vertex count, instance count, first vertex, first instance.
+  | CommandClearDepthRect !Rect !Float
+    -- ^ Clear the open pass's depth attachment to the value within the
+    -- rectangle, in render-area pixels, with one rectangle and one layer
+    -- (R2D-17).
   | CommandCopyImageToBuffer !Word64 !SurfaceExtent !Word64
     -- ^ The whole color image, tightly packed, into the buffer at offset zero.
   | CommandHostReadBarrier !Word64 !Word64
@@ -773,6 +777,7 @@ nativeName = \case
   CommandSetViewport _ → "vkCmdSetViewport"
   CommandSetScissor _ → "vkCmdSetScissor"
   CommandDraw {} → "vkCmdDraw"
+  CommandClearDepthRect {} → "vkCmdClearAttachments"
   CommandCopyImageToBuffer {} → "vkCmdCopyImageToBuffer"
   CommandHostReadBarrier {} → "vkCmdPipelineBarrier2"
   CommandBeginLabel _ → "vkCmdBeginDebugUtilsLabelEXT"

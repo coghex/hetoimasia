@@ -36,6 +36,18 @@
 --   readback. The main thread waits for its ticket; a second action reads
 --   the readback, which is probed for exact bytes inside each quad and
 --   outside both, and written as a PNG to a temporary path.
+-- * @r2d17-depth-rect@ opens no window either (R2D-17). One owner-thread
+--   action makes the session's shared ring, an RGBA8 color target, a
+--   @D32_SFLOAT@ depth target of its extent, a layout and a depth-tested
+--   pipeline over the scene3d sample's shaders and a readback buffer, and
+--   records a frame-less batch whose pass clears the depth to 0.0, so that a
+--   less-or-equal test passes nothing, clears a rectangle touching none of the
+--   target's edges to 1.0 with 'clearDepthRect', and draws a quad covering the
+--   whole target at depth 0.5. The main thread waits for its ticket; a second
+--   action reads the readback, which shows the quad's color exactly inside
+--   the rectangle and the pass's clear color exactly outside it, probed on
+--   both sides of each edge, and is written as a PNG to a temporary path.
+--   Depth cannot be read back, so the picture is the evidence.
 -- * @grs12-frameless@ opens no window either (GRS-12). One owner-thread
 --   action builds a color target and a vertex buffer and records a
 --   frame-less batch that initializes the target and moves the buffer into a
@@ -62,6 +74,7 @@ module Test.GPU.Vulkan.Native.SurfaceFree
   , runGrowth
   , runSwap
   , runScene3d
+  , runDepthRect
   , surfaceFreeSection
   , laterWindowSection
   , framelessSection
@@ -73,6 +86,7 @@ module Test.GPU.Vulkan.Native.SurfaceFree
   , growthSection
   , swapSection
   , scene3dSection
+  , depthRectSection
   , surfaceFreeSpec
   , laterWindowSpec
   , framelessSpec
@@ -84,6 +98,7 @@ module Test.GPU.Vulkan.Native.SurfaceFree
   , growthSpec
   , swapSpec
   , scene3dSpec
+  , depthRectSpec
   ) where
 
 import Control.Concurrent (ThreadId, myThreadId, threadDelay)
@@ -224,6 +239,11 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , constructDepthCheckedPipeline
   , constructDepthFormat
   , depthFormatPreference
+  , DepthPass (..)
+  , PipelineBlend (BlendNone)
+  , beginRenderingWithDepth
+  , clearDepthRect
+  , depthTested
   )
 import Hetoimasia.GPU.Vulkan.Native.Presentation (formatB8G8R8A8Srgb)
 import Hetoimasia.GPU.Vulkan.Native.Recording.ShaderInterfaces (tableSamplerOffset)
@@ -232,6 +252,7 @@ import qualified Hetoimasia.Sample.Scene3d as Scene3d
 import qualified Hetoimasia.Sample.Scene3d.Evidence as Scene3dEvidence
 import qualified Hetoimasia.Sample.Scene3d.Oracle as Scene3dOracle
 import qualified Hetoimasia.Sample.Scene3d.Scene as Scene3dScene
+import Hetoimasia.Sample.Scene3d.Shaders (scene3dShaders)
 import Hetoimasia.Sample.Sprites.Evidence (Evidence (..), Host (..), runEvidence)
 import Hetoimasia.Sample.Sprites.Oracle (ProbeResult (..))
 import Hetoimasia.Sample.Sprites.Swap (SwapEvidence (..), SwapFacts (..), runSwapEvidence)
@@ -773,6 +794,146 @@ drawingBatch construction = do
                         Left refusal → Left refusal
                         Right (_, Left refusal) → Left refusal
                         Right (ticket, Right ()) → Right (readback, ticket)
+
+-- | The depth-rect case (R2D-17): a pass into an RGBA8 color target and a
+-- @D32_SFLOAT@ depth target that clears the depth to 0.0, clears a rectangle
+-- of it to 1.0, and draws a quad covering the whole target at depth 0.5 with a
+-- less-or-equal test, so the quad shows exactly where depth was cleared.
+runDepthRect ∷ Maybe Backend → Journal → IO SurfaceFreeOutcome
+runDepthRect backend journal = do
+  heading journal "R2D-17: a surface-free session clears a rectangle of a depth attachment inside a pass, draws a full-target quad at depth 0.5 with a less-or-equal test, and reads it back"
+  runCase backend defaultBudgetRequest {requestedBytes = 2 * 1024 * 1024 * 1024} [] "vulkan-native-r2d17-depth-rect" $ \vulkan _ _ _ → do
+    recorded ← act vulkan (VulkanAction (\construction → (,) <$> myThreadId <*> depthRectBatch construction)) >>= \case
+      ActionReturned (ran, Right made) → pure (ran, made)
+      ActionReturned (_, Left refusal) → stopWith ("the depth-rect batch was refused: " <> tshow refusal)
+      other → stopWith ("the depth-rect action did not return: " <> outcomeText other)
+    let (drawnOn, (readback, ticket)) = recorded
+    waited ← awaitTicket ticket deadline
+    read' ← act vulkan (VulkanAction (\construction → (,) <$> myThreadId <*> readConstructedReadback construction readback 0 offscreenBytes)) >>= \case
+      ActionReturned (ran, Right bytes) → pure (ran, bytes)
+      ActionReturned (_, Left refusal) → stopWith ("the readback was refused: " <> tshow refusal)
+      other → stopWith ("the reading action did not return: " <> outcomeText other)
+    let (readOn, bytes) = read'
+    directory ← getTemporaryDirectory
+    (path, handle) ← openBinaryTempFile directory "hetoimasia-r2d17-depth-rect.png"
+    ByteString.hPut handle (encodeRgba offscreenSide offscreenSide bytes)
+    hClose handle
+    note journal ("the readback is at " <> Text.pack path)
+    let shot = Shot Rgba8Srgb waited [(point, pixelAt bytes point) | (point, _) ← depthRectProbes] path
+    roots ← atomically (readVulkanRoots (vulkanController vulkan))
+    pure (Seen [drawnOn, readOn] ["cleared the depth rectangle, drew the quad and copied the target", "read the readback"] 0 (Just roots) Nothing [waited] [shot] Nothing Nothing Nothing Nothing Nothing Nothing)
+  where
+    deadline = either (error . show) id (durationFromNanoseconds AllowZero 10000000000)
+    pixelAt bytes (x, y) = ByteString.unpack (ByteString.take 4 (ByteString.drop ((y * offscreenSide + x) * 4) bytes))
+
+-- | The rectangle the case clears the depth to 1.0 within, in pixels of the
+-- 64 by 64 targets: 16 to 47 across and 20 to 43 down, touching no edge.
+depthRectCleared ∷ Rect
+depthRectCleared = Rect 16 20 32 24
+
+-- | Probe points and what each must read: the quad's magenta where the depth
+-- was cleared to 1.0, the pass's blue clear where it stayed 0.0. Each edge of
+-- the rectangle has a pixel just inside it and one just outside, and so do
+-- two corners; the rest are well away from it.
+depthRectProbes ∷ [((Int, Int), [Word8])]
+depthRectProbes =
+  [ ((32, 32), inside)
+  , ((16, 32), inside)
+  , ((15, 32), outside)
+  , ((47, 32), inside)
+  , ((48, 32), outside)
+  , ((32, 20), inside)
+  , ((32, 19), outside)
+  , ((32, 43), inside)
+  , ((32, 44), outside)
+  , ((16, 20), inside)
+  , ((15, 19), outside)
+  , ((47, 43), inside)
+  , ((48, 44), outside)
+  , ((4, 4), outside)
+  , ((60, 60), outside)
+  ]
+  where
+    inside = [255, 0, 255, 255]
+    outside = [0, 0, 255, 255]
+
+-- | The quad as two triangles of the scene3d sample's vertices: a position of
+-- three floats and a color of four normalized bytes, covering the whole
+-- clip-space square at depth 0.5, in magenta.
+depthRectVertices ∷ ByteString.ByteString
+depthRectVertices = ByteString.concat [vertex x y | (x, y) ← [(-1, -1), (1, -1), (1, 1), (-1, -1), (1, 1), (-1, 1)]]
+  where
+    vertex x y = floatList [x, y, 0.5] <> ByteString.pack [255, 0, 255, 255]
+
+-- | The identity transform the scene3d shaders' push-constant block takes.
+depthRectTransform ∷ ByteString.ByteString
+depthRectTransform = floatList [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
+
+floatList ∷ [Float] → ByteString.ByteString
+floatList values = ByteString.pack (concat [word (castFloatToWord32 value) | value ← values])
+  where
+    word ∷ Word32 → [Word8]
+    word value = [fromIntegral (value `shiftR` shift) | shift ← [0, 8, 16, 24]]
+
+-- | The session's ring, an RGBA8 color target, a depth target of the backend's
+-- depth format, which the case requires to be @D32_SFLOAT@, a layout and a
+-- depth-tested pipeline over the scene3d shaders, a readback buffer, and a
+-- frame-less batch that writes the quad into a ring region, begins a pass
+-- clearing the color to blue and the depth to 0.0, clears the rectangle to
+-- 1.0, draws the quad at depth 0.5, ends the pass, copies the target into the
+-- readback after its transition, and returns it to rest.
+depthRectBatch ∷ Construction q inst msgr phys dev cmd → IO (Either Refusal (Readback, BatchTicket))
+depthRectBatch construction = do
+  let side = fromIntegral offscreenSide
+      ringSize = either (error . show) id (validateRingSize 4096)
+      steps target depth pipeline readback recorder =
+        claimRegion recorder (fromIntegral (ByteString.length depthRectVertices)) 4 >>= \case
+          Left refusal → pure (Left refusal)
+          Right claim →
+            writeClaim recorder claim 0 depthRectVertices >>= \case
+              Left refusal → pure (Left refusal)
+              Right () →
+                inOrder
+                  [ beginRenderingWithDepth recorder target ClearFromUndefined (ClearColor 0 0 1 1) (DepthPass depth ClearFromUndefined 0)
+                  , clearDepthRect recorder depthRectCleared 1
+                  , bindPipeline recorder pipeline
+                  , setViewport recorder (Viewport 0 0 (fromIntegral side) (fromIntegral side))
+                  , setScissor recorder (Rect 0 0 side side)
+                  , bindVertexBuffer recorder 0 (FromClaim claim 0)
+                  , pushConstants recorder [PushVertex] 0 depthRectTransform
+                  , draw recorder 6 1
+                  , endRendering recorder
+                  , transitionResource recorder target (FromUse ColorAttachment) TransferRead
+                  , copyTargetToReadback recorder target readback
+                  , transitionResource recorder target (FromUse TransferRead) ColorAttachment
+                  ]
+  constructDepthFormat construction >>= \case
+    Left refusal → pure (Left refusal)
+    Right format
+      | format /= Depth32Float → pure (Left (RefusedUnsupported ("a depth attachment of " <> tshow format <> ", when the case needs D32_SFLOAT")))
+      | otherwise →
+          constructRing construction ringSize >>= \case
+            Left refusal → pure (Left refusal)
+            Right () →
+              constructImage construction (ImageDescription ColorTarget Rgba8Srgb side side 1) >>= \case
+                Left refusal → pure (Left refusal)
+                Right target →
+                  constructImage construction (ImageDescription DepthTarget format side side 1) >>= \case
+                    Left refusal → pure (Left refusal)
+                    Right depth →
+                      constructPipelineLayoutFor construction scene3dShaders >>= \case
+                        Left refusal → pure (Left refusal)
+                        Right layout →
+                          constructDepthCheckedPipeline construction layout scene3dShaders (formatCode Rgba8Srgb) BlendNone (depthTested format) >>= \case
+                            Left refusal → pure (Left refusal)
+                            Right pipeline →
+                              constructReadback construction offscreenBytes >>= \case
+                                Left refusal → pure (Left refusal)
+                                Right readback →
+                                  constructFramelessBatch construction (steps target depth pipeline readback) <&> \case
+                                    Left refusal → Left refusal
+                                    Right (_, Left refusal) → Left refusal
+                                    Right (ticket, Right ()) → Right (readback, ticket)
 
 -- | The formats the case renders into.
 offscreenFormats ∷ [ImageFormat]
@@ -1788,6 +1949,49 @@ offscreenSpec outcome = describe "GRS-5 offscreen color targets in a surface-fre
 
   it "reached a verdict after the last callback with no issue and no error, synchronization validation included" $
     on outcome clean
+
+depthRectSection ∷ SurfaceFreeOutcome → [Text]
+depthRectSection outcome =
+  section "A surface-free session clearing a rectangle of a depth attachment inside a pass" outcome
+    <> case outcome of
+      SurfaceFreeRecorded facts →
+        concat
+          [ [ "- ticket " <> tshow (shotTicket shot) <> ", PNG at " <> Text.pack (shotPng shot)
+            , "  cleared rectangle (x, y, width, height): " <> tshow depthRectCleared
+            , "  probes: " <> Text.intercalate "; " [tshow point <> " " <> tshow bytes | (point, bytes) ← shotProbes shot]
+            ]
+          | shot ← factsShots facts
+          ]
+      SurfaceFreeFailed _ → []
+
+depthRectSpec ∷ SurfaceFreeOutcome → Spec
+depthRectSpec outcome = describe "R2D-17 clearing depth within a rectangle in a surface-free session" $ do
+  it "opened no window, created no surface and acquired no image" $
+    on outcome $ \facts → do
+      factsWindows facts `shouldBe` 0
+      callNames facts `shouldSatisfy` notElem "glfwCreateWindowSurface"
+      callNames facts `shouldSatisfy` notElem "vkAcquireNextImageKHR"
+      deviceFirst facts
+
+  it "cleared the rectangle with vkCmdClearAttachments and drew in one frame-less batch whose ticket completed, on the owner's thread" $
+    on outcome $ \facts → do
+      factsRunning facts `shouldSatisfy` ordered ["vkCreatePipelineLayout", "vkCreateGraphicsPipelines", "vkBeginCommandBuffer", "vkQueueSubmit2"]
+      map shotTicket (factsShots facts) `shouldBe` [Right TicketComplete]
+      ownerThread facts $ \owner → factsActionThreads facts `shouldBe` [owner, owner]
+
+  it "read back exact bytes: the quad's magenta exactly inside the rectangle and the pass's blue clear exactly outside it, on both sides of each edge" $
+    on outcome $ \facts →
+      [probes shot | shot ← factsShots facts] `shouldBe` [map snd depthRectProbes]
+
+  it "retired cleanly, the ring with every other managed resource before the device, with every Vulkan call on the owner's thread" $
+    on outcome $ \facts → do
+      callNames facts `shouldSatisfy` ordered ["vkDestroyDevice", "vkDestroyDebugUtilsMessengerEXT", "vkDestroyInstance"]
+      oneOwnerThread facts
+
+  it "reached a verdict after the last callback with no issue and no error, synchronization validation included" $
+    on outcome clean
+  where
+    probes = map snd . shotProbes
 
 drawingSection ∷ SurfaceFreeOutcome → [Text]
 drawingSection outcome =
