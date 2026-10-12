@@ -3248,11 +3248,16 @@ limit, what was asked for and what the device allows:
 
 - three bound sets, against `maxBoundDescriptorSets`;
 - two dynamic storage buffers across the layout, set 1's lookup buffer and
-  set 2's, against `maxDescriptorSetStorageBuffersDynamic` and its
-  update-after-bind counterpart, the fewer of the two;
+  set 2's, against `maxDescriptorSetStorageBuffersDynamic`;
 - two storage buffers visible to each stage, against
-  `maxPerStageDescriptorStorageBuffers` and its update-after-bind
-  counterpart.
+  `maxPerStageDescriptorStorageBuffers`.
+
+Both sets are ordinary descriptor-set layouts, so these are the ordinary
+limits; the update-after-bind counterparts are not read, since they may
+legally be zero on a device that does not support storage-buffer
+update-after-bind. A regression example (`Test.GPU.Vulkan.Native.Recording`)
+converts a device with the ordinary limits sufficient and the counterparts
+zero.
 
 **Layouts that hold it.** `createTablePipelineLayoutWith recording shaders
 options` (`constructTablePipelineLayoutWith`) is the options form of the table's
