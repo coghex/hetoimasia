@@ -1197,7 +1197,7 @@ allocation is made under ([Usages and memory types](#usages-and-memory-types)):
 | --- | --- | --- | --- |
 | `VertexBuffer` | vertex buffer, transfer destination | `UsageStaticGeometry` | static vertex data, staged |
 | `IndexBuffer` | index buffer, transfer destination | `UsageStaticGeometry` | static index data, staged |
-| `InstanceBuffer` | vertex buffer, index buffer | `UsageFrameRing` | per-frame instance data, or the shared ring (D-33), which the device reads directly |
+| `InstanceBuffer` | vertex buffer, index buffer, storage buffer | `UsageFrameRing` | per-frame instance data, or the shared ring (D-33), which the device reads directly, as vertex, index or instance data, or through the storage table's set 2 (R2D-15) |
 | `LookupBuffer` | storage buffer | `UsageFrameRing` | a per-frame lookup table (D-23, D-35) |
 | `StagingBuffer` | transfer source | `UsageStaging` | host-written bytes the device copies from |
 
@@ -1305,7 +1305,7 @@ onto the stages and accesses it covers and, for an image, a layout
 | `ColorTarget` | `ColorAttachment` | color attachment | color-attachment output | color-attachment read and write |
 | `VertexBuffer` | `GeometryRead` | — | vertex input | vertex attribute read |
 | `IndexBuffer` | `GeometryRead` | — | vertex input | index read |
-| `InstanceBuffer` | `InstanceRead` | — | vertex input, vertex and fragment shaders | vertex attribute, index and shader read |
+| `InstanceBuffer` | `InstanceRead` | — | vertex input, vertex and fragment shaders | vertex attribute, index and shader read (which includes shader storage reads, R2D-15) |
 | `LookupBuffer` | `StorageRead` | — | vertex and fragment shaders | shader storage read |
 | `StagingBuffer` | `TransferRead` | — | transfer | transfer read |
 
@@ -1886,14 +1886,22 @@ what is checked, and leaves bound data bound, as Vulkan does.
 size once: zero, negative and sizes no `VkDeviceSize` can hold are refused,
 never clamped. `createRing recording size` makes the session's one ring — a
 second is `RefusedMisuse DuplicateSubject` — as a buffer placed through the
-device's allocator under the instance buffer's usage, vertex and index reads in
-the frame ring's host-visible memory, mapped for its lifetime and charged as
-the allocator holds it (D-40). A size beyond the device's `maxBufferSize` is
-`RefusedOutOfBounds` before anything is made, and a block the byte budget cannot
-hold is `RefusedBackpressure`. The ring is a managed generation the recording
-owns: no handle to it is returned, and it is released with every other live
-generation when the recording retires. The window integration makes it with
-`constructRing` in an owner-thread action.
+device's allocator under the instance buffer's usage, vertex, index and storage
+reads in the frame ring's host-visible memory, mapped for its lifetime and
+charged as the allocator holds it (D-40). A size beyond the device's
+`maxBufferSize` is `RefusedOutOfBounds` before anything is made, and a block the
+byte budget cannot hold is `RefusedBackpressure`. The ring is a managed
+generation the recording owns: no handle to it is returned, and it is released
+with every other live generation when the recording retires. The window
+integration makes it with `constructRing` in an owner-thread action.
+
+The configured size is the ring's **claimable** size, `R`: claims are placed in,
+padded within and bounded by the first `R` bytes. A ring made with a
+storage-table window ([Per-batch storage tables](#per-batch-storage-tables),
+below) is `R + W` bytes long, the last `W` bytes a tail no claim uses.
+Allocation, mapping, the byte budget's accounting and the `maxBufferSize`
+check are of the whole `R + W`; the claim arena, `RingView`'s size and the
+reclamation rules stay `R`'s.
 
 **Claims.** While a batch records, frame or frame-less alike,
 `claimRegion recorder size alignment` claims a region of the ring for it, and
@@ -3038,7 +3046,9 @@ the sampler index, the slot index and the combined image `NonUniform`.
 - `constructTextureTable`, over the session's uploads; the host must
   configure `vulkanUploads`, or it is refused;
 - `constructTablePipelineLayout` and
-  `constructShaderSampledTablePipelineLayout`;
+  `constructShaderSampledTablePipelineLayout`, and, for set 2, the options
+  form `constructTablePipelineLayoutWith`
+  ([Per-batch storage tables](#per-batch-storage-tables));
 - `registerConstructedTexture` and `releaseConstructedTexture`;
 - `readConstructedTable`.
 
@@ -3180,6 +3190,204 @@ synchronization validation, reports nothing.
 | The version ring's buffer and mapping | The recording, as a managed lookup buffer | The owner writes a version into an entry no batch holds; the device reads the entry a batch bound | The graphics owner | Until `retireRecording` | Destroyed with every other managed resource |
 | Each ring entry's version generation | The recording | Batches retain it through the model's holds; `versionHeld` reads them | The graphics owner | Until `retireRecording` | Destroyed with every other managed resource |
 | The images the table holds | The recording (`tableTextures`) | Registration adds; reclamation removes and releases | The graphics owner | From registration until no live version maps the image's slot | Released then; destroyed once nothing holds it |
+| The storage table (R2D-15): set 2's layout, pool and set, and the ring's window | The recording (`recordingStorage`; the window in `recordingRing`) | `createRingWith` makes the ring and records its window; `createStorageTable` makes the table once; a batch's first bind retains its layout and pool, and its claims retain the ring | The graphics owner | Until `retireRecording` | Destroyed with every other managed resource |
+
+### Per-batch storage tables
+
+R2D-15 (#427) lets a batch bind a table it wrote to the shared ring
+([The ring](#drawing-from-buffers)) as a storage buffer, beside the texture
+table. It is the backend half of the render-2d design's per-batch tables (P-5,
+D-11, D-25 and D-30 of the [render-2d design](designs/render_2d_design.md)):
+clip rectangles and material records are written into regions the batch claims
+and bound for that batch. Clip and material semantics are not part of it. It
+is `hetoimasia-gpu-vulkan-native` alone: no `render-2d-vulkan` code uses set 2
+yet, and shaders still read instances from vertex input, not from storage.
+
+**Storage usage.** The ring's buffer kind, `InstanceBuffer`, gains the storage
+buffer usage beside its vertex and index usage. The ring's `InstanceRead` use
+is unchanged: it already covers shader reads in the vertex and fragment stages
+(`SHADER_READ`, which includes `SHADER_STORAGE_READ`), so binding the ring as
+a storage buffer records no use of its own, and the batch's first claim still
+enters it.
+
+**The window.** The application configures a **storage-table window** of `W`
+bytes. `validateStorageWindow` refuses zero, negative and unrepresentable
+values, never clamping (`StorageWindowRefused`), and `createRingWith recording
+size (Just window)` — `constructRingWith` in the window integration — checks it
+against the device and the ring. It is refused, with nothing made, when:
+
+- the window exceeds the device's `maxStorageBufferRange`
+  (`RefusedLimit "maxStorageBufferRange"`);
+- the window exceeds the ring's claimable size `R` (`RefusedOutOfBounds`);
+- the whole buffer, `R + W`, is a total no `VkDeviceSize` can hold, or exceeds
+  `maxBufferSize` (`RefusedOutOfBounds`).
+
+The last refuses a ring that is valid on its own once its tail is added. The
+buffer is `R + W` bytes so a window that starts at any claimable offset stays
+inside it; claims never consume the tail. `createRing` makes the ring with no
+window, as before, and `RingView` shows the window (`ringViewWindow`) beside
+the claimable size.
+
+**Set 2.** `createStorageTable recording` (`constructStorageTable`) makes, once
+per session, an engine-owned set layout with one dynamic storage buffer at
+binding 0, visible to the vertex and fragment stages, its pool, and its one
+set, whose descriptor covers the ring from offset 0 over `W` bytes. Each is a
+managed generation of its own, as the texture table's are; the first bind of a
+batch retains the layout and the pool, and the recording releases them with the
+other live generations when it retires. It needs the ring made with a window and
+not the texture table: it may be made before the table or after, but only a
+layout that also holds the table holds it. A second is `RefusedMisuse
+DuplicateSubject`; a session with no ring, or a ring made with no window, is
+`RefusedIllegal`. Before anything is made the device's limits for the layouts
+that hold it are checked, and each refusal is a `RefusedLimit` naming the
+limit, what was asked for and what the device allows:
+
+- three bound sets, against `maxBoundDescriptorSets`;
+- two dynamic storage buffers across the layout, set 1's lookup buffer and
+  set 2's, against `maxDescriptorSetStorageBuffersDynamic` and its
+  update-after-bind counterpart, the fewer of the two;
+- two storage buffers visible to each stage, against
+  `maxPerStageDescriptorStorageBuffers` and its update-after-bind
+  counterpart.
+
+**Layouts that hold it.** `createTablePipelineLayoutWith recording shaders
+options` (`constructTablePipelineLayoutWith`) is the options form of the table's
+layout constructors. `TableLayoutOptions` names the sampler mode — pushed at an
+offset (`TablePushedSampler`), as `createTablePipelineLayout` declares, or
+chosen by the shaders (`TableShaderSampler`), as
+`createShaderSampledTablePipelineLayout` does — and whether the layout holds set
+2. `createTablePipelineLayout` and `createShaderSampledTablePipelineLayout`, and
+their window-integration equivalents, keep their signatures and behaviour: each
+is the options form without set 2, and every existing layout is unchanged. A
+layout that holds set 2 declares it after the table's two sets, so its layouts
+are, from set 0 on, the texture table's, the lookup buffer's and the storage
+table's. It is refused before any native call, in this order: in a session with
+no texture table; in a session with no storage table; for whatever the shaders'
+checks and the sampler choice refuse; for the push ranges the device's limit
+refuses; and then for the limits across the **whole** layout, set 1 included,
+each a `RefusedLimit` naming the limit:
+
+- three bound sets (`maxBoundDescriptorSets`);
+- two dynamic storage buffers (`maxDescriptorSetStorageBuffersDynamic`);
+- two storage buffers visible to each stage
+  (`maxPerStageDescriptorStorageBuffers`);
+- the table's cap, its four samplers and its two buffers — the cap plus six
+  resources in one stage — against `maxPerStageUpdateAfterBindResources`.
+
+**The shader interface.** Checked shaders under a layout that holds set 2 may
+declare its binding, `storageTableDescriptors`: set 2's one storage buffer at
+binding 0, which either stage may read, beside the table's own bindings under
+the rules that hold already (set 0 in the fragment stage alone). Under any other
+layout declaring it is refused with no native call: a layout holding the table
+alone refuses it as a binding the table does not hold (`RefusedIncompatible`),
+and a layout holding no table as before (`RefusedUnsupported`). The reference
+pair is `storageTableShaders` (in `Recording.Shaders`), with interfaces
+`storageTableVertexInterface` and `storageTableFragmentInterface`: both stages
+declare set 2's binding, the vertex stage draws a rectangle from the table's
+first four floats with no vertex input, and the fragment stage shows its next
+four as the colour. The shader suite checks that their SPIR-V declares exactly
+that binding and matches the interfaces.
+
+**Claiming and binding.** `claimTable recorder size` is `claimRegion` with the
+device's `minStorageBufferOffsetAlignment`, so the region's start is a valid
+dynamic offset; every refusal of a claim is its. The table is written with
+`writeClaim` as any claim is. `bindStorageTable recorder claim offset` binds set
+2 under the bound pipeline's layout, through `vkCmdBindDescriptorSets` for set 2
+alone, with a dynamic offset equal to the claim's region start plus `offset`.
+Sets 0 and 1 and the texture table's version offset stay as they stand. Refused
+with no native call:
+
+- a session that has failed, or a closed recorder;
+- no pipeline bound, or a pipeline whose layout does not hold set 2;
+- a claim that is stale (`StaleIdentity`), another batch's (`WrongParent`) or
+  another session's (`ForeignIdentity`);
+- an `offset` past the claim's end (`RefusedOutOfBounds`);
+- the bytes from `offset` to the claim's end beyond the window, since the shader
+  could not see the whole table — oversized (`RefusedOutOfBounds`, naming those
+  bytes and the window);
+- a resulting offset that is not a multiple of `minStorageBufferOffsetAlignment`
+  (`RefusedIllegal`);
+- a resulting offset greater than `UINT32_MAX`, computed without overflow and
+  refused before it is narrowed (`storageDynamicOffset`, `RefusedOutOfBounds`).
+  The byte budget keeps every ring below 2^32 bytes, so no bind of a claim
+  reaches this bound; the stand-in examples test the arithmetic where it is
+  made.
+
+The window is a descriptor window, not ownership of every byte it exposes. A
+shader's reads must stay within the bound claim's unpadded suffix, from the bound
+offset to the end of the bytes the claim asked for, and never reach a
+neighbouring claim or the unused tail; the backend cannot see them. Binding and
+drawing respect the ring's `InstanceRead` use, which the bind reads it in and a
+draw checks it is still in.
+
+**Drawing.** A draw with a pipeline whose layout holds set 2 — `draw` and
+`drawIndexed` alike — is refused with no native call unless set 2 is bound under
+a compatible layout, besides the texture table's checks. Binding another
+pipeline disturbs the binding as it does the texture table's: set 2 stays bound
+only under a pipeline whose layout holds it, with the same push-constant ranges
+and the same kind of sampler choice; any other pipeline disturbs it, and the next
+draw needs it bound again. Binding the texture table leaves a compatibly bound
+set 2, and binding set 2 leaves the table, in either order; a pipeline that
+disturbs one disturbs the other under the rules above. The batch's first claim
+retains the ring, so the retention of its claims covers what set 2 reads; the
+batch's first bind retains the layout and the pool of set 2, and a later bind
+retains only the layout it binds them under.
+
+**The window integration.** An owner-thread action has `constructRingWith`,
+`constructStorageTable` and `constructTablePipelineLayoutWith`, beside
+`constructRing` and the table's constructors, which are unchanged. A renderer or
+a frame-less batch records `claimTable` and `bindStorageTable` as it records any
+command.
+
+**Proof.** The stand-in examples (`Test.GPU.Vulkan.Native.Table`, in
+`native-tests`) cover:
+
+- the window validated once, the ring made `R + W` bytes long under storage
+  usage with claims that never consume the tail, and a plain ring unchanged;
+- a window refused for the device's range and for the ring, and an
+  otherwise-valid `R` refused when `R + W` exceeds the device's buffer size or
+  no size can hold it, each before anything is allocated;
+- the instance-read use covering both shader stages' reads;
+- set 2's creation: its layout, pool and set, and a descriptor over the ring
+  from offset zero for the window; a second refused; a missing ring or window
+  refused; each limit refused first, naming it, with nothing made; and a failing
+  step releasing what it made;
+- the options-form layouts without set 2 equal to the original constructors,
+  and with it declaring the three set layouts in order;
+- a shader declaring set 2's binding admitted under a layout that holds it and
+  refused under every other, with no native call;
+- each limit across the whole layout refused naming it before a layout is
+  created, and the original layouts still made under the same limits;
+- binding at a dynamic offset, two tables in one batch each drawn, and every
+  refusal of a bind — no pipeline, a layout without set 2, a stale or another
+  batch's claim, past the claim, oversized, misaligned, a closed recorder and a
+  failed session — each with no native call, the claim's end and a table that is
+  exactly the window admitted;
+- the 32-bit arithmetic above and at the boundary;
+- a draw and an indexed draw refused before set 2 is bound;
+- set 2 kept through the table's bind in either order and through a compatible
+  pipeline switch, and disturbed by a pipeline without it and by one of the
+  other sampler kind over equal ranges;
+- retention: the ring held by the first claim, set 2's generations by the first
+  bind, and neither changed by a later claim and a rebind.
+
+A mutation check that never disturbed set 2 on a pipeline switch, one that
+ignored the sampler kind, one that skipped the draw check, one that dropped
+each of the oversized, misaligned and past-the-end refusals, one that skipped
+the whole-layout limits, one that made the ring `R` bytes and one that
+retained set 2 at no bind each failed an example.
+
+The surface-free native case `r2d15-storage-tables` makes a table, a ring with a
+256-byte window, the storage table, and a shader-sampled layout that also holds
+set 2 over `storageTableShaders`. One batch claims two regions for per-batch
+tables with `claimTable` — each a rectangle in clip space and a colour — writes
+them, binds the texture table, and draws twice in one batch, binding each table
+at its own dynamic offset before its draw. The fragment shader reads its colour
+from the bound table, with no selected sampler. The target is a 64-by-64 RGBA8
+linear one, so a colour reads back as its own bytes: the left half reads
+(200, 100, 50, 255), the first table's, and the right half (30, 220, 120, 255),
+the second's, exactly. Validation, with synchronization validation, reports
+nothing.
 
 ### Destruction
 
