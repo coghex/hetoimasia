@@ -4089,16 +4089,20 @@ window reattached) is notified and released for each. A *use* ends on
 evidence that the frame's commands can no longer read what the scene
 references: its recording was discarded — the frame was skipped, which resets
 the recorder before it discharges the batch; a target's teardown skips the
-frames still acquired, so it discards, once its reset has answered, a recording
-a renderer's exception left partial — or the submission that carried it
-completed. A frame abandoned after its submission, a presentation that was
+frames still acquired and unsubmitted, so it discards, once its reset has
+answered, a recording a renderer's exception left partial — or the submission
+that carried it completed. A submission's completion is read from the frames'
+own state — it is no longer outstanding there and the device has not been
+lost — so one recorded before a poll raised or was cancelled counts, and a
+submission is associated with its use in the same masked step that submits it. A frame abandoned after its submission, a presentation that was
 refused or enqueued nothing, a timeout, the target's retirement and the owner's
 retirement end nothing. A use whose discard or completion is not established —
 a recording that raised, a skip that was refused, a submission the device's
 loss let go of without completing — stays, and so does the revision it names:
 it remains awaiting release and is shown as such, and the revisions adopted
 after it for the same window wait behind it. After the device's loss nothing is
-completed and so nothing is released on its account; the recording's teardown
+completed and a skip resets nothing — it lets go of the unsubmitted recording
+under the loss rule — so no use ends and nothing is released on its account; the recording's teardown
 destroys the resources under the device-loss rules regardless. The adoption, the
 ledger's record, the hook and the watermark are one uninterruptible transition,
 and so are a release pass's removal of its records and its hooks: a cancellation
@@ -4151,7 +4155,8 @@ step's adoption satisfies runs in that same step.
 window's latest published revision (`windowPublished`, `Nothing` for a window
 the host no longer holds), its adopted watermark (`windowAdopted`, `Nothing`
 before any adoption — an unadopted initial scene is not an adopted revision 0)
-and the revisions awaiting release (`windowAwaitingRelease`), and the release
+and the revisions awaiting release (`windowAwaitingRelease`), how many times a target's adoption was deferred at
+its retention limit (`windowDeferrals`), and the release
 requests still queued, in the order made, with the revision each awaits of each
 window (`sceneRequests`). Below it, `readGraphicsSceneRevisions` reads the
 window revisions published into the handoff
