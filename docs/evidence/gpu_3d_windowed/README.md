@@ -19,7 +19,7 @@ and the probes; the backend's contract is
 | After PNG SHA-256 | `5fec13c16332f5f25da12da76b7f02c626f337d5f13a9b31e6b5e26e43541714` |
 | Probe record | [`scene3d-windowed-probes-macos.json`](scene3d-windowed-probes-macos.json), the case's own output |
 | Producer | `test.vulkan-native` (`--complete`, `grs13-window-depth` case), run locally with `HETOIMASIA_NATIVE_SESSION=desktop` and `HETOIMASIA_VALIDATION_EVIDENCE` set |
-| Revision run | `772e407122f20946af2ec2eec6b8ee50c3934c32`, the pull request's head when the run was made |
+| Revision run | `8b553fdb23af6782fd799d8ccd6d6b2ce8b80af4`, the pull request's head when the run was made (the captures and every probe value are byte-identical to the run at `772e4071`, before the review's lifecycle changes) |
 | Platform | macOS 26.7.1 (25G313), Apple M3 Max, arm64 |
 | Device and driver | Apple M3 Max; MoltenVK (`DRIVER_ID_MOLTENVK`), as the provisioned prefix pins it |
 | Loader and layers | The provisioned prefix's loader and `VK_LAYER_KHRONOS_validation`; implicit layers disabled, no layer settings file |
