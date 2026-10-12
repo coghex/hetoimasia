@@ -96,6 +96,18 @@
 --   index of 3 — and read back: the nearest instance reads its texel exactly,
 --   the linear one the blend within one step, and index 7 reads as sampler 3
 --   (render-2d D-4);
+-- * @r2d7-ordered-path@ — the same device start with no window, then the 2D
+--   renderer's recorder (R2D-7): ten fixtures — both zoom modes with pixel snap
+--   on and off, nearest, linear and default samplers mixed in one draw, a
+--   quarter-turn camera, tint, brightness and an additive instance,
+--   overlapping translucent instances in key and submission order, a UI layer
+--   at content scale 1 and 2, two views with separate viewports one of them
+--   fractional, two passes into an sRGB and a UNORM target, a depth-enabled
+--   layer of cutout-marked art drawn ordered, and the placeholder for an
+--   unknown index and a stale generation — rendered offscreen from render-2d
+--   snapshots, read back after completion, every pixel of every target judged
+--   against the render-2d oracle, and written as lossless PNGs and a probe
+--   record under the validation runner's evidence directory (#422);
 -- * @grs8-sprites@ — the same device start with no window, then the sprites
 --   sample's window-free evidence (GRS-8): its scene of indexed, instanced
 --   textured quads through texture handles with premultiplied-alpha blending,
@@ -446,6 +458,14 @@ scenarios =
       $ \consent journal _ → do
         outcome ← SurfaceFree.runShaderSamplers (consentBackend consent) journal
         pure (SurfaceFree.shaderSamplersSpec outcome, section "The R2D-16 shader-chosen samplers record" (SurfaceFree.shaderSamplersSection outcome))
+  , Scenario
+      "r2d7-ordered-path"
+      "records ten render-2d snapshots through the ordered path into offscreen targets of a surface-free session — zoom modes with pixel snap, mixed samplers, a quarter-turn camera, tint, brightness and additive output, overlap order, UI content scales, fractional views, sRGB and UNORM targets, cutout art drawn ordered and placeholder handles — reads each target back after completion, passes every determinate probe of the render-2d oracle with each named behaviour distinguished from its contrast, and writes lossless PNGs and a probe record, with validation reporting nothing"
+      False
+      Nothing
+      $ \consent journal _ → do
+        outcome ← SurfaceFree.runOrderedPath (consentBackend consent) journal
+        pure (SurfaceFree.orderedPathSpec outcome, section "The R2D-7 ordered path evidence record" (SurfaceFree.orderedPathSection outcome))
   , Scenario
       "grs8-sprites"
       "draws the sprites sample's scene of instanced textured quads through texture handles with premultiplied-alpha blending in a frame-less batch of a surface-free session, reads the target back after completion, passes every probe of the independent oracle and writes a lossless PNG and a probe record, with validation reporting nothing"

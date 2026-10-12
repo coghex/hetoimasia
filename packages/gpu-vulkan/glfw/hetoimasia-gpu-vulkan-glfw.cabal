@@ -167,6 +167,8 @@ test-suite vulkan-native-tests
         Test.GPU.Vulkan.Native.Interaction
         Test.GPU.Vulkan.Native.Naming
         Test.GPU.Vulkan.Native.Ordering
+        Test.GPU.Vulkan.Native.OrderedPath
+        Test.GPU.Vulkan.Native.OrderedPath.Fixtures
         Test.GPU.Vulkan.Native.Platform
         Test.GPU.Vulkan.Native.Private
         Test.GPU.Vulkan.Native.Recording
@@ -251,4 +253,16 @@ test-suite vulkan-native-tests
         -- The scene3d sample's drawing and window-free evidence (GRS-10),
         -- which the scene3d case runs over this suite's own session; it
         -- depends on the native backend and the math package alone.
-        hetoimasia-sample-scene3d ==0.1.0.0
+        hetoimasia-sample-scene3d ==0.1.0.0,
+        -- The 2D renderer's Vulkan recorder (R2D-7), which the ordered-path
+        -- case records snapshots through over this suite's own session, the
+        -- pure render-2d it records, the oracle that judges what it drew, the
+        -- decoded images the oracle samples, and the math package the
+        -- fixtures' transforms are built with. Only this suite depends on
+        -- them, never an engine library.
+        hetoimasia-asset ==0.1.0.0,
+        hetoimasia-math ==0.1.0.0,
+        hetoimasia-render-2d ==0.1.0.0,
+        hetoimasia-render-2d-oracle ==0.1.0.0,
+        hetoimasia-render-2d-vulkan ==0.1.0.0,
+        hetoimasia-render-api ==0.1.0.0

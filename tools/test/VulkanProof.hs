@@ -143,7 +143,7 @@ siblingSourcesAbsent =
   "the Vulkan packages' sources are checkout-only and absent here, as in an unpacked source \
   \distribution; this check runs from a checkout, which is where the workflow group runs it"
 
--- | The mains of the six suites the headless group runs.
+-- | The mains of the seven suites the headless group runs.
 headlessMains ∷ [FilePath]
 headlessMains =
   [ nativePackage </> "test/RootsMain.hs"
@@ -152,6 +152,7 @@ headlessMains =
   , "samples/triangle/renderer/test/Main.hs"
   , "samples/sprites/renderer/test/Main.hs"
   , "samples/scene3d/renderer/test/Main.hs"
+  , render2dVulkanPackage </> "test/Main.hs"
   ]
 
 -- | The three validation groups that run through the Vulkan project: the
@@ -173,6 +174,12 @@ nativePackage = "packages/gpu-vulkan/native"
 -- component, and the Vulkan project is the only one that may name it.
 integrationPackage ∷ String
 integrationPackage = "packages/gpu-vulkan/glfw"
+
+-- | The 2D renderer's Vulkan recorder (R2D-7). It depends on the native
+-- package, so it resolves the binding, and the Vulkan project is the only one
+-- that may name it.
+render2dVulkanPackage ∷ String
+render2dVulkanPackage = "packages/render-2d-vulkan"
 
 -- | The GLFW package. The ordinary projects list it with its Vulkan interop
 -- component switched off; the Vulkan project lists it with that component on.
@@ -199,16 +206,19 @@ samplePackages =
   ]
 
 -- | Everything the Vulkan project names: the native package, the window
--- integration package, the samples' packages, the GLFW package
--- whose interop component it enables, the local dependency closure of the
--- native package and that component, and the test-only support library the
--- native package's shader suite uses. All but the first eight are ordinary
--- packages the other projects list too, and with the interop flag off none of
--- them depends on the binding.
+-- integration package, the 2D renderer's Vulkan recorder, the samples'
+-- packages, the GLFW package whose interop component it enables, the local
+-- dependency closure of the native package and that component, the pure
+-- render-2d packages the recorder records and the integration's native suite
+-- judges it with, and the test-only support library the native package's
+-- shader suite uses. All but the first nine are ordinary packages the other
+-- projects list too, and with the interop flag off none of them depends on the
+-- binding.
 vulkanProject ∷ [String]
 vulkanProject =
   [ nativePackage
   , integrationPackage
+  , render2dVulkanPackage
   ]
     <> samplePackages
     <> [ glfwPackage
@@ -217,6 +227,11 @@ vulkanProject =
        , "packages/runtime"
        , "packages/foundation"
        , "packages/math"
+       , "packages/asset"
+       , "packages/asset-image"
+       , "packages/render-api"
+       , "packages/render-2d"
+       , "packages/render-2d-oracle"
        , "tools/test-support"
        ]
 
@@ -358,6 +373,7 @@ spec = describe "The Vulkan project boundary" $ do
                  , "hetoimasia-sample-triangle:test:triangle-tests"
                  , "hetoimasia-sample-sprites:test:sprites-tests"
                  , "hetoimasia-sample-scene3d:test:scene3d-tests"
+                 , "hetoimasia-render-2d-vulkan:test:render-2d-vulkan-tests"
                  ]
     -- And the runner's test mode starts no display: the only display it
     -- ever starts is the native mode's.
@@ -367,7 +383,7 @@ spec = describe "The Vulkan project boundary" $ do
     filter ("x11.sh" `isInfixOf`) testMode `shouldBe` []
 
   it "fails each headless suite on a selection that matches none of its examples" $ do
-    -- The group runs six suites under one command, so one of them passing
+    -- The group runs seven suites under one command, so one of them passing
     -- empty — every example filtered away by a selector or an ambient Hspec
     -- setting — would leave a passing receipt that asserted nothing for it.
     -- Each suite's main has to refuse an empty selection itself.

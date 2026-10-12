@@ -77,6 +77,7 @@ module Test.GPU.Vulkan.Native.SurfaceFree
   , runSwap
   , runScene3d
   , runDepthRect
+  , runOrderedPath
   , surfaceFreeSection
   , laterWindowSection
   , framelessSection
@@ -90,6 +91,7 @@ module Test.GPU.Vulkan.Native.SurfaceFree
   , swapSection
   , scene3dSection
   , depthRectSection
+  , orderedPathSection
   , surfaceFreeSpec
   , laterWindowSpec
   , framelessSpec
@@ -103,6 +105,7 @@ module Test.GPU.Vulkan.Native.SurfaceFree
   , swapSpec
   , scene3dSpec
   , depthRectSpec
+  , orderedPathSpec
   ) where
 
 import Control.Concurrent (ThreadId, myThreadId, threadDelay)
@@ -279,6 +282,7 @@ import Hetoimasia.Runtime.GLFW
 import Hetoimasia.Runtime.Logging (withLoggingLifetime)
 import Hetoimasia.Runtime.Supervision (RuntimeControl)
 import Test.GPU.Vulkan.Native.Environment (validationFeatures)
+import qualified Test.GPU.Vulkan.Native.OrderedPath as OrderedPath
 import Test.GPU.Vulkan.Native.Platform (requestingBackend)
 import Test.GPU.Vulkan.Native.Png (encodeRgba)
 import Test.Vulkan.Proof.Journal (Journal, heading, note)
@@ -314,6 +318,7 @@ data SurfaceFreeFacts = SurfaceFreeFacts
   , factsGrowth ∷ !(Maybe GrowthFacts)
   , factsSwap ∷ !(Maybe SwapEvidence)
   , factsScene3d ∷ !(Maybe Scene3dEvidence.Evidence)
+  , factsOrdered ∷ !(Maybe OrderedPath.Evidence)
   }
 
 data SurfaceFreeOutcome
@@ -335,6 +340,7 @@ data Seen = Seen
   , seenGrowth ∷ !(Maybe GrowthFacts)
   , seenSwap ∷ !(Maybe SwapEvidence)
   , seenScene3d ∷ !(Maybe Scene3dEvidence.Evidence)
+  , seenOrdered ∷ !(Maybe OrderedPath.Evidence)
   }
 
 -- | What the uploads case (GRS-6) found: each upload's ticket, waited for
@@ -372,7 +378,7 @@ runSurfaceFree backend journal = do
     windows ← length <$> atomically (hostWindowIdentities (vulkanWindowHost vulkan))
     roots ← atomically (readVulkanRoots (vulkanController vulkan))
     note journal ("the actions answered " <> Text.intercalate "; " answers)
-    pure (Seen threads answers windows (Just roots) Nothing [] [] Nothing Nothing Nothing Nothing Nothing Nothing)
+    pure (Seen threads answers windows (Just roots) Nothing [] [] Nothing Nothing Nothing Nothing Nothing Nothing Nothing)
 
 -- | The case that admits a window after the device exists.
 runLaterWindow ∷ Maybe Backend → Journal → IO SurfaceFreeOutcome
@@ -404,7 +410,7 @@ runLaterWindow backend journal = do
       pure (if any (`elem` retired) presented then FinishWith () else ContinueWith NoUpdateDemand)
     note journal "presented a frame to the later window and saw its presentation retire"
     roots ← atomically (readVulkanRoots (vulkanController vulkan))
-    pure (Seen [] [] 1 (Just roots) (Just standing) [] [] Nothing Nothing Nothing Nothing Nothing Nothing)
+    pure (Seen [] [] 1 (Just roots) (Just standing) [] [] Nothing Nothing Nothing Nothing Nothing Nothing Nothing)
   where
     quiet = recordingLogger (\_ → pure ())
 
@@ -429,7 +435,7 @@ runFrameless backend journal = do
     tickets ← mapM (\ticket → awaitTicket ticket deadline) [firstTicket, snd second]
     note journal ("the tickets answered " <> tshow tickets)
     roots ← atomically (readVulkanRoots (vulkanController vulkan))
-    pure (Seen [firstOn, fst second] ["recorded an initializing frame-less batch", "recorded a second frame-less batch"] 0 (Just roots) Nothing tickets [] Nothing Nothing Nothing Nothing Nothing Nothing)
+    pure (Seen [firstOn, fst second] ["recorded an initializing frame-less batch", "recorded a second frame-less batch"] 0 (Just roots) Nothing tickets [] Nothing Nothing Nothing Nothing Nothing Nothing Nothing)
   where
     deadline = either (error . show) id (durationFromNanoseconds AllowZero 10000000000)
 
@@ -462,7 +468,7 @@ runOffscreen backend journal = do
       | ((format, _, _), ticket, reading) ← zip3 batches tickets readings
       ]
     roots ← atomically (readVulkanRoots (vulkanController vulkan))
-    pure (Seen [renderedOn, readOn] ["rendered and copied both targets", "read both readbacks"] 0 (Just roots) Nothing tickets shots Nothing Nothing Nothing Nothing Nothing Nothing)
+    pure (Seen [renderedOn, readOn] ["rendered and copied both targets", "read both readbacks"] 0 (Just roots) Nothing tickets shots Nothing Nothing Nothing Nothing Nothing Nothing Nothing)
   where
     deadline = either (error . show) id (durationFromNanoseconds AllowZero 10000000000)
     pixelAt bytes (x, y) = ByteString.unpack (ByteString.take 4 (ByteString.drop ((y * offscreenSide + x) * 4) bytes))
@@ -491,7 +497,7 @@ runDrawing backend journal = do
     note journal ("the readback is at " <> Text.pack path)
     let shot = Shot Rgba8Srgb waited [(point, pixelAt bytes point) | point ← drawingProbes] path
     roots ← atomically (readVulkanRoots (vulkanController vulkan))
-    pure (Seen [drawnOn, readOn] ["drew the quad and copied the target", "read the readback"] 0 (Just roots) Nothing [waited] [shot] Nothing Nothing Nothing Nothing Nothing Nothing)
+    pure (Seen [drawnOn, readOn] ["drew the quad and copied the target", "read the readback"] 0 (Just roots) Nothing [waited] [shot] Nothing Nothing Nothing Nothing Nothing Nothing Nothing)
   where
     deadline = either (error . show) id (durationFromNanoseconds AllowZero 10000000000)
     pixelAt bytes (x, y) = ByteString.unpack (ByteString.take 4 (ByteString.drop ((y * offscreenSide + x) * 4) bytes))
@@ -565,6 +571,7 @@ runUploads backend journal = do
             [waited]
             [shot]
             (Just facts)
+            Nothing
             Nothing
             Nothing
             Nothing
@@ -826,7 +833,7 @@ runDepthRect backend journal = do
     note journal ("the readback is at " <> Text.pack path)
     let shot = Shot Rgba8Srgb waited [(point, pixelAt bytes point) | (point, _) ← depthRectProbes] path
     roots ← atomically (readVulkanRoots (vulkanController vulkan))
-    pure (Seen [drawnOn, readOn] ["cleared the depth rectangle, drew the quad and copied the target", "read the readback"] 0 (Just roots) Nothing [waited] [shot] Nothing Nothing Nothing Nothing Nothing Nothing)
+    pure (Seen [drawnOn, readOn] ["cleared the depth rectangle, drew the quad and copied the target", "read the readback"] 0 (Just roots) Nothing [waited] [shot] Nothing Nothing Nothing Nothing Nothing Nothing Nothing)
   where
     deadline = either (error . show) id (durationFromNanoseconds AllowZero 10000000000)
     pixelAt bytes (x, y) = ByteString.unpack (ByteString.take 4 (ByteString.drop ((y * offscreenSide + x) * 4) bytes))
@@ -1181,6 +1188,7 @@ runTable backend journal = do
             Nothing
             Nothing
             Nothing
+            Nothing
         )
   where
     deadline = either (error . show) id (durationFromNanoseconds AllowZero 30000000000)
@@ -1349,6 +1357,7 @@ runShaderSamplers backend journal = do
             Nothing
             Nothing
             Nothing
+            Nothing
         )
   where
     deadline = either (error . show) id (durationFromNanoseconds AllowZero 30000000000)
@@ -1477,7 +1486,7 @@ runSprites backend journal = do
       note journal ("sprites capture: " <> maybe "not written" Text.pack (evidencePng outcome) <> "; probe record: " <> Text.pack (evidenceRecord outcome))
       mapM_ (\failure → note journal ("sprites evidence failed: " <> failure)) (evidenceFailure outcome)
       roots ← atomically (readVulkanRoots (vulkanController vulkan))
-      pure (Seen [] ["ran the sprites evidence"] 0 (Just roots) Nothing [] [] Nothing Nothing (Just outcome) Nothing Nothing Nothing)
+      pure (Seen [] ["ran the sprites evidence"] 0 (Just roots) Nothing [] [] Nothing Nothing (Just outcome) Nothing Nothing Nothing Nothing)
   where
     spritesDirectory =
       lookupEnv "HETOIMASIA_VALIDATION_EVIDENCE" >>= \case
@@ -1511,7 +1520,7 @@ runSwap backend journal = do
       mapM_ (\facts → note journal ("swap facts: " <> tshow facts)) (swapFacts outcome)
       mapM_ (\failure → note journal ("swap evidence failed: " <> failure)) (swapFailure outcome)
       roots ← atomically (readVulkanRoots (vulkanController vulkan))
-      pure (Seen [] ["ran the swap evidence"] 0 (Just roots) Nothing [] [] Nothing Nothing Nothing Nothing (Just outcome) Nothing)
+      pure (Seen [] ["ran the swap evidence"] 0 (Just roots) Nothing [] [] Nothing Nothing Nothing Nothing (Just outcome) Nothing Nothing)
   where
     swapDirectory =
       lookupEnv "HETOIMASIA_VALIDATION_EVIDENCE" >>= \case
@@ -1540,7 +1549,7 @@ runScene3d backend journal = do
     note journal ("scene3d captures: " <> Text.intercalate ", " [Text.pack path | pose ← Scene3dEvidence.evidencePoses outcome, Just path ← [Scene3dEvidence.poseEvidencePng pose]] <> "; probe record: " <> Text.pack (Scene3dEvidence.evidenceRecord outcome))
     mapM_ (\failure → note journal ("scene3d evidence failed: " <> failure)) (Scene3dEvidence.evidenceFailure outcome)
     roots ← atomically (readVulkanRoots (vulkanController vulkan))
-    pure (Seen [] ["ran the scene3d evidence"] 0 (Just roots) Nothing [] [] Nothing Nothing Nothing Nothing Nothing (Just outcome))
+    pure (Seen [] ["ran the scene3d evidence"] 0 (Just roots) Nothing [] [] Nothing Nothing Nothing Nothing Nothing (Just outcome) Nothing)
   where
     scene3dDirectory =
       lookupEnv "HETOIMASIA_VALIDATION_EVIDENCE" >>= \case
@@ -1665,6 +1674,98 @@ spritesBuilders construction =
     , inspectTable = readConstructedTable construction
     }
 
+-- | The ordered path's case (R2D-7): the 2D renderer's recorder
+-- ("Hetoimasia.Render.TwoD.Vulkan") over this suite's surface-free session —
+-- ten fixtures rendered offscreen, every pixel of every target judged against
+-- the oracle ("Test.GPU.Vulkan.Native.OrderedPath") — with the files written
+-- under the validation runner's evidence directory when it names one, and
+-- otherwise into a directory of their own that is kept and reported.
+runOrderedPath ∷ Maybe Backend → Journal → IO SurfaceFreeOutcome
+runOrderedPath backend journal = do
+  heading journal "R2D-7: a surface-free session records render-2d snapshots through the ordered path into offscreen targets, reads each back after completion and judges every pixel against the render-2d oracle, and writes a lossless PNG a target and a probe record"
+  directory ← orderedDirectory
+  note journal ("the ordered path's evidence is written into " <> Text.pack directory)
+  runCaseWith
+    (\config → config {vulkanUploads = Just uploadConfig})
+    backend
+    defaultBudgetRequest {requestedBytes = 2 * 1024 * 1024 * 1024}
+    []
+    "vulkan-native-r2d7-ordered-path"
+    $ \vulkan _ _ _ → do
+      outcome ← OrderedPath.runEvidence (orderedHost vulkan) directory
+      note journal ("ordered path probe record: " <> Text.pack (OrderedPath.evidenceRecord outcome))
+      mapM_ (\failure → note journal ("ordered path evidence failed: " <> failure)) (OrderedPath.evidenceFailure outcome)
+      mapM_
+        ( \result → do
+            let probes = OrderedPath.resultProbes result
+                determinate = length [() | probed ← probes, OrderedPath.isDeterminate probed]
+            note journal
+              ( "ordered path fixture " <> OrderedPath.resultFixture result <> ": "
+                  <> tshow (length probes) <> " probes, " <> tshow determinate <> " determinate, "
+                  <> tshow (length probes - determinate) <> " not counted; "
+                  <> (if OrderedPath.fixturePassed result then "passed" else "FAILED" <> maybe "" (": " <>) (OrderedPath.resultFailure result))
+              )
+        )
+        (OrderedPath.evidenceFixtures outcome)
+      roots ← atomically (readVulkanRoots (vulkanController vulkan))
+      pure (Seen [] ["ran the ordered path's evidence"] 0 (Just roots) Nothing [] [] Nothing Nothing Nothing Nothing Nothing Nothing (Just outcome))
+  where
+    orderedDirectory =
+      lookupEnv "HETOIMASIA_VALIDATION_EVIDENCE" >>= \case
+        Just evidence | not (null evidence) → pure (evidence </> "ordered-path")
+        _ → do
+          temporary ← getTemporaryDirectory
+          stamp ← (round . (* 1000) . utcTimeToPOSIXSeconds ∷ UTCTime → Integer) <$> getCurrentTime
+          pure (temporary </> ("hetoimasia-ordered-path-" <> show stamp))
+
+-- | The ordered path's evidence host over this suite's session: owner-thread
+-- actions over its constructions, uploads admitted from the main thread and
+-- waited for, and batches waited for, each wait bounded by a deadline.
+orderedHost ∷ VulkanHost () → OrderedPath.Host
+orderedHost vulkan =
+  OrderedPath.Host
+    { OrderedPath.hostAct = \what body → acting what (VulkanAction body)
+    , OrderedPath.hostRecord = \what body →
+        acting
+          what
+          ( VulkanAction
+              ( \construction →
+                  body construction >>= \case
+                    Left refusal → pure (Left refusal)
+                    Right recording →
+                      constructFramelessBatch construction recording >>= \case
+                        Left refusal → pure (Left refusal)
+                        Right (_, Left refusal) → pure (Left refusal)
+                        Right (ticket, Right ()) → pure (Right ticket)
+              )
+          )
+    , OrderedPath.hostUpload = \request →
+        submitVulkanUpload vulkan request >>= \case
+          Left refusal → pure (Left (tshow refusal))
+          Right ticket →
+            awaitUploadTicket ticket deadline >>= \case
+              Right UploadComplete → pure (Right ())
+              other → pure (Left (tshow other))
+    , OrderedPath.hostAwait = \ticket →
+        awaitTicket ticket deadline >>= \case
+          Right TicketComplete → pure (Right ())
+          other → pure (Left (tshow other))
+    , OrderedPath.hostReadTable = acting "reading the texture table" (VulkanAction (fmap Right . readConstructedTable))
+    , OrderedPath.hostRead = \readback size → acting "reading a readback" (VulkanAction (\construction → readConstructedReadback construction readback 0 size))
+    }
+  where
+    deadline = either (error . show) id (durationFromNanoseconds AllowZero 30000000000)
+    acting ∷ Text → VulkanAction (Either Refusal a) → IO (Either Text a)
+    acting what action =
+      atomically (submitVulkanAction vulkan action) >>= \case
+        Left refusal → pure (Left (what <> " was refused: " <> tshow refusal))
+        Right ticket →
+          atomically (awaitVulkanAction ticket) >>= \case
+            ActionReturned (Right value) → pure (Right value)
+            ActionReturned (Left refusal) → pure (Left (what <> " was refused: " <> tshow refusal))
+            ActionRaised failure → pure (Left (what <> " raised: " <> tshow failure))
+            ActionRefused refusal → pure (Left (what <> " was refused before it ran: " <> tshow refusal))
+
 -- | What the growth case (GRS-14) found.
 data GrowthFacts = GrowthFacts
   { growthAllocated ∷ ![Word32]
@@ -1767,6 +1868,7 @@ runGrowth backend journal = do
             Nothing
             Nothing
             (Just facts)
+            Nothing
             Nothing
             Nothing
         )
@@ -1971,6 +2073,7 @@ runCaseWith adjust backend request windows label body = do
               , factsGrowth = seenGrowth seen
               , factsSwap = seenSwap seen
               , factsScene3d = seenScene3d seen
+              , factsOrdered = seenOrdered seen
               }
   where
     -- Every call's name, as it returns, where a transaction can wait for it.
@@ -2411,6 +2514,63 @@ spritesSpec outcome = describe "GRS-8 the sprites sample's window-free evidence"
         png ← maybe (pure False) doesFileExist (evidencePng evidence)
         record ← doesFileExist (evidenceRecord evidence)
         (png, record) `shouldBe` (True, True)
+
+  it "retired cleanly, with every Vulkan call on the owner's thread" $
+    on outcome $ \facts → do
+      callNames facts `shouldSatisfy` ordered ["vkDestroyDevice", "vkDestroyDebugUtilsMessengerEXT", "vkDestroyInstance"]
+      oneOwnerThread facts
+
+  it "reached a verdict after the last callback with no issue and no error, synchronization validation included" $
+    on outcome clean
+
+orderedPathSection ∷ SurfaceFreeOutcome → [Text]
+orderedPathSection outcome =
+  section "A surface-free session recording the ordered path's evidence fixtures" outcome
+    <> case outcome of
+      SurfaceFreeRecorded facts → case factsOrdered facts of
+        Nothing → ["- no ordered path evidence"]
+        Just evidence →
+          [ "- probe record: " <> Text.pack (OrderedPath.evidenceRecord evidence)
+          , "- failure: " <> fromMaybe "none" (OrderedPath.evidenceFailure evidence)
+          ]
+            <> concat
+              [ [ "- " <> OrderedPath.resultFixture result <> ": "
+                    <> (if OrderedPath.fixturePassed result then "pass" else "FAIL")
+                    <> ", " <> tshow (length (OrderedPath.resultProbes result)) <> " probes, "
+                    <> tshow (length [() | probed ← OrderedPath.resultProbes result, OrderedPath.isDeterminate probed]) <> " determinate"
+                ]
+                  <> [ "    - " <> (if OrderedPath.namedDistinguishes named && OrderedPath.verdictPasses (OrderedPath.namedVerdict named) then "pass " else "FAIL ") <> OrderedPath.namedName named
+                     | named ← OrderedPath.resultNamed result
+                     ]
+              | result ← OrderedPath.evidenceFixtures evidence
+              ]
+      SurfaceFreeFailed _ → []
+
+orderedPathSpec ∷ SurfaceFreeOutcome → Spec
+orderedPathSpec outcome = describe "R2D-7 the ordered path's window-free evidence" $ do
+  it "opened no window, created no surface and acquired no image" $
+    on outcome $ \facts → do
+      factsWindows facts `shouldBe` 0
+      callNames facts `shouldSatisfy` notElem "glfwCreateWindowSurface"
+      callNames facts `shouldSatisfy` notElem "vkAcquireNextImageKHR"
+      deviceFirst facts
+
+  it "rendered every fixture and read back every target once its batch had completed, every determinate probe within its tolerance and every named behaviour distinguished from its contrast" $
+    on outcome $ \facts → case factsOrdered facts of
+      Nothing → expectationFailure "no ordered path evidence"
+      Just evidence → do
+        OrderedPath.evidenceFailure evidence `shouldBe` Nothing
+        [OrderedPath.resultFixture result | result ← OrderedPath.evidenceFixtures evidence, not (OrderedPath.fixturePassed result)] `shouldBe` []
+        length (OrderedPath.evidenceFixtures evidence) `shouldSatisfy` (>= 10)
+        OrderedPath.evidencePassed evidence `shouldBe` True
+
+  it "wrote a lossless PNG for every target and the probe record where they are kept" $
+    on outcome $ \facts → case factsOrdered facts of
+      Nothing → expectationFailure "no ordered path evidence"
+      Just evidence → do
+        record ← doesFileExist (OrderedPath.evidenceRecord evidence)
+        pngs ← traverse (maybe (pure False) doesFileExist . OrderedPath.targetPng) [target | result ← OrderedPath.evidenceFixtures evidence, target ← OrderedPath.resultTargets result]
+        (record, and pngs, not (null pngs)) `shouldBe` (True, True, True)
 
   it "retired cleanly, with every Vulkan call on the owner's thread" $
     on outcome $ \facts → do
