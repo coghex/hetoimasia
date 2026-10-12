@@ -55,6 +55,12 @@ package hetoimasia-gpu-vulkan-native
 package hetoimasia-gpu-vulkan-glfw
   ghc-options: -Werror -j
 
+-- The 2D renderer's Vulkan recorder (R2D-7) is held to the same policy. Like
+-- the native and integration packages above, it is named only by
+-- `cabal.project.vulkan`.
+package hetoimasia-render-2d-vulkan
+  ghc-options: -Werror -j
+
 -- The scene3d sample (GRS-10) is held to the same policy. Like the native and
 -- integration packages above, it is named only by `cabal.project.vulkan`.
 package hetoimasia-sample-scene3d

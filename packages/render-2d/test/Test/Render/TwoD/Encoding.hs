@@ -16,10 +16,22 @@ import GHC.Float (castFloatToWord32)
 import Hetoimasia.Math.Affine2 (fromColumns, identity, toColumnMajor)
 import Hetoimasia.Math.Vector (V2 (..))
 import Hetoimasia.Render.Api.Texture.Backend (handleGeneration, handleIndex, textureHandle)
-import Hetoimasia.Render.TwoD.Encoding (encodeLayer, instanceStride)
+import Hetoimasia.Render.TwoD.DrawPlan
+  ( CutoutMarks
+  , DrawPlan (..)
+  , PlannedLayer
+  , PlannedPass (..)
+  , PlannedView (..)
+  , cutoutMarks
+  , drawingOrder
+  , noCutoutMarks
+  , planSnapshot
+  )
+import Hetoimasia.Render.TwoD.Encoding (encodeLayer, encodeLayerInDrawingOrder, instanceStride)
+import Hetoimasia.Render.TwoD.Settings (defaultViewSettings)
 import Hetoimasia.Render.TwoD.Snapshot
-import Hetoimasia.Render.TwoD.Validation (validLayers, validateSnapshot)
-import Test.Hspec (Spec, describe, it, shouldBe)
+import Hetoimasia.Render.TwoD.Validation (ValidLayer, validLayers, validateSnapshot)
+import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe)
 import Test.Hspec.QuickCheck (prop)
 import Test.QuickCheck (counterexample, forAll, listOf, property, resize)
 import Test.Render.TwoD.Support
@@ -29,6 +41,7 @@ spec = describe "Encoding" $ do
   layoutSpec
   lengthAndOrderSpec
   referenceSpec
+  drawingOrderSpec
 
 -- | An instance whose every field has a different, recognisable value.
 distinct ∷ Instance
@@ -252,3 +265,92 @@ littleEndian word = [fromIntegral ((word `shiftR` shift) .&. 0xFF) | shift ← [
 -- | A word from four bytes, least significant first.
 fromLE ∷ [Word8] → Word32
 fromLE bytes = sum [fromIntegral byte * 256 ^ position | (position, byte) ← zip [0 ∷ Int ..] bytes]
+
+-- | Every planned layer of a snapshot, planned with these marks, beside its
+-- validated layer, in snapshot order.
+plannedWith ∷ CutoutMarks → Snapshot → [(PlannedLayer, ValidLayer)]
+plannedWith marks snapshot = case validateSnapshot snapshot of
+  Left refused → error ("the snapshot was refused: " <> show refused)
+  Right valid →
+    zip
+      [ layer
+      | DrawPlan passes ← [planSnapshot marks valid]
+      , PlannedPass {plannedViews = views} ← passes
+      , PlannedView {plannedLayers = layers} ← views
+      , layer ← layers
+      ]
+      (validLayers valid)
+
+-- | The chunk of a submission-order buffer at this submission index.
+chunk ∷ Int → [Word8] → [Word8]
+chunk index = field (64 * index) 64
+
+drawingOrderSpec ∷ Spec
+drawingOrderSpec = describe "in drawing order" $ do
+  let keyed key = plain {instanceDepthKey = key, instanceTexture = textureHandle 1 key}
+      inOrder marks layer = case plannedWith marks (snapshotWithView (plainView [layer])) of
+        [(planned, valid)] → (drawingOrder planned, fmap ByteString.unpack (encodeLayerInDrawingOrder planned valid), ByteString.unpack (encodeLayer valid))
+        other → error ("expected one layer, found " <> show (length other))
+
+  it "writes the chunks of ascending depth key, then submission, as the plan orders them" $ do
+    let instances = [keyed 3, keyed 1, keyed 2, keyed 1]
+        (order, bytes, _) = inOrder noCutoutMarks (UiLayer instances)
+    order `shouldBe` [1, 3, 2, 0]
+    -- Each chunk is the independent reference encoding of the instance the
+    -- order names at that position, not a copy of the encoder under test.
+    bytes `shouldBe` Just (concatMap (referenceBytes . (instances !!)) [1, 3, 2, 0])
+
+  it "writes the chunks `encodeLayer` writes, permuted by the drawing order" $ do
+    let instances = [distinct, keyed 5, plain, keyed 2, distinct {instanceDepthKey = 1}]
+        (order, bytes, submission) = inOrder noCutoutMarks (UiLayer instances)
+    order `shouldBe` [2, 4, 3, 1, 0]
+    bytes `shouldBe` Just (concatMap (`chunk` submission) order)
+
+  it "writes the cutout instances first when a mark routes them there" $ do
+    let marked = textureHandle 7 1
+        instances = [keyed 0, plain {instanceTexture = marked, instanceDepthKey = 9}, keyed 4]
+        (order, bytes, submission) = inOrder (cutoutMarks [marked]) (WorldLayer DepthEnabled instances)
+    -- The cutout run comes before every ordered-path instance whatever its key.
+    order `shouldBe` [1, 0, 2]
+    bytes `shouldBe` Just (concatMap (`chunk` submission) order)
+
+  it "gives a run's instances as the contiguous range its start and count name" $ do
+    let marked = textureHandle 7 1
+        instances = [keyed 0, plain {instanceTexture = marked, instanceDepthKey = 9}, keyed 4, plain {instanceTexture = marked}]
+        snapshot = snapshotWithView (plainView [WorldLayer DepthEnabled instances])
+    case plannedWith (cutoutMarks [marked]) snapshot of
+      [(planned, valid)] → do
+        let submission = ByteString.unpack (encodeLayer valid)
+            bytes = maybe [] ByteString.unpack (encodeLayerInDrawingOrder planned valid)
+        -- The cutouts 1 and 3 form the first run, the ordered 0 and 2 the second.
+        drawingOrder planned `shouldBe` [1, 3, 0, 2]
+        field 0 128 bytes `shouldBe` chunk 1 submission <> chunk 3 submission
+        field 128 128 bytes `shouldBe` chunk 0 submission <> chunk 2 submission
+      other → error ("expected one layer, found " <> show (length other))
+
+  it "encodes a layer with no instances, and one in a zero-size viewport, to the empty buffer" $ do
+    let emptyViewport = View plainCamera (Viewport (V2 0 0) (V2 0 480)) defaultViewSettings [UiLayer [plain, distinct]]
+        zeroSize = [(planned, valid) | (planned, valid) ← plannedWith noCutoutMarks (snapshotWithView emptyViewport)]
+    inOrder noCutoutMarks (UiLayer []) `shouldBe` ([], Just [], [])
+    map (\(planned, valid) → (drawingOrder planned, encodeLayerInDrawingOrder planned valid)) zeroSize `shouldBe` [([], Just ByteString.empty)]
+
+  it "refuses a plan that names an instance the layer does not hold" $
+    case
+      ( plannedWith noCutoutMarks (snapshotWithView (plainView [UiLayer [plain, plain, plain]]))
+      , plannedWith noCutoutMarks (snapshotWithView (plainView [UiLayer [plain, plain]]))
+      ) of
+      ([(planned, _)], [(_, short)]) → encodeLayerInDrawingOrder planned short `shouldBe` Nothing
+      _ → expectationFailure "each snapshot has one layer"
+
+  it "gives the same bytes every time" $
+    case plannedWith noCutoutMarks (snapshotWithView (plainView [UiLayer [keyed 3, keyed 1, keyed 2]])) of
+      [(planned, valid)] → encodeLayerInDrawingOrder planned valid `shouldBe` encodeLayerInDrawingOrder planned valid
+      _ → expectationFailure "the snapshot has one layer"
+
+  prop "is, for every layer of a generated snapshot, the submission chunks permuted by its drawing order" $
+    forAll validSnapshotGen $ \snapshot →
+      and
+        [ fmap ByteString.unpack (encodeLayerInDrawingOrder planned valid)
+            == Just (concatMap (`chunk` ByteString.unpack (encodeLayer valid)) (drawingOrder planned))
+        | (planned, valid) ← plannedWith noCutoutMarks snapshot
+        ]

@@ -1,0 +1,97 @@
+cabal-version: 3.16
+name: hetoimasia-render-2d-vulkan
+version: 0.1.0.0
+synopsis: The 2D renderer's Vulkan recorder for the ordered path
+description:
+    R2D-7's recorder: a validated render-2d snapshot recorded into one batch
+    of the native backend, every pass in list order into an offscreen colour
+    target or the frame's image, every view under its own scissor, every layer
+    as one instanced draw per run of the ordered path, with premultiplied-alpha
+    blending. It owns the built-in shaders, checked against interface
+    descriptions in the package (GRS-16): a vertex stage that places each
+    instance's unit square through the instance and view transforms and snaps
+    its origin rigidly, and a fragment stage that samples the texture table
+    with the sampler the instance or the view's default chooses and wraps the
+    default material in tint, brightness and the additive flag (render-2d
+    D-4, D-5, D-9, D-24).
+    .
+    It depends on hetoimasia-render-2d, hetoimasia-render-api, hetoimasia-math
+    and the native backend alone, names nothing of the window integration, and
+    receives the constructions it needs from its host, so it holds no native
+    handle of its own and makes no Vulkan call outside the backend's
+    vocabulary. It is selected only by `cabal.project.vulkan`, so neither
+    `cabal.project` nor `cabal.project.cpu` resolves the binding, the Vulkan
+    headers or a loader, and only `tools/vulkan/run.sh` builds it.
+license: GPL-3.0-only
+license-file: LICENSE
+author: Vincent Coghlan
+maintainer: Vincent Coghlan
+category: Graphics
+build-type: Simple
+tested-with: GHC ==9.14.1
+extra-doc-files: README.md
+-- The shader toolchain fingerprint every splice here checks and registers,
+-- which `tools/vulkan/run.sh` generates at `shaders/toolchain.fingerprint`
+-- before every build and removes afterwards. Cabal decides whether to run GHC
+-- from the files a package lists, never from the ones a splice registers, so
+-- it is listed here; see packages/gpu-vulkan/native/README.md.
+extra-source-files:
+    **/*.fingerprint
+
+source-repository head
+    type: git
+    location: https://github.com/coghex/hetoimasia.git
+    subdir: packages/render-2d-vulkan
+
+common language
+    default-language: GHC2024
+    default-extensions: UnicodeSyntax OverloadedStrings
+    ghc-options: -Wall -Wcompat -Wincomplete-uni-patterns -Wincomplete-record-updates
+
+library
+    import: language
+    hs-source-dirs: src
+    exposed-modules:
+        Hetoimasia.Render.TwoD.Vulkan
+        Hetoimasia.Render.TwoD.Vulkan.Frame
+        Hetoimasia.Render.TwoD.Vulkan.Layout
+        Hetoimasia.Render.TwoD.Vulkan.ShaderInterfaces
+        Hetoimasia.Render.TwoD.Vulkan.Shaders
+    build-depends:
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        containers >=0.8 && <0.9,
+        hetoimasia-gpu-vulkan-native ==0.1.0.0,
+        hetoimasia-math ==0.1.0.0,
+        hetoimasia-render-2d ==0.1.0.0,
+        hetoimasia-render-api ==0.1.0.0
+
+-- The recorder's device-free contracts, registered with the group
+-- `test.vulkan-headless`: the scissor rule, the push-constant packing, the
+-- attribute descriptions, the sampler-choice mapping, the pure frame work, and
+-- refusals and recordings through a stand-in native layer. The suite links the
+-- loader only because the native backend does.
+test-suite render-2d-vulkan-tests
+    import: language
+    type: exitcode-stdio-1.0
+    ghc-options: -threaded -rtsopts
+    hs-source-dirs: test
+    main-is: Main.hs
+    other-modules:
+        Test.Render.TwoD.Vulkan.Layout
+        Test.Render.TwoD.Vulkan.Recording
+        Test.Render.TwoD.Vulkan.StandIn
+    build-depends:
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        containers >=0.8 && <0.9,
+        hspec >=2.11 && <3,
+        stm >=2.5.3 && <2.6,
+        text >=2.1 && <2.2,
+        hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-gpu-vulkan-model ==0.1.0.0,
+        hetoimasia-gpu-vulkan-native ==0.1.0.0,
+        hetoimasia-math ==0.1.0.0,
+        hetoimasia-render-2d ==0.1.0.0,
+        hetoimasia-render-2d-vulkan,
+        hetoimasia-render-api ==0.1.0.0
