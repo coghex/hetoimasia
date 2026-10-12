@@ -33,10 +33,11 @@ concrete precondition
 - [x] R2D-8. Show a decoded image in a window through published snapshots — [#424]
 - [x] R2D-17. Clear a depth attachment within a rectangle — [#425]
 - [x] R2D-9. Draw cutout sprites depth-tested in world layers — [#426]
-- [ ] R2D-10. Retain static instance content across frames
+- [x] R2D-10. Retain static instance content across frames — [#429]
 - [x] R2D-15. Bind per-batch storage tables from the ring — [#427]
 - [ ] R2D-11. Accept application materials as checked fragment functions
 - [x] R2D-12. Clip instances by index in the shader — [#428]
+- [ ] R2D-18. Animate instances by GPU frame selection
 - [ ] R2D-13. Sample an offscreen pass's target in later passes
 
 ## Epic contract
@@ -196,8 +197,8 @@ The decisions below govern. The owner accepted these proposals as written on
   and equal-key rule exact.
 - **P-4. The instance's flags word** holds the sampler choice (default,
   nearest, linear; 2 bits), the translucent override (1 bit), the additive
-  flag (1 bit, D-24) and the clip index (16 bits), with 12 bits reserved
-  (D-4, D-11).
+  flag (1 bit, D-24), the frame-table index (12 bits, 0 meaning not
+  animated, D-32) and the clip index (16 bits) (D-4, D-11).
 - **P-5. Per-batch tables** — clip rectangles (D-11) and material data
   (D-5) — are written to ring regions the batch claims (GRS D-33) and bound
   for that batch, through the storage tables R2D-15 adds (D-30).
@@ -641,6 +642,39 @@ reviewable:
   R2D-12 (P-5);
 - R2D-13 additionally owns read eligibility per pass (Q-10).
 
+### D-31. Retained content: device-local chunks with explicit release
+
+Owner decision 2026-10-12; resolves Q-2.
+
+- **Storage.** Device-local buffers, filled through the existing bounded
+  staging uploads (GRS-6, #342).
+- **Ownership.** An application-owned handle with explicit release, under
+  D-28's hold-and-release rules like a texture: published snapshots
+  reference it, the owner holds it on adoption, and a release takes effect
+  only after every window has moved past.
+- **Update.** Whole-chunk rebuilds only: build a new chunk, publish a
+  snapshot referencing it, release the old one. No range writes, which would
+  need synchronizing with frames still reading the buffer.
+- **Chunking.** The application chooses the chunks, for example one per map
+  region. Each chunk records its bounds in its layer's space, so a view
+  skips chunks wholly outside it, and each carries its own material data
+  records (D-25).
+
+### D-32. Animation by GPU frame selection
+
+Owner decision 2026-10-12; resolves Q-3.
+
+An animated instance names a frame table: a frame count, a frame duration
+and per-frame UV rectangles. The view pushes the current time and the shader
+selects the frame. It works identically for retained and dynamic content, so
+animation never forces a rebuild. The instance names its table by a 12-bit
+frame-table index in the flags word (P-4), 0 meaning not animated; where
+frame tables are stored is settled with the slice that delivers them
+(R2D-18).
+
+Rejected: rebuilding chunks to animate, which defeats retention for maps
+with animated tiles.
+
 ## Open questions
 
 ### Q-1. Integer zoom as a per-view setting
@@ -664,11 +698,15 @@ off-view vertex work, so retained content should be chunked so that views
 can skip chunks outside them. Retained content carries its own material
 records (D-25). Affects R2D-10. Resolves before R2D-10 is drafted.
 
+Resolved by D-31 (owner decision 2026-10-12).
+
 ### Q-3. Animated content inside retained buffers
 
 Animated tiles (water, torches) in retained content either force rebuilds or
 need GPU-side frame selection, for example a frame-table index in the
 parameter word and a time value pushed per draw. Affects R2D-10 and R2D-11.
+
+Resolved by D-32 (owner decision 2026-10-12): GPU-side frame selection.
 
 ### Q-4. Where a texture's cutout-safe mark is stored
 
@@ -956,16 +994,18 @@ Moved to the [asset design](asset_design.md) as AST-2 (D-15).
 - **Outcome:** static content is built once and drawn every frame without
   republishing.
 - **Scope:** building, referencing from layers, release on completion
-  evidence, merging with dynamic content.
+  evidence, merging with dynamic content, culling chunks by their bounds,
+  and chunks built for one layer kind (D-31).
 - **Phase:** 3
 - **Depends on:** R2D-9
 - **Ordering:** not on the critical path
-- **Relevant decisions:** D-1, D-2, D-25, D-27, D-28
+- **Relevant decisions:** D-1, D-2, D-25, D-27, D-28, D-31
 - **Acceptance signals:** readback over several frames with only dynamic
   content republished; a texture swap shows through retained content, and
   a swap that changes the mark is refused.
-- **Out of scope:** GPU animation, unless Q-3 decides otherwise.
-- **Open questions:** Q-2, Q-3
+- **Out of scope:** range writes into a chunk (D-31); material records in
+  chunks, which arrive with R2D-11; animation (R2D-18).
+- **Open questions:** None
 
 ### R2D-15. Bind per-batch storage tables from the ring
 
@@ -992,16 +1032,17 @@ Moved to the [asset design](asset_design.md) as AST-2 (D-15).
 - **Outcome:** adapters supply effects without engine changes.
 - **Scope:** material registration, cutout capability, generated cutout and
   translucent variants, per-draw push block, per-instance parameter word,
-  material data records holding full handles.
+  material data records holding full handles, including those retained
+  chunks carry (D-31).
 - **Phase:** 3
 - **Depends on:** R2D-9, R2D-15
 - **Ordering:** independent
-- **Relevant decisions:** D-4, D-5, D-25, D-26
+- **Relevant decisions:** D-4, D-5, D-25, D-26, D-31
 - **Acceptance signals:** a sample material using a second texture through
   a material record matches the oracle; a released and reused second
   texture samples the placeholder; a misdeclared material fails to compile.
 - **Out of scope:** live shader loading.
-- **Open questions:** Q-3
+- **Open questions:** None
 
 ### R2D-12. Clip instances by index in the shader
 
@@ -1015,6 +1056,27 @@ Moved to the [asset design](asset_design.md) as AST-2 (D-15).
 - **Acceptance signals:** readback matches the oracle for nested and rotated
   clips within one draw.
 - **Out of scope:** stencil-based clipping.
+- **Open questions:** None
+
+### R2D-18. Animate instances by GPU frame selection
+
+- **Outcome:** animated sprites and tiles change frame on the GPU without
+  republishing or rebuilding content.
+- **Scope:** the frame-table index in flags bits 4–15 (P-4); per-view frame
+  tables (frame count, frame duration, per-frame UV rectangles) written to
+  the batch's storage region (R2D-15); a per-view animation time carried by
+  the snapshot; shader frame selection `floor(time / duration) mod count`;
+  `render-2d-oracle` support; for retained and dynamic content alike
+  (D-32).
+- **Phase:** 3
+- **Depends on:** R2D-7, R2D-15, R2D-10
+- **Ordering:** not on the critical path
+- **Relevant decisions:** D-4, D-32
+- **Acceptance signals:** readback at several times matches the oracle for
+  an animated dynamic sprite and an animated retained tile, the chunk never
+  rebuilt; frame boundaries are exact, and an index beyond the view's tables
+  is refused.
+- **Out of scope:** easing or per-instance time offsets; Lua bindings.
 - **Open questions:** None
 
 ### R2D-13. Sample an offscreen pass's target in later passes
