@@ -37,7 +37,7 @@ concrete precondition
 - [x] R2D-15. Bind per-batch storage tables from the ring — [#427]
 - [x] R2D-11. Accept application materials as checked fragment functions — [#430]
 - [x] R2D-12. Clip instances by index in the shader — [#428]
-- [ ] R2D-18. Animate instances by GPU frame selection
+- [x] R2D-18. Animate instances by GPU frame selection — [#431]
 - [ ] R2D-13. Sample an offscreen pass's target in later passes
 
 ## Epic contract
