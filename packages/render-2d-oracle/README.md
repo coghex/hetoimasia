@@ -81,7 +81,9 @@ its origin lands on `snapPoint` of its mapped origin, `worldToTarget` or
   corner of which is beyond the finite `Float` range, since the recorder's 32-bit
   vertices could not carry it. Such a refusal applies to every probe whose centre
   is within the view's viewport. A singular quad is not that: it has no area, and
-  it is known to cover nothing.
+  its own transform shows it covers nothing, so it needs no mapping: a view whose
+  mapping cannot be built and whose instances are all singular draws nothing and
+  refuses nothing.
 
 ## Coverage
 
@@ -131,10 +133,19 @@ pixels, and `λ = log₂ ρmax`. The derivatives are taken exactly.
 - Any other minified probe on a texture with more than one level is
   indeterminate: not axis-aligned, or between two levels.
 
-`ε = 2⁻¹²`: how far a 32-bit quarter turn, or a scale of exactly one half, can be
-from itself. The same tolerance decides an axis: the off-axis derivatives are at
-most `ε` of the largest. Below it a neighbouring level's weight is under a
-thousandth of a channel step.
+`ε = 2⁻¹⁶`. A level of detail that close to a whole number is read as the whole
+level, and reading it so costs the neighbouring level's weight, at most `ε`, of
+the neighbouring texel. A tint is at most 1, a brightness is at most 3 and the
+sRGB encoding's slope never exceeds 12.92, so the error is at most
+`2⁻¹⁶ × 3 × 12.92 × 255 ≈ 0.15` of a channel step before the store rounds: it
+cannot move a stored byte by more than the tolerance of 1, nor move a carried
+byte at all. A level of detail farther than `ε` from a whole number is fractional
+and indeterminate, however close: a 1.9997-pixel quad over 4 texels (`λ ≈ 1.0002`)
+brightened three times on an sRGB target is the case that stores a different byte
+from the whole level. An axis is aligned when its off-axis derivatives are at most
+2⁻¹² of the largest, which is how far a 32-bit quarter turn can be from itself; a
+tilt that small changes a column's length by under 2⁻²⁴ of itself, so it moves
+the level of detail far less than `ε`.
 
 ## Colour
 
