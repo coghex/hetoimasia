@@ -21,7 +21,7 @@ concrete precondition
 ## Processing status
 
 - [x] EPIC. Establish an independent 2D renderer over the shared GPU services — [#413]
-- [ ] R2D-1. Create `render-api`'s texture handle and `render-2d`'s snapshot, settings and instance encoding
+- [x] R2D-1. Create `render-api`'s texture handle and `render-2d`'s snapshot, settings and instance encoding — [#414]
 - [ ] R2D-2. Map cameras and views between window, UI and world space
 - [ ] R2D-3. Build ordered draw runs from a snapshot
 - [ ] R2D-4. Compute expected pixels from a snapshot in `render-2d-oracle`
