@@ -198,6 +198,19 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , bindTable
   , selectSampler
 
+    -- * Per-batch storage tables (R2D-15)
+  , StorageWindow
+  , StorageWindowRefused (..)
+  , validateStorageWindow
+  , constructRingWith
+  , constructStorageTable
+  , constructTablePipelineLayoutWith
+  , TableLayoutOptions (..)
+  , TableUse (..)
+  , storageTableDescriptors
+  , claimTable
+  , bindStorageTable
+
     -- * Drawing from buffers with push constants (GRS-4)
   , constructPipelineLayoutWith
   , constructPipelineWith
@@ -348,6 +361,8 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , constructTextureTable
   , constructTablePipelineLayout
   , constructShaderSampledTablePipelineLayout
+  , constructTablePipelineLayoutWith
+  , constructStorageTable
   , registerConstructedTexture
   , swapConstructedTexture
   , releaseConstructedTexture
@@ -357,6 +372,7 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , constructPipelineLayoutWith
   , constructPipelineWith
   , constructRing
+  , constructRingWith
   , constructPipelineLayoutFor
   , constructCheckedPipeline
   , constructBlendedCheckedPipeline
@@ -426,6 +442,8 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , RingClaim
   , RingSize
   , RingSizeRefused (..)
+  , StorageWindow
+  , StorageWindowRefused (..)
   , VertexAttribute (..)
   , VertexBinding (..)
   , VertexFormat (..)
@@ -438,6 +456,7 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , noVertexInput
   , pushConstants
   , validateRingSize
+  , validateStorageWindow
   , writeClaim
   , Image
   , ImageDescription (..)
@@ -489,9 +508,14 @@ import Hetoimasia.GPU.Vulkan.Native.TextureTable
   , SwapTicket
   , SwapState (..)
   , readSwapTicket
+  , TableLayoutOptions (..)
+  , TableUse (..)
+  , bindStorageTable
   , bindTable
+  , claimTable
   , defaultVersionCount
   , selectSampler
+  , storageTableDescriptors
   , tableSamplerIndex
   , textureTableDescriptors
   , validateTableConfig

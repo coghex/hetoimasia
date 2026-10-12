@@ -356,14 +356,15 @@ pushConstantsUnsafe buffer layout stages offset bytes = do
   Unsafe.unsafeUseAsCStringLen bytes $ \(pointer, count) →
     mkCmdPushConstants entry (handle buffer) layout stages offset (fromIntegral count) (castPtr pointer)
 
--- | Bind descriptor sets for graphics, from set 0 on, with their dynamic
--- offsets in order (GRS-7), through arrays that live only for the call.
-bindDescriptorSetsUnsafe ∷ CommandBuffer → PipelineLayout → [Word64] → [Word32] → IO ()
-bindDescriptorSetsUnsafe buffer layout sets offsets = do
+-- | Bind descriptor sets for graphics, from this set number on, with their
+-- dynamic offsets in order (GRS-7; the storage table's set 2, R2D-15),
+-- through arrays that live only for the call.
+bindDescriptorSetsUnsafe ∷ CommandBuffer → PipelineLayout → Word32 → [Word64] → [Word32] → IO ()
+bindDescriptorSetsUnsafe buffer layout first sets offsets = do
   entry ← resolved "vkCmdBindDescriptorSets" (pVkCmdBindDescriptorSets (commands buffer))
   withArrayLen (map DescriptorSet sets) $ \setCount setPointer →
     withArrayLen offsets $ \offsetCount offsetPointer →
-      mkCmdBindDescriptorSets entry (handle buffer) PIPELINE_BIND_POINT_GRAPHICS layout 0 (fromIntegral setCount) setPointer (fromIntegral offsetCount) offsetPointer
+      mkCmdBindDescriptorSets entry (handle buffer) PIPELINE_BIND_POINT_GRAPHICS layout first (fromIntegral setCount) setPointer (fromIntegral offsetCount) offsetPointer
 
 -- | Bind one buffer, at one offset, to one vertex input binding.
 bindVertexBufferUnsafe ∷ CommandBuffer → Word32 → Buffer → Word64 → IO ()

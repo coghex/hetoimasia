@@ -85,6 +85,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   , tableSamplerBinding
   , tableTextureBinding
   , lookupBinding
+  , storageBinding
   , SetLayoutRequest (..)
   , PoolRequest (..)
   , DescriptorWrite (..)
@@ -219,6 +220,10 @@ data NativeCommand
   | CommandBindDescriptorSets !Word64 ![Word64] ![Word32]
     -- ^ The pipeline layout, the descriptor sets bound from set 0 on, and
     -- their dynamic offsets in order (GRS-7).
+  | CommandBindStorageSet !Word64 !Word64 !Word32
+    -- ^ The pipeline layout, the storage table's set, bound as set 2 alone
+    -- — leaving sets 0 and 1 as they stand — and its one dynamic offset
+    -- (R2D-15).
   deriving (Eq, Show)
 
 -- | The shaders of a graphics pipeline, as SPIR-V.
@@ -362,6 +367,15 @@ data RecordingLimits = RecordingLimits
     -- ^ @maxUpdateAfterBindDescriptorsInAllPools@: the most descriptors all
     -- update-after-bind pools together may hold — the texture table's set 0
     -- pool, its samplers and its initial images.
+  , limitDynamicStorageBuffers ∷ !Word32
+    -- ^ The fewer of @maxDescriptorSetStorageBuffersDynamic@ and
+    -- @maxDescriptorSetUpdateAfterBindStorageBuffersDynamic@: the most dynamic
+    -- storage buffers a pipeline layout may hold across its sets — set 1's
+    -- lookup buffer and set 2's storage table (R2D-15).
+  , limitStageStorageBuffers ∷ !Word32
+    -- ^ The fewer of @maxPerStageDescriptorStorageBuffers@ and
+    -- @maxPerStageDescriptorUpdateAfterBindStorageBuffers@: the most storage
+    -- buffers one shader stage of a pipeline layout may see.
   }
   deriving (Eq, Show)
 
@@ -487,7 +501,8 @@ data BufferKind
   | InstanceBuffer
     -- ^ Per-frame instance data, or the shared ring (D-33): host-visible
     -- memory the device reads directly, bound as vertex, index or instance
-    -- data.
+    -- data, and, through the storage table's set 2 (R2D-15), as a storage
+    -- buffer.
   | LookupBuffer
     -- ^ A per-frame lookup table (D-23, D-35): host-visible memory the device
     -- reads as a storage buffer.
@@ -501,7 +516,7 @@ bufferKindUse ∷ BufferKind → (Word32, MemoryUsage)
 bufferKindUse = \case
   VertexBuffer → (bufferVertex .|. bufferTransferDestination, UsageStaticGeometry)
   IndexBuffer → (bufferIndex .|. bufferTransferDestination, UsageStaticGeometry)
-  InstanceBuffer → (bufferVertex .|. bufferIndex, UsageFrameRing)
+  InstanceBuffer → (bufferStorage .|. bufferVertex .|. bufferIndex, UsageFrameRing)
   LookupBuffer → (bufferStorage, UsageFrameRing)
   StagingBuffer → (bufferTransferSource, UsageStaging)
   where
@@ -707,7 +722,8 @@ data ViewRequest = ViewRequest
 data RecordingOps dev cmd = RecordingOps
   { opsCreatePipelineLayout ∷ dev → [Word64] → [PushConstantRange] → IO Word64
     -- ^ A pipeline layout with these descriptor-set layouts, from set 0 on —
-    -- none, or the texture table's two (GRS-7) — and these push-constant
+    -- none, the texture table's two (GRS-7), or those and the storage
+    -- table's (R2D-15) — and these push-constant
     -- ranges, which the recording has already validated.
   , opsDestroyPipelineLayout ∷ dev → Word64 → IO ()
   , opsCreatePipeline ∷ dev → PipelineRequest → (ShaderStage → Word64 → IO ()) → IO Word64
@@ -791,6 +807,7 @@ nativeName = \case
   CommandCopyBufferToImage {} → "vkCmdCopyBufferToImage"
   CommandCopyImageLevelToBuffer {} → "vkCmdCopyImageToBuffer"
   CommandBindDescriptorSets {} → "vkCmdBindDescriptorSets"
+  CommandBindStorageSet {} → "vkCmdBindDescriptorSets"
 
 -- ---------------------------------------------------------------------------
 -- The texture table (GRS-7)
@@ -821,6 +838,11 @@ tableTextureBinding = 1
 lookupBinding ∷ Word32
 lookupBinding = 0
 
+-- | Set 2's one binding (R2D-15): the storage table's dynamic storage buffer
+-- over the ring.
+storageBinding ∷ Word32
+storageBinding = 0
+
 -- | One of the table's two descriptor-set layouts.
 data SetLayoutRequest
   = TextureSetLayout ![Word64] !Word32
@@ -832,6 +854,9 @@ data SetLayoutRequest
   | LookupSetLayout
     -- ^ Set 1: one dynamic storage buffer at 'lookupBinding', visible to the
     -- vertex and fragment stages.
+  | StorageSetLayout
+    -- ^ Set 2 (R2D-15): one dynamic storage buffer at 'storageBinding',
+    -- visible to the vertex and fragment stages, over the ring.
   deriving (Eq, Show)
 
 -- | A pool for one of the table's sets.
@@ -841,6 +866,8 @@ data PoolRequest
     -- sampled images.
   | LookupPool
     -- ^ One set of one dynamic storage buffer.
+  | StoragePool
+    -- ^ One set of one dynamic storage buffer: the storage table's (R2D-15).
   deriving (Eq, Show)
 
 -- | One descriptor update.
@@ -851,6 +878,9 @@ data DescriptorWrite
   | WriteLookupBuffer !Word64 !Word64 !Natural
     -- ^ Set 1's buffer: this buffer, from offset zero, over this range; each
     -- binding's dynamic offset selects a version within it.
+  | WriteStorageTable !Word64 !Word64 !Natural
+    -- ^ Set 2's buffer (R2D-15): this buffer, from offset zero, over this
+    -- window; each bind's dynamic offset places the window within it.
   | CopySampledImages !Word64 !Word64 ![(Word32, Word32)]
     -- ^ Copy set 0's array from the first set into the second, run by run —
     -- each run a first element and a count — at the same elements: a

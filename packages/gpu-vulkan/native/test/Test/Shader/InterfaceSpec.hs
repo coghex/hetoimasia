@@ -17,8 +17,8 @@ import System.Directory (createDirectoryIfMissing)
 import System.FilePath (takeDirectory, (</>))
 import Test.Hspec
 
-import Hetoimasia.GPU.Vulkan.Native.Recording.ShaderInterfaces (tableFragmentInterface, tableInstanceFragmentInterface, tableInstanceStride, tableInstanceVertexInterface, tableVertexInterface)
-import Hetoimasia.GPU.Vulkan.Native.Recording.Shaders (tableInstanceShaders, tableShaders)
+import Hetoimasia.GPU.Vulkan.Native.Recording.ShaderInterfaces (storageTableFragmentInterface, storageTableVertexInterface, tableFragmentInterface, tableInstanceFragmentInterface, tableInstanceStride, tableInstanceVertexInterface, tableVertexInterface)
+import Hetoimasia.GPU.Vulkan.Native.Recording.Shaders (storageTableShaders, tableInstanceShaders, tableShaders)
 import Hetoimasia.GPU.Vulkan.Native.Shader.Interface
 import Hetoimasia.GPU.Vulkan.Native.Shader.Reflect
 import Hetoimasia.GPU.Vulkan.Native.Shader.Toolchain (fingerprintPath)
@@ -201,6 +201,29 @@ spec = describe "Shader interfaces" $ do
       undecorated ← ByteString.readFile "test/fixtures/spirv/descriptors.frag.spv"
       nonUniformIndexing undecorated `shouldSatisfy` (not . null)
       nonUniformIndexing undecorated `shouldSatisfy` (not . and)
+
+    it "include the storage table's shaders (R2D-15): set 2's one storage buffer declared by both stages, and no push constant, vertex input or other binding" $ do
+      let CheckedShaders vertex fragment = storageTableShaders
+      checkedInterface vertex `shouldBe` storageTableVertexInterface
+      checkedInterface fragment `shouldBe` storageTableFragmentInterface
+      storageTableDescriptors `shouldBe` [DescriptorDeclaration 2 0 StorageBuffer (DescriptorCount 1)]
+      interfaceDescriptors storageTableVertexInterface `shouldBe` storageTableDescriptors
+      interfaceDescriptors storageTableFragmentInterface `shouldBe` storageTableDescriptors
+      interfacePushConstants storageTableVertexInterface `shouldBe` []
+      interfacePushConstants storageTableFragmentInterface `shouldBe` []
+      interfaceVertexInput storageTableVertexInterface `shouldBe` noVertexInput
+      -- Exactly set 2's binding, in each stage that reads it, and no input.
+      fmap reflectionDescriptors (reflect (checkedSpirv vertex)) `shouldBe` Right [ReflectedDescriptor 2 0 ReflectedStorageBuffer (ReflectedFixed 1)]
+      fmap reflectionDescriptors (reflect (checkedSpirv fragment)) `shouldBe` Right [ReflectedDescriptor 2 0 ReflectedStorageBuffer (ReflectedFixed 1)]
+      fmap reflectionInputs (reflect (checkedSpirv vertex)) `shouldBe` Right []
+      fmap (compareInterface storageTableVertexInterface) (reflect (checkedSpirv vertex)) `shouldBe` Right []
+      fmap (compareInterface storageTableFragmentInterface) (reflect (checkedSpirv fragment)) `shouldBe` Right []
+      -- A description that leaves the binding out, or declares it of another
+      -- kind, is a mismatch the build would refuse.
+      fmap (map renderMismatch . compareInterface (interfaceFor FragmentInterface)) (reflect (checkedSpirv fragment))
+        `shouldBe` Right ["descriptor set 2, binding 0 (StorageBuffer) is present in the shader but undeclared"]
+      fmap (compareInterface storageTableFragmentInterface {interfaceDescriptors = [DescriptorDeclaration 2 0 UniformBuffer (DescriptorCount 1)]}) (reflect (checkedSpirv fragment))
+        `shouldBe` Right [DescriptorKindMismatch 2 0 UniformBuffer ReflectedStorageBuffer]
 
     it "report a stage mismatch, in both directions, when a description is for the other stage" $ do
       fmap (compareInterface (interfaceFor VertexInterface)) (reflect verificationFragment) `shouldBe` Right [StageMismatch VertexInterface ReflectedFragment]

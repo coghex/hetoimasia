@@ -96,6 +96,13 @@
 --   index of 3 — and read back: the nearest instance reads its texel exactly,
 --   the linear one the blend within one step, and index 7 reads as sampler 3
 --   (render-2d D-4);
+-- * @r2d15-storage-tables@ — the same device start with no window, then the
+--   session's texture table, a ring made with a storage-table window, and a
+--   pipeline layout that also holds the storage table's set 2: two per-batch
+--   tables written into regions the batch claimed, each bound at its own
+--   dynamic offset before one of two draws in the batch, whose fragment shader
+--   reads its colour from the bound table, read back so that each draw shows
+--   its own table's colour exactly (render-2d D-30, P-5);
 -- * @grs8-sprites@ — the same device start with no window, then the sprites
 --   sample's window-free evidence (GRS-8): its scene of indexed, instanced
 --   textured quads through texture handles with premultiplied-alpha blending,
@@ -446,6 +453,14 @@ scenarios =
       $ \consent journal _ → do
         outcome ← SurfaceFree.runShaderSamplers (consentBackend consent) journal
         pure (SurfaceFree.shaderSamplersSpec outcome, section "The R2D-16 shader-chosen samplers record" (SurfaceFree.shaderSamplersSection outcome))
+  , Scenario
+      "r2d15-storage-tables"
+      "draws twice in one batch of a frame-less batch of a surface-free session, through a shader-sampled table layout that also holds set 2 and no selected sampler: two per-batch tables are written into regions of a ring made with a storage-table window, and each is bound at its own dynamic offset before its draw, whose fragment shader reads its colour from the bound table; reads the target back and checks that each draw shows its own table's colour exactly, with validation reporting nothing"
+      False
+      Nothing
+      $ \consent journal _ → do
+        outcome ← SurfaceFree.runStorageTables (consentBackend consent) journal
+        pure (SurfaceFree.storageTablesSpec outcome, section "The R2D-15 per-batch storage tables record" (SurfaceFree.storageTablesSection outcome))
   , Scenario
       "grs8-sprites"
       "draws the sprites sample's scene of instanced textured quads through texture handles with premultiplied-alpha blending in a frame-less batch of a surface-free session, reads the target back after completion, passes every probe of the independent oracle and writes a lossless PNG and a probe record, with validation reporting nothing"

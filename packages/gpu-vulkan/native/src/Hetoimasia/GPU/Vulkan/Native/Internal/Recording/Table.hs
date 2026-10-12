@@ -21,8 +21,10 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Table
   , swapTexture
   , releaseTexture
   , refreshTextureTable
+  , createStorageTable
   , createTablePipelineLayout
   , createShaderSampledTablePipelineLayout
+  , createTablePipelineLayoutWith
   , TableView (..)
   , readTable
   , RegistrationNotUndone (..)
@@ -48,7 +50,8 @@ import Hetoimasia.GPU.Model.Budget (BudgetKind (TextureSlotBudget))
 import Hetoimasia.GPU.Model.Identity (IdentityKind (..), Misuse (..), ResourceId)
 import qualified Hetoimasia.GPU.Model.TextureTable as Book
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Construction
-  ( checkedTableRanges
+  ( checkedStorageTableRanges
+  , checkedTableRanges
   , construct
   , constructOnce
   , undoing
@@ -80,8 +83,11 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , PipelineLayout (..)
   , Recording (..)
   , Refusal (..)
+  , RingState (..)
+  , StorageTableState (..)
   , SwapState (..)
   , SwapTicket (..)
+  , TableLayoutOptions (..)
   , TableState (..)
   , TableUse (..)
   , sessionHasFailed
@@ -619,15 +625,7 @@ refreshTextureTable recording = owned recording (refreshTable recording)
 -- refuse.
 createTablePipelineLayout ∷ Recording q inst msgr phys dev cmd → CheckedShaders → Word32 → IO (Either Refusal PipelineLayout)
 createTablePipelineLayout recording shaders samplerOffset =
-  tablePipelineLayout recording shaders $ \ranges →
-    if samplerOffset `mod` 4 /= 0 || not (any covers ranges)
-      then Left (RefusedIllegal "a sampler index outside every push-constant range the fragment stage sees")
-      else Right (TablePushedSampler samplerOffset)
-  where
-    covers range =
-      PushFragment `elem` rangeStages range
-        && rangeOffset range <= samplerOffset
-        && toInteger samplerOffset + 4 <= toInteger (rangeOffset range) + toInteger (rangeSize range)
+  createTablePipelineLayoutWith recording shaders (TableLayoutOptions (TablePushedSampler samplerOffset) False)
 
 -- | A pipeline layout holding the texture table whose shaders choose their
 -- samplers (render-2d D-4): the same set layouts and the same checks of the
@@ -639,34 +637,169 @@ createTablePipelineLayout recording shaders samplerOffset =
 -- before any native call: a session with no table, and whatever
 -- 'checkedTableRanges' and the push-range validation refuse.
 createShaderSampledTablePipelineLayout ∷ Recording q inst msgr phys dev cmd → CheckedShaders → IO (Either Refusal PipelineLayout)
-createShaderSampledTablePipelineLayout recording shaders = tablePipelineLayout recording shaders (const (Right TableShaderSampler))
+createShaderSampledTablePipelineLayout recording shaders =
+  createTablePipelineLayoutWith recording shaders (TableLayoutOptions TableShaderSampler False)
 
--- | The layout both constructors make: the table's checks, then the sampler
--- choice the caller validates against the ranges the shaders need.
-tablePipelineLayout
-  ∷ Recording q inst msgr phys dev cmd
-  → CheckedShaders
-  → ([PushConstantRange] → Either Refusal TableUse)
-  → IO (Either Refusal PipelineLayout)
-tablePipelineLayout recording shaders choose =
-  owned recording . checkpointed recording $
-    readTVarIO (recordingTable recording) >>= \case
-      Nothing → pure (Left (RefusedIllegal "a pipeline layout holding a texture table this session has not made"))
-      Just table → case checkedTableRanges shaders >>= \ranges → (,) ranges <$> choose ranges of
+-- | The options form of the table's layout constructors (R2D-15): how the
+-- layout's draws choose a sampler — pushed at an offset, as
+-- 'createTablePipelineLayout' declares, or by the shaders, as
+-- 'createShaderSampledTablePipelineLayout' — and whether it also holds the
+-- storage table's set 2. Without set 2 it is exactly the layout of those two
+-- constructors, which are this with that option off. With it, the layout
+-- declares set 2 after the table's two, the checked shaders may also declare
+-- its binding ('Hetoimasia.GPU.Vulkan.Native.Shader.Interface.storageTableDescriptors')
+-- and the draws through its pipelines need set 2 bound ('bindStorageTable');
+-- under any other layout, declaring that binding is refused.
+--
+-- Refused before any native call, in this order: a session with no table; a
+-- layout holding set 2 in a session with no storage table
+-- ('createStorageTable'); whatever the shaders' checks and the sampler choice
+-- refuse; the push-range validation; and, for a layout holding set 2, the
+-- device limits across the whole layout, each refusal a 'RefusedLimit' naming
+-- the limit — three bound sets, two dynamic storage buffers (set 1's and set
+-- 2's), two storage buffers visible to each stage, and the table's cap and
+-- its six other resources against the per-stage update-after-bind
+-- resources.
+createTablePipelineLayoutWith ∷ Recording q inst msgr phys dev cmd → CheckedShaders → TableLayoutOptions → IO (Either Refusal PipelineLayout)
+createTablePipelineLayoutWith recording shaders (TableLayoutOptions sampler storage) =
+  owned recording . checkpointed recording $ do
+    held ← readTVarIO (recordingTable recording)
+    held' ← readTVarIO (recordingStorage recording)
+    case (held, held') of
+      (Nothing, _) → pure (Left (RefusedIllegal "a pipeline layout holding a texture table this session has not made"))
+      (Just _, Nothing) | storage → pure (Left (RefusedIllegal "a pipeline layout holding a storage table this session has not made"))
+      (Just table, _) → case (if storage then checkedStorageTableRanges else checkedTableRanges) shaders >>= \ranges → (,) ranges <$> choose ranges of
         Left refusal → pure (Left refusal)
         Right (ranges, use) → do
           limits ← opsRecordingLimits (recordingOps recording)
           case validatePushRanges (limitPushConstantBytes limits) ranges of
             Left refusal → pure (Left refusal)
-            Right () →
-              fmap PipelineLayout
-                <$> construct
-                  recording
-                  0
-                  1
-                  "vkCreatePipelineLayout"
-                  (\layer device _ _ → Right . (\handle → NativeLayout handle ranges (Just use)) <$> opsCreatePipelineLayout layer device (tableSetLayoutHandles table) ranges)
-                  Nothing
+            Right ()
+              | storage
+              , Just refusal ← storageLayoutRefusal limits (tableEntries table) → pure (Left refusal)
+              | otherwise →
+                  fmap PipelineLayout
+                    <$> construct
+                      recording
+                      0
+                      1
+                      "vkCreatePipelineLayout"
+                      ( \layer device _ _ →
+                          Right
+                            . (\handle → NativeLayout handle ranges (Just use) storage)
+                            <$> opsCreatePipelineLayout layer device (tableSetLayoutHandles table <> maybe [] (pure . storageLayoutHandle) (if storage then held' else Nothing)) ranges
+                      )
+                      Nothing
+  where
+    -- The caller's sampler choice, validated against the ranges the shaders
+    -- need.
+    choose ranges = case sampler of
+      TableShaderSampler → Right TableShaderSampler
+      TablePushedSampler samplerOffset
+        | samplerOffset `mod` 4 /= 0 || not (any (covers samplerOffset) ranges) →
+            Left (RefusedIllegal "a sampler index outside every push-constant range the fragment stage sees")
+        | otherwise → Right (TablePushedSampler samplerOffset)
+    covers samplerOffset range =
+      PushFragment `elem` rangeStages range
+        && rangeOffset range <= samplerOffset
+        && toInteger samplerOffset + 4 <= toInteger (rangeOffset range) + toInteger (rangeSize range)
+
+-- | What a layout holding set 2 needs of the device beyond the texture
+-- table's own (R2D-15), across the whole layout: three bound sets, two
+-- dynamic storage buffers — set 1's and set 2's — two storage buffers
+-- visible to each stage, and the table's cap and its six other resources
+-- (four samplers and the two buffers) in one stage. The first the device
+-- cannot give is a 'RefusedLimit' naming it.
+storageLayoutRefusal ∷ RecordingLimits → Word32 → Maybe Refusal
+storageLayoutRefusal limits capacity =
+  case [refusal | (name, asked, limit) ← checks, asked > limit, let refusal = RefusedLimit name asked limit] of
+    refusal : _ → Just refusal
+    [] → Nothing
+  where
+    checks =
+      storageTableChecks limits
+        <> [("maxPerStageUpdateAfterBindResources", fromIntegral capacity + 6, fromIntegral (limitTableResources limits))]
+
+-- | The limits a storage table needs wherever it is held: the layout's three
+-- sets, its two dynamic storage buffers and the two it shows each stage.
+storageTableChecks ∷ RecordingLimits → [(Text, Natural, Natural)]
+storageTableChecks limits =
+  [ ("maxBoundDescriptorSets", 3, fromIntegral (limitBoundSets limits))
+  , ("maxDescriptorSetStorageBuffersDynamic", 2, fromIntegral (limitDynamicStorageBuffers limits))
+  , ("maxPerStageDescriptorStorageBuffers", 2, fromIntegral (limitStageStorageBuffers limits))
+  ]
+
+-- | Make the session's storage table (R2D-15; render-2d design D-30), once:
+-- an engine-owned set 2 — one dynamic storage buffer at binding 0, visible to
+-- the vertex and fragment stages — its pool, and the one set allocated from
+-- it, whose descriptor covers the ring at offset zero over the storage-table
+-- window the ring was made with ('createRingWith'). Each is a managed
+-- generation of its own, which a batch's first bind of the table retains and
+-- the recording releases with the others. It needs the ring, made with a
+-- window, and not the texture table: made before it or after, but only
+-- layouts that also hold the texture table hold it.
+--
+-- Before anything is made: a second table is 'RefusedMisuse' with
+-- 'DuplicateSubject'; a session with no ring, or one whose ring was made with
+-- no window, is 'RefusedIllegal'; and the device's limits for the layouts that
+-- hold it — three bound sets, two dynamic storage buffers and two storage
+-- buffers visible to each stage — are each a 'RefusedLimit' naming the limit.
+-- A construction that is refused or raises releases every generation already
+-- made. Refused, like all new work, once the session has failed.
+createStorageTable ∷ Recording q inst msgr phys dev cmd → IO (Either Refusal ())
+createStorageTable recording =
+  owned recording . checkpointed recording $ do
+    existing ← readTVarIO (recordingStorage recording)
+    ring ← readTVarIO (recordingRing recording)
+    limits ← opsRecordingLimits ops
+    case existing of
+      Just _ → pure (Left (RefusedMisuse (DuplicateSubject ResourceIdentity)))
+      Nothing → case ring of
+        Nothing → pure (Left (RefusedIllegal "a storage table in a session that has made no ring"))
+        Just RingState {ringWindow = Nothing} → pure (Left (RefusedIllegal "a storage table over a ring made with no storage-table window"))
+        Just held@RingState {ringWindow = Just window} → case [RefusedLimit name asked limit | (name, asked, limit) ← storageTableChecks limits, asked > limit] of
+          refusal : _ → pure (Left refusal)
+          -- Masked from the first creation to the table's publication, as the
+          -- texture table's is: a cancellation can arrive only at an
+          -- interruptible point inside a step, which the unwinding then sees
+          -- every generation made before.
+          [] → mask_ $ do
+            made ← newIORef []
+            let step action =
+                  action >>= \case
+                    Left refusal → throwIO (Abandon refusal)
+                    Right resource → resource <$ modifyIORef' made (resource :)
+            outcome ← try @Abandon (build held window step) `onException` unwind made
+            case outcome of
+              Right state → Right () <$ atomically (writeTVar (recordingStorage recording) (Just state))
+              Left (Abandon refusal) → unwind made >> pure (Left refusal)
+  where
+    ops = recordingOps recording
+    build held window step = do
+      layout ← step (construct recording 0 1 "vkCreateDescriptorSetLayout" (\layer device _ _ → Right . NativeSetLayout 2 <$> opsCreateSetLayout layer device StorageSetLayout) Nothing)
+      pool ← step (construct recording 0 1 "vkCreateDescriptorPool" (\layer device _ _ → Right . NativeDescriptorPool 2 <$> opsCreateDescriptorPool layer device StoragePool) Nothing)
+      layoutHandle ← handleOf layout
+      poolHandle ← handleOf pool
+      device ←
+        atomically (readRootsDevice (recordingRoots recording)) >>= \case
+          Nothing → throwIO (Abandon RefusedDeviceAbsent)
+          Just (_, handle) → pure handle
+      set ← rootsCall (recordingRoots recording) "vkAllocateDescriptorSets" (opsAllocateSet ops device poolHandle layoutHandle Nothing)
+      readRootsInstrumentation (recordingRoots recording) >>= \case
+        Nothing → pure ()
+        Just (_, instrumentation) → nameRootsObject (recordingRoots recording) instrumentation ObjectDescriptorSet set (tableSetName pool 2)
+      rootsCall (recordingRoots recording) "vkUpdateDescriptorSets" $
+        opsWriteDescriptors ops device [WriteStorageTable set (allocationBuffer (ringMapping held)) window]
+      pure (StorageTableState [layout, pool] layoutHandle set window)
+    handleOf resource =
+      liveNative recording resource >>= \case
+        Left refusal → throwIO (Abandon refusal)
+        Right (NativeSetLayout _ handle) → pure handle
+        Right (NativeDescriptorPool _ handle) → pure handle
+        Right _ → throwIO (Abandon RefusedWrongKind)
+    unwind made = do
+      resources ← readIORef made
+      for_ resources (\resource → releaseManaged recording (Made resource))
 
 -- | The texture table as an observer sees it.
 data TableView = TableView

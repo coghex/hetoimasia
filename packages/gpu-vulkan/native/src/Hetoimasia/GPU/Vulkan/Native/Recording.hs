@@ -220,6 +220,12 @@
 -- than the ring is refused for good. A claim's number is never reissued, so a
 -- claim whose region was reclaimed is refused, not mistaken for the new one.
 --
+-- The ring is also a storage buffer (R2D-15): 'createRingWith' makes it with a
+-- storage-table window, validated once ('validateStorageWindow'), as a tail of
+-- that many bytes no claim uses, and the storage table's set 2
+-- ("Hetoimasia.GPU.Vulkan.Native.TextureTable") lets a draw read a table the
+-- batch wrote ('claimTable') at a dynamic offset.
+--
 -- = Ordering
 --
 -- 'transitionResource' (GRS-3) moves a managed buffer or image between the
@@ -313,6 +319,7 @@ module Hetoimasia.GPU.Vulkan.Native.Recording
   , tableSamplerBinding
   , tableTextureBinding
   , lookupBinding
+  , storageBinding
   , SetLayoutRequest (..)
   , PoolRequest (..)
   , DescriptorWrite (..)
@@ -445,7 +452,12 @@ module Hetoimasia.GPU.Vulkan.Native.Recording
   , ringSizeBytes
   , RingSizeRefused (..)
   , validateRingSize
+  , StorageWindow
+  , storageWindowBytes
+  , StorageWindowRefused (..)
+  , validateStorageWindow
   , createRing
+  , createRingWith
   , RingClaim
   , claimSize
   , claimRegion
@@ -508,6 +520,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Construction
   , selectDepthFormat
   , createReadback
   , createRing
+  , createRingWith
   , checkedRanges
   , createPipelineLayoutFor
   , createCheckedPipeline
@@ -527,6 +540,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   , SetLayoutRequest (..)
   , TableSampler (..)
   , lookupBinding
+  , storageBinding
   , tableSamplerBinding
   , tableSamplerIndex
   , tableTextureBinding
@@ -649,12 +663,16 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , RingSize
   , RingSizeRefused (..)
   , RingView (..)
+  , StorageWindow
+  , StorageWindowRefused (..)
   , TicketState (..)
   , awaitTicket
   , claimSize
   , readRing
   , ringSizeBytes
+  , storageWindowBytes
   , validateRingSize
+  , validateStorageWindow
   , readTicket
   , readBatch
   , readBatches
