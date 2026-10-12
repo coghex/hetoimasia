@@ -606,9 +606,9 @@ A recorded batch holds the generation it records into as a recorded reference
   retained.
 - Device loss raised by any generation call is latched as the roots' is.
 - A host that asked for windowed depth (GRS-13) has every generation also own a
-  depth image, made last in its construction, released when its CPU use ends and
-  destroyed once the batches that recorded it have completed; one that cannot be
-  made fails the construction ([Windowed depth](#windowed-depth)).
+  depth image, made last in its construction, released when the generation is
+  destroyed and destroyed once the batches that recorded it have completed; one
+  that cannot be made fails the construction ([Windowed depth](#windowed-depth)).
 - Close wins: a closed target begins no construction and admits no recovery
   attempt, and a construction completed after the close is retired rather than
   published. A target's retirement retires its active generation, destroys every
@@ -1691,11 +1691,14 @@ clearing pass initializes it.
 
 **Following the generation.** A resize or a replacement builds a new
 generation, which gets a depth image of its own, of its new extent; the old
-generation's is released when the generation's CPU use ends — the moment it is
-replaced or retired by a lost surface or a close, or its construction failed, as
-soon as no consumer holds a use of it — so nothing can begin a pass with it
-again, and the model destroys it only once every batch that recorded it has
-completed, never earlier; one no batch recorded is destroyed at once. Two
+generation's is released when the generation is destroyed — whether it was
+replaced, retired by a lost surface or a close, or its construction failed — and
+that happens only once every hold on the generation has ended, its outstanding
+presentations included, which is the evidence that retires it, and after its
+swapchain and views; so nothing can begin a pass with the image again, and the
+model destroys it only once every batch that recorded it has completed, never
+before the generation itself could retire. A generation kept uncertain keeps its
+image too. Two
 generations that overlap, a replacement still building beside the active one or
 a retired one whose frames are in flight, each have an image of their own with
 their own extent. A lost surface (VK-14) retires its generation, and the depth
@@ -1720,7 +1723,11 @@ that could not be made — which destroys the image it made — or a naming call
 raised fails it the same way, and everything charged is given back. A
 construction that fails after its depth image was made — the target closed
 meanwhile, so the model refuses to publish it — releases the image with the
-candidate. Nothing of this leaves a generation without the depth it was
+candidate once that is destroyed. A cancellation that interrupts the image's or
+its view's creation inside the call leaves unknown whether it made anything, as
+one inside a swapchain's creation does: the candidate is kept uncertain with
+everything it made, the session fails with `CleanupFailed`, and teardown neither
+destroys nor retries it. Nothing of this leaves a generation without the depth it was
 configured for, or an image owned by no generation.
 
 **State.**
@@ -1728,7 +1735,7 @@ configured for, or an image owned by no generation.
 | State | Owner | Readers and writers | Thread | Lifetime | Reset or disposal |
 | --- | --- | --- | --- | --- | --- |
 | Whether generations carry a depth image, and what makes it | The generations (`Generations.State`) | The controller asks (`requireWindowDepth`) when it makes them; the recording supplies (`supplyRecordingWindowDepth`) when it is made; `Reconciliation` reads it before a construction and when it makes the image | Any, in `STM` | The session | Never reset; absent until asked for |
-| A generation's depth image | The generation's record (`genDepth`), over a managed image of the recording's | `Reconciliation` makes it and records it; `Observation` reads it (`viewDepth`); the generation's CPU use ending releases it | The owner | From its construction until the model records its disposal | Released with the generation, destroyed once every batch that recorded it has completed; kept, explicitly uncertain, if its destruction raised, as any managed image is |
+| A generation's depth image | The generation's record (`genDepth`), over a managed image of the recording's | `Reconciliation` makes it and records it; `Observation` reads it (`viewDepth`); `Disposal` releases it when it destroys the generation | The owner | From its construction until the model records its disposal | Released with the generation, destroyed once every batch that recorded it has completed; kept, explicitly uncertain, if its destruction raised, as any managed image is |
 | The depth images generations own | The recording (`recordingWindowDepths`) | Its construction adds each; `releaseManaged` reads to refuse a release; the recording's disposal removes it with the image | The owner | As the image's managed record | Forgotten with its disposal |
 
 **Proof.** The stand-in suite (`Test.GPU.Vulkan.Native.WindowDepth`) drives the
@@ -1738,12 +1745,14 @@ the generation, and none made, asked about or charged when the session did not
 ask; no generation built before the recording supplies the depth, and one built
 after; every target's generation and every frame of one generation sharing its
 image; a replacement's image of its new extent beside the old, which is
-released only when its generation's CPU use ends and destroyed only once the
-batch that recorded it has completed, and at once when none did; a lost
+released only when its generation is destroyed — which a held use of it, or a
+presentation of it whose fence has not been signalled, withholds — and
+destroyed only once the batch that recorded it has completed; a lost
 surface's, an out-of-date generation's, a close's and the device's loss's
 handling; construction failures — no depth format, a view that could not be
 made, an out-of-memory result recovered once and one not recovered, a target
-closed after the image was made — each leaving no active generation or leaked
+closed after the image was made, a cancellation inside the image's creation —
+each leaving no active generation or leaked
 image and nothing charged; and the frame's pass: its commands and barriers, the
 frames in flight sharing the image with consecutive clearing passes, the
 initialization published only by submission and never by an abandoned or refused
@@ -4710,7 +4719,7 @@ VK-18's D-33 order and releases nothing early.
 | Unavailability reports | The controller | Written by the owner's step; any thread reads | Owner | The most recent 64 | Oldest dropped |
 | Generation records | The generations' `Internal.Generations.State`, which defines them | `Reconciliation` builds and replaces, `Retirement` retires the active one, and `Disposal` destroys and removes, on the owner's step; any thread holds and ends a CPU use through `Uses`, in `STM` | The owner (uses: any) | From the construction that begins one until its destruction returned | Kept, explicitly uncertain, when a destruction raised; never retried |
 | Whether generations carry a depth image (GRS-13) | The generations' `Internal.Generations.State`, which defines it | The controller asks when it makes them; the recording supplies what makes the images when it is made; `Reconciliation` reads it | Any, in `STM` | The session | Never reset |
-| A generation's depth image (GRS-13) | The generation's record, over a managed image of the recording's | `Reconciliation` makes and records it; `Observation` reads it; the generation's CPU use ending releases it | The owner | From its construction until the model records its disposal | Released with the generation, destroyed once every batch that recorded it has completed |
+| A generation's depth image (GRS-13) | The generation's record, over a managed image of the recording's | `Reconciliation` makes and records it; `Observation` reads it; `Disposal` releases it when it destroys the generation | The owner | From its construction until the model records its disposal | Released with the generation, destroyed once every batch that recorded it has completed |
 | Swapchain results | The generations' `Internal.Generations.State`, which defines them | The owner reports through `Uses`; `Reconciliation` consumes on its step | The owner | Until the active generation is replaced | Cleared by the publication that replaces it, or by the surface's loss |
 | A target's lost surface and outstanding attempt | The generations' `Internal.Generations.State`, which defines them | `Reconciliation` marks the loss; `Surface` releases, asks and installs; `Retirement` settles an attempt still outstanding | The owner | From the loss until a replacement is installed, or the target retires | Cleared by the installation, or by retirement |
 | Rendering: the recording and the frames | The controller's rendering | Made by the first frame attempted, or the first owner-thread action run, once the device exists; read by every step and retirement | The owner | From then until whole-owner retirement | Retired before the device is destroyed |
