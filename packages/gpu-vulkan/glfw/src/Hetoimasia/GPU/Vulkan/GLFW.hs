@@ -139,6 +139,7 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , defaultDepthClear
   , beginRenderingWithDepth
   , beginFrameRenderingWithDepth
+  , clearDepthRect
   , CompareOp (..)
   , PipelineDepth (..)
   , depthTested
@@ -171,6 +172,7 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , defaultVersionCount
   , constructTextureTable
   , constructTablePipelineLayout
+  , constructShaderSampledTablePipelineLayout
   , textureTableDescriptors
   , TextureHandle (..)
   , LookupEntry (..)
@@ -336,6 +338,7 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , readConstructedReadback
   , constructTextureTable
   , constructTablePipelineLayout
+  , constructShaderSampledTablePipelineLayout
   , registerConstructedTexture
   , swapConstructedTexture
   , releaseConstructedTexture
@@ -455,6 +458,7 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , defaultDepthClear
   , depthFormatPreference
   , clearedDepth
+  , clearDepthRect
   , depthTested
   , draw
   , endRendering

@@ -60,6 +60,13 @@
 -- A draw with such a pipeline needs the table bound under a compatible layout
 -- and a sampler selected ('selectSampler'); binding the table without one is
 -- refused with no native call.
+--
+-- A consumer whose shaders choose their samplers, per instance, makes the
+-- layout with 'createShaderSampledTablePipelineLayout' instead: it names no
+-- sampler offset and reserves no push-constant bytes, a draw with its
+-- pipelines needs no selected sampler, and 'selectSampler' under them is
+-- refused with no native call. The shaders index the table's four samplers
+-- and must clamp the index to the last of them.
 module Hetoimasia.GPU.Vulkan.Native.TextureTable
   ( -- * Configuration
     Book.TableConfig
@@ -94,6 +101,7 @@ module Hetoimasia.GPU.Vulkan.Native.TextureTable
     -- * Pipelines and draws
   , textureTableDescriptors
   , createTablePipelineLayout
+  , createShaderSampledTablePipelineLayout
   , TableSampler (..)
   , tableSamplerIndex
   , bindTable
@@ -106,6 +114,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Recorder (bindTable, sele
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Table
   ( RegistrationNotUndone (..)
   , TableView (..)
+  , createShaderSampledTablePipelineLayout
   , createTablePipelineLayout
   , createTextureTable
   , readTable

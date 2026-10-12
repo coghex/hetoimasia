@@ -136,6 +136,164 @@ spec = describe "Texture table" $ do
       length [() | CreatedLayout {} ← calls'] `shouldBe` length [() | CreatedLayout {} ← calls] + 1
       kitTarget kit `seq` clean rig
 
+  describe "shader-sampled pipeline layouts" $ do
+    it "makes a layout holding both set layouts, with no sampler offset and no push-constant range, and a checked pipeline over it" $ do
+      (rig, _, kit) ← tableRig 4 2
+      before ← recordingCalls (rigRecordingStandIn rig)
+      layout ← createShaderSampledTablePipelineLayout (rigRecording rig) sampledShaders >>= either (fail . show) pure
+      after ← recordingCalls (rigRecordingStandIn rig)
+      let layouts = [handle | CreatedSetLayout handle _ ← before]
+          made = drop (length before) after
+      [declared | DeclaredSetLayouts _ declared ← made] `shouldBe` [layouts]
+      -- The stand-in records a layout's ranges only when it has any.
+      [ranges | DeclaredRanges _ ranges ← made] `shouldBe` []
+      length [() | CreatedLayout {} ← made] `shouldBe` 1
+      pipeline ← createCheckedPipeline (rigRecording rig) layout sampledShaders (formatCode Rgba8Srgb) >>= either (fail . show) pure
+      -- A range the shaders declare is the layout's, with no offset reserved
+      -- in it.
+      wide ← createShaderSampledTablePipelineLayout (rigRecording rig) (sampledShadersWith [PushMember 0 16]) >>= either (fail . show) pure
+      createCheckedPipeline (rigRecording rig) wide (sampledShadersWith [PushMember 0 16]) (formatCode Rgba8Srgb) `shouldReturn'` (either (fail . show) (const (pure ())))
+      -- A layout of the other kind is not the shaders' layout.
+      createCheckedPipeline (rigRecording rig) layout tableShaders (formatCode Rgba8Srgb)
+        `shouldReturn'` refused (RefusedIncompatible "a pipeline layout whose push-constant ranges are not the ones its checked shaders declare")
+      pipeline `seq` kitTarget kit `seq` clean rig
+
+    it "is refused, making no native call, in a session with no table, for a binding the table does not hold, for a vertex stage declaring set 0, and for ranges past the device's limit" $ do
+      bare ← newRig
+      bareBefore ← recordingCalls (rigRecordingStandIn bare)
+      createShaderSampledTablePipelineLayout (rigRecording bare) sampledShaders
+        `shouldReturn'` refused (RefusedIllegal "a pipeline layout holding a texture table this session has not made")
+      bareAfter ← recordingCalls (rigRecordingStandIn bare)
+      length bareAfter `shouldBe` length bareBefore
+      (rig, _, kit) ← tableRig 4 2
+      before ← recordingCalls (rigRecordingStandIn rig)
+      createShaderSampledTablePipelineLayout (rigRecording rig) (sampledWith [DescriptorDeclaration 2 0 StorageBuffer (DescriptorCount 1)] [])
+        `shouldReturn'` refused (RefusedIncompatible "a shader declaring a descriptor binding the texture table does not hold")
+      createShaderSampledTablePipelineLayout (rigRecording rig) (sampledVertexDeclaring [DescriptorDeclaration 0 1 SampledImage RuntimeSized])
+        `shouldReturn'` refused (RefusedIncompatible "a vertex shader declaring the texture table's samplers or images, which only the fragment stage sees")
+      createShaderSampledTablePipelineLayout (rigRecording rig) (sampledVertexDeclaring [DescriptorDeclaration 0 0 Sampler (DescriptorCount 4)])
+        `shouldReturn'` refused (RefusedIncompatible "a vertex shader declaring the texture table's samplers or images, which only the fragment stage sees")
+      limitRecording (rigRecordingStandIn rig) standInRecordingLimits {limitImageDimension = 16, limitPushConstantBytes = 8}
+      createShaderSampledTablePipelineLayout (rigRecording rig) (sampledShadersWith [PushMember 0 12])
+        `shouldReturn'` refused (RefusedOutOfBounds 12 8)
+      limitRecording (rigRecordingStandIn rig) standInRecordingLimits {limitImageDimension = 16}
+      after ← recordingCalls (rigRecordingStandIn rig)
+      length [() | CreatedLayout {} ← after] `shouldBe` length [() | CreatedLayout {} ← before]
+      -- The shaders' own bindings are still refused by a layout without the table.
+      createPipelineLayoutFor (rigRecording rig) sampledShaders `shouldReturn'` refused (RefusedUnsupported "a shader declaring descriptor bindings, which only a pipeline layout holding the texture table declares")
+      kitTarget kit `seq` clean rig
+
+  describe "drawing under a shader-sampled layout" $ do
+    it "binds the table and draws with no selected sampler, refuses selectSampler with no native call, and admits a push over offset 8 while keeping the ordinary push checks" $ do
+      (rig, _, kit) ← tableRig 4 2
+      pipeline ← sampledPipeline rig (sampledShadersWith [PushMember 0 16])
+      answers ← framelessOnce rig $ \recorder → inPassWith kit pipeline recorder $ do
+        ok (bindTable recorder)
+        ok (draw recorder 3 1)
+        before ← commandCount rig
+        selected ← selectSampler recorder 1
+        beyond ← selectSampler recorder 9
+        after ← commandCount rig
+        ok (pushConstants recorder [PushFragment] 8 (ByteString.pack [7, 0, 0, 0]))
+        ok (pushConstants recorder [PushFragment] 4 (ByteString.pack [1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0]))
+        unaligned ← pushConstants recorder [PushFragment] 10 (ByteString.pack [1, 0, 0, 0])
+        past ← pushConstants recorder [PushFragment] 16 (ByteString.pack [1, 0, 0, 0])
+        vertex ← pushConstants recorder [PushVertex] 8 (ByteString.pack [1, 0, 0, 0])
+        ok (draw recorder 3 1)
+        pure ([selected, beyond, unaligned, past, vertex], after - before)
+      fst answers
+        `shouldBe` [ Left (RefusedIllegal "selecting a sampler under a pipeline whose layout's shaders choose their samplers")
+                   , Left (RefusedIllegal "selecting a sampler under a pipeline whose layout's shaders choose their samplers")
+                   , Left (RefusedIllegal "a push whose offset or size is not a multiple of four")
+                   , Left (RefusedOutOfBounds 20 16)
+                   , Left (RefusedIllegal "a push to the PushVertex stage, for which the bound pipeline's layout declares no range")
+                   ]
+      snd answers `shouldBe` 0
+      calls ← recordingCalls (rigRecordingStandIn rig)
+      let commands' = [command | Recorded _ command ← calls]
+      [(offset, bytes) | CommandPushConstants _ _ offset bytes ← commands'] `shouldBe` [(8, ByteString.pack [7, 0, 0, 0]), (4, ByteString.pack [1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0])]
+      length [() | CommandDraw {} ← commands'] `shouldBe` 2
+      clean rig
+
+    it "refuses a draw, making no native call, before the table is bound under a compatible layout and while the batch holds an image its version maps in another use, and draws once it is back" $ do
+      (rig, uploads, kit) ← tableRig 4 2
+      pipeline ← sampledPipeline rig sampledShaders
+      texture ← uploadedTexture rig uploads
+      _ ← registered rig texture
+      answers ← framelessOnce rig $ \recorder → do
+        unbound ← inPassWith kit pipeline recorder (draw recorder 3 1)
+        ok (transitionResource recorder texture (FromUse ShaderSampled) TransferRead)
+        moved ← inPassWith kit pipeline recorder $ do
+          ok (bindTable recorder)
+          draw recorder 3 1
+        ok (transitionResource recorder texture (FromUse TransferRead) ShaderSampled)
+        back ← inPassWith kit pipeline recorder $ do
+          ok (bindTable recorder)
+          draw recorder 3 1
+        pure [unbound, moved, back]
+      answers
+        `shouldBe` [ Left (RefusedIllegal "a draw with a pipeline holding the texture table before the table is bound under a compatible layout")
+                   , Left (RefusedIllegal "a draw through the texture table while the batch holds an image its version maps in a use other than sampling")
+                   , Right ()
+                   ]
+      calls ← recordingCalls (rigRecordingStandIn rig)
+      length [() | Recorded _ CommandDraw {} ← calls] `shouldBe` 1
+      clean rig
+
+    it "disturbs the table binding and the sampler selection on a switch between a pushed and a shader-sampled pipeline of identical ranges, in both directions, and a rebind keeps the batch's sets and version" $ do
+      (rig, uploads, kit) ← tableRigWith 16 2 4
+      sampled ← sampledPipeline rig (sampledShadersWith [PushMember 0 8, PushMember 8 4])
+      t1 ← uploadedTexture rig uploads
+      t2 ← uploadedTexture rig uploads
+      answers ← framelessOnce rig $ \recorder → inPass kit recorder $ do
+        ok (bindTable recorder)
+        ok (selectSampler recorder 1)
+        ok (draw recorder 3 1)
+        ok (bindPipeline recorder sampled)
+        -- Two registrations change the mapping and grow the table, but the
+        -- batch keeps the set and version it took.
+        _ ← registered rig t1
+        _ ← registered rig t2
+        toSampled ← draw recorder 3 1
+        ok (bindTable recorder)
+        ok (draw recorder 3 1)
+        ok (bindPipeline recorder (kitPipeline kit))
+        toPushed ← draw recorder 3 1
+        ok (bindTable recorder)
+        unselected ← draw recorder 3 1
+        ok (selectSampler recorder 2)
+        ok (draw recorder 3 1)
+        pure [toSampled, toPushed, unselected]
+      answers
+        `shouldBe` [ Left (RefusedIllegal "a draw with a pipeline holding the texture table before the table is bound under a compatible layout")
+                   , Left (RefusedIllegal "a draw with a pipeline holding the texture table before the table is bound under a compatible layout")
+                   , Left (RefusedIllegal "a draw with a pipeline holding the texture table before a sampler is selected")
+                   ]
+      calls ← recordingCalls (rigRecordingStandIn rig)
+      let commands' = [command | Recorded _ command ← calls]
+          binds = [(sets, offsets) | CommandBindDescriptorSets _ sets offsets ← commands']
+      length binds `shouldBe` 3
+      length (Set.fromList binds) `shouldBe` 1
+      [bytes | CommandPushConstants _ _ 8 bytes ← commands'] `shouldBe` [ByteString.pack [1, 0, 0, 0], ByteString.pack [2, 0, 0, 0]]
+      length [() | CommandDraw {} ← commands'] `shouldBe` 3
+      clean rig
+
+    it "keeps the pushed path as it was: a draw before a sampler is selected is refused, and switching between pushed pipelines of equal ranges keeps the table bound" $ do
+      (rig, _, kit) ← tableRig 4 2
+      other ← do
+        layout ← createTablePipelineLayout (rigRecording rig) tableShaders 8 >>= either (fail . show) pure
+        createCheckedPipeline (rigRecording rig) layout tableShaders (formatCode Rgba8Srgb) >>= either (fail . show) pure
+      answers ← framelessOnce rig $ \recorder → inPass kit recorder $ do
+        ok (bindTable recorder)
+        before ← draw recorder 3 1
+        ok (selectSampler recorder 3)
+        ok (bindPipeline recorder other)
+        kept ← draw recorder 3 1
+        pure [before, kept]
+      answers
+        `shouldBe` [Left (RefusedIllegal "a draw with a pipeline holding the texture table before a sampler is selected"), Right ()]
+      clean rig
+
   describe "binding and drawing" $ do
     it "binds both sets under the pipeline's layout with the batch's version offset, selects a sampler by a push at the declared offset, and draws" $ do
       (rig, _, kit) ← tableRig 4 2
@@ -1200,6 +1358,34 @@ shadersWith descriptors =
     (CheckedShader (ByteString.pack [1, 2, 3, 4]) (interfaceFor VertexInterface))
     (CheckedShader (ByteString.pack [5, 6, 7, 8]) (interfaceFor FragmentInterface) {interfacePushConstants = [PushMember 0 8, PushMember 8 4], interfaceDescriptors = descriptors})
 
+-- | A fragment stage reading the table whose sampler the shaders choose: it
+-- declares no push constants.
+sampledShaders ∷ CheckedShaders
+sampledShaders = sampledShadersWith []
+
+-- | 'sampledShaders' with a fragment push-constant block of these members.
+sampledShadersWith ∷ [PushMember] → CheckedShaders
+sampledShadersWith = sampledWith textureTableDescriptors
+
+sampledWith ∷ [DescriptorDeclaration] → [PushMember] → CheckedShaders
+sampledWith descriptors members =
+  CheckedShaders
+    (CheckedShader (ByteString.pack [1, 2, 3, 4]) (interfaceFor VertexInterface))
+    (CheckedShader (ByteString.pack [5, 6, 7, 8]) (interfaceFor FragmentInterface) {interfacePushConstants = members, interfaceDescriptors = descriptors})
+
+-- | 'sampledShaders' with this vertex stage's descriptors.
+sampledVertexDeclaring ∷ [DescriptorDeclaration] → CheckedShaders
+sampledVertexDeclaring descriptors =
+  CheckedShaders
+    (CheckedShader (ByteString.pack [1, 2, 3, 4]) (interfaceFor VertexInterface) {interfaceDescriptors = descriptors})
+    (CheckedShader (ByteString.pack [5, 6, 7, 8]) (interfaceFor FragmentInterface) {interfaceDescriptors = textureTableDescriptors})
+
+-- | A pipeline over a shader-sampled layout for these shaders.
+sampledPipeline ∷ Rig → CheckedShaders → IO Pipeline
+sampledPipeline rig shaders = do
+  layout ← createShaderSampledTablePipelineLayout (rigRecording rig) shaders >>= either (fail . show) pure
+  createCheckedPipeline (rigRecording rig) layout shaders (formatCode Rgba8Srgb) >>= either (fail . show) pure
+
 plainShaders ∷ CheckedShaders
 plainShaders =
   CheckedShaders
@@ -1207,9 +1393,13 @@ plainShaders =
     (CheckedShader (ByteString.pack [5, 6, 7, 8]) (interfaceFor FragmentInterface))
 
 inPass ∷ Kit → Rec → IO a → IO a
-inPass kit recorder action = do
+inPass kit = inPassWith kit (kitPipeline kit)
+
+-- | 'inPass' over this pipeline instead of the kit's.
+inPassWith ∷ Kit → Pipeline → Rec → IO a → IO a
+inPassWith kit pipeline recorder action = do
   ok (beginRenderingInto recorder (kitTarget kit) ClearFromUndefined (ClearColor 0 0 0 1))
-  ok (bindPipeline recorder (kitPipeline kit))
+  ok (bindPipeline recorder pipeline)
   ok (setViewport recorder (Viewport 0 0 32 16))
   ok (setScissor recorder (Rect 0 0 32 16))
   value ← action

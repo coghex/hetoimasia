@@ -692,6 +692,11 @@ recordCommand commands = \case
   CommandSetScissor rect →
     setScissorUnsafe commands Rect2D {offset = Offset2D rect.rectX rect.rectY, extent = Extent2D rect.rectWidth rect.rectHeight}
   CommandDraw vertices instances firstVertex firstInstance → drawUnsafe commands vertices instances firstVertex firstInstance
+  CommandClearDepthRect area value →
+    clearAttachmentsUnsafe
+      commands
+      ClearAttachment {aspectMask = IMAGE_ASPECT_DEPTH_BIT, colorAttachment = 0, clearValue = DepthStencil (ClearDepthStencilValue value 0)}
+      ClearRect {rect = Rect2D {offset = Offset2D area.rectX area.rectY, extent = Extent2D area.rectWidth area.rectHeight}, baseArrayLayer = 0, layerCount = 1}
   CommandCopyImageToBuffer image extent buffer →
     copyImageToBufferUnsafe
       commands

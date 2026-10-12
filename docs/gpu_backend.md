@@ -1581,11 +1581,55 @@ pass has, with no native call. `beginRendering` into the frame's image has no
 depth attachment, and a colour-only pass into a color target begins exactly as
 it did before depth.
 
+**Clearing depth within a rectangle.** `clearDepthRect recorder rect value`
+(R2D-17; render-2d D-10 and D-30) clears the open pass's depth attachment to
+`value` within `rect`, in render-area pixels, and leaves depth outside it
+unchanged. It is recorded as `vkCmdClearAttachments` over the depth aspect,
+with one attachment, one rectangle and one layer, and works in a pass begun by
+`beginRenderingWithDepth` (in a frame batch or a frame-less one) and in one
+begun by `beginFrameRenderingWithDepth` (in a frame batch; a frame-image pass
+is unsupported in a frame-less batch, as [Windowed depth](#windowed-depth)
+says). It is exported from `Hetoimasia.GPU.Vulkan.Native.Recording` and from
+`Hetoimasia.GPU.Vulkan.GLFW`, beside the depth passes. A world layer that
+clears its own depth within its viewport when it begins (D-10) uses it so the
+layers stay independent.
+
+- *The rectangle* is a `Rect`, the scissor's vocabulary: a nonnegative pixel
+  offset, a positive width and a positive height, with its half-open bounds
+  wholly within the open pass's render area. Touching the render area's edges
+  and covering all of it are valid. The far edges are summed as integers, so
+  no extent overflows.
+- *Refusals*, each with no native call and nothing recorded: no pass is open,
+  or the open pass has no depth attachment (`RefusedIllegal`); the rectangle
+  is empty, has a negative offset or does not lie wholly within the render
+  area (`RefusedIllegal`); the value is not finite or lies outside 0 to 1
+  (`RefusedIllegal`, as a pass's clear value is); the session has failed
+  (`RefusedSessionFailed`, or `RefusedDiagnosticPending`, before anything is
+  done, as every other new work is); and, as for every command, the recorder
+  is closed (`RefusedRecorderClosed`) or the caller is not the graphics
+  owner's thread (`RefusedNotOwner`).
+- *Draw state* is neither needed nor touched. The clear needs no bound
+  pipeline, viewport or scissor, it leaves every binding a draw uses as it
+  was, and it clears the whole requested rectangle whatever scissor is set,
+  because `vkCmdClearAttachments` is not narrowed by one.
+- *Ordering.* The clear is ordered with the pass's draws exactly as a draw is:
+  draws recorded before it see the old depth, and draws after it see the
+  cleared depth. It is a use of the depth target within the pass already
+  entered, so the target's barriers, its use and its retention are those of
+  the pass, and nothing is entered or retained by the clear itself.
+  Synchronization validation reports nothing.
+- *Depth only.* Colour clears within a rectangle are not added, and stencil
+  does not exist (above).
+
 **The native commands.** `CommandBeginRendering` carries the pass's optional
 `DepthClear`, and a pipeline request its optional `PipelineDepth`; the
 production layer builds the attachment (`depthAttachmentInfo`) and the
 depth-stencil state (`nativeDepthState`) from them, and the stand-in journals
-a declared depth (`DeclaredDepth`). The depth target's barriers are those of
+a declared depth (`DeclaredDepth`). `CommandClearDepthRect rect value` carries
+a rectangle clear; the production layer records it through
+`clearAttachmentsUnsafe` (one of the [audited](#the-ffi-audit) recording
+calls) and the stand-in journals it, with its rectangle and value, among the
+batch's other commands. The depth target's barriers are those of
 `DepthAttachment`: early and late fragment tests, depth-stencil attachment
 read and write, the depth-attachment layout, over the depth aspect.
 
@@ -1611,13 +1655,26 @@ kept until its batch completes and destroyed at once after a discard, and the
 agreement between a pipeline and the pass it is drawn in for every ordering:
 a pipeline of another depth format, one declaring none in a depth pass, one
 declaring depth in a pass without, bound outside rendering in a frame batch
-and retained across passes. `Test.GPU.Vulkan.Native.Checked` covers
+and retained across passes. It also covers `clearDepthRect`: the clear in a
+pass into a color target, in a frame batch and a frame-less one, and in a pass
+into the frame's image with the generation's depth image, journalled with its
+rectangle and value; every refusal above with nothing recorded — an empty
+rectangle, negative offsets, overruns and extents large enough to overflow, a
+value outside 0 to 1 or not finite, no pass or none with depth, a session that
+failed with the pass still open, a closed recorder and another thread; the
+clear before any draw state is bound and under a smaller scissor, leaving a
+draw's bindings as they were; the clear between two draws, journalled in
+order; the pass's barriers unchanged by it; and the native layer's failure
+named `vkCmdClearAttachments`. `Test.GPU.Vulkan.Native.Checked` covers
 `createDepthCheckedPipeline` and checks `nativeDepthState` and
 `depthAttachmentInfo` field by field. The surface-free native case
 `grs10-scene3d` ([below](#the-native-suite)) draws two depth-tested cubes from
 two camera poses on the device and reads them back
 ([samples/scene3d/README.md](../samples/scene3d/README.md)); its captures are
-retained in [`docs/evidence/gpu_3d/`](evidence/gpu_3d/README.md).
+retained in [`docs/evidence/gpu_3d/`](evidence/gpu_3d/README.md). Depth cannot
+be read back — a `DepthTarget`'s only usage is depth-stencil attachment — so
+the native case `r2d17-depth-rect` observes the rectangle clear through colour
+([below](#the-native-suite)).
 
 | State | Owner | Readers and writers | Thread | Lifetime | Reset or disposal |
 | --- | --- | --- | --- | --- | --- |
@@ -2850,6 +2907,26 @@ native call:
 - an offset that is unaligned or outside every fragment range;
 - whatever the checked-range and push-range validation refuse.
 
+**Two layout kinds** (R2D-16; render-2d D-4). A layout is one of two kinds,
+by how its draws choose a sampler.
+
+- *Pushed* (`createTablePipelineLayout`): the recorder pushes the sampler
+  index at the declared offset, as above. Every draw samples with one
+  sampler, so mixed filtering takes one draw per filter.
+- *Shader-sampled* (`createShaderSampledTablePipelineLayout recording
+  shaders`): the layout declares no sampler offset and reserves no
+  push-constant bytes, and the shaders choose their samplers, per instance,
+  from vertex input. It makes the same layout and checks the shaders exactly
+  as the pushed kind does (the table's own bindings only, set 0 in the
+  fragment stage alone, the push ranges against the device's limit), and is
+  refused before any native call in a session with no table and wherever the
+  pushed kind's checks refuse. It checks no sampler offset, so shaders that
+  declare no push constants at all are valid and need no dummy fragment
+  range. The window integration's `constructShaderSampledTablePipelineLayout
+  construction shaders` is the confined equivalent, exported from
+  `Hetoimasia.GPU.Vulkan.GLFW` beside `constructTablePipelineLayout`; the
+  native package's facade `TextureTable` exports the first.
+
 **Binding and drawing.** `bindTable recorder` binds both sets under the bound
 pipeline's layout, with the dynamic offset of the batch's version, through
 `vkCmdBindDescriptorSets`.
@@ -2873,13 +2950,35 @@ table's pipeline needs both again. Refused with no native call:
   hold the table, or in a session with no table;
 - a sampler index above 3 (`RefusedOutOfBounds`), or a sampler selected
   under a pipeline without the table;
-- a push over the sampler index's four bytes;
+- `selectSampler` under a shader-sampled pipeline, naming that the layout's
+  shaders choose their samplers;
+- a push over the sampler index's four bytes, under a pushed layout;
 - a draw with a table pipeline before the table is bound under a compatible
-  layout, or before a sampler is selected;
+  layout, or, under a pushed layout, before a sampler is selected;
 - a draw through the table while the batch holds an image its version maps
   in a use other than sampling, for example after moving a texture to a
   transfer use, until the batch moves it back;
 - any binding once the session has failed.
+
+**The draw check under each kind.** A draw through a pushed layout needs the
+table bound under a compatible layout, a selected sampler, and every image
+the batch's version maps in its sampled use. A draw through a shader-sampled
+layout needs the first and the last and not the sampler: it needs no
+`selectSampler`. Every other refusal of a table draw is the same under both.
+Under a shader-sampled layout no sampler index is reserved, so an ordinary
+push may cover any bytes of the layout's ranges, offset 8 included; the
+ordinary push checks (alignment, size, stage coverage and range bounds) still
+apply. The pushed path is unchanged: `createTablePipelineLayout`,
+`selectSampler`, the pushed draw's requirement of a selected sampler and the
+refusal of a push over the sampler index behave as before.
+
+Binding a pipeline of the other kind disturbs the binding and the sampler
+selection, as binding any pipeline with different push ranges or table use
+does, even when the two layouts' push ranges are equal: the table's
+pipeline needs `bindTable` again, which binds the same sets and version the
+batch already took, and a return to a pushed pipeline needs a fresh
+`selectSampler`. Binding another pipeline of the same kind with equal ranges
+keeps both, as before.
 
 **The shaders.** `tableShaders` (in `Recording.Shaders`) are the reference
 pair the native case draws with. The vertex shader covers the render area
@@ -2895,11 +2994,49 @@ Their interface descriptions are `tableVertexInterface` and
 `tableFragmentInterface`: the handle at push offset 0 and the sampler index
 at `tableSamplerOffset` (8).
 
+**The shader's obligations under a shader-sampled layout.** The backend
+cannot see per-instance data, so two obligations are the shader's:
+
+- *Clamp the index.* The table holds four samplers, so a shader must clamp
+  the sampler index it reads from instance data to 3, as
+  `samplers[nonuniformEXT(min(index, 3u))]`. An instance's index beyond 3
+  therefore samples with sampler 3. An unclamped index past the array is
+  undefined behavior that the backend cannot refuse.
+- *Index with `nonuniformEXT`.* The profile enables non-uniform sampled-image
+  indexing and not dynamic indexing, and the sampler index varies by
+  instance, so the sampler index, the slot index and the combined sampled
+  image the sample consumes are each `nonuniformEXT`.
+
+**The instance shaders.** `tableInstanceShaders` (in `Recording.Shaders`) are
+the reference pair for a shader-sampled layout, with interfaces
+`tableInstanceVertexInterface` and `tableInstanceFragmentInterface` (in
+`Recording.ShaderInterfaces`). The vertex shader draws one rectangle per
+instance from six vertices, two triangles generated from `gl_VertexIndex`,
+so a pipeline over them takes no per-vertex input. Its one per-instance
+binding, of `tableInstanceStride` (28) bytes, carries:
+
+| Location | Format | Offset | Content |
+| --- | --- | --- | --- |
+| 0 | four floats | 0 | the rectangle in clip space: left, top, right, bottom |
+| 1 | `VertexUint` | 16 | the texture handle's lookup index |
+| 2 | `VertexUint` | 20 | the handle's generation |
+| 3 | `VertexUint` | 24 | the sampler index |
+
+It passes the handle and the sampler index to the fragment stage as flat
+values. The fragment shader declares the table's bindings and no push
+constants. It resolves the handle as `tableShaders` do (slot 0 for an index
+past the version's entries or a stale generation) and samples with
+`samplers[nonuniformEXT(min(index, 3u))]`, the slot index and the combined
+image also `nonuniformEXT`. The shader suite checks that their SPIR-V
+declares exactly the table's bindings, matches the interfaces, and decorates
+the sampler index, the slot index and the combined image `NonUniform`.
+
 **The window integration.** An owner-thread action has:
 
 - `constructTextureTable`, over the session's uploads; the host must
   configure `vulkanUploads`, or it is refused;
-- `constructTablePipelineLayout`;
+- `constructTablePipelineLayout` and
+  `constructShaderSampledTablePipelineLayout`;
 - `registerConstructedTexture` and `releaseConstructedTexture`;
 - `readConstructedTable`.
 
@@ -2973,6 +3110,45 @@ construction unmasked failed the cancellation example. The device-profile exampl
 features, by name. The shader suite checks that `tableShaders`' SPIR-V
 declares exactly the table's three bindings and matches its descriptions.
 
+The stand-in examples for the shader-sampled kind (`Test.GPU.Vulkan.Native.Table`)
+cover:
+
+- the layout made with its two set layouts and no range, and a checked
+  pipeline over shaders declaring no push constants, with the other kind's
+  shaders refused as incompatible with it;
+- the layout refused with no native call in a session with no table, for a
+  binding the table does not hold, for a vertex stage declaring set 0, and
+  for ranges past the device's limit;
+- a table draw admitted with no `selectSampler`, `selectSampler` refused with
+  no native call, a push over offset 8 admitted, and the ordinary push
+  checks still refusing a misaligned push, one beyond the range and one to a
+  stage the layout has no range for;
+- a draw refused before a compatible table binding, and while the batch holds
+  a mapped image outside sampling;
+- switches between a pushed and a shader-sampled pipeline of identical
+  ranges, in both directions, each disturbing the table binding and the
+  sampler selection, a rebind binding the batch's first set and version after
+  the table has grown, and a return to the pushed path requiring a fresh
+  `selectSampler`;
+- every pushed example unchanged, including the refusal of a draw before a
+  sampler is selected.
+
+The surface-free native case `r2d16-shader-samplers` makes a table, a
+shader-sampled layout over `tableInstanceShaders` and a two-texel texture, a
+red texel then a blue one. One batch binds the table and draws four
+instances in **one** draw call, with no `selectSampler`, each filling a
+quadrant of a 64-by-64 sRGB target, with sampler indices 0
+(nearest/clamp-to-edge), 2 (linear/clamp-to-edge), 7 and 3. The target is
+read back and probed. A pixel 12 across a 32-pixel quadrant reads 0.390625
+across the texture. The nearest instance's probe reads the red texel exactly.
+The linear one's reads the blend, 0.28125 of the blue texel, within one step
+of the sRGB encoding of that blend, so the two differ. The probes of index 7
+and index 3 sit 3 pixels in, where repeat addressing wraps the blue texel in
+from the left and clamping does not: both read the blend within one step,
+and a linear/clamp-to-edge probe at the same offset reads the red texel
+alone, so index 7 sampled as sampler 3, not as 2. Validation, with
+synchronization validation, reports nothing.
+
 The surface-free native case `grs7-texture-table` makes a table of sixteen
 slots, eight at first, over the session's uploads. It then draws four
 frame-less batches, each into a 64-by-64 RGBA8 target that is copied back
@@ -3026,7 +3202,7 @@ image, then frees its allocation (`vmaDestroyImage`), settling that too.
 
 D-28's production split, as built. The binding is compiled with
 `+safe-foreign-calls`, so every import of its own is `safe`; the package's only
-genuine `unsafe` Vulkan imports are the nineteen `dynamic` imports in the private
+genuine `unsafe` Vulkan imports are the twenty `dynamic` imports in the private
 `Hetoimasia.GPU.Vulkan.Native.Internal.Commands`, each calling the function
 pointer the binding's own device dispatch table (`DeviceCmds`) resolved for the
 command buffer's device, with structures marshalled by the binding's
@@ -3044,6 +3220,7 @@ its calling convention.
 | `vkCmdSetViewport` | Records dynamic state. |
 | `vkCmdSetScissor` | Records dynamic state. |
 | `vkCmdDraw` | Records a draw. |
+| `vkCmdClearAttachments` | Records the clear of the open pass's depth attachment within one rectangle, one attachment and one layer; the structures are marshalled for the call and not kept (R2D-17). |
 | `vkCmdPushConstants` | Records push-constant bytes, which the recording has checked fit the bound layout's ranges; they are copied into the command buffer during the call and not kept (GRS-4). |
 | `vkCmdBindVertexBuffers` | Records one buffer, already created, bound to one vertex input binding at an offset (GRS-4). |
 | `vkCmdBindIndexBuffer` | Records an already-created buffer bound as index data at an offset (GRS-4). |
@@ -3082,7 +3259,7 @@ alone, under the same masked steps as the accounting around them.
 `ffiAllocatorImports`), the binding's flags, the allocator, and the C-only
 callback; the native case's record prints it, so it is part of the evidence
 identity beside the build's source digest. The headless suite reads the
-package's own import declarations and requires exactly those nineteen `dynamic`
+package's own import declarations and requires exactly those twenty `dynamic`
 imports and, besides them, only the capture callback's address import and the
 allocator shim's entries.
 
@@ -5362,7 +5539,7 @@ companions — and adds the Vulkan owner's:
 | Main thread | Hspec runs on a thread of its own; the process main thread owns one shared production graphics session: `withLoaderIntegration`, then `runGraphicsOwnerApplication` over `withVulkanOwnerHost`, with the production native layer and surface bridge. An example that needs the main thread — to hand a window's surface over, which GLFW creates there, or to close a window — submits an operation (`onMain`); the main thread runs it between two turns of the host's owner loop and returns its result or rethrows its failure. Windows are created through the host's command port from the example's own thread, which the owner loop executes, as an application's worker would. |
 | Identities | Every dispatched operation is checked, before it runs, to be on the bound process main thread that entered the session — the Haskell thread, the bound flag, and the OS thread read through `pthread_self` — and a failed check fails the operation and the run. Every native call the session makes is recorded where it runs by a `NativeObserver`, so an example shows from the calls themselves that the instance, its messenger, the device and every surface's destruction ran on the graphics owner's thread and every surface's creation on the main thread — never from the name of an Hspec hook. |
 | Sharing | The roots — the instance, its explicit messenger, and the one device — are acquired lazily, by the first dispatched operation, at most once, and shared by every later example. Each example's windows and targets are its own and are closed inside it. |
-| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, `vk12-frames`, `vk13-presentation`, `vk14-recovery`, `vk15-validation-stop`, `vk15-retention`, `vk16-composed`, `vk17-one-slot`, `vk17-two-slots`, `vk19-capture`, `grs15-surface-free`, `grs15-surface-free-window`, `grs12-frameless`, `grs3-ordering`, `grs7-texture-table`, `grs8-sprites`, `grs9-swap`, `grs10-scene3d`, `grs13-window-depth`, `grs14-table-growth`, `synchronization-hazard`, `debug-names`, and, under the isolated compositor's consent only, `wayland-connection-loss`. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. Each child runs in a process group of its own under an external 20-second deadline covering its exit and the end of its output; one still running at it is terminated with its group and fails its example as expired. |
+| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, `vk12-frames`, `vk13-presentation`, `vk14-recovery`, `vk15-validation-stop`, `vk15-retention`, `vk16-composed`, `vk17-one-slot`, `vk17-two-slots`, `vk19-capture`, `grs15-surface-free`, `grs15-surface-free-window`, `grs12-frameless`, `grs3-ordering`, `grs7-texture-table`, `grs8-sprites`, `grs9-swap`, `grs10-scene3d`, `grs13-window-depth`, `grs14-table-growth`, `r2d17-depth-rect`, `synchronization-hazard`, `debug-names`, and, under the isolated compositor's consent only, `wayland-connection-loss`. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. Each child runs in a process group of its own under an external 20-second deadline covering its exit and the end of its output; one still running at it is terminated with its group and fails its example as expired. |
 | Selection | Building, listing and filtering the tree, a `--dry-run`, and a selection that dispatches nothing acquire nothing and start no child. A selection matching no example fails. `--complete`, which the catalog group passes, runs the whole tree with Hspec's configuration reading left out and then fails unless the shared session was acquired once and every private scenario the run's consent requires ran and passed — every one, except that `wayland-connection-loss` is required under the isolated compositor's consent and pending under any other — so no ambient setting can turn the group's receipt into a pass for a subset. The consent rules and the migrated proof's pure release, construction, publication and loader-selection examples need no session and run without consent. |
 | Consent | Read once, at startup, from `HETOIMASIA_NATIVE_SESSION`, with the GLFW suite's rules for `desktop`, `isolated-x11:<display>` and `isolated-wayland:<socket>`: the last only on Linux, only when `WAYLAND_DISPLAY` names that socket, and never beside a `DISPLAY`. Under the Wayland consent every session requests Wayland by name — the shared host, each child's host, the VK-5 bridge's loader-aware session, and the proof shim's raw initialization, which sets `GLFW_PLATFORM` and fails one that selected another platform — so no X11 or XWayland session stands in; under the others every session requests nothing, as before. The first shared example asserts the platform GLFW selected before any example renders. Without consent every native example is refused before its body, the session is never acquired, and the run ends with the refusal on stderr and a non-zero exit. |
 | Environment | Before any Vulkan call, the suite clears every ambient discovery override and every validation-layer setting it finds and records which, disables implicit layers, and points the layer's settings file at an empty one; a child inherits and re-establishes the same environment. |
@@ -5771,6 +5948,37 @@ passes only if all of these hold:
 
 The PNGs and the record go beneath `HETOIMASIA_VALIDATION_EVIDENCE/swap/`
 when the runner names an evidence directory.
+
+R2D-17's case, `r2d17-depth-rect`, runs the same surface-free composition
+and host, with no uploads, to prove `clearDepthRect`
+([Depth attachments](#depth-attachments)) on the device. Depth cannot be read
+back, so it observes depth through colour. An owner-thread action builds the
+ring, an RGBA8 target of 64 by 64, a `D32_SFLOAT` depth target of that extent
+(the case requires the backend's depth format to be that one), the scene3d
+sample's layout and depth-tested pipeline over its shaders, and a readback
+buffer. One frame-less batch then:
+
+1. begins a pass into the target and the depth target, clearing the colour to
+   blue and the depth to 0.0, so that a less-or-equal test passes nothing;
+2. sets a scissor of 4 by 4 and clears a rectangle touching none of the
+   target's edges (16 to 47 across, 20 to 43 down) to 1.0 with `clearDepthRect`,
+   which the scissor must not narrow;
+3. draws a quad covering the whole target at depth 0.5, in magenta, tested
+   less-or-equal, with an identity transform;
+4. ends the pass, copies the target into the readback after its transition and
+   returns it to rest.
+
+A second action reads the readback, which is written as a PNG to a temporary
+path the journal names. It passes only if all of these hold:
+
+- no window, surface or image acquisition was made, and the device came first;
+- the batch's ticket completed, and the actions ran on the owner's thread;
+- the readback shows the quad's magenta exactly inside the rectangle and the
+  pass's blue clear exactly outside it, probed at interior pixels on both sides
+  of each edge, two corners and two points well away from it, every channel an
+  endpoint and so exact;
+- the roots retired in order, with every Vulkan call on the owner's thread;
+- the verdict, with synchronization validation, is clean.
 
 GRS-10's case, `grs10-scene3d`, runs the scene3d sample's window-free evidence
 ([samples/scene3d/README.md](../samples/scene3d/README.md)) over the same

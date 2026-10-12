@@ -88,6 +88,14 @@
 --   is submitted, which still draws the original, and the new texture drawn
 --   beside the released handle, which resolves to the placeholder; every
 --   batch read back and probed (#343);
+-- * @r2d16-shader-samplers@ — the same device start with no window, then the
+--   session's texture table and a pipeline layout holding it that declares no
+--   sampler offset: four instances of one two-texel texture drawn in a single
+--   draw call with no sampler selected, each choosing its own from instance
+--   data — nearest/clamp-to-edge, linear/clamp-to-edge, an index of 7 and an
+--   index of 3 — and read back: the nearest instance reads its texel exactly,
+--   the linear one the blend within one step, and index 7 reads as sampler 3
+--   (render-2d D-4);
 -- * @grs8-sprites@ — the same device start with no window, then the sprites
 --   sample's window-free evidence (GRS-8): its scene of indexed, instanced
 --   textured quads through texture handles with premultiplied-alpha blending,
@@ -108,6 +116,13 @@
 --   sample's independent oracle — the nearer cube, drawn first, showing where
 --   the cubes overlap — and written as a lossless PNG a pose and a probe
 --   record under the validation runner's evidence directory (#349);
+-- * @r2d17-depth-rect@ — the same device start with no window, then a pass
+--   into an RGBA8 color target and a @D32_SFLOAT@ depth target that clears
+--   the depth to 0.0, clears a rectangle touching none of the target's edges
+--   to 1.0, and draws a quad covering the target at depth 0.5 with a
+--   less-or-equal test; the quad's color read back exactly inside the
+--   rectangle and the pass's clear color exactly outside it, on both sides of
+--   each edge, with synchronization validation reporting nothing (#425);
 -- * @grs13-window-depth@ — a window whose host asked for windowed depth: the
 --   scene3d sample's two cubes drawn with a depth test into the window's own
 --   image with the depth image of its swapchain generation, a frame captured
@@ -424,6 +439,14 @@ scenarios =
         outcome ← SurfaceFree.runTable (consentBackend consent) journal
         pure (SurfaceFree.tableSpec outcome, section "The GRS-7 texture table record" (SurfaceFree.tableSection outcome))
   , Scenario
+      "r2d16-shader-samplers"
+      "draws four instances of one two-texel texture in a single draw call of a frame-less batch of a surface-free session, through a shader-sampled table layout and no selected sampler: one instance with nearest/clamp-to-edge, one with linear/clamp-to-edge, one with sampler index 7 and one with 3, reads the target back, and checks that the nearest instance reads the texel exactly, the linear one the blend within one step, and index 7 as sampler 3, with validation reporting nothing"
+      False
+      Nothing
+      $ \consent journal _ → do
+        outcome ← SurfaceFree.runShaderSamplers (consentBackend consent) journal
+        pure (SurfaceFree.shaderSamplersSpec outcome, section "The R2D-16 shader-chosen samplers record" (SurfaceFree.shaderSamplersSection outcome))
+  , Scenario
       "grs8-sprites"
       "draws the sprites sample's scene of instanced textured quads through texture handles with premultiplied-alpha blending in a frame-less batch of a surface-free session, reads the target back after completion, passes every probe of the independent oracle and writes a lossless PNG and a probe record, with validation reporting nothing"
       False
@@ -447,6 +470,14 @@ scenarios =
       $ \consent journal _ → do
         outcome ← SurfaceFree.runScene3d (consentBackend consent) journal
         pure (SurfaceFree.scene3dSpec outcome, section "The GRS-10 scene3d evidence record" (SurfaceFree.scene3dSection outcome))
+  , Scenario
+      "r2d17-depth-rect"
+      "clears a rectangle of a D32_SFLOAT depth attachment to 1.0 inside a pass that cleared it to 0.0, draws a full-target quad at depth 0.5 with a less-or-equal test in a frame-less batch of a surface-free session, and reads exact bytes: the quad inside the rectangle and the pass's clear outside it, on both sides of each edge, with synchronization validation reporting nothing"
+      False
+      Nothing
+      $ \consent journal _ → do
+        outcome ← SurfaceFree.runDepthRect (consentBackend consent) journal
+        pure (SurfaceFree.depthRectSpec outcome, section "The R2D-17 depth rectangle record" (SurfaceFree.depthRectSection outcome))
   , Scenario
       "grs13-window-depth"
       "draws the scene3d sample's two flat-coloured cubes with a depth test into a window's own image with the depth image of its swapchain generation, captures a frame and passes every probe of the independent oracle — the nearer cube, drawn first, showing where the cubes overlap — resizes the window and captures a frame of the generation built at the new size, which gave itself a depth image of its own, with synchronization validation reporting nothing"

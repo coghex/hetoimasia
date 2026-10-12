@@ -122,6 +122,7 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
   , readConstructedReadback
   , constructTextureTable
   , constructTablePipelineLayout
+  , constructShaderSampledTablePipelineLayout
   , registerConstructedTexture
   , swapConstructedTexture
   , releaseConstructedTexture
@@ -340,6 +341,7 @@ import Hetoimasia.GPU.Vulkan.Native.TextureTable
   ( TableConfig
   , TableView
   , TextureHandle
+  , createShaderSampledTablePipelineLayout
   , createTablePipelineLayout
   , createTextureTable
   , readTable
@@ -636,6 +638,14 @@ constructTextureTable construction config =
 -- 'selectSampler' pushes.
 constructTablePipelineLayout ∷ Construction q inst msgr phys dev cmd → CheckedShaders → Word32 → IO (Either Refusal PipelineLayout)
 constructTablePipelineLayout construction shaders offset = confined construction (createTablePipelineLayout (constructionRecording construction) shaders offset)
+
+-- | A pipeline layout holding the texture table whose shaders choose their
+-- samplers, per instance: both of its sets and the checked shaders'
+-- push-constant ranges, with no sampler offset. A draw needs no
+-- 'selectSampler', which it refuses; the shaders must clamp their sampler
+-- index to the table's last.
+constructShaderSampledTablePipelineLayout ∷ Construction q inst msgr phys dev cmd → CheckedShaders → IO (Either Refusal PipelineLayout)
+constructShaderSampledTablePipelineLayout construction shaders = confined construction (createShaderSampledTablePipelineLayout (constructionRecording construction) shaders)
 
 -- | Register an uploaded texture with the table and answer its stable
 -- handle: slot 0's placeholder until its upload completes, its own slot in

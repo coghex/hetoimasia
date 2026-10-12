@@ -36,6 +36,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Recorder
   , defaultDepthClear
   , beginRenderingWithDepth
   , beginFrameRenderingWithDepth
+  , clearDepthRect
   , endRendering
   , bindPipeline
   , setViewport
@@ -183,6 +184,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , RingClaim (..)
   , RingState (..)
   , StorageOwner (..)
+  , TableUse (..)
   , editBatch
   , editManaged
   , isAsynchronous
@@ -193,6 +195,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , orderedObject
   , owned
   , releaseClaims
+  , tableShaderSampled
   , tshow
   )
 import Hetoimasia.GPU.Model.Budget (BudgetKind (FramelessBatchBudget, RingBudget), framelessBatchLimit)
@@ -1087,6 +1090,56 @@ beginTargetPass recorder (Image resource) start clear depth =
   where
     recording = recorderRecording recorder
 
+-- | Clear the open pass's depth attachment to a value within a rectangle, in
+-- render-area pixels, leaving depth outside it unchanged (R2D-17). It is
+-- recorded as @vkCmdClearAttachments@ over the depth aspect, with one
+-- rectangle and one layer, and works in a pass begun by
+-- 'beginRenderingWithDepth' or by 'beginFrameRenderingWithDepth'.
+--
+-- The rectangle uses the scissor's coordinates ('Rect'): a nonnegative offset
+-- and a positive width and height, with its half-open bounds wholly within the
+-- pass's render area, which touching its edges and covering all of it satisfy.
+-- The clear needs no bound pipeline, viewport or scissor, leaves every binding
+-- a draw uses as it was, and is not narrowed by a scissor that is set.
+--
+-- The clear is ordered with the pass's draws as a draw is: draws recorded
+-- before it see the old depth and draws after it see the cleared depth. It is
+-- a use of the depth target within the pass already entered, so the target's
+-- barriers, use and retention are those of the pass.
+--
+-- Refused with no native call: a session that has failed; a closed recorder;
+-- no pass open, or an open pass with no depth attachment, as 'RefusedIllegal';
+-- an empty rectangle, one with a negative offset, or one that does not lie
+-- wholly within the render area, as 'RefusedIllegal'; and a value that is not
+-- finite or lies outside zero to one, as 'RefusedIllegal'.
+clearDepthRect ∷ Recorder q inst msgr phys dev cmd → Rect → Float → IO (Either Refusal ())
+clearDepthRect recorder rect value =
+  owned recording . checkpointed recording . command recorder $ \state → do
+    attachment ← maybe (Left (RefusedIllegal "clearing depth with no pass open")) Right (stateRendering state)
+    when (isNothing (attachmentDepth attachment)) $
+      Left (RefusedIllegal "clearing depth in a pass with no depth attachment")
+    depthRectFits rect attachment
+    when (isNaN value || isInfinite value || value < 0 || value > 1) $
+      Left (RefusedIllegal "a depth clear value that is not between zero and one")
+    Right (state, [], CommandClearDepthRect rect value)
+  where
+    recording = recorderRecording recorder
+
+-- | A depth clear's rectangle against the render area of the pass it clears
+-- in: the scissor's rule, with an empty rectangle refused too. The far edges
+-- are summed as integers, so no extent overflows.
+depthRectFits ∷ Rect → Attachment → Either Refusal ()
+depthRectFits rect attachment
+  | rectWidth rect == 0 || rectHeight rect == 0 = Left (RefusedIllegal "a depth clear rectangle with no area")
+  | rectX rect < 0 || rectY rect < 0 = Left (RefusedIllegal "a depth clear rectangle with a negative offset")
+  | reach (rectX rect) (rectWidth rect) > toInteger (extentWidth extent)
+      || reach (rectY rect) (rectHeight rect) > toInteger (extentHeight extent) =
+      Left (RefusedIllegal "a depth clear rectangle outside the render area")
+  | otherwise = Right ()
+  where
+    extent = attachmentExtent attachment
+    reach offset size = toInteger offset + toInteger size
+
 -- | End dynamic rendering. On a labelled batch the pass's label closes after it.
 endRendering ∷ Recorder q inst msgr phys dev cmd → IO (Either Refusal ())
 endRendering recorder = commandSequence recorder $ \state →
@@ -1110,7 +1163,13 @@ bindPipeline recorder (Pipeline pipeline) =
           -- table with the same push-constant ranges (GRS-7); and pushed
           -- constants, the sampler index among them, only under a layout with
           -- the same ranges.
-          table = fmap (\binding → if isJust (interfaceTable interface) && bindingRanges binding == Just ranges then binding else binding {bindingRanges = Nothing}) (stateTable state)
+          -- A pipeline that leaves the sampler to its shaders and one that
+          -- has it pushed are of different kinds even over equal ranges, and
+          -- binding one over the other disturbs the table binding too.
+          sameKind = case statePipeline state of
+            Just previous → tableShaderSampled (interfaceTable (boundInterface previous)) == tableShaderSampled (interfaceTable interface)
+            Nothing → True
+          table = fmap (\binding → if isJust (interfaceTable interface) && sameKind && bindingRanges binding == Just ranges then binding else binding {bindingRanges = Nothing}) (stateTable state)
           sampler = case statePipeline state of
             Just previous | interfacePushConstants (boundInterface previous) == ranges && interfaceTable (boundInterface previous) == interfaceTable interface → stateSampler state
             _ → Nothing
@@ -1233,17 +1292,18 @@ drawIndexed recorder indices instances =
 
 -- | A draw with a pipeline whose layout holds the texture table needs the
 -- table bound compatibly — under a layout with the same push-constant ranges
--- — a sampler selected, and every image the batch's version can sample in
--- its sampled use: untouched by the batch, resting there, or returned to it
--- (GRS-7). A texture the batch has moved to another use cannot be sampled
--- through its descriptor's layout until it is moved back.
+-- — a sampler selected, unless the layout's shaders choose their samplers,
+-- and every image the batch's version can sample in its sampled use:
+-- untouched by the batch, resting there, or returned to it (GRS-7). A
+-- texture the batch has moved to another use cannot be sampled through its
+-- descriptor's layout until it is moved back.
 tableReady ∷ RecorderState → BoundPipeline → Either Refusal ()
 tableReady state bound = case interfaceTable (boundInterface bound) of
   Nothing → Right ()
   Just _
     | (stateTable state >>= bindingRanges) /= Just (interfacePushConstants (boundInterface bound)) →
         Left (RefusedIllegal "a draw with a pipeline holding the texture table before the table is bound under a compatible layout")
-    | isNothing (stateSampler state) → Left (RefusedIllegal "a draw with a pipeline holding the texture table before a sampler is selected")
+    | not (tableShaderSampled (interfaceTable (boundInterface bound))) && isNothing (stateSampler state) → Left (RefusedIllegal "a draw with a pipeline holding the texture table before a sampler is selected")
     | any elsewhere (maybe [] bindingImages (stateTable state)) →
         Left (RefusedIllegal "a draw through the texture table while the batch holds an image its version maps in a use other than sampling")
     | otherwise → Right ()
@@ -1315,14 +1375,16 @@ bindTable recorder =
 -- index, pushed at the offset the bound pipeline's layout declared for it,
 -- to every stage of the push-constant range holding it. Refused with no
 -- native call: a closed recorder; no pipeline bound, or one whose layout does
--- not hold the table; and an index beyond the table's four samplers, as
--- 'RefusedOutOfBounds'.
+-- not hold the table, or one whose layout's shaders choose their samplers
+-- ('Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Table.createShaderSampledTablePipelineLayout');
+-- and an index beyond the table's four samplers, as 'RefusedOutOfBounds'.
 selectSampler ∷ Recorder q inst msgr phys dev cmd → Word32 → IO (Either Refusal ())
 selectSampler recorder index = command recorder $ \state → case statePipeline state of
   Nothing → Left (RefusedIllegal "selecting a sampler with no pipeline bound")
   Just bound → case interfaceTable (boundInterface bound) of
     Nothing → Left (RefusedIllegal "selecting a sampler under a pipeline whose layout does not hold the texture table")
-    Just offset
+    Just TableShaderSampler → Left (RefusedIllegal "selecting a sampler under a pipeline whose layout's shaders choose their samplers")
+    Just (TablePushedSampler offset)
       | index > 3 → Left (RefusedOutOfBounds (fromIntegral index) 3)
       | otherwise →
           let stages = case [rangeStages range | range ← interfacePushConstants (boundInterface bound), rangeOffset range <= offset, toInteger offset + 4 <= toInteger (rangeOffset range) + toInteger (rangeSize range)] of
@@ -1713,10 +1775,13 @@ pushConstants recorder stages offset bytes = command recorder $ \state → case 
       let (low, high) = extent range
        in when (low < reach && start < high && any (`notElem` stages) (rangeStages range)) $
             Left (RefusedIllegal "a push that leaves out a stage of a range its bytes overlap")
-    -- The texture table's sampler index is the recorder's to push (GRS-7).
-    for_ (interfaceTable (boundInterface bound)) $ \sampler →
-      when (toInteger sampler < reach && start < toInteger sampler + 4) $
-        Left (RefusedIllegal "a push over the sampler index, which selectSampler sets")
+    -- The texture table's pushed sampler index is the recorder's to push
+    -- (GRS-7); a layout whose shaders choose their samplers reserves none.
+    for_ (interfaceTable (boundInterface bound)) $ \case
+      TableShaderSampler → pure ()
+      TablePushedSampler sampler →
+        when (toInteger sampler < reach && start < toInteger sampler + 4) $
+          Left (RefusedIllegal "a push over the sampler index, which selectSampler sets")
     Right (state, [boundLayout bound], CommandPushConstants (interfaceLayout (boundInterface bound)) (nub stages) offset bytes)
 
 -- | Claim a region of the session's shared ring for this batch (D-33): this
