@@ -665,15 +665,17 @@ Owner decision 2026-10-12; resolves Q-2.
 Owner decision 2026-10-12; resolves Q-3.
 
 An animated instance names a frame table: a frame count, a frame duration
-and per-frame UV rectangles. The view pushes the current time and the shader
-selects the frame. It works identically for retained and dynamic content, so
-animation never forces a rebuild. The instance names its table by a 12-bit
-frame-table index in the flags word (P-4), 0 meaning not animated; where
-frame tables are stored is settled with the slice that delivers them
-(R2D-18).
+and per-frame UV rectangles. The frame is chosen exactly from the view's
+time, once per table, and the shader applies it. It works identically for
+retained and dynamic content, so animation never forces a rebuild. The
+instance names its table by a 12-bit frame-table index in the flags word
+(P-4), 0 meaning not animated; where frame tables are stored is settled with
+the slice that delivers them (R2D-18).
 
 Rejected: rebuilding chunks to animate, which defeats retention for maps
-with animated tiles.
+with animated tiles; selecting the frame in the shader from a 32-bit time or
+phase, which can disagree with the exact formula and overflow for huge
+durations (owner decision 2026-10-12, after #431's review).
 
 ## Open questions
 
@@ -1018,8 +1020,8 @@ Moved to the [asset design](asset_design.md) as AST-2 (D-15).
   and the checked shader interface admitting the set; contract updates in
   `gpu_backend.md`.
 - **Phase:** 3
-- **Depends on:** `none`
-- **Ordering:** can land first
+- **Depends on:** R2D-16
+- **Ordering:** not on the critical path
 - **Relevant decisions:** D-11, D-25, D-30
 - **Acceptance signals:** native-suite evidence of a draw reading a
   per-batch table at a dynamic offset, with clean validation; misaligned or
@@ -1065,9 +1067,11 @@ Moved to the [asset design](asset_design.md) as AST-2 (D-15).
 - **Scope:** the frame-table index in flags bits 4–15 (P-4); per-view frame
   tables (frame count, frame duration, per-frame UV rectangles) written to
   the batch's storage region (R2D-15); a per-view animation time carried by
-  the snapshot; shader frame selection `floor(time / duration) mod count`;
-  `render-2d-oracle` support; for retained and dynamic content alike
-  (D-32).
+  the snapshot; each table's current frame `floor(time / duration) mod
+  count`, computed exactly in `Double` once per table and written with it,
+  so the shader only looks up that frame's UV rectangle and does no time
+  arithmetic; `render-2d-oracle` support; for retained and dynamic content
+  alike, with references resolved against the view drawing them (D-32).
 - **Phase:** 3
 - **Depends on:** R2D-7, R2D-15, R2D-10
 - **Ordering:** not on the critical path
