@@ -150,6 +150,8 @@ the audited suite inventory, and which optional probes are local-only.
 | `test.vulkan-diagnostics` | `cabal test --project-file cabal.project.cpu hetoimasia-gpu-vulkan-diagnostics:diagnostics-tests --test-show-details=direct` | no | no | any |
 | `test.math` | `cabal test --project-file cabal.project.cpu hetoimasia-math:math-tests --test-show-details=direct` | no | no | any |
 | `test.asset-image` | `cabal test --project-file cabal.project.cpu hetoimasia-asset-image:asset-image-tests --test-show-details=direct` | no | no | any |
+| `test.render-api` | `cabal test --project-file cabal.project.cpu hetoimasia-render-api:render-api-tests --test-show-details=direct` | no | no | any |
+| `test.render-2d` | `cabal test --project-file cabal.project.cpu hetoimasia-render-2d:render-2d-tests --test-show-details=direct` | no | no | any |
 | `smoke.console` | `cabal run exe:hetoimasia -- --smoke` | no | yes | any |
 | `test.workflow` | `cabal test workflow-tests --test-show-details=direct` | no | no | any |
 | `test.x11-helper` | `cabal test x11-helper-tests --test-show-details=direct` | yes | no | any |
@@ -286,6 +288,32 @@ through `cabal.project.cpu` for the same reason. Its fixtures sit under the
 suite's own source directory, `packages/asset-image/test/`, so they are inputs
 derived from its component and a fixture-only change selects it. See
 [the package's contract](../packages/asset-image/README.md).
+
+`test.render-api` runs the render-api package's own suite: the opaque texture
+handle's construction and access through its backend-facing module at every
+`Word32` edge and over generated values, its equality, ordering and `show`, and
+separately compiled external clients proving that the public module supplies
+the instances but neither the constructor, a field reader, record update nor
+the backend's construction function. It is mandatory but outside the floor,
+like `test.math`, and runs through `cabal.project.cpu`: the library depends on
+`base` alone. See [the package's contract](../packages/render-api/README.md).
+
+`test.render-2d` runs the render-2d package's own suite: snapshot validation
+refusing, with every reason found and its pass, view, layer and instance index,
+each non-finite or out-of-range value the contract names at its boundary
+(depth keys 2²⁴ − 1, 2²⁴ and 2³² − 1; the UI scale and brightness ranges; NaN
+and both infinities), a second or non-final window pass and a non-zero clip
+index, with faults at different locations retained together, including inside
+a zero-size viewport; offscreen-only snapshots accepted and valid snapshots
+unchanged; the discrete-step-zoom list's refusals; the 64-byte little-endian
+instance layout checked field by field against bytes written out by hand and an
+independent reference encoder, for zero, one and many instances; the flags
+word for every sampler choice and flag combination with its reserved bits zero
+and the clip index in the top 16 bits; and external clients proving that
+validated values and offscreen target references cannot be forged. It is
+mandatory but outside the floor, like `test.math`, and runs through
+`cabal.project.cpu`: the library depends on no GPU, GLFW, Vulkan, runtime or
+Lua package. See [the package's contract](../packages/render-2d/README.md).
 
 `test.vulkan-headless` runs the Vulkan-linked headless suites through
 `cabal.project.vulkan`, against the provisioned native prefix, and executes them
@@ -801,7 +829,7 @@ Each worker is declared once, to the planner:
 
 ```bash
 python3 tools/validation/plan.py --base origin/master --head HEAD \
-  --worker haskell-engine=cpu:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.vulkan,test.vulkan-diagnostics,test.math,test.asset-image,smoke.console \
+  --worker haskell-engine=cpu:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.vulkan,test.vulkan-diagnostics,test.math,test.asset-image,test.render-api,test.render-2d,smoke.console \
   --worker haskell-workflow=cpu:test.workflow \
   --worker glfw-native=display:test.glfw-native,test.glfw-wayland \
   --worker vulkan=cpu+display:test.vulkan-headless,test.vulkan-native,test.vulkan-wayland
@@ -966,7 +994,7 @@ class to every execution:
 
 | Job | Runner class | Groups, in order |
 | --- | --- | --- |
-| `haskell-engine` | `cpu` | `build.all`, `test.engine`, `test.foundation`, `test.runtime`, `test.glfw`, `test.scripting-lua`, `test.vulkan`, `test.vulkan-diagnostics`, `test.math`, `test.asset-image`, `smoke.console` |
+| `haskell-engine` | `cpu` | `build.all`, `test.engine`, `test.foundation`, `test.runtime`, `test.glfw`, `test.scripting-lua`, `test.vulkan`, `test.vulkan-diagnostics`, `test.math`, `test.asset-image`, `test.render-api`, `test.render-2d`, `smoke.console` |
 | `haskell-workflow` | `cpu` | `test.workflow` |
 | `glfw-native` | `display` | `test.glfw-native`, `test.glfw-wayland` |
 | `vulkan` | `cpu`, `display` | `test.vulkan-headless`, `test.vulkan-native`, `test.vulkan-wayland` |
@@ -2361,7 +2389,7 @@ contributes, one `--toolchain` each:
 toolchain=(--toolchain "ghc=$(ghc --numeric-version)" --toolchain "cabal=$(cabal --numeric-version)")
 while IFS= read -r entry; do toolchain+=(--toolchain "$entry"); done < <(python3 tools/native/native.py toolchain)
 python3 tools/validation/plan.py --base origin/master --head HEAD --runner-os Darwin "${toolchain[@]}" \
-  --worker local=cpu+display:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.vulkan,test.vulkan-diagnostics,test.math,test.asset-image,test.vulkan-headless,test.vulkan-native,smoke.console,test.workflow,test.glfw-native \
+  --worker local=cpu+display:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.vulkan,test.vulkan-diagnostics,test.math,test.asset-image,test.render-api,test.render-2d,test.vulkan-headless,test.vulkan-native,smoke.console,test.workflow,test.glfw-native \
   --json > plan.json
 python3 -I tools/validation/run.py test.workflow --plan plan.json --receipts receipts \
   --worker local --runner-class cpu --runner-class display \
@@ -2485,7 +2513,7 @@ REQUEST
 python3 tools/validation/plan.py --base origin/master --head HEAD --runner-os Darwin \
   --toolchain "ghc=$(ghc --numeric-version)" --toolchain "cabal=$(cabal --numeric-version)" \
   --request-file request.txt \
-  --worker local=cpu+display:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.vulkan,test.vulkan-diagnostics,test.math,test.asset-image,test.vulkan-headless,test.vulkan-native,smoke.console,test.workflow,test.glfw-native,test.macos-confinement \
+  --worker local=cpu+display:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.vulkan,test.vulkan-diagnostics,test.math,test.asset-image,test.render-api,test.render-2d,test.vulkan-headless,test.vulkan-native,smoke.console,test.workflow,test.glfw-native,test.macos-confinement \
   --json > plan.json
 python3 -I tools/validation/run.py test.macos-confinement --plan plan.json --receipts receipts \
   --worker local --runner-class cpu --runner-class display \
