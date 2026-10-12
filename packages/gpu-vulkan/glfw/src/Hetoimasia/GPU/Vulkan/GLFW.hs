@@ -29,6 +29,15 @@
 -- on their own evidence. A main-thread stall delays what the main thread
 -- publishes and nothing the owner already holds.
 --
+-- A host configured with 'PerWindowScenes' (R2D-14) carries a scene for each
+-- window instead of one for the whole owner: 'publishVulkanWindowScene'
+-- publishes a window's scene and asks that window's target alone for a frame,
+-- the renderer is handed the scene of the window it renders, and the host's
+-- 'SceneLifecycle' hears when a target adopts a revision and when one may be
+-- let go. 'requestVulkanRelease' queues an owner-thread action that waits for
+-- the revisions the owner must have adopted first, and 'readVulkanSceneState'
+-- reads it all. A shared host, the default, is unchanged.
+--
 -- The renderer is the consumer's (VK-19). Each frame's 'FrameRequest' names
 -- its target, slot and image and the image's extent and color format before
 -- the renderer records anything, and the renderer is lent the session's

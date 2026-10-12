@@ -851,7 +851,10 @@ readReadiness (VulkanController state) =
 -- | The operations the graphics owner runs, on its own thread, rendering the
 -- scene it holds with this renderer.
 --
--- The progress step raises a latched failure; destroys the surface of any
+-- The progress step raises a latched failure; adopts, for every constructed
+-- target, the scene of its window (or the shared scene) whether or not a frame
+-- is rendered, before anything else it does ("Hetoimasia.GPU.Vulkan.GLFW.Internal.Scenes");
+-- destroys the surface of any
 -- attachment whose announcement the port refused and whose slot has since
 -- begun retiring; folds the step's demand and scene into render requests and,
 -- when a poll is due or a frame is to be attempted, asks the fences
