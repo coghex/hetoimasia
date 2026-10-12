@@ -17,7 +17,7 @@
 module Test.Render.TwoD.DrawPlan (spec) where
 
 import Data.List (nub, sort)
-import Data.Word (Word32, Word8)
+import Data.Word (Word32)
 import Hetoimasia.Math.Vector (V2 (..))
 import Hetoimasia.Render.Api.Texture (TextureHandle)
 import Hetoimasia.Render.Api.Texture.Backend (textureHandle)
