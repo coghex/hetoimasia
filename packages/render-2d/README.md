@@ -80,7 +80,7 @@ any other.
 | `CameraPositionNotFinite`, `CameraRotationNotFinite` | the position or rotation has a NaN or infinite value |
 | `CameraZoomInvalid` | the zoom is NaN, infinite, zero or negative |
 | `ViewportNotFinite` | the origin or extent has a NaN or infinite component |
-| `ViewportExtentNegative` | a finite extent is negative |
+| `ViewportExtentNegative` | an extent component is negative, negative infinity included; checked independently of `ViewportNotFinite`, so a viewport can be refused for both |
 | `UiScaleOutOfRange` | the UI scale is NaN, infinite or outside [0.5, 4.0] |
 | `BrightnessOutOfRange` | the brightness is NaN, infinite or outside [0.5, 3.0] |
 | `HalfHeightInvalid` | a fixed half-height is NaN, infinite, zero or negative |
@@ -113,7 +113,7 @@ It is a list of zoom levels read in a view's zoom mode; smooth zoom stays
 available whatever the list holds. `validateZoomSteps` refuses an empty list
 (`ZoomListEmpty`), a level that is NaN, infinite, zero or negative
 (`ZoomLevelInvalid`), and a level not greater than the one before it
-(`ZoomLevelNotIncreasing`, reported only between two finite levels), each
+(`ZoomLevelNotIncreasing`, checked independently of the first and skipped only next to a NaN, which has no order), each
 naming the level (`AtLevel`) and all together. The default list is the whole
 numbers 1 to 8.
 
