@@ -223,39 +223,53 @@ probe = Probe
 -- The fixtures
 
 -- | Both zoom modes, each with pixel snap off and on, in four 16 × 16 views
--- over one 32 × 32 target. A 2.1-unit sprite is 8.4 pixels at 4 pixels per unit
--- (camera 1.4, so its origin is at 2.4 within its view) and 4.2 pixels at 2
--- (camera 1.3, so at 5.4): with snap on the camera's translation and then the
--- sprite's origin round to whole pixels, which moves the fractional right edge
--- (10.8 to 10.4, 9.6 to 9.2) across the centre of one column.
+-- over one 32 × 32 target; every sprite is 2.1 world units wide, and each view's
+-- own pixel coordinates are worked out below. With snap on the camera's
+-- translation rounds (in 'worldTransform') and then the sprite's origin rounds
+-- rigidly, in the vertex shader, so each of the two roundings moves a column
+-- edge across a pixel centre that the unsnapped view keeps on the other side.
 --
--- View 0: pixels per unit, snap off, columns 2 to 10 covered. View 1: snap on,
--- columns 2 to 9. View 2: fixed half-height 4 at zoom 1, snap off, scale 2,
--- columns 5 to 9. View 3: the same with snap on, columns 5 to 8.
+-- * View 0: 4 pixels per unit, snap off, camera 1.45, sprite origin (0.1, 0.1):
+--   the translation is 8 − 5.8 = 2.2 and the sprite begins at 2.6 and ends at
+--   11.0, so columns and rows 3 to 10 are covered.
+-- * View 1: the same with snap on: the translation rounds to 2, the sprite's
+--   origin to 2.4, which the shader rounds to 2.0, so it ends at 10.4 and
+--   columns and rows 2 to 9 are covered. Without the shader's rounding it would
+--   cover 3 to 10 (origin 2.4 to 10.8: column 2 not, column 10 yes) and without
+--   the camera's, 3 to 10 again (origin 2.6 rounds to 3.0).
+-- * View 2: fixed half-height 4 at zoom 1, so 2 pixels per unit in a viewport 16
+--   tall, snap off, camera 1.1, sprite origin (0.3, 0.3): the translation is
+--   8 − 2.2 = 5.8, the sprite begins at 6.4 and ends at 10.6, so columns and
+--   rows 6 to 10 are covered.
+-- * View 3: the same with snap on: the translation rounds to 6, the origin to
+--   6.6, which the shader rounds to 7, so it ends at 11.2 and columns and rows
+--   7 to 10 are covered.
 placement ∷ Fixture
 placement =
   Fixture
     { fixtureName = "placement"
     , fixtureShapes = [shape]
     , fixtureSnapshot = \handles →
-        let sprite = quad (0, 0) (2.1, 2.1) (handleOf handles Checker)
+        let checker = handleOf handles Checker
+            sprite origin = quad origin (2.1, 2.1) checker
             ppu snap = defaultViewSettings {settingPixelSnap = snap}
             fixed snap = defaultViewSettings {settingPixelSnap = snap, settingZoomMode = FixedHalfHeight 4}
-            at origin camera settings = view origin (16, 16) camera settings [WorldLayer DepthDisabled [sprite]]
+            at origin camera settings instance' = view origin (16, 16) camera settings [WorldLayer DepthDisabled [instance']]
          in Snapshot
               [ pass
                   shape
                   (0.1, 0.1, 0.1, 1)
-                  [ at (0, 0) (Camera (V2 1.4 1.4) 4 Nothing) (ppu False)
-                  , at (16, 0) (Camera (V2 1.4 1.4) 4 Nothing) (ppu True)
-                  , at (0, 16) (Camera (V2 1.3 1.3) 1 Nothing) (fixed False)
-                  , at (16, 16) (Camera (V2 1.3 1.3) 1 Nothing) (fixed True)
+                  [ at (0, 0) (Camera (V2 1.45 1.45) 4 Nothing) (ppu False) (sprite (0.1, 0.1))
+                  , at (16, 0) (Camera (V2 1.45 1.45) 4 Nothing) (ppu True) (sprite (0.1, 0.1))
+                  , at (0, 16) (Camera (V2 1.1 1.1) 1 Nothing) (fixed False) (sprite (0.3, 0.3))
+                  , at (16, 16) (Camera (V2 1.1 1.1) 1 Nothing) (fixed True) (sprite (0.3, 0.3))
                   ]
               ]
     , fixtureNamed =
-        [ NamedProbe "pixel snap on moves a fractional sprite's right edge off column 10 (pixels per unit)" (probe 0 26 5) (probe 0 10 5)
-        , NamedProbe "pixel snap on moves a fractional sprite's right edge off column 9 (fixed half-height)" (probe 0 25 22) (probe 0 9 22)
-        , NamedProbe "a fixed half-height scales the world by the viewport's height, not by the zoom" (probe 0 10 22) (probe 0 10 5)
+        [ NamedProbe "pixel snap on rounds the sprite's right edge back across column 10 (pixels per unit)" (probe 0 26 5) (probe 0 10 5)
+        , NamedProbe "pixel snap on rounds the sprite's left edge back across column 2 (pixels per unit)" (probe 0 18 5) (probe 0 2 5)
+        , NamedProbe "pixel snap on rounds a fixed half-height sprite's origin up past column 6" (probe 0 22 23) (probe 0 6 23)
+        , NamedProbe "a fixed half-height scales the world by the viewport's height, not by the zoom" (probe 0 3 23) (probe 0 3 5)
         ]
     }
   where
