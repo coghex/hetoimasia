@@ -11,6 +11,8 @@
 -- list must be non-empty, every level finite and positive, and the levels
 -- strictly increasing. The default list is the whole numbers 1 to 8.
 --
+-- 'stepZoomIn' and 'stepZoomOut' move a zoom value through a validated list.
+--
 -- __Dependencies.__ @base@ and the package's hidden checks.
 --
 -- __State.__ The module owns none.
@@ -19,13 +21,21 @@ module Hetoimasia.Render.TwoD.ZoomSteps
   , zoomLevels
   , defaultZoomSteps
   , validateZoomSteps
+
+    -- * Stepping
+  , stepZoomIn
+  , stepZoomOut
+
+    -- * Refusals
   , ZoomRefusal (..)
   , ZoomLocation (..)
   , ZoomReason (..)
   ) where
 
+import Data.Foldable (find)
 import Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.List.NonEmpty as NonEmpty
+import Data.Maybe (fromMaybe)
 import Hetoimasia.Render.TwoD.Internal.Check (positiveFinite)
 
 -- | A validated list of zoom levels: non-empty, finite, positive and strictly
@@ -41,6 +51,25 @@ zoomLevels (ZoomSteps levels) = levels
 -- | The whole numbers 1 to 8.
 defaultZoomSteps ∷ ZoomSteps
 defaultZoomSteps = ZoomSteps (1 :| [2 .. 8])
+
+-- | Step in: the smallest level greater than the current zoom, or the largest
+-- level when none is greater. The result is always one of the list's levels.
+--
+-- The levels and the zoom value are read in the same zoom mode, so the
+-- function does not depend on which: it only compares numbers. Smooth zoom is a
+-- plain zoom value that these functions never touch. A zoom that is NaN has no
+-- greater level, so it steps to the largest; a validated camera zoom is never
+-- NaN.
+stepZoomIn ∷ ZoomSteps → Float → Float
+stepZoomIn (ZoomSteps levels) zoom =
+  fromMaybe (NonEmpty.last levels) (find (> zoom) levels)
+
+-- | Step out: the largest level smaller than the current zoom, or the smallest
+-- level when none is smaller. The result is always one of the list's levels.
+-- A NaN zoom has no smaller level, so it steps to the smallest.
+stepZoomOut ∷ ZoomSteps → Float → Float
+stepZoomOut (ZoomSteps levels) zoom =
+  fromMaybe (NonEmpty.head levels) (find (< zoom) (NonEmpty.reverse levels))
 
 -- | Where a refusal was found.
 data ZoomLocation

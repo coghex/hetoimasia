@@ -8,7 +8,7 @@ import qualified Data.List.NonEmpty as NonEmpty
 import Hetoimasia.Render.TwoD.ZoomSteps
 import Test.Hspec (Spec, describe, it, shouldBe)
 import Test.Hspec.QuickCheck (prop)
-import Test.QuickCheck (Gen, counterexample, elements, forAll, listOf, property)
+import Test.QuickCheck (Gen, choose, counterexample, elements, forAll, listOf, property, suchThat, (===))
 
 spec ∷ Spec
 spec = describe "ZoomSteps" $ do
@@ -54,6 +54,85 @@ spec = describe "ZoomSteps" $ do
         , at 6 ZoomLevelNotIncreasing
         ]
 
+  describe "stepping" $ do
+    let levels = defaultZoomSteps
+        custom = either (error "invalid") id (validateZoomSteps [0.5, 1.5, 4])
+
+    it "steps in to the smallest level greater than the zoom" $ do
+      stepZoomIn levels 3 `shouldBe` 4
+      stepZoomIn levels 3.5 `shouldBe` 4
+      stepZoomIn levels 2.999 `shouldBe` 3
+      stepZoomIn levels 1 `shouldBe` 2
+      stepZoomIn custom 1 `shouldBe` 1.5
+      stepZoomIn custom 1.5 `shouldBe` 4
+
+    it "steps out to the largest level smaller than the zoom" $ do
+      stepZoomOut levels 3 `shouldBe` 2
+      stepZoomOut levels 3.5 `shouldBe` 3
+      stepZoomOut levels 3.001 `shouldBe` 3
+      stepZoomOut levels 8 `shouldBe` 7
+      stepZoomOut custom 1 `shouldBe` 0.5
+      stepZoomOut custom 1.5 `shouldBe` 0.5
+
+    it "steps in to the largest level when none is greater" $ do
+      stepZoomIn levels 8 `shouldBe` 8
+      stepZoomIn levels 9 `shouldBe` 8
+      stepZoomIn levels 1.0e30 `shouldBe` 8
+      stepZoomIn custom 4 `shouldBe` 4
+
+    it "steps out to the smallest level when none is smaller" $ do
+      stepZoomOut levels 1 `shouldBe` 1
+      stepZoomOut levels 0.5 `shouldBe` 1
+      stepZoomOut levels 1.0e-30 `shouldBe` 1
+      stepZoomOut custom 0.5 `shouldBe` 0.5
+
+    it "steps from below the smallest level and above the largest" $ do
+      stepZoomIn levels 0.25 `shouldBe` 1
+      stepZoomIn levels 0 `shouldBe` 1
+      stepZoomOut levels 8.5 `shouldBe` 8
+      stepZoomOut levels 1.0e30 `shouldBe` 8
+
+    it "gives the largest or the smallest level for a NaN zoom, which has no order" $ do
+      stepZoomIn levels nan `shouldBe` 8
+      stepZoomOut levels nan `shouldBe` 1
+
+    it "steps through a one-level list to that level" $ do
+      let one = either (error "invalid") id (validateZoomSteps [2])
+      map (stepZoomIn one) [0.1, 2, 9] `shouldBe` [2, 2, 2]
+      map (stepZoomOut one) [0.1, 2, 9] `shouldBe` [2, 2, 2]
+
+    prop "always gives a level of the list" $
+      forAll ((,) <$> validList <*> zoomValue) $ \(steps, zoom) →
+        property (all (`elem` NonEmpty.toList (zoomLevels steps)) [stepZoomIn steps zoom, stepZoomOut steps zoom])
+
+    prop "moves in the stated direction until the end of the list" $
+      forAll ((,) <$> validList <*> zoomValue) $ \(steps, zoom) →
+        let top = NonEmpty.last (zoomLevels steps)
+            bottom = NonEmpty.head (zoomLevels steps)
+         in property
+              ( (stepZoomIn steps zoom > zoom || stepZoomIn steps zoom == top)
+                  && (stepZoomOut steps zoom < zoom || stepZoomOut steps zoom == bottom)
+              )
+
+    prop "gives the neighbouring level, with nothing between" $
+      forAll ((,) <$> validList <*> zoomValue) $ \(steps, zoom) →
+        let ls = NonEmpty.toList (zoomLevels steps)
+            up = stepZoomIn steps zoom
+            down = stepZoomOut steps zoom
+         in property
+              ( not (any (\l → l > zoom && l < up) ls)
+                  && not (any (\l → l < zoom && l > down) ls)
+              )
+
+    prop "steps in and then out, or out and then in, between levels" $
+      forAll (validList `suchThat` ((> 1) . length . zoomLevels)) $ \steps →
+        let ls = NonEmpty.toList (zoomLevels steps)
+            inner = take (length ls - 2) (drop 1 ls)
+         in property (all (\l → stepZoomOut steps (stepZoomIn steps l) == l && stepZoomIn steps (stepZoomOut steps l) == l) inner)
+
+    prop "leaves smooth zoom alone: it is a plain value, and stepping reads it only" $
+      forAll zoomValue $ \zoom → stepZoomIn levels zoom === stepZoomIn levels zoom
+
   it "is exercised for every reason it can give" $
     sort (nub [zoomRefusalReason refusal | (_, _, expected) ← refusalCases, refusal ← expected])
       `shouldBe` [minBound .. maxBound]
@@ -98,6 +177,22 @@ validateZoomSteps' ∷ [Float] → Either [ZoomRefusal] [Float]
 validateZoomSteps' levels = case validateZoomSteps levels of
   Left refused → Left (NonEmpty.toList refused)
   Right accepted → Right (NonEmpty.toList (zoomLevels accepted))
+
+-- | A valid list: strictly increasing positive levels, one to six of them.
+validList ∷ Gen ZoomSteps
+validList = do
+  count ← choose (1, 6 ∷ Int)
+  increments ← mapM (const (choose (0.01, 5))) [1 .. count]
+  either (error "invalid") pure (validateZoomSteps (scanl1 (+) increments))
+
+-- | A zoom value anywhere a camera's might be, whole numbers and a level's
+-- neighbours included.
+zoomValue ∷ Gen Float
+zoomValue = elements [0.001, 0.5, 1, 1.5, 2, 3, 3.5, 7.999, 8, 8.5, 100, 1.0e30] `orElse` choose (0.001, 20)
+  where
+    orElse a b = do
+      pick ← choose (0, 1 ∷ Int)
+      if pick == 0 then a else b
 
 -- | A candidate list drawn from a pool that holds both valid and invalid
 -- levels, in any order.
