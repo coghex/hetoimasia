@@ -9,27 +9,35 @@
 -- its batch's submission and never by a discarded one; the retention of a
 -- released depth target until its batch has completed or been discarded; and
 -- the agreement between a pipeline and the pass it is drawn in, however the
--- commands are ordered.
+-- commands are ordered; and the clear of a rectangle of the open pass's depth
+-- attachment (R2D-17) in both pass kinds and both batch kinds, its refusals,
+-- its order among a pass's draws and its leaving the pass's barriers as they
+-- are.
 --
 -- Nothing here creates a Vulkan object, and nothing waits on a clock.
 module Test.GPU.Vulkan.Native.Depth (spec) where
 
+import Control.Concurrent (forkIO)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (atomically)
-import Control.Exception (ErrorCall (ErrorCall), throwIO, try)
+import Control.Monad (when)
+import Control.Exception (ErrorCall (ErrorCall), SomeException, throwIO, try)
 import qualified Data.ByteString as ByteString
-import Data.IORef (modifyIORef', newIORef, readIORef)
+import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Word (Word32, Word64)
 import Test.Hspec (Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy)
 
+import Hetoimasia.GPU.Model (SessionFailureCause (CleanupFailed))
 import Hetoimasia.GPU.Model.Identity (IdentityKind (..), Misuse (..))
 import Hetoimasia.GPU.Vulkan.Native.Frames
 import Hetoimasia.GPU.Vulkan.Native.Presentation (formatB8G8R8A8Srgb)
 import Hetoimasia.GPU.Vulkan.Native.Recording
+import Hetoimasia.GPU.Vulkan.Native.Roots (failRootsSessionBecause)
 import Test.GPU.Vulkan.Native.FramesRig
 import Test.GPU.Vulkan.Native.FramesStandIn
-import Test.GPU.Vulkan.Native.RecordingStandIn (RecordingCall (..), recordingCalls, standInImageLimits, supportImages)
+import Test.GPU.Vulkan.Native.RecordingStandIn (RecordingCall (..), RecordingFailure, RecordingStep (AtRecord), failAt, recordingCalls, standInImageLimits, supportImages)
 
 type Rec = Recorder () Int Int Text Int Word64
 
@@ -214,6 +222,245 @@ spec = describe "Depth attachments" $ do
             , beginRenderingInto recorder (kitColor kit) ClearTarget clearBlue
             ]
       fmap snd answer `shouldBe` Right [Left RefusedUninitialized, Left RefusedUninitialized]
+
+  describe "clearing depth within a rectangle (R2D-17)" $ do
+    it "records the clear in a frame-less batch's pass, journalled with its rectangle and value, and leaves the pass's other commands as they were" $ do
+      rig ← newRig
+      kit ← newKit rig Rgba8Srgb
+      before ← commandCount rig
+      answer ← framelessRun rig $ \recorder → do
+        ok (clearingPass kit recorder)
+        cleared ← clearDepthRect recorder (Rect 4 2 8 6) 0.25
+        ok (endRendering recorder)
+        pure cleared
+      answer `shouldBe` Right ()
+      commands ← drop before <$> commandsOf' rig
+      clearsIn commands `shouldBe` [(Rect 4 2 8 6, 0.25)]
+      clean rig
+
+    it "records it in a frame batch's pass into a managed color target" $ do
+      rig ← newRig
+      kit ← newKit rig Rgba8Srgb
+      frame ← owned rig
+      before ← commandCount rig
+      (batch, answer) ← recordFrame (rigRecording rig) (ownedFrame frame) (\recorder → do
+        ok (clearingPass kit recorder)
+        cleared ← clearDepthRect recorder (Rect 0 0 32 16) 1
+        ok (endRendering recorder)
+        pure cleared) >>= either (fail . show) pure
+      answer `shouldBe` Right ()
+      commands ← drop before <$> commandsOf' rig
+      clearsIn commands `shouldBe` [(Rect 0 0 32 16, 1)]
+      fmap viewBatchStanding <$> atomically (readBatch (rigRecording rig) batch) `shouldReturn` Just BatchSealed
+      clean rig
+
+    it "records it in a frame batch's pass into the frame's image with the generation's depth image" $ do
+      rig ← newRigWindowDepth WindowedDepth
+      generation ← activeGeneration rig
+      Just depth ← atomically (windowDepthOf (rigRecording rig) generation)
+      frame ← owned rig
+      before ← commandCount rig
+      (_, answers) ← recordFrame (rigRecording rig) (ownedFrame frame) (\recorder → do
+        ok (transitionImage recorder LayoutUndefined LayoutColorAttachment)
+        ok (beginFrameRenderingWithDepth recorder clearBlue (clearedDepth depth ClearFromUndefined))
+        inside ← clearDepthRect recorder (Rect 100 50 300 200) 0.5
+        whole ← clearDepthRect recorder (Rect 0 0 640 480) 0
+        beyond ← clearDepthRect recorder (Rect 1 0 640 480) 0
+        ok (endRendering recorder)
+        ok (transitionImage recorder LayoutColorAttachment LayoutPresentSource)
+        pure [inside, whole, beyond]) >>= either (fail . show) pure
+      answers
+        `shouldBe` [ Right ()
+                   , Right ()
+                   , Left (RefusedIllegal "a depth clear rectangle outside the render area")
+                   ]
+      commands ← drop before <$> commandsOf' rig
+      clearsIn commands `shouldBe` [(Rect 100 50 300 200, 0.5), (Rect 0 0 640 480, 0)]
+      clean rig
+
+    it "accepts every rectangle within the render area, touching its edges or covering all of it" $ do
+      rig ← newRig
+      kit ← newKit rig Rgba8Srgb
+      before ← commandCount rig
+      answers ← framelessRun rig $ \recorder → do
+        ok (clearingPass kit recorder)
+        cleared ← mapM (\rect → clearDepthRect recorder rect 0.75) fits
+        ok (endRendering recorder)
+        pure cleared
+      answers `shouldBe` map (const (Right ())) fits
+      commands ← drop before <$> commandsOf' rig
+      map fst (clearsIn commands) `shouldBe` fits
+      clean rig
+
+    it "refuses, recording nothing, a rectangle with no area, a negative offset or an extent beyond the render area, however large" $ do
+      rig ← newRig
+      kit ← newKit rig Rgba8Srgb
+      before ← commandCount rig
+      answers ← framelessRun rig $ \recorder → do
+        ok (clearingPass kit recorder)
+        refused ← mapM (\rect → clearDepthRect recorder rect 0.5) (map fst misfits)
+        ok (endRendering recorder)
+        pure refused
+      answers `shouldBe` [Left (RefusedIllegal reason) | (_, reason) ← misfits]
+      commands ← drop before <$> commandsOf' rig
+      clearsIn commands `shouldBe` []
+      clean rig
+
+    it "refuses, recording nothing, a value that is not finite or lies outside zero to one, and accepts zero and one" $ do
+      rig ← newRig
+      kit ← newKit rig Rgba8Srgb
+      before ← commandCount rig
+      answers ← framelessRun rig $ \recorder → do
+        ok (clearingPass kit recorder)
+        refused ← mapM (clearDepthRect recorder (Rect 0 0 8 8)) [nan, infinity, -infinity, 1.5, -0.25]
+        accepted ← mapM (clearDepthRect recorder (Rect 0 0 8 8)) [0, 1]
+        ok (endRendering recorder)
+        pure (refused, accepted)
+      answers
+        `shouldBe` ( replicate 5 (Left (RefusedIllegal "a depth clear value that is not between zero and one"))
+                   , [Right (), Right ()]
+                   )
+      commands ← drop before <$> commandsOf' rig
+      map snd (clearsIn commands) `shouldBe` [0, 1]
+
+    it "refuses, recording nothing, outside a pass and in a pass with no depth attachment" $ do
+      rig ← newRig
+      kit ← newKit rig Rgba8Srgb
+      before ← commandCount rig
+      answers ← framelessRun rig $ \recorder → do
+        unopened ← clearDepthRect recorder (Rect 0 0 8 8) 0.5
+        ok (beginRenderingInto recorder (kitColor kit) ClearFromUndefined clearBlue)
+        colourOnly ← clearDepthRect recorder (Rect 0 0 8 8) 0.5
+        ok (endRendering recorder)
+        ended ← clearDepthRect recorder (Rect 0 0 8 8) 0.5
+        pure [unopened, colourOnly, ended]
+      answers
+        `shouldBe` [ Left (RefusedIllegal "clearing depth with no pass open")
+                   , Left (RefusedIllegal "clearing depth in a pass with no depth attachment")
+                   , Left (RefusedIllegal "clearing depth with no pass open")
+                   ]
+      commands ← drop before <$> commandsOf' rig
+      clearsIn commands `shouldBe` []
+
+    it "refuses in a frame batch outside a pass, and in the frame's own pass, which has no depth attachment" $ do
+      rig ← newRig
+      frame ← owned rig
+      (_, answers) ← recordFrame (rigRecording rig) (ownedFrame frame) (\recorder → do
+        unopened ← clearDepthRect recorder (Rect 0 0 8 8) 0.5
+        ok (transitionImage recorder LayoutUndefined LayoutColorAttachment)
+        ok (beginRendering recorder clearBlue)
+        colourOnly ← clearDepthRect recorder (Rect 0 0 8 8) 0.5
+        ok (endRendering recorder)
+        ok (transitionImage recorder LayoutColorAttachment LayoutPresentSource)
+        pure [unopened, colourOnly]) >>= either (fail . show) pure
+      answers
+        `shouldBe` [ Left (RefusedIllegal "clearing depth with no pass open")
+                   , Left (RefusedIllegal "clearing depth in a pass with no depth attachment")
+                   ]
+      commands ← commandsOf' rig
+      clearsIn commands `shouldBe` []
+
+    it "refuses once the session has failed, with the pass still open, recording no clear" $ do
+      rig ← newRig
+      kit ← newKit rig Rgba8Srgb
+      outcome ← newIORef Nothing
+      _ ← try @SomeException $ withFramelessScope (rigFrames rig) $ \scope →
+        recordFramelessIn scope $ \recorder → do
+          ok (clearingPass kit recorder)
+          ok (clearDepthRect recorder (Rect 0 0 8 8) 0.5)
+          atomically (failRootsSessionBecause (rigRoots rig) CleanupFailed "a later cleanup failed")
+          before ← commandCount rig
+          answer ← clearDepthRect recorder (Rect 0 0 8 8) 0.25
+          after ← commandCount rig
+          writeIORef outcome (Just (answer, after - before))
+      Just (answer, recorded) ← readIORef outcome
+      answer `shouldSatisfy` \case
+        Left (RefusedSessionFailed _) → True
+        _ → False
+      recorded `shouldBe` 0
+      commands ← commandsOf' rig
+      clearsIn commands `shouldBe` [(Rect 0 0 8 8, 0.5)]
+
+    it "refuses off the owner's thread and from a recorder kept past its consumer, recording nothing" $ do
+      rig ← newRig
+      kit ← newKit rig Rgba8Srgb
+      kept ← newIORef Nothing
+      offThread ← newEmptyMVar
+      before ← commandCount rig
+      framelessRun rig $ \recorder → do
+        ok (clearingPass kit recorder)
+        writeIORef kept (Just recorder)
+        _ ← forkIO (clearDepthRect recorder (Rect 0 0 8 8) 0.5 >>= putMVar offThread)
+        takeMVar offThread `shouldReturn` Left RefusedNotOwner
+        ok (endRendering recorder)
+      stale ← readIORef kept >>= maybe (fail "no recorder") pure
+      clearDepthRect stale (Rect 0 0 8 8) 0.5 `shouldReturn` Left RefusedRecorderClosed
+      commands ← drop before <$> commandsOf' rig
+      clearsIn commands `shouldBe` []
+
+    it "names vkCmdClearAttachments when the native layer raises recording it, leaving the batch partial as any command's failure does" $ do
+      rig ← newRig
+      kit ← newKit rig Rgba8Srgb
+      standing ← newIORef Nothing
+      _ ← try @SomeException $ withFramelessScope (rigFrames rig) $ \scope →
+        recordFramelessIn scope $ \recorder → do
+          ok (clearingPass kit recorder)
+          failAt (rigRecordingStandIn rig) AtRecord
+          raised ← try @RecordingFailure (clearDepthRect recorder (Rect 0 0 8 8) 0.5)
+          batches ← atomically (readBatches (rigRecording rig))
+          writeIORef standing (Just (either (const True) (const False) raised, map viewBatchStanding batches))
+      readIORef standing
+        `shouldReturn` Just (True, [BatchPartial "vkCmdClearAttachments raised: RecordingFailure AtRecord"])
+
+    it "orders the clear among the pass's draws as a draw is ordered: draws before it see the old depth, draws after it the cleared depth" $ do
+      rig ← newRig
+      kit ← newKit rig Rgba8Srgb
+      before ← commandCount rig
+      framelessRun rig $ \recorder → do
+        ok (clearingPass kit recorder)
+        ok (bindPipeline recorder (kitTested kit))
+        dynamicState recorder
+        ok (draw recorder 3 1)
+        ok (clearDepthRect recorder (Rect 8 4 16 8) 1)
+        ok (draw recorder 6 1)
+        ok (clearDepthRect recorder (Rect 0 0 32 16) 0)
+        ok (endRendering recorder)
+      commands ← drop before <$> commandsOf' rig
+      [ordering | ordering ← map sequenced commands, ordering /= Other]
+        `shouldBe` [Drew 3, Cleared (Rect 8 4 16 8) 1, Drew 6, Cleared (Rect 0 0 32 16) 0]
+      clean rig
+
+    it "needs no pipeline, viewport or scissor, clears the requested rectangle whatever scissor is set, and leaves every draw binding as it was" $ do
+      rig ← newRig
+      kit ← newKit rig Rgba8Srgb
+      before ← commandCount rig
+      answers ← framelessRun rig $ \recorder → do
+        ok (clearingPass kit recorder)
+        -- Before anything a draw needs is bound.
+        early ← clearDepthRect recorder (Rect 0 0 32 16) 0.5
+        ok (bindPipeline recorder (kitTested kit))
+        dynamicState recorder
+        -- Under a scissor much smaller than the rectangle.
+        ok (setScissor recorder (Rect 0 0 4 4))
+        narrowed ← clearDepthRect recorder (Rect 8 8 24 8) 0.5
+        -- The pipeline, viewport and scissor stand: a draw needs no rebinding.
+        drawn ← draw recorder 3 1
+        ok (endRendering recorder)
+        pure (early, narrowed, drawn)
+      answers `shouldBe` (Right (), Right (), Right ())
+      commands ← drop before <$> commandsOf' rig
+      clearsIn commands `shouldBe` [(Rect 0 0 32 16, 0.5), (Rect 8 8 24 8, 0.5)]
+      -- Only the pass's own bindings and its one draw: the clear added none.
+      length [() | CommandBindPipeline {} ← commands] `shouldBe` 1
+      length [() | CommandSetScissor {} ← commands] `shouldBe` 2
+      length [() | CommandDraw {} ← commands] `shouldBe` 1
+      clean rig
+
+    it "leaves the depth target's barriers, use and retention those of the pass: the same commands as the pass without the clear, bar the clear" $ do
+      cleared ← barriersAround True
+      plain ← barriersAround False
+      cleared `shouldBe` plain
+      cleared `shouldSatisfy` (not . null)
 
   describe "initialization" $ do
     it "initializes a new depth target by a pass that clears it from undefined, published to other batches only by that batch's submission" $ do
@@ -449,6 +696,75 @@ clearsTwiceAndOnceWithout kit recorder = do
   ok (endRendering recorder)
   ok (beginRenderingInto recorder (kitColor kit) ClearTarget clearBlue)
   ok (endRendering recorder)
+
+-- | The commands a frame-less pass into the kit's targets records, with the
+-- depth clear in it or without, bar the clear itself.
+barriersAround ∷ Bool → IO [NativeCommand]
+barriersAround clears = do
+  rig ← newRig
+  kit ← newKit rig Rgba8Srgb
+  before ← commandCount rig
+  _ ← framelessRun rig $ \recorder → do
+    ok (clearingPass kit recorder)
+    when clears (ok (clearDepthRect recorder (Rect 2 2 4 4) 0.5))
+    ok (endRendering recorder)
+  commands ← drop before <$> commandsOf' rig
+  clean rig
+  pure [command | command ← commands, not (isClear command)]
+  where
+    isClear = \case
+      CommandClearDepthRect {} → True
+      _ → False
+
+-- | Run an action against a recorder of a frame-less batch, and answer what it
+-- answered.
+framelessRun ∷ Rig → (Rec → IO a) → IO a
+framelessRun rig action =
+  withFramelessScope (rigFrames rig) $ \scope →
+    recordFramelessIn scope action >>= either (fail . show) (pure . snd)
+
+-- | The depth clears among these commands, in order.
+clearsIn ∷ [NativeCommand] → [(Rect, Float)]
+clearsIn commands = [(rect, value) | CommandClearDepthRect rect value ← commands]
+
+-- | What a command is to the order of a pass's draws and clears.
+data Sequenced = Drew Word32 | Cleared Rect Float | Other
+  deriving (Eq, Show)
+
+sequenced ∷ NativeCommand → Sequenced
+sequenced = \case
+  CommandDraw vertices _ _ _ → Drew vertices
+  CommandClearDepthRect rect value → Cleared rect value
+  _ → Other
+
+-- | Rectangles within the 32 by 16 targets: the whole render area, each edge
+-- touched, one pixel in a corner and one in the middle.
+fits ∷ [Rect]
+fits = [Rect 0 0 32 16, Rect 0 0 1 1, Rect 31 15 1 1, Rect 31 0 1 16, Rect 0 15 32 1, Rect 15 7 2 2]
+
+-- | Rectangles that are not within them, and why each is refused.
+misfits ∷ [(Rect, Text)]
+misfits =
+  [ (Rect 0 0 0 4, noArea)
+  , (Rect 0 0 4 0, noArea)
+  , (Rect 0 0 0 0, noArea)
+  , (Rect (-1) 0 4 4, negative)
+  , (Rect 0 (-1) 4 4, negative)
+  , (Rect minBound minBound 4 4, negative)
+  , (Rect 0 0 33 16, outside)
+  , (Rect 0 0 32 17, outside)
+  , (Rect 1 0 32 16, outside)
+  , (Rect 0 1 32 16, outside)
+  , (Rect 32 0 1 1, outside)
+  , (Rect 0 16 1 1, outside)
+  , (Rect maxBound 0 maxBound 1, outside)
+  , (Rect 0 maxBound 1 maxBound, outside)
+  , (Rect 0 0 maxBound maxBound, outside)
+  ]
+  where
+    noArea = "a depth clear rectangle with no area"
+    negative = "a depth clear rectangle with a negative offset"
+    outside = "a depth clear rectangle outside the render area"
 
 -- | The viewport and scissor of the 32 by 16 targets.
 dynamicState ∷ Rec → IO ()

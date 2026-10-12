@@ -983,6 +983,7 @@ shape = \case
   CommandSetViewport _ → "viewport"
   CommandSetScissor _ → "scissor"
   CommandDraw vertices instances _ _ → "draw " <> show vertices <> " " <> show instances
+  CommandClearDepthRect {} → "clear depth rect"
   CommandCopyImageToBuffer {} → "copy"
   CommandHostReadBarrier {} → "host read barrier"
   CommandBeginLabel _ → "label"

@@ -34,6 +34,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Commands
   , setViewportUnsafe
   , setScissorUnsafe
   , drawUnsafe
+  , clearAttachmentsUnsafe
   , pushConstantsUnsafe
   , bindDescriptorSetsUnsafe
   , bindVertexBufferUnsafe
@@ -62,6 +63,8 @@ import Vulkan.Core10
   ( Buffer (..)
   , BufferCopy
   , BufferImageCopy
+  , ClearAttachment
+  , ClearRect
   , CommandBufferBeginInfo
   , DescriptorSet (..)
   , Image (..)
@@ -96,6 +99,7 @@ unsafeImports =
   , "vkCmdSetViewport"
   , "vkCmdSetScissor"
   , "vkCmdDraw"
+  , "vkCmdClearAttachments"
   , "vkCmdPushConstants"
   , "vkCmdBindDescriptorSets"
   , "vkCmdBindVertexBuffers"
@@ -169,6 +173,16 @@ foreign import ccall unsafe "dynamic"
     → Word32
     → Word32
     → Word32
+    → IO ()
+
+foreign import ccall unsafe "dynamic"
+  mkCmdClearAttachments
+    ∷ FunPtr (Ptr CommandBuffer_T → Word32 → Ptr ClearAttachment → Word32 → Ptr ClearRect → IO ())
+    → Ptr CommandBuffer_T
+    → Word32
+    → Ptr ClearAttachment
+    → Word32
+    → Ptr ClearRect
     → IO ()
 
 foreign import ccall unsafe "dynamic"
@@ -326,6 +340,13 @@ drawUnsafe ∷ CommandBuffer → Word32 → Word32 → Word32 → Word32 → IO 
 drawUnsafe buffer vertices instances firstVertex firstInstance = do
   entry ← resolved "vkCmdDraw" (pVkCmdDraw (commands buffer))
   mkCmdDraw entry (handle buffer) vertices instances firstVertex firstInstance
+
+-- | Record the clear of one attachment within one rectangle, through
+-- structures that live only for the call.
+clearAttachmentsUnsafe ∷ CommandBuffer → ClearAttachment → ClearRect → IO ()
+clearAttachmentsUnsafe buffer attachment rect = do
+  entry ← resolved "vkCmdClearAttachments" (pVkCmdClearAttachments (commands buffer))
+  withCStruct attachment $ \attachments → withCStruct rect $ \rects → mkCmdClearAttachments entry (handle buffer) 1 attachments 1 rects
 
 -- | Push the bytes, which the caller has checked are a non-empty multiple of
 -- four, through a pointer into them that lives only for the call.
