@@ -23,6 +23,7 @@ import Hetoimasia.Runtime.GLFW.Internal.Host.Attachments (hostGraphicsPublisher)
 import Hetoimasia.Runtime.GLFW.Internal.Host.Config (HostConfig (..))
 import Hetoimasia.Runtime.GLFW.Internal.Host.Seam (hostAttachmentView, hostPendingAttachments)
 import Hetoimasia.Runtime.GLFW.Internal.Host.State (WindowHost, hostConfiguration)
+import Hetoimasia.Runtime.GLFW.Internal.Host.Windows (hostWindowIdentities)
 import Hetoimasia.Runtime.GLFW.Internal.Host.Wake (hostWakeNotifier)
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Config (GraphicsOwnerConfig (..))
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Handoff (newOwnerHandoff)
@@ -61,6 +62,7 @@ startGraphicsOwner group host settled config publish = do
     newOwnerHandoff
       (hostWindowLimit (hostConfiguration host))
       (max 1 (ownerEventCapacity config))
+      (ownerSceneMode config)
       (ownerScene config)
   latch ← newTVarIO Nothing
   delivered ← newTVarIO False
@@ -91,6 +93,7 @@ startGraphicsOwner group host settled config publish = do
           presenting
           (hostPendingAttachments host)
           (retiringAttachments host)
+          (hostWindowIdentities host)
           started
           (retainedFailureBound (hostWindowLimit (hostConfiguration host)))
           reservations

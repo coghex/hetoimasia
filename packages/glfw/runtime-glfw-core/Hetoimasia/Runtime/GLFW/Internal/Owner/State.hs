@@ -62,6 +62,7 @@ import Hetoimasia.Foundation.Time (MonotonicSource)
 import Hetoimasia.Foundation.Worker (Worker, WorkerGroup)
 import Hetoimasia.GLFW.Internal.Attachment (Acknowledgement, AttachmentId)
 import Hetoimasia.GLFW.Internal.Notify (Notifier)
+import Hetoimasia.GLFW.Window (WindowId)
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Config (GraphicsOwnerConfig)
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Evidence (RollbackEvidence, TargetEvidence)
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Handoff (OwnerHandoff, TargetGeometry)
@@ -265,6 +266,10 @@ data GraphicsOwner scene = GraphicsOwner
     -- lifetime port — no @detach@ call is involved at all — so the owner
     -- learns it by looking rather than by being told, which is idempotent by
     -- construction and puts no obligation on the application.
+  , ownerWindows ∷ !(STM [WindowId])
+    -- ^ The identities of the windows the host holds, closing ones included,
+    -- read only. It is what a per-window scene's publication is checked
+    -- against, and what the owner prunes the publications of ended windows by.
   , ownerStarted ∷ !(TVar Bool)
   , ownerRetainedLimit ∷ !Int
     -- ^ How many failures the owner keeps, derived from the host's own window

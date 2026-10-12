@@ -50,6 +50,7 @@ library controller
         Hetoimasia.GPU.Vulkan.GLFW.Internal.Loop
         Hetoimasia.GPU.Vulkan.GLFW.Internal.Production
         Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
+        Hetoimasia.GPU.Vulkan.GLFW.Internal.Scenes
     build-depends:
         base >=4.22 && <4.23,
         bytestring >=0.12 && <0.13,
@@ -101,6 +102,7 @@ test-suite integration-tests
         Test.GPU.Vulkan.GLFW.Controller
         Test.GPU.Vulkan.GLFW.Loop
         Test.GPU.Vulkan.GLFW.Rescue
+        Test.GPU.Vulkan.GLFW.Scenes
         Test.GPU.Vulkan.GLFW.StandIn
     ghc-options: -threaded -rtsopts
     build-depends:
@@ -171,6 +173,7 @@ test-suite vulkan-native-tests
         Test.GPU.Vulkan.Native.Shared
         Test.GPU.Vulkan.Native.Png
         Test.GPU.Vulkan.Native.SurfaceFree
+        Test.GPU.Vulkan.Native.WindowScenes
         Test.GPU.Vulkan.Native.Spec
         Test.GPU.Vulkan.Native.Terminal
         Test.GPU.Vulkan.Native.Triangle

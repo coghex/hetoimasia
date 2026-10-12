@@ -713,6 +713,15 @@ module Hetoimasia.Runtime.GLFW
   , publishOwnerDemand
   , ScenePublication (..)
   , publishOwnerScene
+  , SceneMode (..)
+  , handoffSceneMode
+  , WindowScenePublication (..)
+  , publishOwnerWindowScene
+  , publishGraphicsWindowScene
+  , readOwnerWindowSceneAt
+  , readOwnerWindowScenes
+  , readGraphicsSceneRevisions
+  , ownerSceneStamp
   , OwnerStatus (..)
   , OwnerPhase (..)
   , readOwnerStatusNow

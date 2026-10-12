@@ -83,6 +83,18 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , runVulkanOwnerLoop
   , publishVulkanScene
 
+    -- * Scenes for each window, and their releases (D-28, D-30)
+  , SceneMode (..)
+  , ScenePublication (..)
+  , publishVulkanWindowScene
+  , WindowScenePublication (..)
+  , SceneLifecycle (..)
+  , noSceneLifecycle
+  , requestVulkanRelease
+  , readVulkanSceneState
+  , VulkanSceneState (..)
+  , WindowSceneStanding (..)
+
     -- * Rendering
   , VulkanRenderer (..)
   , FrameRequest (..)
@@ -297,7 +309,7 @@ import Control.Concurrent.STM (STM)
 import Hetoimasia.Foundation.Log (Logger)
 import Hetoimasia.GLFW.Vulkan (LoaderIntegration)
 import Hetoimasia.GLFW.Window (WindowId)
-import Hetoimasia.Runtime.GLFW (EventAdmission, GraphicsService)
+import Hetoimasia.Runtime.GLFW (EventAdmission, GraphicsService, SceneMode (..), ScenePublication (..), WindowScenePublication (..))
 import Hetoimasia.GPU.Model.Identity (TargetClass)
 import Hetoimasia.GPU.Vulkan.Diagnostics (DiagnosticVerdict)
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
@@ -307,9 +319,13 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , ActionTicket
   , CaptureMode (CaptureOff)
   , Construction
+  , SceneLifecycle (..)
   , VulkanAction (..)
   , VulkanDeviceStart (..)
+  , VulkanSceneState (..)
+  , WindowSceneStanding (..)
   , awaitVulkanAction
+  , noSceneLifecycle
   , defaultActionCapacity
   , readVulkanAction
   , Constructed
@@ -376,7 +392,7 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , vulkanHostConfig
   )
 import qualified Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller as Controller
-import Hetoimasia.GPU.Vulkan.GLFW.Internal.Loop (publishVulkanScene, runVulkanOwnerLoop)
+import Hetoimasia.GPU.Vulkan.GLFW.Internal.Loop (publishVulkanScene, publishVulkanWindowScene, runVulkanOwnerLoop)
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Production (withVulkanOwnerHostAs)
 import Hetoimasia.GPU.Vulkan.Native.Recording
   ( BatchTicket
@@ -496,6 +512,22 @@ withVulkanOwnerHost = withVulkanOwnerHostAs CaptureOff
 -- session's 'Construction', from any thread, or have it refused at once.
 submitVulkanAction ∷ VulkanHost scene → VulkanAction r → STM (Either ActionRefusal (ActionTicket r))
 submitVulkanAction host = Controller.submitVulkanAction (vulkanController host)
+
+-- | Hand this host's owner a release request (D-28): an owner-thread action,
+-- admitted and refused as 'submitVulkanAction' admits and refuses one, that
+-- runs only once every window the host held a scene for has adopted the
+-- revision that was current when the request was made, or a later one, or has
+-- ended. Windows that appear later do not delay it; requests run in the order
+-- they were made; one whose condition is already met runs at the next owner
+-- step.
+requestVulkanRelease ∷ VulkanHost scene → VulkanAction r → STM (Either ActionRefusal (ActionTicket r))
+requestVulkanRelease host = Controller.requestVulkanRelease (vulkanController host)
+
+-- | Each window's latest published and adopted scene revision, the revisions
+-- awaiting release, and the release requests still queued with the revisions
+-- each awaits.
+readVulkanSceneState ∷ VulkanHost scene → STM VulkanSceneState
+readVulkanSceneState host = Controller.readVulkanSceneState (vulkanController host)
 
 -- | Admit an upload into this host's session from any thread (GRS-6):
 -- answered at once, its bytes copied into the session's staging buffer before

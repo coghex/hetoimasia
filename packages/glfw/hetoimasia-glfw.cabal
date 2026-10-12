@@ -350,6 +350,7 @@ test-suite glfw-tests
         Test.GLFW.Owner.Handover
         Test.GLFW.Owner.Port
         Test.GLFW.Owner.Progress
+        Test.GLFW.Owner.Scenes
         Test.GLFW.Protected
         Test.GLFW.Render
         Test.GLFW.Scheduled

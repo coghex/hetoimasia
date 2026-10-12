@@ -42,6 +42,7 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , declareUnsupported
   , StandInFailure (..)
   , StandInLoss (..)
+  , StandInNotPresented (..)
   , StandInSurfaceLost (..)
   , injectedMessageId
   , reportErrorNow
@@ -95,6 +96,10 @@ module Test.GPU.Vulkan.GLFW.StandIn
     -- * The rig
   , Rig (..)
   , Scene
+  , SceneEvent (..)
+  , sceneEvents
+  , sceneRounds
+  , withPerWindowScenes
   , newRig
   , newRigOf
   , surfaceFreeRig
@@ -225,6 +230,7 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , Readiness (..)
   , ControllerHooks (..)
   , VulkanDeviceStart (..)
+  , SceneLifecycle (..)
   , defaultActionCapacity
   , handOverVulkanTarget
   , readReadiness
@@ -268,6 +274,7 @@ import Hetoimasia.Runtime.GLFW
   , GraphicsService
   , HostConfig (..)
   , LoopHooks (..)
+  , SceneMode (..)
   , TargetStanding (..)
   , OwnerStatus (..)
   , readOwnerStatusNow
@@ -437,6 +444,14 @@ newtype StandInLoss = StandInLoss Text
   deriving (Eq, Show)
 
 instance Exception StandInLoss
+
+-- | A presentation that raised and enqueued nothing, which the frames' layer
+-- classifies as a specified no-effect failure when the swapchain's entry says
+-- out of memory ('raiseOnPresent', 'scriptPresentStatus').
+data StandInNotPresented = StandInNotPresented
+  deriving (Show)
+
+instance Exception StandInNotPresented
 
 data Native = Native
   { nativeScript ∷ !(TVar (Map Step Scripted))
@@ -1228,7 +1243,7 @@ renderingLayers rescued events rendering clock =
         , opsSubmit = \_ _ _ handle → do
             fence handle FenceSubmission
             record events (QueueSubmitted handle)
-        , opsNoEffect = const False
+        , opsNoEffect = \failure → isJust (fromException failure ∷ Maybe StandInNotPresented)
         , opsReleaseImages = \_ swapchain indices → do
             atomically (modifyTVar' (renderingBusy rendering) (Map.adjust (\held → foldr Set.delete held indices) swapchain))
             record events (ImageReleased swapchain indices)
@@ -1272,7 +1287,14 @@ millisecondsOf milliseconds = either (error . show) id (durationFromNanoseconds 
 -- ---------------------------------------------------------------------------
 -- The rig
 
-type Scene = ()
+type Scene = Int
+
+-- | What the host's scene lifecycle told its renderer, oldest first, on the
+-- owner's thread.
+data SceneEvent
+  = SceneAdopted !WindowId !Natural !Scene
+  | SceneReleased !WindowId !Natural
+  deriving (Eq, Show)
 
 -- | Everything an example needs to run one Vulkan graphics host.
 data Rig = Rig
@@ -1347,6 +1369,13 @@ data Rig = Rig
     -- ^ The session the host was given, once it has been made: what a direct
     -- command host is built over, as an application that supplies its own
     -- session to 'Hetoimasia.Runtime.GLFW.withGraphicsOwnerHostIn' holds it.
+  , rigSceneMode ∷ !SceneMode
+    -- ^ Whether the host carries one scene or one for each window.
+  , rigSceneEvents ∷ !(TVar [SceneEvent])
+    -- ^ Every adoption and release the host's lifecycle reported.
+  , rigSceneRounds ∷ !(TVar [Natural])
+    -- ^ For each of them, the owner's completed rounds when it was reported:
+    -- the round that reported it is the next one.
   }
 
 -- | Make the capture's sink raise on every record it is given from now on.
@@ -1377,6 +1406,20 @@ surfaceFreeRig count = (\rig → rig {rigDeviceStart = DeviceSurfaceFree}) <$> n
 -- | The same rig with this many owner-thread actions queued at once.
 withActionCapacity ∷ Natural → Rig → Rig
 withActionCapacity capacity rig = rig {rigActionCapacity = capacity}
+
+-- | The same rig with a scene for each window.
+withPerWindowScenes ∷ Rig → Rig
+withPerWindowScenes rig = rig {rigSceneMode = PerWindowScenes}
+
+-- | Every adoption and release the host's lifecycle reported, oldest first.
+sceneEvents ∷ Rig → IO [SceneEvent]
+sceneEvents = readTVarIO . rigSceneEvents
+
+-- | For each of 'sceneEvents', the owner's completed rounds when it was
+-- reported, so an example can wait for the round that reported the latest to
+-- end, which never waits for a round that is not coming.
+sceneRounds ∷ Rig → IO [Natural]
+sceneRounds = readTVarIO . rigSceneRounds
 
 -- | The same rig with the session's uploads configured (GRS-6).
 withUploads ∷ UploadConfig → Rig → Rig
@@ -1588,6 +1631,8 @@ newRigClocked visible windows clock = do
   presentRounds' ← newTVarIO []
   armings ← newTVarIO []
   armHook ← newTVarIO Nothing
+  sceneLog ← newTVarIO []
+  sceneRoundLog ← newTVarIO []
   let defaults = (defaultHostConfig windows) {hostIdleWait = 0.005}
   pure
     Rig
@@ -1625,6 +1670,9 @@ newRigClocked visible windows clock = do
       , rigUploads = Nothing
       , rigWindowDepth = False
       , rigSession = session
+      , rigSceneMode = SharedScene
+      , rigSceneEvents = sceneLog
+      , rigSceneRounds = sceneRoundLog
       }
 
 -- | Run a whole Vulkan graphics host under the application runner, on a bound
@@ -1645,7 +1693,7 @@ runRigCaught rig body = asProcessMainThread (rigSeam rig) (try (runRigHere rig b
 runRigHere ∷ Rig → (VulkanHost Scene → RuntimeControl → IO a) → IO a
 runRigHere rig body = myThreadId >>= \self → withBoundThread (rigBound rig) self $ do
   integration ← seamIntegration (rigSeam rig) defaultIntegrationScript
-  scene ← prepare ()
+  scene ← prepare 0
   budgets ← either (throwIO . StandInFailure . Text.pack . show) pure (validateBudgets (rigBudgets rig))
   let base = vulkanHostConfig (rigHostConfig rig) (rigCapture rig) budgets scene
       config =
@@ -1660,6 +1708,12 @@ runRigHere rig body = myThreadId >>= \self → withBoundThread (rigBound rig) se
           , vulkanActionCapacity = rigActionCapacity rig
           , vulkanUploads = rigUploads rig
           , vulkanWindowDepth = rigWindowDepth rig
+          , vulkanSceneMode = rigSceneMode rig
+          , vulkanSceneLifecycle =
+              SceneLifecycle
+                { sceneAdopted = \window revision adopted → reportScene (SceneAdopted window revision adopted)
+                , sceneReleased = \window revision → reportScene (SceneReleased window revision)
+                }
           , vulkanFrameObserver = \event → do
               atomically $ do
                 modifyTVar' (rigFrameEvents rig) (<> [event])
@@ -1671,6 +1725,11 @@ runRigHere rig body = myThreadId >>= \self → withBoundThread (rigBound rig) se
                   _ → pure ()
               readTVarIO (rigFrameHook rig) >>= ($ event)
           }
+      reportScene event = atomically $ do
+        modifyTVar' (rigSceneEvents rig) (<> [event])
+        owner <- readTVar (rigOwner rig)
+        rounds <- maybe (pure 0) (fmap statusRounds . readOwnerStatusNow) owner
+        modifyTVar' (rigSceneRounds rig) (<> [rounds])
       timed owner = case rigClock rig of
         Nothing → owner
         Just cell →

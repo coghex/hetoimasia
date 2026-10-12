@@ -51,6 +51,7 @@
 module Hetoimasia.GPU.Vulkan.GLFW.Internal.Loop
   ( runVulkanOwnerLoop
   , publishVulkanScene
+  , publishVulkanWindowScene
   , vulkanLoopHooks
   , LoopAdapter
   , newLoopAdapter
@@ -70,7 +71,7 @@ import Hetoimasia.Foundation.Messaging.Snapshot (Publication (..), observedValue
 import Hetoimasia.Foundation.Time (Instant, deadlineReached)
 import Hetoimasia.GLFW.Command (clientObservations)
 import Hetoimasia.GLFW.Demand (CapturedDemand (..), DemandRequest, demandDeadline, demandIsImmediate, demandRequested, noDemand)
-import Hetoimasia.GLFW.Window (observedRevision)
+import Hetoimasia.GLFW.Window (WindowId, observedRevision)
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller (VulkanHost (..), replaceVulkanSurfaces)
 import Hetoimasia.Runtime.GLFW
   ( AttachmentId
@@ -88,6 +89,8 @@ import Hetoimasia.Runtime.GLFW
   , ownerHandoff
   , publishGraphicsObservation
   , publishOwnerDemand
+  , WindowScenePublication
+  , publishGraphicsWindowScene
   , publishOwnerScene
   , readOwnerDemandTaken
   , readOwnerStatusNow
@@ -192,5 +195,23 @@ foldOwnerDeadline adapter now schedule = do
 -- has not rendered, a publisher never waits, and a main thread stalled in a
 -- platform modal loop keeps no other thread from publishing. A newer scene is
 -- rendered to every eligible target.
+--
+-- A host configured with per-window scenes carries no shared one: it refuses
+-- ('Hetoimasia.Runtime.GLFW.SceneRefusedPerWindow') and publishes nothing; a
+-- window's scene is 'publishVulkanWindowScene'.
 publishVulkanScene ∷ VulkanHost scene → Prepared scene → IO ScenePublication
 publishVulkanScene host scene = atomically (publishOwnerScene (ownerHandoff (vulkanGraphicsOwner host)) scene)
+
+-- | Publish one window's scene in a host configured with
+-- 'Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller.PerWindowScenes', from any
+-- application thread.
+--
+-- It is a latest-value snapshot for the window: a newer publication replaces
+-- one the owner has not taken, a publisher never waits, and the window's
+-- revisions rise independently of every other's. It asks that window's target
+-- for a frame, and no other's. It is keyed by the window, so it survives the
+-- window's surface being recreated under a new attachment. A window the host
+-- does not hold, or one that has ended, is answered with a result naming it,
+-- and nothing changes; a shared host answers that it carries one scene.
+publishVulkanWindowScene ∷ VulkanHost scene → WindowId → Prepared scene → IO WindowScenePublication
+publishVulkanWindowScene host window scene = atomically (publishGraphicsWindowScene (vulkanGraphicsOwner host) window scene)

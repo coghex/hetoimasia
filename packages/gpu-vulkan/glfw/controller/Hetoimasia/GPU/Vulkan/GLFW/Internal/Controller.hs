@@ -193,6 +193,15 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , ActionTicket
   , submitVulkanAction
 
+    -- * Scenes and releases (D-28, D-30)
+  , SceneMode (..)
+  , SceneLifecycle (..)
+  , noSceneLifecycle
+  , requestVulkanRelease
+  , readVulkanSceneState
+  , VulkanSceneState (..)
+  , WindowSceneStanding (..)
+
     -- * Uploads (GRS-6)
   , VulkanUploadRefusal (..)
   , submitVulkanUpload
@@ -280,7 +289,7 @@ import Control.Monad (forM, forM_, join, unless, void, when)
 import Control.Monad.IO.Class (liftIO)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as Char8
-import Data.Foldable (for_)
+import Data.Foldable (for_, traverse_)
 import Data.Functor ((<&>))
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Maybe (isJust, isNothing)
@@ -351,13 +360,33 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Actions
   , actionsCount
   , actionsWaiting
   , admitAction
+  , admitRelease
   , awaitActionTicket
   , newActions
+  , pendingBarriers
   , readActionTicket
   , refuseRemaining
   , startAction
   )
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Bridge
+import Hetoimasia.GPU.Vulkan.GLFW.Internal.Scenes
+  ( SceneLifecycle (..)
+  , SceneSource (..)
+  , Scenes
+  , VulkanSceneState (..)
+  , WindowSceneStanding (..)
+  , adoptScene
+  , endSceneTarget
+  , forgetSceneTarget
+  , installSceneSource
+  , newScenes
+  , noSceneLifecycle
+  , readSceneState
+  , registerSceneTarget
+  , releaseScenes
+  , sceneBarrier
+  , sceneBarrierMet
+  )
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Capture
   ( CaptureMode (..)
   , CaptureOutcome (..)
@@ -462,7 +491,7 @@ import Hetoimasia.Runtime.GLFW
   , GraphicsAttachment (..)
   , GraphicsOperations (..)
   , GraphicsOwner
-  , GraphicsOwnerConfig
+  , GraphicsOwnerConfig (..)
   , GraphicsRefusal
   , GraphicsService
   , HostConfig (..)
@@ -475,6 +504,7 @@ import Hetoimasia.Runtime.GLFW
   , RenderEligibility (..)
   , RetirementReadiness (..)
   , RolledBack
+  , SceneMode (..)
   , SlotState (SlotAttached)
   , StepReport (..)
   , Stage (CustodyRegistered, CustodySettling)
@@ -486,7 +516,10 @@ import Hetoimasia.Runtime.GLFW
   , TargetStepView (..)
   , WindowHost
   , announceGraphicsTarget
+  , attachmentWindow
+  , hostWindowIdentities
   , ownerTargetAcknowledgement
+  , readGraphicsSceneRevisions
   , wakeGraphicsHost
   , custodyOf
   , graphicsAttachment
@@ -587,6 +620,14 @@ data State inst msgr phys dev cmd lease obligation = State
     -- ^ Whether the owner's admission is still open, read by every action's
     -- admission and start. The composition installs the owner's own once it
     -- exists; it closes when the owner's exit begins or its run ends.
+  , stateScenes ∷ !Scenes
+    -- ^ The revision of its scene each target has adopted, which revisions are
+    -- awaiting release, and what a release request waits for
+    -- ("Hetoimasia.GPU.Vulkan.GLFW.Internal.Scenes").
+  , stateSceneReleased ∷ !(TVar (WindowId → Natural → IO ()))
+    -- ^ The lifecycle's release hook, which the owner's teardown runs as well
+    -- as its step. The composition installs the host's own; it does nothing
+    -- until then.
   }
 
 -- | Instants the package's own examples must reach and nothing else can: a
@@ -679,7 +720,8 @@ newVulkanControllerWith
 newVulkanControllerWith hooks capture deviceStart capacity uploads windowDepth ops rendering observer pointer bridge layers validation budgets clock poll = do
   roots ← newRoots ops budgets clock
   ownerOpen ← newTVarIO (pure True)
-  actions ← newActions capacity (actionGate roots ownerOpen)
+  scenes ← newScenes
+  actions ← newActions capacity (actionGate roots ownerOpen) (sceneBarrierMet scenes)
   -- Only a host built for verification capture plans its swapchains
   -- unclipped and as transfer sources; every other host's are the profile's.
   generations ← case capture of
@@ -713,6 +755,8 @@ newVulkanControllerWith hooks capture deviceStart capacity uploads windowDepth o
       <*> pure deviceStart
       <*> pure actions
       <*> pure ownerOpen
+      <*> pure scenes
+      <*> newTVarIO (\_ _ → pure ())
 
 -- | Supply the instance extensions the window system requires, copied from
 -- the loader-aware session on the main thread. The owner's startup reads
@@ -825,8 +869,8 @@ readReadiness (VulkanController state) =
 -- rendering does: a frame wanted now, an acquisition's retry, a demand deadline
 -- ahead. A target's retirement is owed until its frames and presentations have
 -- gone on their own evidence.
-controllerOperations ∷ VulkanController → VulkanRenderer scene → GraphicsOperations scene
-controllerOperations (VulkanController state) renderer =
+controllerOperations ∷ VulkanController → VulkanRenderer scene → SceneLifecycle scene → GraphicsOperations scene
+controllerOperations (VulkanController state) renderer lifecycle =
   GraphicsOperations
     { graphicsStartOwner = \_ → startOwner state
     , graphicsConstructTarget = constructTarget state
@@ -871,8 +915,6 @@ controllerOperations (VulkanController state) renderer =
         -- device exists, so they exist before any action of the session's
         -- runs.
         madeUploads ← makeRenderingUploads (stateRendering state)
-        served ← serviceActions state
-        settled ← settleUnannounced state
         mapped ← readTVarIO (stateTargets state)
         let now = stepNow step
             constructed =
@@ -881,7 +923,26 @@ controllerOperations (VulkanController state) renderer =
               , viewConstructed view
               , Just target ← [Map.lookup (viewTarget view) mapped]
               ]
-            geometries = Map.fromList [(target, targetGeometry view) | (target, view) ← constructed]
+            -- The scene each constructed target is handed this step, beside
+            -- the revision of its publication: the one shared scene's, or
+            -- its window's own.
+            scenes =
+              Map.fromList
+                [ (attachment, taken)
+                | (_, view) ← constructed
+                , let attachment = viewTarget view
+                , Just taken ← [case stepSceneMode step of
+                    SharedScene → Just (stepScene step, stepSceneRevision step)
+                    PerWindowScenes → Map.lookup (attachmentWindow attachment) (stepWindowScenes step)]
+                ]
+        -- Adoption comes first in the step, whether or not a frame is
+        -- rendered, so every frame of the step is of a scene its target has
+        -- adopted and a release request the adoption satisfies runs in this
+        -- same step.
+        traverse_ (\(attachment, (scene, revision)) → adoptScene (stateScenes state) lifecycle attachment scene revision) (Map.toList scenes)
+        served ← serviceActions state
+        settled ← settleUnannounced state
+        let geometries = Map.fromList [(target, targetGeometry view) | (target, view) ← constructed]
             observed = Map.fromList [(target, (viewRevision view, viewEligibility view, viewWithdrawals view)) | (target, view) ← constructed]
         -- The generations are stepped when there is something for them to do:
         -- a target's observation moved, their own deadline — a settling
@@ -909,7 +970,7 @@ controllerOperations (VulkanController state) renderer =
             (stateRendering state)
             StepInputs
               { inputsNow = now
-              , inputsSceneRevision = stepSceneRevision step
+              , inputsSceneRevisions = Map.map snd scenes
               , inputsDemand = stepDemand step
               , inputsDemandRevision = stepDemandRevision step
               , inputsTargets = targets
@@ -927,7 +988,7 @@ controllerOperations (VulkanController state) renderer =
         -- A replacement the generations' step just published is asked for a
         -- frame in this step, not left for a later publication to notice.
         published ← requestPublished (stateRendering state) targets (planDue plan)
-        presented ← renderDue (stateRendering state) renderer now (stepScene step) (stepSceneRevision step) (planDue plan <> published)
+        presented ← renderDue (stateRendering state) renderer now (`Map.lookup` scenes) (planDue plan <> published)
         -- A capture whose batch completed is delivered in the step whose poll
         -- observed it, and what the renderer or a capture released is
         -- destroyed once nothing holds it.
@@ -944,10 +1005,15 @@ controllerOperations (VulkanController state) renderer =
         -- whose slot no batch's version maps any longer is let go.
         refreshRenderingTable (stateRendering state)
         reclaimReleased (stateRendering state) now
+        -- The scene revisions this step's polls ended the last uses of.
+        _ ← settleSceneReleases state
         asked ← askReplacements state (summarySurfacesWanted summary)
         replaced ← settleReplacements state now (stepTargets step)
         noticeUnavailable state
         failRequired state
+        -- Adopting a scene and releasing one are bookkeeping, not work the step
+        -- did on the device: a host that presents nothing reports none, as it
+        -- always has.
         pure (if served || uploaded || settled || summaryAdvanced summary || asked || replaced || presented || captured then noStepWork {stepAdvanced = True} else noStepWork)
 
 -- | Why an upload was not admitted through the controller (GRS-6).
@@ -1111,9 +1177,13 @@ prepareRetirement state retiring =
       -- the ones it has, and a later one would have no frame and no
       -- settlement.
       atomically (closeCaptures (stateCaptures state) (retiringTarget retiring))
+      -- It adopts no scene from here on, and what it adopted is superseded:
+      -- released once the frames recorded with it are over.
+      atomically (endSceneTarget (stateScenes state) (retiringTarget retiring))
       now ← readInstant (stateClock state)
       (owed, wanted) ← prepareTargetRetirement (stateRendering state) now target
       _ ← askReplacements state wanted
+      _ ← settleSceneReleases state
       pure (maybe RetirementReady RetirementOwed owed)
 
 -- | Destroy, on the owner's thread, the surface of every attachment the owner
@@ -1416,6 +1486,7 @@ constructTarget state start = do
         answer ← admitRootTarget (stateRoots state) classification (TargetSurface (handleOf obligation) (destruction bridge obligation))
         for_ answer $ \target → atomically $ do
           modifyTVar' (stateTargets state) (Map.insert attachment target)
+          registerSceneTarget (stateScenes state) attachment
           trackTarget (stateGenerations state) target classification (handleOf obligation)
         pure answer
       case admitted of
@@ -1486,6 +1557,10 @@ retireTarget state retiring = do
       -- generations, whose holds its presentations were: preparation waited
       -- for every one of them to end.
       retireTargetRendering (stateRendering state) now target attachment
+      -- Nothing of the target is recorded or in flight any more: what it
+      -- adopted is released, if every use of it is over.
+      _ ← settleSceneReleases state
+      atomically (forgetSceneTarget (stateScenes state) attachment)
       retireTargetGenerations (stateGenerations state) now target
       -- Raises, and keeps the record and this mapping, if the destruction was
       -- uncertain: the owner then never offers this again.
@@ -1549,6 +1624,7 @@ retireOwner state retiring = do
   -- is refused, before the recording its construction would use is retired.
   atomically (refuseRemaining (stateActions state) ActionOwnerClosed)
   now ← readInstant (stateClock state)
+  _ ← settleSceneReleases state
   endCaptures (stateRendering state)
   retireRendering (stateRendering state) now
   device ← retireRoots (stateRoots state)
@@ -1879,6 +1955,44 @@ submitVulkanAction (VulkanController state) action = do
   device ← isJust <$> readRootsDevice (stateRoots state)
   admitAction (stateActions state) device action
 
+-- | Hand the graphics owner a release request (D-28): an owner-thread action,
+-- admitted and refused exactly as 'submitVulkanAction' admits and refuses one,
+-- that runs only once the owner has adopted the scene revisions that were
+-- current when it was made.
+--
+-- In the transaction that queues it, the request records the latest revision
+-- published for each window that holds a scene the owner may yet adopt — a
+-- window with a live target, or in a per-window host one that has had a
+-- publication — so the windows it waits for, the revisions, and its place in
+-- the order are one coherent fact however publications and windows change
+-- around it. It runs in the owner's step once, for each of those windows, the
+-- window has adopted that revision or a later one, or the host no longer holds
+-- it. A window that appears later is not waited for. Release requests run in
+-- the order they were made, and one whose condition is already met runs in the
+-- owner's next step. An idle owner is woken when one becomes runnable, and is
+-- not kept running by one that is not.
+--
+-- A request still queued when the owner's exit begins is settled as refused,
+-- as an action is, and never replayed.
+requestVulkanRelease ∷ VulkanController → VulkanAction r → STM (Either ActionRefusal (ActionTicket r))
+requestVulkanRelease (VulkanController state) action = do
+  device ← isJust <$> readRootsDevice (stateRoots state)
+  admitRelease (stateActions state) device (sceneBarrier (stateScenes state)) action
+
+-- | The scenes the owner holds, as any thread may read them: for each window,
+-- its latest published and its adopted revision and the revisions awaiting
+-- release, and the release requests still queued with the revision each
+-- awaits of each window.
+readVulkanSceneState ∷ VulkanController → STM VulkanSceneState
+readVulkanSceneState (VulkanController state) = readSceneState (stateScenes state) (pendingBarriers (stateActions state))
+
+-- | Release every adopted scene revision that may be, with the lifecycle's own
+-- hook, and answer whether any was.
+settleSceneReleases ∷ State inst msgr phys dev cmd lease obligation → IO Bool
+settleSceneReleases state = do
+  hook ← readTVarIO (stateSceneReleased state)
+  releaseScenes (stateScenes state) hook (sceneUsed (stateRendering state))
+
 -- | An action's outcome, once it has one: what it returned, what it raised,
 -- or that it was refused before it started — the owner's exit or the
 -- session's failure began first, which this read itself settles. It never
@@ -2182,6 +2296,20 @@ data VulkanHostConfig scene = VulkanHostConfig
     -- its owner records into upload copies in one turn, and how many uploads
     -- may wait at once, validated by 'validateUploadConfig'. 'Nothing', by
     -- default, takes no upload.
+  , vulkanSceneMode ∷ !SceneMode
+    -- ^ Whether the owner carries one scene for every window ('SharedScene',
+    -- the default, which behaves exactly as the owner always has) or one for
+    -- each ('PerWindowScenes'). In the first, 'publishVulkanScene' publishes
+    -- the scene and a newer one is rendered to every eligible target. In the
+    -- second it is refused, each window starts with 'vulkanScene' at revision
+    -- 0, 'publishVulkanWindowScene' publishes a window's own scene, and the
+    -- renderer is handed the scene of the window whose target it renders. It
+    -- is applied after 'vulkanOwner' and overrides anything that set.
+  , vulkanSceneLifecycle ∷ SceneLifecycle scene
+    -- ^ How the owner tells the renderer which scene revisions it holds: when
+    -- it adopts one for a window's target, and when one may be let go
+    -- ('noSceneLifecycle', the default, does nothing). Both run on the owner's
+    -- thread and neither may raise.
   , vulkanWindowDepth ∷ !Bool
     -- ^ Whether every swapchain generation of every window owns a depth image
     -- (GRS-13). 'False', by default: no generation has one, and nothing
@@ -2215,11 +2343,12 @@ defaultActionCapacity = 64
 -- | A configuration with the given capture configuration and budgets, no
 -- layers or validation features, the owner's defaults, no observer, a
 -- renderer that clears every frame to opaque black, the device created at the
--- first window's admission, 'defaultActionCapacity', no uploads and no windowed
+-- first window's admission, 'defaultActionCapacity', no uploads, one scene
+-- shared by every window with a lifecycle that does nothing, and no windowed
 -- depth.
 vulkanHostConfig ∷ HostConfig → CaptureConfig → Budgets → Prepared scene → VulkanHostConfig scene
 vulkanHostConfig host capture budgets scene =
-  VulkanHostConfig host capture [] [] budgets scene id (const noObserver) (clearRenderer (\_ _ → ClearColor 0 0 0 1)) noFrameObserver DeviceAtFirstSurface defaultActionCapacity Nothing False
+  VulkanHostConfig host capture [] [] budgets scene id (const noObserver) (clearRenderer (\_ _ → ClearColor 0 0 0 1)) noFrameObserver DeviceAtFirstSurface defaultActionCapacity Nothing SharedScene noSceneLifecycle False
 
 -- | A running Vulkan graphics host.
 data VulkanHost scene = VulkanHost
@@ -2306,7 +2435,9 @@ withVulkanOwnerHostHooked hooks capturing logger layer rendering pointer bridge 
           copied ← liftIO (extensions entered)
           liftIO (atomically (supplyInstanceExtensions controller copied))
           pure entered
-        owner = vulkanOwner config (graphicsOwnerConfig (controllerOperations controller (vulkanRenderer config)) (vulkanScene config))
+        owner =
+          (vulkanOwner config (graphicsOwnerConfig (controllerOperations controller (vulkanRenderer config) (vulkanSceneLifecycle config)) (vulkanScene config)))
+            {ownerSceneMode = vulkanSceneMode config}
     outcome ←
       tryWithContext $
         withGraphicsOwnerHostIn logger session host owner $ \windows graphics → do
@@ -2316,6 +2447,16 @@ withVulkanOwnerHostHooked hooks capturing logger layer rendering pointer bridge 
           atomically $ do
             writeTVar (stateHostWake state) (wakeGraphicsHost graphics)
             writeTVar (stateOwnerOpen state) (targetEventsOpen (ownerHandoff graphics))
+            -- A release request is held to the scenes the owner holds for the
+            -- windows the host holds, and its hook is the host's own.
+            installSceneSource
+              (stateScenes state)
+              SceneSource
+                { sourceMode = vulkanSceneMode config
+                , sourceWindows = hostWindowIdentities windows
+                , sourceRevisions = readGraphicsSceneRevisions graphics
+                }
+            writeTVar (stateSceneReleased state) (sceneReleased (vulkanSceneLifecycle config))
           use (VulkanHost windows graphics controller)
     -- However the host ended, an instance it did not destroy may still have
     -- a messenger naming the capture, so the capture's storage is kept rather

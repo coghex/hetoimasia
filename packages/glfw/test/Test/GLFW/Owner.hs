@@ -25,6 +25,7 @@ import qualified Test.GLFW.Owner.Failure.Reporting as FailureReporting
 import qualified Test.GLFW.Owner.Handover as Handover
 import qualified Test.GLFW.Owner.Port as Port
 import qualified Test.GLFW.Owner.Progress as Progress
+import qualified Test.GLFW.Owner.Scenes as Scenes
 import Test.Hspec (Spec, describe)
 
 -- | The whole group, in the order the examples have always run. A behavior
@@ -35,6 +36,7 @@ spec = describe "GLFW graphics owner" $ do
   describe "handing a target over" Handover.spec
   describe "independent progress" Progress.spec
   describe "the bounded lifetime port" Port.spec
+  describe "a scene for each window" Scenes.spec
   describe "cancellation" Cancellation.spec
   describe "the D-33 exit" $ do
     ExitRetirement.spec

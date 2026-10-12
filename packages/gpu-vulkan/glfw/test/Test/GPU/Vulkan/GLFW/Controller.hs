@@ -898,7 +898,7 @@ testSinkFailure = do
     atomically (sinkHasFailed rig >>= check)
     -- An idle owner learns of it at its next round, which a published scene
     -- gives it; nothing here waits on a clock.
-    scene ← prepare ()
+    scene ← prepare 0
     let poke remaining = do
           seen ← statusRounds <$> atomically (readOwnerStatusNow owner)
           _ ← atomically (publishOwnerScene (ownerHandoff owner) scene)
@@ -1159,7 +1159,7 @@ testLateSurfaceFails = do
     atomically (writeTVar controllerOf (Just (vulkanController host)))
     one ← handedOver host first RequiredTarget
     TargetUsable ← awaitStanding host one
-    scene ← prepare ()
+    scene ← prepare 0
     -- While the main thread is inside the second surface's creation, a layer
     -- reports an error; the owner learns of it at its next round and its
     -- drain retires the first target and the device, then waits for the

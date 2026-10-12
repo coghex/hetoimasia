@@ -129,6 +129,8 @@ module Hetoimasia.Runtime.GLFW.Internal.Owner
   , ownerTargetAcknowledgement
   , awaitOwnerRound
   , readOwnerDemandTaken
+  , publishGraphicsWindowScene
+  , readGraphicsSceneRevisions
   , wakeGraphicsHost
 
     -- * The additive protected-host constructor
