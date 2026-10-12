@@ -1,0 +1,309 @@
+# hetoimasia-render-2d-oracle
+
+The 2D renderer's oracle: expected pixels computed from a validated snapshot,
+without a GPU.
+
+From a validated `render-2d` snapshot, the cutout marks it is planned with,
+each target's metrics, colour format and pixel extent, and a lookup from texture
+handle to decoded image, the oracle says what one pixel of one pass's target
+holds once that pass has run: an 8-bit RGBA value with a per-channel tolerance,
+or **indeterminate** with the reason it will not guess, or **unevaluable** with
+the input defect that stops it. A pure reader returns a pixel of a tightly
+packed readback, and a verdict compares the two. Every rendering slice proves
+itself against it ([the design](../../docs/designs/render_2d_design.md): D-12,
+*Verification strategy*), and the recorder's offscreen readbacks (R2D-7) are its
+first client. Expectations come from the snapshot, never from an observed image.
+
+It is a pure package. The library depends on `hetoimasia-render-2d` (the
+snapshot, validation, the view mapping and the draw plan), `hetoimasia-render-api`
+(the texture handle), `hetoimasia-math`, `hetoimasia-asset` (the decoded image)
+and `hetoimasia-asset-image` (software BC7 decoding), and on `array`,
+`bytestring`, `containers`, `text` and `base`. It depends on no GPU, GLFW,
+Vulkan, runtime or Lua package, so it builds in the CPU project.
+
+## Inputs
+
+`newOracle` takes an `OracleInput`:
+
+| Field | Meaning |
+| --- | --- |
+| `inputSnapshot` | A `ValidSnapshot`. |
+| `inputCutoutMarks` | The `CutoutMarks` the snapshot is planned with (`planSnapshot`). |
+| `inputWindow` | The window target's `TargetSpec`, if any pass draws to it. |
+| `inputOffscreen` | A `TargetSpec` for each offscreen `TargetRef` a pass draws to. |
+| `inputTextures` | The `DecodedImage` behind a complete handle, generation included. |
+
+A `TargetSpec` holds the target's `TargetMetrics` (logical extent, framebuffer
+extent, content scale), its colour format (`R8G8B8A8` or `B8G8R8A8`, each sRGB
+or UNORM) and its pixel extent. The metrics are what the view mappings are built
+from, and the pixel extent must be the metrics' framebuffer extent: the oracle
+checks, and refuses a disagreement, so a mapping built for one size is never
+read as another's pixels.
+
+A `Probe` names a pass by index and a pixel by column and row within that pass's
+target, with the origin at the upper left. Its expectation is the target's value
+once that pass has run. Each pass starts from its own clear colour, so two
+passes that clear the same target each keep their own expectation.
+
+## The quad
+
+An instance's transform places the **unit square** [0, 1]² in its layer's space
+(choice A). This is the contract the recorder's vertex stage must meet:
+
+- local (0, 0) is the instance's origin, the translation of its transform; it is
+  the point pixel snap rounds;
+- local (1, 0) and (0, 1) are the transform's first and second columns added to
+  the origin;
+- texture coordinates interpolate affinely from `(u0, v0)` at local (0, 0) to
+  `(u1, v1)` at local (1, 1), so `u = u0 + (u1 − u0) · x` and
+  `v = v0 + (v1 − v0) · y`, with Y pointing down in texture space as everywhere.
+
+## Placement
+
+A world instance maps to target pixels through `render-2d`'s world transform
+(`worldTransform`), and a UI instance through its UI transform (`uiTransform`);
+the oracle composes the layer's transform with the instance's, exactly, in
+rational arithmetic over the 32-bit coefficients. With the view's pixel snap on,
+the camera's translation is already rounded inside the world transform (the UI
+transform stays continuous), and the whole quad is then shifted rigidly so that
+its origin lands on `snapPoint` of its mapped origin, `worldToTarget` or
+`uiToTarget` of the instance's translation. A quad's size and shape never snap.
+
+- A view draws only pixels whose centre its viewport contains
+  (`viewportContains`: left and top inclusive, right and bottom exclusive).
+- An empty viewport (a zero width or height) and a **singular** quad (a zero
+  determinant, which is exact here) contribute nothing, and neither is a
+  refusal. A reflected quad (a negative determinant) is placed and sampled like
+  any other, with its texture reflected.
+- A required placement that cannot be represented is a refusal, never a silent
+  skip: a view whose mapping `viewMapping` cannot build as finite `Float`s, an
+  instance whose snapped origin cannot be represented, or a non-singular quad any
+  corner of which is beyond the finite `Float` range, since the recorder's 32-bit
+  vertices could not carry it. Such a refusal applies to every probe whose centre
+  is within the view's viewport. A singular quad is not that: it has no area, and
+  it is known to cover nothing.
+
+## Coverage
+
+An instance covers a pixel whose centre lies inside its placed quad. A probe
+whose centre lies within 1/16 pixel of the quad's edge, or of a viewport edge
+that is not on a whole pixel, is **indeterminate** and reported as such, never
+guessed (choice E): a rasterizer's fixed-point snapping can fall either side of
+an edge that close. The distance is the Euclidean distance to the edge segments,
+computed exactly, and 1/16 itself is inside the band. A viewport edge on a whole
+pixel is half a pixel from every centre and so never reports.
+
+## Sampling
+
+- The instance's sampler resolves through the view's default filter:
+  `SamplerDefault` takes `settingFilter`, the others are what they say.
+- Addressing is clamp-to-edge (choice F), per axis.
+- **Nearest** takes the texel containing the coordinate. Within 1/16 texel of an
+  interior texel boundary the recorder's rounding picks either side, so the probe
+  is indeterminate unless the texels on both sides are alike.
+- **Linear** weighs the four texels around `coordinate × extent − ½`, with the
+  weights computed exactly, so a coordinate at a texel's centre reads that texel
+  alone.
+- An sRGB texture's colour channels decode to linear light before filtering
+  (`TexelRgba8Srgb`, and BC7 decoded from `TexelBc7Srgb`); alpha, and a linear
+  texture, are read as they are. Colour art is premultiplied in linear light by
+  the asset pipeline, so the oracle does not premultiply again. BC7 levels are
+  decoded with `asset-image`'s software decoder.
+- **A handle absent from the lookup** samples the placeholder, a 1×1
+  transparent-black texel, whatever the sampler. A handle is compared complete,
+  generation included, so two handles with one index and two generations are two
+  textures. A handle the lookup returns an image for is *not* absent: an image
+  that is not well formed is refused (below), never replaced by the placeholder.
+
+### The mip level (choice C)
+
+The level of detail is computed from the placed quad's constant texture-coordinate
+derivatives, as Vulkan's `ρmax`: the larger of the lengths of the two columns of
+the matrix of derivatives of the level-0 texel coordinates with respect to target
+pixels, and `λ = log₂ ρmax`. The derivatives are taken exactly.
+
+- A texture with one level, and a magnified probe (`λ ≤ ε`), sample level 0.
+- A minified probe is determinate when the derivatives are **axis-aligned** (no
+  shear, and no rotation other than quarter turns) and `λ` is within `ε` of a
+  whole number, or at least the last level's index less `ε`. It then samples that
+  level, or the last: no sampler clamps the level of detail, and a linear sampler
+  at a whole `λ` weighs the neighbouring level by zero.
+- Any other minified probe on a texture with more than one level is
+  indeterminate: not axis-aligned, or between two levels.
+
+`ε = 2⁻¹²`: how far a 32-bit quarter turn, or a scale of exactly one half, can be
+from itself. The same tolerance decides an axis: the off-axis derivatives are at
+most `ε` of the largest. Below it a neighbouring level's weight is under a
+thousandth of a channel step.
+
+## Colour
+
+With `t` the sampled texel (premultiplied, linear), `m = t` for the default
+material, `c` the tint (each byte over 255) and `b` the view's brightness
+(design D-24):
+
+```
+s     = m × c                     componentwise
+s.rgb = s.rgb × b
+s.a   = 0                         for an additive instance
+s     = clamp s to [0, 1]         a fixed-point attachment clamps the source
+result = s + destination × (1 − s.a)      clamped to [0, 1]
+```
+
+- **Every store is rounded.** The result of each blended fragment is encoded to
+  the target's 8-bit storage and rounded half up; the next fragment reads that
+  stored byte, decoding the colour channels on an sRGB target. Eight identical
+  UNORM sources of byte 4 over transparent black give 32, not 30.
+- An sRGB target decodes the destination before blending and encodes the result
+  on store; a UNORM target stores linear values; alpha is linear in every format.
+  The encode and decode are the standard piecewise sRGB transfer function.
+- A pass starts from its clear colour, a linear value encoded like any other.
+- The result is reported in RGBA order whatever the target's channel order.
+- Everything the target stores is an 8-bit channel; the oracle's only
+  floating-point arithmetic is this colour pipeline, in double precision.
+
+## Order
+
+The oracle visits a pass's views in order, each view's layers in order, and each
+layer's instances in the plan's drawing order (`drawingOrder` from
+`planSnapshot`): by depth key, then submission sequence, where a layer has no
+depth or no instance is cutout-marked (design D-2, D-22). A probe that any
+instance taking the `Cutout` path could cover, including by being within 1/16
+pixel of its edge, is **indeterminate** until R2D-9 adds depth expectations
+(choice H). Ordered-path instances in a depth-enabled layer pass the depth test
+against the cleared depth of 1.0, as design D-23 maps keys, so nothing else about
+depth changes what is drawn here.
+
+## Verdicts and exactness
+
+An expectation is `Expected value tolerance`, `Indeterminate why` or
+`Unevaluable failure`. `judge` and `judgeReadback` compare it with a pixel or a
+readback: the verdict **passes when every channel is within its tolerance**, and
+an indeterminate or unevaluable probe is never a pass.
+
+**The exactness rule (choice G).** A channel's tolerance is 0 when its final
+*stored* value involves no rounding, and 1 otherwise. The oracle follows each
+channel through sampling, shading, blending and the store:
+
+- a stored texel byte carried through unchanged is exact only when every step
+  preserves it: the texture and the target store the colour alike (an sRGB
+  texture on an sRGB target, a linear one on a UNORM target; alpha always), the
+  filter reads one texel or alike texels, the tint byte is 255, the brightness is
+  1, and the fragment replaces the destination (source alpha of exactly 1) or lands
+  on a destination byte of 0;
+- a value that is exactly 0 or 1, from a clear component of 0 or 1, a texel byte
+  of 0 or 255, a product of 0, or a clamp, is exact in every format;
+- a channel a fragment leaves untouched keeps its stored byte and its flag;
+- anything else is within one: a tint other than 255, brightness other than 1, a
+  weighted filter, a destination blended under a partial alpha, a colour space
+  that differs between texture and target, a clear component other than 0 or 1,
+  and **additive colour**, which is summed into the destination and rounds
+  whatever its alpha, so an additive source's alpha of zero never makes its colour
+  exact. Exactness is per channel, so a pixel may be exact in alpha and within one
+  in colour.
+
+## Indeterminate cases
+
+Each names where: the view as `AtView pass view`, or an instance as
+`AtInstance pass view layer instance`, by submission index.
+
+| Reason | When |
+| --- | --- |
+| `NearViewportEdge` | The probe's centre is within 1/16 pixel of an edge of a view's viewport that is not on a whole pixel, and the view has an instance that could draw there. |
+| `NearQuadEdge` | The centre is within 1/16 pixel of the edge of an ordered-path instance's quad. |
+| `OnCutoutPath` | A cutout-path instance covers the probe or is within 1/16 pixel of covering it. |
+| `MinifiedNotAxisAligned` | A minified probe, on a texture with more than one level, whose derivatives are sheared or rotated by other than a quarter turn. |
+| `MinifiedFractionalLevel` | A minified, axis-aligned probe whose level of detail is between two levels. |
+| `NearTexelBoundary` | A nearest-filtered coordinate within 1/16 texel of an interior boundary between texels that differ. |
+
+If a probe is both indeterminate and unevaluable it is unevaluable: a defect in
+the inputs is what to repair first.
+
+## Unevaluable probes
+
+A defect in an input is a non-passing result that names it, never a guess and
+never a skip. `ValidSnapshot` validates neither the lookup, the targets nor the
+readback, so the oracle does:
+
+| Failure | When |
+| --- | --- |
+| `PassOutOfRange` | The probe's pass is not a pass of the snapshot, including a negative index. |
+| `PixelOutsideTarget` | The probe's pixel is outside its target, including a negative coordinate and any pixel of a zero-extent target. |
+| `MissingTarget` | No `TargetSpec` for the pass's target. |
+| `InvalidMetrics` | The metrics have a negative extent, or a content scale that is not finite and positive. |
+| `ExtentDisagrees` | The pixel extent is not the metrics' framebuffer extent. |
+| `TargetTooLarge` | An extent beyond 2²³ pixels, where a pixel centre is not exactly a `Float`. |
+| `MappingNotRepresentable` | A view's mapping cannot be built, and an instance in it needs one. |
+| `PlacementNotRepresentable` | A non-singular quad's corners, or its snapped origin, are not finite `Float`s. |
+| `MalformedImage` | A texture the lookup returned that is not a well-formed image: a zero extent, no levels or more than the extent's mip chain has, a level whose byte count is not its extent's, or BC7 levels the software decoder refuses. Byte counts are checked in `Integer`, so an extent near 2³² cannot wrap. |
+
+A malformed texture is refused only for a probe an instance covers. A readback
+fault is reported by the reader:
+
+- `readPixel format extent bytes x y` returns the pixel at a column and row of a
+  tightly packed readback (level 0, rows top first, four bytes a pixel, in the
+  target's own format with no conversion), swizzling `B8G8R8A8` to RGBA and
+  leaving every byte as stored, an sRGB-encoded one included.
+- `ReadbackSizeWrong` (the bytes needed, then supplied; compared in `Integer`),
+  `ReadbackPixelOutside` and `ReadbackExtentInvalid` are faults, never pixels.
+
+## What is shared with `render-2d`, and what is independent
+
+**Shared** (a mistake in one is a mistake in both, so the fixtures below do not
+rely on them): `ValidSnapshot` and its validation; `viewMapping`, with
+`worldTransform`, `uiTransform`, `worldToTarget`, `uiToTarget`, `snapPoint` and
+`mappingPixelSnap`, which place the camera and snap; `viewportContains` and
+`viewportIsEmpty`; and `planSnapshot` with `drawingOrder` and each run's path,
+which order the instances and route the cutout path.
+
+**Independent**: composing the instance's transform with the layer's, coverage,
+distance from an edge, derivatives, level selection, texel addressing and
+filtering, the sRGB transfer function, the shading and blend equations, the
+rounding of every store, the exactness rule, the verdicts and the readback
+reader. These are written here, in rational arithmetic where the question is
+geometric.
+
+The suite's fixtures are independent of both: each expected value is written in
+the test, as a hand-drawn picture or as bytes worked on paper from the equations
+above (the camera's position at the viewport's centre, whole-number zoom spacing
+in both zoom modes, a quarter-turn rotation, UI at content scale 1 and 2, pixel
+snap, nearest and linear filtering across a texel boundary, sRGB against UNORM,
+tint, brightness with a clamped result, additive output, premultiplied overlap in
+drawing order, equal keys in submission order, a UI instance with a larger key
+over one submitted later, a 2:1 minified fixture reading level 1 with each filter
+and a 45° minified probe reported indeterminate, the placeholder, a BC7 texture
+and every indeterminate case). Against synthetic readbacks written as pictures,
+the suite shows the oracle **rejects** reversed overlap, a channel off by two and
+a wrong snap, and accepts the exact image.
+
+## Precision
+
+Placement and texel addressing are exact over the snapshot's 32-bit coefficients;
+the recorder places in 32-bit arithmetic. The 1/16-pixel band is what absorbs the
+difference, and it does while placed coordinates stay below about 2¹⁶ pixels,
+where a `Float` is still finer than 1/128 pixel; beyond that the oracle claims
+only its own exact arithmetic, and a game that places quads that far from the
+origin should not read a probe near an edge as determinate. The window's pixel
+centres are exact `Float`s up to the 2²³-pixel extent the oracle accepts.
+
+## Purity, owned state, threads and lifetimes
+
+Every function is pure and total over a validated snapshot and the lookups it is
+given; the same inputs always give the same expectations. The package owns **no
+state**, starts **no thread**, holds no native handle, performs no IO and reads
+no file, so it has no lifetime to manage and nothing to reset or dispose of. An
+`Oracle` is an immutable value that holds the snapshot's plan and the lookup;
+building it checks nothing eagerly, and each defect is reported by the probes it
+affects. The lookup is a pure function the caller supplies; it is called as the
+probes need it, and nothing is cached.
+
+## Tests
+
+```
+cabal test --project-file cabal.project.cpu hetoimasia-render-2d-oracle:render-2d-oracle-tests --test-show-details=direct
+```
+
+The suite is the CPU validation group `test.render-2d-oracle`; it needs no GPU
+and no display. Its components, selectable with `--test-options='--match <name>'`
+on the suite that owns them, are `Placement`, `Sampling`, `Colour`, `Probes` and
+`Verdicts`.

@@ -355,6 +355,18 @@ the UV rectangle as two `vec2`s, or reads the instance as vertex attributes.
 Declared as a `vec4`, the UV rectangle would align to 16 bytes and move to
 offset 32, breaking the 64-byte stride. Never declare it as a `vec4`.
 
+## The quad an instance places
+
+An instance's transform places the **unit square** [0, 1]² in its layer's
+space: local (0, 0) is the instance's origin, the translation of its transform,
+which pixel snap rounds, and texture coordinates interpolate affinely from
+`(u0, v0)` at local (0, 0) to `(u1, v1)` at local (1, 1). Nothing in this
+package draws a quad, so this is the contract the recorder's vertex stage must
+meet (R2D-7); it is stated and tested in
+[`hetoimasia-render-2d-oracle`](../render-2d-oracle/README.md), which computes
+the pixels a snapshot draws under it, and a recorder is proven against that
+oracle's probes.
+
 ## Owned state, threads and lifetimes
 
 None: every value is pure and immutable. The package starts no thread, owns no
@@ -367,7 +379,8 @@ slices of the design (R2D-14, R2D-8).
 
 Which instance lies under a point (the game's question); clip-space conversion
 and the shader's snapping (R2D-7); reading window metrics and publishing per
-window (R2D-14, R2D-8); culling instances per view; expected pixels (R2D-4); retained static
+window (R2D-14, R2D-8); culling instances per view; expected pixels (R2D-4, in
+[`hetoimasia-render-2d-oracle`](../render-2d-oracle/README.md)); retained static
 content and its merge with the dynamic snapshot (R2D-10); application materials
 and splitting runs between them (R2D-11); computing or registering a texture's
 mark (R2D-7, R2D-8); recording, shaders,
