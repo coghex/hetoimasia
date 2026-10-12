@@ -26,7 +26,7 @@ module Hetoimasia.Render.TwoD.ZoomSteps
 
 import Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.List.NonEmpty as NonEmpty
-import Hetoimasia.Render.TwoD.Internal.Check (finite, positiveFinite)
+import Hetoimasia.Render.TwoD.Internal.Check (positiveFinite)
 
 -- | A validated list of zoom levels: non-empty, finite, positive and strictly
 -- increasing. The constructor is private, so every value came from
@@ -56,8 +56,9 @@ data ZoomReason
     ZoomListEmpty
   | -- | The level is NaN, infinite, zero or negative.
     ZoomLevelInvalid
-  | -- | The level is not greater than the level before it. Reported only when
-    -- both are finite.
+  | -- | The level is not greater than the level before it. Checked
+    -- independently of 'ZoomLevelInvalid'; only a NaN neighbour has no order to
+    -- compare, so an infinity is compared like any other number.
     ZoomLevelNotIncreasing
   deriving stock (Eq, Ord, Show, Enum, Bounded)
 
@@ -82,8 +83,7 @@ validateZoomSteps levels@(first : rest) =
         [ [ZoomRefusal (AtLevel index) ZoomLevelInvalid | not (positiveFinite level)]
             <> [ ZoomRefusal (AtLevel index) ZoomLevelNotIncreasing
                | Just before ← [previous]
-               , finite before
-               , finite level
+               , not (isNaN before || isNaN level)
                , level <= before
                ]
         | (index, level, previous) ← zip3 [0 ..] levels (Nothing : map Just levels)

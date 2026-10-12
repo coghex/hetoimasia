@@ -32,10 +32,16 @@ spec = describe "ZoomSteps" $ do
       (\(name, levels, expected) → it ("a candidate with " <> name) $ validateZoomSteps' levels `shouldBe` Left expected)
       refusalCases
 
-  it "does not compare a level with a non-finite neighbour, which is refused already" $ do
+  it "does not compare a level with a NaN neighbour, which has no order" $ do
     validateZoomSteps' [nan, 1] `shouldBe` Left [at 0 ZoomLevelInvalid]
     validateZoomSteps' [2, nan, 1] `shouldBe` Left [at 1 ZoomLevelInvalid]
-    validateZoomSteps' [inf, 1] `shouldBe` Left [at 0 ZoomLevelInvalid]
+
+  it "compares an infinite level like any other number, besides refusing it" $ do
+    validateZoomSteps' [inf, 1] `shouldBe` Left [at 0 ZoomLevelInvalid, at 1 ZoomLevelNotIncreasing]
+    validateZoomSteps' [1, inf] `shouldBe` Left [at 1 ZoomLevelInvalid]
+    validateZoomSteps' [1, inf, inf] `shouldBe` Left [at 1 ZoomLevelInvalid, at 2 ZoomLevelInvalid, at 2 ZoomLevelNotIncreasing]
+    validateZoomSteps' [-inf, 1] `shouldBe` Left [at 0 ZoomLevelInvalid]
+    validateZoomSteps' [1, -inf] `shouldBe` Left [at 1 ZoomLevelInvalid, at 1 ZoomLevelNotIncreasing]
 
   it "reports every reason together, in the order of the levels" $
     validateZoomSteps' [0, nan, 2, 1, -1, 1, 1]

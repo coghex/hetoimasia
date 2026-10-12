@@ -97,7 +97,9 @@ data Reason
     CameraRotationNotFinite
   | -- | A viewport origin or extent with a NaN or infinite component.
     ViewportNotFinite
-  | -- | A viewport with a negative extent.
+  | -- | A viewport with a negative extent component, which includes negative
+    -- infinity: this is checked independently of 'ViewportNotFinite', so a
+    -- viewport can be refused for both.
     ViewportExtentNegative
   | -- | A UI scale that is NaN, infinite or outside [0.5, 4.0].
     UiScaleOutOfRange
@@ -205,10 +207,10 @@ viewRefusals passIndex viewIndex view =
     V2 px py = cameraPosition camera
     settings = viewSettings view
     Viewport (V2 ox oy) (V2 width height) = viewViewport view
-    viewportRefusals
-      | not (allFinite [ox, oy, width, height]) = [at ViewportNotFinite]
-      | width < 0 || height < 0 = [at ViewportExtentNegative]
-      | otherwise = []
+    -- Independent: a NaN origin does not hide a finite negative extent.
+    viewportRefusals =
+      [at ViewportNotFinite | not (allFinite [ox, oy, width, height])]
+        <> [at ViewportExtentNegative | width < 0 || height < 0]
 
 layerRefusals ∷ Int → Int → Int → Layer → [Refusal]
 layerRefusals passIndex viewIndex layerIndex layer =
