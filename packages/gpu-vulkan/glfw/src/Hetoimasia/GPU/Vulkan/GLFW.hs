@@ -159,6 +159,7 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , defaultVersionCount
   , constructTextureTable
   , constructTablePipelineLayout
+  , constructShaderSampledTablePipelineLayout
   , textureTableDescriptors
   , TextureHandle (..)
   , LookupEntry (..)
@@ -320,6 +321,7 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , readConstructedReadback
   , constructTextureTable
   , constructTablePipelineLayout
+  , constructShaderSampledTablePipelineLayout
   , registerConstructedTexture
   , swapConstructedTexture
   , releaseConstructedTexture

@@ -22,6 +22,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Table
   , releaseTexture
   , refreshTextureTable
   , createTablePipelineLayout
+  , createShaderSampledTablePipelineLayout
   , TableView (..)
   , readTable
   , RegistrationNotUndone (..)
@@ -82,6 +83,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , SwapState (..)
   , SwapTicket (..)
   , TableState (..)
+  , TableUse (..)
   , sessionHasFailed
   , settleSwap
   , checkpointed
@@ -617,32 +619,54 @@ refreshTextureTable recording = owned recording (refreshTable recording)
 -- refuse.
 createTablePipelineLayout ∷ Recording q inst msgr phys dev cmd → CheckedShaders → Word32 → IO (Either Refusal PipelineLayout)
 createTablePipelineLayout recording shaders samplerOffset =
+  tablePipelineLayout recording shaders $ \ranges →
+    if samplerOffset `mod` 4 /= 0 || not (any covers ranges)
+      then Left (RefusedIllegal "a sampler index outside every push-constant range the fragment stage sees")
+      else Right (TablePushedSampler samplerOffset)
+  where
+    covers range =
+      PushFragment `elem` rangeStages range
+        && rangeOffset range <= samplerOffset
+        && toInteger samplerOffset + 4 <= toInteger (rangeOffset range) + toInteger (rangeSize range)
+
+-- | A pipeline layout holding the texture table whose shaders choose their
+-- samplers (render-2d D-4): the same set layouts and the same checks of the
+-- shaders' bindings and push-constant ranges as 'createTablePipelineLayout',
+-- but no sampler offset. No push-constant bytes are reserved, so the shaders
+-- may declare none at all. A draw through a pipeline over it needs no
+-- 'selectSampler' (which it refuses); the shaders index the table's four
+-- samplers themselves, and must clamp the index to the table's last. Refused
+-- before any native call: a session with no table, and whatever
+-- 'checkedTableRanges' and the push-range validation refuse.
+createShaderSampledTablePipelineLayout ∷ Recording q inst msgr phys dev cmd → CheckedShaders → IO (Either Refusal PipelineLayout)
+createShaderSampledTablePipelineLayout recording shaders = tablePipelineLayout recording shaders (const (Right TableShaderSampler))
+
+-- | The layout both constructors make: the table's checks, then the sampler
+-- choice the caller validates against the ranges the shaders need.
+tablePipelineLayout
+  ∷ Recording q inst msgr phys dev cmd
+  → CheckedShaders
+  → ([PushConstantRange] → Either Refusal TableUse)
+  → IO (Either Refusal PipelineLayout)
+tablePipelineLayout recording shaders choose =
   owned recording . checkpointed recording $
     readTVarIO (recordingTable recording) >>= \case
       Nothing → pure (Left (RefusedIllegal "a pipeline layout holding a texture table this session has not made"))
-      Just table → case checkedTableRanges shaders of
+      Just table → case checkedTableRanges shaders >>= \ranges → (,) ranges <$> choose ranges of
         Left refusal → pure (Left refusal)
-        Right ranges
-          | samplerOffset `mod` 4 /= 0 || not (any (covers samplerOffset) ranges) →
-              pure (Left (RefusedIllegal "a sampler index outside every push-constant range the fragment stage sees"))
-          | otherwise → do
-              limits ← opsRecordingLimits (recordingOps recording)
-              case validatePushRanges (limitPushConstantBytes limits) ranges of
-                Left refusal → pure (Left refusal)
-                Right () →
-                  fmap PipelineLayout
-                    <$> construct
-                      recording
-                      0
-                      1
-                      "vkCreatePipelineLayout"
-                      (\layer device _ _ → Right . (\handle → NativeLayout handle ranges (Just samplerOffset)) <$> opsCreatePipelineLayout layer device (tableSetLayoutHandles table) ranges)
-                      Nothing
-  where
-    covers offset range =
-      PushFragment `elem` rangeStages range
-        && rangeOffset range <= offset
-        && toInteger offset + 4 <= toInteger (rangeOffset range) + toInteger (rangeSize range)
+        Right (ranges, use) → do
+          limits ← opsRecordingLimits (recordingOps recording)
+          case validatePushRanges (limitPushConstantBytes limits) ranges of
+            Left refusal → pure (Left refusal)
+            Right () →
+              fmap PipelineLayout
+                <$> construct
+                  recording
+                  0
+                  1
+                  "vkCreatePipelineLayout"
+                  (\layer device _ _ → Right . (\handle → NativeLayout handle ranges (Just use)) <$> opsCreatePipelineLayout layer device (tableSetLayoutHandles table) ranges)
+                  Nothing
 
 -- | The texture table as an observer sees it.
 data TableView = TableView

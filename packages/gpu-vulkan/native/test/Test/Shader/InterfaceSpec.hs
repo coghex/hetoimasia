@@ -17,8 +17,8 @@ import System.Directory (createDirectoryIfMissing)
 import System.FilePath (takeDirectory, (</>))
 import Test.Hspec
 
-import Hetoimasia.GPU.Vulkan.Native.Recording.ShaderInterfaces (tableFragmentInterface, tableVertexInterface)
-import Hetoimasia.GPU.Vulkan.Native.Recording.Shaders (tableShaders)
+import Hetoimasia.GPU.Vulkan.Native.Recording.ShaderInterfaces (tableFragmentInterface, tableInstanceFragmentInterface, tableInstanceStride, tableInstanceVertexInterface, tableVertexInterface)
+import Hetoimasia.GPU.Vulkan.Native.Recording.Shaders (tableInstanceShaders, tableShaders)
 import Hetoimasia.GPU.Vulkan.Native.Shader.Interface
 import Hetoimasia.GPU.Vulkan.Native.Shader.Reflect
 import Hetoimasia.GPU.Vulkan.Native.Shader.Toolchain (fingerprintPath)
@@ -160,6 +160,47 @@ spec = describe "Shader interfaces" $ do
       -- Any other binding beside them is a mismatch the build names.
       fmap (map renderMismatch . compareInterface tableFragmentInterface {interfaceDescriptors = take 2 textureTableDescriptors}) (reflect (checkedSpirv fragment))
         `shouldBe` Right ["descriptor set 1, binding 0 (StorageBuffer) is present in the shader but undeclared"]
+
+    it "include the table's instance shaders (R2D-16): the table's own bindings and no push constants, a per-instance vertex binding, and a sampler index, a slot index and a combined image all NonUniform" $ do
+      let CheckedShaders vertex fragment = tableInstanceShaders
+      checkedInterface vertex `shouldBe` tableInstanceVertexInterface
+      checkedInterface fragment `shouldBe` tableInstanceFragmentInterface
+      interfaceDescriptors tableInstanceFragmentInterface `shouldBe` textureTableDescriptors
+      interfacePushConstants tableInstanceFragmentInterface `shouldBe` []
+      interfacePushConstants tableInstanceVertexInterface `shouldBe` []
+      -- Exactly the table's bindings: the fragment stage reads all three, and
+      -- the vertex stage none.
+      fmap reflectionDescriptors (reflect (checkedSpirv fragment))
+        `shouldBe` Right
+          [ ReflectedDescriptor 0 0 ReflectedSampler (ReflectedFixed 4)
+          , ReflectedDescriptor 0 1 ReflectedSampledImage ReflectedRuntime
+          , ReflectedDescriptor 1 0 ReflectedStorageBuffer (ReflectedFixed 1)
+          ]
+      fmap reflectionDescriptors (reflect (checkedSpirv vertex)) `shouldBe` Right []
+      fmap (compareInterface tableInstanceFragmentInterface) (reflect (checkedSpirv fragment)) `shouldBe` Right []
+      fmap (compareInterface tableInstanceVertexInterface) (reflect (checkedSpirv vertex)) `shouldBe` Right []
+      -- One binding, per instance, of the stride the three attributes fill,
+      -- with the sampler index a 32-bit unsigned integer.
+      interfaceVertexInput tableInstanceVertexInterface
+        `shouldBe` VertexInput
+          [VertexBinding 0 tableInstanceStride PerInstance]
+          [VertexAttribute 0 0 VertexFloat4 0, VertexAttribute 1 0 VertexUint 16, VertexAttribute 2 0 VertexUint 20, VertexAttribute 3 0 VertexUint 24]
+      tableInstanceStride `shouldBe` 28
+      fmap reflectionInputs (reflect (checkedSpirv vertex))
+        `shouldBe` Right [(0, VectorType (FloatScalar 32) 4), (1, ScalarType (UnsignedScalar 32)), (2, ScalarType (UnsignedScalar 32)), (3, ScalarType (UnsignedScalar 32))]
+      -- The sampler index comes from instance data, so the sampler index and
+      -- the slot index each reach the descriptor arrays through NonUniform
+      -- indices, and the image, the sampler and the combined operand the
+      -- sample consumes are NonUniform too.
+      let spirv = checkedSpirv fragment
+      nonUniformSampling spirv `shouldSatisfy` (not . null)
+      nonUniformSampling spirv `shouldSatisfy` all id
+      nonUniformIndexing spirv `shouldSatisfy` ((== 2) . length)
+      nonUniformIndexing spirv `shouldSatisfy` all id
+      -- The same check refuses a shader whose indices are not decorated.
+      undecorated ← ByteString.readFile "test/fixtures/spirv/descriptors.frag.spv"
+      nonUniformIndexing undecorated `shouldSatisfy` (not . null)
+      nonUniformIndexing undecorated `shouldSatisfy` (not . and)
 
     it "report a stage mismatch, in both directions, when a description is for the other stage" $ do
       fmap (compareInterface (interfaceFor VertexInterface)) (reflect verificationFragment) `shouldBe` Right [StageMismatch VertexInterface ReflectedFragment]
@@ -386,3 +427,28 @@ nonUniformSampling bytes =
     nonUniform = [target | (71, [target, 5300]) ← instructions]
     -- OpSampledImage result-type result image sampler.
     combined = [(result, [image, sampler]) | (86, [_, result, image, sampler]) ← instructions]
+
+-- | For every sampled image a module combines: whether the index of the array
+-- access each of its image and its sampler is loaded through is decorated
+-- NonUniform — the slot index of the image array, and the sampler index.
+nonUniformIndexing ∷ ByteString.ByteString → [Bool]
+nonUniformIndexing bytes =
+  [ all (`elem` nonUniform) indices
+  | (86, [_, _, image, sampler]) ← instructions
+  , operand ← [image, sampler]
+  , (61, [_, loaded, pointer]) ← instructions
+  , loaded == operand
+  , (65, _ : accessed : _ : indices) ← instructions
+  , accessed == pointer
+  ]
+  where
+    words' = [littleEndian (ByteString.take 4 (ByteString.drop (4 * index) bytes)) | index ← [0 .. ByteString.length bytes `div` 4 - 1]]
+    littleEndian chunk = foldr (\byte acc → acc `shiftL` 8 .|. fromIntegral byte) 0 (ByteString.unpack chunk) ∷ Word32
+    instructions = go (drop 5 words')
+    go = \case
+      [] → []
+      first : rest →
+        let count = fromIntegral (first `shiftR` 16)
+            opcode = first .&. 0xffff
+         in (opcode, take (count - 1) rest) : go (drop (max 0 (count - 1)) rest)
+    nonUniform = [target | (71, [target, 5300]) ← instructions]
