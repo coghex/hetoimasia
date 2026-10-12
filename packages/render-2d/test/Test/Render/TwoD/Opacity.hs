@@ -25,7 +25,9 @@ spec = describe "Validated value and target opacity across the package boundary"
   rejected "a client that names the offscreen target reference's constructor" targetConstructor "GHC-10237" "TargetRef"
   rejected "a client that reads the target reference's index through the public module" targetReader "GHC-61689" "targetRefIndex"
   rejected "a client that builds a target reference through the public module" targetBuilder "GHC-61689" "targetRef"
+  rejected "a client that names the view mapping's constructor" mappingConstructor "GHC-10237" "ViewMapping"
   accepted "a client that validates a candidate and encodes its layers" validateAndEncode
+  accepted "a client that builds a view mapping and converts a cursor position" buildMapping
   accepted "a client that builds and reads a target reference through the backend-facing module" backendTarget
 
 withClient ∷ String → ((Mode → IO Client) → IO ()) → IO ()
@@ -166,4 +168,35 @@ backendTarget =
     , ""
     , "numbers ∷ TargetRef → (Word32, Word32)"
     , "numbers reference = (targetRefIndex reference, targetRefGeneration reference)"
+    ]
+
+mappingConstructor ∷ String
+mappingConstructor =
+  unlines
+    [ "module Client (forged) where"
+    , ""
+    , "import Hetoimasia.Render.TwoD.Mapping (ViewMapping (ViewMapping))"
+    , ""
+    , "forged ∷ ViewMapping"
+    , "forged = ViewMapping undefined undefined undefined undefined undefined undefined"
+    ]
+
+-- | What game code does with the mapping: build it from the window's metrics
+-- and a view, and turn a cursor position into a world point.
+buildMapping ∷ String
+buildMapping =
+  unlines
+    [ "module Client (pick) where"
+    , ""
+    , "import Hetoimasia.Math.Vector (V2 (..))"
+    , "import Hetoimasia.Render.TwoD.Mapping (viewMapping, windowToWorld)"
+    , "import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..))"
+    , "import Hetoimasia.Render.TwoD.Settings (defaultViewSettings)"
+    , "import Hetoimasia.Render.TwoD.Snapshot (Camera (..), View (..), Viewport (..))"
+    , ""
+    , "pick ∷ V2 → Maybe V2"
+    , "pick cursor = viewMapping metrics view >>= \\mapping → windowToWorld mapping cursor"
+    , "  where"
+    , "    metrics = TargetMetrics (PixelExtent 640 480) (PixelExtent 1280 960) 2 2"
+    , "    view = View (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 1280 960)) defaultViewSettings []"
     ]
