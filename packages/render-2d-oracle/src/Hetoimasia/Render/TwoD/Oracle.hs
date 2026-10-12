@@ -51,6 +51,8 @@ module Hetoimasia.Render.TwoD.Oracle
     -- * Verdicts
   , Verdict (..)
   , ChannelDifference (..)
+  , ReadbackFault (..)
+  , readProbe
   , judge
   , judgeReadback
   , passes
@@ -130,7 +132,7 @@ import Hetoimasia.Render.TwoD.Oracle.Internal.Sample
   , placeholder
   , sampleLevel
   )
-import Hetoimasia.Render.TwoD.Oracle.Readback (ReadbackFault, readPixel)
+import Hetoimasia.Render.TwoD.Oracle.Readback (ReadbackFault (..), readPixel)
 import Hetoimasia.Render.TwoD.Settings (TextureFilter (..), ViewSettings (..))
 import Hetoimasia.Render.TwoD.Snapshot
   ( ClearColour
@@ -512,6 +514,11 @@ judge (Expected expected@(Rgba8 er eg eb ea) tolerance@(Tolerance tr tg tb ta)) 
         | (channel, e, a, t) ← [(Red, er, ar, tr), (Green, eg, ag, tg), (Blue, eb, ab, tb), (Alpha, ea, aa, ta)]
         , abs (fromIntegral e - fromIntegral a ∷ Int) > fromIntegral t
         ]
+
+-- | The pixel a probe names in a tightly packed readback of a target of this
+-- format and extent, in RGBA order: 'readPixel' at the probe's column and row.
+readProbe ∷ ColourFormat → PixelExtent → ByteString → Probe → Either ReadbackFault Rgba8
+readProbe format extent bytes (Probe _ x y) = readPixel format extent bytes x y
 
 -- | A probe judged against a tightly packed readback of its target, which must
 -- be in the target's format and extent.

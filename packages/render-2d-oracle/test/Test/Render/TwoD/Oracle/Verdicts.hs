@@ -10,7 +10,7 @@ import Data.ByteString (ByteString)
 import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..))
 import Hetoimasia.Render.TwoD.Oracle
 import Hetoimasia.Render.TwoD.Oracle.Colour (Channel (..), ColourFormat (..), Rgba8 (..), Tolerance (..))
-import Hetoimasia.Render.TwoD.Oracle.Readback (ReadbackFault (..), readPixel)
+import Hetoimasia.Render.TwoD.Oracle.Readback (readPixel)
 import Hetoimasia.Render.TwoD.Settings (ViewSettings (..), defaultViewSettings)
 import Hetoimasia.Render.TwoD.Snapshot
 import Hetoimasia.Render.TwoD.Validation (Location (..))
@@ -93,6 +93,11 @@ spec = describe "readbacks and verdicts" $ do
     it "swizzles B8G8R8A8 to RGBA, leaving every byte as stored" $ do
       readPixel B8G8R8A8Srgb extent bytes 0 0 `shouldBe` Right (Rgba8 3 2 1 4)
       readPixel B8G8R8A8Unorm extent bytes 1 0 `shouldBe` Right (Rgba8 7 6 5 8)
+
+    it "reads the pixel a probe names" $ do
+      readProbe B8G8R8A8Srgb extent bytes (Probe 0 1 0) `shouldBe` Right (Rgba8 7 6 5 8)
+      readProbe R8G8B8A8Srgb extent bytes (Probe 3 0 0) `shouldBe` Right (Rgba8 1 2 3 4)
+      readProbe R8G8B8A8Srgb extent bytes (Probe 0 2 0) `shouldBe` Left (ReadbackPixelOutside 2 0)
 
     it "reads rows top first" $
       readPixel R8G8B8A8Unorm (PixelExtent 1 2) bytes 0 1 `shouldBe` Right (Rgba8 5 6 7 8)
