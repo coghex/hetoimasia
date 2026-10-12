@@ -8,7 +8,7 @@ import Hetoimasia.Math.Vector (V2 (..))
 import Hetoimasia.Render.TwoD.Mapping (snapPixel, snapPoint)
 import Test.Hspec (Spec, describe, it, shouldBe)
 import Test.Hspec.QuickCheck (prop)
-import Test.QuickCheck (Gen, choose, counterexample, elements, forAll, frequency, property, (===))
+import Test.QuickCheck (Gen, choose, counterexample, elements, forAll, frequency, property, (===), (==>))
 
 spec ∷ Spec
 spec = describe "Snapping" $ do
@@ -75,9 +75,24 @@ spec = describe "Snapping" $ do
       forAll ((,) <$> anyFinite <*> anyFinite) $ \(x, y) →
         property (x > y || snapPixel x <= snapPixel y)
 
-    prop "commutes with whole-number shifts" $
+    prop "commutes with whole-number shifts, wherever the shifted sum is exact" $
       forAll ((,) <$> ordinary <*> choose (-1000, 1000 ∷ Int)) $ \(x, n) →
-        snapPixel (x + fromIntegral n) === snapPixel x + fromIntegral n
+        let shifted = x + fromIntegral n
+         in -- Float addition can round the sum, and then it is a different number
+            -- from the one being shifted; the property is about exact sums.
+            toRational shifted == toRational x + fromIntegral n
+              ==> snapPixel shifted === snapPixel x + fromIntegral n
+
+    it "keeps the shift property's counterexample out of its domain: the sum is rounded" $ do
+      -- 65535.49609375 + 1 rounds to 65536.5 in 32-bit arithmetic, which snaps
+      -- to 65537, while 65535.49609375 snaps to 65535 and 65535 + 1 is 65536.
+      let x = 65535.49609375 ∷ Float
+      (x + 1) `shouldBe` 65536.5
+      toRational (x + 1) == toRational x + 1 `shouldBe` False
+      snapPixel x `shouldBe` 65535
+      snapPixel (x + 1) `shouldBe` 65537
+      -- The exact shifted value, 65536.49609375, snaps to 65536.
+      (floor (toRational x + 1 + 1 / 2) ∷ Integer) `shouldBe` 65536
 
 -- | Finite floats of every magnitude, whole numbers and exact halves included.
 anyFinite ∷ Gen Float

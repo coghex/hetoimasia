@@ -248,11 +248,32 @@ snapping = describe "pixel snap" $ do
     targetToWorld on (V2 51 51) `shouldBe` Just (V2 1 1)
     targetToWorld off (V2 50.25 50.25) `shouldBe` Just (V2 0.5 0.5)
 
-  it "snaps the UI origin, and inverts the snapped UI transform" $ do
+  describe "UI" $ do
     let uiView snap = viewOf plainCamera (Viewport (V2 10.4 20.6) (V2 100 100)) defaultViewSettings {settingPixelSnap = snap}
-    uiToTarget (mapping (pixels 200 200) (uiView True)) (V2 1 1) `shouldBe` Just (V2 11 22)
-    uiToTarget (mapping (pixels 200 200) (uiView False)) (V2 1 1) `shouldBe` Just (V2 11.4 21.6)
-    targetToUi (mapping (pixels 200 200) (uiView True)) (V2 11 22) `shouldBe` Just (V2 1 1)
+        uiOn = mapping (pixels 200 200) (uiView True)
+        uiOff = mapping (pixels 200 200) (uiView False)
+
+    it "keeps the continuous equation and its inverse with snap on: the transform does not change" $ do
+      uiTransform uiOn `shouldBe` uiTransform uiOff
+      uiToTarget uiOn (V2 0 0) `shouldBe` Just (V2 10.4 20.6)
+      uiToTarget uiOn (V2 1 1) `shouldBe` Just (V2 11.4 21.6)
+      targetToUi uiOn (V2 10.4 20.6) `shouldBeNear` (V2 0 0, 1.0e-5)
+      targetToUi uiOn (V2 11.4 21.6) `shouldBeNear` (V2 1 1, 1.0e-5)
+
+    it "rounds a UI instance origin through snapPoint, separately, and leaves the inverse unrounded" $ do
+      fmap snapPoint (uiToTarget uiOn (V2 1 1)) `shouldBe` Just (V2 11 22)
+      targetToUi uiOn (V2 11 22) `shouldBeNear` (V2 0.6 1.4, 1.0e-5)
+
+  it "keeps the camera at the centre to the 32-bit resolution of its translation, far from the origin" $ do
+    -- Scale 40960 pixels per unit at position 999.99: the translation is about
+    -- 4e7, where one ulp is 4 pixels, so the camera lands pixels from the centre
+    -- (2056, 2068 against 2058.4, 2068.6) and the mapping is still finite and
+    -- inverts what it holds. The tolerance states that resolution.
+    let far = viewOf (Camera (V2 999.99 999.99) 10 (Just 0.7)) (Viewport (V2 10.4 20.6) (V2 4096 4096)) (snapSettings True (FixedHalfHeight 0.5))
+    isJust (viewMapping (pixels 4096 4096) far) `shouldBe` True
+    centreTolerance far > 2.4 `shouldBe` True
+    fmap (\(dx, dy) → abs dx <= centreTolerance far && abs dy <= centreTolerance far) (centreOffset (pixels 4096 4096) far)
+      `shouldBe` Just True
 
   it "reports whether the view snaps" $ do
     mappingPixelSnap on `shouldBe` True
@@ -494,6 +515,41 @@ numeric = describe "unrepresentable results" $ do
   it "treats an offscreen target's metrics as logical = pixels, content scale 1" $
     offscreenMetrics (PixelExtent 7 9) `shouldBe` TargetMetrics (PixelExtent 7 9) (PixelExtent 7 9) 1 1
 
+-- | How far the camera position may appear from the viewport's centre: half a
+-- pixel with snap on, plus the resolution of the 32-bit translation, which is
+-- the centre minus the scale times the camera position. One ulp of that
+-- product is about 1.2e-7 of its size, and a few ulps of rounding accumulate
+-- through the coefficients, so the allowance is 4e-7 of the magnitudes held,
+-- and 1e-3 beside.
+centreTolerance ∷ View → Float
+centreTolerance view = snapPart + 1.0e-3 + 4.0e-7 * magnitude
+  where
+    Viewport (V2 ox oy) (V2 w h) = viewViewport view
+    V2 px py = cameraPosition (viewCamera view)
+    zoom = cameraZoom (viewCamera view)
+    scale = case settingZoomMode (viewSettings view) of
+      PixelsPerUnit → zoom
+      FixedHalfHeight half → h * zoom / (2 * half)
+    snapPart = if settingPixelSnap (viewSettings view) then 0.5 else 0
+    magnitude = abs ox + abs oy + w + h + scale * (abs px + abs py)
+
+-- | Where the camera position lands, relative to the viewport's centre.
+centreOffset ∷ TargetMetrics → View → Maybe (Float, Float)
+centreOffset metrics view =
+  (\(V2 x y) → (x - (ox + w / 2), y - (oy + h / 2))) <$> worldToTarget (mapping metrics view) (cameraPosition (viewCamera view))
+  where
+    Viewport (V2 ox oy) (V2 w h) = viewViewport view
+
+centreWithinTolerance ∷ TargetMetrics → View → Property
+centreWithinTolerance metrics view = case centreOffset metrics view of
+  Just (dx, dy) →
+    counterexample
+      (show (dx, dy) <> " from the centre, within " <> show tolerance)
+      (property (abs dx <= tolerance && abs dy <= tolerance))
+  Nothing → counterexample "no result" (property False)
+  where
+    tolerance = centreTolerance view
+
 -- Properties ----------------------------------------------------------------
 
 -- | A target, and a view valid on it, in the domain the tolerance is stated for.
@@ -584,22 +640,20 @@ properties = describe "properties" $ do
        in closeTo (maximum [abs px, abs py] * 0.1) p (windowToTarget m p >>= targetToWindow m)
 
   prop "window → world → window and window → UI → window return the point" $
-    forAll ((,) <$> genCase <*> genPoint) $ \(c, p) →
+    forAll ((,) <$> genCase <*> genPoint) $ \(c@(Case metrics _), p) →
       let m = mappingOf c
           V2 px py = p
           window = maximum [abs px, abs py] * 8
-       in closeTo (window + 2 * worldMagnitude m p) p (windowToWorld m p >>= worldToWindow m)
-            .&&. closeTo (window + 2 * uiMagnitude m p) p (windowToUi m p >>= uiToWindow m)
+          -- The error made in target pixels reaches the window scaled by the
+          -- logical-to-framebuffer ratio, which a tiny framebuffer makes large.
+          PixelExtent lw lh = metricsLogical metrics
+          PixelExtent fw fh = metricsFramebuffer metrics
+          amplify = maximum [1, fromIntegral lw / fromIntegral fw, fromIntegral lh / fromIntegral fh]
+       in closeTo (amplify * (window + 2 * worldMagnitude m p)) p (windowToWorld m p >>= worldToWindow m)
+            .&&. closeTo (amplify * (window + 2 * uiMagnitude m p)) p (windowToUi m p >>= uiToWindow m)
 
-  prop "the camera position appears at the viewport's centre, to half a pixel with snap on" $
-    forAll genCase $ \c@(Case _ view) →
-      let m = mappingOf c
-          Viewport (V2 ox oy) (V2 w h) = viewViewport view
-          V2 cx cy = cameraPosition (viewCamera view)
-          tolerance = if settingPixelSnap (viewSettings view) then 0.5 + 1.0e-3 else 1.0e-3 * (1 + max (abs ox + w) (abs oy + h))
-       in case worldToTarget m (V2 cx cy) of
-            Just (V2 x y) → counterexample (show (x, y)) (property (abs (x - (ox + w / 2)) <= tolerance && abs (y - (oy + h / 2)) <= tolerance))
-            Nothing → counterexample "no result" (property False)
+  prop "the camera position appears at the viewport's centre, to the stated tolerance" $
+    forAll genCase $ \(Case metrics view) → centreWithinTolerance metrics view
 
   prop "snapping the position drawing computes moves it by at most half a pixel per axis" $
     forAll ((,) <$> genCase <*> genPoint) $ \(c, p) →
@@ -609,13 +663,17 @@ properties = describe "properties" $ do
             Nothing → False
        in property (within worldToTarget && within uiToTarget)
 
-  prop "the translation is on the pixel grid with snap on, and the inverse maps that transform back" $
-    forAll genCase $ \c@(Case _ view) →
+  prop "the world translation is on the pixel grid with snap on, and the UI transform never changes with snap" $
+    forAll genCase $ \c@(Case metrics view) →
       let m = mappingOf c
           grid f = case drop 4 (toColumnMajor f) of
             [tx, ty] → snapPixel tx == tx && snapPixel ty == ty
             _ → False
-       in property (not (settingPixelSnap (viewSettings view)) || (grid (worldTransform m) && grid (uiTransform m)))
+          flipped = mapping metrics view {viewSettings = (viewSettings view) {settingPixelSnap = not (settingPixelSnap (viewSettings view))}}
+       in property
+            ( (not (settingPixelSnap (viewSettings view)) || grid (worldTransform m))
+                && uiTransform m == uiTransform flipped
+            )
 
   prop "gives a mapping only for a valid view and valid metrics, whatever the floats" $
     forAll anyCase $ \(Case metrics view, _) →

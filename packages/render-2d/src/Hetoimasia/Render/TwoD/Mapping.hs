@@ -51,16 +51,19 @@
 -- 'windowToWorld' and 'windowToUi' compose this with the inverse transforms, and
 -- 'worldToWindow' and 'uiToWindow' go back.
 --
--- __Pixel snap.__ When the view's pixel snap is on, the translation of each
--- transform is rounded to the device pixel grid with 'snapPixel': the camera's
--- translation for the world transform, the UI origin for the UI transform. The
--- inverse is the exact inverse of that same transform, so picking uses
--- precisely the transform drawing uses, with its snapped translation, and
--- rounds no result. The per-instance origin rounding the recorder later
--- applies rigidly in the shader is 'snapPoint', exposed separately: a consumer
--- reproduces a snapped sprite's origin as @snapPoint (worldToTarget m origin)@.
--- For the transform @F@ drawing uses, @|snapPoint (F p) − F p| ≤ 0.5@ per
--- axis, which is the whole promise: the unsnapped inverse differs from a
+-- __Pixel snap.__ When the view's pixel snap is on, the world transform's
+-- translation, which is the camera's, is rounded to the device pixel grid with
+-- 'snapPixel'. The UI transform stays the continuous equation above, with the
+-- viewport's origin as it is: UI snaps in device pixels through the rounding of
+-- UI /instance/ origins, which is 'snapPoint', exposed separately. Every inverse
+-- is the exact inverse of the transform drawing uses, with its snapped
+-- translation where it has one, and rounds no result, so picking uses precisely
+-- the transform drawing uses. The per-instance origin rounding the recorder
+-- later applies rigidly in the shader is 'snapPoint' too: a consumer reproduces
+-- a snapped sprite's origin as @snapPoint (worldToTarget m origin)@ or
+-- @snapPoint (uiToTarget m origin)@, when 'mappingPixelSnap' says the view
+-- snaps. For the transform @F@ drawing uses, @|snapPoint (F p) − F p| ≤ 0.5@
+-- per axis, which is the whole promise: the unsnapped inverse differs from a
 -- snapped sprite's drawn origin by at most half a device pixel per axis. It
 -- cannot be measured against a separate transform whose camera translation is
 -- not snapped: with the viewport centre at 50, zoom 1, camera position 0.25
@@ -68,6 +71,15 @@
 -- camera-snapped position 50.5 and the drawn origin 51. With snap on, the
 -- camera's position appears within half a pixel of the viewport's centre, and
 -- exactly at it with snap off.
+--
+-- __Float resolution.__ The transforms hold 32-bit coefficients, so a position
+-- is only as exact as the coefficients: the translation is the viewport's
+-- centre minus the scale times the camera position, and once that product
+-- exceeds 2²³ pixels one ulp of it is more than a pixel. The mapping is still
+-- finite and still inverts exactly what it holds, but the camera position then
+-- appears at the centre only to that resolution, in either snap setting. The
+-- half-pixel promise above is unaffected: it compares a position with its own
+-- rounding. A game with such ranges keeps its camera near the origin.
 --
 -- __Degenerate input.__ Nothing is clamped, and every refusal is 'Nothing':
 --
@@ -169,8 +181,9 @@ viewMapping metrics view = do
   where
     empty = viewportIsEmpty (viewViewport view)
 
--- | Whether the view snaps to the device pixel grid: whether its transforms'
--- translations are rounded, and whether the recorder rounds instance origins.
+-- | Whether the view snaps to the device pixel grid: whether the world
+-- transform's translation is rounded, and whether the recorder rounds instance
+-- origins (with 'snapPoint'), in the world and in the UI.
 mappingPixelSnap ∷ ViewMapping → Bool
 mappingPixelSnap = mappingSnap
 
@@ -184,7 +197,7 @@ worldInverse ∷ ViewMapping → Maybe Affine2
 worldInverse = mappingWorldInverse
 
 -- | The UI-to-target transform: the scale UI scale × content scale, then the
--- viewport's origin, snapped when pixel snap is on.
+-- viewport's origin. Pixel snap does not change it.
 uiTransform ∷ ViewMapping → Affine2
 uiTransform = mappingUi
 
@@ -297,7 +310,7 @@ worldAffine view = affine snaps a b c d tx ty
 
 -- The UI transform.
 uiAffine ∷ TargetMetrics → View → Maybe Affine2
-uiAffine metrics view = affine (settingPixelSnap settings) kx 0 0 ky (float2Double ox) (float2Double oy)
+uiAffine metrics view = affine False kx 0 0 ky (float2Double ox) (float2Double oy)
   where
     settings = viewSettings view
     Viewport (V2 ox oy) _ = viewViewport view
