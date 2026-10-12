@@ -369,8 +369,9 @@ class AdapterChecks(unittest.TestCase):
         suites = self.overlaid(with_group("test.vulkan-headless", dict(timeout_seconds=1200)))
         affected = self.assert_policy_change(suites, "test.vulkan-headless", ["trial_seconds"])
         # One suite for each component the group's command names: the native
-        # backend's two, the integration's, and the three samples'.
-        self.assertEqual(len(affected), 6, sorted(affected))
+        # backend's two, the integration's, the three samples', and the 2D
+        # renderer's Vulkan recorder's.
+        self.assertEqual(len(affected), 7, sorted(affected))
 
     def test_a_policy_edit_that_leaves_execution_unchanged_keeps_the_identity(self):
         # Both timeouts fall below the trial floor, so both run 60-second trials.
