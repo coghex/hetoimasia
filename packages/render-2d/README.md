@@ -5,8 +5,9 @@ validation that refuses a bad one, the application-wide discrete-step-zoom
 list, the pure draw plan that routes, orders and splits a validated frame's
 instances into draw runs, the pure mapping of a view between window,
 framebuffer, UI and world space, and the 64-byte instance encoding a backend
-uploads. Everything that records commands follows in later slices. The decision
-record is
+uploads, in submission order or in a planned layer's drawing order. Everything
+that records commands is [`hetoimasia-render-2d-vulkan`](../render-2d-vulkan/README.md)'s.
+The decision record is
 [the 2D renderer design](../../docs/designs/render_2d_design.md) (D-1 to D-4,
 D-7 to D-10, D-12, D-16 to D-19, D-22 to D-25, D-27, D-29; R2D-1 to R2D-3); the package's place among the
 others is [the foundation design](../../docs/engine_foundation_design.md).
@@ -22,7 +23,7 @@ others is [the foundation design](../../docs/engine_foundation_design.md).
 | `Hetoimasia.Render.TwoD.Metrics` | `TargetMetrics` (logical extent, framebuffer extent, per-axis content scale), `PixelExtent`; `offscreenMetrics`, `validMetrics` |
 | `Hetoimasia.Render.TwoD.Mapping` | `viewMapping ∷ TargetMetrics → View → Maybe ViewMapping`; the transforms `worldTransform`, `worldInverse`, `uiTransform`, `uiInverse`; the point conversions `worldToTarget`, `targetToWorld`, `uiToTarget`, `targetToUi`, `windowToTarget`, `targetToWindow`, `windowToWorld`, `worldToWindow`, `windowToUi`, `uiToWindow`; `viewportIsEmpty`, `viewportContains`; `snapPixel`, `snapPoint`; `mappingPixelSnap` |
 | `Hetoimasia.Render.TwoD.DrawPlan` | `planSnapshot ∷ CutoutMarks → ValidSnapshot → DrawPlan`; `CutoutMarks` with `cutoutMarks`, `noCutoutMarks`, `isMarkedCutout`; `DrawPlan`, `PlannedPass`, `PlannedView`, `PlannedLayer`, `LayerSpace`, `DrawRun`, `DrawPath` (`Cutout`, `Ordered`), `Material` (`DefaultMaterial`) with `materialCutoutCapable`; `drawingOrder`, `runIndices` |
-| `Hetoimasia.Render.TwoD.Encoding` | `encodeLayer ∷ ValidLayer → ByteString`; `instanceStride`, `flagsWord` |
+| `Hetoimasia.Render.TwoD.Encoding` | `encodeLayer ∷ ValidLayer → ByteString`; `encodeLayerInDrawingOrder ∷ PlannedLayer → ValidLayer → Maybe ByteString`; `instanceStride`, `flagsWord` |
 
 There is no collecting module and no prelude: import the module that owns what
 you use.
@@ -103,7 +104,7 @@ a window pass is a publication rule, not a validation one.
 only by validation: their constructors are private and no record-update route
 exists, so a function that takes one can rely on every check above.
 `validLayers` gives each layer of a valid snapshot, with its location, in pass,
-view and layer order, and `encodeLayer` accepts only such a layer.
+view and layer order, and `encodeLayer` and `encodeLayerInDrawingOrder` accept only such a layer.
 
 **Offscreen targets.** A `TargetRef` is an index and a generation a backend
 issues. It holds no native handle, building one acquires nothing and starts no
@@ -349,6 +350,17 @@ The clip index occupies the top 16 bits, so a shader reads it as `flags >> 16`.
 A non-zero clip index is refused until clip tables exist, so a valid layer's
 flags word has its top 16 bits zero for now; `flagsWord` packs any instance, so
 the layout is fixed and tested independently of that refusal.
+
+**Drawing order.** `encodeLayerInDrawingOrder planned layer` writes the same
+chunks permuted by a planned layer's drawing order (`drawingOrder`): its *k*-th
+chunk is byte for byte the chunk `encodeLayer` writes at the position the order
+lists *k*-th, so a draw run's instances are one contiguous range of the buffer,
+its `runStart` and `runCount` over it with no further reordering. A layer whose
+plan holds no order (an empty layer, or one in a zero-size viewport) encodes to
+the empty buffer, and `Nothing` answers a plan that names an instance the layer
+does not hold, which planning that layer never does. It is pure and linear in
+the instance count; it allocates the one result buffer of the exact final size
+and holds the layer's instances in one array while it writes.
 
 **std430.** The 64-byte stride is std430-compatible only when a shader declares
 the UV rectangle as two `vec2`s, or reads the instance as vertex attributes.

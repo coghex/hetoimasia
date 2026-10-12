@@ -1,0 +1,257 @@
+# hetoimasia-render-2d-vulkan
+
+The 2D renderer's Vulkan recorder for the **ordered path** (R2D-7): a validated
+[render-2d](../render-2d/README.md) snapshot recorded into one batch of the
+[native backend](../gpu-vulkan/native/README.md), every pass in list order into
+an offscreen colour target or the frame's image, every view under its own
+scissor, every layer as one instanced draw per run, with premultiplied-alpha
+blending. It owns the built-in shaders and the wrapping the engine applies
+around a material. The decision record is
+[the 2D renderer design](../../docs/designs/render_2d_design.md) (D-2, D-4, D-5,
+D-9, D-10, D-12, D-22, D-24; P-6); the backend's contract is
+[docs/gpu_backend.md](../../docs/gpu_backend.md).
+
+| Module | Contents |
+| --- | --- |
+| `Hetoimasia.Render.TwoD.Vulkan` | `Builders`; `Configuration`, `defaultConfiguration`; `Renderer`, `makeRenderer`, `pipelineFor`; `prepareSnapshot`, `FrameRecording`; re-exports `Hetoimasia.Render.TwoD.Vulkan.Frame` and `orderedShaders` |
+| `Hetoimasia.Render.TwoD.Vulkan.Frame` | `Attachment`, `offscreenAttachment`, `TargetBinding`, `FrameInput`; `FrameRefusal`; `frameWork` and the work it computes: `PassWork`, `ViewWork`, `LayerWork`, `RunWork` |
+| `Hetoimasia.Render.TwoD.Vulkan.Layout` | the instance as vertex input (`instanceVertexInput`), the push block (`ViewPush`, `packViewPush`, `pushMembers`), the sampler choice (`shaderSamplerIndex`), the scissor rule (`viewScissor`) |
+| `Hetoimasia.Render.TwoD.Vulkan.ShaderInterfaces` | the checked interface descriptions the shaders are compiled against |
+| `Hetoimasia.Render.TwoD.Vulkan.Shaders` | `orderedShaders`, the vertex and fragment stages |
+
+## Boundary
+
+The library's `build-depends` names `base`, `bytestring`, `containers`,
+`hetoimasia-gpu-vulkan-native`, `hetoimasia-math` (the transforms' coefficients),
+`hetoimasia-render-2d` and `hetoimasia-render-api`. It names no GLFW,
+window-integration, runtime or Lua package, holds no native handle of its own
+(its `Renderer` holds the backend's managed, opaque handles to a pipeline layout
+and pipelines, as the sprites sample does) and makes no Vulkan call outside the
+backend's vocabulary. The constructions it needs arrive as `Builders`, which a
+host fills from the construction an owner-thread action or a frame lends it.
+
+The package is selected only by `cabal.project.vulkan`: it resolves the Vulkan
+binding through the native package, so neither `cabal.project` nor
+`cabal.project.cpu` lists it, and `tools/vulkan/run.sh` is the one command that
+builds it, regenerating the shader toolchain fingerprint its shader splices
+check. `render-2d` gains no dependency.
+
+## Making the renderer
+
+`makeRenderer builders configuration` makes, through the host's constructions,
+in this order: the session's ring (`configurationRing`), the texture table the
+draws go through (`configurationTable`), and a **shader-sampled table pipeline
+layout** over the package's shaders (R2D-16): a layout holding the table that
+declares no sampler offset, so a draw needs no `selectSampler`, with one
+push-constant range for both stages (44 bytes, below). A pipeline is made per
+colour format the first time a pass into that format draws, with
+premultiplied-alpha blending, by `pipelineFor`. Textures are registered with the
+table by their owner; the recorder samples whatever handles the snapshot names,
+and an unregistered or released handle, or one whose generation the table no
+longer holds, samples slot 0's transparent placeholder.
+
+## Recording a frame
+
+`prepareSnapshot builders renderer input` runs on the owner's thread before a
+batch records, and answers either a `FrameRefusal` or a `FrameRecording`: what
+records the frame into the batch's recorder. The `FrameInput` is the validated
+snapshot, the lookup that resolves an offscreen `TargetRef`, and the window's
+`Attachment` when a host renderer records the frame inside a frame batch. The
+snapshot is planned with `noCutoutMarks`, so every instance takes the `Ordered`
+path (D-22); a depth-enabled world layer draws without a depth attachment and
+its `plannedClearsDepth` mark is not acted on until R2D-9.
+
+Everything that can refuse is decided first, in `frameWork`, which is pure:
+
+| `FrameRefusal` | When |
+| --- | --- |
+| `UnknownTarget pass ref` | an offscreen pass names a reference the lookup does not hold |
+| `NoWindowAttachment pass` | a window pass with no frame context |
+| `InvalidMetrics pass` | the pass's metrics have a negative extent or a content scale that is not finite and positive |
+| `MetricsDisagree pass metrics extent` | the metrics' framebuffer extent is not the attachment's actual extent |
+| `ViewNotMappable pass view` | `viewMapping` refuses the view under the metrics |
+| `PlanDisagrees location` | the plan's layers and the snapshot's do not pair (planning the same snapshot never produces it) |
+| `RefusedByBackend refusal` | the backend refused a pipeline, a claim or a command |
+
+The first refusal in snapshot order is the answer, and nothing has been recorded.
+What `FrameRecording` then does, in the one batch:
+
+1. **Claims.** Every layer that draws has its instances encoded in drawing
+   order (`encodeLayerInDrawingOrder`, byte for byte the matching 64-byte
+   chunks of `encodeLayer`, permuted by the plan's order) and written into one
+   ring region of its own, aligned to 16, in pass, view and layer order. They
+   are all claimed before the first pass begins, and the first the ring cannot
+   hold is a `RefusedByBackend` that stops the rest: no clear and no draw has
+   been recorded, and the claims already granted stay the backend's to reclaim
+   when the batch completes or to discard with it.
+2. **Passes**, in list order. A pass begins rendering into its target cleared to
+   the pass's clear colour (an offscreen target `ClearFromUndefined`, so it may
+   be new or hold anything; the window's pass into the frame's own image) and
+   ends before the next begins. A pass that draws something then binds its
+   format's pipeline, a viewport over the **whole** attachment, and the table.
+   A pass that draws nothing begins, clears and ends, and binds neither.
+3. **Views**, in order, each under a scissor covering exactly the pixels whose
+   centres its viewport contains: per axis `[ceil(x − ½), ceil(x + w − ½))`,
+   clamped to the attachment (`viewScissor`; `viewportContains`, pixel by
+   pixel). A view whose scissor is empty, or that holds no layer to draw,
+   records no draw and no scissor.
+4. **Layers**, in order. A layer pushes its block, then draws **one instanced
+   draw of six vertices per run**: it binds its region at the run's first
+   instance (64 bytes a step) and draws the run's count. Sampler choices,
+   tints and depth keys never split a run, so a layer is one draw until
+   application materials exist.
+
+The recorder never reads back and never transitions a target for a copy: after
+it a target is in its colour-attachment use, and a caller that reads it back
+moves it to `TransferRead`, copies and returns it, as the sprites sample does.
+
+## Targets and metrics
+
+A pass's attachment is described by an `Attachment`: the colour format's
+`VkFormat` code, the actual extent and the `TargetMetrics` its views map under.
+`offscreenAttachment format width height` is the ordinary offscreen case, with
+`offscreenMetrics`: the logical extent is the pixel extent and the content scale
+1. A caller that needs a window's content scale supplies its own metrics —
+the surface-free content-scale-2 fixture does, for a 32 × 32 attachment of
+logical extent 16 × 16 at scale 2, shared with the oracle — and the window's
+pass takes its `Attachment` from the host's observation of the frame. The
+metrics must be valid and their framebuffer extent must be the attachment's.
+
+## The instance as vertex input
+
+One binding advances per instance at render-2d's 64-byte stride
+(`instanceVertexInput`); the vertex stage reads these attributes, in
+[#414](../render-2d/README.md#the-instance-encoding)'s layout:
+
+| Location | Offset | Format | Field |
+| --- | --- | --- | --- |
+| 0 | 0 | four floats | the transform's a, b, c, d |
+| 1 | 16 | two floats | tx, ty |
+| 2 | 24 | four floats | the UV rectangle (u0, v0, u1, v1) |
+| 3 | 40 | uint | the handle's lookup index |
+| 4 | 44 | uint | its generation |
+| 5 | 52 | four unorm bytes | the tint, red first |
+| 6 | 56 | uint | the flags word |
+| 7 | 60 | uint | the material parameter word |
+
+The depth key at offset 48 is not read: the ordered path sorts by it on the
+host, and no depth attachment exists until R2D-9. The unit square's six
+vertices are the shader's own.
+
+## The push block
+
+Both stages declare one push block, std430, 44 bytes (`ViewPush`,
+`packViewPush`), pushed for each layer under the layer's own space:
+
+| Offset | Size | Member |
+| --- | --- | --- |
+| 0 | 16 | `vec4 viewLinear`: a, b, c, d of the layer's transform to target pixels |
+| 16 | 8 | `vec2 viewTranslation`: tx, ty |
+| 24 | 8 | `vec2 extent`: the attachment's width and height in pixels |
+| 32 | 4 | `float brightness` |
+| 36 | 4 | `uint filtering`: the view's default filter, 1 nearest, 2 linear |
+| 40 | 4 | `uint snap`: 1 when the view snaps instance origins |
+
+The transform is `worldTransform` for a world layer and `uiTransform` for a UI
+layer, from `viewMapping` for the pass's metrics; it maps `(x, y)` to
+`(a·x + c·y + tx, b·x + d·y + ty)`.
+
+## The shaders
+
+Checked shaders (GRS-16), compiled while the package builds and checked against
+the descriptions in `Hetoimasia.Render.TwoD.Vulkan.ShaderInterfaces`, under the
+shader-sampled layout.
+
+**Vertex stage.** For each of the six corners `(x, y)` of the unit square
+[0, 1]² (two triangles), with the instance's transform and the view's:
+
+```text
+world  = (a·x + c·y + tx,  b·x + d·y + ty)
+target = (va·wx + vc·wy + vtx,  vb·wx + vd·wy + vty)
+origin = the view transform applied to (tx, ty)              the mapped (0, 0)
+shift  = floor(origin + ½) − origin                           when the view snaps, else 0
+clip   = ((target + shift) / extent) · 2 − 1                  Vulkan's Y down
+```
+
+With snap on the camera's translation has already been rounded (inside
+`worldTransform`, D-9) and this rounds the sprite's origin, moving the quad
+rigidly: the arithmetic of `snapPoint`. UVs interpolate affinely from `(u0, v0)`
+at local (0, 0) to `(u1, v1)` at (1, 1). The handle, the tint, the flags and the
+parameter word pass on as flat values.
+
+**Fragment stage.** The handle resolves through the batch's lookup version, as
+the backend's reference shaders do: an index past the version's entries, or an
+entry of another generation, is slot 0's placeholder before any descriptor is
+read. The sampler choice is the flags word's low two bits: 0 takes the view's
+default filter, 1 nearest, 2 linear (3, which render-2d never produces, takes
+the default). Nearest is the table's sampler 0 (nearest, clamp to edge) and
+linear its sampler 2 (linear, clamp to edge), clamped to the last sampler and
+marked `nonuniformEXT`, because the choice differs between the instances of one
+draw. With `t` the sampled texel (sRGB decoded by the hardware on an sRGB image),
+`c` the tint and `b` the view's brightness (D-24):
+
+```text
+m = material(t)                    the built-in default: m = t
+s = m × c;  s.rgb = s.rgb × b      wrapMaterial: tint, then brightness
+s.a = 0 for an additive instance   blendOutput
+result = s + destination × (1 − s.a)       the pipeline's premultiplied blend
+```
+
+**The material-wrapping structure (P-6).** The engine owns the vertex stage,
+the instance format and the table bindings, and wraps whatever material it is
+given: `material`, `wrapMaterial` and `blendOutput` are three separate
+functions in the fragment stage, so an application material (R2D-11) replaces
+`material` alone and cannot omit the tint, the brightness or the blend output.
+
+## Owned state, threads and lifetimes
+
+| State | Owner | Readers and writers | Thread | Lifetime | Reset or disposal |
+| --- | --- | --- | --- | --- | --- |
+| The ring, the texture table and the pipeline layout | The host session | `makeRenderer` makes them through `Builders`; batches `prepareSnapshot` records read them | Owner | From `makeRenderer` until the host session ends | Released and destroyed with every managed resource before the device |
+| The pipelines, one per colour format | A `Renderer` | `pipelineFor`, on a format's first drawing pass | Owner | From that first pass until the host session ends | As above |
+
+A `Renderer` holds an `IORef` of the pipelines and is used on the graphics
+owner's thread only, as every backend construction is. `frameWork` is pure and
+`FrameRecording` is a closure over its result: neither keeps a native handle
+past the action that records it. The package starts no thread and keeps no
+other state.
+
+## Tests
+
+`render-2d-vulkan-tests` is the headless suite, registered with the validation
+group `test.vulkan-headless`:
+
+```bash
+bash tools/vulkan/run.sh test hetoimasia-render-2d-vulkan:test:render-2d-vulkan-tests
+```
+
+It checks the scissor rule against `viewportContains` pixel by pixel over a
+sweep of viewports and against hand-worked rectangles; the push block against
+bytes written out by hand; the attribute descriptions against the bytes
+render-2d's own encoder wrote; the sampler-choice mapping for every choice and
+default; the pure frame work (passes, views, scissors, drawing-order bytes, push
+blocks, content scale) and every refusal at its boundary; and the recording
+itself, through a stand-in native layer built over the backend's public seam
+(its own recording, frames and uploads, with no device): the command order of
+passes, views, layers and draws with their scissors and push blocks, the
+drawing-order instance bytes at their ring offsets, mixed sampler choices in one
+run and one draw, empty scissors recording no draw while the pass keeps its
+clear, no depth work for a depth-enabled layer, one pipeline per format with the
+premultiplied blend, and the refusals of an unknown target in a later pass, an
+unmappable view and a full ring after an earlier layer's claim, none of which
+records a clear or a draw.
+
+The device's proof is the surface-free native case `r2d7-ordered-path` of
+`vulkan-native-tests` ([docs/gpu_backend.md](../../docs/gpu_backend.md#the-native-suite)),
+which renders ten fixtures through this recorder and judges every pixel of every
+target against [`hetoimasia-render-2d-oracle`](../render-2d-oracle/README.md).
+
+## Not here
+
+Depth attachments, the cutout path and depth clears (R2D-17, R2D-9);
+application materials (R2D-11), clip tables (R2D-12) and per-batch storage
+tables (R2D-15); retained content (R2D-10); publishing per window, holding
+referenced objects (D-28), the host adapter and the windowed sample (R2D-14,
+R2D-8); registering textures with their marks and the swap rule (R2D-8);
+sampling an offscreen pass's target in a later pass (R2D-13); per-view culling;
+and performance claims, which need retained measurements.
