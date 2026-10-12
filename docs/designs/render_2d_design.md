@@ -30,7 +30,7 @@ concrete precondition
 - [x] R2D-16. Let table pipelines choose samplers in the shader — [#421]
 - [x] R2D-7. Record the ordered path in `render-2d-vulkan`, proven by offscreen readback — [#422]
 - [x] R2D-14. Publish scenes per window in the window host — [#423]
-- [ ] R2D-8. Show a decoded image in a window through published snapshots
+- [x] R2D-8. Show a decoded image in a window through published snapshots — [#424]
 - [ ] R2D-17. Clear a depth attachment within a rectangle
 - [ ] R2D-9. Draw cutout sprites depth-tested in world layers
 - [ ] R2D-10. Retain static instance content across frames
@@ -1020,10 +1020,14 @@ Moved to the [asset design](asset_design.md) as AST-2 (D-15).
 ### R2D-13. Sample an offscreen pass's target in later passes
 
 - **Outcome:** render-to-texture through the pass list.
-- **Scope:** a colour target registrable in the texture table, its
-  transitions between passes, checked read eligibility so drawing into a
-  registered target does not block draws sampling other images, refusal of
-  a pass sampling its own target, and `render-2d` support.
+- **Scope:** creating offscreen colour targets in `render-2d-vulkan` and
+  issuing their `TargetRef`s, with their lifetimes and D-28 holds and
+  releases (moved from R2D-8, owner decision 2026-10-12; until then a
+  windowed snapshot holds no offscreen pass); a colour target registrable
+  in the texture table, its transitions between passes, checked read
+  eligibility so drawing into a registered target does not block draws
+  sampling other images, refusal of a pass sampling its own target, and
+  `render-2d` support.
 - **Phase:** 4
 - **Depends on:** R2D-7
 - **Ordering:** not on the critical path
