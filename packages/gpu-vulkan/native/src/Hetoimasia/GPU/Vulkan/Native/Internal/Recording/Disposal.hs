@@ -186,6 +186,7 @@ forget recording disposed = do
   modifyTVar' (recordingManaged recording) (\held → foldr Map.delete held disposed)
   modifyTVar' (recordingIndexData recording) (\held → foldr Map.delete held disposed)
   modifyTVar' (recordingFilled recording) (\held → foldr Set.delete held disposed)
+  modifyTVar' (recordingWindowDepths recording) (\held → foldr Set.delete held disposed)
   modifyTVar' (recordingStorages recording) (Map.filter (`notElem` disposed))
   -- A batch record that goes with its storage is a submitted batch whose
   -- submission completed: its ring regions go too.

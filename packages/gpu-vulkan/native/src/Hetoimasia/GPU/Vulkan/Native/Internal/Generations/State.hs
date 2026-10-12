@@ -45,10 +45,18 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Generations.State
   , settlingPeriod
   , trackTarget
 
+    -- * Windowed depth (GRS-13)
+  , WindowDepth (..)
+  , DepthStanding (..)
+  , requireWindowDepth
+  , supplyWindowDepth
+  , releaseGenerationDepth
+
     -- * Failures
   , GenerationDestructionFailed (..)
   , GenerationEffectUncertain (..)
   , GenerationsRetained (..)
+  , WindowDepthRefused (..)
 
     -- * Helpers
   , lookupGeneration
@@ -57,11 +65,12 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Generations.State
   , isAsynchronous
   ) where
 
-import Control.Concurrent.STM (STM, TVar, modifyTVar', newTVarIO, readTVar)
+import Control.Concurrent.STM (STM, TVar, modifyTVar', newTVarIO, readTVar, writeTVar)
 import Control.Exception (Exception (displayException), SomeAsyncException, SomeException, fromException)
 import Control.Monad (unless)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
+import Data.Foldable (for_)
 import Data.Maybe (isJust)
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -77,7 +86,7 @@ import Hetoimasia.Foundation.Time
   )
 import Hetoimasia.GPU.Model (Outcome (..), endGenerationCpuUse)
 import Hetoimasia.GPU.Model.Budget (BudgetKind)
-import Hetoimasia.GPU.Model.Identity (GenerationId, TargetClass, TargetId, generationTarget)
+import Hetoimasia.GPU.Model.Identity (GenerationId, ResourceId, TargetClass, TargetId, generationTarget)
 import Hetoimasia.GPU.Vulkan.Native.Presentation
   ( CaptureUsage (..)
   , GenerationPlan
@@ -122,6 +131,10 @@ data NativeGeneration = NativeGeneration
   , genCpuEnded ∷ !Bool
   , genGeometry ∷ !TargetGeometry
     -- ^ The geometry it was planned from.
+  , genDepth ∷ !(Maybe ResourceId)
+    -- ^ The depth image the generation owns when the session asked for windowed
+    -- depth (GRS-13): a managed image of the recording's, made with the
+    -- generation, of its extent, and released with it ('endCpuUse').
   }
 
 -- | What a target's generations are doing, as any thread may read it.
@@ -221,13 +234,35 @@ data Generations q inst msgr phys dev = Generations
     -- ^ Where the owner's next step starts among the targets when it destroys
     -- retired generations, so a step's bounded disposal reaches every target
     -- in turn.
+  , generationsDepth ∷ !(TVar DepthStanding)
+    -- ^ Whether generations carry a depth image (GRS-13), and what makes it.
   }
+
+-- | What makes and releases the depth image of a generation (GRS-13). The
+-- generations are below the recording that owns managed images, so the
+-- recording installs this: 'windowDepthCreate' makes a depth image of the
+-- extent, named from the candidate generation's identity, and raises — as a
+-- refusal turned into 'WindowDepthRefused', or as the native call raised — if
+-- it cannot, having made nothing; 'windowDepthRelease' releases the managed
+-- image in the model, in the transaction the generation's CPU use ends in.
+data WindowDepth = WindowDepth
+  { windowDepthCreate ∷ GenerationId → SurfaceExtent → IO ResourceId
+  , windowDepthRelease ∷ ResourceId → STM ()
+  }
+
+-- | Whether the generations carry a depth image.
+data DepthStanding
+  = DepthDisabled
+    -- ^ The default: no generation has one.
+  | DepthAwaiting
+    -- ^ Asked for, and not yet supplied: no generation is constructed.
+  | DepthSupplied !WindowDepth
 
 -- | The generations' state, with the examples' seam and the capture usage.
 -- The public constructors are "Hetoimasia.GPU.Vulkan.Native.Internal.Generations.Disposal"'s,
 -- which also register the generations' disposer with the roots.
 makeGenerations ∷ (GenerationId → IO ()) → CaptureUsage → Roots q inst msgr phys dev → IO (Generations q inst msgr phys dev)
-makeGenerations hook capture roots = (\targets → Generations roots targets hook capture) <$> newTVarIO Map.empty <*> newTVarIO 0
+makeGenerations hook capture roots = (\targets → Generations roots targets hook capture) <$> newTVarIO Map.empty <*> newTVarIO 0 <*> newTVarIO DepthDisabled
 
 -- | How long a move is coalesced, from when it was first seen, before its
 -- replacement is built from the newest geometry: 16 ms. It bounds how often a
@@ -260,6 +295,30 @@ trackTarget generations target classification surface =
         , recordWithdrawn = False
         }
 
+-- | Ask for a depth image with every generation (GRS-13). Until
+-- 'supplyWindowDepth' supplies what makes it, no generation is constructed, so
+-- none is ever published without the depth it was configured for. Asking after
+-- it was supplied changes nothing.
+requireWindowDepth ∷ Generations q inst msgr phys dev → STM ()
+requireWindowDepth generations =
+  readTVar (generationsDepth generations) >>= \case
+    DepthDisabled → writeTVar (generationsDepth generations) DepthAwaiting
+    _ → pure ()
+
+-- | Supply what makes and releases a generation's depth image, which also asks
+-- for one. Every generation constructed from now on carries a depth image.
+supplyWindowDepth ∷ Generations q inst msgr phys dev → WindowDepth → STM ()
+supplyWindowDepth generations = writeTVar (generationsDepth generations) . DepthSupplied
+
+-- | Release a generation's depth image, if it has one. Releasing what was
+-- released already is refused by the model and changes nothing.
+releaseGenerationDepth ∷ Generations q inst msgr phys dev → NativeGeneration → STM ()
+releaseGenerationDepth generations native =
+  for_ (genDepth native) $ \depth →
+    readTVar (generationsDepth generations) >>= \case
+      DepthSupplied supplied → windowDepthRelease supplied depth
+      _ → pure ()
+
 -- ---------------------------------------------------------------------------
 -- Failures
 
@@ -280,6 +339,16 @@ data GenerationEffectUncertain = GenerationEffectUncertain !GenerationId !Text
 instance Exception GenerationEffectUncertain where
   displayException (GenerationEffectUncertain generation reason) =
     "the outcome of " <> show generation <> " is uncertain: " <> Text.unpack reason
+
+-- | A generation's depth image could not be made (GRS-13): the generation's
+-- construction fails, as any of its native calls failing does. A depth image
+-- the session asked for is never left out of a generation.
+data WindowDepthRefused = WindowDepthRefused !GenerationId !Text
+  deriving (Eq, Show)
+
+instance Exception WindowDepthRefused where
+  displayException (WindowDepthRefused generation reason) =
+    "the depth image of " <> show generation <> " was not made: " <> Text.unpack reason
 
 -- | A target's retirement found generations it could not destroy: holds that
 -- have not ended, or a destruction that was uncertain. They, the surface and
@@ -313,6 +382,9 @@ endCpuUse generations generation = do
       Admitted next → ((), next)
       _ → ((), model)
     editGeneration generations generation (\entry → entry {genCpuEnded = True})
+    -- The generation's depth image goes with it (GRS-13): released here, it is
+    -- destroyed once the model reports every batch that recorded it complete.
+    for_ native (releaseGenerationDepth generations)
 
 isAsynchronous ∷ SomeException → Bool
 isAsynchronous exception = isJust (fromException exception ∷ Maybe SomeAsyncException)

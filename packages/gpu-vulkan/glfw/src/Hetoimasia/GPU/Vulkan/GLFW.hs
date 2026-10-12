@@ -40,6 +40,16 @@
 -- which it cannot yet record through. It never holds a native handle. What it did not release is destroyed with the
 -- session's other managed resources, before the device.
 --
+-- A host configured with 'vulkanWindowDepth' (GRS-13) gives every swapchain
+-- generation one managed depth image of its extent, shared by its frames in
+-- flight, which follows the generation through resize, replacement and
+-- surface recovery and is destroyed only once the batches that recorded it have
+-- completed. The frame's request names it ('requestDepth'), and the renderer
+-- begins its pass into the frame's image with it ('beginFrameRenderingWithDepth').
+-- A generation whose depth image cannot be made fails its construction as any
+-- native call of it does. A host that did not ask has none, and nothing about
+-- its frames changes.
+--
 -- A host configured with 'DeviceSurfaceFree' creates the device in the
 -- owner's startup, before and without any window, and admits a window handed
 -- over later only if the chosen queue family presents to it. With or without
@@ -116,6 +126,7 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , clearedDepth
   , defaultDepthClear
   , beginRenderingWithDepth
+  , beginFrameRenderingWithDepth
   , CompareOp (..)
   , PipelineDepth (..)
   , depthTested
@@ -421,6 +432,7 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , beginRendering
   , beginRenderingInto
   , beginRenderingWithDepth
+  , beginFrameRenderingWithDepth
   , copyTargetToReadback
   , copyLevelToReadback
   , bindPipeline

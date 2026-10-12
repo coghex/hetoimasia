@@ -116,6 +116,9 @@ supportedClient =
       , "UseRefusal (..)"
       , "useGeneration"
       , "endGenerationUse"
+      , "WindowDepth (..)"
+      , "requireWindowDepth"
+      , "supplyWindowDepth"
       , "ReplacementAnswer (..)"
       , "offerReplacementSurface"
       , "replacementSurfaceFailed"
@@ -128,6 +131,7 @@ supportedClient =
       , "GenerationDestructionFailed (..)"
       , "GenerationEffectUncertain (..)"
       , "GenerationsRetained (..)"
+      , "WindowDepthRefused (..)"
       , "AllocationNotRecovered (..)"
       , "RecoveryEnd (..)"
       ]

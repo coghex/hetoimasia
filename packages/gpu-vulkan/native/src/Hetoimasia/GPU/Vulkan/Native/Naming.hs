@@ -36,6 +36,8 @@ module Hetoimasia.GPU.Vulkan.Native.Naming
   , swapchainName
   , swapchainImageName
   , imageViewName
+  , windowDepthName
+  , windowDepthViewName
   , pipelineLayoutName
   , pipelineName
   , shaderModuleName
@@ -179,6 +181,13 @@ swapchainImageName generation index = boundedName (generationText generation <> 
 
 imageViewName ∷ GenerationId → Natural → ByteString
 imageViewName generation index = boundedName (generationText generation <> " view " <> shown index)
+
+-- | The depth image a swapchain generation owns when windowed depth is
+-- enabled (GRS-13), and its one view, named from the generation's identity.
+-- Its allocation is named the same inside the allocator.
+windowDepthName, windowDepthViewName ∷ GenerationId → ByteString
+windowDepthName generation = boundedName (generationText generation <> " depth image")
+windowDepthViewName generation = boundedName (generationText generation <> " depth view")
 
 pipelineLayoutName ∷ ResourceId → ByteString
 pipelineLayoutName resource = boundedName (resourceText resource <> " pipeline layout")

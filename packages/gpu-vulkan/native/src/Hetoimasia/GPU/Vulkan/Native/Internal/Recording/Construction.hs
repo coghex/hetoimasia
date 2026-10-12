@@ -1064,9 +1064,15 @@ releaseManaged recording handle =
         -- An image the texture table holds is released through its handle,
         -- and only once no live version maps its slot (GRS-7).
         tabled ← maybe False (Set.member resource . tableTextures) <$> readTVar (recordingTable recording)
+        -- A swapchain generation's depth image is its generation's: released
+        -- when its generation's CPU use ends, never through a handle (GRS-13).
+        windowed ← Set.member resource <$> readTVar (recordingWindowDepths recording)
         if tabled
           then pure (Left (RefusedIllegal "an image the texture table holds: release its handle instead"))
-          else releaseLive recording resource
+          else
+            if windowed
+              then pure (Left (RefusedIllegal "a swapchain generation's depth image: its generation releases it"))
+              else releaseLive recording resource
   where
     resource = managedResource handle
 
