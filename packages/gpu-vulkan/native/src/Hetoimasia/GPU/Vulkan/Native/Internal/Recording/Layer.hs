@@ -368,14 +368,12 @@ data RecordingLimits = RecordingLimits
     -- update-after-bind pools together may hold — the texture table's set 0
     -- pool, its samplers and its initial images.
   , limitDynamicStorageBuffers ∷ !Word32
-    -- ^ The fewer of @maxDescriptorSetStorageBuffersDynamic@ and
-    -- @maxDescriptorSetUpdateAfterBindStorageBuffersDynamic@: the most dynamic
-    -- storage buffers a pipeline layout may hold across its sets — set 1's
-    -- lookup buffer and set 2's storage table (R2D-15).
+    -- ^ @maxDescriptorSetStorageBuffersDynamic@: the most dynamic storage
+    -- buffers a pipeline layout may hold across its sets — set 1's lookup
+    -- buffer and set 2's storage table (R2D-15), both ordinary layouts.
   , limitStageStorageBuffers ∷ !Word32
-    -- ^ The fewer of @maxPerStageDescriptorStorageBuffers@ and
-    -- @maxPerStageDescriptorUpdateAfterBindStorageBuffers@: the most storage
-    -- buffers one shader stage of a pipeline layout may see.
+    -- ^ @maxPerStageDescriptorStorageBuffers@: the most storage buffers one
+    -- shader stage of a pipeline layout may see.
   }
   deriving (Eq, Show)
 

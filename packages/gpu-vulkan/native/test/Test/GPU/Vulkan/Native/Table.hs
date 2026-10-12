@@ -1,3 +1,5 @@
+{-# LANGUAGE DuplicateRecordFields #-}
+
 -- | The bindless texture table (GRS-7) over the frames', the recording's and
 -- the allocator's stand-in native layers: making it — its samplers, set
 -- layouts declared at the cap, pools, sets at the initial size, version ring
@@ -23,6 +25,9 @@ import qualified Data.Set as Set
 import Data.Text (Text)
 import Data.Word (Word32, Word64)
 import Numeric.Natural (Natural)
+import Vulkan.Core10 (PhysicalDeviceLimits (..))
+import Vulkan.Core12 (PhysicalDeviceVulkan12Properties (..))
+import Vulkan.Zero (zero)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldReturn, shouldSatisfy)
 
 import Hetoimasia.GPU.Model.Access (ResourceKind (InstanceResource))
@@ -32,6 +37,7 @@ import Hetoimasia.GPU.Model.Identity (BatchId, HoldSubject (..), IdentityKind (.
 import Hetoimasia.GPU.Vulkan.Native.Roots (failRootsSessionBecause, readRootsModel)
 import Hetoimasia.GPU.Vulkan.Native.Frames
 import Hetoimasia.GPU.Vulkan.Native.Recording
+import Hetoimasia.GPU.Vulkan.Native.Recording.Vulkan (recordingLimitsOf)
 import Hetoimasia.GPU.Vulkan.Native.Shader.Interface
   ( DescriptorCount (..)
   , DescriptorDeclaration (..)
@@ -381,6 +387,12 @@ spec = describe "Texture table" $ do
       createStorageTable (rigRecording rig) `shouldReturn'` refused (RefusedMisuse (DuplicateSubject ResourceIdentity))
       clean rig
 
+    it "reads the ordinary storage-buffer limits from a device, whatever its update-after-bind counterparts are, which may legally be zero" $ do
+      let limits = (zero ∷ PhysicalDeviceLimits) {maxDescriptorSetStorageBuffersDynamic = 4, maxPerStageDescriptorStorageBuffers = 12}
+          noUpdateAfterBind = (zero ∷ PhysicalDeviceVulkan12Properties) {maxDescriptorSetUpdateAfterBindStorageBuffersDynamic = 0, maxPerStageDescriptorUpdateAfterBindStorageBuffers = 0}
+          converted = recordingLimitsOf limits noUpdateAfterBind
+      (limitDynamicStorageBuffers converted, limitStageStorageBuffers converted) `shouldBe` (4, 12)
+
     it "is made without the texture table, and refused with no ring or a ring made with no window" $ do
       bare ← newRig
       createStorageTable (rigRecording bare) `shouldReturn'` refused (RefusedIllegal "a storage table in a session that has made no ring")
@@ -568,33 +580,40 @@ spec = describe "Texture table" $ do
         big ← tableClaim recorder 512
         small ← tableClaim recorder 256
         writeIORef kept (Just (recorder, small))
-        noPipeline ← bindStorageTable recorder small 0
+        -- Each refusal is the only thing between two counts of commands.
+        let counted bind = do
+              before ← commandCount rig
+              answer ← bind
+              after ← commandCount rig
+              pure (answer, after - before)
+        noPipeline ← counted (bindStorageTable recorder small 0)
         ok (beginRenderingInto recorder (kitTarget kit) ClearFromUndefined (ClearColor 0 0 0 1))
         ok (bindPipeline recorder sampled)
-        notHeld ← bindStorageTable recorder small 0
+        notHeld ← counted (bindStorageTable recorder small 0)
         ok (bindPipeline recorder pipeline)
-        before ← commandCount rig
-        past ← bindStorageTable recorder small 257
-        oversized ← bindStorageTable recorder big 0
-        misaligned ← bindStorageTable recorder small 4
-        after ← commandCount rig
+        past ← counted (bindStorageTable recorder small 257)
+        oversized ← counted (bindStorageTable recorder big 0)
+        misaligned ← counted (bindStorageTable recorder small 4)
         -- The edges are not refused: the claim's end, and a table that is
         -- exactly the window.
-        atEnd ← bindStorageTable recorder small 256
-        exact ← bindStorageTable recorder big 256
+        atEnd ← counted (bindStorageTable recorder small 256)
+        exact ← counted (bindStorageTable recorder big 256)
         ok (endRendering recorder)
-        pure ([noPipeline, notHeld, past, oversized, misaligned], (after - before, [atEnd, exact]))
-      refusals
+        pure ([noPipeline, notHeld, past, oversized, misaligned], [atEnd, exact])
+      map fst refusals
         `shouldBe` [ Left (RefusedIllegal "binding the storage table with no pipeline bound")
                    , Left (RefusedIllegal "binding the storage table under a pipeline whose layout does not hold it")
                    , Left (RefusedOutOfBounds 257 256)
                    , Left (RefusedOutOfBounds 512 256)
                    , Left (RefusedIllegal "a storage table bound at an offset that is not a multiple of the device's storage-buffer offset alignment")
                    ]
-      native `shouldBe` (0, [Right (), Right ()])
+      map snd refusals `shouldBe` replicate 5 0
+      native `shouldBe` [(Right (), 1), (Right (), 1)]
       -- The recorder is closed once its action ends.
       Just (recorder, small) ← readIORef kept
+      closedBefore ← commandCount rig
       bindStorageTable recorder small 0 `shouldReturn` Left RefusedRecorderClosed
+      commandCount rig `shouldReturn` closedBefore
       clean rig
 
     it "refuses another session's claim, another batch's and a reclaimed one, each with no native call" $ do

@@ -21,6 +21,7 @@ module Hetoimasia.GPU.Vulkan.Native.Recording.Vulkan
   , nativeDepthState
   , depthAttachmentInfo
   , transitionScopes
+  , recordingLimitsOf
   ) where
 
 import Data.Maybe (mapMaybe)
@@ -116,25 +117,7 @@ vulkanRecordingOps physical = do
       largest = fromIntegral thirteen.maxBufferSize
       deviceLimits = properties.properties.limits
       framebuffer = (deviceLimits.maxFramebufferWidth, deviceLimits.maxFramebufferHeight)
-      recording =
-        RecordingLimits
-          { limitPushConstantBytes = deviceLimits.maxPushConstantsSize
-          , limitVertexBindings = deviceLimits.maxVertexInputBindings
-          , limitVertexAttributes = deviceLimits.maxVertexInputAttributes
-          , limitVertexStride = deviceLimits.maxVertexInputBindingStride
-          , limitVertexAttributeOffset = deviceLimits.maxVertexInputAttributeOffset
-          , limitNonCoherentAtom = fromIntegral deviceLimits.nonCoherentAtomSize
-          , limitImageDimension = deviceLimits.maxImageDimension2D
-          , limitTableSampledImages = min twelve.maxPerStageDescriptorUpdateAfterBindSampledImages twelve.maxDescriptorSetUpdateAfterBindSampledImages
-          , limitTableSamplers = min twelve.maxPerStageDescriptorUpdateAfterBindSamplers twelve.maxDescriptorSetUpdateAfterBindSamplers
-          , limitTableResources = twelve.maxPerStageUpdateAfterBindResources
-          , limitBoundSets = deviceLimits.maxBoundDescriptorSets
-          , limitStorageAlignment = fromIntegral deviceLimits.minStorageBufferOffsetAlignment
-          , limitStorageRange = fromIntegral deviceLimits.maxStorageBufferRange
-          , limitTablePoolDescriptors = twelve.maxUpdateAfterBindDescriptorsInAllPools
-          , limitDynamicStorageBuffers = min deviceLimits.maxDescriptorSetStorageBuffersDynamic twelve.maxDescriptorSetUpdateAfterBindStorageBuffersDynamic
-          , limitStageStorageBuffers = min deviceLimits.maxPerStageDescriptorStorageBuffers twelve.maxPerStageDescriptorUpdateAfterBindStorageBuffers
-          }
+      recording = recordingLimitsOf deviceLimits twelve
   pure
     RecordingOps
       { opsCreatePipelineLayout = \device layouts ranges →
@@ -207,6 +190,33 @@ vulkanRecordingOps physical = do
       , opsWriteDescriptors = \device updates →
           updateDescriptorSets device (Vector.fromList (mapMaybe descriptorWrite updates)) (Vector.fromList (concatMap descriptorCopies updates))
       }
+
+-- | What the recording is allowed of a device, from its limits and its
+-- Vulkan 1.2 properties. The storage-buffer limits are the ordinary ones: the
+-- storage table's set and the lookup buffer's are ordinary descriptor-set
+-- layouts, which Vulkan checks against the ordinary limits, and the
+-- update-after-bind counterparts may legally be zero where storage-buffer
+-- update-after-bind is unsupported.
+recordingLimitsOf ∷ PhysicalDeviceLimits → PhysicalDeviceVulkan12Properties → RecordingLimits
+recordingLimitsOf deviceLimits twelve =
+  RecordingLimits
+    { limitPushConstantBytes = deviceLimits.maxPushConstantsSize
+    , limitVertexBindings = deviceLimits.maxVertexInputBindings
+    , limitVertexAttributes = deviceLimits.maxVertexInputAttributes
+    , limitVertexStride = deviceLimits.maxVertexInputBindingStride
+    , limitVertexAttributeOffset = deviceLimits.maxVertexInputAttributeOffset
+    , limitNonCoherentAtom = fromIntegral deviceLimits.nonCoherentAtomSize
+    , limitImageDimension = deviceLimits.maxImageDimension2D
+    , limitTableSampledImages = min twelve.maxPerStageDescriptorUpdateAfterBindSampledImages twelve.maxDescriptorSetUpdateAfterBindSampledImages
+    , limitTableSamplers = min twelve.maxPerStageDescriptorUpdateAfterBindSamplers twelve.maxDescriptorSetUpdateAfterBindSamplers
+    , limitTableResources = twelve.maxPerStageUpdateAfterBindResources
+    , limitBoundSets = deviceLimits.maxBoundDescriptorSets
+    , limitStorageAlignment = fromIntegral deviceLimits.minStorageBufferOffsetAlignment
+    , limitStorageRange = fromIntegral deviceLimits.maxStorageBufferRange
+    , limitTablePoolDescriptors = twelve.maxUpdateAfterBindDescriptorsInAllPools
+    , limitDynamicStorageBuffers = deviceLimits.maxDescriptorSetStorageBuffersDynamic
+    , limitStageStorageBuffers = deviceLimits.maxPerStageDescriptorStorageBuffers
+    }
 
 -- | One of the texture table's samplers (GRS-7): nearest or linear, clamping
 -- to the edge or repeating, linear also between mip levels, never
