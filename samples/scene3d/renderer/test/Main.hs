@@ -14,7 +14,8 @@ import qualified Test.Sample.Scene3d.Oracle as Oracle
 import qualified Test.Sample.Scene3d.Png as Png
 import qualified Test.Sample.Scene3d.Record as Record
 import qualified Test.Sample.Scene3d.Scene as Scene
+import qualified Test.Sample.Scene3d.Windowed as Windowed
 import Test.Hspec.Runner (Config (configFailOnEmpty), defaultConfig, hspecWith)
 
 main ∷ IO ()
-main = hspecWith defaultConfig {configFailOnEmpty = True} (Scene.spec >> Camera.spec >> Oracle.spec >> Png.spec >> Record.spec)
+main = hspecWith defaultConfig {configFailOnEmpty = True} (Scene.spec >> Camera.spec >> Oracle.spec >> Png.spec >> Record.spec >> Windowed.spec)

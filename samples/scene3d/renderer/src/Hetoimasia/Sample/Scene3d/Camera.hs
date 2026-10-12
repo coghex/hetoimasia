@@ -14,8 +14,10 @@
 module Hetoimasia.Sample.Scene3d.Camera
   ( viewMatrix
   , projectionMatrix
+  , projectionMatrixFor
   , modelMatrix
   , transform
+  , transformFor
   , viewProjection
   , packMatrix
   ) where
@@ -40,13 +42,18 @@ viewMatrix pose = lookAt (vector (poseEye pose)) (vector (poseTarget pose)) (vec
 -- the near plane to 1 at the far plane, and the top of the view at clip-space
 -- Y = −1.
 projectionMatrix ∷ Pose → Maybe M44
-projectionMatrix pose =
+projectionMatrix = projectionMatrixFor (fromIntegral targetWidth / fromIntegral targetHeight)
+
+-- | 'projectionMatrix' for a target of this aspect ratio, width over height:
+-- the windowed mode's, whose window has the extent its user gave it.
+projectionMatrixFor ∷ Double → Pose → Maybe M44
+projectionMatrixFor aspect pose =
   perspective
     ZeroToOne
     YDown
     Frustum
       { fieldOfViewY = double2Float (poseFovDegrees pose * pi / 180)
-      , aspectRatio = fromIntegral targetWidth / fromIntegral targetHeight
+      , aspectRatio = double2Float aspect
       , nearPlane = double2Float (poseNear pose)
       , farPlane = double2Float (poseFar pose)
       }
@@ -58,12 +65,19 @@ modelMatrix cube = multiply (translation (vector (cubeCentre cube))) <$> rotatio
 
 -- | The projection after the view: world space to homogeneous clip space.
 viewProjection ∷ Pose → Maybe M44
-viewProjection pose = multiply <$> projectionMatrix pose <*> viewMatrix pose
+viewProjection = viewProjectionFor (fromIntegral targetWidth / fromIntegral targetHeight)
+
+viewProjectionFor ∷ Double → Pose → Maybe M44
+viewProjectionFor aspect pose = multiply <$> projectionMatrixFor aspect pose <*> viewMatrix pose
 
 -- | The matrix the vertex shader multiplies a cube's vertices by: model, then
 -- view, then projection.
 transform ∷ Pose → Cube → Maybe M44
-transform pose cube = multiply <$> viewProjection pose <*> modelMatrix cube
+transform = transformFor (fromIntegral targetWidth / fromIntegral targetHeight)
+
+-- | 'transform' for a target of this aspect ratio, width over height.
+transformFor ∷ Double → Pose → Cube → Maybe M44
+transformFor aspect pose cube = multiply <$> viewProjectionFor aspect pose <*> modelMatrix cube
 
 -- | A matrix as a push-constant block holds a @mat4@: its sixteen elements,
 -- column by column, as little-endian 32-bit floats.
