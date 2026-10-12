@@ -1,0 +1,61 @@
+cabal-version: 3.16
+name: hetoimasia-render-api
+version: 0.1.0.0
+synopsis: Backend-independent rendering contracts for Hetoimasia
+description:
+    The opaque texture handle a renderer's clients hold and a backend resolves:
+    a 32-bit lookup index and a 32-bit generation. Game code can compare, order
+    and show a handle but cannot build one or take one apart through the public
+    module; a separate, backend-facing module constructs a handle from an index
+    and a generation and reads them back. The library depends on base alone: no
+    Vulkan, Lua, runtime or game package, and no other local package. It reads
+    no file, performs no IO, owns no state and starts no thread.
+license: GPL-3.0-only
+license-file: LICENSE
+author: Vincent Coghlan
+maintainer: Vincent Coghlan
+category: Graphics
+build-type: Simple
+tested-with: GHC ==9.14.1
+extra-doc-files: README.md
+
+source-repository head
+    type: git
+    location: https://github.com/coghex/hetoimasia.git
+    subdir: packages/render-api
+
+common language
+    default-language: GHC2024
+    default-extensions: UnicodeSyntax
+    ghc-options: -Wall -Wcompat -Wincomplete-uni-patterns -Wincomplete-record-updates
+
+library
+    import: language
+    hs-source-dirs: src
+    exposed-modules:
+        Hetoimasia.Render.Api.Texture
+        Hetoimasia.Render.Api.Texture.Backend
+    -- The handle's representation, which only the two modules above import.
+    other-modules:
+        Hetoimasia.Render.Api.Internal.Texture
+    build-depends:
+        base >=4.22 && <4.23
+
+-- This package's own contracts, registered as the CPU validation group
+-- `test.render-api`. The library depends on base only; Hspec, QuickCheck and
+-- the external-client compiler harness are the suite's alone.
+test-suite render-api-tests
+    import: language
+    type: exitcode-stdio-1.0
+    main-is: Main.hs
+    hs-source-dirs: test
+    other-modules:
+        Test.Render.Api.Handle
+        Test.Render.Api.Opacity
+        Test.Render.Api.Spec
+    build-depends:
+        base >=4.22 && <4.23,
+        hspec >=2.11 && <3,
+        QuickCheck >=2.15 && <2.19,
+        hetoimasia-render-api ==0.1.0.0,
+        hetoimasia-test-support ==0.1.0.0
