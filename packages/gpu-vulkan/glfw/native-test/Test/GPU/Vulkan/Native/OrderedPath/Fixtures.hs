@@ -42,6 +42,7 @@ import qualified Data.ByteString as ByteString
 import Data.ByteString (ByteString)
 import Data.Text (Text)
 import Data.Word (Word32, Word8)
+import GHC.Float (castWord32ToFloat)
 import Hetoimasia.Asset.Image (DecodedImage (..), TexelFormat (..))
 import Hetoimasia.GPU.Vulkan.Native.Recording (ImageFormat (..))
 import Hetoimasia.Math.Affine2 (fromColumns)
@@ -171,6 +172,7 @@ fixtures =
   , formats
   , cutoutArt
   , placeholders
+  , snapBoundary
   ]
 
 -- ---------------------------------------------------------------------------
@@ -545,3 +547,35 @@ placeholders =
     }
   where
     shape = offscreenShape 1 Rgba8Linear 24 24
+
+-- | A snapping view whose sprite's origin is the largest 'Float' below one
+-- half (0x3effffff, 0.49999997) on both axes: it rounds down to 0, as
+-- 'Hetoimasia.Render.TwoD.Mapping.snapPixel' evaluates it exactly. A shader
+-- that added 0.5 in single precision would get 1.0, floor it to 1 and shift
+-- the 4-pixel quad by a whole pixel, covering 1 to 4 where 0 to 3 is right.
+snapBoundary ∷ Fixture
+snapBoundary =
+  Fixture
+    { fixtureName = "snap-boundary"
+    , fixtureShapes = [shape]
+    , fixtureSnapshot = \handles →
+        let belowHalf = castWord32ToFloat 0x3effffff
+         in Snapshot
+              [ pass
+                  shape
+                  (0.1, 0.1, 0.1, 1)
+                  [ view
+                      (0, 0)
+                      (16, 16)
+                      (identityCamera (16, 16))
+                      defaultViewSettings {settingPixelSnap = True}
+                      [UiLayer [tinted (255, 128, 0, 255) (quad (belowHalf, belowHalf) (4, 4) (handleOf handles White))]]
+                  ]
+              ]
+    , fixtureNamed =
+        [ NamedProbe "an origin just below one half snaps to 0, so the quad covers pixel 0" (probe 0 0 0) (probe 0 8 8)
+        , NamedProbe "an origin just below one half snaps to 0, so the quad leaves pixel 4" (probe 0 4 4) (probe 0 3 3)
+        ]
+    }
+  where
+    shape = offscreenShape 1 Rgba8Linear 16 16

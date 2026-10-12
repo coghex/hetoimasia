@@ -16,6 +16,7 @@
 -- > target = (va·wx + vc·wy + vtx, vb·wx + vd·wy + vty)
 -- > origin = (va·tx + vc·ty + vtx, vb·tx + vd·ty + vty)         the mapped (0, 0)
 -- > shift  = floor(origin + ½) − origin                          when the view snaps, else 0
+-- >                                                              (evaluated exactly: floor(origin) plus 1 when its fraction is at least ½)
 -- > clip   = ((target + shift) / extent) · 2 − 1                 Vulkan's Y down
 --
 -- so with snap on the quad moves rigidly until its origin lands on
@@ -92,6 +93,14 @@ orderedShaders =
                   pushed.viewLinear.y * world.x + pushed.viewLinear.w * world.y + pushed.viewTranslation.y);
           }
 
+          // floor(p + 0.5) exactly, as Mapping.snapPixel evaluates it: the
+          // fraction p - floor(p) is exact in single precision, whereas p + 0.5
+          // is not (the largest float below one half would round up to 1.0).
+          vec2 snapped(vec2 p) {
+              vec2 whole = floor(p);
+              return whole + step(vec2(0.5), p - whole);
+          }
+
           void main() {
               vec2 corner = corners[gl_VertexIndex];
               vec2 world = vec2(
@@ -100,7 +109,7 @@ orderedShaders =
               vec2 target = viewed(world);
               if (pushed.snap != 0u) {
                   vec2 origin = viewed(translation);
-                  target += floor(origin + 0.5) - origin;
+                  target += snapped(origin) - origin;
               }
               at = mix(uvRect.xy, uvRect.zw, corner);
               handle = uvec2(handleIndex, handleGeneration);
