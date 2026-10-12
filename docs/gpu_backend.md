@@ -1706,9 +1706,13 @@ image goes with it as above; the generation that [recovery](#replacing-a-lost-su
 builds on the replacement surface gets one of its own, and recovery attempts, a
 required target's escalation and an optional target's isolation treat depth as
 they treat the generation. Teardown retires the active generation as it retires
-any, so the image is released with it; whatever the recording still holds live is
-released by its retirement, and under device loss destroyed under the
-device-loss rule, with no completion evidence manufactured.
+any, so the image is released with it. The recording's own retirement releases
+what it still holds live, but not a generation's depth image: that is its
+generation's to release, so a recording retiring while the generation stands — a
+presentation not yet retired, or the generation kept uncertain — retains the
+image (`ResourcesRetained`), as it retains the generation. Under the device's
+loss every hold is let go of, and the retirement releases the image too, to be
+destroyed under the device-loss rule, with no completion evidence manufactured.
 
 **Failure.** A depth image that cannot be made fails its generation's
 construction as any native call of it does: the candidate is retired and never
@@ -1725,9 +1729,10 @@ construction that fails after its depth image was made — the target closed
 meanwhile, so the model refuses to publish it — releases the image with the
 candidate once that is destroyed. A cancellation that interrupts the image's or
 its view's creation inside the call leaves unknown whether it made anything, as
-one inside a swapchain's creation does: the candidate is kept uncertain with
-everything it made, the session fails with `CleanupFailed`, and teardown neither
-destroys nor retries it. Nothing of this leaves a generation without the depth it was
+one inside a swapchain's creation does: the candidate is kept uncertain, the
+image and its allocation are retained — never destroyed or freed under a view
+that may exist, which holds for any managed image's creation — the session fails
+with `CleanupFailed`, and teardown neither destroys nor retries any of it. Nothing of this leaves a generation without the depth it was
 configured for, or an image owned by no generation.
 
 **State.**
