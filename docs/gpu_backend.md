@@ -1581,11 +1581,55 @@ pass has, with no native call. `beginRendering` into the frame's image has no
 depth attachment, and a colour-only pass into a color target begins exactly as
 it did before depth.
 
+**Clearing depth within a rectangle.** `clearDepthRect recorder rect value`
+(R2D-17; render-2d D-10 and D-30) clears the open pass's depth attachment to
+`value` within `rect`, in render-area pixels, and leaves depth outside it
+unchanged. It is recorded as `vkCmdClearAttachments` over the depth aspect,
+with one attachment, one rectangle and one layer, and works in a pass begun by
+`beginRenderingWithDepth` (in a frame batch or a frame-less one) and in one
+begun by `beginFrameRenderingWithDepth` (in a frame batch; a frame-image pass
+is unsupported in a frame-less batch, as [Windowed depth](#windowed-depth)
+says). It is exported from `Hetoimasia.GPU.Vulkan.Native.Recording` and from
+`Hetoimasia.GPU.Vulkan.GLFW`, beside the depth passes. A world layer that
+clears its own depth within its viewport when it begins (D-10) uses it so the
+layers stay independent.
+
+- *The rectangle* is a `Rect`, the scissor's vocabulary: a nonnegative pixel
+  offset, a positive width and a positive height, with its half-open bounds
+  wholly within the open pass's render area. Touching the render area's edges
+  and covering all of it are valid. The far edges are summed as integers, so
+  no extent overflows.
+- *Refusals*, each with no native call and nothing recorded: no pass is open,
+  or the open pass has no depth attachment (`RefusedIllegal`); the rectangle
+  is empty, has a negative offset or does not lie wholly within the render
+  area (`RefusedIllegal`); the value is not finite or lies outside 0 to 1
+  (`RefusedIllegal`, as a pass's clear value is); the session has failed
+  (`RefusedSessionFailed`, or `RefusedDiagnosticPending`, before anything is
+  done, as every other new work is); and, as for every command, the recorder
+  is closed (`RefusedRecorderClosed`) or the caller is not the graphics
+  owner's thread (`RefusedNotOwner`).
+- *Draw state* is neither needed nor touched. The clear needs no bound
+  pipeline, viewport or scissor, it leaves every binding a draw uses as it
+  was, and it clears the whole requested rectangle whatever scissor is set,
+  because `vkCmdClearAttachments` is not narrowed by one.
+- *Ordering.* The clear is ordered with the pass's draws exactly as a draw is:
+  draws recorded before it see the old depth, and draws after it see the
+  cleared depth. It is a use of the depth target within the pass already
+  entered, so the target's barriers, its use and its retention are those of
+  the pass, and nothing is entered or retained by the clear itself.
+  Synchronization validation reports nothing.
+- *Depth only.* Colour clears within a rectangle are not added, and stencil
+  does not exist (above).
+
 **The native commands.** `CommandBeginRendering` carries the pass's optional
 `DepthClear`, and a pipeline request its optional `PipelineDepth`; the
 production layer builds the attachment (`depthAttachmentInfo`) and the
 depth-stencil state (`nativeDepthState`) from them, and the stand-in journals
-a declared depth (`DeclaredDepth`). The depth target's barriers are those of
+a declared depth (`DeclaredDepth`). `CommandClearDepthRect rect value` carries
+a rectangle clear; the production layer records it through
+`clearAttachmentsUnsafe` (one of the [audited](#the-ffi-audit) recording
+calls) and the stand-in journals it, with its rectangle and value, among the
+batch's other commands. The depth target's barriers are those of
 `DepthAttachment`: early and late fragment tests, depth-stencil attachment
 read and write, the depth-attachment layout, over the depth aspect.
 
@@ -1611,13 +1655,26 @@ kept until its batch completes and destroyed at once after a discard, and the
 agreement between a pipeline and the pass it is drawn in for every ordering:
 a pipeline of another depth format, one declaring none in a depth pass, one
 declaring depth in a pass without, bound outside rendering in a frame batch
-and retained across passes. `Test.GPU.Vulkan.Native.Checked` covers
+and retained across passes. It also covers `clearDepthRect`: the clear in a
+pass into a color target, in a frame batch and a frame-less one, and in a pass
+into the frame's image with the generation's depth image, journalled with its
+rectangle and value; every refusal above with nothing recorded — an empty
+rectangle, negative offsets, overruns and extents large enough to overflow, a
+value outside 0 to 1 or not finite, no pass or none with depth, a session that
+failed with the pass still open, a closed recorder and another thread; the
+clear before any draw state is bound and under a smaller scissor, leaving a
+draw's bindings as they were; the clear between two draws, journalled in
+order; the pass's barriers unchanged by it; and the native layer's failure
+named `vkCmdClearAttachments`. `Test.GPU.Vulkan.Native.Checked` covers
 `createDepthCheckedPipeline` and checks `nativeDepthState` and
 `depthAttachmentInfo` field by field. The surface-free native case
 `grs10-scene3d` ([below](#the-native-suite)) draws two depth-tested cubes from
 two camera poses on the device and reads them back
 ([samples/scene3d/README.md](../samples/scene3d/README.md)); its captures are
-retained in [`docs/evidence/gpu_3d/`](evidence/gpu_3d/README.md).
+retained in [`docs/evidence/gpu_3d/`](evidence/gpu_3d/README.md). Depth cannot
+be read back — a `DepthTarget`'s only usage is depth-stencil attachment — so
+the native case `r2d17-depth-rect` observes the rectangle clear through colour
+([below](#the-native-suite)).
 
 | State | Owner | Readers and writers | Thread | Lifetime | Reset or disposal |
 | --- | --- | --- | --- | --- | --- |
@@ -3145,7 +3202,7 @@ image, then frees its allocation (`vmaDestroyImage`), settling that too.
 
 D-28's production split, as built. The binding is compiled with
 `+safe-foreign-calls`, so every import of its own is `safe`; the package's only
-genuine `unsafe` Vulkan imports are the nineteen `dynamic` imports in the private
+genuine `unsafe` Vulkan imports are the twenty `dynamic` imports in the private
 `Hetoimasia.GPU.Vulkan.Native.Internal.Commands`, each calling the function
 pointer the binding's own device dispatch table (`DeviceCmds`) resolved for the
 command buffer's device, with structures marshalled by the binding's
@@ -3163,6 +3220,7 @@ its calling convention.
 | `vkCmdSetViewport` | Records dynamic state. |
 | `vkCmdSetScissor` | Records dynamic state. |
 | `vkCmdDraw` | Records a draw. |
+| `vkCmdClearAttachments` | Records the clear of the open pass's depth attachment within one rectangle, one attachment and one layer; the structures are marshalled for the call and not kept (R2D-17). |
 | `vkCmdPushConstants` | Records push-constant bytes, which the recording has checked fit the bound layout's ranges; they are copied into the command buffer during the call and not kept (GRS-4). |
 | `vkCmdBindVertexBuffers` | Records one buffer, already created, bound to one vertex input binding at an offset (GRS-4). |
 | `vkCmdBindIndexBuffer` | Records an already-created buffer bound as index data at an offset (GRS-4). |
@@ -3201,7 +3259,7 @@ alone, under the same masked steps as the accounting around them.
 `ffiAllocatorImports`), the binding's flags, the allocator, and the C-only
 callback; the native case's record prints it, so it is part of the evidence
 identity beside the build's source digest. The headless suite reads the
-package's own import declarations and requires exactly those nineteen `dynamic`
+package's own import declarations and requires exactly those twenty `dynamic`
 imports and, besides them, only the capture callback's address import and the
 allocator shim's entries.
 
@@ -5481,7 +5539,7 @@ companions — and adds the Vulkan owner's:
 | Main thread | Hspec runs on a thread of its own; the process main thread owns one shared production graphics session: `withLoaderIntegration`, then `runGraphicsOwnerApplication` over `withVulkanOwnerHost`, with the production native layer and surface bridge. An example that needs the main thread — to hand a window's surface over, which GLFW creates there, or to close a window — submits an operation (`onMain`); the main thread runs it between two turns of the host's owner loop and returns its result or rethrows its failure. Windows are created through the host's command port from the example's own thread, which the owner loop executes, as an application's worker would. |
 | Identities | Every dispatched operation is checked, before it runs, to be on the bound process main thread that entered the session — the Haskell thread, the bound flag, and the OS thread read through `pthread_self` — and a failed check fails the operation and the run. Every native call the session makes is recorded where it runs by a `NativeObserver`, so an example shows from the calls themselves that the instance, its messenger, the device and every surface's destruction ran on the graphics owner's thread and every surface's creation on the main thread — never from the name of an Hspec hook. |
 | Sharing | The roots — the instance, its explicit messenger, and the one device — are acquired lazily, by the first dispatched operation, at most once, and shared by every later example. Each example's windows and targets are its own and are closed inside it. |
-| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, `vk12-frames`, `vk13-presentation`, `vk14-recovery`, `vk15-validation-stop`, `vk15-retention`, `vk16-composed`, `vk17-one-slot`, `vk17-two-slots`, `vk19-capture`, `grs15-surface-free`, `grs15-surface-free-window`, `grs12-frameless`, `grs3-ordering`, `grs7-texture-table`, `grs8-sprites`, `grs9-swap`, `grs10-scene3d`, `grs13-window-depth`, `grs14-table-growth`, `synchronization-hazard`, `debug-names`, and, under the isolated compositor's consent only, `wayland-connection-loss`. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. Each child runs in a process group of its own under an external 20-second deadline covering its exit and the end of its output; one still running at it is terminated with its group and fails its example as expired. |
+| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, `vk12-frames`, `vk13-presentation`, `vk14-recovery`, `vk15-validation-stop`, `vk15-retention`, `vk16-composed`, `vk17-one-slot`, `vk17-two-slots`, `vk19-capture`, `grs15-surface-free`, `grs15-surface-free-window`, `grs12-frameless`, `grs3-ordering`, `grs7-texture-table`, `grs8-sprites`, `grs9-swap`, `grs10-scene3d`, `grs13-window-depth`, `grs14-table-growth`, `r2d17-depth-rect`, `synchronization-hazard`, `debug-names`, and, under the isolated compositor's consent only, `wayland-connection-loss`. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. Each child runs in a process group of its own under an external 20-second deadline covering its exit and the end of its output; one still running at it is terminated with its group and fails its example as expired. |
 | Selection | Building, listing and filtering the tree, a `--dry-run`, and a selection that dispatches nothing acquire nothing and start no child. A selection matching no example fails. `--complete`, which the catalog group passes, runs the whole tree with Hspec's configuration reading left out and then fails unless the shared session was acquired once and every private scenario the run's consent requires ran and passed — every one, except that `wayland-connection-loss` is required under the isolated compositor's consent and pending under any other — so no ambient setting can turn the group's receipt into a pass for a subset. The consent rules and the migrated proof's pure release, construction, publication and loader-selection examples need no session and run without consent. |
 | Consent | Read once, at startup, from `HETOIMASIA_NATIVE_SESSION`, with the GLFW suite's rules for `desktop`, `isolated-x11:<display>` and `isolated-wayland:<socket>`: the last only on Linux, only when `WAYLAND_DISPLAY` names that socket, and never beside a `DISPLAY`. Under the Wayland consent every session requests Wayland by name — the shared host, each child's host, the VK-5 bridge's loader-aware session, and the proof shim's raw initialization, which sets `GLFW_PLATFORM` and fails one that selected another platform — so no X11 or XWayland session stands in; under the others every session requests nothing, as before. The first shared example asserts the platform GLFW selected before any example renders. Without consent every native example is refused before its body, the session is never acquired, and the run ends with the refusal on stderr and a non-zero exit. |
 | Environment | Before any Vulkan call, the suite clears every ambient discovery override and every validation-layer setting it finds and records which, disables implicit layers, and points the layer's settings file at an empty one; a child inherits and re-establishes the same environment. |
@@ -5890,6 +5948,37 @@ passes only if all of these hold:
 
 The PNGs and the record go beneath `HETOIMASIA_VALIDATION_EVIDENCE/swap/`
 when the runner names an evidence directory.
+
+R2D-17's case, `r2d17-depth-rect`, runs the same surface-free composition
+and host, with no uploads, to prove `clearDepthRect`
+([Depth attachments](#depth-attachments)) on the device. Depth cannot be read
+back, so it observes depth through colour. An owner-thread action builds the
+ring, an RGBA8 target of 64 by 64, a `D32_SFLOAT` depth target of that extent
+(the case requires the backend's depth format to be that one), the scene3d
+sample's layout and depth-tested pipeline over its shaders, and a readback
+buffer. One frame-less batch then:
+
+1. begins a pass into the target and the depth target, clearing the colour to
+   blue and the depth to 0.0, so that a less-or-equal test passes nothing;
+2. sets a scissor of 4 by 4 and clears a rectangle touching none of the
+   target's edges (16 to 47 across, 20 to 43 down) to 1.0 with `clearDepthRect`,
+   which the scissor must not narrow;
+3. draws a quad covering the whole target at depth 0.5, in magenta, tested
+   less-or-equal, with an identity transform;
+4. ends the pass, copies the target into the readback after its transition and
+   returns it to rest.
+
+A second action reads the readback, which is written as a PNG to a temporary
+path the journal names. It passes only if all of these hold:
+
+- no window, surface or image acquisition was made, and the device came first;
+- the batch's ticket completed, and the actions ran on the owner's thread;
+- the readback shows the quad's magenta exactly inside the rectangle and the
+  pass's blue clear exactly outside it, probed at interior pixels on both sides
+  of each edge, two corners and two points well away from it, every channel an
+  endpoint and so exact;
+- the roots retired in order, with every Vulkan call on the owner's thread;
+- the verdict, with synchronization validation, is clean.
 
 GRS-10's case, `grs10-scene3d`, runs the scene3d sample's window-free evidence
 ([samples/scene3d/README.md](../samples/scene3d/README.md)) over the same

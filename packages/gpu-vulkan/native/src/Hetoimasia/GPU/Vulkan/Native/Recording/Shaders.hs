@@ -26,15 +26,32 @@
 -- descriptor is read — and samples that slot with the pushed sampler. A
 -- pipeline over them needs a layout from 'createTablePipelineLayout' given
 -- 'tableSamplerOffset'.
+--
+-- 'tableInstanceShaders' sample the same table with the sampler chosen per
+-- instance (render-2d D-4): the vertex stage draws one rectangle for each
+-- instance, whose vertex input carries the rectangle in clip space, a texture
+-- handle and a sampler index; the fragment stage resolves the handle as
+-- 'tableShaders' do and samples with that index, clamped to the table's last
+-- sampler. They declare no push constants, so a pipeline over them needs a
+-- layout from 'createShaderSampledTablePipelineLayout', and draws with no
+-- 'selectSampler'.
 module Hetoimasia.GPU.Vulkan.Native.Recording.Shaders
   ( verificationShaders
   , endpointShaders
   , quadShaders
   , tableShaders
+  , tableInstanceShaders
   ) where
 
 import Hetoimasia.GPU.Vulkan.Native.Recording (PipelineShaders (..))
-import Hetoimasia.GPU.Vulkan.Native.Recording.ShaderInterfaces (quadFragmentInterface, quadVertexInterface, tableFragmentInterface, tableVertexInterface)
+import Hetoimasia.GPU.Vulkan.Native.Recording.ShaderInterfaces
+  ( quadFragmentInterface
+  , quadVertexInterface
+  , tableFragmentInterface
+  , tableInstanceFragmentInterface
+  , tableInstanceVertexInterface
+  , tableVertexInterface
+  )
 import Hetoimasia.GPU.Vulkan.Native.Shader (CheckedShaders (..), checkedFragmentShader, checkedVertexShader, fragmentShader, glsl, vertexShader)
 
 verificationShaders ∷ PipelineShaders
@@ -187,6 +204,78 @@ tableShaders =
               // dynamic indexing, so every index and the combined operand the
               // sample consumes are marked non-uniform.
               colour = texture(nonuniformEXT(sampler2D(textures[nonuniformEXT(slot)], samplers[nonuniformEXT(min(pushed.filtering, 3u))])), at);
+          }
+        |]
+         )
+    }
+
+tableInstanceShaders ∷ CheckedShaders
+tableInstanceShaders =
+  CheckedShaders
+    { checkedVertex =
+        $( checkedVertexShader
+             tableInstanceVertexInterface
+             [glsl|
+          #version 450
+
+          layout(location = 0) in vec4 rectangle;
+          layout(location = 1) in uint lookupIndex;
+          layout(location = 2) in uint generation;
+          layout(location = 3) in uint samplerIndex;
+
+          layout(location = 0) out vec2 at;
+          layout(location = 1) flat out uvec2 handle;
+          layout(location = 2) flat out uint filtering;
+
+          // Two triangles over the unit square.
+          const vec2 corners[6] = vec2[](vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(0.0, 1.0), vec2(0.0, 1.0), vec2(1.0, 0.0), vec2(1.0, 1.0));
+
+          void main() {
+              vec2 corner = corners[gl_VertexIndex];
+              at = corner;
+              handle = uvec2(lookupIndex, generation);
+              filtering = samplerIndex;
+              gl_Position = vec4(mix(rectangle.xy, rectangle.zw, corner), 0.0, 1.0);
+          }
+        |]
+         )
+    , checkedFragment =
+        $( checkedFragmentShader
+             tableInstanceFragmentInterface
+             [glsl|
+          #version 450
+          #extension GL_EXT_nonuniform_qualifier : require
+
+          layout(set = 0, binding = 0) uniform sampler samplers[4];
+          layout(set = 0, binding = 1) uniform texture2D textures[];
+          layout(set = 1, binding = 0, std430) readonly buffer Lookup {
+              uvec2 entries[];
+          } lookups;
+
+          layout(location = 0) in vec2 at;
+          layout(location = 1) flat in uvec2 handle;
+          layout(location = 2) flat in uint filtering;
+          layout(location = 0) out vec4 colour;
+
+          // A handle's slot in the bound version: its entry's, when the
+          // index is within the version and the entry holds the handle's
+          // generation; otherwise slot 0, the placeholder.
+          uint resolve(uvec2 handle) {
+              if (handle.x >= uint(lookups.entries.length())) {
+                  return 0u;
+              }
+              uvec2 entry = lookups.entries[handle.x];
+              return entry.y == handle.y ? entry.x : 0u;
+          }
+
+          void main() {
+              uint slot = resolve(handle);
+              // The sampler index comes from instance data the backend cannot
+              // see, so the shader clamps it to the table's last sampler. The
+              // profile enables non-uniform sampled-image indexing, not
+              // dynamic indexing, so every index and the combined operand the
+              // sample consumes are marked non-uniform.
+              colour = texture(nonuniformEXT(sampler2D(textures[nonuniformEXT(slot)], samplers[nonuniformEXT(min(filtering, 3u))])), at);
           }
         |]
          )

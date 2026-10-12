@@ -223,6 +223,7 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , releaseConstructed
   , constructTextureTable
   , constructTablePipelineLayout
+  , constructShaderSampledTablePipelineLayout
   , registerConstructedTexture
   , swapConstructedTexture
   , releaseConstructedTexture
