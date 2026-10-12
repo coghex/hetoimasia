@@ -61,7 +61,8 @@
 -- scene's revision 0 for a window with no publication, whether or not it has
 -- a target yet, since a window attached later adopts the scene it holds and
 -- must find what it references still there. The barrier is met when, for each
--- window it names, the window's adopted watermark has reached that revision,
+-- window it names, the revision a live target of the window holds has reached
+-- that revision,
 -- or the host no longer holds the window. A window that appears later is not
 -- named, and so delays nothing.
 --
@@ -236,7 +237,7 @@ retentionLimit slots = 2 * (slots + 1)
 --
 -- The ledger's record, the hook and the watermark are one uninterruptible
 -- transition; the hook has run, and the bookkeeping is complete, before the
--- window's adopted watermark moves.
+-- revision counts as held for a barrier.
 adoptScene ∷ Scenes → SceneLifecycle scene → Natural → AttachmentId → scene → Natural → IO Adopting
 adoptScene scenes lifecycle limit attachment scene revision = uninterruptibleMask_ $ do
   answer ← atomically $ do
