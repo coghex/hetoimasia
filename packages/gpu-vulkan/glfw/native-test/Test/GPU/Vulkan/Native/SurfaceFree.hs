@@ -1828,7 +1828,7 @@ spritesBuilders construction =
 
 -- | The ordered path's case (R2D-7): the 2D renderer's recorder
 -- ("Hetoimasia.Render.TwoD.Vulkan") over this suite's surface-free session —
--- ten fixtures rendered offscreen, every pixel of every target judged against
+-- eleven fixtures rendered offscreen, every pixel of every target judged against
 -- the oracle ("Test.GPU.Vulkan.Native.OrderedPath") — with the files written
 -- under the validation runner's evidence directory when it names one, and
 -- otherwise into a directory of their own that is kept and reported.
