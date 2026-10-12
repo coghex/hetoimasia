@@ -305,12 +305,12 @@ each non-finite or out-of-range value the contract names at its boundary
 and both infinities), a second or non-final window pass and a non-zero clip
 index, with faults at different locations retained together, including inside
 a zero-size viewport; offscreen-only snapshots accepted and valid snapshots
-unchanged; the discrete-step-zoom list's refusals; the 64-byte little-endian
+unchanged; the discrete-step-zoom list's refusals and stepping; the pure view mapping between window, framebuffer, UI and world space with its snapping and every degenerate and unrepresentable refusal; the 64-byte little-endian
 instance layout checked field by field against bytes written out by hand and an
 independent reference encoder, for zero, one and many instances; the flags
 word for every sampler choice and flag combination with its reserved bits zero
 and the clip index in the top 16 bits; and external clients proving that
-validated values and offscreen target references cannot be forged. It is
+validated values, offscreen target references and view mappings cannot be forged. It is
 mandatory but outside the floor, like `test.math`, and runs through
 `cabal.project.cpu`: the library depends on no GPU, GLFW, Vulkan, runtime or
 Lua package. See [the package's contract](../packages/render-2d/README.md).
