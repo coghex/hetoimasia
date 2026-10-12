@@ -87,7 +87,6 @@ test-suite render-2d-oracle-tests
         containers >=0.8 && <0.9,
         hspec >=2.11 && <3,
         hetoimasia-asset ==0.1.0.0,
-        hetoimasia-asset-image ==0.1.0.0,
         hetoimasia-math ==0.1.0.0,
         hetoimasia-render-2d ==0.1.0.0,
         hetoimasia-render-2d-oracle ==0.1.0.0,

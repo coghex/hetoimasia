@@ -20,6 +20,7 @@ module Hetoimasia.Render.TwoD.Oracle.Internal.Geometry
     Placement (..)
   , place
   , instanceIsSingular
+  , isDegenerate
   , representable
   , localPoint
   , inverseLinear
@@ -82,6 +83,12 @@ instanceIsSingular transform = a * d - b * c == 0
 
 determinant ∷ Placement → Rational
 determinant p = plA p * plD p - plB p * plC p
+
+-- | Whether a placement has no inverse. A layer's transform is invertible, so
+-- this holds for a placed instance only when 'instanceIsSingular' does; it is
+-- the guard that keeps the coverage arithmetic total all the same.
+isDegenerate ∷ Placement → Bool
+isDegenerate p = determinant p == 0
 
 corners ∷ Placement → [Point Rational]
 corners p =

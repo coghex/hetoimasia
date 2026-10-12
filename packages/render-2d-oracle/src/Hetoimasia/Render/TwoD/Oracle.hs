@@ -111,6 +111,7 @@ import Hetoimasia.Render.TwoD.Oracle.Internal.Geometry
   , coverage
   , instanceIsSingular
   , inverseLinear
+  , isDegenerate
   , nearBoundary
   , place
   , representable
@@ -198,7 +199,7 @@ data Expectation
 -- by pass, view, layer and submission index.
 data Indeterminate
   = -- | The probe's centre is within 1/16 pixel of an edge of a view's viewport
-    -- that is not on a whole pixel, and the view draws something there.
+    -- that is not on a whole pixel.
     NearViewportEdge !Location
   | -- | The probe's centre is within 1/16 pixel of an edge of an instance's quad.
     NearQuadEdge !Location
@@ -381,7 +382,7 @@ combine spec pass fragments =
 viewFragments ∷ Oracle → TargetSpec → Int → Int → OracleView → [Fragment]
 viewFragments oracle spec x y view
   | viewportIsEmpty viewport = []
-  | near = [Unsure (NearViewportEdge (ovLocation view)) | not (null body)] <> body
+  | near = Unsure (NearViewportEdge (ovLocation view)) : body
   | contains = body
   | otherwise = []
   where
@@ -418,7 +419,7 @@ instanceFragment oracle spec x y view mapping space (Drawn location instanceValu
   | otherwise = case placement of
       Nothing → Just (Bad (PlacementNotRepresentable location))
       Just placed
-        | not (representable placed) → Just (Bad (PlacementNotRepresentable location))
+        | isDegenerate placed || not (representable placed) → Just (Bad (PlacementNotRepresentable location))
         | otherwise → case coverage placed centre of
             Outside → Nothing
             NearEdge → Just (Unsure (if cutout then OnCutoutPath location else NearQuadEdge location))

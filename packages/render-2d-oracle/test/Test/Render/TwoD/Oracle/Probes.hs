@@ -75,10 +75,16 @@ spec = describe "probes" $ do
       expectAt oracle 3 4 `shouldBe` Expected (Rgba8 255 0 0 255) (Tolerance 0 0 0 0)
       expectAt oracle 5 4 `shouldBe` clearAt
 
-    it "does not report a viewport edge where the view draws nothing" $ do
+    it "reports a viewport edge near the centre whether or not the view draws anything" $ do
       let oracle =
             mkOracle srgb8 [] [offscreenPass noClear [mkView defaultCamera (Viewport (V2 0 0) (V2 4.45 8)) defaultViewSettings [world []]]]
-      expectAt oracle 4 4 `shouldBe` clearAt
+      expectAt oracle 4 4 `shouldBe` Indeterminate (NearViewportEdge (AtView 0 0))
+      expectAt oracle 3 4 `shouldBe` clearAt
+
+    it "does not report an empty viewport's edges, which draw nothing" $ do
+      let oracle =
+            mkOracle srgb8 [(h1, solid True red)] [offscreenPass noClear [mkView defaultCamera (Viewport (V2 0 0) (V2 0 8)) defaultViewSettings [world [sprite h1 (-4, -4) (8, 8)]]]]
+      expectAt oracle 0 4 `shouldBe` clearAt
 
     it "reports a cutout-path instance that could cover the probe, and only that" $ do
       let marks = cutoutMarks [h1]
