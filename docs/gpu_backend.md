@@ -2850,6 +2850,26 @@ native call:
 - an offset that is unaligned or outside every fragment range;
 - whatever the checked-range and push-range validation refuse.
 
+**Two layout kinds** (R2D-16; render-2d D-4). A layout is one of two kinds,
+by how its draws choose a sampler.
+
+- *Pushed* (`createTablePipelineLayout`): the recorder pushes the sampler
+  index at the declared offset, as above. Every draw samples with one
+  sampler, so mixed filtering takes one draw per filter.
+- *Shader-sampled* (`createShaderSampledTablePipelineLayout recording
+  shaders`): the layout declares no sampler offset and reserves no
+  push-constant bytes, and the shaders choose their samplers, per instance,
+  from vertex input. It makes the same layout and checks the shaders exactly
+  as the pushed kind does (the table's own bindings only, set 0 in the
+  fragment stage alone, the push ranges against the device's limit), and is
+  refused before any native call in a session with no table and wherever the
+  pushed kind's checks refuse. It checks no sampler offset, so shaders that
+  declare no push constants at all are valid and need no dummy fragment
+  range. The window integration's `constructShaderSampledTablePipelineLayout
+  construction shaders` is the confined equivalent, exported from
+  `Hetoimasia.GPU.Vulkan.GLFW` beside `constructTablePipelineLayout`; the
+  native package's facade `TextureTable` exports the first.
+
 **Binding and drawing.** `bindTable recorder` binds both sets under the bound
 pipeline's layout, with the dynamic offset of the batch's version, through
 `vkCmdBindDescriptorSets`.
@@ -2873,13 +2893,35 @@ table's pipeline needs both again. Refused with no native call:
   hold the table, or in a session with no table;
 - a sampler index above 3 (`RefusedOutOfBounds`), or a sampler selected
   under a pipeline without the table;
-- a push over the sampler index's four bytes;
+- `selectSampler` under a shader-sampled pipeline, naming that the layout's
+  shaders choose their samplers;
+- a push over the sampler index's four bytes, under a pushed layout;
 - a draw with a table pipeline before the table is bound under a compatible
-  layout, or before a sampler is selected;
+  layout, or, under a pushed layout, before a sampler is selected;
 - a draw through the table while the batch holds an image its version maps
   in a use other than sampling, for example after moving a texture to a
   transfer use, until the batch moves it back;
 - any binding once the session has failed.
+
+**The draw check under each kind.** A draw through a pushed layout needs the
+table bound under a compatible layout, a selected sampler, and every image
+the batch's version maps in its sampled use. A draw through a shader-sampled
+layout needs the first and the last and not the sampler: it needs no
+`selectSampler`. Every other refusal of a table draw is the same under both.
+Under a shader-sampled layout no sampler index is reserved, so an ordinary
+push may cover any bytes of the layout's ranges, offset 8 included; the
+ordinary push checks (alignment, size, stage coverage and range bounds) still
+apply. The pushed path is unchanged: `createTablePipelineLayout`,
+`selectSampler`, the pushed draw's requirement of a selected sampler and the
+refusal of a push over the sampler index behave as before.
+
+Binding a pipeline of the other kind disturbs the binding and the sampler
+selection, as binding any pipeline with different push ranges or table use
+does, even when the two layouts' push ranges are equal: the table's
+pipeline needs `bindTable` again, which binds the same sets and version the
+batch already took, and a return to a pushed pipeline needs a fresh
+`selectSampler`. Binding another pipeline of the same kind with equal ranges
+keeps both, as before.
 
 **The shaders.** `tableShaders` (in `Recording.Shaders`) are the reference
 pair the native case draws with. The vertex shader covers the render area
@@ -2895,11 +2937,49 @@ Their interface descriptions are `tableVertexInterface` and
 `tableFragmentInterface`: the handle at push offset 0 and the sampler index
 at `tableSamplerOffset` (8).
 
+**The shader's obligations under a shader-sampled layout.** The backend
+cannot see per-instance data, so two obligations are the shader's:
+
+- *Clamp the index.* The table holds four samplers, so a shader must clamp
+  the sampler index it reads from instance data to 3, as
+  `samplers[nonuniformEXT(min(index, 3u))]`. An instance's index beyond 3
+  therefore samples with sampler 3. An unclamped index past the array is
+  undefined behavior that the backend cannot refuse.
+- *Index with `nonuniformEXT`.* The profile enables non-uniform sampled-image
+  indexing and not dynamic indexing, and the sampler index varies by
+  instance, so the sampler index, the slot index and the combined sampled
+  image the sample consumes are each `nonuniformEXT`.
+
+**The instance shaders.** `tableInstanceShaders` (in `Recording.Shaders`) are
+the reference pair for a shader-sampled layout, with interfaces
+`tableInstanceVertexInterface` and `tableInstanceFragmentInterface` (in
+`Recording.ShaderInterfaces`). The vertex shader draws one rectangle per
+instance from six vertices, two triangles generated from `gl_VertexIndex`,
+so a pipeline over them takes no per-vertex input. Its one per-instance
+binding, of `tableInstanceStride` (28) bytes, carries:
+
+| Location | Format | Offset | Content |
+| --- | --- | --- | --- |
+| 0 | four floats | 0 | the rectangle in clip space: left, top, right, bottom |
+| 1 | `VertexUint` | 16 | the texture handle's lookup index |
+| 2 | `VertexUint` | 20 | the handle's generation |
+| 3 | `VertexUint` | 24 | the sampler index |
+
+It passes the handle and the sampler index to the fragment stage as flat
+values. The fragment shader declares the table's bindings and no push
+constants. It resolves the handle as `tableShaders` do (slot 0 for an index
+past the version's entries or a stale generation) and samples with
+`samplers[nonuniformEXT(min(index, 3u))]`, the slot index and the combined
+image also `nonuniformEXT`. The shader suite checks that their SPIR-V
+declares exactly the table's bindings, matches the interfaces, and decorates
+the sampler index, the slot index and the combined image `NonUniform`.
+
 **The window integration.** An owner-thread action has:
 
 - `constructTextureTable`, over the session's uploads; the host must
   configure `vulkanUploads`, or it is refused;
-- `constructTablePipelineLayout`;
+- `constructTablePipelineLayout` and
+  `constructShaderSampledTablePipelineLayout`;
 - `registerConstructedTexture` and `releaseConstructedTexture`;
 - `readConstructedTable`.
 
@@ -2972,6 +3052,45 @@ references failed the retirement example, and one that ran the
 construction unmasked failed the cancellation example. The device-profile examples refuse a device missing any of the six
 features, by name. The shader suite checks that `tableShaders`' SPIR-V
 declares exactly the table's three bindings and matches its descriptions.
+
+The stand-in examples for the shader-sampled kind (`Test.GPU.Vulkan.Native.Table`)
+cover:
+
+- the layout made with its two set layouts and no range, and a checked
+  pipeline over shaders declaring no push constants, with the other kind's
+  shaders refused as incompatible with it;
+- the layout refused with no native call in a session with no table, for a
+  binding the table does not hold, for a vertex stage declaring set 0, and
+  for ranges past the device's limit;
+- a table draw admitted with no `selectSampler`, `selectSampler` refused with
+  no native call, a push over offset 8 admitted, and the ordinary push
+  checks still refusing a misaligned push, one beyond the range and one to a
+  stage the layout has no range for;
+- a draw refused before a compatible table binding, and while the batch holds
+  a mapped image outside sampling;
+- switches between a pushed and a shader-sampled pipeline of identical
+  ranges, in both directions, each disturbing the table binding and the
+  sampler selection, a rebind binding the batch's first set and version after
+  the table has grown, and a return to the pushed path requiring a fresh
+  `selectSampler`;
+- every pushed example unchanged, including the refusal of a draw before a
+  sampler is selected.
+
+The surface-free native case `r2d16-shader-samplers` makes a table, a
+shader-sampled layout over `tableInstanceShaders` and a two-texel texture, a
+red texel then a blue one. One batch binds the table and draws four
+instances in **one** draw call, with no `selectSampler`, each filling a
+quadrant of a 64-by-64 sRGB target, with sampler indices 0
+(nearest/clamp-to-edge), 2 (linear/clamp-to-edge), 7 and 3. The target is
+read back and probed. A pixel 12 across a 32-pixel quadrant reads 0.390625
+across the texture. The nearest instance's probe reads the red texel exactly.
+The linear one's reads the blend, 0.28125 of the blue texel, within one step
+of the sRGB encoding of that blend, so the two differ. The probes of index 7
+and index 3 sit 3 pixels in, where repeat addressing wraps the blue texel in
+from the left and clamping does not: both read the blend within one step,
+and a linear/clamp-to-edge probe at the same offset reads the red texel
+alone, so index 7 sampled as sampler 3, not as 2. Validation, with
+synchronization validation, reports nothing.
 
 The surface-free native case `grs7-texture-table` makes a table of sixteen
 slots, eight at first, over the session's uploads. It then draws four
