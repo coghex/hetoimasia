@@ -1,0 +1,94 @@
+cabal-version: 3.16
+name: hetoimasia-render-2d-oracle
+version: 0.1.0.0
+synopsis: Expected pixels of a 2D snapshot, computed without a GPU
+description:
+    A pure oracle for the 2D renderer. From a validated snapshot, the cutout
+    marks it is planned with, each target's metrics, colour format and pixel
+    extent, and a lookup from texture handle to decoded image, it computes what
+    one pixel of one pass's target holds once that pass has run: an 8-bit RGBA
+    value with a per-channel tolerance, or an indeterminate verdict naming why
+    the oracle will not guess, or a refusal naming the input defect that stops
+    it from answering. A pure reader returns a pixel of a tightly packed
+    readback, swizzling B8G8R8A8, and a verdict compares the two. Placement,
+    coverage and texel addressing are computed exactly, in rational
+    arithmetic over the 32-bit coefficients; colour is computed in double
+    precision with the sRGB transfer function and with the 8-bit rounding of
+    every store. The library depends on hetoimasia-render-2d,
+    hetoimasia-render-api, hetoimasia-math, hetoimasia-asset and
+    hetoimasia-asset-image for software BC7 decoding, and on standard
+    libraries: no GPU, GLFW, Vulkan, runtime or Lua package. It reads no
+    file, performs no IO, owns no state and starts no thread.
+license: GPL-3.0-only
+license-file: LICENSE
+author: Vincent Coghlan
+maintainer: Vincent Coghlan
+category: Graphics
+build-type: Simple
+tested-with: GHC ==9.14.1
+extra-doc-files: README.md
+
+source-repository head
+    type: git
+    location: https://github.com/coghex/hetoimasia.git
+    subdir: packages/render-2d-oracle
+
+common language
+    default-language: GHC2024
+    default-extensions: UnicodeSyntax
+    ghc-options: -Wall -Wcompat -Wincomplete-uni-patterns -Wincomplete-record-updates
+
+library
+    import: language
+    hs-source-dirs: src
+    exposed-modules:
+        Hetoimasia.Render.TwoD.Oracle
+        Hetoimasia.Render.TwoD.Oracle.Colour
+        Hetoimasia.Render.TwoD.Oracle.Readback
+    -- Exact placement and coverage, the checked image and its texel access,
+    -- the filtering and level selection, and the colour pipeline, which only
+    -- the oracle itself imports.
+    other-modules:
+        Hetoimasia.Render.TwoD.Oracle.Internal.Geometry
+        Hetoimasia.Render.TwoD.Oracle.Internal.Image
+        Hetoimasia.Render.TwoD.Oracle.Internal.Pipeline
+        Hetoimasia.Render.TwoD.Oracle.Internal.Sample
+    build-depends:
+        array >=0.5 && <0.6,
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        containers >=0.8 && <0.9,
+        hetoimasia-asset ==0.1.0.0,
+        hetoimasia-asset-image ==0.1.0.0,
+        hetoimasia-math ==0.1.0.0,
+        hetoimasia-render-2d ==0.1.0.0,
+        hetoimasia-render-api ==0.1.0.0,
+        text >=2.1 && <2.2
+
+-- This package's own contracts, registered as the CPU validation group
+-- `test.render-2d-oracle`. The library depends on no GPU, GLFW, Vulkan,
+-- runtime or Lua package; Hspec is the suite's alone.
+test-suite render-2d-oracle-tests
+    import: language
+    type: exitcode-stdio-1.0
+    main-is: Main.hs
+    hs-source-dirs: test
+    other-modules:
+        Test.Render.TwoD.Oracle.Colour
+        Test.Render.TwoD.Oracle.Placement
+        Test.Render.TwoD.Oracle.Probes
+        Test.Render.TwoD.Oracle.Sampling
+        Test.Render.TwoD.Oracle.Spec
+        Test.Render.TwoD.Oracle.Support
+        Test.Render.TwoD.Oracle.Verdicts
+    build-depends:
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        containers >=0.8 && <0.9,
+        hspec >=2.11 && <3,
+        hetoimasia-asset ==0.1.0.0,
+        hetoimasia-asset-image ==0.1.0.0,
+        hetoimasia-math ==0.1.0.0,
+        hetoimasia-render-2d ==0.1.0.0,
+        hetoimasia-render-2d-oracle ==0.1.0.0,
+        hetoimasia-render-api ==0.1.0.0
