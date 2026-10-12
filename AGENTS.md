@@ -126,11 +126,12 @@ These instructions are also the authority for Claude sessions through CLAUDE.md.
   or `--match 'Logging lifetime'` select runtime subgroups as they did at root,
   and on `glfw-tests` the GLFW group names, such as `--match 'GLFW session'`,
   select what they selected at root or in the removed window-examples executable.
-- The Vulkan native backend and window integration packages, and the
-  triangle and sprites samples, build only through `cabal.project.vulkan`, by
+- The Vulkan native backend and window integration packages, the 2D
+  renderer's Vulkan recorder (`packages/render-2d-vulkan`), and the
+  triangle, sprites and scene3d samples, build only through `cabal.project.vulkan`, by
   `bash tools/vulkan/run.sh`. Its test mode runs their headless suites
   (`native-tests`, `shader-tests`, `integration-tests`, `triangle-tests`,
-  `sprites-tests`) — the
+  `sprites-tests`, `scene3d-tests`, `render-2d-vulkan-tests`) — the
   group `test.vulkan-headless` — and needs no consent. The native suite `vulkan-native-tests` (`test.vulkan-native`) opens
   windows and presents on macOS, so it takes the same desktop opt-in, under the
   same standing approval, as `glfw-native-tests`; on Linux its runner starts an
