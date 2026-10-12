@@ -156,9 +156,9 @@ texelSource imageSrgbEncoded targetSrgb texels offset =
     byteAt n = ByteString.unsafeIndex texels (offset + n)
     colour n = pinChan (Chan (decode (byteAt n)) (imageSrgbEncoded == targetSrgb || byteAt n == 255 || byteAt n == 0))
     alpha n = Chan (fromIntegral (byteAt n) / 255) True
-    decode ∷ Word8 → Double
+    decode ∷ Word8 → Rational
     decode byte
-      | imageSrgbEncoded = srgbToLinear (fromIntegral byte / 255)
+      | imageSrgbEncoded = toRational (srgbToLinear (fromIntegral byte / 255))
       | otherwise = fromIntegral byte / 255
 
 -- | Weight texels: the one that carries all the weight, or any set that agrees,
@@ -174,4 +174,4 @@ mixChannel weighted = case filter ((/= 0) . fst) weighted of
   [(_, only)] → only
   live@((_, first) : rest)
     | all ((== first) . snd) rest → first
-    | otherwise → pinChan (Chan (sum [fromRational weight * chanValue chan | (weight, chan) ← live]) False)
+    | otherwise → pinChan (Chan (sum [weight * chanValue chan | (weight, chan) ← live]) False)

@@ -7,7 +7,7 @@
 module Test.Render.TwoD.Oracle.Colour (spec) where
 
 import Hetoimasia.Render.TwoD.Oracle
-import Hetoimasia.Render.TwoD.Oracle.Colour (ColourFormat (..), Rgba8 (..), Tolerance (..))
+import Hetoimasia.Render.TwoD.Oracle.Colour (Channel (..), ColourFormat (..), Rgba8 (..), Tolerance (..))
 import Hetoimasia.Render.TwoD.Settings (ViewSettings (..), defaultViewSettings)
 import Hetoimasia.Render.TwoD.Snapshot
 import Test.Hspec hiding (Expectation)
@@ -172,6 +172,38 @@ spec = describe "colour" $ do
             mkOracle srgb8 [(h1, solid False halfRed)] [offscreenPass noClear [fullView 8 8 [world [spriteAt h1 (0, 0), spriteAt h1 (0, 0)]]]]
       centre oracle `shouldBe` Expected (Rgba8 188 0 0 128) (Tolerance 1 0 0 0)
       centre twice `shouldBe` Expected (Rgba8 225 0 0 192) (Tolerance 1 0 0 1)
+
+  describe "stores that are ties" $ do
+    -- Brightness 0.5 on a texel of 5 makes every source exactly 2.5 channel
+    -- steps. Vulkan does not fix which way a tie rounds, so one store is 2 or 3,
+    -- two stores 4 to 6, and each further store widens the range of bytes a
+    -- device could hold by another step.
+    let halves count =
+          mkOracle
+            unorm8
+            [(h1, solid False (5, 5, 5, 255))]
+            [ offscreenPass
+                noClear
+                [mkView defaultCamera (fullViewport 8 8) defaultViewSettings {settingBrightness = 0.5} [world (replicate count (additive (spriteAt h1 (0, 0))))]]
+            ]
+
+    it "bounds one tied store to a step, reading it as the tie rounds up" $
+      centre (halves 1) `shouldBe` Expected (Rgba8 3 3 3 0) (Tolerance 1 1 1 0)
+
+    it "bounds two tied stores to one tolerance, around the middle of 4 to 6" $
+      centre (halves 2) `shouldBe` Expected (Rgba8 5 5 5 0) (Tolerance 1 1 1 0)
+
+    it "reports three tied stores as indeterminate, since no tolerance of 1 covers 6 to 9" $
+      centre (halves 3) `shouldBe` Indeterminate (RoundingNotBounded Red)
+
+    it "reports eight tied stores as indeterminate, not as one rounded value" $
+      -- Rounding half up at every store would say 24; a device may hold far from it.
+      centre (halves 8) `shouldBe` Indeterminate (RoundingNotBounded Red)
+
+    it "keeps a store that is not a tie determinate through many draws" $
+      -- Eight sources of byte 4 never land within a 1024th of a half step.
+      centre (mkOracle unorm8 [(h1, solid False (4, 4, 4, 4))] [offscreenPass noClear [fullView 8 8 [world (replicate 8 (spriteAt h1 (0, 0)))]]])
+        `shouldBe` Expected (Rgba8 32 32 32 32) (Tolerance 1 1 1 1)
 
   describe "the clear colour" $ do
     it "is exact for a component of 0 or 1 and rounds any other" $ do

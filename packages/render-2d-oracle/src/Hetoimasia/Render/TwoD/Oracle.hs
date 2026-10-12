@@ -121,8 +121,7 @@ import Hetoimasia.Render.TwoD.Oracle.Internal.Pipeline
   ( Source
   , blend
   , clearPixel
-  , pixelTolerance
-  , pixelValue
+  , pixelOutcome
   , shade
   )
 import Hetoimasia.Render.TwoD.Oracle.Internal.Sample
@@ -215,6 +214,10 @@ data Indeterminate
   | -- | A nearest-filtered coordinate within 1/16 texel of an interior boundary
     -- between texels that differ.
     NearTexelBoundary !Location
+  | -- | A channel whose stored byte cannot be bounded to within one step: the
+    -- stores' rounding, where a value is a tie or within a 1024th of a byte of
+    -- one, leaves more than three bytes it could hold after the last draw.
+    RoundingNotBounded !Channel
   deriving stock (Eq, Show)
 
 -- | Why the oracle cannot answer.
@@ -377,7 +380,9 @@ combine spec pass fragments =
     ([], []) →
       let format = specFormat spec
           final = foldl' (\pixel source → blend format source pixel) (clearPixel format (opClear pass)) [source | Draws source ← fragments]
-       in Expected (pixelValue final) (pixelTolerance final)
+       in case pixelOutcome final of
+            Left channel → Indeterminate (RoundingNotBounded channel)
+            Right (value, tolerance) → Expected value tolerance
 
 viewFragments ∷ Oracle → TargetSpec → Int → Int → OracleView → [Fragment]
 viewFragments oracle spec x y view
