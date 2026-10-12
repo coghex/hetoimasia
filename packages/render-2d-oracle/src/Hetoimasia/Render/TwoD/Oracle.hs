@@ -390,7 +390,7 @@ viewFragments oracle spec x y view
     centreX = fromIntegral x + 0.5 ∷ Float
     centreY = fromIntegral y + 0.5 ∷ Float
     contains = viewportContains viewport (V2 centreX centreY)
-    near = nearBoundary (1 / 16) (viewportEdges viewport) (realToFrac centreX, realToFrac centreY)
+    near = nearBoundary (1 / 16) (viewportEdges viewport) (toRational centreX, toRational centreY)
     body = case ovMapping view of
       -- A mapping is needed by an instance that has area: a singular quad is
       -- known to cover nothing from its own transform.
@@ -405,15 +405,15 @@ viewFragments oracle spec x y view
 needsMapping ∷ Drawn → Bool
 needsMapping (Drawn _ instanceValue _) = not (instanceIsSingular (instanceTransform instanceValue))
 
--- | A viewport's four edges, in 'Double'.
-viewportEdges ∷ Viewport → [((Double, Double), (Double, Double))]
+-- | A viewport's four edges, exactly.
+viewportEdges ∷ Viewport → [((Rational, Rational), (Rational, Rational))]
 viewportEdges (Viewport (V2 ox oy) (V2 width height)) =
   [(topLeft, topRight), (topRight, bottomRight), (bottomRight, bottomLeft), (bottomLeft, topLeft)]
   where
-    left = realToFrac ox
-    top = realToFrac oy
-    right = left + realToFrac width
-    bottom = top + realToFrac height
+    left = toRational ox
+    top = toRational oy
+    right = left + toRational width
+    bottom = top + toRational height
     topLeft = (left, top)
     topRight = (right, top)
     bottomRight = (right, bottom)

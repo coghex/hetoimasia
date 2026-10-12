@@ -206,9 +206,31 @@ spec = describe "sampling" $ do
               [(h1, blackBlack)]
               [offscreenPass noClear [mkView defaultCamera (fullViewport 8 8) bright [world [linear (sprite h1 (1, 1) (size, size))]]]]
       expectAt (at 1.9997) 5 5 `shouldBe` Indeterminate (MinifiedFractionalLevel (AtInstance 0 0 0 0))
-      -- Within 2⁻¹⁶ of level 1 the blend is under a fifth of a channel step even
-      -- so, and the oracle reads level 1: black, exactly.
-      expectAt (at 2.00001) 5 5 `shouldBe` Expected (Rgba8 0 0 0 255) (Tolerance 0 0 0 0)
+      -- Only a level of detail that is exactly whole is read as a level, however
+      -- close: 4 texels over 2.00001 pixels is a hair under 1.
+      expectAt (at 2.00001) 5 5 `shouldBe` Indeterminate (MinifiedFractionalLevel (AtInstance 0 0 0 0))
+      -- Exactly 2 pixels is level 1, black.
+      expectAt (at 2) 5 5 `shouldBe` Expected (Rgba8 0 0 0 255) (Tolerance 0 0 0 0)
+
+    it "does not argue a near-whole level of detail through repeated blends" $ do
+      -- Two additive linear quads of 1.99998 pixels over 4 texels have a level
+      -- of detail of 1.0000144. Level 1 alone would store 2, 2, 2 and a second
+      -- draw 4; the specified mip blend gives a source of about 1.5055 channel
+      -- steps and so 4 and 4, which no tolerance of 1 covers. It is refused.
+      let ones = rgba8 False 4 4 [flat 16 (1, 1, 1, 255), flat 4 (1, 1, 1, 255), flat 1 (255, 255, 255, 255)]
+          bright = defaultViewSettings {settingBrightness = 1.499999}
+          quad = (linear (sprite h1 (1, 1) (1.99998, 1.99998))) {instanceAdditive = True}
+          oracle = mkOracle unorm8 [(h1, ones)] [offscreenPass noClear [mkView defaultCamera (fullViewport 8 8) bright [world [quad, quad]]]]
+      expectAt oracle 5 5 `shouldBe` Indeterminate (MinifiedFractionalLevel (AtInstance 0 0 0 0))
+
+    it "refuses a minified probe through a quarter turn that is not exact" $ do
+      -- A camera turned by the 32-bit π/2 has a cosine of about −4.4e-8, so the
+      -- derivatives are not exactly axis-aligned.
+      let turned = mkView (Camera (V2 0 0) 1 (Just (pi / 2))) (fullViewport 8 8) defaultViewSettings [world [sprite h1 (1, 1) (2, 2)]]
+          oracle = mkOracle unorm8 [(h1, mipped)] [offscreenPass noClear [turned]]
+          pixels = [expectAt oracle x y | x ← [0 .. 7], y ← [0 .. 7]]
+      pixels `shouldSatisfy` any (== Indeterminate (MinifiedNotAxisAligned (AtInstance 0 0 0 0)))
+      pixels `shouldSatisfy` all (\p → p `notElem` [Expected (Rgba8 0 255 0 255) (Tolerance 0 0 0 0)])
 
     it "reads level 0 when the texture has only one level, however minified" $ do
       let turned = (sprite h1 (0, 0) (1, 1)) {instanceTransform = fromColumns (V2 1.4142135 1.4142135) (V2 (-1.4142135) 1.4142135) (V2 0 0)}

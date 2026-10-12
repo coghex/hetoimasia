@@ -81,6 +81,13 @@ spec = describe "probes" $ do
       expectAt oracle 4 4 `shouldBe` Indeterminate (NearViewportEdge (AtView 0 0))
       expectAt oracle 3 4 `shouldBe` clearAt
 
+    it "finds a viewport edge near the centre of a huge finite viewport" $ do
+      -- Double arithmetic would lose the centre's offset from an edge 0.05 pixel
+      -- away when the viewport spans 2e20 pixels; the distance is exact.
+      let oracle =
+            mkOracle srgb8 [] [offscreenPass noClear [mkView defaultCamera (Viewport (V2 0.45 (-1.0e20)) (V2 4 2.0e20)) defaultViewSettings [world []]]]
+      expectAt oracle 0 0 `shouldBe` Indeterminate (NearViewportEdge (AtView 0 0))
+
     it "does not report an empty viewport's edges, which draw nothing" $ do
       let oracle =
             mkOracle srgb8 [(h1, solid True red)] [offscreenPass noClear [mkView defaultCamera (Viewport (V2 0 0) (V2 0 8)) defaultViewSettings [world [sprite h1 (-4, -4) (8, 8)]]]]
