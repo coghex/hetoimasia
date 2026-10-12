@@ -11,14 +11,17 @@
 -- = What makes a frame wanted
 --
 -- The graphics owner hands each step the latest render demand the main thread
--- published and the latest scene any application thread published, each with
--- the revision of its publication. A target is asked for a frame — the GPU
--- model's 'requestRender', which is also what restarts the idle backoff — when
+-- published and the scene of every target, each with the revision of its
+-- publication: the one scene any application thread published, in a shared
+-- host, or the scene of the target's own window, in a per-window one. A target
+-- is asked for a frame — the GPU model's 'requestRender', which is also what
+-- restarts the idle backoff — when
 --
 -- * a demand publication it has not acted on is due: immediate, or with a
 --   deadline that has come (one still ahead is kept, and asked for when it
 --   comes);
--- * a scene publication it has not rendered arrives; or
+-- * a scene publication /for it/ it has not rendered arrives — in a per-window
+--   host a window's publication asks that window's target alone; or
 -- * a target that has shown a frame before can no longer be showing the
 --   latest one: its active swapchain generation is not the one its last
 --   presentation went to, or it has become eligible again after a suspension.
@@ -78,6 +81,11 @@
 -- | on, and a demand    | module    |                                    |        |                              | rise                         |
 -- | deadline ahead      |           |                                    |        |                              |                              |
 -- +---------------------+-----------+------------------------------------+--------+------------------------------+------------------------------+
+-- | The scene uses      | This      | Opened before a frame's renderer   | Owner  | A frame's recording until    | Removed when the frame's     |
+-- |                     | module    | runs; submitted, discharged and    |        | the batch it recorded is     | recording was discarded, or  |
+-- |                     |           | completed by the step; read by the |        | discarded or its submission  | its submission completed;    |
+-- |                     |           | scene ledger                       |        | has completed                | kept, uncertain, otherwise   |
+-- +---------------------+-----------+------------------------------------+--------+------------------------------+------------------------------+
 -- | The construction's  | This      | 'confined' keeps the first escaped | Owner  | The owner's run              | Cleared each time the        |
 -- | escape record       | module    | failure; an owner-thread action's  |        |                              | construction is lent         |
 -- |                     |           | runner reads it                    |        |                              |                              |
@@ -136,6 +144,7 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
   , StepPlan (..)
   , planStep
   , requestPublished
+  , sceneUsed
   , renderDue
   , settleCaptures
   , reclaimReleased
@@ -168,7 +177,10 @@ import Control.Exception
   , ExceptionWithContext (ExceptionWithContext)
   , SomeAsyncException
   , SomeException
+  , finally
   , fromException
+  , mask
+  , mask_
   , onException
   , rethrowIO
   , throwIO
@@ -244,7 +256,10 @@ import Hetoimasia.GPU.Vulkan.Native.Frames
   , withFramelessScope
   , presentFrame
   , progressFrames
+  , takeCompletedSubmissions
   , readFrameStandings
+  , enableCompletionLog
+  , readCompletedSubmissions
   , readPresentations
   , retireTargetFrames
   , skipFrame
@@ -262,7 +277,8 @@ import Hetoimasia.GPU.Vulkan.Native.Generations
 import Hetoimasia.GPU.Vulkan.Native.Presentation (GenerationPlan (..), SurfaceExtent, SurfaceFormat (..), imageUsageTransferSource)
 import Hetoimasia.GPU.Vulkan.Native.Profile (DevicePlan (..))
 import Hetoimasia.GPU.Vulkan.Native.Recording
-  ( Buffer
+  ( BatchView (..)
+  , Buffer
   , BufferDescription
   , ClearColor
   , FrameStorage
@@ -284,6 +300,7 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , RecordingOps
   , Refusal (..)
   , beginRendering
+  , readBatches
   , copyToReadback
   , createBuffer
   , createFrameStorage
@@ -851,6 +868,33 @@ data Rendering q inst msgr phys dev cmd = Rendering
     -- ^ Whether the host asked for a depth image with every generation
     -- (GRS-13). The generations were asked at construction; the recording
     -- supplies what makes the images when it is made ('live').
+  , renderingUses ∷ !(TVar (Map Natural SceneUse))
+    -- ^ Every frame recorded with a scene revision whose recording has not yet
+    -- been discarded and whose submission has not yet completed, by the serial
+    -- the use was opened under.
+  , renderingUseSerial ∷ !(TVar Natural)
+  }
+
+-- | One frame's recorded use of a scene revision: what keeps that revision from
+-- being released.
+--
+-- A use ends only with evidence that the frame's commands can no longer read
+-- what the scene references: its recording was discarded (the frame was
+-- skipped, which resets the recorder first), or the submission that carried
+-- it completed. A frame abandoned after its submission, a presentation that
+-- was refused or enqueued nothing, a timeout and the owner's retirement end
+-- nothing. A use whose discard or completion was never established stays, and
+-- so does the revision it names.
+data SceneUse = SceneUse
+  { useAttachment ∷ !AttachmentId
+  , useFrame ∷ !FrameSlotId
+    -- ^ The frame slot whose recording this is, so a teardown that discards
+    -- the recording can end the use.
+  , useRevision ∷ !Natural
+  , useSubmission ∷ !(Maybe SubmissionId)
+    -- ^ The submission that carried the frame, once there was one.
+  , useRecorded ∷ !Bool
+    -- ^ Whether the frame's recording has ended, however it did.
   }
 
 -- | Where the session's uploads stand.
@@ -885,6 +929,8 @@ newRendering roots generations ops observer captures uploads windowDepth =
     <*> newTVarIO Nothing
     <*> newTVarIO (maybe UploadsUnconfigured UploadsPending uploads)
     <*> pure windowDepth
+    <*> newTVarIO Map.empty
+    <*> newTVarIO 0
 
 -- | The recording and the frames, made the first time they are needed once
 -- the device exists, on the owner's thread, which is what makes it their
@@ -901,6 +947,8 @@ live rendering =
           recording ← newRecording ops (renderingRoots rendering) (renderingGenerations rendering)
           frames ← newFrames (renderingFrameOps (renderingOps rendering)) recording
           let made = Live recording frames
+          -- The scene uses read completions from the frames' log.
+          atomically (enableCompletionLog frames)
           -- The generations built from now on carry the depth image the host
           -- asked for (GRS-13).
           atomically $ do
@@ -929,7 +977,10 @@ instance Exception FrameStorageRefused
 -- | What one owner step hands the rendering.
 data StepInputs = StepInputs
   { inputsNow ∷ !Instant
-  , inputsSceneRevision ∷ !Natural
+  , inputsSceneRevisions ∷ !(Map AttachmentId Natural)
+    -- ^ The revision of the scene of every target the owner constructed: the
+    -- one shared scene's, for each, in a shared host, and the target's own
+    -- window's in a per-window one. A target absent from it has had none.
   , inputsDemand ∷ !OwnerDemand
   , inputsDemandRevision ∷ !Natural
   , inputsTargets ∷ ![(TargetId, AttachmentId, Bool)]
@@ -972,7 +1023,7 @@ planStep rendering inputs = do
           , came
               || attachment `elem` inputsCaptures inputs
               || (inputsDemandRevision inputs > targetDemandSeen record && demandDue)
-              || inputsSceneRevision inputs > targetSceneSeen record
+              || sceneRevisionOf attachment > targetSceneSeen record
               || ( isJust (targetShown record)
                      && eligible
                      && (not (targetEligible record) || movedTo record (lookup target views >>= id))
@@ -986,14 +1037,14 @@ planStep rendering inputs = do
     -- from a frame that could not be made.
     writeTVar (renderingTargets rendering) $
       foldl
-        ( \records (target, _, eligible) →
+        ( \records (target, attachment, eligible) →
             Map.alter
               ( Just
                   . ( \record →
                         record
                           { targetEligible = eligible
                           , targetDemandSeen = inputsDemandRevision inputs
-                          , targetSceneSeen = inputsSceneRevision inputs
+                          , targetSceneSeen = sceneRevisionOf attachment
                           , targetRetryAt = if target `elem` wanted then Nothing else targetRetryAt record
                           , targetAsked = if target `elem` wanted then (lookup target views >>= id) >>= viewActive else targetAsked record
                           }
@@ -1025,6 +1076,7 @@ planStep rendering inputs = do
   where
     now = inputsNow inputs
     demand = inputsDemand inputs
+    sceneRevisionOf attachment = Map.findWithDefault 0 attachment (inputsSceneRevisions inputs)
     -- Holds a demand deadline still ahead, once per publication, and answers
     -- whether a held one has come. One publication can carry both parts — two
     -- windows, one asking now and one by a later deadline — and each is kept:
@@ -1090,18 +1142,81 @@ pollDue now model = case progressDeadline model of
   TurnUnschedulable → True
   NoTurnNeeded → False
 
+-- | Whether any frame recorded with this revision of the scene, for this
+-- target's attachment, has a use that is not yet over.
+--
+-- Both kinds of evidence are explicit, durable and read from the layers that
+-- own the fact. A submitted frame's use is over when the frames' log holds the
+-- completion the model recorded for its submission, appended in the same
+-- transaction, so a step that raised or was cancelled afterwards leaves it; a
+-- submission an uncertain fence dropped, or the device's loss let go of, is not
+-- in the log. A frame that was never submitted has a use that is over when its
+-- recording has ended and the recording holds no unsubmitted batch of its
+-- frame — the batch was reset and dropped — and the device has not been lost,
+-- since after the loss a skip lets a recording go without resetting anything.
+sceneUsed ∷ Rendering q inst msgr phys dev cmd → AttachmentId → Natural → STM Bool
+sceneUsed rendering attachment revision = do
+  over ← useEvidence rendering
+  any (\use → useAttachment use == attachment && useRevision use == revision && not (over use)) . Map.elems <$> readTVar (renderingUses rendering)
+
+-- | Which uses the layers' durable evidence says are over.
+useEvidence ∷ Rendering q inst msgr phys dev cmd → STM (SceneUse → Bool)
+useEvidence rendering =
+  readTVar (renderingLive rendering) >>= \case
+    Nothing → pure (const False)
+    Just made → do
+      completed ← readCompletedSubmissions (liveFrames made)
+      lost ← deviceLossObserved <$> readRootsModel (renderingRoots rendering)
+      batches ← readBatches (liveRecording made)
+      -- A frame's recording is discarded only when the recording holds no batch
+      -- of it at all: a batch submitted and not yet dropped is not a discard.
+      let batchesOf frame = [() | view ← batches, viewBatchFrame view == Just frame]
+      pure $ \use → case useSubmission use of
+        Just submission → submission `elem` completed
+        Nothing → useRecorded use && not lost && null (batchesOf (useFrame use))
+
+-- | Take the completions the frames recorded and forget the uses the evidence
+-- says are over, so the table holds no more than the frames in flight and the
+-- uses that are uncertain.
+reconcileUses ∷ Rendering q inst msgr phys dev cmd → STM ()
+reconcileUses rendering =
+  readTVar (renderingLive rendering) >>= \case
+    Nothing → pure ()
+    Just made → do
+      over ← useEvidence rendering
+      modifyTVar' (renderingUses rendering) (Map.filter (not . over))
+      -- The log held what the filter just read; nothing in it names a use that
+      -- remains, as a use is associated with its submission before the step
+      -- that could complete it.
+      void (takeCompletedSubmissions (liveFrames made))
+
+-- | Open the use of a scene revision a frame is about to record.
+openUse ∷ Rendering q inst msgr phys dev cmd → AttachmentId → FrameSlotId → Natural → IO Natural
+openUse rendering attachment frame revision = atomically $ do
+  serial ← stateTVar (renderingUseSerial rendering) (\at → (at, at + 1))
+  modifyTVar' (renderingUses rendering) (Map.insert serial (SceneUse attachment frame revision Nothing False))
+  pure serial
+
 -- | Ask the fences, once, and report what was observed.
 poll ∷ Rendering q inst msgr phys dev cmd → Instant → IO ()
 poll rendering now =
   readTVarIO (renderingLive rendering) >>= \case
     Nothing → pure ()
     Just made → do
-      progress ← progressFrames (liveFrames made) now
+      -- A submission's completion is the evidence that ends the uses of the
+      -- scene revisions its frames recorded. It is read from the frames'
+      -- state, which records a completion before the step can raise for another
+      -- presentation or cleanup, or be cancelled, so it is reconciled however
+      -- the step ends.
+      progress ← progressFrames (liveFrames made) now `onException` atomically (reconcileUses rendering)
+      atomically (reconcileUses rendering)
       for_ (progressCompleted progress) (renderingObserver rendering . SubmissionCompleted)
       for_ (progressRetired progress) (renderingObserver rendering . PresentationRetired)
 
--- | Offer each due target one frame of the scene. Answers whether any frame
--- was presented.
+-- | Offer each due target one frame of its scene, as the owner adopted it for
+-- that target: the scene and the revision of its publication, which the
+-- caller looks up by the target's attachment. Answers whether any frame was
+-- presented.
 --
 -- A frame acquired for a target whose attachment has a verification capture
 -- outstanding is that capture's frame, whatever becomes of it. Its commands
@@ -1115,11 +1230,10 @@ renderDue
   ∷ Rendering q inst msgr phys dev cmd
   → VulkanRenderer scene
   → Instant
-  → scene
-  → Natural
+  → (AttachmentId → Maybe (scene, Natural))
   → [(TargetId, AttachmentId)]
   → IO Bool
-renderDue rendering renderer now scene revision due =
+renderDue rendering renderer now sceneOf due =
   if null due
     then pure False
     else
@@ -1133,7 +1247,12 @@ renderDue rendering renderer now scene revision due =
       ready ← storagesFor made target
       if not ready
         then False <$ retryAfterPending target
-        else do
+        else case sceneOf attachment of
+         -- A target that has adopted no scene is not rendered: the step
+         -- adopts before it renders, so this is only a target the owner did
+         -- not hand a scene.
+         Nothing → False <$ retryAfterPending target
+         Just (scene, revision) → do
           -- The request this frame will be for is the one outstanding before
           -- it is asked for: one admitted while the acquisition is under way
           -- is the next frame's.
@@ -1151,10 +1270,10 @@ renderDue rendering renderer now scene revision due =
               observe (FrameAcquired attachment (ownedFrame owned) (ownedImage owned))
               described ← describeImage made target (ownedImage owned)
               case described of
-                Nothing → False <$ abandon made attachment owned (Captured asked Nothing) "its generation is no longer tracked, or has no depth image the session asked for"
+                Nothing → False <$ abandon made attachment owned (Captured asked Nothing) Nothing "its generation is no longer tracked, or has no depth image the session asked for"
                 Just image → do
                   capture ← if asked then prepareCapture made attachment owned image else pure (Captured False Nothing)
-                  recordOne made target attachment owned image capture
+                  recordOne made target attachment owned image capture scene revision
             Right (AcquisitionPending reason) → do
               observe (FramePending attachment reason)
               False <$ retryAfterPending target
@@ -1202,7 +1321,7 @@ renderDue rendering renderer now scene revision due =
             Left refusal → Captured False Nothing <$ withhold attachment (WithheldNoReadback refusal)
             Right readback → pure (Captured True (Just (readback, bytes)))
     withhold attachment reason = atomically (settleCapture captures attachment (CaptureWithheld attachment reason))
-    recordOne made target attachment owned image capture = do
+    recordOne made target attachment owned image capture scene revision = do
       let request = FrameRequest attachment target (ownedFrame owned) (ownedImage owned) (imageExtent image) (imageFormat image) revision (imageDepth image)
           construction = construct rendering made
           finish recorder = case capturedWork capture of
@@ -1211,23 +1330,46 @@ renderDue rendering renderer now scene revision due =
               transitionImage recorder LayoutColorAttachment LayoutTransferSource
                 `andThen` copyToReadback recorder readback
                 `andThen` transitionImage recorder LayoutTransferSource LayoutPresentSource
-      recorded ←
-        recordFrame (liveRecording made) (ownedFrame owned) (\recorder →
-          transitionImage recorder LayoutUndefined LayoutColorAttachment
-            `andThen` renderScene renderer scene request construction recorder
-            `andThen` finish recorder)
-          `onException` giveUp made attachment owned capture "its recording raised"
+      -- The use is opened before the renderer can record anything, so that no
+      -- way the recording ends leaves a frame that read the scene unrecorded,
+      -- and its opening and the handler that marks the recording ended are
+      -- installed in one masked step, so no cancellation lands between them.
+      -- Only the recording itself is restored to the owner's own state.
+      (use, recorded) ← mask $ \restore → do
+        opened ← openUse rendering attachment (ownedFrame owned) revision
+        ended ←
+          restore
+            ( recordFrame (liveRecording made) (ownedFrame owned) (\recorder →
+                transitionImage recorder LayoutUndefined LayoutColorAttachment
+                  `andThen` renderScene renderer scene request construction recorder
+                  `andThen` finish recorder)
+                `onException` giveUp made attachment owned capture "its recording raised"
+            )
+            `finally` atomically (modifyTVar' (renderingUses rendering) (Map.adjust (\held → held {useRecorded = True}) opened))
+        pure (opened, ended)
       case recorded of
         Right (batch, Right ()) →
-          submitFrames (liveFrames made) (batch :| []) >>= \case
+          -- The submission and the use's record of it are one masked step, so
+          -- no cancellation leaves a frame the device has been given with a use
+          -- that says it was never submitted.
+          mask_
+            ( submitFrames (liveFrames made) (batch :| []) >>= \answer → do
+                case answer of
+                  Right (SubmittedAs submission) → atomically (modifyTVar' (renderingUses rendering) (Map.adjust (\held → held {useSubmission = Just submission}) use))
+                  _ → pure ()
+                pure answer
+            )
+            >>= \case
             Right (SubmittedAs submission) → do
+              -- From here the frame's commands are the device's, and only the
+              -- submission's completion ends the use.
               observe (FrameSubmitted attachment (ownedFrame owned) submission)
-              present made target attachment owned image capture
-            Right (SubmittedNothing reason) → False <$ abandon made attachment owned capture ("its submission had no effect: " <> reason)
-            Left refusal → False <$ abandon made attachment owned capture ("its submission was refused: " <> tshow refusal)
-        Right (_, Left refusal) → False <$ abandon made attachment owned capture ("the renderer refused: " <> tshow refusal)
-        Left refusal → False <$ abandon made attachment owned capture ("its recording was refused: " <> tshow refusal)
-    present made target attachment owned image capture = do
+              present made target attachment owned image capture revision
+            Right (SubmittedNothing reason) → False <$ abandon made attachment owned capture (Just use) ("its submission had no effect: " <> reason)
+            Left refusal → False <$ abandon made attachment owned capture (Just use) ("its submission was refused: " <> tshow refusal)
+        Right (_, Left refusal) → False <$ abandon made attachment owned capture (Just use) ("the renderer refused: " <> tshow refusal)
+        Left refusal → False <$ abandon made attachment owned capture (Just use) ("its recording was refused: " <> tshow refusal)
+    present made target attachment owned image capture revision = do
       observe (FramePresentRequested attachment (ownedFrame owned) (ownedImage owned) revision)
       presentFrame (liveFrames made) (ownedFrame owned) >>= \case
         Right (PresentedAs presentation outcome) → do
@@ -1264,7 +1406,9 @@ renderDue rendering renderer now scene revision due =
     -- A frame given up after its acquisition leaves the target's render
     -- demand standing: the frame is tried again at the backoff's first
     -- interval, as a pending acquisition is, never on every round.
-    abandon made attachment owned capture reason = do
+    abandon made attachment owned capture _ reason = do
+      -- Skipping resets the frame's recorder before it discharges the batch's
+      -- references; the use ends on the recording's own state, not on this answer.
       _ ← skipFrame (liveFrames made) (ownedFrame owned)
       observe (FrameAbandoned attachment (ownedFrame owned) reason)
       giveUp made attachment owned capture reason
@@ -1416,6 +1560,9 @@ prepareTargetRetirement rendering now target =
             Admitted next → ((), next)
             _ → ((), model)
       void (closeTargetFrames (liveFrames made) target)
+      -- A frame skipped here resets its recording, which the uses read from the
+      -- recording's own state.
+      atomically (reconcileUses rendering)
       model ← atomically (readRootsModel (renderingRoots rendering))
       if deviceLossObserved model
         then pure (Nothing, [])

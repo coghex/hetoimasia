@@ -42,6 +42,7 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , declareUnsupported
   , StandInFailure (..)
   , StandInLoss (..)
+  , StandInNotPresented (..)
   , StandInSurfaceLost (..)
   , injectedMessageId
   , reportErrorNow
@@ -70,6 +71,11 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , keepPresentationsOf
   , stallSwapchain
   , raiseOnPresent
+  , loseWhileRecording
+  , CancelPoint (..)
+  , cancelOwnerAt
+  , cancelOwnerNow'
+  , ownerCancelled
   , suboptimalWhileStale
   , swapchainsCreated
   , refuseFrames
@@ -95,6 +101,10 @@ module Test.GPU.Vulkan.GLFW.StandIn
     -- * The rig
   , Rig (..)
   , Scene
+  , SceneEvent (..)
+  , sceneEvents
+  , sceneRounds
+  , withPerWindowScenes
   , newRig
   , newRigOf
   , surfaceFreeRig
@@ -131,7 +141,8 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , awaitTerminal
   ) where
 
-import Control.Concurrent (ThreadId, myThreadId)
+import Control.Concurrent (ThreadId, forkIO, myThreadId, throwTo, yield)
+import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (..), threadStatus)
 import Control.Concurrent.STM
   ( STM
   , TVar
@@ -147,7 +158,7 @@ import Control.Concurrent.STM
   , stateTVar
   , writeTVar
   )
-import Control.Exception (Exception, ExceptionWithContext (ExceptionWithContext), SomeAsyncException, SomeException, fromException, mask, rethrowIO, throwIO, try, tryWithContext, uninterruptibleMask_)
+import Control.Exception (ErrorCall (ErrorCall), Exception, ExceptionWithContext (ExceptionWithContext), SomeAsyncException, SomeException, fromException, mask, rethrowIO, throwIO, try, tryWithContext, uninterruptibleMask_)
 import Control.Monad (void, when)
 import Control.Monad.IO.Class (liftIO)
 import Data.ByteString (ByteString)
@@ -225,6 +236,7 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , Readiness (..)
   , ControllerHooks (..)
   , VulkanDeviceStart (..)
+  , SceneLifecycle (..)
   , defaultActionCapacity
   , handOverVulkanTarget
   , readReadiness
@@ -268,6 +280,7 @@ import Hetoimasia.Runtime.GLFW
   , GraphicsService
   , HostConfig (..)
   , LoopHooks (..)
+  , SceneMode (..)
   , TargetStanding (..)
   , OwnerStatus (..)
   , readOwnerStatusNow
@@ -437,6 +450,14 @@ newtype StandInLoss = StandInLoss Text
   deriving (Eq, Show)
 
 instance Exception StandInLoss
+
+-- | A presentation that raised and enqueued nothing, which the frames' layer
+-- classifies as a specified no-effect failure when the swapchain's entry says
+-- out of memory ('raiseOnPresent', 'scriptPresentStatus').
+data StandInNotPresented = StandInNotPresented
+  deriving (Show)
+
+instance Exception StandInNotPresented
 
 data Native = Native
   { nativeScript ∷ !(TVar (Map Step Scripted))
@@ -907,7 +928,45 @@ data Rendering = Rendering
   , renderingKindBuffers ∷ !(TVar (Set Word64))
     -- ^ The live buffers of the engine's kinds (GRS-2), as against readback
     -- buffers.
+  , renderingRecordLoss ∷ !(TVar Bool)
+    -- ^ Whether beginning a command buffer reports the device lost.
+  , renderingCancelAt ∷ !(TVar (Maybe CancelPoint))
+    -- ^ Where the graphics owner is cancelled, once, from another thread.
+  , renderingCancelled ∷ !(TVar Bool)
+    -- ^ Whether that cancellation has been thrown.
   }
+
+-- | Where a rig cancels the graphics owner.
+data CancelPoint
+  = CancelAfterSubmit
+    -- ^ Inside the native submission, so it lands when the frames' masked
+    -- step has recorded the submission.
+  | CancelAfterCompletion
+    -- ^ Inside the query of a submission's fence that proved it complete, so
+    -- it lands when the frames' masked step has recorded the completion.
+  deriving (Eq, Show)
+
+-- | Throw the cancellation, if it is armed for this point, from a thread of its
+-- own, and wait until it is blocked on its delivery or delivered: a thread
+-- inside a masked step is not interrupted until the step ends, so what this
+-- tests is that the step's bookkeeping finishes first.
+cancelAt ∷ Rendering → CancelPoint → IO ()
+cancelAt rendering point = do
+  armed ← atomically (stateTVar (renderingCancelAt rendering) (\held → (held == Just point, if held == Just point then Nothing else held)))
+  when armed (cancelOwnerNow rendering)
+
+cancelOwnerNow ∷ Rendering → IO ()
+cancelOwnerNow rendering = do
+  owner ← myThreadId
+  thrower ← forkIO (throwTo owner (ErrorCall "the owner was cancelled"))
+  atomically (writeTVar (renderingCancelled rendering) True)
+  let settled =
+        threadStatus thrower >>= \case
+          ThreadBlocked BlockedOnException → pure ()
+          ThreadFinished → pure ()
+          ThreadDied → pure ()
+          _ → yield >> settled
+  settled
 
 -- | A managed object the recording's layer creates, or the recording's layer
 -- itself, made from the session's physical device when the recording is first
@@ -945,6 +1004,9 @@ newRendering =
     <*> newTVarIO False
     <*> newTVarIO Set.empty
     <*> newTVarIO Set.empty
+    <*> newTVarIO False
+    <*> newTVarIO Nothing
+    <*> newTVarIO False
 
 -- | Whether a submission's fence answers signalled when it is next asked.
 submissionsComplete ∷ Rig → Bool → IO ()
@@ -986,6 +1048,23 @@ keepPresentationsOf rig swapchain kept =
 -- | Answer not ready to every later acquisition from this swapchain.
 stallSwapchain ∷ Rig → Word64 → IO ()
 stallSwapchain rig swapchain = atomically (modifyTVar' (renderingStalled (rigRendering rig)) (Set.insert swapchain))
+
+-- | Have every later beginning of a command buffer report the device lost, as
+-- a loss during a frame's recording does.
+loseWhileRecording ∷ Rig → IO ()
+loseWhileRecording rig = atomically (writeTVar (renderingRecordLoss (rigRendering rig)) True)
+
+-- | Cancel the graphics owner, once, at this point of a frame's life.
+cancelOwnerAt ∷ Rig → CancelPoint → IO ()
+cancelOwnerAt rig point = atomically (writeTVar (renderingCancelAt (rigRendering rig)) (Just point))
+
+-- | Cancel the graphics owner now, from its own thread (a frame observer's, say).
+cancelOwnerNow' ∷ Rig → IO ()
+cancelOwnerNow' = cancelOwnerNow . rigRendering
+
+-- | Whether the cancellation has been thrown.
+ownerCancelled ∷ Rig → STM Bool
+ownerCancelled = readTVar . renderingCancelled . rigRendering
 
 -- | Have the next presentation raise this, once, after writing its entry.
 raiseOnPresent ∷ Rig → SomeException → IO ()
@@ -1155,7 +1234,9 @@ renderingLayers rescued events rendering clock =
         , opsDestroyStorage = \_ _ → pure ()
         , opsReadMapped = \_ _ size → pure (ByteString.replicate (fromIntegral size) readbackByte)
         , opsWriteMapped = \_ _ _ → pure ()
-        , opsBeginCommands = \_ → pure ()
+        , opsBeginCommands = \_ →
+            readTVarIO (renderingRecordLoss rendering) >>= \losing →
+              when losing (throwIO (StandInLoss "vkBeginCommandBuffer"))
         , opsEndCommands = \_ → pure ()
         , opsRecord = \buffer command → record events (CommandRecorded buffer command)
         , opsCommandBufferHandle = id
@@ -1188,7 +1269,8 @@ renderingLayers rescued events rendering clock =
         , opsFenceSignalled = \_ handle → do
             record events (FenceQueried handle)
             slow
-            atomically $ do
+            kindBefore ← Map.lookup handle <$> readTVarIO (renderingFences rendering)
+            answer ← atomically $ do
               kind ← Map.lookup handle <$> readTVar (renderingFences rendering)
               submissions ← readTVar (renderingSubmissions rendering)
               presentations ← readTVar (renderingPresentations rendering)
@@ -1209,6 +1291,10 @@ renderingLayers rescued events rendering clock =
                     modifyTVar' (renderingBusy rendering) (Map.adjust (Set.delete index) swapchain)
                   pure True
                 _ → pure False
+            -- A submission's completion has been recorded: the cancellation, if
+            -- armed for this point, lands once the call's masked step ends.
+            when (answer && kindBefore == Just FenceSubmission) (cancelAt rendering CancelAfterCompletion)
+            pure answer
         , opsAcquireImage = \_ swapchain _ → do
             readTVarIO (renderingHold rendering) >>= \case
               Nothing → pure ()
@@ -1228,7 +1314,8 @@ renderingLayers rescued events rendering clock =
         , opsSubmit = \_ _ _ handle → do
             fence handle FenceSubmission
             record events (QueueSubmitted handle)
-        , opsNoEffect = const False
+            cancelAt rendering CancelAfterSubmit
+        , opsNoEffect = \failure → isJust (fromException failure ∷ Maybe StandInNotPresented)
         , opsReleaseImages = \_ swapchain indices → do
             atomically (modifyTVar' (renderingBusy rendering) (Map.adjust (\held → foldr Set.delete held indices) swapchain))
             record events (ImageReleased swapchain indices)
@@ -1272,7 +1359,14 @@ millisecondsOf milliseconds = either (error . show) id (durationFromNanoseconds 
 -- ---------------------------------------------------------------------------
 -- The rig
 
-type Scene = ()
+type Scene = Int
+
+-- | What the host's scene lifecycle told its renderer, oldest first, on the
+-- owner's thread.
+data SceneEvent
+  = SceneAdopted !WindowId !Natural !Scene
+  | SceneReleased !WindowId !Natural
+  deriving (Eq, Show)
 
 -- | Everything an example needs to run one Vulkan graphics host.
 data Rig = Rig
@@ -1347,6 +1441,13 @@ data Rig = Rig
     -- ^ The session the host was given, once it has been made: what a direct
     -- command host is built over, as an application that supplies its own
     -- session to 'Hetoimasia.Runtime.GLFW.withGraphicsOwnerHostIn' holds it.
+  , rigSceneMode ∷ !SceneMode
+    -- ^ Whether the host carries one scene or one for each window.
+  , rigSceneEvents ∷ !(TVar [SceneEvent])
+    -- ^ Every adoption and release the host's lifecycle reported.
+  , rigSceneRounds ∷ !(TVar [Natural])
+    -- ^ For each of them, the owner's completed rounds when it was reported:
+    -- the round that reported it is the next one.
   }
 
 -- | Make the capture's sink raise on every record it is given from now on.
@@ -1377,6 +1478,20 @@ surfaceFreeRig count = (\rig → rig {rigDeviceStart = DeviceSurfaceFree}) <$> n
 -- | The same rig with this many owner-thread actions queued at once.
 withActionCapacity ∷ Natural → Rig → Rig
 withActionCapacity capacity rig = rig {rigActionCapacity = capacity}
+
+-- | The same rig with a scene for each window.
+withPerWindowScenes ∷ Rig → Rig
+withPerWindowScenes rig = rig {rigSceneMode = PerWindowScenes}
+
+-- | Every adoption and release the host's lifecycle reported, oldest first.
+sceneEvents ∷ Rig → IO [SceneEvent]
+sceneEvents = readTVarIO . rigSceneEvents
+
+-- | For each of 'sceneEvents', the owner's completed rounds when it was
+-- reported, so an example can wait for the round that reported the latest to
+-- end, which never waits for a round that is not coming.
+sceneRounds ∷ Rig → IO [Natural]
+sceneRounds = readTVarIO . rigSceneRounds
 
 -- | The same rig with the session's uploads configured (GRS-6).
 withUploads ∷ UploadConfig → Rig → Rig
@@ -1588,6 +1703,8 @@ newRigClocked visible windows clock = do
   presentRounds' ← newTVarIO []
   armings ← newTVarIO []
   armHook ← newTVarIO Nothing
+  sceneLog ← newTVarIO []
+  sceneRoundLog ← newTVarIO []
   let defaults = (defaultHostConfig windows) {hostIdleWait = 0.005}
   pure
     Rig
@@ -1625,6 +1742,9 @@ newRigClocked visible windows clock = do
       , rigUploads = Nothing
       , rigWindowDepth = False
       , rigSession = session
+      , rigSceneMode = SharedScene
+      , rigSceneEvents = sceneLog
+      , rigSceneRounds = sceneRoundLog
       }
 
 -- | Run a whole Vulkan graphics host under the application runner, on a bound
@@ -1645,7 +1765,7 @@ runRigCaught rig body = asProcessMainThread (rigSeam rig) (try (runRigHere rig b
 runRigHere ∷ Rig → (VulkanHost Scene → RuntimeControl → IO a) → IO a
 runRigHere rig body = myThreadId >>= \self → withBoundThread (rigBound rig) self $ do
   integration ← seamIntegration (rigSeam rig) defaultIntegrationScript
-  scene ← prepare ()
+  scene ← prepare 0
   budgets ← either (throwIO . StandInFailure . Text.pack . show) pure (validateBudgets (rigBudgets rig))
   let base = vulkanHostConfig (rigHostConfig rig) (rigCapture rig) budgets scene
       config =
@@ -1660,6 +1780,12 @@ runRigHere rig body = myThreadId >>= \self → withBoundThread (rigBound rig) se
           , vulkanActionCapacity = rigActionCapacity rig
           , vulkanUploads = rigUploads rig
           , vulkanWindowDepth = rigWindowDepth rig
+          , vulkanSceneMode = rigSceneMode rig
+          , vulkanSceneLifecycle =
+              SceneLifecycle
+                { sceneAdopted = \window revision adopted → reportScene (SceneAdopted window revision adopted)
+                , sceneReleased = \window revision → reportScene (SceneReleased window revision)
+                }
           , vulkanFrameObserver = \event → do
               atomically $ do
                 modifyTVar' (rigFrameEvents rig) (<> [event])
@@ -1671,6 +1797,11 @@ runRigHere rig body = myThreadId >>= \self → withBoundThread (rigBound rig) se
                   _ → pure ()
               readTVarIO (rigFrameHook rig) >>= ($ event)
           }
+      reportScene event = atomically $ do
+        modifyTVar' (rigSceneEvents rig) (<> [event])
+        owner <- readTVar (rigOwner rig)
+        rounds <- maybe (pure 0) (fmap statusRounds . readOwnerStatusNow) owner
+        modifyTVar' (rigSceneRounds rig) (<> [rounds])
       timed owner = case rigClock rig of
         Nothing → owner
         Just cell →

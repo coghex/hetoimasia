@@ -20,23 +20,35 @@ module Hetoimasia.Runtime.GLFW.Internal.Owner.Observation
   , ownerTargetAcknowledgement
   , awaitOwnerRound
   , readOwnerDemandTaken
+  , publishGraphicsWindowScene
+  , readGraphicsSceneRevisions
+  , pruneWindowScenes
   ) where
 
 import Control.Concurrent.STM (STM, check, readTVar)
 import Control.Exception (ExceptionWithContext, SomeException)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
+import Hetoimasia.Foundation.Messaging.Payload (Prepared)
 import Hetoimasia.Foundation.Worker (Worker)
 import Hetoimasia.GLFW.Internal.Attachment (Acknowledgement, AttachmentId)
+import Hetoimasia.GLFW.Window (WindowId)
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Custody (custodyAcknowledgementOf)
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Handoff
   ( OwnerHandoff
   , OwnerStatus (statusRounds)
   , OwnerTerminal (ownerRunEnded)
   , TargetGeometry
+  , SceneMode (..)
   , TerminalRecord
+  , WindowScenePublication
+  , handoffSceneMode
   , ownerTerminal
+  , publishOwnerWindowScene
+  , pruneOwnerWindowScenes
   , readOwnerDemandAt
+  , readOwnerSceneAt
+  , readOwnerWindowSceneAt
   , readOwnerStatus
   , targetTerminals
   )
@@ -135,3 +147,37 @@ readOwnerDemandTaken owner = do
   (_, published) ← readOwnerDemandAt (ownerHandoff' owner)
   (seen, _) ← readTVar (ownerSeenInputs owner)
   pure (seen >= published)
+
+-- | Publish one window's scene, from any application thread, in a handoff that
+-- carries one for each window.
+--
+-- The windows the host holds are read in the same transaction as the
+-- publication, so a window that ends is never accepted a scene after the
+-- transaction that saw it end. A window the host does not hold is answered
+-- 'Hetoimasia.Runtime.GLFW.Internal.Owner.Handoff.WindowSceneUnknown', naming
+-- it, and nothing changes. See
+-- 'Hetoimasia.Runtime.GLFW.Internal.Owner.Handoff.publishOwnerWindowScene'.
+publishGraphicsWindowScene ∷ GraphicsOwner scene → WindowId → Prepared scene → STM WindowScenePublication
+publishGraphicsWindowScene owner window scene = do
+  held ← ownerWindows owner
+  publishOwnerWindowScene (ownerHandoff' owner) held window scene
+
+-- | The latest published scene revision of every window the host holds, in one
+-- transaction: a window's own, or zero for one that has had no publication.
+-- In a shared handoff the shared scene's revision plays the part of every
+-- window's.
+readGraphicsSceneRevisions ∷ GraphicsOwner scene → STM (Map WindowId Natural)
+readGraphicsSceneRevisions owner = do
+  held ← ownerWindows owner
+  let handoff = ownerHandoff' owner
+  revisions ← case handoffSceneMode handoff of
+    SharedScene → (\(_, revision) → map (\window → (window, revision)) held) <$> readOwnerSceneAt handoff
+    PerWindowScenes → traverse (\window → (\(_, revision) → (window, revision)) <$> readOwnerWindowSceneAt handoff window) held
+  pure (Map.fromList revisions)
+
+-- | Forget the publication of every window the host no longer holds. The
+-- owner's round does it; nothing else writes the table.
+pruneWindowScenes ∷ GraphicsOwner scene → STM ()
+pruneWindowScenes owner = do
+  held ← ownerWindows owner
+  pruneOwnerWindowScenes (ownerHandoff' owner) held

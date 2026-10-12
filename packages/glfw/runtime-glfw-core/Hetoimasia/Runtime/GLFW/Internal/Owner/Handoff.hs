@@ -20,8 +20,9 @@
 -- +--------------------------+-----------------+------------------------------+
 -- | Render demand            | main → owner    | one latest-value snapshot    |
 -- +--------------------------+-----------------+------------------------------+
--- | Scene                    | any application | one latest-value snapshot    |
--- |                          | thread → owner  |                              |
+-- | Scene                    | any application | one latest-value snapshot,   |
+-- |                          | thread → owner  | or one per window            |
+-- |                          |                 | ('SceneMode')                |
 -- +--------------------------+-----------------+------------------------------+
 -- | Progress and the next    | owner → main    | one coalescing status cell   |
 -- | deadline                 |                 | ('OwnerStatus')              |
@@ -68,6 +69,11 @@
 -- | The demand and scene | The owner        | Main thread, and any            | Any    | The owner's lifetime | Closed by the exit          |
 -- | snapshots            | handoff state    | application thread, publish     |        |                      |                             |
 -- +----------------------+------------------+---------------------------------+--------+----------------------+-----------------------------+
+-- | A window's scene     | The owner        | Any application thread          | Any    | From the window's    | Pruned by the owner's round |
+-- | snapshot (per-window | handoff state    | publishes; the graphics owner   |        | first publication    | once the host no longer     |
+-- | mode)                |                  | reads and prunes                |        | until the host       | holds the window; closed    |
+-- |                      |                  |                                 |        | retires the window   | by the exit                 |
+-- +----------------------+------------------+---------------------------------+--------+----------------------+-----------------------------+
 -- | The status cell      | The owner        | The graphics owner writes; any  | Any    | The owner's lifetime | Never reopened once the     |
 -- |                      | handoff state    | thread reads                    |        |                      | owner has finished          |
 -- +----------------------+------------------+---------------------------------+--------+----------------------+-----------------------------+
@@ -110,10 +116,18 @@ module Hetoimasia.Runtime.GLFW.Internal.Owner.Handoff
   , readOwnerDemandAt
 
     -- * Any application thread to owner: the scene
+  , SceneMode (..)
+  , handoffSceneMode
   , ScenePublication (..)
   , publishOwnerScene
   , readOwnerScene
   , readOwnerSceneAt
+  , WindowScenePublication (..)
+  , publishOwnerWindowScene
+  , readOwnerWindowSceneAt
+  , readOwnerWindowScenes
+  , pruneOwnerWindowScenes
+  , ownerSceneStamp
 
     -- * Owner to main thread: replaceable status
   , OwnerStatus (..)
@@ -197,6 +211,7 @@ import Hetoimasia.GLFW.Internal.Attachment (Acknowledgement, AttachmentId, Retir
 import Hetoimasia.GLFW.Window
   ( Attribute (..)
   , Extent (..)
+  , WindowId
   , WindowObservation
   , observedFramebufferExtent
   )
@@ -413,6 +428,17 @@ data OwnerHandoff scene = OwnerHandoff
   , handoffLimit' ∷ !Int
   , handoffDemand ∷ !(SnapshotPublisher OwnerDemand)
   , handoffScene ∷ !(SnapshotPublisher scene)
+  , handoffSceneMode' ∷ !SceneMode
+  , handoffInitialScene ∷ !(Prepared scene)
+    -- ^ The scene every window starts with in per-window mode, at revision 0.
+  , handoffWindowScenes ∷ !(TVar (Map WindowId (WindowSceneCell scene)))
+    -- ^ The latest publication of each window that has had one. A window
+    -- absent from it holds the initial scene at revision 0.
+  , handoffSceneStamp ∷ !(TVar Natural)
+    -- ^ How many window publications have been accepted, which only rises. It
+    -- is the revision the owner's wait compares in per-window mode, where no
+    -- single snapshot's revision says that any window published.
+  , handoffScenesOpen ∷ !(TVar Bool)
   , handoffStatus ∷ !(TVar OwnerStatus)
   , handoffTargetTerminals ∷ !(TVar (Map AttachmentId TerminalRecord))
   , handoffOwnerTerminal ∷ !(TVar OwnerTerminal)
@@ -428,8 +454,8 @@ data OwnerHandoff scene = OwnerHandoff
 -- lifetime port, so the whole handoff is bounded by configuration and by
 -- nothing that grows with how long the owner runs or with how many targets it
 -- has ever held.
-newOwnerHandoff ∷ Int → Int → Prepared scene → IO (OwnerHandoff scene)
-newOwnerHandoff limit capacity scene = do
+newOwnerHandoff ∷ Int → Int → SceneMode → Prepared scene → IO (OwnerHandoff scene)
+newOwnerHandoff limit capacity mode scene = do
   events ← newChannel (fromIntegral (max 1 capacity))
   demand ← prepare noOwnerDemand >>= newSnapshot
   OwnerHandoff events (channelSender events)
@@ -437,6 +463,11 @@ newOwnerHandoff limit capacity scene = do
     <*> pure (max 1 limit)
     <*> pure demand
     <*> newSnapshot scene
+    <*> pure mode
+    <*> pure scene
+    <*> newTVarIO Map.empty
+    <*> newTVarIO 0
+    <*> newTVarIO True
     <*> newTVarIO initialOwnerStatus
     <*> newTVarIO Map.empty
     <*> newTVarIO noOwnerTerminal
@@ -495,6 +526,7 @@ closeOwnerPublications handoff = do
   closeTargetEvents handoff
   closeSnapshot (handoffDemand handoff)
   closeSnapshot (handoffScene handoff)
+  writeTVar (handoffScenesOpen handoff) False
   slots ← readTVar (handoffSlots handoff)
   mapM_ (closeSnapshot . slotSnapshot) (Map.elems slots)
 
@@ -583,8 +615,29 @@ readOwnerDemandAt handoff = do
   observed ← readSnapshot (snapshotReader (handoffDemand handoff))
   pure (preparedValue (observedValue observed), cursorRevision (observedCursor observed))
 
+-- | Whether the owner renders one scene for the whole owner or one for each
+-- window. A host's configuration chooses, once, and it does not change.
+data SceneMode
+  = SharedScene
+    -- ^ One latest-value snapshot for every target, as the owner has always
+    -- had. 'publishOwnerScene' publishes it, and a newer one is rendered to
+    -- every eligible target.
+  | PerWindowScenes
+    -- ^ One latest-value snapshot for each window, keyed by the window's
+    -- identity ('publishOwnerWindowScene'). 'publishOwnerScene' is refused: no
+    -- scene is shared.
+  deriving (Eq, Show)
+
+-- | The mode this handoff was built for.
+handoffSceneMode ∷ OwnerHandoff scene → SceneMode
+handoffSceneMode = handoffSceneMode'
+
 -- | What one scene publication did.
-newtype ScenePublication = ScenePublication Publication
+data ScenePublication
+  = ScenePublication !Publication
+  | SceneRefusedPerWindow
+    -- ^ The handoff carries one scene for each window, so a scene for the
+    -- whole owner is refused. Nothing was published.
   deriving (Eq, Show)
 
 -- | Publish the scene the owner renders, from any application thread.
@@ -593,8 +646,12 @@ newtype ScenePublication = ScenePublication Publication
 -- faster than the owner consumes them replaces its own last one and never
 -- waits, and a main thread stalled in a platform modal loop publishes nothing
 -- without keeping the owner from rendering the last coherent scene it holds.
+--
+-- In 'PerWindowScenes' mode it is refused, and changes nothing.
 publishOwnerScene ∷ OwnerHandoff scene → Prepared scene → STM ScenePublication
-publishOwnerScene handoff = fmap ScenePublication . publish (handoffScene handoff)
+publishOwnerScene handoff scene = case handoffSceneMode' handoff of
+  PerWindowScenes → pure SceneRefusedPerWindow
+  SharedScene → ScenePublication <$> publish (handoffScene handoff) scene
 
 readOwnerScene ∷ OwnerHandoff scene → STM scene
 readOwnerScene = fmap fst . readOwnerSceneAt
@@ -604,6 +661,91 @@ readOwnerSceneAt ∷ OwnerHandoff scene → STM (scene, Natural)
 readOwnerSceneAt handoff = do
   observed ← readSnapshot (snapshotReader (handoffScene handoff))
   pure (preparedValue (observedValue observed), cursorRevision (observedCursor observed))
+
+-- | One window's latest publication.
+data WindowSceneCell scene = WindowSceneCell !(Prepared scene) !Natural
+
+-- | What one publication of a window's scene did.
+data WindowScenePublication
+  = WindowScenePublished !WindowId !Natural
+    -- ^ Accepted: this window's scene is now at this revision. Revisions rise
+    -- by one for each accepted publication, independently for each window.
+  | WindowSceneUnknown !WindowId
+    -- ^ The host holds no such window: it was never created, or it has ended.
+    -- Nothing changed.
+  | WindowSceneClosed !WindowId
+    -- ^ The owner's publications have ended with the owner's exit. Nothing
+    -- changed.
+  | WindowScenesNotEnabled !WindowId
+    -- ^ The handoff carries one scene for the whole owner. Nothing changed.
+  deriving (Eq, Show)
+
+-- | Publish one window's scene, from any application thread, given the
+-- windows the host holds, read in the same transaction.
+--
+-- It is a latest-value snapshot per window: it never waits, and it replaces
+-- that window's publication if the owner has not taken it. Each window's
+-- revisions rise independently, the first publication being revision 1 after
+-- the initial scene's revision 0. A window the host does not hold is answered
+-- 'WindowSceneUnknown', naming it, and nothing changes. The publication is
+-- keyed by the window and not by an attachment, so it survives the window's
+-- surface being recreated under a new attachment incarnation. An accepted
+-- publication forgets the publications of every window the supplied list does
+-- not hold, so the table is bounded by the host's windows without waiting for
+-- the owner's rounds.
+publishOwnerWindowScene
+  ∷ OwnerHandoff scene → [WindowId] → WindowId → Prepared scene → STM WindowScenePublication
+publishOwnerWindowScene handoff held window scene = case handoffSceneMode' handoff of
+  SharedScene → pure (WindowScenesNotEnabled window)
+  PerWindowScenes → do
+    open ← readTVar (handoffScenesOpen handoff)
+    if not open
+      then pure (WindowSceneClosed window)
+      else
+        if window `notElem` held
+          then pure (WindowSceneUnknown window)
+          else do
+            cells ← readTVar (handoffWindowScenes handoff)
+            let revision = maybe 0 (\(WindowSceneCell _ held') → held') (Map.lookup window cells) + 1
+            -- A publication forgets those of the windows the host no longer
+            -- holds, read in this same transaction, so the table is bounded by
+            -- the host's windows however long the owner is occupied and
+            -- however many windows come and go meanwhile.
+            writeTVar
+              (handoffWindowScenes handoff)
+              (Map.insert window (WindowSceneCell scene revision) (Map.filterWithKey (\at _ → at `elem` held) cells))
+            modifyTVar' (handoffSceneStamp handoff) (+ 1)
+            pure (WindowScenePublished window revision)
+
+-- | One window's scene beside its revision: its latest publication, or the
+-- initial scene at revision 0 when it has had none.
+readOwnerWindowSceneAt ∷ OwnerHandoff scene → WindowId → STM (scene, Natural)
+readOwnerWindowSceneAt handoff window = do
+  cells ← readTVar (handoffWindowScenes handoff)
+  pure $ case Map.lookup window cells of
+    Nothing → (preparedValue (handoffInitialScene handoff), 0)
+    Just (WindowSceneCell scene revision) → (preparedValue scene, revision)
+
+-- | Every window that has had a publication, with its scene and revision, in
+-- one transaction.
+readOwnerWindowScenes ∷ OwnerHandoff scene → STM (Map WindowId (scene, Natural))
+readOwnerWindowScenes handoff =
+  Map.map (\(WindowSceneCell scene revision) → (preparedValue scene, revision)) <$> readTVar (handoffWindowScenes handoff)
+
+-- | Forget the publication of every window the host no longer holds, which the
+-- owner does each round. A window's identity is never reissued, so nothing
+-- forgotten here can be mistaken for a later window's.
+pruneOwnerWindowScenes ∷ OwnerHandoff scene → [WindowId] → STM ()
+pruneOwnerWindowScenes handoff held =
+  modifyTVar' (handoffWindowScenes handoff) (Map.filterWithKey (\window _ → window `elem` held))
+
+-- | The count the owner's wait compares, which rises whenever a scene is
+-- published: the shared snapshot's revision, or in per-window mode the number
+-- of window publications accepted.
+ownerSceneStamp ∷ OwnerHandoff scene → STM Natural
+ownerSceneStamp handoff = case handoffSceneMode' handoff of
+  SharedScene → snd <$> readOwnerSceneAt handoff
+  PerWindowScenes → readTVar (handoffSceneStamp handoff)
 
 -- ---------------------------------------------------------------------------
 -- Status

@@ -137,7 +137,10 @@ progressFrames frames now = owner recording $ do
                   note failures (unlessLoss failure (FrameEffectUncertain (submissionFrames record) reason))
                 Right False → pure ()
                 Right True → do
-                  recorded ← atomically (complete submission record)
+                  recorded ← atomically $ do
+                    done ← complete submission record
+                    when done (modifyTVar' (framesCompletions frames) (fmap (submission :)))
+                    pure done
                   if recorded
                     then modifyIORef' completed (submission :)
                     else note failures (toException (FrameEffectUncertain (submissionFrames record) "the model refused a completion its fence proved"))

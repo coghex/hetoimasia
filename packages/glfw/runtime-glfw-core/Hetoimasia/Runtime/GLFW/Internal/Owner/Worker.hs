@@ -24,19 +24,24 @@ import Data.Maybe (isJust)
 import qualified Data.Set as Set
 import Hetoimasia.Foundation.Time (Instant, deadlineReached, readInstant, remainingUntil)
 import Hetoimasia.Foundation.Worker (StopToken, stopRequested)
+import Hetoimasia.GLFW.Internal.Attachment (attachmentWindow)
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Config (GraphicsOwnerConfig (..), OwnerTimer (..))
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Drain (absorbOwnerFailure, ownerDrain, settleOwnerOutcome)
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Evidence (HasEvidence (..))
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Handoff
   ( OwnerPhase (OwnerRunning)
   , OwnerStatus (statusNextDeadline)
+  , SceneMode (..)
   , TargetObservation (targetRevision)
   , closeOwnerPublications
+  , handoffSceneMode
   , noTargetGeometry
+  , ownerSceneStamp
   , pendingTargetEvents
   , readOwnerDemandAt
   , readOwnerSceneAt
   , readOwnerStatus
+  , readOwnerWindowSceneAt
   , readTargetObservations
   , recordOwnerEnded
   , recordOwnerStarted
@@ -44,6 +49,7 @@ import Hetoimasia.Runtime.GLFW.Internal.Owner.Handoff
   , writeOwnerProgress
   )
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Latch (latchFailure)
+import Hetoimasia.Runtime.GLFW.Internal.Owner.Observation (pruneWindowScenes)
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Operations
   ( GraphicsOperations (..)
   , NextDeadline (..)
@@ -148,6 +154,9 @@ ownerRound owner token = do
   retireReleased owner
   publishOwed owner
   forgetValidatedTargets owner
+  -- A window the host has retired takes its scene publication with it, so the
+  -- table is bounded by the windows the host holds.
+  atomically (pruneWindowScenes owner)
   ending ← atomically (ownerEnding owner token)
   if ending
     then pure True
@@ -194,20 +203,32 @@ offerStep ∷ GraphicsOwner scene → IO (StepReport, NextDeadline)
 offerStep owner = do
   now ← readInstant (ownerClock owner)
   report ← mask $ \restore → do
-    (scene, sceneRevision, demand, demandRevision, views) ← atomically $ do
+    (scene, sceneRevision, windowScenes, demand, demandRevision, views) ← atomically $ do
       (scene, sceneRevision) ← readOwnerSceneAt handoff
       (demand, demandRevision) ← readOwnerDemandAt handoff
       withheld ← applyWithholding owner
       states ← readTVar (ownerTargets owner)
       geometry ← readTVar (ownerGeometryCells owner)
+      -- In per-window mode every target's window is handed its own scene, the
+      -- window's latest publication or the initial scene, read here with the
+      -- rest so a step never sees one window's scene from this round beside
+      -- another's from the last.
+      windowScenes ← case handoffSceneMode handoff of
+        SharedScene → pure Map.empty
+        PerWindowScenes →
+          Map.fromList
+            <$> traverse
+              (\window → (,) window <$> readOwnerWindowSceneAt handoff window)
+              (Set.toAscList (Set.fromList (map attachmentWindow (Map.keys states))))
       -- Recorded in the same transaction the step's inputs were read in, so
       -- the wait below can never conclude that a publication this step did
       -- not see has already been folded.
-      writeTVar (ownerSeenInputs owner) (demandRevision, sceneRevision)
+      stamp ← ownerSceneStamp handoff
+      writeTVar (ownerSeenInputs owner) (demandRevision, stamp)
       let views = map (stepView geometry withheld) (Map.toAscList states)
       recordStepPresenting owner views
-      pure (scene, sceneRevision, demand, demandRevision, views)
-    restore (graphicsStep operations (OwnerStep now scene sceneRevision demand demandRevision views) >>= evaluate)
+      pure (scene, sceneRevision, windowScenes, demand, demandRevision, views)
+    restore (graphicsStep operations (OwnerStep now scene sceneRevision (handoffSceneMode handoff) windowScenes demand demandRevision views) >>= evaluate)
       `finally` atomically (endStepPresenting owner)
   deadline ← graphicsNextDeadline operations >>= evaluate
   pure (report, deadline)
@@ -273,9 +294,9 @@ ownerWait owner token = do
 inputsAdvanced ∷ GraphicsOwner scene → STM Bool
 inputsAdvanced owner = do
   (_, demandRevision) ← readOwnerDemandAt (ownerHandoff' owner)
-  (_, sceneRevision) ← readOwnerSceneAt (ownerHandoff' owner)
+  sceneStamp ← ownerSceneStamp (ownerHandoff' owner)
   (seenDemand, seenScene) ← readTVar (ownerSeenInputs owner)
-  pure (demandRevision > seenDemand || sceneRevision > seenScene)
+  pure (demandRevision > seenDemand || sceneStamp > seenScene)
 
 -- | Whether any target's observation is newer than the one the owner folded.
 observationsAdvanced ∷ GraphicsOwner scene → STM Bool

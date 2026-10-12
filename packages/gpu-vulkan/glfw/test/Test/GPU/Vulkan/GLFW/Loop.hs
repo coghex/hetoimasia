@@ -951,7 +951,7 @@ testStalledMainThread = do
           WaitAccepted ticket → awaitCompletion ticket >> atomically (writeTVar served True)
           WaitClosed → pure ()
       forM_ [1 .. 3 ∷ Int] $ \count → do
-        scene ← prepare ()
+        scene ← prepare 0
         _ ← publishVulkanScene host scene
         atomically $ do
           -- Each scene is presented while the pump stays held.
@@ -996,7 +996,7 @@ testStalledLiveResize = do
         presentedBefore ← presentsOf rig attachment
         builtBefore ← length <$> swapchainsBuilt rig
         offerExtent rig (Just (SurfaceExtent (640 + step * 4) 480))
-        scene ← prepare ()
+        scene ← prepare 0
         _ ← publishVulkanScene host scene
         awaitPresents rig attachment (presentedBefore + 1)
         presentedIn ← maybe 0 (+ 1) . lastMaybe <$> presentRounds rig

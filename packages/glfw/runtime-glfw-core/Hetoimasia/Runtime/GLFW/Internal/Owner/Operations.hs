@@ -35,7 +35,8 @@ import Hetoimasia.Runtime.GLFW.Internal.Owner.Evidence
   , TargetEvidence
   , TargetRetired
   )
-import Hetoimasia.Runtime.GLFW.Internal.Owner.Handoff (OwnerDemand, TargetGeometry)
+import Data.Map.Strict (Map)
+import Hetoimasia.Runtime.GLFW.Internal.Owner.Handoff (OwnerDemand, SceneMode, TargetGeometry)
 import Hetoimasia.Runtime.GLFW.Internal.RenderDemand (RenderEligibility)
 import Numeric.Natural (Natural)
 
@@ -112,6 +113,18 @@ data OwnerStep scene = OwnerStep
     -- ^ The revision of that scene's publication, so a backend can tell a
     -- newly published scene from the one it last rendered. Zero until an
     -- application thread has published one.
+  , stepSceneMode ∷ !SceneMode
+    -- ^ Whether the owner carries one scene for every target
+    -- ('Hetoimasia.Runtime.GLFW.Internal.Owner.Handoff.SharedScene') or one
+    -- for each window. In per-window mode nothing can publish the shared
+    -- scene, so 'stepScene' stays the initial scene at revision zero and a
+    -- target's scene is its window's, in 'stepWindowScenes'.
+  , stepWindowScenes ∷ !(Map WindowId (scene, Natural))
+    -- ^ In per-window mode, the scene of the window of every target in
+    -- 'stepTargets', beside the revision of its publication: the window's
+    -- latest publication, or the initial scene at revision zero when it has
+    -- had none. Read in the same transaction as the rest of the step's inputs.
+    -- Empty in shared mode.
   , stepDemand ∷ !OwnerDemand
   , stepDemandRevision ∷ !Natural
     -- ^ The revision of the demand's publication: two publications of equal

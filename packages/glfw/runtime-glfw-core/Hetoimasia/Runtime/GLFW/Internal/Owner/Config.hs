@@ -19,6 +19,7 @@ import Data.Text (Text)
 import Hetoimasia.Foundation.Log (Component, unsafeComponent)
 import Hetoimasia.Foundation.Messaging.Payload (Prepared)
 import Hetoimasia.Foundation.Time (Duration, Instant, durationNanoseconds)
+import Hetoimasia.Runtime.GLFW.Internal.Owner.Handoff (SceneMode (..))
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Operations (GraphicsOperations)
 
 -- | How the owner waits for an absolute instant nothing else will wake it for.
@@ -63,7 +64,12 @@ data GraphicsOwnerConfig scene = GraphicsOwnerConfig
   , ownerScene ∷ !(Prepared scene)
     -- ^ The scene the owner holds before any application thread has published
     -- one. It is the application's own value, prepared by the application, so
-    -- this package needs no @NFData@ instance for it.
+    -- this package needs no @NFData@ instance for it. In 'PerWindowScenes' mode
+    -- it is the scene each window starts with, at revision zero.
+  , ownerSceneMode ∷ !SceneMode
+    -- ^ Whether the owner carries one scene for every target or one for each
+    -- window. 'SharedScene' by default, which is how the owner has always
+    -- behaved.
   , ownerEventCapacity ∷ !Int
     -- ^ How many attachment lifetime events the owner's one ordinary bounded
     -- port holds. At least one.
@@ -71,7 +77,8 @@ data GraphicsOwnerConfig scene = GraphicsOwnerConfig
   }
 
 -- | A configuration over the given operations and initial scene: the label
--- @graphics-owner@, a lifetime port of sixteen events, and the process timer.
+-- @graphics-owner@, one scene shared by every target, a lifetime port of
+-- sixteen events, and the process timer.
 --
 -- There is no disposition to choose. This delivery's graphics owner is
 -- __required__: its terminal failure stops the run. An owner-wide optional
@@ -88,6 +95,7 @@ graphicsOwnerConfig operations scene =
     { ownerOperations = operations
     , ownerLabel = "graphics-owner"
     , ownerScene = scene
+    , ownerSceneMode = SharedScene
     , ownerEventCapacity = 16
     , ownerClockTimer = realtimeOwnerTimer
     }

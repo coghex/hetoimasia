@@ -40,6 +40,11 @@
 --   one hidden, suspended and shown again while the other keeps presenting,
 --   and the host's exit through D-33 ("Test.GPU.Vulkan.Native.Composed", #232;
 --   required on Wayland too since #357);
+-- * @r2d14-window-scenes@ — R2D-14's scene for each of two windows through the
+--   production host: a publication for one window presents to it and to no
+--   other, each frame is cleared to the colour of its own window's scene, and
+--   a release request made while the second window shows revision 1 runs only
+--   after it has adopted revision 2 ("Test.GPU.Vulkan.Native.WindowScenes");
 -- * @vk17-one-slot@ and @vk17-two-slots@ — VK-17's required profile: the
 --   triangle sample's renderer in two windows, each captured, the first
 --   resized and captured at its new extent and then closed while the second
@@ -215,6 +220,7 @@ import qualified Test.GPU.Vulkan.Native.Recording as Recording
 import qualified Test.GPU.Vulkan.Native.SurfaceFree as SurfaceFree
 import qualified Test.GPU.Vulkan.Native.Terminal as Terminal
 import qualified Test.GPU.Vulkan.Native.Triangle as Triangle
+import qualified Test.GPU.Vulkan.Native.WindowScenes as WindowScenes
 import qualified Test.GPU.Vulkan.Native.WindowedDepth as WindowedDepth
 import qualified Test.Vulkan.Proof.Bridge as Bridge
 import qualified Test.Vulkan.Proof.BridgeSpec as BridgeSpec
@@ -336,6 +342,14 @@ scenarios =
       $ \consent journal _ → do
         outcome ← Composed.runComposed (consentBackend consent) journal
         pure (Composed.spec outcome, section "The VK-16 composed loop record" (Composed.composedSection outcome))
+  , Scenario
+      "r2d14-window-scenes"
+      "publishes a scene for each of two windows, presenting to the published window alone with a frame cleared to its scene's colour, and runs a release request only once the second window has adopted the revision current when it was made, with validation reporting nothing"
+      False
+      Nothing
+      $ \consent journal _ → do
+        outcome ← WindowScenes.runWindowScenes (consentBackend consent) journal
+        pure (WindowScenes.spec outcome, section "The R2D-14 window scenes record" (WindowScenes.windowScenesSection outcome))
   , Scenario
       "vk17-one-slot"
       "renders the triangle sample in two windows with one frame slot, capturing each, the first again after its resize, and the second after the first closes, with validation reporting nothing"
