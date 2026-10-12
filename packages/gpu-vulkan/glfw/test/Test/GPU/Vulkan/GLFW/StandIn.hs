@@ -72,6 +72,10 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , stallSwapchain
   , raiseOnPresent
   , loseWhileRecording
+  , CancelPoint (..)
+  , cancelOwnerAt
+  , cancelOwnerNow'
+  , ownerCancelled
   , suboptimalWhileStale
   , swapchainsCreated
   , refuseFrames
@@ -137,7 +141,8 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , awaitTerminal
   ) where
 
-import Control.Concurrent (ThreadId, myThreadId)
+import Control.Concurrent (ThreadId, forkIO, myThreadId, throwTo, yield)
+import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (..), threadStatus)
 import Control.Concurrent.STM
   ( STM
   , TVar
@@ -153,7 +158,7 @@ import Control.Concurrent.STM
   , stateTVar
   , writeTVar
   )
-import Control.Exception (Exception, ExceptionWithContext (ExceptionWithContext), SomeAsyncException, SomeException, fromException, mask, rethrowIO, throwIO, try, tryWithContext, uninterruptibleMask_)
+import Control.Exception (ErrorCall (ErrorCall), Exception, ExceptionWithContext (ExceptionWithContext), SomeAsyncException, SomeException, fromException, mask, rethrowIO, throwIO, try, tryWithContext, uninterruptibleMask_)
 import Control.Monad (void, when)
 import Control.Monad.IO.Class (liftIO)
 import Data.ByteString (ByteString)
@@ -925,7 +930,43 @@ data Rendering = Rendering
     -- buffers.
   , renderingRecordLoss ∷ !(TVar Bool)
     -- ^ Whether beginning a command buffer reports the device lost.
+  , renderingCancelAt ∷ !(TVar (Maybe CancelPoint))
+    -- ^ Where the graphics owner is cancelled, once, from another thread.
+  , renderingCancelled ∷ !(TVar Bool)
+    -- ^ Whether that cancellation has been thrown.
   }
+
+-- | Where a rig cancels the graphics owner.
+data CancelPoint
+  = CancelAfterSubmit
+    -- ^ Inside the native submission, so it lands when the frames' masked
+    -- step has recorded the submission.
+  | CancelAfterCompletion
+    -- ^ Inside the query of a submission's fence that proved it complete, so
+    -- it lands when the frames' masked step has recorded the completion.
+  deriving (Eq, Show)
+
+-- | Throw the cancellation, if it is armed for this point, from a thread of its
+-- own, and wait until it is blocked on its delivery or delivered: a thread
+-- inside a masked step is not interrupted until the step ends, so what this
+-- tests is that the step's bookkeeping finishes first.
+cancelAt ∷ Rendering → CancelPoint → IO ()
+cancelAt rendering point = do
+  armed ← atomically (stateTVar (renderingCancelAt rendering) (\held → (held == Just point, if held == Just point then Nothing else held)))
+  when armed (cancelOwnerNow rendering)
+
+cancelOwnerNow ∷ Rendering → IO ()
+cancelOwnerNow rendering = do
+  owner ← myThreadId
+  thrower ← forkIO (throwTo owner (ErrorCall "the owner was cancelled"))
+  atomically (writeTVar (renderingCancelled rendering) True)
+  let settled =
+        threadStatus thrower >>= \case
+          ThreadBlocked BlockedOnException → pure ()
+          ThreadFinished → pure ()
+          ThreadDied → pure ()
+          _ → yield >> settled
+  settled
 
 -- | A managed object the recording's layer creates, or the recording's layer
 -- itself, made from the session's physical device when the recording is first
@@ -963,6 +1004,8 @@ newRendering =
     <*> newTVarIO False
     <*> newTVarIO Set.empty
     <*> newTVarIO Set.empty
+    <*> newTVarIO False
+    <*> newTVarIO Nothing
     <*> newTVarIO False
 
 -- | Whether a submission's fence answers signalled when it is next asked.
@@ -1010,6 +1053,18 @@ stallSwapchain rig swapchain = atomically (modifyTVar' (renderingStalled (rigRen
 -- a loss during a frame's recording does.
 loseWhileRecording ∷ Rig → IO ()
 loseWhileRecording rig = atomically (writeTVar (renderingRecordLoss (rigRendering rig)) True)
+
+-- | Cancel the graphics owner, once, at this point of a frame's life.
+cancelOwnerAt ∷ Rig → CancelPoint → IO ()
+cancelOwnerAt rig point = atomically (writeTVar (renderingCancelAt (rigRendering rig)) (Just point))
+
+-- | Cancel the graphics owner now, from its own thread (a frame observer's, say).
+cancelOwnerNow' ∷ Rig → IO ()
+cancelOwnerNow' = cancelOwnerNow . rigRendering
+
+-- | Whether the cancellation has been thrown.
+ownerCancelled ∷ Rig → STM Bool
+ownerCancelled = readTVar . renderingCancelled . rigRendering
 
 -- | Have the next presentation raise this, once, after writing its entry.
 raiseOnPresent ∷ Rig → SomeException → IO ()
@@ -1214,7 +1269,8 @@ renderingLayers rescued events rendering clock =
         , opsFenceSignalled = \_ handle → do
             record events (FenceQueried handle)
             slow
-            atomically $ do
+            kindBefore ← Map.lookup handle <$> readTVarIO (renderingFences rendering)
+            answer ← atomically $ do
               kind ← Map.lookup handle <$> readTVar (renderingFences rendering)
               submissions ← readTVar (renderingSubmissions rendering)
               presentations ← readTVar (renderingPresentations rendering)
@@ -1235,6 +1291,10 @@ renderingLayers rescued events rendering clock =
                     modifyTVar' (renderingBusy rendering) (Map.adjust (Set.delete index) swapchain)
                   pure True
                 _ → pure False
+            -- A submission's completion has been recorded: the cancellation, if
+            -- armed for this point, lands once the call's masked step ends.
+            when (answer && kindBefore == Just FenceSubmission) (cancelAt rendering CancelAfterCompletion)
+            pure answer
         , opsAcquireImage = \_ swapchain _ → do
             readTVarIO (renderingHold rendering) >>= \case
               Nothing → pure ()
@@ -1254,6 +1314,7 @@ renderingLayers rescued events rendering clock =
         , opsSubmit = \_ _ _ handle → do
             fence handle FenceSubmission
             record events (QueueSubmitted handle)
+            cancelAt rendering CancelAfterSubmit
         , opsNoEffect = \failure → isJust (fromException failure ∷ Maybe StandInNotPresented)
         , opsReleaseImages = \_ swapchain indices → do
             atomically (modifyTVar' (renderingBusy rendering) (Map.adjust (\held → foldr Set.delete held indices) swapchain))

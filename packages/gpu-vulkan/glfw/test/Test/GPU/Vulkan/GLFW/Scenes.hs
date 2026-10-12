@@ -14,9 +14,9 @@ module Test.GPU.Vulkan.GLFW.Scenes (spec) where
 
 import Control.Concurrent (ThreadId, forkIO, throwTo, yield)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, registerDelay, writeTVar)
+import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, registerDelay, stateTVar, writeTVar)
 import Control.Exception (ErrorCall (..), SomeException, throwIO, toException, try)
-import Control.Monad (void)
+import Control.Monad (void, when)
 import Data.List (nub, sort)
 import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (..), threadStatus)
 import qualified Data.Map.Strict as Map
@@ -89,6 +89,9 @@ spec = describe "Vulkan scenes for each window (R2D-14)" $ do
     itBounded "holds a finite number of unreleased revisions for a target, adopting nothing newer behind a pending submission until a release makes room, then catching up in order" testRetentionBound
     itBounded "keeps a revision awaiting release when the device's loss lets its submission go without completing it" testLossKeepsRevision
     itBounded "keeps the revision of a recording the device's loss interrupted, which no reset discarded" testLossDuringRecording
+    itBounded "keeps a revision while a submission the owner's cancellation followed is pending, then releases it once on the completion" testCancelledAfterSubmission
+    itBounded "releases a revision exactly once when the owner is cancelled right after the completion that ended its last use was recorded" testCancelledAfterCompletion
+    itBounded "releases a revision exactly once when the owner is cancelled right after a recording was discarded" testCancelledAfterDiscard
     itBounded "completes an adoption's record, notification and watermark, and a release's removal and notifications, whatever cancels the owner meanwhile" testLedgerCancellation
     itBounded "ends the use of a recording that raised once the target's teardown discards it, releasing its revision at the target's retirement" testTeardownDiscard
 
@@ -97,6 +100,7 @@ spec = describe "Vulkan scenes for each window (R2D-14)" $ do
     itBounded "wait for a window with a publication and no target, run in the order made without holding back an action that has no barrier, and are released by that window's end" testRequestOrderAndWindowEnd
     itBounded "wait for every window the host holds, even one with no target and no publication, in a per-window host and in a shared one" testTargetlessWindowHolds
     itBounded "are not delayed by a window created after they were made" testRequestIgnoresLaterWindow
+    itBounded "wait for a window whose adopting target was released until another adopts, in a per-window host and in a shared one" testDetachedWindowHoldsRequest
     itBounded "wait on a shared scene's revision for every window in a shared host" testRequestSharedMode
     itBounded "are refused when the queue is full and before the device exists, and settled as refused, never replayed, when the owner exits" testRequestAdmission
     itBounded "are refused after the session's failure, including one queued before it that never started" testRequestAfterFailure
@@ -889,7 +893,7 @@ testLedgerCancellation = do
     _ ← takeMVar finished
     after ← atomically (readSceneState scenes (pure []))
     done ← readTVarIO hooks
-    pure (fmap windowAdopted (Map.lookup window (sceneWindows standing)), fmap windowAwaitingRelease (Map.lookup window (sceneWindows after)), done)
+    pure (fmap windowAdopted (Map.lookup window (sceneWindows standing)), Just (maybe [] windowAwaitingRelease (Map.lookup window (sceneWindows after))), done)
   adoptedBeforeCancel `shouldBe` Just (Just 3)
   adoptedAfter `shouldBe` Just []
   releasedAll `shouldBe` ["adopted 3", "adopted 4", "released 3", "released 4"]
@@ -975,3 +979,112 @@ testLossDuringRecording = do
     other → failWith ("expected one window, saw " <> show other)
   adoptedBy events window `shouldBe` [(0, 0), (1, 93)]
   releasedBy events window `shouldBe` [0]
+
+-- | A window whose adopting target was released holds nothing, however long
+-- ago its revision was adopted: a request made then waits until a target
+-- adopts again, since the revision the window published is one that target
+-- will take.
+testDetachedWindowHoldsRequest ∷ IO ()
+testDetachedWindowHoldsRequest = do
+  perWindow ← scenesRig 1
+  shared ← visibleRigOf 1
+  forM_' [(perWindow, \host window → void (publishTo host window 7)), (shared, \host _ → void (prepare 7 >>= publishVulkanScene host))] $ \(rig, publish) → do
+    (whileDetached, afterReattach) ← runRig rig $ \host control → do
+      [window] ← windowsOf host
+      service ← attach host window
+      composedUntil rig host control "the first adoption" (not . null . flip adoptedBy window <$> sceneEvents rig)
+      publish host window
+      composedUntil rig host control "the publication's adoption" ((>= 2) . length . flip adoptedBy window <$> sceneEvents rig)
+      _ ← releaseGraphicsTarget (vulkanWindowHost host) (vulkanGraphicsOwner host) service
+      _ ← awaitTerminal host service
+      composedUntil rig host control "the target's release" ((>= 1) . length . flip releasedBy window <$> sceneEvents rig)
+      ran ← newTVarIO []
+      -- The window still publishes revision 1, and nothing holds it.
+      _ ← request host (mark ran "request")
+      _ ← atomically (submitVulkanAction (vulkanController host) (mark ran "plain")) >>= either (\refusal → failWith ("refused: " <> show refusal)) pure
+      composedUntil rig host control "the plain action's run" ((== ["plain"]) <$> readTVarIO ran)
+      settleOwner rig host
+      whileDetached ← readTVarIO ran
+      _ ← attach host window
+      composedUntil rig host control "the request's run" ((== ["plain", "request"]) <$> readTVarIO ran)
+      (,) whileDetached <$> readTVarIO ran
+    whileDetached `shouldBe` ["plain"]
+    afterReattach `shouldBe` ["plain", "request"]
+
+-- | The owner is cancelled right after the frames accepted a submission, from
+-- another thread, with its completion withheld. The cancellation lands when
+-- the masked step that submits and associates it has ended, so the revision
+-- is still held for a submission that has not completed, and is released once,
+-- on the completion.
+testCancelledAfterSubmission ∷ IO ()
+testCancelledAfterSubmission = do
+  rig ← scenesRig 1
+  heldWhilePending ← runRigCaught rig $ \host control → do
+    _ ← superviseGraphicsOwner control (vulkanGraphicsOwner host)
+    [window] ← windowsOf host
+    _ ← attach host window
+    composedUntil rig host control "the first adoption" (not . null . flip adoptedBy window <$> sceneEvents rig)
+    submissionsComplete rig False
+    cancelOwnerAt rig CancelAfterSubmit
+    _ ← publishTo host window 61
+    atomically (ownerCancelled rig >>= check)
+    -- The owner is gone, its submission not complete: nothing says the commands
+    -- are over.
+    pending ← flip releasedBy window <$> sceneEvents rig
+    submissionsComplete rig True
+    pending `shouldBe` [0]
+    composedUntil rig host control "the owner's end" (checkRuntime control >> pure False)
+  either (const (pure ())) (const (failWith "the run returned instead of failing with the cancellation")) heldWhilePending
+  events ← sceneEvents rig
+  [window] ← case nub [at | SceneAdopted at _ _ ← events] of
+    [only] → pure [only]
+    other → failWith ("expected one window, saw " <> show other)
+  releasedBy events window `shouldBe` [0, 1]
+
+testCancelledAfterCompletion ∷ IO ()
+testCancelledAfterCompletion = do
+  rig ← scenesRig 1
+  outcome ← runRigCaught rig $ \host control → do
+    _ ← superviseGraphicsOwner control (vulkanGraphicsOwner host)
+    [window] ← windowsOf host
+    _ ← attach host window
+    composedUntil rig host control "the first adoption" (not . null . flip adoptedBy window <$> sceneEvents rig)
+    cancelOwnerAt rig CancelAfterCompletion
+    _ ← publishTo host window 62
+    composedUntil rig host control "the owner's end" (checkRuntime control >> pure False)
+  either (const (pure ())) (const (failWith "the run returned instead of failing with the cancellation")) outcome
+  cancelled ← atomically (ownerCancelled rig)
+  cancelled `shouldBe` True
+  events ← sceneEvents rig
+  [window] ← case nub [at | SceneAdopted at _ _ ← events] of
+    [only] → pure [only]
+    other → failWith ("expected one window, saw " <> show other)
+  -- The completion was recorded before the step could return it: the evidence
+  -- survived, and the revision was released once.
+  releasedBy events window `shouldBe` [0, 1]
+
+testCancelledAfterDiscard ∷ IO ()
+testCancelledAfterDiscard = do
+  rig ← scenesRig 1
+  fired ← newTVarIO False
+  outcome ← runRigCaught rig $ \host control → do
+    _ ← superviseGraphicsOwner control (vulkanGraphicsOwner host)
+    [window] ← windowsOf host
+    _ ← attach host window
+    composedUntil rig host control "the first adoption" (not . null . flip adoptedBy window <$> sceneEvents rig)
+    -- The renderer refuses the frame: it is skipped, which resets and drops its
+    -- recording, and the owner is cancelled as the abandonment is reported.
+    refuseFrames rig True
+    onFrameEvent rig $ \case
+      FrameAbandoned {} → do
+        first ← atomically (stateTVar fired (\held → (not held, True)))
+        when first (cancelOwnerNow' rig)
+      _ → pure ()
+    _ ← publishTo host window 63
+    composedUntil rig host control "the owner's end" (checkRuntime control >> pure False)
+  either (const (pure ())) (const (failWith "the run returned instead of failing with the cancellation")) outcome
+  events ← sceneEvents rig
+  [window] ← case nub [at | SceneAdopted at _ _ ← events] of
+    [only] → pure [only]
+    other → failWith ("expected one window, saw " <> show other)
+  releasedBy events window `shouldBe` [0, 1]

@@ -179,6 +179,7 @@ import Control.Exception
   , SomeException
   , finally
   , fromException
+  , mask
   , mask_
   , onException
   , rethrowIO
@@ -257,6 +258,7 @@ import Hetoimasia.GPU.Vulkan.Native.Frames
   , progressFrames
   , takeCompletedSubmissions
   , readFrameStandings
+  , enableCompletionLog
   , readCompletedSubmissions
   , readPresentations
   , retireTargetFrames
@@ -275,8 +277,7 @@ import Hetoimasia.GPU.Vulkan.Native.Generations
 import Hetoimasia.GPU.Vulkan.Native.Presentation (GenerationPlan (..), SurfaceExtent, SurfaceFormat (..), imageUsageTransferSource)
 import Hetoimasia.GPU.Vulkan.Native.Profile (DevicePlan (..))
 import Hetoimasia.GPU.Vulkan.Native.Recording
-  ( BatchStanding (..)
-  , BatchView (..)
+  ( BatchView (..)
   , Buffer
   , BufferDescription
   , ClearColor
@@ -946,6 +947,8 @@ live rendering =
           recording ← newRecording ops (renderingRoots rendering) (renderingGenerations rendering)
           frames ← newFrames (renderingFrameOps (renderingOps rendering)) recording
           let made = Live recording frames
+          -- The scene uses read completions from the frames' log.
+          atomically (enableCompletionLog frames)
           -- The generations built from now on carry the depth image the host
           -- asked for (GRS-13).
           atomically $ do
@@ -1165,13 +1168,12 @@ useEvidence rendering =
       completed ← readCompletedSubmissions (liveFrames made)
       lost ← deviceLossObserved <$> readRootsModel (renderingRoots rendering)
       batches ← readBatches (liveRecording made)
-      let unsubmitted frame = [() | view ← batches, viewBatchFrame view == Just frame, notSubmitted (viewBatchStanding view)]
-          notSubmitted = \case
-            BatchSubmitted _ → False
-            _ → True
+      -- A frame's recording is discarded only when the recording holds no batch
+      -- of it at all: a batch submitted and not yet dropped is not a discard.
+      let batchesOf frame = [() | view ← batches, viewBatchFrame view == Just frame]
       pure $ \use → case useSubmission use of
         Just submission → submission `elem` completed
-        Nothing → useRecorded use && not lost && null (unsubmitted (useFrame use))
+        Nothing → useRecorded use && not lost && null (batchesOf (useFrame use))
 
 -- | Take the completions the frames recorded and forget the uses the evidence
 -- says are over, so the table holds no more than the frames in flight and the
@@ -1320,9 +1322,6 @@ renderDue rendering renderer now sceneOf due =
             Right readback → pure (Captured True (Just (readback, bytes)))
     withhold attachment reason = atomically (settleCapture captures attachment (CaptureWithheld attachment reason))
     recordOne made target attachment owned image capture scene revision = do
-      -- The use is opened before the renderer can record anything, so that no
-      -- way the recording ends leaves a frame that read the scene unrecorded.
-      use ← openUse rendering attachment (ownedFrame owned) revision
       let request = FrameRequest attachment target (ownedFrame owned) (ownedImage owned) (imageExtent image) (imageFormat image) revision (imageDepth image)
           construction = construct rendering made
           finish recorder = case capturedWork capture of
@@ -1331,13 +1330,23 @@ renderDue rendering renderer now sceneOf due =
               transitionImage recorder LayoutColorAttachment LayoutTransferSource
                 `andThen` copyToReadback recorder readback
                 `andThen` transitionImage recorder LayoutTransferSource LayoutPresentSource
-      recorded ←
-        recordFrame (liveRecording made) (ownedFrame owned) (\recorder →
-          transitionImage recorder LayoutUndefined LayoutColorAttachment
-            `andThen` renderScene renderer scene request construction recorder
-            `andThen` finish recorder)
-          `onException` giveUp made attachment owned capture "its recording raised"
-          `finally` atomically (modifyTVar' (renderingUses rendering) (Map.adjust (\held → held {useRecorded = True}) use))
+      -- The use is opened before the renderer can record anything, so that no
+      -- way the recording ends leaves a frame that read the scene unrecorded,
+      -- and its opening and the handler that marks the recording ended are
+      -- installed in one masked step, so no cancellation lands between them.
+      -- Only the recording itself is restored to the owner's own state.
+      (use, recorded) ← mask $ \restore → do
+        opened ← openUse rendering attachment (ownedFrame owned) revision
+        ended ←
+          restore
+            ( recordFrame (liveRecording made) (ownedFrame owned) (\recorder →
+                transitionImage recorder LayoutUndefined LayoutColorAttachment
+                  `andThen` renderScene renderer scene request construction recorder
+                  `andThen` finish recorder)
+                `onException` giveUp made attachment owned capture "its recording raised"
+            )
+            `finally` atomically (modifyTVar' (renderingUses rendering) (Map.adjust (\held → held {useRecorded = True}) opened))
+        pure (opened, ended)
       case recorded of
         Right (batch, Right ()) →
           -- The submission and the use's record of it are one masked step, so

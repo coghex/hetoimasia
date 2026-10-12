@@ -167,6 +167,12 @@ data SceneSource = SceneSource
 
 data TargetScene = TargetScene
   { targetAdopted ∷ !(Maybe Natural)
+    -- ^ The highest revision the target has adopted, recorded before the hook
+    -- runs, which is what gates a further adoption.
+  , targetHeld ∷ !(Maybe Natural)
+    -- ^ The highest revision the target has adopted and notified, once its
+    -- hook has returned: what it holds, as a release barrier reads it. It
+    -- stops counting the moment the target ends.
   , targetEnded ∷ !Bool
   }
 
@@ -179,8 +185,6 @@ data Adoption = Adoption
 
 data Ledger = Ledger
   { ledgerTargets ∷ !(Map AttachmentId TargetScene)
-  , ledgerAdopted ∷ !(Map WindowId Natural)
-    -- ^ The highest revision any target of each window has adopted.
   , ledgerRecords ∷ ![Adoption]
     -- ^ Every adopted revision not yet released, oldest adoption first.
   , ledgerDeferred ∷ !(Map WindowId Natural)
@@ -194,7 +198,7 @@ data Scenes = Scenes
   }
 
 newScenes ∷ IO Scenes
-newScenes = Scenes <$> newTVarIO (Ledger Map.empty Map.empty [] Map.empty) <*> newTVarIO Nothing
+newScenes = Scenes <$> newTVarIO (Ledger Map.empty [] Map.empty) <*> newTVarIO Nothing
 
 -- | Install where the scenes are read from, once the owner exists. Until then
 -- no barrier names a window.
@@ -205,7 +209,7 @@ installSceneSource scenes = writeTVar (scenesSource scenes) . Just
 registerSceneTarget ∷ Scenes → AttachmentId → STM ()
 registerSceneTarget scenes attachment =
   modifyTVar' (scenesLedger scenes) $ \ledger →
-    ledger {ledgerTargets = Map.insertWith (\_ held → held) attachment (TargetScene Nothing False) (ledgerTargets ledger)}
+    ledger {ledgerTargets = Map.insertWith (\_ held → held) attachment (TargetScene Nothing Nothing False) (ledgerTargets ledger)}
 
 -- | What adopting a scene for a target came to.
 data Adopting
@@ -257,14 +261,11 @@ adoptScene scenes lifecycle limit attachment scene revision = uninterruptibleMas
     Adopted → do
       sceneAdopted lifecycle window revision scene
       atomically $ do
-        -- The watermark of a window the host no longer holds is dropped with
-        -- it: a barrier treats such a window as ended without reading it.
         held ← readTVar (scenesSource scenes) >>= maybe (pure Nothing) (fmap Just . sourceWindows)
         modifyTVar' (scenesLedger scenes) $ \ledger →
           ledger
-            { ledgerAdopted =
-                maybe id (\windows → Map.filterWithKey (\at _ → at `elem` windows)) held $
-                  Map.insertWith max window revision (ledgerAdopted ledger)
+            { -- Only now does the target hold the revision for a barrier.
+              ledgerTargets = Map.adjust (\target → target {targetHeld = Just revision}) attachment (ledgerTargets ledger)
             , ledgerDeferred = maybe id (\windows → Map.filterWithKey (\at _ → at `elem` windows)) held (ledgerDeferred ledger)
             }
     _ → pure ()
@@ -331,6 +332,21 @@ sceneBarrier scenes =
     Nothing → pure Map.empty
     Just source → sourceRevisions source
 
+-- | The highest revision a live target of each window holds. A target that has
+-- ended holds nothing: a window whose adopting target was detached or released
+-- has no hold until another adoption replaces it, however long ago its
+-- revision was adopted, since the revision it published is one a later target
+-- will adopt.
+liveWatermark ∷ Ledger → Map WindowId Natural
+liveWatermark ledger =
+  Map.fromListWith
+    max
+    [ (attachmentWindow attachment, revision)
+    | (attachment, target) ← Map.toList (ledgerTargets ledger)
+    , not (targetEnded target)
+    , Just revision ← [targetHeld target]
+    ]
+
 -- | Whether a barrier is met: for each window it names, the window's adopted
 -- watermark has reached the revision, or the host no longer holds the window.
 sceneBarrierMet ∷ Scenes → Barrier → STM Bool
@@ -339,7 +355,7 @@ sceneBarrierMet scenes barrier =
     Nothing → pure True
     Just source → do
       held ← sourceWindows source
-      adopted ← ledgerAdopted <$> readTVar (scenesLedger scenes)
+      adopted ← liveWatermark <$> readTVar (scenesLedger scenes)
       pure $
         all
           (\(window, revision) → window `notElem` held || maybe False (>= revision) (Map.lookup window adopted))
@@ -355,8 +371,9 @@ data WindowSceneStanding = WindowSceneStanding
     -- 'Nothing' for a window the host no longer holds, whose adopted
     -- revisions may still be awaiting release.
   , windowAdopted ∷ !(Maybe Natural)
-    -- ^ The highest revision any target of the window has adopted, once one
-    -- has.
+    -- ^ The highest revision a live target of the window holds, once it has
+    -- adopted one: the barrier's watermark. A window whose adopting target has
+    -- ended holds none until another adopts.
   , windowDeferrals ∷ !Natural
     -- ^ How many times a target of it, at its retention limit, deferred
     -- adopting a newer revision: the positive sign that pressure held an
@@ -386,11 +403,12 @@ readSceneState scenes pending = do
   published ← readTVar (scenesSource scenes) >>= maybe (pure Map.empty) sourceRevisions
   requests ← pending
   let awaiting = Map.fromListWith (flip (<>)) [(attachmentWindow (adoptionAttachment record), [adoptionRevision record]) | record ← ledgerRecords ledger, adoptionSuperseded record]
-      windows = Set.unions [Map.keysSet published, Map.keysSet (ledgerAdopted ledger), Map.keysSet awaiting, Map.keysSet (ledgerDeferred ledger)]
+      holding = liveWatermark ledger
+      windows = Set.unions [Map.keysSet published, Map.keysSet holding, Map.keysSet awaiting, Map.keysSet (ledgerDeferred ledger)]
       standing window =
         WindowSceneStanding
           { windowPublished = Map.lookup window published
-          , windowAdopted = Map.lookup window (ledgerAdopted ledger)
+          , windowAdopted = Map.lookup window holding
           , windowDeferrals = Map.findWithDefault 0 window (ledgerDeferred ledger)
           , windowAwaitingRelease = fromMaybe [] (Map.lookup window awaiting)
           }

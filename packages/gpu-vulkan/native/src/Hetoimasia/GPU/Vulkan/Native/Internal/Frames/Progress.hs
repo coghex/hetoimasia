@@ -139,7 +139,7 @@ progressFrames frames now = owner recording $ do
                 Right True → do
                   recorded ← atomically $ do
                     done ← complete submission record
-                    when done (modifyTVar' (framesCompletions frames) (submission :))
+                    when done (modifyTVar' (framesCompletions frames) (fmap (submission :)))
                     pure done
                   if recorded
                     then modifyIORef' completed (submission :)

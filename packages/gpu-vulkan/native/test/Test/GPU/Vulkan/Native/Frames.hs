@@ -217,13 +217,19 @@ spec = describe "Frames" $ do
       completeFence (rigStandIn rig) (fences !! 1)
       progress rig `shouldReturn'` \report → progressCompleted report `shouldBe` [late]
       atomically (readOutstandingSubmissions (rigFrames rig)) `shouldReturn` [early]
-      -- The completion is recorded in a log of its own, in the transaction that
-      -- recorded it in the model, until a consumer takes it.
-      atomically (readCompletedSubmissions (rigFrames rig)) `shouldReturn` [late]
-      atomically (takeCompletedSubmissions (rigFrames rig)) `shouldReturn` [late]
-      atomically (takeCompletedSubmissions (rigFrames rig)) `shouldReturn` []
       generation ← activeGeneration rig
       submittedOn rig (GenerationSubject generation) `shouldReturn` [early]
+      -- The completion log is off until a consumer asks for it, so the original
+      -- progress API retains nothing however long it runs.
+      atomically (readCompletedSubmissions (rigFrames rig)) `shouldReturn` []
+      atomically (enableCompletionLog (rigFrames rig))
+      completeFence (rigStandIn rig) (fences !! 0)
+      progress rig `shouldReturn'` \report → progressCompleted report `shouldBe` [early]
+      -- Once enabled, the completion is recorded in a log of its own, in the
+      -- transaction that recorded it in the model, until a consumer takes it.
+      atomically (readCompletedSubmissions (rigFrames rig)) `shouldReturn` [early]
+      atomically (takeCompletedSubmissions (rigFrames rig)) `shouldReturn` [early]
+      atomically (takeCompletedSubmissions (rigFrames rig)) `shouldReturn` []
       clean rig
 
     it "refuses a duplicate batch, a consumed one, a discarded one and a partial one before any native call" $ do
@@ -287,6 +293,7 @@ spec = describe "Frames" $ do
       rig ← newRig
       frame ← owned rig
       _ ← sealed rig frame >>= \batch → submitted rig (batch :| [])
+      atomically (enableCompletionLog (rigFrames rig))
       failFrameStep (rigStandIn rig) AtQueryFence
       progress rig `raises` \(FrameEffectUncertain _ _) → True
       clearFrameStep (rigStandIn rig) AtQueryFence
