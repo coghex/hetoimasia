@@ -24,7 +24,7 @@ concrete precondition
 - [x] R2D-1. Create `render-api`'s texture handle and `render-2d`'s snapshot, settings and instance encoding — [#414]
 - [x] R2D-2. Map cameras and views between window, UI and world space — [#415]
 - [x] R2D-3. Build ordered draw runs from a snapshot — [#416]
-- [ ] R2D-4. Compute expected pixels from a snapshot in `render-2d-oracle`
+- [x] R2D-4. Compute expected pixels from a snapshot in `render-2d-oracle` — [#420]
 - [x] R2D-5. Decode PNG into premultiplied RGBA8 levels — [no-issue]: moved to the asset epic as AST-1 (D-15)
 - [x] R2D-6. Read KTX2 files carrying BC7 or RGBA8 levels — [no-issue]: moved to the asset epic as AST-2 (D-15)
 - [ ] R2D-16. Let table pipelines choose samplers in the shader
