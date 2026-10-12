@@ -300,7 +300,9 @@ suites can capture.
 | Instance and messenger creation and destruction, device selection and creation, the later-target check, every surface's destruction, device destruction | The graphics owner |
 | Every surface query, swapchain and image view creation and destruction | The graphics owner |
 | Publishing a target's observation (`publishGraphicsObservation`) and capturing its window's render demand | The main thread: `runVulkanOwnerLoop` does both every turn |
-| Publishing the scene (`publishVulkanScene`) | Any application thread |
+| Publishing the scene (`publishVulkanScene`), or a window's scene (`publishVulkanWindowScene`) | Any application thread |
+| Making a release request (`requestVulkanRelease`) and reading the scenes' state (`readVulkanSceneState`) | Any thread, in `STM` |
+| Adopting a scene for a target, releasing an adopted revision, and the lifecycle's two hooks | The graphics owner, in its step and its teardown |
 | Recording, acquiring, submitting, presenting, abandoning, asking a fence, and destroying frame synchronization and frame storages | The graphics owner |
 | Holding and ending a generation's CPU use | Any thread, in `STM` |
 | Reporting a swapchain call's out-of-date, suboptimal or surface-lost result | The graphics owner, whose acquisitions and presentations produce it |
@@ -3991,7 +3993,10 @@ for it — when
   deadline when it comes. A held deadline that comes while no target is
   constructed stays held until one is;
 - a scene publication the owner has not rendered arrives: the renderer renders
-  the latest scene, whichever application thread published it (D-31); or
+  the latest scene, whichever application thread published it (D-31). In a
+  host with a scene for each window the publication is the target's own
+  window's, so it asks that window's target for a frame and no other's
+  ([A scene for each window](#a-scene-for-each-window)); or
 - a target that has presented before can no longer be showing the latest
   scene: its active generation is not the one its last presentation went to,
   or it has become eligible again after a suspension. A generation it moved to
@@ -4007,6 +4012,153 @@ for it — when
 Nothing else asks. A target nobody asked a frame of is never rendered to,
 however its generations change, so a host whose application publishes neither
 demand nor a scene presents nothing, exactly as before VK-16.
+
+### A scene for each window
+
+R2D-14 ([#423](https://github.com/coghex/hetoimasia/issues/423); D-18, D-28 and
+D-30 of [the 2D renderer's design](designs/render_2d_design.md)) lets an
+application give each window a scene of its own. It is a generic extension of
+the window host and knows nothing of `render-2d`: what a snapshot references,
+and holding it, are the adapter's that renders it.
+
+**The mode.** `vulkanSceneMode` chooses, once, how the owner carries the
+scene, and `vulkanScene` is the initial scene either way.
+
+- `SharedScene`, the default, is the owner as it has always been. One
+  latest-value snapshot serves every target; `publishVulkanScene` publishes it
+  and a newer one is rendered to every eligible target. Nothing about a host
+  that does not ask changes.
+- `PerWindowScenes` carries one snapshot for each window, keyed by the window's
+  `WindowId` and not by an attachment. `publishVulkanScene` is refused
+  (`SceneRefusedPerWindow`) and publishes nothing. Each window starts with
+  `vulkanScene` at revision 0, and the renderer is handed the scene of the
+  window whose target it is rendering, with that window's revision as
+  `requestSceneRevision`.
+
+**Publishing.** `publishVulkanWindowScene host window scene` publishes from any
+application thread as a latest-value snapshot for the window: it never waits,
+and it replaces that window's publication if the owner has not taken it. The
+window's first publication is revision 1 and each accepted one is the next, for
+that window alone. Because the snapshot is the window's, it survives the
+window's surface being recreated, and a window detached and attached again
+adopts the publication its predecessor held. The answer names the window
+(`WindowScenePublication`): `WindowScenePublished window revision`;
+`WindowSceneUnknown window` for a window the host does not hold — never
+created, or retired — which changes nothing; `WindowSceneClosed window` once
+the owner's publications have closed; and `WindowScenesNotEnabled window` in a
+shared host. The windows the host holds are read in the transaction that
+publishes, so a window that has ended is never accepted a scene afterwards. The
+owner forgets the publication of a window the host no longer holds at its next
+round, so the table is bounded by the host's windows.
+
+**What asks for a frame.** A window's unrendered publication asks that window's
+target alone. Every other target's demand, pacing and generation-driven
+requests are unchanged, and a target created after a publication — a window
+reattached — is asked for a frame of the publication it never rendered, as a
+fresh target is in a shared host. An idle owner wakes for any window's
+publication.
+
+**Adoption.** A target *adopts* the scene of its window in the owner's step,
+before anything else the step does and whether or not a frame is rendered: a
+suspended or minimized window adopts what is published for it. It adopts when
+the window's revision is newer than the one the target holds, or when it holds
+none, which is how a window with no publication adopts the initial scene as
+revision 0 in the first step after its target is constructed. Adopting asks for
+no frame; only a publication does. A revision published and replaced before a
+step takes it is never adopted, so it is never notified and never released.
+Recovery of a lost surface keeps the attachment and its target and adopts
+nothing; reattaching the window makes a new target, which adopts again.
+
+**The lifecycle.** `vulkanSceneLifecycle` (default `noSceneLifecycle`, which
+does nothing, so existing renderers are unchanged) supplies two hooks, run on
+the owner's thread. Neither may raise or wait.
+
+- `sceneAdopted window revision scene` runs when a target adopts a revision,
+  with the exact scene the step took — which a later publication may already
+  have replaced, so it is not for the hook to read the latest — before the
+  window's adopted watermark moves. An adapter holds what the scene references
+  from here.
+- `sceneReleased window revision` runs once the revision is superseded (a newer
+  one adopted for the target) or its target has ended, **and** every frame
+  recorded with it has a use that is over.
+
+Every adopted revision is released exactly once, in adoption order for each
+window, and a revision is removed from the ledger before its hook runs. The
+two hooks pair by window and revision; a revision adopted by two targets (a
+window reattached) is notified and released for each. A *use* ends on
+evidence that the frame's commands can no longer read what the scene
+references: its recording was discarded — the frame was skipped, which resets
+the recorder before it discharges the batch — or the submission that carried it
+completed. A frame abandoned after its submission, a presentation that was
+refused or enqueued nothing, a timeout, the target's retirement and the owner's
+retirement end nothing. A use whose discard or completion is not established —
+a recording that raised, a skip that was refused, a submission the device's
+loss let go of without completing — stays, and so does the revision it names:
+it remains awaiting release and is shown as such, and the revisions adopted
+after it for the same window wait behind it. After the device's loss nothing is
+completed and so nothing is released on its account; the recording's teardown
+destroys the resources under the device-loss rules regardless. The ledger is
+bounded by the host's windows and the frames in flight: a target holds one
+current record, and a superseded record stays only while some frame recorded
+with it has a use that is not over, of which a target has at most one for each
+frame slot.
+
+**Release requests.** `requestVulkanRelease host action` queues an owner-thread
+action, lent the `Construction` as any other, that runs only once the owner has
+adopted what D-28 says before an application releases an object a snapshot
+references. It is admitted, bounded and settled exactly as `submitVulkanAction`
+is ([Owner-thread actions](#owner-thread-actions)): the same refusals
+(`ActionQueueFull`, `ActionDeviceNotReady`, `ActionSessionFailed`,
+`ActionOwnerClosed`), the same queue and capacity, and a request still queued
+when the owner's exit begins is settled as refused and never run.
+
+In the transaction that queues it, the request records a *barrier*: for each
+window that holds a scene the owner may yet adopt, the latest revision
+published for it. A window is named when it has a live target (the shared
+scene's revision playing the part of every window's in a shared host) or, in a
+per-window host, when it has had a publication — a snapshot nobody has adopted
+is one a release must not run past. The request runs when, for every window it
+names, the window's adopted watermark — the highest revision any of its targets
+adopted — has reached that revision, or the host no longer holds the window.
+Windows that appear later are not named and delay nothing. The barrier,
+the publications and the order of requests are one coherent fact however
+publications and windows change around the request.
+
+Requests run in the order they were made: one starts only when its barrier is
+met and no earlier request is still queued. An action with no barrier is never
+held back by one that has; it runs as it always did, and a queue holding only
+requests that cannot start is not work, so it neither wakes an idle owner nor
+keeps one running. A request whose barrier is already met starts in the next
+owner step. The step adopts before it services the queue, so a request the
+step's adoption satisfies runs in that same step.
+
+**Observation.** `readVulkanSceneState` reads, in one transaction, each
+window's latest published revision (`windowPublished`, `Nothing` for a window
+the host no longer holds), its adopted watermark (`windowAdopted`, `Nothing`
+before any adoption — an unadopted initial scene is not an adopted revision 0)
+and the revisions awaiting release (`windowAwaitingRelease`), and the release
+requests still queued, in the order made, with the revision each awaits of each
+window (`sceneRequests`). Below it, `readGraphicsSceneRevisions` reads the
+window revisions published into the handoff
+([the owner's handoffs](glfw.md#a-scene-for-each-window)).
+
+The headless examples cover each promise over the scripted seam
+(`Test.GPU.Vulkan.GLFW.Scenes`): a publication asking only its window's
+target; adoption by a suspended window and of the initial scene as revision 0;
+a revision replaced before a step takes it never being notified; release only
+after the last frame recorded with a revision has completed, in adoption order
+with several in flight, and exactly once, at supersession, at a target's end
+and at the owner's retirement; a submitted frame whose presentation enqueued
+nothing keeping its revision; a window's publication across a surface's
+recovery and across a target's release and reattachment; and requests that wait
+for the revision current when they were made, are released by a window's end,
+are not delayed by a window they did not name or by one that appears later, run
+in the order made without holding back an action that has no barrier, are
+refused when the queue is full, before the device exists, after the session's
+failure and after the owner's exit, and wake an idle owner only when one can
+run. The native
+suite's `r2d14-window-scenes` runs the production host over two windows
+([The native suite](#the-native-suite)).
 
 ### Rendering a frame
 
@@ -4499,6 +4651,10 @@ frame-less batch recording ([Frame-less batches](#frame-less-batches)).
   come after it returns. `Construction` calls from any other thread are
   refused (`RefusedNotOwner`), as they are for the renderer.
 
+A release request ([A scene for each window](#a-scene-for-each-window)) is an
+action that also waits for the scene revisions its barrier names, admitted and
+settled by exactly these rules and sharing the queue and its capacity.
+
 The headless examples cover each case over the scripted seam — surface-free
 startup and teardown order with no window, later admission and refusal, an
 action on the owner's thread returning its result, the default setting's
@@ -4912,6 +5068,9 @@ VK-18's D-33 order and releases nothing early.
 | The device start | The controller | Configured; read by the owner's startup | The owner | The host | — |
 | Rendering: per-target records (frame storages, acquisition retry, last generation shown, eligibility, closing) | The controller's rendering | The owner's step, retirement readiness and retirement | The owner | From a target's first render request until its retirement | Removed by the target's retirement |
 | Rendering: the demand and scene revisions acted on, and a demand deadline ahead | The controller's rendering | The owner's step | The owner | The owner's run | Only rise |
+| The scene ledger: each target's adopted revision, the adopted revisions awaiting release, each window's adopted watermark | The controller ([A scene for each window](#a-scene-for-each-window)) | The owner's step adopts and releases; a target's preparation ends it and its retirement forgets it; any thread reads, and a release request's admission reads | Any, in `STM` | A target's admission until its retirement; a record until released | A record is removed, once, before its release hook runs; a window's watermark with the window |
+| The scene uses | The controller's rendering | Opened before a frame's renderer runs; the step ends them on a recording's discard or a submission's completion; the ledger reads | The owner | A frame's recording until the batch is discarded or its submission completed | Removed on that evidence; kept, uncertain, otherwise |
+| The scene source | The controller | Installed once by the composition with the owner: the mode, the host's windows and their published revisions; a barrier and the state read it | Any, in `STM` | The host | Never reset |
 | Observations reconciled | The controller | The owner's step: each target's observation revision and eligibility the generations were last stepped with | The owner | The owner's run | Replaced every step that reconciles |
 | The adapter's published revisions and untaken demand | `runVulkanOwnerLoop` | The main thread, every turn | Main | The loop's run | Bounded by the windows the host holds; untaken demand forgotten once the owner took it |
 | Deferred attachments | The controller | Written by a handover whose announcement the port refused; removed by `announceVulkanTarget` once admitted, or by the owner once it has destroyed the surface | Main, owner | Until announced or settled | Cleared by whole-owner retirement |
@@ -5539,7 +5698,7 @@ companions — and adds the Vulkan owner's:
 | Main thread | Hspec runs on a thread of its own; the process main thread owns one shared production graphics session: `withLoaderIntegration`, then `runGraphicsOwnerApplication` over `withVulkanOwnerHost`, with the production native layer and surface bridge. An example that needs the main thread — to hand a window's surface over, which GLFW creates there, or to close a window — submits an operation (`onMain`); the main thread runs it between two turns of the host's owner loop and returns its result or rethrows its failure. Windows are created through the host's command port from the example's own thread, which the owner loop executes, as an application's worker would. |
 | Identities | Every dispatched operation is checked, before it runs, to be on the bound process main thread that entered the session — the Haskell thread, the bound flag, and the OS thread read through `pthread_self` — and a failed check fails the operation and the run. Every native call the session makes is recorded where it runs by a `NativeObserver`, so an example shows from the calls themselves that the instance, its messenger, the device and every surface's destruction ran on the graphics owner's thread and every surface's creation on the main thread — never from the name of an Hspec hook. |
 | Sharing | The roots — the instance, its explicit messenger, and the one device — are acquired lazily, by the first dispatched operation, at most once, and shared by every later example. Each example's windows and targets are its own and are closed inside it. |
-| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, `vk12-frames`, `vk13-presentation`, `vk14-recovery`, `vk15-validation-stop`, `vk15-retention`, `vk16-composed`, `vk17-one-slot`, `vk17-two-slots`, `vk19-capture`, `grs15-surface-free`, `grs15-surface-free-window`, `grs12-frameless`, `grs3-ordering`, `grs7-texture-table`, `grs8-sprites`, `grs9-swap`, `grs10-scene3d`, `grs13-window-depth`, `grs14-table-growth`, `r2d17-depth-rect`, `synchronization-hazard`, `debug-names`, and, under the isolated compositor's consent only, `wayland-connection-loss`. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. Each child runs in a process group of its own under an external 20-second deadline covering its exit and the end of its output; one still running at it is terminated with its group and fails its example as expired. |
+| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, `vk12-frames`, `vk13-presentation`, `vk14-recovery`, `vk15-validation-stop`, `vk15-retention`, `vk16-composed`, `vk17-one-slot`, `vk17-two-slots`, `vk19-capture`, `grs15-surface-free`, `grs15-surface-free-window`, `grs12-frameless`, `grs3-ordering`, `grs7-texture-table`, `grs8-sprites`, `grs9-swap`, `grs10-scene3d`, `grs13-window-depth`, `grs14-table-growth`, `r2d17-depth-rect`, `r2d14-window-scenes`, `synchronization-hazard`, `debug-names`, and, under the isolated compositor's consent only, `wayland-connection-loss`. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. Each child runs in a process group of its own under an external 20-second deadline covering its exit and the end of its output; one still running at it is terminated with its group and fails its example as expired. |
 | Selection | Building, listing and filtering the tree, a `--dry-run`, and a selection that dispatches nothing acquire nothing and start no child. A selection matching no example fails. `--complete`, which the catalog group passes, runs the whole tree with Hspec's configuration reading left out and then fails unless the shared session was acquired once and every private scenario the run's consent requires ran and passed — every one, except that `wayland-connection-loss` is required under the isolated compositor's consent and pending under any other — so no ambient setting can turn the group's receipt into a pass for a subset. The consent rules and the migrated proof's pure release, construction, publication and loader-selection examples need no session and run without consent. |
 | Consent | Read once, at startup, from `HETOIMASIA_NATIVE_SESSION`, with the GLFW suite's rules for `desktop`, `isolated-x11:<display>` and `isolated-wayland:<socket>`: the last only on Linux, only when `WAYLAND_DISPLAY` names that socket, and never beside a `DISPLAY`. Under the Wayland consent every session requests Wayland by name — the shared host, each child's host, the VK-5 bridge's loader-aware session, and the proof shim's raw initialization, which sets `GLFW_PLATFORM` and fails one that selected another platform — so no X11 or XWayland session stands in; under the others every session requests nothing, as before. The first shared example asserts the platform GLFW selected before any example renders. Without consent every native example is refused before its body, the session is never acquired, and the run ends with the refusal on stderr and a non-zero exit. |
 | Environment | Before any Vulkan call, the suite clears every ambient discovery override and every validation-layer setting it finds and records which, disables implicit layers, and points the layer's settings file at an empty one; a child inherits and re-establishes the same environment. |
@@ -5948,6 +6107,24 @@ passes only if all of these hold:
 
 The PNGs and the record go beneath `HETOIMASIA_VALIDATION_EVIDENCE/swap/`
 when the runner names an evidence directory.
+
+R2D-14's case, `r2d14-window-scenes`, runs the production composition with
+`PerWindowScenes`, the validation layer and synchronization validation, over
+two mapped windows, driven by `runVulkanOwnerLoop`, with a test renderer that
+clears each frame to a colour taken from the scene its window was handed —
+scene 1 red, 2 green, 3 blue — and a lifecycle that logs each adoption and
+release. Nothing but a publication asks for a frame, and nothing is
+captured from the screen: every count is of the owner's own frame events. The
+case publishes scene 1 for the first window and requires its target to present
+one frame and the second's none, the owner round that made it allowed to end
+first; publishes scene 2 for the second window, which presents it; and then, in
+one transaction, publishes scene 3 for the second window and makes a release
+request while the second window shows revision 1. It passes only if the request
+ran after the owner adopted revision 2 of the second window; if each frame was
+cleared to its own window's scene; if every adoption was released, in order,
+by the host's exit; if every Vulkan call ran on the graphics owner's thread
+and every surface was created on the main thread; and if the verdict after the
+last teardown callback has no issue and no error was reported.
 
 R2D-17's case, `r2d17-depth-rect`, runs the same surface-free composition
 and host, with no uploads, to prove `clearDepthRect`

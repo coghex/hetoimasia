@@ -3900,7 +3900,7 @@ every Vulkan call on the owner's.
 | Attachment lifetime | main → owner | one bounded port |
 | `WindowObservation` and render eligibility | main → owner | one latest-value snapshot per attached target |
 | Render demand | main → owner | one latest-value snapshot |
-| Scene | any application thread → owner | one latest-value snapshot |
+| Scene | any application thread → owner | one latest-value snapshot, or one for each window (`ownerSceneMode`) |
 | Progress and the next deadline | owner → main | one coalescing status cell |
 | Retirement facts | owner → main | the host's existing completion publisher, with the terminal record retaining what a refusal could not carry |
 
@@ -4092,6 +4092,52 @@ which establishes nothing the owner had not already established. An owner whose
 run has ended without a target's record leaves no progress path at all, so that
 opportunity stalls: the window, the session and every parent stay retained, and
 only independent evidence revives it.
+
+#### A scene for each window
+
+`GraphicsOwnerConfig`'s `ownerSceneMode` chooses, once, whether the owner
+carries one scene for every target (`SharedScene`, the default, which is the
+owner as it has always been) or one for each window (`PerWindowScenes`,
+R2D-14). The initial scene `ownerScene` is the scene every window starts with,
+at revision 0.
+
+In `PerWindowScenes` the handoff holds one latest-value snapshot for each window
+that has had a publication, **keyed by the window's `WindowId`**, never by an
+attachment: a window's surface recreated under a new attachment incarnation
+leaves its publication where it was, and the new target takes it. A snapshot
+is its scene and its revision; the first publication is revision 1 and each
+accepted one is the next, for that window alone, so one window's revisions
+never move another's. `publishGraphicsWindowScene owner window scene` publishes
+from any application thread in one `STM` transaction that never waits and
+replaces the window's publication if the owner has not taken it. The windows
+the host holds (`hostWindowIdentities`) are read in the same transaction, so
+the answer is exact:
+
+| Answer | Meaning |
+|---|---|
+| `WindowScenePublished window revision` | Accepted, at this revision. |
+| `WindowSceneUnknown window` | The host holds no such window — never created, or retired. Nothing changed. |
+| `WindowSceneClosed window` | The owner's publications have closed. Nothing changed. |
+| `WindowScenesNotEnabled window` | The handoff carries one scene for the whole owner. Nothing changed. |
+
+`publishOwnerScene` is refused with `SceneRefusedPerWindow` in this mode, and
+publishes nothing. Each round the owner forgets the publication of every
+window the host no longer holds, so the table is bounded by the host's
+windows (the window limit); quiescence closes it with the rest of the
+publications.
+
+Each step is handed `stepSceneMode` and, in `PerWindowScenes`,
+`stepWindowScenes`: the scene of the window of every target the owner holds —
+its latest publication, or the initial scene at revision 0 when it has had none
+— beside the revision, read in the same transaction as the rest of the step's
+inputs. The shared scene stays the initial scene at revision 0, as nothing can
+publish it. The owner's wait compares a count that rises with every accepted
+window publication, so an idle owner wakes for any window's. What a backend
+does with a window's scene — which target it asks for a frame, when it adopts
+and releases a revision — is the backend's
+([A scene for each window](gpu_backend.md#a-scene-for-each-window));
+`readGraphicsSceneRevisions` reads, for every window the host holds, the latest
+revision published for it (the shared scene's, for each, in `SharedScene`).
 
 #### The owner's own scheduling
 
@@ -5192,6 +5238,7 @@ see [the Vulkan native suite](gpu_backend.md#the-native-suite).
 | Render demand: per-window scheduling state and the rotation cursor | Whichever caller threads the `RenderDemand` value | Each `renderTurn` folds the turn's captures and frame requests into it; `acknowledgeRender` clears what an offer served | Whatever thread the caller's turn runs on; no shared cell | The caller's own value | An entry is removed when a turn stops listing its window, when its phase is terminal, and by `forgetRenderWindow`; nothing here holds a window, a handle, or any state a driver could name |
 | Graphics owner lifetime port | The graphics owner's handoff | The main thread sends one attachment lifetime event; the owner receives | Any; STM | The owner worker | Closed by the exit before the join and drained by the owner's own retirement; bounded by its configured capacity |
 | Graphics target observation slots | The graphics owner's handoff | The main thread publishes; the owner reads | Any; STM | A target's attachment until the owner releases it | At most one per window the host may hold; removed when the owner releases the target, after which a publication for it answers unknown |
+| A window's scene snapshot (`PerWindowScenes`) | The graphics owner's handoff | Any application thread publishes (the host's windows read in the same transaction); the graphics owner reads and prunes | Any; STM | From the window's first publication until the host retires the window | Pruned by the owner's round once the host no longer holds the window; closed by the owner's quiescence |
 | Graphics render demand and scene snapshots | The graphics owner's handoff | The main thread publishes the demand; any application thread publishes the scene; the owner reads both | Any; STM | The owner worker | One value each, replaced by every publication; closed by the exit |
 | Graphics owner status | The graphics owner's handoff | The owner writes each round; any thread reads | Write: owner worker; read: any | The owner worker | Coalescing, replaced by every round; never evidence and never permission |
 | Graphics terminal records | The graphics owner's handoff | The owner writes one per target against what its injected retirement returned; the main thread validates and reads | Write: owner worker; read: any | Until the attachment it names has validated its facts and left the host's pending set | A record is written once and never replaced, and its facts stay owed until validated; it is forgotten only once the host's own model no longer holds that attachment, which is what keeps these bounded by the live windows rather than by incarnations |
