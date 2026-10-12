@@ -152,6 +152,7 @@ the audited suite inventory, and which optional probes are local-only.
 | `test.asset-image` | `cabal test --project-file cabal.project.cpu hetoimasia-asset-image:asset-image-tests --test-show-details=direct` | no | no | any |
 | `test.render-api` | `cabal test --project-file cabal.project.cpu hetoimasia-render-api:render-api-tests --test-show-details=direct` | no | no | any |
 | `test.render-2d` | `cabal test --project-file cabal.project.cpu hetoimasia-render-2d:render-2d-tests --test-show-details=direct` | no | no | any |
+| `test.render-2d-oracle` | `cabal test --project-file cabal.project.cpu hetoimasia-render-2d-oracle:render-2d-oracle-tests --test-show-details=direct` | no | no | any |
 | `smoke.console` | `cabal run exe:hetoimasia -- --smoke` | no | yes | any |
 | `test.workflow` | `cabal test workflow-tests --test-show-details=direct` | no | no | any |
 | `test.x11-helper` | `cabal test x11-helper-tests --test-show-details=direct` | yes | no | any |
@@ -314,6 +315,25 @@ validated values, offscreen target references and view mappings cannot be forged
 mandatory but outside the floor, like `test.math`, and runs through
 `cabal.project.cpu`: the library depends on no GPU, GLFW, Vulkan, runtime or
 Lua package. See [the package's contract](../packages/render-2d/README.md).
+
+`test.render-2d-oracle` runs the render-2d-oracle package's own suite: the pure
+oracle's expected pixels for hand-drawn fixtures worked on paper from its
+equations (the camera at the viewport's centre, whole-number zoom in both zoom
+modes, a quarter-turn rotation, UI at content scale 1 and 2, pixel snap moving a
+sprite rigidly, nearest and linear filtering across a texel boundary, sRGB
+decoding and encoding against UNORM, 2:1 minified fixtures reading level 1 with
+each filter, tint, brightness with a clamped result, additive output,
+premultiplied overlap in drawing order, equal keys in submission order, the
+placeholder, BC7 through its decoded levels, and the 8-bit store after every
+draw), every indeterminate case, every refusal of a defective target, index,
+image or readback at its boundary, the readback reader swizzling `B8G8R8A8`, and
+hand-written synthetic readbacks that the oracle rejects when overlap is
+reversed, a channel is off by two or the snap is wrong and accepts when exact.
+It is mandatory but outside the floor, like `test.math`, runs through
+`cabal.project.cpu` on the `haskell-engine` worker and publishes a reusable
+receipt like the other engine groups: the library depends on no GPU, GLFW,
+Vulkan, runtime or Lua package. See
+[the package's contract](../packages/render-2d-oracle/README.md).
 
 `test.vulkan-headless` runs the Vulkan-linked headless suites through
 `cabal.project.vulkan`, against the provisioned native prefix, and executes them
@@ -829,7 +849,7 @@ Each worker is declared once, to the planner:
 
 ```bash
 python3 tools/validation/plan.py --base origin/master --head HEAD \
-  --worker haskell-engine=cpu:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.vulkan,test.vulkan-diagnostics,test.math,test.asset-image,test.render-api,test.render-2d,smoke.console \
+  --worker haskell-engine=cpu:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.vulkan,test.vulkan-diagnostics,test.math,test.asset-image,test.render-api,test.render-2d,test.render-2d-oracle,smoke.console \
   --worker haskell-workflow=cpu:test.workflow \
   --worker glfw-native=display:test.glfw-native,test.glfw-wayland \
   --worker vulkan=cpu+display:test.vulkan-headless,test.vulkan-native,test.vulkan-wayland
