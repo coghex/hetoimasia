@@ -1,7 +1,7 @@
 cabal-version: 3.16
 name: hetoimasia-render-2d
 version: 0.1.0.0
-synopsis: The 2D renderer's frame value, validation and instance encoding
+synopsis: The 2D renderer's frame value, validation, draw plan and instance encoding
 description:
     A window's published frame as a pure value: an ordered list of passes, each
     naming its target (the window or an offscreen texture), its clear and its
@@ -12,7 +12,9 @@ description:
     was found; nothing is clamped, wrapped or corrected. The application-wide
     discrete-step-zoom list validates the same way. A pure function encodes a
     validated layer's instances into one strict buffer of 64 little-endian
-    bytes per instance. The library depends on hetoimasia-render-api,
+    bytes per instance. A pure draw plan routes each instance of a validated
+    snapshot to the cutout or the ordered path, orders a layer's instances and
+    splits them into draw runs. The library depends on hetoimasia-render-api,
     hetoimasia-math and standard libraries only: no GPU, GLFW, Vulkan, runtime
     or Lua package, and no native handle appears in any value. It reads no
     file, performs no IO, owns no state and starts no thread.
@@ -39,6 +41,7 @@ library
     import: language
     hs-source-dirs: src
     exposed-modules:
+        Hetoimasia.Render.TwoD.DrawPlan
         Hetoimasia.Render.TwoD.Encoding
         Hetoimasia.Render.TwoD.Settings
         Hetoimasia.Render.TwoD.Snapshot
@@ -53,8 +56,10 @@ library
         Hetoimasia.Render.TwoD.Internal.Check
         Hetoimasia.Render.TwoD.Internal.Target
     build-depends:
+        array >=0.5 && <0.6,
         base >=4.22 && <4.23,
         bytestring >=0.12 && <0.13,
+        containers >=0.8 && <0.9,
         hetoimasia-math ==0.1.0.0,
         hetoimasia-render-api ==0.1.0.0
 
@@ -68,6 +73,7 @@ test-suite render-2d-tests
     main-is: Main.hs
     hs-source-dirs: test
     other-modules:
+        Test.Render.TwoD.DrawPlan
         Test.Render.TwoD.Encoding
         Test.Render.TwoD.Flags
         Test.Render.TwoD.Opacity

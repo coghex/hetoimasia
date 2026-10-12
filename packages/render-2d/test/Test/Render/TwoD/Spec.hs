@@ -1,6 +1,7 @@
 -- | The render-2d package's component specs, composed under one @TwoD@ group.
 module Test.Render.TwoD.Spec (spec) where
 
+import qualified Test.Render.TwoD.DrawPlan as DrawPlan
 import qualified Test.Render.TwoD.Encoding as Encoding
 import qualified Test.Render.TwoD.Flags as Flags
 import qualified Test.Render.TwoD.Opacity as Opacity
@@ -13,5 +14,6 @@ spec = describe "TwoD" $ do
   Validation.spec
   ZoomSteps.spec
   Encoding.spec
+  DrawPlan.spec
   Flags.spec
   Opacity.spec
