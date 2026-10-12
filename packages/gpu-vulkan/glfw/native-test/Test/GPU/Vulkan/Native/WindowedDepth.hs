@@ -16,11 +16,14 @@
 -- front camera, which does not orbit, so the independent oracle's probes
 -- apply at the window's framebuffer.
 --
--- 1. A frame of the window is captured, and the front pose's probes at its
---    extent checked against the oracle.
+-- 1. The window is asked for frames continuously, so that its frames in flight
+--    share the generation's one depth image, each clearing it in turn; once
+--    'warmFrames' have been presented a frame of it is captured, and the front
+--    pose's probes at its extent checked against the oracle.
 -- 2. The window is resized through its command port. Once its target's active
---    generation is the one built at the new extent, a frame of it is captured
---    and its probes checked at that extent.
+--    generation is the one built at the new extent, it is asked for frames again
+--    until 'warmFrames' of them have been presented, and a frame of it is
+--    captured and its probes checked at that extent.
 -- 3. The loop finishes and the host exits through D-33.
 --
 -- Each probe is checked within an explicit tolerance, never a whole-image
@@ -72,7 +75,8 @@ import Hetoimasia.Foundation.Log
   , mkLogger
   )
 import Hetoimasia.Foundation.Messaging.Payload (prepare)
-import Hetoimasia.GLFW.Command (SubmitResult (..), setWindowSizeCommand, submitWindowCommand)
+import Hetoimasia.GLFW.Command (SubmitResult (..), clientDemandPublisher, setWindowSizeCommand, submitWindowCommand)
+import Hetoimasia.GLFW.Demand (immediateDemand, publishDemand)
 import Hetoimasia.GLFW.Session (Backend)
 import Hetoimasia.GLFW.Vulkan (withLoaderIntegration)
 import Hetoimasia.GLFW.Window (Extent (..), WindowConfig (..), hiddenTestWindowConfig)
@@ -119,6 +123,7 @@ import Hetoimasia.Runtime.GLFW
   , defaultScheduledHooks
   , graphicsAttachment
   , hostCommandPort
+  , hostWindowClient
   , hostWindowIdentities
   , readTargetStanding
   , runGraphicsOwnerApplication
@@ -140,6 +145,12 @@ import Test.GPU.Vulkan.Native.Environment (validationFeatures)
 import Test.GPU.Vulkan.Native.Platform (requestingBackend)
 import Test.Vulkan.Proof.Journal (Journal, heading, note)
 import Test.Vulkan.Proof.Roots (NativeCall (..), nativeCallObserver)
+
+-- | How many frames a window is asked for, and sees presented, before each
+-- capture: enough that frames overlap in flight and clear the shared depth
+-- image one after another, under synchronization validation.
+warmFrames ∷ Int
+warmFrames = 12
 
 -- | How far each channel may be from its expected value: the rounding in the
 -- sRGB encoding and in the device's conversion, and nothing else.
@@ -196,9 +207,14 @@ data WindowDepthOutcome
 -- | The step the composed loop's update opportunity is in.
 data Step
   = Starting
+  | WarmingFirst
+    -- ^ Frames of the first generation are asked for and presented.
   | CapturingFirst
   | Resizing !SurfaceExtent
     -- ^ The target's active extent when the resize was asked for.
+  | WarmingResized !Int
+    -- ^ Frames of the generation built after the resize are asked for; this
+    -- many had been presented when it was built.
   | CapturingResized
   | Settling
     -- ^ Both captures are in; the presentations made retire.
@@ -342,6 +358,16 @@ runWindowDepth backend journal = do
                       writeTVar ticket Nothing
                       modifyTVar' checked (<> [Checked label outcome active])
                     pure True
+          -- Ask the window for another frame; the loop asks again each turn, so
+          -- it always has one.
+          demand =
+            atomically (hostWindowClient windowHost window) >>= \case
+              Nothing → pure ()
+              Just client → () <$ publishDemand (clientDemandPublisher client) immediateDemand
+          presentedCount = length . filter isPresented <$> readTVarIO events
+          isPresented = \case
+            FramePresented {} → True
+            _ → False
           retired = do
             seen ← readTVarIO events
             let presented = [presentation | FramePresented _ _ presentation _ ← seen]
@@ -357,9 +383,13 @@ runWindowDepth backend journal = do
           Starting →
             activeOf >>= \case
               Nothing → pure ()
-              Just _ → do
-                ask "the window, before the resize"
-                atomically (writeTVar step CapturingFirst)
+              Just _ → atomically (writeTVar step WarmingFirst)
+          WarmingFirst → do
+            demand
+            count ← presentedCount
+            when (count >= warmFrames) $ do
+              ask "the window, before the resize"
+              atomically (writeTVar step CapturingFirst)
           CapturingFirst → do
             done ← collect
             when done $
@@ -377,9 +407,15 @@ runWindowDepth backend journal = do
             -- new extent.
             activeOf >>= \case
               Just extent | extent /= before → do
-                ask "the window, after the resize"
-                atomically (writeTVar step CapturingResized)
+                count ← presentedCount
+                atomically (writeTVar step (WarmingResized count))
               _ → pure ()
+          WarmingResized from → do
+            demand
+            count ← presentedCount
+            when (count >= from + warmFrames) $ do
+              ask "the window, after the resize"
+              atomically (writeTVar step CapturingResized)
           CapturingResized → do
             done ← collect
             when done (atomically (writeTVar step Settling))
@@ -585,6 +621,7 @@ windowDepthSection = \case
       <> [ "- the window was resized from " <> maybe "no extent" tshow (factsResizedFrom facts)
          , "- generations seen (extent, depth image): " <> tshow [(heldExtent entry, isJust (heldDepth entry)) | entry ← factsHeld facts]
          , "- frame requests: " <> tshow (length (factsRequests facts)) <> ", every one naming its generation's depth image: " <> tshow (all (isJust . requestedDepth) (factsRequests facts))
+         , "- frames presented: " <> tshow (length [() | FramePresented {} ← factsEvents facts]) <> ", of which submitted before an earlier submission had completed: " <> tshow (overlapped (factsEvents facts))
          , "- generations seen (usage, clipped): " <> tshow (factsPlans facts)
          , "- expected as the sRGB image stores each color, within " <> tshow tolerance
          , "- Vulkan calls: " <> tshow (length (vulkanCalls facts)) <> ", on " <> tshow (length (nub (map (.callHaskellThread) (vulkanCalls facts)))) <> " thread(s)"
@@ -593,6 +630,17 @@ windowDepthSection = \case
          , "- error reports: " <> tshow (length (factsErrors facts))
          , "- seconds, from the loader integration to the verdict: " <> Text.pack (show (factsSeconds facts))
          ]
+
+-- | How many frames were submitted while an earlier submission had not yet
+-- completed: frames in flight, which share their generation's depth image.
+overlapped ∷ [FrameEvent] → Int
+overlapped = go (0 ∷ Int) 0
+  where
+    go _ found [] = found
+    go outstanding found (event : rest) = case event of
+      FrameSubmitted {} → go (outstanding + 1) (if outstanding > 0 then found + 1 else found) rest
+      SubmissionCompleted _ → go (max 0 (outstanding - 1)) found rest
+      _ → go outstanding found rest
 
 vulkanCalls ∷ WindowDepthFacts → [NativeCall]
 vulkanCalls facts = [call | call ← factsCalls facts, "vk" `Text.isPrefixOf` call.callName]
@@ -612,6 +660,10 @@ spec outcome = describe "GRS-13 windowed depth" $ do
       -- Every frame of one generation named the one depth image.
       forM_ (nub (map requestedGeneration (factsRequests facts))) $ \generation →
         length (nub [requestedDepth request | request ← factsRequests facts, requestedGeneration request == generation]) `shouldBe` 1
+
+  it "presented frames continuously, so that each generation's depth image was cleared by frame after frame in flight" $
+    on outcome $ \facts →
+      length [() | FramePresented {} ← factsEvents facts] `shouldSatisfy` (>= 2 * warmFrames)
 
   it "captured the window before the resize and again at the extent of the generation built after it" $
     on outcome $ \facts → do
