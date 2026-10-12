@@ -42,7 +42,8 @@
 --   pipeline over the scene3d sample's shaders and a readback buffer, and
 --   records a frame-less batch whose pass clears the depth to 0.0, so that a
 --   less-or-equal test passes nothing, clears a rectangle touching none of the
---   target's edges to 1.0 with 'clearDepthRect', and draws a quad covering the
+--   target's edges to 1.0 with 'clearDepthRect' under a scissor much smaller
+--   than it, and draws a quad covering the
 --   whole target at depth 0.5. The main thread waits for its ticket; a second
 --   action reads the readback, which shows the quad's color exactly inside
 --   the rectangle and the pass's clear color exactly outside it, probed on
@@ -880,7 +881,7 @@ floatList values = ByteString.pack (concat [word (castFloatToWord32 value) | val
 -- depth-tested pipeline over the scene3d shaders, a readback buffer, and a
 -- frame-less batch that writes the quad into a ring region, begins a pass
 -- clearing the color to blue and the depth to 0.0, clears the rectangle to
--- 1.0, draws the quad at depth 0.5, ends the pass, copies the target into the
+-- 1.0 under a scissor much smaller than it, draws the quad at depth 0.5, ends the pass, copies the target into the
 -- readback after its transition, and returns it to rest.
 depthRectBatch ∷ Construction q inst msgr phys dev cmd → IO (Either Refusal (Readback, BatchTicket))
 depthRectBatch construction = do
@@ -895,6 +896,8 @@ depthRectBatch construction = do
               Right () →
                 inOrder
                   [ beginRenderingWithDepth recorder target ClearFromUndefined (ClearColor 0 0 1 1) (DepthPass depth ClearFromUndefined 0)
+                  , -- A scissor far smaller than the rectangle must not narrow the clear.
+                    setScissor recorder (Rect 0 0 4 4)
                   , clearDepthRect recorder depthRectCleared 1
                   , bindPipeline recorder pipeline
                   , setViewport recorder (Viewport 0 0 (fromIntegral side) (fromIntegral side))
