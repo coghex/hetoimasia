@@ -597,9 +597,12 @@ spec = describe "Texture table" $ do
       bindStorageTable recorder small 0 `shouldReturn` Left RefusedRecorderClosed
       clean rig
 
-    it "refuses another batch's claim and a reclaimed one, and a claim past what 32 bits can hold, with no native call" $ do
+    it "refuses another session's claim, another batch's and a reclaimed one, each with no native call" $ do
       (rig, _, kit) ← storageRig 4096 256
       pipeline ← storagePipeline rig TableShaderSampler storageShaders
+      -- A claim of a ring of another session.
+      (foreignRig, _, _) ← storageRig 4096 256
+      foreignClaim ← framelessOnce foreignRig (\recorder → tableClaim recorder 64)
       kept ← newIORef Nothing
       earlier ← framelessOnce rig $ \recorder → do
         claim ← tableClaim recorder 2048
@@ -607,19 +610,30 @@ spec = describe "Texture table" $ do
         pure ()
       earlier `shouldBe` ()
       Just claim ← readIORef kept
+      -- Each bind is the only thing between the two counts of commands.
+      let refusedBinding recorder held = do
+            before ← commandCount rig
+            answer ← bindStorageTable recorder held 0
+            after ← commandCount rig
+            pure (answer, after - before)
+      elsewhere ← framelessOnce rig $ \recorder → do
+        _ ← tableClaim recorder 64
+        inPassWith kit pipeline recorder (refusedBinding recorder foreignClaim)
+      elsewhere `shouldBe` (Left (RefusedMisuse (ForeignIdentity ResourceIdentity)), 0)
       other ← framelessOnce rig $ \recorder → do
         _ ← tableClaim recorder 64
-        inPassWith kit pipeline recorder (bindStorageTable recorder claim 0)
-      other `shouldBe` Left (RefusedMisuse (WrongParent BatchIdentity))
+        inPassWith kit pipeline recorder (refusedBinding recorder claim)
+      other `shouldBe` (Left (RefusedMisuse (WrongParent BatchIdentity)), 0)
       -- Its batch completes; the next claim needs the whole ring, so the
       -- region is reclaimed and handed on.
       settleAll rig
       reused ← framelessOnce rig $ \recorder → do
         _ ← tableClaim recorder 4096
-        inPassWith kit pipeline recorder (bindStorageTable recorder claim 0)
-      reused `shouldBe` Left (RefusedMisuse (StaleIdentity ResourceIdentity))
+        inPassWith kit pipeline recorder (refusedBinding recorder claim)
+      reused `shouldBe` (Left (RefusedMisuse (StaleIdentity ResourceIdentity)), 0)
       settleAll rig
       clean rig
+      clean foreignRig
 
     it "refuses a dynamic offset past 32 bits before narrowing it, computing the claim's start plus the offset without overflow" $ do
       -- The byte budget (D-40) keeps every ring's bytes below 2^32, so no
