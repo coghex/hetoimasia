@@ -3255,7 +3255,7 @@ limit, what was asked for and what the device allows:
 Both sets are ordinary descriptor-set layouts, so these are the ordinary
 limits; the update-after-bind counterparts are not read, since they may
 legally be zero on a device that does not support storage-buffer
-update-after-bind. A regression example (`Test.GPU.Vulkan.Native.Recording`)
+update-after-bind. A regression example (`Test.GPU.Vulkan.Native.Table`)
 converts a device with the ordinary limits sufficient and the counterparts
 zero.
 
