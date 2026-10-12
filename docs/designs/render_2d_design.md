@@ -35,7 +35,7 @@ concrete precondition
 - [x] R2D-9. Draw cutout sprites depth-tested in world layers — [#426]
 - [x] R2D-10. Retain static instance content across frames — [#429]
 - [x] R2D-15. Bind per-batch storage tables from the ring — [#427]
-- [ ] R2D-11. Accept application materials as checked fragment functions
+- [x] R2D-11. Accept application materials as checked fragment functions — [#430]
 - [x] R2D-12. Clip instances by index in the shader — [#428]
 - [ ] R2D-18. Animate instances by GPU frame selection
 - [ ] R2D-13. Sample an offscreen pass's target in later passes
@@ -1035,7 +1035,7 @@ Moved to the [asset design](asset_design.md) as AST-2 (D-15).
   material data records holding full handles, including those retained
   chunks carry (D-31).
 - **Phase:** 3
-- **Depends on:** R2D-9, R2D-15
+- **Depends on:** R2D-9, R2D-15, R2D-10
 - **Ordering:** independent
 - **Relevant decisions:** D-4, D-5, D-25, D-26, D-31
 - **Acceptance signals:** a sample material using a second texture through
