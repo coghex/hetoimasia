@@ -134,7 +134,8 @@ data NativeGeneration = NativeGeneration
   , genDepth ∷ !(Maybe ResourceId)
     -- ^ The depth image the generation owns when the session asked for windowed
     -- depth (GRS-13): a managed image of the recording's, made with the
-    -- generation, of its extent, and released with it ('endCpuUse').
+    -- generation, of its extent, and released with it, when the generation is
+    -- destroyed ('releaseGenerationDepth').
   }
 
 -- | What a target's generations are doing, as any thread may read it.
@@ -244,7 +245,8 @@ data Generations q inst msgr phys dev = Generations
 -- extent, named from the candidate generation's identity, and raises — as a
 -- refusal turned into 'WindowDepthRefused', or as the native call raised — if
 -- it cannot, having made nothing; 'windowDepthRelease' releases the managed
--- image in the model, in the transaction the generation's CPU use ends in.
+-- image in the model, in the transaction that records the generation's
+-- destruction.
 data WindowDepth = WindowDepth
   { windowDepthCreate ∷ GenerationId → SurfaceExtent → IO ResourceId
   , windowDepthRelease ∷ ResourceId → STM ()
@@ -382,9 +384,6 @@ endCpuUse generations generation = do
       Admitted next → ((), next)
       _ → ((), model)
     editGeneration generations generation (\entry → entry {genCpuEnded = True})
-    -- The generation's depth image goes with it (GRS-13): released here, it is
-    -- destroyed once the model reports every batch that recorded it complete.
-    for_ native (releaseGenerationDepth generations)
 
 isAsynchronous ∷ SomeException → Bool
 isAsynchronous exception = isJust (fromException exception ∷ Maybe SomeAsyncException)

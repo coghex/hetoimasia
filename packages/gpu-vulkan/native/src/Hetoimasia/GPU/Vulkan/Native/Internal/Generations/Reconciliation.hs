@@ -436,14 +436,19 @@ reconcile generations now target geometry = do
                 -- for one: made last, so a swapchain that cannot be built or an
                 -- image count that is refused spends none, and recorded the
                 -- moment it exists, so a construction that fails after it
-                -- releases it with the candidate.
+                -- releases it with the candidate once that is destroyed.
                 depth ← atomically (readTVar (generationsDepth generations))
                 case depth of
                   DepthDisabled → pure ()
                   DepthAwaiting → throwIO (WindowDepthRefused candidate "what makes it was not supplied")
                   DepthSupplied supplied → do
+                    -- A cancellation inside the image's or its view's creation
+                    -- leaves unknown whether either was made, as one inside a
+                    -- swapchain's does: the candidate is retained uncertain.
+                    writeIORef inCreation (Just "the depth image's creation")
                     made ← windowDepthCreate supplied candidate (planExtent planned)
                     atomically (editGeneration generations candidate (\entry → entry {genDepth = Just made}))
+                    writeIORef inCreation Nothing
                 pure count
           case outcome of
             Right count → publish candidate count

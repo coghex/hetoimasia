@@ -11,24 +11,27 @@
 -- Nothing here creates a Vulkan object, and nothing waits on a clock.
 module Test.GPU.Vulkan.Native.WindowDepth (spec) where
 
-import Control.Concurrent.STM (atomically)
+import Control.Concurrent (forkIO, killThread, myThreadId)
+import Control.Concurrent.MVar (putMVar, newEmptyMVar, takeMVar)
+import Control.Concurrent.STM (atomically, check, newTVarIO, readTVar)
 import qualified Data.ByteString as ByteString
+import Control.Exception (AsyncException (ThreadKilled), SomeException, fromException, try)
 import Control.Monad (void)
 import Data.List.NonEmpty (NonEmpty ((:|)))
 import Data.Maybe (isJust)
 import Data.Text (Text)
 import Data.Word (Word32, Word64)
 import Numeric.Natural (Natural)
-import Test.Hspec (Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy)
+import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldReturn, shouldSatisfy)
 
-import Hetoimasia.GPU.Model (DeviceLossRelease (..), SessionState (..), TargetPhase (..), TargetView (..), closeTarget, sessionState, usage, usageObjects)
+import Hetoimasia.GPU.Model (DeviceLossRelease (..), SessionFailureCause (CleanupFailed), SessionState (..), TargetPhase (..), TargetView (..), closeTarget, sessionState, usage, usageObjects)
 import Hetoimasia.GPU.Model.Identity (BatchId, GenerationId, ResourceId, TargetClass (..), TargetId, imageGeneration)
 import Hetoimasia.GPU.Vulkan.Native.Frames
 import Hetoimasia.GPU.Vulkan.Native.Generations
 import Hetoimasia.GPU.Vulkan.Native.Naming (windowDepthName)
 import Hetoimasia.GPU.Vulkan.Native.Presentation
 import Hetoimasia.GPU.Vulkan.Native.Recording
-import Hetoimasia.GPU.Vulkan.Native.Roots (lostDuring)
+import Hetoimasia.GPU.Vulkan.Native.Roots (lostDuring, readRootsView, viewAdmitting)
 import Test.GPU.Vulkan.Native.AllocatorStandIn (AllocatorCall (..), allocatorCalls, allocatorOutOfMemory)
 import Test.GPU.Vulkan.Native.FramesRig
 import Test.GPU.Vulkan.Native.FramesStandIn
@@ -42,6 +45,7 @@ import Test.GPU.Vulkan.Native.RecordingStandIn
   , supportImages
   )
 import Test.GPU.Vulkan.Native.StandIn (StandIn (standAllocator), offerSurface, surfaceNumbered)
+import qualified Test.GPU.Vulkan.Native.StandIn as Roots'
 
 type Rec = Recorder () Int Int Text Int Word64
 
@@ -111,24 +115,56 @@ spec = describe "Windowed depth (GRS-13)" $ do
       (batch, begun) ← depthFrame rig frame (clearedDepth firstDepth ClearFromUndefined)
       begun `shouldBe` Right ()
       _ ← submitted rig (batch :| [])
+      presentFrame (rigFrames rig) (ownedFrame frame) >>= either (fail . show) (const (pure ()))
       resizeTo rig 100 800 600
       second ← activeGeneration rig
       second `shouldSatisfy` (/= first)
       Just secondDepth ← depthOf rig second
       secondDepth `shouldSatisfy` (/= firstDepth)
       requested rig `shouldReturn` [(formatCode Depth32Float, 640, 480), (formatCode Depth32Float, 800, 600)]
-      -- The old generation is retired, so its depth is released; the batch
-      -- that recorded it has not completed, so it is not destroyed.
-      depthManaged rig `shouldReturn` [(managedResource firstDepth, ManagedReleased), (managedResource secondDepth, ManagedLive)]
+      -- The old generation is retired and its frame still holds it: its depth
+      -- stays, as it does until the generation itself is destroyed.
+      depthManaged rig `shouldReturn` [(managedResource firstDepth, ManagedLive), (managedResource secondDepth, ManagedLive)]
       disposeResources (rigRecording rig) (at 130) `shouldReturn` []
-      destroyedImages rig `shouldReturn` []
-      destroyedViews rig `shouldReturn` []
       settleAll rig
-      destroyed ← disposeResources (rigRecording rig) (at 140)
+      -- Nothing holds the generation now, so the next step destroys it and the
+      -- depth is released with it; the batch that recorded the depth has
+      -- completed, so the recording destroys it.
+      stepAt rig 140 800 600
+      depthManaged rig `shouldReturn` [(managedResource firstDepth, ManagedReleased), (managedResource secondDepth, ManagedLive)]
+      destroyedImages rig `shouldReturn` []
+      destroyed ← disposeResources (rigRecording rig) (at 141)
       destroyed `shouldBe` [managedResource firstDepth]
       length <$> destroyedImages rig `shouldReturn` 1
       length <$> destroyedViews rig `shouldReturn` 1
       depthManaged rig `shouldReturn` [(managedResource secondDepth, ManagedLive)]
+      clean rig
+
+    it "keeps the old depth image while the old generation's presentation is outstanding, though the batch that recorded it has completed, and releases it only once the generation can retire" $ do
+      rig ← newRigWindowDepth WindowedDepth
+      first ← activeGeneration rig
+      Just firstDepth ← depthOf rig first
+      frame ← owned rig
+      (batch, _) ← depthFrame rig frame (clearedDepth firstDepth ClearFromUndefined)
+      _ ← submitted rig (batch :| [])
+      presentFrame (rigFrames rig) (ownedFrame frame) >>= either (fail . show) (const (pure ()))
+      submission ← (\calls → [fence | Submitted _ fence ← calls]) <$> frameCalls (rigStandIn rig)
+      resizeTo rig 100 800 600
+      -- The graphics submission completes; the presentation's fence does not.
+      mapM_ (completeFence (rigStandIn rig)) submission
+      _ ← progress rig
+      stepAt rig 140 800 600
+      disposeResources (rigRecording rig) (at 141) `shouldReturn` []
+      depthManaged rig >>= (`shouldSatisfy` elem (managedResource firstDepth, ManagedLive))
+      destroyedImages rig `shouldReturn` []
+      -- Its presentation retires: the generation can be destroyed, and the depth
+      -- goes with it.
+      completeAll (rigStandIn rig)
+      _ ← progress rig
+      stepAt rig 150 800 600
+      depthManaged rig >>= (`shouldSatisfy` notElem (managedResource firstDepth, ManagedLive))
+      destroyed ← disposeResources (rigRecording rig) (at 151)
+      destroyed `shouldSatisfy` elem (managedResource firstDepth)
       clean rig
 
     it "destroys the old depth image at once when no batch recorded it" $ do
@@ -136,10 +172,13 @@ spec = describe "Windowed depth (GRS-13)" $ do
       first ← activeGeneration rig
       Just firstDepth ← depthOf rig first
       resizeTo rig 100 800 600
-      destroyed ← disposeResources (rigRecording rig) (at 130)
+      -- The retired generation, held by nothing, is destroyed by the next step.
+      disposeResources (rigRecording rig) (at 130) `shouldReturn` []
+      stepAt rig 140 800 600
+      destroyed ← disposeResources (rigRecording rig) (at 141)
       destroyed `shouldBe` [managedResource firstDepth]
 
-    it "releases the old depth image only when its generation's CPU use has ended, so a consumer holding the retired generation can still record with it" $ do
+    it "keeps the old depth image while a consumer holds the retired generation, and releases it only once the generation is destroyed" $ do
       rig ← newRigWindowDepth WindowedDepth
       first ← activeGeneration rig
       Just firstDepth ← depthOf rig first
@@ -151,6 +190,8 @@ spec = describe "Windowed depth (GRS-13)" $ do
       requested rig `shouldReturn` [(formatCode Depth32Float, 640, 480), (formatCode Depth32Float, 800, 600)]
       depthManaged rig `shouldReturn` [(managedResource firstDepth, ManagedLive), (managedResource secondDepth, ManagedLive)]
       atomically (endGenerationUse (rigGenerations rig) held)
+      depthManaged rig `shouldReturn` [(managedResource firstDepth, ManagedLive), (managedResource secondDepth, ManagedLive)]
+      stepAt rig 140 800 600
       depthManaged rig `shouldReturn` [(managedResource firstDepth, ManagedReleased), (managedResource secondDepth, ManagedLive)]
 
   describe "recovery and loss" $ do
@@ -161,8 +202,11 @@ spec = describe "Windowed depth (GRS-13)" $ do
       void (atomically (noteSwapchainResult (rigGenerations rig) first SwapchainSurfaceLost))
       wantedAt rig 1 `shouldReturn` []
       viewCondition <$> generationsOf rig `shouldReturn` SurfaceLost
-      depthManaged rig `shouldReturn` [(managedResource firstDepth, ManagedReleased)]
+      depthManaged rig `shouldReturn` [(managedResource firstDepth, ManagedLive)]
+      -- Held by nothing, the generation is destroyed by the next step, and its
+      -- depth is released with it.
       wantedAt rig 2 `shouldReturn` [rigTarget rig]
+      depthManaged rig `shouldReturn` [(managedResource firstDepth, ManagedReleased)]
       viewCondition <$> generationsOf rig `shouldReturn` SurfaceReplacing
       offerReplacementSurface (rigGenerations rig) (at 3) (rigTarget rig) (surfaceNumbered (rigRootsStandIn rig) 20) `shouldReturn` ReplacementInstalled
       stepAt rig 3 640 480
@@ -285,6 +329,33 @@ spec = describe "Windowed depth (GRS-13)" $ do
       viewCondition <$> generationsOf rig >>= (`shouldSatisfy` isConstructionFailed)
       depthManaged rig `shouldReturn` []
 
+    it "retains a candidate whose depth image's creation a cancellation interrupted inside the call, fails the session, and destroys none of it" $ do
+      rig ← newRigWindowDepth WindowedDepthPending
+      atomically (supplyRecordingWindowDepth (rigRecording rig))
+      gate ← newTVarIO False
+      began ← newEmptyMVar
+      -- The cancellation reaches the step inside the depth view's creation,
+      -- which blocks interruptibly: whether it made the view is unknown.
+      onceAt (rigRecordingStandIn rig) AtCreateView (putMVar began () >> atomically (readTVar gate >>= check))
+      owner ← myThreadId
+      _ ← forkIO (takeMVar began >> killThread owner)
+      outcome ← try @SomeException (stepAt rig 0 640 480)
+      either (\failure → fromException failure `shouldBe` Just ThreadKilled) (const (expectationFailure "the step was not cancelled")) outcome
+      [generation] ← viewGenerations <$> generationsOf rig
+      viewStanding generation `shouldSatisfy` \case
+        GenerationUncertain _ → True
+        _ → False
+      sessionState <$> modelOf rig `shouldReturn` SessionFailed CleanupFailed
+      viewAdmitting <$> atomically (readRootsView (rigRoots rig)) `shouldReturn` False
+      -- Nothing of it is destroyed or retried, and its teardown is refused.
+      stepAt rig 1 640 480
+      stepAt rig 200 640 480
+      recorded ← Roots'.calls (rigRootsStandIn rig)
+      [() | Roots'.DestroyedSwapchain _ ← recorded] `shouldBe` []
+      [() | Roots'.DestroyedView _ ← recorded] `shouldBe` []
+      length [() | Roots'.CreatedSwapchain {} ← recorded] `shouldBe` 1
+      retireTargetGenerations (rigGenerations rig) (at 300) (rigTarget rig) `raises` \(GenerationsRetained _ remaining) → remaining == [viewGeneration generation]
+
     it "releases the depth of a candidate the close superseded after the depth was made, and never publishes it" $ do
       rig ← newRigWindowDepth WindowedDepthPending
       atomically (supplyRecordingWindowDepth (rigRecording rig))
@@ -297,9 +368,11 @@ spec = describe "Windowed depth (GRS-13)" $ do
       view ← generationsOf rig
       [viewStanding entry | entry ← viewGenerations view] `shouldBe` [GenerationRetiredHeld]
       [isJust (viewDepth entry) | entry ← viewGenerations view] `shouldBe` [True]
+      -- The retired candidate is destroyed by the next step, with its depth.
+      stepAt rig 1 640 480
       depths ← depthManaged rig
       map snd depths `shouldBe` [ManagedReleased]
-      destroyed ← disposeResources (rigRecording rig) (at 1)
+      destroyed ← disposeResources (rigRecording rig) (at 2)
       destroyed `shouldBe` map fst depths
 
   describe "the frame's pass" $ do

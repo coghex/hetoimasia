@@ -113,12 +113,17 @@
 -- the allocation charged and, when the device is out of memory, recovered as
 -- any allocation is (VK-14) — fails the construction as any other of its
 -- native calls does: the candidate is retired and never published, and its
--- depth, if it had one, is released with it. A replacement makes its own depth
--- of its own extent; the old generation's is released when the generation's CPU
--- use ends, whether it was replaced, retired by a lost surface or by a close,
--- or its construction failed, and the model destroys it once every batch that
--- recorded it has completed, never earlier. Teardown releases what remains
--- with the recording. A depth image is read through 'viewDepth'.
+-- depth, if it had one, is released with it. A cancellation inside the image's
+-- creation leaves unknown whether it made anything, as one inside a swapchain's
+-- does, so the candidate is retained uncertain and the session fails. A
+-- replacement makes its own depth of its own extent. The old generation's is
+-- released when the generation is destroyed — only once every hold on the
+-- generation has ended, which is the evidence that retires it, and after its
+-- swapchain and views — whether it was replaced, retired by a lost surface or by
+-- a close, or its construction failed; the model destroys it once every batch
+-- that recorded it has completed, never earlier. A generation kept uncertain
+-- keeps its depth image too. Teardown releases what remains with the
+-- recording. A depth image is read through 'viewDepth'.
 --
 -- = Close
 --

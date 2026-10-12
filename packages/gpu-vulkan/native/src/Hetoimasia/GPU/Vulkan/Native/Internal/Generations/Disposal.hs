@@ -60,6 +60,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Generations.State
   , isAsynchronous
   , lookupGeneration
   , makeGenerations
+  , releaseGenerationDepth
   )
 import Hetoimasia.GPU.Vulkan.Native.Roots
   ( GenerationOps (..)
@@ -195,7 +196,11 @@ destroyGeneration generations device generation native = go (reverse (genViews n
           step "vkDestroySwapchainKHR" (opsDestroySwapchain ops device swapchain) (\entry → entry {genSwapchain = Nothing, genImages = []}) >>= \case
             Nothing → finished
             failure → pure failure
-    finished = Nothing <$ atomically (editGeneration generations generation (\entry → entry {genStanding = GenerationDestroyedPending}))
+    -- The generation's depth image (GRS-13) is released only now, with the
+    -- generation: after every hold on the generation has ended, which is the
+    -- evidence that retires it, and its swapchain and views are destroyed. The
+    -- recording destroys it once the batches that recorded it have completed.
+    finished = Nothing <$ atomically (editGeneration generations generation (\entry → entry {genStanding = GenerationDestroyedPending}) >> releaseGenerationDepth generations native)
     step name destroy record = mask_ $
       tryWithContext (rootsCall roots name destroy) >>= \case
         Right () → Nothing <$ atomically (editGeneration generations generation record)

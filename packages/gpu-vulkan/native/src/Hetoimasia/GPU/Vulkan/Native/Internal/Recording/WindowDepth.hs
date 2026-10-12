@@ -9,7 +9,7 @@
 -- first pass that clears it has been submitted (D-26), and a batch that records
 -- a pass with it retains it until that batch has completed. What differs is
 -- who owns it. The generation's construction makes it and records it; the
--- generation releases it, in the transaction its CPU use ends in, and the
+-- generation releases it, in the transaction its destruction is recorded in, and the
 -- recording destroys it once the model reports every hold on it ended. No
 -- handle releases it ('releaseManaged' refuses), and the frame's recorder
 -- takes it only from the request of a frame of its own generation
@@ -115,7 +115,7 @@ createWindowDepth recording generation extent =
         _ → pure ()
 
 -- | Release a generation's depth image in the model, in the transaction that
--- ends the generation's CPU use. A batch that recorded it keeps it until its
+-- records the generation's destruction. A batch that recorded it keeps it until its
 -- own references end.
 releaseWindowDepth ∷ Recording q inst msgr phys dev cmd → ResourceId → STM ()
 releaseWindowDepth recording resource = void (releaseLive recording resource)
