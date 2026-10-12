@@ -34,7 +34,7 @@ concrete precondition
 - [x] R2D-17. Clear a depth attachment within a rectangle — [#425]
 - [x] R2D-9. Draw cutout sprites depth-tested in world layers — [#426]
 - [ ] R2D-10. Retain static instance content across frames
-- [ ] R2D-15. Bind per-batch storage tables from the ring
+- [x] R2D-15. Bind per-batch storage tables from the ring — [#427]
 - [ ] R2D-11. Accept application materials as checked fragment functions
 - [ ] R2D-12. Clip instances by index in the shader
 - [ ] R2D-13. Sample an offscreen pass's target in later passes
