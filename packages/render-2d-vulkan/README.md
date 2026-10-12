@@ -175,7 +175,10 @@ clip   = ((target + shift) / extent) · 2 − 1                  Vulkan's Y down
 
 With snap on the camera's translation has already been rounded (inside
 `worldTransform`, D-9) and this rounds the sprite's origin, moving the quad
-rigidly: the arithmetic of `snapPoint`. UVs interpolate affinely from `(u0, v0)`
+rigidly: the arithmetic of `snapPoint`. The rounding is exact half-up, as
+`snapPixel` evaluates it: the shader takes `floor(p)` and adds 1 when the exact
+fraction `p − floor(p)` is at least ½, because `p + ½` is not exact in single
+precision (the largest `Float` below one half would round up to 1.0). UVs interpolate affinely from `(u0, v0)`
 at local (0, 0) to `(u1, v1)` at (1, 1). The handle, the tint, the flags and the
 parameter word pass on as flat values.
 
@@ -243,7 +246,7 @@ records a clear or a draw.
 
 The device's proof is the surface-free native case `r2d7-ordered-path` of
 `vulkan-native-tests` ([docs/gpu_backend.md](../../docs/gpu_backend.md#the-native-suite)),
-which renders ten fixtures through this recorder and judges every pixel of every
+which renders eleven fixtures through this recorder and judges every pixel of every
 target against [`hetoimasia-render-2d-oracle`](../render-2d-oracle/README.md).
 
 ## Not here

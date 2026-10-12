@@ -6428,7 +6428,7 @@ over the host's constructions — the ring, a table of 16 slots, the
 shader-sampled layout — and four textures: a 2 × 2 linear checker, a 2 × 2 sRGB
 grey, a 1 × 1 white and a 2 × 2 binary-alpha art texture. Their uploads are
 admitted off the owner's thread and waited for, the table's placeholder is
-awaited, and the textures are registered. Then, for each of ten fixtures, an
+awaited, and the textures are registered. Then, for each of eleven fixtures, an
 action makes the fixture's offscreen colour targets and readbacks, and one
 frame-less batch records the fixture's `render-2d` snapshot through
 `prepareSnapshot` — planned with no cutout marks, as the oracle is — and copies
@@ -6457,7 +6457,10 @@ otherwise):
 9. *cutout-art*: a depth-enabled world layer holding binary-alpha art, drawn
    ordered because nothing is marked;
 10. *placeholders*: a handle whose index no texture holds and one whose
-    generation is stale, beside a registered texture.
+    generation is stale, beside a registered texture;
+11. *snap-boundary*: a snapping view whose sprite's origin is the largest
+    `Float` below one half, which rounds to 0 as `snapPixel` rounds it exactly
+    (a shader adding 0.5 in single precision would round it to 1).
 
 Every pixel of every target is probed. A probe the oracle gives a determinate
 expectation must read within its tolerance; one it cannot decide — within 1/16
