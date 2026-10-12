@@ -4121,9 +4121,11 @@ the answer is exact:
 | `WindowScenesNotEnabled window` | The handoff carries one scene for the whole owner. Nothing changed. |
 
 `publishOwnerScene` is refused with `SceneRefusedPerWindow` in this mode, and
-publishes nothing. Each round the owner forgets the publication of every
-window the host no longer holds, so the table is bounded by the host's
-windows (the window limit); quiescence closes it with the rest of the
+publishes nothing. An accepted publication forgets the publication of every
+window the supplied list of held windows does not name, read in the same
+transaction, and the owner does the same each round, so the table is bounded by
+the host's windows (the window limit) whatever the owner is occupied with and
+however many windows come and go; quiescence closes it with the rest of the
 publications.
 
 Each step is handed `stepSceneMode` and, in `PerWindowScenes`,

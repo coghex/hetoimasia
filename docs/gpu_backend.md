@@ -3489,7 +3489,10 @@ is the `PresentationRetired` fact ([Retirement
 evidence](#retirement-evidence)). A signalled cleanup fence, followed by a
 release that returned, is the `UnpresentedFrameSettled` fact. Nothing else —
 elapsed time, a returned call, a cancellation, a reset fence — ever becomes any
-of them. A step makes
+of them. The completion is also appended, in that same transaction, to a log
+(`readCompletedSubmissions`, `takeCompletedSubmissions`) a consumer reads
+without depending on the step's return: a step that raises after recording one
+leaves it there, and a submission dropped as uncertain never enters it. A step makes
 at most the model's progress-action limit of native calls. Its work — each
 outstanding submission's fence, each cleanup owed, each cleanup fence — is one
 list that each step starts one place further along, so a budget smaller than
@@ -4087,14 +4090,21 @@ window, and a revision is removed from the ledger before its hook runs. The
 two hooks pair by window and revision; a revision adopted by two targets (a
 window reattached) is notified and released for each. A *use* ends on
 evidence that the frame's commands can no longer read what the scene
-references: its recording was discarded — the frame was skipped, which resets
-the recorder before it discharges the batch; a target's teardown skips the
-frames still acquired and unsubmitted, so it discards, once its reset has
-answered, a recording a renderer's exception left partial — or the submission
-that carried it completed. A submission's completion is read from the frames'
-own state — it is no longer outstanding there and the device has not been
-lost — so one recorded before a poll raised or was cancelled counts, and a
-submission is associated with its use in the same masked step that submits it. A frame abandoned after its submission, a presentation that was
+references: its recording was discarded, or the submission that carried it
+completed. Both are read from the layer that owns the fact, never from the
+answer of a call that may have been cancelled. A *completion* is the entry the
+frames append to their completion log in the transaction that records the
+model's completion on the fence's evidence (`readCompletedSubmissions`,
+`takeCompletedSubmissions`), so a step that raised or was cancelled afterwards
+leaves it; a submission an uncertain fence query dropped, or the device's loss
+let go of, is never in it, whatever the outstanding set says. A *discard* is a
+recording that has ended — however it ended, including by a renderer's exception
+— and for which the recording holds no unsubmitted batch of its frame: the skip,
+which a target's teardown makes of every frame still acquired, reset the
+recorder and dropped the batch. After the device's loss a skip lets go of the
+unsubmitted recording without resetting anything, so no discard is evidenced.
+A submission is associated with its use in the same masked step that submits it.
+A frame abandoned after its submission, a presentation that was
 refused or enqueued nothing, a timeout, the target's retirement and the owner's
 retirement end nothing. A use whose discard or completion is not established —
 a recording that raised, a skip that was refused, a submission the device's
