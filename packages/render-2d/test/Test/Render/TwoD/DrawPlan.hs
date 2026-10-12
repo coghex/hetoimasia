@@ -16,8 +16,10 @@
 -- materials.
 module Test.Render.TwoD.DrawPlan (spec) where
 
+import Control.Exception (evaluate)
 import Data.List (nub, sort)
 import Data.Word (Word32)
+import GHC.Exts.Heap (Box, allClosures, asBox, getBoxedClosureData)
 import Hetoimasia.Math.Vector (V2 (..))
 import Hetoimasia.Render.Api.Texture (TextureHandle)
 import Hetoimasia.Render.Api.Texture.Backend (textureHandle)
@@ -25,6 +27,7 @@ import Hetoimasia.Render.TwoD.DrawPlan
 import Hetoimasia.Render.TwoD.Settings (ViewSettings, defaultViewSettings)
 import Hetoimasia.Render.TwoD.Snapshot
 import Hetoimasia.Render.TwoD.Validation (Location (..), validateSnapshot)
+import System.Mem (performMajorGC)
 import Test.Hspec (Spec, describe, it, shouldBe)
 import Test.Hspec.QuickCheck (prop)
 import Test.QuickCheck
@@ -54,6 +57,7 @@ spec = describe "Draw plan" $ do
   withoutDepthSpec
   runSpec
   structureSpec
+  retentionSpec
   generatedSpec
 
 -- * Builders
@@ -378,6 +382,40 @@ structureSpec = describe "structure" $ do
       _ → fail "the UI layer was missing"
   it "plans a snapshot of no passes to no passes" $
     plannedWith marked (Snapshot []) `shouldBe` DrawPlan []
+
+-- * Retention
+
+-- | A planned layer keeps the permutation and its few runs, and nothing else
+-- per instance: after the layer is evaluated, the number of heap closures
+-- reachable from it does not depend on how many instances it orders. A lazy
+-- field still holding the list the order was built from would reach one closure
+-- or more for every instance.
+retentionSpec ∷ Spec
+retentionSpec = describe "retention" $ do
+  it "reaches the same heap from a layer of 4000 instances as from one of 200" $ do
+    small ← reachableFromLayer 200
+    large ← reachableFromLayer 4000
+    large `shouldBe` small
+  it "reaches a small heap: the permutation, the runs and the layer's few fields" $ do
+    reachable ← reachableFromLayer 4000
+    (reachable < 100) `shouldBe` True
+  where
+    reachableFromLayer count = do
+      let instances =
+            [ if even index then cutoutAt (fromIntegral (index `mod` 7)) else translucentAt (fromIntegral (index `mod` 5))
+            | index ← [0 .. count - 1 ∷ Int]
+            ]
+      planned ← evaluate (layerPlan marked (depthLayer instances))
+      performMajorGC
+      closureCount (asBox planned)
+
+-- | The closures reachable from a value, counted along every path. The values
+-- measured here are trees and small shared constants, with no cycle.
+closureCount ∷ Box → IO Int
+closureCount box = do
+  closure ← getBoxedClosureData box
+  below ← mapM closureCount (allClosures closure)
+  pure (1 + sum below)
 
 -- * Generated
 

@@ -190,7 +190,7 @@ data PlannedLayer = PlannedLayer
   , plannedOrder ∷ !(UArray Int Int)
   -- ^ The permutation of the layer's submission indices that is its drawing
   -- order. Empty in a zero-size viewport.
-  , plannedRuns ∷ [DrawRun]
+  , plannedRuns ∷ ![DrawRun]
   -- ^ The runs, in drawing order. They partition 'plannedOrder'.
   }
   deriving stock (Eq, Show)
@@ -246,12 +246,15 @@ planView marks passIndex viewIndex view =
 
 planLayer ∷ CutoutMarks → Viewport → Location → Layer → PlannedLayer
 planLayer marks viewport location layer =
+  -- Both fields that read the drawing order are evaluated before the layer
+  -- exists, and neither is a thunk: nothing the plan returns still refers to the
+  -- per-instance list, so only the permutation is kept.
   PlannedLayer
     { plannedLocation = location
     , plannedSpace = space
     , plannedClearsDepth = clearsDepth
     , plannedOrder = listArray (0, length order - 1) (map fst order)
-    , plannedRuns = runsOf (map snd order)
+    , plannedRuns = spineStrict (runsOf (map snd order))
     }
   where
     (space, clearsDepth) = case layer of
@@ -261,6 +264,11 @@ planLayer marks viewport location layer =
     order
       | emptyViewport viewport = []
       | otherwise = drawOrder marks clearsDepth (layerInstances layer)
+
+-- | The list with its spine and elements evaluated, so no unevaluated tail
+-- keeps what produced it alive.
+spineStrict ∷ [a] → [a]
+spineStrict items = foldr seq () items `seq` items
 
 emptyViewport ∷ Viewport → Bool
 emptyViewport (Viewport _ (V2 width height)) = width == 0 || height == 0
