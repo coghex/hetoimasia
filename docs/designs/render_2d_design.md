@@ -28,7 +28,7 @@ concrete precondition
 - [x] R2D-5. Decode PNG into premultiplied RGBA8 levels — [no-issue]: moved to the asset epic as AST-1 (D-15)
 - [x] R2D-6. Read KTX2 files carrying BC7 or RGBA8 levels — [no-issue]: moved to the asset epic as AST-2 (D-15)
 - [x] R2D-16. Let table pipelines choose samplers in the shader — [#421]
-- [ ] R2D-7. Record the ordered path in `render-2d-vulkan`, proven by offscreen readback
+- [x] R2D-7. Record the ordered path in `render-2d-vulkan`, proven by offscreen readback — [#422]
 - [ ] R2D-14. Publish scenes per window in the window host
 - [ ] R2D-8. Show a decoded image in a window through published snapshots
 - [ ] R2D-17. Clear a depth attachment within a rectangle
