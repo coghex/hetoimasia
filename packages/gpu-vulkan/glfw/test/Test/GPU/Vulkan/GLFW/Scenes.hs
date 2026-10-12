@@ -12,11 +12,13 @@
 -- read it from.
 module Test.GPU.Vulkan.GLFW.Scenes (spec) where
 
-import Control.Concurrent (forkIO)
+import Control.Concurrent (ThreadId, forkIO, throwTo, yield)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, registerDelay, writeTVar)
-import Control.Exception (throwIO, toException)
+import Control.Exception (ErrorCall (..), SomeException, throwIO, toException, try)
 import Control.Monad (void)
 import Data.List (nub, sort)
+import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (..), threadStatus)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust)
 import qualified Data.Text as Text
@@ -27,11 +29,14 @@ import System.Timeout (timeout)
 import Hetoimasia.Foundation.Messaging.Payload (prepare)
 import Hetoimasia.Foundation.Messaging.Snapshot (Publication (..))
 import Hetoimasia.GPU.Vulkan.Native.Frames (PresentStatus (..))
-import Hetoimasia.GLFW.Window (WindowId)
+import Hetoimasia.GLFW.Command (awaitSubmitWindowCommand, createWindowCommand)
+import Hetoimasia.GLFW.Window (WindowId, hiddenTestWindowConfig)
+import Hetoimasia.GPU.Model.Budget (defaultBudgetRequest, frameSlotLimit, validateBudgets)
 import Hetoimasia.GPU.Model (TargetPhase (..), TargetView (..), targetView)
 import Hetoimasia.GPU.Model.Identity (TargetClass (..))
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Loop (publishVulkanScene, publishVulkanWindowScene, runVulkanOwnerLoop)
+import Hetoimasia.GPU.Vulkan.GLFW.Internal.Scenes (adoptScene, endSceneTarget, newScenes, readSceneState, registerSceneTarget, releaseScenes, retentionLimit)
 import Hetoimasia.GPU.Vulkan.Native.Generations (GenerationView (..), SwapchainResult (..), TargetCondition (..), TargetGenerationsView (..))
 import Hetoimasia.GPU.Vulkan.Native.Recording (ClearColor (..))
 import Hetoimasia.GPU.Vulkan.Native.Roots (RootTargetView (..), TerminalCause (..))
@@ -51,6 +56,7 @@ import Hetoimasia.Runtime.GLFW
   , closeHostWindow
   , defaultScheduledHooks
   , graphicsAttachment
+  , hostCommandPort
   , ownerHandoff
   , publishGraphicsWindowScene
   , publishOwnerScene
@@ -80,10 +86,15 @@ spec = describe "Vulkan scenes for each window (R2D-14)" $ do
     itBounded "releases several superseded revisions with frames in flight in adoption order, once each, as their submissions complete" testReleaseOrder
     itBounded "keeps a revision awaiting release while its submission is pending, whatever became of the frame's presentation" testAbandonedFrameKeepsRevision
     itBounded "releases the revisions of an ended target and of the owner's retirement, each exactly once" testReleaseAtEnd
+    itBounded "holds a finite number of unreleased revisions for a target, adopting nothing newer behind a pending submission until a release makes room, then catching up in order" testRetentionBound
+    itBounded "completes an adoption's record, notification and watermark, and a release's removal and notifications, whatever cancels the owner meanwhile" testLedgerCancellation
+    itBounded "ends the use of a recording that raised once the target's teardown discards it, releasing its revision at the target's retirement" testTeardownDiscard
 
   describe "release requests" $ do
     itBounded "wait for the revision current when they were made, observably, and run once the window adopts it" testRequestWaitsForAdoption
-    itBounded "wait for a window with a publication and no target, are not delayed by one that was not named, run in the order made, and are released by that window's end" testRequestOrderAndWindowEnd
+    itBounded "wait for a window with a publication and no target, run in the order made without holding back an action that has no barrier, and are released by that window's end" testRequestOrderAndWindowEnd
+    itBounded "wait for every window the host holds, even one with no target and no publication, in a per-window host and in a shared one" testTargetlessWindowHolds
+    itBounded "are not delayed by a window created after they were made" testRequestIgnoresLaterWindow
     itBounded "wait on a shared scene's revision for every window in a shared host" testRequestSharedMode
     itBounded "are refused when the queue is full and before the device exists, and settled as refused, never replayed, when the owner exits" testRequestAdmission
     itBounded "are refused after the session's failure, including one queued before it that never started" testRequestAfterFailure
@@ -504,21 +515,21 @@ testRequestWaitsForAdoption = do
 
 testRequestOrderAndWindowEnd ∷ IO ()
 testRequestOrderAndWindowEnd = do
-  rig ← scenesRig 4
+  rig ← scenesRig 3
   (barriers, whileHeld, finished) ← runRig rig $ \host control → do
     windows ← windowsOf host
-    (c, d) ← case drop 2 windows of
-      [third, fourth] → pure (third, fourth)
-      _ → failWith "the host holds fewer than four windows"
-    _ ← attachBoth rig host control
+    c ← case drop 2 windows of
+      third : _ → pure third
+      [] → failWith "the host holds fewer than three windows"
+    (a, _, b, _) ← attachBoth rig host control
     -- A window with a publication and no target: nothing adopts it until the
     -- window ends.
     held ← publishTo host c 1
     held `shouldBe` WindowScenePublished c 1
     ran ← newTVarIO []
-    first ← request host (mark ran "first")
-    second ← request host (mark ran "second")
-    plain ← atomically (submitVulkanAction (vulkanController host) (mark ran "plain")) >>= either (\refusal → failWith ("refused: " <> show refusal)) pure
+    _ ← request host (mark ran "first")
+    _ ← request host (mark ran "second")
+    _ ← atomically (submitVulkanAction (vulkanController host) (mark ran "plain")) >>= either (\refusal → failWith ("refused: " <> show refusal)) pure
     composedUntil rig host control "the plain action's run" ((== ["plain"]) <$> readTVarIO ran)
     settleOwner rig host
     whileHeld ← readTVarIO ran
@@ -534,25 +545,83 @@ testRequestOrderAndWindowEnd = do
     spun `shouldBe` False
     (statusNextDeadline idle, statusImmediate idle) `shouldBe` (Nothing, False)
     state ← atomically (readVulkanSceneState (vulkanController host))
-    -- A window that had no publication when they were made is not named, and
-    -- nothing about it delays them.
-    _ ← publishTo host d 5
     CloseStarted ← closeHostWindow (vulkanWindowHost host) c
     composedUntil rig host control "the first window's end" (notElem c <$> windowsOf host)
     composedUntil rig host control "both requests" ((== 3) . length <$> readTVarIO ran)
     finished ← readTVarIO ran
-    _ ← (,,) <$> ranWith first <*> ranWith second <*> ranWith plain
-    pure ((c, d, sceneRequests state), whileHeld, finished)
-  let (c, d, requests) = barriers
+    pure ((a, b, c, sceneRequests state), whileHeld, finished)
+  let (a, b, c, requests) = barriers
   -- Held while C's publication was unadopted, behind neither each other nor
   -- the action admitted after them.
   whileHeld `shouldBe` ["plain"]
   length requests `shouldBe` 2
-  forM_' requests $ \named → do
-    Map.lookup c named `shouldBe` Just 1
-    Map.member d named `shouldBe` False
+  forM_' requests $ \named →
+    named `shouldBe` Map.fromList [(a, 0), (b, 0), (c, 1)]
   -- The window's end released them, in the order they were made.
   finished `shouldBe` ["plain", "first", "second"]
+
+-- | A request names every window the host holds, whether or not it has a
+-- target or a publication yet: the scene it holds may be adopted by a target
+-- attached later, and must find what it references still there.
+testTargetlessWindowHolds ∷ IO ()
+testTargetlessWindowHolds = do
+  perWindow ← scenesRig 3
+  shared ← visibleRigOf 3
+  forM_' [(perWindow, 0), (shared, 0)] $ \(rig, expected) → do
+    (named, whileHeld, afterEnd) ← runRig rig $ \host control → do
+      windows ← windowsOf host
+      c ← case drop 2 windows of
+        third : _ → pure third
+        [] → failWith "the host holds fewer than three windows"
+      (a, _, b, _) ← attachBoth rig host control
+      ran ← newTVarIO []
+      -- C has no target and no publication.
+      _ ← request host (mark ran "request")
+      state ← atomically (readVulkanSceneState (vulkanController host))
+      _ ← atomically (submitVulkanAction (vulkanController host) (mark ran "plain")) >>= either (\refusal → failWith ("refused: " <> show refusal)) pure
+      composedUntil rig host control "the plain action's run" ((== ["plain"]) <$> readTVarIO ran)
+      settleOwner rig host
+      whileHeld ← readTVarIO ran
+      CloseStarted ← closeHostWindow (vulkanWindowHost host) c
+      composedUntil rig host control "the request after C's end" (notElem c <$> windowsOf host)
+      composedUntil rig host control "the request's run" ((== 2) . length <$> readTVarIO ran)
+      afterEnd ← readTVarIO ran
+      pure ((a, b, c, sceneRequests state), whileHeld, afterEnd)
+    let (a, b, c, requests) = named
+    requests `shouldBe` [Map.fromList [(a, expected), (b, expected), (c, expected)]]
+    whileHeld `shouldBe` ["plain"]
+    afterEnd `shouldBe` ["plain", "request"]
+
+testRequestIgnoresLaterWindow ∷ IO ()
+testRequestIgnoresLaterWindow = do
+  rig ← scenesRig 3
+  (requests, created, finished) ← runRig rig $ \host control → do
+    windows ← windowsOf host
+    c ← case drop 2 windows of
+      third : _ → pure third
+      [] → failWith "the host holds fewer than three windows"
+    _ ← attachBoth rig host control
+    ran ← newTVarIO []
+    _ ← request host (mark ran "request")
+    state ← atomically (readVulkanSceneState (vulkanController host))
+    -- A window created after the request, with a publication nothing will
+    -- adopt: it is not named, and delays nothing once C ends.
+    submitted ← newTVarIO False
+    forkAndSet (void (awaitSubmitWindowCommand (hostCommandPort (vulkanWindowHost host)) [("client", "integration-tests")] (createWindowCommand (hiddenTestWindowConfig "created later" 64 48)))) submitted
+    composedUntil rig host control "the created window" ((== 4) . length <$> windowsOf host)
+    later ← filter (`notElem` windows) <$> windowsOf host
+    late ← case later of
+      [one] → pure one
+      other → failWith ("expected one new window, saw " <> show other)
+    published ← publishTo host late 9
+    published `shouldBe` WindowScenePublished late 1
+    CloseStarted ← closeHostWindow (vulkanWindowHost host) c
+    composedUntil rig host control "the request's run" ((== ["request"]) <$> readTVarIO ran)
+    pure (sceneRequests state, late, ())
+  case requests of
+    [named] → Map.member created named `shouldBe` False
+    other → failWith ("expected one pending request, saw " <> show other)
+  finished `shouldBe` ()
 
 forM_' ∷ [a] → (a → IO ()) → IO ()
 forM_' items body = mapM_ body items
@@ -711,3 +780,148 @@ testRequestAfterFailure = do
     settledAs = \case
       ActionRefused (ActionSessionFailed cause) → Just cause
       _ → Nothing
+
+-- ---------------------------------------------------------------------------
+-- Retention, cancellation and teardown
+
+testRetentionBound ∷ IO ()
+testRetentionBound = do
+  rig ← scenesRig 1
+  slots ← either (const (failWith "the default budgets are invalid")) (pure . frameSlotLimit) (validateBudgets defaultBudgetRequest)
+  let bound = fromIntegral (retentionLimit slots) ∷ Int
+      newest = 12 * fromIntegral bound ∷ Natural
+  (published, adopted, awaiting, caught, released) ← runRig rig $ \host control → do
+    [window] ← windowsOf host
+    service ← attach host window
+    composedUntil rig host control "the first adoption" (not . null . flip adoptedBy window <$> sceneEvents rig)
+    submissionsComplete rig False
+    baseline ← presentsOf rig (graphicsAttachment service)
+    _ ← publishTo host window 1
+    composedUntil rig host control "the first revision's frame" ((> baseline) <$> presentsOf rig (graphicsAttachment service))
+    -- Many publications behind one submission that has not completed: the
+    -- window's snapshot keeps the latest, and the target adopts no more than
+    -- its limit allows.
+    forM_' [2 .. fromIntegral newest] $ \value → void (publishTo host window value)
+    settleOwner rig host
+    composedUntil rig host control "the owner's pressure" $ do
+      state ← atomically (readVulkanSceneState (vulkanController host))
+      pure (fmap windowPublished (Map.lookup window (sceneWindows state)) == Just (Just newest))
+    settleOwner rig host
+    state ← atomically (readVulkanSceneState (vulkanController host))
+    let standing = Map.lookup window (sceneWindows state)
+    -- Completion makes room, and the target catches up with the latest.
+    submissionsComplete rig True
+    composedUntil rig host control "the latest revision's adoption" $ do
+      held ← atomically (readVulkanSceneState (vulkanController host))
+      pure (fmap windowAdopted (Map.lookup window (sceneWindows held)) == Just (Just newest))
+    settleOwner rig host
+    events ← sceneEvents rig
+    pure (fmap windowPublished standing, fmap windowAdopted standing, maybe 0 (length . windowAwaitingRelease) standing, length (adoptedBy events window), releasedBy events window)
+  published `shouldBe` Just (Just newest)
+  -- Behind the pending submission the target held at most its limit, so it
+  -- adopted fewer revisions than were published, and the list awaiting release
+  -- stayed finite.
+  adopted `shouldSatisfy` maybe False (maybe False (< newest))
+  awaiting `shouldSatisfy` (< bound)
+  caught `shouldSatisfy` (<= bound + fromIntegral (newest `div` 1))
+  -- Once room was made, releases went in adoption order, each once.
+  released `shouldBe` sort released
+  released `shouldBe` nub released
+
+-- | The ledger's two transitions, cancelled from outside while their hooks
+-- run: the adoption is recorded, notified and published to the barrier, and the
+-- release is removed and notified for every record it took, whatever cancels
+-- the thread meanwhile.
+testLedgerCancellation ∷ IO ()
+testLedgerCancellation = do
+  rig ← scenesRig 1
+  (adoptedBeforeCancel, adoptedAfter, releasedAll) ← runRig rig $ \host _ → do
+    [window] ← windowsOf host
+    service ← attach host window
+    let attachment = graphicsAttachment service
+    scenes ← newScenes
+    atomically (registerSceneTarget scenes attachment)
+    hooks ← newTVarIO ([] ∷ [String])
+    entered ← newEmptyMVar
+    proceed ← newEmptyMVar
+    let lifecycle = SceneLifecycle
+          { sceneAdopted = \_ revision _ → do
+              atomically (modifyTVar' hooks (<> ["adopted " <> show revision]))
+              putMVar entered ()
+              takeMVar proceed
+          , sceneReleased = \_ revision → do
+              atomically (modifyTVar' hooks (<> ["released " <> show revision]))
+              putMVar entered ()
+              takeMVar proceed
+          }
+        cancelDuring action = do
+          finished ← newEmptyMVar
+          thread ← forkIO (try @SomeException (void action) >>= putMVar finished)
+          takeMVar entered
+          -- The cancellation is delivered once the transition ends, never in it:
+          -- the thrower is blocked until then, and only then is the hook let go.
+          cancelled ← forkIO (throwTo thread (ErrorCall "cancelled"))
+          awaitSettled cancelled
+          putMVar proceed ()
+          takeMVar finished
+    -- An adoption cancelled while its hook runs.
+    _ ← cancelDuring (adoptScene scenes lifecycle 100 attachment (5 ∷ Scene) 3)
+    standing ← atomically (readSceneState scenes (pure []))
+    -- A second revision, then the target ends: two records are due, and the
+    -- release is cancelled while the first one's hook runs.
+    _ ← cancelDuring (adoptScene scenes lifecycle 100 attachment (6 ∷ Scene) 4)
+    -- Take the second adoption's own cancellation out of the way: the thread
+    -- it ran on is gone, and nothing is waiting on 'proceed'.
+    atomically (endSceneTarget scenes attachment)
+    finished ← newEmptyMVar
+    thread ← forkIO (try @SomeException (releaseScenes scenes (sceneReleased lifecycle) (\_ _ → pure False)) >>= putMVar finished)
+    takeMVar entered
+    cancelled ← forkIO (throwTo thread (ErrorCall "cancelled"))
+    awaitSettled cancelled
+    putMVar proceed ()
+    -- The second record's hook runs as well, though the first was cancelled.
+    takeMVar entered
+    putMVar proceed ()
+    _ ← takeMVar finished
+    after ← atomically (readSceneState scenes (pure []))
+    done ← readTVarIO hooks
+    pure (fmap windowAdopted (Map.lookup window (sceneWindows standing)), fmap windowAwaitingRelease (Map.lookup window (sceneWindows after)), done)
+  adoptedBeforeCancel `shouldBe` Just (Just 3)
+  adoptedAfter `shouldBe` Just []
+  releasedAll `shouldBe` ["adopted 3", "adopted 4", "released 3", "released 4"]
+
+testTeardownDiscard ∷ IO ()
+testTeardownDiscard = do
+  -- A renderer that raises leaves its frame acquired with a partial recording.
+  -- The owner's run ends; its teardown skips the frame, which discards the
+  -- recording once the recorder's reset succeeds, and the revision is released
+  -- at the target's retirement. (A refused skip discards nothing, so its use
+  -- stays; the frames' retirement then never completes, which an example
+  -- cannot end, so that half is the code's: the use is removed only on a skip
+  -- that answered.)
+  discarded ← scenesRig 1
+  outcome ← runRigCaught discarded $ \host control → do
+    [held] ← windowsOf host
+    _ ← superviseGraphicsOwner control (vulkanGraphicsOwner host)
+    _ ← attach host held
+    composedUntil discarded host control "the first adoption" (not . null . flip adoptedBy held <$> sceneEvents discarded)
+    renderWith discarded (VulkanRenderer (\_ _ _ _ → throwIO (StandInFailure "the renderer raised")))
+    _ ← publishTo host held 77
+    composedUntil discarded host control "the renderer's failure" (checkRuntime control >> pure False)
+  either (const (pure ())) (const (failWith "the run returned instead of failing with the renderer's")) outcome
+  events ← sceneEvents discarded
+  [window] ← case nub [at | SceneAdopted at _ _ ← events] of
+    [only] → pure [only]
+    other → failWith ("expected one window, saw " <> show other)
+  adoptedBy events window `shouldBe` [(0, 0), (1, 77)]
+  releasedBy events window `shouldBe` [0, 1]
+
+-- | Wait until a thread throwing an exception to another is blocked on its
+-- delivery, or has delivered it.
+awaitSettled ∷ ThreadId → IO ()
+awaitSettled thread =
+  threadStatus thread >>= \case
+    ThreadBlocked BlockedOnException → pure ()
+    ThreadFinished → pure ()
+    ThreadDied → pure ()
+    _ → yield >> awaitSettled thread

@@ -879,6 +879,9 @@ data Rendering q inst msgr phys dev cmd = Rendering
 -- so does the revision it names.
 data SceneUse = SceneUse
   { useAttachment ∷ !AttachmentId
+  , useFrame ∷ !FrameSlotId
+    -- ^ The frame slot whose recording this is, so a teardown that discards
+    -- the recording can end the use.
   , useRevision ∷ !Natural
   , useSubmission ∷ !(Maybe SubmissionId)
     -- ^ The submission that carried the frame, once there was one.
@@ -1134,10 +1137,10 @@ sceneUsed rendering attachment revision =
   any (\use → useAttachment use == attachment && useRevision use == revision) . Map.elems <$> readTVar (renderingUses rendering)
 
 -- | Open the use of a scene revision a frame is about to record.
-openUse ∷ Rendering q inst msgr phys dev cmd → AttachmentId → Natural → IO Natural
-openUse rendering attachment revision = atomically $ do
+openUse ∷ Rendering q inst msgr phys dev cmd → AttachmentId → FrameSlotId → Natural → IO Natural
+openUse rendering attachment frame revision = atomically $ do
   serial ← stateTVar (renderingUseSerial rendering) (\at → (at, at + 1))
-  modifyTVar' (renderingUses rendering) (Map.insert serial (SceneUse attachment revision Nothing))
+  modifyTVar' (renderingUses rendering) (Map.insert serial (SceneUse attachment frame revision Nothing))
   pure serial
 
 -- | Ask the fences, once, and report what was observed.
@@ -1265,7 +1268,7 @@ renderDue rendering renderer now sceneOf due =
     recordOne made target attachment owned image capture scene revision = do
       -- The use is opened before the renderer can record anything, so that no
       -- way the recording ends leaves a frame that read the scene unrecorded.
-      use ← openUse rendering attachment revision
+      use ← openUse rendering attachment (ownedFrame owned) revision
       let request = FrameRequest attachment target (ownedFrame owned) (ownedImage owned) (imageExtent image) (imageFormat image) revision (imageDepth image)
           construction = construct rendering made
           finish recorder = case capturedWork capture of
@@ -1485,7 +1488,14 @@ prepareTargetRetirement rendering now target =
           stateRootsModel (renderingRoots rendering) $ \model → case closeTarget target model of
             Admitted next → ((), next)
             _ → ((), model)
-      void (closeTargetFrames (liveFrames made) target)
+      closed ← closeTargetFrames (liveFrames made) target
+      -- A frame skipped here is an unsubmitted recording discarded, its
+      -- recorder reset before its batch's references were let go: the use of
+      -- a recording that raised, or was left partial, ends on that evidence. A
+      -- refused skip discards nothing and the use stays; a submitted frame is
+      -- closed, not discarded, and its use ends with its submission.
+      atomically . modifyTVar' (renderingUses rendering) $
+        Map.filter (\use → not (isNothing (useSubmission use) && any (\(frame, answer) → frame == useFrame use && either (const False) (const True) answer) closed))
       model ← atomically (readRootsModel (renderingRoots rendering))
       if deviceLossObserved model
         then pure (Nothing, [])

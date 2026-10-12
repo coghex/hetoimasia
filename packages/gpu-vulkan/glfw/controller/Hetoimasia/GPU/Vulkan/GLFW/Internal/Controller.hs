@@ -290,7 +290,7 @@ import Control.Monad (forM, forM_, join, unless, void, when)
 import Control.Monad.IO.Class (liftIO)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as Char8
-import Data.Foldable (for_, traverse_)
+import Data.Foldable (for_)
 import Data.Functor ((<&>))
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Maybe (isJust, isNothing)
@@ -329,9 +329,10 @@ import Hetoimasia.GPU.Model
   , SessionFailureCause (RequiredTargetUnrecoverable)
   , SessionState (SessionFailed)
   , escalations
+  , modelBudgets
   , sessionState
   )
-import Hetoimasia.GPU.Model.Budget (Budgets)
+import Hetoimasia.GPU.Model.Budget (Budgets, frameSlotLimit)
 import Hetoimasia.GPU.Model.Identity (GenerationId, TargetClass (..), TargetId)
 import Hetoimasia.GPU.Vulkan.Diagnostics
   ( CaptureAlarm (..)
@@ -376,6 +377,7 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Scenes
   , Scenes
   , VulkanSceneState (..)
   , WindowSceneStanding (..)
+  , Adopting (..)
   , adoptScene
   , endSceneTarget
   , forgetSceneTarget
@@ -385,6 +387,7 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Scenes
   , readSceneState
   , registerSceneTarget
   , releaseScenes
+  , retentionLimit
   , sceneBarrier
   , sceneBarrierMet
   )
@@ -943,7 +946,13 @@ controllerOperations (VulkanController state) renderer lifecycle =
         -- rendered, so every frame of the step is of a scene its target has
         -- adopted and a release request the adoption satisfies runs in this
         -- same step.
-        traverse_ (\(attachment, (scene, revision)) → adoptScene (stateScenes state) lifecycle attachment scene revision) (Map.toList scenes)
+        limit ← retentionLimit . frameSlotLimit . modelBudgets <$> atomically (readRootsModel (stateRoots state))
+        answered ← traverse (\(attachment, (scene, revision)) → (,) attachment <$> adoptScene (stateScenes state) lifecycle limit attachment scene revision) (Map.toList scenes)
+        -- A target at its retention limit adopted nothing: this step renders
+        -- nothing for it and asks nothing of it, so its demand and the window's
+        -- newer publication are still owed when a release has made room.
+        let pressed = [attachment | (attachment, AtLimit) ← answered]
+            adoptable = foldr Map.delete scenes pressed
         served ← serviceActions state
         settled ← settleUnannounced state
         let geometries = Map.fromList [(target, targetGeometry view) | (target, view) ← constructed]
@@ -974,7 +983,7 @@ controllerOperations (VulkanController state) renderer lifecycle =
             (stateRendering state)
             StepInputs
               { inputsNow = now
-              , inputsSceneRevisions = Map.map snd scenes
+              , inputsSceneRevisions = Map.map snd adoptable
               , inputsDemand = stepDemand step
               , inputsDemandRevision = stepDemandRevision step
               , inputsTargets = targets
@@ -992,7 +1001,7 @@ controllerOperations (VulkanController state) renderer lifecycle =
         -- A replacement the generations' step just published is asked for a
         -- frame in this step, not left for a later publication to notice.
         published ← requestPublished (stateRendering state) targets (planDue plan)
-        presented ← renderDue (stateRendering state) renderer now (`Map.lookup` scenes) (planDue plan <> published)
+        presented ← renderDue (stateRendering state) renderer now (`Map.lookup` adoptable) (planDue plan <> published)
         -- A capture whose batch completed is delivered in the step whose poll
         -- observed it, and what the renderer or a capture released is
         -- destroyed once nothing holds it.
@@ -1010,7 +1019,7 @@ controllerOperations (VulkanController state) renderer lifecycle =
         refreshRenderingTable (stateRendering state)
         reclaimReleased (stateRendering state) now
         -- The scene revisions this step's polls ended the last uses of.
-        _ ← settleSceneReleases state
+        released ← settleSceneReleases state
         asked ← askReplacements state (summarySurfacesWanted summary)
         replaced ← settleReplacements state now (stepTargets step)
         noticeUnavailable state
@@ -1018,7 +1027,10 @@ controllerOperations (VulkanController state) renderer lifecycle =
         -- Adopting a scene and releasing one are bookkeeping, not work the step
         -- did on the device: a host that presents nothing reports none, as it
         -- always has.
-        pure (if served || uploaded || settled || summaryAdvanced summary || asked || replaced || presented || captured then noStepWork {stepAdvanced = True} else noStepWork)
+        let report = if served || uploaded || settled || summaryAdvanced summary || asked || replaced || presented || captured then noStepWork {stepAdvanced = True} else noStepWork
+        -- A release made room for a target that was at its limit: it adopts in
+        -- the next round, which is owed at once.
+        pure report {stepImmediateWork = released && not (null pressed)}
 
 -- | Why an upload was not admitted through the controller (GRS-6).
 data VulkanUploadRefusal

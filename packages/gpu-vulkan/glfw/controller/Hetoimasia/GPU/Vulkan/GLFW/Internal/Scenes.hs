@@ -25,7 +25,18 @@
 -- Adopting a revision runs the lifecycle's 'sceneAdopted', handing it the
 -- exact scene the step took, and only then raises the window's adopted
 -- watermark, which is what a release request's barrier reads. The revision
--- the target held before is superseded.
+-- the target held before is superseded. The whole transition — the ledger's
+-- record, the hook and the watermark — runs uninterruptibly, so a
+-- cancellation of the owner lands before it or after it and never inside:
+-- every adoption that is recorded has been notified, and every notified one
+-- is on the ledger to be released.
+--
+-- A target holds a finite number of unreleased revisions (D-28's pressure):
+-- its current one and the superseded ones still awaiting release, bounded by
+-- 'retentionLimit'. A target at its limit adopts nothing newer. The step
+-- skips its frame, keeps the window's demand, and tries again once a release
+-- has made room; the publication itself never waits, and the window's snapshot
+-- keeps the latest scene meanwhile.
 --
 -- = Release
 --
@@ -39,18 +50,20 @@
 -- Releases are made in adoption order for each window: a revision is released
 -- only after every revision adopted before it for the same window has been.
 -- Each is removed from the ledger before its 'sceneReleased' runs, so it is
--- released exactly once, however that hook ends.
+-- released exactly once, and the removal and the hooks of one pass run
+-- uninterruptibly together, so a cancellation never loses a notification
+-- between them.
 --
 -- = Release requests
 --
--- A release request waits for a 'Barrier' captured when it was made: for each
--- participating window, the latest revision published for it. A window
--- participates when it holds a live target, or, in a per-window host, when
--- it has had a publication — a snapshot nobody has adopted is one a release
--- must not run past. The barrier is met when, for each window it names, the
--- window's adopted watermark has reached that revision, or the host no longer
--- holds the window. A window that appears later is not named, and so delays
--- nothing.
+-- A release request waits for a 'Barrier' captured when it was made: for every
+-- window the host holds, the latest revision published for it — the initial
+-- scene's revision 0 for a window with no publication, whether or not it has
+-- a target yet, since a window attached later adopts the scene it holds and
+-- must find what it references still there. The barrier is met when, for each
+-- window it names, the window's adopted watermark has reached that revision,
+-- or the host no longer holds the window. A window that appears later is not
+-- named, and so delays nothing.
 --
 -- = State
 --
@@ -66,10 +79,8 @@
 -- |                  |             | the state read it                  |        |                       |                           |
 -- +------------------+-------------+------------------------------------+--------+-----------------------+---------------------------+
 --
--- The ledger is bounded by the host's windows and the frames in flight: a
--- target has one current record, and a superseded record stays only while
--- some frame recorded with it has a use that is not over, of which a target
--- has at most one for each frame slot.
+-- The ledger is bounded: a target holds at most 'retentionLimit' records, and
+-- the host's windows bound the targets.
 module Hetoimasia.GPU.Vulkan.GLFW.Internal.Scenes
   ( -- * The lifecycle
     SceneLifecycle (..)
@@ -81,6 +92,8 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Scenes
   , SceneSource (..)
   , installSceneSource
   , registerSceneTarget
+  , Adopting (..)
+  , retentionLimit
   , adoptScene
   , endSceneTarget
   , forgetSceneTarget
@@ -97,7 +110,8 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Scenes
   ) where
 
 import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, writeTVar)
-import Control.Monad (filterM, forM_, when)
+import Control.Exception (uninterruptibleMask_)
+import Control.Monad (filterM, forM_)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe)
@@ -190,39 +204,65 @@ registerSceneTarget scenes attachment =
   modifyTVar' (scenesLedger scenes) $ \ledger →
     ledger {ledgerTargets = Map.insertWith (\_ held → held) attachment (TargetScene Nothing False) (ledgerTargets ledger)}
 
+-- | What adopting a scene for a target came to.
+data Adopting
+  = Adopted
+    -- ^ The target adopted it now.
+  | AlreadyHeld
+    -- ^ The target holds this revision or a newer one, or has ended: there is
+    -- nothing to adopt.
+  | AtLimit
+    -- ^ The target holds as many unreleased revisions as it may. Nothing was
+    -- adopted, and a later attempt may be.
+  deriving (Eq, Show)
+
+-- | How many unreleased revisions one target may hold for a host whose targets
+-- have this many frame slots: the revisions frames in flight can reference,
+-- and the current one, and as many again waiting behind them in adoption
+-- order. It is derived from the budgets, not chosen, so the frames the host
+-- may keep in flight never reach it before the owner has been told.
+retentionLimit ∷ Natural → Natural
+retentionLimit slots = 2 * (slots + 1)
+
 -- | Adopt this scene, at this revision, for this target, when it is newer than
--- what the target holds. Answers whether it was adopted.
+-- what the target holds and the target is below its retention limit.
 --
--- The bookkeeping is complete, and the hook has run, before the window's
--- adopted watermark moves.
-adoptScene ∷ Scenes → SceneLifecycle scene → AttachmentId → scene → Natural → IO Bool
-adoptScene scenes lifecycle attachment scene revision = do
-  taken ← atomically $ do
+-- The ledger's record, the hook and the watermark are one uninterruptible
+-- transition; the hook has run, and the bookkeeping is complete, before the
+-- window's adopted watermark moves.
+adoptScene ∷ Scenes → SceneLifecycle scene → Natural → AttachmentId → scene → Natural → IO Adopting
+adoptScene scenes lifecycle limit attachment scene revision = uninterruptibleMask_ $ do
+  answer ← atomically $ do
     ledger ← readTVar (scenesLedger scenes)
     case Map.lookup attachment (ledgerTargets ledger) of
       Just target
         | not (targetEnded target)
-        , maybe True (< revision) (targetAdopted target) → do
-            writeTVar (scenesLedger scenes) $
-              ledger
-                { ledgerTargets = Map.insert attachment target {targetAdopted = Just revision} (ledgerTargets ledger)
-                , ledgerRecords = map (supersede attachment) (ledgerRecords ledger) <> [Adoption attachment revision False]
-                }
-            pure True
-      _ → pure False
-  when taken $ do
-    sceneAdopted lifecycle window revision scene
-    atomically $ do
-      -- The watermark of a window the host no longer holds is dropped with it:
-      -- a barrier treats such a window as ended without reading it.
-      held ← readTVar (scenesSource scenes) >>= maybe (pure Nothing) (fmap Just . sourceWindows)
-      modifyTVar' (scenesLedger scenes) $ \ledger →
-        ledger
-          { ledgerAdopted =
-              maybe id (\windows → Map.filterWithKey (\at _ → at `elem` windows)) held $
-                Map.insertWith max window revision (ledgerAdopted ledger)
-          }
-  pure taken
+        , maybe True (< revision) (targetAdopted target) →
+            if fromIntegral (length (filter ((== attachment) . adoptionAttachment) (ledgerRecords ledger))) >= limit
+              then pure AtLimit
+              else do
+                writeTVar (scenesLedger scenes) $
+                  ledger
+                    { ledgerTargets = Map.insert attachment target {targetAdopted = Just revision} (ledgerTargets ledger)
+                    , ledgerRecords = map (supersede attachment) (ledgerRecords ledger) <> [Adoption attachment revision False]
+                    }
+                pure Adopted
+      _ → pure AlreadyHeld
+  case answer of
+    Adopted → do
+      sceneAdopted lifecycle window revision scene
+      atomically $ do
+        -- The watermark of a window the host no longer holds is dropped with
+        -- it: a barrier treats such a window as ended without reading it.
+        held ← readTVar (scenesSource scenes) >>= maybe (pure Nothing) (fmap Just . sourceWindows)
+        modifyTVar' (scenesLedger scenes) $ \ledger →
+          ledger
+            { ledgerAdopted =
+                maybe id (\windows → Map.filterWithKey (\at _ → at `elem` windows)) held $
+                  Map.insertWith max window revision (ledgerAdopted ledger)
+            }
+    _ → pure ()
+  pure answer
   where
     window = attachmentWindow attachment
 
@@ -256,7 +296,7 @@ forgetSceneTarget scenes attachment =
 -- released. Each is removed from the ledger in one transaction with the
 -- others, before the hook is run for any of them.
 releaseScenes ∷ Scenes → (WindowId → Natural → IO ()) → (AttachmentId → Natural → STM Bool) → IO Bool
-releaseScenes scenes released used = do
+releaseScenes scenes released used = uninterruptibleMask_ $ do
   due ← atomically $ do
     ledger ← readTVar (scenesLedger scenes)
     ready ← filterM (\record → if adoptionSuperseded record then not <$> used (adoptionAttachment record) (adoptionRevision record) else pure False) (ledgerRecords ledger)
@@ -277,23 +317,13 @@ releaseScenes scenes released used = do
 -- Release requests
 
 -- | The barrier a release request made now waits for, in one transaction with
--- the host's windows and their published revisions.
+-- the host's windows and their published revisions: every window the host
+-- holds, at the latest revision published for it.
 sceneBarrier ∷ Scenes → STM Barrier
 sceneBarrier scenes =
   readTVar (scenesSource scenes) >>= \case
     Nothing → pure Map.empty
-    Just source → do
-      revisions ← sourceRevisions source
-      ledger ← readTVar (scenesLedger scenes)
-      let live =
-            Set.fromList
-              [ attachmentWindow attachment
-              | (attachment, target) ← Map.toList (ledgerTargets ledger)
-              , not (targetEnded target)
-              ]
-          participates window revision =
-            window `Set.member` live || (sourceMode source == PerWindowScenes && revision >= 1)
-      pure (Map.filterWithKey participates revisions)
+    Just source → sourceRevisions source
 
 -- | Whether a barrier is met: for each window it names, the window's adopted
 -- watermark has reached the revision, or the host no longer holds the window.
