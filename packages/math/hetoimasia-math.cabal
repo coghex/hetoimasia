@@ -4,7 +4,7 @@ version: 0.1.0.0
 synopsis: Vectors, matrices and projective transformations for Hetoimasia
 description:
     Two-, three- and four-component vectors and 4×4 matrices of 32-bit Float,
-    affine transforms, a look-at view matrix, and a perspective projection whose
+    affine transforms, 2×3 affine transforms of the plane, a look-at view matrix, and a perspective projection whose
     depth range and clip-space Y direction are explicit parameters. Conventions:
     column vectors multiplied as M × v, right-handed world and view space with
     the camera looking down −Z, and checked operations that return Maybe rather
@@ -34,6 +34,7 @@ library
     import: language
     hs-source-dirs: src
     exposed-modules:
+        Hetoimasia.Math.Affine2
         Hetoimasia.Math.Matrix
         Hetoimasia.Math.Projection
         Hetoimasia.Math.Transform
@@ -53,6 +54,7 @@ test-suite math-tests
     main-is: Main.hs
     hs-source-dirs: test
     other-modules:
+        Test.Math.Affine2
         Test.Math.Matrix
         Test.Math.Projection
         Test.Math.Spec

@@ -10,6 +10,8 @@ packages:
   packages/math
   packages/asset
   packages/asset-image
+  packages/render-api
+  packages/render-2d
   packages/runtime
   packages/scripting-lua
   packages/gpu-vulkan/model

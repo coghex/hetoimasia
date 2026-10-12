@@ -286,6 +286,50 @@
       "optional": false
     },
     {
+      "id": "test.render-api",
+      "description": "Portable Hspec contracts for the render-api package's texture handle: construction and access through the backend-facing module at every Word32 edge, in every pairing of index and generation, and over generated values; equality, ordering (by index, then generation) and show; and, through separately compiled external clients that expose only base and the package, that the public module supplies the handle's instances but neither its constructor nor a field reader nor the backend's construction function, while the backend-facing module builds and reads a handle. It runs through the CPU project; the library depends on base alone.",
+      "command": [
+        "cabal",
+        "test",
+        "--project-file",
+        "cabal.project.cpu",
+        "hetoimasia-render-api:render-api-tests",
+        "--test-show-details=direct"
+      ],
+      "component": "hetoimasia-render-api:test:render-api-tests",
+      "inputs": [
+        "cabal.project.common",
+        "cabal.project.cpu"
+      ],
+      "framework": "hspec",
+      "runner": "cpu",
+      "timeout_seconds": 1800,
+      "category": "test",
+      "optional": false
+    },
+    {
+      "id": "test.render-2d",
+      "description": "Portable Hspec contracts for the render-2d package's frame value and instance encoding: snapshot validation refusing, with every reason found and its pass, view, layer and instance index, a non-finite or out-of-range UI scale, brightness, fixed half-height, camera, viewport, clear colour, transform and UV rectangle, a depth key of 2^24 or more, a second or non-final window pass and a non-zero clip index, each at its boundary and retained together across locations, including inside a zero-size viewport; offscreen-only snapshots accepted and validated snapshots unchanged; the discrete-step-zoom list's refusals; the 64-byte little-endian instance layout checked field by field against hand-written bytes and an independent reference encoder, for zero, one and many generated instances; the flags word's packing for every sampler choice and flag combination with its reserved bits zero and the clip index in the top 16 bits; and, through external clients, that validated values and offscreen target references cannot be forged. It runs through the CPU project and needs no GPU.",
+      "command": [
+        "cabal",
+        "test",
+        "--project-file",
+        "cabal.project.cpu",
+        "hetoimasia-render-2d:render-2d-tests",
+        "--test-show-details=direct"
+      ],
+      "component": "hetoimasia-render-2d:test:render-2d-tests",
+      "inputs": [
+        "cabal.project.common",
+        "cabal.project.cpu"
+      ],
+      "framework": "hspec",
+      "runner": "cpu",
+      "timeout_seconds": 1800,
+      "category": "test",
+      "optional": false
+    },
+    {
       "id": "test.vulkan-headless",
       "description": "Vulkan-linked headless Hspec contracts, executed rather than only built, through cabal.project.vulkan against the provisioned native prefix: the native backend's profile and roots decisions over a stand-in native layer (native-tests), its shader contract against the provisioned compiler (shader-tests), the window integration's controller over the GLFW package's scripted seam (integration-tests), the triangle sample's pipeline cache over stand-in builders (triangle-tests), the sprites sample's scene, probe oracle, fixtures and PNG writer (sprites-tests), and the scene3d sample's scene, cameras built with the math package, independent probe oracle and PNG writer (scene3d-tests). None acquires a display, a GLFW session, or a device, and none reads desktop consent; the headers and loader are build and link prerequisites only.",
       "command": [
