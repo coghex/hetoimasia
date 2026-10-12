@@ -5,7 +5,9 @@ draws two flat-coloured cubes, one in front of the other, indexed and with a
 depth test, from two camera poses, into an offscreen colour target and a depth
 target. Its independent probe oracle and window-free evidence mode show the
 result is right — that the nearer cube occludes the farther one by depth, and
-that the camera moved — not merely that it was submitted.
+that the camera moved — not merely that it was submitted. GRS-13 (#350) adds a
+windowed mode: the same scene drawn into a window's own image with the depth
+image of the window's swapchain generation, from a camera that slowly orbits it.
 
 It has two packages, in the triangle and sprites samples' dependency direction:
 
@@ -140,9 +142,52 @@ bash tools/vulkan/run.sh native hetoimasia-sample-scene3d-app:exe:hetoimasia-sce
   --evidence --output-dir /tmp/scene3d-evidence --validation
 ```
 
-There is no windowed mode yet. It arrives with windowed depth (GRS-13, #350),
-which gives each swapchain generation its own depth image; this sample's
-windowed mode will then orbit the camera around this scene.
+## Windowed mode
+
+`hetoimasia-scene3d --windowed [--seconds N] [--validation]` opens one window
+(800×600) whose host asked for windowed depth (`vulkanWindowDepth`, GRS-13). Every
+swapchain generation of the window owns one managed depth image of its extent,
+shared by its frames in flight; each frame's request names it, and the sample's
+renderer begins its pass into the frame's own image with it
+(`beginFrameRenderingWithDepth`), clearing the colour to the scene's clear colour
+and the depth to 1.0 from undefined, then draws the two cubes nearer first as the
+offscreen evidence does. A window resized is rebuilt at its new size with a depth
+image of its own; the application does nothing for it. The camera orbits the
+scene on a circle of radius 7 about its vertical axis at height 2.6, looking at
+the scene's centre, and turns a quarter of a degree each frame it draws — about
+fifteen degrees a second at sixty frames a second — until the window is closed or
+`--seconds` has passed. Frames are drawn as fast as the swapchain presents them.
+
+The projection is built for the window's own aspect ratio
+(`Hetoimasia.Sample.Scene3d.Camera.projectionMatrixFor`); everything else is the
+offscreen drawing's — the same shaders, vertices, push constants and pipeline,
+built once for the window's colour format on the first frame, with the session's
+shared ring made then too. The pipeline declares the depth format the backend
+chose, which is the format of every generation's depth image. The window's
+swapchain is sRGB, so a colour the shaders write reads back encoded: the
+sample's `storedChannel` is what a channel of an expected colour reads as.
+
+It prints the frames presented and the diagnostic verdict when the window has
+closed, and exits 0 only when the verdict is clean. It is launched explicitly and
+never run by tests: it opens a window on the desktop it is started on.
+
+```bash
+bash tools/vulkan/run.sh build hetoimasia-sample-scene3d-app:exe:hetoimasia-scene3d
+bash tools/vulkan/run.sh native hetoimasia-sample-scene3d-app:exe:hetoimasia-scene3d -- \
+  --windowed --validation
+```
+
+The native suite checks the windowed drawing with a window of its own and the
+front camera, which does not orbit, so the oracle's probes apply: it is the
+`grs13-window-depth` private case (`Test.GPU.Vulkan.Native.WindowedDepth`), which
+captures a frame, resizes the window, captures a frame of the generation built at
+the new size and checks the front pose's probes, scaled to each framebuffer, at
+both extents, within a tolerance of 6 per channel, writing the captures and a
+probe record beneath `HETOIMASIA_VALIDATION_EVIDENCE/scene3d-windowed/` when the
+validation runner names an evidence directory. The retained captures and record
+are in [`docs/evidence/gpu_3d_windowed/`](../../docs/evidence/gpu_3d_windowed/README.md);
+[the backend's contract](../../docs/gpu_backend.md#windowed-depth) describes
+what the host gives a windowed renderer.
 
 ## The probe oracle
 
@@ -219,3 +264,11 @@ one interior, every purpose present in both poses, the occlusion probes
 discriminating, the camera-moved probes real — and that the oracle tells a right
 image from one drawn without depth or with one value wrong; the PNG writer; and
 that the probe record is well-formed JSON.
+
+It also checks the windowed mode's pure parts: the orbiting camera, which stays on
+its circle at its height looking at the scene's centre whatever its angle, and
+whose matrices exist for every angle at a window's own aspect ratio and equal the
+evidence target's at its own; the front pose's probes scaled to each framebuffer
+the native case may meet, each still well inside a face there, with an
+occlusion, a face and a clear probe among them, the oracle's colour for each; and
+the sRGB encoding the swapchain stores colours in.

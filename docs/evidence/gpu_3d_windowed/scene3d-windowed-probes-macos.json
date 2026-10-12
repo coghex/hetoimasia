@@ -1,0 +1,45 @@
+{
+  "tolerance": 6,
+  "frames": [
+    {
+      "step": "the window, before the resize",
+      "capture": "scene3d-windowed-the-window-before-the-resize.png",
+      "extent": [320, 240],
+      "format": 50,
+      "probes": [
+        {"name": "front: near cube +Z face", "pixel": [218, 171], "purpose": "FaceColour", "expected": [255, 168, 182, 255], "observed": [255, 168, 182, 255], "passed": true},
+        {"name": "front: near cube +Y face", "pixel": [206, 103], "purpose": "FaceColour", "expected": [255, 236, 56, 255], "observed": [255, 236, 56, 255], "passed": true},
+        {"name": "front: far cube +Z face, moved from the side pose's pixels", "pixel": [103, 102], "purpose": "CameraMovedPlace", "expected": [168, 202, 255, 255], "observed": [168, 202, 255, 255], "passed": true},
+        {"name": "front: far cube +X face, moved from the side pose's pixels", "pixel": [161, 76], "purpose": "CameraMovedPlace", "expected": [108, 143, 229, 255], "observed": [108, 143, 229, 255], "passed": true},
+        {"name": "front: near cube -X face, hidden from the side pose", "pixel": [151, 175], "purpose": "CameraMovedFace", "expected": [250, 187, 110, 255], "observed": [250, 187, 110, 255], "passed": true},
+        {"name": "front: pixel (146, 132) shows the near cube's +Z face", "pixel": [182, 165], "purpose": "CameraMovedPlace", "expected": [255, 168, 182, 255], "observed": [255, 168, 182, 255], "passed": true},
+        {"name": "front: near cube -X face over the far cube", "pixel": [143, 130], "purpose": "Occlusion", "expected": [250, 187, 110, 255], "observed": [250, 187, 110, 255], "passed": true},
+        {"name": "front: near cube +Y face over the far cube", "pixel": [161, 102], "purpose": "Occlusion", "expected": [255, 236, 56, 255], "observed": [255, 236, 56, 255], "passed": true},
+        {"name": "front: clear, upper left", "pixel": [10, 10], "purpose": "Clear", "expected": [99, 120, 137, 255], "observed": [99, 120, 137, 255], "passed": true},
+        {"name": "front: clear, right", "pixel": [300, 75], "purpose": "Clear", "expected": [99, 120, 137, 255], "observed": [99, 120, 137, 255], "passed": true},
+        {"name": "front: clear, lower left", "pixel": [50, 220], "purpose": "Clear", "expected": [99, 120, 137, 255], "observed": [99, 120, 137, 255], "passed": true}
+      ]
+    }
+,
+    {
+      "step": "the window, after the resize",
+      "capture": "scene3d-windowed-the-window-after-the-resize.png",
+      "extent": [400, 300],
+      "format": 50,
+      "probes": [
+        {"name": "front: near cube +Z face", "pixel": [273, 214], "purpose": "FaceColour", "expected": [255, 168, 182, 255], "observed": [255, 168, 182, 255], "passed": true},
+        {"name": "front: near cube +Y face", "pixel": [257, 129], "purpose": "FaceColour", "expected": [255, 236, 56, 255], "observed": [255, 236, 56, 255], "passed": true},
+        {"name": "front: far cube +Z face, moved from the side pose's pixels", "pixel": [129, 128], "purpose": "CameraMovedPlace", "expected": [168, 202, 255, 255], "observed": [168, 202, 255, 255], "passed": true},
+        {"name": "front: far cube +X face, moved from the side pose's pixels", "pixel": [201, 95], "purpose": "CameraMovedPlace", "expected": [108, 143, 229, 255], "observed": [108, 143, 229, 255], "passed": true},
+        {"name": "front: near cube -X face, hidden from the side pose", "pixel": [189, 218], "purpose": "CameraMovedFace", "expected": [250, 187, 110, 255], "observed": [250, 187, 110, 255], "passed": true},
+        {"name": "front: pixel (146, 132) shows the near cube's +Z face", "pixel": [228, 206], "purpose": "CameraMovedPlace", "expected": [255, 168, 182, 255], "observed": [255, 168, 182, 255], "passed": true},
+        {"name": "front: near cube -X face over the far cube", "pixel": [179, 162], "purpose": "Occlusion", "expected": [250, 187, 110, 255], "observed": [250, 187, 110, 255], "passed": true},
+        {"name": "front: near cube +Y face over the far cube", "pixel": [201, 128], "purpose": "Occlusion", "expected": [255, 236, 56, 255], "observed": [255, 236, 56, 255], "passed": true},
+        {"name": "front: clear, upper left", "pixel": [12, 12], "purpose": "Clear", "expected": [99, 120, 137, 255], "observed": [99, 120, 137, 255], "passed": true},
+        {"name": "front: clear, right", "pixel": [375, 93], "purpose": "Clear", "expected": [99, 120, 137, 255], "observed": [99, 120, 137, 255], "passed": true},
+        {"name": "front: clear, lower left", "pixel": [62, 275], "purpose": "Clear", "expected": [99, 120, 137, 255], "observed": [99, 120, 137, 255], "passed": true}
+      ]
+    }
+
+  ]
+}

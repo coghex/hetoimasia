@@ -605,6 +605,10 @@ A recorded batch holds the generation it records into as a recorded reference
   `CleanupFailed`, admission closes, and the surface and everything above are
   retained.
 - Device loss raised by any generation call is latched as the roots' is.
+- A host that asked for windowed depth (GRS-13) has every generation also own a
+  depth image, made last in its construction, released when its CPU use ends and
+  destroyed once the batches that recorded it have completed; one that cannot be
+  made fails the construction ([Windowed depth](#windowed-depth)).
 - Close wins: a closed target begins no construction and admits no recovery
   attempt, and a construction completed after the close is retired rather than
   published. A target's retirement retires its active generation, destroys every
@@ -1483,8 +1487,8 @@ depth it renders with. It obeys GRS-3's contract
 ([above](#ordering-managed-resources)): the target's one use is
 `DepthAttachment`, in which it rests, every entry and exit barrier is the
 recorder's, and a new target awaits an initializing pass. Windowed depth —
-a depth image that follows each swapchain generation — is
-[not here](#out-of-scope-for-depth): it is GRS-13's (#350).
+a depth image that follows each swapchain generation, for a pass into the
+frame's own image — is [its own section](#windowed-depth): GRS-13's (#350).
 
 **Conventions (D-36).** Coordinates follow Vulkan's, not OpenGL's: clip-space
 Y points down, and depth runs 0 at the near plane to 1 at the far plane. A
@@ -1585,11 +1589,11 @@ a declared depth (`DeclaredDepth`). The depth target's barriers are those of
 `DepthAttachment`: early and late fragment tests, depth-stencil attachment
 read and write, the depth-attachment layout, over the depth aspect.
 
-**Out of scope for depth.** Windowed depth that follows swapchain generations
-and the sample's windowed mode (GRS-13, #350); a depth attachment for the
-frame's own image; `render-3d`, camera policy, lighting and materials;
-reversed-Z as a default; stencil; multisampling; and more than one color
-attachment.
+**Out of scope for depth.** `render-3d`, camera policy, lighting and
+materials; reversed-Z as a default; stencil; multisampling; and more than one
+color attachment. Windowed depth, a depth attachment for the frame's own image
+that follows swapchain generations, and the sample's windowed mode are
+[GRS-13's](#windowed-depth) (#350).
 
 **Proof.** The stand-in suite (`Test.GPU.Vulkan.Native.Depth`) chooses the
 depth format and falls back through the other two, refuses a depth target of an unsupported or
@@ -1619,6 +1623,143 @@ retained in [`docs/evidence/gpu_3d/`](evidence/gpu_3d/README.md).
 | --- | --- | --- | --- | --- | --- |
 | The open pass's depth-attachment format, beside its color attachment's | The recorder (`Recorder`) | `beginRenderingWithDepth` sets it, `beginRendering` and `beginRenderingInto` leave none, and `endRendering` clears it; `bindPipeline` and `draw` read it | The graphics owner | One consumer action | Dropped with the recorder |
 | A pipeline's declared depth | Its managed generation (`PipelineInterface`) | `createPipelineWithDepth` and `createDepthCheckedPipeline` set it; `bindPipeline` and `draw` read it | The graphics owner | The pipeline generation's | Dropped with its disposal |
+
+### Windowed depth
+
+GRS-13 (#350) gives each swapchain generation of a window a managed depth
+image, so a renderer can draw into the window with a depth test (D-24). It
+builds on [Depth attachments](#depth-attachments) — the image is an ordinary
+managed `DepthTarget`, ordered by GRS-3's contract and D-26's boundary
+barriers — and follows the generations' own lifecycle
+([Swapchain generations](#swapchain-generations)): construction, resize and
+replacement, surface recovery (VK-14), failure and teardown.
+
+**The setting.** `VulkanHostConfig`'s `vulkanWindowDepth` is `False` by
+default, and nothing then changes: no generation has a depth image, no
+`FrameRequest` names one (`requestDepth` is `Nothing`), the device is asked
+nothing about depth, and the triangle, the sprites and every renderer that
+draws without depth behave exactly as before. When it is `True`, the controller
+asks the generations for a depth image with every generation
+(`requireWindowDepth`), and **no generation is constructed** until the
+recording supplies what makes the images (`supplyRecordingWindowDepth`): the
+recording exists only once the device does, so the owner's step makes it
+before the generations' step ([The owner's
+step](#completion-and-the-owners-step)), and no generation is ever published
+without the depth it was configured for.
+
+**One image per generation.** Each generation owns one depth image of its
+extent, in the depth-only format `selectDepthFormat` answers, with its one owned
+view, shared by every frame in flight of that generation. It is made last in
+the generation's construction — after its swapchain, images and views, so a
+swapchain that cannot be built, or an image count that is refused, spends none
+— as a managed image of the recording's (`createImage`): its memory is charged
+beneath the model's accounting by the allocation protocol (D-40), it awaits
+initialization until the first pass that clears it from undefined has been
+submitted (D-26), and every batch that records a pass with it holds it until
+that batch has completed. The image and its allocation are named from the
+generation's identity (`windowDepthName`, `windowDepthViewName`: *the
+generation's name* and ` depth image` or ` depth view`), and the generation's
+record keeps it the moment it exists (`viewDepth` reads it). `windowDepthOf
+recording generation` answers the handle of a live one.
+
+**The frame's pass.** A windowed frame's request names its generation's depth
+image (`requestDepth`), borrowed from the generation: the renderer neither makes
+nor keeps it past the frame, and cannot release it — `releaseManaged` of a
+generation's depth image is `RefusedIllegal`, because its generation releases it.
+`beginFrameRenderingWithDepth recorder clear depthPass` begins dynamic
+rendering into the frame's image with the depth image as the depth attachment,
+in a frame batch only (a frame-less batch has no swapchain image,
+`RefusedUnsupported`): the image cleared to the color, the depth image cleared to
+the pass's value (`clearedDepth image start` clears to 1.0) and stored, in the
+depth-attachment layout, across the whole extent. It is `beginRenderingWithDepth`
+for the frame's image, with the same rules and the same refusals — a depth image
+that is released, another session's, of the wrong kind or of more than one mip
+level, one of another extent than the frame's (`RefusedIncompatible`, naming
+both), a clear value outside 0 to 1 — each with no native call and neither image
+entered. While the pass is open a pipeline is drawn only if it declares the depth
+format of the attachment; the frame's pass without a depth image is as it was.
+
+The frames in flight of one generation share the image, and D-26's boundary
+barriers order them: each batch's entry barrier chains to the exit barrier of the
+earlier-submitted ones on the one graphics queue, whether a pass clears from
+undefined each time (`ClearFromUndefined`, which every frame may do) or keeps
+the contents of one before (`ClearTarget`). The first pass that clears it from
+undefined initializes it once its batch has been submitted: a first recording
+that was refused or abandoned publishes nothing, a `ClearTarget` pass over an
+image that still awaits initialization is `RefusedUninitialized`, and a later
+clearing pass initializes it.
+
+**Following the generation.** A resize or a replacement builds a new
+generation, which gets a depth image of its own, of its new extent; the old
+generation's is released when the generation's CPU use ends — the moment it is
+replaced or retired by a lost surface or a close, or its construction failed, as
+soon as no consumer holds a use of it — so nothing can begin a pass with it
+again, and the model destroys it only once every batch that recorded it has
+completed, never earlier; one no batch recorded is destroyed at once. Two
+generations that overlap, a replacement still building beside the active one or
+a retired one whose frames are in flight, each have an image of their own with
+their own extent. A lost surface (VK-14) retires its generation, and the depth
+image goes with it as above; the generation that [recovery](#replacing-a-lost-surface)
+builds on the replacement surface gets one of its own, and recovery attempts, a
+required target's escalation and an optional target's isolation treat depth as
+they treat the generation. Teardown retires the active generation as it retires
+any, so the image is released with it; whatever the recording still holds live is
+released by its retirement, and under device loss destroyed under the
+device-loss rule, with no completion evidence manufactured.
+
+**Failure.** A depth image that cannot be made fails its generation's
+construction as any native call of it does: the candidate is retired and never
+published, its failure is the target's `ConstructionFailed` and a recovery
+attempt, and a depth image it had made is released with it. The image's creation
+is the recording's, so its allocation is charged and recovered as any other's: an
+out-of-memory result is recovered once, by one reclamation pass and one more
+attempt, when the pass freed something ([Allocation
+recovery](#allocation-recovery)); a byte or object budget that cannot hold it is
+a refusal, `RefusedBackpressure`; a device that supports no depth format, a view
+that could not be made — which destroys the image it made — or a naming call that
+raised fails it the same way, and everything charged is given back. A
+construction that fails after its depth image was made — the target closed
+meanwhile, so the model refuses to publish it — releases the image with the
+candidate. Nothing of this leaves a generation without the depth it was
+configured for, or an image owned by no generation.
+
+**State.**
+
+| State | Owner | Readers and writers | Thread | Lifetime | Reset or disposal |
+| --- | --- | --- | --- | --- | --- |
+| Whether generations carry a depth image, and what makes it | The generations (`Generations.State`) | The controller asks (`requireWindowDepth`) when it makes them; the recording supplies (`supplyRecordingWindowDepth`) when it is made; `Reconciliation` reads it before a construction and when it makes the image | Any, in `STM` | The session | Never reset; absent until asked for |
+| A generation's depth image | The generation's record (`genDepth`), over a managed image of the recording's | `Reconciliation` makes it and records it; `Observation` reads it (`viewDepth`); the generation's CPU use ending releases it | The owner | From its construction until the model records its disposal | Released with the generation, destroyed once every batch that recorded it has completed; kept, explicitly uncertain, if its destruction raised, as any managed image is |
+| The depth images generations own | The recording (`recordingWindowDepths`) | Its construction adds each; `releaseManaged` reads to refuse a release; the recording's disposal removes it with the image | The owner | As the image's managed record | Forgotten with its disposal |
+
+**Proof.** The stand-in suite (`Test.GPU.Vulkan.Native.WindowDepth`) drives the
+roots', recording's and frames' stand-ins as a whole: a depth image made with
+each generation, of its extent, in the format the device supports and named from
+the generation, and none made, asked about or charged when the session did not
+ask; no generation built before the recording supplies the depth, and one built
+after; every target's generation and every frame of one generation sharing its
+image; a replacement's image of its new extent beside the old, which is
+released only when its generation's CPU use ends and destroyed only once the
+batch that recorded it has completed, and at once when none did; a lost
+surface's, an out-of-date generation's, a close's and the device's loss's
+handling; construction failures — no depth format, a view that could not be
+made, an out-of-memory result recovered once and one not recovered, a target
+closed after the image was made — each leaving no active generation or leaked
+image and nothing charged; and the frame's pass: its commands and barriers, the
+frames in flight sharing the image with consecutive clearing passes, the
+initialization published only by submission and never by an abandoned or refused
+recording, and every refusal above. `Test.GPU.Vulkan.GLFW.Consumer` runs
+whole hosts over the GLFW seam: a host that did not ask names no depth image and
+makes none, and one that did names each frame's generation's image, the same one
+for its frames, gives a replacement its own, and destroys each with its
+generation.
+
+The native case `grs13-window-depth` ([below](#the-native-suite)) draws the
+scene3d sample's two cubes into a real window with its generation's depth
+image, resizes it, and checks the captured frames' pixels against the sample's
+independent oracle before and after, with synchronization validation enabled
+([samples/scene3d/README.md](../samples/scene3d/README.md)); its captures are
+retained in [`docs/evidence/gpu_3d_windowed/`](evidence/gpu_3d_windowed/README.md).
+The sample's `--windowed` mode is launched explicitly and never run by tests.
 
 ### Drawing from buffers
 
@@ -3706,10 +3847,11 @@ frame slot of the model's budget — the first time that target is.
 The renderer is `∀`-typed over the native handles, so it records through the
 managed boundary alone; `clearRenderer` clears the frame to the colour it
 computes from the scene and the `FrameRequest` — the attachment, target,
-frame, image, the image's extent and color format, and the scene revision. The
-request is the frame's description, handed to the renderer before it records
-anything; the controller's own transitions around it are the only commands
-recorded first.
+frame, image, the image's extent and color format, the scene revision and, for
+a host that asked for [windowed depth](#windowed-depth), its generation's depth
+image (`requestDepth`, `Nothing` otherwise). The request is the frame's
+description, handed to the renderer before it records anything; the
+controller's own transitions around it are the only commands recorded first.
 
 ### Consumer construction
 
@@ -4567,6 +4709,8 @@ VK-18's D-33 order and releases nothing early.
 | Replacements | The controller | The owner's step asks; `replaceVulkanSurfaces` on the main thread claims, creates and deposits; the owner's step, or the attachment's retirement, takes each | Owner, main | From an admitted attempt's request until its deposit is settled | Taken by the attachment's retirement, which waits for one being created |
 | Unavailability reports | The controller | Written by the owner's step; any thread reads | Owner | The most recent 64 | Oldest dropped |
 | Generation records | The generations' `Internal.Generations.State`, which defines them | `Reconciliation` builds and replaces, `Retirement` retires the active one, and `Disposal` destroys and removes, on the owner's step; any thread holds and ends a CPU use through `Uses`, in `STM` | The owner (uses: any) | From the construction that begins one until its destruction returned | Kept, explicitly uncertain, when a destruction raised; never retried |
+| Whether generations carry a depth image (GRS-13) | The generations' `Internal.Generations.State`, which defines it | The controller asks when it makes them; the recording supplies what makes the images when it is made; `Reconciliation` reads it | Any, in `STM` | The session | Never reset |
+| A generation's depth image (GRS-13) | The generation's record, over a managed image of the recording's | `Reconciliation` makes and records it; `Observation` reads it; the generation's CPU use ending releases it | The owner | From its construction until the model records its disposal | Released with the generation, destroyed once every batch that recorded it has completed |
 | Swapchain results | The generations' `Internal.Generations.State`, which defines them | The owner reports through `Uses`; `Reconciliation` consumes on its step | The owner | Until the active generation is replaced | Cleared by the publication that replaces it, or by the surface's loss |
 | A target's lost surface and outstanding attempt | The generations' `Internal.Generations.State`, which defines them | `Reconciliation` marks the loss; `Surface` releases, asks and installs; `Retirement` settles an attempt still outstanding | The owner | From the loss until a replacement is installed, or the target retires | Cleared by the installation, or by retirement |
 | Rendering: the recording and the frames | The controller's rendering | Made by the first frame attempted, or the first owner-thread action run, once the device exists; read by every step and retirement | The owner | From then until whole-owner retirement | Retired before the device is destroyed |
@@ -4580,6 +4724,7 @@ VK-18's D-33 order and releases nothing early.
 | Observations reconciled | The controller | The owner's step: each target's observation revision and eligibility the generations were last stepped with | The owner | The owner's run | Replaced every step that reconciles |
 | The adapter's published revisions and untaken demand | `runVulkanOwnerLoop` | The main thread, every turn | Main | The loop's run | Bounded by the windows the host holds; untaken demand forgotten once the owner took it |
 | Deferred attachments | The controller | Written by a handover whose announcement the port refused; removed by `announceVulkanTarget` once admitted, or by the owner once it has destroyed the surface | Main, owner | Until announced or settled | Cleared by whole-owner retirement |
+| The depth images generations own (GRS-13) | The recording | A generation's construction adds each; `releaseManaged` reads to refuse a release; disposal removes it with the image | The owner | As the image's managed record | Forgotten with its disposal |
 | Managed records | The recording | Construction inserts; release, replacement and disposal advance each one's standing | The owner | From construction until the model records the disposal | Removed once the model records it; kept, explicitly uncertain, when a destruction raised; never retried |
 | Frame storages | The recording | Construction inserts one per target frame slot; disposal removes it | The owner | As its managed record | As its managed record |
 | Batch records | The recording | `recordFrame` inserts; a discard or reset removes one after the invalidation returned | The owner | From admission until invalidated | Kept, explicitly uncertain, when an invalidation raised; never retried |
@@ -5203,7 +5348,7 @@ companions — and adds the Vulkan owner's:
 | Main thread | Hspec runs on a thread of its own; the process main thread owns one shared production graphics session: `withLoaderIntegration`, then `runGraphicsOwnerApplication` over `withVulkanOwnerHost`, with the production native layer and surface bridge. An example that needs the main thread — to hand a window's surface over, which GLFW creates there, or to close a window — submits an operation (`onMain`); the main thread runs it between two turns of the host's owner loop and returns its result or rethrows its failure. Windows are created through the host's command port from the example's own thread, which the owner loop executes, as an application's worker would. |
 | Identities | Every dispatched operation is checked, before it runs, to be on the bound process main thread that entered the session — the Haskell thread, the bound flag, and the OS thread read through `pthread_self` — and a failed check fails the operation and the run. Every native call the session makes is recorded where it runs by a `NativeObserver`, so an example shows from the calls themselves that the instance, its messenger, the device and every surface's destruction ran on the graphics owner's thread and every surface's creation on the main thread — never from the name of an Hspec hook. |
 | Sharing | The roots — the instance, its explicit messenger, and the one device — are acquired lazily, by the first dispatched operation, at most once, and shared by every later example. Each example's windows and targets are its own and are closed inside it. |
-| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, `vk12-frames`, `vk13-presentation`, `vk14-recovery`, `vk15-validation-stop`, `vk15-retention`, `vk16-composed`, `vk17-one-slot`, `vk17-two-slots`, `vk19-capture`, `grs15-surface-free`, `grs15-surface-free-window`, `grs12-frameless`, `grs3-ordering`, `grs7-texture-table`, `grs8-sprites`, `grs9-swap`, `grs10-scene3d`, `grs14-table-growth`, `synchronization-hazard`, `debug-names`, and, under the isolated compositor's consent only, `wayland-connection-loss`. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. Each child runs in a process group of its own under an external 20-second deadline covering its exit and the end of its output; one still running at it is terminated with its group and fails its example as expired. |
+| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, `vk12-frames`, `vk13-presentation`, `vk14-recovery`, `vk15-validation-stop`, `vk15-retention`, `vk16-composed`, `vk17-one-slot`, `vk17-two-slots`, `vk19-capture`, `grs15-surface-free`, `grs15-surface-free-window`, `grs12-frameless`, `grs3-ordering`, `grs7-texture-table`, `grs8-sprites`, `grs9-swap`, `grs10-scene3d`, `grs13-window-depth`, `grs14-table-growth`, `synchronization-hazard`, `debug-names`, and, under the isolated compositor's consent only, `wayland-connection-loss`. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. Each child runs in a process group of its own under an external 20-second deadline covering its exit and the end of its output; one still running at it is terminated with its group and fails its example as expired. |
 | Selection | Building, listing and filtering the tree, a `--dry-run`, and a selection that dispatches nothing acquire nothing and start no child. A selection matching no example fails. `--complete`, which the catalog group passes, runs the whole tree with Hspec's configuration reading left out and then fails unless the shared session was acquired once and every private scenario the run's consent requires ran and passed — every one, except that `wayland-connection-loss` is required under the isolated compositor's consent and pending under any other — so no ambient setting can turn the group's receipt into a pass for a subset. The consent rules and the migrated proof's pure release, construction, publication and loader-selection examples need no session and run without consent. |
 | Consent | Read once, at startup, from `HETOIMASIA_NATIVE_SESSION`, with the GLFW suite's rules for `desktop`, `isolated-x11:<display>` and `isolated-wayland:<socket>`: the last only on Linux, only when `WAYLAND_DISPLAY` names that socket, and never beside a `DISPLAY`. Under the Wayland consent every session requests Wayland by name — the shared host, each child's host, the VK-5 bridge's loader-aware session, and the proof shim's raw initialization, which sets `GLFW_PLATFORM` and fails one that selected another platform — so no X11 or XWayland session stands in; under the others every session requests nothing, as before. The first shared example asserts the platform GLFW selected before any example renders. Without consent every native example is refused before its body, the session is never acquired, and the run ends with the refusal on stderr and a non-zero exit. |
 | Environment | Before any Vulkan call, the suite clears every ambient discovery override and every validation-layer setting it finds and records which, disables implicit layers, and points the layer's settings file at an empty one; a child inherits and re-establishes the same environment. |
@@ -5516,6 +5661,44 @@ write-after-write at the third submission, but nothing for the depth target's
 load-op clear across submissions: for the depth target the case shows the
 barriers recorded and their layouts accepted, not a hazard the layer could
 have seen.
+
+GRS-13's case, `grs13-window-depth`, runs the production host with
+verification capture on over one mapped window that requests no focus, and with
+`vulkanWindowDepth` set. The renderer is the scene3d sample's windowed drawing
+([samples/scene3d/README.md](../samples/scene3d/README.md)) from the evidence's
+front camera, which does not orbit, so the sample's independent oracle applies
+at the window's framebuffer. Its steps:
+
+1. The window is asked for frames continuously until twelve have been presented,
+   so that frames overlap in flight and clear the generation's one depth image
+   one after another; a frame of it is then captured, and the front pose's
+   probes at its extent checked against the oracle.
+2. The window is resized through its command port. Once its target's active
+   generation is the one built at the new extent, the window is asked for twelve
+   frames of it, and a frame is captured and its probes checked at that extent.
+
+Each probe is the sample's own, scaled to the framebuffer and kept only where it
+is still well inside a face, checked within a tolerance of 6 per channel against
+what the oracle's colour reads as in the swapchain's sRGB encoding. It passes
+only if all of these hold:
+
+- every generation the target published owned a depth image of its own, and every
+  frame request named its generation's, the same one for all of its frames;
+- more than twenty frames were presented in all, most of them submitted while an
+  earlier one was in flight, each clearing a generation's shared depth image;
+- both captured frames' probes pass, the occlusion probes — where both cubes
+  are struck, and a depth test, not draw order, decides which shows — among
+  them, at two different extents;
+- each captured frame was acquired, submitted, presented and retired on its own
+  present fence;
+- every generation was an unclipped transfer source, and every Vulkan call ran
+  on the graphics owner's thread;
+- the captures were written as lossless PNGs, with a probe record, under the
+  validation runner's evidence directory; and
+- the verdict after the last teardown callback, with synchronization validation,
+  is clean, which includes no hazard of the depth image shared by frames in
+  flight and none of it across the resize, and a host that exited with no
+  allocation left.
 
 GRS-14's case, `grs14-table-growth`, runs the same surface-free composition
 with a table of five slots at most, two at first, and a pipeline built over
