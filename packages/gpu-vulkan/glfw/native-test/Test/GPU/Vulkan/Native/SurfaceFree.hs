@@ -72,6 +72,7 @@ module Test.GPU.Vulkan.Native.SurfaceFree
   , runUploads
   , runTable
   , runShaderSamplers
+  , runStorageTables
   , runSprites
   , runGrowth
   , runSwap
@@ -85,6 +86,7 @@ module Test.GPU.Vulkan.Native.SurfaceFree
   , uploadsSection
   , tableSection
   , shaderSamplersSection
+  , storageTablesSection
   , spritesSection
   , growthSection
   , swapSection
@@ -98,6 +100,7 @@ module Test.GPU.Vulkan.Native.SurfaceFree
   , uploadsSpec
   , tableSpec
   , shaderSamplersSpec
+  , storageTablesSpec
   , spritesSpec
   , growthSpec
   , swapSpec
@@ -212,10 +215,18 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , constructPipelineLayoutFor
   , constructCheckedPipeline
   , constructRing
+  , constructRingWith
   , drawIndexed
   , pushConstants
   , validateRingSize
   , writeClaim
+  , TableLayoutOptions (..)
+  , TableUse (..)
+  , bindStorageTable
+  , claimTable
+  , constructStorageTable
+  , constructTablePipelineLayoutWith
+  , validateStorageWindow
   , UploadConfig
   , UploadRequest (..)
   , UploadState (..)
@@ -263,7 +274,7 @@ import Hetoimasia.Sample.Sprites.Oracle (ProbeResult (..))
 import Hetoimasia.Sample.Sprites.Swap (SwapEvidence (..), SwapFacts (..), runSwapEvidence)
 import qualified Hetoimasia.Sample.Sprites.Scene as Sprites
 import Hetoimasia.Sample.Sprites.Scene (Probe (..))
-import Hetoimasia.GPU.Vulkan.Native.Recording.Shaders (endpointShaders, quadShaders, tableInstanceShaders, tableShaders, verificationShaders)
+import Hetoimasia.GPU.Vulkan.Native.Recording.Shaders (endpointShaders, quadShaders, storageTableShaders, tableInstanceShaders, tableShaders, verificationShaders)
 import Hetoimasia.GPU.Vulkan.Native.Roots (RootStanding (..), RootsView (..))
 import Hetoimasia.Runtime.GLFW
   ( ScheduledStep (..)
@@ -1455,6 +1466,146 @@ expectedShaderSamplerProbes = [[255, 0, 0, 255], blend, blend, blend, [255, 0, 0
     encode linear =
       round . (* 255) $ if linear <= 0.0031308 then 12.92 * linear else 1.055 * linear ** (1 / 2.4) - 0.055
 
+-- | The storage-table case (R2D-15): a texture table and a ring made with a
+-- storage-table window, the storage table, and a pipeline over a layout that
+-- holds the table's two sets and set 2, with the storage-table shaders. One
+-- frame-less batch claims two regions of the ring for per-batch tables —
+-- each a rectangle in clip space and a colour — writes them, binds the
+-- texture table, and draws twice in one batch, binding each table at its own
+-- dynamic offset, with no selected sampler. The fragment shader reads its
+-- colour from the bound table, so the target, copied into a readback, shows
+-- each draw's own table's colour exactly.
+runStorageTables ∷ Maybe Backend → Journal → IO SurfaceFreeOutcome
+runStorageTables backend journal = do
+  heading journal "R2D-15: a surface-free session draws twice in one batch, binding a per-batch table from the ring at its own dynamic offset before each draw, the fragment shader reading its colour from the bound table"
+  runCaseWith
+    (\config → config {vulkanUploads = Just uploadConfig})
+    backend
+    defaultBudgetRequest {requestedBytes = 2 * 1024 * 1024 * 1024}
+    []
+    "vulkan-native-r2d15-storage-tables"
+    $ \vulkan _ _ _ → do
+      (madeOn, made) ← acted vulkan "the tables, the target and the pipeline" storageTableTargets
+      awaitTable vulkan "the placeholder written" tableViewPlaceholderWritten
+      (drawnOn, ticket) ← acted vulkan "the storage-table batch" (storageTableBatch made)
+      waited ← awaitTicket ticket deadline
+      (readOn, bytes) ← acted vulkan "the readback" $ \construction → readConstructedReadback construction (storageReadback made) 0 offscreenBytes
+      directory ← getTemporaryDirectory
+      (path, handle) ← openBinaryTempFile directory "hetoimasia-r2d15-storage-tables.png"
+      ByteString.hPut handle (encodeRgba offscreenSide offscreenSide bytes)
+      hClose handle
+      note journal ("the readback is at " <> Text.pack path)
+      roots ← atomically (readVulkanRoots (vulkanController vulkan))
+      let shot = Shot Rgba8Linear waited [(point, pixelAt bytes point) | point ← storageTableProbes] path
+      pure
+        ( Seen
+            [madeOn, drawnOn, readOn]
+            ["made the ring, its window, the tables and the pipeline", "drew twice, binding each table at its dynamic offset", "read the readback"]
+            0
+            (Just roots)
+            Nothing
+            [waited]
+            [shot]
+            Nothing
+            (Just (TableFacts [] Nothing Nothing [] [] (Right ())))
+            Nothing
+            Nothing
+            Nothing
+            Nothing
+        )
+  where
+    deadline = either (error . show) id (durationFromNanoseconds AllowZero 30000000000)
+    pixelAt bytes (x, y) = ByteString.unpack (ByteString.take 4 (ByteString.drop ((y * offscreenSide + x) * 4) bytes))
+
+-- | What the storage-table case draws with and reads back from.
+data StorageTargets = StorageTargets
+  { storageTarget ∷ !Image
+  , storagePipeline ∷ !Pipeline
+  , storageReadback ∷ !Readback
+  }
+
+-- | The storage-table window, in bytes: a table is thirty-two, and a window of
+-- eight times that shows the shader none of the next claim's.
+storageWindowSize ∷ Integer
+storageWindowSize = 256
+
+-- | The session's texture table, the shared ring made with a storage-table
+-- window, the storage table, an RGBA8 linear color target, a pipeline over a
+-- shader-sampled layout that also holds set 2 and the storage-table shaders,
+-- and a readback for the target.
+storageTableTargets ∷ Construction q inst msgr phys dev cmd → IO (Either Refusal StorageTargets)
+storageTableTargets construction =
+  constructTextureTable construction (either (error . show) id (validateTableConfig 16 8 (toInteger defaultVersionCount))) >>= \case
+    Left refusal → pure (Left refusal)
+    Right () →
+      constructRingWith construction (either (error . show) id (validateRingSize 4096)) (either (error . show) id (validateStorageWindow storageWindowSize)) >>= \case
+        Left refusal → pure (Left refusal)
+        Right () →
+          constructStorageTable construction >>= \case
+            Left refusal → pure (Left refusal)
+            Right () → do
+              let side = fromIntegral offscreenSide
+              target ← constructImage construction (ImageDescription ColorTarget Rgba8Linear side side 1)
+              pipeline ←
+                constructTablePipelineLayoutWith construction storageTableShaders (TableLayoutOptions TableShaderSampler True) >>= \case
+                  Left refusal → pure (Left refusal)
+                  Right layout → constructCheckedPipeline construction layout storageTableShaders (formatCode Rgba8Linear)
+              readback ← constructReadback construction offscreenBytes
+              pure (StorageTargets <$> target <*> pipeline <*> readback)
+
+-- | The two tables, each a rectangle in clip space (left, top, right, bottom)
+-- and a colour as eight floats: the target's left half in one colour and its
+-- right half in another, neither a colour a clear or a blend could make.
+storageTables ∷ [ByteString.ByteString]
+storageTables = [table (-1, -1, 0, 1) (200 / 255, 100 / 255, 50 / 255, 1), table (0, -1, 1, 1) (30 / 255, 220 / 255, 120 / 255, 1)]
+  where
+    table (left, top, right, bottom) (red, green, blue, alpha) =
+      ByteString.pack (concatMap (word . castFloatToWord32) [left, top, right, bottom, red, green, blue, alpha])
+    word ∷ Word32 → [Word8]
+    word value = [fromIntegral (value `shiftR` shift) | shift ← [0, 8, 16, 24]]
+
+-- | One frame-less batch: a region of the ring claimed for each table with
+-- the device's storage alignment and written, the target cleared to opaque
+-- black, the texture table bound, and two draws of six vertices, each after
+-- binding its own table; copied into the readback.
+storageTableBatch ∷ StorageTargets → Construction q inst msgr phys dev cmd → IO (Either Refusal BatchTicket)
+storageTableBatch made construction =
+  constructFramelessBatch construction steps <&> \case
+    Left refusal → Left refusal
+    Right (_, Left refusal) → Left refusal
+    Right (ticket, Right ()) → Right ticket
+  where
+    side = fromIntegral offscreenSide ∷ Float
+    target = storageTarget made
+    steps recorder = do
+      claims ← mapM (\contents → claimTable recorder (fromIntegral (ByteString.length contents)) <&> fmap (\claim → (claim, contents))) storageTables
+      case sequence claims of
+        Left refusal → pure (Left refusal)
+        Right held →
+          inOrder $
+            [writeClaim recorder claim 0 contents | (claim, contents) ← held]
+              <> [ beginRenderingInto recorder target ClearFromUndefined (ClearColor 0 0 0 1)
+                 , bindPipeline recorder (storagePipeline made)
+                 , setViewport recorder (Viewport 0 0 side side)
+                 , setScissor recorder (Rect 0 0 (fromIntegral offscreenSide) (fromIntegral offscreenSide))
+                 , bindTable recorder
+                 ]
+              <> concat [[bindStorageTable recorder claim 0, draw recorder 6 1] | (claim, _) ← held]
+              <> [ endRendering recorder
+                 , transitionResource recorder target (FromUse ColorAttachment) TransferRead
+                 , copyTargetToReadback recorder target (storageReadback made)
+                 , transitionResource recorder target (FromUse TransferRead) ColorAttachment
+                 ]
+
+-- | The probe points: the middle of each half of the target.
+storageTableProbes ∷ [(Int, Int)]
+storageTableProbes = [(16, 32), (48, 32)]
+
+-- | What each probe must read, exactly: each table's colour, as the bytes of
+-- the linear target.
+expectedStorageTableProbes ∷ [[Word8]]
+expectedStorageTableProbes = [[200, 100, 50, 255], [30, 220, 120, 255]]
+
 -- | The sprites case (GRS-8): the sprites sample's window-free evidence over
 -- this suite's surface-free session — the sample's own scene, renderer,
 -- oracle, PNG and probe record ("Hetoimasia.Sample.Sprites.Evidence") — with
@@ -2367,6 +2518,51 @@ shaderSamplersSpec outcome = describe "R2D-16 shader-chosen samplers in a surfac
   where
     withinOne actual expected =
       (zipWith (\a b → abs (fromIntegral a - fromIntegral b ∷ Int)) actual expected) `shouldSatisfy` all (<= 1)
+
+storageTablesSection ∷ SurfaceFreeOutcome → [Text]
+storageTablesSection outcome =
+  section "A surface-free session binding per-batch storage tables from the ring" outcome
+    <> case outcome of
+      SurfaceFreeRecorded facts →
+        [ "- " <> tshow (zip (map fst (shotProbes shot)) (map snd (shotProbes shot))) <> ", ticket " <> tshow (shotTicket shot) <> ", PNG at " <> Text.pack (shotPng shot)
+        | shot ← factsShots facts
+        ]
+      SurfaceFreeFailed _ → []
+
+storageTablesSpec ∷ SurfaceFreeOutcome → Spec
+storageTablesSpec outcome = describe "R2D-15 per-batch storage tables in a surface-free session" $ do
+  it "opened no window, created no surface and acquired no image" $
+    on outcome $ \facts → do
+      factsWindows facts `shouldBe` 0
+      callNames facts `shouldSatisfy` notElem "glfwCreateWindowSurface"
+      callNames facts `shouldSatisfy` notElem "vkAcquireNextImageKHR"
+      deviceFirst facts
+
+  it "made the ring a window longer, set 2's layout, pool and set, and a pipeline layout holding the table's two sets and set 2, and drew in one batch whose ticket completed, on the owner's thread" $
+    on outcome $ \facts → do
+      -- The table's two set layouts and pools, and set 2's.
+      length (filter (== "vkCreateDescriptorSetLayout") (callNames facts)) `shouldBe` 3
+      length (filter (== "vkCreateDescriptorPool") (callNames facts)) `shouldBe` 3
+      length (filter (== "vkCreatePipelineLayout") (callNames facts)) `shouldBe` 1
+      factsRunning facts `shouldSatisfy` ordered ["vkCreateSampler", "vkCreateDescriptorSetLayout", "vkCreateDescriptorPool", "vkAllocateDescriptorSets", "vkUpdateDescriptorSets", "vkCreateDescriptorSetLayout", "vkCreateDescriptorPool", "vkAllocateDescriptorSets", "vkUpdateDescriptorSets", "vkCreatePipelineLayout", "vkCreateGraphicsPipelines"]
+      map shotTicket (factsShots facts) `shouldBe` [Right TicketComplete]
+      ownerThread facts $ \owner → factsActionThreads facts `shouldBe` replicate 3 owner
+
+  it "bound each table at its own dynamic offset and drew twice, each draw showing its own table's colour exactly" $
+    on outcome $ \facts → case [map snd (shotProbes shot) | shot ← factsShots facts] of
+      [[left, right]] → do
+        left `shouldBe` (expectedStorageTableProbes !! 0)
+        right `shouldBe` (expectedStorageTableProbes !! 1)
+        left `shouldSatisfy` (/= right)
+      other → expectationFailure ("expected one readback of two probes, got " <> show other)
+
+  it "retired cleanly, the table's pools, set layouts and samplers before the device, with every Vulkan call on the owner's thread" $
+    on outcome $ \facts → do
+      callNames facts `shouldSatisfy` ordered ["vkDestroyDescriptorPool", "vkDestroyDescriptorSetLayout", "vkDestroySampler", "vkDestroyDevice", "vkDestroyDebugUtilsMessengerEXT", "vkDestroyInstance"]
+      oneOwnerThread facts
+
+  it "reached a verdict after the last callback with no issue and no error, synchronization validation included" $
+    on outcome clean
 
 spritesSection ∷ SurfaceFreeOutcome → [Text]
 spritesSection outcome =

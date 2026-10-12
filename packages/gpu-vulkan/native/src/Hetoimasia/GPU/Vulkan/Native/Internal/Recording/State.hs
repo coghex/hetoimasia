@@ -22,6 +22,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , NativeResource (..)
   , PipelineInterface (..)
   , TableUse (..)
+  , TableLayoutOptions (..)
   , tableShaderSampled
   , ReadbackContents (..)
   , ManagedRecord (..)
@@ -44,6 +45,9 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
 
     -- * The texture table (GRS-7)
   , TableState (..)
+  , StorageTableState (..)
+  , StorageView (..)
+  , readStorageTable
   , SwapState (..)
   , SwapTicket (..)
   , readSwapTicket
@@ -56,6 +60,10 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , ringSizeBytes
   , RingSizeRefused (..)
   , validateRingSize
+  , StorageWindow
+  , storageWindowBytes
+  , StorageWindowRefused (..)
+  , validateStorageWindow
   , RingState (..)
   , ClaimRecord (..)
   , RingClaim (..)
@@ -174,10 +182,10 @@ data ManagedStanding
   deriving (Eq, Show)
 
 data NativeResource cmd
-  = NativeLayout !Word64 ![PushConstantRange] !(Maybe TableUse)
-    -- ^ The layout, the push-constant ranges it declares, and, for a layout
-    -- that holds the texture table's two sets (GRS-7), how its draws choose a
-    -- sampler.
+  = NativeLayout !Word64 ![PushConstantRange] !(Maybe TableUse) !Bool
+    -- ^ The layout, the push-constant ranges it declares, for a layout that
+    -- holds the texture table's two sets (GRS-7) how its draws choose a
+    -- sampler, and whether it also holds the storage table's set 2 (R2D-15).
   | NativePipeline !Word64 !ResourceId !Word32 !PipelineInterface
     -- ^ The pipeline, the layout generation it was built over, the color
     -- format it renders to, and what it declares of its interface.
@@ -216,6 +224,15 @@ data TableUse
   | TableShaderSampler
   deriving (Eq, Show)
 
+-- | What a pipeline layout holding the texture table is asked to hold
+-- (R2D-15): how its draws choose a sampler, and whether it also holds the
+-- storage table's set 2.
+data TableLayoutOptions = TableLayoutOptions
+  { optionSampler ∷ !TableUse
+  , optionStorage ∷ !Bool
+  }
+  deriving (Eq, Show)
+
 -- | Whether a pipeline's table use leaves the sampler to its shaders.
 tableShaderSampled ∷ Maybe TableUse → Bool
 tableShaderSampled = (== Just TableShaderSampler)
@@ -231,6 +248,9 @@ data PipelineInterface = PipelineInterface
   , interfaceTable ∷ !(Maybe TableUse)
     -- ^ For a pipeline over a layout holding the texture table (GRS-7), how
     -- its draws choose a sampler.
+  , interfaceStorage ∷ !Bool
+    -- ^ Whether its layout also holds the storage table's set 2 (R2D-15),
+    -- which its draws need bound.
   , interfaceDepth ∷ !(Maybe PipelineDepth)
     -- ^ What the pipeline declares of depth (GRS-10), if it declares any: the
     -- attachment format it renders with, which every draw checks against the
@@ -321,6 +341,8 @@ data Recording q inst msgr phys dev cmd = Recording
     -- was cancelled before any copy. Forgotten with the buffer's disposal.
   , recordingTable ∷ !(TVar (Maybe TableState))
     -- ^ The session's texture table (GRS-7), once made.
+  , recordingStorage ∷ !(TVar (Maybe StorageTableState))
+    -- ^ The session's storage table (R2D-15), once made.
   , recordingWindowDepths ∷ !(TVar (Set ResourceId))
     -- ^ The depth images swapchain generations own (GRS-13): made with their
     -- generation and released with it, so no handle releases one. Added by the
@@ -371,6 +393,35 @@ data TableState = TableState
   , tableSwapTickets ∷ !(Map ResourceId (TVar SwapState))
     -- ^ Each pending swap's report, by its replacement image (GRS-9).
   }
+
+-- | The session's storage table (R2D-15): the engine-owned set 2 over the
+-- ring, with the managed generations behind it. A batch that binds it retains
+-- the layout and the pool at its first bind, and the ring through its claims.
+data StorageTableState = StorageTableState
+  { storageObjects ∷ ![ResourceId]
+    -- ^ Set 2's layout and its pool, which a batch's first bind of the table
+    -- retains.
+  , storageLayoutHandle ∷ !Word64
+    -- ^ Set 2's layout, as a pipeline layout declares it.
+  , storageSet ∷ !Word64
+    -- ^ The one set, whose descriptor covers the ring at offset zero over the
+    -- window.
+  , storageBytes ∷ !Natural
+    -- ^ The window: how many bytes the shader can see from a bind's offset.
+  }
+
+-- | The storage table as an observer sees it.
+data StorageView = StorageView
+  { storageViewObjects ∷ ![ResourceId]
+  , storageViewSet ∷ !Word64
+  , storageViewWindow ∷ !Natural
+  }
+  deriving (Eq, Show)
+
+readStorageTable ∷ Recording q inst msgr phys dev cmd → STM (Maybe StorageView)
+readStorageTable recording =
+  fmap (\storage → StorageView (storageObjects storage) (storageSet storage) (storageBytes storage))
+    <$> readTVar (recordingStorage recording)
 
 -- | Where an accepted texture swap stands (GRS-9). It only advances, from
 -- 'SwapPending' to exactly one of the others.
@@ -465,6 +516,7 @@ makeRecording ops roots generations = do
     <*> newTVarIO Map.empty
     <*> newTVarIO Set.empty
     <*> newTVarIO Nothing
+    <*> newTVarIO Nothing
     <*> newTVarIO Set.empty
 
 -- | Why an operation made no native call.
@@ -487,6 +539,9 @@ data Refusal
   | RefusedIncompatible !Text
   | RefusedOutOfBounds !Natural !Natural
     -- ^ What was asked for, and what there is.
+  | RefusedLimit !Text !Natural !Natural
+    -- ^ A device limit, by the name Vulkan gives it, what was asked for, and
+    -- what the device allows (R2D-15).
   | RefusedNotWritten !Text
     -- ^ No completion evidence exposes the bytes.
   | RefusedInUse
@@ -550,6 +605,33 @@ validateRingSize requested
   | requested > 2 ^ (64 ∷ Int) - 1 = Left (RingSizeUnrepresentable requested)
   | otherwise = Right (RingSize (fromInteger requested))
 
+-- | The storage-table window of the session's ring, in bytes (R2D-15): how
+-- much of the ring a shader reads through set 2 from a bind's offset, as the
+-- application configures it. Validated once ('validateStorageWindow') and
+-- never clamped; the ring is made this many bytes longer than its size, so a
+-- window starting at any claimable offset stays inside the buffer.
+newtype StorageWindow = StorageWindow Natural
+  deriving (Eq, Ord, Show)
+
+storageWindowBytes ∷ StorageWindow → Natural
+storageWindowBytes (StorageWindow bytes) = bytes
+
+-- | Why a configured window was refused before the device was asked.
+data StorageWindowRefused
+  = StorageWindowNotPositive !Integer
+  | StorageWindowUnrepresentable !Integer
+    -- ^ Larger than any Vulkan size can hold.
+  deriving (Eq, Show)
+
+-- | Validate a configured window: zero and negative ones, and ones no
+-- @VkDeviceSize@ can hold, are refused, never clamped. Whether the device's
+-- @maxStorageBufferRange@ and the ring allow it is asked when the ring is made.
+validateStorageWindow ∷ Integer → Either StorageWindowRefused StorageWindow
+validateStorageWindow requested
+  | requested <= 0 = Left (StorageWindowNotPositive requested)
+  | requested > 2 ^ (64 ∷ Int) - 1 = Left (StorageWindowUnrepresentable requested)
+  | otherwise = Right (StorageWindow (fromInteger requested))
+
 -- | The session's shared ring: its managed generation and mapping, its size,
 -- the granularity its claims are padded to, and the regions batches hold.
 data RingState = RingState
@@ -557,7 +639,10 @@ data RingState = RingState
     -- ^ The ring buffer's managed generation, which a batch binding one of
     -- its regions retains.
   , ringMapping ∷ !ReadbackAllocation
+    -- ^ The whole buffer's mapping: the claimable bytes and the window's tail.
   , ringBytes ∷ !Natural
+    -- ^ The configured, claimable size: what claims are placed in and bounded
+    -- by. The buffer is longer by the window, when there is one.
   , ringAtom ∷ !Natural
     -- ^ One for coherent memory; the device's @nonCoherentAtomSize@
     -- otherwise, so no two claims share an atom a flush covers.
@@ -567,6 +652,9 @@ data RingState = RingState
     -- ^ The number the next claim is issued: never reissued.
   , ringHead ∷ !Natural
     -- ^ Where the next claim is first tried: the end of the last one.
+  , ringWindow ∷ !(Maybe Natural)
+    -- ^ The storage-table window, when the ring was made with one (R2D-15): a
+    -- tail of this many bytes after the claimable ones, which no claim uses.
   }
 
 -- | One region a batch holds.
@@ -602,12 +690,14 @@ data RingView = RingView
   , ringViewAtom ∷ !Natural
   , ringViewClaims ∷ ![(Natural, ClaimRecord)]
     -- ^ Every region a batch holds, by its claim's number, in order.
+  , ringViewWindow ∷ !(Maybe Natural)
+    -- ^ The storage-table window and the tail it adds to the buffer (R2D-15).
   }
   deriving (Eq, Show)
 
 readRing ∷ Recording q inst msgr phys dev cmd → STM (Maybe RingView)
 readRing recording =
-  fmap (\ring → RingView (ringResource ring) (ringBytes ring) (ringAtom ring) (Map.toAscList (ringClaims ring)))
+  fmap (\ring → RingView (ringResource ring) (ringBytes ring) (ringAtom ring) (Map.toAscList (ringClaims ring)) (ringWindow ring))
     <$> readTVar (recordingRing recording)
 
 -- | Reclaim every region these batches hold: for batches whose submission
@@ -795,8 +885,8 @@ readManaged recording =
   where
     view (resource, record) =
       let (kind, handles) = case managedNative record of
-            NativeLayout handle _ Nothing → ("pipeline layout", [handle])
-            NativeLayout handle _ (Just _) → ("table pipeline layout", [handle])
+            NativeLayout handle _ Nothing _ → ("pipeline layout", [handle])
+            NativeLayout handle _ (Just _) _ → ("table pipeline layout", [handle])
             NativePipeline handle _ _ _ → ("pipeline", [handle])
             NativeStorage (StorageOfFrame _ _) pool _ → ("frame storage", [pool])
             NativeStorage (StorageOfFrameless _) pool _ → ("frame-less storage", [pool])
@@ -921,7 +1011,7 @@ readbackBuffer allocation = AllocatedBuffer (allocationMemory allocation) (alloc
 -- made from.
 destroyNative ∷ Recording q inst msgr phys dev cmd → dev → NativeResource cmd → IO ()
 destroyNative recording device = \case
-  NativeLayout handle _ _ → rootsCall roots "vkDestroyPipelineLayout" (opsDestroyPipelineLayout ops device handle)
+  NativeLayout handle _ _ _ → rootsCall roots "vkDestroyPipelineLayout" (opsDestroyPipelineLayout ops device handle)
   NativePipeline handle _ _ _ → rootsCall roots "vkDestroyPipeline" (opsDestroyPipeline ops device handle)
   NativeStorage _ pool _ → rootsCall roots "vkDestroyCommandPool" (opsDestroyStorage ops device pool)
   NativeReadback allocation _ → freeBuffer roots (readbackBuffer allocation)

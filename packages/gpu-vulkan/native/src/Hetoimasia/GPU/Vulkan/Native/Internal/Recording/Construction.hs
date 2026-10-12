@@ -30,6 +30,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Construction
   , replacePipelineWith
   , checkedRanges
   , checkedTableRanges
+  , checkedStorageTableRanges
   , validatePushRanges
   , createPipelineLayoutFor
   , createCheckedPipeline
@@ -37,6 +38,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Construction
   , createDepthCheckedPipeline
   , replaceCheckedPipeline
   , createRing
+  , createRingWith
   , createFrameStorage
   , createFramelessStorage
   , createReadback
@@ -54,7 +56,7 @@ import Data.ByteString (ByteString)
 import Data.Foldable (for_)
 import Data.List (nub, sort)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (isJust)
+import Data.Maybe (fromMaybe, isJust)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import Data.Word (Word32, Word64)
@@ -142,6 +144,8 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , RingSize
   , RingState (..)
   , StorageOwner (..)
+  , StorageWindow
+  , storageWindowBytes
   , destroyNative
   , editManaged
   , isAsynchronous
@@ -211,7 +215,7 @@ createPipelineLayoutWith recording ranges =
       Left refusal → pure (Left refusal)
       Right () →
         fmap PipelineLayout
-          <$> construct recording 0 1 "vkCreatePipelineLayout" (\ops device _ _ → Right . (\handle → NativeLayout handle ranges Nothing) <$> opsCreatePipelineLayout ops device [] ranges) Nothing
+          <$> construct recording 0 1 "vkCreatePipelineLayout" (\ops device _ _ → Right . (\handle → NativeLayout handle ranges Nothing False) <$> opsCreatePipelineLayout ops device [] ranges) Nothing
 
 -- | Whether push-constant ranges are ones a layout may declare.
 validatePushRanges ∷ Word32 → [PushConstantRange] → Either Refusal ()
@@ -350,7 +354,7 @@ buildPipeline recording (PipelineLayout layout) shaders format input blend depth
   owned recording $
     liveNative recording layout >>= \case
       Left refusal → pure (Left refusal)
-      Right (NativeLayout handle ranges table) → do
+      Right (NativeLayout handle ranges table storage) → do
         limits ← opsRecordingLimits (recordingOps recording)
         case validateVertexInput limits input of
           Left refusal → pure (Left refusal)
@@ -366,7 +370,7 @@ buildPipeline recording (PipelineLayout layout) shaders format input blend depth
                     "vkCreateGraphicsPipelines"
                     ( \ops device _ issued → do
                         naming ← shaderNaming recording issued
-                        (\created → Right (NativePipeline created layout format (PipelineInterface handle ranges input table depth)))
+                        (\created → Right (NativePipeline created layout format (PipelineInterface handle ranges input table storage depth)))
                           <$> opsCreatePipeline ops device (PipelineRequest handle shaders format input blend depth) naming
                     )
                     replacing
@@ -480,25 +484,35 @@ createReadback recording bytes
 -- reaching beyond what 32 bits can hold, computed without bound, as
 -- 'RefusedOutOfBounds'.
 checkedRanges ∷ CheckedShaders → Either Refusal [PushConstantRange]
-checkedRanges = checkedRangesWith False
+checkedRanges = checkedRangesWith False False
 
 -- | 'checkedRanges' for a pipeline layout holding the texture table (GRS-7):
 -- each stage may declare any of the table's own bindings
 -- ('Interface.textureTableDescriptors'), and any other binding is
 -- 'RefusedIncompatible'.
 checkedTableRanges ∷ CheckedShaders → Either Refusal [PushConstantRange]
-checkedTableRanges = checkedRangesWith True
+checkedTableRanges = checkedRangesWith True False
 
-checkedRangesWith ∷ Bool → CheckedShaders → Either Refusal [PushConstantRange]
-checkedRangesWith table (CheckedShaders vertex fragment)
+-- | 'checkedTableRanges' for a layout that also holds the storage table's
+-- set 2 (R2D-15): each stage may declare its binding too
+-- ('Interface.storageTableDescriptors'), and that binding is
+-- 'RefusedIncompatible' under a layout that does not hold it.
+checkedStorageTableRanges ∷ CheckedShaders → Either Refusal [PushConstantRange]
+checkedStorageTableRanges = checkedRangesWith True True
+
+-- | The ranges for a layout that holds the texture table or not, and the
+-- storage table or not (a layout holding the storage table holds the texture
+-- table as well).
+checkedRangesWith ∷ Bool → Bool → CheckedShaders → Either Refusal [PushConstantRange]
+checkedRangesWith table storage (CheckedShaders vertex fragment)
   | Interface.interfaceStage vertexInterface /= VertexInterface = Left (RefusedIncompatible "a vertex stage whose shader is not a vertex shader's")
   | Interface.interfaceStage fragmentInterface /= FragmentInterface = Left (RefusedIncompatible "a fragment stage whose shader is not a fragment shader's")
   | not table && not (null declared) =
       Left (RefusedUnsupported "a shader declaring descriptor bindings, which only a pipeline layout holding the texture table declares")
-  | table && any (`notElem` Interface.textureTableDescriptors) declared =
-      Left (RefusedIncompatible "a shader declaring a descriptor binding the texture table does not hold")
+  | table && any (`notElem` admitted) declared =
+      Left (RefusedIncompatible (if storage then "a shader declaring a descriptor binding the texture table and the storage table do not hold" else "a shader declaring a descriptor binding the texture table does not hold"))
   -- Set 0's samplers and images are visible to the fragment stage alone;
-  -- set 1's lookup buffer to both.
+  -- set 1's lookup buffer and set 2's storage table to both.
   | table && any ((== 0) . Interface.descriptorSet) (Interface.interfaceDescriptors vertexInterface) =
       Left (RefusedIncompatible "a vertex shader declaring the texture table's samplers or images, which only the fragment stage sees")
   | otherwise = case (Interface.interfacePushConstants vertexInterface, Interface.interfacePushConstants fragmentInterface) of
@@ -512,6 +526,7 @@ checkedRangesWith table (CheckedShaders vertex fragment)
     vertexInterface = checkedInterface vertex
     fragmentInterface = checkedInterface fragment
     declared = Interface.interfaceDescriptors vertexInterface <> Interface.interfaceDescriptors fragmentInterface
+    admitted = Interface.textureTableDescriptors <> (if storage then Interface.storageTableDescriptors else [])
     spanning stages members =
       let low = minimum (map pushMemberOffset members)
           high = maximum [toInteger (pushMemberOffset member) + toInteger (pushMemberSize member) | member ← members]
@@ -575,7 +590,7 @@ checkedPipeline recording held@(PipelineLayout layout) shaders format blend dept
       Left refusal → pure (Left refusal)
       -- A layout holding the texture table admits the table's bindings
       -- (GRS-7); any other admits none.
-      Right (NativeLayout _ declared table) → case checkedRangesWith (isJust table) shaders of
+      Right (NativeLayout _ declared table storage) → case checkedRangesWith (isJust table) storage shaders of
         Left refusal → pure (Left refusal)
         Right needed
           | normalized declared /= normalized needed →
@@ -596,9 +611,9 @@ checkedPipeline recording held@(PipelineLayout layout) shaders format blend dept
 
 -- | Make the session's shared ring (GRS-4, D-33): one host-visible buffer of
 -- the configured size, placed through the device's allocator under the
--- instance buffer's usage — vertex and index reads, the frame ring's memory
--- usage — and mapped for its lifetime. A session has at most one: a second
--- is 'RefusedMisuse' with 'DuplicateSubject'. A size larger than the
+-- instance buffer's usage — vertex, index and storage reads, the frame ring's
+-- memory usage — and mapped for its lifetime. A session has at most one: a
+-- second is 'RefusedMisuse' with 'DuplicateSubject'. A size larger than the
 -- device's @maxBufferSize@ is 'RefusedOutOfBounds' before anything is made;
 -- the ring is never made smaller than configured. Its memory is charged as
 -- the allocator holds it (D-40), and a block the byte budget cannot hold is
@@ -612,49 +627,75 @@ checkedPipeline recording held@(PipelineLayout layout) shaders format blend dept
 -- it is released with every other live generation when the recording
 -- retires.
 createRing ∷ Recording q inst msgr phys dev cmd → RingSize → IO (Either Refusal ())
-createRing recording size =
+createRing recording size = createRingWith recording size Nothing
+
+-- | 'createRing' with a storage-table window (R2D-15), validated once: the
+-- configured size @R@ is the ring's claimable size, and the buffer is made
+-- @R + W@ bytes, the @W@-byte tail no claim uses, so a window starting at any
+-- claimable offset stays inside it. The window is refused, never clamped, and
+-- nothing is made, when it is larger than the device's
+-- @maxStorageBufferRange@ ('RefusedLimit') or than the ring
+-- ('RefusedOutOfBounds'), and the whole buffer — a total no size can hold, or
+-- one beyond @maxBufferSize@ — is 'RefusedOutOfBounds'. Allocation, mapping,
+-- accounting and the buffer-size checks are of the @R + W@ bytes; claims,
+-- their padding and the ring's head stay within the first @R@.
+createRingWith ∷ Recording q inst msgr phys dev cmd → RingSize → Maybe StorageWindow → IO (Either Refusal ())
+createRingWith recording size window =
   owned recording $ do
     existing ← readTVarIO (recordingRing recording)
     most ← opsMaxBufferSize (recordingOps recording)
     case existing of
       Just _ → pure (Left (RefusedMisuse (DuplicateSubject ResourceIdentity)))
       Nothing
-        | bytes > most → pure (Left (RefusedOutOfBounds bytes most))
+        | total > unrepresentable → pure (Left (RefusedOutOfBounds total unrepresentable))
+        | total > most → pure (Left (RefusedOutOfBounds total most))
         | otherwise → do
             limits ← opsRecordingLimits (recordingOps recording)
-            made ←
-              construct
-                recording
-                0
-                2
-                "vmaCreateBuffer"
-                ( \_ _ attempt _ →
-                    allocateBuffer (recordingRoots recording) attempt usage (BufferRequest bytes flags) >>= \case
-                      Left refusal → pure (Left (allocationRefused refusal))
-                      Right allocated
-                        | Just _ ← allocatedMapped allocated → pure (Right (NativeBuffer InstanceBuffer bytes allocated))
-                        -- The frame ring's usage requires host-visible memory,
-                        -- which is always mapped.
-                        | otherwise → do
-                            freeBuffer (recordingRoots recording) allocated
-                            fail "the ring's memory is not mapped"
-                )
-                Nothing
-            case made of
-              Left refusal → pure (Left refusal)
-              Right resource → atomically $ do
-                managed ← readTVar (recordingManaged recording)
-                case managedNative <$> Map.lookup resource managed of
-                  Just (NativeBuffer _ _ allocated)
-                    | Just mapped ← allocatedMapped allocated → do
-                        let mapping = ReadbackAllocation (memoryResource (allocatedMemory allocated)) (allocatedMemory allocated) bytes (allocatedCoherent allocated) mapped
-                            atom = if allocatedCoherent allocated then 1 else max 1 (limitNonCoherentAtom limits)
-                        writeTVar (recordingRing recording) (Just (RingState resource mapping bytes atom Map.empty 0 0))
-                        pure (Right ())
-                  _ → pure (Left (RefusedMisuse (StaleIdentity ResourceIdentity)))
+            case windowRefusal limits of
+              Just refusal → pure (Left refusal)
+              Nothing → build limits
   where
-    bytes = ringSizeBytes size
+    claimable = ringSizeBytes size
+    windowBytes = storageWindowBytes <$> window
+    total = claimable + fromMaybe 0 windowBytes
+    unrepresentable = 2 ^ (64 ∷ Int) - 1
     (flags, usage) = bufferKindUse InstanceBuffer
+    windowRefusal limits = case windowBytes of
+      Just reach
+        | reach > limitStorageRange limits → Just (RefusedLimit "maxStorageBufferRange" reach (limitStorageRange limits))
+        | reach > claimable → Just (RefusedOutOfBounds reach claimable)
+      _ → Nothing
+    build limits = do
+      made ←
+        construct
+          recording
+          0
+          2
+          "vmaCreateBuffer"
+          ( \_ _ attempt _ →
+              allocateBuffer (recordingRoots recording) attempt usage (BufferRequest total flags) >>= \case
+                Left refusal → pure (Left (allocationRefused refusal))
+                Right allocated
+                  | Just _ ← allocatedMapped allocated → pure (Right (NativeBuffer InstanceBuffer total allocated))
+                  -- The frame ring's usage requires host-visible memory,
+                  -- which is always mapped.
+                  | otherwise → do
+                      freeBuffer (recordingRoots recording) allocated
+                      fail "the ring's memory is not mapped"
+          )
+          Nothing
+      case made of
+        Left refusal → pure (Left refusal)
+        Right resource → atomically $ do
+          managed ← readTVar (recordingManaged recording)
+          case managedNative <$> Map.lookup resource managed of
+            Just (NativeBuffer _ _ allocated)
+              | Just mapped ← allocatedMapped allocated → do
+                  let mapping = ReadbackAllocation (memoryResource (allocatedMemory allocated)) (allocatedMemory allocated) total (allocatedCoherent allocated) mapped
+                      atom = if allocatedCoherent allocated then 1 else max 1 (limitNonCoherentAtom limits)
+                  writeTVar (recordingRing recording) (Just (RingState resource mapping claimable atom Map.empty 0 0 windowBytes))
+                  pure (Right ())
+            _ → pure (Left (RefusedMisuse (StaleIdentity ResourceIdentity)))
 
 -- | Make a staging buffer for the session's uploads (GRS-6): one host-visible
 -- buffer of the configured size, of the staging kind — a transfer source in
@@ -1043,7 +1084,7 @@ nameManaged recording resource native =
 -- | What each of a generation's native objects is named.
 managedNames ∷ Recording q inst msgr phys dev cmd → ResourceId → NativeResource cmd → [(NativeObjectKind, Word64, ByteString)]
 managedNames recording resource = \case
-  NativeLayout handle _ _ → [(ObjectPipelineLayout, handle, pipelineLayoutName resource)]
+  NativeLayout handle _ _ _ → [(ObjectPipelineLayout, handle, pipelineLayoutName resource)]
   NativePipeline handle _ _ _ → [(ObjectPipeline, handle, pipelineName resource)]
   NativeStorage (StorageOfFrame target slot) pool commands →
     [ (ObjectCommandPool, pool, commandPoolName resource target slot)

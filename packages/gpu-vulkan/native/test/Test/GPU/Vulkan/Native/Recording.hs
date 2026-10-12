@@ -966,7 +966,7 @@ spec = describe "Recording" $ do
       map bufferKindUse [minBound .. maxBound]
         `shouldBe` [ (0x80 .|. 0x02, UsageStaticGeometry)
                    , (0x40 .|. 0x02, UsageStaticGeometry)
-                   , (0x80 .|. 0x40, UsageFrameRing)
+                   , (0x80 .|. 0x40 .|. 0x20, UsageFrameRing)
                    , (0x20, UsageFrameRing)
                    , (0x01, UsageStaging)
                    ]

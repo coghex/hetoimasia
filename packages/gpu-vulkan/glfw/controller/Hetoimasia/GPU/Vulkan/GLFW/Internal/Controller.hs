@@ -218,6 +218,7 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , constructPipelineWith
   , replaceConstructedPipeline
   , constructRing
+  , constructRingWith
   , constructPipelineLayoutFor
   , constructCheckedPipeline
   , constructBlendedCheckedPipeline
@@ -233,6 +234,8 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , constructTextureTable
   , constructTablePipelineLayout
   , constructShaderSampledTablePipelineLayout
+  , constructTablePipelineLayoutWith
+  , constructStorageTable
   , registerConstructedTexture
   , swapConstructedTexture
   , releaseConstructedTexture

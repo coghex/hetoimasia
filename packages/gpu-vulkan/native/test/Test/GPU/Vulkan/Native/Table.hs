@@ -1,3 +1,5 @@
+{-# LANGUAGE DuplicateRecordFields #-}
+
 -- | The bindless texture table (GRS-7) over the frames', the recording's and
 -- the allocator's stand-in native layers: making it — its samplers, set
 -- layouts declared at the cap, pools, sets at the initial size, version ring
@@ -22,14 +24,20 @@ import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Text (Text)
 import Data.Word (Word32, Word64)
+import Numeric.Natural (Natural)
+import Vulkan.Core10 (PhysicalDeviceLimits (..))
+import Vulkan.Core12 (PhysicalDeviceVulkan12Properties (..))
+import Vulkan.Zero (zero)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldReturn, shouldSatisfy)
 
-import Hetoimasia.GPU.Model.Budget (BudgetKind (LookupVersionBudget, TextureSlotBudget))
-import Hetoimasia.GPU.Model (SessionFailureCause (CleanupFailed), SessionState (SessionFailed), sessionState)
-import Hetoimasia.GPU.Model.Identity (IdentityKind (..), Misuse (..))
+import Hetoimasia.GPU.Model.Access (ResourceKind (InstanceResource))
+import Hetoimasia.GPU.Model.Budget (BudgetKind (LookupVersionBudget, RingBudget, TextureSlotBudget))
+import Hetoimasia.GPU.Model (GpuModel, HoldView (..), SessionFailureCause (CleanupFailed), SessionState (SessionFailed), holdView, sessionState)
+import Hetoimasia.GPU.Model.Identity (BatchId, HoldSubject (..), IdentityKind (..), Misuse (..), ResourceId)
 import Hetoimasia.GPU.Vulkan.Native.Roots (failRootsSessionBecause, readRootsModel)
 import Hetoimasia.GPU.Vulkan.Native.Frames
 import Hetoimasia.GPU.Vulkan.Native.Recording
+import Hetoimasia.GPU.Vulkan.Native.Recording.Vulkan (recordingLimitsOf)
 import Hetoimasia.GPU.Vulkan.Native.Shader.Interface
   ( DescriptorCount (..)
   , DescriptorDeclaration (..)
@@ -42,7 +50,9 @@ import Hetoimasia.GPU.Vulkan.Native.Shader.Interface
 import Hetoimasia.GPU.Vulkan.Native.TextureTable
 import Hetoimasia.GPU.Vulkan.Native.Uploads
 import Data.Functor ((<&>))
-import Test.GPU.Vulkan.Native.AllocatorStandIn (AllocatorCall (Flushed), allocatorCalls, allowTypes, deviceLocalType, nonCoherentType)
+import Data.Bits ((.&.))
+import Data.List (nub)
+import Test.GPU.Vulkan.Native.AllocatorStandIn (AllocatorCall (Flushed, Placing), allocatorCalls, allowTypes, deviceLocalType, nonCoherentType)
 import Test.GPU.Vulkan.Native.FramesRig
 import Test.GPU.Vulkan.Native.FramesStandIn (FrameStep (AtQueryFence), completeAll, completeFence, loseFrameStep, pendingFences)
 import Test.GPU.Vulkan.Native.StandIn (StandIn (standAllocator), StandInResult (..), offerNaming, outOfMemoryNaming)
@@ -292,6 +302,511 @@ spec = describe "Texture table" $ do
         pure [before, kept]
       answers
         `shouldBe` [Left (RefusedIllegal "a draw with a pipeline holding the texture table before a sampler is selected"), Right ()]
+      clean rig
+
+  describe "the ring's storage window (R2D-15)" $ do
+    it "validates a window once, never clamping it" $
+      map (fmap storageWindowBytes) [validateStorageWindow 0, validateStorageWindow (-4), validateStorageWindow (2 ^ (64 ∷ Int)), validateStorageWindow 64]
+        `shouldBe` [Left (StorageWindowNotPositive 0), Left (StorageWindowNotPositive (-4)), Left (StorageWindowUnrepresentable (2 ^ (64 ∷ Int))), Right 64]
+
+    it "covers shader storage reads in the vertex and fragment stages by the ring's instance-read use" $ do
+      -- The use is the ring's resting use, entered by the batch's first
+      -- claim: its stages include both shaders', and its access is
+      -- @SHADER_READ@, which covers storage reads beside sampled and uniform
+      -- ones, so binding the ring as a storage buffer records no other use.
+      let scope = useScope InstanceResource InstanceRead
+      (scopeStages scope .&. 0x8, scopeStages scope .&. 0x80, scopeAccess scope .&. 0x20) `shouldBe` (0x8, 0x80, 0x20)
+
+    it "makes the ring R + W bytes under storage usage with a tail no claim uses, and a plain ring R bytes, both with storage usage" $ do
+      plain ← newRig
+      plainBefore ← placed plain
+      ok (createRing (rigRecording plain) (ringOf 256))
+      (drop (length plainBefore) <$> placed plain) `shouldReturn` [256]
+      (atomically (readRing (rigRecording plain)) <&> fmap (\view → (ringViewBytes view, ringViewWindow view))) `shouldReturn` Just (256, Nothing)
+      -- The ring is the instance buffer's kind, which gains storage usage
+      -- beside its vertex and index usage.
+      fst (bufferKindUse InstanceBuffer) `shouldBe` 0xE0
+      rig ← newRig
+      before ← placed rig
+      ok (createRingWith (rigRecording rig) (ringOf 256) (Just (windowOf 64)))
+      (drop (length before) <$> placed rig) `shouldReturn` [320]
+      (atomically (readRing (rigRecording rig)) <&> fmap (\view → (ringViewBytes view, ringViewWindow view))) `shouldReturn` Just (256, Just 64)
+      createRingWith (rigRecording rig) (ringOf 256) (Just (windowOf 64)) `shouldReturn'` refused (RefusedMisuse (DuplicateSubject ResourceIdentity))
+      -- Claims fill the 256 claimable bytes and never the 64 after them.
+      answers ← framelessOnce rig $ \recorder → do
+        larger ← claimRegion recorder 257 4
+        whole ← claimRegion recorder 256 4
+        tail' ← claimRegion recorder 1 4
+        pure (fmap (const ()) larger, fmap (const ()) whole, fmap (const ()) tail')
+      answers `shouldBe` (Left (RefusedOutOfBounds 257 256), Right (), Left (RefusedBackpressure RingBudget))
+      claimStarts rig `shouldReturn` [0]
+      clean rig
+
+    it "refuses a window the device or the ring cannot hold, and a total no buffer can be, before allocating, never clamping" $ do
+      rig ← newRig
+      before ← placed rig
+      let standIn = rigRecordingStandIn rig
+      limitRecording standIn standInRecordingLimits {limitStorageRange = 63}
+      createRingWith (rigRecording rig) (ringOf 256) (Just (windowOf 64)) `shouldReturn'` refused (RefusedLimit "maxStorageBufferRange" 64 63)
+      limitRecording standIn standInRecordingLimits
+      createRingWith (rigRecording rig) (ringOf 256) (Just (windowOf 300)) `shouldReturn'` refused (RefusedOutOfBounds 300 256)
+      -- The ring alone is valid; with its tail it exceeds the device's buffer.
+      limitBuffers standIn 300
+      createRingWith (rigRecording rig) (ringOf 256) (Just (windowOf 64)) `shouldReturn'` refused (RefusedOutOfBounds 320 300)
+      -- A total no size can hold.
+      limitBuffers standIn (2 ^ (65 ∷ Int))
+      createRingWith (rigRecording rig) (ringOf (2 ^ (64 ∷ Int) - 1)) (Just (windowOf 1)) `shouldReturn'` refused (RefusedOutOfBounds (2 ^ (64 ∷ Int)) (2 ^ (64 ∷ Int) - 1))
+      (drop (length before) <$> placed rig) `shouldReturn` []
+      (atomically (readRing (rigRecording rig)) <&> fmap ringViewBytes) `shouldReturn` Nothing
+      -- Nothing was made, so the same ring, refused above only for its tail,
+      -- is made once the device allows it.
+      limitBuffers standIn 300
+      ok (createRing (rigRecording rig) (ringOf 256))
+      (drop (length before) <$> placed rig) `shouldReturn` [256]
+      clean rig
+
+  describe "the storage table (R2D-15)" $ do
+    it "makes set 2 once: its layout, its pool and its one set, whose descriptor covers the ring from offset zero over the window" $ do
+      (rig, _, _) ← tableRig 4 2
+      ok (createRingWith (rigRecording rig) (ringOf 4096) (Just (windowOf 1024)))
+      before ← recordingCalls (rigRecordingStandIn rig)
+      ok (createStorageTable (rigRecording rig))
+      made ← drop (length before) <$> recordingCalls (rigRecordingStandIn rig)
+      [request | CreatedSetLayout _ request ← made] `shouldBe` [StorageSetLayout]
+      [request | CreatedPool _ request ← made] `shouldBe` [StoragePool]
+      [count | AllocatedSet _ _ _ count ← made] `shouldBe` [Nothing]
+      ringBuffer ← ringBufferHandle rig
+      set ← case [set' | AllocatedSet set' _ _ _ ← made] of
+        [only] → pure only
+        other → fail ("expected one set, found " <> show other)
+      [writes | WroteDescriptors writes ← made] `shouldBe` [[WriteStorageTable set ringBuffer 1024]]
+      (atomically (readStorageTable (rigRecording rig)) <&> fmap (\view → (storageViewSet view, storageViewWindow view, length (storageViewObjects view)))) `shouldReturn` Just (set, 1024, 2)
+      -- The table's two set layouts and pools, and set 2's.
+      managedCount rig "table set layout" `shouldReturn` 3
+      managedCount rig "table pool" `shouldReturn` 3
+      createStorageTable (rigRecording rig) `shouldReturn'` refused (RefusedMisuse (DuplicateSubject ResourceIdentity))
+      clean rig
+
+    it "reads the ordinary storage-buffer limits from a device, whatever its update-after-bind counterparts are, which may legally be zero" $ do
+      let limits = (zero ∷ PhysicalDeviceLimits) {maxDescriptorSetStorageBuffersDynamic = 4, maxPerStageDescriptorStorageBuffers = 12}
+          noUpdateAfterBind = (zero ∷ PhysicalDeviceVulkan12Properties) {maxDescriptorSetUpdateAfterBindStorageBuffersDynamic = 0, maxPerStageDescriptorUpdateAfterBindStorageBuffers = 0}
+          converted = recordingLimitsOf limits noUpdateAfterBind
+      (limitDynamicStorageBuffers converted, limitStageStorageBuffers converted) `shouldBe` (4, 12)
+
+    it "is made without the texture table, and refused with no ring or a ring made with no window" $ do
+      bare ← newRig
+      createStorageTable (rigRecording bare) `shouldReturn'` refused (RefusedIllegal "a storage table in a session that has made no ring")
+      ok (createRing (rigRecording bare) (ringOf 256))
+      createStorageTable (rigRecording bare) `shouldReturn'` refused (RefusedIllegal "a storage table over a ring made with no storage-table window")
+      alone ← newRig
+      ok (createRingWith (rigRecording alone) (ringOf 256) (Just (windowOf 64)))
+      ok (createStorageTable (rigRecording alone))
+      atomically (readTable (rigRecording alone)) `shouldReturn` Nothing
+      clean alone
+
+    it "checks the device's limits for the layouts that hold it first, naming each, and makes nothing" $ do
+      (rig, _, _) ← tableRig 4 2
+      ok (createRingWith (rigRecording rig) (ringOf 4096) (Just (windowOf 1024)))
+      let standIn = rigRecordingStandIn rig
+          limits = standInRecordingLimits {limitImageDimension = 16}
+          refusedUnder changed = do
+            limitRecording standIn changed
+            answer ← createStorageTable (rigRecording rig)
+            limitRecording standIn limits
+            pure answer
+      refusedUnder limits {limitBoundSets = 2} `shouldReturn'` refused (RefusedLimit "maxBoundDescriptorSets" 3 2)
+      refusedUnder limits {limitDynamicStorageBuffers = 1} `shouldReturn'` refused (RefusedLimit "maxDescriptorSetStorageBuffersDynamic" 2 1)
+      refusedUnder limits {limitStageStorageBuffers = 1} `shouldReturn'` refused (RefusedLimit "maxPerStageDescriptorStorageBuffers" 2 1)
+      calls ← recordingCalls (rigRecordingStandIn rig)
+      length [() | CreatedSetLayout _ StorageSetLayout ← calls] `shouldBe` 0
+      length [() | CreatedPool _ StoragePool ← calls] `shouldBe` 0
+      atomically (readStorageTable (rigRecording rig)) `shouldReturn` Nothing
+      ok (createStorageTable (rigRecording rig))
+      clean rig
+
+    it "releases every generation it made when a step fails, publishes nothing, and can be made again" $ do
+      (rig, _, _) ← tableRig 4 2
+      ok (createRingWith (rigRecording rig) (ringOf 4096) (Just (windowOf 1024)))
+      let standIn = rigRecordingStandIn rig
+      failAt standIn AtCreatePool
+      failed ← try @SomeException (createStorageTable (rigRecording rig))
+      either (const True) (const False) failed `shouldBe` True
+      atomically (readStorageTable (rigRecording rig)) `shouldReturn` Nothing
+      -- The layout made before the pool was released at once.
+      views ← atomically (readManaged (rigRecording rig))
+      length [() | ManagedView _ ManagedReleased "table set layout" _ ← views] `shouldBe` 1
+      succeedAt standIn AtCreatePool
+      ok (createStorageTable (rigRecording rig))
+      (atomically (readStorageTable (rigRecording rig)) <&> fmap storageViewWindow) `shouldReturn` Just 1024
+
+  describe "layouts that hold set 2 (R2D-15)" $ do
+    it "keeps the original constructors as the options form without set 2: the same set layouts and the same ranges" $ do
+      (rig, _, _) ← storageRig 4096 1024
+      let shapeOf calls = ([declared | DeclaredSetLayouts _ declared ← calls], [ranges | DeclaredRanges _ ranges ← calls])
+          since from calls = shapeOf (drop (length from) calls)
+          calls' = recordingCalls (rigRecordingStandIn rig)
+      pushedBefore ← calls'
+      ok (fmap (const ()) <$> createTablePipelineLayout (rigRecording rig) tableShaders 8)
+      pushedMid ← calls'
+      ok (fmap (const ()) <$> createTablePipelineLayoutWith (rigRecording rig) tableShaders (TableLayoutOptions (TablePushedSampler 8) False))
+      pushedAfter ← calls'
+      since pushedBefore pushedMid `shouldBe` since pushedMid pushedAfter
+      ok (fmap (const ()) <$> createShaderSampledTablePipelineLayout (rigRecording rig) (sampledShadersWith [PushMember 0 16]))
+      sampledMid ← calls'
+      ok (fmap (const ()) <$> createTablePipelineLayoutWith (rigRecording rig) (sampledShadersWith [PushMember 0 16]) (TableLayoutOptions TableShaderSampler False))
+      sampledAfter ← calls'
+      since pushedAfter sampledMid `shouldBe` since sampledMid sampledAfter
+      -- Without set 2 the layouts hold the table's two set layouts alone.
+      fmap length (fst (since pushedBefore pushedMid)) `shouldBe` [2]
+      clean rig
+
+    it "declares set 2 after the table's two set layouts, admits its binding beside the table's and a pipeline over it" $ do
+      (rig, _, _) ← storageRig 4096 1024
+      calls ← recordingCalls (rigRecordingStandIn rig)
+      -- The table's set 0 and set 1 layouts, then set 2's.
+      let setLayouts = [handle | CreatedSetLayout handle _ ← calls]
+      [request | CreatedSetLayout _ request ← calls] `shouldBe` [TextureSetLayout [h | CreatedSampler h _ ← calls] 16, LookupSetLayout, StorageSetLayout]
+      layout ← createTablePipelineLayoutWith (rigRecording rig) storageShaders (TableLayoutOptions TableShaderSampler True) >>= either (fail . show) pure
+      made ← recordingCalls (rigRecordingStandIn rig)
+      [declared | DeclaredSetLayouts _ declared ← drop (length calls) made] `shouldBe` [setLayouts]
+      -- A stage may declare the table's own bindings and set 2's together.
+      both ← createTablePipelineLayoutWith (rigRecording rig) (storageShadersWith (textureTableDescriptors <> storageTableDescriptors)) (TableLayoutOptions TableShaderSampler True)
+      either (fail . show) (const (pure ())) both
+      ok (fmap (const ()) <$> createCheckedPipeline (rigRecording rig) layout storageShaders (formatCode Rgba8Srgb))
+      -- Shaders that do not declare it are fine under it, too.
+      ok (fmap (const ()) <$> createCheckedPipeline (rigRecording rig) layout sampledShaders (formatCode Rgba8Srgb))
+      clean rig
+
+    it "refuses a shader declaring set 2's binding under every other layout, with no native call" $ do
+      (rig, _, _) ← storageRig 4096 1024
+      before ← length . filter isLayout <$> recordingCalls (rigRecordingStandIn rig)
+      createTablePipelineLayout (rigRecording rig) storageShaders 8
+        `shouldReturn'` refused (RefusedIncompatible "a shader declaring a descriptor binding the texture table does not hold")
+      createShaderSampledTablePipelineLayout (rigRecording rig) storageShaders
+        `shouldReturn'` refused (RefusedIncompatible "a shader declaring a descriptor binding the texture table does not hold")
+      createTablePipelineLayoutWith (rigRecording rig) storageShaders (TableLayoutOptions TableShaderSampler False)
+        `shouldReturn'` refused (RefusedIncompatible "a shader declaring a descriptor binding the texture table does not hold")
+      createPipelineLayoutFor (rigRecording rig) storageShaders
+        `shouldReturn'` refused (RefusedUnsupported "a shader declaring descriptor bindings, which only a pipeline layout holding the texture table declares")
+      -- A pipeline over a layout that does not hold it is refused the same way.
+      tableOnly ← createShaderSampledTablePipelineLayout (rigRecording rig) sampledShaders >>= either (fail . show) pure
+      createCheckedPipeline (rigRecording rig) tableOnly storageShaders (formatCode Rgba8Srgb)
+        `shouldReturn'` refused (RefusedIncompatible "a shader declaring a descriptor binding the texture table does not hold")
+      -- Set 2 is visible to both stages; only the table's set 0 is the
+      -- fragment stage's alone, as it was.
+      createTablePipelineLayoutWith (rigRecording rig) (storageShadersWith (storageTableDescriptors <> [DescriptorDeclaration 3 0 StorageBuffer (DescriptorCount 1)])) (TableLayoutOptions TableShaderSampler True)
+        `shouldReturn'` refused (RefusedIncompatible "a shader declaring a descriptor binding the texture table and the storage table do not hold")
+      after ← length . filter isLayout <$> recordingCalls (rigRecordingStandIn rig)
+      -- Only the one table-only layout above was made.
+      after - before `shouldBe` 1
+      clean rig
+
+    it "is refused with no storage table, and with no texture table first" $ do
+      bare ← newRig
+      createTablePipelineLayoutWith (rigRecording bare) storageShaders (TableLayoutOptions TableShaderSampler True)
+        `shouldReturn'` refused (RefusedIllegal "a pipeline layout holding a texture table this session has not made")
+      (rig, _, _) ← tableRig 4 2
+      before ← length . filter isLayout <$> recordingCalls (rigRecordingStandIn rig)
+      createTablePipelineLayoutWith (rigRecording rig) storageShaders (TableLayoutOptions TableShaderSampler True)
+        `shouldReturn'` refused (RefusedIllegal "a pipeline layout holding a storage table this session has not made")
+      after ← length . filter isLayout <$> recordingCalls (rigRecordingStandIn rig)
+      after `shouldBe` before
+      clean rig
+
+    it "checks the device's limits across the whole layout, set 1 included, naming each before it creates one, and leaves the original layouts alone" $ do
+      (rig, _, _) ← storageRig 4096 1024
+      let standIn = rigRecordingStandIn rig
+          limits = standInRecordingLimits {limitImageDimension = 16}
+          under changed layouts = do
+            limitRecording standIn changed
+            answer ← layouts
+            limitRecording standIn limits
+            pure answer
+          storageLayout = fmap (const ()) <$> createTablePipelineLayoutWith (rigRecording rig) storageShaders (TableLayoutOptions TableShaderSampler True)
+          original = fmap (const ()) <$> createShaderSampledTablePipelineLayout (rigRecording rig) sampledShaders
+      before ← length . filter isLayout <$> recordingCalls (rigRecordingStandIn rig)
+      under limits {limitBoundSets = 2} storageLayout `shouldReturn'` refused (RefusedLimit "maxBoundDescriptorSets" 3 2)
+      under limits {limitDynamicStorageBuffers = 1} storageLayout `shouldReturn'` refused (RefusedLimit "maxDescriptorSetStorageBuffersDynamic" 2 1)
+      under limits {limitStageStorageBuffers = 1} storageLayout `shouldReturn'` refused (RefusedLimit "maxPerStageDescriptorStorageBuffers" 2 1)
+      -- The table's cap of sixteen images, its four samplers and its two
+      -- buffers are 22 resources in one stage; the table alone is 21.
+      under limits {limitTableResources = 21} storageLayout `shouldReturn'` refused (RefusedLimit "maxPerStageUpdateAfterBindResources" 22 21)
+      after ← length . filter isLayout <$> recordingCalls (rigRecordingStandIn rig)
+      after `shouldBe` before
+      -- The layouts that do not hold set 2 are checked as they always were.
+      under limits {limitBoundSets = 2} original >>= either (fail . show) pure
+      under limits {limitDynamicStorageBuffers = 1, limitStageStorageBuffers = 1, limitTableResources = 21} original >>= either (fail . show) pure
+      under limits storageLayout >>= either (fail . show) pure
+      clean rig
+
+  describe "binding the storage table (R2D-15)" $ do
+    it "binds set 2 alone at the claim's start plus the offset, leaving the table's sets and version offset as they stand, and draws with each table of a batch" $ do
+      (rig, _, kit) ← storageRig 4096 1024
+      pipeline ← storagePipeline rig TableShaderSampler storageShaders
+      let setOf = atomically (readStorageTable (rigRecording rig)) >>= maybe (fail "no storage table") (pure . storageViewSet)
+      answers ← framelessOnce rig $ \recorder → do
+        first ← tableClaim recorder 64
+        second ← tableClaim recorder 512
+        ok (writeClaim recorder first 0 (fill 64))
+        ok (writeClaim recorder second 0 (fill 512))
+        inPassWith kit pipeline recorder $ do
+          ok (bindTable recorder)
+          bound ← bindStorageTable recorder first 0
+          ok (draw recorder 3 1)
+          offset ← bindStorageTable recorder second 256
+          ok (draw recorder 3 1)
+          pure [bound, offset]
+      answers `shouldBe` [Right (), Right ()]
+      set ← setOf
+      starts ← claimStarts rig
+      calls ← recordingCalls (rigRecordingStandIn rig)
+      let commands' = [command | Recorded _ command ← calls]
+          layoutHandle = last [handle | CreatedLayout handle ← calls]
+      -- The first claim starts at zero, the second at the next multiple of
+      -- the 256-byte storage alignment.
+      starts `shouldBe` [0, 256]
+      [(layout, bound, offset) | CommandBindStorageSet layout bound offset ← commands'] `shouldBe` [(layoutHandle, set, 0), (layoutHandle, set, 512)]
+      -- The table's own bind is the only other, and only the one.
+      [offsets | CommandBindDescriptorSets _ _ offsets ← commands'] `shouldBe` [[0]]
+      length [() | CommandDraw {} ← commands'] `shouldBe` 2
+      clean rig
+
+    it "refuses with no native call: no pipeline, a layout that does not hold set 2, an offset past the claim, a table too big for the window, a misaligned offset, and a recorder that is closed" $ do
+      (rig, _, kit) ← storageRig 4096 256
+      pipeline ← storagePipeline rig TableShaderSampler storageShaders
+      sampled ← sampledPipeline rig sampledShaders
+      kept ← newIORef Nothing
+      (refusals, native) ← framelessOnce rig $ \recorder → do
+        big ← tableClaim recorder 512
+        small ← tableClaim recorder 256
+        writeIORef kept (Just (recorder, small))
+        -- Each refusal is the only thing between two counts of commands.
+        let counted bind = do
+              before ← commandCount rig
+              answer ← bind
+              after ← commandCount rig
+              pure (answer, after - before)
+        noPipeline ← counted (bindStorageTable recorder small 0)
+        ok (beginRenderingInto recorder (kitTarget kit) ClearFromUndefined (ClearColor 0 0 0 1))
+        ok (bindPipeline recorder sampled)
+        notHeld ← counted (bindStorageTable recorder small 0)
+        ok (bindPipeline recorder pipeline)
+        past ← counted (bindStorageTable recorder small 257)
+        oversized ← counted (bindStorageTable recorder big 0)
+        misaligned ← counted (bindStorageTable recorder small 4)
+        -- The edges are not refused: the claim's end, and a table that is
+        -- exactly the window.
+        atEnd ← counted (bindStorageTable recorder small 256)
+        exact ← counted (bindStorageTable recorder big 256)
+        ok (endRendering recorder)
+        pure ([noPipeline, notHeld, past, oversized, misaligned], [atEnd, exact])
+      map fst refusals
+        `shouldBe` [ Left (RefusedIllegal "binding the storage table with no pipeline bound")
+                   , Left (RefusedIllegal "binding the storage table under a pipeline whose layout does not hold it")
+                   , Left (RefusedOutOfBounds 257 256)
+                   , Left (RefusedOutOfBounds 512 256)
+                   , Left (RefusedIllegal "a storage table bound at an offset that is not a multiple of the device's storage-buffer offset alignment")
+                   ]
+      map snd refusals `shouldBe` replicate 5 0
+      native `shouldBe` [(Right (), 1), (Right (), 1)]
+      -- The recorder is closed once its action ends.
+      Just (recorder, small) ← readIORef kept
+      closedBefore ← commandCount rig
+      bindStorageTable recorder small 0 `shouldReturn` Left RefusedRecorderClosed
+      commandCount rig `shouldReturn` closedBefore
+      clean rig
+
+    it "refuses another session's claim, another batch's and a reclaimed one, each with no native call" $ do
+      (rig, _, kit) ← storageRig 4096 256
+      pipeline ← storagePipeline rig TableShaderSampler storageShaders
+      -- A claim of a ring of another session.
+      (foreignRig, _, _) ← storageRig 4096 256
+      foreignClaim ← framelessOnce foreignRig (\recorder → tableClaim recorder 64)
+      kept ← newIORef Nothing
+      earlier ← framelessOnce rig $ \recorder → do
+        claim ← tableClaim recorder 2048
+        writeIORef kept (Just claim)
+        pure ()
+      earlier `shouldBe` ()
+      Just claim ← readIORef kept
+      -- Each bind is the only thing between the two counts of commands.
+      let refusedBinding recorder held = do
+            before ← commandCount rig
+            answer ← bindStorageTable recorder held 0
+            after ← commandCount rig
+            pure (answer, after - before)
+      elsewhere ← framelessOnce rig $ \recorder → do
+        _ ← tableClaim recorder 64
+        inPassWith kit pipeline recorder (refusedBinding recorder foreignClaim)
+      elsewhere `shouldBe` (Left (RefusedMisuse (ForeignIdentity ResourceIdentity)), 0)
+      other ← framelessOnce rig $ \recorder → do
+        _ ← tableClaim recorder 64
+        inPassWith kit pipeline recorder (refusedBinding recorder claim)
+      other `shouldBe` (Left (RefusedMisuse (WrongParent BatchIdentity)), 0)
+      -- Its batch completes; the next claim needs the whole ring, so the
+      -- region is reclaimed and handed on.
+      settleAll rig
+      reused ← framelessOnce rig $ \recorder → do
+        _ ← tableClaim recorder 4096
+        inPassWith kit pipeline recorder (refusedBinding recorder claim)
+      reused `shouldBe` (Left (RefusedMisuse (StaleIdentity ResourceIdentity)), 0)
+      settleAll rig
+      clean rig
+      clean foreignRig
+
+    it "refuses a dynamic offset past 32 bits before narrowing it, computing the claim's start plus the offset without overflow" $ do
+      -- The byte budget (D-40) keeps every ring's bytes below 2^32, so no
+      -- claim a bind can name reaches the boundary: the check is defensive,
+      -- and its arithmetic is tested where it is made.
+      let boundary = 2 ^ (32 ∷ Int) - 1
+      map (uncurry storageDynamicOffset)
+        [ (0, 0)
+        , (boundary - 255, 255)
+        , (boundary, 0)
+        , (boundary, 1)
+        , (2 ^ (32 ∷ Int), 0)
+        , (2 ^ (64 ∷ Int) - 1, 2 ^ (64 ∷ Int) - 1)
+        ]
+        `shouldBe` [ Right 0
+                   , Right 4294967295
+                   , Right 4294967295
+                   , Left (RefusedOutOfBounds (2 ^ (32 ∷ Int)) (2 ^ (32 ∷ Int) - 1))
+                   , Left (RefusedOutOfBounds (2 ^ (32 ∷ Int)) (2 ^ (32 ∷ Int) - 1))
+                   , Left (RefusedOutOfBounds (2 ^ (65 ∷ Int) - 2) (2 ^ (32 ∷ Int) - 1))
+                   ]
+
+    it "is refused once the session has failed, with no native call" $ do
+      (rig, _, kit) ← storageRig 4096 256
+      pipeline ← storagePipeline rig TableShaderSampler storageShaders
+      bound ← newIORef Nothing
+      _ ← try @SomeException $ withFramelessScope (rigFrames rig) $ \scope →
+        recordFramelessIn scope $ \recorder → do
+          claim ← tableClaim recorder 64
+          ok (beginRenderingInto recorder (kitTarget kit) ClearFromUndefined (ClearColor 0 0 0 1))
+          ok (bindPipeline recorder pipeline)
+          atomically (failRootsSessionBecause (rigRoots rig) CleanupFailed "a later cleanup failed")
+          before ← commandCount rig
+          answer ← bindStorageTable recorder claim 0
+          after ← commandCount rig
+          writeIORef bound (Just (answer, after - before))
+      Just (answer, native) ← readIORef bound
+      answer `shouldSatisfy` sessionFailed
+      native `shouldBe` 0
+
+  describe "drawing under a layout that holds set 2 (R2D-15)" $ do
+    it "refuses a draw and an indexed draw before set 2 is bound, with no native call, and draws once it is" $ do
+      (rig, _, kit) ← storageRig 4096 1024
+      pipeline ← storagePipeline rig TableShaderSampler storageShaders
+      answers ← framelessOnce rig $ \recorder → do
+        table ← tableClaim recorder 64
+        indices ← claimRegion recorder 6 2 >>= either (fail . show) pure
+        ok (writeClaim recorder indices 0 (ByteString.pack [0, 0, 1, 0, 2, 0]))
+        inPassWith kit pipeline recorder $ do
+          unboundTable ← draw recorder 3 1
+          ok (bindTable recorder)
+          ok (bindIndexBuffer recorder (FromClaim indices 0) Index16)
+          before ← commandCount rig
+          unbound ← draw recorder 3 1
+          unboundIndexed ← drawIndexed recorder 3 1
+          after ← commandCount rig
+          ok (bindStorageTable recorder table 0)
+          ok (draw recorder 3 1)
+          ok (drawIndexed recorder 3 1)
+          pure ([unboundTable, unbound, unboundIndexed], after - before)
+      fst answers
+        `shouldBe` [ Left (RefusedIllegal "a draw with a pipeline holding the texture table before the table is bound under a compatible layout")
+                   , Left (RefusedIllegal "a draw with a pipeline holding the storage table before it is bound under a compatible layout")
+                   , Left (RefusedIllegal "a draw with a pipeline holding the storage table before it is bound under a compatible layout")
+                   ]
+      snd answers `shouldBe` 0
+      calls ← recordingCalls (rigRecordingStandIn rig)
+      length [() | Recorded _ CommandDraw {} ← calls] `shouldBe` 1
+      length [() | Recorded _ CommandDrawIndexed {} ← calls] `shouldBe` 1
+      clean rig
+
+    it "keeps set 2 bound through the table's bind in either order and through a compatible pipeline switch, and needs it bound again after any other" $ do
+      (rig, _, kit) ← storageRig 4096 1024
+      first ← storagePipeline rig TableShaderSampler storageShaders
+      second ← storagePipeline rig TableShaderSampler storageShaders
+      withoutSet2 ← sampledPipeline rig sampledShaders
+      sampledRanges ← storagePipeline rig TableShaderSampler (storageShadersRanged [PushMember 0 8, PushMember 8 4])
+      pushedRanges ← storagePipeline rig (TablePushedSampler 8) (storageShadersRanged [PushMember 0 8, PushMember 8 4])
+      let storageUnbound = Left (RefusedIllegal "a draw with a pipeline holding the storage table before it is bound under a compatible layout")
+      answers ← framelessOnce rig $ \recorder → do
+        table ← tableClaim recorder 64
+        -- Set 2 first, then the table: the table's bind keeps set 2.
+        orderOne ← inPassWith kit first recorder $ do
+          ok (bindStorageTable recorder table 0)
+          ok (bindTable recorder)
+          draw recorder 3 1
+        -- A compatible switch keeps both; a pipeline whose layout does not
+        -- hold set 2 disturbs it alone, as the table is kept under equal ranges.
+        switched ← inPassWith kit first recorder $ do
+          ok (bindPipeline recorder second)
+          kept <- draw recorder 3 1
+          ok (bindPipeline recorder withoutSet2)
+          ok (draw recorder 3 1)
+          ok (bindPipeline recorder first)
+          disturbed <- draw recorder 3 1
+          ok (bindStorageTable recorder table 0)
+          rebound <- draw recorder 3 1
+          pure [kept, disturbed, rebound]
+        -- A pushed pipeline of the same ranges is of another kind: it
+        -- disturbs both, and a rebind of each is owed.
+        kinds ← inPassWith kit sampledRanges recorder $ do
+          ok (bindTable recorder)
+          ok (bindStorageTable recorder table 0)
+          ok (draw recorder 3 1)
+          ok (bindPipeline recorder pushedRanges)
+          ok (bindTable recorder)
+          ok (selectSampler recorder 1)
+          disturbed <- draw recorder 3 1
+          ok (bindStorageTable recorder table 0)
+          rebound <- draw recorder 3 1
+          pure [disturbed, rebound]
+        -- The table first, then set 2.
+        orderTwo ← inPassWith kit first recorder $ do
+          ok (bindTable recorder)
+          ok (bindStorageTable recorder table 0)
+          draw recorder 3 1
+        pure (orderOne, switched, kinds, orderTwo)
+      answers `shouldBe` (Right (), [Right (), storageUnbound, Right ()], [storageUnbound, Right ()], Right ())
+      calls ← recordingCalls (rigRecordingStandIn rig)
+      let commands' = [command | Recorded _ command ← calls]
+      -- Five binds of set 2 were made, one for each that was owed.
+      length [() | CommandBindStorageSet {} ← commands'] `shouldBe` 5
+      clean rig
+
+    it "retains set 2's layout and pool at the batch's first bind, the ring through its claims, and keeps them through a later claim and a rebind" $ do
+      (rig, _, kit) ← storageRig 4096 1024
+      pipeline ← storagePipeline rig TableShaderSampler storageShaders
+      Just view ← atomically (readStorageTable (rigRecording rig))
+      Just ring ← atomically (readRing (rigRecording rig))
+      let holders = mapM (heldBy rig) (ringViewResource ring : storageViewObjects view)
+      (beforeBind, afterBind, current) ← framelessOnce rig $ \recorder → do
+        first ← tableClaim recorder 64
+        beforeBind ← holders
+        afterBind ← inPassWith kit pipeline recorder $ do
+          ok (bindTable recorder)
+          ok (bindStorageTable recorder first 0)
+          holders
+        pure (beforeBind, afterBind, recorderBatch recorder)
+      -- The ring is held by the first claim; set 2's generations by the bind.
+      beforeBind `shouldBe` [[current], [], []]
+      afterBind `shouldBe` [[current], [current], [current]]
+      -- A later claim and a rebind change nothing held.
+      (final, again) ← framelessOnce rig $ \recorder → do
+        first ← tableClaim recorder 64
+        later ← tableClaim recorder 64
+        final ← inPassWith kit pipeline recorder $ do
+          ok (bindTable recorder)
+          ok (bindStorageTable recorder first 0)
+          ok (bindStorageTable recorder later 0)
+          ok (bindStorageTable recorder first 0)
+          holders
+        pure (final, recorderBatch recorder)
+      final `shouldBe` [[again], [again], [again]]
+      settleAll rig
       clean rig
 
   describe "binding and drawing" $ do
@@ -1417,6 +1932,86 @@ recordDrawing rig kit = framelessOnce rig $ \recorder → inPass kit recorder $ 
   ok (bindTable recorder)
   ok (selectSampler recorder 0)
   ok (draw recorder 3 1)
+
+-- ---------------------------------------------------------------------------
+-- The storage table (R2D-15)
+
+ringOf ∷ Integer → RingSize
+ringOf = either (error . show) id . validateRingSize
+
+windowOf ∷ Integer → StorageWindow
+windowOf = either (error . show) id . validateStorageWindow
+
+-- | A session with a table, a ring of this many bytes made with a storage
+-- window of this many, the storage table, and a kit to draw with.
+storageRig ∷ Integer → Integer → IO (Rig, Ups, Kit)
+storageRig ring window = do
+  (rig, uploads, kit) ← tableRig 4 2
+  ok (createRingWith (rigRecording rig) (ringOf ring) (Just (windowOf window)))
+  ok (createStorageTable (rigRecording rig))
+  pure (rig, uploads, kit)
+
+-- | Shaders whose stages declare set 2's binding and nothing else, and no
+-- push constants.
+storageShaders ∷ CheckedShaders
+storageShaders = storageShadersWith storageTableDescriptors
+
+-- | A fragment stage declaring these bindings and a vertex stage declaring
+-- those of them in set 2.
+storageShadersWith ∷ [DescriptorDeclaration] → CheckedShaders
+storageShadersWith descriptors = storageShadersDeclaring descriptors []
+
+-- | 'storageShaders' with a fragment push-constant block of these members.
+storageShadersRanged ∷ [PushMember] → CheckedShaders
+storageShadersRanged = storageShadersDeclaring storageTableDescriptors
+
+storageShadersDeclaring ∷ [DescriptorDeclaration] → [PushMember] → CheckedShaders
+storageShadersDeclaring descriptors members =
+  CheckedShaders
+    (CheckedShader (ByteString.pack [1, 2, 3, 4]) (interfaceFor VertexInterface) {interfaceDescriptors = filter ((== 2) . descriptorSet) descriptors})
+    (CheckedShader (ByteString.pack [5, 6, 7, 8]) (interfaceFor FragmentInterface) {interfacePushConstants = members, interfaceDescriptors = descriptors})
+
+-- | A pipeline over a layout that holds set 2, for these shaders.
+storagePipeline ∷ Rig → TableUse → CheckedShaders → IO Pipeline
+storagePipeline rig use shaders = do
+  layout ← createTablePipelineLayoutWith (rigRecording rig) shaders (TableLayoutOptions use True) >>= either (fail . show) pure
+  createCheckedPipeline (rigRecording rig) layout shaders (formatCode Rgba8Srgb) >>= either (fail . show) pure
+
+tableClaim ∷ Rec → Natural → IO RingClaim
+tableClaim recorder size = claimTable recorder size >>= either (fail . ("the claim was refused: " <>) . show) pure
+
+fill ∷ Int → ByteString.ByteString
+fill count = ByteString.replicate count 0x5A
+
+-- | Where every region of the ring a batch holds starts, in claim order.
+claimStarts ∷ Rig → IO [Natural]
+claimStarts rig =
+  atomically (readRing (rigRecording rig)) >>= \case
+    Just ring → pure [claimRecordOffset record | (_, record) ← ringViewClaims ring]
+    Nothing → fail "the ring was not made"
+
+-- | The ring buffer's native handle.
+ringBufferHandle ∷ Rig → IO Word64
+ringBufferHandle rig = do
+  Just ring ← atomically (readRing (rigRecording rig))
+  views ← atomically (readManaged (rigRecording rig))
+  case [handle | ManagedView resource _ _ (handle : _) ← views, resource == ringViewResource ring] of
+    handle : _ → pure handle
+    [] → fail "the ring has no native handle"
+
+-- | The size of every allocation the allocator was asked to place, in order
+-- (each once, however many placements its attempts made).
+placed ∷ Rig → IO [Natural]
+placed rig = (\calls → nub [size | Placing size _ _ ← calls]) <$> allocatorCalls (standAllocator (rigRootsStandIn rig))
+
+isLayout ∷ RecordingCall → Bool
+isLayout = \case
+  CreatedLayout _ → True
+  _ → False
+
+-- | The batches that hold this resource while they record.
+heldBy ∷ Rig → ResourceId → IO [BatchId]
+heldBy rig resource = (\model → maybe [] viewRecorded (holdView (ResourceSubject resource) (model ∷ GpuModel))) <$> atomically (readRootsModel (rigRoots rig))
 
 -- ---------------------------------------------------------------------------
 -- Observation

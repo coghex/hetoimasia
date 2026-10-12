@@ -55,6 +55,11 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Recorder
   , bindTable
   , selectSampler
 
+    -- * The storage table (R2D-15)
+  , claimTable
+  , bindStorageTable
+  , storageDynamicOffset
+
     -- * Push constants, vertex input and the ring (GRS-4)
   , pushConstants
   , claimRegion
@@ -148,6 +153,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer
   , ReadbackAllocation (..)
   , RecordingOps (..)
   , Rect (..)
+  , RecordingLimits (..)
   , Viewport (..)
   , nativeName
   , resourceBarrier
@@ -184,6 +190,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , RingClaim (..)
   , RingState (..)
   , StorageOwner (..)
+  , StorageTableState (..)
   , TableUse (..)
   , editBatch
   , editManaged
@@ -231,6 +238,21 @@ data RecorderState = RecorderState
   , stateSampler ∷ !(Maybe Word32)
     -- ^ The sampler index selected, while the push constants that hold it
     -- stand.
+  , stateStorage ∷ !(Maybe StorageBinding)
+    -- ^ The storage table's binding (R2D-15), from the batch's first bind of
+    -- it on.
+  }
+
+-- | A batch's binding of the storage table's set 2 (R2D-15): the ring the
+-- region came from, which a draw checks is still in its instance-read use, and
+-- the push-constant ranges of the layout the set is bound under while that
+-- binding stands — as the texture table's, kept by a pipeline whose layout
+-- holds set 2 with the same ranges and the same kind of sampler choice, and
+-- disturbed by any other, so the next draw needs set 2 bound again. The
+-- binding outlives its disturbance: a later bind of the batch retains less.
+data StorageBinding = StorageBinding
+  { storageRing ∷ !ResourceId
+  , storageRanges ∷ !(Maybe [PushConstantRange])
   }
 
 -- | A batch's binding of the texture table (GRS-7): the version it took at
@@ -433,7 +455,7 @@ recordAdmitted
   → IO (Either Refusal (BatchId, a))
 recordAdmitted recording batch commands image label restore consumer = do
   opened ← newIORef True
-  state ← newIORef (RecorderState LayoutUndefined Nothing Nothing Map.empty Nothing [] Nothing Nothing emptyAccess Map.empty Nothing Nothing)
+  state ← newIORef (RecorderState LayoutUndefined Nothing Nothing Map.empty Nothing [] Nothing Nothing emptyAccess Map.empty Nothing Nothing Nothing)
   labelled ← isJust <$> readRootsInstrumentation roots
   labels ← newIORef 0
   let recorder = Recorder recording batch commands image opened state labelled labels
@@ -1170,10 +1192,13 @@ bindPipeline recorder (Pipeline pipeline) =
             Just previous → tableShaderSampled (interfaceTable (boundInterface previous)) == tableShaderSampled (interfaceTable interface)
             Nothing → True
           table = fmap (\binding → if isJust (interfaceTable interface) && sameKind && bindingRanges binding == Just ranges then binding else binding {bindingRanges = Nothing}) (stateTable state)
+          -- The storage table's set 2 stands under the same conditions, and
+          -- only under a layout that holds it (R2D-15).
+          storage = fmap (\binding → if interfaceStorage interface && sameKind && storageRanges binding == Just ranges then binding else binding {storageRanges = Nothing}) (stateStorage state)
           sampler = case statePipeline state of
             Just previous | interfacePushConstants (boundInterface previous) == ranges && interfaceTable (boundInterface previous) == interfaceTable interface → stateSampler state
             _ → Nothing
-      Right (state {statePipeline = Just (BoundPipeline pipeline format layout interface), stateTable = table, stateSampler = sampler}, [pipeline, layout], CommandBindPipeline handle)
+      Right (state {statePipeline = Just (BoundPipeline pipeline format layout interface), stateTable = table, stateSampler = sampler, stateStorage = storage}, [pipeline, layout], CommandBindPipeline handle)
     Right _ → pure (Left RefusedWrongKind)
 
 -- | A pipeline built for another color format than the attachment's, or
@@ -1310,6 +1335,19 @@ tableReady state bound = case interfaceTable (boundInterface bound) of
   where
     elsewhere image = maybe False (/= ShaderSampled) (Access.accessUse image (stateAccess state))
 
+-- | A draw with a pipeline whose layout holds the storage table's set 2
+-- (R2D-15) needs it bound under a compatible layout — the same push-constant
+-- ranges and kind of sampler choice — over a ring the batch still holds in its
+-- instance-read use, which its bind read it in. Both draws check it.
+storageReady ∷ RecorderState → BoundPipeline → Either Refusal ()
+storageReady state bound
+  | not (interfaceStorage (boundInterface bound)) = Right ()
+  | otherwise = case stateStorage state of
+      Just binding
+        | storageRanges binding == Just (interfacePushConstants (boundInterface bound)) →
+            stillInUse state (BoundData (storageRing binding) InstanceRead Nothing 0 0)
+      _ → Left (RefusedIllegal "a draw with a pipeline holding the storage table before it is bound under a compatible layout")
+
 -- | Bind the texture table (GRS-7) under the bound pipeline's layout, which
 -- must hold it: set 0 and set 1, with set 1's dynamic offset selecting the
 -- batch's version. The batch's first bind takes the version
@@ -1396,6 +1434,93 @@ selectSampler recorder index = command recorder $ \state → case statePipeline 
                 , CommandPushConstants (interfaceLayout (boundInterface bound)) stages offset (word32Bytes index)
                 )
 
+-- | Claim a region of the ring for a per-batch table (R2D-15): 'claimRegion'
+-- with the device's storage-buffer offset alignment
+-- (@minStorageBufferOffsetAlignment@), so the region's start is a valid
+-- dynamic offset for the storage table's set 2. Every refusal of
+-- 'claimRegion' is this one's.
+claimTable ∷ Recorder q inst msgr phys dev cmd → Natural → IO (Either Refusal RingClaim)
+claimTable recorder size = do
+  limits ← opsRecordingLimits (recordingOps (recorderRecording recorder))
+  claimRegion recorder size (max 1 (limitStorageAlignment limits))
+
+-- | Bind the storage table's set 2 (R2D-15) under the bound pipeline's layout,
+-- which must hold it, at a dynamic offset equal to the claim's region start
+-- plus the offset into the claim: the shader then reads, through the set's
+-- window, the bytes from there on, up to the window's size. Sets 0 and 1 and
+-- the texture table's version offset stay as they stand, and binding the
+-- texture table leaves a compatibly bound set 2, as the layouts are
+-- compatible for set 2 only when they hold it with the same push-constant
+-- ranges; any other pipeline disturbs the binding as it does the texture
+-- table's.
+--
+-- The batch's first bind retains set 2's layout and its pool, and the ring is
+-- retained through the claim that came from it; a later bind retains only the
+-- layout it binds them under. The bind reads the ring in its instance-read
+-- use, which the batch's first claim entered it in, and a draw checks it is
+-- still in it.
+--
+-- Refused with no native call: a session that has failed; a closed recorder;
+-- no pipeline bound, or one whose layout does not hold set 2; a claim that is
+-- stale, another session's or another batch's; an offset past the claim's
+-- end; the bytes from the offset to the claim's end beyond the window, since
+-- the shader could not see the whole table, as 'RefusedOutOfBounds' naming
+-- them and the window; a resulting offset that is not a multiple of
+-- @minStorageBufferOffsetAlignment@; and one that 32 bits cannot hold, as
+-- 'RefusedOutOfBounds', computed without overflow.
+bindStorageTable ∷ Recorder q inst msgr phys dev cmd → RingClaim → Natural → IO (Either Refusal ())
+bindStorageTable recorder claim offset =
+  owned recording . checkpointed recording $
+    readIORef (recorderOpen recorder) >>= \case
+      False → pure (Left RefusedRecorderClosed)
+      True → do
+        state ← readIORef (recorderState recorder)
+        case statePipeline state of
+          Nothing → pure (Left (RefusedIllegal "binding the storage table with no pipeline bound"))
+          Just bound
+            | not (interfaceStorage (boundInterface bound)) →
+                pure (Left (RefusedIllegal "binding the storage table under a pipeline whose layout does not hold it"))
+            | otherwise → do
+                held ← readTVarIO (recordingStorage recording)
+                limits ← opsRecordingLimits (recordingOps recording)
+                atomically (claimed recorder claim) >>= \case
+                  Left refusal → pure (Left refusal)
+                  Right (ring, record) → case held of
+                    Nothing → pure (Left (RefusedIllegal "binding a storage table this session has not made"))
+                    Just storage → command recorder $ \current → do
+                      let alignment = max 1 (limitStorageAlignment limits)
+                          size = claimRecordSize record
+                          start = claimRecordOffset record + offset
+                          visible = size - offset
+                      when (offset > size) (Left (RefusedOutOfBounds offset size))
+                      when (visible > storageBytes storage) (Left (RefusedOutOfBounds visible (storageBytes storage)))
+                      when (start `mod` alignment /= 0) (Left (RefusedIllegal "a storage table bound at an offset that is not a multiple of the device's storage-buffer offset alignment"))
+                      dynamic ← storageDynamicOffset (claimRecordOffset record) offset
+                      now ← maybe (Left (RefusedIllegal "binding the storage table with no pipeline bound")) Right (statePipeline current)
+                      stillInUse current (BoundData (ringResource ring) InstanceRead Nothing 0 0)
+                      let ranges = interfacePushConstants (boundInterface now)
+                          first = isNothing (stateStorage current)
+                      Right
+                        ( current {stateStorage = Just (StorageBinding (ringResource ring) (Just ranges))}
+                        , if first then storageObjects storage <> [boundLayout now] else [boundLayout now]
+                        , CommandBindStorageSet (interfaceLayout (boundInterface now)) (storageSet storage) dynamic
+                        )
+  where
+    recording = recorderRecording recorder
+
+-- | The dynamic offset of a bind of the storage table (R2D-15): the claim's
+-- start plus the offset into it, computed without overflow, and refused as
+-- 'RefusedOutOfBounds' — naming the offset and the most 32 bits hold — when it
+-- is more than a 32-bit dynamic offset can be. The byte budget keeps every
+-- ring below that bound, so no bind of a claim reaches it; the check keeps the
+-- narrowing from ever wrapping.
+storageDynamicOffset ∷ Natural → Natural → Either Refusal Word32
+storageDynamicOffset start offset
+  | total > fromIntegral (maxBound ∷ Word32) = Left (RefusedOutOfBounds total (fromIntegral (maxBound ∷ Word32)))
+  | otherwise = Right (fromIntegral total)
+  where
+    total = start + offset
+
 -- | Four little-endian bytes.
 word32Bytes ∷ Word32 → ByteString
 word32Bytes value = ByteString.pack [fromIntegral (value `shiftR` shift) | shift ← [0, 8, 16, 24]]
@@ -1474,6 +1599,7 @@ drawChecked recorder indexed count instances decide = do
                 viewportFits viewport attachment
                 scissorFits rect attachment
                 tableReady current bound
+                storageReady current bound
                 (next, native) ← decide current bound
                 Right (next, [boundPipeline bound, boundLayout bound], native)
           _ → Left (RefusedIllegal "a draw before the viewport and scissor are set")

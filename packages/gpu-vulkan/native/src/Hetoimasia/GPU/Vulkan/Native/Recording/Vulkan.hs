@@ -21,6 +21,7 @@ module Hetoimasia.GPU.Vulkan.Native.Recording.Vulkan
   , nativeDepthState
   , depthAttachmentInfo
   , transitionScopes
+  , recordingLimitsOf
   ) where
 
 import Data.Maybe (mapMaybe)
@@ -71,6 +72,7 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , SetLayoutRequest (..)
   , TableSampler (..)
   , lookupBinding
+  , storageBinding
   , tableSamplerBinding
   , tableTextureBinding
   , ImageLayout (..)
@@ -115,23 +117,7 @@ vulkanRecordingOps physical = do
       largest = fromIntegral thirteen.maxBufferSize
       deviceLimits = properties.properties.limits
       framebuffer = (deviceLimits.maxFramebufferWidth, deviceLimits.maxFramebufferHeight)
-      recording =
-        RecordingLimits
-          { limitPushConstantBytes = deviceLimits.maxPushConstantsSize
-          , limitVertexBindings = deviceLimits.maxVertexInputBindings
-          , limitVertexAttributes = deviceLimits.maxVertexInputAttributes
-          , limitVertexStride = deviceLimits.maxVertexInputBindingStride
-          , limitVertexAttributeOffset = deviceLimits.maxVertexInputAttributeOffset
-          , limitNonCoherentAtom = fromIntegral deviceLimits.nonCoherentAtomSize
-          , limitImageDimension = deviceLimits.maxImageDimension2D
-          , limitTableSampledImages = min twelve.maxPerStageDescriptorUpdateAfterBindSampledImages twelve.maxDescriptorSetUpdateAfterBindSampledImages
-          , limitTableSamplers = min twelve.maxPerStageDescriptorUpdateAfterBindSamplers twelve.maxDescriptorSetUpdateAfterBindSamplers
-          , limitTableResources = twelve.maxPerStageUpdateAfterBindResources
-          , limitBoundSets = deviceLimits.maxBoundDescriptorSets
-          , limitStorageAlignment = fromIntegral deviceLimits.minStorageBufferOffsetAlignment
-          , limitStorageRange = fromIntegral deviceLimits.maxStorageBufferRange
-          , limitTablePoolDescriptors = twelve.maxUpdateAfterBindDescriptorsInAllPools
-          }
+      recording = recordingLimitsOf deviceLimits twelve
   pure
     RecordingOps
       { opsCreatePipelineLayout = \device layouts ranges →
@@ -205,6 +191,33 @@ vulkanRecordingOps physical = do
           updateDescriptorSets device (Vector.fromList (mapMaybe descriptorWrite updates)) (Vector.fromList (concatMap descriptorCopies updates))
       }
 
+-- | What the recording is allowed of a device, from its limits and its
+-- Vulkan 1.2 properties. The storage-buffer limits are the ordinary ones: the
+-- storage table's set and the lookup buffer's are ordinary descriptor-set
+-- layouts, which Vulkan checks against the ordinary limits, and the
+-- update-after-bind counterparts may legally be zero where storage-buffer
+-- update-after-bind is unsupported.
+recordingLimitsOf ∷ PhysicalDeviceLimits → PhysicalDeviceVulkan12Properties → RecordingLimits
+recordingLimitsOf deviceLimits twelve =
+  RecordingLimits
+    { limitPushConstantBytes = deviceLimits.maxPushConstantsSize
+    , limitVertexBindings = deviceLimits.maxVertexInputBindings
+    , limitVertexAttributes = deviceLimits.maxVertexInputAttributes
+    , limitVertexStride = deviceLimits.maxVertexInputBindingStride
+    , limitVertexAttributeOffset = deviceLimits.maxVertexInputAttributeOffset
+    , limitNonCoherentAtom = fromIntegral deviceLimits.nonCoherentAtomSize
+    , limitImageDimension = deviceLimits.maxImageDimension2D
+    , limitTableSampledImages = min twelve.maxPerStageDescriptorUpdateAfterBindSampledImages twelve.maxDescriptorSetUpdateAfterBindSampledImages
+    , limitTableSamplers = min twelve.maxPerStageDescriptorUpdateAfterBindSamplers twelve.maxDescriptorSetUpdateAfterBindSamplers
+    , limitTableResources = twelve.maxPerStageUpdateAfterBindResources
+    , limitBoundSets = deviceLimits.maxBoundDescriptorSets
+    , limitStorageAlignment = fromIntegral deviceLimits.minStorageBufferOffsetAlignment
+    , limitStorageRange = fromIntegral deviceLimits.maxStorageBufferRange
+    , limitTablePoolDescriptors = twelve.maxUpdateAfterBindDescriptorsInAllPools
+    , limitDynamicStorageBuffers = deviceLimits.maxDescriptorSetStorageBuffersDynamic
+    , limitStageStorageBuffers = deviceLimits.maxPerStageDescriptorStorageBuffers
+    }
+
 -- | One of the texture table's samplers (GRS-7): nearest or linear, clamping
 -- to the edge or repeating, linear also between mip levels, never
 -- anisotropic, over every level an image has.
@@ -233,7 +246,7 @@ samplerInfo sampler =
 -- | One of the table's set layouts: set 0's immutable samplers, then its
 -- partially bound, update-after-bind, variable-count array, which may be
 -- updated while unused by pending work, in a layout for an update-after-bind
--- pool; or set 1's one dynamic storage buffer.
+-- pool; or set 1's one dynamic storage buffer, or set 2's (R2D-15).
 createSetLayout ∷ Device → SetLayoutRequest → IO Word64
 createSetLayout device = \case
   TextureSetLayout samplers capacity →
@@ -276,26 +289,31 @@ createSetLayout device = \case
             ∷ DescriptorSetLayoutCreateInfo '[DescriptorSetLayoutBindingFlagsCreateInfo]
         )
         Nothing
-  LookupSetLayout →
-    (\(DescriptorSetLayout created) → created)
-      <$> createDescriptorSetLayout
-        device
-        ( DescriptorSetLayoutCreateInfo
-            { next = ()
-            , flags = zero
-            , bindings =
-                Vector.singleton
-                  DescriptorSetLayoutBinding
-                    { binding = lookupBinding
-                    , descriptorType = DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC
-                    , descriptorCount = 1
-                    , stageFlags = SHADER_STAGE_VERTEX_BIT .|. SHADER_STAGE_FRAGMENT_BIT
-                    , immutableSamplers = Vector.empty
-                    }
-            }
-            ∷ DescriptorSetLayoutCreateInfo '[]
-        )
-        Nothing
+  LookupSetLayout → dynamicStorageLayout lookupBinding
+  StorageSetLayout → dynamicStorageLayout storageBinding
+  where
+    -- A set of one dynamic storage buffer, visible to the vertex and fragment
+    -- stages: set 1's lookup ring, or set 2's storage table.
+    dynamicStorageLayout number =
+      (\(DescriptorSetLayout created) → created)
+        <$> createDescriptorSetLayout
+          device
+          ( DescriptorSetLayoutCreateInfo
+              { next = ()
+              , flags = zero
+              , bindings =
+                  Vector.singleton
+                    DescriptorSetLayoutBinding
+                      { binding = number
+                      , descriptorType = DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC
+                      , descriptorCount = 1
+                      , stageFlags = SHADER_STAGE_VERTEX_BIT .|. SHADER_STAGE_FRAGMENT_BIT
+                      , immutableSamplers = Vector.empty
+                      }
+              }
+              ∷ DescriptorSetLayoutCreateInfo '[]
+          )
+          Nothing
 
 -- | A pool for exactly one of the table's sets.
 poolInfo ∷ PoolRequest → DescriptorPoolCreateInfo '[]
@@ -307,13 +325,16 @@ poolInfo = \case
       , maxSets = 1
       , poolSizes = Vector.fromList [DescriptorPoolSize DESCRIPTOR_TYPE_SAMPLER samplers, DescriptorPoolSize DESCRIPTOR_TYPE_SAMPLED_IMAGE images]
       }
-  LookupPool →
-    DescriptorPoolCreateInfo
-      { next = ()
-      , flags = zero
-      , maxSets = 1
-      , poolSizes = Vector.singleton (DescriptorPoolSize DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC 1)
-      }
+  LookupPool → dynamicStoragePool
+  StoragePool → dynamicStoragePool
+  where
+    dynamicStoragePool =
+      DescriptorPoolCreateInfo
+        { next = ()
+        , flags = zero
+        , maxSets = 1
+        , poolSizes = Vector.singleton (DescriptorPoolSize DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC 1)
+        }
 
 -- | One set from the pool, of the layout, with its variable-count binding's
 -- count when it has one.
@@ -358,21 +379,24 @@ descriptorWrite = \case
           }
           ∷ WriteDescriptorSet '[]
       )
-  WriteLookupBuffer set buffer range →
-    Just . SomeStruct $
-      ( WriteDescriptorSet
-          { next = ()
-          , dstSet = DescriptorSet set
-          , dstBinding = lookupBinding
-          , dstArrayElement = 0
-          , descriptorCount = 1
-          , descriptorType = DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC
-          , imageInfo = Vector.empty
-          , bufferInfo = Vector.singleton (DescriptorBufferInfo (Buffer buffer) 0 (fromIntegral range))
-          , texelBufferView = Vector.empty
-          }
-          ∷ WriteDescriptorSet '[]
-      )
+  WriteLookupBuffer set buffer range → Just (dynamicStorageWrite lookupBinding set buffer range)
+  WriteStorageTable set buffer window → Just (dynamicStorageWrite storageBinding set buffer window)
+  where
+    dynamicStorageWrite number set buffer range =
+      SomeStruct
+        ( WriteDescriptorSet
+            { next = ()
+            , dstSet = DescriptorSet set
+            , dstBinding = number
+            , dstArrayElement = 0
+            , descriptorCount = 1
+            , descriptorType = DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC
+            , imageInfo = Vector.empty
+            , bufferInfo = Vector.singleton (DescriptorBufferInfo (Buffer buffer) 0 (fromIntegral range))
+            , texelBufferView = Vector.empty
+            }
+            ∷ WriteDescriptorSet '[]
+        )
 
 -- | A growth's copies of set 0's array into the larger set (GRS-14): one per
 -- run, at the same elements.
@@ -812,7 +836,8 @@ recordCommand commands = \case
             BarrierBuffer _ → Vector.empty
         }
   CommandPushConstants layout stages offset bytes → pushConstantsUnsafe commands (PipelineLayout layout) (pushStageFlags stages) offset bytes
-  CommandBindDescriptorSets layout sets offsets → bindDescriptorSetsUnsafe commands (PipelineLayout layout) sets offsets
+  CommandBindDescriptorSets layout sets offsets → bindDescriptorSetsUnsafe commands (PipelineLayout layout) 0 sets offsets
+  CommandBindStorageSet layout set offset → bindDescriptorSetsUnsafe commands (PipelineLayout layout) 2 [set] [offset]
   CommandBindVertexBuffer binding buffer offset → bindVertexBufferUnsafe commands binding (Buffer buffer) offset
   CommandBindIndexBuffer buffer offset kind →
     bindIndexBufferUnsafe commands (Buffer buffer) offset $ case kind of

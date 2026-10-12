@@ -38,6 +38,7 @@ module Hetoimasia.GPU.Vulkan.Native.Shader.Interface
   , DescriptorCount (..)
   , DescriptorDeclaration (..)
   , textureTableDescriptors
+  , storageTableDescriptors
 
     -- * Vertex input, as a pipeline binds it
   , VertexInput (..)
@@ -145,6 +146,14 @@ textureTableDescriptors =
   , DescriptorDeclaration 0 1 SampledImage RuntimeSized
   , DescriptorDeclaration 1 0 StorageBuffer (DescriptorCount 1)
   ]
+
+-- | The storage table's binding (R2D-15; render-2d design D-30), as a shader
+-- that reads it declares it: set 2's one storage buffer at binding 0, which
+-- either stage may read. Only a pipeline layout that holds set 2 admits it
+-- ('createTablePipelineLayoutWith'); under any other layout a shader that
+-- declares it is refused.
+storageTableDescriptors ∷ [DescriptorDeclaration]
+storageTableDescriptors = [DescriptorDeclaration 2 0 StorageBuffer (DescriptorCount 1)]
 
 -- | A shader whose interface was checked against its description while the
 -- package built: its SPIR-V, and that description. The checked splices make

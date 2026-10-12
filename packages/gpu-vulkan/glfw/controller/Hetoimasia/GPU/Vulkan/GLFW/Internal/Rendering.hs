@@ -108,6 +108,7 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
   , constructPipelineWith
   , replaceConstructedPipeline
   , constructRing
+  , constructRingWith
   , constructPipelineLayoutFor
   , constructCheckedPipeline
   , constructBlendedCheckedPipeline
@@ -123,6 +124,8 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
   , constructTextureTable
   , constructTablePipelineLayout
   , constructShaderSampledTablePipelineLayout
+  , constructTablePipelineLayoutWith
+  , constructStorageTable
   , registerConstructedTexture
   , swapConstructedTexture
   , releaseConstructedTexture
@@ -292,6 +295,7 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , PipelineShaders
   , PushConstantRange
   , RingSize
+  , StorageWindow
   , VertexInput
   , BatchTicket
   , Readback
@@ -311,6 +315,7 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , createPipelineWith
   , createReadback
   , createRing
+  , createRingWith
   , CheckedShaders
   , createCheckedPipeline
   , createPipelineLayoutFor
@@ -349,8 +354,11 @@ import Hetoimasia.GPU.Vulkan.Native.TextureTable
   ( TableConfig
   , TableView
   , TextureHandle
+  , TableLayoutOptions
   , createShaderSampledTablePipelineLayout
+  , createStorageTable
   , createTablePipelineLayout
+  , createTablePipelineLayoutWith
   , createTextureTable
   , readTable
   , refreshTextureTable
@@ -543,6 +551,28 @@ constructPipelineWith construction layout shaders format input =
 -- releases it with everything else; no handle to it is lent.
 constructRing ∷ Construction q inst msgr phys dev cmd → RingSize → IO (Either Refusal ())
 constructRing construction size = confined construction (createRing (constructionRecording construction) size)
+
+-- | 'constructRing' with a storage-table window (R2D-15), validated once: the
+-- ring is made as many bytes longer than its size as the window, a tail no
+-- claim uses, so a window starting at any claimable offset stays inside the
+-- buffer. Refused, with nothing made, when the window exceeds the device's
+-- @maxStorageBufferRange@ or the ring, or the whole buffer exceeds
+-- @maxBufferSize@.
+constructRingWith ∷ Construction q inst msgr phys dev cmd → RingSize → StorageWindow → IO (Either Refusal ())
+constructRingWith construction size window = confined construction (createRingWith (constructionRecording construction) size (Just window))
+
+-- | Make the session's storage table (R2D-15): the engine-owned set 2 over the
+-- ring's window, once. It needs the ring made with a window
+-- ('constructRingWith'); layouts that hold it also hold the texture table.
+constructStorageTable ∷ Construction q inst msgr phys dev cmd → IO (Either Refusal ())
+constructStorageTable construction = confined construction (createStorageTable (constructionRecording construction))
+
+-- | A pipeline layout holding the texture table, with the sampler choice and
+-- the storage table's set 2 as the options ask (R2D-15). Without set 2 it is
+-- the layout 'constructTablePipelineLayout' or
+-- 'constructShaderSampledTablePipelineLayout' makes.
+constructTablePipelineLayoutWith ∷ Construction q inst msgr phys dev cmd → CheckedShaders → TableLayoutOptions → IO (Either Refusal PipelineLayout)
+constructTablePipelineLayoutWith construction shaders options = confined construction (createTablePipelineLayoutWith (constructionRecording construction) shaders options)
 
 -- | A pipeline layout with exactly the push-constant ranges these checked
 -- shaders' descriptions need (GRS-16).
