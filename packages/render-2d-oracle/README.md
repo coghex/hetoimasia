@@ -124,28 +124,27 @@ derivatives, as Vulkan's `ρmax`: the larger of the lengths of the two columns o
 the matrix of derivatives of the level-0 texel coordinates with respect to target
 pixels, and `λ = log₂ ρmax`. The derivatives are taken exactly.
 
-- A texture with one level, and a magnified probe (`λ ≤ ε`), sample level 0.
+- A texture with one level, and a magnified probe (`λ ≤ 0`, exactly
+  `ρmax² ≤ 1`), sample level 0.
 - A minified probe is determinate when the derivatives are **axis-aligned** (no
-  shear, and no rotation other than quarter turns) and `λ` is within `ε` of a
-  whole number, or at least the last level's index less `ε`. It then samples that
-  level, or the last: no sampler clamps the level of detail, and a linear sampler
-  at a whole `λ` weighs the neighbouring level by zero.
+  shear, and no rotation other than quarter turns) and `λ` is **exactly** a whole
+  number, or at least the last level's index. It then samples that level, or the
+  last: no sampler clamps the level of detail, and a linear sampler at a whole `λ`
+  weighs the neighbouring level by zero.
 - Any other minified probe on a texture with more than one level is
   indeterminate: not axis-aligned, or between two levels.
 
-`ε = 2⁻¹⁶`. A level of detail that close to a whole number is read as the whole
-level, and reading it so costs the neighbouring level's weight, at most `ε`, of
-the neighbouring texel. A tint is at most 1, a brightness is at most 3 and the
-sRGB encoding's slope never exceeds 12.92, so the error is at most
-`2⁻¹⁶ × 3 × 12.92 × 255 ≈ 0.15` of a channel step before the store rounds: it
-cannot move a stored byte by more than the tolerance of 1, nor move a carried
-byte at all. A level of detail farther than `ε` from a whole number is fractional
-and indeterminate, however close: a 1.9997-pixel quad over 4 texels (`λ ≈ 1.0002`)
-brightened three times on an sRGB target is the case that stores a different byte
-from the whole level. An axis is aligned when its off-axis derivatives are at most
-2⁻¹² of the largest, which is how far a 32-bit quarter turn can be from itself; a
-tilt that small changes a column's length by under 2⁻²⁴ of itself, so it moves
-the level of detail far less than `ε`.
+Both tests are exact, in rational arithmetic on the derivatives: `λ` is the whole
+number `k` exactly when `ρmax² = 4ᵏ`, and an axis is aligned exactly when its
+off-axis derivatives are zero. There is no tolerance to argue through the shading,
+blending and 8-bit store that follow, and none could be: a level of detail a hair
+from whole shifts a neighbouring level's weight, which brightness and the sRGB
+encoding amplify, and repeated blends add the rounding of each store. A 1.9997-
+pixel quad over 4 texels (`λ ≈ 1.0002`) and one of 1.99998 pixels (`λ ≈ 1.0000144`)
+are both indeterminate. The consequence is that a rotation which is not exactly a
+quarter turn, such as a camera turned by the 32-bit `π/2`, is not axis-aligned, so
+a minified probe through it is indeterminate; a transform written with exact
+coefficients, such as columns `(0, 1)` and `(−1, 0)`, is.
 
 ## Colour
 
