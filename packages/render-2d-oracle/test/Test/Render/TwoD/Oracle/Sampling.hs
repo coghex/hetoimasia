@@ -193,6 +193,23 @@ spec = describe "sampling" $ do
       -- 4 texels over 3 pixels is a level of detail of about 0.41.
       expectAt (drawn (sprite h1 (1, 1) (3, 3))) 6 6 `shouldBe` Indeterminate (MinifiedFractionalLevel (AtInstance 0 0 0 0))
 
+    it "reports a level of detail just off a whole number rather than collapsing it" $ do
+      -- Levels 0 and 1 are black and level 2 white. A 1.9997-pixel quad over 4
+      -- texels has a level of detail of 1.0002, and a linear blend with level 2
+      -- at weight 0.0002, brightened 3 times and sRGB encoded, stores byte 2:
+      -- reading level 1 alone would say black.
+      let blackBlack = rgba8 False 4 4 [flat 16 (0, 0, 0, 255), flat 4 (0, 0, 0, 255), flat 1 (255, 255, 255, 255)]
+          bright = defaultViewSettings {settingBrightness = 3}
+          at size =
+            mkOracle
+              srgb8
+              [(h1, blackBlack)]
+              [offscreenPass noClear [mkView defaultCamera (fullViewport 8 8) bright [world [linear (sprite h1 (1, 1) (size, size))]]]]
+      expectAt (at 1.9997) 5 5 `shouldBe` Indeterminate (MinifiedFractionalLevel (AtInstance 0 0 0 0))
+      -- Within 2⁻¹⁶ of level 1 the blend is under a fifth of a channel step even
+      -- so, and the oracle reads level 1: black, exactly.
+      expectAt (at 2.00001) 5 5 `shouldBe` Expected (Rgba8 0 0 0 255) (Tolerance 0 0 0 0)
+
     it "reads level 0 when the texture has only one level, however minified" $ do
       let turned = (sprite h1 (0, 0) (1, 1)) {instanceTransform = fromColumns (V2 1.4142135 1.4142135) (V2 (-1.4142135) 1.4142135) (V2 0 0)}
           single = mkOracle target [(h1, solid False red)] [offscreenPass noClear [fullView 8 8 [world [turned]]]]

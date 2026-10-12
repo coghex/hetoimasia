@@ -392,12 +392,18 @@ viewFragments oracle spec x y view
     contains = viewportContains viewport (V2 centreX centreY)
     near = nearBoundary (1 / 16) (viewportEdges viewport) (realToFrac centreX, realToFrac centreY)
     body = case ovMapping view of
-      Nothing → [Bad (MappingNotRepresentable (ovLocation view)) | any (not . null . olInstances) (ovLayers view)]
+      -- A mapping is needed by an instance that has area: a singular quad is
+      -- known to cover nothing from its own transform.
+      Nothing → [Bad (MappingNotRepresentable (ovLocation view)) | any needsMapping (concatMap olInstances (ovLayers view))]
       Just mapping →
         concat
           [ mapMaybe (instanceFragment oracle spec x y view mapping (olSpace layer)) (olInstances layer)
           | layer ← ovLayers view
           ]
+
+-- | Whether an instance has area, so that drawing it needs the view's mapping.
+needsMapping ∷ Drawn → Bool
+needsMapping (Drawn _ instanceValue _) = not (instanceIsSingular (instanceTransform instanceValue))
 
 -- | A viewport's four edges, in 'Double'.
 viewportEdges ∷ Viewport → [((Double, Double), (Double, Double))]

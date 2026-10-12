@@ -12,9 +12,9 @@
 --   at least the last level's index less @ε@, reads that level or the last;
 -- * any other minified probe is refused, never guessed.
 --
--- @ε = 2⁻¹²@, which is how far a 32-bit quarter turn or a scale of exactly
--- one half can be from itself: below it a neighbouring level's weight is under
--- a thousandth of a channel step. Addressing is clamp-to-edge. Nearest takes
+-- @ε = 2⁻¹⁶@ (and an axis is aligned when its off-axis derivatives are at most
+-- 2⁻¹² of the largest, which moves @λ@ by far less than @ε@): the bound on the
+-- error this introduces is worked out at 'lodEpsilon'. Addressing is clamp-to-edge. Nearest takes
 -- the texel containing the coordinate and, within 1/16 texel of an interior
 -- texel boundary, where the recorder's rounding picks either side, is refused
 -- unless the texels on both sides are alike;
@@ -70,19 +70,32 @@ data LevelRefusal
     FractionalLevel
   deriving stock (Eq, Show)
 
--- | How far a level of detail may be from a whole number, or an axis from its
--- matrix's direction, and still count as on it.
-epsilon ∷ Double
-epsilon = 1 / 4096
+-- | How far a level of detail may be from a whole number, or from the last
+-- level's index, and still count as on it: 2⁻¹⁶. Reading the whole level
+-- instead of the linear blend with its neighbour then errs by at most this
+-- weight of the neighbouring texel, which a tint of at most 1, a brightness of
+-- at most 3 and the sRGB encoding, whose slope never exceeds 12.92, amplify to
+-- at most 2⁻¹⁶ × 3 × 12.92 × 255 ≈ 0.15 of a channel step before the store
+-- rounds: never enough to move a stored byte by more than the tolerance of 1,
+-- nor to move one that is a whole carried byte at all.
+lodEpsilon ∷ Double
+lodEpsilon = 1 / 65536
+
+-- | How far an off-axis derivative may be from zero, relative to the largest
+-- derivative, for the derivatives still to count as axis-aligned: 2⁻¹². A
+-- tilt that small changes the length of a column by under 2⁻²⁴ of itself, so it
+-- moves the level of detail far less than 'lodEpsilon'.
+axisEpsilon ∷ Double
+axisEpsilon = 1 / 4096
 
 -- | The level a probe reads, given the texture's level count.
 chooseLevel ∷ Int → Derivatives → Either LevelRefusal Int
 chooseLevel levelCount (Derivatives a b c e)
   | levelCount <= 1 = Right 0
-  | lambda <= epsilon = Right 0
+  | lambda <= lodEpsilon = Right 0
   | not axisAligned = Left NotAxisAligned
-  | lambda >= fromIntegral lastLevel - epsilon = Right lastLevel
-  | abs (lambda - fromIntegral nearest) <= epsilon = Right nearest
+  | lambda >= fromIntegral lastLevel - lodEpsilon = Right lastLevel
+  | abs (lambda - fromIntegral nearest) <= lodEpsilon = Right nearest
   | otherwise = Left FractionalLevel
   where
     lastLevel = levelCount - 1
@@ -90,7 +103,7 @@ chooseLevel levelCount (Derivatives a b c e)
     lambda = 0.5 * logBase 2 (fromRational rhoSquared ∷ Double)
     nearest = round lambda ∷ Int
     biggest = maximum (map abs [a, b, c, e])
-    slack = toRational epsilon * biggest
+    slack = toRational axisEpsilon * biggest
     axisAligned =
       (abs b <= slack && abs c <= slack) || (abs a <= slack && abs e <= slack)
 

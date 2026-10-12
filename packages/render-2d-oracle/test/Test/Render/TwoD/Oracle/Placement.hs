@@ -218,5 +218,10 @@ spec = describe "placement and coverage" $ do
           empty =
             mkOracle srgb8 [(h1, solid True red)] $
               [offscreenPass noClear [mkView camera (fullViewport 8 8) defaultViewSettings [world []]]]
+          flatOnly =
+            mkOracle srgb8 [(h1, solid True red)] $
+              [offscreenPass noClear [mkView camera (fullViewport 8 8) defaultViewSettings [world [(spriteAt h1 (0, 0)) {instanceTransform = fromColumns (V2 0 0) (V2 0 1) (V2 0 0)}]]]]
       expectAt drawing 4 4 `shouldBe` Unevaluable (MappingNotRepresentable (AtView 0 0))
+      -- A quad with no area needs no mapping: it is known to cover nothing.
       expectAt empty 4 4 `shouldBe` Expected (Rgba8 0 0 0 0) (Tolerance 0 0 0 0)
+      expectAt flatOnly 4 4 `shouldBe` Expected (Rgba8 0 0 0 0) (Tolerance 0 0 0 0)
