@@ -31,7 +31,7 @@ concrete precondition
 - [x] R2D-7. Record the ordered path in `render-2d-vulkan`, proven by offscreen readback — [#422]
 - [x] R2D-14. Publish scenes per window in the window host — [#423]
 - [x] R2D-8. Show a decoded image in a window through published snapshots — [#424]
-- [ ] R2D-17. Clear a depth attachment within a rectangle
+- [x] R2D-17. Clear a depth attachment within a rectangle — [#425]
 - [ ] R2D-9. Draw cutout sprites depth-tested in world layers
 - [ ] R2D-10. Retain static instance content across frames
 - [ ] R2D-15. Bind per-batch storage tables from the ring
