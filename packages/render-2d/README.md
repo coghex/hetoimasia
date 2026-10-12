@@ -2,11 +2,12 @@
 
 The 2D renderer's frame as a value: the snapshot game code builds, the pure
 validation that refuses a bad one, the application-wide discrete-step-zoom
-list, and the 64-byte instance encoding a backend uploads. Mapping views to
-screen space, sorting and draw runs, and everything that records commands
-follow in later slices. The decision record is
-[the 2D renderer design](../../docs/designs/render_2d_design.md) (D-1, D-4, D-7,
-D-9, D-10, D-12, D-16 to D-18, D-23, D-24; R2D-1); the package's place among the
+list, the pure draw plan that routes, orders and splits a validated frame's
+instances into draw runs, and the 64-byte instance encoding a backend uploads.
+Mapping views to screen space and everything that records commands follow in
+later slices. The decision record is
+[the 2D renderer design](../../docs/designs/render_2d_design.md) (D-1 to D-4,
+D-7, D-9, D-10, D-12, D-16 to D-19, D-22 to D-25, D-27; R2D-1, R2D-3); the package's place among the
 others is [the foundation design](../../docs/engine_foundation_design.md).
 
 | Module | Contents |
@@ -17,6 +18,7 @@ others is [the foundation design](../../docs/engine_foundation_design.md).
 | `Hetoimasia.Render.TwoD.Target.Backend` | `targetRef ∷ Word32 → Word32 → TargetRef`; `targetRefIndex`, `targetRefGeneration` (backends, and tests standing in for one) |
 | `Hetoimasia.Render.TwoD.Validation` | `validateSnapshot`; `Refusal`, `Location`, `Reason`; `ValidSnapshot` with `validSnapshot` and `validLayers`; `ValidLayer` with `validLayerLocation` and `validLayerContents` |
 | `Hetoimasia.Render.TwoD.ZoomSteps` | `ZoomSteps`, `zoomLevels`, `defaultZoomSteps`, `validateZoomSteps`; `ZoomRefusal`, `ZoomLocation`, `ZoomReason` |
+| `Hetoimasia.Render.TwoD.DrawPlan` | `planSnapshot ∷ CutoutMarks → ValidSnapshot → DrawPlan`; `CutoutMarks` with `cutoutMarks`, `noCutoutMarks`, `isMarkedCutout`; `DrawPlan`, `PlannedPass`, `PlannedView`, `PlannedLayer`, `LayerSpace`, `DrawRun`, `DrawPath` (`Cutout`, `Ordered`), `Material` (`DefaultMaterial`) with `materialCutoutCapable`; `drawingOrder`, `runIndices` |
 | `Hetoimasia.Render.TwoD.Encoding` | `encodeLayer ∷ ValidLayer → ByteString`; `instanceStride`, `flagsWord` |
 
 There is no collecting module and no prelude: import the module that owns what
@@ -24,7 +26,8 @@ you use.
 
 ## Boundary
 
-The library's `build-depends` names `base`, `bytestring`,
+The library's `build-depends` names `base`, `array` and `containers` (the plan's
+permutation and the set of marked handles), `bytestring`,
 [`hetoimasia-math`](../math/README.md) (for the camera's position and the
 instance's 2×3 affine transform) and
 [`hetoimasia-render-api`](../render-api/README.md) (for the texture handle). It
@@ -105,6 +108,81 @@ lifetime, and game code can only compare, order and show one.
 `Hetoimasia.Render.TwoD.Target.Backend` builds and reads one, for backends and
 for tests that stand in for one.
 
+## The draw plan
+
+`planSnapshot marks valid` is pure and total over a validated snapshot. It
+keeps the snapshot's structure: the passes in list order, within each pass the
+views in order, within each view the layers in order, and within each layer an
+ordered list of draw runs. A `PlannedPass` keeps its target and clear, a
+`PlannedView` its camera, viewport and settings, and a `PlannedLayer` its
+`Location` (`AtLayer`), its `LayerSpace` (`WorldSpace` with its depth, or
+`UiSpace`) and whether it clears depth.
+
+A `PlannedLayer` carries its drawing order as `plannedOrder`, a permutation of
+the layer's submission indices (an unboxed array, the one structure the plan
+keeps per instance; `drawingOrder` lists it), so a recorder can encode
+instances in drawing order. A `DrawRun` names its `DrawPath` (`Cutout` or
+`Ordered`), its `Material` and a contiguous range of that permutation
+(`runStart`, `runCount`; `runIndices` lists it). A zero-size viewport and a
+layer with no instances hold no runs, and a zero-size viewport holds no order
+either. A world layer with depth enabled is marked `plannedClearsDepth`: it
+clears depth within its viewport before its runs, whether or not any instance
+takes the cutout path.
+
+**The marks (choice A).** A texture's cutout mark is an input. The caller gives
+`cutoutMarks` the complete handles, generation included, that are marked
+cutout-safe; the mark is computed by `asset-image`, may be overridden when the
+texture is registered with `render-2d`, and is fixed at registration (D-19,
+D-27). This package computes and stores none. A handle that is not in the set,
+including one that only shares a lookup index with a marked handle, is
+unmarked and takes the ordered path.
+
+**Routing (D-3, D-22, D-24, D-25).** An instance takes the cutout path only when
+all of these hold; every other instance takes the ordered path:
+
+| Condition | Why |
+| --- | --- |
+| it is in a world layer whose depth is enabled | without depth there is nothing to resolve overlap, so a layer without depth and every UI layer draw wholly in the ordered path |
+| its texture is marked cutout-safe | an unmarked or unknown handle is ordered |
+| its material is cutout-capable | only cutout-capable materials route to the cutout pass |
+| its tint alpha is 255 | a fading sprite must blend |
+| its translucent flag and its additive flag are both clear | both always take the ordered path |
+
+Until application materials exist (R2D-11), every instance uses the built-in
+`DefaultMaterial`, which is cutout-capable; how an instance names a material,
+and splitting runs between materials, arrive with application materials.
+
+**Ordering within a layer.** The cutout runs come first, ordered by material
+and then by submission sequence (an instance's position in its own layer, from
+zero); the depth buffer, not the sort, resolves their overlap. The
+ordered-path instances follow, sorted back to front: ascending depth key, since
+a larger key is nearer, then ascending submission sequence. **UI layers, and
+every layer without depth, sort wholly this way**: by ascending depth key and
+then submission sequence, which at equal keys is plain painter's order, so a
+UI instance with a larger key draws over one submitted later with a smaller
+key. The order is total and repeatable: the same snapshot and marks always
+give the same plan.
+
+**Runs.** Consecutive instances in the drawing order share a run when they
+share a path and a material. A sampler choice, a tint, a depth key, a
+transform, a UV rectangle or a material parameter word never splits a run,
+because each travels in the instance; so a layer holds at most two runs until
+application materials exist, its cutout run and its ordered run.
+
+**Equal keys (D-23).** The plan realizes two documented outcomes:
+
+1. Among cutouts at an equal key, the later draw in run order wins, because the
+   recorder draws them with a less-or-equal depth test; runs are ordered by
+   material, and instances within a run by submission sequence.
+2. At an equal key, an ordered-path instance always draws after a cutout, and
+   so over it, because the ordered path follows every cutout run.
+
+An adapter that needs a guaranteed winner between two instances gives them
+distinct depth keys.
+
+**Cost.** Planning allocates the one permutation per layer and sorts it once,
+O(n log n) in the layer's instance count.
+
 ## Discrete step zoom
 
 Discrete step zoom is an application-wide setting, independent of the per-view
@@ -168,8 +246,10 @@ slices of the design (R2D-14, R2D-8).
 
 ## Not here
 
-View mapping and picking (R2D-2); routing between the cutout and ordered paths,
-sorting and draw runs (R2D-3); expected pixels (R2D-4); recording, shaders,
+View mapping and picking (R2D-2); expected pixels (R2D-4); retained static
+content and its merge with the dynamic snapshot (R2D-10); application materials
+and splitting runs between them (R2D-11); computing or registering a texture's
+mark (R2D-7, R2D-8); recording, shaders,
 samplers and everything in `render-2d-vulkan`; publication; retained static
 content; material data records and clip tables; sampling offscreen targets; and
 Lua bindings.
@@ -194,5 +274,18 @@ one and many instances, the flags word for every sampler choice and flag
 combination with its reserved bits zero and the clip index in the top 16 bits,
 and, through separately compiled external clients, that a validated value and
 an offscreen target reference cannot be forged. Generated and hand-written
-inputs sit side by side. Hspec, QuickCheck and the external-client harness are
+inputs sit side by side. For the draw plan it checks the routing of every
+combination of the conditions above (layer kind, mark, tint alpha, translucent
+and additive flags), a mark for one generation leaving another handle that
+reuses its lookup index unmarked, the exact drawing order and runs of
+interleaved cutout and translucent inputs, both equal-key outcomes as concrete
+fixtures, layers without depth and UI layers taking only the ordered path in
+ascending key then submission order, the depth-clear mark on every
+depth-enabled world layer including an ordered-only and an empty one, a
+zero-size viewport and an empty layer holding no runs, the structure of
+several passes, views and layers kept with their metadata, and, over generated
+snapshots, that planning twice gives the same plan, that each layer's order is
+a permutation of its submission indices and its runs partition it with maximal
+path grouping, that the order meets an independent characterisation, and that
+shuffled equal-key inputs keep their new submission order on each path. Hspec, QuickCheck and the external-client harness are
 the suite's dependencies, not the library's.
