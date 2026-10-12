@@ -209,7 +209,7 @@ Each names where: the view as `AtView pass view`, or an instance as
 
 | Reason | When |
 | --- | --- |
-| `NearViewportEdge` | The probe's centre is within 1/16 pixel of an edge of a view's viewport that is not on a whole pixel, and the view has an instance that could draw there. |
+| `NearViewportEdge` | The probe's centre is within 1/16 pixel of an edge of a view's non-empty viewport that is not on a whole pixel, whatever the view draws. |
 | `NearQuadEdge` | The centre is within 1/16 pixel of the edge of an ordered-path instance's quad. |
 | `OnCutoutPath` | A cutout-path instance covers the probe or is within 1/16 pixel of covering it. |
 | `MinifiedNotAxisAligned` | A minified probe, on a texture with more than one level, whose derivatives are sheared or rotated by other than a quarter turn. |
