@@ -217,6 +217,11 @@ spec = describe "Frames" $ do
       completeFence (rigStandIn rig) (fences !! 1)
       progress rig `shouldReturn'` \report → progressCompleted report `shouldBe` [late]
       atomically (readOutstandingSubmissions (rigFrames rig)) `shouldReturn` [early]
+      -- The completion is recorded in a log of its own, in the transaction that
+      -- recorded it in the model, until a consumer takes it.
+      atomically (readCompletedSubmissions (rigFrames rig)) `shouldReturn` [late]
+      atomically (takeCompletedSubmissions (rigFrames rig)) `shouldReturn` [late]
+      atomically (takeCompletedSubmissions (rigFrames rig)) `shouldReturn` []
       generation ← activeGeneration rig
       submittedOn rig (GenerationSubject generation) `shouldReturn` [early]
       clean rig
@@ -277,6 +282,19 @@ spec = describe "Frames" $ do
       _ ← progress rig
       filter isQuery <$> frameCalls (rigStandIn rig) `shouldReturn` []
       retireTargetFrames (rigFrames rig) (rigTarget rig) `raises` \(FramesRetained _ frames _ _ _) → frames == [ownedFrame frame]
+
+    it "logs no completion for a submission whose fence query raised, though the frames no longer hold it" $ do
+      rig ← newRig
+      frame ← owned rig
+      _ ← sealed rig frame >>= \batch → submitted rig (batch :| [])
+      failFrameStep (rigStandIn rig) AtQueryFence
+      progress rig `raises` \(FrameEffectUncertain _ _) → True
+      clearFrameStep (rigStandIn rig) AtQueryFence
+      -- Dropped as uncertain, which is no completion: the log, unlike the
+      -- outstanding set, does not say it finished.
+      atomically (readOutstandingSubmissions (rigFrames rig)) `shouldReturn` []
+      atomically (readCompletedSubmissions (rigFrames rig)) `shouldReturn` []
+      sessionState <$> modelOf rig `shouldReturn` SessionFailed CleanupFailed
 
     it "retains a fence whose reset raised, stops admission and fails the session, submitting nothing" $ do
       rig ← newRig

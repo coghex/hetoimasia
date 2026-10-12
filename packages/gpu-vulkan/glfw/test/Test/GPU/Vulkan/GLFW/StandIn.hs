@@ -71,6 +71,7 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , keepPresentationsOf
   , stallSwapchain
   , raiseOnPresent
+  , loseWhileRecording
   , suboptimalWhileStale
   , swapchainsCreated
   , refuseFrames
@@ -922,6 +923,8 @@ data Rendering = Rendering
   , renderingKindBuffers ∷ !(TVar (Set Word64))
     -- ^ The live buffers of the engine's kinds (GRS-2), as against readback
     -- buffers.
+  , renderingRecordLoss ∷ !(TVar Bool)
+    -- ^ Whether beginning a command buffer reports the device lost.
   }
 
 -- | A managed object the recording's layer creates, or the recording's layer
@@ -960,6 +963,7 @@ newRendering =
     <*> newTVarIO False
     <*> newTVarIO Set.empty
     <*> newTVarIO Set.empty
+    <*> newTVarIO False
 
 -- | Whether a submission's fence answers signalled when it is next asked.
 submissionsComplete ∷ Rig → Bool → IO ()
@@ -1001,6 +1005,11 @@ keepPresentationsOf rig swapchain kept =
 -- | Answer not ready to every later acquisition from this swapchain.
 stallSwapchain ∷ Rig → Word64 → IO ()
 stallSwapchain rig swapchain = atomically (modifyTVar' (renderingStalled (rigRendering rig)) (Set.insert swapchain))
+
+-- | Have every later beginning of a command buffer report the device lost, as
+-- a loss during a frame's recording does.
+loseWhileRecording ∷ Rig → IO ()
+loseWhileRecording rig = atomically (writeTVar (renderingRecordLoss (rigRendering rig)) True)
 
 -- | Have the next presentation raise this, once, after writing its entry.
 raiseOnPresent ∷ Rig → SomeException → IO ()
@@ -1170,7 +1179,9 @@ renderingLayers rescued events rendering clock =
         , opsDestroyStorage = \_ _ → pure ()
         , opsReadMapped = \_ _ size → pure (ByteString.replicate (fromIntegral size) readbackByte)
         , opsWriteMapped = \_ _ _ → pure ()
-        , opsBeginCommands = \_ → pure ()
+        , opsBeginCommands = \_ →
+            readTVarIO (renderingRecordLoss rendering) >>= \losing →
+              when losing (throwIO (StandInLoss "vkBeginCommandBuffer"))
         , opsEndCommands = \_ → pure ()
         , opsRecord = \buffer command → record events (CommandRecorded buffer command)
         , opsCommandBufferHandle = id

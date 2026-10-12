@@ -51,6 +51,8 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Frames.State
   , SlotView (..)
   , readSlots
   , readOutstandingSubmissions
+  , readCompletedSubmissions
+  , takeCompletedSubmissions
   , PoolView (..)
   , readPool
   , PresentationStanding (..)
@@ -75,7 +77,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Frames.State
   , frameMisuse
   ) where
 
-import Control.Concurrent.STM (STM, TVar, modifyTVar', newTVarIO, readTVar)
+import Control.Concurrent.STM (STM, TVar, modifyTVar', newTVarIO, readTVar, stateTVar)
 import Control.Exception (Exception (displayException))
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -313,6 +315,13 @@ data Frames q inst msgr phys dev cmd = Frames
     -- ^ Each frame-less slot's fence, by slot (GRS-12).
   , framesFramelessSubmissions ∷ !(TVar (Map SubmissionId FramelessRecord))
     -- ^ Each outstanding frame-less submission.
+  , framesCompletions ∷ !(TVar [SubmissionId])
+    -- ^ The submissions whose completion the model recorded on their fence's
+    -- evidence and that no consumer has taken ('takeCompletedSubmissions'),
+    -- newest first. It is appended in the same transaction as the model's
+    -- completion, so a step that raises after recording a completion leaves it
+    -- here; a submission an uncertain fence query dropped, or the device's loss
+    -- let go of, is never in it.
   }
 
 -- | The frames over this recording, owned by the thread that owns it — the
@@ -328,6 +337,7 @@ newFrames ops recording =
     <*> newTVarIO 0
     <*> newTVarIO Map.empty
     <*> newTVarIO Map.empty
+    <*> newTVarIO []
 
 framesRoots ∷ Frames q inst msgr phys dev cmd → Roots q inst msgr phys dev
 framesRoots = recordingRoots . framesRecording
@@ -509,6 +519,18 @@ readSlots frames = map (\((target, slot), sync) → SlotView target slot sync) .
 
 readOutstandingSubmissions ∷ Frames q inst msgr phys dev cmd → STM [SubmissionId]
 readOutstandingSubmissions frames = Map.keys <$> readTVar (framesSubmissions frames)
+
+-- | The submissions whose completion has been recorded and not yet taken, the
+-- evidence a consumer of completion reads without depending on a step's
+-- return. Reading takes nothing.
+readCompletedSubmissions ∷ Frames q inst msgr phys dev cmd → STM [SubmissionId]
+readCompletedSubmissions = readTVar . framesCompletions
+
+-- | Take the completions recorded since the last taking, clearing them. The
+-- graphics owner's rendering takes them each time it reconciles, so the log is
+-- bounded by the submissions in flight.
+takeCompletedSubmissions ∷ Frames q inst msgr phys dev cmd → STM [SubmissionId]
+takeCompletedSubmissions frames = stateTVar (framesCompletions frames) (\held → (held, []))
 
 data PoolView = PoolView
   { viewPoolTarget ∷ !TargetId

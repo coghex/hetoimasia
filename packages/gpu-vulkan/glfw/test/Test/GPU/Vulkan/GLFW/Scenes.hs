@@ -88,6 +88,7 @@ spec = describe "Vulkan scenes for each window (R2D-14)" $ do
     itBounded "releases the revisions of an ended target and of the owner's retirement, each exactly once" testReleaseAtEnd
     itBounded "holds a finite number of unreleased revisions for a target, adopting nothing newer behind a pending submission until a release makes room, then catching up in order" testRetentionBound
     itBounded "keeps a revision awaiting release when the device's loss lets its submission go without completing it" testLossKeepsRevision
+    itBounded "keeps the revision of a recording the device's loss interrupted, which no reset discarded" testLossDuringRecording
     itBounded "completes an adoption's record, notification and watermark, and a release's removal and notifications, whatever cancels the owner meanwhile" testLedgerCancellation
     itBounded "ends the use of a recording that raised once the target's teardown discards it, releasing its revision at the target's retirement" testTeardownDiscard
 
@@ -951,4 +952,26 @@ testLossKeepsRevision = do
   adoptedBy events window `shouldBe` [(0, 0), (1, 91)]
   -- Revision 1 is the target's current one when it ends, but nothing verified
   -- the frame's commands over: it stays awaiting release.
+  releasedBy events window `shouldBe` [0]
+
+-- | The device is lost while a frame is being recorded: the unsubmitted
+-- recording is let go of under the loss rule, which resets nothing, so no
+-- discard is evidenced and the revision stays awaiting release.
+testLossDuringRecording ∷ IO ()
+testLossDuringRecording = do
+  rig ← scenesRig 1
+  outcome ← runRigCaught rig $ \host control → do
+    _ ← superviseGraphicsOwner control (vulkanGraphicsOwner host)
+    [window] ← windowsOf host
+    _ ← attach host window
+    composedUntil rig host control "the first adoption" (not . null . flip adoptedBy window <$> sceneEvents rig)
+    loseWhileRecording rig
+    _ ← publishTo host window 93
+    composedUntil rig host control "the loss at a checkpoint" (checkRuntime control >> pure False)
+  either (const (pure ())) (const (failWith "the run returned instead of failing with the loss")) outcome
+  events ← sceneEvents rig
+  [window] ← case nub [at | SceneAdopted at _ _ ← events] of
+    [only] → pure [only]
+    other → failWith ("expected one window, saw " <> show other)
+  adoptedBy events window `shouldBe` [(0, 0), (1, 93)]
   releasedBy events window `shouldBe` [0]

@@ -252,6 +252,8 @@ module Hetoimasia.GPU.Vulkan.Native.Frames
   , SlotView (..)
   , readSlots
   , readOutstandingSubmissions
+  , readCompletedSubmissions
+  , takeCompletedSubmissions
   , PoolHolder (..)
   , PoolSync (..)
   , PoolView (..)
@@ -319,6 +321,8 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.State
   , newFrames
   , readFrameStandings
   , readOutstandingSubmissions
+  , readCompletedSubmissions
+  , takeCompletedSubmissions
   , readPool
   , readPresentations
   , readSlots

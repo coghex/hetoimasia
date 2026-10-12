@@ -689,7 +689,10 @@ data WindowScenePublication
 -- the initial scene's revision 0. A window the host does not hold is answered
 -- 'WindowSceneUnknown', naming it, and nothing changes. The publication is
 -- keyed by the window and not by an attachment, so it survives the window's
--- surface being recreated under a new attachment incarnation.
+-- surface being recreated under a new attachment incarnation. An accepted
+-- publication forgets the publications of every window the supplied list does
+-- not hold, so the table is bounded by the host's windows without waiting for
+-- the owner's rounds.
 publishOwnerWindowScene
   ∷ OwnerHandoff scene → [WindowId] → WindowId → Prepared scene → STM WindowScenePublication
 publishOwnerWindowScene handoff held window scene = case handoffSceneMode' handoff of
@@ -704,7 +707,13 @@ publishOwnerWindowScene handoff held window scene = case handoffSceneMode' hando
           else do
             cells ← readTVar (handoffWindowScenes handoff)
             let revision = maybe 0 (\(WindowSceneCell _ held') → held') (Map.lookup window cells) + 1
-            writeTVar (handoffWindowScenes handoff) (Map.insert window (WindowSceneCell scene revision) cells)
+            -- A publication forgets those of the windows the host no longer
+            -- holds, read in this same transaction, so the table is bounded by
+            -- the host's windows however long the owner is occupied and
+            -- however many windows come and go meanwhile.
+            writeTVar
+              (handoffWindowScenes handoff)
+              (Map.insert window (WindowSceneCell scene revision) (Map.filterWithKey (\at _ → at `elem` held) cells))
             modifyTVar' (handoffSceneStamp handoff) (+ 1)
             pure (WindowScenePublished window revision)
 

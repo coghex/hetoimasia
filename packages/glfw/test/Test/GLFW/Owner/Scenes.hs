@@ -25,6 +25,8 @@ spec = do
     (boundedExample testUnknownWindow)
   it "forgets the publication of a window the host has retired"
     (boundedExample testRetiredWindowForgotten)
+  it "bounds the publication table by the host's windows with each publication, however long the owner is occupied"
+    (boundedExample testTableBoundedByPublication)
   it "wakes an idle owner for a window's publication"
     (boundedExample testWindowPublicationWakes)
   it "keeps the shared scene as it was: published and stepped as one, with no window's scene, and per-window publication refused"
@@ -155,7 +157,10 @@ testSharedModeUnchanged = do
     scene ← prepare (Scene 4)
     published ← atomically (publishOwnerScene (ownerHandoff owner) scene)
     refused ← publishTo owner window 9
-    _ ← awaitIdle owner
+    -- The step that took the publication, whichever round that is.
+    atomically $ do
+      current ← readTVar seen
+      check (fmap (\(_, _, revision) → revision) current == Just 1)
     stepped ← readTVarIO seen
     pure (published, window, refused, stepped)
   published `shouldBe` ScenePublication Published
@@ -190,3 +195,22 @@ firstWindow host =
   atomically (hostWindowIdentities host) >>= \case
     first : _ → pure first
     [] → unexpected "the host created no window"
+
+-- | Windows come and go, and each is published to, while the owner takes no
+-- round at all: the table keeps only the windows the host holds at the latest
+-- publication, whatever the owner has pruned.
+testTableBoundedByPublication ∷ IO ()
+testTableBoundedByPublication = do
+  rig ← perWindowRig
+  (second, held) ← ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control → do
+    (first, other) ← twoWindows host
+    one ← prepare (Scene 1)
+    two ← prepare (Scene 2)
+    -- One transaction, so no owner round can fall between the steps: first is
+    -- held when it is published to, and the other alone when it is.
+    keys ← atomically $ do
+      _ ← publishOwnerWindowScene (ownerHandoff owner) [first] first one
+      _ ← publishOwnerWindowScene (ownerHandoff owner) [other] other two
+      Map.keys <$> readOwnerWindowScenes (ownerHandoff owner)
+    pure (other, keys)
+  held `shouldBe` [second]
