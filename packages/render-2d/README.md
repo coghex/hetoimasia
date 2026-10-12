@@ -249,11 +249,14 @@ framebuffer = window · framebufferExtent / logicalExtent
 **Pixel snap and picking.** `snapPixel x = floor (x + 0.5)` per axis, evaluated
 exactly (halves round up: −0.5 gives 0; a whole Float such as 8388609 stays),
 and `snapPoint` applies it to a position. With a view's pixel snap on, the
-mapping rounds the translation of each transform: the camera's translation for
-the world, the UI origin for the UI. The recorder rounds each instance's origin
-rigidly in the shader, which `snapPoint (worldToTarget m origin)` reproduces.
-The inverse conversions stay **unsnapped**: they invert the same transform
-drawing uses, with its snapped translation, and round no result. So for the
+world mapping rounds its translation, which is the camera's. The UI transform
+stays the continuous equation above, with the viewport's origin as it is; UI
+snaps in device pixels through the rounding of UI instance origins. The recorder
+rounds each instance's origin rigidly in the shader, which
+`snapPoint (worldToTarget m origin)` and `snapPoint (uiToTarget m origin)`
+reproduce (`mappingPixelSnap` says whether the view snaps). The inverse
+conversions stay **unsnapped**: they invert the same transform drawing uses,
+with its snapped translation where it has one, and round no result. So for the
 transform `F` drawing uses, `|snapPoint (F p) − F p| ≤ 0.5` per axis, and a
 snapped sprite's drawn origin differs from the unsnapped inverse's point by at
 most half a device pixel per axis. That promise holds against `F`, not against
@@ -262,6 +265,15 @@ zoom 1, camera 0.25 and an instance origin 0.5, the ideal position is 50.25,
 the camera-snapped position 50.5 and the drawn origin 51. With snap on the
 camera position appears within half a pixel of the centre. Which instance lies
 under a point stays the game's question.
+
+**Float resolution.** The transforms hold 32-bit coefficients. The world
+translation is the viewport's centre minus the scale times the camera position,
+and once that product exceeds 2²³ pixels one ulp of it is more than a pixel:
+the mapping is still finite and inverts exactly what it holds, but the camera
+position then appears at the centre only to that resolution, with snap on or
+off (scale 40960 pixels per unit at position 999.99 lands pixels away). The
+half-pixel promise is unaffected, because it compares a position with its own
+rounding. A game with such ranges keeps its camera near the origin.
 
 **Degenerate and unrepresentable input.** Nothing is clamped, and every refusal
 is `Nothing`:
@@ -404,7 +416,7 @@ same physical size on content scale 1 and 2, window conversion at ratios 1, 2
 and a different ratio per axis, a content scale unlike the extent ratio);
 every combination of pixel snap, both zoom modes and smooth or discrete step
 zoom across window sizes and content scales; the camera-snap counterexample
-above; round trips for generated views and metrics within a stated tolerance;
+above, the UI transform unchanged by snap, and the camera's position at the centre to the stated Float resolution, far from the origin; round trips for generated views and metrics within a stated tolerance;
 the half-pixel property; the snapping function at half boundaries and the
 whole Float 8388609; every degenerate case, containment at all four edges, the
 refusal of unrepresentable results, and, over wild and extreme inputs, that no
