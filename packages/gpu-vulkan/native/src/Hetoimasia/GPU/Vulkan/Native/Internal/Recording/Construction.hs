@@ -47,7 +47,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Construction
   ) where
 
 import Control.Concurrent.STM (STM, atomically, modifyTVar', readTVar, readTVarIO, writeTVar)
-import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, displayException, mask_, onException, rethrowIO, throwIO, tryWithContext)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, displayException, mask_, rethrowIO, throwIO, tryWithContext)
 import Control.Monad (when)
 import qualified Data.Text as Text
 import Data.ByteString (ByteString)
@@ -783,7 +783,10 @@ createBuffer recording (BufferDescription kind bytes)
 -- — and no bytes of its own (D-40). A view whose creation raised destroys the
 -- image and frees its allocation before the failure is raised, so a creation
 -- that raised created nothing; if that cleanup raised too, what it concerned
--- is retained and the session fails with 'CleanupFailed'.
+-- is retained and the session fails with 'CleanupFailed'. A view whose
+-- creation a cancellation interrupted inside the call may exist, so the image
+-- and its allocation are retained instead, never destroyed or freed, and the
+-- session fails with 'CleanupFailed'.
 createImage ∷ Recording q inst msgr phys dev cmd → ImageDescription → IO (Either Refusal Image)
 createImage recording description =
   owned recording $ case describedRefusal of
@@ -819,8 +822,19 @@ createImage recording description =
         Left refusal → pure (Left (allocationRefused refusal))
         Right memory → do
           view ←
-            rootsCall roots "vkCreateImageView" (opsCreateView native device (ViewRequest (memoryResource memory) code (useAspect use) levels))
-              `onException` undoing roots "destroying the image whose view could not be created" (freeImage roots memory)
+            tryWithContext @SomeException (rootsCall roots "vkCreateImageView" (opsCreateView native device (ViewRequest (memoryResource memory) code (useAspect use) levels))) >>= \case
+              Right made → pure made
+              Left failure@(ExceptionWithContext _ exception)
+                -- A cancellation inside the call leaves unknown whether it made
+                -- a view of the image, so the image is never destroyed under
+                -- one: it and its allocation are retained, counted with the
+                -- roots, and the session fails.
+                | isAsynchronous exception → do
+                    atomically (failRootsSessionBecause roots CleanupFailed "a cancellation interrupted vkCreateImageView, so whether it made a view of the image is unknown, and the image and its allocation are retained")
+                    rethrowIO failure
+                | otherwise → do
+                    undoing roots "destroying the image whose view could not be created" (freeImage roots memory)
+                    rethrowIO failure
           pure (Right (NativeImage description memory view))
 
 -- | What an allocation that made nothing refused with, as the recording

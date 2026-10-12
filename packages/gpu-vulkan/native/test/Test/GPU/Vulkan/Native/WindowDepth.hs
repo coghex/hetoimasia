@@ -249,6 +249,39 @@ spec = describe "Windowed depth (GRS-13)" $ do
       destroyed `shouldBe` [managedResource firstDepth]
       depthManaged rig `shouldReturn` []
 
+    it "retains a generation's depth image through the recording's retirement while its generation still awaits its presentation" $ do
+      rig ← newRigWindowDepth WindowedDepth
+      first ← activeGeneration rig
+      Just firstDepth ← depthOf rig first
+      frame ← owned rig
+      (batch, _) ← depthFrame rig frame (clearedDepth firstDepth ClearFromUndefined)
+      _ ← submitted rig (batch :| [])
+      presentFrame (rigFrames rig) (ownedFrame frame) >>= either (fail . show) (const (pure ()))
+      submission ← (\calls → [fence | Submitted _ fence ← calls]) <$> frameCalls (rigStandIn rig)
+      -- The graphics submission completes, the presentation's fence does not,
+      -- and the target's drain never finished: the generation stands.
+      mapM_ (completeFence (rigStandIn rig)) submission
+      _ ← progress rig
+      retireRecording (rigRecording rig) (at 10) `raises` \(ResourcesRetained remaining) → managedResource firstDepth `elem` remaining
+      depthManaged rig >>= (`shouldSatisfy` elem (managedResource firstDepth, ManagedLive))
+      destroyedImages rig `shouldReturn` []
+
+    it "lets the device's loss release a generation's depth image through the recording's retirement, whatever became of its generation" $ do
+      rig ← newRigWindowDepth WindowedDepth
+      first ← activeGeneration rig
+      Just firstDepth ← depthOf rig first
+      frame ← owned rig
+      (batch, _) ← depthFrame rig frame (clearedDepth firstDepth ClearFromUndefined)
+      _ ← submitted rig (batch :| [])
+      loseFrameStep (rigStandIn rig) AtQueryFence
+      progress rig `raises` \loss → lostDuring loss == "vkGetFenceStatus"
+      _ ← closeTargetFrames (rigFrames rig) (rigTarget rig)
+      _ ← releaseFramesToDeviceLoss (rigFrames rig)
+      retireTargetFrames (rigFrames rig) (rigTarget rig)
+      -- Its generation was never retired, and the loss let every hold go.
+      retireRecording (rigRecording rig) (at 11)
+      depthManaged rig `shouldReturn` []
+
     it "lets the loss of the device release the depth with its generation, and the recording's retirement destroy it under the device-loss rule" $ do
       rig ← newRigWindowDepth WindowedDepth
       first ← activeGeneration rig
@@ -354,6 +387,13 @@ spec = describe "Windowed depth (GRS-13)" $ do
       [() | Roots'.DestroyedSwapchain _ ← recorded] `shouldBe` []
       [() | Roots'.DestroyedView _ ← recorded] `shouldBe` []
       length [() | Roots'.CreatedSwapchain {} ← recorded] `shouldBe` 1
+      -- Nor is the depth image, whose view's outcome is unknown, destroyed or
+      -- its allocation freed — at the cancellation or by any teardown.
+      allocated ← allocatorCalls (standAllocator (rigRootsStandIn rig))
+      length [() | MadeImage {} ← allocated] `shouldBe` 1
+      [() | DestroyedImage _ ← allocated] `shouldBe` []
+      [() | FreedAllocation _ ← allocated] `shouldBe` []
+      depthManaged rig `shouldReturn` []
       retireTargetGenerations (rigGenerations rig) (at 300) (rigTarget rig) `raises` \(GenerationsRetained _ remaining) → remaining == [viewGeneration generation]
 
     it "releases the depth of a candidate the close superseded after the depth was made, and never publishes it" $ do

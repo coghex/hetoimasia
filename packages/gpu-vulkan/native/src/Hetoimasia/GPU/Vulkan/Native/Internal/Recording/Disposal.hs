@@ -35,6 +35,7 @@ import Hetoimasia.GPU.Model
   , EvidenceSource (..)
   , SessionFailureCause (CleanupFailed)
   , TurnReport (..)
+  , deviceLossObserved
   , disposalEligible
   , endResourceCpuUse
   , releaseResource
@@ -226,7 +227,16 @@ retireRecording recording now = owner recording $ do
   -- ticket fails here, if the host's retirement has not failed it already.
   -- The replacement is released with every other live generation below.
   atomically (failPendingSwaps recording)
-  live ← Map.keys . Map.filter ((== ManagedLive) . managedStanding) <$> readTVarIO (recordingManaged recording)
+  -- A swapchain generation's depth image (GRS-13) is its generation's to
+  -- release, once the generation has been destroyed: a recording retiring
+  -- while its generation is still held — a presentation not yet retired, or
+  -- the generation kept uncertain — retains it, as the generation is. Under the
+  -- device's loss every hold is let go of, and so is the image.
+  lost ← deviceLossObserved <$> atomically (stateRootsModel roots (\model → (model, model)))
+  owned' ← readTVarIO (recordingWindowDepths recording)
+  live ←
+    Map.keys . Map.filterWithKey (\resource record → managedStanding record == ManagedLive && (lost || resource `Set.notMember` owned'))
+      <$> readTVarIO (recordingManaged recording)
   for_ live $ \resource → atomically $ do
     modelEdit roots (releaseResource resource)
     modelEdit roots (endResourceCpuUse resource)
