@@ -3,11 +3,12 @@
 The 2D renderer's frame as a value: the snapshot game code builds, the pure
 validation that refuses a bad one, the application-wide discrete-step-zoom
 list, the pure draw plan that routes, orders and splits a validated frame's
-instances into draw runs, and the 64-byte instance encoding a backend uploads.
-Mapping views to screen space and everything that records commands follow in
-later slices. The decision record is
+instances into draw runs, the pure mapping of a view between window,
+framebuffer, UI and world space, and the 64-byte instance encoding a backend
+uploads. Everything that records commands follows in later slices. The decision
+record is
 [the 2D renderer design](../../docs/designs/render_2d_design.md) (D-1 to D-4,
-D-7, D-9, D-10, D-12, D-16 to D-19, D-22 to D-25, D-27; R2D-1, R2D-3); the package's place among the
+D-7 to D-10, D-12, D-16 to D-19, D-22 to D-25, D-27, D-29; R2D-1 to R2D-3); the package's place among the
 others is [the foundation design](../../docs/engine_foundation_design.md).
 
 | Module | Contents |
@@ -17,7 +18,9 @@ others is [the foundation design](../../docs/engine_foundation_design.md).
 | `Hetoimasia.Render.TwoD.Target` | `TargetRef`, the opaque offscreen target reference: `Eq`, `Ord` and `Show` only |
 | `Hetoimasia.Render.TwoD.Target.Backend` | `targetRef ∷ Word32 → Word32 → TargetRef`; `targetRefIndex`, `targetRefGeneration` (backends, and tests standing in for one) |
 | `Hetoimasia.Render.TwoD.Validation` | `validateSnapshot`; `Refusal`, `Location`, `Reason`; `ValidSnapshot` with `validSnapshot` and `validLayers`; `ValidLayer` with `validLayerLocation` and `validLayerContents` |
-| `Hetoimasia.Render.TwoD.ZoomSteps` | `ZoomSteps`, `zoomLevels`, `defaultZoomSteps`, `validateZoomSteps`; `ZoomRefusal`, `ZoomLocation`, `ZoomReason` |
+| `Hetoimasia.Render.TwoD.ZoomSteps` | `ZoomSteps`, `zoomLevels`, `defaultZoomSteps`, `validateZoomSteps`; `stepZoomIn`, `stepZoomOut`; `ZoomRefusal`, `ZoomLocation`, `ZoomReason` |
+| `Hetoimasia.Render.TwoD.Metrics` | `TargetMetrics` (logical extent, framebuffer extent, per-axis content scale), `PixelExtent`; `offscreenMetrics`, `validMetrics` |
+| `Hetoimasia.Render.TwoD.Mapping` | `viewMapping ∷ TargetMetrics → View → Maybe ViewMapping`; the transforms `worldTransform`, `worldInverse`, `uiTransform`, `uiInverse`; the point conversions `worldToTarget`, `targetToWorld`, `uiToTarget`, `targetToUi`, `windowToTarget`, `targetToWindow`, `windowToWorld`, `worldToWindow`, `windowToUi`, `uiToWindow`; `viewportIsEmpty`, `viewportContains`; `snapPixel`, `snapPoint`; `mappingPixelSnap` |
 | `Hetoimasia.Render.TwoD.DrawPlan` | `planSnapshot ∷ CutoutMarks → ValidSnapshot → DrawPlan`; `CutoutMarks` with `cutoutMarks`, `noCutoutMarks`, `isMarkedCutout`; `DrawPlan`, `PlannedPass`, `PlannedView`, `PlannedLayer`, `LayerSpace`, `DrawRun`, `DrawPath` (`Cutout`, `Ordered`), `Material` (`DefaultMaterial`) with `materialCutoutCapable`; `drawingOrder`, `runIndices` |
 | `Hetoimasia.Render.TwoD.Encoding` | `encodeLayer ∷ ValidLayer → ByteString`; `instanceStride`, `flagsWord` |
 
@@ -183,6 +186,116 @@ distinct depth keys.
 **Cost.** Planning allocates the one permutation per layer and sorts it once,
 O(n log n) in the layer's instance count.
 
+## Mapping views
+
+`viewMapping metrics view` is the one pure mapping of a view, shared by drawing
+and picking. It converts window points (a cursor position) to world or UI
+points and back, and knows the logical size, the framebuffer size and the
+content scale. It is built from plain values, so this package needs no window
+package: the caller fills a `TargetMetrics` from the window layer's
+observation (its logical `Extent`, framebuffer `Extent` and `ContentScale`,
+copied field by field) or, for an offscreen target, from
+`offscreenMetrics (PixelExtent w h)`, whose logical extent equals its pixel
+extent and whose content scale is 1.
+
+**Units.** A viewport is a rectangle of **target pixels**: framebuffer pixels
+for the window, the origin at the upper left and Y down. Every mapped position
+is in target pixels. Converting them to Vulkan clip space belongs to the
+recorder. Extents are whole, non-negative pixel counts (a zero extent is an
+ordinary observation, as a minimized window reports), and a content-scale
+component is finite and strictly positive.
+
+**World.** With `C` the viewport's centre, `p` the camera position, `θ` its
+rotation in radians (0 for none) and `s` the uniform scale on both axes:
+
+```text
+target = C + s · R(−θ) · (world − p)
+s = zoom                          pixels per world unit
+s = viewportHeight · zoom / (2h)  a fixed half-height h
+```
+
+The camera position appears at the viewport's centre (exactly, with snap off).
+In pixels-per-unit mode one world unit spans `zoom` framebuffer pixels, so a
+larger window shows more world and a whole-number zoom gives exact pixel
+spacing. In fixed-half-height mode half the viewport's height spans `h ÷ zoom`
+world units at any resolution; the same total area is visible only while the
+aspect ratio is unchanged. `R` is the rotation of
+[the math package](../math/README.md#affine2): a positive angle takes +X toward
++Y, which is clockwise on a Y-down screen. The camera is turned by `θ` about
+the viewport's centre, so the target's +X axis points along world
+`(cos θ, sin θ)` and the world appears turned by `−θ`: at `θ = π/2` world +Y
+lies to the right of the centre and world +X above it.
+
+**UI.** Independent of the camera, per axis, with UI scale `u` and content
+scale `k`:
+
+```text
+target = viewportOrigin + uiPoint · (u · k)
+```
+
+so a UI element has the same physical size on any display.
+
+**Window.** A window point maps to a framebuffer pixel by the ratio of the
+framebuffer extent to the logical extent, per axis, and content scale plays no
+part:
+
+```text
+framebuffer = window · framebufferExtent / logicalExtent
+```
+
+`windowToWorld` and `windowToUi` compose it with the inverse transforms, and
+`worldToWindow` and `uiToWindow` go back.
+
+**Pixel snap and picking.** `snapPixel x = floor (x + 0.5)` per axis, evaluated
+exactly (halves round up: −0.5 gives 0; a whole Float such as 8388609 stays),
+and `snapPoint` applies it to a position. With a view's pixel snap on, the
+world mapping rounds its translation, which is the camera's. The UI transform
+stays the continuous equation above, with the viewport's origin as it is; UI
+snaps in device pixels through the rounding of UI instance origins. The recorder
+rounds each instance's origin rigidly in the shader, which
+`snapPoint (worldToTarget m origin)` and `snapPoint (uiToTarget m origin)`
+reproduce (`mappingPixelSnap` says whether the view snaps). The inverse
+conversions stay **unsnapped**: they invert the same transform drawing uses,
+with its snapped translation where it has one, and round no result. So for the
+transform `F` drawing uses, `|snapPoint (F p) − F p| ≤ 0.5` per axis, and a
+snapped sprite's drawn origin differs from the unsnapped inverse's point by at
+most half a device pixel per axis. That promise holds against `F`, not against
+a separate transform with an unsnapped camera: with the viewport centre at 50,
+zoom 1, camera 0.25 and an instance origin 0.5, the ideal position is 50.25,
+the camera-snapped position 50.5 and the drawn origin 51. With snap on the
+camera position appears within half a pixel of the centre. Which instance lies
+under a point stays the game's question.
+
+**Float resolution.** The transforms hold 32-bit coefficients. The world
+translation is the viewport's centre minus the scale times the camera position,
+and once that product exceeds 2²³ pixels one ulp of it is more than a pixel:
+the mapping is still finite and inverts exactly what it holds, but the camera
+position then appears at the centre only to that resolution, with snap on or
+off (scale 40960 pixels per unit at position 999.99 lands pixels away). The
+half-pixel promise is unaffected, because it compares a position with its own
+rounding. A game with such ranges keeps its camera near the origin.
+
+**Degenerate and unrepresentable input.** Nothing is clamped, and every refusal
+is `Nothing`:
+
+- A view that validation refuses (`viewReasons` lists why), metrics with a
+  negative extent, or a content scale that is not finite and positive, give no
+  mapping.
+- A mapping whose coefficients, or whose inverse for a non-empty viewport,
+  cannot be finite `Float`s gives no mapping: a camera position of 2e38 at zoom
+  2 overflows, and a subnormal scale has no representable inverse.
+- A viewport with a zero width or height draws nothing (`viewportIsEmpty`), and
+  its inverse transforms and conversions are `Nothing`.
+- A zero logical or framebuffer extent makes every window conversion `Nothing`;
+  world and UI conversions still work.
+- A conversion of a non-finite point, or one whose result overflows, is
+  `Nothing`.
+- A point outside the viewport still converts. `viewportContains` says whether
+  a target-pixel point is inside: the left and top edges are in, the right and
+  bottom edges out, and an empty viewport contains nothing.
+
+No conversion produces a NaN or an infinity; every function is pure and total.
+
 ## Discrete step zoom
 
 Discrete step zoom is an application-wide setting, independent of the per-view
@@ -194,6 +307,12 @@ available whatever the list holds. `validateZoomSteps` refuses an empty list
 (`ZoomLevelNotIncreasing`, checked independently of the first and skipped only next to a NaN, which has no order), each
 naming the level (`AtLevel`) and all together. The default list is the whole
 numbers 1 to 8.
+
+`stepZoomIn` returns the smallest level greater than the current zoom, or the
+largest level when none is greater; `stepZoomOut` returns the largest level
+smaller than the current zoom, or the smallest when none is smaller. The levels
+and the zoom are read in the same zoom mode, so the functions only compare
+numbers. Smooth zoom stays a plain zoom value that they never touch.
 
 ## The instance encoding
 
@@ -246,7 +365,9 @@ slices of the design (R2D-14, R2D-8).
 
 ## Not here
 
-View mapping and picking (R2D-2); expected pixels (R2D-4); retained static
+Which instance lies under a point (the game's question); clip-space conversion
+and the shader's snapping (R2D-7); reading window metrics and publishing per
+window (R2D-14, R2D-8); culling instances per view; expected pixels (R2D-4); retained static
 content and its merge with the dynamic snapshot (R2D-10); application materials
 and splitting runs between them (R2D-11); computing or registering a texture's
 mark (R2D-7, R2D-8); recording, shaders,
@@ -287,5 +408,18 @@ several passes, views and layers kept with their metadata, and, over generated
 snapshots, that planning twice gives the same plan, that each layer's order is
 a permutation of its submission indices and its runs partition it with maximal
 path grouping, that the order meets an independent characterisation, and that
-shuffled equal-key inputs keep their new submission order on each path. Hspec, QuickCheck and the external-client harness are
+shuffled equal-key inputs keep their new submission order on each path. For the
+view mapping it checks the equations against hand-computed values (the camera
+at the viewport's centre, whole-number zoom spacing, a fixed half-height at two
+window sizes, a quarter-turn rotation with its signed basis vectors, UI at the
+same physical size on content scale 1 and 2, window conversion at ratios 1, 2
+and a different ratio per axis, a content scale unlike the extent ratio);
+every combination of pixel snap, both zoom modes and smooth or discrete step
+zoom across window sizes and content scales; the camera-snap counterexample
+above, the UI transform unchanged by snap, and the camera's position at the centre to the stated Float resolution, far from the origin; round trips for generated views and metrics within a stated tolerance;
+the half-pixel property; the snapping function at half boundaries and the
+whole Float 8388609; every degenerate case, containment at all four edges, the
+refusal of unrepresentable results, and, over wild and extreme inputs, that no
+conversion is non-finite; and the discrete stepping at, between, below and
+above the levels. Hspec, QuickCheck and the external-client harness are
 the suite's dependencies, not the library's.
