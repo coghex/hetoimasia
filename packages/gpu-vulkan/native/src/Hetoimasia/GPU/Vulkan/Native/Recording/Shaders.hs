@@ -35,12 +35,20 @@
 -- sampler. They declare no push constants, so a pipeline over them needs a
 -- layout from 'createShaderSampledTablePipelineLayout', and draws with no
 -- 'selectSampler'.
+--
+-- 'storageTableShaders' read the storage table (R2D-15) that a batch bound at
+-- set 2 from the ring: both stages declare its one binding, a rectangle and a
+-- colour as eight floats, the vertex stage drawing the rectangle and the
+-- fragment stage showing the colour. They declare no push constants and no
+-- other binding, so a pipeline over them needs a layout from
+-- 'createTablePipelineLayoutWith' that holds set 2.
 module Hetoimasia.GPU.Vulkan.Native.Recording.Shaders
   ( verificationShaders
   , endpointShaders
   , quadShaders
   , tableShaders
   , tableInstanceShaders
+  , storageTableShaders
   ) where
 
 import Hetoimasia.GPU.Vulkan.Native.Recording (PipelineShaders (..))
@@ -51,6 +59,8 @@ import Hetoimasia.GPU.Vulkan.Native.Recording.ShaderInterfaces
   , tableInstanceFragmentInterface
   , tableInstanceVertexInterface
   , tableVertexInterface
+  , storageTableFragmentInterface
+  , storageTableVertexInterface
   )
 import Hetoimasia.GPU.Vulkan.Native.Shader (CheckedShaders (..), checkedFragmentShader, checkedVertexShader, fragmentShader, glsl, vertexShader)
 
@@ -276,6 +286,51 @@ tableInstanceShaders =
               // dynamic indexing, so every index and the combined operand the
               // sample consumes are marked non-uniform.
               colour = texture(nonuniformEXT(sampler2D(textures[nonuniformEXT(slot)], samplers[nonuniformEXT(min(filtering, 3u))])), at);
+          }
+        |]
+         )
+    }
+
+storageTableShaders ∷ CheckedShaders
+storageTableShaders =
+  CheckedShaders
+    { checkedVertex =
+        $( checkedVertexShader
+             storageTableVertexInterface
+             [glsl|
+          #version 450
+
+          // The batch's table, at the dynamic offset it bound: the rectangle
+          // to draw in clip space (left, top, right, bottom), then a colour.
+          layout(set = 2, binding = 0, std430) readonly buffer Storage {
+              vec4 rectangle;
+              vec4 shade;
+          } table;
+
+          // Two triangles over the unit square.
+          const vec2 corners[6] = vec2[](vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(0.0, 1.0), vec2(0.0, 1.0), vec2(1.0, 0.0), vec2(1.0, 1.0));
+
+          void main() {
+              vec2 corner = corners[gl_VertexIndex];
+              gl_Position = vec4(mix(table.rectangle.xy, table.rectangle.zw, corner), 0.0, 1.0);
+          }
+        |]
+         )
+    , checkedFragment =
+        $( checkedFragmentShader
+             storageTableFragmentInterface
+             [glsl|
+          #version 450
+
+          layout(set = 2, binding = 0, std430) readonly buffer Storage {
+              vec4 rectangle;
+              vec4 shade;
+          } table;
+
+          layout(location = 0) out vec4 colour;
+
+          void main() {
+              colour = table.shade;
           }
         |]
          )

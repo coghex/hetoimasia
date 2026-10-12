@@ -185,10 +185,11 @@ standInMaxFramebuffer = (16384, 16384)
 -- | What the device allows pipeline interfaces and mapped memory unless an
 -- example says otherwise: Vulkan's required minimums — with the descriptor
 -- indexing the profile requires for the texture table's update-after-bind
--- limits, and the largest minimum storage-buffer offset alignment Vulkan
--- permits — and a 64-byte atom.
+-- limits, the largest minimum storage-buffer offset alignment Vulkan
+-- permits, and the minimum dynamic and per-stage storage buffers — and a
+-- 64-byte atom.
 standInRecordingLimits ∷ RecordingLimits
-standInRecordingLimits = RecordingLimits 128 16 16 2048 2047 64 16384 500000 500000 500000 4 256 134217728 500000
+standInRecordingLimits = RecordingLimits 128 16 16 2048 2047 64 16384 500000 500000 500000 4 256 134217728 500000 4 4
 
 -- | Have the device allow pipeline interfaces and mapped memory this from now
 -- on.

@@ -10,6 +10,8 @@ module Hetoimasia.GPU.Vulkan.Native.Recording.ShaderInterfaces
   , tableInstanceVertexInterface
   , tableInstanceFragmentInterface
   , tableInstanceStride
+  , storageTableVertexInterface
+  , storageTableFragmentInterface
   ) where
 
 import Data.Word (Word32)
@@ -79,3 +81,14 @@ tableInstanceFragmentInterface = (interfaceFor FragmentInterface) {interfaceDesc
 -- floats and three unsigned integers.
 tableInstanceStride ∷ Word32
 tableInstanceStride = 28
+
+-- | No vertex input — the shader makes its own vertices — and the storage
+-- table's binding (R2D-15): the rectangle it draws is read from the table the
+-- batch bound at set 2.
+storageTableVertexInterface ∷ ShaderInterface
+storageTableVertexInterface = (interfaceFor VertexInterface) {interfaceDescriptors = storageTableDescriptors}
+
+-- | The storage table's binding and no push constants: the colour it shows is
+-- read from the table the batch bound at set 2.
+storageTableFragmentInterface ∷ ShaderInterface
+storageTableFragmentInterface = (interfaceFor FragmentInterface) {interfaceDescriptors = storageTableDescriptors}

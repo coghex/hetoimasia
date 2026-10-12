@@ -67,6 +67,22 @@
 -- pipelines needs no selected sampler, and 'selectSampler' under them is
 -- refused with no native call. The shaders index the table's four samplers
 -- and must clamp the index to the last of them.
+--
+-- = Per-batch storage tables (R2D-15)
+--
+-- A layout may additionally hold a third engine-owned set, set 2: one
+-- dynamic storage buffer over the session's ring, selected by a dynamic
+-- offset, through which a shader reads a table its batch wrote. The ring is
+-- made with a storage-table window of W bytes ('createRingWith',
+-- 'validateStorageWindow'), 'createStorageTable' makes the set once, and
+-- 'createTablePipelineLayoutWith' makes a layout that holds it
+-- ('TableLayoutOptions'); its checked shaders may declare
+-- 'storageTableDescriptors', which no other layout admits. A batch claims the
+-- table's region with 'claimTable', writes it, and binds it with
+-- 'bindStorageTable' at an offset into the claim; a draw under such a layout
+-- needs it bound, beside the table. The window is a descriptor window, not
+-- ownership of the bytes it exposes: a shader reads only the claim's own
+-- bytes from the bound offset on.
 module Hetoimasia.GPU.Vulkan.Native.TextureTable
   ( -- * Configuration
     Book.TableConfig
@@ -106,16 +122,30 @@ module Hetoimasia.GPU.Vulkan.Native.TextureTable
   , tableSamplerIndex
   , bindTable
   , selectSampler
+
+    -- * Per-batch storage tables (R2D-15)
+  , storageTableDescriptors
+  , TableUse (..)
+  , TableLayoutOptions (..)
+  , createTablePipelineLayoutWith
+  , createStorageTable
+  , StorageView (..)
+  , readStorageTable
+  , claimTable
+  , bindStorageTable
+  , storageDynamicOffset
   ) where
 
 import qualified Hetoimasia.GPU.Model.TextureTable as Book
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Layer (TableSampler (..), tableSamplerIndex)
-import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Recorder (bindTable, selectSampler)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Recorder (bindStorageTable, bindTable, claimTable, selectSampler, storageDynamicOffset)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Table
   ( RegistrationNotUndone (..)
   , TableView (..)
   , createShaderSampledTablePipelineLayout
+  , createStorageTable
   , createTablePipelineLayout
+  , createTablePipelineLayoutWith
   , createTextureTable
   , readTable
   , refreshTextureTable
@@ -123,5 +153,5 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Table
   , releaseTexture
   , swapTexture
   )
-import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State (SwapState (..), SwapTicket, failPendingSwaps, readSwapTicket)
-import Hetoimasia.GPU.Vulkan.Native.Shader.Interface (textureTableDescriptors)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State (StorageView (..), SwapState (..), SwapTicket, TableLayoutOptions (..), TableUse (..), failPendingSwaps, readStorageTable, readSwapTicket)
+import Hetoimasia.GPU.Vulkan.Native.Shader.Interface (storageTableDescriptors, textureTableDescriptors)
