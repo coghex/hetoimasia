@@ -175,7 +175,7 @@ result = s + destination × (1 − s.a)      clamped to [0, 1]
   channel whose range is wider makes the probe **indeterminate**
   (`RoundingNotBounded`), never given a wider tolerance. Eight additive sources
   of exactly 2.5 channel steps are the standard case: rounding half up at every
-  store would say 24, and a device may hold anything from about 18 to 26.
+  store would say 24, and a device may hold anything from 16 to 24.
 - An sRGB target decodes the destination before blending and encodes the result
   on store; a UNORM target stores linear values; alpha is linear in every format.
   The encode and decode are the standard piecewise sRGB transfer function.
