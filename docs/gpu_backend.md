@@ -4088,7 +4088,9 @@ two hooks pair by window and revision; a revision adopted by two targets (a
 window reattached) is notified and released for each. A *use* ends on
 evidence that the frame's commands can no longer read what the scene
 references: its recording was discarded — the frame was skipped, which resets
-the recorder before it discharges the batch — or the submission that carried it
+the recorder before it discharges the batch; a target's teardown skips the
+frames still acquired, so it discards, once its reset has answered, a recording
+a renderer's exception left partial — or the submission that carried it
 completed. A frame abandoned after its submission, a presentation that was
 refused or enqueued nothing, a timeout, the target's retirement and the owner's
 retirement end nothing. A use whose discard or completion is not established —
@@ -4097,11 +4099,23 @@ loss let go of without completing — stays, and so does the revision it names:
 it remains awaiting release and is shown as such, and the revisions adopted
 after it for the same window wait behind it. After the device's loss nothing is
 completed and so nothing is released on its account; the recording's teardown
-destroys the resources under the device-loss rules regardless. The ledger is
-bounded by the host's windows and the frames in flight: a target holds one
-current record, and a superseded record stays only while some frame recorded
-with it has a use that is not over, of which a target has at most one for each
-frame slot.
+destroys the resources under the device-loss rules regardless. The adoption, the
+ledger's record, the hook and the watermark are one uninterruptible transition,
+and so are a release pass's removal of its records and its hooks: a cancellation
+of the owner lands before or after them, never between, so every recorded
+adoption has been notified and every notified one is on the ledger to be
+released, once. For that the hooks must return finitely.
+
+**Pressure.** A target holds a finite number of unreleased revisions —
+`2 × (frameSlotLimit + 1)`: the revisions frames in flight can reference, the
+current one, and as many again waiting behind them in adoption order. A target
+at its limit adopts nothing newer: the step renders nothing for it and asks
+nothing of it, so its demand and the window's newer publication are still owed,
+and when a release makes room the owner takes another round at once and the
+target adopts the window's latest. The publication never waits — the window's
+snapshot keeps the latest scene, replacing the last, however many are
+published behind one submission that has not completed. The ledger is thereby
+bounded by the targets, which the host's windows bound.
 
 **Release requests.** `requestVulkanRelease host action` queues an owner-thread
 action, lent the `Construction` as any other, that runs only once the owner has
@@ -4112,15 +4126,16 @@ is ([Owner-thread actions](#owner-thread-actions)): the same refusals
 `ActionOwnerClosed`), the same queue and capacity, and a request still queued
 when the owner's exit begins is settled as refused and never run.
 
-In the transaction that queues it, the request records a *barrier*: for each
-window that holds a scene the owner may yet adopt, the latest revision
-published for it. A window is named when it has a live target (the shared
-scene's revision playing the part of every window's in a shared host) or, in a
-per-window host, when it has had a publication — a snapshot nobody has adopted
-is one a release must not run past. The request runs when, for every window it
-names, the window's adopted watermark — the highest revision any of its targets
-adopted — has reached that revision, or the host no longer holds the window.
-Windows that appear later are not named and delay nothing. The barrier,
+In the transaction that queues it, the request records a *barrier*: for every
+window the host holds, the latest revision published for it — revision 0, the
+initial scene, for a window with no publication, and the shared scene's
+revision for every window in a shared host. A window with no target yet is
+named like any other: a target attached to it later adopts the scene it holds,
+and must find what that scene references still there. The request runs when,
+for every window it names, the window's adopted watermark — the highest
+revision any of its targets adopted — has reached that revision, or the host no
+longer holds the window. Windows that appear later are not named and delay
+nothing. The barrier,
 the publications and the order of requests are one coherent fact however
 publications and windows change around the request.
 
@@ -4148,11 +4163,17 @@ target; adoption by a suspended window and of the initial scene as revision 0;
 a revision replaced before a step takes it never being notified; release only
 after the last frame recorded with a revision has completed, in adoption order
 with several in flight, and exactly once, at supersession, at a target's end
-and at the owner's retirement; a submitted frame whose presentation enqueued
+and at the owner's retirement; a finite number of unreleased revisions held
+for a target behind one pending submission, however many are published, with
+the catching up in order once it completes; an adoption's and a release pass's
+notifications completed whatever cancels the thread running them meanwhile; a
+recording that raised discarded by the target's teardown, releasing its
+revision; a submitted frame whose presentation enqueued
 nothing keeping its revision; a window's publication across a surface's
 recovery and across a target's release and reattachment; and requests that wait
-for the revision current when they were made, are released by a window's end,
-are not delayed by a window they did not name or by one that appears later, run
+for the revision current when they were made, are released by a window's end, name every window the host holds — a window
+with no target and none with no publication included, in a per-window host
+and in a shared one — are not delayed by a window created after them, run
 in the order made without holding back an action that has no barrier, are
 refused when the queue is full, before the device exists, after the session's
 failure and after the owner's exit, and wake an idle owner only when one can
