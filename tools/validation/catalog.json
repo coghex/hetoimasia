@@ -330,6 +330,28 @@
       "optional": false
     },
     {
+      "id": "test.render-2d-oracle",
+      "description": "Portable Hspec contracts for the render-2d-oracle package's expected pixels, computed from a validated snapshot without a GPU: the camera's position at the viewport's centre, whole-number zoom spacing in both zoom modes, a quarter-turn rotation, UI at content scale 1 and 2 and with a viewport origin, pixel snap moving a sprite rigidly by its origin's rounding including the camera's translation, reflected, singular and unrepresentable quads and unrepresentable mappings, empty and letterboxed viewports; nearest and linear filtering across a texel boundary with clamp-to-edge, sRGB decoding on sampling and encoding on an sRGB target against a UNORM target, 2:1 minified fixtures reading level 1 with each filter and the last level, a probe rotated by 45 degrees or between levels reported indeterminate, the placeholder for an absent handle and for a handle whose generation differs, and BC7 textures sampled through their software-decoded levels; tint, brightness (including a clamped result), additive output and the exactness rule per channel, premultiplied overlap in drawing order, equal keys in submission order, a UI instance with a larger key over one submitted later, view and layer order, nonzero clears, and the 8-bit store after every draw (eight sources of byte 4 give 32); every indeterminate case and every refusal (missing, invalid or disagreeing target metadata, pass and pixel indices, malformed images, incorrectly sized readbacks) at its boundary; the readback reader swizzling B8G8R8A8; and, against hand-written synthetic readbacks, that the oracle rejects reversed overlap, a channel off by two and a wrong snap and accepts the exact image. It runs through the CPU project and needs no GPU.",
+      "command": [
+        "cabal",
+        "test",
+        "--project-file",
+        "cabal.project.cpu",
+        "hetoimasia-render-2d-oracle:render-2d-oracle-tests",
+        "--test-show-details=direct"
+      ],
+      "component": "hetoimasia-render-2d-oracle:test:render-2d-oracle-tests",
+      "inputs": [
+        "cabal.project.common",
+        "cabal.project.cpu"
+      ],
+      "framework": "hspec",
+      "runner": "cpu",
+      "timeout_seconds": 1800,
+      "category": "test",
+      "optional": false
+    },
+    {
       "id": "test.vulkan-headless",
       "description": "Vulkan-linked headless Hspec contracts, executed rather than only built, through cabal.project.vulkan against the provisioned native prefix: the native backend's profile and roots decisions over a stand-in native layer (native-tests), its shader contract against the provisioned compiler (shader-tests), the window integration's controller over the GLFW package's scripted seam (integration-tests), the triangle sample's pipeline cache over stand-in builders (triangle-tests), the sprites sample's scene, probe oracle, fixtures and PNG writer (sprites-tests), and the scene3d sample's scene, cameras built with the math package, independent probe oracle and PNG writer (scene3d-tests). None acquires a display, a GLFW session, or a device, and none reads desktop consent; the headers and loader are build and link prerequisites only.",
       "command": [

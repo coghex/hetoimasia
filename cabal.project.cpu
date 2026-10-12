@@ -12,6 +12,7 @@ packages:
   packages/asset-image
   packages/render-api
   packages/render-2d
+  packages/render-2d-oracle
   packages/runtime
   packages/scripting-lua
   packages/gpu-vulkan/model
