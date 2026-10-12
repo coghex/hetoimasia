@@ -4103,7 +4103,13 @@ recording that has ended — however it ended, including by a renderer's excepti
 which a target's teardown makes of every frame still acquired, reset the
 recorder and dropped the batch. After the device's loss a skip lets go of the
 unsubmitted recording without resetting anything, so no discard is evidenced.
-A submission is associated with its use in the same masked step that submits it.
+A submission is associated with its use in the same masked step that submits it,
+and a use is opened and the handler that marks its recording ended installed in
+one masked step. The log is off until a consumer enables it
+(`enableCompletionLog`, which the rendering does when it makes the frames), so
+a caller of the original progress API retains nothing however long it runs;
+enabled, the rendering takes it each time it reconciles, which bounds it by the
+submissions in flight.
 A frame abandoned after its submission, a presentation that was
 refused or enqueued nothing, a timeout, the target's retirement and the owner's
 retirement end nothing. A use whose discard or completion is not established —
@@ -4146,9 +4152,12 @@ initial scene, for a window with no publication, and the shared scene's
 revision for every window in a shared host. A window with no target yet is
 named like any other: a target attached to it later adopts the scene it holds,
 and must find what that scene references still there. The request runs when,
-for every window it names, the window's adopted watermark — the highest
-revision any of its targets adopted — has reached that revision, or the host no
-longer holds the window. Windows that appear later are not named and delay
+for every window it names, the revision a live target of the window *holds* —
+the highest it has adopted and notified — has reached that revision, or the host
+no longer holds the window. A target that has ended holds nothing, whatever it
+adopted: a window whose adopting target was detached or released has no hold
+until another adopts, since the revision it published is one that target will
+take, so a request made meanwhile waits for it. Windows that appear later are not named and delay
 nothing. The barrier,
 the publications and the order of requests are one coherent fact however
 publications and windows change around the request.
