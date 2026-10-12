@@ -20,13 +20,13 @@ concrete precondition
 
 ## Processing status
 
-- [ ] EPIC. Establish an independent 2D renderer over the shared GPU services
+- [x] EPIC. Establish an independent 2D renderer over the shared GPU services — [#413]
 - [ ] R2D-1. Create `render-api`'s texture handle and `render-2d`'s snapshot, settings and instance encoding
 - [ ] R2D-2. Map cameras and views between window, UI and world space
 - [ ] R2D-3. Build ordered draw runs from a snapshot
 - [ ] R2D-4. Compute expected pixels from a snapshot in `render-2d-oracle`
-- [no-issue] R2D-5. Decode PNG into premultiplied RGBA8 levels — moved to the asset epic as AST-1 (D-15)
-- [no-issue] R2D-6. Read KTX2 files carrying BC7 or RGBA8 levels — moved to the asset epic as AST-2 (D-15)
+- [x] R2D-5. Decode PNG into premultiplied RGBA8 levels — [no-issue]: moved to the asset epic as AST-1 (D-15)
+- [x] R2D-6. Read KTX2 files carrying BC7 or RGBA8 levels — [no-issue]: moved to the asset epic as AST-2 (D-15)
 - [ ] R2D-16. Let table pipelines choose samplers in the shader
 - [ ] R2D-7. Record the ordered path in `render-2d-vulkan`, proven by offscreen readback
 - [ ] R2D-14. Publish scenes per window in the window host
