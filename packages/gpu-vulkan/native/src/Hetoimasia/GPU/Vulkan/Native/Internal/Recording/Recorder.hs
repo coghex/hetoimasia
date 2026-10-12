@@ -184,6 +184,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , RingClaim (..)
   , RingState (..)
   , StorageOwner (..)
+  , TableUse (..)
   , editBatch
   , editManaged
   , isAsynchronous
@@ -194,6 +195,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.State
   , orderedObject
   , owned
   , releaseClaims
+  , tableShaderSampled
   , tshow
   )
 import Hetoimasia.GPU.Model.Budget (BudgetKind (FramelessBatchBudget, RingBudget), framelessBatchLimit)
@@ -1161,7 +1163,13 @@ bindPipeline recorder (Pipeline pipeline) =
           -- table with the same push-constant ranges (GRS-7); and pushed
           -- constants, the sampler index among them, only under a layout with
           -- the same ranges.
-          table = fmap (\binding → if isJust (interfaceTable interface) && bindingRanges binding == Just ranges then binding else binding {bindingRanges = Nothing}) (stateTable state)
+          -- A pipeline that leaves the sampler to its shaders and one that
+          -- has it pushed are of different kinds even over equal ranges, and
+          -- binding one over the other disturbs the table binding too.
+          sameKind = case statePipeline state of
+            Just previous → tableShaderSampled (interfaceTable (boundInterface previous)) == tableShaderSampled (interfaceTable interface)
+            Nothing → True
+          table = fmap (\binding → if isJust (interfaceTable interface) && sameKind && bindingRanges binding == Just ranges then binding else binding {bindingRanges = Nothing}) (stateTable state)
           sampler = case statePipeline state of
             Just previous | interfacePushConstants (boundInterface previous) == ranges && interfaceTable (boundInterface previous) == interfaceTable interface → stateSampler state
             _ → Nothing
@@ -1284,17 +1292,18 @@ drawIndexed recorder indices instances =
 
 -- | A draw with a pipeline whose layout holds the texture table needs the
 -- table bound compatibly — under a layout with the same push-constant ranges
--- — a sampler selected, and every image the batch's version can sample in
--- its sampled use: untouched by the batch, resting there, or returned to it
--- (GRS-7). A texture the batch has moved to another use cannot be sampled
--- through its descriptor's layout until it is moved back.
+-- — a sampler selected, unless the layout's shaders choose their samplers,
+-- and every image the batch's version can sample in its sampled use:
+-- untouched by the batch, resting there, or returned to it (GRS-7). A
+-- texture the batch has moved to another use cannot be sampled through its
+-- descriptor's layout until it is moved back.
 tableReady ∷ RecorderState → BoundPipeline → Either Refusal ()
 tableReady state bound = case interfaceTable (boundInterface bound) of
   Nothing → Right ()
   Just _
     | (stateTable state >>= bindingRanges) /= Just (interfacePushConstants (boundInterface bound)) →
         Left (RefusedIllegal "a draw with a pipeline holding the texture table before the table is bound under a compatible layout")
-    | isNothing (stateSampler state) → Left (RefusedIllegal "a draw with a pipeline holding the texture table before a sampler is selected")
+    | not (tableShaderSampled (interfaceTable (boundInterface bound))) && isNothing (stateSampler state) → Left (RefusedIllegal "a draw with a pipeline holding the texture table before a sampler is selected")
     | any elsewhere (maybe [] bindingImages (stateTable state)) →
         Left (RefusedIllegal "a draw through the texture table while the batch holds an image its version maps in a use other than sampling")
     | otherwise → Right ()
@@ -1366,14 +1375,16 @@ bindTable recorder =
 -- index, pushed at the offset the bound pipeline's layout declared for it,
 -- to every stage of the push-constant range holding it. Refused with no
 -- native call: a closed recorder; no pipeline bound, or one whose layout does
--- not hold the table; and an index beyond the table's four samplers, as
--- 'RefusedOutOfBounds'.
+-- not hold the table, or one whose layout's shaders choose their samplers
+-- ('Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Table.createShaderSampledTablePipelineLayout');
+-- and an index beyond the table's four samplers, as 'RefusedOutOfBounds'.
 selectSampler ∷ Recorder q inst msgr phys dev cmd → Word32 → IO (Either Refusal ())
 selectSampler recorder index = command recorder $ \state → case statePipeline state of
   Nothing → Left (RefusedIllegal "selecting a sampler with no pipeline bound")
   Just bound → case interfaceTable (boundInterface bound) of
     Nothing → Left (RefusedIllegal "selecting a sampler under a pipeline whose layout does not hold the texture table")
-    Just offset
+    Just TableShaderSampler → Left (RefusedIllegal "selecting a sampler under a pipeline whose layout's shaders choose their samplers")
+    Just (TablePushedSampler offset)
       | index > 3 → Left (RefusedOutOfBounds (fromIntegral index) 3)
       | otherwise →
           let stages = case [rangeStages range | range ← interfacePushConstants (boundInterface bound), rangeOffset range <= offset, toInteger offset + 4 <= toInteger (rangeOffset range) + toInteger (rangeSize range)] of
@@ -1764,10 +1775,13 @@ pushConstants recorder stages offset bytes = command recorder $ \state → case 
       let (low, high) = extent range
        in when (low < reach && start < high && any (`notElem` stages) (rangeStages range)) $
             Left (RefusedIllegal "a push that leaves out a stage of a range its bytes overlap")
-    -- The texture table's sampler index is the recorder's to push (GRS-7).
-    for_ (interfaceTable (boundInterface bound)) $ \sampler →
-      when (toInteger sampler < reach && start < toInteger sampler + 4) $
-        Left (RefusedIllegal "a push over the sampler index, which selectSampler sets")
+    -- The texture table's pushed sampler index is the recorder's to push
+    -- (GRS-7); a layout whose shaders choose their samplers reserves none.
+    for_ (interfaceTable (boundInterface bound)) $ \case
+      TableShaderSampler → pure ()
+      TablePushedSampler sampler →
+        when (toInteger sampler < reach && start < toInteger sampler + 4) $
+          Left (RefusedIllegal "a push over the sampler index, which selectSampler sets")
     Right (state, [boundLayout bound], CommandPushConstants (interfaceLayout (boundInterface bound)) (nub stages) offset bytes)
 
 -- | Claim a region of the session's shared ring for this batch (D-33): this

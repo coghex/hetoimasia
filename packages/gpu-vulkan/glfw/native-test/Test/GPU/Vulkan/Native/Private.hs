@@ -83,6 +83,14 @@
 --   is submitted, which still draws the original, and the new texture drawn
 --   beside the released handle, which resolves to the placeholder; every
 --   batch read back and probed (#343);
+-- * @r2d16-shader-samplers@ — the same device start with no window, then the
+--   session's texture table and a pipeline layout holding it that declares no
+--   sampler offset: four instances of one two-texel texture drawn in a single
+--   draw call with no sampler selected, each choosing its own from instance
+--   data — nearest/clamp-to-edge, linear/clamp-to-edge, an index of 7 and an
+--   index of 3 — and read back: the nearest instance reads its texel exactly,
+--   the linear one the blend within one step, and index 7 reads as sampler 3
+--   (render-2d D-4);
 -- * @grs8-sprites@ — the same device start with no window, then the sprites
 --   sample's window-free evidence (GRS-8): its scene of indexed, instanced
 --   textured quads through texture handles with premultiplied-alpha blending,
@@ -416,6 +424,14 @@ scenarios =
       $ \consent journal _ → do
         outcome ← SurfaceFree.runTable (consentBackend consent) journal
         pure (SurfaceFree.tableSpec outcome, section "The GRS-7 texture table record" (SurfaceFree.tableSection outcome))
+  , Scenario
+      "r2d16-shader-samplers"
+      "draws four instances of one two-texel texture in a single draw call of a frame-less batch of a surface-free session, through a shader-sampled table layout and no selected sampler: one instance with nearest/clamp-to-edge, one with linear/clamp-to-edge, one with sampler index 7 and one with 3, reads the target back, and checks that the nearest instance reads the texel exactly, the linear one the blend within one step, and index 7 as sampler 3, with validation reporting nothing"
+      False
+      Nothing
+      $ \consent journal _ → do
+        outcome ← SurfaceFree.runShaderSamplers (consentBackend consent) journal
+        pure (SurfaceFree.shaderSamplersSpec outcome, section "The R2D-16 shader-chosen samplers record" (SurfaceFree.shaderSamplersSection outcome))
   , Scenario
       "grs8-sprites"
       "draws the sprites sample's scene of instanced textured quads through texture handles with premultiplied-alpha blending in a frame-less batch of a surface-free session, reads the target back after completion, passes every probe of the independent oracle and writes a lossless PNG and a probe record, with validation reporting nothing"
