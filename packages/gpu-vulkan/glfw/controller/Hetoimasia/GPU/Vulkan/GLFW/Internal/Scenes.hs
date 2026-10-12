@@ -183,6 +183,9 @@ data Ledger = Ledger
     -- ^ The highest revision any target of each window has adopted.
   , ledgerRecords ∷ ![Adoption]
     -- ^ Every adopted revision not yet released, oldest adoption first.
+  , ledgerDeferred ∷ !(Map WindowId Natural)
+    -- ^ For each window, how many adoptions a target of it deferred at its
+    -- retention limit.
   }
 
 data Scenes = Scenes
@@ -191,7 +194,7 @@ data Scenes = Scenes
   }
 
 newScenes ∷ IO Scenes
-newScenes = Scenes <$> newTVarIO (Ledger Map.empty Map.empty []) <*> newTVarIO Nothing
+newScenes = Scenes <$> newTVarIO (Ledger Map.empty Map.empty [] Map.empty) <*> newTVarIO Nothing
 
 -- | Install where the scenes are read from, once the owner exists. Until then
 -- no barrier names a window.
@@ -239,7 +242,9 @@ adoptScene scenes lifecycle limit attachment scene revision = uninterruptibleMas
         | not (targetEnded target)
         , maybe True (< revision) (targetAdopted target) →
             if fromIntegral (length (filter ((== attachment) . adoptionAttachment) (ledgerRecords ledger))) >= limit
-              then pure AtLimit
+              then do
+                writeTVar (scenesLedger scenes) ledger {ledgerDeferred = Map.insertWith (+) window 1 (ledgerDeferred ledger)}
+                pure AtLimit
               else do
                 writeTVar (scenesLedger scenes) $
                   ledger
@@ -260,6 +265,7 @@ adoptScene scenes lifecycle limit attachment scene revision = uninterruptibleMas
             { ledgerAdopted =
                 maybe id (\windows → Map.filterWithKey (\at _ → at `elem` windows)) held $
                   Map.insertWith max window revision (ledgerAdopted ledger)
+            , ledgerDeferred = maybe id (\windows → Map.filterWithKey (\at _ → at `elem` windows)) held (ledgerDeferred ledger)
             }
     _ → pure ()
   pure answer
@@ -351,6 +357,10 @@ data WindowSceneStanding = WindowSceneStanding
   , windowAdopted ∷ !(Maybe Natural)
     -- ^ The highest revision any target of the window has adopted, once one
     -- has.
+  , windowDeferrals ∷ !Natural
+    -- ^ How many times a target of it, at its retention limit, deferred
+    -- adopting a newer revision: the positive sign that pressure held an
+    -- adoption back.
   , windowAwaitingRelease ∷ ![Natural]
     -- ^ The revisions adopted for it and superseded, or whose target ended,
     -- that are not yet released, in adoption order: each waits for a frame
@@ -376,11 +386,12 @@ readSceneState scenes pending = do
   published ← readTVar (scenesSource scenes) >>= maybe (pure Map.empty) sourceRevisions
   requests ← pending
   let awaiting = Map.fromListWith (flip (<>)) [(attachmentWindow (adoptionAttachment record), [adoptionRevision record]) | record ← ledgerRecords ledger, adoptionSuperseded record]
-      windows = Set.unions [Map.keysSet published, Map.keysSet (ledgerAdopted ledger), Map.keysSet awaiting]
+      windows = Set.unions [Map.keysSet published, Map.keysSet (ledgerAdopted ledger), Map.keysSet awaiting, Map.keysSet (ledgerDeferred ledger)]
       standing window =
         WindowSceneStanding
           { windowPublished = Map.lookup window published
           , windowAdopted = Map.lookup window (ledgerAdopted ledger)
+          , windowDeferrals = Map.findWithDefault 0 window (ledgerDeferred ledger)
           , windowAwaitingRelease = fromMaybe [] (Map.lookup window awaiting)
           }
   pure (VulkanSceneState (Map.fromSet standing windows) requests)

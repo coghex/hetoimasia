@@ -178,6 +178,7 @@ import Control.Exception
   , SomeAsyncException
   , SomeException
   , fromException
+  , mask_
   , onException
   , rethrowIO
   , throwIO
@@ -233,6 +234,7 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Capture
 import Hetoimasia.GPU.Vulkan.Native.Frames
   ( Acquisition (..)
   , FrameOps
+  , FrameStage (..)
   , FrameStanding (..)
   , Frames
   , OwnedFrame (..)
@@ -254,6 +256,7 @@ import Hetoimasia.GPU.Vulkan.Native.Frames
   , presentFrame
   , progressFrames
   , readFrameStandings
+  , readOutstandingSubmissions
   , readPresentations
   , retireTargetFrames
   , skipFrame
@@ -1132,9 +1135,37 @@ pollDue now model = case progressDeadline model of
 
 -- | Whether any frame recorded with this revision of the scene, for this
 -- target's attachment, has a use that is not yet over.
+--
+-- A submitted frame's use is over when its submission is no longer
+-- outstanding in the frames and the device has not been lost: the frames
+-- remove a submission only on its fence's completion, or when the device's
+-- loss lets it go without completing, which is no evidence. It is read from
+-- the frames' own state, so a completion recorded before a poll raised or was
+-- cancelled counts, and one the loss let go of does not.
 sceneUsed ∷ Rendering q inst msgr phys dev cmd → AttachmentId → Natural → STM Bool
-sceneUsed rendering attachment revision =
-  any (\use → useAttachment use == attachment && useRevision use == revision) . Map.elems <$> readTVar (renderingUses rendering)
+sceneUsed rendering attachment revision = do
+  over ← submissionOver rendering
+  any (\use → useAttachment use == attachment && useRevision use == revision && not (maybe False over (useSubmission use)))
+    . Map.elems
+    <$> readTVar (renderingUses rendering)
+
+-- | Whether a submission has verifiably completed: gone from the frames'
+-- outstanding set with the device still not lost.
+submissionOver ∷ Rendering q inst msgr phys dev cmd → STM (SubmissionId → Bool)
+submissionOver rendering =
+  readTVar (renderingLive rendering) >>= \case
+    Nothing → pure (const False)
+    Just made → do
+      lost ← deviceLossObserved <$> readRootsModel (renderingRoots rendering)
+      pending ← readOutstandingSubmissions (liveFrames made)
+      pure (\submission → not lost && submission `notElem` pending)
+
+-- | Forget the uses whose submissions have verifiably completed, so the table
+-- holds no more than the frames in flight and the uses that are uncertain.
+reconcileUses ∷ Rendering q inst msgr phys dev cmd → STM ()
+reconcileUses rendering = do
+  over ← submissionOver rendering
+  modifyTVar' (renderingUses rendering) (Map.filter (\use → not (maybe False over (useSubmission use))))
 
 -- | Open the use of a scene revision a frame is about to record.
 openUse ∷ Rendering q inst msgr phys dev cmd → AttachmentId → FrameSlotId → Natural → IO Natural
@@ -1149,11 +1180,13 @@ poll rendering now =
   readTVarIO (renderingLive rendering) >>= \case
     Nothing → pure ()
     Just made → do
-      progress ← progressFrames (liveFrames made) now
       -- A submission's completion is the evidence that ends the uses of the
-      -- scene revisions its frames recorded.
-      atomically . modifyTVar' (renderingUses rendering) $
-        Map.filter (\use → maybe True (`notElem` progressCompleted progress) (useSubmission use))
+      -- scene revisions its frames recorded. It is read from the frames'
+      -- state, which records a completion before the step can raise for another
+      -- presentation or cleanup, or be cancelled, so it is reconciled however
+      -- the step ends.
+      progress ← progressFrames (liveFrames made) now `onException` atomically (reconcileUses rendering)
+      atomically (reconcileUses rendering)
       for_ (progressCompleted progress) (renderingObserver rendering . SubmissionCompleted)
       for_ (progressRetired progress) (renderingObserver rendering . PresentationRetired)
 
@@ -1285,11 +1318,20 @@ renderDue rendering renderer now sceneOf due =
           `onException` giveUp made attachment owned capture "its recording raised"
       case recorded of
         Right (batch, Right ()) →
-          submitFrames (liveFrames made) (batch :| []) >>= \case
+          -- The submission and the use's record of it are one masked step, so
+          -- no cancellation leaves a frame the device has been given with a use
+          -- that says it was never submitted.
+          mask_
+            ( submitFrames (liveFrames made) (batch :| []) >>= \answer → do
+                case answer of
+                  Right (SubmittedAs submission) → atomically (modifyTVar' (renderingUses rendering) (Map.adjust (\held → held {useSubmission = Just submission}) use))
+                  _ → pure ()
+                pure answer
+            )
+            >>= \case
             Right (SubmittedAs submission) → do
               -- From here the frame's commands are the device's, and only the
               -- submission's completion ends the use.
-              atomically (modifyTVar' (renderingUses rendering) (Map.adjust (\held → held {useSubmission = Just submission}) use))
               observe (FrameSubmitted attachment (ownedFrame owned) submission)
               present made target attachment owned image capture revision
             Right (SubmittedNothing reason) → False <$ abandon made attachment owned capture (Just use) ("its submission had no effect: " <> reason)
@@ -1338,7 +1380,11 @@ renderDue rendering renderer now sceneOf due =
       -- references, so a skip that answered is the recording discarded, and
       -- the use with it. One that was refused discards nothing: the use stays.
       skipped ← skipFrame (liveFrames made) (ownedFrame owned)
-      for_ use $ \serial → when (either (const False) (const True) skipped) (atomically (modifyTVar' (renderingUses rendering) (Map.delete serial)))
+      -- After the device's loss a skip answers without a native reset: it lets
+      -- go of the unsubmitted recording under the loss rule, which discards
+      -- nothing, so the use stays.
+      lost ← deviceLossObserved <$> atomically (readRootsModel (renderingRoots rendering))
+      for_ use $ \serial → when (either (const False) (const True) skipped && not lost) (atomically (modifyTVar' (renderingUses rendering) (Map.delete serial)))
       observe (FrameAbandoned attachment (ownedFrame owned) reason)
       giveUp made attachment owned capture reason
       retryAfterPending (frameTarget (ownedFrame owned))
@@ -1488,14 +1534,21 @@ prepareTargetRetirement rendering now target =
           stateRootsModel (renderingRoots rendering) $ \model → case closeTarget target model of
             Admitted next → ((), next)
             _ → ((), model)
+      -- The frames acquired and not submitted when the close begins: their
+      -- skip is the discard of an unsubmitted recording.
+      before ← atomically (readFrameStandings (liveFrames made))
+      let acquired = [standingFrame held | held ← before, standingStage held == StageAcquired, frameTarget (standingFrame held) == target]
       closed ← closeTargetFrames (liveFrames made) target
-      -- A frame skipped here is an unsubmitted recording discarded, its
-      -- recorder reset before its batch's references were let go: the use of
-      -- a recording that raised, or was left partial, ends on that evidence. A
-      -- refused skip discards nothing and the use stays; a submitted frame is
-      -- closed, not discarded, and its use ends with its submission.
-      atomically . modifyTVar' (renderingUses rendering) $
-        Map.filter (\use → not (isNothing (useSubmission use) && any (\(frame, answer) → frame == useFrame use && either (const False) (const True) answer) closed))
+      lost' ← deviceLossObserved <$> atomically (readRootsModel (renderingRoots rendering))
+      -- A frame skipped here, that was acquired and unsubmitted, is a recording
+      -- discarded: its recorder was reset before its batch's references were let
+      -- go, and the use of a recording that raised, or was left partial, ends
+      -- on that evidence. A refused skip discards nothing and the use stays; a
+      -- submitted frame is closed, not discarded, and its use ends with its
+      -- submission; and after the device's loss a skip resets nothing, so
+      -- nothing is discarded.
+      unless lost' . atomically . modifyTVar' (renderingUses rendering) $
+        Map.filter (\use → not (isNothing (useSubmission use) && useFrame use `elem` acquired && any (\(frame, answer) → frame == useFrame use && either (const False) (const True) answer) closed))
       model ← atomically (readRootsModel (renderingRoots rendering))
       if deviceLossObserved model
         then pure (Nothing, [])

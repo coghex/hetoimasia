@@ -87,6 +87,7 @@ spec = describe "Vulkan scenes for each window (R2D-14)" $ do
     itBounded "keeps a revision awaiting release while its submission is pending, whatever became of the frame's presentation" testAbandonedFrameKeepsRevision
     itBounded "releases the revisions of an ended target and of the owner's retirement, each exactly once" testReleaseAtEnd
     itBounded "holds a finite number of unreleased revisions for a target, adopting nothing newer behind a pending submission until a release makes room, then catching up in order" testRetentionBound
+    itBounded "keeps a revision awaiting release when the device's loss lets its submission go without completing it" testLossKeepsRevision
     itBounded "completes an adoption's record, notification and watermark, and a release's removal and notifications, whatever cancels the owner meanwhile" testLedgerCancellation
     itBounded "ends the use of a recording that raised once the target's teardown discards it, releasing its revision at the target's retirement" testTeardownDiscard
 
@@ -788,9 +789,9 @@ testRetentionBound ∷ IO ()
 testRetentionBound = do
   rig ← scenesRig 1
   slots ← either (const (failWith "the default budgets are invalid")) (pure . frameSlotLimit) (validateBudgets defaultBudgetRequest)
-  let bound = fromIntegral (retentionLimit slots) ∷ Int
-      newest = 12 * fromIntegral bound ∷ Natural
-  (published, adopted, awaiting, caught, released) ← runRig rig $ \host control → do
+  let bound = retentionLimit slots
+      extra = 5 ∷ Natural
+  atLimit ← runRig rig $ \host control → do
     [window] ← windowsOf host
     service ← attach host window
     composedUntil rig host control "the first adoption" (not . null . flip adoptedBy window <$> sceneEvents rig)
@@ -798,35 +799,37 @@ testRetentionBound = do
     baseline ← presentsOf rig (graphicsAttachment service)
     _ ← publishTo host window 1
     composedUntil rig host control "the first revision's frame" ((> baseline) <$> presentsOf rig (graphicsAttachment service))
-    -- Many publications behind one submission that has not completed: the
-    -- window's snapshot keeps the latest, and the target adopts no more than
-    -- its limit allows.
-    forM_' [2 .. fromIntegral newest] $ \value → void (publishTo host window value)
-    settleOwner rig host
-    composedUntil rig host control "the owner's pressure" $ do
-      state ← atomically (readVulkanSceneState (vulkanController host))
-      pure (fmap windowPublished (Map.lookup window (sceneWindows state)) == Just (Just newest))
-    settleOwner rig host
-    state ← atomically (readVulkanSceneState (vulkanController host))
-    let standing = Map.lookup window (sceneWindows state)
+    let standingOf = (Map.lookup window . sceneWindows) <$> atomically (readVulkanSceneState (vulkanController host))
+        adoptedAt = maybe Nothing windowAdopted <$> standingOf
+    -- One submission has not completed, so no revision adopted after the first
+    -- is released: each adoption the target may make, it makes, until its
+    -- record is full.
+    forM_' [2 .. bound] $ \revision → do
+      _ ← publishTo host window (fromIntegral revision)
+      composedUntil rig host control "the next adoption" ((== Just revision) <$> adoptedAt)
+    -- Publications beyond it replace each other in the window's snapshot, and
+    -- the target defers adopting any of them: the ledger says so.
+    forM_' [bound + 1 .. bound + extra] $ \revision → void (publishTo host window (fromIntegral revision))
+    composedUntil rig host control "an adoption deferred at the limit" $
+      (maybe False ((>= 1) . windowDeferrals)) <$> standingOf
+    atLimit ← standingOf
     -- Completion makes room, and the target catches up with the latest.
     submissionsComplete rig True
-    composedUntil rig host control "the latest revision's adoption" $ do
-      held ← atomically (readVulkanSceneState (vulkanController host))
-      pure (fmap windowAdopted (Map.lookup window (sceneWindows held)) == Just (Just newest))
+    composedUntil rig host control "the latest revision's adoption" ((== Just (bound + extra)) <$> adoptedAt)
     settleOwner rig host
-    events ← sceneEvents rig
-    pure (fmap windowPublished standing, fmap windowAdopted standing, maybe 0 (length . windowAwaitingRelease) standing, length (adoptedBy events window), releasedBy events window)
-  published `shouldBe` Just (Just newest)
-  -- Behind the pending submission the target held at most its limit, so it
-  -- adopted fewer revisions than were published, and the list awaiting release
-  -- stayed finite.
-  adopted `shouldSatisfy` maybe False (maybe False (< newest))
-  awaiting `shouldSatisfy` (< bound)
-  caught `shouldSatisfy` (<= bound + fromIntegral (newest `div` 1))
-  -- Once room was made, releases went in adoption order, each once.
-  released `shouldBe` sort released
-  released `shouldBe` nub released
+    pure atLimit
+  -- Read once the host has ended, so the owner's retirement is behind it.
+  events ← sceneEvents rig
+  fmap windowPublished atLimit `shouldBe` Just (Just (bound + extra))
+  fmap windowAdopted atLimit `shouldBe` Just (Just bound)
+  fmap (length . windowAwaitingRelease) atLimit `shouldSatisfy` (maybe False (< fromIntegral bound))
+  [window] ← case nub [at | SceneAdopted at _ _ ← events] of
+    [only] → pure [only]
+    other → failWith ("expected one window, saw " <> show other)
+  -- The revisions between were replaced in the snapshot and never adopted;
+  -- the releases went in adoption order, each once.
+  map fst (adoptedBy events window) `shouldBe` [0] <> [1 .. bound] <> [bound + extra]
+  releasedBy events window `shouldBe` [0] <> [1 .. bound] <> [bound + extra]
 
 -- | The ledger's two transitions, cancelled from outside while their hooks
 -- run: the adoption is recorded, notified and published to the barrier, and the
@@ -925,3 +928,27 @@ awaitSettled thread =
     ThreadFinished → pure ()
     ThreadDied → pure ()
     _ → yield >> awaitSettled thread
+
+testLossKeepsRevision ∷ IO ()
+testLossKeepsRevision = do
+  rig ← scenesRig 1
+  outcome ← runRigCaught rig $ \host control → do
+    _ ← superviseGraphicsOwner control (vulkanGraphicsOwner host)
+    [window] ← windowsOf host
+    _ ← attach host window
+    composedUntil rig host control "the first adoption" (not . null . flip adoptedBy window <$> sceneEvents rig)
+    -- The frame's submission never completes, and its presentation reports the
+    -- device lost: the loss lets the submission go, which is not completion.
+    submissionsComplete rig False
+    raiseOnPresent rig (toException (StandInLoss "vkQueuePresentKHR"))
+    _ ← publishTo host window 91
+    composedUntil rig host control "the loss at a checkpoint" (checkRuntime control >> pure False)
+  either (const (pure ())) (const (failWith "the run returned instead of failing with the loss")) outcome
+  events ← sceneEvents rig
+  [window] ← case nub [at | SceneAdopted at _ _ ← events] of
+    [only] → pure [only]
+    other → failWith ("expected one window, saw " <> show other)
+  adoptedBy events window `shouldBe` [(0, 0), (1, 91)]
+  -- Revision 1 is the target's current one when it ends, but nothing verified
+  -- the frame's commands over: it stays awaiting release.
+  releasedBy events window `shouldBe` [0]
