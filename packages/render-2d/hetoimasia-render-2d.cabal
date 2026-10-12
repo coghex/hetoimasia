@@ -40,6 +40,8 @@ library
     hs-source-dirs: src
     exposed-modules:
         Hetoimasia.Render.TwoD.Encoding
+        Hetoimasia.Render.TwoD.Mapping
+        Hetoimasia.Render.TwoD.Metrics
         Hetoimasia.Render.TwoD.Settings
         Hetoimasia.Render.TwoD.Snapshot
         Hetoimasia.Render.TwoD.Target
@@ -70,7 +72,9 @@ test-suite render-2d-tests
     other-modules:
         Test.Render.TwoD.Encoding
         Test.Render.TwoD.Flags
+        Test.Render.TwoD.Mapping
         Test.Render.TwoD.Opacity
+        Test.Render.TwoD.Snapping
         Test.Render.TwoD.Spec
         Test.Render.TwoD.Support
         Test.Render.TwoD.Validation

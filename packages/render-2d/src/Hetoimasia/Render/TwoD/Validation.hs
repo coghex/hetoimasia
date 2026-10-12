@@ -29,6 +29,7 @@ module Hetoimasia.Render.TwoD.Validation
     validateSnapshot
 
     -- * Refusals
+  , viewReasons
   , Refusal (..)
   , Location (..)
   , Reason (..)
@@ -190,6 +191,23 @@ validClear (ClearColour r g b a) = all (withinClosed 0 1) [r, g, b, a]
 
 viewRefusals ∷ Int → Int → View → [Refusal]
 viewRefusals passIndex viewIndex view =
+  viewOwnRefusals (Refusal (AtView passIndex viewIndex)) view
+    <> concat
+      [ layerRefusals passIndex viewIndex layerIndex layer
+      | (layerIndex, layer) ← zip [0 ..] (viewLayers view)
+      ]
+
+-- | The reasons a view's camera, viewport and settings are refused, in the order
+-- 'validateSnapshot' reports them and without looking at its layers. Empty
+-- exactly when those parts are valid, so a function that needs only the view's
+-- geometry, as the mappings in "Hetoimasia.Render.TwoD.Mapping" do, applies the
+-- same checks as validation without a snapshot around it.
+viewReasons ∷ View → [Reason]
+viewReasons = map refusalReason . viewOwnRefusals (Refusal (AtView 0 0))
+
+-- | Everything about a view but its layers, refused with the given location.
+viewOwnRefusals ∷ (Reason → Refusal) → View → [Refusal]
+viewOwnRefusals at view =
   [at CameraPositionNotFinite | not (allFinite [px, py])]
     <> [at CameraZoomInvalid | not (positiveFinite (cameraZoom camera))]
     <> [at CameraRotationNotFinite | Just rotation ← [cameraRotation camera], not (finite rotation)]
@@ -197,12 +215,7 @@ viewRefusals passIndex viewIndex view =
     <> [at UiScaleOutOfRange | not (uncurry withinClosed uiScaleRange (settingUiScale settings))]
     <> [at BrightnessOutOfRange | not (uncurry withinClosed brightnessRange (settingBrightness settings))]
     <> [at HalfHeightInvalid | FixedHalfHeight half ← [settingZoomMode settings], not (positiveFinite half)]
-    <> concat
-      [ layerRefusals passIndex viewIndex layerIndex layer
-      | (layerIndex, layer) ← zip [0 ..] (viewLayers view)
-      ]
   where
-    at = Refusal (AtView passIndex viewIndex)
     camera = viewCamera view
     V2 px py = cameraPosition camera
     settings = viewSettings view
