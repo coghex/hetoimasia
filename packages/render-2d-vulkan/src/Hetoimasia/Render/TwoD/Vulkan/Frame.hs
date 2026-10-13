@@ -46,15 +46,19 @@
 --
 -- = Clip tables (R2D-12)
 --
--- Each view's plan carries its clip table, resolved. The tables of the views
--- that draw (a non-empty scissor and a layer with a run) are packed one after
--- another, in pass and view order, into the batch's one clip region
--- ('clipRegion', in "Hetoimasia.Render.TwoD.Vulkan.Layout"'s format), and each
--- layer's push block carries its view's first entry as its @clipBase@. A frame
--- that draws always has a region, of one zero entry when no view has an entry
--- (the layout holds set 2, so a draw needs it bound); a frame that draws
--- nothing has none. A region larger than the configured window is refused
--- ('ClipTablesTooLarge') by 'requireClipWindow' before anything is recorded.
+-- Each view's plan carries its clip table, resolved. For each view that draws
+-- (a non-empty scissor and a layer with a run), and each space, world or UI,
+-- that one of its layers selects a clip from (some instance has a clip index),
+-- the table is written once with its edges taken about the layer-space point
+-- under the scissor's centre ('ClipTable'; the reason is in
+-- "Hetoimasia.Render.TwoD.Vulkan.Layout"), and each such layer's push block
+-- carries that table's first entry as its @clipBase@ and the scissor's centre as
+-- its @clipCentre@. The tables are packed one after another, in pass and view
+-- order, into the batch's one clip region ('clipRegion'). A frame that draws
+-- always has a region, of one zero entry when no table is written (the layout
+-- holds set 2, so a draw needs it bound); a frame that draws nothing has none.
+-- A region larger than the configured window is refused ('ClipTablesTooLarge')
+-- by 'requireClipWindow' before anything is recorded.
 --
 -- = Refusals
 --
@@ -89,6 +93,8 @@ module Hetoimasia.Render.TwoD.Vulkan.Frame
     -- * The work
   , PassWork (..)
   , ViewWork (..)
+  , ClipTable (..)
+  , ClipSpace (..)
   , LayerWork (..)
   , layerPushBytes
   , RunWork (..)
@@ -106,15 +112,15 @@ import Control.Monad (zipWithM)
 import Data.ByteString (ByteString)
 import qualified Data.Map.Strict as Map
 import qualified Data.ByteString as ByteString
-import Data.List (mapAccumL)
-import Data.Maybe (catMaybes, fromMaybe, isJust)
+import Data.List (find, mapAccumL, nub)
+import Data.Maybe (catMaybes, fromMaybe, isJust, listToMaybe)
 import Data.Word (Word32, Word64)
 import Hetoimasia.Math.Affine2 (identity)
 import Hetoimasia.GPU.Vulkan.Native.Recording
   ( ClearColor (..)
   , Image
   , ImageFormat (..)
-  , Rect
+  , Rect (..)
   , Refusal
   , formatCode
   )
@@ -136,23 +142,26 @@ import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..), off
 import Hetoimasia.Render.TwoD.Settings (ViewSettings (..))
 import Hetoimasia.Render.TwoD.Snapshot
   ( ClearColour (..)
+  , Instance (..)
   , Layer (..)
   , LayerDepth (..)
   , Pass (..)
   , Snapshot (..)
   , Target (..)
   , View (..)
+  , layerInstances
   )
 import Hetoimasia.Render.TwoD.Target (TargetRef)
 import Hetoimasia.Render.TwoD.Validation
   ( Location (..)
   , ValidLayer
   , ValidSnapshot
+  , validLayerContents
   , validLayerLocation
   , validLayers
   , validSnapshot
   )
-import Hetoimasia.Render.TwoD.Vulkan.Layout (ViewPush (..), clipEntryBytes, packClipTable, packViewPush, viewScissor)
+import Hetoimasia.Render.TwoD.Vulkan.Layout (ViewPush (..), clipEntryBytes, clipReference, packClipTable, packViewPush, rebaseClip, viewScissor)
 
 -- | What a pass renders into, as the caller knows it: the colour format's
 -- @VkFormat@ code, the actual extent, and the metrics views map under.
@@ -285,10 +294,30 @@ data ViewWork = ViewWork
   { workViewIndex ∷ !Int
   , workRect ∷ !(Maybe Rect)
   , workClips ∷ ![ResolvedClip]
-    -- ^ The view's clip table, resolved, which the batch's clip region holds
-    -- when the view draws.
+    -- ^ The view's clip table, resolved, in the layer's space as the plan
+    -- gives it.
+  , workTables ∷ ![ClipTable]
+    -- ^ The tables the batch's clip region holds for this view: one for each
+    -- space a layer selects a clip from, empty for a view that draws nothing.
   , workLayers ∷ ![LayerWork]
   }
+
+-- | The space a layer's clips are in.
+data ClipSpace = ClipWorld | ClipUi
+  deriving (Eq, Ord, Show)
+
+-- | One table of the batch's clip region: a view's resolved entries for one
+-- space, with each edge taken about the layer-space point under the scissor's
+-- centre ('Hetoimasia.Render.TwoD.Vulkan.Layout.clipReference'), where the
+-- table begins in the region, in entries, and the centre.
+data ClipTable = ClipTable
+  { tableSpace ∷ !ClipSpace
+  , tableBase ∷ !Word32
+  , tableCentre ∷ !(Float, Float)
+    -- ^ The centre of the view's scissor, in target pixels.
+  , tableEntries ∷ ![ResolvedClip]
+  }
+  deriving (Eq, Show)
 
 -- | One layer that draws, or clears depth: the push block of its space, its
 -- instances in drawing order, and its runs as ranges of them.
@@ -298,7 +327,11 @@ data LayerWork = LayerWork
     -- ^ A depth-enabled world layer: it clears depth to 1.0 within its view's
     -- scissor before its runs, though it holds none.
   , layerPush ∷ !ViewPush
-    -- ^ The push block of the layer's space, with its view's clip base.
+    -- ^ The push block of the layer's space, with its clip table's base and
+    -- centre.
+  , layerClipSpace ∷ !(Maybe ClipSpace)
+    -- ^ The space the layer's clips are in when some instance has a clip index;
+    -- 'Nothing' when none does, so the layer reads no table.
   , layerBytes ∷ !ByteString
     -- ^ 64 bytes an instance, in drawing order.
   , layerRunList ∷ ![RunWork]
@@ -416,6 +449,7 @@ viewWork layers attachment passNumber index (view, planned) = do
                 WorldSpace _ → worldInverse mapping
                 UiSpace → uiInverse mapping
             , pushClipBase = 0
+            , pushClipCentre = (0, 0)
             , pushExtent = (attachmentWidth attachment, attachmentHeight attachment)
             , pushBrightness = settingBrightness settings
             , pushFilter = settingFilter settings
@@ -424,7 +458,7 @@ viewWork layers attachment passNumber index (view, planned) = do
   drawn ← case rect of
     Nothing → Right []
     Just _ → catMaybes <$> mapM (layerWork layers pushFor) (plannedLayers planned)
-  Right (ViewWork index rect (plannedClips planned) drawn)
+  Right (ViewWork index rect (plannedClips planned) [] drawn)
 
 layerWork ∷ Map.Map (Int, Int, Int) ValidLayer → (LayerSpace → ViewPush) → PlannedLayer → Either FrameRefusal (Maybe LayerWork)
 layerWork layers pushFor planned
@@ -441,40 +475,62 @@ layerWork layers pushFor planned
               { layerLocation = location
               , layerClearsDepth = plannedClearsDepth planned
               , layerPush = pushFor (plannedSpace planned)
+              , layerClipSpace = clipSpaceOf (plannedSpace planned) valid
               , layerBytes = bytes
               , layerRunList = [RunWork (fromIntegral (runStart run)) (fromIntegral (runCount run)) (runPath run) | run ← plannedRuns planned]
               }
         )
+
+-- | The space a layer's clips are in, when some instance selects one.
+clipSpaceOf ∷ LayerSpace → ValidLayer → Maybe ClipSpace
+clipSpaceOf space valid
+  | any ((/= 0) . instanceClip) (layerInstances (validLayerContents valid)) = Just (case space of WorldSpace _ → ClipWorld; UiSpace → ClipUi)
+  | otherwise = Nothing
 
 -- | Whether a view records a draw: a non-empty scissor and a layer with a run.
 -- Only such a view's clip table is written to the batch's clip region.
 viewDraws ∷ ViewWork → Bool
 viewDraws view = isJust (workRect view) && any (not . null . layerRunList) (workLayers view)
 
--- | Give each drawing view's layers the index of its table's first entry in the
--- batch's clip region, the tables following one another in pass and view order.
+-- | Write each drawing view's clip tables, one for each space a layer selects a
+-- clip from, one after another in pass and view order, and give each such layer
+-- its table's first entry and the scissor's centre. A table's edges are taken
+-- about the layer-space point under that centre, from the transform of the
+-- space's first layer.
 assignClipBases ∷ [PassWork] → [PassWork]
 assignClipBases = snd . mapAccumL pass 0
   where
     pass base work =
       let (base', views) = mapAccumL view base (workViews work)
        in (base', work {workViews = views})
-    view base work
-      | viewDraws work = (base + fromIntegral (length (workClips work)), work {workLayers = map (withBase base) (workLayers work)})
-      | otherwise = (base, work)
-    withBase base layer = layer {layerPush = (layerPush layer) {pushClipBase = base}}
+    view base work = case workRect work of
+      Just rect
+        | viewDraws work →
+            let centre = (fromIntegral (rectX rect) + fromIntegral (rectWidth rect) / 2, fromIntegral (rectY rect) + fromIntegral (rectHeight rect) / 2)
+                spaces = nub [space | layer ← workLayers work, Just space ← [layerClipSpace layer]]
+                (base', tables) = mapAccumL (table work centre) base spaces
+                assign layer = case layerClipSpace layer of
+                  Just space | Just held ← find ((== space) . tableSpace) tables → layer {layerPush = (layerPush layer) {pushClipBase = tableBase held, pushClipCentre = centre}}
+                  _ → layer
+             in (base', work {workTables = tables, workLayers = map assign (workLayers work)})
+      _ → (base, work)
+    table work centre base space =
+      let transform = fromMaybe identity (listToMaybe [pushTransform (layerPush layer) | layer ← workLayers work, layerClipSpace layer == Just space])
+          reference = clipReference transform centre
+          entries = map (rebaseClip reference) (workClips work)
+       in (base + fromIntegral (length entries), ClipTable space base centre entries)
 
--- | The bytes of the batch's clip region: the resolved tables of the views that
--- draw, one after another in pass and view order, 'clipEntryBytes' an entry. A
--- frame that draws but has no entry gets a single zero entry, since set 2 must
--- be bound for any draw; a frame that draws nothing has none ('Nothing').
+-- | The bytes of the batch's clip region: the tables of the views that draw, one
+-- after another in pass and view order, 'clipEntryBytes' an entry. A frame that
+-- draws but writes no table gets a single zero entry, since set 2 must be bound
+-- for any draw; a frame that draws nothing has none ('Nothing').
 clipRegion ∷ [PassWork] → Maybe ByteString
 clipRegion passes
   | not (any passDraws passes) = Nothing
   | null entries = Just (ByteString.replicate clipEntryBytes 0)
   | otherwise = Just (packClipTable entries)
   where
-    entries = [entry | pass ← passes, view ← workViews pass, viewDraws view, entry ← workClips view]
+    entries = [entry | pass ← passes, view ← workViews pass, table ← workTables view, entry ← tableEntries table]
 
 -- | Refuse a frame whose clip region is larger than the window: the region's
 -- size and the window, in bytes. The window is the storage-table window the

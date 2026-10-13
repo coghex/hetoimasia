@@ -126,13 +126,14 @@ pushSpec = describe "the push block" $ do
     and (zipWith (\(PushMember offset size) (PushMember next _) → offset + size == next) pushMembers (drop 1 pushMembers)) `shouldBe` True
     sum [size | PushMember _ size ← pushMembers] `shouldBe` fromIntegral pushBytes
 
-  it "packs a transform, its inverse, a clip base, an extent, a brightness, a filter and a snap flag at their offsets" $ do
+  it "packs a transform, the inverse's linear part, a clip base and centre, an extent, a brightness, a filter and a snap flag at their offsets" $ do
     let bytes =
           packViewPush
             ViewPush
               { pushTransform = fromColumns (V2 2 0) (V2 0 2) (V2 10 20)
               , pushInverse = fromColumns (V2 0.5 0) (V2 0 0.5) (V2 (-5) (-10))
               , pushClipBase = 3
+              , pushClipCentre = (320, 240)
               , pushExtent = (640, 480)
               , pushBrightness = 1.5
               , pushFilter = FilterLinear
@@ -156,8 +157,8 @@ pushSpec = describe "the push block" $ do
         , [0x00, 0x00, 0x00, 0x00] -- 52: inverse b = 0.0
         , [0x00, 0x00, 0x00, 0x00] -- 56: inverse c = 0.0
         , [0x00, 0x00, 0x00, 0x3F] -- 60: inverse d = 0.5
-        , [0x00, 0x00, 0xA0, 0xC0] -- 64: inverse tx = -5.0
-        , [0x00, 0x00, 0x20, 0xC1] -- 68: inverse ty = -10.0
+        , [0x00, 0x00, 0xA0, 0x43] -- 64: clip centre x = 320.0 (the inverse's translation is not pushed)
+        , [0x00, 0x00, 0x70, 0x43] -- 68: clip centre y = 240.0
         ]
 
   it "packs nearest as 1 and snap off as 0, with the transform's off-diagonal and negative values" $ do
@@ -167,6 +168,7 @@ pushSpec = describe "the push block" $ do
               { pushTransform = fromColumns (V2 0 1) (V2 (-1) 0) (V2 0.5 (-0.25))
               , pushInverse = fromColumns (V2 0 (-1)) (V2 1 0) (V2 0.25 0.5)
               , pushClipBase = 0
+              , pushClipCentre = (0.5, -0.25)
               , pushExtent = (1, 2)
               , pushBrightness = 0.5
               , pushFilter = FilterNearest
@@ -190,8 +192,8 @@ pushSpec = describe "the push block" $ do
         , [0x00, 0x00, 0x80, 0xBF] -- inverse b = -1.0
         , [0x00, 0x00, 0x80, 0x3F] -- inverse c = 1.0
         , [0x00, 0x00, 0x00, 0x00] -- inverse d = 0.0
-        , [0x00, 0x00, 0x80, 0x3E] -- inverse tx = 0.25
-        , [0x00, 0x00, 0x00, 0x3F] -- inverse ty = 0.5
+        , [0x00, 0x00, 0x00, 0x3F] -- clip centre x = 0.5
+        , [0x00, 0x00, 0x80, 0xBE] -- clip centre y = -0.25
         ]
 
   it "gives a filter the code an instance's sampler choice uses for it" $ do
@@ -342,6 +344,37 @@ clipTableSpec = describe "the clip table" $ do
 
   it "is as many entries as it was given, each 16 bytes" $
     ByteString.length (packClipTable (replicate 7 (ResolvedClip 0 0 1 1))) `shouldBe` 7 * clipEntryBytes
+
+  it "rebases a clip about the layer-space point under a target-pixel point" $ do
+    -- The transform (100, 0, 0, 100) with translation (-6553584, 16) puts the
+    -- world point (65536, 0) at (16, 16): the point under (16, 16), and so the
+    -- reference, is (65536, 0), and under (26, 36) it is (65536.1, 0.2).
+    let far = fromColumns (V2 100 0) (V2 0 100) (V2 (-6553584) 16)
+    clipReference far (16, 16) `shouldBe` (65536, 0)
+    -- Exactly (26 + 6553584) / 100 and (36 - 16) / 100, each rounded once.
+    clipReference far (26, 36) `shouldBe` (65536.1, 0.2)
+
+  it "gives the point under the centre for a transform with a turn in it, by hand" $ do
+    -- A quarter turn: (x, y) goes to (-y + 10, x + 20), so (7, 25) comes from
+    -- x = 5 (from the second coordinate: 25 - 20) and y = 3 (from the first:
+    -- 10 - 7).
+    clipReference (fromColumns (V2 0 1) (V2 (-1) 0) (V2 10 20)) (7, 25) `shouldBe` (5, 3)
+
+  it "has no inverse to take for a singular transform: the origin" $
+    clipReference (fromColumns (V2 1 2) (V2 2 4) (V2 0 0)) (3, 4) `shouldBe` (0, 0)
+
+  it "takes a clip's edges about the reference in double precision, rounding once" $ do
+    -- Edges near 65536 about a reference of exactly 65536 are small, exact floats.
+    rebaseClip (65536, 0) (ResolvedClip 65536.1484375 (-1) 65536.6484375 1) `shouldBe` ResolvedClip 0.1484375 (-1) 0.6484375 1
+    -- The difference of two floats is taken exactly before it is rounded.
+    rebaseClip (0.1, 0.2) (ResolvedClip 1 2 3 4) `shouldBe` ResolvedClip 0.9 1.8 2.9 3.8
+
+  it "keeps an empty clip empty, and a clip the rebasing leaves no area empty" $ do
+    rebaseClip (3, 4) emptyClip `shouldBe` emptyClip
+    -- Edges at a billion, 64 apart (the spacing of floats there), are 0 and 64
+    -- about a reference of a billion.
+    rebaseClip (1.0e9, 0) (ResolvedClip 1.0e9 0 (1.0e9 + 64) 1) `shouldBe` ResolvedClip 0 0 64 1
+    rebaseClip (0, 0) (ResolvedClip 3 0 3 1) `shouldBe` emptyClip
 
 -- ---------------------------------------------------------------------------
 -- The shaders' interfaces

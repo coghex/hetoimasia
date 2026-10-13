@@ -1869,7 +1869,7 @@ runCutoutDepth backend journal =
     "cutout-depth"
 
 -- | The clip case (R2D-12): the same recorder over the same kind of session,
--- six fixtures whose instances carry clip indices into their views' tables,
+-- seven fixtures whose instances carry clip indices into their views' tables,
 -- judged against the oracle ("Test.GPU.Vulkan.Native.Clip"), with a
 -- @D32_SFLOAT@ depth image for the one fixture that draws cutouts. Where the
 -- device chooses another depth format it renders nothing, reports the format,
@@ -2817,7 +2817,7 @@ cutoutDepthSpec ∷ SurfaceFreeOutcome → Spec
 cutoutDepthSpec = evidenceSpec "R2D-9 the cutout path's window-free evidence" "cutout depth" 7 True
 
 clipSpec ∷ SurfaceFreeOutcome → Spec
-clipSpec = evidenceSpec "R2D-12 clipping's window-free evidence" "clip" 6 True
+clipSpec = evidenceSpec "R2D-12 clipping's window-free evidence" "clip" 7 True
 
 -- | The examples of an evidence case: no window, every fixture rendered and
 -- read back after its batch completed, every determinate probe within its

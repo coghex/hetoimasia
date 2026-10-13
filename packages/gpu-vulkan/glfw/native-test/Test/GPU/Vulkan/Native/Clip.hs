@@ -35,13 +35,13 @@ import Hetoimasia.GPU.Vulkan.Native.Recording (ImageFormat (..))
 import Test.GPU.Vulkan.Native.OrderedPath (Suite (..))
 import Test.GPU.Vulkan.Native.OrderedPath.Fixtures
 
--- | The suite: one texture, six fixtures, over a depth image where a fixture asks
+-- | The suite: one texture, seven fixtures, over a depth image where a fixture asks
 -- for one.
 clipSuite ∷ Suite
 clipSuite = Suite "clip" "clip-probes.json" [texture | texture ← textures, textureKey texture == White] clipFixtures True
 
 clipFixtures ∷ [Fixture]
-clipFixtures = [oneDraw, ownTables, uiScales, snapping, cutouts, empties]
+clipFixtures = [oneDraw, ownTables, uiScales, snapping, farCamera, cutouts, empties]
 
 -- ---------------------------------------------------------------------------
 -- Building blocks
@@ -219,6 +219,45 @@ snapping =
     , fixtureNamed =
         [ NamedProbe "a clip does not follow a sprite's origin snap" (probe 0 16 16) (probe 0 19 16)
         , NamedProbe "a clip is placed by the view's snapped translation" (probe 0 18 16) (probe 0 19 16)
+        ]
+    }
+
+
+-- | A view looking at a distant place: the camera at (65536, 0) at zoom 100 over a
+-- 32 × 32 viewport puts world x = 65536 at pixel 16, so the transform's
+-- translation is (-6553584, 16) and a world x is at @100 x − 6553584@. The red
+-- sprite covers world x in [65536, 65537), pixels 16 to 115, and the clip from
+-- (65536.1484375, -1) of extent (0.5, 2) is x in [30.84375, 80.84375) on the
+-- target: pixel 30 (centre 30.5) is 0.34 pixel outside it, and pixel 31 inside.
+-- A single-precision absolute world coordinate near 65536 is spaced 1/128 apart,
+-- which at this zoom is most of a pixel: mapping the fragment back to the world
+-- would give 65536.1484375 for pixel 30's centre, whose exact value is 65536.145,
+-- and admit it. The clip test is taken about the world point under the
+-- scissor's centre, so it does not.
+farCamera ∷ Fixture
+farCamera =
+  Fixture
+    { fixtureName = "far-camera"
+    , fixtureMarked = []
+    , fixtureShapes = [shape32]
+    , fixtureSnapshot = \handles →
+        Snapshot
+          [ pass
+              shape32
+              (0, 0, 0, 1)
+              [ clipView
+                  (0, 0)
+                  (32, 32)
+                  (Camera (V2 65536 0) 100 Nothing)
+                  defaultViewSettings
+                  [rect (65536.1484375, -1) (0.5, 2)]
+                  [WorldLayer DepthDisabled [clipped 1 (paint handles (255, 0, 0) (65536, -1) (1, 2))]]
+              ]
+          ]
+    , fixtureNamed =
+        [ NamedProbe "a clip far from the origin keeps its edge where the exact transform puts it: pixel 31 is inside it" (probe 0 31 16) (probe 0 30 16)
+        , NamedProbe "a clip far from the origin does not admit the pixel 0.34 pixel outside its edge, which a coarse absolute coordinate would" (probe 0 30 16) (probe 0 31 16)
+        , NamedProbe "the sprite's own pixels short of the clip draw nothing" (probe 0 20 16) (probe 0 31 16)
         ]
     }
 

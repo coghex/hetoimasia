@@ -168,20 +168,21 @@ firstFrameLayers = case encodings firstFrame of
 chunk ∷ Int → ByteString → ByteString
 chunk index = ByteString.take 64 . ByteString.drop (64 * index)
 
--- | A push block, built by hand, for a view whose clip table starts at entry 0.
+-- | A push block, built by hand, for a layer that selects no clip: its clip
+-- table starts at entry 0 and its centre is the origin.
 push ∷ [Float] → (Word32, Word32) → Float → TextureFilter → Bool → ByteString
-push = pushBased 0
+push = pushBased 0 (0, 0)
 
--- | A push block, built by hand, whose clip base is this entry. The transforms
--- these examples use are a uniform scale and a translation, whose inverse is
--- written out: scale 1 over s with the off-diagonal terms minus zero, as the
--- inverse of a transform with none gives them, and translation minus the
--- translation over s.
-pushBased ∷ Word32 → [Float] → (Word32, Word32) → Float → TextureFilter → Bool → ByteString
-pushBased base [a, b, c, d, tx, ty] extent brightness filtering snap
+-- | A push block, built by hand, whose clip base is this entry and clip centre
+-- this point. The transforms these examples use are a uniform scale and a
+-- translation, whose inverse's linear part is written out: scale 1 over s with
+-- the off-diagonal terms minus zero, as the inverse of a transform with none
+-- gives them.
+pushBased ∷ Word32 → (Float, Float) → [Float] → (Word32, Word32) → Float → TextureFilter → Bool → ByteString
+pushBased base centre [a, b, c, d, tx, ty] extent brightness filtering snap
   | b == 0 && c == 0 && a == d =
-      packViewPush (ViewPush (fromColumns (V2 a b) (V2 c d) (V2 tx ty)) (fromColumns (V2 (1 / a) (-0.0)) (V2 (-0.0) (1 / a)) (V2 (negate tx / a) (negate ty / a))) base extent brightness filtering snap)
-pushBased _ other _ _ _ _ = error ("a hand-built push block needs a uniform scale and six coefficients, not " <> show other)
+      packViewPush (ViewPush (fromColumns (V2 a b) (V2 c d) (V2 tx ty)) (fromColumns (V2 (1 / a) (-0.0)) (V2 (-0.0) (1 / a)) (V2 0 0)) base centre extent brightness filtering snap)
+pushBased _ _ other _ _ _ _ = error ("a hand-built push block needs a uniform scale and six coefficients, not " <> show other)
 
 -- ---------------------------------------------------------------------------
 -- The work
@@ -617,8 +618,10 @@ clipView (origin, extent') table indices =
 --   (0.5, 0.5) 4 × 4 under it, which resolves to (0.5, 0.5) to (1, 1); and
 --   (3, 3) 1 × 1, which resolves to (3, 3) to (4, 4).
 --
--- So the region holds, in order, the six entries of views 0, 2 and 3, and the
--- views' first entries are 0, 2 and 3.
+-- So the region holds, in order, the six entries of views 0, 2 and 3 (each
+-- written for its UI layer only: the world layer of view 2 selects no clip), and
+-- the layers' first entries are 0 for view 0's, none for view 2's world layer, 2
+-- for its UI layer and 3 for view 3's.
 clipFrame ∷ ValidSnapshot
 clipFrame =
   valid
@@ -640,16 +643,22 @@ clipFrame =
         [clipView ((0, 0), (16, 16)) [clipEntry (0, 0) (1, 1) Nothing, clipEntry (0.5, 0.5) (4, 4) (Just 0), clipEntry (3, 3) (1, 1) Nothing] [3]]
     ]
 
--- | The region 'clipFrame' packs, written out by hand.
+-- | The region 'clipFrame' packs, written out by hand. Each edge is taken about
+-- the layer-space point under the centre of its view's scissor, which for a UI
+-- layer is the centre minus the viewport's origin:
+--
+-- * view 0: scissor (0, 0) 16 × 32, centre (8, 16), reference (8, 16);
+-- * view 2: scissor (16, 0) 16 × 32, centre (24, 16), origin (16, 0), reference (8, 16);
+-- * view 3: scissor (0, 0) 16 × 16, centre (8, 8), reference (8, 8).
 clipFrameRegion ∷ ByteString
 clipFrameRegion =
   floats
-    [ 0, 0, 10, 10 -- view 0, entry 0
-    , 5, 5, 10, 10 -- view 0, entry 1, intersected with entry 0
-    , 1, 2, 4, 6 -- view 2, entry 0
-    , 0, 0, 1, 1 -- view 3, entry 0
-    , 0.5, 0.5, 1, 1 -- view 3, entry 1, intersected with entry 0
-    , 3, 3, 4, 4 -- view 3, entry 2
+    [ -8, -16, 2, -6 -- view 0, entry 0: (0, 0) to (10, 10)
+    , -3, -11, 2, -6 -- view 0, entry 1: (5, 5) to (10, 10), intersected with entry 0
+    , -7, -14, -4, -10 -- view 2, entry 0: (1, 2) to (4, 6)
+    , -8, -8, -7, -7 -- view 3, entry 0: (0, 0) to (1, 1)
+    , -7.5, -7.5, -7, -7 -- view 3, entry 1: (0.5, 0.5) to (1, 1), intersected with entry 0
+    , -5, -5, -4, -4 -- view 3, entry 2: (3, 3) to (4, 4)
     ]
 
 clipSpec ∷ Spec
@@ -661,25 +670,29 @@ clipSpec = describe "clip tables" $ do
         Right passes → clipRegion passes `shouldBe` Just clipFrameRegion
         Left refused → expectationFailure (show refused)
 
-  it "gives each layer the index of its view's first entry, in entries, and a view that draws nothing none" $
+  it "gives each layer that selects a clip the index of its table's first entry, in entries, and the scissor's centre; the rest none" $
     withRig $ \rig → do
       input ← inputOver rig clipFrame
       case frameWork input of
-        Right passes →
+        Right passes → do
           [ [(workViewIndex view, map (pushClipBase . layerPush) (workLayers view)) | view ← workViews pass]
-          | pass ← passes
-          ]
-            `shouldBe` [[(0, [0]), (1, []), (2, [2, 2])], [(0, [3])]]
+            | pass ← passes
+            ]
+            `shouldBe` [[(0, [0]), (1, []), (2, [0, 2])], [(0, [3])]]
+          [ [(workViewIndex view, map (pushClipCentre . layerPush) (workLayers view)) | view ← workViews pass]
+            | pass ← passes
+            ]
+            `shouldBe` [[(0, [(8, 16)]), (1, []), (2, [(0, 0), (24, 16)])], [(0, [(8, 8)])]]
         Left refused → expectationFailure (show refused)
 
-  it "pushes the inverse of the layer's transform, which the fragment stage clips in" $
+  it "pushes the inverse of the layer's transform and the centre the clip test is taken about" $
     withRig $ \rig → do
       input ← inputOver rig clipFrame
       case frameWork input of
         Right (first : _) →
           -- View 0's UI layer: the transform is the identity at the viewport's origin.
           map (layerPushBytes) (concatMap workLayers (take 1 (workViews first)))
-            `shouldBe` [pushBased 0 [1, 0, 0, 1, 0, 0] (32, 32) 1 FilterNearest False]
+            `shouldBe` [pushBased 0 (8, 16) [1, 0, 0, 1, 0, 0] (32, 32) 1 FilterNearest False]
         other → expectationFailure ("expected passes, found " <> either show (show . length) other)
 
   it "claims the region first, with the table alignment, writes it, and binds it as set 2 wherever the table is bound" $
@@ -697,9 +710,69 @@ clipSpec = describe "clip tables" $ do
       let bound = [tag | tag ← seen commands, case tag of SeenTable → True; SeenStorage _ → True; _ → False]
       -- Two passes draw: each binds the table and then the region, at the region's own start.
       bound `shouldBe` [SeenTable, SeenStorage 0, SeenTable, SeenStorage 0]
-      -- Each layer's push block names its view's first entry.
+      -- Each layer's push block names its table's first entry, and its centre.
       [ByteString.take 4 (ByteString.drop 44 bytes) | SeenPush _ _ bytes ← seen commands]
-        `shouldBe` [floatlessWord base | base ← [0, 2, 2, 3]]
+        `shouldBe` [floatlessWord base | base ← [0, 0, 2, 3]]
+      [ByteString.drop 64 bytes | SeenPush _ _ bytes ← seen commands]
+        `shouldBe` [floats centre | centre ← [[8, 16], [0, 0], [24, 16], [8, 8]]]
+
+  it "writes a table for each space its layers select clips from, about that space's own reference point" $
+    withRig $ \rig → do
+      -- One view over the 32 × 32 target (refA) with a table of two entries, a
+      -- world layer selecting entry 0 and a UI layer selecting entry 1 (a
+      -- different entry: an entry may not be reached from both spaces). The
+      -- camera is at (3, 4) at zoom 2 over the viewport (0, 0) 32 × 32, so the
+      -- world transform is (2, 0, 0, 2, 10, 8) and the world point under the
+      -- scissor's centre (16, 16) is (3, 4); the UI transform is the identity,
+      -- so the UI point under it is (16, 16). Each space gets the whole table
+      -- about its own reference.
+      let table = [clipEntry (0, 0) (10, 10) Nothing, clipEntry (20, 20) (4, 4) Nothing]
+          view =
+            View
+              (Camera (V2 3 4) 2 Nothing)
+              (Viewport (V2 0 0) (V2 32 32))
+              defaultViewSettings
+              table
+              [WorldLayer DepthDisabled [clippedSprite 1], UiLayer [clippedSprite 2]]
+          snapshot = valid [Pass (OffscreenTarget refA) (ClearColour 0 0 0 1) [view]]
+      input ← inputOver rig snapshot
+      case frameWork input of
+        Right [only] → do
+          [(tableSpace held, tableBase held, tableCentre held) | work ← workViews only, held ← workTables work]
+            `shouldBe` [(ClipWorld, 0, (16, 16)), (ClipUi, 2, (16, 16))]
+          [pushClipBase (layerPush layer) | work ← workViews only, layer ← workLayers work] `shouldBe` [0, 2]
+          clipRegion [only]
+            `shouldBe` Just
+              ( floats
+                  [ -3, -4, 7, 6 -- the world table about (3, 4): entry 0, (0, 0) to (10, 10)
+                  , 17, 16, 21, 20 -- entry 1, (20, 20) to (24, 24)
+                  , -16, -16, -6, -6 -- the UI table about (16, 16): entry 0
+                  , 4, 4, 8, 8 -- entry 1
+                  ]
+              )
+        other → expectationFailure ("expected one pass, found " <> either show (show . length) other)
+
+  it "keeps a distant clip's edges exact: about the reference, not about the origin" $
+    withRig $ \rig → do
+      -- The camera at (65536, 0) at zoom 100 over a 32 × 32 viewport puts world x
+      -- = 65536 at pixel 16, so the transform's translation is (-6553584, 16). A
+      -- clip from (65536.1484375, -1) of extent (0.5, 2) has its left edge at
+      -- 0.1484375 of a world unit about the reference (65536, 0): about the
+      -- origin, in single precision, that edge would be spaced 1/128 apart.
+      let view =
+            View
+              (Camera (V2 65536 0) 100 Nothing)
+              (Viewport (V2 0 0) (V2 32 32))
+              defaultViewSettings
+              [clipEntry (65536.1484375, -1) (0.5, 2) Nothing]
+              [WorldLayer DepthDisabled [clippedSprite 1]]
+          snapshot = valid [Pass (OffscreenTarget refA) (ClearColour 0 0 0 1) [view]]
+      input ← inputOver rig snapshot
+      case frameWork input of
+        Right [only] → do
+          clipRegion [only] `shouldBe` Just (floats [0.1484375, -1, 0.6484375, 1])
+          [pushClipCentre (layerPush layer) | work ← workViews only, layer ← workLayers work] `shouldBe` [(16, 16)]
+        other → expectationFailure ("expected one pass, found " <> either show (show . length) other)
 
   it "keeps instances of different clip indices in one run and one draw" $
     withRig $ \rig → do

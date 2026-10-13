@@ -7,10 +7,12 @@
 --   #414's layout ('instanceVertexInput').
 -- * The push block both stages declare: the view's transform, the attachment's
 --   extent, the view's brightness, its default filter and whether it snaps,
---   where the view's clip table starts and the inverse of the transform
+--   where the view's clip table starts, the inverse of the transform's linear
+--   part and the point the clip comparison is made around
 --   ('packViewPush', 'pushMembers').
 -- * The clip table a batch binds as set 2: one 16-byte entry per clip, in the
---   resolved rectangle's four edges, std430 ('packClipTable', 'clipEntryBytes').
+--   resolved rectangle's four edges taken about a reference point, std430
+--   ('packClipTable', 'clipEntryBytes', 'clipReference', 'rebaseClip').
 -- * The depth an instance's key gives ('depthFromKey'), which is what the vertex
 --   stage writes (R2D-9).
 -- * The sampler an instance resolves to ('shaderSamplerIndex'), which is what
@@ -31,15 +33,18 @@
 -- >     32     4  float brightness
 -- >     36     4  uint filtering           the view's default filter: 1 nearest, 2 linear
 -- >     40     4  uint snap                1 when the view snaps instance origins
--- >     44     4  uint clipBase            the view's clip table's first entry, in entries
+-- >     44     4  uint clipBase            the layer's clip table's first entry, in entries
 -- >     48    16  vec4 inverseLinear       a, b, c, d of the transform's inverse
--- >     64     8  vec2 inverseTranslation  tx, ty of the inverse
+-- >     64     8  vec2 clipCentre          the target-pixel point the clip test is taken about
 --
 -- The transform maps @(x, y)@ to @(a·x + c·y + tx, b·x + d·y + ty)@, the
 -- coefficients of "Hetoimasia.Math.Affine2" in column-major order. The block is
 -- pushed per layer, so the transform and its inverse are those of the layer's
 -- space, the world's or the UI's, exactly as 'Hetoimasia.Render.TwoD.Mapping'
--- gives them, with the world's translation snapped when the view snaps.
+-- gives them, with the world's translation snapped when the view snaps. Only
+-- the inverse's linear part is pushed: the clip test is made about
+-- @clipCentre@, not about the origin, so that it never forms an absolute
+-- coordinate in the layer's space (see below).
 --
 -- = The clip table (R2D-12)
 --
@@ -50,23 +55,38 @@
 -- @vec4@ of 16 bytes, little-endian:
 --
 -- > offset  size  field
--- >      0     4  float left    the half-open rectangle in the layer's space,
+-- >      0     4  float left    the half-open rectangle about the reference point,
 -- >      4     4  float top     a point inside when left ≤ x < right and
 -- >      8     4  float right   top ≤ y < bottom; an empty clip is all zeros
 -- >     12     4  float bottom
 --
--- The views' tables follow one another with no padding, in pass and view
--- order: a 16-byte entry needs none, and the region's own start is aligned by
--- the claim. The @clipBase@ member of the push block is the index of a view's
--- first entry within the region, in entries (units of 16 bytes), so an
--- instance whose flags word holds clip index @k > 0@ reads entry
--- @clipBase + k − 1@, and a view's index @k@ always means that view's own
--- entry @k − 1@. Clip index 0 reads nothing, so a view with no table, and a
--- layer of such a view, pushes a base of 0 and never looks. A batch that draws
--- but holds no clip entry at all still binds a region of one zero entry,
--- because a layout holding set 2 refuses a draw until set 2 is bound; the
--- region's size, and the window it must fit, are in 'clipEntryBytes' times the
--- entries.
+-- __The reference point.__ An edge is written as its distance, in the layer's
+-- space, from the layer-space point under the centre of the view's scissor
+-- ('clipReference'), and the fragment stage tests the fragment's offset from
+-- that centre, carried to the layer's space by the inverse's linear part, so
+-- no coordinate it compares is an absolute position in the layer's space.
+-- That is what keeps the test exact where a view looks at a distant place: a
+-- single-precision absolute coordinate near 65536 is spaced 1/128 apart, which
+-- at a zoom of 100 is most of a pixel, whereas an edge near the viewport is
+-- a small number about the reference whatever the camera's position. The
+-- difference is taken in double precision, from the resolved floats and the
+-- transform's own coefficients, and rounded once. A table is written once for
+-- each space, world or UI, a view's layers select clips from: the reference
+-- depends on the layer's transform, so one table cannot serve both, and a
+-- space no layer selects a clip from gets none.
+--
+-- The tables follow one another with no padding, in pass and view order (a
+-- view's world table before its UI table when both exist): a 16-byte entry
+-- needs none, and the region's own start is aligned by the claim. The
+-- @clipBase@ member of the push block is the index of a layer's table's first
+-- entry within the region, in entries (units of 16 bytes), so an instance
+-- whose flags word holds clip index @k > 0@ reads entry @clipBase + k − 1@,
+-- and a view's index @k@ always means that view's own entry @k − 1@. Clip
+-- index 0 reads nothing, so a layer none of whose instances selects a clip
+-- pushes a base of 0 and never looks. A batch that draws but writes no clip
+-- entry at all still binds a region of one zero entry, because a layout
+-- holding set 2 refuses a draw until set 2 is bound; the region's size, and
+-- the window it must fit, are in 'clipEntryBytes' times the entries.
 module Hetoimasia.Render.TwoD.Vulkan.Layout
   ( -- * The instance as vertex input
     instanceStride
@@ -81,6 +101,8 @@ module Hetoimasia.Render.TwoD.Vulkan.Layout
     -- * The clip table
   , clipEntryBytes
   , packClipTable
+  , clipReference
+  , rebaseClip
     -- * Sampler choice
   , shaderSamplerIndex
   , instanceSamplerBits
@@ -106,7 +128,8 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
 import Hetoimasia.GPU.Vulkan.Native.Shader.Interface (PushMember (..))
 import Hetoimasia.Math.Affine2 (Affine2, toColumnMajor)
 import Hetoimasia.Math.Vector (V2 (..))
-import Hetoimasia.Render.TwoD.Clip (ResolvedClip (..))
+import GHC.Float (double2Float, float2Double)
+import Hetoimasia.Render.TwoD.Clip (ResolvedClip (..), clipIsEmpty, emptyClip)
 import Hetoimasia.Render.TwoD.Settings (TextureFilter (..))
 import Hetoimasia.Render.TwoD.Snapshot (Viewport (..), depthKeyLimit)
 
@@ -168,8 +191,12 @@ data ViewPush = ViewPush
     -- ^ Its inverse, from target pixels back to the layer's space, which the
     -- fragment stage clips in.
   , pushClipBase ∷ !Word32
-    -- ^ The index, in entries, of the view's first entry in the batch's clip
-    -- region.
+    -- ^ The index, in entries, of the layer's clip table's first entry in the
+    -- batch's clip region.
+  , pushClipCentre ∷ !(Float, Float)
+    -- ^ The target-pixel point the fragment stage's clip test is taken about:
+    -- the centre of the view's scissor, where the table's edges are measured
+    -- from the layer-space point under it.
   , pushExtent ∷ !(Word32, Word32)
     -- ^ The attachment's width and height.
   , pushBrightness ∷ !Float
@@ -209,9 +236,12 @@ packViewPush view =
       <> word32LE (filterCode (pushFilter view))
       <> word32LE (if pushSnap view then 1 else 0)
       <> word32LE (pushClipBase view)
-      <> foldMap floatLE (toColumnMajor (pushInverse view))
+      <> foldMap floatLE (take 4 (toColumnMajor (pushInverse view)))
+      <> floatLE centreX
+      <> floatLE centreY
   where
     (width, height) = pushExtent view
+    (centreX, centreY) = pushClipCentre view
 
 -- | The size of one clip table entry in bytes: 16, a @vec4@.
 clipEntryBytes ∷ Int
@@ -223,6 +253,43 @@ clipEntryBytes = 16
 packClipTable ∷ [ResolvedClip] → ByteString
 packClipTable =
   Lazy.toStrict . toLazyByteString . foldMap (\(ResolvedClip left top right bottom) → foldMap floatLE [left, top, right, bottom])
+
+-- | The layer-space point under a target-pixel point, for the transform that
+-- takes the layer's space to target pixels: the exact inverse of the transform,
+-- applied to the point, computed over 'Rational's from the transform's float
+-- coefficients and rounded once to double precision. A transform that has no
+-- inverse gives the origin: its view draws nothing, since a mapping that exists
+-- for a non-empty viewport is invertible.
+clipReference ∷ Affine2 → (Float, Float) → (Double, Double)
+clipReference transform (centreX, centreY) = case map toRational (toColumnMajor transform) of
+  [a, b, c, d, tx, ty]
+    | a * d - b * c /= 0 →
+        let determinant = a * d - b * c
+            ia = d / determinant
+            ib = negate b / determinant
+            ic = negate c / determinant
+            id' = a / determinant
+            itx = negate (ia * tx + ic * ty)
+            ity = negate (ib * tx + id' * ty)
+         in (fromRational (ia * cx + ic * cy + itx), fromRational (ib * cx + id' * cy + ity))
+  _ → (0, 0)
+  where
+    cx = toRational centreX
+    cy = toRational centreY
+
+-- | A resolved clip with its edges taken about a layer-space reference point
+-- ('clipReference'): each edge minus the reference, in double precision and
+-- rounded once to a float. The empty clip stays empty, and so does a clip the
+-- rounding leaves no area (a region narrower than the spacing of floats about
+-- the reference).
+rebaseClip ∷ (Double, Double) → ResolvedClip → ResolvedClip
+rebaseClip (rx, ry) clip@(ResolvedClip left top right bottom)
+  | clipIsEmpty clip = emptyClip
+  | clipIsEmpty rebased = emptyClip
+  | otherwise = rebased
+  where
+    rebased = ResolvedClip (shifted left rx) (shifted top ry) (shifted right rx) (shifted bottom ry)
+    shifted edge origin = double2Float (float2Double edge - origin)
 
 -- | A filter's code in the block, which is also the sampler choice code of an
 -- instance that names it: 1 nearest, 2 linear.

@@ -67,14 +67,19 @@
 --
 -- > k = 0                          no clip: nothing is read
 -- > r = rectangles[clipBase + k − 1]                  (left, top, right, bottom)
--- > p = inverse · gl_FragCoord.xy                      the pixel centre in the layer's space
+-- > p = inverseLinear · (gl_FragCoord.xy − clipCentre)   the pixel centre's offset, in the layer's space
 -- > discard unless  r.left ≤ p.x < r.right  and  r.top ≤ p.y < r.bottom
 --
--- The inverse is the push block's @inverseLinear@ and @inverseTranslation@,
--- the exact inverse of the transform the layer's instances are placed with, so
--- a sprite's own origin snap neither moves nor is undone by the clip, and the
--- view's snapped translation, the zoom, the rotation, and the UI scale, content
--- scale and viewport origin are all in it. A discarded fragment writes neither
+-- The table's edges were written as their distance from the layer-space point
+-- under @clipCentre@ (see "Hetoimasia.Render.TwoD.Vulkan.Layout"), so the test
+-- never forms an absolute coordinate in the layer's space, which in single
+-- precision is too coarse far from the origin: a view looking at world
+-- coordinates near 65536 at a zoom of 100 would misplace an edge by most of a
+-- pixel. @inverseLinear@ is the linear part of the exact inverse of the
+-- transform the layer's instances are placed with, so a sprite's own origin snap
+-- neither moves nor is undone by the clip, and the view's snapped translation (in
+-- the reference), the zoom, the rotation, and the UI scale and content scale
+-- are all in it. A discarded fragment writes neither
 -- colour nor depth, in the ordered and the cutout variant alike. Instances of
 -- different clip indices share one draw: the index travels with the instance.
 --

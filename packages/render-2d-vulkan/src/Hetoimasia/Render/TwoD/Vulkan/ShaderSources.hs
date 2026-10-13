@@ -44,7 +44,7 @@ vertexSource =
               uint snap;
               uint clipBase;
               vec4 inverseLinear;
-              vec2 inverseTranslation;
+              vec2 clipCentre;
           } pushed;
 
           layout(location = 0) out vec2 at;
@@ -128,7 +128,7 @@ fragmentPrelude =
               uint snap;
               uint clipBase;
               vec4 inverseLinear;
-              vec2 inverseTranslation;
+              vec2 clipCentre;
           } pushed;
 
           layout(location = 0) in vec2 at;
@@ -183,20 +183,24 @@ fragmentPrelude =
           }
 
           // Whether the instance's clip excludes this fragment (design D-11).
-          // The fragment's pixel centre, mapped back into the layer's space by
-          // the inverse the push block carries, must lie in the clip's
-          // half-open rectangle: left and top inside, right and bottom
-          // outside. Clip index 0 means none, and reads nothing; index k reads
-          // the view's entry k - 1.
+          // The fragment's pixel centre must lie in the clip's half-open
+          // rectangle in the layer's space: left and top inside, right and
+          // bottom outside. Clip index 0 means none, and reads nothing; index k
+          // reads the layer's table's entry k - 1. The comparison is made about
+          // a reference point, never in absolute layer coordinates, which are
+          // too coarse in single precision far from the origin: the fragment's
+          // offset from the push block's clipCentre goes through the inverse's
+          // linear part, and the table's edges were written as their distance
+          // from the layer-space point under that centre.
           bool clippedOut() {
               if (clipIndex == 0u) {
                   return false;
               }
               vec4 clip = clips.rectangles[pushed.clipBase + clipIndex - 1u];
-              vec2 centre = gl_FragCoord.xy;
+              vec2 offset = gl_FragCoord.xy - pushed.clipCentre;
               vec2 local = vec2(
-                  pushed.inverseLinear.x * centre.x + pushed.inverseLinear.z * centre.y + pushed.inverseTranslation.x,
-                  pushed.inverseLinear.y * centre.x + pushed.inverseLinear.w * centre.y + pushed.inverseTranslation.y);
+                  pushed.inverseLinear.x * offset.x + pushed.inverseLinear.z * offset.y,
+                  pushed.inverseLinear.y * offset.x + pushed.inverseLinear.w * offset.y);
               return !(local.x >= clip.x && local.x < clip.z && local.y >= clip.y && local.y < clip.w);
           }
         |]
