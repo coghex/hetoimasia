@@ -10,7 +10,8 @@
 -- A 256×256 RGBA8 sRGB target of logical extent 128×128 at content scale 2,
 -- UI scale 1, holds the PNG's world copy, the KTX2 copy beside it and the
 -- PNG's UI copy (see "Hetoimasia.Sample.Image2d.Scene"). The snapshot is planned
--- with 'noCutoutMarks', as the recorder is, and the oracle is given the
+-- with 'noCutoutMarks', which the recorder is given explicitly (an offscreen
+-- pass names its marks, R2D-9) as the oracle is, and the oracle is given the
 -- decoded images the registered handles name.
 --
 -- A run passes only when:
@@ -241,11 +242,13 @@ evidence Host {hostAct = actOn, hostRecord = recordOn, hostAwait = awaitBatch, h
           let input =
                 Render.FrameInput
                   { Render.frameSnapshot = valid
+                  , Render.frameMarks = noCutoutMarks
                   , Render.frameTarget = \reference →
                       if evidenceTarget == OffscreenTarget reference
-                        then Just (Render.TargetBinding target (Render.Attachment (formatCode Rgba8Srgb) (fromIntegral side) (fromIntegral side) evidenceMetrics))
+                        then Just (Render.TargetBinding target (Render.Attachment (formatCode Rgba8Srgb) (fromIntegral side) (fromIntegral side) evidenceMetrics) Nothing)
                         else Nothing
                   , Render.frameWindow = Nothing
+                  , Render.frameWindowDepth = Nothing
                   }
           ticket ← recordOn "recording the frame" $ \builders →
             Render.prepareSnapshot (renderBuilders builders) (preparedRenderer prepared) input >>= \case
