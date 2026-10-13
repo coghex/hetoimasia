@@ -30,6 +30,10 @@ module Hetoimasia.Render.TwoD.Oracle.Internal.Geometry
   , coverage
   , nearBoundary
   , Point
+
+    -- * Clip rectangles
+  , ClipStanding (..)
+  , clipStanding
   ) where
 
 import Hetoimasia.Math.Affine2 (Affine2, columns)
@@ -163,3 +167,36 @@ segmentDistanceSquared (x0, y0) (x1, y1) (px, py)
     nearestX = x0 + along * ex
     nearestY = y0 + along * ey
     squared value = value * value
+
+-- | How a pixel centre stands to a clip rectangle, as the layer's transform
+-- places it in target pixels.
+data ClipStanding
+  = -- | Outside the rectangle, and farther than 1/16 pixel from its boundary.
+    ClipOutside
+  | -- | Inside the rectangle, and farther than 1/16 pixel from its boundary.
+    ClipInside
+  | -- | Within 1/16 pixel of the rectangle's boundary, after transformation.
+    ClipNearEdge
+  deriving stock (Eq, Show)
+
+-- | Where a target pixel centre stands to the half-open rectangle
+-- @[left, right) × [top, bottom)@ of the layer's space, under a non-singular
+-- placement of that space in target pixels (the layer's transform, with no
+-- instance in it).
+--
+-- Membership is exact: the centre is carried back to the layer's space by the
+-- placement's inverse and compared with the rectangle, the left and top edges
+-- inside and the right and bottom edges outside. The band is measured in
+-- target pixels: the rectangle's four corners are carried forward and a centre
+-- within 1/16 pixel, in the Euclidean distance, of any of the four segments
+-- between them is 'ClipNearEdge', as a quad's edges are in 'coverage'.
+clipStanding ∷ Placement → (Rational, Rational, Rational, Rational) → Point Rational → ClipStanding
+clipStanding p (left, top, right, bottom) centre
+  | nearBoundary (1 / 16) (zip corners' (drop 1 corners' <> take 1 corners')) centre = ClipNearEdge
+  | inside = ClipInside
+  | otherwise = ClipOutside
+  where
+    (qx, qy) = localPoint p centre
+    inside = left <= qx && qx < right && top <= qy && qy < bottom
+    forward (x, y) = (plA p * x + plC p * y + plTx p, plB p * x + plD p * y + plTy p)
+    corners' = map forward [(left, top), (right, top), (right, bottom), (left, bottom)]
