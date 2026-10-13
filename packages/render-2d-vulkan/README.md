@@ -28,7 +28,7 @@ contract is [docs/gpu_backend.md](../../docs/gpu_backend.md).
 | `Hetoimasia.Render.TwoD.Vulkan.Textures` | `Textures`, `newTextures`; `registerTexture` with a `MarkPolicy`; `swapTexture` with a `SwapPolicy`; `TextureRefusal`; the logical release marker (`markReleased`, `isReleased`), `releaseTextureNow`; `registeredMark`, `registeredMarks` |
 | `Hetoimasia.Render.TwoD.Vulkan.Window` | the host adapter: `Host`, `Adapter`, `newAdapter`; `Scene2D`, `blankScene`; `publish2DSnapshot`, `PublishRefusal`; `release2DTexture`, `release2DChunk`; `adapterAdopted`, `adapterReleased`, `retryReleases`, `textureHolds`, `chunkHolds`; `FrameInfo`, `renderWindowFrame`, `pendingChunkUploads` |
 | `Hetoimasia.Render.TwoD.Vulkan.Frame` | `Attachment`, `offscreenAttachment`, `TargetBinding`, `DepthBinding`, `FrameInput`; `depthLayers`, `requireWorldDepth`, `worldDepthShortfall`; `FrameRefusal`; `frameWork` and the work it computes: `PassWork`, `ViewWork`, `LayerWork`, `RunWork`, `RunReads`, `PipelineKind`, `runPipeline`; the clip region: `viewDraws`, `clipRegion`, `requireClipWindow` |
-| `Hetoimasia.Render.TwoD.Vulkan.Layout` | the instance as vertex input (`instanceVertexInput`), the key's depth (`depthFromKey`), the push block (`ViewPush`, `packViewPush`, `pushMembers`), the clip table's bytes (`packClipTable`, `clipEntryBytes`), the sampler choice (`shaderSamplerIndex`), the scissor rule (`viewScissor`) |
+| `Hetoimasia.Render.TwoD.Vulkan.Layout` | the instance as vertex input (`instanceVertexInput`), the key's depth (`depthFromKey`), the push block (`ViewPush`, `packViewPush`, `pushMembers`), the clip table's bytes and reference (`packClipTable`, `clipEntryBytes`, `clipReference`, `rebaseClip`), the sampler choice (`shaderSamplerIndex`), the scissor rule (`viewScissor`) |
 | `Hetoimasia.Render.TwoD.Vulkan.ShaderInterfaces` | the checked interface descriptions the shaders are compiled against |
 | `Hetoimasia.Render.TwoD.Vulkan.Shaders` | `orderedShaders` and `cutoutShaders`: one vertex stage and two fragment stages |
 
@@ -492,15 +492,16 @@ Both stages declare one push block, std430, 72 bytes (`ViewPush`,
 | 32 | 4 | `float brightness` |
 | 36 | 4 | `uint filtering`: the view's default filter, 1 nearest, 2 linear |
 | 40 | 4 | `uint snap`: 1 when the view snaps instance origins |
-| 44 | 4 | `uint clipBase`: the index, in entries, of the view's first clip entry in the batch's clip region |
+| 44 | 4 | `uint clipBase`: the index, in entries, of the layer's clip table's first entry in the batch's clip region |
 | 48 | 16 | `vec4 inverseLinear`: a, b, c, d of the transform's inverse |
-| 64 | 8 | `vec2 inverseTranslation`: tx, ty of the inverse |
+| 64 | 8 | `vec2 clipCentre`: the target-pixel point the clip test is taken about |
 
 The transform is `worldTransform` for a world layer and `uiTransform` for a UI
 layer, from `viewMapping` for the pass's metrics; it maps `(x, y)` to
 `(a·x + c·y + tx, b·x + d·y + ty)`. The inverse is `worldInverse` or
-`uiInverse`, the exact inverse of the transform the layer draws with, which the
-fragment stage clips in.
+`uiInverse`, the exact inverse of the transform the layer draws with; only its
+linear part is pushed, and the fragment stage clips about `clipCentre` (below),
+never in absolute coordinates of the layer's space.
 
 ## Clip tables (R2D-12)
 
@@ -514,30 +515,49 @@ bound. The format is one 16-byte entry per clip (`packClipTable`,
 
 | Offset | Size | Field |
 | --- | --- | --- |
-| 0 | 4 | `float left`: the half-open rectangle in the layer's space |
+| 0 | 4 | `float left`: the half-open rectangle about the reference point |
 | 4 | 4 | `float top` |
 | 8 | 4 | `float right` |
 | 12 | 4 | `float bottom`; an empty clip is all zeros |
 
-The views' tables follow one another with no padding, in pass and view order: a
-16-byte entry needs none, and the region's own start is aligned by the claim. A
-layer's push block names its view's first entry in `clipBase`, in **entries**
-(units of 16 bytes), so an instance whose flags word holds clip index `k > 0`
-reads entry `clipBase + k − 1`, and one index selects each view's own entry. Clip
-index 0 reads nothing, so a view with no table, and every layer of one, pushes a
-base of 0 and never looks, including when the whole region is the single zero
-entry the next paragraph describes.
+**The reference point.** An edge is written as its distance, in the layer's
+space, from the layer-space point under the centre of the view's scissor
+(`clipReference`: the exact inverse of the layer's transform applied to the
+centre, over `Rational`s), and the fragment stage tests the fragment's offset
+from that centre, carried to the layer's space by the inverse's linear part
+(`inverseLinear`). No coordinate it compares is an absolute position in the
+layer's space. That keeps the test exact where a view looks at a distant place:
+a single-precision absolute coordinate near 65536 is spaced 1/128 apart, which
+at a zoom of 100 is most of a pixel, so mapping a fragment back to the world and
+comparing it with an edge at 65536.1484375 admits a pixel 0.34 pixel outside it,
+whereas the edge about the reference (65536) is the exact 0.1484375, and the
+fragment's offset a small number. The difference (`rebaseClip`) is taken in
+double precision from the resolved floats and rounded once. The reference
+depends on the layer's transform, so a view's table is written once for **each
+space, world or UI, one of its layers selects a clip from** (some instance has a
+clip index), the whole table about that space's reference, and a space no layer
+selects a clip from gets none.
 
-A frame that draws always has a region: when no view that draws holds an entry,
-the region is one zero entry (16 bytes), because a layout that holds set 2
-refuses a draw until set 2 is bound. A frame that draws nothing has none and
-binds none. The region's size is the actual packed layout, `clipEntryBytes` times
-the entries of the views that draw; a region larger than the window is a
-`ClipTablesTooLarge` naming its size and the window, decided before anything is
-recorded (a table of exactly the window is accepted, and the tables of a view
-that records no draw are not counted). The backend checks the rest when the
-region is bound: the bytes from the offset to the claim's end within the window,
-and the offset's alignment.
+The tables follow one another with no padding, in pass and view order (a view's
+world table before its UI table when both exist): a 16-byte entry needs none, and
+the region's own start is aligned by the claim. A layer's push block names its
+table's first entry in `clipBase`, in **entries** (units of 16 bytes), and the
+scissor's centre in `clipCentre`, so an instance whose flags word holds clip
+index `k > 0` reads entry `clipBase + k − 1`, and one index selects each view's
+own entry. Clip index 0 reads nothing, so a layer none of whose instances selects
+a clip pushes a base of 0 and a centre of the origin and never looks, including
+when the whole region is the single zero entry the next paragraph describes.
+
+A frame that draws always has a region: when no table is written, the region is
+one zero entry (16 bytes), because a layout that holds set 2 refuses a draw until
+set 2 is bound. A frame that draws nothing has none and binds none. The region's
+size is the actual packed layout, `clipEntryBytes` times the entries of every
+table written (one for each space a drawing view's layers select clips from); a
+region larger than the window is a `ClipTablesTooLarge` naming its size and the
+window, decided before anything is recorded (a table of exactly the window is
+accepted, and the tables of a view that records no draw are not counted). The
+backend checks the rest when the region is bound: the bytes from the offset to the
+claim's end within the window, and the offset's alignment.
 
 ## The shaders
 
@@ -587,22 +607,25 @@ result = s + destination × (1 − s.a)       the pipeline's premultiplied blend
 **Clipping (D-11).** The vertex stage passes the instance's clip index
 `flags >> 16` on, flat. Both fragment variants end with the clip test, after the
 sample is taken (so a discarded invocation still takes part in its quad's
-derivatives): with `k` the clip index, `r = rectangles[clipBase + k − 1]` and `p`
-the fragment's pixel centre (`gl_FragCoord.xy`) carried back to the layer's space
-by the pushed inverse,
+derivatives): with `k` the clip index, `r = rectangles[clipBase + k − 1]`, `c` the
+push block's `clipCentre` and `L` its `inverseLinear`,
 
 ```text
 k = 0                                             nothing is read
+p = L · (gl_FragCoord.xy − c)                     the pixel centre's offset, in the layer's space
 discard unless  r.left ≤ p.x < r.right  and  r.top ≤ p.y < r.bottom
 ```
 
+where the table's edges are measured from the layer-space point under `c` (above),
+so the comparison is made between small numbers whatever the camera's position.
 A discarded fragment writes neither colour nor depth, in the ordered and the
-cutout variant alike (choice C). The inverse is that of the transform the layer's
-instances are placed with, so the view's snapped translation, the zoom and the
-rotation are in it for a world clip, and the UI scale, the content scale and the
-viewport's origin for a UI clip; a sprite's own origin snap neither moves the
-clip nor is undone by it. Instances with different clip indices stay in one
-draw: the index travels with the instance.
+cutout variant alike (choice C). `L` is the linear part of the exact inverse of
+the transform the layer's instances are placed with, and the reference is that
+transform's own, so the view's snapped translation, the zoom and the rotation are
+in them for a world clip, and the UI scale, the content scale and the viewport's
+origin for a UI clip; a sprite's own origin snap neither moves the clip nor is
+undone by it. Instances with different clip indices stay in one draw: the index
+travels with the instance.
 
 **The cutout variant (D-26).** An instance routed to the cutout path, so with a
 tint alpha of 255 and no translucent or additive flag, is drawn by
@@ -668,7 +691,10 @@ passes, views, layers and draws with their scissors and push blocks, the
 drawing-order instance bytes at their ring offsets, mixed sampler choices in one
 run and one draw, empty scissors recording no draw while the pass keeps its
 clear, one pipeline per format and kind, the clip region (the tables of the views
-that draw packed in pass and view order, each layer's first-entry index, the
+that draw, one for each space a layer selects clips from, their edges taken about
+the layer-space point under the scissor's centre — by hand, and for a camera at
+(65536, 0) at zoom 100 the exact 0.1484375 — packed in pass and view order, each
+layer's first-entry index and centre, the
 region claimed first and bound as set 2 where the table is, a region of one zero
 entry when nothing is clipped and none when nothing draws, a region exactly the
 window accepted and one entry more refused naming its size, the tables of a view
@@ -716,12 +742,14 @@ A third case, `r2d8-image`, runs the [image2d sample](../../samples/image2d/READ
 registration, the swap rule and the adapter's holds and deferred release through
 the production host's per-window scenes.
 
-A fourth, `r2d12-clip`, renders six clip fixtures (R2D-12) and judges every pixel
+A fourth, `r2d12-clip`, renders seven clip fixtures (R2D-12) and judges every pixel
 against the oracle's clip model: in **one draw** under a camera turned an eighth
 of a turn, an unclipped instance, a clipped one and one under a nested clip; two
 views whose one clip index selects each view's own rectangle; a UI clip at content
 scale 2 in a viewport away from the origin; a clip under pixel snap and zoom that
 neither follows a sprite's origin snap nor ignores the view's snapped translation;
+a view of world coordinates near 65536 at a zoom of 100, whose clip edge a coarse
+absolute coordinate would misplace by most of a pixel, kept exact by the reference point;
 a cutout clipped away, writing no depth, so the farther cutout shows through; and
 an empty clip with a clip under one. Each named behaviour is a probe the oracle
 must give determinately and that differs from its contrast's.

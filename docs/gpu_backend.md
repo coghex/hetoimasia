@@ -6570,7 +6570,10 @@ that also holds set 2 (`TableLayoutOptions TableShaderSampler True`), and each
 batch writes the resolved clip tables of the views that draw into one region
 claimed with `claimTable` before any instance region, and binds it with
 `bindStorageTable` at offset 0 wherever the texture table is bound; a layer's
-push block names its view's first entry. Six fixtures are rendered into
+push block names its table's first entry and the centre of its view's scissor,
+about whose layer-space point the table's edges are written, so that the
+fragment test never forms an absolute coordinate in the layer's space. Seven
+fixtures are rendered into
 `R8G8B8A8_UNORM` targets, one with a `D32_SFLOAT` depth image, and read back as the
 ordered path's are; each shows its behaviours by named probes that must be
 determinate and differ from their contrast's:
@@ -6586,9 +6589,13 @@ determinate and differ from their contrast's:
 4. *snapping*: a world clip under pixel snap and zoom 2, with the camera at a
    fractional position, that is placed by the view's snapped translation and does
    not follow a sprite whose origin the shader snaps 0.4 pixel;
-5. *cutouts*: a nearer cutout clipped away on half the target writes no depth, so
+5. *far-camera*: a view of world coordinates near 65536 at a zoom of 100, where a
+   single-precision absolute coordinate is spaced most of a pixel apart: a clip
+   edge at 65536.1484375 stays 30.84375 on the target, the pixel 0.34 outside it
+   draws nothing, and the next draws;
+6. *cutouts*: a nearer cutout clipped away on half the target writes no depth, so
    the farther cutout shows through there, and hides nothing where its clip holds;
-6. *empties*: an empty clip, and a clip under one whose own rectangle is the whole
+7. *empties*: an empty clip, and a clip under one whose own rectangle is the whole
    target, clip everything, beside an unclipped instance that still draws.
 
 The pass criteria are the ordered path's, with the device's depth format reported
