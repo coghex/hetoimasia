@@ -558,7 +558,7 @@ extent640 = (640, 480)
 -- | Whether a world-with-depth chunk of these bounds is skipped in the plain view,
 -- where world point (x, y) lies at target (320 + x, 240 + y).
 culledAt ∷ (Float, Float) → (Float, Float) → Bool
-culledAt (x0, y0) (x1, y1) = chunkCulled plainMapping extent640 plainViewport ChunkWorldDepth (Bounds (V2 x0 y0) (V2 x1 y1))
+culledAt (x0, y0) (x1, y1) = chunkCulled plainMapping extent640 plainViewport ChunkWorldDepth (Bounds (V2 x0 y0) (V2 x1 y1)) 0
 
 cullingSpec ∷ Spec
 cullingSpec = describe "culling" $ do
@@ -585,7 +585,7 @@ cullingSpec = describe "culling" $ do
     culledAt (320.25, 0) (330, 10) `shouldBe` True
   it "keeps a chunk half a pixel further out when the view snaps, which rounds an instance's origin by up to that" $ do
     let snapping = mappingOf (offscreenMetrics (PixelExtent 640 480)) plainCamera plainViewport defaultViewSettings {settingPixelSnap = True}
-        culledSnapped = chunkCulled snapping extent640 plainViewport ChunkWorldDepth
+        culledSnapped bounds = chunkCulled snapping extent640 plainViewport ChunkWorldDepth bounds 0
     mappingPixelSnap snapping `shouldBe` True
     -- Left of the view, 0.3 beyond its edge: skipped unsnapped, kept snapped.
     culledAt (-330.3, 0) (-320.3, 10) `shouldBe` True
@@ -595,7 +595,7 @@ cullingSpec = describe "culling" $ do
   it "follows a rotated camera: a quarter turn moves what lay to the right of the view above it" $ do
     let quarter = pi / 2 ∷ Float
         turned = mappingOf (offscreenMetrics (PixelExtent 640 480)) plainCamera {cameraRotation = Just quarter} plainViewport defaultViewSettings
-        skipped bounds = chunkCulled turned extent640 plainViewport ChunkWorldDepth bounds
+        skipped bounds = chunkCulled turned extent640 plainViewport ChunkWorldDepth bounds 0
     -- World +X is then above the centre: x in [300, 360] is at target y near 240 - x, far above the view.
     skipped (Bounds (V2 300 0) (V2 360 10)) `shouldBe` True
     -- World +Y is then right of the centre, still inside at y in [100, 110].
@@ -606,7 +606,7 @@ cullingSpec = describe "culling" $ do
     let metrics = TargetMetrics (PixelExtent 640 480) (PixelExtent 640 480) 1.5 1.5
         viewport = Viewport (V2 320 0) (V2 320 480)
         mapping scale = mappingOf metrics plainCamera viewport defaultViewSettings {settingUiScale = scale}
-        skipped scale = chunkCulled (mapping scale) extent640 viewport ChunkUi (Bounds (V2 0 0) (V2 100 50))
+        skipped scale = chunkCulled (mapping scale) extent640 viewport ChunkUi (Bounds (V2 0 0) (V2 100 50)) 0
     -- The viewport's origin is 320, and a UI point maps to origin + point × scale × content scale.
     -- Scale 2 × 1.5 = 3: the chunk spans target x in [320, 620], so it is in view.
     skipped 2 `shouldBe` False
@@ -616,14 +616,14 @@ cullingSpec = describe "culling" $ do
     -- a scale of 3, wholly beyond it, and [165, 300] at a scale of 1.5, within it.
     let left = Viewport (V2 0 0) (V2 300 480)
         leftMapping scale = mappingOf metrics plainCamera left defaultViewSettings {settingUiScale = scale}
-        skippedLeft scale = chunkCulled (leftMapping scale) extent640 left ChunkUi (Bounds (V2 110 0) (V2 200 50))
+        skippedLeft scale = chunkCulled (leftMapping scale) extent640 left ChunkUi (Bounds (V2 110 0) (V2 200 50)) 0
     skippedLeft 2 `shouldBe` True
     skippedLeft 1 `shouldBe` False
   it "treats a viewport beyond the target as the part of it within the target" $ do
     let viewport = Viewport (V2 600 0) (V2 400 480)
         mapping = mappingOf (offscreenMetrics (PixelExtent 640 480)) plainCamera viewport defaultViewSettings
     -- Target x in [650, 700] is within the viewport but beyond the 640-pixel target.
-    chunkCulled mapping extent640 viewport ChunkWorldFlat (Bounds (V2 330 0) (V2 380 10)) `shouldBe` True
+    chunkCulled mapping extent640 viewport ChunkWorldFlat (Bounds (V2 330 0) (V2 380 10)) 0 `shouldBe` True
   it "skips a chunk in one view and keeps it in another, planning each as such" $ do
     let chunk = built ChunkWorldDepth [cutoutAt 1 1, orderedAt 2 2]
         held = chunksFrom [(ref 1 1, chunk)]
@@ -634,8 +634,8 @@ cullingSpec = describe "culling" $ do
           ]
         snapshot = Snapshot [windowPass views]
         metrics = offscreenMetrics (PixelExtent 640 480)
-        culler _ viewIndex kind bounds =
-          chunkCulled (mappingOf metrics (viewCamera (views !! viewIndex)) plainViewport defaultViewSettings) extent640 plainViewport kind bounds
+        culler _ viewIndex kind bounds placement =
+          chunkCulled (mappingOf metrics (viewCamera (views !! viewIndex)) plainViewport defaultViewSettings) extent640 plainViewport kind bounds placement
     case validateSnapshotWith held snapshot of
       Left refused → fail ("refused: " <> show refused)
       Right valid → case planPasses (planSnapshotCulled culler marks valid) of
@@ -647,6 +647,29 @@ cullingSpec = describe "culling" $ do
           map runShape (plannedRuns far) `shouldBe` [(Ordered, RingRun, 0, 1)]
           drawingSources far `shouldBe` [DynamicInstance 0]
         other → fail ("planned to " <> show other)
+  it "keeps a chunk whose placement cancels large terms, the 32-bit arithmetic rounding at their size (a camera 8 million units away)" $ do
+    -- With the camera at x = 8,000,000 and a zoom of 5.3, an 8 × 1 instance at x = 8,000,001.5 lies at
+    -- target x of about 13.5, but each product the shader forms is about 4 × 10⁷, where a 32-bit
+    -- float steps by 4: evaluated in single precision its x endpoints fall at 12 and 56, so column 12
+    -- of a viewport 13 pixels wide is covered. The culler may not discard it.
+    let metrics = offscreenMetrics (PixelExtent 32 32)
+        viewport = Viewport (V2 0 0) (V2 13 32)
+        mapping = mappingOf metrics (Camera (V2 8000000 16) 5.3 Nothing) viewport defaultViewSettings
+        chunk = either (error . show) id (buildChunk marks ChunkWorldFlat DeriveBounds [placed (8, 0) (0, 1) (8000001.5, 16)])
+    chunkCulled mapping (32, 32) viewport ChunkWorldFlat (chunkBounds chunk) (chunkPlacementMagnitude chunk) `shouldBe` False
+  prop "never skips a chunk whose 32-bit placement reaches the view, however large the terms that cancel" $
+    checkCoverage $
+      forAll cancellingCase $ \(camera, viewport, instances) →
+        let metrics = offscreenMetrics (PixelExtent 32 32)
+         in case viewMapping metrics (View camera viewport defaultViewSettings []) of
+              Nothing → property True
+              Just mapping →
+                let chunk = either (error . show) id (buildChunk marks ChunkWorldFlat DeriveBounds instances)
+                    reached = any (floatPlacementReaches mapping viewport) instances
+                    skipped = chunkCulled mapping (32, 32) viewport ChunkWorldFlat (chunkBounds chunk) (chunkPlacementMagnitude chunk)
+                 in cover 15 reached "the single-precision placement reaches the view" $
+                      cover 10 (not reached && skipped) "it does not and the chunk is skipped" $
+                        counterexample "the single-precision placement reaches the view but the chunk was skipped" (not (reached && skipped))
   prop "never skips a chunk with an instance that covers a pixel centre of the view, whatever the camera, scales and snap" $
     checkCoverage $
       forAll cullingCase $ \(extent, kind, camera, viewport, settings, instances) →
@@ -656,7 +679,7 @@ cullingSpec = describe "culling" $ do
             Just mapping →
               let chunk = built' kind instances
                   covered = [() | candidate ← instances, coversACentre mapping kind extent viewport candidate]
-                  skipped = chunkCulled mapping extent viewport kind (chunkBounds chunk)
+                  skipped = chunkCulled mapping extent viewport kind (chunkBounds chunk) (chunkPlacementMagnitude chunk)
                in cover 20 (not (null covered)) "an instance covers a pixel centre" $
                     cover 10 (null covered && skipped) "nothing is covered and the chunk is skipped" $
                       counterexample
@@ -738,6 +761,45 @@ coversACentre mapping kind (width, height) (Viewport (V2 ox oy) (V2 vw vh)) cand
               u = (dx * fy - dy * fx) / determinant
               v = (ex * dy - ey * dx) / determinant
            in u >= 0 && u <= 1 && v >= 0 && v <= 1
+
+-- | A camera far from the origin and instances near it, so that the terms of the
+-- placement are large and nearly cancel.
+cancellingCase ∷ Gen (Camera, Viewport, [Instance])
+cancellingCase = do
+  camX ← elements [0, 1.0e5, 1.0e6, 8.0e6, -8.0e6, 3.0e7]
+  camY ← elements [0, 1.0e6, -4.0e6]
+  zoom ← elements [0.5, 1, 2, 5.3, 8]
+  width ← choose (4, 32)
+  height ← choose (4, 32)
+  offsets ← resize 4 (nonEmptyOf ((,) <$> choose (-20, 40) <*> choose (-20, 40)))
+  size ← choose (1, 10)
+  let instances = [placed (size, 0) (0, 1) (fromIntegral (round' camX + x ∷ Integer) + 0.5, fromIntegral (round' camY + y ∷ Integer)) | (x, y) ← offsets]
+  pure (Camera (V2 camX camY) zoom Nothing, Viewport (V2 0 0) (V2 width height), instances)
+  where
+    round' ∷ Float → Integer
+    round' = round
+
+-- | Whether the instance, placed by the shader's own 32-bit arithmetic, one multiply
+-- and one add at a time, has a corner within the part of the target the view draws
+-- to (taken as a rectangle, as culling takes it).
+floatPlacementReaches ∷ ViewMapping → Viewport → Instance → Bool
+floatPlacementReaches mapping (Viewport (V2 ox oy) (V2 w h)) candidate =
+  minimum xs <= right && maximum xs >= left && minimum ys <= bottom && maximum ys >= top
+  where
+    (V2 ia ib, V2 ic id' , V2 itx ity) = columns (instanceTransform candidate)
+    (V2 va vb, V2 vc vd, V2 vtx vty) = columns (worldTransform mapping)
+    corners = [(u, v) | u ← [0, 1], v ← [0, 1 ∷ Float]]
+    placedAt (u, v) =
+      let wx = (ia * u + ic * v) + itx
+          wy = (ib * u + id' * v) + ity
+       in ((va * wx + vc * wy) + vtx, (vb * wx + vd * wy) + vty)
+    mapped = map placedAt corners
+    xs = map fst mapped
+    ys = map snd mapped
+    left = max 0 ox
+    top = max 0 oy
+    right = min 32 (ox + w)
+    bottom = min 32 (oy + h)
 
 -- * Encoding
 

@@ -69,6 +69,12 @@ data Chunk = Chunk
   -- ascending depth key and then build position.
   , chunkTextureSet ∷ !(Set TextureHandle)
   -- ^ Every texture any instance names.
+  , chunkMagnitudeField ∷ !Double
+  -- ^ The largest magnitude any term of placing an instance reaches:
+  -- @max (|a| + |c| + |tx|) (|b| + |d| + |ty|)@ over the instances (the unit
+  -- square's coordinates being at most 1). The 32-bit arithmetic that places an
+  -- instance rounds at the size of these terms, however little of them is left
+  -- in the result.
   }
   deriving stock (Eq, Show)
 

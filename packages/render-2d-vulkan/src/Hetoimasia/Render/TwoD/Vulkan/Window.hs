@@ -125,7 +125,7 @@ import Control.Concurrent.MVar (MVar, newMVar, withMVar)
 import Control.Exception (mask, onException)
 import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO)
 import Control.DeepSeq (NFData (rnf))
-import Control.Monad (filterM, forM_)
+import Control.Monad (forM_)
 import Data.Kind (Type)
 import Data.List.NonEmpty (NonEmpty)
 import Data.Map.Strict (Map)
@@ -157,12 +157,12 @@ import Hetoimasia.Render.TwoD.Vulkan.Frame (Attachment (..), DepthBinding (..), 
 import Hetoimasia.Render.TwoD.Vulkan.Chunks
   ( ChunkStanding (..)
   , Retained
+  , RetainedView (..)
   , chunkStandingSTM
-  , isChunkReleased
   , markChunkReleasedSTM
   , releaseChunkNow
   , retainedBuffers
-  , retainedChunks
+  , retainedViewSTM
   )
 import Hetoimasia.Render.TwoD.Vulkan.Textures (Textures, isReleased, markReleasedSTM, registeredMarks, releaseTextureNow)
 import Numeric.Natural (Natural)
@@ -321,8 +321,12 @@ data PublishRefusal
 -- the window, answering its revision. Admission is serialized with the releases.
 publish2DSnapshot ∷ Adapter window → window → Snapshot → IO (Either PublishRefusal Natural)
 publish2DSnapshot adapter window candidate = withMVar (adapterLock adapter) $ \_ → do
-  chunks ← retainedChunks (adapterRetained adapter)
-  case validateSnapshotWith chunks candidate of
+  -- One transaction reads what the registry holds, each chunk's release flag and
+  -- its standing, so the checks below are made against the chunks the snapshot
+  -- was resolved against: a release the owner's thread runs meanwhile removes a
+  -- chunk from the view it can no longer change.
+  view ← atomically (retainedViewSTM (adapterRetained adapter))
+  case validateSnapshotWith (viewChunks view) candidate of
     Left reasons → pure (Left (SnapshotInvalid reasons))
     Right valid → case ([index | (index, Pass {passTarget = OffscreenTarget _}) ← zip [0 ..] (Snapshot.snapshotPasses candidate)], length [() | Pass {passTarget = WindowTarget} ← Snapshot.snapshotPasses candidate]) of
       (index : _, _) → pure (Left (OffscreenPassHeld index))
@@ -332,12 +336,11 @@ publish2DSnapshot adapter window candidate = withMVar (adapterLock adapter) $ \_
         Just (location, held) → pure (Left (WorldDepthRefused location held))
         Nothing → do
           let scene = sceneOf valid
-          (released, chunkReleased, standings) ← atomically $ do
-            textures ← filterReleased (Set.toList (sceneReferences scene))
-            gone ← filterM (isChunkReleased (adapterRetained adapter)) (Set.toList (sceneChunks scene))
-            states ← traverse (\reference → (,) reference <$> chunkStandingSTM (adapterRetained adapter) reference) (Set.toList (sceneChunks scene))
-            pure (textures, gone, states)
-          case (released, chunkReleased, [(reference, ended) | (reference, Just (ChunkFailed ended)) ← standings]) of
+              chunkRefs = Set.toList (sceneChunks scene)
+              releasedChunks = [reference | reference ← chunkRefs, Map.findWithDefault True reference (viewReleased view)]
+              failedChunks = [(reference, ended) | reference ← chunkRefs, Just (ChunkFailed ended) ← [Map.lookup reference (viewStandings view)]]
+          released ← atomically (filterReleased (Set.toList (sceneReferences scene)))
+          case (released, releasedChunks, failedChunks) of
             (handle : _, _, _) → pure (Left (TextureReleasedInSnapshot handle))
             ([], reference : _, _) → pure (Left (ChunkReleasedInSnapshot reference))
             ([], [], (reference, ended) : _) → pure (Left (ChunkUploadFailedInSnapshot reference ended))

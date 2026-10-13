@@ -103,6 +103,7 @@ import Hetoimasia.Render.TwoD.Chunk
   , ChunkRef
   , chunkBounds
   , chunkCutoutPositions
+  , chunkPlacementMagnitude
   , lookupChunk
   )
 import Hetoimasia.Render.TwoD.Culling (chunkCulled)
@@ -754,7 +755,7 @@ culled ctx = do
           viewOne = viewAt (0, 16) (32, 16) (5016, 24) [layer]
           metrics = offscreenMetrics (PixelExtent 32 32)
           skipped view reference = case (viewMapping metrics view, lookupChunk held reference) of
-            (Just mapping, Just chunk) → Just (chunkCulled mapping (32, 32) (viewViewport view) ChunkWorldDepth (chunkBounds chunk))
+            (Just mapping, Just chunk) → Just (chunkCulled mapping (32, 32) (viewViewport view) ChunkWorldDepth (chunkBounds chunk) (chunkPlacementMagnitude chunk))
             _ → Nothing
       revision ← next ctx
       result ←

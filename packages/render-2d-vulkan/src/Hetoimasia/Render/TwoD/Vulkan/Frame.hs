@@ -213,7 +213,7 @@ depthLayers valid =
   [ AtLayer passIndex viewIndex layerIndex
   | (passIndex, pass) ← zip [0 ..] (snapshotPasses (validSnapshot valid))
   , (viewIndex, view) ← zip [0 ..] (passViews pass)
-  , (layerIndex, WorldLayer DepthEnabled _) ← zip [0 ..] (viewLayers view)
+  , (layerIndex, WorldLayerWith DepthEnabled _ _) ← zip [0 ..] (viewLayers view)
   ]
 
 -- | The rule for a session whose depth format is this one, or that offers none
@@ -401,8 +401,8 @@ frameWork input =
     -- first found: planning needs a pass's view mappings only for its culling.
     resolved = zipWith (resolvePass input) [0 ..] passes
     plan = planSnapshotCulled culler (frameMarks input) valid
-    culler passIndex viewIndex kind bounds = case Map.lookup (passIndex, viewIndex) cullable of
-      Just (mapping, extent, viewport) → chunkCulled mapping extent viewport kind bounds
+    culler passIndex viewIndex kind bounds placement = case Map.lookup (passIndex, viewIndex) cullable of
+      Just (mapping, extent, viewport) → chunkCulled mapping extent viewport kind bounds placement
       Nothing → False
     cullable =
       Map.fromList
@@ -437,7 +437,7 @@ depthFor passIndex views works supplied = case (supplied, needing, holding) of
     holding =
       [ AtLayer passIndex viewIndex layerIndex
       | (viewIndex, view) ← zip [0 ..] views
-      , (layerIndex, WorldLayer DepthEnabled _) ← zip [0 ..] (viewLayers view)
+      , (layerIndex, WorldLayerWith DepthEnabled _ _) ← zip [0 ..] (viewLayers view)
       ]
 
 viewWork ∷ FrameInput → Map.Map (Int, Int, Int) ValidLayer → Attachment → Int → Int → (View, PlannedView) → Either FrameRefusal ViewWork

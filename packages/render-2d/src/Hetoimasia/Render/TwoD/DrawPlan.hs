@@ -185,13 +185,14 @@ data InstanceSource
     ChunkInstance !Int !Int
   deriving stock (Eq, Ord, Show)
 
--- | Whether a chunk of this kind and bounds is skipped for the view at this pass
--- and view index.
-type ChunkCuller = Int → Int → ChunkKind → Bounds → Bool
+-- | Whether a chunk of this kind, bounds and placement magnitude
+-- ('Hetoimasia.Render.TwoD.Chunk.chunkPlacementMagnitude') is skipped for the view
+-- at this pass and view index.
+type ChunkCuller = Int → Int → ChunkKind → Bounds → Double → Bool
 
 -- | The culler that skips nothing.
 noCulling ∷ ChunkCuller
-noCulling _ _ _ _ = False
+noCulling _ _ _ _ _ = False
 
 -- | A frame's draw plan: the snapshot's passes, in order.
 newtype DrawPlan = DrawPlan
@@ -326,7 +327,7 @@ planView culls chunksOf marks passIndex viewIndex view =
         ]
     }
 
-planLayer ∷ (ChunkKind → Bounds → Bool) → CutoutMarks → Viewport → Location → Layer → [(ChunkRef, Chunk)] → PlannedLayer
+planLayer ∷ (ChunkKind → Bounds → Double → Bool) → CutoutMarks → Viewport → Location → Layer → [(ChunkRef, Chunk)] → PlannedLayer
 planLayer culls marks viewport location layer chunks =
   -- Every field that reads the drawing order is evaluated before the layer
   -- exists, and none is a thunk: nothing the plan returns still refers to the
@@ -349,7 +350,7 @@ planLayer culls marks viewport location layer chunks =
     drawn = not (emptyViewport viewport)
     listings = zip [0 ..] (map snd chunks)
     (skipped, live)
-      | drawn = partition (\(_, held) → culls kind (chunkBoundsField held)) listings
+      | drawn = partition (\(_, held) → culls kind (chunkBoundsField held) (chunkMagnitudeField held)) listings
       | otherwise = ([], [])
     culled = map fst skipped
     (ringEntries, runs)

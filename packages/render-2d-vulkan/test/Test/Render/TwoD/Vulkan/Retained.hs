@@ -12,7 +12,10 @@
 -- adopted and released.
 module Test.Render.TwoD.Vulkan.Retained (spec) where
 
-import Control.Concurrent.STM (readTVarIO)
+import Control.Concurrent (forkIO, yield)
+import Control.Monad (forM_)
+import Control.Concurrent.STM (atomically, newTVarIO, readTVar, readTVarIO, retry, writeTVar)
+import qualified Data.Map.Strict as Map
 import Control.Exception (AsyncException (ThreadKilled), throwIO, try)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
@@ -467,6 +470,31 @@ recordingSpec = describe "recording a frame that draws chunks" $ do
         | kind ← [ChunkWorldFlat, ChunkUi]
         ]
 
+  it "refuses a depth image that is not D32_SFLOAT for a depth-enabled layer that lists chunks, and a session offering no D32_SFLOAT, naming the layer, even over an empty viewport" $
+    withSetup $ \setup → do
+      reference ← built setup ChunkWorldDepth [cutAt 0 3]
+      settleUploads (setupRig setup)
+      let emptyView = View (Camera (V2 16 16) 1 Nothing) (Viewport (V2 0 0) (V2 0 0)) defaultViewSettings [WorldLayerWith DepthEnabled [reference] []]
+      lie ← depthTarget (setupRig setup) Depth24 32 32
+      image ← target (setupRig setup) Rgba8Linear 32 32
+      buffers ← retainedBuffers (setupRetained setup)
+      forM_ [fullView [WorldLayerWith DepthEnabled [reference] []], emptyView] $ \view → do
+        snapshot ← snapshotOver setup [view]
+        let input =
+              FrameInput
+                { frameSnapshot = snapshot
+                , frameMarks = artMarks
+                , frameTarget = \_ → Just (TargetBinding image (offscreenAttachment Rgba8Linear 32 32) (Just (DepthBinding lie Depth32Float)))
+                , frameWindow = Nothing
+                , frameWindowDepth = Nothing
+                , frameChunks = buffers
+                }
+            declared = input {frameTarget = \_ → Just (TargetBinding image (offscreenAttachment Rgba8Linear 32 32) (Just (DepthBinding lie Depth24)))}
+        fmap (const ()) (frameWork declared) `shouldBe` Left (DepthFormatRefused (AtLayer 0 0 0) Depth24)
+        requireWorldDepth (Just Depth24) snapshot `shouldBe` Left (DepthFormatRefused (AtLayer 0 0 0) Depth24)
+        requireWorldDepth Nothing snapshot `shouldBe` Left (NoDepthFormat (AtLayer 0 0 0))
+        requireWorldDepth (Just Depth32Float) snapshot `shouldBe` Right ()
+
   it "refuses a frame that lists a chunk with cutout instances for which no buffer was supplied, naming the layer and the chunk" $
     withSetup $ \setup → do
       reference ← built setup ChunkWorldDepth [cutAt 0 3]
@@ -613,6 +641,19 @@ publishSpec = describe "publishing a snapshot that lists chunks" $ do
       publishChunks env 1 ui `shouldReturn'` Left (SnapshotInvalid (Validation.Refusal (AtChunk 0 0 0 0 reference) ChunkKindMismatch :| []))
       length <$> readTVarIO (fakePublished (envFake env)) >>= (`shouldBe` 0)
 
+  it "refuses a depth-enabled layer that lists chunks where the session's depth format is not D32_SFLOAT, naming the layer, and publishes nothing" $
+    mapM_
+      ( \(offered, session) → withEnvOffering offered [1] $ \env → do
+          art ← registered env 1 True DefaultMark
+          reference ← chunkIn env art ChunkWorldDepth
+          publish2DSnapshot (envAdapter env) 1 (windowListing [reference] []) >>= (`shouldBe` Left (WorldDepthRefused (AtLayer 0 0 0) session))
+          -- Even where the view's viewport is empty and nothing could be drawn.
+          let empty = Snapshot [Pass WindowTarget (ClearColour 0 0 0 1) [View (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 0 0)) defaultViewSettings [WorldLayerWith DepthEnabled [reference] []]]]
+          publish2DSnapshot (envAdapter env) 1 empty >>= (`shouldBe` Left (WorldDepthRefused (AtLayer 0 0 0) session))
+          length <$> readTVarIO (fakePublished (envFake env)) >>= (`shouldBe` 0)
+      )
+      [([Depth24, Depth16], Just Depth24), ([], Nothing)]
+
   it "refuses a reference the registry does not hold, naming the layer and the chunk: never built, or released since" $
     withChunkEnv [1] $ \env _ reference → do
       let stranger = chunkRefOf 77 1
@@ -626,6 +667,44 @@ publishSpec = describe "publishing a snapshot that lists chunks" $ do
       release2DChunk (envAdapter env) reference >>= (`shouldBe` Right ())
       publishChunks env 1 (windowListing [reference] []) `shouldReturn'` Left (ChunkReleasedInSnapshot reference)
       publishChunks env 1 (windowListing [] []) >>= (`shouldBe` Right 1)
+
+  it "never accepts a snapshot that lists a chunk whose release has run, however publications and the release interleave" $
+    withChunkEnv [1] $ \env _ reference → do
+      released ← newTVarIO False
+      done ← newTVarIO False
+      failure ← newTVarIO (Nothing ∷ Maybe String)
+      -- Publications run on an application thread, as they do; the release runs on the owner's.
+      _ ← forkIO $ do
+        let loop remaining = do
+              ran ← readTVarIO released
+              answer ← publish2DSnapshot (envAdapter env) 1 (windowListing [reference] [])
+              -- A publication that began after the release ran must have been refused.
+              case answer of
+                Right _ | ran → atomically (writeTVar failure (Just "a snapshot listing a released chunk was accepted after its release ran"))
+                _ → pure ()
+              if ran || remaining <= (0 ∷ Int) then atomically (writeTVar done True) else yield >> loop (remaining - 1)
+        loop 2000
+      markChunkReleased (envRetained env) reference >>= (`shouldBe` True)
+      yield
+      releaseChunkNow (builders (envRig env)) (envRetained env) reference >>= (`shouldBe` Right ())
+      atomically (writeTVar released True)
+      atomically (readTVar done >>= \finished → if finished then pure () else retry)
+      readTVarIO failure >>= (`shouldBe` Nothing)
+      -- Whatever got through before the marker, nothing lists the chunk now.
+      publish2DSnapshot (envAdapter env) 1 (windowListing [reference] []) >>= (`shouldSatisfy` either (const True) (const False))
+      view ← atomically (retainedViewSTM (envRetained env))
+      Map.member reference (viewReleased view) `shouldBe` False
+
+  it "reads the registry as one view: a marked chunk with its flag and standing, a released one absent from all of it" $
+    withChunkEnv [1] $ \env _ reference → do
+      before ← atomically (retainedViewSTM (envRetained env))
+      (Map.lookup reference (viewReleased before), Map.lookup reference (viewStandings before)) `shouldBe` (Just False, Just ChunkReady)
+      markChunkReleased (envRetained env) reference >>= (`shouldBe` True)
+      marked ← atomically (retainedViewSTM (envRetained env))
+      Map.lookup reference (viewReleased marked) `shouldBe` Just True
+      releaseChunkNow (builders (envRig env)) (envRetained env) reference >>= (`shouldBe` Right ())
+      after ← atomically (retainedViewSTM (envRetained env))
+      (Map.member reference (viewReleased after), Map.member reference (viewStandings after), lookupChunk (viewChunks after) reference) `shouldBe` (False, False, Nothing)
 
   it "refuses a chunk whose upload ended without completing, naming it and how it ended" $
     withEnv [1] $ \env → do

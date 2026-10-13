@@ -43,14 +43,14 @@ import Hetoimasia.Render.TwoD.Snapshot (Viewport (..))
 
 -- | Whether the view whose mapping, viewport and target extent these are skips
 -- a chunk of this kind with these bounds.
-chunkCulled ∷ ViewMapping → (Word32, Word32) → Viewport → ChunkKind → Bounds → Bool
-chunkCulled mapping (targetWidth, targetHeight) (Viewport (V2 originX originY) (V2 width height)) kind (Bounds (V2 x0 y0) (V2 x1 y1))
-  | not (all finite [lowX, lowY, highX, highY, viewLeft, viewTop, viewRight, viewBottom]) = False
+chunkCulled ∷ ViewMapping → (Word32, Word32) → Viewport → ChunkKind → Bounds → Double → Bool
+chunkCulled mapping (targetWidth, targetHeight) (Viewport (V2 originX originY) (V2 width height)) kind (Bounds (V2 x0 y0) (V2 x1 y1)) placement
+  | not (all finite [lowX, lowY, highX, highY, viewLeft, viewTop, viewRight, viewBottom, errorX, errorY]) = False
   | otherwise =
-      highX + margin < viewLeft
-        || lowX - margin > viewRight
-        || highY + margin < viewTop
-        || lowY - margin > viewBottom
+      highX + marginX < viewLeft
+        || lowX - marginX > viewRight
+        || highY + marginY < viewTop
+        || lowY - marginY > viewBottom
   where
     transform = case kind of
       ChunkUi → uiTransform mapping
@@ -72,6 +72,13 @@ chunkCulled mapping (targetWidth, targetHeight) (Viewport (V2 originX originY) (
     viewTop = max 0 top
     viewRight = min (fromIntegral targetWidth) (left + wide width)
     viewBottom = min (fromIntegral targetHeight) (top + wide height)
-    margin = (if mappingPixelSnap mapping then 0.5 else 0) + 0.0625 + slack
-    slack = maximum (map abs [lowX, highX, lowY, highY, viewRight, viewBottom]) * (2 ** (-18))
+    margin = (if mappingPixelSnap mapping then 0.5 else 0) + 0.0625
+    marginX = margin + errorX
+    marginY = margin + errorY
+    -- The rounding of 32-bit arithmetic, at the size of its terms.
+    scale = maximum (map abs [viewLeft, viewTop, viewRight, viewBottom, fromIntegral targetWidth, fromIntegral targetHeight])
+    reachX = abs a * max (abs bx0) (abs bx1) + abs c * max (abs by0) (abs by1) + abs tx
+    reachY = abs b * max (abs bx0) (abs bx1) + abs d * max (abs by0) (abs by1) + abs ty
+    errorX = 16 * 2 ** (-24) * (reachX + (abs a + abs c) * placement + scale)
+    errorY = 16 * 2 ** (-24) * (reachY + (abs b + abs d) * placement + scale)
     finite value = not (isNaN value || isInfinite value)

@@ -69,6 +69,8 @@ module Hetoimasia.Render.TwoD.Vulkan.Chunks
   , chunkStanding
   , chunkStandingSTM
   , retainedChunks
+  , RetainedView (..)
+  , retainedViewSTM
   , retainedBuffers
   , chunkBufferOf
   , markChunkReleased
@@ -242,6 +244,39 @@ retainedChunks ∷ Retained → IO Chunks
 retainedChunks (Retained ledger) = do
   held ← readTVarIO ledger
   pure (chunksFrom [(reference, entryChunk entry) | (reference, entry) ← Map.toList (ledgerEntries held)])
+
+-- | What the registry holds at one instant, read in one transaction: the chunks a
+-- snapshot may be validated against, and for each the release flag and the
+-- standing. Everything publication checks is read from one such view, so a chunk
+-- the owner's thread releases meanwhile can neither be resolved by one read and
+-- missed by another.
+data RetainedView = RetainedView
+  { viewChunks ∷ !Chunks
+  , viewReleased ∷ !(Map ChunkRef Bool)
+    -- ^ Whether each held chunk has been marked released.
+  , viewStandings ∷ !(Map ChunkRef ChunkStanding)
+  }
+
+-- | The registry as it stands, in one transaction.
+retainedViewSTM ∷ Retained → STM RetainedView
+retainedViewSTM (Retained ledger) = do
+  held ← readTVar ledger
+  standings ← traverse standingOf (ledgerEntries held)
+  pure
+    RetainedView
+      { viewChunks = chunksFrom [(reference, entryChunk entry) | (reference, entry) ← Map.toList (ledgerEntries held)]
+      , viewReleased = Map.map entryReleased (ledgerEntries held)
+      , viewStandings = standings
+      }
+  where
+    standingOf entry = case entryDevice entry of
+      Nothing → pure ChunkReady
+      Just (_, ticket) → standingFor <$> readUploadTicket ticket
+    standingFor = \case
+      UploadComplete → ChunkReady
+      UploadQueued → ChunkUploading
+      UploadUploading → ChunkUploading
+      ended → ChunkFailed ended
 
 -- | The references the registry holds.
 liveChunks ∷ Retained → IO [ChunkRef]

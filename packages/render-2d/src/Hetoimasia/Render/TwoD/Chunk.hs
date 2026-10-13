@@ -82,6 +82,7 @@ module Hetoimasia.Render.TwoD.Chunk
   , chunkCutoutPositions
   , chunkOrderedPositions
   , chunkTextures
+  , chunkPlacementMagnitude
 
     -- * Resolving references
   , Chunks
@@ -161,6 +162,7 @@ buildChunk marks kind request instances =
             , chunkCutoutOrder = map fst (sortOn (\(position, candidate) → (instanceMaterialOf candidate, position)) cutouts)
             , chunkOrderedOrder = map fst (sortOn (\(position, candidate) → (instanceDepthKey candidate, position)) ordered)
             , chunkTextureSet = Set.fromList (map instanceTexture instances)
+            , chunkMagnitudeField = maximum (0 : map placementMagnitude instances)
             }
   where
     count = length instances
@@ -284,6 +286,19 @@ chunkOrderedPositions = chunkOrderedOrder
 -- visible.
 chunkTextures ∷ Chunk → Set TextureHandle
 chunkTextures = chunkTextureSet
+
+-- | The largest magnitude any term of placing an instance reaches, over the
+-- chunk's instances: what the shader's 32-bit arithmetic rounds at, however
+-- much of it cancels. Culling widens its margin by the rounding this allows.
+chunkPlacementMagnitude ∷ Chunk → Double
+chunkPlacementMagnitude = chunkMagnitudeField
+
+-- | The magnitude of the terms of one instance's placement.
+placementMagnitude ∷ Instance → Double
+placementMagnitude candidate = max (abs a + abs c + abs tx) (abs b + abs d + abs ty)
+  where
+    (V2 fa fb, V2 fc fd, V2 ftx fty) = columns (instanceTransform candidate)
+    (a, b, c, d, tx, ty) = (realToFrac fa, realToFrac fb, realToFrac fc, realToFrac fd, realToFrac ftx, realToFrac fty) ∷ (Double, Double, Double, Double, Double, Double)
 
 -- | No chunk: every reference is unresolved.
 noChunks ∷ Chunks
