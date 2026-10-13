@@ -78,7 +78,6 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , constructImageFormat
   , constructReadback
   , constructRingWith
-  , constructShaderSampledTablePipelineLayout
   , constructStorageTable
   , constructTablePipelineLayoutWith
   , TableLayoutOptions (..)

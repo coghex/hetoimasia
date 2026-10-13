@@ -132,6 +132,18 @@
 --   reason under the validation runner's evidence directory; where the device
 --   chooses another depth format the run reports it and checks the recorder's
 --   refusal instead (#426);
+-- * @r2d12-clip@ — the same device start with no window, then the 2D renderer's
+--   recorder over instances that carry clip indices (R2D-12): six fixtures —
+--   one draw, under a camera turned an eighth of a turn, of an unclipped
+--   instance, a clipped one and one under a nested clip; two views whose one
+--   clip index selects each view's own rectangle; a UI clip at content scale 2
+--   in a viewport away from the origin; a clip under pixel snap and zoom that
+--   neither follows a sprite's origin snap nor ignores the view's snapped
+--   translation; a cutout clipped away writing no depth; and an empty clip and
+--   a clip under one — the batch's clip tables written into one ring region
+--   and bound as the storage table, every pixel of every target judged against
+--   the render-2d oracle, and written as lossless PNGs and a probe record
+--   under the validation runner's evidence directory (#428);
 -- * @r2d15-storage-tables@ — the same device start with no window, then the
 --   session's texture table, a ring made with a storage-table window, and a
 --   pipeline layout that also holds the storage table's set 2: two per-batch
@@ -514,6 +526,14 @@ scenarios =
       $ \consent journal _ → do
         outcome ← SurfaceFree.runCutoutDepth (consentBackend consent) journal
         pure (SurfaceFree.cutoutDepthSpec outcome, section "The R2D-9 cutout path evidence record" (SurfaceFree.cutoutDepthSection outcome))
+  , Scenario
+      "r2d12-clip"
+      "records six render-2d snapshots whose instances carry clip indices into their views' clip tables into offscreen targets of a surface-free session, the batch's tables written into one ring region and bound as the storage table and the fragment stage discarding outside each instance's clip — an unclipped, a clipped and a nested-clipped instance in one draw under a camera turned an eighth of a turn, two views whose one clip index selects each view's own rectangle, a UI clip at content scale 2 in a viewport away from the origin, a clip under pixel snap and zoom that neither follows a sprite's origin snap nor ignores the view's snapped translation, a clipped-away cutout that writes no depth, and an empty clip with a clip under one — reads each target back after completion, passes every determinate probe of the render-2d oracle with each named behaviour distinguished from its contrast, and writes lossless PNGs and a probe record, with validation reporting nothing"
+      False
+      Nothing
+      $ \consent journal _ → do
+        outcome ← SurfaceFree.runClip (consentBackend consent) journal
+        pure (SurfaceFree.clipSpec outcome, section "The R2D-12 clip evidence record" (SurfaceFree.clipSection outcome))
   , Scenario
       "r2d15-storage-tables"
       "draws twice in one batch of a frame-less batch of a surface-free session, through a shader-sampled table layout that also holds set 2 and no selected sampler: two per-batch tables are written into regions of a ring made with a storage-table window, and each is bound at its own dynamic offset before its draw, whose fragment shader reads its colour from the bound table; reads the target back and checks that each draw shows its own table's colour exactly, with validation reporting nothing"

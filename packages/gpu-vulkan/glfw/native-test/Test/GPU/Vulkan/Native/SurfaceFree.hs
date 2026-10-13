@@ -80,6 +80,7 @@ module Test.GPU.Vulkan.Native.SurfaceFree
   , runDepthRect
   , runOrderedPath
   , runCutoutDepth
+  , runClip
   , surfaceFreeSection
   , laterWindowSection
   , framelessSection
@@ -96,6 +97,7 @@ module Test.GPU.Vulkan.Native.SurfaceFree
   , depthRectSection
   , orderedPathSection
   , cutoutDepthSection
+  , clipSection
   , surfaceFreeSpec
   , laterWindowSpec
   , framelessSpec
@@ -112,6 +114,7 @@ module Test.GPU.Vulkan.Native.SurfaceFree
   , depthRectSpec
   , orderedPathSpec
   , cutoutDepthSpec
+  , clipSpec
   ) where
 
 import Control.Concurrent (ThreadId, myThreadId, threadDelay)
@@ -296,6 +299,7 @@ import Hetoimasia.Runtime.GLFW
 import Hetoimasia.Runtime.Logging (withLoggingLifetime)
 import Hetoimasia.Runtime.Supervision (RuntimeControl)
 import Test.GPU.Vulkan.Native.Environment (validationFeatures)
+import qualified Test.GPU.Vulkan.Native.Clip as Clip
 import qualified Test.GPU.Vulkan.Native.CutoutDepth as CutoutDepth
 import qualified Test.GPU.Vulkan.Native.OrderedPath as OrderedPath
 import Test.GPU.Vulkan.Native.Platform (requestingBackend)
@@ -1864,6 +1868,22 @@ runCutoutDepth backend journal =
     "vulkan-native-r2d9-cutout-depth"
     "cutout-depth"
 
+-- | The clip case (R2D-12): the same recorder over the same kind of session,
+-- six fixtures whose instances carry clip indices into their views' tables,
+-- judged against the oracle ("Test.GPU.Vulkan.Native.Clip"), with a
+-- @D32_SFLOAT@ depth image for the one fixture that draws cutouts. Where the
+-- device chooses another depth format it renders nothing, reports the format,
+-- and checks the recorder's refusal on it.
+runClip ∷ Maybe Backend → Journal → IO SurfaceFreeOutcome
+runClip backend journal =
+  runEvidenceSuite
+    backend
+    journal
+    Clip.clipSuite
+    "R2D-12: a surface-free session records render-2d snapshots whose instances are clipped by index into per-view tables the batch binds as its storage table, reads each target back after completion and judges every pixel against the render-2d oracle, and writes a lossless PNG a target and a probe record"
+    "vulkan-native-r2d12-clip"
+    "clip"
+
 runEvidenceSuite ∷ Maybe Backend → Journal → OrderedPath.Suite → Text → Text → String → IO SurfaceFreeOutcome
 runEvidenceSuite backend journal suite headline caseName directoryName = do
   heading journal headline
@@ -2787,11 +2807,17 @@ evidenceSection title label outcome =
               ]
       SurfaceFreeFailed _ → []
 
+clipSection ∷ SurfaceFreeOutcome → [Text]
+clipSection = evidenceSection "A surface-free session recording the clip fixtures" "clip"
+
 orderedPathSpec ∷ SurfaceFreeOutcome → Spec
 orderedPathSpec = evidenceSpec "R2D-7 the ordered path's window-free evidence" "ordered path" 10 True
 
 cutoutDepthSpec ∷ SurfaceFreeOutcome → Spec
 cutoutDepthSpec = evidenceSpec "R2D-9 the cutout path's window-free evidence" "cutout depth" 7 True
+
+clipSpec ∷ SurfaceFreeOutcome → Spec
+clipSpec = evidenceSpec "R2D-12 clipping's window-free evidence" "clip" 6 True
 
 -- | The examples of an evidence case: no window, every fixture rendered and
 -- read back after its batch completed, every determinate probe within its
