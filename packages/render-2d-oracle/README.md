@@ -12,7 +12,8 @@ the input defect that stops it. A pure reader returns a pixel of a tightly
 packed readback, and a verdict compares the two. Every rendering slice proves
 itself against it ([the design](../../docs/designs/render_2d_design.md): D-12,
 *Verification strategy*), and the recorder's offscreen readbacks (R2D-7, and
-R2D-9 for the cutout path and depth) are its client. Expectations come from the
+R2D-9 for the cutout path and depth, and R2D-10 for retained chunks) are its
+client. Expectations come from the
 snapshot, never from an observed image.
 
 It is a pure package. The library depends on `hetoimasia-render-2d` (the
@@ -197,6 +198,30 @@ submission, then the ordered-path instances by depth key and then submission
 world layer with depth disabled, draws each instance that covers the probe, in
 that order, blended.
 
+**Retained chunks (R2D-10, D-31).** A layer that lists chunks is evaluated as
+the plan orders it, from the chunks the snapshot was validated against, which
+the `ValidSnapshot` carries, so the oracle looks nothing up and needs no further
+input. Its drawing order is the plan's: first each listed chunk's cutout
+instances, as a run in the order the layer lists them, with the path the chunk was
+**built** with (routing is fixed at build, whatever marks the oracle is given:
+those are the dynamic instances'), then the layer's dynamic cutouts, then the
+ordered instances of the chunks and the layer merged by ascending depth key and
+then source order (a chunk before any dynamic instance, listings in order, each
+in build order). A chunk listed twice is drawn twice. The equal-key outcomes
+below follow unchanged: among cutouts the later source wins, an ordered instance
+draws over a cutout. A fragment of a chunk's instance is named by an
+`AtChunkInstance` location (pass, view, layer, the chunk's position in the layer's
+list, the instance's build position), where an indeterminate probe or a refusal
+names the instance.
+
+**Culling.** A view that culls a chunk (`chunkCulled`, from the view's mapping,
+its viewport and the target's extent, conservatively: see `render-2d`) contributes
+none of it, as the recorder does not draw it. Because the bounds enclose the
+chunk's geometry, culling changes no pixel the view draws, and the suite shows
+it: a layer that lists chunks gives, at every pixel, the expectation of the layer
+that holds the same instances itself, in source order, whatever the camera, scale
+or snap.
+
 A **depth-enabled world layer** has the depth model of design D-2, D-23 and
 D-26, evaluated per probe pixel:
 
@@ -235,6 +260,47 @@ a sample, whether or not another instance would hide it: the oracle does not
 prove a hiding it need not rely on. A cutout instance whose quad edge is within
 1/16 pixel of the probe is indeterminate for the same reason as an ordered
 one's (`NearQuadEdge`).
+
+## Clips (D-11, R2D-12)
+
+An instance whose clip index `k` is not 0 selects entry `k − 1` of its view's
+clip table, as the plan resolved it (`plannedClips`, from `resolveClips`: every
+entry intersected with its parent chain, in the entry's space, rounded once to
+floats; see [`render-2d`](../render-2d/README.md#clip-tables)). The oracle
+applies the resolved rectangle as the recorder's fragment stage does, but exactly:
+
+1. **Membership.** The probe's pixel centre is carried back to the layer's space
+   by the exact inverse of the transform the layer's instances are placed with
+   (the view's `worldTransform` with its snapped translation, or `uiTransform`),
+   computed over `Rational`s from the transform's 32-bit coefficients, and
+   compared with the half-open rectangle `left ≤ x < right`, `top ≤ y < bottom`
+   of the resolved floats, exactly. Outside it the instance **receives nothing
+   from the probe**: it draws neither colour nor depth (a clipped-away cutout
+   leaves the farther one visible), whatever its quad covers. The sprite's own
+   origin snap is not part of the clip: it neither moves the clip nor is undone
+   by it.
+2. **The edge band.** The rectangle's four corners are carried forward to target
+   pixels by the same transform, and a centre within 1/16 pixel, in the Euclidean
+   distance and measured **in target pixels**, of any of the four segments
+   between them is `NearClipEdge` (1/16 itself is inside the band, as for a
+   quad's edges). The band is measured in the target's pixels, not the layer's
+   units, so a UI scale of 4 or a zoom of ¼ changes how far a unit of the layer
+   is from the probe, and not the band.
+3. **When it counts.** The band applies to an instance that could draw at the
+   probe: one that covers it, or whose quad edge lies within 1/16 pixel of it
+   (`NearQuadEdge` wins when both hold). An instance clearly outside its clip is
+   `Nothing`, however its quad lies, and an instance whose quad does not reach
+   the probe makes no pixel indeterminate for a clip edge it does not use.
+   A placement that cannot be represented stays unevaluable before any clip is
+   asked.
+4. **An empty clip** (the resolved `emptyClip`: a zero extent, an empty
+   intersection, or a descendant of one) holds no point and has no boundary:
+   the instance gives nothing at any probe, and no probe is indeterminate for
+   its edge, even at the rectangle's own origin.
+
+Clip index 0 means none: no clip is asked. The oracle plans with the same marks
+as the recorder, so a clipped cutout-path instance and a clipped ordered one are
+both clipped before they are shaded.
 
 ## Verdicts and exactness
 
@@ -277,6 +343,7 @@ Each names where: the view as `AtView pass view`, or an instance as
 | --- | --- |
 | `NearViewportEdge` | The probe's centre is within 1/16 pixel of an edge of a view's non-empty viewport that is not on a whole pixel, whatever the view draws. |
 | `NearQuadEdge` | The centre is within 1/16 pixel of the edge of an instance's quad, on the ordered or the cutout path. |
+| `NearClipEdge` | The centre is within 1/16 pixel, in target pixels, of the boundary after transformation of the non-empty clip rectangle of an instance that could draw there. |
 | `NearCutoutThreshold` | A cutout-path instance's sample has an alpha, before brightness, within 2/255 of ½ (inclusive). |
 | `MinifiedNotAxisAligned` | A minified probe, on a texture with more than one level, whose derivatives are sheared or rotated by other than a quarter turn. |
 | `MinifiedFractionalLevel` | A minified, axis-aligned probe whose level of detail is between two levels. |
@@ -317,14 +384,16 @@ fault is reported by the reader:
 ## What is shared with `render-2d`, and what is independent
 
 **Shared** (a mistake in one is a mistake in both, so the fixtures below do not
-rely on them): `ValidSnapshot` and its validation; `viewMapping`, with
+rely on them): `ValidSnapshot` and its validation, and the chunks it carries;
+`chunkCulled`; `viewMapping`, with
 `worldTransform`, `uiTransform`, `worldToTarget`, `uiToTarget`, `snapPoint` and
 `mappingPixelSnap`, which place the camera and snap; `viewportContains` and
 `viewportIsEmpty`; and `planSnapshot` with `drawingOrder` and each run's path,
 which order the instances and route the cutout path.
 
 **Independent**: composing the instance's transform with the layer's, coverage,
-distance from an edge, derivatives, level selection, texel addressing and
+the clip's membership and its distance from an edge (the inverse of the layer's
+transform is taken here, over `Rational`s, not read from the mapping), derivatives, level selection, texel addressing and
 filtering, the sRGB transfer function, the shading and blend equations, the
 rounding of every store, the exactness rule, the verdicts and the readback
 reader. These are written here, in rational arithmetic where the question is
@@ -343,7 +412,19 @@ the depth model — cutouts and translucent instances interleaved, both equal-ke
 rules, a discarded fragment leaving farther art visible, a filtered edge writing
 white, a cutout reading its mip level, the threshold band at its edges, two
 layers with independent keys, and a UI layer and a world layer without depth
-beside a depth-enabled one — and every indeterminate case). Against synthetic readbacks written as pictures,
+beside a depth-enabled one — clips: an axis-aligned one, nested and three-deep
+intersections with unclipped, parent-clipped and child-clipped instances in one
+layer, a 45° rotated camera with and without zoom, the edge band at its
+boundary and measured in target pixels under a UI scale of 4 and a zoom of ¼, the
+view's snapped translation, UI at content scale 2 from a viewport origin, a
+clipped-away cutout, an empty clip and its descendants, and two views with
+tables of their own — retained chunks of each kind, written as pictures:
+the merge order of a layer's chunks and its dynamic instances (equal keys, the
+listing's order, a chunk listed twice), the later source winning a cutout tie,
+an ordered chunk instance over a cutout, a chunk's routing the one it was built
+with whatever marks the oracle is given, a faint cutout-marked texel discarded by a
+depth chunk and blended by a world chunk without depth and a UI chunk, and a chunk
+shown in one view and skipped in another — and every indeterminate case). Against synthetic readbacks written as pictures,
 the suite shows the oracle **rejects** reversed overlap, a channel off by two and
 a wrong snap, and accepts the exact image.
 
@@ -356,6 +437,14 @@ where a `Float` is still finer than 1/128 pixel; beyond that the oracle claims
 only its own exact arithmetic, and a game that places quads that far from the
 origin should not read a probe near an edge as determinate. The window's pixel
 centres are exact `Float`s up to the 2²³-pixel extent the oracle accepts.
+
+A clip's membership and band are exact too, over the layer's transform and the
+resolved floats, wherever the view looks: the recorder's clip test is taken about
+a reference point near the view, so that it is exact in the same way even for a
+camera far from the origin (world coordinates near 65536 at a zoom of 100, where
+an absolute single-precision coordinate is spaced most of a pixel apart), and a
+determinate clip probe there is held to the oracle's answer by the native case's
+`far-camera` fixture.
 
 ## Purity, owned state, threads and lifetimes
 
@@ -377,4 +466,4 @@ cabal test --project-file cabal.project.cpu hetoimasia-render-2d-oracle:render-2
 The suite is the CPU validation group `test.render-2d-oracle`; it needs no GPU
 and no display. Its components, selectable with `--test-options='--match <name>'`
 on the suite that owns them, are `Placement`, `Sampling`, `Colour`, `Probes`,
-`Depth` and `Verdicts`.
+`Depth`, `Clip`, `Chunks` and `Verdicts`.

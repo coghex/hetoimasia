@@ -175,8 +175,8 @@ uses, and releases both resources and still exits 0 — it just says nothing.
 | `packages/gpu-vulkan/diagnostics/` | Header-free validation capture and its diagnostic lifetime | Buildable without a Vulkan SDK |
 | `packages/gpu-vulkan/native/` | Native Vulkan backend: roots, swapchain generations, managed recording, frames, presentation, recovery and terminal failure | Buildable only through `cabal.project.vulkan` |
 | `packages/gpu-vulkan/glfw/` | Window integration: session controller, surface handover and the scheduled owner loop | Buildable only through `cabal.project.vulkan` |
-| `packages/render-2d/` | The 2D frame as a value: snapshot, validation, step zoom, view mapping, draw plan and the 64-byte instance encoding; no GPU | Buildable |
-| `packages/render-2d-oracle/` | The 2D renderer's oracle: expected pixels computed from a validated snapshot, with probes, verdicts and a readback reader; no GPU | Buildable |
+| `packages/render-2d/` | The 2D frame as a value: snapshot, validation, clip tables and their resolver, step zoom, view mapping, draw plan and the 64-byte instance encoding; no GPU | Buildable |
+| `packages/render-2d-oracle/` | The 2D renderer's oracle: expected pixels computed from a validated snapshot, clips included, with probes, verdicts and a readback reader; no GPU | Buildable |
 | `packages/render-2d-vulkan/` | The 2D renderer's Vulkan recorder for the ordered path (passes, views and layers recorded into one batch, with the built-in shaders), texture registration with cutout marks and the swap rule, and the per-window host adapter (publication, holds and releases) | Buildable only through `cabal.project.vulkan`; proven offscreen against the oracle and through the production host's per-window scenes |
 | `packages/render-3d/` | Dedicated 3D rendering path | Planned |
 | `packages/scripting-lua/` | Lua binding, protocol model, and confinement experiments | Binding/model buildable; production runtime planned |
