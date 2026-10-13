@@ -6587,7 +6587,8 @@ resolves to its own slot after the release ran:
    showing it, afterwards;
 3. a snapshot naming the released texture is offered and refused, naming it;
 4. a snapshot without it is published, adopted as revision 2, revision 1 is
-   released by the host, and only then does the release take effect: the
+   released by the host, and only then does the release take effect — by an
+   action that waits for no barrier, since the request's was met in step 2: the
    table no longer maps the handle, and nothing is left pending.
 
 It passes only if the evidence passed; every named probe held; the swap was
