@@ -1,0 +1,14 @@
+{
+  "batch": "D1",
+  "kind": "diagnostic",
+  "purpose": "Find the wait the example stalls in on Linux. Unfixed controller and test, plus temporary phase markers and a 20 s watchdog that prints the phase, the owner's rounds and the latch (stress-438 only; removed before the final head).",
+  "example": "Vulkan scenes for each window (R2D-14) release requests are refused after the session's failure",
+  "toolchain": "the CI image named by tools/ci-image/descriptor.json (ghc 9.14.1, cabal 3.18.1.0), runner ubuntu-latest x86_64",
+  "rts": "none (the suite's -threaded -rtsopts defaults)",
+  "variants": [
+    {"name": "d1-natural-load", "runs": 4000, "processes": 4, "load": 8, "seed": "random", "preErrorDelayMs": 0, "match": ["are refused after the session's failure"]},
+    {"name": "d1-issue-seed-load", "runs": 1000, "processes": 2, "load": 8, "seed": "fixed", "fixedSeed": 1777504540, "preErrorDelayMs": 0, "match": ["are refused after the session's failure"]},
+    {"name": "d1-natural-unloaded", "runs": 1000, "processes": 1, "load": 0, "seed": "random", "preErrorDelayMs": 0, "match": ["are refused after the session's failure"]},
+    {"name": "d1-forced-idle", "runs": 3, "processes": 3, "load": 0, "seed": "random", "preErrorDelayMs": 300, "runTimeoutSeconds": 100, "match": ["are refused after the session's failure"]}
+  ]
+}

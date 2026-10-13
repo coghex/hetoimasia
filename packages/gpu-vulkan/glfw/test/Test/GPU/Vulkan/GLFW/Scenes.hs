@@ -12,10 +12,15 @@
 -- read it from.
 module Test.GPU.Vulkan.GLFW.Scenes (spec) where
 
-import Control.Concurrent (ThreadId, forkIO, throwTo, yield)
+import Control.Concurrent (ThreadId, forkIO, killThread, threadDelay, throwTo, yield)
+import Data.Functor ((<&>))
+import Data.IORef (newIORef, readIORef, writeIORef)
+import GHC.Clock (getMonotonicTime)
+import System.Environment (lookupEnv)
+import System.IO (hPutStrLn, stderr)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, registerDelay, stateTVar, writeTVar)
-import Control.Exception (ErrorCall (..), SomeException, throwIO, toException, try)
+import Control.Exception (ErrorCall (..), SomeException, bracket, finally, throwIO, toException, try)
 import Control.Monad (void, when)
 import Data.List (nub, sort)
 import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (..), threadStatus)
@@ -39,7 +44,7 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Loop (publishVulkanScene, publishVulk
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Scenes (adoptScene, endSceneTarget, newScenes, readSceneState, registerSceneTarget, releaseScenes, retentionLimit)
 import Hetoimasia.GPU.Vulkan.Native.Generations (GenerationView (..), SwapchainResult (..), TargetCondition (..), TargetGenerationsView (..))
 import Hetoimasia.GPU.Vulkan.Native.Recording (ClearColor (..))
-import Hetoimasia.GPU.Vulkan.Native.Roots (RootTargetView (..), TerminalCause (..))
+import Hetoimasia.GPU.Vulkan.Native.Roots (RootTargetView (..), TerminalCause (..), reportPrimary)
 import Hetoimasia.Runtime.Supervision (checkRuntime)
 import Hetoimasia.Runtime.GLFW
   ( AttachmentId
@@ -760,28 +765,66 @@ testReleaseOrder = do
 
 testRequestAfterFailure ∷ IO ()
 testRequestAfterFailure = do
-  rig ← withPerWindowScenes <$> surfaceFreeRig 1
-  observed ← newTVarIO Nothing
-  outcome ← runRigCaught rig $ \host control → do
-    _ ← superviseGraphicsOwner control (vulkanGraphicsOwner host)
-    atomically (readReadiness (vulkanController host) >>= check . (== RootsReady))
-    [window] ← windowsOf host
-    -- A window with a publication and no target: nothing adopts it, so the
-    -- request is still queued when the session fails.
-    published ← publishTo host window 1
-    published `shouldBe` WindowScenePublished window 1
-    queued ← request host (VulkanAction (\_ → pure ()))
-    reportErrorNow rig "an error while a request waits"
-    atomically (readOwnerFailure (vulkanGraphicsOwner host) >>= check . isJust)
-    settled ← atomically (awaitVulkanAction queued)
-    later ← atomically (requestVulkanRelease (vulkanController host) (VulkanAction (\_ → pure ())))
-    atomically (writeTVar observed (Just (settledAs settled, either Just (const Nothing) later)))
-    checkRuntime control
-  case outcome of
-    Left _ → pure ()
-    Right _ → failWith "the run returned instead of failing with the session's failure"
-  readTVarIO observed
-    >>= (`shouldBe` Just (Just TerminalValidationError, Just (ActionSessionFailed TerminalValidationError)))
+  -- TEMPORARY (#438 diagnosis): phase markers and a watchdog that names the
+  -- wait this example is blocked in, and an optional pause that lets the
+  -- owner go idle before the error is reported.
+  started ← getMonotonicTime
+  phase ← newIORef "setup"
+  hostRef ← newIORef Nothing
+  ticketRef ← newIORef Nothing
+  pause ← maybe 0 read <$> lookupEnv "HET438_PRE_ERROR_DELAY_MS"
+  let at name = writeIORef phase name
+      dump = do
+        now ← getMonotonicTime
+        current ← readIORef phase
+        hPutStrLn stderr ("HET438-WATCHDOG phase=" <> current <> " elapsed=" <> show (now - started))
+        readIORef hostRef >>= \case
+          Nothing → hPutStrLn stderr "HET438-WATCHDOG host=not-yet-available"
+          Just host → do
+            readiness ← atomically (readReadiness (vulkanController host))
+            failure ← atomically (readOwnerFailure (vulkanGraphicsOwner host))
+            status ← atomically (readOwnerStatusNow (vulkanGraphicsOwner host))
+            terminal ← atomically (readVulkanTerminal (vulkanController host))
+            hPutStrLn stderr ("HET438-WATCHDOG readiness=" <> show readiness <> " ownerFailure=" <> show (isJust failure) <> " ownerRounds=" <> show (statusRounds status) <> " terminalLatched=" <> show (isJust (reportPrimary terminal)))
+            readIORef ticketRef >>= \case
+              Nothing → hPutStrLn stderr "HET438-WATCHDOG ticket=none-yet"
+              Just look → look >>= hPutStrLn stderr . ("HET438-WATCHDOG ticket=" <>)
+  bracket (forkIO (threadDelay 20000000 >> dump)) killThread $ \_ → do
+    rig ← withPerWindowScenes <$> surfaceFreeRig 1
+    observed ← newTVarIO Nothing
+    outcome ← runRigCaught rig $ \host control → (`finally` at "teardown") $ do
+      writeIORef hostRef (Just host)
+      at "supervise"
+      _ ← superviseGraphicsOwner control (vulkanGraphicsOwner host)
+      at "wait-ready"
+      atomically (readReadiness (vulkanController host) >>= check . (== RootsReady))
+      at "publish"
+      [window] ← windowsOf host
+      -- A window with a publication and no target: nothing adopts it, so the
+      -- request is still queued when the session fails.
+      published ← publishTo host window 1
+      published `shouldBe` WindowScenePublished window 1
+      at "request"
+      queued ← request host (VulkanAction (\_ → pure ()))
+      writeIORef ticketRef (Just (atomically (readVulkanAction queued) <&> maybe "queued-or-running" (\case ActionReturned _ → "returned"; ActionRaised _ → "raised"; ActionRefused refusal → "refused:" <> show refusal)))
+      when (pause > 0) (at "pause" >> threadDelay (pause * 1000))
+      at "report-error"
+      reportErrorNow rig "an error while a request waits"
+      at "wait-owner-failure"
+      atomically (readOwnerFailure (vulkanGraphicsOwner host) >>= check . isJust)
+      at "wait-settlement"
+      settled ← atomically (awaitVulkanAction queued)
+      at "later-request"
+      later ← atomically (requestVulkanRelease (vulkanController host) (VulkanAction (\_ → pure ())))
+      atomically (writeTVar observed (Just (settledAs settled, either Just (const Nothing) later)))
+      at "check-runtime"
+      checkRuntime control
+    at "after-teardown"
+    case outcome of
+      Left _ → pure ()
+      Right _ → failWith "the run returned instead of failing with the session's failure"
+    readTVarIO observed
+      >>= (`shouldBe` Just (Just TerminalValidationError, Just (ActionSessionFailed TerminalValidationError)))
   where
     settledAs = \case
       ActionRefused (ActionSessionFailed cause) → Just cause

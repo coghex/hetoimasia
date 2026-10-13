@@ -1,0 +1,126 @@
+# TEMPORARY (#438): bounded Linux stress batches for one integration example.
+#
+# The owner chose a pull-request-triggered stress workflow on the #438 branch,
+# on GitHub-hosted x86_64 runners and the CI image the validation workflow
+# uses, in place of a local Linux runner (which quruntul does not have). It is
+# removed before the final head. It publishes nothing and holds no secret.
+#
+# A batch is declared by committing `stress-438/batch.json` and nothing else
+# starts one: the workflow runs only when that file changes. Each declaration
+# names its revision's runs, seeds, external load, process concurrency and RTS
+# options before it executes; a batch that fails is kept, never rerun
+# unchanged.
+name: stress-438
+on:
+  pull_request:
+    paths:
+      - 'stress-438/batch.json'
+concurrency:
+  group: stress-438-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  declare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      image: ${{ steps.read.outputs.image }}
+      matrix: ${{ steps.read.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: read
+        run: |
+          set -euo pipefail
+          python3 -I - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          d = json.load(open("tools/ci-image/descriptor.json"))
+          print("image=%s@%s" % (d["reference"], d["digest"]))
+          b = json.load(open("stress-438/batch.json"))
+          print("matrix=" + json.dumps({"include": b["variants"]}))
+          PY
+          python3 -I -c 'import json; print(json.dumps(json.load(open("stress-438/batch.json")), indent=1))' >> "$GITHUB_STEP_SUMMARY"
+  build:
+    needs: declare
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    container:
+      image: ${{ needs.declare.outputs.image }}
+      options: --init
+    steps:
+      - uses: actions/checkout@v7
+      - run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - uses: actions/cache/restore@v6
+        with:
+          path: /opt/hetoimasia/cabal/store
+          key: stress-438-none-${{ github.sha }}
+          restore-keys: |
+            cabal-store-vulkan-
+      - uses: actions/cache/restore@v6
+        with:
+          path: dist-vulkan
+          key: stress-438-none-${{ github.sha }}
+          restore-keys: |
+            dist-vulkan-
+      - name: Build the integration suite
+        run: |
+          set -euo pipefail
+          {
+            echo "revision=$(git rev-parse HEAD)"
+            ghc --version
+            cabal --version
+            uname -a
+            nproc
+          } | tee toolchain.txt
+          bash tools/vulkan/run.sh build hetoimasia-gpu-vulkan-glfw:test:integration-tests
+          bin="$(find dist-vulkan -type f -name integration-tests -perm -u+x | head -1)"
+          test -n "$bin"
+          mkdir -p artifact
+          cp "$bin" artifact/integration-tests
+          cp toolchain.txt artifact/toolchain.txt
+      - uses: actions/upload-artifact@v7
+        with:
+          name: stress-438-binary
+          path: artifact
+          retention-days: 14
+  stress:
+    needs: [declare, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.declare.outputs.matrix) }}
+    container:
+      image: ${{ needs.declare.outputs.image }}
+      options: --init
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: stress-438-binary
+          path: artifact
+      - name: Run the declared variant
+        env:
+          VARIANT: ${{ toJSON(matrix) }}
+        run: |
+          set -uo pipefail
+          chmod +x artifact/integration-tests
+          bash stress-438/run-variant.sh "$VARIANT" "$PWD/artifact/integration-tests" "$PWD/evidence" "$PWD/packages/gpu-vulkan/glfw"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: stress-438-evidence-${{ matrix.name }}
+          path: evidence
+          retention-days: 90
+      - name: Fail a variant that must pass
+        run: |
+          set -euo pipefail
+          python3 -I - <<'PY'
+          import json, sys
+          s = json.load(open("evidence/summary.json"))
+          if s["mustPass"] and (s["failures"] or s["executed"] != s["declaredRuns"]):
+              sys.exit("variant %s must pass: %d failure(s), %d of %d runs executed" % (s["name"], s["failures"], s["executed"], s["declaredRuns"]))
+          PY
