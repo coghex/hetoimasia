@@ -799,15 +799,47 @@ depthRefusalSpec = describe "the D32_SFLOAT requirement, before anything is reco
       input ← depthFrame rig noCutoutMarks (Just Depth24) (onePass [viewAt (100, 100) (8, 8) [deepLayer]])
       fmap (const ()) (frameWork input) `shouldBe` Left (DepthFormatRefused (AtLayer 0 0 0) Depth24)
 
+  it "refuses a depth image whose format the backend holds as another than the maker declared, naming the layer, before recording anything" $
+    withRig $ \rig → do
+      renderer ← rendererOver rig 4096
+      -- A 24-bit depth image declared as D32_SFLOAT.
+      image ← target rig Rgba8Linear 16 16
+      lie ← depthTarget rig Depth24 16 16
+      let input snapshot = FrameInput snapshot noCutoutMarks (\_ → Just (TargetBinding image (offscreenAttachment Rgba8Linear 16 16) (Just (DepthBinding lie Depth32Float)))) Nothing Nothing
+          clearOnly = onePass [viewAt (0, 0) (16, 16) [WorldLayer DepthEnabled []]]
+      recorded rig renderer (input deepSnapshot) `shouldReturn` Left (DepthFormatRefused (AtLayer 0 0 1) Depth24)
+      recorded rig renderer (input clearOnly) `shouldReturn` Left (DepthFormatRefused (AtLayer 0 0 0) Depth24)
+      recorded rig renderer (input (onePass [viewAt (100, 100) (8, 8) [deepLayer]])) `shouldReturn` Left (DepthFormatRefused (AtLayer 0 0 0) Depth24)
+      commandsRecorded rig >>= (`shouldBe` [])
+      ringOffsets rig >>= (`shouldBe` [])
+      pipelinesMade rig >>= (`shouldBe` [])
+
+  it "refuses a depth-enabled layer wholly outside the target on a device that offers only X8_D24, though no depth image is supplied" $ do
+    rig ← newRigOffering [Depth24, Depth16]
+    renderer ← rendererOver rig 4096
+    input ← depthFrame rig noCutoutMarks Nothing (onePass [viewAt (100, 100) (8, 8) [deepLayer]])
+    recorded rig renderer input `shouldReturn` Left (DepthFormatRefused (AtLayer 0 0 0) Depth24)
+    commandsRecorded rig >>= (`shouldBe` [])
+
+  it "refuses a depth-enabled layer when the session offers no depth format at all" $ do
+    rig ← newRigOffering []
+    renderer ← rendererOver rig 4096
+    input ← depthFrame rig noCutoutMarks Nothing (onePass [viewAt (0, 0) (16, 16) [deepLayer]])
+    recorded rig renderer input `shouldReturn` Left (NoDepthFormat (AtLayer 0 0 0))
+    -- What has no such layer still records.
+    plain ← depthFrame rig noCutoutMarks Nothing (onePass [viewAt (0, 0) (16, 16) [UiLayer [spriteOf artHandle 0 1]]])
+    recorded rig renderer plain `shouldReturn` Right ()
+
   it "refuses at publication for a session's depth format, naming the first depth-enabled layer, and leaves a snapshot with none alone" $ do
     let twoDeep = onePass [viewAt (0, 0) (16, 16) [UiLayer [], deepLayer, deepLayer]]
         none = onePass [viewAt (0, 0) (16, 16) [UiLayer [], WorldLayer DepthDisabled []]]
     depthLayers twoDeep `shouldBe` [AtLayer 0 0 1, AtLayer 0 0 2]
-    requireWorldDepth Depth24 twoDeep `shouldBe` Left (DepthFormatRefused (AtLayer 0 0 1) Depth24)
-    requireWorldDepth Depth16 twoDeep `shouldBe` Left (DepthFormatRefused (AtLayer 0 0 1) Depth16)
-    requireWorldDepth Depth32Float twoDeep `shouldBe` Right ()
+    requireWorldDepth (Just Depth24) twoDeep `shouldBe` Left (DepthFormatRefused (AtLayer 0 0 1) Depth24)
+    requireWorldDepth (Just Depth16) twoDeep `shouldBe` Left (DepthFormatRefused (AtLayer 0 0 1) Depth16)
+    requireWorldDepth Nothing twoDeep `shouldBe` Left (NoDepthFormat (AtLayer 0 0 1))
+    requireWorldDepth (Just Depth32Float) twoDeep `shouldBe` Right ()
     depthLayers none `shouldBe` []
-    mapM_ (\format → requireWorldDepth format none `shouldBe` Right ()) [Depth32Float, Depth24, Depth16]
+    mapM_ (\format → requireWorldDepth format none `shouldBe` Right ()) [Just Depth32Float, Just Depth24, Just Depth16, Nothing]
 
   it "constructs the renderer and publishes and records a depth-free snapshot on a device that offers only X8_D24" $ do
     rig ← newRigOffering [Depth24, Depth16]
@@ -815,7 +847,7 @@ depthRefusalSpec = describe "the D32_SFLOAT requirement, before anything is reco
     let plain = onePass [viewAt (0, 0) (16, 16) [WorldLayer DepthDisabled [spriteOf artHandle 0 1], UiLayer [spriteOf artHandle 0 1]]]
     -- Marks alone change nothing about it, and no depth image is supplied.
     input ← depthFrame rig marked Nothing plain
-    requireWorldDepth Depth24 plain `shouldBe` Right ()
+    requireWorldDepth (Just Depth24) plain `shouldBe` Right ()
     recorded rig renderer input `shouldReturn` Right ()
     commands ← commandsRecorded rig
     length [() | CommandDraw {} ← commands] `shouldBe` 2

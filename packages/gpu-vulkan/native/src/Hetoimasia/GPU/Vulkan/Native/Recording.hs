@@ -336,6 +336,7 @@ module Hetoimasia.GPU.Vulkan.Native.Recording
   , depthTested
   , depthFormatPreference
   , selectDepthFormat
+  , imageFormatOf
   , DepthPass (..)
   , clearedDepth
   , defaultDepthClear
@@ -518,6 +519,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Construction
   , createPipelineWithDepth
   , createDepthCheckedPipeline
   , selectDepthFormat
+  , imageFormatOf
   , createReadback
   , createRing
   , createRingWith

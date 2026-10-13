@@ -154,6 +154,7 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , depthTested
   , depthFormatPreference
   , constructDepthFormat
+  , constructImageFormat
   , constructDepthCheckedPipeline
 
     -- * Uploads (GRS-6)
@@ -378,6 +379,7 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , constructBlendedCheckedPipeline
   , constructDepthCheckedPipeline
   , constructDepthFormat
+  , constructImageFormat
   , replaceConstructedCheckedPipeline
   , replaceConstructedPipeline
   , releaseConstructed

@@ -24,7 +24,12 @@
 -- refused ('NoDepthTarget'), and so is a pass holding such a layer whose
 -- supplied depth image has another format ('DepthFormatRefused'), each naming
 -- the layer. 'requireWorldDepth' is the same rule for a session's depth format,
--- for a host to apply when it publishes a snapshot.
+-- which 'Hetoimasia.Render.TwoD.Vulkan.prepareSnapshot' applies to every snapshot
+-- before it looks at a single pass, and a host applies when it publishes one.
+-- A 'DepthBinding' names an image and the format its maker declared; the
+-- recorder's 'prepareSnapshot' replaces the declaration with the format the
+-- backend holds for the image before it works the frame out, so a false
+-- declaration is refused, naming the layer, like any other.
 --
 -- = Targets and metrics
 --
@@ -183,12 +188,14 @@ depthLayers valid =
   , (layerIndex, WorldLayer DepthEnabled _) ← zip [0 ..] (viewLayers view)
   ]
 
--- | The rule for a session whose depth format is this one (D-23): a snapshot
--- holding a depth-enabled world layer is refused, naming the first, unless the
+-- | The rule for a session whose depth format is this one, or that offers none
+-- ('Nothing') (D-23): a snapshot holding a depth-enabled world layer, in a view
+-- whose scissor may be empty or not, is refused, naming the first, unless the
 -- format is @D32_SFLOAT@; a snapshot with none is unaffected on any device.
-requireWorldDepth ∷ ImageFormat → ValidSnapshot → Either FrameRefusal ()
-requireWorldDepth format valid = case depthLayers valid of
-  location : _ | format /= Depth32Float → Left (DepthFormatRefused location format)
+requireWorldDepth ∷ Maybe ImageFormat → ValidSnapshot → Either FrameRefusal ()
+requireWorldDepth format valid = case (depthLayers valid, format) of
+  (location : _, Nothing) → Left (NoDepthFormat location)
+  (location : _, Just held) | held /= Depth32Float → Left (DepthFormatRefused location held)
   _ → Right ()
 
 -- | Why a frame was refused, before anything was recorded.
@@ -212,8 +219,10 @@ data FrameRefusal
     -- layer, was given none.
     NoDepthTarget !Location
   | -- | A depth-enabled world layer needs @D32_SFLOAT@ and the depth image
-    -- supplied has this format (D-23).
+    -- supplied, or the session's depth format, is this one (D-23).
     DepthFormatRefused !Location !ImageFormat
+  | -- | A depth-enabled world layer, and the session offers no depth format.
+    NoDepthFormat !Location
   | -- | The backend refused a construction, a claim or a command.
     RefusedByBackend !Refusal
   deriving (Eq, Show)

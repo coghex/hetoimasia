@@ -75,6 +75,7 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , constructDepthCheckedPipeline
   , constructDepthFormat
   , constructImage
+  , constructImageFormat
   , constructReadback
   , constructRing
   , constructShaderSampledTablePipelineLayout
@@ -284,6 +285,8 @@ builders construction =
     , Render.buildTableLayout = constructShaderSampledTablePipelineLayout construction
     , Render.buildPipeline = constructBlendedCheckedPipeline construction
     , Render.buildDepthPipeline = constructDepthCheckedPipeline construction
+    , Render.buildDepthFormat = constructDepthFormat construction
+    , Render.buildImageFormat = constructImageFormat construction
     }
 
 -- | What the recorder gives a depth-enabled snapshot over a depth image of a

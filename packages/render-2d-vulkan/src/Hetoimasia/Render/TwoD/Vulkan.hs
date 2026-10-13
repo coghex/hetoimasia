@@ -105,6 +105,7 @@ module Hetoimasia.Render.TwoD.Vulkan
 
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import qualified Data.ByteString as ByteString
+import Control.Applicative ((<|>))
 import Data.List (mapAccumL, nub)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust, listToMaybe)
@@ -114,6 +115,7 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , CompareOp (..)
   , ImageFormat (..)
   , PassStart (..)
+  , Image
   , Pipeline
   , PipelineBlend (..)
   , PipelineDepth (..)
@@ -149,7 +151,8 @@ import Hetoimasia.GPU.Vulkan.Native.TextureTable
   , defaultVersionCount
   , validateTableConfig
   )
-import Hetoimasia.Render.TwoD.Validation (Location (..))
+import Hetoimasia.Render.TwoD.Snapshot (Pass (..), Snapshot (..), Target (..))
+import Hetoimasia.Render.TwoD.Validation (Location (..), validSnapshot)
 import Hetoimasia.Render.TwoD.Vulkan.Frame
 import Hetoimasia.Render.TwoD.Vulkan.Layout (instanceStride)
 import Hetoimasia.Render.TwoD.Vulkan.Shaders (cutoutShaders, orderedShaders)
@@ -168,6 +171,11 @@ data Builders q inst msgr phys dev cmd = Builders
     -- declares no depth.
   , buildDepthPipeline ∷ PipelineLayout → CheckedShaders → Word32 → PipelineBlend → PipelineDepth → IO (Either Refusal Pipeline)
     -- ^ The same, declaring the depth a pass with a depth attachment has.
+  , buildDepthFormat ∷ IO (Either Refusal ImageFormat)
+    -- ^ The session's depth format: what the backend chooses for depth targets.
+  , buildImageFormat ∷ Image → IO (Either Refusal ImageFormat)
+    -- ^ The format the backend holds for a live image, which a depth image's
+    -- maker's declaration is checked against.
   }
 
 -- | What the renderer makes with: the session's ring and its texture table.
@@ -188,6 +196,8 @@ defaultConfiguration =
 -- made for each colour format and kind.
 data Renderer = Renderer
   { rendererLayout ∷ !PipelineLayout
+  , rendererDepthFormat ∷ !(Maybe ImageFormat)
+    -- ^ The session's depth format, if it offers one.
   , rendererPipelines ∷ !(IORef (Map.Map (Word32, PipelineKind) Pipeline))
   }
 
@@ -202,7 +212,11 @@ makeRenderer builders configuration =
         Right () →
           buildTableLayout builders orderedShaders >>= \case
             Left refusal → pure (Left refusal)
-            Right layout → Right . Renderer layout <$> newIORef Map.empty
+            Right layout → do
+              -- A session that offers no depth format still renders what has no
+              -- depth-enabled world layer.
+              depth ← either (const Nothing) Just <$> buildDepthFormat builders
+              Right . Renderer layout depth <$> newIORef Map.empty
 
 -- | The depth a kind of pipeline declares: none for 'PlainPipeline', otherwise
 -- @D32_SFLOAT@ (D-23), tested less-or-equal, and written only by the cutout
@@ -243,7 +257,38 @@ claimAlignment = 16
 -- batch records. A refusal names where and records nothing; otherwise what is
 -- returned records the frame.
 prepareSnapshot ∷ Builders q inst msgr phys dev cmd → Renderer → FrameInput → IO (Either FrameRefusal (FrameRecording q inst msgr phys dev cmd))
-prepareSnapshot builders renderer input = case frameWork input of
+prepareSnapshot builders renderer declared =
+  case requireWorldDepth (rendererDepthFormat renderer) (frameSnapshot declared) of
+    Left refusal → pure (Left refusal)
+    Right () →
+      verifiedDepth builders declared >>= \case
+        Left refusal → pure (Left refusal)
+        Right input → prepareVerified builders renderer input
+
+-- | The frame with the format of every depth image it supplies replaced by the
+-- one the backend holds for it, so what the work is decided on is the image's,
+-- not its maker's word. A depth image the backend no longer holds is the
+-- backend's refusal.
+verifiedDepth ∷ Builders q inst msgr phys dev cmd → FrameInput → IO (Either FrameRefusal FrameInput)
+verifiedDepth builders input = do
+  let references = nub [reference | Pass (OffscreenTarget reference) _ _ ← snapshotPasses (validSnapshot (frameSnapshot input))]
+      supplied = [(reference, depth) | reference ← references, Just binding ← [frameTarget input reference], Just depth ← [bindingDepth binding]]
+  checked ← traverse (\(reference, depth) → fmap ((,) reference) <$> actually depth) supplied
+  window ← traverse actually (frameWindowDepth input)
+  pure $ do
+    found ← either (Left . RefusedByBackend) Right (sequence checked)
+    windowed ← either (Left . RefusedByBackend) Right (sequence window)
+    let byReference = Map.fromList found
+    Right
+      input
+        { frameTarget = \reference → (\binding → binding {bindingDepth = Map.lookup reference byReference <|> bindingDepth binding}) <$> frameTarget input reference
+        , frameWindowDepth = windowed
+        }
+  where
+    actually depth = fmap (\format → depth {depthFormat = format}) <$> buildImageFormat builders (depthImage depth)
+
+prepareVerified ∷ Builders q inst msgr phys dev cmd → Renderer → FrameInput → IO (Either FrameRefusal (FrameRecording q inst msgr phys dev cmd))
+prepareVerified builders renderer input = case frameWork input of
   Left refusal → pure (Left refusal)
   Right passes → do
     let needed = nub [(attachmentFormat (workAttachment pass), kind) | pass ← passes, kind ← kindsOf pass]

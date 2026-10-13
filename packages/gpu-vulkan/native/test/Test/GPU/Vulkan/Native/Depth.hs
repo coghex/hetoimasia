@@ -124,6 +124,20 @@ spec = describe "Depth attachments" $ do
       -- before it was asked.
       queriesOf rig `shouldReturn` [ImageQuery (formatCode Depth24) depthUsage depthFeatures]
 
+  describe "the format of an image" $ do
+    it "is the one the backend made it with, whatever its kind, and a released or foreign handle has none" $ do
+      rig ← newRig
+      foreignRig ← newRig
+      depth ← createImage (rigRecording rig) (ImageDescription DepthTarget Depth24 32 16 1) >>= either (fail . show) pure
+      colour ← createImage (rigRecording rig) (ImageDescription ColorTarget Rgba8Srgb 32 16 1) >>= either (fail . show) pure
+      released ← createImage (rigRecording rig) (ImageDescription DepthTarget Depth32Float 32 16 1) >>= either (fail . show) pure
+      foreignDepth ← createImage (rigRecording foreignRig) (ImageDescription DepthTarget Depth32Float 32 16 1) >>= either (fail . show) pure
+      _ ← releaseManaged (rigRecording rig) released
+      imageFormatOf (rigRecording rig) depth `shouldReturn` Right Depth24
+      imageFormatOf (rigRecording rig) colour `shouldReturn` Right Rgba8Srgb
+      answers ← traverse (imageFormatOf (rigRecording rig)) [released, foreignDepth]
+      map (either (const True) (const False)) answers `shouldBe` [True, True]
+
   describe "depth in passes" $ do
     it "begins a pass in a frame batch with the depth target's view cleared to 1.0 unless given another value, and a pass with no depth attachment with none" $ do
       rig ← newRig

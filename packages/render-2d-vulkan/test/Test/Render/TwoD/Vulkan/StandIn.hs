@@ -144,6 +144,8 @@ builders rig =
     , Render.buildTableLayout = createShaderSampledTablePipelineLayout (rigRecording rig)
     , Render.buildPipeline = createBlendedCheckedPipeline (rigRecording rig)
     , Render.buildDepthPipeline = createDepthCheckedPipeline (rigRecording rig)
+    , Render.buildDepthFormat = selectDepthFormat (rigRecording rig)
+    , Render.buildImageFormat = imageFormatOf (rigRecording rig)
     }
 
 -- | A colour target of this format and extent, made as the backend makes one.
