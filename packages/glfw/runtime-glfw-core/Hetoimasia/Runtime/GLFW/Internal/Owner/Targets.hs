@@ -26,8 +26,11 @@ import Hetoimasia.Runtime.GLFW.Internal.Owner.Handoff
   ( TargetEvent (..)
   , TargetObservation (..)
   , noTargetGeometry
+  , observationContentScale
   , observationFramebuffer
+  , observationLogical
   , observeGeometry
+  , observeWindowMetrics
   , readTargetObservations
   , takeTargetEvents
   )
@@ -167,9 +170,13 @@ foldObservations owner = atomically $ do
     foldGeometry held (target, observation) =
       Map.insert
         target
-        ( observeGeometry
-            (observationFramebuffer observation)
-            (targetBounds observation)
-            (Map.findWithDefault noTargetGeometry target held)
+        ( observeWindowMetrics
+            (observationLogical observation)
+            (observationContentScale observation)
+            ( observeGeometry
+                (observationFramebuffer observation)
+                (targetBounds observation)
+                (Map.findWithDefault noTargetGeometry target held)
+            )
         )
         held

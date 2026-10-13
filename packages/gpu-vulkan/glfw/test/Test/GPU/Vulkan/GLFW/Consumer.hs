@@ -101,6 +101,9 @@ spec = describe "Vulkan consumer rendering and capture" $ do
     itBounded "names no depth image in any frame's request and makes none when the host did not ask" testNoWindowDepth
     itBounded "names each frame's generation's depth image in its request, the same one for a generation's frames, gives a replacement its own and destroys each with its generation" testWindowDepth
 
+  describe "the window's own geometry (R2D-8)" $ do
+    itBounded "names the window's logical extent and per-axis content scale in each request, from its latest observation and apart from the generation's framebuffer extent" testWindowMetrics
+
   describe "consumer teardown" $ do
     itBounded "destroys what the consumer built, pipeline before layout, before the device on the host's normal exit, with a clean verdict" testNormalTeardown
     itBounded "destroys what the consumer built before the device on a terminal exit, with the validation error primary" testTerminalTeardown
@@ -237,6 +240,40 @@ testWindowDepth = do
   map fst made `shouldSatisfy` all (`elem` gone)
   commands ← map snd <$> commandsRecorded rig
   [clear | CommandBeginRendering _ _ _ (Just clear) ← commands] `shouldSatisfy` (not . null)
+
+-- | A window's request names the logical extent and the content scale of its
+-- target's latest observation — what the scripted platform answered when the
+-- window was sampled — whatever the generation's framebuffer extent is: here
+-- the platform's own logical 800 by 600 at content scale 2 by 2 over a 640 by
+-- 480 framebuffer, then a logical 400 by 300 at the unequal scales 1.5 by
+-- 2.25 with the framebuffer, and so the request's extent, unchanged.
+testWindowMetrics ∷ IO ()
+testWindowMetrics = do
+  rig ← visibleRig
+  seen ← newTVarIO []
+  renderWith rig $ VulkanRenderer $ \_ request _ recorder → do
+    atomically (modifyTVar' seen (<> [request]))
+    chain [beginRendering recorder (ClearColor 0 0 0 1), endRendering recorder]
+  runRig rig $ \host control → do
+    [window] ← windowsOf host
+    service ← firstFrame rig host control window
+    demandFrame host window
+    composedUntil rig host control "a second frame" (\_ → pure ()) ((>= 2) <$> presentsOf rig (graphicsAttachment service))
+    setWindowMetrics rig host window (400, 300) (1.5, 2.25)
+    demandFrame host window
+    composedUntil rig host control "a frame of the changed observation" (\_ → demandFrame host window) $
+      any ((== Just (400, 300)) . requestLogicalExtent) <$> readTVarIO seen
+    pure ()
+  requests ← readTVarIO seen
+  -- The first frames carry what the platform answered at the start; none
+  -- carries a value the platform did not report.
+  take 1 [(requestLogicalExtent request, requestContentScale request) | request ← requests] `shouldBe` [(Just (800, 600), Just (2, 2))]
+  -- The changed observation reaches a later frame whole: both extents' axes
+  -- and both scale axes, unequal.
+  [(requestLogicalExtent request, requestContentScale request) | request ← requests, requestLogicalExtent request == Just (400, 300)]
+    `shouldSatisfy` (\found → not (null found) && all (== (Just (400, 300), Just (1.5, 2.25))) found)
+  -- The framebuffer extent of the generation is its own, not derived from them.
+  map requestExtent requests `shouldSatisfy` all (== SurfaceExtent 640 480)
 
 -- | The distinct items, in the order they first appear.
 nubOrdered ∷ Eq a ⇒ [a] → [a]
