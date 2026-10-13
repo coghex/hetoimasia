@@ -2,6 +2,7 @@
 module Test.Render.TwoD.Spec (spec) where
 
 import qualified Test.Render.TwoD.Clip as Clip
+import qualified Test.Render.TwoD.Chunks as Chunks
 import qualified Test.Render.TwoD.DrawPlan as DrawPlan
 import qualified Test.Render.TwoD.Encoding as Encoding
 import qualified Test.Render.TwoD.Flags as Flags
@@ -21,5 +22,6 @@ spec = describe "TwoD" $ do
   Snapping.spec
   Encoding.spec
   DrawPlan.spec
+  Chunks.spec
   Flags.spec
   Opacity.spec

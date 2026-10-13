@@ -67,7 +67,7 @@ library
 
 -- This package's own contracts, registered as the CPU validation group
 -- `test.render-2d-oracle`. The library depends on no GPU, GLFW, Vulkan,
--- runtime or Lua package; Hspec is the suite's alone.
+-- runtime or Lua package; Hspec and QuickCheck are the suite's alone.
 test-suite render-2d-oracle-tests
     import: language
     type: exitcode-stdio-1.0
@@ -75,6 +75,7 @@ test-suite render-2d-oracle-tests
     hs-source-dirs: test
     other-modules:
         Test.Render.TwoD.Oracle.Clip
+        Test.Render.TwoD.Oracle.Chunks
         Test.Render.TwoD.Oracle.Colour
         Test.Render.TwoD.Oracle.Depth
         Test.Render.TwoD.Oracle.Placement
@@ -88,6 +89,7 @@ test-suite render-2d-oracle-tests
         bytestring >=0.12 && <0.13,
         containers >=0.8 && <0.9,
         hspec >=2.11 && <3,
+        QuickCheck >=2.15 && <2.19,
         hetoimasia-asset ==0.1.0.0,
         hetoimasia-math ==0.1.0.0,
         hetoimasia-render-2d ==0.1.0.0,

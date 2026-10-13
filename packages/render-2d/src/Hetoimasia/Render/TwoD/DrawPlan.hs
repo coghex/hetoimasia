@@ -33,6 +33,33 @@
 -- equal key an ordered-path instance draws after, and so over, a cutout. An
 -- adapter that needs a guaranteed winner gives distinct keys.
 --
+-- __Chunks__ (R2D-10, decisions D-1, D-31). A layer may list retained chunks
+-- beside its dynamic instances ("Hetoimasia.Render.TwoD.Chunk"). A chunk's
+-- routing was fixed when it was built, so planning never routes it again. The
+-- /source order/ of a layer's content is: its chunks in the order it lists
+-- them, each listing in the chunk's build order, then its dynamic instances in
+-- submission order. A chunk listed twice contributes at both places. The order
+-- is total and repeatable, and it ties every comparison below:
+--
+-- * the cutout runs come first, ordered by material and then by source order,
+--   so within a material each chunk listing's cutouts draw as one run from the
+--   chunk's own buffer ('ChunkRun'), in listing order, and the dynamic cutouts
+--   follow as one run from the frame's ring ('RingRun'); a later source
+--   therefore wins an equal-depth tie among cutouts;
+-- * the ordered-path instances of the chunks and the dynamic instances are merged
+--   into the one ordered run, by ascending depth key and then source order,
+--   and are written to the ring each frame in that order; and since the ordered
+--   instances draw after every cutout, an ordered instance at an equal key draws
+--   over a cutout.
+--
+-- A zero-size viewport plans nothing from chunks either.
+--
+-- __Culling.__ 'planSnapshotCulled' takes a 'ChunkCuller', which says for a pass
+-- and a view whether a chunk of a given kind and bounds lies wholly outside the
+-- view ("Hetoimasia.Render.TwoD.Culling" is the rule). A culled listing
+-- contributes nothing to the plan, which is otherwise exactly the plan without
+-- it, and is named in 'plannedCulled'. 'planSnapshot' culls nothing.
+--
 -- __Runs.__ Consecutive instances in the drawing order share a run when they
 -- share a path and a material. A sampler, tint, flag other than the routing
 -- ones, depth key, transform, UV rectangle or material parameter word never
@@ -55,18 +82,23 @@
 -- lookup index.
 --
 -- __Cost.__ Planning is pure and total over a validated snapshot. A layer's
--- instances are sorted once, in O(n log n) in the layer's instance count; the
--- one structure the plan keeps per instance is the permutation, an unboxed
--- array of that many indices.
+-- instances, and the ordered instances of its chunks, are sorted once, in
+-- O(n log n) in their count (a chunk's ordered instances are held sorted, so the
+-- sort meets presorted runs); the plan keeps per instance only two unboxed
+-- arrays of indices, the permutation and where each index points. A chunk's
+-- cutout instances are not in them: they are not rewritten.
 --
 -- __Dependencies.__ @base@, @array@ for the permutation, @containers@ for the
--- set of marked handles, @hetoimasia-render-api@ for the handle, and this
--- package's clip, snapshot and validation modules.
+-- chunks of a layer, @hetoimasia-render-api@ for the handle, and this package's
+-- clip, snapshot, validation, chunk and routing modules.
 --
 -- __State.__ The module owns none.
 module Hetoimasia.Render.TwoD.DrawPlan
   ( -- * Planning
     planSnapshot
+  , planSnapshotCulled
+  , ChunkCuller
+  , noCulling
 
     -- * Marks
   , CutoutMarks
@@ -82,19 +114,33 @@ module Hetoimasia.Render.TwoD.DrawPlan
   , LayerSpace (..)
   , DrawRun (..)
   , DrawPath (..)
+  , RunSource (..)
+  , InstanceSource (..)
   , Material (..)
   , materialCutoutCapable
   , drawingOrder
+  , drawingSources
   , runIndices
   ) where
 
+import qualified Data.Array as Array
 import Data.Array.Unboxed (UArray, elems, listArray)
 import Data.List (partition, sortOn)
-import Data.Set (Set)
-import qualified Data.Set as Set
+import qualified Data.Map.Strict as Map
 import Hetoimasia.Math.Vector (V2 (..))
-import Hetoimasia.Render.Api.Texture (TextureHandle)
 import Hetoimasia.Render.TwoD.Clip (ResolvedClip, resolveClips)
+import Hetoimasia.Render.TwoD.Internal.Chunk (Bounds, Chunk (..), ChunkKind, layerChunkKind)
+import Hetoimasia.Render.TwoD.Internal.ChunkRef (ChunkRef)
+import Hetoimasia.Render.TwoD.Internal.Routing
+  ( CutoutMarks
+  , Material (..)
+  , cutoutMarks
+  , instanceMaterialOf
+  , isMarkedCutout
+  , materialCutoutCapable
+  , noCutoutMarks
+  , routesToCutout
+  )
 import Hetoimasia.Render.TwoD.Settings (ViewSettings)
 import Hetoimasia.Render.TwoD.Snapshot
   ( Camera
@@ -105,29 +151,18 @@ import Hetoimasia.Render.TwoD.Snapshot
   , Pass (..)
   , Snapshot (..)
   , Target
-  , Tint (..)
   , View (..)
   , Viewport (..)
   , layerInstances
   )
-import Hetoimasia.Render.TwoD.Validation (Location (..), ValidSnapshot, validSnapshot)
-
--- | The textures marked cutout-safe, each by its complete handle, generation
--- included. A handle that is not in the set is unmarked.
-newtype CutoutMarks = CutoutMarks (Set TextureHandle)
-  deriving stock (Eq, Show)
-
--- | The marks naming exactly these handles as cutout-safe.
-cutoutMarks ∷ [TextureHandle] → CutoutMarks
-cutoutMarks = CutoutMarks . Set.fromList
-
--- | No texture is marked: every instance takes the ordered path.
-noCutoutMarks ∷ CutoutMarks
-noCutoutMarks = CutoutMarks Set.empty
-
--- | Whether this exact handle, generation included, is marked cutout-safe.
-isMarkedCutout ∷ CutoutMarks → TextureHandle → Bool
-isMarkedCutout (CutoutMarks marked) handle = Set.member handle marked
+import Hetoimasia.Render.TwoD.Validation
+  ( Location (..)
+  , ValidSnapshot
+  , validLayerChunks
+  , validLayerLocation
+  , validLayers
+  , validSnapshot
+  )
 
 -- | The path a run draws in.
 data DrawPath
@@ -138,21 +173,34 @@ data DrawPath
     Ordered
   deriving stock (Eq, Ord, Show, Enum, Bounded)
 
--- | The material a run draws with. Application materials, and how an instance
--- names one, arrive later (R2D-11); until then every instance uses the
--- built-in default.
-data Material = DefaultMaterial
-  deriving stock (Eq, Ord, Show, Enum, Bounded)
+-- | Where a run's instances are read from.
+data RunSource
+  = -- | The frame's ring: the run's range of the layer's drawing order, written
+    -- each frame.
+    RingRun
+  | -- | A chunk listing's own device buffer, from the first instance it holds
+    -- for the run's range: the position of the listing in the layer's chunk
+    -- list.
+    ChunkRun !Int
+  deriving stock (Eq, Ord, Show)
 
--- | Whether a material routes to the cutout path: its output alpha is binary
--- wherever its primary texture's is. The built-in default is.
-materialCutoutCapable ∷ Material → Bool
-materialCutoutCapable DefaultMaterial = True
+-- | Where an instance of a layer's drawing order comes from.
+data InstanceSource
+  = -- | The layer's dynamic instance at this submission index.
+    DynamicInstance !Int
+  | -- | The instance at this build position of the chunk listed at this position.
+    ChunkInstance !Int !Int
+  deriving stock (Eq, Ord, Show)
 
--- | The material an instance draws with. Until application materials exist,
--- the built-in default for every instance.
-instanceMaterialOf ∷ Instance → Material
-instanceMaterialOf _ = DefaultMaterial
+-- | Whether the chunk of this reference, kind, bounds and placement magnitude
+-- ('Hetoimasia.Render.TwoD.Chunk.chunkPlacementMagnitude') is skipped for the view
+-- at this pass and view index. A backend may skip a chunk for a reason of its own,
+-- by reference, as well as by bounds.
+type ChunkCuller = Int → Int → ChunkRef → ChunkKind → Bounds → Double → Bool
+
+-- | The culler that skips nothing.
+noCulling ∷ ChunkCuller
+noCulling _ _ _ _ _ _ = False
 
 -- | A frame's draw plan: the snapshot's passes, in order.
 newtype DrawPlan = DrawPlan
@@ -198,83 +246,128 @@ data PlannedLayer = PlannedLayer
   -- world layer with depth enabled does, whether or not any of its instances
   -- takes the cutout path.
   , plannedOrder ∷ !(UArray Int Int)
-  -- ^ The permutation of the layer's submission indices that is its drawing
-  -- order. Empty in a zero-size viewport.
+  -- ^ The permutation of the layer's instances that is the order the ring
+  -- holds them in: each entry is a submission index of the layer's dynamic
+  -- instances or, where 'plannedOrigin' says so, a build position in a chunk.
+  -- Empty in a zero-size viewport. For a layer that lists no chunk, the
+  -- layer's whole drawing order.
+  , plannedOrigin ∷ !(UArray Int Int)
+  -- ^ For each entry of 'plannedOrder', @-1@ when it is a dynamic instance's
+  -- submission index and otherwise the position in the layer's chunk list of
+  -- the listing it is a build position in.
+  , plannedCulled ∷ ![Int]
+  -- ^ The positions in the layer's chunk list of the listings the culler
+  -- skipped for the view, in listing order.
   , plannedRuns ∷ ![DrawRun]
-  -- ^ The runs, in drawing order. They partition 'plannedOrder'.
+  -- ^ The runs, in drawing order. Those that read the ring ('RingRun')
+  -- partition 'plannedOrder', in order; the cutout runs of a chunk read the
+  -- chunk's own buffer ('ChunkRun') and are not in it.
   }
   deriving stock (Eq, Show)
 
--- | A contiguous range of a layer's drawing order sharing a path and a
--- material.
+-- | A contiguous range of instances sharing a path and a material.
 data DrawRun = DrawRun
   { runPath ∷ !DrawPath
   , runMaterial ∷ !Material
   , runStart ∷ !Int
-  -- ^ The position in 'plannedOrder' of the run's first instance.
+  -- ^ The position in 'plannedOrder' of the run's first instance for a
+  -- 'RingRun'; for a 'ChunkRun', the position in the chunk's cutout order
+  -- (which its buffer follows) of the first.
   , runCount ∷ !Int
   -- ^ The number of instances; always at least one.
+  , runSource ∷ !RunSource
   }
   deriving stock (Eq, Show)
 
--- | A layer's submission indices in drawing order.
+-- | A layer's ring entries in drawing order: for a layer that lists no chunk,
+-- its submission indices.
 drawingOrder ∷ PlannedLayer → [Int]
 drawingOrder = elems . plannedOrder
 
--- | The submission indices a run draws, in drawing order.
-runIndices ∷ PlannedLayer → DrawRun → [Int]
-runIndices layer run = take (runCount run) (drop (runStart run) (drawingOrder layer))
+-- | Where each entry of the layer's drawing order comes from.
+drawingSources ∷ PlannedLayer → [InstanceSource]
+drawingSources layer = zipWith source (elems (plannedOrigin layer)) (elems (plannedOrder layer))
+  where
+    source origin index
+      | origin < 0 = DynamicInstance index
+      | otherwise = ChunkInstance origin index
 
--- | Plan a validated snapshot against the textures' cutout marks.
+-- | The entries of 'plannedOrder' a run draws, in drawing order. A chunk's run
+-- reads the chunk's buffer and holds none.
+runIndices ∷ PlannedLayer → DrawRun → [Int]
+runIndices layer run = case runSource run of
+  RingRun → take (runCount run) (drop (runStart run) (drawingOrder layer))
+  ChunkRun _ → []
+
+-- | Plan a validated snapshot against the textures' cutout marks, culling no
+-- chunk.
 planSnapshot ∷ CutoutMarks → ValidSnapshot → DrawPlan
-planSnapshot marks valid =
+planSnapshot = planSnapshotCulled noCulling
+
+-- | Plan a validated snapshot against the textures' cutout marks, leaving out
+-- the chunk listings the culler skips for each view.
+planSnapshotCulled ∷ ChunkCuller → CutoutMarks → ValidSnapshot → DrawPlan
+planSnapshotCulled culls marks valid =
   DrawPlan
-    [ planPass marks passIndex pass
+    [ planPass culls chunksOf marks passIndex pass
     | (passIndex, pass) ← zip [0 ..] (snapshotPasses (validSnapshot valid))
     ]
+  where
+    chunksOf = Map.fromList [((pass, view, layer), validLayerChunks held) | held ← validLayers valid, AtLayer pass view layer ← [validLayerLocation held]]
 
-planPass ∷ CutoutMarks → Int → Pass → PlannedPass
-planPass marks passIndex pass =
+type ChunksOf = Map.Map (Int, Int, Int) [(ChunkRef, Chunk)]
+
+planPass ∷ ChunkCuller → ChunksOf → CutoutMarks → Int → Pass → PlannedPass
+planPass culls chunksOf marks passIndex pass =
   PlannedPass
     { plannedTarget = passTarget pass
     , plannedClear = passClear pass
     , plannedViews =
-        [planView marks passIndex viewIndex view | (viewIndex, view) ← zip [0 ..] (passViews pass)]
+        [planView culls chunksOf marks passIndex viewIndex view | (viewIndex, view) ← zip [0 ..] (passViews pass)]
     }
 
-planView ∷ CutoutMarks → Int → Int → View → PlannedView
-planView marks passIndex viewIndex view =
+planView ∷ ChunkCuller → ChunksOf → CutoutMarks → Int → Int → View → PlannedView
+planView culls chunksOf marks passIndex viewIndex view =
   PlannedView
     { plannedCamera = viewCamera view
     , plannedViewport = viewViewport view
     , plannedSettings = viewSettings view
     , plannedClips = resolveClips (viewClips view)
     , plannedLayers =
-        [ planLayer marks (viewViewport view) (AtLayer passIndex viewIndex layerIndex) layer
+        [ planLayer (culls passIndex viewIndex) marks (viewViewport view) (AtLayer passIndex viewIndex layerIndex) layer (Map.findWithDefault [] (passIndex, viewIndex, layerIndex) chunksOf)
         | (layerIndex, layer) ← zip [0 ..] (viewLayers view)
         ]
     }
 
-planLayer ∷ CutoutMarks → Viewport → Location → Layer → PlannedLayer
-planLayer marks viewport location layer =
-  -- Both fields that read the drawing order are evaluated before the layer
-  -- exists, and neither is a thunk: nothing the plan returns still refers to the
+planLayer ∷ (ChunkRef → ChunkKind → Bounds → Double → Bool) → CutoutMarks → Viewport → Location → Layer → [(ChunkRef, Chunk)] → PlannedLayer
+planLayer culls marks viewport location layer chunks =
+  -- Every field that reads the drawing order is evaluated before the layer
+  -- exists, and none is a thunk: nothing the plan returns still refers to the
   -- per-instance list, so only the permutation is kept.
   PlannedLayer
     { plannedLocation = location
     , plannedSpace = space
     , plannedClearsDepth = clearsDepth
-    , plannedOrder = listArray (0, length order - 1) (map fst order)
-    , plannedRuns = spineStrict (runsOf (map snd order))
+    , plannedOrder = listArray (0, length ringEntries - 1) [index | (_, index, _) ← ringEntries]
+    , plannedOrigin = listArray (0, length ringEntries - 1) [origin | (origin, _, _) ← ringEntries]
+    , plannedCulled = spineStrict culled
+    , plannedRuns = spineStrict runs
     }
   where
     (space, clearsDepth) = case layer of
-      WorldLayer depth _ → (WorldSpace depth, depth == DepthEnabled)
-      UiLayer _ → (UiSpace, False)
+      WorldLayerWith depth _ _ → (WorldSpace depth, depth == DepthEnabled)
+      UiLayerWith _ _ → (UiSpace, False)
+    kind = layerChunkKind layer
     -- A zero-size viewport draws nothing, so it holds no order and no runs.
-    order
-      | emptyViewport viewport = []
-      | otherwise = drawOrder marks clearsDepth (layerInstances layer)
+    drawn = not (emptyViewport viewport)
+    listings = zip [0 ..] (map snd chunks)
+    (skipped, live)
+      | drawn = partition (\(position, held) → culls (fst (chunks !! position)) kind (chunkBoundsField held) (chunkMagnitudeField held)) listings
+      | otherwise = ([], [])
+    culled = map fst skipped
+    (ringEntries, runs)
+      | drawn = arrange marks clearsDepth live (layerInstances layer)
+      | otherwise = ([], [])
 
 -- | The list with its spine and elements evaluated, so no unevaluated tail
 -- keeps what produced it alive.
@@ -284,38 +377,67 @@ spineStrict items = foldr seq () items `seq` items
 emptyViewport ∷ Viewport → Bool
 emptyViewport (Viewport _ (V2 width height)) = width == 0 || height == 0
 
--- | The layer's drawing order: each submission index with the path and material
--- it draws in. The cutouts come first, by material and then submission
--- sequence; the ordered instances follow, by depth key and then submission
--- sequence. The index is the sequence, so it breaks every tie.
-drawOrder ∷ CutoutMarks → Bool → [Instance] → [(Int, (DrawPath, Material))]
-drawOrder marks depthEnabled instances =
-  map cutoutEntry (sortOn (\(index, candidate) → (instanceMaterialOf candidate, index)) cutouts)
-    <> map orderedEntry (sortOn (\(index, candidate) → (instanceDepthKey candidate, index)) ordered)
+-- | The ring's entries of a layer — each as its origin (@-1@ dynamic, else the
+-- chunk listing's position), its index there and the path and material it
+-- draws in — and the layer's runs.
+--
+-- The cutouts come first: by material, and within a material each chunk
+-- listing's cutouts as a run of the chunk's own buffer in listing order, then
+-- the dynamic cutouts by submission order as a run of the ring. The ordered
+-- instances follow, the chunks' and the dynamic ones merged by ascending depth
+-- key and then source order, which is a listing's position (a chunk's before
+-- any dynamic instance) and then the index.
+arrange ∷ CutoutMarks → Bool → [(Int, Chunk)] → [Instance] → ([(Int, Int, (DrawPath, Material))], [DrawRun])
+arrange marks depthEnabled live instances = (ringEntries, cutoutRuns <> orderedRuns)
   where
-    (cutouts, ordered) = partition (routesToCutout marks depthEnabled . snd) (zip [0 ..] instances)
-    cutoutEntry (index, candidate) = (index, (Cutout, instanceMaterialOf candidate))
-    orderedEntry (index, candidate) = (index, (Ordered, instanceMaterialOf candidate))
+    (dynamicCutouts, dynamicOrdered) = partition (routesToCutout marks depthEnabled . snd) (zip [0 ..] instances)
+    sortedCutouts = sortOn (\(index, candidate) → (instanceMaterialOf candidate, index)) dynamicCutouts
+    ringCutouts = [(-1, index, (Cutout, instanceMaterialOf candidate)) | (index, candidate) ← sortedCutouts]
+    chunkOrdered =
+      [ (key, position, index, instanceMaterialOf candidate)
+      | (position, held) ← live
+      , index ← chunkOrderedOrder held
+      , let candidate = chunkInstanceArray held `at` index
+      , let key = instanceDepthKey candidate
+      ]
+    dynamicOrderedKeyed = [(instanceDepthKey candidate, maxBound, index, instanceMaterialOf candidate) | (index, candidate) ← dynamicOrdered]
+    mergedOrdered = sortOn (\(key, position, index, _) → (key, position, index)) (chunkOrdered <> dynamicOrderedKeyed)
+    ringOrdered = [(if position == maxBound then -1 else position, index, (Ordered, material)) | (_, position, index, material) ← mergedOrdered]
+    ringEntries = ringCutouts <> ringOrdered
+    ringCutoutRuns = [run {runSource = RingRun} | run ← runsOf 0 [path | (_, _, path) ← ringCutouts]]
+    chunkCutoutRuns =
+      [ DrawRun Cutout material start count (ChunkRun position)
+      | (position, held) ← live
+      , (start, count, material) ← materialGroups [instanceMaterialOf (chunkInstanceArray held `at` index) | index ← chunkCutoutOrder held]
+      ]
+    -- By material, and within one by source order: a chunk's listings in order,
+    -- then the ring's.
+    cutoutRuns = sortOn (\run → (runMaterial run, sourceRank (runSource run))) (chunkCutoutRuns <> ringCutoutRuns)
+    orderedRuns = runsOf (length ringCutouts) [path | (_, _, path) ← ringOrdered]
+    sourceRank = \case
+      ChunkRun position → position
+      RingRun → maxBound
+    at array index = array Array.! index
 
--- | Whether an instance takes the cutout path in a layer.
-routesToCutout ∷ CutoutMarks → Bool → Instance → Bool
-routesToCutout marks depthEnabled candidate =
-  depthEnabled
-    && isMarkedCutout marks (instanceTexture candidate)
-    && materialCutoutCapable (instanceMaterialOf candidate)
-    && opaque (instanceTint candidate)
-    && not (instanceTranslucent candidate)
-    && not (instanceAdditive candidate)
+-- | The maximal ranges of consecutive equal materials, as start, count and
+-- material.
+materialGroups ∷ [Material] → [(Int, Int, Material)]
+materialGroups = go 0
   where
-    opaque (Tint _ _ _ alpha) = alpha == 255
+    go _ [] = []
+    go start (first : rest) =
+      let (same, others) = span (== first) rest
+          count = 1 + length same
+       in (start, count, first) : go (start + count) others
 
--- | Group consecutive entries sharing a path and a material into runs.
-runsOf ∷ [(DrawPath, Material)] → [DrawRun]
-runsOf = go 0
+-- | Group consecutive entries sharing a path and a material into ring runs,
+-- the first starting at this position of the drawing order.
+runsOf ∷ Int → [(DrawPath, Material)] → [DrawRun]
+runsOf = go
   where
     go _ [] = []
     go start (first : rest) =
       let (same, others) = span (== first) rest
           count = 1 + length same
           (path, material) = first
-       in DrawRun path material start count : go (start + count) others
+       in DrawRun path material start count RingRun : go (start + count) others

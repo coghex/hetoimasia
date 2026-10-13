@@ -1,9 +1,12 @@
+{-# LANGUAGE PatternSynonyms #-}
+
 -- | A window's frame as a plain value: the candidate snapshot game code builds.
 --
 -- A snapshot is an ordered list of passes. A pass names its target, its clear
 -- and its ordered views; a view is a camera, a viewport within the target, its
 -- per-view settings, its clip table and its ordered layers; a layer declares its
--- space and holds its instances in submission order. The window's pass comes last. Nothing
+-- space, lists the retained chunks it draws (R2D-10) and holds its dynamic instances in
+-- submission order. The window's pass comes last. Nothing
 -- here is a native handle, and nothing is checked on construction: the
 -- constructors are public because a candidate is only data, and
 -- "Hetoimasia.Render.TwoD.Validation" is what turns one into a value the
@@ -16,7 +19,7 @@
 --
 -- __Dependencies.__ @base@, @hetoimasia-math@ for the camera's position and the
 -- instance's transform, @hetoimasia-render-api@ for the texture handle, and
--- this package's clip, settings and target modules.
+-- this package's clip, settings, target and chunk-reference modules.
 --
 -- __State.__ The module owns none.
 module Hetoimasia.Render.TwoD.Snapshot
@@ -32,9 +35,10 @@ module Hetoimasia.Render.TwoD.Snapshot
   , Camera (..)
 
     -- * Layers
-  , Layer (..)
+  , Layer (WorldLayerWith, UiLayerWith, WorldLayer, UiLayer)
   , LayerDepth (..)
   , layerInstances
+  , layerChunks
 
     -- * Instances
   , Instance (..)
@@ -49,6 +53,7 @@ import Hetoimasia.Math.Affine2 (Affine2)
 import Hetoimasia.Math.Vector (V2)
 import Hetoimasia.Render.Api.Texture (TextureHandle)
 import Hetoimasia.Render.TwoD.Clip (ClipEntry)
+import Hetoimasia.Render.TwoD.Internal.ChunkRef (ChunkRef)
 import Hetoimasia.Render.TwoD.Settings (ViewSettings)
 import Hetoimasia.Render.TwoD.Target (TargetRef)
 
@@ -114,23 +119,52 @@ data Camera = Camera
   }
   deriving stock (Eq, Show)
 
--- | A layer's instances in submission order, in the space the layer declares.
+-- | A layer: the space it declares, the retained chunks it lists in order and
+-- its dynamic instances in submission order, in that space.
+--
+-- A chunk is named by a 'ChunkRef' (R2D-10) and is drawn beside the layer's
+-- dynamic instances, in the layer's space and under its rules. A chunk is built
+-- for exactly one kind of layer, and validation refuses a layer that lists one
+-- built for another. A chunk listed twice is drawn twice, once for each
+-- listing, and each listing takes its own place in the layer's order.
+--
+-- 'WorldLayer' and 'UiLayer' are the layer that lists no chunks: as
+-- constructors they build one, and as patterns they match one.
 data Layer
   = -- | World space, in game units through the view's camera, with depth
-    -- enabled or not.
-    WorldLayer !LayerDepth [Instance]
-  | -- | UI space, in logical pixels from the upper left.
-    UiLayer [Instance]
+    -- enabled or not: its chunks, then its dynamic instances.
+    WorldLayerWith !LayerDepth [ChunkRef] [Instance]
+  | -- | UI space, in logical pixels from the upper left: its chunks, then its
+    -- dynamic instances.
+    UiLayerWith [ChunkRef] [Instance]
   deriving stock (Eq, Show)
+
+-- | A world layer listing no chunks.
+pattern WorldLayer ∷ LayerDepth → [Instance] → Layer
+pattern WorldLayer depth instances ← WorldLayerWith depth [] instances
+  where
+    WorldLayer depth instances = WorldLayerWith depth [] instances
+
+-- | A UI layer listing no chunks.
+pattern UiLayer ∷ [Instance] → Layer
+pattern UiLayer instances ← UiLayerWith [] instances
+  where
+    UiLayer instances = UiLayerWith [] instances
 
 -- | Whether a world layer is depth-tested.
 data LayerDepth = DepthEnabled | DepthDisabled
   deriving stock (Eq, Ord, Show, Enum, Bounded)
 
--- | The instances of a layer, in submission order.
+-- | The dynamic instances of a layer, in submission order. The instances of its
+-- chunks are not among them.
 layerInstances ∷ Layer → [Instance]
-layerInstances (WorldLayer _ instances) = instances
-layerInstances (UiLayer instances) = instances
+layerInstances (WorldLayerWith _ _ instances) = instances
+layerInstances (UiLayerWith _ instances) = instances
+
+-- | The chunks a layer lists, in the order it lists them.
+layerChunks ∷ Layer → [ChunkRef]
+layerChunks (WorldLayerWith _ chunks _) = chunks
+layerChunks (UiLayerWith chunks _) = chunks
 
 -- | One sprite instance.
 data Instance = Instance

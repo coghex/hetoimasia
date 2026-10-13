@@ -85,10 +85,13 @@ import Hetoimasia.GPU.Model.Identity (TargetClass (..))
 import Hetoimasia.GPU.Vulkan.Diagnostics (CaptureConfig (..), DiagnosticVerdict (..), defaultCaptureConfig, verdictIssues)
 import Hetoimasia.GPU.Vulkan.GLFW
   ( ActionOutcome (..)
+  , BufferDescription (..)
+  , BufferKind (..)
   , Construction
   , FrameEvent (..)
   , FrameRequest (..)
   , Readiness (..)
+  , UploadRefusal (..)
   , Refusal
   , SceneLifecycle (..)
   , SceneMode (..)
@@ -112,6 +115,7 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , constructFramelessBatch
   , constructImage
   , constructReadback
+  , constructBuffer
   , constructRingWith
   , constructStorageTable
   , constructTablePipelineLayoutWith
@@ -125,6 +129,7 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , readReadiness
   , readVulkanGenerations
   , registerConstructedTexture
+  , releaseConstructed
   , releaseConstructedTexture
   , requestVulkanRelease
   , runVulkanOwnerLoop
@@ -142,6 +147,7 @@ import qualified Hetoimasia.Render.Api.Texture as Api
 import Hetoimasia.Render.Api.Texture.Backend (handleGeneration, handleIndex)
 import Hetoimasia.Render.TwoD.Snapshot (Target (WindowTarget))
 import qualified Hetoimasia.Render.TwoD.Vulkan as Render
+import Hetoimasia.Render.TwoD.Vulkan.Chunks (newRetained)
 import Hetoimasia.Render.TwoD.Vulkan.Window
   ( FrameInfo (..)
   , Host (..)
@@ -352,7 +358,8 @@ runImage2d backend journal = do
           handles = handlesOf prepared
       -- The adapter, over the host's public publication and release-request
       -- operations, and the hooks that reach it.
-      adapter ← newAdapter (windowHostOf vulkan keep stripes) (preparedTextures prepared) (preparedRenderer prepared)
+      retained ← newRetained
+      adapter ← newAdapter (windowHostOf vulkan keep stripes) (preparedTextures prepared) retained (preparedRenderer prepared)
       atomically (writeTVar adapterSlot (Just adapter))
       windows ← atomically (hostWindowIdentities windowHost)
       window ← case windows of
@@ -531,6 +538,10 @@ renderBuildersOf construction =
     , Render.registerImage = registerConstructedTexture construction
     , Render.swapImage = swapConstructedTexture construction
     , Render.releaseImage = releaseConstructedTexture construction
+    , Render.buildVertexBuffer = \bytes → constructBuffer construction (BufferDescription VertexBuffer bytes)
+    , -- This sample retains no chunk, so it admits no upload into a chunk's buffer.
+      Render.uploadBuffer = \_ _ → pure (Left UploadClosed)
+    , Render.releaseBuffer = releaseConstructed construction
     }
 
 -- | The sample's constructions, from the host's.

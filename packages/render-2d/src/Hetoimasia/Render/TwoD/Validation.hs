@@ -37,17 +37,33 @@
 -- 'validLayers' gives each layer, with its location, for the encoder in
 -- "Hetoimasia.Render.TwoD.Encoding".
 --
--- __Dependencies.__ @base@, @containers@ for the clip table's reach,
--- @hetoimasia-math@ for the affine type, and this package's clip, snapshot and
--- settings modules.
+-- __Chunks__ (R2D-10). A layer may list retained chunks by reference. A
+-- reference resolves, exactly, through the 'Chunks' the caller validates
+-- against ('validateSnapshotWith'): one the set does not hold, whether it was
+-- never issued, is stale or names a chunk since released, is refused
+-- ('ChunkUnresolved'), and so is one built for another kind of layer than the
+-- one that lists it ('ChunkKindMismatch'), each at an 'AtChunk' location that
+-- names the layer and the chunk. The valid snapshot keeps what each listing
+-- resolved to, so planning, encoding and the oracle need no lookup of their own
+-- and the snapshot means the same thing wherever it is read. 'validateSnapshot'
+-- validates against no chunks, so it refuses any layer that lists one. A chunk
+-- has no clip table (R2D-12 leaves retained content's to a later slice), so its
+-- instances must select no clip: a chunk instance with a clip index is refused,
+-- as 'ClipIndexUnknown', when the chunk is built.
+--
+-- __Dependencies.__ @base@, @containers@ for the set of chunks and the clip
+-- table's reach, @hetoimasia-math@ for the affine type, and this package's clip,
+-- snapshot, chunk and settings modules.
 --
 -- __State.__ The module owns none.
 module Hetoimasia.Render.TwoD.Validation
   ( -- * Validation
     validateSnapshot
+  , validateSnapshotWith
 
     -- * Refusals
   , viewReasons
+  , instanceReasons
   , Refusal (..)
   , Location (..)
   , Reason (..)
@@ -56,9 +72,11 @@ module Hetoimasia.Render.TwoD.Validation
   , ValidSnapshot
   , validSnapshot
   , validLayers
+  , validChunkRefs
   , ValidLayer
   , validLayerLocation
   , validLayerContents
+  , validLayerChunks
   ) where
 
 import Data.List.NonEmpty (NonEmpty)
@@ -68,6 +86,8 @@ import Hetoimasia.Math.Affine2 (toColumnMajor)
 import Hetoimasia.Math.Vector (V2 (..))
 import Hetoimasia.Render.TwoD.Clip (ClipEntry (..), ClipRect (..), clipEntryOfIndex)
 import Hetoimasia.Render.TwoD.Internal.Check (allFinite, finite, positiveFinite, withinClosed)
+import Hetoimasia.Render.TwoD.Internal.Chunk (Chunk (..), ChunkKind, Chunks (..), layerChunkKind)
+import Hetoimasia.Render.TwoD.Internal.ChunkRef (ChunkRef)
 import Hetoimasia.Render.TwoD.Settings
   ( ViewSettings (..)
   , ZoomMode (..)
@@ -86,6 +106,7 @@ import Hetoimasia.Render.TwoD.Snapshot
   , View (..)
   , Viewport (..)
   , depthKeyLimit
+  , layerChunks
   , layerInstances
   )
 
@@ -101,6 +122,13 @@ data Location
     AtLayer !Int !Int !Int
   | -- | The instance: pass, view, layer, instance.
     AtInstance !Int !Int !Int !Int
+  | -- | The chunk a layer lists: pass, view, layer, its position in the layer's
+    -- list, and the reference listed there.
+    AtChunk !Int !Int !Int !Int !ChunkRef
+  | -- | An instance of a chunk a layer lists: pass, view, layer, the chunk's
+    -- position in the layer's list, and the instance's build position in the
+    -- chunk.
+    AtChunkInstance !Int !Int !Int !Int !Int
   deriving stock (Eq, Ord, Show)
 
 -- | Why a candidate was refused. A reason names no value; the location says
@@ -137,7 +165,8 @@ data Reason
   | -- | A depth key of 2²⁴ or more.
     DepthKeyTooLarge
   | -- | A clip index beyond the view's table: an instance with index @k@ in a
-    -- view whose table holds fewer than @k@ entries.
+    -- view whose table holds fewer than @k@ entries. A retained chunk has no
+    -- table, so any clip index of a chunk's instance is one.
     ClipIndexUnknown
   | -- | A clip entry whose parent is not an earlier entry of its table.
     ClipParentInvalid
@@ -146,6 +175,11 @@ data Reason
   | -- | A clip entry referenced, directly or through a descendant, from both a
     -- world layer and a UI layer.
     ClipSpaceMixed
+  | -- | A chunk the chunks validated against do not hold: never issued, stale
+    -- (another generation), or released.
+    ChunkUnresolved
+  | -- | A chunk built for another kind of layer than the one that lists it.
+    ChunkKindMismatch
   deriving stock (Eq, Ord, Show, Enum, Bounded)
 
 -- | One reason a candidate was refused, and where.
@@ -159,9 +193,9 @@ data Refusal = Refusal
 data ValidSnapshot = ValidSnapshot !Snapshot [ValidLayer]
   deriving stock (Eq, Show)
 
--- | A layer every check accepted, with where it sits in its snapshot. The
--- constructor is private.
-data ValidLayer = ValidLayer !Location Layer
+-- | A layer every check accepted, with where it sits in its snapshot and what
+-- each chunk it lists resolved to. The constructor is private.
+data ValidLayer = ValidLayer !Location Layer [(ChunkRef, Chunk)]
   deriving stock (Eq, Show)
 
 -- | The candidate, exactly as validated: the same values in the same order.
@@ -175,15 +209,37 @@ validLayers (ValidSnapshot _ layers) = layers
 
 -- | Where the layer sits: an 'AtLayer' location.
 validLayerLocation ∷ ValidLayer → Location
-validLayerLocation (ValidLayer location _) = location
+validLayerLocation (ValidLayer location _ _) = location
 
--- | The layer, with its instances in submission order.
+-- | The layer, with its dynamic instances in submission order and the chunks
+-- it lists by reference.
 validLayerContents ∷ ValidLayer → Layer
-validLayerContents (ValidLayer _ layer) = layer
+validLayerContents (ValidLayer _ layer _) = layer
 
--- | Validate a candidate, refusing it with every reason found.
+-- | What each chunk the layer lists resolved to, in the order the layer lists
+-- them: a chunk listed twice appears twice.
+validLayerChunks ∷ ValidLayer → [(ChunkRef, Chunk)]
+validLayerChunks (ValidLayer _ _ chunks) = chunks
+
+-- | Every chunk the snapshot lists in any layer of any view, once each, in the
+-- order each is first listed.
+validChunkRefs ∷ ValidSnapshot → [ChunkRef]
+validChunkRefs valid = go [] [reference | held ← validLayers valid, (reference, _) ← validLayerChunks held]
+  where
+    go _ [] = []
+    go seen (reference : rest)
+      | reference `elem` seen = go seen rest
+      | otherwise = reference : go (reference : seen) rest
+
+-- | Validate a candidate that lists no chunk, refusing it with every reason
+-- found. A layer that lists one is refused: nothing resolves it.
 validateSnapshot ∷ Snapshot → Either (NonEmpty Refusal) ValidSnapshot
-validateSnapshot snapshot@(Snapshot passes) =
+validateSnapshot = validateSnapshotWith (Chunks Map.empty)
+
+-- | Validate a candidate against the chunks it may list, refusing it with every
+-- reason found.
+validateSnapshotWith ∷ Chunks → Snapshot → Either (NonEmpty Refusal) ValidSnapshot
+validateSnapshotWith (Chunks held) snapshot@(Snapshot passes) =
   case NonEmpty.nonEmpty (concat refusalsByPass) of
     Just refusals → Left refusals
     Nothing → Right (ValidSnapshot snapshot layers)
@@ -191,11 +247,11 @@ validateSnapshot snapshot@(Snapshot passes) =
     lastIndex = length passes - 1
     windowsBefore = scanl (\count pass → if isWindow pass then count + 1 else count) (0 ∷ Int) passes
     refusalsByPass =
-      [ passRefusals index pass before (index == lastIndex)
+      [ passRefusals held index pass before (index == lastIndex)
       | (index, pass, before) ← zip3 [0 ..] passes windowsBefore
       ]
     layers =
-      [ ValidLayer (AtLayer passIndex viewIndex layerIndex) layer
+      [ ValidLayer (AtLayer passIndex viewIndex layerIndex) layer [(reference, chunk) | reference ← layerChunks layer, Just chunk ← [Map.lookup reference held]]
       | (passIndex, pass) ← zip [0 ..] passes
       , (viewIndex, view) ← zip [0 ..] (passViews pass)
       , (layerIndex, layer) ← zip [0 ..] (viewLayers view)
@@ -206,25 +262,25 @@ isWindow pass = case passTarget pass of
   WindowTarget → True
   OffscreenTarget _ → False
 
-passRefusals ∷ Int → Pass → Int → Bool → [Refusal]
-passRefusals index pass windowsBefore isLast =
+passRefusals ∷ Map.Map ChunkRef Chunk → Int → Pass → Int → Bool → [Refusal]
+passRefusals held index pass windowsBefore isLast =
   [at MultipleWindowPasses | isWindow pass, windowsBefore > 0]
     <> [at WindowPassNotLast | isWindow pass, not isLast]
     <> [at ClearColourInvalid | not (validClear (passClear pass))]
     <> concat
-      [viewRefusals index viewIndex view | (viewIndex, view) ← zip [0 ..] (passViews pass)]
+      [viewRefusals held index viewIndex view | (viewIndex, view) ← zip [0 ..] (passViews pass)]
   where
     at = Refusal (AtPass index)
 
 validClear ∷ ClearColour → Bool
 validClear (ClearColour r g b a) = all (withinClosed 0 1) [r, g, b, a]
 
-viewRefusals ∷ Int → Int → View → [Refusal]
-viewRefusals passIndex viewIndex view =
+viewRefusals ∷ Map.Map ChunkRef Chunk → Int → Int → View → [Refusal]
+viewRefusals held passIndex viewIndex view =
   viewOwnRefusals (Refusal (AtView passIndex viewIndex)) view
     <> clipEntryRefusals passIndex viewIndex (viewClips view)
     <> concat
-      [ layerRefusals passIndex viewIndex (length (viewClips view)) layerIndex layer
+      [ layerRefusals held passIndex viewIndex (length (viewClips view)) layerIndex layer
       | (layerIndex, layer) ← zip [0 ..] (viewLayers view)
       ]
     <> mixedSpaceRefusals passIndex viewIndex view
@@ -294,27 +350,45 @@ mixedSpaceRefusals passIndex viewIndex view =
         [ (entry, (isWorld, not isWorld))
         | layer ← viewLayers view
         , let isWorld = case layer of
-                WorldLayer _ _ → True
-                UiLayer _ → False
+                WorldLayerWith _ _ _ → True
+                UiLayerWith _ _ → False
         , candidate ← layerInstances layer
         , Just start ← [clipEntryOfIndex (instanceClip candidate)]
         , start < count
         , entry ← chain start
         ]
 
-layerRefusals ∷ Int → Int → Int → Int → Layer → [Refusal]
-layerRefusals passIndex viewIndex tableSize layerIndex layer =
+-- | The chunks a layer lists come first, in the order it lists them, then its
+-- dynamic instances, whose clip indices are checked against the view's table.
+layerRefusals ∷ Map.Map ChunkRef Chunk → Int → Int → Int → Int → Layer → [Refusal]
+layerRefusals held passIndex viewIndex tableSize layerIndex layer =
   concat
-    [ instanceRefusals tableSize (AtInstance passIndex viewIndex layerIndex index) candidate
-    | (index, candidate) ← zip [0 ..] (layerInstances layer)
+    [ chunkRefusals (AtChunk passIndex viewIndex layerIndex position reference) (layerChunkKind layer) (Map.lookup reference held)
+    | (position, reference) ← zip [0 ..] (layerChunks layer)
     ]
+    <> concat
+      [ instanceRefusals tableSize (AtInstance passIndex viewIndex layerIndex index) candidate
+      | (index, candidate) ← zip [0 ..] (layerInstances layer)
+      ]
+
+chunkRefusals ∷ Location → ChunkKind → Maybe Chunk → [Refusal]
+chunkRefusals location expected = \case
+  Nothing → [Refusal location ChunkUnresolved]
+  Just built → [Refusal location ChunkKindMismatch | chunkKindField built /= expected]
 
 instanceRefusals ∷ Int → Location → Instance → [Refusal]
-instanceRefusals tableSize location candidate =
-  [at TransformNotFinite | not (allFinite (toColumnMajor (instanceTransform candidate)))]
-    <> [at UvNotFinite | not (allFinite [u0, v0, u1, v1])]
-    <> [at DepthKeyTooLarge | instanceDepthKey candidate >= depthKeyLimit]
-    <> [at ClipIndexUnknown | Just entry ← [clipEntryOfIndex (instanceClip candidate)], entry >= tableSize]
+instanceRefusals tableSize location = map (Refusal location) . instanceReasons tableSize
+
+-- | The reasons an instance is refused, in the order validation reports them:
+-- empty exactly when every one of its values is acceptable, a clip index being
+-- acceptable when it is 0 or selects an entry of a table of this many entries.
+-- A retained chunk validates its instances with the same function when it is
+-- built, against no table.
+instanceReasons ∷ Int → Instance → [Reason]
+instanceReasons tableSize candidate =
+  [TransformNotFinite | not (allFinite (toColumnMajor (instanceTransform candidate)))]
+    <> [UvNotFinite | not (allFinite [u0, v0, u1, v1])]
+    <> [DepthKeyTooLarge | instanceDepthKey candidate >= depthKeyLimit]
+    <> [ClipIndexUnknown | Just entry ← [clipEntryOfIndex (instanceClip candidate)], entry >= tableSize]
   where
-    at = Refusal location
     UvRect u0 v0 u1 v1 = instanceUv candidate

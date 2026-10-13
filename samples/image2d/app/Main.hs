@@ -54,10 +54,13 @@ import Hetoimasia.GPU.Model.Budget (BudgetRequest (..), defaultBudgetRequest, va
 import Hetoimasia.GPU.Vulkan.Diagnostics (CaptureConfig (..), DiagnosticVerdict, defaultCaptureConfig, verdictIssues)
 import Hetoimasia.GPU.Vulkan.GLFW
   ( ActionOutcome (..)
+  , BufferDescription (..)
+  , BufferKind (..)
   , Construction
   , FrameEvent (..)
   , FrameRequest (..)
   , Readiness (..)
+  , UploadRefusal (..)
   , Refusal
   , SceneLifecycle (..)
   , SceneMode (..)
@@ -82,6 +85,7 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , constructFramelessBatch
   , constructImage
   , constructReadback
+  , constructBuffer
   , constructRingWith
   , constructStorageTable
   , constructTablePipelineLayoutWith
@@ -94,6 +98,7 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , readConstructedTable
   , readReadiness
   , registerConstructedTexture
+  , releaseConstructed
   , releaseConstructedTexture
   , requestVulkanRelease
   , runVulkanOwnerLoop
@@ -108,6 +113,7 @@ import Hetoimasia.GPU.Vulkan.Native.Presentation (SurfaceExtent (..))
 import Hetoimasia.Render.TwoD.Settings (uiScaleRange)
 import Hetoimasia.Render.TwoD.Snapshot (Target (WindowTarget))
 import qualified Hetoimasia.Render.TwoD.Vulkan as Render
+import Hetoimasia.Render.TwoD.Vulkan.Chunks (newRetained)
 import Hetoimasia.Render.TwoD.Vulkan.Window
   ( Adapter
   , FrameInfo (..)
@@ -252,7 +258,8 @@ run mode validation = do
               ready ← Sample.prepare (hostOf vulkan)
               made ← either (\failure → hPutStrLn stderr (Text.unpack failure) >> exitFailure) pure ready
               atomically (writeTVar prepared (Just made))
-              adapter ← newAdapter (windowHostOf vulkan) (preparedTextures made) (preparedRenderer made)
+              retained ← newRetained
+              adapter ← newAdapter (windowHostOf vulkan) (preparedTextures made) retained (preparedRenderer made)
               atomically (writeTVar adapterSlot (Just adapter))
               atomically (writeTVar passed True)
               render logger vulkan control adapter made uiScale frame presented
@@ -291,6 +298,10 @@ renderBuildersOf construction =
     , Render.registerImage = registerConstructedTexture construction
     , Render.swapImage = swapConstructedTexture construction
     , Render.releaseImage = releaseConstructedTexture construction
+    , Render.buildVertexBuffer = \bytes → constructBuffer construction (BufferDescription VertexBuffer bytes)
+    , -- This sample retains no chunk, so it admits no upload into a chunk's buffer.
+      Render.uploadBuffer = \_ _ → pure (Left UploadClosed)
+    , Render.releaseBuffer = releaseConstructed construction
     }
 
 -- | The sample's constructions, from the host's.

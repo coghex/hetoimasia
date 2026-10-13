@@ -31,6 +31,20 @@
 -- backend holds for the image before it works the frame out, so a false
 -- declaration is refused, naming the layer, like any other.
 --
+-- = Retained chunks (R2D-10)
+--
+-- A layer may list retained chunks ("Hetoimasia.Render.TwoD.Chunk"). Its work is
+-- then the ring's, the layer's dynamic cutouts and the merged ordered instances
+-- of its chunks and its own, written each frame, together with the chunks'
+-- cutout runs, which read the chunk's own device buffer ('ReadsChunk') as the
+-- caller's 'frameChunks' resolves it and are never rewritten. A view skips a
+-- chunk wholly outside it before any of this is worked out, under the view's
+-- mapping and the attachment's extent ("Hetoimasia.Render.TwoD.Culling"), and
+-- the skipped listings are named in the layer's work ('layerCulled'); nothing of
+-- them is encoded, claimed or drawn. A chunk with cutout instances that
+-- 'frameChunks' holds no buffer for is refused ('ChunkBufferMissing') before
+-- anything is recorded.
+--
 -- = Targets and metrics
 --
 -- Each pass names a target. An offscreen one resolves through the caller's
@@ -73,6 +87,9 @@
 --   its pass and view;
 -- * 'NoDepthTarget', 'DepthFormatRefused': a depth-enabled world layer the pass
 --   cannot give a @D32_SFLOAT@ attachment, naming the layer;
+-- * 'ChunkBufferMissing': a chunk drawn with cutout instances, in a view that
+--   does not cull it, for which the caller supplied no device buffer, naming the
+--   layer and the chunk;
 -- * 'PlanDisagrees': the plan and the snapshot's layers do not pair, which
 --   planning the same snapshot never produces;
 -- * 'ClipNotRepresentable': a drawing view whose layers select clips has a
@@ -102,6 +119,7 @@ module Hetoimasia.Render.TwoD.Vulkan.Frame
   , LayerWork (..)
   , layerPushBytes
   , RunWork (..)
+  , RunReads (..)
   , PipelineKind (..)
   , runPipeline
   , passDraws
@@ -114,21 +132,26 @@ module Hetoimasia.Render.TwoD.Vulkan.Frame
 
 import Control.Monad (zipWithM)
 import Data.ByteString (ByteString)
-import qualified Data.Map.Strict as Map
 import qualified Data.ByteString as ByteString
 import Data.List (find, mapAccumL, nub)
+import qualified Data.Map.Strict as Map
+import Data.Set (Set)
+import qualified Data.Set as Set
 import Data.Maybe (catMaybes, fromMaybe, isJust, listToMaybe)
 import Data.Word (Word32, Word64)
 import Hetoimasia.Math.Affine2 (identity)
 import Hetoimasia.GPU.Vulkan.Native.Recording
-  ( ClearColor (..)
+  ( Buffer
+  , ClearColor (..)
   , Image
   , ImageFormat (..)
   , Rect (..)
   , Refusal
   , formatCode
   )
+import Hetoimasia.Render.TwoD.Chunk (ChunkRef)
 import Hetoimasia.Render.TwoD.Clip (ResolvedClip)
+import Hetoimasia.Render.TwoD.Culling (chunkCulled)
 import Hetoimasia.Render.TwoD.DrawPlan
   ( DrawPlan (..)
   , DrawRun (..)
@@ -138,7 +161,8 @@ import Hetoimasia.Render.TwoD.DrawPlan
   , CutoutMarks
   , PlannedPass (..)
   , PlannedView (..)
-  , planSnapshot
+  , RunSource (..)
+  , planSnapshotCulled
   )
 import Hetoimasia.Render.TwoD.Encoding (encodeLayerInDrawingOrder)
 import Hetoimasia.Render.TwoD.Mapping (mappingPixelSnap, uiInverse, uiTransform, viewMapping, worldInverse, worldTransform)
@@ -160,6 +184,7 @@ import Hetoimasia.Render.TwoD.Validation
   ( Location (..)
   , ValidLayer
   , ValidSnapshot
+  , validLayerChunks
   , validLayerContents
   , validLayerLocation
   , validLayers
@@ -214,6 +239,14 @@ data FrameInput = FrameInput
   , frameWindow ∷ !(Maybe Attachment)
   , frameWindowDepth ∷ !(Maybe DepthBinding)
     -- ^ The window generation's depth image, if the host enabled windowed depth.
+  , frameChunks ∷ ChunkRef → Maybe Buffer
+    -- ^ The device buffer of a retained chunk that has cutout instances, as the
+    -- registry holds it ('Hetoimasia.Render.TwoD.Vulkan.Chunks.retainedBuffers');
+    -- @const Nothing@ where the frame lists no chunk.
+  , frameOmitted ∷ !(Set ChunkRef)
+    -- ^ The chunks the frame leaves out of every view, whose listings are treated
+    -- as skipped ('layerCulled'): those whose upload ended without completing,
+    -- which no retry can draw. 'Set.empty' where there are none.
   }
 
 -- | The depth-enabled world layers of a snapshot, in snapshot order.
@@ -222,7 +255,7 @@ depthLayers valid =
   [ AtLayer passIndex viewIndex layerIndex
   | (passIndex, pass) ← zip [0 ..] (snapshotPasses (validSnapshot valid))
   , (viewIndex, view) ← zip [0 ..] (passViews pass)
-  , (layerIndex, WorldLayer DepthEnabled _) ← zip [0 ..] (viewLayers view)
+  , (layerIndex, WorldLayerWith DepthEnabled _ _) ← zip [0 ..] (viewLayers view)
   ]
 
 -- | The rule for a session whose depth format is this one, or that offers none
@@ -271,6 +304,9 @@ data FrameRefusal
     DepthFormatRefused !Location !ImageFormat
   | -- | A depth-enabled world layer, and the session offers no depth format.
     NoDepthFormat !Location
+  | -- | A layer draws a chunk with cutout instances for which the frame holds no
+    -- device buffer: the layer, and the chunk.
+    ChunkBufferMissing !Location !ChunkRef
   | -- | A view whose layers select clips draws where the fragment stage's
     -- layer-space offsets could overflow a float: the pass and the view. A
     -- scissor that spans more than about 10³⁸ units of the layer, whose clip test
@@ -329,10 +365,14 @@ data ClipTable = ClipTable
   }
   deriving (Eq, Show)
 
--- | One layer that draws, or clears depth: the push block of its space, its
--- instances in drawing order, and its runs as ranges of them.
+
+-- | One layer that draws, clears depth, or skipped a chunk: the push block of
+-- its space, its instances in drawing order, and its runs as ranges of them.
 data LayerWork = LayerWork
   { layerLocation ∷ !Location
+  , layerCulled ∷ ![ChunkRef]
+    -- ^ The chunks the layer lists that its view skips, in listed order, a chunk
+    -- listed twice named twice.
   , layerClearsDepth ∷ !Bool
     -- ^ A depth-enabled world layer: it clears depth to 1.0 within its view's
     -- scissor before its runs, though it holds none.
@@ -340,10 +380,11 @@ data LayerWork = LayerWork
     -- ^ The push block of the layer's space, with its clip table's base and
     -- centre.
   , layerClipSpace ∷ !(Maybe ClipSpace)
-    -- ^ The space the layer's clips are in when some instance has a clip index;
-    -- 'Nothing' when none does, so the layer reads no table.
+    -- ^ The space the layer's clips are in when some dynamic instance has a clip
+    -- index; 'Nothing' when none does, so the layer reads no table.
   , layerBytes ∷ !ByteString
-    -- ^ 64 bytes an instance, in drawing order.
+    -- ^ 64 bytes an instance, in drawing order: the ring entries, which are empty
+    -- for a layer whose every run reads a chunk's buffer.
   , layerRunList ∷ ![RunWork]
   }
   deriving (Eq, Show)
@@ -352,13 +393,24 @@ data LayerWork = LayerWork
 layerPushBytes ∷ LayerWork → ByteString
 layerPushBytes = packViewPush . layerPush
 
--- | A run: a contiguous range of its layer's drawn instances, and the path the
--- plan gave it.
+-- | A run: a contiguous range of instances, where they are read from, and the
+-- path the plan gave it.
 data RunWork = RunWork
   { runFirstInstance ∷ !Word32
+  -- ^ The first instance, among the layer's ring entries or among the chunk
+  -- buffer's.
   , runInstanceCount ∷ !Word32
   , runWorkPath ∷ !DrawPath
+  , runReads ∷ !RunReads
   }
+  deriving (Eq, Show)
+
+-- | Where a run's instances are read from.
+data RunReads
+  = -- | The layer's region of the frame's ring.
+    ReadsRing
+  | -- | A retained chunk's own device buffer, which is not rewritten.
+    ReadsChunk !ChunkRef !Buffer
   deriving (Eq, Show)
 
 -- | The pipelines the recorder draws with. Each declares what its pass has: the
@@ -391,23 +443,16 @@ runPipeline passHasDepth layer run
 passDraws ∷ PassWork → Bool
 passDraws = any (any (not . null . layerRunList) . workLayers) . workViews
 
--- | Work out a frame, or the first refusal in snapshot order.
-frameWork ∷ FrameInput → Either FrameRefusal [PassWork]
-frameWork input = do
-  passes ←
-    zipWithM
-      (passWork input layers)
-      [0 ..]
-      (zip (snapshotPasses (validSnapshot valid)) (planPasses (planSnapshot (frameMarks input) valid)))
-  let assigned = assignClipBases passes
-  requireClipArithmetic assigned
-  pure assigned
-  where
-    valid = frameSnapshot input
-    layers = Map.fromList [((pass, view, layer), held) | held ← validLayers valid, AtLayer pass view layer ← [validLayerLocation held]]
+-- | A pass's target as the caller resolves it, checked: the offscreen colour
+-- image if any, the attachment, and the depth image supplied.
+data Resolved = Resolved !(Maybe Image) !Attachment !(Maybe DepthBinding)
 
-passWork ∷ FrameInput → Map.Map (Int, Int, Int) ValidLayer → Int → (Pass, PlannedPass) → Either FrameRefusal PassWork
-passWork input layers index (pass, planned) = do
+resolvedAttachment ∷ Resolved → Attachment
+resolvedAttachment (Resolved _ attachment _) = attachment
+
+-- | Resolve a pass's target and check its metrics against it.
+resolvePass ∷ FrameInput → Int → Pass → Either FrameRefusal Resolved
+resolvePass input index pass = do
   (image, attachment, supplied) ← case passTarget pass of
     WindowTarget → maybe (Left (NoWindowAttachment index)) (\held → Right (Nothing, held, frameWindowDepth input)) (frameWindow input)
     OffscreenTarget reference →
@@ -423,11 +468,48 @@ passWork input layers index (pass, planned) = do
     else
       if (toInteger framebufferWidth, toInteger framebufferHeight) /= (toInteger (fst extent), toInteger (snd extent))
         then Left (MetricsDisagree index (metricsFramebuffer metrics) extent)
-        else do
-          views ← zipWithM (viewWork layers attachment index) [0 ..] (zip (passViews pass) (plannedViews planned))
-          depth ← depthFor index (passViews pass) views supplied
-          let ClearColour red green blue alpha = passClear pass
-          Right (PassWork index image attachment (ClearColor red green blue alpha) depth views)
+        else Right (Resolved image attachment supplied)
+
+-- | Work out a frame, or the first refusal in snapshot order.
+frameWork ∷ FrameInput → Either FrameRefusal [PassWork]
+frameWork input = do
+  works ←
+    zipWithM
+      (passWork input layers)
+      [0 ..]
+      (zip3 passes resolved (planPasses plan))
+  let assigned = assignClipBases works
+  requireClipArithmetic assigned
+  pure assigned
+  where
+    valid = frameSnapshot input
+    passes = snapshotPasses (validSnapshot valid)
+    layers = Map.fromList [((pass, view, layer), held) | held ← validLayers valid, AtLayer pass view layer ← [validLayerLocation held]]
+    -- Resolved lazily, in snapshot order, so the first refusal is still the
+    -- first found: planning needs a pass's view mappings only for its culling.
+    resolved = zipWith (resolvePass input) [0 ..] passes
+    plan = planSnapshotCulled culler (frameMarks input) valid
+    culler passIndex viewIndex reference kind bounds placement
+      | Set.member reference (frameOmitted input) = True
+      | otherwise = case Map.lookup (passIndex, viewIndex) cullable of
+          Just (mapping, extent, viewport) → chunkCulled mapping extent viewport kind bounds placement
+          Nothing → False
+    cullable =
+      Map.fromList
+        [ ((passIndex, viewIndex), (mapping, (attachmentWidth attachment, attachmentHeight attachment), viewViewport view))
+        | (passIndex, pass, Right found) ← zip3 [0 ..] passes resolved
+        , let attachment = resolvedAttachment found
+        , (viewIndex, view) ← zip [0 ..] (passViews pass)
+        , Just mapping ← [viewMapping (attachmentMetrics attachment) view]
+        ]
+
+passWork ∷ FrameInput → Map.Map (Int, Int, Int) ValidLayer → Int → (Pass, Either FrameRefusal Resolved, PlannedPass) → Either FrameRefusal PassWork
+passWork input layers index (pass, resolved, planned) = do
+  Resolved image attachment supplied ← resolved
+  views ← zipWithM (viewWork input layers attachment index) [0 ..] (zip (passViews pass) (plannedViews planned))
+  depth ← depthFor index (passViews pass) views supplied
+  let ClearColour red green blue alpha = passClear pass
+  Right (PassWork index image attachment (ClearColor red green blue alpha) depth views)
 
 -- | The depth attachment a pass begins with. A pass needs one when a view with
 -- a non-empty scissor holds a depth-enabled world layer; it is refused, naming
@@ -445,11 +527,11 @@ depthFor passIndex views works supplied = case (supplied, needing, holding) of
     holding =
       [ AtLayer passIndex viewIndex layerIndex
       | (viewIndex, view) ← zip [0 ..] views
-      , (layerIndex, WorldLayer DepthEnabled _) ← zip [0 ..] (viewLayers view)
+      , (layerIndex, WorldLayerWith DepthEnabled _ _) ← zip [0 ..] (viewLayers view)
       ]
 
-viewWork ∷ Map.Map (Int, Int, Int) ValidLayer → Attachment → Int → Int → (View, PlannedView) → Either FrameRefusal ViewWork
-viewWork layers attachment passNumber index (view, planned) = do
+viewWork ∷ FrameInput → Map.Map (Int, Int, Int) ValidLayer → Attachment → Int → Int → (View, PlannedView) → Either FrameRefusal ViewWork
+viewWork input layers attachment passNumber index (view, planned) = do
   mapping ← maybe (Left (ViewNotMappable passNumber index)) Right (viewMapping (attachmentMetrics attachment) view)
   let rect = viewScissor (viewViewport view) (attachmentWidth attachment, attachmentHeight attachment)
       settings = viewSettings view
@@ -470,29 +552,43 @@ viewWork layers attachment passNumber index (view, planned) = do
             }
   drawn ← case rect of
     Nothing → Right []
-    Just _ → catMaybes <$> mapM (layerWork layers pushFor) (plannedLayers planned)
+    Just _ → catMaybes <$> mapM (layerWork input layers pushFor) (plannedLayers planned)
   Right (ViewWork index rect (plannedClips planned) [] drawn)
 
-layerWork ∷ Map.Map (Int, Int, Int) ValidLayer → (LayerSpace → ViewPush) → PlannedLayer → Either FrameRefusal (Maybe LayerWork)
-layerWork layers pushFor planned
-  | null (plannedRuns planned) && not (plannedClearsDepth planned) = Right Nothing
+layerWork ∷ FrameInput → Map.Map (Int, Int, Int) ValidLayer → (LayerSpace → ViewPush) → PlannedLayer → Either FrameRefusal (Maybe LayerWork)
+layerWork input layers pushFor planned
+  | null (plannedRuns planned) && not (plannedClearsDepth planned) && null (plannedCulled planned) = Right Nothing
   | otherwise = do
       let location = plannedLocation planned
       valid ← case location of
         AtLayer pass view layer → maybe (Left (PlanDisagrees location)) Right (Map.lookup (pass, view, layer) layers)
         _ → Left (PlanDisagrees location)
       bytes ← maybe (Left (PlanDisagrees location)) Right (encodeLayerInDrawingOrder planned valid)
+      let listed = map fst (validLayerChunks valid)
+          chunkAt position = case drop position listed of
+            reference : _ → Right reference
+            [] → Left (PlanDisagrees location)
+      culled ← traverse chunkAt (plannedCulled planned)
+      runs ← traverse (runWork location chunkAt) (plannedRuns planned)
       Right
         ( Just
             LayerWork
               { layerLocation = location
+              , layerCulled = culled
               , layerClearsDepth = plannedClearsDepth planned
               , layerPush = pushFor (plannedSpace planned)
               , layerClipSpace = clipSpaceOf (plannedSpace planned) valid
               , layerBytes = bytes
-              , layerRunList = [RunWork (fromIntegral (runStart run)) (fromIntegral (runCount run)) (runPath run) | run ← plannedRuns planned]
+              , layerRunList = runs
               }
         )
+  where
+    runWork location chunkAt run = case runSource run of
+      RingRun → Right (RunWork (fromIntegral (runStart run)) (fromIntegral (runCount run)) (runPath run) ReadsRing)
+      ChunkRun position → do
+        reference ← chunkAt position
+        buffer ← maybe (Left (ChunkBufferMissing location reference)) Right (frameChunks input reference)
+        Right (RunWork (fromIntegral (runStart run)) (fromIntegral (runCount run)) (runPath run) (ReadsChunk reference buffer))
 
 -- | The space a layer's clips are in, when some instance selects one.
 clipSpaceOf ∷ LayerSpace → ValidLayer → Maybe ClipSpace
