@@ -371,8 +371,9 @@ order is total and repeatable. A zero-size viewport plans nothing from a chunk,
 either.
 
 `planSnapshotCulled culler marks valid` leaves out the chunk listings the culler
-skips for each view (`ChunkCuller`: pass index, view index, kind and bounds; see
-`chunkCulled`). The plan of a view is then exactly the plan without those
+skips for each view (`ChunkCuller`: pass index, view index, the chunk's reference,
+its kind, bounds and placement magnitude; see `chunkCulled`; a backend may also skip
+a chunk by reference, as the recorder does for one whose upload failed). The plan of a view is then exactly the plan without those
 listings, and `plannedCulled` names them by position in the layer's list.
 `planSnapshot` culls none.
 

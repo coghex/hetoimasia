@@ -280,10 +280,13 @@ completed records nothing, claims nothing and refuses the frame
 (`RefusedIllegal`, naming the chunk), which the host skips and retries at its
 backoff with the window's demand kept; nothing of an incomplete chunk is ever
 drawn, and publication never waits (`pendingChunkUploads` names the chunks a
-frame waits for). A chunk that *failed* is a refusal of its own: a snapshot that
-lists it is not published (`ChunkUploadFailedInSnapshot`), and a frame of a scene
-that does is refused saying the upload ended without completing, so nothing
-retries for ever.
+frame waits for). A chunk that *failed* is not pressure: no retry will complete its
+upload, and the host retries every refused frame, so refusing the frame would retry
+it for ever. A snapshot that lists it is not published (`ChunkUploadFailedInSnapshot`),
+and a frame of an already adopted scene that lists it is **recorded without it**, as
+if every view skipped it (`FrameInput`'s `frameOmitted`; `layerCulled` names it), with
+`failedChunkUploads` naming it and how its upload ended, so the application publishes
+a snapshot that lists a rebuilt chunk. Nothing of an incomplete chunk is ever drawn.
 
 **Culling.** Before anything is worked out, a view skips every chunk whose
 bounds, mapped through its transform, lie wholly outside its viewport within the
