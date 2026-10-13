@@ -258,7 +258,8 @@ is refused, checking in this order:
 2. `OffscreenPassHeld`, naming the pass, when the snapshot holds an offscreen
    pass: windowed snapshots hold none until R2D-13 issues target references;
 3. `NoWindowPass`, when the snapshot has no window pass — an empty snapshot
-   included; removing every layer publishes a window pass with none;
+   included; removing every layer publishes a window pass with none (a second
+   window pass is validation's refusal, in 1);
 4. `TextureReleasedInSnapshot`, naming the texture, when the snapshot
    references one whose release was requested (any instance of any layer of
    any view, visible or not);
@@ -283,8 +284,10 @@ current then, and the adapter's release action releases the texture in the
 table only if **no adopted revision holds it**; otherwise the texture keeps
 rendering wherever an adopted snapshot shows it. When a hold ends,
 `adapterReleased` finds each pending texture no hold names and asks again, so
-progress is rechecked whenever either condition changes. The request is
-refused for a handle never registered or already released.
+progress is rechecked whenever either condition changes. A request the host
+refused leaves the texture marked and pending, and releasing the same handle
+again repeats it; a handle never registered, or whose release has run, is
+refused as `ReleaseUnknown`.
 
 Publication and release are **serialized by one lock**, with the release
 marker and the host's capture of the barrier inside it. So a snapshot accepted
