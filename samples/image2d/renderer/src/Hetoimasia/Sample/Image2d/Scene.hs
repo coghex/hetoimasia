@@ -22,6 +22,7 @@ module Hetoimasia.Sample.Image2d.Scene
   ) where
 
 import Data.Word (Word32)
+import qualified Data.Map.Strict as Map
 import Hetoimasia.Math.Affine2 (fromColumns)
 import Hetoimasia.Math.Vector (V2 (..))
 import Hetoimasia.Render.Api.Texture (TextureHandle)
@@ -65,11 +66,12 @@ snapshotFor target handles layout =
   where
     (width, height) = layoutFramebuffer layout
     view =
-      View
+      ViewWith
         { viewCamera = Camera (V2 0 0) 1 Nothing
         , viewViewport = Viewport (V2 0 0) (V2 (fromIntegral width) (fromIntegral height))
         , viewSettings = defaultViewSettings {settingUiScale = layoutUiScale layout}
         , viewClips = []
+        , viewMaterials = Map.empty
         , viewLayers =
             [ WorldLayer DepthDisabled [sprite (handlePng handles) (-80, 0) 64, sprite (handleKtx2 handles) (16, 0) 64]
             , UiLayer [sprite (handlePng handles) (8, 8) uiLogicalSize]
