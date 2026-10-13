@@ -325,14 +325,22 @@ word, the record that word indexes (the view's for a dynamic instance, the chunk
 own for a chunk's instance; empty for a material whose layout is empty), the bytes
 of the application push block the view holds for the material (`pushFloat` and
 `pushWord` read it at a byte offset, as the shader's members are laid out), and
-`materialSample`, which samples any other texture at coordinates of the model's
-choosing the way the shader's `sampleTexture` does. That sampling is
+`materialSample` and `materialSampleScaled`, which sample any other texture at
+coordinates of the model's choosing the way the shader's `sampleTexture` does.
+That sampling is
 **generation-aware**: the handle is looked up as a complete handle, so one the
 lookup does not hold, a released one or one whose index another generation now
 holds, samples the transparent placeholder; the instance's sampler choice
 applies, and the level is selected by the instance's rate of change of texture
 coordinates (so a model that scales its coordinates is sampled at the level the
-instance's own rate gives). A sample the oracle will not guess at (a nearest
+instance's own rate gives). The level follows how fast the sampled coordinates
+change, which the oracle knows only for the fragment's own: `materialSample` at
+any other coordinates, for a texture of more than one level, is the
+indeterminate case `UnrelatedSecondaryCoordinates` (a one-level texture has no
+choice to make), and a model that derives its coordinates from the fragment's
+says by what factor it scaled their rate of change with `materialSampleScaled`
+(`(2, 2)` for `uv * 2.0`, `(1, 1)` for an offset), so the level is the one the
+shader's derivatives select. A sample the oracle will not guess at (a nearest
 coordinate near a texel boundary, a minified sample whose level is between two or
 whose derivatives are sheared) is a `ModelFault` the model returns, and the oracle
 reports it as the indeterminate case it is, naming the instance
