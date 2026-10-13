@@ -43,6 +43,8 @@ packages:
   samples/triangle/app
   samples/sprites/renderer
   samples/sprites/app
+  samples/image2d/renderer
+  samples/image2d/app
   samples/scene3d/renderer
   samples/scene3d/app
   packages/glfw

@@ -72,6 +72,8 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , copyTargetToReadback
   , formatCode
   , registerConstructedTexture
+  , releaseConstructedTexture
+  , swapConstructedTexture
   , transitionResource
   , validateRingSize
   , validateTableConfig
@@ -237,6 +239,9 @@ builders construction =
     , Render.buildTable = constructTextureTable construction
     , Render.buildTableLayout = constructShaderSampledTablePipelineLayout construction
     , Render.buildPipeline = constructBlendedCheckedPipeline construction
+    , Render.registerImage = registerConstructedTexture construction
+    , Render.swapImage = swapConstructedTexture construction
+    , Render.releaseImage = releaseConstructedTexture construction
     }
 
 evidenceOver ∷ Host → FilePath → IO (Either Text [FixtureResult])

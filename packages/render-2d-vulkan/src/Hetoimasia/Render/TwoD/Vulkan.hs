@@ -112,7 +112,6 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , validateRingSize
   , writeClaim
   )
-import Hetoimasia.GPU.Vulkan.Native.Shader (CheckedShaders)
 import Hetoimasia.GPU.Vulkan.Native.TextureTable
   ( TableConfig
   , bindTable
@@ -120,22 +119,10 @@ import Hetoimasia.GPU.Vulkan.Native.TextureTable
   , validateTableConfig
   )
 import Hetoimasia.Render.TwoD.Validation (Location)
+import Hetoimasia.Render.TwoD.Vulkan.Builders (Builders (..))
 import Hetoimasia.Render.TwoD.Vulkan.Frame
 import Hetoimasia.Render.TwoD.Vulkan.Layout (instanceStride)
 import Hetoimasia.Render.TwoD.Vulkan.Shaders (orderedShaders)
-
--- | The constructions the renderer needs, as the host lends them inside an
--- owner-thread action or a frame. The record's type parameters are the host
--- session's, which only a batch's recorder names.
-data Builders q inst msgr phys dev cmd = Builders
-  { buildRing ∷ RingSize → IO (Either Refusal ())
-  , buildTable ∷ TableConfig → IO (Either Refusal ())
-  , buildTableLayout ∷ CheckedShaders → IO (Either Refusal PipelineLayout)
-    -- ^ A shader-sampled table pipeline layout: one that declares no sampler
-    -- offset, over these shaders.
-  , buildPipeline ∷ PipelineLayout → CheckedShaders → Word32 → PipelineBlend → IO (Either Refusal Pipeline)
-    -- ^ A pipeline over the layout for a colour format's @VkFormat@ code.
-  }
 
 -- | What the renderer makes with: the session's ring and its texture table.
 data Configuration = Configuration

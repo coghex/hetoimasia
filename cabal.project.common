@@ -61,6 +61,14 @@ package hetoimasia-gpu-vulkan-glfw
 package hetoimasia-render-2d-vulkan
   ghc-options: -Werror -j
 
+-- The image2d sample (R2D-8) is held to the same policy. Like the native and
+-- integration packages above, it is named only by `cabal.project.vulkan`.
+package hetoimasia-sample-image2d
+  ghc-options: -Werror -j
+
+package hetoimasia-sample-image2d-app
+  ghc-options: -Werror -j
+
 -- The scene3d sample (GRS-10) is held to the same policy. Like the native and
 -- integration packages above, it is named only by `cabal.project.vulkan`.
 package hetoimasia-sample-scene3d
