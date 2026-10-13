@@ -97,7 +97,7 @@ and clip space.
 **every** reason found, each naming where: the pass, view, layer and instance
 index (`AtPass`, `AtView`, `AtClipEntry`, `AtFrameTable`, `AtLayer`, `AtInstance`; and `AtChunk`, which names the layer, the
 chunk's position in the layer's list and the reference listed there, and `AtChunkInstance`, which names an instance of a
-chunk, used by the oracle and by the frame-table refusal of a chunk). Nothing is clamped,
+chunk, used by the oracle; and `AtChunkFrame`, which names the view, the layer, the chunk by its position and its reference, and the instance of a chunk whose frame-table index a view lacks). Nothing is clamped,
 wrapped or corrected, and a valid snapshot holds exactly the candidate's
 values in the candidate's order (`validSnapshot`). Validation is total and
 deterministic, and the refusals come in snapshot order. Everything is checked
@@ -129,7 +129,7 @@ any other.
 | `PushBlockSizeMismatch` | a view's push block for a material is not the size the reference declares (`AtPushBlock`: pass, view, material) |
 | `PushBlockMissing` | a material the view uses, by a dynamic instance or a chunk it lists, declares a non-empty push block and the view holds none (`AtPushBlock`) |
 | `FrameIndexTooLarge` | an instance's frame-table index is above 4095, which the flags word's bits 4–15 cannot hold (named by the instance; a chunk's instances are checked when it is built) |
-| `FrameIndexUnknown` | an instance's frame-table index `k` is past its view's tables, which hold fewer than `k` (named by the instance), or a chunk a layer lists has an instance whose index is (named by the listing and the first instance carrying the chunk's largest index: `AtChunkInstance`) |
+| `FrameIndexUnknown` | an instance's frame-table index `k` is past its view's tables, which hold fewer than `k` (named by the instance), or a chunk a layer lists has an instance whose index is (`AtChunkFrame`: the view, the layer, the chunk's position in the layer's list and its reference, and the first instance carrying the chunk's largest index) |
 | `FrameCountInvalid` | a frame table's count is below 1 (`AtFrameTable`: pass, view, table) |
 | `FrameDurationInvalid` | a frame table's duration is NaN, infinite, zero or negative |
 | `FrameCycleNotFinite` | a table with a valid count and duration has a count times duration that is not finite in `Double` |
@@ -432,7 +432,7 @@ chunk records, when built, its largest index and the first instance carrying it
 (`chunkLargestFrameIndex`). Validating a snapshot checks each chunk a layer lists
 against the tables of **every view that lists it**, whether or not the view culls
 it: a chunk whose largest index is past a view's tables is refused, naming the view,
-the layer, the chunk and that instance (`AtChunkInstance`). All of it happens before
+the layer, the chunk (its position in the layer's list and its reference) and that instance (`AtChunkFrame`). All of it happens before
 any GPU access.
 
 ## The draw plan
