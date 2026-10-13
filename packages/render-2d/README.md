@@ -8,18 +8,22 @@ framebuffer, UI and world space, and the 64-byte instance encoding a backend
 uploads, in submission order or in a planned layer's drawing order, and
 **retained chunks** (R2D-10): static content built once, listed by reference in
 the layers of later snapshots, merged with their dynamic content by a total
-order and culled by their bounds. Everything
+order and culled by their bounds, and **application materials** (R2D-11): the
+reference an instance names a material by, which carries the material's declared
+facts, and the records and push blocks a view and a chunk hold for it. Everything
 that records commands is [`hetoimasia-render-2d-vulkan`](../render-2d-vulkan/README.md)'s.
 The decision record is
-[the 2D renderer design](../../docs/designs/render_2d_design.md) (D-1 to D-4,
-D-7 to D-10, D-12, D-16 to D-19, D-22 to D-25, D-27, D-29, D-31; R2D-1 to R2D-3, R2D-10); the package's place among the
+[the 2D renderer design](../../docs/designs/render_2d_design.md) (D-1 to D-5,
+D-7 to D-10, D-12, D-16 to D-19, D-22 to D-27, D-29, D-31; P-6; R2D-1 to R2D-3, R2D-10, R2D-11); the package's place among the
 others is [the foundation design](../../docs/engine_foundation_design.md).
 
 | Module | Contents |
 | --- | --- |
-| `Hetoimasia.Render.TwoD.Snapshot` | `Snapshot`, `Pass`, `Target` (`WindowTarget`, `OffscreenTarget`), `ClearColour`, `View` (with its `viewClips` table), `Viewport`, `Camera`, `Layer` (the constructors `WorldLayerWith` and `UiLayerWith`, which list chunks, and the patterns `WorldLayer` and `UiLayer`, the layer that lists none), `LayerDepth`, `Instance`, `UvRect`, `Tint`, `Sampler`; `layerInstances`, `layerChunks`, `depthKeyLimit` |
+| `Hetoimasia.Render.TwoD.Snapshot` | `Snapshot`, `Pass`, `Target` (`WindowTarget`, `OffscreenTarget`), `ClearColour`, `View` (the constructor `ViewWith`, which also holds `viewMaterials`, and the pattern `View`, the view that holds none; with its `viewClips` table), `Viewport`, `Camera`, `Layer` (the constructors `WorldLayerWith` and `UiLayerWith`, which list chunks, and the patterns `WorldLayer` and `UiLayer`, the layer that lists none), `LayerDepth`, `Instance` (with `instanceParameter`, the material parameter word, and `instanceMaterial`, a `MaterialRef`), `UvRect`, `Tint`, `Sampler`; `layerInstances`, `layerChunks`, `depthKeyLimit` |
 | `Hetoimasia.Render.TwoD.Clip` | `ClipRect`, `ClipEntry` (a view's clip table is a list of them); `ResolvedClip`, `emptyClip`, `clipIsEmpty`, `clipContains` and `resolveClips`, the pure resolver; `clipEntryOfIndex` |
-| `Hetoimasia.Render.TwoD.Chunk` | `ChunkRef`, the opaque chunk reference (`Eq`, `Ord`, `Show` only); `ChunkKind` (`ChunkWorldDepth`, `ChunkWorldFlat`, `ChunkUi`), `layerChunkKind`; `Bounds`, `BoundsRequest` (`DeriveBounds`, `SuppliedBounds`); `Chunk`, `buildChunk`, `ChunkRefusal`; `chunkKind`, `chunkBounds`, `chunkSize`, `chunkInstances`, `chunkInstanceAt`, `chunkCutoutPositions`, `chunkOrderedPositions`, `chunkTextures`, `chunkPlacementMagnitude`; `Chunks`, `noChunks`, `chunksFrom`, `lookupChunk`, `chunkRefsOf` |
+| `Hetoimasia.Render.TwoD.Material` | `MaterialRef`, the opaque material reference (`Eq`, `Ord`, `Show` only), `defaultMaterial`; `materialFacts`, `materialCutoutCapable`, `materialRecordLayout`, `materialPushBytes`; `MaterialFacts`, `RecordLayout` (handles, words), `recordLayoutIsEmpty`, `recordLayoutBytes`; `MaterialRecord`, `MaterialData` (a view's records and push block for one material), `noMaterialData` |
+| `Hetoimasia.Render.TwoD.Material.Backend` | `materialRef ∷ Word64 → MaterialFacts → MaterialRef`; `materialRefIdentity`, `defaultMaterialIdentity` (the backend that registers materials, and tests standing in for one; game code does not import it) |
+| `Hetoimasia.Render.TwoD.Chunk` | `ChunkRef`, the opaque chunk reference (`Eq`, `Ord`, `Show` only); `ChunkKind` (`ChunkWorldDepth`, `ChunkWorldFlat`, `ChunkUi`), `layerChunkKind`; `Bounds`, `BoundsRequest` (`DeriveBounds`, `SuppliedBounds`); `Chunk`, `buildChunk`, `buildChunkWith` (a chunk that carries its own records), `ChunkRefusal`; `chunkKind`, `chunkBounds`, `chunkSize`, `chunkInstances`, `chunkInstanceAt`, `chunkCutoutPositions`, `chunkOrderedPositions`, `chunkTextures`, `chunkRecords`, `chunkMaterials`, `chunkPlacementMagnitude`; `Chunks`, `noChunks`, `chunksFrom`, `lookupChunk`, `chunkRefsOf` |
 | `Hetoimasia.Render.TwoD.Chunk.Backend` | `chunkRef ∷ Word32 → Word32 → ChunkRef`; `chunkRefIndex`, `chunkRefGeneration` (backends, and tests standing in for one) |
 | `Hetoimasia.Render.TwoD.Culling` | `chunkCulled`: whether a view skips a chunk of a kind and bounds, conservatively |
 | `Hetoimasia.Render.TwoD.Settings` | `ViewSettings` and `defaultViewSettings`, `TextureFilter`, `ZoomMode`; `uiScaleRange`, `brightnessRange` |
@@ -29,8 +33,8 @@ others is [the foundation design](../../docs/engine_foundation_design.md).
 | `Hetoimasia.Render.TwoD.ZoomSteps` | `ZoomSteps`, `zoomLevels`, `defaultZoomSteps`, `validateZoomSteps`; `stepZoomIn`, `stepZoomOut`; `ZoomRefusal`, `ZoomLocation`, `ZoomReason` |
 | `Hetoimasia.Render.TwoD.Metrics` | `TargetMetrics` (logical extent, framebuffer extent, per-axis content scale), `PixelExtent`; `offscreenMetrics`, `validMetrics` |
 | `Hetoimasia.Render.TwoD.Mapping` | `viewMapping ∷ TargetMetrics → View → Maybe ViewMapping`; the transforms `worldTransform`, `worldInverse`, `uiTransform`, `uiInverse`; the point conversions `worldToTarget`, `targetToWorld`, `uiToTarget`, `targetToUi`, `windowToTarget`, `targetToWindow`, `windowToWorld`, `worldToWindow`, `windowToUi`, `uiToWindow`; `viewportIsEmpty`, `viewportContains`; `snapPixel`, `snapPoint`; `mappingPixelSnap` |
-| `Hetoimasia.Render.TwoD.DrawPlan` | `planSnapshot ∷ CutoutMarks → ValidSnapshot → DrawPlan`, `planSnapshotCulled` with a `ChunkCuller` (`noCulling` skips none); `CutoutMarks` with `cutoutMarks`, `noCutoutMarks`, `isMarkedCutout`; `DrawPlan`, `PlannedPass`, `PlannedView`, `PlannedLayer`, `LayerSpace`, `DrawRun`, `DrawPath` (`Cutout`, `Ordered`), `RunSource` (`RingRun`, `ChunkRun`), `InstanceSource`, `Material` (`DefaultMaterial`) with `materialCutoutCapable`; `drawingOrder`, `drawingSources`, `runIndices` |
-| `Hetoimasia.Render.TwoD.Encoding` | `encodeLayer ∷ ValidLayer → ByteString`; `encodeLayerInDrawingOrder ∷ PlannedLayer → ValidLayer → Maybe ByteString`; `encodeChunkCutouts ∷ Chunk → ByteString`; `instanceStride`, `flagsWord` |
+| `Hetoimasia.Render.TwoD.DrawPlan` | `planSnapshot ∷ CutoutMarks → ValidSnapshot → DrawPlan`, `planSnapshotCulled` with a `ChunkCuller` (`noCulling` skips none); `CutoutMarks` with `cutoutMarks`, `noCutoutMarks`, `isMarkedCutout`; `DrawPlan`, `PlannedPass`, `PlannedView`, `PlannedLayer`, `LayerSpace`, `DrawRun`, `DrawPath` (`Cutout`, `Ordered`), `RunSource` (`RingRun`, `ChunkRun`), `RecordSource` (`NoRecords`, `ViewRecords`, `ChunkRecords`), `InstanceSource`; `drawingOrder`, `drawingSources`, `runIndices` |
+| `Hetoimasia.Render.TwoD.Encoding` | `encodeLayer ∷ ValidLayer → ByteString`; `encodeLayerInDrawingOrder ∷ PlannedLayer → ValidLayer → Maybe ByteString`; `encodeChunkCutouts ∷ Chunk → ByteString`; `encodeRecords ∷ RecordLayout → [MaterialRecord] → ByteString`; `instanceStride`, `flagsWord` |
 
 There is no collecting module and no prelude: import the module that owns what
 you use.
@@ -72,7 +76,8 @@ and clip space.
 - **Instance:** a 2×3 affine transform, a UV rectangle `(u0, v0, u1, v1)`, a
   texture handle, a depth key, an RGBA8 tint (a componentwise multiplier), a
   sampler choice (default, nearest, linear), a translucent flag, an additive
-  flag, a clip index and a material parameter word.
+  flag, a clip index, a material parameter word and the **material** it is
+  drawn with, a `MaterialRef` ([below](#application-materials)).
 - **Clip tables** ([below](#clip-tables)): a view carries an ordered table of
   clip rectangles, and an instance's clip index, 0 meaning none, selects an
   entry of its own view's table.
@@ -112,6 +117,10 @@ any other.
 | `ClipSpaceMixed` | a clip entry is referenced, directly or through a descendant, from both a world layer and a UI layer (named by the entry) |
 | `ChunkUnresolved` | a layer lists a chunk the chunks validated against do not hold: never issued, stale (another generation) or released |
 | `ChunkKindMismatch` | a layer lists a chunk built for another kind of layer |
+| `ParameterBeyondRecords` | an instance's material has records and its parameter word is not below the number of records the view holds for it (named by the instance) |
+| `RecordLayoutMismatch` | a record a view holds has not the handles and words its material's reference declares (`AtRecord`: pass, view, material, record) |
+| `PushBlockSizeMismatch` | a view's push block for a material is not the size the reference declares (`AtPushBlock`: pass, view, material) |
+| `PushBlockMissing` | a material the view uses, by a dynamic instance or a chunk it lists, declares a non-empty push block and the view holds none (`AtPushBlock`) |
 
 NaN and both infinities are refused explicitly, so no range comparison can
 accept one by accident. A snapshot holding only offscreen passes is valid, for
@@ -271,6 +280,74 @@ origin, the allowance grows with them and the chunk is kept. So a chunk whose ed
 touches the view is kept and one that cannot be decided is never discarded. Only
 chunks are culled: dynamic instances are not.
 
+## Application materials
+
+An application defines a material as a fragment function the build checks
+(`hetoimasia-render-2d-vulkan`'s splice; D-5), and the engine wraps its colour in
+the tint, the brightness and the cutout discard or the blend output, so no
+material can omit them (P-6). This package is the pure side: what an instance
+names, and the data a view and a chunk hold for it.
+
+**The reference.** A `MaterialRef` carries an opaque identity a backend chose and
+the material's declared facts: whether it is **cutout-capable** (its output alpha
+is binary wherever its primary texture's is; only such a material routes to the
+cutout path, D-25), the **layout of its records** (a number of full texture
+handles, then a number of 32-bit words), and the **size of its push block** in
+bytes (a multiple of four, zero for none). Game code can compare, order and show a
+reference and read its facts (`materialCutoutCapable`, `materialRecordLayout`,
+`materialPushBytes`); it cannot construct one, and cannot rewrite a fact of one:
+the type is exported without its constructor or a field (checked through
+separately compiled external clients), and
+`Hetoimasia.Render.TwoD.Material.Backend.materialRef` builds one from an identity
+and facts, for the backend that registers materials and for a test that stands in
+for it. Two references are equal only when the identity and every fact agree. The
+built-in default is the constant `defaultMaterial`, identity 0, which no backend
+issues another reference with: cutout-capable, an empty record, no push block.
+
+**Naming a material per instance.** `instanceMaterial` is a `MaterialRef`, the
+default material unless the instance says otherwise. It is a value the planner
+reads and is **not encoded**: the 64-byte layout is unchanged. The material
+parameter word, at byte offset 60 as before, is `instanceParameter`. It indexes
+the records the instance's view holds for its material (a chunk's instance: the
+chunk's), and reaches the material itself as a value. The default material needs
+neither a record nor a push block and ignores the word, and so does a material
+whose record layout is empty: its instances' words are not checked.
+
+**Records and push blocks.** A view holds a `MaterialData` for each material its
+instances use (`viewMaterials`): its `materialRecords`, each a `MaterialRecord`
+of the full handles and the words the layout declares, and the bytes of its push
+block, `materialPushBlock`. Every handle in a record is a full handle, a lookup
+index and a generation, which the backend resolves through the texture table's
+lookup with its generation check, so a handle released and reused samples the
+transparent placeholder (D-25). Validation refuses, naming the location, a
+parameter word beyond the records, a record whose layout does not match the one
+in its material's reference, a push block whose size is not the reference's, and
+a missing push block for a used material that declares one (the reasons above).
+These apply wherever the view sits, a zero-size viewport included. A retained
+chunk carries records of its own (`buildChunkWith`, D-31): they are checked when
+the chunk is built, and a refusal names the chunk's instance by build position
+(`ChunkParameterBeyondRecords`) or the record by material and position
+(`ChunkRecordMismatch`), after the instance refusals and before the bounds'. The
+textures a chunk's records name are among `chunkTextures`, so a snapshot that
+lists the chunk holds them with it.
+
+**Planning.** The planner routes by the reference's `materialCutoutCapable`, and
+the cutout runs are split and ordered by material (the reference's order).
+Besides a path and a material a run has a **record source** (`runRecords`): the
+view's records, or the records of the chunk listed at a position, or none for a
+material whose layout is empty. Consecutive instances share a run only when
+path, material and, where the material has records, source agree, so a run never
+mixes two tables a backend would write at two bases; the drawing order is the one
+the merge gave without the split. Two chunks using one material and one parameter
+index with different records are two runs even when everything else matches.
+
+**Encoding.** `encodeRecords layout records` writes a table's records as a
+backend puts them in its storage region: little-endian 32-bit words, record after
+record with no padding, each record a lookup index and a generation for each
+handle and then its words, so record `k` begins `k × (2 × handles + words)` words
+into its table. The function is total: a record cut short is padded with zero
+words and one that is longer is cut off at the layout.
+
 ## The draw plan
 
 `planSnapshot marks valid` is pure and total over a validated snapshot. It
@@ -285,7 +362,8 @@ A `PlannedLayer` carries its drawing order as `plannedOrder`, a permutation of
 the layer's submission indices (an unboxed array, the one structure the plan
 keeps per instance; `drawingOrder` lists it), so a recorder can encode
 instances in drawing order. A `DrawRun` names its `DrawPath` (`Cutout` or
-`Ordered`), its `Material` and a contiguous range of that permutation
+`Ordered`), its `MaterialRef` (`runMaterial`), the source of its records
+(`runRecords`) and a contiguous range of that permutation
 (`runStart`, `runCount`; `runIndices` lists it). A zero-size viewport and a
 layer with no instances hold no runs, and a zero-size viewport holds no order
 either. A world layer with depth enabled is marked `plannedClearsDepth`: it
@@ -307,13 +385,12 @@ all of these hold; every other instance takes the ordered path:
 | --- | --- |
 | it is in a world layer whose depth is enabled | without depth there is nothing to resolve overlap, so a layer without depth and every UI layer draw wholly in the ordered path |
 | its texture is marked cutout-safe | an unmarked or unknown handle is ordered |
-| its material is cutout-capable | only cutout-capable materials route to the cutout pass |
+| its material is cutout-capable | the instance's `MaterialRef` says so; only cutout-capable materials route to the cutout pass |
 | its tint alpha is 255 | a fading sprite must blend |
 | its translucent flag and its additive flag are both clear | both always take the ordered path |
 
-Until application materials exist (R2D-11), every instance uses the built-in
-`DefaultMaterial`, which is cutout-capable; how an instance names a material,
-and splitting runs between materials, arrive with application materials.
+An instance names its material by a `MaterialRef`; the built-in default is
+cutout-capable ([above](#application-materials)).
 
 **Ordering within a layer.** The cutout runs come first, ordered by material
 and then by submission sequence (an instance's position in its own layer, from
@@ -327,10 +404,11 @@ key. The order is total and repeatable: the same snapshot and marks always
 give the same plan.
 
 **Runs.** Consecutive instances in the drawing order share a run when they
-share a path and a material. A sampler choice, a tint, a depth key, a
-transform, a UV rectangle or a material parameter word never splits a run,
-because each travels in the instance; so a layer holds at most two runs until
-application materials exist, its cutout run and its ordered run.
+share a path, a material and, where the material has records, a record source.
+A sampler choice, a tint, a depth key, a transform, a UV rectangle or a material
+parameter word never splits a run, because each travels in the instance; so a
+layer that uses only the default material holds at most two runs (and the cutout
+runs of its chunks), its cutout run and its ordered run.
 
 **Equal keys (D-23).** The plan realizes two documented outcomes:
 
@@ -602,12 +680,13 @@ and the shader's snapping (R2D-7); reading window metrics and publishing per
 window (R2D-14, R2D-8); culling dynamic instances per view (chunks are culled by their bounds); expected pixels (R2D-4, in
 [`hetoimasia-render-2d-oracle`](../render-2d-oracle/README.md)); range writes into
 a chunk, which D-31 rules out (a chunk is rebuilt whole: build a new one, publish,
-release the old); the material records a chunk carries, which arrive with application
-materials (R2D-11), and splitting runs between them; computing or registering a texture's
+release the old); computing or registering a texture's
 mark (R2D-7, R2D-8); recording, shaders,
 samplers, the device buffers, uploads and holds of chunks and everything in
 `render-2d-vulkan`; publication; clip tables in retained content beyond what
-R2D-12 defines for instances; material data records; sampling offscreen
+R2D-12 defines for instances; shaders and live shader loading (D-5), a
+material that changes the vertex stage or the instance format, and mod-supplied
+materials; sampling offscreen
 targets; stencil-based or hardware clipping and rounded or non-rectangular
 clips; animation (R2D-18); and Lua bindings.
 
@@ -634,7 +713,14 @@ empty intersection and its descendants, edges that only touch, a zero extent,
 large finite coordinates and the resolver's determinism over generated tables,
 a clip index never splitting a run, an accepted index surviving the encoder,
 and, through separately compiled external clients, that a validated value and
-an offscreen target reference cannot be forged. Generated and hand-written
+an offscreen target reference cannot be forged and that a material reference can
+be neither built nor rewritten from the public module (the backend-facing
+constructor works). For materials it checks the default's constant facts, routing
+by capability, runs split and ordered by material, runs split by record source
+between the view and two chunks that use one material and one parameter index
+with different records, every record, push-block and parameter refusal at its
+location and edge (inside a zero-size viewport too), a chunk's own refusals, and
+the record encoding by bytes written out by hand. Generated and hand-written
 inputs sit side by side. For the draw plan it checks the routing of every
 combination of the conditions above (layer kind, mark, tint alpha, translucent
 and additive flags), a mark for one generation leaving another handle that

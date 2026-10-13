@@ -12,8 +12,8 @@ the input defect that stops it. A pure reader returns a pixel of a tightly
 packed readback, and a verdict compares the two. Every rendering slice proves
 itself against it ([the design](../../docs/designs/render_2d_design.md): D-12,
 *Verification strategy*), and the recorder's offscreen readbacks (R2D-7, and
-R2D-9 for the cutout path and depth, and R2D-10 for retained chunks) are its
-client. Expectations come from the
+R2D-9 for the cutout path and depth, R2D-10 for retained chunks and R2D-11 for
+application materials) are its client. Expectations come from the
 snapshot, never from an observed image.
 
 It is a pure package. The library depends on `hetoimasia-render-2d` (the
@@ -41,6 +41,10 @@ or UNORM) and its pixel extent. The metrics are what the view mappings are built
 from, and the pixel extent must be the metrics' framebuffer extent: the oracle
 checks, and refuses a disagreement, so a mapping built for one size is never
 read as another's pixels.
+
+`newOracleWith models` takes the same input and, for each application material
+the snapshot uses, its model ([below](#application-materials-r2d-11));
+`newOracle` is `newOracleWith` with none.
 
 A `Probe` names a pass by index and a pixel by column and row within that pass's
 target, with the origin at the upper left. Its expectation is the target's value
@@ -302,6 +306,56 @@ Clip index 0 means none: no clip is asked. The oracle plans with the same marks
 as the recorder, so a clipped cutout-path instance and a clipped ordered one are
 both clipped before they are shaded.
 
+## Application materials (R2D-11)
+
+An instance names its material by a `MaterialRef`
+([`render-2d`](../render-2d/README.md#application-materials)). The default
+material's model is built in: its colour is the instance's texel, which is why
+every fixture above is unchanged. Any other material needs a **model**, given by
+its reference to `newOracleWith`: a pure Haskell function of the same inputs the
+material's GLSL function receives, in `Hetoimasia.Render.TwoD.Oracle.Material`.
+
+```haskell
+newtype MaterialModel = MaterialModel {runMaterialModel ∷ MaterialInput → Either ModelFault Colour}
+```
+
+A `MaterialInput` holds the primary texel (`Colour`: premultiplied, in linear
+light, as `Double`s), the texture coordinates `(u, v)`, the instance's parameter
+word, the record that word indexes (the view's for a dynamic instance, the chunk's
+own for a chunk's instance; empty for a material whose layout is empty), the bytes
+of the application push block the view holds for the material (`pushFloat` and
+`pushWord` read it at a byte offset, as the shader's members are laid out), and
+`materialSample`, which samples any other texture at coordinates of the model's
+choosing the way the shader's `sampleTexture` does. That sampling is
+**generation-aware**: the handle is looked up as a complete handle, so one the
+lookup does not hold, a released one or one whose index another generation now
+holds, samples the transparent placeholder; the instance's sampler choice
+applies, and the level is selected by the instance's rate of change of texture
+coordinates (so a model that scales its coordinates is sampled at the level the
+instance's own rate gives). A sample the oracle will not guess at (a nearest
+coordinate near a texel boundary, a minified sample whose level is between two or
+whose derivatives are sheared) is a `ModelFault` the model returns, and the oracle
+reports it as the indeterminate case it is, naming the instance
+(`NearTexelBoundary`, `MinifiedNotAxisAligned`, `MinifiedFractionalLevel`); a
+malformed texture is `MalformedImage`.
+
+The oracle applies **the same wrapping** to the model's colour that it applies to
+the default texel: the tint and the brightness and the additive flag's lack of
+coverage on the ordered path, and the cutout variant's rule (D-26) on the cutout
+path, so a cutout-capable material's alpha, which it promises binary wherever its
+primary texture's is, meets the same threshold and the same band of
+`NearCutoutThreshold`. The model's components are inexact (tolerance 1) unless
+they are exactly 0 or 1. A material with no model is `MissingMaterialModel`, and a
+colour with a component that is not finite is `ModelOutputNotFinite`.
+
+`Hetoimasia.Render.TwoD.Oracle.Material.Sample.mixModel` is the model of the
+sample material
+("Hetoimasia.Render.TwoD.Vulkan.Material.Sample"): with `t` the texel, `s` the
+second texture sampled at the same coordinates and
+`w = clamp(strength × word ÷ 255 + bias, 0, 1)` (the push block's two floats and
+the record's word), the colour is `(mix(t.rgb, s.rgb × t.a, w), t.a)`. The tests
+check it on its own against fixtures written in them, then through the oracle.
+
 ## Verdicts and exactness
 
 An expectation is `Expected value tolerance`, `Indeterminate why` or
@@ -369,6 +423,8 @@ readback, so the oracle does:
 | `TargetTooLarge` | An extent beyond 2²³ pixels, where a pixel centre is not exactly a `Float`. |
 | `MappingNotRepresentable` | A view's mapping cannot be built, and an instance in it needs one. |
 | `PlacementNotRepresentable` | A non-singular quad's corners, or its snapped origin, are not finite `Float`s. |
+| `MissingMaterialModel` | An instance of an application material for which no model was given (`newOracleWith`), named by the instance and the material; it is never drawn as the default material. |
+| `ModelOutputNotFinite` | An instance whose material's model returned a colour with a NaN or infinite component. |
 | `MalformedImage` | A texture the lookup returned that is not a well-formed image: a zero extent, no levels or more than the extent's mip chain has, a level whose byte count is not its extent's, or BC7 levels the software decoder refuses. Byte counts are checked in `Integer`, so an extent near 2³² cannot wrap. |
 
 A malformed texture is refused only for a probe an instance covers. A readback
@@ -468,4 +524,4 @@ cabal test --project-file cabal.project.cpu hetoimasia-render-2d-oracle:render-2
 The suite is the CPU validation group `test.render-2d-oracle`; it needs no GPU
 and no display. Its components, selectable with `--test-options='--match <name>'`
 on the suite that owns them, are `Placement`, `Sampling`, `Colour`, `Probes`,
-`Depth`, `Clip`, `Chunks` and `Verdicts`.
+`Depth`, `Clip`, `Chunks`, `Materials` and `Verdicts`.
