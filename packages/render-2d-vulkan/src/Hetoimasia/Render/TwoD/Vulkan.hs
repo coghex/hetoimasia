@@ -382,7 +382,10 @@ recordPass recorder pipelines regions pass =
           , backend (setViewport recorder (Viewport 0 0 width height))
           , backend (bindTable recorder)
           ]
-    viewSteps bound view = case (workRect view, workLayers view) of
+    -- A layer that only skipped a chunk has nothing to record: a view holding no
+    -- other records no scissor.
+    recordsSomething layer = layerClearsDepth layer || not (null (layerRunList layer))
+    viewSteps bound view = case (workRect view, filter recordsSomething (workLayers view)) of
       (Just rect, layers@(_ : _)) →
         let (bound', steps) = mapAccumL (layerSteps rect) bound layers
          in (bound', backend (setScissor recorder rect) : concat steps)

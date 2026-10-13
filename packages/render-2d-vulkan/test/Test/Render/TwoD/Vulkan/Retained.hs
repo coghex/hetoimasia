@@ -514,6 +514,22 @@ cullingSpec = describe "culling a chunk by its bounds" $ do
       drawnFrom commands `shouldSatisfy` ((== 2) . length)
       (nearBuffer `elem` drawnFrom commands) `shouldBe` True
 
+  it "records no scissor and no draw in a view whose only content is a chunk it skips, the pass still beginning and ending" $
+    withSetup $ \setup → do
+      reference ← built setup ChunkUi [ordAt 500 1]
+      resetJournal (setupRig setup)
+      snapshot ← snapshotOver setup [fullView [UiLayerWith [reference] []]]
+      input ← frameFor setup snapshot
+      case frameWork input of
+        Right [pass] → map (map layerCulled . workLayers) (workViews pass) `shouldBe` [[[reference]]]
+        other → expectationFailure ("expected one pass, found " <> either show (show . length) other)
+      record setup input >>= (`shouldBe` Right ())
+      commands ← commandsRecorded (setupRig setup)
+      draws commands `shouldBe` []
+      length [() | CommandSetScissor _ ← commands] `shouldBe` 0
+      length [() | CommandBeginRendering {} ← commands] `shouldBe` 1
+      length [() | CommandEndRendering ← commands] `shouldBe` 1
+
   it "keeps a chunk in one view and skips it in another, each view planned for itself" $
     withSetup $ \setup → do
       reference ← built setup ChunkWorldDepth [cutAt 4 1]
