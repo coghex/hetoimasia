@@ -172,9 +172,10 @@ data Suite = Suite
   , suiteNeedsDepth ∷ !Bool
   }
 
--- | The ordered path's: eleven fixtures, no depth.
+-- | The ordered path's: eleven fixtures, one of them (a depth-enabled layer of
+-- art drawn ordered) over a depth image.
 orderedSuite ∷ Suite
-orderedSuite = Suite "ordered-path" "ordered-path-probes.json" textures fixtures False
+orderedSuite = Suite "ordered-path" "ordered-path-probes.json" textures fixtures True
 
 -- | One fixture's findings.
 data FixtureResult = FixtureResult

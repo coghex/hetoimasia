@@ -525,10 +525,12 @@ formats =
     unorm = offscreenShape 2 Rgba8Linear 16 16
 
 -- | A depth-enabled world layer holding cutout-marked art (binary alpha),
--- drawn ordered because nothing is marked. The art's orange texels lie on one
--- diagonal and its transparent ones on the other; the second sprite, a larger
--- key, is tinted, so where its transparent texel lies over the first's orange
--- one the first shows through, and where its orange one does it covers it.
+-- drawn ordered because nothing is marked, in a pass with a depth attachment
+-- that its tested-and-unwritten ordered instances pass against. The art's orange
+-- texels lie on one diagonal and its transparent ones on the other; the second
+-- sprite, a larger key, is tinted, so where its transparent texel lies over the
+-- first's orange one the first shows through, and where its orange one does it
+-- covers it.
 cutoutArt ∷ Fixture
 cutoutArt =
   Fixture
@@ -555,7 +557,7 @@ cutoutArt =
         ]
     }
   where
-    shape = offscreenShape 1 Rgba8Linear 24 24
+    shape = depthShape 1 Rgba8Linear 24 24
 
 -- | A handle whose index no texture holds and one that reuses a registered
 -- index with another generation both sample slot 0's transparent placeholder,

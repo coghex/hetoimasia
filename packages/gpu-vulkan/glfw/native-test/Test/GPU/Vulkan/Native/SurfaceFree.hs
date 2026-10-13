@@ -2788,7 +2788,7 @@ evidenceSection title label outcome =
       SurfaceFreeFailed _ → []
 
 orderedPathSpec ∷ SurfaceFreeOutcome → Spec
-orderedPathSpec = evidenceSpec "R2D-7 the ordered path's window-free evidence" "ordered path" 10 False
+orderedPathSpec = evidenceSpec "R2D-7 the ordered path's window-free evidence" "ordered path" 10 True
 
 cutoutDepthSpec ∷ SurfaceFreeOutcome → Spec
 cutoutDepthSpec = evidenceSpec "R2D-9 the cutout path's window-free evidence" "cutout depth" 7 True
