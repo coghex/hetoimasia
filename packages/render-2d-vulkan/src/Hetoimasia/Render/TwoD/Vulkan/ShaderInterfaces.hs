@@ -12,16 +12,19 @@ module Hetoimasia.Render.TwoD.Vulkan.ShaderInterfaces
 import Hetoimasia.GPU.Vulkan.Native.Shader.Interface
 import Hetoimasia.Render.TwoD.Vulkan.Layout (instanceVertexInput, pushMembers, reservedPushMember)
 
--- | The instance attributes ('instanceVertexInput') and the push block.
+-- | The instance attributes ('instanceVertexInput'), the push block and the
+-- storage table's binding, which holds the view's frame tables (R2D-18).
 orderedVertexInterface ∷ ShaderInterface
 orderedVertexInterface =
   (interfaceFor VertexInterface)
     { interfacePushConstants = pushMembers <> [reservedPushMember 0]
     , interfaceVertexInput = instanceVertexInput
+    , interfaceDescriptors = storageTableDescriptors
     }
 
 -- | The push block, the texture table's bindings and the storage table's
--- binding, which holds the batch's clip tables (R2D-12).
+-- binding, which holds the batch's clip tables (R2D-12), material records and
+-- frame tables.
 orderedFragmentInterface ∷ ShaderInterface
 orderedFragmentInterface =
   (interfaceFor FragmentInterface)

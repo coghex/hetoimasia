@@ -2,8 +2,9 @@
 -- combination, the reserved bits, and the clip index in the top 16 bits.
 --
 -- __Layout under test.__ Bits 0–1 the sampler choice (0 default, 1 nearest,
--- 2 linear, 3 never produced), bit 2 translucent, bit 3 additive, bits 4–15
--- reserved and zero, bits 16–31 the clip index. The expected words are written
+-- 2 linear, 3 never produced), bit 2 translucent, bit 3 additive, bits 4–15 the
+-- frame-table index (R2D-18, whose own examples are in "Test.Render.TwoD.Animation"),
+-- bits 16–31 the clip index. The expected words are written
 -- out by hand. A validated layer's clip index is always zero, so the clip
 -- packing is checked on the flags word directly, where a clip index can be set,
 -- and the encoded bytes are checked for every combination with clip zero.
@@ -62,7 +63,7 @@ samplerAndFlagsSpec = describe "sampler choice, translucent and additive" $ do
           -- The same word reaches bytes 56 to 59 of the encoded instance.
           let bytes = ByteString.unpack (encodeLayer (singleLayer (UiLayer [shaped sampler translucent additive])))
           take 4 (drop 56 bytes) `shouldBe` [fromIntegral expected, 0, 0, 0]
-          -- Reserved bits 4 to 15 and the whole clip field are zero.
+          -- An instance with no frame table has bits 4 to 15 and the whole clip field zero.
           expected .&. 0xFFFFFFF0 `shouldBe` 0
           -- The sampler code 3 is never produced.
           (expected .&. 3 /= 3) `shouldBe` True
@@ -89,20 +90,20 @@ clipSpec = describe "the clip index" $ do
     flagsWord (shaped SamplerNearest True False) {instanceClip = 0xFFFF} `shouldBe` 0xFFFF0005
     flagsWord (shaped SamplerDefault True True) {instanceClip = 1} `shouldBe` 0x0001000C
 
-  it "keeps bits 4 to 15 zero at the largest clip index with every flag set" $
+  it "keeps bits 4 to 15 zero at the largest clip index with every flag set and no frame table" $
     (flagsWord (shaped SamplerLinear True True) {instanceClip = maxBound} `shiftR` 4) .&. 0xFFF
       `shouldBe` 0
 
 propertySpec ∷ Spec
 propertySpec = describe "over any instance" $ do
-  prop "packs each field into its own bits and leaves bits 4 to 15 zero" $
+  prop "packs each field into its own bits, the frame-table index's low 12 bits in bits 4 to 15" $
     forAll anyInstance $ \candidate →
       let word = flagsWord candidate
           clip = fromIntegral (word `shiftR` 16) ∷ Word16
           code = fromIntegral (word .&. 3) ∷ Word8
        in property
             ( clip == instanceClip candidate
-                && (word `shiftR` 4) .&. 0xFFF == 0
+                && (word `shiftR` 4) .&. 0xFFF == fromIntegral (instanceFrameTable candidate .&. 0xFFF)
                 && testBit word 2 == instanceTranslucent candidate
                 && testBit word 3 == instanceAdditive candidate
                 && code /= 3

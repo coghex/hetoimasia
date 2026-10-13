@@ -13,6 +13,8 @@ module Test.Render.TwoD.Vulkan.Layout (spec) where
 
 import Data.Bits (shiftR, (.&.))
 import qualified Data.ByteString as ByteString
+import Data.ByteString.Builder (floatLE, toLazyByteString, word32LE)
+import qualified Data.ByteString.Lazy as Lazy
 import Data.Word (Word32, Word8)
 import GHC.Float (castFloatToWord32)
 import Hetoimasia.GPU.Vulkan.Native.Recording
@@ -46,6 +48,7 @@ spec = describe "Layout" $ do
   scissorSpec
   pushSpec
   clipTableSpec
+  frameBlockSpec
   attributeSpec
   depthSpec
   samplerSpec
@@ -119,10 +122,11 @@ scissorSpec = describe "the scissor of a view" $ do
 
 pushSpec ∷ Spec
 pushSpec = describe "the push block" $ do
-  it "is 76 bytes in ten members that tile it, each at its natural alignment" $ do
-    pushBytes `shouldBe` 76
+  it "is 80 bytes in eleven members that tile it, each at its natural alignment, with the application's block beginning where they end" $ do
+    pushBytes `shouldBe` 80
+    applicationPushOffset `shouldBe` 80
     [(offset, size) | PushMember offset size ← pushMembers]
-      `shouldBe` [(0, 16), (16, 8), (24, 8), (32, 4), (36, 4), (40, 4), (44, 4), (48, 16), (64, 8), (72, 4)]
+      `shouldBe` [(0, 16), (16, 8), (24, 8), (32, 4), (36, 4), (40, 4), (44, 4), (48, 16), (64, 8), (72, 4), (76, 4)]
     -- Each member starts where the one before ends.
     and (zipWith (\(PushMember offset size) (PushMember next _) → offset + size == next) pushMembers (drop 1 pushMembers)) `shouldBe` True
     sum [size | PushMember _ size ← pushMembers] `shouldBe` fromIntegral pushBytes
@@ -135,6 +139,7 @@ pushSpec = describe "the push block" $ do
               , pushInverse = fromColumns (V2 0.5 0) (V2 0 0.5) (V2 (-5) (-10))
               , pushClipBase = 3
               , pushClipCentre = (320, 240)
+              , pushFrameBase = 0x01020304
               , pushExtent = (640, 480)
               , pushBrightness = 1.5
               , pushFilter = FilterLinear
@@ -161,6 +166,7 @@ pushSpec = describe "the push block" $ do
         , [0x00, 0x00, 0xA0, 0x43] -- 64: clip centre x = 320.0 (the inverse's translation is not pushed)
         , [0x00, 0x00, 0x70, 0x43] -- 68: clip centre y = 240.0
         , [0x00, 0x00, 0x00, 0x00] -- 72: record base, zero until a run pushes its own
+        , [0x04, 0x03, 0x02, 0x01] -- 76: frame base 0x01020304, little-endian
         ]
 
   it "packs nearest as 1 and snap off as 0, with the transform's off-diagonal and negative values" $ do
@@ -171,6 +177,7 @@ pushSpec = describe "the push block" $ do
               , pushInverse = fromColumns (V2 0 (-1)) (V2 1 0) (V2 0.25 0.5)
               , pushClipBase = 0
               , pushClipCentre = (0.5, -0.25)
+              , pushFrameBase = 0
               , pushExtent = (1, 2)
               , pushBrightness = 0.5
               , pushFilter = FilterNearest
@@ -197,6 +204,7 @@ pushSpec = describe "the push block" $ do
         , [0x00, 0x00, 0x00, 0x3F] -- clip centre x = 0.5
         , [0x00, 0x00, 0x80, 0xBE] -- clip centre y = -0.25
         , [0x00, 0x00, 0x00, 0x00] -- record base
+        , [0x00, 0x00, 0x00, 0x00] -- frame base
         ]
 
   it "gives a filter the code an instance's sampler choice uses for it" $ do
@@ -426,15 +434,108 @@ clipTableSpec = describe "the clip table" $ do
     clipRepresentable (forward (2 ^^ (60 ∷ Int))) (inverse (2 ^^ (60 ∷ Int))) (32, 32) `shouldBe` True
 
 -- ---------------------------------------------------------------------------
+-- The frame tables (R2D-18)
+
+-- | Words as little-endian bytes.
+wordBytes ∷ [Word32] → ByteString.ByteString
+wordBytes = Lazy.toStrict . toLazyByteString . foldMap word32LE
+
+-- | Floats as little-endian bytes.
+floatBytes ∷ [Float] → ByteString.ByteString
+floatBytes = Lazy.toStrict . toLazyByteString . foldMap floatLE
+
+-- | A table of this many frames of this duration; frame k shows (k, 0, k + 1, 1).
+tableOf ∷ Int → Double → FrameTable
+tableOf count duration = FrameTable count duration [UvRect (fromIntegral k) 0 (fromIntegral k + 1) 1 | k ← [0 .. count - 1]]
+
+frameBlockSpec ∷ Spec
+frameBlockSpec = describe "the frame block" $ do
+  it "puts a directory of one word a table, padded to a multiple of four, before the records of 4 + 4 × count words each" $ do
+    -- Three and two frames: a directory of four words, a record of 16 and one of 12.
+    frameBlockLayout 0 [3, 2] `shouldBe` FrameBlockLayout 0 0 [4, 20] 32
+    -- Five tables take a directory of eight words; a table of one frame is eight words.
+    frameBlockLayout 0 [1, 1, 1, 1, 1] `shouldBe` FrameBlockLayout 0 0 [8, 16, 24, 32, 40] 48
+    frameBlockLayout 0 [] `shouldBe` FrameBlockLayout 0 0 [] 0
+    -- The first record begins where the directory ends, whatever the counts.
+    [take 1 (blockRecords (frameBlockLayout 0 (replicate n 1))) | n ← [1 .. 12]]
+      `shouldBe` [[4 * ((toInteger n + 3) `div` 4)] | n ← [1 .. 12 ∷ Int]]
+
+  it "begins on a 16-byte boundary, padding with zero words from the word it was asked to begin at" $ do
+    frameBlockLayout 8 [1] `shouldBe` FrameBlockLayout 8 0 [4] 12
+    frameBlockLayout 9 [1] `shouldBe` FrameBlockLayout 12 3 [4] 12
+    frameBlockLayout 10 [1] `shouldBe` FrameBlockLayout 12 2 [4] 12
+    frameBlockLayout 11 [1] `shouldBe` FrameBlockLayout 12 1 [4] 12
+
+  it "writes the directory, then each table's current frame, count, two reserved words and rectangles, as words" $ do
+    -- At time 1.25: 1.25 / 0.5 = 2.5, floor 2, 2 mod 3 = frame 2; 1.25 / 10 = 0.125, frame 0.
+    let tables = [tableOf 3 0.5, tableOf 2 10]
+        expected =
+          wordBytes [4, 20, 0, 0]
+            <> wordBytes [2, 3, 0, 0]
+            <> floatBytes [0, 0, 1, 1, 1, 0, 2, 1, 2, 0, 3, 1]
+            <> wordBytes [0, 2, 0, 0]
+            <> floatBytes [0, 0, 1, 1, 1, 0, 2, 1]
+    packFrameBlock 0 1.25 tables `shouldBe` Just expected
+    ByteString.length expected `shouldBe` 128
+
+  it "writes the zero padding first when the block is asked to begin off a boundary" $
+    packFrameBlock 9 0 [tableOf 1 1]
+      `shouldBe` Just (wordBytes [0, 0, 0] <> wordBytes [4, 0, 0, 0] <> wordBytes [0, 1, 0, 0] <> floatBytes [0, 0, 1, 1])
+
+  it "computes each table's frame with the Double formula at the view's time, exactly" $
+    mapM_
+      ( \(table, time, frame) →
+          fmap (ByteString.take 4 . ByteString.drop 16) (packFrameBlock 0 time [table]) `shouldBe` Just (wordBytes [frame])
+      )
+      [ (tableOf 2 8192, 991231.9998, 0)
+      , (tableOf 3 (2 ^ (127 ∷ Int)), 2.5 * 2 ^ (127 ∷ Int), 2)
+      , (tableOf 2 0.1, 43 * 0.1, 0)
+      , (tableOf 4 0.5, 1.5, 3)
+      , (tableOf 4 0.5, 2, 0)
+      , (tableOf 7 1, 1.0e6, 1000000 `mod` 7)
+      ]
+
+  it "cuts a table's rectangles off at its count and pads a short list with zero rectangles, so a record never moves another" $ do
+    packFrameBlock 0 0 [FrameTable 1 1 [UvRect 0 0 1 1, UvRect 9 9 9 9]]
+      `shouldBe` Just (wordBytes [4, 0, 0, 0] <> wordBytes [0, 1, 0, 0] <> floatBytes [0, 0, 1, 1])
+    packFrameBlock 0 0 [FrameTable 2 1 [UvRect 0 0 1 1]]
+      `shouldBe` Just (wordBytes [4, 0, 0, 0] <> wordBytes [0, 2, 0, 0] <> floatBytes [0, 0, 1, 1, 0, 0, 0, 0])
+
+  it "is representable when every count, offset and the block's end fit 32 bits, and not otherwise" $ do
+    frameBlockRepresentable 0 [1, 2, 3] `shouldBe` True
+    frameBlockRepresentable 0 [] `shouldBe` True
+    -- A count of 0 has no frame, and 2^32 does not fit the header's word.
+    frameBlockRepresentable 0 [0] `shouldBe` False
+    frameBlockRepresentable 0 [4294967296] `shouldBe` False
+    frameBlockRepresentable 0 [-1] `shouldBe` False
+    -- A count that fits whose record does not: 4 + 4 × (2^32 − 1) words is past 2^32 − 1.
+    frameBlockRepresentable 0 [4294967295] `shouldBe` False
+    frameBlockRepresentable 0 [1073741823] `shouldBe` False
+    -- 4 + 4 × 1073741822 = 4294967292 words, with the directory's four, is 4294967296.
+    frameBlockRepresentable 0 [1073741822] `shouldBe` False
+    -- Two records that each fit and together do not.
+    frameBlockRepresentable 0 [536870911, 536870911, 536870911] `shouldBe` False
+    -- The start counts too: the block must end by the last word a 32-bit index names.
+    frameBlockRepresentable 4294967283 [1] `shouldBe` False
+    frameBlockRepresentable 4294967280 [1] `shouldBe` True
+
+  it "writes nothing for a table whose count does not fit, before it makes any byte, whatever the list holds" $ do
+    packFrameBlock 0 0 [FrameTable 4294967296 1 []] `shouldBe` Nothing
+    packFrameBlock 0 0 [FrameTable 4294967295 1 []] `shouldBe` Nothing
+    packFrameBlock 0 0 [FrameTable 0 1 []] `shouldBe` Nothing
+    packFrameBlock 0 0 [tableOf 1 1, FrameTable 4294967296 1 []] `shouldBe` Nothing
+    packFrameBlock 4294967283 0 [tableOf 1 1] `shouldBe` Nothing
+
+-- ---------------------------------------------------------------------------
 -- The shaders' interfaces
 
 interfaceSpec ∷ Spec
 interfaceSpec = describe "the shaders' checked interfaces" $ do
-  it "declare one push block of 128 bytes in both stages: the engine's 76 and the application's bytes reserved" $
+  it "declare one push block of 128 bytes in both stages: the engine's 80 and the application's bytes reserved" $
     case (checkedVertex orderedShaders, checkedFragment orderedShaders) of
       (CheckedShader _ vertex, CheckedShader _ fragment) →
         [(offset, offset + size) | PushMember offset size ← interfacePushConstants vertex <> interfacePushConstants fragment]
-          `shouldBe` concat (replicate 2 [(0, 16), (16, 24), (24, 32), (32, 36), (36, 40), (40, 44), (44, 48), (48, 64), (64, 72), (72, 76), (80, 128)])
+          `shouldBe` concat (replicate 2 [(0, 16), (16, 24), (24, 32), (32, 36), (36, 40), (40, 44), (44, 48), (48, 64), (64, 72), (72, 76), (76, 80), (80, 128)])
 
   it "declare the instance attributes in the vertex stage, which both variants share" $
     mapM_
@@ -453,10 +554,10 @@ interfaceSpec = describe "the shaders' checked interfaces" $ do
         cutoutVertexCode `shouldBe` orderedVertexCode
         (cutoutFragmentCode == orderedFragmentCode) `shouldBe` False
 
-  it "declare the clip table's binding in the fragment stage, beside the texture table's, and none in the vertex stage" $
+  it "declare the storage region's binding in the fragment stage, beside the texture table's, and in the vertex stage, which reads the frame tables from it" $
     case (checkedVertex orderedShaders, checkedFragment orderedShaders, checkedFragment cutoutShaders) of
       (CheckedShader _ vertex, CheckedShader _ fragment, CheckedShader _ cutout) → do
-        interfaceDescriptors vertex `shouldBe` []
+        interfaceDescriptors vertex `shouldBe` storageTableDescriptors
         interfaceDescriptors fragment `shouldBe` textureTableDescriptors <> storageTableDescriptors
         interfaceDescriptors cutout `shouldBe` interfaceDescriptors fragment
 
@@ -464,7 +565,7 @@ interfaceSpec = describe "the shaders' checked interfaces" $ do
     case (checkedVertex orderedShaders, checkedFragment orderedShaders) of
       (CheckedShader _ vertex, CheckedShader _ fragment) → do
         interfacePushConstants vertex `shouldBe` interfacePushConstants fragment
-        length (interfacePushConstants vertex) `shouldBe` 11
+        length (interfacePushConstants vertex) `shouldBe` 12
 
 -- ---------------------------------------------------------------------------
 -- Fixtures
@@ -482,6 +583,7 @@ distinctInstance =
     , instanceTranslucent = True
     , instanceAdditive = True
     , instanceClip = 0
+    , instanceFrameTable = 0
     , instanceParameter = 0xDEADBEEF
     , instanceMaterial = defaultMaterial
     }

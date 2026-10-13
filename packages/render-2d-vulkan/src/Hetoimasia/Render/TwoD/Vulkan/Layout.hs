@@ -26,7 +26,7 @@
 --
 -- Both stages declare one block, in std430 order, 128 bytes, which is a
 -- guaranteed minimum of a device's @maxPushConstantsSize@. The engine owns the
--- first 80 (76 are members):
+-- first 80, all of them members:
 --
 -- > offset  size  member
 -- >      0    16  vec4 viewLinear          a, b, c, d of the layer's transform
@@ -40,6 +40,8 @@
 -- >     64     8  vec2 clipCentre          the target-pixel point the clip test is taken about
 -- >     72     4  uint recordBase          the word of the batch's storage region where
 -- >                                        the material records a run's instances index begin
+-- >     76     4  uint frameBase           the word of the batch's storage region where the
+-- >                                        view's frame tables (R2D-18) begin; 0 when it has none
 --
 -- The transform maps @(x, y)@ to @(a·x + c·y + tx, b·x + d·y + ty)@, the
 -- coefficients of "Hetoimasia.Math.Affine2" in column-major order. The block is
@@ -60,13 +62,43 @@
 -- the built-in shaders and every material's, and binding another material's
 -- pipeline never disturbs the descriptor sets or the push constants already set.
 --
--- = The storage region (R2D-11, R2D-12)
+-- = The storage region (R2D-11, R2D-12, R2D-18)
 --
--- The batch's one region holds the clip tables first and then the material
--- records ("Hetoimasia.Render.TwoD.Vulkan.Frame"'s @recordRegion@ lays them out):
--- the clip tables are read as @vec4@ entries from the region's start, and a run's
+-- The batch's one region holds the clip tables first, then the material records
+-- and then the frame tables of the views that draw
+-- ("Hetoimasia.Render.TwoD.Vulkan.Frame"'s @recordRegion@ lays them out): the
+-- clip tables are read as @vec4@ entries from the region's start, a run's
 -- @recordBase@ is the word index, from the same start, where its records'
--- table begins, so it is the clip tables' size in words and more.
+-- table begins, so it is the clip tables' size in words and more, and a layer's
+-- @frameBase@ is the word index, from the same start, where its view's frame
+-- tables begin.
+--
+-- = The frame tables (R2D-18)
+--
+-- A view's frame tables ('Hetoimasia.Render.TwoD.Snapshot.viewFrameTables') are
+-- written once for the view, in one block of 32-bit words, little-endian, std430:
+-- the block begins on a 16-byte boundary of the region, and holds first a
+-- directory with one word for each table, padded with zero words to a multiple
+-- of four, and then each table's record, in table order:
+--
+-- > word     field
+-- >   0..n−1  directory   the word, from the block's start, where table i's record begins
+-- >   (padding to a multiple of four words)
+-- > record:
+-- >   0       uint frame  the table's current frame: floor (t / duration) mod count
+-- >   1       uint count  its number of frames
+-- >   2, 3    reserved    zero, so that the rectangles begin on a 16-byte boundary
+-- >   4 + 4k  vec4 uv[k]  frame k's rectangle: u0, v0, u1, v1 as floats
+--
+-- Table @i@ is the one an instance whose frame-table index is @i + 1@ selects: the
+-- vertex stage reads the flags' bits 4–15 (0 meaning not animated), then the
+-- table's record through the directory at @frameBase@, then the rectangle at the
+-- record's current frame, and uses it in place of the instance's own. The frame
+-- is computed on the host ('Hetoimasia.Render.TwoD.Animation.currentFrame'), exactly,
+-- from the view's time, so the shader does no time arithmetic. Every table of a
+-- view that draws is written, whether or not an instance uses it, so a retained
+-- chunk, whose instances carry their indices from the time it was built, finds the
+-- tables of whichever view draws it ('frameBlockLayout', 'packFrameBlock').
 --
 -- = The clip table (R2D-12)
 --
@@ -122,6 +154,7 @@ module Hetoimasia.Render.TwoD.Vulkan.Layout
   , filterCode
   , recordBaseOffset
   , packRecordBase
+  , frameBaseOffset
   , maxPushBytes
   , applicationPushOffset
   , applicationPushLimit
@@ -133,6 +166,12 @@ module Hetoimasia.Render.TwoD.Vulkan.Layout
   , clipReference
   , rebaseClip
   , clipRepresentable
+    -- * The frame tables
+  , FrameBlockLayout (..)
+  , frameRecordHeaderWords
+  , frameBlockLayout
+  , frameBlockRepresentable
+  , packFrameBlock
     -- * Sampler choice
   , shaderSamplerIndex
   , instanceSamplerBits
@@ -159,9 +198,10 @@ import Hetoimasia.GPU.Vulkan.Native.Shader.Interface (PushMember (..))
 import Hetoimasia.Math.Affine2 (Affine2, toColumnMajor)
 import Hetoimasia.Math.Vector (V2 (..))
 import GHC.Float (float2Double)
+import Hetoimasia.Render.TwoD.Animation (currentFrame)
 import Hetoimasia.Render.TwoD.Clip (ResolvedClip (..), clipIsEmpty, emptyClip)
 import Hetoimasia.Render.TwoD.Settings (TextureFilter (..))
-import Hetoimasia.Render.TwoD.Snapshot (Viewport (..), depthKeyLimit)
+import Hetoimasia.Render.TwoD.Snapshot (FrameTable (..), UvRect (..), Viewport (..), depthKeyLimit)
 
 -- | The bytes of one instance: render-2d's 'Hetoimasia.Render.TwoD.Encoding.instanceStride'.
 instanceStride ∷ Word32
@@ -227,6 +267,9 @@ data ViewPush = ViewPush
     -- ^ The target-pixel point the fragment stage's clip test is taken about:
     -- the centre of the view's scissor, where the table's edges are measured
     -- from the layer-space point under it.
+  , pushFrameBase ∷ !Word32
+    -- ^ The word of the batch's storage region where the view's frame tables begin
+    -- (R2D-18); 0 for a view that has none, which no instance indexes.
   , pushExtent ∷ !(Word32, Word32)
     -- ^ The attachment's width and height.
   , pushBrightness ∷ !Float
@@ -250,11 +293,12 @@ pushMembers =
   , PushMember 48 16
   , PushMember 64 8
   , PushMember 72 4
+  , PushMember 76 4
   ]
 
 -- | The size of the engine's part of the block in bytes: what a layer pushes.
 pushBytes ∷ Int
-pushBytes = 76
+pushBytes = 80
 
 -- | The block, little-endian, 'pushBytes' bytes.
 packViewPush ∷ ViewPush → ByteString
@@ -271,6 +315,7 @@ packViewPush view =
       <> floatLE centreX
       <> floatLE centreY
       <> word32LE 0
+      <> word32LE (pushFrameBase view)
   where
     (width, height) = pushExtent view
     (centreX, centreY) = pushClipCentre view
@@ -280,6 +325,11 @@ packViewPush view =
 -- draws.
 recordBaseOffset ∷ Word32
 recordBaseOffset = 72
+
+-- | The offset of the frame base in the block, 76: the word of the batch's
+-- region where the view's frame tables begin, pushed with the layer's block.
+frameBaseOffset ∷ Word32
+frameBaseOffset = 76
 
 -- | The record base a run pushes at 'recordBaseOffset': the word of the batch's
 -- storage region where the records its instances index begin.
@@ -321,6 +371,81 @@ clipEntryBytes = 16
 packClipTable ∷ [ResolvedClip] → ByteString
 packClipTable =
   Lazy.toStrict . toLazyByteString . foldMap (\(ResolvedClip left top right bottom) → foldMap floatLE [left, top, right, bottom])
+
+-- | The words of a table record's header: the current frame, the count, and two
+-- reserved words, so that its rectangles begin on a 16-byte boundary.
+frameRecordHeaderWords ∷ Integer
+frameRecordHeaderWords = 4
+
+-- | Where a view's frame block puts things, in 32-bit words, computed exactly
+-- over 'Integer's so that no size or offset can wrap: for tables of these frame
+-- counts, beginning at this word of the region.
+data FrameBlockLayout = FrameBlockLayout
+  { blockStart ∷ !Integer
+  -- ^ The word where the block begins, the requested word rounded up to a
+  -- multiple of four (a 16-byte boundary of the region).
+  , blockPadding ∷ !Integer
+  -- ^ The zero words between the requested word and 'blockStart'.
+  , blockRecords ∷ ![Integer]
+  -- ^ The word, from 'blockStart', where each table's record begins: after the
+  -- directory, which is one word a table rounded up to a multiple of four.
+  , blockWords ∷ !Integer
+  -- ^ The block's size in words, from 'blockStart': the directory and every
+  -- record. The padding before it is not counted.
+  }
+  deriving (Eq, Show)
+
+-- | The layout of a frame block of tables with these frame counts, beginning at
+-- or after this word of the region.
+frameBlockLayout ∷ Integer → [Integer] → FrameBlockLayout
+frameBlockLayout from counts = FrameBlockLayout start (start - from) offsets total
+  where
+    start = 4 * ((from + 3) `div` 4)
+    directory = 4 * ((toInteger (length counts) + 3) `div` 4)
+    sizes = [frameRecordHeaderWords + 4 * max 0 count | count ← counts]
+    offsets = take (length counts) (scanl (+) directory sizes)
+    total = directory + sum sizes
+
+-- | Whether every number a frame block holds fits the 32-bit word that holds it,
+-- so that nothing is narrowed or wrapped: each table's count, each table's
+-- current frame (below its count, so representable whenever the count is), each
+-- record's offset in the directory, and the block's start and end in the region,
+-- which the layer's push block names. The block begins at or after this word.
+frameBlockRepresentable ∷ Integer → [Integer] → Bool
+frameBlockRepresentable from counts =
+  all (\count → count >= 1 && count <= limit) counts
+    && blockStart layout + blockWords layout <= limit
+    && all (<= limit) (blockRecords layout)
+  where
+    limit = toInteger (maxBound ∷ Word32)
+    layout = frameBlockLayout from counts
+
+-- | A view's frame tables as the batch's region holds them, beginning at or
+-- after this word: the zero padding to the block's boundary, the directory and
+-- the records, with the current frame of each table at the view's time
+-- ('currentFrame'). 'Nothing' when a number the block holds does not fit
+-- ('frameBlockRepresentable'), checked before any byte is made. A table's
+-- rectangles are exactly its count: fewer are padded with zero rectangles and
+-- more are cut off at the count, so a record never moves another.
+packFrameBlock ∷ Integer → Double → [FrameTable] → Maybe ByteString
+packFrameBlock from time tables
+  | not (frameBlockRepresentable from counts) = Nothing
+  | otherwise =
+      Just . Lazy.toStrict . toLazyByteString $
+        foldMap word32LE (replicate (fromInteger (blockPadding layout)) 0)
+          <> foldMap (word32LE . fromInteger) (blockRecords layout)
+          <> foldMap word32LE (replicate (fromInteger (4 * ((toInteger (length tables) + 3) `div` 4) - toInteger (length tables))) 0)
+          <> foldMap record tables
+  where
+    counts = map (toInteger . frameTableCount) tables
+    layout = frameBlockLayout from counts
+    record table =
+      word32LE (fromInteger (currentFrame time table))
+        <> word32LE (fromIntegral (frameTableCount table))
+        <> word32LE 0
+        <> word32LE 0
+        <> foldMap rectangle (take (frameTableCount table) (frameTableFrames table <> repeat (UvRect 0 0 0 0)))
+    rectangle (UvRect u0 v0 u1 v1) = foldMap floatLE [u0, v0, u1, v1]
 
 -- | The layer-space point under a target-pixel point, for the transform that
 -- takes the layer's space to target pixels: the exact inverse of the transform,

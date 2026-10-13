@@ -62,6 +62,19 @@
 -- additive flag, or the cutout variant's discard. The record is the view's for a
 -- dynamic instance and the chunk's own for a chunk's instance.
 --
+-- __Animation__ (R2D-18, design D-32). An instance whose frame-table index
+-- selects a table of its view shows, in place of its own UV rectangle, the
+-- rectangle of the table's current frame at the view's animation time, whether it
+-- is a dynamic instance or a retained chunk's (the index is the drawing view's
+-- own, so one chunk drawn in two views shows each view's frame). The frame is
+-- 'Hetoimasia.Render.TwoD.Animation.currentFrame', the formula the recorder
+-- evaluates and writes: @floor (t / duration) mod count@, the quotient the
+-- 'Double' division and the floor exact, so a time on a boundary selects the
+-- frame the formula gives, exactly. There is no tolerance and no indeterminacy
+-- band for animation: a probe is never indeterminate because of it. Everything
+-- else about the instance is its own, and the frame's rectangle is sampled, and
+-- its rate of change taken, exactly as an instance's own rectangle is.
+--
 -- __Purity.__ Every function is pure and total over a validated snapshot and
 -- the lookup it is given; the same inputs always give the same expectations.
 --
@@ -104,7 +117,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
-import Data.Maybe (mapMaybe)
+import Data.Maybe (listToMaybe, mapMaybe)
 import Data.Word (Word32, Word8)
 import Hetoimasia.Render.TwoD.Chunk (Chunk, ChunkRef, chunkCutoutPositions, chunkInstanceAt, chunkRecords)
 import Hetoimasia.Render.TwoD.Material (MaterialData (..), MaterialRecord (..), MaterialRef, defaultMaterial)
@@ -113,6 +126,7 @@ import Hetoimasia.Asset.Image (DecodedImage (..))
 import Hetoimasia.Math.Affine2 (columns, identity)
 import Hetoimasia.Math.Vector (V2 (..))
 import Hetoimasia.Render.Api.Texture (TextureHandle)
+import Hetoimasia.Render.TwoD.Animation (currentFrame, frameTableOfIndex)
 import Hetoimasia.Render.TwoD.Clip (ResolvedClip (..), clipEntryOfIndex, clipIsEmpty)
 import Hetoimasia.Render.TwoD.DrawPlan
   ( CutoutMarks
@@ -199,6 +213,7 @@ import Hetoimasia.Render.TwoD.Oracle.Readback (ReadbackFault (..), readPixel)
 import Hetoimasia.Render.TwoD.Settings (TextureFilter (..), ViewSettings (..))
 import Hetoimasia.Render.TwoD.Snapshot
   ( ClearColour
+  , FrameTable (..)
   , Instance (..)
   , Layer
   , Pass (..)
@@ -426,7 +441,7 @@ buildView chunksOf passIndex viewIndex resolved view planned =
     , ovMapping = either (const Nothing) (\spec → viewMapping (specMetrics spec) view) resolved
     , ovClips = plannedClips planned
     , ovLayers =
-        [ buildLayer passIndex viewIndex layerIndex (viewMaterials view) layer (Map.findWithDefault [] (passIndex, viewIndex, layerIndex) chunksOf) plannedLayer
+        [ buildLayer passIndex viewIndex layerIndex (viewMaterials view) (animated (viewAnimationTime view) (viewFrameTables view)) layer (Map.findWithDefault [] (passIndex, viewIndex, layerIndex) chunksOf) plannedLayer
         | (layerIndex, layer, plannedLayer) ← zip3 [0 ..] (viewLayers view) (plannedLayers planned)
         ]
     }
@@ -434,8 +449,8 @@ buildView chunksOf passIndex viewIndex resolved view planned =
 -- | A layer's instances in the order the plan draws them: each run in turn, a
 -- chunk's cutout run read from the chunk and a ring run from the layer's ring
 -- entries, which are its dynamic instances and the chunks' ordered ones.
-buildLayer ∷ Int → Int → Int → Map MaterialRef MaterialData → Layer → [(ChunkRef, Chunk)] → PlannedLayer → OracleLayer
-buildLayer passIndex viewIndex layerIndex materials layer chunks planned =
+buildLayer ∷ Int → Int → Int → Map MaterialRef MaterialData → (Instance → Instance) → Layer → [(ChunkRef, Chunk)] → PlannedLayer → OracleLayer
+buildLayer passIndex viewIndex layerIndex materials animate layer chunks planned =
   OracleLayer
     { olSpace = plannedSpace planned
     , olDepth = plannedClearsDepth planned
@@ -453,9 +468,9 @@ buildLayer passIndex viewIndex layerIndex materials layer chunks planned =
         ]
     drawn source path = case source of
       DynamicInstance index →
-        let candidate = dynamic ! index
+        let candidate = animate (dynamic ! index)
          in Drawn (AtInstance passIndex viewIndex layerIndex index) candidate path (viewModelData candidate)
-      ChunkInstance position index → case nth position chunks >>= \(_, held) → fmap ((,) held) (chunkInstanceAt held index) of
+      ChunkInstance position index → case nth position chunks >>= \(_, held) → fmap ((,) held . animate) (chunkInstanceAt held index) of
         Just (held, candidate) → Drawn (AtChunkInstance passIndex viewIndex layerIndex position index) candidate path (chunkModelData held candidate)
         Nothing → error "the plan names a chunk instance the layer's chunks do not hold"
     -- The record an instance's parameter word indexes: the view's records for a
@@ -472,6 +487,20 @@ buildLayer passIndex viewIndex layerIndex materials layer chunks planned =
     nth position items = case drop position items of
       item : _ → Just item
       [] → Nothing
+
+-- | The instance as the shader draws it in a view at this time with these frame
+-- tables (R2D-18): an animated instance shows the rectangle of its table's
+-- current frame in place of its own, and every other field is its own. The frame
+-- is 'currentFrame', the 'Double' formula the recorder writes, so a boundary is
+-- exact and no probe is indeterminate because of animation. An instance that is
+-- not animated, or names a table the view lacks (which validation refuses), is
+-- unchanged.
+animated ∷ Double → [FrameTable] → Instance → Instance
+animated time tables candidate =
+  case frameTableOfIndex (instanceFrameTable candidate) >>= \index → listToMaybe (drop index tables) of
+    Just table
+      | rect : _ ← drop (fromInteger (currentFrame time table)) (frameTableFrames table) → candidate {instanceUv = rect}
+    _ → candidate
 
 -- | The checked spec of a pass's target.
 resolveTarget ∷ OracleInput → Target → Either Failure TargetSpec

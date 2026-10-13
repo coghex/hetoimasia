@@ -58,6 +58,7 @@ distinct =
     , instanceTranslucent = True
     , instanceAdditive = True
     , instanceClip = 0
+    , instanceFrameTable = 0
     , instanceParameter = 0xDEADBEEF
     , -- A material that is not the default, which the 64 bytes do not show: the
       -- reference is a value the planner reads and is never encoded.

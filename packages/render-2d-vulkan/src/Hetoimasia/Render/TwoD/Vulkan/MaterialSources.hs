@@ -233,7 +233,7 @@ appMembers laid =
 
 -- | The vertex stage of a material: the engine's, declaring the material's push
 -- block (which it does not read) because a pipeline's two stages declare the same
--- block.
+-- block, and the storage region, from which it reads an animated instance's frame.
 materialVertexSource ∷ Laid → String
 materialVertexSource = vertexSource . appMembers
 
@@ -310,12 +310,14 @@ declaredPushMembers laid =
     <> [PushMember (applicationPushOffset + offset) (fst (pushTypeSize kind)) | PushOffset _ kind offset ← laidOffsets laid]
     <> [reservedPushMember (laidBytes laid) | laidBytes laid < applicationPushLimit]
 
--- | The vertex stage's description: the instance attributes and the push block.
+-- | The vertex stage's description: the instance attributes, the push block and
+-- the storage region, which it reads the view's frame tables from (R2D-18).
 materialVertexInterface ∷ Laid → ShaderInterface
 materialVertexInterface laid =
   (interfaceFor VertexInterface)
     { interfacePushConstants = declaredPushMembers laid
     , interfaceVertexInput = instanceVertexInput
+    , interfaceDescriptors = storageTableDescriptors
     }
 
 -- | The fragment stage's description: the push block, the texture table and the

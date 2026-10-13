@@ -81,6 +81,7 @@ plainInstance =
     , instanceTranslucent = False
     , instanceAdditive = False
     , instanceClip = 0
+    , instanceFrameTable = 0
     , instanceParameter = 0
     , instanceMaterial = defaultMaterial
     }
@@ -191,17 +192,18 @@ validInstance = do
   instanceTranslucent ← arbitrary
   instanceAdditive ← arbitrary
   instanceParameter ← arbitrary
-  pure Instance {instanceClip = 0, instanceMaterial = defaultMaterial, ..}
+  pure Instance {instanceClip = 0, instanceFrameTable = 0, instanceMaterial = defaultMaterial, ..}
 
 -- | An instance whose every field takes its whole range, including a clip
--- index and a depth key beyond the limit. For the flags word and the encoder's
+-- index, a frame-table index and a depth key beyond the limit. For the flags word and the encoder's
 -- layout, not for validation.
 anyInstance ∷ Gen Instance
 anyInstance = do
   base ← validInstance
   clip ← arbitrary
+  frame ← arbitrary
   key ← arbitrary
-  pure base {instanceClip = clip, instanceDepthKey = key}
+  pure base {instanceClip = clip, instanceFrameTable = frame, instanceDepthKey = key}
 
 -- | A layer of valid instances.
 validLayerGen ∷ Gen Layer

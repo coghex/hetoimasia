@@ -72,6 +72,8 @@ snapshotFor target handles layout =
         , viewSettings = defaultViewSettings {settingUiScale = layoutUiScale layout}
         , viewClips = []
         , viewMaterials = Map.empty
+        , viewFrameTables = []
+        , viewAnimationTime = 0
         , viewLayers =
             [ WorldLayer DepthDisabled [sprite (handlePng handles) (-80, 0) 64, sprite (handleKtx2 handles) (16, 0) 64]
             , UiLayer [sprite (handlePng handles) (8, 8) uiLogicalSize]
@@ -92,6 +94,7 @@ sprite handle (x, y) side =
     , instanceTranslucent = False
     , instanceAdditive = False
     , instanceClip = 0
+    , instanceFrameTable = 0
     , instanceParameter = 0
     , instanceMaterial = defaultMaterial
     }

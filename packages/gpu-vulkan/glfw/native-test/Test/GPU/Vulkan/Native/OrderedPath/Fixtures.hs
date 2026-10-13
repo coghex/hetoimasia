@@ -223,6 +223,7 @@ quad (x, y) (w, h) handle =
     , instanceTranslucent = False
     , instanceAdditive = False
     , instanceClip = 0
+    , instanceFrameTable = 0
     , instanceParameter = 0
     , instanceMaterial = defaultMaterial
     }

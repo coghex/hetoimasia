@@ -66,6 +66,28 @@
 -- inside a zero-size viewport too. A chunk's own records are checked when the
 -- chunk is built ("Hetoimasia.Render.TwoD.Chunk").
 --
+-- __Frame tables__ (R2D-18). A view holds an ordered list of frame tables and an
+-- animation time. Every table is checked, whether or not an instance uses it and
+-- wherever the view sits, a zero-size viewport included, each named by its pass,
+-- view and index ('AtFrameTable'): a count below 1 ('FrameCountInvalid'); a
+-- duration that is not finite and positive ('FrameDurationInvalid'); a count times
+-- the duration that is not finite in 'Double' ('FrameCycleNotFinite'); the view's
+-- time over the duration, the 'Double' division, not finite ('FramePhaseNotFinite');
+-- a list of rectangles whose length is not the count ('FrameUvCountMismatch'); and
+-- a rectangle with a NaN or infinite value ('FrameUvNotFinite'). The view's time,
+-- named by the view, must be finite and not negative ('AnimationTimeInvalid'). The
+-- cycle is asked of a table whose count and duration are themselves valid, and the
+-- quotient of a table whose duration and a view whose time are, so that each
+-- refusal names its own cause. An instance's frame-table index above 4095 is
+-- refused ('FrameIndexTooLarge'), and one beyond the tables of the view that draws
+-- the instance is ('FrameIndexUnknown'), each named by the instance. A chunk's
+-- instances are checked at build for the first, and the chunk, as recorded when it
+-- was built, for the second against the tables of each view whose layer lists it,
+-- whether or not the view culls it: the refusal names the view, the layer, the
+-- chunk (its position in the layer's list and the reference listed there) and its
+-- first instance carrying the largest index ('AtChunkFrame'). Within a view
+-- the table refusals come after the clip table's entries and before its layers'.
+--
 -- __Dependencies.__ @base@, @containers@ for the set of chunks and the clip
 -- table's reach, @hetoimasia-math@ for the affine type, and this package's clip,
 -- snapshot, chunk, material and settings modules.
@@ -102,6 +124,15 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 import Hetoimasia.Math.Affine2 (toColumnMajor)
 import Hetoimasia.Math.Vector (V2 (..))
+import Hetoimasia.Render.TwoD.Animation
+  ( cycleFinite
+  , durationValid
+  , frameTableOfIndex
+  , framesFinite
+  , maxFrameIndex
+  , phaseFinite
+  , timeValid
+  )
 import Hetoimasia.Render.TwoD.Clip (ClipEntry (..), ClipRect (..), clipEntryOfIndex)
 import Hetoimasia.Render.TwoD.Internal.Check (allFinite, finite, positiveFinite, withinClosed)
 import Hetoimasia.Render.TwoD.Internal.Chunk (Chunk (..), ChunkKind, Chunks (..), layerChunkKind)
@@ -122,6 +153,7 @@ import Hetoimasia.Render.TwoD.Settings
 import Hetoimasia.Render.TwoD.Snapshot
   ( Camera (..)
   , ClearColour (..)
+  , FrameTable (..)
   , Instance (..)
   , Layer (..)
   , Pass (..)
@@ -160,6 +192,13 @@ data Location
   | -- | The push block a view holds, or lacks, for a material: pass, view and
     -- the material.
     AtPushBlock !Int !Int !MaterialRef
+  | -- | The frame table at this index of the view's tables: pass, view, table.
+    AtFrameTable !Int !Int !Int
+  | -- | The first instance of a chunk a layer lists that carries the chunk's
+    -- largest frame-table index: pass, view, layer, the chunk's position in the
+    -- layer's list, the reference listed there, and the instance's build
+    -- position in the chunk.
+    AtChunkFrame !Int !Int !Int !Int !ChunkRef !Int
   deriving stock (Eq, Ord, Show)
 
 -- | Why a candidate was refused. A reason names no value; the location says
@@ -222,6 +261,28 @@ data Reason
   | -- | A material the view uses, which declares a non-empty push block, and the
     -- view holds none for it.
     PushBlockMissing
+  | -- | A frame-table index above 4095, which the flags word's bits 4–15 cannot
+    -- hold.
+    FrameIndexTooLarge
+  | -- | A frame-table index beyond the view's tables: an instance with index @k@
+    -- in a view that holds fewer than @k@ tables, or a chunk, drawn in such a
+    -- view, whose largest index @k@ is beyond them.
+    FrameIndexUnknown
+  | -- | A frame table with a count below 1.
+    FrameCountInvalid
+  | -- | A frame table whose duration is NaN, infinite, zero or negative.
+    FrameDurationInvalid
+  | -- | A frame table whose count times its duration is not finite in 'Double'.
+    FrameCycleNotFinite
+  | -- | A frame table whose duration, with the view's time, gives a quotient
+    -- that is not finite in 'Double'.
+    FramePhaseNotFinite
+  | -- | A frame table whose list of rectangles is not as long as its count.
+    FrameUvCountMismatch
+  | -- | A frame table rectangle with a NaN or infinite value.
+    FrameUvNotFinite
+  | -- | A view's animation time that is NaN, infinite or negative.
+    AnimationTimeInvalid
   deriving stock (Eq, Ord, Show, Enum, Bounded)
 
 -- | One reason a candidate was refused, and where.
@@ -322,8 +383,9 @@ viewRefusals held passIndex viewIndex view =
   viewOwnRefusals (Refusal (AtView passIndex viewIndex)) view
     <> materialRefusals held passIndex viewIndex view
     <> clipEntryRefusals passIndex viewIndex (viewClips view)
+    <> animationRefusals passIndex viewIndex view
     <> concat
-      [ layerRefusals held (viewMaterials view) passIndex viewIndex (length (viewClips view)) layerIndex layer
+      [ layerRefusals held (viewMaterials view) passIndex viewIndex (length (viewClips view)) (length (viewFrameTables view)) layerIndex layer
       | (layerIndex, layer) ← zip [0 ..] (viewLayers view)
       ]
     <> mixedSpaceRefusals passIndex viewIndex view
@@ -394,6 +456,29 @@ clipEntryRefusals passIndex viewIndex entries =
     , let at = Refusal (AtClipEntry passIndex viewIndex index)
     ]
 
+-- | The refusals of a view's animation: its time, then each frame table, table by
+-- table, in the order 'Reason' lists them. The cycle is asked only of a table
+-- whose count and duration are valid, and the quotient only of a table whose
+-- duration is valid in a view whose time is, so a refusal never repeats the cause
+-- another names.
+animationRefusals ∷ Int → Int → View → [Refusal]
+animationRefusals passIndex viewIndex view =
+  [Refusal (AtView passIndex viewIndex) AnimationTimeInvalid | not (timeValid time)]
+    <> concat
+      [ [at FrameCountInvalid | count < 1]
+          <> [at FrameDurationInvalid | not (durationValid duration)]
+          <> [at FrameCycleNotFinite | count >= 1, durationValid duration, not (cycleFinite table)]
+          <> [at FramePhaseNotFinite | timeValid time, durationValid duration, not (phaseFinite time table)]
+          <> [at FrameUvCountMismatch | toInteger (length (frameTableFrames table)) /= toInteger count]
+          <> [at FrameUvNotFinite | not (framesFinite table)]
+      | (index, table) ← zip [0 ..] (viewFrameTables view)
+      , let at = Refusal (AtFrameTable passIndex viewIndex index)
+            count = frameTableCount table
+            duration = frameTableDuration table
+      ]
+  where
+    time = viewAnimationTime view
+
 -- | A finite rectangle whose extent is not negative.
 validClipRect ∷ ClipRect → Bool
 validClipRect (ClipRect (V2 x y) (V2 width height)) =
@@ -430,17 +515,37 @@ mixedSpaceRefusals passIndex viewIndex view =
 
 -- | The chunks a layer lists come first, in the order it lists them, then its
 -- dynamic instances, whose clip indices are checked against the view's table.
-layerRefusals ∷ Map.Map ChunkRef Chunk → Map.Map MaterialRef MaterialData → Int → Int → Int → Int → Layer → [Refusal]
-layerRefusals held materials passIndex viewIndex tableSize layerIndex layer =
+layerRefusals ∷ Map.Map ChunkRef Chunk → Map.Map MaterialRef MaterialData → Int → Int → Int → Int → Int → Layer → [Refusal]
+layerRefusals held materials passIndex viewIndex tableSize frameTables layerIndex layer =
   concat
     [ chunkRefusals (AtChunk passIndex viewIndex layerIndex position reference) (layerChunkKind layer) (Map.lookup reference held)
+        <> chunkFrameRefusals (AtChunkFrame passIndex viewIndex layerIndex position reference) frameTables (Map.lookup reference held)
     | (position, reference) ← zip [0 ..] (layerChunks layer)
     ]
     <> concat
       [ instanceRefusals tableSize (AtInstance passIndex viewIndex layerIndex index) candidate
         <> [Refusal (AtInstance passIndex viewIndex layerIndex index) ParameterBeyondRecords | parameterBeyond materials candidate]
+        <> [Refusal (AtInstance passIndex viewIndex layerIndex index) FrameIndexUnknown | frameIndexUnknown frameTables candidate]
       | (index, candidate) ← zip [0 ..] (layerInstances layer)
       ]
+
+-- | Whether the instance's frame-table index selects a table beyond a view's.
+frameIndexUnknown ∷ Int → Instance → Bool
+frameIndexUnknown tables candidate = case frameTableOfIndex (instanceFrameTable candidate) of
+  Just table → table >= tables
+  Nothing → False
+
+-- | The refusal of a chunk the view lists whose largest frame-table index is
+-- beyond the view's tables, named by the first instance carrying that index.
+-- Made for a chunk the view culls too: the chunk is drawn in some other frame,
+-- and an index is the view's own.
+chunkFrameRefusals ∷ (Int → Location) → Int → Maybe Chunk → [Refusal]
+chunkFrameRefusals at tables = \case
+  Just built
+    | Just (largest, first) ← chunkFrameField built
+    , toInteger largest > toInteger tables →
+        [Refusal (at first) FrameIndexUnknown]
+  _ → []
 
 -- | Whether the instance's material has records and its parameter word does not
 -- index one of those the view holds.
@@ -463,12 +568,15 @@ instanceRefusals tableSize location = map (Refusal location) . instanceReasons t
 -- empty exactly when every one of its values is acceptable, a clip index being
 -- acceptable when it is 0 or selects an entry of a table of this many entries.
 -- A retained chunk validates its instances with the same function when it is
--- built, against no table.
+-- built, against no table. The frame-table index is checked here only against
+-- the 12 bits the flags word holds ('FrameIndexTooLarge'): which tables exist is
+-- the drawing view's, and a chunk has none.
 instanceReasons ∷ Int → Instance → [Reason]
 instanceReasons tableSize candidate =
   [TransformNotFinite | not (allFinite (toColumnMajor (instanceTransform candidate)))]
     <> [UvNotFinite | not (allFinite [u0, v0, u1, v1])]
     <> [DepthKeyTooLarge | instanceDepthKey candidate >= depthKeyLimit]
     <> [ClipIndexUnknown | Just entry ← [clipEntryOfIndex (instanceClip candidate)], entry >= tableSize]
+    <> [FrameIndexTooLarge | instanceFrameTable candidate > maxFrameIndex]
   where
     UvRect u0 v0 u1 v1 = instanceUv candidate

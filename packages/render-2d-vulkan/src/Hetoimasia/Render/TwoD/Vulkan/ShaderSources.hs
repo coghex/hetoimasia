@@ -36,7 +36,9 @@ import Hetoimasia.Render.TwoD.Vulkan.Layout (applicationPushLimit, applicationPu
 -- | The vertex stage: the unit square placed through the instance's and the
 -- view's transforms, snapped rigidly when the view snaps, with the depth the
 -- instance's key gives constant across the quad, and the instance's clip index
--- passed on flat.
+-- passed on flat. An animated instance (frame-table index in the flags' bits
+-- 4–15, R2D-18) takes its texture rectangle from the current frame of its view's
+-- table, which the batch's region holds, in place of its own.
 vertexSource ∷ String → String
 vertexSource appMembers = vertexHead <> pushBlockSource appMembers <> vertexBody
 
@@ -54,6 +56,13 @@ vertexHead =
           layout(location = 6) in uint flags;
           layout(location = 7) in uint parameter;
           layout(location = 8) in uint depthKey;
+
+          // The batch's storage region (R2D-12, R2D-11, R2D-18), read as words:
+          // here only the view's frame tables, which a vertex of an animated
+          // instance reads its texture rectangle from.
+          layout(set = 2, binding = 0, std430) readonly buffer Region {
+              uint words[];
+          } region;
 
         |]
 
@@ -83,6 +92,22 @@ vertexBody =
               return whole + step(vec2(0.5), p - whole);
           }
 
+          // The texture rectangle of the current frame of the view's table for a
+          // frame-table index k > 0 (R2D-18): the directory at frameBase gives
+          // the word, from frameBase, where table k - 1's record begins; the
+          // record holds the table's current frame, as the host computed it,
+          // then its count and two reserved words, then one vec4 rectangle for
+          // each frame. No time arithmetic is done here.
+          vec4 frameRectangle(uint index) {
+              uint record = pushed.frameBase + region.words[pushed.frameBase + index - 1u];
+              uint at4 = record + 4u + region.words[record] * 4u;
+              return vec4(
+                  uintBitsToFloat(region.words[at4]),
+                  uintBitsToFloat(region.words[at4 + 1u]),
+                  uintBitsToFloat(region.words[at4 + 2u]),
+                  uintBitsToFloat(region.words[at4 + 3u]));
+          }
+
           // (2^24 - 1 - k) / 2^24 for a key below 2^24 (design D-23): the
           // numerator has 24 bits at most and the denominator is a power of
           // two, so the depth is exact, and a larger key is nearer.
@@ -100,7 +125,11 @@ vertexBody =
                   vec2 origin = viewed(translation);
                   target += snapped(origin) - origin;
               }
-              at = mix(uvRect.xy, uvRect.zw, corner);
+              // The instance's own rectangle, or its table's current frame's:
+              // the flags' bits 4-15 hold the table's index, 0 meaning none.
+              uint frameIndex = (flags >> 4u) & 0xFFFu;
+              vec4 rectangle = frameIndex == 0u ? uvRect : frameRectangle(frameIndex);
+              at = mix(rectangle.xy, rectangle.zw, corner);
               handle = uvec2(handleIndex, handleGeneration);
               tinted = tint;
               attributes = uvec2(flags, parameter);
@@ -251,6 +280,7 @@ pushBlockSource appMembers =
     , "    vec4 inverseLinear;"
     , "    vec2 clipCentre;"
     , "    uint recordBase;"
+    , "    uint frameBase;"
     , appMembers
     , "} pushed;"
     , ""
