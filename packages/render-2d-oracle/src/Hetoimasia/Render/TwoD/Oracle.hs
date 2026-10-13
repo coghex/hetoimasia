@@ -277,6 +277,9 @@ data Indeterminate
   | -- | A nearest-filtered coordinate within 1/16 texel of an interior boundary
     -- between texels that differ.
     NearTexelBoundary !Location
+  | -- | A model sampled a texture of more than one level at coordinates other
+    -- than the fragment's own without saying how fast they change.
+    UnrelatedSecondaryCoordinates !Location
   | -- | The probe's centre is within 1/16 pixel of the boundary of the clip
     -- rectangle of an instance that could draw there.
     NearClipEdge !Location
@@ -688,7 +691,8 @@ materialColour oracle spec view given instanceValue location placed local@(lx, l
                 , materialParameter = instanceParameter instanceValue
                 , materialRecord = modelRecord given
                 , materialPush = modelPush given
-                , materialSample = \handle (su, sv) → sampleAnother handle (toRational su, toRational sv)
+                , materialSample = \handle (su, sv) → sampleAnother handle (toRational su, toRational sv) (1, 1) (own su sv)
+                , materialSampleScaled = \handle (su, sv) (ku, kv) → sampleAnother handle (toRational su, toRational sv) (toRational ku, toRational kv) True
                 }
         case runMaterialModel model input of
           Left fault → Left (faultFragment location fault)
@@ -704,9 +708,12 @@ materialColour oracle spec view given instanceValue location placed local@(lx, l
     v = r v0 + (r v1 - r v0) * ly
     -- A texture sampled at coordinates of the model's choosing: with the same
     -- placement, the rate of change of its coordinates is the instance's own.
-    sampleAnother handle at = case sampleTextureAt oracle spec view instanceValue location placed handle at of
+    sampleAnother handle at scale ownCoordinates = case sampleTextureAt oracle spec view instanceValue location placed handle at scale ownCoordinates of
       Left fragment → Left (modelFaultOf handle fragment)
       Right source → Right (colourOf source)
+    -- Whether the coordinates are the fragment's own, to the precision of a
+    -- 'Double'.
+    own su sv = abs (toRational su - u) <= 1 / 1000000000 && abs (toRational sv - v) <= 1 / 1000000000
 
 -- | A source as the colour a model reads.
 colourOf ∷ Source → Colour
@@ -731,12 +738,14 @@ faultFragment location = \case
   SampleMinifiedNotAxisAligned _ → Unsure (MinifiedNotAxisAligned location)
   SampleMinifiedFractionalLevel _ → Unsure (MinifiedFractionalLevel location)
   SampleMalformedImage handle fault → Bad (MalformedImage location handle fault)
+  SampleCoordinatesUnrelated _ → Unsure (UnrelatedSecondaryCoordinates location)
 
 -- | The fault a fragment that says why there is no sample comes to.
 modelFaultOf ∷ TextureHandle → Fragment → ModelFault
 modelFaultOf handle = \case
   Unsure (MinifiedNotAxisAligned _) → SampleMinifiedNotAxisAligned handle
   Unsure (MinifiedFractionalLevel _) → SampleMinifiedFractionalLevel handle
+  Unsure (UnrelatedSecondaryCoordinates _) → SampleCoordinatesUnrelated handle
   Bad (MalformedImage _ _ fault) → SampleMalformedImage handle fault
   _ → SampleNearTexelBoundary handle
 
@@ -744,7 +753,7 @@ modelFaultOf handle = \case
 -- fragment that says why there is none.
 sampleTexture ∷ Oracle → TargetSpec → OracleView → Instance → Location → Placement → TextureHandle → (Rational, Rational) → Either Fragment Source
 sampleTexture oracle spec view instanceValue location placed handle (lx, ly) =
-  sampleTextureAt oracle spec view instanceValue location placed handle (u, v)
+  sampleTextureAt oracle spec view instanceValue location placed handle (u, v) (1, 1) True
   where
     UvRect u0 v0 u1 v1 = instanceUv instanceValue
     r = toRational
@@ -752,18 +761,23 @@ sampleTexture oracle spec view instanceValue location placed handle (lx, ly) =
     v = r v0 + (r v1 - r v0) * ly
 
 -- | A texture sampled at these texture coordinates, with the instance's sampler
--- choice, and the level its rate of change of coordinates selects: the
--- instance's own, since it is the instance's quad that is placed.
-sampleTextureAt ∷ Oracle → TargetSpec → OracleView → Instance → Location → Placement → TextureHandle → (Rational, Rational) → Either Fragment Source
-sampleTextureAt oracle spec view instanceValue location placed handle (u, v) =
+-- choice, and the level selected by the instance's rate of change of texture
+-- coordinates times this factor in each direction. Coordinates that are not the
+-- fragment's own and carry no declared factor ('False') are unrelated to that
+-- rate, which decides the level of a texture of more than one level, so for such
+-- a texture they are the indeterminate case.
+sampleTextureAt ∷ Oracle → TargetSpec → OracleView → Instance → Location → Placement → TextureHandle → (Rational, Rational) → (Rational, Rational) → Bool → Either Fragment Source
+sampleTextureAt oracle spec view instanceValue location placed handle (u, v) (scaleU, scaleV) ownCoordinates =
   case oracleTextures oracle handle of
     Nothing → Right placeholder
     Just decoded → case checkImage decoded of
       Left fault → Left (Bad (MalformedImage location handle fault))
       Right image → case imageLevels image of
         [] → Left (Bad (MalformedImage location handle (LevelCountInvalid 0)))
-        Level width0 height0 _ : _ →
-          let slopes = derivatives (inverseLinear placed) (r u0, r v0, r u1, r v1) (width0, height0)
+        Level width0 height0 _ : _
+          | not ownCoordinates && length (imageLevels image) > 1 → Left (Unsure (UnrelatedSecondaryCoordinates location))
+          | otherwise →
+          let slopes = derivatives (inverseLinear placed) (r u0 * scaleU, r v0 * scaleV, r u1 * scaleU, r v1 * scaleV) (width0, height0)
            in case chooseLevel (length (imageLevels image)) slopes of
                 Left NotAxisAligned → Left (Unsure (MinifiedNotAxisAligned location))
                 Left FractionalLevel → Left (Unsure (MinifiedFractionalLevel location))

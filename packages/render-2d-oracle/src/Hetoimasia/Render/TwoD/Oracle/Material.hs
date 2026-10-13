@@ -92,6 +92,10 @@ data ModelFault
     SampleMinifiedFractionalLevel !TextureHandle
   | -- | A texture the lookup returned that is not a well-formed image.
     SampleMalformedImage !TextureHandle !ImageFault
+  | -- | A texture of more than one level sampled by 'materialSample' at
+    -- coordinates other than the fragment's own: how fast they change is the
+    -- model's to say ('materialSampleScaled'), and the level depends on it.
+    SampleCoordinatesUnrelated !TextureHandle
   deriving stock (Eq, Show)
 
 -- | What a model is given.
@@ -111,7 +115,16 @@ data MaterialInput = MaterialInput
   -- ^ A texture sampled at these coordinates, as the shader's sampling function
   -- does: the instance's sampler choice, the placeholder for a handle the
   -- lookup does not hold, and the level the instance's rate of change of
-  -- texture coordinates selects.
+  -- texture coordinates selects. That level is the right one only where the
+  -- coordinates change as the fragment's own do, so for a texture of more than
+  -- one level any other coordinates are a 'SampleCoordinatesUnrelated' fault;
+  -- a model that offsets or scales the coordinates says so with
+  -- 'materialSampleScaled'.
+  , materialSampleScaled ∷ TextureHandle → (Double, Double) → (Double, Double) → Either ModelFault Colour
+  -- ^ The same at coordinates the model derived from the fragment's own, given
+  -- the factor by which it multiplied their rate of change in each direction:
+  -- @(1, 1)@ for an offset, @(2, 2)@ for @uv * 2.0@. The level is selected by
+  -- the instance's rate of change times that factor.
   }
 
 -- | A pure model of one material, from the inputs its function receives to the

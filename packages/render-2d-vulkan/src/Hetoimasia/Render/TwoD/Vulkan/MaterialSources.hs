@@ -261,28 +261,32 @@ recordSupport (RecordLayout handles wordCount) =
       , "// A record of the material's layout: its handles, then its words. An array"
       , "// the layout leaves empty has one element, never read, which is zero."
       , "struct MaterialRecord {"
-      , "    uvec2 handles[" <> show (max 1 handles) <> "];"
-      , "    uint words[" <> show (max 1 wordCount) <> "];"
+      , "    uvec2 handles[" <> show (max 1 handleCount) <> "];"
+      , "    uint words[" <> show (max 1 wordTotal) <> "];"
       , "};"
       , ""
       , "MaterialRecord loadRecord(uint index) {"
       , "    MaterialRecord record;"
       ]
-        <> ["    record.handles[" <> show k <> "] = uvec2(0u, 0u);" | k ← [0 .. max 1 handles - 1]]
-        <> ["    record.words[" <> show k <> "] = 0u;" | k ← [0 .. max 1 wordCount - 1]]
+        <> ["    record.handles[" <> show k <> "] = uvec2(0u, 0u);" | k ← [0 .. max 1 handleCount - 1]]
+        <> ["    record.words[" <> show k <> "] = 0u;" | k ← [0 .. max 1 wordTotal - 1]]
         <> loads
         <> ["    return record;", "}"]
     )
   where
-    stride = 2 * handles + wordCount
+    -- Signed counts, so that a layout with no handle or no word counts down from
+    -- nothing rather than wrapping a Word32 to billions of assignments.
+    handleCount = fromIntegral handles ∷ Int
+    wordTotal = fromIntegral wordCount ∷ Int
+    stride = 2 * handleCount + wordTotal
     loads
       | stride == 0 = []
       | otherwise =
           ["    uint base = pushed.recordBase + index * " <> show stride <> "u;"]
             <> [ "    record.handles[" <> show k <> "] = uvec2(region.words[base + " <> show (2 * k) <> "u], region.words[base + " <> show (2 * k + 1) <> "u]);"
-               | k ← [0 .. handles - 1]
+               | k ← [0 .. handleCount - 1]
                ]
-            <> ["    record.words[" <> show k <> "] = region.words[base + " <> show (2 * handles + k) <> "u];" | k ← [0 .. wordCount - 1]]
+            <> ["    record.words[" <> show k <> "] = region.words[base + " <> show (2 * handleCount + k) <> "u];" | k ← [0 .. wordTotal - 1]]
 
 -- | The instance's material at its fragment: its function applied to the sampled
 -- texel, the coordinates, the parameter word and the record the word indexes.

@@ -89,6 +89,7 @@ spec = describe "application materials" $ do
   wrappingSpec
   recordSpec
   samplingSpec
+  scaledSpec
   diagnosticSpec
   chunkSpec
 
@@ -104,6 +105,7 @@ inputWith texel second weight push =
     , materialRecord = recordFor h2 weight
     , materialPush = push
     , materialSample = \_ _ → Right second
+    , materialSampleScaled = \_ _ _ → Right second
     }
 
 run ∷ MaterialInput → Either ModelFault Colour
@@ -252,6 +254,45 @@ samplingSpec = describe "sampling a further texture" $ do
         run' sampler = bytesAt (oracleOf [translucentRef] [] [(h1, base), (h2, two)] (viewWith [(translucentRef, MaterialData [recordFor h2 255] (pushOf 1 0))] [UiLayer [(mixed translucentRef h1 (2, 2)) {instanceSampler = sampler}]])) 2 2
     run' SamplerNearest `shouldSatisfy` (either (== "indeterminate: NearTexelBoundary (AtInstance 0 0 0 0)") (const False))
     run' SamplerLinear `shouldSatisfy` near (Rgba8 128 128 128 255)
+
+-- * Coordinates a model derives from the fragment's
+
+scaledSpec ∷ Spec
+scaledSpec = describe "a further texture of several levels, sampled at coordinates the model derived" $ do
+  let -- 4 × 4 texels in three levels: level 0 red, level 1 green, yellow, cyan and white, level 2 blue.
+      layered =
+        rgba8
+          False
+          4
+          4
+          [ flat 16 (255, 0, 0, 255)
+          , concat [[0, 255, 0, 255], [255, 255, 0, 255], [0, 255, 255, 255], [255, 255, 255, 255]]
+          , flat 1 (0, 0, 255, 255)
+          ]
+      view' = viewWith [(translucentRef, MaterialData [recordFor h2 0] (pushOf 0 0))] [UiLayer [(sprite h1 (2, 2) (4, 4)) {instanceMaterial = translucentRef}]]
+      textures = [(h1, solid False (200, 100, 0, 255)), (h2, layered)]
+      answer model =
+        bytesAt
+          ( newOracleWith
+              (Map.singleton translucentRef model)
+              OracleInput
+                { inputSnapshot = validated [offscreenPass noClear [view']]
+                , inputCutoutMarks = cutoutMarks []
+                , inputWindow = Nothing
+                , inputOffscreen = Map.singleton offscreenRef unorm8
+                , inputTextures = \handle → lookup handle textures
+                }
+          )
+          3
+          3
+      doubled (u, v) = (2 * u, 2 * v)
+  it "selects the level the instance's rate of change gives, for the fragment's own coordinates" $
+    answer (MaterialModel (\input → materialSample input h2 (materialUv input))) `shouldBe` Right (Rgba8 255 0 0 255)
+  it "selects the level the model's declared factor gives: uv * 2 over the same quad is a 2:1 minification, level 1 (the pixel at local (3/8, 3/8) reads its texel (1, 1), white)" $
+    answer (MaterialModel (\input → materialSampleScaled input h2 (doubled (materialUv input)) (2, 2))) `shouldBe` Right (Rgba8 255 255 255 255)
+  it "is indeterminate, naming the instance, for other coordinates that declare no factor" $
+    answer (MaterialModel (\input → materialSample input h2 (doubled (materialUv input))))
+      `shouldBe` Left "indeterminate: UnrelatedSecondaryCoordinates (AtInstance 0 0 0 0)"
 
 -- * What the oracle will not guess
 

@@ -19,6 +19,7 @@ import qualified Data.ByteString as ByteString
 import Data.ByteString.Builder (floatLE, toLazyByteString, word32LE)
 import qualified Data.ByteString.Lazy as Lazy
 import Data.List (isInfixOf)
+import Data.Maybe (isJust)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Word (Word32, Word64)
@@ -78,6 +79,7 @@ import System.Directory (createDirectoryIfMissing)
 import System.FilePath (takeDirectory, (</>))
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
 import Test.Render.TwoD.Vulkan.Environment
+import Test.Render.TwoD.Vulkan.Materials.Layouts (handlesOnlyMaterial, wordsOnlyMaterial)
 import Test.Render.TwoD.Vulkan.StandIn
 
 spec ∷ Spec
@@ -363,6 +365,10 @@ splicedSpec = describe "a spliced material" $ do
 
 registrationSpec ∷ Spec
 registrationSpec = describe "registering a material" $ do
+  it "splices a record of handles only, and one of words only, with each variant its facts call for" $ do
+    definedFacts handlesOnlyMaterial `shouldBe` MaterialFacts True (RecordLayout 1 0) 0
+    definedFacts wordsOnlyMaterial `shouldBe` MaterialFacts False (RecordLayout 0 1) 0
+    (isJust (definedCutout handlesOnlyMaterial), isJust (definedCutout wordsOnlyMaterial)) `shouldBe` (True, False)
   it "issues a reference carrying exactly the facts the splice recorded" $
     withFixtures $ \fixtures → do
       map materialFacts [fixMix fixtures, fixTranslucent fixtures, fixTint fixtures]
