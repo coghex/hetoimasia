@@ -37,6 +37,20 @@
 -- oracle is built so that a chunk whose bounds do not is not possible. A
 -- fragment of a chunk's instance is named by its 'AtChunkInstance' location.
 --
+-- __Application materials__ (R2D-11). An instance names its material by a
+-- reference. The default material's model is built in: its output is the
+-- texel itself. Any other material needs a 'MaterialModel'
+-- ("Hetoimasia.Render.TwoD.Oracle.Material") given to 'newOracleWith' under its
+-- reference, a pure function of the inputs the material receives — the
+-- instance's texel, texture coordinates and parameter word, its record, the
+-- view's push block for the material, and the sampling of any further texture
+-- through the same lookup and generation check. A fragment of an instance
+-- whose material has no model is 'Unevaluable' ('MissingMaterialModel'), never
+-- drawn as the default. The oracle applies the same wrapping to the model's
+-- colour that it applies to the default texel: the tint, the brightness and the
+-- additive flag, or the cutout variant's discard. The record is the view's for a
+-- dynamic instance and the chunk's own for a chunk's instance.
+--
 -- __Purity.__ Every function is pure and total over a validated snapshot and
 -- the lookup it is given; the same inputs always give the same expectations.
 --
@@ -52,6 +66,7 @@ module Hetoimasia.Render.TwoD.Oracle
     -- * The oracle
   , Oracle
   , newOracle
+  , newOracleWith
   , probeTarget
 
     -- * Probes and expectations
@@ -75,11 +90,13 @@ module Hetoimasia.Render.TwoD.Oracle
 import Control.Monad (unless)
 import Data.Array (listArray, (!))
 import Data.ByteString (ByteString)
+import qualified Data.ByteString as ByteString
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import Data.Maybe (mapMaybe)
 import Data.Word (Word32, Word8)
-import Hetoimasia.Render.TwoD.Chunk (Chunk, ChunkRef, chunkCutoutPositions, chunkInstanceAt)
+import Hetoimasia.Render.TwoD.Chunk (Chunk, ChunkRef, chunkCutoutPositions, chunkInstanceAt, chunkRecords)
+import Hetoimasia.Render.TwoD.Material (MaterialData (..), MaterialRecord (..), MaterialRef, defaultMaterial)
 import Hetoimasia.Render.TwoD.Culling (chunkCulled)
 import Hetoimasia.Asset.Image (DecodedImage (..))
 import Hetoimasia.Math.Affine2 (columns)
@@ -126,6 +143,12 @@ import Hetoimasia.Render.TwoD.Oracle.Colour
   , formatIsSrgb
   , withinTolerance
   )
+import Hetoimasia.Render.TwoD.Oracle.Material
+  ( Colour (..)
+  , MaterialInput (..)
+  , MaterialModel (..)
+  , ModelFault (..)
+  )
 import Hetoimasia.Render.TwoD.Oracle.Internal.Geometry
   ( Coverage (..)
   , Placement
@@ -139,11 +162,14 @@ import Hetoimasia.Render.TwoD.Oracle.Internal.Geometry
   )
 import Hetoimasia.Render.TwoD.Oracle.Internal.Image (Image (..), ImageFault (..), Level (..), checkImage)
 import Hetoimasia.Render.TwoD.Oracle.Internal.Pipeline
-  ( Cut (..)
+  ( Chan (..)
+  , Cut (..)
+  , Quad (..)
   , Source
   , blend
   , clearPixel
   , cutout
+  , pinChan
   , pixelOutcome
   , shade
   )
@@ -267,6 +293,12 @@ data Failure
     PlacementNotRepresentable !Location
   | -- | A texture the lookup returned, which is not a well-formed image.
     MalformedImage !Location !TextureHandle !ImageFault
+  | -- | An instance of an application material for which no model was given:
+    -- the instance, and the material.
+    MissingMaterialModel !Location !MaterialRef
+  | -- | An instance whose material's model returned a colour with a component
+    -- that is NaN or infinite.
+    ModelOutputNotFinite !Location
   deriving stock (Eq, Show)
 
 -- | A snapshot prepared for probing. Building it checks nothing eagerly: every
@@ -274,6 +306,7 @@ data Failure
 data Oracle = Oracle
   { oraclePasses ∷ [OraclePass]
   , oracleTextures ∷ TextureHandle → Maybe DecodedImage
+  , oracleModels ∷ Map MaterialRef MaterialModel
   }
 
 data OraclePass = OraclePass
@@ -298,19 +331,34 @@ data OracleLayer = OracleLayer
   , olInstances ∷ [Drawn]
   }
 
--- | An instance in its layer's drawing order: where it is, the instance and the
--- path the plan gave it.
-data Drawn = Drawn !Location !Instance !DrawPath
+-- | What an instance's material is given beyond the instance: the record its
+-- parameter word indexes, from its view or its chunk, and the view's push block.
+data ModelData = ModelData
+  { modelRecord ∷ !MaterialRecord
+  , modelPush ∷ !ByteString
+  }
 
--- | Prepare a snapshot for probing.
+-- | An instance in its layer's drawing order: where it is, the instance, the
+-- path the plan gave it and what its material is given.
+data Drawn = Drawn !Location !Instance !DrawPath !ModelData
+
+-- | Prepare a snapshot for probing, with no application material's model: an
+-- instance of one is unevaluable.
 newOracle ∷ OracleInput → Oracle
-newOracle input =
+newOracle = newOracleWith Map.empty
+
+-- | Prepare a snapshot for probing, with a model for each application material
+-- it uses ("Hetoimasia.Render.TwoD.Oracle.Material"). The default material's is
+-- built in and need not be given, and one that is given for it is ignored.
+newOracleWith ∷ Map MaterialRef MaterialModel → OracleInput → Oracle
+newOracleWith models input =
   Oracle
     { oraclePasses =
         [ buildPass input chunksOf passIndex pass planned
         | (passIndex, pass, planned) ← zip3 [0 ..] (snapshotPasses snapshot) (planPasses plan)
         ]
     , oracleTextures = inputTextures input
+    , oracleModels = models
     }
   where
     snapshot = validSnapshot (inputSnapshot input)
@@ -355,7 +403,7 @@ buildView chunksOf passIndex viewIndex resolved view planned =
     , ovSettings = viewSettings view
     , ovMapping = either (const Nothing) (\spec → viewMapping (specMetrics spec) view) resolved
     , ovLayers =
-        [ buildLayer passIndex viewIndex layerIndex layer (Map.findWithDefault [] (passIndex, viewIndex, layerIndex) chunksOf) plannedLayer
+        [ buildLayer passIndex viewIndex layerIndex (viewMaterials view) layer (Map.findWithDefault [] (passIndex, viewIndex, layerIndex) chunksOf) plannedLayer
         | (layerIndex, layer, plannedLayer) ← zip3 [0 ..] (viewLayers view) (plannedLayers planned)
         ]
     }
@@ -363,8 +411,8 @@ buildView chunksOf passIndex viewIndex resolved view planned =
 -- | A layer's instances in the order the plan draws them: each run in turn, a
 -- chunk's cutout run read from the chunk and a ring run from the layer's ring
 -- entries, which are its dynamic instances and the chunks' ordered ones.
-buildLayer ∷ Int → Int → Int → Layer → [(ChunkRef, Chunk)] → PlannedLayer → OracleLayer
-buildLayer passIndex viewIndex layerIndex layer chunks planned =
+buildLayer ∷ Int → Int → Int → Map MaterialRef MaterialData → Layer → [(ChunkRef, Chunk)] → PlannedLayer → OracleLayer
+buildLayer passIndex viewIndex layerIndex materials layer chunks planned =
   OracleLayer
     { olSpace = plannedSpace planned
     , olDepth = plannedClearsDepth planned
@@ -381,10 +429,23 @@ buildLayer passIndex viewIndex layerIndex layer chunks planned =
         | index ← take (runCount run) (drop (runStart run) (maybe [] (chunkCutoutPositions . snd) (nth position chunks)))
         ]
     drawn source path = case source of
-      DynamicInstance index → Drawn (AtInstance passIndex viewIndex layerIndex index) (dynamic ! index) path
-      ChunkInstance position index → case nth position chunks >>= \(_, held) → chunkInstanceAt held index of
-        Just candidate → Drawn (AtChunkInstance passIndex viewIndex layerIndex position index) candidate path
+      DynamicInstance index →
+        let candidate = dynamic ! index
+         in Drawn (AtInstance passIndex viewIndex layerIndex index) candidate path (viewModelData candidate)
+      ChunkInstance position index → case nth position chunks >>= \(_, held) → fmap ((,) held) (chunkInstanceAt held index) of
+        Just (held, candidate) → Drawn (AtChunkInstance passIndex viewIndex layerIndex position index) candidate path (chunkModelData held candidate)
         Nothing → error "the plan names a chunk instance the layer's chunks do not hold"
+    -- The record an instance's parameter word indexes: the view's records for a
+    -- dynamic instance, the chunk's own for a chunk's.
+    viewModelData candidate =
+      let held = Map.lookup (instanceMaterial candidate) materials
+       in ModelData (recordAt (maybe [] materialRecords held) candidate) (maybe ByteString.empty materialPushBlock held)
+    chunkModelData built candidate =
+      ModelData (recordAt (Map.findWithDefault [] (instanceMaterial candidate) (chunkRecords built)) candidate) (viewPush candidate)
+    viewPush candidate = maybe ByteString.empty materialPushBlock (Map.lookup (instanceMaterial candidate) materials)
+    recordAt records candidate = case drop (fromIntegral (instanceParameter candidate)) records of
+      found : _ → found
+      [] → MaterialRecord [] []
     nth position items = case drop position items of
       item : _ → Just item
       [] → Nothing
@@ -476,7 +537,7 @@ layerFragments oracle spec x y view mapping layer
   | olDepth layer =
       depthTested
         [ (path, nearness (instanceDepthKey instanceValue), fragment)
-        | drawn@(Drawn _ instanceValue path) ← olInstances layer
+        | drawn@(Drawn _ instanceValue path _) ← olInstances layer
         , Just fragment ← [instanceFragment oracle spec x y view mapping (olSpace layer) drawn]
         ]
   | otherwise = mapMaybe (instanceFragment oracle spec x y view mapping (olSpace layer)) (olInstances layer)
@@ -503,7 +564,7 @@ depthTested = go 1
 
 -- | Whether an instance has area, so that drawing it needs the view's mapping.
 needsMapping ∷ Drawn → Bool
-needsMapping (Drawn _ instanceValue _) = not (instanceIsSingular (instanceTransform instanceValue))
+needsMapping (Drawn _ instanceValue _ _) = not (instanceIsSingular (instanceTransform instanceValue))
 
 -- | A viewport's four edges, exactly.
 viewportEdges ∷ Viewport → [((Rational, Rational), (Rational, Rational))]
@@ -520,7 +581,7 @@ viewportEdges (Viewport (V2 ox oy) (V2 width height)) =
     bottomLeft = (left, bottom)
 
 instanceFragment ∷ Oracle → TargetSpec → Int → Int → OracleView → ViewMapping → LayerSpace → Drawn → Maybe Fragment
-instanceFragment oracle spec x y view mapping space (Drawn location instanceValue path)
+instanceFragment oracle spec x y view mapping space (Drawn location instanceValue path given)
   | instanceIsSingular transform = Nothing
   | otherwise = case placement of
       Nothing → Just (Bad (PlacementNotRepresentable location))
@@ -530,8 +591,8 @@ instanceFragment oracle spec x y view mapping space (Drawn location instanceValu
             Outside → Nothing
             NearEdge → Just (Unsure (NearQuadEdge location))
             Inside local
-              | onCutoutPath → Just (cutoutSampled oracle spec view instanceValue location placed local)
-              | otherwise → Just (sampled oracle spec view instanceValue location placed local)
+              | onCutoutPath → Just (cutoutSampled oracle spec view given instanceValue location placed local)
+              | otherwise → Just (sampled oracle spec view given instanceValue location placed local)
   where
     transform = instanceTransform instanceValue
     onCutoutPath = path == Cutout
@@ -552,27 +613,109 @@ instanceFragment oracle spec x y view mapping space (Drawn location instanceValu
 
 -- | The fragment an ordered-path instance draws at a pixel its quad covers, at
 -- local coordinates @(lx, ly)@.
-sampled ∷ Oracle → TargetSpec → OracleView → Instance → Location → Placement → (Rational, Rational) → Fragment
-sampled oracle spec view instanceValue location placed local =
-  either id (Draws . lit) (texelAt oracle spec view instanceValue location placed local)
+sampled ∷ Oracle → TargetSpec → OracleView → ModelData → Instance → Location → Placement → (Rational, Rational) → Fragment
+sampled oracle spec view given instanceValue location placed local =
+  either id (Draws . lit) (materialColour oracle spec view given instanceValue location placed local)
   where
     lit = shade (instanceTint instanceValue) (settingBrightness (ovSettings view)) (instanceAdditive instanceValue)
 
 -- | The fragment a cutout-path instance gives at such a pixel: the cutout
--- variant's rule (design D-26) on the sample.
-cutoutSampled ∷ Oracle → TargetSpec → OracleView → Instance → Location → Placement → (Rational, Rational) → Fragment
-cutoutSampled oracle spec view instanceValue location placed local =
-  case texelAt oracle spec view instanceValue location placed local of
+-- variant's rule (design D-26) on the material's colour.
+cutoutSampled ∷ Oracle → TargetSpec → OracleView → ModelData → Instance → Location → Placement → (Rational, Rational) → Fragment
+cutoutSampled oracle spec view given instanceValue location placed local =
+  case materialColour oracle spec view given instanceValue location placed local of
     Left fragment → fragment
-    Right texel → case cutout (instanceTint instanceValue) (settingBrightness (ovSettings view)) texel of
+    Right colour → case cutout (instanceTint instanceValue) (settingBrightness (ovSettings view)) colour of
       Discarded → Discards
       Survives source → Draws source
       AtThreshold → Unsure (NearCutoutThreshold location)
 
+-- | The colour the instance's material gives at a pixel its quad covers: the
+-- texel itself for the default material, and otherwise the material's model
+-- applied to the texel, the coordinates, the parameter word, the record and the
+-- push block. Or the fragment that says why there is none.
+materialColour ∷ Oracle → TargetSpec → OracleView → ModelData → Instance → Location → Placement → (Rational, Rational) → Either Fragment Source
+materialColour oracle spec view given instanceValue location placed local@(lx, ly)
+  | material == defaultMaterial = texel
+  | otherwise = case Map.lookup material (oracleModels oracle) of
+      Nothing → Left (Bad (MissingMaterialModel location material))
+      Just model → do
+        primary ← texel
+        let input =
+              MaterialInput
+                { materialTexel = colourOf primary
+                , materialUv = (fromRational u, fromRational v)
+                , materialParameter = instanceParameter instanceValue
+                , materialRecord = modelRecord given
+                , materialPush = modelPush given
+                , materialSample = \handle (su, sv) → sampleAnother handle (toRational su, toRational sv)
+                }
+        case runMaterialModel model input of
+          Left fault → Left (faultFragment location fault)
+          Right output
+            | not (finiteColour output) → Left (Bad (ModelOutputNotFinite location))
+            | otherwise → Right (sourceOf output)
+  where
+    material = instanceMaterial instanceValue
+    texel = sampleTexture oracle spec view instanceValue location placed (instanceTexture instanceValue) local
+    UvRect u0 v0 u1 v1 = instanceUv instanceValue
+    r = toRational
+    u = r u0 + (r u1 - r u0) * lx
+    v = r v0 + (r v1 - r v0) * ly
+    -- A texture sampled at coordinates of the model's choosing: with the same
+    -- placement, the rate of change of its coordinates is the instance's own.
+    sampleAnother handle at = case sampleTextureAt oracle spec view instanceValue location placed handle at of
+      Left fragment → Left (modelFaultOf handle fragment)
+      Right source → Right (colourOf source)
+
+-- | A source as the colour a model reads.
+colourOf ∷ Source → Colour
+colourOf (Quad red green blue alpha) = Colour (channel red) (channel green) (channel blue) (channel alpha)
+  where
+    channel = fromRational . chanValue
+
+-- | The source a model's colour is: its components, none of them exact unless
+-- they are exactly zero or one.
+sourceOf ∷ Colour → Source
+sourceOf (Colour red green blue alpha) = Quad (channel red) (channel green) (channel blue) (channel alpha)
+  where
+    channel value = pinChan (Chan (toRational value) False)
+
+finiteColour ∷ Colour → Bool
+finiteColour (Colour red green blue alpha) = all (\value → not (isNaN value || isInfinite value)) [red, green, blue, alpha]
+
+-- | The fragment a fault of a model's own sampling comes to.
+faultFragment ∷ Location → ModelFault → Fragment
+faultFragment location = \case
+  SampleNearTexelBoundary _ → Unsure (NearTexelBoundary location)
+  SampleMinifiedNotAxisAligned _ → Unsure (MinifiedNotAxisAligned location)
+  SampleMinifiedFractionalLevel _ → Unsure (MinifiedFractionalLevel location)
+  SampleMalformedImage handle fault → Bad (MalformedImage location handle fault)
+
+-- | The fault a fragment that says why there is no sample comes to.
+modelFaultOf ∷ TextureHandle → Fragment → ModelFault
+modelFaultOf handle = \case
+  Unsure (MinifiedNotAxisAligned _) → SampleMinifiedNotAxisAligned handle
+  Unsure (MinifiedFractionalLevel _) → SampleMinifiedFractionalLevel handle
+  Bad (MalformedImage _ _ fault) → SampleMalformedImage handle fault
+  _ → SampleNearTexelBoundary handle
+
 -- | The texel an instance samples at local coordinates @(lx, ly)@, or the
 -- fragment that says why there is none.
-texelAt ∷ Oracle → TargetSpec → OracleView → Instance → Location → Placement → (Rational, Rational) → Either Fragment Source
-texelAt oracle spec view instanceValue location placed (lx, ly) =
+sampleTexture ∷ Oracle → TargetSpec → OracleView → Instance → Location → Placement → TextureHandle → (Rational, Rational) → Either Fragment Source
+sampleTexture oracle spec view instanceValue location placed handle (lx, ly) =
+  sampleTextureAt oracle spec view instanceValue location placed handle (u, v)
+  where
+    UvRect u0 v0 u1 v1 = instanceUv instanceValue
+    r = toRational
+    u = r u0 + (r u1 - r u0) * lx
+    v = r v0 + (r v1 - r v0) * ly
+
+-- | A texture sampled at these texture coordinates, with the instance's sampler
+-- choice, and the level its rate of change of coordinates selects: the
+-- instance's own, since it is the instance's quad that is placed.
+sampleTextureAt ∷ Oracle → TargetSpec → OracleView → Instance → Location → Placement → TextureHandle → (Rational, Rational) → Either Fragment Source
+sampleTextureAt oracle spec view instanceValue location placed handle (u, v) =
   case oracleTextures oracle handle of
     Nothing → Right placeholder
     Just decoded → case checkImage decoded of
@@ -588,11 +731,8 @@ texelAt oracle spec view instanceValue location placed (lx, ly) =
                   Left AtTexelBoundary → Left (Unsure (NearTexelBoundary location))
                   Right source → Right source
   where
-    handle = instanceTexture instanceValue
     UvRect u0 v0 u1 v1 = instanceUv instanceValue
     r = toRational
-    u = r u0 + (r u1 - r u0) * lx
-    v = r v0 + (r v1 - r v0) * ly
     settings = ovSettings view
     filtering = case instanceSampler instanceValue of
       SamplerDefault → settingFilter settings

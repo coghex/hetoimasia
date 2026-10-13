@@ -44,6 +44,8 @@ library
     exposed-modules:
         Hetoimasia.Render.TwoD.Oracle
         Hetoimasia.Render.TwoD.Oracle.Colour
+        Hetoimasia.Render.TwoD.Oracle.Material
+        Hetoimasia.Render.TwoD.Oracle.Material.Sample
         Hetoimasia.Render.TwoD.Oracle.Readback
     -- Exact placement and coverage, the checked image and its texel access,
     -- the filtering and level selection, and the colour pipeline, which only
@@ -77,6 +79,7 @@ test-suite render-2d-oracle-tests
         Test.Render.TwoD.Oracle.Chunks
         Test.Render.TwoD.Oracle.Colour
         Test.Render.TwoD.Oracle.Depth
+        Test.Render.TwoD.Oracle.Materials
         Test.Render.TwoD.Oracle.Placement
         Test.Render.TwoD.Oracle.Probes
         Test.Render.TwoD.Oracle.Sampling

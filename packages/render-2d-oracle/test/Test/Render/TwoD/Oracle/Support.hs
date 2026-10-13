@@ -54,6 +54,7 @@ import Hetoimasia.Math.Vector (V2 (..))
 import Hetoimasia.Render.Api.Texture (TextureHandle)
 import Hetoimasia.Render.Api.Texture.Backend (textureHandle)
 import Hetoimasia.Render.TwoD.DrawPlan (CutoutMarks, noCutoutMarks)
+import Hetoimasia.Render.TwoD.Material (defaultMaterial)
 import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), offscreenMetrics)
 import Hetoimasia.Render.TwoD.Oracle
 import Hetoimasia.Render.TwoD.Oracle.Colour (ColourFormat (..), Rgba8 (..))
@@ -122,7 +123,8 @@ sprite handle (x, y) (w, h) =
     , instanceTranslucent = False
     , instanceAdditive = False
     , instanceClip = 0
-    , instanceMaterial = 0
+    , instanceParameter = 0
+    , instanceMaterial = defaultMaterial
     }
 
 -- | A camera at the origin, zoom 1, no rotation.
