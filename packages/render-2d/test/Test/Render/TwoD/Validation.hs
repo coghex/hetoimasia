@@ -93,7 +93,7 @@ acceptedSpec ∷ Spec
 acceptedSpec = describe "an accepted snapshot" $ do
   it "is unchanged by validation, with every layer in its place" $ do
     let first = UiLayer [plainInstance, plainInstance {instanceDepthKey = 5}]
-        second = WorldLayer DepthDisabled [plainInstance {instanceMaterial = 9}]
+        second = WorldLayer DepthDisabled [plainInstance {instanceParameter = 9}]
         snapshot =
           Snapshot
             [ plainPass (offscreen 3) [plainView [first], plainView [second, first]]
@@ -202,10 +202,12 @@ refusalSpec = describe "a refused snapshot" $ do
     refusals
 
   -- The two reasons about retained chunks are about what a snapshot lists, not
-  -- about its own values; "Test.Render.TwoD.Chunks" exercises them.
-  it "is exercised for every reason the module can give but the chunk ones" $
+  -- about its own values; "Test.Render.TwoD.Chunks" exercises them. The four
+  -- about application materials are about the data a view holds for them;
+  -- "Test.Render.TwoD.Materials" exercises them.
+  it "is exercised for every reason the module can give but the chunk and the material ones" $
     sort (nub [refusalReason refusal | (_, _, expected) ← refusals, refusal ← expected])
-      `shouldBe` [reason | reason ← [minBound .. maxBound], reason `notElem` [ChunkUnresolved, ChunkKindMismatch]]
+      `shouldBe` [reason | reason ← [minBound .. maxBound], reason `notElem` [ChunkUnresolved, ChunkKindMismatch, ParameterBeyondRecords, RecordLayoutMismatch, PushBlockSizeMismatch, PushBlockMissing]]
 
   it "ignores a fixed half-height outside the fixed half-height mode" $
     refusalsOf (withSettings defaultViewSettings {settingZoomMode = PixelsPerUnit}) `shouldBe` []

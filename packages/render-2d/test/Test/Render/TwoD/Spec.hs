@@ -7,6 +7,7 @@ import qualified Test.Render.TwoD.DrawPlan as DrawPlan
 import qualified Test.Render.TwoD.Encoding as Encoding
 import qualified Test.Render.TwoD.Flags as Flags
 import qualified Test.Render.TwoD.Mapping as Mapping
+import qualified Test.Render.TwoD.Materials as Materials
 import qualified Test.Render.TwoD.Opacity as Opacity
 import qualified Test.Render.TwoD.Snapping as Snapping
 import qualified Test.Render.TwoD.Validation as Validation
@@ -23,5 +24,6 @@ spec = describe "TwoD" $ do
   Encoding.spec
   DrawPlan.spec
   Chunks.spec
+  Materials.spec
   Flags.spec
   Opacity.spec

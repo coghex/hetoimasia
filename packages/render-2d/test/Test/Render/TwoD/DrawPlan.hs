@@ -24,6 +24,7 @@ import Hetoimasia.Math.Vector (V2 (..))
 import Hetoimasia.Render.Api.Texture (TextureHandle)
 import Hetoimasia.Render.Api.Texture.Backend (textureHandle)
 import Hetoimasia.Render.TwoD.DrawPlan
+import Hetoimasia.Render.TwoD.Material (defaultMaterial, materialCutoutCapable)
 import Hetoimasia.Render.TwoD.Settings (ViewSettings, defaultViewSettings)
 import Hetoimasia.Render.TwoD.Snapshot
 import Hetoimasia.Render.TwoD.Validation (Location (..), validateSnapshot)
@@ -100,11 +101,11 @@ unmarkedAt key = plainInstance {instanceDepthKey = key, instanceTexture = textur
 -- | Number the instances in submission order through the material word, which
 -- the plan never reads, so a drawn instance can be named by its tag.
 tagged ∷ [Instance] → [Instance]
-tagged = zipWith (\n candidate → candidate {instanceMaterial = n}) [0 ..]
+tagged = zipWith (\n candidate → candidate {instanceParameter = n}) [0 ..]
 
 -- | The tags of the instances in the order the layer draws them.
 drawnTags ∷ PlannedLayer → [Instance] → [Word32]
-drawnTags planned instances = [instanceMaterial (instances !! index) | index ← drawingOrder planned]
+drawnTags planned instances = [instanceParameter (instances !! index) | index ← drawingOrder planned]
 
 runShapes ∷ PlannedLayer → [(DrawPath, Int, Int)]
 runShapes planned = [(runPath run, runStart run, runCount run) | run ← plannedRuns planned]
@@ -128,7 +129,7 @@ routingSpec = describe "routing" $ do
   it "routes the cutout-eligible instance to a single cutout run in a depth-enabled world layer" $ do
     let planned = layerPlan marked (depthLayer [cutoutAt 3])
     runShapes planned `shouldBe` [(Cutout, 0, 1)]
-    runMaterial <$> plannedRuns planned `shouldBe` [DefaultMaterial]
+    runMaterial <$> plannedRuns planned `shouldBe` [defaultMaterial]
   it "takes the ordered path for an unmarked texture and for an unknown handle" $ do
     runShapes (layerPlan noCutoutMarks (depthLayer [cutoutAt 1])) `shouldBe` [(Ordered, 0, 1)]
     runShapes (layerPlan marked (depthLayer [unmarkedAt 1])) `shouldBe` [(Ordered, 0, 1)]
@@ -302,9 +303,9 @@ runSpec = describe "runs" $ do
   it "are not split by sampler, tint colour, depth key, transform, UV or material parameter word" $ do
     let varied =
           [ plainInstance {instanceSampler = SamplerNearest, instanceDepthKey = 9}
-          , plainInstance {instanceSampler = SamplerLinear, instanceTint = Tint 1 2 3 255, instanceMaterial = 77}
+          , plainInstance {instanceSampler = SamplerLinear, instanceTint = Tint 1 2 3 255, instanceParameter = 77}
           , plainInstance {instanceUv = UvRect 0.25 0.25 0.5 0.5, instanceDepthKey = 0}
-          , plainInstance {instanceSampler = SamplerDefault, instanceTint = Tint 255 0 0 255, instanceMaterial = 4}
+          , plainInstance {instanceSampler = SamplerDefault, instanceTint = Tint 255 0 0 255, instanceParameter = 4}
           ]
     runShapes (layerPlan marked (depthLayer varied)) `shouldBe` [(Cutout, 0, 4)]
   it "are not split by tint alpha or the flags among the ordered instances" $ do
@@ -312,16 +313,16 @@ runSpec = describe "runs" $ do
           [ translucentAt 1
           , plainInstance {instanceAdditive = True, instanceDepthKey = 2}
           , plainInstance {instanceTint = Tint 9 9 9 10, instanceDepthKey = 3, instanceSampler = SamplerLinear}
-          , plainInstance {instanceTranslucent = True, instanceAdditive = True, instanceMaterial = 5}
+          , plainInstance {instanceTranslucent = True, instanceAdditive = True, instanceParameter = 5}
           ]
     runShapes (layerPlan marked (depthLayer varied)) `shouldBe` [(Ordered, 0, 4)]
   it "give a run's indices as the slice of the drawing order it names" $ do
     let planned = layerPlan marked (depthLayer (tagged [translucentAt 3, cutoutAt 0, cutoutAt 1, translucentAt 1]))
     map (runIndices planned) (plannedRuns planned) `shouldBe` [[1, 2], [3, 0]]
   it "name the built-in default material until application materials exist" $
-    map runMaterial (plannedRuns (layerPlan marked (depthLayer [cutoutAt 1, translucentAt 1]))) `shouldBe` [DefaultMaterial, DefaultMaterial]
+    map runMaterial (plannedRuns (layerPlan marked (depthLayer [cutoutAt 1, translucentAt 1]))) `shouldBe` [defaultMaterial, defaultMaterial]
   it "treat the built-in default material as cutout-capable" $
-    materialCutoutCapable DefaultMaterial `shouldBe` True
+    materialCutoutCapable defaultMaterial `shouldBe` True
 
 -- * Structure
 
@@ -454,7 +455,7 @@ generatedSpec = describe "over generated snapshots" $ do
         forAll (shuffle (tagged instances)) $ \shuffled →
           let planned = layerPlan marks (depthLayer shuffled)
               drawn = [shuffled !! index | index ← drawingOrder planned]
-              tag = instanceMaterial
+              tag = instanceParameter
               cutoutTags xs = [tag candidate | candidate ← xs, expectedPath marks True candidate == Cutout]
               orderedTagsAt key xs =
                 [ tag candidate
@@ -621,7 +622,7 @@ routedInstanceGen = do
       , instanceTranslucent = translucent
       , instanceAdditive = additive
       , instanceSampler = sampler
-      , instanceMaterial = material
+      , instanceParameter = material
       }
 
 routedLayerGen ∷ Gen Layer

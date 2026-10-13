@@ -4,10 +4,11 @@
 -- built.
 --
 -- __Ownership.__ A hidden module of @hetoimasia-render-2d@;
--- "Hetoimasia.Render.TwoD.DrawPlan" re-exports the marks and the material.
+-- "Hetoimasia.Render.TwoD.DrawPlan" re-exports the marks.
 --
 -- __Dependencies.__ @base@, @containers@ for the set of marked handles,
--- @hetoimasia-render-api@ for the handle, and this package's snapshot module.
+-- @hetoimasia-render-api@ for the handle, and this package's material and
+-- snapshot modules.
 --
 -- __State.__ The module owns none.
 module Hetoimasia.Render.TwoD.Internal.Routing
@@ -15,15 +16,13 @@ module Hetoimasia.Render.TwoD.Internal.Routing
   , cutoutMarks
   , noCutoutMarks
   , isMarkedCutout
-  , Material (..)
-  , materialCutoutCapable
-  , instanceMaterialOf
   , routesToCutout
   ) where
 
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Hetoimasia.Render.Api.Texture (TextureHandle)
+import Hetoimasia.Render.TwoD.Internal.Material (MaterialRef (..), MaterialFacts (..))
 import Hetoimasia.Render.TwoD.Snapshot (Instance (..), Tint (..))
 
 -- | The textures marked cutout-safe, each by its complete handle, generation
@@ -43,29 +42,13 @@ noCutoutMarks = CutoutMarks Set.empty
 isMarkedCutout ∷ CutoutMarks → TextureHandle → Bool
 isMarkedCutout (CutoutMarks marked) handle = Set.member handle marked
 
--- | The material a run draws with. Application materials, and how an instance
--- names one, arrive later (R2D-11); until then every instance uses the
--- built-in default.
-data Material = DefaultMaterial
-  deriving stock (Eq, Ord, Show, Enum, Bounded)
-
--- | Whether a material routes to the cutout path: its output alpha is binary
--- wherever its primary texture's is. The built-in default is.
-materialCutoutCapable ∷ Material → Bool
-materialCutoutCapable DefaultMaterial = True
-
--- | The material an instance draws with. Until application materials exist,
--- the built-in default for every instance.
-instanceMaterialOf ∷ Instance → Material
-instanceMaterialOf _ = DefaultMaterial
-
 -- | Whether an instance takes the cutout path, given whether its layer is a
 -- depth-enabled world layer.
 routesToCutout ∷ CutoutMarks → Bool → Instance → Bool
 routesToCutout marks depthEnabled candidate =
   depthEnabled
     && isMarkedCutout marks (instanceTexture candidate)
-    && materialCutoutCapable (instanceMaterialOf candidate)
+    && factCutoutCapable (materialRefFacts (instanceMaterial candidate))
     && opaque (instanceTint candidate)
     && not (instanceTranslucent candidate)
     && not (instanceAdditive candidate)

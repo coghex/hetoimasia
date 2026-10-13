@@ -1,27 +1,47 @@
 {-# LANGUAGE QuasiQuotes #-}
 
--- | The GLSL the package's shaders are compiled from (R2D-7, R2D-9), kept as
--- text apart from "Hetoimasia.Render.TwoD.Vulkan.Shaders" because a splice can
--- run only what another module has compiled. The vertex stage is shared by every
--- pipeline; the fragment stage is a shared prelude, which holds the table
--- lookup, the sampler choice, the default material and the tint, followed by
--- the tail of the path it serves, so the two variants differ in their wrapping
--- and output alone and R2D-11 substitutes the material alone.
+-- | The GLSL the package's shaders are compiled from (R2D-7, R2D-9, R2D-11,
+-- R2D-12), kept as text apart from "Hetoimasia.Render.TwoD.Vulkan.Shaders"
+-- because a splice can run only what another module has compiled. The vertex
+-- stage is shared by every pipeline; the fragment stage is a shared start (the
+-- bindings, the push block, the table lookup, the sampler choice, the tint and
+-- the clip test), then a material (the built-in default's, or an application's
+-- from "Hetoimasia.Render.TwoD.Vulkan.MaterialSources"), followed by the tail of
+-- the path it serves, so the variants differ in their wrapping and output alone
+-- and a material replaces @material@ alone.
+--
+-- Every shader declares the same push block, 128 bytes: the engine's members,
+-- then the application's, then the rest as reserved words ('pushBlockSource'),
+-- so a pipeline layout serves them all. Set 2's one storage buffer is read as
+-- words: the clip tables' edges as the floats whose bits they are, and the
+-- material records as they are.
 module Hetoimasia.Render.TwoD.Vulkan.ShaderSources
   ( vertexSource
-  , fragmentPrelude
+  , fragmentHead
+  , fragmentCommon
+  , defaultMaterialSource
   , orderedTail
   , cutoutTail
+  , pushBlockSource
+  , reservedDeclaration
+  , builtInPushTail
+  , builtInFragmentSource
   ) where
 
+import Data.List (intercalate)
+import Data.Word (Word32)
 import Hetoimasia.GPU.Vulkan.Native.Shader (glsl)
+import Hetoimasia.Render.TwoD.Vulkan.Layout (applicationPushLimit, applicationPushOffset, reservedPushWords)
 
 -- | The vertex stage: the unit square placed through the instance's and the
 -- view's transforms, snapped rigidly when the view snaps, with the depth the
 -- instance's key gives constant across the quad, and the instance's clip index
 -- passed on flat.
-vertexSource ∷ String
-vertexSource =
+vertexSource ∷ String → String
+vertexSource appMembers = vertexHead <> pushBlockSource appMembers <> vertexBody
+
+vertexHead ∷ String
+vertexHead =
   [glsl|
           #version 450
 
@@ -35,18 +55,11 @@ vertexSource =
           layout(location = 7) in uint parameter;
           layout(location = 8) in uint depthKey;
 
-          layout(push_constant) uniform Pushed {
-              vec4 viewLinear;
-              vec2 viewTranslation;
-              vec2 extent;
-              float brightness;
-              uint filtering;
-              uint snap;
-              uint clipBase;
-              vec4 inverseLinear;
-              vec2 clipCentre;
-          } pushed;
+        |]
 
+vertexBody ∷ String
+vertexBody =
+  [glsl|
           layout(location = 0) out vec2 at;
           layout(location = 1) flat out uvec2 handle;
           layout(location = 2) flat out vec4 tinted;
@@ -97,13 +110,11 @@ vertexSource =
           }
         |]
 
--- | What both fragment variants share: the table's bindings, the clip table
--- and the push block, the handle's lookup, the sampler choice, the default
--- material, the tint and the clip test.
--- 'sampleMaterial' is the instance's material at its fragment, before the
--- engine's wrapping.
-fragmentPrelude ∷ String
-fragmentPrelude =
+-- | The fragment stage's start: the version, the extension, the texture table's
+-- bindings and set 2's storage buffer, which holds the batch's clip tables
+-- (R2D-12) and then its material records (R2D-11), read as words.
+fragmentHead ∷ String
+fragmentHead =
   [glsl|
           #version 450
           #extension GL_EXT_nonuniform_qualifier : require
@@ -113,24 +124,22 @@ fragmentPrelude =
           layout(set = 1, binding = 0, std430) readonly buffer Lookup {
               uvec2 entries[];
           } lookups;
-          // The batch's clip tables (R2D-12): one vec4 per resolved clip, its
-          // left, top, right and bottom edges in the layer's space.
-          layout(set = 2, binding = 0, std430) readonly buffer Clips {
-              vec4 rectangles[];
-          } clips;
+          // The batch's storage region (R2D-12, R2D-11): the clip tables, one
+          // entry of four floats per resolved clip (left, top, right and bottom
+          // edges, about a reference point), and after them the material
+          // records, as the words they are. Both are read as words, the floats
+          // through their bits.
+          layout(set = 2, binding = 0, std430) readonly buffer Region {
+              uint words[];
+          } region;
+        |]
 
-          layout(push_constant) uniform Pushed {
-              vec4 viewLinear;
-              vec2 viewTranslation;
-              vec2 extent;
-              float brightness;
-              uint filtering;
-              uint snap;
-              uint clipBase;
-              vec4 inverseLinear;
-              vec2 clipCentre;
-          } pushed;
-
+-- | What both fragment variants share after the push block (which
+-- 'pushBlockSource' declares between them): the interpolants, the handle's
+-- lookup, the sampler choice, 'sampleTexture', the tint and the clip test.
+fragmentCommon ∷ String
+fragmentCommon =
+  [glsl|
           layout(location = 0) in vec2 at;
           layout(location = 1) flat in uvec2 handle;
           layout(location = 2) flat in vec4 tinted;
@@ -159,22 +168,19 @@ fragmentPrelude =
               return filtering == 2u ? 2u : 0u;
           }
 
-          // The material: the built-in default, which is the texel itself.
-          vec4 material(vec4 texel) {
-              return texel;
-          }
-
-          // The instance's material at this fragment.
-          vec4 sampleMaterial() {
-              uint slot = resolve(handle);
+          // A texture sampled at coordinates: the handle resolved through the
+          // lookup with its generation check, so an index past the version, or
+          // an entry of another generation, is the transparent placeholder, and
+          // the instance's own sampler choice.
+          vec4 sampleTexture(uvec2 wanted, vec2 uv) {
+              uint slot = resolve(wanted);
               // The sampler choice comes from instance data the backend cannot
               // see, so it is clamped to the table's last sampler. The profile
               // enables non-uniform sampled-image indexing, not dynamic
               // indexing, so every index and the combined operand the sample
               // consumes are marked non-uniform.
               uint chosen = min(chosenSampler(attributes.x), 3u);
-              vec4 texel = texture(nonuniformEXT(sampler2D(textures[nonuniformEXT(slot)], samplers[nonuniformEXT(chosen)])), at);
-              return material(texel);
+              return texture(nonuniformEXT(sampler2D(textures[nonuniformEXT(slot)], samplers[nonuniformEXT(chosen)])), uv);
           }
 
           // The engine's tint, the first stage of wrapping any material.
@@ -196,7 +202,12 @@ fragmentPrelude =
               if (clipIndex == 0u) {
                   return false;
               }
-              vec4 clip = clips.rectangles[pushed.clipBase + clipIndex - 1u];
+              uint at4 = (pushed.clipBase + clipIndex - 1u) * 4u;
+              vec4 clip = vec4(
+                  uintBitsToFloat(region.words[at4]),
+                  uintBitsToFloat(region.words[at4 + 1u]),
+                  uintBitsToFloat(region.words[at4 + 2u]),
+                  uintBitsToFloat(region.words[at4 + 3u]));
               vec2 offset = gl_FragCoord.xy - pushed.clipCentre;
               vec2 local = vec2(
                   pushed.inverseLinear.x * offset.x + pushed.inverseLinear.z * offset.y,
@@ -204,6 +215,65 @@ fragmentPrelude =
               return !(local.x >= clip.x && local.x < clip.z && local.y >= clip.y && local.y < clip.w);
           }
         |]
+
+-- | The built-in default material: the texel itself. 'sampleMaterial' is the
+-- instance's material at its fragment, before the engine's wrapping.
+defaultMaterialSource ∷ String
+defaultMaterialSource =
+  [glsl|
+          // The material: the built-in default, which is the texel itself.
+          vec4 material(vec4 texel) {
+              return texel;
+          }
+
+          // The instance's material at this fragment.
+          vec4 sampleMaterial() {
+              return material(sampleTexture(handle, at));
+          }
+        |]
+
+-- | The push block both stages declare, 128 bytes: the engine's members, then
+-- these declarations of the application's own members and of the words reserved
+-- after them ('applicationPushOffset', 'applicationPushLimit'). Every shader
+-- declares the whole range, so one pipeline layout serves them all.
+pushBlockSource ∷ String → String
+pushBlockSource appMembers =
+  intercalate
+    "\n"
+    [ "layout(push_constant) uniform Pushed {"
+    , "    vec4 viewLinear;"
+    , "    vec2 viewTranslation;"
+    , "    vec2 extent;"
+    , "    float brightness;"
+    , "    uint filtering;"
+    , "    uint snap;"
+    , "    uint clipBase;"
+    , "    vec4 inverseLinear;"
+    , "    vec2 clipCentre;"
+    , "    uint recordBase;"
+    , appMembers
+    , "} pushed;"
+    , ""
+    ]
+
+-- | The words reserved after an application's own members, which have used this
+-- many bytes of the block: one array member that makes the block span the whole
+-- range. Nothing for a block that has used it all.
+reservedDeclaration ∷ Word32 → String
+reservedDeclaration used
+  | count == 0 = ""
+  | otherwise = "    layout(offset = " <> show (applicationPushOffset + used) <> ") uint reserved[" <> show count <> "];\n"
+  where
+    count = reservedPushWords (min applicationPushLimit used)
+
+-- | What the built-in shaders declare after the engine's members: all of the
+-- application's bytes, reserved.
+builtInPushTail ∷ String
+builtInPushTail = reservedDeclaration 0
+
+-- | The built-in fragment stage with the tail of its path.
+builtInFragmentSource ∷ String → String
+builtInFragmentSource tailSource = fragmentHead <> pushBlockSource builtInPushTail <> fragmentCommon <> defaultMaterialSource <> tailSource
 
 -- | The ordered path's fragment tail: brightness after the tint, then the
 -- blend output, an additive instance contributing no coverage.

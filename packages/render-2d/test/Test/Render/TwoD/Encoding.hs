@@ -28,6 +28,8 @@ import Hetoimasia.Render.TwoD.DrawPlan
   , planSnapshot
   )
 import Hetoimasia.Render.TwoD.Encoding (encodeLayer, encodeLayerInDrawingOrder, instanceStride)
+import Hetoimasia.Render.TwoD.Material (MaterialFacts (..), RecordLayout (..))
+import Hetoimasia.Render.TwoD.Material.Backend (materialRef)
 import Hetoimasia.Render.TwoD.Settings (defaultViewSettings)
 import Hetoimasia.Render.TwoD.Snapshot
 import Hetoimasia.Render.TwoD.Validation (ValidLayer, validLayers, validateSnapshot)
@@ -56,7 +58,10 @@ distinct =
     , instanceTranslucent = True
     , instanceAdditive = True
     , instanceClip = 0
-    , instanceMaterial = 0xDEADBEEF
+    , instanceParameter = 0xDEADBEEF
+    , -- A material that is not the default, which the 64 bytes do not show: the
+      -- reference is a value the planner reads and is never encoded.
+      instanceMaterial = materialRef 7 (MaterialFacts False (RecordLayout 0 0) 0)
     }
 
 -- | The 64 bytes 'distinct' must encode to, offset by offset.
@@ -232,7 +237,7 @@ referenceSpec = describe "against an independent reference" $ do
                 && fromLE (field 44 4 bytes) == handleGeneration (instanceTexture candidate)
                 && fromLE (field 48 4 bytes) == instanceDepthKey candidate
                 && field 52 4 bytes == [r, g, b, a]
-                && fromLE (field 60 4 bytes) == instanceMaterial candidate
+                && fromLE (field 60 4 bytes) == instanceParameter candidate
             )
 
 -- | The reference encoder: the same 64 bytes, written with shifts and masks.
@@ -245,7 +250,7 @@ referenceBytes candidate =
     <> littleEndian (instanceDepthKey candidate)
     <> [r, g, b, a]
     <> littleEndian flags
-    <> littleEndian (instanceMaterial candidate)
+    <> littleEndian (instanceParameter candidate)
   where
     UvRect u0 v0 u1 v1 = instanceUv candidate
     Tint r g b a = instanceTint candidate

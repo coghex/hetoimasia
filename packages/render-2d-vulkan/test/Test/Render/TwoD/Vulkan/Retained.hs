@@ -47,6 +47,7 @@ import qualified Hetoimasia.Render.TwoD.Chunk.Backend as Backend
 import Hetoimasia.Render.TwoD.DrawPlan (CutoutMarks, cutoutMarks)
 import Hetoimasia.Render.TwoD.Encoding (encodeLayer)
 import Hetoimasia.Render.TwoD.Settings (ViewSettings (..), defaultViewSettings)
+import Hetoimasia.Render.TwoD.Material (defaultMaterial)
 import Hetoimasia.Render.TwoD.Snapshot
 import Hetoimasia.Render.TwoD.Target (TargetRef)
 import Hetoimasia.Render.TwoD.Target.Backend (targetRef)
@@ -99,7 +100,8 @@ sprite' handle x key =
     , instanceTranslucent = False
     , instanceAdditive = False
     , instanceClip = 0
-    , instanceMaterial = 0
+    , instanceParameter = 0
+    , instanceMaterial = defaultMaterial
     }
 
 -- | A cutout-eligible sprite, and a translucent one, which is always ordered.
@@ -147,7 +149,7 @@ withSetup action = do
       rig
       Render.Configuration
         { Render.configurationRing = either (error . show) id (validateRingSize (64 * 1024))
-        , Render.configurationClipWindow = either (error . show) id (validateStorageWindow 4096)
+        , Render.configurationRegionWindow = either (error . show) id (validateStorageWindow 4096)
         , Render.configurationTable = either (error . show) id (validateTableConfig 16 8 4)
         }
   resetJournal rig

@@ -88,7 +88,7 @@ configuration ∷ Render.Configuration
 configuration =
   Render.Configuration
     { Render.configurationRing = either (error . show) id (validateRingSize (1024 * 1024))
-    , Render.configurationClipWindow = either (error . show) id (validateStorageWindow (16 * 1024))
+    , Render.configurationRegionWindow = either (error . show) id (validateStorageWindow (16 * 1024))
     , Render.configurationTable = either (error . show) id (validateTableConfig 16 8 4)
     }
 

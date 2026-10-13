@@ -159,6 +159,19 @@
 --   back after completion, every pixel judged against the render-2d oracle, and
 --   written as lossless PNGs, a probe record and the bytes uploaded and written
 --   to the ring, under the validation runner's evidence directory (#429);
+-- * @r2d11-materials@ — the same device start with no window, then the 2D
+--   renderer's recorder over targets that each have a @D32_SFLOAT@ depth image
+--   (R2D-11): the sample material and two others, defined by a Template Haskell
+--   splice and registered with the renderer, drawn from render-2d snapshots
+--   that name them — a second texture through a record in the ordered and the
+--   cutout paths with the engine's tint wrapping the material's colour, a push
+--   block that changes the colour, default and application materials split into
+--   runs by the parameter word and the record source, a chunk carrying its own
+--   records beside the view's, and a released texture's index reused, its old
+--   handle sampling the placeholder — read back after completion, every pixel
+--   judged against the render-2d oracle given a pure model of each material, and
+--   written as lossless PNGs and a probe record under the validation runner's
+--   evidence directory (#430);
 -- * @r2d15-storage-tables@ — the same device start with no window, then the
 --   session's texture table, a ring made with a storage-table window, and a
 --   pipeline layout that also holds the storage table's set 2: two per-batch
@@ -557,6 +570,14 @@ scenarios =
       $ \consent journal _ → do
         outcome ← SurfaceFree.runRetained (consentBackend consent) journal
         pure (SurfaceFree.retainedSpec outcome, section "The R2D-10 retained chunks evidence record" (SurfaceFree.retainedSection outcome))
+  , Scenario
+      "r2d11-materials"
+      "records six frames of render-2d snapshots that name application materials defined by a Template Haskell splice, into offscreen targets that have a D32_SFLOAT depth image, in a surface-free session — the sample material's second texture through a record in the ordered and the cutout paths, a push block that changes the colour, default and application materials split into runs, a chunk carrying its own records, and a released texture's index reused with its old handle sampling the placeholder — reads each back after completion, judges every pixel against the render-2d oracle given a model of each material, and writes a lossless PNG a target and a probe record; where the device chooses another depth format it reports that"
+      False
+      Nothing
+      $ \consent journal _ → do
+        outcome ← SurfaceFree.runMaterials (consentBackend consent) journal
+        pure (SurfaceFree.materialsSpec outcome, section "The R2D-11 application materials evidence record" (SurfaceFree.materialsSection outcome))
   , Scenario
       "r2d15-storage-tables"
       "draws twice in one batch of a frame-less batch of a surface-free session, through a shader-sampled table layout that also holds set 2 and no selected sampler: two per-batch tables are written into regions of a ring made with a storage-table window, and each is bound at its own dynamic offset before its draw, whose fragment shader reads its colour from the bound table; reads the target back and checks that each draw shows its own table's colour exactly, with validation reporting nothing"

@@ -62,6 +62,9 @@ library
         Hetoimasia.Render.TwoD.Vulkan.Chunks
         Hetoimasia.Render.TwoD.Vulkan.Frame
         Hetoimasia.Render.TwoD.Vulkan.Layout
+        Hetoimasia.Render.TwoD.Vulkan.Material
+        Hetoimasia.Render.TwoD.Vulkan.Material.Sample
+        Hetoimasia.Render.TwoD.Vulkan.MaterialSources
         Hetoimasia.Render.TwoD.Vulkan.ShaderInterfaces
         Hetoimasia.Render.TwoD.Vulkan.Shaders
         Hetoimasia.Render.TwoD.Vulkan.Textures
@@ -74,6 +77,7 @@ library
         containers >=0.8 && <0.9,
         deepseq >=1.5 && <1.6,
         stm >=2.5.3 && <2.6,
+        template-haskell >=2.24 && <2.25,
         text >=2.1 && <2.2,
         hetoimasia-asset ==0.1.0.0,
         hetoimasia-gpu-vulkan-native ==0.1.0.0,
@@ -95,6 +99,8 @@ test-suite render-2d-vulkan-tests
     other-modules:
         Test.Render.TwoD.Vulkan.Environment
         Test.Render.TwoD.Vulkan.Layout
+        Test.Render.TwoD.Vulkan.Materials
+        Test.Render.TwoD.Vulkan.Materials.Layouts
         Test.Render.TwoD.Vulkan.Recording
         Test.Render.TwoD.Vulkan.Retained
         Test.Render.TwoD.Vulkan.StandIn
@@ -103,6 +109,8 @@ test-suite render-2d-vulkan-tests
         base >=4.22 && <4.23,
         bytestring >=0.12 && <0.13,
         containers >=0.8 && <0.9,
+        directory >=1.3 && <1.4,
+        filepath >=1.5 && <1.6,
         hspec >=2.11 && <3,
         stm >=2.5.3 && <2.6,
         text >=2.1 && <2.2,
@@ -113,4 +121,5 @@ test-suite render-2d-vulkan-tests
         hetoimasia-math ==0.1.0.0,
         hetoimasia-render-2d ==0.1.0.0,
         hetoimasia-render-2d-vulkan,
-        hetoimasia-render-api ==0.1.0.0
+        hetoimasia-render-api ==0.1.0.0,
+        hetoimasia-test-support ==0.1.0.0

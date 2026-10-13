@@ -40,6 +40,7 @@ module Test.GPU.Vulkan.Native.OrderedPath
   , verdictPasses
   , runEvidence
   , runValidated
+  , runValidatedWith
   , finishEvidence
   , awaitPlaceholder
   , configuration
@@ -118,10 +119,12 @@ import Hetoimasia.Render.TwoD.Oracle
   , Verdict (..)
   , expect
   , judgeReadback
-  , newOracle
+  , newOracleWith
   , passes
   )
+import Hetoimasia.Render.TwoD.Material (MaterialRef)
 import Hetoimasia.Render.TwoD.Oracle.Colour (Rgba8 (..), Tolerance (..))
+import Hetoimasia.Render.TwoD.Oracle.Material (MaterialModel)
 import Hetoimasia.Render.TwoD.Oracle.Readback (readPixel)
 import Hetoimasia.Render.TwoD.Validation (ValidSnapshot, validateSnapshot)
 import qualified Hetoimasia.Render.TwoD.Vulkan as Render
@@ -310,7 +313,7 @@ configuration ∷ Render.Configuration
 configuration =
   Render.Configuration
     { Render.configurationRing = either (error . show) id (validateRingSize (1024 * 1024))
-    , Render.configurationClipWindow = either (error . show) id (validateStorageWindow (16 * 1024))
+    , Render.configurationRegionWindow = either (error . show) id (validateStorageWindow (16 * 1024))
     , Render.configurationTable = either (error . show) id (validateTableConfig 16 8 4)
     }
 
@@ -459,7 +462,26 @@ runValidated
   → [NamedProbe]
   → ValidSnapshot
   → IO FixtureResult
-runValidated host suite directory depthFormat renderer marks chunkBuffers decodedAt name shapes namedProbes valid = do
+runValidated = runValidatedWith Map.empty
+
+-- | 'runValidated' for a snapshot that names application materials (R2D-11): the
+-- oracle is given a model of each, by the reference the session issued for it.
+runValidatedWith
+  ∷ Map.Map MaterialRef MaterialModel
+  → Host
+  → Suite
+  → FilePath
+  → ImageFormat
+  → Render.Renderer
+  → CutoutMarks
+  → (ChunkRef → Maybe Buffer)
+  → (Api.TextureHandle → Maybe DecodedImage)
+  → Text
+  → [TargetShape]
+  → [NamedProbe]
+  → ValidSnapshot
+  → IO FixtureResult
+runValidatedWith models host suite directory depthFormat renderer marks chunkBuffers decodedAt name shapes namedProbes valid = do
       made ← hostAct host ("making " <> name <> "'s targets") $ \construction →
         fmap sequence . traverse (target construction) $ shapes
       case made of
@@ -522,7 +544,7 @@ runValidated host suite directory depthFormat renderer marks chunkBuffers decode
       ]
     judged readbacks = do
       let oracle =
-            newOracle
+            newOracleWith models
               OracleInput
                 { inputSnapshot = valid
                 , inputCutoutMarks = marks

@@ -47,6 +47,7 @@ import Hetoimasia.Render.TwoD.Clip (ClipEntry (..), ClipRect (..), ResolvedClip 
 import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..))
 import Hetoimasia.Render.TwoD.Settings (TextureFilter (..), ViewSettings (..), defaultViewSettings)
 import Hetoimasia.Render.TwoD.DrawPlan (CutoutMarks, DrawPath (..), cutoutMarks, noCutoutMarks)
+import Hetoimasia.Render.TwoD.Material (defaultMaterial)
 import Hetoimasia.Render.TwoD.Snapshot
 import Hetoimasia.Render.TwoD.Target (TargetRef)
 import Hetoimasia.Render.TwoD.Target.Backend (targetRef)
@@ -89,7 +90,8 @@ sprite x key sampler =
     , instanceTranslucent = False
     , instanceAdditive = False
     , instanceClip = 0
-    , instanceMaterial = 0
+    , instanceParameter = 0
+    , instanceMaterial = defaultMaterial
     }
 
 -- | The first frame: two passes.
@@ -269,7 +271,7 @@ workSpec = describe "the work a snapshot comes to" $ do
           let layers = concatMap workLayers (workViews first <> workViews last')
           -- The world layer's sprites have keys 5, 1, 5: the drawing order is 1, 0, 2.
           map layerBytes layers `shouldBe` [chunk 1 world <> chunk 0 world <> chunk 2 world, ui, second, deep]
-          map layerRunList layers `shouldBe` [[RunWork 0 3 Ordered ReadsRing], [RunWork 0 2 Ordered ReadsRing], [RunWork 0 1 Ordered ReadsRing], [RunWork 0 1 Ordered ReadsRing]]
+          map layerRunList layers `shouldBe` [[RunWork 0 3 Ordered ReadsRing defaultMaterial NoRunRecords], [RunWork 0 2 Ordered ReadsRing defaultMaterial NoRunRecords], [RunWork 0 1 Ordered ReadsRing defaultMaterial NoRunRecords], [RunWork 0 1 Ordered ReadsRing defaultMaterial NoRunRecords]]
         other → expectationFailure ("expected two passes, found " <> either show (show . length) other)
 
   it "pushes each layer the transform of its own space, the view's settings and the attachment's extent" $
@@ -304,7 +306,7 @@ workSpec = describe "the work a snapshot comes to" $ do
       input ← inputOver rig firstFrame
       case frameWork input of
         Right [first, last'] → do
-          map (map layerRunList . workLayers) (workViews last') `shouldBe` [[[RunWork 0 1 Ordered ReadsRing]]]
+          map (map layerRunList . workLayers) (workViews last') `shouldBe` [[[RunWork 0 1 Ordered ReadsRing defaultMaterial NoRunRecords]]]
           map layerClearsDepth (concatMap workLayers (workViews last')) `shouldBe` [True]
           fmap depthFormat (workDepth last') `shouldBe` Just Depth32Float
           -- The first pass holds no depth-enabled world layer, so it has none.
@@ -437,7 +439,7 @@ rendererOver rig ringBytes = do
       rig
       Render.Configuration
         { Render.configurationRing = either (error . show) id (validateRingSize ringBytes)
-        , Render.configurationClipWindow = either (error . show) id (validateStorageWindow (min 4096 ringBytes))
+        , Render.configurationRegionWindow = either (error . show) id (validateStorageWindow (min 4096 ringBytes))
         , Render.configurationTable = either (error . show) id (validateTableConfig 16 8 4)
         }
   -- What the table's own placeholder upload recorded is not the frame's.
@@ -551,8 +553,8 @@ recordingSpec = describe "recording a frame" $ do
     withRig $ \rig → do
       _ ← rendererOver rig 4096
       layouts ← layoutsMade rig
-      -- The table's two set layouts and the clip table's, and one range of 72 bytes for both stages.
-      [(length sets, ranges) | (sets, ranges) ← layouts] `shouldBe` [(3, [PushConstantRange [PushVertex, PushFragment] 0 72])]
+      -- The table's two set layouts and the clip table's, and one range of 128 bytes for both stages.
+      [(length sets, ranges) | (sets, ranges) ← layouts] `shouldBe` [(3, [PushConstantRange [PushVertex, PushFragment] 0 128])]
 
   it "refuses an unknown target in a later pass before it records a clear, a claim or a draw" $
     withRig $ \rig → do
@@ -725,7 +727,7 @@ clipSpec = describe "clip tables" $ do
       -- Each layer's push block names its table's first entry, and its centre.
       [ByteString.take 4 (ByteString.drop 44 bytes) | SeenPush _ _ bytes ← seen commands]
         `shouldBe` [floatlessWord base | base ← [0, 0, 2, 3]]
-      [ByteString.drop 64 bytes | SeenPush _ _ bytes ← seen commands]
+      [ByteString.take 8 (ByteString.drop 64 bytes) | SeenPush _ _ bytes ← seen commands]
         `shouldBe` [floats centre | centre ← [[8, 16], [0, 0], [24, 16], [8, 8]]]
 
   it "writes a table for each space its layers select clips from, about that space's own reference point" $
@@ -1151,7 +1153,7 @@ depthSpec = describe "depth passes" $ do
       input ← depthFrame rig marked (Just Depth32Float) snapshot
       case frameWork input of
         Right [only] → do
-          map layerRunList (concatMap workLayers (workViews only)) `shouldBe` [[RunWork 0 1 Cutout ReadsRing, RunWork 1 1 Ordered ReadsRing]]
+          map layerRunList (concatMap workLayers (workViews only)) `shouldBe` [[RunWork 0 1 Cutout ReadsRing defaultMaterial NoRunRecords, RunWork 1 1 Ordered ReadsRing defaultMaterial NoRunRecords]]
           -- The cutout instance, submission index 1, is encoded first.
           case encodings snapshot of
             [written] → map layerBytes (concatMap workLayers (workViews only)) `shouldBe` [chunk 1 written <> chunk 0 written]

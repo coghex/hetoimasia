@@ -34,6 +34,7 @@ import Hetoimasia.Render.TwoD.Clip (ResolvedClip (..), emptyClip)
 import Hetoimasia.Render.TwoD.Encoding (encodeLayer, flagsWord)
 import Hetoimasia.Render.TwoD.Mapping (viewportContains)
 import Hetoimasia.Render.TwoD.Settings (TextureFilter (..), defaultViewSettings)
+import Hetoimasia.Render.TwoD.Material (defaultMaterial)
 import Hetoimasia.Render.TwoD.Snapshot
 import Hetoimasia.Render.TwoD.Validation (ValidLayer, validLayers, validateSnapshot)
 import Hetoimasia.Render.TwoD.Vulkan.Layout
@@ -118,10 +119,10 @@ scissorSpec = describe "the scissor of a view" $ do
 
 pushSpec ∷ Spec
 pushSpec = describe "the push block" $ do
-  it "is 72 bytes in nine members that tile it, each at its natural alignment" $ do
-    pushBytes `shouldBe` 72
+  it "is 76 bytes in ten members that tile it, each at its natural alignment" $ do
+    pushBytes `shouldBe` 76
     [(offset, size) | PushMember offset size ← pushMembers]
-      `shouldBe` [(0, 16), (16, 8), (24, 8), (32, 4), (36, 4), (40, 4), (44, 4), (48, 16), (64, 8)]
+      `shouldBe` [(0, 16), (16, 8), (24, 8), (32, 4), (36, 4), (40, 4), (44, 4), (48, 16), (64, 8), (72, 4)]
     -- Each member starts where the one before ends.
     and (zipWith (\(PushMember offset size) (PushMember next _) → offset + size == next) pushMembers (drop 1 pushMembers)) `shouldBe` True
     sum [size | PushMember _ size ← pushMembers] `shouldBe` fromIntegral pushBytes
@@ -159,6 +160,7 @@ pushSpec = describe "the push block" $ do
         , [0x00, 0x00, 0x00, 0x3F] -- 60: inverse d = 0.5
         , [0x00, 0x00, 0xA0, 0x43] -- 64: clip centre x = 320.0 (the inverse's translation is not pushed)
         , [0x00, 0x00, 0x70, 0x43] -- 68: clip centre y = 240.0
+        , [0x00, 0x00, 0x00, 0x00] -- 72: record base, zero until a run pushes its own
         ]
 
   it "packs nearest as 1 and snap off as 0, with the transform's off-diagonal and negative values" $ do
@@ -194,6 +196,7 @@ pushSpec = describe "the push block" $ do
         , [0x00, 0x00, 0x00, 0x00] -- inverse d = 0.0
         , [0x00, 0x00, 0x00, 0x3F] -- clip centre x = 0.5
         , [0x00, 0x00, 0x80, 0xBE] -- clip centre y = -0.25
+        , [0x00, 0x00, 0x00, 0x00] -- record base
         ]
 
   it "gives a filter the code an instance's sampler choice uses for it" $ do
@@ -427,11 +430,11 @@ clipTableSpec = describe "the clip table" $ do
 
 interfaceSpec ∷ Spec
 interfaceSpec = describe "the shaders' checked interfaces" $ do
-  it "declare one push block of 72 bytes in both stages" $
+  it "declare one push block of 128 bytes in both stages: the engine's 76 and the application's bytes reserved" $
     case (checkedVertex orderedShaders, checkedFragment orderedShaders) of
       (CheckedShader _ vertex, CheckedShader _ fragment) →
         [(offset, offset + size) | PushMember offset size ← interfacePushConstants vertex <> interfacePushConstants fragment]
-          `shouldBe` concat (replicate 2 [(0, 16), (16, 24), (24, 32), (32, 36), (36, 40), (40, 44), (44, 48), (48, 64), (64, 72)])
+          `shouldBe` concat (replicate 2 [(0, 16), (16, 24), (24, 32), (32, 36), (36, 40), (40, 44), (44, 48), (48, 64), (64, 72), (72, 76), (80, 128)])
 
   it "declare the instance attributes in the vertex stage, which both variants share" $
     mapM_
@@ -461,7 +464,7 @@ interfaceSpec = describe "the shaders' checked interfaces" $ do
     case (checkedVertex orderedShaders, checkedFragment orderedShaders) of
       (CheckedShader _ vertex, CheckedShader _ fragment) → do
         interfacePushConstants vertex `shouldBe` interfacePushConstants fragment
-        length (interfacePushConstants vertex) `shouldBe` 9
+        length (interfacePushConstants vertex) `shouldBe` 11
 
 -- ---------------------------------------------------------------------------
 -- Fixtures
@@ -479,7 +482,8 @@ distinctInstance =
     , instanceTranslucent = True
     , instanceAdditive = True
     , instanceClip = 0
-    , instanceMaterial = 0xDEADBEEF
+    , instanceParameter = 0xDEADBEEF
+    , instanceMaterial = defaultMaterial
     }
 
 -- | The validated layer holding this one instance.

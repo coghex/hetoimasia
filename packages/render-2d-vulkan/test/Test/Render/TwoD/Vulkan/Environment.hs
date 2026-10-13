@@ -43,6 +43,7 @@ import Hetoimasia.Math.Vector (V2 (..))
 import qualified Hetoimasia.Render.Api.Texture as Api
 import qualified Hetoimasia.Render.Api.Texture.Backend as ApiBackend
 import Hetoimasia.Render.TwoD.Settings (defaultViewSettings)
+import Hetoimasia.Render.TwoD.Material (defaultMaterial)
 import Hetoimasia.Render.TwoD.Snapshot
 import qualified Hetoimasia.Render.TwoD.Vulkan as Render
 import Hetoimasia.Render.TwoD.Vulkan.Chunks (Retained, newRetained)
@@ -77,6 +78,7 @@ data Env = Env
   , envRetained ∷ !Retained
   , envAdapter ∷ !(Adapter Int)
   , envFake ∷ !Fake
+  , envRenderer ∷ !Render.Renderer
   }
 
 -- | A stand-in host that holds these windows.
@@ -131,7 +133,7 @@ withEnvOffering offered windows action = do
       rig
       Render.Configuration
         { Render.configurationRing = either (error . show) id (validateRingSize (64 * 1024))
-        , Render.configurationClipWindow = either (error . show) id (validateStorageWindow 4096)
+        , Render.configurationRegionWindow = either (error . show) id (validateStorageWindow 4096)
         , Render.configurationTable = either (error . show) id (validateTableConfig 16 8 4)
         }
   resetJournal rig
@@ -139,7 +141,7 @@ withEnvOffering offered windows action = do
   retained ← newRetained
   (host, fake) ← newFake windows
   adapter ← newAdapter host textures retained renderer
-  action (Env rig textures retained adapter fake)
+  action (Env rig textures retained adapter fake renderer)
 
 -- | Four texels of this colour.
 bytesOf ∷ Word32 → ByteString
@@ -172,7 +174,8 @@ sprite handle =
     , instanceTranslucent = False
     , instanceAdditive = False
     , instanceClip = 0
-    , instanceMaterial = 0
+    , instanceParameter = 0
+    , instanceMaterial = defaultMaterial
     }
 
 -- | Publish, expecting acceptance.

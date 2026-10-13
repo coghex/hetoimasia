@@ -45,6 +45,7 @@ import Hetoimasia.Math.Affine2 (Affine2, fromColumns, identity)
 import Hetoimasia.Math.Vector (V2 (..))
 import Hetoimasia.Render.Api.Texture.Backend (textureHandle)
 import Hetoimasia.Render.TwoD.Clip (ClipEntry (..), ClipRect (..))
+import Hetoimasia.Render.TwoD.Material (defaultMaterial)
 import Hetoimasia.Render.TwoD.Settings (ViewSettings (..), ZoomMode (..), defaultViewSettings, TextureFilter (..))
 import Hetoimasia.Render.TwoD.Snapshot
 import Hetoimasia.Render.TwoD.Target.Backend (targetRef)
@@ -80,7 +81,8 @@ plainInstance =
     , instanceTranslucent = False
     , instanceAdditive = False
     , instanceClip = 0
-    , instanceMaterial = 0
+    , instanceParameter = 0
+    , instanceMaterial = defaultMaterial
     }
 
 -- | A camera at the origin with zoom 1 and no rotation.
@@ -188,8 +190,8 @@ validInstance = do
   instanceSampler ← elements [minBound .. maxBound]
   instanceTranslucent ← arbitrary
   instanceAdditive ← arbitrary
-  instanceMaterial ← arbitrary
-  pure Instance {instanceClip = 0, ..}
+  instanceParameter ← arbitrary
+  pure Instance {instanceClip = 0, instanceMaterial = defaultMaterial, ..}
 
 -- | An instance whose every field takes its whole range, including a clip
 -- index and a depth key beyond the limit. For the flags word and the encoder's

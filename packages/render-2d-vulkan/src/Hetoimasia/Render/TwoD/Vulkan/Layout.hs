@@ -24,7 +24,9 @@
 --
 -- = The push block
 --
--- Both stages declare one block, in std430 order, 72 bytes:
+-- Both stages declare one block, in std430 order, 128 bytes, which is a
+-- guaranteed minimum of a device's @maxPushConstantsSize@. The engine owns the
+-- first 80 (76 are members):
 --
 -- > offset  size  member
 -- >      0    16  vec4 viewLinear          a, b, c, d of the layer's transform
@@ -36,6 +38,8 @@
 -- >     44     4  uint clipBase            the layer's clip table's first entry, in entries
 -- >     48    16  vec4 inverseLinear       a, b, c, d of the transform's inverse
 -- >     64     8  vec2 clipCentre          the target-pixel point the clip test is taken about
+-- >     72     4  uint recordBase          the word of the batch's storage region where
+-- >                                        the material records a run's instances index begin
 --
 -- The transform maps @(x, y)@ to @(a·x + c·y + tx, b·x + d·y + ty)@, the
 -- coefficients of "Hetoimasia.Math.Affine2" in column-major order. The block is
@@ -45,6 +49,24 @@
 -- the inverse's linear part is pushed: the clip test is made about
 -- @clipCentre@, not about the origin, so that it never forms an absolute
 -- coordinate in the layer's space (see below).
+--
+-- The rest is the application's (R2D-11): an application material's own push
+-- block begins at 'applicationPushOffset', 80, a 16-byte boundary so that any
+-- std430 member is legal there, and may be 'applicationPushLimit' bytes long, 48.
+-- A material's shaders declare its members from that offset and, after them,
+-- the rest of the limit as reserved words ('reservedPushMember'); the built-in
+-- shaders declare all of it as reserved. Every shader therefore declares the
+-- same 128-byte range, vertex and fragment alike, so one pipeline layout serves
+-- the built-in shaders and every material's, and binding another material's
+-- pipeline never disturbs the descriptor sets or the push constants already set.
+--
+-- = The storage region (R2D-11, R2D-12)
+--
+-- The batch's one region holds the clip tables first and then the material
+-- records ("Hetoimasia.Render.TwoD.Vulkan.Frame"'s @recordRegion@ lays them out):
+-- the clip tables are read as @vec4@ entries from the region's start, and a run's
+-- @recordBase@ is the word index, from the same start, where its records'
+-- table begins, so it is the clip tables' size in words and more.
 --
 -- = The clip table (R2D-12)
 --
@@ -98,6 +120,13 @@ module Hetoimasia.Render.TwoD.Vulkan.Layout
   , pushBytes
   , packViewPush
   , filterCode
+  , recordBaseOffset
+  , packRecordBase
+  , maxPushBytes
+  , applicationPushOffset
+  , applicationPushLimit
+  , reservedPushMember
+  , reservedPushWords
     -- * The clip table
   , clipEntryBytes
   , packClipTable
@@ -220,11 +249,12 @@ pushMembers =
   , PushMember 44 4
   , PushMember 48 16
   , PushMember 64 8
+  , PushMember 72 4
   ]
 
--- | The block's size in bytes.
+-- | The size of the engine's part of the block in bytes: what a layer pushes.
 pushBytes ∷ Int
-pushBytes = 72
+pushBytes = 76
 
 -- | The block, little-endian, 'pushBytes' bytes.
 packViewPush ∷ ViewPush → ByteString
@@ -240,9 +270,46 @@ packViewPush view =
       <> foldMap floatLE (take 4 (toColumnMajor (pushInverse view)))
       <> floatLE centreX
       <> floatLE centreY
+      <> word32LE 0
   where
     (width, height) = pushExtent view
     (centreX, centreY) = pushClipCentre view
+
+-- | The offset of the record base in the block, 72. A layer's push sets it to
+-- zero, and a run that reads records pushes its own ('packRecordBase') before it
+-- draws.
+recordBaseOffset ∷ Word32
+recordBaseOffset = 72
+
+-- | The record base a run pushes at 'recordBaseOffset': the word of the batch's
+-- storage region where the records its instances index begin.
+packRecordBase ∷ Word32 → ByteString
+packRecordBase = Lazy.toStrict . toLazyByteString . word32LE
+
+-- | The most bytes the block may span, 128, which every device holds.
+maxPushBytes ∷ Word32
+maxPushBytes = 128
+
+-- | Where an application material's push block begins: the engine's part rounded
+-- up to a 16-byte boundary, so any std430 member may sit there.
+applicationPushOffset ∷ Word32
+applicationPushOffset = 16 * ((fromIntegral pushBytes + 15) `div` 16)
+
+-- | The most bytes an application material's push block may hold: the block's
+-- 128 bytes less the engine's part. A material that would exceed it fails to
+-- compile.
+applicationPushLimit ∷ Word32
+applicationPushLimit = maxPushBytes - applicationPushOffset
+
+-- | What a shader declares after the engine's part and an application block that
+-- has used this many bytes, up to the limit, so that every shader declares the
+-- same range. The built-in shaders use none.
+reservedPushMember ∷ Word32 → PushMember
+reservedPushMember used = PushMember (applicationPushOffset + used) (applicationPushLimit - used)
+
+-- | The number of words 'reservedPushMember' of a block of this size spans.
+reservedPushWords ∷ Word32 → Word32
+reservedPushWords used = (applicationPushLimit - used) `div` 4
 
 -- | The size of one clip table entry in bytes: 16, a @vec4@.
 clipEntryBytes ∷ Int

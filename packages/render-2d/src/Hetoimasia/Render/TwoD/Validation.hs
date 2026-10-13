@@ -51,9 +51,24 @@
 -- instances must select no clip: a chunk instance with a clip index is refused,
 -- as 'ClipIndexUnknown', when the chunk is built.
 --
+-- __Materials__ (R2D-11). A view holds, for each application material, its records
+-- and the bytes of its push block ('viewMaterials'). A record whose handles and
+-- words are not the layout the material's reference declares is refused
+-- ('RecordLayoutMismatch', at an 'AtRecord' location); so is a push block whose
+-- size is not the reference's ('PushBlockSizeMismatch', at 'AtPushBlock'), and a
+-- material a view uses, by a dynamic instance or by a chunk a layer lists, that
+-- declares a non-empty push block and has none in the view ('PushBlockMissing').
+-- An instance whose material has records and whose parameter word is not below
+-- the number of records the view holds for it is refused
+-- ('ParameterBeyondRecords'). The built-in default material, and any material
+-- whose layout is empty, needs no record and no push block, and its instances'
+-- parameter words are not checked. These checks apply wherever the view sits,
+-- inside a zero-size viewport too. A chunk's own records are checked when the
+-- chunk is built ("Hetoimasia.Render.TwoD.Chunk").
+--
 -- __Dependencies.__ @base@, @containers@ for the set of chunks and the clip
 -- table's reach, @hetoimasia-math@ for the affine type, and this package's clip,
--- snapshot, chunk and settings modules.
+-- snapshot, chunk, material and settings modules.
 --
 -- __State.__ The module owns none.
 module Hetoimasia.Render.TwoD.Validation
@@ -79,15 +94,25 @@ module Hetoimasia.Render.TwoD.Validation
   , validLayerChunks
   ) where
 
+import qualified Data.ByteString as ByteString
 import Data.List.NonEmpty (NonEmpty)
 import qualified Data.List.NonEmpty as NonEmpty
 import qualified Data.Map.Strict as Map
+import Data.Set (Set)
+import qualified Data.Set as Set
 import Hetoimasia.Math.Affine2 (toColumnMajor)
 import Hetoimasia.Math.Vector (V2 (..))
 import Hetoimasia.Render.TwoD.Clip (ClipEntry (..), ClipRect (..), clipEntryOfIndex)
 import Hetoimasia.Render.TwoD.Internal.Check (allFinite, finite, positiveFinite, withinClosed)
 import Hetoimasia.Render.TwoD.Internal.Chunk (Chunk (..), ChunkKind, Chunks (..), layerChunkKind)
 import Hetoimasia.Render.TwoD.Internal.ChunkRef (ChunkRef)
+import Hetoimasia.Render.TwoD.Internal.Material
+  ( MaterialData (..)
+  , MaterialFacts (..)
+  , MaterialRef (..)
+  , recordLayoutIsEmpty
+  , recordMatches
+  )
 import Hetoimasia.Render.TwoD.Settings
   ( ViewSettings (..)
   , ZoomMode (..)
@@ -129,6 +154,12 @@ data Location
     -- position in the layer's list, and the instance's build position in the
     -- chunk.
     AtChunkInstance !Int !Int !Int !Int !Int
+  | -- | A record a view holds for a material: pass, view, the material and the
+    -- record's position among that material's records in the view.
+    AtRecord !Int !Int !MaterialRef !Int
+  | -- | The push block a view holds, or lacks, for a material: pass, view and
+    -- the material.
+    AtPushBlock !Int !Int !MaterialRef
   deriving stock (Eq, Ord, Show)
 
 -- | Why a candidate was refused. A reason names no value; the location says
@@ -180,6 +211,17 @@ data Reason
     ChunkUnresolved
   | -- | A chunk built for another kind of layer than the one that lists it.
     ChunkKindMismatch
+  | -- | An instance whose material has records and whose parameter word is not
+    -- below the number of records its view holds for that material.
+    ParameterBeyondRecords
+  | -- | A record that does not have the handles and words its material's
+    -- reference declares.
+    RecordLayoutMismatch
+  | -- | A push block whose size is not the one its material's reference declares.
+    PushBlockSizeMismatch
+  | -- | A material the view uses, which declares a non-empty push block, and the
+    -- view holds none for it.
+    PushBlockMissing
   deriving stock (Eq, Ord, Show, Enum, Bounded)
 
 -- | One reason a candidate was refused, and where.
@@ -278,12 +320,40 @@ validClear (ClearColour r g b a) = all (withinClosed 0 1) [r, g, b, a]
 viewRefusals ∷ Map.Map ChunkRef Chunk → Int → Int → View → [Refusal]
 viewRefusals held passIndex viewIndex view =
   viewOwnRefusals (Refusal (AtView passIndex viewIndex)) view
+    <> materialRefusals held passIndex viewIndex view
     <> clipEntryRefusals passIndex viewIndex (viewClips view)
     <> concat
-      [ layerRefusals held passIndex viewIndex (length (viewClips view)) layerIndex layer
+      [ layerRefusals held (viewMaterials view) passIndex viewIndex (length (viewClips view)) layerIndex layer
       | (layerIndex, layer) ← zip [0 ..] (viewLayers view)
       ]
     <> mixedSpaceRefusals passIndex viewIndex view
+
+-- | What a view holds for its materials, checked against the facts of each
+-- material's reference: each record's layout, each push block's size, and the
+-- push block of every material the view uses that declares one.
+materialRefusals ∷ Map.Map ChunkRef Chunk → Int → Int → View → [Refusal]
+materialRefusals held passIndex viewIndex view =
+  [ Refusal (AtRecord passIndex viewIndex material index) RecordLayoutMismatch
+  | (material, MaterialData records _) ← Map.toList (viewMaterials view)
+  , (index, record) ← zip [0 ..] records
+  , not (recordMatches (factRecordLayout (materialRefFacts material)) record)
+  ]
+    <> [ Refusal (AtPushBlock passIndex viewIndex material) PushBlockSizeMismatch
+       | (material, MaterialData _ block) ← Map.toList (viewMaterials view)
+       , toInteger (ByteString.length block) /= toInteger (factPushBytes (materialRefFacts material))
+       ]
+    <> [ Refusal (AtPushBlock passIndex viewIndex material) PushBlockMissing
+       | material ← Set.toList (viewMaterialsUsed held view)
+       , factPushBytes (materialRefFacts material) /= 0
+       , not (Map.member material (viewMaterials view))
+       ]
+
+-- | Every material any dynamic instance of the view names, or any chunk its
+-- layers list (as resolved) does.
+viewMaterialsUsed ∷ Map.Map ChunkRef Chunk → View → Set MaterialRef
+viewMaterialsUsed held view =
+  Set.fromList [instanceMaterial candidate | layer ← viewLayers view, candidate ← layerInstances layer]
+    <> Set.unions [chunkMaterialSet built | layer ← viewLayers view, reference ← layerChunks layer, Just built ← [Map.lookup reference held]]
 
 -- | The reasons a view's camera, viewport and settings are refused, in the order
 -- 'validateSnapshot' reports them and without looking at its layers. Empty
@@ -360,16 +430,26 @@ mixedSpaceRefusals passIndex viewIndex view =
 
 -- | The chunks a layer lists come first, in the order it lists them, then its
 -- dynamic instances, whose clip indices are checked against the view's table.
-layerRefusals ∷ Map.Map ChunkRef Chunk → Int → Int → Int → Int → Layer → [Refusal]
-layerRefusals held passIndex viewIndex tableSize layerIndex layer =
+layerRefusals ∷ Map.Map ChunkRef Chunk → Map.Map MaterialRef MaterialData → Int → Int → Int → Int → Layer → [Refusal]
+layerRefusals held materials passIndex viewIndex tableSize layerIndex layer =
   concat
     [ chunkRefusals (AtChunk passIndex viewIndex layerIndex position reference) (layerChunkKind layer) (Map.lookup reference held)
     | (position, reference) ← zip [0 ..] (layerChunks layer)
     ]
     <> concat
       [ instanceRefusals tableSize (AtInstance passIndex viewIndex layerIndex index) candidate
+        <> [Refusal (AtInstance passIndex viewIndex layerIndex index) ParameterBeyondRecords | parameterBeyond materials candidate]
       | (index, candidate) ← zip [0 ..] (layerInstances layer)
       ]
+
+-- | Whether the instance's material has records and its parameter word does not
+-- index one of those the view holds.
+parameterBeyond ∷ Map.Map MaterialRef MaterialData → Instance → Bool
+parameterBeyond materials candidate =
+  not (recordLayoutIsEmpty (factRecordLayout (materialRefFacts material)))
+    && toInteger (instanceParameter candidate) >= toInteger (maybe 0 (length . materialRecords) (Map.lookup material materials))
+  where
+    material = instanceMaterial candidate
 
 chunkRefusals ∷ Location → ChunkKind → Maybe Chunk → [Refusal]
 chunkRefusals location expected = \case
