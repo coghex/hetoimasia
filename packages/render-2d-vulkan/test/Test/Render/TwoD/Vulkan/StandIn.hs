@@ -150,6 +150,9 @@ builders rig =
     , Render.registerImage = registerTexture (rigRecording rig)
     , Render.swapImage = swapTexture (rigRecording rig)
     , Render.releaseImage = releaseTexture (rigRecording rig)
+    , Render.buildVertexBuffer = \bytes → createBuffer (rigRecording rig) (BufferDescription VertexBuffer bytes)
+    , Render.uploadBuffer = \buffer bytes → submitUpload (rigUploads rig) (UploadBuffer buffer bytes)
+    , Render.releaseBuffer = releaseManaged (rigRecording rig)
     }
 
 -- | A colour target of this format and extent, made as the backend makes one.

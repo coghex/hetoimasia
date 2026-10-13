@@ -28,10 +28,14 @@
 -- refusal there is a 'FrameRefusal' naming where, and nothing has been
 -- recorded. What it returns records into the batch's recorder:
 --
--- 1. every layer's instances, written in drawing order into one ring region
---    each, all claimed before the first pass begins; a full ring is a refusal
+-- 1. every layer's ring entries, written in drawing order into one ring region
+--    each, all claimed before the first pass begins; a layer none of whose runs
+--    reads the ring claims nothing. A full ring is a refusal
 --    ('RefusedByBackend') with no clear and no draw recorded, and the batch's
---    claims stay the backend's to reclaim or discard;
+--    claims stay the backend's to reclaim or discard. Then every retained
+--    chunk's device buffer that the frame draws from is moved to its
+--    vertex-input use (R2D-10), once, before any pass begins, because the
+--    backend refuses a buffer's first touch inside rendering;
 -- 2. each pass in list order: it begins rendering into its target, cleared to
 --    the pass's clear colour (an offscreen target from undefined, the
 --    window's frame as the frame's own), and, when a view with a non-empty
@@ -46,7 +50,9 @@
 --    depth to 1.0 within the scissor ('clearDepthRect'); then the layer's push
 --    block, then one instanced draw of six vertices per run, binding the run's
 --    pipeline when it is not the bound one, the instance region at the run's
---    first instance and drawing its count.
+--    first instance and drawing its count. A run of a retained chunk binds the
+--    chunk's own buffer instead, at the run's first instance, and a chunk the
+--    view skips is not there at all.
 --
 -- = The pipelines
 --
@@ -123,8 +129,10 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , PushStage (..)
   , Recorder
   , Refusal (..)
+  , ResourceUse (..)
   , RingClaim
   , RingSize
+  , TransitionSource (..)
   , Viewport (..)
   , beginFrameRenderingWithDepth
   , beginRendering
@@ -141,6 +149,7 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , pushConstants
   , setScissor
   , setViewport
+  , transitionResource
   , validateRingSize
   , writeClaim
   )
@@ -290,7 +299,8 @@ runsOf pass =
   , run ← layerRunList layer
   ]
 
--- | Claim and write every layer's region, then record each pass.
+-- | Claim and write every layer's region, move the chunk buffers the frame
+-- draws from to their vertex-input use, then record each pass.
 recordPrepared ∷ Map.Map (Word32, PipelineKind) Pipeline → [PassWork] → FrameRecording q inst msgr phys dev cmd
 recordPrepared pipelines passes recorder = do
   claimed ← claimInOrder recorder layersInOrder
@@ -298,11 +308,25 @@ recordPrepared pipelines passes recorder = do
     Left refusal → pure (Left (RefusedByBackend refusal))
     Right regions → do
       let byLocation = Map.fromList (zip (map layerLocation layersInOrder) regions)
-      stopAtFirst [recordPass recorder pipelines byLocation pass | pass ← passes]
+      stopAtFirst
+        ( [backend (transitionResource recorder buffer (FromUse GeometryRead) GeometryRead) | buffer ← chunkBuffers]
+            <> [recordPass recorder pipelines byLocation pass | pass ← passes]
+        )
   where
-    -- A layer that holds no run, a depth-enabled one that only clears, claims
-    -- nothing.
-    layersInOrder = [layer | pass ← passes, view ← workViews pass, layer ← workLayers view, not (null (layerRunList layer))]
+    -- A layer whose runs all read a chunk's buffer, or that holds none, only
+    -- clears or draws from elsewhere: it claims nothing.
+    layersInOrder = [layer | pass ← passes, view ← workViews pass, layer ← workLayers view, not (ByteString.null (layerBytes layer))]
+    -- The buffers of the chunks drawn from, once each, in the order first drawn.
+    chunkBuffers =
+      nub
+        [ buffer
+        | pass ← passes
+        , view ← workViews pass
+        , layer ← workLayers view
+        , run ← layerRunList layer
+        , ReadsChunk _ buffer ← [runReads run]
+        ]
+    backend = fmap (either (Left . RefusedByBackend) Right)
 
 -- | Claim every layer's region in order, stopping at the first the backend
 -- refuses, so a full ring is met once and nothing later is claimed.
@@ -369,20 +393,25 @@ recordPass recorder pipelines regions pass =
       -- unusable by the draws after it, and a draw after one finds the table
       -- gone unless it is bound anew (Vulkan itself leaves them undisturbed).
       let clear = concat [[backend (clearDepthRect recorder rect 1)] <> [backend (bindTable recorder) | drawsHere] | layerClearsDepth layer]
-       in case (layerRunList layer, Map.lookup (layerLocation layer) regions) of
-            ([], _) → (bound, clear)
-            (_, Nothing) → (bound, clear <> [pure (Left (PlanDisagrees (layerLocation layer)))])
-            (runs, Just claim) →
-              let (bound', steps) = mapAccumL (runSteps layer claim) bound runs
+       in case layerRunList layer of
+            [] → (bound, clear)
+            runs →
+              let (bound', steps) = mapAccumL (runSteps layer (Map.lookup (layerLocation layer) regions)) bound runs
                in (bound', clear <> [backend (pushConstants recorder [PushVertex, PushFragment] 0 (layerPushBytes layer))] <> concat steps)
     runSteps layer claim bound run =
       let kind = runPipeline depthed layer run
           rebind
             | bound == Just kind = []
             | otherwise = [maybe missing (backend . bindPipeline recorder) (pipelineOf kind)]
+          offset = fromIntegral (runFirstInstance run) * fromIntegral instanceStride
+          -- A ring run reads the layer's region; a chunk's run, the chunk's buffer.
+          source = case (runReads run, claim) of
+            (ReadsRing, Just region) → backend (bindVertexBuffer recorder 0 (FromClaim region offset))
+            (ReadsRing, Nothing) → pure (Left (PlanDisagrees (layerLocation layer)))
+            (ReadsChunk _ buffer, _) → backend (bindVertexBuffer recorder 0 (FromBuffer buffer offset))
        in ( Just kind
           , rebind
-              <> [ backend (bindVertexBuffer recorder 0 (FromClaim claim (fromIntegral (runFirstInstance run) * fromIntegral instanceStride)))
+              <> [ source
                  , backend (draw recorder 6 (runInstanceCount run))
                  ]
           )
