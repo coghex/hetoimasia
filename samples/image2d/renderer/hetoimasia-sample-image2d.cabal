@@ -78,6 +78,7 @@ test-suite image2d-tests
     main-is: Main.hs
     other-modules:
         Test.Sample.Image2d.Assets
+        Test.Sample.Image2d.Record
         Test.Sample.Image2d.Scene
     build-depends:
         base >=4.22 && <4.23,

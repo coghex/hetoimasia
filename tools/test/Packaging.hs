@@ -102,6 +102,7 @@ checkoutOnly =
   , ("packages/gpu-vulkan/glfw/test/Main.hs", "VulkanProof.hs checks the integration suite fails an empty selection, as a sibling package's source")
   , ("samples/triangle/renderer/test/Main.hs", "VulkanProof.hs checks the triangle sample's suite fails an empty selection, as a sibling package's source")
   , ("samples/sprites/renderer/test/Main.hs", "VulkanProof.hs checks the sprites sample's suite fails an empty selection, as a sibling package's source")
+  , ("samples/image2d/renderer/test/Main.hs", "VulkanProof.hs checks the image2d sample's suite fails an empty selection, as a sibling package's source")
   , ("samples/scene3d/renderer/test/Main.hs", "VulkanProof.hs checks the scene3d sample's suite fails an empty selection, as a sibling package's source")
   , ("packages/render-2d-vulkan/test/Main.hs", "VulkanProof.hs checks the 2D recorder's suite fails an empty selection, as a sibling package's source")
   , ("packages/gpu-vulkan/glfw/native-test/Main.hs", "VulkanProof.hs checks the native suite's complete profile, as a sibling package's source")

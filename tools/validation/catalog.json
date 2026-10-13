@@ -363,6 +363,7 @@
         "hetoimasia-gpu-vulkan-glfw:test:integration-tests",
         "hetoimasia-sample-triangle:test:triangle-tests",
         "hetoimasia-sample-sprites:test:sprites-tests",
+        "hetoimasia-sample-image2d:test:image2d-tests",
         "hetoimasia-sample-scene3d:test:scene3d-tests",
         "hetoimasia-render-2d-vulkan:test:render-2d-vulkan-tests"
       ],
@@ -373,6 +374,7 @@
         "packages/gpu-vulkan/native/",
         "samples/triangle/renderer/",
         "samples/sprites/renderer/",
+        "samples/image2d/renderer/",
         "samples/scene3d/renderer/",
         "packages/render-2d-vulkan/",
         "packages/render-2d/",
@@ -409,6 +411,7 @@
           "hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests",
           "hetoimasia-sample-triangle-app:exe:hetoimasia-triangle",
           "hetoimasia-sample-sprites-app:exe:hetoimasia-sprites",
+          "hetoimasia-sample-image2d-app:exe:hetoimasia-image2d",
           "hetoimasia-sample-scene3d-app:exe:hetoimasia-scene3d"
         ],
         "timeout_seconds": 3600
@@ -420,6 +423,7 @@
         "tools/ci-image/",
         "samples/triangle/app/",
         "samples/sprites/app/",
+        "samples/image2d/app/",
         "samples/scene3d/app/",
         "tools/display/",
         "tools/native/",
@@ -454,6 +458,7 @@
           "hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests",
           "hetoimasia-sample-triangle-app:exe:hetoimasia-triangle",
           "hetoimasia-sample-sprites-app:exe:hetoimasia-sprites",
+          "hetoimasia-sample-image2d-app:exe:hetoimasia-image2d",
           "hetoimasia-sample-scene3d-app:exe:hetoimasia-scene3d"
         ],
         "timeout_seconds": 3600
@@ -465,6 +470,7 @@
         "tools/ci-image/",
         "samples/triangle/app/",
         "samples/sprites/app/",
+        "samples/image2d/app/",
         "samples/scene3d/app/",
         "tools/display/",
         "tools/native/",
@@ -519,6 +525,7 @@
         "packages/glfw/hetoimasia-glfw.cabal",
         "samples/triangle/renderer/test/Main.hs",
         "samples/sprites/renderer/test/Main.hs",
+        "samples/image2d/renderer/test/Main.hs",
         "samples/scene3d/renderer/test/Main.hs",
         "packages/render-2d-vulkan/test/Main.hs"
       ],

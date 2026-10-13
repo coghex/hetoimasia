@@ -10,8 +10,9 @@
 module Main (main) where
 
 import qualified Test.Sample.Image2d.Assets as Assets
+import qualified Test.Sample.Image2d.Record as Record
 import qualified Test.Sample.Image2d.Scene as Scene
 import Test.Hspec.Runner (Config (configFailOnEmpty), defaultConfig, hspecWith)
 
 main ∷ IO ()
-main = hspecWith defaultConfig {configFailOnEmpty = True} (Assets.spec >> Scene.spec)
+main = hspecWith defaultConfig {configFailOnEmpty = True} (Assets.spec >> Scene.spec >> Record.spec)
