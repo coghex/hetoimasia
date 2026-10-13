@@ -12,15 +12,10 @@
 -- read it from.
 module Test.GPU.Vulkan.GLFW.Scenes (spec) where
 
-import Control.Concurrent (ThreadId, forkIO, killThread, threadDelay, throwTo, yield)
-import Data.Functor ((<&>))
-import Data.IORef (newIORef, readIORef, writeIORef)
-import GHC.Clock (getMonotonicTime)
-import System.Environment (lookupEnv)
-import System.IO (hPutStrLn, stderr)
+import Control.Concurrent (ThreadId, forkIO, throwTo, yield)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, registerDelay, stateTVar, writeTVar)
-import Control.Exception (ErrorCall (..), SomeException, bracket, finally, throwIO, toException, try)
+import Control.Exception (ErrorCall (..), SomeException, throwIO, toException, try)
 import Control.Monad (void, when)
 import Data.List (nub, sort)
 import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (..), threadStatus)
@@ -44,7 +39,7 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Loop (publishVulkanScene, publishVulk
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Scenes (adoptScene, endSceneTarget, newScenes, readSceneState, registerSceneTarget, releaseScenes, retentionLimit)
 import Hetoimasia.GPU.Vulkan.Native.Generations (GenerationView (..), SwapchainResult (..), TargetCondition (..), TargetGenerationsView (..))
 import Hetoimasia.GPU.Vulkan.Native.Recording (ClearColor (..))
-import Hetoimasia.GPU.Vulkan.Native.Roots (RootTargetView (..), TerminalCause (..), reportPrimary)
+import Hetoimasia.GPU.Vulkan.Native.Roots (RootTargetView (..), TerminalCause (..))
 import Hetoimasia.Runtime.Supervision (checkRuntime)
 import Hetoimasia.Runtime.GLFW
   ( AttachmentId
@@ -109,6 +104,7 @@ spec = describe "Vulkan scenes for each window (R2D-14)" $ do
     itBounded "wait on a shared scene's revision for every window in a shared host" testRequestSharedMode
     itBounded "are refused when the queue is full and before the device exists, and settled as refused, never replayed, when the owner exits" testRequestAdmission
     itBounded "are refused after the session's failure, including one queued before it that never started" testRequestAfterFailure
+    itBounded "are refused after a failure reported while the owner is idle, which the next publication brings to its checkpoint, including one queued before it that never started" testRequestAfterFailureWhileIdle
 
 -- ---------------------------------------------------------------------------
 -- Helpers
@@ -764,71 +760,81 @@ testReleaseOrder = do
   released `shouldBe` [0, 1, 2]
 
 testRequestAfterFailure ∷ IO ()
-testRequestAfterFailure = do
-  -- TEMPORARY (#438 diagnosis): phase markers and a watchdog that names the
-  -- wait this example is blocked in, and an optional pause that lets the
-  -- owner go idle before the error is reported.
-  started ← getMonotonicTime
-  phase ← newIORef "setup"
-  hostRef ← newIORef Nothing
-  ticketRef ← newIORef Nothing
-  pause ← maybe 0 read <$> lookupEnv "HET438_PRE_ERROR_DELAY_MS"
-  let at name = writeIORef phase name
-      dump = do
-        now ← getMonotonicTime
-        current ← readIORef phase
-        hPutStrLn stderr ("HET438-WATCHDOG phase=" <> current <> " elapsed=" <> show (now - started))
-        readIORef hostRef >>= \case
-          Nothing → hPutStrLn stderr "HET438-WATCHDOG host=not-yet-available"
-          Just host → do
-            readiness ← atomically (readReadiness (vulkanController host))
-            failure ← atomically (readOwnerFailure (vulkanGraphicsOwner host))
-            status ← atomically (readOwnerStatusNow (vulkanGraphicsOwner host))
-            terminal ← atomically (readVulkanTerminal (vulkanController host))
-            hPutStrLn stderr ("HET438-WATCHDOG readiness=" <> show readiness <> " ownerFailure=" <> show (isJust failure) <> " ownerRounds=" <> show (statusRounds status) <> " terminalLatched=" <> show (isJust (reportPrimary terminal)))
-            readIORef ticketRef >>= \case
-              Nothing → hPutStrLn stderr "HET438-WATCHDOG ticket=none-yet"
-              Just look → look >>= hPutStrLn stderr . ("HET438-WATCHDOG ticket=" <>)
-  bracket (forkIO (threadDelay 20000000 >> dump)) killThread $ \_ → do
-    rig ← withPerWindowScenes <$> surfaceFreeRig 1
-    observed ← newTVarIO Nothing
-    outcome ← runRigCaught rig $ \host control → (`finally` at "teardown") $ do
-      writeIORef hostRef (Just host)
-      at "supervise"
-      _ ← superviseGraphicsOwner control (vulkanGraphicsOwner host)
-      at "wait-ready"
-      atomically (readReadiness (vulkanController host) >>= check . (== RootsReady))
-      at "publish"
-      [window] ← windowsOf host
-      -- A window with a publication and no target: nothing adopts it, so the
-      -- request is still queued when the session fails.
-      published ← publishTo host window 1
-      published `shouldBe` WindowScenePublished window 1
-      at "request"
-      queued ← request host (VulkanAction (\_ → pure ()))
-      writeIORef ticketRef (Just (atomically (readVulkanAction queued) <&> maybe "queued-or-running" (\case ActionReturned _ → "returned"; ActionRaised _ → "raised"; ActionRefused refusal → "refused:" <> show refusal)))
-      when (pause > 0) (at "pause" >> threadDelay (pause * 1000))
-      at "report-error"
-      reportErrorNow rig "an error while a request waits"
-      at "wait-owner-failure"
-      atomically (readOwnerFailure (vulkanGraphicsOwner host) >>= check . isJust)
-      at "wait-settlement"
-      settled ← atomically (awaitVulkanAction queued)
-      at "later-request"
-      later ← atomically (requestVulkanRelease (vulkanController host) (VulkanAction (\_ → pure ())))
-      atomically (writeTVar observed (Just (settledAs settled, either Just (const Nothing) later)))
-      at "check-runtime"
-      checkRuntime control
-    at "after-teardown"
-    case outcome of
-      Left _ → pure ()
-      Right _ → failWith "the run returned instead of failing with the session's failure"
-    readTVarIO observed
-      >>= (`shouldBe` Just (Just TerminalValidationError, Just (ActionSessionFailed TerminalValidationError)))
+testRequestAfterFailure = requestAfterFailure False
+
+testRequestAfterFailureWhileIdle ∷ IO ()
+testRequestAfterFailureWhileIdle = requestAfterFailure True
+
+-- | A validation error is reported while a release request waits, and the
+-- session fails: the request that never started is settled as refused by the
+-- failure, and a request made after it is refused at once.
+--
+-- The owner latches the error at its next checkpoint, and reporting it wakes
+-- nobody (the latch table in docs/gpu_backend.md). The one thing queued is a
+-- release request blocked on its barrier, which wakes no idle owner either. So
+-- an owner that has ended the round that took the publication before the error
+-- is reported is never asked for another, and the wait for its failure never
+-- ends; whether that happens used to be down to the scheduler (it left the
+-- example running into its bound once on Linux CI, #438). The example reports
+-- the error and then gives the owner a round as an application does, by
+-- publishing the window's next scene. With @idle@ it first waits for the owner
+-- to have ended its last round with nothing owed, which is the interleaving
+-- that stalled.
+requestAfterFailure ∷ Bool → IO ()
+requestAfterFailure idle = do
+  rig ← withPerWindowScenes <$> surfaceFreeRig 1
+  observed ← newTVarIO Nothing
+  outcome ← runRigCaught rig $ \host control → do
+    _ ← superviseGraphicsOwner control (vulkanGraphicsOwner host)
+    atomically (readReadiness (vulkanController host) >>= check . (== RootsReady))
+    [window] ← windowsOf host
+    -- A window with a publication and no target: nothing adopts it, so the
+    -- request is still queued when the session fails.
+    published ← publishTo host window 1
+    published `shouldBe` WindowScenePublished window 1
+    queued ← request host (VulkanAction (\_ → pure ()))
+    when idle (awaitIdleOwner host)
+    reportErrorNow rig "an error while a request waits"
+    atomically (readOwnerFailure (vulkanGraphicsOwner host) >>= check . isJust)
+    settled ← atomically (awaitVulkanAction queued)
+    later ← atomically (requestVulkanRelease (vulkanController host) (VulkanAction (\_ → pure ())))
+    atomically (writeTVar observed (Just (settledAs settled, either Just (const Nothing) later)))
+    checkRuntime control
+  case outcome of
+    Left _ → pure ()
+    Right _ → failWith "the run returned instead of failing with the session's failure"
+  readTVarIO observed
+    >>= (`shouldBe` Just (Just TerminalValidationError, Just (ActionSessionFailed TerminalValidationError)))
   where
     settledAs = \case
       ActionRefused (ActionSessionFailed cause) → Just cause
       _ → Nothing
+
+-- | Wait until the owner has ended a round that began after everything this
+-- thread did so far, with nothing left to ask it for another.
+--
+-- An action with no barrier runs in a round of the owner's, and that round
+-- counts the rounds ended before it (the idiom 'settleOwner' uses for a
+-- scene event). The first action settles inside some round; the second is
+-- admitted after that, so it runs in a later round, one that began after the
+-- caller's earlier publications and admissions were made and read them. When
+-- that round has ended the owner is waiting for a wake, and none is owed: the
+-- release request that waits wakes no one.
+awaitIdleOwner ∷ VulkanHost Scene → IO ()
+awaitIdleOwner host = do
+  _ ← inRound
+  rounds ← inRound
+  void (atomically (awaitOwnerRound (vulkanGraphicsOwner host) rounds))
+  where
+    owner = vulkanGraphicsOwner host
+    inRound = do
+      seen ← newTVarIO 0
+      ticket ←
+        atomically (submitVulkanAction (vulkanController host) (VulkanAction (\_ → atomically (readOwnerStatusNow owner >>= writeTVar seen . statusRounds))))
+          >>= either (\refusal → failWith ("the action was refused: " <> show refusal)) pure
+      atomically (awaitVulkanAction ticket) >>= \case
+        ActionReturned () → readTVarIO seen
+        _ → failWith "the action did not return"
 
 -- ---------------------------------------------------------------------------
 -- Retention, cancellation and teardown
