@@ -1504,6 +1504,13 @@ conventions comes from `hetoimasia-math`'s `perspective ZeroToOne YDown`
 ([its contract](../packages/math/README.md)), which promises no byte layout:
 the renderer packs what it pushes itself.
 
+**The format of an image.** `imageFormatOf recording image`
+(`constructImageFormat` through the host's `Construction`) answers the format a
+live image of the session was made with, as the backend holds it, on the owner's
+thread with no native call; a released, replaced or foreign handle has the
+refusal every handle has, and a handle that is not an image `RefusedWrongKind`.
+The 2D renderer checks a depth image's declared format against it (R2D-9).
+
 **The depth format.** `selectDepthFormat` (`constructDepthFormat` through the
 host's `Construction`) answers the depth-only format the backend will use,
 asking the device and never assuming one: the first of `depthFormatPreference`
@@ -4454,9 +4461,21 @@ managed boundary alone; `clearRenderer` clears the frame to the colour it
 computes from the scene and the `FrameRequest` — the attachment, target,
 frame, image, the image's extent and color format, the scene revision and, for
 a host that asked for [windowed depth](#windowed-depth), its generation's depth
-image (`requestDepth`, `Nothing` otherwise). The request is the frame's
-description, handed to the renderer before it records anything; the
-controller's own transitions around it are the only commands recorded first.
+image (`requestDepth`, `Nothing` otherwise) and, for the window the target
+presents to, the latest window observation the owner has published:
+`requestLogicalExtent`, the window's logical extent in window coordinates, and
+`requestContentScale`, its content scale per axis (R2D-8). Both are `Maybe`, and
+`Nothing` says the platform has not reported that attribute for this window,
+never a default: the owner's coherent observation keeps the last value each
+attribute reported, so one reported without the other does not erase it, and a
+renderer that needs a value it was not given declines the frame rather than
+invent one (the 2D adapter refuses it, and the host's backoff retries). They
+are independent of the image's own extent, which stays the framebuffer extent:
+the frame image's pixels, which the window's logical extent times its content
+scale describes but need not equal exactly. A renderer that does not read them
+is unchanged. The request is the frame's description, handed to the renderer
+before it records anything; the controller's own transitions around it are the
+only commands recorded first.
 
 ### Consumer construction
 
@@ -5080,6 +5099,17 @@ sources, is the session's **primary**:
 | A native effect whose outcome is unknown | By the step that observed it: a submission, a presentation, a bookkeeping refusal | `TerminalUncertainEffect` |
 | A cleanup that raised | By the destruction or cleanup that raised: a surface — one created while the lease closed included — a root, a generation, a frame's cleanup submission or release, a slot's or pool record's objects, a managed resource | `TerminalCleanupFailed` |
 | A required target's recovery exhausted | The model escalates it; the next checkpoint, or any read of the latch, takes it | `TerminalRequiredTarget` |
+
+Reporting an error wakes no one. The error is latched at the owner's next
+checkpoint, and the owner takes a round only when something asks for one: a
+sink failure and a primary latched on another thread have wakes of their own,
+a validation error does not, and neither does a release request waiting on its
+barrier. An example that reports an error from its own thread therefore gives
+the owner a round afterwards, as an admitted action, a published demand or a
+published scene does, and the integration suite's examples do. One that only
+waited for the failure depended on the owner not yet having ended the round that
+took its last input, which a loaded Linux runner decided the other way in about
+two runs in a hundred (#438).
 
 Latching the primary is one transaction: it closes the roots' admission and
 fails the model's session with the matching cause (`DiagnosticSinkFailed` for
@@ -5960,7 +5990,7 @@ companions — and adds the Vulkan owner's:
 | Main thread | Hspec runs on a thread of its own; the process main thread owns one shared production graphics session: `withLoaderIntegration`, then `runGraphicsOwnerApplication` over `withVulkanOwnerHost`, with the production native layer and surface bridge. An example that needs the main thread — to hand a window's surface over, which GLFW creates there, or to close a window — submits an operation (`onMain`); the main thread runs it between two turns of the host's owner loop and returns its result or rethrows its failure. Windows are created through the host's command port from the example's own thread, which the owner loop executes, as an application's worker would. |
 | Identities | Every dispatched operation is checked, before it runs, to be on the bound process main thread that entered the session — the Haskell thread, the bound flag, and the OS thread read through `pthread_self` — and a failed check fails the operation and the run. Every native call the session makes is recorded where it runs by a `NativeObserver`, so an example shows from the calls themselves that the instance, its messenger, the device and every surface's destruction ran on the graphics owner's thread and every surface's creation on the main thread — never from the name of an Hspec hook. |
 | Sharing | The roots — the instance, its explicit messenger, and the one device — are acquired lazily, by the first dispatched operation, at most once, and shared by every later example. Each example's windows and targets are its own and are closed inside it. |
-| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, `vk12-frames`, `vk13-presentation`, `vk14-recovery`, `vk15-validation-stop`, `vk15-retention`, `vk16-composed`, `vk17-one-slot`, `vk17-two-slots`, `vk19-capture`, `grs15-surface-free`, `grs15-surface-free-window`, `grs12-frameless`, `grs3-ordering`, `grs7-texture-table`, `grs8-sprites`, `grs9-swap`, `grs10-scene3d`, `grs13-window-depth`, `grs14-table-growth`, `r2d17-depth-rect`, `r2d14-window-scenes`, `r2d7-ordered-path`, `synchronization-hazard`, `debug-names`, and, under the isolated compositor's consent only, `wayland-connection-loss`. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. Each child runs in a process group of its own under an external 20-second deadline covering its exit and the end of its output; one still running at it is terminated with its group and fails its example as expired. |
+| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, `vk12-frames`, `vk13-presentation`, `vk14-recovery`, `vk15-validation-stop`, `vk15-retention`, `vk16-composed`, `vk17-one-slot`, `vk17-two-slots`, `vk19-capture`, `grs15-surface-free`, `grs15-surface-free-window`, `grs12-frameless`, `grs3-ordering`, `grs7-texture-table`, `grs8-sprites`, `grs9-swap`, `grs10-scene3d`, `grs13-window-depth`, `grs14-table-growth`, `r2d17-depth-rect`, `r2d14-window-scenes`, `r2d7-ordered-path`, `r2d9-cutout-depth`, `r2d8-image`, `synchronization-hazard`, `debug-names`, and, under the isolated compositor's consent only, `wayland-connection-loss`. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. Each child runs in a process group of its own under an external 20-second deadline covering its exit and the end of its output; one still running at it is terminated with its group and fails its example as expired. |
 | Selection | Building, listing and filtering the tree, a `--dry-run`, and a selection that dispatches nothing acquire nothing and start no child. A selection matching no example fails. `--complete`, which the catalog group passes, runs the whole tree with Hspec's configuration reading left out and then fails unless the shared session was acquired once and every private scenario the run's consent requires ran and passed — every one, except that `wayland-connection-loss` is required under the isolated compositor's consent and pending under any other — so no ambient setting can turn the group's receipt into a pass for a subset. The consent rules and the migrated proof's pure release, construction, publication and loader-selection examples need no session and run without consent. |
 | Consent | Read once, at startup, from `HETOIMASIA_NATIVE_SESSION`, with the GLFW suite's rules for `desktop`, `isolated-x11:<display>` and `isolated-wayland:<socket>`: the last only on Linux, only when `WAYLAND_DISPLAY` names that socket, and never beside a `DISPLAY`. Under the Wayland consent every session requests Wayland by name — the shared host, each child's host, the VK-5 bridge's loader-aware session, and the proof shim's raw initialization, which sets `GLFW_PLATFORM` and fails one that selected another platform — so no X11 or XWayland session stands in; under the others every session requests nothing, as before. The first shared example asserts the platform GLFW selected before any example renders. Without consent every native example is refused before its body, the session is never acquired, and the run ends with the refusal on stderr and a non-zero exit. |
 | Environment | Before any Vulkan call, the suite clears every ambient discovery override and every validation-layer setting it finds and records which, disables implicit layers, and points the layer's settings file at an empty one; a child inherits and re-establishes the same environment. |
@@ -6455,7 +6485,10 @@ otherwise):
 8. *formats*: an `R8G8B8A8_SRGB` target and a UNORM one in two passes of one
    frame, drawing the same sRGB texture;
 9. *cutout-art*: a depth-enabled world layer holding binary-alpha art, drawn
-   ordered because nothing is marked;
+   ordered because nothing is marked, into a target that has a `D32_SFLOAT` depth
+   image its pass begins with (R2D-9), so the case needs that format and
+   otherwise reports it and checks the recorder's refusal, as `r2d9-cutout-depth`
+   does;
 10. *placeholders*: a handle whose index no texture holds and one whose
     generation is stale, beside a registered texture;
 11. *snap-boundary*: a snapping view whose sprite's origin is the largest
@@ -6486,6 +6519,100 @@ passes only if all of these hold:
 The PNGs and the record go beneath `HETOIMASIA_VALIDATION_EVIDENCE/ordered-path/`
 when the runner names an evidence directory. The whole child runs under the
 suite's 20-second deadline; it takes well under a second.
+
+R2D-9's case, `r2d9-cutout-depth`, runs the same composition, host and runner
+over targets that each have a depth image of their extent, to prove the cutout
+path and the depth pass. The device chooses the depth format
+(`constructDepthFormat`); the case needs `D32_SFLOAT` (render-2d D-23). Where
+the device chooses another it renders nothing, reports the format it chose and
+checks that the recorder refuses a depth-enabled world layer over a depth image
+of it before recording; otherwise each of seven fixtures is rendered into
+`R8G8B8A8_UNORM` targets with a `D32_SFLOAT` depth image, through
+`prepareSnapshot` planned with the marks the fixture names — the same marks the
+oracle is planned with — and read back as the ordered path's are:
+
+1. *interleaved*: cutouts and translucent instances interleaved in one
+   depth-enabled world layer, a translucent instance nearer than a cutout
+   drawing over it and one farther hidden by it;
+2. *equal-keys*: both equal-key rules — among cutouts of an equal key the later
+   draw wins, and at an equal key a translucent instance, submitted first, is
+   drawn over a cutout;
+3. *discarded*: a nearer cutout, submitted first, whose discarded fragments
+   write no depth, so the farther cutout submitted after it shows through;
+4. *filtered-edge*: a linearly filtered cutout edge whose
+   `(0.6, 0.6, 0.6, 0.6)` sample writes white, not grey, and one below an alpha
+   of a half that is discarded;
+5. *minified*: a 4 × 4 cutout texture of three levels minified 2:1, whose level 1
+   is opaque while its level 0 alone would be discarded, beside the twin that
+   has level 0 only;
+6. *two-layers*: two depth-enabled world layers in one view, the second's keys
+   independent of the first's;
+7. *mixed-layers*: a UI layer and a world layer without depth in the same depth
+   pass as a depth-enabled layer, neither testing nor writing depth.
+
+The pass criteria are the ordered path's: every determinate probe within its
+tolerance, every named probe determinate and distinct from its contrast, the
+files kept, the roots retired in order, a clean verdict with synchronization
+validation. The probe record also names the depth format and, for every
+indeterminate probe, its reason; the PNGs and the record go beneath
+`HETOIMASIA_VALIDATION_EVIDENCE/cutout-depth/`. The case found that on MoltenVK a
+`clearDepthRect` recorded after a draw of the same pass leaves the descriptor
+bindings unusable by the draws after it; the recorder binds the texture table
+again after each depth clear in a pass that draws.
+
+R2D-8's case, `r2d8-image`, runs the [image2d sample](../samples/image2d/README.md)
+through the production composition — `withVulkanOwnerHost` over the loader
+integration, with the validation layer and synchronization validation —
+configured with `PerWindowScenes`, the 2D adapter's lifecycle hooks, the
+session's uploads, the surface-free device start and one test-owned window, in
+a child process of its own. Nothing is captured from the screen. It runs in two
+parts.
+
+*The evidence*, before the window is handed over, makes the sample's renderer
+and its textures — a 64 × 64 PNG decoded with `asset-image`, a 32 × 32 RGBA8
+KTX2 image, and a PNG of non-binary alpha — registers two of them with their
+default marks, and renders the sample's frame into an offscreen
+`R8G8B8A8_SRGB` target of logical extent 128 × 128 at content scale 2 through
+the recorder, reading it back after the batch's completion. Every pixel is
+judged against the oracle, planned with no cutout marks as the recorder is; 19
+named probes — the PNG's world copy, its UI copy at 48 logical pixels, the
+KTX2 copy and the clear background — are each read within one step of a colour
+stated by hand from the images' region tables, independent of the decoder, the
+oracle and the readback, with the oracle agreeing and a contrast of a different
+colour; and the swap rule is shown: a swap of the PNG's handle to the
+non-binary image is refused naming the marks `True` and `False`, changes
+nothing, and is accepted with the registered mark explicitly kept.
+
+*The lifecycle* then runs the actual adapter and the host's adoption callbacks
+in the window, driven by `runVulkanOwnerLoop`, with a renderer that logs every
+scene it is handed with its revision, and a release request wrapped to log, from
+the real table on the owner's thread, whether the KTX2 image's handle still
+resolves to its own slot after the release ran:
+
+1. a snapshot showing the PNG and the KTX2 image is published, adopted as
+   revision 1, and rendered;
+2. the KTX2 image's release is requested while revision 1 is adopted. The
+   adapter marks it released and asks the host; the release runs on the
+   owner's thread once the host's barrier is met, finds revision 1 holding the
+   texture, and the table still maps it; the window renders revision 1 again,
+   showing it, afterwards;
+3. a snapshot naming the released texture is offered and refused, naming it;
+4. a snapshot without it is published, adopted as revision 2, revision 1 is
+   released by the host, and only then does the release take effect — by an
+   action that waits for no barrier, since the request's was met in step 2: the
+   table no longer maps the handle, and nothing is left pending.
+
+It passes only if the evidence passed; every named probe held; the swap was
+refused and accepted as above; every release that ran before revision 1's
+release found the texture mapped, and one afterwards found it released, with
+revision 2 adopted before revision 1's release and that before the release's
+effect; the refusal named the texture and the snapshot without it was
+accepted; every Vulkan call ran on the graphics owner's thread and every
+surface was created on the main thread; and the verdict after the last
+teardown callback has no issue and no error was reported. The PNG and the
+probe record go beneath `HETOIMASIA_VALIDATION_EVIDENCE/image2d/` when the
+runner names an evidence directory. The windowed mode of the sample is the
+owner-visible path and no test launches it.
 
 GRS-10's case, `grs10-scene3d`, runs the scene3d sample's window-free evidence
 ([samples/scene3d/README.md](../samples/scene3d/README.md)) over the same
