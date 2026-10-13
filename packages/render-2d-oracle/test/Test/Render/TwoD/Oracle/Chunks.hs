@@ -30,7 +30,7 @@ import Hetoimasia.Render.TwoD.Snapshot
 import Hetoimasia.Render.TwoD.Validation (validateSnapshotWith)
 import Test.Hspec hiding (Expectation)
 import Test.Hspec.QuickCheck (prop)
-import Test.QuickCheck (Gen, choose, conjoin, counterexample, elements, forAll, listOf, resize, (===))
+import Test.QuickCheck (Gen, checkCoverage, choose, conjoin, counterexample, cover, elements, forAll, listOf, resize, (===))
 import Test.Render.TwoD.Oracle.Support
 
 -- * Fixtures
@@ -329,7 +329,8 @@ shape = \case
 inlineSpec ∷ Spec
 inlineSpec = describe "a layer that lists chunks" $
   prop "gives the expectation of the layer that holds the same instances itself in source order, at every pixel" $
-    forAll fixtureGen $ \fixture →
+    checkCoverage $
+      forAll fixtureGen $ \fixture →
       let kind = fixtureKind fixture
           built = [chunkOf allMarked kind instances | instances ← fixtureChunks fixture]
           held = [(ref (fromIntegral index), chunk) | (index, chunk) ← zip [0 ∷ Int ..] built]
@@ -350,8 +351,11 @@ inlineSpec = describe "a layer that lists chunks" $
                 }
           chunked = oracle held withChunks
           reference = oracle [] plain
-       in conjoin
-            [ counterexample ("pixel " <> show (x, y)) (shape (expect chunked (Probe 0 x y)) === shape (expect reference (Probe 0 x y)))
-            | x ← [0 .. 7]
-            , y ← [0 .. 7]
-            ]
+          drawn = length [() | x ← [0 .. 7], y ← [0 .. 7], Expected value _ ← [expect reference (Probe 0 x y)], value /= Rgba8 0 0 0 0]
+       in cover 40 (drawn > 0) "something is drawn in view" $
+            cover 20 (not (null (fixtureListing fixture))) "the layer lists chunks" $
+              conjoin
+                [ counterexample ("pixel " <> show (x, y)) (shape (expect chunked (Probe 0 x y)) === shape (expect reference (Probe 0 x y)))
+                | x ← [0 .. 7]
+                , y ← [0 .. 7]
+                ]

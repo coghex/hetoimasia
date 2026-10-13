@@ -57,9 +57,11 @@ import Test.QuickCheck
   ( Gen
   , Property
   , arbitrary
+  , checkCoverage
   , choose
   , conjoin
   , counterexample
+  , cover
   , elements
   , forAll
   , listOf
@@ -474,18 +476,21 @@ mergeSpec = describe "the merge order of a layer's content" $ do
         other → fail ("planned to " <> show other)
       Left refused → fail ("refused: " <> show refused)
   prop "is total and repeatable, and matches an independent characterisation, for generated chunks and dynamic instances" $
-    forAll layerCase $ \(kind, listing, listedChunks, dynamic) →
+    checkCoverage $
+      forAll layerCase $ \(kind, listing, listedChunks, dynamic) →
       let held = [(ref (fromIntegral i) 1, chunk) | (i, chunk) ← zip [0 ∷ Int ..] listedChunks]
           refs = [ref (fromIntegral i) 1 | i ← listing]
           listed = [listedChunks !! i | i ← listing]
           layer = layerOf kind refs dynamic
           (_, plan) = planned marks held layer
           (_, again) = planned marks held layer
-       in conjoin
-            [ counterexample "repeatable" (plan === again)
-            , counterexample "the ring and the runs" (characterised kind listed dynamic plan)
-            , counterexample "culls nothing" (plannedCulled plan === [])
-            ]
+       in cover 30 (not (null listing)) "the layer lists chunks" $
+            cover 10 (kind == ChunkWorldDepth && any (not . null . chunkCutoutPositions) listed) "a depth chunk has cutouts" $
+              conjoin
+                [ counterexample "repeatable" (plan === again)
+                , counterexample "the ring and the runs" (characterised kind listed dynamic plan)
+                , counterexample "culls nothing" (plannedCulled plan === [])
+                ]
   where
     layerCase = do
       kind ← elements allKinds
@@ -643,16 +648,20 @@ cullingSpec = describe "culling" $ do
           drawingSources far `shouldBe` [DynamicInstance 0]
         other → fail ("planned to " <> show other)
   prop "never skips a chunk with an instance that covers a pixel centre of the view, whatever the camera, scales and snap" $
-    forAll cullingCase $ \(extent, kind, camera, viewport, settings, instances) →
+    checkCoverage $
+      forAll cullingCase $ \(extent, kind, camera, viewport, settings, instances) →
       let metrics = TargetMetrics (PixelExtent (fromIntegral (fst extent)) (fromIntegral (snd extent))) (PixelExtent (fromIntegral (fst extent)) (fromIntegral (snd extent))) 1 1
        in case viewMapping metrics (View camera viewport settings []) of
             Nothing → property True
             Just mapping →
               let chunk = built' kind instances
                   covered = [() | candidate ← instances, coversACentre mapping kind extent viewport candidate]
-               in counterexample
-                    ("an instance covers a pixel centre of the view but the chunk was skipped: " <> show (mappingPixelSnap mapping))
-                    (null covered || not (chunkCulled mapping extent viewport kind (chunkBounds chunk)))
+                  skipped = chunkCulled mapping extent viewport kind (chunkBounds chunk)
+               in cover 20 (not (null covered)) "an instance covers a pixel centre" $
+                    cover 10 (null covered && skipped) "nothing is covered and the chunk is skipped" $
+                      counterexample
+                        ("an instance covers a pixel centre of the view but the chunk was skipped: " <> show (mappingPixelSnap mapping))
+                        (null covered || not skipped)
   where
     built' kind = either (error . show) id . buildChunk marks kind DeriveBounds
 
@@ -663,11 +672,11 @@ cullingCase = do
   width ← choose (4, 12)
   height ← choose (4, 12)
   kind ← elements allKinds
-  position ← V2 <$> choose (-20, 20) <*> choose (-20, 20)
+  position ← V2 <$> choose (-6, 6) <*> choose (-6, 6)
   zoom ← elements [0.5, 1, 2, 3.25]
   rotated ← oneof [pure Nothing, Just <$> choose (-3.2, 3.2)]
-  viewportOrigin ← V2 <$> choose (-3, 8) <*> choose (-3, 8)
-  viewportExtent ← V2 <$> choose (0, 14) <*> choose (0, 14)
+  viewportOrigin ← V2 <$> choose (-1, 4) <*> choose (-1, 4)
+  viewportExtent ← V2 <$> choose (3, 12) <*> choose (3, 12)
   snap ← arbitrary
   scale ← elements [0.5, 1, 1.75, 4]
   instances ← resize 4 (listOf1 small)
@@ -680,8 +689,8 @@ cullingCase = do
       b ← coefficient
       c ← coefficient
       d ← coefficient
-      tx ← choose (-30, 30)
-      ty ← choose (-30, 30)
+      tx ← choose (-8, 12)
+      ty ← choose (-8, 12)
       pure (placed (a, b) (c, d) (tx, ty))
 
 -- | Whether the instance, drawn in this view, covers the centre of some pixel of
