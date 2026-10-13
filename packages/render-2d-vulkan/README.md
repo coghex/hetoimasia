@@ -1,7 +1,11 @@
 # hetoimasia-render-2d-vulkan
 
 The 2D renderer's Vulkan recorder for the **ordered path** (R2D-7) and the
-**cutout path** (R2D-9): a validated [render-2d](../render-2d/README.md) snapshot
+**cutout path** (R2D-9), and, with it, what a host needs to show decoded images
+in windows (R2D-8): texture registration with cutout marks and the swap rule,
+and a per-window host adapter that publishes snapshots, holds what an adopted
+revision references and releases textures behind the window host's barrier. The
+recorder: a validated [render-2d](../render-2d/README.md) snapshot
 recorded into one batch of the
 [native backend](../gpu-vulkan/native/README.md), every pass in list order into
 an offscreen colour target or the frame's image, every view under its own
@@ -11,12 +15,15 @@ drawn first, depth-tested and depth-written, and the ordered path's instances
 are depth-tested and not written. It owns the built-in shaders and the wrapping
 the engine applies around a material. The decision record is
 [the 2D renderer design](../../docs/designs/render_2d_design.md) (D-2, D-3, D-4,
-D-5, D-9, D-10, D-12, D-19, D-22, D-23, D-24, D-26, D-27; P-6); the backend's
+D-5, D-9, D-10, D-12, D-19, D-22, D-23, D-24, D-26, D-27, D-28, D-29; P-6); the backend's
 contract is [docs/gpu_backend.md](../../docs/gpu_backend.md).
 
 | Module | Contents |
 | --- | --- |
-| `Hetoimasia.Render.TwoD.Vulkan` | `Builders`; `Configuration`, `defaultConfiguration`; `Renderer`, `makeRenderer`, `pipelineFor`, `pipelineDeclaration`; `prepareSnapshot`, `FrameRecording`; re-exports `Hetoimasia.Render.TwoD.Vulkan.Frame`, `orderedShaders` and `cutoutShaders` |
+| `Hetoimasia.Render.TwoD.Vulkan` | re-exports `Builders`; `Configuration`, `defaultConfiguration`; `Renderer`, `makeRenderer`, `pipelineFor`, `pipelineDeclaration`; `prepareSnapshot`, `FrameRecording`; re-exports `Hetoimasia.Render.TwoD.Vulkan.Frame`, `orderedShaders` and `cutoutShaders` |
+| `Hetoimasia.Render.TwoD.Vulkan.Builders` | `Builders`: the constructions the recorder and the registry need from a host: the ring, the table, the layout, a pipeline, and registering, swapping and releasing an uploaded texture |
+| `Hetoimasia.Render.TwoD.Vulkan.Textures` | `Textures`, `newTextures`; `registerTexture` with a `MarkPolicy`; `swapTexture` with a `SwapPolicy`; `TextureRefusal`; the logical release marker (`markReleased`, `isReleased`), `releaseTextureNow`; `registeredMark`, `registeredMarks` |
+| `Hetoimasia.Render.TwoD.Vulkan.Window` | the host adapter: `Host`, `Adapter`, `newAdapter`; `Scene2D`, `blankScene`; `publish2DSnapshot`, `PublishRefusal`; `release2DTexture`; `adapterAdopted`, `adapterReleased`; `FrameInfo`, `renderWindowFrame` |
 | `Hetoimasia.Render.TwoD.Vulkan.Frame` | `Attachment`, `offscreenAttachment`, `TargetBinding`, `DepthBinding`, `FrameInput`; `depthLayers`, `requireWorldDepth`; `FrameRefusal`; `frameWork` and the work it computes: `PassWork`, `ViewWork`, `LayerWork`, `RunWork`, `PipelineKind`, `runPipeline` |
 | `Hetoimasia.Render.TwoD.Vulkan.Layout` | the instance as vertex input (`instanceVertexInput`), the key's depth (`depthFromKey`), the push block (`ViewPush`, `packViewPush`, `pushMembers`), the sampler choice (`shaderSamplerIndex`), the scissor rule (`viewScissor`) |
 | `Hetoimasia.Render.TwoD.Vulkan.ShaderInterfaces` | the checked interface descriptions the shaders are compiled against |
@@ -25,13 +32,24 @@ contract is [docs/gpu_backend.md](../../docs/gpu_backend.md).
 ## Boundary
 
 The library's `build-depends` names `base`, `bytestring`, `containers`,
-`hetoimasia-gpu-vulkan-native`, `hetoimasia-math` (the transforms' coefficients),
-`hetoimasia-render-2d` and `hetoimasia-render-api`. It names no GLFW,
+`deepseq` and `stm` (the adapter's state), `text`, `hetoimasia-asset` (the decoded
+image a mark is computed from), `hetoimasia-gpu-vulkan-native`, `hetoimasia-math`
+(the transforms' coefficients), `hetoimasia-render-2d` and
+`hetoimasia-render-api`. It names no GLFW,
 window-integration, runtime or Lua package, holds no native handle of its own
 (its `Renderer` holds the backend's managed, opaque handles to a pipeline layout
 and pipelines, as the sprites sample does) and makes no Vulkan call outside the
 backend's vocabulary. The constructions it needs arrive as `Builders`, which a
 host fills from the construction an owner-thread action or a frame lends it.
+
+The host adapter is written the same way, **generic over the window's identity
+and over a `Host` record of plain functions** (publish a scene for a window,
+queue an owner-thread release), never over the window integration's own types.
+The integration's native suite lives in the integration's package and depends on
+this one, so a dependency the other way would be a cycle; the sample's
+executable and that suite each fill `Host` from the integration's public
+`publishVulkanWindowScene`, `requestVulkanRelease` and `SceneLifecycle`, in a
+few lines each (see [samples/image2d](../../samples/image2d/README.md)).
 
 The package is selected only by `cabal.project.vulkan`: it resolves the Vulkan
 binding through the native package, so neither `cabal.project` nor
@@ -137,18 +155,28 @@ backend's `DepthTarget` image and the format the caller made it with:
   frame's request names.
 
 **The `D32_SFLOAT` requirement (choice B, D-23).** World-layer depth is
-`D32_SFLOAT` and nothing else, never degraded to a lower-precision format. The
-recorder refuses, before it records anything and naming the layer: a pass that
-needs a depth attachment and was given none (`NoDepthTarget`), and a pass holding
-a depth-enabled world layer whose supplied image is declared in another format
-(`DepthFormatRefused`), whether or not its scissors leave a pixel. The format is the
-caller's word about the image; a false one is refused by the backend when the
-first pipeline is bound. A snapshot with no depth-enabled world layer is
-unaffected on any device. `requireWorldDepth format snapshot` is the same rule
-for a session's depth format (`selectDepthFormat`), which a host applies when it
-publishes a snapshot, so a snapshot holding a depth-enabled world layer is
-refused at publication, naming the layer, on a device whose depth format is
-another; `depthLayers` lists the layers.
+`D32_SFLOAT` and nothing else, never degraded to a lower-precision format.
+`prepareSnapshot` refuses, before it records or claims anything and naming the
+layer, in this order:
+
+1. a snapshot holding a depth-enabled world layer, in a view whose scissor may be
+   empty or not, when the **session's depth format** (`Builders.buildDepthFormat`,
+   read once by `makeRenderer`) is not `D32_SFLOAT` (`DepthFormatRefused`), or the
+   session offers none (`NoDepthFormat`);
+2. a pass that needs a depth attachment and was given none (`NoDepthTarget`);
+3. a pass holding a depth-enabled world layer whose supplied image is not
+   `D32_SFLOAT` (`DepthFormatRefused`), whether or not its scissors leave a pixel.
+
+The format of a supplied image is the **backend's**, not its maker's:
+`prepareSnapshot` asks `Builders.buildImageFormat` (`imageFormatOf`) for every
+`DepthBinding` and replaces the declared `depthFormat` with the answer, so a
+24-bit image declared as `D32_SFLOAT` is refused, naming the layer, even in a
+layer that only clears; an image the backend no longer holds is the backend's
+refusal. A snapshot with no depth-enabled world layer is unaffected on any
+device. `requireWorldDepth format snapshot` is rule 1 on its own, for a host to
+apply when it publishes a snapshot (a snapshot holding a depth-enabled world layer
+is then refused at publication, naming the layer, on such a session);
+`depthLayers` lists the layers.
 
 **The clear.** Each depth-enabled world layer clears depth to 1.0 within its
 view's scissor rectangle with `clearDepthRect` before its runs. Because
@@ -177,6 +205,103 @@ a power of two, and constant across the quad. Depth is cleared to 1.0 and
 compared less-or-equal. Among cutouts of an equal key the later draw in run order
 wins; at an equal key a translucent instance is drawn after, and so over, a
 cutout. Both are tested, in the oracle and on the device.
+
+## Registering textures and marks
+
+`registerTexture builders textures image decoded policy` registers an uploaded
+texture with the table, through `Builders`, and answers a `render-api`
+`TextureHandle` made from the backend's index and generation, so a handle from
+before a release never aliases a reused index. The **mark** is the texture's
+cutout mark (D-19, D-27): by default `decodedBinaryAlpha decoded`, which
+`asset-image` computes — whether every alpha of level 0 is 0 or 255 — or an
+explicit `OverrideMark` the application states. It is stored with the complete
+handle, generation included, for the handle's life, and nothing but its release
+changes it. `registeredMark` answers it and `registeredMarks` the `CutoutMarks`
+of every registered handle whose mark is set. **Nothing here acts on a mark**:
+the host adapter plans with `noCutoutMarks` (R2D-8), so a mark changes nothing it
+renders, and a host that wants the cutout path (R2D-9) passes `registeredMarks`
+as the frame's marks. A registration is refused as the table refuses it, storing
+nothing.
+
+## The swap rule
+
+`swapTexture builders textures handle image decoded policy` gives a registered
+handle a replacement through the table's swap (GRS-9), unchanged, under the
+mark rule (D-27): a replacement whose computed mark differs from the registered
+one is refused as `MarkMismatch registered computed`, naming both, unless the
+policy is `KeepRegisteredMark`, the caller's explicit statement that the
+rendering semantics did not change; the registered mark then stays. A genuine
+change of rendering semantics takes a new handle. The rule is checked **before
+the table is asked**, so a refusal of any kind — a mismatch, a handle never
+registered (`TextureUnknown`), a handle already released (`TextureReleased`) or
+the table's own — leaves the image, the mark and any swap already pending as
+they were.
+
+## The host adapter
+
+The adapter makes one host's windows show `render-2d` snapshots: it publishes
+them per window, holds what each adopted revision references, releases textures
+behind the host's barrier, and renders each window's adopted snapshot into the
+frame's image. A host (the window integration in its per-window mode) gives it
+`Host window`: `hostPublish`, which publishes a `Scene2D` for a window and
+answers the revision or why not, and `hostRequestRelease`, which queues an
+owner-thread action behind the revisions the host must have adopted first.
+`newAdapter host textures` makes it over the registry; the host's lifecycle
+hooks call `adapterAdopted` and `adapterReleased`; the host's renderer calls
+`renderWindowFrame`.
+
+**Publishing.** `publish2DSnapshot adapter window snapshot` validates the
+snapshot and publishes it for one window, answering the window's revision. It
+is refused, checking in this order:
+
+1. `SnapshotInvalid`, with validation's reasons, each naming where;
+2. `OffscreenPassHeld`, naming the pass, when the snapshot holds an offscreen
+   pass: windowed snapshots hold none until R2D-13 issues target references;
+3. `NoWindowPass`, when the snapshot has no window pass — an empty snapshot
+   included; removing every layer publishes a window pass with none;
+4. `TextureReleasedInSnapshot`, naming the texture, when the snapshot
+   references one whose release was requested (any instance of any layer of
+   any view, visible or not);
+5. what the host answers: `PublishWindowUnknown`, `PublishHostClosed` or
+   `PublishHostShared`.
+
+**Holds (D-28).** When the owner adopts a revision of a window, `adapterAdopted`
+records a hold on every texture the revision's snapshot references — once for
+each texture, however often it is referenced — and when the host reports the
+revision released (superseded, or its window ended, and its last recording
+over), `adapterReleased` drops it. A texture is held while any adopted revision
+of any window holds it: two windows sharing one texture hold it twice, a
+superseded revision keeps its hold until its own release, and a closed window's
+revisions are released by the host and so drop theirs. Holds are keyed by
+window and revision.
+
+**Releasing (D-28).** `release2DTexture adapter handle` marks the texture
+released at once, which publication's check reads, adds it to the pending set
+and asks the host for the release. The host runs the request on the owner's
+thread once every window it held at the request has adopted the revision
+current then, and the adapter's release action releases the texture in the
+table only if **no adopted revision holds it**; otherwise the texture keeps
+rendering wherever an adopted snapshot shows it. When a hold ends,
+`adapterReleased` finds each pending texture no hold names and asks again, so
+progress is rechecked whenever either condition changes. The request is
+refused for a handle never registered or already released.
+
+Publication and release are **serialized by one lock**, with the release
+marker and the host's capture of the barrier inside it. So a snapshot accepted
+before the marker is published before the request captures the revisions it
+waits for: it is adopted, and acquires its holds, before the release can run,
+however late the owner takes it. One offered after the marker is refused.
+
+**Metrics (D-29).** `renderWindowFrame builders renderer info scene recorder`
+records the scene's window pass into the frame's image, with `TargetMetrics`
+built from the frame's own framebuffer extent, the window's logical extent and
+its per-axis content scale. The last two arrive in `FrameRequest`
+(`requestLogicalExtent`, `requestContentScale`, `Maybe` because the platform
+may not have reported them; the host preserves an unavailable observation
+rather than inventing one). A frame whose request carries neither, or whose
+metrics are not usable (a non-positive or non-finite scale), is refused —
+`RefusedIllegal`, naming what was missing — before anything is recorded, which
+the host skips and retries at its backoff.
 
 ## Targets and metrics
 
@@ -304,9 +429,16 @@ functions in the fragment stage, so an application material (R2D-11) replaces
 | --- | --- | --- | --- | --- | --- |
 | The ring, the texture table and the pipeline layout | The host session | `makeRenderer` makes them through `Builders`; batches `prepareSnapshot` records read them | Owner | From `makeRenderer` until the host session ends | Released and destroyed with every managed resource before the device |
 | The pipelines, one per colour format and kind | A `Renderer` | `pipelineFor`, on the first pass that draws with the pair | Owner | From that first pass until the host session ends | As above |
+| Each registered handle's mark and release flag | A `Textures` (a `TVar` ledger keyed by the complete handle) | `registerTexture` adds; `markReleased` flags; `releaseTextureNow` removes the mark; any thread reads in STM | Registration, swap and table release on the owner; marker and reads on any | From the registration until the table release | The flag is never cleared: a released handle stays refused after its index is reused |
+| The holds (window and revision to the textures that revision references) and the pending releases | An `Adapter` | `adapterAdopted` and `adapterReleased` on the owner's thread; the release action on the owner's thread; reads on any | Owner writes, any reads | From the adapter's creation until it is dropped | A revision's hold is dropped by its release; a pending texture leaves the set when its release runs |
+| The publication lock | An `Adapter` | `publish2DSnapshot` and `release2DTexture`, each for its whole length | Application threads | The adapter's life | None |
 
 A `Renderer` holds an `IORef` of the pipelines and is used on the graphics
-owner's thread only, as every backend construction is. `frameWork` is pure and
+owner's thread only, as every backend construction is. The registry and the
+adapter's state are read from any thread; publication and release run on
+application threads behind the adapter's lock, never on the owner's thread, which
+only runs the hooks and the release action and neither raises nor waits.
+`frameWork` is pure and
 `FrameRecording` is a closure over its result: neither keeps a native handle
 past the action that records it. The package starts no thread and keeps no
 other state.
@@ -342,6 +474,23 @@ at publication, on a device that offers only `X8_D24` (where a depth-free
 snapshot still publishes and records, since no pipeline is made for a depth it
 cannot attach).
 
+The registry and the adapter are checked over a coordinated stand-in for the
+window host, which publishes scenes per window with rising revisions and queues
+the release actions it is asked for, while the example plays the owner (it adopts
+and releases revisions and runs the queue when it says the barrier is met), over
+the backend's real table on the stand-in recording: marks stored by default and
+by override and keyed by the complete handle after an index is reused; the swap
+refusal naming both marks and leaving the mark, the table and the handle as they
+were, the keep, and the refusals of an unknown and a released handle before the
+table is asked; publication, its revisions and every refusal; holds taken once
+however often a texture is named, dropped on release, counted twice for two
+windows, kept by a superseded revision and dropped by a closed window; release
+marked at once, deferred while an adopted snapshot shows the texture and made
+when the last holding revision is released; a snapshot accepted before a
+release stays adoptable and holds the texture; and the frame's metrics
+refused, with nothing recorded, when the request names no extent, no scale or an
+unusable one.
+
 The device's proof is two surface-free native cases of `vulkan-native-tests`
 ([docs/gpu_backend.md](../../docs/gpu_backend.md#the-native-suite)), which render
 fixtures through this recorder and judge every pixel of every target against
@@ -354,13 +503,20 @@ independent keys, and a UI layer and a world layer without depth in the same
 depth pass). Each writes a lossless PNG of every target and a probe record naming
 the depth format and every indeterminate reason.
 
+A third case, `r2d8-image`, runs the [image2d sample](../../samples/image2d/README.md):
+registration, the swap rule and the adapter's holds and deferred release through
+the production host's per-window scenes.
+
 ## Not here
 
 Alpha-to-coverage and MSAA; depth formats other than `D32_SFLOAT` for world
-layers; application materials and their capability (R2D-11), clip tables (R2D-12)
-and per-batch storage tables (R2D-15); retained content (R2D-10); publishing per
-window, holding referenced objects (D-28), the host adapter, which enables
-windowed depth and calls `requireWorldDepth` at publication, and the windowed
-sample (R2D-14, R2D-8); registering textures with their marks and the swap rule
-(R2D-8); sampling an offscreen pass's target in a later pass (R2D-13); per-view
-culling; and performance claims, which need retained measurements.
+layers; wiring the host adapter to R2D-9: it plans with `noCutoutMarks` and
+publishes and renders whatever snapshot validates, so supplying the registered
+marks, enabling windowed depth and calling `requireWorldDepth` at publication are
+not part of R2D-8 (the recorder's side is `frameMarks`, `frameWindowDepth` and
+`requireWorldDepth`); application materials and their
+capability (R2D-11), clip tables (R2D-12) and per-batch storage tables (R2D-15);
+retained content (R2D-10); creating offscreen targets, issuing their references
+and their lifetimes, holds and releases, and sampling an offscreen pass's target
+in a later pass (R2D-13); per-view culling; and performance claims, which need
+retained measurements.

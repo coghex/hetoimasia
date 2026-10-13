@@ -177,10 +177,11 @@ uses, and releases both resources and still exits 0 — it just says nothing.
 | `packages/gpu-vulkan/glfw/` | Window integration: session controller, surface handover and the scheduled owner loop | Buildable only through `cabal.project.vulkan` |
 | `packages/render-2d/` | The 2D frame as a value: snapshot, validation, step zoom, view mapping, draw plan and the 64-byte instance encoding; no GPU | Buildable |
 | `packages/render-2d-oracle/` | The 2D renderer's oracle: expected pixels computed from a validated snapshot, with probes, verdicts and a readback reader; no GPU | Buildable |
-| `packages/render-2d-vulkan/` | The 2D renderer's Vulkan recorder for the ordered path: passes, views and layers recorded into one batch, with the built-in shaders | Buildable only through `cabal.project.vulkan`; proven offscreen against the oracle |
+| `packages/render-2d-vulkan/` | The 2D renderer's Vulkan recorder for the ordered path (passes, views and layers recorded into one batch, with the built-in shaders), texture registration with cutout marks and the swap rule, and the per-window host adapter (publication, holds and releases) | Buildable only through `cabal.project.vulkan`; proven offscreen against the oracle and through the production host's per-window scenes |
 | `packages/render-3d/` | Dedicated 3D rendering path | Planned |
 | `packages/scripting-lua/` | Lua binding, protocol model, and confinement experiments | Binding/model buildable; production runtime planned |
 | `samples/triangle/` | Independent two-window triangle consumer | Buildable only through `cabal.project.vulkan`; required native profile recorded on macOS and Linux |
+| `samples/image2d/` | A decoded PNG in a world and a UI layer with a KTX2 image beside it, through the 2D renderer and its host adapter | Buildable only through `cabal.project.vulkan`; evidence and lifecycle proven by the native case `r2d8-image`; windowed mode launched by hand |
 | `integrations/` | Game adapters | Planned |
 | `packages/foundation/test/` | Foundation-owned headless Hspec contracts | Buildable without GLFW through `cabal.project.cpu` |
 | `packages/runtime/test/`, `packages/glfw/test/` | Package-owned runtime and headless GLFW contracts | Buildable |

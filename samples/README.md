@@ -17,6 +17,16 @@ library depends on a sample, and nothing routine launches one.
   suite's `grs8-sprites` case runs; its executable (`sprites/app`,
   `hetoimasia-sprites`) writes the same evidence (`--evidence`) or shows the
   scene in a window (`--windowed`), launched by hand.
+- [`image2d/`](image2d/README.md) — R2D-8's 2D renderer consumer: a committed
+  PNG decoded with `asset-image` and drawn in a world layer and again in a UI
+  layer at a fixed logical size, with a committed RGBA8 KTX2 image beside it,
+  through the 2D renderer's recorder, texture registry and per-window host
+  adapter. Its drawing, hand-stated probes and window-free evidence
+  (`image2d/renderer`) are what the native suite's `r2d8-image` case runs, with
+  the texture lifecycle through the production host's per-window scenes; its
+  executable (`image2d/app`, `hetoimasia-image2d`) writes the evidence
+  (`--evidence`) or shows the images in a window (`--windowed [--ui-scale]`),
+  launched by hand.
 - [`scene3d/`](scene3d/README.md) — GRS-10's 3D scaffolding scene: two
   flat-coloured cubes, one in front of the other, drawn indexed with a depth
   test from two camera poses built with `hetoimasia-math`, checked against an
