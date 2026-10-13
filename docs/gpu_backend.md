@@ -3211,8 +3211,10 @@ table. It is the backend half of the render-2d design's per-batch tables (P-5,
 D-11, D-25 and D-30 of the [render-2d design](designs/render_2d_design.md)):
 clip rectangles and material records are written into regions the batch claims
 and bound for that batch. Clip and material semantics are not part of it. It
-is `hetoimasia-gpu-vulkan-native` alone: no `render-2d-vulkan` code uses set 2
-yet, and shaders still read instances from vertex input, not from storage.
+is `hetoimasia-gpu-vulkan-native` alone. `render-2d-vulkan` is its first client
+(R2D-12): it writes each batch's clip tables into one region, binds it as set 2
+and reads it in its fragment shaders; shaders still read instances from vertex
+input, not from storage.
 
 **Storage usage.** The ring's buffer kind, `InstanceBuffer`, gains the storage
 buffer usage beside its vertex and index usage. The ring's `InstanceRead` use
@@ -5990,7 +5992,7 @@ companions — and adds the Vulkan owner's:
 | Main thread | Hspec runs on a thread of its own; the process main thread owns one shared production graphics session: `withLoaderIntegration`, then `runGraphicsOwnerApplication` over `withVulkanOwnerHost`, with the production native layer and surface bridge. An example that needs the main thread — to hand a window's surface over, which GLFW creates there, or to close a window — submits an operation (`onMain`); the main thread runs it between two turns of the host's owner loop and returns its result or rethrows its failure. Windows are created through the host's command port from the example's own thread, which the owner loop executes, as an application's worker would. |
 | Identities | Every dispatched operation is checked, before it runs, to be on the bound process main thread that entered the session — the Haskell thread, the bound flag, and the OS thread read through `pthread_self` — and a failed check fails the operation and the run. Every native call the session makes is recorded where it runs by a `NativeObserver`, so an example shows from the calls themselves that the instance, its messenger, the device and every surface's destruction ran on the graphics owner's thread and every surface's creation on the main thread — never from the name of an Hspec hook. |
 | Sharing | The roots — the instance, its explicit messenger, and the one device — are acquired lazily, by the first dispatched operation, at most once, and shared by every later example. Each example's windows and targets are its own and are closed inside it. |
-| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, `vk12-frames`, `vk13-presentation`, `vk14-recovery`, `vk15-validation-stop`, `vk15-retention`, `vk16-composed`, `vk17-one-slot`, `vk17-two-slots`, `vk19-capture`, `grs15-surface-free`, `grs15-surface-free-window`, `grs12-frameless`, `grs3-ordering`, `grs7-texture-table`, `grs8-sprites`, `grs9-swap`, `grs10-scene3d`, `grs13-window-depth`, `grs14-table-growth`, `r2d17-depth-rect`, `r2d14-window-scenes`, `r2d7-ordered-path`, `r2d9-cutout-depth`, `r2d8-image`, `synchronization-hazard`, `debug-names`, and, under the isolated compositor's consent only, `wayland-connection-loss`. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. Each child runs in a process group of its own under an external 20-second deadline covering its exit and the end of its output; one still running at it is terminated with its group and fails its example as expired. |
+| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, `vk12-frames`, `vk13-presentation`, `vk14-recovery`, `vk15-validation-stop`, `vk15-retention`, `vk16-composed`, `vk17-one-slot`, `vk17-two-slots`, `vk19-capture`, `grs15-surface-free`, `grs15-surface-free-window`, `grs12-frameless`, `grs3-ordering`, `grs7-texture-table`, `grs8-sprites`, `grs9-swap`, `grs10-scene3d`, `grs13-window-depth`, `grs14-table-growth`, `r2d17-depth-rect`, `r2d14-window-scenes`, `r2d7-ordered-path`, `r2d9-cutout-depth`, `r2d12-clip`, `r2d8-image`, `synchronization-hazard`, `debug-names`, and, under the isolated compositor's consent only, `wayland-connection-loss`. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. Each child runs in a process group of its own under an external 20-second deadline covering its exit and the end of its output; one still running at it is terminated with its group and fails its example as expired. |
 | Selection | Building, listing and filtering the tree, a `--dry-run`, and a selection that dispatches nothing acquire nothing and start no child. A selection matching no example fails. `--complete`, which the catalog group passes, runs the whole tree with Hspec's configuration reading left out and then fails unless the shared session was acquired once and every private scenario the run's consent requires ran and passed — every one, except that `wayland-connection-loss` is required under the isolated compositor's consent and pending under any other — so no ambient setting can turn the group's receipt into a pass for a subset. The consent rules and the migrated proof's pure release, construction, publication and loader-selection examples need no session and run without consent. |
 | Consent | Read once, at startup, from `HETOIMASIA_NATIVE_SESSION`, with the GLFW suite's rules for `desktop`, `isolated-x11:<display>` and `isolated-wayland:<socket>`: the last only on Linux, only when `WAYLAND_DISPLAY` names that socket, and never beside a `DISPLAY`. Under the Wayland consent every session requests Wayland by name — the shared host, each child's host, the VK-5 bridge's loader-aware session, and the proof shim's raw initialization, which sets `GLFW_PLATFORM` and fails one that selected another platform — so no X11 or XWayland session stands in; under the others every session requests nothing, as before. The first shared example asserts the platform GLFW selected before any example renders. Without consent every native example is refused before its body, the session is never acquired, and the run ends with the refusal on stderr and a non-zero exit. |
 | Environment | Before any Vulkan call, the suite clears every ambient discovery override and every validation-layer setting it finds and records which, disables implicit layers, and points the layer's settings file at an empty one; a child inherits and re-establishes the same environment. |
@@ -6558,7 +6560,40 @@ indeterminate probe, its reason; the PNGs and the record go beneath
 `HETOIMASIA_VALIDATION_EVIDENCE/cutout-depth/`. The case found that on MoltenVK a
 `clearDepthRect` recorded after a draw of the same pass leaves the descriptor
 bindings unusable by the draws after it; the recorder binds the texture table
-again after each depth clear in a pass that draws.
+again after each depth clear in a pass that draws, and it binds the clip region
+again there too (R2D-12, below).
+
+R2D-12's case, `r2d12-clip`, runs the same composition, host and runner over the
+recorder's clip tables (render-2d D-11). The renderer is made with a ring that has
+a storage-table window of 16 KiB, the storage table and a shader-sampled layout
+that also holds set 2 (`TableLayoutOptions TableShaderSampler True`), and each
+batch writes the resolved clip tables of the views that draw into one region
+claimed with `claimTable` before any instance region, and binds it with
+`bindStorageTable` at offset 0 wherever the texture table is bound; a layer's
+push block names its view's first entry. Six fixtures are rendered into
+`R8G8B8A8_UNORM` targets, one with a `D32_SFLOAT` depth image, and read back as the
+ordered path's are; each shows its behaviours by named probes that must be
+determinate and differ from their contrast's:
+
+1. *one-draw*: under a camera turned an eighth of a turn, one draw of three
+   instances covering the target: an unclipped one, one clipped to a world
+   square (a diamond on the target) and one under a nested clip that keeps the
+   square's half and is cut by its parent where its own rectangle reaches past;
+2. *own-tables*: two views of one target whose one clip index selects each
+   view's own rectangle, the second from its own viewport origin;
+3. *ui-scales*: a UI clip at content scale 2 in a viewport away from the target's
+   origin;
+4. *snapping*: a world clip under pixel snap and zoom 2, with the camera at a
+   fractional position, that is placed by the view's snapped translation and does
+   not follow a sprite whose origin the shader snaps 0.4 pixel;
+5. *cutouts*: a nearer cutout clipped away on half the target writes no depth, so
+   the farther cutout shows through there, and hides nothing where its clip holds;
+6. *empties*: an empty clip, and a clip under one whose own rectangle is the whole
+   target, clip everything, beside an unclipped instance that still draws.
+
+The pass criteria are the ordered path's, with the device's depth format reported
+as for `r2d9-cutout-depth` where it is not `D32_SFLOAT`; the PNGs and the probe
+record go beneath `HETOIMASIA_VALIDATION_EVIDENCE/clip/`.
 
 R2D-8's case, `r2d8-image`, runs the [image2d sample](../samples/image2d/README.md)
 through the production composition — `withVulkanOwnerHost` over the loader

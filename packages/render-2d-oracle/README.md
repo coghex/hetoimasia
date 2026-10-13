@@ -236,6 +236,47 @@ prove a hiding it need not rely on. A cutout instance whose quad edge is within
 1/16 pixel of the probe is indeterminate for the same reason as an ordered
 one's (`NearQuadEdge`).
 
+## Clips (D-11, R2D-12)
+
+An instance whose clip index `k` is not 0 selects entry `k − 1` of its view's
+clip table, as the plan resolved it (`plannedClips`, from `resolveClips`: every
+entry intersected with its parent chain, in the entry's space, rounded once to
+floats; see [`render-2d`](../render-2d/README.md#clip-tables)). The oracle
+applies the resolved rectangle as the recorder's fragment stage does, but exactly:
+
+1. **Membership.** The probe's pixel centre is carried back to the layer's space
+   by the exact inverse of the transform the layer's instances are placed with
+   (the view's `worldTransform` with its snapped translation, or `uiTransform`),
+   computed over `Rational`s from the transform's 32-bit coefficients, and
+   compared with the half-open rectangle `left ≤ x < right`, `top ≤ y < bottom`
+   of the resolved floats, exactly. Outside it the instance **receives nothing
+   from the probe**: it draws neither colour nor depth (a clipped-away cutout
+   leaves the farther one visible), whatever its quad covers. The sprite's own
+   origin snap is not part of the clip: it neither moves the clip nor is undone
+   by it.
+2. **The edge band.** The rectangle's four corners are carried forward to target
+   pixels by the same transform, and a centre within 1/16 pixel, in the Euclidean
+   distance and measured **in target pixels**, of any of the four segments
+   between them is `NearClipEdge` (1/16 itself is inside the band, as for a
+   quad's edges). The band is measured in the target's pixels, not the layer's
+   units, so a UI scale of 4 or a zoom of ¼ changes how far a unit of the layer
+   is from the probe, and not the band.
+3. **When it counts.** The band applies to an instance that could draw at the
+   probe: one that covers it, or whose quad edge lies within 1/16 pixel of it
+   (`NearQuadEdge` wins when both hold). An instance clearly outside its clip is
+   `Nothing`, however its quad lies, and an instance whose quad does not reach
+   the probe makes no pixel indeterminate for a clip edge it does not use.
+   A placement that cannot be represented stays unevaluable before any clip is
+   asked.
+4. **An empty clip** (the resolved `emptyClip`: a zero extent, an empty
+   intersection, or a descendant of one) holds no point and has no boundary:
+   the instance gives nothing at any probe, and no probe is indeterminate for
+   its edge, even at the rectangle's own origin.
+
+Clip index 0 means none: no clip is asked. The oracle plans with the same marks
+as the recorder, so a clipped cutout-path instance and a clipped ordered one are
+both clipped before they are shaded.
+
 ## Verdicts and exactness
 
 An expectation is `Expected value tolerance`, `Indeterminate why` or
@@ -277,6 +318,7 @@ Each names where: the view as `AtView pass view`, or an instance as
 | --- | --- |
 | `NearViewportEdge` | The probe's centre is within 1/16 pixel of an edge of a view's non-empty viewport that is not on a whole pixel, whatever the view draws. |
 | `NearQuadEdge` | The centre is within 1/16 pixel of the edge of an instance's quad, on the ordered or the cutout path. |
+| `NearClipEdge` | The centre is within 1/16 pixel, in target pixels, of the boundary after transformation of the non-empty clip rectangle of an instance that could draw there. |
 | `NearCutoutThreshold` | A cutout-path instance's sample has an alpha, before brightness, within 2/255 of ½ (inclusive). |
 | `MinifiedNotAxisAligned` | A minified probe, on a texture with more than one level, whose derivatives are sheared or rotated by other than a quarter turn. |
 | `MinifiedFractionalLevel` | A minified, axis-aligned probe whose level of detail is between two levels. |
@@ -324,7 +366,8 @@ rely on them): `ValidSnapshot` and its validation; `viewMapping`, with
 which order the instances and route the cutout path.
 
 **Independent**: composing the instance's transform with the layer's, coverage,
-distance from an edge, derivatives, level selection, texel addressing and
+the clip's membership and its distance from an edge (the inverse of the layer's
+transform is taken here, over `Rational`s, not read from the mapping), derivatives, level selection, texel addressing and
 filtering, the sRGB transfer function, the shading and blend equations, the
 rounding of every store, the exactness rule, the verdicts and the readback
 reader. These are written here, in rational arithmetic where the question is
@@ -343,7 +386,13 @@ the depth model — cutouts and translucent instances interleaved, both equal-ke
 rules, a discarded fragment leaving farther art visible, a filtered edge writing
 white, a cutout reading its mip level, the threshold band at its edges, two
 layers with independent keys, and a UI layer and a world layer without depth
-beside a depth-enabled one — and every indeterminate case). Against synthetic readbacks written as pictures,
+beside a depth-enabled one — clips: an axis-aligned one, nested and three-deep
+intersections with unclipped, parent-clipped and child-clipped instances in one
+layer, a 45° rotated camera with and without zoom, the edge band at its
+boundary and measured in target pixels under a UI scale of 4 and a zoom of ¼, the
+view's snapped translation, UI at content scale 2 from a viewport origin, a
+clipped-away cutout, an empty clip and its descendants, and two views with
+tables of their own — and every indeterminate case). Against synthetic readbacks written as pictures,
 the suite shows the oracle **rejects** reversed overlap, a channel off by two and
 a wrong snap, and accepts the exact image.
 
@@ -377,4 +426,4 @@ cabal test --project-file cabal.project.cpu hetoimasia-render-2d-oracle:render-2
 The suite is the CPU validation group `test.render-2d-oracle`; it needs no GPU
 and no display. Its components, selectable with `--test-options='--match <name>'`
 on the suite that owns them, are `Placement`, `Sampling`, `Colour`, `Probes`,
-`Depth` and `Verdicts`.
+`Depth`, `Clip` and `Verdicts`.

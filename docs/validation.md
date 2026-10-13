@@ -303,14 +303,16 @@ like `test.math`, and runs through `cabal.project.cpu`: the library depends on
 refusing, with every reason found and its pass, view, layer and instance index,
 each non-finite or out-of-range value the contract names at its boundary
 (depth keys 2²⁴ − 1, 2²⁴ and 2³² − 1; the UI scale and brightness ranges; NaN
-and both infinities), a second or non-final window pass and a non-zero clip
-index, with faults at different locations retained together, including inside
+and both infinities), a second or non-final window pass, a clip index past its view's table, a clip entry
+whose parent is not earlier or whose rectangle is invalid, and an entry referenced from both a
+world and a UI layer, with faults at different locations retained together, including inside
 a zero-size viewport; offscreen-only snapshots accepted and valid snapshots
 unchanged; the discrete-step-zoom list's refusals and stepping; the pure view mapping between window, framebuffer, UI and world space with its snapping and every degenerate and unrepresentable refusal; the 64-byte little-endian
 instance layout checked field by field against bytes written out by hand and an
 independent reference encoder, for zero, one and many instances; the flags
 word for every sampler choice and flag combination with its reserved bits zero
-and the clip index in the top 16 bits; and external clients proving that
+and the clip index in the top 16 bits; the clip resolver's nested, empty and
+touching intersections and its determinism; and external clients proving that
 validated values, offscreen target references and view mappings cannot be forged. It is
 mandatory but outside the floor, like `test.math`, and runs through
 `cabal.project.cpu`: the library depends on no GPU, GLFW, Vulkan, runtime or
@@ -325,7 +327,11 @@ decoding and encoding against UNORM, 2:1 minified fixtures reading level 1 with
 each filter, tint, brightness with a clamped result, additive output,
 premultiplied overlap in drawing order, equal keys in submission order, the
 placeholder, BC7 through its decoded levels, and the 8-bit store after every
-draw), every indeterminate case, every refusal of a defective target, index,
+draw), the resolved clips (an axis-aligned one, nested and three-deep
+intersections in one layer, a clip under a 45° rotated camera, the edge band
+measured in target pixels, the view's snapped translation, UI scale and content
+scale from a viewport origin, a clipped-away cutout, empty clips), every
+indeterminate case, every refusal of a defective target, index,
 image or readback at its boundary, the readback reader swizzling `B8G8R8A8`, and
 hand-written synthetic readbacks that the oracle rejects when overlap is
 reversed, a channel is off by two or the snap is wrong and accepts when exact.
@@ -388,7 +394,9 @@ writes its PNG and probe record beneath the group's evidence directory), the
 scene3d sample's window-free depth-tested evidence case (`grs10-scene3d`, which
 writes a PNG a camera pose and its probe record beneath the same directory), the
 image2d sample's evidence and texture-lifecycle case (`r2d8-image`, which writes
-its PNG and probe record beneath the same directory), and
+its PNG and probe record beneath the same directory), the clip fixtures
+(`r2d12-clip`, which writes a PNG a target and its probe record beneath the same
+directory), and
 the synchronization-validation control in child processes of their own. It requires the `display` class, is mandatory outside
 the floor, and is the one group with a [preparation](#preparation-and-the-watchdog):
 

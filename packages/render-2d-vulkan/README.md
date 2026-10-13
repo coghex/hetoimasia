@@ -21,11 +21,11 @@ contract is [docs/gpu_backend.md](../../docs/gpu_backend.md).
 | Module | Contents |
 | --- | --- |
 | `Hetoimasia.Render.TwoD.Vulkan` | re-exports `Builders`; `Configuration`, `defaultConfiguration`; `Renderer`, `makeRenderer`, `rendererDepthFormat`, `pipelineFor`, `pipelineDeclaration`; `prepareSnapshot`, `FrameRecording`; re-exports `Hetoimasia.Render.TwoD.Vulkan.Frame`, `orderedShaders` and `cutoutShaders` |
-| `Hetoimasia.Render.TwoD.Vulkan.Builders` | `Builders`: the constructions the recorder and the registry need from a host: the ring, the table, the layout, a pipeline, and registering, swapping and releasing an uploaded texture |
+| `Hetoimasia.Render.TwoD.Vulkan.Builders` | `Builders`: the constructions the recorder and the registry need from a host: the ring with its storage-table window, the table, the storage table, the layout, a pipeline, and registering, swapping and releasing an uploaded texture |
 | `Hetoimasia.Render.TwoD.Vulkan.Textures` | `Textures`, `newTextures`; `registerTexture` with a `MarkPolicy`; `swapTexture` with a `SwapPolicy`; `TextureRefusal`; the logical release marker (`markReleased`, `isReleased`), `releaseTextureNow`; `registeredMark`, `registeredMarks` |
 | `Hetoimasia.Render.TwoD.Vulkan.Window` | the host adapter: `Host`, `Adapter`, `newAdapter`; `Scene2D`, `blankScene`; `publish2DSnapshot`, `PublishRefusal`; `release2DTexture`; `adapterAdopted`, `adapterReleased`, `retryReleases`; `FrameInfo`, `renderWindowFrame` |
-| `Hetoimasia.Render.TwoD.Vulkan.Frame` | `Attachment`, `offscreenAttachment`, `TargetBinding`, `DepthBinding`, `FrameInput`; `depthLayers`, `requireWorldDepth`, `worldDepthShortfall`; `FrameRefusal`; `frameWork` and the work it computes: `PassWork`, `ViewWork`, `LayerWork`, `RunWork`, `PipelineKind`, `runPipeline` |
-| `Hetoimasia.Render.TwoD.Vulkan.Layout` | the instance as vertex input (`instanceVertexInput`), the key's depth (`depthFromKey`), the push block (`ViewPush`, `packViewPush`, `pushMembers`), the sampler choice (`shaderSamplerIndex`), the scissor rule (`viewScissor`) |
+| `Hetoimasia.Render.TwoD.Vulkan.Frame` | `Attachment`, `offscreenAttachment`, `TargetBinding`, `DepthBinding`, `FrameInput`; `depthLayers`, `requireWorldDepth`, `worldDepthShortfall`; `FrameRefusal`; `frameWork` and the work it computes: `PassWork`, `ViewWork`, `LayerWork`, `RunWork`, `PipelineKind`, `runPipeline`; the clip region: `viewDraws`, `clipRegion`, `requireClipWindow` |
+| `Hetoimasia.Render.TwoD.Vulkan.Layout` | the instance as vertex input (`instanceVertexInput`), the key's depth (`depthFromKey`), the push block (`ViewPush`, `packViewPush`, `pushMembers`), the clip table's bytes (`packClipTable`, `clipEntryBytes`), the sampler choice (`shaderSamplerIndex`), the scissor rule (`viewScissor`) |
 | `Hetoimasia.Render.TwoD.Vulkan.ShaderInterfaces` | the checked interface descriptions the shaders are compiled against |
 | `Hetoimasia.Render.TwoD.Vulkan.Shaders` | `orderedShaders` and `cutoutShaders`: one vertex stage and two fragment stages |
 
@@ -60,11 +60,14 @@ check. `render-2d` gains no dependency.
 ## Making the renderer
 
 `makeRenderer builders configuration` makes, through the host's constructions,
-in this order: the session's ring (`configurationRing`), the texture table the
-draws go through (`configurationTable`), and a **shader-sampled table pipeline
-layout** over the package's shaders (R2D-16): a layout holding the table that
-declares no sampler offset, so a draw needs no `selectSampler`, with one
-push-constant range for both stages (44 bytes, below). A pipeline is made per
+in this order: the session's ring with its **storage-table window**
+(`configurationRing` and `configurationClipWindow`, the most bytes of clip table
+one batch may bind, 64 KiB by default: 4096 entries), the texture table the
+draws go through (`configurationTable`), the **storage table** (set 2, over the
+ring's window), and a **shader-sampled table pipeline layout** over the
+package's shaders (R2D-16) that also holds set 2: a layout holding the table
+that declares no sampler offset, so a draw needs no `selectSampler`, with one
+push-constant range for both stages (72 bytes, below). A pipeline is made per
 colour format and kind (below) the first time a pass into that format draws
 with it, by `pipelineFor`. Textures are registered with the
 table by their owner; the recorder samples whatever handles the snapshot names,
@@ -97,12 +100,14 @@ Everything that can refuse is decided first, in `frameWork`, which is pure:
 | `NoDepthTarget location` | a pass needs a depth attachment (below) for this depth-enabled world layer and was given none |
 | `DepthFormatRefused location format` | a pass holding this depth-enabled world layer was given a depth image whose format is not `D32_SFLOAT` (D-23) |
 | `PlanDisagrees location` | the plan's layers and the snapshot's do not pair (planning the same snapshot never produces it) |
+| `ClipTablesTooLarge bytes window` | the batch's packed clip tables (below) are `bytes` long, and the window is only `window` bytes |
 | `RefusedByBackend refusal` | the backend refused a pipeline, a claim or a command |
 
 The first refusal in snapshot order is the answer, and nothing has been recorded.
 What `FrameRecording` then does, in the one batch:
 
-1. **Claims.** Every layer that draws has its instances encoded in drawing
+1. **Claims.** The batch's **clip region** is claimed first, with the backend's
+   table alignment (`claimTable`), and written (below). Every layer that draws has its instances encoded in drawing
    order (`encodeLayerInDrawingOrder`, byte for byte the matching 64-byte
    chunks of `encodeLayer`, permuted by the plan's order) and written into one
    ring region of its own, aligned to 16, in pass, view and layer order. They
@@ -119,8 +124,10 @@ What `FrameRecording` then does, in the one batch:
    (`beginRenderingWithDepth`, or `beginFrameRenderingWithDepth` for the
    window); every other pass begins with none, exactly as the ordered path's
    does. A pass that draws something then binds its first run's pipeline, a
-   viewport over the **whole** attachment, and the table. A pass that draws
-   nothing begins, clears and ends, and binds neither.
+   viewport over the **whole** attachment, the table, and the clip region as the
+   storage table (`bindStorageTable` at offset 0, so the dynamic offset is the
+   region's own start). A pass that draws nothing begins, clears and ends, and
+   binds none of them.
 3. **Views**, in order, each under a scissor covering exactly the pixels whose
    centres its viewport contains: per axis `[ceil(x − ½), ceil(x + w − ½))`,
    clamped to the attachment (`viewScissor`; `viewportContains`, pixel by
@@ -128,7 +135,7 @@ What `FrameRecording` then does, in the one batch:
    records no draw and no scissor.
 4. **Layers**, in order. A depth-enabled world layer first **clears depth to
    1.0 within its view's scissor** with `clearDepthRect` (#425), then binds the
-   table again, then pushes its block; a layer whose scissor is empty records no
+   table and the clip region again, then pushes its block; a layer whose scissor is empty records no
    clear and no draw, and a depth-enabled layer with no instance records its
    clear and claims no region. A layer then draws **one instanced draw of six
    vertices per run**: it binds the run's pipeline if another is bound, its
@@ -363,7 +370,7 @@ square's six vertices are the shader's own.
 
 ## The push block
 
-Both stages declare one push block, std430, 44 bytes (`ViewPush`,
+Both stages declare one push block, std430, 72 bytes (`ViewPush`,
 `packViewPush`), pushed for each layer under the layer's own space:
 
 | Offset | Size | Member |
@@ -374,10 +381,52 @@ Both stages declare one push block, std430, 44 bytes (`ViewPush`,
 | 32 | 4 | `float brightness` |
 | 36 | 4 | `uint filtering`: the view's default filter, 1 nearest, 2 linear |
 | 40 | 4 | `uint snap`: 1 when the view snaps instance origins |
+| 44 | 4 | `uint clipBase`: the index, in entries, of the view's first clip entry in the batch's clip region |
+| 48 | 16 | `vec4 inverseLinear`: a, b, c, d of the transform's inverse |
+| 64 | 8 | `vec2 inverseTranslation`: tx, ty of the inverse |
 
 The transform is `worldTransform` for a world layer and `uiTransform` for a UI
 layer, from `viewMapping` for the pass's metrics; it maps `(x, y)` to
-`(a·x + c·y + tx, b·x + d·y + ty)`.
+`(a·x + c·y + tx, b·x + d·y + ty)`. The inverse is `worldInverse` or
+`uiInverse`, the exact inverse of the transform the layer draws with, which the
+fragment stage clips in.
+
+## Clip tables (R2D-12)
+
+A batch writes the resolved clip tables ([render-2d](../render-2d/README.md#clip-tables))
+of every view that **draws** (a non-empty scissor and a layer with a run) into
+one ring region, claimed with the backend's table alignment before any layer's
+instances, written with `writeClaim`, and bound as the storage table (set 2,
+binding 0, a read-only std430 buffer of `vec4`s) wherever the texture table is
+bound. The format is one 16-byte entry per clip (`packClipTable`,
+`clipEntryBytes`), little-endian:
+
+| Offset | Size | Field |
+| --- | --- | --- |
+| 0 | 4 | `float left`: the half-open rectangle in the layer's space |
+| 4 | 4 | `float top` |
+| 8 | 4 | `float right` |
+| 12 | 4 | `float bottom`; an empty clip is all zeros |
+
+The views' tables follow one another with no padding, in pass and view order: a
+16-byte entry needs none, and the region's own start is aligned by the claim. A
+layer's push block names its view's first entry in `clipBase`, in **entries**
+(units of 16 bytes), so an instance whose flags word holds clip index `k > 0`
+reads entry `clipBase + k − 1`, and one index selects each view's own entry. Clip
+index 0 reads nothing, so a view with no table, and every layer of one, pushes a
+base of 0 and never looks, including when the whole region is the single zero
+entry the next paragraph describes.
+
+A frame that draws always has a region: when no view that draws holds an entry,
+the region is one zero entry (16 bytes), because a layout that holds set 2
+refuses a draw until set 2 is bound. A frame that draws nothing has none and
+binds none. The region's size is the actual packed layout, `clipEntryBytes` times
+the entries of the views that draw; a region larger than the window is a
+`ClipTablesTooLarge` naming its size and the window, decided before anything is
+recorded (a table of exactly the window is accepted, and the tables of a view
+that records no draw are not counted). The backend checks the rest when the
+region is bound: the bytes from the offset to the claim's end within the window,
+and the offset's alignment.
 
 ## The shaders
 
@@ -423,6 +472,26 @@ s = m × c;  s.rgb = s.rgb × b      wrapMaterial: tint, then brightness
 s.a = 0 for an additive instance   blendOutput
 result = s + destination × (1 − s.a)       the pipeline's premultiplied blend
 ```
+
+**Clipping (D-11).** The vertex stage passes the instance's clip index
+`flags >> 16` on, flat. Both fragment variants end with the clip test, after the
+sample is taken (so a discarded invocation still takes part in its quad's
+derivatives): with `k` the clip index, `r = rectangles[clipBase + k − 1]` and `p`
+the fragment's pixel centre (`gl_FragCoord.xy`) carried back to the layer's space
+by the pushed inverse,
+
+```text
+k = 0                                             nothing is read
+discard unless  r.left ≤ p.x < r.right  and  r.top ≤ p.y < r.bottom
+```
+
+A discarded fragment writes neither colour nor depth, in the ordered and the
+cutout variant alike (choice C). The inverse is that of the transform the layer's
+instances are placed with, so the view's snapped translation, the zoom and the
+rotation are in it for a world clip, and the UI scale, the content scale and the
+viewport's origin for a UI clip; a sprite's own origin snap neither moves the
+clip nor is undone by it. Instances with different clip indices stay in one
+draw: the index travels with the instance.
 
 **The cutout variant (D-26).** An instance routed to the cutout path, so with a
 tint alpha of 255 and no translucent or additive flag, is drawn by
@@ -486,7 +555,12 @@ itself, through a stand-in native layer built over the backend's public seam
 passes, views, layers and draws with their scissors and push blocks, the
 drawing-order instance bytes at their ring offsets, mixed sampler choices in one
 run and one draw, empty scissors recording no draw while the pass keeps its
-clear, one pipeline per format and kind, and the refusals of an unknown target in
+clear, one pipeline per format and kind, the clip region (the tables of the views
+that draw packed in pass and view order, each layer's first-entry index, the
+region claimed first and bound as set 2 where the table is, a region of one zero
+entry when nothing is clipped and none when nothing draws, a region exactly the
+window accepted and one entry more refused naming its size, the tables of a view
+that records no draw uncounted), and the refusals of an unknown target in
 a later pass, an unmappable view and a full ring after an earlier layer's claim,
 none of which records a clear or a draw. For depth it checks which passes begin
 with a depth attachment; the clear rectangle of each depth-enabled layer, before
@@ -530,11 +604,22 @@ A third case, `r2d8-image`, runs the [image2d sample](../../samples/image2d/READ
 registration, the swap rule and the adapter's holds and deferred release through
 the production host's per-window scenes.
 
+A fourth, `r2d12-clip`, renders six clip fixtures (R2D-12) and judges every pixel
+against the oracle's clip model: in **one draw** under a camera turned an eighth
+of a turn, an unclipped instance, a clipped one and one under a nested clip; two
+views whose one clip index selects each view's own rectangle; a UI clip at content
+scale 2 in a viewport away from the origin; a clip under pixel snap and zoom that
+neither follows a sprite's origin snap nor ignores the view's snapped translation;
+a cutout clipped away, writing no depth, so the farther cutout shows through; and
+an empty clip with a clip under one. Each named behaviour is a probe the oracle
+must give determinately and that differs from its contrast's.
+
 ## Not here
 
 Alpha-to-coverage and MSAA; depth formats other than `D32_SFLOAT` for world
 layers; application materials and their
-capability (R2D-11), clip tables (R2D-12) and per-batch storage tables (R2D-15);
+capability (R2D-11) and a clip table's retained content (R2D-10); stencil-based clipping, hardware clip
+distances and per-view culling of fully clipped instances;
 retained content (R2D-10); creating offscreen targets, issuing their references
 and their lifetimes, holds and releases, and sampling an offscreen pass's target
 in a later pass (R2D-13); per-view culling; and performance claims, which need
