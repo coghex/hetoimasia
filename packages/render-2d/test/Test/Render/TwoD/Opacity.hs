@@ -1,8 +1,9 @@
 -- | Examples proving what the package boundary shows a client: a validated
 -- snapshot and a validated layer cannot be built or rewritten from outside the
 -- validation module, an offscreen target reference cannot be built or taken
--- apart through its public module, and the backend-facing target module and the
--- documented validate-then-encode route do work.
+-- apart through its public module, a retained chunk's reference and a built chunk
+-- cannot be forged either, and the backend-facing target and chunk-reference
+-- modules and the documented validate-then-encode route do work.
 --
 -- Each compiles a separate single-module client with the harness from
 -- "Test.Support.ExternalClient", exposing @base@, @hetoimasia-math@,
@@ -26,9 +27,16 @@ spec = describe "Validated value and target opacity across the package boundary"
   rejected "a client that reads the target reference's index through the public module" targetReader "GHC-61689" "targetRefIndex"
   rejected "a client that builds a target reference through the public module" targetBuilder "GHC-61689" "targetRef"
   rejected "a client that names the view mapping's constructor" mappingConstructor "GHC-10237" "ViewMapping"
+  rejected "a client that names the chunk reference's constructor" chunkRefConstructor "GHC-10237" "ChunkRef"
+  rejected "a client that reads the chunk reference's index through the public module" chunkRefReader "GHC-61689" "chunkRefIndex"
+  rejected "a client that builds a chunk reference through the public module" chunkRefBuilder "GHC-61689" "chunkRef"
+  rejected "a client that names the built chunk's constructor" chunkConstructor "GHC-10237" "Chunk"
+  rejected "a client that rewrites a built chunk by record update" chunkRecordUpdate "GHC-22385" "chunkKind"
   accepted "a client that validates a candidate and encodes its layers" validateAndEncode
   accepted "a client that builds a view mapping and converts a cursor position" buildMapping
   accepted "a client that builds and reads a target reference through the backend-facing module" backendTarget
+  accepted "a client that builds and reads a chunk reference through the backend-facing module" backendChunkRef
+  accepted "a client that builds a chunk, lists it in a layer and validates the snapshot against it" buildAndList
 
 withClient ∷ String → ((Mode → IO Client) → IO ()) → IO ()
 withClient =
@@ -168,6 +176,106 @@ backendTarget =
     , ""
     , "numbers ∷ TargetRef → (Word32, Word32)"
     , "numbers reference = (targetRefIndex reference, targetRefGeneration reference)"
+    ]
+
+chunkRefConstructor ∷ String
+chunkRefConstructor =
+  unlines
+    [ "module Client (forged) where"
+    , ""
+    , "import Hetoimasia.Render.TwoD.Chunk (ChunkRef (ChunkRef))"
+    , ""
+    , "forged ∷ ChunkRef"
+    , "forged = ChunkRef 1 1"
+    ]
+
+chunkRefReader ∷ String
+chunkRefReader =
+  unlines
+    [ "module Client (index) where"
+    , ""
+    , "import Data.Word (Word32)"
+    , "import Hetoimasia.Render.TwoD.Chunk (ChunkRef, chunkRefIndex)"
+    , ""
+    , "index ∷ ChunkRef → Word32"
+    , "index = chunkRefIndex"
+    ]
+
+chunkRefBuilder ∷ String
+chunkRefBuilder =
+  unlines
+    [ "module Client (made) where"
+    , ""
+    , "import Hetoimasia.Render.TwoD.Chunk (ChunkRef, chunkRef)"
+    , ""
+    , "made ∷ ChunkRef"
+    , "made = chunkRef 1 1"
+    ]
+
+chunkConstructor ∷ String
+chunkConstructor =
+  unlines
+    [ "module Client (forged) where"
+    , ""
+    , "import Hetoimasia.Render.TwoD.Chunk (Chunk (Chunk))"
+    , ""
+    , "forged ∷ Chunk → Chunk"
+    , "forged held = Chunk held"
+    ]
+
+chunkRecordUpdate ∷ String
+chunkRecordUpdate =
+  unlines
+    [ "module Client (rewritten) where"
+    , ""
+    , "import Hetoimasia.Render.TwoD.Chunk (Chunk, ChunkKind, chunkKind)"
+    , ""
+    , "rewritten ∷ Chunk → ChunkKind → Chunk"
+    , "rewritten held kind = held { chunkKind = kind }"
+    ]
+
+backendChunkRef ∷ String
+backendChunkRef =
+  unlines
+    [ "module Client (issued, numbers) where"
+    , ""
+    , "import Data.Word (Word32)"
+    , "import Hetoimasia.Render.TwoD.Chunk (ChunkRef)"
+    , "import Hetoimasia.Render.TwoD.Chunk.Backend (chunkRef, chunkRefGeneration, chunkRefIndex)"
+    , ""
+    , "issued ∷ Word32 → Word32 → ChunkRef"
+    , "issued = chunkRef"
+    , ""
+    , "numbers ∷ ChunkRef → (Word32, Word32)"
+    , "numbers reference = (chunkRefIndex reference, chunkRefGeneration reference)"
+    ]
+
+-- | What a backend's client does: build a chunk, list it in a layer and validate
+-- the snapshot against the chunks it holds.
+buildAndList ∷ String
+buildAndList =
+  unlines
+    [ "module Client (frame) where"
+    , ""
+    , "import Hetoimasia.Math.Affine2 (identity)"
+    , "import Hetoimasia.Math.Vector (V2 (..))"
+    , "import Hetoimasia.Render.Api.Texture (TextureHandle)"
+    , "import Hetoimasia.Render.TwoD.Chunk"
+    , "import Hetoimasia.Render.TwoD.Chunk.Backend (chunkRef)"
+    , "import Hetoimasia.Render.TwoD.DrawPlan (noCutoutMarks)"
+    , "import Hetoimasia.Render.TwoD.Settings (defaultViewSettings)"
+    , "import Hetoimasia.Render.TwoD.Snapshot"
+    , "import Hetoimasia.Render.TwoD.Validation (validateSnapshotWith)"
+    , ""
+    , "frame ∷ TextureHandle → Bool"
+    , "frame texture = case buildChunk noCutoutMarks ChunkUi DeriveBounds [candidate] of"
+    , "  Left _ → False"
+    , "  Right built → either (const False) (const True) (validateSnapshotWith (chunksFrom [(reference, built)]) snapshot)"
+    , "  where"
+    , "    reference = chunkRef 1 1"
+    , "    candidate = Instance identity (UvRect 0 0 1 1) texture 0 (Tint 255 255 255 255) SamplerDefault False False 0 0"
+    , "    snapshot = Snapshot [Pass WindowTarget (ClearColour 0 0 0 1) [view]]"
+    , "    view = View (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 640 480)) defaultViewSettings [UiLayerWith [reference] []]"
     ]
 
 mappingConstructor ∷ String
