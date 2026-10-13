@@ -376,6 +376,31 @@ clipTableSpec = describe "the clip table" $ do
     rebaseClip (1.0e9, 0) (ResolvedClip 1.0e9 0 (1.0e9 + 64) 1) `shouldBe` ResolvedClip 0 0 64 1
     rebaseClip (0, 0) (ResolvedClip 3 0 3 1) `shouldBe` emptyClip
 
+  it "clamps an edge past the finite range to the largest float, never to an infinity" $ do
+    -- About a reference of 4.4e38, an edge at -1e38 is at -5.4e38, past the
+    -- floats; one at 1e38 is at about -3.4e38, within them.
+    let ResolvedClip left top right bottom = rebaseClip (4.4e38, 4.4e38) (ResolvedClip (-1.0e38) (-1.0e38) 1.0e38 1.0e38)
+    (left, top) `shouldBe` (-3.4028235e38, -3.4028235e38)
+    all (\edge → not (isInfinite edge || isNaN edge)) [left, top, right, bottom] `shouldBe` True
+    (right < 0 && right > -3.4028235e38, bottom < 0 && bottom > -3.4028235e38) `shouldBe` (True, True)
+
+  it "leaves a clip wholly past the finite range on one side with no area: empty" $
+    rebaseClip (4.4e38, 0) (ResolvedClip (-3.0e38) 0 (-2.0e38) 1) `shouldBe` emptyClip
+
+  it "finds the clip arithmetic representable at ordinary scales, and not where a scissor spans more than the floats hold" $ do
+    let scaled s = fromColumns (V2 s 0) (V2 0 s) (V2 0 0)
+    -- Half of 32 pixels is 16, so the offset reaches 16 times the inverse's scale: the
+    -- limit is half the largest float, 1.7e38.
+    clipRepresentable (scaled 1) (32, 32) `shouldBe` True
+    clipRepresentable (scaled 1.0e37) (32, 32) `shouldBe` True
+    clipRepresentable (scaled 1.1e37) (32, 32) `shouldBe` False
+    clipRepresentable (scaled 8.0e37) (32, 32) `shouldBe` False
+
+  it "counts both of an axis's products, so a turn that splits the reach is checked too" $ do
+    -- 1e37 · 16 + 1e37 · 16 = 3.2e38 on x, past the limit, though each product alone is not.
+    clipRepresentable (fromColumns (V2 1.0e37 1.0e37) (V2 1.0e37 1.0e37) (V2 0 0)) (32, 32) `shouldBe` False
+    clipRepresentable (fromColumns (V2 5.0e36 5.0e36) (V2 5.0e36 5.0e36) (V2 0 0)) (32, 32) `shouldBe` True
+
 -- ---------------------------------------------------------------------------
 -- The shaders' interfaces
 

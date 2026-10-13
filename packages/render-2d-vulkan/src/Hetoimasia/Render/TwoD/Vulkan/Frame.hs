@@ -75,6 +75,9 @@
 --   cannot give a @D32_SFLOAT@ attachment, naming the layer;
 -- * 'PlanDisagrees': the plan and the snapshot's layers do not pair, which
 --   planning the same snapshot never produces;
+-- * 'ClipNotRepresentable': a drawing view whose layers select clips has a
+--   scissor and an inverse transform for which the fragment stage's offsets
+--   could overflow a float, naming the pass and the view;
 -- * 'ClipTablesTooLarge': the batch's packed clip tables exceed the window
 --   ('requireClipWindow'), naming their size and the window.
 module Hetoimasia.Render.TwoD.Vulkan.Frame
@@ -161,7 +164,7 @@ import Hetoimasia.Render.TwoD.Validation
   , validLayers
   , validSnapshot
   )
-import Hetoimasia.Render.TwoD.Vulkan.Layout (ViewPush (..), clipEntryBytes, clipReference, packClipTable, packViewPush, rebaseClip, viewScissor)
+import Hetoimasia.Render.TwoD.Vulkan.Layout (ViewPush (..), clipEntryBytes, clipReference, clipRepresentable, packClipTable, packViewPush, rebaseClip, viewScissor)
 
 -- | What a pass renders into, as the caller knows it: the colour format's
 -- @VkFormat@ code, the actual extent, and the metrics views map under.
@@ -267,6 +270,11 @@ data FrameRefusal
     DepthFormatRefused !Location !ImageFormat
   | -- | A depth-enabled world layer, and the session offers no depth format.
     NoDepthFormat !Location
+  | -- | A view whose layers select clips draws where the fragment stage's
+    -- layer-space offsets could overflow a float: the pass and the view. A
+    -- scissor that spans more than about 10³⁸ units of the layer, whose clip test
+    -- would compare infinities and admit a fragment outside its clip.
+    ClipNotRepresentable !Int !Int
   | -- | The batch's packed clip tables are this many bytes, and the clip window
     -- is only this many.
     ClipTablesTooLarge !Word64 !Word64
@@ -383,12 +391,15 @@ passDraws = any (any (not . null . layerRunList) . workLayers) . workViews
 
 -- | Work out a frame, or the first refusal in snapshot order.
 frameWork ∷ FrameInput → Either FrameRefusal [PassWork]
-frameWork input =
-  assignClipBases
-    <$> zipWithM
+frameWork input = do
+  passes ←
+    zipWithM
       (passWork input layers)
       [0 ..]
       (zip (snapshotPasses (validSnapshot valid)) (planPasses (planSnapshot (frameMarks input) valid)))
+  let assigned = assignClipBases passes
+  requireClipArithmetic assigned
+  pure assigned
   where
     valid = frameSnapshot input
     layers = Map.fromList [((pass, view, layer), held) | held ← validLayers valid, AtLayer pass view layer ← [validLayerLocation held]]
@@ -519,6 +530,21 @@ assignClipBases = snd . mapAccumL pass 0
           reference = clipReference transform centre
           entries = map (rebaseClip reference) (workClips work)
        in (base + fromIntegral (length entries), ClipTable space base centre entries)
+
+-- | Refuse a frame holding a drawing view whose clip test could overflow: for
+-- each table written, the layer's inverse and the view's scissor must satisfy
+-- 'clipRepresentable'. The first such view in snapshot order is the refusal.
+requireClipArithmetic ∷ [PassWork] → Either FrameRefusal ()
+requireClipArithmetic passes =
+  case [ClipNotRepresentable (workIndex pass) (workViewIndex view) | pass ← passes, view ← workViews pass, unrepresentable view] of
+    refusal : _ → Left refusal
+    [] → Right ()
+  where
+    unrepresentable view = case workRect view of
+      Just rect | viewDraws view → any (selectsUnrepresentably rect) (workLayers view)
+      _ → False
+    selectsUnrepresentably rect layer =
+      isJust (layerClipSpace layer) && not (clipRepresentable (pushInverse (layerPush layer)) (rectWidth rect, rectHeight rect))
 
 -- | The bytes of the batch's clip region: the tables of the views that draw, one
 -- after another in pass and view order, 'clipEntryBytes' an entry. A frame that

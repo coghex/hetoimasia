@@ -217,6 +217,12 @@ inputOver rig snapshot = do
       , frameWindowDepth = Nothing
       }
 
+-- | The work is refused, with this refusal.
+shouldFailWith ∷ Either FrameRefusal [PassWork] → FrameRefusal → IO ()
+shouldFailWith answer expected = case answer of
+  Left refusal → refusal `shouldBe` expected
+  Right _ → expectationFailure ("expected " <> show expected <> ", but the work was not refused")
+
 withRig ∷ (Rig → IO a) → IO a
 withRig action = newRig >>= action
 
@@ -773,6 +779,30 @@ clipSpec = describe "clip tables" $ do
           clipRegion [only] `shouldBe` Just (floats [0.1484375, -1, 0.6484375, 1])
           [pushClipCentre (layerPush layer) | work ← workViews only, layer ← workLayers work] `shouldBe` [(16, 16)]
         other → expectationFailure ("expected one pass, found " <> either show (show . length) other)
+
+  it "refuses a view whose clip test could overflow a float, naming it, and not one that selects no clip" $
+    withRig $ \rig → do
+      -- The viewport (-16, -16) 32 × 32 over the 32 × 32 target leaves the scissor
+      -- (0, 0) 16 × 16, and a zoom of 1.25e-38 at the camera (-2e38, -2e38) has a
+      -- finite transform whose inverse scales by 8e37: a fragment's offset reaches
+      -- 8 × 8e37 and more, past the floats. A clip selected there is refused; the
+      -- same view with no clip selected draws.
+      let view clip =
+            View
+              (Camera (V2 (-2.0e38) (-2.0e38)) 1.25e-38 Nothing)
+              (Viewport (V2 (-16) (-16)) (V2 32 32))
+              defaultViewSettings
+              [clipEntry (-1.0e38, -1.0e38) (2.0e38, 2.0e38) Nothing]
+              [WorldLayer DepthDisabled [(sprite (-2.0e38) 0 SamplerDefault) {instanceTransform = fromColumns (V2 3.0e38 0) (V2 0 3.0e38) (V2 (-2.0e38) (-2.0e38)), instanceClip = clip}]]
+          snapshot clip = valid [Pass (OffscreenTarget refA) (ClearColour 0 0 0 1) [view clip]]
+      refused ← inputOver rig (snapshot 1)
+      frameWork refused `shouldFailWith` ClipNotRepresentable 0 0
+      unclipped ← inputOver rig (snapshot 0)
+      either show (const "drawn") (frameWork unclipped) `shouldBe` "drawn"
+      renderer ← rendererOver rig 4096
+      recorded rig renderer refused `shouldReturn` Left (ClipNotRepresentable 0 0)
+      commandsRecorded rig >>= (`shouldBe` [])
+      ringOffsets rig >>= (`shouldBe` [])
 
   it "keeps instances of different clip indices in one run and one draw" $
     withRig $ \rig → do

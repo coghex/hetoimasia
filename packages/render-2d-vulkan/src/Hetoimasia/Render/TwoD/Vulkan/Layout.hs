@@ -103,6 +103,7 @@ module Hetoimasia.Render.TwoD.Vulkan.Layout
   , packClipTable
   , clipReference
   , rebaseClip
+  , clipRepresentable
     -- * Sampler choice
   , shaderSamplerIndex
   , instanceSamplerBits
@@ -279,9 +280,12 @@ clipReference transform (centreX, centreY) = case map toRational (toColumnMajor 
 
 -- | A resolved clip with its edges taken about a layer-space reference point
 -- ('clipReference'): each edge minus the reference, in double precision and
--- rounded once to a float. The empty clip stays empty, and so does a clip the
+-- rounded once to a float, and clamped to the finite range, so that no edge is
+-- infinite however far from the reference it lies (an edge past the largest
+-- float is beyond anything the fragment stage's offsets reach: see
+-- 'clipRepresentable'). The empty clip stays empty, and so does a clip the
 -- rounding leaves no area (a region narrower than the spacing of floats about
--- the reference).
+-- the reference, or one wholly beyond the finite range on one side).
 rebaseClip ∷ (Double, Double) → ResolvedClip → ResolvedClip
 rebaseClip (rx, ry) clip@(ResolvedClip left top right bottom)
   | clipIsEmpty clip = emptyClip
@@ -289,7 +293,28 @@ rebaseClip (rx, ry) clip@(ResolvedClip left top right bottom)
   | otherwise = rebased
   where
     rebased = ResolvedClip (shifted left rx) (shifted top ry) (shifted right rx) (shifted bottom ry)
-    shifted edge origin = double2Float (float2Double edge - origin)
+    shifted edge origin = double2Float (max (negate largest) (min largest (float2Double edge - origin)))
+    largest = float2Double (encodeFloat 16777215 104)
+
+-- | Whether the fragment stage's clip arithmetic stays within the finite
+-- floats for a layer whose transform has this inverse, over a scissor of this
+-- size: the layer-space offset of a fragment's centre from the scissor's centre
+-- is at most the inverse's linear part applied to half the scissor's size, per
+-- axis, and that bound must not exceed half the largest finite float, so that
+-- neither the offset nor the sum of its two products can overflow (an overflow
+-- would admit a fragment whose edge test then compares infinities). It holds
+-- whenever the scene is within the floats' own range: a view whose zoom is so
+-- small that its scissor spans more than about 10³⁸ units of the layer is the
+-- case it refuses.
+clipRepresentable ∷ Affine2 → (Word32, Word32) → Bool
+clipRepresentable inverse (width, height) = case map float2Double (toColumnMajor inverse) of
+  [a, b, c, d, _, _] →
+    let halfWidth = fromIntegral width / 2
+        halfHeight = fromIntegral height / 2
+        reachX = abs a * halfWidth + abs c * halfHeight
+        reachY = abs b * halfWidth + abs d * halfHeight
+     in max reachX reachY <= float2Double (encodeFloat 16777215 104) / 2
+  _ → False
 
 -- | A filter's code in the block, which is also the sampler choice code of an
 -- instance that names it: 1 nearest, 2 linear.
