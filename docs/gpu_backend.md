@@ -5992,7 +5992,7 @@ companions — and adds the Vulkan owner's:
 | Main thread | Hspec runs on a thread of its own; the process main thread owns one shared production graphics session: `withLoaderIntegration`, then `runGraphicsOwnerApplication` over `withVulkanOwnerHost`, with the production native layer and surface bridge. An example that needs the main thread — to hand a window's surface over, which GLFW creates there, or to close a window — submits an operation (`onMain`); the main thread runs it between two turns of the host's owner loop and returns its result or rethrows its failure. Windows are created through the host's command port from the example's own thread, which the owner loop executes, as an application's worker would. |
 | Identities | Every dispatched operation is checked, before it runs, to be on the bound process main thread that entered the session — the Haskell thread, the bound flag, and the OS thread read through `pthread_self` — and a failed check fails the operation and the run. Every native call the session makes is recorded where it runs by a `NativeObserver`, so an example shows from the calls themselves that the instance, its messenger, the device and every surface's destruction ran on the graphics owner's thread and every surface's creation on the main thread — never from the name of an Hspec hook. |
 | Sharing | The roots — the instance, its explicit messenger, and the one device — are acquired lazily, by the first dispatched operation, at most once, and shared by every later example. Each example's windows and targets are its own and are closed inside it. |
-| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, `vk12-frames`, `vk13-presentation`, `vk14-recovery`, `vk15-validation-stop`, `vk15-retention`, `vk16-composed`, `vk17-one-slot`, `vk17-two-slots`, `vk19-capture`, `grs15-surface-free`, `grs15-surface-free-window`, `grs12-frameless`, `grs3-ordering`, `grs7-texture-table`, `grs8-sprites`, `grs9-swap`, `grs10-scene3d`, `grs13-window-depth`, `grs14-table-growth`, `r2d17-depth-rect`, `r2d14-window-scenes`, `r2d7-ordered-path`, `r2d9-cutout-depth`, `r2d12-clip`, `r2d8-image`, `synchronization-hazard`, `debug-names`, and, under the isolated compositor's consent only, `wayland-connection-loss`. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. Each child runs in a process group of its own under an external 20-second deadline covering its exit and the end of its output; one still running at it is terminated with its group and fails its example as expired. |
+| Private roots | A case that must create, poison or destroy roots of its own runs in a child process of the same executable, started with `--private-roots <scenario>`, on the child's own main thread: `vk2-compatibility`, `vk6-capture`, `vk5-bridge`, `vk7-roots`, `vk11-recording`, `vk12-frames`, `vk13-presentation`, `vk14-recovery`, `vk15-validation-stop`, `vk15-retention`, `vk16-composed`, `vk17-one-slot`, `vk17-two-slots`, `vk19-capture`, `grs15-surface-free`, `grs15-surface-free-window`, `grs12-frameless`, `grs3-ordering`, `grs7-texture-table`, `grs8-sprites`, `grs9-swap`, `grs10-scene3d`, `grs13-window-depth`, `grs14-table-growth`, `r2d17-depth-rect`, `r2d14-window-scenes`, `r2d7-ordered-path`, `r2d9-cutout-depth`, `r2d12-clip`, `r2d10-retained`, `r2d8-image`, `synchronization-hazard`, `debug-names`, and, under the isolated compositor's consent only, `wayland-connection-loss`. The child asserts its migrated examples as the proof did — the whole spec, with Hspec's configuration reading left out, so an ambient `HSPEC_*` cannot narrow its verdict — and the parent's example passes only when every one ran and passed. The parent starts no child without consent; a child started directly without it refuses with exit status 3 before looking its scenario up, and an unknown scenario under consent exits 2. Each child runs in a process group of its own under an external 20-second deadline covering its exit and the end of its output; one still running at it is terminated with its group and fails its example as expired. |
 | Selection | Building, listing and filtering the tree, a `--dry-run`, and a selection that dispatches nothing acquire nothing and start no child. A selection matching no example fails. `--complete`, which the catalog group passes, runs the whole tree with Hspec's configuration reading left out and then fails unless the shared session was acquired once and every private scenario the run's consent requires ran and passed — every one, except that `wayland-connection-loss` is required under the isolated compositor's consent and pending under any other — so no ambient setting can turn the group's receipt into a pass for a subset. The consent rules and the migrated proof's pure release, construction, publication and loader-selection examples need no session and run without consent. |
 | Consent | Read once, at startup, from `HETOIMASIA_NATIVE_SESSION`, with the GLFW suite's rules for `desktop`, `isolated-x11:<display>` and `isolated-wayland:<socket>`: the last only on Linux, only when `WAYLAND_DISPLAY` names that socket, and never beside a `DISPLAY`. Under the Wayland consent every session requests Wayland by name — the shared host, each child's host, the VK-5 bridge's loader-aware session, and the proof shim's raw initialization, which sets `GLFW_PLATFORM` and fails one that selected another platform — so no X11 or XWayland session stands in; under the others every session requests nothing, as before. The first shared example asserts the platform GLFW selected before any example renders. Without consent every native example is refused before its body, the session is never acquired, and the run ends with the refusal on stderr and a non-zero exit. |
 | Environment | Before any Vulkan call, the suite clears every ambient discovery override and every validation-layer setting it finds and records which, disables implicit layers, and points the layer's settings file at an empty one; a child inherits and re-establishes the same environment. |
@@ -6594,6 +6594,59 @@ determinate and differ from their contrast's:
 The pass criteria are the ordered path's, with the device's depth format reported
 as for `r2d9-cutout-depth` where it is not `D32_SFLOAT`; the PNGs and the probe
 record go beneath `HETOIMASIA_VALIDATION_EVIDENCE/clip/`.
+
+R2D-10's case, `r2d10-retained`, runs the same composition, host and runner over
+targets that each have a `D32_SFLOAT` depth image, to prove retained chunks over
+several frames (render-2d D-1, D-28, D-31). It needs `D32_SFLOAT` as
+`r2d9-cutout-depth` does and otherwise reports the format and renders nothing. The
+session also holds the registries the window host's adapter is made over and an
+adapter, whose holds the case drives as the owner does: it adopts a revision of a
+scene made from a validated snapshot before rendering it, and reports it released
+when its last recording is over; a release is requested through the integration's
+own `requestVulkanRelease`, and an upload is admitted for a ticket the registry
+polls (`submitVulkanUpload`). A windowed snapshot cannot be used, because
+publication refuses an offscreen pass and a window pass cannot be recorded without
+a window. Eleven frames are rendered, each into a 32 × 32 `R8G8B8A8_UNORM` target
+with a depth image, through `prepareSnapshot` planned with the registered marks, and
+read back as the ordered path's are:
+
+1. *interleaved* (3 frames): a world chunk with depth, built once, holding two
+   cutouts and a translucent instance, and a second chunk listed after it holding
+   one cutout, in a depth-enabled world layer beside dynamic cutouts, one of which
+   moves each frame and only which is republished: a dynamic cutout at an equal key
+   to a chunk cutout wins the tie as the later source, so does the later listed
+   chunk's cutout against the earlier's, and the first chunk's translucent
+   instance is hidden behind a nearer chunk cutout and blends over a farther one;
+   the chunks' three cutouts, 192 bytes in two uploads, are uploaded once and the
+   ring receives 192 bytes a frame (two dynamic cutouts and the one ordered
+   instance), never a chunk's cutouts;
+2. *ordered-kinds*: a world chunk without depth and a UI chunk, drawn wholly in the
+   ordered path beside dynamic content in the same layers and merged with it by key
+   and then source; a texel with an alpha under a half, registered with an explicit
+   cutout mark, is discarded by a depth chunk's cutout path and blended by the other
+   two kinds; these two kinds make no buffer and admit no upload;
+3. *swap* (3 frames): the texture a chunk's instance names swapped, under the
+   handle, to an image of the same computed mark shows through the same chunk and
+   snapshot without a rebuild; a swap to an image whose computed mark differs is
+   refused naming both marks, and the pixel keeps showing the accepted texture;
+4. *release* (3 frames): a chunk released while the adopted snapshot shows it keeps
+   its buffer — the request ran on the owner's thread with the revision holding the
+   chunk — and the snapshot's frame, rendered again, still draws it; a snapshot
+   without it is adopted and draws none of it; once the first revision's last
+   recording is over the buffer is released and the chunk forgotten, and a snapshot
+   that lists it is refused as unresolved;
+5. *culling*: a chunk drawn in one view of a pass and skipped in another, and a
+   chunk wholly outside both.
+
+The pass criteria are the ordered path's: every determinate probe within its
+tolerance, every named probe determinate and distinct from its contrast, the files
+kept, the roots retired in order, a clean verdict with synchronization validation;
+and each fixture also fails on a check the case makes beyond pixels (the uploads
+admitted, the holds, the registry, the culling rule). The PNGs, the probe record and
+`retained-measurements.json` — per frame, the bytes written to the ring, the chunk
+bytes uploaded so far and the uploads admitted so far — go beneath
+`HETOIMASIA_VALIDATION_EVIDENCE/retained/`. The case runs in well under a second of
+the suite's 20-second child deadline.
 
 R2D-8's case, `r2d8-image`, runs the [image2d sample](../samples/image2d/README.md)
 through the production composition — `withVulkanOwnerHost` over the loader

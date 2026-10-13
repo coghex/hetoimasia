@@ -12,7 +12,8 @@ the input defect that stops it. A pure reader returns a pixel of a tightly
 packed readback, and a verdict compares the two. Every rendering slice proves
 itself against it ([the design](../../docs/designs/render_2d_design.md): D-12,
 *Verification strategy*), and the recorder's offscreen readbacks (R2D-7, and
-R2D-9 for the cutout path and depth) are its client. Expectations come from the
+R2D-9 for the cutout path and depth, and R2D-10 for retained chunks) are its
+client. Expectations come from the
 snapshot, never from an observed image.
 
 It is a pure package. The library depends on `hetoimasia-render-2d` (the
@@ -197,6 +198,30 @@ submission, then the ordered-path instances by depth key and then submission
 world layer with depth disabled, draws each instance that covers the probe, in
 that order, blended.
 
+**Retained chunks (R2D-10, D-31).** A layer that lists chunks is evaluated as
+the plan orders it, from the chunks the snapshot was validated against, which
+the `ValidSnapshot` carries, so the oracle looks nothing up and needs no further
+input. Its drawing order is the plan's: first each listed chunk's cutout
+instances, as a run in the order the layer lists them, with the path the chunk was
+**built** with (routing is fixed at build, whatever marks the oracle is given:
+those are the dynamic instances'), then the layer's dynamic cutouts, then the
+ordered instances of the chunks and the layer merged by ascending depth key and
+then source order (a chunk before any dynamic instance, listings in order, each
+in build order). A chunk listed twice is drawn twice. The equal-key outcomes
+below follow unchanged: among cutouts the later source wins, an ordered instance
+draws over a cutout. A fragment of a chunk's instance is named by an
+`AtChunkInstance` location (pass, view, layer, the chunk's position in the layer's
+list, the instance's build position), where an indeterminate probe or a refusal
+names the instance.
+
+**Culling.** A view that culls a chunk (`chunkCulled`, from the view's mapping,
+its viewport and the target's extent, conservatively: see `render-2d`) contributes
+none of it, as the recorder does not draw it. Because the bounds enclose the
+chunk's geometry, culling changes no pixel the view draws, and the suite shows
+it: a layer that lists chunks gives, at every pixel, the expectation of the layer
+that holds the same instances itself, in source order, whatever the camera, scale
+or snap.
+
 A **depth-enabled world layer** has the depth model of design D-2, D-23 and
 D-26, evaluated per probe pixel:
 
@@ -359,7 +384,8 @@ fault is reported by the reader:
 ## What is shared with `render-2d`, and what is independent
 
 **Shared** (a mistake in one is a mistake in both, so the fixtures below do not
-rely on them): `ValidSnapshot` and its validation; `viewMapping`, with
+rely on them): `ValidSnapshot` and its validation, and the chunks it carries;
+`chunkCulled`; `viewMapping`, with
 `worldTransform`, `uiTransform`, `worldToTarget`, `uiToTarget`, `snapPoint` and
 `mappingPixelSnap`, which place the camera and snap; `viewportContains` and
 `viewportIsEmpty`; and `planSnapshot` with `drawingOrder` and each run's path,
@@ -392,7 +418,13 @@ layer, a 45° rotated camera with and without zoom, the edge band at its
 boundary and measured in target pixels under a UI scale of 4 and a zoom of ¼, the
 view's snapped translation, UI at content scale 2 from a viewport origin, a
 clipped-away cutout, an empty clip and its descendants, and two views with
-tables of their own — and every indeterminate case). Against synthetic readbacks written as pictures,
+tables of their own — retained chunks of each kind, written as pictures:
+the merge order of a layer's chunks and its dynamic instances (equal keys, the
+listing's order, a chunk listed twice), the later source winning a cutout tie,
+an ordered chunk instance over a cutout, a chunk's routing the one it was built
+with whatever marks the oracle is given, a faint cutout-marked texel discarded by a
+depth chunk and blended by a world chunk without depth and a UI chunk, and a chunk
+shown in one view and skipped in another — and every indeterminate case). Against synthetic readbacks written as pictures,
 the suite shows the oracle **rejects** reversed overlap, a channel off by two and
 a wrong snap, and accepts the exact image.
 
@@ -426,4 +458,4 @@ cabal test --project-file cabal.project.cpu hetoimasia-render-2d-oracle:render-2
 The suite is the CPU validation group `test.render-2d-oracle`; it needs no GPU
 and no display. Its components, selectable with `--test-options='--match <name>'`
 on the suite that owns them, are `Placement`, `Sampling`, `Colour`, `Probes`,
-`Depth`, `Clip` and `Verdicts`.
+`Depth`, `Clip`, `Chunks` and `Verdicts`.
