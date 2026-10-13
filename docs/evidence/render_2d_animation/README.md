@@ -27,9 +27,16 @@ READMEs.
 
 All nine PNGs are **byte-identical** between the two platforms and the Wayland
 run (same SHA-256 below). The captures were taken at the pull request's head
-`c20f32de`; the pull request's later heads differ from it only by master's
-documentation landings (these READMEs and this record), which `docs/` keeps
-outside the native source digest.
+`c20f32de`. The macOS run was repeated at the head `46e4d447`, after the one code
+change since (the chunk's reference named in a frame-index refusal, which does not
+touch drawing): source digest
+`c82b16872d88dc757af19afebc400201784884dab073111a6d77bdce26935d54`, 169 examples,
+0 failures, 2 pending, shared-session verdict clean, `r2d18-animation` exited
+successfully in 0.61 s; the nine PNGs have the same SHA-256 values, and the probe
+record differs only in the scratch directory its `png` fields name. The pull
+request's later heads differ from `46e4d447` only by master's documentation
+landings (these READMEs and this record), which `docs/` keeps outside the native
+source digest.
 
 ## The case
 
