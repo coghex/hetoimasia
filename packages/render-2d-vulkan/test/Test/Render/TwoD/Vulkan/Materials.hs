@@ -15,6 +15,7 @@ module Test.Render.TwoD.Vulkan.Materials (spec) where
 
 import Control.Monad (forM_)
 import Data.ByteString (ByteString)
+import qualified Data.ByteString as ByteString
 import Data.ByteString.Builder (floatLE, toLazyByteString, word32LE)
 import qualified Data.ByteString.Lazy as Lazy
 import Data.List (isInfixOf)
@@ -114,7 +115,7 @@ unit material parameter x key =
 -- | The 16 × 16 view over the plain camera holding this data and these layers.
 viewHolding ∷ [(MaterialRef, MaterialData)] → [Layer] → View
 viewHolding held layers =
-  ViewWith (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 16 16)) defaultViewSettings (Map.fromList held) layers
+  ViewWith (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 16 16)) defaultViewSettings [] (Map.fromList held) layers
 
 -- | Two floats, little-endian: the sample material's push block.
 twoFloats ∷ Float → Float → ByteString
@@ -164,7 +165,7 @@ rendererOver rig = do
       Render.Configuration
         { Render.configurationRing = either (error . show) id (validateRingSize (64 * 1024))
         , Render.configurationTable = either (error . show) id (validateTableConfig 16 8 4)
-        , Render.configurationRecordWindow = either (error . show) id (validateStorageWindow 4096)
+        , Render.configurationRegionWindow = either (error . show) id (validateStorageWindow 4096)
         }
   resetJournal rig
   pure renderer
@@ -218,7 +219,7 @@ seen = concatMap $ \case
 
 -- | The engine's block for a 16 × 16 UI layer at scale one.
 enginePush ∷ ByteString
-enginePush = packViewPush (ViewPush (fromColumns (V2 1 0) (V2 0 1) (V2 0 0)) (16, 16) 1 FilterNearest False)
+enginePush = packViewPush (ViewPush (fromColumns (V2 1 0) (V2 0 1) (V2 0 0)) (fromColumns (V2 1 (-0.0)) (V2 (-0.0) 1) (V2 0 0)) 0 (0, 0) (16, 16) 1 FilterNearest False)
 
 both ∷ [PushStage]
 both = [PushVertex, PushFragment]
@@ -266,21 +267,23 @@ declarationSpec = describe "a material's declaration" $ do
     laidBytes (layOut []) `shouldBe` 0
     laidBytes (layOut [PushField "x" PushFloat, PushField "y" PushFloat]) `shouldBe` 8
 
-  it "starts the application's block at 48 and lets it hold 80 bytes, which together with the engine's part fill the 128 every device holds" $ do
-    applicationPushOffset `shouldBe` 48
-    applicationPushLimit `shouldBe` 80
+  it "starts the application's block at 80 and lets it hold 48 bytes, which together with the engine's part fill the 128 every device holds" $ do
+    applicationPushOffset `shouldBe` 80
+    applicationPushLimit `shouldBe` 48
     maxPushBytes `shouldBe` 128
-    fromIntegral pushBytes + applicationPushLimit `shouldBe` maxPushBytes
+    applicationPushOffset + applicationPushLimit `shouldBe` maxPushBytes
+    -- the engine's 76 bytes, then four of alignment
+    fromIntegral pushBytes `shouldSatisfy` (<= applicationPushOffset)
     (applicationPushOffset `mod` 16) `shouldBe` 0
 
   it "refuses a push block beyond the limit, naming its size and the limit, and accepts one that fills it exactly" $ do
-    let over = declaration {declaredPush = replicate 6 (PushField "x" PushVec4)}
-    -- six members would all be named "x": the size is the problem named first.
-    take 1 (declarationProblems over) `shouldSatisfy` all ("96 bytes, beyond the limit of 80 bytes" `isInfixOf`)
+    let over = declaration {declaredPush = replicate 4 (PushField "x" PushVec4)}
+    -- four members would all be named "x": the size is the problem named first.
+    take 1 (declarationProblems over) `shouldSatisfy` all ("64 bytes, beyond the limit of 48 bytes" `isInfixOf`)
     let named n = PushField ("m" <> show (n ∷ Int)) PushVec4
-        exact = declaration {declaredPush = map named [0 .. 4]}
+        exact = declaration {declaredPush = map named [0 .. 2]}
     declarationProblems exact `shouldBe` []
-    declarationProblems exact {declaredPush = map named [0 .. 5]} `shouldSatisfy` any ("96 bytes" `isInfixOf`)
+    declarationProblems exact {declaredPush = map named [0 .. 3]} `shouldSatisfy` any ("64 bytes" `isInfixOf`)
 
   it "refuses a record beyond the limits, a member name the shader may not declare and one the engine's block already has" $ do
     declarationProblems declaration {declaredRecord = RecordLayout (maxRecordHandles + 1) 0} `shouldSatisfy` any ("handles" `isInfixOf`)
@@ -330,19 +333,19 @@ splicedSpec = describe "a spliced material" $ do
     forM_ variants $ \variant → do
       let (vertex, fragment) = members variant
       vertex `shouldBe` fragment
-      [(offset, offset + size) | PushMember offset size ← take 7 vertex] `shouldBe` [(0, 16), (16, 24), (24, 32), (32, 36), (36, 40), (40, 44), (44, 48)]
+      [(offset, offset + size) | PushMember offset size ← take 10 vertex] `shouldBe` [(0, 16), (16, 24), (24, 32), (32, 36), (36, 40), (40, 44), (44, 48), (48, 64), (64, 72), (72, 76)]
       maximum [offset + size | PushMember offset size ← vertex] `shouldBe` 128
-    -- The sample's two floats at 48 and 52, the rest from 56; the tint material's vec4 at 48, the rest from 64.
-    [(offset, size) | PushMember offset size ← drop 7 (fst (members (definedTranslucent mixMaterial)))] `shouldBe` [(48, 4), (52, 4), (56, 72)]
-    [(offset, size) | PushMember offset size ← drop 7 (fst (members (definedTranslucent tintOnlyMaterial)))] `shouldBe` [(48, 16), (64, 64)]
+    -- The sample's two floats at 80 and 84, the rest from 88; the tint material's vec4 at 80, the rest from 96.
+    [(offset, size) | PushMember offset size ← drop 10 (fst (members (definedTranslucent mixMaterial)))] `shouldBe` [(80, 4), (84, 4), (88, 40)]
+    [(offset, size) | PushMember offset size ← drop 10 (fst (members (definedTranslucent tintOnlyMaterial)))] `shouldBe` [(80, 16), (96, 32)]
     -- The built-in shaders reserve all of it.
-    [(offset, size) | PushMember offset size ← drop 7 (fst (members orderedShaders))] `shouldBe` [(48, 80)]
+    [(offset, size) | PushMember offset size ← drop 10 (fst (members orderedShaders))] `shouldBe` [(80, 48)]
 
-  it "reads the texture table, and the storage table only when the material has records" $ do
+  it "reads the texture table and the storage region, whether or not the material has records" $ do
     let descriptors shaders = case checkedFragment shaders of CheckedShader _ fragment → interfaceDescriptors fragment
     descriptors (definedTranslucent mixMaterial) `shouldBe` textureTableDescriptors <> storageTableDescriptors
     descriptors (definedTranslucent translucentMixMaterial) `shouldBe` textureTableDescriptors <> storageTableDescriptors
-    descriptors (definedTranslucent tintOnlyMaterial) `shouldBe` textureTableDescriptors
+    descriptors (definedTranslucent tintOnlyMaterial) `shouldBe` textureTableDescriptors <> storageTableDescriptors
     forM_ (maybe [] pure (definedCutout mixMaterial)) $ \cutout →
       descriptors cutout `shouldBe` textureTableDescriptors <> storageTableDescriptors
     storageTableDescriptors `shouldBe` [DescriptorDeclaration 2 0 StorageBuffer (DescriptorCount 1)]
@@ -410,38 +413,40 @@ recordingSpec = describe "recording materials" $ do
       input ← frameFor (fixRig fixtures) noCutoutMarks Rgba8Linear (onePass [] [viewHolding held [layer]])
       recorded fixtures input `shouldReturnRight` ()
       commands ← commandsRecorded (fixRig fixtures)
-      -- The region: the mix table (two records of three words) at word 0, the
-      -- translucent mix's (one) at word 6.
+      -- The region: the clip region's one zero entry (four words), then the mix
+      -- table (two records of three words) at word 4, the translucent mix's (one)
+      -- at word 10.
       writes ← claimWrites (fixRig fixtures)
-      take 1 writes `shouldBe` [(0, words' [10, 1, 7, 11, 1, 9, 12, 1, 3])]
-      -- 36 bytes are padded to the atom of 16, so the layer's region begins at 48.
-      ringOffsets (fixRig fixtures) >>= (`shouldBe` [0, 48])
+      take 1 writes `shouldBe` [(0, ByteString.replicate 16 0 <> words' [10, 1, 7, 11, 1, 9, 12, 1, 3])]
+      -- 52 bytes are padded to the atom of 16, so the layer's region begins at 64.
+      ringOffsets (fixRig fixtures) >>= (`shouldBe` [0, 64])
       seen commands
         `shouldBe` [ SeenPipeline
                    , SeenTable
                    , SeenStorage
                    , SeenPush both 0 enginePush
                    , -- the default material's run: no push block, no records
-                     SeenBind 48
+                     SeenBind 64
                    , SeenDraw 1
-                   , -- the mix material's run: its base is zero, which the layer's push left
+                   , -- the mix material's run: its table begins at word 4
                      SeenPipeline
+                   , SeenPush both recordBaseOffset (words' [4])
                    , SeenPush both applicationPushOffset (twoFloats 0.5 0.25)
-                   , SeenBind 112
+                   , SeenBind 128
                    , SeenDraw 2
-                   , -- the translucent mix's run: its table begins at word 6
+                   , -- the translucent mix's run: its table begins at word 10
                      SeenPipeline
-                   , SeenPush both recordBaseOffset (words' [6])
+                   , SeenPush both recordBaseOffset (words' [10])
                    , SeenPush both applicationPushOffset (twoFloats 1 0)
-                   , SeenBind 240
+                   , SeenBind 256
                    , SeenDraw 1
                    , -- the tint-only material: a push block and no records
                      SeenPipeline
                    , SeenPush both applicationPushOffset (colour 1 0.5 0.25 1)
-                   , SeenBind 304
+                   , SeenBind 320
                    , SeenDraw 1
                    , SeenPipeline
-                   , SeenBind 368
+                   , SeenBind 384
                    , SeenDraw 1
                    ]
 
@@ -456,15 +461,16 @@ recordingSpec = describe "recording materials" $ do
       input ← frameFor (fixRig fixtures) noCutoutMarks Rgba8Linear (onePass [(a, chunkA), (b, chunkB)] [viewHolding held [layer]])
       recorded fixtures input `shouldReturnRight` ()
       commands ← commandsRecorded (fixRig fixtures)
-      -- Tables in the order their first reader appears: chunk a (word 0), chunk b
-      -- (word 3), the view (word 6). The third listing reads a's table again.
+      -- Tables in the order their first reader appears, after the clip region's
+      -- four words: chunk a (word 4), chunk b (word 7), the view (word 10). The
+      -- third listing reads a's table again.
       writes ← claimWrites (fixRig fixtures)
-      take 1 writes `shouldBe` [(0, words' [20, 1, 21, 21, 1, 22, 30, 1, 31])]
+      take 1 writes `shouldBe` [(0, ByteString.replicate 16 0 <> words' [20, 1, 21, 21, 1, 22, 30, 1, 31])]
       -- At key 1 the order is the listings in turn, then the dynamic instance:
       -- four runs, each from its own source, though path and material are equal.
-      -- Listing 0 reads the table at word 0, which the layer's push left; then
-      -- listing 1's at 3, listing 2 (the same chunk) at 0 again, and the view's at 6.
-      [bytes | SeenPush _ offset bytes ← seen commands, offset == recordBaseOffset] `shouldBe` [words' [3], words' [0], words' [6]]
+      -- Listing 0 reads the table at word 4; then listing 1's at 7, listing 2 (the
+      -- same chunk) at 4 again, and the view's at 10.
+      [bytes | SeenPush _ offset bytes ← seen commands, offset == recordBaseOffset] `shouldBe` [words' [4], words' [7], words' [4], words' [10]]
       length [() | SeenDraw 1 ← seen commands] `shouldBe` 4
       -- The material's push block is the view's, pushed once for all four runs.
       length [() | SeenPush _ offset _ ← seen commands, offset == applicationPushOffset] `shouldBe` 1
@@ -478,9 +484,10 @@ recordingSpec = describe "recording materials" $ do
       input ← frameFor (fixRig fixtures) noCutoutMarks Rgba8Linear (onePass [(a, chunkA)] [viewHolding held [layer]])
       recorded fixtures input `shouldReturnRight` ()
       commands ← commandsRecorded (fixRig fixtures)
-      -- Keys 3 (chunk), 5 (dynamic), 7 (chunk): three runs of one instance each.
+      -- Keys 3 (chunk), 5 (dynamic), 7 (chunk): three runs of one instance each,
+      -- the chunk's table at word 4 and the view's at word 7.
       length [() | SeenDraw 1 ← seen commands] `shouldBe` 3
-      [bytes | SeenPush _ offset bytes ← seen commands, offset == recordBaseOffset] `shouldBe` [words' [3], words' [0]]
+      [bytes | SeenPush _ offset bytes ← seen commands, offset == recordBaseOffset] `shouldBe` [words' [4], words' [7], words' [4]]
 
   it "pushes the material's push block once for a view however many layers use it, and again after each depth clear" $
     withFixtures $ \fixtures → do
@@ -636,20 +643,21 @@ refusalSpec = describe "what the recorder refuses before it records anything" $ 
 
   it "refuses a frame whose records are larger than the storage window, naming both sizes" $
     withFixtures $ \fixtures → do
-      -- 400 records of a handle and a word are 4800 bytes; the window is 4096.
+      -- 400 records of a handle and a word are 4800 bytes, and the clip region's
+      -- 16 come first; the window is 4096.
       let records = [record [(10, 1)] [n] | n ← [0 .. 399]]
           held = [(fixMix fixtures, MaterialData records (twoFloats 1 0))]
           layer = UiLayer [unit (fixMix fixtures) 399 0 0]
       input ← frameFor (fixRig fixtures) noCutoutMarks Rgba8Linear (onePass [] [viewHolding held [layer]])
-      recorded fixtures input `shouldBe'` Left (RecordsTooLarge 4800 4096)
+      recorded fixtures input `shouldBe'` Left (RecordsTooLarge 4816 4096)
       nothingRecorded fixtures
 
   it "accepts a frame whose records fill the window exactly" $
     withFixtures $ \fixtures → do
-      -- 341 records are 4092 bytes, the most whole records the window holds.
-      let records = [record [(10, 1)] [n] | n ← [0 .. 340]]
+      -- 340 records are 4080 bytes, which with the clip region's 16 fill the window.
+      let records = [record [(10, 1)] [n] | n ← [0 .. 339]]
           held = [(fixMix fixtures, MaterialData records (twoFloats 1 0))]
-          layer = UiLayer [unit (fixMix fixtures) 340 0 0]
+          layer = UiLayer [unit (fixMix fixtures) 339 0 0]
       input ← frameFor (fixRig fixtures) noCutoutMarks Rgba8Linear (onePass [] [viewHolding held [layer]])
       recorded fixtures input `shouldBe'` Right ()
   where
@@ -746,7 +754,7 @@ externalSpec = describe "a material in a separately compiled module" $ do
   it "fails to compile when its push block is beyond the limit, naming the size and the limit" $
     withClient (clientWith "RecordLayout 0 0" "[PushField \"a\" PushVec4, PushField \"b\" PushVec4, PushField \"c\" PushVec4, PushField \"d\" PushVec4, PushField \"e\" PushVec4, PushField \"f\" PushVec4]" "return texel;") $ \built → do
       built `rejectedBecause` "the material's declaration is refused"
-      built `rejectedBecause` "the push block would be 96 bytes, beyond the limit of 80 bytes"
+      built `rejectedBecause` "the push block would be 96 bytes, beyond the limit of 48 bytes"
 
   it "fails to compile when its shader reads a record member beyond the layout it declares" $
     withClient (correct (unlines ["    float beyond = float(record.words[2]);", "    return texel * beyond;"])) $ \built → do

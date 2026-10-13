@@ -35,8 +35,8 @@ import Hetoimasia.GPU.Vulkan.Native.TextureTable
 
 data Builders q inst msgr phys dev cmd = Builders
   { buildRing ∷ RingSize → StorageWindow → IO (Either Refusal ())
-    -- ^ The shared ring, with the storage-table window the batches' material
-    -- records are bound through (R2D-11).
+    -- ^ The shared ring, with the storage-table window the batches' clip tables
+    -- (R2D-12) and material records (R2D-11) are bound through.
   , buildStorageTable ∷ IO (Either Refusal ())
     -- ^ The session's storage table, set 2 over the ring's window, once; it
     -- needs the ring made with a window.

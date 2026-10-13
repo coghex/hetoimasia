@@ -13,10 +13,12 @@ module Test.Render.TwoD.Vulkan.Recording (spec) where
 import Data.Bits ((.&.))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
+import Data.ByteString.Builder (floatLE, toLazyByteString)
+import qualified Data.ByteString.Lazy as Lazy
 import Data.List (nub)
 import Data.Maybe (mapMaybe)
 import qualified Data.Set as Set
-import Data.Word (Word32, Word64)
+import Data.Word (Word16, Word32, Word64)
 import Hetoimasia.GPU.Vulkan.Native.Recording
   ( ClearColor (..)
   , CompareOp (..)
@@ -37,10 +39,11 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   )
 import qualified Hetoimasia.GPU.Vulkan.Native.Recording as Native
 import Hetoimasia.GPU.Vulkan.Native.TextureTable (validateTableConfig)
-import Hetoimasia.Math.Affine2 (fromColumns)
+import Hetoimasia.Math.Affine2 (fromColumns, toColumnMajor)
 import Hetoimasia.Math.Vector (V2 (..))
 import Hetoimasia.Render.Api.Texture (TextureHandle)
 import Hetoimasia.Render.Api.Texture.Backend (textureHandle)
+import Hetoimasia.Render.TwoD.Clip (ClipEntry (..), ClipRect (..), ResolvedClip (..))
 import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..))
 import Hetoimasia.Render.TwoD.Settings (TextureFilter (..), ViewSettings (..), defaultViewSettings)
 import Hetoimasia.Render.TwoD.DrawPlan (CutoutMarks, DrawPath (..), cutoutMarks, noCutoutMarks)
@@ -61,6 +64,8 @@ spec = describe "Recording" $ do
   workSpec
   refusalSpec
   recordingSpec
+  clipSpec
+  clipAgreementSpec
   depthSpec
   depthRefusalSpec
   emptySpec
@@ -117,6 +122,7 @@ firstFrame =
             (Camera (V2 0 0) 1 Nothing)
             (Viewport (V2 0 0) (V2 16 32))
             defaultViewSettings
+            []
             [ WorldLayer DepthDisabled [sprite 1 5 SamplerDefault, sprite 2 1 SamplerNearest, sprite 3 5 SamplerLinear]
             , UiLayer [sprite 0 0 SamplerDefault, sprite 4 0 SamplerDefault]
             ]
@@ -124,11 +130,13 @@ firstFrame =
             (Camera (V2 0 0) 1 Nothing)
             (Viewport (V2 16.5 0) (V2 15 32))
             defaultViewSettings {settingBrightness = 2, settingFilter = FilterLinear, settingPixelSnap = True}
+            []
             [UiLayer [sprite 9 0 SamplerDefault]]
         , View
             (Camera (V2 0 0) 1 Nothing)
             (Viewport (V2 100 100) (V2 10 10))
             defaultViewSettings
+            []
             [UiLayer [sprite 0 0 SamplerDefault]]
         ]
     , Pass
@@ -138,6 +146,7 @@ firstFrame =
             (Camera (V2 4 4) 2 Nothing)
             (Viewport (V2 0 0) (V2 16 16))
             defaultViewSettings
+            []
             [WorldLayer DepthEnabled [sprite 0 0 SamplerDefault]]
         ]
     ]
@@ -163,11 +172,21 @@ firstFrameLayers = case encodings firstFrame of
 chunk ∷ Int → ByteString → ByteString
 chunk index = ByteString.take 64 . ByteString.drop (64 * index)
 
--- | A push block, built by hand.
+-- | A push block, built by hand, for a layer that selects no clip: its clip
+-- table starts at entry 0 and its centre is the origin.
 push ∷ [Float] → (Word32, Word32) → Float → TextureFilter → Bool → ByteString
-push [a, b, c, d, tx, ty] extent brightness filtering snap =
-  packViewPush (ViewPush (fromColumns (V2 a b) (V2 c d) (V2 tx ty)) extent brightness filtering snap)
-push other _ _ _ _ = error ("a transform has six coefficients, not " <> show (length other))
+push = pushBased 0 (0, 0)
+
+-- | A push block, built by hand, whose clip base is this entry and clip centre
+-- this point. The transforms these examples use are a uniform scale and a
+-- translation, whose inverse's linear part is written out: scale 1 over s with
+-- the off-diagonal terms minus zero, as the inverse of a transform with none
+-- gives them.
+pushBased ∷ Word32 → (Float, Float) → [Float] → (Word32, Word32) → Float → TextureFilter → Bool → ByteString
+pushBased base centre [a, b, c, d, tx, ty] extent brightness filtering snap
+  | b == 0 && c == 0 && a == d =
+      packViewPush (ViewPush (fromColumns (V2 a b) (V2 c d) (V2 tx ty)) (fromColumns (V2 (1 / a) (-0.0)) (V2 (-0.0) (1 / a)) (V2 0 0)) base centre extent brightness filtering snap)
+pushBased _ _ other _ _ _ _ = error ("a hand-built push block needs a uniform scale and six coefficients, not " <> show other)
 
 -- ---------------------------------------------------------------------------
 -- The work
@@ -203,6 +222,12 @@ inputOver rig snapshot = do
       , frameChunks = const Nothing
       , frameOmitted = Set.empty
       }
+
+-- | The work is refused, with this refusal.
+shouldFailWith ∷ Either FrameRefusal [PassWork] → FrameRefusal → IO ()
+shouldFailWith answer expected = case answer of
+  Left refusal → refusal `shouldBe` expected
+  Right _ → expectationFailure ("expected " <> show expected <> ", but the work was not refused")
 
 withRig ∷ (Rig → IO a) → IO a
 withRig action = newRig >>= action
@@ -270,7 +295,7 @@ workSpec = describe "the work a snapshot comes to" $ do
     withRig $ \rig → do
       image ← target rig Rgba8Srgb 32 32
       let metrics = TargetMetrics (PixelExtent 16 16) (PixelExtent 32 32) 2 2
-          snapshot = valid [Pass (OffscreenTarget refA) (ClearColour 0 0 0 1) [View (Camera (V2 0 0) 1 Nothing) (Viewport (V2 4 6) (V2 20 20)) defaultViewSettings [UiLayer [sprite 0 0 SamplerDefault]]]]
+          snapshot = valid [Pass (OffscreenTarget refA) (ClearColour 0 0 0 1) [View (Camera (V2 0 0) 1 Nothing) (Viewport (V2 4 6) (V2 20 20)) defaultViewSettings [] [UiLayer [sprite 0 0 SamplerDefault]]]]
           input = frameOf snapshot (\_ → Just (plainBinding image (Attachment (formatCode Rgba8Srgb) 32 32 metrics))) Nothing
       case frameWork input of
         Right [only] → map layerPushBytes (concatMap workLayers (workViews only)) `shouldBe` [push [2, 0, 0, 2, 4, 6] (32, 32) 1 FilterNearest False]
@@ -309,7 +334,7 @@ refusalSpec = describe "refusals, before anything is recorded" $ do
 
   it "takes a window pass's attachment from the frame context, with no image of its own" $
     withRig $ \_ → do
-      let snapshot = valid [Pass WindowTarget (ClearColour 0 0 0 1) [View (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 8 8)) defaultViewSettings [UiLayer [sprite 0 0 SamplerDefault]]]]
+      let snapshot = valid [Pass WindowTarget (ClearColour 0 0 0 1) [View (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 8 8)) defaultViewSettings [] [UiLayer [sprite 0 0 SamplerDefault]]]]
           input = frameOf snapshot (const Nothing) (Just (Attachment (formatCode Bgra8Srgb) 8 8 (TargetMetrics (PixelExtent 4 4) (PixelExtent 8 8) 2 2)))
       case frameWork input of
         Right [only] → do
@@ -345,8 +370,8 @@ refusalSpec = describe "refusals, before anything is recorded" $ do
       image ← target rig Rgba8Srgb 32 32
       -- A camera position of 2e38 at zoom 2 is finite, so it validates, but its
       -- translation overflows a 32-bit coefficient.
-      let overflow = View (Camera (V2 2e38 0) 2 Nothing) (Viewport (V2 0 0) (V2 8 8)) defaultViewSettings [UiLayer [sprite 0 0 SamplerDefault]]
-          fine = View (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 8 8)) defaultViewSettings []
+      let overflow = View (Camera (V2 2e38 0) 2 Nothing) (Viewport (V2 0 0) (V2 8 8)) defaultViewSettings [] [UiLayer [sprite 0 0 SamplerDefault]]
+          fine = View (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 8 8)) defaultViewSettings [] []
           snapshot = valid [Pass (OffscreenTarget refA) (ClearColour 0 0 0 1) [fine, overflow]]
           input = frameOf snapshot (\_ → Just (plainBinding image (offscreenAttachment Rgba8Srgb 32 32))) Nothing
       fmap (const ()) (frameWork input) `shouldBe` Left (ViewNotMappable 0 1)
@@ -382,8 +407,8 @@ data Seen
   | SeenPipeline
   | SeenViewport !Native.Viewport
   | SeenTable
-  | SeenStorage
-    -- ^ The storage table (set 2) bound: the region the batch's material records were written to.
+  | SeenStorage !Word32
+    -- ^ The storage table (set 2) bound at this dynamic offset into the ring.
   | SeenScissor !Rect
   | SeenPush ![PushStage] !Word32 !ByteString
   | SeenBind !Word32 !Word64
@@ -399,7 +424,7 @@ seen = mapMaybe $ \case
   CommandBindPipeline _ → Just SeenPipeline
   CommandSetViewport viewport → Just (SeenViewport viewport)
   CommandBindDescriptorSets {} → Just SeenTable
-  CommandBindStorageSet {} → Just SeenStorage
+  CommandBindStorageSet _ _ offset → Just (SeenStorage offset)
   CommandSetScissor rect → Just (SeenScissor rect)
   CommandPushConstants _ stages offset bytes → Just (SeenPush stages offset bytes)
   CommandBindVertexBuffer binding _ offset → Just (SeenBind binding offset)
@@ -414,8 +439,8 @@ rendererOver rig ringBytes = do
       rig
       Render.Configuration
         { Render.configurationRing = either (error . show) id (validateRingSize ringBytes)
+        , Render.configurationRegionWindow = either (error . show) id (validateStorageWindow (min 4096 ringBytes))
         , Render.configurationTable = either (error . show) id (validateTableConfig 16 8 4)
-        , Render.configurationRecordWindow = either (error . show) id (validateStorageWindow (min ringBytes 4096))
         }
   -- What the table's own placeholder upload recorded is not the frame's.
   resetJournal rig
@@ -440,15 +465,15 @@ recordingSpec = describe "recording a frame" $ do
       input ← inputOver rig firstFrame
       recorded rig renderer input `shouldBe'` Right ()
       commands ← commandsRecorded rig
-      -- The ring's five claims are the batch's material records (one word, padded
-      -- to the atom of 16) and, one a layer, 192, 128, 64 and 64 bytes.
+      -- The ring's five claims: the clip region's one entry, then a layer each,
+      -- of 192, 128, 64 and 64 bytes.
       ringOffsets rig >>= (`shouldBe` [0, 16, 208, 336, 400])
       seen commands
         `shouldBe` [ SeenBegin (ClearColor 0.25 0.5 0.75 1) Nothing
                    , SeenPipeline
                    , SeenViewport (Native.Viewport 0 0 32 32)
                    , SeenTable
-                   , SeenStorage
+                   , SeenStorage 0
                    , SeenScissor (Rect 0 0 16 32)
                    , SeenPush [PushVertex, PushFragment] 0 (push [1, 0, 0, 1, 8, 16] (32, 32) 1 FilterNearest False)
                    , SeenBind 0 16
@@ -465,11 +490,11 @@ recordingSpec = describe "recording a frame" $ do
                    , SeenPipeline
                    , SeenViewport (Native.Viewport 0 0 16 16)
                    , SeenTable
-                   , SeenStorage
+                   , SeenStorage 0
                    , SeenScissor (Rect 0 0 16 16)
                    , SeenClearDepth (Rect 0 0 16 16) 1
                    , SeenTable
-                   , SeenStorage
+                   , SeenStorage 0
                    , SeenPush [PushVertex, PushFragment] 0 (push [2, 0, 0, 2, 0, 0] (16, 16) 1 FilterNearest False)
                    , SeenBind 0 400
                    , SeenDraw 6 1
@@ -484,11 +509,9 @@ recordingSpec = describe "recording a frame" $ do
       recorded rig renderer input `shouldBe'` Right ()
       writes ← claimWrites rig
       let (world, ui, second, deep) = firstFrameLayers
-      -- The batch's records come first (a frame of the default material alone has
-      -- one zero word), then the world layer, written 1, 0, 2: ascending key, then
-      -- submission.
+      -- The world layer is written 1, 0, 2: ascending key, then submission.
       writes
-        `shouldBe` [(0, ByteString.replicate 4 0), (16, chunk 1 world <> chunk 0 world <> chunk 2 world), (208, ui), (336, second), (400, deep)]
+        `shouldBe` [(0, ByteString.replicate 16 0), (16, chunk 1 world <> chunk 0 world <> chunk 2 world), (208, ui), (336, second), (400, deep)]
 
   it "keeps instances of mixed sampler choices in one run and one draw" $
     withRig $ \rig → do
@@ -530,8 +553,7 @@ recordingSpec = describe "recording a frame" $ do
     withRig $ \rig → do
       _ ← rendererOver rig 4096
       layouts ← layoutsMade rig
-      -- The table's two set layouts and the storage table's, and one range of 128
-      -- bytes for both stages: the engine's 48 and the application's 80.
+      -- The table's two set layouts and the clip table's, and one range of 128 bytes for both stages.
       [(length sets, ranges) | (sets, ranges) ← layouts] `shouldBe` [(3, [PushConstantRange [PushVertex, PushFragment] 0 128])]
 
   it "refuses an unknown target in a later pass before it records a clear, a claim or a draw" $
@@ -546,17 +568,17 @@ recordingSpec = describe "recording a frame" $ do
 
   it "refuses a frame the ring cannot hold, recording no clear and no draw, and keeps the claims the backend granted" $
     withRig $ \rig → do
-      -- The records' 16 bytes and the first layer's 192 fit a ring of 256; the
-      -- second's 128 do not.
+      -- The clip region's 16 bytes and the first layer's 192 fit a ring of 256;
+      -- the second layer's 128 do not.
       renderer ← rendererOver rig 256
       input ← inputOver rig firstFrame
       answer ← recorded rig renderer input
       case answer of
         Left (RefusedByBackend _) → pure ()
         other → expectationFailure ("expected the backend's refusal, found " <> show other)
-      -- Only the records' region and the first layer's were claimed: the refusal
-      -- stopped the rest. The claim's own buffer barriers are the batch's; nothing
-      -- is cleared or drawn.
+      -- Only the clip region and the first layer's region were claimed: the
+      -- refusal stopped the rest.
+      -- The claim's own buffer barriers are the batch's; nothing is cleared or drawn.
       (seen <$> commandsRecorded rig) >>= (`shouldBe` [])
       ringOffsets rig >>= (`shouldBe` [0, 16])
 
@@ -564,13 +586,438 @@ recordingSpec = describe "recording a frame" $ do
     withRig $ \rig → do
       renderer ← rendererOver rig 4096
       image ← target rig Rgba8Srgb 32 32
-      let overflow = View (Camera (V2 2e38 0) 2 Nothing) (Viewport (V2 0 0) (V2 8 8)) defaultViewSettings [UiLayer [sprite 0 0 SamplerDefault]]
+      let overflow = View (Camera (V2 2e38 0) 2 Nothing) (Viewport (V2 0 0) (V2 8 8)) defaultViewSettings [] [UiLayer [sprite 0 0 SamplerDefault]]
           snapshot = valid [Pass (OffscreenTarget refA) (ClearColour 0 0 0 1) [], Pass (OffscreenTarget refA) (ClearColour 0 0 0 1) [overflow]]
           input = frameOf snapshot (\_ → Just (plainBinding image (offscreenAttachment Rgba8Srgb 32 32))) Nothing
       recorded rig renderer input `shouldBe'` Left (ViewNotMappable 1 0)
       commandsRecorded rig >>= (`shouldBe` [])
   where
     shouldBe' action expected = action >>= (`shouldBe` expected)
+
+-- ---------------------------------------------------------------------------
+-- Clip tables (R2D-12)
+
+-- | Floats as little-endian bytes: how the clip region holds a resolved
+-- rectangle's four edges.
+floats ∷ [Float] → ByteString
+floats = Lazy.toStrict . toLazyByteString . foldMap floatLE
+
+-- | A clip entry: this origin and extent, and this parent.
+clipEntry ∷ (Float, Float) → (Float, Float) → Maybe Int → ClipEntry
+clipEntry (x, y) (width, height) = ClipEntry (ClipRect (V2 x y) (V2 width height))
+
+-- | A UI sprite with this clip index.
+clippedSprite ∷ Word16 → Instance
+clippedSprite index = (sprite 0 0 SamplerDefault) {instanceClip = index}
+
+-- | A view of this viewport and clip table, holding one UI layer of sprites of
+-- these clip indices.
+clipView ∷ ((Float, Float), (Float, Float)) → [ClipEntry] → [Word16] → View
+clipView (origin, extent') table indices =
+  View (Camera (V2 0 0) 1 Nothing) (Viewport (uncurry V2 origin) (uncurry V2 extent')) defaultViewSettings table [UiLayer (map clippedSprite indices)]
+
+-- | Two passes: pass 0 into the 32 × 32 target (refA) holds three views, and
+-- pass 1 into the 16 × 16 one (refB) holds one.
+--
+-- * view 0, viewport (0, 0) 16 × 32, a table of two entries: (0, 0) 10 × 10, and
+--   (5, 5) 10 × 10 under it, which resolves to (5, 5) to (10, 10); its sprites
+--   take clip indices 1, 2 and 0;
+-- * view 1, viewport (100, 100) 10 × 10, wholly outside the target, holds three
+--   entries and draws nothing, so its table is not written;
+-- * view 2, viewport (16, 0) 16 × 32, one entry (1, 2) 3 × 4, which resolves to
+--   (1, 2) to (4, 6), and two layers, a world layer without a clip and a UI
+--   layer whose first sprite takes it (a world and a UI layer could not both
+--   take one entry);
+-- * view 3, in pass 1, viewport (0, 0) 16 × 16, three entries: (0, 0) 1 × 1;
+--   (0.5, 0.5) 4 × 4 under it, which resolves to (0.5, 0.5) to (1, 1); and
+--   (3, 3) 1 × 1, which resolves to (3, 3) to (4, 4).
+--
+-- So the region holds, in order, the six entries of views 0, 2 and 3 (each
+-- written for its UI layer only: the world layer of view 2 selects no clip), and
+-- the layers' first entries are 0 for view 0's, none for view 2's world layer, 2
+-- for its UI layer and 3 for view 3's.
+clipFrame ∷ ValidSnapshot
+clipFrame =
+  valid
+    [ Pass
+        (OffscreenTarget refA)
+        (ClearColour 0 0 0 1)
+        [ clipView ((0, 0), (16, 32)) [clipEntry (0, 0) (10, 10) Nothing, clipEntry (5, 5) (10, 10) (Just 0)] [1, 2, 0]
+        , clipView ((100, 100), (10, 10)) [clipEntry (0, 0) (1, 1) Nothing, clipEntry (0, 0) (2, 2) Nothing, clipEntry (0, 0) (3, 3) Nothing] [1, 2, 3]
+        , View
+            (Camera (V2 0 0) 1 Nothing)
+            (Viewport (V2 16 0) (V2 16 32))
+            defaultViewSettings
+            [clipEntry (1, 2) (3, 4) Nothing]
+            [WorldLayer DepthDisabled [clippedSprite 0], UiLayer [clippedSprite 1, clippedSprite 0]]
+        ]
+    , Pass
+        (OffscreenTarget refB)
+        (ClearColour 0 0 0 1)
+        [clipView ((0, 0), (16, 16)) [clipEntry (0, 0) (1, 1) Nothing, clipEntry (0.5, 0.5) (4, 4) (Just 0), clipEntry (3, 3) (1, 1) Nothing] [3]]
+    ]
+
+-- | The region 'clipFrame' packs, written out by hand. Each edge is taken about
+-- the layer-space point under the centre of its view's scissor, which for a UI
+-- layer is the centre minus the viewport's origin:
+--
+-- * view 0: scissor (0, 0) 16 × 32, centre (8, 16), reference (8, 16);
+-- * view 2: scissor (16, 0) 16 × 32, centre (24, 16), origin (16, 0), reference (8, 16);
+-- * view 3: scissor (0, 0) 16 × 16, centre (8, 8), reference (8, 8).
+clipFrameRegion ∷ ByteString
+clipFrameRegion =
+  floats
+    [ -8, -16, 2, -6 -- view 0, entry 0: (0, 0) to (10, 10)
+    , -3, -11, 2, -6 -- view 0, entry 1: (5, 5) to (10, 10), intersected with entry 0
+    , -7, -14, -4, -10 -- view 2, entry 0: (1, 2) to (4, 6)
+    , -8, -8, -7, -7 -- view 3, entry 0: (0, 0) to (1, 1)
+    , -7.5, -7.5, -7, -7 -- view 3, entry 1: (0.5, 0.5) to (1, 1), intersected with entry 0
+    , -5, -5, -4, -4 -- view 3, entry 2: (3, 3) to (4, 4)
+    ]
+
+clipSpec ∷ Spec
+clipSpec = describe "clip tables" $ do
+  it "packs the tables of the views that draw into one region, in pass and view order, 16 bytes an entry" $
+    withRig $ \rig → do
+      input ← inputOver rig clipFrame
+      case frameWork input of
+        Right passes → clipRegion passes `shouldBe` Just clipFrameRegion
+        Left refused → expectationFailure (show refused)
+
+  it "gives each layer that selects a clip the index of its table's first entry, in entries, and the scissor's centre; the rest none" $
+    withRig $ \rig → do
+      input ← inputOver rig clipFrame
+      case frameWork input of
+        Right passes → do
+          [ [(workViewIndex view, map (pushClipBase . layerPush) (workLayers view)) | view ← workViews pass]
+            | pass ← passes
+            ]
+            `shouldBe` [[(0, [0]), (1, []), (2, [0, 2])], [(0, [3])]]
+          [ [(workViewIndex view, map (pushClipCentre . layerPush) (workLayers view)) | view ← workViews pass]
+            | pass ← passes
+            ]
+            `shouldBe` [[(0, [(8, 16)]), (1, []), (2, [(0, 0), (24, 16)])], [(0, [(8, 8)])]]
+        Left refused → expectationFailure (show refused)
+
+  it "pushes the inverse of the layer's transform and the centre the clip test is taken about" $
+    withRig $ \rig → do
+      input ← inputOver rig clipFrame
+      case frameWork input of
+        Right (first : _) →
+          -- View 0's UI layer: the transform is the identity at the viewport's origin.
+          map (layerPushBytes) (concatMap workLayers (take 1 (workViews first)))
+            `shouldBe` [pushBased 0 (8, 16) [1, 0, 0, 1, 0, 0] (32, 32) 1 FilterNearest False]
+        other → expectationFailure ("expected passes, found " <> either show (show . length) other)
+
+  it "claims the region first, with the table alignment, writes it, and binds it as set 2 wherever the table is bound" $
+    withRig $ \rig → do
+      renderer ← rendererOver rig 4096
+      input ← inputOver rig clipFrame
+      recorded rig renderer input `shouldReturn` Right ()
+      offsets ← ringOffsets rig
+      writes ← claimWrites rig
+      take 1 writes `shouldBe` [(0, clipFrameRegion)]
+      -- The region's 96 bytes (six entries), then every layer's instances: 192,
+      -- 64, 128 and 64 bytes, each at a multiple of 16.
+      offsets `shouldBe` [0, 96, 288, 352, 480]
+      commands ← commandsRecorded rig
+      let bound = [tag | tag ← seen commands, case tag of SeenTable → True; SeenStorage _ → True; _ → False]
+      -- Two passes draw: each binds the table and then the region, at the region's own start.
+      bound `shouldBe` [SeenTable, SeenStorage 0, SeenTable, SeenStorage 0]
+      -- Each layer's push block names its table's first entry, and its centre.
+      [ByteString.take 4 (ByteString.drop 44 bytes) | SeenPush _ _ bytes ← seen commands]
+        `shouldBe` [floatlessWord base | base ← [0, 0, 2, 3]]
+      [ByteString.take 8 (ByteString.drop 64 bytes) | SeenPush _ _ bytes ← seen commands]
+        `shouldBe` [floats centre | centre ← [[8, 16], [0, 0], [24, 16], [8, 8]]]
+
+  it "writes a table for each space its layers select clips from, about that space's own reference point" $
+    withRig $ \rig → do
+      -- One view over the 32 × 32 target (refA) with a table of two entries, a
+      -- world layer selecting entry 0 and a UI layer selecting entry 1 (a
+      -- different entry: an entry may not be reached from both spaces). The
+      -- camera is at (3, 4) at zoom 2 over the viewport (0, 0) 32 × 32, so the
+      -- world transform is (2, 0, 0, 2, 10, 8) and the world point under the
+      -- scissor's centre (16, 16) is (3, 4); the UI transform is the identity,
+      -- so the UI point under it is (16, 16). Each space gets the whole table
+      -- about its own reference.
+      let table = [clipEntry (0, 0) (10, 10) Nothing, clipEntry (20, 20) (4, 4) Nothing]
+          view =
+            View
+              (Camera (V2 3 4) 2 Nothing)
+              (Viewport (V2 0 0) (V2 32 32))
+              defaultViewSettings
+              table
+              [WorldLayer DepthDisabled [clippedSprite 1], UiLayer [clippedSprite 2]]
+          snapshot = valid [Pass (OffscreenTarget refA) (ClearColour 0 0 0 1) [view]]
+      input ← inputOver rig snapshot
+      case frameWork input of
+        Right [only] → do
+          [(tableSpace held, tableBase held, tableCentre held) | work ← workViews only, held ← workTables work]
+            `shouldBe` [(ClipWorld, 0, (16, 16)), (ClipUi, 2, (16, 16))]
+          [pushClipBase (layerPush layer) | work ← workViews only, layer ← workLayers work] `shouldBe` [0, 2]
+          clipRegion [only]
+            `shouldBe` Just
+              ( floats
+                  [ -3, -4, 7, 6 -- the world table about (3, 4): entry 0, (0, 0) to (10, 10)
+                  , 17, 16, 21, 20 -- entry 1, (20, 20) to (24, 24)
+                  , -16, -16, -6, -6 -- the UI table about (16, 16): entry 0
+                  , 4, 4, 8, 8 -- entry 1
+                  ]
+              )
+        other → expectationFailure ("expected one pass, found " <> either show (show . length) other)
+
+  it "keeps a distant clip's edges exact: about the reference, not about the origin" $
+    withRig $ \rig → do
+      -- The camera at (65536, 0) at zoom 100 over a 32 × 32 viewport puts world x
+      -- = 65536 at pixel 16, so the transform's translation is (-6553584, 16). A
+      -- clip from (65536.1484375, -1) of extent (0.5, 2) has its left edge at
+      -- 0.1484375 of a world unit about the reference (65536, 0): about the
+      -- origin, in single precision, that edge would be spaced 1/128 apart.
+      let view =
+            View
+              (Camera (V2 65536 0) 100 Nothing)
+              (Viewport (V2 0 0) (V2 32 32))
+              defaultViewSettings
+              [clipEntry (65536.1484375, -1) (0.5, 2) Nothing]
+              [WorldLayer DepthDisabled [clippedSprite 1]]
+          snapshot = valid [Pass (OffscreenTarget refA) (ClearColour 0 0 0 1) [view]]
+      input ← inputOver rig snapshot
+      case frameWork input of
+        Right [only] → do
+          clipRegion [only] `shouldBe` Just (floats [0.1484375, -1, 0.6484375, 1])
+          [pushClipCentre (layerPush layer) | work ← workViews only, layer ← workLayers work] `shouldBe` [(16, 16)]
+        other → expectationFailure ("expected one pass, found " <> either show (show . length) other)
+
+  it "takes an edge's difference from the reference before rounding: an extreme zoom keeps it exact" $
+    withRig $ \rig → do
+      -- At zoom 2^60 about a camera at world x = 1 over a 32 × 32 viewport the
+      -- translation 16 − 2^60 rounds to −2^60, so a world x is at 2^60 (x − 1) and
+      -- the point under the scissor's centre is x = 1 + 2^-56, which a double
+      -- cannot hold. The clip from (1, -1) of extent (1, 2) is about that point
+      -- −2^-56 to 1 on x and −1 to 1 on y.
+      let view =
+            View
+              (Camera (V2 1 0) (2 ^^ (60 ∷ Int)) Nothing)
+              (Viewport (V2 0 0) (V2 32 32))
+              defaultViewSettings
+              [clipEntry (1, -1) (1, 2) Nothing]
+              [WorldLayer DepthDisabled [clippedSprite 1]]
+      input ← inputOver rig (valid [Pass (OffscreenTarget refA) (ClearColour 0 0 0 1) [view]])
+      case frameWork input of
+        Right [only] → clipRegion [only] `shouldBe` Just (floats [negate (2 ^^ (-56 ∷ Int)), -1, 1, 1])
+        other → expectationFailure ("expected one pass, found " <> either show (show . length) other)
+
+  it "refuses a view whose clip test could overflow a float, naming it, and not one that selects no clip" $
+    withRig $ \rig → do
+      -- The viewport (-16, -16) 32 × 32 over the 32 × 32 target leaves the scissor
+      -- (0, 0) 16 × 16, and a zoom of 1.25e-38 at the camera (-2e38, -2e38) has a
+      -- finite transform whose inverse scales by 8e37: a fragment's offset reaches
+      -- 8 × 8e37 and more, past the floats. A clip selected there is refused; the
+      -- same view with no clip selected draws.
+      let view clip =
+            View
+              (Camera (V2 (-2.0e38) (-2.0e38)) 1.25e-38 Nothing)
+              (Viewport (V2 (-16) (-16)) (V2 32 32))
+              defaultViewSettings
+              [clipEntry (-1.0e38, -1.0e38) (2.0e38, 2.0e38) Nothing]
+              [WorldLayer DepthDisabled [(sprite (-2.0e38) 0 SamplerDefault) {instanceTransform = fromColumns (V2 3.0e38 0) (V2 0 3.0e38) (V2 (-2.0e38) (-2.0e38)), instanceClip = clip}]]
+          snapshot clip = valid [Pass (OffscreenTarget refA) (ClearColour 0 0 0 1) [view clip]]
+      refused ← inputOver rig (snapshot 1)
+      frameWork refused `shouldFailWith` ClipNotRepresentable 0 0
+      unclipped ← inputOver rig (snapshot 0)
+      either show (const "drawn") (frameWork unclipped) `shouldBe` "drawn"
+      renderer ← rendererOver rig 4096
+      recorded rig renderer refused `shouldReturn` Left (ClipNotRepresentable 0 0)
+      commandsRecorded rig >>= (`shouldBe` [])
+      ringOffsets rig >>= (`shouldBe` [])
+
+  it "keeps instances of different clip indices in one run and one draw" $
+    withRig $ \rig → do
+      renderer ← rendererOver rig 4096
+      input ← inputOver rig clipFrame
+      recorded rig renderer input `shouldReturn` Right ()
+      commands ← commandsRecorded rig
+      -- View 0's three sprites (clip indices 1, 2, 0) are one draw.
+      [() | SeenDraw 6 3 ← seen commands] `shouldBe` [()]
+
+  it "writes each instance's clip index unchanged into its flags word, bits 16 to 31" $
+    withRig $ \rig → do
+      renderer ← rendererOver rig 4096
+      input ← inputOver rig clipFrame
+      recorded rig renderer input `shouldReturn` Right ()
+      writes ← claimWrites rig
+      -- The first layer's instances were written in drawing order: the sprites
+      -- are all at key 0, so submission order, with clip indices 1, 2 and 0.
+      let clipOf bytes index = toInteger (ByteString.index bytes (64 * index + 58)) + 256 * toInteger (ByteString.index bytes (64 * index + 59))
+      [map (clipOf bytes) [0, 1, 2 ∷ Int] | (96, bytes) ← writes] `shouldBe` [[1, 2, 0]]
+
+  it "binds a region of one zero entry for a frame that draws and holds no clip entry" $
+    withRig $ \rig → do
+      input ← inputOver rig firstFrame
+      case frameWork input of
+        Right passes → clipRegion passes `shouldBe` Just (ByteString.replicate 16 0)
+        Left refused → expectationFailure (show refused)
+
+  it "holds no region for a frame that draws nothing" $
+    withRig $ \rig → do
+      input ← depthFrame rig noCutoutMarks (Just Depth32Float) (onePass [viewAt (0, 0) (16, 16) [WorldLayer DepthEnabled []]])
+      case frameWork input of
+        Right passes → clipRegion passes `shouldBe` Nothing
+        Left refused → expectationFailure (show refused)
+
+  it "accepts tables that exactly fill the window and refuses one entry more, naming the size and the window" $
+    withRig $ \rig → do
+      let table count = replicate count (clipEntry (0, 0) (1, 1) Nothing)
+          frameOf' count = valid [Pass (OffscreenTarget refB) (ClearColour 0 0 0 1) [clipView ((0, 0), (16, 16)) (table count) [1]]]
+      exact ← inputOver rig (frameOf' 256)
+      over ← inputOver rig (frameOf' 257)
+      (frameWork exact >>= requireClipWindow 4096) `shouldBe` Right ()
+      (frameWork over >>= requireClipWindow 4096) `shouldBe` Left (ClipTablesTooLarge 4112 4096)
+
+  it "counts only the tables of views that draw against the window" $
+    withRig $ \rig → do
+      let table count = replicate count (clipEntry (0, 0) (1, 1) Nothing)
+          snapshot = valid [Pass (OffscreenTarget refB) (ClearColour 0 0 0 1) [clipView ((100, 100), (4, 4)) (table 300) [1], clipView ((0, 0), (16, 16)) (table 2) [1]]]
+      input ← inputOver rig snapshot
+      case frameWork input of
+        Right passes → do
+          fmap ByteString.length (clipRegion passes) `shouldBe` Just 32
+          requireClipWindow 4096 passes `shouldBe` Right ()
+        Left refused → expectationFailure (show refused)
+
+  it "refuses a frame whose tables do not fit the window before it claims anything or records a command" $
+    withRig $ \rig → do
+      renderer ← rendererOver rig 4096
+      let table = replicate 257 (clipEntry (0, 0) (1, 1) Nothing)
+          snapshot = valid [Pass (OffscreenTarget refB) (ClearColour 0 0 0 1) [clipView ((0, 0), (16, 16)) table [1]]]
+      input ← inputOver rig snapshot
+      recorded rig renderer input `shouldReturn` Left (ClipTablesTooLarge 4112 4096)
+      commandsRecorded rig >>= (`shouldBe` [])
+      ringOffsets rig >>= (`shouldBe` [])
+      pipelinesMade rig >>= (`shouldBe` [])
+  where
+    floatlessWord ∷ Word32 → ByteString
+    floatlessWord base = ByteString.pack [fromIntegral (base `div` (256 ^ k) `mod` 256) | k ← [0 .. 3 ∷ Word32]]
+
+-- ---------------------------------------------------------------------------
+-- The clip test against exact geometry
+
+-- | A view to sweep: a name, how its view is made from a clip table, and the
+-- clip entry to test, when it is given rather than placed in the view.
+data Sweep = Sweep String ([ClipEntry] → View) (Maybe ClipEntry)
+
+worldSweep ∷ String → (Float, Float) → Float → Maybe Float → Maybe ClipEntry → Sweep
+worldSweep name (x, y) zoom turn =
+  Sweep
+    name
+    (\table → View (Camera (V2 x y) zoom turn) (Viewport (V2 0 0) (V2 32 32)) defaultViewSettings table [WorldLayer DepthDisabled [clippedSprite 1]])
+
+uiSweep ∷ String → Float → (Float, Float) → Sweep
+uiSweep name scale (x, y) =
+  Sweep
+    name
+    (\table → View (Camera (V2 0 0) 1 Nothing) (Viewport (V2 x y) (V2 28 26)) defaultViewSettings {settingUiScale = scale} table [UiLayer [clippedSprite 1]])
+    Nothing
+
+-- | Every view of the sweep: cameras at the origin, near it and far from it, at
+-- zooms from 2^-100 to 2^100, turned and not, in the world; UI scales and
+-- viewport origins; and the scenes the review found wanting.
+sweeps ∷ [Sweep]
+sweeps =
+  [ worldSweep ("world zoom 2^" <> show k <> " camera " <> show camera <> maybe "" (const " turned") turn) camera (2 ^^ k) turn Nothing
+  | k ← [-100, -60, -20, -5, 0, 5, 20, 60, 100 ∷ Int]
+  , camera ← [(0, 0), (1, 0), (65536, 3), (-400000, 250000)]
+  , turn ← [Nothing, Just 0.6]
+  ]
+    <> [uiSweep ("ui scale " <> show scale <> " origin " <> show origin) scale origin | scale ← [0.5, 1, 3.5], origin ← [(0, 0), (3, 5)]]
+    <> [ worldSweep "round 1: camera (65536, 0), zoom 100" (65536, 0) 100 Nothing (Just (clipEntry (65536.1484375, -1) (0.5, 2) Nothing))
+       , worldSweep "round 3: camera (1, 0), zoom 2^60" (1, 0) (2 ^^ (60 ∷ Int)) Nothing (Just (clipEntry (1, -1) (1, 2) Nothing))
+       ]
+
+-- | The layer-space point under a target-pixel point for a transform's six
+-- coefficients, exactly.
+exactInverse ∷ [Float] → (Rational, Rational) → (Rational, Rational)
+exactInverse coefficients (x, y) = case map toRational coefficients of
+  [a, b, c, d, tx, ty] →
+    let determinant = a * d - b * c
+        dx = x - tx
+        dy = y - ty
+     in ((d * dx - c * dy) / determinant, (a * dy - b * dx) / determinant)
+  _ → (0, 0)
+
+-- | The clip test as the fragment stage evaluates it, in single-precision
+-- arithmetic, on what the work holds: the offset of the pixel's centre from the
+-- push block's centre through the inverse's linear part, compared with the
+-- table's edges.
+shaderInside ∷ ViewPush → ResolvedClip → (Int, Int) → Bool
+shaderInside block (ResolvedClip left top right bottom) (px, py) = case take 4 (toColumnMajor (pushInverse block)) of
+  [a, b, c, d] →
+    let (centreX, centreY) = pushClipCentre block
+        offsetX = fromIntegral px + 0.5 - centreX
+        offsetY = fromIntegral py + 0.5 - centreY
+        localX = a * offsetX + c * offsetY
+        localY = b * offsetX + d * offsetY
+     in localX >= left && localX < right && localY >= top && localY < bottom
+  _ → False
+
+-- | What a sweep found of one view: the disagreements outside the band, the
+-- probes compared and how many of those were inside the clip.
+sweepFindings ∷ FrameInput → Sweep → ([String], Int, Int)
+sweepFindings base (Sweep name makeView given) = case (given, placement) of
+  (Just entry, _) → check entry
+  (Nothing, Just entry) → check entry
+  (Nothing, Nothing) → (["could not place a clip in " <> name], 0, 0)
+  where
+    snapshotOf table = valid [Pass (OffscreenTarget refA) (ClearColour 0 0 0 1) [makeView table]]
+    workOf table = frameWork base {frameSnapshot = snapshotOf table}
+    -- A clip whose corners are the layer-space points under two target pixels.
+    placement = case workOf [clipEntry (0, 0) (1, 1) Nothing] of
+      Right [pass] | view : _ ← workViews pass, layer : _ ← workLayers view →
+        let coefficients = toColumnMajor (pushTransform (layerPush layer))
+            (ax, ay) = exactInverse coefficients (6.3, 9.7)
+            (bx, by) = exactInverse coefficients (24.6, 22.4)
+            floatOf = fromRational ∷ Rational → Float
+            (left, right) = (min ax bx, max ax bx)
+            (top, bottom) = (min ay by, max ay by)
+         in Just (ClipEntry (ClipRect (V2 (floatOf left) (floatOf top)) (V2 (floatOf (right - left)) (floatOf (bottom - top)))) Nothing)
+      _ → Nothing
+    check entry = case workOf [entry] of
+      Right [pass]
+        | view : _ ← workViews pass
+        , layer : _ ← workLayers view
+        , Just rect ← workRect view
+        , table : _ ← workTables view
+        , held : _ ← tableEntries table
+        , resolved : _ ← workClips view →
+            let block = layerPush layer
+                coefficients = toColumnMajor (pushTransform block)
+                scale = toRational (maximum (map abs (take 4 coefficients)))
+                ResolvedClip left top right bottom = resolved
+                (l, t, r, b) = (toRational left, toRational top, toRational right, toRational bottom)
+                probes = [(x, y) | y ← [fromIntegral (rectY rect) .. fromIntegral (rectY rect) + fromIntegral (rectHeight rect) - 1], x ← [fromIntegral (rectX rect) .. fromIntegral (rectX rect) + fromIntegral (rectWidth rect) - 1]]
+                judged (x, y) =
+                  let (qx, qy) = exactInverse coefficients (fromIntegral x + 1 / 2, fromIntegral y + 1 / 2)
+                      exact = l <= qx && qx < r && t <= qy && qy < b
+                      margin = fromRational (minimum [abs (qx - l), abs (qx - r), abs (qy - t), abs (qy - b)] * scale) ∷ Double
+                      shader = shaderInside block held (x, y)
+                   in (margin >= 0.07, exact, shader == exact, name <> " pixel " <> show (x, y) <> ": the shader " <> show shader <> ", exact geometry " <> show exact <> ", margin " <> show margin <> " pixels")
+                results = map judged probes
+             in ([why | (compared, _, agrees, why) ← results, compared, not agrees], length [() | (True, _, _, _) ← results], length [() | (True, True, _, _) ← results])
+      Left refusal → (["refused " <> name <> ": " <> show refusal], 0, 0)
+      other → (["unexpected work for " <> name <> ": " <> either show (show . length) other], 0, 0)
+
+clipAgreementSpec ∷ Spec
+clipAgreementSpec = describe "the clip test against exact geometry" $
+  it "agrees with the exact transform and rectangle at every pixel more than 0.07 pixel from a clip's edge, from zooms of 2^-100 to 2^100, near and far cameras, turns, UI scales and the scenes the review found wanting" $
+    withRig $ \rig → do
+      base ← inputOver rig firstFrame
+      let findings = map (sweepFindings base) sweeps
+          disagreements = concat [found | (found, _, _) ← findings]
+          compared = sum [n | (_, n, _) ← findings]
+          inside = sum [n | (_, _, n) ← findings]
+      take 8 disagreements `shouldBe` []
+      -- The sweep is not vacuous: most of its probes are compared, and some of them are inside a clip.
+      (compared > 40000, inside > 5000, inside < compared - 5000) `shouldBe` (True, True, True)
 
 -- ---------------------------------------------------------------------------
 -- Depth (R2D-9)
@@ -590,7 +1037,7 @@ marked = cutoutMarks [artHandle]
 
 -- | A view of this viewport over the 16 × 16 target, camera at the origin.
 viewAt ∷ (Float, Float) → (Float, Float) → [Layer] → View
-viewAt origin extent' = View (Camera (V2 0 0) 1 Nothing) (Viewport (uncurry V2 origin) (uncurry V2 extent')) defaultViewSettings
+viewAt origin extent' = View (Camera (V2 0 0) 1 Nothing) (Viewport (uncurry V2 origin) (uncurry V2 extent')) defaultViewSettings []
 
 -- | One pass into the 16 × 16 target (refB) of these views.
 onePass ∷ [View] → ValidSnapshot
@@ -655,18 +1102,18 @@ depthSpec = describe "depth passes" $ do
                    , SeenPipeline
                    , SeenViewport (Native.Viewport 0 0 16 16)
                    , SeenTable
-                   , SeenStorage
+                   , SeenStorage 0
                    , SeenScissor (Rect 0 0 8 16)
                    , SeenClearDepth (Rect 0 0 8 16) 1
                    , SeenTable
-                   , SeenStorage
+                   , SeenStorage 0
                    , SeenPush [PushVertex, PushFragment] 0 (push [1, 0, 0, 1, 4, 8] (16, 16) 1 FilterNearest False)
                    , SeenBind 0 16
                    , SeenDraw 6 1
                    , SeenScissor (Rect 8 0 8 16)
                    , SeenClearDepth (Rect 8 0 8 16) 1
                    , SeenTable
-                   , SeenStorage
+                   , SeenStorage 0
                    , SeenPush [PushVertex, PushFragment] 0 (push [1, 0, 0, 1, 12, 8] (16, 16) 1 FilterNearest False)
                    , SeenBind 0 80
                    , SeenDraw 6 1
@@ -888,9 +1335,9 @@ emptySpec = describe "passes that draw nothing" $ do
       renderer ← rendererOver rig 4096
       image ← target rig Rgba8Srgb 32 32
       -- One view wholly outside the target; one inside with no layer.
-      let outside = View (Camera (V2 0 0) 1 Nothing) (Viewport (V2 100 100) (V2 4 4)) defaultViewSettings [UiLayer [sprite 0 0 SamplerDefault]]
-          empty' = View (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 4 4)) defaultViewSettings [UiLayer []]
-          zeroSize = View (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 0 4)) defaultViewSettings [UiLayer [sprite 0 0 SamplerDefault]]
+      let outside = View (Camera (V2 0 0) 1 Nothing) (Viewport (V2 100 100) (V2 4 4)) defaultViewSettings [] [UiLayer [sprite 0 0 SamplerDefault]]
+          empty' = View (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 4 4)) defaultViewSettings [] [UiLayer []]
+          zeroSize = View (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 0 4)) defaultViewSettings [] [UiLayer [sprite 0 0 SamplerDefault]]
           snapshot = valid [Pass (OffscreenTarget refA) (ClearColour 0.5 0.5 0.5 1) [outside, empty', zeroSize]]
           input = frameOf snapshot (\_ → Just (plainBinding image (offscreenAttachment Rgba8Srgb 32 32))) Nothing
       answer ← Render.prepareSnapshot (builders rig) renderer input >>= either (pure . Left) (framelessOnce rig)

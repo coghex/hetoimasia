@@ -117,7 +117,7 @@ layerOf = \case
 
 -- | The bytes of these instances as the dynamic encoder writes them, in this order.
 encoded ∷ [Instance] → ByteString
-encoded instances = case validateSnapshot (Snapshot [Pass WindowTarget (ClearColour 0 0 0 1) [View (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 8 8)) defaultViewSettings [UiLayer instances]]]) of
+encoded instances = case validateSnapshot (Snapshot [Pass WindowTarget (ClearColour 0 0 0 1) [View (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 8 8)) defaultViewSettings [] [UiLayer instances]]]) of
   Right valid → case validLayers valid of
     [only] → encodeLayer only
     other → error ("one layer expected, not " <> show (length other))
@@ -149,8 +149,8 @@ withSetup action = do
       rig
       Render.Configuration
         { Render.configurationRing = either (error . show) id (validateRingSize (64 * 1024))
+        , Render.configurationRegionWindow = either (error . show) id (validateStorageWindow 4096)
         , Render.configurationTable = either (error . show) id (validateTableConfig 16 8 4)
-        , Render.configurationRecordWindow = either (error . show) id (validateStorageWindow 4096)
         }
   resetJournal rig
   retained ← newRetained
@@ -208,7 +208,7 @@ target0 = targetRef 1 1
 -- | A view over the whole 32 × 32 target, the camera at its centre so that world
 -- and target coordinates agree, holding these layers.
 fullView ∷ [Layer] → View
-fullView = View (Camera (V2 16 16) 1 Nothing) (Viewport (V2 0 0) (V2 32 32)) defaultViewSettings
+fullView = View (Camera (V2 16 16) 1 Nothing) (Viewport (V2 0 0) (V2 32 32)) defaultViewSettings []
 
 -- | The frame over the 32 × 32 target with a depth image, drawing chunks from
 -- the registry's buffers with the art marked.
@@ -312,7 +312,7 @@ refusalSpec = describe "refusing a build" $ do
     withSetup $ \setup → do
       let bad = (cutAt 0 16777216) {instanceClip = 2}
       buildChunkOf setup ChunkWorldDepth [cutAt 0 1, bad]
-        `shouldReturnRefused` BuildInvalid (ChunkInstanceInvalid 1 DepthKeyTooLarge :| [ChunkInstanceInvalid 1 ClipIndexNotZero])
+        `shouldReturnRefused` BuildInvalid (ChunkInstanceInvalid 1 DepthKeyTooLarge :| [ChunkInstanceInvalid 1 ClipIndexUnknown])
       buildRetainedChunk (trackedBuilders setup) (setupRetained setup) artMarks ChunkUi (SuppliedBounds (Bounds (V2 0 0) (V2 1 1))) [cutAt 0 1]
         `shouldReturnRefused` BuildInvalid (ChunkBoundsInsufficient :| [])
       liveChunks (setupRetained setup) >>= (`shouldBe` [])
@@ -379,11 +379,6 @@ refusalSpec = describe "refusing a build" $ do
   where
     shouldReturnRefused action expected = action >>= (`shouldBe` Left expected)
 
--- | The batch's material records when none is read: one zero word, which a draw
--- under the renderer's layout needs the storage table bound to.
-noRecords ∷ ByteString
-noRecords = ByteString.replicate 4 0
-
 -- ---------------------------------------------------------------------------
 -- Recording
 
@@ -408,11 +403,11 @@ recordingSpec = describe "recording a frame that draws chunks" $ do
       commands ← commandsRecorded (setupRig setup)
       -- The ring holds, in one region: the dynamic cutout, then the ordered instances at keys 4
       -- (the dynamic translucent) and 9 (the chunk's), the chunk before nothing at an equal key.
-      -- (Before it, at offset 0, is the batch's one-word region of material records.)
-      claimWrites (setupRig setup) >>= (`shouldBe` [(0, noRecords), (16, encoded [dynamicCut, dynamicOrd, ordAt 15 9])])
+      claimWrites (setupRig setup) >>= (`shouldBe` [(0, ByteString.replicate 16 0), (16, encoded [dynamicCut, dynamicOrd, ordAt 15 9])])
       ringOffsets (setupRig setup) >>= (`shouldBe` [0, 16])
       -- Three draws: the chunk's three cutouts from its buffer at offset 0, the dynamic cutout
-      -- from the ring at offset 16, then the two ordered instances from the ring at offset 80.
+      -- from the ring at offset 16 (after the clip region's one entry), then the two
+      -- ordered instances from the ring at offset 80.
       case draws commands of
         [(first, firstOffset, firstCount), (second, secondOffset, secondCount), (third, thirdOffset, thirdCount)] → do
           (first, firstOffset, firstCount) `shouldBe` (chunkBuffer, 0, 3)
@@ -450,7 +445,7 @@ recordingSpec = describe "recording a frame that draws chunks" $ do
       resetJournal (setupRig setup)
       snapshot ← snapshotOver setup [fullView [WorldLayerWith DepthEnabled [reference] []]]
       frameFor setup snapshot >>= record setup >>= (`shouldBe` Right ())
-      -- Only the batch's one-word region of material records is claimed.
+      -- Only the clip region's single zero entry is claimed: nothing of the layer's.
       ringOffsets (setupRig setup) >>= (`shouldBe` [0])
       length . draws <$> commandsRecorded (setupRig setup) >>= (`shouldBe` 1)
 
@@ -475,7 +470,7 @@ recordingSpec = describe "recording a frame that draws chunks" $ do
             frameFor setup snapshot >>= record setup >>= (`shouldBe` Right ())
             -- Keys 2 (chunk build 1, then the dynamic), 5, 7: the chunk's key-2 instance
             -- before the dynamic one at an equal key.
-            claimWrites (setupRig setup) >>= (`shouldBe` [(0, noRecords), (16, encoded [ordAt 4 2, ordAt 12 2, ordAt 8 5, cutAt 0 7])])
+            claimWrites (setupRig setup) >>= (`shouldBe` [(0, ByteString.replicate 16 0), (16, encoded [ordAt 4 2, ordAt 12 2, ordAt 8 5, cutAt 0 7])])
             commands ← commandsRecorded (setupRig setup)
             map (\(_, offset, count) → (offset, count)) (draws commands) `shouldBe` [(16, 4)]
             copiesInto commands `shouldBe` []
@@ -486,7 +481,7 @@ recordingSpec = describe "recording a frame that draws chunks" $ do
     withSetup $ \setup → do
       reference ← built setup ChunkWorldDepth [cutAt 0 3]
       settleUploads (setupRig setup)
-      let emptyView = View (Camera (V2 16 16) 1 Nothing) (Viewport (V2 0 0) (V2 0 0)) defaultViewSettings [WorldLayerWith DepthEnabled [reference] []]
+      let emptyView = View (Camera (V2 16 16) 1 Nothing) (Viewport (V2 0 0) (V2 0 0)) defaultViewSettings [] [WorldLayerWith DepthEnabled [reference] []]
       lie ← depthTarget (setupRig setup) Depth24 32 32
       image ← target (setupRig setup) Rgba8Linear 32 32
       buffers ← retainedBuffers (setupRetained setup)
@@ -551,7 +546,7 @@ cullingSpec = describe "culling a chunk by its bounds" $ do
         other → expectationFailure ("expected one pass, found " <> either show (show . length) other)
       record setup input >>= (`shouldBe` Right ())
       commands <- commandsRecorded (setupRig setup)
-      claimWrites (setupRig setup) >>= (`shouldBe` [(0, noRecords), (16, encoded [ordAt 8 2])])
+      claimWrites (setupRig setup) >>= (`shouldBe` [(0, ByteString.replicate 16 0), (16, encoded [ordAt 8 2])])
       drawnFrom commands `shouldSatisfy` ((== 2) . length)
       (nearBuffer `elem` drawnFrom commands) `shouldBe` True
 
@@ -584,7 +579,7 @@ cullingSpec = describe "culling a chunk by its bounds" $ do
         Right [pass] → map (map layerCulled . workLayers) (workViews pass) `shouldBe` [[[omitted]]]
         other → expectationFailure ("expected one pass, found " <> either show (show . length) other)
       record setup leaving >>= (`shouldBe` Right ())
-      claimWrites (setupRig setup) >>= (`shouldBe` [(0, noRecords), (16, encoded [ordAt 8 2])])
+      claimWrites (setupRig setup) >>= (`shouldBe` [(0, ByteString.replicate 16 0), (16, encoded [ordAt 8 2])])
       length . draws <$> commandsRecorded (setupRig setup) >>= (`shouldBe` 2)
 
   it "keeps a chunk in one view and skips it in another, each view planned for itself" $
@@ -593,7 +588,7 @@ cullingSpec = describe "culling a chunk by its bounds" $ do
       settleUploads (setupRig setup)
       let layer = WorldLayerWith DepthEnabled [reference] []
           here = fullView [layer]
-          elsewhere = View (Camera (V2 5000 16) 1 Nothing) (Viewport (V2 0 0) (V2 32 32)) defaultViewSettings [layer]
+          elsewhere = View (Camera (V2 5000 16) 1 Nothing) (Viewport (V2 0 0) (V2 32 32)) defaultViewSettings [] [layer]
       snapshot ← snapshotOver setup [here, elsewhere]
       input ← frameFor setup snapshot
       case frameWork input of
@@ -638,12 +633,12 @@ chunkIn env art kind = do
 -- these dynamic instances.
 windowListing ∷ [ChunkRef] → [Instance] → Snapshot
 windowListing references dynamic =
-  Snapshot [Pass WindowTarget (ClearColour 0 0 0 1) [View (Camera (V2 16 16) 1 Nothing) (Viewport (V2 0 0) (V2 32 32)) defaultViewSettings [WorldLayerWith DepthEnabled references dynamic]]]
+  Snapshot [Pass WindowTarget (ClearColour 0 0 0 1) [View (Camera (V2 16 16) 1 Nothing) (Viewport (V2 0 0) (V2 32 32)) defaultViewSettings [] [WorldLayerWith DepthEnabled references dynamic]]]
 
 -- | The same far from the view, where the chunk is culled.
 windowListingFar ∷ [ChunkRef] → Snapshot
 windowListingFar references =
-  Snapshot [Pass WindowTarget (ClearColour 0 0 0 1) [View (Camera (V2 90000 16) 1 Nothing) (Viewport (V2 0 0) (V2 32 32)) defaultViewSettings [WorldLayerWith DepthEnabled references []]]]
+  Snapshot [Pass WindowTarget (ClearColour 0 0 0 1) [View (Camera (V2 90000 16) 1 Nothing) (Viewport (V2 0 0) (V2 32 32)) defaultViewSettings [] [WorldLayerWith DepthEnabled references []]]]
 
 publishChunks ∷ Env → Int → Snapshot → IO (Either PublishRefusal Natural)
 publishChunks env = publish2DSnapshot (envAdapter env)
@@ -666,7 +661,7 @@ publishSpec = describe "publishing a snapshot that lists chunks" $ do
 
   it "refuses a chunk in a layer of another kind, naming the layer and the chunk, and publishes nothing" $
     withChunkEnv [1] $ \env _ reference → do
-      let ui = Snapshot [Pass WindowTarget (ClearColour 0 0 0 1) [View (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 32 32)) defaultViewSettings [UiLayerWith [reference] []]]]
+      let ui = Snapshot [Pass WindowTarget (ClearColour 0 0 0 1) [View (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 32 32)) defaultViewSettings [] [UiLayerWith [reference] []]]]
       publishChunks env 1 ui `shouldReturn'` Left (SnapshotInvalid (Validation.Refusal (AtChunk 0 0 0 0 reference) ChunkKindMismatch :| []))
       length <$> readTVarIO (fakePublished (envFake env)) >>= (`shouldBe` 0)
 
@@ -677,7 +672,7 @@ publishSpec = describe "publishing a snapshot that lists chunks" $ do
           reference ← chunkIn env art ChunkWorldDepth
           publish2DSnapshot (envAdapter env) 1 (windowListing [reference] []) >>= (`shouldBe` Left (WorldDepthRefused (AtLayer 0 0 0) session))
           -- Even where the view's viewport is empty and nothing could be drawn.
-          let empty = Snapshot [Pass WindowTarget (ClearColour 0 0 0 1) [View (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 0 0)) defaultViewSettings [WorldLayerWith DepthEnabled [reference] []]]]
+          let empty = Snapshot [Pass WindowTarget (ClearColour 0 0 0 1) [View (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 0 0)) defaultViewSettings [] [WorldLayerWith DepthEnabled [reference] []]]]
           publish2DSnapshot (envAdapter env) 1 empty >>= (`shouldBe` Left (WorldDepthRefused (AtLayer 0 0 0) session))
           length <$> readTVarIO (fakePublished (envFake env)) >>= (`shouldBe` 0)
       )

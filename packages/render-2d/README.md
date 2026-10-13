@@ -179,6 +179,8 @@ spacing of floats at its position resolves as empty. On input that validation
 would refuse, a parent that is not an earlier entry is ignored and a rectangle
 that is not finite, or has a negative extent, resolves as empty.
 
+A retained chunk has no clip table (R2D-12 defines clips for a view's dynamic instances only), so its instances select no clip: a chunk instance with a clip index is refused, as `ClipIndexUnknown`, when the chunk is built.
+
 The draw plan carries each view's resolved table (`plannedClips`). A clip index
 never changes the plan: it neither splits a run nor moves an instance in the
 drawing order, so instances of different clips share one draw, and an accepted

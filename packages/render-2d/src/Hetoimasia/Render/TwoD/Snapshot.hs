@@ -5,8 +5,8 @@
 --
 -- A snapshot is an ordered list of passes. A pass names its target, its clear
 -- and its ordered views; a view is a camera, a viewport within the target, its
--- per-view settings and its ordered layers; a layer declares its space, lists
--- the retained chunks it draws (R2D-10) and holds its dynamic instances in
+-- per-view settings, its clip table and its ordered layers; a layer declares its
+-- space, lists the retained chunks it draws (R2D-10) and holds its dynamic instances in
 -- submission order. The window's pass comes last. A view also holds, for each
 -- application material (R2D-11) its instances use, the material's records and
 -- the bytes of its push block. Nothing
@@ -22,8 +22,8 @@
 --
 -- __Dependencies.__ @base@, @containers@ for a view's materials,
 -- @hetoimasia-math@ for the camera's position and the instance's transform,
--- @hetoimasia-render-api@ for the texture handle, and this package's material,
--- settings, target and chunk-reference modules.
+-- @hetoimasia-render-api@ for the texture handle, and this package's clip,
+-- material, settings, target and chunk-reference modules.
 --
 -- __State.__ The module owns none.
 module Hetoimasia.Render.TwoD.Snapshot
@@ -34,7 +34,7 @@ module Hetoimasia.Render.TwoD.Snapshot
   , ClearColour (..)
 
     -- * Views
-  , View (ViewWith, View, viewCamera, viewViewport, viewSettings, viewMaterials, viewLayers)
+  , View (ViewWith, View, viewCamera, viewViewport, viewSettings, viewClips, viewMaterials, viewLayers)
   , Viewport (..)
   , Camera (..)
 
@@ -58,6 +58,7 @@ import Data.Word (Word16, Word32, Word8)
 import Hetoimasia.Math.Affine2 (Affine2)
 import Hetoimasia.Math.Vector (V2)
 import Hetoimasia.Render.Api.Texture (TextureHandle)
+import Hetoimasia.Render.TwoD.Clip (ClipEntry)
 import Hetoimasia.Render.TwoD.Internal.ChunkRef (ChunkRef)
 import Hetoimasia.Render.TwoD.Internal.Material (MaterialData, MaterialRef)
 import Hetoimasia.Render.TwoD.Settings (ViewSettings)
@@ -90,8 +91,14 @@ data Target
 data ClearColour = ClearColour !Float !Float !Float !Float
   deriving stock (Eq, Show)
 
--- | A camera, the part of the target it draws to, its settings, the data it
--- holds for the application materials its instances use, and its layers.
+-- | A camera, the part of the target it draws to, its settings, its clip table,
+-- the data it holds for the application materials its instances use, and its
+-- layers.
+--
+-- The clip table is ordered: entry @i@ is the one an instance with clip index
+-- @i + 1@ selects, and a layer's instances can reference only their own view's
+-- table ("Hetoimasia.Render.TwoD.Clip"). An empty table is a view whose
+-- instances all have clip index 0.
 --
 -- 'viewMaterials' holds, for each application material (R2D-11), its records,
 -- which the parameter words of the view's instances index, and the bytes of its
@@ -103,16 +110,17 @@ data View = ViewWith
   { viewCamera ∷ !Camera
   , viewViewport ∷ !Viewport
   , viewSettings ∷ !ViewSettings
+  , viewClips ∷ [ClipEntry]
   , viewMaterials ∷ !(Map MaterialRef MaterialData)
   , viewLayers ∷ [Layer]
   }
   deriving stock (Eq, Show)
 
 -- | A view holding no data for any material.
-pattern View ∷ Camera → Viewport → ViewSettings → [Layer] → View
-pattern View camera viewport settings layers ← ViewWith camera viewport settings (Map.null → True) layers
+pattern View ∷ Camera → Viewport → ViewSettings → [ClipEntry] → [Layer] → View
+pattern View camera viewport settings clips layers ← ViewWith camera viewport settings clips (Map.null → True) layers
   where
-    View camera viewport settings layers = ViewWith camera viewport settings Map.empty layers
+    View camera viewport settings clips layers = ViewWith camera viewport settings clips Map.empty layers
 
 -- | A rectangle within the target: its upper-left corner and its extent, both
 -- finite and the extent not negative. A zero extent is accepted and draws
@@ -195,8 +203,8 @@ data Instance = Instance
   -- ^ The translucent override.
   , instanceAdditive ∷ !Bool
   , instanceClip ∷ !Word16
-  -- ^ A clip index, 0 meaning none. A non-zero index is refused until clip
-  -- tables exist.
+  -- ^ A clip index, 0 meaning none. A non-zero index @k@ selects entry @k − 1@
+  -- of the view's clip table, and must lie within it.
   , instanceParameter ∷ !Word32
   -- ^ The material parameter word, encoded at byte offset 60. It indexes the
   -- records the view (or the chunk) holds for the instance's material, and

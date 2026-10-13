@@ -34,8 +34,7 @@
 -- * It checks both stages of both variants against interface descriptions it
 --   generates from the declaration (GRS-16, D-19): the push-constant block's
 --   members, the vertex input, and the descriptor bindings the shader reads,
---   which are the texture table's and, for a material that has records, the
---   storage table's. A shader that declares more, or less, or differently than
+--   which are the texture table's and the storage region's. A shader that declares more, or less, or differently than
 --   the declaration fails the build, naming the stage, the splice's position and
 --   every mismatch. So does GLSL that does not compile.
 -- * It refuses a declaration that is itself wrong: a push block beyond
@@ -131,5 +130,5 @@ defineMaterial declaration = case declarationProblems declaration of
     RecordLayout handles wordCount = declaredRecord declaration
     variant tailSource = do
       vertex ← checkedVertexShader (materialVertexInterface laid) (materialVertexSource laid)
-      fragment ← checkedFragmentShader (materialFragmentInterface (declaredRecord declaration) laid) (materialFragmentSource declaration laid tailSource)
+      fragment ← checkedFragmentShader (materialFragmentInterface laid) (materialFragmentSource declaration laid tailSource)
       [|CheckedShaders $(pure vertex) $(pure fragment)|]

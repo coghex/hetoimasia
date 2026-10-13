@@ -121,7 +121,6 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , constructTablePipelineLayoutWith
   , TableLayoutOptions (..)
   , TableUse (..)
-  , constructShaderSampledTablePipelineLayout
   , constructTextureTable
   , handOverVulkanTarget
   , publishVulkanWindowScene

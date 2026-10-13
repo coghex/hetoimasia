@@ -285,7 +285,7 @@ runSpec = describe "runs" $ do
   it "hold nothing in a zero-size viewport, whatever the layers hold" $
     sequence_
       [ do
-          let view = View plainCamera viewport defaultViewSettings [depthLayer [cutoutAt 1, translucentAt 2], UiLayer [plainInstance]]
+          let view = View plainCamera viewport defaultViewSettings [] [depthLayer [cutoutAt 1, translucentAt 2], UiLayer [plainInstance]]
               plan = plannedWith marked (snapshotWithView view)
               layers = [planned | pass ← planPasses plan, planView ← plannedViews pass, planned ← plannedLayers planView]
           length layers `shouldBe` 2
@@ -333,9 +333,9 @@ structureSpec = describe "structure" $ do
         cameraB = Camera (V2 (-3) 4) 0.5 (Just 0.25)
         viewportA = Viewport (V2 0 0) (V2 320 240)
         viewportB = Viewport (V2 320 0) (V2 320 240)
-        viewA = View cameraA viewportA defaultViewSettings [depthLayer [cutoutAt 2, translucentAt 1], UiLayer [cutoutAt 3, cutoutAt 1]]
-        viewB = View cameraB viewportB defaultViewSettings [WorldLayer DepthDisabled [cutoutAt 5], depthLayer []]
-        viewC = View cameraA viewportB defaultViewSettings []
+        viewA = View cameraA viewportA defaultViewSettings [] [depthLayer [cutoutAt 2, translucentAt 1], UiLayer [cutoutAt 3, cutoutAt 1]]
+        viewB = View cameraB viewportB defaultViewSettings [] [WorldLayer DepthDisabled [cutoutAt 5], depthLayer []]
+        viewC = View cameraA viewportB defaultViewSettings [] []
         clearA = ClearColour 0.1 0.2 0.3 1
         clearB = ClearColour 0 0 0 0
         snapshot =
@@ -650,4 +650,4 @@ routedSnapshotGen = do
     view = do
       extent ← frequency [(4, pure (V2 640 480)), (1, pure (V2 0 0)), (1, pure (V2 0 50)), (1, pure (V2 50 0))]
       layers ← resize 3 (listOf routedLayerGen)
-      pure (View plainCamera (Viewport (V2 0 0) extent) defaultViewSettings layers)
+      pure (View plainCamera (Viewport (V2 0 0) extent) defaultViewSettings [] layers)

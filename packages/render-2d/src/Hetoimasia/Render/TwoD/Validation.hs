@@ -10,7 +10,24 @@
 --
 -- __Refusals.__ See 'Reason' for each, and 'Location' for where it is named.
 -- Everything is checked wherever it sits, so invalid data inside a zero-size
--- viewport is refused like any other. A zero-size viewport itself is accepted
+-- viewport, an unused clip entry or a view with no layers is refused like any
+-- other.
+--
+-- __Clip tables__ (R2D-12). A view's clip table is checked entry by entry, then
+-- the references to it. An entry's rectangle must be finite with an extent that
+-- is not negative ('ClipRectInvalid'); its parent, when it names one, must be an
+-- earlier entry of the same table, a zero-based index @p@ with @0 ≤ p < i@
+-- ('ClipParentInvalid'), so a chain only runs toward lower indices and cannot
+-- close on itself. Each of those is named by the entry, with its pass and view
+-- ('AtClipEntry'). An instance's clip index @k > 0@ must select an entry the
+-- table holds, @k ≤ n@ for a table of @n@ entries ('ClipIndexUnknown'), and is
+-- named by the instance. Finally the space each referencing layer is in, world
+-- or UI, is carried through the whole parent chain of the entry it selects: an
+-- entry reached from both spaces, directly or through different descendants, is
+-- refused ('ClipSpaceMixed', named by the entry), since nesting would intersect
+-- coordinates of different units. An entry reached from one space only, or from
+-- none, is accepted. Within a view the refusals come in this order: its own
+-- parts, the table's entries, its layers' instances, then the mixed spaces. A zero-size viewport itself is accepted
 -- and draws nothing, and a snapshot holding only offscreen passes is valid,
 -- for window-free rendering and evidence. That a snapshot published to a
 -- window holds a window pass is a publication rule, not a validation one.
@@ -29,7 +46,10 @@
 -- names the layer and the chunk. The valid snapshot keeps what each listing
 -- resolved to, so planning, encoding and the oracle need no lookup of their own
 -- and the snapshot means the same thing wherever it is read. 'validateSnapshot'
--- validates against no chunks, so it refuses any layer that lists one.
+-- validates against no chunks, so it refuses any layer that lists one. A chunk
+-- has no clip table (R2D-12 leaves retained content's to a later slice), so its
+-- instances must select no clip: a chunk instance with a clip index is refused,
+-- as 'ClipIndexUnknown', when the chunk is built.
 --
 -- __Materials__ (R2D-11). A view holds, for each application material, its records
 -- and the bytes of its push block ('viewMaterials'). A record whose handles and
@@ -46,9 +66,9 @@
 -- inside a zero-size viewport too. A chunk's own records are checked when the
 -- chunk is built ("Hetoimasia.Render.TwoD.Chunk").
 --
--- __Dependencies.__ @base@, @containers@ for the set of chunks, @hetoimasia-math@
--- for the affine type, and this package's snapshot, chunk, material and settings
--- modules.
+-- __Dependencies.__ @base@, @containers@ for the set of chunks and the clip
+-- table's reach, @hetoimasia-math@ for the affine type, and this package's clip,
+-- snapshot, chunk, material and settings modules.
 --
 -- __State.__ The module owns none.
 module Hetoimasia.Render.TwoD.Validation
@@ -82,6 +102,7 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 import Hetoimasia.Math.Affine2 (toColumnMajor)
 import Hetoimasia.Math.Vector (V2 (..))
+import Hetoimasia.Render.TwoD.Clip (ClipEntry (..), ClipRect (..), clipEntryOfIndex)
 import Hetoimasia.Render.TwoD.Internal.Check (allFinite, finite, positiveFinite, withinClosed)
 import Hetoimasia.Render.TwoD.Internal.Chunk (Chunk (..), ChunkKind, Chunks (..), layerChunkKind)
 import Hetoimasia.Render.TwoD.Internal.ChunkRef (ChunkRef)
@@ -102,7 +123,7 @@ import Hetoimasia.Render.TwoD.Snapshot
   ( Camera (..)
   , ClearColour (..)
   , Instance (..)
-  , Layer
+  , Layer (..)
   , Pass (..)
   , Snapshot (..)
   , Target (..)
@@ -120,6 +141,8 @@ data Location
     AtPass !Int
   | -- | The view at this index of the pass at this index.
     AtView !Int !Int
+  | -- | The clip table's entry: pass, view, entry.
+    AtClipEntry !Int !Int !Int
   | -- | The layer: pass, view, layer.
     AtLayer !Int !Int !Int
   | -- | The instance: pass, view, layer, instance.
@@ -172,8 +195,17 @@ data Reason
     UvNotFinite
   | -- | A depth key of 2²⁴ or more.
     DepthKeyTooLarge
-  | -- | A non-zero clip index, refused until clip tables exist.
-    ClipIndexNotZero
+  | -- | A clip index beyond the view's table: an instance with index @k@ in a
+    -- view whose table holds fewer than @k@ entries. A retained chunk has no
+    -- table, so any clip index of a chunk's instance is one.
+    ClipIndexUnknown
+  | -- | A clip entry whose parent is not an earlier entry of its table.
+    ClipParentInvalid
+  | -- | A clip rectangle with a NaN or infinite coordinate, or a negative extent.
+    ClipRectInvalid
+  | -- | A clip entry referenced, directly or through a descendant, from both a
+    -- world layer and a UI layer.
+    ClipSpaceMixed
   | -- | A chunk the chunks validated against do not hold: never issued, stale
     -- (another generation), or released.
     ChunkUnresolved
@@ -289,10 +321,12 @@ viewRefusals ∷ Map.Map ChunkRef Chunk → Int → Int → View → [Refusal]
 viewRefusals held passIndex viewIndex view =
   viewOwnRefusals (Refusal (AtView passIndex viewIndex)) view
     <> materialRefusals held passIndex viewIndex view
+    <> clipEntryRefusals passIndex viewIndex (viewClips view)
     <> concat
-      [ layerRefusals held (viewMaterials view) passIndex viewIndex layerIndex layer
+      [ layerRefusals held (viewMaterials view) passIndex viewIndex (length (viewClips view)) layerIndex layer
       | (layerIndex, layer) ← zip [0 ..] (viewLayers view)
       ]
+    <> mixedSpaceRefusals passIndex viewIndex view
 
 -- | What a view holds for its materials, checked against the facts of each
 -- material's reference: each record's layout, each push block's size, and the
@@ -349,16 +383,61 @@ viewOwnRefusals at view =
       [at ViewportNotFinite | not (allFinite [ox, oy, width, height])]
         <> [at ViewportExtentNegative | width < 0 || height < 0]
 
+-- | The refusals of a view's clip table, entry by entry: the rectangle, then the
+-- parent.
+clipEntryRefusals ∷ Int → Int → [ClipEntry] → [Refusal]
+clipEntryRefusals passIndex viewIndex entries =
+  concat
+    [ [at ClipRectInvalid | not (validClipRect (clipRect entry))]
+        <> [at ClipParentInvalid | Just parent ← [clipParent entry], parent < 0 || parent >= index]
+    | (index, entry) ← zip [0 ..] entries
+    , let at = Refusal (AtClipEntry passIndex viewIndex index)
+    ]
+
+-- | A finite rectangle whose extent is not negative.
+validClipRect ∷ ClipRect → Bool
+validClipRect (ClipRect (V2 x y) (V2 width height)) =
+  allFinite [x, y, width, height] && width >= 0 && height >= 0
+
+-- | The entries reached from both spaces, in table order. A layer's space is
+-- carried through the parent chain of every entry its instances select, up to
+-- the first parent that is not an earlier entry (which 'ClipParentInvalid'
+-- refuses on its own); an index beyond the table reaches nothing
+-- ('ClipIndexUnknown' refuses it).
+mixedSpaceRefusals ∷ Int → Int → View → [Refusal]
+mixedSpaceRefusals passIndex viewIndex view =
+  [ Refusal (AtClipEntry passIndex viewIndex entry) ClipSpaceMixed
+  | (entry, (True, True)) ← Map.toAscList reached
+  ]
+  where
+    entries = viewClips view
+    count = length entries
+    parents = Map.fromList [(index, parent) | (index, ClipEntry {clipParent = Just parent}) ← zip [0 ..] entries, parent >= 0, parent < index]
+    chain entry = entry : maybe [] chain (Map.lookup entry parents)
+    reached =
+      Map.fromListWith
+        (\(world, ui) (world', ui') → (world || world', ui || ui'))
+        [ (entry, (isWorld, not isWorld))
+        | layer ← viewLayers view
+        , let isWorld = case layer of
+                WorldLayerWith _ _ _ → True
+                UiLayerWith _ _ → False
+        , candidate ← layerInstances layer
+        , Just start ← [clipEntryOfIndex (instanceClip candidate)]
+        , start < count
+        , entry ← chain start
+        ]
+
 -- | The chunks a layer lists come first, in the order it lists them, then its
--- dynamic instances.
-layerRefusals ∷ Map.Map ChunkRef Chunk → Map.Map MaterialRef MaterialData → Int → Int → Int → Layer → [Refusal]
-layerRefusals held materials passIndex viewIndex layerIndex layer =
+-- dynamic instances, whose clip indices are checked against the view's table.
+layerRefusals ∷ Map.Map ChunkRef Chunk → Map.Map MaterialRef MaterialData → Int → Int → Int → Int → Layer → [Refusal]
+layerRefusals held materials passIndex viewIndex tableSize layerIndex layer =
   concat
     [ chunkRefusals (AtChunk passIndex viewIndex layerIndex position reference) (layerChunkKind layer) (Map.lookup reference held)
     | (position, reference) ← zip [0 ..] (layerChunks layer)
     ]
     <> concat
-      [ instanceRefusals (AtInstance passIndex viewIndex layerIndex index) candidate
+      [ instanceRefusals tableSize (AtInstance passIndex viewIndex layerIndex index) candidate
         <> [Refusal (AtInstance passIndex viewIndex layerIndex index) ParameterBeyondRecords | parameterBeyond materials candidate]
       | (index, candidate) ← zip [0 ..] (layerInstances layer)
       ]
@@ -377,17 +456,19 @@ chunkRefusals location expected = \case
   Nothing → [Refusal location ChunkUnresolved]
   Just built → [Refusal location ChunkKindMismatch | chunkKindField built /= expected]
 
-instanceRefusals ∷ Location → Instance → [Refusal]
-instanceRefusals location = map (Refusal location) . instanceReasons
+instanceRefusals ∷ Int → Location → Instance → [Refusal]
+instanceRefusals tableSize location = map (Refusal location) . instanceReasons tableSize
 
 -- | The reasons an instance is refused, in the order validation reports them:
--- empty exactly when every one of its values is acceptable. A retained chunk
--- validates its instances with the same function when it is built.
-instanceReasons ∷ Instance → [Reason]
-instanceReasons candidate =
+-- empty exactly when every one of its values is acceptable, a clip index being
+-- acceptable when it is 0 or selects an entry of a table of this many entries.
+-- A retained chunk validates its instances with the same function when it is
+-- built, against no table.
+instanceReasons ∷ Int → Instance → [Reason]
+instanceReasons tableSize candidate =
   [TransformNotFinite | not (allFinite (toColumnMajor (instanceTransform candidate)))]
     <> [UvNotFinite | not (allFinite [u0, v0, u1, v1])]
     <> [DepthKeyTooLarge | instanceDepthKey candidate >= depthKeyLimit]
-    <> [ClipIndexNotZero | instanceClip candidate /= 0]
+    <> [ClipIndexUnknown | Just entry ← [clipEntryOfIndex (instanceClip candidate)], entry >= tableSize]
   where
     UvRect u0 v0 u1 v1 = instanceUv candidate

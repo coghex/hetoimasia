@@ -192,7 +192,7 @@ buildChunkWith marks kind request records instances =
     count = length instances
     held = listArray (0, count - 1) instances
     numbered = zip [0 ..] instances
-    instanceRefusals = [ChunkInstanceInvalid position reason | (position, candidate) ← numbered, reason ← instanceReasons candidate]
+    instanceRefusals = [ChunkInstanceInvalid position reason | (position, candidate) ← numbered, reason ← instanceReasons 0 candidate]
     recordRefusals =
       [ ChunkRecordMismatch material index
       | (material, listed) ← Map.toList records

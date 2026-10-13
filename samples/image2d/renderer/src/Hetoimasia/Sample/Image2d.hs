@@ -88,8 +88,8 @@ configuration ∷ Render.Configuration
 configuration =
   Render.Configuration
     { Render.configurationRing = either (error . show) id (validateRingSize (1024 * 1024))
+    , Render.configurationRegionWindow = either (error . show) id (validateStorageWindow (16 * 1024))
     , Render.configurationTable = either (error . show) id (validateTableConfig 16 8 4)
-    , Render.configurationRecordWindow = either (error . show) id (validateStorageWindow 4096)
     }
 
 -- | What 'prepare' made.

@@ -19,6 +19,17 @@
 -- rounds, and texture coordinates interpolate affinely from @(u0, v0)@ at
 -- local (0, 0) to @(u1, v1)@ at local (1, 1).
 --
+-- __Clips__ (design D-11, R2D-12). An instance whose clip index selects an
+-- entry of its view's clip table, resolved as 'resolveClips' resolves it, draws
+-- only where the fragment's pixel centre, carried back to the layer's space by
+-- the exact inverse of the transform the layer draws with, lies in the
+-- half-open resolved rectangle; a centre outside it receives nothing from that
+-- instance, colour or depth. The layer's transform is the view's own, with its
+-- snapped translation, and no sprite's origin snap is undone or applied to the
+-- clip. A centre within 1/16 pixel, measured in target pixels against the
+-- clip's boundary after transformation, of an instance that could draw there is
+-- 'NearClipEdge'. Clip index 0 means none.
+--
 -- __Exactness.__ Placement, coverage and texel addressing are computed in
 -- 'Rational's from the snapshot's 32-bit coefficients. Colour is computed in
 -- double precision with every store rounded to 8 bits.
@@ -99,9 +110,10 @@ import Hetoimasia.Render.TwoD.Chunk (Chunk, ChunkRef, chunkCutoutPositions, chun
 import Hetoimasia.Render.TwoD.Material (MaterialData (..), MaterialRecord (..), MaterialRef, defaultMaterial)
 import Hetoimasia.Render.TwoD.Culling (chunkCulled)
 import Hetoimasia.Asset.Image (DecodedImage (..))
-import Hetoimasia.Math.Affine2 (columns)
+import Hetoimasia.Math.Affine2 (columns, identity)
 import Hetoimasia.Math.Vector (V2 (..))
 import Hetoimasia.Render.Api.Texture (TextureHandle)
+import Hetoimasia.Render.TwoD.Clip (ResolvedClip (..), clipEntryOfIndex, clipIsEmpty)
 import Hetoimasia.Render.TwoD.DrawPlan
   ( CutoutMarks
   , DrawPath (..)
@@ -150,8 +162,10 @@ import Hetoimasia.Render.TwoD.Oracle.Material
   , ModelFault (..)
   )
 import Hetoimasia.Render.TwoD.Oracle.Internal.Geometry
-  ( Coverage (..)
+  ( ClipStanding (..)
+  , Coverage (..)
   , Placement
+  , clipStanding
   , coverage
   , instanceIsSingular
   , inverseLinear
@@ -263,6 +277,9 @@ data Indeterminate
   | -- | A nearest-filtered coordinate within 1/16 texel of an interior boundary
     -- between texels that differ.
     NearTexelBoundary !Location
+  | -- | The probe's centre is within 1/16 pixel of the boundary of the clip
+    -- rectangle of an instance that could draw there.
+    NearClipEdge !Location
   | -- | A channel whose stored byte cannot be bounded to within one step: the
     -- stores' rounding, where a value is a tie or within a 1024th of a byte of
     -- one, leaves more than three bytes it could hold after the last draw.
@@ -320,6 +337,8 @@ data OracleView = OracleView
   , ovViewport ∷ !Viewport
   , ovSettings ∷ !ViewSettings
   , ovMapping ∷ Maybe ViewMapping
+  , ovClips ∷ [ResolvedClip]
+  -- ^ The view's clip table, resolved: entry @k − 1@ is what clip index @k@ selects.
   , ovLayers ∷ [OracleLayer]
   }
 
@@ -402,6 +421,7 @@ buildView chunksOf passIndex viewIndex resolved view planned =
     , ovViewport = viewViewport view
     , ovSettings = viewSettings view
     , ovMapping = either (const Nothing) (\spec → viewMapping (specMetrics spec) view) resolved
+    , ovClips = plannedClips planned
     , ovLayers =
         [ buildLayer passIndex viewIndex layerIndex (viewMaterials view) layer (Map.findWithDefault [] (passIndex, viewIndex, layerIndex) chunksOf) plannedLayer
         | (layerIndex, layer, plannedLayer) ← zip3 [0 ..] (viewLayers view) (plannedLayers planned)
@@ -587,13 +607,33 @@ instanceFragment oracle spec x y view mapping space (Drawn location instanceValu
       Nothing → Just (Bad (PlacementNotRepresentable location))
       Just placed
         | isDegenerate placed || not (representable placed) → Just (Bad (PlacementNotRepresentable location))
-        | otherwise → case coverage placed centre of
-            Outside → Nothing
-            NearEdge → Just (Unsure (NearQuadEdge location))
-            Inside local
-              | onCutoutPath → Just (cutoutSampled oracle spec view given instanceValue location placed local)
-              | otherwise → Just (sampled oracle spec view given instanceValue location placed local)
+        | otherwise → case clipStandingOf of
+            -- Outside its clip an instance gives nothing, whatever its quad does.
+            Just ClipOutside → Nothing
+            standing → case coverage placed centre of
+              Outside → Nothing
+              NearEdge → Just (Unsure (NearQuadEdge location))
+              Inside local
+                | standing == Just ClipNearEdge → Just (Unsure (NearClipEdge location))
+                | onCutoutPath → Just (cutoutSampled oracle spec view given instanceValue location placed local)
+                | otherwise → Just (sampled oracle spec view given instanceValue location placed local)
   where
+    -- How the pixel centre stands to the instance's clip, if it has one: the
+    -- selected entry's resolved rectangle, an empty one holding no point and
+    -- having no edge.
+    clipStandingOf = case clipEntryOfIndex (instanceClip instanceValue) of
+      Nothing → Nothing
+      Just entryIndex → case drop entryIndex (ovClips view) of
+        clip : _
+          | clipIsEmpty clip → Just ClipOutside
+          | otherwise →
+              let r = toRational
+                  layerPlacement = place layerTransform identity Nothing
+               in if isDegenerate layerPlacement
+                    then Just ClipOutside
+                    else Just (clipStanding layerPlacement (r (resolvedLeft clip), r (resolvedTop clip), r (resolvedRight clip), r (resolvedBottom clip)) centre)
+        -- A validated snapshot selects an entry its table holds.
+        [] → Just ClipOutside
     transform = instanceTransform instanceValue
     onCutoutPath = path == Cutout
     centre = (fromIntegral x + 1 / 2, fromIntegral y + 1 / 2)

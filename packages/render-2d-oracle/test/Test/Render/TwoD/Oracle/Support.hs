@@ -25,6 +25,7 @@ module Test.Render.TwoD.Oracle.Support
   , defaultCamera
   , fullViewport
   , mkView
+  , mkClipView
   , fullView
   , offscreenPass
   , noClear
@@ -53,6 +54,7 @@ import Hetoimasia.Math.Affine2 (fromColumns)
 import Hetoimasia.Math.Vector (V2 (..))
 import Hetoimasia.Render.Api.Texture (TextureHandle)
 import Hetoimasia.Render.Api.Texture.Backend (textureHandle)
+import Hetoimasia.Render.TwoD.Clip (ClipEntry)
 import Hetoimasia.Render.TwoD.DrawPlan (CutoutMarks, noCutoutMarks)
 import Hetoimasia.Render.TwoD.Material (defaultMaterial)
 import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), offscreenMetrics)
@@ -135,14 +137,18 @@ defaultCamera = Camera (V2 0 0) 1 Nothing
 fullViewport ∷ Float → Float → Viewport
 fullViewport w h = Viewport (V2 0 0) (V2 w h)
 
--- | A view of a camera, a viewport, settings and layers.
+-- | A view of a camera, a viewport, settings and layers, with no clip table.
 mkView ∷ Camera → Viewport → ViewSettings → [Layer] → View
-mkView = View
+mkView camera viewport settings = View camera viewport settings []
+
+-- | A view of a camera, a viewport, settings, a clip table and layers.
+mkClipView ∷ Camera → Viewport → ViewSettings → [ClipEntry] → [Layer] → View
+mkClipView = View
 
 -- | The default camera and settings over a viewport covering a target of this
 -- extent.
 fullView ∷ Float → Float → [Layer] → View
-fullView w h = View defaultCamera (fullViewport w h) defaultViewSettings
+fullView w h = View defaultCamera (fullViewport w h) defaultViewSettings []
 
 -- | A pass into the fixtures' offscreen target.
 offscreenPass ∷ ClearColour → [View] → Pass

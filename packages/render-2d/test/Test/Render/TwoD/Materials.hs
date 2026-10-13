@@ -327,7 +327,7 @@ viewSpec = describe "the material data a view holds" $ do
   it "keeps the view a plain value: the constructor without data builds one with none" $ do
     viewMaterials (plainView []) `shouldBe` Map.empty
     case plainView [UiLayer []] of
-      View _ _ _ layers → length layers `shouldBe` 1
+      View _ _ _ _ layers → length layers `shouldBe` 1
       ViewWith {} → expectationFailure "the view holds data for a material, though it was built with none"
     case viewHolding [(mixMaterial, noMaterialData)] [] of
       View {} → expectationFailure "a view holding data for a material matches the pattern for one that holds none"

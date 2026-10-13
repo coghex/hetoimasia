@@ -238,13 +238,12 @@ materialVertexSource ∷ Laid → String
 materialVertexSource = vertexSource . appMembers
 
 -- | The fragment stage of one variant of a material: the table's bindings, the
--- storage table's when the material has records, the push block, what both
+-- storage region, the push block, what both
 -- variants share, the record and its loader, the application's function, the
 -- instance's material at its fragment, and the variant's tail.
 materialFragmentSource ∷ MaterialDeclaration → Laid → String → String
 materialFragmentSource declaration laid tailSource =
   fragmentHead
-    <> recordBinding
     <> pushBlockSource (appMembers laid)
     <> fragmentCommon
     <> recordSupport (declaredRecord declaration)
@@ -253,13 +252,6 @@ materialFragmentSource declaration laid tailSource =
     <> "\n"
     <> sampleApplicationMaterial
     <> tailSource
-  where
-    recordBinding
-      | recordIsEmpty (declaredRecord declaration) = ""
-      | otherwise = "\nlayout(set = 2, binding = 0, std430) readonly buffer Records {\n    uint words[];\n} records;\n"
-
-recordIsEmpty ∷ RecordLayout → Bool
-recordIsEmpty (RecordLayout handles wordCount) = handles == 0 && wordCount == 0
 
 -- | The record struct and the function that loads a record of the layout.
 recordSupport ∷ RecordLayout → String
@@ -287,10 +279,10 @@ recordSupport (RecordLayout handles wordCount) =
       | stride == 0 = []
       | otherwise =
           ["    uint base = pushed.recordBase + index * " <> show stride <> "u;"]
-            <> [ "    record.handles[" <> show k <> "] = uvec2(records.words[base + " <> show (2 * k) <> "u], records.words[base + " <> show (2 * k + 1) <> "u]);"
+            <> [ "    record.handles[" <> show k <> "] = uvec2(region.words[base + " <> show (2 * k) <> "u], region.words[base + " <> show (2 * k + 1) <> "u]);"
                | k ← [0 .. handles - 1]
                ]
-            <> ["    record.words[" <> show k <> "] = records.words[base + " <> show (2 * handles + k) <> "u];" | k ← [0 .. wordCount - 1]]
+            <> ["    record.words[" <> show k <> "] = region.words[base + " <> show (2 * handles + k) <> "u];" | k ← [0 .. wordCount - 1]]
 
 -- | The instance's material at its fragment: its function applied to the sampled
 -- texel, the coordinates, the parameter word and the record the word indexes.
@@ -322,11 +314,11 @@ materialVertexInterface laid =
     , interfaceVertexInput = instanceVertexInput
     }
 
--- | The fragment stage's description: the push block, the texture table, and the
--- storage table when the material has records.
-materialFragmentInterface ∷ RecordLayout → Laid → ShaderInterface
-materialFragmentInterface layout laid =
+-- | The fragment stage's description: the push block, the texture table and the
+-- storage region.
+materialFragmentInterface ∷ Laid → ShaderInterface
+materialFragmentInterface laid =
   (interfaceFor FragmentInterface)
     { interfacePushConstants = declaredPushMembers laid
-    , interfaceDescriptors = textureTableDescriptors <> (if recordIsEmpty layout then [] else storageTableDescriptors)
+    , interfaceDescriptors = textureTableDescriptors <> storageTableDescriptors
     }

@@ -133,8 +133,8 @@ withEnvOffering offered windows action = do
       rig
       Render.Configuration
         { Render.configurationRing = either (error . show) id (validateRingSize (64 * 1024))
+        , Render.configurationRegionWindow = either (error . show) id (validateStorageWindow 4096)
         , Render.configurationTable = either (error . show) id (validateTableConfig 16 8 4)
-        , Render.configurationRecordWindow = either (error . show) id (validateStorageWindow 4096)
         }
   resetJournal rig
   textures ← newTextures
@@ -160,7 +160,7 @@ registered env shade binary policy = do
 -- | A window snapshot of one UI layer naming these textures.
 windowSnapshot ∷ [Api.TextureHandle] → Snapshot
 windowSnapshot handles =
-  Snapshot [Pass WindowTarget (ClearColour 0 0 0 1) [View (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 16 16)) defaultViewSettings [UiLayer (map sprite handles)]]]
+  Snapshot [Pass WindowTarget (ClearColour 0 0 0 1) [View (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 16 16)) defaultViewSettings [] [UiLayer (map sprite handles)]]]
 
 sprite ∷ Api.TextureHandle → Instance
 sprite handle =
