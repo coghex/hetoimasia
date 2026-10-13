@@ -50,8 +50,9 @@ mixMaterial =
          }
    )
 
--- | The same function declared not cutout-capable: it has no cutout variant and
--- routes to the ordered path whatever its texture says.
+-- | The same function declared not cutout-capable (the weight's sum is written
+-- the other way round, which gives the same value and its own SPIR-V): it has no
+-- cutout variant and routes to the ordered path whatever its texture says.
 translucentMixMaterial ∷ DefinedMaterial
 translucentMixMaterial =
   $( defineMaterial
@@ -63,7 +64,7 @@ translucentMixMaterial =
              unlines
                [ "vec4 material(vec4 texel, vec2 uv, uint parameter, MaterialRecord record) {"
                , "    vec4 second = sampleTexture(record.handles[0], uv);"
-               , "    float weight = clamp(pushed.strength * (float(record.words[0]) / 255.0) + pushed.bias, 0.0, 1.0);"
+               , "    float weight = clamp(pushed.bias + pushed.strength * (float(record.words[0]) / 255.0), 0.0, 1.0);"
                , "    return vec4(mix(texel.rgb, second.rgb * texel.a, weight), texel.a);"
                , "}"
                ]

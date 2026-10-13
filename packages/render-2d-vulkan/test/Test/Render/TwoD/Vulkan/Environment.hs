@@ -78,6 +78,7 @@ data Env = Env
   , envRetained ∷ !Retained
   , envAdapter ∷ !(Adapter Int)
   , envFake ∷ !Fake
+  , envRenderer ∷ !Render.Renderer
   }
 
 -- | A stand-in host that holds these windows.
@@ -140,7 +141,7 @@ withEnvOffering offered windows action = do
   retained ← newRetained
   (host, fake) ← newFake windows
   adapter ← newAdapter host textures retained renderer
-  action (Env rig textures retained adapter fake)
+  action (Env rig textures retained adapter fake renderer)
 
 -- | Four texels of this colour.
 bytesOf ∷ Word32 → ByteString
