@@ -26,6 +26,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Recording.Construction
   , createPipelineWith
   , createPipelineWithDepth
   , selectDepthFormat
+  , imageFormatOf
   , replacePipeline
   , replacePipelineWith
   , checkedRanges
@@ -305,6 +306,19 @@ createPipelineWithDepth recording layout shaders format input depth = buildPipel
 -- asked about each in turn and none is assumed; no format with a stencil
 -- aspect is ever offered. A device that supports none is
 -- 'RefusedImageUnsupported'.
+-- | The format a live image of this session was made with, which a caller's
+-- own account of it cannot be trusted to give (R2D-9): a released, replaced or
+-- foreign handle is the refusal 'liveNative' gives, and a handle that is not an
+-- image is 'RefusedWrongKind'. Like every construction it runs on the owner's
+-- thread and makes no native call.
+imageFormatOf ∷ Recording q inst msgr phys dev cmd → Image → IO (Either Refusal ImageFormat)
+imageFormatOf recording (Image resource) =
+  owned recording $
+    liveNative recording resource >>= \case
+      Right (NativeImage description _ _) → pure (Right (imageFormat description))
+      Right _ → pure (Left RefusedWrongKind)
+      Left refusal → pure (Left refusal)
+
 selectDepthFormat ∷ Recording q inst msgr phys dev cmd → IO (Either Refusal ImageFormat)
 selectDepthFormat recording = owned recording (choose depthFormatPreference)
   where

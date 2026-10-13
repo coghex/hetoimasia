@@ -114,6 +114,7 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
   , constructBlendedCheckedPipeline
   , constructDepthCheckedPipeline
   , constructDepthFormat
+  , constructImageFormat
   , replaceConstructedCheckedPipeline
   , constructBuffer
   , constructImage
@@ -336,6 +337,7 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , windowDepthOf
   , createBlendedCheckedPipeline
   , createDepthCheckedPipeline
+  , imageFormatOf
   , selectDepthFormat
   , ImageFormat
   , PipelineBlend
@@ -1839,3 +1841,9 @@ rotated cursor items = drop offset items <> take offset items
 
 tshow ∷ Show a ⇒ a → Text
 tshow = Text.pack . show
+
+-- | The format a live image of the session was made with, as the backend
+-- holds it (R2D-9): a caller's declaration of a depth image's format is checked
+-- against it before a snapshot is recorded.
+constructImageFormat ∷ Construction q inst msgr phys dev cmd → Image → IO (Either Refusal ImageFormat)
+constructImageFormat construction image = confined construction (imageFormatOf (constructionRecording construction) image)

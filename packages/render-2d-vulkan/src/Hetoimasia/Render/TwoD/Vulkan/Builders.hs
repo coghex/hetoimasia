@@ -13,8 +13,10 @@ module Hetoimasia.Render.TwoD.Vulkan.Builders
 import Data.Word (Word32)
 import Hetoimasia.GPU.Vulkan.Native.Recording
   ( Image
+  , ImageFormat
   , Pipeline
   , PipelineBlend
+  , PipelineDepth
   , PipelineLayout
   , Refusal
   , RingSize
@@ -33,7 +35,16 @@ data Builders q inst msgr phys dev cmd = Builders
     -- ^ A shader-sampled table pipeline layout: one that declares no sampler
     -- offset, over these shaders.
   , buildPipeline ∷ PipelineLayout → CheckedShaders → Word32 → PipelineBlend → IO (Either Refusal Pipeline)
-    -- ^ A pipeline over the layout for a colour format's @VkFormat@ code.
+    -- ^ A pipeline over the layout for a colour format's @VkFormat@ code, which
+    -- declares no depth.
+  , buildDepthPipeline ∷ PipelineLayout → CheckedShaders → Word32 → PipelineBlend → PipelineDepth → IO (Either Refusal Pipeline)
+    -- ^ The same, declaring the depth a pass with a depth attachment has
+    -- (R2D-9).
+  , buildDepthFormat ∷ IO (Either Refusal ImageFormat)
+    -- ^ The session's depth format: what the backend chooses for depth targets.
+  , buildImageFormat ∷ Image → IO (Either Refusal ImageFormat)
+    -- ^ The format the backend holds for a live image, which a depth image's
+    -- maker's declaration is checked against.
   , registerImage ∷ Image → IO (Either Refusal TextureHandle)
     -- ^ Register an uploaded texture with the table, answering the backend's
     -- handle for it.

@@ -79,6 +79,7 @@ module Test.GPU.Vulkan.Native.SurfaceFree
   , runScene3d
   , runDepthRect
   , runOrderedPath
+  , runCutoutDepth
   , surfaceFreeSection
   , laterWindowSection
   , framelessSection
@@ -94,6 +95,7 @@ module Test.GPU.Vulkan.Native.SurfaceFree
   , scene3dSection
   , depthRectSection
   , orderedPathSection
+  , cutoutDepthSection
   , surfaceFreeSpec
   , laterWindowSpec
   , framelessSpec
@@ -109,6 +111,7 @@ module Test.GPU.Vulkan.Native.SurfaceFree
   , scene3dSpec
   , depthRectSpec
   , orderedPathSpec
+  , cutoutDepthSpec
   ) where
 
 import Control.Concurrent (ThreadId, myThreadId, threadDelay)
@@ -122,7 +125,7 @@ import Data.List (elemIndex, nub)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as Text
-import Data.Maybe (fromMaybe, listToMaybe)
+import Data.Maybe (fromMaybe, isJust, listToMaybe)
 import Data.Time.Clock (UTCTime, addUTCTime, diffUTCTime, getCurrentTime)
 import Data.Time.Clock.POSIX (utcTimeToPOSIXSeconds)
 import System.Environment (lookupEnv)
@@ -293,6 +296,7 @@ import Hetoimasia.Runtime.GLFW
 import Hetoimasia.Runtime.Logging (withLoggingLifetime)
 import Hetoimasia.Runtime.Supervision (RuntimeControl)
 import Test.GPU.Vulkan.Native.Environment (validationFeatures)
+import qualified Test.GPU.Vulkan.Native.CutoutDepth as CutoutDepth
 import qualified Test.GPU.Vulkan.Native.OrderedPath as OrderedPath
 import Test.GPU.Vulkan.Native.Platform (requestingBackend)
 import Test.GPU.Vulkan.Native.Png (encodeRgba)
@@ -1833,26 +1837,56 @@ spritesBuilders construction =
 -- under the validation runner's evidence directory when it names one, and
 -- otherwise into a directory of their own that is kept and reported.
 runOrderedPath ∷ Maybe Backend → Journal → IO SurfaceFreeOutcome
-runOrderedPath backend journal = do
-  heading journal "R2D-7: a surface-free session records render-2d snapshots through the ordered path into offscreen targets, reads each back after completion and judges every pixel against the render-2d oracle, and writes a lossless PNG a target and a probe record"
-  directory ← orderedDirectory
-  note journal ("the ordered path's evidence is written into " <> Text.pack directory)
+runOrderedPath backend journal =
+  runEvidenceSuite
+    backend
+    journal
+    OrderedPath.orderedSuite
+    "R2D-7: a surface-free session records render-2d snapshots through the ordered path into offscreen targets, reads each back after completion and judges every pixel against the render-2d oracle, and writes a lossless PNG a target and a probe record"
+    "vulkan-native-r2d7-ordered-path"
+    "ordered-path"
+
+-- | The cutout path's case (R2D-9): the same recorder over the same kind of
+-- session, with a @D32_SFLOAT@ depth image for every target, seven fixtures
+-- judged against the oracle planned with the marks they name
+-- ("Test.GPU.Vulkan.Native.CutoutDepth"), and its files and probe record under
+-- the validation runner's evidence directory when it names one, and otherwise
+-- in a directory of their own that is kept and reported. Where the device
+-- chooses another depth format it renders nothing, reports the format, and
+-- checks the recorder's refusal on it.
+runCutoutDepth ∷ Maybe Backend → Journal → IO SurfaceFreeOutcome
+runCutoutDepth backend journal =
+  runEvidenceSuite
+    backend
+    journal
+    CutoutDepth.cutoutSuite
+    "R2D-9: a surface-free session records render-2d snapshots with cutout art depth-tested in world layers into offscreen targets that have a D32_SFLOAT depth image, reads each back after completion and judges every pixel against the render-2d oracle, and writes a lossless PNG a target and a probe record that names the depth format and every indeterminate reason"
+    "vulkan-native-r2d9-cutout-depth"
+    "cutout-depth"
+
+runEvidenceSuite ∷ Maybe Backend → Journal → OrderedPath.Suite → Text → Text → String → IO SurfaceFreeOutcome
+runEvidenceSuite backend journal suite headline caseName directoryName = do
+  heading journal headline
+  directory ← evidenceDirectory
+  note journal ("the " <> Text.pack directoryName <> " evidence is written into " <> Text.pack directory)
   runCaseWith
     (\config → config {vulkanUploads = Just uploadConfig})
     backend
     defaultBudgetRequest {requestedBytes = 2 * 1024 * 1024 * 1024}
     []
-    "vulkan-native-r2d7-ordered-path"
+    caseName
     $ \vulkan _ _ _ → do
-      outcome ← OrderedPath.runEvidence (orderedHost vulkan) directory
-      note journal ("ordered path probe record: " <> Text.pack (OrderedPath.evidenceRecord outcome))
-      mapM_ (\failure → note journal ("ordered path evidence failed: " <> failure)) (OrderedPath.evidenceFailure outcome)
+      outcome ← OrderedPath.runEvidence (orderedHost vulkan) suite directory
+      note journal (Text.pack directoryName <> " probe record: " <> Text.pack (OrderedPath.evidenceRecord outcome))
+      mapM_ (\depth → note journal (Text.pack directoryName <> " depth format: " <> tshow depth)) (OrderedPath.evidenceDepthFormat outcome)
+      mapM_ (\why → note journal (Text.pack directoryName <> " unavailable: " <> why)) (OrderedPath.evidenceUnavailable outcome)
+      mapM_ (\failure → note journal (Text.pack directoryName <> " evidence failed: " <> failure)) (OrderedPath.evidenceFailure outcome)
       mapM_
         ( \result → do
             let probes = OrderedPath.resultProbes result
                 determinate = length [() | probed ← probes, OrderedPath.isDeterminate probed]
             note journal
-              ( "ordered path fixture " <> OrderedPath.resultFixture result <> ": "
+              ( Text.pack directoryName <> " fixture " <> OrderedPath.resultFixture result <> ": "
                   <> tshow (length probes) <> " probes, " <> tshow determinate <> " determinate, "
                   <> tshow (length probes - determinate) <> " not counted; "
                   <> (if OrderedPath.fixturePassed result then "passed" else "FAILED" <> maybe "" (": " <>) (OrderedPath.resultFailure result))
@@ -1860,15 +1894,15 @@ runOrderedPath backend journal = do
         )
         (OrderedPath.evidenceFixtures outcome)
       roots ← atomically (readVulkanRoots (vulkanController vulkan))
-      pure (Seen [] ["ran the ordered path's evidence"] 0 (Just roots) Nothing [] [] Nothing Nothing Nothing Nothing Nothing Nothing (Just outcome))
+      pure (Seen [] ["ran the " <> Text.pack directoryName <> " evidence"] 0 (Just roots) Nothing [] [] Nothing Nothing Nothing Nothing Nothing Nothing (Just outcome))
   where
-    orderedDirectory =
+    evidenceDirectory =
       lookupEnv "HETOIMASIA_VALIDATION_EVIDENCE" >>= \case
-        Just evidence | not (null evidence) → pure (evidence </> "ordered-path")
+        Just evidence | not (null evidence) → pure (evidence </> directoryName)
         _ → do
           temporary ← getTemporaryDirectory
           stamp ← (round . (* 1000) . utcTimeToPOSIXSeconds ∷ UTCTime → Integer) <$> getCurrentTime
-          pure (temporary </> ("hetoimasia-ordered-path-" <> show stamp))
+          pure (temporary </> ("hetoimasia-" <> directoryName <> "-" <> show stamp))
 
 -- | The ordered path's evidence host over this suite's session: owner-thread
 -- actions over its constructions, uploads admitted from the main thread and
@@ -2721,15 +2755,25 @@ spritesSpec outcome = describe "GRS-8 the sprites sample's window-free evidence"
     on outcome clean
 
 orderedPathSection ∷ SurfaceFreeOutcome → [Text]
-orderedPathSection outcome =
-  section "A surface-free session recording the ordered path's evidence fixtures" outcome
+orderedPathSection = evidenceSection "A surface-free session recording the ordered path's evidence fixtures" "ordered path"
+
+cutoutDepthSection ∷ SurfaceFreeOutcome → [Text]
+cutoutDepthSection = evidenceSection "A surface-free session recording the cutout path's evidence fixtures over a D32_SFLOAT depth image" "cutout depth"
+
+-- | The report of an evidence case: its probe record, the depth format, why it
+-- rendered nothing if it did not, and each fixture with its named behaviours.
+evidenceSection ∷ Text → Text → SurfaceFreeOutcome → [Text]
+evidenceSection title label outcome =
+  section title outcome
     <> case outcome of
       SurfaceFreeRecorded facts → case factsOrdered facts of
-        Nothing → ["- no ordered path evidence"]
+        Nothing → ["- no " <> label <> " evidence"]
         Just evidence →
           [ "- probe record: " <> Text.pack (OrderedPath.evidenceRecord evidence)
           , "- failure: " <> fromMaybe "none" (OrderedPath.evidenceFailure evidence)
           ]
+            <> [ "- depth format: " <> tshow depth | depth ← maybe [] pure (OrderedPath.evidenceDepthFormat evidence)]
+            <> [ "- unavailable: " <> why | why ← maybe [] pure (OrderedPath.evidenceUnavailable evidence)]
             <> concat
               [ [ "- " <> OrderedPath.resultFixture result <> ": "
                     <> (if OrderedPath.fixturePassed result then "pass" else "FAIL")
@@ -2744,7 +2788,19 @@ orderedPathSection outcome =
       SurfaceFreeFailed _ → []
 
 orderedPathSpec ∷ SurfaceFreeOutcome → Spec
-orderedPathSpec outcome = describe "R2D-7 the ordered path's window-free evidence" $ do
+orderedPathSpec = evidenceSpec "R2D-7 the ordered path's window-free evidence" "ordered path" 10 True
+
+cutoutDepthSpec ∷ SurfaceFreeOutcome → Spec
+cutoutDepthSpec = evidenceSpec "R2D-9 the cutout path's window-free evidence" "cutout depth" 7 True
+
+-- | The examples of an evidence case: no window, every fixture rendered and
+-- read back after its batch completed, every determinate probe within its
+-- tolerance and every named behaviour distinguished from its contrast, the
+-- files kept, and a clean retirement. A case that needs depth is satisfied by
+-- reporting where @D32_SFLOAT@ is unavailable, with the recorder's refusal
+-- checked, and is otherwise satisfied only by a @D32_SFLOAT@ image.
+evidenceSpec ∷ Text → Text → Int → Bool → SurfaceFreeOutcome → Spec
+evidenceSpec title label minimumFixtures needsDepth outcome = describe (Text.unpack title) $ do
   it "opened no window, created no surface and acquired no image" $
     on outcome $ \facts → do
       factsWindows facts `shouldBe` 0
@@ -2752,22 +2808,28 @@ orderedPathSpec outcome = describe "R2D-7 the ordered path's window-free evidenc
       callNames facts `shouldSatisfy` notElem "vkAcquireNextImageKHR"
       deviceFirst facts
 
-  it "rendered every fixture and read back every target once its batch had completed, every determinate probe within its tolerance and every named behaviour distinguished from its contrast" $
+  it "rendered every fixture and read back every target once its batch had completed, every determinate probe within its tolerance and every named behaviour distinguished from its contrast, or reports where D32_SFLOAT is unavailable" $
     on outcome $ \facts → case factsOrdered facts of
-      Nothing → expectationFailure "no ordered path evidence"
+      Nothing → expectationFailure ("no " <> Text.unpack label <> " evidence")
       Just evidence → do
         OrderedPath.evidenceFailure evidence `shouldBe` Nothing
-        [OrderedPath.resultFixture result | result ← OrderedPath.evidenceFixtures evidence, not (OrderedPath.fixturePassed result)] `shouldBe` []
-        length (OrderedPath.evidenceFixtures evidence) `shouldSatisfy` (>= 10)
         OrderedPath.evidencePassed evidence `shouldBe` True
+        case OrderedPath.evidenceUnavailable evidence of
+          Just _ | needsDepth → do
+            map OrderedPath.resultFixture (OrderedPath.evidenceFixtures evidence) `shouldBe` []
+            OrderedPath.evidenceDepthFormat evidence `shouldSatisfy` (/= Just Depth32Float)
+          _ → do
+            [OrderedPath.resultFixture result | result ← OrderedPath.evidenceFixtures evidence, not (OrderedPath.fixturePassed result)] `shouldBe` []
+            length (OrderedPath.evidenceFixtures evidence) `shouldSatisfy` (>= minimumFixtures)
+            when needsDepth $ OrderedPath.evidenceDepthFormat evidence `shouldBe` Just Depth32Float
 
   it "wrote a lossless PNG for every target and the probe record where they are kept" $
     on outcome $ \facts → case factsOrdered facts of
-      Nothing → expectationFailure "no ordered path evidence"
+      Nothing → expectationFailure ("no " <> Text.unpack label <> " evidence")
       Just evidence → do
         record ← doesFileExist (OrderedPath.evidenceRecord evidence)
         pngs ← traverse (maybe (pure False) doesFileExist . OrderedPath.targetPng) [target | result ← OrderedPath.evidenceFixtures evidence, target ← OrderedPath.resultTargets result]
-        (record, and pngs, not (null pngs)) `shouldBe` (True, True, True)
+        (record, and pngs, not (null pngs) || isJust (OrderedPath.evidenceUnavailable evidence)) `shouldBe` (True, True, True)
 
   it "retired cleanly, with every Vulkan call on the owner's thread" $
     on outcome $ \facts → do

@@ -64,7 +64,7 @@ import Data.ByteString (ByteString)
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import Data.Maybe (mapMaybe)
-import Data.Word (Word8)
+import Data.Word (Word32, Word8)
 import Hetoimasia.Asset.Image (DecodedImage (..))
 import Hetoimasia.Math.Affine2 (columns)
 import Hetoimasia.Math.Vector (V2 (..))
@@ -79,6 +79,7 @@ import Hetoimasia.Render.TwoD.DrawPlan
   , PlannedView (..)
   , drawingOrder
   , planSnapshot
+  , plannedClearsDepth
   , plannedRuns
   , plannedSpace
   , runCount
@@ -118,9 +119,11 @@ import Hetoimasia.Render.TwoD.Oracle.Internal.Geometry
   )
 import Hetoimasia.Render.TwoD.Oracle.Internal.Image (Image (..), ImageFault (..), Level (..), checkImage)
 import Hetoimasia.Render.TwoD.Oracle.Internal.Pipeline
-  ( Source
+  ( Cut (..)
+  , Source
   , blend
   , clearPixel
+  , cutout
   , pixelOutcome
   , shade
   )
@@ -202,9 +205,9 @@ data Indeterminate
     NearViewportEdge !Location
   | -- | The probe's centre is within 1/16 pixel of an edge of an instance's quad.
     NearQuadEdge !Location
-  | -- | An instance on the cutout path could cover the probe; depth
-    -- expectations arrive with R2D-9.
-    OnCutoutPath !Location
+  | -- | A cutout-path instance's sample has an alpha, before brightness, within
+    -- 2/255 of ½, the cutout variant's threshold (design D-26).
+    NearCutoutThreshold !Location
   | -- | A minified probe whose derivatives are sheared or rotated by other than
     -- a quarter turn, on a texture with more than one level.
     MinifiedNotAxisAligned !Location
@@ -269,6 +272,9 @@ data OracleView = OracleView
 
 data OracleLayer = OracleLayer
   { olSpace ∷ !LayerSpace
+  , olDepth ∷ !Bool
+    -- ^ Whether the layer is a depth-enabled world layer: it clears depth within
+    -- its view's viewport before its runs.
   , olInstances ∷ [Drawn]
   }
 
@@ -320,6 +326,7 @@ buildLayer ∷ Int → Int → Int → Layer → PlannedLayer → OracleLayer
 buildLayer passIndex viewIndex layerIndex layer planned =
   OracleLayer
     { olSpace = plannedSpace planned
+    , olDepth = plannedClearsDepth planned
     , olInstances =
         [ Drawn (AtInstance passIndex viewIndex layerIndex index) (instances ! index) path
         | (index, path) ← zip (drawingOrder planned) paths
@@ -361,6 +368,9 @@ passAt oracle passIndex
 -- | What one fragment of the pixel's evaluation came to.
 data Fragment
   = Draws !Source
+  | -- | A cutout fragment the variant discards: it draws nothing and writes no
+    -- depth.
+    Discards
   | Unsure !Indeterminate
   | Bad !Failure
 
@@ -401,10 +411,43 @@ viewFragments oracle spec x y view
       -- known to cover nothing from its own transform.
       Nothing → [Bad (MappingNotRepresentable (ovLocation view)) | any needsMapping (concatMap olInstances (ovLayers view))]
       Just mapping →
-        concat
-          [ mapMaybe (instanceFragment oracle spec x y view mapping (olSpace layer)) (olInstances layer)
-          | layer ← ovLayers view
-          ]
+        concatMap (layerFragments oracle spec x y view mapping) (ovLayers view)
+
+-- | A layer's fragments at a pixel in the layer's drawing order. A layer
+-- without depth draws every covering instance. A depth-enabled layer first
+-- clears depth to 1.0 within its viewport (the pixel is within it, or this is
+-- not asked), then runs its cutouts, which are tested less-or-equal and written,
+-- and its ordered instances, which are tested and not written; the plan's
+-- order puts every cutout first.
+layerFragments ∷ Oracle → TargetSpec → Int → Int → OracleView → ViewMapping → OracleLayer → [Fragment]
+layerFragments oracle spec x y view mapping layer
+  | olDepth layer =
+      depthTested
+        [ (path, nearness (instanceDepthKey instanceValue), fragment)
+        | drawn@(Drawn _ instanceValue path) ← olInstances layer
+        , Just fragment ← [instanceFragment oracle spec x y view mapping (olSpace layer) drawn]
+        ]
+  | otherwise = mapMaybe (instanceFragment oracle spec x y view mapping (olSpace layer)) (olInstances layer)
+
+-- | A depth key's depth, @(2²⁴ − 1 − k) / 2²⁴@ (design D-23): exact in a 32-bit
+-- float, and a larger key is nearer.
+nearness ∷ Word32 → Rational
+nearness key = (16777215 - toRational key) / 16777216
+
+-- | The fragments of a depth-enabled layer that pass its depth test, from the
+-- 1.0 its clear leaves: each is compared less-or-equal against the depth held,
+-- and a cutout fragment that passes writes its own. A discarded fragment writes
+-- nothing, and one that is indeterminate or refused is kept for its reason.
+depthTested ∷ [(DrawPath, Rational, Fragment)] → [Fragment]
+depthTested = go 1
+  where
+    go _ [] = []
+    go held ((path, depth, fragment) : rest) = case fragment of
+      Draws _
+        | depth <= held → fragment : go (if path == Cutout then depth else held) rest
+        | otherwise → go held rest
+      Discards → go held rest
+      _ → fragment : go held rest
 
 -- | Whether an instance has area, so that drawing it needs the view's mapping.
 needsMapping ∷ Drawn → Bool
@@ -433,13 +476,13 @@ instanceFragment oracle spec x y view mapping space (Drawn location instanceValu
         | isDegenerate placed || not (representable placed) → Just (Bad (PlacementNotRepresentable location))
         | otherwise → case coverage placed centre of
             Outside → Nothing
-            NearEdge → Just (Unsure (if cutout then OnCutoutPath location else NearQuadEdge location))
+            NearEdge → Just (Unsure (NearQuadEdge location))
             Inside local
-              | cutout → Just (Unsure (OnCutoutPath location))
+              | onCutoutPath → Just (cutoutSampled oracle spec view instanceValue location placed local)
               | otherwise → Just (sampled oracle spec view instanceValue location placed local)
   where
     transform = instanceTransform instanceValue
-    cutout = path == Cutout
+    onCutoutPath = path == Cutout
     centre = (fromIntegral x + 1 / 2, fromIntegral y + 1 / 2)
     (V2 _ _, V2 _ _, V2 originX originY) = columns transform
     layerTransform = case space of
@@ -455,24 +498,43 @@ instanceFragment oracle spec x y view mapping space (Drawn location instanceValu
           Just (place layerTransform transform (Just (snappedX, snappedY)))
       | otherwise = Just (place layerTransform transform Nothing)
 
--- | The fragment an instance draws at a pixel its quad covers, at local
--- coordinates @(lx, ly)@.
+-- | The fragment an ordered-path instance draws at a pixel its quad covers, at
+-- local coordinates @(lx, ly)@.
 sampled ∷ Oracle → TargetSpec → OracleView → Instance → Location → Placement → (Rational, Rational) → Fragment
-sampled oracle spec view instanceValue location placed (lx, ly) =
+sampled oracle spec view instanceValue location placed local =
+  either id (Draws . lit) (texelAt oracle spec view instanceValue location placed local)
+  where
+    lit = shade (instanceTint instanceValue) (settingBrightness (ovSettings view)) (instanceAdditive instanceValue)
+
+-- | The fragment a cutout-path instance gives at such a pixel: the cutout
+-- variant's rule (design D-26) on the sample.
+cutoutSampled ∷ Oracle → TargetSpec → OracleView → Instance → Location → Placement → (Rational, Rational) → Fragment
+cutoutSampled oracle spec view instanceValue location placed local =
+  case texelAt oracle spec view instanceValue location placed local of
+    Left fragment → fragment
+    Right texel → case cutout (instanceTint instanceValue) (settingBrightness (ovSettings view)) texel of
+      Discarded → Discards
+      Survives source → Draws source
+      AtThreshold → Unsure (NearCutoutThreshold location)
+
+-- | The texel an instance samples at local coordinates @(lx, ly)@, or the
+-- fragment that says why there is none.
+texelAt ∷ Oracle → TargetSpec → OracleView → Instance → Location → Placement → (Rational, Rational) → Either Fragment Source
+texelAt oracle spec view instanceValue location placed (lx, ly) =
   case oracleTextures oracle handle of
-    Nothing → Draws (lit placeholder)
+    Nothing → Right placeholder
     Just decoded → case checkImage decoded of
-      Left fault → Bad (MalformedImage location handle fault)
+      Left fault → Left (Bad (MalformedImage location handle fault))
       Right image → case imageLevels image of
-        [] → Bad (MalformedImage location handle (LevelCountInvalid 0))
+        [] → Left (Bad (MalformedImage location handle (LevelCountInvalid 0)))
         Level width0 height0 _ : _ →
           let slopes = derivatives (inverseLinear placed) (r u0, r v0, r u1, r v1) (width0, height0)
            in case chooseLevel (length (imageLevels image)) slopes of
-                Left NotAxisAligned → Unsure (MinifiedNotAxisAligned location)
-                Left FractionalLevel → Unsure (MinifiedFractionalLevel location)
+                Left NotAxisAligned → Left (Unsure (MinifiedNotAxisAligned location))
+                Left FractionalLevel → Left (Unsure (MinifiedFractionalLevel location))
                 Right level → case sampleLevel (formatIsSrgb (specFormat spec)) filtering image level (u, v) of
-                  Left AtTexelBoundary → Unsure (NearTexelBoundary location)
-                  Right source → Draws (lit source)
+                  Left AtTexelBoundary → Left (Unsure (NearTexelBoundary location))
+                  Right source → Right source
   where
     handle = instanceTexture instanceValue
     UvRect u0 v0 u1 v1 = instanceUv instanceValue
@@ -484,7 +546,6 @@ sampled oracle spec view instanceValue location placed (lx, ly) =
       SamplerDefault → settingFilter settings
       SamplerNearest → FilterNearest
       SamplerLinear → FilterLinear
-    lit = shade (instanceTint instanceValue) (settingBrightness settings) (instanceAdditive instanceValue)
 
 -- | How a probe's verdict reads against the pixel that was observed.
 data Verdict

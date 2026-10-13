@@ -28,7 +28,7 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word32)
 import Hetoimasia.Asset.Image (DecodedImage (..), TexelFormat (..))
-import Hetoimasia.GPU.Vulkan.Native.Recording (Refusal (..), validateRingSize)
+import Hetoimasia.GPU.Vulkan.Native.Recording (ImageFormat (..), PipelineDepth (..), PipelineRequest (..), Refusal (..), validateRingSize)
 import Hetoimasia.GPU.Vulkan.Native.TextureTable (LookupEntry (..), TableView (..), readTable, validateTableConfig)
 import Hetoimasia.Math.Affine2 (fromColumns)
 import Hetoimasia.Math.Vector (V2 (..))
@@ -39,7 +39,9 @@ import Hetoimasia.Render.TwoD.Settings (defaultViewSettings)
 import Hetoimasia.Render.TwoD.Snapshot
 import Hetoimasia.Render.TwoD.Target.Backend (targetRef)
 import qualified Hetoimasia.Render.TwoD.Validation as Validation
+import Hetoimasia.Render.TwoD.Validation (Location (..), validateSnapshot)
 import qualified Hetoimasia.Render.TwoD.Vulkan as Render
+import Hetoimasia.Render.TwoD.Vulkan.Frame (FrameRefusal (..))
 import Hetoimasia.Render.TwoD.Vulkan.Textures
 import Hetoimasia.Render.TwoD.Vulkan.Window
 import Numeric.Natural (Natural)
@@ -54,6 +56,7 @@ spec = describe "Windows" $ do
   holdsSpec
   releaseSpec
   frameSpec
+  depthSpec
 
 -- ---------------------------------------------------------------------------
 -- The environment
@@ -79,7 +82,6 @@ data Fake = Fake
 
 data Env = Env
   { envRig ∷ !Rig
-  , envRenderer ∷ !Render.Renderer
   , envTextures ∷ !Textures
   , envAdapter ∷ !(Adapter Int)
   , envFake ∷ !Fake
@@ -126,8 +128,12 @@ newFake windows = do
   pure (Host publish request plain, Fake published queued refusing capacity cancel cancelPlain asked)
 
 withEnv ∷ [Int] → (Env → IO a) → IO a
-withEnv windows action = do
-  rig ← newRig
+withEnv = withEnvOffering [Depth32Float, Depth24, Depth16]
+
+-- | The same over a device that offers only these depth formats.
+withEnvOffering ∷ [ImageFormat] → [Int] → (Env → IO a) → IO a
+withEnvOffering offered windows action = do
+  rig ← newRigOffering offered
   renderer ←
     newRenderer
       rig
@@ -138,8 +144,8 @@ withEnv windows action = do
   resetJournal rig
   textures ← newTextures
   (host, fake) ← newFake windows
-  adapter ← newAdapter host textures
-  action (Env rig renderer textures adapter fake)
+  adapter ← newAdapter host textures renderer
+  action (Env rig textures adapter fake)
 
 -- | Four texels of this colour.
 bytesOf ∷ Word32 → ByteString
@@ -633,8 +639,8 @@ releaseSpec = describe "releasing a texture behind the host's barrier" $ do
 
 frameSpec ∷ Spec
 frameSpec = describe "rendering a window's scene" $ do
-  let info = FrameInfo (64, 64) 50 (Just (32, 32)) (Just (2, 2))
-      renderWith env frame = framelessOnce (envRig env) (renderWindowFrame (builders (envRig env)) (envRenderer env) frame blankScene)
+  let info = FrameInfo (64, 64) 50 (Just (32, 32)) (Just (2, 2)) Nothing
+      renderWith env frame = framelessOnce (envRig env) (renderWindowFrame (envAdapter env) (builders (envRig env)) frame blankScene)
   it "skips a frame whose request names no logical extent, no content scale, or unusable metrics, before recording anything" $
     withEnv [1] $ \env → do
       noLogical ← renderWith env info {frameLogical = Nothing}
@@ -657,3 +663,88 @@ frameSpec = describe "rendering a window's scene" $ do
         Left (RefusedIllegal reason) → reason `shouldSatisfy` (\why → not (any (`Text.isInfixOf` why) ["logical extent", "content scale", "metrics"]))
         Left _ → pure ()
         Right () → pure ()
+
+-- ---------------------------------------------------------------------------
+-- Depth (R2D-9)
+
+-- | A window snapshot of a UI layer (holding the first texture) and then a
+-- depth-enabled world layer (layer 1) holding them all.
+deepSnapshot ∷ [Api.TextureHandle] → Snapshot
+deepSnapshot handles =
+  Snapshot [Pass WindowTarget (ClearColour 0 0 0 1) [View (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 16 16)) defaultViewSettings [UiLayer (map sprite (take 1 handles)), WorldLayer DepthEnabled (map sprite handles)]]]
+
+-- | The scene a snapshot makes.
+sceneFor ∷ Snapshot → Scene2D
+sceneFor snapshot = either (error . show) sceneOf (validateSnapshot snapshot)
+
+-- | What each pipeline made declares of depth: whether it tests and writes.
+declaredDepth ∷ Env → IO [Maybe (Bool, Bool)]
+declaredDepth env = map (fmap (\declared → (depthTest declared, depthWrite declared)) . requestDepth) <$> pipelinesMade (envRig env)
+
+depthSpec ∷ Spec
+depthSpec = describe "world depth" $ do
+  let info = FrameInfo (64, 64) 50 (Just (32, 32)) (Just (2, 2)) Nothing
+      renderWith env frame scene = framelessOnce (envRig env) (renderWindowFrame (envAdapter env) (builders (envRig env)) frame scene)
+  it "publishes a depth-enabled world layer where the session's depth format is D32_SFLOAT" $
+    withEnv [1] $ \env → do
+      handle ← registered env 1 True DefaultMark
+      publish2DSnapshot (envAdapter env) 1 (deepSnapshot [handle]) >>= (`shouldBe` Right 1)
+
+  it "refuses a depth-enabled world layer where the session's depth format is not D32_SFLOAT, naming the layer and publishing nothing" $ do
+    mapM_
+      ( \(offered, session) → withEnvOffering offered [1] $ \env → do
+          handle ← registered env 1 True DefaultMark
+          publish2DSnapshot (envAdapter env) 1 (deepSnapshot [handle]) >>= (`shouldBe` Left (WorldDepthRefused (AtLayer 0 0 1) session))
+          length <$> readTVarIO (fakePublished (envFake env)) >>= (`shouldBe` 0)
+      )
+      [([Depth24, Depth16], Just Depth24), ([Depth16], Just Depth16), ([], Nothing)]
+
+  it "publishes and records a depth-free snapshot on a device that offers only X8_D24, building no depth pipeline" $
+    withEnvOffering [Depth24, Depth16] [1] $ \env → do
+      handle ← registered env 1 True DefaultMark
+      let flat = Snapshot [Pass WindowTarget (ClearColour 0 0 0 1) [View (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 16 16)) defaultViewSettings [UiLayer [sprite handle], WorldLayer DepthDisabled [sprite handle]]]]
+      publish2DSnapshot (envAdapter env) 1 flat >>= (`shouldBe` Right 1)
+      -- The frame-less batch refuses the window pass's first command; the
+      -- renderer's preparation, which makes the pipelines, came before it.
+      _ ← renderWith env info (sceneFor flat)
+      declaredDepth env >>= (`shouldBe` [Nothing])
+
+  it "plans a frame with the registered handles' marks, so a marked texture's instance gets the cutout pipeline" $
+    withEnv [1] $ \env → do
+      art ← registered env 1 True DefaultMark
+      plain ← registered env 2 False DefaultMark
+      depth ← depthTarget (envRig env) Depth32Float 64 64
+      _ ← renderWith env info {frameDepthImage = Just depth} (sceneFor (deepSnapshot [art, plain]))
+      -- The UI layer's untested pipeline, the cutout run's, and the ordered
+      -- instance's tested-not-written one.
+      declared ← declaredDepth env
+      (Just (True, True) `elem` declared, Just (True, False) `elem` declared, Just (False, False) `elem` declared) `shouldBe` (True, True, True)
+
+  it "routes nothing to the cutout pipeline when no texture of the scene is marked" $
+    withEnv [1] $ \env → do
+      plain ← registered env 2 False DefaultMark
+      depth ← depthTarget (envRig env) Depth32Float 64 64
+      _ ← renderWith env info {frameDepthImage = Just depth} (sceneFor (deepSnapshot [plain]))
+      declared ← declaredDepth env
+      Just (True, True) `elem` declared `shouldBe` False
+
+  it "refuses a frame holding a depth-enabled world layer when the request gave no depth image, naming the layer and recording nothing" $
+    withEnv [1] $ \env → do
+      art ← registered env 1 True DefaultMark
+      resetJournal (envRig env)
+      answer ← renderWith env info (sceneFor (deepSnapshot [art]))
+      case answer of
+        Left (RefusedIllegal reason) → reason `shouldSatisfy` Text.isInfixOf (Text.pack (show (NoDepthTarget (AtLayer 0 0 1))))
+        other → expectationFailure ("expected the layer to be named, found " <> show other)
+      commandsRecorded (envRig env) >>= (`shouldBe` [])
+      pipelinesMade (envRig env) >>= (`shouldBe` [])
+
+  it "takes the depth image's format from the backend, not from the host's declaration" $
+    withEnv [1] $ \env → do
+      art ← registered env 1 True DefaultMark
+      lower ← depthTarget (envRig env) Depth24 64 64
+      answer ← renderWith env info {frameDepthImage = Just lower} (sceneFor (deepSnapshot [art]))
+      case answer of
+        Left (RefusedIllegal reason) → reason `shouldSatisfy` Text.isInfixOf (Text.pack (show (DepthFormatRefused (AtLayer 0 0 1) Depth24)))
+        other → expectationFailure ("expected the lower-precision format to be refused, found " <> show other)
+      pipelinesMade (envRig env) >>= (`shouldBe` [])

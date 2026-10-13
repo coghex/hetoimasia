@@ -115,6 +115,23 @@
 --   snapshots, read back after completion, every pixel of every target judged
 --   against the render-2d oracle, and written as lossless PNGs and a probe
 --   record under the validation runner's evidence directory (#422);
+-- * @r2d9-cutout-depth@ — the same device start with no window, then the 2D
+--   renderer's recorder over targets that each have a @D32_SFLOAT@ depth image
+--   (R2D-9): seven fixtures — cutouts and translucent instances interleaved in
+--   one depth-enabled world layer, both equal-key rules (the later cutout wins;
+--   a translucent instance draws over a cutout of an equal key), a nearer
+--   cutout's discarded fragment exposing the farther one, a linearly filtered
+--   edge whose @(0.6, 0.6, 0.6, 0.6)@ sample writes white, a minified cutout
+--   texture sampling its mips against a twin that has only level 0, two
+--   depth-enabled world layers in one view whose keys are independent, and a UI
+--   layer and a world layer without depth in the same depth pass — rendered
+--   offscreen from render-2d snapshots planned with the registered marks, read
+--   back after completion, every pixel of every target judged against the
+--   render-2d oracle planned with the same marks, and written as lossless PNGs
+--   and a probe record that names the depth format and every indeterminate
+--   reason under the validation runner's evidence directory; where the device
+--   chooses another depth format the run reports it and checks the recorder's
+--   refusal instead (#426);
 -- * @r2d15-storage-tables@ — the same device start with no window, then the
 --   session's texture table, a ring made with a storage-table window, and a
 --   pipeline layout that also holds the storage table's set 2: two per-batch
@@ -489,6 +506,14 @@ scenarios =
       $ \consent journal _ → do
         outcome ← SurfaceFree.runOrderedPath (consentBackend consent) journal
         pure (SurfaceFree.orderedPathSpec outcome, section "The R2D-7 ordered path evidence record" (SurfaceFree.orderedPathSection outcome))
+  , Scenario
+      "r2d9-cutout-depth"
+      "records seven render-2d snapshots with cutout art depth-tested in world layers into offscreen targets that have a D32_SFLOAT depth image, in a surface-free session — cutouts and translucent instances interleaved, both equal-key rules, a discarded fragment exposing farther art, a filtered edge writing white, a minified texture sampling its mips, two depth-enabled layers with independent keys, and a UI layer and a world layer without depth in the same pass — reads each back after completion, judges every pixel against the render-2d oracle, and writes a lossless PNG a target and a probe record naming the depth format and every indeterminate reason; where the device chooses another depth format it reports that and checks the recorder's refusal"
+      False
+      Nothing
+      $ \consent journal _ → do
+        outcome ← SurfaceFree.runCutoutDepth (consentBackend consent) journal
+        pure (SurfaceFree.cutoutDepthSpec outcome, section "The R2D-9 cutout path evidence record" (SurfaceFree.cutoutDepthSection outcome))
   , Scenario
       "r2d15-storage-tables"
       "draws twice in one batch of a frame-less batch of a surface-free session, through a shader-sampled table layout that also holds set 2 and no selected sampler: two per-batch tables are written into regions of a ring made with a storage-table window, and each is bound at its own dynamic offset before its draw, whose fragment shader reads its colour from the bound table; reads the target back and checks that each draw shows its own table's colour exactly, with validation reporting nothing"

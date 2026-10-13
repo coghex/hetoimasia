@@ -106,6 +106,9 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , awaitUploadTicket
   , awaitVulkanAction
   , constructBlendedCheckedPipeline
+  , constructDepthCheckedPipeline
+  , constructDepthFormat
+  , constructImageFormat
   , constructFramelessBatch
   , constructImage
   , constructReadback
@@ -262,6 +265,7 @@ runImage2d backend journal = do
           , vulkanObserver = nativeCallObserver recorded
           , vulkanFrameObserver = \event → keep (Frame event)
           , vulkanSceneMode = PerWindowScenes
+          , vulkanWindowDepth = True
           , vulkanUploads = Just uploadConfig
           , vulkanDeviceStart = DeviceSurfaceFree
           , vulkanSceneLifecycle =
@@ -275,12 +279,12 @@ runImage2d backend journal = do
                 }
           , vulkanRenderer = VulkanRenderer $ \scene request construction recorder → do
               keep (Rendered (requestSceneRevision request) (sceneReferences scene))
-              readTVarIO preparedHeld >>= \case
-                Nothing → pure (Right ())
-                Just ready → do
+              (,) <$> readTVarIO preparedHeld <*> readTVarIO adapterSlot >>= \case
+                (Just _, Just adapter) → do
                   let SurfaceExtent width height = requestExtent request
-                      info = FrameInfo (width, height) (requestFormat request) (requestLogicalExtent request) (requestContentScale request)
-                  renderWindowFrame (renderBuildersOf construction) (preparedRenderer ready) info scene recorder
+                      info = FrameInfo (width, height) (requestFormat request) (requestLogicalExtent request) (requestContentScale request) (requestDepth request)
+                  renderWindowFrame adapter (renderBuildersOf construction) info scene recorder
+                _ → pure (Right ())
           }
   outcome ←
     try @SomeException $
@@ -345,7 +349,7 @@ runImage2d backend journal = do
           handles = handlesOf prepared
       -- The adapter, over the host's public publication and release-request
       -- operations, and the hooks that reach it.
-      adapter ← newAdapter (windowHostOf vulkan keep stripes) (preparedTextures prepared)
+      adapter ← newAdapter (windowHostOf vulkan keep stripes) (preparedTextures prepared) (preparedRenderer prepared)
       atomically (writeTVar adapterSlot (Just adapter))
       windows ← atomically (hostWindowIdentities windowHost)
       window ← case windows of
@@ -517,6 +521,9 @@ renderBuildersOf construction =
     , Render.buildTable = constructTextureTable construction
     , Render.buildTableLayout = constructShaderSampledTablePipelineLayout construction
     , Render.buildPipeline = constructBlendedCheckedPipeline construction
+    , Render.buildDepthPipeline = constructDepthCheckedPipeline construction
+    , Render.buildDepthFormat = constructDepthFormat construction
+    , Render.buildImageFormat = constructImageFormat construction
     , Render.registerImage = registerConstructedTexture construction
     , Render.swapImage = swapConstructedTexture construction
     , Render.releaseImage = releaseConstructedTexture construction

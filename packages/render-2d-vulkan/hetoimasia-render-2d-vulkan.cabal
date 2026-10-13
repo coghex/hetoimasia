@@ -1,19 +1,24 @@
 cabal-version: 3.16
 name: hetoimasia-render-2d-vulkan
 version: 0.1.0.0
-synopsis: The 2D renderer's Vulkan recorder for the ordered path
+synopsis: The 2D renderer's Vulkan recorder for the ordered and cutout paths
 description:
-    R2D-7's recorder: a validated render-2d snapshot recorded into one batch
-    of the native backend, every pass in list order into an offscreen colour
-    target or the frame's image, every view under its own scissor, every layer
-    as one instanced draw per run of the ordered path, with premultiplied-alpha
-    blending. It owns the built-in shaders, checked against interface
-    descriptions in the package (GRS-16): a vertex stage that places each
-    instance's unit square through the instance and view transforms and snaps
-    its origin rigidly, and a fragment stage that samples the texture table
-    with the sampler the instance or the view's default chooses and wraps the
-    default material in tint, brightness and the additive flag (render-2d
-    D-4, D-5, D-9, D-24).
+    R2D-7's and R2D-9's recorder: a validated render-2d snapshot recorded into
+    one batch of the native backend, every pass in list order into an offscreen
+    colour target or the frame's image, every view under its own scissor, every
+    layer as one instanced draw per run. The ordered path blends premultiplied
+    alpha. A pass whose views hold a depth-enabled world layer begins with a
+    D32_SFLOAT depth attachment, the layer clears depth within its view's
+    scissor, the cutout path's art is drawn first, depth-tested and depth-written,
+    and the ordered path's instances are depth-tested and not written. It owns
+    the built-in shaders, checked against interface descriptions in the package
+    (GRS-16): a vertex stage that places each instance's unit square through the
+    instance and view transforms, snaps its origin rigidly and writes the depth
+    its key gives, and two fragment stages that sample the texture table with the
+    sampler the instance or the view's default chooses and wrap the default
+    material in tint, brightness and the additive flag, or, for a cutout, discard
+    below an alpha of a half and write the un-premultiplied colour (render-2d D-4,
+    D-5, D-9, D-23, D-24, D-26).
     .
     It depends on hetoimasia-render-2d, hetoimasia-render-api, hetoimasia-math
     and the native backend alone, names nothing of the window integration, and
@@ -60,6 +65,8 @@ library
         Hetoimasia.Render.TwoD.Vulkan.Shaders
         Hetoimasia.Render.TwoD.Vulkan.Textures
         Hetoimasia.Render.TwoD.Vulkan.Window
+    other-modules:
+        Hetoimasia.Render.TwoD.Vulkan.ShaderSources
     build-depends:
         base >=4.22 && <4.23,
         bytestring >=0.12 && <0.13,

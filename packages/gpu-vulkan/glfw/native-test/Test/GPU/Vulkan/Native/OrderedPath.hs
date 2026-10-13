@@ -1,13 +1,17 @@
--- | The ordered path's window-free evidence (R2D-7): the fixtures of
--- "Test.GPU.Vulkan.Native.OrderedPath.Fixtures" rendered into offscreen colour
--- targets of a surface-free session through @hetoimasia-render-2d-vulkan@,
--- each read back only once its batch's completion is proved, and every pixel
--- of every target judged against @hetoimasia-render-2d-oracle@.
+-- | The 2D renderer's window-free evidence (R2D-7, R2D-9): a suite's fixtures
+-- ("Test.GPU.Vulkan.Native.OrderedPath.Fixtures" is the ordered path's)
+-- rendered into offscreen colour targets of a surface-free session through
+-- @hetoimasia-render-2d-vulkan@, each read back only once its batch's
+-- completion is proved, and every pixel of every target judged against
+-- @hetoimasia-render-2d-oracle@.
 --
--- The oracle is planned with 'noCutoutMarks', as the recorder is, and is given
--- the metrics, the format and the extent each target was made with, and the
--- decoded texels each registered handle names; a handle it does not know
--- samples the placeholder.
+-- The recorder and the oracle are planned with the marks the fixture names
+-- ('fixtureMarked'), and the oracle is given the metrics, the format and the
+-- extent each target was made with, and the decoded texels each registered
+-- handle names; a handle it does not know samples the placeholder. A target a
+-- fixture gives a depth image has one in the format the device chooses for
+-- depth; where that is not @D32_SFLOAT@, a suite that needs depth reports the
+-- format and checks the recorder's refusal on it instead of rendering.
 --
 -- A run passes only when, for every fixture:
 --
@@ -24,6 +28,8 @@
 -- directory the caller names.
 module Test.GPU.Vulkan.Native.OrderedPath
   ( Host (..)
+  , Suite (..)
+  , orderedSuite
   , Evidence (..)
   , FixtureResult (..)
   , ProbeResult (..)
@@ -34,7 +40,6 @@ module Test.GPU.Vulkan.Native.OrderedPath
   , verdictPasses
   , runEvidence
   , renderRecord
-  , recordName
   ) where
 
 import Control.Concurrent (threadDelay)
@@ -42,6 +47,7 @@ import Control.Monad (foldM)
 import qualified Data.ByteString as ByteString
 import Data.ByteString (ByteString)
 import Data.List (intercalate)
+import Data.Maybe (isJust)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -54,7 +60,9 @@ import System.FilePath ((</>))
 import Hetoimasia.GPU.Vulkan.GLFW
   ( BatchTicket
   , Construction
+  , Image
   , ImageDescription (..)
+  , ImageFormat (..)
   , ImageKind (..)
   , Readback
   , Refusal (..)
@@ -64,7 +72,10 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , TransitionSource (..)
   , UploadRequest (..)
   , constructBlendedCheckedPipeline
+  , constructDepthCheckedPipeline
+  , constructDepthFormat
   , constructImage
+  , constructImageFormat
   , constructReadback
   , constructRing
   , constructShaderSampledTablePipelineLayout
@@ -82,7 +93,7 @@ import Hetoimasia.GPU.Vulkan.Native.Recording (Recorder)
 import Hetoimasia.Asset.Image (DecodedImage)
 import qualified Hetoimasia.Render.Api.Texture as Api
 import Hetoimasia.Render.Api.Texture.Backend (textureHandle)
-import Hetoimasia.Render.TwoD.DrawPlan (noCutoutMarks)
+import Hetoimasia.Render.TwoD.DrawPlan (cutoutMarks)
 import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..))
 import Hetoimasia.Render.TwoD.Oracle
   ( Expectation (..)
@@ -150,7 +161,24 @@ data TargetResult = TargetResult
   , targetShape ∷ !TargetShape
   , targetPng ∷ !(Maybe FilePath)
   , targetBytesRead ∷ !Int
+  , targetDepthFormat ∷ !(Maybe ImageFormat)
+    -- ^ The format of the depth image the pass drew with, if the shape has one.
   }
+
+-- | A set of fixtures run together: the textures they use, their fixtures, the
+-- name that prefixes their files, and whether they need a depth image.
+data Suite = Suite
+  { suiteName ∷ !String
+  , suiteRecord ∷ !FilePath
+  , suiteTextures ∷ ![Texture]
+  , suiteFixtures ∷ ![Fixture]
+  , suiteNeedsDepth ∷ !Bool
+  }
+
+-- | The ordered path's: eleven fixtures, one of them (a depth-enabled layer of
+-- art drawn ordered) over a depth image.
+orderedSuite ∷ Suite
+orderedSuite = Suite "ordered-path" "ordered-path-probes.json" textures fixtures True
 
 -- | One fixture's findings.
 data FixtureResult = FixtureResult
@@ -200,28 +228,47 @@ data Evidence = Evidence
     -- ^ Why the run stopped before judging a fixture, if it did.
   , evidenceFixtures ∷ ![FixtureResult]
   , evidenceRecord ∷ !FilePath
+  , evidenceDepthFormat ∷ !(Maybe ImageFormat)
+    -- ^ The depth format the device chose, for a suite that needs depth.
+  , evidenceUnavailable ∷ !(Maybe Text)
+    -- ^ Why a suite that needs @D32_SFLOAT@ rendered nothing, when the device
+    -- chose another depth format, and what its refusal check found.
   }
 
-recordName ∷ FilePath
-recordName = "ordered-path-probes.json"
+-- | What an evidence run came to before it was written.
+data Outcome
+  = Rendered ![FixtureResult]
+  | -- | The device's depth format is not @D32_SFLOAT@: the format, and the
+    -- refusal the recorder gave a depth-enabled snapshot over a depth image of it.
+    Unavailable !ImageFormat !(Either Text Text)
 
 -- | Run the evidence over a host, writing the PNGs and the probe record into
 -- this directory, which is made if missing and never deleted.
-runEvidence ∷ Host → FilePath → IO Evidence
-runEvidence host directory = do
+runEvidence ∷ Host → Suite → FilePath → IO Evidence
+runEvidence host suite directory = do
   createDirectoryIfMissing True directory
-  outcome ← evidenceOver host directory
-  let recordPath = directory </> recordName
-      (failure, results) = case outcome of
-        Left why → (Just why, [])
-        Right found → (Nothing, found)
-  ByteString.writeFile recordPath (Text.encodeUtf8 (renderRecord failure results))
+  depth ← if suiteNeedsDepth suite then hostAct host "choosing the depth format" (\construction → constructDepthFormat construction) else pure (Right Depth32Float)
+  outcome ← case depth of
+    Left why → pure (Left why)
+    Right format
+      | suiteNeedsDepth suite && format /= Depth32Float → Right . Unavailable format <$> refusalCheck host suite format
+      | otherwise → fmap Rendered <$> evidenceOver host suite directory format
+  let recordPath = directory </> suiteRecord suite
+      depthFormat = either (const Nothing) (\format → if suiteNeedsDepth suite then Just format else Nothing) depth
+      (failure, results, unavailable) = case outcome of
+        Left why → (Just why, [], Nothing)
+        Right (Rendered found) → (Nothing, found, Nothing)
+        Right (Unavailable format (Left why)) → (Just why, [], Just ("D32_SFLOAT is not available: the device chose " <> tshow format))
+        Right (Unavailable format (Right checked)) → (Nothing, [], Just ("D32_SFLOAT is not available: the device chose " <> tshow format <> "; " <> checked))
+  ByteString.writeFile recordPath (Text.encodeUtf8 (renderRecord suite depthFormat unavailable failure results))
   pure
     Evidence
-      { evidencePassed = failure == Nothing && length results == length fixtures && all fixturePassed results
+      { evidencePassed = failure == Nothing && (isJust unavailable || (length results == length (suiteFixtures suite) && all fixturePassed results))
       , evidenceFailure = failure
       , evidenceFixtures = results
       , evidenceRecord = recordPath
+      , evidenceDepthFormat = depthFormat
+      , evidenceUnavailable = unavailable
       }
 
 -- | A table of 16 slots, 8 at first and four versions; a ring of a mebibyte.
@@ -239,21 +286,67 @@ builders construction =
     , Render.buildTable = constructTextureTable construction
     , Render.buildTableLayout = constructShaderSampledTablePipelineLayout construction
     , Render.buildPipeline = constructBlendedCheckedPipeline construction
+    , Render.buildDepthPipeline = constructDepthCheckedPipeline construction
+    , Render.buildDepthFormat = constructDepthFormat construction
+    , Render.buildImageFormat = constructImageFormat construction
     , Render.registerImage = registerConstructedTexture construction
     , Render.swapImage = swapConstructedTexture construction
     , Render.releaseImage = releaseConstructedTexture construction
     }
 
-evidenceOver ∷ Host → FilePath → IO (Either Text [FixtureResult])
-evidenceOver host directory = do
+-- | What the recorder gives a depth-enabled snapshot over a depth image of a
+-- format that is not @D32_SFLOAT@: its refusal, naming the layer. The check is
+-- the pure work of the frame, so no renderer, texture or batch is needed.
+refusalCheck ∷ Host → Suite → ImageFormat → IO (Either Text Text)
+refusalCheck host suite format =
+  case [fixture' | fixture' ← suiteFixtures suite, any shapeDepth (fixtureShapes fixture')] of
+    [] → pure (Left "the suite has no fixture with a depth image")
+    fixture' : _ → do
+      handles ← pure (Handles (const (textureHandle 1 1)) (textureHandle 1000 1) (textureHandle 1000 2))
+      case validateSnapshot (fixtureSnapshot fixture' handles) of
+        Left refused → pure (Left ("the snapshot was refused: " <> tshow refused))
+        Right valid → do
+          made ← hostAct host "making a depth image of the device's format" $ \construction → do
+            colours ← traverse (\shape → constructImage construction (ImageDescription ColorTarget (shapeFormat shape) (shapeWidth shape) (shapeHeight shape) 1)) (fixtureShapes fixture')
+            depths ← traverse (\shape → constructImage construction (ImageDescription DepthTarget format (shapeWidth shape) (shapeHeight shape) 1)) (fixtureShapes fixture')
+            pure ((,) <$> sequence colours <*> sequence depths)
+          case made of
+            Left failure → pure (Left failure)
+            Right (colours, depths) → do
+              let shapes = fixtureShapes fixture'
+                  input =
+                    Render.FrameInput
+                      { Render.frameSnapshot = valid
+                      , Render.frameMarks = cutoutMarks []
+                      , Render.frameTarget = \reference →
+                          lookup
+                            reference
+                            [ ( shapeRef shape
+                              , Render.TargetBinding
+                                  colour
+                                  (Render.Attachment (formatCode (shapeFormat shape)) (shapeWidth shape) (shapeHeight shape) (shapeMetrics shape))
+                                  (if shapeDepth shape then Just (Render.DepthBinding depth format) else Nothing)
+                              )
+                            | (shape, colour, depth) ← zip3 shapes colours depths
+                            ]
+                      , Render.frameWindow = Nothing
+                      , Render.frameWindowDepth = Nothing
+                      }
+              pure $ case Render.frameWork input of
+                Left refusal@(Render.DepthFormatRefused _ refused) | refused == format → Right ("the recorder refused a depth-enabled layer over it before recording: " <> tshow refusal)
+                Left other → Left ("the recorder's refusal was not the depth format's: " <> tshow other)
+                Right _ → Left "the recorder accepted a depth-enabled layer over a depth image that is not D32_SFLOAT"
+
+evidenceOver ∷ Host → Suite → FilePath → ImageFormat → IO (Either Text [FixtureResult])
+evidenceOver host suite directory depthFormat = do
   made ← hostAct host "making the renderer and the textures" $ \construction → do
     renderer ← Render.makeRenderer (builders construction) configuration
-    images ← traverse (\texture → constructImage construction (ImageDescription TextureImage (textureFormat texture) (textureWidth texture) (textureHeight texture) 1)) textures
+    images ← traverse (\texture → constructImage construction (ImageDescription TextureImage (textureFormat texture) (textureWidth texture) (textureHeight texture) (fromIntegral (length (textureLevels texture))))) (suiteTextures suite)
     pure ((,) <$> renderer <*> sequence images)
   case made of
     Left failure → pure (Left failure)
     Right (renderer, images) → do
-      uploads ← traverse (\(texture, image) → hostUpload host (UploadImage image [textureBytes texture])) (zip textures images)
+      uploads ← traverse (\(texture, image) → hostUpload host (UploadImage image (textureLevels texture))) (zip (suiteTextures suite) images)
       case sequence uploads of
         Left failure → pure (Left ("an upload did not complete: " <> failure))
         Right _ →
@@ -263,8 +356,8 @@ evidenceOver host directory = do
               hostAct host "registering the textures" (\construction → fmap sequence (traverse (registerConstructedTexture construction) images)) >>= \case
                 Left failure → pure (Left failure)
                 Right registered → do
-                  let byKey = Map.fromList [(textureKey texture, textureHandle (handleIndex backend) (handleGeneration backend)) | (texture, backend) ← zip textures registered]
-                      decodedByHandle = Map.fromList [(byKey Map.! textureKey texture, decoded texture) | texture ← textures]
+                  let byKey = Map.fromList [(textureKey texture, textureHandle (handleIndex backend) (handleGeneration backend)) | (texture, backend) ← zip (suiteTextures suite) registered]
+                      decodedByHandle = Map.fromList [(byKey Map.! textureKey texture, decoded texture) | texture ← suiteTextures suite]
                       handles =
                         Handles
                           { handleOf = (byKey Map.!)
@@ -273,7 +366,7 @@ evidenceOver host directory = do
                               backend : _ → textureHandle (handleIndex backend) (handleGeneration backend + 1)
                               [] → textureHandle 1000 2
                           }
-                  Right . reverse <$> foldM (\done fixture' → (: done) <$> runFixture host directory renderer handles decodedByHandle fixture') [] fixtures
+                  Right . reverse <$> foldM (\done fixture' → (: done) <$> runFixture host suite directory depthFormat renderer handles decodedByHandle fixture') [] (suiteFixtures suite)
 
 -- | The table binds once its placeholder's upload has completed and its
 -- descriptor is written, which the owner's steps do.
@@ -289,13 +382,15 @@ awaitPlaceholder host remaining =
 -- | Render one fixture, read its targets back and judge every pixel.
 runFixture
   ∷ Host
+  → Suite
   → FilePath
+  → ImageFormat
   → Render.Renderer
   → Handles
   → Map.Map Api.TextureHandle DecodedImage
   → Fixture
   → IO FixtureResult
-runFixture host directory renderer handles decodedByHandle fixture =
+runFixture host suite directory depthFormat renderer handles decodedByHandle fixture =
   case validateSnapshot (fixtureSnapshot fixture handles) of
     Left refused → pure (failed ("the snapshot was refused: " <> tshow refused))
     Right valid → do
@@ -307,13 +402,20 @@ runFixture host directory renderer handles decodedByHandle fixture =
           let input =
                 Render.FrameInput
                   { Render.frameSnapshot = valid
+                  , Render.frameMarks = marks
                   , Render.frameTarget = \reference →
                       lookup
                         reference
-                        [ (shapeRef shape, Render.TargetBinding image (Render.Attachment (formatCode (shapeFormat shape)) (shapeWidth shape) (shapeHeight shape) (shapeMetrics shape)))
-                        | (shape, (image, _)) ← zip shapes pairs
+                        [ ( shapeRef shape
+                          , Render.TargetBinding
+                              image
+                              (Render.Attachment (formatCode (shapeFormat shape)) (shapeWidth shape) (shapeHeight shape) (shapeMetrics shape))
+                              (fmap (\held → Render.DepthBinding held depthFormat) depth)
+                          )
+                        | (shape, (image, _, depth)) ← zip shapes pairs
                         ]
                   , Render.frameWindow = Nothing
+                  , Render.frameWindowDepth = Nothing
                   }
           ticket ← hostRecord host ("recording " <> name) $ \construction →
             Render.prepareSnapshot (builders construction) renderer input >>= \case
@@ -322,25 +424,31 @@ runFixture host directory renderer handles decodedByHandle fixture =
                 pure . Right $ \recorder →
                   recording recorder >>= \case
                     Left refusal → pure (Left (RefusedIllegal (tshow refusal)))
-                    Right () → inOrder (concatMap (copyOut recorder) pairs)
+                    Right () → inOrder (concatMap (copyOut recorder) [(image, readback) | (image, readback, _) ← pairs])
           case ticket of
             Left failure → pure (failed failure)
             Right batch →
               hostAwait host batch >>= \case
                 Left failure → pure (failed ("the batch did not complete: " <> failure))
                 Right () →
-                  fmap sequence (traverse (\(shape, (_, readback)) → hostRead host readback (targetBytes shape)) (zip shapes pairs)) >>= \case
+                  fmap sequence (traverse (\(shape, (_, readback, _)) → hostRead host readback (targetBytes shape)) (zip shapes pairs)) >>= \case
                     Left failure → pure (failed ("a readback was not read: " <> failure))
                     Right readbacks → judged valid readbacks
   where
     name = fixtureName fixture
     shapes = fixtureShapes fixture
+    marks = cutoutMarks [handleOf handles key | key ← fixtureMarked fixture]
     failed failure = FixtureResult name [] [] [] (Just failure)
     targetBytes shape = fromIntegral (shapeWidth shape) * fromIntegral (shapeHeight shape) * 4 ∷ Natural
+    target ∷ Construction q inst msgr phys dev cmd → TargetShape → IO (Either Refusal (Image, Readback, Maybe Image))
     target construction shape = do
       image ← constructImage construction (ImageDescription ColorTarget (shapeFormat shape) (shapeWidth shape) (shapeHeight shape) 1)
       readback ← constructReadback construction (targetBytes shape)
-      pure ((,) <$> image <*> readback)
+      depth ←
+        if shapeDepth shape
+          then fmap Just <$> constructImage construction (ImageDescription DepthTarget depthFormat (shapeWidth shape) (shapeHeight shape) 1)
+          else pure (Right Nothing)
+      pure ((,,) <$> image <*> readback <*> depth)
     -- The target leaves its colour-attachment use for a copy and returns to it.
     copyOut recorder (image, readback) =
       [ transitionResource recorder image (FromUse ColorAttachment) TransferRead
@@ -352,7 +460,7 @@ runFixture host directory renderer handles decodedByHandle fixture =
             newOracle
               OracleInput
                 { inputSnapshot = valid
-                , inputCutoutMarks = noCutoutMarks
+                , inputCutoutMarks = marks
                 , inputWindow = Nothing
                 , inputOffscreen =
                     Map.fromList
@@ -371,7 +479,7 @@ runFixture host directory renderer handles decodedByHandle fixture =
           observed (Probe index x y) = do
             (format, extent) ← colourOf index
             either (const Nothing) Just (readPixel format extent (bytesOf index) x y)
-          judge probe = judgeReadback oracle probe (bytesOf (probePass probe))
+          judge asked = judgeReadback oracle asked (bytesOf (probePass asked))
           probes =
             [ ProbeResult at (expect oracle at) (observed at) (judge at)
             | (index, shape, _) ← perPass
@@ -399,9 +507,9 @@ runFixture host directory renderer handles decodedByHandle fixture =
       pngs ←
         traverse
           ( \(index, shape, bytes) → do
-              let path = directory </> ("ordered-path-" <> Text.unpack name <> "-" <> show index <> ".png")
+              let path = directory </> (suiteName suite <> "-" <> Text.unpack name <> "-" <> show index <> ".png")
               ByteString.writeFile path (encodeRgba (fromIntegral (shapeWidth shape)) (fromIntegral (shapeHeight shape)) bytes)
-              pure (TargetResult index shape (Just path) (ByteString.length bytes))
+              pure (TargetResult index shape (Just path) (ByteString.length bytes) (if shapeDepth shape then Just depthFormat else Nothing))
           )
           perPass
       pure (FixtureResult name pngs probes named Nothing)
@@ -423,13 +531,16 @@ tshow = Text.pack . show
 -- for, their expectations, tolerances, observed values, contrasts and
 -- verdicts, the counts of what passed, failed and was indeterminate, and every
 -- indeterminate probe with its reason.
-renderRecord ∷ Maybe Text → [FixtureResult] → Text
-renderRecord failure results =
+renderRecord ∷ Suite → Maybe ImageFormat → Maybe Text → Maybe Text → [FixtureResult] → Text
+renderRecord suite depthFormat unavailable failure results =
   Text.pack . (<> "\n") $
     object
-      [ ("failure", maybe "null" (str . Text.unpack) failure)
+      [ ("suite", str (suiteName suite))
+      , ("depth_format", maybe "null" (str . show) depthFormat)
+      , ("unavailable", maybe "null" (str . Text.unpack) unavailable)
+      , ("failure", maybe "null" (str . Text.unpack) failure)
       , ("fixtures", list (map fixtureRecord results))
-      , ("passed", bool (failure == Nothing && length results == length fixtures && all fixturePassed results))
+      , ("passed", bool (failure == Nothing && (isJust unavailable || (length results == length (suiteFixtures suite) && all fixturePassed results))))
       ]
   where
     fixtureRecord result =
@@ -443,7 +554,7 @@ renderRecord failure results =
         , ("failed", list [failedRecord probed | probed ← resultProbes result, failedVerdict (probeVerdict probed)])
         , ("passed", bool (fixturePassed result))
         ]
-    targetRecord (TargetResult index shape png bytes') =
+    targetRecord (TargetResult index shape png bytes' targetDepth) =
       let metrics = shapeMetrics shape
           PixelExtent logicalWidth logicalHeight = metricsLogical metrics
           PixelExtent framebufferWidth framebufferHeight = metricsFramebuffer metrics
@@ -458,6 +569,7 @@ renderRecord failure results =
             , ("content_scale", list [show (metricsScaleX metrics), show (metricsScaleY metrics)])
             , ("png", maybe "null" str png)
             , ("readback_bytes", show bytes')
+            , ("depth_format", maybe "null" (str . show) targetDepth)
             ]
     counts result =
       let probes = resultProbes result

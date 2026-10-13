@@ -76,6 +76,9 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , awaitUploadTicket
   , awaitVulkanAction
   , constructBlendedCheckedPipeline
+  , constructDepthCheckedPipeline
+  , constructDepthFormat
+  , constructImageFormat
   , constructFramelessBatch
   , constructImage
   , constructReadback
@@ -200,7 +203,8 @@ run mode validation = do
       base = vulkanHostConfig (defaultHostConfig windows) capture budgets initial
       config =
         base
-          { vulkanRenderer = imageRenderer prepared frame
+          { vulkanRenderer = imageRenderer prepared frame adapterSlot
+          , vulkanWindowDepth = True
           , vulkanUploads = Just uploadConfig
           , vulkanDeviceStart = DeviceSurfaceFree
           , vulkanFrameObserver = \case
@@ -245,7 +249,7 @@ run mode validation = do
               ready ← Sample.prepare (hostOf vulkan)
               made ← either (\failure → hPutStrLn stderr (Text.unpack failure) >> exitFailure) pure ready
               atomically (writeTVar prepared (Just made))
-              adapter ← newAdapter (windowHostOf vulkan) (preparedTextures made)
+              adapter ← newAdapter (windowHostOf vulkan) (preparedTextures made) (preparedRenderer made)
               atomically (writeTVar adapterSlot (Just adapter))
               atomically (writeTVar passed True)
               render logger vulkan control adapter made uiScale frame presented
@@ -277,6 +281,9 @@ renderBuildersOf construction =
     , Render.buildTable = constructTextureTable construction
     , Render.buildTableLayout = constructShaderSampledTablePipelineLayout construction
     , Render.buildPipeline = constructBlendedCheckedPipeline construction
+    , Render.buildDepthPipeline = constructDepthCheckedPipeline construction
+    , Render.buildDepthFormat = constructDepthFormat construction
+    , Render.buildImageFormat = constructImageFormat construction
     , Render.registerImage = registerConstructedTexture construction
     , Render.swapImage = swapConstructedTexture construction
     , Render.releaseImage = releaseConstructedTexture construction
@@ -365,15 +372,15 @@ windowHostOf vulkan =
 -- | The window's frame: its adopted snapshot recorded into the frame's image
 -- by the adapter, once the textures are registered, and what the frame's
 -- request said of the window remembered for the next publication.
-imageRenderer ∷ TVar (Maybe Prepared) → TVar (Maybe FrameInfo) → VulkanRenderer Scene2D
-imageRenderer prepared frame = VulkanRenderer $ \scene request construction recorder →
-  readTVarIO prepared >>= \case
-    Nothing → pure (Right ())
-    Just ready → do
+imageRenderer ∷ TVar (Maybe Prepared) → TVar (Maybe FrameInfo) → TVar (Maybe (Adapter WindowId)) → VulkanRenderer Scene2D
+imageRenderer prepared frame adapterSlot = VulkanRenderer $ \scene request construction recorder →
+  (,) <$> readTVarIO prepared <*> readTVarIO adapterSlot >>= \case
+    (Just _, Just adapter) → do
       let SurfaceExtent width height = requestExtent request
-          info = FrameInfo (width, height) (requestFormat request) (requestLogicalExtent request) (requestContentScale request)
+          info = FrameInfo (width, height) (requestFormat request) (requestLogicalExtent request) (requestContentScale request) (requestDepth request)
       atomically (writeTVar frame (Just info))
-      renderWindowFrame (renderBuildersOf construction) (preparedRenderer ready) info scene recorder
+      renderWindowFrame adapter (renderBuildersOf construction) info scene recorder
+    _ → pure (Right ())
 
 -- | Print the evidence's outcome: where it was written, each named probe,
 -- the swap demonstration, and the verdict.

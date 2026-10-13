@@ -224,6 +224,7 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , constructBlendedCheckedPipeline
   , constructDepthCheckedPipeline
   , constructDepthFormat
+  , constructImageFormat
   , replaceConstructedCheckedPipeline
   , constructBuffer
   , constructImage

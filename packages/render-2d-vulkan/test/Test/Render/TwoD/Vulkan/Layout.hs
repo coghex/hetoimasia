@@ -1,7 +1,7 @@
 -- | The recorder's pure layout decisions: the scissor rule against
 -- 'viewportContains', the push block's bytes, the instance attributes against
--- render-2d's 64-byte encoding, the sampler-choice mapping, and the shaders'
--- checked interfaces against the same numbers.
+-- render-2d's 64-byte encoding, the key-to-depth mapping, the sampler-choice
+-- mapping, and the shaders' checked interfaces against the same numbers.
 --
 -- __Where the expected values come from.__ Never from the code under test: the
 -- scissors and push bytes are worked out by hand (each float as the
@@ -36,7 +36,7 @@ import Hetoimasia.Render.TwoD.Settings (TextureFilter (..), defaultViewSettings)
 import Hetoimasia.Render.TwoD.Snapshot
 import Hetoimasia.Render.TwoD.Validation (ValidLayer, validLayers, validateSnapshot)
 import Hetoimasia.Render.TwoD.Vulkan.Layout
-import Hetoimasia.Render.TwoD.Vulkan.Shaders (orderedShaders)
+import Hetoimasia.Render.TwoD.Vulkan.Shaders (cutoutShaders, orderedShaders)
 import Test.Hspec (Spec, describe, it, shouldBe)
 
 spec ∷ Spec
@@ -44,6 +44,7 @@ spec = describe "Layout" $ do
   scissorSpec
   pushSpec
   attributeSpec
+  depthSpec
   samplerSpec
   interfaceSpec
 
@@ -203,6 +204,7 @@ attributeSpec = describe "the instance's vertex input" $ do
                  , (5, 0, VertexRgba8Unorm)
                  , (6, 0, VertexUint)
                  , (7, 0, VertexUint)
+                 , (8, 0, VertexUint)
                  ]
     map read' attributes
       `shouldBe` [ floats [2, 3, 5, 7] -- the transform's a, b, c, d
@@ -213,6 +215,7 @@ attributeSpec = describe "the instance's vertex input" $ do
                  , [0x11, 0x22, 0x33, 0x44] -- the tint, red first
                  , littleEndian (flagsWord distinctInstance) -- the flags word
                  , littleEndian 0xDEADBEEF -- the material parameter word
+                 , littleEndian 0x00ABCDEF -- the depth key
                  ]
 
   it "keeps every attribute inside the stride and aligned to its component size, with no two overlapping" $ do
@@ -221,6 +224,40 @@ attributeSpec = describe "the instance's vertex input" $ do
     all ((<= 64) . snd) spans `shouldBe` True
     all (\attribute → attributeOffset attribute `mod` 4 == 0) attributes `shouldBe` True
     and [e1 <= s2 || e2 <= s1 | (i, (s1, e1)) ← zip [0 ∷ Int ..] spans, (j, (s2, e2)) ← zip [0 ..] spans, i < j] `shouldBe` True
+
+-- ---------------------------------------------------------------------------
+-- The key's depth
+
+depthSpec ∷ Spec
+depthSpec = describe "the depth a key gives" $ do
+  it "is (2^24 - 1 - k) / 2^24, worked by hand at the ends and the middle of the range" $ do
+    -- 16777215 / 16777216 is the largest float below one: 0x3F7FFFFF.
+    fmap castFloatToWord32 (depthFromKey 0) `shouldBe` Just 0x3F7FFFFF
+    -- 16777214 / 16777216 is the float below that one: 0x3F7FFFFE.
+    fmap castFloatToWord32 (depthFromKey 1) `shouldBe` Just 0x3F7FFFFE
+    -- 8388607 / 16777216 = 0.5 - 2^-24, which is two steps (2^-25 each) below one half: 0x3EFFFFFE.
+    fmap castFloatToWord32 (depthFromKey 0x800000) `shouldBe` Just 0x3EFFFFFE
+    -- 2^23 - 1 gives 8388608 / 16777216 = 0.5: 0x3F000000.
+    fmap castFloatToWord32 (depthFromKey 0x7FFFFF) `shouldBe` Just 0x3F000000
+    -- The nearest key gives 1 / 2^24 = 2^-24: 0x33800000.
+    fmap castFloatToWord32 (depthFromKey 0xFFFFFE) `shouldBe` Just 0x33800000
+    -- Key 2^24 - 1 is depth 0.
+    depthFromKey 0xFFFFFF `shouldBe` Just 0
+
+  it "is exact: scaled back by 2^24 it is the integer the key leaves" $
+    and [fmap (* 16777216) (depthFromKey key) == Just (fromIntegral (16777215 - key)) | key ← [0, 1, 2, 255, 65535, 0x7FFFFF, 0x800000, 0xFFFFFD, 0xFFFFFE, 0xFFFFFF]]
+      `shouldBe` True
+
+  it "falls as the key grows, so a larger key is nearer, and stays below the cleared 1.0" $ do
+    and [a > b | (a, b) ← zip depths (drop 1 depths)] `shouldBe` True
+    all (< Just 1) (map depthFromKey [0, 1, 0xFFFFFF]) `shouldBe` True
+
+  it "has no depth for a key at or past 2^24, which a validated snapshot never holds" $ do
+    depthFromKey 0x1000000 `shouldBe` Nothing
+    depthFromKey maxBound `shouldBe` Nothing
+    depthKeyLimit `shouldBe` 0x1000000
+  where
+    depths = map depthFromKey [0, 1, 2, 100, 0x7FFFFF, 0x800000, 0xFFFFFE, 0xFFFFFF]
 
 -- ---------------------------------------------------------------------------
 -- The sampler choice
@@ -269,9 +306,22 @@ interfaceSpec = describe "the shaders' checked interfaces" $ do
         [(offset, offset + size) | PushMember offset size ← interfacePushConstants vertex <> interfacePushConstants fragment]
           `shouldBe` concat (replicate 2 [(0, 16), (16, 24), (24, 32), (32, 36), (36, 40), (40, 44)])
 
-  it "declare the instance attributes in the vertex stage" $
-    case checkedVertex orderedShaders of
-      CheckedShader _ description → interfaceVertexInput description `shouldBe` instanceVertexInput
+  it "declare the instance attributes in the vertex stage, which both variants share" $
+    mapM_
+      ( \shaders → case checkedVertex shaders of
+          CheckedShader _ description → interfaceVertexInput description `shouldBe` instanceVertexInput
+      )
+      [orderedShaders, cutoutShaders]
+
+  it "are the same two stages' interfaces for the cutout variant" $
+    case (checkedVertex orderedShaders, checkedFragment orderedShaders, checkedVertex cutoutShaders, checkedFragment cutoutShaders) of
+      (CheckedShader orderedVertexCode orderedVertex, CheckedShader orderedFragmentCode orderedFragment, CheckedShader cutoutVertexCode cutoutVertex, CheckedShader cutoutFragmentCode cutoutFragment) → do
+        interfacePushConstants cutoutVertex `shouldBe` interfacePushConstants orderedVertex
+        interfacePushConstants cutoutFragment `shouldBe` interfacePushConstants orderedFragment
+        interfaceDescriptors cutoutFragment `shouldBe` interfaceDescriptors orderedFragment
+        -- The vertex stage is the same compiled code; the fragment stage is not.
+        cutoutVertexCode `shouldBe` orderedVertexCode
+        (cutoutFragmentCode == orderedFragmentCode) `shouldBe` False
 
   it "declare the same members in both stages" $
     case (checkedVertex orderedShaders, checkedFragment orderedShaders) of

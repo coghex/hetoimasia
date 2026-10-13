@@ -19,8 +19,10 @@
 -- the pass when it holds an offscreen pass, since windowed snapshots hold none
 -- until R2D-13 issues target references; when it holds no window pass — an
 -- empty snapshot is refused, and removing textures publishes a window pass
--- with no layers, while validation refuses a second one; and naming the
--- texture when it references one whose release has been requested.
+-- with no layers, while validation refuses a second one; naming the layer when
+-- it holds a depth-enabled world layer and the session's depth format is not
+-- @D32_SFLOAT@ (D-23; a snapshot with none is unaffected on any device); and
+-- naming the texture when it references one whose release has been requested.
 --
 -- = Holds (D-28)
 --
@@ -56,12 +58,15 @@
 -- the window pass, with 'TargetMetrics' built from the frame's own framebuffer
 -- extent and the window's latest logical extent and content scale (D-29). A
 -- frame whose request carries neither is skipped, as a refusal, through the
--- host's existing backoff; nothing is invented.
+-- host's existing backoff; nothing is invented. The snapshot is planned with
+-- the registered handles' marks (R2D-9), and a host that enabled windowed depth
+-- supplies the frame's depth image ('frameDepthImage').
 --
 -- = State
 --
 -- An 'Adapter' owns the holds, the textures whose release is pending, and the
--- lock that serializes publication with release. The holds and the pending set
+-- lock that serializes publication with release; it is made over the registry
+-- and the renderer, whose session depth format publication checks. The holds and the pending set
 -- are written on the graphics owner's thread by the lifecycle's hooks and by
 -- the release action, and read from any; publication and release run on any
 -- application thread, behind the lock.
@@ -108,7 +113,7 @@ import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word32)
-import Hetoimasia.GPU.Vulkan.Native.Recording (Recorder, Refusal (..))
+import Hetoimasia.GPU.Vulkan.Native.Recording (Image, ImageFormat (..), Recorder, Refusal (..))
 import qualified Hetoimasia.Render.Api.Texture as Api
 import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..), validMetrics)
 import qualified Hetoimasia.Render.TwoD.Snapshot as Snapshot
@@ -120,12 +125,12 @@ import Hetoimasia.Render.TwoD.Snapshot
   , Target (..)
   , layerInstances
   )
-import Hetoimasia.Render.TwoD.Validation (ValidSnapshot, validSnapshot, validateSnapshot)
+import Hetoimasia.Render.TwoD.Validation (Location, ValidSnapshot, validSnapshot, validateSnapshot)
 import qualified Hetoimasia.Render.TwoD.Validation as Validation
-import Hetoimasia.Render.TwoD.Vulkan (Renderer, prepareSnapshot)
+import Hetoimasia.Render.TwoD.Vulkan (Renderer, prepareSnapshot, rendererDepthFormat)
 import Hetoimasia.Render.TwoD.Vulkan.Builders (Builders)
-import Hetoimasia.Render.TwoD.Vulkan.Frame (Attachment (..), FrameInput (..), FrameRefusal (..))
-import Hetoimasia.Render.TwoD.Vulkan.Textures (Textures, isReleased, markReleasedSTM, releaseTextureNow)
+import Hetoimasia.Render.TwoD.Vulkan.Frame (Attachment (..), DepthBinding (..), FrameInput (..), FrameRefusal (..), worldDepthShortfall)
+import Hetoimasia.Render.TwoD.Vulkan.Textures (Textures, isReleased, markReleasedSTM, registeredMarks, releaseTextureNow)
 import Numeric.Natural (Natural)
 
 -- | What a window's published revision holds: the validated snapshot, and the
@@ -211,6 +216,9 @@ data Stage
 data Adapter window = Adapter
   { adapterHost ∷ !(Host window)
   , adapterTextures ∷ !Textures
+  , adapterRenderer ∷ !Renderer
+    -- ^ The renderer the window's frames record with, whose session depth
+    -- format publication checks a snapshot's depth-enabled world layers against.
   , adapterLock ∷ !(MVar ())
   , adapterHolds ∷ !(TVar (Map (window, Natural) (Set Api.TextureHandle)))
   , adapterPending ∷ !(TVar (Map Api.TextureHandle Stage))
@@ -219,8 +227,11 @@ data Adapter window = Adapter
     -- queued in the host.
   }
 
-newAdapter ∷ Host window → Textures → IO (Adapter window)
-newAdapter host textures = Adapter host textures <$> newMVar () <*> newTVarIO Map.empty <*> newTVarIO Map.empty <*> newTVarIO Set.empty
+-- | An adapter over the host, the registry, and the renderer its frames record
+-- with. The renderer's session depth format is what publication requires of a
+-- snapshot holding a depth-enabled world layer (D-23).
+newAdapter ∷ Host window → Textures → Renderer → IO (Adapter window)
+newAdapter host textures renderer = Adapter host textures renderer <$> newMVar () <*> newTVarIO Map.empty <*> newTVarIO Map.empty <*> newTVarIO Set.empty
 
 -- | Why a snapshot was not published.
 data PublishRefusal
@@ -231,6 +242,11 @@ data PublishRefusal
     OffscreenPassHeld !Int
   | -- | The snapshot has no window pass; an empty one is refused.
     NoWindowPass
+  | -- | The snapshot holds a depth-enabled world layer at this location and the
+    -- session's depth format is not @D32_SFLOAT@ (D-23): the session's format,
+    -- 'Nothing' when it offers none. A layer is never degraded to a
+    -- lower-precision depth.
+    WorldDepthRefused !Location !(Maybe ImageFormat)
   | -- | The snapshot references this texture, whose release was requested.
     TextureReleasedInSnapshot !Api.TextureHandle
   | -- | The host holds no such window.
@@ -251,18 +267,21 @@ publish2DSnapshot adapter window candidate = withMVar (adapterLock adapter) $ \_
       (index : _, _) → pure (Left (OffscreenPassHeld index))
       ([], 0) → pure (Left NoWindowPass)
       -- Validation has refused a second window pass already.
-      ([], _) → do
-        let scene = sceneOf valid
-        released ← atomically (filterReleased (Set.toList (sceneReferences scene)))
-        case released of
-          handle : _ → pure (Left (TextureReleasedInSnapshot handle))
-          [] →
-            hostPublish (adapterHost adapter) window scene >>= \case
-              HostPublished revision → pure (Right revision)
-              HostWindowUnknown → pure (Left PublishWindowUnknown)
-              HostClosed → pure (Left PublishHostClosed)
-              HostSharedScenes → pure (Left PublishHostShared)
+      ([], _) → case worldDepthShortfall sessionDepth valid of
+        Just (location, held) → pure (Left (WorldDepthRefused location held))
+        Nothing → do
+          let scene = sceneOf valid
+          released ← atomically (filterReleased (Set.toList (sceneReferences scene)))
+          case released of
+            handle : _ → pure (Left (TextureReleasedInSnapshot handle))
+            [] →
+              hostPublish (adapterHost adapter) window scene >>= \case
+                HostPublished revision → pure (Right revision)
+                HostWindowUnknown → pure (Left PublishWindowUnknown)
+                HostClosed → pure (Left PublishHostClosed)
+                HostSharedScenes → pure (Left PublishHostShared)
   where
+    sessionDepth = rendererDepthFormat (adapterRenderer adapter)
     filterReleased handles = fmap concat (traverse (\handle → (\flagged → [handle | flagged]) <$> isReleased (adapterTextures adapter) handle) handles)
 
 -- | Why a release was not requested.
@@ -394,6 +413,10 @@ data FrameInfo = FrameInfo
     -- ^ The window's logical extent, if the platform has reported one.
   , frameScale ∷ !(Maybe (Float, Float))
     -- ^ The window's content scale, per axis, if it has reported one.
+  , frameDepthImage ∷ !(Maybe Image)
+    -- ^ The frame's generation depth image, which a host that enabled windowed
+    -- depth is given with the request. A pass holding a depth-enabled world
+    -- layer is refused, naming the layer, without it.
   }
   deriving (Eq, Show)
 
@@ -403,13 +426,13 @@ data FrameInfo = FrameInfo
 -- the request carries no logical extent or no content scale, when they make no
 -- valid metrics, and as 'prepareSnapshot' and the recording refuse.
 renderWindowFrame
-  ∷ Builders q inst msgr phys dev cmd
-  → Renderer
+  ∷ Adapter window
+  → Builders q inst msgr phys dev cmd
   → FrameInfo
   → Scene2D
   → Recorder q inst msgr phys dev cmd
   → IO (Either Refusal ())
-renderWindowFrame builders renderer info scene recorder = case (frameLogical info, frameScale info) of
+renderWindowFrame adapter builders info scene recorder = case (frameLogical info, frameScale info) of
   (Nothing, _) → pure (Left (RefusedIllegal "the frame names no logical extent for its window, so no view can be mapped"))
   (_, Nothing) → pure (Left (RefusedIllegal "the frame names no content scale for its window, so no view can be mapped"))
   (Just (logicalWidth, logicalHeight), Just (scaleX, scaleY)) →
@@ -418,9 +441,20 @@ renderWindowFrame builders renderer info scene recorder = case (frameLogical inf
      in if not (validMetrics metrics)
           then pure (Left (RefusedIllegal ("the window's metrics are not usable: " <> Text.pack (show metrics))))
           else
-            prepareSnapshot builders renderer (FrameInput {frameSnapshot = sceneSnapshot scene, frameTarget = const Nothing, frameWindow = Just (Attachment (frameFormat info) width height metrics)}) >>= \case
-              Left refusal → pure (Left (refused refusal))
-              Right recording → either (Left . refused) Right <$> recording recorder
+            registeredMarks (adapterTextures adapter) >>= \marks →
+              prepareSnapshot
+                builders
+                (adapterRenderer adapter)
+                FrameInput
+                  { frameSnapshot = sceneSnapshot scene
+                  , frameMarks = marks
+                  , frameTarget = const Nothing
+                  , frameWindow = Just (Attachment (frameFormat info) width height metrics)
+                  , frameWindowDepth = (`DepthBinding` Depth32Float) <$> frameDepthImage info
+                  }
+                >>= \case
+                  Left refusal → pure (Left (refused refusal))
+                  Right recording → either (Left . refused) Right <$> recording recorder
   where
     refused = \case
       RefusedByBackend refusal → refusal
