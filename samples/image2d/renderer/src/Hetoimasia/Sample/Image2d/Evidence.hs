@@ -249,6 +249,7 @@ evidence Host {hostAct = actOn, hostRecord = recordOn, hostAwait = awaitBatch, h
                         else Nothing
                   , Render.frameWindow = Nothing
                   , Render.frameWindowDepth = Nothing
+                  , Render.frameChunks = const Nothing
                   }
           ticket ← recordOn "recording the frame" $ \builders →
             Render.prepareSnapshot (renderBuilders builders) (preparedRenderer prepared) input >>= \case
