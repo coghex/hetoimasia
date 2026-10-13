@@ -104,6 +104,7 @@ Everything that can refuse is decided first, in `frameWork`, which is pure:
 | `DepthFormatRefused location format` | a pass holding this depth-enabled world layer was given a depth image whose format is not `D32_SFLOAT` (D-23) |
 | `ChunkBufferMissing location chunk` | a layer draws a chunk that has cutout instances in a view that does not cull it, and the frame holds no device buffer for it (`frameChunks`) |
 | `PlanDisagrees location` | the plan's layers and the snapshot's do not pair (planning the same snapshot never produces it) |
+| `ClipNotRepresentable pass view` | a drawing view whose layers select clips has a scissor and an inverse transform for which the clip test's layer-space offsets could overflow a float (below) |
 | `ClipTablesTooLarge bytes window` | the batch's packed clip tables (below) are `bytes` long, and the window is only `window` bytes |
 | `RefusedByBackend refusal` | the backend refused a pipeline, a claim or a command |
 
@@ -550,6 +551,18 @@ index `k > 0` reads entry `clipBase + k − 1`, and one index selects each view'
 own entry. Clip index 0 reads nothing, so a layer none of whose instances selects
 a clip pushes a base of 0 and a centre of the origin and never looks, including
 when the whole region is the single zero entry the next paragraph describes.
+
+**Range.** Every number the fragment stage compares is finite. The table's edges
+are clamped to the finite floats when they are taken about the reference (an edge
+past the largest float is beyond anything a fragment's offset reaches), and a view
+whose clip test could overflow is refused before anything is recorded
+(`ClipNotRepresentable pass view`): the layer-space offset of a fragment's centre
+from the scissor's centre is at most the inverse's linear part applied to half the
+scissor's size, per axis, and that bound, both products of an axis together, must
+not exceed half the largest finite float (`clipRepresentable`). It holds for any
+scene within the floats' own range; it refuses a view whose zoom is so small that
+its scissor spans more than about 10³⁸ units of the layer, where an overflowed
+offset would compare as an infinity and admit a fragment outside its clip.
 
 A frame that draws always has a region: when no table is written, the region is
 one zero entry (16 bytes), because a layout that holds set 2 refuses a draw until
