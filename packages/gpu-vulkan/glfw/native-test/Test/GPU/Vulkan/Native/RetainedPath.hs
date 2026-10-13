@@ -210,13 +210,20 @@ buildersWith submit construction =
 
 -- | The adapter's host: nothing is published to a window, and the releases it
 -- asks for go to the session.
-windowHostOf ∷ RetainedHost → Host Int
-windowHostOf host =
+windowHostOf ∷ RetainedHost → IORef Int → Host Int
+windowHostOf host ran =
   Host
     { hostPublish = \_ _ → pure HostWindowUnknown
-    , hostRequestRelease = retainedRequestRelease host
-    , hostRunOnOwner = retainedRunOnOwner host
+    , hostRequestRelease = \body → retainedRequestRelease host (counted body)
+    , hostRunOnOwner = \body → retainedRunOnOwner host (counted body)
     }
+  where
+    -- Count each release action the owner has run, so the case can wait for one.
+    counted ∷ ReleaseBody → ReleaseBody
+    counted body builders = do
+      answer ← body builders
+      atomicModifyIORef' ran (\count → (count + 1, ()))
+      pure answer
 
 -- ---------------------------------------------------------------------------
 -- The suite
@@ -284,6 +291,8 @@ data Ctx = Ctx
   , ctxMeasures ∷ !(IORef [String])
     -- ^ The measurements, as JSON objects, newest first.
   , ctxRevision ∷ !(IORef Natural)
+  , ctxReleasesRun ∷ !(IORef Int)
+    -- ^ How many release actions the owner has run for the adapter.
   }
 
 handleOf ∷ Ctx → Piece → Api.TextureHandle
@@ -349,12 +358,13 @@ prepare host directory format = do
                 Left failure → pure (Left failure)
                 Right handles → do
                   retained ← newRetained
-                  adapter ← newAdapter (windowHostOf host) textures retained renderer
+                  releasesRun ← newIORef 0
+                  adapter ← newAdapter (windowHostOf host releasesRun) textures retained renderer
                   decoded ← newIORef (Map.fromList [(handle, decodedOf (texel piece)) | (piece, handle) ← handles])
                   uploaded ← newIORef 0
                   measures ← newIORef []
                   revision ← newIORef 0
-                  pure (Right (Ctx host submit submits directory format renderer textures retained adapter (Map.fromList handles) decoded uploaded measures revision))
+                  pure (Right (Ctx host submit submits directory format renderer textures retained adapter (Map.fromList handles) decoded uploaded measures revision releasesRun))
   where
     pieces = [minBound .. maxBound] ∷ [Piece]
     registerPiece builders textures (piece, image) =
@@ -476,10 +486,16 @@ awaitForgotten ctx reference remaining =
       | remaining <= 0 → pure False
       | otherwise → threadDelay 25000 >> awaitForgotten ctx reference (remaining - 1)
 
--- | Run a no-op owner action: the actions queued before it have run when it
--- returns.
-settleOwner ∷ Ctx → IO ()
-settleOwner ctx = () <$ OrderedPath.hostAct (base ctx) "letting the owner settle" (\_ → pure (Right ()))
+-- | Wait, a bounded time, for the owner to have run this many release actions.
+awaitReleaseRun ∷ Ctx → Int → Int → IO Bool
+awaitReleaseRun ctx wanted remaining = do
+  ran ← readIORef (ctxReleasesRun ctx)
+  if ran >= wanted
+    then pure True
+    else
+      if remaining <= 0
+        then pure False
+        else threadDelay 25000 >> awaitReleaseRun ctx wanted (remaining - 1)
 
 -- | A failed setup as a fixture.
 failedAt ∷ Text → Text → FixtureResult
@@ -494,6 +510,7 @@ failedAt name why = FixtureResult name [] [] [] (Just why)
 -- > A  blue     key 5  pixels  2..11 × 2..11     chunk cutout
 -- > B  green    key 3  pixels  8..17 × 8..17     chunk cutout
 -- > T  half red key 4  pixels 10..15 × 10..15    chunk, ordered (tint alpha 128)
+-- > E  cyan     key 3  pixels 14..21 × 12..19    cutout of a second chunk, listed after the first
 -- > M  magenta  key 3  pixels  8..15 × 2..9      dynamic cutout
 -- > Y  yellow   key 9  pixels x..x+5 × 22..27    dynamic cutout, x = 2, 10, 18
 --
@@ -502,39 +519,45 @@ failedAt name why = FixtureResult name [] [] [] (Just why)
 -- * (4, 4): A alone, blue; (9, 5): A over M (key 5 against 3), blue;
 --   (13, 5): M alone, magenta.
 -- * (13, 9): M over B at an equal key 3, the later source, magenta; (16, 16): B alone, green.
+-- * (16, 14): E over B at an equal key 3, the later listed chunk, cyan; (16, 10): B alone, green.
 -- * (13, 12): T over B, T being nearer (key 4 against 3): half red over green is
 --   (255, 127, 0); (10, 10): T behind A (key 4 against 5), blue.
 interleaved ∷ Ctx → IO [FixtureResult]
 interleaved ctx = do
   before ← readIORef (ctxSubmits ctx)
-  buildChunkOf ctx ChunkWorldDepth [a, b, t] >>= \case
-    Left why → pure [failedAt (Text.pack ("interleaved-" <> show n)) why | n ← [1 .. 3 ∷ Int]]
-    Right reference → do
-      framed ← mapM (frameOf reference) (zip [1 ..] [2, 10, 18])
+  first ← buildChunkOf ctx ChunkWorldDepth [a, b, t]
+  second ← buildChunkOf ctx ChunkWorldDepth [e]
+  case (first, second) of
+    (Right reference, Right laterReference) → do
+      framed ← mapM (frameOf [reference, laterReference]) (zip [1 ..] [2, 10, 18])
       standing ← chunkStanding (ctxRetained ctx) reference
       holds ← chunkHolds (ctxAdapter ctx) reference
       submits ← readIORef (ctxSubmits ctx)
       -- The chunk was uploaded once for three frames, and the last frame's revision still holds it.
       let checks =
-            [ ("the chunk's upload was admitted once for all three frames", submits - before == 1)
+            [ ("each chunk's upload was admitted once for all three frames", submits - before == 2)
             , ("the chunk is ready", standing == Just ChunkReady)
             , ("only the last revision still holds the chunk", holds == 1)
             ]
       mapM_ (retire ctx . snd) (drop 2 framed)
       pure [verified checks result | (result, _) ← framed]
+    _ → pure [failedAt (Text.pack ("interleaved-" <> show n)) "a chunk was not built" | n ← [1 .. 3 ∷ Int]]
   where
     white = White
     a = block ctx white (0, 0, 255, 255) 5 (2, 2) (10, 10)
     b = block ctx white (0, 255, 0, 255) 3 (8, 8) (10, 10)
     t = block ctx white (255, 0, 0, 128) 4 (10, 10) (6, 6)
+    -- A second chunk, listed after the first: cyan at an equal key 3 over 14..21 × 12..19.
+    e = block ctx white (0, 255, 255, 255) 3 (14, 12) (8, 8)
     magenta = block ctx white (255, 0, 255, 255) 3 (8, 2) (8, 8)
     yellow x = block ctx white (255, 255, 0, 255) 9 (x, 22) (6, 6)
-    frameOf reference (n, x) = do
+    frameOf references (n, x) = do
       revision ← next ctx
-      let layer = WorldLayerWith DepthEnabled [reference] [magenta, yellow x]
+      let layer = WorldLayerWith DepthEnabled references [magenta, yellow x]
           here = (floor x + 2, 24)
           probes =
-            [ named "a dynamic cutout at an equal key to a chunk cutout wins the tie as the later source" (13, 9) (16, 16)
+            [ named "a dynamic cutout at an equal key to a chunk cutout wins the tie as the later source" (13, 9) (16, 8)
+            , named "a later listed chunk's cutout wins a tie with an earlier chunk's at an equal key" (16, 14) (16, 10)
             , named "a chunk's translucent instance blends over a chunk cutout it is nearer than" (13, 12) (16, 16)
             , named "a chunk's translucent instance is hidden behind a nearer chunk cutout" (10, 10) (13, 12)
             , named "the dynamic cutout is drawn where this frame put it" here (28, 14)
@@ -675,8 +698,9 @@ released ctx =
           withoutChunk = [viewOver (0, 0) (32, 32) [WorldLayerWith DepthEnabled [] [marker]]]
       r1 ← next ctx
       first ← renderFrame ctx "release-1" r1 withChunk [named "the chunk is drawn from the adopted snapshot" (8, 8) (28, 4)]
+      runsBefore ← readIORef (ctxReleasesRun ctx)
       requested ← release2DChunk (ctxAdapter ctx) reference
-      settleOwner ctx
+      ran ← awaitReleaseRun ctx (runsBefore + 1) (400 ∷ Int)
       standingAfterRequest ← chunkStanding (ctxRetained ctx) reference
       holdsAfterRequest ← chunkHolds (ctxAdapter ctx) reference
       pending ← pendingChunkReleases (ctxAdapter ctx)
@@ -695,7 +719,8 @@ released ctx =
       pure
         [ verified [("the release was requested through the adapter", either (const False) (const True) requested)] first
         , verified
-            [ ("the request ran with an adopted revision still holding the chunk, which kept its buffer", standingAfterRequest == Just ChunkReady)
+            [ ("the owner ran the release request", ran)
+            , ("the request ran with an adopted revision still holding the chunk, which kept its buffer", standingAfterRequest == Just ChunkReady)
             , ("one adopted revision held it", holdsAfterRequest == 1)
             , ("the release was pending", pending == Set.singleton reference)
             ]
