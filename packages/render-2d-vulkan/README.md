@@ -155,18 +155,28 @@ backend's `DepthTarget` image and the format the caller made it with:
   frame's request names.
 
 **The `D32_SFLOAT` requirement (choice B, D-23).** World-layer depth is
-`D32_SFLOAT` and nothing else, never degraded to a lower-precision format. The
-recorder refuses, before it records anything and naming the layer: a pass that
-needs a depth attachment and was given none (`NoDepthTarget`), and a pass holding
-a depth-enabled world layer whose supplied image is declared in another format
-(`DepthFormatRefused`), whether or not its scissors leave a pixel. The format is the
-caller's word about the image; a false one is refused by the backend when the
-first pipeline is bound. A snapshot with no depth-enabled world layer is
-unaffected on any device. `requireWorldDepth format snapshot` is the same rule
-for a session's depth format (`selectDepthFormat`), which a host applies when it
-publishes a snapshot, so a snapshot holding a depth-enabled world layer is
-refused at publication, naming the layer, on a device whose depth format is
-another; `depthLayers` lists the layers.
+`D32_SFLOAT` and nothing else, never degraded to a lower-precision format.
+`prepareSnapshot` refuses, before it records or claims anything and naming the
+layer, in this order:
+
+1. a snapshot holding a depth-enabled world layer, in a view whose scissor may be
+   empty or not, when the **session's depth format** (`Builders.buildDepthFormat`,
+   read once by `makeRenderer`) is not `D32_SFLOAT` (`DepthFormatRefused`), or the
+   session offers none (`NoDepthFormat`);
+2. a pass that needs a depth attachment and was given none (`NoDepthTarget`);
+3. a pass holding a depth-enabled world layer whose supplied image is not
+   `D32_SFLOAT` (`DepthFormatRefused`), whether or not its scissors leave a pixel.
+
+The format of a supplied image is the **backend's**, not its maker's:
+`prepareSnapshot` asks `Builders.buildImageFormat` (`imageFormatOf`) for every
+`DepthBinding` and replaces the declared `depthFormat` with the answer, so a
+24-bit image declared as `D32_SFLOAT` is refused, naming the layer, even in a
+layer that only clears; an image the backend no longer holds is the backend's
+refusal. A snapshot with no depth-enabled world layer is unaffected on any
+device. `requireWorldDepth format snapshot` is rule 1 on its own, for a host to
+apply when it publishes a snapshot (a snapshot holding a depth-enabled world layer
+is then refused at publication, naming the layer, on such a session);
+`depthLayers` lists the layers.
 
 **The clear.** Each depth-enabled world layer clears depth to 1.0 within its
 view's scissor rectangle with `clearDepthRect` before its runs. Because
@@ -500,10 +510,11 @@ the production host's per-window scenes.
 ## Not here
 
 Alpha-to-coverage and MSAA; depth formats other than `D32_SFLOAT` for world
-layers; acting on marks (R2D-9: planning here still uses `noCutoutMarks`, and the
-adapter publishes and renders whatever snapshot validates, so windowed depth —
-enabling it and calling `requireWorldDepth` at publication — is not wired by the
-host adapter yet and is not part of R2D-8); application materials and their
+layers; wiring the host adapter to R2D-9: it plans with `noCutoutMarks` and
+publishes and renders whatever snapshot validates, so supplying the registered
+marks, enabling windowed depth and calling `requireWorldDepth` at publication are
+not part of R2D-8 (the recorder's side is `frameMarks`, `frameWindowDepth` and
+`requireWorldDepth`); application materials and their
 capability (R2D-11), clip tables (R2D-12) and per-batch storage tables (R2D-15);
 retained content (R2D-10); creating offscreen targets, issuing their references
 and their lifetimes, holds and releases, and sampling an offscreen pass's target

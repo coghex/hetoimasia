@@ -1504,6 +1504,13 @@ conventions comes from `hetoimasia-math`'s `perspective ZeroToOne YDown`
 ([its contract](../packages/math/README.md)), which promises no byte layout:
 the renderer packs what it pushes itself.
 
+**The format of an image.** `imageFormatOf recording image`
+(`constructImageFormat` through the host's `Construction`) answers the format a
+live image of the session was made with, as the backend holds it, on the owner's
+thread with no native call; a released, replaced or foreign handle has the
+refusal every handle has, and a handle that is not an image `RefusedWrongKind`.
+The 2D renderer checks a depth image's declared format against it (R2D-9).
+
 **The depth format.** `selectDepthFormat` (`constructDepthFormat` through the
 host's `Construction`) answers the depth-only format the backend will use,
 asking the device and never assuming one: the first of `depthFormatPreference`
@@ -6467,7 +6474,10 @@ otherwise):
 8. *formats*: an `R8G8B8A8_SRGB` target and a UNORM one in two passes of one
    frame, drawing the same sRGB texture;
 9. *cutout-art*: a depth-enabled world layer holding binary-alpha art, drawn
-   ordered because nothing is marked;
+   ordered because nothing is marked, into a target that has a `D32_SFLOAT` depth
+   image its pass begins with (R2D-9), so the case needs that format and
+   otherwise reports it and checks the recorder's refusal, as `r2d9-cutout-depth`
+   does;
 10. *placeholders*: a handle whose index no texture holds and one whose
     generation is stale, beside a registered texture;
 11. *snap-boundary*: a snapping view whose sprite's origin is the largest
