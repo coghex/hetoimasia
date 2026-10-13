@@ -14,7 +14,8 @@ others is [the foundation design](../../docs/engine_foundation_design.md).
 
 | Module | Contents |
 | --- | --- |
-| `Hetoimasia.Render.TwoD.Snapshot` | `Snapshot`, `Pass`, `Target` (`WindowTarget`, `OffscreenTarget`), `ClearColour`, `View`, `Viewport`, `Camera`, `Layer` (`WorldLayer`, `UiLayer`), `LayerDepth`, `Instance`, `UvRect`, `Tint`, `Sampler`; `layerInstances`, `depthKeyLimit` |
+| `Hetoimasia.Render.TwoD.Snapshot` | `Snapshot`, `Pass`, `Target` (`WindowTarget`, `OffscreenTarget`), `ClearColour`, `View` (with its `viewClips` table), `Viewport`, `Camera`, `Layer` (`WorldLayer`, `UiLayer`), `LayerDepth`, `Instance`, `UvRect`, `Tint`, `Sampler`; `layerInstances`, `depthKeyLimit` |
+| `Hetoimasia.Render.TwoD.Clip` | `ClipRect`, `ClipEntry` (a view's clip table is a list of them); `ResolvedClip`, `emptyClip`, `clipIsEmpty`, `clipContains` and `resolveClips`, the pure resolver; `clipEntryOfIndex` |
 | `Hetoimasia.Render.TwoD.Settings` | `ViewSettings` and `defaultViewSettings`, `TextureFilter`, `ZoomMode`; `uiScaleRange`, `brightnessRange` |
 | `Hetoimasia.Render.TwoD.Target` | `TargetRef`, the opaque offscreen target reference: `Eq`, `Ord` and `Show` only |
 | `Hetoimasia.Render.TwoD.Target.Backend` | `targetRef ∷ Word32 → Word32 → TargetRef`; `targetRefIndex`, `targetRefGeneration` (backends, and tests standing in for one) |
@@ -46,8 +47,8 @@ as facings, z-slices and isometric projection; none appears here.
 A snapshot is an ordered list of passes. Each pass names its target (the
 window, or an offscreen texture by `TargetRef`), a clear colour and its ordered
 views; the window's pass comes last, and there is at most one. A view is a
-camera, a viewport rectangle within the target, its per-view settings and its
-ordered layers. A layer is a world layer (game units through the camera, with
+camera, a viewport rectangle within the target, its per-view settings, its
+ordered clip table and its ordered layers. A layer is a world layer (game units through the camera, with
 depth enabled or not) or a UI layer (logical pixels from the upper left), each
 holding its instances in submission order. Y points down everywhere: world, UI,
 texture coordinates and clip space.
@@ -65,6 +66,9 @@ texture coordinates and clip space.
   texture handle, a depth key, an RGBA8 tint (a componentwise multiplier), a
   sampler choice (default, nearest, linear), a translucent flag, an additive
   flag, a clip index and a material parameter word.
+- **Clip tables** ([below](#clip-tables)): a view carries an ordered table of
+  clip rectangles, and an instance's clip index, 0 meaning none, selects an
+  entry of its own view's table.
 - **Depth keys** lie in [0, 2²⁴). A larger key is refused, never wrapped or
   collapsed; a larger key is nearer.
 
@@ -72,7 +76,7 @@ texture coordinates and clip space.
 
 `validateSnapshot` turns a candidate into a `ValidSnapshot` or refuses it with
 **every** reason found, each naming where: the pass, view, layer and instance
-index (`AtPass`, `AtView`, `AtLayer`, `AtInstance`). Nothing is clamped,
+index (`AtPass`, `AtView`, `AtClipEntry`, `AtLayer`, `AtInstance`). Nothing is clamped,
 wrapped or corrected, and a valid snapshot holds exactly the candidate's
 values in the candidate's order (`validSnapshot`). Validation is total and
 deterministic, and the refusals come in snapshot order. Everything is checked
@@ -93,7 +97,10 @@ any other.
 | `HalfHeightInvalid` | a fixed half-height is NaN, infinite, zero or negative |
 | `TransformNotFinite`, `UvNotFinite` | an instance's transform or UV rectangle has a NaN or infinite value |
 | `DepthKeyTooLarge` | a depth key is 2²⁴ or more |
-| `ClipIndexNotZero` | a clip index is not zero, until clip tables exist |
+| `ClipIndexUnknown` | an instance's clip index `k` is past its view's clip table, which holds fewer than `k` entries (named by the instance) |
+| `ClipParentInvalid` | a clip entry's parent is not an earlier entry of its table (named by the entry) |
+| `ClipRectInvalid` | a clip rectangle has a NaN or infinite coordinate or a negative extent (named by the entry) |
+| `ClipSpaceMixed` | a clip entry is referenced, directly or through a descendant, from both a world layer and a UI layer (named by the entry) |
 
 NaN and both infinities are refused explicitly, so no range comparison can
 accept one by accident. A snapshot holding only offscreen passes is valid, for
@@ -112,13 +119,70 @@ lifetime, and game code can only compare, order and show one.
 `Hetoimasia.Render.TwoD.Target.Backend` builds and reads one, for backends and
 for tests that stand in for one.
 
+## Clip tables
+
+A view carries an ordered **clip table** (`viewClips`), and an instance's clip
+index selects an entry of it (R2D-12, design D-11). The table's entry `i` is the
+one clip index `i + 1` selects; clip index 0 means no clip. An entry is a
+`ClipRect` (an origin and an extent) and an optional parent: the zero-based
+index `p` of an *earlier* entry of the same table, `0 ≤ p < i`, so a chain only
+runs toward lower indices and cannot close on itself. A clip index always means
+its own view's entry: the same index in two views selects each view's own
+rectangle.
+
+**Space (choice B).** A clip rectangle is axis-aligned in the space of the
+layer whose instances reference it: world units for a world layer, UI logical
+pixels for a UI layer. It therefore moves, turns and zooms with that layer's
+content under the view's transform. World clips use the world mapping, which
+carries the camera's position, rotation and zoom and the snapped translation of
+a pixel-snapping view; UI clips use the UI scale, the content scale and the
+viewport's origin, independent of the camera. An entry is referenced from
+layers of one space only.
+
+**Rectangles.** Membership is half-open: a point is inside when
+`left ≤ x < right` and `top ≤ y < bottom`, with `right = left + width` and
+`bottom = top + height`. A zero width or height holds no point, and clips
+everything; a negative extent or a coordinate that is not finite is refused.
+
+**Validation.** Each entry's rectangle and parent are checked wherever the entry
+sits, including entries no instance uses and entries of a view with no layers.
+An instance's clip index must lie within its view's table. Finally the space of
+every referencing layer, world or UI, is carried through the whole parent chain
+of the entry it selects, and an entry reached from both spaces, directly or
+through different descendants, is refused (`ClipSpaceMixed`): nesting would
+intersect coordinates of different units. The refusals of a view come in this
+order: its camera, viewport and settings, its table's entries, its instances,
+then the mixed spaces. Every other refusal is unchanged.
+
+**The resolver.** `resolveClips ∷ [ClipEntry] → [ResolvedClip]` intersects every
+entry with its whole parent chain, in the entry's space, and answers one
+`ResolvedClip` (the four edges, as floats) per entry in table order. It is pure,
+total and deterministic. The intersection is computed exactly, over `Rational`s,
+and rounded once to the nearest floats, so it does not depend on the depth of a
+chain. An empty intersection is kept as `emptyClip` (all four edges zero),
+which holds no point; an entry whose ancestor is empty is empty however its own
+rectangle lies; two rectangles that only touch intersect in nothing. A sum that
+overflows a float is clamped to the largest finite float, so no resolved field is
+infinite or NaN because of finite endpoints, and a region narrower than the
+spacing of floats at its position resolves as empty. On input that validation
+would refuse, a parent that is not an earlier entry is ignored and a rectangle
+that is not finite, or has a negative extent, resolves as empty.
+
+The draw plan carries each view's resolved table (`plannedClips`). A clip index
+never changes the plan: it neither splits a run nor moves an instance in the
+drawing order, so instances of different clips share one draw, and an accepted
+clip index reaches the encoded flags word unchanged. Applying a clip to a
+fragment is the recorder's and the oracle's: see
+[`hetoimasia-render-2d-vulkan`](../render-2d-vulkan/README.md) and
+[`hetoimasia-render-2d-oracle`](../render-2d-oracle/README.md).
+
 ## The draw plan
 
 `planSnapshot marks valid` is pure and total over a validated snapshot. It
 keeps the snapshot's structure: the passes in list order, within each pass the
 views in order, within each view the layers in order, and within each layer an
 ordered list of draw runs. A `PlannedPass` keeps its target and clear, a
-`PlannedView` its camera, viewport and settings, and a `PlannedLayer` its
+`PlannedView` its camera, viewport, settings and resolved clip table, and a `PlannedLayer` its
 `Location` (`AtLayer`), its `LayerSpace` (`WorldSpace` with its depth, or
 `UiSpace`) and whether it clears depth.
 
@@ -347,9 +411,11 @@ The flags word:
 | 16–31 | clip index (unsigned 16-bit, 0 meaning none) |
 
 The clip index occupies the top 16 bits, so a shader reads it as `flags >> 16`.
-A non-zero clip index is refused until clip tables exist, so a valid layer's
-flags word has its top 16 bits zero for now; `flagsWord` packs any instance, so
-the layout is fixed and tested independently of that refusal.
+A valid layer's clip index is 0 or selects an entry of its view's clip table
+([above](#clip-tables)), and encoding writes it unchanged: it neither renumbers
+nor resolves it, so the table's entry order is the one a shader indexes.
+`flagsWord` packs any instance, so the layout is fixed and tested independently
+of validation.
 
 **Drawing order.** `encodeLayerInDrawingOrder planned layer` writes the same
 chunks permuted by a planned layer's drawing order (`drawingOrder`): its *k*-th
@@ -397,8 +463,9 @@ content and its merge with the dynamic snapshot (R2D-10); application materials
 and splitting runs between them (R2D-11); computing or registering a texture's
 mark (R2D-7, R2D-8); recording, shaders,
 samplers and everything in `render-2d-vulkan`; publication; retained static
-content; material data records and clip tables; sampling offscreen targets; and
-Lua bindings.
+content and its clip tables (R2D-10); material data records; sampling offscreen
+targets; stencil-based or hardware clipping and rounded or non-rectangular
+clips; and Lua bindings.
 
 ## Tests
 
@@ -418,6 +485,10 @@ window-pass rules, the zoom list's refusals, the instance layout field by field
 against bytes written out by hand and an independent reference encoder, zero,
 one and many instances, the flags word for every sampler choice and flag
 combination with its reserved bits zero and the clip index in the top 16 bits,
+every clip refusal at its location, nested and three-deep intersections, an
+empty intersection and its descendants, edges that only touch, a zero extent,
+large finite coordinates and the resolver's determinism over generated tables,
+a clip index never splitting a run, an accepted index surviving the encoder,
 and, through separately compiled external clients, that a validated value and
 an offscreen target reference cannot be forged. Generated and hand-written
 inputs sit side by side. For the draw plan it checks the routing of every
