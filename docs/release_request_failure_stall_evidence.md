@@ -162,6 +162,28 @@ Locally on macOS at `bc80ade8`: `bash tools/vulkan/run.sh test
 hetoimasia-gpu-vulkan-glfw:test:integration-tests` 160 examples, 0 failures;
 `cabal build all` warning-clean.
 
+## Tested and final revisions
+
+The acceptance batch F1 ran on the code at `bc80ade8` (the stress workflow
+built the pull request's merge ref `c07394429cad`, whose toolchain record is in
+the run's `stress-438-binary` artifact). The workflow and `stress-438/` were
+then removed in `9f525a81`, and `origin/master` (documentation only) was merged
+in at `d3a0d52b`. The production sources, the tests, the dependencies and every
+build input are the same bytes at the tested and the final revision:
+
+```
+git diff --name-only bc80ade8 d3a0d52b | grep -v '\.md$'
+.github/workflows/stress-438.yml
+stress-438/batch.json
+stress-438/run-variant.sh
+```
+
+and those three are the removed temporary files; the markdown files that differ
+are the documentation merged from master. `git diff bc80ade8 d3a0d52b --
+packages tools '*.cabal' 'cabal.project*'` is empty apart from markdown. So no
+new acceptance batch was owed. The local acceptance commands were rerun at
+`d3a0d52b` (the planner's required groups for that head).
+
 ## A note that is not part of this fix
 
 The same wake rule means an application that reports a validation error from
