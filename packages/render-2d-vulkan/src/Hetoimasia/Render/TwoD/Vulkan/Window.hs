@@ -19,8 +19,8 @@
 -- the pass when it holds an offscreen pass, since windowed snapshots hold none
 -- until R2D-13 issues target references; when it holds no window pass — an
 -- empty snapshot is refused, and removing textures publishes a window pass
--- with no layers; and naming the texture when it references one whose release
--- has been requested.
+-- with no layers, while validation refuses a second one; and naming the
+-- texture when it references one whose release has been requested.
 --
 -- = Holds (D-28)
 --
@@ -221,9 +221,10 @@ publish2DSnapshot ∷ Adapter window → window → Snapshot → IO (Either Publ
 publish2DSnapshot adapter window candidate = withMVar (adapterLock adapter) $ \_ →
   case validateSnapshot candidate of
     Left reasons → pure (Left (SnapshotInvalid reasons))
-    Right valid → case ([index | (index, Pass {passTarget = OffscreenTarget _}) ← zip [0 ..] (Snapshot.snapshotPasses candidate)], [() | Pass {passTarget = WindowTarget} ← Snapshot.snapshotPasses candidate]) of
+    Right valid → case ([index | (index, Pass {passTarget = OffscreenTarget _}) ← zip [0 ..] (Snapshot.snapshotPasses candidate)], length [() | Pass {passTarget = WindowTarget} ← Snapshot.snapshotPasses candidate]) of
       (index : _, _) → pure (Left (OffscreenPassHeld index))
-      ([], []) → pure (Left NoWindowPass)
+      ([], 0) → pure (Left NoWindowPass)
+      -- Validation has refused a second window pass already.
       ([], _) → do
         let scene = sceneOf valid
         released ← atomically (filterReleased (Set.toList (sceneReferences scene)))
@@ -240,24 +241,26 @@ publish2DSnapshot adapter window candidate = withMVar (adapterLock adapter) $ \_
 
 -- | Why a release was not requested.
 data ReleaseRefusal
-  = -- | The texture was never registered, or its release was already requested.
+  = -- | The texture was never registered, or its release has already run.
     ReleaseUnknown !Api.TextureHandle
   | -- | The window host refused the request, saying why.
     ReleaseRequestRefused !Text
   deriving (Eq, Show)
 
 -- | Mark the texture released and ask the host to release it behind its
--- barrier, once no adopted revision holds it.
+-- barrier, once no adopted revision holds it. A request the host refused
+-- leaves the texture marked and pending, and asking again for the same handle
+-- repeats the request; nothing else is asked twice, and a handle whose release
+-- has run, or that was never registered, is refused as unknown.
 release2DTexture ∷ Adapter window → Api.TextureHandle → IO (Either ReleaseRefusal ())
 release2DTexture adapter handle = withMVar (adapterLock adapter) $ \_ → do
-  marked ← markReleasedHandle
-  if not marked
+  marked ← markReleased (adapterTextures adapter) handle
+  waiting ← Set.member handle <$> readTVarIO (adapterPending adapter)
+  if not (marked || waiting)
     then pure (Left (ReleaseUnknown handle))
     else do
       atomically (modifyTVar' (adapterPending adapter) (Set.insert handle))
       either (Left . ReleaseRequestRefused) Right <$> requestRelease adapter handle
-  where
-    markReleasedHandle = markReleased (adapterTextures adapter) handle
 
 -- | Ask the host to run the release of this texture after its barrier.
 requestRelease ∷ Adapter window → Api.TextureHandle → IO (Either Text ())
@@ -338,7 +341,7 @@ renderWindowFrame builders renderer info scene recorder = case (frameLogical inf
      in if not (validMetrics metrics)
           then pure (Left (RefusedIllegal ("the window's metrics are not usable: " <> Text.pack (show metrics))))
           else
-            prepareSnapshot builders renderer (FrameInput (sceneSnapshot scene) (const Nothing) (Just (Attachment (frameFormat info) width height metrics))) >>= \case
+            prepareSnapshot builders renderer (FrameInput {frameSnapshot = sceneSnapshot scene, frameTarget = const Nothing, frameWindow = Just (Attachment (frameFormat info) width height metrics)}) >>= \case
               Left refusal → pure (Left (refused refusal))
               Right recording → either (Left . refused) Right <$> recording recorder
   where

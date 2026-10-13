@@ -19,6 +19,7 @@ module Test.Render.TwoD.Vulkan.Windows (spec) where
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
+import Data.Foldable (toList)
 import Data.List.NonEmpty (NonEmpty ((:|)))
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
@@ -62,6 +63,8 @@ newtype Queued = Queued ReleaseBody
 data Fake = Fake
   { fakePublished ∷ !(TVar [(Int, Natural, Scene2D)])
   , fakeQueued ∷ !(TVar [Queued])
+  , fakeRefusing ∷ !(TVar Bool)
+    -- ^ Whether the host refuses the release requests it is asked for.
   }
 
 data Env = Env
@@ -78,6 +81,7 @@ newFake windows = do
   revisions ← newTVarIO (Map.fromList [(window, 0) | window ← windows])
   published ← newTVarIO []
   queued ← newTVarIO []
+  refusing ← newTVarIO False
   let publish window scene = atomically $ do
         known ← Map.lookup window <$> readTVar revisions
         case known of
@@ -87,8 +91,10 @@ newFake windows = do
             modifyTVar' published (<> [(window, revision + 1, scene)])
             pure (HostPublished (revision + 1))
       request ∷ ReleaseBody → IO (Either Text ())
-      request body = Right () <$ atomically (modifyTVar' queued (<> [Queued body]))
-  pure (Host publish request, Fake published queued)
+      request body = atomically $ do
+        refused ← readTVar refusing
+        if refused then pure (Left "the host's queue is full") else Right () <$ modifyTVar' queued (<> [Queued body])
+  pure (Host publish request, Fake published queued refusing)
 
 withEnv ∷ [Int] → (Env → IO a) → IO a
 withEnv windows action = do
@@ -273,7 +279,7 @@ publishSpec = describe "publishing a snapshot" $ do
         Left (SnapshotInvalid (reason :| _)) → Validation.refusalReason reason `shouldBe` Validation.ClearColourInvalid
         other → expectationFailure ("expected validation's reasons, found " <> show other)
 
-  it "refuses a snapshot holding an offscreen pass, naming the pass, and an empty snapshot" $
+  it "refuses a snapshot holding an offscreen pass, naming the pass, an empty one and one holding two window passes" $
     withEnv [1] $ \env → do
       let offscreen = Pass (OffscreenTarget (targetRef 1 1)) (ClearColour 0 0 0 1) []
           window = Pass WindowTarget (ClearColour 0 0 0 1) []
@@ -281,6 +287,12 @@ publishSpec = describe "publishing a snapshot" $ do
       publish2DSnapshot (envAdapter env) 1 (Snapshot [offscreen, window]) >>= (`shouldBe` Left (OffscreenPassHeld 0))
       publish2DSnapshot (envAdapter env) 1 (Snapshot [offscreen]) >>= (`shouldBe` Left (OffscreenPassHeld 0))
       publish2DSnapshot (envAdapter env) 1 (Snapshot []) >>= (`shouldBe` Left NoWindowPass)
+      -- A second window pass is validation's refusal, with its reason.
+      publish2DSnapshot (envAdapter env) 1 (Snapshot [window, window]) >>= \case
+        Left (SnapshotInvalid reasons) → map Validation.refusalReason (toList reasons) `shouldSatisfy` elem Validation.MultipleWindowPasses
+        other → expectationFailure ("expected validation's reasons, found " <> show other)
+      -- Nothing refused was published.
+      length <$> readTVarIO (fakePublished (envFake env)) >>= (`shouldBe` 1)
 
   it "refuses a snapshot that references a texture whose release was requested, naming it, while another publishes" $
     withEnv [1] $ \env → do
@@ -368,13 +380,37 @@ releaseSpec = describe "releasing a texture behind the host's barrier" $ do
       length <$> readTVarIO (fakeQueued (envFake env)) >>= (`shouldBe` 1)
       resolves env handle >>= (`shouldBe` True)
 
-  it "refuses a second release of the same handle, and one of a handle never registered" $
+  it "refuses the release of a handle never registered, and of one whose release has run" $
     withEnv [1] $ \env → do
       handle ← registered env 1 True DefaultMark
       release2DTexture (envAdapter env) handle >>= (`shouldBe` Right ())
+      _ ← runQueued env
       release2DTexture (envAdapter env) handle >>= (`shouldBe` Left (ReleaseUnknown handle))
       let stranger = ApiBackend.textureHandle 12 1
       release2DTexture (envAdapter env) stranger >>= (`shouldBe` Left (ReleaseUnknown stranger))
+
+  it "repeats the request when a handle whose release is pending is released again, and releases once however many ran" $
+    withEnv [1] $ \env → do
+      handle ← registered env 1 True DefaultMark
+      release2DTexture (envAdapter env) handle >>= (`shouldBe` Right ())
+      release2DTexture (envAdapter env) handle >>= (`shouldBe` Right ())
+      runQueued env >>= (`shouldBe` [Right (), Right ()])
+      resolves env handle >>= (`shouldBe` False)
+      pendingReleases (envAdapter env) >>= (`shouldBe` Set.empty)
+
+  it "keeps a texture marked released and pending when the host refused the request, which asking again repeats" $
+    withEnv [1] $ \env → do
+      handle ← registered env 1 True DefaultMark
+      atomically (writeTVar (fakeRefusing (envFake env)) True)
+      release2DTexture (envAdapter env) handle >>= (`shouldBe` Left (ReleaseRequestRefused "the host's queue is full"))
+      atomically (isReleased (envTextures env) handle) >>= (`shouldBe` True)
+      pendingReleases (envAdapter env) >>= (`shouldBe` Set.singleton handle)
+      publish2DSnapshot (envAdapter env) 1 (windowSnapshot [handle]) >>= (`shouldBe` Left (TextureReleasedInSnapshot handle))
+      length <$> readTVarIO (fakeQueued (envFake env)) >>= (`shouldBe` 0)
+      atomically (writeTVar (fakeRefusing (envFake env)) False)
+      release2DTexture (envAdapter env) handle >>= (`shouldBe` Right ())
+      runQueued env >>= (`shouldBe` [Right ()])
+      resolves env handle >>= (`shouldBe` False)
 
   it "releases at once, once the barrier is met, a texture no adopted revision holds" $
     withEnv [1] $ \env → do
