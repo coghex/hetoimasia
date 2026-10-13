@@ -538,8 +538,12 @@ a single-precision absolute coordinate near 65536 is spaced 1/128 apart, which
 at a zoom of 100 is most of a pixel, so mapping a fragment back to the world and
 comparing it with an edge at 65536.1484375 admits a pixel 0.34 pixel outside it,
 whereas the edge about the reference (65536) is the exact 0.1484375, and the
-fragment's offset a small number. The difference (`rebaseClip`) is taken in
-double precision from the resolved floats and rounded once. The reference
+fragment's offset a small number. The difference (`rebaseClip`) is taken
+exactly, over `Rational`s, from the resolved floats and the exact reference, and
+rounded once: a reference rounded first (to a double, say) loses the low bits an
+extreme zoom measures its edges against (at zoom 2⁶⁰ about a camera at world x =
+1, the reference 1 + 2⁻⁵⁶ would become 1, and the left edge 0 instead of −2⁻⁵⁶,
+discarding pixels 8.5 pixels inside the clip). The reference
 depends on the layer's transform, so a view's table is written once for **each
 space, world or UI, one of its layers selects a clip from** (some instance has a
 clip index), the whole table about that space's reference, and a space no layer
@@ -562,10 +566,19 @@ whose clip test could overflow is refused before anything is recorded
 (`ClipNotRepresentable pass view`): the layer-space offset of a fragment's centre
 from the scissor's centre is at most the inverse's linear part applied to half the
 scissor's size, per axis, and that bound, both products of an axis together, must
-not exceed half the largest finite float (`clipRepresentable`). It holds for any
-scene within the floats' own range; it refuses a view whose zoom is so small that
-its scissor spans more than about 10³⁸ units of the layer, where an overflowed
-offset would compare as an infinity and admit a fragment outside its clip.
+not exceed half the largest finite float, and the layer's scale, the pixels a
+unit spans, must not exceed 2¹⁰⁰ (`clipRepresentable`; beyond that, a device that
+flushes denormals to zero would move an edge by a visible amount). Within both,
+the test agrees with exact geometry to a few millionths of a pixel: the offset is
+an exact difference of small numbers, a product by a coefficient that carries a
+relative error of 2⁻²⁴, and a comparison with an edge that carries the same. It
+refuses a view whose zoom is so small that its scissor spans more than about
+10³⁸ units of the layer, where an overflowed offset would compare as an infinity
+and admit a fragment outside its clip, and one whose layer spans more than 2¹⁰⁰
+pixels a unit. The recorder's examples sweep the test, as the fragment stage
+evaluates it on the tables the recorder writes, against exact geometry at every
+pixel more than 0.07 pixel from a clip's edge, over zooms from 2⁻¹⁰⁰ to 2¹⁰⁰,
+cameras at the origin and far from it, turns, UI scales and viewport origins.
 
 A frame that draws always has a region: when no table is written, the region is
 one zero entry (16 bytes), because a layout that holds set 2 refuses a draw until
