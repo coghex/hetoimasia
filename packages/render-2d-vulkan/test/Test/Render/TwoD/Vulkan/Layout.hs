@@ -33,6 +33,7 @@ import Hetoimasia.Render.Api.Texture.Backend (textureHandle)
 import Hetoimasia.Render.TwoD.Encoding (encodeLayer, flagsWord)
 import Hetoimasia.Render.TwoD.Mapping (viewportContains)
 import Hetoimasia.Render.TwoD.Settings (TextureFilter (..), defaultViewSettings)
+import Hetoimasia.Render.TwoD.Material (defaultMaterial)
 import Hetoimasia.Render.TwoD.Snapshot
 import Hetoimasia.Render.TwoD.Validation (ValidLayer, validLayers, validateSnapshot)
 import Hetoimasia.Render.TwoD.Vulkan.Layout
@@ -116,10 +117,10 @@ scissorSpec = describe "the scissor of a view" $ do
 
 pushSpec ∷ Spec
 pushSpec = describe "the push block" $ do
-  it "is 44 bytes in six members that tile it, each at its natural alignment" $ do
-    pushBytes `shouldBe` 44
+  it "is 48 bytes in seven members that tile it, each at its natural alignment" $ do
+    pushBytes `shouldBe` 48
     [(offset, size) | PushMember offset size ← pushMembers]
-      `shouldBe` [(0, 16), (16, 8), (24, 8), (32, 4), (36, 4), (40, 4)]
+      `shouldBe` [(0, 16), (16, 8), (24, 8), (32, 4), (36, 4), (40, 4), (44, 4)]
     -- Each member starts where the one before ends.
     and (zipWith (\(PushMember offset size) (PushMember next _) → offset + size == next) pushMembers (drop 1 pushMembers)) `shouldBe` True
     sum [size | PushMember _ size ← pushMembers] `shouldBe` fromIntegral pushBytes
@@ -147,6 +148,7 @@ pushSpec = describe "the push block" $ do
         , [0x00, 0x00, 0xC0, 0x3F] -- 32: brightness = 1.5
         , [0x02, 0x00, 0x00, 0x00] -- 36: filter = linear (2)
         , [0x01, 0x00, 0x00, 0x00] -- 40: snap on
+        , [0x00, 0x00, 0x00, 0x00] -- 44: record base, zero until a run pushes its own
         ]
 
   it "packs nearest as 1 and snap off as 0, with the transform's off-diagonal and negative values" $ do
@@ -172,6 +174,7 @@ pushSpec = describe "the push block" $ do
         , [0x00, 0x00, 0x00, 0x3F] -- brightness = 0.5
         , [0x01, 0x00, 0x00, 0x00] -- filter = nearest (1)
         , [0x00, 0x00, 0x00, 0x00] -- snap off
+        , [0x00, 0x00, 0x00, 0x00] -- record base
         ]
 
   it "gives a filter the code an instance's sampler choice uses for it" $ do
@@ -300,11 +303,11 @@ samplerSpec = describe "the sampler an instance resolves to" $ do
 
 interfaceSpec ∷ Spec
 interfaceSpec = describe "the shaders' checked interfaces" $ do
-  it "declare one push block of 44 bytes in both stages" $
+  it "declare one push block of 128 bytes in both stages: the engine's 48 and the application's bytes reserved" $
     case (checkedVertex orderedShaders, checkedFragment orderedShaders) of
       (CheckedShader _ vertex, CheckedShader _ fragment) →
         [(offset, offset + size) | PushMember offset size ← interfacePushConstants vertex <> interfacePushConstants fragment]
-          `shouldBe` concat (replicate 2 [(0, 16), (16, 24), (24, 32), (32, 36), (36, 40), (40, 44)])
+          `shouldBe` concat (replicate 2 [(0, 16), (16, 24), (24, 32), (32, 36), (36, 40), (40, 44), (44, 48), (48, 128)])
 
   it "declare the instance attributes in the vertex stage, which both variants share" $
     mapM_
@@ -327,7 +330,7 @@ interfaceSpec = describe "the shaders' checked interfaces" $ do
     case (checkedVertex orderedShaders, checkedFragment orderedShaders) of
       (CheckedShader _ vertex, CheckedShader _ fragment) → do
         interfacePushConstants vertex `shouldBe` interfacePushConstants fragment
-        length (interfacePushConstants vertex) `shouldBe` 6
+        length (interfacePushConstants vertex) `shouldBe` 8
 
 -- ---------------------------------------------------------------------------
 -- Fixtures
@@ -345,7 +348,8 @@ distinctInstance =
     , instanceTranslucent = True
     , instanceAdditive = True
     , instanceClip = 0
-    , instanceMaterial = 0xDEADBEEF
+    , instanceParameter = 0xDEADBEEF
+    , instanceMaterial = defaultMaterial
     }
 
 -- | The validated layer holding this one instance.

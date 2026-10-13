@@ -22,6 +22,7 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , PipelineLayout
   , Refusal
   , RingSize
+  , StorageWindow
   )
 import Hetoimasia.GPU.Vulkan.Native.Shader (CheckedShaders)
 import Hetoimasia.GPU.Vulkan.Native.Uploads (UploadRefusal, UploadTicket)
@@ -33,11 +34,16 @@ import Hetoimasia.GPU.Vulkan.Native.TextureTable
   )
 
 data Builders q inst msgr phys dev cmd = Builders
-  { buildRing ∷ RingSize → IO (Either Refusal ())
+  { buildRing ∷ RingSize → StorageWindow → IO (Either Refusal ())
+    -- ^ The shared ring, with the storage-table window the batches' material
+    -- records are bound through (R2D-11).
+  , buildStorageTable ∷ IO (Either Refusal ())
+    -- ^ The session's storage table, set 2 over the ring's window, once; it
+    -- needs the ring made with a window.
   , buildTable ∷ TableConfig → IO (Either Refusal ())
   , buildTableLayout ∷ CheckedShaders → IO (Either Refusal PipelineLayout)
-    -- ^ A shader-sampled table pipeline layout: one that declares no sampler
-    -- offset, over these shaders.
+    -- ^ A shader-sampled table pipeline layout that also holds the storage
+    -- table's set 2: one that declares no sampler offset, over these shaders.
   , buildPipeline ∷ PipelineLayout → CheckedShaders → Word32 → PipelineBlend → IO (Either Refusal Pipeline)
     -- ^ A pipeline over the layout for a colour format's @VkFormat@ code, which
     -- declares no depth.

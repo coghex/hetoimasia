@@ -86,7 +86,11 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , constructImage
   , constructReadback
   , constructBuffer
-  , constructRing
+  , constructRingWith
+  , constructStorageTable
+  , constructTablePipelineLayoutWith
+  , TableLayoutOptions (..)
+  , TableUse (..)
   , constructShaderSampledTablePipelineLayout
   , constructTextureTable
   , handOverVulkanTarget
@@ -284,9 +288,10 @@ awaitReadiness vulkan = do
 renderBuildersOf ∷ Construction q inst msgr phys dev cmd → Render.Builders q inst msgr phys dev cmd
 renderBuildersOf construction =
   Render.Builders
-    { Render.buildRing = constructRing construction
+    { Render.buildRing = constructRingWith construction
+    , Render.buildStorageTable = constructStorageTable construction
     , Render.buildTable = constructTextureTable construction
-    , Render.buildTableLayout = constructShaderSampledTablePipelineLayout construction
+    , Render.buildTableLayout = \shaders → constructTablePipelineLayoutWith construction shaders (TableLayoutOptions TableShaderSampler True)
     , Render.buildPipeline = constructBlendedCheckedPipeline construction
     , Render.buildDepthPipeline = constructDepthCheckedPipeline construction
     , Render.buildDepthFormat = constructDepthFormat construction

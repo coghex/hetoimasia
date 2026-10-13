@@ -62,11 +62,14 @@ library
         Hetoimasia.Render.TwoD.Vulkan.Chunks
         Hetoimasia.Render.TwoD.Vulkan.Frame
         Hetoimasia.Render.TwoD.Vulkan.Layout
+        Hetoimasia.Render.TwoD.Vulkan.Material
+        Hetoimasia.Render.TwoD.Vulkan.Material.Sample
         Hetoimasia.Render.TwoD.Vulkan.ShaderInterfaces
         Hetoimasia.Render.TwoD.Vulkan.Shaders
         Hetoimasia.Render.TwoD.Vulkan.Textures
         Hetoimasia.Render.TwoD.Vulkan.Window
     other-modules:
+        Hetoimasia.Render.TwoD.Vulkan.MaterialSources
         Hetoimasia.Render.TwoD.Vulkan.ShaderSources
     build-depends:
         base >=4.22 && <4.23,
@@ -74,6 +77,7 @@ library
         containers >=0.8 && <0.9,
         deepseq >=1.5 && <1.6,
         stm >=2.5.3 && <2.6,
+        template-haskell >=2.24 && <2.25,
         text >=2.1 && <2.2,
         hetoimasia-asset ==0.1.0.0,
         hetoimasia-gpu-vulkan-native ==0.1.0.0,

@@ -7,9 +7,11 @@
 -- 'buildRetainedChunk', on the graphics owner's thread inside an action that
 -- lends the host's 'Builders', turns a list of instances into a 'ChunkRef':
 --
--- 1. it builds the immutable description with @render-2d@'s 'buildChunk' for one
---    kind of layer, routing the instances once against the textures' registered
---    marks (D-3, D-22), and refuses the instances or the bounds that do not
+-- 1. it builds the immutable description with @render-2d@'s 'buildChunk' (or
+--    'buildChunkWith', for a chunk that carries its own records for the
+--    application materials its instances use, R2D-11) for one kind of layer,
+--    routing the instances once against the textures' registered marks (D-3,
+--    D-22), and refuses the instances, the records or the bounds that do not
 --    validate, with every reason;
 -- 2. it encodes the cutout-path instances, 64 bytes each in the order the buffer
 --    holds them ('encodeChunkCutouts');
@@ -31,6 +33,12 @@
 -- refusal, none of which asking again changes, among them 'UploadOversized'
 -- (a chunk whose cutout bytes cannot fit the staging buffer at all: build it as
 -- smaller chunks) and a failed or closed session.
+--
+-- A chunk's records are not retained on the device: they are written into the
+-- batch's storage region each frame, beside the view's, and the textures their
+-- handles name are held with the chunk's, so a snapshot that lists the chunk
+-- holds them as it holds the instances' own. A chunk's records follow the hold
+-- and release rules of the chunk itself ("Hetoimasia.Render.TwoD.Vulkan.Window").
 --
 -- = Standing
 --
@@ -65,6 +73,7 @@ module Hetoimasia.Render.TwoD.Vulkan.Chunks
   , newRetained
   , BuildRefusal (..)
   , buildRetainedChunk
+  , buildRetainedChunkWith
   , ChunkStanding (..)
   , chunkStanding
   , chunkStandingSTM
@@ -97,9 +106,10 @@ import Hetoimasia.Render.TwoD.Chunk
   , ChunkRef
   , ChunkRefusal
   , Chunks
-  , buildChunk
+  , buildChunkWith
   , chunksFrom
   )
+import Hetoimasia.Render.TwoD.Material (MaterialRecord, MaterialRef)
 import Hetoimasia.Render.TwoD.Chunk.Backend (chunkRef, chunkRefGeneration, chunkRefIndex)
 import Hetoimasia.Render.TwoD.DrawPlan (CutoutMarks)
 import Hetoimasia.Render.TwoD.Encoding (encodeChunkCutouts)
@@ -159,8 +169,25 @@ buildRetainedChunk
   → BoundsRequest
   → [Instance]
   → IO (Either BuildRefusal ChunkRef)
-buildRetainedChunk builders (Retained ledger) marks kind bounds instances =
-  case buildChunk marks kind bounds instances of
+buildRetainedChunk builders retained marks kind bounds = buildRetainedChunkWith builders retained marks kind bounds Map.empty
+
+-- | 'buildRetainedChunk' for a chunk that carries its own records (R2D-11, D-31)
+-- for the application materials its instances use: each must have the layout its
+-- material declares and each instance's parameter word must index the records
+-- the chunk holds for its material, or the build is refused with every reason
+-- ('BuildInvalid'). Whether the materials were issued to the renderer the chunk
+-- is drawn by is checked at publication and at recording, naming the instance.
+buildRetainedChunkWith
+  ∷ Builders q inst msgr phys dev cmd
+  → Retained
+  → CutoutMarks
+  → ChunkKind
+  → BoundsRequest
+  → Map MaterialRef [MaterialRecord]
+  → [Instance]
+  → IO (Either BuildRefusal ChunkRef)
+buildRetainedChunkWith builders (Retained ledger) marks kind bounds records instances =
+  case buildChunkWith marks kind bounds records instances of
     Left refusals → pure (Left (BuildInvalid refusals))
     Right described → mask_ $ do
       made ← deviceFor (encodeChunkCutouts described)

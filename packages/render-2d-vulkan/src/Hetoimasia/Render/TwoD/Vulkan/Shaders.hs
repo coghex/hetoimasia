@@ -59,8 +59,13 @@
 --
 -- Material, wrapping and output are separate functions, and both variants share
 -- the lookup, the sampler choice and the material, so an application material
--- (R2D-11) replaces @material@ alone and cannot omit the tint, the brightness
--- or the output.
+-- (R2D-11, "Hetoimasia.Render.TwoD.Vulkan.Material") replaces @material@ alone
+-- and cannot omit the tint, the brightness or the output.
+--
+-- Every shader declares the same 128-byte push block (the engine's members, the
+-- application's, then reserved words), so the built-in shaders declare all the
+-- application's bytes as reserved and a material's declare its own members and
+-- the rest; one pipeline layout serves them all.
 module Hetoimasia.Render.TwoD.Vulkan.Shaders
   ( orderedShaders
   , cutoutShaders
@@ -68,14 +73,20 @@ module Hetoimasia.Render.TwoD.Vulkan.Shaders
 
 import Hetoimasia.GPU.Vulkan.Native.Shader (CheckedShaders (..), checkedFragmentShader, checkedVertexShader)
 import Hetoimasia.Render.TwoD.Vulkan.ShaderInterfaces (orderedFragmentInterface, orderedVertexInterface)
-import Hetoimasia.Render.TwoD.Vulkan.ShaderSources (cutoutTail, fragmentPrelude, orderedTail, vertexSource)
+import Hetoimasia.Render.TwoD.Vulkan.ShaderSources
+  ( builtInFragmentSource
+  , builtInPushTail
+  , cutoutTail
+  , orderedTail
+  , vertexSource
+  )
 
 -- | The ordered path's shaders: premultiplied-alpha blending's source.
 orderedShaders ∷ CheckedShaders
 orderedShaders =
   CheckedShaders
-    { checkedVertex = $(checkedVertexShader orderedVertexInterface vertexSource)
-    , checkedFragment = $(checkedFragmentShader orderedFragmentInterface (fragmentPrelude <> orderedTail))
+    { checkedVertex = $(checkedVertexShader orderedVertexInterface (vertexSource builtInPushTail))
+    , checkedFragment = $(checkedFragmentShader orderedFragmentInterface (builtInFragmentSource orderedTail))
     }
 
 -- | The cutout path's shaders: the same vertex stage and the cutout variant of
@@ -83,6 +94,7 @@ orderedShaders =
 cutoutShaders ∷ CheckedShaders
 cutoutShaders =
   CheckedShaders
-    { checkedVertex = $(checkedVertexShader orderedVertexInterface vertexSource)
-    , checkedFragment = $(checkedFragmentShader orderedFragmentInterface (fragmentPrelude <> cutoutTail))
+    { checkedVertex = $(checkedVertexShader orderedVertexInterface (vertexSource builtInPushTail))
+    , checkedFragment = $(checkedFragmentShader orderedFragmentInterface (builtInFragmentSource cutoutTail))
     }
+

@@ -33,6 +33,7 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , formatCode
   , selectDepthFormat
   , validateRingSize
+  , validateStorageWindow
   )
 import qualified Hetoimasia.GPU.Vulkan.Native.Recording as Native
 import Hetoimasia.GPU.Vulkan.Native.TextureTable (validateTableConfig)
@@ -43,6 +44,7 @@ import Hetoimasia.Render.Api.Texture.Backend (textureHandle)
 import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..))
 import Hetoimasia.Render.TwoD.Settings (TextureFilter (..), ViewSettings (..), defaultViewSettings)
 import Hetoimasia.Render.TwoD.DrawPlan (CutoutMarks, DrawPath (..), cutoutMarks, noCutoutMarks)
+import Hetoimasia.Render.TwoD.Material (defaultMaterial)
 import Hetoimasia.Render.TwoD.Snapshot
 import Hetoimasia.Render.TwoD.Target (TargetRef)
 import Hetoimasia.Render.TwoD.Target.Backend (targetRef)
@@ -83,7 +85,8 @@ sprite x key sampler =
     , instanceTranslucent = False
     , instanceAdditive = False
     , instanceClip = 0
-    , instanceMaterial = 0
+    , instanceParameter = 0
+    , instanceMaterial = defaultMaterial
     }
 
 -- | The first frame: two passes.
@@ -243,7 +246,7 @@ workSpec = describe "the work a snapshot comes to" $ do
           let layers = concatMap workLayers (workViews first <> workViews last')
           -- The world layer's sprites have keys 5, 1, 5: the drawing order is 1, 0, 2.
           map layerBytes layers `shouldBe` [chunk 1 world <> chunk 0 world <> chunk 2 world, ui, second, deep]
-          map layerRunList layers `shouldBe` [[RunWork 0 3 Ordered ReadsRing], [RunWork 0 2 Ordered ReadsRing], [RunWork 0 1 Ordered ReadsRing], [RunWork 0 1 Ordered ReadsRing]]
+          map layerRunList layers `shouldBe` [[RunWork 0 3 Ordered ReadsRing defaultMaterial NoRunRecords], [RunWork 0 2 Ordered ReadsRing defaultMaterial NoRunRecords], [RunWork 0 1 Ordered ReadsRing defaultMaterial NoRunRecords], [RunWork 0 1 Ordered ReadsRing defaultMaterial NoRunRecords]]
         other → expectationFailure ("expected two passes, found " <> either show (show . length) other)
 
   it "pushes each layer the transform of its own space, the view's settings and the attachment's extent" $
@@ -278,7 +281,7 @@ workSpec = describe "the work a snapshot comes to" $ do
       input ← inputOver rig firstFrame
       case frameWork input of
         Right [first, last'] → do
-          map (map layerRunList . workLayers) (workViews last') `shouldBe` [[[RunWork 0 1 Ordered ReadsRing]]]
+          map (map layerRunList . workLayers) (workViews last') `shouldBe` [[[RunWork 0 1 Ordered ReadsRing defaultMaterial NoRunRecords]]]
           map layerClearsDepth (concatMap workLayers (workViews last')) `shouldBe` [True]
           fmap depthFormat (workDepth last') `shouldBe` Just Depth32Float
           -- The first pass holds no depth-enabled world layer, so it has none.
@@ -379,6 +382,8 @@ data Seen
   | SeenPipeline
   | SeenViewport !Native.Viewport
   | SeenTable
+  | SeenStorage
+    -- ^ The storage table (set 2) bound: the region the batch's material records were written to.
   | SeenScissor !Rect
   | SeenPush ![PushStage] !Word32 !ByteString
   | SeenBind !Word32 !Word64
@@ -394,6 +399,7 @@ seen = mapMaybe $ \case
   CommandBindPipeline _ → Just SeenPipeline
   CommandSetViewport viewport → Just (SeenViewport viewport)
   CommandBindDescriptorSets {} → Just SeenTable
+  CommandBindStorageSet {} → Just SeenStorage
   CommandSetScissor rect → Just (SeenScissor rect)
   CommandPushConstants _ stages offset bytes → Just (SeenPush stages offset bytes)
   CommandBindVertexBuffer binding _ offset → Just (SeenBind binding offset)
@@ -409,6 +415,7 @@ rendererOver rig ringBytes = do
       Render.Configuration
         { Render.configurationRing = either (error . show) id (validateRingSize ringBytes)
         , Render.configurationTable = either (error . show) id (validateTableConfig 16 8 4)
+        , Render.configurationRecordWindow = either (error . show) id (validateStorageWindow (min ringBytes 4096))
         }
   -- What the table's own placeholder upload recorded is not the frame's.
   resetJournal rig
@@ -433,34 +440,38 @@ recordingSpec = describe "recording a frame" $ do
       input ← inputOver rig firstFrame
       recorded rig renderer input `shouldBe'` Right ()
       commands ← commandsRecorded rig
-      -- The ring's four claims, one a layer, are 192, 128, 64 and 64 bytes.
-      ringOffsets rig >>= (`shouldBe` [0, 192, 320, 384])
+      -- The ring's five claims are the batch's material records (one word, padded
+      -- to the atom of 16) and, one a layer, 192, 128, 64 and 64 bytes.
+      ringOffsets rig >>= (`shouldBe` [0, 16, 208, 336, 400])
       seen commands
         `shouldBe` [ SeenBegin (ClearColor 0.25 0.5 0.75 1) Nothing
                    , SeenPipeline
                    , SeenViewport (Native.Viewport 0 0 32 32)
                    , SeenTable
+                   , SeenStorage
                    , SeenScissor (Rect 0 0 16 32)
                    , SeenPush [PushVertex, PushFragment] 0 (push [1, 0, 0, 1, 8, 16] (32, 32) 1 FilterNearest False)
-                   , SeenBind 0 0
+                   , SeenBind 0 16
                    , SeenDraw 6 3
                    , SeenPush [PushVertex, PushFragment] 0 (push [1, 0, 0, 1, 0, 0] (32, 32) 1 FilterNearest False)
-                   , SeenBind 0 192
+                   , SeenBind 0 208
                    , SeenDraw 6 2
                    , SeenScissor (Rect 16 0 15 32)
                    , SeenPush [PushVertex, PushFragment] 0 (push [1, 0, 0, 1, 16.5, 0] (32, 32) 2 FilterLinear True)
-                   , SeenBind 0 320
+                   , SeenBind 0 336
                    , SeenDraw 6 1
                    , SeenEnd
                    , SeenBegin (ClearColor 1 0 0 0.5) (Just 1)
                    , SeenPipeline
                    , SeenViewport (Native.Viewport 0 0 16 16)
                    , SeenTable
+                   , SeenStorage
                    , SeenScissor (Rect 0 0 16 16)
                    , SeenClearDepth (Rect 0 0 16 16) 1
                    , SeenTable
+                   , SeenStorage
                    , SeenPush [PushVertex, PushFragment] 0 (push [2, 0, 0, 2, 0, 0] (16, 16) 1 FilterNearest False)
-                   , SeenBind 0 384
+                   , SeenBind 0 400
                    , SeenDraw 6 1
                    , SeenEnd
                    ]
@@ -473,9 +484,11 @@ recordingSpec = describe "recording a frame" $ do
       recorded rig renderer input `shouldBe'` Right ()
       writes ← claimWrites rig
       let (world, ui, second, deep) = firstFrameLayers
-      -- The world layer is written 1, 0, 2: ascending key, then submission.
+      -- The batch's records come first (a frame of the default material alone has
+      -- one zero word), then the world layer, written 1, 0, 2: ascending key, then
+      -- submission.
       writes
-        `shouldBe` [(0, chunk 1 world <> chunk 0 world <> chunk 2 world), (192, ui), (320, second), (384, deep)]
+        `shouldBe` [(0, ByteString.replicate 4 0), (16, chunk 1 world <> chunk 0 world <> chunk 2 world), (208, ui), (336, second), (400, deep)]
 
   it "keeps instances of mixed sampler choices in one run and one draw" $
     withRig $ \rig → do
@@ -486,7 +499,7 @@ recordingSpec = describe "recording a frame" $ do
       -- The world layer's one draw takes three instances whose flags words
       -- (at offset 56 of each chunk) say nearest, default and linear.
       let flags bytes index = ByteString.index bytes (64 * index + 56) .&. 3
-      [map (flags bytes) [0, 1, 2] | (0, bytes) ← writes] `shouldBe` [[1, 0, 2]]
+      [map (flags bytes) [0, 1, 2] | (16, bytes) ← writes] `shouldBe` [[1, 0, 2]]
       commands ← commandsRecorded rig
       length [() | SeenDraw 6 3 ← seen commands] `shouldBe` 1
 
@@ -517,8 +530,9 @@ recordingSpec = describe "recording a frame" $ do
     withRig $ \rig → do
       _ ← rendererOver rig 4096
       layouts ← layoutsMade rig
-      -- Both of the table's set layouts, and one range of 44 bytes for both stages.
-      [(length sets, ranges) | (sets, ranges) ← layouts] `shouldBe` [(2, [PushConstantRange [PushVertex, PushFragment] 0 44])]
+      -- The table's two set layouts and the storage table's, and one range of 128
+      -- bytes for both stages: the engine's 48 and the application's 80.
+      [(length sets, ranges) | (sets, ranges) ← layouts] `shouldBe` [(3, [PushConstantRange [PushVertex, PushFragment] 0 128])]
 
   it "refuses an unknown target in a later pass before it records a clear, a claim or a draw" $
     withRig $ \rig → do
@@ -532,17 +546,19 @@ recordingSpec = describe "recording a frame" $ do
 
   it "refuses a frame the ring cannot hold, recording no clear and no draw, and keeps the claims the backend granted" $
     withRig $ \rig → do
-      -- The first layer's 192 bytes fit a ring of 256; the second's 128 do not.
+      -- The records' 16 bytes and the first layer's 192 fit a ring of 256; the
+      -- second's 128 do not.
       renderer ← rendererOver rig 256
       input ← inputOver rig firstFrame
       answer ← recorded rig renderer input
       case answer of
         Left (RefusedByBackend _) → pure ()
         other → expectationFailure ("expected the backend's refusal, found " <> show other)
-      -- Only the first layer's region was claimed: the refusal stopped the rest.
-      -- The claim's own buffer barriers are the batch's; nothing is cleared or drawn.
+      -- Only the records' region and the first layer's were claimed: the refusal
+      -- stopped the rest. The claim's own buffer barriers are the batch's; nothing
+      -- is cleared or drawn.
       (seen <$> commandsRecorded rig) >>= (`shouldBe` [])
-      ringOffsets rig >>= (`shouldBe` [0])
+      ringOffsets rig >>= (`shouldBe` [0, 16])
 
   it "records nothing a refused view would draw, and refuses a view's mapping before any pass begins" $
     withRig $ \rig → do
@@ -639,17 +655,20 @@ depthSpec = describe "depth passes" $ do
                    , SeenPipeline
                    , SeenViewport (Native.Viewport 0 0 16 16)
                    , SeenTable
+                   , SeenStorage
                    , SeenScissor (Rect 0 0 8 16)
                    , SeenClearDepth (Rect 0 0 8 16) 1
                    , SeenTable
+                   , SeenStorage
                    , SeenPush [PushVertex, PushFragment] 0 (push [1, 0, 0, 1, 4, 8] (16, 16) 1 FilterNearest False)
-                   , SeenBind 0 0
+                   , SeenBind 0 16
                    , SeenDraw 6 1
                    , SeenScissor (Rect 8 0 8 16)
                    , SeenClearDepth (Rect 8 0 8 16) 1
                    , SeenTable
+                   , SeenStorage
                    , SeenPush [PushVertex, PushFragment] 0 (push [1, 0, 0, 1, 12, 8] (16, 16) 1 FilterNearest False)
-                   , SeenBind 0 64
+                   , SeenBind 0 80
                    , SeenDraw 6 1
                    , SeenEnd
                    ]
@@ -687,7 +706,7 @@ depthSpec = describe "depth passes" $ do
       input ← depthFrame rig marked (Just Depth32Float) snapshot
       case frameWork input of
         Right [only] → do
-          map layerRunList (concatMap workLayers (workViews only)) `shouldBe` [[RunWork 0 1 Cutout ReadsRing, RunWork 1 1 Ordered ReadsRing]]
+          map layerRunList (concatMap workLayers (workViews only)) `shouldBe` [[RunWork 0 1 Cutout ReadsRing defaultMaterial NoRunRecords, RunWork 1 1 Ordered ReadsRing defaultMaterial NoRunRecords]]
           -- The cutout instance, submission index 1, is encoded first.
           case encodings snapshot of
             [written] → map layerBytes (concatMap workLayers (workViews only)) `shouldBe` [chunk 1 written <> chunk 0 written]
@@ -713,7 +732,7 @@ depthSpec = describe "depth passes" $ do
         [cutout, ordered] → (requestShaders cutout == requestShaders ordered) `shouldBe` False
         other → expectationFailure ("expected two pipelines, found " <> show (length other))
       -- Both runs draw once each, from the one layer's region at the run's first instance.
-      [(binding', offset) | CommandBindVertexBuffer binding' _ offset ← commands] `shouldBe` [(0, 0), (0, 64)]
+      [(binding', offset) | CommandBindVertexBuffer binding' _ offset ← commands] `shouldBe` [(0, 16), (0, 80)]
       length [() | CommandDraw {} ← commands] `shouldBe` 2
 
   it "gives every pipeline of a pass with depth the one declared format, and an untested pipeline neither tests nor writes" $

@@ -10,13 +10,13 @@ module Hetoimasia.Render.TwoD.Vulkan.ShaderInterfaces
   ) where
 
 import Hetoimasia.GPU.Vulkan.Native.Shader.Interface
-import Hetoimasia.Render.TwoD.Vulkan.Layout (instanceVertexInput, pushMembers)
+import Hetoimasia.Render.TwoD.Vulkan.Layout (instanceVertexInput, pushMembers, reservedPushMember)
 
 -- | The instance attributes ('instanceVertexInput') and the push block.
 orderedVertexInterface ∷ ShaderInterface
 orderedVertexInterface =
   (interfaceFor VertexInterface)
-    { interfacePushConstants = pushMembers
+    { interfacePushConstants = pushMembers <> [reservedPushMember 0]
     , interfaceVertexInput = instanceVertexInput
     }
 
@@ -24,6 +24,6 @@ orderedVertexInterface =
 orderedFragmentInterface ∷ ShaderInterface
 orderedFragmentInterface =
   (interfaceFor FragmentInterface)
-    { interfacePushConstants = pushMembers
+    { interfacePushConstants = pushMembers <> [reservedPushMember 0]
     , interfaceDescriptors = textureTableDescriptors
     }

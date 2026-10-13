@@ -12,10 +12,12 @@
 --
 -- = Making the renderer
 --
--- 'makeRenderer' makes, through the host's constructions, the session's ring,
--- the texture table the draws go through, and a shader-sampled table pipeline
--- layout (R2D-16) over the package's shaders. A pipeline is made per colour
--- format and per kind ('PipelineKind') the first time a pass into that format
+-- 'makeRenderer' makes, through the host's constructions, the session's ring
+-- with the storage-table window the material records are bound through
+-- (R2D-11), the texture table the draws go through, the storage table (set 2),
+-- and a shader-sampled table pipeline layout (R2D-16) that holds set 2, over the
+-- package's shaders. A pipeline is made per colour format, per kind
+-- ('PipelineKind') and per material the first time a pass into that format
 -- draws with it. The textures are registered with the table by their owner; the
 -- recorder samples whatever handles the snapshot names, and an unregistered or
 -- released handle samples slot 0's transparent placeholder (choice G).
@@ -28,7 +30,8 @@
 -- refusal there is a 'FrameRefusal' naming where, and nothing has been
 -- recorded. What it returns records into the batch's recorder:
 --
--- 1. every layer's ring entries, written in drawing order into one ring region
+-- 1. the batch's material records, written into one ring region claimed for the
+--    storage table, then every layer's ring entries, written in drawing order into one ring region
 --    each, all claimed before the first pass begins; a layer none of whose runs
 --    reads the ring claims nothing. A full ring is a refusal
 --    ('RefusedByBackend') with no clear and no draw recorded, and the batch's
@@ -41,8 +44,8 @@
 --    window's frame as the frame's own), and, when a view with a non-empty
 --    scissor holds a depth-enabled world layer, with the caller's depth image
 --    as its depth attachment, cleared to 1.0 across it. It binds its first
---    run's pipeline, the table and a viewport over the whole attachment,
---    draws, and ends before the next begins;
+--    run's pipeline, the table, the records' region as the storage table and a
+--    viewport over the whole attachment, draws, and ends before the next begins;
 -- 3. within a pass, each view in order under its scissor, which covers
 --    exactly the pixels whose centres the view's viewport contains; a view
 --    whose scissor is empty records no clear and no draw;
@@ -53,6 +56,28 @@
 --    first instance and drawing its count. A run of a retained chunk binds the
 --    chunk's own buffer instead, at the run's first instance, and a chunk the
 --    view skips is not there at all.
+--
+-- = Materials (R2D-11)
+--
+-- 'registerMaterial' registers a material an application defined
+-- ("Hetoimasia.Render.TwoD.Vulkan.Material") with the renderer and issues its
+-- 'MaterialRef', which carries exactly the facts the splice recorded and an
+-- identity of this session's own. A snapshot that names a reference the session
+-- did not issue, or one with another material's identity and different facts, is
+-- refused before anything is recorded, naming it ('MaterialNotIssued',
+-- 'MaterialFactsDisagree'); the built-in default is every session's. A
+-- material's pipelines are built per colour format and kind the first time a pass
+-- draws with them, as the built-in ones are: the translucent variant for the
+-- ordered kinds, the cutout variant for 'CutoutPipeline'.
+--
+-- Every material's records, for the views and chunks the frame draws, are packed
+-- into one region of the ring (the order is "Hetoimasia.Render.TwoD.Vulkan.Frame"'s
+-- 'recordRegion'), written with the instances, and bound as the storage table at
+-- offset 0 wherever the texture table is. A run that reads records pushes the word
+-- of the region its table begins at (@recordBase@) before it draws; a material
+-- that has a push block has the view's bytes for it pushed at
+-- 'applicationPushOffset' before its first run in the view. Every pipeline of
+-- every material shares the one layout, so neither disturbs what is bound.
 --
 -- = The pipelines
 --
@@ -99,7 +124,11 @@ module Hetoimasia.Render.TwoD.Vulkan
   , rendererLayout
   , rendererDepthFormat
   , pipelineFor
+  , pipelineForMaterial
   , pipelineDeclaration
+    -- * Materials
+  , registerMaterial
+  , issuedMaterials
     -- * Recording
   , module Hetoimasia.Render.TwoD.Vulkan.Frame
   , FrameRecording
@@ -111,12 +140,13 @@ module Hetoimasia.Render.TwoD.Vulkan
   ) where
 
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
+import System.IO.Unsafe (unsafePerformIO)
 import qualified Data.ByteString as ByteString
 import Control.Applicative ((<|>))
 import Data.List (mapAccumL, nub)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust, listToMaybe)
-import Data.Word (Word32)
+import Data.Word (Word32, Word64)
 import Hetoimasia.GPU.Vulkan.Native.Recording
   ( BufferSource (..)
   , CompareOp (..)
@@ -132,6 +162,7 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , ResourceUse (..)
   , RingClaim
   , RingSize
+  , StorageWindow
   , TransitionSource (..)
   , Viewport (..)
   , beginFrameRenderingWithDepth
@@ -149,62 +180,130 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , pushConstants
   , setScissor
   , setViewport
+  , storageWindowBytes
   , transitionResource
   , validateRingSize
+  , validateStorageWindow
   , writeClaim
   )
+import Hetoimasia.GPU.Vulkan.Native.Shader (CheckedShaders)
 import Hetoimasia.GPU.Vulkan.Native.TextureTable
   ( TableConfig
+  , bindStorageTable
   , bindTable
+  , claimTable
   , defaultVersionCount
   , validateTableConfig
   )
+import Hetoimasia.Render.TwoD.Material (MaterialRef, defaultMaterial)
+import Hetoimasia.Render.TwoD.Material.Backend (materialRef, materialRefIdentity)
 import Hetoimasia.Render.TwoD.Snapshot (Pass (..), Snapshot (..), Target (..))
 import Hetoimasia.Render.TwoD.Validation (Location (..), validSnapshot)
 import Hetoimasia.Render.TwoD.Vulkan.Builders (Builders (..))
 import Hetoimasia.Render.TwoD.Vulkan.Frame
-import Hetoimasia.Render.TwoD.Vulkan.Layout (instanceStride)
+import Hetoimasia.Render.TwoD.Vulkan.Layout (applicationPushOffset, instanceStride, packRecordBase, recordBaseOffset)
+import Hetoimasia.Render.TwoD.Vulkan.Material (DefinedMaterial (..))
 import Hetoimasia.Render.TwoD.Vulkan.Shaders (cutoutShaders, orderedShaders)
 
--- | What the renderer makes with: the session's ring and its texture table.
+-- | What the renderer makes with: the session's ring, its texture table and the
+-- storage-table window a batch's material records must fit.
 data Configuration = Configuration
   { configurationRing ∷ !RingSize
   , configurationTable ∷ !TableConfig
+  , configurationRecordWindow ∷ !StorageWindow
+    -- ^ The most bytes of material records one batch may bind: the window the
+    -- ring is made with. A batch whose packed records are larger is refused
+    -- ('RecordsTooLarge').
   }
 
--- | A four-mebibyte ring and a table of 1024 slots, 64 allocated at first,
--- with the default version ring.
+-- | A four-mebibyte ring, a table of 1024 slots, 64 allocated at first, with
+-- the default version ring, and a record window of 64 kibibytes.
 defaultConfiguration ∷ Configuration
 defaultConfiguration =
   Configuration
     (either (error . show) id (validateRingSize (4 * 1024 * 1024)))
     (either (error . show) id (validateTableConfig 1024 64 (toInteger defaultVersionCount)))
+    (either (error . show) id (validateStorageWindow (64 * 1024)))
 
--- | The renderer's state: the table's shader-sampled layout, and the pipeline
--- made for each colour format and kind.
+-- | The renderer's state: the table's shader-sampled layout, the pipeline made
+-- for each colour format, kind and material, and the materials registered.
 data Renderer = Renderer
   { rendererLayout ∷ !PipelineLayout
+  , rendererRecordWindow ∷ !Word64
+    -- ^ The bytes of material records a batch may bind.
   , rendererDepthFormat ∷ !(Maybe ImageFormat)
     -- ^ The session's depth format, if it offers one.
-  , rendererPipelines ∷ !(IORef (Map.Map (Word32, PipelineKind) Pipeline))
+  , rendererSession ∷ !Word32
+    -- ^ The number every reference this renderer issues carries in its identity,
+    -- so another session's reference is never taken for one of this session's.
+  , rendererMaterials ∷ !(IORef (Map.Map Word64 Registered))
+    -- ^ The materials registered, by the identity issued for each.
+  , rendererPipelines ∷ !(IORef (Map.Map (Word32, PipelineKind, Word64) Pipeline))
   }
 
--- | Make the ring, the texture table and the pipeline layout.
+-- | A registered material and the reference issued for it.
+data Registered = Registered
+  { registeredMaterial ∷ !DefinedMaterial
+  , registeredRef ∷ !MaterialRef
+  }
+
+-- | The next session number: every renderer made takes one, so references of
+-- different renderers never share an identity.
+sessionCounter ∷ IORef Word32
+sessionCounter = unsafePerformIO (newIORef 0)
+{-# NOINLINE sessionCounter #-}
+
+-- | Make the ring with its record window, the texture table, the storage table
+-- and the pipeline layout.
 makeRenderer ∷ Builders q inst msgr phys dev cmd → Configuration → IO (Either Refusal Renderer)
 makeRenderer builders configuration =
-  buildRing builders (configurationRing configuration) >>= \case
+  buildRing builders (configurationRing configuration) (configurationRecordWindow configuration) >>= \case
     Left refusal → pure (Left refusal)
     Right () →
       buildTable builders (configurationTable configuration) >>= \case
         Left refusal → pure (Left refusal)
         Right () →
-          buildTableLayout builders orderedShaders >>= \case
+          buildStorageTable builders >>= \case
             Left refusal → pure (Left refusal)
-            Right layout → do
-              -- A session that offers no depth format still renders what has no
-              -- depth-enabled world layer.
-              depth ← either (const Nothing) Just <$> buildDepthFormat builders
-              Right . Renderer layout depth <$> newIORef Map.empty
+            Right () →
+              buildTableLayout builders orderedShaders >>= \case
+                Left refusal → pure (Left refusal)
+                Right layout → do
+                  -- A session that offers no depth format still renders what has no
+                  -- depth-enabled world layer.
+                  depth ← either (const Nothing) Just <$> buildDepthFormat builders
+                  session ← atomicModifyIORef' sessionCounter (\held → (held + 1, held + 1))
+                  materials ← newIORef Map.empty
+                  pipelines ← newIORef Map.empty
+                  pure (Right (Renderer layout (fromIntegral (storageWindowBytes (configurationRecordWindow configuration))) depth session materials pipelines))
+
+-- | Register a material an application defined, and issue its reference. The
+-- reference carries exactly the facts the material was defined with and an
+-- identity that is this renderer's own: it is the only kind of reference
+-- ("Hetoimasia.Render.TwoD.Material.Backend"'s @materialRef@ builds others, which
+-- the recorder refuses) the renderer records. Registering a material equal to one
+-- already registered answers the reference already issued. No native call is
+-- made: the material's pipelines are built when a pass first draws with them.
+registerMaterial ∷ Renderer → DefinedMaterial → IO MaterialRef
+registerMaterial renderer defined =
+  atomicModifyIORef' (rendererMaterials renderer) $ \held ->
+    case [registeredRef each | each ← Map.elems held, registeredMaterial each == defined] of
+      issued : _ → (held, issued)
+      [] →
+        let identity = (fromIntegral (rendererSession renderer) * 4294967296) + fromIntegral (Map.size held + 1)
+            issued = materialRef identity (definedFacts defined)
+         in (Map.insert identity (Registered defined issued) held, issued)
+
+-- | What the renderer issued, by identity: the reference issued under it, for
+-- 'Hetoimasia.Render.TwoD.Vulkan.Frame.unissuedMaterial' to compare a snapshot's
+-- references with. The built-in default is every renderer's.
+issuedMaterials ∷ Renderer → IO (Word64 → Maybe MaterialRef)
+issuedMaterials renderer = do
+  held ← readIORef (rendererMaterials renderer)
+  pure $ \identity ->
+    if identity == materialRefIdentity defaultMaterial
+      then Just defaultMaterial
+      else registeredRef <$> Map.lookup identity held
 
 -- | The depth a kind of pipeline declares: none for 'PlainPipeline', otherwise
 -- @D32_SFLOAT@ (D-23), tested less-or-equal, and written only by the cutout
@@ -217,21 +316,41 @@ pipelineDeclaration = \case
   UntestedPipeline → Just (PipelineDepth Depth32Float False False CompareLessOrEqual)
 
 -- | The renderer's pipeline of a kind for a colour format, over the table's
--- layout, made the first time the pair is drawn.
+-- layout, made the first time the pair is drawn: the built-in default
+-- material's.
 pipelineFor ∷ Builders q inst msgr phys dev cmd → Renderer → PipelineKind → Word32 → IO (Either Refusal Pipeline)
-pipelineFor builders renderer kind format =
-  (Map.lookup (format, kind) <$> readIORef (rendererPipelines renderer)) >>= \case
+pipelineFor builders renderer = pipelineForMaterial builders renderer defaultMaterial
+
+-- | The pipeline of a material's variant for a kind and a colour format, made
+-- the first time the triple is drawn. A kind that draws the cutout variant needs
+-- a material that has one, and a reference the renderer did not issue has none:
+-- both are refused as 'RefusedIllegal'.
+pipelineForMaterial ∷ Builders q inst msgr phys dev cmd → Renderer → MaterialRef → PipelineKind → Word32 → IO (Either Refusal Pipeline)
+pipelineForMaterial builders renderer material kind format =
+  (Map.lookup (format, kind, materialRefIdentity material) <$> readIORef (rendererPipelines renderer)) >>= \case
     Just pipeline → pure (Right pipeline)
     Nothing →
-      build >>= \case
+      shadersFor >>= \case
         Left refusal → pure (Left refusal)
-        Right pipeline → Right pipeline <$ atomicModifyIORef' (rendererPipelines renderer) (\held → (Map.insert (format, kind) pipeline held, ()))
+        Right shaders →
+          build shaders >>= \case
+            Left refusal → pure (Left refusal)
+            Right pipeline → Right pipeline <$ atomicModifyIORef' (rendererPipelines renderer) (\held → (Map.insert (format, kind, materialRefIdentity material) pipeline held, ()))
   where
     layout = rendererLayout renderer
-    build = case (kind, pipelineDeclaration kind) of
-      (CutoutPipeline, Just depth) → buildDepthPipeline builders layout cutoutShaders format BlendNone depth
-      (_, Just depth) → buildDepthPipeline builders layout orderedShaders format BlendPremultipliedAlpha depth
-      (_, Nothing) → buildPipeline builders layout orderedShaders format BlendPremultipliedAlpha
+    shadersFor
+      | material == defaultMaterial = pure (Right (if kind == CutoutPipeline then cutoutShaders else orderedShaders))
+      | otherwise =
+          (Map.lookup (materialRefIdentity material) <$> readIORef (rendererMaterials renderer)) >>= \case
+            Nothing → pure (Left (RefusedIllegal "a pipeline for a material this renderer did not issue"))
+            Just registered
+              | kind == CutoutPipeline → pure (maybe (Left (RefusedIllegal "a cutout pipeline for a material that is not cutout-capable and has no cutout variant")) Right (definedCutout (registeredMaterial registered)))
+              | otherwise → pure (Right (definedTranslucent (registeredMaterial registered)))
+    build ∷ CheckedShaders → IO (Either Refusal Pipeline)
+    build shaders = case (kind, pipelineDeclaration kind) of
+      (CutoutPipeline, Just depth) → buildDepthPipeline builders layout shaders format BlendNone depth
+      (_, Just depth) → buildDepthPipeline builders layout shaders format BlendPremultipliedAlpha depth
+      (_, Nothing) → buildPipeline builders layout shaders format BlendPremultipliedAlpha
 
 -- | What records a prepared frame into a batch's recorder.
 type FrameRecording q inst msgr phys dev cmd = Recorder q inst msgr phys dev cmd → IO (Either FrameRefusal ())
@@ -276,42 +395,59 @@ verifiedDepth builders input = do
     actually depth = fmap (\format → depth {depthFormat = format}) <$> buildImageFormat builders (depthImage depth)
 
 prepareVerified ∷ Builders q inst msgr phys dev cmd → Renderer → FrameInput → IO (Either FrameRefusal (FrameRecording q inst msgr phys dev cmd))
-prepareVerified builders renderer input = case frameWork input of
-  Left refusal → pure (Left refusal)
-  Right passes → do
-    let needed = nub [(attachmentFormat (workAttachment pass), kind) | pass ← passes, kind ← kindsOf pass]
-    pipelines ← traverse (\(format, kind) → pipelineFor builders renderer kind format) needed
-    pure $ case sequence pipelines of
-      Left refusal → Left (RefusedByBackend refusal)
-      Right found → Right (recordPrepared (Map.fromList (zip needed found)) passes)
+prepareVerified builders renderer input = do
+  issued ← issuedMaterials renderer
+  case unissuedMaterial issued (frameSnapshot input) of
+    Just refusal → pure (Left refusal)
+    Nothing → case frameWork input >>= withRegion of
+      Left refusal → pure (Left refusal)
+      Right (passes, region) → do
+        let needed = nub [(attachmentFormat (workAttachment pass), kind, material) | pass ← passes, (kind, material) ← kindsOf pass]
+        pipelines ← traverse (\(format, kind, material) → pipelineForMaterial builders renderer material kind format) needed
+        pure $ case sequence pipelines of
+          Left refusal → Left (RefusedByBackend refusal)
+          Right found → Right (recordPrepared (Map.fromList (zip [(format, kind, materialRefIdentity material) | (format, kind, material) ← needed] found)) region passes)
+  where
+    -- The region the frame's records need, which must fit the window the ring
+    -- was made with.
+    withRegion passes = case recordRegion passes of
+      Just region
+        | toInteger (ByteString.length (regionBytes region)) > toInteger (rendererRecordWindow renderer) →
+            Left (RecordsTooLarge (fromIntegral (ByteString.length (regionBytes region))) (rendererRecordWindow renderer))
+      held → Right (passes, held)
 
--- | The kinds of pipeline a pass draws with, in the order it first needs them.
-kindsOf ∷ PassWork → [PipelineKind]
+-- | The kinds of pipeline a pass draws with, and the material of each, in the
+-- order it first needs them.
+kindsOf ∷ PassWork → [(PipelineKind, MaterialRef)]
 kindsOf = nub . map snd . runsOf
 
--- | Every run of a pass in recording order, with the pipeline kind it draws
--- with.
-runsOf ∷ PassWork → [(RunWork, PipelineKind)]
+-- | Every run of a pass in recording order, with the pipeline kind and the
+-- material it draws with.
+runsOf ∷ PassWork → [(RunWork, (PipelineKind, MaterialRef))]
 runsOf pass =
-  [ (run, runPipeline (isJust (workDepth pass)) layer run)
+  [ (run, (runPipeline (isJust (workDepth pass)) layer run, runWorkMaterial run))
   | view ← workViews pass
   , layer ← workLayers view
   , run ← layerRunList layer
   ]
 
--- | Claim and write every layer's region, move the chunk buffers the frame
--- draws from to their vertex-input use, then record each pass.
-recordPrepared ∷ Map.Map (Word32, PipelineKind) Pipeline → [PassWork] → FrameRecording q inst msgr phys dev cmd
-recordPrepared pipelines passes recorder = do
-  claimed ← claimInOrder recorder layersInOrder
-  case claimed of
+-- | Claim and write the material records' region and every layer's region, move
+-- the chunk buffers the frame draws from to their vertex-input use, then record
+-- each pass.
+recordPrepared ∷ Map.Map (Word32, PipelineKind, Word64) Pipeline → Maybe RecordRegion → [PassWork] → FrameRecording q inst msgr phys dev cmd
+recordPrepared pipelines region passes recorder =
+  claimRecords recorder region >>= \case
     Left refusal → pure (Left (RefusedByBackend refusal))
-    Right regions → do
-      let byLocation = Map.fromList (zip (map layerLocation layersInOrder) regions)
-      stopAtFirst
-        ( [backend (transitionResource recorder buffer (FromUse GeometryRead) GeometryRead) | buffer ← chunkBuffers]
-            <> [recordPass recorder pipelines byLocation pass | pass ← passes]
-        )
+    Right records → do
+      claimed ← claimInOrder recorder layersInOrder
+      case claimed of
+        Left refusal → pure (Left (RefusedByBackend refusal))
+        Right regions → do
+          let byLocation = Map.fromList (zip (map layerLocation layersInOrder) regions)
+          stopAtFirst
+            ( [backend (transitionResource recorder buffer (FromUse GeometryRead) GeometryRead) | buffer ← chunkBuffers]
+                <> [recordPass recorder pipelines records byLocation pass | pass ← passes]
+            )
   where
     -- A layer whose runs all read a chunk's buffer, or that holds none, only
     -- clears or draws from elsewhere: it claims nothing.
@@ -327,6 +463,17 @@ recordPrepared pipelines passes recorder = do
         , ReadsChunk _ buffer ← [runReads run]
         ]
     backend = fmap (either (Left . RefusedByBackend) Right)
+
+-- | The region the batch's records are written into, claimed for the storage
+-- table with the backend's table alignment and written: the claim, and where each
+-- table begins. A frame that draws nothing has none.
+claimRecords ∷ Recorder q inst msgr phys dev cmd → Maybe RecordRegion → IO (Either Refusal (Maybe (RingClaim, Map.Map RecordKey Word32)))
+claimRecords recorder = \case
+  Nothing → pure (Right Nothing)
+  Just region →
+    claimTable recorder (fromIntegral (ByteString.length (regionBytes region))) >>= \case
+      Left refusal → pure (Left refusal)
+      Right claim → fmap (const (Just (claim, regionBases region))) <$> writeClaim recorder claim 0 (regionBytes region)
 
 -- | Claim every layer's region in order, stopping at the first the backend
 -- refuses, so a full ring is met once and nothing later is claimed.
@@ -345,18 +492,30 @@ claimLayer recorder layer =
     Left refusal → pure (Left refusal)
     Right claim → fmap (const claim) <$> writeClaim recorder claim 0 (layerBytes layer)
 
+-- | What a pass's recording has bound so far, which it keeps from step to step so
+-- that it pushes and binds only what a run changes.
+data Walk = Walk
+  { walkBound ∷ !(Maybe (PipelineKind, MaterialRef))
+    -- ^ The bound pipeline's kind and material.
+  , walkBase ∷ !(Maybe Word32)
+    -- ^ The record base pushed last.
+  , walkApplication ∷ !(Maybe (Int, MaterialRef))
+    -- ^ The view and material whose application push block was pushed last.
+  }
+
 -- | Record one pass: begin, bind, draw each view, end.
 recordPass
   ∷ Recorder q inst msgr phys dev cmd
-  → Map.Map (Word32, PipelineKind) Pipeline
+  → Map.Map (Word32, PipelineKind, Word64) Pipeline
+  → Maybe (RingClaim, Map.Map RecordKey Word32)
   → Map.Map Location RingClaim
   → PassWork
   → IO (Either FrameRefusal ())
-recordPass recorder pipelines regions pass =
+recordPass recorder pipelines records regions pass =
   stopAtFirst $
     [backend begin]
       <> bindings
-      <> concat (snd (mapAccumL viewSteps (fmap snd (listToMaybe (runsOf pass))) (workViews pass)))
+      <> concat (snd (mapAccumL viewSteps (Walk (fmap snd (listToMaybe (runsOf pass))) Nothing Nothing) (workViews pass)))
       <> [backend (endRendering recorder)]
   where
     attachment = workAttachment pass
@@ -369,51 +528,79 @@ recordPass recorder pipelines regions pass =
       (Just image, Just depth) → beginRenderingWithDepth recorder image ClearFromUndefined (workClear pass) (clearedDepth (depthImage depth) ClearFromUndefined)
       (Nothing, Nothing) → beginRendering recorder (workClear pass)
       (Nothing, Just depth) → beginFrameRenderingWithDepth recorder (workClear pass) (clearedDepth (depthImage depth) ClearFromUndefined)
-    pipelineOf kind = Map.lookup (attachmentFormat attachment, kind) pipelines
-    missing = pure (Left (RefusedByBackend (RefusedIllegal "no pipeline was made for the pass's colour format and kind")))
+    pipelineOf kind material = Map.lookup (attachmentFormat attachment, kind, materialRefIdentity material) pipelines
+    missing = pure (Left (RefusedByBackend (RefusedIllegal "no pipeline was made for the pass's colour format, kind and material")))
+    -- The table and the records' region as the storage table, as the draws after
+    -- them need them: the region is bound at its own start, where the batch wrote
+    -- it.
+    tables =
+      backend (bindTable recorder)
+        : maybe [pure (Left (RefusedByBackend (RefusedIllegal "a pass that draws has no region for its material records")))] (\(claim, _) → [backend (bindStorageTable recorder claim 0)]) records
     -- The first run's pipeline, the viewport over the whole attachment and the
-    -- table, bound only where something is drawn.
+    -- tables, bound only where something is drawn.
     bindings = case runsOf pass of
       [] → []
-      (_, kind) : _ → case pipelineOf kind of
+      (_, (kind, material)) : _ → case pipelineOf kind material of
         Nothing → [missing]
         Just pipeline →
           [ backend (bindPipeline recorder pipeline)
           , backend (setViewport recorder (Viewport 0 0 width height))
-          , backend (bindTable recorder)
           ]
+            <> tables
     -- A layer that only skipped a chunk has nothing to record: a view holding no
     -- other records no scissor.
     recordsSomething layer = layerClearsDepth layer || not (null (layerRunList layer))
-    viewSteps bound view = case (workRect view, filter recordsSomething (workLayers view)) of
+    viewSteps walk view = case (workRect view, filter recordsSomething (workLayers view)) of
       (Just rect, layers@(_ : _)) →
-        let (bound', steps) = mapAccumL (layerSteps rect) bound layers
-         in (bound', backend (setScissor recorder rect) : concat steps)
-      _ → (bound, [])
-    layerSteps rect bound layer =
-      -- A depth clear is followed by binding the table again, where the pass
+        let (walk', steps) = mapAccumL (layerSteps rect (workViewIndex view) (workPushBlocks view)) walk layers
+         in (walk', backend (setScissor recorder rect) : concat steps)
+      _ → (walk, [])
+    layerSteps rect viewIndex pushBlocks walk layer =
+      -- A depth clear is followed by binding the tables again, where the pass
       -- draws: on MoltenVK a mid-pass clear leaves the descriptor bindings
       -- unusable by the draws after it, and a draw after one finds the table
-      -- gone unless it is bound anew (Vulkan itself leaves them undisturbed).
-      let clear = concat [[backend (clearDepthRect recorder rect 1)] <> [backend (bindTable recorder) | drawsHere] | layerClearsDepth layer]
+      -- gone unless it is bound anew (Vulkan itself leaves them undisturbed). The
+      -- material's push block is pushed again for the same reason.
+      let clear = concat [[backend (clearDepthRect recorder rect 1)] <> (if drawsHere then tables else []) | layerClearsDepth layer]
+          cleared = if layerClearsDepth layer then walk {walkApplication = Nothing} else walk
        in case layerRunList layer of
-            [] → (bound, clear)
+            [] → (cleared, clear)
             runs →
-              let (bound', steps) = mapAccumL (runSteps layer (Map.lookup (layerLocation layer) regions)) bound runs
-               in (bound', clear <> [backend (pushConstants recorder [PushVertex, PushFragment] 0 (layerPushBytes layer))] <> concat steps)
-    runSteps layer claim bound run =
+              -- The layer's block sets the record base to zero.
+              let (walk', steps) = mapAccumL (runSteps layer (Map.lookup (layerLocation layer) regions) viewIndex pushBlocks) cleared {walkBase = Just 0} runs
+               in (walk', clear <> [backend (pushConstants recorder [PushVertex, PushFragment] 0 (layerPushBytes layer))] <> concat steps)
+    runSteps layer claim viewIndex pushBlocks walk run =
       let kind = runPipeline depthed layer run
+          material = runWorkMaterial run
           rebind
-            | bound == Just kind = []
-            | otherwise = [maybe missing (backend . bindPipeline recorder) (pipelineOf kind)]
+            | walkBound walk == Just (kind, material) = []
+            | otherwise = [maybe missing (backend . bindPipeline recorder) (pipelineOf kind material)]
+          -- A run that reads records pushes the word its table begins at, unless
+          -- it is the one already pushed.
+          (basePushes, base') = case runWorkRecords run of
+            NoRunRecords → ([], walkBase walk)
+            RunRecords key _ → case records >>= Map.lookup key . snd of
+              Nothing → ([pure (Left (PlanDisagrees (layerLocation layer)))], walkBase walk)
+              Just base
+                | walkBase walk == Just base → ([], walkBase walk)
+                | otherwise → ([backend (pushConstants recorder [PushVertex, PushFragment] recordBaseOffset (packRecordBase base))], Just base)
+          -- A material that has a push block has the view's bytes pushed before
+          -- its first run in the view.
+          (applicationPushes, application') = case Map.lookup material pushBlocks of
+            Just block
+              | walkApplication walk /= Just (viewIndex, material) →
+                  ([backend (pushConstants recorder [PushVertex, PushFragment] applicationPushOffset block)], Just (viewIndex, material))
+            _ → ([], walkApplication walk)
           offset = fromIntegral (runFirstInstance run) * fromIntegral instanceStride
           -- A ring run reads the layer's region; a chunk's run, the chunk's buffer.
           source = case (runReads run, claim) of
             (ReadsRing, Just region) → backend (bindVertexBuffer recorder 0 (FromClaim region offset))
             (ReadsRing, Nothing) → pure (Left (PlanDisagrees (layerLocation layer)))
             (ReadsChunk _ buffer, _) → backend (bindVertexBuffer recorder 0 (FromBuffer buffer offset))
-       in ( Just kind
+       in ( Walk (Just (kind, material)) base' application'
           , rebind
+              <> basePushes
+              <> applicationPushes
               <> [ source
                  , backend (draw recorder 6 (runInstanceCount run))
                  ]

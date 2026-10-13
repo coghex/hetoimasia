@@ -27,6 +27,7 @@ import Hetoimasia.Math.Vector (V2 (..))
 import Hetoimasia.Render.Api.Texture (TextureHandle)
 import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..))
 import Hetoimasia.Render.TwoD.Settings (ViewSettings (..), defaultViewSettings)
+import Hetoimasia.Render.TwoD.Material (defaultMaterial)
 import Hetoimasia.Render.TwoD.Snapshot
 
 -- | The textures the scene draws.
@@ -88,5 +89,6 @@ sprite handle (x, y) side =
     , instanceTranslucent = False
     , instanceAdditive = False
     , instanceClip = 0
-    , instanceMaterial = 0
+    , instanceParameter = 0
+    , instanceMaterial = defaultMaterial
     }

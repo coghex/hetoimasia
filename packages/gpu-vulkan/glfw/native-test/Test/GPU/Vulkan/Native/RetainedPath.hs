@@ -87,7 +87,11 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , constructDepthFormat
   , constructImage
   , constructImageFormat
-  , constructRing
+  , constructRingWith
+  , constructStorageTable
+  , constructTablePipelineLayoutWith
+  , TableLayoutOptions (..)
+  , TableUse (..)
   , constructShaderSampledTablePipelineLayout
   , constructTextureTable
   , registerConstructedTexture
@@ -194,9 +198,10 @@ buildersWith
   → Render.Builders q inst msgr phys dev cmd
 buildersWith submit construction =
   Render.Builders
-    { Render.buildRing = constructRing construction
+    { Render.buildRing = constructRingWith construction
+    , Render.buildStorageTable = constructStorageTable construction
     , Render.buildTable = constructTextureTable construction
-    , Render.buildTableLayout = constructShaderSampledTablePipelineLayout construction
+    , Render.buildTableLayout = \shaders → constructTablePipelineLayoutWith construction shaders (TableLayoutOptions TableShaderSampler True)
     , Render.buildPipeline = constructBlendedCheckedPipeline construction
     , Render.buildDepthPipeline = constructDepthCheckedPipeline construction
     , Render.buildDepthFormat = constructDepthFormat construction

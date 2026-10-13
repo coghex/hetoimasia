@@ -23,8 +23,9 @@
 -- it holds a depth-enabled world layer and the session's depth format is not
 -- @D32_SFLOAT@ (D-23; a snapshot with none is unaffected on any device);
 -- naming the texture when it references one whose release has been requested,
--- and the chunk likewise; and naming the chunk when it lists one whose upload
--- ended without completing (R2D-10). Chunks are resolved against the registry
+-- and the chunk likewise; naming the instance when it names a material the
+-- renderer did not issue (R2D-11); and naming the chunk when it lists one whose
+-- upload ended without completing (R2D-10). Chunks are resolved against the registry
 -- ("Hetoimasia.Render.TwoD.Vulkan.Chunks"): a reference it does not hold, stale
 -- or never issued, is validation's refusal naming the layer and the chunk. A
 -- chunk whose upload is still under way is not refused: publication never waits
@@ -35,8 +36,11 @@
 -- When the owner adopts a revision of a window, 'adapterAdopted' records a
 -- hold on every texture the revision's snapshot references, once for each
 -- texture however often it is referenced, and on every chunk it lists, whether
--- or not a view culls the chunk: the textures a chunk's instances name are
--- among the snapshot's references and held with it. When the revision is
+-- or not a view culls the chunk: the textures a chunk's instances name, and the
+-- full handles its records hold, are among the snapshot's references and held
+-- with it; so are the handles of the records its views hold for their
+-- materials (R2D-11). A material is never released: it lives as long as the
+-- renderer, so nothing holds one. When the revision is
 -- released, 'adapterReleased' drops its holds. A texture or a chunk is held
 -- while any adopted revision of any window holds it, so two windows sharing one
 -- hold it twice, a window's closure drops its hold when the host reports its
@@ -142,6 +146,7 @@ import Hetoimasia.GPU.Vulkan.Native.Recording (Image, ImageFormat (..), Recorder
 import Hetoimasia.GPU.Vulkan.Native.Uploads (UploadState)
 import qualified Hetoimasia.Render.Api.Texture as Api
 import Hetoimasia.Render.TwoD.Chunk (ChunkRef, chunkTextures)
+import Hetoimasia.Render.TwoD.Material (MaterialData (..), MaterialRecord (..))
 import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..), validMetrics)
 import qualified Hetoimasia.Render.TwoD.Snapshot as Snapshot
 import Hetoimasia.Render.TwoD.Snapshot
@@ -154,9 +159,9 @@ import Hetoimasia.Render.TwoD.Snapshot
   )
 import Hetoimasia.Render.TwoD.Validation (Location, ValidSnapshot, validLayerChunks, validLayers, validSnapshot, validateSnapshot, validateSnapshotWith)
 import qualified Hetoimasia.Render.TwoD.Validation as Validation
-import Hetoimasia.Render.TwoD.Vulkan (Renderer, prepareSnapshot, rendererDepthFormat)
+import Hetoimasia.Render.TwoD.Vulkan (Renderer, issuedMaterials, prepareSnapshot, rendererDepthFormat)
 import Hetoimasia.Render.TwoD.Vulkan.Builders (Builders)
-import Hetoimasia.Render.TwoD.Vulkan.Frame (Attachment (..), DepthBinding (..), FrameInput (..), FrameRefusal (..), worldDepthShortfall)
+import Hetoimasia.Render.TwoD.Vulkan.Frame (Attachment (..), DepthBinding (..), FrameInput (..), FrameRefusal (..), unissuedMaterial, worldDepthShortfall)
 import Hetoimasia.Render.TwoD.Vulkan.Chunks
   ( ChunkStanding (..)
   , Retained
@@ -199,6 +204,14 @@ sceneOf valid =
         , layer ← viewLayers view
         , candidate ← layerInstances layer
         ]
+        <> Set.fromList
+          [ handle
+          | pass ← snapshotPasses (validSnapshot valid)
+          , view ← passViews pass
+          , MaterialData records _ ← Map.elems (Snapshot.viewMaterials view)
+          , record ← records
+          , handle ← recordHandles record
+          ]
         <> Set.unions [chunkTextures chunk | held ← validLayers valid, (_, chunk) ← validLayerChunks held]
     )
     (Set.fromList [reference | held ← validLayers valid, (reference, _) ← validLayerChunks held])
@@ -312,6 +325,11 @@ data PublishRefusal
   | -- | The snapshot lists this chunk, whose cutout instances' upload ended
     -- without completing: how it ended.
     ChunkUploadFailedInSnapshot !ChunkRef !UploadState
+  | -- | The snapshot, in a layer or a chunk it lists, names a material this
+    -- renderer did not issue, or names it with other facts than it was issued
+    -- with: the refusal the recorder would make, naming the instance and the
+    -- reference.
+    MaterialNotIssuedInSnapshot !FrameRefusal
   | -- | The host holds no such window.
     PublishWindowUnknown
   | -- | The host's publications have ended.
@@ -335,9 +353,10 @@ publish2DSnapshot adapter window candidate = withMVar (adapterLock adapter) $ \_
       (index : _, _) → pure (Left (OffscreenPassHeld index))
       ([], 0) → pure (Left NoWindowPass)
       -- Validation has refused a second window pass already.
-      ([], _) → case worldDepthShortfall sessionDepth valid of
-        Just (location, held) → pure (Left (WorldDepthRefused location held))
-        Nothing → do
+      ([], _) → issuedMaterials (adapterRenderer adapter) >>= \issued → case (worldDepthShortfall sessionDepth valid, unissuedMaterial issued valid) of
+        (Just (location, held), _) → pure (Left (WorldDepthRefused location held))
+        (_, Just refusal) → pure (Left (MaterialNotIssuedInSnapshot refusal))
+        (Nothing, Nothing) → do
           let scene = sceneOf valid
               chunkRefs = Set.toList (sceneChunks scene)
               releasedChunks = [reference | reference ← chunkRefs, Map.findWithDefault True reference (viewReleased view)]

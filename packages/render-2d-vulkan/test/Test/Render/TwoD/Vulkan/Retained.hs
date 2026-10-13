@@ -33,6 +33,7 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , Refusal (..)
   , releaseManaged
   , validateRingSize
+  , validateStorageWindow
   )
 import Hetoimasia.GPU.Vulkan.Native.TextureTable (validateTableConfig)
 import Hetoimasia.GPU.Vulkan.Native.Uploads (UploadRefusal (..), UploadState (..))
@@ -46,6 +47,7 @@ import qualified Hetoimasia.Render.TwoD.Chunk.Backend as Backend
 import Hetoimasia.Render.TwoD.DrawPlan (CutoutMarks, cutoutMarks)
 import Hetoimasia.Render.TwoD.Encoding (encodeLayer)
 import Hetoimasia.Render.TwoD.Settings (ViewSettings (..), defaultViewSettings)
+import Hetoimasia.Render.TwoD.Material (defaultMaterial)
 import Hetoimasia.Render.TwoD.Snapshot
 import Hetoimasia.Render.TwoD.Target (TargetRef)
 import Hetoimasia.Render.TwoD.Target.Backend (targetRef)
@@ -98,7 +100,8 @@ sprite' handle x key =
     , instanceTranslucent = False
     , instanceAdditive = False
     , instanceClip = 0
-    , instanceMaterial = 0
+    , instanceParameter = 0
+    , instanceMaterial = defaultMaterial
     }
 
 -- | A cutout-eligible sprite, and a translucent one, which is always ordered.
@@ -147,6 +150,7 @@ withSetup action = do
       Render.Configuration
         { Render.configurationRing = either (error . show) id (validateRingSize (64 * 1024))
         , Render.configurationTable = either (error . show) id (validateTableConfig 16 8 4)
+        , Render.configurationRecordWindow = either (error . show) id (validateStorageWindow 4096)
         }
   resetJournal rig
   retained ← newRetained
@@ -375,6 +379,11 @@ refusalSpec = describe "refusing a build" $ do
   where
     shouldReturnRefused action expected = action >>= (`shouldBe` Left expected)
 
+-- | The batch's material records when none is read: one zero word, which a draw
+-- under the renderer's layout needs the storage table bound to.
+noRecords ∷ ByteString
+noRecords = ByteString.replicate 4 0
+
 -- ---------------------------------------------------------------------------
 -- Recording
 
@@ -399,14 +408,15 @@ recordingSpec = describe "recording a frame that draws chunks" $ do
       commands ← commandsRecorded (setupRig setup)
       -- The ring holds, in one region: the dynamic cutout, then the ordered instances at keys 4
       -- (the dynamic translucent) and 9 (the chunk's), the chunk before nothing at an equal key.
-      claimWrites (setupRig setup) >>= (`shouldBe` [(0, encoded [dynamicCut, dynamicOrd, ordAt 15 9])])
-      ringOffsets (setupRig setup) >>= (`shouldBe` [0])
+      -- (Before it, at offset 0, is the batch's one-word region of material records.)
+      claimWrites (setupRig setup) >>= (`shouldBe` [(0, noRecords), (16, encoded [dynamicCut, dynamicOrd, ordAt 15 9])])
+      ringOffsets (setupRig setup) >>= (`shouldBe` [0, 16])
       -- Three draws: the chunk's three cutouts from its buffer at offset 0, the dynamic cutout
-      -- from the ring at offset 0, then the two ordered instances from the ring at offset 64.
+      -- from the ring at offset 16, then the two ordered instances from the ring at offset 80.
       case draws commands of
         [(first, firstOffset, firstCount), (second, secondOffset, secondCount), (third, thirdOffset, thirdCount)] → do
           (first, firstOffset, firstCount) `shouldBe` (chunkBuffer, 0, 3)
-          (secondOffset, secondCount, thirdOffset, thirdCount) `shouldBe` (0, 1, 64, 2)
+          (secondOffset, secondCount, thirdOffset, thirdCount) `shouldBe` (16, 1, 80, 2)
           second `shouldBe` third
           second `shouldSatisfy` (/= chunkBuffer)
         other → expectationFailure ("expected three draws, found " <> show other)
@@ -440,7 +450,8 @@ recordingSpec = describe "recording a frame that draws chunks" $ do
       resetJournal (setupRig setup)
       snapshot ← snapshotOver setup [fullView [WorldLayerWith DepthEnabled [reference] []]]
       frameFor setup snapshot >>= record setup >>= (`shouldBe` Right ())
-      ringOffsets (setupRig setup) >>= (`shouldBe` [])
+      -- Only the batch's one-word region of material records is claimed.
+      ringOffsets (setupRig setup) >>= (`shouldBe` [0])
       length . draws <$> commandsRecorded (setupRig setup) >>= (`shouldBe` 1)
 
   it "draws a chunk listed twice twice from its one buffer, and chunks of different layers from their own buffers" $
@@ -464,9 +475,9 @@ recordingSpec = describe "recording a frame that draws chunks" $ do
             frameFor setup snapshot >>= record setup >>= (`shouldBe` Right ())
             -- Keys 2 (chunk build 1, then the dynamic), 5, 7: the chunk's key-2 instance
             -- before the dynamic one at an equal key.
-            claimWrites (setupRig setup) >>= (`shouldBe` [(0, encoded [ordAt 4 2, ordAt 12 2, ordAt 8 5, cutAt 0 7])])
+            claimWrites (setupRig setup) >>= (`shouldBe` [(0, noRecords), (16, encoded [ordAt 4 2, ordAt 12 2, ordAt 8 5, cutAt 0 7])])
             commands ← commandsRecorded (setupRig setup)
-            map (\(_, offset, count) → (offset, count)) (draws commands) `shouldBe` [(0, 4)]
+            map (\(_, offset, count) → (offset, count)) (draws commands) `shouldBe` [(16, 4)]
             copiesInto commands `shouldBe` []
         | kind ← [ChunkWorldFlat, ChunkUi]
         ]
@@ -540,7 +551,7 @@ cullingSpec = describe "culling a chunk by its bounds" $ do
         other → expectationFailure ("expected one pass, found " <> either show (show . length) other)
       record setup input >>= (`shouldBe` Right ())
       commands <- commandsRecorded (setupRig setup)
-      claimWrites (setupRig setup) >>= (`shouldBe` [(0, encoded [ordAt 8 2])])
+      claimWrites (setupRig setup) >>= (`shouldBe` [(0, noRecords), (16, encoded [ordAt 8 2])])
       drawnFrom commands `shouldSatisfy` ((== 2) . length)
       (nearBuffer `elem` drawnFrom commands) `shouldBe` True
 
@@ -573,7 +584,7 @@ cullingSpec = describe "culling a chunk by its bounds" $ do
         Right [pass] → map (map layerCulled . workLayers) (workViews pass) `shouldBe` [[[omitted]]]
         other → expectationFailure ("expected one pass, found " <> either show (show . length) other)
       record setup leaving >>= (`shouldBe` Right ())
-      claimWrites (setupRig setup) >>= (`shouldBe` [(0, encoded [ordAt 8 2])])
+      claimWrites (setupRig setup) >>= (`shouldBe` [(0, noRecords), (16, encoded [ordAt 8 2])])
       length . draws <$> commandsRecorded (setupRig setup) >>= (`shouldBe` 2)
 
   it "keeps a chunk in one view and skips it in another, each view planned for itself" $

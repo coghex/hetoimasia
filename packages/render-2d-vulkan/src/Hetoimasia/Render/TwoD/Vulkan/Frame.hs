@@ -45,6 +45,20 @@
 -- 'frameChunks' holds no buffer for is refused ('ChunkBufferMissing') before
 -- anything is recorded.
 --
+-- = Materials (R2D-11)
+--
+-- A run draws with the material its instances name, and the material's records,
+-- which its instances' parameter words index, are written into the batch's
+-- storage region ('recordRegion'): the view's own records for the runs of its
+-- dynamic instances, and a chunk's for the runs of that chunk's, each table once
+-- however often it is drawn, with the word its run pushes as the base the
+-- shader indexes from ('RecordKey', 'RunRecords'). A view's push block for a
+-- material is pushed before the material's runs ('workPushBlocks'). A material
+-- the session did not issue, or whose facts differ from the ones it was issued
+-- with, is refused ('MaterialNotIssued', 'MaterialFactsDisagree'), naming it
+-- and where, before anything is recorded, and so is a region larger than the
+-- storage window ('RecordsTooLarge').
+--
 -- = Targets and metrics
 --
 -- Each pass names a target. An offscreen one resolves through the caller's
@@ -74,6 +88,7 @@
 -- * 'ChunkBufferMissing': a chunk drawn with cutout instances, in a view that
 --   does not cull it, for which the caller supplied no device buffer, naming the
 --   layer and the chunk;
+-- * 'MaterialNotIssued', 'MaterialFactsDisagree', 'RecordsTooLarge': see above;
 -- * 'PlanDisagrees': the plan and the snapshot's layers do not pair, which
 --   planning the same snapshot never produces.
 module Hetoimasia.Render.TwoD.Vulkan.Frame
@@ -95,19 +110,27 @@ module Hetoimasia.Render.TwoD.Vulkan.Frame
   , LayerWork (..)
   , RunWork (..)
   , RunReads (..)
+  , RunRecords (..)
+  , RecordKey (..)
+  , RecordRegion (..)
   , PipelineKind (..)
   , runPipeline
   , passDraws
   , frameWork
+    -- * Materials
+  , recordRegion
+  , unissuedMaterial
   ) where
 
 import Control.Monad (zipWithM)
 import Data.ByteString (ByteString)
+import qualified Data.ByteString as ByteString
+import Data.List (nubBy)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Maybe (catMaybes)
-import Data.Word (Word32)
+import Data.Word (Word32, Word64)
 import Hetoimasia.GPU.Vulkan.Native.Recording
   ( Buffer
   , ClearColor (..)
@@ -117,7 +140,7 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , Refusal
   , formatCode
   )
-import Hetoimasia.Render.TwoD.Chunk (ChunkRef)
+import Hetoimasia.Render.TwoD.Chunk (Chunk, ChunkRef, chunkInstances, chunkRecords)
 import Hetoimasia.Render.TwoD.Culling (chunkCulled)
 import Hetoimasia.Render.TwoD.DrawPlan
   ( DrawPlan (..)
@@ -128,21 +151,31 @@ import Hetoimasia.Render.TwoD.DrawPlan
   , CutoutMarks
   , PlannedPass (..)
   , PlannedView (..)
+  , RecordSource (..)
   , RunSource (..)
   , planSnapshotCulled
   )
-import Hetoimasia.Render.TwoD.Encoding (encodeLayerInDrawingOrder)
+import Hetoimasia.Render.TwoD.Encoding (encodeLayerInDrawingOrder, encodeRecords)
+import Hetoimasia.Render.TwoD.Material
+  ( MaterialData (..)
+  , MaterialRef
+  , defaultMaterial
+  , materialRecordLayout
+  )
+import Hetoimasia.Render.TwoD.Material.Backend (materialRefIdentity)
 import Hetoimasia.Render.TwoD.Mapping (mappingPixelSnap, uiTransform, viewMapping, worldTransform)
 import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..), offscreenMetrics, validMetrics)
 import Hetoimasia.Render.TwoD.Settings (ViewSettings (..))
 import Hetoimasia.Render.TwoD.Snapshot
   ( ClearColour (..)
+  , Instance (..)
   , Layer (..)
   , LayerDepth (..)
   , Pass (..)
   , Snapshot (..)
   , Target (..)
   , View (..)
+  , layerInstances
   )
 import Hetoimasia.Render.TwoD.Target (TargetRef)
 import Hetoimasia.Render.TwoD.Validation
@@ -150,6 +183,7 @@ import Hetoimasia.Render.TwoD.Validation
   , ValidLayer
   , ValidSnapshot
   , validLayerChunks
+  , validLayerContents
   , validLayerLocation
   , validLayers
   , validSnapshot
@@ -271,6 +305,20 @@ data FrameRefusal
   | -- | A layer draws a chunk with cutout instances for which the frame holds no
     -- device buffer: the layer, and the chunk.
     ChunkBufferMissing !Location !ChunkRef
+  | -- | An instance, or an instance of a chunk a layer lists, names a material
+    -- the session did not issue (R2D-11): where, and the reference.
+    MaterialNotIssued !Location !MaterialRef
+  | -- | An instance names a reference with the identity of a material the session
+    -- issued, but facts that differ from the ones it was issued with: where, the
+    -- reference named and the reference issued.
+    MaterialFactsDisagree !Location !MaterialRef !MaterialRef
+  | -- | An instance names a material that is not cutout-capable on a path that
+    -- needs its cutout variant, which it has none of: where, and the material.
+    -- Planning never routes one there.
+    NoCutoutVariant !Location !MaterialRef
+  | -- | The batch's material records are this many bytes, and the storage window
+    -- is only this many.
+    RecordsTooLarge !Word64 !Word64
   | -- | The backend refused a construction, a claim or a command.
     RefusedByBackend !Refusal
   deriving (Eq, Show)
@@ -294,6 +342,9 @@ data PassWork = PassWork
 data ViewWork = ViewWork
   { workViewIndex ∷ !Int
   , workRect ∷ !(Maybe Rect)
+  , workPushBlocks ∷ !(Map.Map MaterialRef ByteString)
+  -- ^ The bytes of the push block the view holds for each material that has one,
+  -- pushed before the material's runs.
   , workLayers ∷ ![LayerWork]
   }
 
@@ -324,8 +375,63 @@ data RunWork = RunWork
   , runInstanceCount ∷ !Word32
   , runWorkPath ∷ !DrawPath
   , runReads ∷ !RunReads
+  , runWorkMaterial ∷ !MaterialRef
+  -- ^ The material the run's instances name.
+  , runWorkRecords ∷ !RunRecords
+  -- ^ The records the run's instances index, which the recorder writes into the
+  -- batch's region and whose base the run pushes.
   }
   deriving (Eq, Show)
+
+-- | Which table of records a run reads, and its bytes.
+data RunRecords
+  = -- | The material has none.
+    NoRunRecords
+  | -- | This table, encoded.
+    RunRecords !RecordKey !ByteString
+  deriving (Eq, Show)
+
+-- | A table of one material's records in the batch's region. A table is
+-- written once however many runs read it.
+data RecordKey
+  = -- | The records the view holds: pass, view and material.
+    ViewTable !Int !Int !MaterialRef
+  | -- | The records a chunk carries.
+    ChunkTable !ChunkRef !MaterialRef
+  deriving (Eq, Ord, Show)
+
+-- | The batch's material records, as the recorder writes them.
+data RecordRegion = RecordRegion
+  { regionBytes ∷ !ByteString
+  -- ^ Every table once, in the order first read, back to back.
+  , regionBases ∷ !(Map.Map RecordKey Word32)
+  -- ^ The word of 'regionBytes' where each table begins: the base its runs push.
+  }
+  deriving (Eq, Show)
+
+-- | The region a frame's runs read, or 'Nothing' when no pass draws, which then
+-- needs none. A frame that draws but whose materials have no records still has
+-- a region, one zero word, because a draw under the renderer's pipeline layout
+-- needs the storage table bound.
+recordRegion ∷ [PassWork] → Maybe RecordRegion
+recordRegion passes
+  | not (any passDraws passes) = Nothing
+  | otherwise = Just (RecordRegion bytes bases)
+  where
+    tables =
+      nubBy
+        (\(left, _) (right, _) → left == right)
+        [ (key, encoded)
+        | pass ← passes
+        , view ← workViews pass
+        , layer ← workLayers view
+        , run ← layerRunList layer
+        , RunRecords key encoded ← [runWorkRecords run]
+        ]
+    bytes
+      | null tables = ByteString.replicate 4 0
+      | otherwise = ByteString.concat (map snd tables)
+    bases = Map.fromList (zip (map fst tables) (scanl (\at (_, encoded) → at + fromIntegral (ByteString.length encoded `div` 4)) 0 tables))
 
 -- | Where a run's instances are read from.
 data RunReads
@@ -464,13 +570,22 @@ viewWork input layers attachment passNumber index (view, planned) = do
             , pushFilter = settingFilter settings
             , pushSnap = mappingPixelSnap mapping
             }
+      held = viewMaterials view
   drawn ← case rect of
     Nothing → Right []
-    Just _ → catMaybes <$> mapM (layerWork input layers pushFor) (plannedLayers planned)
-  Right (ViewWork index rect drawn)
+    Just _ → catMaybes <$> mapM (layerWork input layers held passNumber index pushFor) (plannedLayers planned)
+  Right (ViewWork index rect (Map.filter (not . ByteString.null) (Map.map materialPushBlock held)) drawn)
 
-layerWork ∷ FrameInput → Map.Map (Int, Int, Int) ValidLayer → (LayerSpace → ByteString) → PlannedLayer → Either FrameRefusal (Maybe LayerWork)
-layerWork input layers pushFor planned
+layerWork
+  ∷ FrameInput
+  → Map.Map (Int, Int, Int) ValidLayer
+  → Map.Map MaterialRef MaterialData
+  → Int
+  → Int
+  → (LayerSpace → ByteString)
+  → PlannedLayer
+  → Either FrameRefusal (Maybe LayerWork)
+layerWork input layers held passNumber viewNumber pushFor planned
   | null (plannedRuns planned) && not (plannedClearsDepth planned) && null (plannedCulled planned) = Right Nothing
   | otherwise = do
       let location = plannedLocation planned
@@ -478,11 +593,11 @@ layerWork input layers pushFor planned
         AtLayer pass view layer → maybe (Left (PlanDisagrees location)) Right (Map.lookup (pass, view, layer) layers)
         _ → Left (PlanDisagrees location)
       bytes ← maybe (Left (PlanDisagrees location)) Right (encodeLayerInDrawingOrder planned valid)
-      let listed = map fst (validLayerChunks valid)
+      let listed = validLayerChunks valid
           chunkAt position = case drop position listed of
-            reference : _ → Right reference
+            entry : _ → Right entry
             [] → Left (PlanDisagrees location)
-      culled ← traverse chunkAt (plannedCulled planned)
+      culled ← traverse (fmap fst . chunkAt) (plannedCulled planned)
       runs ← traverse (runWork location chunkAt) (plannedRuns planned)
       Right
         ( Just
@@ -496,9 +611,49 @@ layerWork input layers pushFor planned
               }
         )
   where
-    runWork location chunkAt run = case runSource run of
-      RingRun → Right (RunWork (fromIntegral (runStart run)) (fromIntegral (runCount run)) (runPath run) ReadsRing)
-      ChunkRun position → do
-        reference ← chunkAt position
-        buffer ← maybe (Left (ChunkBufferMissing location reference)) Right (frameChunks input reference)
-        Right (RunWork (fromIntegral (runStart run)) (fromIntegral (runCount run)) (runPath run) (ReadsChunk reference buffer))
+    runWork location chunkAt run = do
+      records ← recordsOf chunkAt (runMaterial run) (runRecords run)
+      case runSource run of
+        RingRun → Right (RunWork (fromIntegral (runStart run)) (fromIntegral (runCount run)) (runPath run) ReadsRing (runMaterial run) records)
+        ChunkRun position → do
+          (reference, _) ← chunkAt position
+          buffer ← maybe (Left (ChunkBufferMissing location reference)) Right (frameChunks input reference)
+          Right (RunWork (fromIntegral (runStart run)) (fromIntegral (runCount run)) (runPath run) (ReadsChunk reference buffer) (runMaterial run) records)
+    -- The records a run's instances index: the view's for its dynamic instances,
+    -- the chunk's for the chunk's.
+    recordsOf chunkAt material = \case
+      NoRecords → Right NoRunRecords
+      ViewRecords → Right (RunRecords (ViewTable passNumber viewNumber material) (encodeRecords (materialRecordLayout material) (maybe [] materialRecords (Map.lookup material held))))
+      ChunkRecords position → do
+        (reference, built) ← chunkAt position
+        Right (RunRecords (ChunkTable reference material) (encodeRecords (materialRecordLayout material) (Map.findWithDefault [] material (chunkRecords built))))
+
+-- | The first instance of the snapshot, dynamic or in a chunk a layer lists, that
+-- names a material the session did not issue, or names one with the facts of
+-- another: the lookup answers, for an identity, the reference the session issued
+-- under it. The built-in default is issued to every session, as a constant.
+unissuedMaterial ∷ (Word64 → Maybe MaterialRef) → ValidSnapshot → Maybe FrameRefusal
+unissuedMaterial issued valid = case concatMap refusalsOfLayer (validLayers valid) of
+  refusal : _ → Just refusal
+  [] → Nothing
+  where
+    refusalsOfLayer layer =
+      [ refusal
+      | (index, candidate) ← zip [0 ..] (layerInstances (validLayerContents layer))
+      , Just refusal ← [check (atLayer layer (\pass view held → AtInstance pass view held index)) (instanceMaterial candidate)]
+      ]
+        <> [ refusal
+           | (position, (_, built)) ← zip [0 ..] (validLayerChunks layer)
+           , (index, candidate) ← zip [0 ..] (chunkInstances (built ∷ Chunk))
+           , Just refusal ← [check (atLayer layer (\pass view held → AtChunkInstance pass view held position index)) (instanceMaterial candidate)]
+           ]
+    atLayer layer build = case validLayerLocation layer of
+      AtLayer pass view held → build pass view held
+      other → other
+    check location material
+      | material == defaultMaterial = Nothing
+      | otherwise = case issued (materialRefIdentity material) of
+          Nothing → Just (MaterialNotIssued location material)
+          Just held
+            | held == material → Nothing
+            | otherwise → Just (MaterialFactsDisagree location material held)

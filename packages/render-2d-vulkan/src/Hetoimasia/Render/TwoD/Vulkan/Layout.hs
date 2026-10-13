@@ -6,8 +6,10 @@
 --   instance at render-2d's 64-byte stride, each attribute at its offset in
 --   #414's layout ('instanceVertexInput').
 -- * The push block both stages declare: the view's transform, the attachment's
---   extent, the view's brightness, its default filter and whether it snaps
---   ('packViewPush', 'pushMembers').
+--   extent, the view's brightness, its default filter, whether it snaps, and the
+--   base of the material records a run reads ('packViewPush', 'pushMembers'),
+--   followed by the application's own block ('applicationPushOffset') and the
+--   bytes reserved to the limit ('reservedPushMember').
 -- * The depth an instance's key gives ('depthFromKey'), which is what the vertex
 --   stage writes (R2D-9).
 -- * The sampler an instance resolves to ('shaderSamplerIndex'), which is what
@@ -19,7 +21,9 @@
 --
 -- = The push block
 --
--- Both stages declare one block, in std430 order, 44 bytes:
+-- Both stages declare one block, in std430 order, 128 bytes, which is a
+-- guaranteed minimum of a device's @maxPushConstantsSize@. The engine owns the
+-- first 48:
 --
 -- > offset  size  member
 -- >      0    16  vec4 viewLinear       a, b, c, d of the view's transform
@@ -28,9 +32,21 @@
 -- >     32     4  float brightness
 -- >     36     4  uint filtering        the view's default filter: 1 nearest, 2 linear
 -- >     40     4  uint snap             1 when the view snaps instance origins
+-- >     44     4  uint recordBase       the word of the batch's storage region
+-- >                                     where the records a run's instances index begin
 --
 -- The transform maps @(x, y)@ to @(a·x + c·y + tx, b·x + d·y + ty)@, the
 -- coefficients of "Hetoimasia.Math.Affine2" in column-major order.
+--
+-- The rest is the application's (R2D-11): an application material's own push
+-- block begins at 'applicationPushOffset', 48, a 16-byte boundary so that any
+-- std430 member is legal there, and may be 'applicationPushLimit' bytes long, 80.
+-- A material's shaders declare its members from that offset and, after them,
+-- the rest of the limit as reserved words ('reservedPushMember'); the built-in
+-- shaders declare all of it as reserved. Every shader therefore declares the
+-- same 128-byte range, vertex and fragment alike, so one pipeline layout serves
+-- the built-in shaders and every material's, and binding another material's
+-- pipeline never disturbs the descriptor sets or the push constants already set.
 module Hetoimasia.Render.TwoD.Vulkan.Layout
   ( -- * The instance as vertex input
     instanceStride
@@ -42,6 +58,13 @@ module Hetoimasia.Render.TwoD.Vulkan.Layout
   , pushBytes
   , packViewPush
   , filterCode
+  , recordBaseOffset
+  , packRecordBase
+  , maxPushBytes
+  , applicationPushOffset
+  , applicationPushLimit
+  , reservedPushMember
+  , reservedPushWords
     -- * Sampler choice
   , shaderSamplerIndex
   , instanceSamplerBits
@@ -132,8 +155,7 @@ data ViewPush = ViewPush
   }
   deriving (Eq, Show)
 
--- | The block's members, in declaration order: the description both stages'
--- checked interfaces declare.
+-- | The engine's members of the block, in declaration order.
 pushMembers ∷ [PushMember]
 pushMembers =
   [ PushMember 0 16
@@ -142,13 +164,17 @@ pushMembers =
   , PushMember 32 4
   , PushMember 36 4
   , PushMember 40 4
+  , PushMember 44 4
   ]
 
--- | The block's size in bytes.
+-- | The size of the engine's part of the block in bytes: what a layer pushes.
 pushBytes ∷ Int
-pushBytes = 44
+pushBytes = 48
 
--- | The block, little-endian, 'pushBytes' bytes.
+-- | The engine's part of the block, little-endian, 'pushBytes' bytes, with the
+-- record base zero: the base of the view's own records is the start of the
+-- region only where the batch's region puts them first, and a run that reads
+-- records pushes its base ('packRecordBase') before it draws.
 packViewPush ∷ ViewPush → ByteString
 packViewPush view =
   Lazy.toStrict . toLazyByteString $
@@ -158,8 +184,45 @@ packViewPush view =
       <> floatLE (pushBrightness view)
       <> word32LE (filterCode (pushFilter view))
       <> word32LE (if pushSnap view then 1 else 0)
+      <> word32LE 0
   where
     (width, height) = pushExtent view
+
+-- | The offset of the record base in the block, 44.
+recordBaseOffset ∷ Word32
+recordBaseOffset = 44
+
+-- | The record base a run pushes at 'recordBaseOffset': the word of the batch's
+-- storage region where the records its instances index begin.
+packRecordBase ∷ Word32 → ByteString
+packRecordBase = Lazy.toStrict . toLazyByteString . word32LE
+
+-- | The most bytes the block may span, 128, which every device holds.
+maxPushBytes ∷ Word32
+maxPushBytes = 128
+
+-- | Where an application material's push block begins: the engine's part rounded
+-- up to a 16-byte boundary, so any std430 member may sit there.
+applicationPushOffset ∷ Word32
+applicationPushOffset = 16 * ((fromIntegral pushBytes + 15) `div` 16)
+
+-- | The most bytes an application material's push block may hold: the block's
+-- 128 bytes less the engine's part. A material that would exceed it fails to
+-- compile.
+applicationPushLimit ∷ Word32
+applicationPushLimit = maxPushBytes - applicationPushOffset
+
+-- | What a shader declares after the engine's part and its own members, up to
+-- the limit, so that every shader declares the same range: 'reservedPushWords'
+-- words after the application's members, or all the application's bytes for the
+-- built-in shaders. Given the size of the application's own block it is the
+-- member that makes the block span the whole range.
+reservedPushMember ∷ Word32 → PushMember
+reservedPushMember used = PushMember (applicationPushOffset + used) (applicationPushLimit - used)
+
+-- | The number of words 'reservedPushMember' of a block of this size spans.
+reservedPushWords ∷ Word32 → Word32
+reservedPushWords used = (applicationPushLimit - used) `div` 4
 
 -- | A filter's code in the block, which is also the sampler choice code of an
 -- instance that names it: 1 nearest, 2 linear.

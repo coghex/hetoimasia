@@ -36,13 +36,14 @@ import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import Data.Word (Word32)
 import Hetoimasia.Asset.Image (DecodedImage (..), TexelFormat (..))
-import Hetoimasia.GPU.Vulkan.Native.Recording (ImageFormat (..), Refusal, validateRingSize)
+import Hetoimasia.GPU.Vulkan.Native.Recording (ImageFormat (..), Refusal, validateRingSize, validateStorageWindow)
 import Hetoimasia.GPU.Vulkan.Native.TextureTable (LookupEntry (..), TableView (..), readTable, validateTableConfig)
 import Hetoimasia.Math.Affine2 (fromColumns)
 import Hetoimasia.Math.Vector (V2 (..))
 import qualified Hetoimasia.Render.Api.Texture as Api
 import qualified Hetoimasia.Render.Api.Texture.Backend as ApiBackend
 import Hetoimasia.Render.TwoD.Settings (defaultViewSettings)
+import Hetoimasia.Render.TwoD.Material (defaultMaterial)
 import Hetoimasia.Render.TwoD.Snapshot
 import qualified Hetoimasia.Render.TwoD.Vulkan as Render
 import Hetoimasia.Render.TwoD.Vulkan.Chunks (Retained, newRetained)
@@ -132,6 +133,7 @@ withEnvOffering offered windows action = do
       Render.Configuration
         { Render.configurationRing = either (error . show) id (validateRingSize (64 * 1024))
         , Render.configurationTable = either (error . show) id (validateTableConfig 16 8 4)
+        , Render.configurationRecordWindow = either (error . show) id (validateStorageWindow 4096)
         }
   resetJournal rig
   textures ← newTextures
@@ -171,7 +173,8 @@ sprite handle =
     , instanceTranslucent = False
     , instanceAdditive = False
     , instanceClip = 0
-    , instanceMaterial = 0
+    , instanceParameter = 0
+    , instanceMaterial = defaultMaterial
     }
 
 -- | Publish, expecting acceptance.
