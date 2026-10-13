@@ -8,6 +8,8 @@
 -- * The push block both stages declare: the view's transform, the attachment's
 --   extent, the view's brightness, its default filter and whether it snaps
 --   ('packViewPush', 'pushMembers').
+-- * The depth an instance's key gives ('depthFromKey'), which is what the vertex
+--   stage writes (R2D-9).
 -- * The sampler an instance resolves to ('shaderSamplerIndex'), which is what
 --   the fragment stage computes.
 -- * The scissor of a view, exactly the pixels whose centres its viewport
@@ -33,6 +35,7 @@ module Hetoimasia.Render.TwoD.Vulkan.Layout
   ( -- * The instance as vertex input
     instanceStride
   , instanceVertexInput
+  , depthFromKey
     -- * The push block
   , ViewPush (..)
   , pushMembers
@@ -65,7 +68,7 @@ import Hetoimasia.GPU.Vulkan.Native.Shader.Interface (PushMember (..))
 import Hetoimasia.Math.Affine2 (Affine2, toColumnMajor)
 import Hetoimasia.Math.Vector (V2 (..))
 import Hetoimasia.Render.TwoD.Settings (TextureFilter (..))
-import Hetoimasia.Render.TwoD.Snapshot (Viewport (..))
+import Hetoimasia.Render.TwoD.Snapshot (Viewport (..), depthKeyLimit)
 
 -- | The bytes of one instance: render-2d's 'Hetoimasia.Render.TwoD.Encoding.instanceStride'.
 instanceStride ∷ Word32
@@ -84,10 +87,12 @@ instanceStride = 64
 -- >        5      52  four unorm bytes  the tint, red first
 -- >        6      56  uint            the flags word
 -- >        7      60  uint            the material parameter word
+-- >        8      48  uint            the depth key
 --
--- The depth key at offset 48 is not read: the ordered path sorts by it on the
--- host, and no depth attachment exists until R2D-9. The unit square's corners
--- are the shader's own.
+-- The depth key at offset 48 is read as 'depthFromKey' reads it: the vertex
+-- stage writes it as the depth of every corner of the instance's quad (R2D-9),
+-- and a pass with no depth attachment ignores it. The unit square's corners are
+-- the shader's own.
 instanceVertexInput ∷ VertexInput
 instanceVertexInput =
   VertexInput
@@ -100,7 +105,18 @@ instanceVertexInput =
     , VertexAttribute 5 0 VertexRgba8Unorm 52
     , VertexAttribute 6 0 VertexUint 56
     , VertexAttribute 7 0 VertexUint 60
+    , VertexAttribute 8 0 VertexUint 48
     ]
+
+-- | The depth a key gives, @(2²⁴ − 1 − k) / 2²⁴@ (design D-23): in [0, 1), a
+-- larger key nearer, and exact in a 32-bit float because the numerator has 24
+-- bits at most and the denominator is a power of two. It is what the vertex
+-- stage computes as @float(0xFFFFFF − k) / 16777216.0@. A key at or past
+-- 'depthKeyLimit', which a validated snapshot never holds, has none.
+depthFromKey ∷ Word32 → Maybe Float
+depthFromKey key
+  | key >= depthKeyLimit = Nothing
+  | otherwise = Just (fromIntegral (depthKeyLimit - 1 - key) / fromIntegral depthKeyLimit)
 
 -- | What a view's draws need beyond the instance: the transform of the layer's
 -- space, the attachment's extent, and the view's settings.

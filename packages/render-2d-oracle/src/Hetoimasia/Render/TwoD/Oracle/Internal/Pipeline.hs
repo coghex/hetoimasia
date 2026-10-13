@@ -33,6 +33,10 @@ module Hetoimasia.Render.TwoD.Oracle.Internal.Pipeline
   , pinChan
   , clearPixel
   , shade
+  , Cut (..)
+  , cutoutThreshold
+  , cutoutBand
+  , cutout
   , blend
   , pixelOutcome
   ) where
@@ -164,6 +168,55 @@ byteFactor byte chan@(Chan value _)
 
 scaleBy ∷ Rational → Chan → Chan
 scaleBy factor (Chan value _) = pinChan (Chan (value * factor) False)
+
+-- | What the cutout variant (design D-26) does with a sample.
+data Cut
+  = -- | The fragment is discarded: its alpha, before brightness, is below ½.
+    Discarded
+  | -- | The fragment survives and writes this source, whose alpha is exactly 1.
+    Survives !Source
+  | -- | The alpha is within 'cutoutBand' of the threshold, where a device's
+    -- filtering and arithmetic may fall either side of it.
+    AtThreshold
+  deriving stock (Eq, Show)
+
+-- | The alpha below which the cutout variant discards.
+cutoutThreshold ∷ Rational
+cutoutThreshold = 1 / 2
+
+-- | How far from 'cutoutThreshold' an alpha may lie, inclusively, and still be
+-- indeterminate: two steps of an 8-bit alpha.
+cutoutBand ∷ Rational
+cutoutBand = 2 / 255
+
+-- | The default material's cutout variant (D-26), with @m = t@ and a tint of
+-- alpha 255 by routing:
+--
+-- > s = m × c
+-- > discard when s.a < ½
+-- > result = (s.rgb / s.a) × b, alpha 1
+--
+-- clamped to [0, 1]. The colour is un-premultiplied by the sample's own alpha,
+-- so a filtered edge sample @(0.6, 0.6, 0.6, 0.6)@ writes white, then brightened.
+-- The tint's alpha is applied for totality, though routing leaves it 255.
+cutout ∷ Tint → Float → Source → Cut
+cutout (Tint tr tg tb ta) brightness (Quad r g b a)
+  | abs (alpha - cutoutThreshold) <= cutoutBand = AtThreshold
+  | alpha < cutoutThreshold = Discarded
+  | otherwise = Survives (Quad (finish sr) (finish sg) (finish sb) (Chan 1 True))
+  where
+    sr = byteFactor tr r
+    sg = byteFactor tg g
+    sb = byteFactor tb b
+    sa = byteFactor ta a
+    alpha = chanValue sa
+    finish = clampChan . lit . over
+    over chan
+      | alpha == 1 = chan
+      | otherwise = pinChan (Chan (chanValue chan / alpha) False)
+    lit chan
+      | brightness == 1 = chan
+      | otherwise = scaleBy (toRational brightness) chan
 
 -- | One fragment blended over a pixel and stored:
 --

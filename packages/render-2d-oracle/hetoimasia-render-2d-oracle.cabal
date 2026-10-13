@@ -75,6 +75,7 @@ test-suite render-2d-oracle-tests
     hs-source-dirs: test
     other-modules:
         Test.Render.TwoD.Oracle.Colour
+        Test.Render.TwoD.Oracle.Depth
         Test.Render.TwoD.Oracle.Placement
         Test.Render.TwoD.Oracle.Probes
         Test.Render.TwoD.Oracle.Sampling

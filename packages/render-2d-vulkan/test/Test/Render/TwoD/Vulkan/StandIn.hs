@@ -16,13 +16,16 @@ module Test.Render.TwoD.Vulkan.StandIn
   ( Rig (..)
   , Rec
   , newRig
+  , newRigOffering
   , builders
   , newRenderer
   , resetJournal
   , target
+  , depthTarget
   , framelessOnce
   , commandsRecorded
   , pipelinesMade
+  , pipelineHandles
   , layoutsMade
   , mappedWrites
   , claimWrites
@@ -89,17 +92,23 @@ data Rig = Rig
   , rigFences ∷ !(TVar (Map Word64 Bool))
     -- ^ Every fence: whether it has signalled.
   , rigHandles ∷ !(TVar Word64)
-  , rigPipelines ∷ !(TVar [(Word32, PipelineBlend)])
-    -- ^ The colour format and blend of every pipeline made, newest first.
+  , rigPipelines ∷ !(TVar [(Word64, PipelineRequest)])
+    -- ^ The handle and the request of every pipeline made, newest first.
   , rigLayouts ∷ !(TVar [([Word64], [PushConstantRange])])
     -- ^ The descriptor-set layouts and push-constant ranges of every pipeline
     -- layout made, newest first.
   }
 
 -- | A session with a surface-free device and its frames and uploads, with
--- neither a ring nor a texture table yet: 'newRenderer' makes them.
+-- neither a ring nor a texture table yet: 'newRenderer' makes them. The device
+-- offers every depth format.
 newRig ∷ IO Rig
-newRig = do
+newRig = newRigOffering [Depth32Float, Depth24, Depth16]
+
+-- | The same over a device that offers only these depth formats, as a depth
+-- attachment and a sampled-or-not image of them.
+newRigOffering ∷ [ImageFormat] → IO Rig
+newRigOffering offered = do
   commands ← newTVarIO []
   writes ← newTVarIO []
   fences ← newTVarIO Map.empty
@@ -112,7 +121,7 @@ newRig = do
   _ ← startRoots roots (InstanceRequest [] [] [])
   _ ← startRootsDevice roots
   generations ← newGenerations roots
-  recording ← newRecording (recordingOps commands writes pipelines layouts memory handles) roots generations
+  recording ← newRecording (recordingOps offered commands writes pipelines layouts memory handles) roots generations
   frames ← newFrames (frameOps fences handles) recording
   uploads ← newUploads frames (either (error . show) id (validateUploadConfig 1048576 262144 8)) >>= either (fail . show) pure
   pure (Rig recording frames uploads commands writes fences handles pipelines layouts)
@@ -134,12 +143,18 @@ builders rig =
     , Render.buildTable = createTextureTable (rigRecording rig) (rigUploads rig)
     , Render.buildTableLayout = createShaderSampledTablePipelineLayout (rigRecording rig)
     , Render.buildPipeline = createBlendedCheckedPipeline (rigRecording rig)
+    , Render.buildDepthPipeline = createDepthCheckedPipeline (rigRecording rig)
     }
 
 -- | A colour target of this format and extent, made as the backend makes one.
 target ∷ Rig → ImageFormat → Word32 → Word32 → IO Image
 target rig format width height =
   createImage (rigRecording rig) (ImageDescription ColorTarget format width height 1) >>= either (fail . show) pure
+
+-- | A depth target of this format and extent, made as the backend makes one.
+depthTarget ∷ Rig → ImageFormat → Word32 → Word32 → IO Image
+depthTarget rig format width height =
+  createImage (rigRecording rig) (ImageDescription DepthTarget format width height 1) >>= either (fail . show) pure
 
 -- | Record one frame-less batch in a scope of its own, answering what the
 -- consumer returned. The batch is submitted when the scope ends.
@@ -157,9 +172,13 @@ resetJournal rig = atomically (writeTVar (rigCommands rig) [] >> writeTVar (rigW
 commandsRecorded ∷ Rig → IO [NativeCommand]
 commandsRecorded rig = reverse <$> readTVarIO (rigCommands rig)
 
--- | The colour format and blend of every pipeline made, oldest first.
-pipelinesMade ∷ Rig → IO [(Word32, PipelineBlend)]
-pipelinesMade rig = reverse <$> readTVarIO (rigPipelines rig)
+-- | Every pipeline made, oldest first.
+pipelinesMade ∷ Rig → IO [PipelineRequest]
+pipelinesMade rig = map snd <$> pipelineHandles rig
+
+-- | Every pipeline made with the handle the native layer gave it, oldest first.
+pipelineHandles ∷ Rig → IO [(Word64, PipelineRequest)]
+pipelineHandles rig = reverse <$> readTVarIO (rigPipelines rig)
 
 -- | The descriptor-set layouts and push-constant ranges of every pipeline layout made, oldest first.
 layoutsMade ∷ Rig → IO [([Word64], [PushConstantRange])]
@@ -340,20 +359,21 @@ allocatorOps handles = do
 -- ---------------------------------------------------------------------------
 -- The recording
 
-recordingOps ∷ TVar [NativeCommand] → TVar [(Word64, Natural, ByteString)] → TVar [(Word32, PipelineBlend)] → TVar [([Word64], [PushConstantRange])] → TVar (Map Word64 ByteString) → TVar Word64 → RecordingOps Int Word64
-recordingOps commands writes pipelines layouts memory handles =
+recordingOps ∷ [ImageFormat] → TVar [NativeCommand] → TVar [(Word64, Natural, ByteString)] → TVar [(Word64, PipelineRequest)] → TVar [([Word64], [PushConstantRange])] → TVar (Map Word64 ByteString) → TVar Word64 → RecordingOps Int Word64
+recordingOps offered commands writes pipelines layouts memory handles =
   RecordingOps
     { opsCreatePipelineLayout = \_ sets ranges → do
         atomically (modifyTVar' layouts ((sets, ranges) :))
         fresh handles
     , opsDestroyPipelineLayout = \_ _ → pure ()
     , opsCreatePipeline = \_ request name → do
-        atomically (modifyTVar' pipelines ((requestColorFormat request, requestBlend request) :))
         vertex ← fresh handles
         name VertexStage vertex
         fragment ← fresh handles
         name FragmentStage fragment
-        fresh handles
+        handle ← fresh handles
+        atomically (modifyTVar' pipelines ((handle, request) :))
+        pure handle
     , opsDestroyPipeline = \_ _ → pure ()
     , opsCreateStorage = \_ _ → (,) <$> fresh handles <*> fresh handles
     , opsResetStorage = \_ _ → pure ()
@@ -374,7 +394,11 @@ recordingOps commands writes pipelines layouts memory handles =
     , opsEndCommands = \_ → pure ()
     , opsRecord = \_ command → atomically (modifyTVar' commands (command :))
     , opsCommandBufferHandle = id
-    , opsImageSupport = \_ → pure (Just (ImageLimits 16384 16384 15 (2 ^ (31 ∷ Int))))
+    , opsImageSupport = \query →
+        pure $
+          if queryFormat query `elem` map formatCode [format | format ← [Depth32Float, Depth24, Depth16], format `notElem` offered]
+            then Nothing
+            else Just (ImageLimits 16384 16384 15 (2 ^ (31 ∷ Int)))
     , opsMaxBufferSize = pure (1024 * 1024 * 1024)
     , opsMaxFramebuffer = pure (16384, 16384)
     , opsRecordingLimits = pure (RecordingLimits 128 16 16 2048 2047 64 16384 500000 500000 500000 4 256 134217728 500000 4 4)

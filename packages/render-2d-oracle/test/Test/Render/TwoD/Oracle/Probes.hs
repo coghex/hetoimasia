@@ -93,15 +93,15 @@ spec = describe "probes" $ do
             mkOracle srgb8 [(h1, solid True red)] [offscreenPass noClear [mkView defaultCamera (Viewport (V2 0 0) (V2 0 8)) defaultViewSettings [world [sprite h1 (-4, -4) (8, 8)]]]]
       expectAt oracle 0 4 `shouldBe` clearAt
 
-    it "reports a cutout-path instance that could cover the probe, and only that" $ do
+    it "draws a cutout-path instance, and reports its edge like any quad's" $ do
       let marks = cutoutMarks [h1]
           cutout = spriteAt h1 (0, 0)
           at layer = mkOracleFull marks Nothing (Map.singleton offscreenRef srgb8) [(h1, solid True red)] [offscreenPass noClear [fullView 8 8 [layer]]]
-      expectAt (at (WorldLayer DepthEnabled [cutout])) 4 4 `shouldBe` Indeterminate (OnCutoutPath inst)
+      expectAt (at (WorldLayer DepthEnabled [cutout])) 4 4 `shouldBe` Expected (Rgba8 255 0 0 255) (Tolerance 0 0 0 0)
       -- A pixel the instance does not reach is unaffected.
       expectAt (at (WorldLayer DepthEnabled [cutout])) 6 6 `shouldBe` clearAt
-      -- Near its edge it could cover the probe too.
-      expectAt (at (WorldLayer DepthEnabled [spriteAt h1 (0.45, 0)])) 4 4 `shouldBe` Indeterminate (OnCutoutPath inst)
+      -- Near its edge it could cover the probe or not.
+      expectAt (at (WorldLayer DepthEnabled [spriteAt h1 (0.45, 0)])) 4 4 `shouldBe` Indeterminate (NearQuadEdge inst)
       -- Without depth, or translucent, or in UI, it takes the ordered path.
       expectAt (at (WorldLayer DepthDisabled [cutout])) 4 4 `shouldBe` Expected (Rgba8 255 0 0 255) (Tolerance 0 0 0 0)
       expectAt (at (WorldLayer DepthEnabled [cutout {instanceTranslucent = True}])) 4 4 `shouldBe` Expected (Rgba8 255 0 0 255) (Tolerance 0 0 0 0)
