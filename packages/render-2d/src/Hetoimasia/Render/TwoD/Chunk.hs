@@ -168,7 +168,7 @@ buildChunk marks kind request instances =
     count = length instances
     held = listArray (0, count - 1) instances
     numbered = zip [0 ..] instances
-    instanceRefusals = [ChunkInstanceInvalid position reason | (position, candidate) ← numbered, reason ← instanceReasons candidate]
+    instanceRefusals = [ChunkInstanceInvalid position reason | (position, candidate) ← numbered, reason ← instanceReasons 0 candidate]
     (cutouts, ordered) = case kind of
       ChunkWorldDepth → partitionBy (routesToCutout marks True . snd) numbered
       _ → ([], numbered)

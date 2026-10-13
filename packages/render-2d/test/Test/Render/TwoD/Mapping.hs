@@ -57,7 +57,7 @@ spec = describe "Mapping" $ do
 
 -- | A view with no layers.
 viewOf ∷ Camera → Viewport → ViewSettings → View
-viewOf camera viewport config = View camera viewport config []
+viewOf camera viewport config = View camera viewport config [] []
 
 snapSettings ∷ Bool → ZoomMode → ViewSettings
 snapSettings snap mode = defaultViewSettings {settingPixelSnap = snap, settingZoomMode = mode}

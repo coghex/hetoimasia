@@ -495,7 +495,7 @@ frameSpec = describe "rendering a window's scene" $ do
 -- depth-enabled world layer (layer 1) holding them all.
 deepSnapshot ∷ [Api.TextureHandle] → Snapshot
 deepSnapshot handles =
-  Snapshot [Pass WindowTarget (ClearColour 0 0 0 1) [View (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 16 16)) defaultViewSettings [UiLayer (map sprite (take 1 handles)), WorldLayer DepthEnabled (map sprite handles)]]]
+  Snapshot [Pass WindowTarget (ClearColour 0 0 0 1) [View (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 16 16)) defaultViewSettings [] [UiLayer (map sprite (take 1 handles)), WorldLayer DepthEnabled (map sprite handles)]]]
 
 -- | The scene a snapshot makes.
 sceneFor ∷ Snapshot → Scene2D
@@ -526,7 +526,7 @@ depthSpec = describe "world depth" $ do
   it "publishes and records a depth-free snapshot on a device that offers only X8_D24, building no depth pipeline" $
     withEnvOffering [Depth24, Depth16] [1] $ \env → do
       handle ← registered env 1 True DefaultMark
-      let flat = Snapshot [Pass WindowTarget (ClearColour 0 0 0 1) [View (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 16 16)) defaultViewSettings [UiLayer [sprite handle], WorldLayer DepthDisabled [sprite handle]]]]
+      let flat = Snapshot [Pass WindowTarget (ClearColour 0 0 0 1) [View (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 16 16)) defaultViewSettings [] [UiLayer [sprite handle], WorldLayer DepthDisabled [sprite handle]]]]
       publish2DSnapshot (envAdapter env) 1 flat >>= (`shouldBe` Right 1)
       -- The frame-less batch refuses the window pass's first command; the
       -- renderer's preparation, which makes the pipelines, came before it.

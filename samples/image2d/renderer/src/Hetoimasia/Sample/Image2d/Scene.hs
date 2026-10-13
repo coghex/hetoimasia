@@ -68,6 +68,7 @@ snapshotFor target handles layout =
         { viewCamera = Camera (V2 0 0) 1 Nothing
         , viewViewport = Viewport (V2 0 0) (V2 (fromIntegral width) (fromIntegral height))
         , viewSettings = defaultViewSettings {settingUiScale = layoutUiScale layout}
+        , viewClips = []
         , viewLayers =
             [ WorldLayer DepthDisabled [sprite (handlePng handles) (-80, 0) 64, sprite (handleKtx2 handles) (16, 0) 64]
             , UiLayer [sprite (handlePng handles) (8, 8) uiLogicalSize]

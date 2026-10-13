@@ -8,7 +8,7 @@
 --
 -- __Generated domain.__ Ordinary generated floats lie in @[−1e6, 1e6]@, depth
 -- keys in @[0, 2²⁴ − 1]@, and every other field takes its whole range, with
--- the clip index zero because a non-zero one is refused. The wild generator is
+-- the clip index zero because a generated view holds no clip table. The wild generator is
 -- the opposite: it reaches NaN, both infinities, signed zeros, the largest
 -- finite values and subnormals, and is used only where the contract is that
 -- validation answers, deterministically, whatever it is given.
@@ -32,6 +32,7 @@ module Test.Render.TwoD.Support
   , validInstance
   , anyInstance
   , validLayerGen
+  , validClipTable
   , validSnapshotGen
   , wildFloat
   , float
@@ -43,6 +44,7 @@ import qualified Data.List.NonEmpty as NonEmpty
 import Hetoimasia.Math.Affine2 (Affine2, fromColumns, identity)
 import Hetoimasia.Math.Vector (V2 (..))
 import Hetoimasia.Render.Api.Texture.Backend (textureHandle)
+import Hetoimasia.Render.TwoD.Clip (ClipEntry (..), ClipRect (..))
 import Hetoimasia.Render.TwoD.Settings (ViewSettings (..), ZoomMode (..), defaultViewSettings, TextureFilter (..))
 import Hetoimasia.Render.TwoD.Snapshot
 import Hetoimasia.Render.TwoD.Target.Backend (targetRef)
@@ -92,7 +94,7 @@ plainViewport = Viewport (V2 0 0) (V2 640 480)
 -- | A view of the plain camera and viewport, the default settings and these
 -- layers.
 plainView ∷ [Layer] → View
-plainView = View plainCamera plainViewport defaultViewSettings
+plainView = View plainCamera plainViewport defaultViewSettings []
 
 -- | A pass with an opaque black clear.
 plainPass ∷ Target → [View] → Pass
@@ -208,6 +210,35 @@ validLayerGen = do
     , pure (UiLayer instances)
     ]
 
+-- | A valid clip table of up to four entries: finite rectangles with extents
+-- that are not negative, each with no parent or an earlier entry as its parent.
+validClipTable ∷ Gen [ClipEntry]
+validClipTable = do
+  count ← choose (0, 4)
+  mapM entry [0 .. count - 1]
+  where
+    entry index = ClipEntry <$> rect <*> parent index
+    rect = ClipRect <$> (V2 <$> float <*> float) <*> (V2 <$> choose (0, 2000) <*> choose (0, 2000))
+    parent index
+      | index == 0 = pure Nothing
+      | otherwise = oneof [pure Nothing, Just <$> choose (0, index - 1)]
+
+-- | Give the instances of one space's layers clip indices within a table of this
+-- many entries, and leave the other space's layers with none, so no entry is
+-- reached from both spaces. A table of no entries changes nothing.
+referenceClips ∷ Int → [Layer] → Gen [Layer]
+referenceClips count layers
+  | count == 0 = pure layers
+  | otherwise = do
+      world ← arbitrary
+      mapM (reference world) layers
+  where
+    reference world layer = case layer of
+      WorldLayer depth instances | world → WorldLayer depth <$> mapM clipped instances
+      UiLayer instances | not world → UiLayer <$> mapM clipped instances
+      _ → pure layer
+    clipped candidate = (\index → candidate {instanceClip = index}) <$> choose (0, fromIntegral count)
+
 -- | A valid snapshot of up to three passes, ending in a window pass half the
 -- time, each with up to three views of up to three layers.
 validSnapshotGen ∷ Gen Snapshot
@@ -227,8 +258,9 @@ validSnapshotGen = do
       camera ← Camera <$> (V2 <$> float <*> float) <*> choose (0.01, 100) <*> oneof [pure Nothing, Just <$> float]
       viewport ← Viewport <$> (V2 <$> float <*> float) <*> (V2 <$> choose (0, 4096) <*> choose (0, 4096))
       settings ← settings'
-      layers ← resize 3 (listOf validLayerGen)
-      pure (View camera viewport settings layers)
+      clips ← validClipTable
+      layers ← resize 3 (listOf validLayerGen) >>= referenceClips (length clips)
+      pure (View camera viewport settings clips layers)
     settings' = do
       scale ← choose (0.5, 4)
       snap ← arbitrary

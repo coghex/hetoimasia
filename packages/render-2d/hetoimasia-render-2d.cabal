@@ -45,6 +45,7 @@ library
     import: language
     hs-source-dirs: src
     exposed-modules:
+        Hetoimasia.Render.TwoD.Clip
         Hetoimasia.Render.TwoD.Chunk
         Hetoimasia.Render.TwoD.Chunk.Backend
         Hetoimasia.Render.TwoD.Culling
@@ -86,6 +87,7 @@ test-suite render-2d-tests
     main-is: Main.hs
     hs-source-dirs: test
     other-modules:
+        Test.Render.TwoD.Clip
         Test.Render.TwoD.Chunks
         Test.Render.TwoD.DrawPlan
         Test.Render.TwoD.Encoding

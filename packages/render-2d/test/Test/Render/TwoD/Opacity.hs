@@ -158,7 +158,7 @@ validateAndEncode =
     , "frame texture = either (const ()) (foldr seq () . map encodeLayer . validLayers) (validateSnapshot snapshot)"
     , "  where"
     , "    snapshot = Snapshot [Pass WindowTarget (ClearColour 0 0 0 1) [view]]"
-    , "    view = View (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 640 480)) defaultViewSettings [layer]"
+    , "    view = View (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 640 480)) defaultViewSettings [] [layer]"
     , "    layer = UiLayer [Instance identity (UvRect 0 0 1 1) texture 0 (Tint 255 255 255 255) SamplerDefault False False 0 0]"
     ]
 
@@ -275,7 +275,7 @@ buildAndList =
     , "    reference = chunkRef 1 1"
     , "    candidate = Instance identity (UvRect 0 0 1 1) texture 0 (Tint 255 255 255 255) SamplerDefault False False 0 0"
     , "    snapshot = Snapshot [Pass WindowTarget (ClearColour 0 0 0 1) [view]]"
-    , "    view = View (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 640 480)) defaultViewSettings [UiLayerWith [reference] []]"
+    , "    view = View (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 640 480)) defaultViewSettings [] [UiLayerWith [reference] []]"
     ]
 
 mappingConstructor ∷ String
@@ -306,5 +306,5 @@ buildMapping =
     , "pick cursor = viewMapping metrics view >>= \\mapping → windowToWorld mapping cursor"
     , "  where"
     , "    metrics = TargetMetrics (PixelExtent 640 480) (PixelExtent 1280 960) 2 2"
-    , "    view = View (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 1280 960)) defaultViewSettings []"
+    , "    view = View (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 1280 960)) defaultViewSettings [] []"
     ]

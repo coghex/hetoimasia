@@ -87,8 +87,11 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , constructDepthFormat
   , constructImage
   , constructImageFormat
-  , constructRing
-  , constructShaderSampledTablePipelineLayout
+  , constructRingWith
+  , constructStorageTable
+  , constructTablePipelineLayoutWith
+  , TableLayoutOptions (..)
+  , TableUse (..)
   , constructTextureTable
   , registerConstructedTexture
   , releaseConstructed
@@ -194,9 +197,10 @@ buildersWith
   → Render.Builders q inst msgr phys dev cmd
 buildersWith submit construction =
   Render.Builders
-    { Render.buildRing = constructRing construction
+    { Render.buildRing = constructRingWith construction
+    , Render.buildStorageTable = constructStorageTable construction
     , Render.buildTable = constructTextureTable construction
-    , Render.buildTableLayout = constructShaderSampledTablePipelineLayout construction
+    , Render.buildTableLayout = \shaders → constructTablePipelineLayoutWith construction shaders (TableLayoutOptions TableShaderSampler True)
     , Render.buildPipeline = constructBlendedCheckedPipeline construction
     , Render.buildDepthPipeline = constructDepthCheckedPipeline construction
     , Render.buildDepthFormat = constructDepthFormat construction
@@ -383,11 +387,11 @@ shape = depthShape 1 Rgba8Linear 32 32
 -- | A view over a viewport of the target whose camera is at the viewport's
 -- centre, so world units are target pixels there, holding these layers.
 viewOver ∷ (Float, Float) → (Float, Float) → [Layer] → View
-viewOver (x, y) (w, h) = View (Camera (V2 (x + w / 2) (y + h / 2)) 1 Nothing) (Viewport (V2 x y) (V2 w h)) defaultViewSettings
+viewOver (x, y) (w, h) = View (Camera (V2 (x + w / 2) (y + h / 2)) 1 Nothing) (Viewport (V2 x y) (V2 w h)) defaultViewSettings []
 
 -- | A view over a viewport whose camera is at this world position.
 viewAt ∷ (Float, Float) → (Float, Float) → (Float, Float) → [Layer] → View
-viewAt (x, y) (w, h) (cx, cy) = View (Camera (V2 cx cy) 1 Nothing) (Viewport (V2 x y) (V2 w h)) defaultViewSettings
+viewAt (x, y) (w, h) (cx, cy) = View (Camera (V2 cx cy) 1 Nothing) (Viewport (V2 x y) (V2 w h)) defaultViewSettings []
 
 -- | A rectangle of this piece's texture tinted with this colour. An opaque
 -- colour from the white piece is cutout-eligible in a depth-enabled world layer.

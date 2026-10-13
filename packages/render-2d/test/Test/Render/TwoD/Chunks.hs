@@ -178,7 +178,7 @@ buildingSpec = describe "building a chunk" $ do
         worse = plainInstance {instanceUv = UvRect nan 0 0 0}
     sequence_
       [ buildChunk marks kind DeriveBounds [plainInstance, bad, worse]
-          `shouldBe` Left (ChunkInstanceInvalid 1 DepthKeyTooLarge :| [ChunkInstanceInvalid 1 ClipIndexNotZero, ChunkInstanceInvalid 2 UvNotFinite])
+          `shouldBe` Left (ChunkInstanceInvalid 1 DepthKeyTooLarge :| [ChunkInstanceInvalid 1 ClipIndexUnknown, ChunkInstanceInvalid 2 UvNotFinite])
       | kind ← allKinds
       ]
   it "is deterministic: the same instances give the same chunk" $
@@ -338,7 +338,7 @@ validationSpec = describe "referencing chunks from layers" $ do
             :| [Refusal (AtChunk 0 0 0 1 (ref 1 1)) ChunkKindMismatch, Refusal (AtInstance 0 0 0 0) UvNotFinite]
         )
   it "checks the references of a layer in a zero-size viewport as it checks any other" $
-    validateSnapshotWith (held ChunkUi) (snapshotWithView (View plainCamera (Viewport (V2 0 0) (V2 0 0)) defaultViewSettings [UiLayerWith [ref 6 1] []]))
+    validateSnapshotWith (held ChunkUi) (snapshotWithView (View plainCamera (Viewport (V2 0 0) (V2 0 0)) defaultViewSettings [] [UiLayerWith [ref 6 1] []]))
       `shouldBe` Left (Refusal (AtChunk 0 0 0 0 (ref 6 1)) ChunkUnresolved :| [])
   it "keeps what each listing resolved to, a chunk listed twice appearing twice, and names each chunk once" $ do
     let a = built ChunkUi [orderedAt 1 10]
@@ -467,7 +467,7 @@ mergeSpec = describe "the merge order of a layer's content" $ do
     plannedCulled plan `shouldBe` []
   it "plans nothing from a chunk in a zero-size viewport" $ do
     let chunk = built ChunkUi [orderedAt 1 1]
-        snapshot = snapshotWithView (View plainCamera (Viewport (V2 0 0) (V2 0 100)) defaultViewSettings [UiLayerWith [ref 1 1] [orderedAt 2 2]])
+        snapshot = snapshotWithView (View plainCamera (Viewport (V2 0 0) (V2 0 100)) defaultViewSettings [] [UiLayerWith [ref 1 1] [orderedAt 2 2]])
     case validateSnapshotWith (chunksFrom [(ref 1 1, chunk)]) snapshot of
       Right valid → case planPasses (planSnapshot marks valid) of
         [PlannedPass {plannedViews = [PlannedView {plannedLayers = [plan]}]}] → do
@@ -547,7 +547,7 @@ characterised kind listed dynamic plan =
 -- and its mapping.
 mappingOf ∷ TargetMetrics → Camera → Viewport → ViewSettings → ViewMapping
 mappingOf metrics camera viewport settings =
-  maybe (error "the view has no mapping") id (viewMapping metrics (View camera viewport settings []))
+  maybe (error "the view has no mapping") id (viewMapping metrics (View camera viewport settings [] []))
 
 plainMapping ∷ ViewMapping
 plainMapping = mappingOf (offscreenMetrics (PixelExtent 640 480)) plainCamera plainViewport defaultViewSettings
@@ -629,8 +629,8 @@ cullingSpec = describe "culling" $ do
         held = chunksFrom [(ref 1 1, chunk)]
         layer = WorldLayerWith DepthEnabled [ref 1 1] [orderedAt 3 3]
         views =
-          [ View plainCamera plainViewport defaultViewSettings [layer]
-          , View plainCamera {cameraPosition = V2 5000 0} plainViewport defaultViewSettings [layer]
+          [ View plainCamera plainViewport defaultViewSettings [] [layer]
+          , View plainCamera {cameraPosition = V2 5000 0} plainViewport defaultViewSettings [] [layer]
           ]
         snapshot = Snapshot [windowPass views]
         metrics = offscreenMetrics (PixelExtent 640 480)
@@ -661,7 +661,7 @@ cullingSpec = describe "culling" $ do
     checkCoverage $
       forAll cancellingCase $ \(camera, viewport, instances) →
         let metrics = offscreenMetrics (PixelExtent 32 32)
-         in case viewMapping metrics (View camera viewport defaultViewSettings []) of
+         in case viewMapping metrics (View camera viewport defaultViewSettings [] []) of
               Nothing → property True
               Just mapping →
                 let chunk = either (error . show) id (buildChunk marks ChunkWorldFlat DeriveBounds instances)
@@ -674,7 +674,7 @@ cullingSpec = describe "culling" $ do
     checkCoverage $
       forAll cullingCase $ \(extent, kind, camera, viewport, settings, instances) →
       let metrics = TargetMetrics (PixelExtent (fromIntegral (fst extent)) (fromIntegral (snd extent))) (PixelExtent (fromIntegral (fst extent)) (fromIntegral (snd extent))) 1 1
-       in case viewMapping metrics (View camera viewport settings []) of
+       in case viewMapping metrics (View camera viewport settings [] []) of
             Nothing → property True
             Just mapping →
               let chunk = built' kind instances

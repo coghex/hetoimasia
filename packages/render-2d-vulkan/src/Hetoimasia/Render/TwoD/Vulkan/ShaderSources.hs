@@ -18,7 +18,8 @@ import Hetoimasia.GPU.Vulkan.Native.Shader (glsl)
 
 -- | The vertex stage: the unit square placed through the instance's and the
 -- view's transforms, snapped rigidly when the view snaps, with the depth the
--- instance's key gives constant across the quad.
+-- instance's key gives constant across the quad, and the instance's clip index
+-- passed on flat.
 vertexSource ∷ String
 vertexSource =
   [glsl|
@@ -41,12 +42,16 @@ vertexSource =
               float brightness;
               uint filtering;
               uint snap;
+              uint clipBase;
+              vec4 inverseLinear;
+              vec2 clipCentre;
           } pushed;
 
           layout(location = 0) out vec2 at;
           layout(location = 1) flat out uvec2 handle;
           layout(location = 2) flat out vec4 tinted;
           layout(location = 3) flat out uvec2 attributes;
+          layout(location = 4) flat out uint clipIndex;
 
           // Two triangles over the unit square.
           const vec2 corners[6] = vec2[](vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(0.0, 1.0), vec2(0.0, 1.0), vec2(1.0, 0.0), vec2(1.0, 1.0));
@@ -86,12 +91,15 @@ vertexSource =
               handle = uvec2(handleIndex, handleGeneration);
               tinted = tint;
               attributes = uvec2(flags, parameter);
+              // The clip index is the flags word's top 16 bits; 0 means none.
+              clipIndex = flags >> 16u;
               gl_Position = vec4(target / pushed.extent * 2.0 - 1.0, depthOf(depthKey), 1.0);
           }
         |]
 
--- | What both fragment variants share: the table's bindings, the push block,
--- the handle's lookup, the sampler choice, the default material and the tint.
+-- | What both fragment variants share: the table's bindings, the clip table
+-- and the push block, the handle's lookup, the sampler choice, the default
+-- material, the tint and the clip test.
 -- 'sampleMaterial' is the instance's material at its fragment, before the
 -- engine's wrapping.
 fragmentPrelude ∷ String
@@ -105,6 +113,11 @@ fragmentPrelude =
           layout(set = 1, binding = 0, std430) readonly buffer Lookup {
               uvec2 entries[];
           } lookups;
+          // The batch's clip tables (R2D-12): one vec4 per resolved clip, its
+          // left, top, right and bottom edges in the layer's space.
+          layout(set = 2, binding = 0, std430) readonly buffer Clips {
+              vec4 rectangles[];
+          } clips;
 
           layout(push_constant) uniform Pushed {
               vec4 viewLinear;
@@ -113,12 +126,16 @@ fragmentPrelude =
               float brightness;
               uint filtering;
               uint snap;
+              uint clipBase;
+              vec4 inverseLinear;
+              vec2 clipCentre;
           } pushed;
 
           layout(location = 0) in vec2 at;
           layout(location = 1) flat in uvec2 handle;
           layout(location = 2) flat in vec4 tinted;
           layout(location = 3) flat in uvec2 attributes;
+          layout(location = 4) flat in uint clipIndex;
           layout(location = 0) out vec4 colour;
 
           // A handle's slot in the bound version: its entry's, when the index
@@ -164,6 +181,28 @@ fragmentPrelude =
           vec4 tintMaterial(vec4 m, vec4 tint) {
               return m * tint;
           }
+
+          // Whether the instance's clip excludes this fragment (design D-11).
+          // The fragment's pixel centre must lie in the clip's half-open
+          // rectangle in the layer's space: left and top inside, right and
+          // bottom outside. Clip index 0 means none, and reads nothing; index k
+          // reads the layer's table's entry k - 1. The comparison is made about
+          // a reference point, never in absolute layer coordinates, which are
+          // too coarse in single precision far from the origin: the fragment's
+          // offset from the push block's clipCentre goes through the inverse's
+          // linear part, and the table's edges were written as their distance
+          // from the layer-space point under that centre.
+          bool clippedOut() {
+              if (clipIndex == 0u) {
+                  return false;
+              }
+              vec4 clip = clips.rectangles[pushed.clipBase + clipIndex - 1u];
+              vec2 offset = gl_FragCoord.xy - pushed.clipCentre;
+              vec2 local = vec2(
+                  pushed.inverseLinear.x * offset.x + pushed.inverseLinear.z * offset.y,
+                  pushed.inverseLinear.y * offset.x + pushed.inverseLinear.w * offset.y);
+              return !(local.x >= clip.x && local.x < clip.z && local.y >= clip.y && local.y < clip.w);
+          }
         |]
 
 -- | The ordered path's fragment tail: brightness after the tint, then the
@@ -187,7 +226,13 @@ orderedTail =
           }
 
           void main() {
-              colour = blendOutput(wrapMaterial(sampleMaterial(), tinted, pushed.brightness), attributes.x);
+              // The sample is taken first, so the neighbouring invocations of a
+              // quad that the clip discards still take part in its derivatives.
+              vec4 s = wrapMaterial(sampleMaterial(), tinted, pushed.brightness);
+              if (clippedOut()) {
+                  discard;
+              }
+              colour = blendOutput(s, attributes.x);
           }
         |]
 
@@ -208,6 +253,10 @@ cutoutTail =
           }
 
           void main() {
-              colour = cutoutOutput(tintMaterial(sampleMaterial(), tinted), pushed.brightness);
+              vec4 s = tintMaterial(sampleMaterial(), tinted);
+              if (clippedOut()) {
+                  discard;
+              }
+              colour = cutoutOutput(s, pushed.brightness);
           }
         |]

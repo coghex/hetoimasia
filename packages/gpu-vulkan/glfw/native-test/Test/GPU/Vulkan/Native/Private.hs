@@ -132,6 +132,20 @@
 --   reason under the validation runner's evidence directory; where the device
 --   chooses another depth format the run reports it and checks the recorder's
 --   refusal instead (#426);
+-- * @r2d12-clip@ — the same device start with no window, then the 2D renderer's
+--   recorder over instances that carry clip indices (R2D-12): seven fixtures —
+--   one draw, under a camera turned an eighth of a turn, of an unclipped
+--   instance, a clipped one and one under a nested clip; two views whose one
+--   clip index selects each view's own rectangle; a UI clip at content scale 2
+--   in a viewport away from the origin; a clip under pixel snap and zoom that
+--   neither follows a sprite's origin snap nor ignores the view's snapped
+--   translation; a view looking at world coordinates near 65536 at a zoom of 100,
+--   where an absolute single-precision coordinate would admit a pixel 0.34 pixel
+--   outside a clip; a cutout clipped away writing no depth; and an empty clip and
+--   a clip under one — the batch's clip tables written into one ring region
+--   and bound as the storage table, every pixel of every target judged against
+--   the render-2d oracle, and written as lossless PNGs and a probe record
+--   under the validation runner's evidence directory (#428);
 -- * @r2d10-retained@ — the same device start with no window, then the 2D
 --   renderer's recorder over targets that each have a @D32_SFLOAT@ depth image
 --   and the adapter's holds (R2D-10): retained chunks built once, their cutout
@@ -527,6 +541,14 @@ scenarios =
       $ \consent journal _ → do
         outcome ← SurfaceFree.runCutoutDepth (consentBackend consent) journal
         pure (SurfaceFree.cutoutDepthSpec outcome, section "The R2D-9 cutout path evidence record" (SurfaceFree.cutoutDepthSection outcome))
+  , Scenario
+      "r2d12-clip"
+      "records seven render-2d snapshots whose instances carry clip indices into their views' clip tables into offscreen targets of a surface-free session, the batch's tables written into one ring region and bound as the storage table and the fragment stage discarding outside each instance's clip — an unclipped, a clipped and a nested-clipped instance in one draw under a camera turned an eighth of a turn, two views whose one clip index selects each view's own rectangle, a UI clip at content scale 2 in a viewport away from the origin, a clip under pixel snap and zoom that neither follows a sprite's origin snap nor ignores the view's snapped translation, a view of world coordinates near 65536 at a zoom of 100 whose clip edge an absolute single-precision coordinate would misplace by most of a pixel, a clipped-away cutout that writes no depth, and an empty clip with a clip under one — reads each target back after completion, passes every determinate probe of the render-2d oracle with each named behaviour distinguished from its contrast, and writes lossless PNGs and a probe record, with validation reporting nothing"
+      False
+      Nothing
+      $ \consent journal _ → do
+        outcome ← SurfaceFree.runClip (consentBackend consent) journal
+        pure (SurfaceFree.clipSpec outcome, section "The R2D-12 clip evidence record" (SurfaceFree.clipSection outcome))
   , Scenario
       "r2d10-retained"
       "records eleven frames of render-2d snapshots that list retained chunks built once beside dynamic content that alone is republished, into offscreen targets that have a D32_SFLOAT depth image, in a surface-free session — retained cutouts and a translucent instance interleaved with dynamic cutouts, a world chunk without depth and a UI chunk drawn in the ordered path beside dynamic content, a texture swap showing through a chunk and a mark-changing swap refused, a chunk released while the adopted snapshot shows it and still drawn until a snapshot without it is adopted, and a chunk outside a view skipped — reads each back after completion, judges every pixel against the render-2d oracle, and writes a lossless PNG a target, a probe record and the bytes uploaded and written to the ring; where the device chooses another depth format it reports that"

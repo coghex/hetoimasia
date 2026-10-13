@@ -239,7 +239,7 @@ additive candidate = candidate {instanceAdditive = True}
 
 -- | A view: viewport origin and extent, camera, settings and layers.
 view ∷ (Float, Float) → (Float, Float) → Camera → ViewSettings → [Layer] → View
-view (x, y) (w, h) camera settings = View camera (Viewport (V2 x y) (V2 w h)) settings
+view (x, y) (w, h) camera settings = View camera (Viewport (V2 x y) (V2 w h)) settings []
 
 -- | The camera that makes world units target pixels in a viewport of this
 -- extent: at its centre at zoom 1.

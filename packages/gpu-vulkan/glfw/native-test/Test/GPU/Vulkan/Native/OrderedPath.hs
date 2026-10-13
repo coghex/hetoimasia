@@ -86,8 +86,11 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , constructImageFormat
   , constructReadback
   , constructBuffer
-  , constructRing
-  , constructShaderSampledTablePipelineLayout
+  , constructRingWith
+  , constructStorageTable
+  , constructTablePipelineLayoutWith
+  , TableLayoutOptions (..)
+  , TableUse (..)
   , constructTextureTable
   , copyTargetToReadback
   , formatCode
@@ -97,6 +100,7 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , swapConstructedTexture
   , transitionResource
   , validateRingSize
+  , validateStorageWindow
   , validateTableConfig
   )
 import Hetoimasia.GPU.Vulkan.Native.Recording (Buffer, Recorder)
@@ -306,15 +310,17 @@ configuration ∷ Render.Configuration
 configuration =
   Render.Configuration
     { Render.configurationRing = either (error . show) id (validateRingSize (1024 * 1024))
+    , Render.configurationClipWindow = either (error . show) id (validateStorageWindow (16 * 1024))
     , Render.configurationTable = either (error . show) id (validateTableConfig 16 8 4)
     }
 
 builders ∷ Construction q inst msgr phys dev cmd → Render.Builders q inst msgr phys dev cmd
 builders construction =
   Render.Builders
-    { Render.buildRing = constructRing construction
+    { Render.buildRing = constructRingWith construction
+    , Render.buildStorageTable = constructStorageTable construction
     , Render.buildTable = constructTextureTable construction
-    , Render.buildTableLayout = constructShaderSampledTablePipelineLayout construction
+    , Render.buildTableLayout = \shaders → constructTablePipelineLayoutWith construction shaders (TableLayoutOptions TableShaderSampler True)
     , Render.buildPipeline = constructBlendedCheckedPipeline construction
     , Render.buildDepthPipeline = constructDepthCheckedPipeline construction
     , Render.buildDepthFormat = constructDepthFormat construction
