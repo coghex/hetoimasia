@@ -8,7 +8,6 @@ module Hetoimasia.Sample.Image2d.Embed
   ( embedFile
   ) where
 
-import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import Data.ByteString.Unsafe (unsafePackAddressLen)
 import Language.Haskell.TH (Exp, Q, integerL, litE, runIO, stringPrimL)
