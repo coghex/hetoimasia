@@ -453,6 +453,7 @@ recordingSpec = describe "recording a frame" $ do
                    , SeenTable
                    , SeenScissor (Rect 0 0 16 16)
                    , SeenClearDepth (Rect 0 0 16 16) 1
+                   , SeenTable
                    , SeenPush [PushVertex, PushFragment] 0 (push [2, 0, 0, 2, 0, 0] (16, 16) 1 FilterNearest False)
                    , SeenBind 0 384
                    , SeenDraw 6 1
@@ -620,7 +621,7 @@ depthSpec = describe "depth passes" $ do
       commands ← commandsRecorded rig
       [fmap (\(DepthClear _ value) → value) depth | CommandBeginRendering _ _ _ depth ← commands] `shouldBe` [Nothing, Nothing, Just 1, Nothing]
 
-  it "clears depth to 1.0 within each depth-enabled layer's view scissor, before its push block and draw, and not in a view with no scissor" $
+  it "clears depth to 1.0 within each depth-enabled layer's view scissor, binds the table again, then its push block and draw, and clears in no view with no scissor" $
     withRig $ \rig → do
       renderer ← rendererOver rig 4096
       let deep x = WorldLayer DepthEnabled [spriteOf plainHandle x 0]
@@ -635,11 +636,13 @@ depthSpec = describe "depth passes" $ do
                    , SeenTable
                    , SeenScissor (Rect 0 0 8 16)
                    , SeenClearDepth (Rect 0 0 8 16) 1
+                   , SeenTable
                    , SeenPush [PushVertex, PushFragment] 0 (push [1, 0, 0, 1, 4, 8] (16, 16) 1 FilterNearest False)
                    , SeenBind 0 0
                    , SeenDraw 6 1
                    , SeenScissor (Rect 8 0 8 16)
                    , SeenClearDepth (Rect 8 0 8 16) 1
+                   , SeenTable
                    , SeenPush [PushVertex, PushFragment] 0 (push [1, 0, 0, 1, 12, 8] (16, 16) 1 FilterNearest False)
                    , SeenBind 0 64
                    , SeenDraw 6 1

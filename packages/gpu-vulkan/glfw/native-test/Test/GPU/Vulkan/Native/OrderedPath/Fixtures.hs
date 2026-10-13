@@ -10,8 +10,12 @@
 -- background would pass whatever the recorder did; a named probe whose value
 -- equals its contrast's would too, so the pair is checked.
 --
--- The oracle is given 'noCutoutMarks', as the recorder plans, so a
--- depth-enabled world layer holding cutout-marked art draws ordered.
+-- A fixture names the textures it marks cutout-safe ('fixtureMarked'), and the
+-- recorder and the oracle are planned with exactly those marks. The ordered
+-- path's own fixtures mark none, so a depth-enabled world layer holding art
+-- draws ordered; a target that 'shapeDepth' asks for has a depth image of its
+-- extent, and a pass into it begins with a depth attachment when a depth-enabled
+-- world layer is drawn.
 --
 -- = The textures
 --
@@ -25,17 +29,29 @@ module Test.GPU.Vulkan.Native.OrderedPath.Fixtures
     TextureKey (..)
   , Texture (..)
   , textures
+  , textureLevels
   , decoded
     -- * Handles
   , Handles (..)
     -- * Targets
   , TargetShape (..)
   , offscreenShape
+  , depthShape
   , colourFormatOf
     -- * Fixtures
   , NamedProbe (..)
   , Fixture (..)
   , fixtures
+    -- * Building blocks, shared with the other suites
+  , quad
+  , tinted
+  , keyed
+  , sampled
+  , additive
+  , view
+  , identityCamera
+  , pass
+  , probe
   ) where
 
 import qualified Data.ByteString as ByteString
@@ -59,25 +75,31 @@ import Hetoimasia.Render.TwoD.Target.Backend (targetRef)
 -- ---------------------------------------------------------------------------
 -- Textures
 
-data TextureKey = Checker | GreySrgb | White | Art
+data TextureKey = Checker | GreySrgb | White | Art | Edge | Mipped | LevelZero
   deriving (Eq, Ord, Show, Enum, Bounded)
 
--- | A texture of one level: its format, extent and bytes as uploaded.
+-- | A texture: its format, its extent, its level 0 bytes as uploaded and any
+-- further levels, each half the size of the one before.
 data Texture = Texture
   { textureKey ∷ !TextureKey
   , textureFormat ∷ !ImageFormat
   , textureWidth ∷ !Word32
   , textureHeight ∷ !Word32
   , textureBytes ∷ !ByteString
+  , textureMips ∷ ![ByteString]
   }
   deriving (Eq, Show)
 
+-- | Every level's bytes, level 0 first.
+textureLevels ∷ Texture → [ByteString]
+textureLevels texture = textureBytes texture : textureMips texture
+
 textures ∷ [Texture]
 textures =
-  [ Texture Checker Rgba8Linear 2 2 (bytes [red, green, blue, yellow])
-  , Texture GreySrgb Rgba8Srgb 2 2 (bytes (replicate 4 [128, 128, 128, 255]))
-  , Texture White Rgba8Linear 1 1 (bytes [[255, 255, 255, 255]])
-  , Texture Art Rgba8Linear 2 2 (bytes [orange, clear', clear', orange])
+  [ Texture Checker Rgba8Linear 2 2 (bytes [red, green, blue, yellow]) []
+  , Texture GreySrgb Rgba8Srgb 2 2 (bytes (replicate 4 [128, 128, 128, 255])) []
+  , Texture White Rgba8Linear 1 1 (bytes [[255, 255, 255, 255]]) []
+  , Texture Art Rgba8Linear 2 2 (bytes [orange, clear', clear', orange]) []
   ]
   where
     bytes = ByteString.pack . concat
@@ -97,8 +119,8 @@ decoded texture =
         _ → TexelRgba8Linear
     , decodedWidth = textureWidth texture
     , decodedHeight = textureHeight texture
-    , decodedLevels = [textureBytes texture]
-    , decodedBinaryAlpha = all (`elem` [0, 255]) (everyFourth (drop 3 (ByteString.unpack (textureBytes texture))))
+    , decodedLevels = textureLevels texture
+    , decodedBinaryAlpha = all (`elem` [0, 255]) (everyFourth (drop 3 (ByteString.unpack (ByteString.concat (textureLevels texture)))))
     }
   where
     everyFourth = \case
@@ -126,13 +148,19 @@ data TargetShape = TargetShape
   , shapeMetrics ∷ !TargetMetrics
     -- ^ What the views map under, shared by the recorder and the oracle; its
     -- framebuffer extent is the target's.
+  , shapeDepth ∷ !Bool
+    -- ^ Whether the target has a depth image of its extent for a pass into it.
   }
 
 -- | A target by index of this format and extent, with ordinary offscreen
 -- metrics: its logical extent is its pixel extent and its content scale 1.
 offscreenShape ∷ Word32 → ImageFormat → Word32 → Word32 → TargetShape
 offscreenShape index format width height =
-  TargetShape (targetRef index 1) format width height (offscreenMetrics (PixelExtent (fromIntegral width) (fromIntegral height)))
+  TargetShape (targetRef index 1) format width height (offscreenMetrics (PixelExtent (fromIntegral width) (fromIntegral height))) False
+
+-- | 'offscreenShape' with a depth image of the target's extent.
+depthShape ∷ Word32 → ImageFormat → Word32 → Word32 → TargetShape
+depthShape index format width height = (offscreenShape index format width height) {shapeDepth = True}
 
 -- | The oracle's name for a target's colour format.
 colourFormatOf ∷ ImageFormat → ColourFormat
@@ -155,6 +183,9 @@ data NamedProbe = NamedProbe
 
 data Fixture = Fixture
   { fixtureName ∷ !Text
+  , fixtureMarked ∷ ![TextureKey]
+    -- ^ The textures marked cutout-safe: the recorder and the oracle plan with
+    -- exactly these marks.
   , fixtureShapes ∷ ![TargetShape]
   , fixtureSnapshot ∷ Handles → Snapshot
   , fixtureNamed ∷ ![NamedProbe]
@@ -250,6 +281,7 @@ placement ∷ Fixture
 placement =
   Fixture
     { fixtureName = "placement"
+    , fixtureMarked = []
     , fixtureShapes = [shape]
     , fixtureSnapshot = \handles →
         let checker = handleOf handles Checker
@@ -286,6 +318,7 @@ samplers ∷ Fixture
 samplers =
   Fixture
     { fixtureName = "samplers"
+    , fixtureMarked = []
     , fixtureShapes = [shape]
     , fixtureSnapshot = \handles →
         let sprite x choice = sampled choice (quad (x, 4) (8, 8) (handleOf handles Checker))
@@ -317,6 +350,7 @@ rotation ∷ Fixture
 rotation =
   Fixture
     { fixtureName = "rotation"
+    , fixtureMarked = []
     , fixtureShapes = [shape]
     , fixtureSnapshot = \handles →
         let quarter = realToFrac (pi / 2 ∷ Double) ∷ Float
@@ -351,6 +385,7 @@ colour ∷ Fixture
 colour =
   Fixture
     { fixtureName = "colour"
+    , fixtureMarked = []
     , fixtureShapes = [shape]
     , fixtureSnapshot = \handles →
         let white = handleOf handles White
@@ -386,6 +421,7 @@ overlap ∷ Fixture
 overlap =
   Fixture
     { fixtureName = "overlap"
+    , fixtureMarked = []
     , fixtureShapes = [shape]
     , fixtureSnapshot = \handles →
         let white = handleOf handles White
@@ -418,6 +454,7 @@ contentScale ∷ Fixture
 contentScale =
   Fixture
     { fixtureName = "content-scale"
+    , fixtureMarked = []
     , fixtureShapes = [one, two]
     , fixtureSnapshot = \handles →
         let layer = UiLayer [tinted (255, 128, 0, 255) (quad (2, 2) (6, 6) (handleOf handles White))]
@@ -441,6 +478,7 @@ fractionalViews ∷ Fixture
 fractionalViews =
   Fixture
     { fixtureName = "fractional-views"
+    , fixtureMarked = []
     , fixtureShapes = [shape]
     , fixtureSnapshot = \handles →
         let white = handleOf handles White
@@ -471,6 +509,7 @@ formats ∷ Fixture
 formats =
   Fixture
     { fixtureName = "formats"
+    , fixtureMarked = []
     , fixtureShapes = [srgb, unorm]
     , fixtureSnapshot = \handles →
         let layer = UiLayer [quad (2, 2) (8, 8) (handleOf handles GreySrgb)]
@@ -494,6 +533,7 @@ cutoutArt ∷ Fixture
 cutoutArt =
   Fixture
     { fixtureName = "cutout-art"
+    , fixtureMarked = []
     , fixtureShapes = [shape]
     , fixtureSnapshot = \handles →
         let art = handleOf handles Art
@@ -525,6 +565,7 @@ placeholders ∷ Fixture
 placeholders =
   Fixture
     { fixtureName = "placeholders"
+    , fixtureMarked = []
     , fixtureShapes = [shape]
     , fixtureSnapshot = \handles →
         let sprite x handle = quad (x, 2) (6, 6) handle
@@ -557,6 +598,7 @@ snapBoundary ∷ Fixture
 snapBoundary =
   Fixture
     { fixtureName = "snap-boundary"
+    , fixtureMarked = []
     , fixtureShapes = [shape]
     , fixtureSnapshot = \handles →
         let belowHalf = castWord32ToFloat 0x3effffff

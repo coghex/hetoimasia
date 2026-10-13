@@ -149,7 +149,7 @@ import Hetoimasia.GPU.Vulkan.Native.TextureTable
   , defaultVersionCount
   , validateTableConfig
   )
-import Hetoimasia.Render.TwoD.Validation (Location)
+import Hetoimasia.Render.TwoD.Validation (Location (..))
 import Hetoimasia.Render.TwoD.Vulkan.Frame
 import Hetoimasia.Render.TwoD.Vulkan.Layout (instanceStride)
 import Hetoimasia.Render.TwoD.Vulkan.Shaders (cutoutShaders, orderedShaders)
@@ -315,6 +315,7 @@ recordPass recorder pipelines regions pass =
     width = fromIntegral (attachmentWidth attachment)
     height = fromIntegral (attachmentHeight attachment)
     depthed = isJust (workDepth pass)
+    drawsHere = passDraws pass
     begin = case (workImage pass, workDepth pass) of
       (Just image, Nothing) → beginRenderingInto recorder image ClearFromUndefined (workClear pass)
       (Just image, Just depth) → beginRenderingWithDepth recorder image ClearFromUndefined (workClear pass) (clearedDepth (depthImage depth) ClearFromUndefined)
@@ -339,7 +340,11 @@ recordPass recorder pipelines regions pass =
          in (bound', backend (setScissor recorder rect) : concat steps)
       _ → (bound, [])
     layerSteps rect bound layer =
-      let clear = [backend (clearDepthRect recorder rect 1) | layerClearsDepth layer]
+      -- A depth clear is followed by binding the table again, where the pass
+      -- draws: on MoltenVK a mid-pass clear leaves the descriptor bindings
+      -- unusable by the draws after it, and a draw after one finds the table
+      -- gone unless it is bound anew (Vulkan itself leaves them undisturbed).
+      let clear = concat [[backend (clearDepthRect recorder rect 1)] <> [backend (bindTable recorder) | drawsHere] | layerClearsDepth layer]
        in case (layerRunList layer, Map.lookup (layerLocation layer) regions) of
             ([], _) → (bound, clear)
             (_, Nothing) → (bound, clear <> [pure (Left (PlanDisagrees (layerLocation layer)))])
