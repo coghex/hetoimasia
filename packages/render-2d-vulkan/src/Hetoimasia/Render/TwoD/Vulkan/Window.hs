@@ -95,6 +95,7 @@ module Hetoimasia.Render.TwoD.Vulkan.Window
   ) where
 
 import Control.Concurrent.MVar (MVar, newMVar, withMVar)
+import Control.Exception (mask, onException)
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO)
 import Control.DeepSeq (NFData (rnf))
 import Control.Monad (forM_)
@@ -299,9 +300,13 @@ release2DTexture adapter handle = withMVar (adapterLock adapter) $ \_ → do
       pure (either (Left . ReleaseRequestRefused) Right answer)
 
 -- | Queue the release after the barrier was met, once, with no barrier of its
--- own. A refusal leaves it for the next 'retryReleases'.
+-- own. The reservation and the admission are protected together: a refusal,
+-- or a cancellation before the host admitted the action, gives the reservation
+-- back, so the next 'retryReleases' queues it. (A cancellation after the host
+-- admitted it leaves a second action possible, which the release's own recheck
+-- makes harmless.)
 followUp ∷ Adapter window → Api.TextureHandle → IO (Either Text ())
-followUp adapter handle = do
+followUp adapter handle = mask $ \restore → do
   fresh ← atomically $ do
     queued ← readTVar (adapterQueued adapter)
     if Set.member handle queued
@@ -310,11 +315,13 @@ followUp adapter handle = do
   if not fresh
     then pure (Right ())
     else do
-      answer ← hostRunOnOwner (adapterHost adapter) (releaseBody adapter handle)
+      answer ← restore (hostRunOnOwner (adapterHost adapter) (releaseBody adapter handle)) `onException` unreserve
       case answer of
-        Left _ → atomically (modifyTVar' (adapterQueued adapter) (Set.delete handle))
+        Left _ → unreserve
         Right () → pure ()
       pure answer
+  where
+    unreserve = atomically (modifyTVar' (adapterQueued adapter) (Set.delete handle))
 
 -- | Queue the release of every pending texture whose barrier was met and that
 -- no adopted revision holds, and whose release action is not already queued.

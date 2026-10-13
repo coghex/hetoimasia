@@ -71,6 +71,8 @@ data Fake = Fake
     -- ^ How many actions the host's queue holds, when bounded.
   , fakeCancel ∷ !(TVar Bool)
     -- ^ Whether the next request is interrupted by a cancellation.
+  , fakeCancelPlain ∷ !(TVar Bool)
+    -- ^ Whether the next barrier-free action is.
   , fakeAsked ∷ !(TVar (Int, Int))
     -- ^ How many actions were admitted with a barrier and without one.
   }
@@ -93,6 +95,7 @@ newFake windows = do
   capacity ← newTVarIO Nothing
   asked ← newTVarIO (0, 0)
   cancel ← newTVarIO False
+  cancelPlain ← newTVarIO False
   let publish window scene = atomically $ do
         known ← Map.lookup window <$> readTVar revisions
         case known of
@@ -117,8 +120,10 @@ newFake windows = do
         interrupted ← atomically (readTVar cancel <* writeTVar cancel False)
         if interrupted then throwIO ThreadKilled else admit True body
       plain ∷ ReleaseBody → IO (Either Text ())
-      plain = admit False
-  pure (Host publish request plain, Fake published queued refusing capacity cancel asked)
+      plain body = do
+        interrupted ← atomically (readTVar cancelPlain <* writeTVar cancelPlain False)
+        if interrupted then throwIO ThreadKilled else admit False body
+  pure (Host publish request plain, Fake published queued refusing capacity cancel cancelPlain asked)
 
 withEnv ∷ [Int] → (Env → IO a) → IO a
 withEnv windows action = do
@@ -588,6 +593,38 @@ releaseSpec = describe "releasing a texture behind the host's barrier" $ do
       length <$> readTVarIO (fakeQueued (envFake env)) >>= (`shouldBe` 0)
       -- Asking again repeats the request, and the lock was not left held.
       release2DTexture (envAdapter env) handle >>= (`shouldBe` Right ())
+      runQueued env >>= (`shouldBe` [Right ()])
+      resolves env handle >>= (`shouldBe` False)
+
+  it "recovers a follow-up whose caller was cancelled before the host admitted it" $
+    withEnv [1] $ \env → do
+      handle ← registered env 1 True DefaultMark
+      showing ← publishOk env 1 [handle]
+      adopt env 1 showing
+      release2DTexture (envAdapter env) handle >>= (`shouldBe` Right ())
+      _ ← runQueued env
+      -- The hold ends, and the thread queueing the follow-up is cancelled.
+      atomically (writeTVar (fakeCancelPlain (envFake env)) True)
+      try @AsyncException (releaseRevision env 1 showing) >>= (`shouldBe` Left ThreadKilled)
+      length <$> readTVarIO (fakeQueued (envFake env)) >>= (`shouldBe` 0)
+      pendingReleases (envAdapter env) >>= (`shouldBe` Set.singleton handle)
+      -- Neither the next retry nor a repeated release is shut out by it.
+      retryReleases (envAdapter env)
+      length <$> readTVarIO (fakeQueued (envFake env)) >>= (`shouldBe` 1)
+      runQueued env >>= (`shouldBe` [Right ()])
+      resolves env handle >>= (`shouldBe` False)
+
+  it "recovers a repeated release of a texture whose barrier was met when its follow-up's caller was cancelled" $
+    withEnv [1] $ \env → do
+      handle ← registered env 1 True DefaultMark
+      showing ← publishOk env 1 [handle]
+      adopt env 1 showing
+      release2DTexture (envAdapter env) handle >>= (`shouldBe` Right ())
+      _ ← runQueued env
+      atomically (writeTVar (fakeCancelPlain (envFake env)) True)
+      try @AsyncException (releaseRevision env 1 showing) >>= (`shouldBe` Left ThreadKilled)
+      release2DTexture (envAdapter env) handle >>= (`shouldBe` Right ())
+      length <$> readTVarIO (fakeQueued (envFake env)) >>= (`shouldBe` 1)
       runQueued env >>= (`shouldBe` [Right ()])
       resolves env handle >>= (`shouldBe` False)
 
