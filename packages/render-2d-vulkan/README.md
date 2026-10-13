@@ -1,23 +1,26 @@
 # hetoimasia-render-2d-vulkan
 
-The 2D renderer's Vulkan recorder for the **ordered path** (R2D-7): a validated
-[render-2d](../render-2d/README.md) snapshot recorded into one batch of the
+The 2D renderer's Vulkan recorder for the **ordered path** (R2D-7) and the
+**cutout path** (R2D-9): a validated [render-2d](../render-2d/README.md) snapshot
+recorded into one batch of the
 [native backend](../gpu-vulkan/native/README.md), every pass in list order into
 an offscreen colour target or the frame's image, every view under its own
-scissor, every layer as one instanced draw per run, with premultiplied-alpha
-blending. It owns the built-in shaders and the wrapping the engine applies
-around a material. The decision record is
-[the 2D renderer design](../../docs/designs/render_2d_design.md) (D-2, D-4, D-5,
-D-9, D-10, D-12, D-22, D-24; P-6); the backend's contract is
-[docs/gpu_backend.md](../../docs/gpu_backend.md).
+scissor, every layer as one instanced draw per run. The ordered path blends
+premultiplied alpha; in a depth-enabled world layer, art marked cutout-safe is
+drawn first, depth-tested and depth-written, and the ordered path's instances
+are depth-tested and not written. It owns the built-in shaders and the wrapping
+the engine applies around a material. The decision record is
+[the 2D renderer design](../../docs/designs/render_2d_design.md) (D-2, D-3, D-4,
+D-5, D-9, D-10, D-12, D-19, D-22, D-23, D-24, D-26, D-27; P-6); the backend's
+contract is [docs/gpu_backend.md](../../docs/gpu_backend.md).
 
 | Module | Contents |
 | --- | --- |
-| `Hetoimasia.Render.TwoD.Vulkan` | `Builders`; `Configuration`, `defaultConfiguration`; `Renderer`, `makeRenderer`, `pipelineFor`; `prepareSnapshot`, `FrameRecording`; re-exports `Hetoimasia.Render.TwoD.Vulkan.Frame` and `orderedShaders` |
-| `Hetoimasia.Render.TwoD.Vulkan.Frame` | `Attachment`, `offscreenAttachment`, `TargetBinding`, `FrameInput`; `FrameRefusal`; `frameWork` and the work it computes: `PassWork`, `ViewWork`, `LayerWork`, `RunWork` |
-| `Hetoimasia.Render.TwoD.Vulkan.Layout` | the instance as vertex input (`instanceVertexInput`), the push block (`ViewPush`, `packViewPush`, `pushMembers`), the sampler choice (`shaderSamplerIndex`), the scissor rule (`viewScissor`) |
+| `Hetoimasia.Render.TwoD.Vulkan` | `Builders`; `Configuration`, `defaultConfiguration`; `Renderer`, `makeRenderer`, `pipelineFor`, `pipelineDeclaration`; `prepareSnapshot`, `FrameRecording`; re-exports `Hetoimasia.Render.TwoD.Vulkan.Frame`, `orderedShaders` and `cutoutShaders` |
+| `Hetoimasia.Render.TwoD.Vulkan.Frame` | `Attachment`, `offscreenAttachment`, `TargetBinding`, `DepthBinding`, `FrameInput`; `depthLayers`, `requireWorldDepth`; `FrameRefusal`; `frameWork` and the work it computes: `PassWork`, `ViewWork`, `LayerWork`, `RunWork`, `PipelineKind`, `runPipeline` |
+| `Hetoimasia.Render.TwoD.Vulkan.Layout` | the instance as vertex input (`instanceVertexInput`), the key's depth (`depthFromKey`), the push block (`ViewPush`, `packViewPush`, `pushMembers`), the sampler choice (`shaderSamplerIndex`), the scissor rule (`viewScissor`) |
 | `Hetoimasia.Render.TwoD.Vulkan.ShaderInterfaces` | the checked interface descriptions the shaders are compiled against |
-| `Hetoimasia.Render.TwoD.Vulkan.Shaders` | `orderedShaders`, the vertex and fragment stages |
+| `Hetoimasia.Render.TwoD.Vulkan.Shaders` | `orderedShaders` and `cutoutShaders`: one vertex stage and two fragment stages |
 
 ## Boundary
 
@@ -44,8 +47,8 @@ draws go through (`configurationTable`), and a **shader-sampled table pipeline
 layout** over the package's shaders (R2D-16): a layout holding the table that
 declares no sampler offset, so a draw needs no `selectSampler`, with one
 push-constant range for both stages (44 bytes, below). A pipeline is made per
-colour format the first time a pass into that format draws, with
-premultiplied-alpha blending, by `pipelineFor`. Textures are registered with the
+colour format and kind (below) the first time a pass into that format draws
+with it, by `pipelineFor`. Textures are registered with the
 table by their owner; the recorder samples whatever handles the snapshot names,
 and an unregistered or released handle, or one whose generation the table no
 longer holds, samples slot 0's transparent placeholder.
@@ -55,11 +58,14 @@ longer holds, samples slot 0's transparent placeholder.
 `prepareSnapshot builders renderer input` runs on the owner's thread before a
 batch records, and answers either a `FrameRefusal` or a `FrameRecording`: what
 records the frame into the batch's recorder. The `FrameInput` is the validated
-snapshot, the lookup that resolves an offscreen `TargetRef`, and the window's
-`Attachment` when a host renderer records the frame inside a frame batch. The
-snapshot is planned with `noCutoutMarks`, so every instance takes the `Ordered`
-path (D-22); a depth-enabled world layer draws without a depth attachment and
-its `plannedClearsDepth` mark is not acted on until R2D-9.
+snapshot, the `CutoutMarks` it is planned with (`frameMarks`: the registered
+handles' marks on a host, `noCutoutMarks` where nothing is marked, in which case
+every instance takes the `Ordered` path, D-22), the lookup that resolves an
+offscreen `TargetRef` to a `TargetBinding`, and the window's `Attachment` and
+depth image when a host renderer records the frame inside a frame batch. Every
+other routing condition is `render-2d`'s, unchanged: a texture marked
+cutout-safe, a cutout-capable material, a tint alpha of 255 and no translucent
+or additive flag, in a depth-enabled world layer.
 
 Everything that can refuse is decided first, in `frameWork`, which is pure:
 
@@ -70,6 +76,8 @@ Everything that can refuse is decided first, in `frameWork`, which is pure:
 | `InvalidMetrics pass` | the pass's metrics have a negative extent or a content scale that is not finite and positive |
 | `MetricsDisagree pass metrics extent` | the metrics' framebuffer extent is not the attachment's actual extent |
 | `ViewNotMappable pass view` | `viewMapping` refuses the view under the metrics |
+| `NoDepthTarget location` | a pass needs a depth attachment (below) for this depth-enabled world layer and was given none |
+| `DepthFormatRefused location format` | a pass holding this depth-enabled world layer was given a depth image whose format is not `D32_SFLOAT` (D-23) |
 | `PlanDisagrees location` | the plan's layers and the snapshot's do not pair (planning the same snapshot never produces it) |
 | `RefusedByBackend refusal` | the backend refused a pipeline, a claim or a command |
 
@@ -87,23 +95,88 @@ What `FrameRecording` then does, in the one batch:
 2. **Passes**, in list order. A pass begins rendering into its target cleared to
    the pass's clear colour (an offscreen target `ClearFromUndefined`, so it may
    be new or hold anything; the window's pass into the frame's own image) and
-   ends before the next begins. A pass that draws something then binds its
-   format's pipeline, a viewport over the **whole** attachment, and the table.
-   A pass that draws nothing begins, clears and ends, and binds neither.
+   ends before the next begins. A pass whose views hold a depth-enabled world
+   layer with a non-empty scissor begins with the caller's `D32_SFLOAT` depth
+   image as its depth attachment, cleared to 1.0 across it
+   (`beginRenderingWithDepth`, or `beginFrameRenderingWithDepth` for the
+   window); every other pass begins with none, exactly as the ordered path's
+   does. A pass that draws something then binds its first run's pipeline, a
+   viewport over the **whole** attachment, and the table. A pass that draws
+   nothing begins, clears and ends, and binds neither.
 3. **Views**, in order, each under a scissor covering exactly the pixels whose
    centres its viewport contains: per axis `[ceil(x − ½), ceil(x + w − ½))`,
    clamped to the attachment (`viewScissor`; `viewportContains`, pixel by
    pixel). A view whose scissor is empty, or that holds no layer to draw,
    records no draw and no scissor.
-4. **Layers**, in order. A layer pushes its block, then draws **one instanced
-   draw of six vertices per run**: it binds its region at the run's first
-   instance (64 bytes a step) and draws the run's count. Sampler choices,
-   tints and depth keys never split a run, so a layer is one draw until
-   application materials exist.
+4. **Layers**, in order. A depth-enabled world layer first **clears depth to
+   1.0 within its view's scissor** with `clearDepthRect` (#425), then binds the
+   table again, then pushes its block; a layer whose scissor is empty records no
+   clear and no draw, and a depth-enabled layer with no instance records its
+   clear and claims no region. A layer then draws **one instanced draw of six
+   vertices per run**: it binds the run's pipeline if another is bound, its
+   region at the run's first instance (64 bytes a step), and draws the run's
+   count. Sampler choices, tints and depth keys never split a run, so a layer is
+   at most two draws until application materials exist: its cutout run, which
+   the plan puts first, and its ordered run.
 
 The recorder never reads back and never transitions a target for a copy: after
 it a target is in its colour-attachment use, and a caller that reads it back
 moves it to `TransferRead`, copies and returns it, as the sprites sample does.
+
+## Depth (R2D-9)
+
+**The attachment (choice A).** A pass begins with a depth attachment exactly when
+some view of it has a non-empty scissor and holds a depth-enabled world layer
+(`PassWork.workDepth`). The image is the caller's, a `DepthBinding` of the
+backend's `DepthTarget` image and the format the caller made it with:
+
+- an offscreen pass: `TargetBinding.bindingDepth`, a depth target of the colour
+  target's extent, which the backend checks when the pass begins;
+- the window's pass: `FrameInput.frameWindowDepth`, the depth image of the frame's
+  swapchain generation, which the host enables with `vulkanWindowDepth` and the
+  frame's request names.
+
+**The `D32_SFLOAT` requirement (choice B, D-23).** World-layer depth is
+`D32_SFLOAT` and nothing else, never degraded to a lower-precision format. The
+recorder refuses, before it records anything and naming the layer: a pass that
+needs a depth attachment and was given none (`NoDepthTarget`), and a pass holding
+a depth-enabled world layer whose supplied image is declared in another format
+(`DepthFormatRefused`), whether or not its scissors leave a pixel. The format is the
+caller's word about the image; a false one is refused by the backend when the
+first pipeline is bound. A snapshot with no depth-enabled world layer is
+unaffected on any device. `requireWorldDepth format snapshot` is the same rule
+for a session's depth format (`selectDepthFormat`), which a host applies when it
+publishes a snapshot, so a snapshot holding a depth-enabled world layer is
+refused at publication, naming the layer, on a device whose depth format is
+another; `depthLayers` lists the layers.
+
+**The clear.** Each depth-enabled world layer clears depth to 1.0 within its
+view's scissor rectangle with `clearDepthRect` before its runs. Because
+`vkCmdClearAttachments` is a draw of the implementation's own on some devices, the
+recorder then binds the texture table again in a pass that draws: on MoltenVK a
+clear recorded after a draw of the same pass left the descriptor bindings
+unusable by the draws after it (found by the `r2d9-cutout-depth` case's two
+layers), and Vulkan itself leaves them undisturbed.
+
+**The pipelines.** In a pass with a depth attachment every pipeline declares
+`D32_SFLOAT` (`pipelineDeclaration`); `runPipeline` says which a run uses:
+
+| `PipelineKind` | Used for | Shaders | Blend | Depth |
+| --- | --- | --- | --- | --- |
+| `CutoutPipeline` | a cutout run | `cutoutShaders` | none | tested less-or-equal, written |
+| `OrderedTestedPipeline` | an ordered-path run of a depth-enabled world layer | `orderedShaders` | premultiplied alpha | tested less-or-equal, not written |
+| `UntestedPipeline` | every other layer of the pass: world layers without depth, UI layers | `orderedShaders` | premultiplied alpha | declared, neither tested nor written |
+| `PlainPipeline` | every layer of a pass with no depth attachment | `orderedShaders` | premultiplied alpha | none declared |
+
+A cutout instance has an opaque result, so the cutout pipeline does not blend.
+
+**Depth from the key.** The vertex stage writes `(2²⁴ − 1 − k) / 2²⁴` for the
+instance's key `k` as the depth of every corner (`depthFromKey`): in [0, 1),
+exact in a 32-bit float because the numerator has 24 bits and the denominator is
+a power of two, and constant across the quad. Depth is cleared to 1.0 and
+compared less-or-equal. Among cutouts of an equal key the later draw in run order
+wins; at an equal key a translucent instance is drawn after, and so over, a
+cutout. Both are tested, in the oracle and on the device.
 
 ## Targets and metrics
 
@@ -133,10 +206,12 @@ One binding advances per instance at render-2d's 64-byte stride
 | 5 | 52 | four unorm bytes | the tint, red first |
 | 6 | 56 | uint | the flags word |
 | 7 | 60 | uint | the material parameter word |
+| 8 | 48 | uint | the depth key |
 
-The depth key at offset 48 is not read: the ordered path sorts by it on the
-host, and no depth attachment exists until R2D-9. The unit square's six
-vertices are the shader's own.
+The depth key at offset 48 is read as the depth of every corner of the quad
+(`depthFromKey`, below); the ordered path still sorts by it on the host, and a
+pass with no depth attachment ignores what the vertex stage writes. The unit
+square's six vertices are the shader's own.
 
 ## The push block
 
@@ -162,7 +237,7 @@ Checked shaders (GRS-16), compiled while the package builds and checked against
 the descriptions in `Hetoimasia.Render.TwoD.Vulkan.ShaderInterfaces`, under the
 shader-sampled layout.
 
-**Vertex stage.** For each of the six corners `(x, y)` of the unit square
+**Vertex stage.** The same for every pipeline. For each of the six corners `(x, y)` of the unit square
 [0, 1]² (two triangles), with the instance's transform and the view's:
 
 ```text
@@ -171,6 +246,7 @@ target = (va·wx + vc·wy + vtx,  vb·wx + vd·wy + vty)
 origin = the view transform applied to (tx, ty)              the mapped (0, 0)
 shift  = floor(origin + ½) − origin                           when the view snaps, else 0
 clip   = ((target + shift) / extent) · 2 − 1                  Vulkan's Y down
+depth  = (2²⁴ − 1 − k) / 2²⁴                                  for the instance's key k
 ```
 
 With snap on the camera's translation has already been rounded (inside
@@ -200,6 +276,22 @@ s.a = 0 for an additive instance   blendOutput
 result = s + destination × (1 − s.a)       the pipeline's premultiplied blend
 ```
 
+**The cutout variant (D-26).** An instance routed to the cutout path, so with a
+tint alpha of 255 and no translucent or additive flag, is drawn by
+`cutoutShaders`: the same vertex stage and, in the fragment stage, the same
+lookup, sampler choice and `material`, and then
+
+```text
+s = m × c                          the tint, as wrapMaterial's first step
+discard when s.a < ½               no colour, no depth
+result = (s.rgb / s.a) × b, alpha 1    un-premultiplied, then brightened
+```
+
+so a filtered edge sample `(0.6, 0.6, 0.6, 0.6)` writes white, not grey. Mip
+levels of cutout-marked textures preserve coverage at this threshold (asset D-10),
+so a minified cutout keeps its shape. The variant shares the material and
+wrapping structure below, so R2D-11 substitutes the material alone.
+
 **The material-wrapping structure (P-6).** The engine owns the vertex stage,
 the instance format and the table bindings, and wraps whatever material it is
 given: `material`, `wrapMaterial` and `blendOutput` are three separate
@@ -211,7 +303,7 @@ functions in the fragment stage, so an application material (R2D-11) replaces
 | State | Owner | Readers and writers | Thread | Lifetime | Reset or disposal |
 | --- | --- | --- | --- | --- | --- |
 | The ring, the texture table and the pipeline layout | The host session | `makeRenderer` makes them through `Builders`; batches `prepareSnapshot` records read them | Owner | From `makeRenderer` until the host session ends | Released and destroyed with every managed resource before the device |
-| The pipelines, one per colour format | A `Renderer` | `pipelineFor`, on a format's first drawing pass | Owner | From that first pass until the host session ends | As above |
+| The pipelines, one per colour format and kind | A `Renderer` | `pipelineFor`, on the first pass that draws with the pair | Owner | From that first pass until the host session ends | As above |
 
 A `Renderer` holds an `IORef` of the pipelines and is used on the graphics
 owner's thread only, as every backend construction is. `frameWork` is pure and
@@ -239,22 +331,36 @@ itself, through a stand-in native layer built over the backend's public seam
 passes, views, layers and draws with their scissors and push blocks, the
 drawing-order instance bytes at their ring offsets, mixed sampler choices in one
 run and one draw, empty scissors recording no draw while the pass keeps its
-clear, no depth work for a depth-enabled layer, one pipeline per format with the
-premultiplied blend, and the refusals of an unknown target in a later pass, an
-unmappable view and a full ring after an earlier layer's claim, none of which
-records a clear or a draw.
+clear, one pipeline per format and kind, and the refusals of an unknown target in
+a later pass, an unmappable view and a full ring after an earlier layer's claim,
+none of which records a clear or a draw. For depth it checks which passes begin
+with a depth attachment; the clear rectangle of each depth-enabled layer, before
+its draws and not in a view with no scissor; the pipeline each path draws with
+and the depth each declares; the marks' plan, cutouts first; the key-to-depth
+mapping at 0, 1, 2²³ and 2²⁴ − 1; and the `D32_SFLOAT` refusal, at recording and
+at publication, on a device that offers only `X8_D24` (where a depth-free
+snapshot still publishes and records, since no pipeline is made for a depth it
+cannot attach).
 
-The device's proof is the surface-free native case `r2d7-ordered-path` of
-`vulkan-native-tests` ([docs/gpu_backend.md](../../docs/gpu_backend.md#the-native-suite)),
-which renders eleven fixtures through this recorder and judges every pixel of every
-target against [`hetoimasia-render-2d-oracle`](../render-2d-oracle/README.md).
+The device's proof is two surface-free native cases of `vulkan-native-tests`
+([docs/gpu_backend.md](../../docs/gpu_backend.md#the-native-suite)), which render
+fixtures through this recorder and judge every pixel of every target against
+[`hetoimasia-render-2d-oracle`](../render-2d-oracle/README.md): `r2d7-ordered-path`
+(eleven fixtures, the ordered path) and `r2d9-cutout-depth` (seven fixtures with a
+`D32_SFLOAT` depth image: cutouts and translucent instances interleaved, both
+equal-key rules, a discarded fragment leaving farther art visible, a filtered edge
+writing white, a minified texture sampling its mips, two depth-enabled layers with
+independent keys, and a UI layer and a world layer without depth in the same
+depth pass). Each writes a lossless PNG of every target and a probe record naming
+the depth format and every indeterminate reason.
 
 ## Not here
 
-Depth attachments, the cutout path and depth clears (R2D-17, R2D-9);
-application materials (R2D-11), clip tables (R2D-12) and per-batch storage
-tables (R2D-15); retained content (R2D-10); publishing per window, holding
-referenced objects (D-28), the host adapter and the windowed sample (R2D-14,
-R2D-8); registering textures with their marks and the swap rule (R2D-8);
-sampling an offscreen pass's target in a later pass (R2D-13); per-view culling;
-and performance claims, which need retained measurements.
+Alpha-to-coverage and MSAA; depth formats other than `D32_SFLOAT` for world
+layers; application materials and their capability (R2D-11), clip tables (R2D-12)
+and per-batch storage tables (R2D-15); retained content (R2D-10); publishing per
+window, holding referenced objects (D-28), the host adapter, which enables
+windowed depth and calls `requireWorldDepth` at publication, and the windowed
+sample (R2D-14, R2D-8); registering textures with their marks and the swap rule
+(R2D-8); sampling an offscreen pass's target in a later pass (R2D-13); per-view
+culling; and performance claims, which need retained measurements.

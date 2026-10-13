@@ -11,8 +11,9 @@ or **indeterminate** with the reason it will not guess, or **unevaluable** with
 the input defect that stops it. A pure reader returns a pixel of a tightly
 packed readback, and a verdict compares the two. Every rendering slice proves
 itself against it ([the design](../../docs/designs/render_2d_design.md): D-12,
-*Verification strategy*), and the recorder's offscreen readbacks (R2D-7) are its
-first client. Expectations come from the snapshot, never from an observed image.
+*Verification strategy*), and the recorder's offscreen readbacks (R2D-7, and
+R2D-9 for the cutout path and depth) are its client. Expectations come from the
+snapshot, never from an observed image.
 
 It is a pure package. The library depends on `hetoimasia-render-2d` (the
 snapshot, validation, the view mapping and the draw plan), `hetoimasia-render-api`
@@ -186,17 +187,54 @@ result = s + destination × (1 − s.a)      clamped to [0, 1]
   evaluated in double precision and converted exactly, so no tie can come from
   its rounding.
 
-## Order
+## Order and depth
 
 The oracle visits a pass's views in order, each view's layers in order, and each
 layer's instances in the plan's drawing order (`drawingOrder` from
-`planSnapshot`): by depth key, then submission sequence, where a layer has no
-depth or no instance is cutout-marked (design D-2, D-22). A probe that any
-instance taking the `Cutout` path could cover, including by being within 1/16
-pixel of its edge, is **indeterminate** until R2D-9 adds depth expectations
-(choice H). Ordered-path instances in a depth-enabled layer pass the depth test
-against the cleared depth of 1.0, as design D-23 maps keys, so nothing else about
-depth changes what is drawn here.
+`planSnapshot`): the cutout-path instances first, by material and then
+submission, then the ordered-path instances by depth key and then submission
+(design D-2, D-22). A layer without depth, which is every UI layer and every
+world layer with depth disabled, draws each instance that covers the probe, in
+that order, blended.
+
+A **depth-enabled world layer** has the depth model of design D-2, D-23 and
+D-26, evaluated per probe pixel:
+
+1. **The clear.** When the layer begins, depth is 1.0 at every pixel the view's
+   viewport contains (the pixels whose centres `viewportContains` accepts, which
+   are exactly the pixels of the recorder's scissor). A later layer in the same
+   view or pass starts from its own clear, so what an earlier layer wrote never
+   reaches it: two depth-enabled layers' keys are independent.
+2. **Depth from the key.** An instance of key *k* has depth
+   `(2²⁴ − 1 − k) / 2²⁴`, exact in a 32-bit float and constant across its quad,
+   so a larger key is nearer. The comparison is less-or-equal, evaluated
+   exactly.
+3. **Cutout runs** come first, each instance in the plan's order. The cutout
+   variant (D-26) computes `s = m × c` from the sample `m` (the texel) and the
+   tint `c`, whose alpha is 255 by routing. It **discards** a fragment whose
+   `s.a`, before brightness, is below ½, which writes neither colour nor depth.
+   A surviving fragment is tested against the depth held, and if it passes it
+   writes depth and the colour `(s.rgb / s.a) × b`, un-premultiplied and then
+   brightened by the view's `b`, with alpha 1 (the destination is replaced). A
+   filtered edge sample `(0.6, 0.6, 0.6, 0.6)` therefore writes white, not grey.
+4. **Ordered instances** follow, in the plan's order. Each is tested against the
+   depth the cutouts left and, if it passes, is shaded and blended as on the
+   ordered path; it writes no depth.
+
+Both equal-key outcomes follow from the model, and are tested: among cutouts of
+an equal key the later draw in run order wins, since a less-or-equal test passes
+it; and at an equal key an ordered instance passes against a cutout's depth and
+is drawn after it, so it is over it.
+
+**The threshold band (choice C).** A cutout sample whose filtered alpha, before
+brightness, lies within 2/255 of ½ (inclusive) is **indeterminate**
+(`NearCutoutThreshold`): a device's filtering and arithmetic may fall on either
+side of the threshold. For 8-bit alphas of a nearest-filtered texture that is
+126 to 129. A probe is indeterminate if any cutout instance covering it has such
+a sample, whether or not another instance would hide it: the oracle does not
+prove a hiding it need not rely on. A cutout instance whose quad edge is within
+1/16 pixel of the probe is indeterminate for the same reason as an ordered
+one's (`NearQuadEdge`).
 
 ## Verdicts and exactness
 
@@ -224,7 +262,11 @@ channel through sampling, shading, blending and the store:
   and **additive colour**, which is summed into the destination and rounds
   whatever its alpha, so an additive source's alpha of zero never makes its colour
   exact. Exactness is per channel, so a pixel may be exact in alpha and within one
-  in colour.
+  in colour;
+- a cutout fragment's colour is the sample's colour divided by its own alpha: the
+  quotient is exact only when the alpha is exactly 1 and the colour is exact, or
+  when the quotient is exactly 0 or 1 (a sample whose colour equals its alpha, as
+  a filtered white edge does); any other is within one. Its alpha is exactly 1.
 
 ## Indeterminate cases
 
@@ -234,8 +276,8 @@ Each names where: the view as `AtView pass view`, or an instance as
 | Reason | When |
 | --- | --- |
 | `NearViewportEdge` | The probe's centre is within 1/16 pixel of an edge of a view's non-empty viewport that is not on a whole pixel, whatever the view draws. |
-| `NearQuadEdge` | The centre is within 1/16 pixel of the edge of an ordered-path instance's quad. |
-| `OnCutoutPath` | A cutout-path instance covers the probe or is within 1/16 pixel of covering it. |
+| `NearQuadEdge` | The centre is within 1/16 pixel of the edge of an instance's quad, on the ordered or the cutout path. |
+| `NearCutoutThreshold` | A cutout-path instance's sample has an alpha, before brightness, within 2/255 of ½ (inclusive). |
 | `MinifiedNotAxisAligned` | A minified probe, on a texture with more than one level, whose derivatives are sheared or rotated by other than a quarter turn. |
 | `MinifiedFractionalLevel` | A minified, axis-aligned probe whose level of detail is between two levels. |
 | `NearTexelBoundary` | A nearest-filtered coordinate within 1/16 texel of an interior boundary between texels that differ. |
@@ -296,8 +338,12 @@ snap, nearest and linear filtering across a texel boundary, sRGB against UNORM,
 tint, brightness with a clamped result, additive output, premultiplied overlap in
 drawing order, equal keys in submission order, a UI instance with a larger key
 over one submitted later, a 2:1 minified fixture reading level 1 with each filter
-and a 45° minified probe reported indeterminate, the placeholder, a BC7 texture
-and every indeterminate case). Against synthetic readbacks written as pictures,
+and a 45° minified probe reported indeterminate, the placeholder, a BC7 texture,
+the depth model — cutouts and translucent instances interleaved, both equal-key
+rules, a discarded fragment leaving farther art visible, a filtered edge writing
+white, a cutout reading its mip level, the threshold band at its edges, two
+layers with independent keys, and a UI layer and a world layer without depth
+beside a depth-enabled one — and every indeterminate case). Against synthetic readbacks written as pictures,
 the suite shows the oracle **rejects** reversed overlap, a channel off by two and
 a wrong snap, and accepts the exact image.
 
@@ -330,5 +376,5 @@ cabal test --project-file cabal.project.cpu hetoimasia-render-2d-oracle:render-2
 
 The suite is the CPU validation group `test.render-2d-oracle`; it needs no GPU
 and no display. Its components, selectable with `--test-options='--match <name>'`
-on the suite that owns them, are `Placement`, `Sampling`, `Colour`, `Probes` and
-`Verdicts`.
+on the suite that owns them, are `Placement`, `Sampling`, `Colour`, `Probes`,
+`Depth` and `Verdicts`.
