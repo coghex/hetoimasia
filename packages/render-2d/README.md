@@ -19,7 +19,7 @@ others is [the foundation design](../../docs/engine_foundation_design.md).
 | --- | --- |
 | `Hetoimasia.Render.TwoD.Snapshot` | `Snapshot`, `Pass`, `Target` (`WindowTarget`, `OffscreenTarget`), `ClearColour`, `View` (with its `viewClips` table), `Viewport`, `Camera`, `Layer` (the constructors `WorldLayerWith` and `UiLayerWith`, which list chunks, and the patterns `WorldLayer` and `UiLayer`, the layer that lists none), `LayerDepth`, `Instance`, `UvRect`, `Tint`, `Sampler`; `layerInstances`, `layerChunks`, `depthKeyLimit` |
 | `Hetoimasia.Render.TwoD.Clip` | `ClipRect`, `ClipEntry` (a view's clip table is a list of them); `ResolvedClip`, `emptyClip`, `clipIsEmpty`, `clipContains` and `resolveClips`, the pure resolver; `clipEntryOfIndex` |
-| `Hetoimasia.Render.TwoD.Chunk` | `ChunkRef`, the opaque chunk reference (`Eq`, `Ord`, `Show` only); `ChunkKind` (`ChunkWorldDepth`, `ChunkWorldFlat`, `ChunkUi`), `layerChunkKind`; `Bounds`, `BoundsRequest` (`DeriveBounds`, `SuppliedBounds`); `Chunk`, `buildChunk`, `ChunkRefusal`; `chunkKind`, `chunkBounds`, `chunkSize`, `chunkInstances`, `chunkInstanceAt`, `chunkCutoutPositions`, `chunkOrderedPositions`, `chunkTextures`; `Chunks`, `noChunks`, `chunksFrom`, `lookupChunk`, `chunkRefsOf` |
+| `Hetoimasia.Render.TwoD.Chunk` | `ChunkRef`, the opaque chunk reference (`Eq`, `Ord`, `Show` only); `ChunkKind` (`ChunkWorldDepth`, `ChunkWorldFlat`, `ChunkUi`), `layerChunkKind`; `Bounds`, `BoundsRequest` (`DeriveBounds`, `SuppliedBounds`); `Chunk`, `buildChunk`, `ChunkRefusal`; `chunkKind`, `chunkBounds`, `chunkSize`, `chunkInstances`, `chunkInstanceAt`, `chunkCutoutPositions`, `chunkOrderedPositions`, `chunkTextures`, `chunkPlacementMagnitude`; `Chunks`, `noChunks`, `chunksFrom`, `lookupChunk`, `chunkRefsOf` |
 | `Hetoimasia.Render.TwoD.Chunk.Backend` | `chunkRef ∷ Word32 → Word32 → ChunkRef`; `chunkRefIndex`, `chunkRefGeneration` (backends, and tests standing in for one) |
 | `Hetoimasia.Render.TwoD.Culling` | `chunkCulled`: whether a view skips a chunk of a kind and bounds, conservatively |
 | `Hetoimasia.Render.TwoD.Settings` | `ViewSettings` and `defaultViewSettings`, `TextureFilter`, `ZoomMode`; `uiScaleRange`, `brightnessRange` |
@@ -251,17 +251,23 @@ twice), so everything after validation reads the same description and nothing
 looks anything up. `validChunkRefs` names every chunk the snapshot lists, once
 each, in the order first listed.
 
-**Culling (D-31).** `chunkCulled mapping extent viewport kind bounds` says
+**Culling (D-31).** `chunkCulled mapping extent viewport kind bounds placement` says
 whether a view skips a chunk: its bounds, mapped through the view's transform
 (`worldTransform` for a world chunk, `uiTransform` for a UI one, so a rotation,
 a shear, a UI scale and a content scale enlarge it exactly as they enlarge the
 chunk), lie wholly outside the viewport clamped to the target. It is
 conservative: the mapped rectangle is widened by half a pixel when the view
 snaps (an instance's origin rounds by at most that), by a sixteenth of a pixel
-(the width of the oracle's band in which coverage is undecided) and by a
-relative slack for 32-bit arithmetic, so a chunk whose edge touches the view is
-kept and one that cannot be decided is never discarded. Only chunks are culled:
-dynamic instances are not.
+(the width of the oracle's band in which coverage is undecided), and by an
+allowance for the shader's 32-bit arithmetic, which rounds at the size of every
+term it adds, not of the sum that is left: on each axis `16 · 2⁻²⁴` times the terms
+of the layer transform over the bounds, the instance placement's terms carried
+through that transform (`chunkPlacementMagnitude`, the largest `|a| + |c| + |tx|`
+or `|b| + |d| + |ty|` of the chunk's instances, is the `placement` argument) and
+the target's extent. Where large coordinates cancel, as with a camera far from the
+origin, the allowance grows with them and the chunk is kept. So a chunk whose edge
+touches the view is kept and one that cannot be decided is never discarded. Only
+chunks are culled: dynamic instances are not.
 
 ## The draw plan
 

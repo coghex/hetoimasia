@@ -374,7 +374,10 @@ is refused, checking in this order:
    `PublishHostShared`.
 
 Step 1 resolves the chunks the snapshot lists against the registry
-(`validateSnapshotWith`), so a reference the registry does not hold, never
+(`validateSnapshotWith`), the registry read once as a coherent view
+(`retainedViewSTM`: the chunks, each one's release flag and each one's standing, in
+one transaction, so a release the owner's thread runs meanwhile cannot be seen by one
+check and missed by another), so a reference the registry does not hold, never
 issued or stale after the chunk's release, or built for another kind of layer, is
 validation's refusal naming the layer and the chunk.
 
