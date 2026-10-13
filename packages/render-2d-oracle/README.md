@@ -438,6 +438,14 @@ only its own exact arithmetic, and a game that places quads that far from the
 origin should not read a probe near an edge as determinate. The window's pixel
 centres are exact `Float`s up to the 2²³-pixel extent the oracle accepts.
 
+A clip's membership and band are exact too, over the layer's transform and the
+resolved floats, wherever the view looks: the recorder's clip test is taken about
+a reference point near the view, so that it is exact in the same way even for a
+camera far from the origin (world coordinates near 65536 at a zoom of 100, where
+an absolute single-precision coordinate is spaced most of a pixel apart), and a
+determinate clip probe there is held to the oracle's answer by the native case's
+`far-camera` fixture.
+
 ## Purity, owned state, threads and lifetimes
 
 Every function is pure and total over a validated snapshot and the lookups it is
