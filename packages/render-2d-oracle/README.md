@@ -327,14 +327,11 @@ of the application push block the view holds for the material (`pushFloat` and
 `pushWord` read it at a byte offset, as the shader's members are laid out), and
 `materialSample` and `materialSampleScaled`, which sample any other texture at
 coordinates of the model's choosing the way the shader's `sampleTexture` does.
-That sampling is
-**generation-aware**: the handle is looked up as a complete handle, so one the
+That sampling is **generation-aware**: the handle is looked up as a complete handle, so one the
 lookup does not hold, a released one or one whose index another generation now
 holds, samples the transparent placeholder; the instance's sampler choice
-applies, and the level is selected by the instance's rate of change of texture
-coordinates (so a model that scales its coordinates is sampled at the level the
-instance's own rate gives). The level follows how fast the sampled coordinates
-change, which the oracle knows only for the fragment's own: `materialSample` at
+applies, and the level is selected by the rate of change of the sampled
+coordinates. The oracle knows that rate only for the fragment's own coordinates: `materialSample` at
 any other coordinates, for a texture of more than one level, is the
 indeterminate case `UnrelatedSecondaryCoordinates` (a one-level texture has no
 choice to make), and a model that derives its coordinates from the fragment's
@@ -344,7 +341,7 @@ shader's derivatives select. A sample the oracle will not guess at (a nearest
 coordinate near a texel boundary, a minified sample whose level is between two or
 whose derivatives are sheared) is a `ModelFault` the model returns, and the oracle
 reports it as the indeterminate case it is, naming the instance
-(`NearTexelBoundary`, `MinifiedNotAxisAligned`, `MinifiedFractionalLevel`); a
+(`NearTexelBoundary`, `MinifiedNotAxisAligned`, `MinifiedFractionalLevel`, `UnrelatedSecondaryCoordinates`); a
 malformed texture is `MalformedImage`.
 
 The oracle applies **the same wrapping** to the model's colour that it applies to
