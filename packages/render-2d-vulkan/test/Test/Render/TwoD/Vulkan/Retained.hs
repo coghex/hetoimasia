@@ -221,6 +221,7 @@ frameFor setup snapshot = do
       , frameWindow = Nothing
       , frameWindowDepth = Nothing
       , frameChunks = buffers
+      , frameOmitted = Set.empty
       }
 
 -- | Record a frame into a frame-less batch.
@@ -488,6 +489,7 @@ recordingSpec = describe "recording a frame that draws chunks" $ do
                 , frameWindow = Nothing
                 , frameWindowDepth = Nothing
                 , frameChunks = buffers
+                , frameOmitted = Set.empty
                 }
             declared = input {frameTarget = \_ → Just (TargetBinding image (offscreenAttachment Rgba8Linear 32 32) (Just (DepthBinding lie Depth24)))}
         fmap (const ()) (frameWork declared) `shouldBe` Left (DepthFormatRefused (AtLayer 0 0 0) Depth24)
@@ -557,6 +559,22 @@ cullingSpec = describe "culling a chunk by its bounds" $ do
       length [() | CommandSetScissor _ ← commands] `shouldBe` 0
       length [() | CommandBeginRendering {} ← commands] `shouldBe` 1
       length [() | CommandEndRendering ← commands] `shouldBe` 1
+
+  it "leaves out a chunk the frame omits, in every view, though it lies in view: nothing of it is drawn, claimed or written, and the layer names it" $
+    withSetup $ \setup → do
+      kept ← built setup ChunkWorldDepth [cutAt 4 1, ordAt 8 2]
+      omitted ← built setup ChunkWorldDepth [cutAt 12 1, ordAt 16 2]
+      settleUploads (setupRig setup)
+      resetJournal (setupRig setup)
+      snapshot ← snapshotOver setup [fullView [WorldLayerWith DepthEnabled [kept, omitted] []]]
+      input ← frameFor setup snapshot
+      let leaving = input {frameOmitted = Set.singleton omitted}
+      case frameWork leaving of
+        Right [pass] → map (map layerCulled . workLayers) (workViews pass) `shouldBe` [[[omitted]]]
+        other → expectationFailure ("expected one pass, found " <> either show (show . length) other)
+      record setup leaving >>= (`shouldBe` Right ())
+      claimWrites (setupRig setup) >>= (`shouldBe` [(0, encoded [ordAt 8 2])])
+      length . draws <$> commandsRecorded (setupRig setup) >>= (`shouldBe` 2)
 
   it "keeps a chunk in one view and skips it in another, each view planned for itself" $
     withSetup $ \setup → do
@@ -893,7 +911,7 @@ pressureSpec = describe "rendering a window's scene that lists chunks" $ do
         Left (RefusedIllegal reason) → reason `shouldSatisfy` (not . Text.isInfixOf "retained chunk")
         _ → pure ()
 
-  it "reports a chunk whose upload ended without completing as a refusal that says so, not as pressure" $
+  it "records the frame without a chunk whose upload ended without completing, and names it, instead of refusing a frame the host would retry for ever" $
     withEnv [1] $ \env → do
       art ← registered env 1 True DefaultMark
       reference ← chunkIn env art ChunkWorldDepth
@@ -903,10 +921,13 @@ pressureSpec = describe "rendering a window's scene that lists chunks" $ do
       releaseManaged (rigRecording (envRig env)) buffer >>= (`shouldBe` Right ())
       settleUploads (envRig env)
       pendingChunkUploads (envAdapter env) scene >>= (`shouldBe` [])
+      failedChunkUploads (envAdapter env) scene >>= (`shouldBe` [(reference, UploadCancelled)])
       answer ← renderWith env scene
+      -- Not refused for the chunk: a refusal is retried at the host's backoff, and this chunk
+      -- can never be drawn. (The frame-less batch refuses the window pass for its own reason.)
       case answer of
-        Left (RefusedIllegal reason) → reason `shouldSatisfy` Text.isInfixOf "ended without completing"
-        other → expectationFailure ("expected the failure to be reported, found " <> show other)
+        Left (RefusedIllegal reason) → reason `shouldSatisfy` (not . Text.isInfixOf "retained chunk")
+        _ → pure ()
 
 -- Accessors the examples use to read a reference's numbers.
 chunkRefOf ∷ Word32 → Word32 → ChunkRef

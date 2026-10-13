@@ -51,6 +51,7 @@ import qualified Data.ByteString as ByteString
 import Data.ByteString (ByteString)
 import Data.List (intercalate)
 import qualified Data.Map.Strict as Map
+import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
@@ -250,6 +251,7 @@ evidence Host {hostAct = actOn, hostRecord = recordOn, hostAwait = awaitBatch, h
                   , Render.frameWindow = Nothing
                   , Render.frameWindowDepth = Nothing
                   , Render.frameChunks = const Nothing
+                  , Render.frameOmitted = Set.empty
                   }
           ticket ← recordOn "recording the frame" $ \builders →
             Render.prepareSnapshot (renderBuilders builders) (preparedRenderer prepared) input >>= \case

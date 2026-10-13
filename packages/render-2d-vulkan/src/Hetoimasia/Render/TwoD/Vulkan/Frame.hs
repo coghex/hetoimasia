@@ -104,6 +104,8 @@ module Hetoimasia.Render.TwoD.Vulkan.Frame
 import Control.Monad (zipWithM)
 import Data.ByteString (ByteString)
 import qualified Data.Map.Strict as Map
+import Data.Set (Set)
+import qualified Data.Set as Set
 import Data.Maybe (catMaybes)
 import Data.Word (Word32)
 import Hetoimasia.GPU.Vulkan.Native.Recording
@@ -205,6 +207,10 @@ data FrameInput = FrameInput
     -- ^ The device buffer of a retained chunk that has cutout instances, as the
     -- registry holds it ('Hetoimasia.Render.TwoD.Vulkan.Chunks.retainedBuffers');
     -- @const Nothing@ where the frame lists no chunk.
+  , frameOmitted ∷ !(Set ChunkRef)
+    -- ^ The chunks the frame leaves out of every view, whose listings are treated
+    -- as skipped ('layerCulled'): those whose upload ended without completing,
+    -- which no retry can draw. 'Set.empty' where there are none.
   }
 
 -- | The depth-enabled world layers of a snapshot, in snapshot order.
@@ -401,9 +407,11 @@ frameWork input =
     -- first found: planning needs a pass's view mappings only for its culling.
     resolved = zipWith (resolvePass input) [0 ..] passes
     plan = planSnapshotCulled culler (frameMarks input) valid
-    culler passIndex viewIndex kind bounds placement = case Map.lookup (passIndex, viewIndex) cullable of
-      Just (mapping, extent, viewport) → chunkCulled mapping extent viewport kind bounds placement
-      Nothing → False
+    culler passIndex viewIndex reference kind bounds placement
+      | Set.member reference (frameOmitted input) = True
+      | otherwise = case Map.lookup (passIndex, viewIndex) cullable of
+          Just (mapping, extent, viewport) → chunkCulled mapping extent viewport kind bounds placement
+          Nothing → False
     cullable =
       Map.fromList
         [ ((passIndex, viewIndex), (mapping, (attachmentWidth attachment, attachmentHeight attachment), viewViewport view))

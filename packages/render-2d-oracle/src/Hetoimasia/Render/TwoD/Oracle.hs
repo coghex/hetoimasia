@@ -318,7 +318,7 @@ newOracle input =
     chunksOf = Map.fromList [((pass, view, layer), validLayerChunks held) | held ← validLayers (inputSnapshot input), AtLayer pass view layer ← [validLayerLocation held]]
     -- A view skips the chunks it culls; one whose target or mapping the oracle
     -- cannot resolve skips none, and is reported by the probes it affects.
-    culler passIndex viewIndex kind bounds placement =
+    culler passIndex viewIndex _ kind bounds placement =
       case Map.lookup (passIndex, viewIndex) cullable of
         Just (mapping, extent, viewport) → chunkCulled mapping extent viewport kind bounds placement
         Nothing → False

@@ -634,7 +634,7 @@ cullingSpec = describe "culling" $ do
           ]
         snapshot = Snapshot [windowPass views]
         metrics = offscreenMetrics (PixelExtent 640 480)
-        culler _ viewIndex kind bounds placement =
+        culler _ viewIndex _ kind bounds placement =
           chunkCulled (mappingOf metrics (viewCamera (views !! viewIndex)) plainViewport defaultViewSettings) extent640 plainViewport kind bounds placement
     case validateSnapshotWith held snapshot of
       Left refused → fail ("refused: " <> show refused)

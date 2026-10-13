@@ -76,7 +76,9 @@
 -- chunk whose upload has not completed is not recorded: the frame is skipped
 -- through the same backoff, with its demand kept, and nothing of an incomplete
 -- chunk is drawn (D-28); 'pendingChunkUploads' names the chunks it waits for. A
--- chunk whose upload failed is reported as a refusal that says so.
+-- chunk whose upload ended without completing can never be drawn, and no retry
+-- changes that, so the frame is recorded without it ('failedChunkUploads' names
+-- it) rather than refused: the host retries every refused frame.
 --
 -- = State
 --
@@ -118,6 +120,7 @@ module Hetoimasia.Render.TwoD.Vulkan.Window
     -- * Rendering
   , FrameInfo (..)
   , pendingChunkUploads
+  , failedChunkUploads
   , renderWindowFrame
   ) where
 
@@ -529,8 +532,9 @@ pendingChunkUploads adapter scene =
 -- mapped under metrics built from the frame's extent and the window's own
 -- observation. Refused, skipping the frame through the host's backoff, when
 -- the request carries no logical extent or no content scale, when they make no
--- valid metrics, when the scene lists a chunk whose upload has not completed or
--- failed, and as 'prepareSnapshot' and the recording refuse.
+-- valid metrics, when the scene lists a chunk whose upload has not completed, and
+-- as 'prepareSnapshot' and the recording refuse. A chunk whose upload failed is
+-- left out of the frame.
 renderWindowFrame
   ∷ Adapter window
   → Builders q inst msgr phys dev cmd
@@ -548,8 +552,8 @@ renderWindowFrame adapter builders info scene recorder = case (frameLogical info
           then pure (Left (RefusedIllegal ("the window's metrics are not usable: " <> Text.pack (show metrics))))
           else
             chunkOutcome adapter scene >>= \case
-              Just refusal → pure (Left refusal)
-              Nothing → do
+              Left refusal → pure (Left refusal)
+              Right omitted → do
                 marks ← registeredMarks (adapterTextures adapter)
                 buffers ← retainedBuffers (adapterRetained adapter)
                 prepareSnapshot
@@ -562,6 +566,7 @@ renderWindowFrame adapter builders info scene recorder = case (frameLogical info
                     , frameWindow = Just (Attachment (frameFormat info) width height metrics)
                     , frameWindowDepth = (`DepthBinding` Depth32Float) <$> frameDepthImage info
                     , frameChunks = buffers
+                    , frameOmitted = omitted
                     }
                   >>= \case
                     Left refusal → pure (Left (refused refusal))
@@ -571,14 +576,28 @@ renderWindowFrame adapter builders info scene recorder = case (frameLogical info
       RefusedByBackend refusal → refusal
       other → RefusedIllegal (Text.pack (show other))
 
--- | Why the scene's chunks forbid recording it now, if they do: an upload still
--- under way, which is pressure, or one that ended without completing, which no
--- retry changes.
-chunkOutcome ∷ Adapter window → Scene2D → IO (Maybe Refusal)
+-- | What the scene's chunks make of recording it now: a refusal for an upload still
+-- under way, which is pressure — the frame is skipped and retried — or for a chunk
+-- the registry no longer holds; otherwise the chunks the frame leaves out. A chunk
+-- whose upload ended without completing can never be drawn, and refusing the frame
+-- for it would be retried at the host's backoff for ever, so the frame is recorded
+-- without it, as if every view skipped it ('layerCulled' names it), and
+-- 'failedChunkUploads' names it for whoever must publish without it.
+chunkOutcome ∷ Adapter window → Scene2D → IO (Either Refusal (Set ChunkRef))
 chunkOutcome adapter scene = do
   states ← atomically (traverse (\reference → (,) reference <$> chunkStandingSTM (adapterRetained adapter) reference) (Set.toList (sceneChunks scene)))
-  pure $ case ([reference | (reference, Just ChunkUploading) ← states], [(reference, ended) | (reference, Just (ChunkFailed ended)) ← states], [reference | (reference, Nothing) ← states]) of
-    (_, (reference, ended) : _, _) → Just (RefusedIllegal ("a retained chunk's upload ended without completing: " <> Text.pack (show (reference, ended))))
-    (_, _, reference : _) → Just (RefusedIllegal ("a retained chunk the scene lists is no longer held: " <> Text.pack (show reference)))
-    (reference : _, _, _) → Just (RefusedIllegal ("a retained chunk's upload has not completed, so the frame waits: " <> Text.pack (show reference)))
-    ([], [], []) → Nothing
+  pure $ case ([reference | (reference, Just ChunkUploading) ← states], [reference | (reference, Just (ChunkFailed _)) ← states], [reference | (reference, Nothing) ← states]) of
+    (_, _, reference : _) → Left (RefusedIllegal ("a retained chunk the scene lists is no longer held: " <> Text.pack (show reference)))
+    (reference : _, _, _) → Left (RefusedIllegal ("a retained chunk's upload has not completed, so the frame waits: " <> Text.pack (show reference)))
+    ([], failed, []) → Right (Set.fromList failed)
+
+-- | The chunks of a scene whose cutout instances' upload ended without completing,
+-- and how it ended. A frame of the scene is recorded without them (see
+-- 'renderWindowFrame'); no retry can draw them, so the application publishes a
+-- snapshot that lists a rebuilt chunk instead, and publication refuses one that
+-- lists these ('ChunkUploadFailedInSnapshot').
+failedChunkUploads ∷ Adapter window → Scene2D → IO [(ChunkRef, UploadState)]
+failedChunkUploads adapter scene =
+  atomically $ do
+    states ← traverse (\reference → (,) reference <$> chunkStandingSTM (adapterRetained adapter) reference) (Set.toList (sceneChunks scene))
+    pure [(reference, ended) | (reference, Just (ChunkFailed ended)) ← states]

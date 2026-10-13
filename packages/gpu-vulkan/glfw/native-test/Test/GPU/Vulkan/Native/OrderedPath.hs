@@ -53,6 +53,7 @@ import Data.ByteString (ByteString)
 import Data.List (intercalate)
 import Data.Maybe (isJust)
 import qualified Data.Map.Strict as Map
+import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
@@ -365,6 +366,7 @@ refusalCheck host suite format =
                       , Render.frameWindow = Nothing
                       , Render.frameWindowDepth = Nothing
                       , Render.frameChunks = const Nothing
+                      , Render.frameOmitted = Set.empty
                       }
               pure $ case Render.frameWork input of
                 Left refusal@(Render.DepthFormatRefused _ refused) | refused == format → Right ("the recorder refused a depth-enabled layer over it before recording: " <> tshow refusal)
@@ -475,6 +477,7 @@ runValidated host suite directory depthFormat renderer marks chunkBuffers decode
                   , Render.frameWindow = Nothing
                   , Render.frameWindowDepth = Nothing
                   , Render.frameChunks = chunkBuffers
+                  , Render.frameOmitted = Set.empty
                   }
           ticket ← hostRecord host ("recording " <> name) $ \construction →
             Render.prepareSnapshot (builders construction) renderer input >>= \case

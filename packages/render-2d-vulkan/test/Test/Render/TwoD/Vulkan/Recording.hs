@@ -15,6 +15,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import Data.List (nub)
 import Data.Maybe (mapMaybe)
+import qualified Data.Set as Set
 import Data.Word (Word32, Word64)
 import Hetoimasia.GPU.Vulkan.Native.Recording
   ( ClearColor (..)
@@ -174,7 +175,7 @@ plainBinding image attachment = TargetBinding image attachment Nothing
 
 -- | A frame with nothing marked cutout, no depth image for the window.
 frameOf ∷ ValidSnapshot → (TargetRef → Maybe TargetBinding) → Maybe Attachment → FrameInput
-frameOf snapshot lookup' window = FrameInput snapshot noCutoutMarks lookup' window Nothing (const Nothing)
+frameOf snapshot lookup' window = FrameInput snapshot noCutoutMarks lookup' window Nothing (const Nothing) Set.empty
 
 -- | The input over the two offscreen targets, with images the rig made: the
 -- second, which the first frame's depth-enabled world layer draws to, has a
@@ -197,6 +198,7 @@ inputOver rig snapshot = do
       , frameWindow = Nothing
       , frameWindowDepth = Nothing
       , frameChunks = const Nothing
+      , frameOmitted = Set.empty
       }
 
 withRig ∷ (Rig → IO a) → IO a
@@ -362,6 +364,7 @@ refusalSpec = describe "refusals, before anything is recorded" $ do
         , frameWindow = Nothing
         , frameWindowDepth = Nothing
         , frameChunks = const Nothing
+        , frameOmitted = Set.empty
         }
 
 -- ---------------------------------------------------------------------------
@@ -583,7 +586,7 @@ depthFrame ∷ Rig → CutoutMarks → Maybe ImageFormat → ValidSnapshot → I
 depthFrame rig marks depthFormat' snapshot = do
   image ← target rig Rgba8Linear 16 16
   depth ← traverse (\format → (\held → DepthBinding held format) <$> depthTarget rig format 16 16) depthFormat'
-  pure (FrameInput snapshot marks (\_ → Just (TargetBinding image (offscreenAttachment Rgba8Linear 16 16) depth)) Nothing Nothing (const Nothing))
+  pure (FrameInput snapshot marks (\_ → Just (TargetBinding image (offscreenAttachment Rgba8Linear 16 16) depth)) Nothing Nothing (const Nothing) Set.empty)
 
 -- | The kinds of pipeline the native layer was asked to bind, in order, by the
 -- depth each declares and whether it blends.
@@ -754,7 +757,7 @@ depthSpec = describe "depth passes" $ do
       let layer = WorldLayer DepthEnabled [spriteOf artHandle 0 1]
           snapshot = valid [Pass WindowTarget (ClearColour 0 0 0 1) [viewAt (0, 0) (8, 8) [layer]]]
           attachment = Attachment (formatCode Bgra8Srgb) 8 8 (TargetMetrics (PixelExtent 8 8) (PixelExtent 8 8) 1 1)
-          input = FrameInput snapshot noCutoutMarks (const Nothing) (Just attachment) `flip` const Nothing
+          input supplied = FrameInput snapshot noCutoutMarks (const Nothing) (Just attachment) supplied (const Nothing) Set.empty
       case frameWork (input (Just (DepthBinding depth Depth32Float))) of
         Right [only] → fmap depthFormat (workDepth only) `shouldBe` Just Depth32Float
         other → expectationFailure ("expected one pass, found " <> either show (show . length) other)
@@ -807,7 +810,7 @@ depthRefusalSpec = describe "the D32_SFLOAT requirement, before anything is reco
       -- A 24-bit depth image declared as D32_SFLOAT.
       image ← target rig Rgba8Linear 16 16
       lie ← depthTarget rig Depth24 16 16
-      let input snapshot = FrameInput snapshot noCutoutMarks (\_ → Just (TargetBinding image (offscreenAttachment Rgba8Linear 16 16) (Just (DepthBinding lie Depth32Float)))) Nothing Nothing (const Nothing)
+      let input snapshot = FrameInput snapshot noCutoutMarks (\_ → Just (TargetBinding image (offscreenAttachment Rgba8Linear 16 16) (Just (DepthBinding lie Depth32Float)))) Nothing Nothing (const Nothing) Set.empty
           clearOnly = onePass [viewAt (0, 0) (16, 16) [WorldLayer DepthEnabled []]]
       recorded rig renderer (input deepSnapshot) `shouldReturn` Left (DepthFormatRefused (AtLayer 0 0 1) Depth24)
       recorded rig renderer (input clearOnly) `shouldReturn` Left (DepthFormatRefused (AtLayer 0 0 0) Depth24)
