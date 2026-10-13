@@ -10,20 +10,24 @@ uploads, in submission order or in a planned layer's drawing order, and
 the layers of later snapshots, merged with their dynamic content by a total
 order and culled by their bounds, and **application materials** (R2D-11): the
 reference an instance names a material by, which carries the material's declared
-facts, and the records and push blocks a view and a chunk hold for it. Everything
+facts, and the records and push blocks a view and a chunk hold for it, and
+**frame tables** (R2D-18): a view's tables of per-frame texture rectangles and its
+animation time, the index an instance names a table by, and the exact selection of
+a table's current frame. Everything
 that records commands is [`hetoimasia-render-2d-vulkan`](../render-2d-vulkan/README.md)'s.
 The decision record is
 [the 2D renderer design](../../docs/designs/render_2d_design.md) (D-1 to D-5,
-D-7 to D-10, D-12, D-16 to D-19, D-22 to D-27, D-29, D-31; P-6; R2D-1 to R2D-3, R2D-10, R2D-11); the package's place among the
+D-7 to D-10, D-12, D-16 to D-19, D-22 to D-27, D-29, D-31, D-32; P-4, P-6; R2D-1 to R2D-3, R2D-10, R2D-11, R2D-18); the package's place among the
 others is [the foundation design](../../docs/engine_foundation_design.md).
 
 | Module | Contents |
 | --- | --- |
-| `Hetoimasia.Render.TwoD.Snapshot` | `Snapshot`, `Pass`, `Target` (`WindowTarget`, `OffscreenTarget`), `ClearColour`, `View` (the constructor `ViewWith`, which also holds `viewMaterials`, and the pattern `View`, the view that holds none; with its `viewClips` table), `Viewport`, `Camera`, `Layer` (the constructors `WorldLayerWith` and `UiLayerWith`, which list chunks, and the patterns `WorldLayer` and `UiLayer`, the layer that lists none), `LayerDepth`, `Instance` (with `instanceParameter`, the material parameter word, and `instanceMaterial`, a `MaterialRef`), `UvRect`, `Tint`, `Sampler`; `layerInstances`, `layerChunks`, `depthKeyLimit` |
+| `Hetoimasia.Render.TwoD.Snapshot` | `Snapshot`, `Pass`, `Target` (`WindowTarget`, `OffscreenTarget`), `ClearColour`, `View` (the constructor `ViewWith`, which also holds `viewMaterials`, `viewFrameTables` and `viewAnimationTime`, and the pattern `View`, the view that holds no material data, no frame table and time 0; with its `viewClips` table), `FrameTable` (a count, a duration and a list of `UvRect`s), `Viewport`, `Camera`, `Layer` (the constructors `WorldLayerWith` and `UiLayerWith`, which list chunks, and the patterns `WorldLayer` and `UiLayer`, the layer that lists none), `LayerDepth`, `Instance` (with `instanceParameter`, the material parameter word, `instanceMaterial`, a `MaterialRef`, and `instanceFrameTable`, the frame-table index), `UvRect`, `Tint`, `Sampler`; `layerInstances`, `layerChunks`, `depthKeyLimit` |
+| `Hetoimasia.Render.TwoD.Animation` | `currentFrame ∷ Double → FrameTable → Integer`, the exact selection; `maxFrameIndex` (4095), `frameTableOfIndex`; the checks validation applies: `timeValid`, `durationValid`, `cycleFinite`, `phaseFinite`, `framesFinite` |
 | `Hetoimasia.Render.TwoD.Clip` | `ClipRect`, `ClipEntry` (a view's clip table is a list of them); `ResolvedClip`, `emptyClip`, `clipIsEmpty`, `clipContains` and `resolveClips`, the pure resolver; `clipEntryOfIndex` |
 | `Hetoimasia.Render.TwoD.Material` | `MaterialRef`, the opaque material reference (`Eq`, `Ord`, `Show` only), `defaultMaterial`; `materialFacts`, `materialCutoutCapable`, `materialRecordLayout`, `materialPushBytes`; `MaterialFacts`, `RecordLayout` (handles, words), `recordLayoutIsEmpty`, `recordLayoutBytes`; `MaterialRecord`, `MaterialData` (a view's records and push block for one material), `noMaterialData` |
 | `Hetoimasia.Render.TwoD.Material.Backend` | `materialRef ∷ Word64 → MaterialFacts → MaterialRef`; `materialRefIdentity`, `defaultMaterialIdentity` (the backend that registers materials, and tests standing in for one; game code does not import it) |
-| `Hetoimasia.Render.TwoD.Chunk` | `ChunkRef`, the opaque chunk reference (`Eq`, `Ord`, `Show` only); `ChunkKind` (`ChunkWorldDepth`, `ChunkWorldFlat`, `ChunkUi`), `layerChunkKind`; `Bounds`, `BoundsRequest` (`DeriveBounds`, `SuppliedBounds`); `Chunk`, `buildChunk`, `buildChunkWith` (a chunk that carries its own records), `ChunkRefusal`; `chunkKind`, `chunkBounds`, `chunkSize`, `chunkInstances`, `chunkInstanceAt`, `chunkCutoutPositions`, `chunkOrderedPositions`, `chunkTextures`, `chunkRecords`, `chunkMaterials`, `chunkPlacementMagnitude`; `Chunks`, `noChunks`, `chunksFrom`, `lookupChunk`, `chunkRefsOf` |
+| `Hetoimasia.Render.TwoD.Chunk` | `ChunkRef`, the opaque chunk reference (`Eq`, `Ord`, `Show` only); `ChunkKind` (`ChunkWorldDepth`, `ChunkWorldFlat`, `ChunkUi`), `layerChunkKind`; `Bounds`, `BoundsRequest` (`DeriveBounds`, `SuppliedBounds`); `Chunk`, `buildChunk`, `buildChunkWith` (a chunk that carries its own records), `ChunkRefusal`; `chunkKind`, `chunkBounds`, `chunkSize`, `chunkInstances`, `chunkInstanceAt`, `chunkCutoutPositions`, `chunkOrderedPositions`, `chunkTextures`, `chunkRecords`, `chunkMaterials`, `chunkLargestFrameIndex`, `chunkPlacementMagnitude`; `Chunks`, `noChunks`, `chunksFrom`, `lookupChunk`, `chunkRefsOf` |
 | `Hetoimasia.Render.TwoD.Chunk.Backend` | `chunkRef ∷ Word32 → Word32 → ChunkRef`; `chunkRefIndex`, `chunkRefGeneration` (backends, and tests standing in for one) |
 | `Hetoimasia.Render.TwoD.Culling` | `chunkCulled`: whether a view skips a chunk of a kind and bounds, conservatively |
 | `Hetoimasia.Render.TwoD.Settings` | `ViewSettings` and `defaultViewSettings`, `TextureFilter`, `ZoomMode`; `uiScaleRange`, `brightnessRange` |
@@ -58,7 +62,7 @@ A snapshot is an ordered list of passes. Each pass names its target (the
 window, or an offscreen texture by `TargetRef`), a clear colour and its ordered
 views; the window's pass comes last, and there is at most one. A view is a
 camera, a viewport rectangle within the target, its per-view settings, its
-ordered clip table and its ordered layers. A layer is a world layer (game units through the camera, with
+ordered clip table, its ordered frame tables and animation time and its ordered layers. A layer is a world layer (game units through the camera, with
 depth enabled or not) or a UI layer (logical pixels from the upper left), each
 listing the retained chunks it draws (below) and holding its dynamic instances
 in submission order. Y points down everywhere: world, UI, texture coordinates
@@ -76,11 +80,14 @@ and clip space.
 - **Instance:** a 2×3 affine transform, a UV rectangle `(u0, v0, u1, v1)`, a
   texture handle, a depth key, an RGBA8 tint (a componentwise multiplier), a
   sampler choice (default, nearest, linear), a translucent flag, an additive
-  flag, a clip index, a material parameter word and the **material** it is
-  drawn with, a `MaterialRef` ([below](#application-materials)).
+  flag, a clip index, a frame-table index, a material parameter word and the
+  **material** it is drawn with, a `MaterialRef` ([below](#application-materials)).
 - **Clip tables** ([below](#clip-tables)): a view carries an ordered table of
   clip rectangles, and an instance's clip index, 0 meaning none, selects an
   entry of its own view's table.
+- **Frame tables and time** ([below](#animation)): a view carries an ordered list
+  of frame tables and an animation time, and an instance's frame-table index, 0
+  meaning not animated, selects a table of the view it is drawn in.
 - **Depth keys** lie in [0, 2²⁴). A larger key is refused, never wrapped or
   collapsed; a larger key is nearer.
 
@@ -88,9 +95,9 @@ and clip space.
 
 `validateSnapshot` turns a candidate into a `ValidSnapshot` or refuses it with
 **every** reason found, each naming where: the pass, view, layer and instance
-index (`AtPass`, `AtView`, `AtClipEntry`, `AtLayer`, `AtInstance`; and `AtChunk`, which names the layer, the
+index (`AtPass`, `AtView`, `AtClipEntry`, `AtFrameTable`, `AtLayer`, `AtInstance`; and `AtChunk`, which names the layer, the
 chunk's position in the layer's list and the reference listed there, and `AtChunkInstance`, which names an instance of a
-chunk, used by the oracle). Nothing is clamped,
+chunk, used by the oracle and by the frame-table refusal of a chunk). Nothing is clamped,
 wrapped or corrected, and a valid snapshot holds exactly the candidate's
 values in the candidate's order (`validSnapshot`). Validation is total and
 deterministic, and the refusals come in snapshot order. Everything is checked
@@ -121,6 +128,15 @@ any other.
 | `RecordLayoutMismatch` | a record a view holds has not the handles and words its material's reference declares (`AtRecord`: pass, view, material, record) |
 | `PushBlockSizeMismatch` | a view's push block for a material is not the size the reference declares (`AtPushBlock`: pass, view, material) |
 | `PushBlockMissing` | a material the view uses, by a dynamic instance or a chunk it lists, declares a non-empty push block and the view holds none (`AtPushBlock`) |
+| `FrameIndexTooLarge` | an instance's frame-table index is above 4095, which the flags word's bits 4–15 cannot hold (named by the instance; a chunk's instances are checked when it is built) |
+| `FrameIndexUnknown` | an instance's frame-table index `k` is past its view's tables, which hold fewer than `k` (named by the instance), or a chunk a layer lists has an instance whose index is (named by the listing and the first instance carrying the chunk's largest index: `AtChunkInstance`) |
+| `FrameCountInvalid` | a frame table's count is below 1 (`AtFrameTable`: pass, view, table) |
+| `FrameDurationInvalid` | a frame table's duration is NaN, infinite, zero or negative |
+| `FrameCycleNotFinite` | a table with a valid count and duration has a count times duration that is not finite in `Double` |
+| `FramePhaseNotFinite` | a table with a valid duration, in a view with a valid time, has a time over duration that is not finite in `Double` |
+| `FrameUvCountMismatch` | a frame table's list of rectangles is not as long as its count |
+| `FrameUvNotFinite` | a frame table's rectangle has a NaN or infinite value |
+| `AnimationTimeInvalid` | a view's animation time is NaN, infinite or negative (named by the view) |
 
 NaN and both infinities are refused explicitly, so no range comparison can
 accept one by accident. A snapshot holding only offscreen passes is valid, for
@@ -347,6 +363,77 @@ record with no padding, each record a lookup index and a generation for each
 handle and then its words, so record `k` begins `k × (2 × handles + words)` words
 into its table. The function is total: a record cut short is padded with zero
 words and one that is longer is cut off at the layout.
+
+## Animation
+
+**Frame tables (R2D-18, D-32, P-4).** An animated instance names a **frame table**:
+a frame count, a frame duration and one UV rectangle for each frame. The frame is
+chosen exactly from the view's time, once for each table, and replaces the
+instance's own rectangle; it works identically for a dynamic instance and a
+retained chunk's, so animating never rebuilds a chunk. Easing, per-instance time
+offsets, ping-pong and one-shot animation, Lua bindings and animating anything but
+the UV rectangle (tint, transform) are not here.
+
+- A view's `viewFrameTables` is ordered: table `i` is the one an instance with
+  frame-table index `i + 1` selects, and index 0 means not animated. An index
+  refers to the tables of **the view the instance is drawn in**: a chunk's
+  instances carry theirs from build time, and the same chunk drawn in two views
+  with different tables and times shows each view's frames. Only a view's times and
+  tables change between frames; a chunk is never rebuilt or republished for it.
+- A `FrameTable` is a count of at least 1, a finite positive duration in seconds and
+  exactly one `UvRect` for each frame, every value finite. The count times the
+  duration must be finite in `Double` (a whole cycle can be measured), and so must
+  the view's time over the duration.
+- `viewAnimationTime` is the view's time in seconds, a finite non-negative `Double`:
+  a view's frames are determined by its snapshot alone, so rendering and the oracle
+  are deterministic and reproducible.
+- The index is the flags word's bits 4–15 ([the instance
+  encoding](#the-instance-encoding)), so at most 4095 tables can be named; a view
+  may hold more, which no instance can select.
+
+**Selection.** For a table of `count` frames of `duration` seconds in a view at
+time `t`,
+
+```
+f = floor (t / duration) mod count
+```
+
+where the quotient is the **`Double` division**, the floor is taken to an unbounded
+`Integer` (so a large finite quotient never overflows, and a quotient beyond 2⁶³ is
+as exact as any other), and `mod` is the integer modulus, in `[0, count)`
+(`currentFrame`). A time exactly on a boundary `k × duration` whose quotient is
+exactly `k` selects frame `k mod count`. There is **no tolerance, no snapping and no
+indeterminacy band**: when a product rounds, the quotient is whatever the division
+gives, and the frame follows. The duration `0.1` at time `43 × 0.1` gives the
+quotient `42.99999999999999` and frame 42, not 43; a test that means a boundary uses
+an exactly representable duration such as `0.5`. A 32-bit phase would select the
+wrong frame for count 2, duration 8192 and time 991231.9998 (it rounds up to the
+next frame) and has no value for count 3, duration 2¹²⁷ and time 2.5 × 2¹²⁷; the
+exact formula gives frame 0 and frame 2. The recorder computes `f` once for each
+table of each view and writes it as a whole number, the shader does no time
+arithmetic, and the oracle evaluates the same function, so a frame is exact at any
+time and any duration validation admits.
+
+**Refusals**, each naming where (`AtFrameTable`: pass, view, table; or the view; or
+the instance), and checked for every table whether or not an instance uses it, and
+in a zero-size viewport like any other: a count below 1, a duration that is not
+finite and positive, a count times duration that is not finite, a time over duration
+that is not finite, a list of rectangles whose length is not the count, a rectangle
+with a non-finite value, a time that is not finite and non-negative (named by the
+view), an instance's index above 4095 and an index beyond its view's tables. The
+cycle is asked of a table whose count and duration are valid, and the quotient of a
+table whose duration is valid in a view whose time is, so each refusal names its own
+cause. Within a view they come after its clip table's and before its layers'. Every
+existing refusal is unchanged.
+
+**Retained references.** Building a chunk refuses an instance whose index is above
+4095, naming the instance (`ChunkInstanceInvalid` with `FrameIndexTooLarge`), and a
+chunk records, when built, its largest index and the first instance carrying it
+(`chunkLargestFrameIndex`). Validating a snapshot checks each chunk a layer lists
+against the tables of **every view that lists it**, whether or not the view culls
+it: a chunk whose largest index is past a view's tables is refused, naming the view,
+the layer, the chunk and that instance (`AtChunkInstance`). All of it happens before
+any GPU access.
 
 ## The draw plan
 
@@ -618,7 +705,7 @@ The flags word:
 | 0–1 | sampler choice: 0 default, 1 nearest, 2 linear; 3 is never produced |
 | 2 | translucent override |
 | 3 | additive flag |
-| 4–15 | reserved, always 0 |
+| 4–15 | frame-table index (12 bits, 0 meaning not animated) |
 | 16–31 | clip index (unsigned 16-bit, 0 meaning none) |
 
 The clip index occupies the top 16 bits, so a shader reads it as `flags >> 16`.
@@ -626,7 +713,12 @@ A valid layer's clip index is 0 or selects an entry of its view's clip table
 ([above](#clip-tables)), and encoding writes it unchanged: it neither renumbers
 nor resolves it, so the table's entry order is the one a shader indexes.
 `flagsWord` packs any instance, so the layout is fixed and tested independently
-of validation.
+of validation. It writes only the **low 12 bits** of the frame-table index (bits
+4–15), on any instance, validated or not, so an index validation would refuse
+(above 4095) never reaches the clip index in bits 16–31 or any other field, and
+a shader reads it as `(flags >> 4) & 0xFFF`. A valid instance's index is 0 or
+selects a table of its view, and is written unchanged. The instance stays 64
+bytes and every other field keeps its offset and its bits.
 
 **Drawing order.** `encodeLayerInDrawingOrder planned layer` writes the same
 chunks permuted by a planned layer's drawing order (`drawingOrder`): its *k*-th
@@ -769,5 +861,18 @@ view and skipped in another, and, over generated views, scales and snap, against
 brute force in exact arithmetic of which pixel centres an instance covers, that a
 chunk with an instance covering one is never skipped; the encoding of a chunk's
 cutouts and of the merged ring entries; and, through external clients, that a
-chunk reference and a built chunk cannot be forged. Hspec, QuickCheck and the external-client harness are
+chunk reference and a built chunk cannot be forged. For animation it checks the
+selection at, just before and just after frame boundaries (exactly representable
+durations), the wrap from frame `count − 1` to frame 0, the review's counterexample
+(count 2, duration 8192, time 991231.9998 selects frame 0), a huge finite duration
+(count 3, duration 2¹²⁷, time 2.5 × 2¹²⁷ selects frame 2), the decimal regression
+(duration 0.1 at 43 × 0.1), and, over generated tables and times near 10⁶ seconds
+and quotients beyond 2⁶³, against a second evaluation of the formula that takes the
+floor from the quotient's mantissa and exponent; every refusal above at its location
+(tables no instance uses and a zero-size viewport included, a chunk drawn in two views
+refused for the view with too few tables, naming the chunk and its instance, and a
+chunk built with an index above 4095); the index in flags bits 4–15 against
+hand-written bytes, with the other fields unchanged and the 64-byte stride kept, and
+`flagsWord` on unvalidated instances with indices 4096 and 65535 leaving the clip
+index and bits 0–3 unchanged. Hspec, QuickCheck and the external-client harness are
 the suite's dependencies, not the library's.
