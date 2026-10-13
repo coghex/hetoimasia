@@ -9,7 +9,8 @@
 -- space, lists the retained chunks it draws (R2D-10) and holds its dynamic instances in
 -- submission order. The window's pass comes last. A view also holds, for each
 -- application material (R2D-11) its instances use, the material's records and
--- the bytes of its push block. Nothing
+-- the bytes of its push block, and, for animation (R2D-18), its frame tables
+-- and its animation time. Nothing
 -- here is a native handle, and nothing is checked on construction: the
 -- constructors are public because a candidate is only data, and
 -- "Hetoimasia.Render.TwoD.Validation" is what turns one into a value the
@@ -34,7 +35,8 @@ module Hetoimasia.Render.TwoD.Snapshot
   , ClearColour (..)
 
     -- * Views
-  , View (ViewWith, View, viewCamera, viewViewport, viewSettings, viewClips, viewMaterials, viewLayers)
+  , View (ViewWith, View, viewCamera, viewViewport, viewSettings, viewClips, viewMaterials, viewFrameTables, viewAnimationTime, viewLayers)
+  , FrameTable (..)
   , Viewport (..)
   , Camera (..)
 
@@ -92,8 +94,8 @@ data ClearColour = ClearColour !Float !Float !Float !Float
   deriving stock (Eq, Show)
 
 -- | A camera, the part of the target it draws to, its settings, its clip table,
--- the data it holds for the application materials its instances use, and its
--- layers.
+-- the data it holds for the application materials its instances use, its frame
+-- tables and animation time, and its layers.
 --
 -- The clip table is ordered: entry @i@ is the one an instance with clip index
 -- @i + 1@ selects, and a layer's instances can reference only their own view's
@@ -103,24 +105,57 @@ data ClearColour = ClearColour !Float !Float !Float !Float
 -- 'viewMaterials' holds, for each application material (R2D-11), its records,
 -- which the parameter words of the view's instances index, and the bytes of its
 -- push block. A material the view holds nothing for has no record and an empty
--- push block, which is all the built-in default needs. 'View' is the view that
--- holds no material data: as a constructor it builds one, and as a pattern it
--- matches one.
+-- push block, which is all the built-in default needs.
+--
+-- 'viewFrameTables' is the ordered list of frame tables (R2D-18) the view's
+-- instances select by index: table @i@ is the one an instance whose frame-table
+-- index is @i + 1@ shows, and index 0 means the instance is not animated. An
+-- index refers to the tables of the view the instance is drawn in, so a retained
+-- chunk drawn in two views shows each view's frames. 'viewAnimationTime' is the
+-- view's time in seconds, which every table of the view is read at: a finite,
+-- non-negative number, so that a view's frames are determined by its snapshot
+-- alone.
+--
+-- 'View' is the view that holds no material data and no frame table, at
+-- animation time 0: as a constructor it builds one, and as a pattern it matches
+-- one.
 data View = ViewWith
   { viewCamera ∷ !Camera
   , viewViewport ∷ !Viewport
   , viewSettings ∷ !ViewSettings
   , viewClips ∷ [ClipEntry]
   , viewMaterials ∷ !(Map MaterialRef MaterialData)
+  , viewFrameTables ∷ [FrameTable]
+  , viewAnimationTime ∷ !Double
   , viewLayers ∷ [Layer]
   }
   deriving stock (Eq, Show)
 
--- | A view holding no data for any material.
+-- | A view holding no data for any material, no frame table, and an animation
+-- time of 0.
 pattern View ∷ Camera → Viewport → ViewSettings → [ClipEntry] → [Layer] → View
-pattern View camera viewport settings clips layers ← ViewWith camera viewport settings clips (Map.null → True) layers
+pattern View camera viewport settings clips layers ← ViewWith camera viewport settings clips (Map.null → True) (null → True) ((== 0) → True) layers
   where
-    View camera viewport settings clips layers = ViewWith camera viewport settings clips Map.empty layers
+    View camera viewport settings clips layers = ViewWith camera viewport settings clips Map.empty [] 0 layers
+
+-- | A frame table (R2D-18): a number of frames, how long each lasts, and the
+-- part of the texture each shows. The frame an animated instance shows at a
+-- view's time @t@ is @floor (t / duration) mod count@, the quotient being the
+-- 'Double' division and the floor an exact integer ("Hetoimasia.Render.TwoD.Animation"),
+-- and that frame's rectangle is shown in place of the instance's own.
+--
+-- The count must be at least 1, the duration finite and positive, the
+-- rectangles exactly one for each frame and all finite, and the count times the
+-- duration, and the view's time over the duration, finite in 'Double'.
+data FrameTable = FrameTable
+  { frameTableCount ∷ !Int
+  -- ^ How many frames the table cycles through.
+  , frameTableDuration ∷ !Double
+  -- ^ How long each frame lasts, in seconds.
+  , frameTableFrames ∷ [UvRect]
+  -- ^ The rectangle of each frame, in order.
+  }
+  deriving stock (Eq, Show)
 
 -- | A rectangle within the target: its upper-left corner and its extent, both
 -- finite and the extent not negative. A zero extent is accepted and draws
@@ -205,6 +240,11 @@ data Instance = Instance
   , instanceClip ∷ !Word16
   -- ^ A clip index, 0 meaning none. A non-zero index @k@ selects entry @k − 1@
   -- of the view's clip table, and must lie within it.
+  , instanceFrameTable ∷ !Word16
+  -- ^ A frame-table index (R2D-18), 0 meaning the instance is not animated. A
+  -- non-zero index @k@ selects table @k − 1@ of the view the instance is drawn
+  -- in, and must lie within it; it is encoded in the flags word's bits 4–15, so
+  -- it is at most 4095.
   , instanceParameter ∷ !Word32
   -- ^ The material parameter word, encoded at byte offset 60. It indexes the
   -- records the view (or the chunk) holds for the instance's material, and

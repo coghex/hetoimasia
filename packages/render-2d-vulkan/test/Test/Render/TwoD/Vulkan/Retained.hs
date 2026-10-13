@@ -100,6 +100,7 @@ sprite' handle x key =
     , instanceTranslucent = False
     , instanceAdditive = False
     , instanceClip = 0
+    , instanceFrameTable = 0
     , instanceParameter = 0
     , instanceMaterial = defaultMaterial
     }

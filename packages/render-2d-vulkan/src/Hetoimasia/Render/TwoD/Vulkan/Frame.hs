@@ -88,6 +88,23 @@
 -- where, before anything is recorded, and so is a region larger than the storage
 -- window ('RecordsTooLarge').
 --
+-- = Frame tables (R2D-18)
+--
+-- Each view that draws writes the frame tables it holds, once, into the batch's
+-- one region after the material records ('recordRegion'), however many layers
+-- and chunks draw in it: the current frame of each table at the view's time
+-- ('Hetoimasia.Render.TwoD.Animation.currentFrame', computed here, on the host,
+-- exactly), its count and its rectangles, after a directory
+-- ("Hetoimasia.Render.TwoD.Vulkan.Layout"'s @packFrameBlock@ has the format). The
+-- word of the region the block begins at is the @frameBase@ every layer of the
+-- view pushes, so the retained chunks and the dynamic instances of the view alike
+-- read the same tables, and the same chunk drawn in two views reads each view's
+-- own. A view with no table writes none, and one that does not draw writes none.
+-- A block whose size, or any offset or header value, does not fit its 32-bit word
+-- is refused ('FrameTablesNotRepresentable') before anything is recorded, and
+-- the whole region, the frame tables with the clip tables and the material
+-- records, is held to the window ('RecordsTooLarge').
+--
 -- = Refusals
 --
 -- A refusal is the first found in snapshot order, and it names where:
@@ -112,6 +129,9 @@
 --   beyond 2¹⁰⁰: 'clipRepresentable'), naming the pass and the view;
 -- * 'ClipTablesTooLarge': the batch's packed clip tables exceed the window
 --   ('requireClipWindow'), naming their size and the window;
+-- * 'FrameTablesNotRepresentable': a drawing view whose frame block holds a size,
+--   an offset or a header value that does not fit its 32-bit word, naming the
+--   pass, the view and the block's size;
 -- * 'MaterialNotIssued', 'MaterialFactsDisagree', 'RecordsTooLarge': see above.
 module Hetoimasia.Render.TwoD.Vulkan.Frame
   ( -- * The caller's side
@@ -146,6 +166,8 @@ module Hetoimasia.Render.TwoD.Vulkan.Frame
   , viewDraws
   , clipRegion
   , requireClipWindow
+    -- * Frame tables
+  , requireFrameBlocks
     -- * Materials
   , recordRegion
   , requireRegionWindow
@@ -200,6 +222,7 @@ import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..), off
 import Hetoimasia.Render.TwoD.Settings (ViewSettings (..))
 import Hetoimasia.Render.TwoD.Snapshot
   ( ClearColour (..)
+  , FrameTable (..)
   , Instance (..)
   , Layer (..)
   , LayerDepth (..)
@@ -220,7 +243,20 @@ import Hetoimasia.Render.TwoD.Validation
   , validLayers
   , validSnapshot
   )
-import Hetoimasia.Render.TwoD.Vulkan.Layout (ViewPush (..), clipEntryBytes, clipReference, clipRepresentable, packClipTable, packViewPush, rebaseClip, viewScissor)
+import Hetoimasia.Render.TwoD.Vulkan.Layout
+  ( FrameBlockLayout (..)
+  , ViewPush (..)
+  , clipEntryBytes
+  , clipReference
+  , clipRepresentable
+  , frameBlockLayout
+  , frameBlockRepresentable
+  , packClipTable
+  , packFrameBlock
+  , packViewPush
+  , rebaseClip
+  , viewScissor
+  )
 
 -- | What a pass renders into, as the caller knows it: the colour format's
 -- @VkFormat@ code, the actual extent, and the metrics views map under.
@@ -356,6 +392,10 @@ data FrameRefusal
   | -- | The batch's clip tables and material records are this many bytes, and
     -- the storage window is only this many.
     RecordsTooLarge !Word64 !Word64
+  | -- | The frame tables a drawing view holds pack into a block of this many
+    -- bytes (padding included) in which a size, an offset or a header value does
+    -- not fit its 32-bit word: the pass, the view, and the size.
+    FrameTablesNotRepresentable !Int !Int !Integer
   | -- | The backend refused a construction, a claim or a command.
     RefusedByBackend !Refusal
   deriving (Eq, Show)
@@ -388,6 +428,11 @@ data ViewWork = ViewWork
   , workPushBlocks ∷ !(Map.Map MaterialRef ByteString)
     -- ^ The bytes of the push block the view holds for each material that has
     -- one, pushed before the material's runs.
+  , workFrameTables ∷ ![FrameTable]
+    -- ^ The view's frame tables (R2D-18), which the batch's region holds when the
+    -- view draws.
+  , workAnimationTime ∷ !Double
+    -- ^ The view's animation time, at which each table's current frame is taken.
   , workLayers ∷ ![LayerWork]
   }
 
@@ -470,19 +515,27 @@ data RecordKey
     ChunkTable !ChunkRef !MaterialRef
   deriving (Eq, Ord, Show)
 
--- | The batch's storage region: the clip tables, then the material records.
+-- | The batch's storage region: the clip tables, then the material records, then
+-- the frame tables.
 data RecordRegion = RecordRegion
   { regionBytes ∷ !ByteString
   -- ^ The clip region ('clipRegion'), then every records table once, in the order
-  -- first read, back to back.
+  -- first read, back to back, then the frame block of every view that draws and
+  -- holds a table, in pass and view order.
   , regionBases ∷ !(Map.Map RecordKey Word32)
   -- ^ The word of 'regionBytes' where each table begins: the base its runs push.
+  , regionFrameBases ∷ !(Map.Map (Int, Int) Word32)
+  -- ^ The word of 'regionBytes' where each view's frame block begins, by pass and
+  -- view: the base its layers push. A view with no block has no entry.
   }
   deriving (Eq, Show)
 
 -- | The batch's region, or 'Nothing' when no pass draws, which then needs none.
 -- A frame that draws has the clip region ('clipRegion', one zero entry when no
--- clip is selected) and after it the material records its runs read.
+-- clip is selected), after it the material records its runs read, and after
+-- those the frame tables of its views that draw ('drawingFrames'), each block on
+-- a 16-byte boundary. A block that does not fit its 32-bit words, which
+-- 'requireFrameBlocks' refuses before the region is used, is left out.
 recordRegion ∷ [PassWork] → Maybe RecordRegion
 recordRegion passes = build <$> clipRegion passes
   where
@@ -498,9 +551,64 @@ recordRegion passes = build <$> clipRegion passes
               , RunRecords key encoded ← [runWorkRecords run]
               ]
           start = fromIntegral (ByteString.length clips `div` 4)
+          recordsEnd = toInteger (ByteString.length clips `div` 4) + sum [toInteger (ByteString.length encoded `div` 4) | (_, encoded) ← tables]
+          (_, blocks) = mapAccumL packed recordsEnd (drawingFrames passes)
+          packed at (key, view) = case packFrameBlock at (workAnimationTime view) (workFrameTables view) of
+            Just bytes → (at + toInteger (ByteString.length bytes `div` 4), Just (key, 4 * ((at + 3) `div` 4), bytes))
+            Nothing → (at, Nothing)
+          found = catMaybes blocks
        in RecordRegion
-            (ByteString.concat (clips : map snd tables))
+            (ByteString.concat (clips : map snd tables <> [bytes | (_, _, bytes) ← found]))
             (Map.fromList (zip (map fst tables) (scanl (\at (_, encoded) → at + fromIntegral (ByteString.length encoded `div` 4)) start tables)))
+            (Map.fromList [(key, fromInteger base) | (key, base, _) ← found])
+
+-- | The views that draw and hold a frame table, with their pass and view
+-- indices, in pass and view order: the views whose frame tables the batch's
+-- region holds.
+drawingFrames ∷ [PassWork] → [((Int, Int), ViewWork)]
+drawingFrames passes =
+  [ ((workIndex pass, workViewIndex view), view)
+  | pass ← passes
+  , view ← workViews pass
+  , viewDraws view
+  , not (null (workFrameTables view))
+  ]
+
+-- | Refuse a frame holding a drawing view whose frame block does not fit: where
+-- the region's frame blocks begin is the end of its clip tables and material
+-- records, and each block, in order, must have every size, offset and header
+-- value representable in its 32-bit word ('frameBlockRepresentable'), computed
+-- exactly. The first such view in snapshot order is the refusal, naming the
+-- block's size in bytes.
+requireFrameBlocks ∷ [PassWork] → Either FrameRefusal ()
+requireFrameBlocks passes = case clipRegion passes of
+  Nothing → Right ()
+  Just clips →
+    let recordsEnd =
+          toInteger (ByteString.length clips `div` 4)
+            + sum [toInteger (ByteString.length encoded `div` 4) | (_, encoded) ← nubBy (\(left, _) (right, _) → left == right) [(key, encoded) | pass ← passes, view ← workViews pass, layer ← workLayers view, run ← layerRunList layer, RunRecords key encoded ← [runWorkRecords run]]]
+     in go recordsEnd (drawingFrames passes)
+  where
+    go _ [] = Right ()
+    go at (((passIndex, viewIndex), view) : rest)
+      | frameBlockRepresentable at counts = go (blockStart layout + blockWords layout) rest
+      | otherwise = Left (FrameTablesNotRepresentable passIndex viewIndex (4 * (blockPadding layout + blockWords layout)))
+      where
+        counts = map (toInteger . frameTableCount) (workFrameTables view)
+        layout = frameBlockLayout at counts
+
+-- | Give each layer of a view whose frame block the region holds the word it
+-- begins at, as the base its push block names.
+assignFrameBases ∷ [PassWork] → [PassWork]
+assignFrameBases passes = case recordRegion passes of
+  Nothing → passes
+  Just region →
+    [ pass {workViews = [assign (Map.lookup (workIndex pass, workViewIndex view) (regionFrameBases region)) view | view ← workViews pass]}
+    | pass ← passes
+    ]
+  where
+    assign Nothing view = view
+    assign (Just base) view = view {workLayers = [layer {layerPush = (layerPush layer) {pushFrameBase = base}} | layer ← workLayers view]}
 
 -- | Refuse a frame whose whole region, the clip tables and the material records,
 -- is larger than the window: the region's size and the window, in bytes. (The
@@ -585,7 +693,8 @@ frameWork input = do
       (zip3 passes resolved (planPasses plan))
   let assigned = assignClipBases works
   requireClipArithmetic assigned
-  pure assigned
+  requireFrameBlocks assigned
+  pure (assignFrameBases assigned)
   where
     valid = frameSnapshot input
     passes = snapshotPasses (validSnapshot valid)
@@ -650,6 +759,7 @@ viewWork input layers attachment passNumber index (view, planned) = do
                 UiSpace → uiInverse mapping
             , pushClipBase = 0
             , pushClipCentre = (0, 0)
+            , pushFrameBase = 0
             , pushExtent = (attachmentWidth attachment, attachmentHeight attachment)
             , pushBrightness = settingBrightness settings
             , pushFilter = settingFilter settings
@@ -659,7 +769,7 @@ viewWork input layers attachment passNumber index (view, planned) = do
   drawn ← case rect of
     Nothing → Right []
     Just _ → catMaybes <$> mapM (layerWork input layers held passNumber index pushFor) (plannedLayers planned)
-  Right (ViewWork index rect (plannedClips planned) [] (Map.filter (not . ByteString.null) (Map.map materialPushBlock held)) drawn)
+  Right (ViewWork index rect (plannedClips planned) [] (Map.filter (not . ByteString.null) (Map.map materialPushBlock held)) (viewFrameTables view) (viewAnimationTime view) drawn)
 
 layerWork
   ∷ FrameInput

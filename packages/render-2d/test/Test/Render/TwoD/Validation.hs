@@ -195,6 +195,21 @@ refusals =
   , ("a clip entry referenced from a world and a UI layer", clipView [clipAt 0 Nothing] [WorldLayer DepthDisabled [clipped 1], UiLayer [clipped 1]], atClipMixed 0)
   ]
 
+-- | The reasons about a view's frame tables, its animation time and the
+-- frame-table indices of its instances.
+animationReasons ∷ [Reason]
+animationReasons =
+  [ FrameIndexTooLarge
+  , FrameIndexUnknown
+  , FrameCountInvalid
+  , FrameDurationInvalid
+  , FrameCycleNotFinite
+  , FramePhaseNotFinite
+  , FrameUvCountMismatch
+  , FrameUvNotFinite
+  , AnimationTimeInvalid
+  ]
+
 refusalSpec ∷ Spec
 refusalSpec = describe "a refused snapshot" $ do
   mapM_
@@ -204,10 +219,12 @@ refusalSpec = describe "a refused snapshot" $ do
   -- The two reasons about retained chunks are about what a snapshot lists, not
   -- about its own values; "Test.Render.TwoD.Chunks" exercises them. The four
   -- about application materials are about the data a view holds for them;
-  -- "Test.Render.TwoD.Materials" exercises them.
-  it "is exercised for every reason the module can give but the chunk and the material ones" $
+  -- "Test.Render.TwoD.Materials" exercises them. The nine about animation
+  -- (R2D-18) are about a view's frame tables, its time and the indices that
+  -- select them; "Test.Render.TwoD.Animation" exercises them.
+  it "is exercised for every reason the module can give but the chunk, the material and the animation ones" $
     sort (nub [refusalReason refusal | (_, _, expected) ← refusals, refusal ← expected])
-      `shouldBe` [reason | reason ← [minBound .. maxBound], reason `notElem` [ChunkUnresolved, ChunkKindMismatch, ParameterBeyondRecords, RecordLayoutMismatch, PushBlockSizeMismatch, PushBlockMissing]]
+      `shouldBe` [reason | reason ← [minBound .. maxBound], reason `notElem` ([ChunkUnresolved, ChunkKindMismatch, ParameterBeyondRecords, RecordLayoutMismatch, PushBlockSizeMismatch, PushBlockMissing] <> animationReasons)]
 
   it "ignores a fixed half-height outside the fixed half-height mode" $
     refusalsOf (withSettings defaultViewSettings {settingZoomMode = PixelsPerUnit}) `shouldBe` []

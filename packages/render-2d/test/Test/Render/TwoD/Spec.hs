@@ -1,6 +1,7 @@
 -- | The render-2d package's component specs, composed under one @TwoD@ group.
 module Test.Render.TwoD.Spec (spec) where
 
+import qualified Test.Render.TwoD.Animation as Animation
 import qualified Test.Render.TwoD.Clip as Clip
 import qualified Test.Render.TwoD.Chunks as Chunks
 import qualified Test.Render.TwoD.DrawPlan as DrawPlan
@@ -25,5 +26,6 @@ spec = describe "TwoD" $ do
   DrawPlan.spec
   Chunks.spec
   Materials.spec
+  Animation.spec
   Flags.spec
   Opacity.spec

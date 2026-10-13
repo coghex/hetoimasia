@@ -85,6 +85,7 @@ module Hetoimasia.Render.TwoD.Chunk
   , chunkTextures
   , chunkRecords
   , chunkMaterials
+  , chunkLargestFrameIndex
   , chunkPlacementMagnitude
 
     -- * Resolving references
@@ -103,6 +104,7 @@ import qualified Data.List.NonEmpty as NonEmpty
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
+import Data.Word (Word16)
 import GHC.Float (castFloatToWord32, castWord32ToFloat)
 import Hetoimasia.Math.Affine2 (columns, toColumnMajor)
 import Hetoimasia.Math.Vector (V2 (..))
@@ -186,12 +188,17 @@ buildChunkWith marks kind request records instances =
             , chunkTextureSet = Set.fromList (map instanceTexture instances) <> Set.fromList [handle | each ← concat (Map.elems records), handle ← recordHandles each]
             , chunkRecordTables = records
             , chunkMaterialSet = Set.fromList (map instanceMaterial instances)
+            , chunkFrameField = largestFrame
             , chunkMagnitudeField = maximum (0 : map placementMagnitude instances)
             }
   where
     count = length instances
     held = listArray (0, count - 1) instances
     numbered = zip [0 ..] instances
+    -- The largest index, and the first instance that carries it.
+    largestFrame = case [(instanceFrameTable candidate, negate position) | (position, candidate) ← numbered, instanceFrameTable candidate /= 0] of
+      [] → Nothing
+      found → let (largest, earliest) = maximum found in Just (largest, negate earliest)
     instanceRefusals = [ChunkInstanceInvalid position reason | (position, candidate) ← numbered, reason ← instanceReasons 0 candidate]
     recordRefusals =
       [ ChunkRecordMismatch material index
@@ -330,6 +337,14 @@ chunkRecords = chunkRecordTables
 -- | Every material any instance of the chunk names.
 chunkMaterials ∷ Chunk → Set MaterialRef
 chunkMaterials = chunkMaterialSet
+
+-- | The largest frame-table index (R2D-18) any instance of the chunk carries and
+-- the build position of the first instance that carries it, or 'Nothing' when
+-- no instance is animated. An index selects a table of the view the chunk is
+-- drawn in, so validation refuses a chunk whose largest index is beyond the
+-- tables of any view that lists it, whether or not the view culls it.
+chunkLargestFrameIndex ∷ Chunk → Maybe (Word16, Int)
+chunkLargestFrameIndex = chunkFrameField
 
 -- | The largest magnitude any term of placing an instance reaches, over the
 -- chunk's instances: what the shader's 32-bit arithmetic rounds at, however

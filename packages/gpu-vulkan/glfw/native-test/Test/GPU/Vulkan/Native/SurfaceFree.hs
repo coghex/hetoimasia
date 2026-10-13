@@ -83,6 +83,7 @@ module Test.GPU.Vulkan.Native.SurfaceFree
   , runClip
   , runRetained
   , runMaterials
+  , runAnimation
   , surfaceFreeSection
   , laterWindowSection
   , framelessSection
@@ -102,6 +103,7 @@ module Test.GPU.Vulkan.Native.SurfaceFree
   , clipSection
   , retainedSection
   , materialsSection
+  , animationSection
   , surfaceFreeSpec
   , laterWindowSpec
   , framelessSpec
@@ -121,6 +123,7 @@ module Test.GPU.Vulkan.Native.SurfaceFree
   , clipSpec
   , retainedSpec
   , materialsSpec
+  , animationSpec
   ) where
 
 import Control.Concurrent (ThreadId, myThreadId, threadDelay)
@@ -308,6 +311,7 @@ import Hetoimasia.Runtime.GLFW
 import Hetoimasia.Runtime.Logging (withLoggingLifetime)
 import Hetoimasia.Runtime.Supervision (RuntimeControl)
 import Test.GPU.Vulkan.Native.Environment (validationFeatures)
+import qualified Test.GPU.Vulkan.Native.AnimationPath as AnimationPath
 import qualified Test.GPU.Vulkan.Native.Clip as Clip
 import qualified Test.GPU.Vulkan.Native.CutoutDepth as CutoutDepth
 import qualified Test.GPU.Vulkan.Native.OrderedPath as OrderedPath
@@ -1932,6 +1936,24 @@ runMaterials backend journal =
     "vulkan-native-r2d11-materials"
     "materials"
 
+-- | The animation case (R2D-18): instances that name a frame table of their view,
+-- the tables written into the batch's storage region and the vertex stage taking
+-- each instance's rectangle from the current frame of its table, drawn from
+-- render-2d snapshots into offscreen targets that have a @D32_SFLOAT@ depth
+-- image, every frame read back after completion and judged against the oracle
+-- ("Test.GPU.Vulkan.Native.AnimationPath"). Its files and probe record go under
+-- the validation runner's evidence directory when it names one, and otherwise
+-- into a directory of their own that is kept and reported.
+runAnimation ∷ Maybe Backend → Journal → IO SurfaceFreeOutcome
+runAnimation backend journal =
+  runEvidenceSuite
+    backend
+    journal
+    (\vulkan directory → AnimationPath.runAnimation (retainedHost vulkan) directory)
+    "R2D-18: a surface-free session records render-2d snapshots whose instances name a frame table of their view, with the view's time, into offscreen targets that have a D32_SFLOAT depth image, reads each back after completion and judges every pixel against the render-2d oracle: an animated dynamic sprite and an animated tile of a retained chunk built once and never rebuilt at several times, including one near 10^6 seconds and times exactly on frame boundaries, the same chunk drawn in two views with different tables and times showing different frames, a non-animated instance in the same draw, and the review's two counterexamples to a 32-bit phase"
+    "vulkan-native-r2d18-animation"
+    "animation"
+
 runEvidenceSuite ∷ Maybe Backend → Journal → (VulkanHost () → FilePath → IO OrderedPath.Evidence) → Text → Text → String → IO SurfaceFreeOutcome
 runEvidenceSuite backend journal runner headline caseName directoryName = do
   heading journal headline
@@ -2900,6 +2922,12 @@ materialsSection = evidenceSection "A surface-free session recording application
 
 materialsSpec ∷ SurfaceFreeOutcome → Spec
 materialsSpec = evidenceSpec "R2D-11 the application materials' window-free evidence" "materials" 6 True
+
+animationSection ∷ SurfaceFreeOutcome → [Text]
+animationSection = evidenceSection "A surface-free session recording animated instances over a D32_SFLOAT depth image" "animation"
+
+animationSpec ∷ SurfaceFreeOutcome → Spec
+animationSpec = evidenceSpec "R2D-18 animation's window-free evidence" "animation" 9 True
 
 -- | The examples of an evidence case: no window, every fixture rendered and
 -- read back after its batch completed, every determinate probe within its

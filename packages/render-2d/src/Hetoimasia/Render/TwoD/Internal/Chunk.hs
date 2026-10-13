@@ -23,6 +23,7 @@ module Hetoimasia.Render.TwoD.Internal.Chunk
 import Data.Array (Array)
 import Data.Map.Strict (Map)
 import Data.Set (Set)
+import Data.Word (Word16)
 import Hetoimasia.Math.Vector (V2)
 import Hetoimasia.Render.Api.Texture (TextureHandle)
 import Hetoimasia.Render.TwoD.Internal.ChunkRef (ChunkRef)
@@ -75,6 +76,11 @@ data Chunk = Chunk
   -- which its instances' parameter words index.
   , chunkMaterialSet ∷ !(Set MaterialRef)
   -- ^ Every material any instance names.
+  , chunkFrameField ∷ !(Maybe (Word16, Int))
+  -- ^ The largest frame-table index (R2D-18) any instance carries and the build
+  -- position of the first instance carrying it; 'Nothing' when no instance is
+  -- animated. An index is the drawing view's own, so this is what validation
+  -- checks against each view's tables.
   , chunkMagnitudeField ∷ !Double
   -- ^ The largest magnitude any term of placing an instance reaches:
   -- @max (|a| + |c| + |tx|) (|b| + |d| + |ty|)@ over the instances (the unit

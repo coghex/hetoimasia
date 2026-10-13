@@ -1,9 +1,10 @@
 -- | The render-2d-oracle suite: its components, in order.
 --
 -- Select one with @--match@: @Placement@, @Sampling@, @Colour@, @Probes@, @Depth@,
--- @Chunks@, @Clip@, @Materials@ or @Verdicts@.
+-- @Chunks@, @Clip@, @Materials@, @Animation@ or @Verdicts@.
 module Test.Render.TwoD.Oracle.Spec (spec) where
 
+import qualified Test.Render.TwoD.Oracle.Animation as Animation
 import qualified Test.Render.TwoD.Oracle.Chunks as Chunks
 import qualified Test.Render.TwoD.Oracle.Clip as Clip
 import qualified Test.Render.TwoD.Oracle.Colour as Colour
@@ -25,4 +26,5 @@ spec = do
   describe "Clip" Clip.spec
   describe "Chunks" Chunks.spec
   describe "Materials" Materials.spec
+  describe "Animation" Animation.spec
   describe "Verdicts" Verdicts.spec

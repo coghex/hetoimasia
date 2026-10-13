@@ -22,13 +22,19 @@
 --
 -- __The flags word.__ Bits 0–1 hold the sampler choice: 0 default, 1 nearest,
 -- 2 linear, and 3 is never produced. Bit 2 is the translucent override and bit
--- 3 the additive flag. Bits 4–15 are reserved and always zero. Bits 16–31 hold
+-- 3 the additive flag. Bits 4–15 hold the frame-table index (R2D-18), 12 bits
+-- with 0 meaning the instance is not animated, so a shader reads it as
+-- @(flags >> 4) & 0xFFF@. Bits 16–31 hold
 -- the clip index, an unsigned 16-bit number with 0 meaning none, so a shader
 -- reads it as @flags >> 16@. A validated layer's clip index is 0 or selects an
 -- entry of its view's clip table ("Hetoimasia.Render.TwoD.Clip"), and is
 -- written unchanged: encoding neither renumbers nor resolves it, so the
--- table's entry order is the one the shader indexes. 'flagsWord' packs any
--- instance, so the layout is fixed and tested independently of validation.
+-- table's entry order is the one the shader indexes. A validated instance's
+-- frame-table index is 0 or selects a table of the view that draws it, and is
+-- likewise written unchanged. 'flagsWord' packs any instance, so the layout is
+-- fixed and tested independently of validation: it writes only the low 12 bits
+-- of the frame-table index, on any instance, so an index validation would
+-- refuse never reaches the clip index or any other field.
 --
 -- __std430.__ The 64-byte stride is std430-compatible only when a shader
 -- declares the UV rectangle as two @vec2@s, or reads the instance as vertex
@@ -82,7 +88,7 @@ module Hetoimasia.Render.TwoD.Encoding
 
 import Data.Array (Array, listArray, (!))
 import qualified Data.Array.Unboxed as Unboxed
-import Data.Bits (shiftL, (.|.))
+import Data.Bits (shiftL, (.&.), (.|.))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import Data.ByteString.Builder (Builder, floatLE, toLazyByteString, word32LE, word8)
@@ -179,12 +185,14 @@ encodeInstance candidate =
     Tint r g b a = instanceTint candidate
 
 -- | The flags word of an instance: sampler choice in bits 0–1, translucent in
--- bit 2, additive in bit 3, bits 4–15 zero and the clip index in bits 16–31.
+-- bit 2, additive in bit 3, the low 12 bits of the frame-table index in bits 4–15
+-- and the clip index in bits 16–31.
 flagsWord ∷ Instance → Word32
 flagsWord candidate =
   samplerCode (instanceSampler candidate)
     .|. flag 2 (instanceTranslucent candidate)
     .|. flag 3 (instanceAdditive candidate)
+    .|. ((fromIntegral (instanceFrameTable candidate) .&. 0xFFF) `shiftL` 4)
     .|. (fromIntegral (instanceClip candidate) `shiftL` 16)
   where
     flag position set = if set then 1 `shiftL` position else 0

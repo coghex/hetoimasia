@@ -315,7 +315,7 @@ inst ctx material piece parameter key origin extent = (keyed key (quad origin ex
 
 -- | A view of the whole target, UI space or world space (camera at the centre).
 viewWith ∷ (Float, Float) → (Float, Float) → [(MaterialRef, MaterialData)] → [Layer] → View
-viewWith (x, y) (w, h) held = ViewWith (Camera (V2 (x + w / 2) (y + h / 2)) 1 Nothing) (Viewport (V2 x y) (V2 w h)) defaultViewSettings [] (Map.fromList held)
+viewWith (x, y) (w, h) held = ViewWith (Camera (V2 (x + w / 2) (y + h / 2)) 1 Nothing) (Viewport (V2 x y) (V2 w h)) defaultViewSettings [] (Map.fromList held) [] 0
 
 -- ---------------------------------------------------------------------------
 -- Ordered

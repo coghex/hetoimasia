@@ -55,6 +55,7 @@ import qualified Hetoimasia.Render.Api.Texture as Api
 import Hetoimasia.Render.Api.Texture.Backend (handleGeneration, handleIndex, textureHandle)
 import Hetoimasia.Render.TwoD.Chunk
 import Hetoimasia.Render.TwoD.Chunk.Backend (chunkRef)
+import Hetoimasia.Render.TwoD.Clip (ClipEntry (..), ClipRect (..))
 import Hetoimasia.Render.TwoD.DrawPlan (CutoutMarks, cutoutMarks, noCutoutMarks)
 import Hetoimasia.Render.TwoD.Material
 import Hetoimasia.Render.TwoD.Material.Backend (materialRef, materialRefIdentity)
@@ -112,6 +113,7 @@ unit material parameter x key =
     , instanceTranslucent = False
     , instanceAdditive = False
     , instanceClip = 0
+    , instanceFrameTable = 0
     , instanceParameter = parameter
     , instanceMaterial = material
     }
@@ -119,7 +121,7 @@ unit material parameter x key =
 -- | The 16 × 16 view over the plain camera holding this data and these layers.
 viewHolding ∷ [(MaterialRef, MaterialData)] → [Layer] → View
 viewHolding held layers =
-  ViewWith (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 16 16)) defaultViewSettings [] (Map.fromList held) layers
+  ViewWith (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 16 16)) defaultViewSettings [] (Map.fromList held) [] 0 layers
 
 -- | Two floats, little-endian: the sample material's push block.
 twoFloats ∷ Float → Float → ByteString
@@ -223,7 +225,7 @@ seen = concatMap $ \case
 
 -- | The engine's block for a 16 × 16 UI layer at scale one.
 enginePush ∷ ByteString
-enginePush = packViewPush (ViewPush (fromColumns (V2 1 0) (V2 0 1) (V2 0 0)) (fromColumns (V2 1 (-0.0)) (V2 (-0.0) 1) (V2 0 0)) 0 (0, 0) (16, 16) 1 FilterNearest False)
+enginePush = packViewPush (ViewPush (fromColumns (V2 1 0) (V2 0 1) (V2 0 0)) (fromColumns (V2 1 (-0.0)) (V2 (-0.0) 1) (V2 0 0)) 0 (0, 0) 0 (16, 16) 1 FilterNearest False)
 
 both ∷ [PushStage]
 both = [PushVertex, PushFragment]
@@ -337,13 +339,13 @@ splicedSpec = describe "a spliced material" $ do
     forM_ variants $ \variant → do
       let (vertex, fragment) = members variant
       vertex `shouldBe` fragment
-      [(offset, offset + size) | PushMember offset size ← take 10 vertex] `shouldBe` [(0, 16), (16, 24), (24, 32), (32, 36), (36, 40), (40, 44), (44, 48), (48, 64), (64, 72), (72, 76)]
+      [(offset, offset + size) | PushMember offset size ← take 11 vertex] `shouldBe` [(0, 16), (16, 24), (24, 32), (32, 36), (36, 40), (40, 44), (44, 48), (48, 64), (64, 72), (72, 76), (76, 80)]
       maximum [offset + size | PushMember offset size ← vertex] `shouldBe` 128
     -- The sample's two floats at 80 and 84, the rest from 88; the tint material's vec4 at 80, the rest from 96.
-    [(offset, size) | PushMember offset size ← drop 10 (fst (members (definedTranslucent mixMaterial)))] `shouldBe` [(80, 4), (84, 4), (88, 40)]
-    [(offset, size) | PushMember offset size ← drop 10 (fst (members (definedTranslucent tintOnlyMaterial)))] `shouldBe` [(80, 16), (96, 32)]
+    [(offset, size) | PushMember offset size ← drop 11 (fst (members (definedTranslucent mixMaterial)))] `shouldBe` [(80, 4), (84, 4), (88, 40)]
+    [(offset, size) | PushMember offset size ← drop 11 (fst (members (definedTranslucent tintOnlyMaterial)))] `shouldBe` [(80, 16), (96, 32)]
     -- The built-in shaders reserve all of it.
-    [(offset, size) | PushMember offset size ← drop 10 (fst (members orderedShaders))] `shouldBe` [(80, 48)]
+    [(offset, size) | PushMember offset size ← drop 11 (fst (members orderedShaders))] `shouldBe` [(80, 48)]
 
   it "reads the texture table and the storage region, whether or not the material has records" $ do
     let descriptors shaders = case checkedFragment shaders of CheckedShader _ fragment → interfaceDescriptors fragment
@@ -659,6 +661,30 @@ refusalSpec = describe "what the recorder refuses before it records anything" $ 
       input ← frameFor (fixRig fixtures) noCutoutMarks Rgba8Linear (onePass [] [viewHolding held [layer]])
       recorded fixtures input `shouldBe'` Left (RecordsTooLarge 4816 4096)
       nothingRecorded fixtures
+
+  it "fits frame tables beside the clip table and the material records: a region that fills the window exactly is accepted, and one table more is refused, naming both sizes" $
+    withFixtures $ \fixtures → do
+      -- The clip table of two entries is 32 bytes, 100 records of a handle and a
+      -- word are 1200, so the frame block begins at word 308. The tables are 78
+      -- of one frame (a record of eight words each), one of two frames (twelve)
+      -- and a directory of 80 words: 716 words, 2864 bytes, 4096 in all.
+      let records = [record [(10, 1)] [n] | n ← [0 .. 99]]
+          held = [(fixMix fixtures, MaterialData records (twoFloats 1 0))]
+          clips = [ClipEntry (ClipRect (V2 0 0) (V2 10 10)) Nothing, ClipEntry (ClipRect (V2 5 5) (V2 10 10)) (Just 0)]
+          tables extra = replicate 78 (FrameTable 1 1 [UvRect 0 0 1 1]) <> [FrameTable 2 1 [UvRect 0 0 1 1, UvRect 1 0 2 1]] <> extra
+          layer = UiLayer [(unit (fixMix fixtures) 99 0 0) {instanceClip = 1, instanceFrameTable = 1}]
+          viewOf extra = ViewWith (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 16 16)) defaultViewSettings clips (Map.fromList held) (tables extra) 0 [layer]
+      exact ← frameFor (fixRig fixtures) noCutoutMarks Rgba8Linear (onePass [] [viewOf []])
+      case frameWork exact of
+        Right passes → do
+          fmap (ByteString.length . regionBytes) (recordRegion passes) `shouldBe` Just 4096
+          fmap regionFrameBases (recordRegion passes) `shouldBe` Just (Map.fromList [((0, 0), 308)])
+        Left refused → expectationFailure (show refused)
+      recorded fixtures exact `shouldBe'` Right ()
+      -- One table of one frame more: a directory of 80 words still, and eight more
+      -- words of record, 32 bytes more than the window.
+      over ← frameFor (fixRig fixtures) noCutoutMarks Rgba8Linear (onePass [] [viewOf [FrameTable 1 1 [UvRect 0 0 1 1]]])
+      recorded fixtures over `shouldBe'` Left (RecordsTooLarge 4128 4096)
 
   it "accepts a frame whose records fill the window exactly" $
     withFixtures $ \fixtures → do

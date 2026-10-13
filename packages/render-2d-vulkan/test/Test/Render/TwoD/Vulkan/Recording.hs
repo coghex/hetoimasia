@@ -13,9 +13,10 @@ module Test.Render.TwoD.Vulkan.Recording (spec) where
 import Data.Bits ((.&.))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
-import Data.ByteString.Builder (floatLE, toLazyByteString)
+import Data.ByteString.Builder (floatLE, toLazyByteString, word32LE)
 import qualified Data.ByteString.Lazy as Lazy
 import Data.List (nub)
+import qualified Data.Map.Strict as Map
 import Data.Maybe (mapMaybe)
 import qualified Data.Set as Set
 import Data.Word (Word16, Word32, Word64)
@@ -43,6 +44,8 @@ import Hetoimasia.Math.Affine2 (fromColumns, toColumnMajor)
 import Hetoimasia.Math.Vector (V2 (..))
 import Hetoimasia.Render.Api.Texture (TextureHandle)
 import Hetoimasia.Render.Api.Texture.Backend (textureHandle)
+import Hetoimasia.Render.TwoD.Chunk (BoundsRequest (..), ChunkKind (..), buildChunk, chunksFrom)
+import Hetoimasia.Render.TwoD.Chunk.Backend (chunkRef)
 import Hetoimasia.Render.TwoD.Clip (ClipEntry (..), ClipRect (..), ResolvedClip (..))
 import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..))
 import Hetoimasia.Render.TwoD.Settings (TextureFilter (..), ViewSettings (..), defaultViewSettings)
@@ -51,7 +54,7 @@ import Hetoimasia.Render.TwoD.Material (defaultMaterial)
 import Hetoimasia.Render.TwoD.Snapshot
 import Hetoimasia.Render.TwoD.Target (TargetRef)
 import Hetoimasia.Render.TwoD.Target.Backend (targetRef)
-import Hetoimasia.Render.TwoD.Validation (Location (..), ValidSnapshot, validLayers, validateSnapshot)
+import Hetoimasia.Render.TwoD.Validation (Location (..), ValidSnapshot, validLayers, validateSnapshot, validateSnapshotWith)
 import Hetoimasia.Render.TwoD.Encoding (encodeLayer)
 import qualified Hetoimasia.Render.TwoD.Vulkan as Render
 import Hetoimasia.Render.TwoD.Vulkan.Frame
@@ -69,6 +72,7 @@ spec = describe "Recording" $ do
   depthSpec
   depthRefusalSpec
   emptySpec
+  frameTableSpec
 
 -- ---------------------------------------------------------------------------
 -- Fixtures
@@ -90,6 +94,7 @@ sprite x key sampler =
     , instanceTranslucent = False
     , instanceAdditive = False
     , instanceClip = 0
+    , instanceFrameTable = 0
     , instanceParameter = 0
     , instanceMaterial = defaultMaterial
     }
@@ -185,7 +190,7 @@ push = pushBased 0 (0, 0)
 pushBased ∷ Word32 → (Float, Float) → [Float] → (Word32, Word32) → Float → TextureFilter → Bool → ByteString
 pushBased base centre [a, b, c, d, tx, ty] extent brightness filtering snap
   | b == 0 && c == 0 && a == d =
-      packViewPush (ViewPush (fromColumns (V2 a b) (V2 c d) (V2 tx ty)) (fromColumns (V2 (1 / a) (-0.0)) (V2 (-0.0) (1 / a)) (V2 0 0)) base centre extent brightness filtering snap)
+      packViewPush (ViewPush (fromColumns (V2 a b) (V2 c d) (V2 tx ty)) (fromColumns (V2 (1 / a) (-0.0)) (V2 (-0.0) (1 / a)) (V2 0 0)) base centre 0 extent brightness filtering snap)
 pushBased _ _ other _ _ _ _ = error ("a hand-built push block needs a uniform scale and six coefficients, not " <> show other)
 
 -- ---------------------------------------------------------------------------
@@ -1355,3 +1360,217 @@ emptySpec = describe "passes that draw nothing" $ do
       answer ← Render.prepareSnapshot (builders rig) renderer input >>= either (pure . Left) (framelessOnce rig)
       answer `shouldBe` Right ()
       commandsRecorded rig >>= (`shouldBe` [])
+
+-- ---------------------------------------------------------------------------
+-- Frame tables (R2D-18)
+
+-- | Words as little-endian bytes.
+wordsLE ∷ [Word32] → ByteString
+wordsLE = Lazy.toStrict . toLazyByteString . foldMap word32LE
+
+-- | A table of this many frames of this duration; frame k shows (k, 0, k + 1, 1).
+frameTable ∷ Int → Double → FrameTable
+frameTable count duration = FrameTable count duration [UvRect (fromIntegral k) 0 (fromIntegral k + 1) 1 | k ← [0 .. count - 1]]
+
+-- | A UI sprite with this frame-table index.
+framedSprite ∷ Word16 → Instance
+framedSprite index = (sprite 0 0 SamplerDefault) {instanceFrameTable = index}
+
+-- | A view of this viewport, clip table, frame tables and time, holding one UI
+-- layer of sprites with these frame-table indices.
+animatedView ∷ ((Float, Float), (Float, Float)) → [ClipEntry] → [FrameTable] → Double → [Instance] → View
+animatedView (origin, extent') clips tables time instances =
+  ViewWith (Camera (V2 0 0) 1 Nothing) (Viewport (uncurry V2 origin) (uncurry V2 extent')) defaultViewSettings clips Map.empty tables time [UiLayer instances]
+
+-- | The frame block of the first fixture, worked out by hand. At time 1.25 the
+-- table of three frames of 0.5 s gives 1.25 / 0.5 = 2.5, whose floor 2 is frame
+-- 2, and the table of two frames of 10 s gives 0.125, frame 0. The directory is
+-- four words (two tables, padded), the first record begins at word 4 and is 16
+-- words (the header's four and three rectangles of four), the second at word 20
+-- and is 12.
+firstBlock ∷ ByteString
+firstBlock =
+  wordsLE [4, 20, 0, 0]
+    <> wordsLE [2, 3, 0, 0]
+    <> floats [0, 0, 1, 1, 1, 0, 2, 1, 2, 0, 3, 1]
+    <> wordsLE [0, 2, 0, 0]
+    <> floats [0, 0, 1, 1, 1, 0, 2, 1]
+
+-- | Pass 0 into the 16 × 16 target (refB): view 0 draws, with a clip table of two
+-- entries one of its sprites selects (32 bytes), two frame tables and the time
+-- 1.25, its sprites taking indices 1, 2 and 0; view 1 lies wholly outside the
+-- target, so it draws nothing and writes no block, though it holds one table.
+firstAnimated ∷ ValidSnapshot
+firstAnimated =
+  valid
+    [ Pass
+        (OffscreenTarget refB)
+        (ClearColour 0 0 0 1)
+        [ animatedView ((0, 0), (16, 16)) [clipEntry (0, 0) (10, 10) Nothing, clipEntry (5, 5) (10, 10) (Just 0)] [frameTable 3 0.5, frameTable 2 10] 1.25 [(framedSprite 1) {instanceClip = 1}, framedSprite 2, framedSprite 0]
+        , animatedView ((100, 100), (10, 10)) [] [frameTable 5 1] 0 [framedSprite 1]
+        ]
+    ]
+
+frameTableSpec ∷ Spec
+frameTableSpec = describe "frame tables" $ do
+  it "packs the tables of a view that draws into the region after its clip tables, each table's current frame computed at the view's time" $
+    withRig $ \rig → do
+      input ← inputOver rig firstAnimated
+      case frameWork input of
+        Left refused → expectationFailure (show refused)
+        Right passes → case (clipRegion passes, recordRegion passes) of
+          (Just clips, Just region) → do
+            ByteString.length clips `shouldBe` 32
+            -- The region is the clip tables, then the block, which begins at word 8.
+            regionBytes region `shouldBe` clips <> firstBlock
+            regionFrameBases region `shouldBe` Map.fromList [((0, 0), 8)]
+            regionBases region `shouldBe` Map.empty
+          other → expectationFailure ("expected a region, found " <> show other)
+
+  it "gives every layer of the view the block's word as its frame base, and a view with no block none" $
+    withRig $ \rig → do
+      input ← inputOver rig firstAnimated
+      case frameWork input of
+        Left refused → expectationFailure (show refused)
+        Right [only] → do
+          [[pushFrameBase (layerPush layer) | layer ← workLayers view] | view ← workViews only] `shouldBe` [[8], []]
+        Right other → expectationFailure ("expected one pass, found " <> show (length other))
+
+  it "pushes the frame base at bytes 76 to 79 of the layer's push block, and writes the clip table and block in one claim" $
+    withRig $ \rig → do
+      renderer ← rendererOver rig 4096
+      input ← inputOver rig firstAnimated
+      recorded rig renderer input `shouldReturn` Right ()
+      commands ← commandsRecorded rig
+      [(ByteString.length bytes, ByteString.take 4 (ByteString.drop 76 bytes)) | SeenPush _ 0 bytes ← seen commands] `shouldBe` [(80, wordsLE [8])]
+      writes ← claimWrites rig
+      expectedRegion ← case frameWork input of
+        Right passes | Just clips ← clipRegion passes → pure (clips <> firstBlock)
+        other → fail ("expected a region, found " <> either show (const "none") other)
+      [bytes | (_, bytes) ← writes, ByteString.length bytes == 160] `shouldBe` [expectedRegion]
+      -- The sprites' flags words hold the frame-table indices in bits 4 to 15 beside the clip index.
+      let flagsOf bytes index = sum [toInteger (ByteString.index bytes (64 * index + 56 + k)) * 256 ^ k | k ← [0 .. 3 ∷ Int]]
+      [map (flagsOf bytes) [0, 1, 2 ∷ Int] | (_, bytes) ← writes, ByteString.length bytes == 192] `shouldBe` [[0x00010010, 0x20, 0]]
+
+  it "writes a view's block once, whatever layers and runs draw in it, and each drawing view its own after the last" $
+    withRig $ \rig → do
+      -- Two drawing views; the second has two layers. Blocks begin after the clip
+      -- region's one zero entry (four words) and each other, on four-word boundaries.
+      let two = valid [Pass (OffscreenTarget refB) (ClearColour 0 0 0 1)
+                [ animatedView ((0, 0), (8, 16)) [] [frameTable 1 1] 0 [framedSprite 1]
+                , ViewWith (Camera (V2 0 0) 1 Nothing) (Viewport (V2 8 0) (V2 8 16)) defaultViewSettings [] Map.empty [frameTable 2 1, frameTable 1 4] 3 [UiLayer [framedSprite 2], WorldLayer DepthDisabled [framedSprite 1]]
+                ]]
+      input ← inputOver rig two
+      case frameWork input of
+        Left refused → expectationFailure (show refused)
+        Right passes → case recordRegion passes of
+          Nothing → expectationFailure "expected a region"
+          Just region → do
+            -- View 0: a directory of four words and one record of eight, from word 4 to 16.
+            -- View 1: a directory of four, records of twelve and eight: from word 16 to 40.
+            regionFrameBases region `shouldBe` Map.fromList [((0, 0), 4), ((0, 1), 16)]
+            ByteString.length (regionBytes region) `shouldBe` 4 * 40
+            -- Time 3: 3 / 1 = 3, frame 3 mod 2 = 1; 3 / 4 = 0.75, frame 0.
+            ByteString.drop (4 * 16) (regionBytes region)
+              `shouldBe` ( wordsLE [4, 16, 0, 0]
+                             <> wordsLE [1, 2, 0, 0]
+                             <> floats [0, 0, 1, 1, 1, 0, 2, 1]
+                             <> wordsLE [0, 1, 0, 0]
+                             <> floats [0, 0, 1, 1]
+                         )
+
+  it "writes no block for a view with no table, and a view that draws and a view that does not both keep what each holds" $
+    withRig $ \rig → do
+      let snapshot = valid [Pass (OffscreenTarget refB) (ClearColour 0 0 0 1) [animatedView ((0, 0), (16, 16)) [] [] 5 [framedSprite 0]]]
+      input ← inputOver rig snapshot
+      case frameWork input of
+        Right passes → do
+          fmap regionBytes (recordRegion passes) `shouldBe` Just (ByteString.replicate 16 0)
+          fmap regionFrameBases (recordRegion passes) `shouldBe` Just Map.empty
+          [pushFrameBase (layerPush layer) | pass ← passes, view ← workViews pass, layer ← workLayers view] `shouldBe` [0]
+        Left refused → expectationFailure (show refused)
+
+  it "takes the frame of each table at the view's time by the formula, over a sweep of tables and times" $
+    withRig $ \rig → do
+      let cases = [(count, duration, time) | (count, duration) ← [(2, 8192), (3, 0.5), (5, 0.1), (4, 0.25), (7, 1)], time ← [0, 0.1, 43 * 0.1, 0.5, 991231.9998, 1.0e6, 2 ^ (70 ∷ Int), 1.0e18]]
+          reference count duration time =
+            let (mantissa, exponent') = decodeFloat (time / duration)
+                whole = if exponent' >= 0 then mantissa * 2 ^ exponent' else mantissa `div` (2 ^ negate exponent')
+             in fromInteger (whole `mod` toInteger (count ∷ Int)) ∷ Word32
+      found ←
+        mapM
+          ( \(count, duration, time) → do
+              input ← inputOver rig (valid [Pass (OffscreenTarget refB) (ClearColour 0 0 0 1) [animatedView ((0, 0), (16, 16)) [] [frameTable count duration] time [framedSprite 1]]])
+              case frameWork input of
+                Right passes | Just region ← recordRegion passes → pure (ByteString.take 4 (ByteString.drop (4 * 4 + 4 * 4) (regionBytes region)))
+                other → fail ("the sweep's frame was refused: " <> either show (const "no region") other)
+          )
+          cases
+      found `shouldBe` [wordsLE [reference count duration time] | (count, duration, time) ← cases]
+
+  it "gives a retained chunk drawn in two views each view's own tables: its instances carry the index, and each view's layer pushes its own block's word" $
+    withRig $ \rig → do
+      renderer ← rendererOver rig 4096
+      -- The chunk's one instance names table 1 of whichever view draws it. View 0
+      -- holds one table of three frames, a directory of four words and a record of
+      -- sixteen, from word 4 to 24; view 1 holds two, from word 24: at time 7 the
+      -- tables of two frames of 1 s and five of 2 s give frames 7 mod 2 = 1 and
+      -- floor 3.5 mod 5 = 3.
+      let reference = chunkRef 1 1
+          tile = either (error . show) id (buildChunk noCutoutMarks ChunkUi DeriveBounds [framedSprite 1])
+          listing = UiLayerWith [reference] []
+          viewOf origin tables time = ViewWith (Camera (V2 0 0) 1 Nothing) (Viewport (uncurry V2 origin) (V2 8 16)) defaultViewSettings [] Map.empty tables time [listing]
+          snapshot = either (error . show) id (validateSnapshotWith (chunksFrom [(reference, tile)]) (Snapshot [Pass (OffscreenTarget refB) (ClearColour 0 0 0 1) [viewOf (0, 0) [frameTable 3 1] 0, viewOf (8, 0) [frameTable 2 1, frameTable 5 2] 7]]))
+      input ← inputOver rig snapshot
+      case frameWork input of
+        Left refused → expectationFailure (show refused)
+        Right passes → do
+          [pushFrameBase (layerPush layer) | pass ← passes, view ← workViews pass, layer ← workLayers view] `shouldBe` [4, 24]
+          fmap regionFrameBases (recordRegion passes) `shouldBe` Just (Map.fromList [((0, 0), 4), ((0, 1), 24)])
+          -- View 1's block: the directory, then the two records, each with its frame.
+          fmap (ByteString.drop (4 * 24) . regionBytes) (recordRegion passes)
+            `shouldBe` Just
+              ( wordsLE [4, 16, 0, 0]
+                  <> wordsLE [1, 2, 0, 0]
+                  <> floats [0, 0, 1, 1, 1, 0, 2, 1]
+                  <> wordsLE [3, 5, 0, 0]
+                  <> floats [0, 0, 1, 1, 1, 0, 2, 1, 2, 0, 3, 1, 3, 0, 4, 1, 4, 0, 5, 1]
+              )
+      recorded rig renderer input `shouldReturn` Right ()
+      commands ← commandsRecorded rig
+      [ByteString.take 4 (ByteString.drop 76 bytes) | SeenPush _ 0 bytes ← seen commands] `shouldBe` [wordsLE [4], wordsLE [24]]
+      writes ← claimWrites rig
+      -- The chunk's instance is in each view's ring entries with the index in its flags word.
+      [ByteString.take 4 (ByteString.drop 56 bytes) | (_, bytes) ← writes, ByteString.length bytes == 64] `shouldBe` [wordsLE [0x10], wordsLE [0x10]]
+
+  it "refuses a block whose size, an offset or a header value does not fit its 32-bit word, naming the pass, view and size" $
+    withRig $ \rig → do
+      input ← inputOver rig firstAnimated
+      case frameWork input of
+        Right [only] → do
+          let widen view = view {workFrameTables = [FrameTable 4294967296 1 []]}
+              refused = [only {workViews = [if workViewIndex view == 0 then widen view else view | view ← workViews only]}]
+          -- The directory's four words, a record of 4 + 4 × 2^32 words, from word 8: 8 + 2^34 words of 4 bytes.
+          requireFrameBlocks [only] `shouldBe` Right ()
+          requireFrameBlocks refused `shouldBe` Left (FrameTablesNotRepresentable 0 0 (4 * (4 + 4 + 4 * 4294967296)))
+        other → expectationFailure ("expected one pass, found " <> either show (show . length) other)
+
+  it "accepts a block that exactly fills the window beside the clip region, and refuses one table more, naming the size and the window" $
+    withRig $ \rig → do
+      -- 113 tables of one frame: a directory of 116 words and 113 records of
+      -- eight, 1020 words, which with the clip region's 16 bytes fill 4096 exactly.
+      let framesOf count = valid [Pass (OffscreenTarget refB) (ClearColour 0 0 0 1) [animatedView ((0, 0), (16, 16)) [] (replicate count (frameTable 1 1)) 0 [framedSprite 1]]]
+      exact ← inputOver rig (framesOf 113)
+      over ← inputOver rig (framesOf 114)
+      (frameWork exact >>= requireRegionWindow 4096) `shouldBe` Right ()
+      -- 114 tables: a directory of 116 words and 912 of records, 1028 words, 4112 bytes, and 16 more.
+      (frameWork over >>= requireRegionWindow 4096) `shouldBe` Left (RecordsTooLarge 4128 4096)
+
+  it "refuses a frame whose frame tables do not fit the window before it claims anything or records a command" $
+    withRig $ \rig → do
+      renderer ← rendererOver rig 4096
+      input ← inputOver rig (valid [Pass (OffscreenTarget refB) (ClearColour 0 0 0 1) [animatedView ((0, 0), (16, 16)) [] (replicate 114 (frameTable 1 1)) 0 [framedSprite 1]]])
+      recorded rig renderer input `shouldReturn` Left (RecordsTooLarge 4128 4096)
+      commandsRecorded rig >>= (`shouldBe` [])
+      ringOffsets rig >>= (`shouldBe` [])
+      pipelinesMade rig >>= (`shouldBe` [])

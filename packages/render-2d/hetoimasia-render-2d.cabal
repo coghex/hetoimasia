@@ -50,6 +50,7 @@ library
     import: language
     hs-source-dirs: src
     exposed-modules:
+        Hetoimasia.Render.TwoD.Animation
         Hetoimasia.Render.TwoD.Clip
         Hetoimasia.Render.TwoD.Chunk
         Hetoimasia.Render.TwoD.Chunk.Backend
@@ -97,6 +98,7 @@ test-suite render-2d-tests
     hs-source-dirs: test
     other-modules:
         Test.Render.TwoD.Clip
+        Test.Render.TwoD.Animation
         Test.Render.TwoD.Chunks
         Test.Render.TwoD.DrawPlan
         Test.Render.TwoD.Encoding

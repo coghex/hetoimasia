@@ -172,6 +172,22 @@
 --   judged against the render-2d oracle given a pure model of each material, and
 --   written as lossless PNGs and a probe record under the validation runner's
 --   evidence directory (#430);
+-- * @r2d18-animation@ — the same device start with no window, then the 2D
+--   renderer's recorder over a target that has a @D32_SFLOAT@ depth image
+--   (R2D-18): instances that name a frame table of their view, which carries
+--   the view's animation time — a strip of four texels shown a frame at a time
+--   by an animated dynamic sprite and by an animated tile of a retained chunk
+--   built once and never rebuilt, at times including one near 10^6 seconds and
+--   times exactly on frame boundaries; the same chunk drawn in two views with
+--   different tables and times, showing different frames; a non-animated
+--   instance in the same draw; and the two counterexamples to a 32-bit phase
+--   (count 2, duration 8192 at 991231.9998 s, and a duration of 2^127) — the
+--   batch's frame tables written into its storage region beside the clip
+--   tables and material records, the vertex stage reading each instance's
+--   rectangle from the current frame of its table, every pixel judged against
+--   the render-2d oracle and each colour against the frame worked out by hand,
+--   and written as lossless PNGs and a probe record under the validation
+--   runner's evidence directory (#431);
 -- * @r2d15-storage-tables@ — the same device start with no window, then the
 --   session's texture table, a ring made with a storage-table window, and a
 --   pipeline layout that also holds the storage table's set 2: two per-batch
@@ -578,6 +594,14 @@ scenarios =
       $ \consent journal _ → do
         outcome ← SurfaceFree.runMaterials (consentBackend consent) journal
         pure (SurfaceFree.materialsSpec outcome, section "The R2D-11 application materials evidence record" (SurfaceFree.materialsSection outcome))
+  , Scenario
+      "r2d18-animation"
+      "records nine render-2d snapshots whose instances name a frame table of their view, with the view's animation time, into offscreen targets that have a D32_SFLOAT depth image, in a surface-free session — an animated dynamic sprite and an animated tile of a retained chunk built once and never rebuilt, at times including one near 10^6 seconds and times exactly on frame boundaries, the same chunk drawn in two views with different tables and times, a non-animated instance in the same draw, and the two counterexamples to a 32-bit phase — the batch's frame tables written into its storage region and the vertex stage reading each instance's rectangle from the current frame of its table, reads each target back after completion, judges every pixel against the render-2d oracle and each named colour against the frame worked out by hand, and writes a lossless PNG a target and a probe record; where the device chooses another depth format it reports that"
+      False
+      Nothing
+      $ \consent journal _ → do
+        outcome ← SurfaceFree.runAnimation (consentBackend consent) journal
+        pure (SurfaceFree.animationSpec outcome, section "The R2D-18 animation evidence record" (SurfaceFree.animationSection outcome))
   , Scenario
       "r2d15-storage-tables"
       "draws twice in one batch of a frame-less batch of a surface-free session, through a shader-sampled table layout that also holds set 2 and no selected sampler: two per-batch tables are written into regions of a ring made with a storage-table window, and each is bound at its own dynamic offset before its draw, whose fragment shader reads its colour from the bound table; reads the target back and checks that each draw shows its own table's colour exactly, with validation reporting nothing"

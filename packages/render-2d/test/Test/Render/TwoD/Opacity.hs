@@ -174,7 +174,7 @@ validateAndEncode =
     , "  where"
     , "    snapshot = Snapshot [Pass WindowTarget (ClearColour 0 0 0 1) [view]]"
     , "    view = View (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 640 480)) defaultViewSettings [] [layer]"
-    , "    layer = UiLayer [Instance identity (UvRect 0 0 1 1) texture 0 (Tint 255 255 255 255) SamplerDefault False False 0 0 defaultMaterial]"
+    , "    layer = UiLayer [Instance identity (UvRect 0 0 1 1) texture 0 (Tint 255 255 255 255) SamplerDefault False False 0 0 0 defaultMaterial]"
     ]
 
 backendTarget ∷ String
@@ -289,7 +289,7 @@ buildAndList =
     , "  Right built → either (const False) (const True) (validateSnapshotWith (chunksFrom [(reference, built)]) snapshot)"
     , "  where"
     , "    reference = chunkRef 1 1"
-    , "    candidate = Instance identity (UvRect 0 0 1 1) texture 0 (Tint 255 255 255 255) SamplerDefault False False 0 0 defaultMaterial"
+    , "    candidate = Instance identity (UvRect 0 0 1 1) texture 0 (Tint 255 255 255 255) SamplerDefault False False 0 0 0 defaultMaterial"
     , "    snapshot = Snapshot [Pass WindowTarget (ClearColour 0 0 0 1) [view]]"
     , "    view = View (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 640 480)) defaultViewSettings [] [UiLayerWith [reference] []]"
     ]
@@ -413,6 +413,6 @@ backendMaterial =
     , "    material = materialRef 1 (MaterialFacts False (RecordLayout 1 0) 4)"
     , "    held = Map.fromList [(material, MaterialData [MaterialRecord [texture] []] (ByteString.pack [0, 0, 0, 0]))]"
     , "    snapshot = Snapshot [Pass WindowTarget (ClearColour 0 0 0 1) [view]]"
-    , "    view = ViewWith (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 640 480)) defaultViewSettings [] held [layer]"
-    , "    layer = UiLayer [Instance identity (UvRect 0 0 1 1) texture 0 (Tint 255 255 255 255) SamplerDefault False False 0 0 material]"
+    , "    view = ViewWith (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 640 480)) defaultViewSettings [] held [] 0 [layer]"
+    , "    layer = UiLayer [Instance identity (UvRect 0 0 1 1) texture 0 (Tint 255 255 255 255) SamplerDefault False False 0 0 0 material]"
     ]
