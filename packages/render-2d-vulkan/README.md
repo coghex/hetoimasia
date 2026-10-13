@@ -22,12 +22,15 @@ contract is [docs/gpu_backend.md](../../docs/gpu_backend.md).
 
 | Module | Contents |
 | --- | --- |
-| `Hetoimasia.Render.TwoD.Vulkan` | re-exports `Builders`; `Configuration`, `defaultConfiguration`; `Renderer`, `makeRenderer`, `rendererDepthFormat`, `pipelineFor`, `pipelineDeclaration`; `prepareSnapshot`, `FrameRecording`; re-exports `Hetoimasia.Render.TwoD.Vulkan.Frame`, `orderedShaders` and `cutoutShaders` |
-| `Hetoimasia.Render.TwoD.Vulkan.Builders` | `Builders`: the constructions the recorder and the registry need from a host: the ring with its storage-table window, the table, the storage table, the layout, a pipeline, and registering, swapping and releasing an uploaded texture; and making, filling (an upload admitted for a ticket) and releasing a device-local vertex buffer |
-| `Hetoimasia.Render.TwoD.Vulkan.Chunks` | the chunk registry: `Retained`, `newRetained`; `buildRetainedChunk`, `BuildRefusal`; `ChunkStanding`, `chunkStanding`; `retainedChunks`, `retainedBuffers`, `chunkBufferOf`, `liveChunks`; the logical release marker (`markChunkReleased`, `isChunkReleased`) and `releaseChunkNow` |
+| `Hetoimasia.Render.TwoD.Vulkan` | re-exports `Builders`; `Configuration`, `defaultConfiguration`; `Renderer`, `makeRenderer`, `rendererDepthFormat`, `pipelineFor`, `pipelineForMaterial`, `pipelineDeclaration`, `registerMaterial`, `issuedMaterials`; `prepareSnapshot`, `FrameRecording`; re-exports `Hetoimasia.Render.TwoD.Vulkan.Frame`, `orderedShaders` and `cutoutShaders` |
+| `Hetoimasia.Render.TwoD.Vulkan.Builders` | `Builders`: the constructions the recorder and the registry need from a host: the ring with its storage-table window (the clip tables' and the material records'), the table, the storage table, the layout, a pipeline, and registering, swapping and releasing an uploaded texture; and making, filling (an upload admitted for a ticket) and releasing a device-local vertex buffer |
+| `Hetoimasia.Render.TwoD.Vulkan.Chunks` | the chunk registry: `Retained`, `newRetained`; `buildRetainedChunk`, `buildRetainedChunkWith` (a chunk that carries its own records), `BuildRefusal`; `ChunkStanding`, `chunkStanding`; `retainedChunks`, `retainedBuffers`, `chunkBufferOf`, `liveChunks`; the logical release marker (`markChunkReleased`, `isChunkReleased`) and `releaseChunkNow` |
 | `Hetoimasia.Render.TwoD.Vulkan.Textures` | `Textures`, `newTextures`; `registerTexture` with a `MarkPolicy`; `swapTexture` with a `SwapPolicy`; `TextureRefusal`; the logical release marker (`markReleased`, `isReleased`), `releaseTextureNow`; `registeredMark`, `registeredMarks` |
 | `Hetoimasia.Render.TwoD.Vulkan.Window` | the host adapter: `Host`, `Adapter`, `newAdapter`; `Scene2D`, `blankScene`; `publish2DSnapshot`, `PublishRefusal`; `release2DTexture`, `release2DChunk`; `adapterAdopted`, `adapterReleased`, `retryReleases`, `textureHolds`, `chunkHolds`; `FrameInfo`, `renderWindowFrame`, `pendingChunkUploads` |
-| `Hetoimasia.Render.TwoD.Vulkan.Frame` | `Attachment`, `offscreenAttachment`, `TargetBinding`, `DepthBinding`, `FrameInput`; `depthLayers`, `requireWorldDepth`, `worldDepthShortfall`; `FrameRefusal`; `frameWork` and the work it computes: `PassWork`, `ViewWork`, `LayerWork`, `RunWork`, `RunReads`, `PipelineKind`, `runPipeline`; the clip region: `viewDraws`, `clipRegion`, `requireClipWindow` |
+| `Hetoimasia.Render.TwoD.Vulkan.Frame` | `Attachment`, `offscreenAttachment`, `TargetBinding`, `DepthBinding`, `FrameInput`; `depthLayers`, `requireWorldDepth`, `worldDepthShortfall`; `FrameRefusal`; `frameWork` and the work it computes: `PassWork`, `ViewWork`, `LayerWork`, `RunWork`, `RunReads`, `RunRecords`, `RecordKey`, `PipelineKind`, `runPipeline`; the clip region: `viewDraws`, `clipRegion`, `requireClipWindow`; the region with the material records: `recordRegion`, `RecordRegion`, `requireRegionWindow`; `unissuedMaterial` |
+| `Hetoimasia.Render.TwoD.Vulkan.Material` | `defineMaterial`, the Template Haskell splice; `MaterialDeclaration` (`declaredCutoutCapable`, `declaredRecord`, `declaredPush`, `declaredSource`), `PushField`, `PushType`, `PushOffset`, `RecordLayout`; `DefinedMaterial` (`definedFacts`, `definedPush`, `definedTranslucent`, `definedCutout`), `definedPushBytes`; the limits `applicationPushOffset`, `applicationPushLimit`, `maxRecordHandles`, `maxRecordWords` |
+| `Hetoimasia.Render.TwoD.Vulkan.MaterialSources` | what a declaration comes to, pure: `layOut`, `Laid`, `declarationProblems`, and the GLSL and interface descriptions the splice compiles and checks (`materialVertexSource`, `materialFragmentSource`, `materialVertexInterface`, `materialFragmentInterface`) |
+| `Hetoimasia.Render.TwoD.Vulkan.Material.Sample` | the reference materials: `mixMaterial` (the sample: a second texture through a record, mixed with the instance's texel; cutout-capable), `translucentMixMaterial` (the same function, not cutout-capable) and `tintOnlyMaterial` (a push block and no record) |
 | `Hetoimasia.Render.TwoD.Vulkan.Layout` | the instance as vertex input (`instanceVertexInput`), the key's depth (`depthFromKey`), the push block (`ViewPush`, `packViewPush`, `pushMembers`), the clip table's bytes and reference (`packClipTable`, `clipEntryBytes`, `clipReference`, `rebaseClip`), the sampler choice (`shaderSamplerIndex`), the scissor rule (`viewScissor`) |
 | `Hetoimasia.Render.TwoD.Vulkan.ShaderInterfaces` | the checked interface descriptions the shaders are compiled against |
 | `Hetoimasia.Render.TwoD.Vulkan.Shaders` | `orderedShaders` and `cutoutShaders`: one vertex stage and two fragment stages |
@@ -64,15 +67,16 @@ check. `render-2d` gains no dependency.
 
 `makeRenderer builders configuration` makes, through the host's constructions,
 in this order: the session's ring with its **storage-table window**
-(`configurationRing` and `configurationClipWindow`, the most bytes of clip table
-one batch may bind, 64 KiB by default: 4096 entries), the texture table the
+(`configurationRing` and `configurationRegionWindow`, the most bytes of storage
+region one batch may bind, 64 KiB by default: its clip tables, 16 bytes an
+entry, and then its material records), the texture table the
 draws go through (`configurationTable`), the **storage table** (set 2, over the
 ring's window), and a **shader-sampled table pipeline layout** over the
 package's shaders (R2D-16) that also holds set 2: a layout holding the table
 that declares no sampler offset, so a draw needs no `selectSampler`, with one
-push-constant range for both stages (72 bytes, below). A pipeline is made per
-colour format and kind (below) the first time a pass into that format draws
-with it, by `pipelineFor`. Textures are registered with the
+push-constant range for both stages (128 bytes, below). A pipeline is made per
+colour format, kind and material (below) the first time a pass into that format
+draws with it, by `pipelineFor` (the built-in material) or `pipelineForMaterial`. Textures are registered with the
 table by their owner; the recorder samples whatever handles the snapshot names,
 and an unregistered or released handle, or one whose generation the table no
 longer holds, samples slot 0's transparent placeholder.
@@ -106,12 +110,15 @@ Everything that can refuse is decided first, in `frameWork`, which is pure:
 | `PlanDisagrees location` | the plan's layers and the snapshot's do not pair (planning the same snapshot never produces it) |
 | `ClipNotRepresentable pass view` | a drawing view whose layers select clips has a scissor and an inverse transform for which the clip test's layer-space offsets could overflow a float (below) |
 | `ClipTablesTooLarge bytes window` | the batch's packed clip tables (below) are `bytes` long, and the window is only `window` bytes |
+| `MaterialNotIssued location material` | an instance, or an instance of a chunk a layer lists, names a material the session did not issue, whether another session's reference or one `materialRef` built (the built-in default is every session's) |
+| `MaterialFactsDisagree location named issued` | an instance names a reference with the identity of a material the session issued but other facts than it was issued with |
+| `RecordsTooLarge bytes window` | the batch's whole region, its clip tables and its material records, is `bytes` long and the window is only `window` bytes |
 | `RefusedByBackend refusal` | the backend refused a pipeline, a claim or a command |
 
 The first refusal in snapshot order is the answer, and nothing has been recorded.
 What `FrameRecording` then does, in the one batch:
 
-1. **Claims.** The batch's **clip region** is claimed first, with the backend's
+1. **Claims.** The batch's **region** (the clip tables and, after them, the material records, [below](#application-materials-r2d-11)) is claimed first, with the backend's
    table alignment (`claimTable`), and written (below). Every layer that draws through the ring has its ring entries
    encoded in drawing order (`encodeLayerInDrawingOrder`, byte for byte the
    matching 64-byte chunks of `encodeLayer`, permuted by the plan's order) and
@@ -303,6 +310,96 @@ buffer. The recorder tests assert this directly (the mapped writes of three
 frames hold the ordered instance's 64 bytes and never the 128 of the cutouts; one
 upload was admitted), and the native case records the numbers.
 
+## Application materials (R2D-11)
+
+An application defines a material, registers it with the renderer, and names the
+reference it is issued in its instances. Materials come only from the
+application's build (D-5); there is no live shader loading.
+
+**Defining.** `defineMaterial` is a Template Haskell splice over a
+`MaterialDeclaration`: whether the material is cutout-capable, the layout of its
+records, the members of its push block, and the GLSL that defines one function of
+a fixed signature,
+
+```glsl
+vec4 material(vec4 texel, vec2 uv, uint parameter, MaterialRecord record)
+```
+
+which receives the instance's sampled texel (premultiplied, in linear light), the
+interpolated texture coordinates, the instance's parameter word and the record
+that word indexes, and returns the material's colour, premultiplied, in linear
+light. Declared around it: `MaterialRecord`, a struct of `uvec2 handles[H]` and
+`uint words[W]` (an empty array of the layout is one never-read, zero element);
+`vec4 sampleTexture(uvec2 handle, vec2 uv)`, which samples a full handle through
+the table's lookup with its generation check and the instance's sampler choice
+(call it unconditionally: its implicit derivatives need uniform control flow); and
+`pushed.name` for each member of the push block. A cutout-capable material
+promises that its output alpha is binary wherever its primary texture's is.
+
+The splice generates the material's **translucent** variant, for the ordered
+path, and, only when it is cutout-capable, its **cutout** variant (D-26). Each
+is the engine's vertex stage, the application's function and the engine's own
+wrapping and output: the tint, the brightness, the additive flag's lack of
+coverage, and the cutout discard; the material replaces the colour alone. It then
+**checks both stages of both variants against interface descriptions it
+generates from the declaration** (GRS-16, D-19): the push-constant members, the
+vertex input and the descriptor bindings, which are the texture table's and the
+storage region's. A shader that declares more or less than the declaration, or
+differently, or GLSL that does not compile, fails the build, naming the stage, the
+splice's position and the mismatch; so does a declaration that is itself wrong: a
+push block beyond `applicationPushLimit`, a record beyond `maxRecordHandles`
+handles or `maxRecordWords` words, a member name that is not a GLSL identifier or
+that the engine's block already has, or a source with no `material`. The splice
+needs the shader toolchain fingerprint `tools/vulkan/run.sh` generates, as every
+splice here does. A `DefinedMaterial` records the facts registration issues a
+reference with, where each push member sits (`definedPush`: std430 offsets from
+the start of the application's block, which is where a host packs the bytes), and
+the two variants' checked shaders.
+
+**Records in the region.** A record is `2 × handles + words` 32-bit words: each
+handle's lookup index then its generation, then the words, no padding
+(`Hetoimasia.Render.TwoD.Encoding.encodeRecords`). The batch's one set-2 region
+holds the clip tables first and then every records table the frame's runs read:
+the view's records for its dynamic instances' runs, a chunk's for that chunk's
+runs, each table once however many runs read it, in the order the first reader
+appears (`recordRegion`). A run pushes the word of the region its table begins at
+as `recordBase` before it draws, unless it is the one already pushed. The shader
+loads record `parameter` from `recordBase + parameter × stride` and resolves each
+handle through the lookup, so a released and reused index samples the placeholder.
+A material that has a push block has the view's bytes for it pushed at
+`applicationPushOffset` before its first run in the view, and again after each
+depth clear, which on MoltenVK disturbs what was set. A run splits wherever the
+plan's record source changes, so a chunk's runs and the view's use their own
+bases.
+
+**Registering.** `registerMaterial renderer defined` issues a `MaterialRef`
+carrying exactly the facts the splice recorded and an identity of the renderer's
+own (its session and an index; a global counter makes a session number never
+repeat, so another renderer's reference never matches). Registering an equal
+material again answers the reference already issued. Nothing native is made: the
+material's pipelines are built **per colour format and depth declaration on first
+use**, as the built-in ones are, from the variant the kind draws. A snapshot that
+names a reference the renderer did not issue, or one with an issued identity and
+other facts, is refused by `prepareSnapshot` before anything is recorded
+(`MaterialNotIssued`, `MaterialFactsDisagree`) and by `publish2DSnapshot`
+(`MaterialNotIssuedInSnapshot`), naming the instance; a material is never
+released, so nothing holds one. A chunk's record handles are among its textures
+and a view's among its snapshot's, so an adopted revision holds them and a
+snapshot that names a texture whose release was requested in a record is refused,
+as it is for an instance's.
+
+**Pipelines.** `pipelineForMaterial` makes the pipeline of a material's variant
+for a kind and a colour format on first use: the translucent variant for the
+plain, ordered-tested and untested kinds, the cutout variant for the cutout kind.
+A material that is not cutout-capable has no cutout variant and the plan never
+routes it there. Every pipeline is over the one layout.
+
+The sample materials ("Hetoimasia.Render.TwoD.Vulkan.Material.Sample") are the
+reference: `mixMaterial` has a record of one handle and one word and a push block
+of two floats, and returns `mix(texel.rgb, second.rgb × texel.a, w)` with alpha
+`texel.a`, where `w = clamp(strength × word ÷ 255 + bias, 0, 1)`. Its model in the
+oracle is "Hetoimasia.Render.TwoD.Oracle.Material.Sample".
+
 ## Registering textures and marks
 
 `registerTexture builders textures image decoded policy` registers an uploaded
@@ -488,8 +585,9 @@ square's six vertices are the shader's own.
 
 ## The push block
 
-Both stages declare one push block, std430, 72 bytes (`ViewPush`,
-`packViewPush`), pushed for each layer under the layer's own space:
+Both stages declare one push block, std430, 128 bytes, which every device
+holds. The engine owns the first 76 (`ViewPush`, `packViewPush`), pushed for each
+layer under the layer's own space:
 
 | Offset | Size | Member |
 | --- | --- | --- |
@@ -502,6 +600,16 @@ Both stages declare one push block, std430, 72 bytes (`ViewPush`,
 | 44 | 4 | `uint clipBase`: the index, in entries, of the layer's clip table's first entry in the batch's clip region |
 | 48 | 16 | `vec4 inverseLinear`: a, b, c, d of the transform's inverse |
 | 64 | 8 | `vec2 clipCentre`: the target-pixel point the clip test is taken about |
+| 72 | 4 | `uint recordBase`: the word of the batch's region where the material records a run's instances index begin; a layer's push sets it to 0 and a run that reads records pushes its own at offset 72 |
+
+The rest is the application's: a material's own push block begins at
+`applicationPushOffset`, 80 (a 16-byte boundary, so any std430 member is legal
+there), and may hold `applicationPushLimit`, 48 bytes. Every shader declares the
+whole 128 bytes, vertex and fragment alike, the built-in ones with all of the
+application's bytes reserved and a material's with its own members then the rest
+reserved, so **one pipeline layout serves every material** and binding another
+material's pipeline never disturbs the descriptor sets or the constants already
+set. Checked interface descriptions compare exactly that range.
 
 The transform is `worldTransform` for a world layer and `uiTransform` for a UI
 layer, from `viewMapping` for the pass's metrics; it maps `(x, y)` to
@@ -686,7 +794,7 @@ functions in the fragment stage, so an application material (R2D-11) replaces
 | State | Owner | Readers and writers | Thread | Lifetime | Reset or disposal |
 | --- | --- | --- | --- | --- | --- |
 | The ring, the texture table and the pipeline layout | The host session | `makeRenderer` makes them through `Builders`; batches `prepareSnapshot` records read them | Owner | From `makeRenderer` until the host session ends | Released and destroyed with every managed resource before the device |
-| The pipelines, one per colour format and kind | A `Renderer` | `pipelineFor`, on the first pass that draws with the pair | Owner | From that first pass until the host session ends | As above |
+| The pipelines, one per colour format, kind and material | A `Renderer` | `pipelineFor` and `pipelineForMaterial`, on the first pass that draws with the triple | Owner | From that first pass until the host session ends | As above |
 | Each registered handle's mark and release flag | A `Textures` (a `TVar` ledger keyed by the complete handle) | `registerTexture` adds; `markReleased` flags; `releaseTextureNow` removes the mark; any thread reads in STM | Registration, swap and table release on the owner; marker and reads on any | From the registration until the table release | The flag is never cleared: a released handle stays refused after its index is reused |
 | Each chunk's description, device buffer and upload ticket, its release flag, the generation of every index and the indices free to reuse | A `Retained` (a `TVar` ledger keyed by the complete reference) | `buildRetainedChunk` adds (and releases the buffer it made if it refuses or is interrupted); `markChunkReleased` flags; `releaseChunkNow` releases the buffer and forgets the chunk; any thread reads in STM | Build, buffer release and `releaseChunkNow` on the owner; marker and reads on any | From the build until the buffer's release | The flag is never cleared: the reference is forgotten with the chunk and its index reused under the next generation |
 | The holds (window and revision to the textures and chunks that revision references), the pending releases with their stage, and the objects whose follow-up action is queued | An `Adapter` | `adapterAdopted` and `adapterReleased` on the owner's thread; the release action on the owner's thread; reads on any | Owner writes, any reads | From the adapter's creation until it is dropped | A revision's hold is dropped by its release; a pending object leaves the set when its release runs |
@@ -710,6 +818,23 @@ group `test.vulkan-headless`:
 ```bash
 bash tools/vulkan/run.sh test hetoimasia-render-2d-vulkan:test:render-2d-vulkan-tests
 ```
+
+For materials it checks what the splice recorded and checked (the facts, where each
+push member sits, the 128-byte block in both stages of every variant, the cutout
+variant exactly when cutout-capable, the descriptors), registration (the facts
+equal the splice's, the same material answering the same reference, identities
+that carry the session), the region and the pushes of a frame of the default and
+application materials (the records back to back in the order their first reader
+appears, after the clip region, each run's base and each material's push block,
+once per view and again after a depth clear), a chunk's records beside the view's
+with a chunk listed twice written once, the pipelines per format and kind from the
+variant the kind draws, over one layout, the refusals of a reference not issued
+(another session's, a forged one, an issued identity with other facts, the default's
+identity with other facts, an instance of a chunk), a region beyond the window and
+one that fills it exactly, publication and the holds on a record's textures, and,
+in separately compiled modules, that a push block beyond the limit, a record member
+beyond the layout, an undeclared resource, a wrong signature and an engine member
+name each fail to compile with the diagnostic that names it.
 
 It checks the scissor rule against `viewportContains` pixel by pixel over a
 sweep of viewports and against hand-worked rectangles; the push block against
@@ -758,7 +883,7 @@ release stays adoptable and holds the texture; and the frame's metrics
 refused, with nothing recorded, when the request names no extent, no scale or an
 unusable one.
 
-The device's proof is two surface-free native cases of `vulkan-native-tests`
+The device's proof is surface-free native cases of `vulkan-native-tests`
 ([docs/gpu_backend.md](../../docs/gpu_backend.md#the-native-suite)), which render
 fixtures through this recorder and judge every pixel of every target against
 [`hetoimasia-render-2d-oracle`](../render-2d-oracle/README.md): `r2d7-ordered-path`
@@ -807,14 +932,31 @@ for every revision of every window including a culled chunk and a texture only a
 names, and release deferred until the barrier is met and the last holding revision's
 recording is over.
 
+A sixth, `r2d11-materials`, defines the three sample materials by the splice,
+registers them and renders six frames of offscreen snapshots that name them, every
+pixel judged against the oracle given a pure model of each material: the sample
+material's second texture through a record in the ordered path (declared not
+cutout-capable) and in the cutout path, where the engine's tint wraps the
+material's colour; an application push block that changes the colour (one view's
+strength against another's); default and application materials in one layer split
+into runs by material, with the parameter word selecting a view's record and a
+material that has no record taking its push block; two retained chunks that each
+carry their own record for the same material and parameter word beside a dynamic
+instance of the view's, each showing its own second texture; and a record that
+names a texture which is then released, its index reused under the next
+generation, the old handle sampling the placeholder and a record naming the new
+handle sampling the new texture. Each named behaviour has a contrast the oracle
+must give determinately and differently, and the plan's runs (one cutout run for
+each material, the sources a chunk's and the view's runs read) fail the frame they
+belong to.
+
 ## Not here
 
 Alpha-to-coverage and MSAA; depth formats other than `D32_SFLOAT` for world
-layers; application materials and their
-capability (R2D-11) and clip tables in retained content beyond what R2D-12 defines for instances;
+layers; live shader loading and mod-supplied materials (D-5), a material that
+changes the vertex stage or the instance format, and clip tables in retained content beyond what R2D-12 defines for instances;
 stencil-based clipping, hardware clip distances and per-view culling of fully clipped instances;
-range writes into a chunk (D-31), and the material records chunks will carry
-(R2D-11); creating offscreen targets, issuing their references
+range writes into a chunk (D-31); creating offscreen targets, issuing their references
 and their lifetimes, holds and releases, and sampling an offscreen pass's target
 in a later pass (R2D-13); culling dynamic instances; and performance claims
 beyond the retained measurements the native case records.
