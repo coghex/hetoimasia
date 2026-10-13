@@ -2,8 +2,8 @@
 --
 -- A snapshot is an ordered list of passes. A pass names its target, its clear
 -- and its ordered views; a view is a camera, a viewport within the target, its
--- per-view settings and its ordered layers; a layer declares its space and
--- holds its instances in submission order. The window's pass comes last. Nothing
+-- per-view settings, its clip table and its ordered layers; a layer declares its
+-- space and holds its instances in submission order. The window's pass comes last. Nothing
 -- here is a native handle, and nothing is checked on construction: the
 -- constructors are public because a candidate is only data, and
 -- "Hetoimasia.Render.TwoD.Validation" is what turns one into a value the
@@ -16,7 +16,7 @@
 --
 -- __Dependencies.__ @base@, @hetoimasia-math@ for the camera's position and the
 -- instance's transform, @hetoimasia-render-api@ for the texture handle, and
--- this package's settings and target modules.
+-- this package's clip, settings and target modules.
 --
 -- __State.__ The module owns none.
 module Hetoimasia.Render.TwoD.Snapshot
@@ -48,6 +48,7 @@ import Data.Word (Word16, Word32, Word8)
 import Hetoimasia.Math.Affine2 (Affine2)
 import Hetoimasia.Math.Vector (V2)
 import Hetoimasia.Render.Api.Texture (TextureHandle)
+import Hetoimasia.Render.TwoD.Clip (ClipEntry)
 import Hetoimasia.Render.TwoD.Settings (ViewSettings)
 import Hetoimasia.Render.TwoD.Target (TargetRef)
 
@@ -78,11 +79,18 @@ data Target
 data ClearColour = ClearColour !Float !Float !Float !Float
   deriving stock (Eq, Show)
 
--- | A camera, the part of the target it draws to, its settings and its layers.
+-- | A camera, the part of the target it draws to, its settings, its clip table
+-- and its layers.
+--
+-- The clip table is ordered: entry @i@ is the one an instance with clip index
+-- @i + 1@ selects, and a layer's instances can reference only their own view's
+-- table ("Hetoimasia.Render.TwoD.Clip"). An empty table is a view whose
+-- instances all have clip index 0.
 data View = View
   { viewCamera ∷ !Camera
   , viewViewport ∷ !Viewport
   , viewSettings ∷ !ViewSettings
+  , viewClips ∷ [ClipEntry]
   , viewLayers ∷ [Layer]
   }
   deriving stock (Eq, Show)
@@ -139,8 +147,8 @@ data Instance = Instance
   -- ^ The translucent override.
   , instanceAdditive ∷ !Bool
   , instanceClip ∷ !Word16
-  -- ^ A clip index, 0 meaning none. A non-zero index is refused until clip
-  -- tables exist.
+  -- ^ A clip index, 0 meaning none. A non-zero index @k@ selects entry @k − 1@
+  -- of the view's clip table, and must lie within it.
   , instanceMaterial ∷ !Word32
   -- ^ The material parameter word.
   }

@@ -329,7 +329,7 @@ drawingOrderSpec = describe "in drawing order" $ do
       other → error ("expected one layer, found " <> show (length other))
 
   it "encodes a layer with no instances, and one in a zero-size viewport, to the empty buffer" $ do
-    let emptyViewport = View plainCamera (Viewport (V2 0 0) (V2 0 480)) defaultViewSettings [UiLayer [plain, distinct]]
+    let emptyViewport = View plainCamera (Viewport (V2 0 0) (V2 0 480)) defaultViewSettings [] [UiLayer [plain, distinct]]
         zeroSize = [(planned, valid) | (planned, valid) ← plannedWith noCutoutMarks (snapshotWithView emptyViewport)]
     inOrder noCutoutMarks (UiLayer []) `shouldBe` ([], Just [], [])
     map (\(planned, valid) → (drawingOrder planned, encodeLayerInDrawingOrder planned valid)) zeroSize `shouldBe` [([], Just ByteString.empty)]

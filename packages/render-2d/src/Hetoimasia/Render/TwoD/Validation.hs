@@ -10,7 +10,24 @@
 --
 -- __Refusals.__ See 'Reason' for each, and 'Location' for where it is named.
 -- Everything is checked wherever it sits, so invalid data inside a zero-size
--- viewport is refused like any other. A zero-size viewport itself is accepted
+-- viewport, an unused clip entry or a view with no layers is refused like any
+-- other.
+--
+-- __Clip tables__ (R2D-12). A view's clip table is checked entry by entry, then
+-- the references to it. An entry's rectangle must be finite with an extent that
+-- is not negative ('ClipRectInvalid'); its parent, when it names one, must be an
+-- earlier entry of the same table, a zero-based index @p@ with @0 ≤ p < i@
+-- ('ClipParentInvalid'), so a chain only runs toward lower indices and cannot
+-- close on itself. Each of those is named by the entry, with its pass and view
+-- ('AtClipEntry'). An instance's clip index @k > 0@ must select an entry the
+-- table holds, @k ≤ n@ for a table of @n@ entries ('ClipIndexUnknown'), and is
+-- named by the instance. Finally the space each referencing layer is in, world
+-- or UI, is carried through the whole parent chain of the entry it selects: an
+-- entry reached from both spaces, directly or through different descendants, is
+-- refused ('ClipSpaceMixed', named by the entry), since nesting would intersect
+-- coordinates of different units. An entry reached from one space only, or from
+-- none, is accepted. Within a view the refusals come in this order: its own
+-- parts, the table's entries, its layers' instances, then the mixed spaces. A zero-size viewport itself is accepted
 -- and draws nothing, and a snapshot holding only offscreen passes is valid,
 -- for window-free rendering and evidence. That a snapshot published to a
 -- window holds a window pass is a publication rule, not a validation one.
@@ -20,8 +37,9 @@
 -- 'validLayers' gives each layer, with its location, for the encoder in
 -- "Hetoimasia.Render.TwoD.Encoding".
 --
--- __Dependencies.__ @base@, @hetoimasia-math@ for the affine type, and this
--- package's snapshot and settings modules.
+-- __Dependencies.__ @base@, @containers@ for the clip table's reach,
+-- @hetoimasia-math@ for the affine type, and this package's clip, snapshot and
+-- settings modules.
 --
 -- __State.__ The module owns none.
 module Hetoimasia.Render.TwoD.Validation
@@ -45,8 +63,10 @@ module Hetoimasia.Render.TwoD.Validation
 
 import Data.List.NonEmpty (NonEmpty)
 import qualified Data.List.NonEmpty as NonEmpty
+import qualified Data.Map.Strict as Map
 import Hetoimasia.Math.Affine2 (toColumnMajor)
 import Hetoimasia.Math.Vector (V2 (..))
+import Hetoimasia.Render.TwoD.Clip (ClipEntry (..), ClipRect (..), clipEntryOfIndex)
 import Hetoimasia.Render.TwoD.Internal.Check (allFinite, finite, positiveFinite, withinClosed)
 import Hetoimasia.Render.TwoD.Settings
   ( ViewSettings (..)
@@ -58,7 +78,7 @@ import Hetoimasia.Render.TwoD.Snapshot
   ( Camera (..)
   , ClearColour (..)
   , Instance (..)
-  , Layer
+  , Layer (..)
   , Pass (..)
   , Snapshot (..)
   , Target (..)
@@ -75,6 +95,8 @@ data Location
     AtPass !Int
   | -- | The view at this index of the pass at this index.
     AtView !Int !Int
+  | -- | The clip table's entry: pass, view, entry.
+    AtClipEntry !Int !Int !Int
   | -- | The layer: pass, view, layer.
     AtLayer !Int !Int !Int
   | -- | The instance: pass, view, layer, instance.
@@ -114,8 +136,16 @@ data Reason
     UvNotFinite
   | -- | A depth key of 2²⁴ or more.
     DepthKeyTooLarge
-  | -- | A non-zero clip index, refused until clip tables exist.
-    ClipIndexNotZero
+  | -- | A clip index beyond the view's table: an instance with index @k@ in a
+    -- view whose table holds fewer than @k@ entries.
+    ClipIndexUnknown
+  | -- | A clip entry whose parent is not an earlier entry of its table.
+    ClipParentInvalid
+  | -- | A clip rectangle with a NaN or infinite coordinate, or a negative extent.
+    ClipRectInvalid
+  | -- | A clip entry referenced, directly or through a descendant, from both a
+    -- world layer and a UI layer.
+    ClipSpaceMixed
   deriving stock (Eq, Ord, Show, Enum, Bounded)
 
 -- | One reason a candidate was refused, and where.
@@ -192,10 +222,12 @@ validClear (ClearColour r g b a) = all (withinClosed 0 1) [r, g, b, a]
 viewRefusals ∷ Int → Int → View → [Refusal]
 viewRefusals passIndex viewIndex view =
   viewOwnRefusals (Refusal (AtView passIndex viewIndex)) view
+    <> clipEntryRefusals passIndex viewIndex (viewClips view)
     <> concat
-      [ layerRefusals passIndex viewIndex layerIndex layer
+      [ layerRefusals passIndex viewIndex (length (viewClips view)) layerIndex layer
       | (layerIndex, layer) ← zip [0 ..] (viewLayers view)
       ]
+    <> mixedSpaceRefusals passIndex viewIndex view
 
 -- | The reasons a view's camera, viewport and settings are refused, in the order
 -- 'validateSnapshot' reports them and without looking at its layers. Empty
@@ -225,19 +257,64 @@ viewOwnRefusals at view =
       [at ViewportNotFinite | not (allFinite [ox, oy, width, height])]
         <> [at ViewportExtentNegative | width < 0 || height < 0]
 
-layerRefusals ∷ Int → Int → Int → Layer → [Refusal]
-layerRefusals passIndex viewIndex layerIndex layer =
+-- | The refusals of a view's clip table, entry by entry: the rectangle, then the
+-- parent.
+clipEntryRefusals ∷ Int → Int → [ClipEntry] → [Refusal]
+clipEntryRefusals passIndex viewIndex entries =
   concat
-    [ instanceRefusals (AtInstance passIndex viewIndex layerIndex index) candidate
+    [ [at ClipRectInvalid | not (validClipRect (clipRect entry))]
+        <> [at ClipParentInvalid | Just parent ← [clipParent entry], parent < 0 || parent >= index]
+    | (index, entry) ← zip [0 ..] entries
+    , let at = Refusal (AtClipEntry passIndex viewIndex index)
+    ]
+
+-- | A finite rectangle whose extent is not negative.
+validClipRect ∷ ClipRect → Bool
+validClipRect (ClipRect (V2 x y) (V2 width height)) =
+  allFinite [x, y, width, height] && width >= 0 && height >= 0
+
+-- | The entries reached from both spaces, in table order. A layer's space is
+-- carried through the parent chain of every entry its instances select, up to
+-- the first parent that is not an earlier entry (which 'ClipParentInvalid'
+-- refuses on its own); an index beyond the table reaches nothing
+-- ('ClipIndexUnknown' refuses it).
+mixedSpaceRefusals ∷ Int → Int → View → [Refusal]
+mixedSpaceRefusals passIndex viewIndex view =
+  [ Refusal (AtClipEntry passIndex viewIndex entry) ClipSpaceMixed
+  | (entry, (True, True)) ← Map.toAscList reached
+  ]
+  where
+    entries = viewClips view
+    count = length entries
+    parents = Map.fromList [(index, parent) | (index, ClipEntry {clipParent = Just parent}) ← zip [0 ..] entries, parent >= 0, parent < index]
+    chain entry = entry : maybe [] chain (Map.lookup entry parents)
+    reached =
+      Map.fromListWith
+        (\(world, ui) (world', ui') → (world || world', ui || ui'))
+        [ (entry, (isWorld, not isWorld))
+        | layer ← viewLayers view
+        , let isWorld = case layer of
+                WorldLayer _ _ → True
+                UiLayer _ → False
+        , candidate ← layerInstances layer
+        , Just start ← [clipEntryOfIndex (instanceClip candidate)]
+        , start < count
+        , entry ← chain start
+        ]
+
+layerRefusals ∷ Int → Int → Int → Int → Layer → [Refusal]
+layerRefusals passIndex viewIndex tableSize layerIndex layer =
+  concat
+    [ instanceRefusals tableSize (AtInstance passIndex viewIndex layerIndex index) candidate
     | (index, candidate) ← zip [0 ..] (layerInstances layer)
     ]
 
-instanceRefusals ∷ Location → Instance → [Refusal]
-instanceRefusals location candidate =
+instanceRefusals ∷ Int → Location → Instance → [Refusal]
+instanceRefusals tableSize location candidate =
   [at TransformNotFinite | not (allFinite (toColumnMajor (instanceTransform candidate)))]
     <> [at UvNotFinite | not (allFinite [u0, v0, u1, v1])]
     <> [at DepthKeyTooLarge | instanceDepthKey candidate >= depthKeyLimit]
-    <> [at ClipIndexNotZero | instanceClip candidate /= 0]
+    <> [at ClipIndexUnknown | Just entry ← [clipEntryOfIndex (instanceClip candidate)], entry >= tableSize]
   where
     at = Refusal location
     UvRect u0 v0 u1 v1 = instanceUv candidate

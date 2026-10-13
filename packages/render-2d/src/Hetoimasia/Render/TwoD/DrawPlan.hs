@@ -42,6 +42,12 @@
 -- ordered run. A view with a zero-size viewport and a layer with no instances
 -- hold no runs.
 --
+-- __Clips.__ A clip index never changes the plan: it does not split a run,
+-- route an instance or move it in the drawing order, so instances with
+-- different clip indices share one run. A view's plan carries its clip table,
+-- resolved ('plannedClips'), for the recorder to write and the oracle to apply;
+-- which entry an instance selects stays in the instance's flags word.
+--
 -- __Marks.__ A texture's cutout mark is an input, not something this module
 -- computes or stores: the caller says which complete handles, generation
 -- included, are marked cutout-safe, and an absent handle takes the ordered
@@ -55,7 +61,7 @@
 --
 -- __Dependencies.__ @base@, @array@ for the permutation, @containers@ for the
 -- set of marked handles, @hetoimasia-render-api@ for the handle, and this
--- package's snapshot and validation modules.
+-- package's clip, snapshot and validation modules.
 --
 -- __State.__ The module owns none.
 module Hetoimasia.Render.TwoD.DrawPlan
@@ -88,6 +94,7 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 import Hetoimasia.Math.Vector (V2 (..))
 import Hetoimasia.Render.Api.Texture (TextureHandle)
+import Hetoimasia.Render.TwoD.Clip (ResolvedClip, resolveClips)
 import Hetoimasia.Render.TwoD.Settings (ViewSettings)
 import Hetoimasia.Render.TwoD.Snapshot
   ( Camera
@@ -166,6 +173,9 @@ data PlannedView = PlannedView
   { plannedCamera ∷ !Camera
   , plannedViewport ∷ !Viewport
   , plannedSettings ∷ !ViewSettings
+  , plannedClips ∷ [ResolvedClip]
+  -- ^ The view's clip table resolved ('resolveClips'): one rectangle per entry,
+  -- each intersected with its parent chain, in table order.
   , plannedLayers ∷ [PlannedLayer]
   }
   deriving stock (Eq, Show)
@@ -238,6 +248,7 @@ planView marks passIndex viewIndex view =
     { plannedCamera = viewCamera view
     , plannedViewport = viewViewport view
     , plannedSettings = viewSettings view
+    , plannedClips = resolveClips (viewClips view)
     , plannedLayers =
         [ planLayer marks (viewViewport view) (AtLayer passIndex viewIndex layerIndex) layer
         | (layerIndex, layer) ← zip [0 ..] (viewLayers view)

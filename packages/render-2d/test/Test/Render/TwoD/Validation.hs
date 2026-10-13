@@ -13,9 +13,10 @@ module Test.Render.TwoD.Validation (spec) where
 
 import Data.Foldable (toList)
 import Data.List (nub, sort)
-import Data.Word (Word32)
+import Data.Word (Word16, Word32)
 import Hetoimasia.Math.Affine2 (fromColumns)
 import Hetoimasia.Math.Vector (V2 (..))
+import Hetoimasia.Render.TwoD.Clip (ClipEntry (..), ClipRect (..))
 import Hetoimasia.Render.TwoD.Settings
   ( TextureFilter (..)
   , ViewSettings (..)
@@ -38,6 +39,7 @@ spec = describe "Validation" $ do
   boundarySpec
   windowPassSpec
   retentionSpec
+  clipTableSpec
   generatedSpec
 
 nan, inf ∷ Float
@@ -53,15 +55,33 @@ atView reason = [Refusal (AtView 0 0) reason]
 atPass ∷ Reason → [Refusal]
 atPass reason = [Refusal (AtPass 0) reason]
 
+atClip ∷ Int → Reason → [Refusal]
+atClip entry reason = [Refusal (AtClipEntry 0 0 entry) reason]
+
+atClipMixed ∷ Int → [Refusal]
+atClipMixed entry = atClip entry ClipSpaceMixed
+
+-- | A snapshot of the plain view with this clip table and these layers.
+clipView ∷ [ClipEntry] → [Layer] → Snapshot
+clipView clips layers = snapshotWithView (View plainCamera plainViewport defaultViewSettings clips layers)
+
+-- | A one-pixel-by-one-pixel entry at this x with this parent.
+clipAt ∷ Float → Maybe Int → ClipEntry
+clipAt x = ClipEntry (ClipRect (V2 x 0) (V2 1 1))
+
+-- | An instance with this clip index.
+clipped ∷ Word16 → Instance
+clipped index = plainInstance {instanceClip = index}
+
 -- | A view with the plain camera and viewport and these settings.
 withSettings ∷ ViewSettings → Snapshot
-withSettings settings = snapshotWithView (View plainCamera plainViewport settings [])
+withSettings settings = snapshotWithView (View plainCamera plainViewport settings [] [])
 
 withCamera ∷ Camera → Snapshot
-withCamera camera = snapshotWithView (View camera plainViewport defaultViewSettings [])
+withCamera camera = snapshotWithView (View camera plainViewport defaultViewSettings [] [])
 
 withViewport ∷ Viewport → Snapshot
-withViewport viewport = snapshotWithView (View plainCamera viewport defaultViewSettings [])
+withViewport viewport = snapshotWithView (View plainCamera viewport defaultViewSettings [] [])
 
 withClear ∷ ClearColour → Snapshot
 withClear clear = snapshotWithPass (Pass WindowTarget clear [])
@@ -162,8 +182,17 @@ refusals =
   , ("an infinite UV value", snapshotWithInstance plainInstance {instanceUv = UvRect 0 (-inf) 1 1}, atInstance UvNotFinite)
   , ("a depth key of 2^24", withKey 16777216, atInstance DepthKeyTooLarge)
   , ("a depth key of 2^32 - 1", withKey maxBound, atInstance DepthKeyTooLarge)
-  , ("a clip index of 1", snapshotWithInstance plainInstance {instanceClip = 1}, atInstance ClipIndexNotZero)
-  , ("a clip index of 65535", snapshotWithInstance plainInstance {instanceClip = maxBound}, atInstance ClipIndexNotZero)
+  , ("a clip index of 1 in a view with no clip table", snapshotWithInstance plainInstance {instanceClip = 1}, atInstance ClipIndexUnknown)
+  , ("a clip index of 65535 in a view with no clip table", snapshotWithInstance plainInstance {instanceClip = maxBound}, atInstance ClipIndexUnknown)
+  , ("a clip index past a table of two entries", clipView [clipAt 0 Nothing, clipAt 1 Nothing] [UiLayer [plainInstance {instanceClip = 3}]], atInstance ClipIndexUnknown)
+  , ("a clip rectangle with a NaN origin", clipView [ClipEntry (ClipRect (V2 nan 0) (V2 1 1)) Nothing] [], atClip 0 ClipRectInvalid)
+  , ("a clip rectangle with an infinite extent", clipView [ClipEntry (ClipRect (V2 0 0) (V2 1 inf)) Nothing] [], atClip 0 ClipRectInvalid)
+  , ("a clip rectangle with a negative width", clipView [ClipEntry (ClipRect (V2 0 0) (V2 (-1) 1)) Nothing] [], atClip 0 ClipRectInvalid)
+  , ("a clip rectangle with a negative height", clipView [ClipEntry (ClipRect (V2 0 0) (V2 1 (-1))) Nothing] [], atClip 0 ClipRectInvalid)
+  , ("a clip entry that is its own parent", clipView [clipAt 0 (Just 0)] [], atClip 0 ClipParentInvalid)
+  , ("a clip entry whose parent comes later", clipView [clipAt 0 (Just 1), clipAt 1 Nothing] [], atClip 0 ClipParentInvalid)
+  , ("a clip entry whose parent is negative", clipView [clipAt 0 (Just (-1))] [], atClip 0 ClipParentInvalid)
+  , ("a clip entry referenced from a world and a UI layer", clipView [clipAt 0 Nothing] [WorldLayer DepthDisabled [clipped 1], UiLayer [clipped 1]], atClipMixed 0)
   ]
 
 refusalSpec ∷ Spec
@@ -280,11 +309,13 @@ retentionSpec = describe "every reason is retained" $ do
                     plainCamera {cameraPosition = V2 nan 0}
                     zeroViewport
                     defaultViewSettings
+                    []
                     [UiLayer [plainInstance {instanceDepthKey = 16777216}, badInstance]]
                 , View
                     plainCamera {cameraZoom = 0, cameraRotation = Just inf}
                     plainViewport
                     defaultViewSettings {settingUiScale = 5, settingBrightness = nan, settingZoomMode = FixedHalfHeight (-1)}
+                    []
                     [WorldLayer DepthDisabled [plainInstance, plainInstance, plainInstance {instanceDepthKey = maxBound}]]
                 ]
             , windowPass [plainView []]
@@ -296,7 +327,7 @@ retentionSpec = describe "every reason is retained" $ do
           , Refusal (AtInstance 0 0 0 0) DepthKeyTooLarge
           , Refusal (AtInstance 0 0 0 1) TransformNotFinite
           , Refusal (AtInstance 0 0 0 1) UvNotFinite
-          , Refusal (AtInstance 0 0 0 1) ClipIndexNotZero
+          , Refusal (AtInstance 0 0 0 1) ClipIndexUnknown
           , Refusal (AtView 0 1) CameraZoomInvalid
           , Refusal (AtView 0 1) CameraRotationNotFinite
           , Refusal (AtView 0 1) UiScaleOutOfRange
@@ -314,7 +345,7 @@ retentionSpec = describe "every reason is retained" $ do
       ( snapshotWithPass
           (windowPass [plainView [], plainView [UiLayer [plainInstance {instanceClip = 1}]], plainView [UiLayer [plainInstance {instanceClip = 1}]]])
       )
-      `shouldBe` [Refusal (AtInstance 0 1 0 0) ClipIndexNotZero, Refusal (AtInstance 0 2 0 0) ClipIndexNotZero]
+      `shouldBe` [Refusal (AtInstance 0 1 0 0) ClipIndexUnknown, Refusal (AtInstance 0 2 0 0) ClipIndexUnknown]
 
   it "reports a refused instance in a layer other than the first" $
     refusalsOf
@@ -322,6 +353,143 @@ retentionSpec = describe "every reason is retained" $ do
           (plainView [UiLayer [], WorldLayer DepthEnabled [plainInstance {instanceUv = UvRect nan nan nan nan}]])
       )
       `shouldBe` [Refusal (AtInstance 0 0 1 0) UvNotFinite]
+
+clipTableSpec ∷ Spec
+clipTableSpec = describe "a view's clip table" $ do
+  it "accepts a table of entries, a parent chain three deep and instances selecting any of them" $
+    refusalsOf
+      ( clipView
+          [clipAt 0 Nothing, clipAt 1 (Just 0), clipAt 2 (Just 1), clipAt 3 (Just 2)]
+          [UiLayer (map clipped [0, 1, 2, 3, 4])]
+      )
+      `shouldBe` []
+
+  it "accepts a zero extent, a parent named by several entries and a table no instance uses" $
+    refusalsOf
+      ( clipView
+          [ClipEntry (ClipRect (V2 0 0) (V2 0 0)) Nothing, clipAt 1 (Just 0), clipAt 2 (Just 0)]
+          []
+      )
+      `shouldBe` []
+
+  it "accepts the largest index a table of that many entries allows" $
+    refusalsOf (clipView [clipAt 0 Nothing] [UiLayer [clipped 1]]) `shouldBe` []
+
+  it "refuses an index just past the table and accepts the one before it" $ do
+    refusalsOf (clipView [clipAt 0 Nothing, clipAt 1 Nothing] [UiLayer [clipped 2]]) `shouldBe` []
+    refusalsOf (clipView [clipAt 0 Nothing, clipAt 1 Nothing] [UiLayer [clipped 3]]) `shouldBe` atInstance ClipIndexUnknown
+
+  it "checks unused entries, and entries of a view with no layers" $
+    refusalsOf (clipView [clipAt 0 Nothing, ClipEntry (ClipRect (V2 0 0) (V2 (-1) 1)) (Just 5)] [])
+      `shouldBe` [Refusal (AtClipEntry 0 0 1) ClipRectInvalid, Refusal (AtClipEntry 0 0 1) ClipParentInvalid]
+
+  it "names the pass, view and entry of a refused entry" $
+    refusalsOf
+      ( Snapshot
+          [ plainPass (offscreen 0) [plainView []]
+          , windowPass
+              [ plainView []
+              , plainView []
+              , View plainCamera plainViewport defaultViewSettings [clipAt 0 Nothing, clipAt 1 Nothing, clipAt 2 (Just 2)] []
+              ]
+          ]
+      )
+      `shouldBe` [Refusal (AtClipEntry 1 2 2) ClipParentInvalid]
+
+  it "names an unknown index by its instance, in the view whose table it overruns" $
+    refusalsOf
+      ( Snapshot
+          [ windowPass
+              [ View plainCamera plainViewport defaultViewSettings [clipAt 0 Nothing, clipAt 1 Nothing] [UiLayer [clipped 2]]
+              , View plainCamera plainViewport defaultViewSettings [clipAt 0 Nothing] [UiLayer [clipped 1], WorldLayer DepthDisabled [clipped 0, clipped 2]]
+              ]
+          ]
+      )
+      `shouldBe` [Refusal (AtInstance 0 1 1 1) ClipIndexUnknown]
+
+  it "gives one index a view-local meaning: the same index is accepted or refused by each view's own table" $
+    refusalsOf
+      ( Snapshot
+          [ windowPass
+              [ View plainCamera plainViewport defaultViewSettings [clipAt 0 Nothing, clipAt 1 Nothing] [UiLayer [clipped 2]]
+              , View plainCamera plainViewport defaultViewSettings [clipAt 0 Nothing] [UiLayer [clipped 2]]
+              ]
+          ]
+      )
+      `shouldBe` [Refusal (AtInstance 0 1 0 0) ClipIndexUnknown]
+
+  it "refuses an entry's rectangle and its parent together, rectangle first" $
+    refusalsOf (clipView [clipAt 0 Nothing, ClipEntry (ClipRect (V2 nan 0) (V2 1 1)) (Just 1)] [])
+      `shouldBe` [Refusal (AtClipEntry 0 0 1) ClipRectInvalid, Refusal (AtClipEntry 0 0 1) ClipParentInvalid]
+
+  it "accepts an entry referenced from several layers of one space" $ do
+    refusalsOf (clipView [clipAt 0 Nothing] [WorldLayer DepthEnabled [clipped 1], WorldLayer DepthDisabled [clipped 1]]) `shouldBe` []
+    refusalsOf (clipView [clipAt 0 Nothing] [UiLayer [clipped 1], UiLayer [clipped 1]]) `shouldBe` []
+
+  it "accepts entries of different spaces when no ancestor is shared" $
+    refusalsOf
+      ( clipView
+          [clipAt 0 Nothing, clipAt 1 Nothing]
+          [WorldLayer DepthDisabled [clipped 1], UiLayer [clipped 2]]
+      )
+      `shouldBe` []
+
+  it "refuses an ancestor reached from both spaces through different children" $
+    refusalsOf
+      ( clipView
+          [clipAt 0 Nothing, clipAt 1 (Just 0), clipAt 2 (Just 0)]
+          [WorldLayer DepthDisabled [clipped 2], UiLayer [clipped 3]]
+      )
+      `shouldBe` atClipMixed 0
+
+  it "refuses an ancestor reached from one space through a descendant and from the other directly" $
+    refusalsOf
+      ( clipView
+          [clipAt 0 Nothing, clipAt 1 (Just 0)]
+          [UiLayer [clipped 1], WorldLayer DepthEnabled [clipped 2]]
+      )
+      `shouldBe` atClipMixed 0
+
+  it "carries a space through a chain three deep" $
+    refusalsOf
+      ( clipView
+          [clipAt 0 Nothing, clipAt 1 (Just 0), clipAt 2 (Just 1), clipAt 3 (Just 0)]
+          [WorldLayer DepthDisabled [clipped 3], UiLayer [clipped 4]]
+      )
+      `shouldBe` atClipMixed 0
+
+  it "refuses every entry reached from both spaces, in table order" $
+    refusalsOf
+      ( clipView
+          [clipAt 0 Nothing, clipAt 1 (Just 0), clipAt 2 Nothing]
+          [WorldLayer DepthDisabled [clipped 2, clipped 3], UiLayer [clipped 2, clipped 3]]
+      )
+      `shouldBe` [Refusal (AtClipEntry 0 0 0) ClipSpaceMixed, Refusal (AtClipEntry 0 0 1) ClipSpaceMixed, Refusal (AtClipEntry 0 0 2) ClipSpaceMixed]
+
+  it "does not carry a space past a parent that is not an earlier entry" $
+    refusalsOf
+      ( clipView
+          [clipAt 0 Nothing, clipAt 1 (Just 1)]
+          [WorldLayer DepthDisabled [clipped 2], UiLayer [clipped 1]]
+      )
+      `shouldBe` atClip 1 ClipParentInvalid
+
+  it "reports the table's entries, then the instances, then the mixed spaces, in that order" $
+    refusalsOf
+      ( clipView
+          [clipAt 0 Nothing, ClipEntry (ClipRect (V2 0 0) (V2 (-1) 1)) Nothing]
+          [WorldLayer DepthDisabled [clipped 1, clipped 9], UiLayer [clipped 1]]
+      )
+      `shouldBe` [ Refusal (AtClipEntry 0 0 1) ClipRectInvalid
+                 , Refusal (AtInstance 0 0 0 1) ClipIndexUnknown
+                 , Refusal (AtClipEntry 0 0 0) ClipSpaceMixed
+                 ]
+
+  it "leaves a valid snapshot's clip table exactly as the candidate gave it" $ do
+    let candidate = clipView [clipAt 0 Nothing, clipAt 1 (Just 0)] [UiLayer [clipped 2]]
+    fmap (map viewClips . concatMap passViews . snapshotPasses . validSnapshot) (validateSnapshot candidate)
+      `shouldBe` Right [[clipAt 0 Nothing, clipAt 1 (Just 0)]]
+
 
 generatedSpec ∷ Spec
 generatedSpec = describe "over generated snapshots" $ do
@@ -373,8 +541,10 @@ wildSnapshot = do
       camera ← Camera <$> (V2 <$> wildFloat <*> wildFloat) <*> wildFloat <*> oneof [pure Nothing, Just <$> wildFloat]
       viewport ← Viewport <$> (V2 <$> wildFloat <*> wildFloat) <*> (V2 <$> wildFloat <*> wildFloat)
       settings ← ViewSettings <$> wildFloat <*> pure False <*> pure FilterNearest <*> wildFloat <*> oneof [pure PixelsPerUnit, FixedHalfHeight <$> wildFloat]
+      clips ← mapM (const wildClip) [1 .. (3 ∷ Int)]
       layers ← mapM (const wildLayer) [1 .. (2 ∷ Int)]
-      pure (View camera viewport settings layers)
+      pure (View camera viewport settings clips layers)
+    wildClip = ClipEntry <$> (ClipRect <$> wildV2 <*> wildV2) <*> oneof [pure Nothing, Just <$> choose (-2, 5)]
     wildLayer = do
       instances ← mapM (const wildInstance) [1 .. (2 ∷ Int)]
       oneof [pure (UiLayer instances), pure (WorldLayer DepthEnabled instances)]
@@ -407,7 +577,7 @@ injection snapshot = case instanceLocations of
     corruptions =
       [ (\i → i {instanceDepthKey = depthKeyLimit}, DepthKeyTooLarge)
       , (\i → i {instanceDepthKey = maxBound}, DepthKeyTooLarge)
-      , (\i → i {instanceClip = 1}, ClipIndexNotZero)
+      , (\i → i {instanceClip = maxBound}, ClipIndexUnknown)
       , (\i → i {instanceUv = UvRect nan 0 0 0}, UvNotFinite)
       , (\i → i {instanceTransform = fromColumns (V2 0 0) (V2 0 0) (V2 inf 0)}, TransformNotFinite)
       ]

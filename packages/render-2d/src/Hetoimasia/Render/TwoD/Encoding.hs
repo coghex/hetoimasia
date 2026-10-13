@@ -20,9 +20,11 @@
 -- 2 linear, and 3 is never produced. Bit 2 is the translucent override and bit
 -- 3 the additive flag. Bits 4–15 are reserved and always zero. Bits 16–31 hold
 -- the clip index, an unsigned 16-bit number with 0 meaning none, so a shader
--- reads it as @flags >> 16@. A validated layer's clip index is always zero
--- until clip tables exist; 'flagsWord' packs any instance, so the layout is
--- fixed and tested independently of that refusal.
+-- reads it as @flags >> 16@. A validated layer's clip index is 0 or selects an
+-- entry of its view's clip table ("Hetoimasia.Render.TwoD.Clip"), and is
+-- written unchanged: encoding neither renumbers nor resolves it, so the
+-- table's entry order is the one the shader indexes. 'flagsWord' packs any
+-- instance, so the layout is fixed and tested independently of validation.
 --
 -- __std430.__ The 64-byte stride is std430-compatible only when a shader
 -- declares the UV rectangle as two @vec2@s, or reads the instance as vertex
