@@ -121,6 +121,15 @@ spec = describe "depth" $ do
           half = (translucent (keyed 7 (cell B))) {instanceTint = Tint 255 0 0 128}
       valueAt (over textures [depth [half, keyed 7 (cell A)]]) 4 4 `shouldBe` Just (Rgba8 255 127 0 255)
 
+    it "interleaves cutouts and translucent instances in one layer: the nearer translucent blends, the farther is hidden" $ do
+      -- Submitted translucent, cutout, translucent, cutout; the plan draws both
+      -- cutouts first, then the translucent ones back to front.
+      let textures = [(A, (0, 255, 0, 255)), (B, (255, 255, 255, 255))]
+          half key x = (translucent (keyed key (spriteAt h2 (x, 0)))) {instanceTint = Tint 255 0 0 128}
+          oracle = over textures [depth [half 20 0, keyed 10 (spriteAt h1 (0, 0)), half 10 1, keyed 20 (spriteAt h1 (1, 0))]]
+      valueAt oracle 4 4 `shouldBe` Just (Rgba8 255 127 0 255)
+      valueAt oracle 5 4 `shouldBe` Just (Rgba8 0 255 0 255)
+
     it "hides a translucent instance behind a cutout and shows one in front of it" $ do
       let textures = [(A, (0, 255, 0, 255)), (B, (255, 255, 255, 255))]
           half key = (translucent (keyed key (cell B))) {instanceTint = Tint 255 0 0 128}
