@@ -795,6 +795,9 @@ requestAfterFailure idle = do
     queued ← request host (VulkanAction (\_ → pure ()))
     when idle (awaitIdleOwner host)
     reportErrorNow rig "an error while a request waits"
+    -- The round that takes the error. Its answer does not matter: the window
+    -- may already have ended with the session.
+    _ ← publishTo host window 2
     atomically (readOwnerFailure (vulkanGraphicsOwner host) >>= check . isJust)
     settled ← atomically (awaitVulkanAction queued)
     later ← atomically (requestVulkanRelease (vulkanController host) (VulkanAction (\_ → pure ())))
