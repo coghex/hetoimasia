@@ -46,9 +46,11 @@ import Hetoimasia.GPU.Vulkan.Native.Shader.Interface
   , storageTableDescriptors
   , textureTableDescriptors
   )
-import Hetoimasia.GPU.Vulkan.Native.TextureTable (validateTableConfig)
+import Control.Concurrent.STM (atomically)
+import Hetoimasia.GPU.Vulkan.Native.TextureTable (LookupEntry (..), TableView (..), readTable, validateTableConfig)
 import Hetoimasia.Math.Affine2 (fromColumns)
 import Hetoimasia.Math.Vector (V2 (..))
+import qualified Hetoimasia.Render.Api.Texture as Api
 import Hetoimasia.Render.Api.Texture.Backend (handleGeneration, handleIndex, textureHandle)
 import Hetoimasia.Render.TwoD.Chunk
 import Hetoimasia.Render.TwoD.Chunk.Backend (chunkRef)
@@ -68,7 +70,7 @@ import Hetoimasia.Render.TwoD.Vulkan.Material
 import Hetoimasia.Render.TwoD.Vulkan.Material.Sample (mixMaterial, tintOnlyMaterial, translucentMixMaterial)
 import Hetoimasia.Render.TwoD.Vulkan.MaterialSources (declarationProblems, laidBytes, laidOffsets, layOut)
 import Hetoimasia.Render.TwoD.Vulkan.Shaders (cutoutShaders, orderedShaders)
-import Hetoimasia.Render.TwoD.Vulkan.Textures (MarkPolicy (..), registeredMarks)
+import Hetoimasia.Render.TwoD.Vulkan.Textures (MarkPolicy (..), registeredMarks, releaseTextureNow)
 import Hetoimasia.Render.TwoD.Vulkan.Window
 import System.Exit (ExitCode (ExitSuccess))
 import Test.Support.ExternalClient (Client (..), Mode (..), rejectedBecause, withStorePackageClient)
@@ -712,6 +714,40 @@ publicationSpec = describe "publishing and holding materials' records" $ do
       -- Without the record's handle the snapshot publishes.
       publish2DSnapshot (envAdapter env) 1 (windowWith [(issued, MaterialData [record [(handleIndex art, handleGeneration art)] [7]] (twoFloats 1 0))] [instanceOf issued art]) >>= (`shouldBe` Right 1)
 
+  it "keeps a record's texture while a batch that recorded it is incomplete, and releases it once the batch completes" $
+    withEnv [1] $ \env → do
+      issued ← Render.registerMaterial (envRenderer env) mixMaterial
+      art ← registered env 1 True DefaultMark
+      second ← registered env 2 True DefaultMark
+      let held = [(issued, MaterialData [record [(handleIndex second, handleGeneration second)] [7]] (twoFloats 1 0))]
+          snapshot = onePass [] [viewHolding held [UiLayer [(unit issued 0 0 0) {instanceTexture = art}]]]
+      image ← target (envRig env) Rgba8Linear 16 16
+      depth ← depthTarget (envRig env) Depth32Float 16 16
+      let input =
+            FrameInput
+              snapshot
+              noCutoutMarks
+              (\_ → Just (TargetBinding image (offscreenAttachment Rgba8Linear 16 16) (Just (DepthBinding depth Depth32Float))))
+              Nothing
+              Nothing
+              (const Nothing)
+              Set.empty
+      slot ← slotOf env second
+      Render.prepareSnapshot (builders (envRig env)) (envRenderer env) input >>= \case
+        Left refusal → expectationFailure (show refusal)
+        Right recording →
+          framelessOnce (envRig env) $ \recorder → do
+            recording recorder >>= (`shouldBe` Right ())
+            -- The batch has recorded and not completed: it holds a table version that maps the slot.
+            releaseTextureNow (builders (envRig env)) (envTextures env) second >>= (`shouldBe` Right ())
+            resolves env second >>= (`shouldBe` False)
+            mappedSlots env >>= (`shouldSatisfy` Set.member slot)
+      -- Submitted, not completed: the batch's version still maps it, and the slot is not free to reuse.
+      mappedSlots env >>= (`shouldSatisfy` Set.member slot)
+      settleUploads (envRig env)
+      refreshTable (envRig env)
+      mappedSlots env >>= (`shouldSatisfy` (not . Set.member slot))
+
   it "holds the textures a chunk's records name with the chunk, which releases with the chunk's own rules" $
     withEnv [1] $ \env → do
       issued ← Render.registerMaterial (envRenderer env) mixMaterial
@@ -739,6 +775,17 @@ publicationSpec = describe "publishing and holding materials' records" $ do
   where
     instanceOf material texture = (unit material 0 0 0) {instanceTexture = texture}
     windowWith held instances = Snapshot [Pass WindowTarget (ClearColour 0 0 0 1) [viewHolding held [UiLayer instances]]]
+
+-- | The table slot a registered handle maps to.
+slotOf ∷ Env → Api.TextureHandle → IO Word32
+slotOf env handle =
+  atomically (readTable (rigRecording (envRig env))) >>= \case
+    Just view | Just entry ← Map.lookup (handleIndex handle) (tableViewMapping view) → pure (entrySlot entry)
+    _ → fail "the handle is not mapped"
+
+-- | The slots a live table version maps: the current one and every one a batch holds.
+mappedSlots ∷ Env → IO (Set.Set Word32)
+mappedSlots env = maybe Set.empty tableViewMapped <$> atomically (readTable (rigRecording (envRig env)))
 
 -- ---------------------------------------------------------------------------
 -- A deliberately misdeclared material, in a module of its own
