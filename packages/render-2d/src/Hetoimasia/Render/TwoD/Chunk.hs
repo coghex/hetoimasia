@@ -54,8 +54,8 @@
 -- merging them with other sources needs no sort of their own.
 --
 -- __Dependencies.__ @base@, @array@, @containers@, @hetoimasia-math@,
--- @hetoimasia-render-api@ and this package's snapshot, validation, routing and
--- chunk-reference modules.
+-- @hetoimasia-render-api@ and this package's snapshot, validation, routing,
+-- material and chunk-reference modules.
 --
 -- __State.__ The module owns none; every function is pure and total.
 module Hetoimasia.Render.TwoD.Chunk
@@ -72,6 +72,7 @@ module Hetoimasia.Render.TwoD.Chunk
   , Chunk
   , ChunkRefusal (..)
   , buildChunk
+  , buildChunkWith
 
     -- * Reading a chunk
   , chunkKind
@@ -82,6 +83,8 @@ module Hetoimasia.Render.TwoD.Chunk
   , chunkCutoutPositions
   , chunkOrderedPositions
   , chunkTextures
+  , chunkRecords
+  , chunkMaterials
   , chunkPlacementMagnitude
 
     -- * Resolving references
@@ -112,7 +115,8 @@ import Hetoimasia.Render.TwoD.Internal.Chunk
   , layerChunkKind
   )
 import Hetoimasia.Render.TwoD.Internal.ChunkRef (ChunkRef)
-import Hetoimasia.Render.TwoD.Internal.Routing (CutoutMarks, instanceMaterialOf, routesToCutout)
+import Hetoimasia.Render.TwoD.Internal.Material (MaterialFacts (..), MaterialRecord (..), MaterialRef (..), recordLayoutIsEmpty, recordMatches)
+import Hetoimasia.Render.TwoD.Internal.Routing (CutoutMarks, routesToCutout)
 import Hetoimasia.Render.TwoD.Snapshot (Instance (..))
 import Hetoimasia.Render.TwoD.Validation (Reason, instanceReasons)
 
@@ -141,15 +145,33 @@ data ChunkRefusal
   | -- | The geometry of the instances reaches beyond what a 32-bit float can
     -- hold.
     ChunkBoundsNotRepresentable
+  | -- | An instance, by build position, whose material has records and whose
+    -- parameter word is not below the number of records the chunk holds for it.
+    ChunkParameterBeyondRecords !Int
+  | -- | A record the chunk holds, by material and position in that material's
+    -- records, whose handles or words do not match the layout the material
+    -- declares.
+    ChunkRecordMismatch !MaterialRef !Int
   deriving stock (Eq, Show)
 
 -- | Build a chunk for one kind of layer from its instances, in build order,
 -- routing them once against the registered marks (decisions D-3, D-22). Every
 -- instance is validated as a snapshot's would be, and the bounds are derived or
--- checked; either every reason is reported or a chunk is built.
+-- checked; either every reason is reported or a chunk is built. The chunk holds
+-- no records, so its instances use the built-in default material, or a material
+-- whose layout is empty.
 buildChunk ∷ CutoutMarks → ChunkKind → BoundsRequest → [Instance] → Either (NonEmpty ChunkRefusal) Chunk
-buildChunk marks kind request instances =
-  case NonEmpty.nonEmpty (instanceRefusals <> boundsRefusals) of
+buildChunk marks kind request = buildChunkWith marks kind request Map.empty
+
+-- | 'buildChunk' for a chunk that carries its own records for the application
+-- materials its instances use (R2D-11, decision D-31). Each record must have the
+-- layout its material declares, and the parameter word of every instance whose
+-- material has records must index the records the chunk holds for it; every
+-- reason is reported, naming the instance by build position or the record by
+-- material and position, after the instance refusals and before the bounds'.
+buildChunkWith ∷ CutoutMarks → ChunkKind → BoundsRequest → Map.Map MaterialRef [MaterialRecord] → [Instance] → Either (NonEmpty ChunkRefusal) Chunk
+buildChunkWith marks kind request records instances =
+  case NonEmpty.nonEmpty (instanceRefusals <> recordRefusals <> boundsRefusals) of
     Just refusals → Left refusals
     Nothing → case resolvedBounds of
       Nothing → Left (NonEmpty.singleton ChunkBoundsNotRepresentable)
@@ -159,9 +181,11 @@ buildChunk marks kind request instances =
             { chunkKindField = kind
             , chunkBoundsField = enclosing
             , chunkInstanceArray = held
-            , chunkCutoutOrder = map fst (sortOn (\(position, candidate) → (instanceMaterialOf candidate, position)) cutouts)
+            , chunkCutoutOrder = map fst (sortOn (\(position, candidate) → (instanceMaterial candidate, position)) cutouts)
             , chunkOrderedOrder = map fst (sortOn (\(position, candidate) → (instanceDepthKey candidate, position)) ordered)
-            , chunkTextureSet = Set.fromList (map instanceTexture instances)
+            , chunkTextureSet = Set.fromList (map instanceTexture instances) <> Set.fromList [handle | each ← concat (Map.elems records), handle ← recordHandles each]
+            , chunkRecordTables = records
+            , chunkMaterialSet = Set.fromList (map instanceMaterial instances)
             , chunkMagnitudeField = maximum (0 : map placementMagnitude instances)
             }
   where
@@ -169,6 +193,18 @@ buildChunk marks kind request instances =
     held = listArray (0, count - 1) instances
     numbered = zip [0 ..] instances
     instanceRefusals = [ChunkInstanceInvalid position reason | (position, candidate) ← numbered, reason ← instanceReasons candidate]
+    recordRefusals =
+      [ ChunkRecordMismatch material index
+      | (material, listed) ← Map.toList records
+      , (index, each) ← zip [0 ..] listed
+      , not (recordMatches (factRecordLayout (materialRefFacts material)) each)
+      ]
+        <> [ ChunkParameterBeyondRecords position
+           | (position, candidate) ← numbered
+           , let layout = factRecordLayout (materialRefFacts (instanceMaterial candidate))
+           , not (recordLayoutIsEmpty layout)
+           , toInteger (instanceParameter candidate) >= toInteger (length (Map.findWithDefault [] (instanceMaterial candidate) records))
+           ]
     (cutouts, ordered) = case kind of
       ChunkWorldDepth → partitionBy (routesToCutout marks True . snd) numbered
       _ → ([], numbered)
@@ -282,10 +318,18 @@ chunkCutoutPositions = chunkCutoutOrder
 chunkOrderedPositions ∷ Chunk → [Int]
 chunkOrderedPositions = chunkOrderedOrder
 
--- | Every texture any instance of the chunk names, whether or not it is
--- visible.
+-- | Every texture any instance of the chunk names, and every handle any of its
+-- records holds, whether or not it is visible.
 chunkTextures ∷ Chunk → Set TextureHandle
 chunkTextures = chunkTextureSet
+
+-- | The chunk's own records, for each application material that has any.
+chunkRecords ∷ Chunk → Map.Map MaterialRef [MaterialRecord]
+chunkRecords = chunkRecordTables
+
+-- | Every material any instance of the chunk names.
+chunkMaterials ∷ Chunk → Set MaterialRef
+chunkMaterials = chunkMaterialSet
 
 -- | The largest magnitude any term of placing an instance reaches, over the
 -- chunk's instances: what the shader's 32-bit arithmetic rounds at, however

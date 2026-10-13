@@ -103,7 +103,7 @@ ref = chunkRef
 -- | An instance in the cutout-eligible shape at this key, tagged in its
 -- material word, which neither the plan nor the encoder reads.
 cutoutAt ∷ Word32 → Word32 → Instance
-cutoutAt key tag = plainInstance {instanceDepthKey = key, instanceMaterial = tag}
+cutoutAt key tag = plainInstance {instanceDepthKey = key, instanceParameter = tag}
 
 -- | An instance that always takes the ordered path (the translucent override).
 orderedAt ∷ Word32 → Word32 → Instance
@@ -131,8 +131,8 @@ planned planMarks held layer =
 -- | The tag of a source of a layer, given the chunks it lists in order.
 tagOf ∷ [Chunk] → [Instance] → InstanceSource → Word32
 tagOf listed dynamic = \case
-  DynamicInstance index → instanceMaterial (dynamic !! index)
-  ChunkInstance position index → instanceMaterial (chunkInstances (listed !! position) !! index)
+  DynamicInstance index → instanceParameter (dynamic !! index)
+  ChunkInstance position index → instanceParameter (chunkInstances (listed !! position) !! index)
 
 -- | The tags of a plan's ring entries, in order.
 ringTags ∷ [Chunk] → [Instance] → PlannedLayer → [Word32]
@@ -321,7 +321,7 @@ validationSpec = describe "referencing chunks from layers" $ do
     let rebuilt = chunksFrom [(ref 1 2, built ChunkUi [orderedAt 0 77])]
     validateSnapshotWith rebuilt (snapshotOf (UiLayerWith [ref 1 1] [])) `shouldSatisfy` isLeft'
     case validateSnapshotWith rebuilt (snapshotOf (UiLayerWith [ref 1 2] [])) of
-      Right valid → map (map instanceMaterial . chunkInstances . snd) (concatMap validLayerChunks (validLayers valid)) `shouldBe` [[77]]
+      Right valid → map (map instanceParameter . chunkInstances . snd) (concatMap validLayerChunks (validLayers valid)) `shouldBe` [[77]]
       Left refused → fail ("refused: " <> show refused)
   it "refuses any listed chunk when the snapshot is validated against none" $
     sequence_
@@ -808,7 +808,7 @@ encodingSpec = describe "encoding what a backend uploads and what it writes" $ d
   it "encodes a chunk's cutout instances as the dynamic encoding of those instances, in the order the buffer holds them" $ do
     let chunk = built ChunkWorldDepth [orderedAt 1 0, cutoutAt 5 1, orderedAt 2 2, cutoutAt 3 3]
         cutouts = [instance' | position ← chunkCutoutPositions chunk, Just instance' ← [chunkInstanceAt chunk position]]
-    map instanceMaterial cutouts `shouldBe` [1, 3]
+    map instanceParameter cutouts `shouldBe` [1, 3]
     encodeChunkCutouts chunk `shouldBe` encodeLayer (singleLayer (WorldLayer DepthEnabled cutouts))
   it "encodes no cutout bytes for a chunk with none, whatever its kind" $
     sequence_ [encodeChunkCutouts (built kind [orderedAt 1 0]) `shouldBe` mempty | kind ← allKinds]
@@ -819,7 +819,7 @@ encodingSpec = describe "encoding what a backend uploads and what it writes" $ d
         layer = WorldLayerWith DepthEnabled [ref 1 1, ref 2 1] dynamic
         (valid, plan) = planned marks [(ref 1 1, first), (ref 2 1, second)] layer
         expectedTags = ringTags [first, second] dynamic plan
-        byTag = [(instanceMaterial candidate, candidate) | candidate ← chunkInstances first <> chunkInstances second <> dynamic]
+        byTag = [(instanceParameter candidate, candidate) | candidate ← chunkInstances first <> chunkInstances second <> dynamic]
         expected = [candidate | tag ← expectedTags, Just candidate ← [lookup tag byTag]]
     expectedTags `shouldBe` [2, 102, 3, 101, 200, 1]
     encodeLayerInDrawingOrder plan valid `shouldBe` Just (encodeLayer (singleLayer (WorldLayer DepthEnabled expected)))

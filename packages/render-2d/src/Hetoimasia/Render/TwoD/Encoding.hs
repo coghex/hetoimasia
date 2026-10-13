@@ -13,6 +13,10 @@
 -- >     56     4  the flags word (u32)
 -- >     60     4  the material parameter word (u32)
 --
+-- The material an instance names ('Hetoimasia.Render.TwoD.Snapshot.instanceMaterial')
+-- is a value the planner reads and is not encoded: the layout above is the whole
+-- of it, and the parameter word is the only material datum an instance carries.
+--
 -- A transform's coefficients are @x' = a * x + c * y + tx@ and
 -- @y' = b * x + d * y + ty@; see "Hetoimasia.Math.Affine2".
 --
@@ -44,6 +48,14 @@
 -- cutout instances, once, in the order the chunk's device buffer holds them: a
 -- run of that chunk draws as its @runStart@ and @runCount@ over this buffer.
 --
+-- __Material records__ (R2D-11). 'encodeRecords' writes a material's records as
+-- the recorder puts them in the batch's storage region: little-endian 32-bit
+-- words, record after record with no padding, each record a full handle for each
+-- of the layout's handles (its lookup index, then its generation) and then its
+-- words. A record is @2 × handles + words@ words, so record @k@ starts at word
+-- @k × (2 × handles + words)@ of its table, which is how the shader indexes it
+-- with the instance's parameter word.
+--
 -- __Cost.__ Encoding is pure, total and linear in the number of instances. It
 -- allocates the one result buffer of the exact final size and no buffer per
 -- instance, and encoding the same layer always gives the same bytes. No
@@ -61,6 +73,7 @@ module Hetoimasia.Render.TwoD.Encoding
   ( encodeLayer
   , encodeLayerInDrawingOrder
   , encodeChunkCutouts
+  , encodeRecords
   , instanceStride
   , flagsWord
   ) where
@@ -70,13 +83,14 @@ import qualified Data.Array.Unboxed as Unboxed
 import Data.Bits (shiftL, (.|.))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
-import Data.ByteString.Builder (Builder, floatLE, word32LE, word8)
+import Data.ByteString.Builder (Builder, floatLE, toLazyByteString, word32LE, word8)
 import Data.ByteString.Builder.Extra (toLazyByteStringWith, untrimmedStrategy)
 import qualified Data.ByteString.Lazy as Lazy
 import Data.Word (Word32)
 import Hetoimasia.Math.Affine2 (toColumnMajor)
 import Hetoimasia.Render.Api.Texture.Backend (handleGeneration, handleIndex)
 import Hetoimasia.Render.TwoD.Chunk (Chunk, chunkCutoutPositions, chunkInstanceAt)
+import Hetoimasia.Render.TwoD.Material (MaterialRecord (..), RecordLayout (..))
 import Hetoimasia.Render.TwoD.DrawPlan (PlannedLayer (..))
 import Hetoimasia.Render.TwoD.Snapshot
   ( Instance (..)
@@ -157,7 +171,7 @@ encodeInstance candidate =
     <> word8 b
     <> word8 a
     <> word32LE (flagsWord candidate)
-    <> word32LE (instanceMaterial candidate)
+    <> word32LE (instanceParameter candidate)
   where
     UvRect u0 v0 u1 v1 = instanceUv candidate
     Tint r g b a = instanceTint candidate
@@ -178,3 +192,22 @@ samplerCode ∷ Sampler → Word32
 samplerCode SamplerDefault = 0
 samplerCode SamplerNearest = 1
 samplerCode SamplerLinear = 2
+
+-- | A material's records, in the order given, as the batch's storage region
+-- holds them (see "Material records" above): 'recordLayoutBytes' bytes each. A
+-- validated view's and chunk's records have exactly the handles and words the
+-- layout declares; the function is total, so one that has fewer is padded with
+-- zero words and one that has more is cut off at the layout, and a record never
+-- moves another.
+encodeRecords ∷ RecordLayout → [MaterialRecord] → ByteString
+encodeRecords (RecordLayout handles wordCount) records
+  | null records = ByteString.empty
+  | otherwise = Lazy.toStrict (toLazyByteString (foldMap encodeRecord records))
+  where
+    encodeRecord (MaterialRecord held values) =
+      foldMap handleWords (fit (fromIntegral handles) Nothing (map Just held))
+        <> foldMap word32LE (fit (fromIntegral wordCount) 0 values)
+    handleWords = \case
+      Just handle → word32LE (handleIndex handle) <> word32LE (handleGeneration handle)
+      Nothing → word32LE 0 <> word32LE 0
+    fit count filler items = take count (items <> repeat filler)

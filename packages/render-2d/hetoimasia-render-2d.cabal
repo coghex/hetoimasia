@@ -18,7 +18,12 @@ description:
     descriptions of static content, built for one kind of layer with their
     routing fixed and their bounds recorded, listed by reference in a layer,
     merged with its dynamic instances by a total order and culled by their
-    bounds. The library depends on hetoimasia-render-api,
+    bounds. An instance names the material it is drawn with by a reference that
+    carries the material's declared facts (R2D-11): whether it is
+    cutout-capable, the layout of its records and the size of its push block; a
+    view and a chunk hold the records and the push blocks, the plan splits runs
+    by material and record source, and the encoder writes the records. The
+    library depends on hetoimasia-render-api,
     hetoimasia-math and standard libraries only: no GPU, GLFW, Vulkan, runtime
     or Lua package, and no native handle appears in any value. It reads no
     file, performs no IO, owns no state and starts no thread.
@@ -51,6 +56,8 @@ library
         Hetoimasia.Render.TwoD.DrawPlan
         Hetoimasia.Render.TwoD.Encoding
         Hetoimasia.Render.TwoD.Mapping
+        Hetoimasia.Render.TwoD.Material
+        Hetoimasia.Render.TwoD.Material.Backend
         Hetoimasia.Render.TwoD.Metrics
         Hetoimasia.Render.TwoD.Settings
         Hetoimasia.Render.TwoD.Snapshot
@@ -61,11 +68,13 @@ library
     -- The finiteness and range tests validation applies, the offscreen target
     -- reference's representation, which only the two target modules import, the
     -- retained chunk's and its reference's, which the chunk modules build and
-    -- validation resolves, and the routing rule the plan and a chunk share.
+    -- validation resolves, the material reference's and the data a view holds
+    -- for a material, and the routing rule the plan and a chunk share.
     other-modules:
         Hetoimasia.Render.TwoD.Internal.Check
         Hetoimasia.Render.TwoD.Internal.Chunk
         Hetoimasia.Render.TwoD.Internal.ChunkRef
+        Hetoimasia.Render.TwoD.Internal.Material
         Hetoimasia.Render.TwoD.Internal.Routing
         Hetoimasia.Render.TwoD.Internal.Target
     build-depends:
@@ -91,6 +100,7 @@ test-suite render-2d-tests
         Test.Render.TwoD.Encoding
         Test.Render.TwoD.Flags
         Test.Render.TwoD.Mapping
+        Test.Render.TwoD.Materials
         Test.Render.TwoD.Opacity
         Test.Render.TwoD.Snapping
         Test.Render.TwoD.Spec

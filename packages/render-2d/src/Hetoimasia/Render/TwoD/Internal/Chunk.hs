@@ -8,8 +8,8 @@
 -- encoder and the oracle read a chunk through the public module's accessors.
 --
 -- __Dependencies.__ @base@, @array@, @containers@, @hetoimasia-math@,
--- @hetoimasia-render-api@ and this package's snapshot and chunk-reference
--- modules.
+-- @hetoimasia-render-api@ and this package's snapshot, material and
+-- chunk-reference modules.
 --
 -- __State.__ The module owns none.
 module Hetoimasia.Render.TwoD.Internal.Chunk
@@ -26,6 +26,7 @@ import Data.Set (Set)
 import Hetoimasia.Math.Vector (V2)
 import Hetoimasia.Render.Api.Texture (TextureHandle)
 import Hetoimasia.Render.TwoD.Internal.ChunkRef (ChunkRef)
+import Hetoimasia.Render.TwoD.Internal.Material (MaterialRecord, MaterialRef)
 import Hetoimasia.Render.TwoD.Snapshot (Instance, Layer (..), LayerDepth (..))
 
 -- | The one kind of layer a chunk is built for.
@@ -68,7 +69,12 @@ data Chunk = Chunk
   -- ^ The build positions of the instances routed to the ordered path, by
   -- ascending depth key and then build position.
   , chunkTextureSet ∷ !(Set TextureHandle)
-  -- ^ Every texture any instance names.
+  -- ^ Every texture any instance names, and every handle any record holds.
+  , chunkRecordTables ∷ !(Map MaterialRef [MaterialRecord])
+  -- ^ The chunk's own records for each application material (R2D-11, D-31),
+  -- which its instances' parameter words index.
+  , chunkMaterialSet ∷ !(Set MaterialRef)
+  -- ^ Every material any instance names.
   , chunkMagnitudeField ∷ !Double
   -- ^ The largest magnitude any term of placing an instance reaches:
   -- @max (|a| + |c| + |tx|) (|b| + |d| + |ty|)@ over the instances (the unit

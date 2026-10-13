@@ -2,8 +2,9 @@
 -- snapshot and a validated layer cannot be built or rewritten from outside the
 -- validation module, an offscreen target reference cannot be built or taken
 -- apart through its public module, a retained chunk's reference and a built chunk
--- cannot be forged either, and the backend-facing target and chunk-reference
--- modules and the documented validate-then-encode route do work.
+-- cannot be forged either, a material reference cannot be built or rewritten
+-- from the public module (R2D-11), and the backend-facing target, chunk-reference
+-- and material modules and the documented validate-then-encode route do work.
 --
 -- Each compiles a separate single-module client with the harness from
 -- "Test.Support.ExternalClient", exposing @base@, @hetoimasia-math@,
@@ -32,7 +33,16 @@ spec = describe "Validated value and target opacity across the package boundary"
   rejected "a client that builds a chunk reference through the public module" chunkRefBuilder "GHC-61689" "chunkRef"
   rejected "a client that names the built chunk's constructor" chunkConstructor "GHC-10237" "Chunk"
   rejected "a client that rewrites a built chunk by record update" chunkRecordUpdate "GHC-22385" "chunkKind"
+  rejected "a client that names the material reference's constructor" materialConstructor "GHC-10237" "MaterialRef"
+  rejected "a client that reads the material reference's identity through the public module" materialIdentityReader "GHC-61689" "materialRefIdentity"
+  rejected "a client that rewrites a fact of a material reference by record update" materialRecordUpdate "GHC-22385" "materialRefFacts"
+  rejected "a client that builds a material reference through the public module" materialBuilder "GHC-61689" "materialRef"
   accepted "a client that validates a candidate and encodes its layers" validateAndEncode
+  accepted "a client that reads a material reference's facts and names the default material" readMaterial
+  acceptedWith
+    ["base", "bytestring", "containers", "hetoimasia-math", "hetoimasia-render-api", "hetoimasia-render-2d"]
+    "a client that builds a material reference through the backend-facing module, names it in an instance and validates the snapshot"
+    backendMaterial
   accepted "a client that builds a view mapping and converts a cursor position" buildMapping
   accepted "a client that builds and reads a target reference through the backend-facing module" backendTarget
   accepted "a client that builds and reads a chunk reference through the backend-facing module" backendChunkRef
@@ -53,9 +63,13 @@ rejected name source code mention =
       clientOutput outcome `shouldContain` mention
 
 accepted ∷ String → String → Spec
-accepted name source =
+accepted = acceptedWith ["base", "hetoimasia-math", "hetoimasia-render-api", "hetoimasia-render-2d"]
+
+-- | An accepted client that may name more packages than the usual four.
+acceptedWith ∷ [String] → String → String → Spec
+acceptedWith packages name source =
   it ("accepts " <> name) $
-    withClient source $ \compile → do
+    withPackageClient packages "Client.hs" source $ \compile → do
       outcome ← compile Typecheck
       case clientStatus outcome of
         ExitSuccess → pure ()
@@ -148,6 +162,7 @@ validateAndEncode =
     , "import Hetoimasia.Math.Vector (V2 (..))"
     , "import Hetoimasia.Render.Api.Texture (TextureHandle)"
     , "import Hetoimasia.Render.TwoD.Encoding (encodeLayer)"
+    , "import Hetoimasia.Render.TwoD.Material (defaultMaterial)"
     , "import Hetoimasia.Render.TwoD.Settings (defaultViewSettings)"
     , "import Hetoimasia.Render.TwoD.Snapshot"
     , "import Hetoimasia.Render.TwoD.Validation (validLayers, validateSnapshot)"
@@ -159,7 +174,7 @@ validateAndEncode =
     , "  where"
     , "    snapshot = Snapshot [Pass WindowTarget (ClearColour 0 0 0 1) [view]]"
     , "    view = View (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 640 480)) defaultViewSettings [layer]"
-    , "    layer = UiLayer [Instance identity (UvRect 0 0 1 1) texture 0 (Tint 255 255 255 255) SamplerDefault False False 0 0]"
+    , "    layer = UiLayer [Instance identity (UvRect 0 0 1 1) texture 0 (Tint 255 255 255 255) SamplerDefault False False 0 0 defaultMaterial]"
     ]
 
 backendTarget ∷ String
@@ -263,6 +278,7 @@ buildAndList =
     , "import Hetoimasia.Render.TwoD.Chunk"
     , "import Hetoimasia.Render.TwoD.Chunk.Backend (chunkRef)"
     , "import Hetoimasia.Render.TwoD.DrawPlan (noCutoutMarks)"
+    , "import Hetoimasia.Render.TwoD.Material (defaultMaterial)"
     , "import Hetoimasia.Render.TwoD.Settings (defaultViewSettings)"
     , "import Hetoimasia.Render.TwoD.Snapshot"
     , "import Hetoimasia.Render.TwoD.Validation (validateSnapshotWith)"
@@ -273,7 +289,7 @@ buildAndList =
     , "  Right built → either (const False) (const True) (validateSnapshotWith (chunksFrom [(reference, built)]) snapshot)"
     , "  where"
     , "    reference = chunkRef 1 1"
-    , "    candidate = Instance identity (UvRect 0 0 1 1) texture 0 (Tint 255 255 255 255) SamplerDefault False False 0 0"
+    , "    candidate = Instance identity (UvRect 0 0 1 1) texture 0 (Tint 255 255 255 255) SamplerDefault False False 0 0 defaultMaterial"
     , "    snapshot = Snapshot [Pass WindowTarget (ClearColour 0 0 0 1) [view]]"
     , "    view = View (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 640 480)) defaultViewSettings [UiLayerWith [reference] []]"
     ]
@@ -307,4 +323,96 @@ buildMapping =
     , "  where"
     , "    metrics = TargetMetrics (PixelExtent 640 480) (PixelExtent 1280 960) 2 2"
     , "    view = View (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 1280 960)) defaultViewSettings []"
+    ]
+
+materialConstructor ∷ String
+materialConstructor =
+  unlines
+    [ "module Client (forged) where"
+    , ""
+    , "import Hetoimasia.Render.TwoD.Material (MaterialFacts (..), MaterialRef (MaterialRef), RecordLayout (..))"
+    , ""
+    , "forged ∷ MaterialRef"
+    , "forged = MaterialRef 1 (MaterialFacts True (RecordLayout 0 0) 0)"
+    ]
+
+materialIdentityReader ∷ String
+materialIdentityReader =
+  unlines
+    [ "module Client (identity) where"
+    , ""
+    , "import Data.Word (Word64)"
+    , "import Hetoimasia.Render.TwoD.Material (MaterialRef, materialRefIdentity)"
+    , ""
+    , "identity ∷ MaterialRef → Word64"
+    , "identity = materialRefIdentity"
+    ]
+
+materialRecordUpdate ∷ String
+materialRecordUpdate =
+  unlines
+    [ "module Client (rewritten) where"
+    , ""
+    , "import Hetoimasia.Render.TwoD.Material (MaterialFacts, MaterialRef)"
+    , ""
+    , "rewritten ∷ MaterialRef → MaterialFacts → MaterialRef"
+    , "rewritten reference facts = reference {materialRefFacts = facts}"
+    ]
+
+materialBuilder ∷ String
+materialBuilder =
+  unlines
+    [ "module Client (made) where"
+    , ""
+    , "import Hetoimasia.Render.TwoD.Material (MaterialFacts (..), MaterialRef, RecordLayout (..), materialRef)"
+    , ""
+    , "made ∷ MaterialRef"
+    , "made = materialRef 1 (MaterialFacts True (RecordLayout 0 0) 0)"
+    ]
+
+-- | What game code does with a reference: compare it, show it and read its facts.
+readMaterial ∷ String
+readMaterial =
+  unlines
+    [ "module Client (summary) where"
+    , ""
+    , "import Hetoimasia.Render.TwoD.Material"
+    , ""
+    , "summary ∷ MaterialRef → (Bool, RecordLayout, Word, Bool, String)"
+    , "summary reference ="
+    , "  ( materialCutoutCapable reference"
+    , "  , materialRecordLayout reference"
+    , "  , fromIntegral (materialPushBytes reference)"
+    , "  , reference == defaultMaterial"
+    , "  , show (materialFacts reference)"
+    , "  )"
+    ]
+
+-- | What a backend, or a test standing in for one, does: build a reference with
+-- its facts, name it in an instance and validate a snapshot holding that
+-- instance, with the records and the push block its view holds for it.
+backendMaterial ∷ String
+backendMaterial =
+  unlines
+    [ "module Client (frame) where"
+    , ""
+    , "import qualified Data.ByteString as ByteString"
+    , "import qualified Data.Map.Strict as Map"
+    , "import Hetoimasia.Math.Affine2 (identity)"
+    , "import Hetoimasia.Math.Vector (V2 (..))"
+    , "import Hetoimasia.Render.Api.Texture (TextureHandle)"
+    , "import Hetoimasia.Render.TwoD.Material"
+    , "import Hetoimasia.Render.TwoD.Material.Backend (materialRef)"
+    , "import Hetoimasia.Render.TwoD.Settings (defaultViewSettings)"
+    , "import Hetoimasia.Render.TwoD.Snapshot"
+    , "import Hetoimasia.Render.TwoD.Validation (validateSnapshot)"
+    , ""
+    , "frame ∷ TextureHandle → Bool"
+    , "frame texture = either (const False) (const True) (validateSnapshot snapshot)"
+    , "  where"
+    , "    material = materialRef 1 (MaterialFacts False (RecordLayout 1 0) 4)"
+    , "    held = Map.fromList [(material, MaterialData [MaterialRecord [texture] []] (ByteString.pack [0, 0, 0, 0]))]"
+    , "    snapshot = Snapshot [Pass WindowTarget (ClearColour 0 0 0 1) [view]]"
+    , "    view = ViewWith (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 640 480)) defaultViewSettings held [layer]"
+    , "    layer = UiLayer [Instance identity (UvRect 0 0 1 1) texture 0 (Tint 255 255 255 255) SamplerDefault False False 0 0 material]"
     ]

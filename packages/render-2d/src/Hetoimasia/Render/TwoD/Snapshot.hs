@@ -1,4 +1,5 @@
 {-# LANGUAGE PatternSynonyms #-}
+{-# LANGUAGE ViewPatterns #-}
 
 -- | A window's frame as a plain value: the candidate snapshot game code builds.
 --
@@ -6,7 +7,9 @@
 -- and its ordered views; a view is a camera, a viewport within the target, its
 -- per-view settings and its ordered layers; a layer declares its space, lists
 -- the retained chunks it draws (R2D-10) and holds its dynamic instances in
--- submission order. The window's pass comes last. Nothing
+-- submission order. The window's pass comes last. A view also holds, for each
+-- application material (R2D-11) its instances use, the material's records and
+-- the bytes of its push block. Nothing
 -- here is a native handle, and nothing is checked on construction: the
 -- constructors are public because a candidate is only data, and
 -- "Hetoimasia.Render.TwoD.Validation" is what turns one into a value the
@@ -17,9 +20,10 @@
 -- World positions are 32-bit floats in game units. A depth key is an unsigned
 -- integer below 'depthKeyLimit', and a larger key is nearer.
 --
--- __Dependencies.__ @base@, @hetoimasia-math@ for the camera's position and the
--- instance's transform, @hetoimasia-render-api@ for the texture handle, and
--- this package's settings, target and chunk-reference modules.
+-- __Dependencies.__ @base@, @containers@ for a view's materials,
+-- @hetoimasia-math@ for the camera's position and the instance's transform,
+-- @hetoimasia-render-api@ for the texture handle, and this package's material,
+-- settings, target and chunk-reference modules.
 --
 -- __State.__ The module owns none.
 module Hetoimasia.Render.TwoD.Snapshot
@@ -30,7 +34,7 @@ module Hetoimasia.Render.TwoD.Snapshot
   , ClearColour (..)
 
     -- * Views
-  , View (..)
+  , View (ViewWith, View, viewCamera, viewViewport, viewSettings, viewMaterials, viewLayers)
   , Viewport (..)
   , Camera (..)
 
@@ -48,11 +52,14 @@ module Hetoimasia.Render.TwoD.Snapshot
   , depthKeyLimit
   ) where
 
+import Data.Map.Strict (Map)
+import qualified Data.Map.Strict as Map
 import Data.Word (Word16, Word32, Word8)
 import Hetoimasia.Math.Affine2 (Affine2)
 import Hetoimasia.Math.Vector (V2)
 import Hetoimasia.Render.Api.Texture (TextureHandle)
 import Hetoimasia.Render.TwoD.Internal.ChunkRef (ChunkRef)
+import Hetoimasia.Render.TwoD.Internal.Material (MaterialData, MaterialRef)
 import Hetoimasia.Render.TwoD.Settings (ViewSettings)
 import Hetoimasia.Render.TwoD.Target (TargetRef)
 
@@ -83,14 +90,29 @@ data Target
 data ClearColour = ClearColour !Float !Float !Float !Float
   deriving stock (Eq, Show)
 
--- | A camera, the part of the target it draws to, its settings and its layers.
-data View = View
+-- | A camera, the part of the target it draws to, its settings, the data it
+-- holds for the application materials its instances use, and its layers.
+--
+-- 'viewMaterials' holds, for each application material (R2D-11), its records,
+-- which the parameter words of the view's instances index, and the bytes of its
+-- push block. A material the view holds nothing for has no record and an empty
+-- push block, which is all the built-in default needs. 'View' is the view that
+-- holds no material data: as a constructor it builds one, and as a pattern it
+-- matches one.
+data View = ViewWith
   { viewCamera ∷ !Camera
   , viewViewport ∷ !Viewport
   , viewSettings ∷ !ViewSettings
+  , viewMaterials ∷ !(Map MaterialRef MaterialData)
   , viewLayers ∷ [Layer]
   }
   deriving stock (Eq, Show)
+
+-- | A view holding no data for any material.
+pattern View ∷ Camera → Viewport → ViewSettings → [Layer] → View
+pattern View camera viewport settings layers ← ViewWith camera viewport settings (Map.null → True) layers
+  where
+    View camera viewport settings layers = ViewWith camera viewport settings Map.empty layers
 
 -- | A rectangle within the target: its upper-left corner and its extent, both
 -- finite and the extent not negative. A zero extent is accepted and draws
@@ -175,8 +197,16 @@ data Instance = Instance
   , instanceClip ∷ !Word16
   -- ^ A clip index, 0 meaning none. A non-zero index is refused until clip
   -- tables exist.
-  , instanceMaterial ∷ !Word32
-  -- ^ The material parameter word.
+  , instanceParameter ∷ !Word32
+  -- ^ The material parameter word, encoded at byte offset 60. It indexes the
+  -- records the view (or the chunk) holds for the instance's material, and
+  -- reaches the material itself as a value. The built-in default material
+  -- ignores it.
+  , instanceMaterial ∷ !MaterialRef
+  -- ^ The material the instance is drawn with: the built-in default
+  -- ('Hetoimasia.Render.TwoD.Material.defaultMaterial') unless an application
+  -- material is named. The planner reads it, and it is not encoded: the 64-byte
+  -- layout is unchanged.
   }
   deriving stock (Eq, Show)
 

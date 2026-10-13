@@ -15,7 +15,7 @@
 -- * it is in a world layer whose depth is enabled (a layer without depth, and
 --   every UI layer, draws wholly in the ordered path);
 -- * its texture is marked cutout-safe;
--- * its material is cutout-capable;
+-- * its material is cutout-capable (the 'MaterialRef' it names says so);
 -- * its tint alpha is 255;
 -- * its translucent flag and its additive flag are both clear.
 --
@@ -61,13 +61,26 @@
 -- it, and is named in 'plannedCulled'. 'planSnapshot' culls nothing.
 --
 -- __Runs.__ Consecutive instances in the drawing order share a run when they
--- share a path and a material. A sampler, tint, flag other than the routing
--- ones, depth key, transform, UV rectangle or material parameter word never
--- splits a run, because each travels in the instance. Until application
--- materials exist every instance uses the built-in 'DefaultMaterial', which is
--- cutout-capable, so a layer holds at most two runs: its cutout run and its
--- ordered run. A view with a zero-size viewport and a layer with no instances
--- hold no runs.
+-- share a path, a material and, where the material has records, a record source
+-- ('RecordSource'). A sampler, tint, flag other than the routing ones, depth
+-- key, transform, UV rectangle or material parameter word never splits a run,
+-- because each travels in the instance. An instance's material is the
+-- 'MaterialRef' it names ('instanceMaterial'), so the cutout runs split and are
+-- ordered by material, and routing reads the reference's cutout capability
+-- (D-25). The built-in default material is cutout-capable and has no records, so
+-- a layer that uses nothing else holds at most two runs: its cutout run and its
+-- ordered run (and the cutout runs of its chunks). A view with a zero-size
+-- viewport and a layer with no instances hold no runs.
+--
+-- __Record sources__ (R2D-11, D-31). A material's records are written by the
+-- recorder in separate tables: the view's, which the layer's dynamic instances'
+-- parameter words index, and one for each chunk listing, which that chunk's
+-- instances' words index, and a run pushes the base of the table it reads. A run
+-- therefore never mixes two sources: where a material has records, instances of
+-- the view and of two different chunk listings split into runs even when path
+-- and material match, and the drawing order is the one that was established
+-- without the split. A material whose layout is empty has no table and its runs
+-- do not split.
 --
 -- __Marks.__ A texture's cutout mark is an input, not something this module
 -- computes or stores: the caller says which complete handles, generation
@@ -109,9 +122,8 @@ module Hetoimasia.Render.TwoD.DrawPlan
   , DrawRun (..)
   , DrawPath (..)
   , RunSource (..)
+  , RecordSource (..)
   , InstanceSource (..)
-  , Material (..)
-  , materialCutoutCapable
   , drawingOrder
   , drawingSources
   , runIndices
@@ -124,13 +136,11 @@ import qualified Data.Map.Strict as Map
 import Hetoimasia.Math.Vector (V2 (..))
 import Hetoimasia.Render.TwoD.Internal.Chunk (Bounds, Chunk (..), ChunkKind, layerChunkKind)
 import Hetoimasia.Render.TwoD.Internal.ChunkRef (ChunkRef)
+import Hetoimasia.Render.TwoD.Internal.Material (MaterialFacts (..), MaterialRef (..), recordLayoutIsEmpty)
 import Hetoimasia.Render.TwoD.Internal.Routing
   ( CutoutMarks
-  , Material (..)
   , cutoutMarks
-  , instanceMaterialOf
   , isMarkedCutout
-  , materialCutoutCapable
   , noCutoutMarks
   , routesToCutout
   )
@@ -175,6 +185,19 @@ data RunSource
     -- for the run's range: the position of the listing in the layer's chunk
     -- list.
     ChunkRun !Int
+  deriving stock (Eq, Ord, Show)
+
+-- | Where the records a run's instances index are read from.
+data RecordSource
+  = -- | The run's material has no records: its layout is empty, as the built-in
+    -- default's is.
+    NoRecords
+  | -- | The records the view holds for the material, which the layer's dynamic
+    -- instances index.
+    ViewRecords
+  | -- | The records the chunk listed at this position of the layer's chunk list
+    -- holds for the material, which that chunk's instances index.
+    ChunkRecords !Int
   deriving stock (Eq, Ord, Show)
 
 -- | Where an instance of a layer's drawing order comes from.
@@ -258,7 +281,7 @@ data PlannedLayer = PlannedLayer
 -- | A contiguous range of instances sharing a path and a material.
 data DrawRun = DrawRun
   { runPath ∷ !DrawPath
-  , runMaterial ∷ !Material
+  , runMaterial ∷ !MaterialRef
   , runStart ∷ !Int
   -- ^ The position in 'plannedOrder' of the run's first instance for a
   -- 'RingRun'; for a 'ChunkRun', the position in the chunk's cutout order
@@ -266,6 +289,9 @@ data DrawRun = DrawRun
   , runCount ∷ !Int
   -- ^ The number of instances; always at least one.
   , runSource ∷ !RunSource
+  , runRecords ∷ !RecordSource
+  -- ^ Where the records the run's instances index are read from; 'NoRecords'
+  -- for a material that has none.
   }
   deriving stock (Eq, Show)
 
@@ -367,8 +393,8 @@ emptyViewport ∷ Viewport → Bool
 emptyViewport (Viewport _ (V2 width height)) = width == 0 || height == 0
 
 -- | The ring's entries of a layer — each as its origin (@-1@ dynamic, else the
--- chunk listing's position), its index there and the path and material it
--- draws in — and the layer's runs.
+-- chunk listing's position), its index there and the path, material and record
+-- source it draws with — and the layer's runs.
 --
 -- The cutouts come first: by material, and within a material each chunk
 -- listing's cutouts as a run of the chunk's own buffer in listing order, then
@@ -376,41 +402,61 @@ emptyViewport (Viewport _ (V2 width height)) = width == 0 || height == 0
 -- instances follow, the chunks' and the dynamic ones merged by ascending depth
 -- key and then source order, which is a listing's position (a chunk's before
 -- any dynamic instance) and then the index.
-arrange ∷ CutoutMarks → Bool → [(Int, Chunk)] → [Instance] → ([(Int, Int, (DrawPath, Material))], [DrawRun])
+arrange ∷ CutoutMarks → Bool → [(Int, Chunk)] → [Instance] → ([(Int, Int, RunKey)], [DrawRun])
 arrange marks depthEnabled live instances = (ringEntries, cutoutRuns <> orderedRuns)
   where
     (dynamicCutouts, dynamicOrdered) = partition (routesToCutout marks depthEnabled . snd) (zip [0 ..] instances)
-    sortedCutouts = sortOn (\(index, candidate) → (instanceMaterialOf candidate, index)) dynamicCutouts
-    ringCutouts = [(-1, index, (Cutout, instanceMaterialOf candidate)) | (index, candidate) ← sortedCutouts]
+    sortedCutouts = sortOn (\(index, candidate) → (instanceMaterial candidate, index)) dynamicCutouts
+    ringCutouts = [(-1, index, runKey Cutout (instanceMaterial candidate) (-1)) | (index, candidate) ← sortedCutouts]
     chunkOrdered =
-      [ (key, position, index, instanceMaterialOf candidate)
+      [ (key, position, index, instanceMaterial candidate)
       | (position, held) ← live
       , index ← chunkOrderedOrder held
       , let candidate = chunkInstanceArray held `at` index
       , let key = instanceDepthKey candidate
       ]
-    dynamicOrderedKeyed = [(instanceDepthKey candidate, maxBound, index, instanceMaterialOf candidate) | (index, candidate) ← dynamicOrdered]
+    dynamicOrderedKeyed = [(instanceDepthKey candidate, maxBound, index, instanceMaterial candidate) | (index, candidate) ← dynamicOrdered]
     mergedOrdered = sortOn (\(key, position, index, _) → (key, position, index)) (chunkOrdered <> dynamicOrderedKeyed)
-    ringOrdered = [(if position == maxBound then -1 else position, index, (Ordered, material)) | (_, position, index, material) ← mergedOrdered]
+    ringOrdered =
+      [ (origin, index, runKey Ordered material origin)
+      | (_, position, index, material) ← mergedOrdered
+      , let origin = if position == maxBound then -1 else position
+      ]
     ringEntries = ringCutouts <> ringOrdered
-    ringCutoutRuns = [run {runSource = RingRun} | run ← runsOf 0 [path | (_, _, path) ← ringCutouts]]
+    ringCutoutRuns = [run {runSource = RingRun} | run ← runsOf 0 [key | (_, _, key) ← ringCutouts]]
     chunkCutoutRuns =
-      [ DrawRun Cutout material start count (ChunkRun position)
+      [ DrawRun Cutout material start count (ChunkRun position) (recordsFor material (ChunkRecords position))
       | (position, held) ← live
-      , (start, count, material) ← materialGroups [instanceMaterialOf (chunkInstanceArray held `at` index) | index ← chunkCutoutOrder held]
+      , (start, count, material) ← materialGroups [instanceMaterial (chunkInstanceArray held `at` index) | index ← chunkCutoutOrder held]
       ]
     -- By material, and within one by source order: a chunk's listings in order,
     -- then the ring's.
     cutoutRuns = sortOn (\run → (runMaterial run, sourceRank (runSource run))) (chunkCutoutRuns <> ringCutoutRuns)
-    orderedRuns = runsOf (length ringCutouts) [path | (_, _, path) ← ringOrdered]
+    orderedRuns = runsOf (length ringCutouts) [key | (_, _, key) ← ringOrdered]
     sourceRank = \case
       ChunkRun position → position
       RingRun → maxBound
     at array index = array Array.! index
 
+-- | What a run's instances share: the path, the material and where the records
+-- they index are read from.
+type RunKey = (DrawPath, MaterialRef, RecordSource)
+
+-- | The key of an entry whose instance comes from this origin (@-1@ the layer's
+-- dynamic instances, otherwise a chunk listing's position).
+runKey ∷ DrawPath → MaterialRef → Int → RunKey
+runKey path material origin = (path, material, recordsFor material (if origin < 0 then ViewRecords else ChunkRecords origin))
+
+-- | The record source a run of this material reads, which is none where the
+-- material's layout is empty, so nothing splits a run of such a material.
+recordsFor ∷ MaterialRef → RecordSource → RecordSource
+recordsFor material source
+  | recordLayoutIsEmpty (factRecordLayout (materialRefFacts material)) = NoRecords
+  | otherwise = source
+
 -- | The maximal ranges of consecutive equal materials, as start, count and
 -- material.
-materialGroups ∷ [Material] → [(Int, Int, Material)]
+materialGroups ∷ [MaterialRef] → [(Int, Int, MaterialRef)]
 materialGroups = go 0
   where
     go _ [] = []
@@ -419,14 +465,14 @@ materialGroups = go 0
           count = 1 + length same
        in (start, count, first) : go (start + count) others
 
--- | Group consecutive entries sharing a path and a material into ring runs,
--- the first starting at this position of the drawing order.
-runsOf ∷ Int → [(DrawPath, Material)] → [DrawRun]
+-- | Group consecutive entries sharing a path, a material and a record source
+-- into ring runs, the first starting at this position of the drawing order.
+runsOf ∷ Int → [RunKey] → [DrawRun]
 runsOf = go
   where
     go _ [] = []
     go start (first : rest) =
       let (same, others) = span (== first) rest
           count = 1 + length same
-          (path, material) = first
-       in DrawRun path material start count RingRun : go (start + count) others
+          (path, material, records) = first
+       in DrawRun path material start count RingRun records : go (start + count) others
