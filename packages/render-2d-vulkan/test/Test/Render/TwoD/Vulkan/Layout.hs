@@ -397,9 +397,16 @@ clipTableSpec = describe "the clip table" $ do
     clipRepresentable (scaled 8.0e37) (32, 32) `shouldBe` False
 
   it "counts both of an axis's products, so a turn that splits the reach is checked too" $ do
-    -- 1e37 · 16 + 1e37 · 16 = 3.2e38 on x, past the limit, though each product alone is not.
-    clipRepresentable (fromColumns (V2 1.0e37 1.0e37) (V2 1.0e37 1.0e37) (V2 0 0)) (32, 32) `shouldBe` False
-    clipRepresentable (fromColumns (V2 5.0e36 5.0e36) (V2 5.0e36 5.0e36) (V2 0 0)) (32, 32) `shouldBe` True
+    -- 1e37 · 16 + 1e37 · 16 = 3.2e38 on one axis, past the limit, though each product alone is not
+    -- (the first transform's columns are (a, b) = (1e37, 0) and (c, d) = (1e37, 0): all its reach is on x).
+    clipRepresentable (fromColumns (V2 1.0e37 0) (V2 1.0e37 0) (V2 0 0)) (32, 32) `shouldBe` False
+    clipRepresentable (fromColumns (V2 0 1.0e37) (V2 0 1.0e37) (V2 0 0)) (32, 32) `shouldBe` False
+    clipRepresentable (fromColumns (V2 5.0e36 0) (V2 5.0e36 0) (V2 0 0)) (32, 32) `shouldBe` True
+    clipRepresentable (fromColumns (V2 0 5.0e36) (V2 0 5.0e36) (V2 0 0)) (32, 32) `shouldBe` True
+    -- A tall scissor weighs the second column more: 1e37 · 16 on the first, 1e37 · 160 on the second.
+    clipRepresentable (fromColumns (V2 1.0e37 0) (V2 1.0e37 0) (V2 0 0)) (32, 320) `shouldBe` False
+    clipRepresentable (fromColumns (V2 1.0e37 0) (V2 0 1.0e37) (V2 0 0)) (32, 320) `shouldBe` False
+    clipRepresentable (fromColumns (V2 1.0e37 0) (V2 0 1.0e37) (V2 0 0)) (32, 32) `shouldBe` True
 
 -- ---------------------------------------------------------------------------
 -- The shaders' interfaces
