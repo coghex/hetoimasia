@@ -5,26 +5,32 @@ validation that refuses a bad one, the application-wide discrete-step-zoom
 list, the pure draw plan that routes, orders and splits a validated frame's
 instances into draw runs, the pure mapping of a view between window,
 framebuffer, UI and world space, and the 64-byte instance encoding a backend
-uploads, in submission order or in a planned layer's drawing order. Everything
+uploads, in submission order or in a planned layer's drawing order, and
+**retained chunks** (R2D-10): static content built once, listed by reference in
+the layers of later snapshots, merged with their dynamic content by a total
+order and culled by their bounds. Everything
 that records commands is [`hetoimasia-render-2d-vulkan`](../render-2d-vulkan/README.md)'s.
 The decision record is
 [the 2D renderer design](../../docs/designs/render_2d_design.md) (D-1 to D-4,
-D-7 to D-10, D-12, D-16 to D-19, D-22 to D-25, D-27, D-29; R2D-1 to R2D-3); the package's place among the
+D-7 to D-10, D-12, D-16 to D-19, D-22 to D-25, D-27, D-29, D-31; R2D-1 to R2D-3, R2D-10); the package's place among the
 others is [the foundation design](../../docs/engine_foundation_design.md).
 
 | Module | Contents |
 | --- | --- |
-| `Hetoimasia.Render.TwoD.Snapshot` | `Snapshot`, `Pass`, `Target` (`WindowTarget`, `OffscreenTarget`), `ClearColour`, `View` (with its `viewClips` table), `Viewport`, `Camera`, `Layer` (`WorldLayer`, `UiLayer`), `LayerDepth`, `Instance`, `UvRect`, `Tint`, `Sampler`; `layerInstances`, `depthKeyLimit` |
+| `Hetoimasia.Render.TwoD.Snapshot` | `Snapshot`, `Pass`, `Target` (`WindowTarget`, `OffscreenTarget`), `ClearColour`, `View` (with its `viewClips` table), `Viewport`, `Camera`, `Layer` (the constructors `WorldLayerWith` and `UiLayerWith`, which list chunks, and the patterns `WorldLayer` and `UiLayer`, the layer that lists none), `LayerDepth`, `Instance`, `UvRect`, `Tint`, `Sampler`; `layerInstances`, `layerChunks`, `depthKeyLimit` |
 | `Hetoimasia.Render.TwoD.Clip` | `ClipRect`, `ClipEntry` (a view's clip table is a list of them); `ResolvedClip`, `emptyClip`, `clipIsEmpty`, `clipContains` and `resolveClips`, the pure resolver; `clipEntryOfIndex` |
+| `Hetoimasia.Render.TwoD.Chunk` | `ChunkRef`, the opaque chunk reference (`Eq`, `Ord`, `Show` only); `ChunkKind` (`ChunkWorldDepth`, `ChunkWorldFlat`, `ChunkUi`), `layerChunkKind`; `Bounds`, `BoundsRequest` (`DeriveBounds`, `SuppliedBounds`); `Chunk`, `buildChunk`, `ChunkRefusal`; `chunkKind`, `chunkBounds`, `chunkSize`, `chunkInstances`, `chunkInstanceAt`, `chunkCutoutPositions`, `chunkOrderedPositions`, `chunkTextures`; `Chunks`, `noChunks`, `chunksFrom`, `lookupChunk`, `chunkRefsOf` |
+| `Hetoimasia.Render.TwoD.Chunk.Backend` | `chunkRef ∷ Word32 → Word32 → ChunkRef`; `chunkRefIndex`, `chunkRefGeneration` (backends, and tests standing in for one) |
+| `Hetoimasia.Render.TwoD.Culling` | `chunkCulled`: whether a view skips a chunk of a kind and bounds, conservatively |
 | `Hetoimasia.Render.TwoD.Settings` | `ViewSettings` and `defaultViewSettings`, `TextureFilter`, `ZoomMode`; `uiScaleRange`, `brightnessRange` |
 | `Hetoimasia.Render.TwoD.Target` | `TargetRef`, the opaque offscreen target reference: `Eq`, `Ord` and `Show` only |
 | `Hetoimasia.Render.TwoD.Target.Backend` | `targetRef ∷ Word32 → Word32 → TargetRef`; `targetRefIndex`, `targetRefGeneration` (backends, and tests standing in for one) |
-| `Hetoimasia.Render.TwoD.Validation` | `validateSnapshot`; `Refusal`, `Location`, `Reason`; `ValidSnapshot` with `validSnapshot` and `validLayers`; `ValidLayer` with `validLayerLocation` and `validLayerContents` |
+| `Hetoimasia.Render.TwoD.Validation` | `validateSnapshot`, `validateSnapshotWith`; `Refusal`, `Location`, `Reason`, `instanceReasons`; `ValidSnapshot` with `validSnapshot`, `validLayers` and `validChunkRefs`; `ValidLayer` with `validLayerLocation`, `validLayerContents` and `validLayerChunks` |
 | `Hetoimasia.Render.TwoD.ZoomSteps` | `ZoomSteps`, `zoomLevels`, `defaultZoomSteps`, `validateZoomSteps`; `stepZoomIn`, `stepZoomOut`; `ZoomRefusal`, `ZoomLocation`, `ZoomReason` |
 | `Hetoimasia.Render.TwoD.Metrics` | `TargetMetrics` (logical extent, framebuffer extent, per-axis content scale), `PixelExtent`; `offscreenMetrics`, `validMetrics` |
 | `Hetoimasia.Render.TwoD.Mapping` | `viewMapping ∷ TargetMetrics → View → Maybe ViewMapping`; the transforms `worldTransform`, `worldInverse`, `uiTransform`, `uiInverse`; the point conversions `worldToTarget`, `targetToWorld`, `uiToTarget`, `targetToUi`, `windowToTarget`, `targetToWindow`, `windowToWorld`, `worldToWindow`, `windowToUi`, `uiToWindow`; `viewportIsEmpty`, `viewportContains`; `snapPixel`, `snapPoint`; `mappingPixelSnap` |
-| `Hetoimasia.Render.TwoD.DrawPlan` | `planSnapshot ∷ CutoutMarks → ValidSnapshot → DrawPlan`; `CutoutMarks` with `cutoutMarks`, `noCutoutMarks`, `isMarkedCutout`; `DrawPlan`, `PlannedPass`, `PlannedView`, `PlannedLayer`, `LayerSpace`, `DrawRun`, `DrawPath` (`Cutout`, `Ordered`), `Material` (`DefaultMaterial`) with `materialCutoutCapable`; `drawingOrder`, `runIndices` |
-| `Hetoimasia.Render.TwoD.Encoding` | `encodeLayer ∷ ValidLayer → ByteString`; `encodeLayerInDrawingOrder ∷ PlannedLayer → ValidLayer → Maybe ByteString`; `instanceStride`, `flagsWord` |
+| `Hetoimasia.Render.TwoD.DrawPlan` | `planSnapshot ∷ CutoutMarks → ValidSnapshot → DrawPlan`, `planSnapshotCulled` with a `ChunkCuller` (`noCulling` skips none); `CutoutMarks` with `cutoutMarks`, `noCutoutMarks`, `isMarkedCutout`; `DrawPlan`, `PlannedPass`, `PlannedView`, `PlannedLayer`, `LayerSpace`, `DrawRun`, `DrawPath` (`Cutout`, `Ordered`), `RunSource` (`RingRun`, `ChunkRun`), `InstanceSource`, `Material` (`DefaultMaterial`) with `materialCutoutCapable`; `drawingOrder`, `drawingSources`, `runIndices` |
+| `Hetoimasia.Render.TwoD.Encoding` | `encodeLayer ∷ ValidLayer → ByteString`; `encodeLayerInDrawingOrder ∷ PlannedLayer → ValidLayer → Maybe ByteString`; `encodeChunkCutouts ∷ Chunk → ByteString`; `instanceStride`, `flagsWord` |
 
 There is no collecting module and no prelude: import the module that owns what
 you use.
@@ -50,8 +56,9 @@ views; the window's pass comes last, and there is at most one. A view is a
 camera, a viewport rectangle within the target, its per-view settings, its
 ordered clip table and its ordered layers. A layer is a world layer (game units through the camera, with
 depth enabled or not) or a UI layer (logical pixels from the upper left), each
-holding its instances in submission order. Y points down everywhere: world, UI,
-texture coordinates and clip space.
+listing the retained chunks it draws (below) and holding its dynamic instances
+in submission order. Y points down everywhere: world, UI, texture coordinates
+and clip space.
 
 - **Camera:** a position, a zoom and an optional rotation in radians. The
   position and rotation must be finite and the zoom finite and positive. A
@@ -76,7 +83,9 @@ texture coordinates and clip space.
 
 `validateSnapshot` turns a candidate into a `ValidSnapshot` or refuses it with
 **every** reason found, each naming where: the pass, view, layer and instance
-index (`AtPass`, `AtView`, `AtClipEntry`, `AtLayer`, `AtInstance`). Nothing is clamped,
+index (`AtPass`, `AtView`, `AtClipEntry`, `AtLayer`, `AtInstance`; and `AtChunk`, which names the layer, the
+chunk's position in the layer's list and the reference listed there, and `AtChunkInstance`, which names an instance of a
+chunk, used by the oracle). Nothing is clamped,
 wrapped or corrected, and a valid snapshot holds exactly the candidate's
 values in the candidate's order (`validSnapshot`). Validation is total and
 deterministic, and the refusals come in snapshot order. Everything is checked
@@ -101,6 +110,8 @@ any other.
 | `ClipParentInvalid` | a clip entry's parent is not an earlier entry of its table (named by the entry) |
 | `ClipRectInvalid` | a clip rectangle has a NaN or infinite coordinate or a negative extent (named by the entry) |
 | `ClipSpaceMixed` | a clip entry is referenced, directly or through a descendant, from both a world layer and a UI layer (named by the entry) |
+| `ChunkUnresolved` | a layer lists a chunk the chunks validated against do not hold: never issued, stale (another generation) or released |
+| `ChunkKindMismatch` | a layer lists a chunk built for another kind of layer |
 
 NaN and both infinities are refused explicitly, so no range comparison can
 accept one by accident. A snapshot holding only offscreen passes is valid, for
@@ -176,6 +187,82 @@ fragment is the recorder's and the oracle's: see
 [`hetoimasia-render-2d-vulkan`](../render-2d-vulkan/README.md) and
 [`hetoimasia-render-2d-oracle`](../render-2d-oracle/README.md).
 
+## Retained chunks
+
+Retained chunks are D-1's static content (R2D-10, decision D-31): built once
+into device buffers by a backend, listed by reference in every snapshot that
+draws them, and merged with the snapshot's dynamic instances by a total order.
+Only the dynamic content is republished. This package holds the backend-free
+half: the **description** every pure step reads, so validation, planning, the
+encoder and the oracle resolve a reference without a GPU or any Vulkan package.
+
+**References.** A `ChunkRef` is an index and a generation a backend issues, like
+a `TargetRef`: opaque to game code (`Eq`, `Ord` and `Show` only), holding no
+native handle, acquiring nothing and keeping nothing alive. A backend that
+reuses an index gives it the next generation, so a stale reference never
+resolves to rebuilt content. `Hetoimasia.Render.TwoD.Chunk.Backend` builds and
+reads one.
+
+**Kinds.** A chunk is built for exactly one kind of layer (`ChunkKind`): a world
+layer with depth (`ChunkWorldDepth`), a world layer without it
+(`ChunkWorldFlat`) or a UI layer (`ChunkUi`), and may be listed only by a layer
+of that kind. Its instances are in the layer's space, and so are its bounds.
+
+**Building.** `buildChunk marks kind bounds instances` validates every instance
+as a snapshot's would be (`instanceReasons`, each reported with its build
+position as `ChunkInstanceInvalid`) and the bounds, and either reports every
+reason or builds an immutable `Chunk` that holds the instances in **build
+order** (the order the application gave them), the textures they name
+(`chunkTextures`), the bounds and the routing. A chunk with no instance has no
+geometry: it needs supplied bounds.
+
+- **Routing is fixed at build (D-3, D-22, D-27).** Only a `ChunkWorldDepth`
+  chunk routes anything to the cutout path, and then only an instance that
+  meets every condition the draw plan's routing lists, against the marks the
+  chunk is built with: a marked texture, a cutout-capable material, a tint alpha
+  of 255 and neither flag. A `ChunkWorldFlat` or `ChunkUi` chunk puts every
+  instance on the ordered path. The routing never changes: a texture swap shows
+  through the chunk because an instance names the handle, and a swap that would
+  change the handle's registered mark is refused at the swap (D-27), so the
+  routing stays true. The chunk holds its cutout instances in the order a device
+  buffer will hold them (`chunkCutoutPositions`: by material, then build order)
+  and its ordered instances by ascending depth key and then build order
+  (`chunkOrderedPositions`), so merging them needs no sort of their own.
+- **Bounds conservatively enclose the geometry.** The geometry of an instance is
+  the unit square its transform places, so on each axis it lies between
+  `t + min 0 a + min 0 c` and `t + max 0 a + max 0 c` (for the x axis; likewise
+  y). `DeriveBounds` takes the rectangle over every instance exactly, in
+  rationals, and rounds each edge outward to a 32-bit float (`ChunkBoundsNotRepresentable`
+  when the geometry leaves the float range, `ChunkBoundsUnderivable` for a chunk with no
+  instance). `SuppliedBounds` are refused unless they are finite
+  (`ChunkBoundsNotFinite`), not inverted (`ChunkBoundsInverted`) and enclose that
+  rectangle exactly (`ChunkBoundsInsufficient`); bounds larger than needed are
+  accepted and only make culling less eager.
+
+**Resolution (no GPU lookup).** `validateSnapshotWith chunks snapshot` resolves
+every listed reference through the `Chunks` the caller holds (`chunksFrom`, by
+exact reference, generation included); `validateSnapshot` is the same against no
+chunks, so it refuses a layer that lists one. A reference the chunks do not
+hold is refused as `ChunkUnresolved`, and one built for another kind of layer as
+`ChunkKindMismatch`, each at an `AtChunk` location naming the layer and the
+chunk, before the layer's instances. The `ValidSnapshot` keeps what each listing
+resolved to (`validLayerChunks`, in listed order, a chunk listed twice appearing
+twice), so everything after validation reads the same description and nothing
+looks anything up. `validChunkRefs` names every chunk the snapshot lists, once
+each, in the order first listed.
+
+**Culling (D-31).** `chunkCulled mapping extent viewport kind bounds` says
+whether a view skips a chunk: its bounds, mapped through the view's transform
+(`worldTransform` for a world chunk, `uiTransform` for a UI one, so a rotation,
+a shear, a UI scale and a content scale enlarge it exactly as they enlarge the
+chunk), lie wholly outside the viewport clamped to the target. It is
+conservative: the mapped rectangle is widened by half a pixel when the view
+snaps (an instance's origin rounds by at most that), by a sixteenth of a pixel
+(the width of the oracle's band in which coverage is undecided) and by a
+relative slack for 32-bit arithmetic, so a chunk whose edge touches the view is
+kept and one that cannot be decided is never discarded. Only chunks are culled:
+dynamic instances are not.
+
 ## The draw plan
 
 `planSnapshot marks valid` is pure and total over a validated snapshot. It
@@ -248,8 +335,45 @@ application materials exist, its cutout run and its ordered run.
 An adapter that needs a guaranteed winner between two instances gives them
 distinct depth keys.
 
-**Cost.** Planning allocates the one permutation per layer and sorts it once,
-O(n log n) in the layer's instance count.
+**Chunks and the merge order (R2D-10).** A layer's content has a **source
+order**: the chunks it lists, in the order it lists them, each listing in the
+chunk's build order, then its dynamic instances in submission order. A chunk
+listed twice contributes at both places. The plan merges the sources with the
+rules above, the source order breaking every tie:
+
+- the **cutout runs** come first, ordered by material and then by source order:
+  within a material, each chunk listing's cutouts are one run that reads the
+  chunk's own device buffer (`ChunkRun position`, from the first cutout the run
+  holds, `runStart`, for `runCount` instances, in the chunk's cutout order),
+  listings in order, then the dynamic cutouts as one run of the frame's ring
+  (`RingRun`). The depth buffer resolves their overlap, and at an equal key the
+  later source wins: a later listed chunk, or the dynamic instance over a
+  chunk's.
+- the **ordered runs** follow: the ordered-path instances of every listed chunk
+  and of the layer's own are merged into one run by ascending depth key and then
+  source order (a chunk before any dynamic instance, listings in order, build
+  order), and are written to the ring each frame in that order. An ordered
+  instance at an equal key therefore draws after, and so over, a cutout, from
+  any source.
+
+The ring's entries are `plannedOrder` with `plannedOrigin` (for each entry, `-1`
+for a dynamic submission index and otherwise the listing the build position is
+in; `drawingSources` lists them as `DynamicInstance` and `ChunkInstance`); a
+chunk's cutouts are not among them, so they are never re-encoded or rewritten.
+`RingRun`s partition the ring's entries, as every run did before chunks. The
+order is total and repeatable. A zero-size viewport plans nothing from a chunk,
+either.
+
+`planSnapshotCulled culler marks valid` leaves out the chunk listings the culler
+skips for each view (`ChunkCuller`: pass index, view index, kind and bounds; see
+`chunkCulled`). The plan of a view is then exactly the plan without those
+listings, and `plannedCulled` names them by position in the layer's list.
+`planSnapshot` culls none.
+
+**Cost.** Planning allocates the two index arrays per layer and sorts the merged
+ordered instances once, O(n log n) in their count (a chunk's ordered instances
+are held sorted, so the sort meets presorted runs); a chunk's cutout instances
+cost nothing per frame.
 
 ## Mapping views
 
@@ -433,6 +557,13 @@ the UV rectangle as two `vec2`s, or reads the instance as vertex attributes.
 Declared as a `vec4`, the UV rectangle would align to 16 bytes and move to
 offset 32, breaking the 64-byte stride. Never declare it as a `vec4`.
 
+`encodeLayerInDrawingOrder` reads each ring entry from the layer's dynamic
+instances or from the chunk listing the plan names, so a layer that lists chunks
+writes its dynamic cutouts and the merged ordered instances; for a layer that
+lists none it is as it always was. `encodeChunkCutouts chunk` encodes a chunk's
+cutout instances once, in the order its device buffer holds them, which is what
+a backend uploads.
+
 ## The quad an instance places
 
 An instance's transform places the **unit square** [0, 1]² in its layer's
@@ -449,23 +580,27 @@ oracle's probes.
 
 None: every value is pure and immutable. The package starts no thread, owns no
 resource and holds no mutable state. A snapshot references the objects it names
-only by value (texture handles and target references); holding those objects
-alive, publishing a snapshot to a window and pressure on either belong to later
-slices of the design (R2D-14, R2D-8).
+only by value (texture handles, target references and chunk references); a
+`Chunk` is an immutable description that a backend retains and resolves
+references to, and holding those objects alive, publishing a snapshot to a
+window and pressure on either belong to the backend and the host adapter
+(R2D-14, R2D-8, R2D-10).
 
 ## Not here
 
 Which instance lies under a point (the game's question); clip-space conversion
 and the shader's snapping (R2D-7); reading window metrics and publishing per
-window (R2D-14, R2D-8); culling instances per view; expected pixels (R2D-4, in
-[`hetoimasia-render-2d-oracle`](../render-2d-oracle/README.md)); retained static
-content and its merge with the dynamic snapshot (R2D-10); application materials
-and splitting runs between them (R2D-11); computing or registering a texture's
+window (R2D-14, R2D-8); culling dynamic instances per view (chunks are culled by their bounds); expected pixels (R2D-4, in
+[`hetoimasia-render-2d-oracle`](../render-2d-oracle/README.md)); range writes into
+a chunk, which D-31 rules out (a chunk is rebuilt whole: build a new one, publish,
+release the old); the material records a chunk carries, which arrive with application
+materials (R2D-11), and splitting runs between them; computing or registering a texture's
 mark (R2D-7, R2D-8); recording, shaders,
-samplers and everything in `render-2d-vulkan`; publication; retained static
-content and its clip tables (R2D-10); material data records; sampling offscreen
+samplers, the device buffers, uploads and holds of chunks and everything in
+`render-2d-vulkan`; publication; clip tables in retained content beyond what
+R2D-12 defines for instances; material data records; sampling offscreen
 targets; stencil-based or hardware clipping and rounded or non-rectangular
-clips; and Lua bindings.
+clips; animation (R2D-18); and Lua bindings.
 
 ## Tests
 
@@ -517,5 +652,27 @@ the half-pixel property; the snapping function at half boundaries and the
 whole Float 8388609; every degenerate case, containment at all four edges, the
 refusal of unrepresentable results, and, over wild and extreme inputs, that no
 conversion is non-finite; and the discrete stepping at, between, below and
-above the levels. Hspec, QuickCheck and the external-client harness are
+above the levels. For chunks it checks, for each of the three kinds, building
+and routing (only a world chunk with depth puts anything on the cutout path, and
+only what meets every condition; the routing fixed against later marks and equal
+to the plan's for the same instances submitted dynamically), the refusal of every
+instance reason with its build position, derived bounds against a corner-by-corner
+characterisation within one float step, supplied bounds exactly tight, one float
+step short on each edge, not finite, inverted, and empty chunks and geometry
+beyond the float range; validation of the nine pairings of a chunk kind and a layer
+kind, each refusing a mismatch naming the layer and the chunk, unresolved and stale
+references, a stale reference never reaching rebuilt content, and chunk refusals
+before instance ones; the merge order as concrete fixtures (equal keys across
+chunks and the dynamic instances, the listing's order rather than the references',
+a chunk listed twice, cutout runs from chunk buffers before the ring's, an ordered
+instance over a cutout) and, over generated chunks and layers, that planning is
+repeatable and matches an independent characterisation that numbers the instances
+in source order and sorts plainly; culling at every side, touching edges, a
+sixteenth of a pixel beyond, half a pixel more under pixel snap, a quarter-turn
+camera, UI and content scale, a viewport beyond the target, one chunk kept in one
+view and skipped in another, and, over generated views, scales and snap, against a
+brute force in exact arithmetic of which pixel centres an instance covers, that a
+chunk with an instance covering one is never skipped; the encoding of a chunk's
+cutouts and of the merged ring entries; and, through external clients, that a
+chunk reference and a built chunk cannot be forged. Hspec, QuickCheck and the external-client harness are
 the suite's dependencies, not the library's.

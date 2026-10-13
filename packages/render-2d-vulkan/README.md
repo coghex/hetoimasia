@@ -2,9 +2,11 @@
 
 The 2D renderer's Vulkan recorder for the **ordered path** (R2D-7) and the
 **cutout path** (R2D-9), and, with it, what a host needs to show decoded images
-in windows (R2D-8): texture registration with cutout marks and the swap rule,
-and a per-window host adapter that publishes snapshots, holds what an adopted
-revision references and releases textures behind the window host's barrier. The
+in windows (R2D-8) and to retain static content across frames (R2D-10): texture
+registration with cutout marks and the swap rule, retained chunks with their
+device buffers and uploads, and a per-window host adapter that publishes
+snapshots, holds what an adopted revision references and releases textures and
+chunks behind the window host's barrier. The
 recorder: a validated [render-2d](../render-2d/README.md) snapshot
 recorded into one batch of the
 [native backend](../gpu-vulkan/native/README.md), every pass in list order into
@@ -15,16 +17,17 @@ drawn first, depth-tested and depth-written, and the ordered path's instances
 are depth-tested and not written. It owns the built-in shaders and the wrapping
 the engine applies around a material. The decision record is
 [the 2D renderer design](../../docs/designs/render_2d_design.md) (D-2, D-3, D-4,
-D-5, D-9, D-10, D-12, D-19, D-22, D-23, D-24, D-26, D-27, D-28, D-29; P-6); the backend's
+D-5, D-9, D-10, D-12, D-19, D-22, D-23, D-24, D-26, D-27, D-28, D-29, D-31; P-6); the backend's
 contract is [docs/gpu_backend.md](../../docs/gpu_backend.md).
 
 | Module | Contents |
 | --- | --- |
 | `Hetoimasia.Render.TwoD.Vulkan` | re-exports `Builders`; `Configuration`, `defaultConfiguration`; `Renderer`, `makeRenderer`, `rendererDepthFormat`, `pipelineFor`, `pipelineDeclaration`; `prepareSnapshot`, `FrameRecording`; re-exports `Hetoimasia.Render.TwoD.Vulkan.Frame`, `orderedShaders` and `cutoutShaders` |
-| `Hetoimasia.Render.TwoD.Vulkan.Builders` | `Builders`: the constructions the recorder and the registry need from a host: the ring with its storage-table window, the table, the storage table, the layout, a pipeline, and registering, swapping and releasing an uploaded texture |
+| `Hetoimasia.Render.TwoD.Vulkan.Builders` | `Builders`: the constructions the recorder and the registry need from a host: the ring with its storage-table window, the table, the storage table, the layout, a pipeline, and registering, swapping and releasing an uploaded texture; and making, filling (an upload admitted for a ticket) and releasing a device-local vertex buffer |
+| `Hetoimasia.Render.TwoD.Vulkan.Chunks` | the chunk registry: `Retained`, `newRetained`; `buildRetainedChunk`, `BuildRefusal`; `ChunkStanding`, `chunkStanding`; `retainedChunks`, `retainedBuffers`, `chunkBufferOf`, `liveChunks`; the logical release marker (`markChunkReleased`, `isChunkReleased`) and `releaseChunkNow` |
 | `Hetoimasia.Render.TwoD.Vulkan.Textures` | `Textures`, `newTextures`; `registerTexture` with a `MarkPolicy`; `swapTexture` with a `SwapPolicy`; `TextureRefusal`; the logical release marker (`markReleased`, `isReleased`), `releaseTextureNow`; `registeredMark`, `registeredMarks` |
-| `Hetoimasia.Render.TwoD.Vulkan.Window` | the host adapter: `Host`, `Adapter`, `newAdapter`; `Scene2D`, `blankScene`; `publish2DSnapshot`, `PublishRefusal`; `release2DTexture`; `adapterAdopted`, `adapterReleased`, `retryReleases`; `FrameInfo`, `renderWindowFrame` |
-| `Hetoimasia.Render.TwoD.Vulkan.Frame` | `Attachment`, `offscreenAttachment`, `TargetBinding`, `DepthBinding`, `FrameInput`; `depthLayers`, `requireWorldDepth`, `worldDepthShortfall`; `FrameRefusal`; `frameWork` and the work it computes: `PassWork`, `ViewWork`, `LayerWork`, `RunWork`, `PipelineKind`, `runPipeline`; the clip region: `viewDraws`, `clipRegion`, `requireClipWindow` |
+| `Hetoimasia.Render.TwoD.Vulkan.Window` | the host adapter: `Host`, `Adapter`, `newAdapter`; `Scene2D`, `blankScene`; `publish2DSnapshot`, `PublishRefusal`; `release2DTexture`, `release2DChunk`; `adapterAdopted`, `adapterReleased`, `retryReleases`, `textureHolds`, `chunkHolds`; `FrameInfo`, `renderWindowFrame`, `pendingChunkUploads` |
+| `Hetoimasia.Render.TwoD.Vulkan.Frame` | `Attachment`, `offscreenAttachment`, `TargetBinding`, `DepthBinding`, `FrameInput`; `depthLayers`, `requireWorldDepth`, `worldDepthShortfall`; `FrameRefusal`; `frameWork` and the work it computes: `PassWork`, `ViewWork`, `LayerWork`, `RunWork`, `RunReads`, `PipelineKind`, `runPipeline`; the clip region: `viewDraws`, `clipRegion`, `requireClipWindow` |
 | `Hetoimasia.Render.TwoD.Vulkan.Layout` | the instance as vertex input (`instanceVertexInput`), the key's depth (`depthFromKey`), the push block (`ViewPush`, `packViewPush`, `pushMembers`), the clip table's bytes (`packClipTable`, `clipEntryBytes`), the sampler choice (`shaderSamplerIndex`), the scissor rule (`viewScissor`) |
 | `Hetoimasia.Render.TwoD.Vulkan.ShaderInterfaces` | the checked interface descriptions the shaders are compiled against |
 | `Hetoimasia.Render.TwoD.Vulkan.Shaders` | `orderedShaders` and `cutoutShaders`: one vertex stage and two fragment stages |
@@ -99,6 +102,7 @@ Everything that can refuse is decided first, in `frameWork`, which is pure:
 | `ViewNotMappable pass view` | `viewMapping` refuses the view under the metrics |
 | `NoDepthTarget location` | a pass needs a depth attachment (below) for this depth-enabled world layer and was given none |
 | `DepthFormatRefused location format` | a pass holding this depth-enabled world layer was given a depth image whose format is not `D32_SFLOAT` (D-23) |
+| `ChunkBufferMissing location chunk` | a layer draws a chunk that has cutout instances in a view that does not cull it, and the frame holds no device buffer for it (`frameChunks`) |
 | `PlanDisagrees location` | the plan's layers and the snapshot's do not pair (planning the same snapshot never produces it) |
 | `ClipTablesTooLarge bytes window` | the batch's packed clip tables (below) are `bytes` long, and the window is only `window` bytes |
 | `RefusedByBackend refusal` | the backend refused a pipeline, a claim or a command |
@@ -107,14 +111,19 @@ The first refusal in snapshot order is the answer, and nothing has been recorded
 What `FrameRecording` then does, in the one batch:
 
 1. **Claims.** The batch's **clip region** is claimed first, with the backend's
-   table alignment (`claimTable`), and written (below). Every layer that draws has its instances encoded in drawing
-   order (`encodeLayerInDrawingOrder`, byte for byte the matching 64-byte
-   chunks of `encodeLayer`, permuted by the plan's order) and written into one
-   ring region of its own, aligned to 16, in pass, view and layer order. They
-   are all claimed before the first pass begins, and the first the ring cannot
-   hold is a `RefusedByBackend` that stops the rest: no clear and no draw has
-   been recorded, and the claims already granted stay the backend's to reclaim
-   when the batch completes or to discard with it.
+   table alignment (`claimTable`), and written (below). Every layer that draws through the ring has its ring entries
+   encoded in drawing order (`encodeLayerInDrawingOrder`, byte for byte the
+   matching 64-byte chunks of `encodeLayer`, permuted by the plan's order) and
+   written into one ring region of its own, aligned to 16, in pass, view and
+   layer order. They are all claimed before the first pass begins, and the first
+   the ring cannot hold is a `RefusedByBackend` that stops the rest: no clear and
+   no draw has been recorded, and the claims already granted stay the backend's
+   to reclaim when the batch completes or to discard with it. A layer none of
+   whose runs reads the ring claims nothing. Then every retained chunk's device
+   buffer the frame draws from is moved to its vertex-input use
+   (`transitionResource`, `GeometryRead`), once, because the backend refuses a
+   buffer's first touch inside rendering; the batch's exit barrier returns it to
+   rest.
 2. **Passes**, in list order. A pass begins rendering into its target cleared to
    the pass's clear colour (an offscreen target `ClearFromUndefined`, so it may
    be new or hold anything; the window's pass into the frame's own image) and
@@ -140,9 +149,12 @@ What `FrameRecording` then does, in the one batch:
    clear and claims no region. A layer then draws **one instanced draw of six
    vertices per run**: it binds the run's pipeline if another is bound, its
    region at the run's first instance (64 bytes a step), and draws the run's
-   count. Sampler choices, tints and depth keys never split a run, so a layer is
-   at most two draws until application materials exist: its cutout run, which
-   the plan puts first, and its ordered run.
+   count. A run of a retained chunk binds the chunk's own buffer at the run's
+   first instance instead. Sampler choices, tints and depth keys never split a
+   run, so a layer that lists no chunk is at most two draws until application
+   materials exist: its cutout run, which the plan puts first, and its ordered
+   run; one that lists chunks adds a cutout run for each listing that has
+   cutouts, before them.
 
 The recorder never reads back and never transitions a target for a copy: after
 it a target is in its colour-attachment use, and a caller that reads it back
@@ -216,6 +228,77 @@ compared less-or-equal. Among cutouts of an equal key the later draw in run orde
 wins; at an equal key a translucent instance is drawn after, and so over, a
 cutout. Both are tested, in the oracle and on the device.
 
+## Retained chunks (R2D-10)
+
+A chunk is static content built once and drawn every frame without republishing
+(D-1, D-31). [`render-2d`](../render-2d/README.md) holds its backend-free
+description (kinds, routing, bounds, the merge order, culling); this package
+makes it a device buffer, draws from it and manages its life.
+
+**Building.** `buildRetainedChunk builders retained marks kind bounds instances`
+runs on the owner's thread, inside an action that lends the host's `Builders`:
+
+1. it builds the description with `buildChunk` for one kind of layer, routing the
+   instances once against the registered marks, and refuses the instances or
+   bounds that do not validate, with every reason (`BuildInvalid`);
+2. it encodes the cutout-path instances, 64 bytes each in buffer order
+   (`encodeChunkCutouts`);
+3. if there are any, it makes a device-local `VertexBuffer` of exactly that size
+   (`buildVertexBuffer`) and admits the upload that fills it through the bounded
+   staging uploads (`uploadBuffer`: admission copies the bytes before it returns
+   and never waits). **An empty cutout partition makes no buffer and no upload**
+   — the backend refuses a zero-byte buffer — and so a chunk of a world layer
+   without depth or of a UI layer, which routes nothing to the cutout path, has
+   no device buffer: its ordered instances are written to the ring each frame,
+   never retained on the device;
+4. it registers the description, the buffer and the upload's ticket under a fresh
+   `ChunkRef`: an index and a generation, the index reused after its chunk's
+   release under the next generation, so a stale reference resolves to nothing.
+
+A refusal changes nothing the registry holds, and nothing is left behind by
+one. The buffer made for a chunk whose upload was refused is released at once,
+and so is one made when an exception or a cancellation interrupts the build after
+it (the build runs under `mask_`, the buffer's release on `onException`). The
+refusals say what to do: `BuildUploadBackpressure` is the staging buffer or its
+queue being full *now* — asking again later can succeed — and
+`BuildUploadRefused` is everything else, none of which asking again changes: an
+`UploadOversized` chunk (more cutout bytes than the whole staging buffer: build
+smaller chunks), an upload target that is not fresh, a closed or failed session.
+`BuildBufferRefused` is the backend refusing the buffer;
+`BuildReferencesExhausted` is every reference in use.
+
+**Standing.** A chunk is `ChunkUploading` until its ticket reports the upload
+complete, `ChunkReady` after, and `ChunkFailed` when the ticket ended without
+completing (cancelled, the device lost). A chunk with no cutout instance is
+`ChunkReady` at once. `chunkStanding` reads it from any thread without a native
+call.
+
+**Pressure (D-28).** An upload that is genuinely pending is pressure, and only
+that: `renderWindowFrame` of a scene that lists a chunk whose upload has not
+completed records nothing, claims nothing and refuses the frame
+(`RefusedIllegal`, naming the chunk), which the host skips and retries at its
+backoff with the window's demand kept; nothing of an incomplete chunk is ever
+drawn, and publication never waits (`pendingChunkUploads` names the chunks a
+frame waits for). A chunk that *failed* is a refusal of its own: a snapshot that
+lists it is not published (`ChunkUploadFailedInSnapshot`), and a frame of a scene
+that does is refused saying the upload ended without completing, so nothing
+retries for ever.
+
+**Culling.** Before anything is worked out, a view skips every chunk whose
+bounds, mapped through its transform, lie wholly outside its viewport within the
+target (`chunkCulled`), exactly as the oracle does. The skipped listings are not
+encoded, claimed or drawn; `layerCulled` names them in a layer's work, and a
+layer that skipped a chunk is kept in the work for that reason even if nothing
+else in it draws. A chunk referenced by a snapshot is still **held** whether or
+not any view culls it, and so are the textures it names.
+
+**Retention.** After the first frame a chunk's cutout data is neither re-encoded
+nor re-uploaded: each frame writes to the ring only the layer's dynamic cutouts
+and the merged ordered instances, and draws the chunk's cutouts straight from its
+buffer. The recorder tests assert this directly (the mapped writes of three
+frames hold the ordered instance's 64 bytes and never the 128 of the cutouts; one
+upload was admitted), and the native case records the numbers.
+
 ## Registering textures and marks
 
 `registerTexture builders textures image decoded policy` registers an uploaded
@@ -281,21 +364,47 @@ is refused, checking in this order:
    is unaffected on any device;
 5. `TextureReleasedInSnapshot`, naming the texture, when the snapshot
    references one whose release was requested (any instance of any layer of
-   any view, visible or not);
-6. what the host answers: `PublishWindowUnknown`, `PublishHostClosed` or
+   any view, visible or not, and any instance of a chunk the snapshot lists);
+6. `ChunkReleasedInSnapshot`, naming the chunk, when the snapshot lists one
+   whose release was requested, and `ChunkUploadFailedInSnapshot`, naming the
+   chunk and how its upload ended, when it lists one whose upload ended without
+   completing (a chunk whose upload is still under way is **not** refused:
+   publication never waits, D-28);
+7. what the host answers: `PublishWindowUnknown`, `PublishHostClosed` or
    `PublishHostShared`.
+
+Step 1 resolves the chunks the snapshot lists against the registry
+(`validateSnapshotWith`), so a reference the registry does not hold, never
+issued or stale after the chunk's release, or built for another kind of layer, is
+validation's refusal naming the layer and the chunk.
 
 **Holds (D-28).** When the owner adopts a revision of a window, `adapterAdopted`
 records a hold on every texture the revision's snapshot references — once for
-each texture, however often it is referenced — and when the host reports the
+each texture, however often it is referenced, including the textures only a
+chunk names — and on every chunk it lists, culled or not, and when the host reports the
 revision released (superseded, or its window ended, and its last recording
 over), `adapterReleased` drops it. A texture is held while any adopted revision
 of any window holds it: two windows sharing one texture hold it twice, a
-superseded revision keeps its hold until its own release, and a closed window's
+superseded revision keeps its hold until its own release — so a chunk's buffer is
+never released because a later revision omits it, only when the last recording of
+every revision that lists it is over — and a closed window's
 revisions are released by the host and so drop theirs. Holds are keyed by
-window and revision.
+window and revision; a texture and a chunk are held alike (`textureHolds`,
+`chunkHolds`).
 
-**Releasing (D-28).** `release2DTexture adapter handle` marks the texture
+**Releasing (D-28, D-31).** `release2DChunk adapter reference` does for a chunk
+what `release2DTexture` does for a texture, below: the chunk is marked released
+(publication refuses a snapshot that lists it), entered in the pending set and
+the host asked for the release through `hostRequestRelease`, whose action
+releases the chunk's buffer — and forgets the chunk, ending its reference — only
+if no adopted revision holds it, so a chunk released while the adopted snapshot
+shows it keeps being drawn until a snapshot without it is adopted and the
+revisions that listed it are over. A release requested while the upload is
+pending cancels it, as the backend's release of an upload target does. Rebuilding
+a chunk is building a new one, publishing a snapshot that lists it and releasing
+the old; there are no range writes (D-31).
+
+`release2DTexture adapter handle` marks the texture
 released, which publication's check reads, and enters it in the pending set —
 one transaction, so a cancellation before the host is asked leaves a texture
 that asking again recovers — and then asks the host for the release through
@@ -331,7 +440,9 @@ may not have reported them; the host preserves an unavailable observation
 rather than inventing one). A frame whose request carries neither, or whose
 metrics are not usable (a non-positive or non-finite scale), is refused —
 `RefusedIllegal`, naming what was missing — before anything is recorded, which
-the host skips and retries at its backoff.
+the host skips and retries at its backoff. A scene that lists a chunk whose
+upload has not completed is refused the same way, naming the chunk, and so is
+one whose chunk failed (see Retained chunks).
 
 ## Targets and metrics
 
@@ -522,7 +633,8 @@ functions in the fragment stage, so an application material (R2D-11) replaces
 | The ring, the texture table and the pipeline layout | The host session | `makeRenderer` makes them through `Builders`; batches `prepareSnapshot` records read them | Owner | From `makeRenderer` until the host session ends | Released and destroyed with every managed resource before the device |
 | The pipelines, one per colour format and kind | A `Renderer` | `pipelineFor`, on the first pass that draws with the pair | Owner | From that first pass until the host session ends | As above |
 | Each registered handle's mark and release flag | A `Textures` (a `TVar` ledger keyed by the complete handle) | `registerTexture` adds; `markReleased` flags; `releaseTextureNow` removes the mark; any thread reads in STM | Registration, swap and table release on the owner; marker and reads on any | From the registration until the table release | The flag is never cleared: a released handle stays refused after its index is reused |
-| The holds (window and revision to the textures that revision references), the pending releases with their stage, and the textures whose follow-up action is queued | An `Adapter` | `adapterAdopted` and `adapterReleased` on the owner's thread; the release action on the owner's thread; reads on any | Owner writes, any reads | From the adapter's creation until it is dropped | A revision's hold is dropped by its release; a pending texture leaves the set when its release runs |
+| Each chunk's description, device buffer and upload ticket, its release flag, the generation of every index and the indices free to reuse | A `Retained` (a `TVar` ledger keyed by the complete reference) | `buildRetainedChunk` adds (and releases the buffer it made if it refuses or is interrupted); `markChunkReleased` flags; `releaseChunkNow` releases the buffer and forgets the chunk; any thread reads in STM | Build, buffer release and `releaseChunkNow` on the owner; marker and reads on any | From the build until the buffer's release | The flag is never cleared: the reference is forgotten with the chunk and its index reused under the next generation |
+| The holds (window and revision to the textures and chunks that revision references), the pending releases with their stage, and the objects whose follow-up action is queued | An `Adapter` | `adapterAdopted` and `adapterReleased` on the owner's thread; the release action on the owner's thread; reads on any | Owner writes, any reads | From the adapter's creation until it is dropped | A revision's hold is dropped by its release; a pending object leaves the set when its release runs |
 | The publication lock | An `Adapter` | `publish2DSnapshot` and `release2DTexture`, each for its whole length | Application threads | The adapter's life | None |
 
 A `Renderer` holds an `IORef` of the pipelines and is used on the graphics
@@ -614,13 +726,35 @@ a cutout clipped away, writing no depth, so the farther cutout shows through; an
 an empty clip with a clip under one. Each named behaviour is a probe the oracle
 must give determinately and that differs from its contrast's.
 
+A fifth, `r2d10-retained`, builds retained chunks once and lists them over eleven
+frames of offscreen snapshots beside dynamic content that alone is republished:
+retained cutouts and a translucent instance interleaved with dynamic cutouts, a
+world chunk without depth and a UI chunk drawn in the ordered path, a texture swap
+showing through a chunk and a mark-changing swap refused, a chunk released while
+shown and still drawn until a snapshot without it is adopted, and a chunk outside a
+view skipped; every pixel is judged against the oracle, and the bytes uploaded once
+and written to the ring each frame are recorded in `retained-measurements.json`.
+The recorder's headless tests (`Test.Render.TwoD.Vulkan.Retained`) cover building
+and upload for each kind (a buffer and one upload only for a chunk with cutout
+instances, none and no pressure for an empty partition), pressure while an upload is
+pending, queue-full backpressure and an oversized upload and an interrupted build,
+each releasing the buffer it made and holding nothing, release while pending and the
+reference's reuse under the next generation, a frame that draws a chunk's cutouts
+from its own buffer with only the dynamic and merged ordered bytes in the ring, three
+frames re-encoding and re-uploading nothing, a chunk listed twice, culling in one view
+and not another, publication refusing an unresolved, released or failed chunk, holds
+for every revision of every window including a culled chunk and a texture only a chunk
+names, and release deferred until the barrier is met and the last holding revision's
+recording is over.
+
 ## Not here
 
 Alpha-to-coverage and MSAA; depth formats other than `D32_SFLOAT` for world
 layers; application materials and their
-capability (R2D-11) and a clip table's retained content (R2D-10); stencil-based clipping, hardware clip
-distances and per-view culling of fully clipped instances;
-retained content (R2D-10); creating offscreen targets, issuing their references
+capability (R2D-11) and clip tables in retained content beyond what R2D-12 defines for instances;
+stencil-based clipping, hardware clip distances and per-view culling of fully clipped instances;
+range writes into a chunk (D-31), and the material records chunks will carry
+(R2D-11); creating offscreen targets, issuing their references
 and their lifetimes, holds and releases, and sampling an offscreen pass's target
-in a later pass (R2D-13); per-view culling; and performance claims, which need
-retained measurements.
+in a later pass (R2D-13); culling dynamic instances; and performance claims
+beyond the retained measurements the native case records.
