@@ -19,6 +19,7 @@
 -- >                                                              (evaluated exactly: floor(origin) plus 1 when its fraction is at least ½)
 -- > clip   = ((target + shift) / extent) · 2 − 1                 Vulkan's Y down
 -- > depth  = (2²⁴ − 1 − k) / 2²⁴                                 for the instance's key k, constant across the quad
+-- > clip   = flags >> 16                                         the instance's clip index, passed on flat
 --
 -- so with snap on the quad moves rigidly until its origin lands on
 -- @floor(p + ½)@ of its mapped origin, the arithmetic of
@@ -56,6 +57,26 @@
 -- > result = (s.rgb / s.a) × b, alpha 1  un-premultiplied by the sample's own alpha
 --
 -- so a filtered edge sample @(0.6, 0.6, 0.6, 0.6)@ writes white, not grey.
+--
+-- = Clipping (R2D-12, design D-11)
+--
+-- Both variants end with the clip test, after the sample is taken, so a quad's
+-- neighbouring invocations keep their derivatives. With the instance's clip
+-- index @k@ (the flags word's top 16 bits), the view's @clipBase@ and the
+-- table the batch bound as set 2, binding 0:
+--
+-- > k = 0                          no clip: nothing is read
+-- > r = rectangles[clipBase + k − 1]                  (left, top, right, bottom)
+-- > p = inverse · gl_FragCoord.xy                      the pixel centre in the layer's space
+-- > discard unless  r.left ≤ p.x < r.right  and  r.top ≤ p.y < r.bottom
+--
+-- The inverse is the push block's @inverseLinear@ and @inverseTranslation@,
+-- the exact inverse of the transform the layer's instances are placed with, so
+-- a sprite's own origin snap neither moves nor is undone by the clip, and the
+-- view's snapped translation, the zoom, the rotation, and the UI scale, content
+-- scale and viewport origin are all in it. A discarded fragment writes neither
+-- colour nor depth, in the ordered and the cutout variant alike. Instances of
+-- different clip indices share one draw: the index travels with the instance.
 --
 -- Material, wrapping and output are separate functions, and both variants share
 -- the lookup, the sampler choice and the material, so an application material

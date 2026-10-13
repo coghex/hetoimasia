@@ -75,7 +75,7 @@ import Hetoimasia.GPU.Vulkan.Native.Presentation
 import Hetoimasia.GPU.Vulkan.Native.Profile
 import Hetoimasia.GPU.Vulkan.Native.Recording
 import Hetoimasia.GPU.Vulkan.Native.Roots
-import Hetoimasia.GPU.Vulkan.Native.TextureTable (createShaderSampledTablePipelineLayout, createTextureTable, refreshTextureTable, registerTexture, releaseTexture, swapTexture)
+import Hetoimasia.GPU.Vulkan.Native.TextureTable (TableLayoutOptions (..), TableUse (..), createStorageTable, createTablePipelineLayoutWith, createTextureTable, refreshTextureTable, registerTexture, releaseTexture, swapTexture)
 import Hetoimasia.GPU.Vulkan.Native.Uploads (UploadRequest (..), Uploads, UploadsView (..), newUploads, progressUploads, readUploads, submitUpload, validateUploadConfig)
 import qualified Hetoimasia.Render.TwoD.Vulkan as Render
 
@@ -140,9 +140,10 @@ newRenderer rig configuration = do
 builders ∷ Rig → Render.Builders () Int Int Text Int Word64
 builders rig =
   Render.Builders
-    { Render.buildRing = createRing (rigRecording rig)
+    { Render.buildRing = \size window → createRingWith (rigRecording rig) size (Just window)
+    , Render.buildStorageTable = createStorageTable (rigRecording rig)
     , Render.buildTable = createTextureTable (rigRecording rig) (rigUploads rig)
-    , Render.buildTableLayout = createShaderSampledTablePipelineLayout (rigRecording rig)
+    , Render.buildTableLayout = \shaders → createTablePipelineLayoutWith (rigRecording rig) shaders (TableLayoutOptions TableShaderSampler True)
     , Render.buildPipeline = createBlendedCheckedPipeline (rigRecording rig)
     , Render.buildDepthPipeline = createDepthCheckedPipeline (rigRecording rig)
     , Render.buildDepthFormat = selectDepthFormat (rigRecording rig)

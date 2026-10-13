@@ -281,4 +281,4 @@ viewSpec = describe "two views" $ do
   it "resolve one clip index against their own tables, in their own viewports" $ do
     let left = mkClipView defaultCamera (Viewport (V2 0 0) (V2 4 8)) defaultViewSettings [rect (1, 0) (1, 8)] [UiLayer [cover h4 1]]
         right = mkClipView defaultCamera (Viewport (V2 4 0) (V2 4 8)) defaultViewSettings [rect (1, 0) (2, 8)] [UiLayer [cover h4 1]]
-    pictureOf (oracleOf unorm8 [left, right]) `shouldBe` replicate 8 ".W..WW.."
+    pictureOf (oracleOf unorm8 [left, right]) `shouldBe` replicate 8 ".W...WW."

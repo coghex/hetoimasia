@@ -44,6 +44,18 @@
 -- Every set of metrics must be valid and its framebuffer extent must be the
 -- attachment's actual extent.
 --
+-- = Clip tables (R2D-12)
+--
+-- Each view's plan carries its clip table, resolved. The tables of the views
+-- that draw (a non-empty scissor and a layer with a run) are packed one after
+-- another, in pass and view order, into the batch's one clip region
+-- ('clipRegion', in "Hetoimasia.Render.TwoD.Vulkan.Layout"'s format), and each
+-- layer's push block carries its view's first entry as its @clipBase@. A frame
+-- that draws always has a region, of one zero entry when no view has an entry
+-- (the layout holds set 2, so a draw needs it bound); a frame that draws
+-- nothing has none. A region larger than the configured window is refused
+-- ('ClipTablesTooLarge') by 'requireClipWindow' before anything is recorded.
+--
 -- = Refusals
 --
 -- A refusal is the first found in snapshot order, and it names where:
@@ -58,7 +70,9 @@
 -- * 'NoDepthTarget', 'DepthFormatRefused': a depth-enabled world layer the pass
 --   cannot give a @D32_SFLOAT@ attachment, naming the layer;
 -- * 'PlanDisagrees': the plan and the snapshot's layers do not pair, which
---   planning the same snapshot never produces.
+--   planning the same snapshot never produces;
+-- * 'ClipTablesTooLarge': the batch's packed clip tables exceed the window
+--   ('requireClipWindow'), naming their size and the window.
 module Hetoimasia.Render.TwoD.Vulkan.Frame
   ( -- * The caller's side
     Attachment (..)
@@ -76,18 +90,26 @@ module Hetoimasia.Render.TwoD.Vulkan.Frame
   , PassWork (..)
   , ViewWork (..)
   , LayerWork (..)
+  , layerPushBytes
   , RunWork (..)
   , PipelineKind (..)
   , runPipeline
   , passDraws
   , frameWork
+    -- * Clip tables
+  , viewDraws
+  , clipRegion
+  , requireClipWindow
   ) where
 
 import Control.Monad (zipWithM)
 import Data.ByteString (ByteString)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (catMaybes)
-import Data.Word (Word32)
+import qualified Data.ByteString as ByteString
+import Data.List (mapAccumL)
+import Data.Maybe (catMaybes, fromMaybe, isJust)
+import Data.Word (Word32, Word64)
+import Hetoimasia.Math.Affine2 (identity)
 import Hetoimasia.GPU.Vulkan.Native.Recording
   ( ClearColor (..)
   , Image
@@ -96,6 +118,7 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , Refusal
   , formatCode
   )
+import Hetoimasia.Render.TwoD.Clip (ResolvedClip)
 import Hetoimasia.Render.TwoD.DrawPlan
   ( DrawPlan (..)
   , DrawRun (..)
@@ -108,7 +131,7 @@ import Hetoimasia.Render.TwoD.DrawPlan
   , planSnapshot
   )
 import Hetoimasia.Render.TwoD.Encoding (encodeLayerInDrawingOrder)
-import Hetoimasia.Render.TwoD.Mapping (mappingPixelSnap, uiTransform, viewMapping, worldTransform)
+import Hetoimasia.Render.TwoD.Mapping (mappingPixelSnap, uiInverse, uiTransform, viewMapping, worldInverse, worldTransform)
 import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..), offscreenMetrics, validMetrics)
 import Hetoimasia.Render.TwoD.Settings (ViewSettings (..))
 import Hetoimasia.Render.TwoD.Snapshot
@@ -129,7 +152,7 @@ import Hetoimasia.Render.TwoD.Validation
   , validLayers
   , validSnapshot
   )
-import Hetoimasia.Render.TwoD.Vulkan.Layout (ViewPush (..), packViewPush, viewScissor)
+import Hetoimasia.Render.TwoD.Vulkan.Layout (ViewPush (..), clipEntryBytes, packClipTable, packViewPush, viewScissor)
 
 -- | What a pass renders into, as the caller knows it: the colour format's
 -- @VkFormat@ code, the actual extent, and the metrics views map under.
@@ -235,6 +258,9 @@ data FrameRefusal
     DepthFormatRefused !Location !ImageFormat
   | -- | A depth-enabled world layer, and the session offers no depth format.
     NoDepthFormat !Location
+  | -- | The batch's packed clip tables are this many bytes, and the clip window
+    -- is only this many.
+    ClipTablesTooLarge !Word64 !Word64
   | -- | The backend refused a construction, a claim or a command.
     RefusedByBackend !Refusal
   deriving (Eq, Show)
@@ -258,6 +284,9 @@ data PassWork = PassWork
 data ViewWork = ViewWork
   { workViewIndex ∷ !Int
   , workRect ∷ !(Maybe Rect)
+  , workClips ∷ ![ResolvedClip]
+    -- ^ The view's clip table, resolved, which the batch's clip region holds
+    -- when the view draws.
   , workLayers ∷ ![LayerWork]
   }
 
@@ -268,12 +297,17 @@ data LayerWork = LayerWork
   , layerClearsDepth ∷ !Bool
     -- ^ A depth-enabled world layer: it clears depth to 1.0 within its view's
     -- scissor before its runs, though it holds none.
-  , layerPushBytes ∷ !ByteString
+  , layerPush ∷ !ViewPush
+    -- ^ The push block of the layer's space, with its view's clip base.
   , layerBytes ∷ !ByteString
     -- ^ 64 bytes an instance, in drawing order.
   , layerRunList ∷ ![RunWork]
   }
   deriving (Eq, Show)
+
+-- | The layer's push block as the recorder pushes it.
+layerPushBytes ∷ LayerWork → ByteString
+layerPushBytes = packViewPush . layerPush
 
 -- | A run: a contiguous range of its layer's drawn instances, and the path the
 -- plan gave it.
@@ -317,10 +351,11 @@ passDraws = any (any (not . null . layerRunList) . workLayers) . workViews
 -- | Work out a frame, or the first refusal in snapshot order.
 frameWork ∷ FrameInput → Either FrameRefusal [PassWork]
 frameWork input =
-  zipWithM
-    (passWork input layers)
-    [0 ..]
-    (zip (snapshotPasses (validSnapshot valid)) (planPasses (planSnapshot (frameMarks input) valid)))
+  assignClipBases
+    <$> zipWithM
+      (passWork input layers)
+      [0 ..]
+      (zip (snapshotPasses (validSnapshot valid)) (planPasses (planSnapshot (frameMarks input) valid)))
   where
     valid = frameSnapshot input
     layers = Map.fromList [((pass, view, layer), held) | held ← validLayers valid, AtLayer pass view layer ← [validLayerLocation held]]
@@ -373,11 +408,14 @@ viewWork layers attachment passNumber index (view, planned) = do
   let rect = viewScissor (viewViewport view) (attachmentWidth attachment, attachmentHeight attachment)
       settings = viewSettings view
       pushFor space =
-        packViewPush
           ViewPush
             { pushTransform = case space of
                 WorldSpace _ → worldTransform mapping
                 UiSpace → uiTransform mapping
+            , pushInverse = fromMaybe identity $ case space of
+                WorldSpace _ → worldInverse mapping
+                UiSpace → uiInverse mapping
+            , pushClipBase = 0
             , pushExtent = (attachmentWidth attachment, attachmentHeight attachment)
             , pushBrightness = settingBrightness settings
             , pushFilter = settingFilter settings
@@ -386,9 +424,9 @@ viewWork layers attachment passNumber index (view, planned) = do
   drawn ← case rect of
     Nothing → Right []
     Just _ → catMaybes <$> mapM (layerWork layers pushFor) (plannedLayers planned)
-  Right (ViewWork index rect drawn)
+  Right (ViewWork index rect (plannedClips planned) drawn)
 
-layerWork ∷ Map.Map (Int, Int, Int) ValidLayer → (LayerSpace → ByteString) → PlannedLayer → Either FrameRefusal (Maybe LayerWork)
+layerWork ∷ Map.Map (Int, Int, Int) ValidLayer → (LayerSpace → ViewPush) → PlannedLayer → Either FrameRefusal (Maybe LayerWork)
 layerWork layers pushFor planned
   | null (plannedRuns planned) && not (plannedClearsDepth planned) = Right Nothing
   | otherwise = do
@@ -402,8 +440,46 @@ layerWork layers pushFor planned
             LayerWork
               { layerLocation = location
               , layerClearsDepth = plannedClearsDepth planned
-              , layerPushBytes = pushFor (plannedSpace planned)
+              , layerPush = pushFor (plannedSpace planned)
               , layerBytes = bytes
               , layerRunList = [RunWork (fromIntegral (runStart run)) (fromIntegral (runCount run)) (runPath run) | run ← plannedRuns planned]
               }
         )
+
+-- | Whether a view records a draw: a non-empty scissor and a layer with a run.
+-- Only such a view's clip table is written to the batch's clip region.
+viewDraws ∷ ViewWork → Bool
+viewDraws view = isJust (workRect view) && any (not . null . layerRunList) (workLayers view)
+
+-- | Give each drawing view's layers the index of its table's first entry in the
+-- batch's clip region, the tables following one another in pass and view order.
+assignClipBases ∷ [PassWork] → [PassWork]
+assignClipBases = snd . mapAccumL pass 0
+  where
+    pass base work =
+      let (base', views) = mapAccumL view base (workViews work)
+       in (base', work {workViews = views})
+    view base work
+      | viewDraws work = (base + fromIntegral (length (workClips work)), work {workLayers = map (withBase base) (workLayers work)})
+      | otherwise = (base, work)
+    withBase base layer = layer {layerPush = (layerPush layer) {pushClipBase = base}}
+
+-- | The bytes of the batch's clip region: the resolved tables of the views that
+-- draw, one after another in pass and view order, 'clipEntryBytes' an entry. A
+-- frame that draws but has no entry gets a single zero entry, since set 2 must
+-- be bound for any draw; a frame that draws nothing has none ('Nothing').
+clipRegion ∷ [PassWork] → Maybe ByteString
+clipRegion passes
+  | not (any passDraws passes) = Nothing
+  | null entries = Just (ByteString.replicate clipEntryBytes 0)
+  | otherwise = Just (packClipTable entries)
+  where
+    entries = [entry | pass ← passes, view ← workViews pass, viewDraws view, entry ← workClips view]
+
+-- | Refuse a frame whose clip region is larger than the window: the region's
+-- size and the window, in bytes. The window is the storage-table window the
+-- ring was made with.
+requireClipWindow ∷ Word64 → [PassWork] → Either FrameRefusal ()
+requireClipWindow window passes = case clipRegion passes of
+  Just bytes | toInteger (ByteString.length bytes) > toInteger window → Left (ClipTablesTooLarge (fromIntegral (ByteString.length bytes)) window)
+  _ → Right ()

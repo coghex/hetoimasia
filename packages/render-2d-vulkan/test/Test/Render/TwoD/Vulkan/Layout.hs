@@ -26,10 +26,11 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , tableSamplerIndex
   , vertexFormatBytes
   )
-import Hetoimasia.GPU.Vulkan.Native.Shader.Interface (CheckedShader (..), CheckedShaders (..), PushMember (..), ShaderInterface (..))
+import Hetoimasia.GPU.Vulkan.Native.Shader.Interface (CheckedShader (..), CheckedShaders (..), PushMember (..), ShaderInterface (..), storageTableDescriptors, textureTableDescriptors)
 import Hetoimasia.Math.Affine2 (fromColumns)
 import Hetoimasia.Math.Vector (V2 (..))
 import Hetoimasia.Render.Api.Texture.Backend (textureHandle)
+import Hetoimasia.Render.TwoD.Clip (ResolvedClip (..), emptyClip)
 import Hetoimasia.Render.TwoD.Encoding (encodeLayer, flagsWord)
 import Hetoimasia.Render.TwoD.Mapping (viewportContains)
 import Hetoimasia.Render.TwoD.Settings (TextureFilter (..), defaultViewSettings)
@@ -43,6 +44,7 @@ spec ∷ Spec
 spec = describe "Layout" $ do
   scissorSpec
   pushSpec
+  clipTableSpec
   attributeSpec
   depthSpec
   samplerSpec
@@ -116,19 +118,21 @@ scissorSpec = describe "the scissor of a view" $ do
 
 pushSpec ∷ Spec
 pushSpec = describe "the push block" $ do
-  it "is 44 bytes in six members that tile it, each at its natural alignment" $ do
-    pushBytes `shouldBe` 44
+  it "is 72 bytes in nine members that tile it, each at its natural alignment" $ do
+    pushBytes `shouldBe` 72
     [(offset, size) | PushMember offset size ← pushMembers]
-      `shouldBe` [(0, 16), (16, 8), (24, 8), (32, 4), (36, 4), (40, 4)]
+      `shouldBe` [(0, 16), (16, 8), (24, 8), (32, 4), (36, 4), (40, 4), (44, 4), (48, 16), (64, 8)]
     -- Each member starts where the one before ends.
     and (zipWith (\(PushMember offset size) (PushMember next _) → offset + size == next) pushMembers (drop 1 pushMembers)) `shouldBe` True
     sum [size | PushMember _ size ← pushMembers] `shouldBe` fromIntegral pushBytes
 
-  it "packs a transform, an extent, a brightness, a filter and a snap flag at their offsets" $ do
+  it "packs a transform, its inverse, a clip base, an extent, a brightness, a filter and a snap flag at their offsets" $ do
     let bytes =
           packViewPush
             ViewPush
               { pushTransform = fromColumns (V2 2 0) (V2 0 2) (V2 10 20)
+              , pushInverse = fromColumns (V2 0.5 0) (V2 0 0.5) (V2 (-5) (-10))
+              , pushClipBase = 3
               , pushExtent = (640, 480)
               , pushBrightness = 1.5
               , pushFilter = FilterLinear
@@ -147,6 +151,13 @@ pushSpec = describe "the push block" $ do
         , [0x00, 0x00, 0xC0, 0x3F] -- 32: brightness = 1.5
         , [0x02, 0x00, 0x00, 0x00] -- 36: filter = linear (2)
         , [0x01, 0x00, 0x00, 0x00] -- 40: snap on
+        , [0x03, 0x00, 0x00, 0x00] -- 44: clip base = 3
+        , [0x00, 0x00, 0x00, 0x3F] -- 48: inverse a = 0.5
+        , [0x00, 0x00, 0x00, 0x00] -- 52: inverse b = 0.0
+        , [0x00, 0x00, 0x00, 0x00] -- 56: inverse c = 0.0
+        , [0x00, 0x00, 0x00, 0x3F] -- 60: inverse d = 0.5
+        , [0x00, 0x00, 0xA0, 0xC0] -- 64: inverse tx = -5.0
+        , [0x00, 0x00, 0x20, 0xC1] -- 68: inverse ty = -10.0
         ]
 
   it "packs nearest as 1 and snap off as 0, with the transform's off-diagonal and negative values" $ do
@@ -154,6 +165,8 @@ pushSpec = describe "the push block" $ do
           packViewPush
             ViewPush
               { pushTransform = fromColumns (V2 0 1) (V2 (-1) 0) (V2 0.5 (-0.25))
+              , pushInverse = fromColumns (V2 0 (-1)) (V2 1 0) (V2 0.25 0.5)
+              , pushClipBase = 0
               , pushExtent = (1, 2)
               , pushBrightness = 0.5
               , pushFilter = FilterNearest
@@ -172,6 +185,13 @@ pushSpec = describe "the push block" $ do
         , [0x00, 0x00, 0x00, 0x3F] -- brightness = 0.5
         , [0x01, 0x00, 0x00, 0x00] -- filter = nearest (1)
         , [0x00, 0x00, 0x00, 0x00] -- snap off
+        , [0x00, 0x00, 0x00, 0x00] -- clip base = 0
+        , [0x00, 0x00, 0x00, 0x00] -- inverse a = 0.0
+        , [0x00, 0x00, 0x80, 0xBF] -- inverse b = -1.0
+        , [0x00, 0x00, 0x80, 0x3F] -- inverse c = 1.0
+        , [0x00, 0x00, 0x00, 0x00] -- inverse d = 0.0
+        , [0x00, 0x00, 0x80, 0x3E] -- inverse tx = 0.25
+        , [0x00, 0x00, 0x00, 0x3F] -- inverse ty = 0.5
         ]
 
   it "gives a filter the code an instance's sampler choice uses for it" $ do
@@ -296,15 +316,43 @@ samplerSpec = describe "the sampler an instance resolves to" $ do
     and [shaderSamplerIndex flags code `elem` [0, 2] | flags ← [0 .. 255], code ← [1, 2]] `shouldBe` True
 
 -- ---------------------------------------------------------------------------
+-- The clip table
+
+clipTableSpec ∷ Spec
+clipTableSpec = describe "the clip table" $ do
+  it "is a vec4 an entry: 16 bytes" $
+    clipEntryBytes `shouldBe` 16
+
+  it "packs an entry's left, top, right and bottom as little-endian floats, in table order" $
+    ByteString.unpack (packClipTable [ResolvedClip 1 2 3 4, ResolvedClip (-0.5) 0.25 8 (-2)])
+      `shouldBe` concat
+        [ [0x00, 0x00, 0x80, 0x3F] -- 0: left = 1.0
+        , [0x00, 0x00, 0x00, 0x40] -- 4: top = 2.0
+        , [0x00, 0x00, 0x40, 0x40] -- 8: right = 3.0
+        , [0x00, 0x00, 0x80, 0x40] -- 12: bottom = 4.0
+        , [0x00, 0x00, 0x00, 0xBF] -- 16: left = -0.5
+        , [0x00, 0x00, 0x80, 0x3E] -- 20: top = 0.25
+        , [0x00, 0x00, 0x00, 0x41] -- 24: right = 8.0
+        , [0x00, 0x00, 0x00, 0xC0] -- 28: bottom = -2.0
+        ]
+
+  it "packs the empty clip as sixteen zero bytes, and a table of none as no bytes" $ do
+    packClipTable [emptyClip] `shouldBe` ByteString.replicate 16 0
+    packClipTable [] `shouldBe` ByteString.empty
+
+  it "is as many entries as it was given, each 16 bytes" $
+    ByteString.length (packClipTable (replicate 7 (ResolvedClip 0 0 1 1))) `shouldBe` 7 * clipEntryBytes
+
+-- ---------------------------------------------------------------------------
 -- The shaders' interfaces
 
 interfaceSpec ∷ Spec
 interfaceSpec = describe "the shaders' checked interfaces" $ do
-  it "declare one push block of 44 bytes in both stages" $
+  it "declare one push block of 72 bytes in both stages" $
     case (checkedVertex orderedShaders, checkedFragment orderedShaders) of
       (CheckedShader _ vertex, CheckedShader _ fragment) →
         [(offset, offset + size) | PushMember offset size ← interfacePushConstants vertex <> interfacePushConstants fragment]
-          `shouldBe` concat (replicate 2 [(0, 16), (16, 24), (24, 32), (32, 36), (36, 40), (40, 44)])
+          `shouldBe` concat (replicate 2 [(0, 16), (16, 24), (24, 32), (32, 36), (36, 40), (40, 44), (44, 48), (48, 64), (64, 72)])
 
   it "declare the instance attributes in the vertex stage, which both variants share" $
     mapM_
@@ -323,11 +371,18 @@ interfaceSpec = describe "the shaders' checked interfaces" $ do
         cutoutVertexCode `shouldBe` orderedVertexCode
         (cutoutFragmentCode == orderedFragmentCode) `shouldBe` False
 
+  it "declare the clip table's binding in the fragment stage, beside the texture table's, and none in the vertex stage" $
+    case (checkedVertex orderedShaders, checkedFragment orderedShaders, checkedFragment cutoutShaders) of
+      (CheckedShader _ vertex, CheckedShader _ fragment, CheckedShader _ cutout) → do
+        interfaceDescriptors vertex `shouldBe` []
+        interfaceDescriptors fragment `shouldBe` textureTableDescriptors <> storageTableDescriptors
+        interfaceDescriptors cutout `shouldBe` interfaceDescriptors fragment
+
   it "declare the same members in both stages" $
     case (checkedVertex orderedShaders, checkedFragment orderedShaders) of
       (CheckedShader _ vertex, CheckedShader _ fragment) → do
         interfacePushConstants vertex `shouldBe` interfacePushConstants fragment
-        length (interfacePushConstants vertex) `shouldBe` 6
+        length (interfacePushConstants vertex) `shouldBe` 9
 
 -- ---------------------------------------------------------------------------
 -- Fixtures
@@ -351,7 +406,7 @@ distinctInstance =
 -- | The validated layer holding this one instance.
 oneLayer ∷ Instance → ValidLayer
 oneLayer candidate =
-  case validateSnapshot (Snapshot [Pass WindowTarget (ClearColour 0 0 0 1) [View (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 64 64)) defaultViewSettings [UiLayer [candidate]]]]) of
+  case validateSnapshot (Snapshot [Pass WindowTarget (ClearColour 0 0 0 1) [View (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 64 64)) defaultViewSettings [] [UiLayer [candidate]]]]) of
     Right valid | layer : _ ← validLayers valid → layer
     other → error ("the fixture was refused: " <> either show (const "no layer") other)
 

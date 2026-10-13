@@ -28,7 +28,7 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word32)
 import Hetoimasia.Asset.Image (DecodedImage (..), TexelFormat (..))
-import Hetoimasia.GPU.Vulkan.Native.Recording (ImageFormat (..), PipelineDepth (..), PipelineRequest (..), Refusal (..), validateRingSize)
+import Hetoimasia.GPU.Vulkan.Native.Recording (ImageFormat (..), PipelineDepth (..), PipelineRequest (..), Refusal (..), validateRingSize, validateStorageWindow)
 import Hetoimasia.GPU.Vulkan.Native.TextureTable (LookupEntry (..), TableView (..), readTable, validateTableConfig)
 import Hetoimasia.Math.Affine2 (fromColumns)
 import Hetoimasia.Math.Vector (V2 (..))
@@ -139,6 +139,7 @@ withEnvOffering offered windows action = do
       rig
       Render.Configuration
         { Render.configurationRing = either (error . show) id (validateRingSize (64 * 1024))
+        , Render.configurationClipWindow = either (error . show) id (validateStorageWindow 4096)
         , Render.configurationTable = either (error . show) id (validateTableConfig 16 8 4)
         }
   resetJournal rig
@@ -164,7 +165,7 @@ registered env shade binary policy = do
 -- | A window snapshot of one UI layer naming these textures.
 windowSnapshot ∷ [Api.TextureHandle] → Snapshot
 windowSnapshot handles =
-  Snapshot [Pass WindowTarget (ClearColour 0 0 0 1) [View (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 16 16)) defaultViewSettings [UiLayer (map sprite handles)]]]
+  Snapshot [Pass WindowTarget (ClearColour 0 0 0 1) [View (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 16 16)) defaultViewSettings [] [UiLayer (map sprite handles)]]]
 
 sprite ∷ Api.TextureHandle → Instance
 sprite handle =
@@ -671,7 +672,7 @@ frameSpec = describe "rendering a window's scene" $ do
 -- depth-enabled world layer (layer 1) holding them all.
 deepSnapshot ∷ [Api.TextureHandle] → Snapshot
 deepSnapshot handles =
-  Snapshot [Pass WindowTarget (ClearColour 0 0 0 1) [View (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 16 16)) defaultViewSettings [UiLayer (map sprite (take 1 handles)), WorldLayer DepthEnabled (map sprite handles)]]]
+  Snapshot [Pass WindowTarget (ClearColour 0 0 0 1) [View (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 16 16)) defaultViewSettings [] [UiLayer (map sprite (take 1 handles)), WorldLayer DepthEnabled (map sprite handles)]]]
 
 -- | The scene a snapshot makes.
 sceneFor ∷ Snapshot → Scene2D
@@ -702,7 +703,7 @@ depthSpec = describe "world depth" $ do
   it "publishes and records a depth-free snapshot on a device that offers only X8_D24, building no depth pipeline" $
     withEnvOffering [Depth24, Depth16] [1] $ \env → do
       handle ← registered env 1 True DefaultMark
-      let flat = Snapshot [Pass WindowTarget (ClearColour 0 0 0 1) [View (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 16 16)) defaultViewSettings [UiLayer [sprite handle], WorldLayer DepthDisabled [sprite handle]]]]
+      let flat = Snapshot [Pass WindowTarget (ClearColour 0 0 0 1) [View (Camera (V2 0 0) 1 Nothing) (Viewport (V2 0 0) (V2 16 16)) defaultViewSettings [] [UiLayer [sprite handle], WorldLayer DepthDisabled [sprite handle]]]]
       publish2DSnapshot (envAdapter env) 1 flat >>= (`shouldBe` Right 1)
       -- The frame-less batch refuses the window pass's first command; the
       -- renderer's preparation, which makes the pipelines, came before it.

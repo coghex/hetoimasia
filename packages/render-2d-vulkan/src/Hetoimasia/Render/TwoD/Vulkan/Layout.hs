@@ -6,8 +6,11 @@
 --   instance at render-2d's 64-byte stride, each attribute at its offset in
 --   #414's layout ('instanceVertexInput').
 -- * The push block both stages declare: the view's transform, the attachment's
---   extent, the view's brightness, its default filter and whether it snaps
+--   extent, the view's brightness, its default filter and whether it snaps,
+--   where the view's clip table starts and the inverse of the transform
 --   ('packViewPush', 'pushMembers').
+-- * The clip table a batch binds as set 2: one 16-byte entry per clip, in the
+--   resolved rectangle's four edges, std430 ('packClipTable', 'clipEntryBytes').
 -- * The depth an instance's key gives ('depthFromKey'), which is what the vertex
 --   stage writes (R2D-9).
 -- * The sampler an instance resolves to ('shaderSamplerIndex'), which is what
@@ -19,18 +22,51 @@
 --
 -- = The push block
 --
--- Both stages declare one block, in std430 order, 44 bytes:
+-- Both stages declare one block, in std430 order, 72 bytes:
 --
 -- > offset  size  member
--- >      0    16  vec4 viewLinear       a, b, c, d of the view's transform
--- >     16     8  vec2 viewTranslation  tx, ty
--- >     24     8  vec2 extent           the attachment's width and height, in pixels
+-- >      0    16  vec4 viewLinear          a, b, c, d of the layer's transform
+-- >     16     8  vec2 viewTranslation     tx, ty
+-- >     24     8  vec2 extent              the attachment's width and height, in pixels
 -- >     32     4  float brightness
--- >     36     4  uint filtering        the view's default filter: 1 nearest, 2 linear
--- >     40     4  uint snap             1 when the view snaps instance origins
+-- >     36     4  uint filtering           the view's default filter: 1 nearest, 2 linear
+-- >     40     4  uint snap                1 when the view snaps instance origins
+-- >     44     4  uint clipBase            the view's clip table's first entry, in entries
+-- >     48    16  vec4 inverseLinear       a, b, c, d of the transform's inverse
+-- >     64     8  vec2 inverseTranslation  tx, ty of the inverse
 --
 -- The transform maps @(x, y)@ to @(a·x + c·y + tx, b·x + d·y + ty)@, the
--- coefficients of "Hetoimasia.Math.Affine2" in column-major order.
+-- coefficients of "Hetoimasia.Math.Affine2" in column-major order. The block is
+-- pushed per layer, so the transform and its inverse are those of the layer's
+-- space, the world's or the UI's, exactly as 'Hetoimasia.Render.TwoD.Mapping'
+-- gives them, with the world's translation snapped when the view snaps.
+--
+-- = The clip table (R2D-12)
+--
+-- A batch writes the clip tables of every view that draws into one ring region
+-- (claimed with the backend's table alignment) and binds it as set 2, binding 0,
+-- a read-only std430 buffer of @vec4@s. A view's table is its resolved entries
+-- ('Hetoimasia.Render.TwoD.Clip.resolveClips') in table order, each as one
+-- @vec4@ of 16 bytes, little-endian:
+--
+-- > offset  size  field
+-- >      0     4  float left    the half-open rectangle in the layer's space,
+-- >      4     4  float top     a point inside when left ≤ x < right and
+-- >      8     4  float right   top ≤ y < bottom; an empty clip is all zeros
+-- >     12     4  float bottom
+--
+-- The views' tables follow one another with no padding, in pass and view
+-- order: a 16-byte entry needs none, and the region's own start is aligned by
+-- the claim. The @clipBase@ member of the push block is the index of a view's
+-- first entry within the region, in entries (units of 16 bytes), so an
+-- instance whose flags word holds clip index @k > 0@ reads entry
+-- @clipBase + k − 1@, and a view's index @k@ always means that view's own
+-- entry @k − 1@. Clip index 0 reads nothing, so a view with no table, and a
+-- layer of such a view, pushes a base of 0 and never looks. A batch that draws
+-- but holds no clip entry at all still binds a region of one zero entry,
+-- because a layout holding set 2 refuses a draw until set 2 is bound; the
+-- region's size, and the window it must fit, are in 'clipEntryBytes' times the
+-- entries.
 module Hetoimasia.Render.TwoD.Vulkan.Layout
   ( -- * The instance as vertex input
     instanceStride
@@ -42,6 +78,9 @@ module Hetoimasia.Render.TwoD.Vulkan.Layout
   , pushBytes
   , packViewPush
   , filterCode
+    -- * The clip table
+  , clipEntryBytes
+  , packClipTable
     -- * Sampler choice
   , shaderSamplerIndex
   , instanceSamplerBits
@@ -67,6 +106,7 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
 import Hetoimasia.GPU.Vulkan.Native.Shader.Interface (PushMember (..))
 import Hetoimasia.Math.Affine2 (Affine2, toColumnMajor)
 import Hetoimasia.Math.Vector (V2 (..))
+import Hetoimasia.Render.TwoD.Clip (ResolvedClip (..))
 import Hetoimasia.Render.TwoD.Settings (TextureFilter (..))
 import Hetoimasia.Render.TwoD.Snapshot (Viewport (..), depthKeyLimit)
 
@@ -119,10 +159,17 @@ depthFromKey key
   | otherwise = Just (fromIntegral (depthKeyLimit - 1 - key) / fromIntegral depthKeyLimit)
 
 -- | What a view's draws need beyond the instance: the transform of the layer's
--- space, the attachment's extent, and the view's settings.
+-- space and its inverse, the attachment's extent, the view's settings and where
+-- its clip table starts.
 data ViewPush = ViewPush
   { pushTransform ∷ !Affine2
     -- ^ The world or UI transform, to target pixels.
+  , pushInverse ∷ !Affine2
+    -- ^ Its inverse, from target pixels back to the layer's space, which the
+    -- fragment stage clips in.
+  , pushClipBase ∷ !Word32
+    -- ^ The index, in entries, of the view's first entry in the batch's clip
+    -- region.
   , pushExtent ∷ !(Word32, Word32)
     -- ^ The attachment's width and height.
   , pushBrightness ∷ !Float
@@ -142,11 +189,14 @@ pushMembers =
   , PushMember 32 4
   , PushMember 36 4
   , PushMember 40 4
+  , PushMember 44 4
+  , PushMember 48 16
+  , PushMember 64 8
   ]
 
 -- | The block's size in bytes.
 pushBytes ∷ Int
-pushBytes = 44
+pushBytes = 72
 
 -- | The block, little-endian, 'pushBytes' bytes.
 packViewPush ∷ ViewPush → ByteString
@@ -158,8 +208,21 @@ packViewPush view =
       <> floatLE (pushBrightness view)
       <> word32LE (filterCode (pushFilter view))
       <> word32LE (if pushSnap view then 1 else 0)
+      <> word32LE (pushClipBase view)
+      <> foldMap floatLE (toColumnMajor (pushInverse view))
   where
     (width, height) = pushExtent view
+
+-- | The size of one clip table entry in bytes: 16, a @vec4@.
+clipEntryBytes ∷ Int
+clipEntryBytes = 16
+
+-- | A view's resolved clip table as the batch's region holds it:
+-- 'clipEntryBytes' per entry, in table order, each the edges left, top, right
+-- and bottom as little-endian floats.
+packClipTable ∷ [ResolvedClip] → ByteString
+packClipTable =
+  Lazy.toStrict . toLazyByteString . foldMap (\(ResolvedClip left top right bottom) → foldMap floatLE [left, top, right, bottom])
 
 -- | A filter's code in the block, which is also the sampler choice code of an
 -- instance that names it: 1 nearest, 2 linear.

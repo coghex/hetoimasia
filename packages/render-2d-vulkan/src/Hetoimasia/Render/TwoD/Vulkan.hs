@@ -12,9 +12,11 @@
 --
 -- = Making the renderer
 --
--- 'makeRenderer' makes, through the host's constructions, the session's ring,
--- the texture table the draws go through, and a shader-sampled table pipeline
--- layout (R2D-16) over the package's shaders. A pipeline is made per colour
+-- 'makeRenderer' makes, through the host's constructions, the session's ring
+-- with the storage-table window the clip tables are bound through (R2D-12),
+-- the texture table the draws go through, the storage table (set 2), and a
+-- shader-sampled table pipeline layout (R2D-16) that holds set 2, over the
+-- package's shaders. A pipeline is made per colour
 -- format and per kind ('PipelineKind') the first time a pass into that format
 -- draws with it. The textures are registered with the table by their owner; the
 -- recorder samples whatever handles the snapshot names, and an unregistered or
@@ -28,8 +30,9 @@
 -- refusal there is a 'FrameRefusal' naming where, and nothing has been
 -- recorded. What it returns records into the batch's recorder:
 --
--- 1. every layer's instances, written in drawing order into one ring region
---    each, all claimed before the first pass begins; a full ring is a refusal
+-- 1. the batch's clip tables, written into one ring region claimed for the
+--    storage table, then every layer's instances, written in drawing order into
+--    one ring region each, all claimed before the first pass begins; a full ring is a refusal
 --    ('RefusedByBackend') with no clear and no draw recorded, and the batch's
 --    claims stay the backend's to reclaim or discard;
 -- 2. each pass in list order: it begins rendering into its target, cleared to
@@ -37,8 +40,8 @@
 --    window's frame as the frame's own), and, when a view with a non-empty
 --    scissor holds a depth-enabled world layer, with the caller's depth image
 --    as its depth attachment, cleared to 1.0 across it. It binds its first
---    run's pipeline, the table and a viewport over the whole attachment,
---    draws, and ends before the next begins;
+--    run's pipeline, the table, the clip region as the storage table and a
+--    viewport over the whole attachment, draws, and ends before the next begins;
 -- 3. within a pass, each view in order under its scissor, which covers
 --    exactly the pixels whose centres the view's viewport contains; a view
 --    whose scissor is empty records no clear and no draw;
@@ -47,6 +50,19 @@
 --    block, then one instanced draw of six vertices per run, binding the run's
 --    pipeline when it is not the bound one, the instance region at the run's
 --    first instance and drawing its count.
+--
+-- = Clip tables (R2D-12)
+--
+-- The resolved clip tables of the views that draw are packed into one region
+-- ("Hetoimasia.Render.TwoD.Vulkan.Layout" has the format), claimed with the
+-- backend's table alignment before any layer's instances, and bound with
+-- 'bindStorageTable' at offset 0 wherever the table is bound. Each layer's push
+-- block names its view's first entry. A region larger than the configured clip
+-- window is refused before anything is recorded
+-- ('Hetoimasia.Render.TwoD.Vulkan.Frame.ClipTablesTooLarge'), naming its size
+-- and the window. The fragment stage discards a fragment outside its
+-- instance's clip, in the ordered and the cutout variant, so instances of
+-- different clips share one draw.
 --
 -- = The pipelines
 --
@@ -110,7 +126,7 @@ import Control.Applicative ((<|>))
 import Data.List (mapAccumL, nub)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust, listToMaybe)
-import Data.Word (Word32)
+import Data.Word (Word32, Word64)
 import Hetoimasia.GPU.Vulkan.Native.Recording
   ( BufferSource (..)
   , CompareOp (..)
@@ -125,6 +141,7 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , Refusal (..)
   , RingClaim
   , RingSize
+  , StorageWindow
   , Viewport (..)
   , beginFrameRenderingWithDepth
   , beginRendering
@@ -141,12 +158,16 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , pushConstants
   , setScissor
   , setViewport
+  , storageWindowBytes
   , validateRingSize
+  , validateStorageWindow
   , writeClaim
   )
 import Hetoimasia.GPU.Vulkan.Native.TextureTable
   ( TableConfig
+  , bindStorageTable
   , bindTable
+  , claimTable
   , defaultVersionCount
   , validateTableConfig
   )
@@ -157,45 +178,57 @@ import Hetoimasia.Render.TwoD.Vulkan.Frame
 import Hetoimasia.Render.TwoD.Vulkan.Layout (instanceStride)
 import Hetoimasia.Render.TwoD.Vulkan.Shaders (cutoutShaders, orderedShaders)
 
--- | What the renderer makes with: the session's ring and its texture table.
+-- | What the renderer makes with: the session's ring, its texture table and the
+-- storage-table window a batch's clip tables must fit.
 data Configuration = Configuration
   { configurationRing ∷ !RingSize
   , configurationTable ∷ !TableConfig
+  , configurationClipWindow ∷ !StorageWindow
+    -- ^ The most bytes of clip table one batch may bind, 16 an entry: the
+    -- window the ring is made with. A batch whose packed tables are larger is
+    -- refused.
   }
 
--- | A four-mebibyte ring and a table of 1024 slots, 64 allocated at first,
--- with the default version ring.
+-- | A four-mebibyte ring, a table of 1024 slots, 64 allocated at first, with
+-- the default version ring, and a clip window of 64 kibibytes, 4096 entries.
 defaultConfiguration ∷ Configuration
 defaultConfiguration =
   Configuration
     (either (error . show) id (validateRingSize (4 * 1024 * 1024)))
     (either (error . show) id (validateTableConfig 1024 64 (toInteger defaultVersionCount)))
+    (either (error . show) id (validateStorageWindow (64 * 1024)))
 
 -- | The renderer's state: the table's shader-sampled layout, and the pipeline
 -- made for each colour format and kind.
 data Renderer = Renderer
   { rendererLayout ∷ !PipelineLayout
+  , rendererClipWindow ∷ !Word64
+    -- ^ The bytes of clip table a batch may bind.
   , rendererDepthFormat ∷ !(Maybe ImageFormat)
     -- ^ The session's depth format, if it offers one.
   , rendererPipelines ∷ !(IORef (Map.Map (Word32, PipelineKind) Pipeline))
   }
 
--- | Make the ring, the texture table and the pipeline layout.
+-- | Make the ring with its clip window, the texture table, the storage table
+-- and the pipeline layout.
 makeRenderer ∷ Builders q inst msgr phys dev cmd → Configuration → IO (Either Refusal Renderer)
 makeRenderer builders configuration =
-  buildRing builders (configurationRing configuration) >>= \case
+  buildRing builders (configurationRing configuration) (configurationClipWindow configuration) >>= \case
     Left refusal → pure (Left refusal)
     Right () →
       buildTable builders (configurationTable configuration) >>= \case
         Left refusal → pure (Left refusal)
         Right () →
-          buildTableLayout builders orderedShaders >>= \case
+          buildStorageTable builders >>= \case
             Left refusal → pure (Left refusal)
-            Right layout → do
-              -- A session that offers no depth format still renders what has no
-              -- depth-enabled world layer.
-              depth ← either (const Nothing) Just <$> buildDepthFormat builders
-              Right . Renderer layout depth <$> newIORef Map.empty
+            Right () →
+              buildTableLayout builders orderedShaders >>= \case
+                Left refusal → pure (Left refusal)
+                Right layout → do
+                  -- A session that offers no depth format still renders what has no
+                  -- depth-enabled world layer.
+                  depth ← either (const Nothing) Just <$> buildDepthFormat builders
+                  Right . Renderer layout (fromIntegral (storageWindowBytes (configurationClipWindow configuration))) depth <$> newIORef Map.empty
 
 -- | The depth a kind of pipeline declares: none for 'PlainPipeline', otherwise
 -- @D32_SFLOAT@ (D-23), tested less-or-equal, and written only by the cutout
@@ -267,7 +300,7 @@ verifiedDepth builders input = do
     actually depth = fmap (\format → depth {depthFormat = format}) <$> buildImageFormat builders (depthImage depth)
 
 prepareVerified ∷ Builders q inst msgr phys dev cmd → Renderer → FrameInput → IO (Either FrameRefusal (FrameRecording q inst msgr phys dev cmd))
-prepareVerified builders renderer input = case frameWork input of
+prepareVerified builders renderer input = case frameWork input >>= \passes → passes <$ requireClipWindow (rendererClipWindow renderer) passes of
   Left refusal → pure (Left refusal)
   Right passes → do
     let needed = nub [(attachmentFormat (workAttachment pass), kind) | pass ← passes, kind ← kindsOf pass]
@@ -290,19 +323,32 @@ runsOf pass =
   , run ← layerRunList layer
   ]
 
--- | Claim and write every layer's region, then record each pass.
+-- | Claim and write the clip region and every layer's region, then record each
+-- pass.
 recordPrepared ∷ Map.Map (Word32, PipelineKind) Pipeline → [PassWork] → FrameRecording q inst msgr phys dev cmd
-recordPrepared pipelines passes recorder = do
-  claimed ← claimInOrder recorder layersInOrder
-  case claimed of
+recordPrepared pipelines passes recorder =
+  claimClips recorder passes >>= \case
     Left refusal → pure (Left (RefusedByBackend refusal))
-    Right regions → do
-      let byLocation = Map.fromList (zip (map layerLocation layersInOrder) regions)
-      stopAtFirst [recordPass recorder pipelines byLocation pass | pass ← passes]
+    Right clips →
+      claimInOrder recorder layersInOrder >>= \case
+        Left refusal → pure (Left (RefusedByBackend refusal))
+        Right regions → do
+          let byLocation = Map.fromList (zip (map layerLocation layersInOrder) regions)
+          stopAtFirst [recordPass recorder pipelines clips byLocation pass | pass ← passes]
   where
     -- A layer that holds no run, a depth-enabled one that only clears, claims
     -- nothing.
     layersInOrder = [layer | pass ← passes, view ← workViews pass, layer ← workLayers view, not (null (layerRunList layer))]
+
+-- | Claim the batch's clip region, for the storage table, and write the packed
+-- tables into it. A frame that draws nothing has none.
+claimClips ∷ Recorder q inst msgr phys dev cmd → [PassWork] → IO (Either Refusal (Maybe RingClaim))
+claimClips recorder passes = case clipRegion passes of
+  Nothing → pure (Right Nothing)
+  Just bytes →
+    claimTable recorder (fromIntegral (ByteString.length bytes)) >>= \case
+      Left refusal → pure (Left refusal)
+      Right claim → fmap (const (Just claim)) <$> writeClaim recorder claim 0 bytes
 
 -- | Claim every layer's region in order, stopping at the first the backend
 -- refuses, so a full ring is met once and nothing later is claimed.
@@ -325,10 +371,11 @@ claimLayer recorder layer =
 recordPass
   ∷ Recorder q inst msgr phys dev cmd
   → Map.Map (Word32, PipelineKind) Pipeline
+  → Maybe RingClaim
   → Map.Map Location RingClaim
   → PassWork
   → IO (Either FrameRefusal ())
-recordPass recorder pipelines regions pass =
+recordPass recorder pipelines clips regions pass =
   stopAtFirst $
     [backend begin]
       <> bindings
@@ -347,8 +394,13 @@ recordPass recorder pipelines regions pass =
       (Nothing, Just depth) → beginFrameRenderingWithDepth recorder (workClear pass) (clearedDepth (depthImage depth) ClearFromUndefined)
     pipelineOf kind = Map.lookup (attachmentFormat attachment, kind) pipelines
     missing = pure (Left (RefusedByBackend (RefusedIllegal "no pipeline was made for the pass's colour format and kind")))
+    -- The table and the clip region, as the draws after them need them: the
+    -- clip region is bound at its own start, where the batch wrote it.
+    tables =
+      backend (bindTable recorder)
+        : maybe [pure (Left (RefusedByBackend (RefusedIllegal "a pass that draws has no clip region")))] (\claim → [backend (bindStorageTable recorder claim 0)]) clips
     -- The first run's pipeline, the viewport over the whole attachment and the
-    -- table, bound only where something is drawn.
+    -- tables, bound only where something is drawn.
     bindings = case runsOf pass of
       [] → []
       (_, kind) : _ → case pipelineOf kind of
@@ -356,19 +408,20 @@ recordPass recorder pipelines regions pass =
         Just pipeline →
           [ backend (bindPipeline recorder pipeline)
           , backend (setViewport recorder (Viewport 0 0 width height))
-          , backend (bindTable recorder)
           ]
+            <> tables
     viewSteps bound view = case (workRect view, workLayers view) of
       (Just rect, layers@(_ : _)) →
         let (bound', steps) = mapAccumL (layerSteps rect) bound layers
          in (bound', backend (setScissor recorder rect) : concat steps)
       _ → (bound, [])
     layerSteps rect bound layer =
-      -- A depth clear is followed by binding the table again, where the pass
-      -- draws: on MoltenVK a mid-pass clear leaves the descriptor bindings
-      -- unusable by the draws after it, and a draw after one finds the table
-      -- gone unless it is bound anew (Vulkan itself leaves them undisturbed).
-      let clear = concat [[backend (clearDepthRect recorder rect 1)] <> [backend (bindTable recorder) | drawsHere] | layerClearsDepth layer]
+      -- A depth clear is followed by binding the table and the clip region
+      -- again, where the pass draws: on MoltenVK a mid-pass clear leaves the
+      -- descriptor bindings unusable by the draws after it, and a draw after one
+      -- finds the table gone unless it is bound anew (Vulkan itself leaves them
+      -- undisturbed).
+      let clear = concat [[backend (clearDepthRect recorder rect 1)] <> (if drawsHere then tables else []) | layerClearsDepth layer]
        in case (layerRunList layer, Map.lookup (layerLocation layer) regions) of
             ([], _) → (bound, clear)
             (_, Nothing) → (bound, clear <> [pure (Left (PlanDisagrees (layerLocation layer)))])
