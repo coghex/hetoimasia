@@ -76,8 +76,9 @@
 -- * 'PlanDisagrees': the plan and the snapshot's layers do not pair, which
 --   planning the same snapshot never produces;
 -- * 'ClipNotRepresentable': a drawing view whose layers select clips has a
---   scissor and an inverse transform for which the fragment stage's offsets
---   could overflow a float, naming the pass and the view;
+--   scissor and a transform for which the fragment stage's clip arithmetic is not
+--   well conditioned (a layer-space reach that could overflow a float, or a scale
+--   beyond 2¹⁰⁰: 'clipRepresentable'), naming the pass and the view;
 -- * 'ClipTablesTooLarge': the batch's packed clip tables exceed the window
 --   ('requireClipWindow'), naming their size and the window.
 module Hetoimasia.Render.TwoD.Vulkan.Frame
@@ -273,7 +274,8 @@ data FrameRefusal
   | -- | A view whose layers select clips draws where the fragment stage's
     -- layer-space offsets could overflow a float: the pass and the view. A
     -- scissor that spans more than about 10³⁸ units of the layer, whose clip test
-    -- would compare infinities and admit a fragment outside its clip.
+    -- would compare infinities and admit a fragment outside its clip, or a layer
+    -- that spans more than 2¹⁰⁰ pixels a unit.
     ClipNotRepresentable !Int !Int
   | -- | The batch's packed clip tables are this many bytes, and the clip window
     -- is only this many.
@@ -544,7 +546,7 @@ requireClipArithmetic passes =
       Just rect | viewDraws view → any (selectsUnrepresentably rect) (workLayers view)
       _ → False
     selectsUnrepresentably rect layer =
-      isJust (layerClipSpace layer) && not (clipRepresentable (pushInverse (layerPush layer)) (rectWidth rect, rectHeight rect))
+      isJust (layerClipSpace layer) && not (clipRepresentable (pushTransform (layerPush layer)) (pushInverse (layerPush layer)) (rectWidth rect, rectHeight rect))
 
 -- | The bytes of the batch's clip region: the tables of the views that draw, one
 -- after another in pass and view order, 'clipEntryBytes' an entry. A frame that

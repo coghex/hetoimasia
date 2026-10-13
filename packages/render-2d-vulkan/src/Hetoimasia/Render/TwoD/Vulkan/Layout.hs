@@ -129,7 +129,7 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
 import Hetoimasia.GPU.Vulkan.Native.Shader.Interface (PushMember (..))
 import Hetoimasia.Math.Affine2 (Affine2, toColumnMajor)
 import Hetoimasia.Math.Vector (V2 (..))
-import GHC.Float (double2Float, float2Double)
+import GHC.Float (float2Double)
 import Hetoimasia.Render.TwoD.Clip (ResolvedClip (..), clipIsEmpty, emptyClip)
 import Hetoimasia.Render.TwoD.Settings (TextureFilter (..))
 import Hetoimasia.Render.TwoD.Snapshot (Viewport (..), depthKeyLimit)
@@ -258,10 +258,11 @@ packClipTable =
 -- | The layer-space point under a target-pixel point, for the transform that
 -- takes the layer's space to target pixels: the exact inverse of the transform,
 -- applied to the point, computed over 'Rational's from the transform's float
--- coefficients and rounded once to double precision. A transform that has no
--- inverse gives the origin: its view draws nothing, since a mapping that exists
--- for a non-empty viewport is invertible.
-clipReference ∷ Affine2 → (Float, Float) → (Double, Double)
+-- coefficients and left exact (it is rounded only after an edge has been taken
+-- from it: 'rebaseClip'). A transform that has no inverse gives the origin: its
+-- view draws nothing, since a mapping that exists for a non-empty viewport is
+-- invertible.
+clipReference ∷ Affine2 → (Float, Float) → (Rational, Rational)
 clipReference transform (centreX, centreY) = case map toRational (toColumnMajor transform) of
   [a, b, c, d, tx, ty]
     | a * d - b * c /= 0 →
@@ -272,48 +273,64 @@ clipReference transform (centreX, centreY) = case map toRational (toColumnMajor 
             id' = a / determinant
             itx = negate (ia * tx + ic * ty)
             ity = negate (ib * tx + id' * ty)
-         in (fromRational (ia * cx + ic * cy + itx), fromRational (ib * cx + id' * cy + ity))
+         in (ia * cx + ic * cy + itx, ib * cx + id' * cy + ity)
   _ → (0, 0)
   where
     cx = toRational centreX
     cy = toRational centreY
 
 -- | A resolved clip with its edges taken about a layer-space reference point
--- ('clipReference'): each edge minus the reference, in double precision and
--- rounded once to a float, and clamped to the finite range, so that no edge is
--- infinite however far from the reference it lies (an edge past the largest
--- float is beyond anything the fragment stage's offsets reach: see
--- 'clipRepresentable'). The empty clip stays empty, and so does a clip the
--- rounding leaves no area (a region narrower than the spacing of floats about
--- the reference, or one wholly beyond the finite range on one side).
-rebaseClip ∷ (Double, Double) → ResolvedClip → ResolvedClip
+-- ('clipReference'): each edge minus the reference, computed exactly over
+-- 'Rational's and rounded once to a float, and clamped to the finite range, so
+-- that no edge is infinite however far from the reference it lies (an edge past
+-- the largest float is beyond anything the fragment stage's offsets reach: see
+-- 'clipRepresentable'). The difference is taken before any rounding: a reference
+-- rounded first loses the low bits that a view at an extreme zoom measures its
+-- edges against. The empty clip stays empty, and so does a clip the rounding
+-- leaves no area (a region narrower than the spacing of floats about the
+-- reference, or one wholly beyond the finite range on one side).
+rebaseClip ∷ (Rational, Rational) → ResolvedClip → ResolvedClip
 rebaseClip (rx, ry) clip@(ResolvedClip left top right bottom)
   | clipIsEmpty clip = emptyClip
   | clipIsEmpty rebased = emptyClip
   | otherwise = rebased
   where
     rebased = ResolvedClip (shifted left rx) (shifted top ry) (shifted right rx) (shifted bottom ry)
-    shifted edge origin = double2Float (max (negate largest) (min largest (float2Double edge - origin)))
-    largest = float2Double (encodeFloat 16777215 104)
+    shifted edge origin
+      | difference >= largest = encodeFloat 16777215 104
+      | difference <= negate largest = negate (encodeFloat 16777215 104)
+      | otherwise = fromRational difference
+      where
+        difference = toRational edge - origin
+    largest = toRational (encodeFloat 16777215 104 ∷ Float)
 
--- | Whether the fragment stage's clip arithmetic stays within the finite
--- floats for a layer whose transform has this inverse, over a scissor of this
--- size: the layer-space offset of a fragment's centre from the scissor's centre
--- is at most the inverse's linear part applied to half the scissor's size, per
--- axis, and that bound must not exceed half the largest finite float, so that
--- neither the offset nor the sum of its two products can overflow (an overflow
--- would admit a fragment whose edge test then compares infinities). It holds
--- whenever the scene is within the floats' own range: a view whose zoom is so
--- small that its scissor spans more than about 10³⁸ units of the layer is the
--- case it refuses.
-clipRepresentable ∷ Affine2 → (Word32, Word32) → Bool
-clipRepresentable inverse (width, height) = case map float2Double (toColumnMajor inverse) of
-  [a, b, c, d, _, _] →
+-- | Whether the fragment stage's clip arithmetic is well conditioned for a
+-- layer whose transform and inverse these are, over a scissor of this size:
+--
+-- * __Reach.__ The layer-space offset of a fragment's centre from the scissor's
+--   centre is at most the inverse's linear part applied to half the scissor's
+--   size, per axis, and that bound must not exceed half the largest finite
+--   float, so that neither the offset nor the sum of its two products can
+--   overflow (an overflow would admit a fragment whose edge test then compares
+--   infinities).
+-- * __Scale.__ The transform's largest linear coefficient, the pixels a unit of
+--   the layer spans, must not exceed 2¹⁰⁰: a device that flushes denormal floats
+--   to zero then moves a clip's edge by at most 2⁻¹²⁶ of a layer unit, which is
+--   under 2⁻²⁶ of a pixel. Gradual underflow moves it by less.
+--
+-- Both hold for any scene within the floats' own comfortable range. A scene
+-- beyond them is what the recorder refuses ('Hetoimasia.Render.TwoD.Vulkan.Frame.ClipNotRepresentable'),
+-- since within them the test agrees with exact geometry to a few millionths of
+-- a pixel.
+clipRepresentable ∷ Affine2 → Affine2 → (Word32, Word32) → Bool
+clipRepresentable transform inverse (width, height) = case (map float2Double (toColumnMajor inverse), map float2Double (toColumnMajor transform)) of
+  ([a, b, c, d, _, _], [fa, fb, fc, fd, _, _]) →
     let halfWidth = fromIntegral width / 2
         halfHeight = fromIntegral height / 2
         reachX = abs a * halfWidth + abs c * halfHeight
         reachY = abs b * halfWidth + abs d * halfHeight
-     in max reachX reachY <= float2Double (encodeFloat 16777215 104) / 2
+        scale = maximum (map abs [fa, fb, fc, fd])
+     in max reachX reachY <= float2Double (encodeFloat 16777215 104) / 2 && scale <= 2 ^ (100 ∷ Int)
   _ → False
 
 -- | A filter's code in the block, which is also the sampler choice code of an

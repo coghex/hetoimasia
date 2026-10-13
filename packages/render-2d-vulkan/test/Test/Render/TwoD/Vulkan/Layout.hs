@@ -27,7 +27,7 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , vertexFormatBytes
   )
 import Hetoimasia.GPU.Vulkan.Native.Shader.Interface (CheckedShader (..), CheckedShaders (..), PushMember (..), ShaderInterface (..), storageTableDescriptors, textureTableDescriptors)
-import Hetoimasia.Math.Affine2 (fromColumns)
+import Hetoimasia.Math.Affine2 (fromColumns, identity)
 import Hetoimasia.Math.Vector (V2 (..))
 import Hetoimasia.Render.Api.Texture.Backend (textureHandle)
 import Hetoimasia.Render.TwoD.Clip (ResolvedClip (..), emptyClip)
@@ -387,26 +387,40 @@ clipTableSpec = describe "the clip table" $ do
   it "leaves a clip wholly past the finite range on one side with no area: empty" $
     rebaseClip (4.4e38, 0) (ResolvedClip (-3.0e38) 0 (-2.0e38) 1) `shouldBe` emptyClip
 
+  it "takes the difference before rounding: a reference no double holds still gives the exact edge" $ do
+    -- At a zoom of 2^60 about a camera at world x = 1, the point under the scissor's
+    -- centre is 1 + 2^-56, which a double rounds to 1: the edge at 1 is 2^-56 of a
+    -- layer unit short of it, not 0.
+    rebaseClip (1 + 2 ^^ (-56 ∷ Int), 0) (ResolvedClip 1 (-1) 2 1) `shouldBe` ResolvedClip (negate (2 ^^ (-56 ∷ Int))) (-1) 1 1
+
   it "finds the clip arithmetic representable at ordinary scales, and not where a scissor spans more than the floats hold" $ do
     let scaled s = fromColumns (V2 s 0) (V2 0 s) (V2 0 0)
+        representable inverse = clipRepresentable identity inverse
     -- Half of 32 pixels is 16, so the offset reaches 16 times the inverse's scale: the
     -- limit is half the largest float, 1.7e38.
-    clipRepresentable (scaled 1) (32, 32) `shouldBe` True
-    clipRepresentable (scaled 1.0e37) (32, 32) `shouldBe` True
-    clipRepresentable (scaled 1.1e37) (32, 32) `shouldBe` False
-    clipRepresentable (scaled 8.0e37) (32, 32) `shouldBe` False
+    representable (scaled 1) (32, 32) `shouldBe` True
+    representable (scaled 1.0e37) (32, 32) `shouldBe` True
+    representable (scaled 1.1e37) (32, 32) `shouldBe` False
+    representable (scaled 8.0e37) (32, 32) `shouldBe` False
 
   it "counts both of an axis's products, so a turn that splits the reach is checked too" $ do
     -- 1e37 · 16 + 1e37 · 16 = 3.2e38 on one axis, past the limit, though each product alone is not
     -- (the first transform's columns are (a, b) = (1e37, 0) and (c, d) = (1e37, 0): all its reach is on x).
-    clipRepresentable (fromColumns (V2 1.0e37 0) (V2 1.0e37 0) (V2 0 0)) (32, 32) `shouldBe` False
-    clipRepresentable (fromColumns (V2 0 1.0e37) (V2 0 1.0e37) (V2 0 0)) (32, 32) `shouldBe` False
-    clipRepresentable (fromColumns (V2 5.0e36 0) (V2 5.0e36 0) (V2 0 0)) (32, 32) `shouldBe` True
-    clipRepresentable (fromColumns (V2 0 5.0e36) (V2 0 5.0e36) (V2 0 0)) (32, 32) `shouldBe` True
+    clipRepresentable identity (fromColumns (V2 1.0e37 0) (V2 1.0e37 0) (V2 0 0)) (32, 32) `shouldBe` False
+    clipRepresentable identity (fromColumns (V2 0 1.0e37) (V2 0 1.0e37) (V2 0 0)) (32, 32) `shouldBe` False
+    clipRepresentable identity (fromColumns (V2 5.0e36 0) (V2 5.0e36 0) (V2 0 0)) (32, 32) `shouldBe` True
+    clipRepresentable identity (fromColumns (V2 0 5.0e36) (V2 0 5.0e36) (V2 0 0)) (32, 32) `shouldBe` True
     -- A tall scissor weighs the second column more: 1e37 · 16 on the first, 1e37 · 160 on the second.
-    clipRepresentable (fromColumns (V2 1.0e37 0) (V2 1.0e37 0) (V2 0 0)) (32, 320) `shouldBe` False
-    clipRepresentable (fromColumns (V2 1.0e37 0) (V2 0 1.0e37) (V2 0 0)) (32, 320) `shouldBe` False
-    clipRepresentable (fromColumns (V2 1.0e37 0) (V2 0 1.0e37) (V2 0 0)) (32, 32) `shouldBe` True
+    clipRepresentable identity (fromColumns (V2 1.0e37 0) (V2 1.0e37 0) (V2 0 0)) (32, 320) `shouldBe` False
+    clipRepresentable identity (fromColumns (V2 1.0e37 0) (V2 0 1.0e37) (V2 0 0)) (32, 320) `shouldBe` False
+    clipRepresentable identity (fromColumns (V2 1.0e37 0) (V2 0 1.0e37) (V2 0 0)) (32, 32) `shouldBe` True
+
+  it "bounds the layer's scale at 2^100 pixels a unit, where a device that flushes denormals would move an edge by a visible amount" $ do
+    let forward s = fromColumns (V2 s 0) (V2 0 s) (V2 0 0)
+        inverse s = fromColumns (V2 (1 / s) 0) (V2 0 (1 / s)) (V2 0 0)
+    clipRepresentable (forward (2 ^^ (100 ∷ Int))) (inverse (2 ^^ (100 ∷ Int))) (32, 32) `shouldBe` True
+    clipRepresentable (forward (2 ^^ (101 ∷ Int))) (inverse (2 ^^ (101 ∷ Int))) (32, 32) `shouldBe` False
+    clipRepresentable (forward (2 ^^ (60 ∷ Int))) (inverse (2 ^^ (60 ∷ Int))) (32, 32) `shouldBe` True
 
 -- ---------------------------------------------------------------------------
 -- The shaders' interfaces

@@ -38,11 +38,11 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   )
 import qualified Hetoimasia.GPU.Vulkan.Native.Recording as Native
 import Hetoimasia.GPU.Vulkan.Native.TextureTable (validateTableConfig)
-import Hetoimasia.Math.Affine2 (fromColumns)
+import Hetoimasia.Math.Affine2 (fromColumns, toColumnMajor)
 import Hetoimasia.Math.Vector (V2 (..))
 import Hetoimasia.Render.Api.Texture (TextureHandle)
 import Hetoimasia.Render.Api.Texture.Backend (textureHandle)
-import Hetoimasia.Render.TwoD.Clip (ClipEntry (..), ClipRect (..))
+import Hetoimasia.Render.TwoD.Clip (ClipEntry (..), ClipRect (..), ResolvedClip (..))
 import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..))
 import Hetoimasia.Render.TwoD.Settings (TextureFilter (..), ViewSettings (..), defaultViewSettings)
 import Hetoimasia.Render.TwoD.DrawPlan (CutoutMarks, DrawPath (..), cutoutMarks, noCutoutMarks)
@@ -63,6 +63,7 @@ spec = describe "Recording" $ do
   refusalSpec
   recordingSpec
   clipSpec
+  clipAgreementSpec
   depthSpec
   depthRefusalSpec
   emptySpec
@@ -780,6 +781,25 @@ clipSpec = describe "clip tables" $ do
           [pushClipCentre (layerPush layer) | work ← workViews only, layer ← workLayers work] `shouldBe` [(16, 16)]
         other → expectationFailure ("expected one pass, found " <> either show (show . length) other)
 
+  it "takes an edge's difference from the reference before rounding: an extreme zoom keeps it exact" $
+    withRig $ \rig → do
+      -- At zoom 2^60 about a camera at world x = 1 over a 32 × 32 viewport the
+      -- translation 16 − 2^60 rounds to −2^60, so a world x is at 2^60 (x − 1) and
+      -- the point under the scissor's centre is x = 1 + 2^-56, which a double
+      -- cannot hold. The clip from (1, -1) of extent (1, 2) is about that point
+      -- −2^-56 to 1 on x and −1 to 1 on y.
+      let view =
+            View
+              (Camera (V2 1 0) (2 ^^ (60 ∷ Int)) Nothing)
+              (Viewport (V2 0 0) (V2 32 32))
+              defaultViewSettings
+              [clipEntry (1, -1) (1, 2) Nothing]
+              [WorldLayer DepthDisabled [clippedSprite 1]]
+      input ← inputOver rig (valid [Pass (OffscreenTarget refA) (ClearColour 0 0 0 1) [view]])
+      case frameWork input of
+        Right [only] → clipRegion [only] `shouldBe` Just (floats [negate (2 ^^ (-56 ∷ Int)), -1, 1, 1])
+        other → expectationFailure ("expected one pass, found " <> either show (show . length) other)
+
   it "refuses a view whose clip test could overflow a float, naming it, and not one that selects no clip" $
     withRig $ \rig → do
       -- The viewport (-16, -16) 32 × 32 over the 32 × 32 target leaves the scissor
@@ -871,6 +891,126 @@ clipSpec = describe "clip tables" $ do
   where
     floatlessWord ∷ Word32 → ByteString
     floatlessWord base = ByteString.pack [fromIntegral (base `div` (256 ^ k) `mod` 256) | k ← [0 .. 3 ∷ Word32]]
+
+-- ---------------------------------------------------------------------------
+-- The clip test against exact geometry
+
+-- | A view to sweep: a name, how its view is made from a clip table, and the
+-- clip entry to test, when it is given rather than placed in the view.
+data Sweep = Sweep String ([ClipEntry] → View) (Maybe ClipEntry)
+
+worldSweep ∷ String → (Float, Float) → Float → Maybe Float → Maybe ClipEntry → Sweep
+worldSweep name (x, y) zoom turn =
+  Sweep
+    name
+    (\table → View (Camera (V2 x y) zoom turn) (Viewport (V2 0 0) (V2 32 32)) defaultViewSettings table [WorldLayer DepthDisabled [clippedSprite 1]])
+
+uiSweep ∷ String → Float → (Float, Float) → Sweep
+uiSweep name scale (x, y) =
+  Sweep
+    name
+    (\table → View (Camera (V2 0 0) 1 Nothing) (Viewport (V2 x y) (V2 28 26)) defaultViewSettings {settingUiScale = scale} table [UiLayer [clippedSprite 1]])
+    Nothing
+
+-- | Every view of the sweep: cameras at the origin, near it and far from it, at
+-- zooms from 2^-100 to 2^100, turned and not, in the world; UI scales and
+-- viewport origins; and the scenes the review found wanting.
+sweeps ∷ [Sweep]
+sweeps =
+  [ worldSweep ("world zoom 2^" <> show k <> " camera " <> show camera <> maybe "" (const " turned") turn) camera (2 ^^ k) turn Nothing
+  | k ← [-100, -60, -20, -5, 0, 5, 20, 60, 100 ∷ Int]
+  , camera ← [(0, 0), (1, 0), (65536, 3), (-400000, 250000)]
+  , turn ← [Nothing, Just 0.6]
+  ]
+    <> [uiSweep ("ui scale " <> show scale <> " origin " <> show origin) scale origin | scale ← [0.5, 1, 3.5], origin ← [(0, 0), (3, 5)]]
+    <> [ worldSweep "round 1: camera (65536, 0), zoom 100" (65536, 0) 100 Nothing (Just (clipEntry (65536.1484375, -1) (0.5, 2) Nothing))
+       , worldSweep "round 3: camera (1, 0), zoom 2^60" (1, 0) (2 ^^ (60 ∷ Int)) Nothing (Just (clipEntry (1, -1) (1, 2) Nothing))
+       ]
+
+-- | The layer-space point under a target-pixel point for a transform's six
+-- coefficients, exactly.
+exactInverse ∷ [Float] → (Rational, Rational) → (Rational, Rational)
+exactInverse coefficients (x, y) = case map toRational coefficients of
+  [a, b, c, d, tx, ty] →
+    let determinant = a * d - b * c
+        dx = x - tx
+        dy = y - ty
+     in ((d * dx - c * dy) / determinant, (a * dy - b * dx) / determinant)
+  _ → (0, 0)
+
+-- | The clip test as the fragment stage evaluates it, in single-precision
+-- arithmetic, on what the work holds: the offset of the pixel's centre from the
+-- push block's centre through the inverse's linear part, compared with the
+-- table's edges.
+shaderInside ∷ ViewPush → ResolvedClip → (Int, Int) → Bool
+shaderInside block (ResolvedClip left top right bottom) (px, py) = case take 4 (toColumnMajor (pushInverse block)) of
+  [a, b, c, d] →
+    let (centreX, centreY) = pushClipCentre block
+        offsetX = fromIntegral px + 0.5 - centreX
+        offsetY = fromIntegral py + 0.5 - centreY
+        localX = a * offsetX + c * offsetY
+        localY = b * offsetX + d * offsetY
+     in localX >= left && localX < right && localY >= top && localY < bottom
+  _ → False
+
+-- | What a sweep found of one view: the disagreements outside the band, the
+-- probes compared and how many of those were inside the clip.
+sweepFindings ∷ FrameInput → Sweep → ([String], Int, Int)
+sweepFindings base (Sweep name makeView given) = case (given, placement) of
+  (Just entry, _) → check entry
+  (Nothing, Just entry) → check entry
+  (Nothing, Nothing) → (["could not place a clip in " <> name], 0, 0)
+  where
+    snapshotOf table = valid [Pass (OffscreenTarget refA) (ClearColour 0 0 0 1) [makeView table]]
+    workOf table = frameWork base {frameSnapshot = snapshotOf table}
+    -- A clip whose corners are the layer-space points under two target pixels.
+    placement = case workOf [clipEntry (0, 0) (1, 1) Nothing] of
+      Right [pass] | view : _ ← workViews pass, layer : _ ← workLayers view →
+        let coefficients = toColumnMajor (pushTransform (layerPush layer))
+            (ax, ay) = exactInverse coefficients (6.3, 9.7)
+            (bx, by) = exactInverse coefficients (24.6, 22.4)
+            floatOf = fromRational ∷ Rational → Float
+            (left, right) = (min ax bx, max ax bx)
+            (top, bottom) = (min ay by, max ay by)
+         in Just (ClipEntry (ClipRect (V2 (floatOf left) (floatOf top)) (V2 (floatOf (right - left)) (floatOf (bottom - top)))) Nothing)
+      _ → Nothing
+    check entry = case workOf [entry] of
+      Right [pass]
+        | view : _ ← workViews pass
+        , layer : _ ← workLayers view
+        , Just rect ← workRect view
+        , table : _ ← workTables view
+        , held : _ ← tableEntries table
+        , resolved : _ ← workClips view →
+            let block = layerPush layer
+                coefficients = toColumnMajor (pushTransform block)
+                scale = toRational (maximum (map abs (take 4 coefficients)))
+                ResolvedClip left top right bottom = resolved
+                (l, t, r, b) = (toRational left, toRational top, toRational right, toRational bottom)
+                probes = [(x, y) | y ← [fromIntegral (rectY rect) .. fromIntegral (rectY rect) + fromIntegral (rectHeight rect) - 1], x ← [fromIntegral (rectX rect) .. fromIntegral (rectX rect) + fromIntegral (rectWidth rect) - 1]]
+                judged (x, y) =
+                  let (qx, qy) = exactInverse coefficients (fromIntegral x + 1 / 2, fromIntegral y + 1 / 2)
+                      exact = l <= qx && qx < r && t <= qy && qy < b
+                      margin = fromRational (minimum [abs (qx - l), abs (qx - r), abs (qy - t), abs (qy - b)] * scale) ∷ Double
+                      shader = shaderInside block held (x, y)
+                   in (margin >= 0.07, exact, shader == exact, name <> " pixel " <> show (x, y) <> ": the shader " <> show shader <> ", exact geometry " <> show exact <> ", margin " <> show margin <> " pixels")
+                results = map judged probes
+             in ([why | (compared, _, agrees, why) ← results, compared, not agrees], length [() | (True, _, _, _) ← results], length [() | (True, True, _, _) ← results])
+      Left refusal → (["refused " <> name <> ": " <> show refusal], 0, 0)
+      other → (["unexpected work for " <> name <> ": " <> either show (show . length) other], 0, 0)
+
+clipAgreementSpec ∷ Spec
+clipAgreementSpec = describe "the clip test against exact geometry" $
+  it "agrees with the exact transform and rectangle at every pixel more than 0.07 pixel from a clip's edge, from zooms of 2^-100 to 2^100, near and far cameras, turns, UI scales and the scenes the review found wanting" $
+    withRig $ \rig → do
+      base ← inputOver rig firstFrame
+      let findings = map (sweepFindings base) sweeps
+          disagreements = concat [found | (found, _, _) ← findings]
+          compared = sum [n | (_, n, _) ← findings]
+          inside = sum [n | (_, _, n) ← findings]
+      take 8 disagreements `shouldBe` []
+      -- The sweep is not vacuous: most of its probes are compared, and some of them are inside a clip.
+      (compared > 40000, inside > 5000, inside < compared - 5000) `shouldBe` (True, True, True)
 
 -- ---------------------------------------------------------------------------
 -- Depth (R2D-9)
