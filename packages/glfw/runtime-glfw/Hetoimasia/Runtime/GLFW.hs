@@ -751,6 +751,9 @@ module Hetoimasia.Runtime.GLFW
   , ExtentBounds (..)
   , observationFramebuffer
   , observeGeometry
+  , observeWindowMetrics
+  , observationLogical
+  , observationContentScale
   , boundGeometry
   , SuppliedExtent (..)
   , ChosenExtent (..)

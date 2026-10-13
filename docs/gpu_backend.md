@@ -5100,6 +5100,17 @@ sources, is the session's **primary**:
 | A cleanup that raised | By the destruction or cleanup that raised: a surface — one created while the lease closed included — a root, a generation, a frame's cleanup submission or release, a slot's or pool record's objects, a managed resource | `TerminalCleanupFailed` |
 | A required target's recovery exhausted | The model escalates it; the next checkpoint, or any read of the latch, takes it | `TerminalRequiredTarget` |
 
+Reporting an error wakes no one. The error is latched at the owner's next
+checkpoint, and the owner takes a round only when something asks for one: a
+sink failure and a primary latched on another thread have wakes of their own,
+a validation error does not, and neither does a release request waiting on its
+barrier. An example that reports an error from its own thread therefore gives
+the owner a round afterwards, as an admitted action, a published demand or a
+published scene does, and the integration suite's examples do. One that only
+waited for the failure depended on the owner not yet having ended the round that
+took its last input, which a loaded Linux runner decided the other way in about
+two runs in a hundred (#438).
+
 Latching the primary is one transaction: it closes the roots' admission and
 fails the model's session with the matching cause (`DiagnosticSinkFailed` for
 a sink). Every cleanup failure is latched with its subject and what raised —
@@ -6587,7 +6598,8 @@ resolves to its own slot after the release ran:
    showing it, afterwards;
 3. a snapshot naming the released texture is offered and refused, naming it;
 4. a snapshot without it is published, adopted as revision 2, revision 1 is
-   released by the host, and only then does the release take effect: the
+   released by the host, and only then does the release take effect — by an
+   action that waits for no barrier, since the request's was met in step 2: the
    table no longer maps the handle, and nothing is left pending.
 
 It passes only if the evidence passed; every named probe held; the swap was

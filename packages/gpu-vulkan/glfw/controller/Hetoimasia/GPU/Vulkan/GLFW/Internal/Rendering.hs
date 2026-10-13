@@ -150,6 +150,7 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
   , requestPublished
   , sceneUsed
   , renderDue
+  , WindowView
   , settleCaptures
   , reclaimReleased
   , renderingDeadline
@@ -428,6 +429,19 @@ data FrameRequest = FrameRequest
     -- image with it ('Hetoimasia.GPU.Vulkan.Native.Recording.beginFrameRenderingWithDepth')
     -- and binds only pipelines that declare the depth format
     -- ('constructDepthFormat').
+  , requestLogicalExtent ∷ !(Maybe (Word32, Word32))
+    -- ^ The window's logical extent, width then height, in screen
+    -- coordinates, as the target's latest published observation reported it
+    -- (R2D-8, D-29): 'Nothing' while the platform has reported none, never a
+    -- value made up. It is the window's, not the image's: after a resize it
+    -- may differ from what 'requestExtent' (the framebuffer extent of the
+    -- generation the image belongs to) implies, while an older generation is
+    -- still in use. A renderer that maps views needs it beside the content
+    -- scale, and skips the frame when either is missing.
+  , requestContentScale ∷ !(Maybe (Float, Float))
+    -- ^ The window's content scale, per axis (x then y), from the same
+    -- observation, 'Nothing' while none has been reported. Existing renderers
+    -- ignore both fields.
   }
   deriving (Eq, Show)
 
@@ -1245,6 +1259,10 @@ poll rendering now =
       for_ (progressCompleted progress) (renderingObserver rendering . SubmissionCompleted)
       for_ (progressRetired progress) (renderingObserver rendering . PresentationRetired)
 
+-- | What the owner last held of a window's own geometry for a target, in the
+-- order 'FrameRequest' names it: the logical extent, then the content scale.
+type WindowView = (Maybe (Word32, Word32), Maybe (Float, Float))
+
 -- | Offer each due target one frame of its scene, as the owner adopted it for
 -- that target: the scene and the revision of its publication, which the
 -- caller looks up by the target's attachment. Answers whether any frame was
@@ -1263,9 +1281,10 @@ renderDue
   → VulkanRenderer scene
   → Instant
   → (AttachmentId → Maybe (scene, Natural))
+  → (AttachmentId → WindowView)
   → [(TargetId, AttachmentId)]
   → IO Bool
-renderDue rendering renderer now sceneOf due =
+renderDue rendering renderer now sceneOf windowOf due =
   if null due
     then pure False
     else
@@ -1305,7 +1324,7 @@ renderDue rendering renderer now sceneOf due =
                 Nothing → False <$ abandon made attachment owned (Captured asked Nothing) Nothing "its generation is no longer tracked, or has no depth image the session asked for"
                 Just image → do
                   capture ← if asked then prepareCapture made attachment owned image else pure (Captured False Nothing)
-                  recordOne made target attachment owned image capture scene revision
+                  recordOne made target attachment owned image capture scene revision (windowOf attachment)
             Right (AcquisitionPending reason) → do
               observe (FramePending attachment reason)
               False <$ retryAfterPending target
@@ -1353,8 +1372,8 @@ renderDue rendering renderer now sceneOf due =
             Left refusal → Captured False Nothing <$ withhold attachment (WithheldNoReadback refusal)
             Right readback → pure (Captured True (Just (readback, bytes)))
     withhold attachment reason = atomically (settleCapture captures attachment (CaptureWithheld attachment reason))
-    recordOne made target attachment owned image capture scene revision = do
-      let request = FrameRequest attachment target (ownedFrame owned) (ownedImage owned) (imageExtent image) (imageFormat image) revision (imageDepth image)
+    recordOne made target attachment owned image capture scene revision (logical, scale) = do
+      let request = FrameRequest attachment target (ownedFrame owned) (ownedImage owned) (imageExtent image) (imageFormat image) revision (imageDepth image) logical scale
           construction = construct rendering made
           finish recorder = case capturedWork capture of
             Nothing → transitionImage recorder LayoutColorAttachment LayoutPresentSource

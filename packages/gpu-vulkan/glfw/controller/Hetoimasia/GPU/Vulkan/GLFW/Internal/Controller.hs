@@ -1005,7 +1005,7 @@ controllerOperations (VulkanController state) renderer lifecycle =
         -- A replacement the generations' step just published is asked for a
         -- frame in this step, not left for a later publication to notice.
         published ← requestPublished (stateRendering state) targets (planDue plan)
-        presented ← renderDue (stateRendering state) renderer now (`Map.lookup` adoptable) (planDue plan <> published)
+        presented ← renderDue (stateRendering state) renderer now (`Map.lookup` adoptable) (windowViewOf constructed) (planDue plan <> published)
         -- A capture whose batch completed is delivered in the step whose poll
         -- observed it, and what the renderer or a capture released is
         -- destroyed once nothing holds it.
@@ -1408,6 +1408,21 @@ replacementDeadline state = do
     deposited = \case
       ReplacementDeposited _ → True
       _ → False
+
+-- | The window geometry each constructed target's view carries, by
+-- attachment, for the frames of this step: the logical extent and the content
+-- scale the owner last held, as 'FrameRequest' names them. A target the step
+-- does not view has none.
+windowViewOf ∷ [(TargetId, TargetStepView)] → AttachmentId → WindowView
+windowViewOf constructed attachment = case [view | (_, view) ← constructed, viewTarget view == attachment] of
+  view : _ →
+    ( dimensions <$> geometryLogical (viewGeometry view)
+    , (\scale → (Window.scaleX scale, Window.scaleY scale)) <$> geometryContentScale (viewGeometry view)
+    )
+  [] → (Nothing, Nothing)
+  where
+    dimensions extent = (clamp (Window.extentWidth extent), clamp (Window.extentHeight extent))
+    clamp = fromIntegral . max 0 . min (fromIntegral (maxBound ∷ Word32))
 
 -- | The geometry one target's view carries, in the native backend's terms: its
 -- eligibility, the last coherent framebuffer observation and the bounds the

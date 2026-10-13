@@ -23,7 +23,7 @@ contract is [docs/gpu_backend.md](../../docs/gpu_backend.md).
 | `Hetoimasia.Render.TwoD.Vulkan` | re-exports `Builders`; `Configuration`, `defaultConfiguration`; `Renderer`, `makeRenderer`, `pipelineFor`, `pipelineDeclaration`; `prepareSnapshot`, `FrameRecording`; re-exports `Hetoimasia.Render.TwoD.Vulkan.Frame`, `orderedShaders` and `cutoutShaders` |
 | `Hetoimasia.Render.TwoD.Vulkan.Builders` | `Builders`: the constructions the recorder and the registry need from a host: the ring, the table, the layout, a pipeline, and registering, swapping and releasing an uploaded texture |
 | `Hetoimasia.Render.TwoD.Vulkan.Textures` | `Textures`, `newTextures`; `registerTexture` with a `MarkPolicy`; `swapTexture` with a `SwapPolicy`; `TextureRefusal`; the logical release marker (`markReleased`, `isReleased`), `releaseTextureNow`; `registeredMark`, `registeredMarks` |
-| `Hetoimasia.Render.TwoD.Vulkan.Window` | the host adapter: `Host`, `Adapter`, `newAdapter`; `Scene2D`, `blankScene`; `publish2DSnapshot`, `PublishRefusal`; `release2DTexture`; `adapterAdopted`, `adapterReleased`; `FrameInfo`, `renderWindowFrame` |
+| `Hetoimasia.Render.TwoD.Vulkan.Window` | the host adapter: `Host`, `Adapter`, `newAdapter`; `Scene2D`, `blankScene`; `publish2DSnapshot`, `PublishRefusal`; `release2DTexture`; `adapterAdopted`, `adapterReleased`, `retryReleases`; `FrameInfo`, `renderWindowFrame` |
 | `Hetoimasia.Render.TwoD.Vulkan.Frame` | `Attachment`, `offscreenAttachment`, `TargetBinding`, `DepthBinding`, `FrameInput`; `depthLayers`, `requireWorldDepth`; `FrameRefusal`; `frameWork` and the work it computes: `PassWork`, `ViewWork`, `LayerWork`, `RunWork`, `PipelineKind`, `runPipeline` |
 | `Hetoimasia.Render.TwoD.Vulkan.Layout` | the instance as vertex input (`instanceVertexInput`), the key's depth (`depthFromKey`), the push block (`ViewPush`, `packViewPush`, `pushMembers`), the sampler choice (`shaderSamplerIndex`), the scissor rule (`viewScissor`) |
 | `Hetoimasia.Render.TwoD.Vulkan.ShaderInterfaces` | the checked interface descriptions the shaders are compiled against |
@@ -244,8 +244,10 @@ them per window, holds what each adopted revision references, releases textures
 behind the host's barrier, and renders each window's adopted snapshot into the
 frame's image. A host (the window integration in its per-window mode) gives it
 `Host window`: `hostPublish`, which publishes a `Scene2D` for a window and
-answers the revision or why not, and `hostRequestRelease`, which queues an
-owner-thread action behind the revisions the host must have adopted first.
+answers the revision or why not; `hostRequestRelease`, which queues an
+owner-thread action behind the revisions the host must have adopted first,
+naming the windows it holds at the request; and `hostRunOnOwner`, which queues
+one that waits for nothing.
 `newAdapter host textures` makes it over the registry; the host's lifecycle
 hooks call `adapterAdopted` and `adapterReleased`; the host's renderer calls
 `renderWindowFrame`.
@@ -258,7 +260,8 @@ is refused, checking in this order:
 2. `OffscreenPassHeld`, naming the pass, when the snapshot holds an offscreen
    pass: windowed snapshots hold none until R2D-13 issues target references;
 3. `NoWindowPass`, when the snapshot has no window pass — an empty snapshot
-   included; removing every layer publishes a window pass with none;
+   included; removing every layer publishes a window pass with none (a second
+   window pass is validation's refusal, in 1);
 4. `TextureReleasedInSnapshot`, naming the texture, when the snapshot
    references one whose release was requested (any instance of any layer of
    any view, visible or not);
@@ -276,15 +279,25 @@ revisions are released by the host and so drop theirs. Holds are keyed by
 window and revision.
 
 **Releasing (D-28).** `release2DTexture adapter handle` marks the texture
-released at once, which publication's check reads, adds it to the pending set
-and asks the host for the release. The host runs the request on the owner's
-thread once every window it held at the request has adopted the revision
-current then, and the adapter's release action releases the texture in the
-table only if **no adopted revision holds it**; otherwise the texture keeps
-rendering wherever an adopted snapshot shows it. When a hold ends,
-`adapterReleased` finds each pending texture no hold names and asks again, so
-progress is rechecked whenever either condition changes. The request is
-refused for a handle never registered or already released.
+released, which publication's check reads, and enters it in the pending set —
+one transaction, so a cancellation before the host is asked leaves a texture
+that asking again recovers — and then asks the host for the release through
+`hostRequestRelease`. The host runs that request on the owner's thread once
+every window it held at the request has adopted the revision current then, and
+the action releases the texture in the table only if **no adopted revision
+holds it**; otherwise the texture keeps rendering wherever an adopted snapshot
+shows it, and the texture is recorded as having met its barrier. When the last
+holding revision is released, `adapterReleased` queues the rest through
+`hostRunOnOwner`: an action that waits for nothing, because the barrier has been
+met and a window that appeared since is not named by it and delays nothing. The
+action rechecks the holds on the owner's thread. If the host's queue is full the
+texture stays eligible, and `retryReleases` — which both hooks and the end of
+every release action call, and an application whose host may refuse for lack of
+room can call from its own loop — queues it again, never blocking. So progress
+is rechecked whenever either condition changes. A request the host refused
+leaves the texture marked and pending, and releasing the same handle again
+repeats it; a handle never registered, or whose release has run, is refused as
+`ReleaseUnknown`.
 
 Publication and release are **serialized by one lock**, with the release
 marker and the host's capture of the barrier inside it. So a snapshot accepted
@@ -430,7 +443,7 @@ functions in the fragment stage, so an application material (R2D-11) replaces
 | The ring, the texture table and the pipeline layout | The host session | `makeRenderer` makes them through `Builders`; batches `prepareSnapshot` records read them | Owner | From `makeRenderer` until the host session ends | Released and destroyed with every managed resource before the device |
 | The pipelines, one per colour format and kind | A `Renderer` | `pipelineFor`, on the first pass that draws with the pair | Owner | From that first pass until the host session ends | As above |
 | Each registered handle's mark and release flag | A `Textures` (a `TVar` ledger keyed by the complete handle) | `registerTexture` adds; `markReleased` flags; `releaseTextureNow` removes the mark; any thread reads in STM | Registration, swap and table release on the owner; marker and reads on any | From the registration until the table release | The flag is never cleared: a released handle stays refused after its index is reused |
-| The holds (window and revision to the textures that revision references) and the pending releases | An `Adapter` | `adapterAdopted` and `adapterReleased` on the owner's thread; the release action on the owner's thread; reads on any | Owner writes, any reads | From the adapter's creation until it is dropped | A revision's hold is dropped by its release; a pending texture leaves the set when its release runs |
+| The holds (window and revision to the textures that revision references), the pending releases with their stage, and the textures whose follow-up action is queued | An `Adapter` | `adapterAdopted` and `adapterReleased` on the owner's thread; the release action on the owner's thread; reads on any | Owner writes, any reads | From the adapter's creation until it is dropped | A revision's hold is dropped by its release; a pending texture leaves the set when its release runs |
 | The publication lock | An `Adapter` | `publish2DSnapshot` and `release2DTexture`, each for its whole length | Application threads | The adapter's life | None |
 
 A `Renderer` holds an `IORef` of the pipelines and is used on the graphics

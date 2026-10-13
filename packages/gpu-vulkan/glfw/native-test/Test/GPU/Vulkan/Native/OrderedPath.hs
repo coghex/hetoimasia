@@ -83,6 +83,8 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , copyTargetToReadback
   , formatCode
   , registerConstructedTexture
+  , releaseConstructedTexture
+  , swapConstructedTexture
   , transitionResource
   , validateRingSize
   , validateTableConfig
@@ -287,6 +289,9 @@ builders construction =
     , Render.buildDepthPipeline = constructDepthCheckedPipeline construction
     , Render.buildDepthFormat = constructDepthFormat construction
     , Render.buildImageFormat = constructImageFormat construction
+    , Render.registerImage = registerConstructedTexture construction
+    , Render.swapImage = swapConstructedTexture construction
+    , Render.releaseImage = releaseConstructedTexture construction
     }
 
 -- | What the recorder gives a depth-enabled snapshot over a depth image of a

@@ -91,6 +91,7 @@ module Hetoimasia.Render.TwoD.Vulkan
   , Renderer
   , makeRenderer
   , rendererLayout
+  , rendererDepthFormat
   , pipelineFor
   , pipelineDeclaration
     -- * Recording
@@ -115,7 +116,6 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , CompareOp (..)
   , ImageFormat (..)
   , PassStart (..)
-  , Image
   , Pipeline
   , PipelineBlend (..)
   , PipelineDepth (..)
@@ -144,7 +144,6 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , validateRingSize
   , writeClaim
   )
-import Hetoimasia.GPU.Vulkan.Native.Shader (CheckedShaders)
 import Hetoimasia.GPU.Vulkan.Native.TextureTable
   ( TableConfig
   , bindTable
@@ -153,30 +152,10 @@ import Hetoimasia.GPU.Vulkan.Native.TextureTable
   )
 import Hetoimasia.Render.TwoD.Snapshot (Pass (..), Snapshot (..), Target (..))
 import Hetoimasia.Render.TwoD.Validation (Location (..), validSnapshot)
+import Hetoimasia.Render.TwoD.Vulkan.Builders (Builders (..))
 import Hetoimasia.Render.TwoD.Vulkan.Frame
 import Hetoimasia.Render.TwoD.Vulkan.Layout (instanceStride)
 import Hetoimasia.Render.TwoD.Vulkan.Shaders (cutoutShaders, orderedShaders)
-
--- | The constructions the renderer needs, as the host lends them inside an
--- owner-thread action or a frame. The record's type parameters are the host
--- session's, which only a batch's recorder names.
-data Builders q inst msgr phys dev cmd = Builders
-  { buildRing ∷ RingSize → IO (Either Refusal ())
-  , buildTable ∷ TableConfig → IO (Either Refusal ())
-  , buildTableLayout ∷ CheckedShaders → IO (Either Refusal PipelineLayout)
-    -- ^ A shader-sampled table pipeline layout: one that declares no sampler
-    -- offset, over these shaders.
-  , buildPipeline ∷ PipelineLayout → CheckedShaders → Word32 → PipelineBlend → IO (Either Refusal Pipeline)
-    -- ^ A pipeline over the layout for a colour format's @VkFormat@ code, which
-    -- declares no depth.
-  , buildDepthPipeline ∷ PipelineLayout → CheckedShaders → Word32 → PipelineBlend → PipelineDepth → IO (Either Refusal Pipeline)
-    -- ^ The same, declaring the depth a pass with a depth attachment has.
-  , buildDepthFormat ∷ IO (Either Refusal ImageFormat)
-    -- ^ The session's depth format: what the backend chooses for depth targets.
-  , buildImageFormat ∷ Image → IO (Either Refusal ImageFormat)
-    -- ^ The format the backend holds for a live image, which a depth image's
-    -- maker's declaration is checked against.
-  }
 
 -- | What the renderer makes with: the session's ring and its texture table.
 data Configuration = Configuration

@@ -158,7 +158,10 @@ module Hetoimasia.Runtime.GLFW.Internal.Owner.Handoff
   , noTargetGeometry
   , ExtentBounds (..)
   , observationFramebuffer
+  , observationLogical
+  , observationContentScale
   , observeGeometry
+  , observeWindowMetrics
   , boundGeometry
   , SuppliedExtent (..)
   , ChosenExtent (..)
@@ -210,10 +213,13 @@ import Hetoimasia.Foundation.Time (Instant)
 import Hetoimasia.GLFW.Internal.Attachment (Acknowledgement, AttachmentId, RetirementFact)
 import Hetoimasia.GLFW.Window
   ( Attribute (..)
+  , ContentScale (..)
   , Extent (..)
   , WindowId
   , WindowObservation
+  , observedContentScale
   , observedFramebufferExtent
+  , observedLogicalExtent
   )
 import Hetoimasia.Runtime.GLFW.Internal.RenderDemand (RenderEligibility (..))
 import Numeric.Natural (Natural)
@@ -853,26 +859,45 @@ data ExtentBounds = ExtentBounds
 instance NFData ExtentBounds where
   rnf bounds = rnf (boundsMinimum bounds) `seq` rnf (boundsMaximum bounds)
 
--- | The last coherent framebuffer observation and reported bounds the owner
--- holds for one target.
+-- | The last coherent framebuffer observation, reported bounds, logical
+-- extent and content scale the owner holds for one target.
 --
 -- It is held by the owner, on the owner's thread, precisely so a main thread
 -- stalled in a platform modal loop leaves the owner with the last observation
--- it did publish rather than with nothing.
+-- it did publish rather than with nothing. Each attribute is held as the
+-- platform last reported it, independently: one it could not report is
+-- 'Nothing' until it does, never a value made up (R2D-8, D-29: a mapping needs
+-- the logical extent and the content scale beside the framebuffer extent).
 data TargetGeometry = TargetGeometry
   { geometryFramebuffer ∷ !(Maybe Extent)
   , geometryBounds ∷ !(Maybe ExtentBounds)
+  , geometryLogical ∷ !(Maybe Extent)
+    -- ^ The window's logical extent, in screen coordinates.
+  , geometryContentScale ∷ !(Maybe ContentScale)
+    -- ^ The window's content scale, per axis.
   }
   deriving (Eq, Show)
 
 noTargetGeometry ∷ TargetGeometry
-noTargetGeometry = TargetGeometry Nothing Nothing
+noTargetGeometry = TargetGeometry Nothing Nothing Nothing Nothing
 
 -- | The framebuffer extent one observation reports, if the platform reported
 -- one at all.
 observationFramebuffer ∷ TargetObservation → Maybe Extent
 observationFramebuffer observation = case observedFramebufferExtent (targetWindow observation) of
   Observed extent → Just extent
+  Unavailable → Nothing
+
+-- | The logical extent one observation reports, if the platform reported one.
+observationLogical ∷ TargetObservation → Maybe Extent
+observationLogical observation = case observedLogicalExtent (targetWindow observation) of
+  Observed extent → Just extent
+  Unavailable → Nothing
+
+-- | The content scale one observation reports, if the platform reported one.
+observationContentScale ∷ TargetObservation → Maybe ContentScale
+observationContentScale observation = case observedContentScale (targetWindow observation) of
+  Observed scale → Just scale
   Unavailable → Nothing
 
 -- | Fold one observation's framebuffer extent and reported bounds into the
@@ -882,9 +907,19 @@ observationFramebuffer observation = case observedFramebufferExtent (targetWindo
 -- geometry rather than none.
 observeGeometry ∷ Maybe Extent → Maybe ExtentBounds → TargetGeometry → TargetGeometry
 observeGeometry framebuffer bounds geometry =
-  TargetGeometry
+  geometry
     { geometryFramebuffer = maybe (geometryFramebuffer geometry) Just framebuffer
     , geometryBounds = maybe (geometryBounds geometry) Just bounds
+    }
+
+-- | Fold one observation's logical extent and content scale into the
+-- geometry the same way: the last value the platform reported of each, kept
+-- when a later observation reports none.
+observeWindowMetrics ∷ Maybe Extent → Maybe ContentScale → TargetGeometry → TargetGeometry
+observeWindowMetrics logical scale geometry =
+  geometry
+    { geometryLogical = maybe (geometryLogical geometry) Just logical
+    , geometryContentScale = maybe (geometryContentScale geometry) Just scale
     }
 
 -- | Clamp an extent to the bounds the geometry holds, if it holds any.

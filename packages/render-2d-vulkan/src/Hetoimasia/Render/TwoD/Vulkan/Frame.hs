@@ -69,6 +69,7 @@ module Hetoimasia.Render.TwoD.Vulkan.Frame
     -- * Depth
   , depthLayers
   , requireWorldDepth
+  , worldDepthShortfall
     -- * Refusals
   , FrameRefusal (..)
     -- * The work
@@ -193,10 +194,21 @@ depthLayers valid =
 -- whose scissor may be empty or not, is refused, naming the first, unless the
 -- format is @D32_SFLOAT@; a snapshot with none is unaffected on any device.
 requireWorldDepth ∷ Maybe ImageFormat → ValidSnapshot → Either FrameRefusal ()
-requireWorldDepth format valid = case (depthLayers valid, format) of
-  (location : _, Nothing) → Left (NoDepthFormat location)
-  (location : _, Just held) | held /= Depth32Float → Left (DepthFormatRefused location held)
-  _ → Right ()
+requireWorldDepth format valid = case worldDepthShortfall format valid of
+  Nothing → Right ()
+  Just (location, Nothing) → Left (NoDepthFormat location)
+  Just (location, Just held) → Left (DepthFormatRefused location held)
+
+-- | The first depth-enabled world layer a session of this depth format cannot
+-- give a @D32_SFLOAT@ attachment, with the format the session has ('Nothing'
+-- when it offers none); 'Nothing' when the snapshot has no such layer or the
+-- format is @D32_SFLOAT@. It is 'requireWorldDepth' without the refusal's
+-- frame, for a host that publishes snapshots and records none.
+worldDepthShortfall ∷ Maybe ImageFormat → ValidSnapshot → Maybe (Location, Maybe ImageFormat)
+worldDepthShortfall format valid = case (depthLayers valid, format) of
+  (location : _, Nothing) → Just (location, Nothing)
+  (location : _, Just held) | held /= Depth32Float → Just (location, Just held)
+  _ → Nothing
 
 -- | Why a frame was refused, before anything was recorded.
 data FrameRefusal

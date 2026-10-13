@@ -162,6 +162,7 @@ test-suite vulkan-native-tests
         Test.GPU.Vulkan.Native.Recovery
         Test.GPU.Vulkan.Native.Gate
         Test.GPU.Vulkan.Native.Hazard
+        Test.GPU.Vulkan.Native.Image2d
         Test.GPU.Vulkan.Native.InstanceScope
         Test.GPU.Vulkan.Native.InstanceScopeSpec
         Test.GPU.Vulkan.Native.Interaction
@@ -255,6 +256,11 @@ test-suite vulkan-native-tests
         -- which the scene3d case runs over this suite's own session; it
         -- depends on the native backend and the math package alone.
         hetoimasia-sample-scene3d ==0.1.0.0,
+        -- The image2d sample's drawing, registration and window-free evidence
+        -- (R2D-8), which the image2d case runs over this suite's own session
+        -- and through the production host's per-window scenes; it depends on
+        -- the native backend and the 2D renderer alone.
+        hetoimasia-sample-image2d ==0.1.0.0,
         -- The 2D renderer's Vulkan recorder (R2D-7), which the ordered-path
         -- case records snapshots through over this suite's own session, the
         -- pure render-2d it records, the oracle that judges what it drew, the

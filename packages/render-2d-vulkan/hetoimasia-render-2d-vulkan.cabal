@@ -58,16 +58,23 @@ library
     hs-source-dirs: src
     exposed-modules:
         Hetoimasia.Render.TwoD.Vulkan
+        Hetoimasia.Render.TwoD.Vulkan.Builders
         Hetoimasia.Render.TwoD.Vulkan.Frame
         Hetoimasia.Render.TwoD.Vulkan.Layout
         Hetoimasia.Render.TwoD.Vulkan.ShaderInterfaces
         Hetoimasia.Render.TwoD.Vulkan.Shaders
+        Hetoimasia.Render.TwoD.Vulkan.Textures
+        Hetoimasia.Render.TwoD.Vulkan.Window
     other-modules:
         Hetoimasia.Render.TwoD.Vulkan.ShaderSources
     build-depends:
         base >=4.22 && <4.23,
         bytestring >=0.12 && <0.13,
         containers >=0.8 && <0.9,
+        deepseq >=1.5 && <1.6,
+        stm >=2.5.3 && <2.6,
+        text >=2.1 && <2.2,
+        hetoimasia-asset ==0.1.0.0,
         hetoimasia-gpu-vulkan-native ==0.1.0.0,
         hetoimasia-math ==0.1.0.0,
         hetoimasia-render-2d ==0.1.0.0,
@@ -88,6 +95,7 @@ test-suite render-2d-vulkan-tests
         Test.Render.TwoD.Vulkan.Layout
         Test.Render.TwoD.Vulkan.Recording
         Test.Render.TwoD.Vulkan.StandIn
+        Test.Render.TwoD.Vulkan.Windows
     build-depends:
         base >=4.22 && <4.23,
         bytestring >=0.12 && <0.13,
@@ -95,6 +103,7 @@ test-suite render-2d-vulkan-tests
         hspec >=2.11 && <3,
         stm >=2.5.3 && <2.6,
         text >=2.1 && <2.2,
+        hetoimasia-asset ==0.1.0.0,
         hetoimasia-foundation ==0.1.0.0,
         hetoimasia-gpu-vulkan-model ==0.1.0.0,
         hetoimasia-gpu-vulkan-native ==0.1.0.0,

@@ -125,6 +125,7 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , setVisible
   , resizeFramebuffer
   , publishObservation
+  , setWindowMetrics
   , nudgeOwner
   , offerExtent
   , twoWindows
@@ -1384,6 +1385,12 @@ data Rig = Rig
     -- refuses a handover's announcement.
   , rigFramebuffer ∷ !(TVar (Int, Int))
     -- ^ What every window's framebuffer size query answers.
+  , rigWindowSize ∷ !(TVar (Int, Int))
+    -- ^ What every window's logical size query answers: 800 by 600 until an
+    -- example says otherwise.
+  , rigContentScale ∷ !(TVar (Float, Float))
+    -- ^ What every window's content scale query answers: 2 by 2 until an
+    -- example says otherwise.
   , rigNudges ∷ !(TVar Natural)
     -- ^ How many times 'nudgeOwner' has republished an observation.
   , rigCapture ∷ !CaptureConfig
@@ -1532,6 +1539,17 @@ resizeFramebuffer rig host window (width, height) = do
     WaitAccepted _ → pure ()
     WaitClosed → throwIO (StandInFailure "the host's command port closed")
 
+-- | Change what the windows' logical size and content scale queries answer,
+-- and ask the window for a size through the host's command port, from the
+-- calling thread, so the owner loop samples and publishes the new
+-- observation. The loop must be turning.
+setWindowMetrics ∷ Rig → VulkanHost Scene → WindowId → (Int, Int) → (Float, Float) → IO ()
+setWindowMetrics rig host window (width, height) scale = do
+  atomically (writeTVar (rigWindowSize rig) (width, height) >> writeTVar (rigContentScale rig) scale)
+  awaitSubmitWindowCommand (hostCommandPort (vulkanWindowHost host)) [("client", "integration-tests")] (setWindowSizeCommand window (Extent width height)) >>= \case
+    WaitAccepted _ → pure ()
+    WaitClosed → throwIO (StandInFailure "the host's command port closed")
+
 -- | Publish the window's latest observation for its target to the owner, as
 -- an application that drives its own loop does; 'runVulkanOwnerLoop' does it
 -- every turn for one that runs the composed loop.
@@ -1642,6 +1660,8 @@ newRigClocked visible windows clock = do
   visibility ← newTVarIO visible
   hidden ← newTVarIO Set.empty
   framebuffer ← newTVarIO (640, 480)
+  windowSize ← newTVarIO (800, 600)
+  contentScale ← newTVarIO (2, 2)
   nudges ← newTVarIO 0
   events ← newTVarIO []
   owner ← newTVarIO Nothing
@@ -1679,6 +1699,8 @@ newRigClocked visible windows clock = do
             record events (WindowGone joined)
         , scriptTerminate = \_ → record events SessionEnded
         , scriptFramebufferSize = \_ → readTVarIO framebuffer
+        , scriptWindowSize = \_ → readTVarIO windowSize
+        , scriptContentScale = \_ → readTVarIO contentScale
         , scriptWindowAttribute = \attribute _ → (&& attribute == VisibleAttribute) <$> readTVarIO visibility
         , -- A window a hide control's call unmapped reports itself invisible
           -- until one shows it again.
@@ -1718,6 +1740,8 @@ newRigClocked visible windows clock = do
       , rigPortCapacity = Nothing
       , rigAfterRefusal = refusalHook
       , rigFramebuffer = framebuffer
+      , rigWindowSize = windowSize
+      , rigContentScale = contentScale
       , rigNudges = nudges
       , rigCapture = defaultCaptureConfig
       , rigSinkFailing = sinkFailing

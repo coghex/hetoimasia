@@ -1,0 +1,461 @@
+-- | The per-window host adapter (R2D-8): publishing 2D snapshots to windows,
+-- holding what an adopted snapshot references, releasing textures behind the
+-- window host's barrier, and rendering a window's adopted snapshot with the
+-- recorder.
+--
+-- The adapter is written over a 'Host' of plain functions, never over the
+-- window integration's own types, for the same reason the recorder is written
+-- over 'Builders': this package depends on the native backend alone, so the
+-- integration's native suite — which lives in the integration's package — can
+-- exercise it without a package cycle. The window integration's
+-- @publishVulkanWindowScene@, @requestVulkanRelease@ and scene lifecycle are
+-- what the host record is filled from, by the sample and by the native case;
+-- the adapter is generic over the window's identity.
+--
+-- = Publishing (D-18, D-28)
+--
+-- 'publish2DSnapshot' validates a candidate snapshot and publishes it for one
+-- window. It is refused: with validation's reasons when it is invalid; naming
+-- the pass when it holds an offscreen pass, since windowed snapshots hold none
+-- until R2D-13 issues target references; when it holds no window pass — an
+-- empty snapshot is refused, and removing textures publishes a window pass
+-- with no layers, while validation refuses a second one; naming the layer when
+-- it holds a depth-enabled world layer and the session's depth format is not
+-- @D32_SFLOAT@ (D-23; a snapshot with none is unaffected on any device); and
+-- naming the texture when it references one whose release has been requested.
+--
+-- = Holds (D-28)
+--
+-- When the owner adopts a revision of a window, 'adapterAdopted' records a
+-- hold on every texture the revision's snapshot references, once for each
+-- texture however often it is referenced; when the revision is released,
+-- 'adapterReleased' drops it. A texture is held while any adopted revision of
+-- any window holds it, so two windows sharing one hold it twice, a window's
+-- closure drops its hold when the host reports its revisions released, and a
+-- superseded revision's hold ends only when its last recording is over.
+--
+-- = Releasing (D-28)
+--
+-- 'release2DTexture' marks the texture released at once, for publication's
+-- check, in one transaction with its entry in the pending set, and asks the
+-- host to run a release after the revisions the window host must have adopted
+-- first, naming the windows it holds at the request. That action releases the
+-- texture in the table only if no adopted revision still holds it; otherwise
+-- the texture keeps rendering wherever an adopted snapshot shows it, the
+-- barrier counts as met, and the release is made when the last holding
+-- revision's release is reported ('adapterReleased'): by a further action that
+-- waits for nothing, so a window that appeared after the request delays
+-- nothing. If the host's queue refuses that action for lack of room, the
+-- texture stays eligible and 'retryReleases', which the hooks and the end of
+-- every release action call, queues it again; nothing blocks. Publication and
+-- release are serialized, so a snapshot accepted before the marker is
+-- published before the request captures its barrier and is adopted, with its
+-- holds, before the release can run; one offered after the marker is refused.
+--
+-- = Rendering
+--
+-- 'renderWindowFrame' records a window's adopted scene into the frame's image:
+-- the window pass, with 'TargetMetrics' built from the frame's own framebuffer
+-- extent and the window's latest logical extent and content scale (D-29). A
+-- frame whose request carries neither is skipped, as a refusal, through the
+-- host's existing backoff; nothing is invented. The snapshot is planned with
+-- the registered handles' marks (R2D-9), and a host that enabled windowed depth
+-- supplies the frame's depth image ('frameDepthImage').
+--
+-- = State
+--
+-- An 'Adapter' owns the holds, the textures whose release is pending, and the
+-- lock that serializes publication with release; it is made over the registry
+-- and the renderer, whose session depth format publication checks. The holds and the pending set
+-- are written on the graphics owner's thread by the lifecycle's hooks and by
+-- the release action, and read from any; publication and release run on any
+-- application thread, behind the lock.
+module Hetoimasia.Render.TwoD.Vulkan.Window
+  ( -- * The scene a window holds
+    Scene2D (..)
+  , sceneOf
+  , blankScene
+    -- * The host's side
+  , Host (..)
+  , HostPublication (..)
+  , ReleaseBody
+    -- * The adapter
+  , Adapter
+  , newAdapter
+  , adapterTextures
+    -- * Publishing and releasing
+  , PublishRefusal (..)
+  , publish2DSnapshot
+  , ReleaseRefusal (..)
+  , release2DTexture
+    -- * Adoption and release of revisions
+  , adapterAdopted
+  , adapterReleased
+  , retryReleases
+  , textureHolds
+  , pendingReleases
+    -- * Rendering
+  , FrameInfo (..)
+  , renderWindowFrame
+  ) where
+
+import Control.Concurrent.MVar (MVar, newMVar, withMVar)
+import Control.Exception (mask, onException)
+import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO)
+import Control.DeepSeq (NFData (rnf))
+import Control.Monad (forM_)
+import Data.Kind (Type)
+import Data.List.NonEmpty (NonEmpty)
+import Data.Map.Strict (Map)
+import qualified Data.Map.Strict as Map
+import Data.Set (Set)
+import qualified Data.Set as Set
+import Data.Text (Text)
+import qualified Data.Text as Text
+import Data.Word (Word32)
+import Hetoimasia.GPU.Vulkan.Native.Recording (Image, ImageFormat (..), Recorder, Refusal (..))
+import qualified Hetoimasia.Render.Api.Texture as Api
+import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..), validMetrics)
+import qualified Hetoimasia.Render.TwoD.Snapshot as Snapshot
+import Hetoimasia.Render.TwoD.Snapshot
+  ( ClearColour (..)
+  , Instance (..)
+  , Pass (..)
+  , Snapshot (..)
+  , Target (..)
+  , layerInstances
+  )
+import Hetoimasia.Render.TwoD.Validation (Location, ValidSnapshot, validSnapshot, validateSnapshot)
+import qualified Hetoimasia.Render.TwoD.Validation as Validation
+import Hetoimasia.Render.TwoD.Vulkan (Renderer, prepareSnapshot, rendererDepthFormat)
+import Hetoimasia.Render.TwoD.Vulkan.Builders (Builders)
+import Hetoimasia.Render.TwoD.Vulkan.Frame (Attachment (..), DepthBinding (..), FrameInput (..), FrameRefusal (..), worldDepthShortfall)
+import Hetoimasia.Render.TwoD.Vulkan.Textures (Textures, isReleased, markReleasedSTM, registeredMarks, releaseTextureNow)
+import Numeric.Natural (Natural)
+
+-- | What a window's published revision holds: the validated snapshot, and the
+-- textures it references.
+data Scene2D = Scene2D
+  { sceneSnapshot ∷ !ValidSnapshot
+  , sceneReferences ∷ !(Set Api.TextureHandle)
+  }
+
+instance NFData Scene2D where
+  rnf scene = Set.size (sceneReferences scene) `seq` sceneSnapshot scene `seq` ()
+
+-- | The scene a validated snapshot makes: every texture any of its instances
+-- names, in any layer of any view, whether or not it is visible.
+sceneOf ∷ ValidSnapshot → Scene2D
+sceneOf valid =
+  Scene2D
+    valid
+    ( Set.fromList
+        [ instanceTexture candidate
+        | pass ← snapshotPasses (validSnapshot valid)
+        , view ← passViews pass
+        , layer ← viewLayers view
+        , candidate ← layerInstances layer
+        ]
+    )
+  where
+    snapshotPasses = Snapshot.snapshotPasses
+    passViews = Snapshot.passViews
+    viewLayers = Snapshot.viewLayers
+
+-- | The scene a window holds before any publication, revision 0: one window
+-- pass cleared to opaque black, referencing nothing.
+blankScene ∷ Scene2D
+blankScene = case validateSnapshot (Snapshot [Pass WindowTarget (ClearColour 0 0 0 1) []]) of
+  Right valid → sceneOf valid
+  Left refused → error ("the blank scene was refused: " <> show refused)
+
+-- | What the window host answered a publication.
+data HostPublication
+  = -- | Accepted, at this revision of the window.
+    HostPublished !Natural
+  | -- | The host holds no such window.
+    HostWindowUnknown
+  | -- | The host's publications have ended with its exit.
+    HostClosed
+  | -- | The host carries one scene for every window, not one for each.
+    HostSharedScenes
+  deriving (Eq, Show)
+
+-- | A release the host runs on the graphics owner's thread, once its barrier is
+-- met, with the builders of the construction it lends.
+type ReleaseBody = ∀ (q ∷ Type) (inst ∷ Type) (msgr ∷ Type) (phys ∷ Type) (dev ∷ Type) (cmd ∷ Type). Builders q inst msgr phys dev cmd → IO (Either Refusal ())
+
+-- | What the adapter needs of the window host, as plain functions. Filled from
+-- the window integration's publication and release-request operations.
+data Host window = Host
+  { hostPublish ∷ window → Scene2D → IO HostPublication
+    -- ^ Publish the window's scene; revisions rise for each accepted one.
+  , hostRequestRelease ∷ (ReleaseBody → IO (Either Text ()))
+    -- ^ Queue an owner-thread action that waits for the revisions the host
+    -- must have adopted first, naming every window the host holds at the
+    -- request and no later one; 'Left' says why it was refused.
+  , hostRunOnOwner ∷ (ReleaseBody → IO (Either Text ()))
+    -- ^ Queue an owner-thread action that waits for nothing. It is admitted
+    -- and bounded as the request is, and never waits for room.
+  }
+
+-- | Where a pending release stands.
+data Stage
+  = -- | The host's request, which waits for the revisions named when it was
+    -- made, is queued, or has not been admitted.
+    AwaitingBarrier
+  | -- | That request has run — every window it named had adopted what it
+    -- waited for — and an adopted revision still held the texture. What
+    -- remains is the holds: no further barrier is asked, so a window that
+    -- appeared since delays nothing.
+    BarrierMet
+  deriving (Eq, Show)
+
+-- | A window host's adapter: its holds, its pending releases and the lock that
+-- serializes publication with release.
+data Adapter window = Adapter
+  { adapterHost ∷ !(Host window)
+  , adapterTextures ∷ !Textures
+  , adapterRenderer ∷ !Renderer
+    -- ^ The renderer the window's frames record with, whose session depth
+    -- format publication checks a snapshot's depth-enabled world layers against.
+  , adapterLock ∷ !(MVar ())
+  , adapterHolds ∷ !(TVar (Map (window, Natural) (Set Api.TextureHandle)))
+  , adapterPending ∷ !(TVar (Map Api.TextureHandle Stage))
+  , adapterQueued ∷ !(TVar (Set Api.TextureHandle))
+    -- ^ The textures whose release action, after the barrier was met, is
+    -- queued in the host.
+  }
+
+-- | An adapter over the host, the registry, and the renderer its frames record
+-- with. The renderer's session depth format is what publication requires of a
+-- snapshot holding a depth-enabled world layer (D-23).
+newAdapter ∷ Host window → Textures → Renderer → IO (Adapter window)
+newAdapter host textures renderer = Adapter host textures renderer <$> newMVar () <*> newTVarIO Map.empty <*> newTVarIO Map.empty <*> newTVarIO Set.empty
+
+-- | Why a snapshot was not published.
+data PublishRefusal
+  = -- | Validation's reasons, each naming where.
+    SnapshotInvalid !(NonEmpty Validation.Refusal)
+  | -- | The pass at this index is offscreen: a windowed snapshot holds none
+    -- until offscreen targets are issued (R2D-13).
+    OffscreenPassHeld !Int
+  | -- | The snapshot has no window pass; an empty one is refused.
+    NoWindowPass
+  | -- | The snapshot holds a depth-enabled world layer at this location and the
+    -- session's depth format is not @D32_SFLOAT@ (D-23): the session's format,
+    -- 'Nothing' when it offers none. A layer is never degraded to a
+    -- lower-precision depth.
+    WorldDepthRefused !Location !(Maybe ImageFormat)
+  | -- | The snapshot references this texture, whose release was requested.
+    TextureReleasedInSnapshot !Api.TextureHandle
+  | -- | The host holds no such window.
+    PublishWindowUnknown
+  | -- | The host's publications have ended.
+    PublishHostClosed
+  | -- | The host carries one shared scene, not a scene for each window.
+    PublishHostShared
+  deriving (Eq, Show)
+
+-- | Validate a candidate and publish it for the window, answering its
+-- revision. Admission is serialized with 'release2DTexture'.
+publish2DSnapshot ∷ Adapter window → window → Snapshot → IO (Either PublishRefusal Natural)
+publish2DSnapshot adapter window candidate = withMVar (adapterLock adapter) $ \_ →
+  case validateSnapshot candidate of
+    Left reasons → pure (Left (SnapshotInvalid reasons))
+    Right valid → case ([index | (index, Pass {passTarget = OffscreenTarget _}) ← zip [0 ..] (Snapshot.snapshotPasses candidate)], length [() | Pass {passTarget = WindowTarget} ← Snapshot.snapshotPasses candidate]) of
+      (index : _, _) → pure (Left (OffscreenPassHeld index))
+      ([], 0) → pure (Left NoWindowPass)
+      -- Validation has refused a second window pass already.
+      ([], _) → case worldDepthShortfall sessionDepth valid of
+        Just (location, held) → pure (Left (WorldDepthRefused location held))
+        Nothing → do
+          let scene = sceneOf valid
+          released ← atomically (filterReleased (Set.toList (sceneReferences scene)))
+          case released of
+            handle : _ → pure (Left (TextureReleasedInSnapshot handle))
+            [] →
+              hostPublish (adapterHost adapter) window scene >>= \case
+                HostPublished revision → pure (Right revision)
+                HostWindowUnknown → pure (Left PublishWindowUnknown)
+                HostClosed → pure (Left PublishHostClosed)
+                HostSharedScenes → pure (Left PublishHostShared)
+  where
+    sessionDepth = rendererDepthFormat (adapterRenderer adapter)
+    filterReleased handles = fmap concat (traverse (\handle → (\flagged → [handle | flagged]) <$> isReleased (adapterTextures adapter) handle) handles)
+
+-- | Why a release was not requested.
+data ReleaseRefusal
+  = -- | The texture was never registered, or its release has already run.
+    ReleaseUnknown !Api.TextureHandle
+  | -- | The window host refused the request, saying why.
+    ReleaseRequestRefused !Text
+  deriving (Eq, Show)
+
+-- | Mark the texture released and ask the host to release it behind its
+-- barrier, once no adopted revision holds it. The marker and the texture's
+-- entry in the pending set are one transaction, so a cancellation before the
+-- host is asked leaves a texture that asking again recovers. A request the host
+-- refused leaves the texture marked and pending, and asking again for the same
+-- handle repeats it; nothing else is asked twice, and a handle whose release
+-- has run, or that was never registered, is refused as unknown.
+release2DTexture ∷ Adapter window → Api.TextureHandle → IO (Either ReleaseRefusal ())
+release2DTexture adapter handle = withMVar (adapterLock adapter) $ \_ → do
+  next ← atomically $ do
+    marked ← markReleasedSTM (adapterTextures adapter) handle
+    stage ← Map.lookup handle <$> readTVar (adapterPending adapter)
+    case stage of
+      Just BarrierMet → pure (Just BarrierMet)
+      Just AwaitingBarrier → pure (Just AwaitingBarrier)
+      Nothing
+        | marked → Just AwaitingBarrier <$ modifyTVar' (adapterPending adapter) (Map.insert handle AwaitingBarrier)
+        | otherwise → pure Nothing
+  case next of
+    Nothing → pure (Left (ReleaseUnknown handle))
+    Just AwaitingBarrier → either (Left . ReleaseRequestRefused) Right <$> hostRequestRelease (adapterHost adapter) (releaseBody adapter handle)
+    Just BarrierMet → do
+      -- The barrier was met already: only the holds remain.
+      answer ← followUp adapter handle
+      pure (either (Left . ReleaseRequestRefused) Right answer)
+
+-- | Queue the release after the barrier was met, once, with no barrier of its
+-- own. The reservation and the admission are protected together: a refusal,
+-- or a cancellation before the host admitted the action, gives the reservation
+-- back, so the next 'retryReleases' queues it. (A cancellation after the host
+-- admitted it leaves a second action possible, which the release's own recheck
+-- makes harmless.)
+followUp ∷ Adapter window → Api.TextureHandle → IO (Either Text ())
+followUp adapter handle = mask $ \restore → do
+  fresh ← atomically $ do
+    queued ← readTVar (adapterQueued adapter)
+    if Set.member handle queued
+      then pure False
+      else True <$ modifyTVar' (adapterQueued adapter) (Set.insert handle)
+  if not fresh
+    then pure (Right ())
+    else do
+      answer ← restore (hostRunOnOwner (adapterHost adapter) (releaseBody adapter handle)) `onException` unreserve
+      case answer of
+        Left _ → unreserve
+        Right () → pure ()
+      pure answer
+  where
+    unreserve = atomically (modifyTVar' (adapterQueued adapter) (Set.delete handle))
+
+-- | Queue the release of every pending texture whose barrier was met and that
+-- no adopted revision holds, and whose release action is not already queued.
+-- It never blocks: a refusal (the host's queue full) leaves the texture for
+-- the next call. The lifecycle hooks and the end of every release action call
+-- it, and an application whose host may refuse for lack of room calls it from
+-- its own loop.
+retryReleases ∷ Adapter window → IO ()
+retryReleases adapter = do
+  ready ← atomically $ do
+    pending ← readTVar (adapterPending adapter)
+    held ← Set.unions . Map.elems <$> readTVar (adapterHolds adapter)
+    queued ← readTVar (adapterQueued adapter)
+    pure [handle | (handle, BarrierMet) ← Map.toList pending, not (Set.member handle held), not (Set.member handle queued)]
+  forM_ ready (followUp adapter)
+
+-- | The release as the host runs it: only a texture still pending and held by
+-- no adopted revision is released in the table. A texture an adopted revision
+-- still holds is marked as having met its barrier, and 'adapterReleased' asks
+-- for the rest when the last hold ends.
+releaseBody ∷ Adapter window → Api.TextureHandle → ReleaseBody
+releaseBody adapter handle builders = do
+  due ← atomically $ do
+    pending ← readTVar (adapterPending adapter)
+    held ← Set.unions . Map.elems <$> readTVar (adapterHolds adapter)
+    modifyTVar' (adapterQueued adapter) (Set.delete handle)
+    case Map.lookup handle pending of
+      Nothing → pure False
+      Just _
+        | Set.member handle held → False <$ modifyTVar' (adapterPending adapter) (Map.insert handle BarrierMet)
+        | otherwise → True <$ modifyTVar' (adapterPending adapter) (Map.delete handle)
+  answer ←
+    if due
+      then releaseTextureNow builders (adapterTextures adapter) handle
+      else pure (Right ())
+  -- Room was just made, and what this action did may have left others due.
+  retryReleases adapter
+  pure answer
+
+-- | The owner adopted this revision of the window with this scene: hold every
+-- texture it references until the revision is released.
+adapterAdopted ∷ Ord window ⇒ Adapter window → window → Natural → Scene2D → IO ()
+adapterAdopted adapter window revision scene = do
+  atomically (modifyTVar' (adapterHolds adapter) (Map.insert (window, revision) (sceneReferences scene)))
+  retryReleases adapter
+
+-- | This revision of the window has been released: drop its holds, and queue
+-- the release of each texture that was waiting only for them.
+adapterReleased ∷ Ord window ⇒ Adapter window → window → Natural → IO ()
+adapterReleased adapter window revision = do
+  atomically (modifyTVar' (adapterHolds adapter) (Map.delete (window, revision)))
+  retryReleases adapter
+
+-- | How many adopted revisions hold the texture.
+textureHolds ∷ Adapter window → Api.TextureHandle → IO Int
+textureHolds adapter handle = length . filter (Set.member handle) . Map.elems <$> readTVarIO (adapterHolds adapter)
+
+-- | The textures whose release was requested and is not yet made in the table.
+pendingReleases ∷ Adapter window → IO (Set Api.TextureHandle)
+pendingReleases adapter = Map.keysSet <$> readTVarIO (adapterPending adapter)
+
+-- | What a frame's request says of its image and its window, in the terms
+-- the window integration's request names them.
+data FrameInfo = FrameInfo
+  { frameExtent ∷ !(Word32, Word32)
+    -- ^ The frame image's extent: the framebuffer extent the views map to.
+  , frameFormat ∷ !Word32
+    -- ^ The image's colour format, a @VkFormat@ code.
+  , frameLogical ∷ !(Maybe (Word32, Word32))
+    -- ^ The window's logical extent, if the platform has reported one.
+  , frameScale ∷ !(Maybe (Float, Float))
+    -- ^ The window's content scale, per axis, if it has reported one.
+  , frameDepthImage ∷ !(Maybe Image)
+    -- ^ The frame's generation depth image, which a host that enabled windowed
+    -- depth is given with the request. A pass holding a depth-enabled world
+    -- layer is refused, naming the layer, without it.
+  }
+  deriving (Eq, Show)
+
+-- | Record a window's adopted scene into the frame's image: the window pass,
+-- mapped under metrics built from the frame's extent and the window's own
+-- observation. Refused, skipping the frame through the host's backoff, when
+-- the request carries no logical extent or no content scale, when they make no
+-- valid metrics, and as 'prepareSnapshot' and the recording refuse.
+renderWindowFrame
+  ∷ Adapter window
+  → Builders q inst msgr phys dev cmd
+  → FrameInfo
+  → Scene2D
+  → Recorder q inst msgr phys dev cmd
+  → IO (Either Refusal ())
+renderWindowFrame adapter builders info scene recorder = case (frameLogical info, frameScale info) of
+  (Nothing, _) → pure (Left (RefusedIllegal "the frame names no logical extent for its window, so no view can be mapped"))
+  (_, Nothing) → pure (Left (RefusedIllegal "the frame names no content scale for its window, so no view can be mapped"))
+  (Just (logicalWidth, logicalHeight), Just (scaleX, scaleY)) →
+    let (width, height) = frameExtent info
+        metrics = TargetMetrics (PixelExtent (fromIntegral logicalWidth) (fromIntegral logicalHeight)) (PixelExtent (fromIntegral width) (fromIntegral height)) scaleX scaleY
+     in if not (validMetrics metrics)
+          then pure (Left (RefusedIllegal ("the window's metrics are not usable: " <> Text.pack (show metrics))))
+          else
+            registeredMarks (adapterTextures adapter) >>= \marks →
+              prepareSnapshot
+                builders
+                (adapterRenderer adapter)
+                FrameInput
+                  { frameSnapshot = sceneSnapshot scene
+                  , frameMarks = marks
+                  , frameTarget = const Nothing
+                  , frameWindow = Just (Attachment (frameFormat info) width height metrics)
+                  , frameWindowDepth = (`DepthBinding` Depth32Float) <$> frameDepthImage info
+                  }
+                >>= \case
+                  Left refusal → pure (Left (refused refusal))
+                  Right recording → either (Left . refused) Right <$> recording recorder
+  where
+    refused = \case
+      RefusedByBackend refusal → refusal
+      other → RefusedIllegal (Text.pack (show other))

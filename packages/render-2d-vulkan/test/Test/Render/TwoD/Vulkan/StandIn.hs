@@ -22,6 +22,7 @@ module Test.Render.TwoD.Vulkan.StandIn
   , resetJournal
   , target
   , depthTarget
+  , uploadedTexture
   , framelessOnce
   , commandsRecorded
   , pipelinesMade
@@ -74,8 +75,8 @@ import Hetoimasia.GPU.Vulkan.Native.Presentation
 import Hetoimasia.GPU.Vulkan.Native.Profile
 import Hetoimasia.GPU.Vulkan.Native.Recording
 import Hetoimasia.GPU.Vulkan.Native.Roots
-import Hetoimasia.GPU.Vulkan.Native.TextureTable (createShaderSampledTablePipelineLayout, createTextureTable, refreshTextureTable)
-import Hetoimasia.GPU.Vulkan.Native.Uploads (Uploads, UploadsView (..), newUploads, progressUploads, readUploads, validateUploadConfig)
+import Hetoimasia.GPU.Vulkan.Native.TextureTable (createShaderSampledTablePipelineLayout, createTextureTable, refreshTextureTable, registerTexture, releaseTexture, swapTexture)
+import Hetoimasia.GPU.Vulkan.Native.Uploads (UploadRequest (..), Uploads, UploadsView (..), newUploads, progressUploads, readUploads, submitUpload, validateUploadConfig)
 import qualified Hetoimasia.Render.TwoD.Vulkan as Render
 
 -- | The recorder a frame-less batch lends.
@@ -146,6 +147,9 @@ builders rig =
     , Render.buildDepthPipeline = createDepthCheckedPipeline (rigRecording rig)
     , Render.buildDepthFormat = selectDepthFormat (rigRecording rig)
     , Render.buildImageFormat = imageFormatOf (rigRecording rig)
+    , Render.registerImage = registerTexture (rigRecording rig)
+    , Render.swapImage = swapTexture (rigRecording rig)
+    , Render.releaseImage = releaseTexture (rigRecording rig)
     }
 
 -- | A colour target of this format and extent, made as the backend makes one.
@@ -157,6 +161,16 @@ target rig format width height =
 depthTarget ∷ Rig → ImageFormat → Word32 → Word32 → IO Image
 depthTarget rig format width height =
   createImage (rigRecording rig) (ImageDescription DepthTarget format width height 1) >>= either (fail . show) pure
+
+-- | A two-by-two RGBA8 texture of these bytes, made and uploaded, with its
+-- upload settled.
+uploadedTexture ∷ Rig → ByteString → IO Image
+uploadedTexture rig bytes = do
+  image ← createImage (rigRecording rig) (ImageDescription TextureImage Rgba8Linear 2 2 1) >>= either (fail . show) pure
+  _ ← submitUpload (rigUploads rig) (UploadImage image [bytes]) >>= either (fail . show) pure
+  settleUploads rig
+  refreshTable rig
+  pure image
 
 -- | Record one frame-less batch in a scope of its own, answering what the
 -- consumer returned. The batch is submitted when the scope ends.
