@@ -23,6 +23,20 @@
 -- 'Rational's from the snapshot's 32-bit coefficients. Colour is computed in
 -- double precision with every store rounded to 8 bits.
 --
+-- __Retained chunks__ (R2D-10). A layer that lists chunks is evaluated as the
+-- plan orders it ("Hetoimasia.Render.TwoD.DrawPlan"): the chunks' cutout
+-- instances first, each listing as a run in the order listed, with the path the
+-- chunk was built with, then the layer's dynamic cutouts, then the ordered
+-- instances of the chunks and of the layer merged by ascending depth key and then
+-- source order (a chunk listing before the dynamic instances, in listing order
+-- and build order). The chunks are those the snapshot was validated against,
+-- which the valid snapshot carries, so the oracle looks nothing up. A chunk
+-- that a view culls ("Hetoimasia.Render.TwoD.Culling", with the view's mapping
+-- and the target's extent) contributes nothing to that view; bounds that
+-- enclose the chunk's geometry make that no change to any pixel, and the
+-- oracle is built so that a chunk whose bounds do not is not possible. A
+-- fragment of a chunk's instance is named by its 'AtChunkInstance' location.
+--
 -- __Purity.__ Every function is pure and total over a validated snapshot and
 -- the lookup it is given; the same inputs always give the same expectations.
 --
@@ -65,6 +79,8 @@ import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import Data.Maybe (mapMaybe)
 import Data.Word (Word32, Word8)
+import Hetoimasia.Render.TwoD.Chunk (Chunk, ChunkRef, chunkCutoutPositions, chunkInstanceAt)
+import Hetoimasia.Render.TwoD.Culling (chunkCulled)
 import Hetoimasia.Asset.Image (DecodedImage (..))
 import Hetoimasia.Math.Affine2 (columns)
 import Hetoimasia.Math.Vector (V2 (..))
@@ -77,13 +93,17 @@ import Hetoimasia.Render.TwoD.DrawPlan
   , PlannedLayer
   , PlannedPass (..)
   , PlannedView (..)
-  , drawingOrder
-  , planSnapshot
+  , RunSource (..)
+  , drawingSources
+  , planSnapshotCulled
   , plannedClearsDepth
   , plannedRuns
   , plannedSpace
   , runCount
   , runPath
+  , runSource
+  , runStart
+  , InstanceSource (..)
   )
 import Hetoimasia.Render.TwoD.Mapping
   ( ViewMapping
@@ -151,7 +171,7 @@ import Hetoimasia.Render.TwoD.Snapshot
   , layerInstances
   )
 import Hetoimasia.Render.TwoD.Target (TargetRef)
-import Hetoimasia.Render.TwoD.Validation (Location (..), ValidSnapshot, validSnapshot)
+import Hetoimasia.Render.TwoD.Validation (Location (..), ValidSnapshot, validLayerChunks, validLayerLocation, validLayers, validSnapshot)
 
 -- | What the oracle needs to know about one target.
 data TargetSpec = TargetSpec
@@ -287,55 +307,87 @@ newOracle ∷ OracleInput → Oracle
 newOracle input =
   Oracle
     { oraclePasses =
-        [ buildPass input passIndex pass planned
+        [ buildPass input chunksOf passIndex pass planned
         | (passIndex, pass, planned) ← zip3 [0 ..] (snapshotPasses snapshot) (planPasses plan)
         ]
     , oracleTextures = inputTextures input
     }
   where
     snapshot = validSnapshot (inputSnapshot input)
-    plan = planSnapshot (inputCutoutMarks input) (inputSnapshot input)
+    plan = planSnapshotCulled culler (inputCutoutMarks input) (inputSnapshot input)
+    chunksOf = Map.fromList [((pass, view, layer), validLayerChunks held) | held ← validLayers (inputSnapshot input), AtLayer pass view layer ← [validLayerLocation held]]
+    -- A view skips the chunks it culls; one whose target or mapping the oracle
+    -- cannot resolve skips none, and is reported by the probes it affects.
+    culler passIndex viewIndex _ kind bounds placement =
+      case Map.lookup (passIndex, viewIndex) cullable of
+        Just (mapping, extent, viewport) → chunkCulled mapping extent viewport kind bounds placement
+        Nothing → False
+    cullable =
+      Map.fromList
+        [ ((passIndex, viewIndex), (mapping, (fromIntegral width, fromIntegral height), viewViewport view))
+        | (passIndex, pass) ← zip [0 ..] (snapshotPasses snapshot)
+        , Right spec ← [resolveTarget input (passTarget pass)]
+        , let PixelExtent width height = specExtent spec
+        , (viewIndex, view) ← zip [0 ..] (passViews pass)
+        , Just mapping ← [viewMapping (specMetrics spec) view]
+        ]
 
-buildPass ∷ OracleInput → Int → Pass → PlannedPass → OraclePass
-buildPass input passIndex pass planned =
+type ChunksOf = Map (Int, Int, Int) [(ChunkRef, Chunk)]
+
+buildPass ∷ OracleInput → ChunksOf → Int → Pass → PlannedPass → OraclePass
+buildPass input chunksOf passIndex pass planned =
   OraclePass
     { opTarget = resolved
     , opClear = passClear pass
     , opViews =
-        [ buildView passIndex viewIndex resolved view plannedView
+        [ buildView chunksOf passIndex viewIndex resolved view plannedView
         | (viewIndex, view, plannedView) ← zip3 [0 ..] (passViews pass) (plannedViews planned)
         ]
     }
   where
     resolved = resolveTarget input (passTarget pass)
 
-buildView ∷ Int → Int → Either Failure TargetSpec → View → PlannedView → OracleView
-buildView passIndex viewIndex resolved view planned =
+buildView ∷ ChunksOf → Int → Int → Either Failure TargetSpec → View → PlannedView → OracleView
+buildView chunksOf passIndex viewIndex resolved view planned =
   OracleView
     { ovLocation = AtView passIndex viewIndex
     , ovViewport = viewViewport view
     , ovSettings = viewSettings view
     , ovMapping = either (const Nothing) (\spec → viewMapping (specMetrics spec) view) resolved
     , ovLayers =
-        [ buildLayer passIndex viewIndex layerIndex layer plannedLayer
+        [ buildLayer passIndex viewIndex layerIndex layer (Map.findWithDefault [] (passIndex, viewIndex, layerIndex) chunksOf) plannedLayer
         | (layerIndex, layer, plannedLayer) ← zip3 [0 ..] (viewLayers view) (plannedLayers planned)
         ]
     }
 
-buildLayer ∷ Int → Int → Int → Layer → PlannedLayer → OracleLayer
-buildLayer passIndex viewIndex layerIndex layer planned =
+-- | A layer's instances in the order the plan draws them: each run in turn, a
+-- chunk's cutout run read from the chunk and a ring run from the layer's ring
+-- entries, which are its dynamic instances and the chunks' ordered ones.
+buildLayer ∷ Int → Int → Int → Layer → [(ChunkRef, Chunk)] → PlannedLayer → OracleLayer
+buildLayer passIndex viewIndex layerIndex layer chunks planned =
   OracleLayer
     { olSpace = plannedSpace planned
     , olDepth = plannedClearsDepth planned
-    , olInstances =
-        [ Drawn (AtInstance passIndex viewIndex layerIndex index) (instances ! index) path
-        | (index, path) ← zip (drawingOrder planned) paths
-        ]
+    , olInstances = concatMap drawRun (plannedRuns planned)
     }
   where
     list = layerInstances layer
-    instances = listArray (0, length list - 1) list
-    paths = concatMap (\run → replicate (runCount run) (runPath run)) (plannedRuns planned)
+    dynamic = listArray (0, length list - 1) list
+    ring = drawingSources planned
+    drawRun run = case runSource run of
+      RingRun → [drawn source (runPath run) | source ← take (runCount run) (drop (runStart run) ring)]
+      ChunkRun position →
+        [ drawn (ChunkInstance position index) (runPath run)
+        | index ← take (runCount run) (drop (runStart run) (maybe [] (chunkCutoutPositions . snd) (nth position chunks)))
+        ]
+    drawn source path = case source of
+      DynamicInstance index → Drawn (AtInstance passIndex viewIndex layerIndex index) (dynamic ! index) path
+      ChunkInstance position index → case nth position chunks >>= \(_, held) → chunkInstanceAt held index of
+        Just candidate → Drawn (AtChunkInstance passIndex viewIndex layerIndex position index) candidate path
+        Nothing → error "the plan names a chunk instance the layer's chunks do not hold"
+    nth position items = case drop position items of
+      item : _ → Just item
+      [] → Nothing
 
 -- | The checked spec of a pass's target.
 resolveTarget ∷ OracleInput → Target → Either Failure TargetSpec

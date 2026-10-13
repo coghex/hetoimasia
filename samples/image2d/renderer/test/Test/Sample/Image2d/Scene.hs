@@ -71,8 +71,8 @@ spec = describe "the scene" $ do
       [probeBehaviour probe | probe ← namedProbes, probeColour probe == probeContrastColour probe] `shouldBe` []
   where
     isWorld = \case
-      WorldLayer {} → True
-      UiLayer {} → False
+      WorldLayerWith {} → True
+      UiLayerWith {} → False
     v = V2
 
 -- | The colour a pixel of the evidence frame shows, by the frame's geometry,

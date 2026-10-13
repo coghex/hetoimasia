@@ -37,6 +37,13 @@
 -- uploads it draws a run as its @runStart@ and @runCount@ over the buffer, with
 -- no further reordering.
 --
+-- __Chunks__ (R2D-10). A layer that lists retained chunks encodes, in drawing
+-- order, the ring's entries: its dynamic cutouts and the merged ordered
+-- instances of its chunks and its own, each entry read from the dynamic list or
+-- from the chunk listing the plan says. 'encodeChunkCutouts' encodes a chunk's
+-- cutout instances, once, in the order the chunk's device buffer holds them: a
+-- run of that chunk draws as its @runStart@ and @runCount@ over this buffer.
+--
 -- __Cost.__ Encoding is pure, total and linear in the number of instances. It
 -- allocates the one result buffer of the exact final size and no buffer per
 -- instance, and encoding the same layer always gives the same bytes. No
@@ -53,11 +60,13 @@
 module Hetoimasia.Render.TwoD.Encoding
   ( encodeLayer
   , encodeLayerInDrawingOrder
+  , encodeChunkCutouts
   , instanceStride
   , flagsWord
   ) where
 
 import Data.Array (Array, listArray, (!))
+import qualified Data.Array.Unboxed as Unboxed
 import Data.Bits (shiftL, (.|.))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
@@ -67,7 +76,8 @@ import qualified Data.ByteString.Lazy as Lazy
 import Data.Word (Word32)
 import Hetoimasia.Math.Affine2 (toColumnMajor)
 import Hetoimasia.Render.Api.Texture.Backend (handleGeneration, handleIndex)
-import Hetoimasia.Render.TwoD.DrawPlan (PlannedLayer, drawingOrder)
+import Hetoimasia.Render.TwoD.Chunk (Chunk, chunkCutoutPositions, chunkInstanceAt)
+import Hetoimasia.Render.TwoD.DrawPlan (PlannedLayer (..))
 import Hetoimasia.Render.TwoD.Snapshot
   ( Instance (..)
   , Sampler (..)
@@ -75,7 +85,7 @@ import Hetoimasia.Render.TwoD.Snapshot
   , UvRect (..)
   , layerInstances
   )
-import Hetoimasia.Render.TwoD.Validation (ValidLayer, validLayerContents)
+import Hetoimasia.Render.TwoD.Validation (ValidLayer, validLayerChunks, validLayerContents)
 
 -- | The size of one encoded instance in bytes: 64.
 instanceStride ∷ Int
@@ -93,26 +103,47 @@ encodeLayer layer
     instances = layerInstances (validLayerContents layer)
     size = instanceStride * length instances
 
--- | A planned layer's instances in drawing order: exactly 'instanceStride'
--- bytes each, in one strict buffer, the @k@-th chunk being the chunk
+-- | A planned layer's ring entries in drawing order: exactly 'instanceStride'
+-- bytes each, in one strict buffer. Each entry is read from the layer's dynamic
+-- instances by submission index, or from the chunk the plan names by build
+-- position; for a layer that lists no chunk, the @k@-th chunk is the chunk
 -- 'encodeLayer' writes for the @k@-th submission index of
 -- 'Hetoimasia.Render.TwoD.DrawPlan.drawingOrder'. A layer whose plan holds no
 -- order (an empty layer, or one in a zero-size viewport) encodes to the empty
 -- buffer. 'Nothing' when the order names an instance the layer does not hold,
 -- which planning that layer never does: the plan belongs to another layer.
 encodeLayerInDrawingOrder ∷ PlannedLayer → ValidLayer → Maybe ByteString
-encodeLayerInDrawingOrder planned layer
-  | any (\index → index < 0 || index >= count) order = Nothing
-  | size == 0 = Just ByteString.empty
-  | otherwise =
-      Just (Lazy.toStrict (toLazyByteStringWith (untrimmedStrategy size size) mempty (foldMap (encodeInstance . (held !)) order)))
+encodeLayerInDrawingOrder planned layer = do
+  resolved ← traverse resolve entries
+  let size = instanceStride * length resolved
+  if size == 0
+    then Just ByteString.empty
+    else Just (Lazy.toStrict (toLazyByteStringWith (untrimmedStrategy size size) mempty (foldMap encodeInstance resolved)))
   where
     instances = layerInstances (validLayerContents layer)
     count = length instances
     held ∷ Array Int Instance
     held = listArray (0, count - 1) instances
-    order = drawingOrder planned
-    size = instanceStride * length order
+    chunks = map snd (validLayerChunks layer)
+    chunkCount = length chunks
+    chunkArray ∷ Array Int Chunk
+    chunkArray = listArray (0, chunkCount - 1) chunks
+    entries = zip (Unboxed.elems (plannedOrigin planned)) (Unboxed.elems (plannedOrder planned))
+    resolve (origin, index)
+      | origin < 0 = if index >= 0 && index < count then Just (held ! index) else Nothing
+      | origin < chunkCount = chunkInstanceAt (chunkArray ! origin) index
+      | otherwise = Nothing
+
+-- | A chunk's cutout-path instances in the order its device buffer holds them
+-- (by material, then build order): exactly 'instanceStride' bytes each, in one
+-- strict buffer, empty when the chunk has none.
+encodeChunkCutouts ∷ Chunk → ByteString
+encodeChunkCutouts built
+  | size == 0 = ByteString.empty
+  | otherwise = Lazy.toStrict (toLazyByteStringWith (untrimmedStrategy size size) mempty (foldMap encodeInstance cutouts))
+  where
+    cutouts = [candidate | position ← chunkCutoutPositions built, Just candidate ← [chunkInstanceAt built position]]
+    size = instanceStride * length cutouts
 
 encodeInstance ∷ Instance → Builder
 encodeInstance candidate =

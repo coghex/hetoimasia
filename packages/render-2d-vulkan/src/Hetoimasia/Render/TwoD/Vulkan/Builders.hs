@@ -1,6 +1,6 @@
--- | The constructions the recorder and the texture registry need from their
--- host (R2D-7, R2D-8), as the host lends them inside an owner-thread action or
--- a frame.
+-- | The constructions the recorder, the texture registry and the chunk registry
+-- need from their host (R2D-7, R2D-8, R2D-10), as the host lends them inside an
+-- owner-thread action or a frame.
 --
 -- The record is the package's whole seam to the host: the window integration
 -- fills it from the 'Construction' it lends, the headless examples from the
@@ -10,9 +10,11 @@ module Hetoimasia.Render.TwoD.Vulkan.Builders
   ( Builders (..)
   ) where
 
+import Data.ByteString (ByteString)
 import Data.Word (Word32)
 import Hetoimasia.GPU.Vulkan.Native.Recording
-  ( Image
+  ( Buffer
+  , Image
   , ImageFormat
   , Pipeline
   , PipelineBlend
@@ -22,6 +24,8 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , RingSize
   )
 import Hetoimasia.GPU.Vulkan.Native.Shader (CheckedShaders)
+import Hetoimasia.GPU.Vulkan.Native.Uploads (UploadRefusal, UploadTicket)
+import Numeric.Natural (Natural)
 import Hetoimasia.GPU.Vulkan.Native.TextureTable
   ( SwapTicket
   , TableConfig
@@ -55,4 +59,15 @@ data Builders q inst msgr phys dev cmd = Builders
     -- ^ Release a handle in the table: it resolves to the placeholder from the
     -- next version on, and its image is destroyed once no batch holds a
     -- version that maps it.
+  , buildVertexBuffer ∷ Natural → IO (Either Refusal Buffer)
+    -- ^ A device-local vertex buffer of this many bytes, which a retained chunk's
+    -- cutout instances are uploaded into (R2D-10). Never asked for zero bytes.
+  , uploadBuffer ∷ Buffer → ByteString → IO (Either UploadRefusal UploadTicket)
+    -- ^ Admit the upload that fills a fresh buffer through the bounded staging
+    -- buffer: admission copies the bytes before it returns and never waits, and
+    -- the ticket says where the upload stands.
+  , releaseBuffer ∷ Buffer → IO (Either Refusal ())
+    -- ^ Release a managed buffer: nothing records through it again, batches that
+    -- already recorded it keep it until their own references end, and an upload
+    -- still settling into it is cancelled or finishes first.
   }

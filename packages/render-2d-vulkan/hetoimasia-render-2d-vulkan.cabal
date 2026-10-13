@@ -59,6 +59,7 @@ library
     exposed-modules:
         Hetoimasia.Render.TwoD.Vulkan
         Hetoimasia.Render.TwoD.Vulkan.Builders
+        Hetoimasia.Render.TwoD.Vulkan.Chunks
         Hetoimasia.Render.TwoD.Vulkan.Frame
         Hetoimasia.Render.TwoD.Vulkan.Layout
         Hetoimasia.Render.TwoD.Vulkan.ShaderInterfaces
@@ -92,8 +93,10 @@ test-suite render-2d-vulkan-tests
     hs-source-dirs: test
     main-is: Main.hs
     other-modules:
+        Test.Render.TwoD.Vulkan.Environment
         Test.Render.TwoD.Vulkan.Layout
         Test.Render.TwoD.Vulkan.Recording
+        Test.Render.TwoD.Vulkan.Retained
         Test.Render.TwoD.Vulkan.StandIn
         Test.Render.TwoD.Vulkan.Windows
     build-depends:

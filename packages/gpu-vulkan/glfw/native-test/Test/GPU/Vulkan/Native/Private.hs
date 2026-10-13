@@ -132,6 +132,19 @@
 --   reason under the validation runner's evidence directory; where the device
 --   chooses another depth format the run reports it and checks the recorder's
 --   refusal instead (#426);
+-- * @r2d10-retained@ — the same device start with no window, then the 2D
+--   renderer's recorder over targets that each have a @D32_SFLOAT@ depth image
+--   and the adapter's holds (R2D-10): retained chunks built once, their cutout
+--   instances uploaded once into device-local buffers, and listed by reference
+--   over several frames beside the dynamic content that alone is republished —
+--   cutouts and a translucent instance interleaved with dynamic cutouts, a world
+--   chunk without depth and a UI chunk drawn wholly in the ordered path, a
+--   texture swap showing through a chunk and a swap to another mark refused, a
+--   chunk released while the adopted snapshot shows it and still drawn until a
+--   snapshot without it is adopted, and a chunk outside a view skipped — read
+--   back after completion, every pixel judged against the render-2d oracle, and
+--   written as lossless PNGs, a probe record and the bytes uploaded and written
+--   to the ring, under the validation runner's evidence directory (#429);
 -- * @r2d15-storage-tables@ — the same device start with no window, then the
 --   session's texture table, a ring made with a storage-table window, and a
 --   pipeline layout that also holds the storage table's set 2: two per-batch
@@ -514,6 +527,14 @@ scenarios =
       $ \consent journal _ → do
         outcome ← SurfaceFree.runCutoutDepth (consentBackend consent) journal
         pure (SurfaceFree.cutoutDepthSpec outcome, section "The R2D-9 cutout path evidence record" (SurfaceFree.cutoutDepthSection outcome))
+  , Scenario
+      "r2d10-retained"
+      "records eleven frames of render-2d snapshots that list retained chunks built once beside dynamic content that alone is republished, into offscreen targets that have a D32_SFLOAT depth image, in a surface-free session — retained cutouts and a translucent instance interleaved with dynamic cutouts, a world chunk without depth and a UI chunk drawn in the ordered path beside dynamic content, a texture swap showing through a chunk and a mark-changing swap refused, a chunk released while the adopted snapshot shows it and still drawn until a snapshot without it is adopted, and a chunk outside a view skipped — reads each back after completion, judges every pixel against the render-2d oracle, and writes a lossless PNG a target, a probe record and the bytes uploaded and written to the ring; where the device chooses another depth format it reports that"
+      False
+      Nothing
+      $ \consent journal _ → do
+        outcome ← SurfaceFree.runRetained (consentBackend consent) journal
+        pure (SurfaceFree.retainedSpec outcome, section "The R2D-10 retained chunks evidence record" (SurfaceFree.retainedSection outcome))
   , Scenario
       "r2d15-storage-tables"
       "draws twice in one batch of a frame-less batch of a surface-free session, through a shader-sampled table layout that also holds set 2 and no selected sampler: two per-batch tables are written into regions of a ring made with a storage-table window, and each is bound at its own dynamic offset before its draw, whose fragment shader reads its colour from the bound table; reads the target back and checks that each draw shows its own table's colour exactly, with validation reporting nothing"

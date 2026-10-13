@@ -39,6 +39,10 @@ module Test.GPU.Vulkan.Native.OrderedPath
   , isDeterminate
   , verdictPasses
   , runEvidence
+  , runValidated
+  , finishEvidence
+  , awaitPlaceholder
+  , configuration
   , renderRecord
   ) where
 
@@ -49,6 +53,7 @@ import Data.ByteString (ByteString)
 import Data.List (intercalate)
 import Data.Maybe (isJust)
 import qualified Data.Map.Strict as Map
+import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
@@ -59,6 +64,8 @@ import System.FilePath ((</>))
 
 import Hetoimasia.GPU.Vulkan.GLFW
   ( BatchTicket
+  , BufferDescription (..)
+  , BufferKind (..)
   , Construction
   , Image
   , ImageDescription (..)
@@ -70,6 +77,7 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , TableView (..)
   , TextureHandle (..)
   , TransitionSource (..)
+  , UploadRefusal (..)
   , UploadRequest (..)
   , constructBlendedCheckedPipeline
   , constructDepthCheckedPipeline
@@ -77,23 +85,26 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , constructImage
   , constructImageFormat
   , constructReadback
+  , constructBuffer
   , constructRing
   , constructShaderSampledTablePipelineLayout
   , constructTextureTable
   , copyTargetToReadback
   , formatCode
   , registerConstructedTexture
+  , releaseConstructed
   , releaseConstructedTexture
   , swapConstructedTexture
   , transitionResource
   , validateRingSize
   , validateTableConfig
   )
-import Hetoimasia.GPU.Vulkan.Native.Recording (Recorder)
+import Hetoimasia.GPU.Vulkan.Native.Recording (Buffer, Recorder)
 import Hetoimasia.Asset.Image (DecodedImage)
 import qualified Hetoimasia.Render.Api.Texture as Api
 import Hetoimasia.Render.Api.Texture.Backend (textureHandle)
-import Hetoimasia.Render.TwoD.DrawPlan (cutoutMarks)
+import Hetoimasia.Render.TwoD.Chunk (ChunkRef)
+import Hetoimasia.Render.TwoD.DrawPlan (CutoutMarks, cutoutMarks)
 import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..))
 import Hetoimasia.Render.TwoD.Oracle
   ( Expectation (..)
@@ -108,7 +119,7 @@ import Hetoimasia.Render.TwoD.Oracle
   )
 import Hetoimasia.Render.TwoD.Oracle.Colour (Rgba8 (..), Tolerance (..))
 import Hetoimasia.Render.TwoD.Oracle.Readback (readPixel)
-import Hetoimasia.Render.TwoD.Validation (validateSnapshot)
+import Hetoimasia.Render.TwoD.Validation (ValidSnapshot, validateSnapshot)
 import qualified Hetoimasia.Render.TwoD.Vulkan as Render
 import Test.GPU.Vulkan.Native.OrderedPath.Fixtures
 import Test.GPU.Vulkan.Native.Png (encodeRgba)
@@ -271,6 +282,25 @@ runEvidence host suite directory = do
       , evidenceUnavailable = unavailable
       }
 
+-- | Write an evidence run's probe record into the directory and say what the run
+-- came to: it passed when it did not stop early and either reported where
+-- @D32_SFLOAT@ is unavailable or judged exactly the suite's fixtures, every one
+-- passing. For a suite whose runner is its own.
+finishEvidence ∷ Suite → FilePath → Maybe ImageFormat → Maybe Text → Maybe Text → [FixtureResult] → IO Evidence
+finishEvidence suite directory depthFormat unavailable failure results = do
+  createDirectoryIfMissing True directory
+  let recordPath = directory </> suiteRecord suite
+  ByteString.writeFile recordPath (Text.encodeUtf8 (renderRecord suite depthFormat unavailable failure results))
+  pure
+    Evidence
+      { evidencePassed = failure == Nothing && (isJust unavailable || (length results == length (suiteFixtures suite) && all fixturePassed results))
+      , evidenceFailure = failure
+      , evidenceFixtures = results
+      , evidenceRecord = recordPath
+      , evidenceDepthFormat = depthFormat
+      , evidenceUnavailable = unavailable
+      }
+
 -- | A table of 16 slots, 8 at first and four versions; a ring of a mebibyte.
 configuration ∷ Render.Configuration
 configuration =
@@ -292,6 +322,10 @@ builders construction =
     , Render.registerImage = registerConstructedTexture construction
     , Render.swapImage = swapConstructedTexture construction
     , Render.releaseImage = releaseConstructedTexture construction
+    , Render.buildVertexBuffer = \bytes → constructBuffer construction (BufferDescription VertexBuffer bytes)
+    , -- The ordered path's evidence retains no chunk, so it admits no upload into a chunk's buffer.
+      Render.uploadBuffer = \_ _ → pure (Left UploadClosed)
+    , Render.releaseBuffer = releaseConstructed construction
     }
 
 -- | What the recorder gives a depth-enabled snapshot over a depth image of a
@@ -331,6 +365,8 @@ refusalCheck host suite format =
                             ]
                       , Render.frameWindow = Nothing
                       , Render.frameWindowDepth = Nothing
+                      , Render.frameChunks = const Nothing
+                      , Render.frameOmitted = Set.empty
                       }
               pure $ case Render.frameWork input of
                 Left refusal@(Render.DepthFormatRefused _ refused) | refused == format → Right ("the recorder refused a depth-enabled layer over it before recording: " <> tshow refusal)
@@ -392,8 +428,32 @@ runFixture
   → IO FixtureResult
 runFixture host suite directory depthFormat renderer handles decodedByHandle fixture =
   case validateSnapshot (fixtureSnapshot fixture handles) of
-    Left refused → pure (failed ("the snapshot was refused: " <> tshow refused))
-    Right valid → do
+    Left refused → pure (FixtureResult name [] [] [] (Just ("the snapshot was refused: " <> tshow refused)))
+    Right valid →
+      runValidated host suite directory depthFormat renderer marks (const Nothing) (`Map.lookup` decodedByHandle) name (fixtureShapes fixture) (fixtureNamed fixture) valid
+  where
+    name = fixtureName fixture
+    marks = cutoutMarks [handleOf handles key | key ← fixtureMarked fixture]
+
+-- | Render one validated snapshot into the targets these shapes describe, read
+-- every target back once its batch has completed, and judge every pixel and every
+-- named probe against an oracle planned with these marks, given the image behind
+-- each handle and the device buffer of each retained chunk the snapshot lists.
+runValidated
+  ∷ Host
+  → Suite
+  → FilePath
+  → ImageFormat
+  → Render.Renderer
+  → CutoutMarks
+  → (ChunkRef → Maybe Buffer)
+  → (Api.TextureHandle → Maybe DecodedImage)
+  → Text
+  → [TargetShape]
+  → [NamedProbe]
+  → ValidSnapshot
+  → IO FixtureResult
+runValidated host suite directory depthFormat renderer marks chunkBuffers decodedAt name shapes namedProbes valid = do
       made ← hostAct host ("making " <> name <> "'s targets") $ \construction →
         fmap sequence . traverse (target construction) $ shapes
       case made of
@@ -416,6 +476,8 @@ runFixture host suite directory depthFormat renderer handles decodedByHandle fix
                         ]
                   , Render.frameWindow = Nothing
                   , Render.frameWindowDepth = Nothing
+                  , Render.frameChunks = chunkBuffers
+                  , Render.frameOmitted = Set.empty
                   }
           ticket ← hostRecord host ("recording " <> name) $ \construction →
             Render.prepareSnapshot (builders construction) renderer input >>= \case
@@ -433,11 +495,8 @@ runFixture host suite directory depthFormat renderer handles decodedByHandle fix
                 Right () →
                   fmap sequence (traverse (\(shape, (_, readback, _)) → hostRead host readback (targetBytes shape)) (zip shapes pairs)) >>= \case
                     Left failure → pure (failed ("a readback was not read: " <> failure))
-                    Right readbacks → judged valid readbacks
+                    Right readbacks → judged readbacks
   where
-    name = fixtureName fixture
-    shapes = fixtureShapes fixture
-    marks = cutoutMarks [handleOf handles key | key ← fixtureMarked fixture]
     failed failure = FixtureResult name [] [] [] (Just failure)
     targetBytes shape = fromIntegral (shapeWidth shape) * fromIntegral (shapeHeight shape) * 4 ∷ Natural
     target ∷ Construction q inst msgr phys dev cmd → TargetShape → IO (Either Refusal (Image, Readback, Maybe Image))
@@ -455,7 +514,7 @@ runFixture host suite directory depthFormat renderer handles decodedByHandle fix
       , copyTargetToReadback recorder image readback
       , transitionResource recorder image (FromUse TransferRead) ColorAttachment
       ]
-    judged valid readbacks = do
+    judged readbacks = do
       let oracle =
             newOracle
               OracleInput
@@ -467,7 +526,7 @@ runFixture host suite directory depthFormat renderer handles decodedByHandle fix
                       [ (shapeRef shape, TargetSpec (shapeMetrics shape) (colourFormatOf (shapeFormat shape)) (PixelExtent (fromIntegral (shapeWidth shape)) (fromIntegral (shapeHeight shape))))
                       | shape ← shapes
                       ]
-                , inputTextures = (`Map.lookup` decodedByHandle)
+                , inputTextures = decodedAt
                 }
           perPass = zip3 [0 ..] shapes readbacks
           bytesOf index = case drop index readbacks of
@@ -500,7 +559,7 @@ runFixture host suite directory depthFormat renderer handles decodedByHandle fix
                     (Expected one _, Expected other _) → one /= other
                     _ → False
                 }
-            | candidate ← fixtureNamed fixture
+            | candidate ← namedProbes
             , let firstExpectation = expect oracle (namedProbe candidate)
                   contrastExpectation = expect oracle (namedContrast candidate)
             ]

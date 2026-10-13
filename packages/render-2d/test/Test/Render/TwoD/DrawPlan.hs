@@ -585,10 +585,10 @@ expectedStructure (Snapshot passes) =
   | (passIndex, pass) ← zip [0 ..] passes
   ]
   where
-    space (WorldLayer depth _) = WorldSpace depth
-    space (UiLayer _) = UiSpace
-    clears (WorldLayer depth _) = depth == DepthEnabled
-    clears (UiLayer _) = False
+    space (WorldLayerWith depth _ _) = WorldSpace depth
+    space (UiLayerWith _ _) = UiSpace
+    clears (WorldLayerWith depth _ _) = depth == DepthEnabled
+    clears (UiLayerWith _ _) = False
     count view layer = if nonZero (viewViewport view) then length (layerInstances layer) else 0
 
 -- * Generators

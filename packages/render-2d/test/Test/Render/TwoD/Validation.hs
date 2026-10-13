@@ -172,9 +172,11 @@ refusalSpec = describe "a refused snapshot" $ do
     (\(name, candidate, expected) → it ("names " <> name <> " and where it was found") $ refusalsOf candidate `shouldBe` expected)
     refusals
 
-  it "is exercised for every reason the module can give" $
+  -- The two reasons about retained chunks are about what a snapshot lists, not
+  -- about its own values; "Test.Render.TwoD.Chunks" exercises them.
+  it "is exercised for every reason the module can give but the chunk ones" $
     sort (nub [refusalReason refusal | (_, _, expected) ← refusals, refusal ← expected])
-      `shouldBe` [minBound .. maxBound]
+      `shouldBe` [reason | reason ← [minBound .. maxBound], reason `notElem` [ChunkUnresolved, ChunkKindMismatch]]
 
   it "ignores a fixed half-height outside the fixed half-height mode" $
     refusalsOf (withSettings defaultViewSettings {settingZoomMode = PixelsPerUnit}) `shouldBe` []
@@ -416,6 +418,6 @@ replaceInstance ∷ (Int, Int, Int, Int) → (Instance → Instance) → Snapsho
 replaceInstance (passAt, viewAt, layerAt, instanceAt) change (Snapshot passes) =
   Snapshot (at passAt (\pass → pass {passViews = at viewAt (\view → view {viewLayers = at layerAt layerChange (viewLayers view)}) (passViews pass)}) passes)
   where
-    layerChange (WorldLayer depth instances) = WorldLayer depth (at instanceAt change instances)
-    layerChange (UiLayer instances) = UiLayer (at instanceAt change instances)
+    layerChange (WorldLayerWith depth chunks instances) = WorldLayerWith depth chunks (at instanceAt change instances)
+    layerChange (UiLayerWith chunks instances) = UiLayerWith chunks (at instanceAt change instances)
     at n f items = [if i == n then f item else item | (i, item) ← zip [0 ..] items]

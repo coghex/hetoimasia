@@ -80,6 +80,7 @@ module Test.GPU.Vulkan.Native.SurfaceFree
   , runDepthRect
   , runOrderedPath
   , runCutoutDepth
+  , runRetained
   , surfaceFreeSection
   , laterWindowSection
   , framelessSection
@@ -96,6 +97,7 @@ module Test.GPU.Vulkan.Native.SurfaceFree
   , depthRectSection
   , orderedPathSection
   , cutoutDepthSection
+  , retainedSection
   , surfaceFreeSpec
   , laterWindowSpec
   , framelessSpec
@@ -112,6 +114,7 @@ module Test.GPU.Vulkan.Native.SurfaceFree
   , depthRectSpec
   , orderedPathSpec
   , cutoutDepthSpec
+  , retainedSpec
   ) where
 
 import Control.Concurrent (ThreadId, myThreadId, threadDelay)
@@ -266,6 +269,9 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , beginRenderingWithDepth
   , clearDepthRect
   , depthTested
+  , UploadRefusal (..)
+  , VulkanUploadRefusal (..)
+  , requestVulkanRelease
   )
 import Hetoimasia.GPU.Vulkan.Native.Presentation (formatB8G8R8A8Srgb)
 import Hetoimasia.GPU.Vulkan.Native.Recording.ShaderInterfaces (tableSamplerOffset)
@@ -298,6 +304,7 @@ import Hetoimasia.Runtime.Supervision (RuntimeControl)
 import Test.GPU.Vulkan.Native.Environment (validationFeatures)
 import qualified Test.GPU.Vulkan.Native.CutoutDepth as CutoutDepth
 import qualified Test.GPU.Vulkan.Native.OrderedPath as OrderedPath
+import qualified Test.GPU.Vulkan.Native.RetainedPath as RetainedPath
 import Test.GPU.Vulkan.Native.Platform (requestingBackend)
 import Test.GPU.Vulkan.Native.Png (encodeRgba)
 import Test.Vulkan.Proof.Journal (Journal, heading, note)
@@ -1841,7 +1848,7 @@ runOrderedPath backend journal =
   runEvidenceSuite
     backend
     journal
-    OrderedPath.orderedSuite
+    (\vulkan directory → OrderedPath.runEvidence (orderedHost vulkan) OrderedPath.orderedSuite directory)
     "R2D-7: a surface-free session records render-2d snapshots through the ordered path into offscreen targets, reads each back after completion and judges every pixel against the render-2d oracle, and writes a lossless PNG a target and a probe record"
     "vulkan-native-r2d7-ordered-path"
     "ordered-path"
@@ -1859,13 +1866,32 @@ runCutoutDepth backend journal =
   runEvidenceSuite
     backend
     journal
-    CutoutDepth.cutoutSuite
+    (\vulkan directory → OrderedPath.runEvidence (orderedHost vulkan) CutoutDepth.cutoutSuite directory)
     "R2D-9: a surface-free session records render-2d snapshots with cutout art depth-tested in world layers into offscreen targets that have a D32_SFLOAT depth image, reads each back after completion and judges every pixel against the render-2d oracle, and writes a lossless PNG a target and a probe record that names the depth format and every indeterminate reason"
     "vulkan-native-r2d9-cutout-depth"
     "cutout-depth"
 
-runEvidenceSuite ∷ Maybe Backend → Journal → OrderedPath.Suite → Text → Text → String → IO SurfaceFreeOutcome
-runEvidenceSuite backend journal suite headline caseName directoryName = do
+-- | The retained chunks' case (R2D-10): the same recorder over the same kind of
+-- session, with a @D32_SFLOAT@ depth image for every target, retained chunks
+-- built once and listed by reference over several frames beside the dynamic
+-- content that alone is republished, the adapter's holds and a release requested
+-- through the integration driven as the owner does, every frame read back after
+-- completion and judged against the oracle ("Test.GPU.Vulkan.Native.RetainedPath").
+-- Its files, probe record and measurements go under the validation runner's
+-- evidence directory when it names one, and otherwise into a directory of their
+-- own that is kept and reported.
+runRetained ∷ Maybe Backend → Journal → IO SurfaceFreeOutcome
+runRetained backend journal =
+  runEvidenceSuite
+    backend
+    journal
+    (\vulkan directory → RetainedPath.runRetained (retainedHost vulkan) directory)
+    "R2D-10: a surface-free session builds retained chunks once and lists them in render-2d snapshots over several frames beside dynamic content that alone is republished, records each frame into an offscreen target that has a D32_SFLOAT depth image, reads it back after completion and judges every pixel against the render-2d oracle: retained cutout and translucent content interleaved with dynamic content, a UI chunk and a world chunk without depth drawn in the ordered path, a texture swap showing through a chunk and a mark-changing swap refused, a chunk released while shown still drawn until a snapshot without it is adopted, and a chunk outside a view skipped"
+    "vulkan-native-r2d10-retained"
+    "retained"
+
+runEvidenceSuite ∷ Maybe Backend → Journal → (VulkanHost () → FilePath → IO OrderedPath.Evidence) → Text → Text → String → IO SurfaceFreeOutcome
+runEvidenceSuite backend journal runner headline caseName directoryName = do
   heading journal headline
   directory ← evidenceDirectory
   note journal ("the " <> Text.pack directoryName <> " evidence is written into " <> Text.pack directory)
@@ -1876,7 +1902,7 @@ runEvidenceSuite backend journal suite headline caseName directoryName = do
     []
     caseName
     $ \vulkan _ _ _ → do
-      outcome ← OrderedPath.runEvidence (orderedHost vulkan) suite directory
+      outcome ← runner vulkan directory
       note journal (Text.pack directoryName <> " probe record: " <> Text.pack (OrderedPath.evidenceRecord outcome))
       mapM_ (\depth → note journal (Text.pack directoryName <> " depth format: " <> tshow depth)) (OrderedPath.evidenceDepthFormat outcome)
       mapM_ (\why → note journal (Text.pack directoryName <> " unavailable: " <> why)) (OrderedPath.evidenceUnavailable outcome)
@@ -1903,6 +1929,30 @@ runEvidenceSuite backend journal suite headline caseName directoryName = do
           temporary ← getTemporaryDirectory
           stamp ← (round . (* 1000) . utcTimeToPOSIXSeconds ∷ UTCTime → Integer) <$> getCurrentTime
           pure (temporary </> ("hetoimasia-" <> directoryName <> "-" <> show stamp))
+
+-- | The retained case's host over this suite's session: the ordered path's, and
+-- uploads admitted for a ticket the registry polls, and the integration's own
+-- release request and owner-thread action for the adapter's releases.
+retainedHost ∷ VulkanHost () → RetainedPath.RetainedHost
+retainedHost vulkan =
+  RetainedPath.RetainedHost
+    { RetainedPath.retainedBase = orderedHost vulkan
+    , RetainedPath.retainedSubmit = submit
+    , RetainedPath.retainedRequestRelease = \body →
+        atomically (requestVulkanRelease vulkan (VulkanAction (body . RetainedPath.buildersWith submit))) >>= \case
+          Left refusal → pure (Left (tshow refusal))
+          Right _ → pure (Right ())
+    , RetainedPath.retainedRunOnOwner = \body →
+        atomically (submitVulkanAction vulkan (VulkanAction (body . RetainedPath.buildersWith submit))) >>= \case
+          Left refusal → pure (Left (tshow refusal))
+          Right _ → pure (Right ())
+    }
+  where
+    submit request =
+      submitVulkanUpload vulkan request >>= \case
+        Left (VulkanUploadRefused refusal) → pure (Left refusal)
+        Left (VulkanUploadsUnavailable _) → pure (Left UploadClosed)
+        Right ticket → pure (Right ticket)
 
 -- | The ordered path's evidence host over this suite's session: owner-thread
 -- actions over its constructions, uploads admitted from the main thread and
@@ -2787,11 +2837,17 @@ evidenceSection title label outcome =
               ]
       SurfaceFreeFailed _ → []
 
+retainedSection ∷ SurfaceFreeOutcome → [Text]
+retainedSection = evidenceSection "A surface-free session recording retained chunks over several frames over a D32_SFLOAT depth image" "retained"
+
 orderedPathSpec ∷ SurfaceFreeOutcome → Spec
 orderedPathSpec = evidenceSpec "R2D-7 the ordered path's window-free evidence" "ordered path" 10 True
 
 cutoutDepthSpec ∷ SurfaceFreeOutcome → Spec
 cutoutDepthSpec = evidenceSpec "R2D-9 the cutout path's window-free evidence" "cutout depth" 7 True
+
+retainedSpec ∷ SurfaceFreeOutcome → Spec
+retainedSpec = evidenceSpec "R2D-10 the retained chunks' window-free evidence" "retained" 11 True
 
 -- | The examples of an evidence case: no window, every fixture rendered and
 -- read back after its batch completed, every determinate probe within its
