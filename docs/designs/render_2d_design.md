@@ -1073,7 +1073,9 @@ Moved to the [asset design](asset_design.md) as AST-2 (D-15).
   arithmetic; `render-2d-oracle` support; for retained and dynamic content
   alike, with references resolved against the view drawing them (D-32).
 - **Phase:** 3
-- **Depends on:** R2D-7, R2D-15, R2D-10
+- **Depends on:** R2D-7, R2D-15, R2D-10, R2D-11, R2D-12 (R2D-11 and R2D-12
+  added on review of #431, 2026-10-12: its storage-fit test packs real
+  material and clip tables beside the frame tables)
 - **Ordering:** not on the critical path
 - **Relevant decisions:** D-4, D-32
 - **Acceptance signals:** readback at several times matches the oracle for
