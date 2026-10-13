@@ -6611,13 +6611,15 @@ with a depth image, through `prepareSnapshot` planned with the registered marks,
 read back as the ordered path's are:
 
 1. *interleaved* (3 frames): a world chunk with depth, built once, holding two
-   cutouts and a translucent instance, listed in a depth-enabled world layer beside
-   dynamic cutouts, one of which moves each frame and only which is republished: a
-   dynamic cutout at an equal key to a chunk cutout wins the tie as the later
-   source, the chunk's translucent instance is hidden behind a nearer chunk cutout
-   and blends over a farther one; the chunk's two cutouts, 128 bytes, are uploaded
-   once and the ring receives 192 bytes a frame (two dynamic cutouts and the one
-   ordered instance), never the chunk's cutouts;
+   cutouts and a translucent instance, and a second chunk listed after it holding
+   one cutout, in a depth-enabled world layer beside dynamic cutouts, one of which
+   moves each frame and only which is republished: a dynamic cutout at an equal key
+   to a chunk cutout wins the tie as the later source, so does the later listed
+   chunk's cutout against the earlier's, and the first chunk's translucent
+   instance is hidden behind a nearer chunk cutout and blends over a farther one;
+   the chunks' three cutouts, 192 bytes in two uploads, are uploaded once and the
+   ring receives 192 bytes a frame (two dynamic cutouts and the one ordered
+   instance), never a chunk's cutouts;
 2. *ordered-kinds*: a world chunk without depth and a UI chunk, drawn wholly in the
    ordered path beside dynamic content in the same layers and merged with it by key
    and then source; a texel with an alpha under a half, registered with an explicit
