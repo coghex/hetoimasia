@@ -549,6 +549,7 @@ scenarios =
       $ \consent journal _ → do
         outcome ← SurfaceFree.runClip (consentBackend consent) journal
         pure (SurfaceFree.clipSpec outcome, section "The R2D-12 clip evidence record" (SurfaceFree.clipSection outcome))
+  , Scenario
       "r2d10-retained"
       "records eleven frames of render-2d snapshots that list retained chunks built once beside dynamic content that alone is republished, into offscreen targets that have a D32_SFLOAT depth image, in a surface-free session — retained cutouts and a translucent instance interleaved with dynamic cutouts, a world chunk without depth and a UI chunk drawn in the ordered path beside dynamic content, a texture swap showing through a chunk and a mark-changing swap refused, a chunk released while the adopted snapshot shows it and still drawn until a snapshot without it is adopted, and a chunk outside a view skipped — reads each back after completion, judges every pixel against the render-2d oracle, and writes a lossless PNG a target, a probe record and the bytes uploaded and written to the ring; where the device chooses another depth format it reports that"
       False
