@@ -104,6 +104,7 @@ spec = describe "Vulkan scenes for each window (R2D-14)" $ do
     itBounded "wait on a shared scene's revision for every window in a shared host" testRequestSharedMode
     itBounded "are refused when the queue is full and before the device exists, and settled as refused, never replayed, when the owner exits" testRequestAdmission
     itBounded "are refused after the session's failure, including one queued before it that never started" testRequestAfterFailure
+    itBounded "are refused after a failure reported while the owner is idle, which the next publication brings to its checkpoint, including one queued before it that never started" testRequestAfterFailureWhileIdle
 
 -- ---------------------------------------------------------------------------
 -- Helpers
@@ -759,7 +760,28 @@ testReleaseOrder = do
   released `shouldBe` [0, 1, 2]
 
 testRequestAfterFailure ∷ IO ()
-testRequestAfterFailure = do
+testRequestAfterFailure = requestAfterFailure False
+
+testRequestAfterFailureWhileIdle ∷ IO ()
+testRequestAfterFailureWhileIdle = requestAfterFailure True
+
+-- | A validation error is reported while a release request waits, and the
+-- session fails: the request that never started is settled as refused by the
+-- failure, and a request made after it is refused at once.
+--
+-- The owner latches the error at its next checkpoint, and reporting it wakes
+-- nobody (the latch table in docs/gpu_backend.md). The one thing queued is a
+-- release request blocked on its barrier, which wakes no idle owner either. So
+-- an owner that has ended the round that took the publication before the error
+-- is reported is never asked for another, and the wait for its failure never
+-- ends; whether that happens used to be down to the scheduler (it left the
+-- example running into its bound once on Linux CI, #438). The example reports
+-- the error and then gives the owner a round as an application does, by
+-- publishing the window's next scene. With @idle@ it first waits for the owner
+-- to have ended its last round with nothing owed, which is the interleaving
+-- that stalled.
+requestAfterFailure ∷ Bool → IO ()
+requestAfterFailure idle = do
   rig ← withPerWindowScenes <$> surfaceFreeRig 1
   observed ← newTVarIO Nothing
   outcome ← runRigCaught rig $ \host control → do
@@ -771,7 +793,11 @@ testRequestAfterFailure = do
     published ← publishTo host window 1
     published `shouldBe` WindowScenePublished window 1
     queued ← request host (VulkanAction (\_ → pure ()))
+    when idle (awaitIdleOwner host)
     reportErrorNow rig "an error while a request waits"
+    -- The round that takes the error. Its answer does not matter: the window
+    -- may already have ended with the session.
+    _ ← publishTo host window 2
     atomically (readOwnerFailure (vulkanGraphicsOwner host) >>= check . isJust)
     settled ← atomically (awaitVulkanAction queued)
     later ← atomically (requestVulkanRelease (vulkanController host) (VulkanAction (\_ → pure ())))
@@ -786,6 +812,32 @@ testRequestAfterFailure = do
     settledAs = \case
       ActionRefused (ActionSessionFailed cause) → Just cause
       _ → Nothing
+
+-- | Wait until the owner has ended a round that began after everything this
+-- thread did so far, with nothing left to ask it for another.
+--
+-- An action with no barrier runs in a round of the owner's, and that round
+-- counts the rounds ended before it (the idiom 'settleOwner' uses for a
+-- scene event). The first action settles inside some round; the second is
+-- admitted after that, so it runs in a later round, one that began after the
+-- caller's earlier publications and admissions were made and read them. When
+-- that round has ended the owner is waiting for a wake, and none is owed: the
+-- release request that waits wakes no one.
+awaitIdleOwner ∷ VulkanHost Scene → IO ()
+awaitIdleOwner host = do
+  _ ← inRound
+  rounds ← inRound
+  void (atomically (awaitOwnerRound (vulkanGraphicsOwner host) rounds))
+  where
+    owner = vulkanGraphicsOwner host
+    inRound = do
+      seen ← newTVarIO 0
+      ticket ←
+        atomically (submitVulkanAction (vulkanController host) (VulkanAction (\_ → atomically (readOwnerStatusNow owner >>= writeTVar seen . statusRounds))))
+          >>= either (\refusal → failWith ("the action was refused: " <> show refusal)) pure
+      atomically (awaitVulkanAction ticket) >>= \case
+        ActionReturned () → readTVarIO seen
+        _ → failWith "the action did not return"
 
 -- ---------------------------------------------------------------------------
 -- Retention, cancellation and teardown
