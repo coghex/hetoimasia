@@ -333,13 +333,13 @@ chunkSpec = describe "retained references" $ do
         short = animatedView [tableOf 1 1, tableOf 1 1] 0 [UiLayer [], UiLayerWith [chunkRef 4 1] []]
         snapshot = Snapshot [windowPass [enough, short]]
     validateSnapshotWith (chunksFrom [(reference, chunk)]) snapshot
-      `shouldBe'` Left (Refusal (AtChunkInstance 0 1 1 0 2) FrameIndexUnknown :| [])
+      `shouldBe'` Left (Refusal (AtChunkFrame 0 1 1 0 reference 2) FrameIndexUnknown :| [])
 
   it "is refused for a view with no tables at all, and accepted once the view holds enough" $ do
     let chunk = chunkOf [framed 1]
         reference = chunkRef 1 1
     validateSnapshotWith (chunksFrom [(reference, chunk)]) (snapshotOfView (plainView [UiLayerWith [reference] []]))
-      `shouldBe'` Left (Refusal (AtChunkInstance 0 0 0 0 0) FrameIndexUnknown :| [])
+      `shouldBe'` Left (Refusal (AtChunkFrame 0 0 0 0 reference 0) FrameIndexUnknown :| [])
     either (const False) (const True) (validateSnapshotWith (chunksFrom [(reference, chunk)]) (snapshotOfView (animatedView [tableOf 1 1] 0 [UiLayerWith [reference] []])))
       `shouldBe` True
 
@@ -348,7 +348,7 @@ chunkSpec = describe "retained references" $ do
         reference = chunkRef 1 1
         far = animatedView [tableOf 1 1] 0 [UiLayerWith [reference] []]
         zero = ViewWith plainCamera (Viewport (V2 0 0) (V2 0 0)) defaultViewSettings [] Map.empty [tableOf 1 1] 0 [UiLayerWith [reference] []]
-        expected = Refusal (AtChunkInstance 0 0 0 0 0) FrameIndexUnknown :| []
+        expected = Refusal (AtChunkFrame 0 0 0 0 reference 0) FrameIndexUnknown :| []
     validateSnapshotWith (chunksFrom [(reference, chunk)]) (snapshotOfView far) `shouldBe'` Left expected
     validateSnapshotWith (chunksFrom [(reference, chunk)]) (snapshotOfView zero) `shouldBe'` Left expected
 
@@ -362,7 +362,7 @@ chunkSpec = describe "retained references" $ do
     let chunk = chunkOf [framed 2]
         reference = chunkRef 1 1
     validateSnapshotWith (chunksFrom [(reference, chunk)]) (snapshotOfView (animatedView [tableOf 1 1] 0 [UiLayerWith [reference, reference] []]))
-      `shouldBe'` Left (Refusal (AtChunkInstance 0 0 0 0 0) FrameIndexUnknown :| [Refusal (AtChunkInstance 0 0 0 1 0) FrameIndexUnknown])
+      `shouldBe'` Left (Refusal (AtChunkFrame 0 0 0 0 reference 0) FrameIndexUnknown :| [Refusal (AtChunkFrame 0 0 0 1 reference 0) FrameIndexUnknown])
   where
     shouldBe' actual expected = actual `shouldBe` expected
 

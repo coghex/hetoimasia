@@ -83,8 +83,9 @@
 -- the instance is ('FrameIndexUnknown'), each named by the instance. A chunk's
 -- instances are checked at build for the first, and the chunk, as recorded when it
 -- was built, for the second against the tables of each view whose layer lists it,
--- whether or not the view culls it: the refusal is named by the chunk's listing and
--- its first instance carrying the largest index ('AtChunkInstance'). Within a view
+-- whether or not the view culls it: the refusal names the view, the layer, the
+-- chunk (its position in the layer's list and the reference listed there) and its
+-- first instance carrying the largest index ('AtChunkFrame'). Within a view
 -- the table refusals come after the clip table's entries and before its layers'.
 --
 -- __Dependencies.__ @base@, @containers@ for the set of chunks and the clip
@@ -193,6 +194,11 @@ data Location
     AtPushBlock !Int !Int !MaterialRef
   | -- | The frame table at this index of the view's tables: pass, view, table.
     AtFrameTable !Int !Int !Int
+  | -- | The first instance of a chunk a layer lists that carries the chunk's
+    -- largest frame-table index: pass, view, layer, the chunk's position in the
+    -- layer's list, the reference listed there, and the instance's build
+    -- position in the chunk.
+    AtChunkFrame !Int !Int !Int !Int !ChunkRef !Int
   deriving stock (Eq, Ord, Show)
 
 -- | Why a candidate was refused. A reason names no value; the location says
@@ -513,7 +519,7 @@ layerRefusals ∷ Map.Map ChunkRef Chunk → Map.Map MaterialRef MaterialData �
 layerRefusals held materials passIndex viewIndex tableSize frameTables layerIndex layer =
   concat
     [ chunkRefusals (AtChunk passIndex viewIndex layerIndex position reference) (layerChunkKind layer) (Map.lookup reference held)
-        <> chunkFrameRefusals (AtChunkInstance passIndex viewIndex layerIndex position) frameTables (Map.lookup reference held)
+        <> chunkFrameRefusals (AtChunkFrame passIndex viewIndex layerIndex position reference) frameTables (Map.lookup reference held)
     | (position, reference) ← zip [0 ..] (layerChunks layer)
     ]
     <> concat
