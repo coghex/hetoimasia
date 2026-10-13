@@ -29,22 +29,35 @@
 -- attributes. Declared as a @vec4@, the UV rectangle would align to 16 bytes
 -- and move to offset 32, breaking the stride.
 --
+-- __Drawing order.__ 'encodeLayerInDrawingOrder' writes the same chunks
+-- permuted by a planned layer's drawing order, so a draw run's instances are
+-- one contiguous range of the buffer: the @k@-th chunk it writes is byte for
+-- byte the chunk 'encodeLayer' writes at the position
+-- 'Hetoimasia.Render.TwoD.DrawPlan.drawingOrder' lists @k@-th. A recorder that
+-- uploads it draws a run as its @runStart@ and @runCount@ over the buffer, with
+-- no further reordering.
+--
 -- __Cost.__ Encoding is pure, total and linear in the number of instances. It
 -- allocates the one result buffer of the exact final size and no buffer per
 -- instance, and encoding the same layer always gives the same bytes. No
 -- instance has a NaN or infinity here, because validation refused it.
+-- 'encodeLayerInDrawingOrder' also holds the layer's instances in one array of
+-- that many elements while it writes.
 --
--- __Dependencies.__ @base@, @bytestring@, @hetoimasia-math@ for the transform's
--- coefficients, @hetoimasia-render-api@'s backend-facing module for the handle's
--- two numbers, and this package's snapshot and validation modules.
+-- __Dependencies.__ @base@, @array@ for the drawing-order encoder's instance
+-- array, @bytestring@, @hetoimasia-math@ for the transform's coefficients,
+-- @hetoimasia-render-api@'s backend-facing module for the handle's two numbers,
+-- and this package's draw plan, snapshot and validation modules.
 --
 -- __State.__ The module owns none.
 module Hetoimasia.Render.TwoD.Encoding
   ( encodeLayer
+  , encodeLayerInDrawingOrder
   , instanceStride
   , flagsWord
   ) where
 
+import Data.Array (Array, listArray, (!))
 import Data.Bits (shiftL, (.|.))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
@@ -54,6 +67,7 @@ import qualified Data.ByteString.Lazy as Lazy
 import Data.Word (Word32)
 import Hetoimasia.Math.Affine2 (toColumnMajor)
 import Hetoimasia.Render.Api.Texture.Backend (handleGeneration, handleIndex)
+import Hetoimasia.Render.TwoD.DrawPlan (PlannedLayer, drawingOrder)
 import Hetoimasia.Render.TwoD.Snapshot
   ( Instance (..)
   , Sampler (..)
@@ -78,6 +92,27 @@ encodeLayer layer
   where
     instances = layerInstances (validLayerContents layer)
     size = instanceStride * length instances
+
+-- | A planned layer's instances in drawing order: exactly 'instanceStride'
+-- bytes each, in one strict buffer, the @k@-th chunk being the chunk
+-- 'encodeLayer' writes for the @k@-th submission index of
+-- 'Hetoimasia.Render.TwoD.DrawPlan.drawingOrder'. A layer whose plan holds no
+-- order (an empty layer, or one in a zero-size viewport) encodes to the empty
+-- buffer. 'Nothing' when the order names an instance the layer does not hold,
+-- which planning that layer never does: the plan belongs to another layer.
+encodeLayerInDrawingOrder ∷ PlannedLayer → ValidLayer → Maybe ByteString
+encodeLayerInDrawingOrder planned layer
+  | any (\index → index < 0 || index >= count) order = Nothing
+  | size == 0 = Just ByteString.empty
+  | otherwise =
+      Just (Lazy.toStrict (toLazyByteStringWith (untrimmedStrategy size size) mempty (foldMap (encodeInstance . (held !)) order)))
+  where
+    instances = layerInstances (validLayerContents layer)
+    count = length instances
+    held ∷ Array Int Instance
+    held = listArray (0, count - 1) instances
+    order = drawingOrder planned
+    size = instanceStride * length order
 
 encodeInstance ∷ Instance → Builder
 encodeInstance candidate =

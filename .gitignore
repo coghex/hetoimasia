@@ -46,3 +46,4 @@ config/*.local.yaml
 /samples/triangle/renderer/shaders/toolchain.fingerprint
 /samples/sprites/renderer/shaders/toolchain.fingerprint
 /samples/scene3d/renderer/shaders/toolchain.fingerprint
+/packages/render-2d-vulkan/shaders/toolchain.fingerprint

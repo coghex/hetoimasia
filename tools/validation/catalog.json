@@ -353,7 +353,7 @@
     },
     {
       "id": "test.vulkan-headless",
-      "description": "Vulkan-linked headless Hspec contracts, executed rather than only built, through cabal.project.vulkan against the provisioned native prefix: the native backend's profile and roots decisions over a stand-in native layer (native-tests), its shader contract against the provisioned compiler (shader-tests), the window integration's controller over the GLFW package's scripted seam (integration-tests), the triangle sample's pipeline cache over stand-in builders (triangle-tests), the sprites sample's scene, probe oracle, fixtures and PNG writer (sprites-tests), and the scene3d sample's scene, cameras built with the math package, independent probe oracle and PNG writer (scene3d-tests). None acquires a display, a GLFW session, or a device, and none reads desktop consent; the headers and loader are build and link prerequisites only.",
+      "description": "Vulkan-linked headless Hspec contracts, executed rather than only built, through cabal.project.vulkan against the provisioned native prefix: the native backend's profile and roots decisions over a stand-in native layer (native-tests), its shader contract against the provisioned compiler (shader-tests), the window integration's controller over the GLFW package's scripted seam (integration-tests), the triangle sample's pipeline cache over stand-in builders (triangle-tests), the sprites sample's scene, probe oracle, fixtures and PNG writer (sprites-tests), the scene3d sample's scene, cameras built with the math package, independent probe oracle and PNG writer (scene3d-tests), and the 2D renderer's Vulkan recorder over a stand-in native layer (render-2d-vulkan-tests): the scissor rule against viewportContains, the push-constant packing, the attribute descriptions against the 64-byte instance layout, the sampler-choice mapping, the pure frame work of targets, metrics, mappings and scissors, and the recorded command order, the drawing-order instance bytes at their ring offsets, mixed samplers in one draw, empty scissors recording no draw, pipelines per format, and the refusals of an unknown target, invalid or disagreeing metrics, an unmappable view and a full ring, none of which records a clear or a draw. None acquires a display, a GLFW session, or a device, and none reads desktop consent; the headers and loader are build and link prerequisites only.",
       "command": [
         "bash",
         "tools/vulkan/run.sh",
@@ -363,7 +363,8 @@
         "hetoimasia-gpu-vulkan-glfw:test:integration-tests",
         "hetoimasia-sample-triangle:test:triangle-tests",
         "hetoimasia-sample-sprites:test:sprites-tests",
-        "hetoimasia-sample-scene3d:test:scene3d-tests"
+        "hetoimasia-sample-scene3d:test:scene3d-tests",
+        "hetoimasia-render-2d-vulkan:test:render-2d-vulkan-tests"
       ],
       "component": "hetoimasia-gpu-vulkan-glfw:test:integration-tests",
       "inputs": [
@@ -373,6 +374,9 @@
         "samples/triangle/renderer/",
         "samples/sprites/renderer/",
         "samples/scene3d/renderer/",
+        "packages/render-2d-vulkan/",
+        "packages/render-2d/",
+        "packages/render-api/",
         "packages/math/",
         "tools/ci-image/",
         "tools/native/",
@@ -388,7 +392,7 @@
     },
     {
       "id": "test.vulkan-native",
-      "description": "The Vulkan native suite: the package-native fixture's shared roots under the graphics owner, with GLFW's session on the process main thread, and the migrated VK-2, VK-5, VK-6 and VK-7 cases, VK-17's required profile over the triangle sample's drawing, the sprites sample's window-free evidence case (GRS-8), which writes its PNG and probe record into the group's evidence directory, the scene3d sample's window-free depth-tested evidence case (GRS-10), which writes a PNG a camera pose and its probe record into the same directory, and the synchronization-validation control in private child processes, all with the validation layer and synchronization validation enabled, failing on any validation error or incomplete diagnostic capture after the last teardown. Its executable, and the triangle, sprites and scene3d samples', are built in a separate preparation stage; its native execution — test-owned display, fixtures, examples, retirement, diagnostic finalization and teardown — is measured alone under a 30-second watchdog. On Linux the command starts its own isolated X11 display; on macOS it needs the desktop opt-in on its own command, given under the owner's standing approval for runs an issue or pull request needs.",
+      "description": "The Vulkan native suite: the package-native fixture's shared roots under the graphics owner, with GLFW's session on the process main thread, and the migrated VK-2, VK-5, VK-6 and VK-7 cases, VK-17's required profile over the triangle sample's drawing, the sprites sample's window-free evidence case (GRS-8), which writes its PNG and probe record into the group's evidence directory, the scene3d sample's window-free depth-tested evidence case (GRS-10), which writes a PNG a camera pose and its probe record into the same directory, the 2D renderer's ordered-path evidence case (R2D-7), which records eleven render-2d snapshots into offscreen targets through render-2d-vulkan and judges every pixel of every target against the render-2d oracle, writing a PNG a target and a probe record into the same directory, and the synchronization-validation control in private child processes, all with the validation layer and synchronization validation enabled, failing on any validation error or incomplete diagnostic capture after the last teardown. Its executable, and the triangle, sprites and scene3d samples', are built in a separate preparation stage; its native execution — test-owned display, fixtures, examples, retirement, diagnostic finalization and teardown — is measured alone under a 30-second watchdog. On Linux the command starts its own isolated X11 display; on macOS it needs the desktop opt-in on its own command, given under the owner's standing approval for runs an issue or pull request needs.",
       "command": [
         "bash",
         "tools/vulkan/run.sh",
@@ -515,7 +519,8 @@
         "packages/glfw/hetoimasia-glfw.cabal",
         "samples/triangle/renderer/test/Main.hs",
         "samples/sprites/renderer/test/Main.hs",
-        "samples/scene3d/renderer/test/Main.hs"
+        "samples/scene3d/renderer/test/Main.hs",
+        "packages/render-2d-vulkan/test/Main.hs"
       ],
       "framework": "hspec",
       "runner": "cpu",

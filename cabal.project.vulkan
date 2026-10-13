@@ -1,13 +1,13 @@
 -- The Vulkan project: the native backend package, the window integration
--- package with its native suite, the triangle sample (VK-17), the sprites
--- sample (GRS-8), the scene3d sample (GRS-10), and the GLFW package with its
--- Vulkan interop component enabled — the only project file that names the first
--- five or turns that component on.
+-- package with its native suite, the 2D renderer's Vulkan recorder (R2D-7), the
+-- triangle sample (VK-17), the sprites sample (GRS-8), the scene3d sample
+-- (GRS-10), and the GLFW package with its Vulkan interop component enabled —
+-- the only project file that names the first six or turns that component on.
 --
 -- `cabal.project` and `cabal.project.cpu` deliberately do not list
--- `packages/gpu-vulkan/native`, `packages/gpu-vulkan/glfw` or the samples'
--- packages under `samples/triangle`, `samples/sprites` and `samples/scene3d`,
--- and neither sets
+-- `packages/gpu-vulkan/native`, `packages/gpu-vulkan/glfw`,
+-- `packages/render-2d-vulkan` or the samples' packages under
+-- `samples/triangle`, `samples/sprites` and `samples/scene3d`, and neither sets
 -- the GLFW package's manual `vulkan-interop` flag, so neither resolves nor links
 -- the Vulkan binding and neither `cabal build all` nor `cabal build all
 -- --project-file cabal.project.cpu` needs a loader or the Vulkan headers. Every
@@ -16,9 +16,11 @@
 -- of the native package and of the interop component — the diagnostics package
 -- whose C capture the native package installs, the GPU model, the runtime the
 -- GLFW package's runtime integration uses, the foundation, the math package the
--- scene3d sample builds its cameras with, and the test-only support library the
--- native package's shader suite uses — which the ordinary
--- projects list too; `cabal.project` lists the GLFW package itself, with the
+-- scene3d sample builds its cameras with, the pure render-2d packages the 2D
+-- recorder records and the integration's native suite judges it with (the
+-- asset and image packages, the render API, render-2d and its oracle), and the
+-- test-only support library the native package's shader suite uses — which the
+-- ordinary projects list too; `cabal.project` lists the GLFW package itself, with the
 -- flag off. Selecting this project is an explicit act, and one command makes
 -- it:
 --
@@ -36,6 +38,7 @@ import: cabal.project.common
 packages:
   packages/gpu-vulkan/native
   packages/gpu-vulkan/glfw
+  packages/render-2d-vulkan
   samples/triangle/renderer
   samples/triangle/app
   samples/sprites/renderer
@@ -48,6 +51,11 @@ packages:
   packages/runtime
   packages/foundation
   packages/math
+  packages/asset
+  packages/asset-image
+  packages/render-api
+  packages/render-2d
+  packages/render-2d-oracle
   tools/test-support
 
 -- The GLFW package's Vulkan interop component: the shared loader capability and

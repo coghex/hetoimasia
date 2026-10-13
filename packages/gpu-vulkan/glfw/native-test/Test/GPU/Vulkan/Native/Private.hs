@@ -96,6 +96,19 @@
 --   index of 3 — and read back: the nearest instance reads its texel exactly,
 --   the linear one the blend within one step, and index 7 reads as sampler 3
 --   (render-2d D-4);
+-- * @r2d7-ordered-path@ — the same device start with no window, then the 2D
+--   renderer's recorder (R2D-7): eleven fixtures — both zoom modes with pixel snap
+--   on and off, nearest, linear and default samplers mixed in one draw, a
+--   quarter-turn camera, tint, brightness and an additive instance,
+--   overlapping translucent instances in key and submission order, a UI layer
+--   at content scale 1 and 2, two views with separate viewports one of them
+--   fractional, two passes into an sRGB and a UNORM target, a depth-enabled
+--   layer of cutout-marked art drawn ordered, and the placeholder for an
+--   unknown index and a stale generation, and a snapping origin just below
+--   one half — rendered offscreen from render-2d
+--   snapshots, read back after completion, every pixel of every target judged
+--   against the render-2d oracle, and written as lossless PNGs and a probe
+--   record under the validation runner's evidence directory (#422);
 -- * @r2d15-storage-tables@ — the same device start with no window, then the
 --   session's texture table, a ring made with a storage-table window, and a
 --   pipeline layout that also holds the storage table's set 2: two per-batch
@@ -453,6 +466,14 @@ scenarios =
       $ \consent journal _ → do
         outcome ← SurfaceFree.runShaderSamplers (consentBackend consent) journal
         pure (SurfaceFree.shaderSamplersSpec outcome, section "The R2D-16 shader-chosen samplers record" (SurfaceFree.shaderSamplersSection outcome))
+  , Scenario
+      "r2d7-ordered-path"
+      "records eleven render-2d snapshots through the ordered path into offscreen targets of a surface-free session — zoom modes with pixel snap, mixed samplers, a quarter-turn camera, tint, brightness and additive output, overlap order, UI content scales, fractional views, sRGB and UNORM targets, cutout art drawn ordered, placeholder handles and a snapping origin just below one half — reads each target back after completion, passes every determinate probe of the render-2d oracle with each named behaviour distinguished from its contrast, and writes lossless PNGs and a probe record, with validation reporting nothing"
+      False
+      Nothing
+      $ \consent journal _ → do
+        outcome ← SurfaceFree.runOrderedPath (consentBackend consent) journal
+        pure (SurfaceFree.orderedPathSpec outcome, section "The R2D-7 ordered path evidence record" (SurfaceFree.orderedPathSection outcome))
   , Scenario
       "r2d15-storage-tables"
       "draws twice in one batch of a frame-less batch of a surface-free session, through a shader-sampled table layout that also holds set 2 and no selected sampler: two per-batch tables are written into regions of a ring made with a storage-table window, and each is bound at its own dynamic offset before its draw, whose fragment shader reads its colour from the bound table; reads the target back and checks that each draw shows its own table's colour exactly, with validation reporting nothing"
