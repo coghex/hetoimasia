@@ -20,11 +20,11 @@ contract is [docs/gpu_backend.md](../../docs/gpu_backend.md).
 
 | Module | Contents |
 | --- | --- |
-| `Hetoimasia.Render.TwoD.Vulkan` | re-exports `Builders`; `Configuration`, `defaultConfiguration`; `Renderer`, `makeRenderer`, `pipelineFor`, `pipelineDeclaration`; `prepareSnapshot`, `FrameRecording`; re-exports `Hetoimasia.Render.TwoD.Vulkan.Frame`, `orderedShaders` and `cutoutShaders` |
+| `Hetoimasia.Render.TwoD.Vulkan` | re-exports `Builders`; `Configuration`, `defaultConfiguration`; `Renderer`, `makeRenderer`, `rendererDepthFormat`, `pipelineFor`, `pipelineDeclaration`; `prepareSnapshot`, `FrameRecording`; re-exports `Hetoimasia.Render.TwoD.Vulkan.Frame`, `orderedShaders` and `cutoutShaders` |
 | `Hetoimasia.Render.TwoD.Vulkan.Builders` | `Builders`: the constructions the recorder and the registry need from a host: the ring, the table, the layout, a pipeline, and registering, swapping and releasing an uploaded texture |
 | `Hetoimasia.Render.TwoD.Vulkan.Textures` | `Textures`, `newTextures`; `registerTexture` with a `MarkPolicy`; `swapTexture` with a `SwapPolicy`; `TextureRefusal`; the logical release marker (`markReleased`, `isReleased`), `releaseTextureNow`; `registeredMark`, `registeredMarks` |
 | `Hetoimasia.Render.TwoD.Vulkan.Window` | the host adapter: `Host`, `Adapter`, `newAdapter`; `Scene2D`, `blankScene`; `publish2DSnapshot`, `PublishRefusal`; `release2DTexture`; `adapterAdopted`, `adapterReleased`, `retryReleases`; `FrameInfo`, `renderWindowFrame` |
-| `Hetoimasia.Render.TwoD.Vulkan.Frame` | `Attachment`, `offscreenAttachment`, `TargetBinding`, `DepthBinding`, `FrameInput`; `depthLayers`, `requireWorldDepth`; `FrameRefusal`; `frameWork` and the work it computes: `PassWork`, `ViewWork`, `LayerWork`, `RunWork`, `PipelineKind`, `runPipeline` |
+| `Hetoimasia.Render.TwoD.Vulkan.Frame` | `Attachment`, `offscreenAttachment`, `TargetBinding`, `DepthBinding`, `FrameInput`; `depthLayers`, `requireWorldDepth`, `worldDepthShortfall`; `FrameRefusal`; `frameWork` and the work it computes: `PassWork`, `ViewWork`, `LayerWork`, `RunWork`, `PipelineKind`, `runPipeline` |
 | `Hetoimasia.Render.TwoD.Vulkan.Layout` | the instance as vertex input (`instanceVertexInput`), the key's depth (`depthFromKey`), the push block (`ViewPush`, `packViewPush`, `pushMembers`), the sampler choice (`shaderSamplerIndex`), the scissor rule (`viewScissor`) |
 | `Hetoimasia.Render.TwoD.Vulkan.ShaderInterfaces` | the checked interface descriptions the shaders are compiled against |
 | `Hetoimasia.Render.TwoD.Vulkan.Shaders` | `orderedShaders` and `cutoutShaders`: one vertex stage and two fragment stages |
@@ -152,7 +152,8 @@ backend's `DepthTarget` image and the format the caller made it with:
   target's extent, which the backend checks when the pass begins;
 - the window's pass: `FrameInput.frameWindowDepth`, the depth image of the frame's
   swapchain generation, which the host enables with `vulkanWindowDepth` and the
-  frame's request names.
+  frame's request names (`requestDepth`); the host adapter takes it from
+  `FrameInfo.frameDepthImage`.
 
 **The `D32_SFLOAT` requirement (choice B, D-23).** World-layer depth is
 `D32_SFLOAT` and nothing else, never degraded to a lower-precision format.
@@ -173,9 +174,11 @@ The format of a supplied image is the **backend's**, not its maker's:
 24-bit image declared as `D32_SFLOAT` is refused, naming the layer, even in a
 layer that only clears; an image the backend no longer holds is the backend's
 refusal. A snapshot with no depth-enabled world layer is unaffected on any
-device. `requireWorldDepth format snapshot` is rule 1 on its own, for a host to
-apply when it publishes a snapshot (a snapshot holding a depth-enabled world layer
-is then refused at publication, naming the layer, on such a session);
+device. `requireWorldDepth format snapshot` is rule 1 on its own, and
+`worldDepthShortfall` the same answer without the refusal's frame: the host
+adapter's `publish2DSnapshot` applies it at publication (`WorldDepthRefused`,
+below), so a snapshot holding a depth-enabled world layer is refused there,
+naming the layer, on a session whose depth format is not `D32_SFLOAT`;
 `depthLayers` lists the layers.
 
 **The clear.** Each depth-enabled world layer clears depth to 1.0 within its
@@ -217,10 +220,10 @@ cutout mark (D-19, D-27): by default `decodedBinaryAlpha decoded`, which
 explicit `OverrideMark` the application states. It is stored with the complete
 handle, generation included, for the handle's life, and nothing but its release
 changes it. `registeredMark` answers it and `registeredMarks` the `CutoutMarks`
-of every registered handle whose mark is set. **Nothing here acts on a mark**:
-the host adapter plans with `noCutoutMarks` (R2D-8), so a mark changes nothing it
-renders, and a host that wants the cutout path (R2D-9) passes `registeredMarks`
-as the frame's marks. A registration is refused as the table refuses it, storing
+of every registered handle whose mark is set. The host adapter plans each window
+frame with `registeredMarks` (R2D-9), read when the frame is prepared, so a marked
+texture's cutout-capable instances in a depth-enabled world layer take the cutout
+path; an offscreen frame passes whatever marks its caller states. A registration is refused as the table refuses it, storing
 nothing.
 
 ## The swap rule
@@ -248,9 +251,12 @@ answers the revision or why not; `hostRequestRelease`, which queues an
 owner-thread action behind the revisions the host must have adopted first,
 naming the windows it holds at the request; and `hostRunOnOwner`, which queues
 one that waits for nothing.
-`newAdapter host textures` makes it over the registry; the host's lifecycle
-hooks call `adapterAdopted` and `adapterReleased`; the host's renderer calls
-`renderWindowFrame`.
+`newAdapter host textures renderer` makes it over the registry and the renderer
+whose session depth format publication checks; the host's lifecycle hooks call
+`adapterAdopted` and `adapterReleased`; the host's renderer calls
+`renderWindowFrame adapter`. A host that draws depth-enabled world layers
+enables `vulkanWindowDepth` in its `VulkanHostConfig`, which gives each frame's
+request its generation's depth image.
 
 **Publishing.** `publish2DSnapshot adapter window snapshot` validates the
 snapshot and publishes it for one window, answering the window's revision. It
@@ -262,10 +268,14 @@ is refused, checking in this order:
 3. `NoWindowPass`, when the snapshot has no window pass — an empty snapshot
    included; removing every layer publishes a window pass with none (a second
    window pass is validation's refusal, in 1);
-4. `TextureReleasedInSnapshot`, naming the texture, when the snapshot
+4. `WorldDepthRefused`, naming the layer and the session's depth format
+   (`Nothing` when it offers none), when the snapshot holds a depth-enabled world
+   layer and that format is not `D32_SFLOAT` (D-23): a snapshot with no such layer
+   is unaffected on any device;
+5. `TextureReleasedInSnapshot`, naming the texture, when the snapshot
    references one whose release was requested (any instance of any layer of
    any view, visible or not);
-5. what the host answers: `PublishWindowUnknown`, `PublishHostClosed` or
+6. what the host answers: `PublishWindowUnknown`, `PublishHostClosed` or
    `PublishHostShared`.
 
 **Holds (D-28).** When the owner adopts a revision of a window, `adapterAdopted`
@@ -305,7 +315,7 @@ before the marker is published before the request captures the revisions it
 waits for: it is adopted, and acquires its holds, before the release can run,
 however late the owner takes it. One offered after the marker is refused.
 
-**Metrics (D-29).** `renderWindowFrame builders renderer info scene recorder`
+**Metrics (D-29).** `renderWindowFrame adapter builders info scene recorder`
 records the scene's window pass into the frame's image, with `TargetMetrics`
 built from the frame's own framebuffer extent, the window's logical extent and
 its per-axis content scale. The last two arrive in `FrameRequest`
@@ -523,11 +533,7 @@ the production host's per-window scenes.
 ## Not here
 
 Alpha-to-coverage and MSAA; depth formats other than `D32_SFLOAT` for world
-layers; wiring the host adapter to R2D-9: it plans with `noCutoutMarks` and
-publishes and renders whatever snapshot validates, so supplying the registered
-marks, enabling windowed depth and calling `requireWorldDepth` at publication are
-not part of R2D-8 (the recorder's side is `frameMarks`, `frameWindowDepth` and
-`requireWorldDepth`); application materials and their
+layers; application materials and their
 capability (R2D-11), clip tables (R2D-12) and per-batch storage tables (R2D-15);
 retained content (R2D-10); creating offscreen targets, issuing their references
 and their lifetimes, holds and releases, and sampling an offscreen pass's target

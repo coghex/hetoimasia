@@ -112,7 +112,7 @@ both axes (1.5 pixels to the texel). The batch is read back once its completion
 is proved. The run passes only when:
 
 - **every pixel** the oracle ([`render-2d-oracle`](../../packages/render-2d-oracle/README.md),
-  planned with `noCutoutMarks` as the recorder is, and given the decoded images
+  planned with `noCutoutMarks`, which the recorder is given explicitly as the oracle is, and given the decoded images
   the registered handles name) gives a determinate expectation read back within
   its tolerance, and at least one did. The frame has no edge or boundary the
   oracle must decline, so all 65,536 are determinate;
