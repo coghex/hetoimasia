@@ -113,6 +113,7 @@ Everything that can refuse is decided first, in `frameWork`, which is pure:
 | `MaterialNotIssued location material` | an instance, or an instance of a chunk a layer lists, names a material the session did not issue, whether another session's reference or one `materialRef` built (the built-in default is every session's) |
 | `MaterialFactsDisagree location named issued` | an instance names a reference with the identity of a material the session issued but other facts than it was issued with |
 | `RecordsTooLarge bytes window` | the batch's whole region, its clip tables and its material records, is `bytes` long and the window is only `window` bytes |
+| `FrameTablesNotRepresentable pass view bytes` | the frame tables a drawing view holds (R2D-18, [below](#frame-tables-r2d-18)) pack into a block of `bytes` bytes in which a size, an offset or a header value does not fit its 32-bit word |
 | `RefusedByBackend refusal` | the backend refused a pipeline, a claim or a command |
 
 The first refusal in snapshot order is the answer, and nothing has been recorded.
@@ -586,7 +587,7 @@ square's six vertices are the shader's own.
 ## The push block
 
 Both stages declare one push block, std430, 128 bytes, which every device
-holds. The engine owns the first 76 (`ViewPush`, `packViewPush`), pushed for each
+holds. The engine owns the first 80 (`ViewPush`, `packViewPush`), pushed for each
 layer under the layer's own space:
 
 | Offset | Size | Member |
@@ -601,6 +602,7 @@ layer under the layer's own space:
 | 48 | 16 | `vec4 inverseLinear`: a, b, c, d of the transform's inverse |
 | 64 | 8 | `vec2 clipCentre`: the target-pixel point the clip test is taken about |
 | 72 | 4 | `uint recordBase`: the word of the batch's region where the material records a run's instances index begin; a layer's push sets it to 0 and a run that reads records pushes its own at offset 72 |
+| 76 | 4 | `uint frameBase`: the word of the batch's region where the layer's view's frame tables (R2D-18) begin; 0 for a view that has none, which no instance indexes |
 
 The rest is the application's: a material's own push block begins at
 `applicationPushOffset`, 80 (a 16-byte boundary, so any std430 member is legal
@@ -699,6 +701,65 @@ accepted, and the tables of a view that records no draw are not counted). The
 backend checks the rest when the region is bound: the bytes from the offset to the
 claim's end within the window, and the offset's alignment.
 
+## Frame tables (R2D-18)
+
+A view's frame tables ([render-2d](../render-2d/README.md#animation)) are written
+into the batch's one region, the one the clip tables and the material records are
+in, with the base of the view's block in the push block. There is no second
+mechanism: the region is claimed, written and bound as it always was, and the
+frame tables are its last part, after the records.
+
+**What is written.** Each view that **draws** and holds a table writes a block
+once, however many layers and chunks draw in it, and each such layer pushes the
+block's word as its `frameBase`, so the dynamic instances and the retained chunks
+of a view read the same tables, and the same chunk drawn in two views reads each
+view's own. A view with no table, and a view that does not draw, write none. Every
+table of a view that draws is written, whether or not an instance uses it, since a
+chunk's instances carry their indices from the time it was built. The blocks follow
+the records in pass and view order, each beginning on a 16-byte boundary of the
+region with zero words of padding before it (`frameBlockLayout`, `packFrameBlock`).
+
+**The block**, 32-bit little-endian words, std430, from the block's start:
+
+| Words | Contents |
+| --- | --- |
+| `0 .. n − 1` | the directory: for table `i`, the word, from the block's start, where its record begins |
+| `n .. ` | zero words to the next multiple of four (a 16-byte boundary), so each record is 16-byte aligned |
+| a record | `uint frame` (the table's current frame), `uint count`, two reserved zero words, then `count` rectangles of four floats (`u0 v0 u1 v1`) |
+
+A record is `4 + 4 × count` words. The **frame is computed here, on the host, in
+`Double`**: `currentFrame` of the view's time and the table
+([the formula](../render-2d/README.md#animation)), an exact integer written as a
+`uint`; the shader does no time arithmetic, and the oracle evaluates the same
+function. A table's `count` is exactly its rectangles; a record never moves another
+(a short list is padded with zero rectangles, a long one is cut at the count, though
+a validated table has neither).
+
+**The shader's lookup.** The vertex stage declares the region's binding (the
+description of both vertex interfaces now names set 2, binding 0, as the fragment
+stage's did) and reads the instance's index from the flags, `(flags >> 4) & 0xFFF`.
+For an index `k > 0` it reads the record's word from the directory at
+`frameBase + k − 1`, then the record's `frame`, then the rectangle at
+`record + 4 + 4 × frame`, and interpolates the quad's texture coordinates from that
+rectangle instead of the instance's own (`at = mix(rect.xy, rect.zw, corner)`).
+For index 0 it uses the instance's own rectangle, so a non-animated instance in the
+same draw is unaffected, and the rectangle is chosen once per vertex of a flat quad,
+as the instance's own was.
+
+**Window accounting.** The region's size is the clip tables, the material records
+and every block with its padding (and the one zero clip entry a drawing batch that
+selects no clip still binds), computed exactly. It is held to the configured
+window: a region larger than it is refused before anything is recorded
+(`RecordsTooLarge`, naming the size and the window; the clip tables alone are
+`ClipTablesTooLarge`'s). Every size and offset is computed over `Integer`s and
+checked before a byte is made (`frameBlockRepresentable`): each table's count must
+fit the header's 32-bit word (and so the frame, which is below it), each record's
+offset must fit the directory's, and the block's start, which the push block
+carries, and its end must fit; a block where one does not is refused
+(`FrameTablesNotRepresentable`, naming the pass, the view and the block's size in
+bytes) rather than narrowed or wrapped. A view with more tables than a flags word
+can name (4095) writes them all, and no instance reaches the rest.
+
 ## The shaders
 
 Checked shaders (GRS-16), compiled while the package builds and checked against
@@ -715,6 +776,7 @@ origin = the view transform applied to (tx, ty)              the mapped (0, 0)
 shift  = floor(origin + ½) − origin                           when the view snaps, else 0
 clip   = ((target + shift) / extent) · 2 − 1                  Vulkan's Y down
 depth  = (2²⁴ − 1 − k) / 2²⁴                                  for the instance's key k
+uv     = the instance's own rectangle, or the current frame's      the flags' bits 4–15 name the view's table (R2D-18, above)
 ```
 
 With snap on the camera's translation has already been rounded (inside
@@ -949,6 +1011,31 @@ handle sampling the new texture. Each named behaviour has a contrast the oracle
 must give determinately and differently, and the plan's runs (one cutout run for
 each material, the sources a chunk's and the view's runs read) fail the frame they
 belong to.
+
+A seventh, `r2d18-animation`, renders nine frames (R2D-18) through a strip of four
+texels, a pixel's colour naming the texel a frame shows, and judges every pixel
+against the oracle, each named colour besides against the frame worked out by hand
+in the case's comments (which does not use the formula the recorder and the oracle
+share): an animated dynamic sprite and an animated tile of a retained chunk, built
+once and never rebuilt (its upload is admitted once for all nine frames), beside a
+non-animated instance in the same draw, at the view times 0, 0.75, 1.0 (a boundary),
+999999.75, 1000000 (exactly on a boundary) and the double just below it, near 10⁶
+seconds; the same chunk drawn in two views with different tables and times showing
+different frames; and the two counterexamples to a 32-bit phase, count 2 with
+duration 8192 at 991231.9998 s (frame 0) and a duration of 2¹²⁷ at 2.5 times that
+(frame 2). Each frame's PNG and the probe record, which names each view's tables,
+time and expected frames, are the retained evidence. The recorder's headless tests
+cover the frame block against bytes written out by hand (the directory, the padding
+to a 16-byte boundary, each record's computed frame, count and rectangles, a short or
+long list, a table whose count does not fit), the frame computed at each view's time
+against a second evaluation of the formula over a sweep of tables and times (near 10⁶
+and beyond 2⁶³), the push offset at bytes 76 to 79, a block written once for a view's
+layers and each drawing view's after the last on a 16-byte boundary, no block for a
+view that does not draw or holds no table, a retained chunk drawn in two views
+reading each view's own block, the aggregate fit of frame tables beside real clip
+tables and material records (a region exactly the window accepted, one table more
+refused naming the size and the window), and the refusal of a size or an offset that
+does not fit its word.
 
 ## Not here
 

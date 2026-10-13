@@ -361,6 +361,36 @@ second texture sampled at the same coordinates and
 the record's word), the colour is `(mix(t.rgb, s.rgb × t.a, w), t.a)`. The tests
 check it on its own against fixtures written in them, then through the oracle.
 
+## Animation (R2D-18, D-32)
+
+An instance whose frame-table index selects a table of its view shows, in place of
+its own UV rectangle, the rectangle of the table's **current frame** at the view's
+animation time, whether it is a dynamic instance or a retained chunk's. The index is
+the drawing view's own, so one chunk drawn in two views shows each view's frame. The
+oracle substitutes the rectangle before it places and samples the instance, so the
+frame's rectangle is sampled, and its rate of change taken for level selection,
+exactly as an instance's own rectangle is, and every other field of the instance is
+its own.
+
+The frame is `Hetoimasia.Render.TwoD.Animation.currentFrame`, the formula the
+recorder evaluates and writes:
+
+```
+f = floor (t / duration) mod count
+```
+
+with the quotient the **`Double` division** and the floor an exact `Integer`
+([render-2d](../render-2d/README.md#animation)). A time exactly on a boundary whose
+quotient is exactly `k` selects frame `k mod count`: **boundaries are exact**. There
+is no epsilon snapping and **no indeterminacy band for animation**: a probe is never
+indeterminate because of it. When a product rounds, the quotient is whatever the
+division gives (`43 × 0.1` over `0.1` is `42.99999999999999`, frame 42), so the
+oracle's fixtures that mean a boundary use exactly representable times and durations
+(multiples of 0.5, 0.25), and the decimal case is a regression in its own right. An
+instance that names a table its view lacks, which validation refuses, is left as it
+is. An animated instance's other indeterminacies (a quad's edge, a texel boundary)
+are as for any instance.
+
 ## Verdicts and exactness
 
 An expectation is `Expected value tolerance`, `Indeterminate why` or
@@ -450,7 +480,12 @@ rely on them): `ValidSnapshot` and its validation, and the chunks it carries;
 `worldTransform`, `uiTransform`, `worldToTarget`, `uiToTarget`, `snapPoint` and
 `mappingPixelSnap`, which place the camera and snap; `viewportContains` and
 `viewportIsEmpty`; and `planSnapshot` with `drawingOrder` and each run's path,
-which order the instances and route the cutout path.
+which order the instances and route the cutout path; and `currentFrame`, the
+selection of an animated instance's frame (R2D-18), which the recorder uses too.
+That function is shared deliberately: it is one formula with one place to be wrong,
+checked in `render-2d` against hand-worked frames (boundaries, the counterexamples
+of a 32-bit phase) and a second evaluation of the formula, and the oracle's own
+fixtures state their expected frames in the test, as colours.
 
 **Independent**: composing the instance's transform with the layer's, coverage,
 the clip's membership and its distance from an edge (the inverse of the layer's
@@ -529,4 +564,14 @@ cabal test --project-file cabal.project.cpu hetoimasia-render-2d-oracle:render-2
 The suite is the CPU validation group `test.render-2d-oracle`; it needs no GPU
 and no display. Its components, selectable with `--test-options='--match <name>'`
 on the suite that owns them, are `Placement`, `Sampling`, `Colour`, `Probes`,
-`Depth`, `Clip`, `Chunks`, `Materials` and `Verdicts`.
+`Depth`, `Clip`, `Chunks`, `Materials`, `Animation` and `Verdicts`. `Animation`
+shows a dynamic instance showing its table's current frame in place of its own
+rectangle (four texels in a row, each frame a texel, read off the colour), the
+table an index names among several, an animated and a non-animated instance in one
+layer, no probe indeterminate because of animation at any time, the frame at, just
+before and just after exact boundaries, the wrap from the last frame to the first,
+the review's counterexamples (count 2, duration 8192, time 991231.9998 is frame 0;
+count 3, duration 2¹²⁷, time 2.5 × 2¹²⁷ is frame 2), the decimal regression
+(duration 0.1 at 43 × 0.1 is frame 0 for count 2), a time near 10⁶ seconds, a
+quotient beyond 2⁶³, and a retained chunk drawn in two views with different tables
+and times showing each view's frame.
