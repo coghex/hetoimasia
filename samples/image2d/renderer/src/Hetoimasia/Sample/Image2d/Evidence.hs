@@ -40,6 +40,7 @@ module Hetoimasia.Sample.Image2d.Evidence
   , SwapDemonstration (..)
   , evidenceTarget
   , runEvidence
+  , runEvidenceWith
   , renderRecord
   , pngName
   , recordName
@@ -98,7 +99,7 @@ import Hetoimasia.Sample.Image2d
 import Hetoimasia.Sample.Image2d.Assets (ImageName (..))
 import Hetoimasia.Sample.Image2d.Fixtures (Colour (..), NamedProbe (..), namedProbes)
 import Hetoimasia.Sample.Image2d.Png (encodePng)
-import Hetoimasia.Sample.Image2d.Scene (evidenceLayout, evidenceMetrics, sceneSnapshot)
+import Hetoimasia.Sample.Image2d.Scene (evidenceLayout, evidenceMetrics, snapshotFor)
 
 -- | One pixel: what the oracle expected, what the readback held, the verdict.
 data ProbeResult = ProbeResult
@@ -163,11 +164,25 @@ evidenceTarget ∷ Target
 evidenceTarget = OffscreenTarget (targetRef 1 1)
 
 -- | Run the evidence over a host, writing the PNG and the probe record into
--- this directory, which is made if missing and never deleted.
+-- this directory, which is made if missing and never deleted. The host's
+-- textures are prepared first; a host that has prepared them already uses
+-- 'runEvidenceWith'.
 runEvidence ∷ Host → FilePath → IO Evidence
-runEvidence host directory = do
+runEvidence host directory =
+  prepare host >>= \case
+    Right prepared → runEvidenceWith host prepared directory
+    Left failure → do
+      createDirectoryIfMissing True directory
+      let recordPath = directory </> recordName
+      ByteString.writeFile recordPath (Text.encodeUtf8 (renderRecord (Just failure) 0 [] [] Nothing))
+      pure (Evidence False (Just failure) [] [] Nothing 0 Nothing recordPath)
+
+-- | Run the evidence over textures a host has prepared. It swaps the
+-- quadrants' handle, kept at its registered mark, and registers nothing.
+runEvidenceWith ∷ Host → Prepared → FilePath → IO Evidence
+runEvidenceWith host prepared directory = do
   createDirectoryIfMissing True directory
-  outcome ← evidence host
+  outcome ← evidence host prepared
   let recordPath = directory </> recordName
   case outcome of
     Left failure → do
@@ -210,59 +225,56 @@ isExpected = \case
   Expected _ _ → True
   _ → False
 
-evidence ∷ Host → IO (Either Text (ByteString, [ProbeResult], [NamedResult], SwapDemonstration))
-evidence host@Host {hostAct = actOn, hostRecord = recordOn, hostAwait = awaitBatch, hostRead = readBytes} =
-  prepare host >>= \case
-    Left failure → pure (Left failure)
-    Right prepared → do
-      let handles = handlesOf prepared
-      case validateSnapshot (sceneSnapshot evidenceTarget handles evidenceLayout) of
-        Left refused → pure (Left ("the snapshot was refused: " <> tshow refused))
-        Right valid → do
-          made ← actOn "making the evidence target" $ \builders → do
-            image ← buildImage builders (ImageDescription ColorTarget Rgba8Srgb (fromIntegral side) (fromIntegral side) 1)
-            readback ← buildReadback builders targetBytes
-            pure ((,) <$> image <*> readback)
-          case made of
-            Left failure → pure (Left failure)
-            Right (target, readback) → do
-              let input =
-                    Render.FrameInput
-                      { Render.frameSnapshot = valid
-                      , Render.frameTarget = \reference →
-                          if evidenceTarget == OffscreenTarget reference
-                            then Just (Render.TargetBinding target (Render.Attachment (formatCode Rgba8Srgb) (fromIntegral side) (fromIntegral side) evidenceMetrics))
-                            else Nothing
-                      , Render.frameWindow = Nothing
-                      }
-              ticket ← recordOn "recording the frame" $ \builders →
-                Render.prepareSnapshot (renderBuilders builders) (preparedRenderer prepared) input >>= \case
-                  Left refusal → pure (Left (RefusedIllegal (tshow refusal)))
-                  Right recording →
-                    pure . Right $ \recorder →
-                      recording recorder >>= \case
-                        Left refusal → pure (Left (RefusedIllegal (tshow refusal)))
-                        Right () →
-                          inOrder
-                            [ transitionResource recorder target (FromUse ColorAttachment) TransferRead
-                            , copyTargetToReadback recorder target readback
-                            , transitionResource recorder target (FromUse TransferRead) ColorAttachment
-                            ]
-              case ticket of
-                Left failure → pure (Left failure)
-                Right batch →
-                  awaitBatch batch >>= \case
-                    Left failure → pure (Left ("the batch did not complete: " <> failure))
+evidence ∷ Host → Prepared → IO (Either Text (ByteString, [ProbeResult], [NamedResult], SwapDemonstration))
+evidence Host {hostAct = actOn, hostRecord = recordOn, hostAwait = awaitBatch, hostRead = readBytes} prepared = do
+  let handles = handlesOf prepared
+  case validateSnapshot (snapshotFor evidenceTarget handles evidenceLayout) of
+    Left refused → pure (Left ("the snapshot was refused: " <> tshow refused))
+    Right valid → do
+      made ← actOn "making the evidence target" $ \builders → do
+        image ← buildImage builders (ImageDescription ColorTarget Rgba8Srgb (fromIntegral side) (fromIntegral side) 1)
+        readback ← buildReadback builders targetBytes
+        pure ((,) <$> image <*> readback)
+      case made of
+        Left failure → pure (Left failure)
+        Right (target, readback) → do
+          let input =
+                Render.FrameInput
+                  { Render.frameSnapshot = valid
+                  , Render.frameTarget = \reference →
+                      if evidenceTarget == OffscreenTarget reference
+                        then Just (Render.TargetBinding target (Render.Attachment (formatCode Rgba8Srgb) (fromIntegral side) (fromIntegral side) evidenceMetrics))
+                        else Nothing
+                  , Render.frameWindow = Nothing
+                  }
+          ticket ← recordOn "recording the frame" $ \builders →
+            Render.prepareSnapshot (renderBuilders builders) (preparedRenderer prepared) input >>= \case
+              Left refusal → pure (Left (RefusedIllegal (tshow refusal)))
+              Right recording →
+                pure . Right $ \recorder →
+                  recording recorder >>= \case
+                    Left refusal → pure (Left (RefusedIllegal (tshow refusal)))
                     Right () →
-                      readBytes readback targetBytes >>= \case
-                        Left failure → pure (Left ("the readback was not read: " <> failure))
-                        Right bytes → do
-                          swap ← demonstrateSwap actOn prepared
-                          pure $ case swap of
-                            Left failure → Left failure
-                            Right shown →
-                              let (probes, named) = judged valid prepared bytes
-                               in Right (bytes, probes, named, shown)
+                      inOrder
+                        [ transitionResource recorder target (FromUse ColorAttachment) TransferRead
+                        , copyTargetToReadback recorder target readback
+                        , transitionResource recorder target (FromUse TransferRead) ColorAttachment
+                        ]
+          case ticket of
+            Left failure → pure (Left failure)
+            Right batch →
+              awaitBatch batch >>= \case
+                Left failure → pure (Left ("the batch did not complete: " <> failure))
+                Right () →
+                  readBytes readback targetBytes >>= \case
+                    Left failure → pure (Left ("the readback was not read: " <> failure))
+                    Right bytes → do
+                      swap ← demonstrateSwap actOn prepared
+                      pure $ case swap of
+                        Left failure → Left failure
+                        Right shown →
+                          let (probes, named) = judged valid prepared bytes
+                           in Right (bytes, probes, named, shown)
 
 -- | Judge every pixel against the oracle and every named probe against its
 -- hand-stated colour.

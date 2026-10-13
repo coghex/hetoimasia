@@ -17,7 +17,7 @@ module Hetoimasia.Sample.Image2d.Scene
   , Layout (..)
   , evidenceLayout
   , evidenceMetrics
-  , sceneSnapshot
+  , snapshotFor
   , uiLogicalSize
   ) where
 
@@ -58,8 +58,8 @@ uiLogicalSize = 48
 
 -- | The snapshot: one pass over this target, cleared to opaque black, with
 -- one view and a world layer and a UI layer.
-sceneSnapshot ∷ Target → Handles → Layout → Snapshot
-sceneSnapshot target handles layout =
+snapshotFor ∷ Target → Handles → Layout → Snapshot
+snapshotFor target handles layout =
   Snapshot [Pass target (ClearColour 0 0 0 1) [view]]
   where
     (width, height) = layoutFramebuffer layout

@@ -29,28 +29,28 @@ spec = describe "the scene" $ do
   it "validates, for a window and for an offscreen target, with one pass of one view" $ do
     mapM_
       ( \target → do
-          let candidate = sceneSnapshot target handles evidenceLayout
+          let candidate = snapshotFor target handles evidenceLayout
           either (const False) (const True) (validateSnapshot candidate) `shouldBe` True
           [(passTarget pass, length (passViews pass)) | pass ← snapshotPasses candidate] `shouldBe` [(target, 1)]
       )
       [WindowTarget, OffscreenTarget (targetRef 1 1)]
 
   it "draws the PNG and the KTX2 image in one world layer and the PNG again in one UI layer" $ do
-    let layers = concatMap viewLayers (concatMap passViews (snapshotPasses (sceneSnapshot WindowTarget handles evidenceLayout)))
+    let layers = concatMap viewLayers (concatMap passViews (snapshotPasses (snapshotFor WindowTarget handles evidenceLayout)))
     [(isWorld layer, map instanceTexture (layerInstances layer)) | layer ← layers]
       `shouldBe` [(True, [textureHandle 1 1, textureHandle 2 1]), (False, [textureHandle 1 1])]
 
   it "draws the UI copy at its fixed logical size and the world copies at 64 units, whatever the layout" $
     mapM_
       ( \layout → do
-          case concatMap passViews (snapshotPasses (sceneSnapshot WindowTarget handles layout)) of
+          case concatMap passViews (snapshotPasses (snapshotFor WindowTarget handles layout)) of
             [view] → map (map sizeOf . layerInstances) (viewLayers view) `shouldBe` [[(64, 64), (64, 64)], [(uiLogicalSize, uiLogicalSize)]]
             other → expectationFailure ("expected one view, found " <> show (length other))
       )
       [evidenceLayout, Layout (2560, 1440) 2, Layout (100, 100) 0.5]
 
   it "puts the layout's UI scale in the view's settings and spans the viewport over its framebuffer" $ do
-    case concatMap passViews (snapshotPasses (sceneSnapshot WindowTarget handles (Layout (640, 480) 3))) of
+    case concatMap passViews (snapshotPasses (snapshotFor WindowTarget handles (Layout (640, 480) 3))) of
       [view] → do
         settingUiScale (viewSettings view) `shouldBe` 3
         viewViewport view `shouldBe` Viewport (v 0 0) (v 640 480)

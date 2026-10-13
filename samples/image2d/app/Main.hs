@@ -134,7 +134,7 @@ import qualified Hetoimasia.Sample.Image2d as Sample
 import Hetoimasia.Sample.Image2d (Builders (..), Prepared (..), handlesOf)
 import Hetoimasia.Sample.Image2d.Evidence (Evidence (..), NamedResult (..), SwapDemonstration (..), runEvidence)
 import Hetoimasia.Sample.Image2d.Fixtures (NamedProbe (..))
-import Hetoimasia.Sample.Image2d.Scene (Layout (..), sceneSnapshot)
+import Hetoimasia.Sample.Image2d.Scene (Layout (..), snapshotFor)
 
 -- | The evidence mode's directory, or the windowed mode and its UI scale.
 data Mode = EvidenceMode !FilePath | WindowedMode !Float
@@ -401,7 +401,7 @@ render logger vulkan control adapter prepared uiScale frame presented = do
   asked ← newTVarIO (0 ∷ Int)
   published ← newTVarIO Nothing
   let publishFor window layout =
-        publish2DSnapshot adapter window (sceneSnapshot WindowTarget (handlesOf prepared) layout) >>= \case
+        publish2DSnapshot adapter window (snapshotFor WindowTarget (handlesOf prepared) layout) >>= \case
           Left refusal → hPutStrLn stderr ("the snapshot was refused: " <> show refusal) >> exitFailure
           Right _ → atomically (writeTVar published (Just layout))
   runVulkanOwnerLoop vulkan control . defaultScheduledHooks logger $ \turn → do

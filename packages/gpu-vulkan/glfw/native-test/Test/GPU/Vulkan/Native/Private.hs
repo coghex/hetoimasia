@@ -45,6 +45,12 @@
 --   other, each frame is cleared to the colour of its own window's scene, and
 --   a release request made while the second window shows revision 1 runs only
 --   after it has adopted revision 2 ("Test.GPU.Vulkan.Native.WindowScenes");
+-- * @r2d8-image@ — R2D-8's image2d sample: its evidence rendered offscreen and
+--   judged against the oracle and colours stated by hand, the swap rule shown
+--   on the registered textures, and a texture's release, requested while the
+--   adopted snapshot shows it, deferred through the per-window adapter and the
+--   host's adoption callbacks until a snapshot without it is adopted
+--   ("Test.GPU.Vulkan.Native.Image2d");
 -- * @vk17-one-slot@ and @vk17-two-slots@ — VK-17's required profile: the
 --   triangle sample's renderer in two windows, each captured, the first
 --   resized and captured at its new extent and then closed while the second
@@ -240,6 +246,7 @@ import qualified Test.GPU.Vulkan.Native.Recording as Recording
 import qualified Test.GPU.Vulkan.Native.SurfaceFree as SurfaceFree
 import qualified Test.GPU.Vulkan.Native.Terminal as Terminal
 import qualified Test.GPU.Vulkan.Native.Triangle as Triangle
+import qualified Test.GPU.Vulkan.Native.Image2d as Image2d
 import qualified Test.GPU.Vulkan.Native.WindowScenes as WindowScenes
 import qualified Test.GPU.Vulkan.Native.WindowedDepth as WindowedDepth
 import qualified Test.Vulkan.Proof.Bridge as Bridge
@@ -370,6 +377,14 @@ scenarios =
       $ \consent journal _ → do
         outcome ← WindowScenes.runWindowScenes (consentBackend consent) journal
         pure (WindowScenes.spec outcome, section "The R2D-14 window scenes record" (WindowScenes.windowScenesSection outcome))
+  , Scenario
+      "r2d8-image"
+      "renders the image2d sample's PNG in a world layer and a UI layer and its KTX2 image offscreen through the 2D recorder and passes every determinate probe of the render-2d oracle and every named probe's hand-stated colour, shows the swap rule refusing a different mark and accepting it kept, and defers a texture's release, requested while the adopted snapshot shows it, until a snapshot without it is adopted, refusing a snapshot that names it, through the per-window adapter and the host's adoption callbacks, with validation reporting nothing"
+      False
+      Nothing
+      $ \consent journal _ → do
+        outcome ← Image2d.runImage2d (consentBackend consent) journal
+        pure (Image2d.spec outcome, section "The R2D-8 image2d record" (Image2d.image2dSection outcome))
   , Scenario
       "vk17-one-slot"
       "renders the triangle sample in two windows with one frame slot, capturing each, the first again after its resize, and the second after the first closes, with validation reporting nothing"
