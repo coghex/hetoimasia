@@ -444,7 +444,9 @@ a reference point near the view, so that it is exact in the same way even for a
 camera far from the origin (world coordinates near 65536 at a zoom of 100, where
 an absolute single-precision coordinate is spaced most of a pixel apart), and a
 determinate clip probe there is held to the oracle's answer by the native case's
-`far-camera` fixture.
+`far-camera` fixture. Where the scene is beyond the floats' range altogether (a
+zoom so small that a view's scissor spans more than about 10³⁸ units) the
+recorder refuses the frame, and the oracle's exact answer is its own.
 
 ## Purity, owned state, threads and lifetimes
 
