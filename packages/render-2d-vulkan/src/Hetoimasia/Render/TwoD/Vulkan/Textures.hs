@@ -51,6 +51,7 @@ module Hetoimasia.Render.TwoD.Vulkan.Textures
   , swapTexture
   , releaseTextureNow
   , markReleased
+  , markReleasedSTM
   , isReleased
   , registeredMark
   , registeredMarks
@@ -181,7 +182,12 @@ releaseTextureNow builders (Textures ledger) handle =
 -- | Mark a handle released, at once, for publication's check. 'False' for one
 -- never registered here or already marked.
 markReleased ∷ Textures → Api.TextureHandle → IO Bool
-markReleased (Textures ledger) handle = atomically $ do
+markReleased textures handle = atomically (markReleasedSTM textures handle)
+
+-- | 'markReleased' as a transaction, for a caller that commits the marker
+-- together with its own state.
+markReleasedSTM ∷ Textures → Api.TextureHandle → STM Bool
+markReleasedSTM (Textures ledger) handle = do
   held ← readTVar ledger
   if Map.member handle (ledgerMarks held) && not (Set.member handle (ledgerReleased held))
     then True <$ writeTVar ledger held {ledgerReleased = Set.insert handle (ledgerReleased held)}

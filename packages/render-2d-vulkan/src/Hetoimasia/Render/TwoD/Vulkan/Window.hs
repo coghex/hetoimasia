@@ -35,15 +35,20 @@
 -- = Releasing (D-28)
 --
 -- 'release2DTexture' marks the texture released at once, for publication's
--- check, and asks the host to run a release after the revisions the window
--- host must have adopted first. That action releases the texture in the table
--- only if no adopted revision still holds it; otherwise the texture keeps
--- rendering wherever an adopted snapshot shows it, and the release is made
--- when the last holding revision's release is reported ('adapterReleased'
--- asks again). Publication and release are serialized, so a snapshot accepted
--- before the marker is published before the request captures its barrier and
--- is adopted, with its holds, before the release can run; one offered after
--- the marker is refused.
+-- check, in one transaction with its entry in the pending set, and asks the
+-- host to run a release after the revisions the window host must have adopted
+-- first, naming the windows it holds at the request. That action releases the
+-- texture in the table only if no adopted revision still holds it; otherwise
+-- the texture keeps rendering wherever an adopted snapshot shows it, the
+-- barrier counts as met, and the release is made when the last holding
+-- revision's release is reported ('adapterReleased'): by a further action that
+-- waits for nothing, so a window that appeared after the request delays
+-- nothing. If the host's queue refuses that action for lack of room, the
+-- texture stays eligible and 'retryReleases', which the hooks and the end of
+-- every release action call, queues it again; nothing blocks. Publication and
+-- release are serialized, so a snapshot accepted before the marker is
+-- published before the request captures its barrier and is adopted, with its
+-- holds, before the release can run; one offered after the marker is refused.
 --
 -- = Rendering
 --
@@ -81,6 +86,7 @@ module Hetoimasia.Render.TwoD.Vulkan.Window
     -- * Adoption and release of revisions
   , adapterAdopted
   , adapterReleased
+  , retryReleases
   , textureHolds
   , pendingReleases
     -- * Rendering
@@ -118,7 +124,7 @@ import qualified Hetoimasia.Render.TwoD.Validation as Validation
 import Hetoimasia.Render.TwoD.Vulkan (Renderer, prepareSnapshot)
 import Hetoimasia.Render.TwoD.Vulkan.Builders (Builders)
 import Hetoimasia.Render.TwoD.Vulkan.Frame (Attachment (..), FrameInput (..), FrameRefusal (..))
-import Hetoimasia.Render.TwoD.Vulkan.Textures (Textures, isReleased, markReleased, releaseTextureNow)
+import Hetoimasia.Render.TwoD.Vulkan.Textures (Textures, isReleased, markReleasedSTM, releaseTextureNow)
 import Numeric.Natural (Natural)
 
 -- | What a window's published revision holds: the validated snapshot, and the
@@ -180,8 +186,24 @@ data Host window = Host
     -- ^ Publish the window's scene; revisions rise for each accepted one.
   , hostRequestRelease ∷ (ReleaseBody → IO (Either Text ()))
     -- ^ Queue an owner-thread action that waits for the revisions the host
-    -- must have adopted first; 'Left' says why it was refused.
+    -- must have adopted first, naming every window the host holds at the
+    -- request and no later one; 'Left' says why it was refused.
+  , hostRunOnOwner ∷ (ReleaseBody → IO (Either Text ()))
+    -- ^ Queue an owner-thread action that waits for nothing. It is admitted
+    -- and bounded as the request is, and never waits for room.
   }
+
+-- | Where a pending release stands.
+data Stage
+  = -- | The host's request, which waits for the revisions named when it was
+    -- made, is queued, or has not been admitted.
+    AwaitingBarrier
+  | -- | That request has run — every window it named had adopted what it
+    -- waited for — and an adopted revision still held the texture. What
+    -- remains is the holds: no further barrier is asked, so a window that
+    -- appeared since delays nothing.
+    BarrierMet
+  deriving (Eq, Show)
 
 -- | A window host's adapter: its holds, its pending releases and the lock that
 -- serializes publication with release.
@@ -190,11 +212,14 @@ data Adapter window = Adapter
   , adapterTextures ∷ !Textures
   , adapterLock ∷ !(MVar ())
   , adapterHolds ∷ !(TVar (Map (window, Natural) (Set Api.TextureHandle)))
-  , adapterPending ∷ !(TVar (Set Api.TextureHandle))
+  , adapterPending ∷ !(TVar (Map Api.TextureHandle Stage))
+  , adapterQueued ∷ !(TVar (Set Api.TextureHandle))
+    -- ^ The textures whose release action, after the barrier was met, is
+    -- queued in the host.
   }
 
 newAdapter ∷ Host window → Textures → IO (Adapter window)
-newAdapter host textures = Adapter host textures <$> newMVar () <*> newTVarIO Map.empty <*> newTVarIO Set.empty
+newAdapter host textures = Adapter host textures <$> newMVar () <*> newTVarIO Map.empty <*> newTVarIO Map.empty <*> newTVarIO Set.empty
 
 -- | Why a snapshot was not published.
 data PublishRefusal
@@ -248,55 +273,100 @@ data ReleaseRefusal
   deriving (Eq, Show)
 
 -- | Mark the texture released and ask the host to release it behind its
--- barrier, once no adopted revision holds it. A request the host refused
--- leaves the texture marked and pending, and asking again for the same handle
--- repeats the request; nothing else is asked twice, and a handle whose release
+-- barrier, once no adopted revision holds it. The marker and the texture's
+-- entry in the pending set are one transaction, so a cancellation before the
+-- host is asked leaves a texture that asking again recovers. A request the host
+-- refused leaves the texture marked and pending, and asking again for the same
+-- handle repeats it; nothing else is asked twice, and a handle whose release
 -- has run, or that was never registered, is refused as unknown.
 release2DTexture ∷ Adapter window → Api.TextureHandle → IO (Either ReleaseRefusal ())
 release2DTexture adapter handle = withMVar (adapterLock adapter) $ \_ → do
-  marked ← markReleased (adapterTextures adapter) handle
-  waiting ← Set.member handle <$> readTVarIO (adapterPending adapter)
-  if not (marked || waiting)
-    then pure (Left (ReleaseUnknown handle))
-    else do
-      atomically (modifyTVar' (adapterPending adapter) (Set.insert handle))
-      either (Left . ReleaseRequestRefused) Right <$> requestRelease adapter handle
+  next ← atomically $ do
+    marked ← markReleasedSTM (adapterTextures adapter) handle
+    stage ← Map.lookup handle <$> readTVar (adapterPending adapter)
+    case stage of
+      Just BarrierMet → pure (Just BarrierMet)
+      Just AwaitingBarrier → pure (Just AwaitingBarrier)
+      Nothing
+        | marked → Just AwaitingBarrier <$ modifyTVar' (adapterPending adapter) (Map.insert handle AwaitingBarrier)
+        | otherwise → pure Nothing
+  case next of
+    Nothing → pure (Left (ReleaseUnknown handle))
+    Just AwaitingBarrier → either (Left . ReleaseRequestRefused) Right <$> hostRequestRelease (adapterHost adapter) (releaseBody adapter handle)
+    Just BarrierMet → do
+      -- The barrier was met already: only the holds remain.
+      answer ← followUp adapter handle
+      pure (either (Left . ReleaseRequestRefused) Right answer)
 
--- | Ask the host to run the release of this texture after its barrier.
-requestRelease ∷ Adapter window → Api.TextureHandle → IO (Either Text ())
-requestRelease adapter handle = hostRequestRelease (adapterHost adapter) (releaseBody adapter handle)
+-- | Queue the release after the barrier was met, once, with no barrier of its
+-- own. A refusal leaves it for the next 'retryReleases'.
+followUp ∷ Adapter window → Api.TextureHandle → IO (Either Text ())
+followUp adapter handle = do
+  fresh ← atomically $ do
+    queued ← readTVar (adapterQueued adapter)
+    if Set.member handle queued
+      then pure False
+      else True <$ modifyTVar' (adapterQueued adapter) (Set.insert handle)
+  if not fresh
+    then pure (Right ())
+    else do
+      answer ← hostRunOnOwner (adapterHost adapter) (releaseBody adapter handle)
+      case answer of
+        Left _ → atomically (modifyTVar' (adapterQueued adapter) (Set.delete handle))
+        Right () → pure ()
+      pure answer
+
+-- | Queue the release of every pending texture whose barrier was met and that
+-- no adopted revision holds, and whose release action is not already queued.
+-- It never blocks: a refusal (the host's queue full) leaves the texture for
+-- the next call. The lifecycle hooks and the end of every release action call
+-- it, and an application whose host may refuse for lack of room calls it from
+-- its own loop.
+retryReleases ∷ Adapter window → IO ()
+retryReleases adapter = do
+  ready ← atomically $ do
+    pending ← readTVar (adapterPending adapter)
+    held ← Set.unions . Map.elems <$> readTVar (adapterHolds adapter)
+    queued ← readTVar (adapterQueued adapter)
+    pure [handle | (handle, BarrierMet) ← Map.toList pending, not (Set.member handle held), not (Set.member handle queued)]
+  forM_ ready (followUp adapter)
 
 -- | The release as the host runs it: only a texture still pending and held by
--- no adopted revision is released in the table; otherwise nothing, and
--- 'adapterReleased' asks again when a hold ends.
+-- no adopted revision is released in the table. A texture an adopted revision
+-- still holds is marked as having met its barrier, and 'adapterReleased' asks
+-- for the rest when the last hold ends.
 releaseBody ∷ Adapter window → Api.TextureHandle → ReleaseBody
 releaseBody adapter handle builders = do
   due ← atomically $ do
     pending ← readTVar (adapterPending adapter)
-    held ← readTVar (adapterHolds adapter)
-    pure (Set.member handle pending && not (any (Set.member handle) (Map.elems held)))
-  if not due
-    then pure (Right ())
-    else do
-      atomically (modifyTVar' (adapterPending adapter) (Set.delete handle))
-      releaseTextureNow builders (adapterTextures adapter) handle
+    held ← Set.unions . Map.elems <$> readTVar (adapterHolds adapter)
+    modifyTVar' (adapterQueued adapter) (Set.delete handle)
+    case Map.lookup handle pending of
+      Nothing → pure False
+      Just _
+        | Set.member handle held → False <$ modifyTVar' (adapterPending adapter) (Map.insert handle BarrierMet)
+        | otherwise → True <$ modifyTVar' (adapterPending adapter) (Map.delete handle)
+  answer ←
+    if due
+      then releaseTextureNow builders (adapterTextures adapter) handle
+      else pure (Right ())
+  -- Room was just made, and what this action did may have left others due.
+  retryReleases adapter
+  pure answer
 
 -- | The owner adopted this revision of the window with this scene: hold every
 -- texture it references until the revision is released.
 adapterAdopted ∷ Ord window ⇒ Adapter window → window → Natural → Scene2D → IO ()
-adapterAdopted adapter window revision scene =
+adapterAdopted adapter window revision scene = do
   atomically (modifyTVar' (adapterHolds adapter) (Map.insert (window, revision) (sceneReferences scene)))
+  retryReleases adapter
 
--- | This revision of the window has been released: drop its holds, and ask the
--- host again for the release of each texture that was waiting only for them.
+-- | This revision of the window has been released: drop its holds, and queue
+-- the release of each texture that was waiting only for them.
 adapterReleased ∷ Ord window ⇒ Adapter window → window → Natural → IO ()
 adapterReleased adapter window revision = do
-  ready ← atomically $ do
-    modifyTVar' (adapterHolds adapter) (Map.delete (window, revision))
-    pending ← readTVar (adapterPending adapter)
-    held ← readTVar (adapterHolds adapter)
-    pure (Set.toList (pending `Set.difference` Set.unions (Map.elems held)))
-  forM_ ready (requestRelease adapter)
+  atomically (modifyTVar' (adapterHolds adapter) (Map.delete (window, revision)))
+  retryReleases adapter
 
 -- | How many adopted revisions hold the texture.
 textureHolds ∷ Adapter window → Api.TextureHandle → IO Int
@@ -304,7 +374,7 @@ textureHolds adapter handle = length . filter (Set.member handle) . Map.elems <$
 
 -- | The textures whose release was requested and is not yet made in the table.
 pendingReleases ∷ Adapter window → IO (Set Api.TextureHandle)
-pendingReleases adapter = readTVarIO (adapterPending adapter)
+pendingReleases adapter = Map.keysSet <$> readTVarIO (adapterPending adapter)
 
 -- | What a frame's request says of its image and its window, in the terms
 -- the window integration's request names them.

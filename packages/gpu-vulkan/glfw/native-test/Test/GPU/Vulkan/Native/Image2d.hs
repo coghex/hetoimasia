@@ -141,6 +141,7 @@ import Hetoimasia.Render.TwoD.Vulkan.Window
   , Host (..)
   , HostPublication (..)
   , PublishRefusal (..)
+  , ReleaseBody
   , Scene2D (..)
   , adapterAdopted
   , adapterReleased
@@ -485,21 +486,23 @@ windowHostOf vulkan keep watched =
           WindowSceneClosed _ → pure HostClosed
           WindowScenesNotEnabled _ → pure HostSharedScenes
     , hostRequestRelease = \body →
-        atomically
-          ( requestVulkanRelease
-              vulkan
-              ( VulkanAction $ \construction → do
-                  answer ← body (renderBuildersOf construction)
-                  table ← readConstructedTable construction
-                  keep (ReleaseRan (resolves table))
-                  pure answer
-              )
-          )
-          >>= \case
-            Left refusal → pure (Left (tshow refusal))
-            Right _ → pure (Right ())
+        atomically (requestVulkanRelease vulkan (VulkanAction (logged body))) >>= \case
+          Left refusal → pure (Left (tshow refusal))
+          Right _ → pure (Right ())
+    , hostRunOnOwner = \body →
+        atomically (submitVulkanAction vulkan (VulkanAction (logged body))) >>= \case
+          Left refusal → pure (Left (tshow refusal))
+          Right _ → pure (Right ())
     }
   where
+    -- The release, then whether the handle still resolves, read from the real
+    -- table on the owner's thread.
+    logged ∷ ReleaseBody → Construction q inst msgr phys dev cmd → IO (Either Refusal ())
+    logged body construction = do
+      answer ← body (renderBuildersOf construction)
+      table ← readConstructedTable construction
+      keep (ReleaseRan (resolves table))
+      pure answer
     resolves = \case
       Nothing → False
       Just view → case Map.lookup (handleIndex watched) (tableViewMapping view) of

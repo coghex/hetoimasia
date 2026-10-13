@@ -356,6 +356,10 @@ windowHostOf vulkan =
         atomically (requestVulkanRelease vulkan (VulkanAction (body . renderBuildersOf))) >>= \case
           Left refusal → pure (Left (tshow refusal))
           Right _ → pure (Right ())
+    , hostRunOnOwner = \body →
+        atomically (submitVulkanAction vulkan (VulkanAction (body . renderBuildersOf))) >>= \case
+          Left refusal → pure (Left (tshow refusal))
+          Right _ → pure (Right ())
     }
 
 -- | The window's frame: its adopted snapshot recorded into the frame's image

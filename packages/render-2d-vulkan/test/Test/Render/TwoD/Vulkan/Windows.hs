@@ -17,6 +17,7 @@
 module Test.Render.TwoD.Vulkan.Windows (spec) where
 
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
+import Control.Exception (AsyncException (ThreadKilled), throwIO, try)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import Data.Foldable (toList)
@@ -57,14 +58,21 @@ spec = describe "Windows" $ do
 -- ---------------------------------------------------------------------------
 -- The environment
 
--- | A release action the stand-in host was asked to queue.
-newtype Queued = Queued ReleaseBody
+-- | A release action the stand-in host was asked to queue, and whether it asked
+-- for the barrier (the request) or nothing (the plain owner action).
+data Queued = Queued !Bool ReleaseBody
 
 data Fake = Fake
   { fakePublished ∷ !(TVar [(Int, Natural, Scene2D)])
   , fakeQueued ∷ !(TVar [Queued])
   , fakeRefusing ∷ !(TVar Bool)
     -- ^ Whether the host refuses the release requests it is asked for.
+  , fakeCapacity ∷ !(TVar (Maybe Int))
+    -- ^ How many actions the host's queue holds, when bounded.
+  , fakeCancel ∷ !(TVar Bool)
+    -- ^ Whether the next request is interrupted by a cancellation.
+  , fakeAsked ∷ !(TVar (Int, Int))
+    -- ^ How many actions were admitted with a barrier and without one.
   }
 
 data Env = Env
@@ -82,6 +90,9 @@ newFake windows = do
   published ← newTVarIO []
   queued ← newTVarIO []
   refusing ← newTVarIO False
+  capacity ← newTVarIO Nothing
+  asked ← newTVarIO (0, 0)
+  cancel ← newTVarIO False
   let publish window scene = atomically $ do
         known ← Map.lookup window <$> readTVar revisions
         case known of
@@ -90,11 +101,24 @@ newFake windows = do
             modifyTVar' revisions (Map.insert window (revision + 1))
             modifyTVar' published (<> [(window, revision + 1, scene)])
             pure (HostPublished (revision + 1))
-      request ∷ ReleaseBody → IO (Either Text ())
-      request body = atomically $ do
+      admit ∷ Bool → ReleaseBody → IO (Either Text ())
+      admit barrier body = atomically $ do
         refused ← readTVar refusing
-        if refused then pure (Left "the host's queue is full") else Right () <$ modifyTVar' queued (<> [Queued body])
-  pure (Host publish request, Fake published queued refusing)
+        room ← readTVar capacity
+        held ← length <$> readTVar queued
+        if refused || maybe False (held >=) room
+          then pure (Left "the host's queue is full")
+          else do
+            modifyTVar' queued (<> [Queued barrier body])
+            modifyTVar' asked (\(b, p) → if barrier then (b + 1, p) else (b, p + 1))
+            pure (Right ())
+      request ∷ ReleaseBody → IO (Either Text ())
+      request body = do
+        interrupted ← atomically (readTVar cancel <* writeTVar cancel False)
+        if interrupted then throwIO ThreadKilled else admit True body
+      plain ∷ ReleaseBody → IO (Either Text ())
+      plain = admit False
+  pure (Host publish request plain, Fake published queued refusing capacity cancel asked)
 
 withEnv ∷ [Int] → (Env → IO a) → IO a
 withEnv windows action = do
@@ -169,7 +193,17 @@ runQueued ∷ Env → IO [Either Refusal ()]
 runQueued env = do
   queued ← readTVarIO (fakeQueued (envFake env))
   atomically (writeTVar (fakeQueued (envFake env)) [])
-  mapM (\(Queued body) → body (builders (envRig env))) queued
+  mapM (\(Queued _ body) → body (builders (envRig env))) queued
+
+-- | The host runs only the first queued action, on the owner's thread.
+runNext ∷ Env → IO [Either Refusal ()]
+runNext env = do
+  queued ← readTVarIO (fakeQueued (envFake env))
+  case queued of
+    [] → pure []
+    Queued _ body : rest → do
+      atomically (writeTVar (fakeQueued (envFake env)) rest)
+      (: []) <$> body (builders (envRig env))
 
 -- | Whether the table resolves this handle to its own slot now.
 resolves ∷ Env → Api.TextureHandle → IO Bool
@@ -488,6 +522,73 @@ releaseSpec = describe "releasing a texture behind the host's barrier" $ do
       -- The window closes: the host reports its revision released.
       releaseRevision env 1 showing
       _ ← runQueued env
+      resolves env handle >>= (`shouldBe` False)
+
+  it "queues the release after the barrier was met with no barrier of its own, so nothing that appeared since can delay it" $
+    withEnv [1] $ \env → do
+      handle ← registered env 1 True DefaultMark
+      showing ← publishOk env 1 [handle]
+      adopt env 1 showing
+      release2DTexture (envAdapter env) handle >>= (`shouldBe` Right ())
+      _ ← runQueued env
+      -- One request, with its barrier; the adopted snapshot held the texture.
+      readTVarIO (fakeAsked (envFake env)) >>= (`shouldBe` (1, 0))
+      releaseRevision env 1 showing
+      -- The rest was asked for with no barrier at all.
+      readTVarIO (fakeAsked (envFake env)) >>= (`shouldBe` (1, 1))
+      _ ← runQueued env
+      resolves env handle >>= (`shouldBe` False)
+
+  it "keeps a texture whose follow-up the host's full queue refused, and queues it again as room is made, one action at a time" $
+    withEnv [1] $ \env → do
+      first ← registered env 1 True DefaultMark
+      second ← registered env 2 True DefaultMark
+      showing ← publishOk env 1 [first, second]
+      adopt env 1 showing
+      mapM_ (\handle → release2DTexture (envAdapter env) handle >>= (`shouldBe` Right ())) [first, second]
+      _ ← runQueued env
+      -- Room for one action only when the showing snapshot is released.
+      atomically (writeTVar (fakeCapacity (envFake env)) (Just 1))
+      releaseRevision env 1 showing
+      length <$> readTVarIO (fakeQueued (envFake env)) >>= (`shouldBe` 1)
+      pendingReleases (envAdapter env) >>= (`shouldBe` Set.fromList [first, second])
+      -- The first runs; making room, it queues the other without anyone asking.
+      runNext env >>= (`shouldBe` [Right ()])
+      length <$> readTVarIO (fakeQueued (envFake env)) >>= (`shouldBe` 1)
+      runNext env >>= (`shouldBe` [Right ()])
+      mapM (resolves env) [first, second] >>= (`shouldBe` [False, False])
+      pendingReleases (envAdapter env) >>= (`shouldBe` Set.empty)
+
+  it "queues a refused follow-up again when the application asks, with no other event" $
+    withEnv [1] $ \env → do
+      handle ← registered env 1 True DefaultMark
+      showing ← publishOk env 1 [handle]
+      adopt env 1 showing
+      release2DTexture (envAdapter env) handle >>= (`shouldBe` Right ())
+      _ ← runQueued env
+      atomically (writeTVar (fakeCapacity (envFake env)) (Just 0))
+      releaseRevision env 1 showing
+      length <$> readTVarIO (fakeQueued (envFake env)) >>= (`shouldBe` 0)
+      retryReleases (envAdapter env)
+      length <$> readTVarIO (fakeQueued (envFake env)) >>= (`shouldBe` 0)
+      atomically (writeTVar (fakeCapacity (envFake env)) Nothing)
+      retryReleases (envAdapter env)
+      runQueued env >>= (`shouldBe` [Right ()])
+      resolves env handle >>= (`shouldBe` False)
+
+  it "recovers a release whose caller was cancelled after the marker and before the host was asked" $
+    withEnv [1] $ \env → do
+      handle ← registered env 1 True DefaultMark
+      atomically (writeTVar (fakeCancel (envFake env)) True)
+      try @AsyncException (release2DTexture (envAdapter env) handle) >>= (`shouldBe` Left ThreadKilled)
+      -- The marker and the pending entry were one transaction.
+      atomically (isReleased (envTextures env) handle) >>= (`shouldBe` True)
+      pendingReleases (envAdapter env) >>= (`shouldBe` Set.singleton handle)
+      publish2DSnapshot (envAdapter env) 1 (windowSnapshot [handle]) >>= (`shouldBe` Left (TextureReleasedInSnapshot handle))
+      length <$> readTVarIO (fakeQueued (envFake env)) >>= (`shouldBe` 0)
+      -- Asking again repeats the request, and the lock was not left held.
+      release2DTexture (envAdapter env) handle >>= (`shouldBe` Right ())
+      runQueued env >>= (`shouldBe` [Right ()])
       resolves env handle >>= (`shouldBe` False)
 
 -- ---------------------------------------------------------------------------
