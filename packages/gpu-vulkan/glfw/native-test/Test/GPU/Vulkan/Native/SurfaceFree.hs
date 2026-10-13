@@ -82,6 +82,7 @@ module Test.GPU.Vulkan.Native.SurfaceFree
   , runCutoutDepth
   , runClip
   , runRetained
+  , runMaterials
   , surfaceFreeSection
   , laterWindowSection
   , framelessSection
@@ -100,6 +101,7 @@ module Test.GPU.Vulkan.Native.SurfaceFree
   , cutoutDepthSection
   , clipSection
   , retainedSection
+  , materialsSection
   , surfaceFreeSpec
   , laterWindowSpec
   , framelessSpec
@@ -118,6 +120,7 @@ module Test.GPU.Vulkan.Native.SurfaceFree
   , cutoutDepthSpec
   , clipSpec
   , retainedSpec
+  , materialsSpec
   ) where
 
 import Control.Concurrent (ThreadId, myThreadId, threadDelay)
@@ -308,6 +311,7 @@ import Test.GPU.Vulkan.Native.Environment (validationFeatures)
 import qualified Test.GPU.Vulkan.Native.Clip as Clip
 import qualified Test.GPU.Vulkan.Native.CutoutDepth as CutoutDepth
 import qualified Test.GPU.Vulkan.Native.OrderedPath as OrderedPath
+import qualified Test.GPU.Vulkan.Native.MaterialsPath as MaterialsPath
 import qualified Test.GPU.Vulkan.Native.RetainedPath as RetainedPath
 import Test.GPU.Vulkan.Native.Platform (requestingBackend)
 import Test.GPU.Vulkan.Native.Png (encodeRgba)
@@ -1910,6 +1914,24 @@ runRetained backend journal =
     "vulkan-native-r2d10-retained"
     "retained"
 
+-- | The application materials' case (R2D-11): the sample material and two others,
+-- defined by a Template Haskell splice and registered with the renderer, drawn
+-- from render-2d snapshots into offscreen targets that have a @D32_SFLOAT@ depth
+-- image, every frame read back after completion and judged against the oracle
+-- given a model of each material ("Test.GPU.Vulkan.Native.MaterialsPath"). Its
+-- files and probe record go under the validation runner's evidence directory when
+-- it names one, and otherwise into a directory of their own that is kept and
+-- reported.
+runMaterials ∷ Maybe Backend → Journal → IO SurfaceFreeOutcome
+runMaterials backend journal =
+  runEvidenceSuite
+    backend
+    journal
+    (\vulkan directory → MaterialsPath.runMaterials (retainedHost vulkan) directory)
+    "R2D-11: a surface-free session registers application materials defined by a Template Haskell splice and records render-2d snapshots that name them into offscreen targets that have a D32_SFLOAT depth image, reads each back after completion and judges every pixel against the render-2d oracle given a model of each material: a second texture through a record in the ordered and the cutout paths, a push block that changes the colour, default and application materials split into runs, a chunk carrying its own records, and a released texture's index reused, its old handle sampling the placeholder"
+    "vulkan-native-r2d11-materials"
+    "materials"
+
 runEvidenceSuite ∷ Maybe Backend → Journal → (VulkanHost () → FilePath → IO OrderedPath.Evidence) → Text → Text → String → IO SurfaceFreeOutcome
 runEvidenceSuite backend journal runner headline caseName directoryName = do
   heading journal headline
@@ -2872,6 +2894,12 @@ clipSpec ∷ SurfaceFreeOutcome → Spec
 clipSpec = evidenceSpec "R2D-12 clipping's window-free evidence" "clip" 7 True
 retainedSpec ∷ SurfaceFreeOutcome → Spec
 retainedSpec = evidenceSpec "R2D-10 the retained chunks' window-free evidence" "retained" 11 True
+
+materialsSection ∷ SurfaceFreeOutcome → [Text]
+materialsSection = evidenceSection "A surface-free session recording application materials over a D32_SFLOAT depth image" "materials"
+
+materialsSpec ∷ SurfaceFreeOutcome → Spec
+materialsSpec = evidenceSpec "R2D-11 the application materials' window-free evidence" "materials" 6 True
 
 -- | The examples of an evidence case: no window, every fixture rendered and
 -- read back after its batch completed, every determinate probe within its
