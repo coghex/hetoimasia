@@ -37,6 +37,16 @@
 # from before that directory exists: cleanup and the signal traps are installed
 # first, so the setup window in which the directory is there and the compositor
 # is not is covered like any other. See docs/validation.md.
+#
+# The cleanup ignores TERM, INT and HUP for its whole duration, before it does
+# anything else. The validation runner signals every member of a stage's session
+# at its expiry and, during the grace that follows, every member it first sees
+# in that grace, which includes the `rm` this cleanup starts; an ignored
+# disposition is inherited by it, so a signal that arrives while the cleanup
+# runs neither ends it early nor kills the removal that leaves no runtime
+# directory behind. The exit status stays what the signal that started the
+# cleanup, or the command, made it. A cleanup that hangs is still frozen and
+# killed after the grace, by the runner.
 set -uo pipefail
 
 usage() {
@@ -100,6 +110,9 @@ alive() {
 # can name a client that a signal outran the recording of. The table holds only
 # this shell's own children, so nothing else is signalled or waited for.
 stop() {
+  # First of all, before anything is started: the ignored disposition is what
+  # the removal below inherits.
+  trap '' TERM INT HUP
   local job
   for job in $(jobs -pr); do
     kill "$job" 2>/dev/null
@@ -117,7 +130,9 @@ trap stop EXIT
 # directory. Waiting on the command rather than running it in the foreground is
 # what lets a signal be handled while it runs instead of after it.
 terminate() {
-  trap - TERM INT HUP
+  # Ignored rather than restored to the default: a second signal while the
+  # cleanup runs must not end it where it stands.
+  trap '' TERM INT HUP
   if [ -n "$command_pid" ]; then
     kill "$command_pid" 2>/dev/null
     wait "$command_pid" 2>/dev/null

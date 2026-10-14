@@ -37,17 +37,32 @@
 -- first check.
 module VulkanProof (spec, readByTheseExamples) where
 
+import Control.Concurrent (threadDelay)
+import Control.Exception (finally)
 import Control.Monad (forM_, when)
 import Data.Char (isDigit, isHexDigit, isSpace)
 import Data.List (dropWhileEnd, isInfixOf, isPrefixOf, isSuffixOf, nub, stripPrefix)
 import Data.Maybe (mapMaybe)
 import Json (Json (..), asArray, asBool, asString, field, parseJson)
 import Sandbox (run)
-import System.Directory (doesFileExist, getCurrentDirectory, listDirectory)
+import System.Directory
+  ( copyFile
+  , createDirectoryIfMissing
+  , doesDirectoryExist
+  , doesFileExist
+  , getCurrentDirectory
+  , getPermissions
+  , listDirectory
+  , setOwnerExecutable
+  , setPermissions
+  )
 import System.Environment (getEnvironment)
 import System.Exit (ExitCode (..))
-import System.FilePath ((</>))
+import System.FilePath (takeDirectory, (</>))
+import System.IO (IOMode (WriteMode), withFile)
 import System.IO.Temp (withSystemTempDirectory)
+import System.Process (CreateProcess (..), StdStream (UseHandle), createProcess, getPid, proc, waitForProcess)
+import System.Timeout (timeout)
 import Test.Hspec (Spec, describe, expectationFailure, it, pendingWith, shouldBe, shouldContain, shouldNotContain, shouldSatisfy)
 
 -- | The retained per-platform records, and the summary that quotes them.
@@ -246,6 +261,8 @@ bindingPackage = "vulkan"
 
 spec ∷ Spec
 spec = describe "The Vulkan project boundary" $ do
+  runnerCleanupSpec
+
   it "names the native package and the window integration package, with their local closure, in the one project file that selects them" $ do
     declared ← projectPackages "cabal.project.vulkan"
     declared `shouldBe` vulkanProject
@@ -1102,3 +1119,194 @@ lookup' ∷ Int → [String] → Maybe String
 lookup' index row = case drop index row of
   (cell : _) → Just cell
   [] → Nothing
+
+-- ---------------------------------------------------------------------------
+-- The runner's cleanup under a stage's expiry (GUIDE-4)
+
+-- | What the runner's fingerprint cleanup keeps when the signals a stage's expiry
+-- sends reach it. The runner runs in a checkout of its own, assembled here from
+-- the checked-in script and stand-ins for what it calls: the toolchain, the
+-- native prefix's discovery, the shader-fingerprint executable, and the suites.
+-- The only stand-in on the cleanup's own path is @rm@, which says the cleanup has
+-- started and holds until the example releases it, so the signal lands inside the
+-- cleanup rather than at an elapsed time. Signals go to the runner's whole
+-- process group, as the validation runner's go to every member of a session, so
+-- they reach the stand-in @rm@ too.
+runnerCleanupSpec ∷ Spec
+runnerCleanupSpec = describe "the runner's fingerprint cleanup" $ do
+  it "removes the fingerprints it generated, keeping the ones it found, and keeps the suites' status, when TERM reaches the cleanup after a normal finish" $
+    withRunnerFixture False $ \fixture → do
+      (status, _) ← runWithSignalsDuringCleanup fixture 1
+      status `shouldBe` ExitSuccess
+      assertCleaned fixture
+
+  it "removes them, and ends as the first signal ended it, when a second TERM reaches the cleanup that the first one started" $
+    withRunnerFixture True $ \fixture → do
+      (status, _) ← runWithSignalsDuringCleanup fixture 2
+      -- Ended by the signal that started the cleanup, as a shell that ran its
+      -- EXIT trap and then died of TERM reports it.
+      status `shouldBe` ExitFailure (-15)
+      assertCleaned fixture
+
+data RunnerFixture = RunnerFixture
+  { fixtureRoot ∷ FilePath
+  , fixtureEnvironment ∷ [(String, String)]
+  }
+
+-- | The fingerprints the runner generates, relative to its checkout.
+generatedFingerprints ∷ [FilePath]
+generatedFingerprints =
+  [ "packages/gpu-vulkan/native/shaders/toolchain.fingerprint"
+  , "samples/triangle/renderer/shaders/toolchain.fingerprint"
+  , "samples/sprites/renderer/shaders/toolchain.fingerprint"
+  , "samples/scene3d/renderer/shaders/toolchain.fingerprint"
+  ]
+
+-- | The fingerprint the fixture already holds, which the runner finds and so
+-- must leave in place.
+foundFingerprint ∷ FilePath
+foundFingerprint = "packages/render-2d-vulkan/shaders/toolchain.fingerprint"
+
+-- | A checkout holding the real runner and stand-ins for everything else, with
+-- one fingerprint already there.
+withRunnerFixture ∷ Bool → (RunnerFixture → IO a) → IO a
+withRunnerFixture blocks action = do
+  checkout ← getCurrentDirectory
+  inherited ← getEnvironment
+  withSystemTempDirectory "hetoimasia-runner-cleanup" $ \root → do
+    let bin = root </> "bin"
+        executable relative contents = do
+          writeFixture relative contents
+          permissions ← getPermissions (root </> relative)
+          setPermissions (root </> relative) (setOwnerExecutable True permissions)
+        writeFixture relative contents = do
+          createDirectoryIfMissing True (takeDirectory (root </> relative))
+          writeFile (root </> relative) contents
+    createDirectoryIfMissing True (takeDirectory (root </> runner))
+    copyFile (checkout </> runner) (root </> runner)
+    writeFixture "tools/ci-image/toolchain.pin" "GHC_VERSION=9.14.1\nCABAL_VERSION=3.18.1.0\n"
+    writeFixture "tools/toolchain/binding.pin" "VULKAN_FLAG_SAFE_FOREIGN_CALLS=on\nVULKAN_FLAG_DARWIN_LIB_DIRS=off\n"
+    writeFixture "cabal.project.vulkan" "constraints:\n    vulkan +safe-foreign-calls,\n    vulkan -darwin-lib-dirs\n"
+    writeFixture "driver.json" "{}\n"
+    createDirectoryIfMissing True (root </> "layers")
+    writeFixture
+      "tools/native/native.py"
+      ( unlines
+          [ "print('export VK_DRIVER_FILES=\"" ++ root ++ "/driver.json\"')"
+          , "print('export VK_LAYER_PATH=\"" ++ root ++ "/layers\"')"
+          , "print('export HETOIMASIA_GLSLANG=\"" ++ root ++ "/bin/glslang\"')"
+          , "print('export HETOIMASIA_VULKAN_LIBDIR=\"" ++ root ++ "/lib\"')"
+          , "print('export HETOIMASIA_VULKAN_INCLUDEDIR=\"" ++ root ++ "/include\"')"
+          ]
+      )
+    executable "bin/glslang" "#!/bin/sh\necho stand-in glslang\n"
+    executable "bin/ghc" "#!/bin/sh\necho 9.14.1\n"
+    -- The fingerprint executable writes its output; the suites record that they
+    -- are running and either finish or wait to be signalled.
+    executable
+      "bin/cabal"
+      ( unlines
+          [ "#!/bin/sh"
+          , "case \"$1\" in"
+          , "  --numeric-version) echo 3.18.1.0 ;;"
+          , "  run)"
+          , "    while [ \"$#\" -gt 0 ]; do"
+          , "      if [ \"$1\" = --output ]; then echo stand-in > \"$2\"; exit 0; fi"
+          , "      shift"
+          , "    done ;;"
+          , "  test)"
+          , "    : > \"$FIXTURE_ROOT/suites-running\""
+          , "    if [ -n \"$FIXTURE_BLOCKS\" ]; then exec sleep 300; fi ;;"
+          , "esac"
+          ]
+      )
+    -- The one command on the cleanup's path: it says the cleanup has started and
+    -- holds until released, so a signal sent in between lands inside the cleanup.
+    executable
+      "bin/rm"
+      ( unlines
+          [ "#!/bin/sh"
+          , ": > \"$FIXTURE_ROOT/cleanup-started\""
+          , "while [ ! -e \"$FIXTURE_ROOT/release\" ]; do sleep 0.05; done"
+          , "exec /bin/rm \"$@\""
+          ]
+      )
+    -- Regenerating a fingerprint writes the same bytes, so the stand-in finds its
+    -- own output already there.
+    writeFixture foundFingerprint "stand-in\n"
+    let unset = ["LD_LIBRARY_PATH", "LD_PRELOAD", "LD_AUDIT", "DYLD_LIBRARY_PATH", "DYLD_FALLBACK_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES", "DYLD_FRAMEWORK_PATH", "DYLD_FALLBACK_FRAMEWORK_PATH", "DYLD_IMAGE_SUFFIX", "PATH"]
+        environment =
+          [ ("PATH", bin ++ ":" ++ maybe "/usr/bin:/bin" id (lookup "PATH" inherited))
+          , ("FIXTURE_ROOT", root)
+          , ("FIXTURE_BLOCKS", if blocks then "yes" else "")
+          ]
+            ++ filter ((`notElem` unset) . fst) inherited
+    action (RunnerFixture root environment)
+
+-- | Run the runner's @test@ mode; once its cleanup has begun, send TERM to its
+-- process group this many times, the first only if the suites were waiting for
+-- one; then release the cleanup and answer how the runner ended.
+--
+-- Every wait is for a file the stand-ins write, bounded; nothing is timed. With
+-- one signal the suites have finished by themselves and the cleanup is what the
+-- signal lands in; with two, the first ends the suites and starts the cleanup.
+runWithSignalsDuringCleanup ∷ RunnerFixture → Int → IO (ExitCode, String)
+runWithSignalsDuringCleanup fixture signals = do
+  let root = fixtureRoot fixture
+  withFile (root </> "runner.log") WriteMode $ \logHandle → do
+    (_, _, _, handle) ←
+      createProcess
+        (proc "bash" [root </> runner, "test", "hetoimasia-gpu-vulkan-native:test:native-tests"])
+          { cwd = Just root
+          , env = Just (fixtureEnvironment fixture)
+          , create_group = True
+          , std_out = UseHandle logHandle
+          , std_err = UseHandle logHandle
+          }
+    pid ← getPid handle >>= maybe (fail "the runner has no process id") pure
+    -- Through Bash, whose builtin takes a process group after `--` everywhere;
+    -- the `sh` of some platforms (dash) does not. A signal that was not delivered
+    -- fails the example rather than letting it go on without one.
+    let signalGroup = do
+          (delivered, _, errors) ← run [] root "bash" ["-c", "kill -TERM -- -\"$0\"", show pid]
+          (delivered, errors) `shouldBe` (ExitSuccess, "")
+        -- Clearing up after the example: a group that has already gone is no failure.
+        endGroup = run [] root "bash" ["-c", "kill -KILL -- -\"$0\" 2>/dev/null || true", show pid]
+    ( do
+        when (signals >= 2) $ do
+          awaitFile (root </> "suites-running")
+          signalGroup
+        awaitFile (root </> "cleanup-started")
+        -- The fingerprints the runner generated are all there when the cleanup
+        -- begins, and so is the one it found.
+        forM_ (foundFingerprint : generatedFingerprints) $ \relative →
+          doesFileExist (root </> relative) >>= (`shouldBe` True)
+        signalGroup
+        writeFile (root </> "release") "released\n"
+        finished ← timeout (60 * 1000 * 1000) (waitForProcess handle)
+        status ← maybe (expectationFailure "the runner did not end within a minute after the cleanup was released" >> pure (ExitFailure 1)) pure finished
+        output ← readFile (root </> "runner.log")
+        length output `seq` pure (status, output)
+      )
+      `finally` endGroup
+
+-- | Wait for a file a stand-in writes, a bounded number of polls.
+awaitFile ∷ FilePath → IO ()
+awaitFile path = go (3000 ∷ Int)
+  where
+    go 0 = expectationFailure (path ++ " did not appear within thirty seconds")
+    go remaining =
+      doesFileExist path >>= \present →
+        if present
+          then pure ()
+          else threadDelay 10000 >> go (remaining - 1)
+
+-- | The generated fingerprints and the directories that held only them are gone,
+-- and the one the runner found is as it was.
+assertCleaned ∷ RunnerFixture → IO ()
+assertCleaned fixture = do
+  let root = fixtureRoot fixture
+  forM_ generatedFingerprints $ \relative → do
+    doesFileExist (root </> relative) >>= (`shouldBe` False)
+    doesDirectoryExist (root </> takeDirectory relative) >>= (`shouldBe` False)
+  readFile (root </> foundFingerprint) >>= (`shouldBe` "stand-in\n")

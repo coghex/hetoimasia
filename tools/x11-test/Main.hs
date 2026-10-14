@@ -277,6 +277,54 @@ x11Spec = describe "Isolated X11 display" $ do
       installStubs display (("xprop", "#!/bin/sh\nexit 0\n") : filter ((/= "xprop") . fst) workingStubs)
       refused display "the window manager did not take :42 within 10 seconds"
 
+  it "finishes its cleanup, keeping the retained logs and leaving no scratch directory, when a second TERM reaches it while it waits for what it stopped" $
+    withDisplay $ \display → do
+      -- The first TERM starts the cleanup: the command signals the helper and
+      -- ends. The window manager, stopped by that cleanup, signals the helper
+      -- again as it goes, which lands while the cleanup waits for it. The
+      -- cleanup ignores TERM, INT and HUP, so neither the wait nor the copy and
+      -- the removal that follow it are cut short, and the status is still the
+      -- first signal's.
+      installStubs display (("openbox", signallingManager) : filter ((/= "openbox") . fst) workingStubs)
+      let retained = directory display </> "retained"
+      (result, _, errors) ← helper display ["--retain", retained, "--", "sh", "-c", "kill -TERM \"$PPID\""]
+      result `shouldBe` ExitFailure 143
+      errors `shouldContain` "terminated by SIGTERM"
+      doesFileExist (directory display </> "second-signal-sent") `shouldReturn` True
+      forM_ ["x11-server.log", "x11-manager.log", "x11-server.txt"] $ \name →
+        doesFileExist (retained </> name) `shouldReturn` True
+      leftBehind "hetoimasia-x11." display `shouldReturn` []
+
+  it "keeps the command's own status when a TERM reaches the cleanup that its normal exit started" $
+    withDisplay $ \display → do
+      -- The race behind a command that finishes near its deadline: the command
+      -- has ended and the cleanup is under way when the signal arrives. The
+      -- signal comes from the window manager the cleanup stops. Left to its
+      -- trap, the helper would end with 143 where the command ended with 3, and
+      -- before it had copied or removed anything.
+      installStubs display (("openbox", signallingManager) : filter ((/= "openbox") . fst) workingStubs)
+      let retained = directory display </> "retained"
+      (result, _, errors) ← helper display ["--retain", retained, "--", "sh", "-c", "exit 3"]
+      result `shouldBe` ExitFailure 3
+      errors `shouldNotContain` "terminated by"
+      doesFileExist (directory display </> "second-signal-sent") `shouldReturn` True
+      forM_ ["x11-server.log", "x11-manager.log", "x11-server.txt"] $ \name →
+        doesFileExist (retained </> name) `shouldReturn` True
+      leftBehind "hetoimasia-x11." display `shouldReturn` []
+
+  it "stops the server and finishes the cleanup when the server tells the observer that started it to stop a second time" $
+    withDisplay $ \display → do
+      -- The observer's own handler stops the server and waits for it; the server,
+      -- stopped, signals the observer again as it goes. The observer ignores
+      -- that, as the helper does, and the helper's cleanup completes.
+      installStubs display (("Xvfb", signallingObserverServer) : filter ((/= "Xvfb") . fst) workingStubs)
+      (result, _, _) ← helper display ["--", "sh", "-c", "exit 3"]
+      result `shouldBe` ExitFailure 3
+      doesFileExist (directory display </> "observer-told-again") `shouldReturn` True
+      server ← pidIn display "server.pid"
+      stopped server `shouldReturn` True
+      leftBehind "hetoimasia-x11." display `shouldReturn` []
+
   it "exits with the command's own status once the display is established" $
     withDisplay $ \display → do
       installStubs display workingStubs
@@ -316,6 +364,31 @@ workingStubs =
         ]
     )
   ]
+
+-- | A window manager that signals the helper again when the helper's cleanup
+-- stops it, and then exits: the second signal arrives while the cleanup waits for
+-- it. Its parent is the helper itself, which starts it directly.
+signallingManager ∷ String
+signallingManager =
+  unlines
+    [ "#!/bin/sh"
+    , "trap 'kill $waiter 2>/dev/null; kill -TERM \"$PPID\"; : > second-signal-sent; exit 0' TERM"
+    , "sleep 300 & waiter=$!"
+    , "wait"
+    ]
+
+-- | A server that comes up and, when it is stopped, signals the observer that
+-- started it (its parent, not the helper) again before it exits.
+signallingObserverServer ∷ String
+signallingObserverServer =
+  unlines
+    [ "#!/bin/sh"
+    , "echo $$ > server.pid"
+    , "trap 'kill $waiter 2>/dev/null; kill -TERM \"$PPID\"; : > observer-told-again; exit 0' TERM"
+    , "echo 42 >&3"
+    , "sleep 300 & waiter=$!"
+    , "wait"
+    ]
 
 -- | A server that exits before reporting a display, and whose report channel
 -- closes only afterwards. The holder inherits the channel and blocks on a
@@ -609,7 +682,7 @@ withHelper relative action = do
 -- display programs themselves are deliberately absent unless stubbed.
 utilities ∷ [String]
 utilities =
-  ["cat", "head", "mkdir", "mkfifo", "mktemp", "ps", "rm", "sed", "sh", "sleep", "tail", "touch", "tr"]
+  ["basename", "cat", "cp", "head", "mkdir", "mkfifo", "mktemp", "ps", "rm", "sed", "sh", "sleep", "tail", "touch", "tr"]
 
 -- | The X11 helper's own scratch directories still sitting in its TMPDIR.
 -- An empty answer proves that none of those directories survived the run.

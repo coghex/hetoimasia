@@ -243,6 +243,36 @@ waylandSpec = describe "Isolated headless Wayland session" $ do
           -- helper can have ended it.
           pidIn session "client.pid" >>= \client → stopped client `shouldReturn` True
 
+  it "removes the runtime directory when a second TERM reaches the cleanup while it waits for the compositor it stopped" $
+    withSession $ \session → do
+      -- The first TERM starts the cleanup: the command signals the helper and
+      -- stays alive for the helper to stop. The compositor, stopped by that
+      -- cleanup, signals the helper again as it goes, which lands while the
+      -- cleanup waits for it. The cleanup ignores TERM, INT and HUP, so the
+      -- removal after the wait still happens, and the status is the first
+      -- signal's.
+      installStubs session (("weston", signallingCompositor) : filter ((/= "weston") . fst) waylandStubs)
+      (result, _, errors) ←
+        sessionHelper session ["--", "sh", "-c", "echo $$ > command.pid; kill -TERM \"$PPID\"; exec sleep 300"]
+      result `shouldBe` ExitFailure 143
+      errors `shouldContain` "terminated by SIGTERM"
+      doesFileExist (directory session </> "second-signal-sent") `shouldReturn` True
+      pidIn session "command.pid" >>= \commanded → stopped commanded `shouldReturn` True
+      cleanedUp session
+
+  it "keeps the command's own status when a TERM reaches the cleanup that its normal exit started" $
+    withSession $ \session → do
+      -- The command has ended and the cleanup is under way when the signal
+      -- arrives, from the compositor the cleanup stops. Left to its trap, the
+      -- helper would end with 143 where the command ended with 3, before it had
+      -- removed anything.
+      installStubs session (("weston", signallingCompositor) : filter ((/= "weston") . fst) waylandStubs)
+      (result, _, errors) ← sessionHelper session ["--", "sh", "-c", "exit 3"]
+      result `shouldBe` ExitFailure 3
+      errors `shouldNotContain` "terminated by"
+      doesFileExist (directory session </> "second-signal-sent") `shouldReturn` True
+      cleanedUp session
+
   it "stops the command and the compositor and removes the runtime directory when a signal ends the run" $
     withSession $ \session → do
       installStubs session waylandStubs
@@ -369,6 +399,19 @@ compositorRecord =
 -- only once this marker exists.
 workingCompositor ∷ String
 workingCompositor = compositorRecord ++ ": > serving\nexec sleep 300\n"
+
+-- | A compositor that serves and, when the helper's cleanup stops it, signals the
+-- helper again and exits: the second signal arrives while the cleanup waits for
+-- it. Its parent is the helper itself, which starts it directly.
+signallingCompositor ∷ String
+signallingCompositor =
+  compositorRecord
+    ++ unlines
+      [ ": > serving"
+      , "trap 'kill $waiter 2>/dev/null; kill -TERM \"$PPID\"; : > second-signal-sent; exit 0' TERM"
+      , "sleep 300 & waiter=$!"
+      , "wait"
+      ]
 
 -- | A compositor that records its launch and then fails, as one refused by its
 -- backend does.
