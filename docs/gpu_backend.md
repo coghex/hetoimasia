@@ -272,8 +272,12 @@ a `NativeObserver`: something that wraps every native call the controller
 makes — the recording's and the frames' included — for evidence, a
 `VulkanRenderer`, a `FrameObserver`, when the device is created
 (`vulkanDeviceStart`: `DeviceAtFirstSurface`, the default, or
-`DeviceSurfaceFree`), and how many owner-thread actions may be queued at once
-(`vulkanActionCapacity`, `defaultActionCapacity` — 64 — by default). The observer must run each call once
+`DeviceSurfaceFree`), how many owner-thread actions may be queued at once
+(`vulkanActionCapacity`, `defaultActionCapacity` — 64 — by default), how many
+release requests may be (`vulkanReleaseCapacity`, `defaultReleaseCapacity` — 64 —
+by default, a bound of its own), and whether the initial scene is declared to
+reference nothing a release request releases (`vulkanInitialSceneHoldsNothing`,
+off by default; see [A scene for each window](#a-scene-for-each-window)). The observer must run each call once
 and answer what it answered; it decides nothing, and the default observes
 nothing. The renderer records one frame of the scene between the controller's
 transitions into rendering and to presentation, with the session's managed
@@ -4368,9 +4372,21 @@ action, lent the `Construction` as any other, that runs only once the owner has
 adopted what D-28 says before an application releases an object a snapshot
 references. It is admitted, bounded and settled exactly as `submitVulkanAction`
 is ([Owner-thread actions](#owner-thread-actions)): the same refusals
-(`ActionQueueFull`, `ActionDeviceNotReady`, `ActionSessionFailed`,
-`ActionOwnerClosed`), the same queue and capacity, and a request still queued
-when the owner's exit begins is settled as refused and never run.
+(`ActionDeviceNotReady`, `ActionSessionFailed`, `ActionOwnerClosed`), the same
+queue, and a request still queued when the owner's exit begins is settled as
+refused and never run. What it does not share is the queue's bound. Release
+requests are admitted against `vulkanReleaseCapacity` alone, ordinary actions
+against `vulkanActionCapacity` alone, and each bounds only the queued entries of
+its own class: a release request admitted while the queue already holds that
+many release requests is refused at once with `ReleaseQueueFull`, and release
+requests never cause `submitVulkanAction` to be refused `ActionQueueFull`, nor
+actions a release request. A request counts from its admission until the owner
+takes it, whatever its barrier — an empty one, or one already met, takes a slot
+too — and one the owner is running no longer occupies a slot. A capacity of zero
+refuses its class at once; the session, owner and device refusals precede
+either capacity refusal. Without a bound of its own, requests that a window
+with no target holds could fill the shared queue and starve every ordinary
+action behind them.
 
 In the transaction that queues it, the request records a *barrier*: for every
 window the host holds, the latest revision published for it — revision 0, the
@@ -4384,7 +4400,38 @@ no longer holds the window. A target that has ended holds nothing, whatever it
 adopted: a window whose adopting target was detached or released has no hold
 until another adopts, since the revision it published is one that target will
 take, so a request made meanwhile waits for it. Windows that appear later are not named and delay
-nothing. The barrier,
+nothing.
+
+**The initial scene's declaration.** A host whose initial scene references
+nothing a release request releases can say so: `vulkanInitialSceneHoldsNothing`
+is off by default, and `render-2d`'s hosts (`samples/image2d` and the native
+`Image2d` case, whose initial scene is `blankScene`) turn it on. With it on, the
+barrier a request captures leaves out every window whose latest revision is 0 —
+in a per-window host a window with no publication, in a shared host every window
+while the shared scene is unpublished — because a target that later adopts the
+initial scene finds nothing there that a release could have freed. A window that
+has never published, untargeted or not, then holds no request, and a request
+made while only such windows exist runs in the next owner step. Only the
+barrier captured with the request is filtered: `readVulkanSceneState` still
+reports revision 0 as the window's published revision, and the omission is made
+for no other window. Every other window is named exactly as above, with or
+without a live target; publishing another blank scene is a publication, and
+creates revision 1, which a request then names. With the setting off the barrier
+is unchanged. The declaration is the host's to make true.
+
+**The case that remains.** A window that has published, and has no live target
+— never rendered, or after `VulkanHandoverRolledBack` or `Unavailable`, or its
+target released — cannot leave the barrier: a target attached later adopts that
+publication, and a released object's freed buffer would then be read. Such a
+window holds every later request until a target of it adopts the barrier's
+revision, or the host drops the window, so those requests stay queued and
+unrun (their memory not reclaimed) until then; each takes a slot of the release
+capacity, and a full release queue refuses further requests with
+`ReleaseQueueFull`, which no longer touches ordinary actions. It is observable:
+`readVulkanSceneState` shows the request's barrier naming the window, and the
+window's published revision above its adopted one (`windowAdopted` is `Nothing`
+for a window with no live target). Resolving it is the application's: attach a
+target of the window, or close it. The barrier,
 the publications and the order of requests are one coherent fact however
 publications and windows change around the request.
 
@@ -4890,7 +4937,9 @@ frame-less batch recording ([Frame-less batches](#frame-less-batches)).
   yet (`ActionDeviceNotReady`: under `DeviceAtFirstSurface`, until the first
   window is admitted; nothing is created for it and it is never held until a
   device exists), and when the queue already holds `vulkanActionCapacity`
-  actions (`ActionQueueFull`). Waiting for the outcome is the caller's
+  actions (`ActionQueueFull`; release requests are not counted toward it, they
+  have `vulkanReleaseCapacity` of their own and `ReleaseQueueFull`, below).
+  Waiting for the outcome is the caller's
   explicit choice. Admission wakes an idle owner without any window event or
   render demand: the queue is part of the owner's wake, except while a
   diagnostic failure is pending, when the owner looks again within its poll.
@@ -4936,12 +4985,19 @@ frame-less batch recording ([Frame-less batches](#frame-less-batches)).
 
 A release request ([A scene for each window](#a-scene-for-each-window)) is an
 action that also waits for the scene revisions its barrier names, admitted and
-settled by exactly these rules and sharing the queue and its capacity.
+settled by exactly these rules and sharing the queue but not its bound: it is
+counted against `vulkanReleaseCapacity`, a capacity of its own, and one made when
+that is full is refused at once with `ReleaseQueueFull`. Neither class of
+admission can fill the other's bound, so a release request waiting on a barrier
+never causes `submitVulkanAction` to be refused.
 
 The headless examples cover each case over the scripted seam — surface-free
 startup and teardown order with no window, later admission and refusal, an
 action on the owner's thread returning its result, the default setting's
-device-not-ready refusal, the full queue's immediate refusal, a raising
+device-not-ready refusal, the full queue's immediate refusal, the two bounds'
+independence (each class refused at its own capacity, an empty barrier still
+counted, slots reused, zero capacities, and device, session and owner refusals
+ahead of a full queue), a raising
 action's failure and its retained resources, a construction's device loss
 ending the owner — raised, or caught and returned from — a failure setting the
 construction up settling its ticket before it ends the owner, refusal after terminal failure and after exit begins

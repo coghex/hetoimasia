@@ -42,7 +42,16 @@ and the suites' verification capture.
   discarded or its submission has completed, exactly once and in adoption order
   for each window. `requestVulkanRelease` queues an owner-thread action that
   runs only once the owner has adopted, for every window it named when it was
-  made, the revision then current; `readVulkanSceneState` reads each window's
+  made, the revision then current. It has a bound of its own,
+  `vulkanReleaseCapacity` (`defaultReleaseCapacity`, 64), apart from
+  `vulkanActionCapacity`: one made when it is full is refused `ReleaseQueueFull`,
+  and release requests never cause `submitVulkanAction` to be refused. A host
+  whose initial scene references nothing a release releases sets
+  `vulkanInitialSceneHoldsNothing` (off by default), and a window that has never
+  published (revision 0) is then left out of the request's barrier; a window that
+  has published and has no live target still holds every later request until a
+  target adopts its revision or the window is closed, which is the application's
+  to resolve and which `readVulkanSceneState` shows. It reads each window's
   published and adopted revisions, those awaiting release, and the requests
   still queued ([A scene for each window](../../../docs/gpu_backend.md#a-scene-for-each-window)).
 - The renderer is the consumer's (VK-19). Each frame's `FrameRequest` names
