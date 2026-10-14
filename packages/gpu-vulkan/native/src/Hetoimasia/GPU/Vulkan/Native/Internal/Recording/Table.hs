@@ -820,10 +820,10 @@ data TableView = TableView
   , tableViewAllocated ∷ !Word32
     -- ^ How many slots the current set 0 holds, slot 0 included (GRS-14).
   , tableViewSets ∷ ![Word64]
+    -- ^ The current set 0, then set 1.
   , tableViewSwaps ∷ ![(Book.TextureHandle, Word32, ResourceId)]
     -- ^ Each pending swap (GRS-9): the handle, its replacement's reserved
     -- slot, and the replacement.
-    -- ^ The current set 0, then set 1.
   }
   deriving (Eq, Show)
 

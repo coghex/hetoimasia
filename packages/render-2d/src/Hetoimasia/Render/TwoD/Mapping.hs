@@ -56,13 +56,16 @@
 -- 'snapPixel'. The UI transform stays the continuous equation above, with the
 -- viewport's origin as it is: UI snaps in device pixels through the rounding of
 -- UI /instance/ origins, which is 'snapPoint', exposed separately. Every inverse
--- is the exact inverse of the transform drawing uses, with its snapped
--- translation where it has one, and rounds no result, so picking uses precisely
--- the transform drawing uses. The per-instance origin rounding the recorder
--- later applies rigidly in the shader is 'snapPoint' too: a consumer reproduces
--- a snapped sprite's origin as @snapPoint (worldToTarget m origin)@ or
--- @snapPoint (uiToTarget m origin)@, when 'mappingPixelSnap' says the view
--- snaps. For the transform @F@ drawing uses, @|snapPoint (F p) − F p| ≤ 0.5@
+-- is the inverse of the transform drawing uses, with its snapped translation
+-- where it has one, subject to floating-point rounding: it is calculated in
+-- double precision from that transform's 32-bit coefficients and rounded to
+-- 32-bit ones, so it inverts what the transform holds to within that rounding and
+-- not exactly. No result is snapped to the pixel grid, so picking uses the
+-- transform drawing uses and not a snapped variant of it. The per-instance
+-- origin rounding the recorder later applies rigidly in the shader is
+-- 'snapPoint' too: a consumer reproduces a snapped sprite's origin as
+-- @snapPoint (worldToTarget m origin)@ or @snapPoint (uiToTarget m origin)@, when
+-- 'mappingPixelSnap' says the view snaps. For the transform @F@ drawing uses, @|snapPoint (F p) − F p| ≤ 0.5@
 -- per axis, which is the whole promise: the unsnapped inverse differs from a
 -- snapped sprite's drawn origin by at most half a device pixel per axis. It
 -- cannot be measured against a separate transform whose camera translation is
@@ -76,10 +79,11 @@
 -- is only as exact as the coefficients: the translation is the viewport's
 -- centre minus the scale times the camera position, and once that product
 -- exceeds 2²³ pixels one ulp of it is more than a pixel. The mapping is still
--- finite and still inverts exactly what it holds, but the camera position then
--- appears at the centre only to that resolution, in either snap setting. The
--- half-pixel promise above is unaffected: it compares a position with its own
--- rounding. A game with such ranges keeps its camera near the origin.
+-- finite and still inverts what it holds, to within floating-point rounding, but
+-- the camera position then appears at the centre only to that resolution, in
+-- either snap setting. The half-pixel promise above is unaffected: it compares
+-- a position with its own rounding. A game with such ranges keeps its camera near
+-- the origin.
 --
 -- __Degenerate input.__ Nothing is clamped, and every refusal is 'Nothing':
 --
@@ -192,7 +196,8 @@ mappingPixelSnap = mappingSnap
 worldTransform ∷ ViewMapping → Affine2
 worldTransform = mappingWorld
 
--- | The exact inverse of 'worldTransform'; 'Nothing' for an empty viewport.
+-- | The inverse of 'worldTransform', subject to floating-point rounding (see
+-- "Float resolution" above); 'Nothing' for an empty viewport.
 worldInverse ∷ ViewMapping → Maybe Affine2
 worldInverse = mappingWorldInverse
 
@@ -201,7 +206,8 @@ worldInverse = mappingWorldInverse
 uiTransform ∷ ViewMapping → Affine2
 uiTransform = mappingUi
 
--- | The exact inverse of 'uiTransform'; 'Nothing' for an empty viewport.
+-- | The inverse of 'uiTransform', subject to floating-point rounding (see
+-- "Float resolution" above); 'Nothing' for an empty viewport.
 uiInverse ∷ ViewMapping → Maybe Affine2
 uiInverse = mappingUiInverse
 

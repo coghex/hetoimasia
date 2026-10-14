@@ -11,9 +11,10 @@
 -- who owns it. The generation's construction makes it and records it; the
 -- generation releases it, in the transaction its destruction is recorded in, and the
 -- recording destroys it once the model reports every hold on it ended. No
--- handle releases it ('releaseManaged' refuses), and the frame's recorder
--- takes it only from the request of a frame of its own generation
--- ('windowDepthOf').
+-- handle releases it ('releaseManaged' refuses), and a frame's request names it
+-- ('windowDepthOf'): the window host takes it from the frame's own generation,
+-- which is what makes it that generation's, since the recorder does not check
+-- that the image a pass is given belongs to the frame's generation.
 --
 -- This module owns no state: the set of depth images of generations lives in
 -- the recording's state, written here when a depth image is made and by the

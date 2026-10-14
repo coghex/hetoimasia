@@ -549,8 +549,12 @@ data UploadState
     -- it.
   | UploadCancelled
     -- ^ Cancelled before any copy was recorded — by its caller, its target's
-    -- release, or the owner's exit — or left unfinished by the exit. Its
-    -- target was not initialized by it.
+    -- release, or the owner's exit: its target was not touched, was not
+    -- initialized by it, and may be uploaded into again. It is also what an upload
+    -- that had started settles as when the owner exits ('retireUploads'), left
+    -- unfinished: part of its target may already have been written, so the target
+    -- is not initialized by it either, and is not eligible for another upload.
+    -- 'cancelUpload' only ever makes the first kind.
   | UploadLost
     -- ^ The device was lost before it completed.
   deriving (Eq, Show)

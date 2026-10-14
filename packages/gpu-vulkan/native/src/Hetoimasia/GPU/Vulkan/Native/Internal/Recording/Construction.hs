@@ -299,13 +299,6 @@ createPipelineWithDepth
   ∷ Recording q inst msgr phys dev cmd → PipelineLayout → PipelineShaders → Word32 → VertexInput → PipelineDepth → IO (Either Refusal Pipeline)
 createPipelineWithDepth recording layout shaders format input depth = buildPipeline recording layout shaders format input BlendNone (Just depth) Nothing
 
--- | The depth-only format the backend will use for depth targets and the
--- pipelines that render with them (GRS-10, D-36): the first of
--- 'depthFormatPreference' — 32-bit floating point, then the other depth-only
--- formats — that the device supports as a depth attachment. The device is
--- asked about each in turn and none is assumed; no format with a stencil
--- aspect is ever offered. A device that supports none is
--- 'RefusedImageUnsupported'.
 -- | The format a live image of this session was made with, which a caller's
 -- own account of it cannot be trusted to give (R2D-9): a released, replaced or
 -- foreign handle is the refusal 'liveNative' gives, and a handle that is not an
@@ -319,6 +312,13 @@ imageFormatOf recording (Image resource) =
       Right _ → pure (Left RefusedWrongKind)
       Left refusal → pure (Left refusal)
 
+-- | The depth-only format the backend will use for depth targets and the
+-- pipelines that render with them (GRS-10, D-36): the first of
+-- 'depthFormatPreference' — 32-bit floating point, then the other depth-only
+-- formats — that the device supports as a depth attachment. The device is
+-- asked about each in turn and none is assumed; no format with a stencil
+-- aspect is ever offered. A device that supports none is
+-- 'RefusedImageUnsupported'.
 selectDepthFormat ∷ Recording q inst msgr phys dev cmd → IO (Either Refusal ImageFormat)
 selectDepthFormat recording = owned recording (choose depthFormatPreference)
   where
