@@ -18,7 +18,8 @@ module Test.Render.TwoD.Vulkan.Windows (spec) where
 
 import Control.Concurrent.STM (atomically, readTVarIO, writeTVar)
 import Control.Exception (AsyncException (ThreadKilled), try)
-import Data.Foldable (toList)
+import Data.Foldable (for_, toList)
+import Data.IORef (newIORef, readIORef)
 import Data.List.NonEmpty (NonEmpty ((:|)))
 import qualified Data.Set as Set
 import qualified Data.Text as Text
@@ -38,6 +39,7 @@ import Hetoimasia.Render.TwoD.Vulkan.Textures
 import Hetoimasia.Render.TwoD.Vulkan.Window
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
 import Test.Render.TwoD.Vulkan.Environment
+import Test.Render.TwoD.Vulkan.Evaluated (unevaluatedParts)
 import Test.Render.TwoD.Vulkan.StandIn
 
 spec ∷ Spec
@@ -179,6 +181,110 @@ publishSpec = describe "publishing a snapshot" $ do
       new ← registered env 2 True DefaultMark
       publish2DSnapshot (envAdapter env) 1 (windowSnapshot [old]) >>= (`shouldBe` Left (TextureReleasedInSnapshot old))
       publish2DSnapshot (envAdapter env) 1 (windowSnapshot [new]) >>= (`shouldBe` Right 1)
+
+  it "refuses a stale handle whose release was never marked, and the marked current generation, while the live generation publishes" $
+    withEnv [1] $ \env → do
+      let sameIndex a b = ApiBackend.handleIndex a `shouldBe` ApiBackend.handleIndex b
+          refused handle = publish2DSnapshot (envAdapter env) 1 (windowSnapshot [handle]) >>= (`shouldBe` Left (TextureReleasedInSnapshot handle))
+      -- generation 1: released directly in the table, never marked
+      g1 ← registered env 1 True DefaultMark
+      releaseTextureNow (builders (envRig env)) (envTextures env) g1 >>= either (fail . show) pure
+      -- generation 2 at the reused index: marked, then released behind the host's barrier
+      g2 ← registered env 2 True DefaultMark
+      sameIndex g1 g2
+      g2 `shouldSatisfy` (/= g1)
+      release2DTexture (envAdapter env) g2 >>= (`shouldBe` Right ())
+      _ ← runQueued env
+      -- before generation 3 exists: generation 2 is refused as the marked current
+      -- generation and generation 1 as stale, though it was never marked
+      refused g2
+      refused g1
+      atomically (mapM (isReleased (envTextures env)) [g1, g2]) >>= (`shouldBe` [True, True])
+      -- generation 3 is the live one; both earlier generations stay refused
+      g3 ← registered env 3 True DefaultMark
+      sameIndex g2 g3
+      refused g1
+      refused g2
+      atomically (isReleased (envTextures env) g3) >>= (`shouldBe` False)
+      publish2DSnapshot (envAdapter env) 1 (windowSnapshot [g3]) >>= (`shouldBe` Right 1)
+      -- a swap of the stale handles is refused as unknown, as the table release removed their marks
+      image ← uploadedTexture (envRig env) (bytesOf 4)
+      stale ← swapTexture (builders (envRig env)) (envTextures env) g1 image (decodedWith True) RefuseMarkChange
+      either Just (const Nothing) stale `shouldBe` Just (TextureUnknown g1)
+
+  it "keeps the whole retained state evaluated through every write path, so no entry holds a closure over an image, a handle or an earlier ledger" $
+    withEnv [1] $ \env → do
+      let wholeState ∷ String → IO ()
+          wholeState step = do
+            stored ← currentLedger (envTextures env)
+            unevaluatedParts stored >>= \parts → (step, parts) `shouldBe` (step, [])
+          direct handle = releaseTextureNow (builders (envRig env)) (envTextures env) handle >>= either (fail . show) pure
+      wholeState "empty"
+      -- the default registration path: the mark is computed from the decoded image
+      binary ← registered env 1 True DefaultMark
+      wholeState "default registration, binary alpha"
+      plain ← registered env 2 False DefaultMark
+      wholeState "default registration, not binary"
+      forced ← registered env 3 False (OverrideMark True)
+      wholeState "override registration"
+      -- the deferred mark and the table release of a marked handle
+      release2DTexture (envAdapter env) binary >>= (`shouldBe` Right ())
+      wholeState "marked release"
+      _ ← runQueued env
+      wholeState "table release of a marked handle"
+      -- a direct release that was never marked
+      direct plain
+      wholeState "unmarked direct release"
+      -- a swap, accepted and refused, changes no state
+      replacement ← uploadedTexture (envRig env) (bytesOf 9)
+      _ ← swapTexture (builders (envRig env)) (envTextures env) forced replacement (decodedWith True) RefuseMarkChange
+      wholeState "accepted swap"
+      _ ← swapTexture (builders (envRig env)) (envTextures env) binary replacement (decodedWith True) RefuseMarkChange
+      wholeState "refused swap of a handle whose mark is gone"
+      -- registrations and unmarked direct releases with no read between them
+      for_ [1 .. 1000 ∷ Int] $ \n → do
+        handle ← registered env (fromIntegral (n `mod` 200) + 1) (even n) DefaultMark
+        direct handle
+      wholeState "a thousand unmarked direct-release cycles"
+      retainedEntries (envTextures env) >>= (`shouldSatisfy` (<= 4))
+
+  it "reports what is not evaluated: a computation over an earlier value is found inside a constructor" $ do
+    ref ← newIORef (1 ∷ Int)
+    lazy ← (+ 1) <$> readIORef ref
+    unevaluatedParts (Just lazy) >>= (`shouldSatisfy` (not . null))
+    unevaluatedParts (Just (3 ∷ Int)) >>= (`shouldBe` [])
+
+  it "retains release state bounded by the indices registered at, however many textures are registered and released" $
+    withEnv [1] $ \env → do
+      let cycles = 1000 ∷ Int
+          kept = 3
+          oneCycle n = do
+            handle ← registered env (fromIntegral (n `mod` 200) + 1) (even n) DefaultMark
+            if n > cycles - kept
+              then pure ()
+              else
+                if even n
+                  then release2DTexture (envAdapter env) handle >>= (`shouldBe` Right ()) >> (runQueued env >>= (`shouldBe` [Right ()]))
+                  else releaseTextureNow (builders (envRig env)) (envTextures env) handle >>= either (fail . show) pure
+            pure handle
+      first ← oneCycle 1
+      afterFirst ← retainedEntries (envTextures env)
+      afterFirst `shouldBe` 1
+      rest ← mapM oneCycle [2 .. cycles]
+      let handles = first : rest
+          released = take (cycles - kept) handles
+          live = drop (cycles - kept) handles
+          indices = Set.fromList (map ApiBackend.handleIndex handles)
+      -- the table reuses the indices, so far fewer indices than registrations are in play
+      Set.size indices `shouldSatisfy` (<= kept + 1)
+      -- the state is one entry per index registered at, and no more
+      retainedEntries (envTextures env) >>= (`shouldBe` Set.size indices)
+      -- every released handle, marked or not, stale or the marked current one, is reported released
+      atomically (mapM (isReleased (envTextures env)) released) >>= (`shouldBe` replicate (cycles - kept) True)
+      -- and refused at publication; the live ones are not and publish
+      mapM_ (\handle → publish2DSnapshot (envAdapter env) 1 (windowSnapshot [handle]) >>= (`shouldBe` Left (TextureReleasedInSnapshot handle))) released
+      atomically (mapM (isReleased (envTextures env)) live) >>= (`shouldBe` replicate kept False)
+      mapM_ (\handle → publish2DSnapshot (envAdapter env) 1 (windowSnapshot [handle]) >>= (`shouldSatisfy` either (const False) (const True))) live
 
   it "names a window the host does not hold" $
     withEnv [1] $ \env → do

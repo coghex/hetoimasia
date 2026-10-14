@@ -28,8 +28,10 @@
 --    snapshot with none is unaffected on any device);
 -- 5. naming the instance when it names a material the renderer did not issue
 --    ('MaterialNotIssuedInSnapshot', R2D-11);
--- 6. naming the texture when it references one whose release has been requested
---    ('TextureReleasedInSnapshot'), and the chunk likewise
+-- 6. naming the texture when it references one the registry reports released
+--    ('TextureReleasedInSnapshot'): one whose release has been requested, or a
+--    stale handle of an index since reused, whether or not its release was
+--    requested (GUIDE-5); and the chunk likewise
 --    ('ChunkReleasedInSnapshot');
 -- 7. naming the chunk when it lists one whose upload ended without completing
 --    ('ChunkUploadFailedInSnapshot', R2D-10);
@@ -402,7 +404,11 @@ data PublishRefusal
     -- 'Nothing' when it offers none. A layer is never degraded to a
     -- lower-precision depth.
     WorldDepthRefused !Location !(Maybe ImageFormat)
-  | -- | The snapshot references this texture, whose release was requested.
+  | -- | The snapshot references this texture, which the registry reports
+    -- released: its release was requested and it is still its index's
+    -- current handle, or it is stale, a handle of an index that has since
+    -- been registered at under another generation, whether or not its
+    -- release was requested (GUIDE-5).
     TextureReleasedInSnapshot !Api.TextureHandle
   | -- | The snapshot lists this chunk, whose release was requested.
     ChunkReleasedInSnapshot !ChunkRef
