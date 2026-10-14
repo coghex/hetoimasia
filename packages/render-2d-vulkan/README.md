@@ -111,7 +111,7 @@ Everything that can refuse is decided first, in `frameWork`, which is pure:
 | `PlanDisagrees location` | the plan's layers and the snapshot's do not pair (planning the same snapshot never produces it) |
 | `ClipNotRepresentable pass view` | a drawing view whose layers select clips has a scissor and an inverse transform for which the clip test's layer-space offsets could overflow a float (below) |
 | `ClipTablesTooLarge bytes window` | the batch's packed clip tables (below) are `bytes` long, and the window is only `window` bytes |
-| `MaterialNotIssued location material` | an instance, or an instance of a chunk a layer lists, names a material the session did not issue, whether another session's reference or one `materialRef` built (the built-in default is every session's) |
+| `MaterialNotIssued location material` | an instance, or an instance of a chunk a layer lists, names a material the session did not issue, whether another session's reference or one `materialRef` built (the built-in default is every session's); a chunk is checked by its material set, and scanned only to name the first instance that uses a refused material |
 | `MaterialFactsDisagree location named issued` | an instance names a reference with the identity of a material the session issued but other facts than it was issued with |
 | `RecordsTooLarge bytes window` | the batch's whole region, its clip tables and its material records, is `bytes` long and the window is only `window` bytes |
 | `FrameTablesNotRepresentable pass view bytes` | the frame tables a drawing view holds (R2D-18, [below](#frame-tables-r2d-18)) pack into a block of `bytes` bytes in which a size, an offset or a header value does not fit its 32-bit word |
@@ -385,7 +385,14 @@ names a reference the renderer did not issue, or one with an issued identity and
 other facts, is refused by `prepareSnapshot` before anything is recorded
 (`MaterialNotIssued`, `MaterialFactsDisagree`) and by `publish2DSnapshot`
 (`MaterialNotIssuedInSnapshot`), naming the instance; a material is never
-released, so nothing holds one. A chunk's record handles are among its textures
+released, so nothing holds one. Both checks are `unissuedMaterial`, which checks a
+chunk a layer lists by the set of materials its build recorded, not by its
+instances: a snapshot whose chunks use only issued materials costs the dynamic
+instances plus the distinct materials of each chunk listed (a lookup each), however
+many instances the chunks retain, and only a chunk whose set holds a refused
+material is scanned, in build order, to name the earliest instance that uses one.
+The answer is the scan of every instance's, the same refusal at the same location;
+the bound is this check's, not publication's or rendering's as a whole. A chunk's record handles are among its textures
 and a view's among its snapshot's, so an adopted revision holds them and a
 snapshot that names a texture whose release was requested in a record is refused,
 as it is for an instance's.
