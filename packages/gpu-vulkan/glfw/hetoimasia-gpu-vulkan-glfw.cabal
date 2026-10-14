@@ -151,6 +151,7 @@ test-suite vulkan-native-tests
     other-modules:
         Test.GPU.Vulkan.Native.Capture
         Test.GPU.Vulkan.Native.Child
+        Test.GPU.Vulkan.Native.ChildSpec
         Test.GPU.Vulkan.Native.Composed
         Test.GPU.Vulkan.Native.Compositor
         Test.GPU.Vulkan.Native.ConnectionLoss
