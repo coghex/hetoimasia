@@ -35,7 +35,10 @@
 -- the renderer is handed the scene of the window it renders, and the host's
 -- 'SceneLifecycle' hears when a target adopts a revision and when one may be
 -- let go. 'requestVulkanRelease' queues an owner-thread action that waits for
--- the revisions the owner must have adopted first, and 'readVulkanSceneState'
+-- the revisions the owner must have adopted first, under a bound of its own
+-- ('vulkanReleaseCapacity', refusing with 'ReleaseQueueFull'), and a host that
+-- declares its initial scene holds nothing ('vulkanInitialSceneHoldsNothing')
+-- is not held by a window that has never published; 'readVulkanSceneState'
 -- reads it all. A shared host, the default, is unchanged.
 --
 -- The renderer is the consumer's (VK-19). Each frame's 'FrameRequest' names
@@ -83,6 +86,7 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , VulkanDeviceStart (..)
   , vulkanHostConfig
   , defaultActionCapacity
+  , defaultReleaseCapacity
   , ValidationFeature (..)
   , VulkanHost (..)
   , NativeObserver (..)
@@ -352,6 +356,7 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , awaitVulkanAction
   , noSceneLifecycle
   , defaultActionCapacity
+  , defaultReleaseCapacity
   , readVulkanAction
   , Constructed
   , constructBuffer
@@ -554,11 +559,28 @@ submitVulkanAction host = Controller.submitVulkanAction (vulkanController host)
 
 -- | Hand this host's owner a release request (D-28): an owner-thread action,
 -- admitted and refused as 'submitVulkanAction' admits and refuses one, that
--- runs only once every window the host held a scene for has adopted the
--- revision that was current when the request was made, or a later one, or has
--- ended. Windows that appear later do not delay it; requests run in the order
--- they were made; one whose condition is already met runs at the next owner
--- step.
+-- runs only once the windows it waits for have adopted the revision that was
+-- current when the request was made, or a later one, or have ended.
+--
+-- It is counted against 'vulkanReleaseCapacity', not 'vulkanActionCapacity':
+-- one made when that bound is full is refused at once with 'ReleaseQueueFull',
+-- release requests never cause 'submitVulkanAction' to be refused, and actions
+-- never cause a release request to be. A request counts until the owner takes
+-- it, however empty or met its barrier.
+--
+-- It waits for every window the host holds, whether or not the window has a
+-- target, because a target attached later adopts the scene the window holds.
+-- A host that sets 'vulkanInitialSceneHoldsNothing' declares its initial scene
+-- references nothing a release frees, and then a window whose latest revision
+-- is 0 (in a per-window host, one with no publication; in a shared host, every
+-- window while the shared scene is unpublished) is not waited for. A published
+-- window with no live target is still waited for, and holds every later
+-- request until a target of it adopts that revision or the window is dropped;
+-- 'readVulkanSceneState' shows that through the request's barrier and the
+-- window's adopted revision, and resolving it, by attaching a target or
+-- closing the window, is the application's. Windows that appear later do not
+-- delay it; requests run in the order they were made; one whose condition is
+-- already met runs at the next owner step.
 requestVulkanRelease ∷ VulkanHost scene → VulkanAction r → STM (Either ActionRefusal (ActionTicket r))
 requestVulkanRelease host = Controller.requestVulkanRelease (vulkanController host)
 

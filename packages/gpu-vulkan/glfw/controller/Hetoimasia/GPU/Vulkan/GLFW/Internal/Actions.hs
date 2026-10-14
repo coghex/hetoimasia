@@ -13,8 +13,11 @@
 --
 -- Admission is one transaction that never waits: it refuses at once, with the
 -- reason, when the session has failed or the owner's admission has closed, when
--- no device exists yet, or when the queue already holds its capacity.
--- Admitted, an action is queued, and its ticket is the caller's only handle on
+-- no device exists yet, or when the queue already holds its capacity for the
+-- admission's class: an action is counted against the action capacity alone,
+-- and a release request against the release capacity alone (see below). Those
+-- refusals come in that order, so a failed session, a closed owner or a missing
+-- device is reported before a full queue. Admitted, an action is queued, and its ticket is the caller's only handle on
 -- it; waiting for the outcome is the caller's explicit choice.
 --
 -- An action starts when the owner takes it, in one transaction that asks the
@@ -35,8 +38,16 @@
 -- runs (D-28). It is admitted exactly as an action is — one transaction that
 -- never waits, refused at once for a failed session, a closed owner, a missing
 -- device or a full queue, and settled as refused if it is still queued when the
--- owner's exit begins — and it shares the queue and its capacity. What differs
--- is when it starts: the queue is in the order requests were made, and a
+-- owner's exit begins — and it shares the queue, though not its capacity: the
+-- release requests the queue holds are bounded by a capacity of their own, and
+-- one admitted when that bound is full is refused at once with
+-- 'ReleaseQueueFull'. Each capacity bounds the queued entries of its own class,
+-- so release requests never cause an action to be refused ('ActionQueueFull')
+-- and actions never cause a release request to be. A release request is
+-- counted from its admission, whether or not its barrier is empty or already
+-- met, until the owner takes it; one the owner is running no longer occupies a
+-- slot, and a capacity of zero refuses its class at once. What differs is when
+-- it starts: the queue is in the order requests were made, and a
 -- release request starts only when its barrier is met and no earlier release
 -- request is still queued, so release requests run in the order they were
 -- made. An action with no barrier is never held back by one that has, and a
@@ -82,6 +93,7 @@ import Control.Concurrent.STM (STM, TVar, newTVar, newTVarIO, readTVar, retry, w
 import Control.Exception (ExceptionWithContext, SomeException)
 import Data.Foldable (for_, toList)
 import Data.Map.Strict (Map)
+import Data.Maybe (isJust)
 import Data.Sequence (Seq, ViewL (..), viewl, (|>))
 import qualified Data.Sequence as Seq
 import Hetoimasia.GLFW.Window (WindowId)
@@ -109,7 +121,12 @@ newtype VulkanAction r = VulkanAction
 -- | Why an action was refused. A refused action never ran.
 data ActionRefusal
   = ActionQueueFull
-    -- ^ The queue already holds its capacity. Nothing waited for room.
+    -- ^ The queue already holds as many actions as its action capacity allows.
+    -- Nothing waited for room, and release requests never count toward it.
+  | ReleaseQueueFull
+    -- ^ The queue already holds as many release requests as its release
+    -- capacity allows. Nothing waited for room, and actions never count toward
+    -- it. Only a release request is refused with this.
   | ActionDeviceNotReady
     -- ^ The session has no device yet: its owner has not started, or — with
     -- the device made at the first window's admission — no window has been
@@ -182,6 +199,9 @@ data Entry = ∀ r. Entry !(TVar (Standing r)) !(VulkanAction r) !(Maybe Barrier
 data Actions = Actions
   { actionsQueue ∷ !(TVar (Seq Entry))
   , actionsCapacity ∷ !Natural
+    -- ^ How many actions with no barrier the queue may hold.
+  , actionsReleaseCapacity ∷ !Natural
+    -- ^ How many release requests the queue may hold, whatever their barriers.
   , actionsGate ∷ STM (Maybe ActionRefusal)
     -- ^ Whether an action may be admitted or started now: 'Nothing', or the
     -- refusal — a failed session, a closed owner.
@@ -189,10 +209,11 @@ data Actions = Actions
     -- ^ Whether a release request's barrier is met now.
   }
 
--- | An empty queue holding at most this many actions, gated by this, whose
--- release requests wait on barriers that are met when this says so.
-newActions ∷ Natural → STM (Maybe ActionRefusal) → (Barrier → STM Bool) → IO Actions
-newActions capacity gate met = (\queue → Actions queue capacity gate met) <$> newTVarIO Seq.empty
+-- | An empty queue holding at most the first many actions and the second many
+-- release requests, gated by this, whose release requests wait on barriers that
+-- are met when this says so.
+newActions ∷ Natural → Natural → STM (Maybe ActionRefusal) → (Barrier → STM Bool) → IO Actions
+newActions capacity releaseCapacity gate met = (\queue → Actions queue capacity releaseCapacity gate met) <$> newTVarIO Seq.empty
 
 -- | Admit one action, given whether the session's device exists, or refuse it
 -- at once. It never waits.
@@ -200,7 +221,8 @@ admitAction ∷ Actions → Bool → VulkanAction r → STM (Either ActionRefusa
 admitAction actions device = admitWith actions device Nothing
 
 -- | Admit one release request, given whether the session's device exists, as
--- 'admitAction' admits an action. The barrier is read in the same transaction
+-- 'admitAction' admits an action, against the release capacity instead of the
+-- action capacity ('ReleaseQueueFull'). The barrier is read in the same transaction
 -- that queues the request, after the gate and the capacity have been
 -- consulted, so what it names is exactly what was published and which windows
 -- were held when the request took its place in the queue.
@@ -215,8 +237,12 @@ admitWith actions device barrier action =
       | not device → pure (Left ActionDeviceNotReady)
       | otherwise → do
           queue ← readTVar (actionsQueue actions)
-          if fromIntegral (Seq.length queue) >= actionsCapacity actions
-            then pure (Left ActionQueueFull)
+          let (capacity, refusal) = case barrier of
+                Nothing → (actionsCapacity actions, ActionQueueFull)
+                Just _ → (actionsReleaseCapacity actions, ReleaseQueueFull)
+              sameClass (Entry _ _ held) = isJust held == isJust barrier
+          if fromIntegral (length (filter sameClass (toList queue))) >= capacity
+            then pure (Left refusal)
             else do
               held ← traverse id barrier
               standing ← newTVar Queued

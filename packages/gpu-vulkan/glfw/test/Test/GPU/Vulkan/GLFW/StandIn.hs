@@ -109,6 +109,8 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , newRigOf
   , surfaceFreeRig
   , withActionCapacity
+  , withReleaseCapacity
+  , withInitialSceneHoldsNothing
   , withUploads
   , withWindowDepth
   , capturingRigOf
@@ -239,6 +241,7 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , VulkanDeviceStart (..)
   , SceneLifecycle (..)
   , defaultActionCapacity
+  , defaultReleaseCapacity
   , handOverVulkanTarget
   , readReadiness
   , vulkanHostConfig
@@ -1440,6 +1443,10 @@ data Rig = Rig
     -- ^ When the host creates the session's device.
   , rigActionCapacity ∷ !Natural
     -- ^ How many owner-thread actions may be queued at once.
+  , rigReleaseCapacity ∷ !Natural
+    -- ^ How many release requests may be queued at once.
+  , rigInitialSceneHoldsNothing ∷ !Bool
+    -- ^ Whether the host declares its initial scene holds nothing a release frees.
   , rigUploads ∷ !(Maybe UploadConfig)
   , rigWindowDepth ∷ !Bool
     -- ^ Whether the host asked for windowed depth (GRS-13).
@@ -1485,6 +1492,15 @@ surfaceFreeRig count = (\rig → rig {rigDeviceStart = DeviceSurfaceFree}) <$> n
 -- | The same rig with this many owner-thread actions queued at once.
 withActionCapacity ∷ Natural → Rig → Rig
 withActionCapacity capacity rig = rig {rigActionCapacity = capacity}
+
+-- | The same rig with this many release requests queued at once.
+withReleaseCapacity ∷ Natural → Rig → Rig
+withReleaseCapacity capacity rig = rig {rigReleaseCapacity = capacity}
+
+-- | The same rig whose host declares its initial scene references nothing a
+-- release request releases, so a never-published window is not waited for.
+withInitialSceneHoldsNothing ∷ Rig → Rig
+withInitialSceneHoldsNothing rig = rig {rigInitialSceneHoldsNothing = True}
 
 -- | The same rig with a scene for each window.
 withPerWindowScenes ∷ Rig → Rig
@@ -1763,6 +1779,8 @@ newRigClocked visible windows clock = do
       , rigFrameHook = frameHook
       , rigDeviceStart = DeviceAtFirstSurface
       , rigActionCapacity = defaultActionCapacity
+      , rigReleaseCapacity = defaultReleaseCapacity
+      , rigInitialSceneHoldsNothing = False
       , rigUploads = Nothing
       , rigWindowDepth = False
       , rigSession = session
@@ -1802,6 +1820,8 @@ runRigHere rig body = myThreadId >>= \self → withBoundThread (rigBound rig) se
                   renderScene chosen current request construction recorder
           , vulkanDeviceStart = rigDeviceStart rig
           , vulkanActionCapacity = rigActionCapacity rig
+          , vulkanReleaseCapacity = rigReleaseCapacity rig
+          , vulkanInitialSceneHoldsNothing = rigInitialSceneHoldsNothing rig
           , vulkanUploads = rigUploads rig
           , vulkanWindowDepth = rigWindowDepth rig
           , vulkanSceneMode = rigSceneMode rig
