@@ -88,12 +88,19 @@ spec = describe "a bounded child launcher" $ do
 -- end of file, which an escaped writer never supplies, fails the example instead
 -- of hanging the run. The bound is a failure bound, not a performance threshold.
 bounded ∷ IO a → IO a
-bounded action = timeout 60000000 action >>= maybe (fail "the launch did not return within a minute") pure
+bounded = boundedBy "the launch did not return within a minute"
 
--- | Both parent-side handles closed and both readers finished.
+boundedBy ∷ String → IO a → IO a
+boundedBy complaint action = timeout 60000000 action >>= maybe (fail complaint) pure
+
+-- | Both parent-side handles closed and both readers finished. A handle's state
+-- is read under its lock, which a reader still blocked on it holds, so a launch
+-- that left a reader running answers this by never answering: that fails the
+-- example here, by the bound, rather than hanging the run.
 reclaimed ∷ Child.Owned → IO ()
 reclaimed owned = do
-  mapM hIsClosed (Child.ownedHandles owned) `shouldReturn` [True, True]
+  closed ← boundedBy "a pipe handle's state was never answered: a reader still holds it" (mapM hIsClosed (Child.ownedHandles owned))
+  closed `shouldBe` [True, True]
   atomically (sequence (Child.ownedReadersFinished owned)) `shouldReturn` [True, True]
 
 -- | A direct child that leaves a descendant in a session of its own holding
