@@ -63,6 +63,15 @@
 # group run from the same checkout. Recreating it with the same toolchain
 # writes the same bytes, which is all a warm build compares.
 #
+# That removal ignores TERM, INT and HUP for its whole duration, before it does
+# anything else. The validation runner signals every member of a stage's session
+# at its expiry and, during the grace that follows, every member it first sees
+# in that grace, which includes the `rm` and `rmdir` the removal starts; an
+# ignored disposition is inherited by them, so a signal that arrives while it
+# runs neither ends it early nor leaves a generated fingerprint in the checkout.
+# The exit status is unchanged by it. A removal that hangs is still frozen and
+# killed after the grace, by the runner.
+#
 # `HETOIMASIA_VMA_FOREIGN_CALLS` chooses the call safety of the Hackage
 # `VulkanMemoryAllocator` binding's Haskell imports, which only the allocator
 # probe calls (GRS-18, #361); the native backend links the VMA that package
@@ -232,8 +241,10 @@ generate_fingerprint() {
     fi
   done
   if [ -n "$cleanup" ]; then
+    # The removal protects itself and the commands it starts from the signals a
+    # stage's expiry sends, first of all.
     # shellcheck disable=SC2064
-    trap "$cleanup" EXIT
+    trap "trap '' TERM INT HUP; $cleanup" EXIT
   fi
   "$HETOIMASIA_GLSLANG" --hetoimasia-identity | sed 's/^/vulkan: glslang wrapper reports /'
   for fingerprint in "${fingerprints[@]}"; do

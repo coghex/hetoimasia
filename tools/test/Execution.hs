@@ -504,21 +504,42 @@ spec = describe "Validation execution" $ do
           `shouldBe` Just ["evidence/probe.evidence/display.log", "evidence/probe.evidence/setup.log"]
         readFile (receiptsDirectory fixture </> "evidence/probe.evidence/display.log") `shouldReturn` "retained\n"
 
-    it "lets a termination handler finish cleanup that starts a subprocess" $
+    it "lets a cleanup that ignores TERM finish the child the grace tells to stop" $
       withFixture $ \fixture → do
-        -- The handler puts SIGTERM back to its default, as the display helpers
-        -- do, and runs a cleanup child. That child is a member the watchdog
-        -- finds only after the signal: it is told to stop on its own, and the
-        -- handler, already signalled once, is not signalled again — a second
-        -- SIGTERM would kill it before it retained anything.
+        -- The cleanup is the helpers' shape: an EXIT trap that ignores TERM, INT
+        -- and HUP before it starts anything. Its child is a member the watchdog
+        -- finds only after the first signal and tells to stop, and the example
+        -- reads that this happened (the witness, told in the same grace, recorded
+        -- it) before it reads the result: the child inherited the ignored
+        -- disposition, ran to completion, and its success is what the cleanup
+        -- retained. A killed child retains `stopped`; nothing retains `cleaned`
+        -- unless the child finished.
         plan ← planRequesting fixture ["probe.cleanup"]
         (result, _, _) ← runGroup fixture "probe.cleanup" plan []
         result `shouldBe` ExitFailure 1
         receipt ← readReceipt fixture "probe.cleanup"
         stringField receipt "outcome" `shouldBe` Just "timeout"
-        numberField receipt "exit_status" `shouldBe` Just 0
         (receipt >>= field "expiry" >>= field "killed" >>= asBool) `shouldBe` Just False
+        readFile' (receiptsDirectory fixture </> "evidence/probe.cleanup/told") `shouldReturn` "told\n"
         readFile' (receiptsDirectory fixture </> "evidence/probe.cleanup/cleaned") `shouldReturn` "cleaned\n"
+        doesFileExist (receiptsDirectory fixture </> "evidence/probe.cleanup/stopped") `shouldReturn` False
+
+    it "tells a cleanup child that does not ignore TERM to stop, once, and leaves the cleanup running" $
+      withFixture $ \fixture → do
+        -- The same cleanup without the ignored disposition: the documented
+        -- behaviour, which pins what the ignoring is for. The witness was told, so
+        -- the grace reached the cleanup's members; the child was stopped by it, so
+        -- the cleanup retained `stopped`; and the shell running the cleanup was
+        -- not told a second time, or it would have retained nothing.
+        plan ← planRequesting fixture ["probe.cleanup-term"]
+        (result, _, _) ← runGroup fixture "probe.cleanup-term" plan []
+        result `shouldBe` ExitFailure 1
+        receipt ← readReceipt fixture "probe.cleanup-term"
+        stringField receipt "outcome" `shouldBe` Just "timeout"
+        (receipt >>= field "expiry" >>= field "killed" >>= asBool) `shouldBe` Just False
+        readFile' (receiptsDirectory fixture </> "evidence/probe.cleanup-term/told") `shouldReturn` "told\n"
+        readFile' (receiptsDirectory fixture </> "evidence/probe.cleanup-term/stopped") `shouldReturn` "stopped\n"
+        doesFileExist (receiptsDirectory fixture </> "evidence/probe.cleanup-term/cleaned") `shouldReturn` False
 
     it "binds the preparation into the plan's identity and the receipt's comparison" $
       withFixture $ \fixture → do
@@ -3211,27 +3232,12 @@ stagedGroupDocuments =
       "1"
       ["sh", "-c", "echo ran > \"$HETOIMASIA_VALIDATION_EVIDENCE/ran\""]
       "30"
-  , -- A stalled command whose termination handler runs a cleanup subprocess
-    -- under the default disposition and only then retains its evidence.
-    stagedGroupDocument
-      "probe.cleanup"
-      [ "python3"
-      , "-c"
-      , unlines
-          [ "import os, signal, subprocess, sys"
-          , "evidence = os.environ['HETOIMASIA_VALIDATION_EVIDENCE']"
-          , "def handler(number, frame):"
-          , "    signal.signal(signal.SIGTERM, signal.SIG_DFL)"
-          , "    subprocess.run(['sleep', '0.3'])"
-          , "    with open(evidence + '/cleaned', 'w') as record:"
-          , "        record.write('cleaned\\n')"
-          , "    sys.exit(0)"
-          , "signal.signal(signal.SIGTERM, handler)"
-          , "while True:"
-          , "    signal.pause()"
-          ]
-      ]
-      "1"
+  , -- A stalled command whose EXIT trap runs a cleanup child, in the helpers'
+    -- shell shape: the trap ignores TERM, INT and HUP before it starts anything,
+    -- so the child inherits the ignored disposition.
+    stagedGroupDocument "probe.cleanup" ["bash", "-c", cleanupScript True] "1"
+  , -- The same cleanup without the ignored disposition.
+    stagedGroupDocument "probe.cleanup-term" ["bash", "-c", cleanupScript False] "1"
   , -- A stalled command that keeps its diagnostics only in its own cleanup.
     stagedGroupDocument
       "probe.evidence"
@@ -3242,6 +3248,45 @@ stagedGroupDocuments =
       ]
       "1"
   ]
+
+-- | A stalled command whose EXIT trap runs a cleanup and decides what it retains
+-- from the cleanup child's own result, so that the evidence is the child's
+-- outcome and nothing else. The cleanup starts two children and waits for both:
+--
+-- * the protected child, which waits for the witness's receipt and succeeds only
+--   if it runs that far;
+-- * the witness, started right after it and left at the default disposition for
+--   TERM, which only the grace's signal to a member first seen in the grace can
+--   end. Its end is the event the example reads in place of elapsed time: the
+--   watchdog observed the cleanup's children and told them to stop. The
+--   protected child was started first, so it is observed no later than the
+--   witness and told in the same pass.
+--
+-- When the cleanup ignores TERM, INT and HUP first (the helpers' shape) the
+-- protected child inherits the ignored disposition, is told and survives, and the
+-- cleanup retains @cleaned@. When it does not, the same signal stops the child
+-- and the cleanup retains @stopped@; the shell running the cleanup, which was
+-- told once already, is not told again, or it would retain nothing. The wait for
+-- the witness is bounded by the grace itself: a runner that stopped telling
+-- fresh members would leave both waiting until they are killed.
+cleanupScript ∷ Bool → String
+cleanupScript ignoring =
+  unlines
+    [ "evidence=\"$HETOIMASIA_VALIDATION_EVIDENCE\""
+    , "cleanup() {"
+    , if ignoring then "  trap '' TERM INT HUP" else "  :"
+    , "  bash -c 'while [ ! -e \"$1/told\" ]; do sleep 0.05; done' protected \"$evidence\" &"
+    , "  protected=$!"
+    , "  ( trap - TERM; exec sleep 300 ) &"
+    , "  witness=$!"
+    , "  wait \"$witness\""
+    , "  echo told > \"$evidence/told\""
+    , "  if wait \"$protected\"; then echo cleaned > \"$evidence/cleaned\"; else echo stopped > \"$evidence/stopped\"; fi"
+    , "}"
+    , "trap cleanup EXIT"
+    , "sleep 300 &"
+    , "wait"
+    ]
 
 -- | The optional groups 'stagedGroupDocuments' declares, as a request names
 -- them.
@@ -3257,6 +3302,7 @@ stagedGroups =
   , "probe.regrouped-stubborn"
   , "probe.regrouped-prepared"
   , "probe.cleanup"
+  , "probe.cleanup-term"
   , "probe.evidence"
   ]
 

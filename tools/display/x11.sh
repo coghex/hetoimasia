@@ -38,6 +38,16 @@
 # diagnostics its cleanup would otherwise delete. The validation runner's
 # evidence directory is what `tools/vulkan/run.sh` names.
 #
+# The cleanup ignores TERM, INT and HUP for its whole duration, before it does
+# anything else. The validation runner signals every member of a stage's session
+# at its expiry and, during the grace that follows, every member it first sees
+# in that grace, which includes the `mkdir`, `cp` and `rm` this cleanup starts;
+# an ignored disposition is inherited by them, so a signal that arrives while it
+# runs neither ends it early nor kills the copy that retains the evidence or the
+# removal that leaves no scratch directory behind. The exit status stays what
+# the signal that started the cleanup, or the command, made it. A cleanup that
+# hangs is still frozen and killed after the grace, by the runner.
+#
 # Exit status: the command's own once it ran; 1 when the display could not be
 # established, with the command never started; 2 for a usage error. See
 # docs/validation.md.
@@ -106,6 +116,9 @@ alive() {
 # started. Nothing here decides an outcome; the startup observations below do
 # that, on their own channels.
 stop() {
+  # First of all, before anything is started: the ignored disposition is what
+  # the copies and the removal below inherit.
+  trap '' TERM INT HUP
   local job
   for job in $(jobs -pr); do
     kill "$job" 2>/dev/null
@@ -128,7 +141,9 @@ trap stop EXIT
 # waits for the server's startup report leaves the server running and the
 # scratch directory behind, because the wait is what the shell dies in.
 terminate() {
-  trap - TERM INT HUP
+  # Ignored rather than restored to the default: a second signal while the
+  # cleanup runs must not end it where it stands.
+  trap '' TERM INT HUP
   echo "x11.sh: terminated by SIG$1; the X server is stopped and its scratch directory removed" >&2
   exit "$2"
 }
@@ -215,7 +230,9 @@ exec 8<>"$scratch/startup" || refuse "no startup-outcome channel could be opened
       halt
     done
   }
-  trap 'halt; settle; exit' TERM
+  # Ignoring the three signals comes first, so a second one neither interrupts
+  # the stop nor reaches what it starts.
+  trap 'trap "" TERM INT HUP; halt; settle; exit' TERM
   Xvfb -displayfd 3 -screen 0 1280x1024x24 -nolisten tcp >"$scratch/server.log" 2>&1 3>"$scratch/displayfd" 8>&- &
   server=$!
   # The report channel's own result, read by a process that does nothing else,
