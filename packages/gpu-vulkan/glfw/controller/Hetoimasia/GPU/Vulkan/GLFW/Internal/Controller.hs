@@ -258,6 +258,7 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , VulkanDeviceStart (..)
   , vulkanHostConfig
   , defaultActionCapacity
+  , defaultReleaseCapacity
   , VulkanHost (..)
   , withVulkanOwnerHostOver
   , withVulkanOwnerHostHooked
@@ -680,9 +681,11 @@ data Replacement obligation
 -- | A controller over a native layer and a surface bridge.
 --
 -- The device start says whether the owner's startup creates the device
--- without a surface, the capacity bounds the owner-thread actions queued at
--- once, and the upload configuration, if any, is the session's uploads'
--- (GRS-6). The layers are the ones the instance is asked to enable, each of
+-- without a surface, the first capacity bounds the owner-thread actions queued
+-- at once and the second the release requests, the flag declares that the
+-- initial scene references nothing a release request releases (so that a window
+-- still at it is left out of a request's barrier), and the upload
+-- configuration, if any, is the session's uploads' (GRS-6). The layers are the ones the instance is asked to enable, each of
 -- which the loader must offer, and the validation features are the ones its
 -- create info enables through them. The clock is the one the roots' model and the owner's
 -- deadlines read, which must be the host's; the period is how soon the owner
@@ -691,6 +694,8 @@ newVulkanController
   ∷ CaptureMode
   → VulkanDeviceStart
   → Natural
+  → Natural
+  → Bool
   → Maybe UploadConfig
   → Bool
   → RootOps Quiesced inst msgr phys dev
@@ -712,6 +717,8 @@ newVulkanControllerWith
   → CaptureMode
   → VulkanDeviceStart
   → Natural
+  → Natural
+  → Bool
   → Maybe UploadConfig
   → Bool
   → RootOps Quiesced inst msgr phys dev
@@ -725,11 +732,11 @@ newVulkanControllerWith
   → MonotonicSource
   → Duration
   → IO VulkanController
-newVulkanControllerWith hooks capture deviceStart capacity uploads windowDepth ops rendering observer pointer bridge layers validation budgets clock poll = do
+newVulkanControllerWith hooks capture deviceStart capacity releaseCapacity initialEmpty uploads windowDepth ops rendering observer pointer bridge layers validation budgets clock poll = do
   roots ← newRoots ops budgets clock
   ownerOpen ← newTVarIO (pure True)
-  scenes ← newScenes
-  actions ← newActions capacity (actionGate roots ownerOpen) (sceneBarrierMet scenes)
+  scenes ← newScenes initialEmpty
+  actions ← newActions capacity releaseCapacity (actionGate roots ownerOpen) (sceneBarrierMet scenes)
   -- Only a host built for verification capture plans its swapchains
   -- unclipped and as transfer sources; every other host's are the profile's.
   generations ← case capture of
@@ -1976,7 +1983,8 @@ takeVulkanCapture (VulkanController state) = takeCapture (stateCaptures state)
 -- | Hand the graphics owner a bounded action to run on its own thread with
 -- the session's 'Construction' (GRS-15), from any thread, answering a ticket
 -- to read its outcome with — or refusing it at once, with the reason: the
--- queue is full ('ActionQueueFull'), the session has no device yet
+-- queue already holds as many actions as 'vulkanActionCapacity' allows
+-- ('ActionQueueFull'; release requests never count toward it), the session has no device yet
 -- ('ActionDeviceNotReady'), the session has failed ('ActionSessionFailed'), or
 -- the owner's admission has closed ('ActionOwnerClosed'). Nothing waits for
 -- room. Admitted, it wakes an idle owner, which runs it in its next step, alone
@@ -1990,22 +1998,38 @@ submitVulkanAction (VulkanController state) action = do
   device ← isJust <$> readRootsDevice (stateRoots state)
   admitAction (stateActions state) device action
 
--- | Hand the graphics owner a release request (D-28): an owner-thread action,
--- admitted and refused exactly as 'submitVulkanAction' admits and refuses one,
+-- | Hand the graphics owner a release request (D-28): an owner-thread action
 -- that runs only once the owner has adopted the scene revisions that were
 -- current when it was made.
 --
+-- It is admitted and refused as 'submitVulkanAction' admits and refuses an
+-- action, with one difference: it is counted against the release capacity
+-- ('vulkanReleaseCapacity'), not the action capacity, and one made when that is
+-- full is refused at once with 'ReleaseQueueFull'. Release requests never cause
+-- 'submitVulkanAction' to be refused ('ActionQueueFull'), and actions never
+-- cause a release request to be. A request counts from its admission, however
+-- empty or met its barrier, until the owner takes it. Session, owner and device
+-- refusals come before a capacity refusal.
+--
 -- In the transaction that queues it, the request records the latest revision
--- published for each window that holds a scene the owner may yet adopt — a
--- window with a live target, or in a per-window host one that has had a
--- publication — so the windows it waits for, the revisions, and its place in
--- the order are one coherent fact however publications and windows change
--- around it. It runs in the owner's step once, for each of those windows, the
--- window has adopted that revision or a later one, or the host no longer holds
--- it. A window that appears later is not waited for. Release requests run in
--- the order they were made, and one whose condition is already met runs in the
--- owner's next step. An idle owner is woken when one becomes runnable, and is
--- not kept running by one that is not.
+-- published for each window the host holds, so the windows it waits for, the
+-- revisions, and its place in the order are one coherent fact however
+-- publications and windows change around it. A host that declared its initial
+-- scene holds nothing ('vulkanInitialSceneHoldsNothing') has every window whose
+-- latest revision is 0 left out: in a per-window host one with no publication,
+-- in a shared host every window while the shared scene is unpublished. Every
+-- other window is named, with or without a live target. The request runs in
+-- the owner's step once, for each window it names, the window has adopted that
+-- revision or a later one (a target that has ended counts for nothing), or the
+-- host no longer holds it. A published window with no live target therefore
+-- holds every later request until a target of it adopts that revision or the
+-- window is dropped; 'readVulkanSceneState' shows it, and resolving it, by
+-- attaching a target or closing the window, is the application's. A window that
+-- appears later is not waited for. Release requests run in the order they were
+-- made, an action with no barrier is never held back by one that has, and one
+-- whose condition is already met runs in the owner's next step. An idle owner
+-- is woken when one becomes runnable, and is not kept running by one that is
+-- not.
 --
 -- A request still queued when the owner's exit begins is settled as refused,
 -- as an action is, and never replayed.
@@ -2325,7 +2349,14 @@ data VulkanHostConfig scene = VulkanHostConfig
     -- admission, by default, or in the owner's startup without a surface.
   , vulkanActionCapacity ∷ !Natural
     -- ^ How many owner-thread actions may be queued at once; one more is
-    -- refused, never waited for.
+    -- refused ('ActionQueueFull'), never waited for. Release requests are not
+    -- counted: 'vulkanReleaseCapacity' bounds those.
+  , vulkanReleaseCapacity ∷ !Natural
+    -- ^ How many release requests ('requestVulkanRelease') may be queued at
+    -- once, counting each from its admission, whatever its barrier, until the
+    -- owner takes it; one more is refused ('ReleaseQueueFull'), never waited
+    -- for. Actions are not counted, so neither class of admission can starve
+    -- the other. A capacity of zero refuses every release request at once.
   , vulkanUploads ∷ !(Maybe UploadConfig)
     -- ^ The session's uploads (GRS-6): its staging buffer's size, the bytes
     -- its owner records into upload copies in one turn, and how many uploads
@@ -2356,6 +2387,21 @@ data VulkanHostConfig scene = VulkanHostConfig
     -- any other native call does. Each 'FrameRequest' names the image
     -- ('requestDepth'), so the renderer can begin its pass into the frame's
     -- image with it.
+  , vulkanInitialSceneHoldsNothing ∷ !Bool
+    -- ^ Whether the host declares that 'vulkanScene', the initial scene every
+    -- window holds until it is published, references nothing a release
+    -- request releases. 'False', by default: every release request waits for
+    -- every window the host holds, a window that has had no publication
+    -- included (revision 0), whether or not it has a target, since a target
+    -- attached later adopts the scene the window holds. When it is 'True' the
+    -- barrier a release request captures leaves out every window whose latest
+    -- revision is 0 — in a per-window host a window with no publication, in a
+    -- shared host every window while the shared scene is unpublished — so a
+    -- never-published, untargeted window no longer holds a request. Every
+    -- other window, a published one with no live target included, is named as
+    -- before, and what 'readVulkanSceneState' reports is unchanged. The
+    -- declaration is the host's to make true: a host whose initial scene
+    -- references something a release may free must leave it 'False'.
   }
 
 -- | When the session's one device is selected and created.
@@ -2375,15 +2421,21 @@ data VulkanDeviceStart
 defaultActionCapacity ∷ Natural
 defaultActionCapacity = 64
 
+-- | How many release requests 'vulkanHostConfig' lets be queued at once,
+-- apart from the actions.
+defaultReleaseCapacity ∷ Natural
+defaultReleaseCapacity = 64
+
 -- | A configuration with the given capture configuration and budgets, no
 -- layers or validation features, the owner's defaults, no observer, a
 -- renderer that clears every frame to opaque black, the device created at the
--- first window's admission, 'defaultActionCapacity', no uploads, one scene
--- shared by every window with a lifecycle that does nothing, and no windowed
--- depth.
+-- first window's admission, 'defaultActionCapacity' and
+-- 'defaultReleaseCapacity', no uploads, one scene shared by every window with a
+-- lifecycle that does nothing, no windowed depth, and no declaration that the
+-- initial scene holds nothing.
 vulkanHostConfig ∷ HostConfig → CaptureConfig → Budgets → Prepared scene → VulkanHostConfig scene
 vulkanHostConfig host capture budgets scene =
-  VulkanHostConfig host capture [] [] budgets scene id (const noObserver) (clearRenderer (\_ _ → ClearColor 0 0 0 1)) noFrameObserver DeviceAtFirstSurface defaultActionCapacity Nothing SharedScene noSceneLifecycle False
+  VulkanHostConfig host capture [] [] budgets scene id (const noObserver) (clearRenderer (\_ _ → ClearColor 0 0 0 1)) noFrameObserver DeviceAtFirstSurface defaultActionCapacity defaultReleaseCapacity Nothing SharedScene noSceneLifecycle False False
 
 -- | A running Vulkan graphics host.
 data VulkanHost scene = VulkanHost
@@ -2445,6 +2497,8 @@ withVulkanOwnerHostHooked hooks capturing logger layer rendering pointer bridge 
         capturing
         (vulkanDeviceStart config)
         (vulkanActionCapacity config)
+        (vulkanReleaseCapacity config)
+        (vulkanInitialSceneHoldsNothing config)
         (vulkanUploads config)
         (vulkanWindowDepth config)
         (observeRoots observer (layer capture))

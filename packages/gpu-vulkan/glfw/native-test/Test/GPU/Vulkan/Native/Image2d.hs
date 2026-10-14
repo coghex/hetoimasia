@@ -282,6 +282,9 @@ runImage2d backend journal = do
           , vulkanFrameObserver = \event → keep (Frame event)
           , vulkanSceneMode = PerWindowScenes
           , vulkanWindowDepth = windowDepth
+            -- The initial scene is 'blankScene', which references nothing a
+            -- release frees: a window that has not published holds no release.
+          , vulkanInitialSceneHoldsNothing = True
           , vulkanUploads = Just uploadConfig
           , vulkanDeviceStart = DeviceSurfaceFree
           , vulkanSceneLifecycle =
