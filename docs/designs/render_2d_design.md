@@ -607,7 +607,9 @@ references the handle.
 - An application's release of such an object takes effect only once the
   owner has adopted, for every window, the snapshot revision current when
   the release was requested, or a later one. So releasing something the
-  current snapshot still shows cannot race its rendering.
+  current snapshot still shows cannot race its rendering. A window still
+  holding the initial scene, which references nothing, holds nothing a release
+  waits for.
 - Publishing a snapshot that references an object already released is
   refused, naming the object.
 - Pressure — a full ring, or every lookup version held — skips the frame,
