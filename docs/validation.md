@@ -1561,7 +1561,9 @@ like a stalled setup does. At expiry the runner signals every process in the
 stage's session that it observes, and the group it was launched in, with
 `SIGTERM` first, so a command that keeps its diagnostics in its own cleanup — the
 display helper's server log, say — can retain them, then kills what survives the
-grace period, as the cleanup guarantee below states.
+grace period, as the cleanup guarantee below states. A cleanup protects itself
+and the commands it starts from those signals by ignoring `SIGTERM`, `SIGINT` and
+`SIGHUP` (what a command's cleanup must do, below).
 
 The boundary is the **session**, which the runner creates for the stage and
 whose identifier is the command's own process id. A descendant that moves into
@@ -1643,6 +1645,25 @@ weaker check:
   the session could not be read at the first signal, it is asked again for one
   second of elapsed time — not a count of attempts — and failing that only the
   launched process is told; the rest are told when they are first observed.
+- **What a command's cleanup must do (#450).** The contract above is unchanged:
+  every process created in the grace period is told to stop once, and that
+  includes the children a cleanup starts — the `mkdir`, `cp` and `rm` of a display
+  helper's `stop()`, the `rm` and `rmdir` of the Vulkan runner's fingerprint
+  removal. A cleanup therefore ignores `SIGTERM`, `SIGINT` and `SIGHUP` for its
+  whole duration, before it does anything else (`trap '' TERM INT HUP` in the
+  shell helpers): an ignored disposition is inherited across `fork` and `exec`, so
+  the signal still reaches the cleanup and its children — the runner tells them,
+  as it must — and none of them ends. Evidence is retained and scratch files are
+  removed, and the helper's exit status is the one the signal that started the
+  cleanup, or the command, gave it (143, 130, 129, or the command's own), however
+  many further signals arrive; that is also what makes a command that finishes near
+  its deadline safe, since its own cleanup may be running when the expiry's signal
+  arrives. A cleanup that does not ignore them has the child it started told to
+  stop, once, which is what the runner's tests pin beside the case that does. A
+  cleanup that hangs is still frozen and killed after the grace period, and
+  `killed` stays truthful. The helpers (`tools/display/x11.sh`,
+  `tools/display/wayland.sh`) and `tools/vulkan/run.sh` do this and say so in their
+  header comments.
 - Every other signal also goes to each remembered group and each remembered
   process. A process group lies wholly inside one session, so signalling it stays
   inside the stage; a group whose first process is still alive is signalled only
