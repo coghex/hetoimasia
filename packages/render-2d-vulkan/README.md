@@ -25,7 +25,8 @@ contract is [docs/gpu_backend.md](../../docs/gpu_backend.md).
 | `Hetoimasia.Render.TwoD.Vulkan` | re-exports `Builders`; `Configuration`, `defaultConfiguration`; `Renderer`, `makeRenderer`, `rendererDepthFormat`, `pipelineFor`, `pipelineForMaterial`, `pipelineDeclaration`, `registerMaterial`, `issuedMaterials`; `prepareSnapshot`, `FrameRecording`; re-exports `Hetoimasia.Render.TwoD.Vulkan.Frame`, `orderedShaders` and `cutoutShaders` |
 | `Hetoimasia.Render.TwoD.Vulkan.Builders` | `Builders`: the constructions the recorder and the registry need from a host: the ring with its storage-table window (the clip tables' and the material records'), the table, the storage table, the layout, a pipeline, and registering, swapping and releasing an uploaded texture; and making, filling (an upload admitted for a ticket) and releasing a device-local vertex buffer |
 | `Hetoimasia.Render.TwoD.Vulkan.Chunks` | the chunk registry: `Retained`, `newRetained`; `buildRetainedChunk`, `buildRetainedChunkWith` (a chunk that carries its own records), `BuildRefusal`; `ChunkStanding`, `chunkStanding`; `retainedChunks`, `retainedBuffers`, `chunkBufferOf`, `liveChunks`; the logical release marker (`markChunkReleased`, `isChunkReleased`) and `releaseChunkNow` |
-| `Hetoimasia.Render.TwoD.Vulkan.Textures` | `Textures`, `newTextures`; `registerTexture` with a `MarkPolicy`; `swapTexture` with a `SwapPolicy`; `TextureRefusal`; the logical release marker (`markReleased`, `isReleased`), `releaseTextureNow`; `registeredMark`, `registeredMarks` |
+| `Hetoimasia.Render.TwoD.Vulkan.Textures` | `Textures`, `newTextures`; `registerTexture` with a `MarkPolicy`; `swapTexture` with a `SwapPolicy`; `TextureRefusal`; the logical release marker (`markReleased`, `isReleased`), `releaseTextureNow`; `registeredMark`, `registeredMarks`, `retainedEntries`; `swapCheck` |
+| `Hetoimasia.Render.TwoD.Vulkan.Textures.Ledger` | the registry's pure state and release policy: `Ledger`, `registerHandle`, `forgetMark`, `markHandleReleased`, `handleReleased`, `markOf`, `markedCutouts`, `retainedEntries` |
 | `Hetoimasia.Render.TwoD.Vulkan.Window` | the host adapter: `Host`, `Adapter`, `newAdapter`; `Scene2D`, `blankScene`; `publish2DSnapshot`, `PublishRefusal`; `release2DTexture`, `release2DChunk`; `adapterAdopted`, `adapterReleased`, `retryReleases`, `textureHolds`, `chunkHolds`; `FrameInfo`, `renderWindowFrame`, `pendingChunkUploads`, `failedChunkUploads`; `RegionOverflow`, `regionOverflow`; `tablesRefusal` |
 | `Hetoimasia.Render.TwoD.Vulkan.Frame` | `Attachment`, `offscreenAttachment`, `TargetBinding`, `DepthBinding`, `FrameInput`; `depthLayers`, `requireWorldDepth`, `worldDepthShortfall`; `FrameRefusal`; `frameWork` and the work it computes: `PassWork`, `ViewWork`, `LayerWork`, `RunWork`, `RunReads`, `RunRecords`, `RecordKey`, `PipelineKind`, `runPipeline`; the clip region: `viewDraws`, `clipRegion`, `requireClipWindow`; the region with the material records: `recordRegion`, `RecordRegion`, `requireRegionWindow`; `unissuedMaterial` |
 | `Hetoimasia.Render.TwoD.Vulkan.Material` | `defineMaterial`, the Template Haskell splice; `MaterialDeclaration` (`declaredCutoutCapable`, `declaredRecord`, `declaredPush`, `declaredSource`), `PushField`, `PushType`, `PushOffset`, `RecordLayout`; `DefinedMaterial` (`definedFacts`, `definedPush`, `definedTranslucent`, `definedCutout`), `definedPushBytes`; the limits `applicationPushOffset`, `applicationPushLimit`, `maxRecordHandles`, `maxRecordWords` |
@@ -428,9 +429,37 @@ policy is `KeepRegisteredMark`, the caller's explicit statement that the
 rendering semantics did not change; the registered mark then stays. A genuine
 change of rendering semantics takes a new handle. The rule is checked **before
 the table is asked**, so a refusal of any kind — a mismatch, a handle never
-registered (`TextureUnknown`), a handle already released (`TextureReleased`) or
-the table's own — leaves the image, the mark and any swap already pending as
+registered or stale (`TextureUnknown`), a handle whose release is marked
+(`TextureReleased`) or the table's own — leaves the image, the mark and any swap already pending as
 they were.
+
+## What is reported released
+
+A handle's release is reported (`isReleased`, and publication's
+`TextureReleasedInSnapshot`) by these rules (GUIDE-5), which keep one entry per
+lookup index, never a set of released handles:
+
+- **A stale handle is refused.** A handle at an index the registry has registered
+  a texture at, whose generation is not the one registered there last, is
+  reported released, whether or not its release was marked, including one released
+  directly in the table without `markReleased`. "Before" is the order of
+  registration at the index, not a numeric comparison, so it holds when the table's
+  generation wraps from its largest value to 1.
+- **The current generation keeps its marker.** The handle registered last is
+  reported released while its release is marked, and the marker persists through
+  the table release until a later generation is registered at the index. An
+  unmarked current handle is not reported released, including after an unmarked
+  direct table release.
+- **An index never registered here** reports nothing released.
+- **A reissued handle is the new live handle.** A handle registered with the index
+  and generation of the current one, as after the generation wraps, is not
+  reported released until it is marked again; retained refusal applies to distinct
+  handle values only.
+
+`swapTexture`'s precedence is unchanged: `TextureUnknown` for a handle that holds
+no mark (never registered, stale, or whose table release removed its mark), then
+`TextureReleased` for a registered handle whose release is marked, then
+`MarkMismatch`, then the table's answer.
 
 ## The host adapter
 
@@ -470,7 +499,10 @@ is refused, checking in this order:
    layer and that format is not `D32_SFLOAT` (D-23): a snapshot with no such layer
    is unaffected on any device;
 5. `TextureReleasedInSnapshot`, naming the texture, when the snapshot
-   references one whose release was requested (any instance of any layer of
+   references one the registry reports released — one whose release was
+   requested and that is still its index's current handle, or a stale handle,
+   one at a registered index whose generation is not the one registered there
+   last, whether or not its release was ever requested (any instance of any layer of
    any view, visible or not, and any instance of a chunk the snapshot lists);
 6. `ChunkReleasedInSnapshot`, naming the chunk, when the snapshot lists one
    whose release was requested, and `ChunkUploadFailedInSnapshot`, naming the
@@ -912,7 +944,7 @@ functions in the fragment stage, so an application material (R2D-11) replaces
 | --- | --- | --- | --- | --- | --- |
 | The ring, the texture table and the pipeline layout | The host session | `makeRenderer` makes them through `Builders`; batches `prepareSnapshot` records read them | Owner | From `makeRenderer` until the host session ends | Released and destroyed with every managed resource before the device |
 | The pipelines, one per colour format, kind and material | A `Renderer` | `pipelineFor` and `pipelineForMaterial`, on the first pass that draws with the triple | Owner | From that first pass until the host session ends | As above |
-| Each registered handle's mark and release flag | A `Textures` (a `TVar` ledger keyed by the complete handle) | `registerTexture` adds; `markReleased` flags; `releaseTextureNow` removes the mark; any thread reads in STM | Registration, swap and table release on the owner; marker and reads on any | From the registration until the table release | The flag is never cleared: a released handle stays refused after its index is reused |
+| For each lookup index a texture was registered at: the generation registered last, that handle's mark and whether its release is marked | A `Textures` (a `TVar` ledger, one fixed-size entry per index) | `registerTexture` writes the index's entry (overwriting the previous generation's); `markReleased` sets the marker; `releaseTextureNow` removes the mark; any thread reads in STM | Registration, swap and table release on the owner; marker and reads on any | From the index's first registration for the life of the `Textures`; one entry per index registered at, however many textures are registered and released there (`retainedEntries`) | The marker is cleared only by registering a later generation at the index, which makes every earlier generation stale and refused whether or not its release was marked; a handle reissued with the current index and generation (after the table's generation wraps) is the new live handle |
 | Each chunk's description, device buffer and upload ticket, its release flag, the generation of every index and the indices free to reuse | A `Retained` (a `TVar` ledger keyed by the complete reference) | `buildRetainedChunk` adds (and releases the buffer it made if it refuses or is interrupted); `markChunkReleased` flags; `releaseChunkNow` releases the buffer and forgets the chunk; any thread reads in STM | Build, buffer release and `releaseChunkNow` on the owner; marker and reads on any | From the build until the buffer's release | The flag is never cleared: the reference is forgotten with the chunk and its index reused under the next generation |
 | The holds (window and revision to the textures and chunks that revision references), the pending releases with their stage, and the objects whose follow-up action is queued | An `Adapter` | `adapterAdopted` and `adapterReleased` on the owner's thread; the release action on the owner's thread; reads on any | Owner writes, any reads | From the adapter's creation until it is dropped | A revision's hold is dropped by its release; a pending object leaves the set when its release runs |
 | The latest region overflow of each window (revision, region size, storage window) | An `Adapter` (one `TVar` map, one transaction for each change) | `renderWindowFrame` writes it when it refuses a frame for its region and removes it when a frame of the window records; `adapterReleased` removes it with the window's last revision; `regionOverflow` reads | Owner writes, any reads | From the refusal until a frame of the window records, or until the window's last revision is released | Never cleared by publication, adoption or another refusal; one window's entry is untouched by another's |
@@ -992,7 +1024,15 @@ the backend's real table on the stand-in recording: marks stored by default and
 by override and keyed by the complete handle after an index is reused; the swap
 refusal naming both marks and leaving the mark, the table and the handle as they
 were, the keep, and the refusals of an unknown and a released handle before the
-table is asked; publication, its revisions and every refusal; holds taken once
+table is asked; the release policy on constructed handles (a marked current
+generation before and after the table release, an unmarked one after a direct
+release, stale generations marked and unmarked, an index never registered, a
+generation wrapping from the largest value to 1 with the reissued identical
+handle live until marked, and `swapTexture`'s precedence for each); an
+unmarked direct release followed by a marked release at the reused index, with
+both old handles refused at publication and the third generation published;
+and a thousand register-and-release cycles, marked and unmarked, whose retained
+entries stay at most one for each index registered at; publication, its revisions and every refusal; holds taken once
 however often a texture is named, dropped on release, counted twice for two
 windows, kept by a superseded revision and dropped by a closed window; release
 marked at once, deferred while an adopted snapshot shows the texture and made
