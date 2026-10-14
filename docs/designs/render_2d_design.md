@@ -660,6 +660,13 @@ Owner decision 2026-10-12; resolves Q-2.
   region. Each chunk records its bounds in its layer's space, so a view
   skips chunks wholly outside it, and each carries its own material data
   records (D-25).
+- **Clipping (owner decision 2026-10-13).** A chunk's instances select no
+  clip: R2D-12 defines clips for a view's dynamic instances only, and a
+  chunk instance with a clip index is refused when the chunk is built.
+  Deliberately left for now; a view's viewport already cuts a chunk to a
+  screen rectangle. A better mechanism can come later, for example
+  resolving a chunk instance's clip index against the drawing view's
+  table, as D-32 does for frame tables, or chunk-owned clip tables.
 
 ### D-32. Animation by GPU frame selection
 
