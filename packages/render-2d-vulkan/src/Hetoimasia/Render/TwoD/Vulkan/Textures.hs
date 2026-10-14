@@ -11,10 +11,11 @@
 -- which @asset-image@ computes — or an explicit override. The mark is stored
 -- with the handle for the handle's life and is never changed by
 -- anything but the handle's release; 'registeredMarks' answers the
--- 'CutoutMarks' of the handles registered. A frame is planned with them, and they
--- decide which instances take the cutout path (D-22): an instance of a marked
--- texture, in a layer that allows it, is drawn by the cutout pipeline, and every
--- other instance takes the ordered one.
+-- 'CutoutMarks' of the handles registered. A frame is planned with them, and a
+-- mark is one of the conditions for the cutout path (D-22): an instance takes it
+-- only if its texture is marked, its layer is a depth-enabled world layer, its
+-- material is cutout-capable, and its tint is opaque and it is neither
+-- translucent nor additive. Every other instance takes the ordered one.
 --
 -- = Swaps (D-27)
 --
@@ -258,7 +259,8 @@ retainedEntries ∷ Textures → IO Int
 retainedEntries (Textures ledger) = Ledger.retainedEntries <$> readTVarIO ledger
 
 -- | The 'CutoutMarks' of the registered handles whose mark is set: what a frame
--- is planned with, and so what decides the cutout routing.
+-- is planned with, and so the mark condition of the cutout routing (the remaining
+-- conditions are the instance's and its layer's).
 registeredMarks ∷ Textures → IO CutoutMarks
 registeredMarks (Textures ledger) = do
   held ← readTVarIO ledger
