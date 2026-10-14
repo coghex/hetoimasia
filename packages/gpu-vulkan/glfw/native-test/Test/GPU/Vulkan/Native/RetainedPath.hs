@@ -221,6 +221,7 @@ windowHostOf host ran =
     { hostPublish = \_ _ → pure HostWindowUnknown
     , hostRequestRelease = \body → retainedRequestRelease host (counted body)
     , hostRunOnOwner = \body → retainedRunOnOwner host (counted body)
+    , hostWindowDepth = False -- the surface-free session is configured with the default, no window depth
     }
   where
     -- Count each release action the owner has run, so the case can wait for one.

@@ -17,6 +17,8 @@ module Test.Render.TwoD.Vulkan.StandIn
   , Rec
   , newRig
   , newRigOffering
+  , newRigWindowed
+  , windowFrameOnce
   , builders
   , newRenderer
   , resetJournal
@@ -59,17 +61,22 @@ import Hetoimasia.GPU.Vulkan.Native.Allocator
   , BufferRequest (..)
   , ImageRequest (..)
   )
+import Hetoimasia.GPU.Model.Identity (TargetClass (OptionalTarget), TargetId)
 import Hetoimasia.GPU.Vulkan.Native.Frames
-  ( AcquireResult (..)
+  ( Acquisition (..)
+  , AcquireResult (..)
   , FrameOps (..)
   , Frames
   , FramelessScope
+  , OwnedFrame (..)
   , newFrames
   , progressFrames
   , recordFramelessIn
+  , skipFrame
+  , tryAcquireFrame
   , withFramelessScope
   )
-import Hetoimasia.GPU.Vulkan.Native.Generations (newGenerations)
+import Hetoimasia.GPU.Vulkan.Native.Generations (newGenerations, stepGenerations, trackTarget)
 import Hetoimasia.GPU.Vulkan.Native.Naming (ShaderStage (..))
 import Hetoimasia.GPU.Vulkan.Native.Presentation
 import Hetoimasia.GPU.Vulkan.Native.Profile
@@ -98,6 +105,10 @@ data Rig = Rig
   , rigLayouts ∷ !(TVar [([Word64], [PushConstantRange])])
     -- ^ The descriptor-set layouts and push-constant ranges of every pipeline
     -- layout made, newest first.
+  , rigWindow ∷ !(Maybe TargetId)
+    -- ^ The window target of a 'newRigWindowed' rig, with a generation and a
+    -- storage for each of its frame slots, so that 'windowFrameOnce' can acquire
+    -- one of its frames.
   }
 
 -- | A session with a surface-free device and its frames and uploads, with
@@ -109,7 +120,17 @@ newRig = newRigOffering [Depth32Float, Depth24, Depth16]
 -- | The same over a device that offers only these depth formats, as a depth
 -- attachment and a sampled-or-not image of them.
 newRigOffering ∷ [ImageFormat] → IO Rig
-newRigOffering offered = do
+newRigOffering offered = newRigWith offered False
+
+-- | The same as 'newRig', with a window target on a surface of 640 by 480 whose
+-- generation holds three images and whose two frame slots have their storage, so
+-- that a window pass is recorded into an acquired frame ('windowFrameOnce')
+-- rather than refused for want of one.
+newRigWindowed ∷ IO Rig
+newRigWindowed = newRigWith [Depth32Float, Depth24, Depth16] True
+
+newRigWith ∷ [ImageFormat] → Bool → IO Rig
+newRigWith offered windowed = do
   commands ← newTVarIO []
   writes ← newTVarIO []
   fences ← newTVarIO Map.empty
@@ -123,9 +144,18 @@ newRigOffering offered = do
   _ ← startRootsDevice roots
   generations ← newGenerations roots
   recording ← newRecording (recordingOps offered commands writes pipelines layouts memory handles) roots generations
-  frames ← newFrames (frameOps fences handles) recording
+  frames ← newFrames (frameOps windowed fences handles) recording
   uploads ← newUploads frames (either (error . show) id (validateUploadConfig 1048576 262144 8)) >>= either (fail . show) pure
-  pure (Rig recording frames uploads commands writes fences handles pipelines layouts)
+  window ←
+    if not windowed
+      then pure Nothing
+      else do
+        admitted ← admitRootTarget roots OptionalTarget (TargetSurface 10 (pure SurfaceDestroyed)) >>= either (fail . show) pure
+        atomically (trackTarget generations admitted OptionalTarget 10)
+        _ ← stepGenerations generations (scriptedInstant zeroDuration) (Map.singleton admitted (TargetGeometry (Right ()) (Just (SurfaceExtent 640 480)) Nothing 1))
+        mapM_ (\slot → createFrameStorage recording admitted slot >>= either (fail . show) pure) [0, 1]
+        pure (Just admitted)
+  pure (Rig recording frames uploads commands writes fences handles pipelines layouts window)
 
 -- | Make the renderer as a host does — the ring, the table, the layout — and
 -- let the table's placeholder upload complete, so a batch can bind it.
@@ -182,6 +212,35 @@ framelessOnce ∷ Rig → (Rec → IO a) → IO a
 framelessOnce rig consumer =
   withFramelessScope (rigFrames rig) $ \scope →
     recordFramelessIn (scope ∷ FramelessScope () Int Int Text Int Word64) consumer >>= either (fail . show) (pure . snd)
+
+-- | Record one batch into an acquired frame of the rig's window target, as the
+-- window host does — the image moved from undefined to the colour-attachment
+-- layout before the consumer and to the presentation layout after it — answering
+-- what the consumer returned, then skip the frame and let its abandonment settle,
+-- so the next one can be acquired. The batch is sealed and never submitted, which
+-- is all the examples need of it: its commands are in the journal.
+windowFrameOnce ∷ Rig → (Rec → IO a) → IO a
+windowFrameOnce rig consumer = case rigWindow rig of
+  Nothing → fail "the rig has no window target"
+  Just windowTarget →
+    tryAcquireFrame (rigFrames rig) windowTarget >>= \case
+      Right (AcquisitionOwned frame) → do
+        let expect what = either (fail . ((what <> " was refused: ") <>) . show) pure
+            bracketed recorder = do
+              transitionImage recorder LayoutUndefined LayoutColorAttachment >>= expect "entering the frame's image"
+              answer' ← consumer recorder
+              transitionImage recorder LayoutColorAttachment LayoutPresentSource >>= expect "leaving the frame's image"
+              pure answer'
+        (_, answer) ← recordFrame (rigRecording rig) (ownedFrame frame) bracketed >>= either (fail . ("the frame was not recorded: " <>) . show) pure
+        skipFrame (rigFrames rig) (ownedFrame frame) >>= either (fail . ("the frame was not skipped: " <>) . show) pure
+        mapM_ (const settleFrames) [1 .. 6 ∷ Int]
+        pure answer
+      other → fail ("no window frame was acquired: " <> either show show other)
+  where
+    settleFrames = do
+      atomically (modifyTVar' (rigFences rig) (Map.map (const True)))
+      _ ← progressFrames (rigFrames rig) (scriptedInstant (either (error . show) id (durationFromNanoseconds AllowZero 1000000)))
+      pure ()
 
 -- | Forget the commands and the mapped writes so far, as an example does once
 -- its fixture is set up.
@@ -290,7 +349,7 @@ rootOps _ handles =
         GenerationOps
           { opsSurfaceOffer = \_ _ → pure standInOffer
           , opsCreateSwapchain = \_ _ → fresh handles
-          , opsSwapchainImages = \_ _ → pure []
+          , opsSwapchainImages = \_ _ → sequence [fresh handles, fresh handles, fresh handles]
           , opsCreateImageView = \_ _ _ → fresh handles
           , opsDestroyImageView = \_ _ → pure ()
           , opsDestroySwapchain = \_ _ → pure ()
@@ -437,8 +496,8 @@ recordingOps offered commands writes pipelines layouts memory handles =
 -- ---------------------------------------------------------------------------
 -- The frames: a submission's fence signals when the example says so.
 
-frameOps ∷ TVar (Map Word64 Bool) → TVar Word64 → FrameOps Int Word64
-frameOps fences handles =
+frameOps ∷ Bool → TVar (Map Word64 Bool) → TVar Word64 → FrameOps Int Word64
+frameOps windowed fences handles =
   FrameOps
     { opsCreateSemaphore = \_ → fresh handles
     , opsDestroySemaphore = \_ _ → pure ()
@@ -448,7 +507,7 @@ frameOps fences handles =
     , opsDestroyFence = \_ handle → atomically (modifyTVar' fences (Map.delete handle))
     , opsResetFence = \_ handle → atomically (modifyTVar' fences (Map.insert handle False))
     , opsFenceSignalled = \_ handle → atomically (Map.findWithDefault False handle <$> readTVar fences)
-    , opsAcquireImage = \_ _ _ → pure AcquiringNotReady
+    , opsAcquireImage = \_ _ _ → pure (if windowed then AcquiredIndex 0 else AcquiringNotReady)
     , opsSubmit = \_ _ _ fence → do
         atomically (modifyTVar' fences (Map.insert fence False))
     , opsNoEffect = const False

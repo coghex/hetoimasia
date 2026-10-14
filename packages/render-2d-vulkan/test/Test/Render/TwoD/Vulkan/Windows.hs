@@ -463,8 +463,8 @@ releaseSpec = describe "releasing a texture behind the host's barrier" $ do
 
 frameSpec ∷ Spec
 frameSpec = describe "rendering a window's scene" $ do
-  let info = FrameInfo (64, 64) 50 (Just (32, 32)) (Just (2, 2)) Nothing
-      renderWith env frame = framelessOnce (envRig env) (renderWindowFrame (envAdapter env) (builders (envRig env)) frame blankScene)
+  let info = FrameInfo (64, 64) 50 (Just (32, 32)) (Just (2, 2)) Nothing 0
+      renderWith env frame = framelessOnce (envRig env) (renderWindowFrame (envAdapter env) (builders (envRig env)) 1 frame blankScene)
   it "skips a frame whose request names no logical extent, no content scale, or unusable metrics, before recording anything" $
     withEnv [1] $ \env → do
       noLogical ← renderWith env info {frameLogical = Nothing}
@@ -507,8 +507,8 @@ declaredDepth env = map (fmap (\declared → (depthTest declared, depthWrite dec
 
 depthSpec ∷ Spec
 depthSpec = describe "world depth" $ do
-  let info = FrameInfo (64, 64) 50 (Just (32, 32)) (Just (2, 2)) Nothing
-      renderWith env frame scene = framelessOnce (envRig env) (renderWindowFrame (envAdapter env) (builders (envRig env)) frame scene)
+  let info = FrameInfo (64, 64) 50 (Just (32, 32)) (Just (2, 2)) Nothing 0
+      renderWith env frame scene = framelessOnce (envRig env) (renderWindowFrame (envAdapter env) (builders (envRig env)) 1 frame scene)
   it "publishes a depth-enabled world layer where the session's depth format is D32_SFLOAT" $
     withEnv [1] $ \env → do
       handle ← registered env 1 True DefaultMark

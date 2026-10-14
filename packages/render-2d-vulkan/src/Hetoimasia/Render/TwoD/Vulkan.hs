@@ -137,6 +137,7 @@ module Hetoimasia.Render.TwoD.Vulkan
   , makeRenderer
   , rendererLayout
   , rendererDepthFormat
+  , rendererRegionWindow
   , pipelineFor
   , pipelineForMaterial
   , pipelineDeclaration

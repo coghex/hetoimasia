@@ -169,6 +169,7 @@ import Hetoimasia.Runtime.GLFW
   , ScheduledStep (..)
   , TargetStanding (..)
   , UpdateSchedule (..)
+  , attachmentWindow
   , defaultHostConfig
   , defaultScheduledHooks
   , graphicsAttachment
@@ -242,6 +243,12 @@ data Phase
     -- showing snapshot's release and the release's second run are awaited.
   | Done
 
+-- | Whether the session's windows give their frames a depth image: the setting
+-- the host is configured with ('vulkanWindowDepth') and the adapter's host record
+-- declares ('hostWindowDepth').
+windowDepth ∷ Bool
+windowDepth = True
+
 -- | The case's own deadline for the lifecycle, inside the child's.
 lifecycleSeconds ∷ Double
 lifecycleSeconds = 12
@@ -274,7 +281,7 @@ runImage2d backend journal = do
           , vulkanObserver = nativeCallObserver recorded
           , vulkanFrameObserver = \event → keep (Frame event)
           , vulkanSceneMode = PerWindowScenes
-          , vulkanWindowDepth = True
+          , vulkanWindowDepth = windowDepth
           , vulkanUploads = Just uploadConfig
           , vulkanDeviceStart = DeviceSurfaceFree
           , vulkanSceneLifecycle =
@@ -291,8 +298,8 @@ runImage2d backend journal = do
               (,) <$> readTVarIO preparedHeld <*> readTVarIO adapterSlot >>= \case
                 (Just _, Just adapter) → do
                   let SurfaceExtent width height = requestExtent request
-                      info = FrameInfo (width, height) (requestFormat request) (requestLogicalExtent request) (requestContentScale request) (requestDepth request)
-                  renderWindowFrame adapter (renderBuildersOf construction) info scene recorder
+                      info = FrameInfo (width, height) (requestFormat request) (requestLogicalExtent request) (requestContentScale request) (requestDepth request) (requestSceneRevision request)
+                  renderWindowFrame adapter (renderBuildersOf construction) (attachmentWindow (requestAttachment request)) info scene recorder
                 _ → pure (Right ())
           }
   outcome ←
@@ -359,7 +366,7 @@ runImage2d backend journal = do
       -- The adapter, over the host's public publication and release-request
       -- operations, and the hooks that reach it.
       retained ← newRetained
-      adapter ← newAdapter (windowHostOf vulkan keep stripes) (preparedTextures prepared) retained (preparedRenderer prepared)
+      adapter ← newAdapter (windowHostOf windowDepth vulkan keep stripes) (preparedTextures prepared) retained (preparedRenderer prepared)
       atomically (writeTVar adapterSlot (Just adapter))
       windows ← atomically (hostWindowIdentities windowHost)
       window ← case windows of
@@ -490,8 +497,8 @@ runImage2d backend journal = do
 -- publication and release-request operations. The release is wrapped to log,
 -- on the owner's thread and from the real table, whether the KTX2 image's
 -- handle still resolves after it ran.
-windowHostOf ∷ VulkanHost Scene2D → (Entry → IO ()) → Api.TextureHandle → Host WindowId
-windowHostOf vulkan keep watched =
+windowHostOf ∷ Bool → VulkanHost Scene2D → (Entry → IO ()) → Api.TextureHandle → Host WindowId
+windowHostOf depth vulkan keep watched =
   Host
     { hostPublish = \window scene →
         prepare scene >>= publishVulkanWindowScene vulkan window >>= \case
@@ -507,6 +514,7 @@ windowHostOf vulkan keep watched =
         atomically (submitVulkanAction vulkan (VulkanAction (logged body))) >>= \case
           Left refusal → pure (Left (tshow refusal))
           Right _ → pure (Right ())
+    , hostWindowDepth = depth
     }
   where
     -- The release, then whether the handle still resolves, read from the real

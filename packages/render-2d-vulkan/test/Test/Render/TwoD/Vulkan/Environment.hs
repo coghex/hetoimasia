@@ -13,8 +13,11 @@ module Test.Render.TwoD.Vulkan.Environment
   , Fake (..)
   , Env (..)
   , newFake
+  , Options (..)
+  , defaultOptions
   , withEnv
   , withEnvOffering
+  , withEnvWith
   , bytesOf
   , decodedWith
   , registered
@@ -81,9 +84,10 @@ data Env = Env
   , envRenderer ∷ !Render.Renderer
   }
 
--- | A stand-in host that holds these windows.
-newFake ∷ [Int] → IO (Host Int, Fake)
-newFake windows = do
+-- | A stand-in host that holds these windows, and gives their frames window
+-- depth or not.
+newFake ∷ Bool → [Int] → IO (Host Int, Fake)
+newFake windowDepth windows = do
   revisions ← newTVarIO (Map.fromList [(window, 0) | window ← windows])
   published ← newTVarIO []
   queued ← newTVarIO []
@@ -119,27 +123,49 @@ newFake windows = do
       plain body = do
         interrupted ← atomically (readTVar cancelPlain <* writeTVar cancelPlain False)
         if interrupted then throwIO ThreadKilled else admit False body
-  pure (Host publish request plain, Fake published queued refusing capacity cancel cancelPlain asked)
+  pure (Host publish request plain windowDepth, Fake published queued refusing capacity cancel cancelPlain asked)
+
+-- | What an environment is made with.
+data Options = Options
+  { optionOffered ∷ [ImageFormat]
+    -- ^ The depth formats the device offers.
+  , optionWindowDepth ∷ Bool
+    -- ^ Whether the stand-in host gives its windows' frames a depth image.
+  , optionStorageWindow ∷ Integer
+    -- ^ The renderer's storage window, in bytes.
+  , optionWindowed ∷ Bool
+    -- ^ Whether the rig has a window target whose frames can be acquired
+    -- ('windowFrameOnce').
+  }
+
+-- | A device offering every depth format, a host that gives window depth, a
+-- storage window of 4096 bytes and no window target.
+defaultOptions ∷ Options
+defaultOptions = Options [Depth32Float, Depth24, Depth16] True 4096 False
 
 withEnv ∷ [Int] → (Env → IO a) → IO a
-withEnv = withEnvOffering [Depth32Float, Depth24, Depth16]
+withEnv = withEnvWith defaultOptions
 
 -- | The same over a device that offers only these depth formats.
 withEnvOffering ∷ [ImageFormat] → [Int] → (Env → IO a) → IO a
-withEnvOffering offered windows action = do
-  rig ← newRigOffering offered
+withEnvOffering offered = withEnvWith defaultOptions {optionOffered = offered}
+
+-- | An environment made with these options.
+withEnvWith ∷ Options → [Int] → (Env → IO a) → IO a
+withEnvWith options windows action = do
+  rig ← if optionWindowed options then newRigWindowed else newRigOffering (optionOffered options)
   renderer ←
     newRenderer
       rig
       Render.Configuration
         { Render.configurationRing = either (error . show) id (validateRingSize (64 * 1024))
-        , Render.configurationRegionWindow = either (error . show) id (validateStorageWindow 4096)
+        , Render.configurationRegionWindow = either (error . show) id (validateStorageWindow (optionStorageWindow options))
         , Render.configurationTable = either (error . show) id (validateTableConfig 16 8 4)
         }
   resetJournal rig
   textures ← newTextures
   retained ← newRetained
-  (host, fake) ← newFake windows
+  (host, fake) ← newFake (optionWindowDepth options) windows
   adapter ← newAdapter host textures retained renderer
   action (Env rig textures retained adapter fake renderer)
 
