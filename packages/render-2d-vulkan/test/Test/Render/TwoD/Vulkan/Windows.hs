@@ -180,6 +180,68 @@ publishSpec = describe "publishing a snapshot" $ do
       publish2DSnapshot (envAdapter env) 1 (windowSnapshot [old]) >>= (`shouldBe` Left (TextureReleasedInSnapshot old))
       publish2DSnapshot (envAdapter env) 1 (windowSnapshot [new]) >>= (`shouldBe` Right 1)
 
+  it "refuses a stale handle whose release was never marked, and the marked current generation, while the live generation publishes" $
+    withEnv [1] $ \env → do
+      let sameIndex a b = ApiBackend.handleIndex a `shouldBe` ApiBackend.handleIndex b
+          refused handle = publish2DSnapshot (envAdapter env) 1 (windowSnapshot [handle]) >>= (`shouldBe` Left (TextureReleasedInSnapshot handle))
+      -- generation 1: released directly in the table, never marked
+      g1 ← registered env 1 True DefaultMark
+      releaseTextureNow (builders (envRig env)) (envTextures env) g1 >>= either (fail . show) pure
+      -- generation 2 at the reused index: marked, then released behind the host's barrier
+      g2 ← registered env 2 True DefaultMark
+      sameIndex g1 g2
+      g2 `shouldSatisfy` (/= g1)
+      release2DTexture (envAdapter env) g2 >>= (`shouldBe` Right ())
+      _ ← runQueued env
+      -- before generation 3 exists: generation 2 is refused as the marked current
+      -- generation and generation 1 as stale, though it was never marked
+      refused g2
+      refused g1
+      atomically (mapM (isReleased (envTextures env)) [g1, g2]) >>= (`shouldBe` [True, True])
+      -- generation 3 is the live one; both earlier generations stay refused
+      g3 ← registered env 3 True DefaultMark
+      sameIndex g2 g3
+      refused g1
+      refused g2
+      atomically (isReleased (envTextures env) g3) >>= (`shouldBe` False)
+      publish2DSnapshot (envAdapter env) 1 (windowSnapshot [g3]) >>= (`shouldBe` Right 1)
+      -- a swap of the stale handles is refused as unknown, as the table release removed their marks
+      image ← uploadedTexture (envRig env) (bytesOf 4)
+      stale ← swapTexture (builders (envRig env)) (envTextures env) g1 image (decodedWith True) RefuseMarkChange
+      either Just (const Nothing) stale `shouldBe` Just (TextureUnknown g1)
+
+  it "retains release state bounded by the indices registered at, however many textures are registered and released" $
+    withEnv [1] $ \env → do
+      let cycles = 1000 ∷ Int
+          kept = 3
+          oneCycle n = do
+            handle ← registered env (fromIntegral (n `mod` 200) + 1) (even n) DefaultMark
+            if n > cycles - kept
+              then pure ()
+              else
+                if even n
+                  then release2DTexture (envAdapter env) handle >>= (`shouldBe` Right ()) >> (runQueued env >>= (`shouldBe` [Right ()]))
+                  else releaseTextureNow (builders (envRig env)) (envTextures env) handle >>= either (fail . show) pure
+            pure handle
+      first ← oneCycle 1
+      afterFirst ← retainedEntries (envTextures env)
+      afterFirst `shouldBe` 1
+      rest ← mapM oneCycle [2 .. cycles]
+      let handles = first : rest
+          released = take (cycles - kept) handles
+          live = drop (cycles - kept) handles
+          indices = Set.fromList (map ApiBackend.handleIndex handles)
+      -- the table reuses the indices, so far fewer indices than registrations are in play
+      Set.size indices `shouldSatisfy` (<= kept + 1)
+      -- the state is one entry per index registered at, and no more
+      retainedEntries (envTextures env) >>= (`shouldBe` Set.size indices)
+      -- every released handle, marked or not, stale or the marked current one, is reported released
+      atomically (mapM (isReleased (envTextures env)) released) >>= (`shouldBe` replicate (cycles - kept) True)
+      -- and refused at publication; the live ones are not and publish
+      mapM_ (\handle → publish2DSnapshot (envAdapter env) 1 (windowSnapshot [handle]) >>= (`shouldBe` Left (TextureReleasedInSnapshot handle))) released
+      atomically (mapM (isReleased (envTextures env)) live) >>= (`shouldBe` replicate kept False)
+      mapM_ (\handle → publish2DSnapshot (envAdapter env) 1 (windowSnapshot [handle]) >>= (`shouldSatisfy` either (const False) (const True))) live
+
   it "names a window the host does not hold" $
     withEnv [1] $ \env → do
       publish2DSnapshot (envAdapter env) 7 (windowSnapshot []) >>= (`shouldBe` Left PublishWindowUnknown)

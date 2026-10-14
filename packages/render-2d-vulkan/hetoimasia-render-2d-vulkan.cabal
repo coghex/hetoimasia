@@ -68,6 +68,7 @@ library
         Hetoimasia.Render.TwoD.Vulkan.ShaderInterfaces
         Hetoimasia.Render.TwoD.Vulkan.Shaders
         Hetoimasia.Render.TwoD.Vulkan.Textures
+        Hetoimasia.Render.TwoD.Vulkan.Textures.Ledger
         Hetoimasia.Render.TwoD.Vulkan.Window
     other-modules:
         Hetoimasia.Render.TwoD.Vulkan.ShaderSources
@@ -99,6 +100,7 @@ test-suite render-2d-vulkan-tests
     other-modules:
         Test.Render.TwoD.Vulkan.Environment
         Test.Render.TwoD.Vulkan.Layout
+        Test.Render.TwoD.Vulkan.Ledger
         Test.Render.TwoD.Vulkan.Materials
         Test.Render.TwoD.Vulkan.Materials.Layouts
         Test.Render.TwoD.Vulkan.Publication
