@@ -38,7 +38,8 @@ concrete precondition
 - [x] R2D-11. Accept application materials as checked fragment functions — [#430]
 - [x] R2D-12. Clip instances by index in the shader — [#428]
 - [x] R2D-18. Animate instances by GPU frame selection — [#431]
-- [ ] R2D-13. Sample an offscreen pass's target in later passes
+- [x] R2D-13. Sample an offscreen pass's target in later passes — [#446]
+  (moved out of #413 as deferred future work, owner decision 2026-10-13)
 
 ## Epic contract
 
@@ -1104,3 +1105,6 @@ Moved to the [asset design](asset_design.md) as AST-2 (D-15).
   target matches the oracle.
 - **Out of scope:** post-processing effects themselves.
 - **Open questions:** Q-10
+- **Status:** moved out of epic #413 to #446 as deferred future work (owner
+  decision 2026-10-13): not required now, and it can be built on top of the
+  delivered renderer. Q-10 is settled before #446 is specified.
