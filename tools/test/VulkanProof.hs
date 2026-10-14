@@ -1264,19 +1264,24 @@ runWithSignalsDuringCleanup fixture signals = do
           , std_err = UseHandle logHandle
           }
     pid ← getPid handle >>= maybe (fail "the runner has no process id") pure
-    let signalGroup = run [] root "sh" ["-c", "kill -TERM -- -\"$0\"", show pid]
-        endGroup = run [] root "sh" ["-c", "kill -KILL -- -\"$0\" 2>/dev/null; :", show pid]
+    -- Through Bash, whose builtin takes a process group after `--` everywhere;
+    -- the `sh` of some platforms (dash) does not. A signal that was not delivered
+    -- fails the example rather than letting it go on without one.
+    let signalGroup = do
+          (delivered, _, errors) ← run [] root "bash" ["-c", "kill -TERM -- -\"$0\"", show pid]
+          (delivered, errors) `shouldBe` (ExitSuccess, "")
+        -- Clearing up after the example: a group that has already gone is no failure.
+        endGroup = run [] root "bash" ["-c", "kill -KILL -- -\"$0\" 2>/dev/null || true", show pid]
     ( do
         when (signals >= 2) $ do
           awaitFile (root </> "suites-running")
-          _ ← signalGroup
-          pure ()
+          signalGroup
         awaitFile (root </> "cleanup-started")
         -- The fingerprints the runner generated are all there when the cleanup
         -- begins, and so is the one it found.
         forM_ (foundFingerprint : generatedFingerprints) $ \relative →
           doesFileExist (root </> relative) >>= (`shouldBe` True)
-        _ ← signalGroup
+        signalGroup
         writeFile (root </> "release") "released\n"
         finished ← timeout (60 * 1000 * 1000) (waitForProcess handle)
         status ← maybe (expectationFailure "the runner did not end within a minute after the cleanup was released" >> pure (ExitFailure 1)) pure finished
