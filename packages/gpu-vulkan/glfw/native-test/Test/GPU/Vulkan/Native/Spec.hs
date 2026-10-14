@@ -14,6 +14,7 @@ import Data.IORef (IORef)
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 
 import Hetoimasia.GLFW.Session (Backend (Wayland))
+import qualified Test.GPU.Vulkan.Native.ChildSpec as ChildSpec
 import Test.GPU.Vulkan.Native.Consent (Consent (..), Refusal (..), consentBackend, consentFrom)
 import Test.GPU.Vulkan.Native.Fixture (Fixture)
 import Test.GPU.Vulkan.Native.Gate (Gate)
@@ -36,6 +37,7 @@ spec gate fixture timings = describe "Vulkan native" $ do
     Publication.spec
     Loader.spec
     InstanceScope.spec
+    ChildSpec.spec
   Shared.spec fixture
   Private.spec gate timings
   Interaction.spec gate
