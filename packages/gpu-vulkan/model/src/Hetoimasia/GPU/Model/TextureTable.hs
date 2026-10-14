@@ -120,8 +120,9 @@ import Data.Word (Word32)
 -- Configuration
 
 -- | The table's validated configuration (D-11): the cap its sampled-image
--- array is declared at, the slots allocated now (growth arrives in GRS-14),
--- slot 0 among them, and how many lookup versions its ring holds.
+-- array is declared at, the slots allocated at first (the table grows by
+-- doubling, up to the cap: GRS-14), slot 0 among them, and how many lookup
+-- versions its ring holds.
 data TableConfig = TableConfig
   { tableCapacity ∷ !Word32
   , tableInitialSlots ∷ !Word32

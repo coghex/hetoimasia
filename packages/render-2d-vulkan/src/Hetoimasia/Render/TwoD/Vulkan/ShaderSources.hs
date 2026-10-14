@@ -23,6 +23,7 @@ module Hetoimasia.Render.TwoD.Vulkan.ShaderSources
   , orderedTail
   , cutoutTail
   , pushBlockSource
+  , enginePushMembers
   , reservedDeclaration
   , builtInPushTail
   , builtInFragmentSource
@@ -261,30 +262,43 @@ defaultMaterialSource =
           }
         |]
 
--- | The push block both stages declare, 128 bytes: the engine's members, then
--- these declarations of the application's own members and of the words reserved
--- after them ('applicationPushOffset', 'applicationPushLimit'). Every shader
--- declares the whole range, so one pipeline layout serves them all.
+-- | The engine's members of the push block, in declaration order, each as its
+-- GLSL type and its name. This is the one place they are declared: 'pushBlockSource'
+-- writes the block from it, and the names a material may not declare for a member
+-- of its own ("Hetoimasia.Render.TwoD.Vulkan.MaterialSources") are read from it,
+-- so a member added here is refused there too. Their layout is
+-- 'Hetoimasia.Render.TwoD.Vulkan.Layout.pushMembers'.
+enginePushMembers ∷ [(String, String)]
+enginePushMembers =
+  [ ("vec4", "viewLinear")
+  , ("vec2", "viewTranslation")
+  , ("vec2", "extent")
+  , ("float", "brightness")
+  , ("uint", "filtering")
+  , ("uint", "snap")
+  , ("uint", "clipBase")
+  , ("vec4", "inverseLinear")
+  , ("vec2", "clipCentre")
+  , ("uint", "recordBase")
+  , ("uint", "frameBase")
+  ]
+
+-- | The push block both stages declare, 128 bytes: the engine's members
+-- ('enginePushMembers'), then these declarations of the application's own members
+-- and of the words reserved after them ('applicationPushOffset',
+-- 'applicationPushLimit'). Every shader declares the whole range, so one pipeline
+-- layout serves them all.
 pushBlockSource ∷ String → String
 pushBlockSource appMembers =
   intercalate
     "\n"
-    [ "layout(push_constant) uniform Pushed {"
-    , "    vec4 viewLinear;"
-    , "    vec2 viewTranslation;"
-    , "    vec2 extent;"
-    , "    float brightness;"
-    , "    uint filtering;"
-    , "    uint snap;"
-    , "    uint clipBase;"
-    , "    vec4 inverseLinear;"
-    , "    vec2 clipCentre;"
-    , "    uint recordBase;"
-    , "    uint frameBase;"
-    , appMembers
-    , "} pushed;"
-    , ""
-    ]
+    ( ["layout(push_constant) uniform Pushed {"]
+        <> ["    " <> glslType <> " " <> name <> ";" | (glslType, name) ← enginePushMembers]
+        <> [ appMembers
+           , "} pushed;"
+           , ""
+           ]
+    )
 
 -- | The words reserved after an application's own members, which have used this
 -- many bytes of the block: one array member that makes the block span the whole

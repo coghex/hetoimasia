@@ -95,7 +95,8 @@ import Hetoimasia.Render.TwoD.Vulkan.Layout
   , reservedPushMember
   )
 import Hetoimasia.Render.TwoD.Vulkan.ShaderSources
-  ( fragmentCommon
+  ( enginePushMembers
+  , fragmentCommon
   , fragmentHead
   , pushBlockSource
   , reservedDeclaration
@@ -218,7 +219,10 @@ declarationProblems declaration =
           && not ("gl_" `isPrefixOf` (first : rest))
           && not ("__" `isInfixOf` (first : rest))
       [] → False
-    engineNames = ["viewLinear", "viewTranslation", "extent", "brightness", "filtering", "snap", "recordBase", "reserved"]
+    -- Every member the engine's block declares, read from the declaration the
+    -- shaders are written from, and the reserved words the block ends with, which
+    -- a material may not name whether or not its own members leave room for them.
+    engineNames = map snd enginePushMembers <> ["reserved"]
 
 -- | The application's members of the push block as the shaders declare them,
 -- each with its offset, then the reserved words that make the block span the

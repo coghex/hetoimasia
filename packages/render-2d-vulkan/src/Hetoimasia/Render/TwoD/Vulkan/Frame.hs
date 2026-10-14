@@ -407,8 +407,9 @@ data FrameRefusal
     -- issued, but facts that differ from the ones it was issued with: where, the
     -- reference named and the reference issued.
     MaterialFactsDisagree !Location !MaterialRef !MaterialRef
-  | -- | The batch's clip tables and material records are this many bytes, and
-    -- the storage window is only this many.
+  | -- | The batch's whole region — its clip tables, its material records and the
+    -- frame tables of the views that draw — is this many bytes, and the storage
+    -- window is only this many.
     RecordsTooLarge !Word64 !Word64
   | -- | The frame tables a drawing view holds pack into a block of this many
     -- bytes (padding included) in which a size, an offset or a header value does

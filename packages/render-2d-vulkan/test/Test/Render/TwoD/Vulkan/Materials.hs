@@ -70,7 +70,7 @@ import Hetoimasia.Render.TwoD.Vulkan.Layout
 import Hetoimasia.Render.TwoD.Vulkan.Chunks (buildRetainedChunkWith)
 import Hetoimasia.Render.TwoD.Vulkan.Material
 import Hetoimasia.Render.TwoD.Vulkan.Material.Sample (mixMaterial, tintOnlyMaterial, translucentMixMaterial)
-import Hetoimasia.Render.TwoD.Vulkan.MaterialSources (declarationProblems, laidBytes, laidOffsets, layOut)
+import Hetoimasia.Render.TwoD.Vulkan.MaterialSources (declarationProblems, laidBytes, laidOffsets, layOut, materialVertexSource)
 import Hetoimasia.Render.TwoD.Vulkan.Shaders (cutoutShaders, orderedShaders)
 import Hetoimasia.Render.TwoD.Vulkan.Textures (MarkPolicy (..), registeredMarks, releaseTextureNow)
 import Hetoimasia.Render.TwoD.Vulkan.Window
@@ -78,7 +78,7 @@ import System.Exit (ExitCode (ExitSuccess))
 import Test.Support.ExternalClient (Client (..), Mode (..), rejectedBecause, withStorePackageClient)
 import System.Directory (createDirectoryIfMissing)
 import System.FilePath (takeDirectory, (</>))
-import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
+import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldNotContain, shouldSatisfy)
 import Test.Render.TwoD.Vulkan.Environment
 import Test.Render.TwoD.Vulkan.Materials.Layouts (handlesOnlyMaterial, wordsOnlyMaterial)
 import Test.Render.TwoD.Vulkan.StandIn
@@ -297,9 +297,30 @@ declarationSpec = describe "a material's declaration" $ do
     declarationProblems declaration {declaredRecord = RecordLayout maxRecordHandles maxRecordWords} `shouldBe` []
     forM_ ["", "1x", "a-b", "gl_x", "a__b", "naïve"] $ \name →
       declarationProblems declaration {declaredPush = [PushField name PushFloat]} `shouldSatisfy` any ("not a GLSL identifier" `isInfixOf`)
-    forM_ ["viewLinear", "viewTranslation", "extent", "brightness", "filtering", "snap", "recordBase", "reserved"] $ \name →
-      declarationProblems declaration {declaredPush = [PushField name PushFloat]} `shouldSatisfy` any ("the engine's own block" `isInfixOf`)
     declarationProblems declaration {declaredPush = [PushField "twice" PushFloat, PushField "twice" PushUint]} `shouldSatisfy` any ("more than once" `isInfixOf`)
+
+  it "refuses every member the engine's push block declares as a member name of a material, read from the shaders' own source" $ do
+    -- What the material's shaders really declare, read from the source they are
+    -- compiled from rather than from the validator's own list, and compared with
+    -- the twelve names stated here by hand: the eleven members of the engine's
+    -- part of the block, in order, and the reserved words that end it.
+    let declared = pushBlockNames (materialVertexSource (layOut []))
+        stated = ["viewLinear", "viewTranslation", "extent", "brightness", "filtering", "snap", "clipBase", "inverseLinear", "clipCentre", "recordBase", "frameBase", "reserved"]
+    declared `shouldBe` stated
+    -- The layout the recorder packs has a member for each of the eleven.
+    length pushMembers `shouldBe` length stated - 1
+    forM_ stated $ \name →
+      declarationProblems declaration {declaredPush = [PushField name PushFloat]}
+        `shouldSatisfy` any (("the push member name " <> show name <> " is one the engine's own block declares") `isInfixOf`)
+    -- The four the validator once omitted, named outright.
+    forM_ ["clipBase", "inverseLinear", "clipCentre", "frameBase"] $ \name →
+      declarationProblems declaration {declaredPush = [PushField name PushUint]} `shouldSatisfy` any ("the engine's own block" `isInfixOf`)
+    -- `reserved` stays refused when the application's own members fill the whole
+    -- range and the shader declares no reserved words at all.
+    let filling = [PushField "a" PushVec4, PushField "b" PushVec4, PushField "c" PushVec4]
+    pushBlockNames (materialVertexSource (layOut filling)) `shouldBe` init stated <> ["a", "b", "c"]
+    declarationProblems declaration {declaredPush = [PushField "a" PushVec4, PushField "b" PushVec4, PushField "reserved" PushVec4]}
+      `shouldSatisfy` any ("the push member name \"reserved\" is one the engine's own block declares" `isInfixOf`)
 
   it "refuses a source that defines no function named material" $
     declarationProblems declaration {declaredSource = "float other() { return 1.0; }"} `shouldSatisfy` any ("material" `isInfixOf`)
@@ -853,6 +874,16 @@ externalSpec = describe "a material in a separately compiled module" $ do
   it "fails to compile when it names a push member the engine's block already declares" $
     withClient (clientWith "RecordLayout 0 0" "[PushField \"brightness\" PushFloat]" "return texel;") $ \built →
       built `rejectedBecause` "the engine's own block"
+
+  -- An otherwise valid material, so the only thing wrong with it is the name: it is
+  -- refused by the declaration's own check, naming the member, and never reaches
+  -- glslang, whose error for a redeclared block member is not one a reader can act on.
+  forM_ ["clipBase", "frameBase"] $ \name →
+    it ("fails to compile with the declaration's refusal, naming it, when it names the engine's " <> name <> " member") $
+      withClient (clientWith "RecordLayout 0 0" ("[PushField \"" <> name <> "\" PushUint]") "return texel;") $ \built → do
+        built `rejectedBecause` "the material's declaration is refused"
+        built `rejectedBecause` ("the push member name \"" <> name <> "\" is one the engine's own block declares")
+        clientOutput built `shouldNotContain` "glslang"
   where
     -- Compile one client against the built packages with a copy of this
     -- package's fingerprint: the first compile only learns the client's
@@ -890,3 +921,14 @@ externalSpec = describe "a material in a separately compiled module" $ do
         , "  , declaredSource = " <> show source
         , "  })"
         ]
+
+
+-- | The names a push block declares, in order, read from a shader's source: the
+-- declarations between the block's opening line and its closing one, each the last
+-- word of its line with an array's size taken off.
+pushBlockNames ∷ String → [String]
+pushBlockNames source =
+  [ takeWhile (/= '[') (last (words (takeWhile (/= ';') line)))
+  | line ← takeWhile (not . ("} pushed;" `isInfixOf`)) (drop 1 (dropWhile (not . ("layout(push_constant) uniform Pushed {" `isInfixOf`)) (lines source)))
+  , ';' `elem` line
+  ]

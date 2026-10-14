@@ -70,8 +70,11 @@
 -- +=====================+===========+====================================+========+==============================+==============================+
 -- | The recording and   | This      | Made by the first frame attempted, | Owner  | The first attempt or action  | 'retireRendering', before    |
 -- | the frames          | module    | or the first owner-thread action,  |        | after the device exists      | the device is destroyed      |
--- |                     |           | once the device exists; read by    |        | until whole-owner retirement |                              |
--- |                     |           | every function here                |        |                              |                              |
+-- |                     |           | or, with windowed depth enabled,   |        | until whole-owner retirement |                              |
+-- |                     |           | by 'prepareRendering' before the   |        |                              |                              |
+-- |                     |           | generations' step, once the device |        |                              |                              |
+-- |                     |           | exists; read by every function     |        |                              |                              |
+-- |                     |           | here                               |        |                              |                              |
 -- +---------------------+-----------+------------------------------------+--------+------------------------------+------------------------------+
 -- | Per-target records  | This      | Written by the step, retirement    | Owner  | A target's first render      | Removed by                   |
 -- |                     | module    | preparation and retirement; read   |        | request until its retirement | 'retireTargetRendering'      |
