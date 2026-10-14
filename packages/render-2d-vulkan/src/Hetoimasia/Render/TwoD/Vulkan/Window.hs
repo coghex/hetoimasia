@@ -306,10 +306,17 @@ data Host window = Host
   , hostRequestRelease ∷ (ReleaseBody → IO (Either Text ()))
     -- ^ Queue an owner-thread action that waits for the revisions the host
     -- must have adopted first, naming every window the host holds at the
-    -- request and no later one; 'Left' says why it was refused.
+    -- request that has had a publication (or, for a host that does not declare
+    -- its initial scene holds nothing, every window it holds) and no later one;
+    -- 'Left' says why it was refused. It is bounded by the host's release
+    -- capacity alone and never waits for room. A window the host holds with a
+    -- publication and no live target holds the request until a target of it
+    -- adopts that revision or the window is closed: the application's to
+    -- resolve.
   , hostRunOnOwner ∷ (ReleaseBody → IO (Either Text ()))
-    -- ^ Queue an owner-thread action that waits for nothing. It is admitted
-    -- and bounded as the request is, and never waits for room.
+    -- ^ Queue an owner-thread action that waits for nothing. It is bounded by
+    -- the host's action capacity, apart from the release requests, and never
+    -- waits for room.
   , hostWindowDepth ∷ !Bool
     -- ^ Whether the window host gives each frame's request a depth image
     -- ('frameDepthImage'): the setting that configures the integration's

@@ -66,6 +66,24 @@
 -- or the host no longer holds the window. A window that appears later is not
 -- named, and so delays nothing.
 --
+-- A host may declare that its initial scene references nothing a release
+-- request releases ('newScenes'). Then the barrier a request captures leaves
+-- out every window whose latest revision is 0 — in a per-window host a window
+-- with no publication, in a shared host every window while the shared scene is
+-- unpublished — because a target adopting the initial scene later finds
+-- nothing there that a release could have freed. This applies to the barrier
+-- captured with a request and to nothing else: the observation still reports
+-- revision 0 as the window's published revision, and every other window is
+-- named as before, with or without a live target. In particular a window that
+-- has had a publication, with no live target, is still named: a target of it
+-- adopts that publication later, and what it references must not have been
+-- freed. It holds every later request until a target of it adopts the
+-- barrier's revision (the watermark of a target that ended counts for nothing)
+-- or the host drops the window, and the observation shows it through the
+-- request's barrier and the window's adopted revision. It is for the
+-- application to resolve: attach a target, or close the window. A publication
+-- of another blank scene creates a positive revision, so it is named too.
+--
 -- = State
 --
 -- +------------------+-------------+------------------------------------+--------+-----------------------+---------------------------+
@@ -115,6 +133,7 @@ import Control.Exception (uninterruptibleMask_)
 import Control.Monad (filterM, forM_)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
+import Data.Functor ((<&>))
 import Data.Maybe (fromMaybe)
 import qualified Data.Set as Set
 import Numeric.Natural (Natural)
@@ -196,10 +215,17 @@ data Ledger = Ledger
 data Scenes = Scenes
   { scenesLedger ∷ !(TVar Ledger)
   , scenesSource ∷ !(TVar (Maybe SceneSource))
+  , scenesInitialEmpty ∷ !Bool
+    -- ^ Whether the host declared that its initial scene references nothing a
+    -- release request releases.
   }
 
-newScenes ∷ IO Scenes
-newScenes = Scenes <$> newTVarIO (Ledger Map.empty [] Map.empty) <*> newTVarIO Nothing
+-- | An empty ledger, for a host that declares, with 'True', that its initial
+-- scene references nothing a release request releases, so that a window still
+-- at the initial scene's revision 0 is left out of every barrier. With 'False'
+-- every window the host holds is named.
+newScenes ∷ Bool → IO Scenes
+newScenes initialEmpty = (\ledger source → Scenes ledger source initialEmpty) <$> newTVarIO (Ledger Map.empty [] Map.empty) <*> newTVarIO Nothing
 
 -- | Install where the scenes are read from, once the owner exists. Until then
 -- no barrier names a window.
@@ -326,12 +352,16 @@ releaseScenes scenes released used = uninterruptibleMask_ $ do
 
 -- | The barrier a release request made now waits for, in one transaction with
 -- the host's windows and their published revisions: every window the host
--- holds, at the latest revision published for it.
+-- holds, at the latest revision published for it — except, for a host that
+-- declared its initial scene holds nothing, a window whose latest revision is
+-- 0. Only this barrier leaves those windows out; 'readSceneState' does not.
 sceneBarrier ∷ Scenes → STM Barrier
 sceneBarrier scenes =
   readTVar (scenesSource scenes) >>= \case
     Nothing → pure Map.empty
-    Just source → sourceRevisions source
+    Just source →
+      sourceRevisions source <&> \revisions →
+        if scenesInitialEmpty scenes then Map.filter (> 0) revisions else revisions
 
 -- | The highest revision a live target of each window holds. A target that has
 -- ended holds nothing: a window whose adopting target was detached or released
