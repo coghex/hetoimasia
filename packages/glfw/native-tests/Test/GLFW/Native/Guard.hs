@@ -22,8 +22,11 @@ module Test.GLFW.Native.Guard (spec) where
 
 import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar, throwTo)
 import Control.Concurrent.STM (atomically, check)
-import Control.Exception (ErrorCall (..), IOException, SomeException, bracket, displayException, finally, fromException, throwIO, try)
+import Control.Exception (annotateIO, someExceptionContext, ErrorCall (..), IOException, SomeException, bracket, displayException, finally, fromException, throwIO, try)
+import Control.Exception.Annotation (ExceptionAnnotation)
+import Control.Exception.Context (getExceptionAnnotations)
 import Control.Monad (void)
+import System.IO.Error (ioeGetErrorString)
 import Data.Either (isLeft)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Hetoimasia.Foundation.Resource (allocResource)
@@ -404,6 +407,26 @@ spec = describe "the native opt-in" $ do
         )
         `finally` void (try (signalProcessGroup sigKILL (Child.ownedPid owned)) ∷ IO (Either IOException ()))
 
+    it "returns the status and output of every short-lived child, however soon it is reaped" $
+      -- The identifier is read before anything waits on the child, so no child can be
+      -- reaped between its start and the read. A child that exits at once is the case
+      -- the order matters for.
+      mapM_ (\_ → do
+               launched ← bounded (Child.launchCommand 30 "true" [])
+               Child.launchedEnd launched `shouldBe` Child.ChildExited ExitSuccess)
+            [1 ∷ Int .. 200]
+
+    it "propagates the exception that ended a launch with the context it carried, and still reclaims" $ do
+      owned ← newIORef Nothing
+      let observe o = writeIORef owned (Just o) >> annotateIO (Marker "the observer's own") (ioError (userError "the observer failed"))
+      outcome ← bounded (try (Child.launchCommandObserved observe Child.terminationGrace Nothing 30 "sh" ["-c", "sleep 30"]))
+      case outcome of
+        Left (failure ∷ SomeException) → do
+          fmap (\(e ∷ IOException) → ioeGetErrorString e) (fromException failure) `shouldBe` Just "the observer failed"
+          (getExceptionAnnotations (someExceptionContext failure) ∷ [Marker]) `shouldBe` [Marker "the observer's own"]
+        Right (_ ∷ Child.Launched) → expectationFailure "the launch returned though its observer failed"
+      readIORef owned >>= maybe (expectationFailure "the launch showed its observer nothing") (\o → reclaimed o >> try (signalProcess nullSignal (Child.ownedPid o)) >>= (`shouldSatisfy` either (\(_ ∷ IOException) → True) (const False)))
+
     it "reads a running process as present, and an exited one as gone whether or not it has been reaped" $ do
       getProcessID >>= inspectPresence >>= (`shouldSatisfy` \case Running _ → True; _ → False)
       reaped ← withZombie $ \zombie → do
@@ -517,6 +540,12 @@ runNested ∷ (Config → Config) → Spec → IO SpecResult
 runNested adjust nested = do
   (config, forest) ← evalSpec defaultConfig nested
   runSpecForest forest (adjust config) {configFormat = Just (formatterToFormat silent)}
+
+-- | A caller's own annotation, used to prove a propagated failure keeps its context.
+newtype Marker = Marker String
+  deriving (Eq, Show)
+
+instance ExceptionAnnotation Marker
 
 -- | An example's wait, bounded so that a launcher that waits for an output pipe's
 -- end of file, which an escaped writer never supplies, fails the example instead

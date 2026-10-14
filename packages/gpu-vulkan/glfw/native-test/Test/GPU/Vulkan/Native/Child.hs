@@ -19,23 +19,25 @@
 -- of the waiting itself, an interruption included, kills the group before it
 -- propagates.
 --
--- __Reclamation.__ A launch owns a process group, two parent-side pipe handles
--- and two output-reader threads, and owns none of them once it returns or
--- propagates, by any path: a normal exit, an expiry, output given up on, a
--- failure while acquiring, or an interruption at any point from acquisition to
--- the result. The readers are stopped, not waited for: an output pipe held open
+-- __Reclamation.__ A launch owns a process group, a reaper thread, two output
+-- readers and the parent's two pipe handles, and owns none of them once it
+-- returns or propagates, by any path: a normal exit, an expiry, output given up
+-- on, a failure while acquiring, or an interruption at any point from
+-- acquisition to the result. It is one composite scope
+-- ("Hetoimasia.Foundation.Resource", docs/resources.md): each part is acquired
+-- and its release installed as one protected step, so there is no interruptible
+-- gap between acquiring a pipe or a thread and being responsible for it, and the
+-- releases run in a declared order under @uninterruptibleMask_@: the group is
+-- killed and the child reaped, then the readers are stopped, then the handles
+-- are closed. The readers are stopped, not waited for: an output pipe held open
 -- from outside the group is never waited on for end of file, so reclaiming it
 -- adds no wait for the escaped writer, which is not ended here and may keep
--- running; what the readers had read is kept. Each reader is stopped by an
--- asynchronous exception and awaited, which is bounded because it is delivered
--- where the reader blocks, and each handle is then closed. Ownership is
--- established under @mask@ in the step that acquires, so there is no
--- interruptible gap between acquiring a pipe or a thread and being responsible
--- for it, and reclamation runs under @uninterruptibleMask_@. A failure to
--- reclaim never replaces the failure that caused it: the primary exception
--- propagates unchanged when reclamation succeeded, and otherwise inside a
--- 'LauncherCleanupFailed' that carries it beside every cleanup failure; a launch
--- that returned normally but could not reclaim raises one with no primary.
+-- running; each reader is stopped by an asynchronous exception where it blocks
+-- and awaited, which is bounded because the exception is delivered there, and
+-- what the readers had read is kept. The scope's failure table applies
+-- unchanged: the launch's own failure propagates with its type, value and
+-- attached context, every cleanup failure retained beside it as evidence, and a
+-- launch that completed but could not reclaim raises its first cleanup failure.
 --
 -- The deadline is enforced from outside the child and reported as
 -- 'ChildExpired'. Nothing here decides what an expiry means; a caller that
@@ -43,7 +45,6 @@
 module Test.GPU.Vulkan.Native.Child
   ( ChildEnd (..)
   , Launched (..)
-  , LauncherCleanupFailed (..)
   , Owned (..)
   , terminationGrace
   , launchCommand
@@ -53,19 +54,20 @@ module Test.GPU.Vulkan.Native.Child
 
 import Control.Concurrent (ThreadId, forkIO, forkIOWithUnmask, killThread)
 import Control.Concurrent.STM (STM, TVar, atomically, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, registerDelay, retry, writeTVar)
-import Control.Exception (Exception, SomeException, catch, finally, mask, throwIO, toException, try, uninterruptibleMask_)
-import Control.Monad (forM, unless, void)
+import Control.Exception (SomeException, catch, finally, try)
+import Control.Monad (unless, void)
+import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
-import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
-import Data.Maybe (catMaybes)
 import qualified Data.Text as Text
 import Data.Text.Encoding (decodeUtf8Lenient)
+import Hetoimasia.Foundation.Resource (Assembly, acquirePart, releaseRank, restoredStep, withComposite)
 import System.Exit (ExitCode)
 import System.IO (Handle, hClose)
 import System.Posix.Signals (Signal, sigKILL, sigTERM, signalProcessGroup)
 import System.Posix.Types (ProcessID)
 import System.Process
   ( CreateProcess (create_group, env, std_err, std_in, std_out)
+  , ProcessHandle
   , StdStream (CreatePipe, NoStream)
   , createProcess
   , getPid
@@ -91,13 +93,6 @@ data Launched = Launched
   , launchedErr ∷ !String
   , launchedPid ∷ !ProcessID
   }
-
--- | A failure to reclaim what a launch owned: the exception that ended the
--- launch, if one did, and every failure of the reclamation itself.
-data LauncherCleanupFailed = LauncherCleanupFailed !(Maybe SomeException) ![SomeException]
-  deriving (Show)
-
-instance Exception LauncherCleanupFailed
 
 -- | What a launch owns while it runs, shown to an observer the moment it is
 -- acquired, so a regression can check afterwards that none of it is still held.
@@ -126,12 +121,98 @@ launchCommand = launchCommandIn Nothing
 launchCommandIn ∷ Maybe [(String, String)] → Double → FilePath → [String] → IO Launched
 launchCommandIn = launchCommandObserved (const (pure ())) terminationGrace
 
+-- | The child as the launch holds it: its handle and identifier, and the
+-- parent's ends of its output pipes.
+data Child = Child !ProcessHandle !ProcessID !Handle !Handle
+
+-- | An output reader: its thread, and whether it has finished.
+data Reader = Reader !ThreadId !(TVar Bool)
+
+-- | Everything the body of a launch uses, assembled and owned by the scope.
+data Running = Running
+  { runningPid ∷ !ProcessID
+  , runningHandles ∷ ![Handle]
+  , runningExited ∷ !(TVar (Maybe ExitCode))
+  , runningFinished ∷ ![TVar Bool]
+  , runningOut ∷ !(TVar ByteString)
+  , runningErr ∷ !(TVar ByteString)
+  }
+
 -- | 'launchCommandIn' with the grace after which output held open is given up
 -- on, and an observer shown what the launch owns once it owns it. The observer
 -- runs where the launch can still be interrupted, with reclamation already
 -- arranged, and may not block on the child.
 launchCommandObserved ∷ (Owned → IO ()) → Double → Maybe [(String, String)] → Double → FilePath → [String] → IO Launched
-launchCommandObserved observe grace environment deadline command arguments = mask $ \restore → do
+launchCommandObserved observe grace environment deadline command arguments = do
+  (end, pid, out, err) ← withComposite (assembly environment command arguments) $ \running → do
+    let reaped = readTVar (runningExited running) >>= maybe retry pure
+        finishedOutput = and <$> traverse readTVar (runningFinished running)
+        -- Finished means reaped with both pipes at end of file: a descendant
+        -- that still holds the child's output keeps it unfinished.
+        finished = reaped <* (finishedOutput >>= check)
+        pid = runningPid running
+        within seconds done = do
+          timer ← registerDelay (max 1 (round (seconds * 1000000)))
+          atomically ((Just <$> done) `orElse` (Nothing <$ (readTVar timer >>= check)))
+    observe
+      Owned
+        { ownedPid = pid
+        , ownedHandles = runningHandles running
+        , ownedReadersFinished = map readTVar (runningFinished running)
+        , ownedCaptured = (,) <$> decodedIn (runningOut running) <*> decodedIn (runningErr running)
+        }
+    end ←
+      within deadline finished >>= \case
+        Just status → pure (ChildExited status)
+        Nothing → do
+          signalGroup sigTERM pid
+          within grace finished >>= \case
+            Just status → pure (ChildExpired deadline status)
+            Nothing → do
+              signalGroup sigKILL pid
+              -- Bounded too: output held open from outside the group is given
+              -- up on, and what was read so far is kept.
+              _ ← within grace finished
+              ChildExpired deadline <$> atomically reaped
+    -- Anything the child started in its group and left running is killed with
+    -- it. That is not waited for: the child is the only process reaped here.
+    signalGroup sigKILL pid
+    -- What was read, taken before the readers are stopped: the readers append
+    -- only what they were given, so nothing is lost by stopping them.
+    (,,,) end pid <$> readTVarIO (runningOut running) <*> readTVarIO (runningErr running)
+  pure (Launched end (decodeText out) (decodeText err) pid)
+
+-- | The launch's parts, each acquired with its release installed in the same
+-- protected step. The child's identifier is read at once, before anything waits
+-- on the child, because the waiter that reaps it closes the handle the
+-- identifier is read from.
+assembly ∷ Maybe [(String, String)] → FilePath → [String] → Assembly Running
+assembly environment command arguments = do
+  Child handle pid out err ←
+    acquirePart "child process group" (releaseRank 0) (start environment command arguments) $ \(Child handle pid _ _) → do
+      signalGroup sigKILL pid
+      void (waitForProcess handle)
+  exited ← restoredStep (newTVarIO Nothing)
+  _ ←
+    acquirePart
+      "child reaper"
+      (releaseRank 1)
+      (forkIO (waitForProcess handle >>= atomically . writeTVar exited . Just))
+      (\_ → atomically (readTVar exited >>= maybe retry (const (pure ()))))
+  outBytes ← restoredStep (newTVarIO ByteString.empty)
+  errBytes ← restoredStep (newTVarIO ByteString.empty)
+  outReader@(Reader _ outDone) ← acquirePart "standard output reader" (releaseRank 2) (startReader outBytes out) stopReader
+  errReader@(Reader _ errDone) ← acquirePart "standard error reader" (releaseRank 2) (startReader errBytes err) stopReader
+  let _ = (outReader, errReader)
+  _ ← acquirePart "standard output pipe" (releaseRank 3) (pure out) hClose
+  _ ← acquirePart "standard error pipe" (releaseRank 3) (pure err) hClose
+  pure (Running pid [out, err] exited [outDone, errDone] outBytes errBytes)
+
+-- | Start the child in a process group of its own and read its identifier. A
+-- failure after the pipes exist closes them: nothing here has been returned for
+-- the scope to release.
+start ∷ Maybe [(String, String)] → FilePath → [String] → IO Child
+start environment command arguments = do
   (_, pipedOut, pipedErr, handle) ←
     createProcess
       (proc command arguments)
@@ -141,100 +222,42 @@ launchCommandObserved observe grace environment deadline command arguments = mas
         , std_err = CreatePipe
         , create_group = True
         }
-  -- From here the launch owns the process group, the pipes and, as they start,
-  -- the readers; nothing below can be interrupted until 'restore' is applied,
-  -- and the handler that reclaims is installed in the same masked step.
-  let handles = catMaybes [pipedOut, pipedErr]
-  exited ← newTVarIO Nothing
-  _ ← forkIO (waitForProcess handle >>= atomically . writeTVar exited . Just)
-  readers ← newIORef []
-  pidRef ← newIORef Nothing
-  let reaped = readTVar exited >>= maybe retry pure
-      killGroup = readIORef pidRef >>= mapM_ (signalGroup sigKILL) >> atomically reaped
-  outBytes ← newTVarIO ByteString.empty
-  errBytes ← newTVarIO ByteString.empty
-  outcome ←
-    try
-      ( do
-          pid ← getPid handle >>= maybe (ioError (userError ("the child " <> command <> " exited before its identifier was read"))) pure
-          writeIORef pidRef (Just pid)
-          finishedFlags ← forM [(pipedOut, outBytes), (pipedErr, errBytes)] $ \(piped, into) → do
-            done ← newTVarIO False
-            thread ←
-              forkIOWithUnmask $ \unmask →
-                (mapM_ (drainInto unmask into) piped `catch` \(_ ∷ SomeException) → pure ())
-                  `finally` atomically (writeTVar done True)
-            modifyIORef' readers ((thread, readTVar done) :)
-            pure (readTVar done)
-          let finishedOutput = and <$> sequence finishedFlags
-              -- Finished means reaped with both pipes at end of file: a descendant
-              -- that still holds the child's output keeps it unfinished.
-              finished = reaped <* (finishedOutput >>= check)
-              within seconds done = do
-                timer ← registerDelay (max 1 (round (seconds * 1000000)))
-                atomically ((Just <$> done) `orElse` (Nothing <$ (readTVar timer >>= check)))
-          end ←
-            restore $ do
-              observe (Owned pid handles finishedFlags ((,) <$> decodedIn outBytes <*> decodedIn errBytes))
-              within deadline finished >>= \case
-                Just status → pure (ChildExited status)
-                Nothing → do
-                  signalGroup sigTERM pid
-                  within grace finished >>= \case
-                    Just status → pure (ChildExpired deadline status)
-                    Nothing → do
-                      signalGroup sigKILL pid
-                      -- Bounded too: output held open from outside the group is given
-                      -- up on, and what was read so far is kept.
-                      _ ← within grace finished
-                      ChildExpired deadline <$> atomically reaped
-          -- Anything the child started in its group and left running is killed with
-          -- it. That is not waited for: the child is the only process reaped here.
-          signalGroup sigKILL pid
-          pure (end, pid)
-      )
-  case outcome of
-    Left (primary ∷ SomeException) → do
-      -- The group is killed and reaped, then the readers and the handles are
-      -- reclaimed, all uninterruptibly; the failure that ended the launch
-      -- propagates as it was unless reclaiming failed too.
-      uninterruptibleMask_ $ do
-        _ ← try killGroup ∷ IO (Either SomeException ExitCode)
-        failures ← reclaim readers handles
-        throwIO (if null failures then primary else toException (LauncherCleanupFailed (Just primary) failures))
-    Right (end, pid) → do
-      failures ← uninterruptibleMask_ (reclaim readers handles)
-      unless (null failures) (throwIO (LauncherCleanupFailed Nothing failures))
-      Launched end <$> decoded outBytes <*> decoded errBytes <*> pure pid
+  let closeBoth = mapM_ (\piped → try (hClose piped) ∷ IO (Either SomeException ())) (concatMap (maybe [] pure) [pipedOut, pipedErr])
+  case (pipedOut, pipedErr) of
+    (Just out, Just err) →
+      getPid handle >>= \case
+        Just pid → pure (Child handle pid out err)
+        Nothing → closeBoth >> ioError (userError ("the child " <> command <> " exited before its identifier was read"))
+    _ → closeBoth >> ioError (userError ("the child " <> command <> " was started without its output pipes"))
+
+-- | Start a reader of one pipe into a buffer. It reads under the unmasked state
+-- only while it waits for bytes, and appends what it read masked, so being
+-- stopped loses nothing it had been given.
+startReader ∷ TVar ByteString → Handle → IO Reader
+startReader into piped = do
+  done ← newTVarIO False
+  thread ←
+    forkIOWithUnmask $ \unmask →
+      (drain unmask `catch` \(_ ∷ SomeException) → pure ())
+        `finally` atomically (writeTVar done True)
+  pure (Reader thread done)
   where
-    -- A reader reads under the caller's unmasked state only while it waits for
-    -- bytes, and appends what it read masked, so being stopped loses nothing it
-    -- had been given.
-    drainInto unmask into piped = do
+    drain unmask = do
       chunk ← unmask (ByteString.hGetSome piped 4096)
       unless (ByteString.null chunk) $ do
         atomically (modifyTVar' into (<> chunk))
-        drainInto unmask into piped
-    decoded bytes = decodeText <$> readTVarIO bytes
+        drain unmask
 
-decodedIn ∷ TVar ByteString.ByteString → STM String
+-- | Stop a reader where it blocks and await it. It is never waited on for the
+-- end of its pipe, which a writer outside the group may hold open for good.
+stopReader ∷ Reader → IO ()
+stopReader (Reader thread done) = killThread thread >> atomically (readTVar done >>= check)
+
+decodedIn ∷ TVar ByteString → STM String
 decodedIn bytes = decodeText <$> readTVar bytes
 
-decodeText ∷ ByteString.ByteString → String
+decodeText ∷ ByteString → String
 decodeText = Text.unpack . decodeUtf8Lenient
-
--- | Stop every output reader, awaiting each, and close the parent's pipe
--- handles; the failures it met, if any. The readers are stopped by an
--- asynchronous exception where they block, never waited on for end of file.
-reclaim ∷ IORefReaders → [Handle] → IO [SomeException]
-reclaim readers handles = do
-  held ← readIORef readers
-  stopped ← forM held $ \(thread, finishedFlag) →
-    try (killThread thread >> atomically (finishedFlag >>= check))
-  closed ← forM handles (\piped → try (hClose piped))
-  pure ([failure | Left failure ← stopped] <> [failure | Left failure ← closed])
-
-type IORefReaders = IORef [(ThreadId, STM Bool)]
 
 -- | Signal a child's process group, which it leads; a group already gone is
 -- not an error.
