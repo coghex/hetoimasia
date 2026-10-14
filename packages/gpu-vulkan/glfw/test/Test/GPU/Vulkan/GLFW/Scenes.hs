@@ -620,14 +620,16 @@ testNeverPublishedWindowLeavesBarrier =
       (a, _, b, _) ← attachBoth rig host control
       ran ← newTVarIO []
       -- C has no target, and nothing has been published: the request names no
-      -- window, and runs without any window adopting anything.
-      _ ← request host (mark ran "never published")
-      beforeRun ← atomically (readVulkanSceneState (vulkanController host))
+      -- window, and runs without any window adopting anything. Its barrier is
+      -- empty, so the owner may take it at once: it is admitted and observed
+      -- in one transaction, which no owner step can come between.
+      (admittedFirst, beforeRun) ← atomically ((,) <$> requestVulkanRelease (vulkanController host) (mark ran "never published") <*> readVulkanSceneState (vulkanController host))
+      either (\refusal → failWith ("the release request was refused: " <> show refusal)) (const (pure ())) admittedFirst
       composedUntil rig host control "the request's run" ((== ["never published"]) <$> readTVarIO ran)
       -- C publishes. It still has no target, so the next request is held to it.
       _ ← publish host c value
-      _ ← request host (mark ran "published")
-      afterPublish ← atomically (readVulkanSceneState (vulkanController host))
+      (admittedSecond, afterPublish) ← atomically ((,) <$> requestVulkanRelease (vulkanController host) (mark ran "published") <*> readVulkanSceneState (vulkanController host))
+      either (\refusal → failWith ("the release request was refused: " <> show refusal)) (const (pure ())) admittedSecond
       _ ← atomically (submitVulkanAction (vulkanController host) (mark ran "plain")) >>= either (\refusal → failWith ("refused: " <> show refusal)) pure
       composedUntil rig host control "the plain action's run" ((== ["never published", "plain"]) <$> readTVarIO ran)
       settleOwner rig host
