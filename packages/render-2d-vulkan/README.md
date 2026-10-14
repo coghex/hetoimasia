@@ -26,7 +26,7 @@ contract is [docs/gpu_backend.md](../../docs/gpu_backend.md).
 | `Hetoimasia.Render.TwoD.Vulkan.Builders` | `Builders`: the constructions the recorder and the registry need from a host: the ring with its storage-table window (the clip tables' and the material records'), the table, the storage table, the layout, a pipeline, and registering, swapping and releasing an uploaded texture; and making, filling (an upload admitted for a ticket) and releasing a device-local vertex buffer |
 | `Hetoimasia.Render.TwoD.Vulkan.Chunks` | the chunk registry: `Retained`, `newRetained`; `buildRetainedChunk`, `buildRetainedChunkWith` (a chunk that carries its own records), `BuildRefusal`; `ChunkStanding`, `chunkStanding`; `retainedChunks`, `retainedBuffers`, `chunkBufferOf`, `liveChunks`; the logical release marker (`markChunkReleased`, `isChunkReleased`) and `releaseChunkNow` |
 | `Hetoimasia.Render.TwoD.Vulkan.Textures` | `Textures`, `newTextures`; `registerTexture` with a `MarkPolicy`; `swapTexture` with a `SwapPolicy`; `TextureRefusal`; the logical release marker (`markReleased`, `isReleased`), `releaseTextureNow`; `registeredMark`, `registeredMarks` |
-| `Hetoimasia.Render.TwoD.Vulkan.Window` | the host adapter: `Host`, `Adapter`, `newAdapter`; `Scene2D`, `blankScene`; `publish2DSnapshot`, `PublishRefusal`; `release2DTexture`, `release2DChunk`; `adapterAdopted`, `adapterReleased`, `retryReleases`, `textureHolds`, `chunkHolds`; `FrameInfo`, `renderWindowFrame`, `pendingChunkUploads` |
+| `Hetoimasia.Render.TwoD.Vulkan.Window` | the host adapter: `Host`, `Adapter`, `newAdapter`; `Scene2D`, `blankScene`; `publish2DSnapshot`, `PublishRefusal`; `release2DTexture`, `release2DChunk`; `adapterAdopted`, `adapterReleased`, `retryReleases`, `textureHolds`, `chunkHolds`; `FrameInfo`, `renderWindowFrame`, `pendingChunkUploads`, `failedChunkUploads`; `RegionOverflow`, `regionOverflow`; `tablesRefusal` |
 | `Hetoimasia.Render.TwoD.Vulkan.Frame` | `Attachment`, `offscreenAttachment`, `TargetBinding`, `DepthBinding`, `FrameInput`; `depthLayers`, `requireWorldDepth`, `worldDepthShortfall`; `FrameRefusal`; `frameWork` and the work it computes: `PassWork`, `ViewWork`, `LayerWork`, `RunWork`, `RunReads`, `RunRecords`, `RecordKey`, `PipelineKind`, `runPipeline`; the clip region: `viewDraws`, `clipRegion`, `requireClipWindow`; the region with the material records: `recordRegion`, `RecordRegion`, `requireRegionWindow`; `unissuedMaterial` |
 | `Hetoimasia.Render.TwoD.Vulkan.Material` | `defineMaterial`, the Template Haskell splice; `MaterialDeclaration` (`declaredCutoutCapable`, `declaredRecord`, `declaredPush`, `declaredSource`), `PushField`, `PushType`, `PushOffset`, `RecordLayout`; `DefinedMaterial` (`definedFacts`, `definedPush`, `definedTranslucent`, `definedCutout`), `definedPushBytes`; the limits `applicationPushOffset`, `applicationPushLimit`, `maxRecordHandles`, `maxRecordWords` |
 | `Hetoimasia.Render.TwoD.Vulkan.MaterialSources` | what a declaration comes to, pure: `layOut`, `Laid`, `declarationProblems`, and the GLSL and interface descriptions the splice compiles and checks (`materialVertexSource`, `materialFragmentSource`, `materialVertexInterface`, `materialFragmentInterface`) |
@@ -441,14 +441,19 @@ frame's image. A host (the window integration in its per-window mode) gives it
 `Host window`: `hostPublish`, which publishes a `Scene2D` for a window and
 answers the revision or why not; `hostRequestRelease`, which queues an
 owner-thread action behind the revisions the host must have adopted first,
-naming the windows it holds at the request; and `hostRunOnOwner`, which queues
-one that waits for nothing.
-`newAdapter host textures renderer` makes it over the registry and the renderer
-whose session depth format publication checks; the host's lifecycle hooks call
-`adapterAdopted` and `adapterReleased`; the host's renderer calls
-`renderWindowFrame adapter`. A host that draws depth-enabled world layers
-enables `vulkanWindowDepth` in its `VulkanHostConfig`, which gives each frame's
-request its generation's depth image.
+naming the windows it holds at the request; `hostRunOnOwner`, which queues
+one that waits for nothing; and `hostWindowDepth`, whether the window host gives
+each frame's request a depth image. A host fills `hostWindowDepth` from the
+setting that configures the integration's `vulkanWindowDepth` in its
+`VulkanHostConfig` (the sample, the native Image2d case and the stand-in host do):
+that setting is what gives each frame's request its generation's depth image, and
+the adapter cannot see it, so the record says so.
+`newAdapter host textures retained renderer` makes it over the registries and the
+renderer whose session depth format and storage window publication checks; the
+host's lifecycle hooks call `adapterAdopted` and `adapterReleased`; the host's
+renderer calls `renderWindowFrame adapter window`, with the window the frame's
+attachment belongs to (`attachmentWindow` of the request's attachment) and the
+request's scene revision in `FrameInfo`'s `frameRevision`.
 
 **Publishing.** `publish2DSnapshot adapter window snapshot` validates the
 snapshot and publishes it for one window, answering the window's revision. It
@@ -472,8 +477,58 @@ is refused, checking in this order:
    chunk and how its upload ended, when it lists one whose upload ended without
    completing (a chunk whose upload is still under way is **not** refused:
    publication never waits, D-28);
-7. what the host answers: `PublishWindowUnknown`, `PublishHostClosed` or
+7. `WindowDepthMissing`, naming the layer, when the snapshot holds a
+   depth-enabled world layer and `hostWindowDepth` is `False`: every frame of
+   it would be refused (`NoDepthTarget`) whatever is done again, so it is refused
+   whether or not the layer's view leaves it any pixel, and a snapshot with no
+   such layer is unaffected. It follows 4, so `WorldDepthRefused` has precedence;
+8. `FrameTablesNotRepresentableInSnapshot`, naming the pass, the view and the
+   block's size in bytes, when the frame tables of a view that draws do not fit
+   their 32-bit words, and `TablesTooLarge`, naming the size and the storage
+   window, when the snapshot's own tables are larger than the window (below).
+   Both carry their sizes as `Integer`s, never narrowed;
+9. what the host answers: `PublishWindowUnknown`, `PublishHostClosed` or
    `PublishHostShared`.
+
+Steps 7 and 8 are the conditions that make every frame of the snapshot refuse at
+recording whatever the application does with it; the host retries every refused
+frame, so they are refused where the publisher is told instead of accepted and
+retried for ever. Nothing else changes: every other refusal keeps its meaning
+and its place, and recording keeps its own `NoDepthTarget`, `ClipTablesTooLarge`
+and `RecordsTooLarge` as a backstop for a caller that records without the adapter.
+
+**The bound of step 8.** The clip tables, the frame tables and the views' own
+material records are the snapshot's, and so is their size, whatever the frame's
+metrics. `snapshotTablesBound` counts them as if every view that has a run drew,
+and no chunk were skipped, in the layout the recorder writes: for each such view,
+its clip table once for each space (world or UI) one of its layers selects a clip
+from, 16 bytes an entry, a single zero entry for a drawing frame that selects none;
+then its records of each material its dynamic instances use, once, 4 bytes a word,
+8 a handle; then its frame block, on a 16-byte boundary, a directory of a word for
+each table rounded up to four, then for each table four header words and four for
+each frame. It is exact when every counted view draws and the scene lists no
+chunk (the tests compare it with the region the recorder writes), and it is never
+less than what a frame writes for those parts under any metrics, so a snapshot it
+lets through is never refused for them at recording. A view with a zero-size
+viewport, or with no instance, has no run and counts for nothing; a view wholly
+outside the target counts in full, because another frame would draw it. All of it
+is `Integer` arithmetic from counts, done before a byte is packed
+(`regionBound`).
+
+**A frame whose region is too large.** The records of the chunks a view does not
+cull are the remainder: which chunks those are depends on the frame's metrics and
+the cameras, so a published scene can still have a frame whose whole region
+outgrows the window. That frame records nothing, as before, but the refusal
+reaches the host as every other does, to be retried, so the adapter also keeps it
+for the application: `regionOverflow adapter window` answers `RegionOverflow`, the
+scene revision the frame was for, the region's size and the storage window
+(`ClipTablesTooLarge` is kept the same way, with the clip tables' size). The
+observation is cleared when a later frame of that window records, and by nothing
+else — publishing, adopting and any other refusal of a frame leave it — and one
+window's recording never clears another's. The application's way out is a
+snapshot that culls those chunks (or lists fewer), after which the next frame
+clears it. When the host reports the window's last revision released
+(`adapterReleased`), the window is retired and its observation is dropped with it.
 
 Step 1 resolves the chunks the snapshot lists against the registry
 (`validateSnapshotWith`), the registry read once as a coherent view
@@ -860,6 +915,7 @@ functions in the fragment stage, so an application material (R2D-11) replaces
 | Each registered handle's mark and release flag | A `Textures` (a `TVar` ledger keyed by the complete handle) | `registerTexture` adds; `markReleased` flags; `releaseTextureNow` removes the mark; any thread reads in STM | Registration, swap and table release on the owner; marker and reads on any | From the registration until the table release | The flag is never cleared: a released handle stays refused after its index is reused |
 | Each chunk's description, device buffer and upload ticket, its release flag, the generation of every index and the indices free to reuse | A `Retained` (a `TVar` ledger keyed by the complete reference) | `buildRetainedChunk` adds (and releases the buffer it made if it refuses or is interrupted); `markChunkReleased` flags; `releaseChunkNow` releases the buffer and forgets the chunk; any thread reads in STM | Build, buffer release and `releaseChunkNow` on the owner; marker and reads on any | From the build until the buffer's release | The flag is never cleared: the reference is forgotten with the chunk and its index reused under the next generation |
 | The holds (window and revision to the textures and chunks that revision references), the pending releases with their stage, and the objects whose follow-up action is queued | An `Adapter` | `adapterAdopted` and `adapterReleased` on the owner's thread; the release action on the owner's thread; reads on any | Owner writes, any reads | From the adapter's creation until it is dropped | A revision's hold is dropped by its release; a pending object leaves the set when its release runs |
+| The latest region overflow of each window (revision, region size, storage window) | An `Adapter` (one `TVar` map, one transaction for each change) | `renderWindowFrame` writes it when it refuses a frame for its region and removes it when a frame of the window records; `adapterReleased` removes it with the window's last revision; `regionOverflow` reads | Owner writes, any reads | From the refusal until a frame of the window records, or until the window's last revision is released | Never cleared by publication, adoption or another refusal; one window's entry is untouched by another's |
 | The publication lock | An `Adapter` | `publish2DSnapshot` and `release2DTexture`, each for its whole length | Application threads | The adapter's life | None |
 
 A `Renderer` holds an `IORef` of the pipelines and is used on the graphics
