@@ -113,7 +113,7 @@ Everything that can refuse is decided first, in `frameWork`, which is pure:
 | `ClipTablesTooLarge bytes window` | the batch's packed clip tables (below) are `bytes` long, and the window is only `window` bytes |
 | `MaterialNotIssued location material` | an instance, or an instance of a chunk a layer lists, names a material the session did not issue, whether another session's reference or one `materialRef` built (the built-in default is every session's); a chunk is checked by its material set, and scanned only to name the first instance that uses a refused material |
 | `MaterialFactsDisagree location named issued` | an instance names a reference with the identity of a material the session issued but other facts than it was issued with |
-| `RecordsTooLarge bytes window` | the batch's whole region, its clip tables and its material records, is `bytes` long and the window is only `window` bytes |
+| `RecordsTooLarge bytes window` | the batch's whole region, its clip tables, its material records and the frame tables of the views that draw, is `bytes` long and the window is only `window` bytes |
 | `FrameTablesNotRepresentable pass view bytes` | the frame tables a drawing view holds (R2D-18, [below](#frame-tables-r2d-18)) pack into a block of `bytes` bytes in which a size, an offset or a header value does not fit its 32-bit word |
 | `RefusedByBackend refusal` | the backend refused a pipeline, a claim or a command |
 

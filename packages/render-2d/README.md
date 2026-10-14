@@ -632,7 +632,7 @@ under a point stays the game's question.
 **Float resolution.** The transforms hold 32-bit coefficients. The world
 translation is the viewport's centre minus the scale times the camera position,
 and once that product exceeds 2²³ pixels one ulp of it is more than a pixel:
-the mapping is still finite and inverts exactly what it holds, but the camera
+the mapping is still finite and inverts what it holds, to within floating-point rounding, but the camera
 position then appears at the centre only to that resolution, with snap on or
 off (scale 40960 pixels per unit at position 999.99 lands pixels away). The
 half-pixel promise is unaffected, because it compares a position with its own
