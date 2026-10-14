@@ -29,7 +29,8 @@
 --
 -- = State
 --
--- A 'Ledger' is an immutable value; the registry ("Hetoimasia.Render.TwoD.Vulkan.Textures")
+-- A 'Ledger' is an immutable value, built strictly (an update is evaluated
+-- before it is returned, so a chain of updates never builds up); the registry ("Hetoimasia.Render.TwoD.Vulkan.Textures")
 -- holds it in a @TVar@ and replaces it in a transaction. An index's entry is
 -- created by its first registration and lives for the life of the registry; a
 -- later registration at the index overwrites it in place.
@@ -70,13 +71,13 @@ emptyLedger = Ledger Map.empty
 -- unmarked as released, and whatever the index held before is stale.
 registerHandle ∷ Api.TextureHandle → Bool → Ledger → Ledger
 registerHandle handle mark (Ledger entries) =
-  Ledger (Map.insert (ApiBackend.handleIndex handle) (Entry (ApiBackend.handleGeneration handle) (Just mark) False) entries)
+  Ledger $! Map.insert (ApiBackend.handleIndex handle) (Entry (ApiBackend.handleGeneration handle) (Just mark) False) entries
 
 -- | The table release of a handle: its mark is forgotten when it is the
 -- index's current handle. A stale handle changes nothing, and the release
 -- marker is kept either way.
 forgetMark ∷ Api.TextureHandle → Ledger → Ledger
-forgetMark handle (Ledger entries) = Ledger (Map.adjust forget (ApiBackend.handleIndex handle) entries)
+forgetMark handle (Ledger entries) = Ledger $! Map.adjust forget (ApiBackend.handleIndex handle) entries
   where
     forget entry
       | entryGeneration entry == ApiBackend.handleGeneration handle = entry {entryMark = Nothing}
@@ -90,7 +91,7 @@ markHandleReleased handle (Ledger entries) = case Map.lookup (ApiBackend.handleI
     | entryGeneration entry == ApiBackend.handleGeneration handle
     , Just _ ← entryMark entry
     , not (entryReleased entry) →
-        Just (Ledger (Map.insert (ApiBackend.handleIndex handle) entry {entryReleased = True} entries))
+        Just $! Ledger $! Map.insert (ApiBackend.handleIndex handle) entry {entryReleased = True} entries
   _ → Nothing
 
 -- | Whether the policy reports the handle released.

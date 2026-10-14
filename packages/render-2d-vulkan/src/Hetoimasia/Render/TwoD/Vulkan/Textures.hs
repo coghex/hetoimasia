@@ -85,6 +85,7 @@ module Hetoimasia.Render.TwoD.Vulkan.Textures
   , registeredMark
   , registeredMarks
   , retainedEntries
+  , currentLedger
   , toBackendHandle
   , fromBackendHandle
   ) where
@@ -164,7 +165,9 @@ registerTexture builders (Textures ledger) image decoded policy =
             OverrideMark explicit → explicit
       atomically $ do
         held ← readTVar ledger
-        writeTVar ledger (Ledger.registerHandle handle mark held)
+        -- Strict: a lazy write would keep the previous ledger alive in a thunk, a
+        -- history of updates as long as the number of registrations.
+        writeTVar ledger $! Ledger.registerHandle handle mark held
       pure (Right handle)
 
 -- | Swap a registered handle to a replacement under the mark rule. Refused,
@@ -210,7 +213,7 @@ releaseTextureNow builders (Textures ledger) handle =
     Right () → do
       atomically $ do
         held <- readTVar ledger
-        writeTVar ledger (Ledger.forgetMark handle held)
+        writeTVar ledger $! Ledger.forgetMark handle held
       pure (Right ())
 
 -- | Mark a handle released, at once, for publication's check. 'False' for one
@@ -224,7 +227,7 @@ markReleasedSTM ∷ Textures → Api.TextureHandle → STM Bool
 markReleasedSTM (Textures ledger) handle = do
   held ← readTVar ledger
   case Ledger.markHandleReleased handle held of
-    Just marked → True <$ writeTVar ledger marked
+    Just marked → True <$ (writeTVar ledger $! marked)
     Nothing → pure False
 
 -- | Whether the handle is released: its release is marked and it is its
@@ -238,6 +241,12 @@ isReleased (Textures ledger) handle = (`Ledger.handleReleased` handle) <$> readT
 -- registered, stale, or already released in the table.
 registeredMark ∷ Textures → Api.TextureHandle → IO (Maybe Bool)
 registeredMark (Textures ledger) handle = (`Ledger.markOf` handle) <$> readTVarIO ledger
+
+-- | The ledger as the registry stores it, without evaluating it, for a test to
+-- inspect that the stored value is evaluated rather than a chain of pending
+-- updates (see 'registerTexture').
+currentLedger ∷ Textures → IO Ledger.Ledger
+currentLedger (Textures ledger) = readTVarIO ledger
 
 -- | How many entries the registry retains: all of its state, one per lookup
 -- index registered at.

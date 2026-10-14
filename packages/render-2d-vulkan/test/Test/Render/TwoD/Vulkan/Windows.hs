@@ -18,9 +18,10 @@ module Test.Render.TwoD.Vulkan.Windows (spec) where
 
 import Control.Concurrent.STM (atomically, readTVarIO, writeTVar)
 import Control.Exception (AsyncException (ThreadKilled), try)
-import Data.Foldable (toList)
+import Data.Foldable (for_, toList)
 import Data.List.NonEmpty (NonEmpty ((:|)))
 import qualified Data.Set as Set
+import GHC.Exts.Heap (GenClosure (..), getClosureData)
 import qualified Data.Text as Text
 import Hetoimasia.GPU.Vulkan.Native.Recording (ImageFormat (..), PipelineDepth (..), PipelineRequest (..), Refusal (..))
 import Hetoimasia.GPU.Vulkan.Native.TextureTable (TableView (..), readTable)
@@ -209,6 +210,19 @@ publishSpec = describe "publishing a snapshot" $ do
       image ← uploadedTexture (envRig env) (bytesOf 4)
       stale ← swapTexture (builders (envRig env)) (envTextures env) g1 image (decodedWith True) RefuseMarkChange
       either Just (const Nothing) stale `shouldBe` Just (TextureUnknown g1)
+
+  it "stores the ledger evaluated, so consecutive unmarked direct-release cycles retain no history of pending updates" $
+    withEnv [1] $ \env → do
+      -- Each registration and each direct table release writes the ledger and nothing
+      -- reads it between: a lazy write would leave a thunk holding the previous ledger, a
+      -- chain as long as the cycle count, which a later query would only then force away.
+      for_ [1 .. 1000 ∷ Int] $ \n → do
+        handle ← registered env (fromIntegral (n `mod` 200) + 1) False DefaultMark
+        releaseTextureNow (builders (envRig env)) (envTextures env) handle >>= either (fail . show) pure
+      stored ← currentLedger (envTextures env)
+      closure ← getClosureData stored
+      pending closure `shouldBe` False
+      retainedEntries (envTextures env) >>= (`shouldBe` 1)
 
   it "retains release state bounded by the indices registered at, however many textures are registered and released" $
     withEnv [1] $ \env → do
@@ -634,3 +648,14 @@ depthSpec = describe "world depth" $ do
         Left (RefusedIllegal reason) → reason `shouldSatisfy` Text.isInfixOf (Text.pack (show (DepthFormatRefused (AtLayer 0 0 1) Depth24)))
         other → expectationFailure ("expected the lower-precision format to be refused, found " <> show other)
       pipelinesMade (envRig env) >>= (`shouldBe` [])
+
+-- | Whether a closure is still to be evaluated: a thunk, an application or a
+-- selector, each of which holds on to what it was built from.
+pending ∷ GenClosure b → Bool
+pending = \case
+  ThunkClosure {} → True
+  APClosure {} → True
+  PAPClosure {} → False
+  APStackClosure {} → True
+  SelectorClosure {} → True
+  _ → False
