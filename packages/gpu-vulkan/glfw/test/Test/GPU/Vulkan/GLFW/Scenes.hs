@@ -99,10 +99,11 @@ spec = describe "Vulkan scenes for each window (R2D-14)" $ do
     itBounded "wait for the revision current when they were made, observably, and run once the window adopts it" testRequestWaitsForAdoption
     itBounded "wait for a window with a publication and no target, run in the order made without holding back an action that has no barrier, and are released by that window's end" testRequestOrderAndWindowEnd
     itBounded "wait for every window the host holds, even one with no target and no publication, in a per-window host and in a shared one" testTargetlessWindowHolds
+    itBounded "leave out a window that has never published when the host declares its initial scene holds nothing, and still wait for a published window with no target until a target adopts it or the window is dropped, in a per-window host and in a shared one" testNeverPublishedWindowLeavesBarrier
     itBounded "are not delayed by a window created after they were made" testRequestIgnoresLaterWindow
-    itBounded "wait for a window whose adopting target was released until another adopts, in a per-window host and in a shared one" testDetachedWindowHoldsRequest
+    itBounded "wait for a window whose adopting target was released until another adopts, in a per-window host and in a shared one, with the host's declaration and without" testDetachedWindowHoldsRequest
     itBounded "wait on a shared scene's revision for every window in a shared host" testRequestSharedMode
-    itBounded "are refused when the queue is full and before the device exists, and settled as refused, never replayed, when the owner exits" testRequestAdmission
+    itBounded "are refused when their own bound is full, never by the actions queued, and before the device exists, and settled as refused, never replayed, when the owner exits" testRequestAdmission
     itBounded "are refused after the session's failure, including one queued before it that never started" testRequestAfterFailure
     itBounded "are refused after a failure reported while the owner is idle, which the next publication brings to its checkpoint, including one queued before it that never started" testRequestAfterFailureWhileIdle
 
@@ -599,6 +600,68 @@ testTargetlessWindowHolds = do
     whileHeld `shouldBe` ["plain"]
     afterEnd `shouldBe` ["plain", "request"]
 
+-- | A host that declares its initial scene references nothing a release
+-- request releases is not held by a window that has never published: in a
+-- per-window host one with no publication, in a shared host every window while
+-- the shared scene is unpublished. The request runs at the next owner step and
+-- names nothing, though the observation still reports revision 0. A window that
+-- has published, with no live target, is named as ever, and holds every later
+-- request until a target of it adopts the barrier's revision or the host drops
+-- the window; publishing another blank scene is a publication too.
+testNeverPublishedWindowLeavesBarrier ∷ IO ()
+testNeverPublishedWindowLeavesBarrier =
+  forM_' [(label, build, publish, adopt, value) | (label, build, publish) ← hosts, (adopt, value) ← [(True, 5), (False, 5), (True, 0)]] $ \(label, build, publish, adopt, value) → do
+    rig ← withInitialSceneHoldsNothing <$> build
+    (unpublished, afterPublish, order) ← runRig rig $ \host control → do
+      windows ← windowsOf host
+      c ← case drop 2 windows of
+        third : _ → pure third
+        [] → failWith "the host holds fewer than three windows"
+      (a, _, b, _) ← attachBoth rig host control
+      ran ← newTVarIO []
+      -- C has no target, and nothing has been published: the request names no
+      -- window, and runs without any window adopting anything.
+      _ ← request host (mark ran "never published")
+      beforeRun ← atomically (readVulkanSceneState (vulkanController host))
+      composedUntil rig host control "the request's run" ((== ["never published"]) <$> readTVarIO ran)
+      -- C publishes. It still has no target, so the next request is held to it.
+      _ ← publish host c value
+      _ ← request host (mark ran "published")
+      afterPublish ← atomically (readVulkanSceneState (vulkanController host))
+      _ ← atomically (submitVulkanAction (vulkanController host) (mark ran "plain")) >>= either (\refusal → failWith ("refused: " <> show refusal)) pure
+      composedUntil rig host control "the plain action's run" ((== ["never published", "plain"]) <$> readTVarIO ran)
+      settleOwner rig host
+      whileHeld ← readTVarIO ran
+      if adopt
+        then void (attach host c)
+        else do
+          CloseStarted ← closeHostWindow (vulkanWindowHost host) c
+          pure ()
+      composedUntil rig host control "the held request's run" ((== 3) . length <$> readTVarIO ran)
+      finished ← readTVarIO ran
+      pure ((a, b, c, beforeRun), (afterPublish, whileHeld), finished)
+    let (a, b, c, beforeRun) = unpublished
+    -- Observed unfiltered: C's published revision is still 0.
+    (label, fmap windowPublished (Map.lookup c (sceneWindows beforeRun))) `shouldBe` (label, Just (Just 0))
+    (label, sceneRequests beforeRun) `shouldBe` (label, [Map.empty])
+    let (published, whileHeld) = afterPublish
+    -- The request made after C published names it, at its revision, and the
+    -- window with no target holds it however long it waits.
+    -- In a shared host the one scene is every window's, so the others are
+    -- named at its revision too; in a per-window host only C is.
+    (label, sceneRequests published)
+      `shouldBe` (label, [Map.fromList ([(c, 1)] <> [(window, 1) | sharedHost label, window ← [a, b]])])
+    (label, whileHeld) `shouldBe` (label, ["never published", "plain"])
+    (label, order) `shouldBe` (label, ["never published", "plain", "published"])
+  where
+    hosts ∷ [(String, IO Rig, VulkanHost Scene → WindowId → Scene → IO ())]
+    hosts =
+      [ ("a per-window host", scenesRig 3, \host window scene → void (publishTo host window scene))
+      , ("a shared host", visibleRigOf 3, \host _ scene → void (prepare scene >>= publishVulkanScene host))
+      ]
+    sharedHost ∷ String → Bool
+    sharedHost label = label == "a shared host"
+
 testRequestIgnoresLaterWindow ∷ IO ()
 testRequestIgnoresLaterWindow = do
   rig ← scenesRig 3
@@ -661,7 +724,7 @@ testRequestAdmission = do
   refusedEarly ← runRig early $ \host _ →
     either Just (const Nothing) <$> atomically (requestVulkanRelease (vulkanController host) (VulkanAction (\_ → pure ())))
   refusedEarly `shouldBe` Just ActionDeviceNotReady
-  rig ← withActionCapacity 1 <$> scenesRig 3
+  rig ← withReleaseCapacity 1 . withActionCapacity 1 <$> scenesRig 3
   ran ← newTVarIO []
   (full, ticket, controller) ← runRig rig $ \host control → do
     windows ← windowsOf host
@@ -671,19 +734,24 @@ testRequestAdmission = do
     _ ← attachBoth rig host control
     _ ← publishTo host c 1
     held ← request host (mark ran "held")
-    -- The queue holds its whole capacity: one more is refused at once, and
-    -- nothing waits for room.
+    -- The queue holds its whole release capacity: one more request is refused
+    -- at once, and nothing waits for room. The queued request is no action's
+    -- business: an action is admitted against its own bound, which a held
+    -- request does not count toward, and so it is refused only once the
+    -- actions themselves fill it.
     full ← atomically (requestVulkanRelease (vulkanController host) (mark ran "full"))
     plain ← atomically (submitVulkanAction (vulkanController host) (mark ran "plain"))
     pure ((either Just (const Nothing) full, either Just (const Nothing) plain), held, vulkanController host)
-  fst full `shouldBe` Just ActionQueueFull
-  snd full `shouldBe` Just ActionQueueFull
+  fst full `shouldBe` Just ReleaseQueueFull
+  snd full `shouldBe` Nothing
   -- Still queued when the owner's exit began, it was refused and never run;
   -- and the closed owner admits no more.
   atomically (readVulkanAction ticket) >>= \case
     Just (ActionRefused ActionOwnerClosed) → pure ()
     _ → failWith "the queued request was not settled as refused by the owner's closing"
-  readTVarIO ran >>= (`shouldBe` [])
+  -- The admitted action may have run before the exit; the refused request
+  -- and the held one never did.
+  readTVarIO ran >>= (`shouldSatisfy` all (== "plain"))
   late ← atomically (requestVulkanRelease controller (VulkanAction (\_ → pure ())))
   either Just (const Nothing) late `shouldBe` Just ActionOwnerClosed
 
@@ -899,7 +967,7 @@ testLedgerCancellation = do
     [window] ← windowsOf host
     service ← attach host window
     let attachment = graphicsAttachment service
-    scenes ← newScenes
+    scenes ← newScenes False
     atomically (registerSceneTarget scenes attachment)
     hooks ← newTVarIO ([] ∷ [String])
     entered ← newEmptyMVar
@@ -1040,7 +1108,12 @@ testDetachedWindowHoldsRequest ∷ IO ()
 testDetachedWindowHoldsRequest = do
   perWindow ← scenesRig 1
   shared ← visibleRigOf 1
-  forM_' [(perWindow, \host window → void (publishTo host window 7)), (shared, \host _ → void (prepare 7 >>= publishVulkanScene host))] $ \(rig, publish) → do
+  declaringPerWindow ← withInitialSceneHoldsNothing <$> scenesRig 1
+  declaringShared ← withInitialSceneHoldsNothing <$> visibleRigOf 1
+  -- The declaration changes nothing here: the window has published, so a
+  -- request names it, and the watermark of the target that ended counts for
+  -- nothing.
+  forM_' [(perWindow, \host window → void (publishTo host window 7)), (shared, \host _ → void (prepare 7 >>= publishVulkanScene host)), (declaringPerWindow, \host window → void (publishTo host window 7)), (declaringShared, \host _ → void (prepare 7 >>= publishVulkanScene host))] $ \(rig, publish) → do
     (whileDetached, afterReattach) ← runRig rig $ \host control → do
       [window] ← windowsOf host
       service ← attach host window

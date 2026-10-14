@@ -91,6 +91,9 @@ spec = describe "Vulkan surface-free sessions and owner-thread actions" $ do
     itBounded "run on the owner's thread with the session's construction, and return their results" testActionOnOwner
     itBounded "are refused as device-not-ready before the first window's admission by default, creating nothing, and run after it" testDeviceNotReady
     itBounded "are refused at once when the queue is full, never waiting for room" testQueueFull
+    itBounded "and release requests are bounded separately: each class is refused at its own capacity, never by the other's entries, in order, with slots reused" testSeparateQueueBounds
+    itBounded "and release requests refuse at once with a capacity of zero, each class independently of the other" testZeroQueueBounds
+    itBounded "and release requests report a device, session or owner refusal before a full queue" testRefusalPrecedence
     itBounded "return a raising action's failure to the caller, keep what it constructed managed, and let the owner go on" testRaisingAction
     itBounded "end the owner's run when a construction inside one loses the device, never answering it as the action's own failure alone" testEscapedConstruction
     itBounded "end the owner's run with a construction's loss that the action caught and returned from, answering the ticket with the loss" testCaughtEscape
@@ -227,6 +230,92 @@ testQueueFull = do
   full `shouldBe` Just ActionQueueFull
   let (held, first, second) = outcomes
   (outcomeValue held, outcomeValue first, outcomeValue second) `shouldBe` (Right (), Right 1, Right 2)
+
+-- | Release requests and actions share the queue but not their bounds: each
+-- class is refused at its own capacity (an empty barrier counts), the other's
+-- entries never count against it, they run in the order they were made, and a
+-- slot the owner took is free again.
+testSeparateQueueBounds ∷ IO ()
+testSeparateQueueBounds = do
+  rig ← withReleaseCapacity 2 . withActionCapacity 3 <$> surfaceFreeRig 0
+  ran ← newTVarIO ([] ∷ [String])
+  rounds ← runRig rig $ \host _ → do
+    awaitReady host
+    let controller = vulkanController host
+        mark tag = VulkanAction (\_ → atomically (modifyTVar' ran (<> [tag])))
+        round' label = do
+          (gate, running, holding) ← holdingAction
+          held ← admitted =<< atomically (submitVulkanAction controller holding)
+          atomically (readTVar running >>= check)
+          -- The owner is inside the holding action, which holds no slot. Three
+          -- actions and two release requests, interleaved, are all admitted:
+          -- five entries in a queue neither bound is five long, so neither
+          -- class counted the other.
+          a1 ← admitted =<< atomically (submitVulkanAction controller (mark (label <> " action 1")))
+          r1 ← admitted =<< atomically (requestVulkanRelease controller (mark (label <> " release 1")))
+          a2 ← admitted =<< atomically (submitVulkanAction controller (mark (label <> " action 2")))
+          r2 ← admitted =<< atomically (requestVulkanRelease controller (mark (label <> " release 2")))
+          a3 ← admitted =<< atomically (submitVulkanAction controller (mark (label <> " action 3")))
+          -- Each class is now full, and refused at once, with its own reason.
+          fullRelease ← atomically (requestVulkanRelease controller (mark (label <> " release 3")))
+          fullAction ← atomically (submitVulkanAction controller (mark (label <> " action 4")))
+          atomically (writeTVar gate True)
+          _ ← atomically (awaitVulkanAction held)
+          mapM_ (atomically . awaitVulkanAction) [a1, a2, a3]
+          mapM_ (atomically . awaitVulkanAction) [r1, r2]
+          pure (refusalOf fullRelease, refusalOf fullAction)
+    first ← round' "first"
+    -- Every slot was taken by the owner, so the same bounds hold again.
+    second ← round' "second"
+    pure [first, second]
+  rounds `shouldBe` replicate 2 (Just ReleaseQueueFull, Just ActionQueueFull)
+  ranInOrder ← readTVarIO ran
+  ranInOrder
+    `shouldBe` [ label <> " " <> what
+               | label ← ["first", "second"]
+               , what ← ["action 1", "release 1", "action 2", "release 2", "action 3"]
+               ]
+
+-- | A capacity of zero refuses its own class at once and leaves the other's
+-- alone, whichever class it is.
+testZeroQueueBounds ∷ IO ()
+testZeroQueueBounds = do
+  noReleases ← withReleaseCapacity 0 <$> surfaceFreeRig 0
+  (release, action) ← runRig noReleases $ \host _ → do
+    awaitReady host
+    release ← atomically (requestVulkanRelease (vulkanController host) (VulkanAction (\_ → pure ())))
+    action ← returned =<< act host (VulkanAction (\_ → pure ("ran" ∷ String)))
+    pure (refusalOf release, action)
+  (release, action) `shouldBe` (Just ReleaseQueueFull, "ran")
+  noActions ← withActionCapacity 0 <$> surfaceFreeRig 0
+  (refused, request) ← runRig noActions $ \host _ → do
+    awaitReady host
+    refused ← atomically (submitVulkanAction (vulkanController host) (VulkanAction (\_ → pure ())))
+    -- Its barrier is empty, so it runs at the next owner step.
+    ticket ← admitted =<< atomically (requestVulkanRelease (vulkanController host) (VulkanAction (\_ → pure ("released" ∷ String))))
+    request ← returned =<< atomically (awaitVulkanAction ticket)
+    pure (refusalOf refused, request)
+  (refused, request) `shouldBe` (Just ActionQueueFull, "released")
+
+-- | A failed session, a closed owner and a missing device are refused as they
+-- always were, ahead of a full queue, for an action and for a release request.
+testRefusalPrecedence ∷ IO ()
+testRefusalPrecedence = do
+  rig ← withReleaseCapacity 0 . withActionCapacity 0 <$> newRig
+  (before, full, controller) ← runRig rig $ \host _ → do
+    awaitReady host
+    let both = (,) <$> submitVulkanAction (vulkanController host) (VulkanAction (\_ → pure ())) <*> requestVulkanRelease (vulkanController host) (VulkanAction (\_ → pure ()))
+        refusals = (\(a, r) → (refusalOf a, refusalOf r))
+    before ← refusals <$> atomically both
+    [window] ← windowsOf host
+    service ← handedOver host window RequiredTarget
+    TargetUsable ← awaitStanding host service
+    full ← refusals <$> atomically both
+    pure (before, full, vulkanController host)
+  before `shouldBe` (Just ActionDeviceNotReady, Just ActionDeviceNotReady)
+  full `shouldBe` (Just ActionQueueFull, Just ReleaseQueueFull)
+  late ← atomically ((,) <$> submitVulkanAction controller (VulkanAction (\_ → pure ())) <*> requestVulkanRelease controller (VulkanAction (\_ → pure ())))
+  (refusalOf (fst late), refusalOf (snd late)) `shouldBe` (Just ActionOwnerClosed, Just ActionOwnerClosed)
 
 testRaisingAction ∷ IO ()
 testRaisingAction = do

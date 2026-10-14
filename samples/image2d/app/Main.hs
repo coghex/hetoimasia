@@ -215,6 +215,9 @@ run mode validation = do
         base
           { vulkanRenderer = imageRenderer prepared frame adapterSlot
           , vulkanWindowDepth = True
+          , -- The initial scene is 'blankScene', which references no texture or
+            -- chunk, so a window that has not published holds no release.
+            vulkanInitialSceneHoldsNothing = True
           , vulkanUploads = Just uploadConfig
           , vulkanDeviceStart = DeviceSurfaceFree
           , vulkanFrameObserver = \case
