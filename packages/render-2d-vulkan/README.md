@@ -1038,10 +1038,14 @@ handle live until marked, and `swapTexture`'s precedence for each); an
 unmarked direct release followed by a marked release at the reused index, with
 both old handles refused at publication and the third generation published;
 a thousand register-and-release cycles, marked and unmarked, whose retained
-entries stay at most one for each index registered at; and a thousand unmarked
-direct-release cycles with no read between them, after which the stored ledger
-is an evaluated value and not a chain of pending updates (every ledger write is
-strict); publication, its revisions and every refusal; holds taken once
+entries stay at most one for each index registered at; and the whole retained
+state after each write path (default and override registration, the marked release,
+the table release, an unmarked direct release, an accepted and a refused swap, and a
+thousand cycles with no read between them), inspected through the heap, which finds
+no thunk, application or function anywhere in it: an entry holds a generation, a
+strict mark and a flag, never a computation over a decoded image, a handle or an
+earlier ledger (every write evaluates the values it stores, and the mark is a type
+with a strict field); publication, its revisions and every refusal; holds taken once
 however often a texture is named, dropped on release, counted twice for two
 windows, kept by a superseded revision and dropped by a closed window; release
 marked at once, deferred while an adopted snapshot shows the texture and made
