@@ -6,6 +6,7 @@
 -- never read from the code under test.
 module Test.Render.TwoD.Vulkan.Ledger (spec) where
 
+import Control.Exception (evaluate)
 import Data.Maybe (fromMaybe)
 import Data.Word (Word32)
 import qualified Hetoimasia.Render.Api.Texture as Api
@@ -13,6 +14,7 @@ import Hetoimasia.Render.Api.Texture.Backend (textureHandle)
 import Hetoimasia.Render.TwoD.Vulkan.Textures (SwapPolicy (..), TextureRefusal (..), swapCheck)
 import Hetoimasia.Render.TwoD.Vulkan.Textures.Ledger
 import Test.Hspec (Spec, describe, it, shouldBe)
+import Test.Render.TwoD.Vulkan.Evaluated (unevaluatedParts)
 
 h ∷ Word32 → Word32 → Api.TextureHandle
 h = textureHandle
@@ -116,3 +118,20 @@ spec = describe "Ledger (the registry's release policy)" $ do
         many = foldl' cycleAt emptyLedger [1 .. 2000]
         spread = foldl' (\ledger index → registerHandle (h index 1) True ledger) many [6 .. 9]
     (retainedEntries emptyLedger, retainedEntries once, retainedEntries many, retainedEntries spread) `shouldBe` (0, 1, 1, 5)
+
+  it "retains no computation: marks computed from the previous ledger or from a large input are evaluated before they are stored" $ do
+    let -- each registration's mark is computed from the ledger it is registered into
+        chained ledger generation = registerHandle (h 5 generation) (maybe False not (markOf ledger (h 5 (generation - 1)))) ledger
+        deferred = foldl' chained (registerHandle (h 5 1) True emptyLedger) [2 .. 1000]
+        -- and from a long input, which a lazy mark would keep alive
+        input = [1 .. 100000 ∷ Int]
+        fromInput = registerHandle (h 6 1) (sum input > 0) deferred
+    -- Evaluating a ledger to its outermost constructor, as storing it in the
+    -- registry does, is all that is needed to have evaluated what it holds.
+    deferredNow ← evaluate deferred
+    fromInputNow ← evaluate fromInput
+    unevaluatedParts deferredNow >>= (`shouldBe` [])
+    unevaluatedParts fromInputNow >>= (`shouldBe` [])
+    (retainedEntries deferred, retainedEntries fromInput) `shouldBe` (1, 2)
+    -- a mark is the value it was computed to be
+    markOf fromInput (h 5 1000) `shouldBe` Just (odd (1000 ∷ Int))

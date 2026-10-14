@@ -29,8 +29,12 @@
 --
 -- = State
 --
--- A 'Ledger' is an immutable value, built strictly (an update is evaluated
--- before it is returned, so a chain of updates never builds up); the registry ("Hetoimasia.Render.TwoD.Vulkan.Textures")
+-- A 'Ledger' is an immutable value, evaluated all the way down: the map is
+-- strict, an 'Entry' has only strict fields, and its mark is a 'Mark', whose
+-- only field is strict, never a lazy 'Bool' or 'Maybe'. An update evaluates
+-- every value it is given before storing it, so nothing the ledger retains can
+-- be a computation that holds a decoded image, a handle or an earlier ledger
+-- alive: neither a chain of updates nor a mark's inputs build up. The registry ("Hetoimasia.Render.TwoD.Vulkan.Textures")
 -- holds it in a @TVar@ and replaces it in a transaction. An index's entry is
 -- created by its first registration and lives for the life of the registry; a
 -- later registration at the index overwrites it in place.
@@ -60,9 +64,13 @@ newtype Ledger = Ledger (Map Word32 Entry)
 -- marked.
 data Entry = Entry
   { entryGeneration ∷ !Word32
-  , entryMark ∷ !(Maybe Bool)
+  , entryMark ∷ !Mark
   , entryReleased ∷ !Bool
   }
+
+-- | A handle's mark, or none once its table release ran. The 'Bool' is strict,
+-- so a mark that is evaluated holds nothing it was computed from.
+data Mark = NoMark | Mark !Bool
 
 emptyLedger ∷ Ledger
 emptyLedger = Ledger Map.empty
@@ -70,8 +78,8 @@ emptyLedger = Ledger Map.empty
 -- | Register a handle with its mark: it becomes its index's current handle,
 -- unmarked as released, and whatever the index held before is stale.
 registerHandle ∷ Api.TextureHandle → Bool → Ledger → Ledger
-registerHandle handle mark (Ledger entries) =
-  Ledger $! Map.insert (ApiBackend.handleIndex handle) (Entry (ApiBackend.handleGeneration handle) (Just mark) False) entries
+registerHandle !handle !mark (Ledger entries) =
+  Ledger $! Map.insert (ApiBackend.handleIndex handle) (Entry (ApiBackend.handleGeneration handle) (Mark mark) False) entries
 
 -- | The table release of a handle: its mark is forgotten when it is the
 -- index's current handle. A stale handle changes nothing, and the release
@@ -80,7 +88,7 @@ forgetMark ∷ Api.TextureHandle → Ledger → Ledger
 forgetMark handle (Ledger entries) = Ledger $! Map.adjust forget (ApiBackend.handleIndex handle) entries
   where
     forget entry
-      | entryGeneration entry == ApiBackend.handleGeneration handle = entry {entryMark = Nothing}
+      | entryGeneration entry == ApiBackend.handleGeneration handle = entry {entryMark = NoMark}
       | otherwise = entry
 
 -- | Mark a handle's release. 'Nothing' for a handle that is not its index's
@@ -89,7 +97,7 @@ markHandleReleased ∷ Api.TextureHandle → Ledger → Maybe Ledger
 markHandleReleased handle (Ledger entries) = case Map.lookup (ApiBackend.handleIndex handle) entries of
   Just entry
     | entryGeneration entry == ApiBackend.handleGeneration handle
-    , Just _ ← entryMark entry
+    , Mark _ ← entryMark entry
     , not (entryReleased entry) →
         Just $! Ledger $! Map.insert (ApiBackend.handleIndex handle) entry {entryReleased = True} entries
   _ → Nothing
@@ -106,7 +114,10 @@ handleReleased (Ledger entries) handle = case Map.lookup (ApiBackend.handleIndex
 -- release ran, or an index never registered.
 markOf ∷ Ledger → Api.TextureHandle → Maybe Bool
 markOf (Ledger entries) handle = case Map.lookup (ApiBackend.handleIndex handle) entries of
-  Just entry | entryGeneration entry == ApiBackend.handleGeneration handle → entryMark entry
+  Just entry
+    | entryGeneration entry == ApiBackend.handleGeneration handle
+    , Mark mark ← entryMark entry →
+        Just mark
   _ → Nothing
 
 -- | The handles that hold a set mark.
@@ -114,7 +125,7 @@ markedCutouts ∷ Ledger → [Api.TextureHandle]
 markedCutouts (Ledger entries) =
   [ ApiBackend.textureHandle index (entryGeneration entry)
   | (index, entry) ← Map.toAscList entries
-  , Just True ← [entryMark entry]
+  , Mark True ← [entryMark entry]
   ]
 
 -- | How many entries the ledger retains, which is all of its state: one per

@@ -19,9 +19,9 @@ module Test.Render.TwoD.Vulkan.Windows (spec) where
 import Control.Concurrent.STM (atomically, readTVarIO, writeTVar)
 import Control.Exception (AsyncException (ThreadKilled), try)
 import Data.Foldable (for_, toList)
+import Data.IORef (newIORef, readIORef)
 import Data.List.NonEmpty (NonEmpty ((:|)))
 import qualified Data.Set as Set
-import GHC.Exts.Heap (GenClosure (..), getClosureData)
 import qualified Data.Text as Text
 import Hetoimasia.GPU.Vulkan.Native.Recording (ImageFormat (..), PipelineDepth (..), PipelineRequest (..), Refusal (..))
 import Hetoimasia.GPU.Vulkan.Native.TextureTable (TableView (..), readTable)
@@ -39,6 +39,7 @@ import Hetoimasia.Render.TwoD.Vulkan.Textures
 import Hetoimasia.Render.TwoD.Vulkan.Window
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
 import Test.Render.TwoD.Vulkan.Environment
+import Test.Render.TwoD.Vulkan.Evaluated (unevaluatedParts)
 import Test.Render.TwoD.Vulkan.StandIn
 
 spec ∷ Spec
@@ -211,18 +212,47 @@ publishSpec = describe "publishing a snapshot" $ do
       stale ← swapTexture (builders (envRig env)) (envTextures env) g1 image (decodedWith True) RefuseMarkChange
       either Just (const Nothing) stale `shouldBe` Just (TextureUnknown g1)
 
-  it "stores the ledger evaluated, so consecutive unmarked direct-release cycles retain no history of pending updates" $
+  it "keeps the whole retained state evaluated through every write path, so no entry holds a closure over an image, a handle or an earlier ledger" $
     withEnv [1] $ \env → do
-      -- Each registration and each direct table release writes the ledger and nothing
-      -- reads it between: a lazy write would leave a thunk holding the previous ledger, a
-      -- chain as long as the cycle count, which a later query would only then force away.
+      let wholeState ∷ String → IO ()
+          wholeState step = do
+            stored ← currentLedger (envTextures env)
+            unevaluatedParts stored >>= \parts → (step, parts) `shouldBe` (step, [])
+          direct handle = releaseTextureNow (builders (envRig env)) (envTextures env) handle >>= either (fail . show) pure
+      wholeState "empty"
+      -- the default registration path: the mark is computed from the decoded image
+      binary ← registered env 1 True DefaultMark
+      wholeState "default registration, binary alpha"
+      plain ← registered env 2 False DefaultMark
+      wholeState "default registration, not binary"
+      forced ← registered env 3 False (OverrideMark True)
+      wholeState "override registration"
+      -- the deferred mark and the table release of a marked handle
+      release2DTexture (envAdapter env) binary >>= (`shouldBe` Right ())
+      wholeState "marked release"
+      _ ← runQueued env
+      wholeState "table release of a marked handle"
+      -- a direct release that was never marked
+      direct plain
+      wholeState "unmarked direct release"
+      -- a swap, accepted and refused, changes no state
+      replacement ← uploadedTexture (envRig env) (bytesOf 9)
+      _ ← swapTexture (builders (envRig env)) (envTextures env) forced replacement (decodedWith True) RefuseMarkChange
+      wholeState "accepted swap"
+      _ ← swapTexture (builders (envRig env)) (envTextures env) binary replacement (decodedWith True) RefuseMarkChange
+      wholeState "refused swap of a handle whose mark is gone"
+      -- registrations and unmarked direct releases with no read between them
       for_ [1 .. 1000 ∷ Int] $ \n → do
-        handle ← registered env (fromIntegral (n `mod` 200) + 1) False DefaultMark
-        releaseTextureNow (builders (envRig env)) (envTextures env) handle >>= either (fail . show) pure
-      stored ← currentLedger (envTextures env)
-      closure ← getClosureData stored
-      pending closure `shouldBe` False
-      retainedEntries (envTextures env) >>= (`shouldBe` 1)
+        handle ← registered env (fromIntegral (n `mod` 200) + 1) (even n) DefaultMark
+        direct handle
+      wholeState "a thousand unmarked direct-release cycles"
+      retainedEntries (envTextures env) >>= (`shouldSatisfy` (<= 4))
+
+  it "reports what is not evaluated: a computation over an earlier value is found inside a constructor" $ do
+    ref ← newIORef (1 ∷ Int)
+    lazy ← (+ 1) <$> readIORef ref
+    unevaluatedParts (Just lazy) >>= (`shouldSatisfy` (not . null))
+    unevaluatedParts (Just (3 ∷ Int)) >>= (`shouldBe` [])
 
   it "retains release state bounded by the indices registered at, however many textures are registered and released" $
     withEnv [1] $ \env → do
@@ -648,14 +678,3 @@ depthSpec = describe "world depth" $ do
         Left (RefusedIllegal reason) → reason `shouldSatisfy` Text.isInfixOf (Text.pack (show (DepthFormatRefused (AtLayer 0 0 1) Depth24)))
         other → expectationFailure ("expected the lower-precision format to be refused, found " <> show other)
       pipelinesMade (envRig env) >>= (`shouldBe` [])
-
--- | Whether a closure is still to be evaluated: a thunk, an application or a
--- selector, each of which holds on to what it was built from.
-pending ∷ GenClosure b → Bool
-pending = \case
-  ThunkClosure {} → True
-  APClosure {} → True
-  PAPClosure {} → False
-  APStackClosure {} → True
-  SelectorClosure {} → True
-  _ → False

@@ -159,8 +159,10 @@ registerTexture builders (Textures ledger) image decoded policy =
   registerImage builders image >>= \case
     Left refusal → pure (Left (TextureRefusedByBackend refusal))
     Right backend → do
-      let handle = fromBackendHandle backend
-          mark = case policy of
+      -- Both are evaluated here, before the transaction: the mark is computed from
+      -- the decoded image, which the ledger must not keep alive through a thunk.
+      let !handle = fromBackendHandle backend
+          !mark = case policy of
             DefaultMark → decodedBinaryAlpha decoded
             OverrideMark explicit → explicit
       atomically $ do
