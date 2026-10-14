@@ -881,8 +881,8 @@ releaseSpec = describe "releasing chunks behind the window host's barrier" $ do
 
 pressureSpec ∷ Spec
 pressureSpec = describe "rendering a window's scene that lists chunks" $ do
-  let info = FrameInfo (64, 64) 50 (Just (32, 32)) (Just (2, 2)) Nothing
-      renderWith env scene = framelessOnce (envRig env) (renderWindowFrame (envAdapter env) (builders (envRig env)) info scene)
+  let info = FrameInfo (64, 64) 50 (Just (32, 32)) (Just (2, 2)) Nothing 0
+      renderWith env scene = framelessOnce (envRig env) (renderWindowFrame (envAdapter env) (builders (envRig env)) 1 info scene)
       sceneOfRevision env = do
         published <- readTVarIO (fakePublished (envFake env))
         case reverse published of

@@ -15,21 +15,50 @@
 -- = Publishing (D-18, D-28)
 --
 -- 'publish2DSnapshot' validates a candidate snapshot and publishes it for one
--- window. It is refused: with validation's reasons when it is invalid; naming
--- the pass when it holds an offscreen pass, since windowed snapshots hold none
--- until R2D-13 issues target references; when it holds no window pass — an
--- empty snapshot is refused, and removing textures publishes a window pass
--- with no layers, while validation refuses a second one; naming the layer when
--- it holds a depth-enabled world layer and the session's depth format is not
--- @D32_SFLOAT@ (D-23; a snapshot with none is unaffected on any device);
--- naming the texture when it references one whose release has been requested,
--- and the chunk likewise; naming the instance when it names a material the
--- renderer did not issue (R2D-11); and naming the chunk when it lists one whose
--- upload ended without completing (R2D-10). Chunks are resolved against the registry
+-- window. It is refused, in this order:
+--
+-- 1. with validation's reasons when it is invalid ('SnapshotInvalid');
+-- 2. naming the pass when it holds an offscreen pass, since windowed snapshots
+--    hold none until R2D-13 issues target references ('OffscreenPassHeld');
+-- 3. when it holds no window pass ('NoWindowPass') — an empty snapshot is
+--    refused, and removing textures publishes a window pass with no layers,
+--    while validation refuses a second one;
+-- 4. naming the layer when it holds a depth-enabled world layer and the
+--    session's depth format is not @D32_SFLOAT@ ('WorldDepthRefused', D-23; a
+--    snapshot with none is unaffected on any device);
+-- 5. naming the instance when it names a material the renderer did not issue
+--    ('MaterialNotIssuedInSnapshot', R2D-11);
+-- 6. naming the texture when it references one whose release has been requested
+--    ('TextureReleasedInSnapshot'), and the chunk likewise
+--    ('ChunkReleasedInSnapshot');
+-- 7. naming the chunk when it lists one whose upload ended without completing
+--    ('ChunkUploadFailedInSnapshot', R2D-10);
+-- 8. naming the layer when it holds a depth-enabled world layer and the host
+--    gives no window depth ('WindowDepthMissing'), whether or not the layer's
+--    view leaves it any pixel;
+-- 9. when the frame tables of a view that draws do not fit the 32-bit words
+--    their block is addressed by ('FrameTablesNotRepresentableInSnapshot'); and
+-- 10. when the snapshot's own tables, counted as 'snapshotTablesBound' counts
+--     them, are larger than the renderer's storage window ('TablesTooLarge').
+--
+-- Chunks are resolved against the registry
 -- ("Hetoimasia.Render.TwoD.Vulkan.Chunks"): a reference it does not hold, stale
 -- or never issued, is validation's refusal naming the layer and the chunk. A
 -- chunk whose upload is still under way is not refused: publication never waits
 -- (D-28), and a frame that would draw it is skipped instead.
+--
+-- Refusals 8 to 10 are the conditions that make every frame of the snapshot
+-- refuse when it is recorded, whatever is done again with it: a retry changes
+-- none of them, and the host retries every refused frame. Refusing them here,
+-- where the publisher is told, is what keeps a snapshot that can never be
+-- recorded from being accepted. Refusal 10 is a bound ('snapshotTablesBound'):
+-- the clip tables, the frame tables and the views' own material records are
+-- counted for every view that has a run, as if each drew, with every header,
+-- directory word and alignment pad, in checked arithmetic. A snapshot it lets
+-- through is never refused for those parts when recorded, under any metrics.
+-- The records of the chunks a view does not cull depend on the frame's metrics
+-- and the cameras, so they stay checked when recording; see "A frame the region
+-- of which is too large" below.
 --
 -- = Holds (D-28)
 --
@@ -84,15 +113,38 @@
 -- changes that, so the frame is recorded without it ('failedChunkUploads' names
 -- it) rather than refused: the host retries every refused frame.
 --
+-- = A frame the region of which is too large
+--
+-- The storage region a frame writes holds the snapshot's own tables, which
+-- publication bounds, and the records of every chunk a view does not cull. Which
+-- chunks those are depends on the frame's metrics and the cameras, so a scene
+-- that was published can still have a frame whose region is larger than the
+-- storage window, and nothing but a different camera or a different snapshot
+-- changes that. Such a frame records nothing, as the recorder refuses it; but the
+-- refusal reaches the host as every other does, to be retried, so the adapter
+-- also keeps it for the application: 'regionOverflow' answers, for a window, the
+-- scene revision that was refused, the region's size and the storage window.
+-- It is cleared when a later frame of the window records, and by nothing else:
+-- publishing, adopting and any other frame refusal leave it. The application
+-- publishes a snapshot that culls the chunks (or lists fewer), and the next frame
+-- clears it.
+--
 -- = State
 --
 -- An 'Adapter' owns the holds, the textures and chunks whose release is pending,
--- and the lock that serializes publication with release; it is made over the
--- texture registry, the chunk registry and the renderer, whose session depth
--- format publication checks. The holds and the pending set are written on the
--- graphics owner's thread by the lifecycle's hooks and by the release action,
--- and read from any; publication and release run on any application thread,
--- behind the lock.
+-- the latest region overflow of each window, and the lock that serializes
+-- publication with release; it is made over the texture registry, the chunk
+-- registry and the renderer, whose session depth format and storage window
+-- publication checks. The holds and the pending set are written on the graphics
+-- owner's thread by the lifecycle's hooks and by the release action, and read
+-- from any; publication and release run on any application thread, behind the
+-- lock. The overflows are written on the graphics owner's thread only — by
+-- 'renderWindowFrame' when it refuses a frame for its region and when it records
+-- one, and by 'adapterReleased' — in one transaction each over the one map, so a
+-- reader on any thread ('regionOverflow') sees a whole, latest observation or
+-- none. A window's observation lives until a frame of the window records, or
+-- until the host reports the window's last revision released ('adapterReleased'),
+-- which is how a closed window's is dropped.
 module Hetoimasia.Render.TwoD.Vulkan.Window
   ( -- * The scene a window holds
     Scene2D (..)
@@ -109,6 +161,7 @@ module Hetoimasia.Render.TwoD.Vulkan.Window
   , adapterRetained
     -- * Publishing and releasing
   , PublishRefusal (..)
+  , tablesRefusal
   , publish2DSnapshot
   , ReleaseRefusal (..)
   , release2DTexture
@@ -126,13 +179,15 @@ module Hetoimasia.Render.TwoD.Vulkan.Window
   , pendingChunkUploads
   , failedChunkUploads
   , renderWindowFrame
+  , RegionOverflow (..)
+  , regionOverflow
   ) where
 
 import Control.Concurrent.MVar (MVar, newMVar, withMVar)
 import Control.Exception (mask, onException)
 import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO)
 import Control.DeepSeq (NFData (rnf))
-import Control.Monad (forM_)
+import Control.Monad (forM_, when)
 import Data.Kind (Type)
 import Data.List.NonEmpty (NonEmpty)
 import Data.Map.Strict (Map)
@@ -141,7 +196,7 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Text
-import Data.Word (Word32)
+import Data.Word (Word32, Word64)
 import Hetoimasia.GPU.Vulkan.Native.Recording (Image, ImageFormat (..), Recorder, Refusal (..))
 import Hetoimasia.GPU.Vulkan.Native.Uploads (UploadState)
 import qualified Hetoimasia.Render.Api.Texture as Api
@@ -159,9 +214,9 @@ import Hetoimasia.Render.TwoD.Snapshot
   )
 import Hetoimasia.Render.TwoD.Validation (Location, ValidSnapshot, validLayerChunks, validLayers, validSnapshot, validateSnapshot, validateSnapshotWith)
 import qualified Hetoimasia.Render.TwoD.Validation as Validation
-import Hetoimasia.Render.TwoD.Vulkan (Renderer, issuedMaterials, prepareSnapshot, rendererDepthFormat)
+import Hetoimasia.Render.TwoD.Vulkan (Renderer, issuedMaterials, prepareSnapshot, rendererDepthFormat, rendererRegionWindow)
 import Hetoimasia.Render.TwoD.Vulkan.Builders (Builders)
-import Hetoimasia.Render.TwoD.Vulkan.Frame (Attachment (..), DepthBinding (..), FrameInput (..), FrameRefusal (..), unissuedMaterial, worldDepthShortfall)
+import Hetoimasia.Render.TwoD.Vulkan.Frame (Attachment (..), DepthBinding (..), FrameInput (..), FrameRefusal (..), depthLayers, snapshotTablesBound, unissuedMaterial, worldDepthShortfall)
 import Hetoimasia.Render.TwoD.Vulkan.Chunks
   ( ChunkStanding (..)
   , Retained
@@ -255,6 +310,12 @@ data Host window = Host
   , hostRunOnOwner ∷ (ReleaseBody → IO (Either Text ()))
     -- ^ Queue an owner-thread action that waits for nothing. It is admitted
     -- and bounded as the request is, and never waits for room.
+  , hostWindowDepth ∷ !Bool
+    -- ^ Whether the window host gives each frame's request a depth image
+    -- ('frameDepthImage'): the setting that configures the integration's
+    -- @vulkanWindowDepth@, from which a host's record is filled. A host that
+    -- gives none has every snapshot holding a depth-enabled world layer refused
+    -- at publication ('WindowDepthMissing'), since each of its frames would be.
   }
 
 -- | An object a published revision holds and an application releases: a texture
@@ -296,13 +357,29 @@ data Adapter window = Adapter
   , adapterQueued ∷ !(TVar (Set Held))
     -- ^ The objects whose release action, after the barrier was met, is queued
     -- in the host.
+  , adapterOverflows ∷ !(TVar (Map window RegionOverflow))
+    -- ^ The latest frame of each window refused for the size of its region, until
+    -- a frame of the window records (see "A frame the region of which is too large").
   }
+
+-- | A frame refused because the storage region it needs is larger than the
+-- renderer's storage window, which no retry of the same scene changes.
+data RegionOverflow = RegionOverflow
+  { overflowRevision ∷ !Natural
+    -- ^ The revision of the window's scene the frame was for.
+  , overflowBytes ∷ !Word64
+    -- ^ The size of the region the refusal named, in bytes: the whole region, or
+    -- the clip tables alone where those were larger than the window.
+  , overflowWindow ∷ !Word64
+    -- ^ The renderer's storage window, in bytes.
+  }
+  deriving (Eq, Show)
 
 -- | An adapter over the host, the texture and chunk registries, and the renderer
 -- its frames record with. The renderer's session depth format is what
 -- publication requires of a snapshot holding a depth-enabled world layer (D-23).
 newAdapter ∷ Host window → Textures → Retained → Renderer → IO (Adapter window)
-newAdapter host textures retained renderer = Adapter host textures retained renderer <$> newMVar () <*> newTVarIO Map.empty <*> newTVarIO Map.empty <*> newTVarIO Set.empty
+newAdapter host textures retained renderer = Adapter host textures retained renderer <$> newMVar () <*> newTVarIO Map.empty <*> newTVarIO Map.empty <*> newTVarIO Set.empty <*> newTVarIO Map.empty
 
 -- | Why a snapshot was not published.
 data PublishRefusal
@@ -330,6 +407,19 @@ data PublishRefusal
     -- with: the refusal the recorder would make, naming the instance and the
     -- reference.
     MaterialNotIssuedInSnapshot !FrameRefusal
+  | -- | The snapshot holds a depth-enabled world layer at this location and the
+    -- host gives its frames no window depth ('hostWindowDepth'): every frame of
+    -- the snapshot would be refused. Named for the first such layer, whether or
+    -- not its view's scissor leaves it any pixel.
+    WindowDepthMissing !Location
+  | -- | The pass and the view whose frame tables do not fit their 32-bit words,
+    -- and the size of the block in bytes, as the recorder would find it
+    -- ('FrameTablesNotRepresentable'); the size is exact, never truncated.
+    FrameTablesNotRepresentableInSnapshot !Int !Int !Integer
+  | -- | The snapshot's clip tables, frame tables and views' own material records
+    -- are this many bytes ('snapshotTablesBound'), and the renderer's storage
+    -- window is only this many. The size is exact, never truncated.
+    TablesTooLarge !Integer !Word64
   | -- | The host holds no such window.
     PublishWindowUnknown
   | -- | The host's publications have ended.
@@ -366,15 +456,34 @@ publish2DSnapshot adapter window candidate = withMVar (adapterLock adapter) $ \_
             (handle : _, _, _) → pure (Left (TextureReleasedInSnapshot handle))
             ([], reference : _, _) → pure (Left (ChunkReleasedInSnapshot reference))
             ([], [], (reference, ended) : _) → pure (Left (ChunkUploadFailedInSnapshot reference ended))
-            ([], [], []) →
-              hostPublish (adapterHost adapter) window scene >>= \case
-                HostPublished revision → pure (Right revision)
-                HostWindowUnknown → pure (Left PublishWindowUnknown)
-                HostClosed → pure (Left PublishHostClosed)
-                HostSharedScenes → pure (Left PublishHostShared)
+            ([], [], []) → case (unrecordable valid, tablesBound valid) of
+              (Just refusal, _) → pure (Left refusal)
+              (_, Just refusal) → pure (Left refusal)
+              (Nothing, Nothing) →
+                hostPublish (adapterHost adapter) window scene >>= \case
+                  HostPublished revision → pure (Right revision)
+                  HostWindowUnknown → pure (Left PublishWindowUnknown)
+                  HostClosed → pure (Left PublishHostClosed)
+                  HostSharedScenes → pure (Left PublishHostShared)
   where
     sessionDepth = rendererDepthFormat (adapterRenderer adapter)
+    -- A depth-enabled world layer, and no window depth: every frame would be refused.
+    unrecordable valid = case depthLayers valid of
+      location : _ | not (hostWindowDepth (adapterHost adapter)) → Just (WindowDepthMissing location)
+      _ → Nothing
+    -- The tables the snapshot owns, against the storage window.
+    tablesBound valid = tablesRefusal (rendererRegionWindow (adapterRenderer adapter)) (snapshotTablesBound valid)
     filterReleased handles = fmap concat (traverse (\handle → (\flagged → [handle | flagged]) <$> isReleased (adapterTextures adapter) handle) handles)
+
+-- | What publication makes of the bound of a snapshot's tables ('snapshotTablesBound')
+-- against a storage window of this many bytes: a frame block that does not
+-- fit its 32-bit words, or a size larger than the window, each carrying its number
+-- exactly, never narrowed; 'Nothing' when the tables fit.
+tablesRefusal ∷ Word64 → Either (Int, Int, Integer) Integer → Maybe PublishRefusal
+tablesRefusal window = \case
+  Left (passIndex, viewIndex, size) → Just (FrameTablesNotRepresentableInSnapshot passIndex viewIndex size)
+  Right size | size > toInteger window → Just (TablesTooLarge size window)
+  Right _ → Nothing
 
 -- | Why a release was not requested.
 data ReleaseRefusal
@@ -495,10 +604,16 @@ adapterAdopted adapter window revision scene = do
   retryReleases adapter
 
 -- | This revision of the window has been released: drop its holds, and queue
--- the release of each object that was waiting only for them.
+-- the release of each object that was waiting only for them. When it was the
+-- window's last, the window's region overflow ('regionOverflow') is dropped too.
 adapterReleased ∷ Ord window ⇒ Adapter window → window → Natural → IO ()
 adapterReleased adapter window revision = do
-  atomically (modifyTVar' (adapterHolds adapter) (Map.delete (window, revision)))
+  atomically $ do
+    modifyTVar' (adapterHolds adapter) (Map.delete (window, revision))
+    -- The window's last revision gone, the window is retired: what was observed
+    -- of it goes with it.
+    remaining ← readTVar (adapterHolds adapter)
+    when (all ((/= window) . fst) (Map.keys remaining)) (modifyTVar' (adapterOverflows adapter) (Map.delete window))
   retryReleases adapter
 
 -- | How many adopted revisions hold the texture.
@@ -535,6 +650,10 @@ data FrameInfo = FrameInfo
     -- ^ The frame's generation depth image, which a host that enabled windowed
     -- depth is given with the request. A pass holding a depth-enabled world
     -- layer is refused, naming the layer, without it.
+  , frameRevision ∷ !Natural
+    -- ^ The revision of the window's scene the frame is for, as the request names
+    -- it: what a refusal of the frame for its region is observed against
+    -- ('regionOverflow').
   }
   deriving (Eq, Show)
 
@@ -555,13 +674,15 @@ pendingChunkUploads adapter scene =
 -- as 'prepareSnapshot' and the recording refuse. A chunk whose upload failed is
 -- left out of the frame.
 renderWindowFrame
-  ∷ Adapter window
+  ∷ Ord window
+  ⇒ Adapter window
   → Builders q inst msgr phys dev cmd
+  → window
   → FrameInfo
   → Scene2D
   → Recorder q inst msgr phys dev cmd
   → IO (Either Refusal ())
-renderWindowFrame adapter builders info scene recorder = case (frameLogical info, frameScale info) of
+renderWindowFrame adapter builders window info scene recorder = case (frameLogical info, frameScale info) of
   (Nothing, _) → pure (Left (RefusedIllegal "the frame names no logical extent for its window, so no view can be mapped"))
   (_, Nothing) → pure (Left (RefusedIllegal "the frame names no content scale for its window, so no view can be mapped"))
   (Just (logicalWidth, logicalHeight), Just (scaleX, scaleY)) →
@@ -588,12 +709,26 @@ renderWindowFrame adapter builders info scene recorder = case (frameLogical info
                     , frameOmitted = omitted
                     }
                   >>= \case
-                    Left refusal → pure (Left (refused refusal))
-                    Right recording → either (Left . refused) Right <$> recording recorder
+                    Left refusal → do
+                      observeOverflow refusal
+                      pure (Left (refused refusal))
+                    Right recording →
+                      recording recorder >>= \case
+                        Left refusal → do
+                          observeOverflow refusal
+                          pure (Left (refused refusal))
+                        Right () → Right () <$ atomically (modifyTVar' (adapterOverflows adapter) (Map.delete window))
   where
     refused = \case
       RefusedByBackend refusal → refusal
       other → RefusedIllegal (Text.pack (show other))
+    -- A frame refused for the size of its region is kept for the application; any
+    -- other refusal leaves what was observed as it was.
+    observeOverflow = \case
+      RecordsTooLarge size limit → keep size limit
+      ClipTablesTooLarge size limit → keep size limit
+      _ → pure ()
+    keep size limit = atomically (modifyTVar' (adapterOverflows adapter) (Map.insert window (RegionOverflow (frameRevision info) size limit)))
 
 -- | What the scene's chunks make of recording it now: a refusal for an upload still
 -- under way, which is pressure — the frame is skipped and retried — or for a chunk
@@ -609,6 +744,16 @@ chunkOutcome adapter scene = do
     (_, _, reference : _) → Left (RefusedIllegal ("a retained chunk the scene lists is no longer held: " <> Text.pack (show reference)))
     (reference : _, _, _) → Left (RefusedIllegal ("a retained chunk's upload has not completed, so the frame waits: " <> Text.pack (show reference)))
     ([], failed, []) → Right (Set.fromList failed)
+
+-- | The latest frame of the window refused because the storage region it needs is
+-- larger than the storage window: the revision of the scene, the region's size and
+-- the window, or 'Nothing' when no frame of the window was, or one has recorded
+-- since. The snapshot's own tables are bounded at publication ('TablesTooLarge');
+-- this is the remainder that depends on the frame, the records of the chunks a
+-- view does not cull, which nothing but a different camera or snapshot changes. It
+-- is read from any thread, and is a whole observation as of the last frame.
+regionOverflow ∷ Ord window ⇒ Adapter window → window → IO (Maybe RegionOverflow)
+regionOverflow adapter window = Map.lookup window <$> readTVarIO (adapterOverflows adapter)
 
 -- | The chunks of a scene whose cutout instances' upload ended without completing,
 -- and how it ended. A frame of the scene is recorded without them (see

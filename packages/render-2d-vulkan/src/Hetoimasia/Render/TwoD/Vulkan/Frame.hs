@@ -105,6 +105,19 @@
 -- the whole region, the frame tables with the clip tables and the material
 -- records, is held to the window ('RecordsTooLarge').
 --
+-- = The tables a snapshot owns, before any frame (GUIDE-1)
+--
+-- Which chunks a view skips depends on the frame's metrics and the cameras, but
+-- the clip tables, the frame tables and the views' own material records are the
+-- snapshot's, and so is their size. 'snapshotTablesBound' works out what they
+-- come to in the batch's region as if every view that has a run drew and nothing
+-- were skipped, with every header, directory word and alignment pad, in
+-- 'Integer's so that no size or offset wraps, before anything is allocated. It is
+-- a bound: whatever the frame's metrics, the region recording writes for those
+-- parts is no larger, so a snapshot within the window is never refused for them
+-- when it is recorded. The records of the chunks a view does not skip are not in
+-- it; they stay checked when recording, as 'RecordsTooLarge'.
+--
 -- = Refusals
 --
 -- A refusal is the first found in snapshot order, and it names where:
@@ -168,6 +181,9 @@ module Hetoimasia.Render.TwoD.Vulkan.Frame
   , requireClipWindow
     -- * Frame tables
   , requireFrameBlocks
+    -- * What a snapshot owns
+  , snapshotTablesBound
+  , regionBound
     -- * Materials
   , recordRegion
   , requireRegionWindow
@@ -203,6 +219,7 @@ import Hetoimasia.Render.TwoD.DrawPlan
   , PlannedLayer (..)
   , DrawPath (..)
   , CutoutMarks
+  , noCutoutMarks
   , PlannedPass (..)
   , PlannedView (..)
   , RecordSource (..)
@@ -215,6 +232,7 @@ import Hetoimasia.Render.TwoD.Material
   , MaterialRef
   , defaultMaterial
   , materialRecordLayout
+  , recordLayoutBytes
   )
 import Hetoimasia.Render.TwoD.Material.Backend (materialRefIdentity)
 import Hetoimasia.Render.TwoD.Mapping (mappingPixelSnap, uiInverse, uiTransform, viewMapping, worldInverse, worldTransform)
@@ -927,3 +945,77 @@ requireClipWindow ∷ Word64 → [PassWork] → Either FrameRefusal ()
 requireClipWindow window passes = case clipRegion passes of
   Just bytes | toInteger (ByteString.length bytes) > toInteger window → Left (ClipTablesTooLarge (fromIntegral (ByteString.length bytes)) window)
   _ → Right ()
+
+-- | What the clip tables, the frame tables and the views' own material records of
+-- a snapshot come to in the batch's storage region, in bytes, counted as if every
+-- view that has a run drew and no chunk were skipped: the bound of the module's
+-- "The tables a snapshot owns". The region holds the clip tables
+-- ('clipEntryBytes' an entry, a view's entries once for each space one of its
+-- layers selects a clip from, a single zero entry where a drawing frame selects
+-- none), then each view's records once for each material its dynamic instances
+-- use, then each view's frame block on a 16-byte boundary, exactly as
+-- 'recordRegion' lays them out. A view counts when the plan, which does not depend
+-- on the frame's metrics, gives one of its layers a run; a view that can never
+-- draw, a zero-size viewport or one without instances, counts for nothing.
+--
+-- The records of the chunks the layers list are not counted, nor is any padding
+-- they would change, since which of them a view draws depends on the frame.
+-- Counting is exact when every counted view draws and the scene lists no chunk.
+--
+-- All of it is computed over 'Integer's, from counts, without packing a byte. A
+-- frame block whose size, an offset or a header value does not fit its 32-bit word
+-- ('frameBlockRepresentable') is refused, 'Left', for the first view in snapshot
+-- order, as recording would find it ('FrameTablesNotRepresentable'): its pass, its
+-- view and the block's size in bytes, padding included.
+snapshotTablesBound ∷ ValidSnapshot → Either (Int, Int, Integer) Integer
+snapshotTablesBound valid = regionBound recordsEnd framed
+  where
+    passes = snapshotPasses (validSnapshot valid)
+    layers = Map.fromList [((pass, view, layer), held) | held ← validLayers valid, AtLayer pass view layer ← [validLayerLocation held]]
+    plan = planSnapshotCulled (\_ _ _ _ _ _ → False) noCutoutMarks valid
+    -- Every view the plan gives a run, with its place: the views a frame can draw.
+    drawing =
+      [ (passIndex, viewIndex, view, planned)
+      | (passIndex, pass, plannedPass) ← zip3 [0 ..] passes (planPasses plan)
+      , (viewIndex, view, planned) ← zip3 [0 ..] (passViews pass) (plannedViews plannedPass)
+      , any (not . null . plannedRuns) (plannedLayers planned)
+      ]
+    -- One table of a view's clips for each space one of its layers selects from.
+    clipEntries =
+      sum
+        [ toInteger (length (plannedClips planned)) * toInteger (length spaces)
+        | (passIndex, viewIndex, _, planned) ← drawing
+        , let spaces = nub [space | (layerIndex, layer) ← zip [0 ..] (plannedLayers planned), Just held ← [Map.lookup (passIndex, viewIndex, layerIndex) layers], Just space ← [clipSpaceOf (plannedSpace layer) held]]
+        ]
+    clipWords
+      | null drawing = 0
+      | otherwise = max 1 clipEntries * toInteger (clipEntryBytes `div` 4)
+    -- A view's records of a material, once however often its runs read them.
+    recordsWords =
+      sum
+        [ if null records then 0 else toInteger (length records) * toInteger (recordLayoutBytes (materialRecordLayout material)) `div` 4
+        | (_, _, view, planned) ← drawing
+        , material ← nub [runMaterial run | layer ← plannedLayers planned, run ← plannedRuns layer, runRecords run == ViewRecords]
+        , let records = maybe [] materialRecords (Map.lookup material (viewMaterials view))
+        ]
+    recordsEnd = clipWords + recordsWords
+    framed = [(passIndex, viewIndex, map (toInteger . frameTableCount) (viewFrameTables view)) | (passIndex, viewIndex, view, _) ← drawing, not (null (viewFrameTables view))]
+
+-- | The arithmetic of 'snapshotTablesBound', from counts alone: the region's size in
+-- bytes when it holds this many words before its frame blocks (the clip tables and
+-- the material records) and then the frame block of each of these views, given by
+-- its pass, its view and the frame count of each of its tables, in order, each
+-- beginning on a 16-byte boundary. A block with a count below one or above 2³²−1,
+-- or whose end or any record's offset passes 2³²−1 words
+-- ('frameBlockRepresentable'), is refused, 'Left', for the first view in order with
+-- its pass, its view and the block's size in bytes, padding included. Sizes are
+-- 'Integer's, never narrowed, and nothing is allocated.
+regionBound ∷ Integer → [(Int, Int, [Integer])] → Either (Int, Int, Integer) Integer
+regionBound = go
+  where
+    go at [] = Right (4 * at)
+    go at ((passIndex, viewIndex, counts) : rest)
+      | frameBlockRepresentable at counts = go (blockStart layout + blockWords layout) rest
+      | otherwise = Left (passIndex, viewIndex, 4 * (blockPadding layout + blockWords layout))
+      where
+        layout = frameBlockLayout at counts
