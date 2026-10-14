@@ -101,6 +101,7 @@ test-suite render-2d-vulkan-tests
         Test.Render.TwoD.Vulkan.Layout
         Test.Render.TwoD.Vulkan.Materials
         Test.Render.TwoD.Vulkan.Materials.Layouts
+        Test.Render.TwoD.Vulkan.Publication
         Test.Render.TwoD.Vulkan.Recording
         Test.Render.TwoD.Vulkan.Retained
         Test.Render.TwoD.Vulkan.StandIn

@@ -133,6 +133,7 @@ import Hetoimasia.Runtime.GLFW
   , Turn (..)
   , UpdateSchedule (..)
   , defaultHostConfig
+  , attachmentWindow
   , defaultScheduledHooks
   , honourHostCloseRequest
   , hostWindowClient
@@ -259,7 +260,7 @@ run mode validation = do
               made ← either (\failure → hPutStrLn stderr (Text.unpack failure) >> exitFailure) pure ready
               atomically (writeTVar prepared (Just made))
               retained ← newRetained
-              adapter ← newAdapter (windowHostOf vulkan) (preparedTextures made) retained (preparedRenderer made)
+              adapter ← newAdapter (windowHostOf (vulkanWindowDepth config) vulkan) (preparedTextures made) retained (preparedRenderer made)
               atomically (writeTVar adapterSlot (Just adapter))
               atomically (writeTVar passed True)
               render logger vulkan control adapter made uiScale frame presented
@@ -365,8 +366,8 @@ deadline = either (error . show) id (durationFromNanoseconds AllowZero 300000000
 
 -- | The adapter's host record, from the window integration's public
 -- publication and release-request operations.
-windowHostOf ∷ VulkanHost Scene2D → Host WindowId
-windowHostOf vulkan =
+windowHostOf ∷ Bool → VulkanHost Scene2D → Host WindowId
+windowHostOf windowDepth vulkan =
   Host
     { hostPublish = \window scene →
         prepare scene >>= publishVulkanWindowScene vulkan window >>= \case
@@ -382,6 +383,7 @@ windowHostOf vulkan =
         atomically (submitVulkanAction vulkan (VulkanAction (body . renderBuildersOf))) >>= \case
           Left refusal → pure (Left (tshow refusal))
           Right _ → pure (Right ())
+    , hostWindowDepth = windowDepth
     }
 
 -- | The window's frame: its adopted snapshot recorded into the frame's image
@@ -392,9 +394,9 @@ imageRenderer prepared frame adapterSlot = VulkanRenderer $ \scene request const
   (,) <$> readTVarIO prepared <*> readTVarIO adapterSlot >>= \case
     (Just _, Just adapter) → do
       let SurfaceExtent width height = requestExtent request
-          info = FrameInfo (width, height) (requestFormat request) (requestLogicalExtent request) (requestContentScale request) (requestDepth request)
+          info = FrameInfo (width, height) (requestFormat request) (requestLogicalExtent request) (requestContentScale request) (requestDepth request) (requestSceneRevision request)
       atomically (writeTVar frame (Just info))
-      renderWindowFrame adapter (renderBuildersOf construction) info scene recorder
+      renderWindowFrame adapter (renderBuildersOf construction) (attachmentWindow (requestAttachment request)) info scene recorder
     _ → pure (Right ())
 
 -- | Print the evidence's outcome: where it was written, each named probe,

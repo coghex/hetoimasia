@@ -11,10 +11,11 @@ module Main (main) where
 
 import qualified Test.Render.TwoD.Vulkan.Layout as Layout
 import qualified Test.Render.TwoD.Vulkan.Materials as Materials
+import qualified Test.Render.TwoD.Vulkan.Publication as Publication
 import qualified Test.Render.TwoD.Vulkan.Recording as Recording
 import qualified Test.Render.TwoD.Vulkan.Retained as Retained
 import qualified Test.Render.TwoD.Vulkan.Windows as Windows
 import Test.Hspec.Runner (Config (configFailOnEmpty), defaultConfig, hspecWith)
 
 main ∷ IO ()
-main = hspecWith defaultConfig {configFailOnEmpty = True} (Layout.spec >> Recording.spec >> Retained.spec >> Materials.spec >> Windows.spec)
+main = hspecWith defaultConfig {configFailOnEmpty = True} (Layout.spec >> Recording.spec >> Retained.spec >> Materials.spec >> Windows.spec >> Publication.spec)
