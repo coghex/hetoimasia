@@ -104,6 +104,7 @@ test-suite render-2d-vulkan-tests
         Test.Render.TwoD.Vulkan.Ledger
         Test.Render.TwoD.Vulkan.Materials
         Test.Render.TwoD.Vulkan.Materials.Layouts
+        Test.Render.TwoD.Vulkan.MaterialSet
         Test.Render.TwoD.Vulkan.Publication
         Test.Render.TwoD.Vulkan.Recording
         Test.Render.TwoD.Vulkan.Retained
@@ -117,6 +118,7 @@ test-suite render-2d-vulkan-tests
         filepath >=1.5 && <1.6,
         ghc-heap >=9.14 && <9.15,
         hspec >=2.11 && <3,
+        QuickCheck >=2.15 && <2.19,
         stm >=2.5.3 && <2.6,
         text >=2.1 && <2.2,
         hetoimasia-asset ==0.1.0.0,

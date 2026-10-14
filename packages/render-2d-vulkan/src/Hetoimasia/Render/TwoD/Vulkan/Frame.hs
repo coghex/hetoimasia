@@ -209,7 +209,7 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , Refusal
   , formatCode
   )
-import Hetoimasia.Render.TwoD.Chunk (Chunk, ChunkRef, chunkInstances, chunkRecords)
+import Hetoimasia.Render.TwoD.Chunk (Chunk, ChunkRef, chunkInstances, chunkMaterials, chunkRecords)
 import Hetoimasia.Render.TwoD.Clip (ResolvedClip)
 import Hetoimasia.Render.TwoD.Culling (chunkCulled)
 import Hetoimasia.Render.TwoD.DrawPlan
@@ -846,6 +846,26 @@ layerWork input layers held passNumber viewNumber pushFor planned
 -- names a material the session did not issue, or names one with the facts of
 -- another: the lookup answers, for an identity, the reference the session issued
 -- under it. The built-in default is issued to every session, as a constant.
+--
+-- A chunk is checked by the set of materials its build recorded
+-- ('chunkMaterials'), not by looking at its instances: when every material in
+-- the set is issued with the facts it names, the chunk's instances are not
+-- traversed. Only when the set holds a material the session did not issue, or
+-- one with other facts, is the chunk scanned, in build order, for the first
+-- instance that names any such material (the earliest refused instance, which
+-- need not use the refused material that sorts first in the set). The answer is
+-- exactly the scan of every instance's: the same refusal, the same first
+-- instance in snapshot order — a layer's dynamic instances before its chunks,
+-- chunks in listed order, a chunk listed twice at each of its positions — and
+-- the same location and references.
+--
+-- Cost: a check that finds nothing does work proportional to the dynamic
+-- instances plus the sum, over every chunk each layer lists (a chunk listed
+-- twice counts twice, a chunk a view culls counts too), of that chunk's
+-- distinct materials, a lookup in the session's issued materials for each. It is
+-- independent of how many instances the chunks retain. A refusal may add one scan
+-- of the refused chunk's instances up to the first refused one. This bounds this
+-- check, not publication or rendering as a whole.
 unissuedMaterial ∷ (Word64 → Maybe MaterialRef) → ValidSnapshot → Maybe FrameRefusal
 unissuedMaterial issued valid = case concatMap refusalsOfLayer (validLayers valid) of
   refusal : _ → Just refusal
@@ -858,12 +878,14 @@ unissuedMaterial issued valid = case concatMap refusalsOfLayer (validLayers vali
       ]
         <> [ refusal
            | (position, (_, built)) ← zip [0 ..] (validLayerChunks layer)
-           , (index, candidate) ← zip [0 ..] (chunkInstances (built ∷ Chunk))
-           , Just refusal ← [check (atLayer layer (\pass view held → AtChunkInstance pass view held position index)) (instanceMaterial candidate)]
+           , not (all agrees (chunkMaterials (built ∷ Chunk)))
+           , refusal ← take 1 [refusal' | (index, candidate) ← zip [0 ..] (chunkInstances built), Just refusal' ← [check (atLayer layer (\pass view held → AtChunkInstance pass view held position index)) (instanceMaterial candidate)]]
            ]
     atLayer layer build = case validLayerLocation layer of
       AtLayer pass view held → build pass view held
       other → other
+    -- Whether the session issued this reference, with the facts it names.
+    agrees material = material == defaultMaterial || issued (materialRefIdentity material) == Just material
     check location material
       | material == defaultMaterial = Nothing
       | otherwise = case issued (materialRefIdentity material) of
