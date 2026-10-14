@@ -427,6 +427,31 @@ spec = describe "the native opt-in" $ do
         Right (_ ∷ Child.Launched) → expectationFailure "the launch returned though its observer failed"
       readIORef owned >>= maybe (expectationFailure "the launch showed its observer nothing") (\o → reclaimed o >> try (signalProcess nullSignal (Child.ownedPid o)) >>= (`shouldSatisfy` either (\(_ ∷ IOException) → True) (const False)))
 
+    mapM_
+      ( \named →
+          it ("owns no pipe handle when setup fails after " <> named <> ", and propagates the failure") $ do
+            seen ← newIORef Nothing
+            let stage name pid handles
+                  | name == key named = writeIORef seen (Just (pid, handles)) >> throwIO (ErrorCall ("setup failed after " <> named))
+                  | otherwise = pure ()
+            ( do
+                outcome ← bounded (try (Child.launchCommandStaged stage (const (pure ())) Child.terminationGrace Nothing 300 "sh" ["-c", "sleep 300"]))
+                case outcome of
+                  Left failure → fmap (\(ErrorCall message) → message) (fromException failure) `shouldBe` Just ("setup failed after " <> named)
+                  Right (_ ∷ Child.Launched) → expectationFailure "the launch returned though its setup failed"
+                readIORef seen >>= \case
+                  Nothing → expectationFailure "setup never reached the stage"
+                  Just (pid, handles) → do
+                    -- A reader still blocked on a handle holds its lock, so this read
+                    -- fails by the bound instead of hanging when one was left running.
+                    closed ← boundedBy "a pipe handle's state was never answered: a reader still holds it" (mapM hIsClosed handles)
+                    closed `shouldBe` [True, True]
+                    try (signalProcess nullSignal pid) >>= (`shouldSatisfy` either (\(_ ∷ IOException) → True) (const False))
+              )
+              `finally` (readIORef seen >>= maybe (pure ()) (\(pid, _) → void (try (signalProcessGroup sigKILL pid) ∷ IO (Either IOException ()))))
+      )
+      ["the child started", "its reaper", "its readers"]
+
     it "reads a running process as present, and an exited one as gone whether or not it has been reaped" $ do
       getProcessID >>= inspectPresence >>= (`shouldSatisfy` \case Running _ → True; _ → False)
       reaped ← withZombie $ \zombie → do
@@ -540,6 +565,12 @@ runNested ∷ (Config → Config) → Spec → IO SpecResult
 runNested adjust nested = do
   (config, forest) ← evalSpec defaultConfig nested
   runSpecForest forest (adjust config) {configFormat = Just (formatterToFormat silent)}
+
+-- | The setup stage a named point in the examples above stands for.
+key ∷ String → String
+key "the child started" = "started"
+key "its reaper" = "reaper"
+key _ = "readers"
 
 -- | A caller's own annotation, used to prove a propagated failure keeps its context.
 newtype Marker = Marker String

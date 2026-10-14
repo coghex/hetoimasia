@@ -46,6 +46,7 @@ module Test.GLFW.Native.Child
   , launchCommand
   , launchCommandIn
   , launchCommandObserved
+  , launchCommandStaged
   ) where
 
 import Control.Concurrent (ThreadId, forkIO, forkIOWithUnmask, killThread)
@@ -139,8 +140,17 @@ data Running = Running
 -- runs where the launch can still be interrupted, with reclamation already
 -- arranged, and may not block on the child.
 launchCommandObserved ∷ (Owned → IO ()) → Double → Maybe [(String, String)] → Double → FilePath → [String] → IO Launched
-launchCommandObserved observe grace environment deadline command arguments = do
-  (end, pid, out, err) ← withComposite (assembly environment command arguments) $ \running → do
+launchCommandObserved = launchCommandStaged (\_ _ _ → pure ())
+
+-- | 'launchCommandObserved' with a hook run at each stage of setting the launch
+-- up, where an interruption can reach it: after the child exists, after its
+-- reaper does, and after both readers do. It is shown the stage's name, the
+-- child's identifier and the parent's two pipe handles, and runs where the
+-- launch can be interrupted with everything acquired so far already covered by
+-- its release, so a failure it raises is a failure part-way through setup.
+launchCommandStaged ∷ (String → ProcessID → [Handle] → IO ()) → (Owned → IO ()) → Double → Maybe [(String, String)] → Double → FilePath → [String] → IO Launched
+launchCommandStaged stage observe grace environment deadline command arguments = do
+  (end, pid, out, err) ← withComposite (assembly stage environment command arguments) $ \running → do
     let reaped = readTVar (runningExited running) >>= maybe retry pure
         finishedOutput = and <$> traverse readTVar (runningFinished running)
         -- Finished means reaped with both pipes at end of file: a descendant
@@ -182,12 +192,18 @@ launchCommandObserved observe grace environment deadline command arguments = do
 -- protected step. The child's identifier is read at once, before anything waits
 -- on the child, because the waiter that reaps it closes the handle the
 -- identifier is read from.
-assembly ∷ Maybe [(String, String)] → FilePath → [String] → Assembly Running
-assembly environment command arguments = do
+--
+-- Both pipe handles are registered at once after the child, ahead of every
+-- later step that can be interrupted, and are released last.
+assembly ∷ (String → ProcessID → [Handle] → IO ()) → Maybe [(String, String)] → FilePath → [String] → Assembly Running
+assembly stage environment command arguments = do
   Child handle pid out err ←
     acquirePart "child process group" (releaseRank 0) (start environment command arguments) $ \(Child handle pid _ _) → do
       signalGroup sigKILL pid
       void (waitForProcess handle)
+  _ ← acquirePart "standard output pipe" (releaseRank 3) (pure out) hClose
+  _ ← acquirePart "standard error pipe" (releaseRank 3) (pure err) hClose
+  restoredStep (stage "started" pid [out, err])
   exited ← restoredStep (newTVarIO Nothing)
   _ ←
     acquirePart
@@ -195,13 +211,12 @@ assembly environment command arguments = do
       (releaseRank 1)
       (forkIO (waitForProcess handle >>= atomically . writeTVar exited . Just))
       (\_ → atomically (readTVar exited >>= maybe retry (const (pure ()))))
+  restoredStep (stage "reaper" pid [out, err])
   outBytes ← restoredStep (newTVarIO ByteString.empty)
   errBytes ← restoredStep (newTVarIO ByteString.empty)
-  outReader@(Reader _ outDone) ← acquirePart "standard output reader" (releaseRank 2) (startReader outBytes out) stopReader
-  errReader@(Reader _ errDone) ← acquirePart "standard error reader" (releaseRank 2) (startReader errBytes err) stopReader
-  let _ = (outReader, errReader)
-  _ ← acquirePart "standard output pipe" (releaseRank 3) (pure out) hClose
-  _ ← acquirePart "standard error pipe" (releaseRank 3) (pure err) hClose
+  Reader _ outDone ← acquirePart "standard output reader" (releaseRank 2) (startReader outBytes out) stopReader
+  Reader _ errDone ← acquirePart "standard error reader" (releaseRank 2) (startReader errBytes err) stopReader
+  restoredStep (stage "readers" pid [out, err])
   pure (Running pid [out, err] exited [outDone, errDone] outBytes errBytes)
 
 -- | Start the child in a process group of its own and read its identifier. A
