@@ -1037,8 +1037,11 @@ generation wrapping from the largest value to 1 with the reissued identical
 handle live until marked, and `swapTexture`'s precedence for each); an
 unmarked direct release followed by a marked release at the reused index, with
 both old handles refused at publication and the third generation published;
-and a thousand register-and-release cycles, marked and unmarked, whose retained
-entries stay at most one for each index registered at; publication, its revisions and every refusal; holds taken once
+a thousand register-and-release cycles, marked and unmarked, whose retained
+entries stay at most one for each index registered at; and a thousand unmarked
+direct-release cycles with no read between them, after which the stored ledger
+is an evaluated value and not a chain of pending updates (every ledger write is
+strict); publication, its revisions and every refusal; holds taken once
 however often a texture is named, dropped on release, counted twice for two
 windows, kept by a superseded revision and dropped by a closed window; release
 marked at once, deferred while an adopted snapshot shows the texture and made
