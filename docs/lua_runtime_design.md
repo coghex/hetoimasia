@@ -43,6 +43,15 @@ LUA-8 deliver trusted execution and reusable machinery; LUA-16/LUA-17 retain
 confined integration and adversarial acceptance behind Q-5. This decision
 approval does not renew design readiness. The document remains `exploring`.
 
+Documentation reconciliation, 2026-10-15, at code `master@2c56edd0`, on the
+owner's request (via the assistant, request
+`user-het-lua-doc-reconcile-20261015`). D-15 records the owner's 2026-09-29
+decision on general VM owners. D-1, P-2, LUA-2 and LUA-5 are reconciled with
+it, and [Current state and evidence](#current-state-and-evidence) is refreshed.
+This reconciliation does not renew readiness. Trusted-path readiness renewal
+(LUA-2, LUA-3, LUA-5 through LUA-8) is still pending the owner. The document
+remains `exploring`, and Q-5 still gates the process branch.
+
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
 reviewed and deliberately not tracked separately · `[deferred]` blocked on a
 concrete precondition
@@ -104,50 +113,77 @@ source observations below remain historical.
 
 ## Current state and evidence
 
-Historical inspection of Hetoimasia at `master@007c285` on 2026-09-16. These
-observations describe the pre-implementation baseline. The post-merge handoff
-above and the recorded Q-3/Q-5 results describe the current state.
+Inspection of Hetoimasia at `master@2c56edd0` on 2026-10-15. This replaces the
+2026-09-16 pre-implementation baseline (`master@007c285`).
 
-- `packages/scripting-lua/README.md` reserves a host for VM lifetime, calls,
-  errors, and registration. It requires one execution owner per VM and keeps
-  game namespaces out of the host. There is no active Lua Cabal component or
-  HsLua dependency in `cabal.project`.
-- `Foundation.Worker` owns startup, stop, cancellation, and terminal outcomes.
-  It retains borrowed dependencies until every worker and cancellation helper
-  finishes. A stuck worker is not detached. It promises no OS-thread affinity.
-- `Runtime.Supervision` classifies required/optional services and finite jobs.
-  `RuntimeControl` belongs to the application thread. `awaitSupervised` handles
-  any pending worker outcome before committing the supplied STM transaction;
-  a fatal outcome is latched. Ordinary IO is not automatically supervised.
-- `Runtime.Inbox` handles one message at a time. An escaping handler exception
-  ends the service. Its context is built in `Scoped` startup and its handoff
-  precedes the worker startup acknowledgement. It is not a Lua scheduler or a
-  general protected-IO constructor for an interpreter.
-- `Foundation.Resource` runs ordinary releases under `uninterruptibleMask_`.
-  Arbitrary script finalization or worker joins do not meet its controlled
-  blocking contract. Worker draining already uses its own protected IO boundary.
-- Foundation messaging supplies prepared payloads, bounded FIFO admission,
-  close/abort, and latest-value snapshots with checked cursors. `Prepared`
-  forces values; it neither copies referenced mutable state nor extends a
-  borrowed resource's lifetime.
-- Those worker/messaging APIs are in-process mechanisms. The repository has no
-  scripting sandbox, bounded Lua IPC protocol, or isolated mod-process owner.
-  OS containment and process supervision below are new work, not existing
-  guarantees conferred by using `Worker` or separate Lua states.
-- [Runtime scheduling](runtime_scheduling_design.md) owns monotonic time,
-  deadlines, fixed-step pacing, and native wake. It does not own Lua tasks.
-  [Window/graphics lifetime](window_graphics_lifetime_design.md) owns graphics
-  retirement. Neither requires Lua as a dependency.
-- [Test architecture](test_architecture_design.md) specifies package-owned
-  suites. New Lua suites should start in their package; they need not wait for
-  the migration of existing central tests.
-- Open tracker items at inspection were #123, #124, #86, and #49; none is a Lua
-  arc. The original foundation plan's FND-5 overlapped host construction.
-  Its [current boundary overview](engine_foundation_design.md) now delegates
-  scripting to this arc; do not resurrect the historical slice or create a
-  second host epic.
-  Readiness recheck on 2026-09-16 found the same open items and no overlapping
-  Lua umbrella.
+- **The Lua host** (`packages/scripting-lua`, built on the `lua` binding
+  `>=2.3.4 && <2.4`). Its public library exposes only
+  `Hetoimasia.Scripting.Lua.Bridge`: `newVm` over an explicit library set,
+  chunk loading, protected calls, error and cancellation transport across the
+  C boundary, and a terminal `closeVm`. The private `bridge` sublibrary holds
+  `Vm`, `Call`, `Callback`, `Fault` and `Library`. It depends only on
+  `hetoimasia-foundation` and the binding. This is LUA-1/#146, merged by PR
+  #173 (`8072d6ea`).
+  - Later refinements: a callback's operation on its own VM is refused
+    (`6a9cbb6f`).
+  - Every cancelled fault runner settles, and its cancellation is proven to
+    land (#369, `4449275d`).
+  - There is still no protected VM owner, module or capability registration
+    surface, or game binding. Those are LUA-2, LUA-3 and LUA-5.
+- **The protocol model.** The private `model` sublibrary is the pure task,
+  admission, request, subscription, epoch, failure and stop model under
+  `Hetoimasia.Scripting.Lua.Internal.Protocol`. This is LUA-4/#149, merged by
+  PR #179 (`a984985e`), with failure-settlement repairs #193/#194. Its session
+  aggregate has since been split into focused private modules (`db410ccb`).
+- **Confinement probes.** The package also holds the LUA-14/LUA-15 probes:
+  `lua-confine-child`, `linux-confinement-probe`, `macos-confinement-helper`
+  and `macos-confinement-probe`, plus the `lua-hazard` fixture. Both platform
+  verdicts are inconclusive (Q-5). They gate only the process branch.
+- **Foundation and runtime reuse.** These are unchanged in role and still in
+  place at this baseline. `Runtime.Application` is the application runner
+  beside them.
+  - `Foundation.Worker` owns startup, stop, cancellation, and terminal outcomes.
+    It retains borrowed dependencies until every worker and cancellation helper
+    finishes. A stuck worker is not detached. It promises no OS-thread affinity.
+  - `Runtime.Supervision` classifies required/optional services and finite jobs.
+    `RuntimeControl` belongs to the application thread. `awaitSupervised` handles
+    any pending worker outcome before committing the supplied STM transaction;
+    a fatal outcome is latched. Ordinary IO is not automatically supervised.
+  - `Runtime.Inbox` handles one message at a time. An escaping handler exception
+    ends the service. Its context is built in `Scoped` startup and its handoff
+    precedes the worker startup acknowledgement. It is not a Lua scheduler or a
+    general protected-IO constructor for an interpreter.
+  - `Foundation.Resource` runs ordinary releases under `uninterruptibleMask_`.
+    Arbitrary script finalization or worker joins do not meet its controlled
+    blocking contract. Worker draining already uses its own protected IO boundary.
+  - Foundation messaging supplies prepared payloads, bounded FIFO admission,
+    close/abort, and latest-value snapshots with checked cursors. `Prepared`
+    forces values; it neither copies referenced mutable state nor extends a
+    borrowed resource's lifetime.
+  - Those worker/messaging APIs are in-process mechanisms. The repository has no
+    scripting sandbox, bounded Lua IPC protocol, or isolated mod-process owner.
+    OS containment and process supervision below are new work, not existing
+    guarantees conferred by using `Worker` or separate Lua states.
+- **The clock.** The monotonic time and deadline boundary that LUA-6 and
+  LUA-12 need (Q-4) has shipped: TIME-1/#133, merged by PR #152, and
+  `Foundation.Time` with its `Types` and `Arithmetic` modules (the latest split
+  is `16933652`). [Runtime scheduling](runtime_scheduling_design.md) owns
+  monotonic time and native wake, not Lua tasks.
+- **A graphics consumer now exists.** The 2D renderer (epic #413, closed
+  2026-10-14) publishes per-window scenes in the window host (#423, PR #435,
+  `ebfdec98`). Its host adapter draws decoded images in a window (#424, PR
+  #441, `1728868b`). These are the presentation consumers P-2 anticipated.
+  The trusted milestone LUA-8 stays headless, with fake capability and
+  presentation consumers and no Vulkan or GLFW dependency.
+- [Window/graphics lifetime](window_graphics_lifetime_design.md) owns graphics
+  retirement. [Test architecture](test_architecture_design.md) specifies
+  package-owned suites, so new Lua suites start in this package.
+- **Tracker.** The open items at inspection are #145 (this epic) and #446
+  (deferred render-to-texture, unrelated). No other issue or pull request
+  overlaps the Lua arc. The original foundation plan's FND-5 overlapped host
+  construction. Its [current boundary overview](engine_foundation_design.md)
+  delegates scripting to this arc; do not resurrect the historical slice or
+  create a second host epic.
 
 ### Synarchy lessons to retain
 
@@ -203,6 +239,9 @@ The owner accepted the two-domain recommendation on 2026-09-16. Each domain
 has an independently created VM and exactly one execution owner. Coroutines
 inside a VM multiplex tasks; they are not the separation between UI and gameplay.
 Base host tests may use one VM, but the arc does not end at a single-owner demo.
+D-15 generalizes the owner: the two domains are one composition of a VM owner
+that an application can create any number of. One VM cannot run Lua on two
+threads, so separate VMs remain the only way to keep UI responsive.
 
 ### D-2. Keep Lua central without coupling the engine to a game
 
@@ -346,6 +385,24 @@ Commands and UI intentions use bounded authorized requests, asynchronous
 native requests use brokered admission and result delivery, and lifecycle
 operations request permitted transitions while the parent retains authority.
 
+### D-15. Make the VM owner a general primitive created at runtime
+
+Owner decision 2026-09-29, recorded here on 2026-10-15. The engine's unit is a
+general **VM owner**. An application may create and retire any number of
+independent VM owners at runtime. Each one has its own binding set and
+capability policy (D-14), and each VM still has exactly one execution owner
+(D-1). Concurrently live owners are independent: none reads another's mutable
+state or calls its VM synchronously, and the failure or retirement of one does
+not stop another. The game's two-domain UI and gameplay arrangement is one
+composition of this primitive, not a fixed pair the engine hard-codes. The
+owner's reasons were later uses: throwaway validation VMs, tool panels,
+background jobs and hot reload. These are not added to this arc's scope; hot
+reload stays out of scope here.
+
+There is no VM pool, cross-VM scheduler or sharding framework until a concrete
+consumer needs one; P-10's caution about sharding stands. D-1's reasoning is
+unchanged.
+
 ## Design
 
 P-1 through P-13 record the accepted contracts, with proof and delivery gates
@@ -398,7 +455,13 @@ layer was evaluated and not selected. Binding selection is complete. Q-3 records
 the supported FFI, callback, cancellation and close contracts. A need for a different
 execution or trust model returns to design; it is not an incidental solver choice.
 
-### P-2. Two owners and coherent application boundaries
+### P-2. VM owners and coherent application boundaries
+
+The diagram shows the game's composition: two trusted first-party VM owners,
+UI and gameplay (D-1), each an instance of the general VM owner of D-15. An
+application may run more owners, created and retired at runtime, under the
+same rules: one execution owner per VM, its own binding set and policy, and no
+synchronous call into another owner.
 
 ```mermaid
 flowchart LR
@@ -1239,18 +1302,23 @@ and verified policy, with adversarial regression coverage.
 > independently of Q-5 after renewed readiness. LUA-4 has already been
 > processed and implemented independently.
 
-- **Outcome:** one owner constructs, uses, and closes a VM while preserving
+- **Outcome:** a VM owner constructs, uses, and closes its VM while preserving
   primary/cleanup evidence and callback dependencies on every supported exit.
+  Any number of independent VM owners can exist at once (D-15).
 - **Scope:** P-3 host boundary, partial construction, protected cancellation,
   finalizer allowlist/phase, opaque ownership, and any minimal evidence seam
-  proven necessary in foundation. Include its contract and focused tests.
+  proven necessary in foundation. Each VM has exactly one owner. Owners are
+  independent: none shares a VM, global state, or registry with another.
+  Include its contract and focused tests.
 - **Phase:** host ownership.
 - **Depends on:** LUA-1.
 - **Ordering:** critical path after readiness resumes; the independent LUA-4 model is already delivered.
-- **Relevant decisions:** D-1, D-2, D-4, D-12, D-13.
+- **Relevant decisions:** D-1, D-2, D-4, D-12, D-13, D-15.
 - **Acceptance signals:** failure/cancellation matrix including close callbacks;
   no ordinary uninterruptible Lua release; no leaked/public native handles;
-  cleanup evidence still classifiable by runtime.
+  cleanup evidence still classifiable by runtime. Several owners created and
+  closed in arbitrary order stay independent: closing or failing one leaves
+  the others' VMs, state and evidence intact.
 - **Out of scope:** module namespaces, worker adapter, scheduler, hard deadlines.
 - **Open questions:** Q-3 is resolved; renewed document readiness remains the
   processing gate. Q-5 does not gate this trusted slice.
@@ -1294,22 +1362,29 @@ and verified policy, with adversarial regression coverage.
 
 ### LUA-5. Integrate trusted VM owners with runtime supervision
 
-- **Outcome:** a supervised in-process owner exposes a ready trusted Lua endpoint
-  and retains VM/callback dependencies through close without a new supervisor.
+- **Outcome:** supervised in-process VM owners expose ready trusted Lua
+  endpoints and retain VM/callback dependencies through close without a new
+  supervisor. An application creates and retires any number of them at runtime
+  (D-15).
 - **Scope:** public runtime sublibrary integration and its Hspec/CI target;
   P-3 component readiness, bounded admission, P-8 failure composition, and P-9
   shutdown evidence. Readiness includes registration and VM initialization.
   Reuse LUA-4's protocol model with explicit first-party owner identity; identity
-  alone must never confer trust or grants. Start with finite call dispatch.
+  alone must never confer trust or grants. Each owner has its own binding set
+  and capability policy (D-14). Creating and retiring owners at runtime needs
+  no pool or cross-owner scheduler. Start with finite call dispatch.
 - **Phase:** trusted runtime ownership.
 - **Depends on:** LUA-3, LUA-4.
 - **Ordering:** trusted critical path, independent of Q-5.
-- **Relevant decisions:** D-1, D-2, D-3, D-4, D-7, D-12, D-13, D-14.
+- **Relevant decisions:** D-1, D-2, D-3, D-4, D-7, D-12, D-13, D-14, D-15.
 - **Acceptance signals:** readiness cannot hang on dead initialization;
   abandoned startup remains owned; full backlog then stop; original failure and
   cleanup preserved; fatal host failures follow normal supervision;
   a stuck VM retains its dependencies; VM ready
-  is not confused with the worker's earlier startup acknowledgement.
+  is not confused with the worker's earlier startup acknowledgement. Owners
+  created and retired while others run, with different binding sets and
+  policies, stay independent: retiring or failing one neither stops another
+  nor widens its bindings.
 - **Out of scope:** deadline scheduling, request/subscription providers, UI/game
   composition, confined process integration (LUA-16), replacement of
   Runtime.Inbox or the application runner.
@@ -1360,7 +1435,8 @@ and verified policy, with adversarial regression coverage.
 
 - **Outcome:** the trusted system milestone demonstrates responsive first-party
   Lua UI during busy finite gameplay, with independent in-process VMs, coherent
-  state, and protected VM/dependency lifetime.
+  state, and protected VM/dependency lifetime. It is the game's two-domain
+  composition of D-15's VM owners.
 - **Scope:** a small application-owned consumer with two domains, intentions,
   explicit gameplay grants and staged snapshot commit; P-2/P-8 policy and P-12
   real-interpreter acceptance; reproduction commands and bounded optional
