@@ -6,7 +6,7 @@ Keep Lua central to authoring a game while Haskell owns execution, transport,
 failure evidence, and lifetime. This is the canonical continuation of
 `lua_runtime_architecture_notes.md` and the design conversation of 2026-09-16.
 
-Design state: `exploring`
+Design state: ready for issue processing
 
 Owner: `coghex/hetoimasia`. Epic #145 and children #146–#149 have been
 created; those children are merged. The owner accepted the two-domain direction,
@@ -52,6 +52,17 @@ This reconciliation does not renew readiness. Trusted-path readiness renewal
 (LUA-2, LUA-3, LUA-5 through LUA-8) is still pending the owner. The document
 remains `exploring`, and Q-5 still gates the process branch.
 
+Narrow readiness renewal, 2026-10-15: the owner, via the assistant (request
+`user-het-lua-narrow-ready-20261015`), approved "hetoimasia's narrow readiness
+step". Trusted-path design readiness is renewed for **LUA-2 and LUA-3 only**,
+so the document is ready for issue processing for those two slices.
+- LUA-5 through LUA-8 are not renewed. They stay `[deferred]` until the owner
+  renews them.
+- The confined branch (LUA-9 through LUA-13, LUA-16, LUA-17) stays
+  `[deferred]` on Q-5's successful platform verdicts.
+
+This is not approval of the whole program, and no other gate changes.
+
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
 reviewed and deliberately not tracked separately · `[deferred]` blocked on a
 concrete precondition
@@ -65,17 +76,17 @@ concrete precondition
 - [ ] LUA-2. Own the VM through a protected IO lifetime
 - [ ] LUA-3. Add application-owned modules and bounded value bindings
 - [x] LUA-4. Model bounded script tasks and execution protocols — [#149]
-- [ ] LUA-5. Integrate trusted VM owners with runtime supervision
-- [ ] LUA-6. Schedule cooperative tasks with bounded service turns
-- [ ] LUA-7. Add bounded asynchronous requests and owned subscriptions
-- [ ] LUA-8. Prove independent trusted UI and gameplay execution headlessly
-- [ ] LUA-9. Add bounded child-process transport and owned process lifetime
-- [ ] LUA-10. Establish Linux mod-process confinement
-- [ ] LUA-11. Establish macOS mod-process confinement
-- [ ] LUA-12. Enforce parent-owned execution and resource budgets
-- [ ] LUA-13. Broker scoped mod capabilities in the parent
-- [ ] LUA-16. Integrate confined mod owners with the runtime
-- [ ] LUA-17. Prove confined execution and adversarial isolation headlessly
+- [ ] LUA-5. Integrate trusted VM owners with runtime supervision — [deferred]: owner renews trusted-path readiness for this slice
+- [ ] LUA-6. Schedule cooperative tasks with bounded service turns — [deferred]: owner renews trusted-path readiness for this slice
+- [ ] LUA-7. Add bounded asynchronous requests and owned subscriptions — [deferred]: owner renews trusted-path readiness for this slice
+- [ ] LUA-8. Prove independent trusted UI and gameplay execution headlessly — [deferred]: owner renews trusted-path readiness for this slice
+- [ ] LUA-9. Add bounded child-process transport and owned process lifetime — [deferred]: Q-5 successful Linux and macOS confinement verdicts
+- [ ] LUA-10. Establish Linux mod-process confinement — [deferred]: Q-5 successful Linux and macOS confinement verdicts
+- [ ] LUA-11. Establish macOS mod-process confinement — [deferred]: Q-5 successful Linux and macOS confinement verdicts
+- [ ] LUA-12. Enforce parent-owned execution and resource budgets — [deferred]: Q-5 successful Linux and macOS confinement verdicts
+- [ ] LUA-13. Broker scoped mod capabilities in the parent — [deferred]: Q-5 successful Linux and macOS confinement verdicts
+- [ ] LUA-16. Integrate confined mod owners with the runtime — [deferred]: Q-5 successful Linux and macOS confinement verdicts
+- [ ] LUA-17. Prove confined execution and adversarial isolation headlessly — [deferred]: Q-5 successful Linux and macOS confinement verdicts
 
 The ledger records processing, not implementation. Keep it synchronized with
 the delivery plan; do not infer issue numbers from these local slice IDs.
@@ -1299,8 +1310,9 @@ and verified policy, with adversarial regression coverage.
 
 > The former Q-3/#146 prerequisite is satisfied. Reuse the selected binding's
 > package contract rather than repeating its proof. D-13 permits this slice
-> independently of Q-5 after renewed readiness. LUA-4 has already been
-> processed and implemented independently.
+> independently of Q-5, and the owner renewed its readiness on 2026-10-15
+> (narrow renewal: LUA-2 and LUA-3). LUA-4 has already been processed and
+> implemented independently.
 
 - **Outcome:** a VM owner constructs, uses, and closes its VM while preserving
   primary/cleanup evidence and callback dependencies on every supported exit.
@@ -1320,8 +1332,8 @@ and verified policy, with adversarial regression coverage.
   closed in arbitrary order stay independent: closing or failing one leaves
   the others' VMs, state and evidence intact.
 - **Out of scope:** module namespaces, worker adapter, scheduler, hard deadlines.
-- **Open questions:** Q-3 is resolved; renewed document readiness remains the
-  processing gate. Q-5 does not gate this trusted slice.
+- **Open questions:** Q-3 is resolved, and readiness was renewed on 2026-10-15.
+  Q-5 does not gate this trusted slice.
 
 ### LUA-3. Add application-owned modules and bounded value bindings
 
@@ -1342,7 +1354,8 @@ and verified policy, with adversarial regression coverage.
   exposes nothing to mods and a direct binding need not have an IPC equivalent.
 - **Out of scope:** asynchronous providers, live reload, coroutine scheduler,
   IPC implementation and mod admission (LUA-13/LUA-16).
-- **Open questions:** None; Q-8 is resolved. Renewed readiness still gates processing.
+- **Open questions:** None; Q-8 is resolved, and readiness was renewed on
+  2026-10-15.
 
 ### LUA-4. Model bounded script tasks and execution protocols
 
@@ -1361,6 +1374,8 @@ and verified policy, with adversarial regression coverage.
 - **Open questions:** None; D-7 fixes failure policy and D-8 scopes identities.
 
 ### LUA-5. Integrate trusted VM owners with runtime supervision
+
+> Deferred: owner renews trusted-path readiness for this slice. The 2026-10-15 narrow renewal covers LUA-2 and LUA-3 only.
 
 - **Outcome:** supervised in-process VM owners expose ready trusted Lua
   endpoints and retain VM/callback dependencies through close without a new
@@ -1392,6 +1407,8 @@ and verified policy, with adversarial regression coverage.
 
 ### LUA-6. Schedule cooperative tasks with bounded service turns
 
+> Deferred: owner renews trusted-path readiness for this slice. The 2026-10-15 narrow renewal covers LUA-2 and LUA-3 only.
+
 - **Outcome:** one trusted VM owner services resumable tasks fairly, wakes for
   events/deadlines, and reports real budget overruns without fake preemption.
 - **Scope:** P-5/P-6 ready classes, finite quanta, coroutine/explicit-segment
@@ -1410,6 +1427,8 @@ and verified policy, with adversarial regression coverage.
 - **Open questions:** Q-4 before processing.
 
 ### LUA-7. Add bounded asynchronous requests and owned subscriptions
+
+> Deferred: owner renews trusted-path readiness for this slice. The 2026-10-15 narrow renewal covers LUA-2 and LUA-3 only.
 
 - **Outcome:** scripts can wait for an engine operation or event without
   blocking the owner or invoking Lua from a producer thread.
@@ -1432,6 +1451,8 @@ and verified policy, with adversarial regression coverage.
 - **Open questions:** None once predecessor gates are satisfied.
 
 ### LUA-8. Prove independent trusted UI and gameplay execution headlessly
+
+> Deferred: owner renews trusted-path readiness for this slice. The 2026-10-15 narrow renewal covers LUA-2 and LUA-3 only.
 
 - **Outcome:** the trusted system milestone demonstrates responsive first-party
   Lua UI during busy finite gameplay, with independent in-process VMs, coherent
@@ -1459,6 +1480,8 @@ and verified policy, with adversarial regression coverage.
 
 ### LUA-9. Add bounded child-process transport and owned process lifetime
 
+> Deferred: Q-5 successful Linux and macOS confinement verdicts (D-11/D-13).
+
 - **Outcome:** a parent owns a child and bounded private IPC through launch,
   readiness, exit, cancellation, and reaping, with no detached helpers.
 - **Scope:** P-13 wire schema/decoder limits, launch-bound identity, restricted
@@ -1481,6 +1504,8 @@ and verified policy, with adversarial regression coverage.
 
 ### LUA-10. Establish Linux mod-process confinement
 
+> Deferred: Q-5 successful Linux and macOS confinement verdicts (D-11/D-13).
+
 - **Outcome:** the selected Linux backend installs and verifies the restricted
   launch/resource profile before untrusted initialization is possible.
 - **Scope:** production integration of LUA-14's proven Linux mechanism,
@@ -1499,6 +1524,8 @@ and verified policy, with adversarial regression coverage.
 - **Open questions:** Q-5 must be resolved before processing.
 
 ### LUA-11. Establish macOS mod-process confinement
+
+> Deferred: Q-5 successful Linux and macOS confinement verdicts (D-11/D-13).
 
 - **Outcome:** the selected macOS helper/deployment arrangement enforces the same
   logical permissions and resource profile on local supported macOS.
@@ -1520,6 +1547,8 @@ and verified policy, with adversarial regression coverage.
 
 ### LUA-12. Enforce parent-owned execution and resource budgets
 
+> Deferred: Q-5 successful Linux and macOS confinement verdicts (D-11/D-13).
+
 - **Outcome:** a child cannot evade configured admission/execution/shutdown
   limits by ignoring yields, forging heartbeats, or flooding the parent.
 - **Scope:** P-13 watchdog/limit state, finite total process/resource admission,
@@ -1537,6 +1566,8 @@ and verified policy, with adversarial regression coverage.
 - **Open questions:** Q-4/Q-5 must be resolved before processing.
 
 ### LUA-13. Broker scoped mod capabilities in the parent
+
+> Deferred: Q-5 successful Linux and macOS confinement verdicts (D-11/D-13).
 
 - **Outcome:** even a malicious child can invoke only its explicitly granted,
   bounded application operations and receive only its allowed views.
@@ -1561,6 +1592,8 @@ and verified policy, with adversarial regression coverage.
 
 ### LUA-16. Integrate confined mod owners with the runtime
 
+> Deferred: Q-5 successful Linux and macOS confinement verdicts (D-11/D-13).
+
 - **Outcome:** a supervised parent owner exposes a ready confined Lua endpoint
   and retains process/provider dependencies through exit without a new supervisor.
 - **Scope:** extend the runtime adapter with P-13 process ownership, bounded
@@ -1584,6 +1617,8 @@ and verified policy, with adversarial regression coverage.
   before processing; predecessor gates and renewed readiness also apply.
 
 ### LUA-17. Prove confined execution and adversarial isolation headlessly
+
+> Deferred: Q-5 successful Linux and macOS confinement verdicts (D-11/D-13).
 
 - **Outcome:** the confined system milestone demonstrates independent mod/domain
   execution alongside trusted first-party owners, with enforced permissions and
