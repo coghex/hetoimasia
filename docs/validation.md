@@ -145,6 +145,7 @@ the audited suite inventory, and which optional probes are local-only.
 | `test.runtime` | `cabal test hetoimasia-runtime:runtime-tests --test-show-details=direct` | no | yes | any |
 | `test.glfw` | `cabal test hetoimasia-glfw:glfw-tests --test-show-details=direct` | no | yes | any |
 | `test.scripting-lua` | `cabal test hetoimasia-scripting-lua:lua-host-tests --test-show-details=direct` | no | no | any |
+| `test.scripting-lua-runtime` | `cabal test hetoimasia-scripting-lua:lua-runtime-tests --test-show-details=direct` | no | no | any |
 | `test.lua-confinement-linux` | `cabal test hetoimasia-scripting-lua:linux-confinement-probe --test-show-details=direct` | yes | no | `Linux` |
 | `test.vulkan` | `cabal test --project-file cabal.project.cpu hetoimasia-gpu-vulkan-model:gpu-model-tests --test-show-details=direct` | no | no | any |
 | `test.vulkan-diagnostics` | `cabal test --project-file cabal.project.cpu hetoimasia-gpu-vulkan-diagnostics:diagnostics-tests --test-show-details=direct` | no | no | any |
@@ -208,6 +209,18 @@ the build links, and whether Lua's garbage collection may run under unsafe calls
 progress and allocation-failure contracts still use `lua-hazard` through
 `build-tool-depends`. Its deliberate nontermination experiment is now the
 separate local-only `test.lua-hazard` probe.
+
+`test.scripting-lua-runtime` runs the Lua runtime adapter's own suite,
+`lua-runtime-tests`, from the `runtime-lua-test/` source directory beside the host's:
+readiness through a supervised wait, owner identity, bounded submission, exactly-once
+settlement, host failures under the owner's policy, protected stop and its exit record,
+independent owners, the refused reply wait from inside a Lua callback, and the adapter's
+dependency closure. Every execution and lifecycle example acquires real VMs under a real
+`withSupervision`. Like `test.scripting-lua` it is mandatory but outside the floor, so it is
+selected when affected. It declares `cabal.project.common`, for the same reason, and its
+Cabal closure covers the host library, the adapter and the runtime and foundation packages
+they depend on. It is routed on the same `haskell-engine` worker, and its receipt is published
+as reusable evidence the way `test.scripting-lua`'s is.
 
 `test.lua-confinement-linux` is a local-only optional feasibility probe, like
 `test.macos-confinement`. It checks namespace/private-root/seccomp confinement,
@@ -863,7 +876,7 @@ Each worker is declared once, to the planner:
 
 ```bash
 python3 tools/validation/plan.py --base origin/master --head HEAD \
-  --worker haskell-engine=cpu:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.vulkan,test.vulkan-diagnostics,test.math,test.asset-image,test.render-api,test.render-2d,test.render-2d-oracle,smoke.console \
+  --worker haskell-engine=cpu:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.scripting-lua-runtime,test.vulkan,test.vulkan-diagnostics,test.math,test.asset-image,test.render-api,test.render-2d,test.render-2d-oracle,smoke.console \
   --worker haskell-workflow=cpu:test.workflow \
   --worker glfw-native=display:test.glfw-native,test.glfw-wayland \
   --worker vulkan=cpu+display:test.vulkan-headless,test.vulkan-native,test.vulkan-wayland
@@ -1028,7 +1041,7 @@ class to every execution:
 
 | Job | Runner class | Groups, in order |
 | --- | --- | --- |
-| `haskell-engine` | `cpu` | `build.all`, `test.engine`, `test.foundation`, `test.runtime`, `test.glfw`, `test.scripting-lua`, `test.vulkan`, `test.vulkan-diagnostics`, `test.math`, `test.asset-image`, `test.render-api`, `test.render-2d`, `smoke.console` |
+| `haskell-engine` | `cpu` | `build.all`, `test.engine`, `test.foundation`, `test.runtime`, `test.glfw`, `test.scripting-lua`, `test.scripting-lua-runtime`, `test.vulkan`, `test.vulkan-diagnostics`, `test.math`, `test.asset-image`, `test.render-api`, `test.render-2d`, `smoke.console` |
 | `haskell-workflow` | `cpu` | `test.workflow` |
 | `glfw-native` | `display` | `test.glfw-native`, `test.glfw-wayland` |
 | `vulkan` | `cpu`, `display` | `test.vulkan-headless`, `test.vulkan-native`, `test.vulkan-wayland` |
@@ -2444,7 +2457,7 @@ contributes, one `--toolchain` each:
 toolchain=(--toolchain "ghc=$(ghc --numeric-version)" --toolchain "cabal=$(cabal --numeric-version)")
 while IFS= read -r entry; do toolchain+=(--toolchain "$entry"); done < <(python3 tools/native/native.py toolchain)
 python3 tools/validation/plan.py --base origin/master --head HEAD --runner-os Darwin "${toolchain[@]}" \
-  --worker local=cpu+display:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.vulkan,test.vulkan-diagnostics,test.math,test.asset-image,test.render-api,test.render-2d,test.vulkan-headless,test.vulkan-native,smoke.console,test.workflow,test.glfw-native \
+  --worker local=cpu+display:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.scripting-lua-runtime,test.vulkan,test.vulkan-diagnostics,test.math,test.asset-image,test.render-api,test.render-2d,test.vulkan-headless,test.vulkan-native,smoke.console,test.workflow,test.glfw-native \
   --json > plan.json
 python3 -I tools/validation/run.py test.workflow --plan plan.json --receipts receipts \
   --worker local --runner-class cpu --runner-class display \
@@ -2568,7 +2581,7 @@ REQUEST
 python3 tools/validation/plan.py --base origin/master --head HEAD --runner-os Darwin \
   --toolchain "ghc=$(ghc --numeric-version)" --toolchain "cabal=$(cabal --numeric-version)" \
   --request-file request.txt \
-  --worker local=cpu+display:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.vulkan,test.vulkan-diagnostics,test.math,test.asset-image,test.render-api,test.render-2d,test.vulkan-headless,test.vulkan-native,smoke.console,test.workflow,test.glfw-native,test.macos-confinement \
+  --worker local=cpu+display:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.scripting-lua-runtime,test.vulkan,test.vulkan-diagnostics,test.math,test.asset-image,test.render-api,test.render-2d,test.vulkan-headless,test.vulkan-native,smoke.console,test.workflow,test.glfw-native,test.macos-confinement \
   --json > plan.json
 python3 -I tools/validation/run.py test.macos-confinement --plan plan.json --receipts receipts \
   --worker local --runner-class cpu --runner-class display \
