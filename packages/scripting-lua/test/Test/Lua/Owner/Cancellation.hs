@@ -33,7 +33,7 @@ import Control.Monad (replicateM)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import qualified Data.Set as Set
 import Data.Text (Text)
-import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (ThreadBlocked), threadStatus)
+import GHC.Conc (BlockReason (BlockedOnException, BlockedOnMVar), ThreadStatus (ThreadBlocked), threadStatus)
 import Hetoimasia.Foundation.Resource (cleanupFailureLabel, cleanupFailures)
 import Hetoimasia.Scripting.Lua.Bridge (chunkName)
 import Hetoimasia.Scripting.Lua.Internal.Callback (CallbackResult (NoResult), installCallback)
@@ -78,6 +78,27 @@ holdCallback finalizing hold config =
           )
           (pure ())
     , ownerAllowlist = Set.insert "hold" (ownerAllowlist config)
+    }
+
+-- | Install @slow@, whose retained release blocks until the example lets it
+-- return: a dependency the close releases after the interpreter has closed, and
+-- that a cancellation of the owner must neither interrupt nor be taken for the
+-- failure of.
+slowRelease ∷ Finalizing → Hold → OwnerConfig → OwnerConfig
+slowRelease finalizing hold config =
+  config
+    { ownerAfterLibraries = \vm → do
+        ownerAfterLibraries config vm
+        installCallback
+          vm
+          "slow"
+          (pure NoResult)
+          ( do
+              note (finalizingEvents finalizing) "slow release: waiting"
+              putMVar (holdEntered hold) ()
+              takeMVar (holdRelease hold)
+              note (finalizingEvents finalizing) "slow release: left"
+          )
     }
 
 -- | A guard whose finalizer calls @hold@ when the state closes.
@@ -217,6 +238,64 @@ spec = describe "cancellation" $ do
     length (filter (== "hold: left") logged) `shouldBe` 1
     logged `shouldSatisfy` before "hold: left" "release"
 
+  it "keeps the evidence on the cancellation however many are queued, past any fixed count" $ do
+    finalizing ← newFinalizing
+    hold ← newHold
+    let config = holdingGuard (holdCallback finalizing hold (failingReleaseConfig finalizing))
+        queued = 1500
+    (owner, slot) ← ownerThread config (\_ → pure ())
+    bounded (takeMVar (holdEntered hold))
+    senders ←
+      replicateM queued $ do
+        done ← newEmptyMVar
+        sender ← forkIO (throwTo owner UserInterrupt >> putMVar done ())
+        pure (sender, done)
+    mapM_ (bounded . awaitBlockedOnException . fst) senders
+    putMVar (holdRelease hold) ()
+    outcome ← bounded (takeMVar slot)
+    mapM_ (bounded . takeMVar . snd) senders
+    case outcome of
+      Right () → expectationFailure "the cancellation was lost"
+      Left failure → do
+        causeOf failure `shouldBe` Just UserInterrupt
+        -- Not one of the queued cancellations was left to supersede the
+        -- exception that carries the close's failure.
+        evidenceLabels failure `shouldBe` ["lua release"]
+
+  it "does not take a cancellation that arrives while a retained release blocks for that release's failure, and raises it ahead of an earlier close failure" $ do
+    finalizing ← newFinalizing
+    hold ← newHold
+    let config = slowRelease finalizing hold (failingFinalizerConfig finalizing)
+    (owner, slot) ← ownerThread config (\_ → pure ())
+    -- The close has run its finalizers, one of which failed, and is releasing: the
+    -- owner is inside the retained release, and is observed blocked on its wait.
+    -- That wait is a blocking operation of Haskell's own, which a cancellation
+    -- could interrupt if the release were interruptible, so the example waits
+    -- until the owner is in it rather than assuming it is.
+    bounded (takeMVar (holdEntered hold))
+    bounded (awaitBlockedOnMVar owner)
+    done ← newEmptyMVar
+    sender ← forkIO (throwTo owner UserInterrupt >> putMVar done ())
+    -- Uninterruptible, the release cannot take the cancellation: it stays queued
+    -- against the owner, with the sender blocked delivering it. An interruptible
+    -- release would take it at once and the sender would finish, which this wait
+    -- would never see.
+    bounded (awaitBlockedOnException sender)
+    putMVar (holdRelease hold) ()
+    outcome ← bounded (takeMVar slot)
+    bounded (takeMVar done)
+    -- The release was not interrupted: it waited, and it left.
+    logged ← events (finalizingEvents finalizing)
+    logged `shouldSatisfy` before "slow release: waiting" "slow release: left"
+    -- The cancellation is the primary failure, with the finalizer's failure as
+    -- cleanup evidence, and is not itself an entry of that evidence.
+    case outcome of
+      Right () → expectationFailure "the cancellation was lost"
+      Left failure → do
+        causeOf failure `shouldBe` Just UserInterrupt
+        asyncCancellation failure `shouldBe` True
+        evidenceLabels failure `shouldBe` ["lua finalizer"]
+
   it "raises a cancellation that arrives during the close ahead of the body's failure, leaving that failure reachable beside it" $ do
     finalizing ← newFinalizing
     hold ← newHold
@@ -251,6 +330,15 @@ before earlier later logged = case (lookup' earlier, lookup' later) of
   _ → False
   where
     lookup' entry = lookup entry (zip logged [0 ∷ Int ..])
+
+-- | Wait until a thread is blocked on an @MVar@, which is where a retained
+-- release that waits for the example stands.
+awaitBlockedOnMVar ∷ ThreadId → IO ()
+awaitBlockedOnMVar thread = do
+  status ← threadStatus thread
+  case status of
+    ThreadBlocked BlockedOnMVar → pure ()
+    _ → yield *> awaitBlockedOnMVar thread
 
 -- | Wait until a thread is blocked delivering an exception to a thread that
 -- cannot take it yet.

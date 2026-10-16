@@ -49,8 +49,9 @@
 --   ends that step; the owner then closes the VM, so nothing is left live;
 -- * during the close is deferred. The close is masked, so it neither lands inside
 --   the close nor stops it, and the dependencies are released only after
---   @lua_close@ returned. It is taken after the close, at the allowances
---   below.
+--   @lua_close@ returned; each release runs uninterruptibly, as a scope's does,
+--   so a cancellation neither lands inside one nor is mistaken for its failure.
+--   It is taken after the close, at the allowances below.
 --
 -- Repeated cancellation cannot abandon the VM or release anything early,
 -- because nothing in the close can be interrupted, and cannot start a second
@@ -206,18 +207,20 @@ withOwnedVm config body = mask $ \restore → do
 -- that carries the close's evidence.
 --
 -- Each allowance delivers at most one pending exception, so this asks until none
--- is delivered. It is bounded, so a thread that cancels the owner without end
--- cannot keep it here for ever; a cancellation past the bound is delivered
--- afterwards, as any other would be.
+-- is delivered. It has no count to stop at, because any count would leave
+-- cancellations pending past it: the evidence has to survive every cancellation
+-- that is queued when the close finishes, however many. It ends when the queue
+-- does, and the queue is whatever other threads have already sent; the owner is
+-- closed by then and waiting here costs nothing. A thread that cancels the owner
+-- without end keeps it here, as it would keep any masked region.
 pendingCancellation ∷ IO (Either (ExceptionWithContext SomeException) ())
-pendingCancellation = go (1000 ∷ Int) (Right ())
+pendingCancellation = go (Right ())
   where
-    go 0 first = pure first
-    go remaining first = do
+    go first = do
       taken ← tryWithContext @SomeException allowInterrupt
       case taken of
         Right () → pure first
-        Left cancellation → go (remaining - 1) (either Left (const (Left cancellation)) first)
+        Left cancellation → go (either Left (const (Left cancellation)) first)
 
 -- | Compose how the lifetime ended into what the owner raises or returns.
 finish

@@ -124,6 +124,7 @@ import Control.Exception
   , throwIO
   , try
   , tryWithContext
+  , uninterruptibleMask_
   )
 import Control.Monad (unless, when)
 import Data.ByteString (useAsCString)
@@ -520,7 +521,12 @@ teardown vm = do
   dropped ← atomicModifyIORef' (vmClosingDropped vm) (\count → (0, count))
   stranded ← takeEscape vm
   releases ← atomicModifyIORef' (vmReleases vm) (\retained → ([], retained))
-  outcomes ← traverse (tryWithContext @SomeException) (reverse releases)
+  -- Each release runs uninterruptibly, as a scope's release does: it is a Haskell
+  -- release with a controlled blocking duration, so a cancellation of the owner
+  -- waits for it instead of being delivered inside it and mistaken for the
+  -- release's own failure. The close above, which runs Lua's finalizers, is not
+  -- run that way.
+  outcomes ← traverse (uninterruptibleMask_ . tryWithContext @SomeException) (reverse releases)
   truncation ←
     if dropped > 0
       then do
