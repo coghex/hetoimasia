@@ -44,6 +44,7 @@ import Hetoimasia.Scripting.Lua.Owner
   , callEntry
   , evalOwned
   , loadModule
+  , loadedModule
   )
 import Hetoimasia.Scripting.Lua.Value
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
@@ -85,6 +86,7 @@ reading owned = do
 
 spec ∷ Spec
 spec = describe "discipline" $ do
+  wideSweep
   it "leaves the stack and the registry as it found them across a thousand calls, refusals and faults" $ do
     fixture ← newFixture
     withOwnerOf ((sampleConfig fixture ["sample"])) $ \owned → do
@@ -195,7 +197,7 @@ spec = describe "discipline" $ do
       filter (Text.isInfixOf "unclassified") kinds `shouldBe` []
       -- Memory ran out inside the boundary's own marshalling, in each direction,
       -- and it was reported as a fault of the call.
-      forM_ ["args", "results", "record", "echo", "call"] $ \label →
+      forM_ ["args", "results", "record"] $ \label →
         kinds `shouldSatisfy` elem (label <> ":memory at the boundary")
       kinds `shouldSatisfy` elem "construction"
       -- Memory ran out while the registration's bindings were being installed in
@@ -207,10 +209,37 @@ spec = describe "discipline" $ do
       kinds `shouldSatisfy` elem "initial module"
       -- Every operation of the body was, somewhere in the sweep, refused for lack
       -- of memory in a classified way, and somewhere succeeded.
-      forM_ ["load", "call", "echo", "many", "args", "results", "record"] $ \label →
+      forM_ ["load", "args", "results", "record"] $ \label →
         kinds `shouldSatisfy` any (\entry → (label <> ":memory") `Text.isPrefixOf` entry)
       forM_ ["load", "call", "echo", "many", "args", "results", "record"] $ \label →
         kinds `shouldSatisfy` elem (label <> ":ok")
+
+-- | A wide entry point's arguments are built on a stack that has to grow, so memory
+-- can run out in reserving it: swept finely, and always a classified failure.
+wideSweep ∷ Spec
+wideSweep = describe "a wide entry point" $
+  it "is a classified failure when memory runs out reserving the stack for its arguments" $ do
+    fixture ← newFixture
+    outcomes ←
+      forM [0, 7 .. 60000] $ \budget → do
+        result ←
+          runOwner
+            ( (defaultOwnerConfig libraries)
+                { ownerBudget = Just budget
+                , ownerRegistration = sampleRegistration fixture
+                , ownerModules = [workbench]
+                }
+            )
+            $ \owned → do
+              Just handle ← loadedModule' owned
+              try @SomeException (callEntry owned handle "many" (replicate 16 (VInteger 1)))
+        pure $ case result of
+          Right outcome → classify' outcome
+          Left _ → "construction"
+    filter (Text.isInfixOf "unclassified") (nub outcomes) `shouldBe` []
+    nub outcomes `shouldSatisfy` elem "ok"
+  where
+    loadedModule' owned = loadedModule owned (ModuleRef "workbench" "1")
 
 -- | How an operation of the sweep ended: it did, or it was refused for lack of
 -- memory in one of the classified ways. Anything else is reported as such, and

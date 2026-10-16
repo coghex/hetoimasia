@@ -228,10 +228,17 @@ loadModule host source =
             raiseEscape vm
             throwFailure luaComponent loadOperation [] $
               (faultOf host LoadModule ref Nothing reason) {boundaryEffect = effect, boundaryTraceback = trace}
+      -- Until the chunk starts nothing executes -- the collector, whose finalizers are
+      -- script-defined Lua, is held -- so a load that failed before then says so.
+      let loadEffect
+            | loadedStarted result = effectNow vm
+            | otherwise = do
+                runs ← operationActionRuns vm
+                pure (if runs > 0 then BindingRan else NoEffect)
       if loadedStatus result /= LUA_OK
         then do
           value ← renderFailure state entry
-          effect ← effectNow vm
+          effect ← loadEffect
           finishFailed (ScriptFailed (classify (loadedStatus result)) value) effect (loadedTrace result)
         else
           if loadedChunkStatus result /= LUA_OK

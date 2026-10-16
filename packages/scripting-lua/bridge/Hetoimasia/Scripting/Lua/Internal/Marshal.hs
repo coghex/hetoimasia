@@ -106,6 +106,7 @@ foreign import ccall safe "hetoimasia_lua_values.h hetoimasia_lua_load_module"
     → Ptr CInt
     → Ptr CInt
     → Ptr CInt
+    → Ptr CInt
     → IO StatusCode
 
 foreign import ccall safe "hetoimasia_lua_values.h hetoimasia_lua_module_release"
@@ -271,6 +272,8 @@ data Loaded = Loaded
   , loadedMissingPresent ∷ !Bool
     -- ^ Whether it was there as something else.
   , loadedStored ∷ !Bool
+  , loadedStarted ∷ !Bool
+    -- ^ Whether the module's chunk began to run. If not, nothing executed.
   , loadedTrace ∷ !(Maybe Text)
   }
 
@@ -287,7 +290,8 @@ loadModuleSource state source chunk required slot =
             alloca $ \loadStatus →
               alloca $ \missing →
                 alloca $ \missingKind →
-                  alloca $ \stored → do
+                  alloca $ \stored →
+                   alloca $ \started → do
                     status <-
                       c_load_module
                         state
@@ -306,6 +310,8 @@ loadModuleSource state source chunk required slot =
                         missing
                         missingKind
                         stored
+                        started
+                    ranChunk ← peek started
                     chunkStatus ← peek loadStatus
                     gone ← peek missing
                     kind ← peek missingKind
@@ -318,6 +324,7 @@ loadModuleSource state source chunk required slot =
                         , loadedMissing = fromIntegral gone
                         , loadedMissingPresent = kind /= 0
                         , loadedStored = kept /= 0
+                        , loadedStarted = ranChunk /= 0
                         , loadedTrace = traced
                         }
   where

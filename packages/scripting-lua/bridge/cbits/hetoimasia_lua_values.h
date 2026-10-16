@@ -137,7 +137,9 @@ int hetoimasia_lua_install_binding(
 ** LUA_ERRSYNTAX with its message on the stack), `*missing` the 1-based position
 ** of the first required entry point that is not a function, or 0, and
 ** `*missing_kind` 0 when it is absent and 1 when something else is there.
-** `*stored` is 1 once the module is in its slot.
+** `*stored` is 1 once the module is in its slot. `*started` is 1 once the chunk
+** began to run: until then nothing executed, because the collector, whose
+** finalizers are script-defined Lua, is held across everything before it.
 */
 int hetoimasia_lua_load_module(
   lua_State *L,
@@ -145,7 +147,7 @@ int hetoimasia_lua_load_module(
   const unsigned char *required, size_t required_length, int required_count,
   lua_Integer slot,
   char *trace, size_t trace_capacity, size_t *trace_length,
-  int *load_status, int *missing, int *missing_kind, int *stored);
+  int *load_status, int *missing, int *missing_kind, int *stored, int *started);
 
 /*
 ** Empty module slot `slot`, so the module it held is unreachable and its

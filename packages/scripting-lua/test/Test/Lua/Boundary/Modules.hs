@@ -354,6 +354,54 @@ spec = describe "application-owned modules" $ do
           [1 .. 20]
         references >>= (`shouldBe` before + 1)
 
+  describe "operations that execute nothing, with finalizers pending" $ do
+    -- Hundreds of unreachable objects whose finalizers call a binding, found by the
+    -- collector and partly run: the rest are pending, and an allocation can start
+    -- a step that runs more of them.
+    let pending owned =
+          run
+            owned
+            ( Text.unlines
+                [ "gcseen = 0"
+                , "collectgarbage('incremental', 0, 0, 1)" -- steps of two bytes: any allocation starts one
+                , "for i = 1, 400 do setmetatable({}, {__gc = function() gcseen = gcseen + 1; sample.note_gc('gc') end}) end"
+                , "repeat collectgarbage('step', 0) until gcseen > 0"
+                ]
+            )
+        ran fixture = length <$> logged fixture
+        longName = Text.replicate 60 "n"
+
+    it "looks an absent optional entry point up without running a finalizer or a binding" $ do
+      fixture ← newFixture
+      withOwner fixture ["sample"] $ \owned → do
+        handle ← loadModule owned (moduleOf "absent" "1" "x = 1" [optional longName [] [], optional "short" [] []])
+        pending owned
+        before ← ran fixture
+        before `shouldSatisfy` (> 0)
+        mapM_ (\_ → callEntry owned handle longName [] >>= (`shouldBe` EntryAbsent)) [1 .. 50 ∷ Int]
+        callEntry owned handle "short" [] >>= (`shouldBe` EntryAbsent)
+        ran fixture >>= (`shouldBe` before)
+
+    it "rejects a load without running a finalizer or a binding, and says no effect" $ do
+      fixture ← newFixture
+      withOwner fixture ["sample"] $ \owned → do
+        pending owned
+        before ← ran fixture
+        before `shouldSatisfy` (> 0)
+        rejected ← mapM (\index → faulted (loadModule owned (moduleOf "bad" (Text.pack (show (index ∷ Int))) "this is not lua" []))) [1 .. 30]
+        mapM_ (\fault → boundaryEffect fault `shouldBe` NoEffect) rejected
+        ran fixture >>= (`shouldBe` before)
+
+    it "refuses arguments without running a finalizer or a binding" $ do
+      fixture ← newFixture
+      withOwner fixture ["sample"] $ \owned → do
+        handle ← loadModule owned (moduleOf "echo" "1" "function f(list) return list end" [required "f" [SList SInteger] [SList SInteger]])
+        pending owned
+        before ← ran fixture
+        -- Refused arguments run nothing at all.
+        mapM_ (\_ → faulted (callEntry owned handle "f" [VList [VFloat 1]])) [1 .. 20 ∷ Int]
+        ran fixture >>= (`shouldBe` before)
+
   describe "absent entry points and the application's own checks" $ do
     it "resolves an absent optional entry point before validating arguments or running a liveness check" $ do
       fixture ← newFixture

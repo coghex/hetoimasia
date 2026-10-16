@@ -5,6 +5,35 @@
 #include <stdlib.h>
 #include <string.h>
 
+/*
+** The collector is held across every host-side phase.
+**
+** Allocating in Lua can start a collection step, and a step can run pending
+** `__gc` finalizers, which are script-defined Lua and can call bindings. A phase
+** that is claimed to execute nothing -- looking an entry point up, reading
+** arguments, building results, loading a module up to the point its chunk starts
+** -- would then not be what it claims. So each of them stops the collector first
+** and gives it back as it was found: `lua_gc(LUA_GCISRUNNING)` is false if a
+** script already stopped it, or while a finalizer is running, and then there is
+** nothing to hold or to give back. Neither call can raise an error or run Lua.
+** What the held collector owes is paid by the next script phase.
+*/
+static int gc_hold(lua_State *L)
+{
+  int was = lua_gc(L, LUA_GCISRUNNING);
+  if (was) {
+    lua_gc(L, LUA_GCSTOP);
+  }
+  return was;
+}
+
+static void gc_release(lua_State *L, int was)
+{
+  if (was) {
+    lua_gc(L, LUA_GCRESTART);
+  }
+}
+
 /* The deepest a value may nest, whatever limit a configuration asks for. It
 ** sizes the path the cycle check keeps on the C stack. */
 #define MAX_DEPTH_HARD 64
@@ -343,6 +372,7 @@ int hetoimasia_lua_read_values(
   reader r;
   int status;
   int i;
+  int held = gc_hold(L);
 
   memset(&r, 0, sizeof r);
   r.max_bytes = max_bytes;
@@ -360,6 +390,7 @@ int hetoimasia_lua_read_values(
   ** the interpreter running out of memory and is answered as Lua answers it, not
   ** as a refusal of the script's value. */
   if (count < 0 || !lua_checkstack(L, count + 6)) {
+    gc_release(L, held);
     return LUA_ERRMEM;
   }
   lua_pushcfunction(L, read_body);
@@ -368,6 +399,7 @@ int hetoimasia_lua_read_values(
     lua_pushvalue(L, first + i);
   }
   status = lua_pcall(L, 1 + count, 0, 0);
+  gc_release(L, held);
 
   if (status == LUA_OK && (r.refusal == HETOIMASIA_READ_STACK || r.refusal == HETOIMASIA_READ_MEMORY)) {
     status = LUA_ERRMEM;
@@ -524,18 +556,21 @@ int hetoimasia_lua_push_values(
 {
   writer w;
   int status;
+  int held = gc_hold(L);
   w.p = buffer;
   w.end = buffer + length;
   w.max_depth = max_depth > MAX_DEPTH_HARD ? MAX_DEPTH_HARD : max_depth;
   w.malformed = 0;
   *malformed = 0;
   if (!lua_checkstack(L, 8)) {
+    gc_release(L, held);
     return LUA_ERRMEM;
   }
   lua_pushcfunction(L, push_body);
   lua_pushlightuserdata(L, &w);
   lua_pushinteger(L, count);
   status = lua_pcall(L, 2, count, 0);
+  gc_release(L, held);
   /* Stack that could not be reserved is memory running out, as above. */
   if (status == LUA_OK && w.malformed == 2) {
     status = LUA_ERRMEM;
@@ -592,11 +627,16 @@ static int setup_body(lua_State *L)
 
 int hetoimasia_lua_values_setup(lua_State *L)
 {
+  int held = gc_hold(L);
+  int status;
   if (!lua_checkstack(L, 8)) {
+    gc_release(L, held);
     return LUA_ERRMEM;
   }
   lua_pushcfunction(L, setup_body);
-  return lua_pcall(L, 0, 0, 0);
+  status = lua_pcall(L, 0, 0, 0);
+  gc_release(L, held);
+  return status;
 }
 
 static int count_body(lua_State *L)
@@ -828,7 +868,19 @@ typedef struct {
   int missing;
   int missing_kind;
   int stored;
+  int gc_held;
+  int started;
 } load_arguments;
+
+/* Give the collector back, once, at the point the chunk is about to start or the
+** load is over without it. */
+static void load_release(lua_State *L, load_arguments *a)
+{
+  if (a->gc_held) {
+    gc_release(L, a->gc_held);
+    a->gc_held = 0;
+  }
+}
 
 static int load_body(lua_State *L)
 {
@@ -848,12 +900,16 @@ static int load_body(lua_State *L)
 
   a->load_status = luaL_loadbufferx(L, a->source, a->source_length, a->chunk, "t");
   if (a->load_status != LUA_OK) {
+    load_release(L, a);
     return 1;
   }
   lua_pushvalue(L, 1);
   if (lua_setupvalue(L, 2, 1) == NULL) {
     lua_pop(L, 1);
   }
+  /* Everything up to here executed nothing. */
+  load_release(L, a);
+  a->started = 1;
   lua_call(L, 0, 0);
 
   p = a->required;
@@ -899,7 +955,7 @@ int hetoimasia_lua_load_module(
   const unsigned char *required, size_t required_length, int required_count,
   lua_Integer slot,
   char *trace, size_t trace_capacity, size_t *trace_length,
-  int *load_status, int *missing, int *missing_kind, int *stored)
+  int *load_status, int *missing, int *missing_kind, int *stored, int *started)
 {
   load_arguments a;
   int base;
@@ -920,13 +976,20 @@ int hetoimasia_lua_load_module(
   a.missing = 0;
   a.missing_kind = 0;
   a.stored = 0;
+  a.started = 0;
+  a.gc_held = 0;
+  *started = 0;
   *trace_length = 0;
   *load_status = LUA_OK;
   *missing = 0;
   *missing_kind = 0;
   *stored = 0;
 
+  /* Held from here until the chunk is about to run (see `load_release`): the
+  ** environment is made and the source parsed without executing anything. */
+  a.gc_held = gc_hold(L);
   if (!lua_checkstack(L, 6)) {
+    load_release(L, &a);
     return LUA_ERRMEM;
   }
   base = lua_gettop(L) + 1;
@@ -941,7 +1004,9 @@ int hetoimasia_lua_load_module(
   *extra = &context;
   status = lua_pcall(L, 1, 1, base);
   *extra = saved;
+  load_release(L, &a);
   lua_remove(L, base);
+  *started = a.started;
   *load_status = a.load_status;
   *missing = a.missing;
   *missing_kind = a.missing_kind;
@@ -1022,9 +1087,11 @@ int hetoimasia_lua_entry_lookup(
   a.length = length;
   a.kind = 0;
   a.found = 0;
+  int held = gc_hold(L);
   *kind = 0;
   *found_module = 0;
   if (!lua_checkstack(L, 8)) {
+    gc_release(L, held);
     return LUA_ERRMEM;
   }
   lua_pushcfunction(L, lookup_body);
@@ -1032,5 +1099,6 @@ int hetoimasia_lua_entry_lookup(
   status = lua_pcall(L, 1, 1, 0);
   *kind = a.kind;
   *found_module = a.found;
+  gc_release(L, held);
   return status;
 }
