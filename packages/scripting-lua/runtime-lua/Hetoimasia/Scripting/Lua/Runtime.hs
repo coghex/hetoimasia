@@ -475,7 +475,9 @@ prepareCall (OwnerEndpoint control) ref entry arguments = do
   payload ← prepare $ case within of
     Right () → WithinBounds (map compact arguments)
     Left rule → OverBound rule
-  pure (PreparedCall control (compactRef ref) (compactName entry) payload)
+  -- Evaluated here, on the producer's thread: until then it would hold the strings
+  -- it was given.
+  evaluate (PreparedCall control (compactRef ref) (compactName entry) payload)
 
 -- | The routing strings of a call get the same treatment as its values: they are
 -- copied, and one longer than any valid identity or name is cut to one character
