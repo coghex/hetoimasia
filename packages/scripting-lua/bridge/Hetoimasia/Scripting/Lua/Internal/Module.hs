@@ -307,6 +307,7 @@ callEntry host handle name arguments =
       let schemas = entryArguments declared
       when (length arguments /= length schemas) $
         refuseArgument 0 [] (RuleArity (length schemas) (length arguments))
+      either (refuseArgument 0 []) pure (checkLimits limits arguments)
       forM_ (zip3 [1 ..] schemas arguments) $ \(index, schema, value) →
         case conformValue context schema value of
           Left (path, rule) → refuseArgument index path rule

@@ -73,8 +73,10 @@ module Hetoimasia.Scripting.Lua.Internal.Value
   , conformRaw
   , conformValue
   , encodeValues
+  , checkLimits
   ) where
 
+import Control.Monad (foldM, foldM_)
 import Data.Bits (shiftL, (.|.))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
@@ -84,6 +86,7 @@ import Data.Int (Int64)
 import Data.List (nub, sortOn)
 import Data.Text (Text)
 import qualified Data.Text.Encoding as Text
+import Data.Text.Unsafe (lengthWord8)
 import Data.Word (Word32, Word64)
 import GHC.Float (castDoubleToWord64, castWord64ToDouble)
 
@@ -505,11 +508,45 @@ conformValue context = go []
             Nothing → Left (reverse path, RuleUnknownCapability expected)
       _ → wrong path schema value
 
+-- | Whether values are within the limits, stopping at the first one passed. The
+-- work is bounded by the limits and not by the values: a result an action built
+-- far past them is refused after visiting what the limits allow, plus one.
+--
+-- Counted as the reader counts: every value is an element, a table's keys are
+-- not, and bytes are the size of the encoding.
+checkLimits ∷ ValueLimits → [Value] → Either ValueRule ()
+checkLimits limits values = foldM_ (\acc value → walk 1 value acc) (0, 0) values
+  where
+    walk ∷ Int → Value → (Int, Int) → Either ValueRule (Int, Int)
+    walk depth value (bytes, elements)
+      | elements + 1 > limitElements limits = Left (RuleElementLimit (limitElements limits))
+      | otherwise = case value of
+          VList items → table depth (bytes + 5, elements + 1) [(9, item) | item ← items]
+          VRecord entries → table depth (bytes + 5, elements + 1) [(5 + lengthWord8 name, item) | (name, item) ← entries]
+          scalar → within (bytes + scalarSize scalar, elements + 1)
+    table depth (bytes, elements) entries
+      | depth > limitDepth limits = Left (RuleDepthLimit (limitDepth limits))
+      | otherwise = do
+          start ← within (bytes, elements)
+          foldM (\acc (keySize, item) → within (add keySize acc) >>= walk (depth + 1) item) start entries
+    add keySize (bytes, elements) = (bytes + keySize, elements)
+    within (bytes, elements)
+      | bytes > limitBytes limits = Left (RuleBytesLimit (limitBytes limits))
+      | otherwise = Right (bytes, elements)
+    scalarSize = \case
+      VBytes bytes → 5 + ByteString.length bytes
+      VText text → 5 + lengthWord8 text
+      VCapability _ → 21
+      VNil → 1
+      VBoolean _ → 1
+      _ → 9
+
 -- | Encode values for the C layer to build in Lua, refusing a copy that would
 -- pass a limit. The sum of the encodings is what the byte limit bounds, and the
 -- values counted by the element limit are the ones the reader would count.
 encodeValues ∷ Context → ValueLimits → [Value] → Either ValueRule ByteString
 encodeValues context limits values = do
+  checkLimits limits values
   (builder, bytes, elements) ← foldlM' step (mempty, 0, 0) values
   if bytes > limitBytes limits then Left (RuleBytesLimit (limitBytes limits)) else Right ()
   if elements > limitElements limits then Left (RuleElementLimit (limitElements limits)) else Right ()

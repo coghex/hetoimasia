@@ -182,7 +182,9 @@ valueHandler boundary vm space binding state restore = do
         )
         (zip3 [1 ..] declared found)
       forM_ (zip [1 ..] values) $ \(index, value) → do
-        retired ← retiredIn boundary value
+        -- The application's own check is application code, like the action: it
+        -- runs unmasked.
+        retired ← restore (retiredIn boundary value)
         forM_ retired $ \(path, typeName) →
           refuseArguments index path (RuleRetiredHandle typeName) visited
       -- Counted before it starts, so a fault of anything the action does is
@@ -199,6 +201,9 @@ valueHandler boundary vm space binding state restore = do
                   refuseResults 2 [] (RuleBytesLimit commandReasonLimit)
               | otherwise → pure [VBoolean False, VText reason]
       let expected = bindingResults binding
+      -- Bounded first: an action that built far more than the limits allow is
+      -- refused after visiting what the limits allow, plus one.
+      either (refuseResults 0 []) pure (checkLimits limits produced)
       when (length produced /= length expected) $
         refuseResults 0 [] (RuleArity (length expected) (length produced))
       forM_ (zip3 [1 ..] expected produced) $ \(index, schema, value) →

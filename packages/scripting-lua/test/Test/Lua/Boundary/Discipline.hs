@@ -24,7 +24,7 @@ import Data.List (nub)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Text.Encoding (encodeUtf8)
-import Hetoimasia.Scripting.Lua.Bridge (FaultKind (MemoryExhausted), LuaFault (faultKind), chunkName)
+import Hetoimasia.Scripting.Lua.Bridge (FaultKind (MemoryExhausted), LuaFault (faultChunk, faultKind), chunkName)
 import Hetoimasia.Scripting.Lua.Internal.Module (liveModuleReferences)
 import Hetoimasia.Scripting.Lua.Internal.Owner
   ( OwnedVm
@@ -181,7 +181,7 @@ spec = describe "discipline" $ do
               pure (("completed" ∷ Text) : steps)
             Left failure
               | Just (fault ∷ LuaFault) ← causeOf failure, faultKind fault == MemoryExhausted →
-                  (ran `shouldBe` False) >> pure ["construction"]
+                  (ran `shouldBe` False) >> pure ["construction", "construction:" <> faultChunk fault]
               | Just (fault ∷ BoundaryFault) ← causeOf failure
               , ScriptFailed MemoryExhausted _ ← boundaryReason fault →
                   (ran `shouldBe` False) >> pure ["initial module"]
@@ -195,6 +195,11 @@ spec = describe "discipline" $ do
       forM_ ["args", "results", "record", "echo", "call"] $ \label →
         kinds `shouldSatisfy` elem (label <> ":memory at the boundary")
       kinds `shouldSatisfy` elem "construction"
+      -- Memory ran out while the registration's bindings were being installed in
+      -- the VM, and while its namespaces and the value boundary's registry share
+      -- were being made.
+      kinds `shouldSatisfy` any ("construction:sample." `Text.isPrefixOf`)
+      kinds `shouldSatisfy` any (`elem` ["construction:sample", "construction:other", "construction:values"])
       kinds `shouldSatisfy` elem "completed"
       kinds `shouldSatisfy` elem "initial module"
       -- Every operation of the body was, somewhere in the sweep, refused for lack

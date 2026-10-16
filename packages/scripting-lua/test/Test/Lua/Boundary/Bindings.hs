@@ -243,6 +243,10 @@ spec = describe "bindings called from Lua" $ do
       fmap refusalSide (refusal fault) `shouldBe` Just Results
       boundaryEffect fault `shouldBe` BindingRan
       logged fixture >>= (`shouldSatisfy` ("make_list" `elem`))
+      -- A result far past the limits is refused after visiting what they allow, not
+      -- after building it: this list is a hundred million values.
+      huge ← withOwnerOf (limited fixture 65536 8 11) $ \owned → runFault owned "sample.make_list(100000000)"
+      fmap refusalRule (refusal huge) `shouldBe` Just (RuleElementLimit 11)
       byBytes ← withOwnerOf (limited fixture 15 8 4096) $ \owned → runFault owned "sample.make_text(11)"
       fmap refusalRule (refusal byBytes) `shouldBe` Just (RuleBytesLimit 15)
       accepting fixture 15 8 4096 "assert(#sample.make_text(10) == 10)"
