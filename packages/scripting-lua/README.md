@@ -541,15 +541,19 @@ runs masked, so it lands at the boundary after the call's bookkeeping.
 | Allocating the VM | Deferred: masked |
 | Initializing or in the body, outside Lua | Delivered; ends that step; the VM is closed |
 | Initializing or in the body, inside a Lua call or a callback | Waits for the call to return, then as above |
-| Closing, including inside a finalizer | Deferred: the close is masked and cannot be interrupted; dependencies are released only after `lua_close` returns; it is taken afterwards |
+| Closing, including inside a finalizer or a retained release | Deferred: the close is masked and cannot be interrupted; dependencies are released only after `lua_close` returns, each release running uninterruptibly as a scope's does, so a cancellation neither lands inside one nor is taken for its failure; it is taken afterwards |
 
-The close is *not* run as `uninterruptibleMask_`, and the owner is not a
-`withResource`. It is masked and runs once; if a finalizer never returns the
+The close of the interpreter is *not* run as `uninterruptibleMask_`, and the
+owner is not a `withResource`. It is masked and runs once; the retained
+dependency releases that follow it are Haskell releases with a controlled
+blocking duration, and run uninterruptibly as any scope's release does; if a finalizer never returns the
 owner waits as the thread running it does, retains the dependencies and never
 detaches the VM. Repeated cancellation therefore cannot abandon a live VM, free
 callback dependencies under it, or start a second close, and every cancellation
-that is pending when the close has finished is taken together, so a later one
-cannot supersede the exception that carries the evidence.
+that is pending when the close has finished is taken together, however many, so
+a later one cannot supersede the exception that carries the evidence. The owner
+stops taking them when none is pending; a thread that cancels it without end keeps
+it there, as it would keep any masked region.
 
 ### Shutdown phase and the finalizer allowlist
 
