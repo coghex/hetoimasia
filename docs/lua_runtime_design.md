@@ -74,7 +74,7 @@ concrete precondition
 - [x] LUA-14. Prove Linux confinement and resource-limit feasibility — [#147]
 - [x] LUA-15. Prove macOS confinement and resource-limit feasibility — [#148]
 - [x] LUA-2. Own the VM through a protected IO lifetime — [#460]
-- [ ] LUA-3. Add application-owned modules and bounded value bindings
+- [x] LUA-3. Add application-owned modules and bounded value bindings — [#462]
 - [x] LUA-4. Model bounded script tasks and execution protocols — [#149]
 - [ ] LUA-5. Integrate trusted VM owners with runtime supervision — [deferred]: owner renews trusted-path readiness for this slice
 - [ ] LUA-6. Schedule cooperative tasks with bounded service turns — [deferred]: owner renews trusted-path readiness for this slice
