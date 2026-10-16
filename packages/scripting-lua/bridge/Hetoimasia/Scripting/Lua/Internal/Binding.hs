@@ -53,7 +53,7 @@ import Hetoimasia.Foundation.Failure (Operation, operation, throwFailure, withOp
 import Hetoimasia.Scripting.Lua.Internal.Boundary
 import Hetoimasia.Scripting.Lua.Internal.Call (reportFault)
 import Hetoimasia.Scripting.Lua.Internal.Callback (Handler, installBinding)
-import Hetoimasia.Scripting.Lua.Internal.Fault (classify, luaComponent, renderFailure)
+import Hetoimasia.Scripting.Lua.Internal.Fault (classify, fromApplication, luaComponent, renderFailure)
 import Hetoimasia.Scripting.Lua.Internal.Marshal
 import Hetoimasia.Scripting.Lua.Internal.Registration
 import Hetoimasia.Scripting.Lua.Internal.Value
@@ -202,9 +202,9 @@ valueHandler boundary vm space binding state restore = do
       -- happened has to include that.
       amendEscape vm upgradeEffect
       produced ← case action of
-        ValuesAction run → restore (run values)
+        ValuesAction run → fromApplication (restore (run values))
         CommandAction run → do
-          answer ← restore (run values)
+          answer ← fromApplication (restore (run values))
           case answer of
             Accepted → pure [VBoolean True, VNil]
             Rejected reason
@@ -248,7 +248,7 @@ retiredIn boundary = go []
     go path = \case
       VCapability capability → do
         live ← case lookupCapability registered (capabilityTypeName capability) of
-          Just kind → capabilityLive kind (capabilityKey capability)
+          Just kind → fromApplication (capabilityLive kind (capabilityKey capability))
           Nothing → pure False
         pure (if live then Nothing else Just (reverse path, capabilityTypeName capability))
       VList items → firstJust [go (AtIndex index : path) item | (index, item) ← zip [1 ..] items]

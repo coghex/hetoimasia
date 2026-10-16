@@ -151,6 +151,42 @@ library
         hetoimasia-foundation ==0.1.0.0,
         hetoimasia-scripting-lua:bridge
 
+-- The runtime adapter (LUA-5): trusted VM owners under runtime supervision. One
+-- owner is one supervised worker running one VM through `withVmOwner` on its own
+-- thread, with bounded call dispatch, exactly-once settlement and the refusal of
+-- a reply wait from inside any Lua callback.
+--
+-- It lives in a sublibrary of its own, in a separate source directory, because
+-- the host library above must not depend on the runtime (P-1): it depends on the
+-- host, on the runtime's supervision and on the foundation, and the host
+-- depends on none of them. It depends on nothing of GLFW, Vulkan, the console
+-- or any game. The private `model` supplies the caps' validation, and the
+-- private `bridge` is named only where it must be: the process-wide record of
+-- the threads running a Lua callback, the mark a failure of application code
+-- carries, and the value limits' check, none of which the host's public modules
+-- offer an application. `Test.LuaRuntime.Dependencies` checks this stanza and
+-- the imports of its modules.
+library runtime-lua
+    import: language
+    hs-source-dirs: runtime-lua
+    exposed-modules:
+        Hetoimasia.Scripting.Lua.Runtime
+    other-modules:
+        Hetoimasia.Scripting.Lua.Runtime.Admission
+        Hetoimasia.Scripting.Lua.Runtime.Dispatch
+        Hetoimasia.Scripting.Lua.Runtime.Types
+    build-depends:
+        base >=4.22 && <4.23,
+        containers >=0.8 && <0.9,
+        deepseq >=1.5.1 && <1.6,
+        stm >=2.5.3 && <2.6,
+        text >=2.1 && <2.2,
+        hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-runtime ==0.1.0.0,
+        hetoimasia-scripting-lua,
+        hetoimasia-scripting-lua:bridge,
+        hetoimasia-scripting-lua:model
+
 -- The hazard runner. An example that cannot be bounded inside the suite's own
 -- process -- cancelling a thread that is inside Lua does not interrupt Lua, so
 -- the thread never dies -- runs here instead, reports what it observed on
@@ -257,6 +293,50 @@ test-suite lua-host-tests
         hetoimasia-scripting-lua,
         hetoimasia-scripting-lua:bridge,
         hetoimasia-scripting-lua:model
+
+-- The runtime adapter's contracts (LUA-5): readiness through a supervised wait,
+-- owner identity, finite submission and both its bounds, exactly-once settlement,
+-- host failures under the owner's policy, protected stop, independent owners and
+-- the refused reply wait from inside a Lua callback, plus the adapter's
+-- dependency closure. Every execution and lifecycle example acquires real VMs
+-- under a real `withSupervision`; the structural checks need no VM. It is a
+-- suite of its own, in its own source directory, beside `lua-host-tests`, which
+-- keeps the host's examples unchanged.
+test-suite lua-runtime-tests
+    import: language
+    type: exitcode-stdio-1.0
+    main-is: Main.hs
+    hs-source-dirs: runtime-lua-test
+    other-modules:
+        Test.LuaRuntime.Callbacks
+        Test.LuaRuntime.Dependencies
+        Test.LuaRuntime.HostFailures
+        Test.LuaRuntime.Identity
+        Test.LuaRuntime.Independence
+        Test.LuaRuntime.Readiness
+        Test.LuaRuntime.Settlement
+        Test.LuaRuntime.Spec
+        Test.LuaRuntime.Stop
+        Test.LuaRuntime.Submission
+        Test.LuaRuntime.Support
+    -- -N2 rather than -N: a call held inside a binding must not starve the
+    -- thread that observes it, on every machine that runs the suite.
+    ghc-options: -threaded -rtsopts "-with-rtsopts=-N2"
+    build-depends:
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        containers >=0.8 && <0.9,
+        directory >=1.3 && <1.4,
+        filepath >=1.5 && <1.6,
+        hspec >=2.11 && <3,
+        stm >=2.5.3 && <2.6,
+        text >=2.1 && <2.2,
+        time >=1.15 && <1.16,
+        hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-runtime ==0.1.0.0,
+        hetoimasia-scripting-lua,
+        hetoimasia-scripting-lua:bridge,
+        hetoimasia-scripting-lua:runtime-lua
 
 -- Deliberate nontermination is optional evidence, separate from lua-host-tests.
 test-suite lua-hazard-probes

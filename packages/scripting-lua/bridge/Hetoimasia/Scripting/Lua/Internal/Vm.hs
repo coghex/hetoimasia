@@ -37,14 +37,20 @@
 -- 'VmReentered' before it takes the gate: it runs no Lua and changes nothing.
 -- Every other thread still waits for the gate, exactly as before. A thread a
 -- callback starts is not one of them, and neither is a callback of another VM;
--- re-entry through either is not detected and stays outside the contract.
+-- re-entry through either is not detected by the VM and stays outside its
+-- contract. Separately from this per-VM set, every callback thread is also
+-- entered in one process-wide record, which 'runningLuaCallback' reads: it is
+-- what lets code that must not wait for anything, such as an adapter's wait for
+-- a reply, refuse when it is asked from inside any VM's callback.
 --
 -- A Haskell exception that reaches a callback is not thrown through the C
 -- frame. The trampoline records it here and signals an ordinary Lua error; the
 -- operation that was running reads the record back and re-raises the original
 -- exception with the context it was caught with, whatever Lua did with the
 -- error in between. The first escape is the one kept: a later failure inside
--- the same operation never displaces the failure that started it. An escape
+-- the same operation never displaces the failure that started it, unless the
+-- later one is a failure of application code and the first a refusal the
+-- boundary itself made (see 'recordEscape'). An escape
 -- from a finalizer during the close belongs to no operation, so the close
 -- drains it and reports it among the close's own failures.
 --
@@ -90,6 +96,7 @@ module Hetoimasia.Scripting.Lua.Internal.Vm
   , withOpenVm
     -- * Callbacks
   , runCallback
+  , runningLuaCallback
     -- * Escaped Haskell failures
   , recordEscape
   , raiseEscape
@@ -142,6 +149,8 @@ import Data.ByteString (useAsCString)
 import Data.Foldable (traverse_)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (delete)
+import Data.Map.Strict (Map)
+import qualified Data.Map.Strict as Map
 import Data.Maybe (maybeToList)
 import Data.Set (Set)
 import qualified Data.Set as Set
@@ -175,6 +184,7 @@ import Hetoimasia.Scripting.Lua.Internal.Fault
   , classify
   , closeSourceLabel
   , luaComponent
+  , raisedByApplication
   , renderFailure
   )
 import Hetoimasia.Scripting.Lua.Internal.Library
@@ -540,12 +550,42 @@ refuseForeign vm name = case vmOwnerThread vm of
 -- | Run a callback's action with its thread marked as one of this VM's
 -- callers, so that what it asks of this same VM is refused rather than left
 -- waiting for the operation that called it.
+--
+-- The thread is also entered in the process-wide record that
+-- 'runningLuaCallback' reads, so that code which must never wait inside any
+-- Lua callback, of this VM or another, can ask. That record names no VM and is
+-- not published as identities: the one thing it answers is whether the caller is
+-- one of them.
 runCallback ∷ Vm → IO a → IO a
 runCallback vm action = do
   self ← myThreadId
   atomicModifyIORef' (vmCallers vm) (\callers → (self : callers, ()))
+  atomicModifyIORef' callbackThreads (\running → (Map.insertWith (+) self 1 running, ()))
   action
-    `finally` atomicModifyIORef' (vmCallers vm) (\callers → (delete self callers, ()))
+    `finally` ( atomicModifyIORef' callbackThreads (\running → (Map.update leave self running, ()))
+                  >> atomicModifyIORef' (vmCallers vm) (\callers → (delete self callers, ()))
+              )
+  where
+    leave count = if count <= 1 then Nothing else Just (count - 1)
+
+-- | Whether the calling thread is running a Lua callback right now, of any VM:
+-- a binding's action, the application's own liveness check, or a finalizer's
+-- callback.
+--
+-- A thread a callback starts is not one of them, and neither is a thread that
+-- merely holds a reference to one. Answered from the process-wide record
+-- 'runCallback' keeps, so it needs no VM and is the same whichever VM's callback
+-- the thread is in.
+runningLuaCallback ∷ IO Bool
+runningLuaCallback = do
+  self ← myThreadId
+  Map.member self <$> readIORef callbackThreads
+
+-- | The threads running a Lua callback, with how deep each is. A thread is in
+-- the record from the moment its callback starts until it returns or fails.
+callbackThreads ∷ IORef (Map ThreadId Int)
+callbackThreads = unsafePerformIO (newIORef Map.empty)
+{-# NOINLINE callbackThreads #-}
 
 -- | Close the interpreter, then release what its callbacks borrowed.
 --
@@ -599,7 +639,8 @@ retainRelease vm release =
 --
 -- During an operation the first one is kept: Lua may go on to call the same
 -- callback again, and that later failure must not displace the one the caller
--- is owed. During the close every one is kept, because the close is not one
+-- is owed. The one exception is a failure of application code arriving after a
+-- refusal the boundary made, which it replaces. During the close every one is kept, because the close is not one
 -- operation -- @lua_close@ runs each pending finalizer, and each is separately
 -- able to fail.
 recordEscape ∷ Vm → ExceptionWithContext SomeException → IO ()
@@ -617,7 +658,17 @@ recordEscape vm captured = do
     _ →
       atomicModifyIORef'
         (vmEscape vm)
-        (\held → (maybe (Just captured) Just held, ()))
+        (\held → (Just (maybe captured (outranking captured) held), ()))
+  where
+    -- The first failure is the one kept, with one exception: a failure of
+    -- application code outranks a refusal the boundary itself made. A script can
+    -- catch the refusal and call a binding whose action then fails, and that
+    -- failure is the host's, which the owner's caller must not mistake for the
+    -- call's own fault just because something else was refused first.
+    outranking new prior
+      | applicationRaised new && not (applicationRaised prior) = new
+      | otherwise = prior
+    applicationRaised (ExceptionWithContext context _) = raisedByApplication context
 
 -- | Change the recorded failure, if there is one, keeping the place it holds.
 amendEscape ∷ Vm → (ExceptionWithContext SomeException → ExceptionWithContext SomeException) → IO ()

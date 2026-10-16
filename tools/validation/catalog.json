@@ -174,6 +174,25 @@
       "optional": false
     },
     {
+      "id": "test.scripting-lua-runtime",
+      "description": "Focused Hspec examples for the Lua runtime adapter's trusted VM owners under real supervision: readiness through a supervised wait that the startup acknowledgement cannot satisfy, owner identity that is never reissued, finite submission and both its bounds, exactly-once settlement with faults of a call returned as data, host failures ending only their own owner under its policy, protected stop and exit records, independent owners, the refused reply wait from inside any Lua callback, and the adapter's dependency closure. Every execution and lifecycle example acquires real VMs.",
+      "command": [
+        "cabal",
+        "test",
+        "hetoimasia-scripting-lua:lua-runtime-tests",
+        "--test-show-details=direct"
+      ],
+      "component": "hetoimasia-scripting-lua:test:lua-runtime-tests",
+      "inputs": [
+        "cabal.project.common"
+      ],
+      "framework": "hspec",
+      "runner": "cpu",
+      "timeout_seconds": 1800,
+      "category": "test",
+      "optional": false
+    },
+    {
       "id": "test.lua-confinement-linux",
       "description": "Local-only optional Linux confinement and resource-limit feasibility probe (LUA-14). Launches confined children through the candidate namespace, private-root, and seccomp profile; records the machine, the permissions, and whether the profile installed at all; and checks the fail-closed refusal, the denied native and Lua accesses with the mechanism that denied each, two-instance isolation and independent termination, the whole-process memory ceiling, the execution bound's escalation, and the three lifetime cases. Built and run on Linux only; on other platforms the components are not built. A green run is evidence, never a supported-platform verdict.",
       "command": [
