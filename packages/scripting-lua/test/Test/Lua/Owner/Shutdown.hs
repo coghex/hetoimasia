@@ -6,9 +6,10 @@
 -- refusal is recorded as cleanup evidence whether or not the finalizer's script
 -- caught the error it raised. What is recorded from finalizers is bounded.
 --
--- Public capability registration is LUA-3's, so these examples install their
--- callbacks and name their allowlists through the package-private configuration,
--- which is the only route to either.
+-- These examples install their callbacks and name their allowlists through the
+-- package-private configuration, which is the only route to a callback that is
+-- not a registered binding. The allowlist a registration builds is the subject of
+-- "Test.Lua.Boundary.Finalizers".
 module Test.Lua.Owner.Shutdown (spec) where
 
 import Control.Exception (SomeException, fromException, try)

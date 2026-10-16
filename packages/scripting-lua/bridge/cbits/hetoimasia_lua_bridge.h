@@ -104,4 +104,7 @@ int hetoimasia_lua_requiref(
 */
 long hetoimasia_lua_carriers_finalized(void);
 
+/* `luaopen_debug` without `sethook`; see the definition for why. */
+int hetoimasia_luaopen_debug(lua_State *L);
+
 #endif

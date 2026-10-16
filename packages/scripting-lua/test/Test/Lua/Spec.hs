@@ -2,6 +2,7 @@
 module Test.Lua.Spec (spec) where
 
 import Test.Hspec (Spec, describe)
+import qualified Test.Lua.Boundary.Spec
 import qualified Test.Lua.Close
 import qualified Test.Lua.Discipline
 import qualified Test.Lua.Faults
@@ -24,4 +25,5 @@ spec = describe "Lua" $ do
   Test.Lua.Hazard.spec
   Test.Lua.Opacity.spec
   Test.Lua.Owner.Spec.spec
+  Test.Lua.Boundary.Spec.spec
   Test.Lua.Protocol.Spec.spec

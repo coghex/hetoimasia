@@ -10,9 +10,10 @@
 -- What is deliberately absent is as much of the contract as what is present.
 -- There is no way to open "all the libraries": 'newVm' takes the list, and the
 -- empty list is a VM with no standard library at all. There is no way to
--- register a Haskell function, because module identity, capability namespaces,
--- and per-domain policy are LUA-3's and installing callbacks without them is
--- how a bridge acquires an unreviewable surface. Here 'closeVm' is called
+-- register a Haskell function, because installing callbacks without module
+-- identity, capability namespaces and a per-owner policy is how a bridge
+-- acquires an unreviewable surface. Those are the protected owner's
+-- ("Hetoimasia.Scripting.Lua.Owner", with "Hetoimasia.Scripting.Lua.Registration"). Here 'closeVm' is called
 -- explicitly and is terminal. A caller that wants the VM closed for it, with its
 -- failures and cancellation handled, uses the protected owner,
 -- "Hetoimasia.Scripting.Lua.Owner", whose VM is not a 'Vm' and so cannot be used

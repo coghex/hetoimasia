@@ -93,9 +93,20 @@ module Hetoimasia.Scripting.Lua.Internal.Vm
     -- * Escaped Haskell failures
   , recordEscape
   , raiseEscape
+  , amendEscape
   , discardEscape
     -- * Retained dependencies
   , retainRelease
+    -- * Identity and the value boundary's bookkeeping
+  , vmIdentity
+  , noteActionRun
+  , operationActionRuns
+  , valuesPrepared
+  , markValuesPrepared
+  , nextModuleSlot
+  , RunContext
+  , setRunContext
+  , runContext
     -- * Probes
   , vmState
   , vmPhase
@@ -136,6 +147,8 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Text
+import Data.Word (Word64)
+import System.IO.Unsafe (unsafePerformIO)
 import Foreign.C (CChar, CInt (CInt), CSize (CSize))
 import Foreign.Ptr (Ptr, nullPtr)
 import GHC.Stack (HasCallStack)
@@ -169,6 +182,7 @@ import Hetoimasia.Scripting.Lua.Internal.Library
   , libraryModuleName
   , libraryOpener
   )
+import Hetoimasia.Scripting.Lua.Internal.Value (VmIdentity (VmIdentity))
 import Lua
   ( CFunction
   , StackIndex
@@ -230,6 +244,20 @@ data Vm = Vm
   , vmClosingDropped ∷ !(IORef Int)
     -- ^ How many finalizer failures the close did not record, past
     -- 'finalizerEvidenceLimit'.
+  , vmIdentity ∷ !VmIdentity
+    -- ^ A number no other VM of the process shares. What a handle this VM issues
+    -- carries, and what is checked when one is used.
+  , vmActionRuns ∷ !(IORef Int)
+    -- ^ How many binding actions have started during the operation that is
+    -- running. Reset when an operation takes the gate; what a fault reads to say
+    -- whether an action may have changed something before it failed.
+  , vmValuesReady ∷ !(IORef Bool)
+    -- ^ Whether the registry's share of the value boundary has been made.
+  , vmModuleSlots ∷ !(IORef Int)
+    -- ^ The next module slot. Slots are never reused.
+  , vmRunContext ∷ !(IORef (Maybe RunContext))
+    -- ^ The module and entry point the running operation is executing, so that a
+    -- fault raised under it can say which. Reset when an operation takes the gate.
   }
 
 -- | What a callback reached from a Lua finalizer may do while its VM closes.
@@ -289,8 +317,11 @@ stackDepth vm = fromIntegral . fromStackIndex <$> lua_gettop (vmState vm)
 -- A probe for this package's own fixtures. The registry keeps released slots on
 -- a free list and hands the most recently released one back first, so taking a
 -- reference before an operation and again after it answers the same slot only
--- if the operation left the registry as it found it. The bridge itself takes no
--- registry reference at all, so the answer should never move.
+-- if the operation left the registry as it found it. The bridge takes no
+-- @luaL_ref@ reference of its own, so the answer should never move. A loaded
+-- module is kept in a slot of a table the bridge owns instead, so loading one
+-- does not move it either; the modules that are live are counted from that table
+-- ('Hetoimasia.Scripting.Lua.Internal.Module.liveModuleReferences').
 probeReferenceSlot ∷ Vm → IO CInt
 probeReferenceSlot vm = do
   let state = vmState vm
@@ -344,7 +375,12 @@ allocateVm spec = do
   finished ← newEmptyMVar
   callers ← newIORef []
   dropped ← newIORef 0
-  pure (Vm state gate phase escape closing releases finished callers (specOwner spec) (specFinalizers spec) dropped)
+  identity ← atomicModifyIORef' identityCounter (\last' → (last' + 1, VmIdentity (last' + 1)))
+  runs ← newIORef 0
+  ready ← newIORef False
+  slots ← newIORef 0
+  context ← newIORef Nothing
+  pure (Vm state gate phase escape closing releases finished callers (specOwner spec) (specFinalizers spec) dropped identity runs ready slots context)
 
 -- | Open exactly the named standard libraries, in order, as one operation of
 -- the VM: under its gate, by its owner, restoring the stack it borrowed.
@@ -418,6 +454,8 @@ withOpenVm vm name body = mask_ $ do
     Open → do
       let state = vmState vm
       entry ← lua_gettop state
+      writeIORef (vmActionRuns vm) 0
+      writeIORef (vmRunContext vm) Nothing
       result ← body state `onException` abandon vm entry
       putMVar (vmGate vm) ()
       pure result
@@ -454,6 +492,10 @@ closeVm vm = mask $ \restore → do
   case phase of
     Open → do
       writeIORef (vmPhaseRef vm) Closing
+      -- The close is an operation of its own: what an earlier operation ran, and
+      -- the module and entry point it was in, are not the finalizers'.
+      writeIORef (vmActionRuns vm) 0
+      writeIORef (vmRunContext vm) Nothing
       outcome ← try (teardown vm)
       writeIORef (vmPhaseRef vm) Closed
       putMVar (vmFinished vm) ()
@@ -577,6 +619,10 @@ recordEscape vm captured = do
         (vmEscape vm)
         (\held → (maybe (Just captured) Just held, ()))
 
+-- | Change the recorded failure, if there is one, keeping the place it holds.
+amendEscape ∷ Vm → (ExceptionWithContext SomeException → ExceptionWithContext SomeException) → IO ()
+amendEscape vm change = atomicModifyIORef' (vmEscape vm) (\held → (fmap change held, ()))
+
 -- | Take the recorded failure, leaving none.
 takeEscape ∷ Vm → IO (Maybe (ExceptionWithContext SomeException))
 takeEscape vm = atomicModifyIORef' (vmEscape vm) (\held → (Nothing, held))
@@ -638,3 +684,39 @@ foreign import ccall safe "hetoimasia_lua_bridge.h hetoimasia_lua_requiref"
 
 showText ∷ Show a ⇒ a → Text
 showText = Text.pack . show
+
+-- | The identities issued so far.
+identityCounter ∷ IORef Word64
+identityCounter = unsafePerformIO (newIORef 0)
+{-# NOINLINE identityCounter #-}
+
+-- | A binding's action is about to start on this VM.
+noteActionRun ∷ Vm → IO ()
+noteActionRun vm = atomicModifyIORef' (vmActionRuns vm) (\count → (count + 1, ()))
+
+-- | How many binding actions have started during the running operation.
+operationActionRuns ∷ Vm → IO Int
+operationActionRuns = readIORef . vmActionRuns
+
+-- | Whether the registry's share of the value boundary has been made.
+valuesPrepared ∷ Vm → IO Bool
+valuesPrepared = readIORef . vmValuesReady
+
+markValuesPrepared ∷ Vm → IO ()
+markValuesPrepared vm = writeIORef (vmValuesReady vm) True
+
+-- | The next module slot, never issued twice.
+nextModuleSlot ∷ Vm → IO Int
+nextModuleSlot vm = atomicModifyIORef' (vmModuleSlots vm) (\slot → (slot + 1, slot + 1))
+
+-- | The module (name, version) and entry point (none while it is loading) an
+-- operation is executing.
+type RunContext = (Text, Text, Maybe Text)
+
+-- | Say what the running operation is executing.
+setRunContext ∷ Vm → RunContext → IO ()
+setRunContext vm = writeIORef (vmRunContext vm) . Just
+
+-- | What the running operation is executing, if it is a module.
+runContext ∷ Vm → IO (Maybe RunContext)
+runContext = readIORef . vmRunContext

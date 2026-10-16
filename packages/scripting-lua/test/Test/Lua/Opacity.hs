@@ -30,6 +30,18 @@
 -- contract, including a reference that outlives its lifetime and one used from
 -- another thread, and its output shows each refused at run time, with 'VmClosed'
 -- and 'VmNotOwned', rather than used.
+--
+-- The registration and value boundary (LUA-3) has clients of its own. Five must
+-- be rejected: one forges a module handle from its constructor or reads its slot;
+-- one forges a capability with an issuer of its choosing; one asks the
+-- registration's public module for the closure a binding runs, so as to run it
+-- without the boundary; one asks any public module for the Lua state, a stack
+-- index, a registry reference, a coroutine or a native address by name; and one
+-- reaches into the private binding module. One must be accepted, linked and run:
+-- it builds a registration and an owner's policy from the public modules alone,
+-- loads a module, calls an entry point with bounded arguments and results, and
+-- observes a typed refusal, both of its own arguments and of a script's call to a
+-- binding.
 module Test.Lua.Opacity (spec) where
 
 import Control.Exception (finally)
@@ -176,6 +188,104 @@ spec = describe "opacity across the package boundary" $ do
                    , "after the lifetime = VmClosed {closedOperation = \"eval-chunk\"}"
                    , "another thread = VmNotOwned {notOwnedOperation = \"eval-chunk\"}"
                    , "after another thread = still ran"
+                   ]
+
+  it "rejects a client that forges a module handle or reads the slot it names" $
+    withClient "Client.hs" moduleHandleClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "GHC-10237"
+      clientOutput outcome `shouldContain` "ModuleHandle"
+
+  it "rejects a client that forges a capability, or stamps one with the VM that issued it" $
+    withClient "Client.hs" capabilityForgeryClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "GHC-10237"
+      clientOutput outcome `shouldContain` "Capability"
+
+  it "rejects a client asking the registration for the closure a binding runs" $
+    withClient "Client.hs" bindingActionClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "does not export"
+      clientOutput outcome `shouldContain` "bindingAction"
+
+  it "rejects a client asking any public module for a Lua state, stack index, registry reference, coroutine or address" $
+    withClient "Client.hs" luaSurfaceClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "does not export"
+      clientOutput outcome `shouldContain` "State"
+      clientOutput outcome `shouldContain` "StackIndex"
+      clientOutput outcome `shouldContain` "luaReference"
+      clientOutput outcome `shouldContain` "Coroutine"
+      clientOutput outcome `shouldContain` "Ptr"
+
+  it "rejects a client that updates a registration, a namespace or a binding through its labels, skipping validation" $
+    mapM_
+      ( \(client, label) →
+          withClient "Client.hs" (updateClient client) $ \compile → do
+            outcome ← compile Typecheck
+            rejectedBecause outcome "Not in scope: record field"
+            clientOutput outcome `shouldContain` label
+      )
+      [ ("a = emptyRegistration {registrationNamespaces = [namespace \"math\" []]}", "registrationNamespaces")
+      , ("a = (snapshotQuery \"x\" [] [] (\\_ → pure [])) {bindingKind = LifecycleOperation}", "bindingKind")
+      , ("a = (namespace \"n\" []) {namespaceBindings = []}", "namespaceBindings")
+      ]
+
+  it "rejects a client that builds a value-limit configuration without the checked constructor" $
+    withClient "Client.hs" limitsUpdateClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "GHC-10237"
+      clientOutput outcome `shouldContain` "ValueLimits"
+
+  it "rejects a client that updates a value-limit configuration through its labels" $
+    withClient "Client.hs" limitsLabelClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "Not in scope: record field"
+      clientOutput outcome `shouldContain` "limitBytes"
+
+  it "rejects a client reaching into the private binding module" $
+    withClient "Client.hs" privateBindingClient $ \compile → do
+      outcome ← compile Typecheck
+      case clientStatus outcome of
+        ExitFailure _ → pure ()
+        ExitSuccess →
+          expectationFailure
+            ("the client compiled, so the binding's internals are reachable:\n" <> clientOutput outcome)
+      clientOutput outcome `shouldContain` "Hetoimasia.Scripting.Lua.Internal.Binding"
+      clientOutput outcome `shouldContain` "hidden package"
+      clientOutput outcome `shouldNotContain` "cannot satisfy"
+
+  it "accepts, links and runs a client building a registration and policy, loading a module, calling an entry point and observing a typed refusal" $
+    withClient "Main.hs" boundaryPublicClient $ \compile → do
+      outcome ← compile Link
+      case clientStatus outcome of
+        ExitSuccess → pure ()
+        status →
+          expectationFailure
+            ( "the boundary client must compile, but the compiler exited with "
+                <> show status
+                <> ":\n"
+                <> clientOutput outcome
+            )
+      (status, out, err) ←
+        readCreateProcessWithExitCode
+          (proc (clientDirectory outcome </> "client") []) {cwd = Just (clientDirectory outcome)}
+          ""
+      status `shouldBe` ExitSuccess
+      err `shouldBe` ""
+      lines out
+        `shouldBe` [ "namespaces = [\"app\"]"
+                   , "confined exposure = []"
+                   , "call = Returned [VInteger 42,VText \"ok\"]"
+                   , "state = 21"
+                   , "optional entry = EntryAbsent"
+                   , "argument refusal = RuleFloatForInteger"
+                   , "argument effect = NoEffect"
+                   , "script refusal binding = Just (\"app\",\"double\")"
+                   , "script refusal rule = RuleFloatForInteger"
+                   , "script refusal effect = LuaRan"
+                   , "unsupported = NotYetSupported LifecycleOperation"
+                   , "handle after the lifetime = VmClosed"
                    ]
 
   it "finds the dependency store without reading a project it cannot write to" $
@@ -437,4 +547,196 @@ ownerPublicClient =
     , "    Right () → putStrLn \"another thread = ran\""
     , "    Left refusal → putStrLn (\"another thread = \" <> show refusal)"
     , "  putStrLn \"after another thread = still ran\""
+    ]
+
+moduleHandleClient ∷ String
+moduleHandleClient =
+  unlines
+    [ "module Client (forged) where"
+    , ""
+    , "import Hetoimasia.Scripting.Lua.Owner (ModuleHandle (ModuleHandle, handleSlot))"
+    , ""
+    , "forged ∷ Maybe ModuleHandle"
+    , "forged = Nothing"
+    ]
+
+capabilityForgeryClient ∷ String
+capabilityForgeryClient =
+  unlines
+    [ "module Client (forged) where"
+    , ""
+    , "import Hetoimasia.Scripting.Lua.Value (Capability (Capability, capabilityIssuer), VmIdentity)"
+    , ""
+    , "forged ∷ Maybe Capability"
+    , "forged = Nothing"
+    ]
+
+bindingActionClient ∷ String
+bindingActionClient =
+  unlines
+    [ "module Client (reached) where"
+    , ""
+    , "import Hetoimasia.Scripting.Lua.Registration (Binding, bindingAction, Action (ValuesAction))"
+    , ""
+    , "reached ∷ Maybe Binding"
+    , "reached = Nothing"
+    ]
+
+luaSurfaceClient ∷ String
+luaSurfaceClient =
+  unlines
+    [ "module Client (reached) where"
+    , ""
+    , "import Hetoimasia.Scripting.Lua.Owner (State, StackIndex, luaReference, Coroutine)"
+    , "import Hetoimasia.Scripting.Lua.Value (Ptr)"
+    , ""
+    , "reached ∷ ()"
+    , "reached = ()"
+    ]
+
+-- | A client whose only binding is this update of a registration, a namespace or
+-- a binding.
+updateClient ∷ String → String
+updateClient definition =
+  unlines
+    [ "module Client (a) where"
+    , ""
+    , "import Hetoimasia.Scripting.Lua.Registration"
+    , "  ( BindingKind (LifecycleOperation), bindingKind, emptyRegistration, namespace"
+    , "  , namespaceBindings, registrationNamespaces, snapshotQuery )"
+    , ""
+    , definition
+    ]
+
+limitsUpdateClient ∷ String
+limitsUpdateClient =
+  unlines
+    [ "module Client (bad) where"
+    , ""
+    , "import Hetoimasia.Scripting.Lua.Value (ValueLimits (ValueLimits))"
+    , ""
+    , "bad ∷ ValueLimits"
+    , "bad = ValueLimits (-1) 8 (-1)"
+    ]
+
+limitsLabelClient ∷ String
+limitsLabelClient =
+  unlines
+    [ "module Client (bad) where"
+    , ""
+    , "import Hetoimasia.Scripting.Lua.Value (ValueLimits, defaultValueLimits, limitBytes)"
+    , ""
+    , "bad ∷ ValueLimits"
+    , "bad = defaultValueLimits {limitBytes = -1}"
+    ]
+
+privateBindingClient ∷ String
+privateBindingClient =
+  unlines
+    [ "module Client (reached) where"
+    , ""
+    , "import Hetoimasia.Scripting.Lua.Internal.Binding (valueHandler)"
+    , "import Hetoimasia.Scripting.Lua.Internal.Marshal (readValues)"
+    , ""
+    , "reached ∷ ()"
+    , "reached = ()"
+    ]
+
+-- | The value boundary's whole public contract, used the way an application would.
+boundaryPublicClient ∷ String
+boundaryPublicClient =
+  unlines
+    [ "{-# LANGUAGE LambdaCase #-}"
+    , "{-# LANGUAGE OverloadedStrings #-}"
+    , "module Main (main) where"
+    , ""
+    , "import Control.Exception (try)"
+    , "import Data.IORef (modifyIORef', newIORef, readIORef)"
+    , "import Data.Int (Int64)"
+    , "import Hetoimasia.Scripting.Lua.Owner"
+    , "  ( BoundaryFault (boundaryBinding, boundaryEffect, boundaryReason)"
+    , "  , CallResult"
+    , "  , EntryPoint (EntryPoint)"
+    , "  , FaultReason (NotYetSupported, ValueRefused)"
+    , "  , Library (LibraryBase)"
+    , "  , ModuleRef (ModuleRef)"
+    , "  , ModuleSource (ModuleSource)"
+    , "  , Requirement (Optional, Required)"
+    , "  , VmClosed"
+    , "  , VmConfig (vmModules, vmOwnerName, vmPolicy, vmRegistration)"
+    , "  , callEntry"
+    , "  , chunkName"
+    , "  , evalOwned"
+    , "  , loadedModule"
+    , "  , vmConfig"
+    , "  , withVmOwner"
+    , "  )"
+    , "import Hetoimasia.Scripting.Lua.Registration"
+    , "  ( confinedEligibleBindings"
+    , "  , lifecycleOperation"
+    , "  , namespace"
+    , "  , namespaceName"
+    , "  , registration"
+    , "  , registrationNamespaces"
+    , "  , snapshotQuery"
+    , "  , stateOperation"
+    , "  )"
+    , "import Hetoimasia.Scripting.Lua.Value (Schema (SInteger, SText), Value (VInteger, VFloat, VText), ValueRefusal (refusalRule))"
+    , ""
+    , "main ∷ IO ()"
+    , "main = do"
+    , "  total ← newIORef (0 ∷ Int64)"
+    , "  let built = registration []"
+    , "        [ namespace \"app\""
+    , "            [ snapshotQuery \"double\" [SInteger] [SInteger] (\\case [VInteger n] → pure [VInteger (2 * n)]; _ → pure [])"
+    , "            , stateOperation \"add\" [SInteger] [] (\\case [VInteger n] → modifyIORef' total (+ n) >> pure []; _ → pure [])"
+    , "            , lifecycleOperation \"stop\" [] [] (\\_ → pure [])"
+    , "            ]"
+    , "        ]"
+    , "  registered ← either (fail . show) pure built"
+    , "  putStrLn (\"namespaces = \" <> show (map namespaceName (registrationNamespaces registered)))"
+    , "  putStrLn (\"confined exposure = \" <> show (confinedEligibleBindings registered))"
+    , "  let source ="
+    , "        ModuleSource"
+    , "          (ModuleRef \"client\" \"1\")"
+    , "          \"function run(n) app.add(n); return app.double(n), 'ok' end\\nfunction bad() return app.double(1.5) end\\nfunction halt() app.stop() end\""
+    , "          [ EntryPoint \"run\" Required [SInteger] [SInteger, SText]"
+    , "          , EntryPoint \"bad\" Required [] [SInteger]"
+    , "          , EntryPoint \"halt\" Required [] []"
+    , "          , EntryPoint \"tick\" Optional [SInteger] []"
+    , "          ]"
+    , "      config = (vmConfig [LibraryBase]) {vmRegistration = registered, vmPolicy = [\"app\"], vmOwnerName = \"client\", vmModules = [source]}"
+    , "  escaped ← withVmOwner config $ \\owned → do"
+    , "    handle ← loadedModule owned (ModuleRef \"client\" \"1\") >>= maybe (fail \"the initial module has no handle\") pure"
+    , "    called ← callEntry owned handle \"run\" [VInteger 21]"
+    , "    putStrLn (\"call = \" <> show (called ∷ CallResult))"
+    , "    readIORef total >>= \\held → putStrLn (\"state = \" <> show held)"
+    , "    callEntry owned handle \"tick\" [VInteger 1] >>= \\absent → putStrLn (\"optional entry = \" <> show absent)"
+    , "    refused ← try (callEntry owned handle \"run\" [VFloat 1.5])"
+    , "    case refused of"
+    , "      Left fault → do"
+    , "        putStrLn (\"argument refusal = \" <> show (ruleOf (boundaryReason fault)))"
+    , "        putStrLn (\"argument effect = \" <> show (boundaryEffect fault))"
+    , "      Right other → putStrLn (\"argument refusal = none \" <> show (other ∷ CallResult))"
+    , "    scripted ← try (callEntry owned handle \"bad\" [])"
+    , "    case scripted of"
+    , "      Left fault → do"
+    , "        putStrLn (\"script refusal binding = \" <> show (boundaryBinding fault))"
+    , "        putStrLn (\"script refusal rule = \" <> show (ruleOf (boundaryReason fault)))"
+    , "        putStrLn (\"script refusal effect = \" <> show (boundaryEffect fault))"
+    , "      Right other → putStrLn (\"script refusal = none \" <> show (other ∷ CallResult))"
+    , "    unsupported ← try (callEntry owned handle \"halt\" [])"
+    , "    case unsupported of"
+    , "      Left fault → putStrLn (\"unsupported = \" <> show (boundaryReason fault))"
+    , "      Right other → putStrLn (\"unsupported = none \" <> show (other ∷ CallResult))"
+    , "    pure (owned, handle)"
+    , "  let (owned, handle) = escaped"
+    , "  late ← try (callEntry owned handle \"run\" [VInteger 1])"
+    , "  case late ∷ Either VmClosed CallResult of"
+    , "    Left _ → putStrLn \"handle after the lifetime = VmClosed\""
+    , "    Right other → putStrLn (\"handle after the lifetime = \" <> show other)"
+    , "  where"
+    , "    ruleOf = \\case"
+    , "      ValueRefused refusal → refusalRule refusal"
+    , "      other → error (show other)"
     ]
