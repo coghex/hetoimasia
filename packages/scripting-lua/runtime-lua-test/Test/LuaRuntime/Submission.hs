@@ -10,7 +10,7 @@ import Data.IORef (newIORef, readIORef)
 import qualified Data.ByteString as ByteString
 import GHC.Stats (RTSStats (gc), GCDetails (gcdetails_live_bytes), getRTSStats)
 import System.Mem (performMajorGC)
-import Control.Monad (forM_, replicateM, replicateM_, void)
+import Control.Monad (forM_, replicateM, replicateM_, void, (>=>))
 import Data.Maybe (isJust)
 import qualified Data.Text as Text
 import Hetoimasia.Foundation.Worker (GroupStatus (statusOutstanding))
@@ -224,14 +224,17 @@ spec = describe "submission" $ do
         size ← newIORef (3000000 ∷ Int) >>= readIORef
         before ← liveBytes
         prepared ← prepareSlices endpoint size
+        routed ← prepareRouting endpoint size
         after ← liveBytes
         -- The buffers the slices were cut from are unreachable by now, and the
-        -- prepared call is still held: it keeps its own few bytes and nothing
-        -- more. Cut slices that were kept as they were would hold six megabytes.
+        -- prepared calls are still held: they keep their own few bytes and nothing
+        -- more, in their values and in their routing strings. Slices kept as they
+        -- were would hold many megabytes.
         (after - before) `shouldSatisfy` (< 1000000)
         -- Held until here, and then it is a call like any other.
         answer ← submitPrepared prepared
         shape answer `shouldBe` "accepted"
+        mapM_ (submitPrepared >=> (\submitted → shape submitted `shouldBe` "accepted")) routed
         retireOwner owner
   where
     liveBytes ∷ IO Int
@@ -252,6 +255,14 @@ spec = describe "submission" $ do
             , VBytes (ByteString.take 5 hugeBytes)
             , VCapability (capability (Text.take 70 hugeText) 1)
             ]
+        ]
+    -- Calls whose routing strings are slices of large buffers, valid ones and
+    -- overlong ones, with no arguments at all.
+    prepareRouting endpoint size = do
+      hugeText ← evaluate (Text.replicate size "t")
+      sequence
+        [ prepareCall endpoint (ModuleRef (Text.take 3 hugeText) (Text.take 1 hugeText)) (Text.take 4 hugeText) []
+        , prepareCall endpoint (ModuleRef (Text.take size hugeText) (Text.take size hugeText)) (Text.take size hugeText) []
         ]
     retryAccepted endpoint = do
       answer ← submit endpoint "echo" [VInteger 1]

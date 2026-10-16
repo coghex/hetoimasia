@@ -245,7 +245,7 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Limits
   )
 import Hetoimasia.Scripting.Lua.Internal.Value (Capability (capabilityTypeName), checkLimits)
 import Hetoimasia.Scripting.Lua.Internal.Vm (runningLuaCallback)
-import Hetoimasia.Scripting.Lua.Owner (ModuleRef (moduleRefName, moduleRefVersion), VmConfig (vmOwnerName, vmValueLimits))
+import Hetoimasia.Scripting.Lua.Owner (ModuleRef (ModuleRef, moduleRefName, moduleRefVersion), VmConfig (vmOwnerName, vmValueLimits), maxIdentityLength)
 import Hetoimasia.Scripting.Lua.Runtime.Admission
   ( admit
   , admitting
@@ -475,7 +475,21 @@ prepareCall (OwnerEndpoint control) ref entry arguments = do
   payload ← prepare $ case within of
     Right () → WithinBounds (map compact arguments)
     Left rule → OverBound rule
-  pure (PreparedCall control ref entry payload)
+  pure (PreparedCall control (compactRef ref) (compactName entry) payload)
+
+-- | The routing strings of a call get the same treatment as its values: they are
+-- copied, and one longer than any valid identity or name is cut to one character
+-- past the longest valid one, which can only be refused, and which is as much of
+-- it as a refusal will ever quote.
+compactRef ∷ ModuleRef → ModuleRef
+compactRef ref =
+  ModuleRef (clip maxIdentityLength (moduleRefName ref)) (clip maxIdentityLength (moduleRefVersion ref))
+
+compactName ∷ Text → Text
+compactName = clip maxNameLength
+
+clip ∷ Int → Text → Text
+clip limit = Text.copy . Text.take (limit + 1)
 
 -- | Compact what the queue keeps. The value limits count the bytes a value
 -- encodes to, and a capability is 21 of them whatever its type's name is; but
