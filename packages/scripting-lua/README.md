@@ -738,7 +738,8 @@ capability. The rules:
   contains itself is refused as a cycle (sharing is not a cycle).
 - A nil cannot be kept in a Lua table, so it cannot cross inside one: a nil list
   element, or a nil value for a record field that is not optional, is refused
-  with `RuleNilInTable`; an optional field that is nil is simply absent.
+  with `RuleNilInTable`; an optional field that is nil is simply absent from the Lua table, though it
+  is still inspected and so is charged against the limits like any other value.
 - Functions, coroutines, light userdata, and userdata that is not a capability of
   this VM are refused with a typed reason; so is a table key that is neither an
   integer nor a string.
@@ -810,7 +811,9 @@ The traceback is built from the debug interface's call records alone
 (`lua_getstack` and `lua_getinfo`; not `luaL_traceback`, whose function-name
 lookup reads the registry through metamethods), so no script-defined Lua can run
 while a fault is recorded, and it allocates nothing; it is bounded at 2,048 bytes
-and 22 levels. A non-string error value, or one whose handler
+and 22 levels. The close is an operation of its own: a fault recorded while
+finalizers run names no module or entry point and counts only the actions run
+during the close. A non-string error value, or one whose handler
 failed, is reported by the existing bounded fallback (its Lua type name, never its
 `__tostring`). A fault never claims that recovery is safe: whether state may have
 changed is exactly `Effect`, and task and session identities arrive with later
