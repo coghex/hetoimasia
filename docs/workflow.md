@@ -133,6 +133,7 @@ inside the plugins; locate those installed copies as the skills instruct.
 Use `cabal build all`, the console smoke, and the focused
 `hetoimasia-foundation:foundation-tests`, `hetoimasia-runtime:runtime-tests`,
 `hetoimasia-glfw:glfw-tests`, `hetoimasia-scripting-lua:lua-host-tests`,
+`hetoimasia-scripting-lua:lua-runtime-tests`,
 `hetoimasia-gpu-vulkan-model:gpu-model-tests`,
 `hetoimasia-gpu-vulkan-diagnostics:diagnostics-tests`, `hetoimasia-math:math-tests`,
 `hetoimasia-asset-image:asset-image-tests`,

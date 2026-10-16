@@ -72,6 +72,7 @@ cabal test hetoimasia-foundation:foundation-tests --test-show-details=direct
 cabal test hetoimasia-runtime:runtime-tests --test-show-details=direct
 cabal test hetoimasia-glfw:glfw-tests --test-show-details=direct
 cabal test hetoimasia-scripting-lua:lua-host-tests --test-show-details=direct
+cabal test hetoimasia-scripting-lua:lua-runtime-tests --test-show-details=direct
 cabal test hetoimasia-gpu-vulkan-model:gpu-model-tests --test-show-details=direct
 cabal test hetoimasia-gpu-vulkan-diagnostics:diagnostics-tests --test-show-details=direct
 cabal test --project-file cabal.project.cpu hetoimasia-math:math-tests --test-show-details=direct
