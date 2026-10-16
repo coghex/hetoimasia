@@ -687,7 +687,9 @@ the globals runs. A policy naming a namespace the registration does not declare
 (`PolicyUnknownNamespace`), a failure to install, and memory running out while
 installing end construction like any other initialization failure: the VM is
 closed through the same close and the body never runs. Which standard libraries a
-script can reach is the owner's explicit set; the base library brings `dofile`
+script can reach is the owner's explicit set, and the debug library an owner opens
+has no `sethook`, because a hook is script-defined Lua that Lua would run while a
+fault's traceback is being recorded; the base library brings `dofile`
 and `loadfile`, so an owner that must not read the disk does not open it.
 
 ### Modules and entry points
