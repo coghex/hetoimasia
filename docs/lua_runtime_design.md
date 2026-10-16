@@ -63,6 +63,23 @@ so the document is ready for issue processing for those two slices.
 
 This is not approval of the whole program, and no other gate changes.
 
+Narrow readiness renewal, 2026-10-16: the owner, via the assistant (request
+`user-het-lua5-readiness-20261016-1740`), accepted priority 1 of guide report
+[2026-10-16T165532Z-edefc39](guide/2026-10-16T165532Z-edefc39.md) and approved
+the narrow LUA-5 readiness renewal. LUA-5 is reconciled with the delivered
+owner, module and protocol APIs at `master@21c2add5`
+([LUA-5](#lua-5-integrate-trusted-vm-owners-with-runtime-supervision)) and its
+trusted-path readiness is renewed, so it is ready for issue processing. Its
+prerequisites LUA-2 (#460, PR #461), LUA-3 (#462, PR #463) and LUA-4 (#149)
+are merged. The reconciliation needed no new owner decision.
+- LUA-6 through LUA-8 stay `[deferred]` until the owner renews them. Where
+  lifecycle-operation binding calls are delivered is decided when LUA-6 is
+  renewed; until then they stay "not yet supported" (#462, decision A1).
+- The confined branch stays `[deferred]` on Q-5's successful platform verdicts.
+
+Readiness is not implementation approval. Processing LUA-5 into an issue and
+implementing it each need their own authorization.
+
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
 reviewed and deliberately not tracked separately · `[deferred]` blocked on a
 concrete precondition
@@ -76,7 +93,7 @@ concrete precondition
 - [x] LUA-2. Own the VM through a protected IO lifetime — [#460]
 - [x] LUA-3. Add application-owned modules and bounded value bindings — [#462]
 - [x] LUA-4. Model bounded script tasks and execution protocols — [#149]
-- [ ] LUA-5. Integrate trusted VM owners with runtime supervision — [deferred]: owner renews trusted-path readiness for this slice
+- [ ] LUA-5. Integrate trusted VM owners with runtime supervision
 - [ ] LUA-6. Schedule cooperative tasks with bounded service turns — [deferred]: owner renews trusted-path readiness for this slice
 - [ ] LUA-7. Add bounded asynchronous requests and owned subscriptions — [deferred]: owner renews trusted-path readiness for this slice
 - [ ] LUA-8. Prove independent trusted UI and gameplay execution headlessly — [deferred]: owner renews trusted-path readiness for this slice
@@ -126,6 +143,16 @@ source observations below remain historical.
 
 Inspection of Hetoimasia at `master@2c56edd0` on 2026-10-15. This replaces the
 2026-09-16 pre-implementation baseline (`master@007c285`).
+
+Addendum at `master@21c2add5`, 2026-10-16, for LUA-5's readiness. LUA-2/#460
+(PR #461, `85bb6118`) delivered the protected owner `withVmOwner`, and
+LUA-3/#462 (PR #463, `edefc398`) delivered application registrations,
+per-owner policy, modules, entry points, bounded values and `BoundaryFault`
+effects. The host's public modules are now `Owner`, `Registration`, `Value` and
+`Bridge`, and it still depends only on foundation and the binding. No
+`runtime-lua` sublibrary exists yet. The foundation and runtime facts below are
+unchanged in role. The bullet below saying no owner or registration surface
+exists describes the 2026-10-15 baseline.
 
 - **The Lua host** (`packages/scripting-lua`, built on the `lua` binding
   `>=2.3.4 && <2.4`). Its public library exposes only
@@ -1375,7 +1402,9 @@ and verified policy, with adversarial regression coverage.
 
 ### LUA-5. Integrate trusted VM owners with runtime supervision
 
-> Deferred: owner renews trusted-path readiness for this slice. The 2026-10-15 narrow renewal covers LUA-2 and LUA-3 only.
+> Readiness renewed on 2026-10-16 for this slice only (request
+> `user-het-lua5-readiness-20261016-1740`), reconciled with the delivered APIs
+> at `master@21c2add5`. LUA-6 through LUA-8 stay deferred.
 
 - **Outcome:** supervised in-process VM owners expose ready trusted Lua
   endpoints and retain VM/callback dependencies through close without a new
@@ -1388,8 +1417,72 @@ and verified policy, with adversarial regression coverage.
   alone must never confer trust or grants. Each owner has its own binding set
   and capability policy (D-14). Creating and retiring owners at runtime needs
   no pool or cross-owner scheduler. Start with finite call dispatch.
+  Reconciled with the delivered APIs:
+  - **Package.** The public `runtime-lua` sublibrary (P-1) lives in its own
+    source directory and depends on the host library, the private `model` (and,
+    where it must, `bridge`) sublibraries, runtime and foundation. It has its own
+    Hspec suite in a non-optional CPU validation group (P-12). The host library
+    gains no runtime dependency.
+  - **One owner is one supervised worker.** Its `Scoped` construction
+    (`workerDefinition`, `Foundation/Worker/Types.hs:208`) creates only bounded
+    control and its admission channel (P-3 step 1). Its execution action runs
+    `withVmOwner` (`Owner.hs:249`) on the worker thread, which is therefore the
+    VM's execution owner. `withVmOwner` installs the registration's granted
+    bindings and loads the initial chunks and configured modules before its body
+    runs. The body publishes component readiness first, then serves admitted
+    calls. Readiness is awaited through `awaitSupervised`
+    (`Supervision.hs:640`), composed with the worker's terminal outcome; the
+    startup acknowledgement `startSupervised` waits for (`Supervision.hs:543`)
+    is not readiness (P-3). `Runtime.Inbox` is neither reused for this startup
+    nor changed.
+  - **Configuration per owner.** Each owner is created from its own host
+    configuration (`VmConfig`, `Owner.hs:216`: libraries, registration, policy,
+    value limits, modules) and a `WorkerPolicy` the application chooses. One
+    `Registration` may be shared by any number of owners (D-14, D-15). The
+    adapter grants nothing beyond the configured policy.
+  - **Owner identity.** The adapter issues each created owner an identity that is
+    unique within its runtime boundary and never reissued after that owner
+    retires. Its endpoint, faults and exit record carry it beside the
+    application's label (`vmOwnerName`). Neither the identity nor the label
+    confers trust or grants. LUA-4's model names an owner by mod and one of the
+    two D-1 domains (`Protocol/Identity.hs:93,101`). That two-valued domain is
+    D-1's composition for LUA-8 and must not limit how many first-party owners
+    exist. Whether the private model's identity is generalized or wrapped is the
+    solver's choice, provided LUA-4's scoping and staleness invariants still
+    hold.
+  - **Finite call dispatch.** An endpoint submits a call to an entry point of a
+    module the owner has loaded, with bounded values, under #462's `callEntry`
+    contract. Submission never blocks: it answers accepted, full or closed (P-7;
+    foundation `SendResult`). The call's result is reserved before it is
+    accepted, and each owner bounds both its queued calls and its unobserved
+    results. Those bounds are validated when the owner is created and tested at
+    the bound and one past it (P-5). Each accepted call settles exactly once:
+    - with its `CallResult`;
+    - with a `BoundaryFault` or `LuaFault`, returned to that caller as data
+      (P-8's handled failure, never a worker failure);
+    - or as discarded at stop, counted in the exit record.
+
+    Calls run one at a time and to completion on the owner thread, in admission
+    order. LUA-5 has no coroutine yield, task, deadline or provider (LUA-6,
+    LUA-7).
+  - **Host failures.** A Haskell failure raised by a binding's action, which #462
+    re-raises unconverted, or any other exception escaping the owner, ends that
+    owner's worker with the failure as its primary outcome. It then follows
+    normal supervision under the owner's `WorkerPolicy`. The adapter neither
+    converts nor retries it. Close failures stay cleanup evidence (P-3, #460).
+  - **Stop and retire.** Stop closes admission, discards queued calls, lets the
+    in-flight call return, and then closes the VM through `withVmOwner` (P-9).
+    Retiring an owner means stopping its worker. Owners are created and retired
+    while others run, with no pool and no cross-owner scheduler (D-15).
+  - **No synchronous cross-owner call (D-13).** A binding may submit a call to
+    another owner's endpoint, since submission never blocks. A thread that is
+    running a binding or other Lua callback may not wait for any owner's reply,
+    including its own owner's: the wait is refused with a typed reason, never
+    left to deadlock.
 - **Phase:** trusted runtime ownership.
-- **Depends on:** LUA-3, LUA-4.
+- **Depends on:** LUA-3, LUA-4. Delivered: LUA-2 (#460), LUA-3 (#462) and
+  LUA-4 (#149), with runtime supervision, worker definitions and bounded
+  foundation channels already in place. No TIME-1 dependency.
 - **Ordering:** trusted critical path, independent of Q-5.
 - **Relevant decisions:** D-1, D-2, D-3, D-4, D-7, D-12, D-13, D-14, D-15.
 - **Acceptance signals:** readiness cannot hang on dead initialization;
@@ -1399,11 +1492,26 @@ and verified policy, with adversarial regression coverage.
   is not confused with the worker's earlier startup acknowledgement. Owners
   created and retired while others run, with different binding sets and
   policies, stay independent: retiring or failing one neither stops another
-  nor widens its bindings.
+  nor widens its bindings. Also:
+  - readiness is observed only after the configured modules have loaded, and a
+    failed module load fails readiness, never leaving it pending;
+  - a full queue answers full without blocking, and a closed one answers closed;
+  - every accepted call settles exactly once, and calls discarded at stop are
+    counted;
+  - a script fault returns to its caller and the owner goes on serving;
+  - a binding's Haskell failure ends only that owner, under its policy;
+  - waiting for a reply from inside a binding is refused, not a deadlock;
+  - a retired owner's identity is never reissued;
+  - `Runtime.Inbox` is unchanged.
 - **Out of scope:** deadline scheduling, request/subscription providers, UI/game
   composition, confined process integration (LUA-16), replacement of
-  Runtime.Inbox or the application runner.
-- **Open questions:** None once predecessor gates are satisfied.
+  Runtime.Inbox or the application runner. Also:
+  - loading further modules through the endpoint after readiness: modules come
+    from the owner's configuration;
+  - lifecycle-operation and asynchronous-request binding calls, which stay
+    "not yet supported" (#462, decision A1). Where lifecycle calls are delivered
+    is decided when LUA-6 is renewed.
+- **Open questions:** None.
 
 ### LUA-6. Schedule cooperative tasks with bounded service turns
 
