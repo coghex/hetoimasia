@@ -22,6 +22,7 @@ module Test.LuaRuntime.Support
   , hasEntered
   , attemptWait
   , gate
+  , applicationFault
   , noted
   , note
     -- * Configurations
@@ -63,6 +64,7 @@ import Control.Exception
   , ExceptionWithContext (ExceptionWithContext)
   , SomeException
   , fromException
+  , throw
   , throwIO
   , tryWithContext
   )
@@ -166,6 +168,8 @@ data Fixture = Fixture
     -- ^ What the application's own liveness check does before it answers.
   , fixtureProbe ∷ !(IORef [Text])
     -- ^ What the fixture's attempts to wait were answered with.
+  , fixtureLiveFault ∷ !(IORef (Maybe BoundaryFault))
+    -- ^ A fault the application's liveness check hides in a lazy answer.
   }
 
 newFixture ∷ IO Fixture
@@ -181,6 +185,7 @@ newFixture =
     <*> newIORef Nothing
     <*> newIORef (pure ())
     <*> newIORef []
+    <*> newIORef Nothing
 
 -- | The gate of this name, made when first asked for.
 gateIn ∷ IORef (Map Text (MVar ())) → Text → IO (MVar ())
@@ -221,7 +226,11 @@ noted fixture = reverse <$> readIORef (fixtureLog fixture)
 
 -- | A boundary fault of the application's own making, which its binding throws.
 applicationBoundaryFault ∷ BoundaryFault
-applicationBoundaryFault =
+applicationBoundaryFault = applicationFault "application"
+
+-- | A boundary fault of the application's own making, naming this chunk.
+applicationFault ∷ Text → BoundaryFault
+applicationFault chunk =
   BoundaryFault
     { boundaryOwner = "the application"
     , boundaryVm = VmIdentity 0
@@ -229,7 +238,7 @@ applicationBoundaryFault =
     , boundaryModule = Nothing
     , boundaryEntry = Nothing
     , boundaryBinding = Nothing
-    , boundaryChunk = "application"
+    , boundaryChunk = chunk
     , boundaryReason = InternalError "thrown by the application"
     , boundaryEffect = NoEffect
     , boundaryTraceback = Nothing
@@ -249,7 +258,9 @@ sampleRegistration fixture = ok (registration [capabilityType "ticket" alive] [a
     alive _ = do
       check ← readIORef (fixtureLiveCheck fixture)
       check
-      pure True
+      hidden ← readIORef (fixtureLiveFault fixture)
+      -- Lazy on purpose: a fault hidden in the answer surfaces when it is read.
+      pure (maybe True throw hidden)
     app =
       namespace
         "app"
@@ -270,6 +281,11 @@ sampleRegistration fixture = ok (registration [capabilityType "ticket" alive] [a
               [VText kind] → throwIO (Broken kind)
               _ → pure ()
             pure []
+        , stateOperation "fail_lazy" [SText] [SInteger] $ \arguments → case arguments of
+            -- The failure is hidden in the result, and surfaces when it is read.
+            [VText "boundary"] → pure [VInteger (throw applicationBoundaryFault)]
+            [VText "lua"] → pure [VInteger (throw (LuaFault CallFailed "application" ErrorAbsent))]
+            _ → pure [VInteger 0]
         , stateOperation "submit" [SText, SInteger] [SInteger] $ \arguments →
             case arguments of
               [VText label, VInteger n] → do
@@ -373,6 +389,7 @@ moduleEntries =
   , required "block_call" [SText] [SInteger]
   , required "block_then_fail" [SText, SText] []
   , required "host_fail" [SText] []
+  , required "fail_lazy" [SText] [SInteger]
   , required "swallow_then_fail" [SText] []
   , required "lifecycle" [] []
   , required "submit_to" [SText, SInteger] [SInteger]
@@ -396,6 +413,7 @@ moduleSource =
     , "function block_call(name) app.block(name) return 1 end"
     , "function block_then_fail(name, kind) app.block(name) app.fail(kind) end"
     , "function host_fail(kind) app.fail(kind) end"
+    , "function fail_lazy(kind) return app.fail_lazy(kind) end"
     , "function swallow_then_fail(kind) pcall(app.note, 5) app.fail(kind) end"
     , "function lifecycle() app.lifecycle() end"
     , "function submit_to(label, n) return app.submit(label, n) end"

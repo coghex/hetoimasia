@@ -5,6 +5,7 @@ module Test.LuaRuntime.HostFailures (spec) where
 import Control.Concurrent.STM (atomically)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), fromException)
 import Control.Monad (forM, forM_)
+import Data.IORef (writeIORef)
 import Data.ByteString (ByteString)
 import qualified Data.Text.Encoding as Text
 import Hetoimasia.Foundation.Resource (cleanupFailureLabel, cleanupFailuresInContext)
@@ -97,6 +98,30 @@ spec = describe "host failures" $ do
       (fromException @LuaFault =<< failureOf' luaStatus) `shouldSatisfy` maybe False (const True)
       (failureOf' swallowedStatus) `shouldSatisfy` maybe False (brokenIs "broken")
       forM_ [boundaryCall, luaCall, swallowedCall] $ \ticket →
+        settleOutcome ticket >>= (`shouldSatisfy` isDiscard ExitFailed Started)
+
+  it "keeps the mark on a failure hidden in a lazy result or a lazy liveness answer, so it is still the host's failure" $ bounded $ do
+    fixture ← newFixture
+    withBoundary $ \control runtime → do
+      let recognizesAll = optionalPolicy (const True)
+          failureOf' = \case
+            WorkerUnavailable (ExceptionWithContext _ failure) → Just failure
+            _ → Nothing
+      lazyBoundary ← startOwner runtime (ownerSpec fixture "lazy boundary" ["app"] recognizesAll (bounds 4 4))
+      lazyLua ← startOwner runtime (ownerSpec fixture "lazy lua" ["app"] recognizesAll (bounds 4 4))
+      lazyLive ← startOwner runtime (ownerSpec fixture "lazy liveness" ["app"] recognizesAll (bounds 4 4))
+      boundaryCall ← submit (ownerEndpoint lazyBoundary) "fail_lazy" [VText "boundary"] >>= accepted
+      luaCall ← submit (ownerEndpoint lazyLua) "fail_lazy" [VText "lua"] >>= accepted
+      writeIORef (fixtureLiveFault fixture) (Just (applicationFault "liveness"))
+      liveCall ← submit (ownerEndpoint lazyLive) "redeem" [VCapability (capability "ticket" 1)] >>= accepted
+      boundaryStatus ← awaitTerminal control lazyBoundary
+      luaStatus ← awaitTerminal control lazyLua
+      liveStatus ← awaitTerminal control lazyLive
+      (fromException @BoundaryFault =<< failureOf' boundaryStatus) `shouldSatisfy` maybe False ((== "the application") . boundaryOwner)
+      (fromException @LuaFault =<< failureOf' luaStatus) `shouldSatisfy` maybe False (const True)
+      (fromException @BoundaryFault =<< failureOf' liveStatus) `shouldSatisfy` maybe False ((== "liveness") . boundaryChunk)
+      -- None of them was handed to a caller as the call's own fault.
+      forM_ [boundaryCall, luaCall, liveCall] $ \ticket →
         settleOutcome ticket >>= (`shouldSatisfy` isDiscard ExitFailed Started)
 
   it "settles a cancelled owner's in-flight call as discarded, started, cancelled, and its queued calls as not started, cancelled" $ bounded $ do

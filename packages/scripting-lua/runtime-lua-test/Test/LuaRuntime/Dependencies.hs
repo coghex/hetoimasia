@@ -28,19 +28,27 @@ packageRoot = search "." (8 ∷ Int)
 cabalName ∷ FilePath
 cabalName = "hetoimasia-scripting-lua.cabal"
 
--- | The dependency names the stanza with this header declares.
-dependencies ∷ String → IO [String]
-dependencies header = do
+-- | The lines of the stanza with this header.
+stanzaBody ∷ String → IO [String]
+stanzaBody header = do
   root ← packageRoot
   description ← readFile (root </> cabalName)
   case stanza (lines description) of
     [] → fail ("the cabal description has no `" <> header <> "` stanza")
-    body → pure (sort (dependencyNames body))
+    body → pure body
   where
     stanza allLines = case dropWhile (/= header) allLines of
       [] → []
       (_ : rest) → takeWhile indented rest
     indented line = null (trim line) || " " `isPrefixOf` line
+
+trim ∷ String → String
+trim = dropWhile isSpace . reverse . dropWhile isSpace . reverse
+
+-- | The dependency names the stanza with this header declares.
+dependencies ∷ String → IO [String]
+dependencies header = sort . dependencyNames <$> stanzaBody header
+  where
     dependencyNames body =
       [ name
       | line ← takeWhile (not . endOfField) (drop 1 (dropWhile (not . isDependencyField) body))
@@ -49,7 +57,6 @@ dependencies header = do
       ]
     isDependencyField line = trim line == "build-depends:"
     endOfField line = not (null (trim line)) && not ("        " `isPrefixOf` line)
-    trim = dropWhile isSpace . reverse . dropWhile isSpace . reverse
 
 -- | Every Haskell source file under a directory of the package.
 sourcesUnder ∷ FilePath → IO [FilePath]
@@ -93,6 +100,15 @@ spec = describe "the adapter's dependency closure" $ do
         , "stm"
         , "text"
         ]
+
+  it "is public, so an application in another package can depend on it" $ do
+    -- A named sublibrary is private unless its stanza says otherwise, and the
+    -- examples here sit in the same package, which can use a private one. The
+    -- other package's view is what the field decides, so the field is checked.
+    body ← stanzaBody "library runtime-lua"
+    [trim line | line ← body, "visibility:" `isPrefixOf` trim line] `shouldBe` ["visibility: public"]
+    sources ← stanzaBody "library"
+    [line | line ← sources, "visibility:" `isPrefixOf` trim line] `shouldBe` []
 
   it "leaves the host library depending on neither the runtime nor the adapter" $ do
     host ← dependencies "library"

@@ -47,7 +47,6 @@ import Control.Exception
   , SomeException
   , fromException
   , mask
-  , mask_
   , rethrowIO
   , tryWithContext
   )
@@ -90,17 +89,18 @@ import Hetoimasia.Scripting.Lua.Value (VmIdentity)
 -- The handoff is where readiness is published: the control, once the VM is
 -- initialized and admission is open, and nothing before.
 runOwner ∷ StopToken → Control → TVar (Maybe Control) → VmConfig → IO ()
-runOwner token control handoff config = do
-  outcome ← tryWithContext @SomeException (withVmOwner config (serve token control handoff config))
+runOwner token control handoff config = mask $ \restore → do
+  outcome ← tryWithContext @SomeException (restore (withVmOwner config (serve token control handoff config)))
   -- An exit before the body, a failure of the close itself: nothing of the
-  -- calls is left to settle then, and this records how the owner ended.
-  mask_ (atomically (shutAndDiscard control (either exitOf (const ExitStopped) outcome)))
+  -- calls is left to settle then, and this records how the owner ended. Masked
+  -- from the catch on, so no cancellation falls between the two.
+  atomically (shutAndDiscard control (either exitOf (const ExitStopped) outcome))
   either rethrowIO pure outcome
 
 -- | The body of the owner's lifetime.
 serve ∷ StopToken → Control → TVar (Maybe Control) → VmConfig → OwnedVm → IO ()
-serve token control handoff config owned = do
-  served ← tryWithContext @SomeException $ do
+serve token control handoff config owned = mask $ \restore → do
+  served ← tryWithContext @SomeException . restore $ do
     handles ← Map.fromList . catMaybes <$> traverse (resolve owned) (map sourceIdentity (vmModules config))
     atomically (openAdmission control >> writeTVar handoff (Just control))
     loop handles
@@ -108,7 +108,10 @@ serve token control handoff config owned = do
     Right () → pure ()
     Left failure → do
       -- Before the VM closes: admission ends and what is unsettled is discarded.
-      mask_ (atomically (shutAndDiscard control (exitOf failure)))
+      -- Masked from the catch on, so no cancellation can reach the VM's teardown
+      -- between the failure and this, and leave accepted calls unsettled for as
+      -- long as a finalizer blocks.
+      atomically (shutAndDiscard control (exitOf failure))
       rethrowIO failure
   where
     identity = vmIdentity (ownedInternalVm owned)

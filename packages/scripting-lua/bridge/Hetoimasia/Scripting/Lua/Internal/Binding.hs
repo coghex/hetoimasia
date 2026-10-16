@@ -41,7 +41,7 @@ module Hetoimasia.Scripting.Lua.Internal.Binding
   , ensureValues
   ) where
 
-import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, fromException, toException)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, evaluate, fromException, toException)
 import Control.Monad (foldM, forM_, unless, when)
 import Data.List (nub)
 import Data.Maybe (fromMaybe)
@@ -202,9 +202,16 @@ valueHandler boundary vm space binding state restore = do
       -- happened has to include that.
       amendEscape vm upgradeEffect
       produced ← case action of
-        ValuesAction run → fromApplication (restore (run values))
+        -- What the action returns is evaluated inside the mark: a failure hidden in
+        -- a lazy result is the application's, whenever it would have surfaced.
+        -- The bounded check reaches every part of a result that can cross, and
+        -- stops at a limit, so an endless result costs no more than a large one.
+        ValuesAction run →
+          fromApplication $ do
+            returned ← restore (run values)
+            returned <$ evaluate (checkLimits limits returned)
         CommandAction run → do
-          answer ← fromApplication (restore (run values))
+          answer ← fromApplication (restore (run values) >>= evaluate)
           case answer of
             Accepted → pure [VBoolean True, VNil]
             Rejected reason
@@ -248,7 +255,7 @@ retiredIn boundary = go []
     go path = \case
       VCapability capability → do
         live ← case lookupCapability registered (capabilityTypeName capability) of
-          Just kind → fromApplication (capabilityLive kind (capabilityKey capability))
+          Just kind → fromApplication (capabilityLive kind (capabilityKey capability) >>= evaluate)
           Nothing → pure False
         pure (if live then Nothing else Just (reverse path, capabilityTypeName capability))
       VList items → firstJust [go (AtIndex index : path) item | (index, item) ← zip [1 ..] items]

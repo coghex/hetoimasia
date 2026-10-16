@@ -8,6 +8,7 @@ import Control.Concurrent.STM (atomically)
 import Control.Exception (ErrorCall (ErrorCall), evaluate, try)
 import Control.Monad (forM_, replicateM, replicateM_, void)
 import Data.Maybe (isJust)
+import qualified Data.Text as Text
 import Hetoimasia.Foundation.Worker (GroupStatus (statusOutstanding))
 import Hetoimasia.Runtime.Supervision (workerGroupStatus)
 import Hetoimasia.Scripting.Lua.Owner
@@ -188,6 +189,28 @@ spec = describe "submission" $ do
           other → fail ("expected the value refusal, found " <> show other)
         -- The owner went on, in order, and nothing ran for the refused call.
         returnedValues <$> settleOutcome after >>= (`shouldBe` Just [VInteger 9])
+        retireOwner owner
+    it "bounds a capability's type name, which the value limits do not count, so a huge one is not kept" $ bounded $ do
+      fixture ← newFixture
+      withBoundary $ \_ runtime → do
+        owner ← startOwner runtime (ownerSpec fixture "capability" ["app"] requiredPolicy (bounds 4 10))
+        let endpoint = ownerEndpoint owner
+        holder ← submit endpoint "block_call" [VText "hold"] >>= accepted
+        awaitEntered fixture "hold"
+        let huge = VCapability (capability (Text.replicate 2000000 "t") 7)
+        -- Accepted and queued while the owner is occupied.
+        queued ← submit endpoint "redeem" [huge] >>= accepted
+        releaseGate fixture "hold"
+        void (settle holder)
+        settlement ← settle queued
+        settledOutcome settlement `shouldSatisfy` \case
+          CallFaulted (BoundaryFailed fault) → case boundaryReason fault of
+            ValueRefused _ → True
+            _ → False
+          _ → False
+        -- Nothing of the name beyond the longest valid one was kept, so neither
+        -- the refusal nor anything else holds two million characters.
+        length (show settlement) `shouldSatisfy` (< 4000)
         retireOwner owner
   where
     retryAccepted endpoint = do

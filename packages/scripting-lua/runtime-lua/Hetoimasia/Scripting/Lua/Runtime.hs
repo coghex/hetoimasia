@@ -207,7 +207,7 @@ module Hetoimasia.Scripting.Lua.Runtime
   ) where
 
 import Control.Concurrent.STM (STM, TVar, atomically, newTVarIO, orElse, readTVar, retry)
-import Control.Exception (ExceptionWithContext, SomeException, evaluate, mask_, onException)
+import Control.Exception (ExceptionWithContext, SomeException, evaluate, mask, mask_, onException)
 import Control.Monad (when)
 import Data.Foldable (toList)
 import Data.IORef (IORef, atomicModifyIORef', newIORef)
@@ -242,7 +242,7 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Limits
   , Quantum (Quantum)
   , validateLimits
   )
-import Hetoimasia.Scripting.Lua.Internal.Value (checkLimits)
+import Hetoimasia.Scripting.Lua.Internal.Value (Capability (capabilityTypeName), checkLimits)
 import Hetoimasia.Scripting.Lua.Internal.Vm (runningLuaCallback)
 import Hetoimasia.Scripting.Lua.Owner (ModuleRef (moduleRefName, moduleRefVersion), VmConfig (vmOwnerName, vmValueLimits))
 import Hetoimasia.Scripting.Lua.Runtime.Admission
@@ -256,7 +256,8 @@ import Hetoimasia.Scripting.Lua.Runtime.Admission
   )
 import Hetoimasia.Scripting.Lua.Runtime.Dispatch (runOwner)
 import Hetoimasia.Scripting.Lua.Runtime.Types
-import Hetoimasia.Scripting.Lua.Value (Value)
+import Hetoimasia.Scripting.Lua.Registration (maxNameLength)
+import Hetoimasia.Scripting.Lua.Value (Value (VCapability, VList, VRecord))
 import Hetoimasia.Foundation.Messaging.Payload (Prepared)
 
 -- | The runtime boundary owners are created in: the supervision control they
@@ -373,18 +374,25 @@ startLuaOwner runtime spec = do
                 (\control → atomically (shutAndDiscard control ExitFailed))
           )
           (\token control → runOwner token control handoff config)
-  started ← startSupervised (runtimeControl runtime) (ownerPolicy spec) definition
-  case started of
-    WorkerStartRejected → pure OwnerRejected
-    WorkerStartUnavailable _ failure → pure (OwnerUnavailable failure)
-    WorkerStarted worker → do
-      -- A creator that stops waiting does not orphan the owner.
-      ready ← awaitSupervised (runtimeControl runtime) (readiness handoff worker) `onException` stopSupervised worker
-      case ready of
-        Just control → do
-          live ← atomically (admitting control)
-          if live then pure (OwnerStarted (LuaOwner worker control)) else ended worker
-        Nothing → ended worker
+  -- Acquisition is masked from the worker's start to the endpoint's handoff, and
+  -- only the two waits are restored: a cancellation cannot fall between the
+  -- start and the handler that asks the owner to stop, nor between the end of
+  -- the wait and the handoff, and so cannot leave behind an owner nobody holds.
+  mask $ \restore → do
+    started ← restore (startSupervised (runtimeControl runtime) (ownerPolicy spec) definition)
+    case started of
+      WorkerStartRejected → pure OwnerRejected
+      WorkerStartUnavailable _ failure → pure (OwnerUnavailable failure)
+      WorkerStarted worker → do
+        -- A creator that stops waiting does not orphan the owner.
+        ready ←
+          restore (awaitSupervised (runtimeControl runtime) (readiness handoff worker))
+            `onException` stopSupervised worker
+        case ready of
+          Just control → do
+            live ← atomically (admitting control)
+            if live then pure (OwnerStarted (LuaOwner worker control)) else ended worker
+          Nothing → ended worker
   where
     ended worker =
       atomically (workerStatus worker) >>= \case
@@ -461,9 +469,24 @@ prepareCall ∷ OwnerEndpoint → ModuleRef → Text → [Value] → IO Prepared
 prepareCall (OwnerEndpoint control) ref entry arguments = do
   within ← evaluate (checkLimits (controlLimits control) arguments)
   payload ← prepare $ case within of
-    Right () → WithinBounds arguments
+    Right () → WithinBounds (map boundCapabilities arguments)
     Left rule → OverBound rule
   pure (PreparedCall control ref entry payload)
+
+-- | Bound what the value limits do not count. A capability is 21 bytes of the
+-- encoding whatever its type's name is, but the queue keeps the capability as it
+-- was given, and its name is as long as the producer made it. No registered
+-- type has a name longer than 'maxNameLength', so a longer one can only be
+-- refused, and what is kept of it is one character past the longest valid name:
+-- enough to never match one, and as much as the refusal will ever quote.
+boundCapabilities ∷ Value → Value
+boundCapabilities = \case
+  VCapability held
+    | Text.length (capabilityTypeName held) > maxNameLength →
+        VCapability held {capabilityTypeName = Text.take (maxNameLength + 1) (capabilityTypeName held)}
+  VList items → VList (map boundCapabilities items)
+  VRecord entries → VRecord [(name, boundCapabilities item) | (name, item) ← entries]
+  value → value
 
 -- | What submitting a call answered.
 data Submission
