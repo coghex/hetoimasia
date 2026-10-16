@@ -93,7 +93,7 @@ concrete precondition
 - [x] LUA-2. Own the VM through a protected IO lifetime — [#460]
 - [x] LUA-3. Add application-owned modules and bounded value bindings — [#462]
 - [x] LUA-4. Model bounded script tasks and execution protocols — [#149]
-- [ ] LUA-5. Integrate trusted VM owners with runtime supervision
+- [x] LUA-5. Integrate trusted VM owners with runtime supervision — [#464]
 - [ ] LUA-6. Schedule cooperative tasks with bounded service turns — [deferred]: owner renews trusted-path readiness for this slice
 - [ ] LUA-7. Add bounded asynchronous requests and owned subscriptions — [deferred]: owner renews trusted-path readiness for this slice
 - [ ] LUA-8. Prove independent trusted UI and gameplay execution headlessly — [deferred]: owner renews trusted-path readiness for this slice
