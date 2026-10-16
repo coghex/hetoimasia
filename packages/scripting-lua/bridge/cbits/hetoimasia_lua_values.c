@@ -657,13 +657,18 @@ static int count_body(lua_State *L)
 
 int hetoimasia_lua_module_count(lua_State *L, long *count)
 {
+  int held = gc_hold(L);
+  int status;
   *count = 0;
   if (!lua_checkstack(L, 8)) {
+    gc_release(L, held);
     return LUA_ERRMEM;
   }
   lua_pushcfunction(L, count_body);
   lua_pushlightuserdata(L, count);
-  return lua_pcall(L, 1, 0, 0);
+  status = lua_pcall(L, 1, 0, 0);
+  gc_release(L, held);
+  return status;
 }
 
 static int namespace_body(lua_State *L)
@@ -1028,12 +1033,17 @@ static int release_body(lua_State *L)
 
 int hetoimasia_lua_module_release(lua_State *L, lua_Integer slot)
 {
+  int held = gc_hold(L);
+  int status;
   if (!lua_checkstack(L, 6)) {
+    gc_release(L, held);
     return LUA_ERRMEM;
   }
   lua_pushcfunction(L, release_body);
   lua_pushinteger(L, slot);
-  return lua_pcall(L, 1, 0, 0);
+  status = lua_pcall(L, 1, 0, 0);
+  gc_release(L, held);
+  return status;
 }
 
 typedef struct {
