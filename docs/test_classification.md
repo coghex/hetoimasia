@@ -37,6 +37,7 @@ execute every buildable probe. Use named suites and selectors instead.
 | `glfw-tests` / `test.glfw` | Floor: headless session/window/host/graphics-owner models, native linkage declarations, and API boundaries; no desktop |
 | `hetoimasia-tests` / `test.engine` | Floor: console child-process startup and exit mapping |
 | `lua-host-tests` / `test.scripting-lua` | Conditional: bridge and protocol contracts; quick allocation-failure and foreign-call progress checks remain here |
+| `lua-runtime-tests` / `test.scripting-lua-runtime` | Conditional: the runtime adapter's supervised owners, readiness, bounded submission, settlement, host failures, stop and refused callback waits, with real VMs under a real supervision boundary; the dependency checks need no VM |
 | `gpu-model-tests` / `test.vulkan` | Conditional: pure retention/frame model with scripted time; no Vulkan device |
 | `diagnostics-tests` / `test.vulkan-diagnostics` | Conditional: the production C validation capture and its diagnostic lifetime, with injected sinks and explicit coordination; no Vulkan device |
 | `math-tests` / `test.math` | Conditional: pure vector, matrix, transform and projection contracts, with generated inputs and every degenerate case; no native prerequisite |

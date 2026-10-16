@@ -3,9 +3,11 @@
 One embedded Lua interpreter, reached through a private bridge. This package
 owns VM construction over an explicitly chosen set of standard libraries, chunk
 loading, protected calls, error and cancellation transport across the C
-boundary, and a terminal close. It depends on `hetoimasia-foundation` and the
-Lua binding and on nothing else in the engine: no runtime, GLFW, Vulkan,
-console, or game code.
+boundary, and a terminal close. Its host library depends on
+`hetoimasia-foundation` and the Lua binding and on nothing else in the engine: no
+runtime, GLFW, Vulkan, console, or game code. The runtime adapter that puts
+owners under supervision is a sublibrary of its own, described under
+[The runtime adapter](#the-runtime-adapter).
 
 Beside it, and sharing nothing with it, the package owns the **protocol model**:
 the pure task, admission, request, subscription, epoch, failure, and stop types
@@ -21,8 +23,11 @@ registers named bindings once, gives each owner a policy naming the namespaces i
 exposes, supplies its own Lua modules, and calls their entry points with bounded
 copied values. See
 [Registration, modules and bounded values](#registration-modules-and-bounded-values).
-Any concrete game namespace, the scheduler, asynchronous requests and the
-confined path are later slices of
+The **runtime adapter** (LUA-5) is here as well: trusted VM owners, each one a
+supervised worker running one VM, with bounded call dispatch, exactly-once
+settlement and the refusal of a reply wait from inside a Lua callback. See
+[The runtime adapter](#the-runtime-adapter). Any concrete game namespace, the
+scheduler, asynchronous requests and the confined path are later slices of
 [the Lua runtime design](../../docs/lua_runtime_design.md). What is here is the
 boundary they will be built on, and the evidence that it holds.
 
@@ -895,6 +900,254 @@ closure or for a Lua state, and a positive client built from the public modules
 alone that constructs a registration and an owner's policy, loads a module, calls
 an entry point and observes a typed refusal.
 
+## The runtime adapter
+
+The runtime adapter (LUA-5; design D-12 to D-15, P-1, P-3, P-5, P-7 to P-9,
+P-12) puts trusted VM owners under runtime supervision. It is the public
+`runtime-lua` sublibrary of this package, in its own source directory
+(`runtime-lua/`), and its one public module is
+`Hetoimasia.Scripting.Lua.Runtime`.
+
+It depends on the host library, the private `model` and, only where it must, the
+private `bridge`, on `hetoimasia-runtime` and on `hetoimasia-foundation`, and on
+nothing of GLFW, Vulkan, the console or a game. The host library gained no
+dependency, and `Hetoimasia.Runtime.Inbox` is neither used nor changed: its
+already-initialized startup handoff is not what a VM owner needs, and P-3 says not
+to weaken it. The bridge is named for three things no public host module offers:
+the process-wide record of the threads running a Lua callback, the mark a failure
+of application code carries, and the value limits' check. The model supplies the
+validation of the two caps the adapter has (below). `Test.LuaRuntime.Dependencies`
+reads the stanza and the imports of the adapter's modules to check all of this,
+without a VM.
+
+One owner is one supervised worker. There is no pool, no scheduler across owners,
+no thread or timer of the adapter's own, and no new supervisor: it composes
+`withVmOwner` with `startSupervised`, `workerDefinition` and `awaitSupervised`.
+
+### Creation and readiness
+
+A `LuaRuntime` is made over the `RuntimeControl` of one `withSupervision`
+invocation (`newLuaRuntime`). `startLuaOwner` takes it, an `OwnerSpec` and
+answers an `OwnerStart`. The spec is the host's `VmConfig`, a `WorkerPolicy` the
+application chooses, and the two bounds, `CallBounds`.
+
+Creation checks the bounds first, and a bound below one raises
+`OwnerBoundsRefused` naming every violation before any worker starts or VM is
+built. It then issues the owner's identity and starts exactly one worker. The
+worker's `Scoped` startup allocates only the owner's bounded queue and counters.
+Constructing the VM, installing the registration's granted bindings, running the
+initial chunks and loading the configured modules all happen inside `withVmOwner`
+on the worker's own thread, which is therefore the VM's execution owner. Only then
+does the body publish readiness and open admission, in one transaction, and only
+then is an endpoint handed out.
+
+Readiness is awaited by one `awaitSupervised` wait, composed with the worker's own
+terminal status. The acknowledgement `startSupervised` waits for means only that
+the startup finished, and the creator never treats it as readiness: a slow initial
+chunk is in progress after `startSupervised` has returned and before creation
+does. A failure of initialization, whether a library, a binding installation, a
+chunk, a module load or a policy naming an unknown namespace, ends creation under
+the owner's policy, and nobody is left waiting. A required owner's failure is
+raised by supervision as any worker's is. An optional owner whose classifier
+recognizes it answers `OwnerUnavailable`, its status committed and the run
+continuing. At handoff admission is checked still to be live; an owner that ended
+without failing answers `OwnerEnded`, and a closed boundary `OwnerRejected`.
+
+A creator whose wait is abandoned, cancelled or woken by another worker's fatal
+outcome, asks the owner to stop. The worker group still owns the worker and
+drains it, and no detached helper exists. Creating an owner waits for readiness,
+so it is refused from a Lua callback (below).
+
+### Identity
+
+Each owner is issued an `OwnerId` by the `LuaRuntime` that created it, once and in
+order, and an identity is never issued again, including after the owner retires.
+The runtime boundary an identity is unique within is that `LuaRuntime` value: make
+one for each `withSupervision` invocation. Two runtimes never issue equal
+identities, even when their sequence numbers agree. The endpoint, every
+settlement and the exit record carry the identity beside the application's label,
+`vmOwnerName`. Neither confers trust or a grant: an owner's authority is exactly
+its configured `vmPolicy`, and two owners of one label with different policies
+keep the bindings of their own. The model's own two-valued `ExecutionDomain` is
+D-1's composition for LUA-8 and limits nothing here; the adapter's identity wraps
+nothing of it and changes none of its examples.
+
+### Submitting calls
+
+An `OwnerEndpoint` submits a call to an entry point of a module the owner loaded
+at initialization, named by its `ModuleRef`, with `[Value]` arguments. It is a
+value usable from any thread, including a binding's action on this owner or on
+another, and it never needs the `RuntimeControl`. Modules come from the owner's
+configuration: nothing loads one through the endpoint after readiness.
+
+`submitCall` never blocks. It answers `CallAccepted` with a `CallTicket`,
+`CallFull` or `CallClosed`, the foundation channel's `Accepted`, `Full` and
+`Closed`, and a full or closed answer changes nothing. Closed takes precedence.
+Two bounds, both configuration, both at least one:
+
+- `boundQueuedCalls` is how many accepted calls may wait for the owner's thread to
+  start them. The call that is running is not queued.
+- `boundResults` is how many results may be reserved at once. A reservation is
+  taken, atomically with the enqueue, as a call is accepted, and held while the
+  call waits, runs, and sits settled but not yet observed. So a result always has
+  a place before its call runs, completion needs no capacity of its own, and the
+  unobserved results are bounded however slowly they are read.
+
+Submission answers full when either bound is reached. The private model's
+`validateLimits` checks the two caps, `maxQueuedAdmissions` and
+`maxRetainedResults`, which mean exactly this; its other caps belong to later
+slices and are held at the smallest valid value. No maximum is imposed beyond what
+memory allows.
+
+An owner that has been asked to stop admits nothing from that moment, whether or
+not its thread has got as far as acting on the request: a call held inside a
+binding does not keep admission open.
+
+The payload is prepared on the producer's thread before publication.
+`prepareCall` evaluates the arguments completely there, so a failure nested in a
+lazy value is raised in the producer, and the owner's thread is handed nothing
+unevaluated. It checks them against the owner's value limits as it goes and stops
+at the first limit, so an endless or oversized argument list costs no more to
+refuse than a small one, and none of it is kept. A call whose arguments were over
+the limits is accepted like any other, carries only the rule they broke, and
+settles in its turn as the same `ValueRefused` fault the argument check raises,
+with `NoEffect`. Preparing is separate from `submitPrepared`, so the three-way
+answer never evaluates anything. The schema and capability checks still happen on
+the owner's thread, under `callEntry`'s own contract.
+
+### Settlement
+
+Calls run one at a time, to completion, on the owner's thread, in the order they
+were accepted, through `callEntry` with that module's handle. There are no
+coroutine yields, tasks, deadlines, timers or providers here. Each accepted call
+settles exactly once, as one of:
+
+- `CallReturned`, with the entry point's `CallResult`, `Returned` values or
+  `EntryAbsent`;
+- `CallFaulted`, with a fault of the call returned to its caller as data:
+  `ScriptFailed` (a memory failure included), `ValueRefused`, `NotYetSupported`, a
+  missing entry point, all as the `BoundaryFault` or `LuaFault` they are, and
+  `ModuleNotLoaded` for a `ModuleRef` the owner did not load, which settles with
+  `NoEffect` and runs nothing. The owner goes on serving the next call, and none
+  of this is a worker failure;
+- `CallDiscarded`, when the owner exits before the call settles, recording how it
+  exited (`ExitStopped`, `ExitFailed` or `ExitCancelled`) and whether the call had
+  started.
+
+A call that had started may have run Lua and the application's bindings, so its
+effects may be real; a discard never claims otherwise, and only a call that never
+started is known to have done nothing. The failure that ended a failed owner goes
+only to supervision: no caller receives the exception or a rendering of it.
+
+No path settles a call twice, loses an accepted call or lets a late result
+overwrite a settlement, including a submission that races stop, failure or
+cancellation. A call the owner has dequeued is marked in flight in the same
+transaction, and its settlement and the clearing of that mark are one more, so a
+call is always queued, in flight or settled.
+
+### Observing results
+
+`pollCall` reads a settlement without blocking. `waitCall` waits for it on any
+thread that is not running a Lua callback, and `awaitCall` waits on the
+application thread, composed with `awaitSupervised`, so a worker's terminal
+outcome is handled first and a fatal one is raised rather than waited out. Every
+accepted call settles, so a wait ends once the owner has run the call or exited.
+
+Reading a settlement is observing it. The first read that finds one gives the
+reservation back, and every later read answers the same settlement and gives
+nothing back, however many threads read it at once. `forgetCall` withdraws
+interest: a settled call gives its reservation back at once, an unsettled one when
+it settles, and the ticket can still be read. A ticket nobody observes or forgets
+keeps its reservation, which is what bounds the unobserved results.
+
+None of these is a transaction, and the adapter exposes no primitive a callback
+could block on.
+
+### Waiting from a callback is refused
+
+A thread running a binding's action or any other Lua callback, of this owner or of
+any other VM, may submit calls but may not wait for a reply, its own owner's
+included: it would be a synchronous call into a thread that may be waiting for it
+(D-13). `waitCall`, `awaitCall` and `startLuaOwner` check when they execute, and
+raise `CallbackWaitRefused` naming the operation (`wait-call`, `await-call`,
+`start-lua-owner`) at once. They never block, so a wait action built earlier
+outside the callback is refused the same way when the callback runs it.
+
+The detection is a process-wide record of the threads running a callback, kept by
+the bridge's callback entry, so it covers the callbacks of a VM that was created
+outside the adapter and the application's own capability-liveness checks, which
+run as callbacks too. It answers a boolean to the adapter and publishes no thread
+identity to application code. A thread a callback starts is not a callback thread,
+and nothing detects it: that stays outside the contract, as it does for the VM's
+own re-entry check.
+
+### Host failures and policy
+
+A Haskell failure raised by a binding's action or by the application's liveness
+check, or any other exception escaping the owner, including one escaping the VM's
+close, ends that owner's worker. It is the worker's primary outcome with its own
+type and context, the VM's close failures are retained beside it as cleanup
+evidence, and the adapter neither converts nor retries it. What follows is the
+owner's `WorkerPolicy`, as for any worker: an optional owner whose classifier
+recognizes the failure becomes `WorkerUnavailable` and every other owner goes on;
+every other outcome is fatal. A retained cleanup failure is always fatal, whatever
+the policy, so a recognized failure whose VM close also failed is `WorkerFatal`
+with the close evidence on it. A normal stop and a requested cancellation keep
+their usual supervision treatment.
+
+A failure is the host's by where it was raised, not by its type. A binding's action
+can throw a `BoundaryFault` or a `LuaFault`, and those are still the host's
+failures. The bridge marks a failure where it escapes application code, as an
+annotation on the exception's context, and the adapter reads the mark and not the
+type: an unmarked `BoundaryFault` or `LuaFault` is a fault of the call, settled as
+data, and a marked one ends the owner. The exception keeps its type and value. When
+a script catches a refusal the boundary made and then calls a binding whose action
+fails, the application's failure is the one the owner's boundary re-raises; in
+every other case the first failure of an operation is the one kept.
+
+### Stop, retire and the exit record
+
+Stopping an owner, through `retireOwner`, `stopSupervised`, or the boundary
+closing, closes admission first, so later submissions answer closed. The owner's
+thread then lets the in-flight call return with its own settlement, discards every
+queued call as not started and stopped, and lets `withVmOwner` close the VM on the
+worker's thread. Retiring an owner is stopping its worker, and owners are created
+and retired while others run.
+
+The same discarding happens on every other exit, a failure of the application's
+code and a cancellation included, with the way the owner exited recorded. In every
+case admission closes, and what had not settled is discarded, before the VM begins
+to close, because closing can block for as long as a finalizer runs and no call may
+be accepted meanwhile. The in-flight call of a failed or cancelled owner is
+discarded as started.
+
+The `ExitRecord`, read through `ownerExitRecord` once the owner has exited, names
+the owner's identity and label, how it exited, and counts the discarded calls, those
+that had started and those that had not, separately. It carries no cleanup
+evidence: that is supervision's, as the model's own `ExitRecord` keeps the two
+apart. A stuck in-flight call keeps the worker, its VM, the registration and the
+binding dependencies live, because nothing is detached and the boundary's drain
+still owns the worker.
+
+### What proves it
+
+The adapter's examples are their own suite, `lua-runtime-tests`, in the
+`runtime-lua-test/` source directory, beside the host's suite and leaving its
+examples unchanged. Every execution and lifecycle example acquires real VMs under
+a real `withSupervision`; the structural checks need no VM. They are coordinated
+with gates the bindings open as they are reached, never with sleeps. Cancellation
+and shutdown windows are the kind an asynchronous-exception race can hide on one
+platform, so CI, which runs them on Linux, is the evidence for them and a local
+pass is not.
+
+```bash
+cabal test hetoimasia-scripting-lua:lua-runtime-tests --test-show-details=direct
+```
+
+It also runs under `--project-file cabal.project.cpu`. The validation group is
+`test.scripting-lua-runtime`, non-optional, routed with `test.scripting-lua`; see
+[docs/validation.md](../../docs/validation.md).
+
 ## The protocol model
 
 The private `model` sublibrary (`model/`) is LUA-4: the vocabulary a scheduler,
@@ -1082,7 +1335,12 @@ worker unwound.
 | LUA-6, the scheduler | `ServiceClass`, `Quanta`, `Ordinal`, the ready/waiting states, `activateNext` |
 | LUA-7, requests and subscriptions | `RequestId`, `Settlement`, `Reply`, the two obligations, `OverloadPolicy` |
 | LUA-9, the child-process transport | every identity, `Payload`, `Reply`, `SegmentOutcome`, the rejection vocabulary |
-| LUA-5, supervision integration | `FailureRecord`, `RecoverySafety`, `ExitRecord` |
+| LUA-5, supervision integration | `Limits` and `validateLimits`, for the two caps its call dispatch has (`maxQueuedAdmissions`, `maxRetainedResults`) |
+
+LUA-5 takes nothing else from this model. It runs finite calls and no task, session
+or request yet, so the adapter has an exit record of its own, counting what its stop
+discarded, and the model's `FailureRecord`, `RecoverySafety` and `ExitRecord`, which
+describe a session of tasks, wait for the slices that run one.
 
 ## Running the suite
 
@@ -1094,7 +1352,14 @@ It also runs under `--project-file cabal.project.cpu`, which this package needs
 no GLFW SDK for. The validation group is `test.scripting-lua`; see
 [docs/validation.md](../../docs/validation.md).
 
-The owner's examples are the `VM owner` component of that same suite, and the
+The runtime adapter's examples are a suite of their own, whose validation group is
+`test.scripting-lua-runtime`:
+
+```bash
+cabal test hetoimasia-scripting-lua:lua-runtime-tests --test-show-details=direct
+```
+
+The owner's examples are the `VM owner` component of the host suite, and the
 bridge's own are the rest:
 
 ```bash
