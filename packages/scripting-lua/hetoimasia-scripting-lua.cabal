@@ -16,7 +16,7 @@ description:
     the VM's execution owner and is deferred until the native call and its
     bookkeeping finish; direct cancellation of a callback thread is unsupported
     and can end the process.
-    This library has no runtime, GLFW, Vulkan, console, or game dependency.
+    The host library has no runtime, GLFW, Vulkan, console, or game dependency.
     Beside the bridge, and sharing no dependency with it, the package owns the
     pure protocol model: bounded script tasks and their transitions, admission
     and its caps, single-settlement requests, owned subscriptions, session
@@ -28,8 +28,14 @@ description:
     owner a policy naming the namespaces it exposes; it supplies its own Lua
     modules under a name and version and calls their declared entry points.
     Every value crosses as a bounded copy checked against a schema, and a
-    refusal is a typed fault of the call. The scheduler and the confined path
-    are later slices.
+    refusal is a typed fault of the call. A public runtime-lua sublibrary, in a
+    source directory of its own, puts such owners under runtime supervision:
+    each is one supervised worker running its VM on its own thread, ready only
+    once its modules have loaded, with bounded non-blocking call submission,
+    exactly-once settlement of every accepted call, host failures left to
+    supervision, a protected stop that discards queued calls and records them,
+    and the refusal of a wait for a reply from inside any Lua callback. The
+    scheduler and the confined path are later slices.
 license: GPL-3.0-only
 license-file: LICENSE
 author: Vincent Coghlan

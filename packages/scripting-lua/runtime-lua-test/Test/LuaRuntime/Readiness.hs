@@ -138,12 +138,17 @@ spec = describe "readiness" $ do
             )
             >>= putMVar outcome . either Just (const Nothing)
       awaitEntered fixture "init"
+      -- The startup was acknowledged, so a creator parked in an STM wait is
+      -- parked in the readiness wait.
+      awaitBlockedOnSTM creator
       throwTo creator ThreadKilled
       takeMVar outcome >>= (`shouldSatisfy` maybe False ((== Just ThreadKilled) . fromException))
       releaseGate fixture "init"
-    -- The boundary returned without a failure: the worker was stopped and
-    -- drained, and its VM was closed, which its finalizer says.
-    awaitEntered fixture "closed"
+      -- The adapter asked the owner to stop, so with its initialization done it
+      -- stops and closes its VM, which its finalizer says, while the boundary
+      -- is still open.
+      awaitEntered fixture "closed"
+    -- The boundary then returned without a failure: the worker was drained.
     noted fixture >>= (`shouldBe` ["gc closed"])
   where
     isJustFault = maybe False (const True)
