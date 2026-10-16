@@ -491,6 +491,10 @@ closeVm vm = mask $ \restore → do
   case phase of
     Open → do
       writeIORef (vmPhaseRef vm) Closing
+      -- The close is an operation of its own: what an earlier operation ran, and
+      -- the module and entry point it was in, are not the finalizers'.
+      writeIORef (vmActionRuns vm) 0
+      writeIORef (vmRunContext vm) Nothing
       outcome ← try (teardown vm)
       writeIORef (vmPhaseRef vm) Closed
       putMVar (vmFinished vm) ()

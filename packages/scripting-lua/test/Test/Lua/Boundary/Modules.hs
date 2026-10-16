@@ -324,6 +324,11 @@ spec = describe "application-owned modules" $ do
         fmap (fmap refusalRule . refusal) endless `shouldSatisfy` pastALimit
         long ← timeout 10000000 (faulted (callEntry owned handle "add" (replicate 5 (VInteger 1))))
         fmap (fmap refusalRule . refusal) long `shouldBe` Just (Just (RuleArity 2 3))
+        nils ← loadModule owned (moduleOf "nils" "1" "function f(r) return r end" [required "f" [SRecord [("a", SOptional SInteger)]] [SRecord [("a", SOptional SInteger)]]])
+        endlessNils ← timeout 10000000 (faulted (callEntry owned nils "f" [VRecord (repeat ("a", VNil))]))
+        fmap (fmap refusalRule . refusal) endlessNils `shouldSatisfy` pastALimit
+        sentinel ← timeout 10000000 (faulted (callEntry owned nils "f" [VRecord (replicate 5000 ("a", VNil) ++ error "inspected past the limits")]))
+        fmap (fmap refusalRule . refusal) sentinel `shouldSatisfy` pastALimit
         lister ← loadModule owned (moduleOf "lister" "1" "function f(list) return list end" [required "f" [SList SInteger] [SList SInteger]])
         endlessList ← timeout 10000000 (faulted (callEntry owned lister "f" [VList (repeat (VInteger 1))]))
         fmap (fmap refusalRule . refusal) endlessList `shouldSatisfy` pastALimit

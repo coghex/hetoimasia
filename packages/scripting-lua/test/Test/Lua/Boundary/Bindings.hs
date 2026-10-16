@@ -146,6 +146,10 @@ spec = describe "bindings called from Lua" $ do
         required ← runFault owned "sample.nil_field()"
         fmap refusalRule (refusal required) `shouldBe` Just RuleNilInTable
         fmap refusalPath (refusal required) `shouldBe` Just [AtField "a"]
+        -- Inspection of nil fields is bounded like any other value: an endless
+        -- record of them is refused at the element limit.
+        endless ← runFault owned "sample.endless_nil()"
+        fmap refusalRule (refusal endless) `shouldBe` Just (RuleElementLimit 4096)
         -- An optional field that is nil is simply absent.
         run owned "local r = sample.nil_optional(); assert(r.a == 1 and r.b == nil and next(r, 'a') == nil)"
 

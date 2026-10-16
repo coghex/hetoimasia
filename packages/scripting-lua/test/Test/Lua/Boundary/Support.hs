@@ -155,6 +155,7 @@ sampleRegistration fixture = ok (registration [capabilityType "ticket" alive, ca
         , snapshotQuery "nil_list" [] [SList (SOptional SInteger)] (\_ → note fixture "nil_list" >> pure [VList [VInteger 1, VNil, VInteger 3]])
         , snapshotQuery "nil_field" [] [SRecord [("a", SInteger), ("b", SOptional SInteger)]] (\_ → note fixture "nil_field" >> pure [VRecord [("a", VNil), ("b", VNil)]])
         , snapshotQuery "nil_optional" [] [SRecord [("a", SInteger), ("b", SOptional SInteger)]] (\_ → note fixture "nil_optional" >> pure [VRecord [("a", VInteger 1), ("b", VNil)]])
+        , snapshotQuery "endless_nil" [] [SRecord [("a", SOptional SInteger)]] (\_ → note fixture "endless_nil" >> pure [VRecord (repeat ("a", VNil))])
         , snapshotQuery "wrong_result" [] [SInteger] (\_ → note fixture "wrong_result" >> pure [VText "not an integer"])
         , snapshotQuery "short_result" [] [SInteger, SInteger] (\_ → note fixture "short_result" >> pure [VInteger 1])
         , stateOperation "set_value" [SText, SInteger] [] $ \arguments → do

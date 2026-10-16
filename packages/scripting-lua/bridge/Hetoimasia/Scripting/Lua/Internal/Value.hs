@@ -525,7 +525,10 @@ conformValue context = go []
 -- far past them is refused after visiting what the limits allow, plus one.
 --
 -- Counted as the reader counts: every value is an element, a table's keys are
--- not, and bytes are the size of the encoding.
+-- not, and bytes are the size of the encoding. A record field that is nil is
+-- omitted from the encoding but is still inspected, so it is charged as the
+-- element and the bytes it would have been: the work is bounded by what is
+-- looked at, and an endless record of nil fields is refused like any other.
 checkLimits ∷ ValueLimits → [Value] → Either ValueRule ()
 checkLimits limits values = foldM_ (\acc value → walk 1 value acc) (0, 0) values
   where
@@ -534,7 +537,7 @@ checkLimits limits values = foldM_ (\acc value → walk 1 value acc) (0, 0) valu
       | elements + 1 > limitElements limits = Left (RuleElementLimit (limitElements limits))
       | otherwise = case value of
           VList items → table depth (bytes + 5, elements + 1) [(9, item) | item ← items]
-          VRecord entries → table depth (bytes + 5, elements + 1) [(5 + lengthWord8 name, item) | (name, item) ← entries, item /= VNil]
+          VRecord entries → table depth (bytes + 5, elements + 1) [(5 + lengthWord8 name, item) | (name, item) ← entries]
           scalar → within (bytes + scalarSize scalar, elements + 1)
     table depth (bytes, elements) entries
       | depth > limitDepth limits = Left (RuleDepthLimit (limitDepth limits))

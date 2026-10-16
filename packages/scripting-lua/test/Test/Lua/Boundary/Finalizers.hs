@@ -99,6 +99,27 @@ spec = describe "the finalizer allowlist" $ do
         Nothing → expectationFailure ("not a boundary fault: " <> show failure)
     logged fixture >>= (`shouldBe` [])
 
+  it "attributes a close-time fault to the close, not to the last operation the body ran" $ do
+    fixture ← newFixture
+    let config =
+          (sampleConfig fixture ["sample"])
+            { vmInitialChunks = [(chunkName "guard", chunk (guard' "sample.note_gc(1.5)"))]
+            }
+    outcome ← tryWithContext @SomeException . withOwnerOf config $ \owned → do
+      handle ← loadModule owned (ModuleSource (ModuleRef "busy" "1") (chunk "function go() sample.set_value('k', 1) end") [EntryPoint "go" Required [] []])
+      _ ← callEntry owned handle "go" []
+      pure ()
+    case outcome of
+      Right () → expectationFailure "the finalizer's fault was dropped"
+      Left failure → case causeOf failure of
+        Just fault → do
+          -- The module the body ran last, and the action it ran, are not the
+          -- finalizer's.
+          boundaryModule fault `shouldBe` Nothing
+          boundaryEntry fault `shouldBe` Nothing
+          boundaryEffect fault `shouldBe` LuaRan
+        Nothing → expectationFailure ("not a boundary fault: " <> show failure)
+
   it "runs an eligible binding from a finalizer of a module the owner loaded" $ do
     fixture ← newFixture
     withOwner fixture ["sample"] $ \owned → do

@@ -131,6 +131,14 @@ spec = describe "values and schemas" $ do
       encodedWith 65536 8 11 [integers 10] `shouldSatisfy` (not . isLeft)
       encodedWith 65536 8 11 [integers 11] `shouldBe` Left (RuleElementLimit 11)
 
+    it "bounds the inspection of nil record fields, which the encoding omits" $ do
+      let sentinel = error "inspected past the limits"
+          tailed = [("a", VNil), ("b", VNil), ("c", VNil)] ++ sentinel
+      encodedWith 65536 8 2 [VRecord tailed] `shouldBe` Left (RuleElementLimit 2)
+      encodedWith 65536 8 2 [VRecord (repeat ("a", VNil))] `shouldBe` Left (RuleElementLimit 2)
+      checkLimits (ValueLimits 65536 8 2) [VRecord (repeat ("a", VNil))] `shouldBe` Left (RuleElementLimit 2)
+      checkLimits (ValueLimits 65536 8 2) [VList (repeat VNil)] `shouldBe` Left (RuleElementLimit 2)
+
     it "is bounded in depth, at the bound and one past" $ do
       encodedWith 65536 2 4096 [VList [VList [VInteger 1]]] `shouldSatisfy` (not . isLeft)
       encodedWith 65536 2 4096 [VList [VList [VList []]]] `shouldBe` Left (RuleDepthLimit 2)
