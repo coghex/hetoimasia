@@ -77,10 +77,12 @@ data Fixture = Fixture
     -- ^ Another owner's VM, which @game.trespass@'s action tries to use.
   , fixtureAttempt ∷ !(IORef (Maybe Text))
     -- ^ How the last of those attempts was refused.
+  , fixtureChecks ∷ !(IORef Int)
+    -- ^ How many times the application's own liveness check ran.
   }
 
 newFixture ∷ IO Fixture
-newFixture = Fixture <$> newIORef [] <*> newIORef Map.empty <*> newIORef Set.empty <*> newIORef Nothing <*> newIORef Nothing <*> newIORef Nothing
+newFixture = Fixture <$> newIORef [] <*> newIORef Map.empty <*> newIORef Set.empty <*> newIORef Nothing <*> newIORef Nothing <*> newIORef Nothing <*> newIORef 0
 
 -- | Everything the bindings noted, oldest first.
 logged ∷ Fixture → IO [Text]
@@ -117,7 +119,9 @@ record = VRecord
 sampleRegistration ∷ Fixture → Registration
 sampleRegistration fixture = ok (registration [capabilityType "ticket" alive, capabilityType "badge" alive] [sample, other])
   where
-    alive key = Set.member key <$> readIORef (fixtureLive fixture)
+    alive key = do
+      atomicModifyIORef' (fixtureChecks fixture) (\held → (held + 1, ()))
+      Set.member key <$> readIORef (fixtureLive fixture)
     sample =
       namespace
         "sample"

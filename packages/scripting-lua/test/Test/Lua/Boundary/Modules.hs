@@ -7,6 +7,7 @@
 module Test.Lua.Boundary.Modules (spec) where
 
 import Control.Exception (SomeException, fromException, try)
+import Control.Monad (forM_)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import Data.IORef (newIORef, readIORef, writeIORef)
@@ -15,7 +16,7 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Text.Encoding (encodeUtf8)
 import Hetoimasia.Scripting.Lua.Owner
-import Hetoimasia.Scripting.Lua.Registration (maxArity)
+import Hetoimasia.Scripting.Lua.Registration (capabilityType, maxArity, registration)
 import Hetoimasia.Scripting.Lua.Value
 import System.Timeout (timeout)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
@@ -352,6 +353,58 @@ spec = describe "application-owned modules" $ do
           )
           [1 .. 20]
         references >>= (`shouldBe` before + 1)
+
+  describe "absent entry points and the application's own checks" $ do
+    it "resolves an absent optional entry point before validating arguments or running a liveness check" $ do
+      fixture ← newFixture
+      ticket ← grantTicket fixture 7
+      withOwner fixture [] $ \owned → do
+        handle ←
+          loadModule
+            owned
+            ( moduleOf
+                "absent"
+                "1"
+                "function needed() end\nfunction drop() needed = nil end"
+                [ optional "on_tick" [SInteger] []
+                , optional "on_ticket" [SCapability "ticket"] []
+                , required "needed" [SInteger] []
+                , required "drop" [] []
+                ]
+            )
+        let checks = readIORef (fixtureChecks fixture)
+        before ← checks
+        -- Arguments that would be refused do not matter: nothing is looked at.
+        callEntry owned handle "on_tick" [VFloat 1] >>= (`shouldBe` EntryAbsent)
+        callEntry owned handle "on_tick" [] >>= (`shouldBe` EntryAbsent)
+        callEntry owned handle "on_ticket" [ticket] >>= (`shouldBe` EntryAbsent)
+        callEntry owned handle "on_ticket" [VInteger 1] >>= (`shouldBe` EntryAbsent)
+        checks >>= (`shouldBe` before)
+        -- A required entry point that has gone is the fault, not the arguments.
+        _ ← callEntry owned handle "drop" []
+        gone ← faulted (callEntry owned handle "needed" [VText "wrong"])
+        boundaryReason gone `shouldBe` EntryMissing False
+        boundaryEffect gone `shouldBe` NoEffect
+        checks >>= (`shouldBe` before)
+
+    it "refuses a liveness check that calls back into its own owner, instead of waiting for it" $ do
+      selfRef ← newIORef Nothing
+      let checked = do
+            found ← readIORef selfRef
+            forM_ found $ \owned → run owned "touched = true"
+            pure True
+          built = either (error . show) id (registration [capabilityType "t" (const checked)] [])
+          config = (vmConfig libraries) {vmRegistration = built}
+      withOwnerOf config $ \owned → do
+        writeIORef selfRef (Just owned)
+        handle ← loadModule owned (moduleOf "live" "1" "function f(c) return c end" [required "f" [SCapability "t"] [SCapability "t"]])
+        outcome ← timeout 10000000 (try @VmReentered (callEntry owned handle "f" [VCapability (capability "t" 1)]))
+        case outcome of
+          Just (Left _) → pure ()
+          other → expectationFailure ("not a prompt VmReentered: " <> show (fmap (either show (const "returned")) other))
+        -- Nothing ran, and the owner is intact.
+        run owned "assert(touched == nil)"
+        writeIORef selfRef Nothing
 
   describe "bounded work" $ do
     it "refuses an oversized or endless argument list without counting or walking it" $ do

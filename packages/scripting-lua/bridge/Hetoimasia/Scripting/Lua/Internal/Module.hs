@@ -79,6 +79,7 @@ import Hetoimasia.Scripting.Lua.Internal.Vm
   , nextModuleSlot
   , operationActionRuns
   , raiseEscape
+  , runCallback
   , setRunContext
   , vmIdentity
   , withOpenVm
@@ -305,7 +306,10 @@ callEntry host handle name arguments =
             throwFailure luaComponent callOperation [] $
               (faultOf host CallEntry ref (Just name) reason) {boundaryEffect = effect, boundaryTraceback = trace}
           refuseArgument ∷ ∀ b. Int → [PathStep] → ValueRule → IO b
-          refuseArgument index path rule = fault (ValueRefused (ValueRefusal Arguments index path rule 0)) NoEffect Nothing
+          refuseArgument index path rule = do
+            -- The entry point is on the stack by now; nothing has run.
+            lua_settop state entry
+            fault (ValueRefused (ValueRefusal Arguments index path rule 0)) NoEffect Nothing
           -- Lua has run by now: a callback's failure outranks what is reported.
           afterLua ∷ ∀ b. FaultReason → Maybe Text → IO b
           afterLua reason trace = do
@@ -317,23 +321,6 @@ callEntry host handle name arguments =
       declared ← case [entryPoint | entryPoint ← handleEntries handle, entryName entryPoint == name] of
         entryPoint : _ → pure entryPoint
         [] → fault (ModuleRefused (EntryUndeclared name)) NoEffect Nothing
-      let schemas = entryArguments declared
-          -- At most one past the declared count is ever counted, so an oversized
-          -- or endless argument list costs no more to refuse than a small one.
-          given = length (take (length schemas + 1) arguments)
-      either (refuseArgument 0 []) pure (checkLimits limits arguments)
-      when (given /= length schemas) $
-        refuseArgument 0 [] (RuleArity (length schemas) given)
-      forM_ (zip3 [1 ..] schemas arguments) $ \(index, schema, value) →
-        case conformValue context schema value of
-          Left (path, rule) → refuseArgument index path rule
-          Right () → pure ()
-      forM_ (zip [1 ..] arguments) $ \(index, value) → do
-        retired ← retiredIn boundary value
-        forM_ retired $ \(path, typeName) → refuseArgument index path (RuleRetiredHandle typeName)
-      encoded ← case encodeValues context limits arguments of
-        Left rule → refuseArgument 0 [] rule
-        Right bytes → pure bytes
       setRunContext vm (moduleRefName ref, moduleRefVersion ref, Just name)
       found ← lookupEntry state (handleSlot handle) name
       case found of
@@ -355,6 +342,25 @@ callEntry host handle name arguments =
           lua_settop state entry
           fault EntryNotAFunction NoEffect Nothing
         LookupFunctionOnStack → do
+          let schemas = entryArguments declared
+              -- At most one past the declared count is ever counted, so an oversized
+              -- or endless argument list costs no more to refuse than a small one.
+              given = length (take (length schemas + 1) arguments)
+          either (refuseArgument 0 []) pure (checkLimits limits arguments)
+          when (given /= length schemas) $
+            refuseArgument 0 [] (RuleArity (length schemas) given)
+          forM_ (zip3 [1 ..] schemas arguments) $ \(index, schema, value) →
+            case conformValue context schema value of
+              Left (path, rule) → refuseArgument index path rule
+              Right () → pure ()
+          forM_ (zip [1 ..] arguments) $ \(index, value) → do
+            -- The application's own check is application code: it runs as a callback,
+            -- so a call it makes on this VM is refused and not waited for.
+            retired ← runCallback vm (retiredIn boundary value)
+            forM_ retired $ \(path, typeName) → refuseArgument index path (RuleRetiredHandle typeName)
+          encoded ← case encodeValues context limits arguments of
+            Left rule → refuseArgument 0 [] rule
+            Right bytes → pure bytes
           pushed ← pushValues state limits encoded (length arguments)
           case pushed of
             Pushed → pure ()
