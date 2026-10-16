@@ -471,6 +471,7 @@ vmConfig    ∷ [Library] → VmConfig
 evalOwned   ∷ OwnedVm → ChunkName → ByteString → IO ()
 callOwned   ∷ OwnedVm → Text → IO ()
 loadModule  ∷ OwnedVm → ModuleSource → IO ModuleHandle
+loadedModule ∷ OwnedVm → ModuleRef → IO (Maybe ModuleHandle)
 callEntry   ∷ OwnedVm → ModuleHandle → Text → [Value] → IO CallResult
 ```
 
@@ -629,7 +630,9 @@ asynchronous providers are later slices.
 ### Registration
 
 A `Registration` is plain data and closures, built once and validated where it is
-built: `registration ∷ [CapabilityType] → [Namespace] → Either
+built, and opaque: its parts are read with ordinary functions, and neither a
+registration, a namespace, a binding nor a `ValueLimits` has an exported record
+label, so none can be updated into one that skipped validation: `registration ∷ [CapabilityType] → [Namespace] → Either
 RegistrationRefusal Registration`. It holds application-named *namespaces* of
 named *bindings*, and the *capability types* the application's scripts may be
 handed. One registration is usable by any number of owners at once. A binding
@@ -693,8 +696,9 @@ A module is Lua source the application supplies under an identity, a name and a
 version (`ModuleSource`); the host reads nothing from disk and searches no path.
 It loads at initialization (`vmModules`; a failure ends the lifetime like an
 initial chunk) or from the body (`loadModule`), is known afterwards by an opaque
-`ModuleHandle`, and a second load under the same identity is refused: there is no
-live reload. Source is text only; a precompiled chunk is refused. Each module
+`ModuleHandle` (`loadedModule` gives the body the handle of a module supplied at
+initialization, by identity), and a second load under the same identity is
+refused: there is no live reload. Source is text only; a precompiled chunk is refused. Each module
 runs in an environment of its own (B1): its global assignments are private to it,
 and the owner's standard libraries and granted namespaces are visible to it by
 reading through to the globals. That is separation of names, not a security
@@ -732,6 +736,9 @@ capability. The rules:
 - Tables are read raw. A table carrying a metatable, even an empty one, is
   refused, so a copy never depends on a metamethod and none runs. A table that
   contains itself is refused as a cycle (sharing is not a cycle).
+- A nil cannot be kept in a Lua table, so it cannot cross inside one: a nil list
+  element, or a nil value for a record field that is not optional, is refused
+  with `RuleNilInTable`; an optional field that is nil is simply absent.
 - Functions, coroutines, light userdata, and userdata that is not a capability of
   this VM are refused with a typed reason; so is a table key that is neither an
   integer nor a string.
@@ -799,9 +806,11 @@ from, a bounded traceback when one was captured, a typed reason, and an `Effect`
 | `LuaRan` | Lua had run in the operation; no binding action had |
 | `BindingRan` | a binding's action had run: application state may have been changed |
 
-The traceback is produced by `luaL_traceback`, which consults no metamethod and
-runs no script-defined Lua, bounded at 2,048 bytes; failing to produce it leaves
-it out and never changes the fault. A non-string error value, or one whose handler
+The traceback is built from the debug interface's call records alone
+(`lua_getstack` and `lua_getinfo`; not `luaL_traceback`, whose function-name
+lookup reads the registry through metamethods), so no script-defined Lua can run
+while a fault is recorded, and it allocates nothing; it is bounded at 2,048 bytes
+and 22 levels. A non-string error value, or one whose handler
 failed, is reported by the existing bounded fallback (its Lua type name, never its
 `__tostring`). A fault never claims that recovery is safe: whether state may have
 changed is exactly `Effect`, and task and session identities arrive with later
