@@ -828,6 +828,23 @@ failed, is reported by the existing bounded fallback (its Lua type name, never i
 changed is exactly `Effect`, and task and session identities arrive with later
 slices.
 
+### Phases that execute nothing
+
+Allocating in Lua can start a collection step, and a step can run pending `__gc`
+finalizers: script-defined Lua that can call bindings. So the collector is held
+(stopped, and given back as it was found: a script that stopped it itself keeps it
+stopped) across every host-side phase — reading arguments, building results, the
+entry-point lookup, the set-up of the boundary's registry share, and a module load
+up to the moment its chunk starts. What the held collector owes is paid by the
+next script phase. Consequently:
+
+- looking an optional entry point up that the module does not define answers
+  `EntryAbsent` having run no Lua, finalizer, binding action or application
+  callback, and arguments are not even validated (the lookup comes first);
+- a load rejected before its chunk starts (a precompiled chunk, a syntax error, an
+  allocation failure while parsing) is `NoEffect`, because nothing executed; a load
+  that fails after the chunk started says what ran (`LuaRan` or `BindingRan`).
+
 ### Registry, stack and memory discipline
 
 Every operation leaves the stack at the depth it entered at, on every path: a
