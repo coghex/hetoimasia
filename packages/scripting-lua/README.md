@@ -953,8 +953,11 @@ recognizes it answers `OwnerUnavailable`, its status committed and the run
 continuing. At handoff admission is checked still to be live; an owner that ended
 without failing answers `OwnerEnded`, and a closed boundary `OwnerRejected`.
 
-A creator whose wait is abandoned, cancelled or woken by another worker's fatal
-outcome, asks the owner to stop. The worker group still owns the worker and
+Acquisition is masked from the worker's start to the endpoint's handoff, with
+only the readiness wait restored once the stop request is armed, so a cancellation
+cannot fall between the worker's start and that request, nor between the end of the
+wait and the handoff. A creator whose wait is abandoned, cancelled or woken by
+another worker's fatal outcome, asks the owner to stop. The worker group still owns the worker and
 drains it, and no detached helper exists. Creating an owner waits for readiness,
 so it is refused from a Lua callback (below).
 
@@ -1008,7 +1011,13 @@ The payload is prepared on the producer's thread before publication.
 lazy value is raised in the producer, and the owner's thread is handed nothing
 unevaluated. It checks them against the owner's value limits as it goes and stops
 at the first limit, so an endless or oversized argument list costs no more to
-refuse than a small one, and none of it is kept. A call whose arguments were over
+refuse than a small one, and none of it is kept. What is kept of an accepted call
+is compacted as well: every string in it, its values' and its routing strings (the
+module's name and version and the entry point's name), is copied to a buffer of its
+own, so a short slice never keeps the larger buffer it was cut from alive while the
+call waits, and a capability type name or routing string longer than any valid one
+is cut to one character past the longest valid one, which can only be refused, and
+is as much of it as a refusal will quote. A call whose arguments were over
 the limits is accepted like any other, carries only the rule they broke, and
 settles in its turn as the same `ValueRefused` fault the argument check raises,
 with `NoEffect`. Preparing is separate from `submitPrepared`, so the three-way

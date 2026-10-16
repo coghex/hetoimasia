@@ -64,6 +64,7 @@ These instructions are also the authority for Claude sessions through CLAUDE.md.
   `cabal test hetoimasia-runtime:runtime-tests --test-show-details=direct`,
   `cabal test hetoimasia-glfw:glfw-tests --test-show-details=direct`,
   `cabal test hetoimasia-scripting-lua:lua-host-tests --test-show-details=direct`,
+  `cabal test hetoimasia-scripting-lua:lua-runtime-tests --test-show-details=direct`,
   `cabal test hetoimasia-gpu-vulkan-model:gpu-model-tests --test-show-details=direct`,
   `cabal test hetoimasia-gpu-vulkan-diagnostics:diagnostics-tests --test-show-details=direct`,
   `cabal test --project-file cabal.project.cpu hetoimasia-math:math-tests --test-show-details=direct`,
@@ -120,6 +121,13 @@ These instructions are also the authority for Claude sessions through CLAUDE.md.
   that report the suite's whole construction record. Run one component with
   `--test-options='--match <Component>'` on the suite that owns it; a selector
   that matches no example fails the suite rather than reporting a silent pass.
+  `lua-runtime-tests` (`packages/scripting-lua/runtime-lua-test/`, composed by
+  `Test.LuaRuntime.Spec`, group `test.scripting-lua-runtime`) owns the runtime
+  adapter's examples: readiness, identity, submission and its bounds,
+  settlement, host failures, stop, independent owners, and the refused reply
+  wait from a Lua callback, with real VMs under a real `withSupervision`, plus
+  the adapter's dependency closure, which needs no VM. It selects and fails on
+  an empty selection the same way.
   Selectors moved with their examples: on the root suite, `--match Runtime`,
   `Resources`, `Recovery`, `Workers`, `Messaging`, `Logging`, `Failures`, and
   `GLFW` now select nothing and fail; on `runtime-tests`, `--match Supervision`
