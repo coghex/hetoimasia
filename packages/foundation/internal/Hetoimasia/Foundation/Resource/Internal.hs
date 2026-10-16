@@ -54,6 +54,7 @@ module Hetoimasia.Foundation.Resource.Internal
     -- * Release primitives
   , tryScope
   , attemptRelease
+  , recordCaughtFailure
   , retainCleanupFailure
   , retainCleanupFailures
 
@@ -96,6 +97,7 @@ import Hetoimasia.Foundation.Resource.Cleanup
   , cleanupFailureLabel
   , cleanupFailuresInContext
   , displayCleanupFailure
+  , recordCaughtFailure
   , retainCleanupFailure
   , retainCleanupFailures
   , tryScope

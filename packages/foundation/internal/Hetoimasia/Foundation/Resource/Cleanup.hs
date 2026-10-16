@@ -32,6 +32,7 @@ module Hetoimasia.Foundation.Resource.Cleanup
     -- * Release primitives
   , tryScope
   , attemptRelease
+  , recordCaughtFailure
   , retainCleanupFailure
   , retainCleanupFailures
   ) where
@@ -225,6 +226,23 @@ attemptRelease label release = uninterruptibleMask_ $ do
     Left caught → do
       identifier ← nextCleanupFailureId
       pure (Just (CleanupFailure identifier label caught))
+
+-- | Record a release failure the caller already caught, as cleanup evidence.
+--
+-- 'attemptRelease' runs a release itself and creates its entry from what the
+-- release threw. This is the other route into the same evidence: a caller that
+-- ran a release of its own, under a discipline of its own, and caught what it
+-- threw with 'tryWithContext', hands the caught exception and its label here
+-- and gets back an entry that is identified exactly as an 'attemptRelease'
+-- entry is. Nothing is run, nothing is masked, and nothing is rethrown.
+--
+-- The identity is issued here, now, so entries recorded in sequence are ordered
+-- by when they were recorded, and the payload is the one given and never
+-- changes afterwards: the invariant 'gatherFailures' reads the evidence by.
+recordCaughtFailure ∷ Text → ExceptionWithContext SomeException → IO CleanupFailure
+recordCaughtFailure label caught = do
+  identifier ← nextCleanupFailureId
+  pure (CleanupFailure identifier label caught)
 
 -- | Append one cleanup failure to the evidence an exception already carries.
 --

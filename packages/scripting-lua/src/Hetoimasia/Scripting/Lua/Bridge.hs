@@ -12,9 +12,11 @@
 -- empty list is a VM with no standard library at all. There is no way to
 -- register a Haskell function, because module identity, capability namespaces,
 -- and per-domain policy are LUA-3's and installing callbacks without them is
--- how a bridge acquires an unreviewable surface. There is no protected owner
--- that closes the VM for you, because that lifetime facility is LUA-2's; here
--- 'closeVm' is called explicitly and is terminal.
+-- how a bridge acquires an unreviewable surface. Here 'closeVm' is called
+-- explicitly and is terminal. A caller that wants the VM closed for it, with its
+-- failures and cancellation handled, uses the protected owner,
+-- "Hetoimasia.Scripting.Lua.Owner", whose VM is not a 'Vm' and so cannot be used
+-- or closed through anything in this module.
 --
 -- Failures arrive as ordinary Haskell exceptions. A Lua error is a 'LuaFault'
 -- with a bounded diagnostic; it did not unwind Haskell to get here. A Haskell
@@ -48,7 +50,13 @@ module Hetoimasia.Scripting.Lua.Bridge
   , ErrorValue (..)
   , VmClosed (..)
   , VmReentered (..)
+  , VmNotOwned (..)
+  , FinalizerRefused (..)
+  , FinalizerEvidenceTruncated (..)
   , CloseFault (..)
+  , CloseFailure (..)
+  , CloseSource (..)
+  , closeSourceLabel
   ) where
 
 import Hetoimasia.Scripting.Lua.Internal.Call
@@ -59,12 +67,18 @@ import Hetoimasia.Scripting.Lua.Internal.Call
   , evalChunk
   )
 import Hetoimasia.Scripting.Lua.Internal.Fault
-  ( CloseFault (..)
+  ( CloseFailure (..)
+  , CloseFault (..)
+  , CloseSource (..)
   , ErrorValue (..)
   , FaultKind (..)
+  , FinalizerEvidenceTruncated (..)
+  , FinalizerRefused (..)
   , LuaFault (..)
   , VmClosed (..)
+  , VmNotOwned (..)
   , VmReentered (..)
+  , closeSourceLabel
   )
 import Hetoimasia.Scripting.Lua.Internal.Library (Library (..))
 import Hetoimasia.Scripting.Lua.Internal.Vm (Vm, closeVm, newVm)

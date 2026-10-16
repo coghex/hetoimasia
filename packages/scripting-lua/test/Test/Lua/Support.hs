@@ -20,6 +20,8 @@ module Test.Lua.Support
   , runScoped
     -- * What the fixture observed
   , interpreterAcquisitions
+    -- * Reading a close's failures
+  , closeCauses
     -- * Observing what a VM did
   , Recorder
   , newRecorder
@@ -53,6 +55,7 @@ import Control.Concurrent.MVar
 import Control.Exception
   ( Exception
   , ErrorCall (ErrorCall)
+  , ExceptionWithContext (ExceptionWithContext)
   , SomeException
   , allowInterrupt
   , bracket
@@ -71,7 +74,14 @@ import GHC.Conc
   , ThreadStatus (..)
   , threadStatus
   )
-import Hetoimasia.Scripting.Lua.Bridge (Library, Vm, closeVm, newVm)
+import Hetoimasia.Scripting.Lua.Bridge
+  ( CloseFailure (closeFailureCause)
+  , CloseFault (closeFailures)
+  , Library
+  , Vm
+  , closeVm
+  , newVm
+  )
 import Hetoimasia.Scripting.Lua.Internal.Callback
   ( CallbackResult (NoResult)
   , installCallback
@@ -130,6 +140,11 @@ runScoped vm body = mask $ \restore → do
     (Right _, Left failure) → Left (CloseFailed failure)
     (Left failure, Right ()) → Left (BodyFailed failure Nothing)
     (Left failure, Left alsoFailed) → Left (BodyFailed failure (Just alsoFailed))
+
+-- | The exceptions a failed close collected, without their sources or contexts,
+-- in the order they were collected.
+closeCauses ∷ CloseFault → [SomeException]
+closeCauses fault = [cause | failure ← closeFailures fault, let ExceptionWithContext _ cause = closeFailureCause failure]
 
 -- | What a VM's callbacks recorded, newest last.
 newtype Recorder = Recorder (MVar [Text])

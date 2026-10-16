@@ -48,6 +48,25 @@
 -- from a finalizer during the close belongs to no operation, so the close
 -- drains it and reports it among the close's own failures.
 --
+-- A VM an owner constructed has a second guard the gate does not provide. The
+-- gate is mutual exclusion: any thread that takes it may run Lua, so on its own
+-- it says nothing about who the VM's one execution owner is. A managed VM
+-- therefore records the thread that constructed it, and an operation or a close
+-- asked by any other thread is refused with 'VmNotOwned' before the gate is
+-- taken, so a refused attempt changes nothing and the rightful owner is not
+-- disturbed. A VM made by 'newVm' alone has no such owner and keeps the gate's
+-- discipline only.
+--
+-- The close is the same one whoever asked: a VM whose construction failed part
+-- way is closed through 'closeVm', so a partly initialized state is torn down
+-- with the same masking, the same retained dependencies and the same evidence
+-- as a finished one, and a failure of that close is retained beside the
+-- construction's own failure rather than replacing it.
+--
+-- While a VM is closing, a callback its finalizers reach runs only if the VM's
+-- finalizer policy lets it, and the failures recorded then are bounded. See
+-- 'FinalizerPolicy' and 'finalizerEvidenceLimit'.
+--
 -- Nothing in this module is public. It holds the state and hands out stack
 -- indices; the package's public library exposes neither.
 module Hetoimasia.Scripting.Lua.Internal.Vm
@@ -56,6 +75,17 @@ module Hetoimasia.Scripting.Lua.Internal.Vm
   , Phase (..)
   , newVm
   , closeVm
+    -- * Construction
+  , VmSpec (..)
+  , unmanagedSpec
+  , FinalizerPolicy (..)
+  , allocateVm
+  , openLibraries
+  , failConstruction
+  , cleanupEvidence
+    -- * Finalizers
+  , finalizerAllowed
+  , finalizerEvidenceLimit
     -- * Operations
   , withOpenVm
     -- * Callbacks
@@ -86,12 +116,15 @@ import Control.Exception
   ( ExceptionWithContext (ExceptionWithContext)
   , SomeException
   , finally
+  , fromException
   , mask
   , mask_
   , onException
   , rethrowIO
   , throwIO
   , try
+  , tryWithContext
+  , uninterruptibleMask_
   )
 import Control.Monad (unless, when)
 import Data.ByteString (useAsCString)
@@ -99,9 +132,11 @@ import Data.Foldable (traverse_)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (delete)
 import Data.Maybe (maybeToList)
+import Data.Set (Set)
+import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Text
-import Foreign.C (CChar, CInt (CInt))
+import Foreign.C (CChar, CInt (CInt), CSize (CSize))
 import Foreign.Ptr (Ptr, nullPtr)
 import GHC.Stack (HasCallStack)
 import Hetoimasia.Foundation.Failure
@@ -111,14 +146,21 @@ import Hetoimasia.Foundation.Failure
   , throwFailure
   , withOperationContext
   )
+import Hetoimasia.Foundation.Resource (composeCleanup)
 import Hetoimasia.Scripting.Lua.Internal.Fault
-  ( CloseFault (CloseFault)
+  ( CloseFailure (CloseFailure)
+  , CloseFault (CloseFault)
+  , CloseSource (..)
   , ErrorValue (ErrorAbsent)
   , FaultKind (MemoryExhausted)
+  , FinalizerEvidenceTruncated (FinalizerEvidenceTruncated)
+  , FinalizerRefused
   , LuaFault (LuaFault)
   , VmClosed (VmClosed)
+  , VmNotOwned (VmNotOwned)
   , VmReentered (VmReentered)
   , classify
+  , closeSourceLabel
   , luaComponent
   , renderFailure
   )
@@ -133,7 +175,6 @@ import Lua
   , State (State)
   , StatusCode (StatusCode)
   , fromStackIndex
-  , lua_close
   , lua_gettop
   , lua_pushboolean
   , lua_settop
@@ -181,7 +222,56 @@ data Vm = Vm
     -- ^ The threads running one of this VM's callbacks right now. Each adds
     -- and removes only itself, and each reads it only to ask whether it is
     -- one, so it needs no gate.
+  , vmOwnerThread ∷ !(Maybe ThreadId)
+    -- ^ The VM's execution owner, for a VM an owner constructed: the one thread
+    -- that may run Lua on it or close it. 'Nothing' for a VM nobody owns.
+  , vmFinalizers ∷ !FinalizerPolicy
+    -- ^ What a callback a finalizer reaches may do while the VM closes.
+  , vmClosingDropped ∷ !(IORef Int)
+    -- ^ How many finalizer failures the close did not record, past
+    -- 'finalizerEvidenceLimit'.
   }
+
+-- | What a callback reached from a Lua finalizer may do while its VM closes.
+data FinalizerPolicy
+  = -- | Every callback runs, as it would from anywhere else. What a VM made by
+    -- 'newVm' alone has.
+    FinalizersUnrestricted
+  | -- | Only the named callbacks run. Any other is refused with
+    -- 'FinalizerRefused' without running, and the refusal is recorded as close
+    -- evidence. The empty set, the default for an owner, runs none.
+    FinalizersAllow !(Set Text)
+
+-- | Whether the VM's policy lets this callback run from a finalizer.
+finalizerAllowed ∷ Vm → Text → Bool
+finalizerAllowed vm name = case vmFinalizers vm of
+  FinalizersUnrestricted → True
+  FinalizersAllow allowed → name `Set.member` allowed
+
+-- | How many failures a close records from its finalizers, refusals included.
+--
+-- A finalizer is script-controlled and can fail as often as it can be called,
+-- so keeping every failure would let a script decide how much the close
+-- remembers. The first this many are kept, in the order they happened, and one
+-- further entry says how many were dropped ('FinalizerEvidenceTruncated').
+finalizerEvidenceLimit ∷ Int
+finalizerEvidenceLimit = 64
+
+-- | How a VM is made, beyond the libraries it opens.
+data VmSpec = VmSpec
+  { specBudget ∷ !(Maybe Int)
+    -- ^ A byte budget the interpreter's allocator holds itself to, for fixtures
+    -- that need an allocation failure at a chosen point. 'Nothing' is Lua's own
+    -- allocator.
+  , specOwner ∷ !(Maybe ThreadId)
+    -- ^ The VM's execution owner, if it has one.
+  , specFinalizers ∷ !FinalizerPolicy
+  }
+
+-- | A VM nobody owns, whose finalizers' callbacks all run, on Lua's allocator:
+-- what 'newVm' makes.
+unmanagedSpec ∷ VmSpec
+unmanagedSpec = VmSpec Nothing Nothing FinalizersUnrestricted
 
 -- | The interpreter's current phase.
 vmPhase ∷ Vm → IO Phase
@@ -218,13 +308,28 @@ probeReferenceSlot vm = do
 -- path here whose only option is the full standard library.
 --
 -- A library that fails to open leaves no state behind: the interpreter is
--- closed before the failure is raised.
+-- closed, through the same teardown any close runs, before the failure is
+-- raised, and a failure of that close is retained beside it.
 newVm ∷ [Library] → IO Vm
 newVm libraries = mask_ $ do
-  -- The one Lua operation that cannot be protected, because there is no state
-  -- yet to protect it with. It reports an allocation failure by answering a
-  -- null state rather than by raising, which is why it is the entry used.
-  state ← hetoimasia_lua_newstate
+  vm ← allocateVm unmanagedSpec
+  opened ← tryWithContext (openLibraries vm libraries)
+  case opened of
+    Right () → pure vm
+    Left failure → failConstruction vm failure
+
+-- | Allocate a VM and the control state around it, opening nothing.
+--
+-- The caller is masked, and the VM is the caller's from this return: whatever
+-- the caller does next, closing it is the caller's to do. The one Lua operation
+-- that cannot be protected, because there is no state yet to protect it with,
+-- reports an allocation failure by answering a null state rather than by
+-- raising, which is why it is the entry used.
+allocateVm ∷ VmSpec → IO Vm
+allocateVm spec = do
+  state ← case specBudget spec of
+    Nothing → hetoimasia_lua_newstate
+    Just limit → hetoimasia_lua_newstate_budgeted (fromIntegral (max 0 limit))
   unless (stateReachable state) $
     throwFailure
       luaComponent
@@ -238,13 +343,35 @@ newVm libraries = mask_ $ do
   releases ← newIORef []
   finished ← newEmptyMVar
   callers ← newIORef []
-  let vm = Vm state gate phase escape closing releases finished callers
-  opened ← try (traverse_ (openLibrary state) libraries)
-  case opened of
-    Right () → pure vm
-    Left failure → do
-      lua_close state
-      throwIO (failure ∷ SomeException)
+  dropped ← newIORef 0
+  pure (Vm state gate phase escape closing releases finished callers (specOwner spec) (specFinalizers spec) dropped)
+
+-- | Open exactly the named standard libraries, in order, as one operation of
+-- the VM: under its gate, by its owner, restoring the stack it borrowed.
+openLibraries ∷ Vm → [Library] → IO ()
+openLibraries vm libraries =
+  withOpenVm vm openOperation $ \state → traverse_ (openLibrary state) libraries
+
+-- | End a VM's construction that failed: close the VM through 'closeVm', so a
+-- partly initialized state is torn down as a finished one is, and raise the
+-- construction's failure with everything the close failed with retained beside
+-- it. The failure keeps its own type and context.
+failConstruction ∷ Vm → ExceptionWithContext SomeException → IO a
+failConstruction vm primary = do
+  closed ← tryWithContext (closeVm vm)
+  composed ← composeCleanup (Just primary) (either cleanupEvidence (const []) closed)
+  rethrowIO (maybe primary id composed)
+
+-- | The cleanup failures a failed close stands for, each under the label of
+-- its source, in the order they were recorded.
+--
+-- A 'CloseFault' stands for each failure it collected, with the context each
+-- was caught with; anything else is one failure of the close itself.
+cleanupEvidence ∷ ExceptionWithContext SomeException → [(Text, ExceptionWithContext SomeException)]
+cleanupEvidence failed@(ExceptionWithContext _ exception) = case fromException exception of
+  Just (CloseFault failures) →
+    [(closeSourceLabel source, cause) | CloseFailure source cause ← failures]
+  Nothing → [("lua close", failed)]
 
 -- | Open one standard library, with the whole @requiref@ inside one protected
 -- Lua call, restoring the stack it borrowed.
@@ -282,6 +409,7 @@ openLibrary state library = do
 withOpenVm ∷ HasCallStack ⇒ Vm → Operation → (State → IO a) → IO a
 withOpenVm vm name body = mask_ $ do
   refuseReentry vm name
+  refuseForeign vm name
   -- Interruptible, and deliberately the only interruptible point: a caller
   -- waiting for a VM that is busy may still be cancelled.
   takeMVar (vmGate vm)
@@ -320,6 +448,7 @@ abandon vm entry = do
 closeVm ∷ Vm → IO ()
 closeVm vm = mask $ \restore → do
   withOperationContext luaComponent closeOperation [] (refuseReentry vm closeOperation)
+  withOperationContext luaComponent closeOperation [] (refuseForeign vm closeOperation)
   takeMVar (vmGate vm)
   phase ← readIORef (vmPhaseRef vm)
   case phase of
@@ -350,6 +479,22 @@ refuseReentry vm name = do
   when (self `elem` callers) $
     throwFailure luaComponent name [] (VmReentered (operationText name))
 
+-- | Refuse an operation asked by a thread that is not this VM's execution
+-- owner, when it has one.
+--
+-- Made before the gate is taken and before anything is read from the VM's
+-- state, so a refused attempt runs no Lua and leaves no mark: the rightful
+-- owner, which may be inside the VM at this very moment, is not disturbed.
+refuseForeign ∷ HasCallStack ⇒ Vm → Operation → IO ()
+refuseForeign vm name = case vmOwnerThread vm of
+  Nothing → pure ()
+  Just owner → do
+    self ← myThreadId
+    phase ← readIORef (vmPhaseRef vm)
+    -- A closed VM has nothing left to own: every thread is told it is closed.
+    unless (self == owner || phase == Closed) $
+      throwFailure luaComponent name [] (VmNotOwned (operationText name))
+
 -- | Run a callback's action with its thread marked as one of this VM's
 -- callers, so that what it asks of this same VM is refused rather than left
 -- waiting for the operation that called it.
@@ -364,23 +509,40 @@ runCallback vm action = do
 --
 -- Every release is attempted; their failures, and any failure a Haskell
 -- finalizer raised while @lua_close@ ran it, are collected into one
--- 'CloseFault' rather than letting the first one hide the rest. A finalizer's
--- failure belongs to no caller's operation, so nothing else would ever observe
--- it.
+-- 'CloseFault' rather than letting the first one hide the rest, each with the
+-- context it was caught with and the source it came from. A finalizer's failure
+-- belongs to no caller's operation, so nothing else would ever observe it.
 teardown ∷ Vm → IO ()
 teardown vm = do
-  lua_close (vmState vm)
+  hetoimasia_lua_close (vmState vm)
   -- Every finalizer that failed, in the order they ran, and anything an
   -- operation left behind.
   escaped ← atomicModifyIORef' (vmClosingEscapes vm) (\held → ([], reverse held))
+  dropped ← atomicModifyIORef' (vmClosingDropped vm) (\count → (0, count))
   stranded ← takeEscape vm
   releases ← atomicModifyIORef' (vmReleases vm) (\retained → ([], retained))
-  outcomes ← traverse (try @SomeException) (reverse releases)
+  -- Each release runs uninterruptibly, as a scope's release does: it is a Haskell
+  -- release with a controlled blocking duration, so a cancellation of the owner
+  -- waits for it instead of being delivered inside it and mistaken for the
+  -- release's own failure. The close above, which runs Lua's finalizers, is not
+  -- run that way.
+  outcomes ← traverse (uninterruptibleMask_ . tryWithContext @SomeException) (reverse releases)
+  truncation ←
+    if dropped > 0
+      then do
+        recorded ← tryWithContext @SomeException (throwIO (FinalizerEvidenceTruncated dropped))
+        pure [CloseFailure FromTruncation captured | Left captured ← [recorded ∷ Either (ExceptionWithContext SomeException) ()]]
+      else pure []
   let finalizerFailures =
-        [failure | ExceptionWithContext _ failure ← escaped <> maybeToList stranded]
-      releaseFailures = [failure | Left failure ← outcomes]
-      failures = finalizerFailures <> releaseFailures
+        [CloseFailure (finalizerSource cause) captured | captured@(ExceptionWithContext _ cause) ← escaped]
+      strandedFailures = [CloseFailure FromStrandedOperation captured | captured ← maybeToList stranded]
+      releaseFailures = [CloseFailure FromRelease captured | Left captured ← outcomes]
+      failures = finalizerFailures <> truncation <> strandedFailures <> releaseFailures
   unless (null failures) (throwIO (CloseFault failures))
+  where
+    finalizerSource cause = case fromException cause of
+      Just (_ ∷ FinalizerRefused) → FromRefusedFinalizer
+      Nothing → FromFinalizer
 
 -- | Retain a dependency's release until after the VM's terminal close.
 --
@@ -402,8 +564,14 @@ recordEscape ∷ Vm → ExceptionWithContext SomeException → IO ()
 recordEscape vm captured = do
   phase ← readIORef (vmPhaseRef vm)
   case phase of
-    Closing →
-      atomicModifyIORef' (vmClosingEscapes vm) (\held → (captured : held, ()))
+    Closing → do
+      -- Bounded, because a finalizer is script-controlled: the first
+      -- 'finalizerEvidenceLimit' failures are kept and the rest only counted.
+      kept ←
+        atomicModifyIORef'
+          (vmClosingEscapes vm)
+          (\held → if length held >= finalizerEvidenceLimit then (held, False) else (captured : held, True))
+      unless kept (atomicModifyIORef' (vmClosingDropped vm) (\count → (count + 1, ())))
     _ →
       atomicModifyIORef'
         (vmEscape vm)
@@ -446,6 +614,19 @@ stateReachable (State pointer) = pointer /= nullPtr
 -- | A new interpreter, or a null state when one could not be allocated.
 foreign import ccall unsafe "hetoimasia_lua_bridge.h hetoimasia_lua_newstate"
   hetoimasia_lua_newstate ∷ IO State
+
+-- | A new interpreter whose allocator refuses to grow past a byte budget, or a
+-- null state when one could not be allocated within it.
+foreign import ccall unsafe "hetoimasia_lua_bridge.h hetoimasia_lua_newstate_budgeted"
+  hetoimasia_lua_newstate_budgeted ∷ CSize → IO State
+
+-- | Close an interpreter, running its finalizers, and release what its
+-- allocator owned.
+--
+-- @safe@: the finalizers it runs include Haskell callbacks, and the close can
+-- take as long as they do.
+foreign import ccall safe "hetoimasia_lua_bridge.h hetoimasia_lua_close"
+  hetoimasia_lua_close ∷ State → IO ()
 
 -- | Open one standard library, with the whole operation inside one protected
 -- Lua call.

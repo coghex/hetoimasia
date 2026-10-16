@@ -69,6 +69,7 @@ import Hetoimasia.Foundation.Resource
   , withResourceLabelled
   , withScoped
   )
+import qualified Test.Foundation.Resources.CallerCleanup as CallerCleanup
 import qualified Test.Foundation.Resources.Collection as Collection
 import qualified Test.Foundation.Resources.Cost as Cost
 import qualified Test.Foundation.Resources.Construction as Construction
@@ -271,6 +272,10 @@ spec = describe "Resources" $ do
   -- them early or at its scope's exit, so its examples group beside the
   -- constructors whose staged protection it reuses.
   Collection.spec
+
+  -- An owner that runs its own release records the failures it caught through
+  -- the same evidence, so its examples group with the scopes' own.
+  CallerCleanup.spec
 
   -- What inspecting retained evidence costs is part of the contract, and is
   -- observable only by measuring, so its examples group separately.
