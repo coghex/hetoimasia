@@ -21,7 +21,13 @@ module Hetoimasia.Scripting.Lua.Internal.Fault
     -- * Lifetime failures
   , VmClosed (..)
   , VmReentered (..)
+  , VmNotOwned (..)
+  , FinalizerRefused (..)
+  , FinalizerEvidenceTruncated (..)
   , CloseFault (..)
+  , CloseFailure (..)
+  , CloseSource (..)
+  , closeSourceLabel
     -- * Naming
   , luaComponent
     -- * Reading what a failed call left
@@ -31,7 +37,7 @@ module Hetoimasia.Scripting.Lua.Internal.Fault
   , diagnosticLimit
   ) where
 
-import Control.Exception (Exception, SomeException)
+import Control.Exception (Exception, ExceptionWithContext, SomeException)
 import qualified Data.ByteString as ByteString
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -145,14 +151,90 @@ newtype VmReentered = VmReentered
 
 instance Exception VmReentered
 
--- | Releasing the bridge's retained dependencies failed after the Lua state
--- was closed.
+-- | An operation was asked of a VM by a thread that is not its execution owner,
+-- and was refused rather than run.
 --
--- Every retained release is attempted; the failures are collected rather than
--- letting the first one hide the rest, and the Lua state is already closed by
--- the time any of them can be raised.
+-- A VM an owner constructed has exactly one execution owner, the thread that
+-- runs its protected lifetime, and only that thread may run Lua on it or close
+-- it. The refusal is made before the VM's gate is taken: it runs no Lua,
+-- changes no state and does not disturb the rightful owner, which goes on
+-- using the VM. Another thread holding a reference to the VM, whether it escaped
+-- the owner's body or was handed over on purpose, is refused every time, for as
+-- long as the VM is open. Once the VM is closed the answer is 'VmClosed'
+-- for every thread, since there is nothing left to own.
+newtype VmNotOwned = VmNotOwned
+  { notOwnedOperation ∷ Text
+  }
+  deriving (Eq, Show)
+
+instance Exception VmNotOwned
+
+-- | A callback reached from a Lua finalizer during the VM's shutdown was not on
+-- the owner's finalizer allowlist, and was refused without running.
+--
+-- It is raised inside the callback's own frame, so Lua sees an ordinary error
+-- it may catch with @pcall@, and it is also recorded for the close: the refusal
+-- becomes cleanup evidence ('CloseFault', as 'FromRefusedFinalizer') whether or
+-- not the finalizer's script handled the error.
+newtype FinalizerRefused = FinalizerRefused
+  { refusedCallback ∷ Text
+  }
+  deriving (Eq, Show)
+
+instance Exception FinalizerRefused
+
+-- | The close recorded fewer finalizer failures than there were: it keeps a
+-- bounded number, and says how many it did not keep.
+newtype FinalizerEvidenceTruncated = FinalizerEvidenceTruncated
+  { droppedFailures ∷ Int
+  }
+  deriving (Eq, Show)
+
+instance Exception FinalizerEvidenceTruncated
+
+-- | Where one close failure came from.
+data CloseSource
+  = -- | A Haskell callback a Lua finalizer ran failed.
+    FromFinalizer
+  | -- | A callback a finalizer reached was refused by the shutdown phase.
+    FromRefusedFinalizer
+  | -- | Releasing a retained dependency failed after the state was closed.
+    FromRelease
+  | -- | A failure an earlier operation left recorded and nothing raised.
+    FromStrandedOperation
+  | -- | Failures beyond the recording bound were dropped.
+    FromTruncation
+  deriving (Bounded, Enum, Eq, Show)
+
+-- | The label a close failure of this source is retained under as cleanup
+-- evidence.
+closeSourceLabel ∷ CloseSource → Text
+closeSourceLabel = \case
+  FromFinalizer → "lua finalizer"
+  FromRefusedFinalizer → "lua finalizer refused"
+  FromRelease → "lua release"
+  FromStrandedOperation → "lua operation"
+  FromTruncation → "lua evidence truncated"
+
+-- | One failure of the close, with where it came from and the context its
+-- exception was caught with.
+data CloseFailure = CloseFailure
+  { closeFailureSource ∷ !CloseSource
+  , closeFailureCause ∷ !(ExceptionWithContext SomeException)
+  }
+  deriving (Show)
+
+-- | Closing the VM failed after the Lua state was closed: a finalizer's
+-- callback failed or was refused, or releasing the bridge's retained
+-- dependencies failed.
+--
+-- Every retained release is attempted and every finalizer failure is kept, up
+-- to a bound; the failures are collected rather than letting the first one hide
+-- the rest, each with the context it was caught with, finalizers' in the order
+-- they ran and then the releases'. The Lua state is already closed by the time
+-- any of them can be raised.
 newtype CloseFault = CloseFault
-  { closeFailures ∷ [SomeException]
+  { closeFailures ∷ [CloseFailure]
   }
   deriving (Show)
 

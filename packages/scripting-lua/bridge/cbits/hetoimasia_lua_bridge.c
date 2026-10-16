@@ -2,6 +2,7 @@
 
 #include <lauxlib.h>
 #include <stdatomic.h>
+#include <stdlib.h>
 
 /* The metatable the carrier userdata wears. Its only entry that does anything
 ** is __gc; __metatable keeps a script from reaching or replacing it. */
@@ -22,6 +23,80 @@ long hetoimasia_lua_carriers_finalized(void)
 lua_State *hetoimasia_lua_newstate(void)
 {
   return luaL_newstate();
+}
+
+/* A byte budget an interpreter's allocator holds itself to. */
+typedef struct {
+  size_t limit;
+  size_t used;
+} hetoimasia_budget;
+
+/*
+** The allocator of a budgeted interpreter: Lua's own contract (a free always
+** succeeds; a request that cannot be met answers NULL, which Lua turns into its
+** memory error), with one more reason to refuse. Growing past the budget is
+** refused, shrinking and freeing never are.
+**
+** When `ptr` is NULL, `osize` is a type tag and not a size, so the old size is
+** taken as zero then.
+*/
+static void *budget_alloc(void *ud, void *ptr, size_t osize, size_t nsize)
+{
+  hetoimasia_budget *budget = (hetoimasia_budget *) ud;
+  size_t old = (ptr == NULL) ? 0 : osize;
+  void *grown;
+  if (nsize == 0) {
+    if (ptr != NULL) {
+      budget->used -= old;
+      free(ptr);
+    }
+    return NULL;
+  }
+  if (nsize > old && budget->used + (nsize - old) > budget->limit) {
+    return NULL;
+  }
+  grown = realloc(ptr, nsize);
+  if (grown != NULL) {
+    budget->used = budget->used - old + nsize;
+  }
+  return grown;
+}
+
+static int budget_panic(lua_State *L)
+{
+  (void) L;
+  return 0;
+}
+
+lua_State *hetoimasia_lua_newstate_budgeted(size_t limit)
+{
+  hetoimasia_budget *budget = (hetoimasia_budget *) malloc(sizeof(hetoimasia_budget));
+  lua_State *L;
+  if (budget == NULL) {
+    return NULL;
+  }
+  budget->limit = limit;
+  budget->used = 0;
+  L = lua_newstate(budget_alloc, budget);
+  if (L == NULL) {
+    free(budget);
+    return NULL;
+  }
+  /* What luaL_newstate does besides allocating: an unprotected error ends the
+  ** process rather than going unnoticed, and warnings are off. */
+  lua_atpanic(L, budget_panic);
+  lua_setwarnf(L, NULL, NULL);
+  return L;
+}
+
+void hetoimasia_lua_close(lua_State *L)
+{
+  void *ud = NULL;
+  lua_Alloc allocator = lua_getallocf(L, &ud);
+  lua_close(L);
+  if (allocator == budget_alloc) {
+    free(ud);
+  }
 }
 
 /*

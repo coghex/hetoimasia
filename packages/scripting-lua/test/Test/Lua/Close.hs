@@ -25,7 +25,7 @@ import Control.Exception
   , try
   )
 import Hetoimasia.Scripting.Lua.Bridge
-  ( CloseFault (closeFailures)
+  ( CloseFault
   , Library (LibraryBase)
   , Vm
   , VmClosed
@@ -39,7 +39,7 @@ import Hetoimasia.Scripting.Lua.Internal.Callback
   )
 import Hetoimasia.Scripting.Lua.Internal.Vm (Phase (Closed), vmPhase)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldContain)
-import Test.Lua.Support (ScopeFailure (BodyFailed, CloseFailed), acquireVm, runScoped)
+import Test.Lua.Support (ScopeFailure (BodyFailed, CloseFailed), acquireVm, closeCauses, runScoped)
 import Test.Support.Bounded (bounded)
 
 newtype BodyBroke = BodyBroke String
@@ -97,7 +97,7 @@ spec = describe "close" $ do
       Left (BodyFailed failed alsoFailed) → do
         fromException failed `shouldBe` Just (BodyBroke "the body failed")
         case alsoFailed >>= fromException of
-          Just fault → case closeFailures fault of
+          Just fault → case closeCauses fault of
             [retained] →
               fromException retained `shouldBe` Just (ReleaseBroke "the release failed")
             other → expectationFailure ("the close retained " <> show (length other) <> " failures")
@@ -111,7 +111,7 @@ spec = describe "close" $ do
       Right () → expectationFailure "the close failure was dropped"
       Left (BodyFailed _ _) → expectationFailure "a body failure was invented"
       Left (CloseFailed failed) → case fromException failed of
-        Just fault → length (closeFailures fault) `shouldBe` 1
+        Just fault → length (closeCauses fault) `shouldBe` 1
         Nothing → expectationFailure "the close raised something else"
 
   it "attempts every release rather than stopping at the first that failed" $ do
@@ -121,7 +121,7 @@ spec = describe "close" $ do
     outcome ← try @CloseFault (closeVm vm)
     case outcome of
       Right () → expectationFailure "the close reported success"
-      Left fault → length (closeFailures fault) `shouldBe` 2
+      Left fault → length (closeCauses fault) `shouldBe` 2
 
   it "cannot be cancelled into releasing early or into a retried partial close" $ do
     vm ← acquireVm [LibraryBase]
@@ -189,7 +189,7 @@ spec = describe "close" $ do
     outcome ← try @CloseFault (closeVm vm)
     case outcome of
       Right () → expectationFailure "the close reported success"
-      Left fault → case closeFailures fault of
+      Left fault → case closeCauses fault of
         [failed] → fromException failed `shouldBe` Just (ReleaseBroke "the finalizer failed")
         other → expectationFailure ("the close reported " <> show (length other) <> " failures")
 
@@ -210,8 +210,8 @@ spec = describe "close" $ do
     case outcome of
       Right () → expectationFailure "the close reported success"
       Left fault → do
-        length (closeFailures fault) `shouldBe` 2
-        let reported = [failed | Just failed ← map fromException (closeFailures fault)]
+        length (closeCauses fault) `shouldBe` 2
+        let reported = [failed | Just failed ← map fromException (closeCauses fault)]
         reported `shouldContain` [ReleaseBroke "first"]
         reported `shouldContain` [ReleaseBroke "second"]
 

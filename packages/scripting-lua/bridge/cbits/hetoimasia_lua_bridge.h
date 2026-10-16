@@ -46,6 +46,24 @@
 lua_State *hetoimasia_lua_newstate(void);
 
 /*
+** A new interpreter whose allocator refuses to grow past `limit` bytes in all,
+** or NULL if one could not be allocated, which a small enough limit makes it.
+**
+** For this package's own fixtures, which need an allocation failure at a chosen
+** point of an owner's construction and have no other way to make one. An
+** interpreter made here is closed only with `hetoimasia_lua_close`, which also
+** frees the budget its allocator holds.
+*/
+lua_State *hetoimasia_lua_newstate_budgeted(size_t limit);
+
+/*
+** Close an interpreter made by either constructor, running its finalizers, and
+** release whatever its allocator owned. This is what runs Haskell callbacks
+** from Lua finalizers, so it is called with a foreign call that can wait.
+*/
+void hetoimasia_lua_close(lua_State *L);
+
+/*
 ** Set `name` in the globals table to a Lua function backed by `function`.
 **
 ** Answers a Lua status code. On failure the error value is left on the stack,

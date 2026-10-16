@@ -41,7 +41,7 @@ import Hetoimasia.Foundation.Failure
   , operationText
   )
 import Hetoimasia.Scripting.Lua.Bridge
-  ( CloseFault (closeFailures)
+  ( CloseFault
   , Library (LibraryBase)
   , Vm
   , VmReentered (VmReentered)
@@ -76,6 +76,7 @@ import Test.Hspec
 import Test.Lua.Support
   ( Recorder
   , acquireVm
+  , closeCauses
   , detached
   , newRecorder
   , recorded
@@ -237,8 +238,8 @@ spec = describe "reentry" $ do
         Left fault → do
           -- Lua runs finalizers in its own order; which ran first is not the
           -- claim.
-          let refused = [operation | Just (VmReentered operation) ← map fromException (closeFailures fault)]
-          length (closeFailures fault) `shouldBe` 2
+          let refused = [operation | Just (VmReentered operation) ← map fromException (closeCauses fault)]
+          length (closeCauses fault) `shouldBe` 2
           sort refused `shouldBe` ["close-vm", "eval-chunk"]
 
   it "makes another thread's operation wait for the owner's call, then run it" $

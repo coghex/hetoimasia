@@ -19,6 +19,17 @@
 -- contract -- construct over a chosen library set, run a chunk, call a global,
 -- read a fault's bounded diagnostic, and close -- and its output is the
 -- evidence that the public surface is sufficient as well as narrow.
+--
+-- The VM owner (LUA-2) has clients of its own. Four must be rejected: one names
+-- the owned VM's constructor; one asks the owner's module for the Lua state or a
+-- native handle, for a way to close the VM, or for the callback registration that
+-- is LUA-3's; one hands an owned VM to the bridge's own operations, to run Lua on
+-- it or to close it behind the owner's back, which the types refuse because an
+-- owned VM is not the bridge's @Vm@; and one reaches into the private owner
+-- module. One must be accepted, linked and run: it uses the owner's whole public
+-- contract, including a reference that outlives its lifetime and one used from
+-- another thread, and its output shows each refused at run time, with 'VmClosed'
+-- and 'VmNotOwned', rather than used.
 module Test.Lua.Opacity (spec) where
 
 import Control.Exception (finally)
@@ -104,6 +115,68 @@ spec = describe "opacity across the package boundary" $ do
       clientOutput outcome `shouldContain` "hidden package"
       clientOutput outcome `shouldContain` "hetoimasia-scripting-lua"
       clientOutput outcome `shouldNotContain` "cannot satisfy"
+
+  it "rejects a client that names the owned VM's constructor" $
+    withClient "Client.hs" ownedConstructorClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "GHC-10237"
+      clientOutput outcome `shouldContain` "OwnedVm"
+
+  it "rejects a client asking the owner for a state, a native handle, a close or a callback registration" $
+    withClient "Client.hs" ownerSurfaceClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "does not export"
+      clientOutput outcome `shouldContain` "ownedInternalVm"
+      clientOutput outcome `shouldContain` "closeOwned"
+      clientOutput outcome `shouldContain` "installCallback"
+
+  it "rejects a client using the bridge's operations on an owned VM, to run Lua on it or close it" $
+    withClient "Client.hs" bridgeBypassClient $ \compile → do
+      outcome ← compile Typecheck
+      -- An owned VM is not the bridge's `Vm`: the type error names the two.
+      rejectedBecause outcome "GHC-83865"
+      clientOutput outcome `shouldContain` "OwnedVm"
+      clientOutput outcome `shouldContain` "Vm"
+
+  it "rejects a client reaching into the private owner module" $
+    withClient "Client.hs" privateOwnerClient $ \compile → do
+      outcome ← compile Typecheck
+      case clientStatus outcome of
+        ExitFailure _ → pure ()
+        ExitSuccess →
+          expectationFailure
+            ("the client compiled, so the owner's internals are reachable:\n" <> clientOutput outcome)
+      clientOutput outcome `shouldContain` "Hetoimasia.Scripting.Lua.Internal.Owner"
+      clientOutput outcome `shouldContain` "hidden package"
+      clientOutput outcome `shouldNotContain` "cannot satisfy"
+
+  it "accepts, links and runs a client using the whole public owner contract, a stale and a foreign reference refused" $
+    withClient "Main.hs" ownerPublicClient $ \compile → do
+      outcome ← compile Link
+      case clientStatus outcome of
+        ExitSuccess → pure ()
+        status →
+          expectationFailure
+            ( "the owner client must compile, but the compiler exited with "
+                <> show status
+                <> ":\n"
+                <> clientOutput outcome
+            )
+      (status, out, err) ←
+        readCreateProcessWithExitCode
+          (proc (clientDirectory outcome </> "client") []) {cwd = Just (clientDirectory outcome)}
+          ""
+      status `shouldBe` ExitSuccess
+      err `shouldBe` ""
+      lines out
+        `shouldBe` [ "initial chunk = ran"
+                   , "body = called"
+                   , "fault kind = CallFailed"
+                   , "failed initialization = CallFailed"
+                   , "after the lifetime = VmClosed {closedOperation = \"eval-chunk\"}"
+                   , "another thread = VmNotOwned {notOwnedOperation = \"eval-chunk\"}"
+                   , "after another thread = still ran"
+                   ]
 
   it "finds the dependency store without reading a project it cannot write to" $
     withSystemTempDirectory "hetoimasia-readonly" $ \directory → do
@@ -258,4 +331,110 @@ publicClient =
     , "    Left fault → putStrLn (\"opaque value = \" <> show (faultValue fault))"
     , "  closeVm vm"
     , "  putStrLn \"closed = ()\""
+    ]
+
+ownedConstructorClient ∷ String
+ownedConstructorClient =
+  unlines
+    [ "module Client (forged) where"
+    , ""
+    , "import Hetoimasia.Scripting.Lua.Owner (OwnedVm (OwnedVm))"
+    , ""
+    , "forged ∷ Maybe OwnedVm"
+    , "forged = Nothing"
+    ]
+
+ownerSurfaceClient ∷ String
+ownerSurfaceClient =
+  unlines
+    [ "module Client (reached) where"
+    , ""
+    , "import Hetoimasia.Scripting.Lua.Owner (ownedInternalVm, closeOwned, installCallback)"
+    , ""
+    , "reached ∷ ()"
+    , "reached = ()"
+    ]
+
+-- | A body that is handed an owned VM and gives it to the bridge's operations.
+bridgeBypassClient ∷ String
+bridgeBypassClient =
+  unlines
+    [ "{-# LANGUAGE OverloadedStrings #-}"
+    , "module Client (bypass) where"
+    , ""
+    , "import Hetoimasia.Scripting.Lua.Bridge (chunkName, closeVm, evalChunk)"
+    , "import Hetoimasia.Scripting.Lua.Owner (vmConfig, withVmOwner)"
+    , ""
+    , "bypass ∷ IO ()"
+    , "bypass = withVmOwner (vmConfig []) $ \\owned → do"
+    , "  evalChunk owned (chunkName \"bypass\") \"x = 1\""
+    , "  closeVm owned"
+    ]
+
+privateOwnerClient ∷ String
+privateOwnerClient =
+  unlines
+    [ "module Client (reached) where"
+    , ""
+    , "import Hetoimasia.Scripting.Lua.Internal.Owner (ownedInternalVm, OwnerConfig (ownerAllowlist))"
+    , ""
+    , "reached ∷ ()"
+    , "reached = ()"
+    ]
+
+-- | The owner's whole public contract, used the way a later slice would use it.
+ownerPublicClient ∷ String
+ownerPublicClient =
+  unlines
+    [ "{-# LANGUAGE OverloadedStrings #-}"
+    , "module Main (main) where"
+    , ""
+    , "import Control.Concurrent (forkIO)"
+    , "import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)"
+    , "import Control.Exception (try)"
+    , "import Hetoimasia.Scripting.Lua.Owner"
+    , "  ( FaultKind"
+    , "  , Library (LibraryBase)"
+    , "  , LuaFault (faultKind)"
+    , "  , VmClosed"
+    , "  , VmNotOwned"
+    , "  , VmConfig (vmInitialChunks)"
+    , "  , callOwned"
+    , "  , chunkName"
+    , "  , evalOwned"
+    , "  , vmConfig"
+    , "  , withVmOwner"
+    , "  )"
+    , ""
+    , "main ∷ IO ()"
+    , "main = do"
+    , "  escaped ← withVmOwner"
+    , "    (vmConfig [LibraryBase]) {vmInitialChunks = [(chunkName \"init\", \"function defined() end\")]}"
+    , "    $ \\owned → do"
+    , "      putStrLn \"initial chunk = ran\""
+    , "      callOwned owned \"defined\""
+    , "      putStrLn \"body = called\""
+    , "      raised ← try (evalOwned owned (chunkName \"raise\") \"error('boom')\")"
+    , "      case raised ∷ Either LuaFault () of"
+    , "        Right () → putStrLn \"fault kind = none\""
+    , "        Left fault → putStrLn (\"fault kind = \" <> show (faultKind fault ∷ FaultKind))"
+    , "      -- Another thread's use is refused while the VM is open, and the owner"
+    , "      -- goes on using it afterwards."
+    , "      refused ← newEmptyMVar"
+    , "      _ ← forkIO (try (evalOwned owned (chunkName \"foreign\") \"touched = true\") >>= putMVar refused)"
+    , "      elsewhere ← takeMVar refused"
+    , "      pure (owned, elsewhere)"
+    , "  let (owned, elsewhere) = escaped"
+    , "  failedInit ← try (withVmOwner (vmConfig [LibraryBase]) {vmInitialChunks = [(chunkName \"bad\", \"error('init')\")]} (\\_ → pure ()))"
+    , "  case failedInit ∷ Either LuaFault () of"
+    , "    Right () → putStrLn \"failed initialization = none\""
+    , "    Left fault → putStrLn (\"failed initialization = \" <> show (faultKind fault ∷ FaultKind))"
+    , "  late ← try (evalOwned owned (chunkName \"late\") \"late = true\")"
+    , "  case late ∷ Either VmClosed () of"
+    , "    Right () → putStrLn \"after the lifetime = ran\""
+    , "    Left refusal → putStrLn (\"after the lifetime = \" <> show refusal)"
+    , "  case elsewhere ∷ Either VmNotOwned () of"
+    , "    Right () → putStrLn \"another thread = ran\""
+    , "    Left refusal → putStrLn (\"another thread = \" <> show refusal)"
+    , "  putStrLn \"after another thread = still ran\""
     ]

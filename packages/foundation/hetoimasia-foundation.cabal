@@ -230,6 +230,7 @@ test-suite foundation-tests
         Test.Foundation.Recovery.Spec
         Test.Foundation.Recovery.Visibility
         Test.Foundation.Resources.Buffer
+        Test.Foundation.Resources.CallerCleanup
         Test.Foundation.Resources.Collection
         Test.Foundation.Resources.Construction
         Test.Foundation.Resources.Cost

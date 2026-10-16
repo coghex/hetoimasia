@@ -124,6 +124,7 @@ supportedClient =
     , "  , displayCleanupFailure"
     , "  , cleanupFailures"
     , "  , cleanupFailuresInContext"
+    , "  , composeCleanup"
     , "  )"
     , "import Hetoimasia.Foundation.Resource.Collection"
     , "  ( Collection"

@@ -30,6 +30,16 @@
 -- the operation that called it. The refusal is an ordinary failure of the
 -- callback's action, so it travels like one.
 --
+-- A callback reached from a Lua finalizer while its VM is closing runs only if
+-- the VM's finalizer policy allows its name; see
+-- 'Hetoimasia.Scripting.Lua.Internal.Vm.FinalizerPolicy'. A callback the policy
+-- refuses does not run: it fails with
+-- 'Hetoimasia.Scripting.Lua.Internal.Fault.FinalizerRefused', which Lua sees as
+-- an ordinary error and the close records as cleanup evidence whether or not the
+-- finalizer's script caught it. Every callback reached while the VM is closing
+-- is reached from a finalizer, because the close is the only thing running Lua
+-- then and it refuses every operation.
+--
 -- A callback borrows whatever Haskell state it closes over. Its release is
 -- retained on the VM and run only after the terminal close, because until
 -- @lua_close@ returns Lua can still call it. It is retained /before/ the
@@ -56,15 +66,18 @@ import Foreign.Ptr (Ptr, castPtr, nullPtr)
 import Foreign.StablePtr (StablePtr, deRefStablePtr, freeStablePtr, newStablePtr)
 import Foreign.Storable (peek)
 import GHC.Stack (HasCallStack)
-import Hetoimasia.Foundation.Failure (Operation, operation, withOperationContext)
+import Hetoimasia.Foundation.Failure (Operation, operation, throwFailure, withOperationContext)
 import Hetoimasia.Scripting.Lua.Internal.Call (reportFault)
-import Hetoimasia.Scripting.Lua.Internal.Fault (classify, luaComponent)
+import Hetoimasia.Scripting.Lua.Internal.Fault (FinalizerRefused (FinalizerRefused), classify, luaComponent)
 import Hetoimasia.Scripting.Lua.Internal.Vm
-  ( Vm
+  ( Phase (Closing)
+  , Vm
+  , finalizerAllowed
   , raiseEscape
   , recordEscape
   , retainRelease
   , runCallback
+  , vmPhase
   , withOpenVm
   )
 import Lua
@@ -135,7 +148,7 @@ installCallback vm name action release =
       status ←
         ByteString.unsafeUseAsCStringLen (Text.encodeUtf8 name) $ \(bytes, len) →
           alloca $ \acquired → do
-            carried ← newStablePtr (Installed vm action)
+            carried ← newStablePtr (Installed vm name action)
             reported ←
               hetoimasia_lua_publish state carried bytes (fromIntegral len ∷ CSize) acquired
             -- Freed here only when Lua never took it. Once the userdata holds
@@ -153,9 +166,9 @@ installCallback vm name action release =
           -- that fails.
           raiseEscape vm
 
--- | What a carrier's stable pointer holds: the VM the callback belongs to, and
--- the callback itself.
-data Installed = Installed !Vm !Callback
+-- | What a carrier's stable pointer holds: the VM the callback belongs to, the
+-- name it was installed under, and the callback itself.
+data Installed = Installed !Vm !Text !Callback
 
 -- | This package's entry from Lua into Haskell.
 --
@@ -193,10 +206,18 @@ hetoimasiaEnter state = mask $ \restore → do
       pure failedResults
     else do
       stored ← peek (castPtr carrier)
-      Installed vm action ← deRefStablePtr stored
+      Installed vm name action ← deRefStablePtr stored
+      -- While the VM closes, only a callback its finalizer policy names runs.
+      phase ← vmPhase vm
+      let refused = phase == Closing && not (finalizerAllowed vm name)
       -- Marked as this VM's caller while it runs, so that asking the same VM
       -- for an operation fails here instead of waiting on the caller's gate.
-      outcome ← runCallback vm (tryWithContext (restore action))
+      -- A refused callback never runs: its refusal is the failure, recorded
+      -- like any other that reached a callback.
+      outcome ←
+        if refused
+          then tryWithContext (throwFailure luaComponent refusedOperation [("callback", name)] (FinalizerRefused name))
+          else runCallback vm (tryWithContext (restore action))
       results ← case outcome ∷ Either (ExceptionWithContext SomeException) CallbackResult of
         Right NoResult → pure (NumResults 0)
         Right (BooleanResult value) → do
@@ -220,3 +241,6 @@ failedResults = NumResults (-1)
 
 installOperation ∷ Operation
 installOperation = operation "install-callback"
+
+refusedOperation ∷ Operation
+refusedOperation = operation "finalizer-callback"

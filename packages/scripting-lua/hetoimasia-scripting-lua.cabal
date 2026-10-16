@@ -20,8 +20,11 @@ description:
     Beside the bridge, and sharing no dependency with it, the package owns the
     pure protocol model: bounded script tasks and their transitions, admission
     and its caps, single-settlement requests, owned subscriptions, session
-    epochs, failure, and stop. The public module and capability registration
-    surface, the protected VM owner, and the scheduler are later slices.
+    epochs, failure, and stop. The protected VM owner is a public module of
+    its own: one VM held through a bracket-shaped IO lifetime that closes it on
+    every exit and keeps the primary failure and the close's failures as
+    cleanup evidence. The capability registration surface and the scheduler
+    are later slices.
 license: GPL-3.0-only
 license-file: LICENSE
 author: Vincent Coghlan
@@ -64,6 +67,7 @@ library bridge
         Hetoimasia.Scripting.Lua.Internal.Callback
         Hetoimasia.Scripting.Lua.Internal.Fault
         Hetoimasia.Scripting.Lua.Internal.Library
+        Hetoimasia.Scripting.Lua.Internal.Owner
         Hetoimasia.Scripting.Lua.Internal.Vm
     build-depends:
         base >=4.22 && <4.23,
@@ -82,7 +86,7 @@ library bridge
 -- is checking this stanza, and `Test.Lua.Protocol.Boundary` checks it here.
 --
 -- It is private because the types are a contract between this package's own
--- later slices -- the VM owner, the scheduler, the request and subscription
+-- later slices -- the scheduler, the request and subscription
 -- protocol, and the child-process transport -- not a public API. Nothing
 -- outside the package depends on it yet.
 library model
@@ -114,12 +118,14 @@ library model
 
 -- What a client outside this package may say: construct a VM over a chosen set
 -- of libraries, load and run a chunk, call a global the VM already defines, and
--- close it. Nothing here mentions the binding's types.
+-- close it; or, through the protected owner, run a body over a VM that the
+-- lifetime closes on every exit. Nothing here mentions the binding's types.
 library
     import: language
     hs-source-dirs: src
     exposed-modules:
         Hetoimasia.Scripting.Lua.Bridge
+        Hetoimasia.Scripting.Lua.Owner
     build-depends:
         base >=4.22 && <4.23,
         bytestring >=0.12 && <0.13,
@@ -155,9 +161,11 @@ executable lua-hazard
 
 -- The bridge's own contracts: the fault and cancellation transport, stack and
 -- registry discipline, the terminal close, independent execution, and the
--- selectable libraries, plus the export boundary the package promises -- and
--- the protocol model's, under the `Protocol` selector, which construct no
--- interpreter at all.
+-- selectable libraries, plus the export boundary the package promises -- the
+-- VM owner's, under the `VM owner` selector: the exit and evidence matrix,
+-- partial construction, cancellation, the shutdown phase, ownership and
+-- independent owners -- and the protocol model's, under the `Protocol`
+-- selector, which construct no interpreter at all.
 test-suite lua-host-tests
     import: language
     type: exitcode-stdio-1.0
@@ -171,6 +179,14 @@ test-suite lua-host-tests
         Test.Lua.Independence
         Test.Lua.Libraries
         Test.Lua.Opacity
+        Test.Lua.Owner.Cancellation
+        Test.Lua.Owner.Construction
+        Test.Lua.Owner.Independence
+        Test.Lua.Owner.Matrix
+        Test.Lua.Owner.Ownership
+        Test.Lua.Owner.Shutdown
+        Test.Lua.Owner.Spec
+        Test.Lua.Owner.Support
         Test.Lua.Protocol.Admission
         Test.Lua.Protocol.Boundary
         Test.Lua.Protocol.Determinism

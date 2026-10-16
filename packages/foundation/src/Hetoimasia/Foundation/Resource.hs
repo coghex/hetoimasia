@@ -54,6 +54,15 @@
 -- while a composite allocated inside it keeps the order its constructor
 -- declared.
 --
+-- 'composeCleanup' is the same failure table for an owner that runs its own
+-- release instead of handing one to a scope. A release that must not run under
+-- 'Control.Exception.uninterruptibleMask_' — an unrestricted native close, which
+-- can wait for as long as foreign code runs — cannot be a scope's release, so
+-- its owner masks it, runs it, catches what it threw, and gives the caught
+-- failures and the primary failure here. Nothing is run or masked by
+-- 'composeCleanup' itself; it issues the identities and attaches the evidence,
+-- with the precedence the scopes use.
+--
 -- Retained evidence is read back with 'cleanupFailures', which needs no
 -- logger. Every rethrow inside this module preserves the primary exception's
 -- 'Control.Exception.Context.ExceptionContext', so an annotation attached
@@ -93,6 +102,9 @@ module Hetoimasia.Foundation.Resource
   , allocComposite
   , locally
 
+    -- * Caller-run cleanup
+  , composeCleanup
+
     -- * Retained cleanup failures
   , CleanupFailure
   , cleanupFailureId
@@ -107,7 +119,8 @@ module Hetoimasia.Foundation.Resource
   ) where
 
 import Control.Exception
-  ( SomeException
+  ( ExceptionWithContext
+  , SomeException
   , mask
   , rethrowIO
   , someExceptionContext
@@ -128,9 +141,11 @@ import Hetoimasia.Foundation.Resource.Internal
   , cleanupFailuresInContext
   , displayCleanupFailure
   , lendAssembled
+  , recordCaughtFailure
   , releaseRank
   , restoredStep
   , retainCleanupFailure
+  , retainCleanupFailures
   , tryScope
   , withScoped
   )
@@ -173,6 +188,51 @@ withResourceLabelled label acquire release body = mask $ \restore → do
       rethrowIO (retainCleanupFailure failure (cleanupFailureException failure))
     (Left primary, Nothing) → rethrowIO primary
     (Left primary, Just failure) → rethrowIO (retainCleanupFailure failure primary)
+
+-- | Compose a primary failure and the cleanup failures a caller caught from a
+-- release it ran itself, by the failure table 'withResource' uses, without
+-- running or masking anything.
+--
+-- The primary is the exception the owner's body (or its own construction) ended
+-- with, if it ended with one, as caught with
+-- 'Control.Exception.tryWithContext'; each cleanup failure is a label naming the
+-- operation whose release threw and the exception it threw with the context it
+-- was caught with, in the order they were observed. The result is what the owner
+-- should end with, to be raised with 'Control.Exception.rethrowIO' so its type,
+-- value and context are kept:
+--
+-- * no primary and no cleanup failure: 'Nothing', nothing failed;
+-- * a primary and cleanup failures: the primary, unchanged in type, value and
+--   every annotation it already carried, with each cleanup failure retained
+--   beside it in observation order;
+-- * a primary and no cleanup failure: the primary, exactly as given;
+-- * no primary and cleanup failures: the first cleanup failure's exception is
+--   primary, as when only a release fails in a scope, and every failure
+--   including that first one is retained, so the outcome is both the failure
+--   and inspectable cleanup evidence ('cleanupFailures' reports it, and so does
+--   'cleanupFailuresInContext' on its context).
+--
+-- Each cleanup failure is given a fresh identity here, so recording one
+-- exception twice makes two entries and the evidence of exceptions nested in
+-- the failures' own contexts is read back without duplication, as it is for a
+-- scope's. Nested evidence a failure's exception already carried stays reachable
+-- through it, and the order of the result is the order of the list.
+--
+-- This is the seam for a release the scopes cannot run: it is not a way to hide
+-- a failure. A cleanup failure given here is cleanup evidence to anything that
+-- reads it, a supervisor included, and it is kept even when the primary is a
+-- cancellation.
+composeCleanup
+  ∷ Maybe (ExceptionWithContext SomeException)
+  → [(Text, ExceptionWithContext SomeException)]
+  → IO (Maybe (ExceptionWithContext SomeException))
+composeCleanup primary caught = do
+  failures ← traverse (uncurry recordCaughtFailure) caught
+  pure $ case (primary, failures) of
+    (Nothing, []) → Nothing
+    (Just carried, []) → Just carried
+    (Just carried, _) → Just (retainCleanupFailures failures carried)
+    (Nothing, first : _) → Just (retainCleanupFailures failures (cleanupFailureException first))
 
 -- | The cleanup failures retained by an exception a caller caught, in the
 -- order they were observed while the scopes unwound.
