@@ -12,14 +12,23 @@ the pure task, admission, request, subscription, epoch, failure, and stop types
 that later slices implement against. See
 [The protocol model](#the-protocol-model).
 
-The public module and capability registration surface, the protected VM owner,
-and any game binding are later slices of
+The **protected VM owner** (LUA-2) is here: one VM held through a bracket-shaped
+IO lifetime that closes it on every exit and keeps the primary failure and the
+close's failures as cleanup evidence. See [The VM owner](#the-vm-owner). The
+capability registration surface and any game binding are later slices of
 [the Lua runtime design](../../docs/lua_runtime_design.md). What is here is the
 boundary they will be built on, and the evidence that it holds.
 
 ## What the boundary exposes
 
-`Hetoimasia.Scripting.Lua.Bridge` is the whole public surface:
+Two modules are public. `Hetoimasia.Scripting.Lua.Owner` is the protected VM
+owner, described under [The VM owner](#the-vm-owner): `withVmOwner`, the owned
+VM it lends its body, and `evalOwned` and `callOwned` on it. A VM it constructs
+is an `OwnedVm`, which is not the bridge's `Vm`, so nothing below accepts it: no
+bridge operation can run Lua on a managed VM or close it behind its owner's back.
+
+`Hetoimasia.Scripting.Lua.Bridge` is the lower, unmanaged surface. Its callers
+close what they construct themselves, and it is what the owner is built on:
 
 - `newVm ∷ [Library] → IO Vm` and `closeVm ∷ Vm → IO ()`.
 - `evalChunk ∷ Vm → ChunkName → ByteString → IO ()` and
@@ -35,7 +44,8 @@ outside the package can depend on. `Test.Lua.Opacity` compiles clients that try
 each of those reaches and requires the compiler to refuse them, and one client
 that uses the whole public contract and requires it to link and run.
 
-Two absences are deliberate. There is no way to register a Haskell function:
+Two absences are deliberate, in both modules. There is no way to register a
+Haskell function:
 module identity, capability namespaces, and per-domain policy are LUA-3's, and
 installing callbacks without them is how a bridge acquires a surface nobody
 reviewed. And there is no call that opens "all the libraries": `newVm` takes the
@@ -413,10 +423,165 @@ own account.
 An unrestricted `lua_close` is deliberately **not** wired into
 `Hetoimasia.Foundation.Resource`'s `withResource`. The resource contract's
 release discipline is written for releases whose blocking is controlled, and
-claiming it here would assert a property this slice has not established. The
-close proof lives in the suite's own private fixture; the protected owner that
-will make that claim is LUA-2's.
+claiming it here would assert a property a close that runs arbitrary Lua
+finalizers does not have. The protected owner, below, is the facility that
+holds the VM's lifetime without making that claim: it masks the close itself and
+records what the close failed with through the foundation's evidence seam.
 
+A `CloseFault` collects each failure as a `CloseFailure`: where it came from
+(`FromFinalizer`, `FromRefusedFinalizer`, `FromRelease`, `FromStrandedOperation`
+or `FromTruncation`) and the exception with the context it was caught with, so a
+finalizer's or a release's own annotations are kept. A VM made by `newVm` is
+*unmanaged*: no thread owns it beyond the gate's mutual exclusion, and the
+callbacks its finalizers reach all run. A library that fails to open, in `newVm`
+or in an owner, closes the interpreter through this same close before the
+failure is raised, and a failure of that close is retained beside it.
+
+## The VM owner
+
+`Hetoimasia.Scripting.Lua.Owner` offers the protected IO lifetime of one VM
+(LUA-2; design P-3, D-1, D-15):
+
+```haskell
+withVmOwner ∷ VmConfig → (OwnedVm → IO r) → IO r
+data VmConfig = VmConfig { vmLibraries ∷ [Library], vmInitialChunks ∷ [(ChunkName, ByteString)] }
+vmConfig    ∷ [Library] → VmConfig
+evalOwned   ∷ OwnedVm → ChunkName → ByteString → IO ()
+callOwned   ∷ OwnedVm → Text → IO ()
+```
+
+`withVmOwner` constructs one VM over exactly the libraries named (the empty list
+opens none), loads the initial chunks inside the lifetime, hands the body that VM
+and only that VM, and closes it on every exit. It depends on foundation and the
+binding and on nothing else: no runtime, GLFW, Vulkan or game package (P-1).
+`OwnedVm` exposes no Lua state, stack index, registry reference, coroutine,
+closure or native address, and no way to close the VM: only the lifetime does.
+
+The lifetime, in order: the interpreter and its control state are allocated,
+masked (a failure here leaves nothing to close); initialization runs with the
+caller's masking state restored — the libraries in order, then the initial chunks
+in order; the body runs unless initialization failed; the VM is closed, whatever
+ended the steps before it; every cancellation still pending is taken at one
+place, and the outcome is composed. The VM is never reachable half-constructed:
+the body does not run unless every initialization step succeeded, and the VM a
+failed step leaves is closed through the same close before the failure is
+raised.
+
+### One owner per VM
+
+The gate is mutual exclusion, not identity: a thread that takes it may run Lua.
+A VM an owner constructed is stricter. It belongs to the thread that runs its
+lifetime, its execution owner, and an operation or a close asked by any other
+thread is refused with `VmNotOwned` *before* the gate is taken, so a refused
+attempt runs no Lua, changes nothing and does not disturb the rightful owner,
+which goes on using the VM. That holds for a thread the body started, for a second
+owner handed the first's VM, and for a reference that escaped the body, as long as
+the VM is open. After the lifetime every thread's attempt is refused with
+`VmClosed`. A callback's own attempt on its VM is `VmReentered`, as before.
+
+### Any number of independent owners (D-15)
+
+Owners are independent. Any number may be live at once, created and closed in any
+order, on any threads. No owner shares a VM, a Lua global state, a registry or a
+callback table with another, so closing, failing or cancelling one leaves every
+other one usable, its state unchanged and its evidence unaffected. There is no
+pool, scheduler or sharding across them: an owner is the thread running its
+lifetime.
+
+### The exit and evidence matrix
+
+Whatever ends the lifetime keeps its own type, value and context. The close's
+failures are retained beside it as cleanup evidence, each with the context it was
+caught with and under a label naming its source (`lua finalizer`, `lua finalizer
+refused`, `lua release`, `lua operation`, `lua evidence truncated`, `lua
+close`), through `composeCleanup`, the foundation's seam below. Evidence is read
+back with `cleanupFailures` or `cleanupFailuresInContext`, which is what a
+supervisor reads.
+
+| Exit | What the owner raises | Cleanup evidence |
+|---|---|---|
+| Body returns, close succeeds | The body's result | None |
+| Body fails, close succeeds | The body's failure, unchanged | None: a close that succeeded is never reported |
+| Body fails, close fails | The body's failure | Every close failure, finalizers' first then releases' |
+| Body returns, close fails | The first close failure | Every close failure, that first one included, so it is the failure and cleanup evidence at once |
+| Construction or initialization fails at any step | That failure, after the VM that was made is closed | Any failure of that close |
+| Cancellation before the lifetime | The cancellation; nothing was constructed | None |
+| Cancellation during initialization or the body | The cancellation, after the VM is closed | Any failure of the close |
+| Cancellation during the close | The cancellation, after the close has completed | Every close failure, on the cancellation |
+| Repeated cancellation | The first; the others are absorbed by it | As above |
+| Cancellation after the body failed | The cancellation, which supersedes the body's failure as it would for any scope | The close's failures; the body's failure stays reachable as the failure the cancellation was raised while handling (`WhileHandling`) |
+
+A cleanup failure stays cleanup, including when a cancellation is the primary
+failure: the exception raised is an asynchronous exception, which is what makes a
+worker's outcome cancelled, and its context carries the evidence a supervisor
+classifies as cleanup. It is never re-raised as a new script error that a
+supervisor would read as a normal stop.
+
+### The evidence seam in foundation
+
+`Hetoimasia.Foundation.Resource.composeCleanup` is the public seam that composes a
+primary failure with cleanup failures its caller *already caught* from a release
+it ran itself: it neither runs nor masks anything, issues each failure its
+identity, keeps every payload immutable, preserves contexts, nested evidence and
+order, and applies the failure table the scopes use. It is the minimal additive
+seam P-3 asked for, so the host imports no private foundation module. See
+[docs/resources.md](../../docs/resources.md#caller-run-cleanup).
+
+### Cancellation points
+
+Where a cancellation can be delivered is what the bridge already proves, not an
+assumption (see [Error and cancellation transport](#error-and-cancellation-transport)
+and the hazard probes): a thread inside a Lua call is not cancelled, because the
+call is `safe`, and the exception waits until it returns. Each bridge operation
+runs masked, so it lands at the boundary after the call's bookkeeping.
+
+| Where the owner is | A cancellation |
+|---|---|
+| Before `withVmOwner` | Lands outside the lifetime; nothing is constructed |
+| Allocating the VM | Deferred: masked |
+| Initializing or in the body, outside Lua | Delivered; ends that step; the VM is closed |
+| Initializing or in the body, inside a Lua call or a callback | Waits for the call to return, then as above |
+| Closing, including inside a finalizer | Deferred: the close is masked and cannot be interrupted; dependencies are released only after `lua_close` returns; it is taken afterwards |
+
+The close is *not* run as `uninterruptibleMask_`, and the owner is not a
+`withResource`. It is masked and runs once; if a finalizer never returns the
+owner waits as the thread running it does, retains the dependencies and never
+detaches the VM. Repeated cancellation therefore cannot abandon a live VM, free
+callback dependencies under it, or start a second close, and every cancellation
+that is pending when the close has finished is taken together, so a later one
+cannot supersede the exception that carries the evidence.
+
+### Shutdown phase and the finalizer allowlist
+
+Before the state closes the owner closes admission: every operation asked of the
+VM is refused. A callback reached from a Lua finalizer runs only if the owner's
+finalizer allowlist names it. The allowlist's default is empty, and LUA-3's
+registration supplies entries; this package's public configuration offers no way
+to add one. Any other callback is refused with `FinalizerRefused` without running,
+and the refusal is recorded as cleanup evidence even if the finalizer's script
+caught the error it raised. What is recorded from finalizers is bounded: the
+first 64 failures are kept in the order they happened, and one further entry says
+how many were dropped (`FinalizerEvidenceTruncated`). Finalizers cannot start
+asynchronous work, wait for another stopping service or re-enter the VM, because
+nothing but an allowlisted callback runs, and an operation on the VM is refused.
+
+### What proves it
+
+`Test.Lua.Owner.*` hold each part of this to expected values written in the
+tests. The exit matrix; partial construction at each step, with an allocator
+budget swept so that memory runs out at the state's allocation, while a library
+opens and while a chunk runs; cancellation before, during initialization, the
+body and the close, repeated, and with a failing close, with the cancellation
+delivered by coordinated blocking and never by sleeping; the shutdown phase and
+an empty allowlist, a denied callback performing no action and leaving evidence
+even when Lua caught its refusal, and the bound; ownership by a thread the body
+started, a second owner and a stale reference; and ten owners live at once on
+separate threads, ended in a scrambled order, one failing, one cancelled and one
+closed with a failing finalizer. `Test.Lua.Opacity` compiles the clients that try
+to reach a state or a native handle through the owner or to bypass it with the
+bridge's operations, and one that uses the whole public owner contract and links
+and runs. Cancellation tests prove ordering, not Linux behavior: CI is what runs
+them where an asynchronous-exception race can differ.
 
 ## The protocol model
 
@@ -616,6 +781,14 @@ cabal test hetoimasia-scripting-lua:lua-host-tests --test-show-details=direct
 It also runs under `--project-file cabal.project.cpu`, which this package needs
 no GLFW SDK for. The validation group is `test.scripting-lua`; see
 [docs/validation.md](../../docs/validation.md).
+
+The owner's examples are the `VM owner` component of that same suite, and the
+bridge's own are the rest:
+
+```bash
+cabal test hetoimasia-scripting-lua:lua-host-tests \
+  --test-show-details=direct --test-option=--match --test-option='VM owner'
+```
 
 The protocol model's examples are the `Protocol` component of that same suite:
 

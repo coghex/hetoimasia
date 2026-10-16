@@ -891,8 +891,10 @@ own.
 ### The evidence boundary
 
 A `CleanupFailure` is read-only outside the foundation package. Entries are
-created only where a release is attempted and throws, and each one is issued
-its `CleanupFailureId` at that moment. A caller reads an entry with the three
+created only where a release is attempted and throws — or where an owner that ran
+its own release hands the failure it caught to
+[`composeCleanup`](#caller-run-cleanup) — and each one is issued its
+`CleanupFailureId` at that moment. A caller reads an entry with the three
 readers above and reattaches it unchanged; there is no supported way to build
 one, and no supported way to alter one it was handed.
 
@@ -920,6 +922,48 @@ there to permit.
 
 Nothing counts entries or refuses a rewrite at run time; the guarantee is that
 the rewrite cannot be expressed, and it is checked when the client is compiled.
+
+### Caller-run cleanup
+
+```haskell
+composeCleanup ∷ Maybe (ExceptionWithContext SomeException)
+               → [(Text, ExceptionWithContext SomeException)]
+               → IO (Maybe (ExceptionWithContext SomeException))
+```
+
+The scopes run a release themselves, under `uninterruptibleMask_`, because the
+release contract assumes controlled blocking. An owner whose release cannot make
+that promise — an unrestricted native close that runs arbitrary foreign code, such
+as the Lua host's `lua_close` — cannot hand it to a scope, so it masks the release
+itself, runs it, and catches what it threw with `tryWithContext`.
+`composeCleanup` is how it records that, through the same evidence the scopes
+leave, without a private module and without the foundation running anything.
+
+Its arguments are the primary failure the owner's body (or construction) ended
+with, if it ended with one, and the caught cleanup failures, each with the label of
+the operation whose release threw, in the order they were observed. It returns
+what the owner should raise, with `rethrowIO`, so the primary keeps its type,
+value and context:
+
+| Primary | Cleanup failures | Result |
+|---|---|---|
+| None | None | `Nothing`: nothing failed |
+| Some | None | The primary, exactly as given |
+| Some | Some | The primary, with every cleanup failure retained beside it in observation order |
+| None | Some | The first cleanup failure's exception as primary, with every failure, that first one included, retained — as when only a release fails in a scope, so the outcome is the failure and inspectable cleanup evidence at once |
+
+That is the failure table above, from failures the caller caught. Each cleanup
+failure is issued a fresh identity at the call, so identities are ordered by when
+they were recorded and a payload never changes afterwards, which is the invariant
+[the evidence boundary](#the-evidence-boundary) rests on. Contexts a caught
+failure already carried, annotations and evidence nested in them, stay reachable
+through it and are read back without duplication. A cancellation as the primary
+stays an asynchronous exception and keeps the evidence on its context, which is
+what makes a worker's outcome `Cancelled` and its evidence cleanup.
+
+It is a seam for a release the scopes cannot run, not a way to hide a failure: a
+cleanup failure given to it is cleanup evidence to anything that reads it, a
+supervisor included.
 
 ### What inspection costs
 
