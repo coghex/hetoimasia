@@ -836,7 +836,14 @@ finalizers: script-defined Lua that can call bindings. So the collector is held
 stopped) across every host-side phase — reading arguments, building results, the
 entry-point lookup, the set-up of the boundary's registry share, and a module load
 up to the moment its chunk starts. What the held collector owes is paid by the
-next script phase. Consequently:
+next script phase: giving the collector back clears its debt, so the bytes a held
+phase allocated are kept as owed and paid as one step of that many kilobytes where
+script code may run — when a module's chunk starts, just before an entry point is
+called, and when a binding returns to its script — and a loop of crossings whose
+script phases allocate nothing cannot grow the heap without bound. The lookup
+itself walks the module's environment comparing keys in place and allocates
+nothing; calling a C function can still grow the stack and start a step, so it is
+held too. Consequently:
 
 - looking an optional entry point up that the module does not define answers
   `EntryAbsent` having run no Lua, finalizer, binding action or application
