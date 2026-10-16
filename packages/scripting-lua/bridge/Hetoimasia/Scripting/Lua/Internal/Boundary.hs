@@ -23,6 +23,7 @@ module Hetoimasia.Scripting.Lua.Internal.Boundary
   ( Boundary (..)
   , boundaryContext
   , ModuleRef (..)
+  , moduleChunk
   , BoundaryFault (..)
   , FaultOperation (..)
   , FaultReason (..)
@@ -33,6 +34,7 @@ module Hetoimasia.Scripting.Lua.Internal.Boundary
 
 import Control.Exception (Exception)
 import Data.Text (Text)
+import qualified Data.Text as Text
 import Hetoimasia.Scripting.Lua.Internal.Fault (ErrorValue, FaultKind)
 import Hetoimasia.Scripting.Lua.Internal.Registration
   ( BindingKind
@@ -71,6 +73,15 @@ data ModuleRef = ModuleRef
   , moduleRefVersion ∷ !Text
   }
   deriving (Eq, Ord, Show)
+
+-- | The chunk name a module is loaded under, for a reader and nothing more:
+-- control characters are replaced so it can never rewrite a diagnostic.
+moduleChunk ∷ ModuleRef → Text
+moduleChunk ref = Text.map tame (moduleRefName ref <> "@" <> moduleRefVersion ref)
+  where
+    tame character
+      | character < ' ' || character == '\DEL' || character == '\0' = '.'
+      | otherwise = character
 
 -- | What was being done when the fault happened.
 data FaultOperation

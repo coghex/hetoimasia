@@ -41,6 +41,7 @@ module Hetoimasia.Scripting.Lua.Internal.Binding
   , ensureValues
   ) where
 
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, fromException, toException)
 import Control.Monad (foldM, forM_, unless, when)
 import qualified Data.ByteString as ByteString
 import Data.List (nub)
@@ -61,6 +62,7 @@ import Hetoimasia.Scripting.Lua.Internal.Vm
   ( Vm
   , markValuesPrepared
   , noteActionRun
+  , amendEscape
   , operationActionRuns
   , runContext
   , valuesPrepared
@@ -130,7 +132,13 @@ valueHandler boundary vm space binding state restore = do
         -- traceback, and the module and entry point it was running, if any.
         (caller, traceback) ← captureContext state
         lua_settop state entry
-        running ← runContext vm
+        running0 ← runContext vm
+        -- The module the operation is running names the fault only if the call
+        -- was made from that module's own code. A finalizer of another module can
+        -- run at any allocation, and is not the entry point that was called.
+        let running = case running0 of
+              Just (name, version, _) | sameChunk (moduleChunk (ModuleRef name version)) caller → running0
+              _ → Nothing
         throwFailure luaComponent callOperation [("binding", qualified)] $
           (blankFault boundary CallBinding reason)
             { boundaryBinding = Just (space, bindingName binding)
@@ -190,6 +198,10 @@ valueHandler boundary vm space binding state restore = do
       -- Counted before it starts, so a fault of anything the action does is
       -- one that happened after an action ran.
       noteActionRun vm
+      -- A refusal the script caught and went on from is the operation's failure
+      -- (C1), and an action is about to run after it: what it reports as having
+      -- happened has to include that.
+      amendEscape vm upgradeEffect
       produced ← case action of
         ValuesAction run → restore (run values)
         CommandAction run → do
@@ -238,3 +250,18 @@ retiredIn boundary = go []
       VRecord entries → firstJust [go (AtField name : path) item | (name, item) ← entries]
       _ → pure Nothing
     firstJust = foldM (\found next → maybe next (pure . Just) found) Nothing
+
+-- | A recorded boundary fault, now known to have an action after it, says a
+-- binding's action ran.
+upgradeEffect ∷ ExceptionWithContext SomeException → ExceptionWithContext SomeException
+upgradeEffect captured@(ExceptionWithContext context exception) = case fromException exception of
+  Just fault | boundaryEffect fault < BindingRan → ExceptionWithContext context (toException (fault {boundaryEffect = BindingRan}))
+  _ → captured
+
+-- | Whether the chunk a call was made from is this module's. Lua shortens a
+-- chunk name to 59 bytes in the form a call record gives it, so a name that long
+-- is matched by its prefix.
+sameChunk ∷ Text → Maybe Text → Bool
+sameChunk chunk = \case
+  Nothing → False
+  Just seen → seen == chunk || (Text.length seen >= 59 && seen `Text.isPrefixOf` chunk)

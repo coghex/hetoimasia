@@ -354,7 +354,9 @@ spec = describe "bindings called from Lua" $ do
         boundaryReason lifecycle `shouldBe` NotYetSupported LifecycleOperation
         caught ← runFault owned "local ok = pcall(sample.spawn_async, 'x'); assert(ok == false); sample.set_value('after', 1)"
         boundaryReason caught `shouldBe` NotYetSupported AsynchronousNativeRequest
-        boundaryEffect caught `shouldBe` LuaRan
+        -- The refusal was the first failure, and an action ran after it: the
+        -- fault says so.
+        boundaryEffect caught `shouldBe` BindingRan
       -- Neither action ran, in any of the three calls.
       logged fixture >>= (`shouldBe` ["set_value"])
 

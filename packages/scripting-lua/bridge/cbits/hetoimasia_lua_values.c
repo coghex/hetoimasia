@@ -356,10 +356,11 @@ int hetoimasia_lua_read_values(
   *buffer = NULL;
   *length = 0;
 
+  /* A stack that cannot be had, or memory for the copy that cannot be had, is
+  ** the interpreter running out of memory and is answered as Lua answers it, not
+  ** as a refusal of the script's value. */
   if (count < 0 || !lua_checkstack(L, count + 6)) {
-    *refusal = HETOIMASIA_READ_STACK;
-    *argument = 1;
-    return LUA_OK;
+    return LUA_ERRMEM;
   }
   lua_pushcfunction(L, read_body);
   lua_pushlightuserdata(L, &r);
@@ -368,6 +369,10 @@ int hetoimasia_lua_read_values(
   }
   status = lua_pcall(L, 1 + count, 0, 0);
 
+  if (status == LUA_OK && (r.refusal == HETOIMASIA_READ_STACK || r.refusal == HETOIMASIA_READ_MEMORY)) {
+    status = LUA_ERRMEM;
+    r.refusal = 0;
+  }
   *visited = r.elements;
   *refusal = r.refusal;
   *argument = r.argument;
@@ -525,13 +530,17 @@ int hetoimasia_lua_push_values(
   w.malformed = 0;
   *malformed = 0;
   if (!lua_checkstack(L, 8)) {
-    *malformed = 2;
-    return LUA_OK;
+    return LUA_ERRMEM;
   }
   lua_pushcfunction(L, push_body);
   lua_pushlightuserdata(L, &w);
   lua_pushinteger(L, count);
   status = lua_pcall(L, 2, count, 0);
+  /* Stack that could not be reserved is memory running out, as above. */
+  if (status == LUA_OK && w.malformed == 2) {
+    status = LUA_ERRMEM;
+    w.malformed = 0;
+  }
   *malformed = w.malformed;
   return status;
 }

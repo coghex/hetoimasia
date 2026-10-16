@@ -93,6 +93,7 @@ module Hetoimasia.Scripting.Lua.Internal.Vm
     -- * Escaped Haskell failures
   , recordEscape
   , raiseEscape
+  , amendEscape
   , discardEscape
     -- * Retained dependencies
   , retainRelease
@@ -617,6 +618,10 @@ recordEscape vm captured = do
       atomicModifyIORef'
         (vmEscape vm)
         (\held → (maybe (Just captured) Just held, ()))
+
+-- | Change the recorded failure, if there is one, keeping the place it holds.
+amendEscape ∷ Vm → (ExceptionWithContext SomeException → ExceptionWithContext SomeException) → IO ()
+amendEscape vm change = atomicModifyIORef' (vmEscape vm) (\held → (fmap change held, ()))
 
 -- | Take the recorded failure, leaving none.
 takeEscape ∷ Vm → IO (Maybe (ExceptionWithContext SomeException))

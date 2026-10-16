@@ -63,6 +63,7 @@ workbench =
         , "function wrong() return 'text' end"
         , "function echo(list) return list end"
         , "function caught() return pcall(sample.add, 1.5, 2) end"
+        , "function many(...) return select('#', ...) end"
         ]
     )
     [ EntryPoint "add" Required [SInteger, SInteger] [SInteger]
@@ -70,6 +71,7 @@ workbench =
     , EntryPoint "wrong" Required [] [SInteger]
     , EntryPoint "echo" Required [SList SInteger] [SList SInteger]
     , EntryPoint "caught" Required [] [SBoolean]
+    , EntryPoint "many" Required (replicate 16 SInteger) [SInteger]
     ]
 
 -- | What the registry and the stack look like.
@@ -149,7 +151,7 @@ spec = describe "discipline" $ do
     it "is classified wherever it lands in installation, loading, calling and marshalling" $ do
       fixture ← newFixture
       outcomes ←
-        forM [0, 500 .. 160000] $ \budget → do
+        forM [0, 100 .. 160000] $ \budget → do
           slot ← newCaptured
           entered ← newIORef False
           seen ← newIORef []
@@ -166,6 +168,7 @@ spec = describe "discipline" $ do
             forM_ loaded $ \handle → do
               try' "call" (callEntry owned handle "add" [VInteger 1, VInteger 2])
               try' "echo" (callEntry owned handle "echo" [VList (map VInteger [1 .. 50])])
+              try' "many" (callEntry owned handle "many" (replicate 16 (VInteger 1)))
             atomicModifyIORef' seen (\held → (("load:" <> classify' loaded) : held, ()))
             try' "args" (evalOwned owned (chunkName "args") "local t = {} for i = 1, 200 do t[i] = i end sample.echo_list(t)")
             try' "results" (evalOwned owned (chunkName "results") "assert(#sample.make_list(200) == 200)")
@@ -204,9 +207,9 @@ spec = describe "discipline" $ do
       kinds `shouldSatisfy` elem "initial module"
       -- Every operation of the body was, somewhere in the sweep, refused for lack
       -- of memory in a classified way, and somewhere succeeded.
-      forM_ ["load", "call", "echo", "args", "results", "record"] $ \label →
+      forM_ ["load", "call", "echo", "many", "args", "results", "record"] $ \label →
         kinds `shouldSatisfy` any (\entry → (label <> ":memory") `Text.isPrefixOf` entry)
-      forM_ ["load", "call", "echo", "args", "results", "record"] $ \label →
+      forM_ ["load", "call", "echo", "many", "args", "results", "record"] $ \label →
         kinds `shouldSatisfy` elem (label <> ":ok")
 
 -- | How an operation of the sweep ended: it did, or it was refused for lack of
@@ -219,6 +222,5 @@ classify' = \case
     | Just (fault ∷ LuaFault) ← fromException failure, faultKind fault == MemoryExhausted → "memory in Lua"
     | Just (fault ∷ BoundaryFault) ← fromException failure → case boundaryReason fault of
         ScriptFailed MemoryExhausted _ → "memory at the boundary"
-        ValueRefused refused | refusalRule refused `elem` [RuleMemory, RuleStack] → "memory at the boundary"
         other → "unclassified " <> Text.pack (show other)
     | otherwise → "unclassified " <> Text.pack (show failure)

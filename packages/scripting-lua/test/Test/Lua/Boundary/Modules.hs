@@ -582,6 +582,42 @@ spec = describe "application-owned modules" $ do
           Just traceback → traceback `shouldSatisfy` Text.isInfixOf "caught@1:1"
           Nothing → expectationFailure "no traceback"
 
+    it "says an action ran when one runs after the refusal the entry point caught" $ do
+      fixture ← newFixture
+      withOwner fixture ["sample"] $ \owned → do
+        handle ←
+          loadModule
+            owned
+            (moduleOf "swallow" "1" "function go() pcall(sample.add, 1.5, 2); sample.set_value('k', 1) end" [required "go" [] []])
+        fault ← faulted (callEntry owned handle "go" [])
+        fmap refusalRule (refusal fault) `shouldBe` Just RuleFloatForInteger
+        boundaryEffect fault `shouldBe` BindingRan
+        -- Before any action, the same refusal says only that Lua ran.
+        early ←
+          loadModule owned (moduleOf "early" "1" "function go() pcall(sample.add, 1.5, 2) end" [required "go" [] []])
+        refusedEarly ← faulted (callEntry owned early "go" [])
+        boundaryEffect refusedEarly `shouldBe` LuaRan
+
+    it "does not name the running entry point for a fault a finalizer of another module raised" $ do
+      fixture ← newFixture
+      withOwner fixture ["sample"] $ \owned → do
+        trap ←
+          loadModule
+            owned
+            ( moduleOf
+                "trap"
+                "1"
+                "held = setmetatable({}, {__gc = function() sample.add('x', 1) end})\nfunction drop() held = nil end"
+                [required "drop" [] []]
+            )
+        other ← loadModule owned (moduleOf "other" "1" "function go() collectgarbage() end" [required "go" [] []])
+        _ ← callEntry owned trap "drop" []
+        fault ← faulted (callEntry owned other "go" [])
+        boundaryBinding fault `shouldBe` Just ("sample", "add")
+        boundaryChunk fault `shouldBe` "trap@1"
+        boundaryModule fault `shouldBe` Nothing
+        boundaryEntry fault `shouldBe` Nothing
+
     it "says a binding's action had run when an entry point fails after it" $ do
       fixture ← newFixture
       withOwner fixture ["sample"] $ \owned → do

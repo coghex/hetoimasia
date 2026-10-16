@@ -168,13 +168,8 @@ faultOf host op ref entry reason =
     , boundaryChunk = chunkOf ref
     }
 
--- | The chunk name a module is loaded under: for a reader, nothing more.
 chunkOf ∷ ModuleRef → Text
-chunkOf ref = Text.map tame (moduleRefName ref <> "@" <> moduleRefVersion ref)
-  where
-    tame character
-      | character < ' ' || character == '\DEL' || character == '\0' = '.'
-      | otherwise = character
+chunkOf = moduleChunk
 
 -- | The effect a fault has if it happens now, while Lua is running.
 effectNow ∷ Vm → IO Effect
