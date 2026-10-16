@@ -1,6 +1,7 @@
 #include "hetoimasia_lua_values.h"
 
 #include <lauxlib.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -653,49 +654,70 @@ int hetoimasia_lua_namespace(lua_State *L, const char *name, size_t length, int 
 /* Protected calls with a bounded traceback                                  */
 /* ------------------------------------------------------------------------ */
 
-typedef struct {
-  char *chunk;
-  size_t chunk_capacity;
-  size_t *chunk_length;
-  char *trace;
-  size_t trace_capacity;
-  size_t *trace_length;
-} context_arguments;
+/*
+** A traceback built from the debug interface's records alone.
+**
+** Not `luaL_traceback`: finding a function's global name there reads the
+** registry's loaded-module table with `lua_getfield`, which honours metamethods,
+** and a script that has the debug library can make that run Lua while a fault is
+** being recorded. `lua_getstack` and `lua_getinfo` with "Sln" read only the call
+** records and the function's prototype, allocate nothing and run nothing, so
+** neither can fail or be hooked. The text is bounded by `capacity` and the depth
+** by `TRACE_LEVELS`.
+*/
+#define TRACE_LEVELS 22
 
-static int context_body(lua_State *L)
+static size_t put(char *buffer, size_t capacity, size_t length, const char *text)
 {
-  context_arguments *a = (context_arguments *) lua_touserdata(L, 1);
+  size_t n = strlen(text);
+  if (length >= capacity) {
+    return length;
+  }
+  if (n > capacity - length) {
+    n = capacity - length;
+  }
+  memcpy(buffer + length, text, n);
+  return length + n;
+}
+
+static size_t build_traceback(lua_State *L, int first, char *buffer, size_t capacity)
+{
   lua_Debug ar;
-  size_t n;
-  const char *s;
   int level;
-  /* Level 0 is this function, level 1 the C function Lua called, and from level
-  ** 2 the callers: the first that is Lua code is the chunk the call was made
-  ** from, however many C functions (a pcall, say) lie between. */
-  for (level = 2; level < 18; level++) {
+  size_t length = put(buffer, capacity, 0, "stack traceback:");
+  for (level = first; level < first + TRACE_LEVELS; level++) {
+    char number[32];
     if (!lua_getstack(L, level, &ar)) {
-      break;
+      return length;
     }
-    if (lua_getinfo(L, "Sl", &ar) && ar.what[0] != 'C' && ar.short_src[0] != '\0') {
-      n = strlen(ar.short_src);
-      if (n > a->chunk_capacity) {
-        n = a->chunk_capacity;
-      }
-      memcpy(a->chunk, ar.short_src, n);
-      *a->chunk_length = n;
-      break;
+    lua_getinfo(L, "Sln", &ar);
+    length = put(buffer, capacity, length, "\n\t");
+    length = put(buffer, capacity, length, ar.short_src);
+    length = put(buffer, capacity, length, ":");
+    if (ar.currentline > 0) {
+      snprintf(number, sizeof number, "%d:", ar.currentline);
+      length = put(buffer, capacity, length, number);
+    }
+    length = put(buffer, capacity, length, " in ");
+    if (ar.namewhat[0] != '\0' && ar.name != NULL) {
+      length = put(buffer, capacity, length, ar.namewhat);
+      length = put(buffer, capacity, length, " '");
+      length = put(buffer, capacity, length, ar.name);
+      length = put(buffer, capacity, length, "'");
+    } else if (ar.what[0] == 'm') {
+      length = put(buffer, capacity, length, "main chunk");
+    } else if (ar.what[0] == 'C') {
+      length = put(buffer, capacity, length, "?");
+    } else {
+      snprintf(number, sizeof number, "<%d>", ar.linedefined);
+      length = put(buffer, capacity, length, "function ");
+      length = put(buffer, capacity, length, number);
     }
   }
-  luaL_traceback(L, L, NULL, 2);
-  s = lua_tolstring(L, -1, &n);
-  if (s != NULL) {
-    if (n > a->trace_capacity) {
-      n = a->trace_capacity;
-    }
-    memcpy(a->trace, s, n);
-    *a->trace_length = n;
+  if (lua_getstack(L, level, &ar)) {
+    length = put(buffer, capacity, length, "\n\t...");
   }
-  return 0;
+  return length;
 }
 
 int hetoimasia_lua_context(
@@ -703,21 +725,29 @@ int hetoimasia_lua_context(
   char *chunk, size_t chunk_capacity, size_t *chunk_length,
   char *trace, size_t trace_capacity, size_t *trace_length)
 {
-  context_arguments a;
-  a.chunk = chunk;
-  a.chunk_capacity = chunk_capacity;
-  a.chunk_length = chunk_length;
-  a.trace = trace;
-  a.trace_capacity = trace_capacity;
-  a.trace_length = trace_length;
+  lua_Debug ar;
+  int level;
   *chunk_length = 0;
   *trace_length = 0;
-  if (!lua_checkstack(L, 8)) {
-    return LUA_ERRMEM;
+  /* Level 0 is the C function Lua called; from level 1 the callers, and the first
+  ** that is Lua code is the chunk the call was made from, however many C
+  ** functions (a pcall, say) lie between. */
+  for (level = 1; level < 1 + TRACE_LEVELS; level++) {
+    if (!lua_getstack(L, level, &ar)) {
+      break;
+    }
+    if (lua_getinfo(L, "Sl", &ar) && ar.what[0] != 'C' && ar.short_src[0] != '\0') {
+      size_t n = strlen(ar.short_src);
+      if (n > chunk_capacity) {
+        n = chunk_capacity;
+      }
+      memcpy(chunk, ar.short_src, n);
+      *chunk_length = n;
+      break;
+    }
   }
-  lua_pushcfunction(L, context_body);
-  lua_pushlightuserdata(L, &a);
-  return lua_pcall(L, 1, 0, 0);
+  *trace_length = build_traceback(L, 1, trace, trace_capacity);
+  return LUA_OK;
 }
 
 typedef struct {
@@ -726,41 +756,19 @@ typedef struct {
   size_t *length;
 } trace_context;
 
-/* Runs under its own protected call, so that failing to build a traceback is a
-** traceback that is not there and never a different failure. */
-static int trace_body(lua_State *L)
-{
-  trace_context *t = (trace_context *) lua_touserdata(L, 1);
-  size_t n;
-  const char *s;
-  luaL_traceback(L, L, NULL, 2);
-  s = lua_tolstring(L, -1, &n);
-  if (s != NULL) {
-    if (n > t->capacity) {
-      n = t->capacity;
-    }
-    memcpy(t->buffer, s, n);
-    *t->length = n;
-  }
-  return 0;
-}
-
 /*
 ** The message handler. It returns the error value it was given, unchanged: the
-** traceback travels in the caller's buffer instead, so no failure of building it
-** can change what the call reports, and rendering the error stays what it was.
-** `luaL_traceback` consults no metamethod, so no script-defined Lua runs here.
+** traceback travels in the caller's buffer instead, so building it cannot change
+** what the call reports, and rendering the error stays what it was. The
+** traceback is built from the call records alone (see `build_traceback`), so no
+** script-defined Lua runs here and nothing can fail.
 */
 static int traceback_handler(lua_State *L)
 {
   trace_context *t = *(trace_context **) lua_getextraspace(L);
-  if (t != NULL && lua_checkstack(L, 6)) {
-    lua_pushcfunction(L, trace_body);
-    lua_pushlightuserdata(L, t);
-    if (lua_pcall(L, 1, 0, 0) != LUA_OK) {
-      lua_pop(L, 1);
-      *t->length = 0;
-    }
+  if (t != NULL) {
+    /* Level 0 is this handler, level 1 the function that raised the error. */
+    *t->length = build_traceback(L, 1, t->buffer, t->capacity);
   }
   lua_settop(L, 1);
   return 1;

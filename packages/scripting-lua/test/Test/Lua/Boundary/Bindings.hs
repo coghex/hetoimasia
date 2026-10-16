@@ -134,6 +134,21 @@ spec = describe "bindings called from Lua" $ do
       (_, listed) ← refused fixture "sample.echo_nested({{1}, {2, 3.5}})"
       refusalPath listed `shouldBe` [AtIndex 2, AtIndex 2]
 
+  describe "a nil in a table" $ do
+    it "refuses a result that Lua could not keep, with a typed reason, rather than dropping it" $ do
+      fixture ← newFixture
+      withOwner fixture ["sample"] $ \owned → do
+        list ← runFault owned "sample.nil_list()"
+        fmap refusalRule (refusal list) `shouldBe` Just RuleNilInTable
+        fmap refusalPath (refusal list) `shouldBe` Just [AtIndex 2]
+        fmap refusalSide (refusal list) `shouldBe` Just Results
+        boundaryEffect list `shouldBe` BindingRan
+        required ← runFault owned "sample.nil_field()"
+        fmap refusalRule (refusal required) `shouldBe` Just RuleNilInTable
+        fmap refusalPath (refusal required) `shouldBe` Just [AtField "a"]
+        -- An optional field that is nil is simply absent.
+        run owned "local r = sample.nil_optional(); assert(r.a == 1 and r.b == nil and next(r, 'a') == nil)"
+
   describe "what is refused without being read" $ do
     it "refuses a table carrying a metatable without consulting any metamethod" $ do
       fixture ← newFixture

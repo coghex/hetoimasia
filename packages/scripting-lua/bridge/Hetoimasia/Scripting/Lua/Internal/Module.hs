@@ -47,6 +47,7 @@ module Hetoimasia.Scripting.Lua.Internal.Module
   , loadModule
   , callEntry
   , liveModuleReferences
+  , loadedModule
     -- * Bounds
   , maxModules
   , maxSourceBytes
@@ -60,8 +61,8 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.List (nub)
-import Data.Set (Set)
-import qualified Data.Set as Set
+import Data.Map.Strict (Map)
+import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
@@ -131,11 +132,11 @@ data CallResult
 data Host = Host
   { hostVm ∷ !Vm
   , hostBoundary ∷ !Boundary
-  , hostLoaded ∷ !(IORef (Set ModuleRef))
+  , hostLoaded ∷ !(IORef (Map ModuleRef ModuleHandle))
   }
 
 newHost ∷ Vm → Boundary → IO Host
-newHost vm boundary = Host vm boundary <$> newIORef Set.empty
+newHost vm boundary = Host vm boundary <$> newIORef Map.empty
 
 -- | At most this many modules in one owner.
 maxModules ∷ Int
@@ -193,6 +194,14 @@ liveModuleReferences host =
         throwFailure luaComponent (operation "count-modules") [] $
           (blankFault (hostBoundary host) LoadModule (ScriptFailed (classify status) ErrorAbsent))
 
+-- | The handle of a module this owner has loaded, by identity: how the body gets
+-- at a module the owner loaded at initialization. Owner-checked like any other
+-- operation on the VM.
+loadedModule ∷ HasCallStack ⇒ Host → ModuleRef → IO (Maybe ModuleHandle)
+loadedModule host ref =
+  withOpenVm (hostVm host) (operation "lookup-module") $ \_ →
+    Map.lookup ref <$> readIORef (hostLoaded host)
+
 -- | Load a module in an environment of its own. See the module header.
 --
 -- Refused before anything runs: an identity or source that does not fit the
@@ -247,17 +256,18 @@ loadModule host source =
                   -- Lua catching the marker; the load fails then, and the slot
                   -- it just filled is emptied.
                   raiseEscape vm `onException` releaseModule state slot
-                  modifyIORef' (hostLoaded host) (Set.insert ref)
-                  pure (ModuleHandle (vmIdentity vm) slot ref (sourceEntries source))
+                  let handle = ModuleHandle (vmIdentity vm) slot ref (sourceEntries source)
+                  modifyIORef' (hostLoaded host) (Map.insert ref handle)
+                  pure handle
   where
     vm = hostVm host
     ref = sourceIdentity source
     required = [entryName entryPoint | entryPoint ← sourceEntries source, entryRequirement entryPoint == Required]
-    validate ∷ (ModuleProblem → IO ()) → Set ModuleRef → IO ()
+    validate ∷ (ModuleProblem → IO ()) → Map ModuleRef ModuleHandle → IO ()
     validate refuse loaded = do
       unless (validIdentity (moduleRefName ref) && validIdentity (moduleRefVersion ref)) (refuse InvalidModuleIdentity)
-      when (ref `Set.member` loaded) (refuse DuplicateModule)
-      when (Set.size loaded >= maxModules) (refuse (TooManyModules maxModules))
+      when (ref `Map.member` loaded) (refuse DuplicateModule)
+      when (Map.size loaded >= maxModules) (refuse (TooManyModules maxModules))
       when (ByteString.length (sourceText source) > maxSourceBytes) (refuse (SourceTooLarge maxSourceBytes))
       when (length (sourceEntries source) > maxEntries) (refuse (TooManyEntries maxEntries))
       let names = map entryName (sourceEntries source)
@@ -305,9 +315,12 @@ callEntry host handle name arguments =
         entryPoint : _ → pure entryPoint
         [] → fault (ModuleRefused (EntryUndeclared name)) NoEffect Nothing
       let schemas = entryArguments declared
-      when (length arguments /= length schemas) $
-        refuseArgument 0 [] (RuleArity (length schemas) (length arguments))
+          -- At most one past the declared count is ever counted, so an oversized
+          -- or endless argument list costs no more to refuse than a small one.
+          given = length (take (length schemas + 1) arguments)
       either (refuseArgument 0 []) pure (checkLimits limits arguments)
+      when (given /= length schemas) $
+        refuseArgument 0 [] (RuleArity (length schemas) given)
       forM_ (zip3 [1 ..] schemas arguments) $ \(index, schema, value) →
         case conformValue context schema value of
           Left (path, rule) → refuseArgument index path rule

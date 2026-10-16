@@ -258,6 +258,10 @@ data ValueRule
   | -- | A float where an integer is declared, integral or not.
     RuleFloatForInteger
   | RuleInvalidUtf8
+  | -- | A nil as a list element, or as the value of a record field that is not
+    -- optional. Lua cannot keep one in a table, so it cannot cross; an optional
+    -- record field that is nil is simply absent.
+    RuleNilInTable
   | -- | A list was declared and the table's keys are not exactly @1..n@.
     RuleNotASequence
   | -- | A record was declared and the table has a key that is not a string.
@@ -484,7 +488,12 @@ conformValue context = go []
       (SBytes, VBytes _) → Right ()
       (SText, VText _) → Right ()
       (SList element, VList values) →
-        sequence_ [go (AtIndex index : path) element item | (index, item) ← zip [1 ..] values]
+        sequence_
+          [ case item of
+              VNil → Left (reverse (AtIndex index : path), RuleNilInTable)
+              _ → go (AtIndex index : path) element item
+          | (index, item) ← zip [1 ..] values
+          ]
       (SRecord fields, VRecord entries) → do
         case [name | name ← nub (map fst entries), length (filter ((== name) . fst) entries) > 1] of
           name : _ → Left (reverse path, RuleDuplicateField name)
@@ -494,6 +503,9 @@ conformValue context = go []
           [] → Right ()
         sequence_
           [ case lookup name entries of
+              Just VNil → case fieldSchema of
+                SOptional _ → Right ()
+                _ → Left (reverse (AtField name : path), RuleNilInTable)
               Just item → go (AtField name : path) fieldSchema item
               Nothing → case fieldSchema of
                 SOptional _ → Right ()
@@ -522,7 +534,7 @@ checkLimits limits values = foldM_ (\acc value → walk 1 value acc) (0, 0) valu
       | elements + 1 > limitElements limits = Left (RuleElementLimit (limitElements limits))
       | otherwise = case value of
           VList items → table depth (bytes + 5, elements + 1) [(9, item) | item ← items]
-          VRecord entries → table depth (bytes + 5, elements + 1) [(5 + lengthWord8 name, item) | (name, item) ← entries]
+          VRecord entries → table depth (bytes + 5, elements + 1) [(5 + lengthWord8 name, item) | (name, item) ← entries, item /= VNil]
           scalar → within (bytes + scalarSize scalar, elements + 1)
     table depth (bytes, elements) entries
       | depth > limitDepth limits = Left (RuleDepthLimit (limitDepth limits))
@@ -568,8 +580,11 @@ encodeOne context limits depth = \case
   VFloat value → Right (Builder.word8 0x04 <> Builder.word64LE (castDoubleToWord64 value), 9, 1)
   VBytes bytes → Right (stringBuilder bytes, 5 + ByteString.length bytes, 1)
   VText text → let bytes = Text.encodeUtf8 text in Right (stringBuilder bytes, 5 + ByteString.length bytes, 1)
-  VList items → table depth [(KeyIndex index, item) | (index, item) ← zip [1 ..] items]
-  VRecord entries → table depth [(KeyName name, item) | (name, item) ← entries]
+  VList items
+    | any isNil items → Left RuleNilInTable
+    | otherwise → table depth [(KeyIndex index, item) | (index, item) ← zip [1 ..] items]
+  -- A nil field is an absent one.
+  VRecord entries → table depth [(KeyName name, item) | (name, item) ← entries, not (isNil item)]
   VCapability capability → do
     issuer ← case capabilityIssuer capability of
       Nothing → Right (contextVm context)
@@ -580,6 +595,9 @@ encodeOne context limits depth = \case
     let VmIdentity identity = issuer
     Right (Builder.word8 0x07 <> Builder.word64LE identity <> Builder.word32LE number <> Builder.word64LE (capabilityKey capability), 21, 1)
   where
+    isNil = \case
+      VNil → True
+      _ → False
     stringBuilder bytes = Builder.word8 0x05 <> Builder.word32LE (fromIntegral (ByteString.length bytes)) <> Builder.byteString bytes
     table level entries
       | level + 1 > limitDepth limits = Left (RuleDepthLimit (limitDepth limits))

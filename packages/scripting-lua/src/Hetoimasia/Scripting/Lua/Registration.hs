@@ -96,4 +96,73 @@ module Hetoimasia.Scripting.Lua.Registration
   , standardGlobals
   ) where
 
-import Hetoimasia.Scripting.Lua.Internal.Registration
+import Data.Text (Text)
+import Hetoimasia.Scripting.Lua.Internal.Registration hiding
+  ( bindingArguments
+  , bindingConfined
+  , bindingDirect
+  , bindingFinalizer
+  , bindingKind
+  , bindingName
+  , bindingResults
+  , capabilityName
+  , namespaceBindings
+  , namespaceName
+  , registrationCapabilityTypes
+  , registrationNamespaces
+  )
+import qualified Hetoimasia.Scripting.Lua.Internal.Registration as Internal
+import Hetoimasia.Scripting.Lua.Value (Schema)
+
+-- The readings below are ordinary functions and not the record labels of the
+-- types they read: a label that is exported can be used in a record update, and
+-- an update would build a registration, a namespace or a binding that skipped
+-- the validation 'registration' applies. Nothing here can be updated.
+
+-- | The namespaces of a registration, in the order they were given.
+registrationNamespaces ∷ Registration → [Namespace]
+registrationNamespaces = Internal.registrationNamespaces
+
+-- | The capability types of a registration, in the order they were given.
+registrationCapabilityTypes ∷ Registration → [CapabilityType]
+registrationCapabilityTypes = Internal.registrationCapabilityTypes
+
+-- | A namespace's name.
+namespaceName ∷ Namespace → Text
+namespaceName = Internal.namespaceName
+
+-- | A namespace's bindings.
+namespaceBindings ∷ Namespace → [Binding]
+namespaceBindings = Internal.namespaceBindings
+
+-- | A capability type's name.
+capabilityName ∷ CapabilityType → Text
+capabilityName = Internal.capabilityName
+
+-- | A binding's name.
+bindingName ∷ Binding → Text
+bindingName = Internal.bindingName
+
+-- | A binding's kind.
+bindingKind ∷ Binding → BindingKind
+bindingKind = Internal.bindingKind
+
+-- | The schemas of a binding's arguments.
+bindingArguments ∷ Binding → [Schema]
+bindingArguments = Internal.bindingArguments
+
+-- | The schemas of a binding's results.
+bindingResults ∷ Binding → [Schema]
+bindingResults = Internal.bindingResults
+
+-- | Whether the binding is eligible for the trusted direct path.
+bindingDirect ∷ Binding → Bool
+bindingDirect = Internal.bindingDirect
+
+-- | Whether the binding is eligible for the confined path.
+bindingConfined ∷ Binding → Bool
+bindingConfined = Internal.bindingConfined
+
+-- | Whether the binding is eligible to run from a Lua finalizer.
+bindingFinalizer ∷ Binding → Bool
+bindingFinalizer = Internal.bindingFinalizer

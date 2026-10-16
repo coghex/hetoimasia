@@ -48,7 +48,10 @@ module Hetoimasia.Scripting.Lua.Value
   , Schema (..)
 
     -- * Limits
-  , ValueLimits (..)
+  , ValueLimits
+  , limitBytes
+  , limitDepth
+  , limitElements
   , defaultValueLimits
   , valueLimitMaxima
   , valueLimits
@@ -69,7 +72,7 @@ import Hetoimasia.Scripting.Lua.Internal.Value
   , Schema (..)
   , Side (..)
   , Value (..)
-  , ValueLimits (..)
+  , ValueLimits
   , ValueRefusal (..)
   , ValueRule (..)
   , VmIdentity
@@ -84,3 +87,20 @@ import Data.Text (Text)
 -- that hands it to a script stamps it as its own; a script cannot make one.
 capability ∷ Text → Word64 → Capability
 capability name key = Internal.Capability name key Nothing
+
+-- The limits are read with ordinary functions, and 'ValueLimits' has no
+-- constructor here: a limit configuration comes from 'valueLimits', which checks
+-- every bound, or from 'defaultValueLimits'. Exporting the record labels would
+-- allow an update that skipped the check.
+
+-- | The most bytes one crossing may copy.
+limitBytes ∷ ValueLimits → Int
+limitBytes = Internal.limitBytes
+
+-- | The deepest nesting of tables one crossing may have.
+limitDepth ∷ ValueLimits → Int
+limitDepth = Internal.limitDepth
+
+-- | The most values one crossing may copy.
+limitElements ∷ ValueLimits → Int
+limitElements = Internal.limitElements

@@ -17,6 +17,7 @@ import Data.Text.Encoding (encodeUtf8)
 import Hetoimasia.Scripting.Lua.Owner
 import Hetoimasia.Scripting.Lua.Registration (maxArity)
 import Hetoimasia.Scripting.Lua.Value
+import System.Timeout (timeout)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
 import Test.Lua.Boundary.Support
 
@@ -314,6 +315,49 @@ spec = describe "application-owned modules" $ do
       loaded ← try @VmClosed (loadModule owned (moduleOf "late" "1" "x = 1" []))
       either (const True) (const False) loaded `shouldBe` True
 
+  describe "bounded work" $ do
+    it "refuses an oversized or endless argument list without counting or walking it" $ do
+      fixture ← newFixture
+      withOwner fixture [] $ \owned → do
+        handle ← loadModule owned calculator
+        endless ← timeout 10000000 (faulted (callEntry owned handle "add" (repeat (VInteger 1))))
+        fmap (fmap refusalRule . refusal) endless `shouldSatisfy` pastALimit
+        long ← timeout 10000000 (faulted (callEntry owned handle "add" (replicate 5 (VInteger 1))))
+        fmap (fmap refusalRule . refusal) long `shouldBe` Just (Just (RuleArity 2 3))
+        lister ← loadModule owned (moduleOf "lister" "1" "function f(list) return list end" [required "f" [SList SInteger] [SList SInteger]])
+        endlessList ← timeout 10000000 (faulted (callEntry owned lister "f" [VList (repeat (VInteger 1))]))
+        fmap (fmap refusalRule . refusal) endlessList `shouldSatisfy` pastALimit
+    it "refuses a nil where Lua could not keep one, before anything runs" $ do
+      fixture ← newFixture
+      withOwner fixture [] $ \owned → do
+        handle ← loadModule owned (moduleOf "n" "1" "function f(list) return list end" [required "f" [SList (SOptional SInteger)] [SList (SOptional SInteger)]])
+        fault ← faulted (callEntry owned handle "f" [VList [VInteger 1, VNil]])
+        fmap refusalRule (refusal fault) `shouldBe` Just RuleNilInTable
+        fmap refusalPath (refusal fault) `shouldBe` Just [AtIndex 2]
+        boundaryEffect fault `shouldBe` NoEffect
+        callEntry owned handle "f" [VList [VInteger 1, VInteger 2]] >>= (`shouldBe` Returned [VList [VInteger 1, VInteger 2]])
+
+  describe "modules supplied at initialization" $ do
+    it "are reachable from the body by identity, owner-checked" $ do
+      fixture ← newFixture
+      let config = (sampleConfig fixture []) {vmModules = [calculator]}
+      escaped ← newIORef Nothing
+      withOwnerOf config $ \owned → do
+        found ← loadedModule owned (ModuleRef "calc" "1")
+        case found of
+          Nothing → expectationFailure "the initial module has no handle"
+          Just handle → do
+            callEntry owned handle "add" [VInteger 20, VInteger 22] >>= (`shouldBe` Returned [VInteger 42])
+            -- The same module cannot be loaded a second time under its identity.
+            dup ← faulted (loadModule owned calculator)
+            boundaryReason dup `shouldBe` ModuleRefused DuplicateModule
+        loadedModule owned (ModuleRef "calc" "2") >>= (`shouldBe` Nothing)
+        loadedModule owned (ModuleRef "other" "1") >>= (`shouldBe` Nothing)
+        writeIORef escaped (Just owned)
+      Just owned ← readIORef escaped
+      outcome ← try @VmClosed (loadedModule owned (ModuleRef "calc" "1"))
+      either (const True) (const False) outcome `shouldBe` True
+
   describe "refused values and failing entry points" $ do
     it "refuses arguments before anything runs, with no effect" $ do
       fixture ← newFixture
@@ -383,6 +427,33 @@ spec = describe "application-owned modules" $ do
         boundaryReason described `shouldBe` ScriptFailed CallFailed (ErrorOpaque "table")
         callEntry owned handle "counter_touched" [] >>= (`shouldBe` Returned [VBoolean False])
 
+    it "builds tracebacks without running script-defined Lua, even when the script has booby-trapped the registry" $ do
+      fixture ← newFixture
+      let config = (sampleConfig fixture ["sample"]) {vmLibraries = [minBound .. maxBound]}
+      withOwnerOf config $ \owned → do
+        run
+          owned
+          ( Text.unlines
+              [ "touched = false"
+              , "local registry = debug.getregistry()"
+              , "registry._LOADED = nil"
+              , "setmetatable(registry, {__index = function() touched = true end, __newindex = function() touched = true end})"
+              ]
+          )
+        -- A fault of a binding call, recorded from inside the callback.
+        called ← runFault owned "sample.add(1.5, 2)"
+        fmap refusalRule (refusal called) `shouldBe` Just RuleFloatForInteger
+        fmap (Text.isInfixOf "example:1") (boundaryTraceback called) `shouldBe` Just True
+        -- A fault of an entry point, recorded by the message handler.
+        handle ← loadModule owned (moduleOf "trap" "1" "function boom() error('x') end" [required "boom" [] []])
+        raised ← faulted (callEntry owned handle "boom" [])
+        case boundaryReason raised of
+          ScriptFailed CallFailed (ErrorMessage message _) → message `shouldSatisfy` Text.isInfixOf "x"
+          other → expectationFailure ("not the script's error: " <> show other)
+        fmap (Text.isInfixOf "trap@1") (boundaryTraceback raised) `shouldBe` Just True
+        -- Neither capture ran the trap.
+        run owned "assert(touched == false)"
+
     it "bounds the traceback it captures" $ do
       fixture ← newFixture
       withOwner fixture [] $ \owned → do
@@ -419,6 +490,14 @@ spec = describe "application-owned modules" $ do
         fault ← faulted (callEntry owned handle "go" [])
         boundaryEffect fault `shouldBe` BindingRan
       stateOf fixture >>= (`shouldBe` Map.fromList [("k", 1)])
+
+-- | Refused for passing the byte limit or the element limit, whichever the walk
+-- reached first.
+pastALimit ∷ Maybe (Maybe ValueRule) → Bool
+pastALimit = \case
+  Just (Just (RuleBytesLimit 65536)) → True
+  Just (Just (RuleElementLimit 4096)) → True
+  _ → False
 
 -- | A module source of exactly this many bytes: a statement and a comment.
 padded ∷ Int → ByteString

@@ -147,6 +147,15 @@ spec = describe "values and schemas" $ do
       against record (VRecord [("name", VText "n"), ("tags", VList []), ("extra", VNil)]) `shouldBe` Left ([], RuleUnknownField "extra")
       against record (VRecord [("name", VText "n"), ("name", VText "m"), ("tags", VList [])]) `shouldBe` Left ([], RuleDuplicateField "name")
 
+    it "refuses a nil where a table cannot keep one, and omits an optional field that is nil" $ do
+      against (SList (SOptional SInteger)) (VList [VInteger 1, VNil]) `shouldBe` Left ([AtIndex 2], RuleNilInTable)
+      against (SRecord [("a", SInteger)]) (VRecord [("a", VNil)]) `shouldBe` Left ([AtField "a"], RuleNilInTable)
+      against (SRecord [("a", SOptional SInteger)]) (VRecord [("a", VNil)]) `shouldBe` Right ()
+      encodeValues context limits [VList [VInteger 1, VNil]] `shouldBe` Left RuleNilInTable
+      -- A nil field is absent in the encoding, so it comes back absent and nil.
+      crossed (SRecord [("a", SOptional SInteger)]) (VRecord [("a", VNil)]) `shouldBe` Right (VRecord [("a", VNil)])
+      encodeValues context limits [VRecord [("a", VNil)]] `shouldBe` encodeValues context limits [VRecord []]
+
     it "checks a capability against the issuing VM and the type" $ do
       against (SCapability "ticket") (VCapability (Capability "ticket" 1 Nothing)) `shouldBe` Right ()
       against (SCapability "ticket") (VCapability (Capability "ticket" 1 (Just here))) `shouldBe` Right ()

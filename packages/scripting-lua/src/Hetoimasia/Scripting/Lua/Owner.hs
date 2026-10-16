@@ -113,6 +113,7 @@ module Hetoimasia.Scripting.Lua.Owner
   , ModuleHandle
   , CallResult (..)
   , loadModule
+  , loadedModule
   , callEntry
   , maxModules
   , maxSourceBytes
@@ -267,6 +268,13 @@ withVmOwner config =
 -- once the lifetime has ended with 'VmClosed'.
 loadModule ∷ HasCallStack ⇒ OwnedVm → ModuleSource → IO ModuleHandle
 loadModule owned = Module.loadModule (ownedHost owned)
+
+-- | The handle of a module this owner has loaded, by identity: how the body gets
+-- at a module supplied through 'vmModules', which loaded before the body ran.
+-- 'Nothing' for an identity the owner has not loaded. The owner's thread only,
+-- and refused with 'VmClosed' once the lifetime has ended.
+loadedModule ∷ HasCallStack ⇒ OwnedVm → ModuleRef → IO (Maybe ModuleHandle)
+loadedModule owned = Module.loadedModule (ownedHost owned)
 
 -- | Call a module's entry point with bounded values.
 --

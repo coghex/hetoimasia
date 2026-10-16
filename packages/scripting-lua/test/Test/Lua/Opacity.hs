@@ -218,6 +218,31 @@ spec = describe "opacity across the package boundary" $ do
       clientOutput outcome `shouldContain` "Coroutine"
       clientOutput outcome `shouldContain` "Ptr"
 
+  it "rejects a client that updates a registration, a namespace or a binding through its labels, skipping validation" $
+    mapM_
+      ( \(client, label) →
+          withClient "Client.hs" (updateClient client) $ \compile → do
+            outcome ← compile Typecheck
+            rejectedBecause outcome "Not in scope: record field"
+            clientOutput outcome `shouldContain` label
+      )
+      [ ("a = emptyRegistration {registrationNamespaces = [namespace \"math\" []]}", "registrationNamespaces")
+      , ("a = (snapshotQuery \"x\" [] [] (\\_ → pure [])) {bindingKind = LifecycleOperation}", "bindingKind")
+      , ("a = (namespace \"n\" []) {namespaceBindings = []}", "namespaceBindings")
+      ]
+
+  it "rejects a client that builds a value-limit configuration without the checked constructor" $
+    withClient "Client.hs" limitsUpdateClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "GHC-10237"
+      clientOutput outcome `shouldContain` "ValueLimits"
+
+  it "rejects a client that updates a value-limit configuration through its labels" $
+    withClient "Client.hs" limitsLabelClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "Not in scope: record field"
+      clientOutput outcome `shouldContain` "limitBytes"
+
   it "rejects a client reaching into the private binding module" $
     withClient "Client.hs" privateBindingClient $ \compile → do
       outcome ← compile Typecheck
@@ -569,6 +594,42 @@ luaSurfaceClient =
     , "reached = ()"
     ]
 
+-- | A client whose only binding is this update of a registration, a namespace or
+-- a binding.
+updateClient ∷ String → String
+updateClient definition =
+  unlines
+    [ "module Client (a) where"
+    , ""
+    , "import Hetoimasia.Scripting.Lua.Registration"
+    , "  ( BindingKind (LifecycleOperation), bindingKind, emptyRegistration, namespace"
+    , "  , namespaceBindings, registrationNamespaces, snapshotQuery )"
+    , ""
+    , definition
+    ]
+
+limitsUpdateClient ∷ String
+limitsUpdateClient =
+  unlines
+    [ "module Client (bad) where"
+    , ""
+    , "import Hetoimasia.Scripting.Lua.Value (ValueLimits (ValueLimits))"
+    , ""
+    , "bad ∷ ValueLimits"
+    , "bad = ValueLimits (-1) 8 (-1)"
+    ]
+
+limitsLabelClient ∷ String
+limitsLabelClient =
+  unlines
+    [ "module Client (bad) where"
+    , ""
+    , "import Hetoimasia.Scripting.Lua.Value (ValueLimits, defaultValueLimits, limitBytes)"
+    , ""
+    , "bad ∷ ValueLimits"
+    , "bad = defaultValueLimits {limitBytes = -1}"
+    ]
+
 privateBindingClient ∷ String
 privateBindingClient =
   unlines
@@ -606,7 +667,7 @@ boundaryPublicClient =
     , "  , callEntry"
     , "  , chunkName"
     , "  , evalOwned"
-    , "  , loadModule"
+    , "  , loadedModule"
     , "  , vmConfig"
     , "  , withVmOwner"
     , "  )"
@@ -644,9 +705,9 @@ boundaryPublicClient =
     , "          , EntryPoint \"halt\" Required [] []"
     , "          , EntryPoint \"tick\" Optional [SInteger] []"
     , "          ]"
-    , "      config = (vmConfig [LibraryBase]) {vmRegistration = registered, vmPolicy = [\"app\"], vmOwnerName = \"client\", vmModules = []}"
+    , "      config = (vmConfig [LibraryBase]) {vmRegistration = registered, vmPolicy = [\"app\"], vmOwnerName = \"client\", vmModules = [source]}"
     , "  escaped ← withVmOwner config $ \\owned → do"
-    , "    handle ← loadModule owned source"
+    , "    handle ← loadedModule owned (ModuleRef \"client\" \"1\") >>= maybe (fail \"the initial module has no handle\") pure"
     , "    called ← callEntry owned handle \"run\" [VInteger 21]"
     , "    putStrLn (\"call = \" <> show (called ∷ CallResult))"
     , "    readIORef total >>= \\held → putStrLn (\"state = \" <> show held)"
