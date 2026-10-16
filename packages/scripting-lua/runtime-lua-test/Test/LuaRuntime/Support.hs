@@ -23,6 +23,7 @@ module Test.LuaRuntime.Support
   , attemptWait
   , gate
   , applicationFault
+  , applicationBoundaryFault
   , noted
   , note
     -- * Configurations
@@ -389,6 +390,7 @@ moduleEntries =
   , required "block_call" [SText] [SInteger]
   , required "block_then_fail" [SText, SText] []
   , required "host_fail" [SText] []
+  , required "catch_then_call" [SText] []
   , required "fail_lazy" [SText] [SInteger]
   , required "swallow_then_fail" [SText] []
   , required "lifecycle" [] []
@@ -413,6 +415,7 @@ moduleSource =
     , "function block_call(name) app.block(name) return 1 end"
     , "function block_then_fail(name, kind) app.block(name) app.fail(kind) end"
     , "function host_fail(kind) app.fail(kind) end"
+    , "function catch_then_call(kind) pcall(app.fail, kind) app.note('after') end"
     , "function fail_lazy(kind) return app.fail_lazy(kind) end"
     , "function swallow_then_fail(kind) pcall(app.note, 5) app.fail(kind) end"
     , "function lifecycle() app.lifecycle() end"

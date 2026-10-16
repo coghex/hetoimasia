@@ -53,7 +53,7 @@ import Hetoimasia.Foundation.Failure (Operation, operation, throwFailure, withOp
 import Hetoimasia.Scripting.Lua.Internal.Boundary
 import Hetoimasia.Scripting.Lua.Internal.Call (reportFault)
 import Hetoimasia.Scripting.Lua.Internal.Callback (Handler, installBinding)
-import Hetoimasia.Scripting.Lua.Internal.Fault (classify, fromApplication, luaComponent, renderFailure)
+import Hetoimasia.Scripting.Lua.Internal.Fault (classify, fromApplication, luaComponent, raisedByApplication, renderFailure)
 import Hetoimasia.Scripting.Lua.Internal.Marshal
 import Hetoimasia.Scripting.Lua.Internal.Registration
 import Hetoimasia.Scripting.Lua.Internal.Value
@@ -267,7 +267,9 @@ retiredIn boundary = go []
 -- binding's action ran.
 upgradeEffect ∷ ExceptionWithContext SomeException → ExceptionWithContext SomeException
 upgradeEffect captured@(ExceptionWithContext context exception) = case fromException exception of
-  Just fault | boundaryEffect fault < BindingRan → ExceptionWithContext context (toException (fault {boundaryEffect = BindingRan}))
+  -- A failure the application raised is its own, however it is typed: it is not
+  -- the boundary's report, so what it says is never rewritten.
+  Just fault | boundaryEffect fault < BindingRan, not (raisedByApplication context) → ExceptionWithContext context (toException (fault {boundaryEffect = BindingRan}))
   _ → captured
 
 -- | Whether the chunk a call was made from is this module's. Lua shortens a

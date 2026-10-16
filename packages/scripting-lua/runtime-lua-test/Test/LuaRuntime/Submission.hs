@@ -6,6 +6,10 @@ import Control.Concurrent (forkIO, yield)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (atomically)
 import Control.Exception (ErrorCall (ErrorCall), evaluate, try)
+import Data.IORef (newIORef, readIORef)
+import qualified Data.ByteString as ByteString
+import GHC.Stats (RTSStats (gc), GCDetails (gcdetails_live_bytes), getRTSStats)
+import System.Mem (performMajorGC)
 import Control.Monad (forM_, replicateM, replicateM_, void)
 import Data.Maybe (isJust)
 import qualified Data.Text as Text
@@ -212,7 +216,43 @@ spec = describe "submission" $ do
         -- the refusal nor anything else holds two million characters.
         length (show settlement) `shouldSatisfy` (< 4000)
         retireOwner owner
+    it "retains only the bytes of a queued string or capability name, not the larger buffer it was cut from" $ bounded $ do
+      fixture ← newFixture
+      withBoundary $ \_ runtime → do
+        owner ← startOwner runtime (ownerSpec fixture "retained" ["app"] requiredPolicy (bounds 4 10))
+        let endpoint = ownerEndpoint owner
+        size ← newIORef (3000000 ∷ Int) >>= readIORef
+        before ← liveBytes
+        prepared ← prepareSlices endpoint size
+        after ← liveBytes
+        -- The buffers the slices were cut from are unreachable by now, and the
+        -- prepared call is still held: it keeps its own few bytes and nothing
+        -- more. Cut slices that were kept as they were would hold six megabytes.
+        (after - before) `shouldSatisfy` (< 1000000)
+        -- Held until here, and then it is a call like any other.
+        answer ← submitPrepared prepared
+        shape answer `shouldBe` "accepted"
+        retireOwner owner
   where
+    liveBytes ∷ IO Int
+    liveBytes = do
+      performMajorGC
+      performMajorGC
+      fromIntegral . gcdetails_live_bytes . gc <$> getRTSStats
+    -- Slices of large buffers, prepared for a call; the buffers are not kept.
+    prepareSlices endpoint size = do
+      hugeText ← evaluate (Text.replicate size "t")
+      hugeBytes ← evaluate (ByteString.replicate size 7)
+      prepareCall
+        endpoint
+        theModule
+        "echo"
+        [ VList
+            [ VText (Text.take 5 hugeText)
+            , VBytes (ByteString.take 5 hugeBytes)
+            , VCapability (capability (Text.take 70 hugeText) 1)
+            ]
+        ]
     retryAccepted endpoint = do
       answer ← submit endpoint "echo" [VInteger 1]
       case answer of

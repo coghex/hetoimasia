@@ -90,6 +90,7 @@ spec = describe "the adapter's dependency closure" $ do
     dependencies "library runtime-lua"
       `shouldReturn` sort
         [ "base"
+        , "bytestring"
         , "containers"
         , "deepseq"
         , "hetoimasia-foundation"

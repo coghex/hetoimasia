@@ -186,6 +186,7 @@ library runtime-lua
         Hetoimasia.Scripting.Lua.Runtime.Types
     build-depends:
         base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
         containers >=0.8 && <0.9,
         deepseq >=1.5.1 && <1.6,
         stm >=2.5.3 && <2.6,
@@ -329,8 +330,10 @@ test-suite lua-runtime-tests
         Test.LuaRuntime.Submission
         Test.LuaRuntime.Support
     -- -N2 rather than -N: a call held inside a binding must not starve the
-    -- thread that observes it, on every machine that runs the suite.
-    ghc-options: -threaded -rtsopts "-with-rtsopts=-N2"
+    -- thread that observes it, on every machine that runs the suite. -T makes the
+    -- runtime's statistics readable, which the example that checks what a queued
+    -- call retains reads.
+    ghc-options: -threaded -rtsopts "-with-rtsopts=-N2 -T"
     build-depends:
         base >=4.22 && <4.23,
         bytestring >=0.12 && <0.13,

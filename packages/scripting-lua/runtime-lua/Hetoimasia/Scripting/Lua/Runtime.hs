@@ -209,6 +209,7 @@ module Hetoimasia.Scripting.Lua.Runtime
 import Control.Concurrent.STM (STM, TVar, atomically, newTVarIO, orElse, readTVar, retry)
 import Control.Exception (ExceptionWithContext, SomeException, evaluate, mask, mask_, onException)
 import Control.Monad (when)
+import qualified Data.ByteString as ByteString
 import Data.Foldable (toList)
 import Data.IORef (IORef, atomicModifyIORef', newIORef)
 import Data.Text (Text)
@@ -257,7 +258,7 @@ import Hetoimasia.Scripting.Lua.Runtime.Admission
 import Hetoimasia.Scripting.Lua.Runtime.Dispatch (runOwner)
 import Hetoimasia.Scripting.Lua.Runtime.Types
 import Hetoimasia.Scripting.Lua.Registration (maxNameLength)
-import Hetoimasia.Scripting.Lua.Value (Value (VCapability, VList, VRecord))
+import Hetoimasia.Scripting.Lua.Value (Value (VBytes, VCapability, VList, VRecord, VText))
 import Hetoimasia.Foundation.Messaging.Payload (Prepared)
 
 -- | The runtime boundary owners are created in: the supervision control they
@@ -375,11 +376,14 @@ startLuaOwner runtime spec = do
           )
           (\token control → runOwner token control handoff config)
   -- Acquisition is masked from the worker's start to the endpoint's handoff, and
-  -- only the two waits are restored: a cancellation cannot fall between the
+  -- only the readiness wait is restored: a cancellation cannot fall between the
   -- start and the handler that asks the owner to stop, nor between the end of
   -- the wait and the handoff, and so cannot leave behind an owner nobody holds.
+  -- The start is not restored: its own wait for the startup is interruptible
+  -- under a mask, and it owns the cleanup of a cancellation there, while
+  -- everything it does after the worker exists is protected by this mask.
   mask $ \restore → do
-    started ← restore (startSupervised (runtimeControl runtime) (ownerPolicy spec) definition)
+    started ← startSupervised (runtimeControl runtime) (ownerPolicy spec) definition
     case started of
       WorkerStartRejected → pure OwnerRejected
       WorkerStartUnavailable _ failure → pure (OwnerUnavailable failure)
@@ -469,23 +473,27 @@ prepareCall ∷ OwnerEndpoint → ModuleRef → Text → [Value] → IO Prepared
 prepareCall (OwnerEndpoint control) ref entry arguments = do
   within ← evaluate (checkLimits (controlLimits control) arguments)
   payload ← prepare $ case within of
-    Right () → WithinBounds (map boundCapabilities arguments)
+    Right () → WithinBounds (map compact arguments)
     Left rule → OverBound rule
   pure (PreparedCall control ref entry payload)
 
--- | Bound what the value limits do not count. A capability is 21 bytes of the
--- encoding whatever its type's name is, but the queue keeps the capability as it
--- was given, and its name is as long as the producer made it. No registered
--- type has a name longer than 'maxNameLength', so a longer one can only be
--- refused, and what is kept of it is one character past the longest valid name:
--- enough to never match one, and as much as the refusal will ever quote.
-boundCapabilities ∷ Value → Value
-boundCapabilities = \case
-  VCapability held
-    | Text.length (capabilityTypeName held) > maxNameLength →
-        VCapability held {capabilityTypeName = Text.take (maxNameLength + 1) (capabilityTypeName held)}
-  VList items → VList (map boundCapabilities items)
-  VRecord entries → VRecord [(name, boundCapabilities item) | (name, item) ← entries]
+-- | Compact what the queue keeps. The value limits count the bytes a value
+-- encodes to, and a capability is 21 of them whatever its type's name is; but
+-- the queue keeps the value as it was given, and a string that is a slice of a
+-- larger one keeps the larger one's whole buffer alive while the call waits.
+-- So every string in an accepted call is copied to a buffer of its own, which
+-- the limits do bound, and a capability's type name is first cut to one
+-- character past 'maxNameLength': no registered type has a longer name, so a
+-- longer one can only be refused, and what is kept is enough to never match one
+-- and as much as the refusal will ever quote.
+compact ∷ Value → Value
+compact = \case
+  VBytes bytes → VBytes (ByteString.copy bytes)
+  VText text → VText (Text.copy text)
+  VCapability held →
+    VCapability held {capabilityTypeName = Text.copy (Text.take (maxNameLength + 1) (capabilityTypeName held))}
+  VList items → VList (map compact items)
+  VRecord entries → VRecord [(Text.copy name, compact item) | (name, item) ← entries]
   value → value
 
 -- | What submitting a call answered.

@@ -124,6 +124,19 @@ spec = describe "host failures" $ do
       forM_ [boundaryCall, luaCall, liveCall] $ \ticket →
         settleOutcome ticket >>= (`shouldSatisfy` isDiscard ExitFailed Started)
 
+  it "delivers an application's own fault to supervision as it was thrown, though the script caught it and called another binding" $ bounded $ do
+    fixture ← newFixture
+    withBoundary $ \control runtime → do
+      owner ← startOwner runtime (ownerSpec fixture "caught" ["app"] (optionalPolicy (const True)) (bounds 4 4))
+      call ← submit (ownerEndpoint owner) "catch_then_call" [VText "boundary"] >>= accepted
+      awaitTerminal control owner >>= \case
+        WorkerUnavailable (ExceptionWithContext _ failure) →
+          -- The fault the fixture threw, effect and all: a later binding's call
+          -- rewrote nothing of it.
+          fromException @BoundaryFault failure `shouldBe` Just applicationBoundaryFault
+        other → fail ("expected an unavailable owner, found " <> show other)
+      settleOutcome call >>= (`shouldSatisfy` isDiscard ExitFailed Started)
+
   it "settles a cancelled owner's in-flight call as discarded, started, cancelled, and its queued calls as not started, cancelled" $ bounded $ do
     fixture ← newFixture
     withBoundary $ \control runtime → do
