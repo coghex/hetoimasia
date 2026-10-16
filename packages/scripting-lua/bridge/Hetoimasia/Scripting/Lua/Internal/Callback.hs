@@ -1,10 +1,11 @@
 -- | Haskell functions Lua can call, and what happens when one of them fails.
 --
 -- Installing a callback is deliberately private. The public registration
--- surface -- module identity, capability namespaces, per-domain policy -- is
--- LUA-3's; what this module provides is the trampoline itself and the narrow
--- fixture vocabulary this package's own examples need to prove the boundary
--- holds.
+-- surface -- namespaces of bindings, module identity, per-owner policy -- is
+-- "Hetoimasia.Scripting.Lua.Registration" and the owner's configuration, built on
+-- 'installBinding'; what this module provides is the trampoline itself, the
+-- 'Handler' a registered binding runs as, and the narrow fixture vocabulary this
+-- package's own examples need to prove the boundary holds.
 --
 -- The trampoline contains failures raised by the callback's own action. They
 -- are caught with their type and context and recorded on the VM, rather than
@@ -50,8 +51,10 @@
 module Hetoimasia.Scripting.Lua.Internal.Callback
   ( CallbackResult (..)
   , Callback
+  , Handler
   , Installed
   , installCallback
+  , installBinding
   , escapeMarker
   ) where
 
@@ -68,6 +71,7 @@ import Foreign.Storable (peek)
 import GHC.Stack (HasCallStack)
 import Hetoimasia.Foundation.Failure (Operation, operation, throwFailure, withOperationContext)
 import Hetoimasia.Scripting.Lua.Internal.Call (reportFault)
+import Hetoimasia.Scripting.Lua.Internal.Marshal (installBindingAt)
 import Hetoimasia.Scripting.Lua.Internal.Fault (FinalizerRefused (FinalizerRefused), classify, luaComponent)
 import Hetoimasia.Scripting.Lua.Internal.Vm
   ( Phase (Closing)
@@ -108,8 +112,9 @@ foreign import ccall safe "hetoimasia_lua_bridge.h hetoimasia_lua_publish"
 
 -- | What a bridge callback answers Lua with.
 --
--- Deliberately tiny. Bounded value marshalling is LUA-3's contract; this is
--- only enough for this package's own examples to observe what a VM did.
+-- Deliberately tiny. Bounded value marshalling is the value boundary's
+-- ("Hetoimasia.Scripting.Lua.Internal.Binding"); this is only enough for this
+-- package's own examples to observe what a VM did.
 data CallbackResult
   = NoResult
   | BooleanResult !Bool
@@ -117,6 +122,33 @@ data CallbackResult
 
 -- | A Haskell operation Lua may call. It takes no arguments.
 type Callback = IO CallbackResult
+
+-- | What runs when Lua calls an installed function, given its Lua state and a
+-- function that unmasks an action.
+--
+-- It is the part of the callback entry that has to touch the stack: it finds its
+-- arguments there, and leaves its results on top of them, answering how many. It
+-- runs masked, like the rest of the entry, and unmasks only the action the
+-- application supplied, so a handler's marshalling is not interruptible. Anything
+-- it throws is contained exactly as a callback's own failure is: recorded on the
+-- VM with its type and context, and answered to Lua with the failure marker.
+--
+-- It must follow the rules of the callback entry: an allocating Lua operation is
+-- made only inside a protected call (see "Hetoimasia.Scripting.Lua.Internal.Marshal"),
+-- never directly.
+type Handler = State → (∀ a. IO a → IO a) → IO NumResults
+
+-- | A fixture callback as a handler: no arguments, and a boolean or nothing back.
+plainHandler ∷ Callback → Handler
+plainHandler action state restore = do
+  result ← restore action
+  case result of
+    NoResult → pure (NumResults 0)
+    BooleanResult value → do
+      -- Allocates nothing, so it cannot raise a Lua error from inside this
+      -- Haskell frame.
+      lua_pushboolean state (if value then TRUE else FALSE)
+      pure (NumResults 1)
 
 -- | The value a failed callback raises in Lua's terms.
 --
@@ -138,25 +170,54 @@ escapeMarker = nullPtr
 -- after the VM's terminal close, never while Lua could still call back.
 installCallback ∷ HasCallStack ⇒ Vm → Text → Callback → IO () → IO ()
 installCallback vm name action release =
-  withOperationContext luaComponent installOperation [("global", name)] $
+  installWith vm [("global", name)] name publishGlobal (plainHandler action) release
+  where
+    publishGlobal state carried acquired =
+      ByteString.unsafeUseAsCStringLen (Text.encodeUtf8 name) $ \(bytes, len) →
+        hetoimasia_lua_publish state carried bytes (fromIntegral len ∷ CSize) acquired
+
+-- | Install a handler as @namespace.name@, in a namespace table that already
+-- exists. The handler is reached by the name @namespace.name@, which is the name
+-- the VM's finalizer policy knows it by.
+--
+-- Nothing is borrowed from the Haskell side that outlives the handler, so there
+-- is no release to retain.
+installBinding ∷ HasCallStack ⇒ Vm → Text → Text → Handler → IO ()
+installBinding vm space name handler =
+  installWith vm [("binding", qualified)] qualified publish handler (pure ())
+  where
+    qualified = space <> "." <> name
+    publish state carried acquired = installBindingAt state carried space name acquired
+
+-- | The installation both public forms share: the release is retained before the
+-- function is published, and the stable pointer is freed here only when Lua
+-- never took it.
+installWith
+  ∷ HasCallStack
+  ⇒ Vm
+  → [(Text, Text)]
+  → Text
+  → (State → StablePtr Installed → Ptr CInt → IO StatusCode)
+  → Handler
+  → IO ()
+  → IO ()
+installWith vm context name publish handler release =
+  withOperationContext luaComponent installOperation context $
     withOpenVm vm installOperation $ \state → do
       entry ← lua_gettop state
       retainRelease vm release
-      -- Both allocations publication needs -- the userdata that carries the
-      -- function and the string that names it -- happen inside one protected
-      -- call, so memory exhaustion here is a status rather than a panic.
+      -- Every allocation publication needs happens inside one protected call,
+      -- so memory exhaustion here is a status rather than a panic.
       status ←
-        ByteString.unsafeUseAsCStringLen (Text.encodeUtf8 name) $ \(bytes, len) →
-          alloca $ \acquired → do
-            carried ← newStablePtr (Installed vm name action)
-            reported ←
-              hetoimasia_lua_publish state carried bytes (fromIntegral len ∷ CSize) acquired
-            -- Freed here only when Lua never took it. Once the userdata holds
-            -- it, its @__gc@ is the owner and freeing it here would be a second
-            -- free of the same pointer.
-            owned ← peek acquired
-            when (owned == (0 ∷ CInt)) (freeStablePtr carried)
-            pure reported
+        alloca $ \acquired → do
+          carried ← newStablePtr (Installed vm name handler)
+          reported ← publish state carried acquired
+          -- Freed here only when Lua never took it. Once the userdata holds
+          -- it, its @__gc@ is the owner and freeing it here would be a second
+          -- free of the same pointer.
+          owned ← peek acquired
+          when (owned == (0 ∷ CInt)) (freeStablePtr carried)
+          pure reported
       if status /= LUA_OK
         then reportFault vm state entry installOperation (classify status) name
         else do
@@ -167,8 +228,8 @@ installCallback vm name action release =
           raiseEscape vm
 
 -- | What a carrier's stable pointer holds: the VM the callback belongs to, the
--- name it was installed under, and the callback itself.
-data Installed = Installed !Vm !Text !Callback
+-- name it was installed under, and what runs when it is called.
+data Installed = Installed !Vm !Text !Handler
 
 -- | This package's entry from Lua into Haskell.
 --
@@ -194,7 +255,8 @@ data Installed = Installed !Vm !Text !Callback
 -- it does: a cancellation aimed at this thread from outside can still end the
 -- process. A registration surface must preserve the trusted-callback rules
 -- above: no publishing the callback thread's identity and no work left running
--- past its return. This does not prohibit LUA-3's planned registration surface.
+-- past its return. A registered binding's 'Handler' keeps them: it publishes no
+-- identity and leaves nothing running.
 hetoimasiaEnter ∷ PreCFunction
 hetoimasiaEnter state = mask $ \restore → do
   -- The C closure put the carrier below the call's own arguments.
@@ -206,7 +268,7 @@ hetoimasiaEnter state = mask $ \restore → do
       pure failedResults
     else do
       stored ← peek (castPtr carrier)
-      Installed vm name action ← deRefStablePtr stored
+      Installed vm name handler ← deRefStablePtr stored
       -- While the VM closes, only a callback its finalizer policy names runs.
       phase ← vmPhase vm
       let refused = phase == Closing && not (finalizerAllowed vm name)
@@ -217,14 +279,9 @@ hetoimasiaEnter state = mask $ \restore → do
       outcome ←
         if refused
           then tryWithContext (throwFailure luaComponent refusedOperation [("callback", name)] (FinalizerRefused name))
-          else runCallback vm (tryWithContext (restore action))
-      results ← case outcome ∷ Either (ExceptionWithContext SomeException) CallbackResult of
-        Right NoResult → pure (NumResults 0)
-        Right (BooleanResult value) → do
-          -- Allocates nothing, so it cannot raise a Lua error from inside this
-          -- Haskell frame.
-          lua_pushboolean state (if value then TRUE else FALSE)
-          pure (NumResults 1)
+          else runCallback vm (tryWithContext (handler state restore))
+      results ← case outcome ∷ Either (ExceptionWithContext SomeException) NumResults of
+        Right produced → pure produced
         Left captured → do
           recordEscape vm captured
           lua_pushlightuserdata state escapeMarker

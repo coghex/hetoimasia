@@ -85,6 +85,7 @@ module Hetoimasia.Scripting.Lua.Internal.Owner
   , defaultOwnerConfig
   , OwnedVm
   , ownedInternalVm
+  , ownedHost
   , withOwnedVm
   , evalOwned
   , callOwned
@@ -110,7 +111,19 @@ import qualified Data.Set as Set
 import Data.Text (Text)
 import GHC.Stack (HasCallStack)
 import Hetoimasia.Foundation.Resource (composeCleanup)
+import Hetoimasia.Scripting.Lua.Internal.Binding (installRegistration)
+import Hetoimasia.Scripting.Lua.Internal.Boundary (Boundary (Boundary))
 import Hetoimasia.Scripting.Lua.Internal.Call (ChunkName, callGlobal, evalChunk)
+import Hetoimasia.Scripting.Lua.Internal.Module (Host, ModuleSource, loadModule, newHost)
+import Hetoimasia.Scripting.Lua.Internal.Registration
+  ( Binding (bindingFinalizer, bindingName)
+  , Namespace (namespaceBindings, namespaceName)
+  , Registration
+  , emptyRegistration
+  , lookupNamespace
+  , qualifiedName
+  )
+import Hetoimasia.Scripting.Lua.Internal.Value (ValueLimits, defaultValueLimits)
 import Hetoimasia.Scripting.Lua.Internal.Library (Library)
 import Hetoimasia.Scripting.Lua.Internal.Vm
   ( FinalizerPolicy (FinalizersAllow)
@@ -120,15 +133,17 @@ import Hetoimasia.Scripting.Lua.Internal.Vm
   , cleanupEvidence
   , closeVm
   , openLibraries
+  , vmIdentity
   )
 
 -- | What an owner is built from.
 --
 -- The first two fields are the public configuration; the rest are this
--- package's own fixtures' controls, which the public module does not offer: the
--- finalizer allowlist, which is empty by default and which LUA-3's capability
--- registration is what will fill, and the hooks and allocation budget that make
--- every construction step reachable by an example.
+-- package's own fixtures' controls, which the public module does not offer: an
+-- added finalizer allowlist, empty by default (the registration's
+-- finalizer-eligible bindings, among the granted namespaces, are always on it),
+-- and the hooks and allocation budget that make every construction step
+-- reachable by an example.
 data OwnerConfig = OwnerConfig
   { ownerLibraries ∷ ![Library]
     -- ^ Exactly the standard libraries the VM opens, in order. The empty list
@@ -146,6 +161,16 @@ data OwnerConfig = OwnerConfig
   , ownerAfterLibraries ∷ !(Vm → IO ())
     -- ^ A step run after the libraries are open and before the initial chunks:
     -- where an example installs the callbacks its chunks call.
+  , ownerName ∷ !Text
+    -- ^ How the owner is named in a fault.
+  , ownerRegistration ∷ Registration
+    -- ^ What the application registered. Shared by any number of owners.
+  , ownerGranted ∷ ![Text]
+    -- ^ The namespaces of the registration this owner exposes: its policy.
+  , ownerLimits ∷ !ValueLimits
+    -- ^ The bounds on every value that crosses for this owner.
+  , ownerModules ∷ ![ModuleSource]
+    -- ^ The application-owned modules loaded after the initial chunks, in order.
   }
 
 -- | An owner over these libraries with no initial chunk, an empty finalizer
@@ -159,7 +184,26 @@ defaultOwnerConfig libraries =
     , ownerBudget = Nothing
     , ownerAfterAllocation = \_ → pure ()
     , ownerAfterLibraries = \_ → pure ()
+    , ownerName = "owner"
+    , ownerRegistration = emptyRegistration
+    , ownerGranted = []
+    , ownerLimits = defaultValueLimits
+    , ownerModules = []
     }
+
+-- | The names of the bindings a Lua finalizer may run during this owner's close:
+-- exactly the granted bindings the registration declares finalizer-eligible,
+-- qualified by their namespace, together with any name the fixture allowlist
+-- adds.
+finalizerAllowlist ∷ OwnerConfig → Set Text
+finalizerAllowlist config =
+  Set.union (ownerAllowlist config) . Set.fromList $
+    [ qualifiedName (namespaceName space) (bindingName binding)
+    | name ← ownerGranted config
+    , Just space ← [lookupNamespace (ownerRegistration config) name]
+    , binding ← namespaceBindings space
+    , bindingFinalizer binding
+    ]
 
 -- | The VM an owner holds, as its body sees it.
 --
@@ -170,11 +214,15 @@ defaultOwnerConfig libraries =
 -- 'Hetoimasia.Scripting.Lua.Internal.Fault.VmNotOwned'. It names no Lua state,
 -- stack index, registry reference, coroutine, closure or native address, and no
 -- way to close the VM: only the lifetime closes it.
-newtype OwnedVm = OwnedVm Vm
+data OwnedVm = OwnedVm !Vm !Host
 
 -- | The bridge's own VM behind an owned one, for this package's fixtures.
 ownedInternalVm ∷ OwnedVm → Vm
-ownedInternalVm (OwnedVm vm) = vm
+ownedInternalVm (OwnedVm vm _) = vm
+
+-- | What loads and calls modules in this owner's VM.
+ownedHost ∷ OwnedVm → Host
+ownedHost (OwnedVm _ host) = host
 
 -- | Run a body over a VM this owner constructed, and close the VM on every
 -- exit. See the module header for the lifetime, the cancellation points and the
@@ -184,13 +232,19 @@ withOwnedVm config body = mask $ \restore → do
   self ← myThreadId
   -- Masked, and the VM is this owner's from the return: from here nothing is
   -- interruptible until the handler below is installed.
-  vm ← allocateVm (VmSpec (ownerBudget config) (Just self) (FinalizersAllow (ownerAllowlist config)))
+  vm ← allocateVm (VmSpec (ownerBudget config) (Just self) (FinalizersAllow (finalizerAllowlist config)))
+  let boundary = Boundary (ownerName config) (vmIdentity vm) (ownerRegistration config) (ownerLimits config)
+  host ← newHost vm boundary
   ran ← tryWithContext @SomeException $ restore $ do
     ownerAfterAllocation config vm
     openLibraries vm (ownerLibraries config)
     ownerAfterLibraries config vm
+    -- Before any initial chunk or module can run, and inside the lifetime, so a
+    -- failure here ends construction like any other step.
+    installRegistration boundary vm (ownerGranted config)
     traverse_ (uncurry (evalChunk vm)) (ownerChunks config)
-    body (OwnedVm vm)
+    traverse_ (loadModule host) (ownerModules config)
+    body (OwnedVm vm host)
   -- The ordinary close: masked, once, never retried, and not uninterruptible
   -- beyond what a blocked finalizer needs.
   closed ← tryWithContext @SomeException (closeVm vm)
@@ -257,8 +311,8 @@ finish ran closed late = do
 
 -- | Load and run a chunk in the owner's VM.
 evalOwned ∷ HasCallStack ⇒ OwnedVm → ChunkName → ByteString → IO ()
-evalOwned (OwnedVm vm) = evalChunk vm
+evalOwned (OwnedVm vm _) = evalChunk vm
 
 -- | Call a global function the owner's VM defines.
 callOwned ∷ HasCallStack ⇒ OwnedVm → Text → IO ()
-callOwned (OwnedVm vm) = callGlobal vm
+callOwned (OwnedVm vm _) = callGlobal vm

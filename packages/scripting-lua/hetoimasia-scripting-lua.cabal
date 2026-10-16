@@ -23,7 +23,12 @@ description:
     epochs, failure, and stop. The protected VM owner is a public module of
     its own: one VM held through a bracket-shaped IO lifetime that closes it on
     every exit and keeps the primary failure and the close's failures as
-    cleanup evidence. The capability registration surface and the scheduler
+    cleanup evidence. An application registers named bindings once, in
+    namespaces, with schemas for their arguments and results, and gives each
+    owner a policy naming the namespaces it exposes; it supplies its own Lua
+    modules under a name and version and calls their declared entry points.
+    Every value crosses as a bounded copy checked against a schema, and a
+    refusal is a typed fault of the call. The scheduler and the confined path
     are later slices.
 license: GPL-3.0-only
 license-file: LICENSE
@@ -35,6 +40,7 @@ tested-with: GHC ==9.14.1
 extra-doc-files: README.md
 extra-source-files:
     bridge/cbits/hetoimasia_lua_bridge.h
+    bridge/cbits/hetoimasia_lua_values.h
     hazard/cbits/hetoimasia_lua_probe.h
     linux/cbits/hetoimasia_confine.h
     macos/cbits/hetoimasia_macos_probe.h
@@ -59,15 +65,25 @@ library bridge
     visibility: private
     hs-source-dirs: bridge
     -- Publication has to happen inside a protected Lua call; see the header.
-    c-sources: bridge/cbits/hetoimasia_lua_bridge.c
+    c-sources:
+        bridge/cbits/hetoimasia_lua_bridge.c
+        bridge/cbits/hetoimasia_lua_values.c
     include-dirs: bridge/cbits
-    install-includes: hetoimasia_lua_bridge.h
+    install-includes:
+        hetoimasia_lua_bridge.h
+        hetoimasia_lua_values.h
     exposed-modules:
+        Hetoimasia.Scripting.Lua.Internal.Binding
+        Hetoimasia.Scripting.Lua.Internal.Boundary
         Hetoimasia.Scripting.Lua.Internal.Call
         Hetoimasia.Scripting.Lua.Internal.Callback
         Hetoimasia.Scripting.Lua.Internal.Fault
         Hetoimasia.Scripting.Lua.Internal.Library
+        Hetoimasia.Scripting.Lua.Internal.Marshal
+        Hetoimasia.Scripting.Lua.Internal.Module
         Hetoimasia.Scripting.Lua.Internal.Owner
+        Hetoimasia.Scripting.Lua.Internal.Registration
+        Hetoimasia.Scripting.Lua.Internal.Value
         Hetoimasia.Scripting.Lua.Internal.Vm
     build-depends:
         base >=4.22 && <4.23,
@@ -126,6 +142,8 @@ library
     exposed-modules:
         Hetoimasia.Scripting.Lua.Bridge
         Hetoimasia.Scripting.Lua.Owner
+        Hetoimasia.Scripting.Lua.Registration
+        Hetoimasia.Scripting.Lua.Value
     build-depends:
         base >=4.22 && <4.23,
         bytestring >=0.12 && <0.13,
@@ -172,6 +190,17 @@ test-suite lua-host-tests
     main-is: Main.hs
     hs-source-dirs: test
     other-modules:
+        Test.Lua.Boundary.Bindings
+        Test.Lua.Boundary.Dependencies
+        Test.Lua.Boundary.Discipline
+        Test.Lua.Boundary.Finalizers
+        Test.Lua.Boundary.Independence
+        Test.Lua.Boundary.Installation
+        Test.Lua.Boundary.Modules
+        Test.Lua.Boundary.Registration
+        Test.Lua.Boundary.Spec
+        Test.Lua.Boundary.Support
+        Test.Lua.Boundary.Values
         Test.Lua.Close
         Test.Lua.Discipline
         Test.Lua.Faults

@@ -5,8 +5,8 @@
 -- because the whole standard library is @io@, @os@, @debug@, and a native
 -- module loader -- the four things untrusted execution cannot be given.
 --
--- The policy that decides which domain gets which library is not here; it is
--- LUA-3's. What is here is that each one is separately refusable, and that
+-- The policy that decides which domain gets which library is the application's
+-- configuration, not this module's. What is here is that each one is separately refusable, and that
 -- refusing them all leaves a working VM.
 module Test.Lua.Libraries (spec) where
 

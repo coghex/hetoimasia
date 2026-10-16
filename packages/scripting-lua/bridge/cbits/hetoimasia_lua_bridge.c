@@ -1,4 +1,5 @@
 #include "hetoimasia_lua_bridge.h"
+#include "hetoimasia_lua_values.h"
 
 #include <lauxlib.h>
 #include <stdatomic.h>
@@ -208,6 +209,62 @@ int hetoimasia_lua_publish(
   lua_pushinteger(L, (lua_Integer) length);
   lua_pushlightuserdata(L, acquired);
   return lua_pcall(L, 4, 0, 0);
+}
+
+/*
+** Everything installing a binding allocates, in one place: the carrier, the C
+** closure over it, and the entry in the namespace's table.
+*/
+static int install_body(lua_State *L)
+{
+  HsStablePtr function = lua_touserdata(L, 1);
+  const char *space = (const char *) lua_touserdata(L, 2);
+  size_t space_length = (size_t) lua_tointeger(L, 3);
+  const char *name = (const char *) lua_touserdata(L, 4);
+  size_t length = (size_t) lua_tointeger(L, 5);
+  int *acquired = (int *) lua_touserdata(L, 6);
+  HsStablePtr *slot;
+
+  lua_settop(L, 0);
+  push_carrier_metatable(L);
+  slot = (HsStablePtr *) lua_newuserdatauv(L, sizeof(HsStablePtr), 0);
+  *slot = function;
+  lua_pushvalue(L, -2);
+  /* As in `publish_body`: ownership of the pointer passes at this instruction. */
+  lua_setmetatable(L, -2);
+  *acquired = 1;
+
+  lua_pushcclosure(L, invoke, 1);
+  lua_pushglobaltable(L);
+  lua_pushlstring(L, space, space_length);
+  /* A raw read and a raw write: no metamethod of the globals or of the
+  ** namespace can run while a binding is being installed. */
+  lua_rawget(L, -2);
+  if (!lua_istable(L, -1)) {
+    return luaL_error(L, "the binding's namespace does not exist");
+  }
+  lua_pushlstring(L, name, length);
+  lua_pushvalue(L, 2);
+  lua_rawset(L, -3);
+  return 0;
+}
+
+int hetoimasia_lua_install_binding(
+  lua_State *L, HsStablePtr function,
+  const char *space, size_t space_length, const char *name, size_t length, int *acquired)
+{
+  *acquired = 0;
+  if (!lua_checkstack(L, 12)) {
+    return LUA_ERRMEM;
+  }
+  lua_pushcfunction(L, install_body);
+  lua_pushlightuserdata(L, function);
+  lua_pushlightuserdata(L, (void *) (size_t) space);
+  lua_pushinteger(L, (lua_Integer) space_length);
+  lua_pushlightuserdata(L, (void *) (size_t) name);
+  lua_pushinteger(L, (lua_Integer) length);
+  lua_pushlightuserdata(L, acquired);
+  return lua_pcall(L, 6, 0, 0);
 }
 
 static int getglobal_body(lua_State *L)

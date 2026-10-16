@@ -11,9 +11,11 @@
 -- frame left, so anything the diagnostic does that could raise a Lua error has
 -- nowhere for that error to go but Lua's panic function, which ends the
 -- process. That rules out more than it looks like: @luaL_ref@ can raise on a
--- memory error, and @lua_tolstring@ allocates when it converts a number. So the
--- bridge takes no registry reference at all, and reads a value only with
--- accessors that cannot allocate.
+-- memory error, and @lua_tolstring@ allocates when it converts a number. So
+-- reporting takes no @luaL_ref@ reference, and reads a value only with
+-- accessors that cannot allocate. (A loaded module does hold a registry slot, in
+-- a table the bridge keeps for the purpose; that is made and emptied inside
+-- protected calls and is never part of reporting.)
 --
 -- Every operation restores the stack depth it entered at, on the faulting paths
 -- as well as the successful one.

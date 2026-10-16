@@ -55,21 +55,76 @@
 -- never detaches a VM it cannot finish closing; it waits for it as the thread
 -- running a stuck finalizer does.
 --
+-- = Bindings, modules and values
+--
+-- An owner is configured with a 'Registration' the application built and a
+-- policy naming the namespaces of it that this owner exposes ('vmPolicy'); every
+-- other namespace is invisible to its scripts. The bindings are installed during
+-- construction, before any initial chunk or module runs, and the set is fixed
+-- for the VM's lifetime. A policy that names a namespace the registration does
+-- not declare ends construction, like any other initialization failure.
+--
+-- Application-owned modules ('ModuleSource') are source the application
+-- supplies under a name and version; the host reads nothing from disk. They load
+-- at initialization ('vmModules') or from the body ('loadModule'), each in an
+-- environment of its own, and are called through the entry points the
+-- application declared ('callEntry'). Values cross as bounded copies; see
+-- "Hetoimasia.Scripting.Lua.Value" for the rules and the limits.
+--
+-- = Faults across the boundary
+--
+-- A refusal of a value, a missing required entry point, a call to a binding of a
+-- kind that is not yet delivered and a failed module load are 'BoundaryFault's:
+-- ordinary Haskell exceptions that name the owner, the module and entry point or
+-- the binding, the operation, the source chunk, a bounded traceback when one was
+-- captured, a typed reason and an 'Effect'. A refusal made inside a binding call
+-- is a fault of the call: the owner's operation raises it even when the script
+-- caught Lua's side of it with @pcall@, so a script cannot hide it. 'Effect'
+-- says whether anything had happened by then: 'NoEffect' for a refusal before any
+-- Lua or binding action ran, 'LuaRan' once Lua had run, 'BindingRan' once a
+-- binding's action had, which means application state may have been changed. A
+-- fault never claims that recovery is safe. A Haskell failure raised by a
+-- binding's action is not converted: it is re-raised at this boundary with its
+-- own type and context.
+--
 -- = Shutdown
 --
 -- Before the state closes the owner closes admission: every operation asked of
 -- the VM is refused. A callback Lua's finalizers reach runs only if the owner's
--- finalizer allowlist names it, and the allowlist is empty: this module offers
--- no way to register a callback, which is LUA-3's. Any callback reached from a
--- finalizer is refused with 'FinalizerRefused', the refusal is retained as cleanup
--- evidence even if the finalizer's script caught the error, and what is retained
--- from finalizers is bounded.
+-- finalizer allowlist names it, and the allowlist is exactly the bindings of the
+-- granted namespaces that the registration declares finalizer-eligible: none by
+-- default. Any other binding reached from a finalizer is refused with
+-- 'FinalizerRefused', the refusal is retained as cleanup evidence even if the
+-- finalizer's script caught the error, and what is retained from finalizers is
+-- bounded. A lifecycle binding on the allowlist still executes nothing: it is not
+-- yet delivered.
 module Hetoimasia.Scripting.Lua.Owner
   ( -- * The lifetime
     VmConfig (..)
   , vmConfig
   , withVmOwner
   , OwnedVm
+
+    -- * Application-owned modules
+  , ModuleSource (..)
+  , ModuleRef (..)
+  , EntryPoint (..)
+  , Requirement (..)
+  , ModuleHandle
+  , CallResult (..)
+  , loadModule
+  , callEntry
+  , maxModules
+  , maxSourceBytes
+  , maxEntries
+  , maxIdentityLength
+
+    -- * Faults across the boundary
+  , BoundaryFault (..)
+  , FaultOperation (..)
+  , FaultReason (..)
+  , Effect (..)
+  , ModuleProblem (..)
 
     -- * Running Lua
   , evalOwned
@@ -99,7 +154,16 @@ module Hetoimasia.Scripting.Lua.Owner
   ) where
 
 import Data.ByteString (ByteString)
+import Data.Text (Text)
 import GHC.Stack (HasCallStack)
+import Hetoimasia.Scripting.Lua.Internal.Boundary
+  ( BoundaryFault (..)
+  , Effect (..)
+  , FaultOperation (..)
+  , FaultReason (..)
+  , ModuleProblem (..)
+  , ModuleRef (..)
+  )
 import Hetoimasia.Scripting.Lua.Internal.Call (ChunkName, chunkName, chunkNameText)
 import Hetoimasia.Scripting.Lua.Internal.Fault
   ( CloseFailure (..)
@@ -116,14 +180,36 @@ import Hetoimasia.Scripting.Lua.Internal.Fault
   , closeSourceLabel
   )
 import Hetoimasia.Scripting.Lua.Internal.Library (Library (..))
+import Hetoimasia.Scripting.Lua.Internal.Module
+  ( CallResult (..)
+  , EntryPoint (..)
+  , ModuleHandle
+  , ModuleSource (..)
+  , Requirement (..)
+  , maxEntries
+  , maxIdentityLength
+  , maxModules
+  , maxSourceBytes
+  )
+import qualified Hetoimasia.Scripting.Lua.Internal.Module as Module
 import Hetoimasia.Scripting.Lua.Internal.Owner
   ( OwnedVm
-  , OwnerConfig (ownerChunks)
+  , OwnerConfig
+      ( ownerChunks
+      , ownerGranted
+      , ownerLimits
+      , ownerModules
+      , ownerName
+      , ownerRegistration
+      )
   , callOwned
   , defaultOwnerConfig
   , evalOwned
+  , ownedHost
   , withOwnedVm
   )
+import Hetoimasia.Scripting.Lua.Internal.Registration (Registration, emptyRegistration)
+import Hetoimasia.Scripting.Lua.Internal.Value (Value, ValueLimits, defaultValueLimits)
 
 -- | What a VM owner constructs.
 data VmConfig = VmConfig
@@ -134,11 +220,25 @@ data VmConfig = VmConfig
     -- ^ The chunks loaded and run, in order, inside the lifetime and before the
     -- body: initialization. One that fails ends the lifetime with its failure,
     -- after closing the VM.
+  , vmOwnerName ∷ Text
+    -- ^ How this owner is named in a fault.
+  , vmRegistration ∷ Registration
+    -- ^ What the application registered. Shared by any number of owners.
+  , vmPolicy ∷ [Text]
+    -- ^ The namespaces of the registration this owner exposes. Only these are
+    -- visible to its scripts.
+  , vmValueLimits ∷ ValueLimits
+    -- ^ The bounds on every value that crosses for this owner.
+  , vmModules ∷ [ModuleSource]
+    -- ^ Modules loaded inside the lifetime, in order, after the initial chunks
+    -- and before the body. One that fails ends the lifetime with its fault, after
+    -- closing the VM.
   }
 
--- | A configuration over these libraries with no initial chunk.
+-- | A configuration over these libraries with no initial chunk, an empty
+-- registration, no exposed namespace, the default value limits and no module.
 vmConfig ∷ [Library] → VmConfig
-vmConfig libraries = VmConfig libraries []
+vmConfig libraries = VmConfig libraries [] "owner" emptyRegistration [] defaultValueLimits []
 
 -- | Run a body over a VM this owner constructs, and close the VM on every exit.
 --
@@ -147,4 +247,33 @@ vmConfig libraries = VmConfig libraries []
 -- for who may use it, how it ends and where a cancellation can land.
 withVmOwner ∷ HasCallStack ⇒ VmConfig → (OwnedVm → IO r) → IO r
 withVmOwner config =
-  withOwnedVm ((defaultOwnerConfig (vmLibraries config)) {ownerChunks = vmInitialChunks config})
+  withOwnedVm
+    (defaultOwnerConfig (vmLibraries config))
+      { ownerChunks = vmInitialChunks config
+      , ownerName = vmOwnerName config
+      , ownerRegistration = vmRegistration config
+      , ownerGranted = vmPolicy config
+      , ownerLimits = vmValueLimits config
+      , ownerModules = vmModules config
+      }
+
+-- | Load a module from the owner's body, in an environment of its own.
+--
+-- Refused before anything runs, with 'NoEffect': an identity the owner already
+-- holds (there is no live reload), an invalid identity or entry point, source or
+-- entry points past their bounds. A required entry point the source does not
+-- define as a function fails the load, naming module and entry. The owner's
+-- thread only; used by any other thread it is refused with 'VmNotOwned', and
+-- once the lifetime has ended with 'VmClosed'.
+loadModule ∷ HasCallStack ⇒ OwnedVm → ModuleSource → IO ModuleHandle
+loadModule owned = Module.loadModule (ownedHost owned)
+
+-- | Call a module's entry point with bounded values.
+--
+-- The handle must be one this owner issued: a handle another owner issued is
+-- refused with 'ModuleHandleForeign', and one used after its owner's lifetime
+-- with 'VmClosed'. An optional entry point the module does not define answers
+-- 'EntryAbsent' and runs nothing; a required one that is gone is a fault, and an
+-- entry point that is present and is not a function is a fault in either case.
+callEntry ∷ HasCallStack ⇒ OwnedVm → ModuleHandle → Text → [Value] → IO CallResult
+callEntry owned = Module.callEntry (ownedHost owned)

@@ -7,7 +7,9 @@
 -- supported VM with no standard library at all.
 --
 -- Which libraries a given domain may have is not decided here. This module only
--- makes each one separately nameable; the per-domain allowlist is LUA-3's.
+-- makes each one separately nameable; which libraries an owner opens is the
+-- application's configuration, and the namespaces it exposes beside them are the
+-- owner's policy over a registration (LUA-3).
 --
 -- @coroutine@ and @utf8@ are absent because the binding exports no opener for
 -- them. Adding one is a change to the binding, not a policy decision here.
