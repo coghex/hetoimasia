@@ -10,6 +10,7 @@ module Test.Lua.Boundary.Bindings (spec) where
 import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (SomeException, fromException, try)
+import GHC.Conc (getAllocationCounter)
 import Data.IORef (readIORef, writeIORef)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
@@ -344,6 +345,17 @@ spec = describe "bindings called from Lua" $ do
         fault ← runFault owned "sample.submit('huge')"
         fmap refusalRule (refusal fault) `shouldBe` Just (RuleBytesLimit commandReasonLimit)
         boundaryEffect fault `shouldBe` BindingRan
+
+    it "refuses a rejection reason far past the bound without copying it" $ do
+      fixture ← newFixture
+      -- Built and measured before the call: refusing it costs no copy of it.
+      Text.length giantReason `shouldBe` 20000000
+      withOwner fixture ["sample"] $ \owned → do
+        before ← getAllocationCounter
+        fault ← runFault owned "sample.submit('giant')"
+        after ← getAllocationCounter
+        fmap refusalRule (refusal fault) `shouldBe` Just (RuleBytesLimit commandReasonLimit)
+        (before - after) `shouldSatisfy` (< 2000000)
 
     it "classifies asynchronous and lifecycle bindings and refuses a call as not yet supported, under pcall too" $ do
       fixture ← newFixture

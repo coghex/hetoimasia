@@ -157,6 +157,14 @@ int hetoimasia_lua_load_module(
 int hetoimasia_lua_module_release(lua_State *L, lua_Integer slot);
 
 /*
+** Pay what the host-side phases that held the collector allocated, as a
+** collection step. A step can run `__gc` finalizers, which are script-defined
+** Lua, so this is called only where script code may run: just before an entry
+** point is called, and when a binding returns to its script.
+*/
+void hetoimasia_lua_gc_service(lua_State *L);
+
+/*
 ** Look an entry point up in a module's own environment by raw access, so no
 ** metamethod runs. `*kind` is 0 for absent, 1 for something that is not a
 ** function and 2 for a function; the stack gains exactly one value, the

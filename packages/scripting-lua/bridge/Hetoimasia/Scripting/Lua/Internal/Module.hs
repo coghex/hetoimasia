@@ -372,6 +372,9 @@ callEntry host handle name arguments =
               fault (ScriptFailed (classify status) value) NoEffect Nothing
             PushMalformed which →
               lua_settop state entry >> fault (InternalError ("an argument could not be built: " <> Text.pack (show which))) NoEffect Nothing
+          -- The entry point may run script code, so what building its arguments
+          -- allocated while the collector was held is paid now.
+          serviceCollector state
           (called, trace) ← callProtected state (length arguments) (-1)
           if called /= LUA_OK
             then do

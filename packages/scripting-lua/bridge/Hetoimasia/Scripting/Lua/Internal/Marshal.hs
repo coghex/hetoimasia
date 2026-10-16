@@ -30,6 +30,7 @@ module Hetoimasia.Scripting.Lua.Internal.Marshal
     -- * Calling
   , callProtected
   , captureContext
+  , serviceCollector
   , traceLimit
   ) where
 
@@ -114,6 +115,10 @@ foreign import ccall safe "hetoimasia_lua_values.h hetoimasia_lua_module_release
 
 foreign import ccall safe "hetoimasia_lua_values.h hetoimasia_lua_entry_lookup"
   c_entry_lookup ∷ State → Int64 → Ptr CChar → CSize → Ptr CInt → Ptr CInt → IO StatusCode
+
+-- Safe: a collection step runs finalizers, which can call back into Haskell.
+foreign import ccall safe "hetoimasia_lua_values.h hetoimasia_lua_gc_service"
+  c_gc_service ∷ State → IO ()
 
 foreign import ccall safe "hetoimasia_lua_values.h hetoimasia_lua_context"
   c_context ∷ State → Ptr CChar → CSize → Ptr CSize → Ptr CChar → CSize → Ptr CSize → IO StatusCode
@@ -377,6 +382,12 @@ moduleReferences state =
     status ← c_module_count state count
     found ← peek count
     pure (if status /= LUA_OK then Left status else Right (fromIntegral found))
+
+-- | Pay what the host-side phases, which hold the collector, allocated since it
+-- was last paid, as a collection step. Where script code may run, and only there:
+-- a step can run finalizers.
+serviceCollector ∷ State → IO ()
+serviceCollector = c_gc_service
 
 -- | Empty a module's slot.
 releaseModule ∷ State → Int → IO StatusCode

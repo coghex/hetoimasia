@@ -6,32 +6,104 @@
 #include <string.h>
 
 /*
-** The collector is held across every host-side phase.
+** The collector is held across every host-side phase that allocates.
 **
 ** Allocating in Lua can start a collection step, and a step can run pending
 ** `__gc` finalizers, which are script-defined Lua and can call bindings. A phase
-** that is claimed to execute nothing -- looking an entry point up, reading
-** arguments, building results, loading a module up to the point its chunk starts
-** -- would then not be what it claims. So each of them stops the collector first
-** and gives it back as it was found: `lua_gc(LUA_GCISRUNNING)` is false if a
-** script already stopped it, or while a finalizer is running, and then there is
-** nothing to hold or to give back. Neither call can raise an error or run Lua.
-** What the held collector owes is paid by the next script phase.
+** that is claimed to execute nothing -- reading arguments, building results,
+** loading a module up to the point its chunk starts -- would then not be what it
+** claims. So each of them stops the collector first and gives it back as it was
+** found: `lua_gc(LUA_GCISRUNNING)` is false if a script already stopped it, or
+** while a finalizer is running, and then there is nothing to hold or to give
+** back. Neither call can raise an error or run Lua.
+**
+** Giving the collector back clears its debt, so what the held phase allocated
+** would never count towards a step: a loop of crossings whose script phases do
+** not allocate would grow without bound. The bytes a phase allocated are
+** therefore kept as owed, in the module table at key 0, and `gc_service` pays
+** them -- as a step of that many kilobytes -- at the start of a phase that is
+** allowed to execute script code: the point a module's chunk starts, just before
+** an entry point is called, and when a binding returns to its script.
+**
+** Calling a C function can itself grow the stack and so start a step, which is
+** why even the entry-point lookup, which allocates nothing, is held.
 */
-static int gc_hold(lua_State *L)
+typedef struct {
+  int was;
+  long before;
+} gc_hold_t;
+
+static long heap_bytes(lua_State *L)
 {
-  int was = lua_gc(L, LUA_GCISRUNNING);
-  if (was) {
-    lua_gc(L, LUA_GCSTOP);
-  }
-  return was;
+  return (long) lua_gc(L, LUA_GCCOUNT) * 1024L + (long) lua_gc(L, LUA_GCCOUNTB);
 }
 
-static void gc_release(lua_State *L, int was)
+static gc_hold_t gc_hold(lua_State *L)
 {
-  if (was) {
-    lua_gc(L, LUA_GCRESTART);
+  gc_hold_t h;
+  h.was = lua_gc(L, LUA_GCISRUNNING);
+  h.before = 0;
+  if (h.was) {
+    h.before = heap_bytes(L);
+    lua_gc(L, LUA_GCSTOP);
   }
+  return h;
+}
+
+static char modules_key;
+
+/* Add to (or, with a negative amount, take from) what is owed. The key exists
+** from the set-up, so setting it allocates nothing. */
+static long owed_add(lua_State *L, long bytes)
+{
+  long owed = 0;
+  if (!lua_checkstack(L, 4)) {
+    return 0;
+  }
+  lua_rawgetp(L, LUA_REGISTRYINDEX, &modules_key);
+  if (lua_istable(L, -1)) {
+    lua_rawgeti(L, -1, 0);
+    if (lua_isinteger(L, -1)) {
+      owed = (long) lua_tointeger(L, -1);
+    }
+    lua_pop(L, 1);
+    owed += bytes;
+    if (owed < 0) {
+      owed = 0;
+    }
+    lua_pushinteger(L, (lua_Integer) owed);
+    lua_rawseti(L, -2, 0);
+  }
+  lua_pop(L, 1);
+  return owed;
+}
+
+static void gc_release(lua_State *L, gc_hold_t h)
+{
+  if (h.was) {
+    long delta = heap_bytes(L) - h.before;
+    lua_gc(L, LUA_GCRESTART);
+    if (delta > 0) {
+      owed_add(L, delta);
+    }
+  }
+}
+
+/* Pay what the held phases allocated, as one step of that many kilobytes. This
+** can run finalizers, so it is called only where script code may run. */
+static void gc_service(lua_State *L)
+{
+  long owed = owed_add(L, 0);
+  if (owed > 0 && lua_gc(L, LUA_GCISRUNNING)) {
+    long kilobytes = owed / 1024 + 1;
+    owed_add(L, -owed);
+    lua_gc(L, LUA_GCSTEP, (int) (kilobytes > 1000000 ? 1000000 : kilobytes));
+  }
+}
+
+void hetoimasia_lua_gc_service(lua_State *L)
+{
+  gc_service(L);
 }
 
 /* The deepest a value may nest, whatever limit a configuration asks for. It
@@ -41,7 +113,6 @@ static void gc_release(lua_State *L, int was)
 /* Registry keys are the addresses of these, as light userdata: reading one
 ** neither allocates nor can raise, and nothing a script does can name it. */
 static char handle_key;
-static char modules_key;
 
 /* A handle, as Lua holds it: the VM that issued it, the application's type for
 ** it, and the application's key within that type. */
@@ -372,7 +443,7 @@ int hetoimasia_lua_read_values(
   reader r;
   int status;
   int i;
-  int held = gc_hold(L);
+  gc_hold_t held = gc_hold(L);
 
   memset(&r, 0, sizeof r);
   r.max_bytes = max_bytes;
@@ -556,7 +627,7 @@ int hetoimasia_lua_push_values(
 {
   writer w;
   int status;
-  int held = gc_hold(L);
+  gc_hold_t held = gc_hold(L);
   w.p = buffer;
   w.end = buffer + length;
   w.max_depth = max_depth > MAX_DEPTH_HARD ? MAX_DEPTH_HARD : max_depth;
@@ -619,7 +690,11 @@ static int setup_body(lua_State *L)
   lua_setfield(L, -2, "__tostring");
   lua_pushcfunction(L, handle_eq);
   lua_setfield(L, -2, "__eq");
-  lua_createtable(L, 0, 0);
+  lua_createtable(L, 1, 0);
+  /* What the held collector owes (see `gc_service`); present from the start so
+  ** that updating it allocates nothing. */
+  lua_pushinteger(L, 0);
+  lua_rawseti(L, -2, 0);
   lua_rawsetp(L, LUA_REGISTRYINDEX, &modules_key);
   lua_rawsetp(L, LUA_REGISTRYINDEX, &handle_key);
   return 0;
@@ -627,7 +702,7 @@ static int setup_body(lua_State *L)
 
 int hetoimasia_lua_values_setup(lua_State *L)
 {
-  int held = gc_hold(L);
+  gc_hold_t held = gc_hold(L);
   int status;
   if (!lua_checkstack(L, 8)) {
     gc_release(L, held);
@@ -647,7 +722,10 @@ static int count_body(lua_State *L)
   if (lua_istable(L, -1)) {
     lua_pushnil(L);
     while (lua_next(L, -2)) {
-      n++;
+      /* Key 0 is not a module: it is what the collector owes. */
+      if (!(lua_isinteger(L, -2) && lua_tointeger(L, -2) == 0)) {
+        n++;
+      }
       lua_pop(L, 1);
     }
   }
@@ -657,7 +735,7 @@ static int count_body(lua_State *L)
 
 int hetoimasia_lua_module_count(lua_State *L, long *count)
 {
-  int held = gc_hold(L);
+  gc_hold_t held = gc_hold(L);
   int status;
   *count = 0;
   if (!lua_checkstack(L, 8)) {
@@ -873,7 +951,7 @@ typedef struct {
   int missing;
   int missing_kind;
   int stored;
-  int gc_held;
+  gc_hold_t gc_held;
   int started;
 } load_arguments;
 
@@ -881,9 +959,9 @@ typedef struct {
 ** load is over without it. */
 static void load_release(lua_State *L, load_arguments *a)
 {
-  if (a->gc_held) {
+  if (a->gc_held.was) {
     gc_release(L, a->gc_held);
-    a->gc_held = 0;
+    a->gc_held.was = 0;
   }
 }
 
@@ -915,6 +993,8 @@ static int load_body(lua_State *L)
   /* Everything up to here executed nothing. */
   load_release(L, a);
   a->started = 1;
+  /* The chunk may run script code, so what the load allocated is paid now. */
+  gc_service(L);
   lua_call(L, 0, 0);
 
   p = a->required;
@@ -982,7 +1062,8 @@ int hetoimasia_lua_load_module(
   a.missing_kind = 0;
   a.stored = 0;
   a.started = 0;
-  a.gc_held = 0;
+  a.gc_held.was = 0;
+  a.gc_held.before = 0;
   *started = 0;
   *trace_length = 0;
   *load_status = LUA_OK;
@@ -1033,7 +1114,7 @@ static int release_body(lua_State *L)
 
 int hetoimasia_lua_module_release(lua_State *L, lua_Integer slot)
 {
-  int held = gc_hold(L);
+  gc_hold_t held = gc_hold(L);
   int status;
   if (!lua_checkstack(L, 6)) {
     gc_release(L, held);
@@ -1072,9 +1153,25 @@ static int lookup_body(lua_State *L)
     return 1;
   }
   a->found = 1;
-  lua_pushlstring(L, a->name, a->length);
-  lua_rawget(L, -2);
-  type = lua_type(L, -1);
+  /* Found by walking the environment and comparing string keys in place, so that
+  ** nothing is allocated: building the key to look it up with could start a
+  ** collection step, and a step can run finalizers. Raw, like a lookup by key. */
+  lua_pushnil(L); /* the answer, if there is none */
+  lua_pushnil(L); /* the traversal's key */
+  while (lua_next(L, -3)) {
+    if (lua_type(L, -2) == LUA_TSTRING) {
+      size_t n;
+      const char *key = lua_tolstring(L, -2, &n);
+      if (n == a->length && (n == 0 || memcmp(key, a->name, n) == 0)) {
+        lua_copy(L, -1, 3);
+        break;
+      }
+    }
+    lua_pop(L, 1);
+  }
+  /* The environment is at 2, the answer at 3. */
+  lua_settop(L, 3);
+  type = lua_type(L, 3);
   if (type == LUA_TNIL) {
     a->kind = 0;
   } else if (type == LUA_TFUNCTION) {
@@ -1092,12 +1189,12 @@ int hetoimasia_lua_entry_lookup(
 {
   lookup_arguments a;
   int status;
+  gc_hold_t held = gc_hold(L);
   a.slot = slot;
   a.name = name;
   a.length = length;
   a.kind = 0;
   a.found = 0;
-  int held = gc_hold(L);
   *kind = 0;
   *found_module = 0;
   if (!lua_checkstack(L, 8)) {

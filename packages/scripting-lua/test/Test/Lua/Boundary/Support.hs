@@ -13,6 +13,7 @@ module Test.Lua.Boundary.Support
   , sampleRegistration
   , sampleConfig
   , libraries
+  , giantReason
   , withOwner
   , withOwnerOf
   , chunk
@@ -174,6 +175,7 @@ sampleRegistration fixture = ok (registration [capabilityType "ticket" alive, ca
             pure $ case arguments of
               [VText "bad"] → Rejected "not allowed"
               [VText "huge"] → Rejected (Text.replicate (commandReasonLimit + 1) "r")
+              [VText "giant"] → Rejected giantReason
               _ → Accepted
         , snapshotQuery "ticket" [SInteger] [SCapability "ticket"] $ \arguments → do
             note fixture "ticket"
@@ -226,6 +228,11 @@ sampleRegistration fixture = ok (registration [capabilityType "ticket" alive, ca
     recordSchema = SRecord [("name", SText), ("count", SInteger), ("note", SOptional SText)]
     render [VText text] = text
     render _ = "?"
+
+-- | A rejection reason of twenty million bytes, built once and shared.
+giantReason ∷ Text
+giantReason = Text.replicate 20000000 "g"
+{-# NOINLINE giantReason #-}
 
 -- | The standard libraries every example's owner opens.
 libraries ∷ [Library]

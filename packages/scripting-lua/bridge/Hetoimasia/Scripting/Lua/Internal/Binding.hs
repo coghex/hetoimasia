@@ -43,12 +43,11 @@ module Hetoimasia.Scripting.Lua.Internal.Binding
 
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, fromException, toException)
 import Control.Monad (foldM, forM_, unless, when)
-import qualified Data.ByteString as ByteString
 import Data.List (nub)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
+import Data.Text.Unsafe (lengthWord8)
 import qualified Data.Text as Text
-import qualified Data.Text.Encoding as Text
 import GHC.Stack (HasCallStack)
 import Hetoimasia.Foundation.Failure (Operation, operation, throwFailure, withOperationContext)
 import Hetoimasia.Scripting.Lua.Internal.Boundary
@@ -209,7 +208,9 @@ valueHandler boundary vm space binding state restore = do
           case answer of
             Accepted → pure [VBoolean True, VNil]
             Rejected reason
-              | ByteString.length (Text.encodeUtf8 reason) > commandReasonLimit →
+              -- Its length in bytes without copying it: the text is the application's
+              -- and may be as large as memory allows.
+              | lengthWord8 reason > commandReasonLimit →
                   refuseResults 2 [] (RuleBytesLimit commandReasonLimit)
               | otherwise → pure [VBoolean False, VText reason]
       let expected = bindingResults binding
@@ -227,7 +228,11 @@ valueHandler boundary vm space binding state restore = do
         Right bytes → pure bytes
       pushed ← pushValues state limits encoded (length produced)
       case pushed of
-        Pushed → pure (NumResults (fromIntegral (length produced)))
+        Pushed → do
+          -- Back to the script: what building its results allocated while the
+          -- collector was held is paid now.
+          serviceCollector state
+          pure (NumResults (fromIntegral (length produced)))
         PushStatus status → do
           value ← renderFailure state entry
           lua_settop state entry

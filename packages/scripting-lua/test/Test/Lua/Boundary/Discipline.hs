@@ -20,6 +20,7 @@ module Test.Lua.Boundary.Discipline (spec) where
 import Control.Exception (SomeException, fromException, try)
 import Control.Monad (forM, forM_, replicateM_)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
+import qualified Data.Map.Strict as Map
 import Data.List (nub)
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -129,6 +130,31 @@ spec = describe "discipline" $ do
       end ← reading owned
       (readDepth end, readSlot end) `shouldBe` (readDepth start, readSlot start)
       readModules end `shouldBe` 40
+
+  it "keeps the heap bounded across many crossings whose script phases allocate nothing" $ do
+    fixture ← newFixture
+    withOwner fixture ["sample"] $ \owned → do
+      handle ← loadModule owned (ModuleSource (ModuleRef "echo" "1") "function echo(s) return s end" [EntryPoint "echo" Required [SText] [SText]])
+      let kilobytes = do
+            run owned "sample.set_value('kb', math.floor(collectgarbage('count')))"
+            Map.findWithDefault 0 "kb" <$> stateOf fixture
+          kib = VText (Text.replicate 1024 "x")
+      -- Warmed, then a collection, so the start is the live size.
+      mapM_ (const (callEntry owned handle "echo" [kib])) [1 .. 100 ∷ Int]
+      run owned "collectgarbage()"
+      start ← kilobytes
+      mapM_ (const (callEntry owned handle "echo" [kib])) [1 .. 10000 ∷ Int]
+      afterEntries ← kilobytes
+      -- Ten thousand one-KiB arguments are ten megabytes of garbage if nothing
+      -- ever pays for them; collected as they go, the heap stays near its start.
+      (afterEntries - start) `shouldSatisfy` (< 2048)
+      -- The same through a binding's results, in one chunk whose own code
+      -- allocates nothing but the calls' arguments and results.
+      run owned "collectgarbage()"
+      middle ← kilobytes
+      run owned "local s = ('x'):rep(1024); for i = 1, 10000 do sample.echo_text(s) end"
+      afterBindings ← kilobytes
+      (afterBindings - middle) `shouldSatisfy` (< 2048)
 
   it "releases the module's reference when the owner closes, finalizing what it held" $ do
     fixture ← newFixture
