@@ -14,18 +14,30 @@ that later slices implement against. See
 
 The **protected VM owner** (LUA-2) is here: one VM held through a bracket-shaped
 IO lifetime that closes it on every exit and keeps the primary failure and the
-close's failures as cleanup evidence. See [The VM owner](#the-vm-owner). The
-capability registration surface and any game binding are later slices of
+close's failures as cleanup evidence. See [The VM owner](#the-vm-owner).
+
+The **registration and value boundary** (LUA-3) is here too: an application
+registers named bindings once, gives each owner a policy naming the namespaces it
+exposes, supplies its own Lua modules, and calls their entry points with bounded
+copied values. See
+[Registration, modules and bounded values](#registration-modules-and-bounded-values).
+Any concrete game namespace, the scheduler, asynchronous requests and the
+confined path are later slices of
 [the Lua runtime design](../../docs/lua_runtime_design.md). What is here is the
 boundary they will be built on, and the evidence that it holds.
 
 ## What the boundary exposes
 
-Two modules are public. `Hetoimasia.Scripting.Lua.Owner` is the protected VM
+Four modules are public. `Hetoimasia.Scripting.Lua.Owner` is the protected VM
 owner, described under [The VM owner](#the-vm-owner): `withVmOwner`, the owned
-VM it lends its body, and `evalOwned` and `callOwned` on it. A VM it constructs
-is an `OwnedVm`, which is not the bridge's `Vm`, so nothing below accepts it: no
-bridge operation can run Lua on a managed VM or close it behind its owner's back.
+VM it lends its body, `evalOwned` and `callOwned` on it, and the module and
+entry-point operations of
+[the value boundary](#registration-modules-and-bounded-values). A VM it
+constructs is an `OwnedVm`, which is not the bridge's `Vm`, so nothing below
+accepts it: no bridge operation can run Lua on a managed VM or close it behind
+its owner's back. `Hetoimasia.Scripting.Lua.Registration` and
+`Hetoimasia.Scripting.Lua.Value` are what an application registers and what
+crosses; they hold no VM.
 
 `Hetoimasia.Scripting.Lua.Bridge` is the lower, unmanaged surface. Its callers
 close what they construct themselves, and it is what the owner is built on:
@@ -44,12 +56,13 @@ outside the package can depend on. `Test.Lua.Opacity` compiles clients that try
 each of those reaches and requires the compiler to refuse them, and one client
 that uses the whole public contract and requires it to link and run.
 
-Two absences are deliberate, in both modules. There is no way to register a
-Haskell function:
-module identity, capability namespaces, and per-domain policy are LUA-3's, and
-installing callbacks without them is how a bridge acquires a surface nobody
-reviewed. And there is no call that opens "all the libraries": `newVm` takes the
-list, and `[]` is a VM with no standard library at all.
+Two absences are deliberate. There is no way to hand Lua a bare Haskell function
+from `Bridge` or from the owner: a Haskell function reaches a script only as a
+binding of a validated `Registration`, in a namespace the owner's policy grants,
+with schemas for what crosses, because installing callbacks without them is how a
+bridge acquires a surface nobody reviewed. And there is no call that opens "all
+the libraries": `newVm` takes the list, and `[]` is a VM with no standard
+library at all.
 
 ## The binding, and why this one
 
@@ -159,9 +172,15 @@ they are not equally bad.
 
 **From inside a callback.** A protected frame exists — the caller's `lua_pcall`,
 further out — so a raise here `longjmp`s *out of a Haskell frame* to reach it.
-That is undefined behaviour, not an error report. So the callback entry uses
-only operations that allocate nothing: `lua_pushboolean` for a boolean result,
-and a light userdata for the failure marker rather than a string.
+That is undefined behaviour, not an error report. So the callback entry itself
+uses only operations that allocate nothing: `lua_pushboolean` for a boolean
+result, and a light userdata for the failure marker rather than a string. A
+registered binding, which has to read and build values, does that work in
+`hetoimasia_lua_values.c`, each operation one `lua_pcall` whose body may raise
+freely because the only frames between it and its `lua_pcall` are C: reading the
+arguments, pushing the results and capturing the caller's context are each such a
+call, made as a `safe` foreign call from the callback's thread, so exhaustion is
+a status the handler turns into a typed fault and never an unwind.
 
 **From Haskell, outside any protected frame.** A raise here finds no frame at
 all and runs Lua's panic function, which ends the process. Everything this
@@ -176,7 +195,7 @@ package does from that position is therefore either non-allocating or wrapped:
 - Publishing a callback, reading a global, and opening a standard library each
   run entirely inside one `lua_pcall`, including the `lua_pushlstring` that
   builds their names. The binding's wrappers push those names first.
-- Reporting a fault takes no registry reference (`luaL_ref` can raise) and calls
+- Reporting a fault takes no `luaL_ref` reference (`luaL_ref` can raise) and calls
   `lua_tolstring` only on a value that is already a string, where it converts
   nothing; a number is read with the non-allocating accessors and formatted in
   Haskell. `Test.Lua.Faults` pins that — a numeric error value renders in
@@ -444,14 +463,20 @@ failure is raised, and a failure of that close is retained beside it.
 
 ```haskell
 withVmOwner ∷ VmConfig → (OwnedVm → IO r) → IO r
-data VmConfig = VmConfig { vmLibraries ∷ [Library], vmInitialChunks ∷ [(ChunkName, ByteString)] }
+data VmConfig = VmConfig
+  { vmLibraries ∷ [Library], vmInitialChunks ∷ [(ChunkName, ByteString)]
+  , vmOwnerName ∷ Text, vmRegistration ∷ Registration, vmPolicy ∷ [Text]
+  , vmValueLimits ∷ ValueLimits, vmModules ∷ [ModuleSource] }
 vmConfig    ∷ [Library] → VmConfig
 evalOwned   ∷ OwnedVm → ChunkName → ByteString → IO ()
 callOwned   ∷ OwnedVm → Text → IO ()
+loadModule  ∷ OwnedVm → ModuleSource → IO ModuleHandle
+callEntry   ∷ OwnedVm → ModuleHandle → Text → [Value] → IO CallResult
 ```
 
 `withVmOwner` constructs one VM over exactly the libraries named (the empty list
-opens none), loads the initial chunks inside the lifetime, hands the body that VM
+opens none), installs the registration's granted bindings, loads the initial
+chunks and the initial modules inside the lifetime, hands the body that VM
 and only that VM, and closes it on every exit. It depends on foundation and the
 binding and on nothing else: no runtime, GLFW, Vulkan or game package (P-1).
 `OwnedVm` exposes no Lua state, stack index, registry reference, coroutine,
@@ -459,8 +484,9 @@ closure or native address, and no way to close the VM: only the lifetime does.
 
 The lifetime, in order: the interpreter and its control state are allocated,
 masked (a failure here leaves nothing to close); initialization runs with the
-caller's masking state restored — the libraries in order, then the initial chunks
-in order; the body runs unless initialization failed; the VM is closed, whatever
+caller's masking state restored — the libraries in order, then the granted
+bindings, then the initial chunks in order, then the initial modules in order;
+the body runs unless initialization failed; the VM is closed, whatever
 ended the steps before it; every cancellation still pending is taken at one
 place, and the outcome is composed. The VM is never reachable half-constructed:
 the body does not run unless every initialization step succeeded, and the VM a
@@ -559,9 +585,13 @@ it there, as it would keep any masked region.
 
 Before the state closes the owner closes admission: every operation asked of the
 VM is refused. A callback reached from a Lua finalizer runs only if the owner's
-finalizer allowlist names it. The allowlist's default is empty, and LUA-3's
-registration supplies entries; this package's public configuration offers no way
-to add one. Any other callback is refused with `FinalizerRefused` without running,
+finalizer allowlist names it. The allowlist is exactly the bindings of the
+namespaces the owner is granted that the registration declares
+finalizer-eligible, named `namespace.binding`; the default is empty because no
+binding is eligible by default, and the asynchronous kind can never be (P-3).
+The allowlist is applied before the call is dispatched: before its arguments are
+read, its handles checked or its action run. Any other binding is refused with
+`FinalizerRefused` without running,
 and the refusal is recorded as cleanup evidence even if the finalizer's script
 caught the error it raised. What is recorded from finalizers is bounded: the
 first 64 failures are kept in the order they happened, and one further entry says
@@ -586,6 +616,238 @@ to reach a state or a native handle through the owner or to bypass it with the
 bridge's operations, and one that uses the whole public owner contract and links
 and runs. Cancellation tests prove ordering, not Linux behavior: CI is what runs
 them where an asynchronous-exception race can differ.
+
+## Registration, modules and bounded values
+
+The registration and value boundary (LUA-3; design P-4, D-2, D-6, D-9, D-12 to
+D-15) is what an application uses to expose a narrow capability to its own
+scripts. It names no concrete namespace, depends on foundation and the binding
+only (P-1) — `Test.Lua.Boundary.Dependencies` reads the Cabal stanzas and the
+imports to check that — and grants nothing to a mod: confinement, IPC and
+asynchronous providers are later slices.
+
+### Registration
+
+A `Registration` is plain data and closures, built once and validated where it is
+built: `registration ∷ [CapabilityType] → [Namespace] → Either
+RegistrationRefusal Registration`. It holds application-named *namespaces* of
+named *bindings*, and the *capability types* the application's scripts may be
+handed. One registration is usable by any number of owners at once. A binding
+declares its kind, the schemas of its arguments and of its results, and three
+eligibilities (D-14):
+
+| Kind | Constructor | Delivered here | Answers |
+|---|---|---|---|
+| snapshot query | `snapshotQuery` | trusted direct path | values |
+| owned state operation | `stateOperation` | trusted direct path | values |
+| command or UI intention | `commandIntention` | trusted direct path | `true, nil` accepted, or `false, reason` (at most 256 UTF-8 bytes) as data |
+| asynchronous native request | `asynchronousNativeRequest` | classified only | a Lua call is a typed `NotYetSupported` fault; the action never runs |
+| lifecycle operation | `lifecycleOperation` | classified only | a Lua call is a typed `NotYetSupported` fault; the action never runs |
+
+The defaults are the safe ones: a binding is **direct-eligible** and nothing
+else, so a default registration exposes nothing to a mod
+(`confinedEligibleBindings` of one is empty) and a direct-only binding needs no
+IPC equivalent. `confinedEligible` is refused when any schema of the binding
+carries a capability, because a handle into one VM has no meaning to a process
+that cannot hold it, and it grants nothing by itself: no grant exists until the
+broker that enforces one. `finalizerEligible` is refused for the asynchronous
+kind. `withoutDirectPath` keeps an owner from installing the binding at all.
+
+Refused when the registration is built: an invalid or duplicate namespace,
+binding or capability-type name; a namespace that would shadow a global the
+standard libraries define (`standardGlobals`); a bound passed; a schema that is
+too deep or too wide, repeats a record field or names an undeclared capability
+type; a confined eligibility on a binding with a capability in its schemas; a
+finalizer eligibility on the asynchronous kind. Each bound is pinned by
+`Test.Lua.Boundary.Registration` at the bound and one past it:
+
+| What | Bound |
+|---|---|
+| a name | 1 to 64 ASCII letters, digits and underscores; not starting with a digit; not a Lua keyword |
+| namespaces in a registration | 64 |
+| bindings in a namespace | 256 |
+| capability types | 64 |
+| arguments, results to a binding | 16 each |
+| nesting of a schema | 8 |
+| fields of a record schema | 64 |
+
+### Per-owner policy
+
+An owner is configured with a registration and a policy, `vmPolicy`: the
+namespaces of it that this owner exposes beside its explicit standard-library set
+(D-15). Only granted namespaces are visible to its scripts. The bindings are
+installed during construction, inside the protected lifetime, after the libraries
+and before any initial chunk or module (P-3 step 2), and the set is fixed for the
+VM's lifetime. Only a binding eligible for the direct path is installed. The
+namespace tables and the bindings are created by raw access, so no metamethod of
+the globals runs. A policy naming a namespace the registration does not declare
+(`PolicyUnknownNamespace`), a failure to install, and memory running out while
+installing end construction like any other initialization failure: the VM is
+closed through the same close and the body never runs. Which standard libraries a
+script can reach is the owner's explicit set; the base library brings `dofile`
+and `loadfile`, so an owner that must not read the disk does not open it.
+
+### Modules and entry points
+
+A module is Lua source the application supplies under an identity, a name and a
+version (`ModuleSource`); the host reads nothing from disk and searches no path.
+It loads at initialization (`vmModules`; a failure ends the lifetime like an
+initial chunk) or from the body (`loadModule`), is known afterwards by an opaque
+`ModuleHandle`, and a second load under the same identity is refused: there is no
+live reload. Source is text only; a precompiled chunk is refused. Each module
+runs in an environment of its own (B1): its global assignments are private to it,
+and the owner's standard libraries and granted namespaces are visible to it by
+reading through to the globals. That is separation of names, not a security
+boundary. At most 256 modules, 1 MiB of source, 64 entry points and 128 bytes of
+name or version for one module; a name, version or entry point that does not fit
+is refused with `NoEffect` before anything runs.
+
+The application declares the entry points, each `Required` or `Optional`, with
+schemas for its arguments and results. They are looked up by raw access in the
+module's environment, so no lookup metamethod can supply or hide one:
+
+- a required entry point the module does not define as a function fails the load
+  with `EntryMissing`, naming module and entry;
+- at call time a required one that has gone is a fault, never an absent answer;
+- an optional one that is not there answers `EntryAbsent`: nothing runs and
+  nothing faults;
+- one that is present and is not a function is a fault, required or optional.
+
+### Values
+
+Values cross as bounded copies, in both directions: a binding's arguments and
+results, an entry point's arguments and results. A value is nil, a boolean, a
+64-bit integer, a float, a byte string, UTF-8 text, a list, a record or a
+capability. The rules:
+
+- Integers keep their exact value over the whole 64-bit range and floats stay
+  floats. An integer schema refuses every float, an integral one such as `1.0`
+  included; a float schema refuses integers; `SNumber` accepts either and keeps
+  which it was.
+- Byte strings and text are distinct schemas over Lua's one string type, and
+  invalid UTF-8 is refused where text is declared.
+- A list is a table whose keys are exactly `1..n`; a record is a table whose keys
+  are exactly its declared fields, an optional one possibly absent, and an
+  undeclared field is refused. Arity is exact.
+- Tables are read raw. A table carrying a metatable, even an empty one, is
+  refused, so a copy never depends on a metamethod and none runs. A table that
+  contains itself is refused as a cycle (sharing is not a cycle).
+- Functions, coroutines, light userdata, and userdata that is not a capability of
+  this VM are refused with a typed reason; so is a table key that is neither an
+  integer nor a string.
+
+A crossing is bounded by bytes, depth and elements, which together cover all the
+values of one call's arguments or one call's results: by default 64 KiB, depth 8
+and 4,096 elements, configurable with `vmValueLimits` up to 16 MiB, depth 64 and
+1,048,576 elements. Bytes are the size of the copy's encoding (1 for nil and a
+boolean, 9 for a number, 5 and the length for a string, 21 for a capability, and
+5 and the size of every key and value for a table), depth counts nested tables (a
+flat table is 1) and elements count every value of the copy, nested ones included
+and table keys not. The reader stops at the first limit it reaches, so the work
+it does is bounded by the limits and not by the input; a refusal's `visited`
+count is at most the element limit plus one. Each limit is pinned at the limit
+and one past it in `Test.Lua.Boundary.Bindings`, `Test.Lua.Boundary.Modules` and
+`Test.Lua.Boundary.Values`.
+
+### Handles
+
+A capability is an opaque identity the application hands its scripts: a type it
+declared and a key within it, issued by one VM. In Lua it is a userdata with a
+shared metatable that hides itself (`getmetatable` answers `false`), and copying
+it creates no new authority. Using one is checked every time, before the
+binding's action: it must have been issued by this VM (`RuleForeignHandle`), be of
+the declared type (`RuleHandleType`), and still be live by the application's own
+check for its type (`RuleRetiredHandle`), which runs at every use. A number, a
+table with the same fields or a string with the same contents is not a handle and
+is refused as the wrong kind of value. A module handle carries the identity of
+the VM that issued it: another owner's is refused (`ModuleHandleForeign`), and
+after the lifetime every use is `VmClosed`, as for the VM itself.
+
+### Calling a binding
+
+A Lua call to a delivered binding is, in order: the kind is checked (a binding of
+a kind not yet delivered is a `NotYetSupported` fault, decision A1); the argument
+count is checked; the arguments are read into a bounded copy; the copy is checked
+against the schemas, capabilities included; the action runs with copies and
+nothing else — it receives no `OwnedVm`, no Lua state and no handle to its own
+VM, so running Lua on or closing its own VM is refused with `VmReentered` and
+using another owner's VM with `VmNotOwned`; its results are checked against the
+result schemas and encoded under the limits; they are built in Lua. #460's rules
+for trusted callbacks hold: the callback thread's identity is published nowhere
+and nothing is left running past the action's return.
+
+A refusal is a **fault of the call** (decision C1): the binding does not run for
+a refused argument, and the owner's operation raises a typed `BoundaryFault`
+naming the binding, the argument and the rule, even if the script caught Lua's
+side of it with `pcall`. Refusing a result necessarily follows the action, and is
+just as observable. A Haskell failure raised by the action itself keeps #460's
+contract and is not converted: it is re-raised at the owner's boundary with its
+own type and context.
+
+### Fault evidence
+
+A `BoundaryFault` is an ordinary Haskell exception, produced with no Lua run to
+render it. It records the owner (by the name it was configured with, and the
+VM's identity), the operation (`InstallBindings`, `LoadModule`, `CallEntry`,
+`CallBinding`), the module's name and version and the entry point when a module
+was running, the binding's namespace and name, the source chunk the call was made
+from, a bounded traceback when one was captured, a typed reason, and an `Effect`:
+
+| Effect | Meaning |
+|---|---|
+| `NoEffect` | refused before any Lua or binding action ran |
+| `LuaRan` | Lua had run in the operation; no binding action had |
+| `BindingRan` | a binding's action had run: application state may have been changed |
+
+The traceback is produced by `luaL_traceback`, which consults no metamethod and
+runs no script-defined Lua, bounded at 2,048 bytes; failing to produce it leaves
+it out and never changes the fault. A non-string error value, or one whose handler
+failed, is reported by the existing bounded fallback (its Lua type name, never its
+`__tostring`). A fault never claims that recovery is safe: whether state may have
+changed is exactly `Effect`, and task and session identities arrive with later
+slices.
+
+### Registry, stack and memory discipline
+
+Every operation leaves the stack at the depth it entered at, on every path: a
+call, a refusal, a script's error, a failed load. A loaded module holds exactly
+one slot of a table the bridge keeps in the registry, for the owner's lifetime,
+and the close releases it. Failed loads, calls and refusals retain nothing. The
+slots are not `luaL_ref` references, so `probeReferenceSlot` stays where it was
+whatever is loaded; the live count is read from the table itself
+(`liveModuleReferences`), and `Test.Lua.Boundary.Discipline` checks both across
+more than a thousand calls, refusals and faults, and across repeated successful and
+failed loads.
+
+Memory running out at any step of installing, loading, calling or marshalling in
+either direction, inside a callback included, is the existing classified
+failure — `MemoryExhausted` as a `LuaFault`, or a `BoundaryFault` whose reason is
+`ScriptFailed MemoryExhausted` — never a panic, a Lua error unwinding through a
+Haskell frame, or a leaked reference. The guarantee is for the recoverable
+allocator failures Lua reports; an operating-system failure to obtain memory at
+all is outside it. A failed *initialization* closes the VM and never enters the
+body; "the state is usable afterwards" applies only to failures caught inside an
+initialized owner's body. The registration itself is plain Haskell, built outside
+the owner, so `ownerBudget` (which limits the interpreter's allocator) covers its
+installation in the VM and not its construction.
+
+### What proves it
+
+`Test.Lua.Boundary.*`, under the `value boundary` selector of the suite:
+registration (names, bounds at the bound and one past, eligibility, shadowing);
+values without an interpreter (the encoding, the limits, the schemas); bindings
+called from Lua (every rule above, the limits at the limit and one past with
+input far larger than the limit, results, `pcall` cases for the settled
+decisions, handles, `VmReentered` and `VmNotOwned`, an action's own failure);
+modules and entry points; the finalizer allowlist (`__gc` finalizers reaching an
+eligible binding, an ineligible one, an allowlisted lifecycle binding);
+independent owners on separate threads with different policies; installation;
+discipline, with the allocator's budget swept across installation, loading,
+calling and marshalling; and the dependency closure. `Test.Lua.Opacity` adds
+negative clients that forge a handle or a capability, reach for a binding's
+closure or for a Lua state, and a positive client built from the public modules
+alone that constructs a registration and an owner's policy, loads a module, calls
+an entry point and observes a typed refusal.
 
 ## The protocol model
 
@@ -792,6 +1054,14 @@ bridge's own are the rest:
 ```bash
 cabal test hetoimasia-scripting-lua:lua-host-tests \
   --test-show-details=direct --test-option=--match --test-option='VM owner'
+```
+
+The registration and value boundary's examples are the `value boundary`
+component of that same suite:
+
+```bash
+cabal test hetoimasia-scripting-lua:lua-host-tests \
+  --test-show-details=direct --test-option=--match --test-option='the value boundary'
 ```
 
 The protocol model's examples are the `Protocol` component of that same suite:
