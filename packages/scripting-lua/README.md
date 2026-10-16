@@ -809,6 +809,13 @@ from, a bounded traceback when one was captured, a typed reason, and an `Effect`
 | `LuaRan` | Lua had run in the operation; no binding action had |
 | `BindingRan` | a binding's action had run: application state may have been changed |
 
+The effect is the one the operation ended with, not the one at the first fault: a
+refusal the script caught is the operation's failure, and if a binding's action
+runs after it the fault says `BindingRan`. The module and entry point are named
+only when the call was made from that module's own code; a fault raised by
+another module's `__gc` finalizer while an entry point runs names the chunk that
+made the call and no module.
+
 The traceback is built from the debug interface's call records alone
 (`lua_getstack` and `lua_getinfo`; not `luaL_traceback`, whose function-name
 lookup reads the registry through metamethods), so no script-defined Lua can run
@@ -834,7 +841,8 @@ more than a thousand calls, refusals and faults, and across repeated successful 
 failed loads.
 
 Memory running out at any step of installing, loading, calling or marshalling in
-either direction, inside a callback included, is the existing classified
+either direction, inside a callback included (a stack that cannot be reserved
+for a copy counts), is the existing classified
 failure — `MemoryExhausted` as a `LuaFault`, or a `BoundaryFault` whose reason is
 `ScriptFailed MemoryExhausted` — never a panic, a Lua error unwinding through a
 Haskell frame, or a leaked reference. The guarantee is for the recoverable
