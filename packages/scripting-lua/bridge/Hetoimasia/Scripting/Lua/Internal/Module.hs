@@ -56,7 +56,7 @@ module Hetoimasia.Scripting.Lua.Internal.Module
   ) where
 
 import Control.Exception (onException)
-import Control.Monad (forM_, unless, when)
+import Control.Monad (forM_, unless, void, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
@@ -223,6 +223,9 @@ loadModule host source =
       result ← loadModuleSource state (sourceText source) (chunkOf ref) required slot
       let finishFailed ∷ ∀ b. FaultReason → Effect → Maybe Text → IO b
           finishFailed reason effect trace = do
+            -- Whatever failed it, a module that was already stored is not kept:
+            -- the load failed, and nothing else could reach it.
+            when (loadedStored result) (void (releaseModule state slot))
             lua_settop state entry
             -- A Haskell failure that reached a callback outranks whatever Lua
             -- reported, as everywhere else.

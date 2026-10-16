@@ -189,6 +189,9 @@ test-suite lua-host-tests
     type: exitcode-stdio-1.0
     main-is: Main.hs
     hs-source-dirs: test
+    -- A return hook that raises, armed from Haskell: the one way to make a load
+    -- fail after its module was stored, which no script can do (see its header).
+    c-sources: test/cbits/hetoimasia_lua_hooks.c
     other-modules:
         Test.Lua.Boundary.Bindings
         Test.Lua.Boundary.Dependencies

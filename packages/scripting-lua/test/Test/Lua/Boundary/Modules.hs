@@ -19,6 +19,10 @@ import Hetoimasia.Scripting.Lua.Registration (maxArity)
 import Hetoimasia.Scripting.Lua.Value
 import System.Timeout (timeout)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
+import Hetoimasia.Scripting.Lua.Internal.Module (liveModuleReferences)
+import Hetoimasia.Scripting.Lua.Internal.Owner (ownedHost, ownedInternalVm)
+import Hetoimasia.Scripting.Lua.Internal.Vm (vmState)
+import Lua (State (State))
 import Test.Lua.Boundary.Support
 
 -- | A module of this name and version with this source and these entry points.
@@ -38,6 +42,9 @@ faulted action = do
   case outcome of
     Left fault → pure fault
     Right _ → expectationFailure "no fault was raised" >> error "unreachable"
+
+foreign import ccall unsafe "hetoimasia_test_arm_return_hook"
+  armReturnHook ∷ State → IO ()
 
 -- | A module with an arithmetic entry point and ways to disturb it.
 calculator ∷ ModuleSource
@@ -315,6 +322,37 @@ spec = describe "application-owned modules" $ do
       loaded ← try @VmClosed (loadModule owned (moduleOf "late" "1" "x = 1" []))
       either (const True) (const False) loaded `shouldBe` True
 
+  describe "a load that fails after the module was stored" $ do
+    it "does not keep the module, or its identity, or its place in the bound" $ do
+      fixture ← newFixture
+      withOwner fixture [] $ \owned → do
+        let state = vmState (ownedInternalVm owned)
+            references = liveModuleReferences (ownedHost owned)
+        -- The first load makes the boundary's share of the registry; the hook is for
+        -- the loads after it.
+        _ ← loadModule owned (moduleOf "warm" "1" "x = 1" [])
+        before ← references
+        -- A return hook raises after the module is stored, as the load returns.
+        armReturnHook state
+        failed ← faulted (loadModule owned (moduleOf "m" "1" "x = 1" []))
+        case boundaryReason failed of
+          ScriptFailed CallFailed (ErrorMessage message _) → message `shouldSatisfy` Text.isInfixOf "return hook failure"
+          other → expectationFailure ("not the hook's failure: " <> show other)
+        references >>= (`shouldBe` before)
+        -- Nothing else could reach it, and the identity is free to load again.
+        handle ← loadModule owned (moduleOf "m" "1" "function f() return 1 end" [required "f" [] [SInteger]])
+        references >>= (`shouldBe` before + 1)
+        callEntry owned handle "f" [] >>= (`shouldBe` Returned [VInteger 1])
+        -- Repeated failures do not accumulate environments or slip past the bound.
+        mapM_
+          ( \index → do
+              armReturnHook state
+              _ ← faulted (loadModule owned (moduleOf "again" (Text.pack (show (index ∷ Int))) "x = 1" []))
+              pure ()
+          )
+          [1 .. 20]
+        references >>= (`shouldBe` before + 1)
+
   describe "bounded work" $ do
     it "refuses an oversized or endless argument list without counting or walking it" $ do
       fixture ← newFixture
@@ -436,6 +474,9 @@ spec = describe "application-owned modules" $ do
       fixture ← newFixture
       let config = (sampleConfig fixture ["sample"]) {vmLibraries = [minBound .. maxBound]}
       withOwnerOf config $ \owned → do
+        -- A hook is script-defined Lua that would run when a fault's traceback is
+        -- recorded, so an owner's debug library has none to set.
+        run owned "assert(debug.sethook == nil and type(debug.getregistry) == 'function' and type(debug.traceback) == 'function')"
         run
           owned
           ( Text.unlines

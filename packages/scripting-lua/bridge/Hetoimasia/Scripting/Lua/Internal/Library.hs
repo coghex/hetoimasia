@@ -23,7 +23,6 @@ import Data.ByteString (ByteString)
 import Lua
   ( CFunction
   , luaopen_base
-  , luaopen_debug
   , luaopen_io
   , luaopen_math
   , luaopen_os
@@ -53,6 +52,14 @@ data Library
     LibraryDebug
   deriving (Bounded, Enum, Eq, Ord, Show)
 
+-- | The debug library without @sethook@. A hook is script-defined Lua that Lua
+-- runs on a call, a return, a line or a count, including when it dispatches the
+-- message handler that records a fault's traceback; a script that could set one
+-- could run code, or replace the original failure with its own, while a fault is
+-- recorded. The rest of the library is as Lua ships it.
+foreign import ccall "hetoimasia_lua_bridge.h &hetoimasia_luaopen_debug"
+  luaopenDebug ∷ CFunction
+
 -- | The module name the library is registered and globally bound under.
 --
 -- The basic functions are the globals table itself, which Lua names @_G@.
@@ -77,4 +84,4 @@ libraryOpener = \case
   LibraryMath → luaopen_math
   LibraryIo → luaopen_io
   LibraryOs → luaopen_os
-  LibraryDebug → luaopen_debug
+  LibraryDebug → luaopenDebug

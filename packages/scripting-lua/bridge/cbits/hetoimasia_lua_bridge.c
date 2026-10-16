@@ -2,6 +2,7 @@
 #include "hetoimasia_lua_values.h"
 
 #include <lauxlib.h>
+#include <lualib.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 
@@ -324,4 +325,23 @@ int hetoimasia_lua_requiref(
   lua_pushcfunction(L, opener);
   lua_pushboolean(L, global);
   return lua_pcall(L, 3, 1, 0);
+}
+
+/*
+** The debug library, without `sethook`.
+**
+** A hook is script-defined Lua that Lua runs on a call, a return, a line or a
+** count. A hook set before an error is raised fires when Lua dispatches the
+** message handler that records a fault's traceback, so a script that can set one
+** could run code, or replace the original failure with its own, while a fault is
+** being recorded. Nothing short of removing the ability closes that, so an owner
+** that opens the debug library gets it without `sethook`; the rest of the library
+** is as Lua ships it.
+*/
+int hetoimasia_luaopen_debug(lua_State *L)
+{
+  int results = luaopen_debug(L);
+  lua_pushnil(L);
+  lua_setfield(L, -2, "sethook");
+  return results;
 }
