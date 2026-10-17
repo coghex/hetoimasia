@@ -1527,7 +1527,11 @@ wakes, and an elapsed wait is the one thing that legitimately changes readiness 
 time.
 
 A refused wait fails its task with a recoverable `ValidationFault`, reports the
-`WaitRefusal` and the failure in the turn report, and counts in `diagRefusedWaits`.
+`WaitRefusal` and the failure in the turn report, and counts in `diagRefusedWaits`. A task that fails while its
+continuation is suspended (a refused wait, or a logical wait whose accumulated duration cannot be represented)
+still owes that continuation a close: it is made on the owner's thread after the failure, its own failure
+is reported in the turn, and an obligation that was interrupted is made by the scheduler's stop. A task that
+fails in its own segment owes none, since its continuation is dead.
 
 ### The timer
 
@@ -1541,8 +1545,9 @@ fire its wakes by hand.
 
 A wake is a prompt to look at the clock, never evidence that a deadline passed. An early wake
 finds nothing due and the timer is armed again. A wake of a registration that was replaced
-or cancelled is stale and ignored, as is any wake after stop. Arming, cancelling and disposing happen under a mask, so the registration the backend
-made and the way to cancel it are never separated by an asynchronous exception. Registrations are whole
+or cancelled is stale and ignored, as is any wake after stop. Arming, cancelling and disposing happen under an uninterruptible mask, so the registration the backend
+made and the way to cancel it are never separated by an asynchronous exception, even at a blocking operation
+inside the backend, which is therefore called uninterruptibly and must not block for long. Registrations are whole
 microseconds, rounded up, at least one and at most one hour (`maxRegistration`), so a
 distant deadline is reached by a chain of wakes each followed by a look at the clock. None of
 this defines a clock. An owner that exits without `stopScheduler` leaves the registration
@@ -1553,7 +1558,7 @@ armed until it fires, which is why the exit path calls it.
 A scheduler may be configured with an elapsed service budget per turn
 (`boundServiceBudget`). When the clock shows it expired as a segment returns, no further
 segment starts in that turn, control and stop are served at that boundary, and the pass
-continues in the next turn. The clock is read again after the work at each boundary, which can close
+continues in the next turn. A turn that is cut at the budget (or a stop request) when nothing is ready starts the pass afresh, as choosing the next segment would, so a cutoff can never change what runs next. The clock is read again after the work at each boundary, which can close
 continuations and so use up the budget. A turn always starts at least one segment, so a small budget cannot
 stop progress, and a budget so large that its deadline is not representable never
 expires. The budget never interrupts a running segment, never changes which task runs next
@@ -1604,7 +1609,9 @@ admission, grants and control, closes every live continuation that is not inside
 once, in identity order, records each task's disposition and what it discarded in the model's
 `ExitRecord`, settles every request not yet applied as no longer applicable, discards
 unfinished grants (so no one is left waiting for them) and cancels the timer, which stays
-disposed. A second call answers the first's report. A segment that was running when its host
+disposed. A second call answers the first's report. A segment's report is applied, so its task is no longer running, before the clock is read or anything else that can
+fail or be interrupted; if reading the clock fails for an elapsed wait the wait is applied as a yield, which leaves
+the task ready and closable. A segment that was running when its host
 failed is recorded as outstanding and its continuation is not closed. The stop runs
 masked and attempts every close: one that is interrupted at its own interruptible
 point keeps the interruption as its failure, the others still run, the stop completes,
