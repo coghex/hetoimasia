@@ -622,6 +622,32 @@ how many were dropped (`FinalizerEvidenceTruncated`). Finalizers cannot start
 asynchronous work, wait for another stopping service or re-enter the VM, because
 nothing but an allowlisted callback runs, and an operation on the VM is refused.
 
+### A scope around each callback
+
+An owner that holds something can lend it to a callback and take it back,
+whatever the callback does, by running a scope around each of the VM's
+callbacks. `withVmOwnerScoped` is `withVmOwner` with a `CallbackScope`: a function
+that receives the callback and a `CallbackSite` and runs it, on the callback's own
+thread. It starts after the VM has recorded the thread as one of its callbacks
+and ends before the record is removed, so everything it set up exists for exactly
+the callback's duration, and a callback that fails still ends it. It runs for
+every callback the VM runs: those of the initial chunks and the modules while
+they load, of a task's segments, of a closing handler, and of a finalizer-eligible
+binding the policy lets run while the VM closes. A callback a finalizer policy
+refuses never runs, so the scope never does for it.
+
+The site answers one question, `siteIsCallback`: whether the calling thread is
+one of this VM's recorded callback threads right now. It is the record the VM
+already keeps to refuse an operation re-entered from a callback (`VmReentered`),
+read at the time of the question. A thread the callback starts is not one, and
+neither is a callback of another VM, which is the same limit `VmReentered` has
+and is why a scope that lends something needs the question: it can tell the
+callback it lent to from every other thread without taking the thread's word.
+The scope runs masked and must neither raise nor wait, because it is not part of
+the callback's action and nothing is there to contain a failure of it; what the
+callback raises passes through unchanged. `withVmOwner` is the same lifetime with
+no scope, and nothing about reentry, cancellation or the exit matrix changes.
+
 ### What proves it
 
 `Test.Lua.Owner.*` hold each part of this to expected values written in the
@@ -634,7 +660,9 @@ an empty allowlist, a denied callback performing no action and leaving evidence
 even when Lua caught its refusal, and the bound; ownership by a thread the body
 started, a second owner and a stale reference; and ten owners live at once on
 separate threads, ended in a scrambled order, one failing, one cancelled and one
-closed with a failing finalizer. `Test.Lua.Opacity` compiles the clients that try
+closed with a failing finalizer; the scope around a callback, run for exactly the
+callback's duration on its own thread, ended by a failing callback, and told by the
+VM's own record which threads are callbacks. `Test.Lua.Opacity` compiles the clients that try
 to reach a state or a native handle through the owner or to bypass it with the
 bridge's operations, and one that uses the whole public owner contract and links
 and runs. Cancellation tests prove ordering, not Linux behavior: CI is what runs
@@ -1726,6 +1754,60 @@ deadline, enters no Lua and does no periodic work: it blocks in the scheduler's 
 wait until a stop request, an admission, a control request, a grant or its timer's wake. A
 stop request wakes it whatever its tasks wait for.
 
+### Lending a collection
+
+The owner's thread holds a resource collection owned by a capability instead of a thread
+(`Hetoimasia.Foundation.Resource.OwnedCollection`, LUA-25), around the VM's lifetime, and
+lends it to each synchronous callback of its VM for exactly the callback's duration. The
+thread-owned collection cannot be used from a binding: a callback runs on a thread of its
+own while the owner's thread is blocked inside Lua, and it accepts calls from the thread
+that created it only. `Hetoimasia.Scripting.Lua.Lending` is how a binding's action uses
+what its callback was lent:
+
+```haskell
+lentToCallback ∷ IO LentCollection
+acquireLent    ∷ LentCollection → Assembly a → IO (Member a)
+acquireLentThen ∷ LentCollection → Assembly a → (Member a → IO b) → IO b
+withLentMember ∷ LentCollection → Member a → (a → IO r) → IO r
+retireLent     ∷ LentCollection → Member a → IO Retirement
+liveLentCount  ∷ LentCollection → IO Int
+```
+
+The action asks `lentToCallback` when it runs; it finds the collection of the owner whose VM
+is running its callback. The loan is never a Lua value, so a script cannot hold or pass it.
+The members it acquires belong to the owner: a member acquired in one callback is borrowed
+and retired in a later one, and what is still live when the owner retires is released then.
+The operations are those of the foundation collection with every one of its guarantees, so
+the live-member bound (`scheduledMemberLimit`, 256 unless the spec says otherwise, and never
+below one: a lower limit is refused with `OwnedInvalidMemberLimit` before anything starts),
+staged acquisition with masked registration and the handoff, retirement exactly once,
+poisoning and the exit's failure table all hold, and a rejection is raised with its own type.
+
+A loan is valid for the callback it was lent to, on that callback's thread. It is refused
+before the operation has any effect, and a refusal does not invalidate the loan:
+
+| Presented | Outcome |
+|---|---|
+| After the callback returned, including in a later callback of the same VM | `LoanEnded` |
+| From a thread the callback started, from another VM's callback, or from any other thread | `LoanElsewhere` |
+| Asking for a loan from a thread that is running no lending callback | `NoLoan` |
+
+Whether a thread is the VM's callback is decided by the record the VM keeps of its callbacks,
+the one that refuses an operation re-entered from a callback, not by anything the callback or
+the thread says: the owner lends through the VM's callback scope, which runs inside that
+record and so cannot lend to a thread the VM did not record. The capability behind a loan is
+itself lent for the callback and revoked with it, so a loan that did reach the foundation's
+operations later would meet `CapabilityStale` there.
+
+The collection lives on the owner's thread around the VM: it is allocated before the VM is
+constructed and closed after the VM has closed, as part of the owner's retirement. Callbacks
+run by a coroutine's closing handlers and by finalizer-eligible bindings while the VM
+closes still find it open. Retirement releases what remains, newest first, on the owner's
+thread, and a release that fails is cleanup evidence on the owner's outcome beside the VM's,
+fatal under every policy, as for any other cleanup failure of the owner. The same retirement
+runs when the owner fails or is cancelled, and when initialization fails after a callback
+acquired a member.
+
 ### Host failures, stop and exit
 
 A Haskell failure raised by a binding's action, the application's liveness check or
@@ -1741,8 +1823,9 @@ the exit kind and whether it began), cancels the timer, discards the admissions 
 not begun, and closes every suspended coroutine on the owner's thread, attempting each
 whatever another does. Closing errors are cleanup evidence on the owner's outcome, and a
 retained cleanup failure is fatal under any policy, as supervision decides for any worker
-(`WorkerCleanupFailed` when the worker was cancelled). `withVmOwner` then closes the VM.
-The same retirement runs when the owner fails or is cancelled, with the way it exited
+(`WorkerCleanupFailed` when the worker was cancelled). `withVmOwnerScoped` then closes the VM,
+and the owner's collection then releases the members still live; a release that fails is
+cleanup evidence as well. The same retirement runs when the owner fails or is cancelled, with the way it exited
 recorded, so a primary host failure or cancellation survives beside the evidence. A
 coroutine the scheduler left alone because its task was inside a segment when the owner
 ended (the application's observer raised before it resumed, say) is closed too, before the
@@ -1785,7 +1868,15 @@ one-shot placement, grants, elapsed waits, budgets and control end to end; creat
 readiness and identity across cycles; every outcome, every bound, a thousand admissions
 racing control requests and a stop, and a ticket's reservation; idle and stop, with
 closing errors retained; host failures, failure and cancellation; the refused waits and tick
-completion; and repeated runs of one workload under different delays and budgets. The
+completion; repeated runs of one workload under different delays and budgets; and the
+lent collection (`Test.LuaRuntime.Scheduled.Lending`): members acquired, borrowed and
+retired during a callback and in a later one, the bound and a lower limit refused, a loan
+kept past its callback, used from a thread the callback started and presented from another
+VM's callback refused with no effect while the callback goes on using its own, a loan
+ended by a callback that fails, the loan found in an initial chunk, a closing handler and a
+finalizer-eligible binding, and retirement releasing what remains on the owner's thread
+after the VM closed, however the owner ends, with a failing release fatal under an optional
+policy that recognizes everything and kept beside the VM's own close failure. The
 cancellation and shutdown windows are the kind an asynchronous-exception race can hide on
 one platform, so CI, which runs them on Linux, is the evidence for them and a local pass is
 not.
