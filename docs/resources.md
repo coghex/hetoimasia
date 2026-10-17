@@ -606,6 +606,192 @@ owner. The collection is not a dependency scheduler.
 
 None of this is application state.
 
+## Capability-owned resource collections
+
+```haskell
+-- Hetoimasia.Foundation.Resource.OwnedCollection
+data OwnedCollection
+data OwnerCapability
+
+allocOwnedCollection   ∷ Int → Scoped (OwnedCollection, OwnerCapability)
+noCapability           ∷ OwnerCapability
+lendCapability         ∷ OwnerCapability → (OwnerCapability → IO r) → IO r
+liveOwnedMemberCount   ∷ OwnedCollection → OwnerCapability → IO Int
+acquireOwnedMember     ∷ OwnedCollection → OwnerCapability → Assembly a → IO (Member a)
+acquireOwnedMemberThen ∷ OwnedCollection → OwnerCapability → Assembly a → (Member a → IO b) → IO b
+withOwnedMember        ∷ OwnedCollection → OwnerCapability → Member a → (a → IO r) → IO r
+retireOwnedMember      ∷ OwnedCollection → OwnerCapability → Member a → IO Retirement
+
+-- Member, Retirement, MemberStatus, memberStatus, and Activity are the
+-- thread-owned collection's, re-exported.
+data OwnedCollectionError
+  = OwnedInvalidMemberLimit Int
+  | CapabilityMissing | CapabilityForeign | CapabilityStale
+  | ConcurrentPresentation
+  | OwnedForeignMember | OwnedReentered Activity | OwnedClosed
+  | OwnedLimitReached Int | OwnedPoisoned | OwnedMemberNotLive
+```
+
+[The thread-owned collection](#scoped-resource-collections) accepts calls only
+from the thread that entered its scope. That is the right owner when the
+application controls the thread, as the window loop does, and the wrong one when
+the code that must acquire and retire members runs on threads its owner does not
+control: a Lua binding's callback runs on a fresh thread for each call, while the
+owner's thread is blocked inside the Lua call that made it. The capability-owned
+collection keeps every guarantee of the thread-owned one and replaces the owner
+thread with an explicit authority. It is additive: the thread-owned collection,
+its contract, and its examples are unchanged, and the rest of this document's
+"Owner, thread, and lifetime" text still describes that collection alone. The
+module imports no logger, runtime, messaging, scripting, or windowing module and
+is built through [the implementation seam](#the-implementation-seam).
+
+```haskell
+withScoped (allocOwnedCollection 8) $ \(collection, capability) → do
+  -- The scope's thread holds the capability. It can present it itself, or lend
+  -- it to code that runs on other threads for a bounded time.
+  lendCapability capability $ \lent → onAnotherThread $ do
+    member ← acquireOwnedMember collection lent (windowAssembly config)
+    withOwnedMember collection lent member render
+  -- The lending has ended: `lent` is stale everywhere. The member it acquired
+  -- is the collection's, and the scope's own capability still reaches it.
+  ...
+```
+
+### Ownership by capability
+
+`allocOwnedCollection limit` allocates the collection for the rest of the
+enclosing scope and returns it with its `OwnerCapability`. A limit below one is
+rejected with `OwnedInvalidMemberLimit` before the collection exists. The
+capability is created with the collection and is unforgeable: its constructor is
+not exported, so a client can only be given one. Every member operation takes
+it, and no operation looks at which thread made it to decide whether it may act.
+Presenting a capability is checked first, before any other check and before any
+effect:
+
+| Presented | Outcome |
+|---|---|
+| `noCapability`, which grants nothing | `CapabilityMissing` |
+| A capability issued for another collection | `CapabilityForeign` |
+| A lent capability whose lending has ended | `CapabilityStale` |
+| A valid capability, after the scope has exited | `OwnedClosed` |
+
+The capability a collection is allocated with never goes stale; after its scope
+the collection answers `OwnedClosed` instead, so a collection value that leaked
+out of its scope reaches nothing.
+
+### Lending
+
+`lendCapability capability action` runs `action` with a different capability,
+derived from the one given and valid for exactly this action. It is revoked on
+every exit from the action — a return, a failure, a cancellation — and from then
+on that capability, and any copy of it kept past the action, fails with
+`CapabilityStale` before any effect. It may be used on whatever thread the action
+gives it to. An operation that was admitted before the revocation is not
+interrupted; revocation stops further admissions. Lending needs a valid
+capability: `noCapability` and a stale one are refused without running the action.
+
+What the owner does with a lent capability is the owner's to decide, and the
+collection does not restrict it by thread. A client that must keep the
+capability to one thread, or to one callback of a VM, enforces that itself
+before presenting it. The scheduled Lua owner does:
+`packages/scripting-lua/README.md` describes how it lends its collection to its
+VM's synchronous callbacks and refuses a presentation from any thread but the
+callback's own.
+
+### Serialization
+
+The collection is not a concurrent data structure, and it does not assume that
+its users keep apart: it enforces it. Operations are admitted through one gate.
+While a thread is inside an operation, an operation presented by a different
+thread with a valid capability fails at once with `ConcurrentPresentation`,
+before any effect. Nothing queues and nothing waits: one operation proceeds and
+the other is refused. Which one that is depends on which was admitted first, and
+the refused one may simply try again. The gate belongs to the collection, not to
+a capability, so holders of different capabilities of the same collection are
+serialized too.
+
+The thread that is inside an operation is not refused its own nested calls. The
+rules of [Borrowing](#borrowing), [Retirement](#retirement), and
+[Reentry](#reentry) apply to it exactly as they do to the thread-owned
+collection's owner: a borrowing callback may borrow other live members, retiring
+the member it borrows returns `RetirementInUse`, acquiring or retiring another
+member from inside it is rejected with `OwnedReentered Borrowing`, the handoff of
+`acquireOwnedMemberThen` may borrow, and `liveOwnedMemberCount` only reads, so
+the running thread may call it at any time. Only the thread inside the operation
+passes those nested calls; another thread meets the gate first.
+
+### The shared guarantees
+
+Acquisition, borrowing, retirement, poisoning, and the exit's failure table are
+those of the thread-owned collection, stated once in
+[Scoped resource collections](#scoped-resource-collections): the live-member
+bound, the staged protection and masked registration, the owner handoff,
+retirement exactly once with the already-retired answer and the stored-failure
+rethrow, poisoning with latched cleanup evidence, release at exit newest first in
+each member's declared order, and the closed collection rejecting every
+operation. The rejections carry the same meaning under the names below, plus the
+three that are this collection's own.
+
+| Thread-owned collection | Capability-owned collection |
+|---|---|
+| `InvalidMemberLimit` | `OwnedInvalidMemberLimit` |
+| `NotOwnerThread` | `CapabilityMissing`, `CapabilityForeign`, `CapabilityStale`, `ConcurrentPresentation` |
+| `ForeignMember` | `OwnedForeignMember` |
+| `CollectionReentered` | `OwnedReentered` |
+| `CollectionClosed` | `OwnedClosed` |
+| `MemberLimitReached` | `OwnedLimitReached` |
+| `CollectionPoisoned` | `OwnedPoisoned` |
+| `MemberNotLive` | `OwnedMemberNotLive` |
+
+A `Member` is the same token either way. A token from one collection presented to
+another, or to a thread-owned one, is a foreign member.
+
+### Leaving the scope
+
+The scope's exit is serialized with the operations like any other user, because a
+collection other threads can use has an exit another thread can race. The
+thread-owned collection needs no such rule, since its owner thread is the only
+one that can be inside an operation when the scope ends.
+
+Exit first closes admission: from then on an operation on any thread is rejected
+with `OwnedReentered Closing`, and nothing new begins. It then waits for the
+operation that was already admitted — an acquisition, a handoff, a borrow, or a
+retirement — to finish, and only then releases the members still live, newest
+first, in the order of [Release order at exit](#release-order-at-exit). A
+cancellation of the scope while it waits does not shorten the wait: the wait is
+uninterruptible, so a member is never released under an operation that is still
+using it and the operation's completion is always accounted for before the final
+release. The cancellation is delivered once the exit has finished. An operation
+that fails while the exit waits for it leaves the gate on its way out, like any
+exit from an operation, and the exit then proceeds.
+
+That wait is the price of sharing a collection across threads, and it makes one
+requirement of a client: an admitted operation is bounded user code, like a
+release, which a scope waits for as well. An operation that never returns holds
+its scope's exit, and a cancellation cannot free it. A borrowing callback or an
+`Assembly` that blocks on something the exiting thread would have to provide is a
+deadlock the client has built.
+
+### State the capability-owned collection holds
+
+| State | Owner | Readers and writers | Thread | Lifetime | Reset or disposal |
+|---|---|---|---|---|---|
+| Gate: admission and the thread inside | The collection | Entered and left by every operation; closed by exit | Any | The scope | Shut at exit and never reopened |
+| Capability validity | The capability and its lender | Read by every operation; cleared by the lending | Any | Allocation, or one lending | Cleared when the lending ends; the original is never cleared |
+| Phase | The collection | Read by every operation; written by acquisition, retirement, and exit | The thread inside | The scope | Closed at exit and never reopened |
+| Active borrows | The collection | Written by `withOwnedMember`; read by acquisition and retirement | The thread inside | The scope | Each borrow drops its count on every exit |
+| Member identity counter | The collection | `acquireOwnedMember` | The thread inside | The scope | Monotone; never reused |
+| Live-member ledger | The collection | Inserted by acquisition; removed by retirement and exit | The thread inside | Registration until retirement or exit | Entry removed at retirement; emptied at exit |
+| Latched cleanup failures | The collection | Written by failed retirements and rollbacks; read by acquisition and exit | The thread inside | First failure until exit | Handed to the exit outcome and cleared |
+| Live member state: value, release, borrow count | The collection | Borrows read the value; retirement and exit take the release | The thread inside | Registration until retirement or exit | Replaced by a terminal state holding no value or release |
+| Terminal member state | Whoever retains the token | `memberStatus` | Any | As long as the token is retained | Immutable; a failed state keeps only its exception |
+
+The gate is what makes the unprotected references safe: only the thread inside an
+operation, or the exit once it has drained the gate, touches the phase, the
+counters, the ledger, the latched failures, and a live member's state, and the
+gate's transitions order those accesses between threads. None of this is
+application state.
+
 ## Component construction
 
 ```haskell
@@ -816,8 +1002,10 @@ one another directly, never the facade, and nothing from the main library; the
 worker group's modules, which share the sublibrary, likewise import
 `Resource.Scoped` and `Resource.Cleanup` directly and never the facade.
 Outside it — `Hetoimasia.Foundation.Resource`,
-`Hetoimasia.Foundation.Resource.Collection`, `Hetoimasia.Foundation.Recovery`,
-and any test that needs the private seam — code imports only the facade.
+`Hetoimasia.Foundation.Resource.Collection`,
+`Hetoimasia.Foundation.Resource.OwnedCollection`,
+`Hetoimasia.Foundation.Recovery`, and any test that needs the private seam — code
+imports only the facade.
 
 `Resource.Cleanup` is the single owner of cleanup identity. It alone defines
 `CleanupFailureId`, `CleanupFailure`, and the counter, and its release attempt
@@ -855,6 +1043,17 @@ so every write to [the state the collection holds](#state-the-collection-holds),
 and re-exports the types with the same constructor visibility as before. A
 client importing the types module directly is refused with `GHC-87110`, naming
 the main library's `hetoimasia-foundation-0.1.0.0` unit.
+
+The capability-owned collection's representations — the collection, its gate and
+admission, the `OwnerCapability`, and the `OwnedCollectionError` type — live in
+`Hetoimasia.Foundation.Resource.OwnedCollection.Types`, a hidden module of the
+main library beside the one above, and are exported by
+`Hetoimasia.Foundation.Resource.OwnedCollection` without the constructors of
+`OwnedCollection` and `OwnerCapability`. That module owns every operation, and
+so every write to [the state it holds](#state-the-capability-owned-collection-holds).
+Its member token, phase, and result types are the thread-owned collection's, from
+the hidden module above. A client importing the types module directly is refused
+as above.
 
 ## Inspecting secondary failures
 
@@ -1697,14 +1896,40 @@ the same cleanup identity, the body staying primary over such a rollback,
 reverse registration order with each member's declared ranks, and a successful
 body failing with the first of several final release failures.
 
+The `Owned resource collection` groups in
+`packages/foundation/test/Test/Foundation/Resources/OwnedCollection.hs` cover
+[Capability-owned resource collections](#capability-owned-resource-collections)
+the same way. The first groups mirror the examples above for the guarantees the
+two collections share, one for one: admission, borrowing and retirement, misuse
+by reentry and by a foreign token, terminal tokens, and cleanup failures, with the
+collection entered through a capability instead of a thread. The groups of its
+own cover the capability: every operation presenting `noCapability`, another
+collection's capability, or a lent capability after its lending ended, each
+refused with no effect, the same lent capability serving every operation while
+the lending lasts, a lending revoked when its action raises or is cancelled, a
+missing or stale capability refused for lending, a lent capability acting from
+another thread and not after, and members acquired on one thread borrowed and
+retired on others. They cover serialization: every operation presented from a
+second thread while a borrow, an acquisition, or a retirement's release is
+running, refused with `ConcurrentPresentation` at once while the first proceeds
+undisturbed, the holders of different capabilities serialized, and the thread
+inside an operation reading the live count. And they cover the scope's exit racing
+an operation already inside it, with barriers: the exit waiting for a borrow, an
+acquisition, an acquire-then handoff, or a retirement on another thread, refusing
+new operations meanwhile with `OwnedReentered Closing` and releasing only after
+the operation ended, newest first and nothing twice, the same wait holding when
+the scope is cancelled while it waits, and the exit proceeding after an operation
+that failed.
+
 The `Collection opacity across the package boundary` group in
-`packages/foundation/test/Test/Foundation/Resources/Opacity.hs` compiles seven more clients the same
-way. Six must be rejected: one naming each of the `Collection` and `Member`
-constructors, one each rewriting a collection through `liveMemberCount` and a
-token through `memberStatus` with record update, one coercing a `Member
-Celsius` to a `Member Double`, which the nominal role refuses, and one
-importing the ledger release primitive from the implementation module, which
-the package's private sublibrary hides. One must be accepted, linked, and run: it uses only the
+`packages/foundation/test/Test/Foundation/Resources/Opacity.hs` compiles nine more clients the same
+way. Eight must be rejected: one naming each of the `Collection`, `Member`,
+`OwnedCollection`, and `OwnerCapability` constructors, one each rewriting a
+collection through `liveMemberCount` and a token through `memberStatus` with
+record update, one coercing a `Member Celsius` to a `Member Double`, which the
+nominal role refuses, and one importing the ledger release primitive from the
+implementation module, which the package's private sublibrary hides. One must be
+accepted, linked, and run: it uses only the
 public operations to acquire three members, borrow two together, observe
 `RetirementInUse`, `Retired`, and `AlreadyRetired`, release the rest at exit in
 reverse order, and read both retained tokens' terminal states afterwards.
@@ -1713,14 +1938,15 @@ The `Resource module visibility across the package boundary` group in
 `packages/foundation/test/Test/Foundation/Resources/Visibility.hs`, selected by
 `--test-options='--match "Resource module visibility"'`, covers
 [The implementation seam](#the-implementation-seam) with the same harness and
-six more clients. One must be accepted: it imports, by name, every name
-`Hetoimasia.Foundation.Resource` and `Hetoimasia.Foundation.Resource.Collection`
-export, with exactly the constructors each exports. Five must be rejected with
-`GHC-87110` and neither `cannot satisfy` nor `Could not find module`: one
-importing each of `Resource.Types`, `Resource.Scoped`, `Resource.Cleanup`, and
-`Resource.Assembly`, naming the `hetoimasia-foundation-0.1.0.0:internal` unit,
-and one importing `Resource.Collection.Types`, naming the main library's unit
-and not the private one.
+seven more clients. One must be accepted: it imports, by name, every name
+`Hetoimasia.Foundation.Resource`, `Hetoimasia.Foundation.Resource.Collection`,
+and `Hetoimasia.Foundation.Resource.OwnedCollection` export, with exactly the
+constructors each exports. Six must be rejected with `GHC-87110` and neither
+`cannot satisfy` nor `Could not find module`: one importing each of
+`Resource.Types`, `Resource.Scoped`, `Resource.Cleanup`, and `Resource.Assembly`,
+naming the `hetoimasia-foundation-0.1.0.0:internal` unit, and one importing each
+of `Resource.Collection.Types` and `Resource.OwnedCollection.Types`, naming the
+main library's unit and not the private one.
 
 The `Resource evidence inspection cost` examples in
 `packages/foundation/test/Test/Foundation/Resources/Cost.hs` cover
