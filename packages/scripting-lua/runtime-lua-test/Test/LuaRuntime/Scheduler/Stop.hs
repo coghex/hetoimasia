@@ -104,6 +104,35 @@ spec = describe "stopping the scheduler, admission and diagnostics" $ do
       map fst (stopCloseFailures again) `shouldBe` [taskIdAt 0]
       length <$> closedTasks rig >>= (`shouldBe` 3)
 
+  describe "close failures that a turn that ended exceptionally had met" $ do
+    let setup = do
+          rig ← newRig
+          refused ← admit rig "refused" OrdinaryClass OneShot
+          _ ← admit rig "broken" OrdinaryClass OneShot
+          script rig "refused" [waitTicks "refused" 0]
+          script rig "broken" [ioError (userError "host failed")]
+          modifyIORef' (rigCloseFailures rig) (Map.insert refused (toException (userError "close failed")))
+          -- The refused wait fails its task, whose suspended continuation is
+          -- closed and fails to close; then the next task's host raises.
+          outcome ← try @SomeException (turn rig)
+          either (const (pure ())) (const (fail "the turn should have ended with the host's failure")) outcome
+          pure (rig, refused)
+
+    it "are kept for the scheduler's stop, which reports them" $ do
+      (rig, refused) ← setup
+      report ← stopScheduler (rigScheduler rig) (rigHost rig)
+      map fst (stopCloseFailures report) `shouldBe` [refused]
+      length <$> closedTasks rig >>= (`shouldBe` 1)
+
+    it "are kept for the next turn, which reports them once" $ do
+      (rig, refused) ← setup
+      first ← turn rig
+      map fst (turnCloseFailures first) `shouldBe` [refused]
+      second ← turn rig
+      turnCloseFailures second `shouldSatisfy` null
+      report ← stopScheduler (rigScheduler rig) (rigHost rig)
+      stopCloseFailures report `shouldSatisfy` null
+
   describe "the owner's one wait" $ do
     it "returns for an admission, a control request, a grant, a timer wake and the owner's stop request, and for nothing else" $ do
       rig ← newRig

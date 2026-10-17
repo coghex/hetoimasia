@@ -48,6 +48,8 @@ module Hetoimasia.Scripting.Lua.Scheduler.State
   , resetPassIfIdle
   , closeObligations
   , closedObligation
+  , retainEvidence
+  , drainEvidence
 
     -- * Time
   , settleGrants
@@ -62,6 +64,8 @@ module Hetoimasia.Scripting.Lua.Scheduler.State
   ) where
 
 import Control.Concurrent.STM (TVar)
+import Control.Exception (SomeException)
+import Data.Foldable (toList)
 import Data.List (sortOn)
 import qualified Data.List.NonEmpty as NonEmpty
 import Data.Map.Strict (Map)
@@ -213,6 +217,10 @@ data SchedState v = SchedState
   , ssPhase ∷ !Phase
   , ssCounts ∷ !Diagnostics
   , ssSites ∷ !(Map (TaskKind, Text) Int)
+  , ssEvidence ∷ !(Seq (TaskId, SomeException))
+    -- ^ Failures of closes that have been made and not yet reported: kept here,
+    -- not in a turn's local accumulator, so an exception that ends the turn cannot
+    -- lose them. A turn's report takes them, and so does the scheduler's stop.
   , ssToClose ∷ !(Set TaskId)
     -- ^ Tasks that ended while their continuation was suspended and whose
     -- continuation has not yet been closed: a refused wait, a wait that could not
@@ -273,6 +281,7 @@ initialState label session =
           , diagTick = 0
           }
     , ssSites = Map.empty
+    , ssEvidence = Seq.empty
     , ssToClose = Set.empty
     }
 
@@ -380,6 +389,14 @@ stoppableTasks state =
 -- suspended, in identity order.
 closeObligations ∷ SchedState v → [TaskId]
 closeObligations = Set.toAscList . ssToClose
+
+-- | Keep the failures of closes that were made, in order, until they are reported.
+retainEvidence ∷ [(TaskId, SomeException)] → SchedState v → SchedState v
+retainEvidence failures state = state {ssEvidence = foldl' (|>) (ssEvidence state) failures}
+
+-- | Take every failure kept, oldest first.
+drainEvidence ∷ SchedState v → ([(TaskId, SomeException)], SchedState v)
+drainEvidence state = (toList (ssEvidence state), state {ssEvidence = Seq.empty})
 
 -- | Take a close obligation off, once the close has been made.
 closedObligation ∷ TaskId → SchedState v → SchedState v

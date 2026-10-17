@@ -608,7 +608,6 @@ data Turn = Turn
   { turnCount ∷ !Int
   , turnFailed ∷ ![(TaskId, TaskFailure)]
   , turnRefused ∷ ![(TaskId, WaitRefusal)]
-  , turnClosing ∷ ![(TaskId, SomeException)]
   }
 
 -- | Run one service turn, on the owner's thread.
@@ -644,21 +643,28 @@ serviceTurn scheduler host = do
             limit ← budget
             now ← started
             either (const Nothing) Just (addDuration now limit)
-      report ← loop deadline started (Turn 0 [] [] [])
+      report ← loop deadline started (Turn 0 [] [])
       syncTimerFor scheduler
       pure report
   where
     config = schedConfig scheduler
     budget = boundServiceBudget (schedBounds config)
 
-    done turn end =
+    done turn end = do
+      -- The failures of closes made so far, including any a turn that ended
+      -- exceptionally left behind.
+      evidence ← atomically $ do
+        state ← readTVar (schedState scheduler)
+        let (kept, drained) = drainEvidence state
+        writeTVar (schedState scheduler) drained
+        pure kept
       pure
         TurnReport
           { turnSegments = turnCount turn
           , turnEnd = end
           , turnFailures = reverse (turnFailed turn)
           , turnRefusedWaits = reverse (turnRefused turn)
-          , turnCloseFailures = reverse (turnClosing turn)
+          , turnCloseFailures = evidence
           }
 
     loop ∷ Maybe Instant → Maybe Instant → Turn → IO TurnReport
@@ -687,11 +693,11 @@ serviceTurn scheduler host = do
                   | turnCount turn > 0 → done turn TurnPassComplete
                   | otherwise → loop deadline fresh turn
                 Just (Just run) → do
-                  (events, after, closing) ← runSegment deadline run
+                  (events, after) ← runSegment deadline run
                   loop
                     deadline
                     (after <|> fresh)
-                    (record events turn {turnCount = turnCount turn + 1, turnClosing = reverse closing <> turnClosing turn})
+                    (record events turn {turnCount = turnCount turn + 1})
 
     -- A turn that ends before it chooses leaves the pass as the next choice would
     -- have: afresh if nothing is ready.
@@ -729,8 +735,8 @@ serviceTurn scheduler host = do
             (Just now, Just limit) → now > limit
             _ → False
       when overran (atomically (modifyTVar' reference (recordOverrunAt site)))
-      closing ← closeOwed scheduler host
-      pure (events, after, closing)
+      closeOwed scheduler host
+      pure (events, after)
 
     record events turn = foldl' note turn events
     note turn = \case
@@ -764,10 +770,10 @@ chooseNext scheduler = do
 boundary ∷ Scheduler v → TaskHost v → Turn → IO Turn
 boundary scheduler host turn0 = do
   first ← reconcile
-  closed ← applyControls scheduler host
+  applyControls scheduler host
   second ← reconcile
-  owed ← closeOwed scheduler host
-  pure (foldl' absorb turn0 (first <> second) `withClosed` (closed <> owed))
+  closeOwed scheduler host
+  pure (foldl' absorb turn0 (first <> second))
   where
     reconcile = atomically $ do
       state ← readTVar (schedState scheduler)
@@ -777,33 +783,33 @@ boundary scheduler host turn0 = do
     absorb turn = \case
       Failed identity failure → turn {turnFailed = (identity, failure) : turnFailed turn}
       WaitRefused identity why → turn {turnRefused = (identity, why) : turnRefused turn}
-    withClosed turn closed = turn {turnClosing = reverse closed <> turnClosing turn}
 
--- | Close the continuations that tasks left suspended when they ended, and answer
--- the closing failures there were. Each close and its record are masked together;
--- one interrupted inside the host stays owed, and the scheduler's stop makes it.
-closeOwed ∷ Scheduler v → TaskHost v → IO [(TaskId, SomeException)]
+-- | Close the continuations that tasks left suspended when they ended. A failure
+-- of a close is kept in the scheduler's state, in the same step that takes the
+-- obligation off, until a turn's report or the stop's takes it. Each close and its
+-- record are masked together; one interrupted inside the host stays owed, and the
+-- scheduler's stop makes it.
+closeOwed ∷ Scheduler v → TaskHost v → IO ()
 closeOwed scheduler host = do
   owed ← closeObligations <$> readTVarIO (schedState scheduler)
-  concat <$> mapM close owed
+  mapM_ close owed
   where
     close identity = mask_ $ do
       closed ← tryClose (hostClose host identity)
-      atomically (modifyTVar' (schedState scheduler) (closedObligation identity))
-      pure [(identity, failure) | CloseFailed failure ← [closed]]
+      atomically . modifyTVar' (schedState scheduler) $
+        retainEvidence [(identity, failure) | CloseFailed failure ← [closed]] . closedObligation identity
 
--- | Apply the accepted control requests, stops first, and answer the closing
--- failures there were.
+-- | Apply the accepted control requests, stops first.
 --
 -- A request leaves the queue in the transaction that settles it, so an exception
 -- that interrupts the batch leaves every request not yet settled queued, and the
 -- scheduler's stop settles it. A close that completed is recorded before any
 -- cancellation is delivered; one that was interrupted is retried by that stop.
-applyControls ∷ Scheduler v → TaskHost v → IO [(TaskId, SomeException)]
+applyControls ∷ Scheduler v → TaskHost v → IO ()
 applyControls scheduler host = do
   batch ← toList . ssControl <$> readTVarIO reference
   let (stops, others) = partition ((== RequestStop) . pendingRequest) batch
-  concat <$> mapM applyOne (stops <> others)
+  mapM_ applyOne (stops <> others)
   where
     reference = schedState scheduler
 
@@ -814,12 +820,12 @@ applyControls scheduler host = do
       settleSlot reference (pendingSlot pending) (ControlSettlement result closing)
 
     applyOne pending = case pendingRequest pending of
-      RequestPause → [] <$ immediate pending pauseIn
-      RequestResume → [] <$ immediate pending resumeIn
+      RequestPause → immediate pending pauseIn
+      RequestResume → immediate pending resumeIn
       RequestStop → do
         live ← liveTarget identity <$> readTVarIO reference
         if not live
-          then [] <$ atomically (conclude pending ControlNoLongerApplicable Nothing)
+          then atomically (conclude pending ControlNoLongerApplicable Nothing)
           else mask_ $ do
             -- Masked from the close to its record: a cancellation that arrives
             -- after the close has returned waits until the task is cancelled and
@@ -828,9 +834,8 @@ applyControls scheduler host = do
             atomically $ do
               state ← readTVar reference
               let (next, result) = cancelIn identity state
-              writeTVar reference next
+              writeTVar reference (retainEvidence [(identity, failure) | CloseFailed failure ← [closed]] next)
               conclude pending result (Just closed)
-            pure [(identity, failure) | CloseFailed failure ← [closed]]
       where
         identity = pendingTask pending
 
@@ -904,7 +909,7 @@ stopScheduler scheduler host = mask_ $ do
         settleSlot reference (pendingSlot pending) (ControlSettlement ControlNoLongerApplicable Nothing)
       state ← readTVar reference
       let (session, exit) = stopSession (ssSession state)
-          report = StopReport exit collected (Seq.length (ssControl before))
+          report = StopReport exit (toList (ssEvidence state) <> collected) (Seq.length (ssControl before))
           aborted = liveCount state
           discards = exitDiscards exit
           counts = ssCounts state
@@ -919,6 +924,7 @@ stopScheduler scheduler host = mask_ $ do
           , ssElapsed = Map.empty
           , ssControl = Seq.empty
           , ssToClose = Set.empty
+          , ssEvidence = Seq.empty
           , ssPhase = Closed report
           , ssCounts =
               counts
