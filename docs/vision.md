@@ -185,6 +185,18 @@ Callback threads are runtime machinery, not cancellation endpoints; limits and
 cancellation follow the VM-owner or process protocol. See [Lua design](lua_runtime_design.md)
 and its platform confinement verdicts.
 
+Owner decision 2026-10-17 ([Lua D-23](lua_runtime_design.md#d-23-deterministic-simulation-is-a-design-requirement)):
+deterministic authoritative simulation is a design requirement. The initial
+qualification target is identical gameplay results for identical initial state,
+content, seed, tick-assigned inputs and scheduling configuration on the same
+build and supported platform. Gameplay runs on logical ticks with explicit
+durations, stable input/effect ordering and owned seeded random streams. Real
+execution delays may slow completion but must not skip required gameplay work
+or change its time increments. UI/presentation keep independent elapsed/frame
+timing and randomness. Applications own simulation and commit policy; engine
+contracts must support this requirement. Cross-platform/version identity and
+network lockstep are separate future qualifications, not current guarantees.
+
 ### V-10. Strong evidence with selective cost
 
 Prefer Hspec and package-owned tests with focused groups. Root tests cover

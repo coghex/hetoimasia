@@ -85,7 +85,8 @@ LUA-5 is now delivered by #464 / PR #465, merged as `29211202`, and TIME-1/#133
 is delivered. The current exploration is limited to LUA-6; it does not revoke
 the prior slices' approvals or renew LUA-7/LUA-8 or the confined branch.
 Q-9 through Q-16 below record remaining questions and proposals. D-16 through
-D-22 record the owner's lifecycle, identity, per-owner scheduler and instance direction. LUA-6 remains
+D-23 record the owner's lifecycle, identity, scheduler, instance and determinism
+requirements. Q-16 is resolved by D-23. LUA-6 remains
 deferred until those choices, their dependent contract reconciliation and an
 explicit readiness signoff are complete. No new tracker item is authorized by
 this design discussion.
@@ -585,8 +586,40 @@ in the illustrative API or a delivery expansion into LUA-7.
 The owner's follow-up emphasizes Synarchy's per-instance startup intervals:
 e.g. UI at 0.01 seconds and unit AI at 1.0 seconds. Preserve this requirement
 in the timing discussion, rather than interpreting every `update` as a render
-frame or every scheduling round. The owner asked for advice on its suitability;
-`dt`, late-update and clock behavior remain Q-15, not inferred approvals.
+frame or every scheduling round. D-23 settles the gameplay timing direction;
+detailed interval
+and pause rules remain Q-15.
+
+### D-23. Deterministic simulation is a design requirement
+
+Owner approval, 2026-10-17: "done right means deterministic simulation ... mark
+it as a design requirement." Deterministic authoritative gameplay is required,
+not an optional future optimization. The first qualification target is identical
+gameplay results for identical initial state, content, seed, tick-assigned input
+sequence and scheduling configuration on the same build and supported platform.
+UI and presentation remain independently paced by elapsed/frame time.
+
+Gameplay uses logical ticks and explicitly granted durations. Independently
+chosen script cadences remain supported on that logical timeline. Stable
+execution/effect ordering, owned seeded random streams, ordered external input
+admission and deterministic incorporation of asynchronous results are necessary
+parts of the contract. Real CPU delays may slow completion but must not change
+the authoritative work performed, skip required decisions or enlarge gameplay
+`dt`. Publish only completed logical state; keep UI responsive while gameplay
+is behind real time. UI randomness must not consume gameplay randomness.
+
+Initially qualify one gameplay VM and scheduling configuration. Alternative
+schedulers remain supported, but result equivalence across policies, worker
+counts, platforms or versions is not part of this first guarantee. Cross-platform
+bitwise identity, cross-version replay, network lockstep and a complete replay
+product remain separate scope. Required evidence includes repeat executions
+comparing canonical authoritative state at logical boundaries while real delays
+and UI activity vary and the tick-assigned inputs remain identical.
+
+The application owns game rules, logical input/commit policy and simulation
+state; engine scheduling and service contracts must support this requirement.
+This decision does not claim the machinery is implemented or renew LUA-6
+readiness before the remaining lifecycle and delivery details are settled.
 
 ## Design
 
@@ -872,6 +905,11 @@ means real elapsed time, not civil/calendar time. Gameplay logical step numbers
 and granted durations come from the application. A scheduler slice does not
 advance simulation time simply because its wall budget expired.
 
+D-23 requires gameplay updates to use logical durations, independently of real
+execution delays. Cadences may differ by instance, but required logical updates
+and authoritative AI decisions are not coalesced because the machine is late.
+Presentation-only refreshes may coalesce under their separate timing contract.
+
 Clock identities remain local to their owner/process. IPC carries logical
 grants and validated durations, not raw clock samples to compare across origins.
 The parent computes enforcement deadlines from its own clock; child timestamps
@@ -999,11 +1037,22 @@ are deferred. Checked snapshot cursors remain tied to their originating snapshot
 
 ### P-10. Determinism and future simulation scaling
 
-Guarantee the scheduler's documented local ordering for a given sequence of
-admitted inputs and explicit grants. Do not claim replay across racing producers,
-worker counts, machines, or Lua versions. The application decides canonical
-admission/commit order and randomness if it needs that stronger promise.
-UI randomness must not consume gameplay's stream.
+D-23 requires deterministic authoritative simulation, initially on the same
+build and supported platform with identical initial state, content, seed,
+tick-assigned inputs and scheduling configuration. Guarantee the scheduler's
+documented local ordering for admitted inputs and explicit grants. The application
+must define canonical input admission, effect/commit order and owned seeded
+randomness; racing producer arrival order is not a reproducibility contract.
+UI randomness must not consume gameplay's stream. Order-sensitive traversal,
+external events (including lifecycle requests) and asynchronous result admission
+must obey the same logical contract. Real-time service budgets may postpone
+work, but cannot choose which authoritative effects happen.
+
+Qualify a single gameplay VM/configuration first through repeated headless
+simulation with canonical state comparisons at logical boundaries, varying real
+delays and UI activity while holding assigned inputs fixed. Do not claim result
+equivalence across different scheduling policies, worker counts, machines or Lua
+versions without further evidence. UI and presentation need not be repeatable.
 
 For a later sharded simulation, preserve these prerequisites from the notes:
 
@@ -1582,7 +1631,7 @@ from delivering that application. No command-line surface has been selected.
 
 ### Q-15. Per-instance update intervals, delta time and late updates
 
-**Open after D-22.** The owner wants concurrent scripts at independently chosen
+**Timing direction resolved by D-23; cadence details open.** The owner wants concurrent scripts at independently chosen
 intervals supplied when starting them (examples: 0.01-second UI refresh and
 1.0-second unit AI). This is compatible with one VM's FIFO policy: timers make
 instances eligible and the selected policy orders their ready work. Alternate
@@ -1596,48 +1645,33 @@ after the observed time. Thus one call after a multi-second stall still receives
 the configured interval. That is a defined tick-size convention, not evidence
 that only that much time elapsed.
 
-**Proposal:** distinguish ordinary periodic refresh/decision work from fixed-step
-simulation. Periodic instances retain their requested interval, have at most
-one pending update, and coalesce missed refreshes into one invocation; `dt`
-reports elapsed time in the selected clock since the preceding update start
-(initially since successful initialization). Expose the configured interval
-separately. The exact phase and pause/reset rules remain to be settled.
-Intervals express intended cadence rather than guaranteed deadlines; callbacks
-do not overlap for one instance. Frame-driven refresh can be an additional
-cadence when a presentation loop exists, not a prerequisite for timed scripts.
+**Accepted direction:** authoritative gameplay instances run at their due logical
+ticks, with `dt` an explicitly granted simulation duration. Real execution
+lateness does not enlarge it or remove a required update. This includes AI target
+selection: a decision can alter future gameplay without integrating movement.
+Bounded service preserves logical steps and their effects under P-6; overload
+may slow simulation relative to real time. UI/presentation updates retain
+elapsed/frame-time pacing and may coalesce obsolete presentation refreshes.
 
-For fixed-step simulation, `dt` is an explicitly granted logical duration;
-bounded catch-up must preserve admitted steps and their effects under P-6.
-Do not classify all AI as disposable periodic work: selecting a new target may
-skip stale refreshes, but advancing authoritative simulation may not. No
-generic timer default silently selects either meaning for the application.
-
-P-6 already distinguishes monotonic real elapsed time for UI from application
-logical time for gameplay. Keep that distinction: a gameplay interval follows
-the application clock's pause/speed behavior, not the OS clock by accident.
-The owner's choice still needed here is whether ordinary periodic `update`
-uses the proposed elapsed `dt` and coalescing, or retains Synarchy's nominal
-interval `dt` (with elapsed time separately exposed). Fixed-step progress is a
-separate explicit contract in either case. This does not renew LUA-6 readiness.
-
-Owner follow-up: agreement with elapsed-time updates was conditional on choosing
-a nondeterministic game. The owner now asks whether to invest in determinism.
-Do not record that conditional response as acceptance of nondeterministic
-authoritative gameplay or of the Q-15 default. Resolve Q-16 first. In particular,
-dropping an AI decision because real-time service was late can change gameplay,
-even when that decision does not itself integrate movement or production.
+Remaining details: logical tick resolution and interval conversion/validation,
+first update and phase rules, pause/resume baselines, presentation `dt` sampling
+and coalescing details, and the public cadence configuration surface. No example
+tick rate is selected as a default. Callbacks for one instance do not overlap.
+The application owns gameplay clock pause/speed policy. These details must be
+settled before readiness; the earlier nondeterministic gameplay-default proposal
+is superseded by D-23.
 
 ### Q-16. Deterministic gameplay target
 
-**Open; recommendation, not owner decision.** The existing P-10 promise is local
-ordering for admitted inputs/grants, not application replay. Foundation design
-keeps game determinism application-owned. P-6 already separates logical gameplay
-time and completed effects from real-time UI pacing. The existing runtime
+**Resolved by D-23.** The owner explicitly requires deterministic simulation
+with the proposed first qualification boundary. P-10 now requires the application
+contract in addition to local scheduler ordering; the foundation design retains
+application ownership without treating determinism as optional. The existing runtime
 `UpdatePolicy` is a pacing helper, not a game simulation driver: its bounded
 fixed-step policy can discard wall-time debt. Discarding that debt must never
 be interpreted as skipping numbered authoritative simulation steps.
 
-Recommend designing the gameplay path now for repeatability with identical
+Design the gameplay path now for repeatability with identical
 initial state, content, seed, tick-assigned input sequence and scheduling
 configuration on the same build and supported platform. Leave presentation
 updates on elapsed/frame time. This is a useful first qualification target;
@@ -1661,13 +1695,13 @@ their order can change results unless effects are isolated or committed in a
 canonical order. Initially qualify one fixed gameplay policy/configuration;
 do not promise replay invariance across policy changes or worker counts.
 
-Proposed evidence is repeated headless execution of a small representative
+Required evidence is repeated headless execution of a small representative
 simulation with canonical authoritative-state digests at logical boundaries,
 varying wall-time delays and UI activity while holding assigned inputs fixed.
 This is prospective acceptance work, not a result obtained in this discussion.
-If approved, reconcile Q-15 and P-10 and identify the engine/application delivery
-boundary before renewing LUA-6. Keep all decisions about pause, event retention
-and shutdown pending until this timing direction is settled.
+Q-15 and P-10 are reconciled with this decision. The engine/application delivery
+boundary and remaining cadence, pause, event retention and shutdown details
+still need resolution before renewing LUA-6.
 
 ## Verification strategy
 
@@ -1976,7 +2010,7 @@ and verified policy, with adversarial regression coverage.
 ### LUA-6. Schedule cooperative tasks with bounded service turns
 
 > Deferred: readiness discussion opened 2026-10-17. LUA-5 and TIME-1 are
-> delivered; remaining lifecycle and Q-13/Q-14 scope need reconciliation before
+> delivered; remaining lifecycle and Q-13/Q-14/Q-15 scope need reconciliation before
 > readiness signoff. Earlier narrow renewals did not cover this slice.
 
 - **Outcome:** one trusted VM owner services resumable tasks fairly, wakes for
@@ -1988,13 +2022,16 @@ and verified policy, with adversarial regression coverage.
 - **Phase:** execution policy.
 - **Depends on:** LUA-5; external TIME-1 (Q-4).
 - **Ordering:** critical path; can run alongside LUA-7 with disjoint modules.
-- **Relevant decisions:** D-1, D-3, D-4, D-12, D-13, D-16, D-17, D-18, D-19, D-20, D-21, D-22.
+- **Relevant decisions:** D-1, D-3, D-4, D-12, D-13, D-16, D-17, D-18, D-19, D-20, D-21, D-22, D-23.
 - **Acceptance signals:** peers get bounded opportunities at safe yields;
   paused/event-only work does not spin; stop wakes waits; logical time advances
   only on explicit completion; elapsed budget cannot be sold as a hard limit.
+  For identical logical inputs and configuration, real delays cannot change
+  gameplay update durations, required work or committed effect order (D-23).
 - **Out of scope:** automatic code rewriting, arbitrary priority API, simulation
   coordinator, CPU affinity/niceness tuning, performance pass/fail thresholds.
-- **Open questions:** Q-9 (detailed lifecycle semantics), Q-13, Q-14, Q-15, Q-16.
+- **Open questions:** Q-9 (detailed lifecycle semantics), Q-13, Q-14, Q-15.
+  Q-16 is resolved by D-23: deterministic simulation is required.
   Q-10's compatibility and Q-11's API/example direction are accepted by D-20;
   their new runner/lifetime questions are tracked under Q-13/Q-14.
   Q-12 is resolved by D-19.

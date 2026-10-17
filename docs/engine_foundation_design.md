@@ -164,5 +164,11 @@ per-command opt-in, given under the owner's standing approval (2026-09-26) for
 runs an issue or pull request needs; approved isolated Linux displays need
 none.
 
-Game saves and game-specific determinism remain application-owned. A later
-Synarchy migration must preserve or explicitly migrate those contracts.
+Game saves and game-specific determinism remain application-owned.
+[Lua D-23](lua_runtime_design.md#d-23-deterministic-simulation-is-a-design-requirement)
+makes deterministic authoritative simulation a requirement: initially qualify
+identical results on the same build/platform for identical initial state,
+content, seed, tick-assigned inputs and scheduling configuration. Engine timing
+and ownership contracts must support that application guarantee; UI/presentation
+remain independently paced. A later Synarchy migration must preserve or
+explicitly migrate save and simulation contracts.
