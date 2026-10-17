@@ -29,6 +29,9 @@ module Hetoimasia.Scripting.Lua.Internal.Boundary
   , FaultReason (..)
   , Effect (..)
   , ModuleProblem (..)
+  , TaskEnd (..)
+  , TaskProblem (..)
+  , SuspendRefusal (..)
   , blankFault
   ) where
 
@@ -91,6 +94,13 @@ data FaultOperation
   | CallEntry
   | -- | A Lua call to a registered binding.
     CallBinding
+  | -- | Starting a task: running a module's entry point as a coroutine, up to
+    -- its first yield, wait or return.
+    StartTask
+  | -- | Running the next segment of a task.
+    ResumeTask
+  | -- | Closing a suspended task.
+    CloseTask
   deriving (Eq, Show)
 
 -- | Whether anything had happened by the time of the fault.
@@ -130,6 +140,45 @@ data ModuleProblem
     EntryUndeclared !Text
   deriving (Eq, Show)
 
+-- | How a task ended, once it is not resumable any more.
+data TaskEnd
+  = -- | Its entry point returned.
+    TaskCompleted
+  | -- | A segment of it failed. The host closed the coroutine, running its pending
+    -- to-be-closed variables, so nothing of it is left.
+    TaskFaulted
+  | -- | It was closed.
+    TaskClosed
+  deriving (Eq, Show)
+
+-- | What is wrong with a task handle an operation was given.
+data TaskProblem
+  = -- | A handle another owner issued.
+    TaskForeign
+  | -- | A task that has ended and cannot be resumed.
+    TaskEnded !TaskEnd
+  | -- | A task whose coroutine is not suspended where the host left it: a script
+    -- resumed or closed the thread it was running on.
+    TaskNotSuspended
+  deriving (Eq, Show)
+
+-- | Why a scheduler operation (a yield or a wait) a script called was refused.
+--
+-- A script can call one from many places; only a call made by the task's own
+-- coroutine, while the host is running that task and where Lua could suspend it,
+-- reaches the scheduler. Everywhere else it is refused, so it can never suspend
+-- something the host is not resuming.
+data SuspendRefusal
+  = -- | The host is not running a task of this owner: an entry point called
+    -- once, an initial chunk, a module load, a finalizer, a close.
+    SuspendOutsideTask
+  | -- | A task is running, and this is a coroutine its script created.
+    SuspendOtherCoroutine
+  | -- | The task's own coroutine, but Lua cannot suspend it here: inside a
+    -- metamethod, a finalizer, or a library function that calls back.
+    SuspendNotYieldable
+  deriving (Eq, Show)
+
 -- | Why a call or load across the boundary failed.
 data FaultReason
   = -- | A value was refused at the boundary: before the binding ran for an
@@ -144,6 +193,13 @@ data FaultReason
     EntryNotAFunction
   | -- | A call to a binding of a kind this slice does not deliver (decision A1).
     NotYetSupported !BindingKind
+  | -- | A task handle was refused before anything ran.
+    TaskRefused !TaskProblem
+  | -- | A scheduler operation called where it cannot reach the scheduler.
+    SuspendRefused !SuspendRefusal
+  | -- | A task's coroutine yielded without a granted scheduler operation: the
+    -- script called @coroutine.yield@ itself, which would suspend it to no one.
+    UnscheduledYield
   | -- | A script raised an error, or its chunk was rejected, or Lua could not
     -- allocate: Lua's own classification, and the error value rendered under a
     -- bound.

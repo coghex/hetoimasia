@@ -120,12 +120,24 @@ module Hetoimasia.Scripting.Lua.Owner
   , maxEntries
   , maxIdentityLength
 
+    -- * Tasks
+  , Task
+  , TaskStart (..)
+  , TaskStep (..)
+  , WaitRequest (..)
+  , startTask
+  , resumeTask
+  , closeTask
+
     -- * Faults across the boundary
   , BoundaryFault (..)
   , FaultOperation (..)
   , FaultReason (..)
   , Effect (..)
   , ModuleProblem (..)
+  , TaskEnd (..)
+  , TaskProblem (..)
+  , SuspendRefusal (..)
 
     -- * Running Lua
   , evalOwned
@@ -164,6 +176,9 @@ import Hetoimasia.Scripting.Lua.Internal.Boundary
   , FaultReason (..)
   , ModuleProblem (..)
   , ModuleRef (..)
+  , SuspendRefusal (..)
+  , TaskEnd (..)
+  , TaskProblem (..)
   )
 import Hetoimasia.Scripting.Lua.Internal.Call (ChunkName, chunkName, chunkNameText)
 import Hetoimasia.Scripting.Lua.Internal.Fault
@@ -210,6 +225,13 @@ import Hetoimasia.Scripting.Lua.Internal.Owner
   , withOwnedVm
   )
 import Hetoimasia.Scripting.Lua.Internal.Registration (Registration, emptyRegistration)
+import Hetoimasia.Scripting.Lua.Internal.Task
+  ( Task
+  , TaskStart (..)
+  , TaskStep (..)
+  , WaitRequest (..)
+  )
+import qualified Hetoimasia.Scripting.Lua.Internal.Task as Task
 import Hetoimasia.Scripting.Lua.Internal.Value (Value, ValueLimits, defaultValueLimits)
 
 -- | What a VM owner constructs.
@@ -285,3 +307,38 @@ loadedModule owned = Module.loadedModule (ownedHost owned)
 -- entry point that is present and is not a function is a fault in either case.
 callEntry ∷ HasCallStack ⇒ OwnedVm → ModuleHandle → Text → [Value] → IO CallResult
 callEntry owned = Module.callEntry (ownedHost owned)
+
+-- | Run a module's entry point as a task: a Lua coroutine of this VM, up to its
+-- first yield, wait or return.
+--
+-- The handle, the entry point and its arguments are checked exactly as
+-- 'callEntry' checks them, and refused before anything runs with 'NoEffect'. An
+-- optional entry point the module does not define answers 'TaskEntryAbsent' and
+-- runs nothing. A failure of the first segment, a script error, a refused value,
+-- an exhausted allocator or a binding's own failure, is raised exactly as
+-- 'callEntry' raises it, and leaves no task behind. The owner's thread only.
+--
+-- The task is not a value: it names a coroutine of this VM, is refused by any
+-- other owner, and is never something a script can be handed.
+startTask ∷ HasCallStack ⇒ OwnedVm → ModuleHandle → Text → [Value] → IO TaskStart
+startTask owned = Task.startTask (ownedHost owned)
+
+-- | Run a suspended task's next segment, after the yield or wait it stopped at.
+--
+-- Each segment ends as 'startTask' does: with the entry point's results
+-- ('Completed'), a yield ('Yielded'), or a wait ('Waiting'). A segment that fails
+-- is raised, and the task is closed by the host, running its pending
+-- to-be-closed variables, and cannot be resumed again. A task that has returned,
+-- failed or been closed, and one another owner issued, is refused with a
+-- 'TaskRefused' fault and 'NoEffect'.
+resumeTask ∷ HasCallStack ⇒ OwnedVm → Task → IO TaskStep
+resumeTask owned = Task.resumeTask (ownedHost owned)
+
+-- | Close a suspended task, running its pending to-be-closed variables on the
+-- owner's thread.
+--
+-- An error one of them raises is raised with the close, as a 'BoundaryFault'
+-- whose reason is a script failure. Closing is terminal and idempotent: the task
+-- is closed even if that failed, and closing a task that has ended does nothing.
+closeTask ∷ HasCallStack ⇒ OwnedVm → Task → IO ()
+closeTask owned = Task.closeTask (ownedHost owned)

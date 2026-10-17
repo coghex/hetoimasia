@@ -46,6 +46,11 @@ module Hetoimasia.Scripting.Lua.Internal.Module
     -- * Loading and calling
   , loadModule
   , callEntry
+  , Prepared (..)
+  , prepareEntry
+  , readResults
+  , faultOf
+  , effectNow
   , liveModuleReferences
   , loadedModule
     -- * Bounds
@@ -84,7 +89,7 @@ import Hetoimasia.Scripting.Lua.Internal.Vm
   , vmIdentity
   , withOpenVm
   )
-import Lua (fromStackIndex, lua_gettop, lua_settop, data LUA_OK)
+import Lua (StackIndex, State, fromStackIndex, lua_gettop, lua_settop, data LUA_OK)
 
 -- | Whether an entry point has to be there.
 data Requirement = Required | Optional
@@ -291,6 +296,127 @@ loadModule host source =
         && ByteString.length (Text.encodeUtf8 text) <= maxIdentityLength
         && Text.all (\character → character >= ' ' && character /= '\DEL') text
 
+-- | An entry point looked up, with its arguments checked and built.
+data Prepared
+  = -- | The entry point is optional and the module does not define it. Nothing
+    -- ran.
+    PreparedAbsent
+  | -- | The function and its arguments are on the stack, in that order. The
+    -- declaration, and how many arguments.
+    PreparedReady !EntryPoint !Int
+
+-- | Everything a call of an entry point does before it runs: the handle, the
+-- declaration, the lookup by raw access, the arguments checked against the
+-- schemas and the limits, and built on the stack.
+--
+-- Shared by the call that runs the entry point once and the one that starts it
+-- as a task, which differ only in what they do with the function afterwards.
+-- Refused before anything runs, with no effect, as 'callEntry' documents.
+prepareEntry
+  ∷ HasCallStack
+  ⇒ Host → FaultOperation → Operation → ModuleHandle → Text → [Value] → State → StackIndex → IO Prepared
+prepareEntry host op operationName handle name arguments state entry = do
+  when (handleVm handle /= vmIdentity vm) (fault (ModuleRefused ModuleHandleForeign) NoEffect Nothing)
+  declared ← case [entryPoint | entryPoint ← handleEntries handle, entryName entryPoint == name] of
+    entryPoint : _ → pure entryPoint
+    [] → fault (ModuleRefused (EntryUndeclared name)) NoEffect Nothing
+  setRunContext vm (moduleRefName ref, moduleRefVersion ref, Just name)
+  found ← lookupEntry state (handleSlot handle) name
+  case found of
+    LookupStatus status → do
+      value ← renderFailure state entry
+      lua_settop state entry
+      raiseEscape vm
+      fault (ScriptFailed (classify status) value) NoEffect Nothing
+    LookupNoModule → do
+      lua_settop state entry
+      fault (InternalError "the module's slot is empty") NoEffect Nothing
+    LookupAbsent → do
+      lua_settop state entry
+      raiseEscape vm
+      case entryRequirement declared of
+        Optional → pure PreparedAbsent
+        Required → fault (EntryMissing False) NoEffect Nothing
+    LookupNotFunction → do
+      lua_settop state entry
+      fault EntryNotAFunction NoEffect Nothing
+    LookupFunctionOnStack → do
+      let schemas = entryArguments declared
+          -- At most one past the declared count is ever counted, so an oversized
+          -- or endless argument list costs no more to refuse than a small one.
+          given = length (take (length schemas + 1) arguments)
+      either (refuseArgument 0 []) pure (checkLimits limits arguments)
+      when (given /= length schemas) $
+        refuseArgument 0 [] (RuleArity (length schemas) given)
+      forM_ (zip3 [1 ..] schemas arguments) $ \(index, schema, value) →
+        case conformValue context schema value of
+          Left (path, rule) → refuseArgument index path rule
+          Right () → pure ()
+      forM_ (zip [1 ..] arguments) $ \(index, value) → do
+        -- The application's own check is application code: it runs as a callback,
+        -- so a call it makes on this VM is refused and not waited for.
+        retired ← runCallback vm (retiredIn boundary value)
+        forM_ retired $ \(path, typeName) → refuseArgument index path (RuleRetiredHandle typeName)
+      encoded ← case encodeValues context limits arguments of
+        Left rule → refuseArgument 0 [] rule
+        Right bytes → pure bytes
+      pushed ← pushValues state limits encoded (length arguments)
+      case pushed of
+        Pushed → pure ()
+        PushStatus status → do
+          value ← renderFailure state entry
+          lua_settop state entry
+          fault (ScriptFailed (classify status) value) NoEffect Nothing
+        PushMalformed which →
+          lua_settop state entry >> fault (InternalError ("an argument could not be built: " <> Text.pack (show which))) NoEffect Nothing
+      pure (PreparedReady declared (length arguments))
+  where
+    vm = hostVm host
+    boundary = hostBoundary host
+    context = boundaryContext boundary
+    limits = boundaryLimits boundary
+    ref = handleModule handle
+    fault ∷ ∀ b. FaultReason → Effect → Maybe Text → IO b
+    fault reason effect trace =
+      throwFailure luaComponent operationName [] $
+        (faultOf host op ref (Just name) reason) {boundaryEffect = effect, boundaryTraceback = trace}
+    refuseArgument ∷ ∀ b. Int → [PathStep] → ValueRule → IO b
+    refuseArgument index path rule = do
+      -- The entry point is on the stack by now; nothing has run.
+      lua_settop state entry
+      fault (ValueRefused (ValueRefusal Arguments index path rule 0)) NoEffect Nothing
+
+-- | The results an entry point returned, copied off the stack from the slot after
+-- @entry@ and checked against the declared schemas. The refusal, if there is
+-- one, with the traceback to report it under.
+--
+-- The count has been checked against the schemas' by the caller.
+readResults ∷ Host → State → StackIndex → [Schema] → Int → IO (Either (FaultReason, Maybe Text) [Value])
+readResults host state entry expected count = do
+  copied ← readValues state limits (vmIdentity (hostVm host)) (fromIntegral (fromStackIndex entry) + 1) count
+  case copied of
+    ReadStatus status → do
+      value ← renderFailure state entry
+      pure (Left (ScriptFailed (classify status) value, Nothing))
+    ReadRefused rule index visited →
+      pure (Left (ValueRefused (ValueRefusal Results index [] rule visited), Nothing))
+    ReadCopied bytes visited → case decodeValues count bytes of
+      Left why → pure (Left (InternalError why, Nothing))
+      Right raws → do
+        let conformed = traverse (\(schema, raw) → conformRaw context schema raw) (zip expected raws)
+        pure $ case conformed of
+          Left (path, rule) → Left (ValueRefused (ValueRefusal Results (locate raws) path rule visited), Nothing)
+          Right values → Right values
+  where
+    boundary = hostBoundary host
+    context = boundaryContext boundary
+    limits = boundaryLimits boundary
+    -- The 1-based position of the first result that does not conform.
+    locate raws =
+      case [index | (index, schema, raw) ← zip3 [1 ..] expected raws, Left _ ← [conformRaw context schema raw]] of
+        index : _ → index
+        [] → 0
+
 -- | Call a module's entry point with bounded values.
 --
 -- Refused before anything runs, with no effect: a handle another owner issued,
@@ -307,11 +433,6 @@ callEntry host handle name arguments =
           fault reason effect trace =
             throwFailure luaComponent callOperation [] $
               (faultOf host CallEntry ref (Just name) reason) {boundaryEffect = effect, boundaryTraceback = trace}
-          refuseArgument ∷ ∀ b. Int → [PathStep] → ValueRule → IO b
-          refuseArgument index path rule = do
-            -- The entry point is on the stack by now; nothing has run.
-            lua_settop state entry
-            fault (ValueRefused (ValueRefusal Arguments index path rule 0)) NoEffect Nothing
           -- Lua has run by now: a callback's failure outranks what is reported.
           afterLua ∷ ∀ b. FaultReason → Maybe Text → IO b
           afterLua reason trace = do
@@ -319,103 +440,34 @@ callEntry host handle name arguments =
             lua_settop state entry
             raiseEscape vm
             fault reason effect trace
-      when (handleVm handle /= vmIdentity vm) (fault (ModuleRefused ModuleHandleForeign) NoEffect Nothing)
-      declared ← case [entryPoint | entryPoint ← handleEntries handle, entryName entryPoint == name] of
-        entryPoint : _ → pure entryPoint
-        [] → fault (ModuleRefused (EntryUndeclared name)) NoEffect Nothing
-      setRunContext vm (moduleRefName ref, moduleRefVersion ref, Just name)
-      found ← lookupEntry state (handleSlot handle) name
-      case found of
-        LookupStatus status → do
-          value ← renderFailure state entry
-          lua_settop state entry
-          raiseEscape vm
-          fault (ScriptFailed (classify status) value) NoEffect Nothing
-        LookupNoModule → do
-          lua_settop state entry
-          fault (InternalError "the module's slot is empty") NoEffect Nothing
-        LookupAbsent -> do
-          lua_settop state entry
-          raiseEscape vm
-          case entryRequirement declared of
-            Optional → pure EntryAbsent
-            Required → fault (EntryMissing False) NoEffect Nothing
-        LookupNotFunction → do
-          lua_settop state entry
-          fault EntryNotAFunction NoEffect Nothing
-        LookupFunctionOnStack → do
-          let schemas = entryArguments declared
-              -- At most one past the declared count is ever counted, so an oversized
-              -- or endless argument list costs no more to refuse than a small one.
-              given = length (take (length schemas + 1) arguments)
-          either (refuseArgument 0 []) pure (checkLimits limits arguments)
-          when (given /= length schemas) $
-            refuseArgument 0 [] (RuleArity (length schemas) given)
-          forM_ (zip3 [1 ..] schemas arguments) $ \(index, schema, value) →
-            case conformValue context schema value of
-              Left (path, rule) → refuseArgument index path rule
-              Right () → pure ()
-          forM_ (zip [1 ..] arguments) $ \(index, value) → do
-            -- The application's own check is application code: it runs as a callback,
-            -- so a call it makes on this VM is refused and not waited for.
-            retired ← runCallback vm (retiredIn boundary value)
-            forM_ retired $ \(path, typeName) → refuseArgument index path (RuleRetiredHandle typeName)
-          encoded ← case encodeValues context limits arguments of
-            Left rule → refuseArgument 0 [] rule
-            Right bytes → pure bytes
-          pushed ← pushValues state limits encoded (length arguments)
-          case pushed of
-            Pushed → pure ()
-            PushStatus status → do
-              value ← renderFailure state entry
-              lua_settop state entry
-              fault (ScriptFailed (classify status) value) NoEffect Nothing
-            PushMalformed which →
-              lua_settop state entry >> fault (InternalError ("an argument could not be built: " <> Text.pack (show which))) NoEffect Nothing
+      prepared ← prepareEntry host CallEntry callOperation handle name arguments state entry
+      case prepared of
+        PreparedAbsent → pure EntryAbsent
+        PreparedReady declared count → do
           -- The entry point may run script code, so what building its arguments
           -- allocated while the collector was held is paid now.
           serviceCollector state
-          (called, trace) ← callProtected state (length arguments) (-1)
+          (called, trace) ← callProtected state count (-1)
           if called /= LUA_OK
             then do
               value ← renderFailure state entry
               afterLua (ScriptFailed (classify called) value) trace
             else do
               top ← fromIntegral . fromStackIndex <$> lua_gettop state
-              let count = top - fromIntegral (fromStackIndex entry)
+              let results = top - fromIntegral (fromStackIndex entry)
                   expected = entryResults declared
-              when (count /= length expected) $
-                afterLua (ValueRefused (ValueRefusal Results 0 [] (RuleArity (length expected) count) 0)) Nothing
-              copied ← readValues state limits (vmIdentity vm) (fromIntegral (fromStackIndex entry) + 1) count
-              case copied of
-                ReadStatus status → do
-                  value ← renderFailure state entry
-                  afterLua (ScriptFailed (classify status) value) Nothing
-                ReadRefused rule index visited →
-                  afterLua (ValueRefused (ValueRefusal Results index [] rule visited)) Nothing
-                ReadCopied bytes visited → case decodeValues count bytes of
-                  Left why → afterLua (InternalError why) Nothing
-                  Right raws → do
-                    let conformed = traverse (\(schema, raw) → conformRaw context schema raw) (zip expected raws)
-                    case conformed of
-                      Left (path, rule) → do
-                        let index = locate expected raws
-                        afterLua (ValueRefused (ValueRefusal Results index path rule visited)) Nothing
-                      Right values → do
-                        lua_settop state entry
-                        -- A callback the entry point reached may have failed
-                        -- with Lua catching the marker, and the call still
-                        -- returned: the failure is the caller's.
-                        raiseEscape vm
-                        pure (Returned values)
+              when (results /= length expected) $
+                afterLua (ValueRefused (ValueRefusal Results 0 [] (RuleArity (length expected) results) 0)) Nothing
+              read' ← readResults host state entry expected results
+              case read' of
+                Left (reason, traced) → afterLua reason traced
+                Right values → do
+                  lua_settop state entry
+                  -- A callback the entry point reached may have failed
+                  -- with Lua catching the marker, and the call still
+                  -- returned: the failure is the caller's.
+                  raiseEscape vm
+                  pure (Returned values)
   where
     vm = hostVm host
-    boundary = hostBoundary host
-    context = boundaryContext boundary
-    limits = boundaryLimits boundary
     ref = handleModule handle
-    -- The 1-based position of the first result that does not conform.
-    locate expected raws =
-      case [index | (index, schema, raw) ← zip3 [1 ..] expected raws, Left _ ← [conformRaw context schema raw]] of
-        index : _ → index
-        [] → 0

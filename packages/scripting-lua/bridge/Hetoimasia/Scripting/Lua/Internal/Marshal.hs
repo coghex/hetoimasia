@@ -27,6 +27,18 @@ module Hetoimasia.Scripting.Lua.Internal.Marshal
   , lookupEntry
   , moduleReferences
   , releaseModule
+    -- * Tasks
+  , newTaskCoroutine
+  , taskThread
+  , threadYieldable
+  , SegmentOutcome (..)
+  , Segment (..)
+  , resumeSegment
+  , TaskClosing (..)
+  , closeTaskCoroutine
+  , TaskCleanup (..)
+  , cleanupTaskCoroutine
+  , taskReferences
     -- * Calling
   , callProtected
   , captureContext
@@ -87,7 +99,41 @@ foreign import ccall safe "hetoimasia_lua_values.h hetoimasia_lua_namespace"
 
 foreign import ccall safe "hetoimasia_lua_values.h hetoimasia_lua_install_binding"
   c_install_binding
-    ∷ State → StablePtr a → Ptr CChar → CSize → Ptr CChar → CSize → Ptr CInt → IO StatusCode
+    ∷ State → StablePtr a → Ptr CChar → CSize → Ptr CChar → CSize → CInt → Ptr CInt → IO StatusCode
+
+foreign import ccall safe "hetoimasia_lua_values.h hetoimasia_lua_task_new"
+  c_task_new ∷ State → Int64 → CInt → IO StatusCode
+
+-- Unsafe: it only reads the registry, and runs no Lua.
+foreign import ccall unsafe "hetoimasia_lua_values.h hetoimasia_lua_task_thread"
+  c_task_thread ∷ State → Int64 → IO State
+
+-- Unsafe: it only reads a thread's status.
+foreign import ccall unsafe "hetoimasia_lua_values.h hetoimasia_lua_yieldable"
+  c_yieldable ∷ State → IO CInt
+
+foreign import ccall safe "hetoimasia_lua_values.h hetoimasia_lua_task_resume"
+  c_task_resume
+    ∷ State
+    → Int64
+    → CInt
+    → CInt
+    → Ptr CChar
+    → CSize
+    → Ptr CSize
+    → Ptr CInt
+    → Ptr CInt
+    → Ptr CInt
+    → IO StatusCode
+
+foreign import ccall safe "hetoimasia_lua_values.h hetoimasia_lua_task_close"
+  c_task_close ∷ State → Int64 → Ptr CInt → Ptr CInt → Ptr CInt → IO StatusCode
+
+foreign import ccall safe "hetoimasia_lua_values.h hetoimasia_lua_task_cleanup"
+  c_task_cleanup ∷ State → Int64 → Ptr CInt → Ptr CInt → Ptr CInt → Ptr CInt → IO StatusCode
+
+foreign import ccall safe "hetoimasia_lua_values.h hetoimasia_lua_task_count"
+  c_task_count ∷ State → Ptr CLong → IO StatusCode
 
 foreign import ccall safe "hetoimasia_lua_values.h hetoimasia_lua_load_module"
   c_load_module
@@ -254,11 +300,14 @@ declareNamespace state name =
 -- | Install a stable pointer's function as @namespace.name@, with the same
 -- ownership report as publishing a global: the flag says whether Lua took the
 -- pointer.
-installBindingAt ∷ State → StablePtr a → Text → Text → Ptr CInt → IO StatusCode
-installBindingAt state carried space name acquired =
+--
+-- A @yielding@ binding suspends the running coroutine once its handler has
+-- returned; see the C closure that makes the yield.
+installBindingAt ∷ State → StablePtr a → Text → Text → Bool → Ptr CInt → IO StatusCode
+installBindingAt state carried space name yielding acquired =
   ByteString.unsafeUseAsCStringLen (Text.encodeUtf8 space) $ \(spacePointer, spaceSize) →
     ByteString.unsafeUseAsCStringLen (Text.encodeUtf8 name) $ \(namePointer, nameSize) →
-      c_install_binding state carried spacePointer (fromIntegral spaceSize) namePointer (fromIntegral nameSize) acquired
+      c_install_binding state carried spacePointer (fromIntegral spaceSize) namePointer (fromIntegral nameSize) (if yielding then 1 else 0) acquired
 
 -- | The bound on a traceback, in bytes.
 traceLimit ∷ Int
@@ -427,3 +476,143 @@ readTrace trace traceLength = do
     else do
       bytes ← ByteString.packCStringLen (trace, fromIntegral size)
       pure (Just (Text.decodeUtf8Lenient bytes))
+
+-- | Create the coroutine of a task in a registry slot, moving into it the function
+-- and @nargs@ arguments on top of the stack. One protected call with the collector
+-- held, so nothing executes; on failure the error value takes the place of the
+-- function and its arguments.
+newTaskCoroutine ∷ State → Int → Int → IO StatusCode
+newTaskCoroutine state slot nargs = c_task_new state (fromIntegral slot) (fromIntegral nargs)
+
+-- | The coroutine anchored in a task's slot, or a null state. Runs no Lua.
+taskThread ∷ State → Int → IO State
+taskThread state slot = c_task_thread state (fromIntegral slot)
+
+-- | Whether the running function could yield right now. Runs no Lua, and reads
+-- the state it is given: a callback asks it of the thread that called it.
+threadYieldable ∷ State → IO Bool
+threadYieldable state = (/= 0) <$> c_yieldable state
+
+-- | How a segment of a task ended.
+data SegmentOutcome
+  = -- | It returned; its results are on the stack.
+    SegmentCompleted
+  | SegmentYielded
+  | -- | It raised an error. The task has been closed; the error is on the stack,
+    -- and above it the one closing raised, if that was another.
+    SegmentFailed
+  | -- | The slot holds nothing that can be run.
+    SegmentUnresumable
+  | -- | It returned a number of results other than the one expected: how many.
+    SegmentArity
+  deriving (Eq, Show)
+
+-- | What running a segment came to.
+data Segment = Segment
+  { segmentStatus ∷ !StatusCode
+    -- ^ The status of a failure, 'LUA_OK' otherwise.
+  , segmentOutcome ∷ !SegmentOutcome
+  , segmentCount ∷ !Int
+  , segmentCleanupError ∷ !Bool
+  , segmentTrace ∷ !(Maybe Text)
+  }
+
+-- | Run the next segment of a task: from the start with its function and
+-- arguments, or from where it yielded, with none.
+resumeSegment ∷ State → Int → Bool → Int → IO Segment
+resumeSegment state slot starting expected =
+  allocaBytes traceLimit $ \trace →
+    alloca $ \traceLength →
+      alloca $ \outcome →
+        alloca $ \count →
+          alloca $ \cleanup → do
+            status ←
+              c_task_resume
+                state
+                (fromIntegral slot)
+                (if starting then 1 else 0)
+                (fromIntegral expected)
+                trace
+                (fromIntegral traceLimit)
+                traceLength
+                outcome
+                count
+                cleanup
+            how ← peek outcome
+            many ← peek count
+            extra ← peek cleanup
+            traced ← readTrace trace traceLength
+            pure
+              Segment
+                { segmentStatus = status
+                , segmentOutcome = case how ∷ CInt of
+                    0 → SegmentCompleted
+                    1 → SegmentYielded
+                    2 → SegmentFailed
+                    4 → SegmentArity
+                    _ → SegmentUnresumable
+                , segmentCount = fromIntegral many
+                , segmentCleanupError = extra /= 0
+                , segmentTrace = traced
+                }
+
+-- | What closing a task's coroutine came to.
+data TaskClosing = TaskClosing
+  { closingPresent ∷ !Bool
+  , closingFailed ∷ !Bool
+    -- ^ Closing raised an error, which is on the stack unless it could not be
+    -- reserved.
+  , closingStatus ∷ !StatusCode
+  , closingMarker ∷ !Bool
+    -- ^ The error closing raised is only the placeholder of a failed callback.
+  }
+
+-- | Close the coroutine in a task's slot, running its pending to-be-closed
+-- variables, and empty the slot.
+closeTaskCoroutine ∷ State → Int → IO TaskClosing
+closeTaskCoroutine state slot =
+  alloca $ \present →
+    alloca $ \failed →
+      alloca $ \marker → do
+        status ← c_task_close state (fromIntegral slot) present failed marker
+        here ← peek present
+        bad ← peek failed
+        placeholder ← peek marker
+        pure (TaskClosing (here /= 0) (bad /= 0) status (placeholder /= 0))
+
+-- | What closing a coroutine that is not suspended where the host left it came to.
+data TaskCleanup = TaskCleanup
+  { cleanupPresent ∷ !Bool
+  , cleanupErrored ∷ !Bool
+    -- ^ It had died with an error, so it can have held to-be-closed variables to
+    -- run. Otherwise closing it ran nothing.
+  , cleanupDifferent ∷ !Bool
+    -- ^ Closing raised an error other than the one it died with. The stack holds
+    -- the error it died with, and above it that one.
+  , cleanupMarker ∷ !Bool
+    -- ^ That error is only the placeholder of a failed callback.
+  }
+
+-- | Close a coroutine that failed, or that a script resumed itself, running its
+-- pending to-be-closed variables, and empty its slot.
+cleanupTaskCoroutine ∷ State → Int → IO TaskCleanup
+cleanupTaskCoroutine state slot =
+  alloca $ \present →
+    alloca $ \errored →
+      alloca $ \different →
+        alloca $ \marker → do
+          _ ← c_task_cleanup state (fromIntegral slot) present errored different marker
+          here ← peek present
+          died ← peek errored
+          extra ← peek different
+          placeholder ← peek marker
+          pure (TaskCleanup (here /= 0) (died /= 0) (extra /= 0) (placeholder /= 0))
+
+-- | How many tasks' coroutines the registry anchors.
+taskReferences ∷ State → IO (Either StatusCode Int)
+taskReferences state =
+  alloca $ \count → do
+    poke count 0
+    status ← c_task_count state count
+    found ← peek count
+    pure (if status /= LUA_OK then Left status else Right (fromIntegral found))
