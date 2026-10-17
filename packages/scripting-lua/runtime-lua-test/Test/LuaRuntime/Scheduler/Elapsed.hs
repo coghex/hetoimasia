@@ -5,7 +5,8 @@
 module Test.LuaRuntime.Scheduler.Elapsed (spec) where
 
 import Control.Concurrent.STM (atomically)
-import Data.IORef (modifyIORef', newIORef, readIORef)
+import Control.Exception (MaskingState (Unmasked), getMaskingState)
+import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Hetoimasia.Foundation.Time (monotonicSource)
 import Hetoimasia.Scripting.Lua.Scheduler
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
@@ -144,6 +145,31 @@ spec = describe "elapsed time and the owned timer" $ do
       ran rig >>= (`shouldBe` ["distant"])
       microsecondsOf rig >>= (`shouldBe` [maxRegistration])
       length <$> allRegs (rigTimer rig) >>= (`shouldBe` 2)
+
+    it "arms and cancels a registration with cancellation deferred, so the registration the backend made and the action that cancels it are never separated" $ do
+      rig ← newRig
+      _ ← admit rig "sleeper" OrdinaryClass OneShot
+      _ ← admit rig "quick" OrdinaryClass OneShot
+      script rig "sleeper" [waitFor "sleeper" 5000000]
+      script rig "quick" [waitFor "quick" 1000000]
+      state ← newIORef []
+      -- The backend is asked, and its cancel action is run, under a mask: an
+      -- asynchronous exception cannot fall between a registration existing and
+      -- the timer holding the way to cancel it, nor between taking that way and
+      -- using it.
+      writeIORef (ftOnArm (rigTimer rig)) (getMaskingState >>= \seen → modifyIORef' state (seen :))
+      _ ← turn rig
+      readIORef state >>= (`shouldSatisfy` (\seen → not (null seen) && Unmasked `notElem` seen))
+      cancelled ← newIORef []
+      writeIORef (ftOnCancel (rigTimer rig)) (getMaskingState >>= \seen → modifyIORef' cancelled (seen :))
+      -- A new earliest deadline cancels the live registration and arms another.
+      script rig "late" [waitFor "late" 500000]
+      _ ← admit rig "late" OrdinaryClass OneShot
+      _ ← turn rig
+      readIORef state >>= (`shouldSatisfy` ((>= 2) . length))
+      _ ← stopScheduler (rigScheduler rig) (rigHost rig)
+      liveRegs (rigTimer rig) >>= (`shouldSatisfy` null)
+      readIORef cancelled >>= (`shouldSatisfy` (\seen → not (null seen) && Unmasked `notElem` seen))
 
     it "is armed with the system timer and wakes the owner when its time comes, with no sleep in the example" $ bounded $ do
       -- The production seam: the threaded runtime's timer manager and the real

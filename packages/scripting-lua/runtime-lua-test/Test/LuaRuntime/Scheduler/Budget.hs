@@ -44,6 +44,33 @@ spec = describe "service budgets and overruns" $ do
     -- Ending exactly at the deadline expires the budget, and is not an overrun.
     diagOverruns <$> diagnostics rig >>= (`shouldBe` 0)
 
+  it "looks at the clock again after the work at a boundary, which can use up the budget" $ do
+    rig ← newRigWith defaultOptions {optBounds = budgeted (Just 10) defaultBounds}
+    a ← admit rig "a" OrdinaryClass Looped
+    _ ← admit rig "b" OrdinaryClass Looped
+    script rig "a" (repeat (cost rig 1 (yielded "a")))
+    script rig "b" (repeat (cost rig 1 (yielded "b")))
+    -- Closing a stopped task's continuation takes the rest of the budget.
+    writeIORef (rigCloseHook rig) (\_ → advanceClock rig 100)
+    cell ← newIORef Nothing
+    script
+      rig
+      "a"
+      ( ( do
+            atomically (requestControl (rigScheduler rig) a RequestStop) >>= \case
+              ControlAccepted accepted → writeIORef cell (Just accepted)
+              other → fail ("not accepted: " <> show other)
+            cost rig 1 (yielded "a")
+        )
+          : repeat (cost rig 1 (yielded "a"))
+      )
+    report ← turn rig
+    -- The first segment returned at 1, inside the budget; the boundary closed the
+    -- task it asked to stop and the clock reached 101; no second segment started.
+    (turnSegments report, turnEnd report) `shouldBe` (1, TurnBudgetExpired)
+    ran rig >>= (`shouldBe` ["a"])
+    readIORef cell >>= maybe (fail "no request") (\accepted → atomically (pollControl accepted) >>= (`shouldSatisfy` \case Just (ControlSettlement ControlApplied (Just CloseClean)) → True; _ → False))
+
   it "never changes where the pass is: a cutoff continues the same pass, with the quanta it had left" $ do
     let quanta = Quanta (Quantum 2) (Quantum 3) (Quantum 2)
         work budget = do

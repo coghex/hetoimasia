@@ -58,7 +58,7 @@ import Control.Concurrent.STM
   , readTVarIO
   , writeTVar
   )
-import Control.Exception (onException)
+import Control.Exception (mask_, onException)
 import Control.Monad (when)
 import Data.Word (Word64)
 import GHC.Event (getSystemTimerManager, registerTimeout, unregisterTimeout)
@@ -165,9 +165,12 @@ syncTimer timer clock target = do
           else arm timer deadline (remainingUntil now deadline)
 
 -- | Arm a registration. The generation and the live record are published before
--- the backend is asked, so a wake that arrives at once finds them.
+-- the backend is asked, so a wake that arrives at once finds them. The whole of
+-- it is masked, so the registration the backend made and the action that cancels
+-- it are never separated by an asynchronous exception: the timer owns it from
+-- the moment it exists.
 arm ∷ Timer → Instant → Duration → IO ()
-arm timer deadline remaining = do
+arm timer deadline remaining = mask_ $ do
   generation ← atomically $ do
     state ← readTVar (timerState timer)
     let issued = stateGeneration state + 1
@@ -204,7 +207,7 @@ retire timer generation = do
 
 -- | Cancel the live registration, if there is one.
 cancelLive ∷ Timer → IO ()
-cancelLive timer = do
+cancelLive timer = mask_ $ do
   cancel ← atomically $ do
     state ← readTVar (timerState timer)
     writeTVar (timerState timer) state {stateLive = Nothing, stateCancel = Nothing}
@@ -214,7 +217,7 @@ cancelLive timer = do
 -- | End the timer for good: cancel what is armed, and ignore every wake and
 -- every request to arm from now on.
 disposeTimer ∷ Timer → IO ()
-disposeTimer timer = do
+disposeTimer timer = mask_ $ do
   cancel ← atomically $ do
     state ← readTVar (timerState timer)
     writeTVar (timerState timer) state {stateLive = Nothing, stateCancel = Nothing, stateDisposed = True}

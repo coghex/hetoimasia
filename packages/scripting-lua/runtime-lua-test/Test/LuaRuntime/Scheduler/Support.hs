@@ -61,7 +61,7 @@ module Test.LuaRuntime.Scheduler.Support
 import Control.Concurrent.STM (TVar, atomically, newTVarIO, orElse, readTVar, writeTVar)
 import Control.Exception (SomeException, throwIO)
 import Control.Concurrent (ThreadId, myThreadId)
-import Control.Monad (filterM)
+import Control.Monad (filterM, join)
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -87,6 +87,7 @@ data Rig = Rig
   , rigScripts ∷ !(IORef (Map Text [Step]))
   , rigClosed ∷ !(IORef [(TaskId, ThreadId)])
   , rigCloseFailures ∷ !(IORef (Map TaskId SomeException))
+  , rigCloseHook ∷ !(IORef (TaskId → IO ()))
   , rigClock ∷ !(IORef Word64)
   , rigTimer ∷ !FakeTimer
   , rigStop ∷ !(TVar Bool)
@@ -131,6 +132,7 @@ newRigWith options = do
   scripts ← newIORef Map.empty
   closed ← newIORef []
   closeFailures ← newIORef Map.empty
+  closeHook ← newIORef (const (pure ()))
   clock ← newIORef 0
   timer ← newFakeTimer
   stop ← newTVarIO False
@@ -158,10 +160,11 @@ newRigWith options = do
           , hostClose = \identity → do
               thread ← myThreadId
               modifyIORef' closed ((identity, thread) :)
+              readIORef closeHook >>= \hook → hook identity
               failures ← readIORef closeFailures
               maybe (pure ()) throwIO (Map.lookup identity failures)
           }
-  pure (Rig scheduler host logRef handedRef scripts closed closeFailures clock timer stop)
+  pure (Rig scheduler host logRef handedRef scripts closed closeFailures closeHook clock timer stop)
 
 -- Scripts ----------------------------------------------------------------------
 
@@ -310,20 +313,29 @@ data FakeTimer = FakeTimer
   { ftBackend ∷ !TimerBackend
   , ftRegs ∷ !(IORef [Reg])
   , ftMostLive ∷ !(IORef Int)
+  , ftOnCancel ∷ !(IORef (IO ()))
+    -- ^ Run by the action that cancels a registration.
+  , ftOnArm ∷ !(IORef (IO ()))
+    -- ^ Run by the backend after it has made a registration and before it hands
+    -- back the action that cancels it: the window an asynchronous exception can
+    -- fall in.
   }
 
 newFakeTimer ∷ IO FakeTimer
 newFakeTimer = do
   registrations ← newIORef []
   mostLive ← newIORef 0
+  onArm ← newIORef (pure ())
+  onCancel ← newIORef (pure ())
   let arm microseconds wake = do
         number ← (+ 1) . length <$> readIORef registrations
         live ← newIORef True
         modifyIORef' registrations (<> [Reg number microseconds wake live])
         liveNow ← length <$> (readIORef registrations >>= filterM (readIORef . regLive))
         modifyIORef' mostLive (max liveNow)
-        pure (writeIORef live False)
-  pure (FakeTimer (TimerBackend arm) registrations mostLive)
+        join (readIORef onArm)
+        pure (join (readIORef onCancel) >> writeIORef live False)
+  pure (FakeTimer (TimerBackend arm) registrations mostLive onCancel onArm)
 
 -- | The registrations that are armed and neither cancelled nor fired.
 liveRegs ∷ FakeTimer → IO [Reg]

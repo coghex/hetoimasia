@@ -313,10 +313,11 @@ import Control.Concurrent.STM
   , retry
   , writeTVar
   )
-import Control.Exception (SomeAsyncException, SomeException, catch, fromException, mask, onException, throwIO)
-import Control.Monad (forM_, unless, void, when)
+import Control.Exception (SomeAsyncException, SomeException, catch, fromException, mask_, throwIO, try)
+import Control.Monad (forM_, unless, when)
 import Data.Foldable (toList)
 import Data.IORef (modifyIORef', newIORef, readIORef)
+import Data.Maybe (isJust)
 import Data.List (partition)
 import qualified Data.List.NonEmpty as NonEmpty
 import qualified Data.Map.Strict as Map
@@ -663,7 +664,13 @@ serviceTurn scheduler host = do
     loop deadline reading turn0 = do
       turn ← boundary scheduler host turn0
       stopping ← atomically (schedStopRequested config)
-      let expired = case (reading, deadline) of
+      -- The boundary can close continuations and so take time: look at the clock
+      -- again before judging the budget, once a segment has run.
+      fresh ←
+        if budget /= Nothing && turnCount turn > 0
+          then Just <$> readInstant (schedClock config)
+          else pure reading
+      let expired = case (fresh, deadline) of
             (Just now, Just limit) → deadlineReached now limit
             _ → False
       if stopping
@@ -677,7 +684,7 @@ serviceTurn scheduler host = do
                 Nothing → done turn TurnIdle
                 Just Nothing
                   | turnCount turn > 0 → done turn TurnPassComplete
-                  | otherwise → loop deadline reading turn
+                  | otherwise → loop deadline fresh turn
                 Just (Just run) → do
                   report ← hostRun host run
                   after ← case (budget, report) of
@@ -692,7 +699,7 @@ serviceTurn scheduler host = do
                     let (next, found) = applyReport (runTask run) overran after report state
                     writeTVar (schedState scheduler) next
                     pure found
-                  loop deadline (after <|> reading) (record events turn {turnCount = turnCount turn + 1})
+                  loop deadline (after <|> fresh) (record events turn {turnCount = turnCount turn + 1})
 
     record events turn = foldl' note turn events
     note turn = \case
@@ -745,7 +752,8 @@ boundary scheduler host turn0 = do
 --
 -- A request leaves the queue in the transaction that settles it, so an exception
 -- that interrupts the batch leaves every request not yet settled queued, and the
--- scheduler's stop settles it. An interrupted close is retried by that stop.
+-- scheduler's stop settles it. A close that completed is recorded before any
+-- cancellation is delivered; one that was interrupted is retried by that stop.
 applyControls ∷ Scheduler v → TaskHost v → IO [(TaskId, SomeException)]
 applyControls scheduler host = do
   batch ← toList . ssControl <$> readTVarIO reference
@@ -767,7 +775,10 @@ applyControls scheduler host = do
         live ← liveTarget identity <$> readTVarIO reference
         if not live
           then [] <$ atomically (conclude pending ControlNoLongerApplicable Nothing)
-          else do
+          else mask_ $ do
+            -- Masked from the close to its record: a cancellation that arrives
+            -- after the close has returned waits until the task is cancelled and
+            -- the request settled, so a completed close is never repeated.
             closed ← tryClose (hostClose host identity)
             atomically $ do
               state ← readTVar reference
@@ -808,10 +819,12 @@ syncTimerFor scheduler = do
 -- task's disposition and what was discarded, every accepted request not yet
 -- applied settles as no longer applicable, unfinished grants are discarded and
 -- the timer is cancelled and stays disposed. A second call answers the first's
--- report and closes nothing again. The work after the closes runs even if one is
--- interrupted.
+-- report and closes nothing again. Everything runs masked, and every close is
+-- attempted: a close that is interrupted keeps the interruption as its failure,
+-- the others still run, the stop completes, and the first interruption is raised
+-- again afterwards.
 stopScheduler ∷ Scheduler v → TaskHost v → IO StopReport
-stopScheduler scheduler host = mask $ \restore → do
+stopScheduler scheduler host = mask_ $ do
   claim ← atomically $ do
     state ← readTVar reference
     case ssPhase state of
@@ -822,17 +835,22 @@ stopScheduler scheduler host = mask $ \restore → do
     Left report → pure report
     Right identities → do
       failures ← newIORef []
-      let closeAll = forM_ identities $ \identity →
-            tryClose (hostClose host identity) >>= \case
-              CloseFailed failure → modifyIORef' failures ((identity, failure) :)
-              CloseClean → pure ()
-          finish = do
-            collected ← reverse <$> readIORef failures
-            report ← atomically (settleStop collected)
-            disposeTimer (schedTimerOf scheduler)
-            pure report
-      restore closeAll `onException` void finish
-      finish
+      interrupted ← newIORef Nothing
+      -- Every obligation is closed, masked: an exception that reaches a close at
+      -- one of its own interruptible points is that close's failure, kept as its
+      -- evidence, and the closes after it still run. The first such exception is
+      -- raised again once the scheduler has stopped.
+      forM_ identities $ \identity →
+        try (hostClose host identity) >>= \case
+          Right () → pure ()
+          Left (failure ∷ SomeException) → do
+            modifyIORef' failures ((identity, failure) :)
+            when (isJust (fromException failure ∷ Maybe SomeAsyncException)) $
+              modifyIORef' interrupted (<|> Just failure)
+      collected ← reverse <$> readIORef failures
+      report ← atomically (settleStop collected)
+      disposeTimer (schedTimerOf scheduler)
+      readIORef interrupted >>= maybe (pure report) throwIO
   where
     reference = schedState scheduler
     settleStop collected = do

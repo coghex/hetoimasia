@@ -8,7 +8,7 @@ module Test.LuaRuntime.Scheduler.Control (spec) where
 import Control.Concurrent (forkIO, myThreadId)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (atomically)
-import Control.Exception (AsyncException (ThreadKilled), SomeException, displayException, fromException, toException, try)
+import Control.Exception (AsyncException (ThreadKilled), MaskingState (Unmasked), SomeException, displayException, fromException, getMaskingState, toException, try)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import qualified Data.Map.Strict as Map
 import Data.List (isInfixOf)
@@ -294,6 +294,24 @@ spec = describe "safe-boundary control" $ do
       report ← stopScheduler (rigScheduler rig) (rigHost rig)
       stopControlsSettled report `shouldBe` 1
       settlement stop >>= (`shouldSatisfy` \case Just (ControlSettlement ControlNoLongerApplicable Nothing) → True; _ → False)
+
+    it "is made with cancellation deferred from the close to its record, so a completed close is recorded and never repeated" $ do
+      rig ← newRig
+      task ← admit rig "task" OrdinaryClass Looped
+      loop rig "task"
+      state ← newIORef Nothing
+      -- An asynchronous exception delivered after the close has returned would leave
+      -- the task live and the request pending, and the stop would close it again.
+      -- What keeps that window shut is the masking state the close runs in, which
+      -- the exception waits behind until the record is made.
+      writeIORef (rigCloseHook rig) $ \_ → getMaskingState >>= writeIORef state . Just
+      stop ← request rig task RequestStop
+      _ ← turn rig
+      readIORef state >>= (`shouldSatisfy` (\seen → seen /= Nothing && seen /= Just Unmasked))
+      resultOf stop >>= (`shouldBe` Just ControlApplied)
+      phase rig task >>= (`shouldBe` Just (PhaseEnded OutcomeCancelled))
+      -- And the same holds for a close that fails, whose evidence is the record.
+      length <$> closedTasks rig >>= (`shouldBe` 1)
 
     it "is made on the thread that drives the scheduler, whichever thread asked for the stop" $ do
       rig ← newRig

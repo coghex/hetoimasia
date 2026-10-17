@@ -4,8 +4,11 @@
 module Test.LuaRuntime.Scheduler.Stop (spec) where
 
 import Control.Concurrent.STM (atomically)
-import Control.Exception (toException)
-import Data.IORef (modifyIORef')
+import Control.Concurrent (forkIO, throwTo)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Exception (AsyncException (ThreadKilled), SomeException, fromException, toException, try)
+import Control.Monad (when)
+import Data.IORef (modifyIORef', writeIORef)
 import qualified Data.Map.Strict as Map
 import Hetoimasia.Scripting.Lua.Scheduler
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
@@ -74,6 +77,32 @@ spec = describe "stopping the scheduler, admission and diagnostics" $ do
       report ← stopScheduler (rigScheduler rig) (rigHost rig)
       map fst <$> closedTasks rig >>= (`shouldBe` [taskIdAt 0, taskIdAt 1, taskIdAt 2])
       map fst (stopCloseFailures report) `shouldBe` [taskIdAt 1]
+
+  describe "a stop that is interrupted" $ do
+    it "still attempts every other continuation's close, keeps the interruption as that close's failure, completes, and raises it afterwards" $ do
+      rig ← newRig
+      mapM_ (\name → admit rig name OrdinaryClass Looped >> loop rig name) ["first", "second", "third"]
+      _ ← turn rig
+      entered ← newEmptyMVar
+      gate ← newEmptyMVar
+      writeIORef (rigCloseHook rig) $ \identity →
+        when (identity == taskIdAt 0) (putMVar entered () >> takeMVar gate)
+      finished ← newEmptyMVar
+      stopper ← forkIO (try @SomeException (stopScheduler (rigScheduler rig) (rigHost rig)) >>= putMVar finished)
+      takeMVar entered
+      -- The first close is blocked, interruptibly, inside the host.
+      throwTo stopper ThreadKilled
+      outcome ← takeMVar finished
+      case outcome of
+        Left failure → fromException failure `shouldBe` Just ThreadKilled
+        Right _ → fail "the interruption should have been raised after the stop completed"
+      map fst <$> closedTasks rig >>= (`shouldBe` [taskIdAt 0, taskIdAt 1, taskIdAt 2])
+      atomically (schedulerClosed (rigScheduler rig)) >>= (`shouldBe` True)
+      -- The stop is complete and its record keeps the interruption as evidence;
+      -- asking again closes nothing.
+      again ← stopScheduler (rigScheduler rig) (rigHost rig)
+      map fst (stopCloseFailures again) `shouldBe` [taskIdAt 0]
+      length <$> closedTasks rig >>= (`shouldBe` 3)
 
   describe "the owner's one wait" $ do
     it "returns for an admission, a control request, a grant, a timer wake and the owner's stop request, and for nothing else" $ do
