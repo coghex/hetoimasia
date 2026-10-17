@@ -6,7 +6,10 @@ Keep Lua central to authoring a game while Haskell owns execution, transport,
 failure evidence, and lifetime. This is the canonical continuation of
 `lua_runtime_architecture_notes.md` and the design conversation of 2026-09-16.
 
-Design state: `exploring`
+Design state: `ready for issue processing`
+
+Current readiness scope: **LUA-6 only** (D-28). Other unchecked slices retain
+their explicit deferrals; this state does not release the confinement gate.
 
 Owner: `coghex/hetoimasia`. Epic #145 and children #146–#149 have been
 created; those children are merged. The owner accepted the two-domain direction,
@@ -86,12 +89,12 @@ is delivered. The current exploration covers LUA-6 and the dependent authoring
 contract/organization under D-25; it does not revoke prior approvals or renew
 the other trusted slices or the confined branch.
 Q-9 through Q-17 below preserve the resolved design questions. D-16 through
-D-27 record lifecycle, identity, scheduling, determinism, delivery and automatic
+D-28 record lifecycle, identity, scheduling, determinism, delivery, automatic
 cleanup requirements. The [instance contract](lua_instance_contract.md) is
 accepted by D-26 and strengthened by D-27. LUA-6's design-readiness check is
-complete; it remains deferred only pending explicit readiness signoff. Do not request
-the same behavioral approval again. No tracker item has been created by this
-design discussion.
+complete and readiness is renewed by D-28. The owner requests manager-led issue
+processing and canonical issue approval. Do not request the same behavioral or
+readiness approval again. No tracker item has yet been created by this session.
 
 LUA-6 readiness check at `637d14a9`: its LUA-5/TIME-1 prerequisites are delivered;
 Q-9 through Q-17 are resolved or assigned under the approved contract and D-25
@@ -102,6 +105,12 @@ the scheduler slice bounded. The ledger matches all 19 delivery sections, and
 the open tracker contains the existing epic #145 but no LUA-6 child. Recommend
 renewing trusted readiness for LUA-6 alone, then processing that child under the
 existing epic. This review does not renew other slices or the confinement branch.
+
+Owner authorization, 2026-10-17: following that recommendation, the owner asked
+"great, give this to the manager to process please, have it process and approve
+the issue" in direct Codex session `01a14598-15ef-7241-ac4a-c3b1b490bec9`.
+Handoff request: `user-het-lua6-process-20261017-0544`. D-28 records its exact
+scope and endpoint; the manager must obtain the canonical independent verdict.
 
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
 reviewed and deliberately not tracked separately · `[deferred]` blocked on a
@@ -117,7 +126,7 @@ concrete precondition
 - [x] LUA-3. Add application-owned modules and bounded value bindings — [#462]
 - [x] LUA-4. Model bounded script tasks and execution protocols — [#149]
 - [x] LUA-5. Integrate trusted VM owners with runtime supervision — [#464]
-- [ ] LUA-6. Schedule cooperative tasks with bounded service turns — [deferred]: owner renews trusted-path readiness for this slice
+- [ ] LUA-6. Schedule cooperative tasks with bounded service turns
 - [ ] LUA-18. Own script instances, hooks and lifecycle controls — [deferred]: contract accepted; renew slice readiness
 - [ ] LUA-7. Add bounded asynchronous requests and owned subscriptions — [deferred]: owner renews trusted-path readiness for this slice
 - [ ] LUA-19. Run script instances through a headless command-line entry — [deferred]: contract accepted; renew slice readiness
@@ -700,6 +709,20 @@ and D-7/P-8 retain unsafe shared-state and fatal host failure behavior. Keep
 these boundaries explicit without burdening ordinary authors with ownership
 bookkeeping. Qualification belongs to LUA-18, provider retirement to LUA-7 and
 the integrated failure examples to LUA-8.
+
+### D-28. Renew LUA-6 readiness and delegate issue processing through approval
+
+Owner authorization, 2026-10-17, direct session
+`01a14598-15ef-7241-ac4a-c3b1b490bec9`: "great, give this to the manager to process
+please, have it process and approve the issue." This follows the completed
+LUA-6 readiness check and explicitly releases that slice for issue processing.
+The manager is to process exactly LUA-6 under existing epic #145, keep its spec
+within the accepted contract/scope and obtain fresh canonical opposite-agent
+issue approval. The requested endpoint is an approved issue, not implementation
+or merge. Canonical reviewers may require in-scope spec corrections; new product
+choices return to the owner. LUA-18/LUA-7/LUA-19/LUA-8 readiness and Q-5's
+confined branch remain separately gated. Handoff request:
+`user-het-lua6-process-20261017-0544`.
 
 ## Design
 
@@ -2078,9 +2101,9 @@ and verified policy, with adversarial regression coverage.
 
 ### LUA-6. Schedule cooperative tasks with bounded service turns
 
-> Deferred: readiness discussion opened 2026-10-17. LUA-5 and TIME-1 are
-> delivered and the concrete contract is accepted (D-26/D-27). Design-readiness
-> review is complete; explicit LUA-6 readiness signoff remains pending.
+> Ready for issue processing under D-28. LUA-5 and TIME-1 are delivered and the
+> concrete contract is accepted (D-26/D-27). The owner requests manager-led
+> processing and canonical issue approval, with endpoint approved issue.
 
 - **Outcome:** one trusted VM owner services resumable tasks fairly, wakes for
   events/deadlines, and reports real budget overruns without fake preemption.
@@ -2101,7 +2124,7 @@ and verified policy, with adversarial regression coverage.
   gameplay update durations, required work or committed effect order (D-23).
 - **Out of scope:** automatic code rewriting, arbitrary priority API, simulation
   coordinator, CPU affinity/niceness tuning, performance pass/fail thresholds.
-- **Open questions:** None; Q-17 is resolved by D-26/D-27. Readiness remains pending.
+- **Open questions:** None; Q-17 is resolved by D-26/D-27 and D-28 renews readiness.
   Q-16 is resolved by D-23: deterministic simulation is required.
   Q-10's compatibility and Q-11's API/example direction are accepted by D-20;
   their new runner/lifetime questions are tracked under Q-13/Q-14.

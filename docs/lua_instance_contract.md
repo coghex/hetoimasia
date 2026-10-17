@@ -5,8 +5,9 @@ Design contract, 2026-10-17. Owner: `coghex/hetoimasia`.
 **Status: accepted design contract (D-26), with the owner's automatic-cleanup
 requirement (D-27).** This refines [the Lua design](lua_runtime_design.md),
 D-16 through D-27. It describes intended behavior, not implemented APIs.
-The whole Lua arc remains `exploring` pending slice readiness reconciliation;
-contract approval does not by itself create issues or qualify implementation.
+The parent design is ready for issue processing for LUA-6 only under D-28;
+other slices retain their readiness gates. Contract approval does not itself
+create issues or qualify implementation.
 
 ## Approved requirements
 
