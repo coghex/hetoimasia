@@ -1935,7 +1935,9 @@ instance's number, and the host runs a hook by handing it to the driver, which c
 instance's `self`. A script cannot reach the table, so it cannot forge or erase another instance's
 state. The one binding the layer installs, `hetoimasia_instance.connect`, tells the owner a
 connection was made, so the owner records it at once; it accepts only the number of the instance
-whose code is running, so a script that names another instance's number is refused.
+whose code is running, so a script that names another instance's number is refused. A script that connects itself through the binding and
+not through its `api` has a connection with no function behind it: the first event for it fails that instance, by name,
+rather than being dropped.
 
 ### Hooks
 
@@ -2020,7 +2022,9 @@ with no scheduler request, reservation or queue between: a request settles as it
 can raise a failure of the host. An invocation that has not run a segment has nothing to freeze or close, even when
 the scheduler holds it in its queue behind slots that stay occupied: pausing takes it back, with its event, to be
 started on resume (the task the scheduler holds is used again when the invocation is the same, so pausing and
-resuming over and over admits nothing new), and a stop discards it as an unstarted invocation. Until it runs, an
+resuming over and over admits nothing new), and a stop discards it as an unstarted invocation. (A task the scheduler holds in its admission queue cannot be
+withdrawn from it: an instance that took one back leaves at most one such task, which does nothing when chosen and
+is used again by the same invocation, and it holds a queue place and a stored-result place until then.) Until it runs, an
 invocation holds its place in the instance's queue, so taking it back never overfills the queue. An owner that has been asked to stop services
 nothing more: its exit settles what was left. The scheduler's own task controls do not reach an instance's
 invocation, whatever the application learned of its identity: they answer unknown, and the instance layer is
@@ -2043,7 +2047,9 @@ the only thing that pauses, resumes or stops it.
 Whole-owner control (`retireScheduled`) is distinct. An orderly retirement stops each live instance
 through the same path with the reason `stopped` before the VM is closed. An owner that fails or is
 cancelled does not enter Lua for its instances again: no `shutdown` runs, which the settlement reports
-(`ShutdownSkippedUnsafe`), and each instance settles as discarded. A lifecycle binding a script calls
+(`ShutdownSkippedUnsafe`), and each instance settles as discarded. That includes an owner whose retirement is
+itself failing: once an instance's `shutdown` raises a failure of the host, or a close or hook is cut short as a
+cancellation is, the instances after it are discarded with the owner's exit, not stopped. A lifecycle binding a script calls
 still answers a typed `NotYetSupported` fault; Lua's own controls and inspection are LUA-23.
 
 ### Results, inspection and idle
