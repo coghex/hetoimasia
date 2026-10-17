@@ -705,7 +705,6 @@ retireInstances ih = do
   forM_ jobs $ \case
     JobControl _ _ receipt → atomically (settleReceipt receipt ControlNoLongerApplicable)
     _ → pure ()
-  mode ← readIORef (ihMode ih)
   cells ← Map.elems <$> readTVarIO (insCells (ihInstances ih))
   -- Each instance ends on its own: what one raises (a host failure from its hook, or
   -- the application's escalation) is kept for the owner's outcome and does not leave
@@ -713,9 +712,9 @@ retireInstances ih = do
   failures ← forM cells $ \cell → do
     ended ← try @SomeException $ do
       settled ← isJust <$> readTVarIO (icResult cell)
-      unless settled $ case mode of
-        Unorderly _ → discard ih cell
-        _ → beginEnding' ih cell EndStopped Nothing >> finishEnding ih cell 0 False
+      -- The way it ends, in order or as discarded, is the owner's exit mode, which
+      -- 'finishEnding' reads.
+      unless settled (beginEnding' ih cell EndStopped Nothing >> finishEnding ih cell 0 False)
     case ended of
       Left failure → [failure] <$ discardUnsettled ih cell
       Right () → pure []
@@ -742,11 +741,3 @@ discardUnsettled ih cell = do
           , resultTermination = Termination 0 0 0 ShutdownSkippedUnsafe
           }
   void (atomically (settleInstance (ihInstances ih) cell settlement))
-
--- | Settle an instance as discarded, whatever it was doing.
-discard ∷ InstanceHost → ICell → IO ()
-discard ih cell = do
-  settled ← isJust <$> readTVarIO (icResult cell)
-  unless settled $ do
-    beginEnding' ih cell EndStopped Nothing
-    finishEnding ih cell 0 False

@@ -105,9 +105,16 @@ spec = describe "events" $ do
       snapshotOf fixture owner "a" >>= (`shouldSatisfy` \held → fmap snapshotQueued held == Just 0)
       -- An owner that has begun to retire, with an instance still ending in its hook,
       -- takes nothing more.
+      -- One of them is paused with two events held, so the end has something to discard.
+      settleControl fixture owner "closing" InstancePause >>= (`shouldBe` ControlApplied)
+      forM_ [1, 2] (expectDelivered fixture owner "closing")
       retireScheduled owner
       awaitEntered (sf fixture) "shutdown"
-      deliverTick fixture owner "closing" 1 >>= (`shouldBe` DeliveryClosed)
+      deliverTick fixture owner "closing" 3 >>= (`shouldBe` DeliveryClosed)
+      -- Ending closed its admission, revoked its connection and discarded what it held,
+      -- at once, and not when the hook returned.
+      snapshotOf fixture owner "closing"
+        >>= (`shouldSatisfy` \held → fmap (\x → (snapshotPhase x, snapshotQueued x, snapshotConnections x)) held == Just (Stopping, 0, 0))
       releaseGate (sf fixture) "shutdown"
 
   it "refuses a payload whose event, stamped with its source and sequence, is over the owner's limits, rather than failing the instance when it runs" $ bounded $ do
@@ -134,6 +141,11 @@ spec = describe "events" $ do
       grantOne control owner
       expectDelivered fixture owner "a" 1
       grantOne control owner
+      -- A paused instance with nothing in flight starts nothing for an event it holds,
+      -- and the owner has served a turn since.
+      logged fixture >>= (`shouldBe` ["init 1"])
+      snapshotOf fixture owner "a"
+        >>= (`shouldSatisfy` \held → fmap (\x → (snapshotQueued x, snapshotExecution x)) held == Just (1, ExecIdle))
       grantOne control owner
       expectDelivered fixture owner "a" 2
       settleControl fixture owner "a" InstanceResume >>= (`shouldBe` ControlApplied)

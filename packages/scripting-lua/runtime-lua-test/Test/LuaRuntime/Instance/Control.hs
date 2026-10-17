@@ -122,6 +122,19 @@ spec = describe "control" $ do
       askControl fixture owner "a" InstanceStop >>= (`shouldSatisfy` \case InstanceControlUnknown → True; _ → False)
       deliverTick fixture owner "a" 2 >>= (`shouldBe` DeliveryUnknownTarget)
 
+  it "settles a request that finds its instance already ended as no longer applicable, not as already in that state" $ bounded $ do
+    fixture ← newIFixture
+    withBoundary $ \_ runtime → do
+      owner ← startInstances fixture runtime "ended first" [echoer, holder] (testConfig instanceBounds') requiredPolicy
+      _ ← admit fixture owner "a" (moduleNamed "echoer")
+      awaitPhase fixture owner "a" Active
+      holdOwner fixture owner
+      -- Nothing is in flight, so the first stop ends the instance as it is applied.
+      receipts ← forM [InstanceStop, InstanceStop, InstanceResume] (expectControl fixture owner "a")
+      releaseOwner fixture
+      results ← forM receipts waitInstanceControl
+      results `shouldBe` [ControlApplied, ControlNoLongerApplicable, ControlNoLongerApplicable]
+
   it "refuses what it cannot take: an identity it never issued, another owner's, a full set of reservations, a closed owner" $ bounded $ do
     fixture ← newIFixture
     withBoundary $ \_ runtime → do
