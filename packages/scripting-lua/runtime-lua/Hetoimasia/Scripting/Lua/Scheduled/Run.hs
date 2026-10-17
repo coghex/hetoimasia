@@ -148,9 +148,12 @@ serve stopping control handoff observe config owned = mask $ \restore → do
   -- The owner is exiting, however it was asked to or made to. Admission, grants
   -- and control close, every unsettled ticket settles, and only then are the
   -- suspended coroutines closed, masked from here on.
-  atomically $ do
-    writeTVar (controlClosing control) True
-    settleAll control (either exitOf (const ExitStopped) served)
+  -- Closing admission is a transaction of its own, first and small, so that a
+  -- crowd of producers cannot starve the large one that settles the tickets: once
+  -- it commits nothing is admitted, and the settlement runs against a state that
+  -- no producer is changing.
+  atomically (writeTVar (controlClosing control) True)
+  atomically (settleAll control (either exitOf (const ExitStopped) served))
   stopped ← tryWithContext @SomeException (stopScheduler scheduler host)
   earlier ← readIORef kept
   let closeFailures =

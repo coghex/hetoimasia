@@ -5,9 +5,11 @@
 -- them raised as cleanup evidence beside the primary outcome.
 module Test.LuaRuntime.Scheduled.Failures (spec) where
 
+import Control.Concurrent (forkIO)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (atomically)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), fromException)
-import Control.Monad (forM)
+import Control.Monad (forM, forM_)
 import Data.Maybe (isJust)
 import Hetoimasia.Foundation.Resource (cleanupFailuresInContext)
 import Hetoimasia.Runtime.Supervision (WorkerCleanupFailed (WorkerCleanupFailed), WorkerStatus (WorkerStopped, WorkerUnavailable))
@@ -45,6 +47,43 @@ spec = describe "host failures, failure and cancellation" $ do
       served ← admitTask' fixture bystander "served" (request "echo" [VInteger 9] OrdinaryClass OneShot Nothing)
       outcomeOf served >>= (`shouldBe` Just [VInteger 9]) . taskReturned
       retireScheduled bystander
+
+  it "leaves no admitted task unsettled when admissions race the owner's failure: admission closes as the owner begins to exit" $ bounded $ do
+    fixture ← newSFixture
+    withBoundary $ \control runtime → do
+      victim ← startScheduled fixture runtime (scheduled fixture "racing" (optionalPolicy (brokenIs "bang")) defaultSchedulerBounds {boundQueuedAdmissions = 4096, boundRetainedResults = 8192})
+      let endpoint = scheduledEndpoint victim
+      _ ← admitTask' fixture victim "bang" (request "block_then_fail" [VText "r", VText "bang"] OrdinaryClass OneShot Nothing)
+      awaitEntered fixture "r"
+      done ← newEmptyMVar
+      _ ← forkIO $ do
+        -- Admitting as fast as it can, from the moment the owner is let go, until
+        -- admission closes.
+        let go held = admitScheduledTask endpoint (request "echo" [VInteger 1] OrdinaryClass OneShot Nothing) >>= \case
+              TaskAccepted _ ticket → go (ticket : held)
+              TaskQueueFull → go held
+              TaskAdmissionClosed → pure held
+        go [] >>= putMVar done
+      releaseGate fixture "r"
+      tickets ← takeMVar done
+      _ ← awaitScheduledTerminal control victim
+      -- Every task the owner accepted settled: none was accepted too late to be.
+      forM_ tickets $ \ticket → outcomeOf ticket >>= (`shouldSatisfy` \case SettledDiscarded _ → True; SettledReturned _ → True; _ → False)
+
+  it "treats an identity another owner issued as unknown, whatever its number" $ bounded $ do
+    fixture ← newSFixture
+    withBoundary $ \_ runtime → do
+      one ← startScheduled fixture runtime (scheduled fixture "one" requiredPolicy defaultSchedulerBounds)
+      two ← startScheduled fixture runtime (scheduled fixture "two" requiredPolicy defaultSchedulerBounds)
+      theirs ← admitTask' fixture one "foreign" (request "forever" [VText "x"] OrdinaryClass Looped Nothing)
+      -- The first task each owner issues has the same local number; the identities
+      -- differ, and neither owner's control reaches the other's task.
+      _ ← admitTask' fixture two "own" (request "forever" [VText "y"] OrdinaryClass Looped Nothing)
+      requestTaskControl (scheduledEndpoint two) (ticketTask theirs) RequestStop >>= \case
+        TaskControlUnknown → pure ()
+        other → fail ("expected the identity to be unknown, found " <> show other)
+      retireScheduled one
+      retireScheduled two
 
   it "is fatal, as for any worker, for the same failure in a required owner" $ bounded $ do
     fixture ← newSFixture
