@@ -370,6 +370,7 @@ test-suite lua-runtime-tests
         Test.LuaRuntime.Identity
         Test.LuaRuntime.Independence
         Test.LuaRuntime.Instance.Basics
+        Test.LuaRuntime.Instance.Boundary
         Test.LuaRuntime.Instance.Capacity
         Test.LuaRuntime.Instance.Control
         Test.LuaRuntime.Instance.Determinism

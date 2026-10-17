@@ -306,7 +306,9 @@ deliverEvent (ScheduledEndpoint control) identity source payload = case controlI
       -- stamping the event, so the limits are checked on that record: a payload that
       -- passes and whose event does not would fail the instance when it ran.
       let stamped = VRecord [("source", VText source), ("sequence", VInteger 0), ("tick", VInteger 0), ("payload", payload)]
-      within ← evaluate (checkLimits (controlLimits control) [stamped])
+      -- The driver's entry point takes the instance's number before it, and the host
+      -- checks the two together.
+      within ← evaluate (checkLimits (controlLimits control) [VInteger 0, stamped])
       let context = Context {contextVm = foreignVm, contextTypeName = const Nothing, contextTypeNumber = const Nothing}
       conforming ← evaluate (conformValue context schema payload)
       case (within, conforming) of

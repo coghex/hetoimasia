@@ -312,8 +312,12 @@ connectSource instances number source = do
     Nothing → pure False
     Just cell → do
       state ← readTVar (icState cell)
+      running ← readTVar (insRunning instances)
+      -- Only the instance whose code is running can connect itself: a script that
+      -- names another instance's number is refused.
       let allowed =
-            not (isTerminal (isPhase state))
+            running == Just number
+              && not (isTerminal (isPhase state))
               && not (isStopped state)
               && Set.member source (icGrants cell)
               && Map.member source (insSources instances)

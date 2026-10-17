@@ -591,6 +591,12 @@ data Instances = Instances
   , insLive ∷ !(TVar Int)
   , insRetained ∷ !(TVar Int)
   , insControls ∷ !(TVar Int)
+  , insRunning ∷ !(TVar (Maybe Word64))
+    -- ^ The instance whose Lua the owner's thread is running, if any: what a binding
+    -- the instance's code calls is told it is called by.
+  , insBlocked ∷ !(TVar Bool)
+    -- ^ An invocation was refused by the scheduler for want of room, and waits for
+    -- room.
   }
 
 -- | Make an owner's instance state.
@@ -603,6 +609,8 @@ newInstances config =
     <*> newTVarIO 0
     <*> newTVarIO 0
     <*> newTVarIO 0
+    <*> newTVarIO Nothing
+    <*> newTVarIO False
 
 -- | An error as one line of text, at most 'failureTextLimit' characters.
 renderError ∷ InstanceError → Text

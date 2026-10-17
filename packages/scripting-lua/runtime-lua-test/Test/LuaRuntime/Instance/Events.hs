@@ -131,6 +131,26 @@ spec = describe "events" $ do
       phaseOf fixture owner "a" >>= (`shouldBe` Just Active)
       snapshotOf fixture owner "a" >>= (`shouldSatisfy` \held → fmap snapshotQueued held == Just 0)
 
+  it "checks the whole of what the host will check, the instance's number beside the event, so an event it accepts never fails the instance" $ bounded $ do
+    fixture ← newIFixture
+    withBoundary $ \_ runtime → do
+      let ownerWith bytes label = do
+            limits ← either (fail . show) pure (valueLimits bytes 8 4096)
+            startWith fixture runtime . withLimits limits $
+              instanceSpec fixture label [echoer] (testConfig instanceBounds') requiredPolicy defaultSchedulerBounds
+      -- The stamped event is 97 bytes, and the number the driver takes is 9 more.
+      over ← ownerWith 105 "over"
+      _ ← admit fixture over "over" (moduleNamed "echoer")
+      awaitPhase fixture over "over" Active
+      deliverTick fixture over "over" 1 >>= (`shouldBe` DeliveryRefused)
+      phaseOf fixture over "over" >>= (`shouldBe` Just Active)
+      exact ← ownerWith 106 "exact"
+      _ ← admit fixture exact "exact" (moduleNamed "echoer")
+      awaitPhase fixture exact "exact" Active
+      expectDelivered fixture exact "exact" 1
+      awaitEffect (sf fixture) "tick 2 n=1 seq=0 t=0 count=1"
+      phaseOf fixture exact "exact" >>= (`shouldBe` Just Active)
+
   it "keeps an accepted event's sequence and the logical tick it was admitted at, however long it waits" $ bounded $ do
     fixture ← newIFixture
     withBoundary $ \control runtime → do

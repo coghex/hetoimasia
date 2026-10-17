@@ -36,6 +36,11 @@ module Test.LuaRuntime.Instance.Support
   , noHooks
   , hostFailing
   , hostShutdown
+  , waitHostShutdown
+  , badCloseHostShutdown
+  , gated
+  , forger
+  , plainModule
   , moduleNamed
     -- * Configurations
   , instanceBounds'
@@ -442,6 +447,66 @@ hostShutdown =
     [ "function init(self, api) api.connect('tick', function(self, event) end) end"
     , "function shutdown(self, reason) fx.fail('boom') end"
     ]
+
+-- | A callback that waits, and a @shutdown@ that records and then fails the way the
+-- host fails.
+waitHostShutdown ∷ ModuleSource
+waitHostShutdown =
+  hooksModule
+    "waithostshutdown"
+    [ "function init(self, api)"
+    , "  api.connect('tick', function(self, event) sched.wait_ticks(1) end)"
+    , "end"
+    , "function shutdown(self, reason) " <> record <> "('shutdown') fx.fail('boom') end"
+    ]
+
+-- | A callback that waits holding a closing handler that raises, and a @shutdown@
+-- that fails the way the host fails.
+badCloseHostShutdown ∷ ModuleSource
+badCloseHostShutdown =
+  hooksModule
+    "badclosehostshutdown"
+    [ "function init(self, api)"
+    , "  api.connect('tick', function(self, event)"
+    , "    local guard <close> = setmetatable({}, {__close = function() error('close boom') end})"
+    , "    sched.wait_ticks(1)"
+    , "  end)"
+    , "end"
+    , "function shutdown(self, reason) fx.fail('boom') end"
+    ]
+
+-- | A callback that waits at a gate, yields, and would then record.
+gated ∷ ModuleSource
+gated =
+  hooksModule
+    "gated"
+    [ "function init(self, api)"
+    , "  api.connect('tick', function(self, event)"
+    , "    fx.block('cb')"
+    , "    sched.yield()"
+    , "    " <> record <> "('after')"
+    , "  end)"
+    , "end"
+    ]
+
+-- | An instance that calls the layer's own binding with the number of the instance
+-- admitted after it, to connect that one beforehand.
+forger ∷ ModuleSource
+forger =
+  hooksModule
+    "forger"
+    [ "function init(self, api)"
+    , "  " <> record <> "('forged ' .. tostring(hetoimasia_instance.connect(2, 'tick')))"
+    , "end"
+    ]
+
+-- | A module of tasks, for the ordinary work an owner of instances may hold.
+plainModule ∷ ModuleSource
+plainModule =
+  ModuleSource
+    (ModuleRef "tasks" "1")
+    (Text.encodeUtf8 "function once(label) fx.record(label) return 1 end\n")
+    [EntryPoint "once" Required [SText] [SInteger]]
 
 -- | The module of this name among those the examples load.
 moduleNamed ∷ Text → ModuleRef

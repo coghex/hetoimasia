@@ -4,6 +4,7 @@
 module Test.LuaRuntime.Instance.Spec (spec) where
 
 import qualified Test.LuaRuntime.Instance.Basics
+import qualified Test.LuaRuntime.Instance.Boundary
 import qualified Test.LuaRuntime.Instance.Capacity
 import qualified Test.LuaRuntime.Instance.Control
 import qualified Test.LuaRuntime.Instance.Determinism
@@ -15,6 +16,7 @@ import Test.Hspec (Spec, describe)
 spec ∷ Spec
 spec = describe "the script instances" $ do
   Test.LuaRuntime.Instance.Basics.spec
+  Test.LuaRuntime.Instance.Boundary.spec
   Test.LuaRuntime.Instance.Capacity.spec
   Test.LuaRuntime.Instance.Control.spec
   Test.LuaRuntime.Instance.Determinism.spec

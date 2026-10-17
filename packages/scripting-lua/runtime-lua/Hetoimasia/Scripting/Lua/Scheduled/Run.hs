@@ -61,13 +61,13 @@ import Control.Exception
   , fromException
   , mask
   , mask_
+  , onException
   , rethrowIO
   , someExceptionContext
-  , throwIO
   , try
   , tryWithContext
   )
-import Control.Monad (forM, forM_)
+import Control.Monad (forM, forM_, unless)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -118,6 +118,7 @@ import Hetoimasia.Scripting.Lua.Instance.Run
   , instanceSegment
   , newInstanceHost
   , retireInstances
+  , servicePending
   , serviceInstances
   , settleEnded
   )
@@ -187,12 +188,20 @@ serve stopping control handoff observe escalate config owned = mask $ \restore �
             -- ended after that, whatever the close did: it is told only when the
             -- close was not interrupted, which an exit settles as discarded.
             hostClose = \task → do
-              closed ← try @SomeException (closeSuspended owned tasks kept task)
+              began ← Map.member task <$> readIORef tasks
+              closed ← tryWithContext @SomeException (closeSuspended owned tasks kept task)
               instances ← readIORef instanceRef
-              case closed of
-                Left failure | Just (_ ∷ SomeAsyncException) ← fromException failure → pure ()
-                _ → forM_ instances (`instanceClosed` task)
-              either throwIO pure closed
+              let interrupted = case closed of
+                    Left (ExceptionWithContext _ failure) | Just (_ ∷ SomeAsyncException) ← fromException failure → True
+                    _ → False
+              unless interrupted $
+                forM_ instances (\ih → instanceClosed ih task began) `onException` do
+                  -- What ending the instance raised is what the scheduler keeps of this
+                  -- close, so the close's own failure is kept here: raising the one
+                  -- must not take the other with it.
+                  forM_ (either Just (const Nothing) closed) $ \failure →
+                    modifyIORef' extra (<> [("lua task close", failure)])
+              either rethrowIO pure closed
           }
   served ← tryWithContext @SomeException . restore $ do
     handles ← Map.fromList . catMaybes <$> traverse (resolve owned) (map sourceIdentity (vmModules config))
@@ -310,6 +319,9 @@ runSegment
   → TaskRun Cursor
   → IO (SegmentReport Cursor)
 runSegment control observe owned identity label handlesRef tasks extra instanceRef run = do
+  -- What the application asked of its instances is applied at this boundary, before
+  -- the segment begins.
+  readIORef instanceRef >>= mapM_ servicePending
   observe
     SegmentContext
       { contextTask = ScheduledTaskId (controlOwner control) (runTask run)

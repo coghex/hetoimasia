@@ -221,6 +221,7 @@ module Hetoimasia.Scripting.Lua.Scheduler
   , AdmitAnswer (..)
   , AdmitRefusal (..)
   , admitTask
+  , admissionAvailable
   , observeTask
   , taskPhase
   , TaskPhase (..)
@@ -461,6 +462,17 @@ admitTask scheduler spec = do
   let (next, answer) = admitIn open spec state
   writeTVar (schedState scheduler) next
   pure answer
+
+-- | Whether admitting a task like this one would be accepted now: the scheduler is
+-- open and neither its queue of admissions nor its stored results is full. Reads
+-- and changes nothing, so an owner can wait for room.
+admissionAvailable ∷ Scheduler v → TaskSpec v → STM Bool
+admissionAvailable scheduler spec = do
+  state ← readTVar (schedState scheduler)
+  open ← isOpen scheduler state
+  pure $ open && case snd (admitIn open spec state) of
+    Admitted _ → True
+    AdmitRefused _ → False
 
 -- | Take a finished task's terminal result, if it has one, and give back the
 -- result storage its admission reserved. A task that has not finished, and one
