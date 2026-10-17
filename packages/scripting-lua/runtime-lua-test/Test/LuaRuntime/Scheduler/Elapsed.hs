@@ -5,7 +5,9 @@
 module Test.LuaRuntime.Scheduler.Elapsed (spec) where
 
 import Control.Concurrent.STM (atomically)
-import Control.Exception (MaskingState (Unmasked), getMaskingState)
+import Control.Concurrent (forkIO, throwTo)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Exception (AsyncException (ThreadKilled), MaskingState (Unmasked), SomeException, getMaskingState, try)
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Hetoimasia.Foundation.Time (monotonicSource)
 import Hetoimasia.Scripting.Lua.Scheduler
@@ -170,6 +172,49 @@ spec = describe "elapsed time and the owned timer" $ do
       _ ← stopScheduler (rigScheduler rig) (rigHost rig)
       liveRegs (rigTimer rig) >>= (`shouldSatisfy` null)
       readIORef cancelled >>= (`shouldSatisfy` (\seen → not (null seen) && Unmasked `notElem` seen))
+
+    it "keeps a registration through an interruption while it is being armed: the cancellation waits, and the stop cancels it" $ do
+      rig ← newRig
+      _ ← admit rig "sleeper" OrdinaryClass OneShot
+      script rig "sleeper" [waitFor "sleeper" 5000000]
+      entered ← newEmptyMVar
+      gate ← newEmptyMVar
+      writeIORef (ftOnArm (rigTimer rig)) (putMVar entered () >> takeMVar gate)
+      finished ← newEmptyMVar
+      driver ← forkIO (try @SomeException (turn rig) >>= putMVar finished)
+      takeMVar entered
+      -- The backend is blocked inside the arming. The interruption cannot be taken
+      -- there: it waits behind the registration, and arrives once the timer holds
+      -- the way to cancel it.
+      thrower ← forkIO (throwTo driver ThreadKilled)
+      awaitDelivered thrower
+      putMVar gate ()
+      _ ← takeMVar finished
+      writeIORef (ftOnArm (rigTimer rig)) (pure ())
+      _ ← stopScheduler (rigScheduler rig) (rigHost rig)
+      liveRegs (rigTimer rig) >>= (`shouldSatisfy` null)
+
+    it "finishes cancelling a registration through an interruption, so a stop that was interrupted still leaves none live" $ do
+      rig ← newRig
+      _ ← admit rig "sleeper" OrdinaryClass OneShot
+      script rig "sleeper" [waitFor "sleeper" 5000000]
+      _ ← turn rig
+      liveRegs (rigTimer rig) >>= (`shouldSatisfy` ((== 1) . length))
+      entered <- newEmptyMVar
+      gate <- newEmptyMVar
+      writeIORef (ftOnCancel (rigTimer rig)) (putMVar entered () >> takeMVar gate)
+      finished ← newEmptyMVar
+      stopper ← forkIO (try @SomeException (stopScheduler (rigScheduler rig) (rigHost rig)) >>= putMVar finished)
+      takeMVar entered
+      thrower ← forkIO (throwTo stopper ThreadKilled)
+      awaitDelivered thrower
+      putMVar gate ()
+      _ ← takeMVar finished
+      atomically (schedulerClosed (rigScheduler rig)) >>= (`shouldBe` True)
+      liveRegs (rigTimer rig) >>= (`shouldSatisfy` null)
+      writeIORef (ftOnCancel (rigTimer rig)) (pure ())
+      _ ← stopScheduler (rigScheduler rig) (rigHost rig)
+      liveRegs (rigTimer rig) >>= (`shouldSatisfy` null)
 
     it "is armed with the system timer and wakes the owner when its time comes, with no sleep in the example" $ bounded $ do
       -- The production seam: the threaded runtime's timer manager and the real

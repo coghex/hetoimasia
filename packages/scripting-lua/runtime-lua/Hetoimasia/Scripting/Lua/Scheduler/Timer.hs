@@ -58,7 +58,7 @@ import Control.Concurrent.STM
   , readTVarIO
   , writeTVar
   )
-import Control.Exception (mask_, onException)
+import Control.Exception (onException, uninterruptibleMask_)
 import Control.Monad (when)
 import Data.Word (Word64)
 import GHC.Event (getSystemTimerManager, registerTimeout, unregisterTimeout)
@@ -166,11 +166,14 @@ syncTimer timer clock target = do
 
 -- | Arm a registration. The generation and the live record are published before
 -- the backend is asked, so a wake that arrives at once finds them. The whole of
--- it is masked, so the registration the backend made and the action that cancels
--- it are never separated by an asynchronous exception: the timer owns it from
--- the moment it exists.
+-- it is uninterruptibly masked, so the registration the backend made and the
+-- action that cancels it are never separated by an asynchronous exception, not
+-- even at a blocking operation inside the backend: the timer owns the
+-- registration from the moment it exists. Cancelling and disposing are masked the
+-- same way. A backend is therefore called uninterruptibly and must not block for
+-- long, which the threaded runtime's timer manager does not.
 arm ∷ Timer → Instant → Duration → IO ()
-arm timer deadline remaining = mask_ $ do
+arm timer deadline remaining = uninterruptibleMask_ $ do
   generation ← atomically $ do
     state ← readTVar (timerState timer)
     let issued = stateGeneration state + 1
@@ -207,7 +210,7 @@ retire timer generation = do
 
 -- | Cancel the live registration, if there is one.
 cancelLive ∷ Timer → IO ()
-cancelLive timer = mask_ $ do
+cancelLive timer = uninterruptibleMask_ $ do
   cancel ← atomically $ do
     state ← readTVar (timerState timer)
     writeTVar (timerState timer) state {stateLive = Nothing, stateCancel = Nothing}
@@ -217,7 +220,7 @@ cancelLive timer = mask_ $ do
 -- | End the timer for good: cancel what is armed, and ignore every wake and
 -- every request to arm from now on.
 disposeTimer ∷ Timer → IO ()
-disposeTimer timer = mask_ $ do
+disposeTimer timer = uninterruptibleMask_ $ do
   cancel ← atomically $ do
     state ← readTVar (timerState timer)
     writeTVar (timerState timer) state {stateLive = Nothing, stateCancel = Nothing, stateDisposed = True}

@@ -195,6 +195,9 @@ spec = describe "stopping the scheduler, admission and diagnostics" $ do
       turnEnd second `shouldBe` TurnIdle
       _ ← granted rig 8
       _ ← turnsUntilIdle rig 5
+      -- Only the stopped task's continuation was closed: the task that failed in its
+      -- own segment has a dead continuation, which is the host's.
+      map fst <$> closedTasks rig >>= (`shouldBe` [stopped])
       counts ← diagnostics rig
       counts
         `shouldBe` Diagnostics

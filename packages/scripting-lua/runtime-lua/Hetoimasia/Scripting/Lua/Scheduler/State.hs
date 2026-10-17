@@ -43,6 +43,11 @@ module Hetoimasia.Scripting.Lua.Scheduler.State
   , beginSegment
   , Event (..)
   , applyReport
+  , siteOf
+  , recordOverrunAt
+  , resetPassIfIdle
+  , closeObligations
+  , closedObligation
 
     -- * Time
   , settleGrants
@@ -61,6 +66,8 @@ import Data.List (sortOn)
 import qualified Data.List.NonEmpty as NonEmpty
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
+import Data.Set (Set)
+import qualified Data.Set as Set
 import Data.Sequence (Seq, ViewL (EmptyL, (:<)), (|>))
 import qualified Data.Sequence as Seq
 import Data.Text (Text)
@@ -206,6 +213,10 @@ data SchedState v = SchedState
   , ssPhase ∷ !Phase
   , ssCounts ∷ !Diagnostics
   , ssSites ∷ !(Map (TaskKind, Text) Int)
+  , ssToClose ∷ !(Set TaskId)
+    -- ^ Tasks that ended while their continuation was suspended and whose
+    -- continuation has not yet been closed: a refused wait, a wait that could not
+    -- be applied. The obligation stays until the close has been made.
   }
 
 -- | The most overrun sites one scheduler attributes. A site is a kind of work
@@ -262,6 +273,7 @@ initialState label session =
           , diagTick = 0
           }
     , ssSites = Map.empty
+    , ssToClose = Set.empty
     }
 
 -- | Count one more, never past the largest number.
@@ -353,15 +365,25 @@ liveTarget ∷ TaskId → SchedState v → Bool
 liveTarget identity state =
   maybe False (not . isTerminal . taskState) (Map.lookup identity (sessionTasks (ssSession state)))
 
--- | Live tasks that are not inside a segment, in identity order: the ones a
--- stop closes.
+-- | The continuations a stop closes, in identity order: those of live tasks that
+-- are not inside a segment, and those still owed a close.
 stoppableTasks ∷ SchedState v → [TaskId]
 stoppableTasks state =
-  [ identity
-  | (identity, task) ← Map.toAscList (sessionTasks (ssSession state))
-  , not (isTerminal (taskState task))
-  , taskState task /= Running
-  ]
+  Set.toAscList . Set.union (ssToClose state) . Set.fromList $
+    [ identity
+    | (identity, task) ← Map.toAscList (sessionTasks (ssSession state))
+    , not (isTerminal (taskState task))
+    , taskState task /= Running
+    ]
+
+-- | The continuations that still have to be closed because their task ended while
+-- suspended, in identity order.
+closeObligations ∷ SchedState v → [TaskId]
+closeObligations = Set.toAscList . ssToClose
+
+-- | Take a close obligation off, once the close has been made.
+closedObligation ∷ TaskId → SchedState v → SchedState v
+closedObligation identity state = state {ssToClose = Set.delete identity (ssToClose state)}
 
 -- Admission --------------------------------------------------------------------
 
@@ -529,8 +551,8 @@ data Event
 -- The reading is the owner's clock at the moment the segment returned. It is
 -- present whenever the report is an elapsed wait, which is the one report that
 -- needs it; an elapsed wait without one cannot be placed and is refused.
-applyReport ∷ TaskId → Bool → Maybe Instant → SegmentReport v → SchedState v → (SchedState v, [Event])
-applyReport identity overran reading report state0 = case report of
+applyReport ∷ TaskId → Maybe Instant → SegmentReport v → SchedState v → (SchedState v, [Event])
+applyReport identity reading report state = case report of
   ReportCompleted value → completed value
   ReportYielded value → applied (SegmentYielded value) $ counting (\counts → counts {diagYielded = bump (diagYielded counts)})
   ReportWaitTicks value ticks
@@ -548,9 +570,8 @@ applyReport identity overran reading report state0 = case report of
           Right deadline →
             placeWait value (ElapsedWait sequenceNumber now deadline) $
               \placed → placed {ssElapsed = Map.insert (deadline, sequenceNumber) identity (ssElapsed placed)}
-  ReportFailed failure → (failTaskIn identity failure state, [Failed identity failure])
+  ReportFailed failure → (failTaskIn False identity failure state, [Failed identity failure])
   where
-    state = if overran then recordOverrun identity state0 else state0
     sequenceNumber = ssNextWait state
 
     completed value = case applyOutcome identity (SegmentCompleted value) (ssSession state) of
@@ -583,7 +604,7 @@ applyReport identity overran reading report state0 = case report of
 
     refuse why =
       let failure = TaskFailure (failureReason ValidationFault ("wait refused: " <> refusalText why)) RecoverySafe
-       in ( counting (\counts → counts {diagRefusedWaits = bump (diagRefusedWaits counts)}) (failTaskIn identity failure state)
+       in ( counting (\counts → counts {diagRefusedWaits = bump (diagRefusedWaits counts)}) (failTaskIn True identity failure state)
           , [WaitRefused identity why, Failed identity failure]
           )
 
@@ -594,16 +615,24 @@ refusalText = \case
   WaitDurationNotPositive → "an elapsed wait of no time"
   WaitDeadlineOverflow → "the deadline is not representable"
 
--- | Fail a live task, ending it with the failure as its result.
-failTaskIn ∷ TaskId → TaskFailure → SchedState v → SchedState v
-failTaskIn identity failure state = case transition identity (failTask key failure) (ssSession state) of
+-- | Fail a live task, ending it with the failure as its result. A task failed
+-- while its continuation was suspended (a wait that was refused, a wait that
+-- could not be applied) still owes that continuation a close; one that failed in
+-- its own segment does not, since its continuation is dead.
+failTaskIn ∷ Bool → TaskId → TaskFailure → SchedState v → SchedState v
+failTaskIn suspended identity failure state = case transition identity (failTask key failure) (ssSession state) of
   (session, Right _) →
     counting
       (\counts → counts {diagFailed = bump (diagFailed counts)})
-      (forget identity state {ssSession = retire identity (ResultFailed failure) session})
+      ( owed
+          (forget identity state {ssSession = retire identity (ResultFailed failure) session})
+      )
   (_, Left _) → state
   where
     key = sessionKey (ssSession state)
+    owed ended
+      | suspended = ended {ssToClose = Set.insert identity (ssToClose ended)}
+      | otherwise = ended
 
 -- | Take a task that has just ended out of every structure that tracks a live
 -- one. The order matters: what a task held is read from its record, which goes
@@ -624,17 +653,31 @@ removeWaiter identity state = case Map.lookup identity (ssInfo state) >>= infoWa
     state {ssElapsed = Map.delete (deadline, sequenceNumber) (ssElapsed state)}
   Nothing → state
 
+-- | The site an overrun of this task would be attributed to: its kind and entry
+-- point. Read before a report is applied, since a task that ends takes its record
+-- with it.
+siteOf ∷ TaskId → SchedState v → Maybe (TaskKind, Text)
+siteOf identity state = (\info → (infoKind info, infoEntry info)) <$> Map.lookup identity (ssInfo state)
+
 -- | Count a segment that ran past the budget against its site.
-recordOverrun ∷ TaskId → SchedState v → SchedState v
-recordOverrun identity state = case Map.lookup identity (ssInfo state) of
-  Nothing → counted
-  Just info →
-    let site = (infoKind info, infoEntry info)
-     in if Map.member site (ssSites state) || Map.size (ssSites state) < maxOverrunSites
-          then counted {ssSites = Map.insertWith (\_ count → bump count) site 1 (ssSites counted)}
-          else counting (\counts → counts {diagOverrunsUnattributed = bump (diagOverrunsUnattributed counts)}) counted
-  where
-    counted = counting (\counts → counts {diagOverruns = bump (diagOverruns counts)}) state
+recordOverrunAt ∷ Maybe (TaskKind, Text) → SchedState v → SchedState v
+recordOverrunAt Nothing state = counted state
+recordOverrunAt (Just site) state
+  | Map.member site (ssSites state) || Map.size (ssSites state) < maxOverrunSites =
+      (counted state) {ssSites = Map.insertWith (\_ count → bump count) site 1 (ssSites state)}
+  | otherwise = counting (\counts → counts {diagOverrunsUnattributed = bump (diagOverrunsUnattributed counts)}) (counted state)
+
+counted ∷ SchedState v → SchedState v
+counted = counting (\counts → counts {diagOverruns = bump (diagOverruns counts)})
+
+-- | Start the pass afresh if nothing at all is ready, as choosing the next
+-- segment does. A turn that ends before it chooses, at a budget or a stop
+-- request, calls this so that where it was cut cannot change what the pass does
+-- next.
+resetPassIfIdle ∷ SchedState v → SchedState v
+resetPassIfIdle state
+  | null (readyCandidates state) = state {ssPass = startOfPass}
+  | otherwise = state
 
 -- Time -------------------------------------------------------------------------
 
@@ -708,7 +751,7 @@ applyHead grant state = foldl' advance (opened, []) (Map.toAscList (ssLogical st
       Just info@TaskInfo {infoWait = Just wait@LogicalWait {}} → case addDurations (waitGranted wait) (grantDuration grant) of
         Left _ →
           let failure = TaskFailure (failureReason ValidationFault "logical wait: the granted duration is not representable") RecoverySafe
-           in (failTaskIn identity failure current, events <> [Failed identity failure])
+           in (failTaskIn True identity failure current, events <> [Failed identity failure])
         Right granted
           | tick >= waitTarget wait →
               (wake identity (ResumedLogical tick granted) (Just identityOfGrant) current, events)

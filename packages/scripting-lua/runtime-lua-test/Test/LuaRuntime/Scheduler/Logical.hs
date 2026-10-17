@@ -148,6 +148,8 @@ spec = describe "logical time" $ do
     -- exactly what that grant gave it.
     handed rig >>= \seen → [resume | ("late", 1, resume) ← seen] `shouldBe` [Just (ResumedLogical 2 (nanoseconds 1))]
     phase rig late >>= (`shouldBe` Just (PhaseEnded OutcomeCompleted))
+    -- The victim ended while its continuation was suspended, so it was closed.
+    map fst <$> closedTasks rig >>= (`shouldBe` [victim])
 
   it "refuses a wait that cannot be represented, and fails its task with a typed failure rather than waiting" $ do
     rig ← newRig
@@ -176,6 +178,8 @@ spec = describe "logical time" $ do
       other → fail ("expected a failed result, found " <> show other)
     counts ← diagnostics rig
     diagRefusedWaits counts `shouldBe` 4
+    -- Each refused wait left a suspended continuation, which was closed once.
+    map fst <$> closedTasks rig >>= (`shouldBe` [zeroTicks, zeroTime, overflow, late])
     -- Nothing waits, so nothing was armed.
     liveRegs (rigTimer rig) >>= (`shouldSatisfy` null)
 

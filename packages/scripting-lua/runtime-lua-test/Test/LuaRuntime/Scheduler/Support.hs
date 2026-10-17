@@ -35,6 +35,7 @@ module Test.LuaRuntime.Scheduler.Support
   , handed
   , closedTasks
   , workAvailable
+  , awaitDelivered
   , taskIdAt
   , phase
   , observe
@@ -60,7 +61,8 @@ module Test.LuaRuntime.Scheduler.Support
 
 import Control.Concurrent.STM (TVar, atomically, newTVarIO, orElse, readTVar, writeTVar)
 import Control.Exception (SomeException, throwIO)
-import Control.Concurrent (ThreadId, myThreadId)
+import Control.Concurrent (ThreadId, myThreadId, yield)
+import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (ThreadBlocked, ThreadDied, ThreadFinished), threadStatus)
 import Control.Monad (filterM, join)
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
@@ -89,6 +91,8 @@ data Rig = Rig
   , rigCloseFailures ∷ !(IORef (Map TaskId SomeException))
   , rigCloseHook ∷ !(IORef (TaskId → IO ()))
   , rigClock ∷ !(IORef Word64)
+  , rigClockHook ∷ !(IORef (IO ()))
+    -- ^ Run at every reading of the injected clock, before it answers.
   , rigTimer ∷ !FakeTimer
   , rigStop ∷ !(TVar Bool)
   }
@@ -134,6 +138,7 @@ newRigWith options = do
   closeFailures ← newIORef Map.empty
   closeHook ← newIORef (const (pure ()))
   clock ← newIORef 0
+  clockHook ← newIORef (pure ())
   timer ← newFakeTimer
   stop ← newTVarIO False
   let config =
@@ -142,7 +147,7 @@ newRigWith options = do
           , schedScope = scope
           , schedPolicy = optPolicy options
           , schedBounds = optBounds options
-          , schedClock = scriptedSource (scriptedInstant . nanoseconds <$> readIORef clock)
+          , schedClock = scriptedSource (join (readIORef clockHook) >> (scriptedInstant . nanoseconds <$> readIORef clock))
           , schedTimer = ftBackend timer
           , schedStopRequested = readTVar stop
           }
@@ -164,7 +169,7 @@ newRigWith options = do
               failures ← readIORef closeFailures
               maybe (pure ()) throwIO (Map.lookup identity failures)
           }
-  pure (Rig scheduler host logRef handedRef scripts closed closeFailures closeHook clock timer stop)
+  pure (Rig scheduler host logRef handedRef scripts closed closeFailures closeHook clock clockHook timer stop)
 
 -- Scripts ----------------------------------------------------------------------
 
@@ -261,6 +266,18 @@ closedTasks rig = reverse <$> readIORef (rigClosed rig)
 -- | Whether the owner's wait would return now.
 workAvailable ∷ Rig → IO Bool
 workAvailable rig = atomically ((awaitWork (rigScheduler rig) >> pure True) `orElse` pure False)
+
+-- | Wait until a thread that is throwing an exception to another has either
+-- delivered it or is blocked because its target cannot take it yet. Used to
+-- order an interruption against a section that defers it.
+awaitDelivered ∷ ThreadId → IO ()
+awaitDelivered thrower = do
+  status ← threadStatus thrower
+  case status of
+    ThreadFinished → pure ()
+    ThreadDied → pure ()
+    ThreadBlocked BlockedOnException → pure ()
+    _ → yield >> awaitDelivered thrower
 
 -- | The identity the nth task admitted to a scheduler gets: the engine issues
 -- them from zero in order.

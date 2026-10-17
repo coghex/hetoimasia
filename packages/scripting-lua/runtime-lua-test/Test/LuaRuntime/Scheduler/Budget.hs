@@ -4,6 +4,7 @@
 module Test.LuaRuntime.Scheduler.Budget (spec) where
 
 import Control.Concurrent.STM (atomically)
+import Control.Exception (SomeException, try)
 import Control.Monad (forM, forM_)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import qualified Data.Text as Text
@@ -44,6 +45,30 @@ spec = describe "service budgets and overruns" $ do
     -- Ending exactly at the deadline expires the budget, and is not an overrun.
     diagOverruns <$> diagnostics rig >>= (`shouldBe` 0)
 
+  it "keeps a suspended continuation closable when the clock fails after its segment returned" $ do
+    rig ← newRigWith defaultOptions {optBounds = budgeted (Just 10) defaultBounds}
+    task ← admit rig "task" OrdinaryClass Looped
+    script rig "task" [writeIORef (rigClockHook rig) (ioError (userError "clock down")) >> yielded "task"]
+    outcome ← try @SomeException (turn rig)
+    either (const (pure ())) (const (fail "the turn should have failed")) outcome
+    -- The segment had returned and its report was applied before the clock was
+    -- read, so the task is ready, not running, and the stop closes it.
+    phase rig task >>= (`shouldBe` Just PhaseReady)
+    writeIORef (rigClockHook rig) (pure ())
+    _ ← stopScheduler (rigScheduler rig) (rigHost rig)
+    map fst <$> closedTasks rig >>= (`shouldBe` [task])
+
+  it "keeps a continuation that waits for elapsed time closable when the clock fails before its deadline can be placed" $ do
+    rig ← newRig
+    task ← admit rig "task" OrdinaryClass Looped
+    script rig "task" [writeIORef (rigClockHook rig) (ioError (userError "clock down")) >> waitFor "task" 100]
+    outcome ← try @SomeException (turn rig)
+    either (const (pure ())) (const (fail "the turn should have failed")) outcome
+    writeIORef (rigClockHook rig) (pure ())
+    phase rig task >>= (`shouldBe` Just PhaseReady)
+    _ ← stopScheduler (rigScheduler rig) (rigHost rig)
+    map fst <$> closedTasks rig >>= (`shouldBe` [task])
+
   it "looks at the clock again after the work at a boundary, which can use up the budget" $ do
     rig ← newRigWith defaultOptions {optBounds = budgeted (Just 10) defaultBounds}
     a ← admit rig "a" OrdinaryClass Looped
@@ -70,6 +95,24 @@ spec = describe "service budgets and overruns" $ do
     (turnSegments report, turnEnd report) `shouldBe` (1, TurnBudgetExpired)
     ran rig >>= (`shouldBe` ["a"])
     readIORef cell >>= maybe (fail "no request") (\accepted → atomically (pollControl accepted) >>= (`shouldSatisfy` \case Just (ControlSettlement ControlApplied (Just CloseClean)) → True; _ → False))
+
+  it "leaves the pass as the next choice would when a cutoff coincides with the owner becoming idle" $ do
+    let order budget = do
+          rig ← newRigWith defaultOptions {optBounds = budgeted budget defaultBounds}
+          forM_ [("control", ControlClass), ("ordinary", OrdinaryClass), ("background", BackgroundClass)] $ \(name, serviceClass) → do
+            _ ← admit rig name serviceClass OneShot
+            script rig name [cost rig 10 (waitTicks name 1)]
+          _ ← turn rig
+          _ ← granted rig 1
+          _ ← turnsUntilIdle rig 5
+          ran rig
+    -- With a budget of 30 the first turn is cut exactly as the last task waits and
+    -- nothing is left ready; the pass must start afresh, as it does without a
+    -- budget, so that the next grant serves control, ordinary, background.
+    unbudgeted ← order Nothing
+    budgetedOrder ← order (Just 30)
+    budgetedOrder `shouldBe` unbudgeted
+    unbudgeted `shouldBe` ["control", "ordinary", "background", "control", "ordinary", "background"]
 
   it "never changes where the pass is: a cutoff continues the same pass, with the quanta it had left" $ do
     let quanta = Quanta (Quantum 2) (Quantum 3) (Quantum 2)

@@ -313,7 +313,7 @@ import Control.Concurrent.STM
   , retry
   , writeTVar
   )
-import Control.Exception (SomeAsyncException, SomeException, catch, fromException, mask_, throwIO, try)
+import Control.Exception (SomeAsyncException, SomeException, catch, fromException, mask, mask_, onException, throwIO, try)
 import Control.Monad (forM_, unless, when)
 import Data.Foldable (toList)
 import Data.IORef (modifyIORef', newIORef, readIORef)
@@ -321,6 +321,7 @@ import Data.Maybe (isJust)
 import Data.List (partition)
 import qualified Data.List.NonEmpty as NonEmpty
 import qualified Data.Map.Strict as Map
+import qualified Data.Set as Set
 import Data.Sequence ((|>))
 import qualified Data.Sequence as Seq
 import Data.Word (Word64)
@@ -674,10 +675,10 @@ serviceTurn scheduler host = do
             (Just now, Just limit) → deadlineReached now limit
             _ → False
       if stopping
-        then done turn TurnStopRequested
+        then idleAndDone turn TurnStopRequested
         else
           if expired && turnCount turn > 0
-            then done turn TurnBudgetExpired
+            then idleAndDone turn TurnBudgetExpired
             else do
               chosen ← atomically (chooseNext scheduler)
               case chosen of
@@ -686,20 +687,50 @@ serviceTurn scheduler host = do
                   | turnCount turn > 0 → done turn TurnPassComplete
                   | otherwise → loop deadline fresh turn
                 Just (Just run) → do
-                  report ← hostRun host run
-                  after ← case (budget, report) of
-                    (Nothing, ReportWaitElapsed {}) → Just <$> readInstant (schedClock config)
-                    (Just _, _) → Just <$> readInstant (schedClock config)
-                    _ → pure Nothing
-                  let overran = case (after, deadline) of
-                        (Just now, Just limit) → now > limit
-                        _ → False
-                  events ← atomically $ do
-                    state ← readTVar (schedState scheduler)
-                    let (next, found) = applyReport (runTask run) overran after report state
-                    writeTVar (schedState scheduler) next
-                    pure found
-                  loop deadline (after <|> fresh) (record events turn {turnCount = turnCount turn + 1})
+                  (events, after, closing) ← runSegment deadline run
+                  loop
+                    deadline
+                    (after <|> fresh)
+                    (record events turn {turnCount = turnCount turn + 1, turnClosing = reverse closing <> turnClosing turn})
+
+    -- A turn that ends before it chooses leaves the pass as the next choice would
+    -- have: afresh if nothing is ready.
+    idleAndDone turn end = do
+      atomically (modifyTVar' (schedState scheduler) resetPassIfIdle)
+      done turn end
+
+    -- Run a segment and apply its report. The report is applied, so the task is
+    -- no longer running and its continuation is stop's to close, before anything
+    -- that can fail or be interrupted: the transition is masked from the moment
+    -- the host returns. Only an elapsed wait needs the clock to be placed, and if
+    -- reading it fails that wait is applied as a yield, which leaves the task
+    -- ready and closable.
+    runSegment deadline run = mask $ \restore → do
+      report ← restore (hostRun host run)
+      let identity = runTask run
+          reference = schedState scheduler
+          apply reading = atomically $ do
+            state ← readTVar reference
+            let (next, found) = applyReport identity reading report state
+            writeTVar reference next
+            pure (siteOf identity state, found)
+      (site, events, after) ← case report of
+        ReportWaitElapsed value _ → do
+          now ←
+            readInstant (schedClock config)
+              `onException` atomically (modifyTVar' reference (fst . applyReport identity Nothing (ReportYielded value)))
+          (found, applied) ← apply (Just now)
+          pure (found, applied, Just now)
+        _ → do
+          (found, applied) ← apply Nothing
+          now ← if budget /= Nothing then Just <$> readInstant (schedClock config) else pure Nothing
+          pure (found, applied, now)
+      let overran = case (after, deadline) of
+            (Just now, Just limit) → now > limit
+            _ → False
+      when overran (atomically (modifyTVar' reference (recordOverrunAt site)))
+      closing ← closeOwed scheduler host
+      pure (events, after, closing)
 
     record events turn = foldl' note turn events
     note turn = \case
@@ -735,7 +766,8 @@ boundary scheduler host turn0 = do
   first ← reconcile
   closed ← applyControls scheduler host
   second ← reconcile
-  pure (foldl' absorb turn0 (first <> second) `withClosed` closed)
+  owed ← closeOwed scheduler host
+  pure (foldl' absorb turn0 (first <> second) `withClosed` (closed <> owed))
   where
     reconcile = atomically $ do
       state ← readTVar (schedState scheduler)
@@ -746,6 +778,19 @@ boundary scheduler host turn0 = do
       Failed identity failure → turn {turnFailed = (identity, failure) : turnFailed turn}
       WaitRefused identity why → turn {turnRefused = (identity, why) : turnRefused turn}
     withClosed turn closed = turn {turnClosing = reverse closed <> turnClosing turn}
+
+-- | Close the continuations that tasks left suspended when they ended, and answer
+-- the closing failures there were. Each close and its record are masked together;
+-- one interrupted inside the host stays owed, and the scheduler's stop makes it.
+closeOwed ∷ Scheduler v → TaskHost v → IO [(TaskId, SomeException)]
+closeOwed scheduler host = do
+  owed ← closeObligations <$> readTVarIO (schedState scheduler)
+  concat <$> mapM close owed
+  where
+    close identity = mask_ $ do
+      closed ← tryClose (hostClose host identity)
+      atomically (modifyTVar' (schedState scheduler) (closedObligation identity))
+      pure [(identity, failure) | CloseFailed failure ← [closed]]
 
 -- | Apply the accepted control requests, stops first, and answer the closing
 -- failures there were.
@@ -873,6 +918,7 @@ stopScheduler scheduler host = mask_ $ do
           , ssLogical = Map.empty
           , ssElapsed = Map.empty
           , ssControl = Seq.empty
+          , ssToClose = Set.empty
           , ssPhase = Closed report
           , ssCounts =
               counts
