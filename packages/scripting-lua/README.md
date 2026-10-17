@@ -37,8 +37,10 @@ logical and elapsed time behind one owned timer, budgets, and safe-boundary
 control, tested against scripted segments. See
 [The scheduling machinery](#the-scheduling-machinery). **Scheduled owners** (LUA-6)
 host it, and the host's task coroutines, on supervised workers with real VMs. See
-[The scheduled owner](#the-scheduled-owner). Any concrete game
-namespace, asynchronous requests and the confined path are later slices of
+[The scheduled owner](#the-scheduled-owner). **Script instances** (LUA-18) sit on
+them: instances of a module with their own state, hooks, event callbacks and a
+lifecycle the application controls. See [Script instances](#script-instances). Any
+concrete game namespace, asynchronous requests and the confined path are later slices of
 [the Lua runtime design](../../docs/lua_runtime_design.md). What is here is the
 boundary they will be built on, and the evidence that it holds.
 
@@ -1855,8 +1857,8 @@ same order of effects recorded through a binding, however long the segments take
 whether budgets expire. It is a property of the scheduler's documented ordering, and holds
 for logical-time work: elapsed waits legitimately change readiness with real time, are not
 covered by it, and are tested separately. A control request that arrives in the middle of a
-step is not ordered logically here: deterministic logical admission of controls is the
-script-instance layer's (LUA-18). No claim is made across policies, worker counts,
+step is not ordered logically here: deterministic logical admission of controls is LUA-23's
+(D-30). No claim is made across policies, worker counts,
 platforms or versions.
 
 ### What proves it
@@ -1880,6 +1882,175 @@ policy that recognizes everything and kept beside the VM's own close failure. Th
 cancellation and shutdown windows are the kind an asynchronous-exception race can hide on
 one platform, so CI, which runs them on Linux, is the evidence for them and a local pass is
 not.
+
+## Script instances
+
+`Hetoimasia.Scripting.Lua.Instance` (LUA-18, in `runtime-lua`) puts instances on a scheduled
+owner. An *instance* is one running copy of a module's behavior, with a `self` of its own, hooks
+the module defines, functions it connected to events, and a lifecycle the application controls and
+reads. It follows the accepted
+[instance contract](../../docs/lua_instance_contract.md) (D-26, D-27). An owner hosts instances
+when it is created with a `scheduledInstances` configuration (`InstanceConfig`); one without serves
+tasks as before and loads nothing of this. The modules that host instances declare their hooks as
+optional entry points (`hookEntries`). Leases on Lua-exposed resources (LUA-22), granted Lua
+controls and Lua inspection (LUA-23), periodic update cadence (LUA-24) and real event providers
+(LUA-7) are later slices.
+
+### Instances and identity
+
+`admitInstance` admits an instance from a module the owner loaded and answers at once, from any
+thread, without blocking: `InstanceAccepted` with the instance's identity and a ticket, `InstanceFull`
+or `InstanceAdmissionClosed`. The identity (`InstanceId`, the TID) is the owner's identity and the
+owner's number for the instance. It is unique within the runtime and never reissued, not after the
+instance ends and its result is observed and not after its owner retires; it is never an OS thread,
+a `ThreadId` or a coroutine, and it, like the application's name for the instance, grants nothing.
+Live instances (`boundLiveInstances`) and the results of ended ones nobody has observed
+(`boundRetainedInstances`) are each bounded, and a result is reserved at admission. A configuration
+that does not fit the scheduler's own bounds is refused before anything starts, naming every
+violation (`InstancesRefused`): the scheduler's retained-result bound must be at least twice the
+live instances, because an instance's next invocation is admitted before the scheduler has given
+back its last result, and its queue of admissions must hold one invocation for each.
+
+The owner's thread makes the instance's `self`, a fresh empty table, before `init` runs. Module code is
+shared by the instances of a module and a fresh `self` does not isolate mutable module globals or
+upvalues. Ending one instance ends only that instance: another instance, the module and the VM stay,
+and what they share stays valid. Instances of one module are independent.
+
+`self`, and the functions an instance connected, are values of the VM: they have an identity and a
+lifetime of their own and cannot cross the value boundary, which copies. The layer keeps them in a
+table in the VM that only a driver module the owner loads beside the application's can reach, by the
+instance's number, and the host runs a hook by handing it to the driver, which calls it with its
+instance's `self`. A script cannot reach the table, so it cannot forge or erase another instance's
+state. The one binding the layer installs, `hetoimasia_instance.connect`, tells the owner a
+connection was made, so the owner records it at once.
+
+### Hooks
+
+| Hook | When | Suspends |
+| --- | --- | --- |
+| `init(self, api)` | once, as a finite call, before anything else; an absent `init` is a successful empty one | no: a wait or a yield is a fault of the hook |
+| `update(self, dt)` | part of the authoring model; nothing makes one due until the periodic cadence (LUA-24), so it is never called in this slice | n/a |
+| `run(self, api)` | a one-shot's body (`RunOnce`), to completion after `init`; a one-shot whose module defines none is refused before any hook runs, naming `run` | yes, as a task's entry point does |
+| callbacks | an event's callback, handed `self` and the event | yes |
+| `shutdown(self, reason)` | once, with `"stopped"`, `"completed"` or `"failed"`; optional | no |
+
+`api` carries only what the instance was granted. In this slice that is `api.connect(source,
+callback)`, which connects a function to an event source the instance was granted (`instanceGrants`)
+and is a script error for any other. The event a callback receives is a table with `source`,
+`sequence`, `tick` and `payload`.
+
+### One invocation at a time
+
+An instance has at most one invocation in flight, including a suspended one: a callback, or a
+one-shot's `run`. An invocation is a task of the owner's scheduler, so the owner's policy orders the
+invocations of its instances among each other and among its tasks (first in, first out, yielding to
+the tail, by default) by the instance's service class; no policy overrides lifecycle, capacity or the
+order an instance's own invocations were accepted in. The next invocation of an instance is admitted at
+the boundary of the segment that ended the last, so the order depends on the order of admission and
+nothing about how long segments take, when timers fire or whether a budget expires.
+
+### Events
+
+An owner offers named event sources (`EventSource`: a name and the shape of the payload). In this
+slice they are a seam for tests: only the application's own threads deliver. `deliverEvent` answers at
+once, from any thread, without blocking: `DeliveryAccepted` with a sequence, `DeliveryQueueFull`,
+`DeliveryClosed`, `DeliveryUnknownTarget` (no live instance of this owner, or none with a connection to
+the source) or `DeliveryRefused` (the payload is over the owner's limits or not what the source
+declares). The payload is checked and copied on the producer's thread, and is kept with its sequence and
+the logical tick it was admitted at, unchanged, until its callback runs, however long that takes and
+whether the instance is paused. No producer thread enters Lua. A connection made during `init` is
+recorded when it is made, so events can be accepted while `init` runs; none is dispatched until `init`
+has succeeded, and if it fails the connection is revoked and the events are counted as unstarted.
+
+Each instance has one bounded first-in, first-out queue of invocations (`boundInvocationQueue`),
+built to be shared with the due updates the periodic cadence will add. A full queue refuses the new
+delivery, counts it (`snapshotQueueFull`) and never evicts an accepted one. Retained results use no
+part of it.
+
+### Failure and escalation
+
+A failed `init` fails that instance: no `update`, `run`, callback or `shutdown` ever runs on it, its
+connections are revoked and its record in the VM is released. Its failure (`InstanceFailure`) names the
+instance, its owner, its source module, the phase, the stage, the error and the traceback, if one was
+captured; the `init` error is primary, nothing later replaces it, and what else failed while it ended is
+kept beside it (`failureSecondary`). There is no retry. An unhandled error in `run` or a callback fails the
+instance the same way, except that `shutdown` runs with the reason `failed`.
+
+Isolation is the default: the instance ends and the owner's other instances run on. The engine cannot
+tell whether state the instances share was damaged, so the application is told of each failure on the
+owner's thread (`instanceEscalate`), after the instance has ended, and decides `Isolate` or `Escalate`,
+which fails the owner as a host failure does (`InstanceEscalated`) under its `WorkerPolicy`. A failure
+raised by application code is never an instance's failure; it ends the owner, unconverted, as it does for
+tasks. Cleanup is the engine's and nothing the application answers can hide it: what closing a coroutine
+raised, a closing handler the script defined included, is cleanup evidence on the owner's outcome and is
+fatal under any policy, as it is for a task, and it stays beside an instance's primary failure.
+
+### Control
+
+`requestInstanceControl` asks that an instance pause, resume or stop, and answers at once, from any
+thread: `InstanceControlAccepted` with a receipt, `InstanceControlFull`, `InstanceControlClosed` or
+`InstanceControlUnknown` (another owner's identity, an ended or never issued instance). An accepted
+request holds a reservation until its settlement is observed or abandoned
+(`boundInstanceControls`), and settles exactly once, as applied, already in that state, or no longer
+applicable, including when the instance or the owner ends first. Requests are applied in the order accepted,
+at the owner's next safe boundary: when the owner's thread services them, between turns and never inside a
+segment.
+
+- **Pause** stops new invocations from starting and freezes the invocation in flight, if any, suspended
+  where it is, running nothing, however its wait would have ended. Accepted events stay in the queue, in
+  order.
+- **Resume** lets it go on: a suspended invocation finishes before another starts, then the retained
+  events run in the order they were accepted and new ones behind them. It does not undo a stop.
+- **Stop** works while paused and takes precedence over ordinary work. It closes the instance's
+  admission, revokes its connections, discards what had not begun and counts it, closes the coroutine of
+  the invocation in flight on the owner's thread and never resumes it, and only then runs `shutdown`. The
+  request's result says the stop was taken; its completion is the instance's settlement, written after the
+  hook and the release. Repeated requests are safe and never resurrect an instance or run `shutdown` again.
+
+Whole-owner control (`retireScheduled`) is distinct. An orderly retirement stops each live instance
+through the same path with the reason `stopped` before the VM is closed. An owner that fails or is
+cancelled does not enter Lua for its instances again: no `shutdown` runs, which the settlement reports
+(`ShutdownSkippedUnsafe`), and each instance settles as discarded. A lifecycle binding a script calls
+still answers a typed `NotYetSupported` fault; Lua's own controls and inspection are LUA-23.
+
+### Results, inspection and idle
+
+Every accepted instance settles exactly once (`InstanceSettlement`): completed, stopped, failed or
+discarded, with what its end revoked and released (`Termination`: the connections revoked, the unstarted
+invocations discarded, the invocations that began and were closed, and what became of `shutdown`). A
+failing `shutdown` is kept and never retried, runtime cleanup still happens, and an instance that would
+have completed or stopped is failed by it; a primary failure stays primary. Observing, abandoning and
+waiting work as for tasks (`pollInstance`, `waitInstance`, `awaitInstance`, `forgetInstance`), and a
+ticket nobody observes or forgets keeps its reservation, which bounds the retained results.
+`inspectInstance` and `inspectInstances` answer bounded, coherent snapshots (`InstanceSnapshot`), each
+read in one transaction, and never borrow a Lua table.
+
+Everything the owner does for an instance is a response to something: an admission, an event, a request,
+a grant, a deadline or a stop. Its wait is the scheduled owner's one STM wait with the instance layer's
+jobs added, so an owner whose instances are all paused, waiting or idle enters no Lua and does no periodic
+work until one of those arrives.
+
+### Determinism
+
+On one owner with a fixed configuration and policy, the same admitted instances, grants, delivered events
+and control requests, each made at the same logical point (while the owner awaits the next grant), give
+the same order of invocations and of effects recorded through a binding, however long the segments take,
+whenever timers fire and whether budgets expire. It holds for logical-time workloads: elapsed waits
+legitimately change readiness. An event or request that arrives in the middle of a step is not ordered
+logically here; that is LUA-23's.
+
+### What proves it
+
+`Test.LuaRuntime.Instance.*`, in `lua-runtime-tests`, run real instances on real supervised scheduled
+owners under the injected clock and fake timer of the scheduled-owner examples, with gates and STM signals
+instead of sleeps: an instance's own `self` and the module it shares, one-shots, identity and snapshots, idle; a failed `init`
+and the hooks that cannot suspend, a failed callback, a failed `shutdown`, the application's escalation, a failure of the
+host and the evidence of a failed close; events during `init`, a full queue, every refusal, and what an accepted event
+keeps; pause and the order resume restores, stop while paused, contradictory and refused requests; what each way
+of ending revokes and counts, retirement, cancellation and the instances an owner never began; every bound and a
+configuration that does not fit; and one workload run under different segment costs and service budgets. The
+cancellation and shutdown windows are the kind an asynchronous-exception race can hide on one platform, so CI, which
+runs them on Linux, is the evidence for them and a local pass is not.
 
 ## The protocol model
 
