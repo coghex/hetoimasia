@@ -2025,7 +2025,8 @@ started on resume (the task the scheduler holds is used again when the invocatio
 resuming over and over admits nothing new), and a stop discards it as an unstarted invocation. (A task the scheduler holds in its admission queue cannot be
 withdrawn from it: an instance that took one back leaves at most one such task, which does nothing when chosen and
 is used again by the same invocation, and it holds a queue place and a stored-result place until then.) Until it runs, an
-invocation holds its place in the instance's queue, so taking it back never overfills the queue. An owner that has been asked to stop services
+invocation holds its place in the instance's queue, so taking it back never overfills the queue; a one-shot's `run`
+is no event and holds none, and one taken back stays counted among the unstarted invocations an ending discards. An owner that has been asked to stop services
 nothing more: its exit settles what was left. The scheduler's own task controls do not reach an instance's
 invocation, whatever the application learned of its identity: they answer unknown, and the instance layer is
 the only thing that pauses, resumes or stops it.
@@ -2065,7 +2066,9 @@ ticket nobody observes or forgets keeps its reservation, which bounds the retain
 read in one transaction, and never borrow a Lua table.
 
 Everything the owner does for an instance is a response to something: an admission, an event, a request,
-a grant, a deadline or a stop, or room appearing in the scheduler's queue or results for an invocation it had none for. Its wait is
+a grant, a deadline or a stop, or room appearing in the scheduler's queue or results for an invocation it had none for, which the owner tries again
+at the boundary where room appears (every boundary gives back what ended invocations held first), so the order of
+invocations does not depend on where turns are cut even when the scheduler's result places are all taken. Its wait is
 the scheduled owner's one STM wait with the instance layer's jobs added, so an owner whose instances are all paused, waiting or idle enters no Lua and does no periodic
 work until one of those arrives.
 
