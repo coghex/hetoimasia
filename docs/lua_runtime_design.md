@@ -84,8 +84,8 @@ LUA-6 readiness discussion opened on 2026-10-17 at the owner's direct request.
 LUA-5 is now delivered by #464 / PR #465, merged as `29211202`, and TIME-1/#133
 is delivered. The current exploration is limited to LUA-6; it does not revoke
 the prior slices' approvals or renew LUA-7/LUA-8 or the confined branch.
-Q-9 through Q-12 below record remaining questions and proposals. D-16 through
-D-19 record the owner's lifecycle, identity and per-owner scheduler direction. LUA-6 remains
+Q-9 through Q-14 below record remaining questions and proposals. D-16 through
+D-20 record the owner's lifecycle, identity and per-owner scheduler direction. LUA-6 remains
 deferred until those choices, their dependent contract reconciliation and an
 explicit readiness signoff are complete. No new tracker item is authorized by
 this design discussion.
@@ -531,6 +531,25 @@ the extension with a small test policy, preserve cooperative execution and
 provide observable bounded service without introducing OS-thread scheduling,
 cross-owner scheduling or forced interruption. It does not alone renew LUA-6
 readiness or authorize implementation.
+
+### D-20. Admit looped scripts and one-shot commands through the selected scheduler
+
+Owner direction, 2026-10-17: preserve existing callers and support scripts that
+can be loaded/unloaded and run in the round-robin loop, with one-shot scripts
+appended to the FIFO queue. Both looped scripts and scripted commands are
+desired. The scheduler contract must retain the distinction so another policy
+can treat one-shots differently; their FIFO placement must not be hard-coded
+outside the selected policy. Existing runtime safety and capacity constraints
+continue to apply to both kinds.
+
+The owner approved developing the inspection/control API and a runnable entry
+point now. They proposed command-line options selecting a VM, its scheduler and
+a Lua source path, with headless or windowed use and a specified VM group.
+Exact syntax, VM-group semantics, looping and unload behavior remain Q-13/Q-14;
+this direction does not silently authorize a game terminal UI or change the
+module lifetime contract. One-shot means one execution to completion, not
+necessarily one unyielding segment: that execution distinction is to be made
+explicit when resolving Q-13.
 
 ## Design
 
@@ -1363,7 +1382,7 @@ scheduled owners. Do not treat that response as signoff on two separate public
 owner forms: their compatibility relationship remains to be reconciled with
 the chosen scheduler contract. Preserve LUA-5's delivered behavior meanwhile.
 
-Next signoff proposal after D-19: leave the existing finite-call owner creation
+Compatibility accepted by the owner with D-20: leave the existing finite-call owner creation
 and submission API working exactly as delivered. Applications explicitly opt
 into a scheduled-task owner and its selected policy. This avoids changing the
 meaning or ordering of existing calls. Scheduled owners admit all executable
@@ -1396,11 +1415,12 @@ runtime; the target owner applies requests at safe boundaries. Knowing an ID
 does not itself grant control. A terminal can build `ps` on the inspection API;
 whether a terminal command itself belongs in LUA-6 is not decided.
 
-Next signoff proposal after D-19: LUA-6 delivers the bounded inspection and
+API/example direction accepted with D-20: LUA-6 delivers the bounded inspection and
 control APIs plus a headless example displaying TID/OWNER/NAME/STATUS and
 demonstrating pause/resume/stop. The actual game's interactive terminal and its
 command parser remain application work. This makes the requested `ps` behavior
-testable without adding a game UI to the engine slice.
+testable without adding a game UI to the engine slice. The owner proposed a
+command-line entry point; Q-14 retains its scope and VM-group questions.
 
 Clarify engine API versus delivery of the game's terminal UI before setting
 the implementation scope. Detailed grant and request semantics still need a
@@ -1426,9 +1446,53 @@ the cooperative execution boundary remain runtime responsibilities rather than
 optional policy features. The detailed design must state how an alternative
 policy preserves bounded opportunities and cannot starve lifecycle handling.
 
-The owner signed off this precise default and extension scope. Q-10's finite-call
-compatibility and Q-11's terminal delivery scope remain open; implementation
-factoring and public symbol names are not additional product decisions.
+The owner signed off this precise default and extension scope. D-20 accepts
+finite-call compatibility and API/example delivery; Q-13/Q-14 retain the new
+script-loading and runner questions. Implementation factoring and public symbol
+names are not additional product decisions.
+
+### Q-13. Loaded script instances, repetition and unloading
+
+**Open following D-20.** Clarify what a looped script does when an entry returns:
+an explicit loop/coroutine that yields and ultimately completes, or a function
+the engine invokes again on subsequent turns until stopped. The latter needs a
+defined per-turn invocation and continuation/state contract; silently replaying
+a completed one-shot is never acceptable. A one-shot may still yield or wait
+before completing, if the owner accepts that meaning.
+
+Also distinguish unloading a task instance (stop it at a safe boundary and
+release its task-owned state) from unloading module code and shared globals
+from the VM. The existing module API loads bounded modules and retains their
+references for the owner lifetime; it exposes no module unload. Other tasks
+can share module state. Do not claim stopping one task removes that shared
+state or rolls back effects. Decide the intended scope before implementing
+dynamic loading, unload or a new source/module lifetime.
+
+### Q-14. Command-line runner and VM groups
+
+**Open; owner proposal, 2026-10-17.** The owner suggested a command-line runner
+selecting a VM, scheduler and script, for example
+`--luavm test --luavm-scheduler fifo --lua ./testscript.lua`, usable headlessly
+or with a window and selecting a VM group.
+
+Verified current entry point at `29211202`: `app/Main.hs` accepts only the
+console smoke/resource-smoke/help paths. It has no Lua runner, VM group
+configuration or windowed application launch. Existing `LuaRuntime` scopes
+owners within a supervision boundary; it is not a named VM-group API.
+
+Proposed clearer CLI shape, not yet selected:
+`hetoimasia lua --group game --vm test --scheduler fifo --script ./testscript.lua --headless`.
+A `lua` subcommand scopes its flags; VM and group get separate names; scheduler
+selection belongs to the VM and file loading belongs to task admission. Useful
+defaults can shorten the common case once those semantics are settled.
+
+Clarify what the group means: an organizational label for several independent
+VMs, or a separately owned group with shared start/stop/control and specified
+failure behavior. It must not accidentally become a cross-VM scheduler or
+expand a supervision failure boundary. Also settle whether LUA-6 supplies only
+the headless runner/API proof or adds actual windowed composition now; using
+the same library API from a future windowed application is a separate claim
+from delivering that application. No command-line surface has been selected.
 
 ## Verification strategy
 
@@ -1737,7 +1801,7 @@ and verified policy, with adversarial regression coverage.
 ### LUA-6. Schedule cooperative tasks with bounded service turns
 
 > Deferred: readiness discussion opened 2026-10-17. LUA-5 and TIME-1 are
-> delivered; Q-9 through Q-11 need completion and dependent reconciliation before
+> delivered; remaining lifecycle and Q-13/Q-14 scope need reconciliation before
 > readiness signoff. Earlier narrow renewals did not cover this slice.
 
 - **Outcome:** one trusted VM owner services resumable tasks fairly, wakes for
@@ -1749,13 +1813,16 @@ and verified policy, with adversarial regression coverage.
 - **Phase:** execution policy.
 - **Depends on:** LUA-5; external TIME-1 (Q-4).
 - **Ordering:** critical path; can run alongside LUA-7 with disjoint modules.
-- **Relevant decisions:** D-1, D-3, D-4, D-12, D-13, D-16, D-17, D-18, D-19.
+- **Relevant decisions:** D-1, D-3, D-4, D-12, D-13, D-16, D-17, D-18, D-19, D-20.
 - **Acceptance signals:** peers get bounded opportunities at safe yields;
   paused/event-only work does not spin; stop wakes waits; logical time advances
   only on explicit completion; elapsed budget cannot be sold as a hard limit.
 - **Out of scope:** automatic code rewriting, arbitrary priority API, simulation
   coordinator, CPU affinity/niceness tuning, performance pass/fail thresholds.
-- **Open questions:** Q-9, Q-10, Q-11. Q-12 is resolved by D-19.
+- **Open questions:** Q-9 (detailed lifecycle semantics), Q-13, Q-14.
+  Q-10's compatibility and Q-11's API/example direction are accepted by D-20;
+  their new runner/lifetime questions are tracked under Q-13/Q-14.
+  Q-12 is resolved by D-19.
   Q-4's TIME-1 prerequisite is satisfied; consume
   its existing clock API.
 
