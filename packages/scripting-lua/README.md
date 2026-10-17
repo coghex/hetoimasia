@@ -1064,8 +1064,13 @@ callback, else the script's error) is the one raised, and every Haskell failure 
 to-be-closed variable's callback raises while the coroutine closes, with its own
 type and context, and any error of Lua's other than the one the segment died
 with, is kept beside it as cleanup evidence (`lua coroutine close`), bounded like
-the finalizers' (64). Nothing is lost because two failures look alike to Lua: they
-both reach it as the same stand-in marker, and the host keeps the originals.
+the finalizers' (64, with one further entry saying how many were not kept).
+Nothing is lost because two failures look alike to Lua: they both reach it as the
+same placeholder (a light userdata that no script can build), and the host keeps
+the originals; an error of any other kind, a table included, is the script's own
+and is always reported. A binding's action that runs after a refusal the closing
+code caught upgrades the `Effect` of every failure kept this way, as it does the
+pending one.
 
 ### Closing a task
 
