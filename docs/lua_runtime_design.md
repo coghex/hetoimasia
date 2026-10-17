@@ -919,16 +919,44 @@ for that instance. The rule LUA-24 implements:
 - The next update is due at the first cadence point after the active update
   finishes.
 - Its `dt` is the logical duration granted since the previous update finished
-  (since successful `init` for the first update). The waiting update itself was
-  told the duration of its own wait when it resumed, so every granted tick is
-  accounted to the instance exactly once.
+  (since successful `init` for the first update). The duration of the waiting
+  update's own wait is reported to the application on the owner's thread when it
+  resumes (`scheduledObserve`); a resumed coroutine receives no value, so a
+  script learns it only through a binding the application grants. Either way
+  every granted tick is accounted to the instance exactly once.
 
 This is the elapsed (UI) rule's "no catch-up burst" applied to logical time. It
 is deterministic, because only the script's own logical waits can cause it.
 
+D-34 extends this rule from a waiting update to any active invocation of the
+instance.
+
 Owner's future idea, recorded and not scheduled: intercept a script's wait in
 Haskell and keep wait counters in an engine data system that mimics what the
 author expects. It needs its own design and issue.
+
+### D-34. Any active invocation makes passed cadence points no-ops
+
+Owner decision, 2026-10-17, in the hetoimasia manager pane ("Any invocation"),
+after #475's canonical review found a deadlock D-33 did not cover
+(https://github.com/coghex/hetoimasia/issues/475#issuecomment-6236027558): an
+event callback waits five ticks at tick 0 with an update interval of 2. The
+update due at tick 2 cannot start behind the active callback (one invocation at
+a time), and if tick 2 could not complete until it started, the callback's own
+wait could never end.
+
+D-33's rule applies to every invocation of the instance (`update`, `run` or an
+event callback): while any one is active, including suspended on a wait,
+cadence points that pass are no-ops for that instance. Ticks keep advancing,
+and an instance whose invocation is waiting has finished its work for those
+ticks. The next update is due at the first cadence point after that invocation
+finishes, with `dt` the logical duration granted since the previous update
+finished. There is no catch-up, no backlog, and no update overtakes an active
+invocation; queued events keep their admission order. A cadence point that
+finds the instance paused, stopping or terminal adds no invocation either, as
+the contract's pause rule already says. Rejected: letting a due update start
+alongside the active invocation (breaks one invocation at a time), and refusing
+waits in event callbacks (contradicts the accepted contract).
 
 ## Design
 
@@ -2568,7 +2596,7 @@ and verified policy, with adversarial regression coverage.
   with the application's configured positive tick duration or refused, the first
   update due one interval after successful `init`, and the granted `dt` fixed at
   the invocation's start and kept across waits and real delays, and cadence
-  points passed during an active update are no-ops (D-33); elapsed intervals
+  points passed during any active invocation are no-ops (D-33, D-34); elapsed intervals
   on the monotonic source with at most one unstarted refresh, obsolete demand
   coalesced without dropping queued events, `dt` the elapsed time between update
   starts (from successful `init`, rebased at resume) and lateness moving the
@@ -2581,7 +2609,7 @@ and verified policy, with adversarial regression coverage.
 - **Phase:** script authoring and lifetime.
 - **Depends on:** LUA-18.
 - **Ordering:** after LUA-18; independent of LUA-22 and LUA-23; precedes LUA-19.
-- **Relevant decisions:** D-15, D-21, D-22, D-23, D-26, D-31, D-33.
+- **Relevant decisions:** D-15, D-21, D-22, D-23, D-26, D-31, D-33, D-34.
 - **Acceptance signals:** exact tick conversion or refusal; the first update one
   interval after `init`; the granted `dt` kept across a wait; UI coalescing with
   no catch-up burst and elapsed `dt` rebased at resume; no periodic demand during
