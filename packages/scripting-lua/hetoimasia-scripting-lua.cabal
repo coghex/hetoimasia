@@ -190,11 +190,15 @@ library runtime-lua
     hs-source-dirs: runtime-lua
     exposed-modules:
         Hetoimasia.Scripting.Lua.Runtime
+        Hetoimasia.Scripting.Lua.Scheduled
         Hetoimasia.Scripting.Lua.Scheduler
     other-modules:
         Hetoimasia.Scripting.Lua.Runtime.Admission
         Hetoimasia.Scripting.Lua.Runtime.Dispatch
+        Hetoimasia.Scripting.Lua.Runtime.Shared
         Hetoimasia.Scripting.Lua.Runtime.Types
+        Hetoimasia.Scripting.Lua.Scheduled.Run
+        Hetoimasia.Scripting.Lua.Scheduled.Types
         Hetoimasia.Scripting.Lua.Scheduler.Policy
         Hetoimasia.Scripting.Lua.Scheduler.State
         Hetoimasia.Scripting.Lua.Scheduler.Timer
@@ -343,6 +347,9 @@ test-suite lua-runtime-tests
         Test.LuaRuntime.Identity
         Test.LuaRuntime.Independence
         Test.LuaRuntime.Readiness
+        Test.LuaRuntime.Scheduled.Execution
+        Test.LuaRuntime.Scheduled.Spec
+        Test.LuaRuntime.Scheduled.Support
         Test.LuaRuntime.Scheduler.Budget
         Test.LuaRuntime.Scheduler.Classes
         Test.LuaRuntime.Scheduler.Control

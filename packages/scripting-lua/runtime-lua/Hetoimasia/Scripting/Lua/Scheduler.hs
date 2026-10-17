@@ -886,6 +886,9 @@ stopScheduler scheduler host = mask_ $ do
   case claim of
     Left report → pure report
     Right identities → do
+      -- The timer is cancelled first, so no wake can arrive while continuations,
+      -- which can take as long as Lua runs, are closed.
+      disposeTimer (schedTimerOf scheduler)
       failures ← newIORef []
       interrupted ← newIORef Nothing
       -- Every obligation is closed, masked: an exception that reaches a close at
@@ -901,7 +904,6 @@ stopScheduler scheduler host = mask_ $ do
               modifyIORef' interrupted (<|> Just failure)
       collected ← reverse <$> readIORef failures
       report ← atomically (settleStop collected)
-      disposeTimer (schedTimerOf scheduler)
       readIORef interrupted >>= maybe (pure report) throwIO
   where
     reference = schedState scheduler

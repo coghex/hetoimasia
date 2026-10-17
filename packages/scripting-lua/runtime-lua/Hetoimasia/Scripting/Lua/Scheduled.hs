@@ -1,0 +1,674 @@
+-- | Scheduled Lua owners under runtime supervision.
+--
+-- A scheduled owner is one supervised worker running one VM, like the owners of
+-- "Hetoimasia.Scripting.Lua.Runtime", but it serves /tasks/ instead of finite
+-- calls: a module's entry point run as a coroutine, a segment at a time, under
+-- the scheduling machinery of "Hetoimasia.Scripting.Lua.Scheduler". This is
+-- LUA-6. It hosts the host library's task execution (LUA-20) and the scheduler
+-- (LUA-21) on a supervised worker and adds no scheduling of its own: which task
+-- runs next, what a tick or a deadline is, how a budget ends a turn and how pause,
+-- resume and stop apply are the scheduler's, and its module documents them.
+--
+-- The finite-call owners are unchanged and stay the way to run a call. An
+-- application opts into a scheduled owner, which admits all executable work as
+-- tasks; finite work there is a task that completes in one segment. A finite-call
+-- owner and a scheduled owner never run the same VM, and any number of each can be
+-- created and retired while the others run.
+--
+-- = Creation and readiness
+--
+-- 'startScheduledOwner' validates the scheduler's configuration (the caps and the
+-- quanta, through the protocol model's own validation, the grant and control
+-- bounds, and the budget) before anything starts, raising
+-- 'Hetoimasia.Scripting.Lua.Scheduler.SchedulerRefused' naming every violation,
+-- and then starts exactly one worker through 'startSupervised'. The VM is
+-- constructed, its bindings installed, its initial chunks run and its modules
+-- loaded inside 'withVmOwner' on the worker's own thread. Only then does the body
+-- publish readiness, and only then does creation return an endpoint. Readiness is
+-- awaited through 'awaitSupervised' composed with the worker's terminal outcome,
+-- never through the startup acknowledgement, so a failure of initialization ends
+-- creation under the owner's 'WorkerPolicy'. A creator whose wait is abandoned
+-- asks the owner to stop and leaves nothing behind.
+--
+-- = Identity
+--
+-- An owner has the 'OwnerId' its 'LuaRuntime' issues, from the one counter the
+-- finite-call owners use, so no two owners of a runtime share one and none is
+-- reissued. A task is named by a 'ScheduledTaskId': the owner's identity and the
+-- owner's number for the task, which it issues from a counter that never rewinds.
+-- It is unique within the runtime and never reissued, not after the task settles
+-- and is observed and not after its owner retires. It is never an OS thread, a
+-- @ThreadId@ or a coroutine. Neither it nor the application's optional name for
+-- the task grants authority. The model's two execution domains limit neither the
+-- number of owners nor of tasks: the model's identity is scoped by the owner's
+-- identity, and this wraps it.
+--
+-- = Admitting tasks
+--
+-- 'admitScheduledTask' admits a task with a module entry point, bounded
+-- arguments, a service class, a kind and an optional name. It never blocks, from
+-- any thread, a binding's action included, and answers 'TaskAccepted' with the
+-- task's identity and its ticket, 'TaskQueueFull' or 'TaskAdmissionClosed'. The arguments are
+-- evaluated, checked against the owner's value limits and copied on the producer's
+-- thread, as a finite call's are; arguments over the limits are accepted and the
+-- task settles as the refusal the argument check raises, running nothing. Queued
+-- admissions, active tasks and settled-but-unobserved results are each bounded, by
+-- the scheduler's bounds, and a task's result is reserved when it is admitted.
+--
+-- = Settlement
+--
+-- Every accepted task settles exactly once, as a 'ScheduledOutcome':
+--
+-- * 'SettledReturned', with the entry point's 'CallResult';
+-- * 'SettledFaulted', a fault of the task returned as data: a refused value, a script
+--   error (a memory failure included), a call to a binding that is not yet
+--   supported, a missing entry point or a module the owner did not load, in a
+--   segment of any number. The owner goes on serving its other tasks and this is
+--   never a worker failure;
+-- * 'SettledRefused', when the scheduler refused what a segment asked for (a wait for
+--   no ticks, or one it cannot represent), a recoverable failure of that task;
+-- * 'SettledCancelled', when a stop request cancelled it;
+-- * 'SettledDiscarded', when the owner exited before the task settled, recording how
+--   the owner exited and whether the task had begun.
+--
+-- No path settles a task twice, loses an accepted task or lets a late outcome
+-- overwrite a settlement, including admission, control and stop racing each other.
+--
+-- = Observing results
+--
+-- Reading and waiting work as for the finite-call tickets. 'pollTask' reads a
+-- settlement without blocking, and reading it is observing it: the first read that
+-- finds the task finished takes its result and gives its reservation back, and
+-- every later read, on any thread, answers the same settlement and gives nothing
+-- back. 'forgetTask' withdraws interest: a finished task gives its reservation
+-- back at once, an unfinished one when the owner next sweeps after it finishes, and
+-- the ticket still reads its settlement. A ticket nobody observes or forgets keeps
+-- its reservation, which is what bounds the unobserved results; the engine keeps no
+-- other history of terminal results. 'waitTask' and 'awaitTask' block, the latter
+-- composed with 'awaitSupervised'.
+--
+-- = Waiting from a callback
+--
+-- A thread that is running any Lua callback may submit and request but may not
+-- wait: it would be a synchronous call into a thread that may be waiting for it. So
+-- 'startScheduledOwner', 'waitTask', 'awaitTask', 'waitControl', 'awaitControl' and
+-- 'awaitTicksComplete' are each refused at once, when they execute, with
+-- 'CallbackWaitRefused', and an action built earlier outside the callback is
+-- refused the same way. A task waits by yielding to its owner's scheduler, never
+-- by blocking its owner's thread.
+--
+-- = Time and control
+--
+-- 'grantScheduledStep' grants a logical step, 'requestTaskControl' requests that a
+-- task pause, resume or stop, and 'awaitTicksComplete' is the supervised wait for
+-- tick completion. The scheduler's module says what each means. A script waits by
+-- calling a wait operation the application registered ('waitOperation'): its first
+-- argument, an integer, is the number of ticks of a 'WaitLogical' wait or the
+-- nanoseconds of a 'WaitElapsed' one; anything else is read as none and refused as
+-- a wait for nothing, so the operation's schema should require one integer.
+--
+-- A resumed coroutine receives no value, so what the wait that ended earned (the
+-- tick reached and the logical duration granted since it began, or the time
+-- elapsed) is told to the application, on the owner's thread, before the segment
+-- that follows it ('scheduledObserve'). A binding that should answer a script's
+-- question about its tick keeps what it was told there where it reads it.
+--
+-- = Idle
+--
+-- An owner whose tasks are all paused, or waiting for an ungranted tick or a future
+-- deadline, enters no Lua and does no periodic work. It blocks in one STM wait
+-- until one of: a stop request, an admission, a control request, a grant, or its
+-- timer's deadline. A stop request wakes it whatever its tasks are waiting for.
+--
+-- = Host failures
+--
+-- A Haskell failure raised by a binding's action, or by the application's liveness
+-- check or observer, or any other exception escaping the owner, ends that owner's
+-- worker as it does a finite-call owner's: it is the worker's primary outcome with
+-- its own type and context, unconverted, and what follows is the owner's
+-- 'WorkerPolicy'. A failure is a host failure by where it was raised, not by its
+-- type. The VM's close failures and the failures of closing suspended coroutines
+-- are retained beside it as cleanup evidence, and a retained cleanup failure is
+-- fatal under any policy.
+--
+-- = Stop and exit
+--
+-- Stopping the owner ('retireScheduled', 'stopSupervised', or the boundary
+-- closing) closes admission, grants and control at once. The owner lets a running
+-- segment return (nothing is preempted, and a stuck segment keeps the worker, the
+-- VM and the binding dependencies live), settles every ticket, cancels its timer,
+-- discards the admissions that had not begun, and closes every suspended coroutine
+-- on its own thread, attempting each whatever another does, keeping their failures
+-- as cleanup evidence. 'withVmOwner' then closes the VM. The same retirement runs
+-- when the owner fails or is cancelled, with the way it exited recorded. The
+-- 'ExitRecord' names the owner and counts the tasks it discarded, started and not
+-- started separately; it is the finite-call adapter's record, and it carries no
+-- cleanup evidence, which supervision does.
+--
+-- = Determinism
+--
+-- On one owner with a fixed policy and configuration, the same admitted tasks,
+-- grants and control requests, each made at the same logical point (while the owner
+-- awaits the next grant), give the same sequence of segments, the same logical
+-- durations to each task and the same order of effects recorded through a binding,
+-- however long the segments take, whenever timers fire, and whether budgets expire.
+-- That is the scheduler's documented ordering, and nothing in this module can
+-- change it. It holds for logical-time workloads: elapsed waits legitimately change
+-- readiness, and arbitrary elapsed-time workloads are not promised the same trace.
+-- A control request that arrives in the middle of a step is not ordered logically
+-- here; deterministic logical admission of controls is the script-instance layer's.
+module Hetoimasia.Scripting.Lua.Scheduled
+  ( -- * Creating owners
+    ScheduledSpec (..)
+  , scheduledSpec
+  , ScheduledStart (..)
+  , startScheduledOwner
+
+    -- * An owner
+  , ScheduledOwner
+  , scheduledIdentity
+  , scheduledEndpoint
+  , scheduledSupervised
+  , retireScheduled
+  , cancelScheduled
+  , scheduledStatus
+  , scheduledExitRecord
+
+    -- * Admitting tasks
+  , ScheduledEndpoint
+  , scheduledEndpointOwner
+  , scheduledEndpointLabel
+  , TaskRequest (..)
+  , TaskAdmission (..)
+  , admitScheduledTask
+  , ScheduledTaskId (..)
+
+    -- * Observing results
+  , ScheduledTicket
+  , ticketTask
+  , pollTask
+  , waitTask
+  , awaitTask
+  , forgetTask
+  , ScheduledSettlement (..)
+  , ScheduledOutcome (..)
+
+    -- * Control
+  , TaskControlAnswer (..)
+  , ControlReceipt
+  , requestTaskControl
+  , pollControl
+  , waitControl
+  , awaitControl
+  , forgetControl
+
+    -- * Time
+  , grantScheduledStep
+  , TickWait (..)
+  , awaitTicksComplete
+  , scheduledTick
+  , ticksOutstanding
+
+    -- * What the application is told
+  , SegmentContext (..)
+  , scheduledDiagnostics
+
+    -- * From the scheduler
+  , Policy (..)
+  , fifoPolicy
+  , SchedulerBounds (..)
+  , ServiceClass (..)
+  , Quanta (..)
+  , Quantum (..)
+  , TaskKind (..)
+  , ControlRequest (..)
+  , ControlResult (..)
+  , ControlSettlement (..)
+  , CloseReport (..)
+  , GrantAnswer (..)
+  , GrantId (..)
+  , Resume (..)
+  , Diagnostics (..)
+  , Overrun (..)
+  , SchedulerRefused (..)
+  , ExecutionDomain (..)
+
+    -- * Refused waits
+  , CallbackWaitRefused (..)
+  ) where
+
+import Control.Concurrent.STM (STM, atomically, modifyTVar', newTVar, newTVarIO, orElse, readTVar, retry, writeTVar)
+import Control.Exception (ExceptionWithContext, SomeException, evaluate, mask, mask_, onException)
+import Control.Monad (join)
+import qualified Data.Map.Strict as Map
+import Data.Text (Text)
+import qualified Data.Text as Text
+import Data.Word (Word64)
+import GHC.Stack (HasCallStack)
+import Hetoimasia.Foundation.Messaging.Payload (prepare, preparedValue)
+import Hetoimasia.Foundation.Resource (allocResource)
+import Hetoimasia.Foundation.Time (Duration, MonotonicSource, monotonicSource)
+import Hetoimasia.Foundation.Failure (operation, throwFailure)
+import Hetoimasia.Foundation.Worker (stopRequested, workerDefinition)
+import Hetoimasia.Runtime.Supervision
+  ( RuntimeControl
+  , SupervisedStart (WorkerStartRejected, WorkerStartUnavailable, WorkerStarted)
+  , SupervisedWorker
+  , WorkerPolicy
+  , WorkerStatus (WorkerLive, WorkerUnavailable)
+  , awaitSupervised
+  , cancelSupervised
+  , startSupervised
+  , stopSupervised
+  , workerStatus
+  )
+import Hetoimasia.Scripting.Lua.Internal.Protocol.Identity
+  ( BehaviorId (BehaviorId)
+  , ExecutionDomain (..)
+  , ModId (ModId)
+  , Owner (Owner)
+  , SessionId (SessionId)
+  , SessionKey (SessionKey)
+  , firstEpoch
+  )
+import Hetoimasia.Scripting.Lua.Internal.Protocol.Limits (Quanta (..), Quantum (..), ServiceClass (..))
+import Hetoimasia.Scripting.Lua.Internal.Value (checkLimits)
+import Hetoimasia.Scripting.Lua.Owner (ModuleRef (moduleRefName), VmConfig (vmOwnerName, vmValueLimits))
+import Hetoimasia.Scripting.Lua.Runtime.Shared
+import Hetoimasia.Scripting.Lua.Runtime.Types
+  ( CallbackWaitRefused (..)
+  , ExitKind (ExitFailed)
+  , ExitRecord
+  , OwnerId
+  , Payload (OverBound, WithinBounds)
+  , ownerSequence
+  )
+import Hetoimasia.Scripting.Lua.Scheduled.Run (runScheduledOwner)
+import Hetoimasia.Scripting.Lua.Scheduled.Types
+import Hetoimasia.Scripting.Lua.Scheduler
+  ( AdmitAnswer (Admitted, AdmitRefused)
+  , AdmitRefusal (AdmitClosed, AdmitFull)
+  , CloseReport (..)
+  , ControlAnswer (ControlAccepted, ControlClosed, ControlFull, ControlUnknownTarget)
+  , ControlRequest (..)
+  , ControlResult (..)
+  , ControlSettlement (..)
+  , ControlTicket (ControlTicket)
+  , Diagnostics (..)
+  , GrantAnswer (..)
+  , GrantId (..)
+  , Overrun (..)
+  , Policy (..)
+  , Resume (..)
+  , SchedulerBounds (..)
+  , SchedulerConfig (..)
+  , SchedulerRefused (..)
+  , TaskKind (..)
+  , TaskSpec (..)
+  , TimerBackend
+  , admitTask
+  , awaitStepsComplete
+  , fifoPolicy
+  , grantStep
+  , newScheduler
+  , readDiagnostics
+  , readTick
+  , requestControl
+  , schedulerClosed
+  , stepsOutstanding
+  , systemTimerBackend
+  )
+
+-- | What one scheduled owner is created from.
+data ScheduledSpec = ScheduledSpec
+  { scheduledVm ∷ VmConfig
+    -- ^ The host configuration: libraries, initial chunks, label, registration,
+    -- policy, value limits and modules. The owner grants nothing beyond its policy.
+  , scheduledWorker ∷ WorkerPolicy
+    -- ^ What supervision does when the owner's worker ends.
+  , scheduledDomain ∷ ExecutionDomain
+    -- ^ The domain the model's identities are scoped to.
+  , scheduledPolicy ∷ Policy
+    -- ^ The scheduling policy, fixed for the owner's life.
+  , scheduledBounds ∷ SchedulerBounds
+    -- ^ The scheduler's validated limits.
+  , scheduledClock ∷ MonotonicSource
+    -- ^ The one clock: TIME-1's.
+  , scheduledTimer ∷ TimerBackend
+    -- ^ What sleeps.
+  , scheduledObserve ∷ SegmentContext → IO ()
+    -- ^ Told, on the owner's thread, what each segment is about to be handed. An
+    -- exception it raises is a failure of the host.
+  }
+
+-- | A configuration with the supplied defaults: the FIFO policy, the production
+-- clock and timer, the gameplay domain, and nothing observing segments.
+scheduledSpec ∷ VmConfig → WorkerPolicy → SchedulerBounds → ScheduledSpec
+scheduledSpec config worker bounds =
+  ScheduledSpec
+    { scheduledVm = config
+    , scheduledWorker = worker
+    , scheduledDomain = GameplayDomain
+    , scheduledPolicy = fifoPolicy
+    , scheduledBounds = bounds
+    , scheduledClock = monotonicSource
+    , scheduledTimer = systemTimerBackend
+    , scheduledObserve = \_ → pure ()
+    }
+
+-- | How creating a scheduled owner ended.
+data ScheduledStart
+  = -- | Ready, admitting, and usable from now on.
+    ScheduledStarted !ScheduledOwner
+  | -- | An optional owner failed with a recognized failure before it could be
+    -- handed out. Its status is committed, and the run continues without it.
+    ScheduledUnavailable !(ExceptionWithContext SomeException)
+  | -- | The boundary had closed registration. Nothing was forked.
+    ScheduledRejected
+  | -- | The owner ended without failing before creation could hand it out.
+    ScheduledEnded
+
+-- | A ready, supervised scheduled owner.
+data ScheduledOwner = ScheduledOwner
+  { ownerWorker ∷ !(SupervisedWorker ())
+  , ownerControl ∷ !Control
+  }
+
+-- | Create one scheduled owner: one supervised worker running one VM.
+--
+-- Raises 'SchedulerRefused', before anything starts, for a configuration the
+-- scheduler refuses, and 'CallbackWaitRefused' from a thread running a Lua
+-- callback. A failure of initialization, a cancellation of the creator and another
+-- worker's fatal outcome propagate as supervision decides. See 'ScheduledStart' for
+-- the other endings.
+startScheduledOwner ∷ HasCallStack ⇒ LuaRuntime → ScheduledSpec → IO ScheduledStart
+startScheduledOwner runtime spec = do
+  refuseCallbackWait "start-scheduled-owner"
+  owner ← issueOwnerId runtime
+  tokenStop ← newTVarIO (pure False)
+  closing ← newTVarIO False
+  let config = scheduledVm spec
+      label = vmOwnerName config
+      stopping = (||) <$> join (readTVar tokenStop) <*> readTVar closing
+      scope = SessionKey (Owner (ModId label) (scheduledDomain spec)) (SessionId (ownerSequence owner)) firstEpoch
+  scheduler ←
+    newScheduler
+      SchedulerConfig
+        { schedLabel = label
+        , schedScope = scope
+        , schedPolicy = scheduledPolicy spec
+        , schedBounds = scheduledBounds spec
+        , schedClock = scheduledClock spec
+        , schedTimer = scheduledTimer spec
+        , schedStopRequested = stopping
+        }
+      >>= either (throwFailure runtimeComponent (operation "start-scheduled-owner") []) pure
+  control ←
+    Control owner label (vmValueLimits config) scheduler
+      <$> newTVarIO Map.empty
+      <*> newTVarIO Map.empty
+      <*> newTVarIO mempty
+      <*> pure closing
+      <*> newTVarIO Nothing
+  handoff ← newTVarIO Nothing
+  let definition =
+        workerDefinition
+          ("lua scheduled owner " <> label <> " #" <> Text.pack (show (ownerSequence owner)))
+          ( \token →
+              allocResource
+                (atomically (writeTVar tokenStop (stopRequested token)) >> pure control)
+                -- The last word on what an exit left, after the run action:
+                -- everything that already ended the owner has done this.
+                (\held → atomically (settleAll held ExitFailed))
+          )
+          (\_ held → runScheduledOwner stopping held handoff (scheduledObserve spec) config)
+  -- Acquisition is masked from the worker's start to the endpoint's handoff, and
+  -- only the readiness wait is restored, exactly as for a finite-call owner.
+  mask $ \restore → do
+    started ← startSupervised (runtimeControl runtime) (scheduledWorker spec) definition
+    case started of
+      WorkerStartRejected → pure ScheduledRejected
+      WorkerStartUnavailable _ failure → pure (ScheduledUnavailable failure)
+      WorkerStarted worker → do
+        ready ←
+          restore (awaitSupervised (runtimeControl runtime) (readiness handoff worker))
+            `onException` stopSupervised worker
+        case ready of
+          Just held → do
+            live ← atomically (admitting held)
+            if live then pure (ScheduledStarted (ScheduledOwner worker held)) else ended worker
+          Nothing → ended worker
+  where
+    ended worker =
+      atomically (workerStatus worker) >>= \case
+        WorkerUnavailable failure → pure (ScheduledUnavailable failure)
+        _ → pure ScheduledEnded
+
+-- | The owner's identity.
+scheduledIdentity ∷ ScheduledOwner → OwnerId
+scheduledIdentity = controlOwner . ownerControl
+
+-- | Where tasks are admitted, grants made and control requested.
+scheduledEndpoint ∷ ScheduledOwner → ScheduledEndpoint
+scheduledEndpoint = ScheduledEndpoint . ownerControl
+
+-- | The supervised worker, for what supervision offers.
+scheduledSupervised ∷ ScheduledOwner → SupervisedWorker ()
+scheduledSupervised = ownerWorker
+
+-- | Retire the owner: ask its worker to stop, recording that its owner asked. It
+-- returns at once; see the module header for what the worker then does.
+retireScheduled ∷ ScheduledOwner → IO ()
+retireScheduled = stopSupervised . ownerWorker
+
+-- | Request the owner's cancellation, recording that its owner asked.
+cancelScheduled ∷ ScheduledOwner → IO ()
+cancelScheduled = cancelSupervised . ownerWorker
+
+-- | What supervision has decided about the owner's worker.
+scheduledStatus ∷ ScheduledOwner → STM WorkerStatus
+scheduledStatus = workerStatus . ownerWorker
+
+-- | What the owner's exit discarded: 'Nothing' until it has exited.
+scheduledExitRecord ∷ ScheduledOwner → STM (Maybe ExitRecord)
+scheduledExitRecord = readTVar . controlExit . ownerControl
+
+-- | Whether the owner admits: it is ready and nothing has asked it to stop.
+admitting ∷ Control → STM Bool
+admitting control = not <$> schedulerClosed (controlScheduler control)
+
+-- | Where an owner's tasks are admitted. Any thread may hold and use it.
+newtype ScheduledEndpoint = ScheduledEndpoint Control
+
+-- | The identity of the owner an endpoint belongs to.
+scheduledEndpointOwner ∷ ScheduledEndpoint → OwnerId
+scheduledEndpointOwner (ScheduledEndpoint control) = controlOwner control
+
+-- | The application's label of the owner an endpoint belongs to.
+scheduledEndpointLabel ∷ ScheduledEndpoint → Text
+scheduledEndpointLabel (ScheduledEndpoint control) = controlLabel control
+
+-- | What admitting a task answered.
+data TaskAdmission
+  = -- | Accepted, with the task's identity and the ticket its settlement is read
+    -- through.
+    TaskAccepted !ScheduledTaskId !ScheduledTicket
+  | -- | A bound is reached: the queue of admissions or the stored results. Nothing
+    -- changed.
+    TaskQueueFull
+  | -- | The owner has stopped admitting. Nothing changed.
+    TaskAdmissionClosed
+  deriving (Show)
+
+-- | Admit a task, without waiting, from any thread.
+--
+-- The arguments are evaluated completely and checked against the owner's value
+-- limits on this thread, and what is kept is copied. An exception nested in a lazy
+-- argument is raised here, with its own type and context.
+admitScheduledTask ∷ ScheduledEndpoint → TaskRequest → IO TaskAdmission
+admitScheduledTask (ScheduledEndpoint control) request = do
+  within ← evaluate (checkLimits (controlLimits control) (requestArguments request))
+  let payload = case within of
+        Right () → WithinBounds (map compact (requestArguments request))
+        Left rule → OverBound rule
+  prepared ← prepare (Pending (compactRef (requestModule request)) (compactName (requestEntry request)) payload)
+  cursor ← evaluate (preparedValue prepared)
+  let entry = compactName (requestEntry request)
+      wanted =
+        TaskSpec
+          { specBehavior = BehaviorId (Text.copy (moduleRefName (compactRef (requestModule request)) <> "/" <> entry))
+          , specEntry = entry
+          , specName = requestName request
+          , specClass = requestClass request
+          , specKind = requestKind request
+          , specCursor = cursor
+          }
+  -- Nothing is interruptible between the commit and the answer, so an accepted
+  -- task is never one whose ticket was never made.
+  mask_ . atomically $
+    admitTask (controlScheduler control) wanted >>= \case
+      Admitted identity → do
+        outcome ← newTVar Nothing
+        forgotten ← newTVar False
+        let cell = Cell identity outcome forgotten
+        modifyTVar' (controlCells control) (Map.insert identity cell)
+        pure (TaskAccepted (ScheduledTaskId (controlOwner control) identity) (ScheduledTicket control cell))
+      AdmitRefused (AdmitFull _ _) → pure TaskQueueFull
+      AdmitRefused AdmitClosed → pure TaskAdmissionClosed
+
+-- | The place an accepted task's settlement is read.
+data ScheduledTicket = ScheduledTicket !Control !Cell
+
+instance Show ScheduledTicket where
+  show (ScheduledTicket control cell) = "scheduled task ticket of " <> show (controlOwner control) <> " " <> show (cellTask cell)
+
+-- | The task a ticket belongs to.
+ticketTask ∷ ScheduledTicket → ScheduledTaskId
+ticketTask (ScheduledTicket control cell) = ScheduledTaskId (controlOwner control) (cellTask cell)
+
+-- | The task's settlement if it has one, without waiting. Observes it.
+pollTask ∷ ScheduledTicket → IO (Maybe ScheduledSettlement)
+pollTask (ScheduledTicket control cell) = atomically (observeCell control cell)
+
+-- | Wait for the task's settlement, on any thread but a Lua callback's.
+--
+-- Every accepted task settles, so this returns once the task has finished or the
+-- owner has exited. Refused with 'CallbackWaitRefused' from a Lua callback.
+waitTask ∷ HasCallStack ⇒ ScheduledTicket → IO ScheduledSettlement
+waitTask (ScheduledTicket control cell) = do
+  refuseCallbackWait "wait-task"
+  atomically (observeCell control cell >>= maybe retry pure)
+
+-- | Wait for the task's settlement on the application thread, composed with
+-- 'awaitSupervised': a worker's terminal outcome is handled first, so a fatal one
+-- is raised here rather than waited out. Refused with 'CallbackWaitRefused' from a
+-- Lua callback.
+awaitTask ∷ HasCallStack ⇒ RuntimeControl → ScheduledTicket → IO ScheduledSettlement
+awaitTask supervision (ScheduledTicket control cell) = do
+  refuseCallbackWait "await-task"
+  awaitSupervised supervision (observeCell control cell >>= maybe retry pure)
+
+-- | Withdraw interest in a task's result. See the module header.
+forgetTask ∷ ScheduledTicket → IO ()
+forgetTask (ScheduledTicket control cell) = atomically (forgetCell control cell)
+
+-- | What requesting control of a task answered.
+data TaskControlAnswer
+  = -- | Taken. Its settlement is read through the receipt.
+    TaskControlAccepted !ControlReceipt
+  | -- | Every result reservation is held. Nothing changed.
+    TaskControlFull
+  | TaskControlClosed
+  | -- | No live task of this owner has this identity.
+    TaskControlUnknown
+  deriving (Show)
+
+-- | The place an accepted control request's settlement is read.
+newtype ControlReceipt = ControlReceipt ControlTicket
+
+instance Show ControlReceipt where
+  show _ = "<control receipt>"
+
+-- | Request that a task pause, resume or stop. Never blocks, from any thread; the
+-- scheduler's module says how it is applied. An identity another owner issued is
+-- unknown here.
+requestTaskControl ∷ ScheduledEndpoint → ScheduledTaskId → ControlRequest → IO TaskControlAnswer
+requestTaskControl (ScheduledEndpoint control) task request
+  | taskOwner task /= controlOwner control = pure TaskControlUnknown
+  | otherwise =
+      atomically (requestControl (controlScheduler control) (taskLocal task) request) <&> \case
+        ControlAccepted ticket → TaskControlAccepted (ControlReceipt ticket)
+        ControlFull → TaskControlFull
+        ControlClosed → TaskControlClosed
+        ControlUnknownTarget → TaskControlUnknown
+  where
+    (<&>) = flip fmap
+
+-- | The settlement if there is one, without waiting. Observes it.
+pollControl ∷ ControlReceipt → IO (Maybe ControlSettlement)
+pollControl (ControlReceipt (ControlTicket poll _ _)) = atomically poll
+
+-- | Wait for the settlement, on any thread but a Lua callback's. Refused with
+-- 'CallbackWaitRefused' from a Lua callback.
+waitControl ∷ HasCallStack ⇒ ControlReceipt → IO ControlSettlement
+waitControl (ControlReceipt (ControlTicket _ await _)) = do
+  refuseCallbackWait "wait-control"
+  atomically await
+
+-- | Wait for the settlement on the application thread, composed with
+-- 'awaitSupervised'. Refused with 'CallbackWaitRefused' from a Lua callback.
+awaitControl ∷ HasCallStack ⇒ RuntimeControl → ControlReceipt → IO ControlSettlement
+awaitControl supervision (ControlReceipt (ControlTicket _ await _)) = do
+  refuseCallbackWait "await-control"
+  awaitSupervised supervision await
+
+-- | Withdraw interest in the settlement.
+forgetControl ∷ ControlReceipt → IO ()
+forgetControl (ControlReceipt (ControlTicket _ _ forget)) = atomically forget
+
+-- | Grant a logical step. Never blocks, from any thread.
+grantScheduledStep ∷ ScheduledEndpoint → Duration → IO GrantAnswer
+grantScheduledStep (ScheduledEndpoint control) duration = atomically (grantStep (controlScheduler control) duration)
+
+-- | How a wait for tick completion ended.
+data TickWait
+  = -- | Every accepted grant has been applied, and the work it made due has
+    -- finished.
+    TicksCompleted
+  | -- | The owner exited first. The ticks outstanding did not complete: they were
+    -- discarded with the owner.
+    TickOwnerEnded
+  deriving (Eq, Show)
+
+-- | Wait, on the application thread and composed with 'awaitSupervised', until
+-- every accepted grant has completed, or the owner has exited.
+--
+-- An owner that stops or fails with a tick outstanding ends the wait with
+-- 'TickOwnerEnded' and never with a false completion. Refused with
+-- 'CallbackWaitRefused' from a Lua callback.
+awaitTicksComplete ∷ HasCallStack ⇒ RuntimeControl → ScheduledOwner → IO TickWait
+awaitTicksComplete supervision owner = do
+  refuseCallbackWait "await-ticks-complete"
+  awaitSupervised supervision $ do
+    closed ← schedulerClosed (controlScheduler (ownerControl owner))
+    if closed
+      then pure TickOwnerEnded
+      else
+        (awaitStepsComplete (controlScheduler (ownerControl owner)) >> pure TicksCompleted)
+          `orElse` ( workerStatus (ownerWorker owner) >>= \case
+                       WorkerLive → retry
+                       _ → pure TickOwnerEnded
+                   )
+
+-- | The logical tick reached.
+scheduledTick ∷ ScheduledEndpoint → STM Word64
+scheduledTick (ScheduledEndpoint control) = readTick (controlScheduler control)
+
+-- | How many accepted grants have not completed.
+ticksOutstanding ∷ ScheduledEndpoint → STM Int
+ticksOutstanding (ScheduledEndpoint control) = stepsOutstanding (controlScheduler control)
+
+-- | A snapshot of the scheduler's bounded counters and gauges. Borrows nothing
+-- from a Lua state.
+scheduledDiagnostics ∷ ScheduledEndpoint → STM Diagnostics
+scheduledDiagnostics (ScheduledEndpoint control) = readDiagnostics (controlScheduler control)

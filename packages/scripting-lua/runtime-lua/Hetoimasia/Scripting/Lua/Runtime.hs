@@ -206,19 +206,13 @@ module Hetoimasia.Scripting.Lua.Runtime
   , CallbackWaitRefused (..)
   ) where
 
-import Control.Concurrent.STM (STM, TVar, atomically, newTVarIO, orElse, readTVar, retry)
+import Control.Concurrent.STM (STM, atomically, newTVarIO, readTVar, retry)
 import Control.Exception (ExceptionWithContext, SomeException, evaluate, mask, mask_, onException)
-import Control.Monad (when)
-import qualified Data.ByteString as ByteString
 import Data.Foldable (toList)
-import Data.IORef (IORef, atomicModifyIORef', newIORef)
 import Data.Text (Text)
 import qualified Data.Text as Text
-import Data.Unique (Unique, newUnique)
-import Data.Word (Word64)
 import GHC.Stack (HasCallStack)
 import Hetoimasia.Foundation.Failure (Operation, operation, throwFailure)
-import Hetoimasia.Foundation.Log (Component, unsafeComponent)
 import Hetoimasia.Foundation.Messaging.Channel (SendResult (Accepted, Closed, Full))
 import Hetoimasia.Foundation.Messaging.Payload (prepare)
 import Hetoimasia.Foundation.Resource (allocResource)
@@ -228,7 +222,7 @@ import Hetoimasia.Runtime.Supervision
   , SupervisedStart (WorkerStartRejected, WorkerStartUnavailable, WorkerStarted)
   , SupervisedWorker
   , WorkerPolicy
-  , WorkerStatus (WorkerLive, WorkerUnavailable)
+  , WorkerStatus (WorkerUnavailable)
   , awaitSupervised
   , cancelSupervised
   , startSupervised
@@ -243,9 +237,8 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Limits
   , Quantum (Quantum)
   , validateLimits
   )
-import Hetoimasia.Scripting.Lua.Internal.Value (Capability (capabilityTypeName), checkLimits)
-import Hetoimasia.Scripting.Lua.Internal.Vm (runningLuaCallback)
-import Hetoimasia.Scripting.Lua.Owner (ModuleRef (ModuleRef, moduleRefName, moduleRefVersion), VmConfig (vmOwnerName, vmValueLimits), maxIdentityLength)
+import Hetoimasia.Scripting.Lua.Internal.Value (checkLimits)
+import Hetoimasia.Scripting.Lua.Owner (ModuleRef (moduleRefName, moduleRefVersion), VmConfig (vmOwnerName, vmValueLimits))
 import Hetoimasia.Scripting.Lua.Runtime.Admission
   ( admit
   , admitting
@@ -256,30 +249,10 @@ import Hetoimasia.Scripting.Lua.Runtime.Admission
   , shutAndDiscard
   )
 import Hetoimasia.Scripting.Lua.Runtime.Dispatch (runOwner)
+import Hetoimasia.Scripting.Lua.Runtime.Shared
 import Hetoimasia.Scripting.Lua.Runtime.Types
-import Hetoimasia.Scripting.Lua.Registration (maxNameLength)
-import Hetoimasia.Scripting.Lua.Value (Value (VBytes, VCapability, VList, VRecord, VText))
+import Hetoimasia.Scripting.Lua.Value (Value)
 import Hetoimasia.Foundation.Messaging.Payload (Prepared)
-
--- | The runtime boundary owners are created in: the supervision control they
--- are started under, and the identities issued so far.
---
--- Make one for each 'withSupervision' invocation. It belongs to the
--- application thread, as the 'RuntimeControl' it holds does.
-data LuaRuntime = LuaRuntime
-  { runtimeControl ∷ !RuntimeControl
-  , runtimeScope ∷ !Unique
-  , runtimeIssued ∷ !(IORef Word64)
-  }
-
--- | A runtime boundary over a supervision control.
-newLuaRuntime ∷ RuntimeControl → IO LuaRuntime
-newLuaRuntime control = LuaRuntime control <$> newUnique <*> newIORef 0
-
--- | The next identity of a runtime, never an earlier one.
-issueOwnerId ∷ LuaRuntime → IO OwnerId
-issueOwnerId runtime =
-  OwnerId (runtimeScope runtime) <$> atomicModifyIORef' (runtimeIssued runtime) (\issued → (issued + 1, issued + 1))
 
 -- | What one owner is created from.
 data OwnerSpec = OwnerSpec
@@ -310,9 +283,6 @@ data LuaOwner = LuaOwner
   , ownerControl ∷ !Control
   }
 
-runtimeComponent ∷ Component
-runtimeComponent = unsafeComponent "scripting.lua.runtime"
-
 startOperation ∷ Operation
 startOperation = operation "start-lua-owner"
 
@@ -339,13 +309,6 @@ checkBounds bounds = case validateLimits limits of
     named QueuedAdmissions value = Just (QueuedCallsBelowOne value)
     named RetainedResults value = Just (ResultsBelowOne value)
     named _ _ = Nothing
-
--- | Refuse, at once, a wait asked from a thread that is running a Lua callback.
-refuseCallbackWait ∷ HasCallStack ⇒ Text → IO ()
-refuseCallbackWait name = do
-  inside ← runningLuaCallback
-  when inside $
-    throwFailure runtimeComponent (operation name) [] (CallbackWaitRefused name)
 
 -- | Create one owner: one supervised worker running one VM.
 --
@@ -402,16 +365,6 @@ startLuaOwner runtime spec = do
       atomically (workerStatus worker) >>= \case
         WorkerUnavailable failure → pure (OwnerUnavailable failure)
         _ → pure OwnerEnded
-
--- | Ready, or the worker's terminal status: whichever comes first, so that a
--- failed initializer never leaves the wait hanging.
-readiness ∷ TVar (Maybe a) → SupervisedWorker () → STM (Maybe a)
-readiness handoff worker =
-  (readTVar handoff >>= maybe retry (pure . Just))
-    `orElse` ( workerStatus worker >>= \case
-                 WorkerLive → retry
-                 _ → pure Nothing
-             )
 
 -- | The owner's identity.
 ownerIdentity ∷ LuaOwner → OwnerId
@@ -478,39 +431,6 @@ prepareCall (OwnerEndpoint control) ref entry arguments = do
   -- Evaluated here, on the producer's thread: until then it would hold the strings
   -- it was given.
   evaluate (PreparedCall control (compactRef ref) (compactName entry) payload)
-
--- | The routing strings of a call get the same treatment as its values: they are
--- copied, and one longer than any valid identity or name is cut to one character
--- past the longest valid one, which can only be refused, and which is as much of
--- it as a refusal will ever quote.
-compactRef ∷ ModuleRef → ModuleRef
-compactRef ref =
-  ModuleRef (clip maxIdentityLength (moduleRefName ref)) (clip maxIdentityLength (moduleRefVersion ref))
-
-compactName ∷ Text → Text
-compactName = clip maxNameLength
-
-clip ∷ Int → Text → Text
-clip limit = Text.copy . Text.take (limit + 1)
-
--- | Compact what the queue keeps. The value limits count the bytes a value
--- encodes to, and a capability is 21 of them whatever its type's name is; but
--- the queue keeps the value as it was given, and a string that is a slice of a
--- larger one keeps the larger one's whole buffer alive while the call waits.
--- So every string in an accepted call is copied to a buffer of its own, which
--- the limits do bound, and a capability's type name is first cut to one
--- character past 'maxNameLength': no registered type has a longer name, so a
--- longer one can only be refused, and what is kept is enough to never match one
--- and as much as the refusal will ever quote.
-compact ∷ Value → Value
-compact = \case
-  VBytes bytes → VBytes (ByteString.copy bytes)
-  VText text → VText (Text.copy text)
-  VCapability held →
-    VCapability held {capabilityTypeName = Text.copy (Text.take (maxNameLength + 1) (capabilityTypeName held))}
-  VList items → VList (map compact items)
-  VRecord entries → VRecord [(Text.copy name, compact item) | (name, item) ← entries]
-  value → value
 
 -- | What submitting a call answered.
 data Submission
