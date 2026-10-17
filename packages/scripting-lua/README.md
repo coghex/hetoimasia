@@ -1964,6 +1964,25 @@ order an instance's own invocations were accepted in. The next invocation of an 
 the boundary of the segment that ended the last, so the order depends on the order of admission and
 nothing about how long segments take, when timers fire or whether a budget expires.
 
+**An invocation the scheduler had no room for is tried again wherever room appears, before the next segment is
+chosen.** Room is a result place, a place of the admission queue and an active slot, and a task keeps its slot and its
+place until its result is observed. The owner takes one step at every safe boundary, after the scheduler's own work
+there (its activations, controls and closes), and the scheduler does the boundary again while that step says it
+released or used something. The step accounts for the invocations that ended and gives back what they held, gives
+back what tickets the application forgot, and then, if the application asked anything or an invocation waits for room
+and there is room, looks at every instance in the order of its number: what waited for room goes before what the
+batch of requests begins. The sites that release room, and where each reaches the step, are these: an invocation's
+end (its place, when the step observes it at the boundary; its slot, with it), a queued admission's activation (a
+place of the queue, by the scheduler's own reconcile before the step), the application's observation or forgetting
+of a ticket (a place and a slot: at any time by the application, and for a forgotten ticket of an unfinished task,
+when the step sweeps after it finishes), an instance's control (a stop or a pause of a begun invocation ends or
+freezes it directly, and a control that finishes a grant settles it at the boundary's second look; a resume looks at
+the instance), the end of an instance (its coroutine's close, accounted at the step before it is looked at again),
+and the owner's own control of its tasks (applied by the scheduler before the step). So where a turn is cut, which
+only decides when the owner's thread is handed back to the loop, changes neither which invocation takes the room
+that is there nor in what order effects happen. Room an application's own thread releases while a segment runs is
+taken at the next boundary, whenever it was released: the application chose when to observe.
+
 ### Events
 
 An owner offers named event sources (`EventSource`: a name and the shape of the payload). In this
@@ -2016,7 +2035,8 @@ request holds a reservation until its settlement is observed or abandoned
 (`boundInstanceControls`), and settles exactly once, as applied, already in that state, or no longer
 applicable, including when the instance or the owner ends first. Requests are applied in the order accepted,
 at the owner's next safe boundary: the owner's thread services them at each of the scheduler's boundaries,
-before the first segment of a turn and after every segment, when no task is running, and never inside a segment.
+before the first segment of a turn and after every segment, when no task is running, after the scheduler's own work
+at that boundary, and never inside a segment.
 Pause and resume of the invocation in flight, and stop, are done to its task directly, at that boundary,
 with no scheduler request, reservation or queue between: a request settles as it is applied, before anything that
 can raise a failure of the host. An invocation that has not run a segment has nothing to freeze or close, even when
@@ -2026,7 +2046,10 @@ resuming over and over admits nothing new), and a stop discards it as an unstart
 withdrawn from it: an instance that took one back leaves at most one such task, which does nothing when chosen and
 is used again by the same invocation, and it holds a queue place and a stored-result place until then.) Until it runs, an
 invocation holds its place in the instance's queue, so taking it back never overfills the queue; a one-shot's `run`
-is no event and holds none, and one taken back stays counted among the unstarted invocations an ending discards. An owner that has been asked to stop services
+is no event and holds none. It is owed from the success of the instance's `init` until its first segment begins,
+whatever became of it meanwhile (taken by the scheduler and queued, refused for want of a place or a queue place,
+taken back by a pause, held while paused): the instance has one record of that, and an ending of any kind (a stop, a
+failure, the owner's retirement or cancellation) counts it once among the unstarted invocations it discards. An owner that has been asked to stop services
 nothing more: its exit settles what was left. The scheduler's own task controls do not reach an instance's
 invocation, whatever the application learned of its identity: they answer unknown, and the instance layer is
 the only thing that pauses, resumes or stops it.
