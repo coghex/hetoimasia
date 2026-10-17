@@ -36,6 +36,7 @@ module Test.LuaRuntime.Instance.Support
   , noHooks
   , hostFailing
   , hostShutdown
+  , hostShutdownBang
   , waitHostShutdown
   , badCloseHostShutdown
   , gated
@@ -448,6 +449,15 @@ hostShutdown =
     , "function shutdown(self, reason) fx.fail('boom') end"
     ]
 
+-- | The same, failing with another failure of the host.
+hostShutdownBang ∷ ModuleSource
+hostShutdownBang =
+  hooksModule
+    "hostshutdownbang"
+    [ "function init(self, api) api.connect('tick', function(self, event) end) end"
+    , "function shutdown(self, reason) fx.fail('bang') end"
+    ]
+
 -- | A callback that waits, and a @shutdown@ that records and then fails the way the
 -- host fails.
 waitHostShutdown ∷ ModuleSource
@@ -505,8 +515,8 @@ plainModule ∷ ModuleSource
 plainModule =
   ModuleSource
     (ModuleRef "tasks" "1")
-    (Text.encodeUtf8 "function once(label) fx.record(label) return 1 end\n")
-    [EntryPoint "once" Required [SText] [SInteger]]
+    (Text.encodeUtf8 "function once(label) fx.record(label) return 1 end\nfunction waits(label) sched.wait_ticks(5) return 1 end\n")
+    [EntryPoint "once" Required [SText] [SInteger], EntryPoint "waits" Required [SText] [SInteger]]
 
 -- | The module of this name among those the examples load.
 moduleNamed ∷ Text → ModuleRef

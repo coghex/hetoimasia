@@ -132,7 +132,7 @@ import Hetoimasia.Scripting.Lua.Scheduler
   , TaskRun (..)
   , TurnReport (turnCloseFailures)
   , awaitWork
-  , serviceTurn
+  , serviceTurnWith
   , stopScheduler
   )
 import Hetoimasia.Scripting.Lua.Value (Side (Arguments), ValueRefusal (ValueRefusal), VmIdentity)
@@ -208,7 +208,7 @@ serve stopping control handoff observe escalate config owned = mask $ \restore �
     writeIORef handlesRef handles
     forM_ ((,) <$> controlInstances control <*> escalate) $ \(instances, decide) →
       forM_ (Map.lookup driverRef handles) $ \driver →
-        newInstanceHost control instances decide owned driver handlesRef tasks extra >>= writeIORef instanceRef . Just
+        newInstanceHost control instances decide host owned driver handlesRef tasks extra >>= writeIORef instanceRef . Just
     atomically (writeTVar handoff (Just control))
     loop host kept extra instanceRef
   -- The owner is exiting, however it was asked to or made to. Admission, grants
@@ -286,7 +286,12 @@ serve stopping control handoff observe escalate config owned = mask $ \restore �
         Nothing → awaitWork scheduler
         Just ih → awaitWork scheduler `orElse` awaitInstanceWork ih
       forM_ instances serviceInstances
-      report ← serviceTurn scheduler host
+      -- At each boundary the owner looks at what its instances were asked, unless it
+      -- was asked to stop itself, in which case its exit settles it.
+      let atBoundary = forM_ instances $ \ih → do
+            halting ← atomically stopping
+            unless halting (servicePending ih)
+      report ← serviceTurnWith atBoundary scheduler host
       forM_ instances settleEnded
       mask_ $ do
         modifyIORef' kept (<> turnCloseFailures report)
@@ -319,9 +324,6 @@ runSegment
   → TaskRun Cursor
   → IO (SegmentReport Cursor)
 runSegment control observe owned identity label handlesRef tasks extra instanceRef run = do
-  -- What the application asked of its instances is applied at this boundary, before
-  -- the segment begins.
-  readIORef instanceRef >>= mapM_ servicePending
   observe
     SegmentContext
       { contextTask = ScheduledTaskId (controlOwner control) (runTask run)

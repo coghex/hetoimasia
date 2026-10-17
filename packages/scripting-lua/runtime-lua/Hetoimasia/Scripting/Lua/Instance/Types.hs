@@ -487,7 +487,9 @@ validateInstanceConfig schedulerRetained schedulerQueued config =
     <> [RetainedBelowLive (boundRetainedInstances b) (boundLiveInstances b) | boundRetainedInstances b < boundLiveInstances b]
     <> [SchedulerRetainedTooSmall schedulerRetained (boundLiveInstances b) | schedulerRetained < 2 * boundLiveInstances b]
     <> [SchedulerQueueTooSmall schedulerQueued (boundLiveInstances b) | schedulerQueued < boundLiveInstances b]
-    <> [InvalidSourceName (sourceName source) | source ← sources, validName (sourceName source) /= Nothing]
+    -- A source is named as a binding is, and the driver's entry point for it is
+    -- named for it after a prefix, under the same bound.
+    <> [InvalidSourceName (sourceName source) | source ← sources, validName (sourceName source) /= Nothing || validName ("event_" <> sourceName source) /= Nothing]
     <> [TooManySources (length sources) sourceLimit | length sources > sourceLimit]
     <> [DuplicateSource name | name ← duplicated names]
     <> [SourceCapability (sourceName source) | source ← sources, hasCapability (sourcePayload source)]

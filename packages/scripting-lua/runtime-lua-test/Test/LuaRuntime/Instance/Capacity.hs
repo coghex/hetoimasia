@@ -133,6 +133,13 @@ spec = describe "capacity" $ do
         >>= (`shouldBe` [InvalidSourceName "bad name", DuplicateSource "tick"])
       refusedWith fixture runtime base {instanceSources = [EventSource "held" (SRecord [("a", SList (SCapability "thing"))])]}
         >>= (`shouldBe` [SourceCapability "held"])
+      -- A name the prefix of the driver's entry point for it would push past the bound,
+      -- and the longest one that fits.
+      let longest = Text.replicate 58 "n"
+      refusedWith fixture runtime base {instanceSources = [EventSource (longest <> "n") SInteger]}
+        >>= (`shouldBe` [InvalidSourceName (longest <> "n")])
+      fits ← startInstances fixture runtime "longest" [echoer] base {instanceSources = [EventSource longest SInteger]} requiredPolicy
+      retireScheduled fits
       -- More sources than the driver can declare an entry point for.
       let many = [EventSource ("source" <> Text.pack (show n)) SInteger | n ← [1 .. 60 ∷ Int]]
       refusedWith fixture runtime base {instanceSources = many} >>= (`shouldBe` [TooManySources 60 59])

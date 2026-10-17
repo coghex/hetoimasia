@@ -11,7 +11,7 @@ import Data.Maybe (mapMaybe)
 import qualified Data.Text as Text
 import Hetoimasia.Scripting.Lua.Instance
 import Hetoimasia.Scripting.Lua.Scheduled
-import Hetoimasia.Scripting.Lua.Value (Value (VInteger, VText), valueLimits)
+import Hetoimasia.Scripting.Lua.Value (Schema (SInteger, SList), Value (VInteger, VList, VText), valueLimits)
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Scheduled.Support (awaitEffect, awaitEntered, defaultSchedulerBounds, releaseGate)
@@ -150,6 +150,17 @@ spec = describe "events" $ do
       expectDelivered fixture exact "exact" 1
       awaitEffect (sf fixture) "tick 2 n=1 seq=0 t=0 count=1"
       phaseOf fixture exact "exact" >>= (`shouldBe` Just Active)
+
+  it "refuses a payload over the limits as it is found to be, without walking the rest of it" $ bounded $ do
+    fixture ← newIFixture
+    withBoundary $ \_ runtime → do
+      let config = (testConfig instanceBounds') {instanceSources = [tickSource, EventSource "list" (SList SInteger)]}
+      owner ← startInstances fixture runtime "lazy" [echoer] config requiredPolicy
+      _ ← admit fixture owner "a" (moduleNamed "echoer")
+      awaitPhase fixture owner "a" Active
+      identity ← idOf fixture "a"
+      -- A list with no end: refused once the limits are passed, not once it is read.
+      deliverEvent (scheduledEndpoint owner) identity "list" (VList (repeat (VInteger 1))) >>= (`shouldBe` DeliveryRefused)
 
   it "keeps an accepted event's sequence and the logical tick it was admitted at, however long it waits" $ bounded $ do
     fixture ← newIFixture

@@ -70,7 +70,8 @@ spec = describe "control" $ do
       second ← expectControl fixture owner "a" InstanceStop
       releaseOwner fixture
       results ← forM [first, second] waitInstanceControl
-      results `shouldBe` [ControlApplied, ControlAlreadyInState]
+      -- The stop ends the instance as it is applied, so the second finds it ended.
+      results `shouldBe` [ControlApplied, ControlNoLongerApplicable]
       settled ← awaitSettled fixture "a"
       resultPhase settled `shouldBe` Stopped
       resultOutcome settled `shouldSatisfy` \case InstanceStopped → True; _ → False
@@ -112,7 +113,7 @@ spec = describe "control" $ do
                    , ControlApplied
                    , ControlNoLongerApplicable
                    , ControlNoLongerApplicable
-                   , ControlAlreadyInState
+                   , ControlNoLongerApplicable
                    ]
       settled ← awaitSettled fixture "a"
       resultPhase settled `shouldBe` Stopped

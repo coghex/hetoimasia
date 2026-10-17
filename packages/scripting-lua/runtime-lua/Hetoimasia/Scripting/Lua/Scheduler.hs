@@ -252,6 +252,8 @@ module Hetoimasia.Scripting.Lua.Scheduler
   , WaitRefusal (..)
   , awaitWork
   , serviceTurn
+  , serviceTurnWith
+  , ownerControl
   , TurnReport (..)
   , TurnEnd (..)
   , stopScheduler
@@ -639,7 +641,15 @@ data Turn = Turn
 -- elapsed waiters or a budget, as a segment returns when there is a budget or the
 -- segment waits for elapsed time.
 serviceTurn ∷ Scheduler v → TaskHost v → IO TurnReport
-serviceTurn scheduler host = do
+serviceTurn = serviceTurnWith (pure ())
+
+-- | 'serviceTurn', running an action of the owner's at each safe boundary: before
+-- the first segment and after every segment, when no task is running, ahead of what
+-- the scheduler does there. It is how an owner that serves more than tasks looks at
+-- what it was asked at the same boundaries the scheduler does. What it raises is a
+-- failure of the host and propagates out of the turn.
+serviceTurnWith ∷ IO () → Scheduler v → TaskHost v → IO TurnReport
+serviceTurnWith atBoundary scheduler host = do
   phaseOpen ← atomically (isStillOpen scheduler)
   if not phaseOpen
     then pure (TurnReport 0 TurnClosed [] [] [])
@@ -684,7 +694,7 @@ serviceTurn scheduler host = do
 
     loop ∷ Maybe Instant → Maybe Instant → Turn → IO TurnReport
     loop deadline reading turn0 = do
-      turn ← boundary scheduler host turn0
+      turn ← boundary atBoundary scheduler host turn0
       stopping ← atomically (schedStopRequested config)
       -- The boundary can close continuations and so take time: look at the clock
       -- again before judging the budget, once a segment has run.
@@ -782,8 +792,9 @@ chooseNext scheduler = do
 
 -- | A safe boundary: apply grants and activate queued admissions, apply control
 -- requests, and settle what that freed.
-boundary ∷ Scheduler v → TaskHost v → Turn → IO Turn
-boundary scheduler host turn0 = do
+boundary ∷ IO () → Scheduler v → TaskHost v → Turn → IO Turn
+boundary atBoundary scheduler host turn0 = do
+  atBoundary
   first ← reconcile
   applyControls scheduler host
   second ← reconcile
@@ -859,6 +870,37 @@ applyControls scheduler host = do
       let (next, result) = step (pendingTask pending) state
       writeTVar reference next
       conclude pending result Nothing
+
+-- | Pause, resume or stop a task by the owner's own thread, at a boundary, at once:
+-- the three operations 'requestControl' applies between segments, without a
+-- reservation, a ticket or a queue to wait in, for an owner that applies requests of
+-- its own at the same boundaries. A task that is running, or that is not live, is
+-- no longer a target and answers 'ControlNoLongerApplicable'. A stop closes the
+-- task's continuation through 'hostClose', once, and cancels it; a failure of the
+-- close is kept as it is for a task's own stop. Only the owner's thread calls it, and
+-- never inside a segment.
+ownerControl ∷ Scheduler v → TaskHost v → TaskId → ControlRequest → IO ControlResult
+ownerControl scheduler host identity = \case
+  RequestPause → atomically (immediate pauseIn)
+  RequestResume → atomically (immediate resumeIn)
+  RequestStop → do
+    live ← liveTarget identity <$> readTVarIO reference
+    if not live
+      then pure ControlNoLongerApplicable
+      else mask_ $ do
+        closed ← tryClose (hostClose host identity)
+        atomically $ do
+          state ← readTVar reference
+          let (next, result) = cancelIn identity state
+          writeTVar reference (retainEvidence [(identity, failure) | CloseFailed failure ← [closed]] next)
+          pure result
+  where
+    reference = schedState scheduler
+    immediate step = do
+      state ← readTVar reference
+      let (next, result) = step identity state
+      writeTVar reference next
+      pure result
 
 -- | Close a continuation. A synchronous failure is the report; an asynchronous
 -- exception is not this action's to keep and propagates.

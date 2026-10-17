@@ -310,14 +310,19 @@ deliverEvent (ScheduledEndpoint control) identity source payload = case controlI
       -- checks the two together.
       within ← evaluate (checkLimits (controlLimits control) [VInteger 0, stamped])
       let context = Context {contextVm = foreignVm, contextTypeName = const Nothing, contextTypeNumber = const Nothing}
-      conforming ← evaluate (conformValue context schema payload)
-      case (within, conforming) of
-        (Right (), Right ()) → do
-          prepared ← prepare (WithinBounds [compact payload])
-          case preparedValue prepared of
-            WithinBounds [kept] → atomically (State.deliverEvent instances (gateOf control) (controlOwner control) identity source kept)
-            _ → pure DeliveryRefused
-        _ → pure DeliveryRefused
+      -- The shape is checked only once the limits have passed: a payload over them is
+      -- refused as it is found to be, and its tail is never walked.
+      case within of
+        Left _ → pure DeliveryRefused
+        Right () → do
+          conforming ← evaluate (conformValue context schema payload)
+          case conforming of
+            Left _ → pure DeliveryRefused
+            Right () → do
+              prepared ← prepare (WithinBounds [compact payload])
+              case preparedValue prepared of
+                WithinBounds [kept] → atomically (State.deliverEvent instances (gateOf control) (controlOwner control) identity source kept)
+                _ → pure DeliveryRefused
   where
     -- No capability crosses a source (the owner's creation refuses one), so no VM's
     -- identity is ever compared.

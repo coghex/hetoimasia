@@ -55,14 +55,14 @@ module Hetoimasia.Scripting.Lua.Instance.Run
   ) where
 
 import Control.Concurrent.STM (STM, atomically, modifyTVar', orElse, readTVar, readTVarIO, retry, writeTVar)
-import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeAsyncException, SomeException, finally, fromException, mask_, onException, rethrowIO, throwIO, try, tryWithContext)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeAsyncException, SomeException, finally, fromException, mask, mask_, onException, rethrowIO, throwIO, tryWithContext)
 import Control.Monad (forM, forM_, unless, void, when)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Foldable (toList)
 import Data.Maybe (isJust)
-import Data.Sequence (ViewL (EmptyL, (:<)), viewl)
+import Data.Sequence (ViewL (EmptyL, (:<)), viewl, (<|))
 import qualified Data.Set as Set
 import Data.Text (Text)
 import Data.Word (Word64)
@@ -99,12 +99,11 @@ import Hetoimasia.Scripting.Lua.Scheduled.Types
 import Hetoimasia.Scripting.Lua.Scheduler
   ( AdmitAnswer (Admitted)
   , BehaviorId (BehaviorId)
-  , ControlAnswer (ControlAccepted, ControlFull)
   , ControlRequest (RequestPause, RequestResume, RequestStop)
   , ControlResult (ControlAlreadyInState, ControlApplied, ControlNoLongerApplicable)
-  , ControlTicket (forgetControl)
   , Scheduler
   , SegmentReport (ReportCompleted, ReportFailed, ReportYielded)
+  , TaskHost
   , TaskKind (OneShot)
   , TaskOutcome (OutcomeFailed)
   , TaskPhase (PhaseEnded, PhasePaused, PhaseQueued, PhaseReady, PhaseRunning, PhaseWaiting)
@@ -115,7 +114,7 @@ import Hetoimasia.Scripting.Lua.Scheduler
   , admitTask
   , observeTask
   , readTick
-  , requestControl
+  , ownerControl
   , schedulerClosed
   , taskPhase
   )
@@ -136,6 +135,10 @@ data ExitMode
 data Live = Live
   { liveSlot ∷ !Word64
   , liveStage ∷ !HookStage
+  , liveEvent ∷ !(Maybe QueuedEvent)
+    -- ^ The event an invocation that has not begun was made for, to give back.
+  , liveWithdrawn ∷ !Bool
+    -- ^ The instance took the invocation back before it began.
   }
 
 -- | Why an instance is ending.
@@ -151,6 +154,9 @@ data Ending = Ending
   , endPrimary ∷ !(Maybe Primary)
   , endConnections ∷ !Int
   , endUnstarted ∷ !Int
+  , endClosed ∷ !Int
+    -- ^ Coroutines closed so far: kept as they are counted, so an ending that raised
+    -- can still be settled with what it did.
   }
 
 -- | What the owner's thread holds for its instances, besides what the application
@@ -172,9 +178,8 @@ data InstanceHost = InstanceHost
     -- ^ Failures the application decided to escalate while a coroutine was being
     -- closed, where raising one would be taken for the close's failure: raised at
     -- the owner's next safe point instead.
-  , ihWanted ∷ !(IORef (Map TaskId [ControlRequest]))
-    -- ^ What the scheduler was asked of an invocation's task and had no reservation
-    -- for, in the order asked: asked again, never dropped for being full.
+  , ihHost ∷ !(TaskHost Cursor)
+    -- ^ What the scheduler runs segments and closes continuations through.
   , ihBacklog ∷ !(IORef [Job])
     -- ^ The jobs of the batch being serviced that have not begun: if servicing one
     -- raises, the owner's exit still finds the rest, and settles their receipts.
@@ -187,20 +192,21 @@ newInstanceHost
   ∷ Control
   → Instances
   → (InstanceFailure → IO Escalation)
+  → TaskHost Cursor
   → OwnedVm
   → ModuleHandle
   → IORef (Map ModuleRef ModuleHandle)
   → IORef (Map TaskId Task)
   → IORef [(Text, ExceptionWithContext SomeException)]
   → IO InstanceHost
-newInstanceHost control instances escalate owned driver handles tasks extra =
+newInstanceHost control instances escalate host owned driver handles tasks extra =
   InstanceHost control instances escalate owned driver handles tasks extra
     <$> newIORef Map.empty
     <*> newIORef Map.empty
     <*> newIORef Set.empty
     <*> newIORef Serving
     <*> newIORef []
-    <*> newIORef Map.empty
+    <*> pure host
     <*> newIORef []
     <*> newIORef Set.empty
 
@@ -249,23 +255,26 @@ scheduler' = controlScheduler . ihControl
 serviceInstances ∷ InstanceHost → IO ()
 serviceInstances ih = do
   settleEnded ih
-  flushWanted ih
   atomically (writeTVar (insBlocked (ihInstances ih)) False)
-  jobs ← atomically (takeJobs (ihInstances ih))
-  writeIORef (ihBacklog ih) (toList jobs)
-  drainBacklog
+  -- The jobs pass from the shared inbox to the backlog in one masked step, so a
+  -- cancellation cannot land between and lose a batch: whatever is not yet begun is
+  -- always in one or the other, where the owner's exit finds it.
+  mask_ $ do
+    jobs ← atomically (takeJobs (ihInstances ih))
+    modifyIORef' (ihBacklog ih) (<> toList jobs)
+  mask (\restore → drainBacklog restore)
   cells ← Map.elems <$> readTVarIO (insCells (ihInstances ih))
   forM_ cells (dispatch ih)
   where
-    -- A job leaves the backlog as it begins, and a control request it raised on is
-    -- settled, as no longer applicable, if nothing had settled it.
-    drainBacklog =
+    -- A job leaves the backlog as it begins, with the handler that settles a request
+    -- it raised on already installed, so no cancellation lands between.
+    drainBacklog restore =
       readIORef (ihBacklog ih) >>= \case
         [] → pure ()
         job : rest → do
           writeIORef (ihBacklog ih) rest
-          run job `onException` abandon job
-          drainBacklog
+          restore (run job) `onException` abandon job
+          drainBacklog restore
     run = \case
       JobStart number → withCell ih number (startInstance ih)
       JobDispatch number → withCell ih number $ \cell → do
@@ -280,39 +289,36 @@ serviceInstances ih = do
       JobControl _ _ receipt → atomically (settleReceipt receipt ControlNoLongerApplicable)
       _ → pure ()
 
--- | Service what the application asked, if it asked anything: called as each segment
--- is about to begin, so a request is applied at the next safe boundary and not only
--- when a turn ends. An instance that is now paused or ending is not entered by the
--- segment about to run, which asks the scheduler to pause or stop it instead.
+-- | Service what the application asked, if it asked anything: the action the owner
+-- runs at each of the scheduler's safe boundaries, so a request is applied at the
+-- next one, between segments, and not only when a turn ends.
 servicePending ∷ InstanceHost → IO ()
 servicePending ih = do
   jobs ← readTVarIO (insInbox (ihInstances ih))
-  unless (null jobs) (serviceInstances ih)
+  backlog ← readIORef (ihBacklog ih)
+  unless (null jobs && null backlog) (serviceInstances ih)
 
--- | Ask the scheduler for what was wanted of invocations' tasks and it had no
--- reservation for, in the order it was wanted. One it cannot take waits for the
--- next look; one for a task that is gone, or not yet live, is dropped: the task's
--- own segment asks again when it is chosen.
-flushWanted ∷ InstanceHost → IO ()
-flushWanted ih = do
-  wanted ← readIORef (ihWanted ih)
-  remaining ← forM (Map.toList wanted) $ \(task, requests) → (,) task <$> offer task requests
-  writeIORef (ihWanted ih) (Map.fromList [(task, left) | (task, left) ← remaining, not (null left)])
-  where
-    offer _ [] = pure []
-    offer task (request : rest) = do
-      asked ← atomically (requestControl (scheduler' ih) task request)
-      case asked of
-        ControlAccepted ticket → atomically (forgetControl ticket) >> offer task rest
-        ControlFull → pure (request : rest)
-        _ → pure []
+-- | Pause, resume or stop an invocation's task now. This is the owner's own thread,
+-- at a boundary, so the scheduler applies it at once, with no reservation to wait
+-- for and nothing to ask again.
+ownerOp ∷ InstanceHost → TaskId → ControlRequest → IO ()
+ownerOp ih task request = void (ownerControl (scheduler' ih) (ihHost ih) task request)
 
--- | Ask the scheduler to do this to an invocation's task, after what was asked
--- before.
-forward ∷ InstanceHost → TaskId → ControlRequest → IO ()
-forward ih task request = do
-  modifyIORef' (ihWanted ih) (Map.insertWith (flip (<>)) task [request])
-  flushWanted ih
+-- | Whether an invocation's coroutine exists: its first segment has run.
+hasBegun ∷ InstanceHost → TaskId → IO Bool
+hasBegun ih task = Map.member task <$> readIORef (ihTasks ih)
+
+-- | Take back an invocation whose first segment has not run. It has no coroutine, so
+-- nothing is closed, and the scheduler's task, which may be waiting for an active slot
+-- that other work holds, becomes one that does nothing when it is chosen. The
+-- instance is free of it at once.
+detach ∷ InstanceHost → ICell → TaskId → IO (Maybe Live)
+detach ih cell task = do
+  modifyIORef' (ihLive ih) (Map.adjust (\held → held {liveWithdrawn = True}) task)
+  held ← Map.lookup task <$> readIORef (ihLive ih)
+  atomically (modifyTVar' (icState cell) (\state → state {isActive = Nothing}))
+  pure held
+
 lookupCell ∷ InstanceHost → Word64 → IO (Maybe ICell)
 lookupCell ih number = Map.lookup number <$> readTVarIO (insCells (ihInstances ih))
 
@@ -367,7 +373,6 @@ settleEnded ih = do
       ResultFailed failure → invocationFailed ih cell (liveStage held) (ErrorRefusedWait failure)
       _ → invocationCompleted ih cell (liveStage held)
   reapInvocations ih
-  flushWanted ih
   raiseDeferred ih
 
 -- Starting ----------------------------------------------------------------------------
@@ -437,18 +442,19 @@ dispatch ih cell = do
       then pure Nothing
       else do
         let next = case icKind cell of
-              RunOnce | not (isRunStarted state) → Just (InvokeRun, StageRun, isQueue state)
+              RunOnce | not (isRunStarted state) → Just (InvokeRun, StageRun, isQueue state, Nothing)
               _ → case viewl (isQueue state) of
                 event :< rest →
                   Just
                     ( InvokeEvent (queuedSource event) (WithinBounds [record event])
                     , StageEvent (queuedSource event)
                     , rest
+                    , Just event
                     )
                 EmptyL → Nothing
         case next of
           Nothing → pure Nothing
-          Just (invocation, stage, rest) → do
+          Just (invocation, stage, rest, event) → do
             let spec =
                   TaskSpec
                     { specBehavior = BehaviorId (behavior stage)
@@ -466,10 +472,10 @@ dispatch ih cell = do
                     , isQueue = rest
                     , isRunStarted = isRunStarted state || stage == StageRun
                     }
-                pure (Just (task, stage))
+                pure (Just (task, stage, event))
               _ → Nothing <$ writeTVar (insBlocked (ihInstances ih)) True
-  forM_ started $ \(task, stage) →
-    modifyIORef' (ihLive ih) (Map.insert task (Live (icId cell) stage))
+  forM_ started $ \(task, stage, event) →
+    modifyIORef' (ihLive ih) (Map.insert task (Live (icId cell) stage event False))
   where
     record event =
       VRecord
@@ -485,10 +491,10 @@ dispatch ih cell = do
 
 -- | Run one segment of an instance's invocation, on behalf of the scheduler.
 --
--- An instance that is paused or ending is not entered: the task asks the scheduler
--- to pause or stop it, which it is already about to, and yields. That is how the
--- scheduler's own control is the one that freezes or closes a task that was waiting
--- in its queue when the request was applied.
+-- What the application asked was applied at the boundary before this segment was
+-- chosen, so an instance whose invocation is chosen is the one that may run. A task
+-- the instance took back before it began, or one whose instance has ended, runs
+-- nothing.
 instanceSegment ∷ InstanceHost → TaskRun Cursor → Word64 → Maybe Invocation → IO (SegmentReport Cursor)
 instanceSegment ih run number starting = do
   found ← lookupCell ih number
@@ -496,22 +502,11 @@ instanceSegment ih run number starting = do
   case (found, held) of
     (Just cell, Just live) → do
       settled ← isJust <$> readTVarIO (icResult cell)
-      state ← readTVarIO (icState cell)
-      if settled
+      if settled || liveWithdrawn live
         then pure (ReportCompleted (Finished (Returned [])))
-        else
-          if isStopped state
-            then hold cell RequestStop
-            else
-              if isPhase state == Paused
-                then hold cell RequestPause
-                else mask_ (go cell (liveStage live))
+        else mask_ (go cell (liveStage live))
     _ → pure (ReportCompleted (Finished (Returned [])))
   where
-    cursor = maybe (HostedInvocation number) (PendingInvocation number) starting
-    hold _ request = do
-      forward ih (runTask run) request
-      pure (ReportYielded cursor)
     go cell stage = do
       let slot = VInteger (fromIntegral number)
       outcome ← case starting of
@@ -617,17 +612,19 @@ applyControl ih cell request receipt = do
         then settle (if request == InstanceStop then ControlAlreadyInState else ControlNoLongerApplicable)
         else case (isPhase state, request) of
           (Active, InstancePause) → do
+            -- Pausing runs no application code, so it is done before it is settled: the
+            -- instance is frozen when the request is read as applied.
             atomically (modifyTVar' (icState cell) (\current → current {isPhase = Paused}))
+            forM_ (isActive state) (pauseInvocation ih cell)
             settle ControlApplied
-            forM_ (isActive state) (\task → forward ih task RequestPause)
           (Active, InstanceResume) → settle ControlAlreadyInState
           (Paused, InstancePause) → settle ControlAlreadyInState
           (Paused, InstanceResume) → do
             atomically (modifyTVar' (icState cell) (\current → current {isPhase = Active}))
-            settle ControlApplied
             case isActive state of
-              Just task → forward ih task RequestResume
+              Just task → ownerOp ih task RequestResume
               Nothing → dispatch ih cell
+            settle ControlApplied
           (_, InstanceStop) → do
             -- Settled as it begins, before anything that can raise: a host failure in
             -- the hook that follows cannot leave the request unsettled.
@@ -657,15 +654,46 @@ continueStop ∷ InstanceHost → ICell → IO ()
 continueStop ih cell = do
   state ← readTVarIO (icState cell)
   case isActive state of
-    Just task → forward ih task RequestStop
     Nothing → finishEnding ih cell 0 False
+    Just task → do
+      started ← hasBegun ih task
+      if started
+        then do
+          -- Its coroutine is closed on this thread and the instance ended after it, as
+          -- the scheduler's own stop does; if the scheduler finds nothing to close, the
+          -- ending finishes here.
+          ownerOp ih task RequestStop
+          settled ← isJust <$> readTVarIO (icResult cell)
+          unless settled (finishEnding ih cell 0 False)
+        else do
+          -- It has not run a segment: nothing to close. It is an unstarted invocation
+          -- discarded, and the instance ends without waiting for the scheduler to
+          -- choose a task that may be queued behind work that never ends.
+          _ ← detach ih cell task
+          modifyIORef' (ihEndings ih) (Map.adjust (\ending → ending {endUnstarted = endUnstarted ending + 1}) (icId cell))
+          finishEnding ih cell 0 False
+
+-- | Freeze the invocation in flight: a suspended one is paused in the scheduler; one
+-- that has not run a segment is taken back, with its event, to be started on resume.
+pauseInvocation ∷ InstanceHost → ICell → TaskId → IO ()
+pauseInvocation ih cell task = do
+  started ← hasBegun ih task
+  if started
+    then ownerOp ih task RequestPause
+    else do
+      held ← detach ih cell task
+      forM_ held $ \live → atomically . modifyTVar' (icState cell) $ \state →
+        state
+          { isQueue = maybe (isQueue state) (<| isQueue state) (liveEvent live)
+          , isRunStarted = isRunStarted state && liveStage live /= StageRun
+          }
 
 -- | Record how an instance is ending, once, and close what it accepts.
 beginEnding' ∷ InstanceHost → ICell → EndReason → Maybe Primary → IO ()
 beginEnding' ih cell reason primary = do
   (connections, unstarted, already) ← atomically (beginEnding cell)
   unless already $
-    modifyIORef' (ihEndings ih) (Map.insert (icId cell) (Ending reason primary connections unstarted))
+    modifyIORef' (ihEndings ih) (Map.insert (icId cell) (Ending reason primary connections unstarted 0))
 
 -- | Raise what the application decided to escalate while a coroutine was being
 -- closed, now that nothing is.
@@ -682,7 +710,8 @@ finishEnding ∷ InstanceHost → ICell → Int → Bool → IO ()
 finishEnding ih cell closed closing = do
   settled ← isJust <$> readTVarIO (icResult cell)
   unless settled $ do
-    ending ← Map.findWithDefault (Ending EndStopped Nothing 0 0) (icId cell) <$> readIORef (ihEndings ih)
+    modifyIORef' (ihEndings ih) (Map.adjust (\held → held {endClosed = max (endClosed held) closed}) (icId cell))
+    ending ← Map.findWithDefault (Ending EndStopped Nothing 0 0 closed) (icId cell) <$> readIORef (ihEndings ih)
     state ← readTVarIO (icState cell)
     mode ← readIORef (ihMode ih)
     handles ← readIORef (ihHandles ih)
@@ -757,7 +786,7 @@ finishEnding ih cell closed closing = do
             , resultModule = icModule cell
             , resultPhase = terminal
             , resultOutcome = outcome
-            , resultTermination = Termination (endConnections ending) (endUnstarted ending) closed disposition
+            , resultTermination = Termination (endConnections ending) (endUnstarted ending) (endClosed ending) disposition
             }
     won ← atomically (settleInstance (ihInstances ih) cell settlement)
     modifyIORef' (ihEndings ih) (Map.delete (icId cell))
@@ -799,7 +828,7 @@ retireInstances ih = do
   -- the application's escalation) is kept for the owner's outcome and does not leave
   -- another unended, and none is left unsettled whatever was raised.
   failures ← forM cells $ \cell → do
-    ended ← try @SomeException $ do
+    ended ← tryWithContext @SomeException $ do
       settled ← isJust <$> readTVarIO (icResult cell)
       -- The way it ends, in order or as discarded, is the owner's exit mode, which
       -- 'finishEnding' reads.
@@ -809,8 +838,12 @@ retireInstances ih = do
       Right () → pure []
   pending ← readIORef (ihDeferred ih)
   writeIORef (ihDeferred ih) []
+  -- The first failure is the one raised; every other is cleanup evidence, whole, so
+  -- supervision receives each of them and none is chosen over the rest.
   case (concat failures, pending) of
-    (failure : _, _) → throwIO failure
+    (failure : others, _) → do
+      modifyIORef' (ihExtra ih) (<> [("lua instance end", other) | other ← others])
+      rethrowIO failure
     ([], failed : _) → throwIO (InstanceEscalated failed)
     _ → pure ()
 
@@ -819,7 +852,10 @@ retireInstances ih = do
 discardUnsettled ∷ InstanceHost → ICell → IO ()
 discardUnsettled ih cell = do
   state ← readTVarIO (icState cell)
-  let settlement =
+  -- What the ending had done before it raised is kept as it was counted.
+  ending ← Map.lookup (icId cell) <$> readIORef (ihEndings ih)
+  let counted = maybe (Termination 0 0 0 ShutdownRaised) (\held → Termination (endConnections held) (endUnstarted held) (endClosed held) ShutdownRaised) ending
+      settlement =
         InstanceSettlement
           { resultInstance = InstanceId (controlOwner (ihControl ih)) (icId cell)
           , resultOwner = controlLabel (ihControl ih)
@@ -827,6 +863,6 @@ discardUnsettled ih cell = do
           , resultModule = icModule cell
           , resultPhase = Stopped
           , resultOutcome = InstanceDiscarded (Discard ExitFailed (if isInitialized state then Started else NotStarted))
-          , resultTermination = Termination 0 0 0 ShutdownSkippedUnsafe
+          , resultTermination = counted
           }
   void (atomically (settleInstance (ihInstances ih) cell settlement))
