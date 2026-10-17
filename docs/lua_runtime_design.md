@@ -8,8 +8,9 @@ failure evidence, and lifetime. This is the canonical continuation of
 
 Design state: `ready for issue processing`
 
-Current readiness scope: **LUA-6 only** (D-28). Other unchecked slices retain
-their explicit deferrals; this state does not release the confinement gate.
+Current readiness scope: **LUA-6 only** (D-28), which now spans LUA-20, LUA-21
+and LUA-6 (D-29). Other unchecked slices retain their explicit deferrals; this
+state does not release the confinement gate.
 
 Owner: `coghex/hetoimasia`. Epic #145 and children #146–#149 have been
 created; those children are merged. The owner accepted the two-domain direction,
@@ -126,6 +127,8 @@ concrete precondition
 - [x] LUA-3. Add application-owned modules and bounded value bindings — [#462]
 - [x] LUA-4. Model bounded script tasks and execution protocols — [#149]
 - [x] LUA-5. Integrate trusted VM owners with runtime supervision — [#464]
+- [ ] LUA-20. Run Lua task coroutines on their VM owner
+- [ ] LUA-21. Add scheduling policies, service quanta, logical time and an owned timer for Lua tasks
 - [ ] LUA-6. Schedule cooperative tasks with bounded service turns
 - [ ] LUA-18. Own script instances, hooks and lifecycle controls — [deferred]: contract accepted; renew slice readiness
 - [ ] LUA-7. Add bounded asynchronous requests and owned subscriptions — [deferred]: owner renews trusted-path readiness for this slice
@@ -723,6 +726,27 @@ or merge. Canonical reviewers may require in-scope spec corrections; new product
 choices return to the owner. LUA-18/LUA-7/LUA-19/LUA-8 readiness and Q-5's
 confined branch remain separately gated. Handoff request:
 `user-het-lua6-process-20261017-0544`.
+
+### D-29. Split LUA-6 into three ordered slices
+
+Owner grant, 2026-10-17T05:47Z, in the manager pane for request
+`user-het-lua6-process-20261017-0544`: "it doesnt have to be one issue, if you
+think it warrants an epic, that is fine, i approve." Under that grant and D-25's
+delegated organization, the hetoimasia manager decided to deliver LUA-6 as three
+ordered slices rather than one issue, with no tracking sub-epic: each is a child
+of epic #145 with its own ledger cursor. Grounds: LUA-5 (PR #465, +3.3k lines)
+used all five review rounds and LUA-3 (PR #463, +7.5k lines) needed seven, while
+LUA-6 spans three separate review surfaces: coroutine execution across the
+foreign-call boundary, the scheduling contract, and supervision integration.
+
+- LUA-20 runs task coroutines on their VM owner, in the host and bridge.
+- LUA-21 delivers the reusable scheduling machinery, independent of LUA-20.
+- LUA-6 keeps its ID and title and integrates both on supervised owners.
+
+LUA-20 and LUA-21 are carved out of LUA-6 with no added scope, so D-28's LUA-6
+readiness covers LUA-20, LUA-21 and LUA-6. LUA-18, LUA-7, LUA-19 and LUA-8
+readiness and Q-5's confined branch stay separately gated. This decision files
+no tracker item.
 
 ## Design
 
@@ -2099,31 +2123,120 @@ and verified policy, with adversarial regression coverage.
     is decided when LUA-6 is renewed.
 - **Open questions:** None.
 
+### LUA-20. Run Lua task coroutines on their VM owner
+
+> Ready for issue processing under D-28 and D-29: carved out of LUA-6 with no
+> added scope.
+
+- **Outcome:** a VM owner runs a module entry point as a protected Lua coroutine
+  on its own thread, resumes it across explicit yields and waits, and closes it
+  safely, with faults and cancellation transported as for finite calls.
+- **Scope:** owner-thread start, resume and close of a task coroutine answering
+  completed, yielded or waiting; error, value-refusal, memory-exhaustion,
+  cancellation and binding-failure transport matching `callEntry`; yields that
+  never `longjmp` through a Haskell frame; idempotent close that runs pending
+  to-be-closed variables and retains their errors; handles usable only on the
+  owner's thread and never a `Value`; unchanged stack and registry discipline;
+  policy-granted yield and wait operations refused as typed call faults wherever
+  they cannot reach the scheduler (finite calls, initial chunks and module loads,
+  finalizers, another VM, script-created coroutines); the standard `coroutine`
+  library made selectable with existing library sets unchanged. Host and bridge
+  only; the host library gains no runtime dependency.
+- **Phase:** execution policy.
+- **Depends on:** LUA-2, LUA-3 (delivered).
+- **Ordering:** critical path; can land first; independent of LUA-21; precedes
+  LUA-6.
+- **Relevant decisions:** D-12, D-13, D-22, D-28, D-29.
+- **Acceptance signals:** start, yield, resume and complete; typed faults during
+  resumed segments; a binding's Haskell failure re-raised unconverted; close runs
+  to-be-closed variables and reports their errors; double close is harmless and
+  resuming a closed or completed coroutine is refused; foreign-thread use is
+  refused; stack and registry stay unchanged across repeated cycles and
+  failures; a scheduler yield is refused with a typed fault from every context
+  that cannot reach the scheduler; `coroutine` is selectable while coroutines
+  stay refused as values.
+- **Out of scope:** scheduling policy, classes, time, timers, control and
+  diagnostics (LUA-21); scheduled owners, settlement and owner stop (LUA-6);
+  instance hooks (LUA-18); providers (LUA-7).
+- **Open questions:** None.
+
+### LUA-21. Add scheduling policies, service quanta, logical time and an owned timer for Lua tasks
+
+> Ready for issue processing under D-28 and D-29: carved out of LUA-6 with no
+> added scope.
+
+- **Outcome:** reusable machinery chooses the next ready task under a per-owner
+  policy with bounded service classes, tracks application-granted logical time
+  and monotonic deadlines through one owned timer, applies control at safe
+  boundaries and reports aggregate diagnostics, testable without a VM.
+- **Scope:** a policy fixed at owner creation with the FIFO default and an
+  extension interface whose choices are checked and cannot starve control, stop
+  or any live class; control/events, ordinary and background classes with
+  validated finite quanta per turn and yield-to-tail `Ordinal` order; looped and
+  one-shot admission kinds visible to the policy; application-granted logical
+  ticks with bounded outstanding grants, deterministic logical wake order and
+  observable tick completion; elapsed waits on TIME-1's monotonic source; one
+  owned, cancellable, STM-composable timer registration per owner with
+  injected-clock tests; elapsed service budgets that end a turn without
+  preemption or reordering, with attributed overruns; nonblocking, bounded
+  pause/resume/stop requests by task identity applied at safe boundaries with
+  request and application results; bounded aggregate counters. Lives in
+  `runtime-lua`; Lua lifecycle-operation bindings stay "not yet supported".
+- **Phase:** execution policy.
+- **Depends on:** LUA-5; external TIME-1 (Q-4).
+- **Ordering:** critical path; independent of LUA-20; precedes LUA-6.
+- **Relevant decisions:** D-3, D-16, D-17, D-18, D-19, D-20, D-23, D-28, D-29.
+- **Acceptance signals:** peers get bounded opportunities at safe yields; a
+  starving test policy cannot block control, stop or another live class;
+  one-shot placement belongs to the policy; logical time advances only on
+  explicit grants; elapsed waits wake exactly at injected deadlines; one timer
+  per owner, cancelled at stop; expired budgets never preempt or reorder and
+  cannot be sold as a hard limit; control answers and safe-boundary rules hold
+  without resurrecting a terminal task or reaching one through a stale
+  identity; counters match a scripted workload. Tests use injected clocks and
+  fake wakes, not sleeps.
+- **Out of scope:** coroutine execution (LUA-20); scheduled owners, settlement,
+  owner stop and the real-VM determinism proof (LUA-6); further built-in
+  policies or changing a policy while an owner runs; instance hooks, Lua
+  controls and deterministic logical control admission (LUA-18).
+- **Open questions:** None.
+
 ### LUA-6. Schedule cooperative tasks with bounded service turns
 
 > Ready for issue processing under D-28. LUA-5 and TIME-1 are delivered and the
-> concrete contract is accepted (D-26/D-27). The owner requests manager-led
+> concrete contract is accepted (D-26/D-27). D-29 carves LUA-20 and LUA-21 out of
+> this slice, which now integrates them. The owner requests manager-led
 > processing and canonical issue approval, with endpoint approved issue.
 
 - **Outcome:** one trusted VM owner services resumable tasks fairly, wakes for
   events/deadlines, and reports real budget overruns without fake preemption.
-- **Scope:** P-5/P-6 ready classes, finite quanta, coroutine/explicit-segment
-  integration, owned cancellable timer adapter, injected-clock tests, and P-11
-  aggregate scheduling diagnostics. Keep existing task/disposition contracts
-  and reusable scheduling machinery independent of process transport. Include
-  policy selection/extension and bounded safe-boundary control transitions;
-  LUA-18 owns author-facing instance hooks and inspection/control bindings.
+- **Scope:** opt-in scheduled owners in `runtime-lua` composing LUA-20's
+  coroutine execution with LUA-21's machinery under supervision: creation and
+  readiness as for LUA-5, whose finite-call API stays unchanged; task identities
+  unique within the runtime and never reissued; bounded nonblocking admission
+  with reserved results and exactly-once settlement, script faults returned as
+  data; idle owners that do not spin; protected owner stop that closes suspended
+  coroutines; host failures under the owner's `WorkerPolicy`; the deterministic
+  ordering proof; end-to-end runs of LUA-21's policy, class, time, budget and
+  control behavior with real VMs; package documentation. Keep existing
+  task/disposition contracts and reusable scheduling machinery independent of
+  process transport. LUA-18 owns author-facing instance hooks and
+  inspection/control bindings.
 - **Phase:** execution policy.
-- **Depends on:** LUA-5; external TIME-1 (Q-4).
-- **Ordering:** critical path; precedes LUA-18, then LUA-7.
-- **Relevant decisions:** D-1, D-3, D-4, D-12, D-13, D-16, D-17, D-18, D-19, D-20, D-21, D-22, D-23, D-24, D-25, D-26, D-27.
-- **Acceptance signals:** peers get bounded opportunities at safe yields;
-  paused/event-only work does not spin; stop wakes waits; logical time advances
-  only on explicit completion; elapsed budget cannot be sold as a hard limit.
-  For identical logical inputs and configuration, real delays cannot change
-  gameplay update durations, required work or committed effect order (D-23).
+- **Depends on:** LUA-20, LUA-21; through them LUA-5 and external TIME-1 (Q-4).
+- **Ordering:** critical path; after LUA-20 and LUA-21; precedes LUA-18, then LUA-7.
+- **Relevant decisions:** D-1, D-3, D-4, D-12, D-13, D-16, D-17, D-18, D-19, D-20, D-21, D-22, D-23, D-24, D-25, D-26, D-27, D-28, D-29.
+- **Acceptance signals:** with real VMs, peers get bounded opportunities at safe
+  yields; paused/event-only work does not spin; stop wakes waits; logical time
+  advances only on explicit completion; elapsed budget cannot be sold as a hard
+  limit; every accepted task settles exactly once; LUA-5's finite-call examples
+  pass unchanged. For identical logical inputs and configuration, real delays
+  cannot change gameplay update durations, required work or committed effect
+  order (D-23).
 - **Out of scope:** automatic code rewriting, arbitrary priority API, simulation
-  coordinator, CPU affinity/niceness tuning, performance pass/fail thresholds.
+  coordinator, CPU affinity/niceness tuning, performance pass/fail thresholds;
+  coroutine execution (LUA-20) and scheduling machinery (LUA-21) beyond their
+  integration.
 - **Open questions:** None; Q-17 is resolved by D-26/D-27 and D-28 renews readiness.
   Q-16 is resolved by D-23: deterministic simulation is required.
   Q-10's compatibility and Q-11's API/example direction are accepted by D-20;
