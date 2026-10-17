@@ -900,6 +900,36 @@ the invocation yields (no acquisition in the non-suspending `init` or
 no behavior beyond making LUA-22's accepted behavior implementable. This
 decision files no tracker item.
 
+### D-33. Due points passed during an active logical update are no-ops
+
+Owner answer, 2026-10-17, in the hetoimasia manager pane, to the LUA-24 drafter's
+question about a logical update falling due while the instance's previous
+update is still active (suspended on its own logical wait for longer than its
+interval): "since the simulation cant tick unless all the updates are done
+(right?) then a wait(5) should act the same as 5 ticks worth of noops, hanging
+the simulation until the work is done."
+
+A waiting update has finished its work for each tick it waits through, so ticks
+keep advancing (otherwise its own wait could never end) and each one is a no-op
+for that instance. The rule LUA-24 implements:
+
+- Cadence points stay on the instance's fixed phase. A point that passes while
+  the instance's update is active adds no invocation: there is no catch-up and
+  no queued backlog.
+- The next update is due at the first cadence point after the active update
+  finishes.
+- Its `dt` is the logical duration granted since the previous update finished
+  (since successful `init` for the first update). The waiting update itself was
+  told the duration of its own wait when it resumed, so every granted tick is
+  accounted to the instance exactly once.
+
+This is the elapsed (UI) rule's "no catch-up burst" applied to logical time. It
+is deterministic, because only the script's own logical waits can cause it.
+
+Owner's future idea, recorded and not scheduled: intercept a script's wait in
+Haskell and keep wait counters in an engine data system that mimics what the
+author expects. It needs its own design and issue.
+
 ## Design
 
 P-1 through P-13 record the accepted contracts, with proof and delivery gates
@@ -2537,7 +2567,8 @@ and verified policy, with adversarial regression coverage.
   intervals as positive integer ticks, a convenience duration converted exactly
   with the application's configured positive tick duration or refused, the first
   update due one interval after successful `init`, and the granted `dt` fixed at
-  the invocation's start and kept across waits and real delays; elapsed intervals
+  the invocation's start and kept across waits and real delays, and cadence
+  points passed during an active update are no-ops (D-33); elapsed intervals
   on the monotonic source with at most one unstarted refresh, obsolete demand
   coalesced without dropping queued events, `dt` the elapsed time between update
   starts (from successful `init`, rebased at resume) and lateness moving the
@@ -2550,7 +2581,7 @@ and verified policy, with adversarial regression coverage.
 - **Phase:** script authoring and lifetime.
 - **Depends on:** LUA-18.
 - **Ordering:** after LUA-18; independent of LUA-22 and LUA-23; precedes LUA-19.
-- **Relevant decisions:** D-15, D-21, D-22, D-23, D-26, D-31.
+- **Relevant decisions:** D-15, D-21, D-22, D-23, D-26, D-31, D-33.
 - **Acceptance signals:** exact tick conversion or refusal; the first update one
   interval after `init`; the granted `dt` kept across a wait; UI coalescing with
   no catch-up burst and elapsed `dt` rebased at resume; no periodic demand during
@@ -2561,8 +2592,8 @@ and verified policy, with adversarial regression coverage.
 - **Out of scope:** frame-driven presentation updates, a gameplay simulation
   driver, the application's clock pause or speed policy, changing an instance's
   interval while it runs.
-- **Open questions:** None; the contract's "Cadence and control defaults" fix
-  the behavior.
+- **Open questions:** None; the contract's "Cadence and control defaults" and
+  D-33 fix the behavior.
 
 ### LUA-25. Lend a resource collection's ownership to synchronous Lua callbacks
 
@@ -2878,6 +2909,9 @@ Resolve Q-5's deployment obstacles and record both successful platform verdicts
 before drafting LUA-9 through LUA-13 or LUA-16/LUA-17. Neither trusted delivery
 nor completed feasibility issues discharge that gate. Required untrusted-mod
 isolation remains part of epic completion; D-6 through D-9 still apply.
+
+An engine-side wait counter that intercepts a script's wait (D-33's recorded
+future idea) needs its own design.
 
 Further arcs require their own evidence and scope: a sharded authoritative
 simulation; durable saves/hot reload; broader mod permissions/distribution;
