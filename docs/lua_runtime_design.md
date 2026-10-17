@@ -85,7 +85,7 @@ LUA-5 is now delivered by #464 / PR #465, merged as `29211202`, and TIME-1/#133
 is delivered. The current exploration is limited to LUA-6; it does not revoke
 the prior slices' approvals or renew LUA-7/LUA-8 or the confined branch.
 Q-9 through Q-14 below record remaining questions and proposals. D-16 through
-D-20 record the owner's lifecycle, identity and per-owner scheduler direction. LUA-6 remains
+D-21 record the owner's lifecycle, identity, per-owner scheduler and instance direction. LUA-6 remains
 deferred until those choices, their dependent contract reconciliation and an
 explicit readiness signoff are complete. No new tracker item is authorized by
 this design discussion.
@@ -544,12 +544,30 @@ continue to apply to both kinds.
 
 The owner approved developing the inspection/control API and a runnable entry
 point now. They proposed command-line options selecting a VM, its scheduler and
-a Lua source path, with headless or windowed use and a specified VM group.
-Exact syntax, VM-group semantics, looping and unload behavior remain Q-13/Q-14;
+a Lua source path, with headless or windowed use. D-21 corrects the original
+"group" wording: it meant instances inside one VM, not groups of VMs.
+Exact syntax and lifecycle behavior remain Q-13/Q-14;
 this direction does not silently authorize a game terminal UI or change the
 module lifetime contract. One-shot means one execution to completion, not
 necessarily one unyielding segment: that execution distinction is to be made
 explicit when resolving Q-13.
+
+### D-21. Instance removal and no VM-group abstraction
+
+Owner clarification, 2026-10-17: removing a running instance removes that
+instance, not other instances using its module or the containing VM. The owner
+asked us to distinguish verified sharing behavior from a proposed design;
+Q-13 records that evidence and the remaining state-ownership proposal.
+
+"Group" meant the collection of script instances inside a single VM. Do not
+add VM groups or a group CLI flag. The expected production composition is a
+gameplay VM and a UI VM; this is an application arrangement, not a hard-coded
+two-owner limit. Possible future VM grouping is not current scope.
+
+The owner requires initialization, repeated updates and shutdown behavior,
+alongside Lua-authored callbacks connected to engine events, and explicitly
+asked to design that authoring contract before proceeding with LUA-6 readiness.
+The recommendation in Q-13 is not yet an accepted API or delivery expansion.
 
 ## Design
 
@@ -1453,27 +1471,79 @@ names are not additional product decisions.
 
 ### Q-13. Loaded script instances, repetition and unloading
 
-**Open following D-20.** Clarify what a looped script does when an entry returns:
-an explicit loop/coroutine that yields and ultimately completes, or a function
-the engine invokes again on subsequent turns until stopped. The latter needs a
-defined per-turn invocation and continuation/state contract; silently replaying
-a completed one-shot is never acceptable. A one-shot may still yield or wait
-before completing, if the owner accepts that meaning.
+**Partially resolved by D-21; authoring proposal open.** The owner wants
+`init`, `update` and `shutdown` behavior plus engine-event callbacks, and asked
+whether this is the right authoring model after inspecting Synarchy. Instance
+removal is accepted; module eviction and instance-state construction are not
+implemented or implicitly approved.
 
-Also distinguish unloading a task instance (stop it at a safe boundary and
-release its task-owned state) from unloading module code and shared globals
-from the VM. The existing module API loads bounded modules and retains their
-references for the owner lifetime; it exposes no module unload. Other tasks
-can share module state. Do not claim stopping one task removes that shared
-state or rolls back effects. Decide the intended scope before implementing
-dynamic loading, unload or a new source/module lifetime.
+Verified source evidence, 2026-10-17:
 
-### Q-14. Command-line runner and VM groups
+- Synarchy's `src/Engine/Scripting/Lua/API/Core.hs` loads a module, calls
+  `init`, deduplicates loads by path, and calls `shutdown` and unrefs the script
+  on `killScript`. Its `Thread/Scheduler.hs:runDueScripts` calls due `update`
+  functions; interval zero supports event-only scripts.
+- Synarchy's `Util.hs:broadcastToModulesReportingErrors` scans loaded scripts
+  for named callbacks. `Thread/Dispatch.hs` uses this for engine events and
+  named UI callbacks. `scripts/autosave.lua` deliberately caches its singleton
+  table in `package.loaded`; dropping a script reference does not clear that
+  table. This is not evidence of multiple independently stateful instances of
+  the same script: the current loader deduplicates by path.
+- Hetoimasia's `packages/scripting-lua/README.md` (Modules and entry points),
+  `bridge/Hetoimasia/Scripting/Lua/Internal/Module.hs` and
+  `bridge/cbits/hetoimasia_lua_values.c` establish one retained environment per
+  loaded module. Calls to that module can share its globals and closure state;
+  different modules have separate environments. There is no public unload or
+  independently owned script-instance state API yet. The earlier suggestion
+  of evicting a module when its last instance disappears was a proposal, not a
+  verified reference-counting facility. Different VMs do not share Lua tables.
+
+**Recommendation, not a decision:** keep named lifecycle hooks and add explicit
+instance-owned state and event subscriptions. A module supplies reusable code;
+each admitted instance gets its own TID and fresh `self` state. Initialize once,
+invoke optional `update` when due, and invoke `shutdown` during orderly removal.
+An instance without `update` can remain alive for events without polling.
+One-shots execute a separate `run` entry to completion rather than being
+silently restarted. Coroutines remain useful for yielding sequences, without
+requiring authors to implement every ordinary update loop themselves.
+
+Connect Lua function values to explicitly granted event sources, with each
+connection owned by the instance. Avoid broadcasting a function-name string
+across every loaded module to locate a targeted callback. Route delivery
+through the owning VM's bounded scheduling machinery; never enter Lua directly
+from an arbitrary producer thread. No per-handler Haskell glue is required
+once the event source is exposed. Serialize callbacks and lifecycle hooks for
+one instance, and revoke its subscriptions on removal. Runtime-owned cleanup
+must still happen if a Lua shutdown hook faults. An instance's state is distinct
+from intentionally shared module state; a fresh `self` table does not isolate
+mutable module globals or captured upvalues.
+
+Cadence and scheduling are separate: application time/ticks make an update
+eligible; the selected VM scheduler orders ready work. A scheduler round is
+not itself a gameplay timestep. Gameplay and UI may supply different cadences.
+The authoring API must use narrow granted services, not a universal engine
+environment or service locator. Returned hook tables versus declared entry
+exports, concrete signatures, yield rules, init failure/shutdown ordering,
+pause/event retention and missed-update policy still need a precise contract.
+
+Professional precedent supports retaining the hook model: [Defold's script
+contract](https://defold.com/manuals/script/) combines instance `self`, lifecycle
+hooks and event handlers; [Godot's signals](https://docs.godotengine.org/en/stable/getting_started/step_by_step/signals.html)
+connect functions explicitly to event sources. These are references for the
+proposal, not authority for project decisions.
+
+This authoring proposal affects LUA-6 lifecycle/scheduling and LUA-7's owned
+subscription interface. Settle the authoring direction first, then reconcile
+delivery boundaries without silently pulling all LUA-7 functionality into
+LUA-6 or renewing that slice.
+
+### Q-14. Command-line runner
 
 **Open; owner proposal, 2026-10-17.** The owner suggested a command-line runner
 selecting a VM, scheduler and script, for example
 `--luavm test --luavm-scheduler fifo --lua ./testscript.lua`, usable headlessly
-or with a window and selecting a VM group.
+or with a window. D-21 resolves the grouping ambiguity: multiple instances
+belong to a VM, with no additional VM-group abstraction.
 
 Verified current entry point at `29211202`: `app/Main.hs` accepts only the
 console smoke/resource-smoke/help paths. It has no Lua runner, VM group
@@ -1481,15 +1551,12 @@ configuration or windowed application launch. Existing `LuaRuntime` scopes
 owners within a supervision boundary; it is not a named VM-group API.
 
 Proposed clearer CLI shape, not yet selected:
-`hetoimasia lua --group game --vm test --scheduler fifo --script ./testscript.lua --headless`.
-A `lua` subcommand scopes its flags; VM and group get separate names; scheduler
+`hetoimasia lua --vm test --scheduler fifo --script ./testscript.lua --headless`.
+A `lua` subcommand scopes its flags; scheduler
 selection belongs to the VM and file loading belongs to task admission. Useful
 defaults can shorten the common case once those semantics are settled.
 
-Clarify what the group means: an organizational label for several independent
-VMs, or a separately owned group with shared start/stop/control and specified
-failure behavior. It must not accidentally become a cross-VM scheduler or
-expand a supervision failure boundary. Also settle whether LUA-6 supplies only
+After the lifecycle authoring discussion, settle whether LUA-6 supplies only
 the headless runner/API proof or adds actual windowed composition now; using
 the same library API from a future windowed application is a separate claim
 from delivering that application. No command-line surface has been selected.
@@ -1813,7 +1880,7 @@ and verified policy, with adversarial regression coverage.
 - **Phase:** execution policy.
 - **Depends on:** LUA-5; external TIME-1 (Q-4).
 - **Ordering:** critical path; can run alongside LUA-7 with disjoint modules.
-- **Relevant decisions:** D-1, D-3, D-4, D-12, D-13, D-16, D-17, D-18, D-19, D-20.
+- **Relevant decisions:** D-1, D-3, D-4, D-12, D-13, D-16, D-17, D-18, D-19, D-20, D-21.
 - **Acceptance signals:** peers get bounded opportunities at safe yields;
   paused/event-only work does not spin; stop wakes waits; logical time advances
   only on explicit completion; elapsed budget cannot be sold as a hard limit.
