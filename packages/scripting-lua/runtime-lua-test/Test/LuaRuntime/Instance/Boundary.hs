@@ -5,16 +5,19 @@ module Test.LuaRuntime.Instance.Boundary (spec) where
 
 import Control.Exception (ExceptionWithContext (ExceptionWithContext))
 import Control.Monad (forM, forM_, void)
-import Data.IORef (modifyIORef', newIORef, readIORef)
+import Control.Concurrent.STM (atomically)
+import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Hetoimasia.Foundation.Resource (cleanupFailureException, cleanupFailureLabel, cleanupFailuresInContext)
 import Hetoimasia.Scripting.Lua.Instance
+import Hetoimasia.Runtime.Supervision (WorkerStatus (WorkerUnavailable))
 import Hetoimasia.Scripting.Lua.Runtime (Discard (Discard), ExitKind (ExitFailed), Progress (Started))
 import Hetoimasia.Scripting.Lua.Scheduled
 import Hetoimasia.Scripting.Lua.Value (Value (VText))
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Scheduled.Support
-  ( awaitDiagnostics
+  ( SFixture (sfObserver)
+  , awaitDiagnostics
   , cancelQueued
   , awaitEffect
   , awaitEntered
@@ -23,7 +26,7 @@ import Test.LuaRuntime.Scheduled.Support
   , releaseGate
   , request
   )
-import Test.LuaRuntime.Support (bounded, brokenIs, expectFatal, requiredPolicy, withBoundary)
+import Test.LuaRuntime.Support (bounded, brokenIs, expectFatal, optionalPolicy, requiredPolicy, withBoundary)
 
 stopped ∷ InstanceOutcome → Bool
 stopped = \case InstanceStopped → True; _ → False
@@ -100,9 +103,9 @@ spec = describe "the boundaries of service" $ do
     -- And what it had done by then, the coroutine it closed included, is counted.
     fmap (terminationClosed . resultTermination) a `shouldBe` Just 1
 
-  it "keeps what closing a coroutine raised when ending its instance raises a failure of the host as well" $ bounded $ do
+  it "keeps what closing a coroutine raised beside the failure of the host that ending its instance raised, and takes neither for the other" $ bounded $ do
     fixture ← newIFixture
-    ExceptionWithContext context _ ← expectFatal $ \control runtime → do
+    ExceptionWithContext context raised ← expectFatal $ \control runtime → do
       owner ← startInstances fixture runtime "both" [badCloseHostShutdown] (testConfig instanceBounds') requiredPolicy
       _ ← admit fixture owner "a" (moduleNamed "badclosehostshutdown")
       awaitPhase fixture owner "a" Active
@@ -110,10 +113,24 @@ spec = describe "the boundaries of service" $ do
       awaitDiagnosticsWaiting owner
       _ ← settleControl fixture owner "a" InstanceStop
       awaitScheduledTerminal control owner
-    -- Supervision receives the closing handler's failure, which was not lost to the
-    -- failure the shutdown raised, and the failure of the host beside it.
-    let labels = map cleanupFailureLabel (cleanupFailuresInContext context)
-    length labels `shouldSatisfy` (>= 2)
+    -- The failure of the host, raised by the shutdown, is the owner's own, as it is
+    -- for an instance with nothing to close; the closing handler's failure is cleanup
+    -- evidence beside it, which the failure of the host did not take with it.
+    raised `shouldSatisfy` brokenIs "boom"
+    map cleanupFailureLabel (cleanupFailuresInContext context) `shouldSatisfy` (not . null)
+
+  it "leaves an optional owner unavailable, not fatal, when a shutdown raises a failure of the host that its policy recognizes, as for an instance with nothing to close" $ bounded $ do
+    fixture ← newIFixture
+    withBoundary $ \control runtime → do
+      owner ← startInstances fixture runtime "recognized" [waitHostShutdown] (testConfig instanceBounds') (optionalPolicy (brokenIs "boom"))
+      _ ← admit fixture owner "a" (moduleNamed "waithostshutdown")
+      awaitPhase fixture owner "a" Active
+      expectDelivered fixture owner "a" 1
+      awaitDiagnosticsWaiting owner
+      _ ← settleControl fixture owner "a" InstanceStop
+      -- Raised from the owner's own code, not from inside the coroutine's close, so it
+      -- is not taken for a failure of the close, which no policy can recognize.
+      awaitScheduledTerminal control owner >>= (`shouldSatisfy` \case WorkerUnavailable _ → True; _ → False)
 
   it "applies a request at the next segment boundary, not only when a turn ends: a callback released at a gate does not run on after a stop" $ bounded $ do
     fixture ← newIFixture
@@ -285,6 +302,151 @@ spec = describe "the boundaries of service" $ do
     settled ← tickOf fixture "a" >>= pollInstance
     fmap (resultTermination) settled
       `shouldBe` Just (Termination {terminationConnections = 1, terminationUnstarted = 2, terminationClosed = 0, terminationShutdown = ShutdownRaised})
+
+  it "ends an instance only by the task that is its invocation in flight: a task it took back, closed first, ends nothing" $ bounded $ do
+    fixture ← newIFixture
+    withBoundary $ \_ runtime → do
+      -- Run the newest ready task first, so a task the instance took back stays behind
+      -- its replacement and the scheduler closes it first, by identity, at retirement.
+      let spec' = (instanceSpec fixture "ghost" [closingGated, holder] (testConfig instanceBounds') requiredPolicy defaultSchedulerBounds) {scheduledPolicy = newestFirst}
+      owner ← startWith fixture runtime spec'
+      _ ← admit fixture owner "a" (moduleNamed "closinggated")
+      awaitPhase fixture owner "a" Active
+      holdOwner fixture owner
+      -- Admitted, taken back by a pause and admitted again by a resume, before any
+      -- segment of it ran: a ghost task and its replacement.
+      expectDelivered fixture owner "a" 1
+      pause ← expectControl fixture owner "a" InstancePause
+      resume ← expectControl fixture owner "a" InstanceResume
+      releaseOwner fixture
+      forM_ [pause, resume] waitInstanceControl
+      awaitEntered (sf fixture) "cb"
+      -- The replacement is inside its first segment, at a gate, when the owner retires.
+      retireScheduled owner
+      releaseGate (sf fixture) "cb"
+      settled ← awaitSettled fixture "a"
+      resultOutcome settled `shouldSatisfy` stopped
+      terminationClosed (resultTermination settled) `shouldBe` 1
+      -- Its coroutine was closed, once, before the hook, which ran once.
+      logged fixture >>= (`shouldBe` ["closed 1", "shutdown 1 stopped"])
+
+  it "begins nothing more once the owner is asked to stop in the middle of a batch: the rest stay unstarted" $ bounded $ do
+    fixture ← newIFixture
+    withBoundary $ \control runtime → do
+      owner ← startInstances fixture runtime "halted batch" [gateInit, echoer, holder] (testConfig instanceBounds') requiredPolicy
+      holdOwner fixture owner
+      _ ← admit fixture owner "g" (moduleNamed "gateinit")
+      _ ← admit fixture owner "b" (moduleNamed "echoer")
+      releaseOwner fixture
+      -- The first one's init waits at its gate, inside the batch; the owner is asked to stop.
+      awaitEntered (sf fixture) "init"
+      retireScheduled owner
+      releaseGate (sf fixture) "init"
+      _ ← awaitScheduledTerminal control owner
+      -- The second was not begun: no init, and it settles as stopped without one.
+      b ← awaitSettled fixture "b"
+      resultOutcome b `shouldSatisfy` stopped
+      terminationShutdown (resultTermination b) `shouldBe` ShutdownSkippedNoInit
+      logged fixture >>= (`shouldBe` ["init done 1", "shutdown 1 stopped"])
+
+  it "counts an invocation the scheduler still holds in its queue as an unstarted one discarded when the owner retires" $ bounded $ do
+    fixture ← newIFixture
+    withBoundary $ \control runtime → do
+      let bounds = defaultSchedulerBounds {boundActiveTasks = 1}
+      owner ←
+        startWith fixture runtime $
+          instanceSpec fixture "retired queued" [echoer, plainModule] (testConfig instanceBounds') requiredPolicy bounds
+      _ ← admit fixture owner "a" (moduleNamed "echoer")
+      awaitPhase fixture owner "a" Active
+      _ ← admitScheduledTask (scheduledEndpoint owner) (request "waits" [VText "w"] OrdinaryClass OneShot Nothing) >>= ordinary
+      awaitDiagnosticsWaiting owner
+      expectDelivered fixture owner "a" 1
+      awaitDiagnostics owner (\counts → diagQueued counts >= 1)
+      retireScheduled owner
+      _ ← awaitScheduledTerminal control owner
+      settled ← awaitSettled fixture "a"
+      resultOutcome settled `shouldSatisfy` stopped
+      let termination = resultTermination settled
+      terminationUnstarted termination `shouldBe` 1
+      terminationClosed termination `shouldBe` 0
+
+  it "uses the task it took back again when the invocation is the same, so pausing and resuming over and over admits nothing new" $ bounded $ do
+    fixture ← newIFixture
+    withBoundary $ \_ runtime → do
+      let bounds = defaultSchedulerBounds {boundActiveTasks = 1}
+      owner ←
+        startWith fixture runtime $
+          instanceSpec fixture "ghosts" [echoer, plainModule] (testConfig instanceBounds') requiredPolicy bounds
+      _ ← admit fixture owner "a" (moduleNamed "echoer")
+      awaitPhase fixture owner "a" Active
+      _ ← admitScheduledTask (scheduledEndpoint owner) (request "waits" [VText "w"] OrdinaryClass OneShot Nothing) >>= ordinary
+      awaitDiagnosticsWaiting owner
+      expectDelivered fixture owner "a" 1
+      awaitDiagnostics owner (\counts → diagQueued counts >= 1)
+      before ← atomically (scheduledDiagnostics (scheduledEndpoint owner))
+      forM_ [1 .. 5 ∷ Int] $ \_ → do
+        settleControl fixture owner "a" InstancePause >>= (`shouldBe` ControlApplied)
+        settleControl fixture owner "a" InstanceResume >>= (`shouldBe` ControlApplied)
+      after ← atomically (scheduledDiagnostics (scheduledEndpoint owner))
+      -- The same task was brought back each time: the scheduler admitted nothing more.
+      diagAdmitted after `shouldBe` diagAdmitted before
+      diagQueued after `shouldBe` diagQueued before
+
+  it "does not let the application control an instance's invocation through the task controls, whatever it learned of its identity" $ bounded $ do
+    fixture ← newIFixture
+    seen ← newIORef Nothing
+    withBoundary $ \_ runtime → do
+      owner ← startInstances fixture runtime "own tasks" [slow] (testConfig instanceBounds') requiredPolicy
+      writeIORef (sfObserver (sf fixture)) (\context → writeIORef seen (Just (contextTask context)))
+      _ ← admit fixture owner "a" (moduleNamed "slow")
+      awaitPhase fixture owner "a" Active
+      expectDelivered fixture owner "a" 1
+      awaitDiagnosticsWaiting owner
+      task ← readIORef seen >>= maybe (fail "no segment was observed") pure
+      -- Told to the application by the observer, and of no use to it.
+      requestTaskControl (scheduledEndpoint owner) task RequestPause >>= (`shouldSatisfy` \case TaskControlUnknown → True; _ → False)
+      requestTaskControl (scheduledEndpoint owner) task RequestStop >>= (`shouldSatisfy` \case TaskControlUnknown → True; _ → False)
+      snapshotOf fixture owner "a" >>= (`shouldSatisfy` \held → fmap snapshotExecution held == Just ExecWaiting)
+
+  it "keeps the queue within its bound when an unstarted invocation is taken back by a pause" $ bounded $ do
+    fixture ← newIFixture
+    withBoundary $ \_ runtime → do
+      let bounds = defaultSchedulerBounds {boundActiveTasks = 1}
+      owner ←
+        startWith fixture runtime $
+          instanceSpec fixture "bounded pause" [echoer, plainModule] (testConfig instanceBounds' {boundInvocationQueue = 2}) requiredPolicy bounds
+      _ ← admit fixture owner "a" (moduleNamed "echoer")
+      awaitPhase fixture owner "a" Active
+      _ ← admitScheduledTask (scheduledEndpoint owner) (request "waits" [VText "w"] OrdinaryClass OneShot Nothing) >>= ordinary
+      awaitDiagnosticsWaiting owner
+      -- The first event's callback is queued behind the occupied slot, still unstarted:
+      -- it holds a place in the queue of two, so one more is taken and the next refused.
+      expectDelivered fixture owner "a" 1
+      awaitDiagnostics owner (\counts → diagQueued counts >= 1)
+      expectDelivered fixture owner "a" 2
+      deliverTick fixture owner "a" 3 >>= (`shouldBe` DeliveryQueueFull)
+      settleControl fixture owner "a" InstancePause >>= (`shouldBe` ControlApplied)
+      snapshotOf fixture owner "a"
+        >>= (`shouldSatisfy` \held → fmap (\x → (snapshotQueued x, snapshotQueueBound x)) held == Just (2, 2))
+      deliverTick fixture owner "a" 4 >>= (`shouldBe` DeliveryQueueFull)
+
+  it "keeps what an ending counted when the owner is cancelled while its shutdown waits: connections revoked, events discarded" $ bounded $ do
+    fixture ← newIFixture
+    withBoundary $ \_ runtime → do
+      owner ← startInstances fixture runtime "cancelled hook" [gateShutdown, holder] (testConfig instanceBounds') requiredPolicy
+      _ ← admit fixture owner "a" (moduleNamed "gateshutdown")
+      awaitPhase fixture owner "a" Active
+      settleControl fixture owner "a" InstancePause >>= (`shouldBe` ControlApplied)
+      forM_ [1, 2] (expectDelivered fixture owner "a")
+      -- The stop's hook waits at its gate; the owner is cancelled meanwhile.
+      receipt ← expectControl fixture owner "a" InstanceStop
+      awaitEntered (sf fixture) "shutdown"
+      cancelQueued owner
+      releaseGate (sf fixture) "shutdown"
+      _ ← waitInstanceControl receipt
+      settled ← awaitSettled fixture "a"
+      let termination = resultTermination settled
+      (terminationConnections termination, terminationUnstarted termination) `shouldBe` (1, 2)
 
   it "wakes for an invocation the scheduler had no room for when ordinary work's results are observed" $ bounded $ do
     fixture ← newIFixture

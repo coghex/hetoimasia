@@ -19,6 +19,7 @@ module Hetoimasia.Scripting.Lua.Instance.State
   , inspectInstances
   , lookupLive
   , connectSource
+  , isInstanceTask
   , beginEnding
   , settleInstance
   , takeJobs
@@ -124,7 +125,9 @@ deliverEvent instances gate owner identity source payload = do
           if not (Set.member source (isConnections state))
             then pure DeliveryUnknownTarget
             else
-              if Seq.length (isQueue state) >= boundInvocationQueue (insBounds instances)
+              -- The invocation in flight, until it has run a segment, is an unstarted one
+              -- and holds its place: taking it back never overfills the queue.
+              if Seq.length (isQueue state) + maybe 0 (const 1) (isPending state) >= boundInvocationQueue (insBounds instances)
                 then do
                   writeTVar (icState cell) state {isQueueFull = isQueueFull state + 1}
                   pure DeliveryQueueFull
@@ -241,7 +244,7 @@ settleInstance instances cell settlement =
     Just _ → pure False
     Nothing → do
       writeTVar (icResult cell) (Just settlement)
-      modifyTVar' (icState cell) (\state → state {isPhase = resultPhase settlement, isStopped = True, isActive = Nothing, isConnections = Set.empty, isQueue = Seq.empty})
+      modifyTVar' (icState cell) (\state → state {isPhase = resultPhase settlement, isStopped = True, isActive = Nothing, isConnections = Set.empty, isQueue = Seq.empty, isPending = Nothing})
       modifyTVar' (insLive instances) (subtract 1)
       forgotten ← readTVar (icForgotten cell)
       when forgotten (releaseResult instances cell)
@@ -263,7 +266,7 @@ snapshotOf instances gate owner label cell = do
       , snapshotKind = icKind cell
       , snapshotPhase = isPhase state
       , snapshotExecution = execution
-      , snapshotQueued = Seq.length (isQueue state)
+      , snapshotQueued = Seq.length (isQueue state) + maybe 0 (const 1) (isPending state)
       , snapshotQueueBound = boundInvocationQueue (insBounds instances)
       , snapshotQueueFull = isQueueFull state
       , snapshotDelivered = isDelivered state
@@ -342,6 +345,12 @@ beginEnding cell = do
           , isStopped = True
           , isConnections = Set.empty
           , isQueue = Seq.empty
+          , isPending = Nothing
           , isDispatchQueued = False
           }
-      pure (Set.size (isConnections state), Seq.length (isQueue state), False)
+      pure (Set.size (isConnections state), Seq.length (isQueue state) + maybe 0 (const 1) (isPending state), False)
+
+-- | Whether a scheduler task is an instance's invocation, which only the instance
+-- layer controls.
+isInstanceTask ∷ Instances → TaskId → STM Bool
+isInstanceTask instances task = Set.member task <$> readTVar (insTasks instances)

@@ -131,10 +131,18 @@
 -- as 'ControlApplied', 'ControlAlreadyInState' or 'ControlNoLongerApplicable',
 -- including a request overtaken by the instance's end or by the owner's.
 --
--- Requests are applied in the order accepted, at the owner's next safe boundary:
--- when the owner's thread services them, between turns and never inside a segment.
--- Control of the instance whose invocation is running waits for the segment to return
--- or yield.
+-- Requests are applied in the order accepted, at the owner's next safe boundary: its
+-- thread services them at each of the scheduler's boundaries, before the first segment
+-- of a turn and after every segment, when no task is running, and never inside a
+-- segment. Control of the instance whose invocation is running waits for the segment
+-- to return or yield. An owner that has been asked to stop services nothing more: its
+-- exit settles what was left. A request settles as it is applied, before anything that
+-- can raise a failure of the host.
+--
+-- An invocation that has not run a segment has nothing to freeze or close, even when
+-- the scheduler holds it queued behind slots that stay occupied: a pause takes it back,
+-- with its event, to be started on resume, and a stop discards it as an unstarted
+-- invocation. It holds its place in the instance's queue until it runs.
 --
 -- * __Pause__ stops new invocations from starting and freezes the invocation in
 --   flight, if there is one: it is suspended where it is, and runs nothing, however
@@ -260,6 +268,7 @@ import Control.Exception (evaluate)
 import qualified Data.Map.Strict as Map
 import Data.List (nub)
 import Data.Text (Text)
+import qualified Data.Text as Text
 import GHC.Stack (HasCallStack)
 import Hetoimasia.Foundation.Messaging.Payload (prepare, preparedValue)
 import Hetoimasia.Runtime.Supervision (RuntimeControl, awaitSupervised)
@@ -321,7 +330,9 @@ deliverEvent (ScheduledEndpoint control) identity source payload = case controlI
             Right () → do
               prepared ← prepare (WithinBounds [compact payload])
               case preparedValue prepared of
-                WithinBounds [kept] → atomically (State.deliverEvent instances (gateOf control) (controlOwner control) identity source kept)
+                -- The source is kept in a buffer of its own, as the payload is: a slice of
+                -- a larger string would keep all of it alive for as long as the event waits.
+                WithinBounds [kept] → atomically (State.deliverEvent instances (gateOf control) (controlOwner control) identity (Text.copy source) kept)
                 _ → pure DeliveryRefused
   where
     -- No capability crosses a source (the owner's creation refuses one), so no VM's

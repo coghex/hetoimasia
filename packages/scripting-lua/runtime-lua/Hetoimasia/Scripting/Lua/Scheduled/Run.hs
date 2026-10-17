@@ -61,9 +61,9 @@ import Control.Exception
   , fromException
   , mask
   , mask_
-  , onException
   , rethrowIO
   , someExceptionContext
+  , throwIO
   , try
   , tryWithContext
   )
@@ -189,19 +189,17 @@ serve stopping control handoff observe escalate config owned = mask $ \restore �
             -- close was not interrupted, which an exit settles as discarded.
             hostClose = \task → do
               began ← Map.member task <$> readIORef tasks
-              closed ← tryWithContext @SomeException (closeSuspended owned tasks kept task)
+              closed ← try @SomeException (closeSuspended owned tasks kept task)
               instances ← readIORef instanceRef
               let interrupted = case closed of
-                    Left (ExceptionWithContext _ failure) | Just (_ ∷ SomeAsyncException) ← fromException failure → True
+                    Left failure | Just (_ ∷ SomeAsyncException) ← fromException failure → True
                     _ → False
-              unless interrupted $
-                forM_ instances (\ih → instanceClosed ih task began) `onException` do
-                  -- What ending the instance raised is what the scheduler keeps of this
-                  -- close, so the close's own failure is kept here: raising the one
-                  -- must not take the other with it.
-                  forM_ (either Just (const Nothing) closed) $ \failure →
-                    modifyIORef' extra (<> [("lua task close", failure)])
-              either rethrowIO pure closed
+              -- The instance is only told its coroutine is closed. Ending it runs a hook,
+              -- which is application code, and a failure of that raised here would be
+              -- taken by the scheduler for the close's own: it ends the instance later,
+              -- from the owner's own code.
+              unless interrupted $ forM_ instances (\ih → instanceClosed ih task began)
+              either throwIO pure closed
           }
   served ← tryWithContext @SomeException . restore $ do
     handles ← Map.fromList . catMaybes <$> traverse (resolve owned) (map sourceIdentity (vmModules config))
@@ -241,8 +239,11 @@ serve stopping control handoff observe escalate config owned = mask $ \restore �
   -- resumed, say), is closed here, before the VM is, where closing it can run the
   -- cleanup a script asked for.
   held ← Map.keys <$> readIORef tasks
-  swept ← forM held $ \held' →
-    either (\failure → [(held', failure)]) (const []) <$> try @SomeException (closeSuspended owned tasks kept held')
+  swept ← forM held $ \held' → do
+    closed ← try @SomeException (closeSuspended owned tasks kept held')
+    -- Counted for its instance, which the exit then ends.
+    forM_ heldInstances (\ih → instanceClosed ih held' True)
+    pure (either (\failure → [(held', failure)]) (const []) closed)
   -- What instances are still live ends now, with every coroutine closed and before
   -- the VM is: in order, through the ordinary path, or as discarded.
   retired ← case heldInstances of

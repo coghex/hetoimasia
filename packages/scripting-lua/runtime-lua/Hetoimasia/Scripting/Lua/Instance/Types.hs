@@ -59,6 +59,7 @@ module Hetoimasia.Scripting.Lua.Instance.Types
   , Instances (..)
   , ICell (..)
   , IState (..)
+  , Pending (..)
   , Job (..)
   , QueuedEvent (..)
   , newInstances
@@ -551,11 +552,20 @@ data IState = IState
     -- started.
   , isRunStarted ∷ !Bool
     -- ^ A one-shot's @run@ was admitted.
+  , isPending ∷ !(Maybe Pending)
+    -- ^ The invocation in flight, until its first segment runs: it is still an
+    -- unstarted one, and counts against the queue's bound and in what an ending
+    -- discards.
   }
+
+-- | An invocation that has been given to the scheduler and has not run a segment.
+data Pending
+  = PendingEvent !QueuedEvent
+  | PendingRun
 
 -- | A fresh instance's state.
 initialState ∷ IState
-initialState = IState Initializing False Set.empty Seq.empty 0 0 0 Nothing False False False
+initialState = IState Initializing False Set.empty Seq.empty 0 0 0 Nothing False False False Nothing
 
 -- | What the owner's thread is asked to do, in the order the application asked.
 data Job
@@ -596,6 +606,9 @@ data Instances = Instances
   , insRunning ∷ !(TVar (Maybe Word64))
     -- ^ The instance whose Lua the owner's thread is running, if any: what a binding
     -- the instance's code calls is told it is called by.
+  , insTasks ∷ !(TVar (Set TaskId))
+    -- ^ The scheduler tasks that are instances' invocations: the application's own
+    -- requests about tasks do not reach them.
   , insBlocked ∷ !(TVar Bool)
     -- ^ An invocation was refused by the scheduler for want of room, and waits for
     -- room.
@@ -612,6 +625,7 @@ newInstances config =
     <*> newTVarIO 0
     <*> newTVarIO 0
     <*> newTVarIO Nothing
+    <*> newTVarIO Set.empty
     <*> newTVarIO False
 
 -- | An error as one line of text, at most 'failureTextLimit' characters.

@@ -40,6 +40,8 @@ module Test.LuaRuntime.Instance.Support
   , waitHostShutdown
   , badCloseHostShutdown
   , gated
+  , closingGated
+  , newestFirst
   , forger
   , plainModule
   , moduleNamed
@@ -94,7 +96,8 @@ import Hetoimasia.Scripting.Lua.Instance
 import Hetoimasia.Scripting.Lua.Owner
 import Hetoimasia.Scripting.Lua.Registration
 import Hetoimasia.Scripting.Lua.Runtime (LuaRuntime)
-import Hetoimasia.Scripting.Lua.Scheduled
+import Hetoimasia.Scripting.Lua.Scheduled hiding (Policy (..))
+import Hetoimasia.Scripting.Lua.Scheduler (Candidate (candidateTask), Policy (..), servable)
 import Hetoimasia.Scripting.Lua.Value
 import Test.LuaRuntime.Scheduler.Support (nanoseconds)
 import Test.LuaRuntime.Scheduled.Support
@@ -498,6 +501,30 @@ gated =
     , "  end)"
     , "end"
     ]
+
+-- | A callback that holds a closing handler, waits at a gate, yields, and would then
+-- record: closed before its instance's shutdown, whichever task the scheduler closes
+-- first.
+closingGated ∷ ModuleSource
+closingGated =
+  hooksModule
+    "closinggated"
+    [ "function init(self, api)"
+    , "  self.id = inst.next()"
+    , "  api.connect('tick', function(self, event)"
+    , "    local guard <close> = setmetatable({}, {__close = function() " <> record <> "('closed ' .. self.id) end})"
+    , "    fx.block('cb')"
+    , "    sched.yield()"
+    , "    " <> record <> "('after')"
+    , "  end)"
+    , "end"
+    , "function shutdown(self, reason) " <> record <> "('shutdown ' .. self.id .. ' ' .. reason) end"
+    ]
+
+-- | A policy that runs the ready task that waited least: a ghost admitted before a
+-- task's replacement is chosen after it.
+newestFirst ∷ Policy
+newestFirst = Policy "newest first" (\view → candidateTask (last (servable view)))
 
 -- | An instance that calls the layer's own binding with the number of the instance
 -- admitted after it, to connect that one beforehand.

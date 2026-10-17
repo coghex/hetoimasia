@@ -304,6 +304,7 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Identity
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Limits (Quanta (..), Quantum (..), ServiceClass (..))
 import Hetoimasia.Scripting.Lua.Internal.Value (checkLimits)
 import Hetoimasia.Scripting.Lua.Instance.Driver (connectNamespace, driverNamespaceName, driverSource)
+import Hetoimasia.Scripting.Lua.Instance.State (isInstanceTask)
 import Hetoimasia.Scripting.Lua.Instance.Types
   ( InstanceConfig (instanceEscalate, instanceSources)
   , InstanceViolation (RegistrationRefused)
@@ -688,13 +689,20 @@ requestTaskControl ∷ ScheduledEndpoint → ScheduledTaskId → ControlRequest 
 requestTaskControl (ScheduledEndpoint control) task request
   | taskOwner task /= controlOwner control = pure TaskControlUnknown
   | otherwise =
-      atomically (requestControl (controlScheduler control) (taskLocal task) request) <&> \case
+      atomically (guarded (requestControl (controlScheduler control) (taskLocal task) request)) <&> \case
         ControlAccepted ticket → TaskControlAccepted (ControlReceipt ticket)
         ControlFull → TaskControlFull
         ControlClosed → TaskControlClosed
         ControlUnknownTarget → TaskControlUnknown
   where
     (<&>) = flip fmap
+    -- A script instance's invocation is the instance layer's, whatever a hook or an
+    -- observer told the application of its identity: a task of this kind is unknown here.
+    guarded asked = case controlInstances control of
+      Nothing → asked
+      Just instances → isInstanceTask instances (taskLocal task) >>= \case
+        True → pure ControlUnknownTarget
+        False → asked
 
 -- | The settlement if there is one, without waiting. Observes it.
 pollControl ∷ ControlReceipt → IO (Maybe ControlSettlement)
