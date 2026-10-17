@@ -1934,7 +1934,8 @@ table in the VM that only a driver module the owner loads beside the application
 instance's number, and the host runs a hook by handing it to the driver, which calls it with its
 instance's `self`. A script cannot reach the table, so it cannot forge or erase another instance's
 state. The one binding the layer installs, `hetoimasia_instance.connect`, tells the owner a
-connection was made, so the owner records it at once.
+connection was made, so the owner records it at once; it accepts only the number of the instance
+whose code is running, so a script that names another instance's number is refused.
 
 ### Hooks
 
@@ -1968,7 +1969,8 @@ slice they are a seam for tests: only the application's own threads deliver. `de
 once, from any thread, without blocking: `DeliveryAccepted` with a sequence, `DeliveryQueueFull`,
 `DeliveryClosed`, `DeliveryUnknownTarget` (no live instance of this owner, or none with a connection to
 the source) or `DeliveryRefused` (the payload is over the owner's limits or not what the source
-declares). The payload is checked and copied on the producer's thread, and is kept with its sequence and
+declares). The payload is checked, as the callback will be handed it (stamped with its source and sequence,
+beside the instance's number, against the owner's limits) and copied on the producer's thread, and is kept with its sequence and
 the logical tick it was admitted at, unchanged, until its callback runs, however long that takes and
 whether the instance is paused. No producer thread enters Lua. A connection made during `init` is
 recorded when it is made, so events can be accepted while `init` runs; none is dispatched until `init`
@@ -1995,7 +1997,9 @@ which fails the owner as a host failure does (`InstanceEscalated`) under its `Wo
 raised by application code is never an instance's failure; it ends the owner, unconverted, as it does for
 tasks. Cleanup is the engine's and nothing the application answers can hide it: what closing a coroutine
 raised, a closing handler the script defined included, is cleanup evidence on the owner's outcome and is
-fatal under any policy, as it is for a task, and it stays beside an instance's primary failure.
+fatal under any policy, as it is for a task, and it stays beside an instance's primary failure; a failure raised
+while an instance ends does not take a close's failure with it, and a `shutdown` that raised a failure of the host is not
+started again when the owner's exit comes back to the instance.
 
 ### Control
 
@@ -2005,8 +2009,11 @@ thread: `InstanceControlAccepted` with a receipt, `InstanceControlFull`, `Instan
 request holds a reservation until its settlement is observed or abandoned
 (`boundInstanceControls`), and settles exactly once, as applied, already in that state, or no longer
 applicable, including when the instance or the owner ends first. Requests are applied in the order accepted,
-at the owner's next safe boundary: when the owner's thread services them, between turns and never inside a
-segment.
+at the owner's next safe boundary: the owner's thread services them as each segment is about to begin and
+between turns, never inside a segment, and the segment about to run does not enter an instance that is paused
+or ending. A request is settled as it is applied, before anything that can raise a failure of the host. The
+owner asks the scheduler to pause, resume or stop the invocation's task, and asks again if the scheduler has
+no reservation to take the request with.
 
 - **Pause** stops new invocations from starting and freezes the invocation in flight, if any, suspended
   where it is, running nothing, however its wait would have ended. Accepted events stay in the queue, in
@@ -2014,7 +2021,8 @@ segment.
 - **Resume** lets it go on: a suspended invocation finishes before another starts, then the retained
   events run in the order they were accepted and new ones behind them. It does not undo a stop.
 - **Stop** works while paused and takes precedence over ordinary work. It closes the instance's
-  admission, revokes its connections, discards what had not begun and counts it, closes the coroutine of
+  admission, revokes its connections, discards what had not begun and counts it (an invocation stopped before its first segment is one
+  of those, not a coroutine closed), closes the coroutine of
   the invocation in flight on the owner's thread and never resumes it, and only then runs `shutdown`. The
   request's result says the stop was taken; its completion is the instance's settlement, written after the
   hook and the release. Repeated requests are safe and never resurrect an instance or run `shutdown` again.
@@ -2038,8 +2046,8 @@ ticket nobody observes or forgets keeps its reservation, which bounds the retain
 read in one transaction, and never borrow a Lua table.
 
 Everything the owner does for an instance is a response to something: an admission, an event, a request,
-a grant, a deadline or a stop. Its wait is the scheduled owner's one STM wait with the instance layer's
-jobs added, so an owner whose instances are all paused, waiting or idle enters no Lua and does no periodic
+a grant, a deadline or a stop, or room appearing in the scheduler for an invocation it had none for. Its wait is
+the scheduled owner's one STM wait with the instance layer's jobs added, so an owner whose instances are all paused, waiting or idle enters no Lua and does no periodic
 work until one of those arrives.
 
 ### Determinism
