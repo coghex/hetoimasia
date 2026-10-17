@@ -1530,8 +1530,9 @@ A refused wait fails its task with a recoverable `ValidationFault`, reports the
 `WaitRefusal` and the failure in the turn report, and counts in `diagRefusedWaits`. A task that fails while its
 continuation is suspended (a refused wait, or a logical wait whose accumulated duration cannot be represented)
 still owes that continuation a close: it is made on the owner's thread after the failure, its own failure
-is kept in the scheduler, in the step that records the close, until a turn's report or the stop's takes it (so an
-exception that ends a turn cannot lose it), and an obligation that was interrupted is made by the scheduler's stop. A task that
+is kept in the scheduler, in the step that records the close, and handed to a turn's report only after the timer has been
+brought in line; the stop reports it too until the next turn shows the report arrived (so no exception on the way out can lose it,
+and at worst it is reported twice), and an obligation that was interrupted is made by the scheduler's stop. A task that
 fails in its own segment owes none, since its continuation is dead.
 
 ### The timer
