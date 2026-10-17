@@ -61,10 +61,9 @@ import Control.Concurrent.STM
   , readTVarIO
   , writeTVar
   )
-import Control.Exception (SomeAsyncException, SomeException, catch, fromException, onException, throwIO, uninterruptibleMask_)
+import Control.Exception (SomeException, catch, onException, throwIO, uninterruptibleMask_)
 import Control.Monad (when)
 import Data.Foldable (traverse_)
-import Data.Maybe (isNothing)
 import Data.Word (Word64)
 import GHC.Event (getSystemTimerManager, registerTimeout, unregisterTimeout)
 import Hetoimasia.Foundation.Time
@@ -227,14 +226,15 @@ cancelLive timer = uninterruptibleMask_ $ do
     pure (stateCancel state)
   traverse_ (keepFailure timer) cancel
 
--- | Run a registration's cancellation, keeping a synchronous failure of it for
--- the owner's stop before it goes on: the turn that met it raises it, and the
+-- | Run a registration's cancellation, keeping whatever it raises, whatever its
+-- type (the cancellation runs uninterruptibly, so nothing asynchronous lands in
+-- it, and an action that throws an asynchronous exception type itself has still
+-- failed), for the owner's stop before it goes on: the turn that met it raises it, and the
 -- registration's action is gone by the time the stop looks again.
 keepFailure ∷ Timer → IO () → IO ()
 keepFailure timer cancel =
   cancel `catch` \failure → do
-    when (isNothing (fromException failure ∷ Maybe SomeAsyncException)) $
-      atomically (modifyTVar' (timerCancelled timer) (<|> Just failure))
+    atomically (modifyTVar' (timerCancelled timer) (<|> Just failure))
     throwIO failure
 
 -- | The first failure a cancellation of this timer's registrations raised.

@@ -8,7 +8,7 @@ module Test.LuaRuntime.Scheduled.Failures (spec) where
 import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (atomically)
-import Control.Exception (ExceptionWithContext (ExceptionWithContext), fromException, throwIO)
+import Control.Exception (AsyncException (ThreadKilled), ExceptionWithContext (ExceptionWithContext), fromException, throwIO)
 import Control.Monad (forM, forM_, void, when)
 import Data.IORef (writeIORef)
 import Data.Maybe (isJust)
@@ -191,6 +191,17 @@ spec = describe "host failures, failure and cancellation" $ do
         -- Stopping the only waiter takes its deadline away, and the turn that
         -- applies the stop cancels the registration.
         writeIORef (ftOnCancel (sfTimer fixture)) (ioError (userError "cancel failed"))
+        _ ← requestTaskControl (scheduledEndpoint owner) (ticketTask ticket) RequestStop
+        awaitScheduledTerminal control owner
+      map cleanupFailureLabel (cleanupFailuresInContext context) `shouldSatisfy` elem "lua timer cancel"
+
+    it "keeps a timer cancellation's failure of any type, even an asynchronous one it raises itself, so an optional owner that recognizes everything is fatal" $ bounded $ do
+      fixture ← newSFixture
+      ExceptionWithContext context _ ← expectFatal $ \control runtime → do
+        owner ← startScheduled fixture runtime (scheduled fixture "killed timer" (optionalPolicy (const True)) defaultSchedulerBounds)
+        ticket ← admitTask' fixture owner "sleeper" (request "sleep" [VText "s", VInteger 5000000000] OrdinaryClass OneShot Nothing)
+        awaitRegistrations fixture 1
+        writeIORef (ftOnCancel (sfTimer fixture)) (throwIO ThreadKilled)
         _ ← requestTaskControl (scheduledEndpoint owner) (ticketTask ticket) RequestStop
         awaitScheduledTerminal control owner
       map cleanupFailureLabel (cleanupFailuresInContext context) `shouldSatisfy` elem "lua timer cancel"
