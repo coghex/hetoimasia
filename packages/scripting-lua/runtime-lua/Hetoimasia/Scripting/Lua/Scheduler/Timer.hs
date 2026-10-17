@@ -45,21 +45,25 @@ module Hetoimasia.Scripting.Lua.Scheduler.Timer
   , newTimer
   , syncTimer
   , disposeTimer
+  , timerCancelFailure
   , timerWoken
   , clearTimerWake
   ) where
 
+import Control.Applicative ((<|>))
 import Control.Concurrent.STM
   ( STM
   , TVar
   , atomically
+  , modifyTVar'
   , newTVarIO
   , readTVar
   , readTVarIO
   , writeTVar
   )
-import Control.Exception (onException, uninterruptibleMask_)
+import Control.Exception (SomeException, catch, onException, throwIO, uninterruptibleMask_)
 import Control.Monad (when)
+import Data.Foldable (traverse_)
 import Data.Word (Word64)
 import GHC.Event (getSystemTimerManager, registerTimeout, unregisterTimeout)
 import Hetoimasia.Foundation.Time
@@ -123,6 +127,10 @@ data Timer = Timer
   { timerBackend ∷ !TimerBackend
   , timerState ∷ !(TVar TimerState)
   , timerFlag ∷ !(TVar Bool)
+  , timerCancelled ∷ !(TVar (Maybe SomeException))
+    -- ^ The first failure a registration's cancellation raised, whoever was
+    -- cancelling: the owner's stop reports it even when the turn that met it
+    -- raised it already.
   }
 
 -- | A timer with nothing armed.
@@ -131,6 +139,7 @@ newTimer backend =
   Timer backend
     <$> newTVarIO (TimerState 0 Nothing Nothing False)
     <*> newTVarIO False
+    <*> newTVarIO Nothing
 
 -- | Whether a wake has arrived that the owner has not yet looked at. Retry-free,
 -- so the owner composes it with its other conditions.
@@ -215,7 +224,22 @@ cancelLive timer = uninterruptibleMask_ $ do
     state ← readTVar (timerState timer)
     writeTVar (timerState timer) state {stateLive = Nothing, stateCancel = Nothing}
     pure (stateCancel state)
-  sequence_ cancel
+  traverse_ (keepFailure timer) cancel
+
+-- | Run a registration's cancellation, keeping whatever it raises, whatever its
+-- type (the cancellation runs uninterruptibly, so nothing asynchronous lands in
+-- it, and an action that throws an asynchronous exception type itself has still
+-- failed), for the owner's stop before it goes on: the turn that met it raises it, and the
+-- registration's action is gone by the time the stop looks again.
+keepFailure ∷ Timer → IO () → IO ()
+keepFailure timer cancel =
+  cancel `catch` \failure → do
+    atomically (modifyTVar' (timerCancelled timer) (<|> Just failure))
+    throwIO failure
+
+-- | The first failure a cancellation of this timer's registrations raised.
+timerCancelFailure ∷ Timer → STM (Maybe SomeException)
+timerCancelFailure = readTVar . timerCancelled
 
 -- | End the timer for good: cancel what is armed, and ignore every wake and
 -- every request to arm from now on.
@@ -226,4 +250,4 @@ disposeTimer timer = uninterruptibleMask_ $ do
     writeTVar (timerState timer) state {stateLive = Nothing, stateCancel = Nothing, stateDisposed = True}
     writeTVar (timerFlag timer) False
     pure (stateCancel state)
-  sequence_ cancel
+  traverse_ (keepFailure timer) cancel

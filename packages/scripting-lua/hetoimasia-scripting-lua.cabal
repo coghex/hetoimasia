@@ -43,8 +43,13 @@ description:
     interface, service classes with finite quanta, application-granted logical
     time, elapsed waits behind one owned cancellable timer, service budgets that
     end a turn and never preempt a segment, nonblocking pause, resume and stop
-    applied at safe boundaries, and bounded aggregate counters. The scheduled
-    owner that hosts it on real VMs and the confined path are later slices.
+    applied at safe boundaries, and bounded aggregate counters. Scheduled owners
+    host that machinery and the host's task coroutines on supervised workers with
+    real VMs: tasks are admitted without blocking, each settles exactly once, an
+    idle owner blocks in one STM wait, a stop closes every suspended coroutine on
+    the owner's thread and keeps closing errors as cleanup evidence, and the same
+    logical-time workload runs identically however long its segments take. The
+    confined path is a later slice.
 license: GPL-3.0-only
 license-file: LICENSE
 author: Vincent Coghlan
@@ -190,11 +195,15 @@ library runtime-lua
     hs-source-dirs: runtime-lua
     exposed-modules:
         Hetoimasia.Scripting.Lua.Runtime
+        Hetoimasia.Scripting.Lua.Scheduled
         Hetoimasia.Scripting.Lua.Scheduler
     other-modules:
         Hetoimasia.Scripting.Lua.Runtime.Admission
         Hetoimasia.Scripting.Lua.Runtime.Dispatch
+        Hetoimasia.Scripting.Lua.Runtime.Shared
         Hetoimasia.Scripting.Lua.Runtime.Types
+        Hetoimasia.Scripting.Lua.Scheduled.Run
+        Hetoimasia.Scripting.Lua.Scheduled.Types
         Hetoimasia.Scripting.Lua.Scheduler.Policy
         Hetoimasia.Scripting.Lua.Scheduler.State
         Hetoimasia.Scripting.Lua.Scheduler.Timer
@@ -328,7 +337,10 @@ test-suite lua-host-tests
 -- under a real `withSupervision`; the structural checks need no VM. The
 -- scheduling machinery's examples (LUA-21) are here too, under the
 -- `Test.LuaRuntime.Scheduler` modules: they run scripted segments under an
--- injected clock and a fake timer, fire every wake by hand and need no VM. It is
+-- injected clock and a fake timer, fire every wake by hand and need no VM. The
+-- scheduled owners' examples (LUA-6) are under `Test.LuaRuntime.Scheduled`: they
+-- run real Lua tasks as coroutines on real supervised owners with the same
+-- injected clock and fake timer, and coordinate with gates and STM signals. It is
 -- a suite of its own, in its own source directory, beside `lua-host-tests`, which
 -- keeps the host's examples unchanged.
 test-suite lua-runtime-tests
@@ -343,6 +355,15 @@ test-suite lua-runtime-tests
         Test.LuaRuntime.Identity
         Test.LuaRuntime.Independence
         Test.LuaRuntime.Readiness
+        Test.LuaRuntime.Scheduled.Creation
+        Test.LuaRuntime.Scheduled.Execution
+        Test.LuaRuntime.Scheduled.Settlement
+        Test.LuaRuntime.Scheduled.Spec
+        Test.LuaRuntime.Scheduled.Callbacks
+        Test.LuaRuntime.Scheduled.Lifecycle
+        Test.LuaRuntime.Scheduled.Failures
+        Test.LuaRuntime.Scheduled.Determinism
+        Test.LuaRuntime.Scheduled.Support
         Test.LuaRuntime.Scheduler.Budget
         Test.LuaRuntime.Scheduler.Classes
         Test.LuaRuntime.Scheduler.Control

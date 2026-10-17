@@ -379,6 +379,7 @@ import Hetoimasia.Scripting.Lua.Scheduler.Timer
   , TimerBackend (..)
   , clearTimerWake
   , disposeTimer
+  , timerCancelFailure
   , maxRegistration
   , newTimer
   , registrationMicroseconds
@@ -874,7 +875,10 @@ syncTimerFor scheduler = do
 -- report and closes nothing again. Everything runs masked, and every close is
 -- attempted: a close that is interrupted keeps the interruption as its failure,
 -- the others still run, the stop completes, and the first interruption is raised
--- again afterwards.
+-- again afterwards. A timer whose cancellation throws does not end the stop
+-- either: that failure is in the report, and is raised once the stop has
+-- completed, unless an interruption is, and a later call answers the completed
+-- report in both cases.
 stopScheduler ∷ Scheduler v → TaskHost v → IO StopReport
 stopScheduler scheduler host = mask_ $ do
   claim ← atomically $ do
@@ -886,6 +890,11 @@ stopScheduler scheduler host = mask_ $ do
   case claim of
     Left report → pure report
     Right identities → do
+      -- The timer is cancelled first, so no wake can arrive while continuations,
+      -- which can take as long as Lua runs, are closed.
+      -- A cancellation that throws is kept, and the stop goes on: the closes and
+      -- the settlement of the control requests do not wait on it.
+      timerFailure ← try (disposeTimer (schedTimerOf scheduler))
       failures ← newIORef []
       interrupted ← newIORef Nothing
       -- Every obligation is closed, masked: an exception that reaches a close at
@@ -900,18 +909,20 @@ stopScheduler scheduler host = mask_ $ do
             when (isJust (fromException failure ∷ Maybe SomeAsyncException)) $
               modifyIORef' interrupted (<|> Just failure)
       collected ← reverse <$> readIORef failures
-      report ← atomically (settleStop collected)
-      disposeTimer (schedTimerOf scheduler)
-      readIORef interrupted >>= maybe (pure report) throwIO
+      -- What cancelling the timer raised, here or in a turn before: the stop is
+      -- where the owner's cleanup is accounted for.
+      cancelled ← atomically (timerCancelFailure (schedTimerOf scheduler))
+      report ← atomically (settleStop collected (either Just (const Nothing) timerFailure <|> cancelled))
+      readIORef interrupted >>= maybe (either (\(failure ∷ SomeException) → throwIO failure) (const (pure report)) timerFailure) throwIO
   where
     reference = schedState scheduler
-    settleStop collected = do
+    settleStop collected timerRaised = do
       before ← readTVar reference
       forM_ (ssControl before) $ \pending →
         settleSlot reference (pendingSlot pending) (ControlSettlement ControlNoLongerApplicable Nothing)
       state ← readTVar reference
       let (session, exit) = stopSession (ssSession state)
-          report = StopReport exit (toList (ssDelivered state) <> toList (ssEvidence state) <> collected) (Seq.length (ssControl before))
+          report = StopReport exit (toList (ssDelivered state) <> toList (ssEvidence state) <> collected) (Seq.length (ssControl before)) timerRaised
           aborted = liveCount state
           discards = exitDiscards exit
           counts = ssCounts state
