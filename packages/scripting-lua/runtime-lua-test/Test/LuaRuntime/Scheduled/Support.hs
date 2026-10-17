@@ -38,6 +38,7 @@ module Test.LuaRuntime.Scheduled.Support
   , request
   , accepted
   , awaitIdle
+  , awaitEffect
   , awaitScheduledTerminal
   , awaitRegistrations
   , awaitDiagnostics
@@ -49,8 +50,8 @@ module Test.LuaRuntime.Scheduled.Support
 import Control.Concurrent (ThreadId, myThreadId, yield)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, readMVar, tryPutMVar)
 import Control.Concurrent.STM (atomically, retry)
-import Control.Exception (Exception, throwIO)
-import Control.Monad (unless, void)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, fromException, throwIO, tryWithContext)
+import Control.Monad (join, unless, void)
 import Data.ByteString (ByteString)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Int (Int64)
@@ -68,7 +69,7 @@ import Hetoimasia.Scripting.Lua.Runtime (LuaRuntime)
 import Hetoimasia.Scripting.Lua.Scheduled
 import Hetoimasia.Scripting.Lua.Value
 import Test.LuaRuntime.Scheduler.Support (FakeTimer (..), allRegs, newFakeTimer, nanoseconds)
-import Test.LuaRuntime.Support (applicationBoundaryFault, awaitBlockedOnSTM)
+import Test.LuaRuntime.Support (Broken (Broken), applicationBoundaryFault, awaitBlockedOnSTM, requiredPolicy)
 
 -- The fixture ------------------------------------------------------------------
 
@@ -85,6 +86,15 @@ data SFixture = SFixture
   , sfIds ∷ !(IORef (Map Text ScheduledTaskId))
   , sfAnswers ∷ !(IORef [Text])
     -- ^ What the control requests a script made were answered with.
+  , sfTickets ∷ !(IORef (Map Text ScheduledTicket))
+  , sfReceipts ∷ !(IORef (Map Text ControlReceipt))
+  , sfRuntime ∷ !(IORef (Maybe LuaRuntime))
+  , sfSupervision ∷ !(IORef (Maybe RuntimeControl))
+  , sfOwner ∷ !(IORef (Maybe ScheduledOwner))
+  , sfPrebuilt ∷ !(IORef (IO ()))
+    -- ^ A wait built outside any callback, which @fx.probe('prebuilt', ...)@ runs.
+  , sfProbe ∷ !(IORef [Text])
+    -- ^ What the waits a script attempted were answered with.
   , sfDelay ∷ !(IORef Word64)
     -- ^ How long each @fx.delay()@ takes on the injected clock.
   , sfClock ∷ !Clock
@@ -94,15 +104,22 @@ data SFixture = SFixture
 newSFixture ∷ IO SFixture
 newSFixture =
   SFixture
-    <$> newIORef []
-    <*> newIORef []
-    <*> newEmptyMVar
-    <*> newIORef Map.empty
-    <*> newIORef Map.empty
-    <*> newIORef Nothing
-    <*> newIORef Map.empty
-    <*> newIORef []
-    <*> newIORef 0
+    <$> newIORef [] -- log
+    <*> newIORef [] -- contexts
+    <*> newEmptyMVar -- owner thread
+    <*> newIORef Map.empty -- gates
+    <*> newIORef Map.empty -- entered
+    <*> newIORef Nothing -- endpoint
+    <*> newIORef Map.empty -- ids
+    <*> newIORef [] -- answers
+    <*> newIORef Map.empty -- tickets
+    <*> newIORef Map.empty -- receipts
+    <*> newIORef Nothing -- runtime
+    <*> newIORef Nothing -- supervision
+    <*> newIORef Nothing -- owner
+    <*> newIORef (pure ()) -- prebuilt
+    <*> newIORef [] -- probe
+    <*> newIORef 0 -- delay
     <*> newClock
     <*> newFakeTimer
 
@@ -202,9 +219,16 @@ schedRegistration fixture = ok (registration [] [sched, fx])
         , stateOperation "fail" [SText] [] $ \arguments → do
             case arguments of
               [VText "boundary"] → throwIO applicationBoundaryFault
-              [VText kind] → throwIO (Broken' kind)
+              [VText kind] → throwIO (Broken kind)
               _ → pure ()
             pure []
+        , -- An attempt, from inside a task, to wait for something: answered with
+          -- whether it was refused as a wait from a callback. Anything else it
+          -- raises is let through, so a hang or another failure fails the example.
+          stateOperation "probe" [SText, SText] [SBoolean] $ \arguments →
+            case arguments of
+              [VText kind, VText name] → (: []) . VBoolean <$> attempt fixture kind name
+              _ → pure [VBoolean False]
         , -- A segment's cost on the injected clock, as the example configured it.
           stateOperation "delay" [] [] $ \_ → do
             readIORef (sfDelay fixture) >>= advanceClock fixture
@@ -237,11 +261,46 @@ schedRegistration fixture = ok (registration [] [sched, fx])
       "stop" → RequestStop
       _ → RequestPause
 
--- | A typed synthetic failure of the application's own code.
-newtype Broken' = Broken' Text
-  deriving (Eq, Show)
-
-instance Exception Broken'
+-- | Attempt a wait of this kind, answering whether it was refused.
+attempt ∷ SFixture → Text → Text → IO Bool
+attempt fixture kind name = do
+  outcome ← tryWithContext @SomeException action
+  case outcome of
+    Right () → note "waited" >> pure False
+    Left (ExceptionWithContext _ failure) → case fromException failure of
+      Just (CallbackWaitRefused operation) → note operation >> pure True
+      Nothing → throwIO failure
+  where
+    note entry = atomicModifyIORef' (sfProbe fixture) (\held → (entry : held, ()))
+    ticket = Map.lookup name <$> readIORef (sfTickets fixture)
+    receipt = Map.lookup name <$> readIORef (sfReceipts fixture)
+    action = case kind of
+      "wait_task" → ticket >>= maybe (pure ()) (void . waitTask)
+      "await_task" → do
+        found ← ticket
+        control ← readIORef (sfSupervision fixture)
+        case (found, control) of
+          (Just held, Just supervision) → void (awaitTask supervision held)
+          _ → pure ()
+      "wait_control" → receipt >>= maybe (pure ()) (void . waitControl)
+      "await_control" → do
+        found ← receipt
+        control ← readIORef (sfSupervision fixture)
+        case (found, control) of
+          (Just held, Just supervision) → void (awaitControl supervision held)
+          _ → pure ()
+      "await_ticks" → do
+        owner ← readIORef (sfOwner fixture)
+        control ← readIORef (sfSupervision fixture)
+        case (owner, control) of
+          (Just held, Just supervision) → void (awaitTicksComplete supervision held)
+          _ → pure ()
+      "start" → do
+        runtime ← readIORef (sfRuntime fixture)
+        case runtime of
+          Just held → void (startScheduledOwner held (scheduled fixture "made" requiredPolicy defaultSchedulerBounds))
+          Nothing → pure ()
+      _ → join (readIORef (sfPrebuilt fixture))
 
 nanosOf ∷ Duration → Int64
 nanosOf = fromIntegral . durationNanoseconds
@@ -272,6 +331,9 @@ tasksEntries =
   , required "costly" [SText, SInteger, SInteger] [SInteger]
   , required "ticker" [SText, SInteger, SInteger] [SInteger]
   , required "delayed" [SText, SInteger] [SInteger]
+  , required "probe" [SText, SText] [SBoolean]
+  , required "tick_then_fail" [SText] []
+  , required "block_then_fail" [SText, SText] []
   , required "bad_wait" [] []
   , EntryPoint "absent" Optional [] []
   ]
@@ -339,6 +401,9 @@ tasksSource =
     , "  for i = 1, n do fx.advance(cost) fx.record(label .. i) sched.yield() end"
     , "  return n"
     , "end"
+    , "function probe(kind, name) return fx.probe(kind, name) end"
+    , "function tick_then_fail(kind) sched.wait_ticks(1) fx.fail(kind) end"
+    , "function block_then_fail(name, kind) fx.block(name) fx.fail(kind) end"
     , "function bad_wait() sched.wait_ticks(0) end"
     ]
 
@@ -446,6 +511,12 @@ accepted fixture name = \case
 -- everything it was given and is idle.
 awaitIdle ∷ SFixture → IO ()
 awaitIdle fixture = readMVar (sfOwnerThread fixture) >>= awaitBlockedOnSTM
+
+-- | Wait, without sleeping, until a binding has recorded this.
+awaitEffect ∷ SFixture → Text → IO ()
+awaitEffect fixture wanted = do
+  seen ← effects fixture
+  if wanted `elem` seen then pure () else yield >> awaitEffect fixture wanted
 
 -- | Wait until the owner's worker has a terminal status committed by supervision,
 -- through a supervised wait, and answer it.

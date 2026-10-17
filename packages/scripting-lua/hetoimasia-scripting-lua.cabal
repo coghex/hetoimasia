@@ -351,6 +351,9 @@ test-suite lua-runtime-tests
         Test.LuaRuntime.Scheduled.Execution
         Test.LuaRuntime.Scheduled.Settlement
         Test.LuaRuntime.Scheduled.Spec
+        Test.LuaRuntime.Scheduled.Callbacks
+        Test.LuaRuntime.Scheduled.Lifecycle
+        Test.LuaRuntime.Scheduled.Failures
         Test.LuaRuntime.Scheduled.Support
         Test.LuaRuntime.Scheduler.Budget
         Test.LuaRuntime.Scheduler.Classes
