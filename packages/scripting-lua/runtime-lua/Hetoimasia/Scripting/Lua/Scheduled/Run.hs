@@ -277,7 +277,10 @@ runSegment control observe owned identity label handlesRef tasks extra run = do
           pure . ReportFailed $
             TaskFailure (failureReason ValidationFault "the task's continuation is not held by its owner") RecoverySafe
         Just task →
-          settledOrRaise extra (resumeTask owned task) >>= \case
+          -- Masked through the outcome's record, as the first segment is: a
+          -- cancellation queued while Lua ran lands after the task's result, or
+          -- the failures of closing its ended coroutine, are kept.
+          mask_ $ settledOrRaise extra (resumeTask owned task) >>= \case
             Left fault → modifyIORef' tasks (Map.delete (runTask run)) >> failed fault
             Right step → reported step
     Finished result → pure (ReportCompleted (Finished result))

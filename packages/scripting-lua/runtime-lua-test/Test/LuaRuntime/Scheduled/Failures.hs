@@ -222,6 +222,33 @@ spec = describe "host failures, failure and cancellation" $ do
       length (cleanupFailuresInContext context) `shouldSatisfy` (>= 1)
 
   describe "cancellation" $ do
+    it "keeps the result of a task that finished in a resumed segment a cancellation was queued during" $ bounded $ do
+      fixture ← newSFixture
+      withBoundary $ \control runtime → do
+        owner ← startScheduled fixture runtime (scheduled fixture "resumed" requiredPolicy defaultSchedulerBounds)
+        ticket ← admitTask' fixture owner "r" (request "resumes_then_blocks" [VText "r", VText "g"] OrdinaryClass OneShot Nothing)
+        awaitDiagnostics owner (\counts → diagWaiting counts >= 1)
+        _ ← grantScheduledStep (scheduledEndpoint owner) (nanoseconds 1)
+        awaitEntered fixture "g"
+        cancelScheduled owner
+        releaseGate fixture "g"
+        awaitScheduledTerminal control owner >>= (`shouldSatisfy` \case WorkerStopped → True; _ → False)
+        outcomeOf ticket >>= (`shouldBe` Just [VInteger 7]) . taskReturned
+
+    it "keeps the failures of closing the ended coroutine of a task whose resumed segment failed when a cancellation was queued during it" $ bounded $ do
+      fixture ← newSFixture
+      ExceptionWithContext context _ ← expectFatal $ \control runtime → do
+        owner ← startScheduled fixture runtime (scheduled fixture "resumed fault" (optionalPolicy (const True)) defaultSchedulerBounds)
+        _ ← admitTask' fixture owner "r" (request "resumes_blocks_fails" [VText "r", VText "g"] OrdinaryClass OneShot Nothing)
+        awaitDiagnostics owner (\counts → diagWaiting counts >= 1)
+        _ ← grantScheduledStep (scheduledEndpoint owner) (nanoseconds 1)
+        awaitEntered fixture "g"
+        cancelScheduled owner
+        releaseGate fixture "g"
+        awaitScheduledTerminal control owner
+      -- A cancelled owner whose cleanup failed ends fatally, not benignly.
+      length (cleanupFailuresInContext context) `shouldSatisfy` (>= 1)
+
     it "closes a coroutine whose task a cancellation interrupted as it first yielded, before the VM, so its close may use a state operation" $ bounded $ do
       fixture ← newSFixture
       withBoundary $ \control runtime → do
