@@ -30,6 +30,9 @@ module Hetoimasia.Scripting.Lua.Internal.Fault
   , closeSourceLabel
     -- * Naming
   , luaComponent
+    -- * Where a failure came from
+  , fromApplication
+  , raisedByApplication
     -- * Reading what a failed call left
   , classify
   , renderFailure
@@ -37,7 +40,15 @@ module Hetoimasia.Scripting.Lua.Internal.Fault
   , diagnosticLimit
   ) where
 
-import Control.Exception (Exception, ExceptionWithContext, SomeException)
+import Control.Exception
+  ( Exception
+  , ExceptionWithContext (ExceptionWithContext)
+  , SomeException
+  , rethrowIO
+  , tryWithContext
+  )
+import Control.Exception.Annotation (ExceptionAnnotation (displayExceptionAnnotation))
+import Control.Exception.Context (ExceptionContext, addExceptionAnnotation, getExceptionAnnotations)
 import qualified Data.ByteString as ByteString
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -70,6 +81,39 @@ import Lua
 -- | This package's component name, used for every failure it raises.
 luaComponent ∷ Component
 luaComponent = unsafeComponent "scripting.lua"
+
+-- | Marks a failure that application code raised: a binding's action, or the
+-- application's own check that a capability is still live.
+--
+-- The boundary's own faults ('Hetoimasia.Scripting.Lua.Internal.Boundary.BoundaryFault'
+-- and 'LuaFault') and a failure of an application's action can have the same
+-- type, because an action is free to throw either. Nothing about the exception
+-- tells them apart, and an owner's caller has to know which it caught: a fault
+-- of the call is the caller's to handle, a failure of the application's own
+-- code is a broken host. So the failure of application code is marked where it
+-- escapes that code, and everything else is not.
+--
+-- The mark is an annotation of the exception's context, which keeps the
+-- exception's type and value, and is added once however many boundaries it
+-- crosses.
+data RaisedByApplication = RaisedByApplication
+
+instance ExceptionAnnotation RaisedByApplication where
+  displayExceptionAnnotation RaisedByApplication = "raised by application code"
+
+-- | Run application code, marking any failure that escapes it as the
+-- application's. The failure is rethrown with its own type, value and context.
+fromApplication ∷ IO a → IO a
+fromApplication action =
+  tryWithContext @SomeException action >>= \case
+    Right result → pure result
+    Left (ExceptionWithContext context exception)
+      | raisedByApplication context → rethrowIO (ExceptionWithContext context exception)
+      | otherwise → rethrowIO (ExceptionWithContext (addExceptionAnnotation RaisedByApplication context) exception)
+
+-- | Whether a failure's context says application code raised it.
+raisedByApplication ∷ ExceptionContext → Bool
+raisedByApplication context = not (null (getExceptionAnnotations context ∷ [RaisedByApplication]))
 
 -- | How many bytes of a Lua error value are reported.
 --

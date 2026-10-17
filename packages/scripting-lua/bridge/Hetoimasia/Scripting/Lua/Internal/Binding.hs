@@ -41,7 +41,7 @@ module Hetoimasia.Scripting.Lua.Internal.Binding
   , ensureValues
   ) where
 
-import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, fromException, toException)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, evaluate, fromException, toException)
 import Control.Monad (foldM, forM_, unless, when)
 import Data.List (nub)
 import Data.Maybe (fromMaybe)
@@ -53,7 +53,7 @@ import Hetoimasia.Foundation.Failure (Operation, operation, throwFailure, withOp
 import Hetoimasia.Scripting.Lua.Internal.Boundary
 import Hetoimasia.Scripting.Lua.Internal.Call (reportFault)
 import Hetoimasia.Scripting.Lua.Internal.Callback (Handler, installBinding)
-import Hetoimasia.Scripting.Lua.Internal.Fault (classify, luaComponent, renderFailure)
+import Hetoimasia.Scripting.Lua.Internal.Fault (classify, fromApplication, luaComponent, raisedByApplication, renderFailure)
 import Hetoimasia.Scripting.Lua.Internal.Marshal
 import Hetoimasia.Scripting.Lua.Internal.Registration
 import Hetoimasia.Scripting.Lua.Internal.Value
@@ -202,9 +202,16 @@ valueHandler boundary vm space binding state restore = do
       -- happened has to include that.
       amendEscape vm upgradeEffect
       produced ← case action of
-        ValuesAction run → restore (run values)
+        -- What the action returns is evaluated inside the mark: a failure hidden in
+        -- a lazy result is the application's, whenever it would have surfaced.
+        -- The bounded check reaches every part of a result that can cross, and
+        -- stops at a limit, so an endless result costs no more than a large one.
+        ValuesAction run →
+          fromApplication $ do
+            returned ← restore (run values)
+            returned <$ evaluate (checkLimits limits returned)
         CommandAction run → do
-          answer ← restore (run values)
+          answer ← fromApplication (restore (run values) >>= evaluate)
           case answer of
             Accepted → pure [VBoolean True, VNil]
             Rejected reason
@@ -248,7 +255,7 @@ retiredIn boundary = go []
     go path = \case
       VCapability capability → do
         live ← case lookupCapability registered (capabilityTypeName capability) of
-          Just kind → capabilityLive kind (capabilityKey capability)
+          Just kind → fromApplication (capabilityLive kind (capabilityKey capability) >>= evaluate)
           Nothing → pure False
         pure (if live then Nothing else Just (reverse path, capabilityTypeName capability))
       VList items → firstJust [go (AtIndex index : path) item | (index, item) ← zip [1 ..] items]
@@ -260,7 +267,9 @@ retiredIn boundary = go []
 -- binding's action ran.
 upgradeEffect ∷ ExceptionWithContext SomeException → ExceptionWithContext SomeException
 upgradeEffect captured@(ExceptionWithContext context exception) = case fromException exception of
-  Just fault | boundaryEffect fault < BindingRan → ExceptionWithContext context (toException (fault {boundaryEffect = BindingRan}))
+  -- A failure the application raised is its own, however it is typed: it is not
+  -- the boundary's report, so what it says is never rewritten.
+  Just fault | boundaryEffect fault < BindingRan, not (raisedByApplication context) → ExceptionWithContext context (toException (fault {boundaryEffect = BindingRan}))
   _ → captured
 
 -- | Whether the chunk a call was made from is this module's. Lua shortens a
