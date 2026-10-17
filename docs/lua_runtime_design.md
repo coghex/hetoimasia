@@ -8,8 +8,8 @@ failure evidence, and lifetime. This is the canonical continuation of
 
 Design state: `ready for issue processing`
 
-Current readiness scope: **LUA-18 only** (D-30), which now spans LUA-18, LUA-22
-and LUA-23. LUA-6 (with LUA-20 and LUA-21, D-28/D-29) is delivered. Other
+Current readiness scope: **LUA-18 only** (D-30), which now spans LUA-18, LUA-22,
+LUA-23 and LUA-24 (D-31). LUA-6 (with LUA-20 and LUA-21, D-28/D-29) is delivered. Other
 unchecked slices retain their explicit deferrals; this state does not release
 the confinement gate.
 
@@ -136,6 +136,13 @@ only. LUA-7, LUA-19 and LUA-8 stay `[deferred]` on their own renewal, and the
 confined branch on Q-5. Readiness is not issue processing or implementation:
 each needs its own authorization.
 
+LUA-18 processing, 2026-10-17 (request `user-het-lua18-process-20261017-1458`,
+the owner's direct "split the slices for me please, then get them processed into
+issues and approve those issues"): the drafted LUA-18 issue was still the size of
+LUA-6's integration PR (#471, six review rounds), so at signoff the manager took
+the drafter's fallback partition and D-31 carves instance cadence (LUA-24) out of
+LUA-18, adding no scope. D-30's readiness covers it.
+
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
 reviewed and deliberately not tracked separately · `[deferred]` blocked on a
 concrete precondition
@@ -156,6 +163,7 @@ concrete precondition
 - [ ] LUA-18. Own script instances, hooks and lifecycle controls
 - [ ] LUA-22. Own instance resources through engine-held leases
 - [ ] LUA-23. Grant Lua lifecycle controls and inspection across owners
+- [ ] LUA-24. Run instance updates on logical and elapsed cadences
 - [ ] LUA-7. Add bounded asynchronous requests and owned subscriptions — [deferred]: owner renews trusted-path readiness for this slice
 - [ ] LUA-19. Run script instances through a headless command-line entry — [deferred]: contract accepted; renew slice readiness
 - [ ] LUA-8. Prove independent trusted UI and gameplay execution headlessly — [deferred]: owner renews trusted-path readiness for this slice
@@ -833,6 +841,29 @@ interests, and LUA-8 integrates all three. This renews trusted readiness for
 LUA-18, LUA-22 and LUA-23 only; LUA-7, LUA-19 and LUA-8 readiness and Q-5's
 confined branch remain separately gated. It files no tracker item and does not
 authorize issue processing or implementation.
+
+### D-31. Carve instance cadence out of LUA-18
+
+Manager decision at the LUA-18 signoff, 2026-10-17, under D-25's delegated
+organization and the owner's request `user-het-lua18-process-20261017-1458`
+("split the slices for me please, then get them processed into issues and approve
+those issues"). The drafted LUA-18 issue carried ten requirements, close to the
+size of LUA-6's integration PR (#471, +3.5k lines, six review rounds). Its
+drafter named cadence as the most separable part, so LUA-24 takes periodic update
+demand from LUA-18:
+
+- LUA-18 keeps instances, hooks, the invocation queue and event delivery, pause,
+  failure, stop and shutdown, and the application's Haskell control and
+  inspection. Its instances are event-only or one-shot; the `update` hook is part
+  of the authoring model, but nothing makes an update due until LUA-24.
+- LUA-24 adds logical and elapsed update intervals, `dt`, refresh coalescing,
+  pause baselines and the rule that a continuous event producer cannot starve a
+  due update.
+
+LUA-24 is carved out with no added scope, depends only on LUA-18 and is
+independent of LUA-22 and LUA-23. LUA-19's looped examples need it, and LUA-8
+integrates it. D-30's readiness covers LUA-24. This decision files no tracker
+item.
 
 ## Design
 
@@ -2332,7 +2363,8 @@ and verified policy, with adversarial regression coverage.
 ### LUA-18. Own script instances, hooks and lifecycle controls
 
 > Ready for issue processing under D-30. LUA-6 is delivered and the contract is
-> accepted (D-26/D-27). D-30 carves LUA-22 and LUA-23 out of this slice.
+> accepted (D-26/D-27). D-30 carves LUA-22 and LUA-23 out of this slice, and
+> D-31 carves cadence (LUA-24).
 
 - **Outcome:** reusable code admits separately owned script instances on a
   scheduled owner, runs their lifecycle hooks in order on that owner, and lets
@@ -2347,11 +2379,9 @@ and verified policy, with adversarial regression coverage.
   invocations shared by due updates and delivered events, with stable admission
   sequence, retention while paused, explicit queue-full refusal and an
   attributable counter, fed through a bounded event-delivery seam with
-  instance-owned connections (test events only); gameplay cadence in positive
-  integer logical ticks with exact conversion or refusal, first update one
-  interval after init and granted `dt` kept across waits; UI cadence on the
-  monotonic source with one coalesced unstarted refresh, elapsed `dt`, no
-  catch-up bursts and the resume baseline; init-failure and ordinary-failure
+  instance-owned connections (test events only); instances that are event-only
+  or one-shot, with periodic update demand left to LUA-24; init-failure and
+  ordinary-failure
   rules, isolation where safe and an application-decided escalation seam for
   unsafe shared-state failure (D-7/P-8); stop with request and completion
   results, precedence over queued work, closing the cancelled continuation
@@ -2365,24 +2395,25 @@ and verified policy, with adversarial regression coverage.
   scheduler and settlement guarantees stay intact.
 - **Phase:** script authoring and lifetime.
 - **Depends on:** LUA-6; consumes LUA-3/LUA-4/LUA-5 boundaries.
-- **Ordering:** after LUA-6; precedes LUA-22 and LUA-23 (independent of each
-  other), then LUA-7 and LUA-19.
+- **Ordering:** after LUA-6; precedes LUA-22, LUA-23 and LUA-24 (independent of
+  each other), then LUA-7 and LUA-19.
 - **Relevant decisions:** D-7, D-16, D-17, D-20, D-21, D-22, D-23, D-24, D-25,
-  D-26, D-27, D-30.
+  D-26, D-27, D-30, D-31.
 - **Acceptance signals:** failed init runs no later hook and reports TID, owner,
   source, phase, error and traceback; safe failure leaves peers running; an
   unsafe shared-state failure reaches the application's escalation; pause
   during a yielded callback freezes it and paused callbacks do not run; retained
   events resume in admission order ahead of new ones and overflow is refused
-  explicitly; a continuous producer cannot starve a due update; stop while paused
-  and stop of partial or suspended work clean up once; cancellation before an
-  update finishes still runs `shutdown` once; shutdown failure is retained and
+  explicitly; stop while paused and stop of partial or suspended work clean up
+  once; cancellation before a callback or `run` finishes still runs `shutdown`
+  once; shutdown failure is retained and
   runtime cleanup still happens; repeated controls never resurrect an instance;
   references shared with live instances remain valid; identical logical inputs
   retain ordering. Tests use injected clocks and barriers, not sleeps.
 - **Out of scope:** engine-owned leases on Lua-exposed resources (LUA-22); Lua
   lifecycle-operation bindings, Lua inspection, cross-owner control and
-  deterministic logical control admission (LUA-23); module eviction/hot
+  deterministic logical control admission (LUA-23); periodic update cadence
+  (LUA-24); module eviction/hot
   reload, real event providers (LUA-7), CLI/window assembly, forced preemption,
   transactions for arbitrary game bindings.
 - **Open questions:** None; contract accepted (D-26/D-27), readiness renewed by
@@ -2458,6 +2489,46 @@ and verified policy, with adversarial regression coverage.
   registries, synchronous cross-owner Lua entry, rollback, forced interruption.
 - **Open questions:** None.
 
+### LUA-24. Run instance updates on logical and elapsed cadences
+
+> Ready for issue processing under D-30 and D-31: carved out of LUA-18 with no
+> added scope.
+
+- **Outcome:** an instance admitted with an update interval has `update(self, dt)`
+  invoked when due, on gameplay's logical timeline or the UI's elapsed one, with
+  pause and lateness handled as the contract says.
+- **Scope:** an interval chosen at admission: none, a logical interval or an
+  elapsed interval, with neither kind hard-coded to UI or gameplay; logical
+  intervals as positive integer ticks, a convenience duration converted exactly
+  with the application's configured positive tick duration or refused, the first
+  update due one interval after successful `init`, and the granted `dt` fixed at
+  the invocation's start and kept across waits and real delays; elapsed intervals
+  on the monotonic source with at most one unstarted refresh, obsolete demand
+  coalesced without dropping queued events, `dt` the elapsed time between update
+  starts (from successful `init`, rebased at resume) and lateness moving the
+  deadline to the next point strictly in the future with no catch-up burst; no
+  periodic demand while paused, an already-admitted update kept, and the first
+  newly due update one full interval after resume; due updates sharing LUA-18's
+  ordered invocation queue so a continuous event producer cannot starve one; the
+  instance's timer demand cancelled on every termination path; the README's
+  cadence section.
+- **Phase:** script authoring and lifetime.
+- **Depends on:** LUA-18.
+- **Ordering:** after LUA-18; independent of LUA-22 and LUA-23; precedes LUA-19.
+- **Relevant decisions:** D-15, D-21, D-22, D-23, D-26, D-31.
+- **Acceptance signals:** exact tick conversion or refusal; the first update one
+  interval after `init`; the granted `dt` kept across a wait; UI coalescing with
+  no catch-up burst and elapsed `dt` rebased at resume; no periodic demand during
+  pause; a continuous producer cannot starve a due update; stop cancels timer
+  demand; identical logical inputs give identical update order and `dt` under
+  varied delays and timer wake timings. Tests use injected clocks and fake timer
+  wakes, not sleeps.
+- **Out of scope:** frame-driven presentation updates, a gameplay simulation
+  driver, the application's clock pause or speed policy, changing an instance's
+  interval while it runs.
+- **Open questions:** None; the contract's "Cadence and control defaults" fix
+  the behavior.
+
 ### LUA-7. Add bounded asynchronous requests and owned subscriptions
 
 > Deferred: owner renews trusted-path readiness for this slice. The 2026-10-15 narrow renewal covers LUA-2 and LUA-3 only.
@@ -2495,8 +2566,8 @@ and verified policy, with adversarial regression coverage.
   event-only and one-shot examples, console invocation/exit tests and Lua-owned
   library contract tests. No `--group` flag.
 - **Phase:** runnable consumer.
-- **Depends on:** LUA-18, LUA-7.
-- **Ordering:** after the instance and provider APIs, before LUA-8.
+- **Depends on:** LUA-18, LUA-24, LUA-7.
+- **Ordering:** after the instance, cadence and provider APIs, before LUA-8.
 - **Relevant decisions:** D-20, D-21, D-22, D-23, D-24, D-25.
 - **Acceptance signals:** start/inspect/control an instance; failed init names
   the instance and cause; one-shot completion exits cleanly; looped examples
@@ -2519,7 +2590,7 @@ and verified policy, with adversarial regression coverage.
   real-interpreter acceptance; reproduction commands and bounded optional
   profiling workloads delivered in the same PR.
 - **Phase:** trusted integrated acceptance.
-- **Depends on:** LUA-6, LUA-18, LUA-22, LUA-23, LUA-7, LUA-19.
+- **Depends on:** LUA-6, LUA-18, LUA-22, LUA-23, LUA-24, LUA-7, LUA-19.
 - **Ordering:** after instance/provider/runner delivery, independent of Q-5;
   no Vulkan or GLFW dependency.
 - **Relevant decisions:** D-1, D-2, D-3, D-4, D-7, D-12, D-13, D-14.
@@ -2706,7 +2777,7 @@ and verified policy, with adversarial regression coverage.
 
 The trusted dependency order is LUA-2 after the delivered LUA-1; LUA-3 after
 LUA-2; LUA-5 after LUA-3 and the delivered LUA-4; then LUA-6 (as LUA-20 and
-LUA-21, then LUA-6, under D-29), LUA-18, LUA-22 and LUA-23, LUA-7, LUA-19 and
+LUA-21, then LUA-6, under D-29), LUA-18, then LUA-22, LUA-23 and LUA-24 (D-31), LUA-7, LUA-19 and
 LUA-8 under D-25 and D-30. LUA-6 retains external TIME-1; LUA-7 consumes the
 instance ownership API and introduces no second clock implementation.
 The shared VK-1 toolchain prerequisite remains satisfied.
@@ -2716,7 +2787,7 @@ platform proofs; LUA-10, LUA-11, and LUA-13 in parallel; LUA-12 after both
 platform slices and TIME-1; LUA-16 after LUA-6/LUA-7/LUA-12/LUA-13; then
 LUA-17 after LUA-8/LUA-16. Stable IDs are preserved, with LUA-16/LUA-17
 retaining the confined integration and acceptance removed from LUA-5/LUA-8.
-There are twenty-three delivery slices. All of this can run alongside
+There are twenty-four delivery slices. All of this can run alongside
 graphics implementation. Coordinate the shared Cabal project, CI
 catalog/workflow, and any narrow foundation evidence change; parallel work
 does not authorize conflicting edits or duplicate platform infrastructure.
