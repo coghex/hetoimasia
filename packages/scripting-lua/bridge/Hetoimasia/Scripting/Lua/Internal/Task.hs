@@ -61,6 +61,7 @@ module Hetoimasia.Scripting.Lua.Internal.Task
   , TaskStep (..)
   , WaitRequest (..)
   , startTask
+  , startTaskVia
   , resumeTask
   , closeTask
   , liveTaskReferences
@@ -92,7 +93,6 @@ import Hetoimasia.Scripting.Lua.Internal.Module
   , Prepared (..)
   , effectNow
   , faultOf
-  , prepareEntry
   , readResults
   )
 import qualified Hetoimasia.Scripting.Lua.Internal.Module as Module
@@ -185,11 +185,21 @@ closeOperation = operation "close-task"
 -- the module does not define answers 'TaskEntryAbsent' and runs nothing. A
 -- failure of the first segment is raised, and leaves no task behind.
 startTask ∷ HasCallStack ⇒ Host → ModuleHandle → Text → [Value] → IO TaskStart
-startTask host handle name arguments =
+startTask = startTaskWith Module.NoLead
+
+-- | Run an entry point as a task through a driver's entry point: the driver's
+-- function is what the coroutine runs, handed the entry point first and then the
+-- values. See 'Module.Lead'. The task is named for the entry point's own module
+-- and entry, which is what a fault and a binding it calls report.
+startTaskVia ∷ HasCallStack ⇒ Host → ModuleHandle → Text → ModuleHandle → Text → [Value] → IO TaskStart
+startTaskVia host driver driverName = startTaskWith (Module.Lead driver driverName) host
+
+startTaskWith ∷ HasCallStack ⇒ Module.Lead → Host → ModuleHandle → Text → [Value] → IO TaskStart
+startTaskWith lead host handle name arguments =
   withOperationContext luaComponent startOperation [("module", moduleRefName ref), ("entry", name)] $
     withOpenVm vm startOperation $ \state → do
       entry ← lua_gettop state
-      prepared ← prepareEntry host StartTask startOperation handle name arguments state entry
+      prepared ← Module.prepareEntryWith lead host StartTask startOperation handle name arguments state entry
       case prepared of
         PreparedAbsent → pure TaskEntryAbsent
         PreparedReady declared count → do
