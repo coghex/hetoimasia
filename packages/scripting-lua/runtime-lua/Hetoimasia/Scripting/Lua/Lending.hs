@@ -13,6 +13,16 @@
 -- in one callback are there for a later one, because the collection is the
 -- owner's and outlives every callback.
 --
+-- = The handle
+--
+-- The application makes a 'Lending' with 'newLending', closes the bindings that
+-- use the collection over it, and gives it to the owner it creates
+-- ('Hetoimasia.Scripting.Lua.Scheduled.scheduledLending'). A handle serves one
+-- owner: giving it to a second is refused with 'LendingInUse'. That is the whole
+-- of how a binding reaches the collection. There is no registry of owners and no
+-- lookup by thread, so a binding can use only the owner whose handle it was given,
+-- and an owner with no handle lends nothing.
+--
 -- = What is lent, and for how long
 --
 -- Each callback of the owner's VM is lent the collection for exactly its
@@ -24,8 +34,9 @@
 -- closed the VM, so the last of those still find it.
 --
 -- A loan is a 'LentCollection'. It is never a Lua value and cannot be made by a
--- client; a binding that wants the collection asks 'lentToCallback' when its
--- action runs. It is valid for that callback, on that callback's thread:
+-- client; a binding that wants the collection asks 'lentToCallback' with its
+-- handle when its action runs. It is valid for that callback, on that callback's
+-- thread:
 --
 -- * once the callback has returned, every operation through it is refused with
 --   'LoanEnded', including in a later callback of the same VM;
@@ -34,9 +45,10 @@
 --   running and goes on using it. Whether a thread is this VM's callback is
 --   decided by the record the VM keeps of its callbacks, which is the one that
 --   refuses an operation re-entered from a callback, and never by what a thread
---   says of itself;
--- * a thread that is not running a callback of an owner that lends finds nothing
---   to ask for, and 'lentToCallback' refuses it with 'NoLoan'.
+--   says of itself. Asking for the loan is not what is checked: a thread that can
+--   ask, because it holds the handle, still cannot use what it is given;
+-- * while the owner's VM is running no callback there is nothing lent, and
+--   'lentToCallback' refuses with 'NoLoan'.
 --
 -- A refusal is raised before the operation has any effect, and does not
 -- invalidate the loan: the callback it was lent to goes on using it. The
@@ -63,7 +75,9 @@
 -- when the owner fails or is cancelled.
 module Hetoimasia.Scripting.Lua.Lending
   ( -- * The collection a callback was lent
-    LentCollection
+    Lending
+  , newLending
+  , LentCollection
   , lentToCallback
 
     -- * Members
@@ -92,21 +106,22 @@ import Hetoimasia.Foundation.Resource.OwnedCollection
   )
 import Hetoimasia.Foundation.Failure (operation, throwFailure)
 import Hetoimasia.Scripting.Lua.Lending.Loan
-  ( LendingRefused (..)
+  ( Lending
+  , LendingRefused (..)
   , LentCollection
-  , loanOfThisThread
+  , currentLoan
+  , newLending
   , presenting
   )
 import Hetoimasia.Scripting.Lua.Runtime.Shared (runtimeComponent)
 
--- | What the callback the calling thread is running was lent: the collection of
--- the scheduled owner whose VM is running it.
+-- | What the callback the handle's owner is running was lent: the owner's
+-- collection.
 --
--- Refused with 'NoLoan' from a thread that is not running such a callback, a
--- thread a callback started included.
-lentToCallback ∷ HasCallStack ⇒ IO LentCollection
-lentToCallback =
-  loanOfThisThread >>= maybe (throwFailure runtimeComponent (operation "lent-collection") [] NoLoan) pure
+-- Refused with 'NoLoan' while the owner's VM is running no callback.
+lentToCallback ∷ HasCallStack ⇒ Lending → IO LentCollection
+lentToCallback lending =
+  currentLoan lending >>= maybe (throwFailure runtimeComponent (operation "lent-collection") [] NoLoan) pure
 
 -- | 'Hetoimasia.Foundation.Resource.OwnedCollection.acquireOwnedMember' on the
 -- lent collection.

@@ -1,45 +1,51 @@
--- | The representations behind "Hetoimasia.Scripting.Lua.Lending": what a
--- callback is lent, the record of which thread was lent what, and the scope a
--- scheduled owner runs around each of its VM's callbacks to lend and take back.
+-- | The representations behind "Hetoimasia.Scripting.Lua.Lending": the handle an
+-- application gives a scheduled owner to lend through, what a callback is lent,
+-- and the scope the owner runs around each of its VM's callbacks to lend and take
+-- back.
 --
 -- This is a hidden module of the adapter. The public module re-exports the
--- operations over 'LentCollection' without its constructor and the refusal type
--- with its own, and the scheduled owner's run action alone builds a
+-- handle and the operations over 'LentCollection' without its constructor and the
+-- refusal type with its own, and the scheduled owner's run action alone builds a
 -- 'lendingScope'. A client cannot make a 'LentCollection', so it can only be
 -- given one by the callback it was lent to.
 --
--- = The record
+-- = The handle
 --
--- A scheduled owner's VM runs each callback on a thread of its own. The scope
--- enters that thread in one process-wide table, keyed by the thread, for exactly
--- the callback's duration, and removes it when the callback ends however it
--- ends. A binding's action finds what its own callback was lent by asking for its
--- own thread: a thread that is not running a lending callback finds nothing, and
--- a thread cannot find another thread's loan. The table holds a loan per
--- callback, not per VM, so a later callback of the same VM is lent a loan of its
--- own, and a loan kept from an earlier one is a different value that has ended.
+-- A 'Lending' belongs to one owner. The application makes it, closes the
+-- bindings that use the collection over it, and gives it to the owner it creates;
+-- there is no registry of owners and no ambient lookup. The handle holds the loan
+-- of the callback the owner's VM is running right now, if it is running one: an
+-- owner's VM runs one callback at a time, because a callback cannot ask its own
+-- VM for anything and the owner's thread is inside Lua until it returns. The
+-- scope sets it when a callback starts and puts back what was there when it ends,
+-- however it ends.
 --
 -- = Who may present a loan
 --
--- Presenting a loan asks three questions before anything else happens, and an
--- operation that fails any of them has no effect. Has the callback it was lent to
--- returned? Is the presenting thread one of the VM's recorded callback threads,
--- by the same record the VM uses to refuse an operation re-entered from a
--- callback? And is it the thread this loan was lent to? A thread the callback
--- started fails the second, another VM's callback fails it too, and a later
--- callback of this VM fails the first because its predecessor's loan ended. The
--- identity is never the callback's own claim: the loan keeps no thread the VM
--- did not record, because the scope runs inside the VM's record of the thread.
+-- Asking the handle for the loan says nothing about whether the asker may use it:
+-- a thread a callback started can ask, and so can another VM's callback holding
+-- the same handle by mistake. Presenting a loan asks three questions before
+-- anything else happens, and an operation that fails any of them has no effect.
+-- Has the callback it was lent to returned? Is the presenting thread one of the
+-- VM's recorded callback threads, by the same record the VM uses to refuse an
+-- operation re-entered from a callback? And is it the thread this loan was lent
+-- to? A thread the callback started fails the second, another VM's callback fails
+-- it too, and a later callback of this VM fails the first because its
+-- predecessor's loan ended. The identity is never the callback's own claim: the
+-- scope runs inside the VM's record of the thread.
 --
 -- The foundation capability behind a loan is itself lent for the callback's
 -- duration, and so is revoked on every exit from it: a loan that somehow reached
 -- the foundation's operations after the callback would meet
 -- 'Hetoimasia.Foundation.Resource.OwnedCollection.CapabilityStale' there.
 module Hetoimasia.Scripting.Lua.Lending.Loan
-  ( LentCollection (..)
+  ( Lending
+  , newLending
+  , bindLending
+  , currentLoan
+  , LentCollection (..)
   , LendingRefused (..)
   , lendingScope
-  , loanOfThisThread
   , presenting
   ) where
 
@@ -47,8 +53,6 @@ import Control.Concurrent (ThreadId, myThreadId)
 import Control.Exception (Exception, finally)
 import Control.Monad (unless)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
-import Data.Map.Strict (Map)
-import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import GHC.Stack (HasCallStack)
 import Hetoimasia.Foundation.Failure (operation, throwFailure)
@@ -59,7 +63,6 @@ import Hetoimasia.Foundation.Resource.OwnedCollection
   )
 import Hetoimasia.Scripting.Lua.Internal.Vm (CallbackScope (CallbackScope), CallbackSite (siteIsCallback))
 import Hetoimasia.Scripting.Lua.Runtime.Shared (runtimeComponent)
-import System.IO.Unsafe (unsafePerformIO)
 
 -- | A scheduled owner's collection, lent to one callback of its VM.
 --
@@ -79,8 +82,7 @@ data LentCollection = LentCollection
 
 -- | Why a collection was not lent to the thread that used it.
 data LendingRefused
-  = -- | The thread is not running a callback of an owner that lends a
-    -- collection, so there is nothing to find.
+  = -- | The handle's owner is running no callback, so nothing is lent.
     NoLoan
   | -- | The callback the collection was lent to has returned.
     LoanEnded
@@ -88,15 +90,35 @@ data LendingRefused
     -- lent to, whether a thread that callback started, another VM's callback, or
     -- any other thread.
     LoanElsewhere
+  | -- | The handle already belongs to an owner. A handle serves one owner.
+    LendingInUse
   deriving (Eq, Show)
 
 instance Exception LendingRefused
 
--- | Every loan being lent right now, by the thread of the callback it was lent
--- to.
-loans ∷ IORef (Map ThreadId LentCollection)
-loans = unsafePerformIO (newIORef Map.empty)
-{-# NOINLINE loans #-}
+-- | What an application gives one scheduled owner to lend through, and its
+-- bindings use to find what their callback was lent.
+data Lending = Lending
+  { lendingCurrent ∷ !(IORef (Maybe LentCollection))
+    -- ^ The loan of the callback the owner's VM is running, if it is running one.
+  , lendingBound ∷ !(IORef Bool)
+    -- ^ Whether an owner has taken the handle.
+  }
+
+-- | A handle that no owner has taken yet and that holds no loan.
+newLending ∷ IO Lending
+newLending = Lending <$> newIORef Nothing <*> newIORef False
+
+-- | Take the handle for an owner. A handle serves one owner, so a second is
+-- refused with 'LendingInUse' before it does anything.
+bindLending ∷ HasCallStack ⇒ Lending → IO ()
+bindLending lending = do
+  taken ← atomicModifyIORef' (lendingBound lending) (\held → (True, held))
+  if taken then refuse "bind-lending" LendingInUse else pure ()
+
+-- | What the handle's owner is lending right now, if its VM is running a callback.
+currentLoan ∷ Lending → IO (Maybe LentCollection)
+currentLoan = readIORef . lendingCurrent
 
 -- | The scope an owner runs around each of its VM's callbacks to lend its
 -- collection: the loan exists exactly while the callback runs, on the callback's
@@ -104,23 +126,16 @@ loans = unsafePerformIO (newIORef Map.empty)
 --
 -- The owner holds the capability on its own thread, and each callback is lent a
 -- capability derived from it, so revoking one callback's loan touches no other.
-lendingScope ∷ OwnedCollection → OwnerCapability → CallbackScope
-lendingScope collection capability = CallbackScope $ \site action → do
+lendingScope ∷ Lending → OwnedCollection → OwnerCapability → CallbackScope
+lendingScope lending collection capability = CallbackScope $ \site action → do
   self ← myThreadId
   lendCapability capability $ \lent → do
     active ← newIORef True
     let loan = LentCollection collection lent self active (siteIsCallback site)
-    earlier ← atomicModifyIORef' loans (\held → (Map.insert self loan held, Map.lookup self held))
+    earlier ← atomicModifyIORef' (lendingCurrent lending) (\held → (Just loan, held))
     action `finally` do
       writeIORef active False
-      atomicModifyIORef' loans $ \held →
-        (maybe (Map.delete self held) (\kept → Map.insert self kept held) earlier, ())
-
--- | What the calling thread's callback was lent, if it is running one that was.
-loanOfThisThread ∷ IO (Maybe LentCollection)
-loanOfThisThread = do
-  self ← myThreadId
-  Map.lookup self <$> readIORef loans
+      writeIORef (lendingCurrent lending) earlier
 
 -- | Run an operation on the loan's collection, presenting its capability, after
 -- the loan has been checked. A refusal is raised before the operation has any

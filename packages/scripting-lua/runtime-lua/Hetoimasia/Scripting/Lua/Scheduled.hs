@@ -122,12 +122,14 @@
 --
 -- = Lending a collection
 --
--- The owner's thread holds a resource collection that is owned by a capability and
--- not by a thread, around the VM's lifetime, and lends it to each synchronous
--- callback of its VM for exactly the callback's duration, so a binding's action
--- can acquire, borrow and retire members on the owner's behalf even though it runs
--- on a thread of its own. "Hetoimasia.Scripting.Lua.Lending" says what a binding
--- asks for, and when and from where the loan is refused: after the callback has
+-- An owner the application gave a 'Lending' handle ('scheduledLending') holds a
+-- resource collection that is owned by a capability and not by a thread, on its
+-- own thread around the VM's lifetime, and lends it to each synchronous callback of
+-- its VM for exactly the callback's duration, so a binding's action can acquire,
+-- borrow and retire members on the owner's behalf even though it runs on a thread
+-- of its own. The bindings reach it through the handle they were built over.
+-- "Hetoimasia.Scripting.Lua.Lending" says what a binding asks for, and when and
+-- from where the loan is refused: after the callback has
 -- returned, from a thread it started, from another VM's callback. The collection
 -- holds at most 'scheduledMemberLimit' members. It stays open while the VM closes,
 -- so a coroutine's closing handlers and a finalizer-eligible binding still find
@@ -257,6 +259,7 @@ module Hetoimasia.Scripting.Lua.Scheduled
 import Control.Concurrent.STM (STM, atomically, modifyTVar', newTVar, newTVarIO, orElse, readTVar, retry, writeTVar)
 import Control.Exception (ExceptionWithContext, SomeException, evaluate, mask, mask_, onException)
 import Control.Monad (join, when)
+import Data.Foldable (traverse_)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -301,6 +304,7 @@ import Hetoimasia.Scripting.Lua.Runtime.Types
   , Payload (OverBound, WithinBounds)
   , ownerSequence
   )
+import Hetoimasia.Scripting.Lua.Lending.Loan (Lending, bindLending)
 import Hetoimasia.Scripting.Lua.Scheduled.Run (runScheduledOwner)
 import Hetoimasia.Scripting.Lua.Scheduled.Types
 import Hetoimasia.Scripting.Lua.Scheduler
@@ -357,15 +361,18 @@ data ScheduledSpec = ScheduledSpec
   , scheduledObserve ∷ SegmentContext → IO ()
     -- ^ Told, on the owner's thread, what each segment is about to be handed. An
     -- exception it raises is a failure of the host.
+  , scheduledLending ∷ Maybe Lending
+    -- ^ The handle the owner lends its collection through, if the application's
+    -- bindings use one. A handle serves one owner. Without it the owner holds no
+    -- collection. See "Hetoimasia.Scripting.Lua.Lending".
   , scheduledMemberLimit ∷ Int
     -- ^ The most members the owner's collection holds live at once. At least one:
-    -- a lower limit is refused when the owner is created. See
-    -- "Hetoimasia.Scripting.Lua.Lending".
+    -- a lower limit is refused when the owner is created.
   }
 
 -- | A configuration with the supplied defaults: the FIFO policy, the production
--- clock and timer, the gameplay domain, nothing observing segments and room for
--- 'defaultMemberLimit' members in the owner's collection.
+-- clock and timer, the gameplay domain, nothing observing segments, no lending
+-- handle and room for 'defaultMemberLimit' members when there is one.
 scheduledSpec ∷ VmConfig → WorkerPolicy → SchedulerBounds → ScheduledSpec
 scheduledSpec config worker bounds =
   ScheduledSpec
@@ -377,6 +384,7 @@ scheduledSpec config worker bounds =
     , scheduledClock = monotonicSource
     , scheduledTimer = systemTimerBackend
     , scheduledObserve = \_ → pure ()
+    , scheduledLending = Nothing
     , scheduledMemberLimit = defaultMemberLimit
     }
 
@@ -436,6 +444,9 @@ startScheduledOwner runtime spec = do
         , schedStopRequested = stopping
         }
       >>= either (throwFailure runtimeComponent (operation "start-scheduled-owner") []) pure
+  -- The handle is taken once the configuration is known to be acceptable and
+  -- before anything starts.
+  traverse_ bindLending (scheduledLending spec)
   control ←
     Control owner label (vmValueLimits config) scheduler
       <$> newTVarIO Map.empty
@@ -454,7 +465,7 @@ startScheduledOwner runtime spec = do
                 -- everything that already ended the owner has done this.
                 (\held → atomically (settleAll held ExitFailed))
           )
-          (\_ held → runScheduledOwner stopping held handoff (scheduledObserve spec) (scheduledMemberLimit spec) config)
+          (\_ held → runScheduledOwner stopping held handoff (scheduledObserve spec) (scheduledLending spec) (scheduledMemberLimit spec) config)
   -- Acquisition is masked from the worker's start to the endpoint's handoff, and
   -- only the readiness wait is restored, exactly as for a finite-call owner.
   mask $ \restore → do

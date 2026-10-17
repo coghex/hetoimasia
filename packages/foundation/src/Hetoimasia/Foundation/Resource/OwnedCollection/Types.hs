@@ -71,6 +71,9 @@ data Gate = Gate
   , gateHolder ∷ !(Maybe (ThreadId, Int))
     -- ^ The thread currently inside an operation, with how many nested
     -- operations it has open. 'Nothing' when no operation is running.
+  , gateExiting ∷ !(Maybe ThreadId)
+    -- ^ The thread running the scope's exit, once the exit has begun: the one
+    -- thread that may still read the live count while members are released.
   }
 
 -- | Whether new operations are admitted.

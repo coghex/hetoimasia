@@ -49,7 +49,7 @@ import Control.Exception
   )
 import Control.Monad (forM, forM_, void)
 import Data.Foldable (for_)
-import Data.IORef (IORef, mkWeakIORef, newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, atomicModifyIORef', mkWeakIORef, newIORef, readIORef, writeIORef)
 import Data.Maybe (isJust)
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -148,6 +148,8 @@ spec = do
       testReentryFromRetirementRelease
     it "rejects acquisition, borrowing, and retirement re-entered from a release at exit"
       testReentryFromClosingRelease
+    it "lets a release at exit read the live count, while another thread is refused"
+      (boundedExample testLiveCountFromClosingRelease)
 
   describe "Owned resource collection capability" $ do
     it "refuses every operation that presents no capability before any effect"
@@ -863,6 +865,38 @@ testReentryFromClosingRelease = do
                    , "release self"
                    , "release existing"
                    ]
+
+testLiveCountFromClosingRelease ∷ Expectation
+testLiveCountFromClosingRelease = do
+  events ← newTrail
+  slot ← newIORef Nothing
+  seen ← newIORef []
+  let counting name =
+        acquirePart
+          name
+          (releaseRank 0)
+          (name <$ record events ("acquire " <> name))
+          ( \_ → do
+              readIORef slot >>= \case
+                Nothing → pure ()
+                Just collection → do
+                  count ← liveMemberCount collection
+                  elsewhere ← rejection (onThread (liveMemberCount collection))
+                  atomicModifyIORef' seen (\held → (held <> [(name, count, elsewhere)], ()))
+              record events ("release " <> name)
+          )
+  withOwned 2 $ \collection → do
+    _ ← acquireMember collection (counting "first")
+    _ ← acquireMember collection (counting "second")
+    writeIORef slot (Just collection)
+  -- The thread running the exit may read, as the thread-owned collection's owner
+  -- may; every other thread is refused, whatever the exit is doing.
+  readIORef seen
+    `shouldReturn` [ ("second", 0, Just (OwnedReentered Closing))
+                   , ("first", 0, Just (OwnedReentered Closing))
+                   ]
+  trail events
+    `shouldReturn` ["acquire first", "acquire second", "release second", "release first"]
 
 -- Terminal tokens ------------------------------------------------------------
 

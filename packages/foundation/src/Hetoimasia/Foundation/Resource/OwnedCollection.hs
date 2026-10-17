@@ -64,7 +64,11 @@
 --
 -- The scope's exit is serialized with the operations like any other user. It
 -- first closes admission: from then on an operation made on any thread is
--- rejected with @'OwnedReentered' 'Closing'@, and nothing new begins. It then
+-- rejected with @'OwnedReentered' 'Closing'@, and nothing new begins. The one
+-- exception is the thread running the exit, which may still call
+-- 'liveOwnedMemberCount' (a release at exit can inspect the collection it is
+-- being released from, as one of the thread-owned collection's can); no other
+-- thread may. It then
 -- waits for the operation that was already admitted, an acquisition, a handoff,
 -- a borrow or a retirement, to finish, and only then releases the live members,
 -- newest first, each member's parts in the order its 'Assembly' declared. The
@@ -292,11 +296,13 @@ lendCapability parent action = mask $ \restore → do
 
 -- | The number of members currently live. Rejected with 'OwnedClosed' once the
 -- collection's scope has exited. Reading it while the collection is busy changes
--- nothing, so the thread inside an operation may call it; another thread is
--- refused with 'ConcurrentPresentation'.
+-- nothing, so the thread inside an operation may call it, and so may the thread
+-- running the scope's exit while it releases members; another thread is refused
+-- with 'ConcurrentPresentation', or with @'OwnedReentered' 'Closing'@ once the
+-- exit has begun.
 liveOwnedMemberCount ∷ OwnedCollection → OwnerCapability → IO Int
 liveOwnedMemberCount collection capability =
-  mask_ . inGate collection capability $
+  mask_ . inGate collection capability Reading $
     Map.size <$> readIORef (ownedLive collection)
 
 -- | Build one member from an 'Assembly' and register it.
@@ -329,7 +335,7 @@ acquireOwnedMember collection capability assembly =
 acquireOwnedMemberThen
   ∷ OwnedCollection → OwnerCapability → Assembly a → (Member a → IO b) → IO b
 acquireOwnedMemberThen collection capability assembly handoff = mask $ \restore →
-  inGate collection capability $ do
+  inGate collection capability Mutating $ do
     requireOpen collection
     requireNoBorrow collection
     latched ← readIORef (ownedLatched collection)
@@ -365,7 +371,7 @@ acquireOwnedMemberThen collection capability assembly handoff = mask $ \restore 
 withOwnedMember
   ∷ OwnedCollection → OwnerCapability → Member a → (a → IO r) → IO r
 withOwnedMember collection capability member@(Member _ _ state) action = mask $ \restore →
-  inGate collection capability $ do
+  inGate collection capability Mutating $ do
     requireOwnMember collection member
     requireOpen collection
     held ← readIORef state
@@ -398,7 +404,7 @@ withOwnedMember collection capability member@(Member _ _ state) action = mask $ 
 -- with every cleanup failure retained.
 retireOwnedMember ∷ OwnedCollection → OwnerCapability → Member a → IO Retirement
 retireOwnedMember collection capability member@(Member _ identifier state) =
-  mask_ . inGate collection capability $ do
+  mask_ . inGate collection capability Mutating $ do
     requireOwnMember collection member
     requireOpen collection
     held ← readIORef state
@@ -435,7 +441,7 @@ newOwnedCollection limit = do
   identity ← newUnique
   collection ←
     OwnedCollection identity limit
-      <$> newTVarIO (Gate Admitting Nothing)
+      <$> newTVarIO (Gate Admitting Nothing Nothing)
       <*> newIORef PhaseOpen
       <*> newIORef 0
       <*> newIORef 0
@@ -453,7 +459,8 @@ newOwnedCollection limit = do
 -- the collection, and a cancellation of the scope must not abandon the release.
 closeOwnedCollection ∷ OwnedCollection → IO [CleanupFailure]
 closeOwnedCollection collection = do
-  atomically (modifyTVar' (ownedGate collection) (\gate → gate {gateAdmission = Draining}))
+  self ← myThreadId
+  atomically (modifyTVar' (ownedGate collection) (\gate → gate {gateAdmission = Draining, gateExiting = Just self}))
   uninterruptibleMask_ . atomically $ do
     gate ← readTVar (ownedGate collection)
     check (isNothing (gateHolder gate))
@@ -490,18 +497,29 @@ latch ∷ OwnedCollection → [CleanupFailure] → IO ()
 latch collection failures =
   modifyIORef' (ownedLatched collection) (reverse failures <>)
 
+-- | What an operation does to the collection.
+data Access
+  = -- | It changes the collection, or lends its members.
+    Mutating
+  | -- | It only reads, and so the thread running the scope's exit may make it.
+    Reading
+
 -- | Run an operation as the collection's one active user, admitting it first and
 -- leaving on every exit. The caller is masked.
 --
 -- Admission reads the capability and the gate in one transaction, so a
 -- capability cannot be revoked between its check and the operation's entry. A
--- refusal is raised before the operation has any effect.
-inGate ∷ OwnedCollection → OwnerCapability → IO a → IO a
-inGate collection capability operation = do
+-- refusal is raised before the operation has any effect. A read by the exiting
+-- thread is admitted without holding the gate, since the exit is the only user
+-- by then.
+inGate ∷ OwnedCollection → OwnerCapability → Access → IO a → IO a
+inGate collection capability access operation = do
   self ← myThreadId
-  refusal ← atomically (admit collection capability self)
-  traverse_ throwIO refusal
-  operation `finally` leave collection
+  admitted ← atomically (admit collection capability access self)
+  case admitted of
+    Left refusal → throwIO refusal
+    Right True → operation `finally` leave collection
+    Right False → operation
 
 -- | Why a capability is not valid for this collection, if it is not.
 capabilityRefusal ∷ OwnerCapability → STM (Maybe OwnedCollectionError)
@@ -511,27 +529,34 @@ capabilityRefusal capability = case capability of
     valid ← readTVar flag
     pure (if valid then Nothing else Just CapabilityStale)
 
--- | Admit one operation of the thread @self@, or say why not. Writes only when
--- it admits.
-admit ∷ OwnedCollection → OwnerCapability → ThreadId → STM (Maybe OwnedCollectionError)
-admit collection capability self = case capability of
+-- | Admit one operation of the thread @self@, or say why not. Answers whether it
+-- now holds the gate. Writes only when it admits and holds.
+admit
+  ∷ OwnedCollection
+  → OwnerCapability
+  → Access
+  → ThreadId
+  → STM (Either OwnedCollectionError Bool)
+admit collection capability access self = case capability of
   OwnerCapability issuer _
-    | issuer /= ownedIdentity collection → pure (Just CapabilityForeign)
+    | issuer /= ownedIdentity collection → pure (Left CapabilityForeign)
   _ → do
     refused ← capabilityRefusal capability
     case refused of
-      Just refusal → pure (Just refusal)
+      Just refusal → pure (Left refusal)
       Nothing → do
         gate ← readTVar (ownedGate collection)
         case gateAdmission gate of
-          Shut → pure (Just OwnedClosed)
-          Draining → pure (Just (OwnedReentered Closing))
+          Shut → pure (Left OwnedClosed)
+          Draining → pure $ case access of
+            Reading | gateExiting gate == Just self → Right False
+            _ → Left (OwnedReentered Closing)
           Admitting → case gateHolder gate of
-            Nothing → Nothing <$ writeTVar (ownedGate collection) gate {gateHolder = Just (self, 1)}
+            Nothing → Right True <$ writeTVar (ownedGate collection) gate {gateHolder = Just (self, 1)}
             Just (holder, depth)
               | holder == self ->
-                  Nothing <$ writeTVar (ownedGate collection) gate {gateHolder = Just (self, depth + 1)}
-              | otherwise → pure (Just ConcurrentPresentation)
+                  Right True <$ writeTVar (ownedGate collection) gate {gateHolder = Just (self, depth + 1)}
+              | otherwise → pure (Left ConcurrentPresentation)
 
 -- | Leave one operation: the thread's nesting drops by one, and the gate is free
 -- once it is back to none.

@@ -26,9 +26,11 @@
 --
 -- = The collection
 --
--- The owner's thread holds a resource collection owned by a capability, around
--- the VM's lifetime: allocated before the VM is constructed and closed after the
--- VM has closed, on this thread. Each callback of the VM is lent it for its
+-- An owner the application gave a 'Lending' handle holds a resource collection
+-- owned by a capability, on the owner's thread, around the VM's lifetime:
+-- allocated before the VM is constructed and closed after the VM has closed.
+-- An owner with no handle holds none and runs as it always did. Each callback of
+-- the VM is lent it for its
 -- duration ("Hetoimasia.Scripting.Lua.Lending"), so the callbacks of the initial
 -- chunks, of a coroutine's closing handlers and of a finalizer-eligible binding
 -- while the VM closes all find it open. Its exit releases what remains, newest
@@ -84,7 +86,7 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Failure (ReasonCode (ScriptFau
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Identity (TaskId)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Task (TaskFailure (TaskFailure))
 import Hetoimasia.Scripting.Lua.Internal.Vm (vmIdentity)
-import Hetoimasia.Scripting.Lua.Lending.Loan (lendingScope)
+import Hetoimasia.Scripting.Lua.Lending.Loan (Lending, lendingScope)
 import Hetoimasia.Scripting.Lua.Owner
   ( BoundaryFault (..)
   , CallResult (EntryAbsent, Returned)
@@ -103,6 +105,7 @@ import Hetoimasia.Scripting.Lua.Owner
   , loadedModule
   , resumeTask
   , startTask
+  , noCallbackScope
   , withVmOwnerScoped
   )
 import qualified Hetoimasia.Scripting.Lua.Owner as Owner
@@ -137,19 +140,20 @@ runScheduledOwner
   → Control
   → TVar (Maybe Control)
   → (SegmentContext → IO ())
+  → Maybe Lending
   → Int
   → VmConfig
   → IO ()
-runScheduledOwner stopping control handoff observe members config = mask $ \restore → do
+runScheduledOwner stopping control handoff observe lending members config = mask $ \restore → do
+  let body = serve stopping control handoff observe config
   outcome ←
-    tryWithContext @SomeException . restore $
+    tryWithContext @SomeException . restore $ case lending of
+      Nothing → withVmOwnerScoped noCallbackScope config body
       -- The collection is allocated first and so released last: after the VM's
       -- close, which is the last thing 'withVmOwnerScoped' does.
-      withScoped (allocOwnedCollection members) $ \(collection, capability) →
-        withVmOwnerScoped
-          (lendingScope collection capability)
-          config
-          (serve stopping control handoff observe config)
+      Just handle →
+        withScoped (allocOwnedCollection members) $ \(collection, capability) →
+          withVmOwnerScoped (lendingScope handle collection capability) config body
   -- An exit before the body, or a failure of the close itself: nothing of the
   -- tasks is left to settle then, and this records how the owner ended.
   atomically (settleAll control (either exitOf (const ExitStopped) outcome))

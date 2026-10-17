@@ -62,6 +62,8 @@ data LFixture = LFixture
     -- ^ Each release and the thread it ran on, newest first.
   , lfGates ∷ !(IORef (Map Text (MVar ())))
   , lfEntered ∷ !(IORef (Map Text (MVar ())))
+  , lfLending ∷ !Lending
+    -- ^ The handle the fixture's first owner lends through.
   }
 
 newLFixture ∷ IO LFixture
@@ -74,6 +76,7 @@ newLFixture =
     <*> newIORef []
     <*> newIORef Map.empty
     <*> newIORef Map.empty
+    <*> newLending
 
 note ∷ LFixture → Text → IO ()
 note fixture entry = atomicModifyIORef' (lfLog fixture) (\held → (entry : held, ()))
@@ -140,6 +143,7 @@ describeRefusal failure
       NoLoan → "no loan"
       LoanEnded → "ended"
       LoanElsewhere → "elsewhere"
+      LendingInUse → "in use"
   | Just rejection ← fromException failure = Text.pack (show (rejection ∷ OwnedCollectionError))
   | otherwise = "unexpected: " <> Text.pack (show failure)
 
@@ -157,8 +161,8 @@ ok = either (error . ("registration refused: " <>) . show) id
 
 -- | The scheduler operations and fixture bindings of the shared fixture, and the
 -- lending bindings.
-lendRegistration ∷ LFixture → Registration
-lendRegistration fixture =
+lendRegistration ∷ LFixture → Lending → Registration
+lendRegistration fixture handle =
   ok (registration [] (registrationNamespaces (schedRegistration (lfBase fixture)) <> [lending]))
   where
     lending =
@@ -166,33 +170,33 @@ lendRegistration fixture =
         "lend"
         [ stateOperation "acquire" [SText] [] $ \arguments → do
             for1 arguments $ \name → do
-              lent ← lentToCallback
+              lent ← lentToCallback handle
               acquireLent lent (tracked fixture name) >>= remember fixture name
         , stateOperation "acquire_failing" [SText] [] $ \arguments →
             for1 arguments $ \name → do
-              lent ← lentToCallback
+              lent ← lentToCallback handle
               acquireLent lent (breaking fixture name) >>= remember fixture name
         , -- Like @acquire@, noting a rejection instead of raising it.
           stateOperation "try_acquire" [SText] [] $ \arguments →
             for1 arguments $ \name → do
-              lent ← lentToCallback
+              lent ← lentToCallback handle
               attemptNoting fixture ("try " <> name) (acquireLent lent (tracked fixture name) >>= remember fixture name)
         , stateOperation "borrow" [SText] [] $ \arguments →
             for1 arguments $ \name → do
-              lent ← lentToCallback
+              lent ← lentToCallback handle
               member ← recall fixture name
               withLentMember lent member (\held → note fixture ("borrow " <> held))
         , stateOperation "retire" [SText] [] $ \arguments →
             for1 arguments $ \name → do
-              lent ← lentToCallback
+              lent ← lentToCallback handle
               member ← recall fixture name
               retireLent lent member >>= \result → note fixture ("retired " <> name <> " " <> Text.pack (show result))
         , stateOperation "count" [] [SInteger] $ \_ → do
-            lent ← lentToCallback
+            lent ← lentToCallback handle
             (\n → [VInteger (fromIntegral n)]) <$> liveLentCount lent
         , -- Keeps this callback's loan for a later presentation.
           stateOperation "keep" [] [] $ \_ → do
-            lentToCallback >>= \lent → atomicModifyIORef' (lfKept fixture) (\_ → (Just lent, ()))
+            lentToCallback handle >>= \lent → atomicModifyIORef' (lfKept fixture) (\_ → (Just lent, ()))
             pure []
         , -- Presents the loan kept earlier, from this callback.
           stateOperation "reuse" [] [] $ \_ → do
@@ -201,15 +205,18 @@ lendRegistration fixture =
               Nothing → note fixture "reuse: nothing kept"
               Just lent → attemptNoting fixture "reuse" (void (acquireLent lent (tracked fixture "reused")))
             pure []
-        , -- A thread this callback starts presents the loan, and asks for one.
+        , -- A thread this callback starts presents the loan it was given, and the
+          -- loan it asks the handle for.
           stateOperation "child" [SText] [] $ \arguments →
             for1 arguments $ \name → do
-              lent ← lentToCallback
+              lent ← lentToCallback handle
               finished ← newEmptyMVar
               _ ←
                 forkIO $ do
-                  attemptNoting fixture "child acquire" (void (acquireLent lent (tracked fixture name)))
-                  attemptNoting fixture "child ask" (void lentToCallback)
+                  attemptNoting fixture "child acquire given" (void (acquireLent lent (tracked fixture name)))
+                  attemptNoting fixture "child acquire asked" $ do
+                    asked ← lentToCallback handle
+                    void (acquireLent asked (tracked fixture name))
                   putMVar finished ()
               takeMVar finished
               -- The refusals did not invalidate this callback's own access.
@@ -218,22 +225,24 @@ lendRegistration fixture =
           -- is opened, then uses the loan it was lent.
           stateOperation "hold" [SText] [] $ \arguments →
             for1 arguments $ \gate → do
-              lent ← lentToCallback
+              lent ← lentToCallback handle
               atomicModifyIORef' (lfKept fixture) (\_ → (Just lent, ()))
               blockAt fixture gate
               attemptNoting fixture "after hold" (acquireLent lent (tracked fixture "legit") >>= remember fixture "legit")
         , -- Keeps this callback's loan and fails the callback.
           stateOperation "keep_fail" [SText] [] $ \arguments →
             for1 arguments $ \kind → do
-              lentToCallback >>= \lent → atomicModifyIORef' (lfKept fixture) (\_ → (Just lent, ()))
+              lentToCallback handle >>= \lent → atomicModifyIORef' (lfKept fixture) (\_ → (Just lent, ()))
               throwIO (Broken kind)
         , stateOperation "block" [SText] [] $ \arguments → for1 arguments (blockAt fixture)
         , finalizerEligible . stateOperation "note" [SText] [] $ \arguments →
             for1 arguments (note fixture)
+        , -- A finalizer-eligible binding that fails.
+          finalizerEligible . stateOperation "gc_fail" [] [] $ \_ → throwIO (Broken "gc boom")
         , -- What a finalizer or a closing handler does with the collection.
           finalizerEligible . stateOperation "gc_acquire" [SText] [] $ \arguments →
             for1 arguments $ \name → do
-              lent ← lentToCallback
+              lent ← lentToCallback handle
               acquireLent lent (tracked fixture name) >>= remember fixture name
         ]
     for1 arguments act = case arguments of
@@ -338,8 +347,15 @@ lendModule = ModuleSource theModule lendSource lendEntries
 -- | A scheduled owner of this label that exposes the lending bindings, with the
 -- shared fixture's clock and fake timer and these initial chunks.
 lendingSpec ∷ LFixture → Text → WorkerPolicy → [(ChunkName, ByteString)] → ScheduledSpec
-lendingSpec fixture label worker chunks =
-  base {scheduledVm = (scheduledVm base) {vmRegistration = lendRegistration fixture, vmModules = [lendModule], vmInitialChunks = chunks}}
+lendingSpec fixture = lendingSpecFor fixture (lfLending fixture)
+
+-- | The same, lending through this handle, which its bindings are built over.
+lendingSpecFor ∷ LFixture → Lending → Text → WorkerPolicy → [(ChunkName, ByteString)] → ScheduledSpec
+lendingSpecFor fixture handle label worker chunks =
+  base
+    { scheduledVm = (scheduledVm base) {vmRegistration = lendRegistration fixture handle, vmModules = [lendModule], vmInitialChunks = chunks}
+    , scheduledLending = Just handle
+    }
   where
     base = scheduledWith (lfBase fixture) label ["sched", "fx", "lend"] worker defaultSchedulerBounds
 
@@ -427,14 +443,15 @@ spec = describe "a collection lent to the owner's callbacks (LUA-25)" $ do
         owner ← startLending fixture runtime (lendingSpec fixture "lends" requiredPolicy [])
         void (outcomeOf =<< task fixture owner "spawns" [VText "t"])
         history fixture
-          >>= (`shouldBe` ["child acquire: elsewhere", "child ask: no loan", "acquire legit", "after child: ok"])
+          >>= (`shouldBe` ["child acquire given: elsewhere", "child acquire asked: elsewhere", "acquire legit", "after child: ok"])
         retireScheduled owner
 
     it "refuses a loan presented from another VM's callback while the callback it was lent to is running, and that callback goes on using it" $ bounded $ do
       fixture ← newLFixture
       withBoundary $ \control runtime → do
         holder ← startLending fixture runtime (lendingSpec fixture "holder" requiredPolicy [])
-        presenter ← startLending fixture runtime (lendingSpec fixture "presenter" requiredPolicy [])
+        presenterHandle ← newLending
+        presenter ← startLending fixture runtime (lendingSpecFor fixture presenterHandle "presenter" requiredPolicy [])
         held ← task fixture holder "holds" [VText "g"]
         awaitReached fixture "g"
         -- The holder's callback is running and its loan is kept; another VM's
@@ -453,11 +470,21 @@ spec = describe "a collection lent to the owner's callbacks (LUA-25)" $ do
         _ ← awaitScheduledTerminal control presenter
         pure ()
 
-    it "refuses a thread that is running no lending callback, with nothing to ask for" $ bounded $ do
+    it "gives a handle to one owner only" $ bounded $ do
+      fixture ← newLFixture
+      withBoundary $ \_ runtime → do
+        first ← startLending fixture runtime (lendingSpec fixture "first" requiredPolicy [])
+        second ← tryWithContext @SomeException (startScheduledOwner runtime (lendingSpec fixture "second" requiredPolicy []))
+        case second of
+          Left (ExceptionWithContext _ failure) → (fromException failure ∷ Maybe LendingRefused) `shouldBe` Just LendingInUse
+          Right _ → expectationFailure "a second owner took the handle"
+        retireScheduled first
+
+    it "finds nothing lent while the owner's VM is running no callback" $ bounded $ do
       fixture ← newLFixture
       withBoundary $ \_ runtime → do
         owner ← startLending fixture runtime (lendingSpec fixture "lends" requiredPolicy [])
-        outcome ← try lentToCallback
+        outcome ← try (lentToCallback (lfLending fixture))
         case outcome of
           Left NoLoan → pure ()
           Left other → expectationFailure ("expected no loan, found " <> show other)
@@ -556,7 +583,7 @@ spec = describe "a collection lent to the owner's callbacks (LUA-25)" $ do
       -- The failing release did not stop the other from running.
       history fixture >>= (`shouldBe` ["acquire x", "acquire y", "release y", "release x"])
 
-    it "keeps both the VM close's and the collection's evidence when both fail" $ bounded $ do
+    it "keeps a coroutine close's failure and the collection's release failure when both fail" $ bounded $ do
       fixture ← newLFixture
       ExceptionWithContext context _ ← expectFatal $ \control runtime → do
         owner ← startLending fixture runtime (lendingSpec fixture "both" (optionalPolicy (const True)) [])
@@ -567,6 +594,24 @@ spec = describe "a collection lent to the owner's callbacks (LUA-25)" $ do
       let labels = map cleanupFailureLabel (cleanupFailuresInContext context)
       labels `shouldSatisfy` elem "held"
       labels `shouldSatisfy` elem "lua task close"
+
+    it "keeps the VM close's own failure and the collection's release failure when a finalizer-eligible binding fails during the close and a release then fails" $ bounded $ do
+      fixture ← newLFixture
+      let source = "keep_alive = setmetatable({}, {__gc = function() lend.gc_fail() end})"
+      ExceptionWithContext context _ ← expectFatal $ \control runtime → do
+        owner ← startLending fixture runtime (lendingSpec fixture "vm and collection" (optionalPolicy (const True)) (chunk source))
+        _ ← task fixture owner "suspends_holding" [VText "t"]
+        awaitDiagnostics owner (\counts → diagWaiting counts >= 1)
+        retireScheduled owner
+        awaitScheduledTerminal control owner
+      let labels = map cleanupFailureLabel (cleanupFailuresInContext context)
+      -- The failure is the VM's: a finalizer reached by closing the state, and no
+      -- coroutine's close. The collection's failing release survives beside it.
+      labels `shouldSatisfy` elem "lua finalizer"
+      labels `shouldSatisfy` elem "y"
+      labels `shouldSatisfy` notElem "lua task close"
+      -- The failing release did not stop the other member's.
+      history fixture >>= (`shouldBe` ["acquire x", "acquire y", "release y", "release x"])
 
     it "releases what remains when the owner fails, with the failure primary" $ bounded $ do
       fixture ← newLFixture
@@ -590,7 +635,8 @@ spec = describe "a collection lent to the owner's callbacks (LUA-25)" $ do
       fixture ← newLFixture
       withBoundary $ \control runtime → do
         left ← startLending fixture runtime ((lendingSpec fixture "left" requiredPolicy []) {scheduledMemberLimit = 1})
-        right ← startLending fixture runtime ((lendingSpec fixture "right" requiredPolicy []) {scheduledMemberLimit = 1})
+        rightHandle ← newLending
+        right ← startLending fixture runtime ((lendingSpecFor fixture rightHandle "right" requiredPolicy []) {scheduledMemberLimit = 1})
         -- Each owner's one member fills its own collection. Were the collection
         -- shared, the second acquisition would be refused for the limit.
         leftTask ← task fixture left "holds_one" [VText "l"]
