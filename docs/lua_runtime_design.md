@@ -2386,9 +2386,9 @@ and verified policy, with adversarial regression coverage.
   unsafe shared-state failure (D-7/P-8); stop with request and completion
   results, precedence over queued work, closing the cancelled continuation
   before `shutdown`, `shutdown` once after successful init with a bounded
-  reason, and its failure retained; revocation of the instance's connections,
-  timer demand and unstarted invocations on every termination path, with
-  disposition counts; the application's Haskell pause/resume/stop and bounded
+  reason, and its failure retained; revocation of the instance's connections
+  and unstarted invocations on every termination path, with disposition counts
+  (LUA-24 adds and cancels periodic timer demand); the application's Haskell pause/resume/stop and bounded
   inspection snapshots (TID, owner, name, status) for the owner it holds. The
   instance layer adds its own owner-thread admission and wake path, or extends
   the scheduled owner with one, inside `runtime-lua`; LUA-6's documented
