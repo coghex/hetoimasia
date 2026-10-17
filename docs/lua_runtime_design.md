@@ -85,13 +85,13 @@ LUA-5 is now delivered by #464 / PR #465, merged as `29211202`, and TIME-1/#133
 is delivered. The current exploration covers LUA-6 and the dependent authoring
 contract/organization under D-25; it does not revoke prior approvals or renew
 the other trusted slices or the confined branch.
-Q-9 through Q-17 below record remaining questions and proposals. D-16 through
-D-25 record the owner's lifecycle, identity, scheduler, instance, determinism
-and delivery direction. The [instance contract](lua_instance_contract.md) is
-the concrete draft for remaining behavioral signoff. Q-16 is resolved by D-23. LUA-6 remains
-deferred until those choices, their dependent contract reconciliation and an
-explicit readiness signoff are complete. No new tracker item is authorized by
-this design discussion.
+Q-9 through Q-17 below preserve the resolved design questions. D-16 through
+D-27 record lifecycle, identity, scheduling, determinism, delivery and automatic
+cleanup requirements. The [instance contract](lua_instance_contract.md) is
+accepted by D-26 and strengthened by D-27. LUA-6 remains deferred pending final
+slice-readiness reconciliation and explicit readiness signoff; do not request
+the same behavioral approval again. No tracker item has been created by this
+design discussion.
 
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
 reviewed and deliberately not tracked separately · `[deferred]` blocked on a
@@ -108,9 +108,9 @@ concrete precondition
 - [x] LUA-4. Model bounded script tasks and execution protocols — [#149]
 - [x] LUA-5. Integrate trusted VM owners with runtime supervision — [#464]
 - [ ] LUA-6. Schedule cooperative tasks with bounded service turns — [deferred]: owner renews trusted-path readiness for this slice
-- [ ] LUA-18. Own script instances, hooks and lifecycle controls — [deferred]: accept the instance contract and renew readiness
+- [ ] LUA-18. Own script instances, hooks and lifecycle controls — [deferred]: contract accepted; renew slice readiness
 - [ ] LUA-7. Add bounded asynchronous requests and owned subscriptions — [deferred]: owner renews trusted-path readiness for this slice
-- [ ] LUA-19. Run script instances through a headless command-line entry — [deferred]: accept the instance contract and renew readiness
+- [ ] LUA-19. Run script instances through a headless command-line entry — [deferred]: contract accepted; renew slice readiness
 - [ ] LUA-8. Prove independent trusted UI and gameplay execution headlessly — [deferred]: owner renews trusted-path readiness for this slice
 - [ ] LUA-9. Add bounded child-process transport and owned process lifetime — [deferred]: Q-5 successful Linux and macOS confinement verdicts
 - [ ] LUA-10. Establish Linux mod-process confinement — [deferred]: Q-5 successful Linux and macOS confinement verdicts
@@ -630,7 +630,7 @@ Owner direction, 2026-10-17: a paused instance must not process callbacks. The
 owner prefers callbacks to queue and execute in order on resume; "probably
 silent failure" was tentative, not approval to silently lose accepted work.
 The concrete bounded retention and overflow recommendation is in the
-[instance contract](lua_instance_contract.md), awaiting Q-17 signoff.
+[instance contract](lua_instance_contract.md), subsequently approved by D-26.
 
 If initialization fails, fail that instance, run none of its later hooks/loop,
 and warn the user with how the script failed. Isolate failure from other
@@ -638,8 +638,8 @@ instances wherever safe. D-7/P-8 still apply if shared authoritative state is
 partially mutated or the host fails; instance-local state alone is no rollback
 of shared module tables or native side effects. The owner wants stop to cease
 work and would like shutdown to run, but explicitly requested a recommendation
-because the loop may be incomplete. The proposed safe-boundary shutdown rules
-are not yet an accepted behavior.
+because the loop may be incomplete. D-26 accepts the safe-boundary shutdown
+rules; D-27 clarifies that engine cleanup must not depend on this Lua hook.
 
 ### D-25. Delegate delivery organization
 
@@ -652,10 +652,49 @@ headless runner, then integrate and qualify in LUA-8. Stable existing IDs remain
 The scope and dependencies below record this organizational choice; it does not
 approve new behavior, file tracker items, or renew readiness for these slices.
 
+### D-26. Accept the instance contract
+
+Owner approval, 2026-10-17: "i approve this" in response to the complete
+[instance contract](lua_instance_contract.md) and its presented defaults.
+Accept bounded FIFO paused-event retention with explicit overflow, safe-boundary
+cancellation, shutdown once after successful init, finite non-suspending
+init/shutdown, the specified cadence/pause baselines and bounded control results.
+Q-17 and the detailed portions of Q-9/Q-13/Q-15 are resolved. D-27 records the
+owner's accompanying clarification; it replaces any suggestion that script
+authors must successfully implement partial-resource cleanup themselves.
+
+### D-27. Engine-owned cleanup independent of script correctness
+
+Owner requirement, 2026-10-17: the system must be scripting-friendly and clean
+up gracefully even when Lua is bad or shutdown commands error; authors should
+not need to track which resources exist to make cleanup correct. Every resource
+acquired through the instance scripting interface therefore has an engine-owned
+scope/lease obligation established before its handle is exposed to Lua.
+Partial construction is guarded by the binding. Failed init, lost/overwritten
+handles, absent/throwing shutdown and Lua closing errors do not bypass cleanup.
+
+Shutdown is an optional application notification. Engine ownership records and
+release actions cannot depend on mutable Lua tables, Lua finalizers or successful
+script disposal. Early release is safe against double destruction; cleanup
+continues across independent registered holdings after a release error and
+retains primary/cleanup evidence. Shared resources lose only the instance's
+lease, not another user's ownership. Native/provider/GPU retirement retains
+dependencies until actual safe completion; cleanup failure is reported rather
+than falsely claimed complete. A binding requiring manual Lua cleanup is not
+qualified for this interface.
+
+This requirement covers Lua errors and partial lifecycle execution; it does not
+promise arbitrary rollback or forced preemption of non-yielding trusted Lua.
+The existing confined-process requirement handles hostile-code containment,
+and D-7/P-8 retain unsafe shared-state and fatal host failure behavior. Keep
+these boundaries explicit without burdening ordinary authors with ownership
+bookkeeping. Qualification belongs to LUA-18, provider retirement to LUA-7 and
+the integrated failure examples to LUA-8.
+
 ## Design
 
 P-1 through P-13 record the accepted contracts, with proof and delivery gates
-scoped by D-13. P-14 links the new instance contract and its remaining proposals.
+scoped by D-13. P-14 links the accepted instance contract and cleanup requirement.
 Q-3 is resolved; Q-5 gates the confined process branch.
 Symbol and component names below are descriptive until their owning slice fixes
 the API.
@@ -1250,12 +1289,11 @@ probes. A future sandbox relaxation or native-mod API needs a new design review.
 
 ### P-14. Script-instance lifecycle contract
 
-[Lua instance contract](lua_instance_contract.md) consolidates initialization,
-pause/resume, ordered event retention, stop/shutdown, cadence, control results
-and delivery ownership. Its approved requirements derive from D-16 through
-D-25; its explicitly proposed detail remains subject to Q-17 signoff. Do not
-mistake publication of that draft for implementation, a blanket acceptance of
-its defaults, or renewed issue-processing readiness.
+[Lua instance contract](lua_instance_contract.md) is accepted by D-26 and
+strengthened by D-27. It fixes initialization, pause/resume, ordered event
+retention, stop/shutdown, engine-owned resource cleanup, cadence and control
+results. Behavioral signoff is complete; implementation evidence and slice
+readiness remain separate gates.
 
 ## Open questions and gates
 
@@ -1448,13 +1486,13 @@ does not itself renew readiness or approve issue processing.
 
 ### Q-9. Lifecycle-operation calls in LUA-6
 
-**Direction resolved by D-16/D-17/D-24; concrete defaults await Q-17.** LUA-3/#462 decision
+**Resolved by D-16/D-17/D-24/D-26/D-27.** LUA-3/#462 decision
 A1 and LUA-5 deliberately leave lifecycle bindings classified but not callable;
 their delivery placement was reserved for LUA-6's readiness renewal.
 
 LUA-6 supplies bounded safe-boundary control machinery. LUA-18 exposes granted
 script-instance controls and their inspection/results, including permitted
-cross-owner submission. The instance contract specifies proposed capacity,
+cross-owner submission. The instance contract specifies accepted capacity,
 admission versus application results, ordering, stale targets, self-control and
 closing behavior. No synchronous cross-owner Lua entry or rollback is implied.
 Whole-owner controls remain distinct from an individual instance's TID.
@@ -1507,8 +1545,8 @@ testable without adding a game UI to the engine slice. The owner proposed a
 command-line entry point; Q-14 records its delegated delivery scope. VM groups
 were excluded by D-21.
 
-The instance contract specifies proposed grant/request results consistent with
-D-14/D-17; Q-17 is the remaining behavioral signoff.
+The accepted instance contract specifies grant/request results consistent with
+D-14/D-17; Q-17 is resolved by D-26/D-27.
 Self-pause needs another permitted controller to resume it. Stop ends future
 execution rather than becoming a resumable pause; completed effects are not
 rolled back. These distinctions must be visible in the eventual contract.
@@ -1537,7 +1575,7 @@ names are not additional product decisions.
 
 ### Q-13. Loaded script instances, repetition and unloading
 
-**Authoring direction accepted by D-22; detailed lifecycle rules open.** The owner wants
+**Resolved by D-21/D-22/D-24/D-26/D-27.** The owner wants
 `init`, `update` and `shutdown` behavior plus engine-event callbacks, and asked
 whether this is the right authoring model after inspecting Synarchy. Instance
 removal and fresh instance state are accepted; module eviction is not approved.
@@ -1590,8 +1628,8 @@ not itself a gameplay timestep. Gameplay and UI may supply different cadences.
 The authoring API must use narrow granted services, not a universal engine
 environment or service locator. Returned hook tables versus declared entry
 exports and concrete adapter symbols remain implementation details under the
-accepted authoring model. The instance contract now supplies proposed yield,
-init failure/shutdown, pause/event and cadence rules for Q-17 signoff.
+accepted authoring model. The accepted instance contract supplies yield,
+init failure/shutdown, pause/event, cadence and automatic cleanup rules.
 
 Professional precedent supports retaining the hook model: [Defold's script
 contract](https://defold.com/manuals/script/) combines instance `self`, lifecycle
@@ -1601,7 +1639,7 @@ design, not authority for project decisions.
 
 Delivery ownership is now explicit under D-25: LUA-6 scheduler machinery,
 LUA-18 instance authoring, LUA-7 provider integration, LUA-19 runner and LUA-8
-integrated qualification. Q-17 settles remaining behavior, not organization.
+integrated qualification. Q-17 is resolved; organization remains delegated.
 
 ### Q-14. Command-line runner
 
@@ -1630,7 +1668,7 @@ the requirement that the library support use by a windowed application.
 
 ### Q-15. Per-instance update intervals, delta time and late updates
 
-**Timing direction resolved by D-23; cadence details open.** The owner wants concurrent scripts at independently chosen
+**Resolved by D-23/D-26.** The owner wants concurrent scripts at independently chosen
 intervals supplied when starting them (examples: 0.01-second UI refresh and
 1.0-second unit AI). This is compatible with one VM's FIFO policy: timers make
 instances eligible and the selected policy orders their ready work. Alternate
@@ -1652,15 +1690,13 @@ Bounded service preserves logical steps and their effects under P-6; overload
 may slow simulation relative to real time. UI/presentation updates retain
 elapsed/frame-time pacing and may coalesce obsolete presentation refreshes.
 
-Remaining details: logical tick resolution and interval conversion/validation,
-first update and phase rules, pause/resume baselines, presentation `dt` sampling
-and coalescing details, and the public cadence configuration surface. No example
-tick rate is selected as a default. Callbacks for one instance do not overlap.
-The application owns gameplay clock pause/speed policy. These details must be
-settled before readiness; the earlier nondeterministic gameplay-default proposal
-is superseded by D-23. The instance contract supplies concrete proposed defaults
-for these remaining details; accept them through Q-17 rather than reopening the
-approved determinism requirement.
+The accepted instance contract fixes interval conversion/validation, first
+update and phase rules, pause/resume baselines and presentation `dt` sampling
+and coalescing. Logical tick resolution is application configuration; no example
+rate is a selected production default. Callbacks for one instance do not overlap.
+The application owns gameplay clock pause/speed policy. Concrete public symbols
+are implementation choices within this contract. The earlier nondeterministic
+gameplay-default proposal is superseded by D-23.
 
 ### Q-16. Deterministic gameplay target
 
@@ -1701,19 +1737,19 @@ simulation with canonical authoritative-state digests at logical boundaries,
 varying wall-time delays and UI activity while holding assigned inputs fixed.
 This is prospective acceptance work, not a result obtained in this discussion.
 Q-15 and P-10 are reconciled with this decision. The engine/application delivery
-boundary and remaining cadence, pause, event retention and shutdown details
-still need resolution before renewing LUA-6.
+boundary is recorded by D-25, and D-26/D-27 settle cadence, pause, event retention,
+shutdown and cleanup. Slice readiness remains to be renewed.
 
 ### Q-17. Accept the concrete instance contract
 
-**Open.** The owner requested a contract and delegated delivery organization.
-[The instance contract](lua_instance_contract.md) records approved requirements
-and the following proposed behavioral groups for explicit signoff:
+**Resolved by D-26/D-27.** The owner approved
+[the instance contract](lua_instance_contract.md) and clarified mandatory
+engine-owned cleanup. The accepted behavioral groups are:
 
 1. Bounded FIFO retention while paused, explicit refusal/reporting on overflow,
    preserved event timestamps and deterministic admission; no silent loss.
 2. Cancellation at safe boundaries, one shutdown after successful init even
-   when ordinary work was partial, partial-state-safe cleanup, finite
+   when ordinary work was partial, automatic engine-owned cleanup, finite
    non-suspending init/shutdown, and runtime cleanup regardless of hook failure.
 3. Configurable integer gameplay periods with exact conversion, first update
    after one interval, no periodic catch-up for intentional pause, elapsed UI
@@ -1722,7 +1758,7 @@ and the following proposed behavioral groups for explicit signoff:
 Failed initialization runs no subsequent script hooks. Failure isolation is
 required where safe; shared authoritative damage still follows D-7/P-8. This
 constraint is not a new blanket permission to continue after corruption.
-Accepting this draft resolves the detailed portions of Q-9/Q-13/Q-15. Readiness
+This resolves the detailed portions of Q-9/Q-13/Q-15. Readiness
 then requires the selected slices' final reconciliation, not more owner choices
 about their organizational split. No tracker artifact has been created.
 
@@ -2033,8 +2069,8 @@ and verified policy, with adversarial regression coverage.
 ### LUA-6. Schedule cooperative tasks with bounded service turns
 
 > Deferred: readiness discussion opened 2026-10-17. LUA-5 and TIME-1 are
-> delivered; the concrete contract awaits Q-17 signoff before
-> readiness signoff. Earlier narrow renewals did not cover this slice.
+> delivered and the concrete contract is accepted (D-26/D-27). Final slice
+> readiness is still to be renewed; earlier narrow renewals did not cover it.
 
 - **Outcome:** one trusted VM owner services resumable tasks fairly, wakes for
   events/deadlines, and reports real budget overruns without fake preemption.
@@ -2055,7 +2091,7 @@ and verified policy, with adversarial regression coverage.
   gameplay update durations, required work or committed effect order (D-23).
 - **Out of scope:** automatic code rewriting, arbitrary priority API, simulation
   coordinator, CPU affinity/niceness tuning, performance pass/fail thresholds.
-- **Open questions:** Q-17 (concrete lifecycle/cadence contract).
+- **Open questions:** None; Q-17 is resolved by D-26/D-27. Readiness remains pending.
   Q-16 is resolved by D-23: deterministic simulation is required.
   Q-10's compatibility and Q-11's API/example direction are accepted by D-20;
   their new runner/lifetime questions are tracked under Q-13/Q-14.
@@ -2065,7 +2101,7 @@ and verified policy, with adversarial regression coverage.
 
 ### LUA-18. Own script instances, hooks and lifecycle controls
 
-> Deferred: Q-17 contract signoff and explicit trusted readiness.
+> Deferred: contract accepted (D-26/D-27); explicit trusted readiness pending.
 
 - **Outcome:** reusable code admits separately owned instances with lifecycle
   hooks, TID/owner/name/status inspection and granted Lua lifecycle controls.
@@ -2073,19 +2109,26 @@ and verified policy, with adversarial regression coverage.
   invocations and continuations, bounded invocation/event admission seam,
   pause/resume/stop and request results, safe failure isolation, owned cleanup,
   permitted cross-owner controls and deterministic logical control admission.
+  Every exposed instance-owned resource has protected registration and an
+  engine-owned cleanup obligation before Lua sees its handle. Implement scoped
+  lease/early-release bookkeeping with existing foundation resource machinery;
+  script shutdown is not the resource owner.
   Test events use the delivery seam; real providers arrive in LUA-7.
 - **Phase:** script authoring and lifetime.
 - **Depends on:** LUA-6; consumes LUA-3/LUA-4/LUA-5 boundaries.
 - **Ordering:** after LUA-6, before LUA-7 and LUA-19.
-- **Relevant decisions:** D-7, D-16, D-17, D-20, D-21, D-22, D-23, D-24, D-25.
+- **Relevant decisions:** D-7, D-16, D-17, D-20, D-21, D-22, D-23, D-24, D-25, D-26, D-27.
 - **Acceptance signals:** failed init runs no later hook; safe failure leaves
   peers running; unsafe shared-state failure is escalated; paused callbacks do
   not run; stop of partial/suspended work cleans up once; shutdown failure
   preserves cleanup; stale controls cannot resurrect tasks; references shared
   with live instances remain valid; identical logical inputs retain ordering.
+  Acquire-then-error before storing a handle, missing/throwing shutdown, lost
+  handles, partial constructor failure, early/double release and a failing
+  native release all retain correct engine ownership and cleanup evidence.
 - **Out of scope:** module eviction/hot reload, real event providers, CLI/window
   assembly, forced preemption, transactions for arbitrary game bindings.
-- **Open questions:** Q-17.
+- **Open questions:** None; contract accepted. Readiness remains pending.
 
 ### LUA-7. Add bounded asynchronous requests and owned subscriptions
 
@@ -2110,11 +2153,12 @@ and verified policy, with adversarial regression coverage.
   of interest; callbacks execute only on their VM owner.
 - **Out of scope:** actual pathfinding/assets/graphics services, general RPC or
   broadcast, automatic restart, mandatory draining of infinite subscriptions.
-- **Open questions:** Q-17 for paused delivery and overflow behavior.
+- **Open questions:** None; paused delivery/overflow are accepted by D-26;
+  D-27 requires engine-owned provider interest/retirement. Readiness remains pending.
 
 ### LUA-19. Run script instances through a headless command-line entry
 
-> Deferred: Q-17 contract signoff and explicit trusted readiness.
+> Deferred: contract accepted (D-26/D-27); explicit trusted readiness pending.
 
 - **Outcome:** run a selected Lua source in a named VM with a selected scheduler,
   exposing the same instance APIs a future windowed application can use.
@@ -2132,7 +2176,7 @@ and verified policy, with adversarial regression coverage.
   and exit status without invoking later hooks.
 - **Out of scope:** window creation, game terminal UI, VM groups, module reload,
   production game content or a full replay product.
-- **Open questions:** Q-17 for the behavior the runner exposes.
+- **Open questions:** None; contract accepted. Readiness remains pending.
 
 ### LUA-8. Prove independent trusted UI and gameplay execution headlessly
 

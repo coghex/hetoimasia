@@ -197,6 +197,15 @@ timing and randomness. Applications own simulation and commit policy; engine
 contracts must support this requirement. Cross-platform/version identity and
 network lockstep are separate future qualifications, not current guarantees.
 
+Owner decision 2026-10-17 ([Lua D-27](lua_runtime_design.md#d-27-engine-owned-cleanup-independent-of-script-correctness)):
+script authors must not be responsible for remembering which engine resources
+exist or making shutdown succeed to avoid leaks. Lua-exposed acquisitions have
+protected engine-owned scope/lease records; failed initialization, lost handles
+and throwing or absent shutdown cannot bypass cleanup. Shared resources release
+only the instance's interest, and provider/GPU dependencies remain until safe
+retirement. This is automatic ownership, not rollback of committed game effects
+or forced interruption of non-yielding trusted Lua.
+
 ### V-10. Strong evidence with selective cost
 
 Prefer Hspec and package-owned tests with focused groups. Root tests cover

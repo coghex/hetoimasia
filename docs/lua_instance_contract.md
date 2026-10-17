@@ -2,10 +2,11 @@
 
 Design contract, 2026-10-17. Owner: `coghex/hetoimasia`.
 
-**Status: draft for the remaining behavioral signoff.** This refines
-[the Lua design](lua_runtime_design.md), D-16 through D-25. It describes intended
-behavior, not implemented APIs. Approved requirements are distinguished below
-from the proposed detailed rules. The whole Lua arc remains `exploring`.
+**Status: accepted design contract (D-26), with the owner's automatic-cleanup
+requirement (D-27).** This refines [the Lua design](lua_runtime_design.md),
+D-16 through D-27. It describes intended behavior, not implemented APIs.
+The whole Lua arc remains `exploring` pending slice readiness reconciliation;
+contract approval does not by itself create issues or qualify implementation.
 
 ## Approved requirements
 
@@ -15,9 +16,9 @@ from the proposed detailed rules. The whole Lua arc remains `exploring`.
 - Lifecycle authoring uses `init(self, api)`, optional `update(self, dt)`,
   `shutdown(self, reason)` and a separate one-shot `run(self, api)`.
   Instance-owned function connections deliver engine events on the VM owner.
-- Pausing suspends updates and callbacks. The owner prefers retaining callbacks
-  and delivering them in order after resume. Exact retention/overflow rules are
-  the proposal below; silent failure was considered, not selected as a policy.
+- Pausing suspends updates and callbacks. Accepted callbacks are retained and
+  delivered in order after resume under the bounded rules below. Silent loss
+  is not the overflow policy.
 - Failed initialization fails that instance, runs no subsequent hooks or loop,
   and reports what failed. Other instances should continue when isolation is
   safe. Existing unsafe shared-state/host failure rules still apply.
@@ -26,6 +27,10 @@ from the proposed detailed rules. The whole Lua arc remains `exploring`.
   event admission and committed effects have defined logical ordering.
 - The owner delegates delivery organization and splitting. Implementation and
   readiness are not claimed by publication of this contract.
+- Script errors, partial initialization, missing handles and a failing or absent
+  `shutdown` must not prevent automatic cleanup of engine-owned instance
+  resources. The engine tracks ownership; the script author is not required to
+  keep a cleanup checklist or test which resources were successfully created.
 
 ## Instance ownership and execution
 
@@ -39,7 +44,7 @@ event connections and scoped engine leases. Module globals/upvalues remain
 shared where the application deliberately shares them. A VM-local instance
 reference cannot be transported to another VM.
 
-Proposed observable lifecycle phases are `Initializing`, `Active`, `Paused`,
+Observable lifecycle phases are `Initializing`, `Active`, `Paused`,
 `Stopping`, and terminal `Completed`, `Stopped` or `Failed`; execution detail
 distinguishes ready/running/waiting within a live phase. The existing protocol's
 terminal cancellation maps to stopped inspection status; these names do not
@@ -51,7 +56,57 @@ reenter it. The selected owner policy orders eligible instances within bounded
 service classes. FIFO and yield-to-tail are the default. It cannot override
 lifecycle, authority, memory or deterministic-effect constraints.
 
-## Proposed initialization and failure rules
+## Automatic resource ownership
+
+Every Lua-exposed acquisition of an instance-lifetime engine resource registers
+its actual ownership obligation in an engine-controlled instance scope. This
+includes connections, timers, pending request interests and leases on native
+resources. The scope exists before `init` runs and is not stored in mutable Lua
+tables. Scripts cannot erase or forge it by changing `self` or module globals.
+
+Reserve bookkeeping/capacity and protect construction before exposing a handle
+to Lua. If construction or registration fails partway through, the binding's
+own staged acquisition unwinds completed stages. There is no interval in which
+Lua has acquired a resource whose cleanup depends on its next statement. The
+foundation's protected resource/collection contracts supply this discipline;
+the Lua API must not invent an unprotected acquire-then-register sequence.
+
+Instance termination revokes callable interests and drains its actual recorded
+holdings whether initialization failed, execution stopped, a callback faulted,
+or shutdown/closing code raised. Releasing one holding must not prevent attempts
+to release the other independent holdings. Preserve dependency ordering and all
+bounded cleanup evidence through the existing resource/supervision contract.
+Lua finalizers, coroutine-local closing handlers and explicit script disposal
+are not the sole owners of essential engine cleanup.
+
+Scripts may explicitly release a handle early for convenience. Handle state and
+scope accounting make repeated release safe: return an already-released result
+rather than invoking the native release twice. Invalid or missing Lua values
+may still produce an ordinary argument error; such an error cannot stop the
+engine from cleaning up other registered holdings. A script that never stores
+the returned handle, overwrites it with nil or omits shutdown still gets cleanup.
+
+The ownership obligation is a lease, not necessarily the entire resource. If an
+asset is shared or an object belongs to the application/world, the script owns
+only its declared interest. Termination releases that interest without deleting
+another instance's resource or an application-owned world object. APIs must
+make instance ownership versus application ownership explicit to binding authors;
+ordinary instance-owned acquisitions are automatic for script authors. Do not
+silently promote an instance resource to shared lifetime because Lua cached a
+handle elsewhere. A separate ownership/lease API is required for longer lifetime.
+
+Bindings cannot expose manually managed native lifetime and then require Lua
+shutdown to repair it. A binding whose ownership and retirement cannot be
+described is not ready for this scripting interface. This rule does not provide
+rollback for arbitrary already-committed game effects; D-7/P-8 still apply.
+
+Cleanup remains subject to real provider/GPU completion. Revocation is immediate
+at the safe owner boundary; destruction waits until the resource owner proves
+it safe. The engine retains pending retirement obligations and dependencies,
+reports native cleanup failures, and never reports complete reclamation merely
+because Lua stopped. A release that fails is recorded, not silently retried.
+
+## Initialization and failure rules
 
 1. Reserve instance/result capacity and create fresh `self` before `init`.
 2. `init` runs once. An absent optional initializer counts as successful empty
@@ -72,7 +127,7 @@ lifecycle, authority, memory or deterministic-effect constraints.
    isolated failure must keep initialization effects local or stage them through
    application services with an actual discard/commit contract.
 
-Proposed hook suspension rule: `init` and `shutdown` are finite, non-suspending
+Hook suspension rule: `init` and `shutdown` are finite, non-suspending
 hooks. An attempted scheduler wait/yield is a reported hook fault. `update`,
 `run` and event callbacks may use explicit cooperative waits/yields. Expensive
 startup continues in scheduled work after `init`; asynchronous native cleanup
@@ -84,7 +139,7 @@ instance, suppresses its remaining ordinary work and enters the cleanup path.
 The same shared-state safety test applies; shutdown is eligible only after
 successful initialization and while Lua entry remains safe.
 
-## Proposed pause, event ordering and resume rules
+## Pause, event ordering and resume rules
 
 Pause takes effect at the next explicit safe boundary. It freezes the current
 continuation and prevents any new ordinary invocation. Resume and stop remain
@@ -99,7 +154,7 @@ means delivering previously unstarted callbacks once, not rerunning completed
 callbacks or their effects. Preserve each event's original payload and logical
 timestamp; resume does not rewrite it as a newly generated event.
 
-**Overflow proposal:** reject the new delivery with an explicit queue-full
+**Overflow:** reject the new delivery with an explicit queue-full
 result and an attributable, bounded diagnostic/counter; do not evict an accepted
 delivery, silently succeed, or grow without limit. Retained terminal failure
 storage does not consume the event FIFO. Producers never block a native callback
@@ -125,7 +180,7 @@ an instance is choosing how the game accounts for its inactive time; replayed
 old events may need application-level stale-target handling. No engine policy
 pretends those callbacks ran at their original occurrence time.
 
-## Proposed stop and shutdown rules
+## Stop and shutdown rules
 
 Stop has a request result and a later completion result. Acceptance is not proof
 that the instance has stopped or resources have retired. Once applied at a safe
@@ -140,7 +195,7 @@ remain alive through this phase. No current segment is forcibly interrupted:
 a trusted script that never returns or yields cannot be guaranteed to stop.
 See Lua's [coroutine close contract](https://www.lua.org/manual/5.4/manual.html#pdf-coroutine.close).
 
-**Shutdown proposal:** if initialization succeeded and the VM/state remains safe
+**Shutdown:** if initialization succeeded and the VM/state remains safe
 to enter, invoke the optional `shutdown` hook once, even if an update or callback
 was cancelled before finishing. Pass the same `self` and a bounded reason
 (`stopped`, `completed` or `failed`). A normal one-shot completion uses the same
@@ -148,18 +203,19 @@ cleanup path. Repeated stop requests never invoke shutdown again. If init never
 succeeded, or the owner suffered a fatal failure that makes Lua entry unsafe,
 skip the hook and report that disposition.
 
-Shutdown must tolerate missing or partial loop state. Register ownership when a
-resource is acquired, not at the end of an update. Keep persistent handles on
-`self` when shutdown needs them; do not assume a cancelled coroutine's local
-variables will be available. Release only holdings that actually exist. A
-shutdown hook cannot restart the stopping instance or admit new ordinary work.
+Shutdown is an optional application notification, not the resource owner. It
+may perform application-specific bookkeeping with whatever state exists. The
+engine does not require it to check resource existence, dispose handles, or run
+successfully for cleanup to happen. If it dereferences missing loop state and
+raises, retain that error and continue engine-owned cleanup. No attempt is made
+to continue the failed Lua function after its error. A shutdown hook cannot
+restart the stopping instance or admit new ordinary work.
 
 After the hook, release remaining runtime-owned instance holdings even if the
 hook failed, invalidate callable references, and retain the terminal outcome.
 Native/provider cleanup follows its actual completion contract; dropping Lua
-interest does not prove external work stopped. Essential engine resources must
-not depend on the Lua hook running successfully. Manually owned application
-resources still require an explicit application cleanup/lease contract.
+interest does not prove external work stopped. All resources exposed through
+this scripting contract require the automatic ownership/lease rules above.
 
 A shutdown error is reported with cleanup evidence, not retried. An ordinary
 stopped/completed instance becomes failed if its hook fails; an existing primary
@@ -167,7 +223,7 @@ failure remains primary. Host cleanup failures follow supervision. Cancellation
 does not undo partial shared mutations: safe boundaries must preserve application
 invariants or leave staged effects discardable; otherwise D-7/P-8 apply.
 
-## Proposed cadence and control defaults
+## Cadence and control defaults
 
 The application supplies a positive logical tick duration; no production rate
 is hard-coded. Gameplay intervals are positive integer tick counts. Convenience
@@ -211,8 +267,8 @@ The owner delegated organization. Keep separately reviewable outcomes:
    against varied execution delays and UI activity with identical logical inputs.
 
 The canonical ledger and dependencies live in the parent design. These entries
-are not filed issues. Do not implement behavior still marked proposed above
-until the owner accepts the contract and the owning slice passes readiness.
+are not filed issues. Behavior is accepted; each owning slice still needs its
+readiness and implementation gates.
 
 Contract tests must cover failed init without later hooks, isolation versus
 unsafe shared-state failure, pause during a yielded callback, ordered bounded
@@ -220,3 +276,10 @@ resume, explicit overflow, stop while paused, cancellation before an update
 finishes, shutdown once, shutdown failure plus runtime cleanup, stale controls,
 provider completion after cancellation, and equal committed gameplay state under
 different real-time delays. Tests use injected clocks/barriers, not timing sleeps.
+Include acquiring a resource and immediately raising before storing its handle;
+overwriting handles; partial acquisition failure; missing/throwing shutdown;
+closing-handler failure; explicit early/double release; one native release
+failing while independent holdings still receive cleanup; shared assets surviving
+one instance's exit; and retained provider/GPU obligations until safe retirement.
+These prove cleanup is engine-owned rather than merely a well-written example's
+behavior. No Lua-written cleanup hook is a prerequisite for passing them.
