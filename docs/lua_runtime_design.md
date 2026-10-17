@@ -127,7 +127,7 @@ concrete precondition
 - [x] LUA-3. Add application-owned modules and bounded value bindings — [#462]
 - [x] LUA-4. Model bounded script tasks and execution protocols — [#149]
 - [x] LUA-5. Integrate trusted VM owners with runtime supervision — [#464]
-- [ ] LUA-20. Run Lua task coroutines on their VM owner
+- [x] LUA-20. Run Lua task coroutines on their VM owner — [#466]
 - [ ] LUA-21. Add scheduling policies, service quanta, logical time and an owned timer for Lua tasks
 - [ ] LUA-6. Schedule cooperative tasks with bounded service turns
 - [ ] LUA-18. Own script instances, hooks and lifecycle controls — [deferred]: contract accepted; renew slice readiness
