@@ -23,6 +23,11 @@ registers named bindings once, gives each owner a policy naming the namespaces i
 exposes, supplies its own Lua modules, and calls their entry points with bounded
 copied values. See
 [Registration, modules and bounded values](#registration-modules-and-bounded-values).
+**Tasks** (LUA-20) are here as well: a module's entry point run as a Lua
+coroutine on its VM's owner, one segment at a time, with the yield and wait
+operations a script uses to give control back and the standard `coroutine`
+library for the transient sequences inside one. See
+[Tasks and the coroutine library](#tasks-and-the-coroutine-library).
 The **runtime adapter** (LUA-5) is here as well: trusted VM owners, each one a
 supervised worker running one VM, with bounded call dispatch, exactly-once
 settlement and the refusal of a reply wait from inside a Lua callback. See
@@ -54,7 +59,9 @@ close what they construct themselves, and it is what the owner is built on:
 
 `Vm` and `ChunkName` are abstract. No exported module hands a caller a Lua
 state, a stack index, a registry reference, a coroutine, a closure, or a native
-address, and none of them has a reachable representation that becomes one: the
+address, and none of them has a reachable representation that becomes one (a
+`Task` of the owner is a handle that *names* a coroutine of its VM and gives
+access to nothing of it; see [Tasks](#tasks-and-the-coroutine-library)): the
 state, the callback entry, and the stack probes live in the package's private
 `bridge` sublibrary, which no client
 outside the package can depend on. `Test.Lua.Opacity` compiles clients that try
@@ -478,6 +485,9 @@ callOwned   ∷ OwnedVm → Text → IO ()
 loadModule  ∷ OwnedVm → ModuleSource → IO ModuleHandle
 loadedModule ∷ OwnedVm → ModuleRef → IO (Maybe ModuleHandle)
 callEntry   ∷ OwnedVm → ModuleHandle → Text → [Value] → IO CallResult
+startTask   ∷ OwnedVm → ModuleHandle → Text → [Value] → IO TaskStart
+resumeTask  ∷ OwnedVm → Task → IO TaskStep
+closeTask   ∷ OwnedVm → Task → IO ()
 ```
 
 `withVmOwner` constructs one VM over exactly the libraries named (the empty list
@@ -526,7 +536,7 @@ Whatever ends the lifetime keeps its own type, value and context. The close's
 failures are retained beside it as cleanup evidence, each with the context it was
 caught with and under a label naming its source (`lua finalizer`, `lua finalizer
 refused`, `lua release`, `lua operation`, `lua evidence truncated`, `lua
-close`), through `composeCleanup`, the foundation's seam below. Evidence is read
+coroutine close`, `lua close`), through `composeCleanup`, the foundation's seam below. Evidence is read
 back with `cleanupFailures` or `cleanupFailuresInContext`, which is what a
 supervisor reads.
 
@@ -536,6 +546,7 @@ supervisor reads.
 | Body fails, close succeeds | The body's failure, unchanged | None: a close that succeeded is never reported |
 | Body fails, close fails | The body's failure | Every close failure, finalizers' first then releases' |
 | Body returns, close fails | The first close failure | Every close failure, that first one included, so it is the failure and cleanup evidence at once |
+| Body returns with tasks still suspended | The result, unless a close fails | Each suspended task's coroutine is closed first, in the order the tasks started, every one attempted whatever another does; a to-be-closed variable's error is evidence under `lua coroutine close` (see [Closing](#closing-a-task)) |
 | Construction or initialization fails at any step | That failure, after the VM that was made is closed | Any failure of that close |
 | Cancellation before the lifetime | The cancellation; nothing was constructed | None |
 | Cancellation during initialization or the body | The cancellation, after the VM is closed | Any failure of the close |
@@ -651,6 +662,7 @@ eligibilities (D-14):
 | command or UI intention | `commandIntention` | trusted direct path | `true, nil` accepted, or `false, reason` (at most 256 UTF-8 bytes) as data |
 | asynchronous native request | `asynchronousNativeRequest` | classified only | a Lua call is a typed `NotYetSupported` fault; the action never runs |
 | lifecycle operation | `lifecycleOperation` | classified only | a Lua call is a typed `NotYetSupported` fault; the action never runs |
+| scheduler operation | `yieldOperation`, `waitOperation` | trusted direct path | nothing: the task's coroutine is suspended (see [Tasks](#tasks-and-the-coroutine-library)) |
 
 The defaults are the safe ones: a binding is **direct-eligible** and nothing
 else, so a default registration exposes nothing to a mod
@@ -658,8 +670,9 @@ else, so a default registration exposes nothing to a mod
 IPC equivalent. `confinedEligible` is refused when any schema of the binding
 carries a capability, because a handle into one VM has no meaning to a process
 that cannot hold it, and it grants nothing by itself: no grant exists until the
-broker that enforces one. `finalizerEligible` is refused for the asynchronous
-kind. `withoutDirectPath` keeps an owner from installing the binding at all.
+broker that enforces one. It is refused for a scheduler operation as well, which
+suspends a coroutine of the trusted path. `finalizerEligible` is refused for the
+asynchronous kind. `withoutDirectPath` keeps an owner from installing the binding at all.
 
 Refused when the registration is built: an invalid or duplicate namespace,
 binding or capability-type name; a namespace that would shadow a global the
@@ -692,7 +705,8 @@ the globals runs. A policy naming a namespace the registration does not declare
 (`PolicyUnknownNamespace`), a failure to install, and memory running out while
 installing end construction like any other initialization failure: the VM is
 closed through the same close and the body never runs. Which standard libraries a
-script can reach is the owner's explicit set, and the debug library an owner opens
+script can reach is the owner's explicit set (`coroutine` is selectable like the
+others; `utf8` is not offered), and the debug library an owner opens
 has no `sethook`, because a hook is script-defined Lua that Lua would run while a
 fault's traceback is being recorded; the base library brings `dofile`
 and `loadfile`, so an owner that must not read the disk does not open it.
@@ -804,7 +818,7 @@ own type and context.
 A `BoundaryFault` is an ordinary Haskell exception, produced with no Lua run to
 render it. It records the owner (by the name it was configured with, and the
 VM's identity), the operation (`InstallBindings`, `LoadModule`, `CallEntry`,
-`CallBinding`), the module's name and version and the entry point when a module
+`CallBinding`, and for a task `StartTask`, `ResumeTask`, `CloseTask`), the module's name and version and the entry point when a module
 was running, the binding's namespace and name, the source chunk the call was made
 from, a bounded traceback when one was captured, a typed reason, and an `Effect`:
 
@@ -899,6 +913,202 @@ negative clients that forge a handle or a capability, reach for a binding's
 closure or for a Lua state, and a positive client built from the public modules
 alone that constructs a registration and an owner's policy, loads a module, calls
 an entry point and observes a typed refusal.
+
+## Tasks and the coroutine library
+
+Tasks (LUA-20; design P-5, P-6, D-12, D-13, D-22, D-29; Q-3) are the host's
+mechanism for script code that gives control back: a module's entry point run as
+a Lua coroutine of its VM, on the VM's owner, a segment at a time. This is the
+mechanism and nothing else. The scheduler that decides when a task runs, what a
+deadline or a tick is, and in what order (LUA-21), and the supervised owners that
+use both (LUA-6), are separate slices; no clock, timer, queue or policy is here,
+and the examples resume a task by hand.
+
+### What a task is
+
+```haskell
+startTask  ∷ OwnedVm → ModuleHandle → Text → [Value] → IO TaskStart
+resumeTask ∷ OwnedVm → Task → IO TaskStep
+closeTask  ∷ OwnedVm → Task → IO ()
+
+data TaskStart = TaskEntryAbsent | TaskStarted Task TaskStep
+data TaskStep  = Completed [Value] | Yielded | Waiting WaitRequest
+data WaitRequest = WaitRequest
+  { waitKind ∷ WaitKind, waitNamespace ∷ Text, waitBinding ∷ Text, waitArguments ∷ [Value] }
+data WaitKind  = WaitElapsed | WaitLogical
+```
+
+`startTask` checks the handle, the entry point and the arguments exactly as
+`callEntry` does (the same code), and runs the entry point as a coroutine up to
+its first yield, wait or return. An optional entry point the module does not
+define answers `TaskEntryAbsent` and executes nothing, as an absent entry point
+does for a call. Each segment ends in one of three ways: the entry point
+returned, with results checked against its declared schemas and the owner's
+limits like a call's (`Completed`, after which the task has ended); the script
+yielded (`Yielded`); or it waited, and the host reports which wait and the
+arguments it gave (`Waiting`). Resuming goes on from there with no values, and the
+operation that suspended returns nothing to the script.
+
+A task is a Lua thread of the owner's VM, kept in a table the bridge owns in the
+registry, one slot per task, until it ends, so that the collector cannot take it
+while the host holds its handle. Starting, resuming and closing are operations of
+the VM like any other: held under its gate by its one execution owner, refused
+from another thread with `VmNotOwned`, from one of the VM's own callbacks with
+`VmReentered`, and once the VM has closed with `VmClosed`. The `Task` is a value
+naming a slot of one VM, checked on every use: another owner's is refused with
+`TaskRefused TaskForeign`. It is never a `Value`, so no task, thread or coroutine
+can cross the boundary, and Lua never sees one. A task that has returned, failed
+or been closed cannot be resumed: `TaskRefused (TaskEnded TaskCompleted |
+TaskFaulted | TaskClosed)`, with `NoEffect`.
+
+The host keeps no count of tasks and imposes no cap on them: how many an owner
+runs, and when, is the admission of the scheduler that uses this. Every
+suspended one is closed when the VM closes.
+
+### Yielding and waiting
+
+A script gives control back through a **scheduler operation**: a binding of the
+application's registration, in a namespace the owner's policy grants, like any
+other (D-22: there is no universal environment, and a script that is not granted
+one has none). Two constructors make them, and the application chooses the names
+and, for a wait, the argument shapes:
+
+```haskell
+yieldOperation ∷ Text → Binding                          -- no arguments
+waitOperation  ∷ Text → WaitKind → [Schema] → Binding    -- WaitElapsed | WaitLogical
+```
+
+Neither runs application code. A wait's arguments are checked against the schemas
+it declares and the owner's value limits like a binding's, before anything is
+suspended: a wrong type or count, or an argument past a limit, is a typed fault of
+the call (`ValueRefused ... Arguments`), and the task is not suspended. Accepted
+ones are reported as they are in `WaitRequest`; the host interprets none of them.
+
+A scheduler operation is a *handler decision and a C action*. The handler runs in
+Haskell like any binding's and decides whether the call can reach the scheduler at
+all; it records what the script asked for on the VM and returns. The C closure of
+the binding then calls `lua_yield`, after every Haskell frame has returned. That is
+the rule the error protocol already follows, for the same reason: `lua_yield`
+unwinds with a `longjmp` exactly as `lua_error` does, and a `longjmp` through a
+Haskell frame is undefined. The coroutine yields no values and is resumed with
+none, so what the script asked for travels in the host's record and never as a Lua
+value.
+
+#### Where it cannot reach a scheduler
+
+A scheduler operation called anywhere the host is not resuming the calling
+coroutine is refused as a typed fault of the call (decision C1), not run: it never
+suspends something nobody will resume, and never yields to the wrong resumer.
+Like every refusal it is raised at the owner's boundary even if the script caught
+Lua's side of it with `pcall`.
+
+| Called from | Reason (`SuspendRefused`) |
+|---|---|
+| a finite `callEntry`, an initial chunk, a module's load, a finalizer on the owner's main thread, a to-be-closed variable's handler while its coroutine closes, a close, another owner's VM | `SuspendOutsideTask`: the host is not running a task of this owner |
+| a coroutine the script created with the `coroutine` library, while a task runs | `SuspendOtherCoroutine` |
+| the task's own coroutine inside a table-sort comparator, a pattern-replacement callback, or a finalizer it happens to run on: anywhere Lua cannot suspend it | `SuspendNotYieldable` |
+
+Lua can suspend across `pcall`, `xpcall` and a metamethod called from Lua code,
+and so a scheduler operation works there. A coroutine that yields with *no*
+scheduler operation, by calling `coroutine.yield` itself at the task's top level
+(directly or through `pcall`), would be suspended to no one; that is
+`UnscheduledYield`, a fault of the segment, and the task is closed. A script that
+resumes the task's own coroutine by hand leaves the host's next resume with
+`TaskRefused TaskNotSuspended`.
+
+### The `coroutine` library
+
+`LibraryCoroutine` is selectable like the other standard libraries, so trusted
+code can use coroutines for transient sequences inside a task (P-5, D-22). Every
+existing library set and default is unchanged: opening it is the owner's explicit
+choice, and the opener is the C library's own. Lua coroutines are not serialized
+or migrated: authoritative long-lived progress uses explicit state. A coroutine a
+script makes is the script's own and is still refused as a value
+(`RuleUnsupportedType "thread"`); a scheduler operation inside it is governed by
+the table above.
+
+### Faults in a segment
+
+Whichever segment fails, it fails as a typed `BoundaryFault`, with the module and
+entry point (the run context is set for every segment), the operation, a bounded
+traceback, a reason and an `Effect`:
+
+- a script error is `ScriptFailed CallFailed`, exhausted allocation
+  `ScriptFailed MemoryExhausted`, with `LuaRan` (`BindingRan` after an action);
+- a result the schema does not allow, or the wrong number, is `ValueRefused` on
+  the results; an argument a binding is called with is `ValueRefused` on the
+  arguments, as a fault of that call; both exactly as `callEntry` raises them;
+- a Haskell failure a binding's action raised is re-raised unconverted with its
+  own type and context, as `callEntry` re-raises it.
+
+**A failure the script caught still wins.** At every boundary of a segment,
+completed, yielded and waiting alike, a refusal the boundary made or a failure of
+application code that reached a callback is raised in preference to what Lua
+reported, even when the script caught the stand-in with `pcall` or
+`coroutine.resume` and went on to yield, wait or return; the host reports the
+failure and never a successful suspension, with its type, context and applicable
+`Effect`. This is `callEntry`'s precedence, applied at each boundary a segment can
+end in.
+
+**A segment that fails leaves nothing.** The coroutine is dead and its stack
+intact, so the host builds the traceback from it, then closes it, running its
+pending to-be-closed variables (Lua's own `coroutine.wrap` does the same), and
+empties its slot: the task has ended (`TaskEnded TaskFaulted`). An error one of
+those variables raises that is not the failure itself is kept as cleanup evidence
+beside the fault (`lua coroutine close`) and never lost.
+
+### Closing a task
+
+`closeTask` runs a suspended task's pending to-be-closed variables on the owner's
+thread and empties its slot. The close is terminal and idempotent: the task is
+closed whether or not a variable's handler failed, a failure is raised as a
+`BoundaryFault` of `CloseTask` (`ScriptFailed CallFailed`, with a Haskell failure
+a handler's callback raised outranking it) once and not again, a second close
+does nothing, and a task that already ended is closed already. A scheduler
+operation inside a handler that runs during the close is refused
+(`SuspendOutsideTask`).
+
+A VM that closes with tasks still suspended closes each of them first, before the
+state, in the order they started. Each is attempted whatever another does, on the
+owner's thread, with everything its callbacks borrow still alive; a callback a
+handler reaches is held to the finalizer allowlist exactly as a finalizer's is, so
+one the allowlist does not name is refused (`lua finalizer refused`) and an
+allowlisted one runs. A failing close is retained as evidence under `lua coroutine
+close`, in the exit matrix above, and the rest still close. A cancellation of the
+owner is deferred past all of it as it is for the close, so a cancellation that
+arrives in the middle of a resumed segment is delivered after the segment's
+bookkeeping, the suspended tasks are closed, and the original asynchronous
+exception is what the owner raises, with their failures on it.
+
+### Stack, registry and memory
+
+Every operation restores the stack depth it entered at, on every path. A task's
+slot is emptied when it ends, however it ends, so the registry holds exactly the
+suspended tasks and nothing else; the slots are not `luaL_ref` references, so
+`probeReferenceSlot` and `liveModuleReferences` do not move, and
+`liveTaskReferences` counts what is suspended. Creating a coroutine is one
+protected call with the collector held, so running out of memory there is a typed
+`ScriptFailed MemoryExhausted` of `StartTask` with `NoEffect` (nothing executed),
+and the allocation it needed is paid when the task first runs, as for a call.
+
+### What proves it
+
+`Test.Lua.Boundary.Tasks`, under the `value boundary` selector: start, yield,
+resume and complete; a wait of each kind with its exact request and arguments,
+resumed by hand, and malformed and over-limit wait arguments; a script error, a
+refused value, an exhausted allocator and a binding's failure in a resumed
+segment; a refusal and a failure caught by `pcall` or `coroutine.resume` and
+followed by a yield, a wait or a return; closing, with a failing handler,
+repeated, and after the task ended; resumption of an ended or foreign task;
+refusals from a finite call, an initial chunk, a module load, a finalizer, a
+script-created coroutine and the places Lua cannot suspend; the library selected
+and used inside a task, and a coroutine still refused as a value; stack, registry,
+tasks and heap across a thousand cycles of every shape and across allocation
+failures swept to the creation of a coroutine; the VM closed with suspended
+tasks, with a failing close, a refused callback and the allowlist; cancellation
+inside a resumed segment with several tasks suspended, delivered by coordinated
+blocking and never by sleeping; foreign-thread and re-entrant use; and two tasks
+on one VM keeping separate continuations and faults.
 
 ## The runtime adapter
 
@@ -1028,7 +1238,8 @@ the owner's thread, under `callEntry`'s own contract.
 
 Calls run one at a time, to completion, on the owner's thread, in the order they
 were accepted, through `callEntry` with that module's handle. There are no
-coroutine yields, tasks, deadlines, timers or providers here. Each accepted call
+coroutine yields, tasks, deadlines, timers or providers here (the host's tasks
+exist, but this adapter does not use them until the slices that schedule them). Each accepted call
 settles exactly once, as one of:
 
 - `CallReturned`, with the entry point's `CallResult`, `Returned` values or
