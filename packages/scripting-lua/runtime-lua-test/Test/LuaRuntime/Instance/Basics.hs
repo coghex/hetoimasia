@@ -4,6 +4,7 @@ module Test.LuaRuntime.Instance.Basics (spec) where
 
 import Control.Concurrent.STM (atomically)
 import Control.Monad (forM_, void)
+import qualified Data.Text as Text
 import Hetoimasia.Runtime.Supervision (WorkerStatus (WorkerStopped))
 import Hetoimasia.Scripting.Lua.Instance
 import Hetoimasia.Scripting.Lua.Scheduled
@@ -126,6 +127,18 @@ spec = describe "an instance" $ do
         Nothing → fail "expected a failure"
       logged fixture >>= (`shouldBe` [])
       terminationShutdown (resultTermination settled) `shouldBe` ShutdownSkippedNoInit
+
+  it "gives an instance only what it was granted: connecting to a source it was not granted is a script error that fails init" $ bounded $ do
+    fixture ← newIFixture
+    withBoundary $ \_ runtime → do
+      owner ← startInstances fixture runtime "ungranted" [echoer] (testConfig instanceBounds') requiredPolicy
+      _ ← admitWith fixture owner "a" (InstanceRequest (moduleNamed "echoer") EventOnly (Just "a") OrdinaryClass [])
+      settled ← awaitSettled fixture "a"
+      resultPhase settled `shouldBe` Failed
+      failure ← maybe (fail "expected a failure") pure (failureOf' settled)
+      failureStage failure `shouldBe` StageInit
+      failureMessage failure `shouldSatisfy` Text.isInfixOf "no event source named tick is granted"
+      terminationConnections (resultTermination settled) `shouldBe` 0
 
   it "has an identity unique within the runtime that is never issued again" $ bounded $ do
     fixture ← newIFixture
