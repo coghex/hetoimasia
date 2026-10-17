@@ -1541,7 +1541,8 @@ fire its wakes by hand.
 
 A wake is a prompt to look at the clock, never evidence that a deadline passed. An early wake
 finds nothing due and the timer is armed again. A wake of a registration that was replaced
-or cancelled is stale and ignored, as is any wake after stop. Registrations are whole
+or cancelled is stale and ignored, as is any wake after stop. Arming, cancelling and disposing happen under a mask, so the registration the backend
+made and the way to cancel it are never separated by an asynchronous exception. Registrations are whole
 microseconds, rounded up, at least one and at most one hour (`maxRegistration`), so a
 distant deadline is reached by a chain of wakes each followed by a look at the clock. None of
 this defines a clock. An owner that exits without `stopScheduler` leaves the registration
@@ -1552,7 +1553,8 @@ armed until it fires, which is why the exit path calls it.
 A scheduler may be configured with an elapsed service budget per turn
 (`boundServiceBudget`). When the clock shows it expired as a segment returns, no further
 segment starts in that turn, control and stop are served at that boundary, and the pass
-continues in the next turn. A turn always starts at least one segment, so a small budget cannot
+continues in the next turn. The clock is read again after the work at each boundary, which can close
+continuations and so use up the budget. A turn always starts at least one segment, so a small budget cannot
 stop progress, and a budget so large that its deadline is not representable never
 expires. The budget never interrupts a running segment, never changes which task runs next
 or the order tasks run in, and installs no instruction hook: it is a service target, not a
@@ -1587,7 +1589,10 @@ and any wake it earns kept: if the wait is satisfied while it is paused it runs 
 and resuming it then puts it at the tail of its class with a fresh `Ordinal` and the wake
 it earned; resuming it before the wait is satisfied returns it to waiting. A paused task
 reports `PhasePaused` either way. Stop closes the task's continuation on the owner's thread,
-once, through `hostClose`, and then cancels it. A synchronous failure of the close is retained
+once, through `hostClose`, and then cancels it. The close and its record are made under a
+mask, so a cancellation that arrives after a close has returned waits until the task is
+cancelled and the request settled, and a completed close is never repeated; a close that
+was interrupted inside the host is retried by the scheduler's stop. A synchronous failure of the close is retained
 in the settlement (`CloseFailed`) and in the turn report and is never reported as a clean
 close; the task is cancelled all the same. A second stop of a task that has ended is not
 applicable and closes nothing again.
@@ -1600,7 +1605,10 @@ once, in identity order, records each task's disposition and what it discarded i
 `ExitRecord`, settles every request not yet applied as no longer applicable, discards
 unfinished grants (so no one is left waiting for them) and cancels the timer, which stays
 disposed. A second call answers the first's report. A segment that was running when its host
-failed is recorded as outstanding and its continuation is not closed.
+failed is recorded as outstanding and its continuation is not closed. The stop runs
+masked and attempts every close: one that is interrupted at its own interruptible
+point keeps the interruption as its failure, the others still run, the stop completes,
+and the first interruption is raised again afterwards.
 
 Given the same configuration, policy, admitted tasks, segment outcomes and grants, the same
 tasks run in the same order whatever the budget and wherever a turn is cut. Elapsed waits are
