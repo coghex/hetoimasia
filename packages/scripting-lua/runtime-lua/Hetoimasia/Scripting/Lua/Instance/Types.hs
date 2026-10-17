@@ -555,6 +555,10 @@ data IState = IState
     -- started.
   , isRunStarted ∷ !Bool
     -- ^ A one-shot's @run@ was admitted.
+  , isHeldRun ∷ !Bool
+    -- ^ A one-shot's @run@ the instance took back before it began, held until it is
+    -- started again or discarded: it is outside the event queue's bound, and an ending
+    -- still counts it among what it discards.
   , isPending ∷ !(Maybe Pending)
     -- ^ The invocation in flight, until its first segment runs: it is still an
     -- unstarted one, and counts against the queue's bound and in what an ending
@@ -576,7 +580,7 @@ data Pending
 
 -- | A fresh instance's state.
 initialState ∷ IState
-initialState = IState Initializing False Set.empty Seq.empty 0 0 0 Nothing False False False Nothing
+initialState = IState Initializing False Set.empty Seq.empty 0 0 0 Nothing False False False False Nothing
 
 -- | What the owner's thread is asked to do, in the order the application asked.
 data Job

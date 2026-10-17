@@ -244,7 +244,7 @@ settleInstance instances cell settlement =
     Just _ → pure False
     Nothing → do
       writeTVar (icResult cell) (Just settlement)
-      modifyTVar' (icState cell) (\state → state {isPhase = resultPhase settlement, isStopped = True, isActive = Nothing, isConnections = Set.empty, isQueue = Seq.empty, isPending = Nothing})
+      modifyTVar' (icState cell) (\state → state {isPhase = resultPhase settlement, isStopped = True, isActive = Nothing, isConnections = Set.empty, isQueue = Seq.empty, isPending = Nothing, isHeldRun = False})
       modifyTVar' (insLive instances) (subtract 1)
       forgotten ← readTVar (icForgotten cell)
       when forgotten (releaseResult instances cell)
@@ -346,9 +346,10 @@ beginEnding cell = do
           , isConnections = Set.empty
           , isQueue = Seq.empty
           , isPending = Nothing
+          , isHeldRun = False
           , isDispatchQueued = False
           }
-      pure (Set.size (isConnections state), Seq.length (isQueue state) + maybe 0 (const 1) (isPending state), False)
+      pure (Set.size (isConnections state), Seq.length (isQueue state) + maybe 0 (const 1) (isPending state) + (if isHeldRun state then 1 else 0), False)
 
 -- | Whether a scheduler task is an instance's invocation, which only the instance
 -- layer controls.

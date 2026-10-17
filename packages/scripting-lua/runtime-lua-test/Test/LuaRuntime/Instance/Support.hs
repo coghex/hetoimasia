@@ -37,6 +37,7 @@ module Test.LuaRuntime.Instance.Support
   , hostFailing
   , hostShutdown
   , closeKilled
+  , delayedEcho
   , killShutdown
   , gateOneShot
   , initValue
@@ -467,6 +468,20 @@ hostShutdownBang =
     , "function shutdown(self, reason) fx.fail('bang') end"
     ]
 
+-- | Callbacks that cost time on the injected clock and record: one segment each.
+delayedEcho ∷ ModuleSource
+delayedEcho =
+  hooksModule
+    "delayedecho"
+    [ "function init(self, api)"
+    , "  self.id = inst.next()"
+    , "  api.connect('tick', function(self, event)"
+    , "    fx.delay()"
+    , "    " <> record <> "('tick ' .. self.id .. ' n=' .. event.payload.n)"
+    , "  end)"
+    , "end"
+    ]
+
 -- | A callback that waits holding a closing handler that is cut short as a
 -- cancellation is, and a @shutdown@ that records.
 closeKilled ∷ ModuleSource
@@ -600,8 +615,8 @@ plainModule ∷ ModuleSource
 plainModule =
   ModuleSource
     (ModuleRef "tasks" "1")
-    (Text.encodeUtf8 "function once(label) fx.record(label) return 1 end\nfunction waits(label) sched.wait_ticks(5) return 1 end\n")
-    [EntryPoint "once" Required [SText] [SInteger], EntryPoint "waits" Required [SText] [SInteger]]
+    (Text.encodeUtf8 "function once(label) fx.record(label) return 1 end\nfunction waits(label) sched.wait_ticks(5) return 1 end\nfunction holds(label) fx.block(label) return 1 end\n")
+    [EntryPoint "once" Required [SText] [SInteger], EntryPoint "waits" Required [SText] [SInteger], EntryPoint "holds" Required [SText] [SInteger]]
 
 -- | The module of this name among those the examples load.
 moduleNamed ∷ Text → ModuleRef

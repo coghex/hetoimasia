@@ -8,6 +8,7 @@ import Control.Monad (forM, forM_, void)
 import Control.Concurrent.STM (atomically)
 import qualified Data.Text as Text
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
+import Test.LuaRuntime.Scheduler.Support (nanoseconds)
 import Hetoimasia.Foundation.Resource (cleanupFailureLabel, cleanupFailuresInContext)
 import Hetoimasia.Scripting.Lua.Instance
 import Hetoimasia.Runtime.Supervision (WorkerStatus (WorkerUnavailable))
@@ -18,7 +19,7 @@ import Hetoimasia.Scripting.Lua.Value (Value (VText))
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Scheduled.Support
-  ( SFixture (sfObserver)
+  ( SFixture (sfDelay, sfObserver)
   , awaitDiagnostics
   , cancelQueued
   , awaitEffect
@@ -467,6 +468,67 @@ spec = describe "the boundaries of service" $ do
       Just (InstanceDiscarded (Discard ExitCancelled Started)) → True
       _ → False
     logged fixture >>= (`shouldSatisfy` all (\entry → not ("shutdown" `Text.isInfixOf` entry)))
+
+  it "tries an invocation the scheduler had no room for again at the boundary where room appears, so the order never depends on where turns are cut" $ bounded $ do
+    let scenario cost budget = do
+          fixture ← newIFixture
+          writeIORef (sfDelay (sf fixture)) cost
+          withBoundary $ \_ runtime → do
+            -- Four result places: two held by ordinary tasks nobody reads, two for the
+            -- instances' invocations; a second invocation of an instance finds none until
+            -- the first's place is given back.
+            let bounds = defaultSchedulerBounds {boundRetainedResults = 4, boundServiceBudget = budget}
+            owner ←
+              startWith fixture runtime $
+                instanceSpec fixture "room order" [delayedEcho, plainModule] (testConfig (InstanceBounds 2 2 8 8)) requiredPolicy bounds
+            _ ← admit fixture owner "a" (moduleNamed "delayedecho")
+            _ ← admit fixture owner "b" (moduleNamed "delayedecho")
+            awaitPhase fixture owner "a" Active
+            awaitPhase fixture owner "b" Active
+            _ ← admitScheduledTask (scheduledEndpoint owner) (request "once" [VText "unread"] OrdinaryClass OneShot Nothing) >>= ordinary
+            awaitEffect (sf fixture) "unread"
+            _ ← admitScheduledTask (scheduledEndpoint owner) (request "holds" [VText "plain"] OrdinaryClass OneShot Nothing) >>= ordinary
+            awaitEntered (sf fixture) "plain"
+            forM_ [1, 2] $ \n → do
+              expectDelivered fixture owner "a" n
+              expectDelivered fixture owner "b" n
+            releaseGate (sf fixture) "plain"
+            awaitEffect (sf fixture) "tick 2 n=2"
+            filter (Text.isPrefixOf "tick") <$> logged fixture
+    baseline ← scenario 0 Nothing
+    baseline `shouldBe` ["tick 1 n=1", "tick 2 n=1", "tick 1 n=2", "tick 2 n=2"]
+    -- A budget every segment overruns, so every turn is cut after one segment.
+    scenario 5 (Just (nanoseconds 1)) >>= (`shouldBe` baseline)
+    scenario 1000 (Just (nanoseconds 2500)) >>= (`shouldBe` baseline)
+
+  it "counts a one-shot's run, taken back by a pause, once when the instance is stopped or the owner retires while it is paused" $ bounded $ do
+    forM_ [True, False] $ \stopping → do
+      -- Each on an owner of its own: the instance's init waits at a gate that opens once.
+      fixture ← newIFixture
+      withBoundary $ \control runtime → do
+        let bounds = defaultSchedulerBounds {boundActiveTasks = 1}
+        owner ←
+          startWith fixture runtime $
+            instanceSpec fixture "held run" [gateOneShot, plainModule] (testConfig instanceBounds') requiredPolicy bounds
+        _ ← admitScheduledTask (scheduledEndpoint owner) (request "waits" [VText "w"] OrdinaryClass OneShot Nothing) >>= ordinary
+        awaitDiagnosticsWaiting owner
+        _ ← admitWith fixture owner "a" (InstanceRequest (moduleNamed "gateoneshot") RunOnce (Just "a") OrdinaryClass ["tick"])
+        awaitEntered (sf fixture) "init"
+        forM_ [1, 2] (expectDelivered fixture owner "a")
+        releaseGate (sf fixture) "init"
+        awaitPhase fixture owner "a" Active
+        awaitDiagnostics owner (\counts → diagQueued counts >= 1)
+        settleControl fixture owner "a" InstancePause >>= (`shouldBe` ControlApplied)
+        -- Two events and the run, held: the run is no part of the queue's bound.
+        snapshotOf fixture owner "a" >>= (`shouldSatisfy` \held → fmap snapshotQueued held == Just 2)
+        if stopping
+          then void (settleControl fixture owner "a" InstanceStop)
+          else do
+            retireScheduled owner
+            void (awaitScheduledTerminal control owner)
+        settled ← awaitSettled fixture "a"
+        terminationUnstarted (resultTermination settled) `shouldBe` 3
+        terminationClosed (resultTermination settled) `shouldBe` 0
 
   it "holds a one-shot's pending run outside the event queue's bound, through initialization and a pause" $ bounded $ do
     fixture ← newIFixture

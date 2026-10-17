@@ -250,8 +250,12 @@ awaitInstanceWork ih =
     -- when it appears, as it does for a grant.
     blocked ← readTVar (insBlocked (ihInstances ih))
     unless blocked retry
-    room ← admissionAvailable (scheduler' ih) (TaskSpec (BehaviorId "instance") "instance" Nothing OrdinaryClass OneShot (Finished (Returned [])))
+    room ← hasRoom ih
     unless room retry
+
+-- | Whether the scheduler would take an invocation now.
+hasRoom ∷ InstanceHost → STM Bool
+hasRoom ih = admissionAvailable (scheduler' ih) (TaskSpec (BehaviorId "instance") "instance" Nothing OrdinaryClass OneShot (Finished (Returned [])))
 
 scheduler' ∷ InstanceHost → Scheduler Cursor
 scheduler' = controlScheduler . ihControl
@@ -314,7 +318,12 @@ servicePending ih = do
   jobs ← readTVarIO (insInbox (ihInstances ih))
   backlog ← readIORef (ihBacklog ih)
   closed ← readIORef (ihToFinish ih)
-  unless (null jobs && null backlog && null closed) (serviceInstances ih)
+  -- An invocation the scheduler had no room for is tried again at the boundary where
+  -- room appears, not only when a turn ends, so when it is admitted does not depend on
+  -- where the turns are cut.
+  blocked ← readTVarIO (insBlocked (ihInstances ih))
+  room ← if blocked then atomically (hasRoom ih) else pure False
+  unless (null jobs && null backlog && null closed && not room) (serviceInstances ih)
 
 -- | Pause, resume or stop an invocation's task now. This is the owner's own thread,
 -- at a boundary, so the scheduler applies it at once, with no reservation to wait
@@ -514,6 +523,7 @@ dispatch ih cell = do
                     { isActive = Just task
                     , isQueue = rest
                     , isRunStarted = isRunStarted state || stage == StageRun
+                    , isHeldRun = isHeldRun state && stage /= StageRun
                     , isPending = Just (maybe PendingRun PendingEvent event)
                     }
                 when (isNothing reusable) $ modifyTVar' (insTasks (ihInstances ih)) (Set.insert task)
@@ -741,7 +751,7 @@ pauseInvocation ih cell task = do
       detach ih cell task
       atomically . modifyTVar' (icState cell) $ \state → case isPending state of
         Just (PendingEvent event) → state {isQueue = event <| isQueue state, isPending = Nothing}
-        Just PendingRun → state {isRunStarted = False, isPending = Nothing}
+        Just PendingRun → state {isRunStarted = False, isHeldRun = True, isPending = Nothing}
         Nothing → state
 
 -- | Record how an instance is ending, once, and close what it accepts.
