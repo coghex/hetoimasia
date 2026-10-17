@@ -74,6 +74,7 @@ import qualified Test.Foundation.Resources.Collection as Collection
 import qualified Test.Foundation.Resources.Cost as Cost
 import qualified Test.Foundation.Resources.Construction as Construction
 import qualified Test.Foundation.Resources.Opacity as Opacity
+import qualified Test.Foundation.Resources.OwnedCollection as OwnedCollection
 import qualified Test.Foundation.Resources.Visibility as Visibility
 import Test.Foundation.Resources.Buffer
   ( Buffer (..)
@@ -272,6 +273,11 @@ spec = describe "Resources" $ do
   -- them early or at its scope's exit, so its examples group beside the
   -- constructors whose staged protection it reuses.
   Collection.spec
+
+  -- The collection owned by a capability keeps the same guarantees for owners
+  -- whose work runs on threads they do not control, so its examples mirror the
+  -- collection's and add its own.
+  OwnedCollection.spec
 
   -- An owner that runs its own release records the failures it caught through
   -- the same evidence, so its examples group with the scopes' own.

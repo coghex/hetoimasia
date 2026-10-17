@@ -126,12 +126,14 @@ import Hetoimasia.Scripting.Lua.Internal.Registration
 import Hetoimasia.Scripting.Lua.Internal.Value (ValueLimits, defaultValueLimits)
 import Hetoimasia.Scripting.Lua.Internal.Library (Library)
 import Hetoimasia.Scripting.Lua.Internal.Vm
-  ( FinalizerPolicy (FinalizersAllow)
+  ( CallbackScope
+  , FinalizerPolicy (FinalizersAllow)
   , Vm
   , VmSpec (VmSpec)
   , allocateVm
   , cleanupEvidence
   , closeVm
+  , noCallbackScope
   , openLibraries
   , vmIdentity
   )
@@ -171,6 +173,9 @@ data OwnerConfig = OwnerConfig
     -- ^ The bounds on every value that crosses for this owner.
   , ownerModules ∷ ![ModuleSource]
     -- ^ The application-owned modules loaded after the initial chunks, in order.
+  , ownerCallbackScope ∷ !CallbackScope
+    -- ^ What runs around each of the VM's callbacks, on the callback's thread.
+    -- Nothing by default.
   }
 
 -- | An owner over these libraries with no initial chunk, an empty finalizer
@@ -189,6 +194,7 @@ defaultOwnerConfig libraries =
     , ownerGranted = []
     , ownerLimits = defaultValueLimits
     , ownerModules = []
+    , ownerCallbackScope = noCallbackScope
     }
 
 -- | The names of the bindings a Lua finalizer may run during this owner's close:
@@ -232,7 +238,7 @@ withOwnedVm config body = mask $ \restore → do
   self ← myThreadId
   -- Masked, and the VM is this owner's from the return: from here nothing is
   -- interruptible until the handler below is installed.
-  vm ← allocateVm (VmSpec (ownerBudget config) (Just self) (FinalizersAllow (finalizerAllowlist config)))
+  vm ← allocateVm (VmSpec (ownerBudget config) (Just self) (FinalizersAllow (finalizerAllowlist config)) (ownerCallbackScope config))
   let boundary = Boundary (ownerName config) (vmIdentity vm) (ownerRegistration config) (ownerLimits config)
   host ← newHost vm boundary
   ran ← tryWithContext @SomeException $ restore $ do

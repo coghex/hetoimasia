@@ -2,9 +2,9 @@
 -- scheduler, runs each task's segments as coroutines, and settles every task
 -- exactly once.
 --
--- 'runScheduledOwner' is the worker's run action. It runs 'withVmOwner' on the
--- worker's own thread, so that thread is the VM's execution owner, constructs and
--- initializes the VM inside it, and serves from inside its body.
+-- 'runScheduledOwner' is the worker's run action. It runs 'withVmOwnerScoped' on
+-- the worker's own thread, so that thread is the VM's execution owner, constructs
+-- and initializes the VM inside it, and serves from inside its body.
 --
 -- = The body
 --
@@ -24,6 +24,19 @@
 -- failure that escapes application code and this module reads the mark, not the
 -- type. A marked failure is a failure of the host and ends the owner, unconverted.
 --
+-- = The collection
+--
+-- An owner the application gave a 'Lending' handle holds a resource collection
+-- owned by a capability, on the owner's thread, around the VM's lifetime:
+-- allocated before the VM is constructed and closed after the VM has closed.
+-- An owner with no handle holds none and runs as it always did. Each callback of
+-- the VM is lent it for its
+-- duration ("Hetoimasia.Scripting.Lua.Lending"), so the callbacks of the initial
+-- chunks, of a coroutine's closing handlers and of a finalizer-eligible binding
+-- while the VM closes all find it open. Its exit releases what remains, newest
+-- first, and a release that fails is cleanup evidence on the owner's outcome,
+-- beside the VM's own, fatal under any policy.
+--
 -- = Every exit
 --
 -- Whatever ends the body, a stop request, a failure of application code or a
@@ -33,7 +46,8 @@
 -- every suspended coroutine on this thread, attempting each one whatever another
 -- does. Their failures, and any the turns had already kept, are cleanup evidence
 -- on the owner's outcome, beside the primary failure if there is one, and are
--- fatal under any policy. All of that happens before 'withVmOwner' closes the VM.
+-- fatal under any policy. All of that happens before 'withVmOwnerScoped' closes
+-- the VM, and the collection's own exit follows the VM's.
 module Hetoimasia.Scripting.Lua.Scheduled.Run
   ( runScheduledOwner
   ) where
@@ -62,7 +76,8 @@ import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word64)
-import Hetoimasia.Foundation.Resource (cleanupFailureException, cleanupFailureLabel, cleanupFailuresInContext, composeCleanup)
+import Hetoimasia.Foundation.Resource (cleanupFailureException, cleanupFailureLabel, cleanupFailuresInContext, composeCleanup, withScoped)
+import Hetoimasia.Foundation.Resource.OwnedCollection (allocOwnedCollection)
 import Hetoimasia.Foundation.Time (Duration, DurationRequirement (AllowZero), durationFromNanoseconds, zeroDuration)
 import Hetoimasia.Scripting.Lua.Internal.Boundary (moduleChunk)
 import Hetoimasia.Scripting.Lua.Internal.Fault (raisedByApplication)
@@ -71,6 +86,7 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Failure (ReasonCode (ScriptFau
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Identity (TaskId)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Task (TaskFailure (TaskFailure))
 import Hetoimasia.Scripting.Lua.Internal.Vm (vmIdentity)
+import Hetoimasia.Scripting.Lua.Lending.Loan (Lending, lendingScope)
 import Hetoimasia.Scripting.Lua.Owner
   ( BoundaryFault (..)
   , CallResult (EntryAbsent, Returned)
@@ -89,7 +105,8 @@ import Hetoimasia.Scripting.Lua.Owner
   , loadedModule
   , resumeTask
   , startTask
-  , withVmOwner
+  , noCallbackScope
+  , withVmOwnerScoped
   )
 import qualified Hetoimasia.Scripting.Lua.Owner as Owner
 import Hetoimasia.Scripting.Lua.Registration (WaitKind (WaitElapsed, WaitLogical))
@@ -116,16 +133,27 @@ import Hetoimasia.Scripting.Lua.Value (Side (Arguments), Value (VInteger), Value
 -- The handoff is where readiness is published: the control, once the VM is
 -- initialized and the modules loaded, and nothing before. The stop condition is
 -- the one the scheduler was configured with, so admission, grants and control
--- close at the same instant the owner is asked to stop.
+-- close at the same instant the owner is asked to stop. The collection holds at
+-- most @members@ live members.
 runScheduledOwner
   ∷ STM Bool
   → Control
   → TVar (Maybe Control)
   → (SegmentContext → IO ())
+  → Maybe Lending
+  → Int
   → VmConfig
   → IO ()
-runScheduledOwner stopping control handoff observe config = mask $ \restore → do
-  outcome ← tryWithContext @SomeException (restore (withVmOwner config (serve stopping control handoff observe config)))
+runScheduledOwner stopping control handoff observe lending members config = mask $ \restore → do
+  let body = serve stopping control handoff observe config
+  outcome ←
+    tryWithContext @SomeException . restore $ case lending of
+      Nothing → withVmOwnerScoped noCallbackScope config body
+      -- The collection is allocated first and so released last: after the VM's
+      -- close, which is the last thing 'withVmOwnerScoped' does.
+      Just handle →
+        withScoped (allocOwnedCollection members) $ \(collection, capability) →
+          withVmOwnerScoped (lendingScope handle collection capability) config body
   -- An exit before the body, or a failure of the close itself: nothing of the
   -- tasks is left to settle then, and this records how the owner ended.
   atomically (settleAll control (either exitOf (const ExitStopped) outcome))
