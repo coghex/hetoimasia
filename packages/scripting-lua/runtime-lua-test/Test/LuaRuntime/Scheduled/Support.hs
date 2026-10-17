@@ -50,7 +50,7 @@ module Test.LuaRuntime.Scheduled.Support
 import Control.Concurrent (ThreadId, myThreadId, yield)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, readMVar, tryPutMVar)
 import Control.Concurrent.STM (atomically, retry)
-import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, fromException, throwIO, tryWithContext)
+import Control.Exception (AsyncException (ThreadKilled), ExceptionWithContext (ExceptionWithContext), SomeException, fromException, throwIO, tryWithContext)
 import Control.Monad (join, unless, void)
 import Data.ByteString (ByteString)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
@@ -78,6 +78,8 @@ data SFixture = SFixture
   { sfLog ∷ !(IORef [Text])
   , sfContexts ∷ !(IORef [SegmentContext])
     -- ^ What each segment was about to be handed, newest first.
+  , sfObserver ∷ !(IORef (SegmentContext → IO ()))
+    -- ^ What else the application does as a segment is about to run.
   , sfOwnerThread ∷ !(MVar ThreadId)
     -- ^ The thread that runs the owner, noted when it first runs a segment.
   , sfGates ∷ !(IORef (Map Text (MVar ())))
@@ -106,6 +108,7 @@ newSFixture =
   SFixture
     <$> newIORef [] -- log
     <*> newIORef [] -- contexts
+    <*> newIORef (const (pure ())) -- observer
     <*> newEmptyMVar -- owner thread
     <*> newIORef Map.empty -- gates
     <*> newIORef Map.empty -- entered
@@ -219,6 +222,7 @@ schedRegistration fixture = ok (registration [] [sched, fx])
         , stateOperation "fail" [SText] [] $ \arguments → do
             case arguments of
               [VText "boundary"] → throwIO applicationBoundaryFault
+              [VText "kill"] → throwIO ThreadKilled
               [VText kind] → throwIO (Broken kind)
               _ → pure ()
             pure []
@@ -334,6 +338,8 @@ tasksEntries =
   , required "probe" [SText, SText] [SBoolean]
   , required "tick_then_fail" [SText] []
   , required "block_then_fail" [SText, SText] []
+  , required "fails_then_close_fails" [SText, SInteger] []
+  , required "close_killed" [SText] []
   , required "bad_wait" [] []
   , EntryPoint "absent" Optional [] []
   ]
@@ -404,6 +410,15 @@ tasksSource =
     , "function probe(kind, name) return fx.probe(kind, name) end"
     , "function tick_then_fail(kind) sched.wait_ticks(1) fx.fail(kind) end"
     , "function block_then_fail(name, kind) fx.block(name) fx.fail(kind) end"
+    , "function fails_then_close_fails(label, yields)"
+    , "  local guard <close> = setmetatable({}, {__close = function() fx.record(label .. ' closing') fx.fail('close boom') end})"
+    , "  if yields == 1 then sched.yield() end"
+    , "  error('script failed')"
+    , "end"
+    , "function close_killed(label)"
+    , "  local guard <close> = setmetatable({}, {__close = function() fx.record(label .. ' closing') fx.fail('kill') end})"
+    , "  sched.wait_ticks(1)"
+    , "end"
     , "function bad_wait() sched.wait_ticks(0) end"
     ]
 
@@ -447,6 +462,7 @@ scheduledWith fixture label granted worker bounds =
         thread ← myThreadId
         void (tryPutMVar (sfOwnerThread fixture) thread)
         atomicModifyIORef' (sfContexts fixture) (\held → (context : held, ()))
+        readIORef (sfObserver fixture) >>= ($ context)
     }
   where
     vm =

@@ -874,7 +874,9 @@ syncTimerFor scheduler = do
 -- report and closes nothing again. Everything runs masked, and every close is
 -- attempted: a close that is interrupted keeps the interruption as its failure,
 -- the others still run, the stop completes, and the first interruption is raised
--- again afterwards.
+-- again afterwards. A timer whose cancellation throws does not end the stop
+-- either: that failure is raised once the stop has completed, unless an
+-- interruption is, and a later call answers the completed report in both cases.
 stopScheduler ∷ Scheduler v → TaskHost v → IO StopReport
 stopScheduler scheduler host = mask_ $ do
   claim ← atomically $ do
@@ -888,7 +890,9 @@ stopScheduler scheduler host = mask_ $ do
     Right identities → do
       -- The timer is cancelled first, so no wake can arrive while continuations,
       -- which can take as long as Lua runs, are closed.
-      disposeTimer (schedTimerOf scheduler)
+      -- A cancellation that throws is kept, and the stop goes on: the closes and
+      -- the settlement of the control requests do not wait on it.
+      timerFailure ← try (disposeTimer (schedTimerOf scheduler))
       failures ← newIORef []
       interrupted ← newIORef Nothing
       -- Every obligation is closed, masked: an exception that reaches a close at
@@ -904,7 +908,7 @@ stopScheduler scheduler host = mask_ $ do
               modifyIORef' interrupted (<|> Just failure)
       collected ← reverse <$> readIORef failures
       report ← atomically (settleStop collected)
-      readIORef interrupted >>= maybe (pure report) throwIO
+      readIORef interrupted >>= maybe (either (\(failure ∷ SomeException) → throwIO failure) (const (pure report)) timerFailure) throwIO
   where
     reference = schedState scheduler
     settleStop collected = do

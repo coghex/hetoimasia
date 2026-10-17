@@ -8,8 +8,9 @@ module Test.LuaRuntime.Scheduled.Failures (spec) where
 import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (atomically)
-import Control.Exception (ExceptionWithContext (ExceptionWithContext), fromException)
-import Control.Monad (forM, forM_)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), fromException, throwIO)
+import Control.Monad (forM, forM_, void, when)
+import Data.IORef (writeIORef)
 import Data.Maybe (isJust)
 import Hetoimasia.Foundation.Resource (cleanupFailuresInContext)
 import Hetoimasia.Runtime.Supervision (WorkerCleanupFailed (WorkerCleanupFailed), WorkerStatus (WorkerStopped, WorkerUnavailable))
@@ -19,7 +20,8 @@ import Hetoimasia.Scripting.Lua.Scheduled
 import Hetoimasia.Scripting.Lua.Value (Value (VInteger, VText))
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Scheduled.Support
-import Test.LuaRuntime.Support (bounded, brokenIs, expectFatal, optionalPolicy, requiredPolicy, withBoundary)
+import Test.LuaRuntime.Scheduler.Support (FakeTimer (ftOnCancel), nanoseconds)
+import Test.LuaRuntime.Support (Broken (Broken), bounded, brokenIs, expectFatal, optionalPolicy, requiredPolicy, withBoundary)
 
 blockThenFail ∷ Value → Value → TaskRequest
 blockThenFail name kind = request "block_then_fail" [name, kind] OrdinaryClass OneShot Nothing
@@ -124,6 +126,75 @@ spec = describe "host failures, failure and cancellation" $ do
       retireScheduled owner
       awaitScheduledTerminal control owner
     length (cleanupFailuresInContext context) `shouldSatisfy` (>= 1)
+
+  describe "cleanup evidence" $ do
+    let failsThenCloseFails yields = request "fails_then_close_fails" [VText "g", VInteger yields] OrdinaryClass OneShot Nothing
+        scriptFaultWithEvidence yields = it ("keeps what closing the coroutine raised when the script's own error ended the " <> (if yields == 0 then "first" else "resumed") <> " segment, and the task still settles as faulted") $ bounded $ do
+          fixture ← newSFixture
+          ExceptionWithContext context _ ← expectFatal $ \control runtime → do
+            owner ← startScheduled fixture runtime (scheduled fixture "evidence" (optionalPolicy (const True)) defaultSchedulerBounds)
+            ticket ← admitTask' fixture owner "g" (failsThenCloseFails yields)
+            -- The failure of the close is fatal, so the owner ends: its task has
+            -- settled as the script's fault all the same.
+            _ ← awaitScheduledTerminal control owner
+            outcomeOf ticket >>= (`shouldSatisfy` \case SettledFaulted _ → True; _ → False)
+          -- Even an optional owner that recognizes everything ends fatally.
+          length (cleanupFailuresInContext context) `shouldSatisfy` (>= 1)
+    scriptFaultWithEvidence 0
+    scriptFaultWithEvidence 1
+
+    it "closes a coroutine the scheduler found inside a segment when the application's observer failed, before the VM is closed" $ bounded $ do
+      fixture ← newSFixture
+      withBoundary $ \control runtime → do
+        writeIORef (sfObserver fixture) $ \context →
+          when (contextSegment context >= 1) (throwIO (Broken "observer"))
+        owner ← startScheduled fixture runtime (scheduled fixture "observer" (optionalPolicy (brokenIs "observer")) defaultSchedulerBounds)
+        ticket ← admitTask' fixture owner "t" (request "closes_cleanly" [VText "t"] OrdinaryClass OneShot Nothing)
+        awaitDiagnostics owner (\counts → diagWaiting counts >= 1)
+        _ ← grantScheduledStep (scheduledEndpoint owner) (nanoseconds 1)
+        -- A recognized failure of an optional owner, not the refusal of a close run
+        -- in the VM's own teardown, where state operations are not allowed.
+        awaitScheduledTerminal control owner >>= (`shouldSatisfy` \case WorkerUnavailable _ → True; _ → False)
+        effects fixture >>= (`shouldSatisfy` elem "t closed")
+        outcomeOf ticket >>= (`shouldSatisfy` \case SettledDiscarded (Discard ExitFailed Started) → True; _ → False)
+
+    it "keeps every close's failure when one close is interrupted, the interruption among them, so that a plain stop is not a benign cancellation" $ bounded $ do
+      fixture ← newSFixture
+      ExceptionWithContext context _ ← expectFatal $ \control runtime → do
+        owner ← startScheduled fixture runtime (scheduled fixture "interrupted" requiredPolicy defaultSchedulerBounds)
+        _ ← admitTask' fixture owner "killed" (request "close_killed" [VText "k"] OrdinaryClass OneShot Nothing)
+        _ ← admitTask' fixture owner "bad" (request "closes_badly" [VText "b"] OrdinaryClass OneShot Nothing)
+        awaitDiagnostics owner (\counts → diagWaiting counts >= 2)
+        retireScheduled owner
+        awaitScheduledTerminal control owner
+      -- Both closes ran, in identity order, and both failures are retained.
+      effects fixture >>= (`shouldSatisfy` \logged → "k closing" `elem` logged && "b closing" `elem` logged)
+      length (cleanupFailuresInContext context) `shouldSatisfy` (>= 2)
+
+    it "keeps the close failures of an owner whose timer's cancellation throws, ending it fatally, with its control receipts settled" $ bounded $ do
+      fixture ← newSFixture
+      ExceptionWithContext context _ ← expectFatal $ \control runtime → do
+        owner ← startScheduled fixture runtime (scheduled fixture "timer" requiredPolicy defaultSchedulerBounds)
+        _ ← admitTask' fixture owner "sleeper" (request "sleep" [VText "s", VInteger 5000000000] OrdinaryClass OneShot Nothing)
+        awaitRegistrations fixture 1
+        writeIORef (ftOnCancel (sfTimer fixture)) (ioError (userError "cancel failed"))
+        retireScheduled owner
+        awaitScheduledTerminal control owner
+      length (cleanupFailuresInContext context) `shouldSatisfy` (>= 1)
+
+    it "ends the owner at the first failure of cleanup, so repeated failing closes keep nothing for as long as it serves" $ bounded $ do
+      fixture ← newSFixture
+      ExceptionWithContext context _ ← expectFatal $ \control runtime → do
+        owner ← startScheduled fixture runtime (scheduled fixture "first" requiredPolicy defaultSchedulerBounds)
+        ticket ← admitTask' fixture owner "bad" (request "closes_badly" [VText "b"] OrdinaryClass OneShot Nothing)
+        awaitDiagnostics owner (\counts → diagWaiting counts >= 1)
+        receipt ← requestTaskControl (scheduledEndpoint owner) (ticketTask ticket) RequestStop
+        case receipt of
+          TaskControlAccepted held → void (waitControl held)
+          other → fail ("the request was not accepted: " <> show other)
+        -- The close of the stopped task failed: the owner is ending, not serving on.
+        awaitScheduledTerminal control owner
+      length (cleanupFailuresInContext context) `shouldSatisfy` (>= 1)
 
   describe "cancellation" $ do
     it "retires the coroutines as a stop does, settling the tasks as discarded by a cancellation" $ bounded $ do

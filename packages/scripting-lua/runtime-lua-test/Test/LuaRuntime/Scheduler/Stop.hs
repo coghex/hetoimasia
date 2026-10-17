@@ -104,6 +104,29 @@ spec = describe "stopping the scheduler, admission and diagnostics" $ do
       map fst (stopCloseFailures again) `shouldBe` [taskIdAt 0]
       length <$> closedTasks rig >>= (`shouldBe` 3)
 
+  describe "a timer whose cancellation throws" $ do
+    it "does not stop the stop: every close runs, the control requests settle, the failure is raised after, and the report is answered again" $ do
+      rig ← newRig
+      sleeper ← admit rig "sleeper" OrdinaryClass OneShot
+      other ← admit rig "other" OrdinaryClass Looped
+      script rig "sleeper" [waitFor "sleeper" 5000000]
+      loop rig "other"
+      _ ← turn rig
+      liveRegs (rigTimer rig) >>= (`shouldSatisfy` ((== 1) . length))
+      pending ← request rig other RequestPause
+      writeIORef (ftOnCancel (rigTimer rig)) (ioError (userError "cancel failed"))
+      outcome ← try @SomeException (stopScheduler (rigScheduler rig) (rigHost rig))
+      case outcome of
+        Left failure → show failure `shouldBe` show (userError "cancel failed")
+        Right _ → fail "the timer's failure should have been raised after the stop completed"
+      map fst <$> closedTasks rig >>= (`shouldBe` [sleeper, other])
+      atomically (pollControl pending) >>= (`shouldSatisfy` \case Just (ControlSettlement ControlNoLongerApplicable Nothing) → True; _ → False)
+      atomically (schedulerClosed (rigScheduler rig)) >>= (`shouldBe` True)
+      -- Complete, so asking again answers its record and closes nothing.
+      again ← stopScheduler (rigScheduler rig) (rigHost rig)
+      stopControlsSettled again `shouldBe` 1
+      length <$> closedTasks rig >>= (`shouldBe` 2)
+
   describe "close failures that a turn that ended exceptionally had met" $ do
     let setup = do
           rig ← newRig
