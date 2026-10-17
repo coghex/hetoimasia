@@ -875,8 +875,9 @@ syncTimerFor scheduler = do
 -- attempted: a close that is interrupted keeps the interruption as its failure,
 -- the others still run, the stop completes, and the first interruption is raised
 -- again afterwards. A timer whose cancellation throws does not end the stop
--- either: that failure is raised once the stop has completed, unless an
--- interruption is, and a later call answers the completed report in both cases.
+-- either: that failure is in the report, and is raised once the stop has
+-- completed, unless an interruption is, and a later call answers the completed
+-- report in both cases.
 stopScheduler ∷ Scheduler v → TaskHost v → IO StopReport
 stopScheduler scheduler host = mask_ $ do
   claim ← atomically $ do
@@ -907,17 +908,17 @@ stopScheduler scheduler host = mask_ $ do
             when (isJust (fromException failure ∷ Maybe SomeAsyncException)) $
               modifyIORef' interrupted (<|> Just failure)
       collected ← reverse <$> readIORef failures
-      report ← atomically (settleStop collected)
+      report ← atomically (settleStop collected (either Just (const Nothing) timerFailure))
       readIORef interrupted >>= maybe (either (\(failure ∷ SomeException) → throwIO failure) (const (pure report)) timerFailure) throwIO
   where
     reference = schedState scheduler
-    settleStop collected = do
+    settleStop collected timerRaised = do
       before ← readTVar reference
       forM_ (ssControl before) $ \pending →
         settleSlot reference (pendingSlot pending) (ControlSettlement ControlNoLongerApplicable Nothing)
       state ← readTVar reference
       let (session, exit) = stopSession (ssSession state)
-          report = StopReport exit (toList (ssDelivered state) <> toList (ssEvidence state) <> collected) (Seq.length (ssControl before))
+          report = StopReport exit (toList (ssDelivered state) <> toList (ssEvidence state) <> collected) (Seq.length (ssControl before)) timerRaised
           aborted = liveCount state
           discards = exitDiscards exit
           counts = ssCounts state

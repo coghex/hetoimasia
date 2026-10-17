@@ -43,19 +43,21 @@ import Control.Exception
   ( ExceptionWithContext (ExceptionWithContext)
   , SomeAsyncException
   , SomeException
+  , catch
   , fromException
   , mask
   , mask_
   , rethrowIO
   , someExceptionContext
+  , throwIO
   , try
   , tryWithContext
   )
-import Control.Monad (forM)
+import Control.Monad (forM, when)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (catMaybes)
+import Data.Maybe (catMaybes, isJust)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -99,7 +101,7 @@ import Hetoimasia.Scripting.Lua.Runtime.Types
 import Hetoimasia.Scripting.Lua.Scheduled.Types
 import Hetoimasia.Scripting.Lua.Scheduler
   ( SegmentReport (..)
-  , StopReport (stopCloseFailures)
+  , StopReport (stopCloseFailures, stopTimerFailure)
   , TaskHost (..)
   , TaskRun (..)
   , TurnReport (turnCloseFailures)
@@ -143,7 +145,7 @@ serve stopping control handoff observe config owned = mask $ \restore → do
   let host =
         TaskHost
           { hostRun = runSegment control observe owned identity label handlesRef tasks extra
-          , hostClose = closeSuspended owned tasks
+          , hostClose = closeSuspended owned tasks kept
           }
   served ← tryWithContext @SomeException . restore $ do
     handles ← Map.fromList . catMaybes <$> traverse (resolve owned) (map sourceIdentity (vmModules config))
@@ -174,14 +176,18 @@ serve stopping control handoff observe config owned = mask $ \restore → do
   -- cleanup a script asked for.
   held ← Map.keys <$> readIORef tasks
   swept ← forM held $ \held' →
-    either (\failure → [(held', failure)]) (const []) <$> try @SomeException (closeSuspended owned tasks held')
+    either (\failure → [(held', failure)]) (const []) <$> try @SomeException (closeSuspended owned tasks kept held')
   earlier ← readIORef kept
   others ← readIORef extra
   let closeFailures =
         Map.toList . Map.fromListWith (\_ first → first) $
           earlier <> maybe [] stopCloseFailures report <> concat swept
       -- What the stop itself raised, unless a close's failure already says it.
-      recorded = map (show . snd) closeFailures
+      timerFailure = report >>= stopTimerFailure
+      recorded = map (show . snd) closeFailures <> [show failure | Just failure ← [timerFailure]]
+      -- What cancelling the timer raised: the stop went on, and the report keeps it
+      -- even when a close's interruption is what the stop raised.
+      timerEvidence = [("lua timer cancel", ExceptionWithContext (someExceptionContext failure) failure) | Just failure ← [timerFailure]]
       interruption =
         [ ("lua scheduler stop", failure)
         | Left failure@(ExceptionWithContext _ raised) ← [stopped]
@@ -192,6 +198,7 @@ serve stopping control handoff observe config owned = mask $ \restore → do
     composeCleanup
       primary
       ( interruption
+          <> timerEvidence
           <> others
           <> [("lua task close", ExceptionWithContext (someExceptionContext failure) failure) | (_, failure) ← closeFailures]
       )
@@ -252,7 +259,10 @@ runSegment control observe owned identity label handlesRef tasks extra run = do
         (Nothing, _) → failed (ModuleNotLoaded ref)
         (Just _, OverBound rule) → failed (BoundaryFailed (refusedArguments ref entry rule))
         (Just handle, WithinBounds arguments) →
-          settledOrRaise extra (startTask owned handle entry arguments) >>= \case
+          -- The coroutine is acquired and published together: a cancellation that
+          -- was queued during the segment lands after both, so the task's
+          -- coroutine is always somewhere the owner's retirement finds it.
+          mask_ $ settledOrRaise extra (startTask owned handle entry arguments) >>= \case
             Left fault → failed fault
             Right TaskEntryAbsent → pure (ReportCompleted (Finished EntryAbsent))
             Right (TaskStarted task step) → do
@@ -313,14 +323,21 @@ durationOf = \case
 
 -- | Close a suspended task's coroutine, once, on this thread. A failure of the
 -- close is raised, for the scheduler to keep as evidence.
-closeSuspended ∷ OwnedVm → IORef (Map TaskId Task) → TaskId → IO ()
-closeSuspended owned tasks identity = do
+--
+-- The scheduler keeps a synchronous failure of the close, but an asynchronous
+-- exception that reaches it is raised unrecorded, and the coroutine is closed
+-- and forgotten by then: it is kept here, by task, before it goes on.
+closeSuspended ∷ OwnedVm → IORef (Map TaskId Task) → IORef [(TaskId, SomeException)] → TaskId → IO ()
+closeSuspended owned tasks kept identity = do
   held ← Map.lookup identity <$> readIORef tasks
   case held of
     Nothing → pure ()
     Just task → do
       modifyIORef' tasks (Map.delete identity)
-      closeTask owned task
+      closeTask owned task `catch` \(failure ∷ SomeException) → do
+        when (isJust (fromException failure ∷ Maybe SomeAsyncException)) $
+          modifyIORef' kept (<> [(identity, failure)])
+        throwIO failure
 
 -- | Run one action of the VM, answering the fault of the task it raised, or
 -- raising what is not the task's own.

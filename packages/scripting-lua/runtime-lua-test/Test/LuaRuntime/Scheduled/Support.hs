@@ -340,6 +340,7 @@ tasksEntries =
   , required "block_then_fail" [SText, SText] []
   , required "fails_then_close_fails" [SText, SInteger] []
   , required "close_killed" [SText] []
+  , required "blocks_then_suspends" [SText, SText] []
   , required "bad_wait" [] []
   , EntryPoint "absent" Optional [] []
   ]
@@ -414,6 +415,11 @@ tasksSource =
     , "  local guard <close> = setmetatable({}, {__close = function() fx.record(label .. ' closing') fx.fail('close boom') end})"
     , "  if yields == 1 then sched.yield() end"
     , "  error('script failed')"
+    , "end"
+    , "function blocks_then_suspends(label, name)"
+    , "  local guard <close> = setmetatable({}, {__close = function() fx.record(label .. ' closed') end})"
+    , "  fx.block(name)"
+    , "  sched.wait_ticks(1)"
     , "end"
     , "function close_killed(label)"
     , "  local guard <close> = setmetatable({}, {__close = function() fx.record(label .. ' closing') fx.fail('kill') end})"

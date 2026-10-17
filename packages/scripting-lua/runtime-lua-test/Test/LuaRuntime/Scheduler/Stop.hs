@@ -127,6 +127,30 @@ spec = describe "stopping the scheduler, admission and diagnostics" $ do
       stopControlsSettled again `shouldBe` 1
       length <$> closedTasks rig >>= (`shouldBe` 2)
 
+  describe "a timer whose cancellation throws and a close that is interrupted" $ do
+    it "keeps the timer's failure in the report that a later call answers, while the interruption is what the stop raises" $ do
+      rig ← newRig
+      _ ← admit rig "sleeper" OrdinaryClass OneShot
+      _ ← admit rig "other" OrdinaryClass Looped
+      script rig "sleeper" [waitFor "sleeper" 5000000]
+      loop rig "other"
+      _ ← turn rig
+      writeIORef (ftOnCancel (rigTimer rig)) (ioError (userError "cancel failed"))
+      entered ← newEmptyMVar
+      gate ← newEmptyMVar
+      writeIORef (rigCloseHook rig) $ \identity →
+        when (identity == taskIdAt 0) (putMVar entered () >> takeMVar gate)
+      finished ← newEmptyMVar
+      stopper ← forkIO (try @SomeException (stopScheduler (rigScheduler rig) (rigHost rig)) >>= putMVar finished)
+      takeMVar entered
+      throwTo stopper ThreadKilled
+      takeMVar finished >>= \case
+        Left failure → fromException failure `shouldBe` Just ThreadKilled
+        Right _ → fail "the interruption should have been raised after the stop completed"
+      again ← stopScheduler (rigScheduler rig) (rigHost rig)
+      fmap show (stopTimerFailure again) `shouldBe` Just (show (userError "cancel failed"))
+      map fst (stopCloseFailures again) `shouldBe` [taskIdAt 0]
+
   describe "close failures that a turn that ended exceptionally had met" $ do
     let setup = do
           rig ← newRig

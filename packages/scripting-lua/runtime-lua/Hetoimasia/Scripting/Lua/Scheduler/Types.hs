@@ -372,6 +372,8 @@ data StopReport = StopReport
   , stopControlsSettled ∷ !Int
     -- ^ Accepted control requests that had not been applied, settled as no
     -- longer applicable.
+  , stopTimerFailure ∷ !(Maybe SomeException)
+    -- ^ What cancelling the timer raised, if it raised: the stop went on.
   }
   deriving (Show)
 

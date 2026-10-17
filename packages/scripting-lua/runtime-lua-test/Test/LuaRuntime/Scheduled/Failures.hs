@@ -12,7 +12,7 @@ import Control.Exception (ExceptionWithContext (ExceptionWithContext), fromExcep
 import Control.Monad (forM, forM_, void, when)
 import Data.IORef (writeIORef)
 import Data.Maybe (isJust)
-import Hetoimasia.Foundation.Resource (cleanupFailuresInContext)
+import Hetoimasia.Foundation.Resource (cleanupFailureLabel, cleanupFailuresInContext)
 import Hetoimasia.Runtime.Supervision (WorkerCleanupFailed (WorkerCleanupFailed), WorkerStatus (WorkerStopped, WorkerUnavailable))
 import Hetoimasia.Scripting.Lua.Owner (BoundaryFault)
 import Hetoimasia.Scripting.Lua.Runtime (Discard (Discard), ExitKind (ExitCancelled, ExitFailed), ExitRecord (exitKind, exitNotStarted, exitStarted), Progress (NotStarted, Started))
@@ -171,6 +171,31 @@ spec = describe "host failures, failure and cancellation" $ do
       effects fixture >>= (`shouldSatisfy` \logged → "k closing" `elem` logged && "b closing" `elem` logged)
       length (cleanupFailuresInContext context) `shouldSatisfy` (>= 2)
 
+    it "keeps an interrupted close as evidence when a task-level stop made it, so an optional owner that recognizes everything is fatal" $ bounded $ do
+      fixture ← newSFixture
+      ExceptionWithContext context _ ← expectFatal $ \control runtime → do
+        owner ← startScheduled fixture runtime (scheduled fixture "task stop" (optionalPolicy (const True)) defaultSchedulerBounds)
+        ticket ← admitTask' fixture owner "killed" (request "close_killed" [VText "k"] OrdinaryClass OneShot Nothing)
+        awaitDiagnostics owner (\counts → diagWaiting counts >= 1)
+        _ ← requestTaskControl (scheduledEndpoint owner) (ticketTask ticket) RequestStop
+        awaitScheduledTerminal control owner
+      effects fixture >>= (`shouldSatisfy` elem "k closing")
+      length (cleanupFailuresInContext context) `shouldSatisfy` (>= 1)
+
+    it "keeps both the timer's failure and an interrupted close's when the stop met both" $ bounded $ do
+      fixture ← newSFixture
+      ExceptionWithContext context _ ← expectFatal $ \control runtime → do
+        owner ← startScheduled fixture runtime (scheduled fixture "both" requiredPolicy defaultSchedulerBounds)
+        _ ← admitTask' fixture owner "killed" (request "close_killed" [VText "k"] OrdinaryClass OneShot Nothing)
+        _ ← admitTask' fixture owner "sleeper" (request "sleep" [VText "s", VInteger 5000000000] OrdinaryClass OneShot Nothing)
+        awaitRegistrations fixture 1
+        writeIORef (ftOnCancel (sfTimer fixture)) (ioError (userError "cancel failed"))
+        retireScheduled owner
+        awaitScheduledTerminal control owner
+      let labels = map cleanupFailureLabel (cleanupFailuresInContext context)
+      labels `shouldSatisfy` elem "lua timer cancel"
+      labels `shouldSatisfy` elem "lua task close"
+
     it "keeps the close failures of an owner whose timer's cancellation throws, ending it fatally, with its control receipts settled" $ bounded $ do
       fixture ← newSFixture
       ExceptionWithContext context _ ← expectFatal $ \control runtime → do
@@ -197,6 +222,18 @@ spec = describe "host failures, failure and cancellation" $ do
       length (cleanupFailuresInContext context) `shouldSatisfy` (>= 1)
 
   describe "cancellation" $ do
+    it "closes a coroutine whose task a cancellation interrupted as it first yielded, before the VM, so its close may use a state operation" $ bounded $ do
+      fixture ← newSFixture
+      withBoundary $ \control runtime → do
+        owner ← startScheduled fixture runtime (scheduled fixture "first segment" requiredPolicy defaultSchedulerBounds)
+        ticket ← admitTask' fixture owner "a" (request "blocks_then_suspends" [VText "a", VText "g"] OrdinaryClass OneShot Nothing)
+        awaitEntered fixture "g"
+        cancelScheduled owner
+        releaseGate fixture "g"
+        awaitScheduledTerminal control owner >>= (`shouldSatisfy` \case WorkerStopped → True; _ → False)
+        effects fixture >>= (`shouldSatisfy` elem "a closed")
+        outcomeOf ticket >>= (`shouldSatisfy` \case SettledDiscarded (Discard ExitCancelled Started) → True; _ → False)
+
     it "retires the coroutines as a stop does, settling the tasks as discarded by a cancellation" $ bounded $ do
       fixture ← newSFixture
       withBoundary $ \control runtime → do
@@ -213,9 +250,9 @@ spec = describe "host failures, failure and cancellation" $ do
         awaitScheduledTerminal control owner >>= (`shouldSatisfy` \case WorkerStopped → True; _ → False)
         outcomeOf suspended >>= (`shouldSatisfy` \case SettledDiscarded (Discard ExitCancelled Started) → True; _ → False)
         outcomeOf unstarted >>= (`shouldSatisfy` \case SettledDiscarded (Discard ExitCancelled NotStarted) → True; _ → False)
-        -- The segment that was running returned, and the cancellation landed behind
-        -- it: Lua or a binding had run, so the task is discarded as started.
-        outcomeOf stuck >>= (`shouldSatisfy` \case SettledDiscarded (Discard ExitCancelled Started) → True; _ → False)
+        -- The segment that was running returned and finished the task, and the
+        -- cancellation landed behind it: a task that completed keeps its result.
+        outcomeOf stuck >>= (`shouldBe` Just []) . taskReturned
         effects fixture >>= (`shouldSatisfy` elem "a closed")
         atomically (scheduledExitRecord owner) >>= \case
           Just record → exitKind record `shouldBe` ExitCancelled
