@@ -84,7 +84,8 @@ LUA-6 readiness discussion opened on 2026-10-17 at the owner's direct request.
 LUA-5 is now delivered by #464 / PR #465, merged as `29211202`, and TIME-1/#133
 is delivered. The current exploration is limited to LUA-6; it does not revoke
 the prior slices' approvals or renew LUA-7/LUA-8 or the confined branch.
-Q-9 and Q-10 below record proposals awaiting the owner's choices. LUA-6 remains
+Q-9 through Q-12 below record remaining questions and proposals. D-16 through
+D-18 record the owner's lifecycle, identity and per-owner scheduler direction. LUA-6 remains
 deferred until those choices, their dependent contract reconciliation and an
 explicit readiness signoff are complete. No new tracker item is authorized by
 this design discussion.
@@ -471,9 +472,43 @@ Owner direction, 2026-10-17: scripts should be able to control lifecycle,
 including pause, resume and stop. Application-only controls are not the desired
 endpoint. The owner also proposed IDs, control from Lua elsewhere, and a game
 terminal `ps` command listing scripts and status. Those proposals are retained
-under Q-9/Q-11: the target granularity, cross-owner authority, identity assignment
-and delivery scope still need clarification. This decision does not choose
+under Q-9/Q-11; D-17 subsequently settles task identity and permitted cross-owner
+control. Detailed lifecycle behavior and delivery scope still need clarification.
+This decision does not choose
 forced interruption, a global registry, a terminal implementation or readiness.
+
+### D-17. Identify script tasks by TID and expose owner, name and status
+
+Owner accepted the proposed task identity and permitted cross-owner control
+direction on 2026-10-17. The display/API vocabulary is **TID** (thread ID),
+**owner** (a string), **name** and **status**, as in the proposed `ps` listing.
+TID identifies one logical running script task, with an engine-issued identity
+and an application-assigned readable name. It does not expose an OS thread,
+Haskell `ThreadId` or a raw Lua coroutine. Several tasks may share one VM owner.
+The owner string is its readable label; the existing internal owner identity
+and capability checks still establish identity and authority.
+
+Permitted Lua code elsewhere can request lifecycle changes by task ID, including
+across VM owners in the application's runtime. Requests remain nonblocking and
+the target owner applies them at safe boundaries. Whole-owner control is
+distinct from controlling one task. Neither the TID nor a readable label grants
+authority. Q-11 retains the question of delivering the terminal command itself.
+
+### D-18. Select scheduling schemes per VM owner
+
+Owner direction, 2026-10-17: FIFO is the default, but different owners must be
+creatable with different scheduling schemes. UI and gameplay may choose
+different schemes; the design must leave room for more sophisticated schedulers
+as the engine matures. This selects per-owner policy, not a global scheduler or
+a requirement that the engine hard-code UI/gameplay owners.
+
+These policies choose the next logical Lua task within an owner at cooperative
+boundaries. They do not select OS/Haskell thread scheduling or preempt a segment
+or blocking callback. Existing D-3/P-5/P-6 bounds and fairness requirements still
+need an explicit relationship to interchangeable policies. Q-12 records the
+proposed default semantics and extension scope pending signoff; Q-10 retains
+compatibility with LUA-5's finite-call interface. No new algorithm beyond FIFO
+has been selected, and LUA-6 readiness is not yet renewed.
 
 ## Design
 
@@ -1300,9 +1335,16 @@ to completion before taking the next; scheduled owners rotate among tasks at
 their explicit safe boundaries. Ordinary function calls inside a task remain
 ordinary Lua calls. Neither mode can forcibly pause arbitrary running code.
 
+Subsequent owner direction selects different scheduling schemes per owner
+(D-18). This is broader than the original contrast between finite-call and
+scheduled owners. Do not treat that response as signoff on two separate public
+owner forms: their compatibility relationship remains to be reconciled with
+the chosen scheduler contract. Preserve LUA-5's delivered behavior meanwhile.
+
 ### Q-11. Script identity, inspection and control across owners
 
-**Open; owner proposal, 2026-10-17.** The owner suggested an ID system, an API
+**Identity and permitted cross-owner control resolved by D-17; terminal delivery
+scope remains open.** The owner suggested an ID system, an API
 to request/set script IDs, pause/resume/stop from Lua elsewhere, and precise
 game-terminal control including `ps` to list scripts and their status.
 
@@ -1313,7 +1355,7 @@ LUA-4 has scoped task IDs, but they are not yet a public scheduled-task API.
 Neither an owner ID nor a task ID should be confused with a source-file name,
 OS thread ID or Lua coroutine pointer.
 
-Recommendation pending signoff: target individual scheduled script tasks with
+Accepted direction (D-17): target individual scheduled script tasks with
 engine-issued opaque IDs and optional application-assigned display names. A
 task ID identifies one running instance, even when several instances use the
 same source. Keep whole-owner control explicitly distinct. Expose bounded
@@ -1323,12 +1365,33 @@ runtime; the target owner applies requests at safe boundaries. Knowing an ID
 does not itself grant control. A terminal can build `ps` on the inspection API;
 whether a terminal command itself belongs in LUA-6 is not decided.
 
-Clarify with the owner before dependent design: task versus owner targets;
-cross-owner reach and grants; automatic IDs versus caller-selected identities
-or display names; and engine API versus delivery of the game's terminal UI.
+Clarify engine API versus delivery of the game's terminal UI before setting
+the implementation scope. Detailed grant and request semantics still need a
+concrete contract consistent with D-14/D-17.
 Self-pause needs another permitted controller to resume it. Stop ends future
 execution rather than becoming a resumable pause; completed effects are not
 rolled back. These distinctions must be visible in the eventual contract.
+
+### Q-12. FIFO default and the scheduler extension contract
+
+**Open; proposal following D-18, 2026-10-17.** In a cooperative scheduler,
+FIFO must not accidentally mean that a resumable task monopolizes its owner
+until completion. Proposed default: FIFO among ready peers within each service
+class, with a yielding task rejoining at the tail; fixed classes receive bounded
+service under P-5's configurable finite quanta. This is round-robin service at
+segment boundaries, with stable ordering for the same admitted inputs.
+
+Proposed LUA-6 scope: an owner selects its scheduling policy at creation, with
+this default supplied and a documented extension boundary for alternative
+policies. No live policy swapping or additional sophisticated built-in algorithm
+is implied. Runtime ownership, grants, admission/result caps, stop handling and
+the cooperative execution boundary remain runtime responsibilities rather than
+optional policy features. The detailed design must state how an alternative
+policy preserves bounded opportunities and cannot starve lifecycle handling.
+
+The owner has selected extensibility but has not yet signed off this precise
+meaning of FIFO or the extension boundary. Resolve this before choosing the
+API, reconciliation of finite calls, or implementation slice boundaries.
 
 ## Verification strategy
 
@@ -1637,7 +1700,7 @@ and verified policy, with adversarial regression coverage.
 ### LUA-6. Schedule cooperative tasks with bounded service turns
 
 > Deferred: readiness discussion opened 2026-10-17. LUA-5 and TIME-1 are
-> delivered; Q-9/Q-10/Q-11 require owner choices and dependent reconciliation before
+> delivered; Q-9 through Q-12 need completion and dependent reconciliation before
 > readiness signoff. Earlier narrow renewals did not cover this slice.
 
 - **Outcome:** one trusted VM owner services resumable tasks fairly, wakes for
@@ -1655,7 +1718,7 @@ and verified policy, with adversarial regression coverage.
   only on explicit completion; elapsed budget cannot be sold as a hard limit.
 - **Out of scope:** automatic code rewriting, arbitrary priority API, simulation
   coordinator, CPU affinity/niceness tuning, performance pass/fail thresholds.
-- **Open questions:** Q-9, Q-10, Q-11. Q-4's TIME-1 prerequisite is satisfied; consume
+- **Open questions:** Q-9, Q-10, Q-11, Q-12. Q-4's TIME-1 prerequisite is satisfied; consume
   its existing clock API.
 
 ### LUA-7. Add bounded asynchronous requests and owned subscriptions
