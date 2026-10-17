@@ -1919,7 +1919,7 @@ a `ThreadId` or a coroutine, and it, like the application's name for the instanc
 Live instances (`boundLiveInstances`) and the results of ended ones nobody has observed
 (`boundRetainedInstances`) are each bounded, and a result is reserved at admission. A configuration
 that does not fit the scheduler's own bounds is refused before anything starts, naming every
-violation (`InstancesRefused`): the scheduler's retained-result bound must be at least twice the
+violation (`InstancesRefused`; a source's name must also leave room for the driver's entry point's prefix): the scheduler's retained-result bound must be at least twice the
 live instances, because an instance's next invocation is admitted before the scheduler has given
 back its last result, and its queue of admissions must hold one invocation for each.
 
@@ -1998,8 +1998,10 @@ raised by application code is never an instance's failure; it ends the owner, un
 tasks. Cleanup is the engine's and nothing the application answers can hide it: what closing a coroutine
 raised, a closing handler the script defined included, is cleanup evidence on the owner's outcome and is
 fatal under any policy, as it is for a task, and it stays beside an instance's primary failure; a failure raised
-while an instance ends does not take a close's failure with it, and a `shutdown` that raised a failure of the host is not
-started again when the owner's exit comes back to the instance.
+while an instance ends does not take a close's failure with it, a `shutdown` that raised a failure of the host is not
+started again when the owner's exit comes back to the instance, and when several instances' ends raise failures the first
+is the owner's and every other is kept whole as cleanup evidence. What an ending had counted survives a failure of the
+host in its hook.
 
 ### Control
 
@@ -2009,11 +2011,14 @@ thread: `InstanceControlAccepted` with a receipt, `InstanceControlFull`, `Instan
 request holds a reservation until its settlement is observed or abandoned
 (`boundInstanceControls`), and settles exactly once, as applied, already in that state, or no longer
 applicable, including when the instance or the owner ends first. Requests are applied in the order accepted,
-at the owner's next safe boundary: the owner's thread services them as each segment is about to begin and
-between turns, never inside a segment, and the segment about to run does not enter an instance that is paused
-or ending. A request is settled as it is applied, before anything that can raise a failure of the host. The
-owner asks the scheduler to pause, resume or stop the invocation's task, and asks again if the scheduler has
-no reservation to take the request with.
+at the owner's next safe boundary: the owner's thread services them at each of the scheduler's boundaries,
+before the first segment of a turn and after every segment, when no task is running, and never inside a segment.
+Pause and resume of the invocation in flight, and stop, are done to its task directly, at that boundary,
+with no scheduler request, reservation or queue between: a request settles as it is applied, before anything that
+can raise a failure of the host. An invocation that has not run a segment has nothing to freeze or close, even when
+the scheduler holds it in its queue behind slots that stay occupied: pausing takes it back, with its event, to be
+started on resume, and a stop discards it as an unstarted invocation. An owner that has been asked to stop services
+nothing more: its exit settles what was left.
 
 - **Pause** stops new invocations from starting and freezes the invocation in flight, if any, suspended
   where it is, running nothing, however its wait would have ended. Accepted events stay in the queue, in
@@ -2025,7 +2030,9 @@ no reservation to take the request with.
   of those, not a coroutine closed), closes the coroutine of
   the invocation in flight on the owner's thread and never resumes it, and only then runs `shutdown`. The
   request's result says the stop was taken; its completion is the instance's settlement, written after the
-  hook and the release. Repeated requests are safe and never resurrect an instance or run `shutdown` again.
+  hook and the release. A stop ends an instance as it is applied unless a hook raises a failure of the host, so a
+  second request finds it ended and settles as no longer applicable. Repeated requests are safe and never
+  resurrect an instance or run `shutdown` again.
 
 Whole-owner control (`retireScheduled`) is distinct. An orderly retirement stops each live instance
 through the same path with the reason `stopped` before the VM is closed. An owner that fails or is
@@ -2046,7 +2053,7 @@ ticket nobody observes or forgets keeps its reservation, which bounds the retain
 read in one transaction, and never borrow a Lua table.
 
 Everything the owner does for an instance is a response to something: an admission, an event, a request,
-a grant, a deadline or a stop, or room appearing in the scheduler for an invocation it had none for. Its wait is
+a grant, a deadline or a stop, or room appearing in the scheduler's queue or results for an invocation it had none for. Its wait is
 the scheduled owner's one STM wait with the instance layer's jobs added, so an owner whose instances are all paused, waiting or idle enters no Lua and does no periodic
 work until one of those arrives.
 
