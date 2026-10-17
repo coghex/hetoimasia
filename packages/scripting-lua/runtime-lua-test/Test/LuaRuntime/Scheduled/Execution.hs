@@ -199,6 +199,19 @@ spec = describe "tasks run as coroutines on a scheduled owner" $ do
         taskEffects fixture >>= (`shouldBe` ["s pause s -> 0", "s after"])
         retireScheduled owner
 
+    it "applies a stop of the running task when its segment returns, closing its coroutine" $ bounded $ do
+      fixture ← newSFixture
+      withBoundary $ \_ runtime → do
+        owner ← startScheduled fixture runtime (scheduled fixture "self stop" requiredPolicy defaultSchedulerBounds)
+        ticket ← holding fixture owner (admitTask' fixture owner "k" (request "controls" [VText "k", VText "k", VText "stop"] OrdinaryClass OneShot (Just "k")))
+        outcomeOf ticket >>= \case
+          SettledCancelled → pure ()
+          other → fail ("expected the task to be cancelled, found " <> show other)
+        -- It asked inside its first segment and was stopped as that returned, so it
+        -- never ran the line after its yield.
+        taskEffects fixture >>= (`shouldBe` ["k stop k -> 0"])
+        retireScheduled owner
+
     it "stops a task, closing its coroutine, and settles it as cancelled" $ bounded $ do
       fixture ← newSFixture
       withBoundary $ \_ runtime → do

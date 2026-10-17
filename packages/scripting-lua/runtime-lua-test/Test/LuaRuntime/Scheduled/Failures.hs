@@ -76,6 +76,16 @@ spec = describe "host failures, failure and cancellation" $ do
     length (cleanupFailuresInContext context) `shouldSatisfy` (>= 1)
     effects fixture >>= (`shouldSatisfy` elem "b closing")
 
+  it "is fatal for an optional owner that recognizes everything when a plain stop's coroutine close fails" $ bounded $ do
+    fixture ← newSFixture
+    ExceptionWithContext context _ ← expectFatal $ \control runtime → do
+      owner ← startScheduled fixture runtime (scheduled fixture "optional stop" (optionalPolicy (const True)) defaultSchedulerBounds)
+      _ ← admitTask' fixture owner "bad" (request "closes_badly" [VText "b"] OrdinaryClass OneShot Nothing)
+      awaitDiagnostics owner (\counts → diagWaiting counts >= 1)
+      retireScheduled owner
+      awaitScheduledTerminal control owner
+    length (cleanupFailuresInContext context) `shouldSatisfy` (>= 1)
+
   describe "cancellation" $ do
     it "retires the coroutines as a stop does, settling the tasks as discarded by a cancellation" $ bounded $ do
       fixture ← newSFixture

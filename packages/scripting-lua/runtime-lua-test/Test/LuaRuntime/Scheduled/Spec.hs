@@ -6,6 +6,7 @@ module Test.LuaRuntime.Scheduled.Spec (spec) where
 
 import qualified Test.LuaRuntime.Scheduled.Callbacks
 import qualified Test.LuaRuntime.Scheduled.Creation
+import qualified Test.LuaRuntime.Scheduled.Determinism
 import qualified Test.LuaRuntime.Scheduled.Execution
 import qualified Test.LuaRuntime.Scheduled.Failures
 import qualified Test.LuaRuntime.Scheduled.Lifecycle
@@ -20,3 +21,4 @@ spec = describe "the scheduled Lua owners" $ do
   Test.LuaRuntime.Scheduled.Callbacks.spec
   Test.LuaRuntime.Scheduled.Lifecycle.spec
   Test.LuaRuntime.Scheduled.Failures.spec
+  Test.LuaRuntime.Scheduled.Determinism.spec
