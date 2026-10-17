@@ -754,7 +754,10 @@ thread-owned collection needs no such rule, since its owner thread is the only
 one that can be inside an operation when the scope ends.
 
 Exit first closes admission: from then on an operation on any thread is rejected
-with `OwnedReentered Closing`, and nothing new begins. It then waits for the
+with `OwnedReentered Closing`, and nothing new begins. The one exception is the
+thread running the exit, which may still call `liveOwnedMemberCount` while it
+releases members, as a release in the thread-owned collection can: the read
+changes nothing, and no other thread may make it. The exit then waits for the
 operation that was already admitted — an acquisition, a handoff, a borrow, or a
 retirement — to finish, and only then releases the members still live, newest
 first, in the order of [Release order at exit](#release-order-at-exit). A
@@ -1918,8 +1921,9 @@ an operation already inside it, with barriers: the exit waiting for a borrow, an
 acquisition, an acquire-then handoff, or a retirement on another thread, refusing
 new operations meanwhile with `OwnedReentered Closing` and releasing only after
 the operation ended, newest first and nothing twice, the same wait holding when
-the scope is cancelled while it waits, and the exit proceeding after an operation
-that failed.
+the scope is cancelled while it waits, the exit proceeding after an operation
+that failed, and a release at exit reading the live count while another thread is
+refused.
 
 The `Collection opacity across the package boundary` group in
 `packages/foundation/test/Test/Foundation/Resources/Opacity.hs` compiles nine more clients the same
