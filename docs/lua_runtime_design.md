@@ -84,7 +84,7 @@ LUA-6 readiness discussion opened on 2026-10-17 at the owner's direct request.
 LUA-5 is now delivered by #464 / PR #465, merged as `29211202`, and TIME-1/#133
 is delivered. The current exploration is limited to LUA-6; it does not revoke
 the prior slices' approvals or renew LUA-7/LUA-8 or the confined branch.
-Q-9 through Q-15 below record remaining questions and proposals. D-16 through
+Q-9 through Q-16 below record remaining questions and proposals. D-16 through
 D-22 record the owner's lifecycle, identity, per-owner scheduler and instance direction. LUA-6 remains
 deferred until those choices, their dependent contract reconciliation and an
 explicit readiness signoff are complete. No new tracker item is authorized by
@@ -1620,6 +1620,55 @@ uses the proposed elapsed `dt` and coalescing, or retains Synarchy's nominal
 interval `dt` (with elapsed time separately exposed). Fixed-step progress is a
 separate explicit contract in either case. This does not renew LUA-6 readiness.
 
+Owner follow-up: agreement with elapsed-time updates was conditional on choosing
+a nondeterministic game. The owner now asks whether to invest in determinism.
+Do not record that conditional response as acceptance of nondeterministic
+authoritative gameplay or of the Q-15 default. Resolve Q-16 first. In particular,
+dropping an AI decision because real-time service was late can change gameplay,
+even when that decision does not itself integrate movement or production.
+
+### Q-16. Deterministic gameplay target
+
+**Open; recommendation, not owner decision.** The existing P-10 promise is local
+ordering for admitted inputs/grants, not application replay. Foundation design
+keeps game determinism application-owned. P-6 already separates logical gameplay
+time and completed effects from real-time UI pacing. The existing runtime
+`UpdatePolicy` is a pacing helper, not a game simulation driver: its bounded
+fixed-step policy can discard wall-time debt. Discarding that debt must never
+be interpreted as skipping numbered authoritative simulation steps.
+
+Recommend designing the gameplay path now for repeatability with identical
+initial state, content, seed, tick-assigned input sequence and scheduling
+configuration on the same build and supported platform. Leave presentation
+updates on elapsed/frame time. This is a useful first qualification target;
+cross-platform bitwise identity, cross-version replay, network lockstep and a
+complete replay product are separate work, not implicit LUA-6 scope.
+
+Different script rates remain supported: represent gameplay cadence as integer
+logical ticks (with a documented conversion policy), and run an instance only
+on its due ticks. Slower AI does not need a callback every base tick. Stable
+phases/ordering or explicit staged commits settle interacting updates. Real
+elapsed budgets may delay completion but may not select which authoritative
+effects occur. Under overload, finish admitted logical work across bounded
+service turns and let simulation lag real time while UI stays responsive.
+
+Required application disciplines include seeded, explicitly owned random
+streams isolated from UI; ordered traversal where order affects results;
+tick/sequence-assigned external commands, events and lifecycle requests; and
+deterministic incorporation of asynchronous results. A fixed timestep alone
+does not establish determinism. Scheduler choices remain supported, but changing
+their order can change results unless effects are isolated or committed in a
+canonical order. Initially qualify one fixed gameplay policy/configuration;
+do not promise replay invariance across policy changes or worker counts.
+
+Proposed evidence is repeated headless execution of a small representative
+simulation with canonical authoritative-state digests at logical boundaries,
+varying wall-time delays and UI activity while holding assigned inputs fixed.
+This is prospective acceptance work, not a result obtained in this discussion.
+If approved, reconcile Q-15 and P-10 and identify the engine/application delivery
+boundary before renewing LUA-6. Keep all decisions about pause, event retention
+and shutdown pending until this timing direction is settled.
+
 ## Verification strategy
 
 The design requires observable contracts rather than one happy-path Lua call:
@@ -1945,7 +1994,7 @@ and verified policy, with adversarial regression coverage.
   only on explicit completion; elapsed budget cannot be sold as a hard limit.
 - **Out of scope:** automatic code rewriting, arbitrary priority API, simulation
   coordinator, CPU affinity/niceness tuning, performance pass/fail thresholds.
-- **Open questions:** Q-9 (detailed lifecycle semantics), Q-13, Q-14, Q-15.
+- **Open questions:** Q-9 (detailed lifecycle semantics), Q-13, Q-14, Q-15, Q-16.
   Q-10's compatibility and Q-11's API/example direction are accepted by D-20;
   their new runner/lifetime questions are tracked under Q-13/Q-14.
   Q-12 is resolved by D-19.
