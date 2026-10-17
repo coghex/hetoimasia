@@ -1,0 +1,199 @@
+-- | The scheduler's own stop and its admission, and the diagnostics (requirement
+-- 11): the whole scheduler's stop distinct from a task's, the caps and the
+-- answers they give, and counters checked against a scripted workload.
+module Test.LuaRuntime.Scheduler.Stop (spec) where
+
+import Control.Concurrent.STM (atomically)
+import Control.Exception (toException)
+import Data.IORef (modifyIORef')
+import qualified Data.Map.Strict as Map
+import Hetoimasia.Scripting.Lua.Scheduler
+import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
+import Test.LuaRuntime.Scheduler.Support
+
+request ∷ Rig → TaskId → ControlRequest → IO ControlTicket
+request rig identity what =
+  atomically (requestControl (rigScheduler rig) identity what) >>= \case
+    ControlAccepted ticket → pure ticket
+    _ → fail "the request was not accepted"
+
+spec ∷ Spec
+spec = describe "stopping the scheduler, admission and diagnostics" $ do
+  describe "the scheduler's stop" $ do
+    it "closes every live continuation once, records what it ended, and refuses everything after" $ do
+      rig ← newRigWith defaultOptions {optBounds = defaultBounds {boundActiveTasks = 4, boundQueuedAdmissions = 2}}
+      ready ← admit rig "ready" OrdinaryClass Looped
+      waiting ← admit rig "waiting" OrdinaryClass OneShot
+      paused ← admit rig "paused" OrdinaryClass Looped
+      finished ← admit rig "finished" OrdinaryClass OneShot
+      queued ← admit rig "queued" OrdinaryClass OneShot
+      loop rig "ready"
+      loop rig "paused"
+      script rig "waiting" [waitTicks "waiting" 9]
+      _ ← request rig paused RequestPause
+      _ ← turn rig
+      -- A grant and a request that the stop will find outstanding.
+      _ ← granted rig 5
+      pending ← request rig ready RequestPause
+      report ← stopScheduler (rigScheduler rig) (rigHost rig)
+      -- Closed in identity order; the finished task has nothing to close.
+      map fst <$> closedTasks rig >>= (`shouldBe` [ready, waiting, paused])
+      let exit = stopRecord report
+      Map.toList (exitTasks exit)
+        `shouldBe` [ (ready, DispositionAborted)
+                   , (waiting, DispositionAborted)
+                   , (paused, DispositionAborted)
+                   , (finished, DispositionTerminal OutcomeCompleted)
+                   , (queued, DispositionNotAdmitted)
+                   ]
+      (discardedResults (exitDiscards exit), discardedAdmissions (exitDiscards exit)) `shouldBe` (1, 1)
+      stopControlsSettled report `shouldBe` 1
+      atomically (pollControl pending) >>= (`shouldSatisfy` \case Just (ControlSettlement ControlNoLongerApplicable Nothing) → True; _ → False)
+      -- The grant was discarded, so no one is left waiting for it.
+      atomically (stepsOutstanding (rigScheduler rig)) >>= (`shouldBe` 0)
+      atomically (schedulerClosed (rigScheduler rig)) >>= (`shouldBe` True)
+      atomically (admitTask (rigScheduler rig) (taskSpec "late" OrdinaryClass OneShot)) >>= (`shouldBe` AdmitRefused AdmitClosed)
+      granted rig 5 >>= (`shouldBe` GrantClosed)
+      atomically (requestControl (rigScheduler rig) ready RequestStop) >>= \case
+        ControlClosed → pure ()
+        _ → fail "expected the request to be refused as closed"
+      after ← turn rig
+      (turnSegments after, turnEnd after) `shouldBe` (0, TurnClosed)
+      counts ← diagnostics rig
+      (diagCancelled counts, diagDiscarded counts) `shouldBe` (3, 2)
+      -- A second stop answers the first's record and closes nothing again.
+      again ← stopScheduler (rigScheduler rig) (rigHost rig)
+      stopRecord again `shouldBe` exit
+      length <$> closedTasks rig >>= (`shouldBe` 3)
+
+    it "retains the failure of each close, closes the others all the same, and reports them in the stop's record" $ do
+      rig ← newRig
+      mapM_ (\name → admit rig name OrdinaryClass Looped >> loop rig name) ["first", "second", "third"]
+      _ ← turn rig
+      writeFailureAt rig (taskIdAt 1)
+      report ← stopScheduler (rigScheduler rig) (rigHost rig)
+      map fst <$> closedTasks rig >>= (`shouldBe` [taskIdAt 0, taskIdAt 1, taskIdAt 2])
+      map fst (stopCloseFailures report) `shouldBe` [taskIdAt 1]
+
+  describe "the owner's one wait" $ do
+    it "returns for an admission, a control request, a grant, a timer wake and the owner's stop request, and for nothing else" $ do
+      rig ← newRig
+      workAvailable rig >>= (`shouldBe` False)
+      task ← admit rig "task" OrdinaryClass OneShot
+      -- An admission is work: a ready task.
+      workAvailable rig >>= (`shouldBe` True)
+      script rig "task" [waitFor "task" 5000000]
+      _ ← turn rig
+      workAvailable rig >>= (`shouldBe` False)
+      -- A control request.
+      _ ← request rig task RequestPause
+      workAvailable rig >>= (`shouldBe` True)
+      _ ← turn rig
+      workAvailable rig >>= (`shouldBe` False)
+      -- A grant.
+      _ ← granted rig 5
+      workAvailable rig >>= (`shouldBe` True)
+      _ ← turn rig
+      workAvailable rig >>= (`shouldBe` False)
+      -- The timer's wake.
+      [armed] ← liveRegs (rigTimer rig)
+      fireReg armed
+      workAvailable rig >>= (`shouldBe` True)
+      _ ← turn rig
+      workAvailable rig >>= (`shouldBe` False)
+      -- The owner's stop request: a turn then ends at once, starting nothing.
+      setStop rig True
+      workAvailable rig >>= (`shouldBe` True)
+      report ← turn rig
+      (turnSegments report, turnEnd report) `shouldBe` (0, TurnStopRequested)
+
+  describe "admission" $ do
+    it "answers full at either cap, changes nothing but a counter, and never reissues an identity" $ do
+      rig ← newRigWith defaultOptions {optBounds = defaultBounds {boundRetainedResults = 2}}
+      first ← admit rig "a" OrdinaryClass OneShot
+      _ ← admit rig "b" OrdinaryClass OneShot
+      atomically (admitTask (rigScheduler rig) (taskSpec "c" OrdinaryClass OneShot)) >>= (`shouldBe` AdmitRefused (AdmitFull RetainedResults 2))
+      diagRejected <$> diagnostics rig >>= (`shouldBe` 1)
+      _ ← turnsUntilIdle rig 5
+      -- The results are unobserved, and the storage they reserved is still held.
+      atomically (admitTask (rigScheduler rig) (taskSpec "d" OrdinaryClass OneShot)) >>= (`shouldBe` AdmitRefused (AdmitFull RetainedResults 2))
+      observe rig first >>= (`shouldSatisfy` \case Just (ResultCompleted "a") → True; _ → False)
+      observe rig first >>= (`shouldBe` Nothing)
+      admit rig "e" OrdinaryClass OneShot >>= (`shouldBe` taskIdAt 2)
+      narrow ← newRigWith defaultOptions {optBounds = defaultBounds {boundActiveTasks = 1, boundQueuedAdmissions = 1}}
+      _ ← admit narrow "active" OrdinaryClass Looped
+      queued ← admit narrow "queued" OrdinaryClass Looped
+      phase narrow queued >>= (`shouldBe` Just PhaseQueued)
+      atomically (admitTask (rigScheduler narrow) (taskSpec "over" OrdinaryClass Looped)) >>= (`shouldBe` AdmitRefused (AdmitFull QueuedAdmissions 1))
+
+    it "is closed once the owner has been asked to stop" $ do
+      rig ← newRig
+      setStop rig True
+      atomically (admitTask (rigScheduler rig) (taskSpec "late" OrdinaryClass OneShot)) >>= (`shouldBe` AdmitRefused AdmitClosed)
+
+  describe "the diagnostics" $ do
+    it "counts a scripted workload exactly" $ do
+      let bounds =
+            defaultBounds
+              { boundActiveTasks = 4
+              , boundQueuedAdmissions = 2
+              , boundRetainedResults = 5
+              , boundQuanta = Quanta (Quantum 2) (Quantum 2) (Quantum 2)
+              , boundOutstandingGrants = 2
+              , boundControlRequests = 4
+              }
+      rig ← newRigWith defaultOptions {optBounds = bounds}
+      _ ← admit rig "control" ControlClass OneShot
+      _ ← admit rig "ordinary" OrdinaryClass Looped
+      _ ← admit rig "background" BackgroundClass OneShot
+      stopped ← admit rig "stopped" OrdinaryClass OneShot
+      _ ← admit rig "queued" OrdinaryClass OneShot
+      atomically (admitTask (rigScheduler rig) (taskSpec "rejected" OrdinaryClass OneShot)) >>= (`shouldBe` AdmitRefused (AdmitFull RetainedResults 5))
+      script rig "control" [yielded "control"]
+      script rig "ordinary" [yielded "ordinary", waitTicks "ordinary" 1]
+      script rig "background" [failedWith "background" (TaskFailure (failureReason ScriptFault "boom") RecoverySafe)]
+      _ ← request rig stopped RequestStop
+      atomically (requestControl (rigScheduler rig) (taskIdAt 999) RequestPause) >>= \case
+        ControlUnknownTarget → pure ()
+        _ → fail "expected the unknown target to be refused"
+      mapM_ (granted rig) [5, 6]
+      granted rig 7 >>= (`shouldBe` GrantFull)
+      granted rig 0 >>= (`shouldBe` GrantNotPositive)
+      first ← turn rig
+      turnSegments first `shouldBe` 5
+      _ ← observe rig stopped
+      second ← turn rig
+      turnEnd second `shouldBe` TurnIdle
+      _ ← granted rig 8
+      _ ← turnsUntilIdle rig 5
+      counts ← diagnostics rig
+      counts
+        `shouldBe` Diagnostics
+          { diagOwner = "test-owner"
+          , diagAdmitted = 5
+          , diagRejected = 1
+          , diagQueued = 0
+          , diagQueueHighWater = 1
+          , diagActive = 0
+          , diagActiveHighWater = 4
+          , diagCompleted = 3
+          , diagYielded = 2
+          , diagWaiting = 1
+          , diagFailed = 1
+          , diagCancelled = 1
+          , diagDiscarded = 0
+          , diagSegmentsByClass = [(ControlClass, 2), (OrdinaryClass, 4), (BackgroundClass, 1)]
+          , diagOverruns = 0
+          , diagOverrunSites = []
+          , diagOverrunsUnattributed = 0
+          , diagRefusedChoices = 0
+          , diagRefusedWaits = 0
+          , diagControlAccepted = 1
+          , diagControlRefused = 1
+          , diagGrantsAccepted = 3
+          , diagGrantsRefused = 2
+          , diagTick = 3
+          }
+
+writeFailureAt ∷ Rig → TaskId → IO ()
+writeFailureAt rig identity = modifyIORef' (rigCloseFailures rig) (Map.insert identity (toException (userError "close boom")))

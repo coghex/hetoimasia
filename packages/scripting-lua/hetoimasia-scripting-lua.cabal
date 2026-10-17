@@ -34,8 +34,14 @@ description:
     once its modules have loaded, with bounded non-blocking call submission,
     exactly-once settlement of every accepted call, host failures left to
     supervision, a protected stop that discards queued calls and records them,
-    and the refusal of a wait for a reply from inside any Lua callback. The
-    scheduler and the confined path are later slices.
+    and the refusal of a wait for a reply from inside any Lua callback. Beside
+    it, and needing no VM, is the scheduling machinery for Lua tasks: a policy
+    fixed per owner with a FIFO default and a checked extension interface,
+    service classes with finite quanta, application-granted logical time, elapsed
+    waits behind one owned cancellable timer, service budgets that end a turn and
+    never preempt a segment, nonblocking pause, resume and stop applied at safe
+    boundaries, and bounded aggregate counters. The scheduled owner that hosts it
+    on real VMs and the confined path are later slices.
 license: GPL-3.0-only
 license-file: LICENSE
 author: Vincent Coghlan
@@ -180,10 +186,15 @@ library runtime-lua
     hs-source-dirs: runtime-lua
     exposed-modules:
         Hetoimasia.Scripting.Lua.Runtime
+        Hetoimasia.Scripting.Lua.Scheduler
     other-modules:
         Hetoimasia.Scripting.Lua.Runtime.Admission
         Hetoimasia.Scripting.Lua.Runtime.Dispatch
         Hetoimasia.Scripting.Lua.Runtime.Types
+        Hetoimasia.Scripting.Lua.Scheduler.Policy
+        Hetoimasia.Scripting.Lua.Scheduler.State
+        Hetoimasia.Scripting.Lua.Scheduler.Timer
+        Hetoimasia.Scripting.Lua.Scheduler.Types
     build-depends:
         base >=4.22 && <4.23,
         bytestring >=0.12 && <0.13,
@@ -309,8 +320,11 @@ test-suite lua-host-tests
 -- host failures under the owner's policy, protected stop, independent owners and
 -- the refused reply wait from inside a Lua callback, plus the adapter's
 -- dependency closure. Every execution and lifecycle example acquires real VMs
--- under a real `withSupervision`; the structural checks need no VM. It is a
--- suite of its own, in its own source directory, beside `lua-host-tests`, which
+-- under a real `withSupervision`; the structural checks need no VM. The
+-- scheduling machinery's examples (LUA-21) are here too, under the
+-- `Test.LuaRuntime.Scheduler` modules: they run scripted segments under an
+-- injected clock and a fake timer, fire every wake by hand and need no VM. It is
+-- a suite of its own, in its own source directory, beside `lua-host-tests`, which
 -- keeps the host's examples unchanged.
 test-suite lua-runtime-tests
     import: language
@@ -324,6 +338,17 @@ test-suite lua-runtime-tests
         Test.LuaRuntime.Identity
         Test.LuaRuntime.Independence
         Test.LuaRuntime.Readiness
+        Test.LuaRuntime.Scheduler.Budget
+        Test.LuaRuntime.Scheduler.Classes
+        Test.LuaRuntime.Scheduler.Control
+        Test.LuaRuntime.Scheduler.Elapsed
+        Test.LuaRuntime.Scheduler.Lifecycle
+        Test.LuaRuntime.Scheduler.Logical
+        Test.LuaRuntime.Scheduler.Policy
+        Test.LuaRuntime.Scheduler.Spec
+        Test.LuaRuntime.Scheduler.Stop
+        Test.LuaRuntime.Scheduler.Structure
+        Test.LuaRuntime.Scheduler.Support
         Test.LuaRuntime.Settlement
         Test.LuaRuntime.Spec
         Test.LuaRuntime.Stop
@@ -348,6 +373,7 @@ test-suite lua-runtime-tests
         hetoimasia-runtime ==0.1.0.0,
         hetoimasia-scripting-lua,
         hetoimasia-scripting-lua:bridge,
+        hetoimasia-scripting-lua:model,
         hetoimasia-scripting-lua:runtime-lua
 
 -- Deliberate nontermination is optional evidence, separate from lua-host-tests.
