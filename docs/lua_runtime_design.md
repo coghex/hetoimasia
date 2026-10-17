@@ -8,9 +8,10 @@ failure evidence, and lifetime. This is the canonical continuation of
 
 Design state: `ready for issue processing`
 
-Current readiness scope: **LUA-6 only** (D-28), which now spans LUA-20, LUA-21
-and LUA-6 (D-29). Other unchecked slices retain their explicit deferrals; this
-state does not release the confinement gate.
+Current readiness scope: **LUA-18 only** (D-30), which now spans LUA-18, LUA-22
+and LUA-23. LUA-6 (with LUA-20 and LUA-21, D-28/D-29) is delivered. Other
+unchecked slices retain their explicit deferrals; this state does not release
+the confinement gate.
 
 Owner: `coghex/hetoimasia`. Epic #145 and children #146–#149 have been
 created; those children are merged. The owner accepted the two-domain direction,
@@ -113,6 +114,28 @@ the issue" in direct Codex session `01a14598-15ef-7241-ac4a-c3b1b490bec9`.
 Handoff request: `user-het-lua6-process-20261017-0544`. D-28 records its exact
 scope and endpoint; the manager must obtain the canonical independent verdict.
 
+LUA-6 delivery, 2026-10-17: LUA-20/#466 (PR #469, `bedae710`), LUA-21/#467
+(PR #470, `889c1ca2`) and LUA-6/#468 (PR #471, `65c7b725`) are merged, with
+post-merge validation green for each.
+
+LUA-18 readiness check at `master@65c7b725`, 2026-10-17, at the owner's direct
+request to the hetoimasia manager ("pick the logical next slice for me and make
+sure that it is ready for processing"). LUA-18 is the first non-terminal,
+non-deferred-by-gate entry and the only trusted slice whose dependencies are all
+delivered: LUA-6 is merged, and LUA-3/LUA-4/LUA-5 supply the boundaries it
+consumes. Its behavior is fixed by the accepted instance contract (D-26/D-27);
+Q-9, Q-11, Q-13, Q-15, Q-16 and Q-17 are resolved, and the integration
+boundaries below are implementation work inside that contract, not product
+choices. The ledger matches the delivery sections; the open tracker holds only
+epic #145 and the unrelated #446, with no instance-layer child or duplicate.
+The slice is larger than LUA-6 was before D-29 split it, so under D-25's
+delegated organization D-30 carves engine-owned instance resources (LUA-22) and
+granted Lua controls with deterministic control admission (LUA-23) out of it,
+adding no scope. D-30 renews trusted readiness for LUA-18, LUA-22 and LUA-23
+only. LUA-7, LUA-19 and LUA-8 stay `[deferred]` on their own renewal, and the
+confined branch on Q-5. Readiness is not issue processing or implementation:
+each needs its own authorization.
+
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
 reviewed and deliberately not tracked separately · `[deferred]` blocked on a
 concrete precondition
@@ -130,7 +153,9 @@ concrete precondition
 - [x] LUA-20. Run Lua task coroutines on their VM owner — [#466]
 - [x] LUA-21. Add scheduling policies, service quanta, logical time and an owned timer for Lua tasks — [#467]
 - [x] LUA-6. Schedule cooperative tasks with bounded service turns — [#468]
-- [ ] LUA-18. Own script instances, hooks and lifecycle controls — [deferred]: contract accepted; renew slice readiness
+- [ ] LUA-18. Own script instances, hooks and lifecycle controls
+- [ ] LUA-22. Own instance resources through engine-held leases
+- [ ] LUA-23. Grant Lua lifecycle controls and inspection across owners
 - [ ] LUA-7. Add bounded asynchronous requests and owned subscriptions — [deferred]: owner renews trusted-path readiness for this slice
 - [ ] LUA-19. Run script instances through a headless command-line entry — [deferred]: contract accepted; renew slice readiness
 - [ ] LUA-8. Prove independent trusted UI and gameplay execution headlessly — [deferred]: owner renews trusted-path readiness for this slice
@@ -205,6 +230,39 @@ monotonic source and injected `scriptedSource`; TIME-1/#133 is closed. The
 bridge offers no host coroutine-resume API today, and lifecycle-operation calls
 still return `NotYetSupported`. These are integration boundaries for LUA-6,
 not completed scheduler capabilities.
+
+Addendum at `master@65c7b725`, 2026-10-17, for LUA-18's readiness. LUA-20
+(#466) gives the host owner-thread task coroutines with typed refusal of a
+scheduler yield wherever it cannot reach the scheduler, and makes `coroutine`
+selectable. LUA-21 (#467) delivers `Hetoimasia.Scripting.Lua.Scheduler`: the
+FIFO default and policy extension, service classes and quanta, `Looped` and
+`OneShot` kinds, application-granted logical ticks, elapsed waits, one owned
+timer, budgets, bounded pause/resume/stop requests by task identity with
+request and application results, and diagnostics; its STM `taskPhase` reads a
+task's phase. LUA-6 (#468) delivers `Hetoimasia.Scripting.Lua.Scheduled`:
+supervised scheduled owners (`startScheduledOwner`, `retireScheduled`),
+runtime-unique `ScheduledTaskId`s, nonblocking `admitScheduledTask` with
+tickets that settle once, `requestTaskControl`, `grantScheduledStep`,
+`awaitTicksComplete`, `scheduledObserve` and protected retirement that closes
+every suspended coroutine, with cleanup failure fatal under any policy. Boundaries
+LUA-18 builds on:
+
+- There is no instance, hook, `self` state, invocation queue, event delivery or
+  per-task inspection export yet. A scheduler task waits only for logical ticks
+  or an elapsed deadline; there is no wait for a delivered event, and the only
+  application code run on the owner's thread between segments is
+  `scheduledObserve`. An instance layer therefore adds its own owner-thread
+  admission and wake path (or extends the scheduled owner with one) inside
+  `runtime-lua`.
+- Lifecycle-operation bindings are still classified `NotYetSupported` (#462,
+  decision A1). Determinism covers controls made at logical points only; logical
+  admission of controls arriving mid-step is LUA-23's.
+- `Foundation.Resource.Collection` supplies one-owner-thread, bounded,
+  early-retirable members built from staged `Assembly`s and registered while
+  masked (`acquireMemberThen` hands the token to an owner's bookkeeping in the
+  same step); repeated retirement answers `AlreadyRetired` without releasing
+  twice; a release failure poisons further acquisition and is latched as
+  cleanup evidence. It is the existing machinery LUA-22 builds leases on.
 
 - **The Lua host** (`packages/scripting-lua`, built on the `lua` binding
   `>=2.3.4 && <2.4`). Its public library exposes only
@@ -747,6 +805,34 @@ LUA-20 and LUA-21 are carved out of LUA-6 with no added scope, so D-28's LUA-6
 readiness covers LUA-20, LUA-21 and LUA-6. LUA-18, LUA-7, LUA-19 and LUA-8
 readiness and Q-5's confined branch stay separately gated. This decision files
 no tracker item.
+
+### D-30. Renew LUA-18 readiness and split it into three slices
+
+Owner request, 2026-10-17, direct to the hetoimasia manager: "pick the logical
+next slice for me and make sure that it is ready for processing." The manager
+selected LUA-18 (the next trusted slice in dependency order, with every
+prerequisite delivered) and completed its readiness check at `master@65c7b725`.
+Under D-25's delegated organization it is delivered as three slices, each a
+child of epic #145 with its own ledger cursor and no tracking sub-epic:
+
+- LUA-18 keeps its ID and title: instances, hooks, the invocation queue,
+  cadence, pause, failure, stop and shutdown, and the application's Haskell
+  control and inspection API.
+- LUA-22 makes Lua-exposed instance resources engine-owned leases (D-27's
+  qualification).
+- LUA-23 makes lifecycle controls and inspection callable from granted Lua,
+  across owners, with deterministic logical control admission.
+
+Grounds: LUA-6 alone needed three slices and up to six review rounds, and
+LUA-18's accepted contract spans three separate review surfaces: the instance
+lifecycle and invocation machinery, staged resource ownership on foundation
+collections, and authority and logical ordering of cross-owner controls. LUA-22
+and LUA-23 are carved out with no added scope and both follow LUA-18; they are
+independent of each other. LUA-7 consumes LUA-22's leases for provider
+interests, and LUA-8 integrates all three. This renews trusted readiness for
+LUA-18, LUA-22 and LUA-23 only; LUA-7, LUA-19 and LUA-8 readiness and Q-5's
+confined branch remain separately gated. It files no tracker item and does not
+authorize issue processing or implementation.
 
 ## Design
 
@@ -1549,7 +1635,8 @@ their delivery placement was reserved for LUA-6's readiness renewal.
 
 LUA-6 supplies bounded safe-boundary control machinery. LUA-18 exposes granted
 script-instance controls and their inspection/results, including permitted
-cross-owner submission. The instance contract specifies accepted capacity,
+cross-owner submission (the Lua-callable and cross-owner part is LUA-23 under
+D-30). The instance contract specifies accepted capacity,
 admission versus application results, ordering, stale targets, self-control and
 closing behavior. No synchronous cross-owner Lua entry or rollback is implied.
 Whole-owner controls remain distinct from an individual instance's TID.
@@ -1595,7 +1682,8 @@ D-25 assigns the headless consumer to LUA-19 and leaves a game terminal outside
 this delivery proof.
 
 API/example direction accepted with D-20 and partitioned under D-25: LUA-18
-delivers bounded inspection/control APIs and LUA-19 a headless example displaying TID/OWNER/NAME/STATUS and
+delivers bounded inspection/control APIs (Lua-callable and cross-owner in
+LUA-23 under D-30) and LUA-19 a headless example displaying TID/OWNER/NAME/STATUS and
 demonstrating pause/resume/stop. The actual game's interactive terminal and its
 command parser remain application work. This makes the requested `ps` behavior
 testable without adding a game UI to the engine slice. The owner proposed a
@@ -2125,8 +2213,7 @@ and verified policy, with adversarial regression coverage.
 
 ### LUA-20. Run Lua task coroutines on their VM owner
 
-> Ready for issue processing under D-28 and D-29: carved out of LUA-6 with no
-> added scope.
+> Delivered by #466 (PR #469, `bedae710`); carved out of LUA-6 under D-29.
 
 - **Outcome:** a VM owner runs a module entry point as a protected Lua coroutine
   on its own thread, resumes it across explicit yields and waits, and closes it
@@ -2162,8 +2249,7 @@ and verified policy, with adversarial regression coverage.
 
 ### LUA-21. Add scheduling policies, service quanta, logical time and an owned timer for Lua tasks
 
-> Ready for issue processing under D-28 and D-29: carved out of LUA-6 with no
-> added scope.
+> Delivered by #467 (PR #470, `889c1ca2`); carved out of LUA-6 under D-29.
 
 - **Outcome:** reusable machinery chooses the next ready task under a per-owner
   policy with bounded service classes, tracks application-granted logical time
@@ -2197,16 +2283,13 @@ and verified policy, with adversarial regression coverage.
   fake wakes, not sleeps.
 - **Out of scope:** coroutine execution (LUA-20); scheduled owners, settlement,
   owner stop and the real-VM determinism proof (LUA-6); further built-in
-  policies or changing a policy while an owner runs; instance hooks, Lua
-  controls and deterministic logical control admission (LUA-18).
+  policies or changing a policy while an owner runs; instance hooks (LUA-18);
+  Lua controls and deterministic logical control admission (LUA-23).
 - **Open questions:** None.
 
 ### LUA-6. Schedule cooperative tasks with bounded service turns
 
-> Ready for issue processing under D-28. LUA-5 and TIME-1 are delivered and the
-> concrete contract is accepted (D-26/D-27). D-29 carves LUA-20 and LUA-21 out of
-> this slice, which now integrates them. The owner requests manager-led
-> processing and canonical issue approval, with endpoint approved issue.
+> Delivered by #468 (PR #471, `65c7b725`), integrating LUA-20 and LUA-21 (D-29).
 
 - **Outcome:** one trusted VM owner services resumable tasks fairly, wakes for
   events/deadlines, and reports real budget overruns without fake preemption.
@@ -2224,7 +2307,8 @@ and verified policy, with adversarial regression coverage.
   inspection/control bindings.
 - **Phase:** execution policy.
 - **Depends on:** LUA-20, LUA-21; through them LUA-5 and external TIME-1 (Q-4).
-- **Ordering:** critical path; after LUA-20 and LUA-21; precedes LUA-18, then LUA-7.
+- **Ordering:** critical path; after LUA-20 and LUA-21; precedes LUA-18, then
+  LUA-22 and LUA-23, then LUA-7.
 - **Relevant decisions:** D-1, D-3, D-4, D-12, D-13, D-16, D-17, D-18, D-19, D-20, D-21, D-22, D-23, D-24, D-25, D-26, D-27, D-28, D-29.
 - **Acceptance signals:** with real VMs, peers get bounded opportunities at safe
   yields; paused/event-only work does not spin; stop wakes waits; logical time
@@ -2247,34 +2331,132 @@ and verified policy, with adversarial regression coverage.
 
 ### LUA-18. Own script instances, hooks and lifecycle controls
 
-> Deferred: contract accepted (D-26/D-27); explicit trusted readiness pending.
+> Ready for issue processing under D-30. LUA-6 is delivered and the contract is
+> accepted (D-26/D-27). D-30 carves LUA-22 and LUA-23 out of this slice.
 
-- **Outcome:** reusable code admits separately owned instances with lifecycle
-  hooks, TID/owner/name/status inspection and granted Lua lifecycle controls.
-- **Scope:** fresh instance state, init/update/run/shutdown adapter, serialized
-  invocations and continuations, bounded invocation/event admission seam,
-  pause/resume/stop and request results, safe failure isolation, owned cleanup,
-  permitted cross-owner controls and deterministic logical control admission.
-  Every exposed instance-owned resource has protected registration and an
-  engine-owned cleanup obligation before Lua sees its handle. Implement scoped
-  lease/early-release bookkeeping with existing foundation resource machinery;
-  script shutdown is not the resource owner.
-  Test events use the delivery seam; real providers arrive in LUA-7.
+- **Outcome:** reusable code admits separately owned script instances on a
+  scheduled owner, runs their lifecycle hooks in order on that owner, and lets
+  the application inspect, pause, resume and stop them with bounded results.
+- **Scope:** instance admission on a scheduled owner with an engine-issued TID,
+  owner label, optional name and the contract's lifecycle phases; fresh `self`
+  per instance over shared module code; the `init(self, api)`, optional
+  `update(self, dt)`, `shutdown(self, reason)` and one-shot `run(self, api)`
+  adapter, with a missing `run` refused before start; finite, non-suspending
+  `init`/`shutdown` (a wait or yield there is a reported hook fault); at most
+  one active invocation per instance; one bounded per-instance FIFO of
+  invocations shared by due updates and delivered events, with stable admission
+  sequence, retention while paused, explicit queue-full refusal and an
+  attributable counter, fed through a bounded event-delivery seam with
+  instance-owned connections (test events only); gameplay cadence in positive
+  integer logical ticks with exact conversion or refusal, first update one
+  interval after init and granted `dt` kept across waits; UI cadence on the
+  monotonic source with one coalesced unstarted refresh, elapsed `dt`, no
+  catch-up bursts and the resume baseline; init-failure and ordinary-failure
+  rules, isolation where safe and an application-decided escalation seam for
+  unsafe shared-state failure (D-7/P-8); stop with request and completion
+  results, precedence over queued work, closing the cancelled continuation
+  before `shutdown`, `shutdown` once after successful init with a bounded
+  reason, and its failure retained; revocation of the instance's connections,
+  timer demand and unstarted invocations on every termination path, with
+  disposition counts; the application's Haskell pause/resume/stop and bounded
+  inspection snapshots (TID, owner, name, status) for the owner it holds. The
+  instance layer adds its own owner-thread admission and wake path, or extends
+  the scheduled owner with one, inside `runtime-lua`; LUA-6's documented
+  scheduler and settlement guarantees stay intact.
 - **Phase:** script authoring and lifetime.
 - **Depends on:** LUA-6; consumes LUA-3/LUA-4/LUA-5 boundaries.
-- **Ordering:** after LUA-6, before LUA-7 and LUA-19.
-- **Relevant decisions:** D-7, D-16, D-17, D-20, D-21, D-22, D-23, D-24, D-25, D-26, D-27.
-- **Acceptance signals:** failed init runs no later hook; safe failure leaves
-  peers running; unsafe shared-state failure is escalated; paused callbacks do
-  not run; stop of partial/suspended work cleans up once; shutdown failure
-  preserves cleanup; stale controls cannot resurrect tasks; references shared
-  with live instances remain valid; identical logical inputs retain ordering.
-  Acquire-then-error before storing a handle, missing/throwing shutdown, lost
-  handles, partial constructor failure, early/double release and a failing
-  native release all retain correct engine ownership and cleanup evidence.
-- **Out of scope:** module eviction/hot reload, real event providers, CLI/window
-  assembly, forced preemption, transactions for arbitrary game bindings.
-- **Open questions:** None; contract accepted. Readiness remains pending.
+- **Ordering:** after LUA-6; precedes LUA-22 and LUA-23 (independent of each
+  other), then LUA-7 and LUA-19.
+- **Relevant decisions:** D-7, D-16, D-17, D-20, D-21, D-22, D-23, D-24, D-25,
+  D-26, D-27, D-30.
+- **Acceptance signals:** failed init runs no later hook and reports TID, owner,
+  source, phase, error and traceback; safe failure leaves peers running; an
+  unsafe shared-state failure reaches the application's escalation; pause
+  during a yielded callback freezes it and paused callbacks do not run; retained
+  events resume in admission order ahead of new ones and overflow is refused
+  explicitly; a continuous producer cannot starve a due update; stop while paused
+  and stop of partial or suspended work clean up once; cancellation before an
+  update finishes still runs `shutdown` once; shutdown failure is retained and
+  runtime cleanup still happens; repeated controls never resurrect an instance;
+  references shared with live instances remain valid; identical logical inputs
+  retain ordering. Tests use injected clocks and barriers, not sleeps.
+- **Out of scope:** engine-owned leases on Lua-exposed resources (LUA-22); Lua
+  lifecycle-operation bindings, Lua inspection, cross-owner control and
+  deterministic logical control admission (LUA-23); module eviction/hot
+  reload, real event providers (LUA-7), CLI/window assembly, forced preemption,
+  transactions for arbitrary game bindings.
+- **Open questions:** None; contract accepted (D-26/D-27), readiness renewed by
+  D-30.
+
+### LUA-22. Own instance resources through engine-held leases
+
+> Ready for issue processing under D-30: carved out of LUA-18 with no added
+> scope.
+
+- **Outcome:** every resource a binding exposes to an instance is owned by the
+  engine, so cleanup is correct however the script behaves.
+- **Scope:** an engine-controlled scope per instance created before `init` and
+  out of reach of Lua tables, built on `Foundation.Resource.Collection`; a
+  binding-author API that reserves capacity, acquires through a staged
+  `Assembly` and registers the obligation before the handle reaches Lua; leases
+  that make instance versus application ownership explicit, so a shared asset or
+  world object loses only the instance's interest; explicit early release with
+  repeated release answering already-released; draining every recorded holding
+  on failed init, stop, a faulted callback and a failing or absent `shutdown`,
+  continuing past a release failure with primary and cleanup evidence retained
+  and reported under supervision; retained retirement obligations until the
+  owning resource proves completion, shown with a fake provider; binding-author
+  documentation for qualifying an instance-lifetime binding.
+- **Phase:** script authoring and lifetime.
+- **Depends on:** LUA-18.
+- **Ordering:** after LUA-18; independent of LUA-23; precedes LUA-7.
+- **Relevant decisions:** D-7, D-24, D-26, D-27, D-30.
+- **Acceptance signals:** acquire-then-error before storing a handle, overwritten
+  and lost handles, partial constructor failure, missing and throwing
+  `shutdown`, a closing-handler failure, early and double release, one failing
+  native release while independent holdings are still released, a shared asset
+  surviving one instance's exit and a retained fake-provider obligation all keep
+  correct engine ownership and cleanup evidence. No Lua cleanup code is needed to
+  pass them.
+- **Out of scope:** real providers and their retirement (LUA-7), GPU or native
+  game bindings, rollback of committed effects, longer-lived ownership APIs
+  beyond the explicit lease boundary.
+- **Open questions:** None; D-27 fixes the requirement.
+
+### LUA-23. Grant Lua lifecycle controls and inspection across owners
+
+> Ready for issue processing under D-30: carved out of LUA-18 with no added
+> scope.
+
+- **Outcome:** permitted Lua code can inspect instances and request pause,
+  resume and stop by TID, on its own owner or another owner of the application's
+  runtime, and a deterministic game admits those requests at logical points.
+- **Scope:** lifecycle-operation bindings become callable where the application
+  grants a control or inspection service, and keep answering `NotYetSupported`
+  elsewhere, so LUA-5's and LUA-6's examples stay unchanged; nonblocking,
+  bounded requests with the contract's refusals (full, closed, unauthorized,
+  unknown or stale target) and application results (applied, already in that
+  state, no longer applicable); authority from the grant alone, never from a
+  TID or label; control of the running instance, including itself, deferred to
+  its safe boundary, and self-pause resumable only by another permitted
+  controller; whole-owner control kept distinct from one instance; coherent,
+  bounded Lua inspection snapshots (TID, owner, name, status) that never borrow
+  Lua tables; logical admission of controls by application-assigned tick and
+  sequence, so a gameplay owner applies controls from the UI VM or a terminal
+  in canonical order whatever their arrival order.
+- **Phase:** script authoring and lifetime.
+- **Depends on:** LUA-18.
+- **Ordering:** after LUA-18; independent of LUA-22; precedes LUA-8.
+- **Relevant decisions:** D-14, D-16, D-17, D-23, D-26, D-30.
+- **Acceptance signals:** granted Lua pauses, resumes and stops an instance on
+  another owner; a TID without the grant is refused; stale or unknown targets,
+  full and closed requests are explicit refusals; repeated or pending stop is
+  never undone or resurrected; self-control lands at the safe boundary;
+  ungranted owners still answer `NotYetSupported`; identical tick-assigned
+  control inputs give identical application order under varied arrival timing.
+- **Out of scope:** the game's terminal and its command parser, global
+  registries, synchronous cross-owner Lua entry, rollback, forced interruption.
+- **Open questions:** None.
 
 ### LUA-7. Add bounded asynchronous requests and owned subscriptions
 
@@ -2290,8 +2472,8 @@ and verified policy, with adversarial regression coverage.
   function subscriptions to LUA-18 instance ownership, bounded paused queues,
   explicit overflow and serialized dispatch per the instance contract.
 - **Phase:** component integration protocol.
-- **Depends on:** LUA-18; consumes LUA-3/LUA-4/LUA-5 boundaries.
-- **Ordering:** after instance ownership; independent of Q-5.
+- **Depends on:** LUA-18, LUA-22; consumes LUA-3/LUA-4/LUA-5 boundaries.
+- **Ordering:** after instance ownership and engine-held leases; independent of Q-5.
 - **Relevant decisions:** D-1, D-2, D-3, D-4, D-12, D-13, D-14, D-22, D-23, D-24, D-25.
 - **Acceptance signals:** full output paths never block provider completion;
   duplicate/late results harmless; unsubscribe and stop races settle once;
@@ -2337,7 +2519,7 @@ and verified policy, with adversarial regression coverage.
   real-interpreter acceptance; reproduction commands and bounded optional
   profiling workloads delivered in the same PR.
 - **Phase:** trusted integrated acceptance.
-- **Depends on:** LUA-6, LUA-18, LUA-7, LUA-19.
+- **Depends on:** LUA-6, LUA-18, LUA-22, LUA-23, LUA-7, LUA-19.
 - **Ordering:** after instance/provider/runner delivery, independent of Q-5;
   no Vulkan or GLFW dependency.
 - **Relevant decisions:** D-1, D-2, D-3, D-4, D-7, D-12, D-13, D-14.
@@ -2523,8 +2705,9 @@ and verified policy, with adversarial regression coverage.
 ## Deferred extensions and next-session handoff
 
 The trusted dependency order is LUA-2 after the delivered LUA-1; LUA-3 after
-LUA-2; LUA-5 after LUA-3 and the delivered LUA-4; then LUA-6, LUA-18, LUA-7,
-LUA-19 and LUA-8 under D-25. LUA-6 retains external TIME-1; LUA-7 consumes the
+LUA-2; LUA-5 after LUA-3 and the delivered LUA-4; then LUA-6 (as LUA-20 and
+LUA-21, then LUA-6, under D-29), LUA-18, LUA-22 and LUA-23, LUA-7, LUA-19 and
+LUA-8 under D-25 and D-30. LUA-6 retains external TIME-1; LUA-7 consumes the
 instance ownership API and introduces no second clock implementation.
 The shared VK-1 toolchain prerequisite remains satisfied.
 
@@ -2533,7 +2716,7 @@ platform proofs; LUA-10, LUA-11, and LUA-13 in parallel; LUA-12 after both
 platform slices and TIME-1; LUA-16 after LUA-6/LUA-7/LUA-12/LUA-13; then
 LUA-17 after LUA-8/LUA-16. Stable IDs are preserved, with LUA-16/LUA-17
 retaining the confined integration and acceptance removed from LUA-5/LUA-8.
-There are nineteen delivery slices. All of this can run alongside
+There are twenty-three delivery slices. All of this can run alongside
 graphics implementation. Coordinate the shared Cabal project, CI
 catalog/workflow, and any narrow foundation evidence change; parallel work
 does not authorize conflicting edits or duplicate platform infrastructure.

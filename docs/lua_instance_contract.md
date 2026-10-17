@@ -5,8 +5,9 @@ Design contract, 2026-10-17. Owner: `coghex/hetoimasia`.
 **Status: accepted design contract (D-26), with the owner's automatic-cleanup
 requirement (D-27).** This refines [the Lua design](lua_runtime_design.md),
 D-16 through D-27. It describes intended behavior, not implemented APIs.
-The parent design is ready for issue processing for LUA-6 only under D-28;
-other slices retain their readiness gates. Contract approval does not itself
+The parent design is ready for issue processing for LUA-18 only under D-30
+(LUA-18, LUA-22 and LUA-23; LUA-6 is delivered); other slices retain their
+readiness gates. Contract approval does not itself
 create issues or qualify implementation.
 
 ## Approved requirements
@@ -259,6 +260,8 @@ The owner delegated organization. Keep separately reviewable outcomes:
    protected coroutine execution and deterministic model tests.
 2. LUA-18: instance authoring/lifecycle adapter, isolated state, inspection and
    granted control API, bounded invocation queue and cleanup/failure behavior.
+   D-30 delivers it as LUA-18, then LUA-22 (engine-held instance leases) and
+   LUA-23 (granted Lua controls, inspection and logical control admission).
 3. LUA-7: connect real request/subscription machinery to instances; prove paused
    event retention, overload, cancellation and safe provider retirement.
 4. LUA-19: headless CLI runner using the same reusable APIs available to a future
