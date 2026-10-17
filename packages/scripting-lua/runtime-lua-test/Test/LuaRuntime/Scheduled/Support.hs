@@ -30,6 +30,7 @@ module Test.LuaRuntime.Scheduled.Support
   , scheduled
   , scheduledWith
   , defaultSchedulerBounds
+  , withChunks
     -- * Creating and driving
   , startScheduled
   , expectScheduled
@@ -37,6 +38,7 @@ module Test.LuaRuntime.Scheduled.Support
   , request
   , accepted
   , awaitIdle
+  , awaitScheduledTerminal
   , awaitRegistrations
   , awaitDiagnostics
   , holding
@@ -59,14 +61,14 @@ import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
 import Data.Word (Word64)
 import Hetoimasia.Foundation.Time (Duration, Instant, durationNanoseconds, scriptedInstant, scriptedSource)
-import Hetoimasia.Runtime.Supervision (WorkerPolicy)
+import Hetoimasia.Runtime.Supervision (RuntimeControl, WorkerPolicy, WorkerStatus (WorkerLive), awaitSupervised)
 import Hetoimasia.Scripting.Lua.Owner
 import Hetoimasia.Scripting.Lua.Registration
 import Hetoimasia.Scripting.Lua.Runtime (LuaRuntime)
 import Hetoimasia.Scripting.Lua.Scheduled
 import Hetoimasia.Scripting.Lua.Value
 import Test.LuaRuntime.Scheduler.Support (FakeTimer (..), allRegs, newFakeTimer, nanoseconds)
-import Test.LuaRuntime.Support (awaitBlockedOnSTM)
+import Test.LuaRuntime.Support (applicationBoundaryFault, awaitBlockedOnSTM)
 
 -- The fixture ------------------------------------------------------------------
 
@@ -83,6 +85,8 @@ data SFixture = SFixture
   , sfIds ∷ !(IORef (Map Text ScheduledTaskId))
   , sfAnswers ∷ !(IORef [Text])
     -- ^ What the control requests a script made were answered with.
+  , sfDelay ∷ !(IORef Word64)
+    -- ^ How long each @fx.delay()@ takes on the injected clock.
   , sfClock ∷ !Clock
   , sfTimer ∷ !FakeTimer
   }
@@ -98,6 +102,7 @@ newSFixture =
     <*> newIORef Nothing
     <*> newIORef Map.empty
     <*> newIORef []
+    <*> newIORef 0
     <*> newClock
     <*> newFakeTimer
 
@@ -196,8 +201,13 @@ schedRegistration fixture = ok (registration [] [sched, fx])
             pure []
         , stateOperation "fail" [SText] [] $ \arguments → do
             case arguments of
+              [VText "boundary"] → throwIO applicationBoundaryFault
               [VText kind] → throwIO (Broken' kind)
               _ → pure ()
+            pure []
+        , -- A segment's cost on the injected clock, as the example configured it.
+          stateOperation "delay" [] [] $ \_ → do
+            readIORef (sfDelay fixture) >>= advanceClock fixture
             pure []
         , -- A segment's cost on the injected clock.
           stateOperation "advance" [SInteger] [] $ \arguments → do
@@ -260,6 +270,8 @@ tasksEntries =
   , required "controls" [SText, SText, SText] []
   , required "echo" [SInteger] [SInteger]
   , required "costly" [SText, SInteger, SInteger] [SInteger]
+  , required "ticker" [SText, SInteger, SInteger] [SInteger]
+  , required "delayed" [SText, SInteger] [SInteger]
   , required "bad_wait" [] []
   , EntryPoint "absent" Optional [] []
   ]
@@ -293,15 +305,28 @@ tasksSource =
     , "function fault(label) fx.record(label) error('task boom') end"
     , "function host_fail(kind) fx.fail(kind) end"
     , "function block_in(name) fx.record('block ' .. name) fx.block(name) fx.record('unblocked ' .. name) end"
+    , "function ticker(label, n, every)"
+    , "  for i = 1, n do"
+    , "    fx.delay()"
+    , "    sched.wait_ticks(every)"
+    , "    local kind, a, b = fx.resume()"
+    , "    fx.record(label .. ' ' .. i .. ' ' .. a .. ':' .. b)"
+    , "  end"
+    , "  return n"
+    , "end"
+    , "function delayed(label, n)"
+    , "  for i = 1, n do fx.delay() fx.record(label .. i) sched.yield() end"
+    , "  return n"
+    , "end"
     , "function closes_cleanly(label)"
     , "  local guard <close> = setmetatable({}, {__close = function() fx.record(label .. ' closed') end})"
     , "  fx.record(label .. ' suspended')"
-    , "  sched.yield()"
+    , "  sched.wait_ticks(1)"
     , "  fx.record(label .. ' resumed')"
     , "end"
     , "function closes_badly(label)"
     , "  local guard <close> = setmetatable({}, {__close = function() fx.record(label .. ' closing') error('close boom') end})"
-    , "  sched.yield()"
+    , "  sched.wait_ticks(1)"
     , "  fx.record(label .. ' resumed')"
     , "end"
     , "function controls(label, target, operation)"
@@ -370,6 +395,10 @@ scheduledWith fixture label granted worker bounds =
 clockInstant ∷ Clock → IO Instant
 clockInstant (Clock ref) = scriptedInstant . nanoseconds <$> readIORef ref
 
+-- | The same configuration running these initial chunks.
+withChunks ∷ [(ChunkName, ByteString)] → ScheduledSpec → ScheduledSpec
+withChunks chunks spec = spec {scheduledVm = (scheduledVm spec) {vmInitialChunks = chunks}}
+
 -- Creating and driving ---------------------------------------------------------
 
 expectScheduled ∷ ScheduledStart → IO ScheduledOwner
@@ -417,6 +446,15 @@ accepted fixture name = \case
 -- everything it was given and is idle.
 awaitIdle ∷ SFixture → IO ()
 awaitIdle fixture = readMVar (sfOwnerThread fixture) >>= awaitBlockedOnSTM
+
+-- | Wait until the owner's worker has a terminal status committed by supervision,
+-- through a supervised wait, and answer it.
+awaitScheduledTerminal ∷ RuntimeControl → ScheduledOwner → IO WorkerStatus
+awaitScheduledTerminal control owner =
+  awaitSupervised control $
+    scheduledStatus owner >>= \case
+      WorkerLive → retry
+      status → pure status
 
 -- | Wait until the fake timer has been asked for this many registrations in all:
 -- the owner has looked at its clock after a wake and armed again. A signal of

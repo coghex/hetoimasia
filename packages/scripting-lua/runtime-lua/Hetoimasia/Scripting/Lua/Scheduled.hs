@@ -374,6 +374,9 @@ data ScheduledOwner = ScheduledOwner
   , ownerControl ∷ !Control
   }
 
+instance Show ScheduledOwner where
+  show owner = "scheduled " <> show (scheduledIdentity owner)
+
 -- | Create one scheduled owner: one supervised worker running one VM.
 --
 -- Raises 'SchedulerRefused', before anything starts, for a configuration the

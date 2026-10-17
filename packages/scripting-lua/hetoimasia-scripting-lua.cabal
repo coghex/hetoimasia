@@ -347,7 +347,9 @@ test-suite lua-runtime-tests
         Test.LuaRuntime.Identity
         Test.LuaRuntime.Independence
         Test.LuaRuntime.Readiness
+        Test.LuaRuntime.Scheduled.Creation
         Test.LuaRuntime.Scheduled.Execution
+        Test.LuaRuntime.Scheduled.Settlement
         Test.LuaRuntime.Scheduled.Spec
         Test.LuaRuntime.Scheduled.Support
         Test.LuaRuntime.Scheduler.Budget
