@@ -6,11 +6,13 @@ module Test.LuaRuntime.Instance.Boundary (spec) where
 import Control.Exception (ExceptionWithContext (ExceptionWithContext))
 import Control.Monad (forM, forM_, void)
 import Control.Concurrent.STM (atomically)
+import qualified Data.Text as Text
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
-import Hetoimasia.Foundation.Resource (cleanupFailureException, cleanupFailureLabel, cleanupFailuresInContext)
+import Hetoimasia.Foundation.Resource (cleanupFailureLabel, cleanupFailuresInContext)
 import Hetoimasia.Scripting.Lua.Instance
 import Hetoimasia.Runtime.Supervision (WorkerStatus (WorkerUnavailable))
-import Hetoimasia.Scripting.Lua.Runtime (Discard (Discard), ExitKind (ExitFailed), Progress (Started))
+import Hetoimasia.Scripting.Lua.Owner (BoundaryFault (boundaryReason), FaultReason (EntryNotAFunction))
+import Hetoimasia.Scripting.Lua.Runtime (CallFault (BoundaryFailed), Discard (Discard), ExitKind (ExitCancelled, ExitFailed), Progress (Started))
 import Hetoimasia.Scripting.Lua.Scheduled
 import Hetoimasia.Scripting.Lua.Value (Value (VText))
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
@@ -164,6 +166,38 @@ spec = describe "the boundaries of service" $ do
       expectDelivered fixture owner "b" 1
       awaitEffect (sf fixture) "tick 1 n=1 seq=0 t=0 count=1"
 
+  it "fails an instance for an event it has no callback for, rather than dropping the event in silence" $ bounded $ do
+    fixture ← newIFixture
+    withBoundary $ \_ runtime → do
+      owner ← startInstances fixture runtime "direct" [direct] (testConfig instanceBounds') requiredPolicy
+      _ ← admit fixture owner "a" (moduleNamed "direct")
+      awaitPhase fixture owner "a" Active
+      -- Its own number, through the layer's binding: recorded, with nothing connected.
+      expectDelivered fixture owner "a" 1
+      settled ← awaitSettled fixture "a"
+      resultPhase settled `shouldBe` Failed
+      fmap failureMessage (failureOf' settled) `shouldSatisfy` maybe False (Text.isInfixOf "no callback is connected")
+
+  it "settles every instance with the owner's exit when a hook is cut short as a cancellation is during retirement, the first of them included" $ bounded $ do
+    fixture ← newIFixture
+    withBoundary $ \control runtime → do
+      owner ← startInstances fixture runtime "cut short" [killShutdown, echoer] (testConfig instanceBounds') requiredPolicy
+      _ ← admit fixture owner "a" (moduleNamed "killshutdown")
+      _ ← admit fixture owner "b" (moduleNamed "echoer")
+      awaitPhase fixture owner "a" Active
+      awaitPhase fixture owner "b" Active
+      retireScheduled owner
+      _ ← awaitScheduledTerminal control owner
+      a ← awaitSettled fixture "a"
+      b ← awaitSettled fixture "b"
+      let cancelled settlement = case resultOutcome settlement of
+            InstanceDiscarded (Discard kind _) → kind == ExitCancelled
+            _ → False
+      a `shouldSatisfy` cancelled
+      b `shouldSatisfy` cancelled
+      terminationShutdown (resultTermination a) `shouldBe` ShutdownRaised
+      terminationShutdown (resultTermination b) `shouldBe` ShutdownSkippedUnsafe
+
   it "counts an invocation stopped before its first segment as an unstarted one discarded, not as a coroutine closed" $ bounded $ do
     fixture ← newIFixture
     withBoundary $ \_ runtime → do
@@ -272,9 +306,9 @@ spec = describe "the boundaries of service" $ do
       _ ← awaitSettled fixture "g"
       pure ()
 
-  it "keeps every failure of the host raised as the owner retires its instances, whole, beside the first" $ bounded $ do
+  it "runs no hook for the instances after the one whose shutdown raised a failure of the host: the owner is failing" $ bounded $ do
     fixture ← newIFixture
-    ExceptionWithContext context raised ← expectFatal $ \control runtime → do
+    ExceptionWithContext _ raised ← expectFatal $ \control runtime → do
       owner ← startInstances fixture runtime "two failures" [hostShutdown, hostShutdownBang] (testConfig instanceBounds') requiredPolicy
       _ ← admit fixture owner "a" (moduleNamed "hostshutdown")
       _ ← admit fixture owner "b" (moduleNamed "hostshutdownbang")
@@ -282,12 +316,14 @@ spec = describe "the boundaries of service" $ do
       awaitPhase fixture owner "b" Active
       retireScheduled owner
       awaitScheduledTerminal control owner
-    -- One is the owner's failure and the other is cleanup evidence: neither was chosen
-    -- over the other and lost.
-    let others = map cleanupFailureException (cleanupFailuresInContext context)
-        failures = raised : [other | ExceptionWithContext _ other ← others]
-    failures `shouldSatisfy` any (brokenIs "boom")
-    failures `shouldSatisfy` any (brokenIs "bang")
+    -- The first failure is the owner's; the second instance's hook, which would have
+    -- raised another, was never run, and it settles as discarded.
+    raised `shouldSatisfy` brokenIs "boom"
+    b ← tickOf fixture "b" >>= pollInstance
+    fmap resultOutcome b `shouldSatisfy` \case
+      Just (InstanceDiscarded (Discard ExitFailed Started)) → True
+      _ → False
+    fmap (terminationShutdown . resultTermination) b `shouldBe` Just ShutdownSkippedUnsafe
 
   it "keeps what an ending counted when its shutdown raises a failure of the host: connections revoked, events discarded" $ bounded $ do
     fixture ← newIFixture
@@ -408,6 +444,80 @@ spec = describe "the boundaries of service" $ do
       requestTaskControl (scheduledEndpoint owner) task RequestStop >>= (`shouldSatisfy` \case TaskControlUnknown → True; _ → False)
       snapshotOf fixture owner "a" >>= (`shouldSatisfy` \held → fmap snapshotExecution held == Just ExecWaiting)
 
+  it "treats an interrupted close in an orderly retirement as a cancellation: no hook runs, and the close is counted" $ bounded $ do
+    fixture ← newIFixture
+    ExceptionWithContext _ _ ← expectFatal $ \control runtime → do
+      owner ← startInstances fixture runtime "interrupted close" [closeKilled, echoer] (testConfig instanceBounds') requiredPolicy
+      _ ← admit fixture owner "a" (moduleNamed "closekilled")
+      _ ← admit fixture owner "b" (moduleNamed "echoer")
+      awaitPhase fixture owner "a" Active
+      awaitPhase fixture owner "b" Active
+      expectDelivered fixture owner "a" 1
+      awaitDiagnosticsWaiting owner
+      retireScheduled owner
+      awaitScheduledTerminal control owner
+    a ← tickOf fixture "a" >>= pollInstance
+    fmap resultOutcome a `shouldSatisfy` \case
+      Just (InstanceDiscarded (Discard ExitCancelled Started)) → True
+      _ → False
+    fmap (terminationClosed . resultTermination) a `shouldBe` Just 1
+    -- The cancellation reaches the instance that was not in the close as well.
+    b ← tickOf fixture "b" >>= pollInstance
+    fmap resultOutcome b `shouldSatisfy` \case
+      Just (InstanceDiscarded (Discard ExitCancelled Started)) → True
+      _ → False
+    logged fixture >>= (`shouldSatisfy` all (\entry → not ("shutdown" `Text.isInfixOf` entry)))
+
+  it "holds a one-shot's pending run outside the event queue's bound, through initialization and a pause" $ bounded $ do
+    fixture ← newIFixture
+    withBoundary $ \_ runtime → do
+      let bounds = defaultSchedulerBounds {boundActiveTasks = 1}
+      owner ←
+        startWith fixture runtime $
+          instanceSpec fixture "run bound" [gateOneShot, plainModule] (testConfig instanceBounds' {boundInvocationQueue = 2}) requiredPolicy bounds
+      _ ← admitScheduledTask (scheduledEndpoint owner) (request "waits" [VText "w"] OrdinaryClass OneShot Nothing) >>= ordinary
+      awaitDiagnosticsWaiting owner
+      _ ← admitWith fixture owner "a" (InstanceRequest (moduleNamed "gateoneshot") RunOnce (Just "a") OrdinaryClass ["tick"])
+      awaitEntered (sf fixture) "init"
+      forM_ [1, 2] (expectDelivered fixture owner "a")
+      releaseGate (sf fixture) "init"
+      -- Init is done; its run is queued behind the occupied slot, unstarted.
+      awaitPhase fixture owner "a" Active
+      awaitDiagnostics owner (\counts → diagQueued counts >= 1)
+      let bound = fmap (\x → (snapshotQueued x, snapshotQueueBound x))
+      snapshotOf fixture owner "a" >>= (`shouldBe'` Just (2, 2)) . bound
+      deliverTick fixture owner "a" 3 >>= (`shouldBe` DeliveryQueueFull)
+      -- Paused and resumed, the run takes back no place an event could be taken into.
+      settleControl fixture owner "a" InstancePause >>= (`shouldBe` ControlApplied)
+      snapshotOf fixture owner "a" >>= (`shouldBe'` Just (2, 2)) . bound
+      deliverTick fixture owner "a" 4 >>= (`shouldBe` DeliveryQueueFull)
+      settleControl fixture owner "a" InstanceResume >>= (`shouldBe` ControlApplied)
+      snapshotOf fixture owner "a" >>= (`shouldBe'` Just (2, 2)) . bound
+
+  it "faults a hook that is present and is not a function, as it faults any entry point that is, and does not take it for an absent one" $ bounded $ do
+    fixture ← newIFixture
+    withBoundary $ \_ runtime → do
+      owner ← startInstances fixture runtime "invalid hooks" [initValue, shutdownValue] (testConfig instanceBounds') requiredPolicy
+      _ ← admit fixture owner "i" (moduleNamed "initvalue")
+      initial ← awaitSettled fixture "i"
+      resultPhase initial `shouldBe` Failed
+      case failureOf' initial of
+        Just failure → do
+          failureStage failure `shouldBe` StageInit
+          failureError failure `shouldSatisfy` isNotAFunction
+        Nothing → fail "expected the invalid init to fail the instance"
+      _ ← admit fixture owner "s" (moduleNamed "shutdownvalue")
+      awaitPhase fixture owner "s" Active
+      settleControl fixture owner "s" InstanceStop >>= (`shouldBe` ControlApplied)
+      ended ← awaitSettled fixture "s"
+      resultPhase ended `shouldBe` Failed
+      case failureOf' ended of
+        Just failure → do
+          failureStage failure `shouldBe` StageShutdown
+          failureError failure `shouldSatisfy` isNotAFunction
+        Nothing → fail "expected the invalid shutdown to fail the instance"
+      terminationShutdown (resultTermination ended) `shouldBe` ShutdownRaised
+
   it "keeps the queue within its bound when an unstarted invocation is taken back by a pause" $ bounded $ do
     fixture ← newIFixture
     withBoundary $ \_ runtime → do
@@ -470,6 +580,12 @@ spec = describe "the boundaries of service" $ do
       _ ← waitTask second
       awaitEffect (sf fixture) "tick 1 n=1 seq=0 t=0 count=1"
   where
+    shouldBe' actual expected = actual `shouldBe` expected
+    isNotAFunction = \case
+      ErrorFault (BoundaryFailed fault) → case boundaryReason fault of
+        EntryNotAFunction → True
+        _ → False
+      _ → False
     ordinary = \case
       TaskAccepted _ ticket → pure ticket
       other → fail ("expected the task accepted, found " <> show other)

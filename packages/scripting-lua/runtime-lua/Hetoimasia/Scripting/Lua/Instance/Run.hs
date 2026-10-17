@@ -55,6 +55,7 @@ module Hetoimasia.Scripting.Lua.Instance.Run
   , instanceSegment
   , instanceClosed
   , settleEnded
+  , reapInvocations
   , retireInstances
   ) where
 
@@ -72,7 +73,7 @@ import Data.Text (Text)
 import Data.Word (Word64)
 import Hetoimasia.Scripting.Lua.Instance.State
 import Hetoimasia.Scripting.Lua.Instance.Types
-import Hetoimasia.Scripting.Lua.Internal.Module (EntryPoint (entryName), ModuleHandle (handleEntries), callEntryVia, entryDefined)
+import Hetoimasia.Scripting.Lua.Internal.Module (EntryPoint (entryName), ModuleHandle (handleEntries), callEntryVia, entryPresent)
 import Hetoimasia.Scripting.Lua.Internal.Owner (ownedHost)
 import Hetoimasia.Scripting.Lua.Internal.Fault (raisedByApplication)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Failure (ReasonCode (ScriptFault), RecoverySafety (RecoverySafe), failureReason)
@@ -440,11 +441,12 @@ withRunning ih number action = do
   atomically (writeTVar (insRunning (ihInstances ih)) (Just number))
   action `finally` atomically (writeTVar (insRunning (ihInstances ih)) Nothing)
 
--- | Whether a module defines a hook, as an entry point it declares and defines.
+-- | Whether a module has a hook, as an entry point it declares and has. One that is
+-- there and is not a function is a hook: running it raises the host's fault for it.
 hookAvailable ∷ InstanceHost → ModuleHandle → Text → IO Bool
 hookAvailable ih handle name
   | name `notElem` map entryName (handleEntries handle) = pure False
-  | otherwise = entryDefined (ownedHost (ihOwned ih)) handle name
+  | otherwise = entryPresent (ownedHost (ihOwned ih)) handle name
 
 -- Invocations ----------------------------------------------------------------------------
 
@@ -879,10 +881,10 @@ retireInstances ih = do
       unless settled (beginEnding' ih cell EndStopped Nothing >> finishEnding ih cell 0)
     case ended of
       Left failure@(ExceptionWithContext _ raised) → do
-        -- Cancelled in the middle of retiring: what is left is not carried on with, and
-        -- no hook runs for the instances after it.
-        when (isJust (fromException raised ∷ Maybe SomeAsyncException)) $
-          writeIORef (ihMode ih) (Unorderly ExitCancelled)
+        -- What an instance's end raised is a failure of the host, or a cancellation:
+        -- the owner is failing, and no hook runs for the instances after it.
+        writeIORef (ihMode ih) . Unorderly $
+          if isJust (fromException raised ∷ Maybe SomeAsyncException) then ExitCancelled else ExitFailed
         [failure] <$ discardUnsettled ih cell
       Right () → pure []
   -- The first failure is the one raised; every other is cleanup evidence, whole, so
@@ -900,7 +902,14 @@ discardUnsettled ih cell = do
   state ← readTVarIO (icState cell)
   -- What the ending had done before it raised is kept as it was counted.
   ending ← Map.lookup (icId cell) <$> readIORef (ihEndings ih)
-  let counted = maybe (Termination 0 0 0 ShutdownRaised) (\held → Termination (endConnections held) (endUnstarted held) (endClosed held) ShutdownRaised) ending
+  mode ← readIORef (ihMode ih)
+  tried ← Set.member (icId cell) <$> readIORef (ihShutdownTried ih)
+  -- How the owner exited, and whether its hook was started and cut short or never was.
+  let kind = case mode of
+        Unorderly how → how
+        _ → ExitFailed
+      disposition = if tried then ShutdownRaised else ShutdownSkippedUnsafe
+      counted = maybe (Termination 0 0 0 disposition) (\held → Termination (endConnections held) (endUnstarted held) (endClosed held) disposition) ending
       settlement =
         InstanceSettlement
           { resultInstance = InstanceId (controlOwner (ihControl ih)) (icId cell)
@@ -908,7 +917,7 @@ discardUnsettled ih cell = do
           , resultName = icName cell
           , resultModule = icModule cell
           , resultPhase = Stopped
-          , resultOutcome = InstanceDiscarded (Discard ExitFailed (if isInitialized state then Started else NotStarted))
+          , resultOutcome = InstanceDiscarded (Discard kind (if isInitialized state then Started else NotStarted))
           , resultTermination = counted
           }
   void (atomically (settleInstance (ihInstances ih) cell settlement))

@@ -36,6 +36,11 @@ module Test.LuaRuntime.Instance.Support
   , noHooks
   , hostFailing
   , hostShutdown
+  , closeKilled
+  , killShutdown
+  , gateOneShot
+  , initValue
+  , shutdownValue
   , hostShutdownBang
   , waitHostShutdown
   , badCloseHostShutdown
@@ -43,6 +48,7 @@ module Test.LuaRuntime.Instance.Support
   , closingGated
   , newestFirst
   , forger
+  , direct
   , plainModule
   , moduleNamed
     -- * Configurations
@@ -461,6 +467,53 @@ hostShutdownBang =
     , "function shutdown(self, reason) fx.fail('bang') end"
     ]
 
+-- | A callback that waits holding a closing handler that is cut short as a
+-- cancellation is, and a @shutdown@ that records.
+closeKilled ∷ ModuleSource
+closeKilled =
+  hooksModule
+    "closekilled"
+    [ "function init(self, api)"
+    , "  self.id = inst.next()"
+    , "  api.connect('tick', function(self, event)"
+    , "    local guard <close> = setmetatable({}, {__close = function() " <> record <> "('closing ' .. self.id) fx.fail('kill') end})"
+    , "    sched.wait_ticks(1)"
+    , "  end)"
+    , "end"
+    , "function shutdown(self, reason) " <> record <> "('shutdown ' .. self.id .. ' ' .. reason) end"
+    ]
+
+-- | A @shutdown@ that is cut short as a cancellation is.
+killShutdown ∷ ModuleSource
+killShutdown =
+  hooksModule
+    "killshutdown"
+    [ "function init(self, api) api.connect('tick', function(self, event) end) end"
+    , "function shutdown(self, reason) fx.fail('kill') end"
+    ]
+
+-- | A one-shot whose @init@ connects and waits at a gate, and whose @run@ records.
+gateOneShot ∷ ModuleSource
+gateOneShot =
+  hooksModule
+    "gateoneshot"
+    [ "function init(self, api)"
+    , "  self.id = inst.next()"
+    , "  api.connect('tick', function(self, event) " <> record <> "('tick ' .. self.id .. ' n=' .. event.payload.n) end)"
+    , "  fx.block('init')"
+    , "end"
+    , "function run(self, api) " <> record <> "('run ' .. self.id) end"
+    , "function shutdown(self, reason) " <> record <> "('shutdown ' .. self.id .. ' ' .. reason) end"
+    ]
+
+-- | A module whose @init@ is present and is not a function.
+initValue ∷ ModuleSource
+initValue = hooksModule "initvalue" ["init = 42", "function shutdown(self, reason) " <> record <> "('shutdown') end"]
+
+-- | A module whose @shutdown@ is present and is not a function.
+shutdownValue ∷ ModuleSource
+shutdownValue = hooksModule "shutdownvalue" ["function init(self, api) api.connect('tick', function(self, event) end) end", "shutdown = 42"]
+
 -- | A callback that waits, and a @shutdown@ that records and then fails the way the
 -- host fails.
 waitHostShutdown ∷ ModuleSource
@@ -536,6 +589,11 @@ forger =
     , "  " <> record <> "('forged ' .. tostring(hetoimasia_instance.connect(2, 'tick')))"
     , "end"
     ]
+
+-- | An instance that connects itself through the layer's own binding, not through its
+-- api, and so has a connection the owner records and no function to run for it.
+direct ∷ ModuleSource
+direct = hooksModule "direct" ["function init(self, api) hetoimasia_instance.connect(1, 'tick') end"]
 
 -- | A module of tasks, for the ordinary work an owner of instances may hold.
 plainModule ∷ ModuleSource

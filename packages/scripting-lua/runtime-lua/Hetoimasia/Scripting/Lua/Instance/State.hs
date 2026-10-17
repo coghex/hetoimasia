@@ -127,7 +127,7 @@ deliverEvent instances gate owner identity source payload = do
             else
               -- The invocation in flight, until it has run a segment, is an unstarted one
               -- and holds its place: taking it back never overfills the queue.
-              if Seq.length (isQueue state) + maybe 0 (const 1) (isPending state) >= boundInvocationQueue (insBounds instances)
+              if Seq.length (isQueue state) + pendingEvents state >= boundInvocationQueue (insBounds instances)
                 then do
                   writeTVar (icState cell) state {isQueueFull = isQueueFull state + 1}
                   pure DeliveryQueueFull
@@ -266,7 +266,7 @@ snapshotOf instances gate owner label cell = do
       , snapshotKind = icKind cell
       , snapshotPhase = isPhase state
       , snapshotExecution = execution
-      , snapshotQueued = Seq.length (isQueue state) + maybe 0 (const 1) (isPending state)
+      , snapshotQueued = Seq.length (isQueue state) + pendingEvents state
       , snapshotQueueBound = boundInvocationQueue (insBounds instances)
       , snapshotQueueFull = isQueueFull state
       , snapshotDelivered = isDelivered state

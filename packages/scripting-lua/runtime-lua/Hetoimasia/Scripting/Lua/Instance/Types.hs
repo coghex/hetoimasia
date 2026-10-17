@@ -60,6 +60,7 @@ module Hetoimasia.Scripting.Lua.Instance.Types
   , ICell (..)
   , IState (..)
   , Pending (..)
+  , pendingEvents
   , Job (..)
   , QueuedEvent (..)
   , newInstances
@@ -202,7 +203,9 @@ data InstanceSnapshot = InstanceSnapshot
   , snapshotPhase ∷ !InstancePhase
   , snapshotExecution ∷ !Execution
   , snapshotQueued ∷ !Int
-    -- ^ Invocations accepted and not begun.
+    -- ^ Events accepted and not begun, the one in flight among them until its first
+    -- segment runs. A one-shot's @run@ is no event and is not counted here, though an
+    -- ending counts it among the unstarted invocations it discards.
   , snapshotQueueBound ∷ !Int
   , snapshotQueueFull ∷ !Int
     -- ^ Deliveries refused because the queue was full.
@@ -220,8 +223,8 @@ data Delivery
     DeliveryAccepted !Word64
   | -- | The instance's queue is full. Nothing was evicted, and a counter says so.
     DeliveryQueueFull
-  | -- | The instance has stopped taking events: it is ending, ended, or its owner
-    -- is.
+  | -- | The instance has stopped taking events: it is ending, or its owner is. An
+    -- instance that has ended is no live target, and is 'DeliveryUnknownTarget'.
     DeliveryClosed
   | -- | No live instance of this owner has this identity, or it has no connection
     -- to that source.
@@ -557,6 +560,14 @@ data IState = IState
     -- unstarted one, and counts against the queue's bound and in what an ending
     -- discards.
   }
+
+-- | How many places of the queue an unstarted invocation in flight holds: an event
+-- does, as it would in the queue, and a one-shot's @run@ does not, being no event
+-- and never in the queue. What an ending discards counts both.
+pendingEvents ∷ IState → Int
+pendingEvents state = case isPending state of
+  Just (PendingEvent _) → 1
+  _ → 0
 
 -- | An invocation that has been given to the scheduler and has not run a segment.
 data Pending

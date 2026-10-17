@@ -148,5 +148,9 @@ spec = describe "stopping" $ do
     fmap resultOutcome a `shouldSatisfy` \case
       Just (InstanceDiscarded (Discard ExitFailed Started)) → True
       _ → False
+    -- The owner is failing, so no hook runs for the instance after it: it is discarded.
     b ← tickOf fixture "b" >>= pollInstance
-    fmap resultOutcome b `shouldSatisfy` maybe False stopped
+    fmap resultOutcome b `shouldSatisfy` \case
+      Just (InstanceDiscarded (Discard ExitFailed Started)) → True
+      _ → False
+    logCount fixture "shutdown 2 stopped" >>= (`shouldBe` 0)

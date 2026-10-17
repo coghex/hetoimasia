@@ -47,7 +47,7 @@ module Hetoimasia.Scripting.Lua.Internal.Module
   , loadModule
   , callEntry
   , callEntryVia
-  , entryDefined
+  , entryPresent
   , Lead (..)
   , Prepared (..)
   , prepareEntry
@@ -483,10 +483,13 @@ callEntry = callEntryWith NoLead
 callEntryVia ∷ HasCallStack ⇒ Host → ModuleHandle → Text → ModuleHandle → Text → [Value] → IO CallResult
 callEntryVia host driver driverName = callEntryWith (Lead driver driverName) host
 
--- | Whether a module defines an entry point as a function, looked up by raw access
--- as a call looks it up. Runs nothing of the module.
-entryDefined ∷ HasCallStack ⇒ Host → ModuleHandle → Text → IO Bool
-entryDefined host handle name =
+-- | Whether a module has an entry point at all, looked up by raw access as a call
+-- looks it up: only one that is not there is absent. One that is there and is not a
+-- function is present, so that calling it raises the host's own fault for it and it is
+-- never taken for an entry point the module does not define. Runs nothing of the
+-- module.
+entryPresent ∷ HasCallStack ⇒ Host → ModuleHandle → Text → IO Bool
+entryPresent host handle name =
   withOpenVm vm (operation "lookup-entry") $ \state → do
     entry ← lua_gettop state
     when (handleVm handle /= vmIdentity vm) $
@@ -495,8 +498,8 @@ entryDefined host handle name =
     found ← lookupEntry state (handleSlot handle) name
     lua_settop state entry
     pure $ case found of
-      LookupFunctionOnStack → True
-      _ → False
+      LookupAbsent → False
+      _ → True
   where
     vm = hostVm host
 

@@ -162,7 +162,10 @@ luaBody =
   , "local function deliver(slot, source, event)"
   , "  local record = find(slot)"
   , "  local callback = record.connections[source]"
-  , "  if callback ~= nil then callback(record.self, event) end"
+  , "  -- A connection the owner recorded and the instance never made through its api is the"
+  , "  -- instance's own fault: its event is not dropped in silence."
+  , "  if callback == nil then error('no callback is connected to the source ' .. source, 0) end"
+  , "  callback(record.self, event)"
   , "end"
   , ""
   ]

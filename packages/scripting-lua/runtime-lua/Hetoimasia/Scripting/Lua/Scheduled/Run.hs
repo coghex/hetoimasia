@@ -67,11 +67,11 @@ import Control.Exception
   , try
   , tryWithContext
   )
-import Control.Monad (forM, forM_, unless)
+import Control.Monad (forM, forM_, unless, when)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (catMaybes)
+import Data.Maybe (catMaybes, isJust)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -106,7 +106,7 @@ import Hetoimasia.Scripting.Lua.Owner
 import qualified Hetoimasia.Scripting.Lua.Owner as Owner
 import Hetoimasia.Scripting.Lua.Runtime.Types
   ( CallFault (BoundaryFailed, ModuleNotLoaded)
-  , ExitKind (ExitFailed, ExitStopped)
+  , ExitKind (ExitCancelled, ExitFailed, ExitStopped)
   , Payload (OverBound, WithinBounds)
   )
 import Hetoimasia.Scripting.Lua.Instance.Driver (driverRef)
@@ -117,6 +117,7 @@ import Hetoimasia.Scripting.Lua.Instance.Run
   , instanceClosed
   , instanceSegment
   , newInstanceHost
+  , reapInvocations
   , retireInstances
   , servicePending
   , serviceInstances
@@ -197,8 +198,12 @@ serve stopping control handoff observe escalate config owned = mask $ \restore �
               -- The instance is only told its coroutine is closed. Ending it runs a hook,
               -- which is application code, and a failure of that raised here would be
               -- taken by the scheduler for the close's own: it ends the instance later,
-              -- from the owner's own code.
-              unless interrupted $ forM_ instances (\ih → instanceClosed ih task began)
+              -- from the owner's own code. A close that was interrupted is a cancellation:
+              -- no hook runs for any instance after it, and what the close had done is
+              -- still counted.
+              forM_ instances $ \ih → do
+                when interrupted (writeIORef (ihMode ih) (Unorderly ExitCancelled))
+                instanceClosed ih task began
               either throwIO pure closed
           }
   served ← tryWithContext @SomeException . restore $ do
@@ -229,6 +234,11 @@ serve stopping control handoff observe escalate config owned = mask $ \restore �
     Right True → ExitFailed
     Right False → ExitStopped
   stopped ← tryWithContext @SomeException (stopScheduler scheduler host)
+  -- A stop that was interrupted is a cancellation however the owner came to exit: the
+  -- hooks of the instances that are left do not run.
+  forM_ heldInstances $ \ih → case stopped of
+    Left (ExceptionWithContext _ raised) | Just (_ ∷ SomeAsyncException) ← fromException raised → writeIORef (ihMode ih) (Unorderly ExitCancelled)
+    _ → pure ()
   -- A stop that raised, because a close was interrupted or the timer's
   -- cancellation threw, completed first: asking again answers what it recorded.
   report ← case stopped of
@@ -241,8 +251,12 @@ serve stopping control handoff observe escalate config owned = mask $ \restore �
   held ← Map.keys <$> readIORef tasks
   swept ← forM held $ \held' → do
     closed ← try @SomeException (closeSuspended owned tasks kept held')
-    -- Counted for its instance, which the exit then ends.
-    forM_ heldInstances (\ih → instanceClosed ih held' True)
+    -- Counted for its instance, which the exit then ends; an interruption of the close
+    -- is a cancellation, as it is in the scheduler's stop.
+    forM_ heldInstances $ \ih → do
+      when (either (isJust . (fromException ∷ SomeException → Maybe SomeAsyncException)) (const False) closed) $
+        writeIORef (ihMode ih) (Unorderly ExitCancelled)
+      instanceClosed ih held' True
     pure (either (\failure → [(held', failure)]) (const []) closed)
   -- What instances are still live ends now, with every coroutine closed and before
   -- the VM is: in order, through the ordinary path, or as discarded.
@@ -290,6 +304,9 @@ serve stopping control handoff observe escalate config owned = mask $ \restore �
       -- At each boundary the owner looks at what its instances were asked, unless it
       -- was asked to stop itself, in which case its exit settles it.
       let atBoundary = forM_ instances $ \ih → do
+            -- The active slots of invocations that ended are given back first, at every
+            -- boundary, so when queued work is chosen does not depend on where turns end.
+            reapInvocations ih
             halting ← atomically stopping
             unless halting (servicePending ih)
       report ← serviceTurnWith atBoundary scheduler host
