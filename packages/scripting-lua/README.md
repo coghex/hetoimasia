@@ -31,8 +31,13 @@ library for the transient sequences inside one. See
 The **runtime adapter** (LUA-5) is here as well: trusted VM owners, each one a
 supervised worker running one VM, with bounded call dispatch, exactly-once
 settlement and the refusal of a reply wait from inside a Lua callback. See
-[The runtime adapter](#the-runtime-adapter). Any concrete game namespace, the
-scheduler, asynchronous requests and the confined path are later slices of
+[The runtime adapter](#the-runtime-adapter). The **scheduling machinery** (LUA-21)
+sits beside it and needs no VM: per-owner policies, service classes and quanta,
+logical and elapsed time behind one owned timer, budgets, and safe-boundary
+control, tested against scripted segments. See
+[The scheduling machinery](#the-scheduling-machinery). Any concrete game
+namespace, scheduled owners that host it on real VMs, asynchronous requests and the
+confined path are later slices of
 [the Lua runtime design](../../docs/lua_runtime_design.md). What is here is the
 boundary they will be built on, and the evidence that it holds.
 
@@ -1384,6 +1389,242 @@ It also runs under `--project-file cabal.project.cpu`. The validation group is
 `test.scripting-lua-runtime`, non-optional, routed with `test.scripting-lua`; see
 [docs/validation.md](../../docs/validation.md).
 
+## The scheduling machinery
+
+`Hetoimasia.Scripting.Lua.Scheduler` (LUA-21, in the `runtime-lua` sublibrary) is the
+reusable machinery one owner needs to choose, under a policy, which of its ready
+tasks runs next; to give each service class a bounded turn; to keep logical time
+that only the application advances, and elapsed deadlines behind one owned timer;
+to apply pause, resume and stop at safe boundaries; and to count what it did. It
+starts no thread, owns no VM and supervises nothing. It runs a task's segment and
+closes a task's continuation through the two actions of a `TaskHost`, so it is
+exercised against scripted segment outcomes and is independent of how coroutines
+come to exist (LUA-20). The scheduled owner that hosts it on a supervised worker with
+real VMs is LUA-6; the finite-call adapter above is unchanged. Its module imports
+nothing of the VM, the bridge, the registration, supervision, GLFW, Vulkan, the
+console or a game: only `base`, the foundation's clock and the protocol model, and
+`Test.LuaRuntime.Scheduler.Structure` reads its imports to check that.
+
+### How it is used
+
+An application makes a `Scheduler v` over tasks that carry values of type `v`
+(`newScheduler`), and calls its producer operations from any thread. Each is a
+transaction that never blocks and answers at once: `admitTask`, `grantStep`,
+`requestControl`. The owner's thread loops: `awaitWork`, which composes admissions,
+control requests, grants, the timer's wake and the owner's stop request in one STM
+wait so that an idle owner sleeps in one place and nothing polls; then
+`serviceTurn`; and on its way out, under mask, `stopScheduler`. Only the owner's thread
+calls those three, and a turn is not reentrant.
+
+The waits that are for other threads, `awaitStepsComplete` and a ticket's
+`awaitControl`, are transactions an application composes with `awaitSupervised`. They
+are the application's: nothing here is reachable from Lua, and a Lua callback must not
+call them, for the reason the finite-call adapter refuses a reply wait from one. A
+task waits by yielding to its owner's scheduler, never by blocking its owner's thread.
+
+### Configuration
+
+`SchedulerBounds` holds the active-task, queued-admission and retained-result caps,
+the three quanta, the bound on outstanding grants, the bound on control requests and an
+optional elapsed service budget. `newScheduler` checks all of it before anything is
+made, and answers every violation at once: the caps and quanta through the protocol
+model's own `validateLimits` (a quantum below one is refused), a grant or control
+bound below one, and a budget that is not positive. A refused configuration
+creates no timer and no state. The caps the scheduler does not use are held at one,
+as the finite-call adapter holds the ones it does not use.
+
+### Policies
+
+Each scheduler takes a `Policy` at creation and keeps it for its life. A policy
+chooses which ready task runs next and nothing else: admission and capacity, the class
+pass and its quanta, control and stop, the timer, the settlement of results and
+ownership all stay with the runtime, under every policy, and none can be bypassed from
+a policy. `fifoPolicy` is the supplied default; the extension interface is
+`PolicyView` (the class whose opportunity it is, and every ready task with its class,
+kind, `Ordinal` and segment count, in `Ordinal` order) and `Candidate`. There is no
+other built-in policy and no live policy change.
+
+How the runtime guarantees a policy cannot starve a class, control or stop: the
+runtime offers a policy an opportunity for one class at a time, and a choice must be a
+ready task of that class. Anything else (a task that is not ready, one of another
+class, one that does not exist) is refused, counted in `diagRefusedChoices`, and
+never run: the oldest ready task of that class runs instead, so a policy that cannot
+choose cannot stall its owner. When a class has used its quantum or has nothing
+ready the pass moves to the next class whatever was chosen, and control requests and
+stop are served between segments, before the policy is asked again. What a policy
+can still do is order the tasks of one class, which includes starving a peer in it,
+and that is bounded only by the class's quantum. A policy that raises is a failure of
+the host and propagates from the turn, before anything is changed.
+
+### Service classes, quanta and turns
+
+Every task belongs to `ControlClass`, `OrdinaryClass` or `BackgroundClass`. Each class has a
+finite quantum of segments. The /pass/ visits the classes in that order; each class with a
+ready task runs at most its quantum of segments before the pass moves on, so no task, of
+any class, gets more than its class's quantum while a peer in another class is ready. A
+/turn/ (`serviceTurn`) runs the pass until it completes, the owner is idle, the budget has
+expired or the owner has been asked to stop.
+
+The position in the pass, and how much of the current class's quantum is used, belong to
+the scheduler and persist across turns. A turn that ends early, at the budget, continues
+the same pass in the next: it never restarts at the control class or replenishes a
+quantum, so where a budget cuts a pass moves where turns end and nothing else. The pass
+starts afresh when it completes and when nothing at all is ready.
+
+Under `fifoPolicy` the ready tasks of a class run in `Ordinal` order. The model issues an
+`Ordinal` at admission and again whenever a task rejoins the ready set, so a yielded,
+woken or resumed task is behind everything already ready, and waiting and paused tasks
+occupy no turn.
+
+Admission records a `TaskKind`, looped or one-shot. The kind is visible to a policy and
+the diagnostics and the runtime never acts on it, so where a one-shot is placed is the
+selected policy's: the default appends it at its class's tail like any other task.
+Admission reserves the task's result storage in the model's session, as the model
+documents, and a finished task keeps its slot and reservation until `observeTask`
+takes its result.
+
+### Logical time
+
+The logical tick advances only when the application grants a step with a positive
+TIME-1 `Duration` (`grantStep`). A round of scheduling, an elapsed deadline and an expired
+budget never advance it.
+
+Accepted grants are applied in the order they were accepted, one tick each, none skipped
+or coalesced, and a grant is applied only when every earlier one has finished, so the
+logical timeline is strictly sequential and what runs depends on the grants and never on
+when they arrived. Applying one adds its duration to every task waiting for ticks and
+wakes the tasks whose wait it reaches, in the order their waits began, to the tail of
+their classes; the policy then serves them. A grant is finished, and its slot in the bound
+on outstanding grants (`boundOutstandingGrants`) is free again, when every task it woke has
+stopped being ready or running: by waiting again, completing, failing, being paused or being
+stopped. A grant past the bound answers `GrantFull` and changes nothing; a zero duration
+answers `GrantNotPositive`; a closed scheduler answers `GrantClosed`.
+
+A task that waits for *n* ticks (`ReportWaitTicks`) wakes when the tick reaches the one it
+was at when the wait began plus *n*, and resumes with the tick it reached and the logical
+duration granted since its wait began (`ResumedLogical`). Both are fixed when the grant that
+satisfied the wait is applied, so a later grant or a delayed dispatch cannot change them. A
+wait for no ticks, or one whose end tick is not representable, is refused. A duration that
+cannot be represented fails that task with a typed failure; nothing wraps, and the rest of
+the step stands.
+
+`awaitStepsComplete` is the STM condition "every accepted grant is applied and finished".
+Composed with `awaitSupervised` it is how an application observes tick completion without
+blocking a thread of its own; `grantComplete` and `stepsOutstanding` read the same state
+without waiting. A task that is paused when its grant is applied does not hold the grant:
+it is not ready or running.
+
+### Elapsed time
+
+A task that waits for an elapsed duration (`ReportWaitElapsed`) wakes once the scheduler's
+monotonic source (`schedClock`: TIME-1's, injected in tests) reaches its deadline, the source's
+reading when the wait began plus the duration, and resumes with the time elapsed on that
+source (`ResumedElapsed`). Arithmetic uses `addDuration`, so a deadline that is not
+representable refuses the wait rather than wrapping; a wait of no time is refused. Deadlines
+are looked at once at the start of each turn, in deadline order and, for one deadline, in
+the order the waits began. How often turns start can therefore move when an elapsed wait
+wakes, and an elapsed wait is the one thing that legitimately changes readiness with real
+time.
+
+A refused wait fails its task with a recoverable `ValidationFault`, reports the
+`WaitRefusal` and the failure in the turn report, and counts in `diagRefusedWaits`.
+
+### The timer
+
+One owned registration (`Hetoimasia.Scripting.Lua.Scheduler.Timer`) is armed for the
+earliest elapsed deadline and re-armed as it changes. It is cancelled when nothing waits and
+at stop, and it is never more than one at a time. Its wake is a flag `awaitWork` composes
+with the owner's other conditions: there is no polling, no per-task timer and no thread of its
+own. Production uses the threaded runtime's timer manager (`systemTimerBackend`), which
+needs the threaded runtime, as running Lua does anyway; tests supply a `TimerBackend` and
+fire its wakes by hand.
+
+A wake is a prompt to look at the clock, never evidence that a deadline passed. An early wake
+finds nothing due and the timer is armed again. A wake of a registration that was replaced
+or cancelled is stale and ignored, as is any wake after stop. Registrations are whole
+microseconds, rounded up, at least one and at most one hour (`maxRegistration`), so a
+distant deadline is reached by a chain of wakes each followed by a look at the clock. None of
+this defines a clock. An owner that exits without `stopScheduler` leaves the registration
+armed until it fires, which is why the exit path calls it.
+
+### Budgets and overruns
+
+A scheduler may be configured with an elapsed service budget per turn
+(`boundServiceBudget`). When the clock shows it expired as a segment returns, no further
+segment starts in that turn, control and stop are served at that boundary, and the pass
+continues in the next turn. A turn always starts at least one segment, so a small budget cannot
+stop progress, and a budget so large that its deadline is not representable never
+expires. The budget never interrupts a running segment, never changes which task runs next
+or the order tasks run in, and installs no instruction hook: it is a service target, not a
+limit, and a segment that never returns is not stopped. A segment that ends strictly after
+the turn's deadline is an overrun, attributed to its owner, its task kind and its entry
+point; a segment that ends exactly at it is not. At most `maxOverrunSites` sites are
+attributed, and an overrun of a site that finds the table full is counted in
+`diagOverrunsUnattributed`.
+
+### Control
+
+A caller holding a task's identity requests that it pause, resume or stop
+(`requestControl`). A request never blocks, is usable from any thread including a
+binding's action, and answers `ControlAccepted`, `ControlFull`, `ControlClosed` or
+`ControlUnknownTarget` (a foreign, stale, ended or never-issued identity, or an admission
+still in the queue), in that order of precedence, and a refusal changes nothing but a
+counter. Accepting takes a reservation for the result, bounded by `boundControlRequests`,
+and holds it until the settlement is observed or abandoned through the request's
+`ControlTicket`, once, whichever comes first. Every accepted request settles exactly once,
+as `ControlApplied`, `ControlAlreadyInState` or `ControlNoLongerApplicable`, including one
+overtaken by the task's end and one outstanding when the scheduler stops.
+
+Requests are applied between segments, in the order accepted, except that stops come first:
+a stop takes precedence over any pause or resume accepted beside it, so a stop is never undone
+by a resume, and a task that has ended is never resurrected. A request about the running task
+is applied when its segment returns or yields; one about a task that completed in it is no
+longer applicable.
+
+Pause freezes a task: it runs no segment and occupies no turn. The model pauses only a
+ready task, so a task paused while it waits stays waiting, with its continuation, its wait
+and any wake it earns kept: if the wait is satisfied while it is paused it runs nothing,
+and resuming it then puts it at the tail of its class with a fresh `Ordinal` and the wake
+it earned; resuming it before the wait is satisfied returns it to waiting. A paused task
+reports `PhasePaused` either way. Stop closes the task's continuation on the owner's thread,
+once, through `hostClose`, and then cancels it. A synchronous failure of the close is retained
+in the settlement (`CloseFailed`) and in the turn report and is never reported as a clean
+close; the task is cancelled all the same. A second stop of a task that has ended is not
+applicable and closes nothing again.
+
+### Stopping, determinism and diagnostics
+
+`stopScheduler` is the whole scheduler's stop, distinct from stopping a task. It closes
+admission, grants and control, closes every live continuation that is not inside a segment
+once, in identity order, records each task's disposition and what it discarded in the model's
+`ExitRecord`, settles every request not yet applied as no longer applicable, discards
+unfinished grants (so no one is left waiting for them) and cancels the timer, which stays
+disposed. A second call answers the first's report. A segment that was running when its host
+failed is recorded as outstanding and its continuation is not closed.
+
+Given the same configuration, policy, admitted tasks, segment outcomes and grants, the same
+tasks run in the same order whatever the budget and wherever a turn is cut. Elapsed waits are
+the exception, since a deadline reached changes readiness; the order among tasks already
+ready is unaffected. Arbitrary elapsed-time workloads are not promised the same trace from
+one run to the next. The proof on a real VM is LUA-6's.
+
+`readDiagnostics` is a snapshot of bounded counters and gauges that borrows nothing from a Lua
+state: admitted and rejected work, queue and active high-water marks, completed, yielded,
+waiting, failed, cancelled and discarded counts, segments by class, overruns by site, refused
+policy choices and refused waits, control and grant counts, and the logical tick. There is no
+per-task history and no per-segment record.
+
+### What proves it
+
+The examples are part of `lua-runtime-tests` (`Test.LuaRuntime.Scheduler.*`), in
+`runtime-lua-test/`. They drive a rig of scripted segments under an injected clock and a
+fake timer whose wakes the example fires, so none sleeps and none needs a VM; the one
+exception that touches a VM checks that a lifecycle-operation binding still answers
+not-yet-supported. One example arms the production timer and blocks in STM until its wake
+arrives. Cancellation and shutdown windows are the kind an asynchronous-exception race can
+hide on one platform, so CI, which runs them on Linux, is the evidence for them and a local
+pass is not.
+
 ## The protocol model
 
 The private `model` sublibrary (`model/`) is LUA-4: the vocabulary a scheduler,
@@ -1446,7 +1687,9 @@ and retained terminal results, with a finite `Quantum` per `ServiceClass`
 (`ControlClass`, `OrdinaryClass`, `BackgroundClass`). `validateLimits` answers
 every `LimitViolation` it finds, and a `ValidLimits` can be obtained no other
 way, so no session exists over an unchecked configuration. The quanta are
-recorded and enforced by nothing here; choosing what runs next is LUA-6's.
+recorded here and enforced by nothing in the model: the scheduling machinery of
+`runtime-lua` (LUA-21) enforces them per pass, and what runs next is a policy's choice
+within it. See [The scheduling machinery](#the-scheduling-machinery).
 
 ### The session
 
@@ -1568,15 +1811,20 @@ worker unwound.
 
 | Slice | What it takes from this model |
 | --- | --- |
-| LUA-6, the scheduler | `ServiceClass`, `Quanta`, `Ordinal`, the ready/waiting states, `activateNext` |
+| LUA-21, the scheduling machinery | `Session` admission and its caps, `ServiceClass`, `Quanta` and `validateLimits`, `Ordinal`, the ready, waiting and paused states and their transitions, `activateNext`, `stopSession` |
+| LUA-6, the scheduled owner | the same, through LUA-21's machinery, with `TaskId` and the session's scope |
 | LUA-7, requests and subscriptions | `RequestId`, `Settlement`, `Reply`, the two obligations, `OverloadPolicy` |
 | LUA-9, the child-process transport | every identity, `Payload`, `Reply`, `SegmentOutcome`, the rejection vocabulary |
 | LUA-5, supervision integration | `Limits` and `validateLimits`, for the two caps its call dispatch has (`maxQueuedAdmissions`, `maxRetainedResults`) |
 
 LUA-5 takes nothing else from this model. It runs finite calls and no task, session
-or request yet, so the adapter has an exit record of its own, counting what its stop
-discarded, and the model's `FailureRecord`, `RecoverySafety` and `ExitRecord`, which
-describe a session of tasks, wait for the slices that run one.
+or request, so the adapter has an exit record of its own, counting what its stop
+discarded. The scheduling machinery is the first consumer of a session of tasks: it keeps
+one `Session` per scheduler, drives its transitions, and answers the model's `ExitRecord`
+in its stop report. It does not use the model's `reportFailure`, whose unsafe case ends the
+whole session (D-7): a failed task is failed alone, its `TaskFailure` and recovery marking are
+reported in the turn, and whether a session ends is the integrating owner's decision. Requests
+and subscriptions wait for LUA-7.
 
 ## Running the suite
 
@@ -1588,8 +1836,8 @@ It also runs under `--project-file cabal.project.cpu`, which this package needs
 no GLFW SDK for. The validation group is `test.scripting-lua`; see
 [docs/validation.md](../../docs/validation.md).
 
-The runtime adapter's examples are a suite of their own, whose validation group is
-`test.scripting-lua-runtime`:
+The runtime adapter's examples and the scheduling machinery's are a suite of their own,
+whose validation group is `test.scripting-lua-runtime`:
 
 ```bash
 cabal test hetoimasia-scripting-lua:lua-runtime-tests --test-show-details=direct
