@@ -38,8 +38,11 @@ module Test.LuaRuntime.Instance.Support
   , hostShutdown
   , closeKilled
   , delayedEcho
+  , spawner
+  , midGate
   , killShutdown
   , gateOneShot
+  , failingOneShot
   , initValue
   , shutdownValue
   , hostShutdownBang
@@ -482,6 +485,41 @@ delayedEcho =
     , "end"
     ]
 
+-- | Callbacks that cost time and record; the first event's also waits at a gate first, so
+-- what an example does meanwhile is accepted before the owner goes on.
+midGate ∷ ModuleSource
+midGate =
+  hooksModule
+    "midgate"
+    [ "function init(self, api)"
+    , "  self.id = inst.next()"
+    , "  api.connect('tick', function(self, event)"
+    , "    fx.delay()"
+    , "    if event.payload.n == 1 then fx.block('mid') end"
+    , "    " <> record <> "('tick ' .. self.id .. ' n=' .. event.payload.n)"
+    , "  end)"
+    , "end"
+    ]
+
+-- | Callbacks that cost time and record; the first instance's first one also admits three
+-- ordinary tasks, which fill a short admission queue: instances whose own work competes
+-- with another's for the scheduler's room.
+spawner ∷ ModuleSource
+spawner =
+  hooksModule
+    "spawner"
+    [ "function init(self, api)"
+    , "  self.id = inst.next()"
+    , "  api.connect('tick', function(self, event)"
+    , "    fx.delay()"
+    , "    " <> record <> "('tick ' .. self.id .. ' n=' .. event.payload.n)"
+    , "    if self.id == 1 and event.payload.n == 1 then"
+    , "      for i = 1, 3 do fx.spawn('once', 'spawned ' .. i) end"
+    , "    end"
+    , "  end)"
+    , "end"
+    ]
+
 -- | A callback that waits holding a closing handler that is cut short as a
 -- cancellation is, and a @shutdown@ that records.
 closeKilled ∷ ModuleSource
@@ -519,6 +557,15 @@ gateOneShot =
     , "end"
     , "function run(self, api) " <> record <> "('run ' .. self.id) end"
     , "function shutdown(self, reason) " <> record <> "('shutdown ' .. self.id .. ' ' .. reason) end"
+    ]
+
+-- | A one-shot whose @init@ fails: its @run@ was never owed.
+failingOneShot ∷ ModuleSource
+failingOneShot =
+  hooksModule
+    "failingoneshot"
+    [ "function init(self, api) error('init fails') end"
+    , "function run(self) " <> record <> "('run') end"
     ]
 
 -- | A module whose @init@ is present and is not a function.
@@ -615,8 +662,8 @@ plainModule ∷ ModuleSource
 plainModule =
   ModuleSource
     (ModuleRef "tasks" "1")
-    (Text.encodeUtf8 "function once(label) fx.record(label) return 1 end\nfunction waits(label) sched.wait_ticks(5) return 1 end\nfunction holds(label) fx.block(label) return 1 end\n")
-    [EntryPoint "once" Required [SText] [SInteger], EntryPoint "waits" Required [SText] [SInteger], EntryPoint "holds" Required [SText] [SInteger]]
+    (Text.encodeUtf8 "function once(label) fx.record(label) return 1 end\nfunction waits(label) sched.wait_ticks(5) return 1 end\nfunction holds(label) fx.block(label) return 1 end\nfunction wakes(label) sched.wait_ticks(1) fx.record(label) return 1 end\n")
+    [EntryPoint "once" Required [SText] [SInteger], EntryPoint "waits" Required [SText] [SInteger], EntryPoint "holds" Required [SText] [SInteger], EntryPoint "wakes" Required [SText] [SInteger]]
 
 -- | The module of this name among those the examples load.
 moduleNamed ∷ Text → ModuleRef

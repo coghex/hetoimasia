@@ -641,14 +641,24 @@ data Turn = Turn
 -- elapsed waiters or a budget, as a segment returns when there is a budget or the
 -- segment waits for elapsed time.
 serviceTurn ∷ Scheduler v → TaskHost v → IO TurnReport
-serviceTurn = serviceTurnWith (pure ())
+serviceTurn = serviceTurnWith (pure False)
 
 -- | 'serviceTurn', running an action of the owner's at each safe boundary: before
--- the first segment and after every segment, when no task is running, ahead of what
--- the scheduler does there. It is how an owner that serves more than tasks looks at
--- what it was asked at the same boundaries the scheduler does. What it raises is a
--- failure of the host and propagates out of the turn.
-serviceTurnWith ∷ IO () → Scheduler v → TaskHost v → IO TurnReport
+-- the first segment and after every segment, when no task is running. It is how an
+-- owner that serves more than tasks looks at what it was asked, and at what the
+-- scheduler released, at the same boundaries the scheduler does. What it raises is
+-- a failure of the host and propagates out of the turn.
+--
+-- The action runs after what the scheduler does at the boundary: after the
+-- activations, controls and closes that freed room, so what waited for that room is
+-- tried then and not at the start of the next turn. It answers whether it released
+-- or used anything the scheduler's own work depends on (it observed a result, which
+-- gives back an active slot and a place, it applied a control, it admitted), and
+-- while it does the boundary is done again, so a boundary ends only where neither the
+-- scheduler nor the owner has anything more to do with what is there. That is why
+-- where a turn is cut changes nothing: the next turn's first boundary finds what this
+-- one's last left.
+serviceTurnWith ∷ IO Bool → Scheduler v → TaskHost v → IO TurnReport
 serviceTurnWith atBoundary scheduler host = do
   phaseOpen ← atomically (isStillOpen scheduler)
   if not phaseOpen
@@ -791,16 +801,19 @@ chooseNext scheduler = do
       Nothing → Just Nothing <$ writeTVar (schedState scheduler) chosen
 
 -- | A safe boundary: apply grants and activate queued admissions, apply control
--- requests, and settle what that freed.
-boundary ∷ IO () → Scheduler v → TaskHost v → Turn → IO Turn
-boundary atBoundary scheduler host turn0 = do
-  atBoundary
-  first ← reconcile
-  applyControls scheduler host
-  second ← reconcile
-  closeOwed scheduler host
-  pure (foldl' absorb turn0 (first <> second))
+-- requests, and settle what that freed, then let the owner use what it freed, and
+-- again for what that freed in turn.
+boundary ∷ IO Bool → Scheduler v → TaskHost v → Turn → IO Turn
+boundary atBoundary scheduler host = settle
   where
+    settle turn = do
+      first ← reconcile
+      applyControls scheduler host
+      second ← reconcile
+      closeOwed scheduler host
+      again ← atBoundary
+      let next = foldl' absorb turn (first <> second)
+      if again then settle next else pure next
     reconcile = atomically $ do
       state ← readTVar (schedState scheduler)
       let (next, events) = settleGrants (activateQueued state)

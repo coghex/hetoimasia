@@ -67,7 +67,7 @@ import Control.Exception
   , try
   , tryWithContext
   )
-import Control.Monad (forM, forM_, unless, when)
+import Control.Monad (forM, forM_, void, when)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -117,9 +117,8 @@ import Hetoimasia.Scripting.Lua.Instance.Run
   , instanceClosed
   , instanceSegment
   , newInstanceHost
-  , reapInvocations
   , retireInstances
-  , servicePending
+  , serviceBoundary
   , serviceInstances
   , settleEnded
   )
@@ -301,19 +300,16 @@ serve stopping control handoff observe escalate config owned = mask $ \restore �
         Nothing → awaitWork scheduler
         Just ih → awaitWork scheduler `orElse` awaitInstanceWork ih
       forM_ instances serviceInstances
-      -- At each boundary the owner looks at what its instances were asked, unless it
-      -- was asked to stop itself, in which case its exit settles it.
-      let atBoundary = forM_ instances $ \ih → do
-            -- The active slots of invocations that ended are given back first, at every
-            -- boundary, so when queued work is chosen does not depend on where turns end.
-            reapInvocations ih
-            halting ← atomically stopping
-            unless halting (servicePending ih)
+      -- At each boundary, after the scheduler's work there, the owner accounts for
+      -- what ended, looks at what its instances were asked and tries again what the
+      -- scheduler had no room for, unless it was asked to stop itself, in which case
+      -- its exit settles it.
+      let atBoundary = maybe (pure False) serviceBoundary instances
       report ← serviceTurnWith atBoundary scheduler host
       forM_ instances settleEnded
       mask_ $ do
         modifyIORef' kept (<> turnCloseFailures report)
-        atomically (sweepForgotten control)
+        void (atomically (sweepForgotten control))
       halt ← atomically stopping
       retained ← (||) <$> (not . null <$> readIORef kept) <*> (not . null <$> readIORef extra)
       if halt || retained

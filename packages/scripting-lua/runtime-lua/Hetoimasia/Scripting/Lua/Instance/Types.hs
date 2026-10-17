@@ -59,8 +59,9 @@ module Hetoimasia.Scripting.Lua.Instance.Types
   , Instances (..)
   , ICell (..)
   , IState (..)
-  , Pending (..)
   , pendingEvents
+  , runOwed
+  , unstartedCount
   , Job (..)
   , QueuedEvent (..)
   , newInstances
@@ -553,34 +554,39 @@ data IState = IState
   , isStopped ∷ !Bool
     -- ^ A stop was applied, or the instance failed: nothing new is accepted or
     -- started.
-  , isRunStarted ∷ !Bool
-    -- ^ A one-shot's @run@ was admitted.
-  , isHeldRun ∷ !Bool
-    -- ^ A one-shot's @run@ the instance took back before it began, held until it is
-    -- started again or discarded: it is outside the event queue's bound, and an ending
-    -- still counts it among what it discards.
-  , isPending ∷ !(Maybe Pending)
-    -- ^ The invocation in flight, until its first segment runs: it is still an
-    -- unstarted one, and counts against the queue's bound and in what an ending
-    -- discards.
+  , isRunBegun ∷ !Bool
+    -- ^ A one-shot's @run@ has run its first segment. A one-shot's run is owed, as an
+    -- unstarted invocation, from the success of its @init@ until this is set or the
+    -- instance is discarded: whether the scheduler has been given it, refused it,
+    -- queued it, had it taken back by a pause or holds it paused makes no difference,
+    -- because nothing of that is how it is represented.
+  , isPending ∷ !(Maybe QueuedEvent)
+    -- ^ The event whose callback is in flight, until that callback's first segment
+    -- runs: it is still an unstarted invocation, and holds its place against the
+    -- queue's bound.
   }
 
--- | How many places of the queue an unstarted invocation in flight holds: an event
--- does, as it would in the queue, and a one-shot's @run@ does not, being no event
--- and never in the queue. What an ending discards counts both.
+-- | How many places of the queue an unstarted invocation in flight holds: an event's,
+-- as it would in the queue. A one-shot's run is no event and holds none.
 pendingEvents ∷ IState → Int
-pendingEvents state = case isPending state of
-  Just (PendingEvent _) → 1
-  _ → 0
+pendingEvents state = maybe 0 (const 1) (isPending state)
 
--- | An invocation that has been given to the scheduler and has not run a segment.
-data Pending
-  = PendingEvent !QueuedEvent
-  | PendingRun
+-- | Whether a one-shot's run is owed: its instance is a one-shot, its @init@ has
+-- succeeded, and the run has not begun. The one representation of an unstarted run,
+-- by which an ending counts it among the invocations it discards, exactly once.
+runOwed ∷ InstanceKind → IState → Bool
+runOwed kind state = kind == RunOnce && isInitialized state && not (isRunBegun state)
+
+-- | The invocations an ending discards for not having begun: the events queued, the
+-- event whose callback has not run a segment, and the run that is owed. The only
+-- count of them, whichever way the instance ends.
+unstartedCount ∷ InstanceKind → IState → Int
+unstartedCount kind state =
+  Seq.length (isQueue state) + pendingEvents state + (if runOwed kind state then 1 else 0)
 
 -- | A fresh instance's state.
 initialState ∷ IState
-initialState = IState Initializing False Set.empty Seq.empty 0 0 0 Nothing False False False False Nothing
+initialState = IState Initializing False Set.empty Seq.empty 0 0 0 Nothing False False False Nothing
 
 -- | What the owner's thread is asked to do, in the order the application asked.
 data Job

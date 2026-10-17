@@ -232,7 +232,8 @@ forgetCell control cell = do
   pure ()
 
 -- | Give back the reservations of forgotten tickets whose tasks have finished.
-sweepForgotten ∷ Control → STM ()
+-- Answers whether it gave any back.
+sweepForgotten ∷ Control → STM Bool
 sweepForgotten control = do
   cells ← readTVar (controlCells control)
   mapM_
@@ -241,6 +242,8 @@ sweepForgotten control = do
         when forgotten (() <$ observeCell control cell)
     )
     (Map.elems cells)
+  remaining ← readTVar (controlCells control)
+  pure (Map.size remaining < Map.size cells)
 
 settlementOf ∷ Control → TaskId → Maybe CallFault → TerminalResult Cursor → ScheduledSettlement
 settlementOf control identity fault terminal =
