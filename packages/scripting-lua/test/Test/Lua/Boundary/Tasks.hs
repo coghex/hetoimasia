@@ -237,6 +237,21 @@ workerSource =
     , "  error('late failure')"
     , "end"
     , "function resume_shared() local ok = coroutine.resume(shared); return ok end"
+    , "function opaque_close_error()"
+    , "  local guard <close> = setmetatable({}, {__close = function() pcall(probe.raise, 'CLEANUP'); error({}) end})"
+    , "  sched.yield()"
+    , "  probe.raise('PRIMARY')"
+    , "end"
+    , "function flood_close()"
+    , "  local guard <close> = setmetatable({}, {__close = function() for _ = 1, 100 do pcall(probe.raise, 'X') end end})"
+    , "  sched.yield()"
+    , "  return 1"
+    , "end"
+    , "function close_effect()"
+    , "  local guard <close> = setmetatable({}, {__close = function() pcall(probe.integer_only, 'bad'); probe.note('CHANGED') end})"
+    , "  sched.yield()"
+    , "  return 1"
+    , "end"
     , "function closed_count() return closed or 0 end"
     , "function yielded_in_close_flag() return yielded_in_close == true end"
     , "function holder() sched.yield(); probe.hold(); sched.yield(); return 1 end"
@@ -329,6 +344,9 @@ workerEntries =
   , required "many_cleanup_failures" [] [SInteger]
   , required "late_failure_with_guard" [] []
   , required "resume_shared" [] [SBoolean]
+  , required "opaque_close_error" [] []
+  , required "close_effect" [] [SInteger]
+  , required "flood_close" [] [SInteger]
   , required "closed_count" [] [SInteger]
   , required "yielded_in_close_flag" [] [SBoolean]
   , required "holder" [] [SInteger]
@@ -699,6 +717,65 @@ cleanupSpec = describe "closing the coroutine of a segment that failed" $ do
           fmap show (fromException raised ∷ Maybe IOException) `shouldBe` Just "user error (SECOND)"
           map snd (evidenceOf raised) `shouldSatisfy` \found -> length found == 1 && all (Text.isInfixOf "FIRST") found
       closeTask owned task
+
+  it "keeps a closing error that is not text, beside a callback's failure, when a segment fails" $ do
+    probe ← newProbe
+    withWorker probe $ \owned handle → do
+      (task, _) ← begin owned handle "opaque_close_error" []
+      outcome ← try @SomeException (resumeTask owned task)
+      case outcome of
+        Right _ → expectationFailure "the failures were lost"
+        Left raised → do
+          fmap show (fromException raised ∷ Maybe IOException) `shouldBe` Just "user error (PRIMARY)"
+          let found = evidenceOf raised
+          map fst found `shouldBe` ["lua coroutine close", "lua coroutine close"]
+          map snd found `shouldSatisfy` \texts → any (Text.isInfixOf "CLEANUP") texts && any (Text.isInfixOf "ErrorOpaque \"table\"") texts
+
+  it "keeps a closing error that is not text, beside a callback's failure, when a task is closed" $ do
+    probe ← newProbe
+    withWorker probe $ \owned handle → do
+      (task, _) ← begin owned handle "opaque_close_error" []
+      outcome ← try @SomeException (closeTask owned task)
+      case outcome of
+        Right _ → expectationFailure "the failures were lost"
+        Left raised → do
+          fmap show (fromException raised ∷ Maybe IOException) `shouldBe` Just "user error (CLEANUP)"
+          map snd (evidenceOf raised) `shouldSatisfy` \texts → length texts == 1 && all (Text.isInfixOf "ErrorOpaque \"table\"") texts
+
+  it "keeps a closing error that is not text, beside a callback's failure, when the VM closes" $ do
+    probe ← newProbe
+    outcome ← try @SomeException $
+      withWorker probe $ \owned handle → void (begin owned handle "opaque_close_error" [])
+    case outcome of
+      Right _ → expectationFailure "the failures were lost"
+      Left raised → do
+        let found = evidenceOf raised
+        map fst found `shouldSatisfy` \labels → "lua coroutine close" `elem` labels
+        map snd found `shouldSatisfy` any (Text.isInfixOf "ErrorOpaque \"table\"")
+        -- The callback is not on the finalizer allowlist, so the refusal is kept.
+        map snd found `shouldSatisfy` any (Text.isInfixOf "FinalizerRefused")
+
+  it "bounds the failures it keeps from one close, and says how many it did not" $ do
+    probe ← newProbe
+    withWorker probe $ \owned handle → do
+      (task, _) ← begin owned handle "flood_close" []
+      outcome ← try @SomeException (closeTask owned task)
+      case outcome of
+        Right _ → expectationFailure "the failures were lost"
+        Left raised → do
+          fmap show (fromException raised ∷ Maybe IOException) `shouldBe` Just "user error (X)"
+          let found = evidenceOf raised
+          length found `shouldBe` 64
+          snd (last found) `shouldSatisfy` Text.isInfixOf "FinalizerEvidenceTruncated {droppedFailures = 36}"
+
+  it "says a binding's action ran when it ran after a refusal the closing code caught" $ do
+    probe ← newProbe
+    withWorker probe $ \owned handle → do
+      (task, _) ← begin owned handle "close_effect" []
+      fault ← faulted (closeTask owned task)
+      boundaryOperation fault `shouldBe` CallBinding
+      boundaryEffect fault `shouldBe` BindingRan
+      logged probe >>= (`shouldBe` ["note CHANGED"])
 
   it "reports what closing ran when a script resumed the coroutine itself and it died holding a variable to close" $ do
     probe ← newProbe

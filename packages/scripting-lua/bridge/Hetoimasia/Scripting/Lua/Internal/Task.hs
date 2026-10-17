@@ -77,7 +77,7 @@ import Hetoimasia.Foundation.Resource (composeCleanup)
 import Hetoimasia.Scripting.Lua.Internal.Boundary
 import Hetoimasia.Scripting.Lua.Internal.Fault
   ( CloseSource (FromCoroutineClose)
-  , ErrorValue (ErrorAbsent, ErrorOpaque)
+  , ErrorValue (ErrorAbsent)
   , FaultKind (CallFailed, MemoryExhausted)
   , LuaFault (LuaFault)
   , classify
@@ -260,7 +260,7 @@ closeTask host task =
                     throwFailure luaComponent closeOperation [] $
                       (faultOf host CloseTask (taskModule task) (Just (taskEntry task)) (ScriptFailed CallFailed value)) {boundaryEffect = effect}
               )
-              (if standIn escapes failure then Nothing else failure)
+              (if standIn (closingMarker closing) escapes then Nothing else failure)
           case escapes <> maybeToList scripted of
             [] → pure ()
             primary : others → do
@@ -392,7 +392,7 @@ runSegment host op name task starting state entry = do
           (closing, escapes) ← withCleanupEscapes vm (closeTaskCoroutine state slot)
           end host task TaskFaulted
           failure ← closeFailure state entry closing
-          extra ← evidenceOf escapes failure
+          extra ← evidenceOf (closingMarker closing) escapes failure
           afterLua extra UnscheduledYield Nothing
   where
     vm = hostVm host
@@ -414,7 +414,7 @@ cleanUp host state entry slot = do
         lua_settop state (StackIndex (fromStackIndex top - 1))
         pure (Just value)
       else pure Nothing
-  evidence ← evidenceOf escapes failure
+  evidence ← evidenceOf (cleanupMarker closing) escapes failure
   pure (Cleanup evidence (cleanupErrored closing || not (null escapes)))
 
 -- | What closing a coroutine raised, and whether it can have run anything.
@@ -426,20 +426,19 @@ data Cleanup = Cleanup
 -- | The failures of closing a coroutine as cleanup evidence: each Haskell failure
 -- a callback raised, with the context it was caught with, and the error Lua
 -- reported, unless that is only the stand-in for one of them.
-evidenceOf ∷ [ExceptionWithContext SomeException] → Maybe ErrorValue → IO [(Text, ExceptionWithContext SomeException)]
-evidenceOf escapes failure = do
+evidenceOf ∷ Bool → [ExceptionWithContext SomeException] → Maybe ErrorValue → IO [(Text, ExceptionWithContext SomeException)]
+evidenceOf marker escapes failure = do
   scripted ←
     traverse
       (\value → captured (throwFailure luaComponent closeOperation [] (LuaFault CallFailed "task" value)))
-      (if standIn escapes failure then Nothing else failure)
+      (if standIn marker escapes then Nothing else failure)
   pure [(closeSourceLabel FromCoroutineClose, failureOf) | failureOf ← escapes <> maybeToList scripted]
 
 -- | Whether the error Lua reported for a close is only the marker standing in for
--- a Haskell failure that has been kept.
-standIn ∷ [ExceptionWithContext SomeException] → Maybe ErrorValue → Bool
-standIn escapes = \case
-  Just (ErrorOpaque _) → not (null escapes)
-  _ → False
+-- a Haskell failure that has been kept. An error of any other kind, an opaque one
+-- included, is the script's own and is reported.
+standIn ∷ Bool → [ExceptionWithContext SomeException] → Bool
+standIn marker escapes = marker && not (null escapes)
 
 -- | The failure an action raises, with the context it was caught with.
 captured ∷ IO () → IO (ExceptionWithContext SomeException)

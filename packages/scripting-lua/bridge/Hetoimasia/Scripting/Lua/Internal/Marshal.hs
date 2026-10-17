@@ -127,10 +127,10 @@ foreign import ccall safe "hetoimasia_lua_values.h hetoimasia_lua_task_resume"
     → IO StatusCode
 
 foreign import ccall safe "hetoimasia_lua_values.h hetoimasia_lua_task_close"
-  c_task_close ∷ State → Int64 → Ptr CInt → Ptr CInt → IO StatusCode
+  c_task_close ∷ State → Int64 → Ptr CInt → Ptr CInt → Ptr CInt → IO StatusCode
 
 foreign import ccall safe "hetoimasia_lua_values.h hetoimasia_lua_task_cleanup"
-  c_task_cleanup ∷ State → Int64 → Ptr CInt → Ptr CInt → Ptr CInt → IO StatusCode
+  c_task_cleanup ∷ State → Int64 → Ptr CInt → Ptr CInt → Ptr CInt → Ptr CInt → IO StatusCode
 
 foreign import ccall safe "hetoimasia_lua_values.h hetoimasia_lua_task_count"
   c_task_count ∷ State → Ptr CLong → IO StatusCode
@@ -563,6 +563,8 @@ data TaskClosing = TaskClosing
     -- ^ Closing raised an error, which is on the stack unless it could not be
     -- reserved.
   , closingStatus ∷ !StatusCode
+  , closingMarker ∷ !Bool
+    -- ^ The error closing raised is only the placeholder of a failed callback.
   }
 
 -- | Close the coroutine in a task's slot, running its pending to-be-closed
@@ -570,11 +572,13 @@ data TaskClosing = TaskClosing
 closeTaskCoroutine ∷ State → Int → IO TaskClosing
 closeTaskCoroutine state slot =
   alloca $ \present →
-    alloca $ \failed → do
-      status ← c_task_close state (fromIntegral slot) present failed
-      here ← peek present
-      bad ← peek failed
-      pure (TaskClosing (here /= 0) (bad /= 0) status)
+    alloca $ \failed →
+      alloca $ \marker → do
+        status ← c_task_close state (fromIntegral slot) present failed marker
+        here ← peek present
+        bad ← peek failed
+        placeholder ← peek marker
+        pure (TaskClosing (here /= 0) (bad /= 0) status (placeholder /= 0))
 
 -- | What closing a coroutine that is not suspended where the host left it came to.
 data TaskCleanup = TaskCleanup
@@ -585,6 +589,8 @@ data TaskCleanup = TaskCleanup
   , cleanupDifferent ∷ !Bool
     -- ^ Closing raised an error other than the one it died with. The stack holds
     -- the error it died with, and above it that one.
+  , cleanupMarker ∷ !Bool
+    -- ^ That error is only the placeholder of a failed callback.
   }
 
 -- | Close a coroutine that failed, or that a script resumed itself, running its
@@ -593,12 +599,14 @@ cleanupTaskCoroutine ∷ State → Int → IO TaskCleanup
 cleanupTaskCoroutine state slot =
   alloca $ \present →
     alloca $ \errored →
-      alloca $ \different → do
-        _ ← c_task_cleanup state (fromIntegral slot) present errored different
-        here ← peek present
-        died ← peek errored
-        extra ← peek different
-        pure (TaskCleanup (here /= 0) (died /= 0) (extra /= 0))
+      alloca $ \different →
+        alloca $ \marker → do
+          _ ← c_task_cleanup state (fromIntegral slot) present errored different marker
+          here ← peek present
+          died ← peek errored
+          extra ← peek different
+          placeholder ← peek marker
+          pure (TaskCleanup (here /= 0) (died /= 0) (extra /= 0) (placeholder /= 0))
 
 -- | How many tasks' coroutines the registry anchors.
 taskReferences ∷ State → IO (Either StatusCode Int)

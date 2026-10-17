@@ -184,7 +184,7 @@ import Hetoimasia.Scripting.Lua.Internal.Fault
   ( CloseFailure (CloseFailure)
   , CloseFault (CloseFault)
   , CloseSource (..)
-  , ErrorValue (ErrorAbsent, ErrorOpaque)
+  , ErrorValue (ErrorAbsent)
   , FaultKind (CallFailed, MemoryExhausted)
   , FinalizerEvidenceTruncated (FinalizerEvidenceTruncated)
   , FinalizerRefused
@@ -293,9 +293,10 @@ data Vm = Vm
   , vmLiveTasks ∷ !(IORef (Set Int))
     -- ^ The slots of the tasks whose coroutines are suspended, which the close
     -- closes before it closes the state.
-  , vmCleaning ∷ !(IORef (Maybe [ExceptionWithContext SomeException]))
+  , vmCleaning ∷ !(IORef (Maybe ([ExceptionWithContext SomeException], Int)))
     -- ^ While a coroutine is being closed, every Haskell failure that reaches a
-    -- callback, newest first, kept apart from the operation's own pending one.
+    -- callback, newest first, kept apart from the operation's own pending one, and
+    -- how many were not kept past 'finalizerEvidenceLimit'.
   }
 
 -- | What a scheduler operation asked for when it suspended a task.
@@ -697,9 +698,9 @@ closeLiveTasks vm = do
       value ← renderFailure state entry
       lua_settop state entry
       after ← length <$> readIORef (vmClosingEscapes vm)
-      let standIn = case value of
-            ErrorOpaque _ → after > before
-            _ → False
+      -- An error that is only the placeholder of a failure kept above is not
+      -- reported a second time; any other error of a close is.
+      let standIn = closingMarker closing && after > before
       when ((closingFailed closing || closingStatus closing /= LUA_OK) && not standIn) $
         throwFailure
           luaComponent
@@ -743,9 +744,9 @@ recordEscape vm captured = do
         atomicModifyIORef'
           (vmCleaning vm)
           ( \held → case held of
-              Just failures
-                | length failures < finalizerEvidenceLimit → (Just (captured : failures), True)
-                | otherwise → (held, True)
+              Just (failures, dropped)
+                | length failures < finalizerEvidenceLimit → (Just (captured : failures, dropped), True)
+                | otherwise → (Just (failures, dropped + 1), True)
               Nothing → (Nothing, False)
           )
       unless kept $
@@ -763,9 +764,14 @@ recordEscape vm captured = do
       | otherwise = prior
     applicationRaised (ExceptionWithContext context _) = raisedByApplication context
 
--- | Change the recorded failure, if there is one, keeping the place it holds.
+-- | Change the recorded failures, if there are any, keeping the place each holds.
 amendEscape ∷ Vm → (ExceptionWithContext SomeException → ExceptionWithContext SomeException) → IO ()
-amendEscape vm change = atomicModifyIORef' (vmEscape vm) (\held → (fmap change held, ()))
+amendEscape vm change = do
+  atomicModifyIORef' (vmEscape vm) (\held → (fmap change held, ()))
+  -- The failures a coroutine's close has kept, and the finalizers', are recorded
+  -- failures of the operation like the pending one.
+  atomicModifyIORef' (vmCleaning vm) (\held → (fmap (\(failures, dropped) → (map change failures, dropped)) held, ()))
+  atomicModifyIORef' (vmClosingEscapes vm) (\held → (map change held, ()))
 
 -- | Take the recorded failure, leaving none.
 takeEscape ∷ Vm → IO (Maybe (ExceptionWithContext SomeException))
@@ -905,7 +911,15 @@ escapePending vm = maybe False (const True) <$> readIORef (vmEscape vm)
 -- 'finalizerEvidenceLimit'.
 withCleanupEscapes ∷ Vm → IO a → IO (a, [ExceptionWithContext SomeException])
 withCleanupEscapes vm action = do
-  writeIORef (vmCleaning vm) (Just [])
+  writeIORef (vmCleaning vm) (Just ([], 0))
   result ← action `onException` writeIORef (vmCleaning vm) Nothing
   collected ← atomicModifyIORef' (vmCleaning vm) (\held → (Nothing, held))
-  pure (result, reverse (maybe [] id collected))
+  let (failures, dropped) = maybe ([], 0) id collected
+  -- Bounded, and it says how much was not kept.
+  truncation ←
+    if dropped > 0
+      then do
+        recorded ← tryWithContext @SomeException (throwIO (FinalizerEvidenceTruncated dropped))
+        pure [captured | Left captured ← [recorded ∷ Either (ExceptionWithContext SomeException) ()]]
+      else pure []
+  pure (result, reverse failures <> truncation)

@@ -244,10 +244,14 @@ int hetoimasia_lua_task_resume(
 ** running its pending to-be-closed variables, and unanchor it. See the
 ** definition for what it leaves on the stack.
 */
-int hetoimasia_lua_task_cleanup(lua_State *L, lua_Integer slot, int *present, int *errored, int *cleanup_error);
+int hetoimasia_lua_task_cleanup(
+  lua_State *L, lua_Integer slot, int *present, int *errored, int *cleanup_error, int *cleanup_marker);
 
-/* Close the task in `slot` and unanchor it. */
-int hetoimasia_lua_task_close(lua_State *L, lua_Integer slot, int *present, int *failed);
+/*
+** Close the task in `slot` and unanchor it. `*marker` says that the error closing
+** raised, on top of the stack, is only the placeholder of a failed callback.
+*/
+int hetoimasia_lua_task_close(lua_State *L, lua_Integer slot, int *present, int *failed, int *marker);
 
 /* How many tasks are anchored. */
 int hetoimasia_lua_task_count(lua_State *L, long *count);

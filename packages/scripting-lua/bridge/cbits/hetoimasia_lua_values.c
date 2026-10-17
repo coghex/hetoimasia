@@ -1326,10 +1326,19 @@ int hetoimasia_lua_yieldable(lua_State *L)
 ** when closing raised an error of its own, that error is copied above it.
 **
 ** Answers 1 when closing raised an error other than the one it failed with. */
-static int task_cleanup(lua_State *L, lua_State *co, lua_Integer slot)
+/* Whether the value on top of the stack is the placeholder a failed callback
+** raises in Lua's terms: a light userdata carrying no address. Nothing a script
+** can build is one. */
+static int is_marker(lua_State *L)
+{
+  return lua_islightuserdata(L, -1) && lua_touserdata(L, -1) == NULL;
+}
+
+static int task_cleanup(lua_State *L, lua_State *co, lua_Integer slot, int *marker)
 {
   int own = 0;
   int different = 0;
+  *marker = 0;
   if (lua_gettop(co) >= 1 && lua_checkstack(L, 4)) {
     lua_xmove(co, L, 1);
     lua_pushvalue(L, -1);
@@ -1342,6 +1351,7 @@ static int task_cleanup(lua_State *L, lua_State *co, lua_Integer slot)
       lua_pop(L, 1);
     } else {
       different = 1;
+      *marker = is_marker(L);
     }
   }
   task_unanchor(L, slot);
@@ -1424,19 +1434,21 @@ int hetoimasia_lua_task_resume(
 ** was another (`*cleanup_error`). `*errored` says whether it had died with an
 ** error, which is whether it can have held anything to run.
 */
-int hetoimasia_lua_task_cleanup(lua_State *L, lua_Integer slot, int *present, int *errored, int *cleanup_error)
+int hetoimasia_lua_task_cleanup(
+  lua_State *L, lua_Integer slot, int *present, int *errored, int *cleanup_error, int *cleanup_marker)
 {
   lua_State *co;
   *present = 0;
   *errored = 0;
   *cleanup_error = 0;
+  *cleanup_marker = 0;
   co = task_thread(L, slot);
   if (co == NULL) {
     return LUA_OK;
   }
   *present = 1;
   *errored = lua_status(co) > LUA_YIELD;
-  *cleanup_error = task_cleanup(L, co, slot);
+  *cleanup_error = task_cleanup(L, co, slot, cleanup_marker);
   return LUA_OK;
 }
 
@@ -1446,11 +1458,12 @@ int hetoimasia_lua_task_cleanup(lua_State *L, lua_Integer slot, int *present, in
 ** nothing. `*failed` is 1 when closing raised an error, which is then on top of
 ** `L`'s stack unless that could not be reserved.
 */
-int hetoimasia_lua_task_close(lua_State *L, lua_Integer slot, int *present, int *failed)
+int hetoimasia_lua_task_close(lua_State *L, lua_Integer slot, int *present, int *failed, int *marker)
 {
   lua_State *co;
   *present = 0;
   *failed = 0;
+  *marker = 0;
   co = task_thread(L, slot);
   if (co == NULL) {
     return LUA_OK;
@@ -1460,6 +1473,7 @@ int hetoimasia_lua_task_close(lua_State *L, lua_Integer slot, int *present, int 
     *failed = 1;
     if (lua_gettop(co) >= 1 && lua_checkstack(L, 4)) {
       lua_xmove(co, L, 1);
+      *marker = is_marker(L);
     }
   }
   task_unanchor(L, slot);
