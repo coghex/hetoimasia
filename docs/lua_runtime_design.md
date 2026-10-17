@@ -85,7 +85,7 @@ LUA-5 is now delivered by #464 / PR #465, merged as `29211202`, and TIME-1/#133
 is delivered. The current exploration is limited to LUA-6; it does not revoke
 the prior slices' approvals or renew LUA-7/LUA-8 or the confined branch.
 Q-9 through Q-12 below record remaining questions and proposals. D-16 through
-D-18 record the owner's lifecycle, identity and per-owner scheduler direction. LUA-6 remains
+D-19 record the owner's lifecycle, identity and per-owner scheduler direction. LUA-6 remains
 deferred until those choices, their dependent contract reconciliation and an
 explicit readiness signoff are complete. No new tracker item is authorized by
 this design discussion.
@@ -504,11 +504,33 @@ a requirement that the engine hard-code UI/gameplay owners.
 
 These policies choose the next logical Lua task within an owner at cooperative
 boundaries. They do not select OS/Haskell thread scheduling or preempt a segment
-or blocking callback. Existing D-3/P-5/P-6 bounds and fairness requirements still
-need an explicit relationship to interchangeable policies. Q-12 records the
-proposed default semantics and extension scope pending signoff; Q-10 retains
-compatibility with LUA-5's finite-call interface. No new algorithm beyond FIFO
-has been selected, and LUA-6 readiness is not yet renewed.
+or blocking callback. D-19 settles the default semantics and extension scope;
+Q-10 retains compatibility with LUA-5's finite-call interface. No new algorithm
+beyond FIFO has been selected, and LUA-6 readiness is not yet renewed.
+
+### D-19. Default to FIFO service at segment boundaries with a policy extension
+
+Owner explicitly accepted the presented default and extension scope on
+2026-10-17 ("yes that's right"):
+
+- The supplied default is FIFO among ready peers within a service class. A
+  task that yields rejoins at the tail, giving round-robin service at segment
+  boundaries; waiting or paused tasks do not occupy a running turn.
+- Control/events, ordinary and background classes each receive bounded
+  opportunities under configured finite quanta (P-5).
+- Each owner selects its scheduling policy at creation. LUA-6 supplies the
+  default and an extension interface for alternative policies.
+- The runtime retains responsibility for lifecycle handling, capacity limits
+  and ownership guarantees under every policy. Alternative selection policy
+  does not authorize bypassing these guarantees.
+- Sophisticated additional built-in algorithms and changing policies while
+  an owner is running are deferred.
+
+This resolves Q-12's product choice. Detailed implementation must demonstrate
+the extension with a small test policy, preserve cooperative execution and
+provide observable bounded service without introducing OS-thread scheduling,
+cross-owner scheduling or forced interruption. It does not alone renew LUA-6
+readiness or authorize implementation.
 
 ## Design
 
@@ -1341,6 +1363,15 @@ scheduled owners. Do not treat that response as signoff on two separate public
 owner forms: their compatibility relationship remains to be reconciled with
 the chosen scheduler contract. Preserve LUA-5's delivered behavior meanwhile.
 
+Next signoff proposal after D-19: leave the existing finite-call owner creation
+and submission API working exactly as delivered. Applications explicitly opt
+into a scheduled-task owner and its selected policy. This avoids changing the
+meaning or ordering of existing calls. Scheduled owners admit all executable
+work through their task scheduler; finite work there is a task that completes
+in one segment, not a bypass. Reuse lifetime and supervision machinery rather
+than duplicating it. This is an API compatibility choice, not two schedulers
+running the same VM at once.
+
 ### Q-11. Script identity, inspection and control across owners
 
 **Identity and permitted cross-owner control resolved by D-17; terminal delivery
@@ -1365,6 +1396,12 @@ runtime; the target owner applies requests at safe boundaries. Knowing an ID
 does not itself grant control. A terminal can build `ps` on the inspection API;
 whether a terminal command itself belongs in LUA-6 is not decided.
 
+Next signoff proposal after D-19: LUA-6 delivers the bounded inspection and
+control APIs plus a headless example displaying TID/OWNER/NAME/STATUS and
+demonstrating pause/resume/stop. The actual game's interactive terminal and its
+command parser remain application work. This makes the requested `ps` behavior
+testable without adding a game UI to the engine slice.
+
 Clarify engine API versus delivery of the game's terminal UI before setting
 the implementation scope. Detailed grant and request semantics still need a
 concrete contract consistent with D-14/D-17.
@@ -1374,14 +1411,14 @@ rolled back. These distinctions must be visible in the eventual contract.
 
 ### Q-12. FIFO default and the scheduler extension contract
 
-**Open; proposal following D-18, 2026-10-17.** In a cooperative scheduler,
+**Resolved by D-19, 2026-10-17.** In a cooperative scheduler,
 FIFO must not accidentally mean that a resumable task monopolizes its owner
-until completion. Proposed default: FIFO among ready peers within each service
+until completion. Accepted default: FIFO among ready peers within each service
 class, with a yielding task rejoining at the tail; fixed classes receive bounded
 service under P-5's configurable finite quanta. This is round-robin service at
 segment boundaries, with stable ordering for the same admitted inputs.
 
-Proposed LUA-6 scope: an owner selects its scheduling policy at creation, with
+Accepted LUA-6 scope: an owner selects its scheduling policy at creation, with
 this default supplied and a documented extension boundary for alternative
 policies. No live policy swapping or additional sophisticated built-in algorithm
 is implied. Runtime ownership, grants, admission/result caps, stop handling and
@@ -1389,9 +1426,9 @@ the cooperative execution boundary remain runtime responsibilities rather than
 optional policy features. The detailed design must state how an alternative
 policy preserves bounded opportunities and cannot starve lifecycle handling.
 
-The owner has selected extensibility but has not yet signed off this precise
-meaning of FIFO or the extension boundary. Resolve this before choosing the
-API, reconciliation of finite calls, or implementation slice boundaries.
+The owner signed off this precise default and extension scope. Q-10's finite-call
+compatibility and Q-11's terminal delivery scope remain open; implementation
+factoring and public symbol names are not additional product decisions.
 
 ## Verification strategy
 
@@ -1700,7 +1737,7 @@ and verified policy, with adversarial regression coverage.
 ### LUA-6. Schedule cooperative tasks with bounded service turns
 
 > Deferred: readiness discussion opened 2026-10-17. LUA-5 and TIME-1 are
-> delivered; Q-9 through Q-12 need completion and dependent reconciliation before
+> delivered; Q-9 through Q-11 need completion and dependent reconciliation before
 > readiness signoff. Earlier narrow renewals did not cover this slice.
 
 - **Outcome:** one trusted VM owner services resumable tasks fairly, wakes for
@@ -1712,13 +1749,14 @@ and verified policy, with adversarial regression coverage.
 - **Phase:** execution policy.
 - **Depends on:** LUA-5; external TIME-1 (Q-4).
 - **Ordering:** critical path; can run alongside LUA-7 with disjoint modules.
-- **Relevant decisions:** D-1, D-3, D-4, D-12, D-13.
+- **Relevant decisions:** D-1, D-3, D-4, D-12, D-13, D-16, D-17, D-18, D-19.
 - **Acceptance signals:** peers get bounded opportunities at safe yields;
   paused/event-only work does not spin; stop wakes waits; logical time advances
   only on explicit completion; elapsed budget cannot be sold as a hard limit.
 - **Out of scope:** automatic code rewriting, arbitrary priority API, simulation
   coordinator, CPU affinity/niceness tuning, performance pass/fail thresholds.
-- **Open questions:** Q-9, Q-10, Q-11, Q-12. Q-4's TIME-1 prerequisite is satisfied; consume
+- **Open questions:** Q-9, Q-10, Q-11. Q-12 is resolved by D-19.
+  Q-4's TIME-1 prerequisite is satisfied; consume
   its existing clock API.
 
 ### LUA-7. Add bounded asynchronous requests and owned subscriptions
