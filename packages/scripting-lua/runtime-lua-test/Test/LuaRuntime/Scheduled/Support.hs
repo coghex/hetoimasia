@@ -16,6 +16,7 @@ module Test.LuaRuntime.Scheduled.Support
   , segmentsRun
   , releaseGate
   , awaitEntered
+  , cancelQueued
     -- * The clock and the timer
   , Clock (..)
   , newClock
@@ -52,6 +53,7 @@ import Control.Concurrent.MVar (MVar, newEmptyMVar, readMVar, tryPutMVar)
 import Control.Concurrent.STM (atomically, retry)
 import Control.Exception (AsyncException (ThreadKilled), ExceptionWithContext (ExceptionWithContext), SomeException, fromException, throwIO, tryWithContext)
 import Control.Monad (join, unless, void)
+import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (ThreadBlocked), listThreads, threadStatus)
 import Data.ByteString (ByteString)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Int (Int64)
@@ -601,3 +603,19 @@ taskReturned ∷ ScheduledOutcome → Maybe [Value]
 taskReturned = \case
   SettledReturned (Returned values) → Just values
   _ → Nothing
+
+-- | Cancel the owner and wait until the cancellation is demonstrably queued: the
+-- helper that delivers it is blocked in its 'throwTo' because the owner is inside
+-- a foreign call or a masked region. Releasing a segment after this is releasing
+-- it with a cancellation pending.
+cancelQueued ∷ ScheduledOwner → IO ()
+cancelQueued owner = do
+  before ← blockedThrowers
+  cancelScheduled owner
+  let wait = blockedThrowers >>= \now → unless (now > before) (yield >> wait)
+  wait
+  where
+    blockedThrowers = do
+      threads ← listThreads
+      statuses ← traverse threadStatus threads
+      pure (length [() | ThreadBlocked BlockedOnException ← statuses])

@@ -379,6 +379,7 @@ import Hetoimasia.Scripting.Lua.Scheduler.Timer
   , TimerBackend (..)
   , clearTimerWake
   , disposeTimer
+  , timerCancelFailure
   , maxRegistration
   , newTimer
   , registrationMicroseconds
@@ -908,7 +909,10 @@ stopScheduler scheduler host = mask_ $ do
             when (isJust (fromException failure ∷ Maybe SomeAsyncException)) $
               modifyIORef' interrupted (<|> Just failure)
       collected ← reverse <$> readIORef failures
-      report ← atomically (settleStop collected (either Just (const Nothing) timerFailure))
+      -- What cancelling the timer raised, here or in a turn before: the stop is
+      -- where the owner's cleanup is accounted for.
+      cancelled ← atomically (timerCancelFailure (schedTimerOf scheduler))
+      report ← atomically (settleStop collected (either Just (const Nothing) timerFailure <|> cancelled))
       readIORef interrupted >>= maybe (either (\(failure ∷ SomeException) → throwIO failure) (const (pure report)) timerFailure) throwIO
   where
     reference = schedState scheduler

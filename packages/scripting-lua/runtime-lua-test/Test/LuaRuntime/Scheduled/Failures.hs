@@ -182,6 +182,19 @@ spec = describe "host failures, failure and cancellation" $ do
       effects fixture >>= (`shouldSatisfy` elem "k closing")
       length (cleanupFailuresInContext context) `shouldSatisfy` (>= 1)
 
+    it "keeps the failure of a timer cancellation a service turn met, so an optional owner that recognizes everything is fatal" $ bounded $ do
+      fixture ← newSFixture
+      ExceptionWithContext context _ ← expectFatal $ \control runtime → do
+        owner ← startScheduled fixture runtime (scheduled fixture "turn timer" (optionalPolicy (const True)) defaultSchedulerBounds)
+        ticket ← admitTask' fixture owner "sleeper" (request "sleep" [VText "s", VInteger 5000000000] OrdinaryClass OneShot Nothing)
+        awaitRegistrations fixture 1
+        -- Stopping the only waiter takes its deadline away, and the turn that
+        -- applies the stop cancels the registration.
+        writeIORef (ftOnCancel (sfTimer fixture)) (ioError (userError "cancel failed"))
+        _ ← requestTaskControl (scheduledEndpoint owner) (ticketTask ticket) RequestStop
+        awaitScheduledTerminal control owner
+      map cleanupFailureLabel (cleanupFailuresInContext context) `shouldSatisfy` elem "lua timer cancel"
+
     it "keeps both the timer's failure and an interrupted close's when the stop met both" $ bounded $ do
       fixture ← newSFixture
       ExceptionWithContext context _ ← expectFatal $ \control runtime → do
@@ -230,7 +243,7 @@ spec = describe "host failures, failure and cancellation" $ do
         awaitDiagnostics owner (\counts → diagWaiting counts >= 1)
         _ ← grantScheduledStep (scheduledEndpoint owner) (nanoseconds 1)
         awaitEntered fixture "g"
-        cancelScheduled owner
+        cancelQueued owner
         releaseGate fixture "g"
         awaitScheduledTerminal control owner >>= (`shouldSatisfy` \case WorkerStopped → True; _ → False)
         outcomeOf ticket >>= (`shouldBe` Just [VInteger 7]) . taskReturned
@@ -243,7 +256,7 @@ spec = describe "host failures, failure and cancellation" $ do
         awaitDiagnostics owner (\counts → diagWaiting counts >= 1)
         _ ← grantScheduledStep (scheduledEndpoint owner) (nanoseconds 1)
         awaitEntered fixture "g"
-        cancelScheduled owner
+        cancelQueued owner
         releaseGate fixture "g"
         awaitScheduledTerminal control owner
       -- A cancelled owner whose cleanup failed ends fatally, not benignly.
@@ -255,7 +268,7 @@ spec = describe "host failures, failure and cancellation" $ do
         owner ← startScheduled fixture runtime (scheduled fixture "first segment" requiredPolicy defaultSchedulerBounds)
         ticket ← admitTask' fixture owner "a" (request "blocks_then_suspends" [VText "a", VText "g"] OrdinaryClass OneShot Nothing)
         awaitEntered fixture "g"
-        cancelScheduled owner
+        cancelQueued owner
         releaseGate fixture "g"
         awaitScheduledTerminal control owner >>= (`shouldSatisfy` \case WorkerStopped → True; _ → False)
         effects fixture >>= (`shouldSatisfy` elem "a closed")
@@ -270,7 +283,7 @@ spec = describe "host failures, failure and cancellation" $ do
         stuck ← admitTask' fixture owner "stuck" (request "block_in" [VText "s"] OrdinaryClass OneShot Nothing)
         awaitEntered fixture "s"
         unstarted ← admitTask' fixture owner "unstarted" (request "echo" [VInteger 1] OrdinaryClass OneShot Nothing)
-        cancelScheduled owner
+        cancelQueued owner
         -- A cancellation is never delivered inside Lua: it lands when the segment
         -- returns.
         releaseGate fixture "s"
