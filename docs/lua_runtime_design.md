@@ -160,7 +160,7 @@ concrete precondition
 - [x] LUA-20. Run Lua task coroutines on their VM owner — [#466]
 - [x] LUA-21. Add scheduling policies, service quanta, logical time and an owned timer for Lua tasks — [#467]
 - [x] LUA-6. Schedule cooperative tasks with bounded service turns — [#468]
-- [ ] LUA-18. Own script instances, hooks and lifecycle controls
+- [x] LUA-18. Own script instances, hooks and lifecycle controls — [#472]
 - [ ] LUA-22. Own instance resources through engine-held leases
 - [ ] LUA-23. Grant Lua lifecycle controls and inspection across owners
 - [ ] LUA-24. Run instance updates on logical and elapsed cadences
