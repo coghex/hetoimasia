@@ -1743,7 +1743,15 @@ whatever another does. Closing errors are cleanup evidence on the owner's outcom
 retained cleanup failure is fatal under any policy, as supervision decides for any worker
 (`WorkerCleanupFailed` when the worker was cancelled). `withVmOwner` then closes the VM.
 The same retirement runs when the owner fails or is cancelled, with the way it exited
-recorded, so a primary host failure or cancellation survives beside the evidence. The
+recorded, so a primary host failure or cancellation survives beside the evidence. A
+coroutine the scheduler left alone because its task was inside a segment when the owner
+ended (the application's observer raised before it resumed, say) is closed too, before the
+VM is, where the cleanup a script asked for may run state operations a VM's own teardown
+refuses. A failure of cleanup is fatal and ends the owner at once, so nothing accumulates
+while it serves: the first coroutine whose close raised, a script error raised together with
+the failures of closing its coroutine (the task still settles as faulted), or a timer
+whose cancellation throws ends the owner through the same retirement. A stop that is itself
+interrupted keeps every close's failure, the interruption among them. The
 `ExitRecord` is the finite-call adapter's: it names the owner and counts the tasks it
 discarded, started and not started separately, and carries no cleanup evidence.
 
