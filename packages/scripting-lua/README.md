@@ -1014,7 +1014,11 @@ scheduler operation, by calling `coroutine.yield` itself at the task's top level
 (directly or through `pcall`), would be suspended to no one; that is
 `UnscheduledYield`, a fault of the segment, and the task is closed. A script that
 resumes the task's own coroutine by hand leaves the host's next resume with
-`TaskRefused TaskNotSuspended`.
+`TaskRefused TaskNotSuspended`. If that coroutine died holding to-be-closed
+variables the host closes it, which runs them: their failures are cleanup
+evidence, and the fault's `Effect` says what ran (`BindingRan` if a binding's
+action did, `LuaRan` if the coroutine could have held something to run, otherwise
+`NoEffect`).
 
 ### The `coroutine` library
 
@@ -1053,17 +1057,24 @@ end in.
 **A segment that fails leaves nothing.** The coroutine is dead and its stack
 intact, so the host builds the traceback from it, then closes it, running its
 pending to-be-closed variables (Lua's own `coroutine.wrap` does the same), and
-empties its slot: the task has ended (`TaskEnded TaskFaulted`). An error one of
-those variables raises that is not the failure itself is kept as cleanup evidence
-beside the fault (`lua coroutine close`) and never lost.
+empties its slot: the task has ended (`TaskEnded TaskFaulted`). The close is a
+step of its own, apart from the segment, so what it raises is never mistaken for
+what the segment did: the segment's failure (a Haskell failure that reached a
+callback, else the script's error) is the one raised, and every Haskell failure a
+to-be-closed variable's callback raises while the coroutine closes, with its own
+type and context, and any error of Lua's other than the one the segment died
+with, is kept beside it as cleanup evidence (`lua coroutine close`), bounded like
+the finalizers' (64). Nothing is lost because two failures look alike to Lua: they
+both reach it as the same stand-in marker, and the host keeps the originals.
 
 ### Closing a task
 
 `closeTask` runs a suspended task's pending to-be-closed variables on the owner's
 thread and empties its slot. The close is terminal and idempotent: the task is
 closed whether or not a variable's handler failed, a failure is raised as a
-`BoundaryFault` of `CloseTask` (`ScriptFailed CallFailed`, with a Haskell failure
-a handler's callback raised outranking it) once and not again, a second close
+`BoundaryFault` of `CloseTask` (`ScriptFailed CallFailed`; a Haskell failure a
+handler's callback raised outranks it, and when several fail the first is the
+failure and the rest are cleanup evidence) once and not again, a second close
 does nothing, and a task that already ended is closed already. A scheduler
 operation inside a handler that runs during the close is refused
 (`SuspendOutsideTask`).
