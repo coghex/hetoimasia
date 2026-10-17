@@ -1751,7 +1751,12 @@ refuses. A failure of cleanup is fatal and ends the owner at once, so nothing ac
 while it serves: the first coroutine whose close raised, a script error raised together with
 the failures of closing its coroutine (the task still settles as faulted), or a timer
 whose cancellation throws ends the owner through the same retirement. A stop that is itself
-interrupted keeps every close's failure, the interruption among them. The
+interrupted keeps every close's failure, the interruption among them, and the failure of a
+timer's cancellation beside it (the scheduler's stop report carries it). A task-level stop
+whose close is interrupted keeps that failure before it propagates. A task's coroutine is
+acquired and published to the owner's table together, masked, so a cancellation queued
+during a first segment lands after it and the retirement finds the coroutine; a task that
+finished in that segment keeps its result. The
 `ExitRecord` is the finite-call adapter's: it names the owner and counts the tasks it
 discarded, started and not started separately, and carries no cleanup evidence.
 
