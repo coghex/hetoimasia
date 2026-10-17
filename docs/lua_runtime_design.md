@@ -6,7 +6,7 @@ Keep Lua central to authoring a game while Haskell owns execution, transport,
 failure evidence, and lifetime. This is the canonical continuation of
 `lua_runtime_architecture_notes.md` and the design conversation of 2026-09-16.
 
-Design state: ready for issue processing
+Design state: `exploring`
 
 Owner: `coghex/hetoimasia`. Epic #145 and children #146–#149 have been
 created; those children are merged. The owner accepted the two-domain direction,
@@ -79,6 +79,15 @@ are merged. The reconciliation needed no new owner decision.
 
 Readiness is not implementation approval. Processing LUA-5 into an issue and
 implementing it each need their own authorization.
+
+LUA-6 readiness discussion opened on 2026-10-17 at the owner's direct request.
+LUA-5 is now delivered by #464 / PR #465, merged as `29211202`, and TIME-1/#133
+is delivered. The current exploration is limited to LUA-6; it does not revoke
+the prior slices' approvals or renew LUA-7/LUA-8 or the confined branch.
+Q-9 and Q-10 below record proposals awaiting the owner's choices. LUA-6 remains
+deferred until those choices, their dependent contract reconciliation and an
+explicit readiness signoff are complete. No new tracker item is authorized by
+this design discussion.
 
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
 reviewed and deliberately not tracked separately · `[deferred]` blocked on a
@@ -153,6 +162,21 @@ effects. The host's public modules are now `Owner`, `Registration`, `Value` and
 `runtime-lua` sublibrary exists yet. The foundation and runtime facts below are
 unchanged in role. The bullet below saying no owner or registration surface
 exists describes the 2026-10-15 baseline.
+
+Addendum at `master@29211202`, 2026-10-17, for LUA-6's readiness discussion:
+LUA-5/#464 is merged by PR #465. The public `runtime-lua` sublibrary now exists.
+`Runtime.startLuaOwner` creates one supervised worker; its dispatch runs
+`withVmOwner`, publishes readiness after configured initialization, then serves
+prepared finite calls in FIFO order (`Runtime/Dispatch.hs`). Submission and
+outstanding results are bounded; application failures preserve their provenance
+through supervision. There is no scheduled task execution or timer yet.
+The protocol model already supplies service classes, quanta, task states,
+segment outcomes, ordinals and session transitions; the runtime adapter
+currently consumes only its cap validation. `Foundation.Time` supplies the
+monotonic source and injected `scriptedSource`; TIME-1/#133 is closed. The
+bridge offers no host coroutine-resume API today, and lifecycle-operation calls
+still return `NotYetSupported`. These are integration boundaries for LUA-6,
+not completed scheduler capabilities.
 
 - **The Lua host** (`packages/scripting-lua`, built on the `lua` binding
   `>=2.3.4 && <2.4`). Its public library exposes only
@@ -1209,6 +1233,54 @@ binding eligibility and the confined subset, with no mod exposure by default.
 Required confinement remains part of epic completion. Approval of these choices
 does not itself renew readiness or approve issue processing.
 
+### Q-9. Lifecycle-operation calls in LUA-6
+
+**Open; proposal, not an accepted decision (2026-10-17).** LUA-3/#462 decision
+A1 and LUA-5 deliberately leave lifecycle bindings classified but not callable;
+their delivery placement was reserved for LUA-6's readiness renewal.
+
+Recommendation: LUA-6 enables a narrow set of authorized lifecycle requests
+for tasks on the scheduled owner: pause, resume and cancel, plus requesting
+that owner's stop. Requests are bounded, report admission or refusal and take
+effect only at the next safe owner boundary. They do not recursively enter the
+scheduler, interrupt a running segment, roll back effects or grant authority to
+control other owners. This does not add owner creation, reload, replacement,
+module loading, provider operations or confined execution.
+
+Alternative: keep lifecycle bindings `NotYetSupported` in LUA-6, with task
+controls available only to the hosting application, and explicitly defer
+script-facing lifecycle delivery to a later slice. That keeps LUA-6 smaller but
+leaves the author-facing transition requests unfinished.
+
+If the recommendation is accepted, the next design pass must specify request
+capacity, admission versus application results, ordering, invalid/stale targets,
+requests concerning the currently running task and behavior during closing.
+No solver may infer these from the existing generic binding action type.
+
+### Q-10. Scheduled tasks beside LUA-5's finite-call owners
+
+**Open; proposal, not an accepted decision (2026-10-17).** LUA-5 promises
+finite calls executed to completion in FIFO admission order. LUA-6 adds
+resumable tasks, service classes and safe-boundary scheduling. The relationship
+must be explicit before implementation.
+
+Recommendation: preserve the existing finite-call owner API and its behavior,
+and make scheduled task execution an explicit choice when constructing an
+owner. A scheduled owner offers task admission and control; it does not also
+expose an unrestricted finite-call bypass around scheduling quotas. Both forms
+reuse the same protected VM lifetime, supervision, registration and failure
+contracts, with exactly one execution loop per VM. This is no VM pool or
+cross-owner scheduler. Exact public names and private factoring remain
+implementation choices.
+
+Alternative: one scheduling model for every owner, representing finite calls
+as one-segment tasks. This avoids two public execution forms but requires an
+explicit compatibility and ordering contract for existing callers alongside
+multi-segment tasks; it is a broader change to LUA-5's delivery.
+
+The owner's choice gates the execution API and acceptance scope, not the
+already accepted requirement for explicit segments and transient coroutines.
+
 ## Verification strategy
 
 The design requires observable contracts rather than one happy-path Lua call:
@@ -1515,7 +1587,9 @@ and verified policy, with adversarial regression coverage.
 
 ### LUA-6. Schedule cooperative tasks with bounded service turns
 
-> Deferred: owner renews trusted-path readiness for this slice. The 2026-10-15 narrow renewal covers LUA-2 and LUA-3 only.
+> Deferred: readiness discussion opened 2026-10-17. LUA-5 and TIME-1 are
+> delivered; Q-9/Q-10 require owner choices and dependent reconciliation before
+> readiness signoff. Earlier narrow renewals did not cover this slice.
 
 - **Outcome:** one trusted VM owner services resumable tasks fairly, wakes for
   events/deadlines, and reports real budget overruns without fake preemption.
@@ -1532,7 +1606,8 @@ and verified policy, with adversarial regression coverage.
   only on explicit completion; elapsed budget cannot be sold as a hard limit.
 - **Out of scope:** automatic code rewriting, arbitrary priority API, simulation
   coordinator, CPU affinity/niceness tuning, performance pass/fail thresholds.
-- **Open questions:** Q-4 before processing.
+- **Open questions:** Q-9, Q-10. Q-4's TIME-1 prerequisite is satisfied; consume
+  its existing clock API.
 
 ### LUA-7. Add bounded asynchronous requests and owned subscriptions
 
