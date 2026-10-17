@@ -1999,7 +1999,9 @@ tasks. Cleanup is the engine's and nothing the application answers can hide it: 
 raised, a closing handler the script defined included, is cleanup evidence on the owner's outcome and is
 fatal under any policy, as it is for a task, and it stays beside an instance's primary failure; a failure raised
 while an instance ends does not take a close's failure with it, a `shutdown` that raised a failure of the host is not
-started again when the owner's exit comes back to the instance, and when several instances' ends raise failures the first
+started again when the owner's exit comes back to the instance, an instance whose coroutine the scheduler closed is ended
+from the owner's own code and not from inside the close, so a failure of the host that a hook raises is the owner's own
+failure and is never taken for a failure of the close, and when several instances' ends raise failures the first
 is the owner's and every other is kept whole as cleanup evidence. What an ending had counted survives a failure of the
 host in its hook.
 
@@ -2017,8 +2019,12 @@ Pause and resume of the invocation in flight, and stop, are done to its task dir
 with no scheduler request, reservation or queue between: a request settles as it is applied, before anything that
 can raise a failure of the host. An invocation that has not run a segment has nothing to freeze or close, even when
 the scheduler holds it in its queue behind slots that stay occupied: pausing takes it back, with its event, to be
-started on resume, and a stop discards it as an unstarted invocation. An owner that has been asked to stop services
-nothing more: its exit settles what was left.
+started on resume (the task the scheduler holds is used again when the invocation is the same, so pausing and
+resuming over and over admits nothing new), and a stop discards it as an unstarted invocation. Until it runs, an
+invocation holds its place in the instance's queue, so taking it back never overfills the queue. An owner that has been asked to stop services
+nothing more: its exit settles what was left. The scheduler's own task controls do not reach an instance's
+invocation, whatever the application learned of its identity: they answer unknown, and the instance layer is
+the only thing that pauses, resumes or stops it.
 
 - **Pause** stops new invocations from starting and freezes the invocation in flight, if any, suspended
   where it is, running nothing, however its wait would have ended. Accepted events stay in the queue, in
