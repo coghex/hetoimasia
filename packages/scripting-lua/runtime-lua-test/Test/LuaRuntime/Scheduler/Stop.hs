@@ -8,7 +8,7 @@ import Control.Concurrent (forkIO, throwTo)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (AsyncException (ThreadKilled), SomeException, fromException, toException, try)
 import Control.Monad (when)
-import Data.IORef (modifyIORef', writeIORef)
+import Data.IORef (atomicModifyIORef', modifyIORef', newIORef, writeIORef)
 import qualified Data.Map.Strict as Map
 import Hetoimasia.Scripting.Lua.Scheduler
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
@@ -132,6 +132,52 @@ spec = describe "stopping the scheduler, admission and diagnostics" $ do
       turnCloseFailures second `shouldSatisfy` null
       report ← stopScheduler (rigScheduler rig) (rigHost rig)
       stopCloseFailures report `shouldSatisfy` null
+
+  describe "close failures when a turn's final timer synchronization fails" $ do
+    let refusedWithElapsedWaiter = do
+          rig ← newRig
+          refused ← admit rig "refused" OrdinaryClass OneShot
+          _ ← admit rig "sleeper" OrdinaryClass OneShot
+          script rig "refused" [waitTicks "refused" 0]
+          script rig "sleeper" [waitFor "sleeper" 5000000]
+          modifyIORef' (rigCloseFailures rig) (Map.insert refused (toException (userError "close failed")))
+          pure (rig, refused)
+
+    it "are kept through a clock failure while the timer is synchronized, for the stop" $ do
+      (rig, refused) ← refusedWithElapsedWaiter
+      readings ← newIORef (0 ∷ Int)
+      -- The first reading places the sleeper's deadline; the second is the timer's.
+      writeIORef (rigClockHook rig) $ do
+        n ← atomicModifyIORef' readings (\seen → (seen + 1, seen + 1))
+        when (n == 2) (ioError (userError "clock down"))
+      outcome ← try @SomeException (turn rig)
+      either (const (pure ())) (const (fail "the turn should have failed")) outcome
+      writeIORef (rigClockHook rig) (pure ())
+      report ← stopScheduler (rigScheduler rig) (rigHost rig)
+      map fst (stopCloseFailures report) `shouldBe` [refused]
+
+    it "are kept through an interruption while the timer is armed, for the next report" $ do
+      (rig, refused) ← refusedWithElapsedWaiter
+      entered ← newEmptyMVar
+      gate ← newEmptyMVar
+      writeIORef (ftOnArm (rigTimer rig)) (putMVar entered () >> takeMVar gate)
+      finished ← newEmptyMVar
+      driver ← forkIO (try @SomeException (turn rig) >>= putMVar finished)
+      takeMVar entered
+      thrower ← forkIO (throwTo driver ThreadKilled)
+      awaitDelivered thrower
+      putMVar gate ()
+      _ ← takeMVar finished
+      writeIORef (ftOnArm (rigTimer rig)) (pure ())
+      next ← turn rig
+      map fst (turnCloseFailures next) `shouldBe` [refused]
+
+    it "are not lost to a report that never arrived: a report is acknowledged by the next turn, and until then the stop reports it again" $ do
+      (rig, refused) ← refusedWithElapsedWaiter
+      first ← turn rig
+      map fst (turnCloseFailures first) `shouldBe` [refused]
+      report ← stopScheduler (rigScheduler rig) (rigHost rig)
+      map fst (stopCloseFailures report) `shouldBe` [refused]
 
   describe "the owner's one wait" $ do
     it "returns for an admission, a control request, a grant, a timer wake and the owner's stop request, and for nothing else" $ do

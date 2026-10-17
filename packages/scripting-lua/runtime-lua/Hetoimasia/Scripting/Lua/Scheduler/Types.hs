@@ -356,7 +356,10 @@ data TurnReport = TurnReport
     -- reported. A refused wait is among them, as a validation failure.
   , turnRefusedWaits ∷ ![(TaskId, WaitRefusal)]
   , turnCloseFailures ∷ ![(TaskId, SomeException)]
-    -- ^ Continuations whose close failed, to be kept as cleanup evidence.
+    -- ^ Continuations whose close failed since the last report, including those a
+    -- turn that ended exceptionally had met, to be kept as cleanup evidence. They are
+    -- kept in the scheduler until the report is handed over, and, until the next
+    -- turn shows it arrived, the scheduler's stop reports them too.
   }
   deriving (Show)
 

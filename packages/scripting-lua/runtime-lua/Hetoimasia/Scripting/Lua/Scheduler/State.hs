@@ -49,7 +49,8 @@ module Hetoimasia.Scripting.Lua.Scheduler.State
   , closeObligations
   , closedObligation
   , retainEvidence
-  , drainEvidence
+  , deliverEvidence
+  , acknowledgeEvidence
 
     -- * Time
   , settleGrants
@@ -221,6 +222,10 @@ data SchedState v = SchedState
     -- ^ Failures of closes that have been made and not yet reported: kept here,
     -- not in a turn's local accumulator, so an exception that ends the turn cannot
     -- lose them. A turn's report takes them, and so does the scheduler's stop.
+  , ssDelivered ∷ !(Seq (TaskId, SomeException))
+    -- ^ The failures the last turn report carried, until the next turn starts. A
+    -- report can be lost to an exception on its way out, so the stop reports these
+    -- too: evidence is never dropped, and at worst it is reported twice.
   , ssToClose ∷ !(Set TaskId)
     -- ^ Tasks that ended while their continuation was suspended and whose
     -- continuation has not yet been closed: a refused wait, a wait that could not
@@ -282,6 +287,7 @@ initialState label session =
           }
     , ssSites = Map.empty
     , ssEvidence = Seq.empty
+    , ssDelivered = Seq.empty
     , ssToClose = Set.empty
     }
 
@@ -394,9 +400,15 @@ closeObligations = Set.toAscList . ssToClose
 retainEvidence ∷ [(TaskId, SomeException)] → SchedState v → SchedState v
 retainEvidence failures state = state {ssEvidence = foldl' (|>) (ssEvidence state) failures}
 
--- | Take every failure kept, oldest first.
-drainEvidence ∷ SchedState v → ([(TaskId, SomeException)], SchedState v)
-drainEvidence state = (toList (ssEvidence state), state {ssEvidence = Seq.empty})
+-- | Hand the failures kept to a report, oldest first. They stay in the state,
+-- as delivered, until the next turn starts and so shows the report arrived.
+deliverEvidence ∷ SchedState v → ([(TaskId, SomeException)], SchedState v)
+deliverEvidence state =
+  (toList (ssEvidence state), state {ssEvidence = Seq.empty, ssDelivered = ssEvidence state})
+
+-- | A new turn has started, so the last report was received.
+acknowledgeEvidence ∷ SchedState v → SchedState v
+acknowledgeEvidence state = state {ssDelivered = Seq.empty}
 
 -- | Take a close obligation off, once the close has been made.
 closedObligation ∷ TaskId → SchedState v → SchedState v

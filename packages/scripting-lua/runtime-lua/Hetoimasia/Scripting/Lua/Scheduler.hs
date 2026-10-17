@@ -632,6 +632,7 @@ serviceTurn scheduler host = do
     then pure (TurnReport 0 TurnClosed [] [] [])
     else do
       atomically (clearTimerWake (schedTimerOf scheduler))
+      atomically (modifyTVar' (schedState scheduler) acknowledgeEvidence)
       waiting ← not . Map.null . ssElapsed <$> readTVarIO (schedState scheduler)
       started ←
         if waiting || budget /= Nothing
@@ -644,27 +645,28 @@ serviceTurn scheduler host = do
             now ← started
             either (const Nothing) Just (addDuration now limit)
       report ← loop deadline started (Turn 0 [] [])
+      -- The timer is brought in line first, and only then are the failures of the
+      -- closes made so far handed to the report, so one that throws leaves them in
+      -- the scheduler for the next report or the stop.
       syncTimerFor scheduler
-      pure report
+      evidence ← atomically $ do
+        state ← readTVar (schedState scheduler)
+        let (kept, delivered) = deliverEvidence state
+        writeTVar (schedState scheduler) delivered
+        pure kept
+      pure report {turnCloseFailures = evidence}
   where
     config = schedConfig scheduler
     budget = boundServiceBudget (schedBounds config)
 
-    done turn end = do
-      -- The failures of closes made so far, including any a turn that ended
-      -- exceptionally left behind.
-      evidence ← atomically $ do
-        state ← readTVar (schedState scheduler)
-        let (kept, drained) = drainEvidence state
-        writeTVar (schedState scheduler) drained
-        pure kept
+    done turn end =
       pure
         TurnReport
           { turnSegments = turnCount turn
           , turnEnd = end
           , turnFailures = reverse (turnFailed turn)
           , turnRefusedWaits = reverse (turnRefused turn)
-          , turnCloseFailures = evidence
+          , turnCloseFailures = []
           }
 
     loop ∷ Maybe Instant → Maybe Instant → Turn → IO TurnReport
@@ -909,7 +911,7 @@ stopScheduler scheduler host = mask_ $ do
         settleSlot reference (pendingSlot pending) (ControlSettlement ControlNoLongerApplicable Nothing)
       state ← readTVar reference
       let (session, exit) = stopSession (ssSession state)
-          report = StopReport exit (toList (ssEvidence state) <> collected) (Seq.length (ssControl before))
+          report = StopReport exit (toList (ssDelivered state) <> toList (ssEvidence state) <> collected) (Seq.length (ssControl before))
           aborted = liveCount state
           discards = exitDiscards exit
           counts = ssCounts state
@@ -925,6 +927,7 @@ stopScheduler scheduler host = mask_ $ do
           , ssControl = Seq.empty
           , ssToClose = Set.empty
           , ssEvidence = Seq.empty
+          , ssDelivered = Seq.empty
           , ssPhase = Closed report
           , ssCounts =
               counts
