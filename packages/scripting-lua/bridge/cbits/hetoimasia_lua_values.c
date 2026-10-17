@@ -52,6 +52,9 @@ static gc_hold_t gc_hold(lua_State *L)
 
 static char modules_key;
 
+/* The table the tasks' coroutines are anchored in, by slot. */
+static char tasks_key;
+
 /* Add to (or, with a negative amount, take from) what is owed. The key exists
 ** from the set-up, so setting it allocates nothing. */
 static long owed_add(lua_State *L, long bytes)
@@ -695,6 +698,9 @@ static int setup_body(lua_State *L)
   ** that updating it allocates nothing. */
   lua_pushinteger(L, 0);
   lua_rawseti(L, -2, 0);
+  /* The coroutines of the tasks the host has started, by slot. */
+  lua_createtable(L, 0, 0);
+  lua_rawsetp(L, LUA_REGISTRYINDEX, &tasks_key);
   lua_rawsetp(L, LUA_REGISTRYINDEX, &modules_key);
   lua_rawsetp(L, LUA_REGISTRYINDEX, &handle_key);
   return 0;
@@ -1206,6 +1212,302 @@ int hetoimasia_lua_entry_lookup(
   status = lua_pcall(L, 1, 1, 0);
   *kind = a.kind;
   *found_module = a.found;
+  gc_release(L, held);
+  return status;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Tasks: coroutines the host starts, resumes and closes                      */
+/* ------------------------------------------------------------------------ */
+
+/*
+** A task is a Lua thread of the VM, anchored by slot in a table the bridge owns
+** so that the collector cannot take it while the host holds a handle. Only the
+** owner's thread starts, resumes or closes one, and every operation below is
+** made while that thread holds the VM's gate.
+**
+** Nothing here lets a Lua error out of a C frame the Haskell caller sits in.
+** Creating the thread is the one step that allocates, and it is one protected
+** call. Resuming is `lua_resume`, which contains its errors and answers a
+** status; the rest only moves values and reads call records, none of which
+** allocates or can raise once the stack has been reserved with
+** `lua_checkstack`, which reports failure rather than raising it.
+*/
+
+/* Look a task's coroutine up. The thread stays anchored; nothing is left on the
+** stack. NULL when the slot holds nothing. */
+static lua_State *task_thread(lua_State *L, lua_Integer slot)
+{
+  lua_State *co = NULL;
+  if (!lua_checkstack(L, 4)) {
+    return NULL;
+  }
+  lua_rawgetp(L, LUA_REGISTRYINDEX, &tasks_key);
+  if (lua_istable(L, -1)) {
+    lua_rawgeti(L, -1, slot);
+    co = lua_tothread(L, -1);
+    lua_pop(L, 1);
+  }
+  lua_pop(L, 1);
+  return co;
+}
+
+/* Empty a task's slot, so the coroutine can be collected. The key exists, so
+** setting it to nil allocates nothing. */
+static void task_unanchor(lua_State *L, lua_Integer slot)
+{
+  if (!lua_checkstack(L, 4)) {
+    return;
+  }
+  lua_rawgetp(L, LUA_REGISTRYINDEX, &tasks_key);
+  if (lua_istable(L, -1)) {
+    lua_pushnil(L);
+    lua_rawseti(L, -2, slot);
+  }
+  lua_pop(L, 1);
+}
+
+/* The arguments are the function, its arguments and the slot. */
+static int task_new_body(lua_State *L)
+{
+  int total = lua_gettop(L);
+  lua_Integer slot = lua_tointeger(L, total);
+  lua_State *co;
+
+  lua_settop(L, total - 1);
+  luaL_checkstack(L, 4, "creating a task");
+  lua_rawgetp(L, LUA_REGISTRYINDEX, &tasks_key);
+  if (!lua_istable(L, -1)) {
+    return luaL_error(L, "the task table is missing");
+  }
+  co = lua_newthread(L);
+  lua_pushvalue(L, -1);
+  lua_rawseti(L, -3, slot);
+  if (!lua_checkstack(co, total + LUA_MINSTACK)) {
+    return luaL_error(L, "too many arguments for a task");
+  }
+  /* The function and its arguments move to the coroutine, the thread being
+  ** anchored by now. */
+  lua_pop(L, 2);
+  lua_xmove(L, co, total - 1);
+  return 0;
+}
+
+int hetoimasia_lua_task_new(lua_State *L, lua_Integer slot, int nargs)
+{
+  gc_hold_t held = gc_hold(L);
+  int status;
+  if (!lua_checkstack(L, 4)) {
+    gc_release(L, held);
+    return LUA_ERRMEM;
+  }
+  lua_pushcfunction(L, task_new_body);
+  /* Below the function, which is nargs + 1 values down. */
+  lua_insert(L, -(nargs + 2));
+  lua_pushinteger(L, slot);
+  status = lua_pcall(L, nargs + 2, 0, 0);
+  gc_release(L, held);
+  return status;
+}
+
+lua_State *hetoimasia_lua_task_thread(lua_State *L, lua_Integer slot)
+{
+  return task_thread(L, slot);
+}
+
+int hetoimasia_lua_yieldable(lua_State *L)
+{
+  return lua_isyieldable(L);
+}
+
+/* A failed segment's coroutine is dead and its stack intact. Close it, which
+** runs the to-be-closed variables it still holds, keeping the error it failed
+** with on its stack for them as Lua requires. The failure is copied to `L` and,
+** when closing raised an error of its own, that error is copied above it.
+**
+** Answers 1 when closing raised an error other than the one it failed with. */
+/* Whether the value on top of the stack is the placeholder a failed callback
+** raises in Lua's terms: a light userdata carrying no address. Nothing a script
+** can build is one. */
+static int is_marker(lua_State *L)
+{
+  return lua_islightuserdata(L, -1) && lua_touserdata(L, -1) == NULL;
+}
+
+static int task_cleanup(lua_State *L, lua_State *co, lua_Integer slot, int *marker)
+{
+  int own = 0;
+  int different = 0;
+  *marker = 0;
+  if (lua_gettop(co) >= 1 && lua_checkstack(L, 4)) {
+    lua_xmove(co, L, 1);
+    lua_pushvalue(L, -1);
+    lua_xmove(L, co, 1);
+    own = 1;
+  }
+  if (lua_closethread(co, L) != LUA_OK && lua_gettop(co) >= 1 && lua_checkstack(L, 4)) {
+    lua_xmove(co, L, 1);
+    if (own && lua_rawequal(L, -1, -2)) {
+      lua_pop(L, 1);
+    } else {
+      different = 1;
+      *marker = is_marker(L);
+    }
+  }
+  task_unanchor(L, slot);
+  return different;
+}
+
+/*
+** Run the next segment of the task in `slot`: from the start when `starting`
+** (the function and its arguments are on the coroutine's stack), else from
+** where it yielded, with no values.
+**
+** `*outcome` says how the segment ended. For a completed task the results are
+** moved onto `L`'s stack when there are `expected` of them. For a failed one the
+** coroutine is left dead and anchored, with the error it failed with on its own
+** stack, and `trace` holds the traceback of the failure.
+*/
+int hetoimasia_lua_task_resume(
+  lua_State *L, lua_Integer slot, int starting, int expected,
+  char *trace, size_t trace_capacity, size_t *trace_length,
+  int *outcome, int *count, int *cleanup_error)
+{
+  lua_State *co;
+  int status;
+  int nresults = 0;
+  int nargs;
+
+  *trace_length = 0;
+  *outcome = HETOIMASIA_TASK_UNRESUMABLE;
+  *count = 0;
+  *cleanup_error = 0;
+  co = task_thread(L, slot);
+  if (co == NULL) {
+    return LUA_OK;
+  }
+  status = lua_status(co);
+  if (starting ? !(status == LUA_OK && lua_gettop(co) >= 1) : status != LUA_YIELD) {
+    return LUA_OK;
+  }
+  nargs = starting ? lua_gettop(co) - 1 : 0;
+  /* What the host-side phases allocated is paid before script code runs. */
+  gc_service(L);
+  status = lua_resume(co, L, nargs, &nresults);
+  if (status == LUA_OK) {
+    task_unanchor(L, slot);
+    *count = nresults;
+    if (nresults != expected) {
+      lua_pop(co, nresults);
+      *outcome = HETOIMASIA_TASK_ARITY;
+      return LUA_OK;
+    }
+    if (nresults > 0 && !lua_checkstack(L, nresults)) {
+      lua_pop(co, nresults);
+      *outcome = HETOIMASIA_TASK_ARITY;
+      return LUA_ERRMEM;
+    }
+    lua_xmove(co, L, nresults);
+    *outcome = HETOIMASIA_TASK_COMPLETED;
+    return LUA_OK;
+  }
+  if (status == LUA_YIELD) {
+    lua_pop(co, nresults);
+    *count = nresults;
+    *outcome = HETOIMASIA_TASK_YIELDED;
+    return LUA_OK;
+  }
+  /* The coroutine is dead and its stack intact. It is closed by a call of its
+  ** own (`hetoimasia_lua_task_cleanup`), so that what closing raises can be told
+  ** from what the segment raised. */
+  *trace_length = build_traceback(co, 0, trace, trace_capacity);
+  *outcome = HETOIMASIA_TASK_FAILED;
+  *cleanup_error = 0;
+  return status;
+}
+
+/*
+** Close the coroutine in `slot` that is not suspended where the host left it --
+** one that failed, or that a script resumed itself -- running the to-be-closed
+** variables it still holds, and unanchor it. The error it died with, if any, is
+** on top of `L`'s stack afterwards, and above it the error closing raised if that
+** was another (`*cleanup_error`). `*errored` says whether it had died with an
+** error, which is whether it can have held anything to run.
+*/
+int hetoimasia_lua_task_cleanup(
+  lua_State *L, lua_Integer slot, int *present, int *errored, int *cleanup_error, int *cleanup_marker)
+{
+  lua_State *co;
+  *present = 0;
+  *errored = 0;
+  *cleanup_error = 0;
+  *cleanup_marker = 0;
+  co = task_thread(L, slot);
+  if (co == NULL) {
+    return LUA_OK;
+  }
+  *present = 1;
+  *errored = lua_status(co) > LUA_YIELD;
+  *cleanup_error = task_cleanup(L, co, slot, cleanup_marker);
+  return LUA_OK;
+}
+
+/*
+** Close the task in `slot`, running the to-be-closed variables of a suspended
+** coroutine, and unanchor it either way. `*present` is 0 when the slot held
+** nothing. `*failed` is 1 when closing raised an error, which is then on top of
+** `L`'s stack unless that could not be reserved.
+*/
+int hetoimasia_lua_task_close(lua_State *L, lua_Integer slot, int *present, int *failed, int *marker)
+{
+  lua_State *co;
+  *present = 0;
+  *failed = 0;
+  *marker = 0;
+  co = task_thread(L, slot);
+  if (co == NULL) {
+    return LUA_OK;
+  }
+  *present = 1;
+  if (lua_closethread(co, L) != LUA_OK) {
+    *failed = 1;
+    if (lua_gettop(co) >= 1 && lua_checkstack(L, 4)) {
+      lua_xmove(co, L, 1);
+      *marker = is_marker(L);
+    }
+  }
+  task_unanchor(L, slot);
+  return LUA_OK;
+}
+
+static int task_count_body(lua_State *L)
+{
+  long *out = (long *) lua_touserdata(L, 1);
+  long n = 0;
+  lua_rawgetp(L, LUA_REGISTRYINDEX, &tasks_key);
+  if (lua_istable(L, -1)) {
+    lua_pushnil(L);
+    while (lua_next(L, -2)) {
+      n++;
+      lua_pop(L, 1);
+    }
+  }
+  *out = n;
+  return 0;
+}
+
+int hetoimasia_lua_task_count(lua_State *L, long *count)
+{
+  gc_hold_t held = gc_hold(L);
+  int status;
+  *count = 0;
+  if (!lua_checkstack(L, 8)) {
+    gc_release(L, held);
+    return LUA_ERRMEM;
+  }
+  lua_pushcfunction(L, task_count_body);
+  lua_pushlightuserdata(L, count);
+  status = lua_pcall(L, 1, 0, 0);
   gc_release(L, held);
   return status;
 }

@@ -34,7 +34,10 @@ description:
     once its modules have loaded, with bounded non-blocking call submission,
     exactly-once settlement of every accepted call, host failures left to
     supervision, a protected stop that discards queued calls and records them,
-    and the refusal of a wait for a reply from inside any Lua callback. The
+    and the refusal of a wait for a reply from inside any Lua callback. The host
+    also runs a module's entry point as a Lua coroutine on its VM owner, one
+    segment at a time, with yield and wait operations an application registers
+    and the standard coroutine library selectable; it schedules nothing. The
     scheduler and the confined path are later slices.
 license: GPL-3.0-only
 license-file: LICENSE
@@ -89,6 +92,7 @@ library bridge
         Hetoimasia.Scripting.Lua.Internal.Module
         Hetoimasia.Scripting.Lua.Internal.Owner
         Hetoimasia.Scripting.Lua.Internal.Registration
+        Hetoimasia.Scripting.Lua.Internal.Task
         Hetoimasia.Scripting.Lua.Internal.Value
         Hetoimasia.Scripting.Lua.Internal.Vm
     build-depends:
@@ -249,6 +253,7 @@ test-suite lua-host-tests
         Test.Lua.Boundary.Registration
         Test.Lua.Boundary.Spec
         Test.Lua.Boundary.Support
+        Test.Lua.Boundary.Tasks
         Test.Lua.Boundary.Values
         Test.Lua.Close
         Test.Lua.Discipline

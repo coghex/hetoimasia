@@ -11,8 +11,10 @@
 -- application's configuration, and the namespaces it exposes beside them are the
 -- owner's policy over a registration (LUA-3).
 --
--- @coroutine@ and @utf8@ are absent because the binding exports no opener for
--- them. Adding one is a change to the binding, not a policy decision here.
+-- @utf8@ is absent because the binding exports no opener for it. Adding one is
+-- a change to the binding, not a policy decision here. @coroutine@ is selectable
+-- like the others, through an opener this bridge declares itself, and a coroutine
+-- a script makes with it is the script's own: it is never a value that crosses.
 module Hetoimasia.Scripting.Lua.Internal.Library
   ( Library (..)
   , libraryModuleName
@@ -50,6 +52,10 @@ data Library
     LibraryOs
   | -- | @debug@.
     LibraryDebug
+  | -- | @coroutine@, for the transient sequences a task's code may build. A
+    -- scheduler yield made inside a coroutine the script created is refused; see
+    -- "Hetoimasia.Scripting.Lua.Owner".
+    LibraryCoroutine
   deriving (Bounded, Enum, Eq, Ord, Show)
 
 -- | The debug library without @sethook@. A hook is script-defined Lua that Lua
@@ -59,6 +65,11 @@ data Library
 -- recorded. The rest of the library is as Lua ships it.
 foreign import ccall "hetoimasia_lua_bridge.h &hetoimasia_luaopen_debug"
   luaopenDebug ∷ CFunction
+
+-- | The coroutine library's opener. The binding exports none, but the C library
+-- it links defines one.
+foreign import ccall "lualib.h &luaopen_coroutine"
+  luaopenCoroutine ∷ CFunction
 
 -- | The module name the library is registered and globally bound under.
 --
@@ -73,6 +84,7 @@ libraryModuleName = \case
   LibraryIo → "io"
   LibraryOs → "os"
   LibraryDebug → "debug"
+  LibraryCoroutine → "coroutine"
 
 -- | The C function that opens the library.
 libraryOpener ∷ Library → CFunction
@@ -85,3 +97,4 @@ libraryOpener = \case
   LibraryIo → luaopen_io
   LibraryOs → luaopen_os
   LibraryDebug → luaopenDebug
+  LibraryCoroutine → luaopenCoroutine

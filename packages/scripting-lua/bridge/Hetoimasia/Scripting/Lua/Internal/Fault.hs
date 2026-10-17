@@ -248,6 +248,9 @@ data CloseSource
     FromStrandedOperation
   | -- | Failures beyond the recording bound were dropped.
     FromTruncation
+  | -- | Closing a task's suspended coroutine failed: one of its pending
+    -- to-be-closed variables raised an error.
+    FromCoroutineClose
   deriving (Bounded, Enum, Eq, Show)
 
 -- | The label a close failure of this source is retained under as cleanup
@@ -259,6 +262,7 @@ closeSourceLabel = \case
   FromRelease → "lua release"
   FromStrandedOperation → "lua operation"
   FromTruncation → "lua evidence truncated"
+  FromCoroutineClose → "lua coroutine close"
 
 -- | One failure of the close, with where it came from and the context its
 -- exception was caught with.

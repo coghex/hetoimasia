@@ -156,7 +156,7 @@
     },
     {
       "id": "test.scripting-lua",
-      "description": "Focused Hspec examples for the Lua host package's fault and cancellation transport across the foreign-call boundary, stack and registry discipline, terminal close, independent execution under the threaded RTS, selectable standard libraries, and its export boundary. Deliberate nontermination is a separate local-only probe.",
+      "description": "Focused Hspec examples for the Lua host package's fault and cancellation transport across the foreign-call boundary, stack and registry discipline, terminal close, independent execution under the threaded RTS, selectable standard libraries (the coroutine library included), the value boundary, and tasks: module entry points run as coroutines on their VM owner, with yield and wait operations, typed refusals wherever a yield cannot reach a scheduler, closing and teardown of suspended coroutines, and its export boundary. Deliberate nontermination is a separate local-only probe.",
       "command": [
         "cabal",
         "test",

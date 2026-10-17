@@ -19,13 +19,30 @@
 -- package, and a direct-only binding needs no confined equivalent.
 --
 -- The kinds are a snapshot query, an owned state operation, a command or UI
--- intention, an asynchronous native request and a lifecycle operation. The first
--- three are delivered on the direct path. A command or UI intention answers
+-- intention, an asynchronous native request, a lifecycle operation and a
+-- scheduler operation. The first three are delivered on the direct path, and so
+-- is the last. A command or UI intention answers
 -- acceptance, or a bounded rejection, as data: two values, a boolean and the
 -- reason text or nil. The last two are accepted and classified here, and a Lua
 -- call to one is a typed 'Hetoimasia.Scripting.Lua.Owner.NotYetSupported' fault
 -- whose action never runs. The asynchronous kind can never be eligible to run
 -- from a Lua finalizer during a VM's close.
+--
+-- = Scheduler operations
+--
+-- A task's code gives control back to whatever resumes it through a scheduler
+-- operation: a yield ('yieldOperation'), or a wait for an elapsed deadline or a
+-- logical tick ('waitOperation', 'WaitKind'). They are bindings like any other,
+-- named by the application and granted by an owner's policy, so a script that is
+-- not granted one has none; nothing about them is global. The host runs no
+-- application code for one. It suspends the task's coroutine and reports to
+-- whoever resumed it that the script yielded, or what it waited for with the
+-- arguments it gave, checked against the schemas the operation declares and the
+-- owner's limits. A wait's arguments mean whatever the application's scheduler
+-- says; the host interprets none. A scheduler operation called anywhere it cannot
+-- reach a scheduler is a typed fault of the call
+-- ('Hetoimasia.Scripting.Lua.Owner.SuspendRefused'), and is never eligible for
+-- the confined path.
 --
 -- = Names and bounds
 --
@@ -62,6 +79,9 @@ module Hetoimasia.Scripting.Lua.Registration
   , commandIntention
   , asynchronousNativeRequest
   , lifecycleOperation
+  , yieldOperation
+  , waitOperation
+  , WaitKind (..)
   , confinedEligible
   , finalizerEligible
   , withoutDirectPath
