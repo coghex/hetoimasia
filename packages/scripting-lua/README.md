@@ -35,9 +35,10 @@ settlement and the refusal of a reply wait from inside a Lua callback. See
 sits beside it and needs no VM: per-owner policies, service classes and quanta,
 logical and elapsed time behind one owned timer, budgets, and safe-boundary
 control, tested against scripted segments. See
-[The scheduling machinery](#the-scheduling-machinery). Any concrete game
-namespace, scheduled owners that host it on real VMs, asynchronous requests and the
-confined path are later slices of
+[The scheduling machinery](#the-scheduling-machinery). **Scheduled owners** (LUA-6)
+host it, and the host's task coroutines, on supervised workers with real VMs. See
+[The scheduled owner](#the-scheduled-owner). Any concrete game
+namespace, asynchronous requests and the confined path are later slices of
 [the Lua runtime design](../../docs/lua_runtime_design.md). What is here is the
 boundary they will be built on, and the evidence that it holds.
 
@@ -926,7 +927,7 @@ mechanism for script code that gives control back: a module's entry point run as
 a Lua coroutine of its VM, on the VM's owner, a segment at a time. This is the
 mechanism and nothing else. The scheduler that decides when a task runs, what a
 deadline or a tick is, and in what order (LUA-21), and the supervised owners that
-use both (LUA-6), are separate slices; no clock, timer, queue or policy is here,
+use both (LUA-6, delivered in `runtime-lua`), are separate slices; no clock, timer, queue or policy is here,
 and the examples resume a task by hand.
 
 ### What a task is
@@ -1152,7 +1153,9 @@ reads the stanza and the imports of the adapter's modules to check all of this,
 without a VM.
 
 One owner is one supervised worker. There is no pool, no scheduler across owners,
-no thread or timer of the adapter's own, and no new supervisor: it composes
+no thread or timer of the adapter's own, and no new supervisor (a scheduled owner,
+below, is the opt-in owner that serves tasks, and shares none of this adapter's
+queue): it composes
 `withVmOwner` with `startSupervised`, `workerDefinition` and `awaitSupervised`.
 
 ### Creation and readiness
@@ -1400,7 +1403,7 @@ starts no thread, owns no VM and supervises nothing. It runs a task's segment an
 closes a task's continuation through the two actions of a `TaskHost`, so it is
 exercised against scripted segment outcomes and is independent of how coroutines
 come to exist (LUA-20). The scheduled owner that hosts it on a supervised worker with
-real VMs is LUA-6; the finite-call adapter above is unchanged. Its module imports
+real VMs is LUA-6, below; the finite-call adapter above is unchanged. Its module imports
 nothing of the VM, the bridge, the registration, supervision, GLFW, Vulkan, the
 console or a game: only `base`, the foundation's clock and the protocol model, and
 `Test.LuaRuntime.Scheduler.Structure` reads its imports to check that.
@@ -1623,7 +1626,7 @@ Given the same configuration, policy, admitted tasks, segment outcomes and grant
 tasks run in the same order whatever the budget and wherever a turn is cut. Elapsed waits are
 the exception, since a deadline reached changes readiness; the order among tasks already
 ready is unaffected. Arbitrary elapsed-time workloads are not promised the same trace from
-one run to the next. The proof on a real VM is LUA-6's.
+one run to the next. The proof on real VMs is the scheduled owner's, below.
 
 `readDiagnostics` is a snapshot of bounded counters and gauges that borrows nothing from a Lua
 state: admitted and rejected work, queue and active high-water marks, completed, yielded,
@@ -1641,6 +1644,135 @@ not-yet-supported. One example arms the production timer and blocks in STM until
 arrives. Cancellation and shutdown windows are the kind an asynchronous-exception race can
 hide on one platform, so CI, which runs them on Linux, is the evidence for them and a local
 pass is not.
+
+## The scheduled owner
+
+`Hetoimasia.Scripting.Lua.Scheduled` (LUA-6, in `runtime-lua`) hosts the host's task
+coroutines (LUA-20) and the scheduling machinery (LUA-21) on a supervised worker with a
+real VM. It adds no scheduling of its own: which task runs next, what a tick or a
+deadline is, how a budget ends a turn and how pause, resume and stop apply are the
+scheduler's, documented above. The finite-call owners of the runtime adapter are
+unchanged and stay the way to run a call; an application opts into a scheduled owner,
+which admits all executable work as tasks (finite work is a task that completes in one
+segment). A finite-call owner and a scheduled owner never run the same VM, and any
+number of each can be created and retired while the others run.
+
+### Creation and readiness
+
+`startScheduledOwner` validates the scheduler's configuration (caps and quanta through the
+model's `validateLimits`, the grant and control bounds, the budget) before anything starts,
+raising `SchedulerRefused` naming every violation, then starts exactly one worker through
+`startSupervised`. The VM is constructed, its bindings installed, its initial chunks run
+and its modules loaded inside `withVmOwner` on the worker's thread; only then is
+readiness published and an endpoint returned. Readiness is awaited through
+`awaitSupervised` composed with the worker's outcome, never the startup acknowledgement,
+and acquisition is masked exactly as for a finite-call owner. A failure of initialization
+ends creation under the owner's `WorkerPolicy`.
+
+### Identity
+
+An owner has the `OwnerId` its `LuaRuntime` issues, from the one counter finite-call
+owners use. A task is named by a `ScheduledTaskId`: the owner's identity and the model's
+`TaskId` the owner issues from a counter that never rewinds. It is unique within the
+runtime and never reissued, after the task settles and is observed and after its owner
+retires. It is never an OS thread, a `ThreadId` or a coroutine, and neither it nor the
+application's optional name for the task grants authority. The model's `TaskId` is scoped
+by a `SessionKey` made from the owner's label, the configured domain and the owner's
+sequence number, so the model's two domains limit neither owners nor tasks, and
+`Test.Lua.Protocol` is untouched.
+
+### Admission, settlement and tickets
+
+`admitScheduledTask` admits a task (module entry, bounded arguments, class, kind, optional
+name). It never blocks and answers `TaskAccepted` with the identity and a ticket,
+`TaskQueueFull` or `TaskAdmissionClosed`. Arguments are evaluated, checked against the
+owner's value limits and copied on the producer's thread; arguments over the limits are
+accepted and settle as the refusal the argument check raises. Every accepted task settles
+exactly once, as `SettledReturned`, `SettledFaulted` (a script fault returned as data,
+never a worker failure), `SettledRefused` (the scheduler refused a wait: a recoverable
+failure of that task), `SettledCancelled` (a stop request) or `SettledDiscarded` (the owner
+exited first, with the exit kind and whether the task had begun).
+
+Reading a ticket is observing it, as for a finite call's: the first read that finds the
+task finished takes its result and gives its reservation back, and every later read, on
+any thread, answers the same settlement. `forgetTask` gives a finished task's reservation
+back at once and an unfinished one's when the owner next sweeps after it finishes. The
+engine keeps no other history of terminal results: the retained cells are bounded by the
+reservations.
+
+A wait is refused from inside a Lua callback, scheduled-owner creation, `waitTask`,
+`awaitTask`, `waitControl`, `awaitControl` and `awaitTicksComplete` included, with
+`CallbackWaitRefused`, and so is an action built outside the callback; a task waits by
+yielding. `awaitTicksComplete` ends with `TickOwnerEnded`, never a false completion, when
+the owner exits with a tick outstanding.
+
+### Time, control and what a script is told
+
+A script waits through a wait operation the application registered with `waitOperation`:
+its first argument, an integer, is the number of ticks of a `WaitLogical` wait or the
+nanoseconds of a `WaitElapsed` one; anything else is read as none and refused by the
+scheduler as a wait for nothing, so the operation's schema should require one integer.
+`grantScheduledStep` and `requestTaskControl` are the scheduler's `grantStep` and
+`requestControl` for this owner. A resumed coroutine receives no value, so what the wait
+that ended earned (the tick reached and the granted duration, or the elapsed time) is told
+to the application on the owner's thread, before the segment that follows
+(`scheduledObserve`); a binding that should answer a script's question about its tick keeps
+what it was told where it reads it.
+
+### Idle
+
+An owner whose tasks are all paused, or waiting for an ungranted tick or a future
+deadline, enters no Lua and does no periodic work: it blocks in the scheduler's one STM
+wait until a stop request, an admission, a control request, a grant or its timer's wake. A
+stop request wakes it whatever its tasks wait for.
+
+### Host failures, stop and exit
+
+A Haskell failure raised by a binding's action, the application's liveness check or
+observer, or anything else escaping the owner, ends the worker as for a finite-call owner:
+the primary outcome with its own type and context, unconverted, judged by the owner's
+`WorkerPolicy`, whatever its type. A script fault only fails its task.
+
+Stopping the owner (`retireScheduled`, `stopSupervised`, the boundary closing) closes
+admission, grants and control at once, lets a running segment return (nothing is
+preempted, and a stuck segment keeps the worker, the VM and the binding dependencies
+live), settles every ticket (a finished task keeps its result, any other is discarded with
+the exit kind and whether it began), cancels the timer, discards the admissions that had
+not begun, and closes every suspended coroutine on the owner's thread, attempting each
+whatever another does. Closing errors are cleanup evidence on the owner's outcome, and a
+retained cleanup failure is fatal under any policy, as supervision decides for any worker
+(`WorkerCleanupFailed` when the worker was cancelled). `withVmOwner` then closes the VM.
+The same retirement runs when the owner fails or is cancelled, with the way it exited
+recorded, so a primary host failure or cancellation survives beside the evidence. The
+`ExitRecord` is the finite-call adapter's: it names the owner and counts the tasks it
+discarded, started and not started separately, and carries no cleanup evidence.
+
+### Determinism
+
+On one owner with a fixed policy and configuration, the same admitted tasks, grants and
+control requests, each made at the same logical point (while the owner awaits the next
+grant), give the same sequence of segments, the same logical durations to each task and the
+same order of effects recorded through a binding, however long the segments take and
+whether budgets expire. It is a property of the scheduler's documented ordering, and holds
+for logical-time work: elapsed waits legitimately change readiness with real time, are not
+covered by it, and are tested separately. A control request that arrives in the middle of a
+step is not ordered logically here: deterministic logical admission of controls is the
+script-instance layer's (LUA-18). No claim is made across policies, worker counts,
+platforms or versions.
+
+### What proves it
+
+`Test.LuaRuntime.Scheduled.*`, in `lua-runtime-tests`, run real Lua tasks as coroutines on
+real supervised scheduled owners, under an injected clock and a fake timer whose wakes the
+example fires, with gates and STM signals instead of sleeps: the policy, classes, quanta,
+one-shot placement, grants, elapsed waits, budgets and control end to end; creation,
+readiness and identity across cycles; every outcome, every bound, a thousand admissions
+racing control requests and a stop, and a ticket's reservation; idle and stop, with
+closing errors retained; host failures, failure and cancellation; the refused waits and tick
+completion; and repeated runs of one workload under different delays and budgets. The
+cancellation and shutdown windows are the kind an asynchronous-exception race can hide on
+one platform, so CI, which runs them on Linux, is the evidence for them and a local pass is
+not.
 
 ## The protocol model
 
@@ -1829,7 +1961,7 @@ worker unwound.
 | Slice | What it takes from this model |
 | --- | --- |
 | LUA-21, the scheduling machinery | `Session` admission and its caps, `ServiceClass`, `Quanta` and `validateLimits`, `Ordinal`, the ready, waiting and paused states and their transitions, `activateNext`, `stopSession` |
-| LUA-6, the scheduled owner | the same, through LUA-21's machinery, with `TaskId` and the session's scope |
+| LUA-6, the scheduled owner | the same, through LUA-21's machinery, with `TaskId` scoped by the owner's identity and wrapped in `ScheduledTaskId` |
 | LUA-7, requests and subscriptions | `RequestId`, `Settlement`, `Reply`, the two obligations, `OverloadPolicy` |
 | LUA-9, the child-process transport | every identity, `Payload`, `Reply`, `SegmentOutcome`, the rejection vocabulary |
 | LUA-5, supervision integration | `Limits` and `validateLimits`, for the two caps its call dispatch has (`maxQueuedAdmissions`, `maxRetainedResults`) |
