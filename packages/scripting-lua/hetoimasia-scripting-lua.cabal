@@ -48,8 +48,14 @@ description:
     real VMs: tasks are admitted without blocking, each settles exactly once, an
     idle owner blocks in one STM wait, a stop closes every suspended coroutine on
     the owner's thread and keeps closing errors as cleanup evidence, and the same
-    logical-time workload runs identically however long its segments take. The
-    confined path is a later slice.
+    logical-time workload runs identically however long its segments take. Script
+    instances run on those owners: each is a module's behavior with a fresh state
+    of its own, optional init, run and shutdown hooks and functions it connected
+    to bounded, ordered event deliveries, one invocation in flight at a time as a
+    scheduler task, paused, resumed and stopped by request at safe boundaries,
+    ended through one path that revokes its connections, closes its coroutine
+    before its shutdown hook and settles it exactly once, with failures isolated
+    unless the application escalates one. The confined path is a later slice.
 license: GPL-3.0-only
 license-file: LICENSE
 author: Vincent Coghlan
@@ -195,14 +201,20 @@ library runtime-lua
     hs-source-dirs: runtime-lua
     exposed-modules:
         Hetoimasia.Scripting.Lua.Runtime
+        Hetoimasia.Scripting.Lua.Instance
         Hetoimasia.Scripting.Lua.Scheduled
         Hetoimasia.Scripting.Lua.Scheduler
     other-modules:
+        Hetoimasia.Scripting.Lua.Instance.Driver
+        Hetoimasia.Scripting.Lua.Instance.Run
+        Hetoimasia.Scripting.Lua.Instance.State
+        Hetoimasia.Scripting.Lua.Instance.Types
         Hetoimasia.Scripting.Lua.Runtime.Admission
         Hetoimasia.Scripting.Lua.Runtime.Dispatch
         Hetoimasia.Scripting.Lua.Runtime.Shared
         Hetoimasia.Scripting.Lua.Runtime.Types
         Hetoimasia.Scripting.Lua.Scheduled.Run
+        Hetoimasia.Scripting.Lua.Scheduled.Shared
         Hetoimasia.Scripting.Lua.Scheduled.Types
         Hetoimasia.Scripting.Lua.Scheduler.Policy
         Hetoimasia.Scripting.Lua.Scheduler.State
@@ -354,6 +366,15 @@ test-suite lua-runtime-tests
         Test.LuaRuntime.HostFailures
         Test.LuaRuntime.Identity
         Test.LuaRuntime.Independence
+        Test.LuaRuntime.Instance.Basics
+        Test.LuaRuntime.Instance.Capacity
+        Test.LuaRuntime.Instance.Control
+        Test.LuaRuntime.Instance.Determinism
+        Test.LuaRuntime.Instance.Events
+        Test.LuaRuntime.Instance.Failure
+        Test.LuaRuntime.Instance.Spec
+        Test.LuaRuntime.Instance.Stop
+        Test.LuaRuntime.Instance.Support
         Test.LuaRuntime.Readiness
         Test.LuaRuntime.Scheduled.Creation
         Test.LuaRuntime.Scheduled.Execution

@@ -239,7 +239,8 @@ module Hetoimasia.Scripting.Lua.Scheduled
 
 import Control.Concurrent.STM (STM, atomically, modifyTVar', newTVar, newTVarIO, orElse, readTVar, retry, writeTVar)
 import Control.Exception (ExceptionWithContext, SomeException, evaluate, mask, mask_, onException)
-import Control.Monad (join)
+import Control.Monad (forM, forM_, join)
+import qualified Data.List.NonEmpty as NonEmpty
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -273,7 +274,16 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Identity
   )
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Limits (Quanta (..), Quantum (..), ServiceClass (..))
 import Hetoimasia.Scripting.Lua.Internal.Value (checkLimits)
-import Hetoimasia.Scripting.Lua.Owner (ModuleRef (moduleRefName), VmConfig (vmOwnerName, vmValueLimits))
+import Hetoimasia.Scripting.Lua.Instance.Driver (connectNamespace, driverNamespaceName, driverSource)
+import Hetoimasia.Scripting.Lua.Instance.Types
+  ( InstanceConfig (instanceEscalate, instanceSources)
+  , InstanceViolation (RegistrationRefused)
+  , InstancesRefused (InstancesRefused)
+  , newInstances
+  , validateInstanceConfig
+  )
+import Hetoimasia.Scripting.Lua.Owner (ModuleRef (moduleRefName), VmConfig (vmModules, vmOwnerName, vmPolicy, vmRegistration, vmValueLimits))
+import Hetoimasia.Scripting.Lua.Registration (registration, registrationCapabilityTypes, registrationNamespaces)
 import Hetoimasia.Scripting.Lua.Runtime.Shared
 import Hetoimasia.Scripting.Lua.Runtime.Types
   ( CallbackWaitRefused (..)
@@ -339,6 +349,11 @@ data ScheduledSpec = ScheduledSpec
   , scheduledObserve ∷ SegmentContext → IO ()
     -- ^ Told, on the owner's thread, what each segment is about to be handed. An
     -- exception it raises is a failure of the host.
+  , scheduledInstances ∷ Maybe InstanceConfig
+    -- ^ Script instances, when the owner hosts any: their bounds, the event
+    -- sources it offers and the application's decision about an instance's
+    -- failure. 'Nothing' for an owner that serves tasks only, which loads no driver
+    -- and installs no binding for them.
   }
 
 -- | A configuration with the supplied defaults: the FIFO policy, the production
@@ -354,6 +369,7 @@ scheduledSpec config worker bounds =
     , scheduledClock = monotonicSource
     , scheduledTimer = systemTimerBackend
     , scheduledObserve = \_ → pure ()
+    , scheduledInstances = Nothing
     }
 
 -- | How creating a scheduled owner ended.
@@ -390,10 +406,35 @@ startScheduledOwner runtime spec = do
   owner ← issueOwnerId runtime
   tokenStop ← newTVarIO (pure False)
   closing ← newTVarIO False
-  let config = scheduledVm spec
-      label = vmOwnerName config
+  let base = scheduledVm spec
+      label = vmOwnerName base
       stopping = (||) <$> join (readTVar tokenStop) <*> readTVar closing
       scope = SessionKey (Owner (ModId label) (scheduledDomain spec)) (SessionId (ownerSequence owner)) firstEpoch
+  -- The owner's instances, when it hosts any: refused before anything starts if the
+  -- configuration does not fit the scheduler's own bounds, and given the driver, the
+  -- binding its @api@ reaches the owner through and a namespace to install it in.
+  hosted ← forM (scheduledInstances spec) $ \instanceConfig → do
+    let bounds = scheduledBounds spec
+        violations = validateInstanceConfig (boundRetainedResults bounds) (boundQueuedAdmissions bounds) instanceConfig
+    forM_ (NonEmpty.nonEmpty violations) $ \refused →
+      throwFailure runtimeComponent (operation "start-scheduled-owner") [] (InstancesRefused refused)
+    instances ← newInstances instanceConfig
+    let registered = vmRegistration base
+    merged ←
+      case registration (registrationCapabilityTypes registered) (registrationNamespaces registered <> [connectNamespace instances]) of
+        Right whole → pure whole
+        Left refusal →
+          throwFailure runtimeComponent (operation "start-scheduled-owner") [] . InstancesRefused $
+            RegistrationRefused (Text.pack (show refusal)) NonEmpty.:| []
+    pure (instances, instanceConfig, merged)
+  let config = case hosted of
+        Nothing → base
+        Just (_, instanceConfig, merged) →
+          base
+            { vmRegistration = merged
+            , vmPolicy = vmPolicy base <> [driverNamespaceName]
+            , vmModules = vmModules base <> [driverSource (instanceSources instanceConfig)]
+            }
   scheduler ←
     newScheduler
       SchedulerConfig
@@ -413,6 +454,8 @@ startScheduledOwner runtime spec = do
       <*> newTVarIO mempty
       <*> pure closing
       <*> newTVarIO Nothing
+      <*> pure stopping
+      <*> pure (fmap (\(instances, _, _) → instances) hosted)
   handoff ← newTVarIO Nothing
   let definition =
         workerDefinition
@@ -424,7 +467,7 @@ startScheduledOwner runtime spec = do
                 -- everything that already ended the owner has done this.
                 (\held → atomically (settleAll held ExitFailed))
           )
-          (\_ held → runScheduledOwner stopping held handoff (scheduledObserve spec) config)
+          (\_ held → runScheduledOwner stopping held handoff (scheduledObserve spec) (fmap (\(_, instanceConfig, _) → instanceEscalate instanceConfig) hosted) config)
   -- Acquisition is masked from the worker's start to the endpoint's handoff, and
   -- only the readiness wait is restored, exactly as for a finite-call owner.
   mask $ \restore → do
@@ -479,9 +522,6 @@ scheduledExitRecord = readTVar . controlExit . ownerControl
 -- | Whether the owner admits: it is ready and nothing has asked it to stop.
 admitting ∷ Control → STM Bool
 admitting control = not <$> schedulerClosed (controlScheduler control)
-
--- | Where an owner's tasks are admitted. Any thread may hold and use it.
-newtype ScheduledEndpoint = ScheduledEndpoint Control
 
 -- | The identity of the owner an endpoint belongs to.
 scheduledEndpointOwner ∷ ScheduledEndpoint → OwnerId

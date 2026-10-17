@@ -46,8 +46,12 @@ module Hetoimasia.Scripting.Lua.Internal.Module
     -- * Loading and calling
   , loadModule
   , callEntry
+  , callEntryVia
+  , entryDefined
+  , Lead (..)
   , Prepared (..)
   , prepareEntry
+  , prepareEntryWith
   , readResults
   , faultOf
   , effectNow
@@ -315,12 +319,55 @@ data Prepared
 prepareEntry
   ∷ HasCallStack
   ⇒ Host → FaultOperation → Operation → ModuleHandle → Text → [Value] → State → StackIndex → IO Prepared
-prepareEntry host op operationName handle name arguments state entry = do
+prepareEntry = prepareEntryWith NoLead
+
+-- | The function an entry point is run through, when it is not run directly.
+--
+-- A lead is another module's entry point, a driver, that is the function the
+-- coroutine or the call runs, and is handed the entry point looked up as its first
+-- argument, before the values. What is checked, built and declared of the
+-- arguments and the results is the driver's: the entry point is only looked up,
+-- and has to be declared by its own module. This is how an owner keeps state in
+-- its VM that a script reads but that is not a value: the driver holds it, and
+-- the entry point is called on it.
+data Lead
+  = NoLead
+  | -- | The driver's module and its entry point.
+    Lead !ModuleHandle !Text
+
+-- | 'prepareEntry' with an optional lead. With a lead the stack holds the
+-- driver's function, then the entry point, then the arguments; the count is of
+-- everything after the driver's function.
+prepareEntryWith
+  ∷ HasCallStack
+  ⇒ Lead → Host → FaultOperation → Operation → ModuleHandle → Text → [Value] → State → StackIndex → IO Prepared
+prepareEntryWith lead host op operationName handle name arguments state entry = do
   when (handleVm handle /= vmIdentity vm) (fault (ModuleRefused ModuleHandleForeign) NoEffect Nothing)
-  declared ← case [entryPoint | entryPoint ← handleEntries handle, entryName entryPoint == name] of
+  hookDeclared ← case [entryPoint | entryPoint ← handleEntries handle, entryName entryPoint == name] of
     entryPoint : _ → pure entryPoint
     [] → fault (ModuleRefused (EntryUndeclared name)) NoEffect Nothing
+  declared ← case lead of
+    NoLead → pure hookDeclared
+    Lead driver driverName → do
+      when (handleVm driver /= vmIdentity vm) (fault (ModuleRefused ModuleHandleForeign) NoEffect Nothing)
+      case [entryPoint | entryPoint ← handleEntries driver, entryName entryPoint == driverName] of
+        entryPoint : _ → pure entryPoint
+        [] → fault (ModuleRefused (EntryUndeclared driverName)) NoEffect Nothing
   setRunContext vm (moduleRefName ref, moduleRefVersion ref, Just name)
+  case lead of
+    NoLead → pure ()
+    Lead driver driverName → do
+      driving ← lookupEntry state (handleSlot driver) driverName
+      case driving of
+        LookupFunctionOnStack → pure ()
+        LookupStatus status → do
+          value ← renderFailure state entry
+          lua_settop state entry
+          raiseEscape vm
+          fault (ScriptFailed (classify status) value) NoEffect Nothing
+        _ → do
+          lua_settop state entry
+          fault (InternalError "the driver's entry point is not a function of its module") NoEffect Nothing
   found ← lookupEntry state (handleSlot handle) name
   case found of
     LookupStatus status → do
@@ -334,7 +381,7 @@ prepareEntry host op operationName handle name arguments state entry = do
     LookupAbsent → do
       lua_settop state entry
       raiseEscape vm
-      case entryRequirement declared of
+      case entryRequirement hookDeclared of
         Optional → pure PreparedAbsent
         Required → fault (EntryMissing False) NoEffect Nothing
     LookupNotFunction → do
@@ -369,8 +416,11 @@ prepareEntry host op operationName handle name arguments state entry = do
           fault (ScriptFailed (classify status) value) NoEffect Nothing
         PushMalformed which →
           lua_settop state entry >> fault (InternalError ("an argument could not be built: " <> Text.pack (show which))) NoEffect Nothing
-      pure (PreparedReady declared (length arguments))
+      pure (PreparedReady declared (length arguments + leading))
   where
+    leading = case lead of
+      NoLead → 0
+      Lead {} → 1
     vm = hostVm host
     boundary = hostBoundary host
     context = boundaryContext boundary
@@ -425,7 +475,33 @@ readResults host state entry expected count = do
 -- a required entry point that is gone, an entry point that is present and not a
 -- function. An optional entry point that is absent answers 'EntryAbsent'.
 callEntry ∷ HasCallStack ⇒ Host → ModuleHandle → Text → [Value] → IO CallResult
-callEntry host handle name arguments =
+callEntry = callEntryWith NoLead
+
+-- | Call an entry point through a driver's entry point: see 'Lead'. Nothing in the
+-- call can suspend: a scheduler operation it reaches is refused as it is for any
+-- call.
+callEntryVia ∷ HasCallStack ⇒ Host → ModuleHandle → Text → ModuleHandle → Text → [Value] → IO CallResult
+callEntryVia host driver driverName = callEntryWith (Lead driver driverName) host
+
+-- | Whether a module defines an entry point as a function, looked up by raw access
+-- as a call looks it up. Runs nothing of the module.
+entryDefined ∷ HasCallStack ⇒ Host → ModuleHandle → Text → IO Bool
+entryDefined host handle name =
+  withOpenVm vm (operation "lookup-entry") $ \state → do
+    entry ← lua_gettop state
+    when (handleVm handle /= vmIdentity vm) $
+      throwFailure luaComponent (operation "lookup-entry") [] $
+        (faultOf host CallEntry (handleModule handle) (Just name) (ModuleRefused ModuleHandleForeign)) {boundaryEffect = NoEffect}
+    found ← lookupEntry state (handleSlot handle) name
+    lua_settop state entry
+    pure $ case found of
+      LookupFunctionOnStack → True
+      _ → False
+  where
+    vm = hostVm host
+
+callEntryWith ∷ HasCallStack ⇒ Lead → Host → ModuleHandle → Text → [Value] → IO CallResult
+callEntryWith lead host handle name arguments =
   withOperationContext luaComponent callOperation [("module", moduleRefName ref), ("entry", name)] $
     withOpenVm vm callOperation $ \state → do
       entry ← lua_gettop state
@@ -440,7 +516,7 @@ callEntry host handle name arguments =
             lua_settop state entry
             raiseEscape vm
             fault reason effect trace
-      prepared ← prepareEntry host CallEntry callOperation handle name arguments state entry
+      prepared ← prepareEntryWith lead host CallEntry callOperation handle name arguments state entry
       case prepared of
         PreparedAbsent → pure EntryAbsent
         PreparedReady declared count → do
