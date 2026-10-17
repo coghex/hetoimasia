@@ -258,6 +258,7 @@ module Hetoimasia.Scripting.Lua.Instance
 import Control.Concurrent.STM (STM, atomically, retry)
 import Control.Exception (evaluate)
 import qualified Data.Map.Strict as Map
+import Data.List (nub)
 import Data.Text (Text)
 import GHC.Stack (HasCallStack)
 import Hetoimasia.Foundation.Messaging.Payload (prepare, preparedValue)
@@ -267,11 +268,11 @@ import Hetoimasia.Scripting.Lua.Instance.Run (gateOf)
 import qualified Hetoimasia.Scripting.Lua.Instance.State as State
 import Hetoimasia.Scripting.Lua.Instance.Types
 import Hetoimasia.Scripting.Lua.Internal.Value (Context (..), VmIdentity (VmIdentity), checkLimits, conformValue)
-import Hetoimasia.Scripting.Lua.Runtime.Shared (compact, refuseCallbackWait)
+import Hetoimasia.Scripting.Lua.Runtime.Shared (compact, compactName, compactRef, refuseCallbackWait)
 import Hetoimasia.Scripting.Lua.Runtime.Types (Payload (WithinBounds))
 import Hetoimasia.Scripting.Lua.Scheduled.Types (Control (controlInstances, controlLabel, controlLimits, controlOwner), ScheduledEndpoint (ScheduledEndpoint))
 import Hetoimasia.Scripting.Lua.Scheduler (ControlResult)
-import Hetoimasia.Scripting.Lua.Value (Value)
+import Hetoimasia.Scripting.Lua.Value (Value (VInteger, VRecord, VText))
 
 -- | Admit an instance, without waiting, from any thread.
 --
@@ -279,7 +280,18 @@ import Hetoimasia.Scripting.Lua.Value (Value)
 admitInstance ∷ ScheduledEndpoint → InstanceRequest → IO InstanceAdmission
 admitInstance (ScheduledEndpoint control) request = case controlInstances control of
   Nothing → pure InstanceAdmissionClosed
-  Just instances → atomically (State.admitInstance instances (gateOf control) (controlOwner control) request)
+  Just instances → do
+    -- What the owner keeps is copied to buffers of its own, and cut as the routing
+    -- strings of a task are; the grants are only the owner's own sources, once each.
+    kept ← evaluate (compacted instances)
+    atomically (State.admitInstance instances (gateOf control) (controlOwner control) kept)
+  where
+    compacted instances =
+      request
+        { instanceModule = compactRef (instanceModule request)
+        , instanceName = compactName <$> instanceName request
+        , instanceGrants = nub [grant | grant ← map compactName (instanceGrants request), Map.member grant (insSources instances)]
+        }
 
 -- | Deliver an event to the function an instance connected to a source, without
 -- waiting, from any thread. The payload is checked against the owner's limits and
@@ -290,7 +302,11 @@ deliverEvent (ScheduledEndpoint control) identity source payload = case controlI
   Just instances → case Map.lookup source (insSources instances) of
     Nothing → pure DeliveryUnknownTarget
     Just schema → do
-      within ← evaluate (checkLimits (controlLimits control) [payload])
+      -- The callback is handed the payload inside a record naming the source and
+      -- stamping the event, so the limits are checked on that record: a payload that
+      -- passes and whose event does not would fail the instance when it ran.
+      let stamped = VRecord [("source", VText source), ("sequence", VInteger 0), ("tick", VInteger 0), ("payload", payload)]
+      within ← evaluate (checkLimits (controlLimits control) [stamped])
       let context = Context {contextVm = foreignVm, contextTypeName = const Nothing, contextTypeNumber = const Nothing}
       conforming ← evaluate (conformValue context schema payload)
       case (within, conforming) of

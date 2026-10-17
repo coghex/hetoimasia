@@ -49,21 +49,20 @@ module Hetoimasia.Scripting.Lua.Instance.Run
   , serviceInstances
   , instanceSegment
   , instanceClosed
-  , reapInvocations
+  , settleEnded
   , retireInstances
   ) where
 
 import Control.Concurrent.STM (STM, atomically, modifyTVar', readTVar, readTVarIO, writeTVar)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeAsyncException, SomeException, fromException, mask_, rethrowIO, throwIO, try, tryWithContext)
 import Control.Monad (forM, forM_, unless, void, when)
-import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust)
 import Data.Sequence (ViewL (EmptyL, (:<)), viewl)
 import qualified Data.Set as Set
 import Data.Text (Text)
-import qualified Data.Text as Text
 import Data.Word (Word64)
 import Hetoimasia.Scripting.Lua.Instance.State
 import Hetoimasia.Scripting.Lua.Instance.Types
@@ -76,7 +75,7 @@ import Hetoimasia.Scripting.Lua.Internal.Task (startTaskVia)
 import Hetoimasia.Scripting.Lua.Owner
   ( BoundaryFault (boundaryTraceback)
   , CallResult (Returned)
-  , ModuleRef
+  , ModuleRef (moduleRefName)
   , OwnedVm
   , Task
   , TaskStart (TaskEntryAbsent, TaskStarted)
@@ -104,8 +103,10 @@ import Hetoimasia.Scripting.Lua.Scheduler
   , Scheduler
   , SegmentReport (ReportCompleted, ReportFailed, ReportYielded)
   , TaskKind (OneShot)
+  , TaskOutcome (OutcomeFailed)
   , TaskPhase (PhaseEnded, PhasePaused, PhaseQueued, PhaseReady, PhaseRunning, PhaseWaiting)
   , TaskRun (runTask)
+  , TerminalResult (ResultFailed)
   , TaskSpec (..)
   , admitTask
   , observeTask
@@ -163,6 +164,10 @@ data InstanceHost = InstanceHost
   , ihEndings ∷ !(IORef (Map Word64 Ending))
   , ihCreated ∷ !(IORef (Set.Set Word64))
   , ihMode ∷ !(IORef ExitMode)
+  , ihDeferred ∷ !(IORef [InstanceFailure])
+    -- ^ Failures the application decided to escalate while a coroutine was being
+    -- closed, where raising one would be taken for the close's failure: raised at
+    -- the owner's next safe point instead.
   }
 
 -- | The host of an owner's instances.
@@ -182,6 +187,7 @@ newInstanceHost control instances escalate owned driver handles tasks extra =
     <*> newIORef Map.empty
     <*> newIORef Set.empty
     <*> newIORef Serving
+    <*> newIORef []
 
 -- | What the scheduler answers the instance layer's transactions.
 gateOf ∷ Control → Gate
@@ -220,7 +226,7 @@ scheduler' = controlScheduler . ihControl
 -- wake.
 serviceInstances ∷ InstanceHost → IO ()
 serviceInstances ih = do
-  reapInvocations ih
+  settleEnded ih
   jobs ← atomically (takeJobs (ihInstances ih))
   forM_ jobs $ \case
     JobStart number → withCell ih number (startInstance ih)
@@ -246,16 +252,50 @@ withCell ih number action = do
     settled ← isJust <$> readTVarIO (icResult cell)
     unless settled (action cell)
 
--- | Give the scheduler's result storage back for every invocation that has ended.
+-- | Give the scheduler's result storage back for every invocation that has ended
+-- and that the instance layer has accounted for: its instance no longer takes it
+-- to be in flight. One the scheduler ended on its own, which the instance has not
+-- heard of, is left for 'settleEnded'.
 reapInvocations ∷ InstanceHost → IO ()
 reapInvocations ih = do
   live ← readIORef (ihLive ih)
-  gone ← atomically . fmap concat . forM (Map.keys live) $ \task →
+  gone ← atomically . fmap concat . forM (Map.toList live) $ \(task, held) →
     taskPhase (scheduler' ih) task >>= \case
-      Just (PhaseEnded _) → [task] <$ observeTask (scheduler' ih) task
+      Just (PhaseEnded _) → do
+        accounted ← accountedFor ih task held
+        if accounted then [task] <$ observeTask (scheduler' ih) task else pure []
       Nothing → pure [task]
       _ → pure []
   modifyIORef' (ihLive ih) (\held → foldr Map.delete held gone)
+
+-- | Whether the instance layer has accounted for the end of an invocation's task:
+-- its instance no longer takes the task to be in flight.
+accountedFor ∷ InstanceHost → TaskId → Live → STM Bool
+accountedFor ih task held = do
+  cells ← readTVar (insCells (ihInstances ih))
+  case Map.lookup (liveSlot held) cells of
+    Nothing → pure True
+    Just cell → (/= Just task) . isActive <$> readTVar (icState cell)
+
+-- | Account for the invocations the scheduler ended without the instance layer
+-- ending them: a wait it refused, which fails the task, is the instance's failure.
+-- Then give back what ended invocations held.
+settleEnded ∷ InstanceHost → IO ()
+settleEnded ih = do
+  live ← readIORef (ihLive ih)
+  forM_ (Map.toList live) $ \(task, held) → do
+    ended ← atomically $ do
+      phase ← taskPhase (scheduler' ih) task
+      case phase of
+        Just (PhaseEnded _) → do
+          accounted ← accountedFor ih task held
+          if accounted then pure Nothing else observeTask (scheduler' ih) task
+        _ → pure Nothing
+    forM_ ended $ \terminal → withCell ih (liveSlot held) $ \cell → case terminal of
+      ResultFailed failure → invocationFailed ih cell (liveStage held) (ErrorRefusedWait failure)
+      _ → invocationCompleted ih cell (liveStage held)
+  reapInvocations ih
+  raiseDeferred ih
 
 -- Starting ----------------------------------------------------------------------------
 
@@ -361,7 +401,7 @@ dispatch ih cell = do
     entry = \case
       StageEvent source → eventEntry source
       _ → "run"
-    behavior stage = Text.pack (show (icModule cell)) <> "/" <> entry stage
+    behavior stage = moduleRefName (icModule cell) <> "/" <> entry stage
 
 -- | Run one segment of an instance's invocation, on behalf of the scheduler.
 --
@@ -460,16 +500,26 @@ invocationFailed ih cell stage failure = do
   atomically (modifyTVar' (icState cell) (\state → state {isActive = Nothing}))
   beginStop ih cell EndFailed (Just (Primary phase stage failure))
 
--- | A coroutine of the scheduler was closed, by a stop or by the owner's own: the
--- instance whose invocation it was is ended, after its coroutine, which is already
--- closed.
+-- | A coroutine of the scheduler was closed: by a stop, by the owner's own, or
+-- because its task ended while it was suspended, as a task whose wait the scheduler
+-- refused does. The instance whose invocation it was ends after its coroutine,
+-- which is already closed: as failed, if the scheduler failed the task, and as
+-- stopped otherwise.
 instanceClosed ∷ InstanceHost → TaskId → IO ()
 instanceClosed ih task = do
   held ← Map.lookup task <$> readIORef (ihLive ih)
   forM_ held $ \live → withCell ih (liveSlot live) $ \cell → do
+    failed ← atomically $
+      taskPhase (scheduler' ih) task >>= \case
+        Just (PhaseEnded OutcomeFailed) → observeTask (scheduler' ih) task
+        _ → pure Nothing
+    phase ← isPhase <$> readTVarIO (icState cell)
     atomically (modifyTVar' (icState cell) (\state → state {isActive = Nothing}))
-    beginEnding' ih cell EndStopped Nothing
-    finishEnding ih cell 1
+    case failed of
+      Just (ResultFailed failure) →
+        beginEnding' ih cell EndFailed (Just (Primary phase (liveStage live) (ErrorRefusedWait failure)))
+      _ → beginEnding' ih cell EndStopped Nothing
+    finishEnding ih cell 1 True
 
 -- Control --------------------------------------------------------------------------------
 
@@ -528,7 +578,7 @@ beginStop ih cell reason primary = do
       case asked of
         ControlAccepted ticket → atomically (forgetControl ticket)
         _ → pure ()
-    Nothing → finishEnding ih cell 0
+    Nothing → finishEnding ih cell 0 False
 
 -- | Record how an instance is ending, once, and close what it accepts.
 beginEnding' ∷ InstanceHost → ICell → EndReason → Maybe Primary → IO ()
@@ -537,11 +587,19 @@ beginEnding' ih cell reason primary = do
   unless already $
     modifyIORef' (ihEndings ih) (Map.insert (icId cell) (Ending reason primary connections unstarted))
 
+-- | Raise what the application decided to escalate while a coroutine was being
+-- closed, now that nothing is.
+raiseDeferred ∷ InstanceHost → IO ()
+raiseDeferred ih = do
+  pending ← readIORef (ihDeferred ih)
+  writeIORef (ihDeferred ih) []
+  forM_ (take 1 pending) (throwIO . InstanceEscalated)
+
 -- | Finish ending an instance: its @shutdown@ hook, once, the release of its
 -- record in the VM, and its settlement, once. The application is then told if it
 -- failed.
-finishEnding ∷ InstanceHost → ICell → Int → IO ()
-finishEnding ih cell closed = do
+finishEnding ∷ InstanceHost → ICell → Int → Bool → IO ()
+finishEnding ih cell closed closing = do
   settled ← isJust <$> readTVarIO (icResult cell)
   unless settled $ do
     ending ← Map.findWithDefault (Ending EndStopped Nothing 0 0) (icId cell) <$> readIORef (ihEndings ih)
@@ -624,7 +682,12 @@ finishEnding ih cell closed = do
       (True, Just _, Unorderly _) → pure ()
       (True, Just failed, _) → do
         decision ← ihEscalate ih failed
-        when (decision == Escalate) $ throwIO (InstanceEscalated failed)
+        -- Raised here, unless a coroutine's close is what is running, where the
+        -- scheduler would take it for the close's failure: then at the next safe point.
+        when (decision == Escalate) $
+          if closing
+            then modifyIORef' (ihDeferred ih) (<> [failed])
+            else throwIO (InstanceEscalated failed)
       _ → pure ()
 
 -- Exit ---------------------------------------------------------------------------------------
@@ -652,11 +715,16 @@ retireInstances ih = do
       settled ← isJust <$> readTVarIO (icResult cell)
       unless settled $ case mode of
         Unorderly _ → discard ih cell
-        _ → beginEnding' ih cell EndStopped Nothing >> finishEnding ih cell 0
+        _ → beginEnding' ih cell EndStopped Nothing >> finishEnding ih cell 0 False
     case ended of
       Left failure → [failure] <$ discardUnsettled ih cell
       Right () → pure []
-  forM_ (take 1 (concat failures)) throwIO
+  pending ← readIORef (ihDeferred ih)
+  writeIORef (ihDeferred ih) []
+  case (concat failures, pending) of
+    (failure : _, _) → throwIO failure
+    ([], failed : _) → throwIO (InstanceEscalated failed)
+    _ → pure ()
 
 -- | Settle an instance that is still unsettled as discarded, because its end could
 -- not be carried through.
@@ -681,4 +749,4 @@ discard ih cell = do
   settled ← isJust <$> readTVarIO (icResult cell)
   unless settled $ do
     beginEnding' ih cell EndStopped Nothing
-    finishEnding ih cell 0
+    finishEnding ih cell 0 False

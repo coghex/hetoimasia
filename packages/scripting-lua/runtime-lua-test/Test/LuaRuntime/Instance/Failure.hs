@@ -12,6 +12,7 @@ import Hetoimasia.Scripting.Lua.Instance
 import Hetoimasia.Scripting.Lua.Owner (BoundaryFault (boundaryReason), FaultReason (SuspendRefused))
 import Hetoimasia.Scripting.Lua.Runtime (CallFault (BoundaryFailed), Discard (Discard), ExitKind (ExitFailed), Progress (Started))
 import Hetoimasia.Scripting.Lua.Scheduled
+import Hetoimasia.Runtime.Supervision (WorkerStatus (WorkerUnavailable))
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Scheduled.Support (awaitEffect, awaitScheduledTerminal)
@@ -118,6 +119,24 @@ spec = describe "failure" $ do
       expectDelivered fixture owner "b" 1
       awaitEffect (sf fixture) "tick 2 n=1 seq=0 t=0 count=1"
 
+  it "fails an instance whose callback asked for a wait the scheduler refused, runs its shutdown, and leaves its peer running" $ bounded $ do
+    fixture ← newIFixture
+    withBoundary $ \_ runtime → do
+      owner ← startInstances fixture runtime "refused wait" [badWait, echoer] (testConfig instanceBounds') requiredPolicy
+      _ ← admit fixture owner "a" (moduleNamed "badwait")
+      _ ← admit fixture owner "b" (moduleNamed "echoer")
+      awaitPhase fixture owner "a" Active
+      awaitPhase fixture owner "b" Active
+      expectDelivered fixture owner "a" 1
+      settled ← awaitSettled fixture "a"
+      resultPhase settled `shouldBe` Failed
+      failure ← expectFailure settled
+      failureStage failure `shouldBe` StageEvent "tick"
+      failureError failure `shouldSatisfy` \case ErrorRefusedWait _ → True; _ → False
+      logged fixture >>= (`shouldSatisfy` elem "shutdown 1 failed")
+      expectDelivered fixture owner "b" 1
+      awaitEffect (sf fixture) "tick 2 n=1 seq=0 t=0 count=1"
+
   it "keeps an instance's primary failure primary when its shutdown fails as well" $ bounded $ do
     fixture ← newIFixture
     withBoundary $ \_ runtime → do
@@ -196,6 +215,24 @@ spec = describe "failure" $ do
       _ → False
     fmap (terminationShutdown . resultTermination) b `shouldBe` Just ShutdownSkippedUnsafe
     logged fixture >>= (`shouldBe` ["init 1"])
+
+  it "raises the application's escalation of a failure met while a stop closes a coroutine as the owner's own failure, which its policy decides" $ bounded $ do
+    fixture ← newIFixture
+    let config = (testConfig instanceBounds') {instanceEscalate = \_ → pure Escalate}
+        recognizes failure = isJust (fromException failure ∷ Maybe InstanceEscalated)
+    withBoundary $ \control runtime → do
+      owner ← startInstances fixture runtime "escalated stop" [waitBadShutdown] config (optionalPolicy recognizes)
+      _ ← admit fixture owner "a" (moduleNamed "waitbadshutdown")
+      awaitPhase fixture owner "a" Active
+      expectDelivered fixture owner "a" 1
+      awaitDiagnosticsWaiting owner
+      _ ← settleControl fixture owner "a" InstanceStop
+      -- The owner is unavailable as an optional owner whose policy recognizes the
+      -- escalation: it was not mistaken for a failure of the close, which is fatal.
+      awaitScheduledTerminal control owner >>= (`shouldSatisfy` \case WorkerUnavailable _ → True; _ → False)
+      settled ← awaitSettled fixture "a"
+      resultPhase settled `shouldBe` Failed
+      fmap failureStage (failureOf' settled) `shouldBe` Just StageShutdown
 
   it "keeps the failure of closing a coroutine as cleanup evidence for supervision, whatever the application's escalation answers" $ bounded $ do
     fixture ← newIFixture

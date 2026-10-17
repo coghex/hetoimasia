@@ -83,7 +83,7 @@ import Data.Word (Word64)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Identity (TaskId)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Limits (ServiceClass)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Task (TaskFailure)
-import Hetoimasia.Scripting.Lua.Owner (ModuleRef)
+import Hetoimasia.Scripting.Lua.Owner (ModuleRef, maxEntries)
 import Hetoimasia.Scripting.Lua.Registration (validName)
 import Hetoimasia.Scripting.Lua.Runtime.Types (CallFault, Discard, OwnerId)
 import Hetoimasia.Scripting.Lua.Scheduler (ControlResult)
@@ -465,6 +465,9 @@ data InstanceViolation
   | DuplicateSource !Text
   | -- | A source's payload names a capability, which is a VM's.
     SourceCapability !Text
+  | -- | More sources than the driver module can declare an entry point for: how many
+    -- were given, and how many fit.
+    TooManySources !Int !Int
   | -- | The application's registration could not take the instance layer's
     -- namespace beside its own: what the registration refused.
     RegistrationRefused !Text
@@ -485,11 +488,14 @@ validateInstanceConfig schedulerRetained schedulerQueued config =
     <> [SchedulerRetainedTooSmall schedulerRetained (boundLiveInstances b) | schedulerRetained < 2 * boundLiveInstances b]
     <> [SchedulerQueueTooSmall schedulerQueued (boundLiveInstances b) | schedulerQueued < boundLiveInstances b]
     <> [InvalidSourceName (sourceName source) | source ← sources, validName (sourceName source) /= Nothing]
+    <> [TooManySources (length sources) sourceLimit | length sources > sourceLimit]
     <> [DuplicateSource name | name ← duplicated names]
     <> [SourceCapability (sourceName source) | source ← sources, hasCapability (sourcePayload source)]
   where
     b = instanceBounds config
     sources = instanceSources config
+    -- The driver declares five entry points of its own, and one for each source.
+    sourceLimit = maxEntries - 5
     names = map sourceName sources
     bounds =
       [ ("live instances", boundLiveInstances b)

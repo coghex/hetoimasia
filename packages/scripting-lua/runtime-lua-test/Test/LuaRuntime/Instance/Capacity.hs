@@ -9,7 +9,10 @@ import Control.Concurrent.STM (atomically)
 import Control.Exception (SomeException, fromException, try)
 import Control.Monad (forM, forM_, replicateM, void)
 import Data.List.NonEmpty (toList)
+import qualified Data.Text as Text
 import Hetoimasia.Scripting.Lua.Instance
+import Hetoimasia.Scripting.Lua.Owner (VmConfig (vmRegistration))
+import Hetoimasia.Scripting.Lua.Registration (namespace, registration, registrationNamespaces)
 import Hetoimasia.Scripting.Lua.Runtime (LuaRuntime)
 import Hetoimasia.Scripting.Lua.Scheduled
 import Hetoimasia.Scripting.Lua.Value (Schema (SCapability, SInteger, SList, SRecord))
@@ -130,6 +133,19 @@ spec = describe "capacity" $ do
         >>= (`shouldBe` [InvalidSourceName "bad name", DuplicateSource "tick"])
       refusedWith fixture runtime base {instanceSources = [EventSource "held" (SRecord [("a", SList (SCapability "thing"))])]}
         >>= (`shouldBe` [SourceCapability "held"])
+      -- More sources than the driver can declare an entry point for.
+      let many = [EventSource ("source" <> Text.pack (show n)) SInteger | n ← [1 .. 60 ∷ Int]]
+      refusedWith fixture runtime base {instanceSources = many} >>= (`shouldBe` [TooManySources 60 59])
+      -- A registration that already holds the layer's namespace cannot take it.
+      taken ← try @SomeException $ do
+        let plain = instanceSpec fixture "taken" [echoer] base requiredPolicy defaultSchedulerBounds
+            existing = either (error . show) id (registration [] (registrationNamespaces (vmRegistration (scheduledVm plain)) <> [namespace "hetoimasia_instance" []]))
+        startScheduled (sf fixture) runtime plain {scheduledVm = (scheduledVm plain) {vmRegistration = existing}}
+      case taken of
+        Left failure → case fromException failure of
+          Just (InstancesRefused violations) → [reason | RegistrationRefused reason ← toList violations] `shouldSatisfy` (not . null)
+          Nothing → fail ("expected the refusal of the registration, found " <> show failure)
+        Right _ → fail "the registration should have been refused"
 
   it "settles every accepted instance exactly once when admissions race the owner's retirement" $ bounded $ do
     fixture ← newIFixture

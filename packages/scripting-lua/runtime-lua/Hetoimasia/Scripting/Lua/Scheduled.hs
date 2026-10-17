@@ -15,6 +15,14 @@
 -- owner and a scheduled owner never run the same VM, and any number of each can be
 -- created and retired while the others run.
 --
+-- = Script instances
+--
+-- An owner created with a 'scheduledInstances' configuration also hosts script
+-- instances, which "Hetoimasia.Scripting.Lua.Instance" documents: modules' behavior
+-- with a @self@ of their own, hooks and event callbacks, whose invocations are tasks
+-- of this owner's scheduler and so are ordered by its policy among its tasks. An
+-- owner without the configuration loads nothing for them and behaves as it did.
+--
 -- = Creation and readiness
 --
 -- 'startScheduledOwner' validates the scheduler's configuration (the caps and the

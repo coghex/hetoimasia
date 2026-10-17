@@ -11,10 +11,10 @@ import Data.Maybe (mapMaybe)
 import qualified Data.Text as Text
 import Hetoimasia.Scripting.Lua.Instance
 import Hetoimasia.Scripting.Lua.Scheduled
-import Hetoimasia.Scripting.Lua.Value (Value (VInteger, VText))
+import Hetoimasia.Scripting.Lua.Value (Value (VInteger, VText), valueLimits)
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Support
-import Test.LuaRuntime.Scheduled.Support (awaitEffect, awaitEntered, releaseGate)
+import Test.LuaRuntime.Scheduled.Support (awaitEffect, awaitEntered, defaultSchedulerBounds, releaseGate)
 import Test.LuaRuntime.Support (bounded, requiredPolicy, withBoundary)
 
 spec ∷ Spec
@@ -109,6 +109,20 @@ spec = describe "events" $ do
       awaitEntered (sf fixture) "shutdown"
       deliverTick fixture owner "closing" 1 >>= (`shouldBe` DeliveryClosed)
       releaseGate (sf fixture) "shutdown"
+
+  it "refuses a payload whose event, stamped with its source and sequence, is over the owner's limits, rather than failing the instance when it runs" $ bounded $ do
+    fixture ← newIFixture
+    withBoundary $ \_ runtime → do
+      -- The payload alone is twenty bytes; the record the callback is handed is more.
+      limits ← either (fail . show) pure (valueLimits 90 8 4096)
+      owner ←
+        startWith fixture runtime . withLimits limits $
+          instanceSpec fixture "limits" [echoer] (testConfig instanceBounds') requiredPolicy defaultSchedulerBounds
+      _ ← admit fixture owner "a" (moduleNamed "echoer")
+      awaitPhase fixture owner "a" Active
+      deliverTick fixture owner "a" 1 >>= (`shouldBe` DeliveryRefused)
+      phaseOf fixture owner "a" >>= (`shouldBe` Just Active)
+      snapshotOf fixture owner "a" >>= (`shouldSatisfy` \held → fmap snapshotQueued held == Just 0)
 
   it "keeps an accepted event's sequence and the logical tick it was admitted at, however long it waits" $ bounded $ do
     fixture ← newIFixture

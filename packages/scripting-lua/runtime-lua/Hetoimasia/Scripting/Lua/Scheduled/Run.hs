@@ -100,9 +100,9 @@ import Hetoimasia.Scripting.Lua.Instance.Run
   , instanceClosed
   , instanceSegment
   , newInstanceHost
-  , reapInvocations
   , retireInstances
   , serviceInstances
+  , settleEnded
   )
 import Hetoimasia.Scripting.Lua.Instance.Types (Escalation, InstanceFailure)
 import Hetoimasia.Scripting.Lua.Scheduled.Shared (closeSuspended, exitOf, settledOrRaise, waitReport)
@@ -250,7 +250,7 @@ serve stopping control handoff observe escalate config owned = mask $ \restore �
         Just ih → awaitWork scheduler `orElse` awaitInstanceWork ih
       forM_ instances serviceInstances
       report ← serviceTurn scheduler host
-      forM_ instances reapInvocations
+      forM_ instances settleEnded
       mask_ $ do
         modifyIORef' kept (<> turnCloseFailures report)
         atomically (sweepForgotten control)

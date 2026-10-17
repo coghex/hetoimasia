@@ -23,6 +23,8 @@ module Test.LuaRuntime.Instance.Support
   , failCallback
   , failBoth
   , failClose
+  , badWait
+  , waitBadShutdown
   , paced
   , holder
   , oneShot
@@ -42,6 +44,7 @@ module Test.LuaRuntime.Instance.Support
   , instanceSpec
   , startInstances
   , startWith
+  , withLimits
     -- * Admitting and driving
   , admit
   , admitWith
@@ -282,6 +285,29 @@ failClose =
     , "function shutdown(self, reason) " <> record <> "('shutdown ' .. reason) end"
     ]
 
+-- | A callback that waits, and a @shutdown@ that raises.
+waitBadShutdown ∷ ModuleSource
+waitBadShutdown =
+  hooksModule
+    "waitbadshutdown"
+    [ "function init(self, api)"
+    , "  api.connect('tick', function(self, event) sched.wait_ticks(1) end)"
+    , "end"
+    , "function shutdown(self, reason) error('shutdown boom') end"
+    ]
+
+-- | A callback that waits for no ticks, which the scheduler refuses.
+badWait ∷ ModuleSource
+badWait =
+  hooksModule
+    "badwait"
+    [ "function init(self, api)"
+    , "  self.id = inst.next()"
+    , "  api.connect('tick', function(self, event) sched.wait_ticks(0) end)"
+    , "end"
+    , "function shutdown(self, reason) " <> record <> "('shutdown ' .. self.id .. ' ' .. reason) end"
+    ]
+
 -- | Callbacks that cost time on the injected clock and yield between two records:
 -- their order against another instance's depends on the scheduler alone.
 paced ∷ ModuleSource
@@ -469,6 +495,10 @@ instanceSpec fixture label modules config worker bounds =
 startInstances ∷ IFixture → LuaRuntime → Text → [ModuleSource] → InstanceConfig → WorkerPolicy → IO ScheduledOwner
 startInstances fixture runtime label modules config worker =
   startScheduled (ifBase fixture) runtime (instanceSpec fixture label modules config worker defaultSchedulerBounds)
+
+-- | The same owner with these limits on every value that crosses for it.
+withLimits ∷ ValueLimits → ScheduledSpec → ScheduledSpec
+withLimits limits spec = spec {scheduledVm = (scheduledVm spec) {vmValueLimits = limits}}
 
 -- | Start an owner from a specification.
 startWith ∷ IFixture → LuaRuntime → ScheduledSpec → IO ScheduledOwner
