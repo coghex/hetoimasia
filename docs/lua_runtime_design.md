@@ -465,6 +465,16 @@ There is no VM pool, cross-VM scheduler or sharding framework until a concrete
 consumer needs one; P-10's caution about sharding stands. D-1's reasoning is
 unchanged.
 
+### D-16. Expose lifecycle control to Lua-authored code
+
+Owner direction, 2026-10-17: scripts should be able to control lifecycle,
+including pause, resume and stop. Application-only controls are not the desired
+endpoint. The owner also proposed IDs, control from Lua elsewhere, and a game
+terminal `ps` command listing scripts and status. Those proposals are retained
+under Q-9/Q-11: the target granularity, cross-owner authority, identity assignment
+and delivery scope still need clarification. This decision does not choose
+forced interruption, a global registry, a terminal implementation or readiness.
+
 ## Design
 
 P-1 through P-13 record the accepted contracts, with proof and delivery gates
@@ -1235,7 +1245,7 @@ does not itself renew readiness or approve issue processing.
 
 ### Q-9. Lifecycle-operation calls in LUA-6
 
-**Open; proposal, not an accepted decision (2026-10-17).** LUA-3/#462 decision
+**Partially resolved by D-16; scope remains open (2026-10-17).** LUA-3/#462 decision
 A1 and LUA-5 deliberately leave lifecycle bindings classified but not callable;
 their delivery placement was reserved for LUA-6's readiness renewal.
 
@@ -1247,10 +1257,11 @@ scheduler, interrupt a running segment, roll back effects or grant authority to
 control other owners. This does not add owner creation, reload, replacement,
 module loading, provider operations or confined execution.
 
-Alternative: keep lifecycle bindings `NotYetSupported` in LUA-6, with task
-controls available only to the hosting application, and explicitly defer
-script-facing lifecycle delivery to a later slice. That keeps LUA-6 smaller but
-leaves the author-facing transition requests unfinished.
+The owner accepted script-facing lifecycle control (D-16), so application-only
+controls are no longer the proposed endpoint. The owner additionally suggested
+controlling any Lua thread from Lua elsewhere. The original same-owner
+recommendation above is therefore not an accepted scope restriction. Q-11
+clarifies tasks versus VM owners and how IDs and cross-owner requests work.
 
 If the recommendation is accepted, the next design pass must specify request
 capacity, admission versus application results, ordering, invalid/stale targets,
@@ -1280,6 +1291,44 @@ multi-segment tasks; it is a broader change to LUA-5's delivery.
 
 The owner's choice gates the execution API and acceptance scope, not the
 already accepted requirement for explicit segments and transient coroutines.
+
+Owner response, 2026-10-17: the recommendation sounds right, but the owner
+requested a clearer explanation before choosing. It remains a proposal. A task
+is a running script instance that may yield and resume, not every Lua function
+invocation; a VM owner may hold many such tasks. Finite-call owners run one call
+to completion before taking the next; scheduled owners rotate among tasks at
+their explicit safe boundaries. Ordinary function calls inside a task remain
+ordinary Lua calls. Neither mode can forcibly pause arbitrary running code.
+
+### Q-11. Script identity, inspection and control across owners
+
+**Open; owner proposal, 2026-10-17.** The owner suggested an ID system, an API
+to request/set script IDs, pause/resume/stop from Lua elsewhere, and precise
+game-terminal control including `ps` to list scripts and their status.
+
+Verified prerequisite: LUA-5 already issues opaque, never-reissued `OwnerId`s
+within a `LuaRuntime`, with distinct identities across runtime instances and
+separate application labels (`packages/scripting-lua/README.md`, Identity).
+LUA-4 has scoped task IDs, but they are not yet a public scheduled-task API.
+Neither an owner ID nor a task ID should be confused with a source-file name,
+OS thread ID or Lua coroutine pointer.
+
+Recommendation pending signoff: target individual scheduled script tasks with
+engine-issued opaque IDs and optional application-assigned display names. A
+task ID identifies one running instance, even when several instances use the
+same source. Keep whole-owner control explicitly distinct. Expose bounded
+inspection snapshots and nonblocking control requests through an
+application-granted interface, potentially across owners of that application's
+runtime; the target owner applies requests at safe boundaries. Knowing an ID
+does not itself grant control. A terminal can build `ps` on the inspection API;
+whether a terminal command itself belongs in LUA-6 is not decided.
+
+Clarify with the owner before dependent design: task versus owner targets;
+cross-owner reach and grants; automatic IDs versus caller-selected identities
+or display names; and engine API versus delivery of the game's terminal UI.
+Self-pause needs another permitted controller to resume it. Stop ends future
+execution rather than becoming a resumable pause; completed effects are not
+rolled back. These distinctions must be visible in the eventual contract.
 
 ## Verification strategy
 
@@ -1588,7 +1637,7 @@ and verified policy, with adversarial regression coverage.
 ### LUA-6. Schedule cooperative tasks with bounded service turns
 
 > Deferred: readiness discussion opened 2026-10-17. LUA-5 and TIME-1 are
-> delivered; Q-9/Q-10 require owner choices and dependent reconciliation before
+> delivered; Q-9/Q-10/Q-11 require owner choices and dependent reconciliation before
 > readiness signoff. Earlier narrow renewals did not cover this slice.
 
 - **Outcome:** one trusted VM owner services resumable tasks fairly, wakes for
@@ -1606,7 +1655,7 @@ and verified policy, with adversarial regression coverage.
   only on explicit completion; elapsed budget cannot be sold as a hard limit.
 - **Out of scope:** automatic code rewriting, arbitrary priority API, simulation
   coordinator, CPU affinity/niceness tuning, performance pass/fail thresholds.
-- **Open questions:** Q-9, Q-10. Q-4's TIME-1 prerequisite is satisfied; consume
+- **Open questions:** Q-9, Q-10, Q-11. Q-4's TIME-1 prerequisite is satisfied; consume
   its existing clock API.
 
 ### LUA-7. Add bounded asynchronous requests and owned subscriptions
