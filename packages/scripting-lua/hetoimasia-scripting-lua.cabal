@@ -194,10 +194,12 @@ library runtime-lua
     visibility: public
     hs-source-dirs: runtime-lua
     exposed-modules:
+        Hetoimasia.Scripting.Lua.Lending
         Hetoimasia.Scripting.Lua.Runtime
         Hetoimasia.Scripting.Lua.Scheduled
         Hetoimasia.Scripting.Lua.Scheduler
     other-modules:
+        Hetoimasia.Scripting.Lua.Lending.Loan
         Hetoimasia.Scripting.Lua.Runtime.Admission
         Hetoimasia.Scripting.Lua.Runtime.Dispatch
         Hetoimasia.Scripting.Lua.Runtime.Shared
@@ -287,6 +289,7 @@ test-suite lua-host-tests
         Test.Lua.Owner.Independence
         Test.Lua.Owner.Matrix
         Test.Lua.Owner.Ownership
+        Test.Lua.Owner.Scope
         Test.Lua.Owner.Shutdown
         Test.Lua.Owner.Spec
         Test.Lua.Owner.Support
@@ -360,6 +363,7 @@ test-suite lua-runtime-tests
         Test.LuaRuntime.Scheduled.Settlement
         Test.LuaRuntime.Scheduled.Spec
         Test.LuaRuntime.Scheduled.Callbacks
+        Test.LuaRuntime.Scheduled.Lending
         Test.LuaRuntime.Scheduled.Lifecycle
         Test.LuaRuntime.Scheduled.Failures
         Test.LuaRuntime.Scheduled.Determinism

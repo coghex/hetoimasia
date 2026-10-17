@@ -1,7 +1,8 @@
 -- | Examples proving that 'Hetoimasia.Foundation.Resource.Scoped',
 -- 'Hetoimasia.Foundation.Resource.CleanupFailure', and the collection types of
--- "Hetoimasia.Foundation.Resource.Collection" are opaque to a client outside
--- the package.
+-- "Hetoimasia.Foundation.Resource.Collection" and
+-- "Hetoimasia.Foundation.Resource.OwnedCollection" are opaque to a client
+-- outside the package.
 --
 -- The other resource examples import the foundation directly, so they share
 -- this test suite's own module environment and cannot observe what the package
@@ -12,9 +13,9 @@
 -- library's @exposed-modules@ and each module's export list allow, which is the
 -- boundary the opacity claim is about.
 --
--- Fifteen clients are compiled: three for the scope facade, five for retained
--- cleanup evidence, and seven for the resource collection. Twelve must be
--- rejected, and each is checked against the specific diagnostic that names the
+-- Seventeen clients are compiled: three for the scope facade, five for retained
+-- cleanup evidence, seven for the resource collection, and two for the
+-- capability-owned collection. Fourteen must be rejected, and each is checked against the specific diagnostic that names the
 -- rejection's cause, so a missing package, an absent compiler, or an unrelated
 -- error can never be mistaken for the guarantee holding. Three must be
 -- accepted, linked, and run, which is both the control proving the environment
@@ -28,7 +29,8 @@
 -- evidence reachable only through the replacement would be lost. A forged or
 -- recast collection token, or a member's release reached from outside, would
 -- let a client release a member the collection still owns, or borrow a value
--- at a type it was never acquired at.
+-- at a type it was never acquired at. A forged owner capability would be
+-- authority over a collection that never issued it.
 --
 -- These are Hspec examples rather than a probe: the work is running a process
 -- and asserting on its output, which this suite already does elsewhere.
@@ -160,6 +162,18 @@ cleanupEvidenceSpec =
 collectionSpec ∷ Spec
 collectionSpec =
   describe "Collection opacity across the package boundary" $ do
+    it "rejects a client that names the owned collection constructor" $
+      withClient "Client.hs" (ownedConstructorClient "OwnedCollection (OwnedCollection)" "OwnedCollection") $ \compile → do
+        outcome ← compile Typecheck
+        rejectedBecause outcome "GHC-10237"
+        clientOutput outcome `shouldContain` "OwnedCollection"
+
+    it "rejects a client that names the owner capability constructor" $
+      withClient "Client.hs" (ownedConstructorClient "OwnerCapability (OwnerCapability)" "OwnerCapability") $ \compile → do
+        outcome ← compile Typecheck
+        rejectedBecause outcome "GHC-10237"
+        clientOutput outcome `shouldContain` "OwnerCapability"
+
     it "rejects a client that names the collection constructor" $
       withClient "Client.hs" (collectionConstructorClient "Collection (Collection)" "Collection") $ \compile → do
         outcome ← compile Typecheck
@@ -508,6 +522,19 @@ collectionConstructorClient imported typeName =
     , "import Hetoimasia.Foundation.Resource.Collection (" <> imported <> ")"
     , ""
     , "named ∷ Maybe " <> typeName <> (if typeName == "Member" then " ()" else "")
+    , "named = Nothing"
+    ]
+
+-- | A client that imports one capability-owned collection type together with its
+-- constructor.
+ownedConstructorClient ∷ String → String → String
+ownedConstructorClient imported typeName =
+  unlines
+    [ "module Client (named) where"
+    , ""
+    , "import Hetoimasia.Foundation.Resource.OwnedCollection (" <> imported <> ")"
+    , ""
+    , "named ∷ Maybe " <> typeName
     , "named = Nothing"
     ]
 

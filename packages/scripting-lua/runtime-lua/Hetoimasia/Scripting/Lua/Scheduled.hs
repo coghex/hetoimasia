@@ -120,6 +120,20 @@
 -- until one of: a stop request, an admission, a control request, a grant, or its
 -- timer's deadline. A stop request wakes it whatever its tasks are waiting for.
 --
+-- = Lending a collection
+--
+-- The owner's thread holds a resource collection that is owned by a capability and
+-- not by a thread, around the VM's lifetime, and lends it to each synchronous
+-- callback of its VM for exactly the callback's duration, so a binding's action
+-- can acquire, borrow and retire members on the owner's behalf even though it runs
+-- on a thread of its own. "Hetoimasia.Scripting.Lua.Lending" says what a binding
+-- asks for, and when and from where the loan is refused: after the callback has
+-- returned, from a thread it started, from another VM's callback. The collection
+-- holds at most 'scheduledMemberLimit' members. It stays open while the VM closes,
+-- so a coroutine's closing handlers and a finalizer-eligible binding still find
+-- it, and it closes after the VM, on the owner's thread, releasing what remains
+-- newest first.
+--
 -- = Host failures
 --
 -- A Haskell failure raised by a binding's action, or by the application's liveness
@@ -139,7 +153,9 @@
 -- VM and the binding dependencies live), settles every ticket, cancels its timer,
 -- discards the admissions that had not begun, and closes every suspended coroutine
 -- on its own thread, attempting each whatever another does, keeping their failures
--- as cleanup evidence. 'withVmOwner' then closes the VM. The same retirement runs
+-- as cleanup evidence. The VM is then closed, and then the owner's collection
+-- releases the members still live, a release that fails being cleanup evidence
+-- as well, fatal under any policy. The same retirement runs
 -- when the owner fails or is cancelled, with the way it exited recorded. The
 -- 'ExitRecord' names the owner and counts the tasks it discarded, started and not
 -- started separately; it is the finite-call adapter's record, and it carries no
@@ -161,6 +177,7 @@ module Hetoimasia.Scripting.Lua.Scheduled
   ( -- * Creating owners
     ScheduledSpec (..)
   , scheduledSpec
+  , defaultMemberLimit
   , ScheduledStart (..)
   , startScheduledOwner
 
@@ -239,7 +256,7 @@ module Hetoimasia.Scripting.Lua.Scheduled
 
 import Control.Concurrent.STM (STM, atomically, modifyTVar', newTVar, newTVarIO, orElse, readTVar, retry, writeTVar)
 import Control.Exception (ExceptionWithContext, SomeException, evaluate, mask, mask_, onException)
-import Control.Monad (join)
+import Control.Monad (join, when)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -247,6 +264,7 @@ import Data.Word (Word64)
 import GHC.Stack (HasCallStack)
 import Hetoimasia.Foundation.Messaging.Payload (prepare, preparedValue)
 import Hetoimasia.Foundation.Resource (allocResource)
+import Hetoimasia.Foundation.Resource.OwnedCollection (OwnedCollectionError (OwnedInvalidMemberLimit))
 import Hetoimasia.Foundation.Time (Duration, MonotonicSource, monotonicSource)
 import Hetoimasia.Foundation.Failure (operation, throwFailure)
 import Hetoimasia.Foundation.Worker (stopRequested, workerDefinition)
@@ -339,10 +357,15 @@ data ScheduledSpec = ScheduledSpec
   , scheduledObserve ∷ SegmentContext → IO ()
     -- ^ Told, on the owner's thread, what each segment is about to be handed. An
     -- exception it raises is a failure of the host.
+  , scheduledMemberLimit ∷ Int
+    -- ^ The most members the owner's collection holds live at once. At least one:
+    -- a lower limit is refused when the owner is created. See
+    -- "Hetoimasia.Scripting.Lua.Lending".
   }
 
 -- | A configuration with the supplied defaults: the FIFO policy, the production
--- clock and timer, the gameplay domain, and nothing observing segments.
+-- clock and timer, the gameplay domain, nothing observing segments and room for
+-- 'defaultMemberLimit' members in the owner's collection.
 scheduledSpec ∷ VmConfig → WorkerPolicy → SchedulerBounds → ScheduledSpec
 scheduledSpec config worker bounds =
   ScheduledSpec
@@ -354,7 +377,12 @@ scheduledSpec config worker bounds =
     , scheduledClock = monotonicSource
     , scheduledTimer = systemTimerBackend
     , scheduledObserve = \_ → pure ()
+    , scheduledMemberLimit = defaultMemberLimit
     }
+
+-- | How many live members an owner's collection holds by default.
+defaultMemberLimit ∷ Int
+defaultMemberLimit = 256
 
 -- | How creating a scheduled owner ended.
 data ScheduledStart
@@ -380,13 +408,15 @@ instance Show ScheduledOwner where
 -- | Create one scheduled owner: one supervised worker running one VM.
 --
 -- Raises 'SchedulerRefused', before anything starts, for a configuration the
--- scheduler refuses, and 'CallbackWaitRefused' from a thread running a Lua
--- callback. A failure of initialization, a cancellation of the creator and another
+-- scheduler refuses, 'OwnedInvalidMemberLimit' for a collection limit below one,
+-- and 'CallbackWaitRefused' from a thread running a Lua callback. A failure of initialization, a cancellation of the creator and another
 -- worker's fatal outcome propagate as supervision decides. See 'ScheduledStart' for
 -- the other endings.
 startScheduledOwner ∷ HasCallStack ⇒ LuaRuntime → ScheduledSpec → IO ScheduledStart
 startScheduledOwner runtime spec = do
   refuseCallbackWait "start-scheduled-owner"
+  when (scheduledMemberLimit spec < 1) $
+    throwFailure runtimeComponent (operation "start-scheduled-owner") [] (OwnedInvalidMemberLimit (scheduledMemberLimit spec))
   owner ← issueOwnerId runtime
   tokenStop ← newTVarIO (pure False)
   closing ← newTVarIO False
@@ -424,7 +454,7 @@ startScheduledOwner runtime spec = do
                 -- everything that already ended the owner has done this.
                 (\held → atomically (settleAll held ExitFailed))
           )
-          (\_ held → runScheduledOwner stopping held handoff (scheduledObserve spec) config)
+          (\_ held → runScheduledOwner stopping held handoff (scheduledObserve spec) (scheduledMemberLimit spec) config)
   -- Acquisition is masked from the worker's start to the endpoint's handoff, and
   -- only the readiness wait is restored, exactly as for a finite-call owner.
   mask $ \restore → do

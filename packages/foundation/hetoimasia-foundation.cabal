@@ -45,13 +45,15 @@ library
         Hetoimasia.Foundation.Recovery
         Hetoimasia.Foundation.Resource
         Hetoimasia.Foundation.Resource.Collection
+        Hetoimasia.Foundation.Resource.OwnedCollection
         Hetoimasia.Foundation.Time
         Hetoimasia.Foundation.Worker
     -- Hidden modules of this library: the public Log, Failure, Recovery,
-    -- Resource.Collection, Time, Messaging.Channel and Messaging.Snapshot
-    -- modules re-export what clients may use from them, and a client importing
-    -- one directly is refused. Unlike the internal sublibrary below, which
-    -- other components of this package share, these serve this library alone.
+    -- Resource.Collection, Resource.OwnedCollection, Time, Messaging.Channel
+    -- and Messaging.Snapshot modules re-export what clients may use from them,
+    -- and a client importing one directly is refused. Unlike the internal
+    -- sublibrary below, which other components of this package share, these
+    -- serve this library alone.
     --   Log.Base: levels, source locations and small options, below every other
     --     logging module and imported by failure attribution.
     --   Log.Component: the validated Component, private so its constructor
@@ -72,6 +74,11 @@ library
     --   Resource.Collection.Types: the collection, member state and token, and
     --     the result and rejection types, private so Collection and Member keep
     --     their constructors unexported; Resource.Collection re-exports them.
+    --   Resource.OwnedCollection.Types: the capability-owned collection, its
+    --     gate, the owner capability and the rejection type, private so the
+    --     collection and the capability keep their constructors unexported;
+    --     Resource.OwnedCollection re-exports them. The member token and the
+    --     results are Resource.Collection.Types'.
     --   Time.Types: instants, durations, requirements, rejections, conversion
     --     results, overflow, sources and baselines with their instances,
     --     private so Duration, Instant, MonotonicSource and ElapsedBaseline keep
@@ -108,6 +115,7 @@ library
         Hetoimasia.Foundation.Messaging.Snapshot.Types
         Hetoimasia.Foundation.Recovery.Types
         Hetoimasia.Foundation.Resource.Collection.Types
+        Hetoimasia.Foundation.Resource.OwnedCollection.Types
         Hetoimasia.Foundation.Time.Arithmetic
         Hetoimasia.Foundation.Time.Types
     hs-source-dirs: src
@@ -236,6 +244,7 @@ test-suite foundation-tests
         Test.Foundation.Resources.Cost
         Test.Foundation.Resources.Journal
         Test.Foundation.Resources.Opacity
+        Test.Foundation.Resources.OwnedCollection
         Test.Foundation.Resources.Spec
         Test.Foundation.Resources.Visibility
         Test.Foundation.Time.Opacity
