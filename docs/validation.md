@@ -216,7 +216,11 @@ readiness through a supervised wait, owner identity, bounded submission, exactly
 settlement, host failures under the owner's policy, protected stop and its exit record,
 independent owners, the refused reply wait from inside a Lua callback, and the adapter's
 dependency closure. Every execution and lifecycle example acquires real VMs under a real
-`withSupervision`. Like `test.scripting-lua` it is mandatory but outside the floor, so it is
+`withSupervision`. The same suite carries the scheduling machinery's examples (LUA-21):
+policies and their refused choices, service classes and quanta, logical time and grants,
+elapsed waits and the owned timer, service budgets and overruns, safe-boundary control and
+its results, the scheduler's stop, and the diagnostics. They run scripted segments under an
+injected clock with timer wakes fired by hand, so none sleeps and none needs a VM. Like `test.scripting-lua` it is mandatory but outside the floor, so it is
 selected when affected. It declares `cabal.project.common`, for the same reason, and its
 Cabal closure covers the host library, the adapter and the runtime and foundation packages
 they depend on. It is routed on the same `haskell-engine` worker, and its receipt is published
