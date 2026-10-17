@@ -84,8 +84,8 @@ LUA-6 readiness discussion opened on 2026-10-17 at the owner's direct request.
 LUA-5 is now delivered by #464 / PR #465, merged as `29211202`, and TIME-1/#133
 is delivered. The current exploration is limited to LUA-6; it does not revoke
 the prior slices' approvals or renew LUA-7/LUA-8 or the confined branch.
-Q-9 through Q-14 below record remaining questions and proposals. D-16 through
-D-21 record the owner's lifecycle, identity, per-owner scheduler and instance direction. LUA-6 remains
+Q-9 through Q-15 below record remaining questions and proposals. D-16 through
+D-22 record the owner's lifecycle, identity, per-owner scheduler and instance direction. LUA-6 remains
 deferred until those choices, their dependent contract reconciliation and an
 explicit readiness signoff are complete. No new tracker item is authorized by
 this design discussion.
@@ -567,7 +567,26 @@ two-owner limit. Possible future VM grouping is not current scope.
 The owner requires initialization, repeated updates and shutdown behavior,
 alongside Lua-authored callbacks connected to engine events, and explicitly
 asked to design that authoring contract before proceeding with LUA-6 readiness.
-The recommendation in Q-13 is not yet an accepted API or delivery expansion.
+The subsequent authoring approval is D-22; it does not renew delivery readiness.
+
+### D-22. Lifecycle hooks with instance state and owned event connections
+
+Owner approval, 2026-10-17: "i like this design ... its what we will do."
+Accept the Q-13 authoring direction presented in the preceding discussion:
+`init(self, api)`, optional `update(self, dt)`, `shutdown(self, reason)`, and a
+separate one-shot `run(self, api)`; fresh per-instance state with shared module
+code; explicit Lua-function event connections owned by the instance; serialized
+callback/lifecycle execution on its VM; automatic disconnection and runtime
+cleanup on removal, including when the Lua shutdown hook faults. Coroutines
+remain available for yielding sequences. Narrow granted services replace any
+universal environment. This approves the authoring model, not every spelling
+in the illustrative API or a delivery expansion into LUA-7.
+
+The owner's follow-up emphasizes Synarchy's per-instance startup intervals:
+e.g. UI at 0.01 seconds and unit AI at 1.0 seconds. Preserve this requirement
+in the timing discussion, rather than interpreting every `update` as a render
+frame or every scheduling round. The owner asked for advice on its suitability;
+`dt`, late-update and clock behavior remain Q-15, not inferred approvals.
 
 ## Design
 
@@ -1471,11 +1490,11 @@ names are not additional product decisions.
 
 ### Q-13. Loaded script instances, repetition and unloading
 
-**Partially resolved by D-21; authoring proposal open.** The owner wants
+**Authoring direction accepted by D-22; detailed lifecycle rules open.** The owner wants
 `init`, `update` and `shutdown` behavior plus engine-event callbacks, and asked
 whether this is the right authoring model after inspecting Synarchy. Instance
-removal is accepted; module eviction and instance-state construction are not
-implemented or implicitly approved.
+removal and fresh instance state are accepted; module eviction is not approved.
+None of this new instance machinery is implemented yet.
 
 Verified source evidence, 2026-10-17:
 
@@ -1498,7 +1517,7 @@ Verified source evidence, 2026-10-17:
   of evicting a module when its last instance disappears was a proposal, not a
   verified reference-counting facility. Different VMs do not share Lua tables.
 
-**Recommendation, not a decision:** keep named lifecycle hooks and add explicit
+**Accepted direction (D-22):** keep named lifecycle hooks and add explicit
 instance-owned state and event subscriptions. A module supplies reusable code;
 each admitted instance gets its own TID and fresh `self` state. Initialize once,
 invoke optional `update` when due, and invoke `shutdown` during orderly removal.
@@ -1524,16 +1543,16 @@ not itself a gameplay timestep. Gameplay and UI may supply different cadences.
 The authoring API must use narrow granted services, not a universal engine
 environment or service locator. Returned hook tables versus declared entry
 exports, concrete signatures, yield rules, init failure/shutdown ordering,
-pause/event retention and missed-update policy still need a precise contract.
+pause/event retention and Q-15's timing policy still need a precise contract.
 
 Professional precedent supports retaining the hook model: [Defold's script
 contract](https://defold.com/manuals/script/) combines instance `self`, lifecycle
 hooks and event handlers; [Godot's signals](https://docs.godotengine.org/en/stable/getting_started/step_by_step/signals.html)
 connect functions explicitly to event sources. These are references for the
-proposal, not authority for project decisions.
+design, not authority for project decisions.
 
-This authoring proposal affects LUA-6 lifecycle/scheduling and LUA-7's owned
-subscription interface. Settle the authoring direction first, then reconcile
+This accepted authoring direction affects LUA-6 lifecycle/scheduling and LUA-7's
+owned subscription interface. Settle remaining semantics, then reconcile
 delivery boundaries without silently pulling all LUA-7 functionality into
 LUA-6 or renewing that slice.
 
@@ -1560,6 +1579,46 @@ After the lifecycle authoring discussion, settle whether LUA-6 supplies only
 the headless runner/API proof or adds actual windowed composition now; using
 the same library API from a future windowed application is a separate claim
 from delivering that application. No command-line surface has been selected.
+
+### Q-15. Per-instance update intervals, delta time and late updates
+
+**Open after D-22.** The owner wants concurrent scripts at independently chosen
+intervals supplied when starting them (examples: 0.01-second UI refresh and
+1.0-second unit AI). This is compatible with one VM's FIFO policy: timers make
+instances eligible and the selected policy orders their ready work. Alternate
+policies remain useful but are not required for different intervals.
+
+Verified Synarchy behavior: `Thread/Scheduler.hs:runDueScripts` passes the
+configured interval as `dt`, not measured elapsed time. `TickPolicy.hs:advanceTick`
+keeps the original phase for lateness below one full interval; for larger
+lateness it drops missed executions and schedules the next deadline one interval
+after the observed time. Thus one call after a multi-second stall still receives
+the configured interval. That is a defined tick-size convention, not evidence
+that only that much time elapsed.
+
+**Proposal:** distinguish ordinary periodic refresh/decision work from fixed-step
+simulation. Periodic instances retain their requested interval, have at most
+one pending update, and coalesce missed refreshes into one invocation; `dt`
+reports elapsed time in the selected clock since the preceding update start
+(initially since successful initialization). Expose the configured interval
+separately. The exact phase and pause/reset rules remain to be settled.
+Intervals express intended cadence rather than guaranteed deadlines; callbacks
+do not overlap for one instance. Frame-driven refresh can be an additional
+cadence when a presentation loop exists, not a prerequisite for timed scripts.
+
+For fixed-step simulation, `dt` is an explicitly granted logical duration;
+bounded catch-up must preserve admitted steps and their effects under P-6.
+Do not classify all AI as disposable periodic work: selecting a new target may
+skip stale refreshes, but advancing authoritative simulation may not. No
+generic timer default silently selects either meaning for the application.
+
+P-6 already distinguishes monotonic real elapsed time for UI from application
+logical time for gameplay. Keep that distinction: a gameplay interval follows
+the application clock's pause/speed behavior, not the OS clock by accident.
+The owner's choice still needed here is whether ordinary periodic `update`
+uses the proposed elapsed `dt` and coalescing, or retains Synarchy's nominal
+interval `dt` (with elapsed time separately exposed). Fixed-step progress is a
+separate explicit contract in either case. This does not renew LUA-6 readiness.
 
 ## Verification strategy
 
@@ -1880,13 +1939,13 @@ and verified policy, with adversarial regression coverage.
 - **Phase:** execution policy.
 - **Depends on:** LUA-5; external TIME-1 (Q-4).
 - **Ordering:** critical path; can run alongside LUA-7 with disjoint modules.
-- **Relevant decisions:** D-1, D-3, D-4, D-12, D-13, D-16, D-17, D-18, D-19, D-20, D-21.
+- **Relevant decisions:** D-1, D-3, D-4, D-12, D-13, D-16, D-17, D-18, D-19, D-20, D-21, D-22.
 - **Acceptance signals:** peers get bounded opportunities at safe yields;
   paused/event-only work does not spin; stop wakes waits; logical time advances
   only on explicit completion; elapsed budget cannot be sold as a hard limit.
 - **Out of scope:** automatic code rewriting, arbitrary priority API, simulation
   coordinator, CPU affinity/niceness tuning, performance pass/fail thresholds.
-- **Open questions:** Q-9 (detailed lifecycle semantics), Q-13, Q-14.
+- **Open questions:** Q-9 (detailed lifecycle semantics), Q-13, Q-14, Q-15.
   Q-10's compatibility and Q-11's API/example direction are accepted by D-20;
   their new runner/lifetime questions are tracked under Q-13/Q-14.
   Q-12 is resolved by D-19.
