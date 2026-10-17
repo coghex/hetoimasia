@@ -116,10 +116,13 @@ int hetoimasia_lua_namespace(lua_State *L, const char *name, size_t length, int 
 /*
 ** Install a Haskell function as `namespace.name`, as `hetoimasia_lua_publish`
 ** installs a global, with the same ownership report for the stable pointer.
+** A `yielding` binding suspends the running coroutine, with no values, once
+** its handler has returned: the yield is made in C after every Haskell frame
+** has gone, as the error is.
 */
 int hetoimasia_lua_install_binding(
   lua_State *L, HsStablePtr function,
-  const char *space, size_t space_length, const char *name, size_t length, int *acquired);
+  const char *space, size_t space_length, const char *name, size_t length, int yielding, int *acquired);
 
 /*
 ** Load a module's source in an environment of its own, run it, check the entry
@@ -194,5 +197,52 @@ int hetoimasia_lua_context(
 int hetoimasia_lua_call(
   lua_State *L, int nargs, int nresults,
   char *trace, size_t trace_capacity, size_t *trace_length);
+
+/* ------------------------------------------------------------------------ */
+/* Tasks                                                                     */
+/* ------------------------------------------------------------------------ */
+
+/* How a segment of a task ended. */
+enum {
+  HETOIMASIA_TASK_COMPLETED = 0,   /* returned; the results are on the stack */
+  HETOIMASIA_TASK_YIELDED = 1,     /* suspended by a yield */
+  HETOIMASIA_TASK_FAILED = 2,      /* raised an error; the task has been closed */
+  HETOIMASIA_TASK_UNRESUMABLE = 3, /* the slot holds nothing resumable */
+  HETOIMASIA_TASK_ARITY = 4        /* returned a number of results other than expected */
+};
+
+/*
+** Create the coroutine of a task, anchor it in `slot` of a table the bridge
+** keeps in the registry, and move into it the function and `nargs` arguments
+** that are on top of the stack. One protected call, with the collector held, so
+** nothing executes while it is made; what it allocated is paid when the task
+** first runs. On any status other than LUA_OK the error value is on the stack in
+** the place of the function and its arguments.
+*/
+int hetoimasia_lua_task_new(lua_State *L, lua_Integer slot, int nargs);
+
+/* The coroutine anchored in `slot`, or NULL. Allocates nothing. */
+lua_State *hetoimasia_lua_task_thread(lua_State *L, lua_Integer slot);
+
+/* Whether the running function could yield: false inside a metamethod, a
+** finalizer, a library callback that does not support it, and on a main
+** thread. */
+int hetoimasia_lua_yieldable(lua_State *L);
+
+/*
+** Run the next segment of the task in `slot`. See the definition for what each
+** outcome leaves on the stack. The result is the status of a failure, LUA_OK
+** otherwise.
+*/
+int hetoimasia_lua_task_resume(
+  lua_State *L, lua_Integer slot, int starting, int expected,
+  char *trace, size_t trace_capacity, size_t *trace_length,
+  int *outcome, int *count, int *cleanup_error);
+
+/* Close the task in `slot` and unanchor it. */
+int hetoimasia_lua_task_close(lua_State *L, lua_Integer slot, int *present, int *failed);
+
+/* How many tasks are anchored. */
+int hetoimasia_lua_task_count(lua_State *L, long *count);
 
 #endif

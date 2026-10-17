@@ -136,6 +136,27 @@ static int invoke(lua_State *L)
 }
 
 /*
+** The C closure of a binding that suspends the running coroutine. The handler
+** has decided, with every Haskell frame still to return, whether the yield is
+** allowed; this makes it afterwards, in C, because `lua_yield` unwinds with a
+** longjmp exactly as `lua_error` does, and that must never cross a Haskell
+** frame. The values the handler leaves are not yielded: what the host is told
+** is kept on the Haskell side, so the coroutine yields none and is resumed
+** with none.
+*/
+static int invoke_yield(lua_State *L)
+{
+  int results;
+  lua_pushvalue(L, lua_upvalueindex(1));
+  lua_insert(L, 1);
+  results = hetoimasia_lua_enter(L);
+  if (results < 0) {
+    return lua_error(L);
+  }
+  return lua_yield(L, 0);
+}
+
+/*
 ** Push the carrier metatable, building it before it is reachable.
 **
 ** `luaL_newmetatable` registers its table and *then* fills it, so an allocation
@@ -224,6 +245,7 @@ static int install_body(lua_State *L)
   const char *name = (const char *) lua_touserdata(L, 4);
   size_t length = (size_t) lua_tointeger(L, 5);
   int *acquired = (int *) lua_touserdata(L, 6);
+  int yielding = (int) lua_tointeger(L, 7);
   HsStablePtr *slot;
 
   lua_settop(L, 0);
@@ -235,7 +257,7 @@ static int install_body(lua_State *L)
   lua_setmetatable(L, -2);
   *acquired = 1;
 
-  lua_pushcclosure(L, invoke, 1);
+  lua_pushcclosure(L, yielding ? invoke_yield : invoke, 1);
   lua_pushglobaltable(L);
   lua_pushlstring(L, space, space_length);
   /* A raw read and a raw write: no metamethod of the globals or of the
@@ -252,7 +274,7 @@ static int install_body(lua_State *L)
 
 int hetoimasia_lua_install_binding(
   lua_State *L, HsStablePtr function,
-  const char *space, size_t space_length, const char *name, size_t length, int *acquired)
+  const char *space, size_t space_length, const char *name, size_t length, int yielding, int *acquired)
 {
   *acquired = 0;
   if (!lua_checkstack(L, 12)) {
@@ -265,7 +287,8 @@ int hetoimasia_lua_install_binding(
   lua_pushlightuserdata(L, (void *) (size_t) name);
   lua_pushinteger(L, (lua_Integer) length);
   lua_pushlightuserdata(L, acquired);
-  return lua_pcall(L, 6, 0, 0);
+  lua_pushinteger(L, (lua_Integer) yielding);
+  return lua_pcall(L, 7, 0, 0);
 }
 
 static int getglobal_body(lua_State *L)

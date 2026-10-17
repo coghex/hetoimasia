@@ -182,12 +182,16 @@ installCallback vm name action release =
 --
 -- Nothing is borrowed from the Haskell side that outlives the handler, so there
 -- is no release to retain.
-installBinding ∷ HasCallStack ⇒ Vm → Text → Text → Handler → IO ()
-installBinding vm space name handler =
+--
+-- A @yielding@ binding suspends the running coroutine, with no values, when its
+-- handler returns without failing: the handler decides, and the yield itself is
+-- made in C once every Haskell frame has returned, exactly as the error is.
+installBinding ∷ HasCallStack ⇒ Vm → Text → Text → Bool → Handler → IO ()
+installBinding vm space name yielding handler =
   installWith vm [("binding", qualified)] qualified publish handler (pure ())
   where
     qualified = space <> "." <> name
-    publish state carried acquired = installBindingAt state carried space name acquired
+    publish state carried acquired = installBindingAt state carried space name yielding acquired
 
 -- | The installation both public forms share: the release is retained before the
 -- function is published, and the stable pointer is freed here only when Lua

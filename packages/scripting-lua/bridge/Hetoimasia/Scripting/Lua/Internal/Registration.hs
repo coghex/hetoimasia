@@ -28,6 +28,12 @@
 -- refused by the owner as not yet supported (decision A1). The kind that starts
 -- asynchronous work is never eligible to run from a finalizer (P-3).
 --
+-- A scheduler operation ('yieldOperation', 'waitOperation') is a binding that runs
+-- no application code: it suspends the coroutine of the task that called it, and
+-- the host reports to whatever resumed the task that it yielded, or what it waited
+-- for and with which arguments. It is eligible for the direct path only. Where a
+-- call to one cannot reach a scheduler it is refused as a typed fault of the call.
+--
 -- = Bounds
 --
 -- Every size a registration can have is bounded, and each bound is documented
@@ -40,6 +46,11 @@ module Hetoimasia.Scripting.Lua.Internal.Registration
     Binding (..)
   , BindingKind (..)
   , Action (..)
+  , WaitKind (..)
+  , Suspend (..)
+  , yieldOperation
+  , waitOperation
+  , isSuspending
   , CommandResult (..)
   , snapshotQuery
   , stateOperation
@@ -109,7 +120,30 @@ data BindingKind
   | CommandOrUiIntention
   | AsynchronousNativeRequest
   | LifecycleOperation
+  | -- | A yield or a wait a task's code makes to give control back to whatever
+    -- resumes it. Delivered on the direct path only.
+    SchedulerOperation
   deriving (Bounded, Enum, Eq, Ord, Show)
+
+-- | What a task's code waits for.
+--
+-- The host reports the request and its arguments and interprets neither: what a
+-- deadline or a tick is, and when one is reached, belong to the scheduler that
+-- resumes the task.
+data WaitKind
+  = -- | An elapsed deadline.
+    WaitElapsed
+  | -- | A logical tick.
+    WaitLogical
+  deriving (Bounded, Enum, Eq, Ord, Show)
+
+-- | What a scheduler operation does when a task calls it.
+data Suspend
+  = -- | Give control back, with nothing to wait for.
+    SuspendYield
+  | -- | Give control back, naming what to wait for.
+    SuspendWait !WaitKind
+  deriving (Eq, Show)
 
 -- | How a command or UI intention answers: acceptance, or a bounded rejection.
 data CommandResult
@@ -136,6 +170,10 @@ data Action
     -- for the slice that will, and is never run: a Lua call to the binding is
     -- refused as not yet supported before anything else happens.
     ReservedAction ([Value] → IO [Value])
+  | -- | A scheduler operation: no application code runs. The task's coroutine is
+    -- suspended and the host is told which operation did it, with the arguments
+    -- it was given.
+    SuspendAction !Suspend
 
 -- | One binding.
 data Binding = Binding
@@ -180,6 +218,31 @@ asynchronousNativeRequest name arguments results action =
 lifecycleOperation ∷ Text → [Schema] → [Schema] → ([Value] → IO [Value]) → Binding
 lifecycleOperation name arguments results action =
   Binding name LifecycleOperation arguments results True False False (ReservedAction action)
+
+-- | A yield: control goes back to whatever resumes the task, which resumes it
+-- later. It takes no arguments and answers none.
+--
+-- Called anywhere that cannot reach a scheduler -- an entry point called once, a
+-- module's chunk, a finalizer, a coroutine the script created, a metamethod -- it
+-- is refused as a typed fault of the call, never run. It is eligible for the
+-- trusted direct path only, and never for the confined path.
+yieldOperation ∷ Text → Binding
+yieldOperation name =
+  Binding name SchedulerOperation [] [] True False False (SuspendAction SuspendYield)
+
+-- | A wait: control goes back with the wait the script asked for and its
+-- arguments, which the schemas bound like any other call's. The host reports
+-- them and waits for nothing itself. Refused wherever a yield is.
+waitOperation ∷ Text → WaitKind → [Schema] → Binding
+waitOperation name kind arguments =
+  Binding name SchedulerOperation arguments [] True False False (SuspendAction (SuspendWait kind))
+
+-- | Whether a binding is a scheduler operation, which suspends the coroutine it
+-- is called from.
+isSuspending ∷ Binding → Bool
+isSuspending binding = case bindingAction binding of
+  SuspendAction _ → True
+  _ → False
 
 -- | Declare the binding eligible for the confined path. Refused when the
 -- registration is built if any schema it declares is not a bounded copied value.
@@ -284,6 +347,9 @@ data RegistrationRefusal
   | -- | A confined eligibility on a binding whose schemas are not all plain
     -- bounded values: the binding.
     ConfinedNeedsPlainValues !Text
+  | -- | A confined eligibility on a scheduler operation: a coroutine of the
+    -- trusted path has no meaning to a process that cannot hold it.
+    SchedulerNotConfined !Text
   | -- | A finalizer eligibility on a binding that starts asynchronous work.
     FinalizerCannotStartWork !Text
   | -- | A command or UI intention is declared with results other than the fixed
@@ -408,6 +474,8 @@ registration capabilities namespaces = do
       mapM_ (checkSchema qualified) schemas
       when (bindingConfined binding && any (not . null . schemaCapabilities) schemas) $
         Left (ConfinedNeedsPlainValues qualified)
+      when (bindingConfined binding && bindingKind binding == SchedulerOperation) $
+        Left (SchedulerNotConfined qualified)
       when (bindingFinalizer binding && bindingKind binding == AsynchronousNativeRequest) $
         Left (FinalizerCannotStartWork qualified)
       when (bindingKind binding == CommandOrUiIntention && bindingResults binding /= commandResults) $

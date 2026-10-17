@@ -114,6 +114,16 @@ module Hetoimasia.Scripting.Lua.Internal.Vm
   , RunContext
   , setRunContext
   , runContext
+    -- * Tasks
+  , Suspension (..)
+  , activeTask
+  , setActiveTask
+  , noteSuspension
+  , takeSuspension
+  , nextTaskSlot
+  , noteTaskLive
+  , noteTaskEnded
+  , escapePending
     -- * Probes
   , vmState
   , vmPhase
@@ -173,8 +183,8 @@ import Hetoimasia.Scripting.Lua.Internal.Fault
   ( CloseFailure (CloseFailure)
   , CloseFault (CloseFault)
   , CloseSource (..)
-  , ErrorValue (ErrorAbsent)
-  , FaultKind (MemoryExhausted)
+  , ErrorValue (ErrorAbsent, ErrorOpaque)
+  , FaultKind (CallFailed, MemoryExhausted)
   , FinalizerEvidenceTruncated (FinalizerEvidenceTruncated)
   , FinalizerRefused
   , LuaFault (LuaFault)
@@ -192,7 +202,9 @@ import Hetoimasia.Scripting.Lua.Internal.Library
   , libraryModuleName
   , libraryOpener
   )
-import Hetoimasia.Scripting.Lua.Internal.Value (VmIdentity (VmIdentity))
+import Hetoimasia.Scripting.Lua.Internal.Marshal (TaskClosing (..), closeTaskCoroutine)
+import Hetoimasia.Scripting.Lua.Internal.Registration (WaitKind)
+import Hetoimasia.Scripting.Lua.Internal.Value (Value, VmIdentity (VmIdentity))
 import Lua
   ( CFunction
   , StackIndex
@@ -268,7 +280,26 @@ data Vm = Vm
   , vmRunContext ∷ !(IORef (Maybe RunContext))
     -- ^ The module and entry point the running operation is executing, so that a
     -- fault raised under it can say which. Reset when an operation takes the gate.
+  , vmActiveTask ∷ !(IORef (Maybe State))
+    -- ^ The coroutine of the task the running operation is resuming: the one
+    -- thread a scheduler operation may suspend. Reset when an operation takes the
+    -- gate.
+  , vmSuspension ∷ !(IORef (Maybe Suspension))
+    -- ^ What the scheduler operation that last suspended the active task asked
+    -- for. Taken by the operation that resumed the task.
+  , vmTaskSlots ∷ !(IORef Int)
+    -- ^ The next task slot. Slots are never reused.
+  , vmLiveTasks ∷ !(IORef (Set Int))
+    -- ^ The slots of the tasks whose coroutines are suspended, which the close
+    -- closes before it closes the state.
   }
+
+-- | What a scheduler operation asked for when it suspended a task.
+data Suspension
+  = SuspensionYield
+  | -- | A wait: its kind, the binding's namespace and name, and its arguments.
+    SuspensionWait !WaitKind !Text !Text ![Value]
+  deriving (Eq, Show)
 
 -- | What a callback reached from a Lua finalizer may do while its VM closes.
 data FinalizerPolicy
@@ -390,7 +421,11 @@ allocateVm spec = do
   ready ← newIORef False
   slots ← newIORef 0
   context ← newIORef Nothing
-  pure (Vm state gate phase escape closing releases finished callers (specOwner spec) (specFinalizers spec) dropped identity runs ready slots context)
+  active ← newIORef Nothing
+  suspension ← newIORef Nothing
+  taskSlots ← newIORef 0
+  live ← newIORef Set.empty
+  pure (Vm state gate phase escape closing releases finished callers (specOwner spec) (specFinalizers spec) dropped identity runs ready slots context active suspension taskSlots live)
 
 -- | Open exactly the named standard libraries, in order, as one operation of
 -- the VM: under its gate, by its owner, restoring the stack it borrowed.
@@ -466,6 +501,8 @@ withOpenVm vm name body = mask_ $ do
       entry ← lua_gettop state
       writeIORef (vmActionRuns vm) 0
       writeIORef (vmRunContext vm) Nothing
+      writeIORef (vmActiveTask vm) Nothing
+      writeIORef (vmSuspension vm) Nothing
       result ← body state `onException` abandon vm entry
       putMVar (vmGate vm) ()
       pure result
@@ -506,6 +543,8 @@ closeVm vm = mask $ \restore → do
       -- the module and entry point it was in, are not the finalizers'.
       writeIORef (vmActionRuns vm) 0
       writeIORef (vmRunContext vm) Nothing
+      writeIORef (vmActiveTask vm) Nothing
+      writeIORef (vmSuspension vm) Nothing
       outcome ← try (teardown vm)
       writeIORef (vmPhaseRef vm) Closed
       putMVar (vmFinished vm) ()
@@ -596,6 +635,11 @@ callbackThreads = unsafePerformIO (newIORef Map.empty)
 -- belongs to no caller's operation, so nothing else would ever observe it.
 teardown ∷ Vm → IO ()
 teardown vm = do
+  -- Tasks still suspended are closed first, on this thread, so their pending
+  -- to-be-closed variables run while the state and everything its callbacks
+  -- borrow are alive. Every close is attempted: one that fails is evidence, and
+  -- does not stop the others.
+  coroutineFailures ← closeLiveTasks vm
   hetoimasia_lua_close (vmState vm)
   -- Every finalizer that failed, in the order they ran, and anything an
   -- operation left behind.
@@ -619,12 +663,44 @@ teardown vm = do
         [CloseFailure (finalizerSource cause) captured | captured@(ExceptionWithContext _ cause) ← escaped]
       strandedFailures = [CloseFailure FromStrandedOperation captured | captured ← maybeToList stranded]
       releaseFailures = [CloseFailure FromRelease captured | Left captured ← outcomes]
-      failures = finalizerFailures <> truncation <> strandedFailures <> releaseFailures
+      failures = coroutineFailures <> finalizerFailures <> truncation <> strandedFailures <> releaseFailures
   unless (null failures) (throwIO (CloseFault failures))
   where
     finalizerSource cause = case fromException cause of
       Just (_ ∷ FinalizerRefused) → FromRefusedFinalizer
       Nothing → FromFinalizer
+
+-- | Close every task whose coroutine is still suspended, in the order they were
+-- started, and answer the failures of the closes.
+--
+-- The close runs the pending to-be-closed variables of each, which is script
+-- code and can reach a callback; the phase is 'Closing', so a callback it
+-- reaches is held to the finalizer policy, and a Haskell failure it raises is
+-- recorded with the finalizers'. A Lua error that is only the stand-in for such
+-- a failure is not reported a second time.
+closeLiveTasks ∷ Vm → IO [CloseFailure]
+closeLiveTasks vm = do
+  slots ← atomicModifyIORef' (vmLiveTasks vm) (\held → (Set.empty, Set.toAscList held))
+  outcomes ← traverse (tryWithContext @SomeException . closeOne) slots
+  pure [CloseFailure FromCoroutineClose captured | Left captured ← outcomes]
+  where
+    state = vmState vm
+    closeOne slot = do
+      entry ← lua_gettop state
+      before ← length <$> readIORef (vmClosingEscapes vm)
+      closing ← closeTaskCoroutine state slot
+      value ← renderFailure state entry
+      lua_settop state entry
+      after ← length <$> readIORef (vmClosingEscapes vm)
+      let standIn = case value of
+            ErrorOpaque _ → after > before
+            _ → False
+      when ((closingFailed closing || closingStatus closing /= LUA_OK) && not standIn) $
+        throwFailure
+          luaComponent
+          (operation "close-task")
+          [("slot", showText slot)]
+          (LuaFault (if closingStatus closing /= LUA_OK then classify (closingStatus closing) else CallFailed) "task" value)
 
 -- | Retain a dependency's release until after the VM's terminal close.
 --
@@ -771,3 +847,37 @@ setRunContext vm = writeIORef (vmRunContext vm) . Just
 -- | What the running operation is executing, if it is a module.
 runContext ∷ Vm → IO (Maybe RunContext)
 runContext = readIORef . vmRunContext
+
+-- | The coroutine of the task the running operation is resuming, if it is
+-- resuming one.
+activeTask ∷ Vm → IO (Maybe State)
+activeTask = readIORef . vmActiveTask
+
+-- | Say which coroutine the running operation is resuming, or that it is not
+-- resuming one.
+setActiveTask ∷ Vm → Maybe State → IO ()
+setActiveTask vm task = atomicModifyIORef' (vmActiveTask vm) (\_ → (task, ()))
+
+-- | A scheduler operation accepted a suspension: what it asked for.
+noteSuspension ∷ Vm → Suspension → IO ()
+noteSuspension vm suspension = atomicModifyIORef' (vmSuspension vm) (\_ → (Just suspension, ()))
+
+-- | Take what the last accepted suspension asked for, leaving none.
+takeSuspension ∷ Vm → IO (Maybe Suspension)
+takeSuspension vm = atomicModifyIORef' (vmSuspension vm) (\held → (Nothing, held))
+
+-- | The next task slot, never issued twice.
+nextTaskSlot ∷ Vm → IO Int
+nextTaskSlot vm = atomicModifyIORef' (vmTaskSlots vm) (\slot → (slot + 1, slot + 1))
+
+-- | A task's coroutine is suspended and will need closing.
+noteTaskLive ∷ Vm → Int → IO ()
+noteTaskLive vm slot = atomicModifyIORef' (vmLiveTasks vm) (\held → (Set.insert slot held, ()))
+
+-- | A task's coroutine is no longer suspended.
+noteTaskEnded ∷ Vm → Int → IO ()
+noteTaskEnded vm slot = atomicModifyIORef' (vmLiveTasks vm) (\held → (Set.delete slot held, ()))
+
+-- | Whether a Haskell failure that reached a callback is waiting to be raised.
+escapePending ∷ Vm → IO Bool
+escapePending vm = maybe False (const True) <$> readIORef (vmEscape vm)

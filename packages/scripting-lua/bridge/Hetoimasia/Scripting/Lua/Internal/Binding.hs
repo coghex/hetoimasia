@@ -61,8 +61,11 @@ import Hetoimasia.Scripting.Lua.Internal.Vm
   ( Vm
   , markValuesPrepared
   , noteActionRun
+  , activeTask
   , amendEscape
+  , noteSuspension
   , operationActionRuns
+  , Suspension (..)
   , runContext
   , valuesPrepared
   , vmIdentity
@@ -95,7 +98,7 @@ installRegistration boundary vm granted = do
             (blankFault boundary InstallBindings (NamespaceTaken name)) {boundaryChunk = name}
   forM_ wanted $ \name → forM_ (lookupNamespace registered name) $ \space →
     forM_ (directBindings space) $ \binding →
-      installBinding vm name (bindingName binding) (valueHandler boundary vm name binding)
+      installBinding vm name (bindingName binding) (isSuspending binding) (valueHandler boundary vm name binding)
 
 -- | Make what the value boundary keeps in the registry, once for the VM: the
 -- metatable every handle wears and the table the modules' slots live in. Called
@@ -170,6 +173,15 @@ valueHandler boundary vm space binding state restore = do
       effect ← current
       faulted (NotYetSupported (bindingKind binding)) effect
     action → do
+      -- A scheduler operation is refused first, wherever it cannot reach the
+      -- scheduler, before anything of its arguments is read.
+      case action of
+        SuspendAction _ → do
+          refusal ← suspensionRefusal vm state
+          forM_ refusal $ \why → do
+            effect ← current
+            faulted (SuspendRefused why) effect
+        _ → pure ()
       top ← fromIntegral . fromStackIndex <$> lua_gettop state
       when (top /= length declared) $
         refuseArguments 0 [] (RuleArity (length declared) top) 0
@@ -194,57 +206,69 @@ valueHandler boundary vm space binding state restore = do
         retired ← restore (retiredIn boundary value)
         forM_ retired $ \(path, typeName) →
           refuseArguments index path (RuleRetiredHandle typeName) visited
-      -- Counted before it starts, so a fault of anything the action does is
-      -- one that happened after an action ran.
-      noteActionRun vm
-      -- A refusal the script caught and went on from is the operation's failure
-      -- (C1), and an action is about to run after it: what it reports as having
-      -- happened has to include that.
-      amendEscape vm upgradeEffect
-      produced ← case action of
+      let runAction ∷ IO [Value] → IO NumResults
+          runAction compute = do
+              -- Counted before it starts, so a fault of anything the action does is
+              -- one that happened after an action ran.
+              noteActionRun vm
+              -- A refusal the script caught and went on from is the operation's failure
+              -- (C1), and an action is about to run after it: what it reports as having
+              -- happened has to include that.
+              amendEscape vm upgradeEffect
+              produced ← compute
+              let expected = bindingResults binding
+              -- Bounded first: an action that built far more than the limits allow is
+              -- refused after visiting what the limits allow, plus one.
+              either (refuseResults 0 []) pure (checkLimits limits produced)
+              when (length produced /= length expected) $
+                refuseResults 0 [] (RuleArity (length expected) (length produced))
+              forM_ (zip3 [1 ..] expected produced) $ \(index, schema, value) →
+                case conformValue context schema value of
+                  Left (path, rule) → refuseResults index path rule
+                  Right () → pure ()
+              encoded ← case encodeValues context limits produced of
+                Left rule → refuseResults 0 [] rule
+                Right bytes → pure bytes
+              pushed ← pushValues state limits encoded (length produced)
+              case pushed of
+                Pushed → do
+                  -- Back to the script: what building its results allocated while the
+                  -- collector was held is paid now.
+                  serviceCollector state
+                  pure (NumResults (fromIntegral (length produced)))
+                PushStatus status → do
+                  value ← renderFailure state entry
+                  lua_settop state entry
+                  faulted (ScriptFailed (classify status) value) BindingRan
+                PushMalformed which → faulted (InternalError (Text.pack ("a result could not be built: " <> show which))) BindingRan
+
+      case action of
+        SuspendAction suspend → do
+          -- No application code runs: the task's coroutine is suspended once this
+          -- handler returns, and the host is told what the script asked for.
+          noteSuspension vm $ case suspend of
+            SuspendYield → SuspensionYield
+            SuspendWait kind → SuspensionWait kind space (bindingName binding) values
+          pure (NumResults 0)
         -- What the action returns is evaluated inside the mark: a failure hidden in
         -- a lazy result is the application's, whenever it would have surfaced.
         -- The bounded check reaches every part of a result that can cross, and
         -- stops at a limit, so an endless result costs no more than a large one.
         ValuesAction run →
-          fromApplication $ do
+          runAction . fromApplication $ do
             returned ← restore (run values)
             returned <$ evaluate (checkLimits limits returned)
-        CommandAction run → do
-          answer ← fromApplication (restore (run values) >>= evaluate)
-          case answer of
-            Accepted → pure [VBoolean True, VNil]
-            Rejected reason
-              -- Its length in bytes without copying it: the text is the application's
-              -- and may be as large as memory allows.
-              | lengthWord8 reason > commandReasonLimit →
-                  refuseResults 2 [] (RuleBytesLimit commandReasonLimit)
-              | otherwise → pure [VBoolean False, VText reason]
-      let expected = bindingResults binding
-      -- Bounded first: an action that built far more than the limits allow is
-      -- refused after visiting what the limits allow, plus one.
-      either (refuseResults 0 []) pure (checkLimits limits produced)
-      when (length produced /= length expected) $
-        refuseResults 0 [] (RuleArity (length expected) (length produced))
-      forM_ (zip3 [1 ..] expected produced) $ \(index, schema, value) →
-        case conformValue context schema value of
-          Left (path, rule) → refuseResults index path rule
-          Right () → pure ()
-      encoded ← case encodeValues context limits produced of
-        Left rule → refuseResults 0 [] rule
-        Right bytes → pure bytes
-      pushed ← pushValues state limits encoded (length produced)
-      case pushed of
-        Pushed → do
-          -- Back to the script: what building its results allocated while the
-          -- collector was held is paid now.
-          serviceCollector state
-          pure (NumResults (fromIntegral (length produced)))
-        PushStatus status → do
-          value ← renderFailure state entry
-          lua_settop state entry
-          faulted (ScriptFailed (classify status) value) BindingRan
-        PushMalformed which → faulted (InternalError (Text.pack ("a result could not be built: " <> show which))) BindingRan
+        CommandAction run →
+          runAction $ do
+            answer ← fromApplication (restore (run values) >>= evaluate)
+            case answer of
+              Accepted → pure [VBoolean True, VNil]
+              Rejected reason
+                -- Its length in bytes without copying it: the text is the application's
+                -- and may be as large as memory allows.
+                | lengthWord8 reason > commandReasonLimit →
+                    refuseResults 2 [] (RuleBytesLimit commandReasonLimit)
+                | otherwise → pure [VBoolean False, VText reason]
 
 -- | The first capability in a value whose type the application's own check
 -- refuses, with where it is. Checked in order, before the binding's action.
@@ -279,3 +303,20 @@ sameChunk ∷ Text → Maybe Text → Bool
 sameChunk chunk = \case
   Nothing → False
   Just seen → seen == chunk || (Text.length seen >= 59 && seen `Text.isPrefixOf` chunk)
+
+-- | Why a scheduler operation called from this thread cannot reach the scheduler,
+-- if it cannot.
+--
+-- It can only when the host is resuming a task of this owner, the call is made by
+-- that task's own coroutine, and Lua could suspend that coroutine right here. The
+-- order is the order of what is cheapest and most general to say.
+suspensionRefusal ∷ Vm → State → IO (Maybe SuspendRefusal)
+suspensionRefusal vm state = do
+  active ← activeTask vm
+  case active of
+    Nothing → pure (Just SuspendOutsideTask)
+    Just task
+      | task /= state → pure (Just SuspendOtherCoroutine)
+      | otherwise → do
+          yieldable ← threadYieldable state
+          pure (if yieldable then Nothing else Just SuspendNotYieldable)
