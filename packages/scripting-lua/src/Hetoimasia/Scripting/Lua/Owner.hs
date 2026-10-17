@@ -98,12 +98,32 @@
 -- finalizer's script caught the error, and what is retained from finalizers is
 -- bounded. A lifecycle binding on the allowlist still executes nothing: it is not
 -- yet delivered.
+--
+-- = Around a callback
+--
+-- A binding's action runs on a thread of its own for each call. 'withVmOwnerScoped'
+-- runs a 'CallbackScope' around each such callback, on the callback's own thread
+-- and for exactly its duration, so an owner that holds something can lend it to a
+-- callback and take it back whatever the callback does. The scope is handed a
+-- 'CallbackSite', which answers whether a thread is one of this VM's callbacks
+-- from the record the VM already keeps when it refuses an operation re-entered
+-- from a callback, so no one has to take a callback's word for who it is. The
+-- scope runs for every callback the VM runs, the initial chunks' and the modules'
+-- included, and for a callback a finalizer reaches that the policy lets run. It
+-- changes no rule of this module, and 'withVmOwner' is the same lifetime with no
+-- scope.
 module Hetoimasia.Scripting.Lua.Owner
   ( -- * The lifetime
     VmConfig (..)
   , vmConfig
   , withVmOwner
+  , withVmOwnerScoped
   , OwnedVm
+
+    -- * Around a callback
+  , CallbackScope (..)
+  , CallbackSite (..)
+  , noCallbackScope
 
     -- * Application-owned modules
   , ModuleSource (..)
@@ -211,7 +231,8 @@ import qualified Hetoimasia.Scripting.Lua.Internal.Module as Module
 import Hetoimasia.Scripting.Lua.Internal.Owner
   ( OwnedVm
   , OwnerConfig
-      ( ownerChunks
+      ( ownerCallbackScope
+      , ownerChunks
       , ownerGranted
       , ownerLimits
       , ownerModules
@@ -233,6 +254,7 @@ import Hetoimasia.Scripting.Lua.Internal.Task
   )
 import qualified Hetoimasia.Scripting.Lua.Internal.Task as Task
 import Hetoimasia.Scripting.Lua.Internal.Value (Value, ValueLimits, defaultValueLimits)
+import Hetoimasia.Scripting.Lua.Internal.Vm (CallbackScope (..), CallbackSite (..), noCallbackScope)
 
 -- | What a VM owner constructs.
 data VmConfig = VmConfig
@@ -269,7 +291,13 @@ vmConfig libraries = VmConfig libraries [] "owner" emptyRegistration [] defaultV
 -- its execution owner for as long as the lifetime lasts. See the module header
 -- for who may use it, how it ends and where a cancellation can land.
 withVmOwner ∷ HasCallStack ⇒ VmConfig → (OwnedVm → IO r) → IO r
-withVmOwner config =
+withVmOwner = withVmOwnerScoped noCallbackScope
+
+-- | 'withVmOwner' with a scope run around each of the VM's callbacks. See
+-- "Around a callback" in the module header, and 'CallbackScope' for what the scope
+-- may and may not do.
+withVmOwnerScoped ∷ HasCallStack ⇒ CallbackScope → VmConfig → (OwnedVm → IO r) → IO r
+withVmOwnerScoped scope config =
   withOwnedVm
     (defaultOwnerConfig (vmLibraries config))
       { ownerChunks = vmInitialChunks config
@@ -278,6 +306,7 @@ withVmOwner config =
       , ownerGranted = vmPolicy config
       , ownerLimits = vmValueLimits config
       , ownerModules = vmModules config
+      , ownerCallbackScope = scope
       }
 
 -- | Load a module from the owner's body, in an environment of its own.

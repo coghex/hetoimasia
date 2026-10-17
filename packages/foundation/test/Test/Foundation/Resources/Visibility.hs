@@ -1,19 +1,20 @@
 -- | Examples proving that the resource family's implementation modules stay
--- inside the foundation package while its two public modules keep every name
+-- inside the foundation package while its three public modules keep every name
 -- they export.
 --
--- "Hetoimasia.Foundation.Resource" and
--- "Hetoimasia.Foundation.Resource.Collection" re-export what clients may use
--- from modules no client can import: four hidden modules of the package's
+-- "Hetoimasia.Foundation.Resource",
+-- "Hetoimasia.Foundation.Resource.Collection" and
+-- "Hetoimasia.Foundation.Resource.OwnedCollection" re-export what clients may
+-- use from modules no client can import: four hidden modules of the package's
 -- private @internal@ sublibrary behind the package-private facade
--- "Hetoimasia.Foundation.Resource.Internal", and one hidden module of the main
+-- "Hetoimasia.Foundation.Resource.Internal", and two hidden modules of the main
 -- library. An example in this suite cannot observe that boundary, so these
 -- examples compile separate single-module clients with the harness from
 -- "Test.Support.ExternalClient", exposing @base@, @text@, and
 -- @hetoimasia-foundation@ and hiding everything else, as the resource opacity
 -- examples do.
 --
--- One client must be accepted: it imports, by name, every name the two public
+-- One client must be accepted: it imports, by name, every name the three public
 -- modules export, with exactly the constructors each exports. Every other
 -- client must be rejected with @GHC-87110@ against the unit that holds the
 -- module it imported, which tells a hidden module apart from a missing module
@@ -53,11 +54,12 @@ spec = describe "Resource module visibility across the package boundary" $ do
       output ← refusedAsHidden hidden
       output `shouldContain` "hetoimasia-foundation-0.1.0.0:internal"
 
-  it ("rejects a client that imports the hidden module " <> collectionTypes) $ do
-    output ← refusedAsHidden collectionTypes
-    -- The main library's unit, which the private sublibrary's name extends.
-    output `shouldContain` "hetoimasia-foundation-0.1.0.0"
-    output `shouldNotContain` "hetoimasia-foundation-0.1.0.0:internal"
+  forM_ [collectionTypes, ownedCollectionTypes] $ \hidden →
+    it ("rejects a client that imports the hidden module " <> hidden) $ do
+      output ← refusedAsHidden hidden
+      -- The main library's unit, which the private sublibrary's name extends.
+      output `shouldContain` "hetoimasia-foundation-0.1.0.0"
+      output `shouldNotContain` "hetoimasia-foundation-0.1.0.0:internal"
 
 withClient ∷ String → ((Mode → IO Client) → IO ()) → IO ()
 withClient = withPackageClient ["base", "text", "hetoimasia-foundation"] "Client.hs"
@@ -93,6 +95,11 @@ privateModules =
 -- | The collection representations, hidden in the main library.
 collectionTypes ∷ String
 collectionTypes = "Hetoimasia.Foundation.Resource.Collection.Types"
+
+-- | The capability-owned collection's representations, hidden in the main
+-- library.
+ownedCollectionTypes ∷ String
+ownedCollectionTypes = "Hetoimasia.Foundation.Resource.OwnedCollection.Types"
 
 importClient ∷ String → String
 importClient hidden = unlines ["module Client () where", "", "import " <> hidden]
@@ -149,5 +156,30 @@ supportedClient =
     , "      , MemberNotLive"
     , "      )"
     , "  , Activity (Acquiring, Borrowing, Retiring, Closing)"
+    , "  )"
+    , "import Hetoimasia.Foundation.Resource.OwnedCollection"
+    , "  ( OwnedCollection"
+    , "  , allocOwnedCollection"
+    , "  , liveOwnedMemberCount"
+    , "  , OwnerCapability"
+    , "  , noCapability"
+    , "  , lendCapability"
+    , "  , acquireOwnedMember"
+    , "  , acquireOwnedMemberThen"
+    , "  , withOwnedMember"
+    , "  , retireOwnedMember"
+    , "  , OwnedCollectionError"
+    , "      ( OwnedInvalidMemberLimit"
+    , "      , CapabilityMissing"
+    , "      , CapabilityForeign"
+    , "      , CapabilityStale"
+    , "      , ConcurrentPresentation"
+    , "      , OwnedForeignMember"
+    , "      , OwnedReentered"
+    , "      , OwnedClosed"
+    , "      , OwnedLimitReached"
+    , "      , OwnedPoisoned"
+    , "      , OwnedMemberNotLive"
+    , "      )"
     , "  )"
     ]

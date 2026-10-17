@@ -43,6 +43,14 @@
 -- what lets code that must not wait for anything, such as an adapter's wait for
 -- a reply, refuse when it is asked from inside any VM's callback.
 --
+-- A VM an owner constructed can also be given a 'CallbackScope', which runs
+-- around each of its callbacks on the callback's own thread, inside the record
+-- above and for exactly the callback's duration. It is how an owner lends
+-- something to a callback and takes it back, and it asks the VM, through the
+-- 'CallbackSite' it is handed, whether a thread is one of the VM's recorded
+-- callbacks instead of keeping a claim of its own. It changes nothing the
+-- paragraphs above say.
+--
 -- A Haskell exception that reaches a callback is not thrown through the C
 -- frame. The trampoline records it here and signals an ordinary Lua error; the
 -- operation that was running reads the record back and re-raises the original
@@ -97,6 +105,9 @@ module Hetoimasia.Scripting.Lua.Internal.Vm
     -- * Callbacks
   , runCallback
   , runningLuaCallback
+  , CallbackScope (..)
+  , CallbackSite (..)
+  , noCallbackScope
     -- * Escaped Haskell failures
   , recordEscape
   , raiseEscape
@@ -297,7 +308,36 @@ data Vm = Vm
     -- ^ While a coroutine is being closed, every Haskell failure that reaches a
     -- callback, newest first, kept apart from the operation's own pending one, and
     -- how many were not kept past 'finalizerEvidenceLimit'.
+  , vmCallbackScope ∷ !CallbackScope
+    -- ^ What runs around each callback on its own thread. Fixed when the VM is
+    -- made.
   }
+
+-- | What an owner runs around each of its VM's callbacks, on the callback's own
+-- thread.
+--
+-- The scope receives the callback's 'CallbackSite' and the callback itself, and
+-- runs it. It starts after the VM has recorded the thread as one of its
+-- callbacks and ends before the record is removed, so everything it set up is
+-- in place for exactly the callback's duration and nothing outlives it. It runs
+-- masked, as the callback's own bookkeeping does, and must not raise: a failure
+-- of the scope itself is not a failure of the callback's action, and nothing is
+-- there to contain it. Whatever the callback raises is the scope's to let
+-- through unchanged. It must not wait for anything.
+newtype CallbackScope = CallbackScope (∀ a. CallbackSite → IO a → IO a)
+
+-- | What a 'CallbackScope' may ask the VM it runs for.
+newtype CallbackSite = CallbackSite
+  { siteIsCallback ∷ IO Bool
+    -- ^ Whether the calling thread is one of this VM's recorded callbacks right
+    -- now: the same record that refuses an operation re-entered from a
+    -- callback. A thread a callback starts is not one, and neither is a
+    -- callback of another VM.
+  }
+
+-- | A scope that runs the callback and nothing more.
+noCallbackScope ∷ CallbackScope
+noCallbackScope = CallbackScope (\_ action → action)
 
 -- | What a scheduler operation asked for when it suspended a task.
 data Suspension
@@ -340,12 +380,14 @@ data VmSpec = VmSpec
   , specOwner ∷ !(Maybe ThreadId)
     -- ^ The VM's execution owner, if it has one.
   , specFinalizers ∷ !FinalizerPolicy
+  , specCallbackScope ∷ !CallbackScope
+    -- ^ What runs around each of the VM's callbacks.
   }
 
--- | A VM nobody owns, whose finalizers' callbacks all run, on Lua's allocator:
--- what 'newVm' makes.
+-- | A VM nobody owns, whose finalizers' callbacks all run, on Lua's allocator,
+-- with nothing around its callbacks: what 'newVm' makes.
 unmanagedSpec ∷ VmSpec
-unmanagedSpec = VmSpec Nothing Nothing FinalizersUnrestricted
+unmanagedSpec = VmSpec Nothing Nothing FinalizersUnrestricted noCallbackScope
 
 -- | The interpreter's current phase.
 vmPhase ∷ Vm → IO Phase
@@ -431,7 +473,7 @@ allocateVm spec = do
   taskSlots ← newIORef 0
   live ← newIORef Set.empty
   cleaning ← newIORef Nothing
-  pure (Vm state gate phase escape closing releases finished callers (specOwner spec) (specFinalizers spec) dropped identity runs ready slots context active suspension taskSlots live cleaning)
+  pure (Vm state gate phase escape closing releases finished callers (specOwner spec) (specFinalizers spec) dropped identity runs ready slots context active suspension taskSlots live cleaning (specCallbackScope spec))
 
 -- | Open exactly the named standard libraries, in order, as one operation of
 -- the VM: under its gate, by its owner, restoring the stack it borrowed.
@@ -606,12 +648,17 @@ runCallback vm action = do
   self ← myThreadId
   atomicModifyIORef' (vmCallers vm) (\callers → (self : callers, ()))
   atomicModifyIORef' callbackThreads (\running → (Map.insertWith (+) self 1 running, ()))
-  action
+  scoped
     `finally` ( atomicModifyIORef' callbackThreads (\running → (Map.update leave self running, ()))
                   >> atomicModifyIORef' (vmCallers vm) (\callers → (delete self callers, ()))
               )
   where
     leave count = if count <= 1 then Nothing else Just (count - 1)
+    -- The owner's scope, if it has one, runs around the action between the record
+    -- being made and it being removed.
+    scoped = case vmCallbackScope vm of
+      CallbackScope around → around site action
+    site = CallbackSite ((\self callers → self `elem` callers) <$> myThreadId <*> readIORef (vmCallers vm))
 
 -- | Whether the calling thread is running a Lua callback right now, of any VM:
 -- a binding's action, the application's own liveness check, or a finalizer's
