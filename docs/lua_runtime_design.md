@@ -88,10 +88,20 @@ the other trusted slices or the confined branch.
 Q-9 through Q-17 below preserve the resolved design questions. D-16 through
 D-27 record lifecycle, identity, scheduling, determinism, delivery and automatic
 cleanup requirements. The [instance contract](lua_instance_contract.md) is
-accepted by D-26 and strengthened by D-27. LUA-6 remains deferred pending final
-slice-readiness reconciliation and explicit readiness signoff; do not request
+accepted by D-26 and strengthened by D-27. LUA-6's design-readiness check is
+complete; it remains deferred only pending explicit readiness signoff. Do not request
 the same behavioral approval again. No tracker item has been created by this
 design discussion.
+
+LUA-6 readiness check at `637d14a9`: its LUA-5/TIME-1 prerequisites are delivered;
+Q-9 through Q-17 are resolved or assigned under the approved contract and D-25
+organization. Its outcome, compatibility, deterministic ordering, bounded
+controls and acceptance signals are explicit. Instance authoring/automatic
+cleanup belongs to LUA-18, providers to LUA-7 and the runner to LUA-19, keeping
+the scheduler slice bounded. The ledger matches all 19 delivery sections, and
+the open tracker contains the existing epic #145 but no LUA-6 child. Recommend
+renewing trusted readiness for LUA-6 alone, then processing that child under the
+existing epic. This review does not renew other slices or the confinement branch.
 
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
 reviewed and deliberately not tracked separately · `[deferred]` blocked on a
@@ -2069,8 +2079,8 @@ and verified policy, with adversarial regression coverage.
 ### LUA-6. Schedule cooperative tasks with bounded service turns
 
 > Deferred: readiness discussion opened 2026-10-17. LUA-5 and TIME-1 are
-> delivered and the concrete contract is accepted (D-26/D-27). Final slice
-> readiness is still to be renewed; earlier narrow renewals did not cover it.
+> delivered and the concrete contract is accepted (D-26/D-27). Design-readiness
+> review is complete; explicit LUA-6 readiness signoff remains pending.
 
 - **Outcome:** one trusted VM owner services resumable tasks fairly, wakes for
   events/deadlines, and reports real budget overruns without fake preemption.
@@ -2083,7 +2093,7 @@ and verified policy, with adversarial regression coverage.
 - **Phase:** execution policy.
 - **Depends on:** LUA-5; external TIME-1 (Q-4).
 - **Ordering:** critical path; precedes LUA-18, then LUA-7.
-- **Relevant decisions:** D-1, D-3, D-4, D-12, D-13, D-16, D-17, D-18, D-19, D-20, D-21, D-22, D-23, D-24, D-25.
+- **Relevant decisions:** D-1, D-3, D-4, D-12, D-13, D-16, D-17, D-18, D-19, D-20, D-21, D-22, D-23, D-24, D-25, D-26, D-27.
 - **Acceptance signals:** peers get bounded opportunities at safe yields;
   paused/event-only work does not spin; stop wakes waits; logical time advances
   only on explicit completion; elapsed budget cannot be sold as a hard limit.
