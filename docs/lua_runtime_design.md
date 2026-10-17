@@ -9,7 +9,7 @@ failure evidence, and lifetime. This is the canonical continuation of
 Design state: `ready for issue processing`
 
 Current readiness scope: **LUA-18 only** (D-30), which now spans LUA-18, LUA-22,
-LUA-23 and LUA-24 (D-31). LUA-6 (with LUA-20 and LUA-21, D-28/D-29) is delivered. Other
+LUA-23 and LUA-24 (D-31), with LUA-25 as LUA-22's prerequisite (D-32). LUA-6 (with LUA-20 and LUA-21, D-28/D-29) is delivered. Other
 unchecked slices retain their explicit deferrals; this state does not release
 the confinement gate.
 
@@ -143,6 +143,13 @@ LUA-6's integration PR (#471, six review rounds), so at signoff the manager took
 the drafter's fallback partition and D-31 carves instance cadence (LUA-24) out of
 LUA-18, adding no scope. D-30's readiness covers it.
 
+LUA-22 review, 2026-10-17: the canonical review of #473 requested changes
+(https://github.com/coghex/hetoimasia/issues/473#issuecomment-6235679552).
+`Foundation.Resource.Collection` admits only the thread that created it, while
+a Lua binding runs on a fresh callback thread for each call and the owner's
+thread is blocked inside Lua, so D-30's "built on `Foundation.Resource.Collection`"
+could not hold. The owner chose a prerequisite slice (D-32, LUA-25).
+
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
 reviewed and deliberately not tracked separately · `[deferred]` blocked on a
 concrete precondition
@@ -164,6 +171,7 @@ concrete precondition
 - [x] LUA-22. Own instance resources through engine-held leases — [#473]
 - [x] LUA-23. Grant Lua lifecycle controls and inspection across owners — [#474]
 - [ ] LUA-24. Run instance updates on logical and elapsed cadences
+- [ ] LUA-25. Lend a resource collection's ownership to synchronous Lua callbacks
 - [ ] LUA-7. Add bounded asynchronous requests and owned subscriptions — [deferred]: owner renews trusted-path readiness for this slice
 - [ ] LUA-19. Run script instances through a headless command-line entry — [deferred]: contract accepted; renew slice readiness
 - [ ] LUA-8. Prove independent trusted UI and gameplay execution headlessly — [deferred]: owner renews trusted-path readiness for this slice
@@ -270,7 +278,11 @@ LUA-18 builds on:
   masked (`acquireMemberThen` hands the token to an owner's bookkeeping in the
   same step); repeated retirement answers `AlreadyRetired` without releasing
   twice; a release failure poisons further acquisition and is latched as
-  cleanup evidence. It is the existing machinery LUA-22 builds leases on.
+  cleanup evidence. Its owner is the thread that created it: every other thread
+  is refused with `NotOwnerThread`. A Lua binding runs on a fresh callback thread
+  for each call while the owner's thread is blocked inside Lua (the host README,
+  "How callbacks re-enter"), so a binding cannot use it directly. D-32 adds the
+  primitive LUA-22 builds leases on (LUA-25).
 
 - **The Lua host** (`packages/scripting-lua`, built on the `lua` binding
   `>=2.3.4 && <2.4`). Its public library exposes only
@@ -864,6 +876,29 @@ LUA-24 is carved out with no added scope, depends only on LUA-18 and is
 independent of LUA-22 and LUA-23. LUA-19's looped examples need it, and LUA-8
 integrates it. D-30's readiness covers LUA-24. This decision files no tracker
 item.
+
+### D-32. Lend collection ownership to synchronous callbacks through a prerequisite slice
+
+Owner decision, 2026-10-17, in the hetoimasia manager pane, answering the
+manager's question after #473's canonical review requested changes
+(https://github.com/coghex/hetoimasia/issues/473#issuecomment-6235679552): the
+"Prerequisite slice" option. `Foundation.Resource.Collection` accepts calls
+only from the thread that created it, but a Lua binding runs on a fresh
+callback thread for each call while its owner's thread is blocked inside Lua,
+so LUA-22's leases cannot be registered from a binding as D-30 assumed.
+
+LUA-25 adds, before LUA-22, an additive foundation primitive: a resource
+collection owned by an explicit, unforgeable owner capability instead of a
+thread, with the existing collection's guarantees. The scheduled owner holds
+that capability and lends it to its VM's synchronous binding callbacks for
+exactly their duration. The existing `Collection` API and contract stay
+unchanged. LUA-22 then builds instance leases on LUA-25 and keeps its other
+scope. Rejected alternatives: delivering the primitive inside LUA-22 (a second
+review surface in one PR), and handing acquisition to the owner's thread after
+the invocation yields (no acquisition in the non-suspending `init` or
+`shutdown`, and changed authoring). D-30's readiness covers LUA-25, which adds
+no behavior beyond making LUA-22's accepted behavior implementable. This
+decision files no tracker item.
 
 ## Design
 
@@ -2421,13 +2456,13 @@ and verified policy, with adversarial regression coverage.
 
 ### LUA-22. Own instance resources through engine-held leases
 
-> Ready for issue processing under D-30: carved out of LUA-18 with no added
-> scope.
+> Linked to #473 under D-30. D-32 makes LUA-25 its prerequisite: #473 is
+> revised to build on it and re-reviewed.
 
 - **Outcome:** every resource a binding exposes to an instance is owned by the
   engine, so cleanup is correct however the script behaves.
 - **Scope:** an engine-controlled scope per instance created before `init` and
-  out of reach of Lua tables, built on `Foundation.Resource.Collection`; a
+  out of reach of Lua tables, built on LUA-25's capability-owned collection; a
   binding-author API that reserves capacity, acquires through a staged
   `Assembly` and registers the obligation before the handle reaches Lua; leases
   that make instance versus application ownership explicit, so a shared asset or
@@ -2439,9 +2474,9 @@ and verified policy, with adversarial regression coverage.
   owning resource proves completion, shown with a fake provider; binding-author
   documentation for qualifying an instance-lifetime binding.
 - **Phase:** script authoring and lifetime.
-- **Depends on:** LUA-18.
-- **Ordering:** after LUA-18; independent of LUA-23; precedes LUA-7.
-- **Relevant decisions:** D-7, D-24, D-26, D-27, D-30.
+- **Depends on:** LUA-18, LUA-25.
+- **Ordering:** after LUA-18 and LUA-25; independent of LUA-23; precedes LUA-7.
+- **Relevant decisions:** D-7, D-24, D-26, D-27, D-30, D-32.
 - **Acceptance signals:** acquire-then-error before storing a handle, overwritten
   and lost handles, partial constructor failure, missing and throwing
   `shutdown`, a closing-handler failure, early and double release, one failing
@@ -2528,6 +2563,48 @@ and verified policy, with adversarial regression coverage.
   interval while it runs.
 - **Open questions:** None; the contract's "Cadence and control defaults" fix
   the behavior.
+
+### LUA-25. Lend a resource collection's ownership to synchronous Lua callbacks
+
+> Ready for issue processing under D-30 and D-32: LUA-22's prerequisite, adding
+> no behavior beyond making its accepted behavior implementable.
+
+- **Outcome:** a VM owner's Lua bindings can acquire, borrow and retire
+  resource-collection members on the owner's behalf during a synchronous
+  callback, with every guarantee the existing collection gives its owner thread.
+- **Scope:** an additive primitive in `hetoimasia-foundation`'s resource
+  modules: a collection whose owner is an explicit, unforgeable capability
+  rather than a thread, refusing an operation that presents no valid
+  capability; the existing collection's rules preserved for it (bounded live
+  set, reentry rejection while busy, foreign-member refusal, staged acquisition
+  with masked registration and the owner handoff, exactly-once retirement with
+  already-retired answers and stored-failure rethrow, poisoning and latched
+  cleanup evidence, closure with its scope); serialization enforced, so two
+  threads presenting the capability at once are refused rather than assumed
+  apart; the existing `Collection` API and contract unchanged, and
+  `docs/resources.md` updated. In `runtime-lua`: the scheduled owner holds the
+  capability on its own thread and lends it to its VM's synchronous binding
+  callbacks for exactly their duration; a lent capability is refused after its
+  callback returns, from a thread the callback starts and from another VM's
+  callback; the collection closes with the owner's retirement on its thread.
+- **Phase:** script authoring and lifetime.
+- **Depends on:** LUA-6 (delivered).
+- **Ordering:** can land first: independent of LUA-18, LUA-23 and LUA-24;
+  precedes LUA-22.
+- **Relevant decisions:** D-15, D-27, D-32.
+- **Acceptance signals:** foundation tests of the capability collection mirror
+  the existing collection's (limit, reentry, foreign members, staged rollback,
+  masked registration, retirement once, poisoning, evidence) and add a missing
+  or stale capability refused and concurrent presentation refused; the existing
+  collection's tests pass unchanged; on a real scheduled owner a test binding
+  acquires, borrows and retires members during a callback, and a capability kept
+  past its callback, used from a thread the callback started or presented from
+  another VM is refused; owner retirement releases what remains with its
+  evidence.
+- **Out of scope:** instance scopes and leases (LUA-22); asynchronous provider
+  retirement (LUA-22, LUA-7); changing the existing `Collection`'s thread-owner
+  contract; cross-owner sharing of a collection.
+- **Open questions:** None; D-32 fixes the approach.
 
 ### LUA-7. Add bounded asynchronous requests and owned subscriptions
 
@@ -2777,7 +2854,7 @@ and verified policy, with adversarial regression coverage.
 
 The trusted dependency order is LUA-2 after the delivered LUA-1; LUA-3 after
 LUA-2; LUA-5 after LUA-3 and the delivered LUA-4; then LUA-6 (as LUA-20 and
-LUA-21, then LUA-6, under D-29), LUA-18, then LUA-22, LUA-23 and LUA-24 (D-31), LUA-7, LUA-19 and
+LUA-21, then LUA-6, under D-29), LUA-18, then LUA-23 and LUA-24 (D-31), LUA-25 then LUA-22 (D-32), LUA-7, LUA-19 and
 LUA-8 under D-25 and D-30. LUA-6 retains external TIME-1; LUA-7 consumes the
 instance ownership API and introduces no second clock implementation.
 The shared VK-1 toolchain prerequisite remains satisfied.
@@ -2787,7 +2864,7 @@ platform proofs; LUA-10, LUA-11, and LUA-13 in parallel; LUA-12 after both
 platform slices and TIME-1; LUA-16 after LUA-6/LUA-7/LUA-12/LUA-13; then
 LUA-17 after LUA-8/LUA-16. Stable IDs are preserved, with LUA-16/LUA-17
 retaining the confined integration and acceptance removed from LUA-5/LUA-8.
-There are twenty-four delivery slices. All of this can run alongside
+There are twenty-five delivery slices. All of this can run alongside
 graphics implementation. Coordinate the shared Cabal project, CI
 catalog/workflow, and any narrow foundation evidence change; parallel work
 does not authorize conflicting edits or duplicate platform infrastructure.
