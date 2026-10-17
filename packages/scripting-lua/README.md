@@ -1753,7 +1753,8 @@ the failures of closing its coroutine (the task still settles as faulted), or a 
 whose cancellation throws ends the owner through the same retirement. A stop that is itself
 interrupted keeps every close's failure, the interruption among them, and the failure of a
 timer's cancellation beside it (the scheduler's stop report carries it, whether the stop
-or an earlier service turn met it: the timer remembers the first). A task-level stop
+or an earlier service turn met it: the timer remembers the first, whatever the type of what
+the cancellation raised, an asynchronous exception type it throws itself included). A task-level stop
 whose close is interrupted keeps that failure before it propagates. A task's coroutine is
 acquired and published to the owner's table together, masked, and a resumed segment's
 outcome is recorded masked as well, so a cancellation queued during a segment lands after
