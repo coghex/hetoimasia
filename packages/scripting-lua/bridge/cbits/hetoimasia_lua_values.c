@@ -1355,9 +1355,8 @@ static int task_cleanup(lua_State *L, lua_State *co, lua_Integer slot)
 **
 ** `*outcome` says how the segment ended. For a completed task the results are
 ** moved onto `L`'s stack when there are `expected` of them. For a failed one the
-** task has been closed and unanchored, the error it failed with is on top of
-** `L`'s stack, and above it the error closing raised if that was a different one
-** (`*cleanup_error`); `trace` holds the traceback of the failure.
+** coroutine is left dead and anchored, with the error it failed with on its own
+** stack, and `trace` holds the traceback of the failure.
 */
 int hetoimasia_lua_task_resume(
   lua_State *L, lua_Integer slot, int starting, int expected,
@@ -1408,10 +1407,37 @@ int hetoimasia_lua_task_resume(
     *outcome = HETOIMASIA_TASK_YIELDED;
     return LUA_OK;
   }
+  /* The coroutine is dead and its stack intact. It is closed by a call of its
+  ** own (`hetoimasia_lua_task_cleanup`), so that what closing raises can be told
+  ** from what the segment raised. */
   *trace_length = build_traceback(co, 0, trace, trace_capacity);
   *outcome = HETOIMASIA_TASK_FAILED;
-  *cleanup_error = task_cleanup(L, co, slot);
+  *cleanup_error = 0;
   return status;
+}
+
+/*
+** Close the coroutine in `slot` that is not suspended where the host left it --
+** one that failed, or that a script resumed itself -- running the to-be-closed
+** variables it still holds, and unanchor it. The error it died with, if any, is
+** on top of `L`'s stack afterwards, and above it the error closing raised if that
+** was another (`*cleanup_error`). `*errored` says whether it had died with an
+** error, which is whether it can have held anything to run.
+*/
+int hetoimasia_lua_task_cleanup(lua_State *L, lua_Integer slot, int *present, int *errored, int *cleanup_error)
+{
+  lua_State *co;
+  *present = 0;
+  *errored = 0;
+  *cleanup_error = 0;
+  co = task_thread(L, slot);
+  if (co == NULL) {
+    return LUA_OK;
+  }
+  *present = 1;
+  *errored = lua_status(co) > LUA_YIELD;
+  *cleanup_error = task_cleanup(L, co, slot);
+  return LUA_OK;
 }
 
 /*

@@ -206,7 +206,7 @@ int hetoimasia_lua_call(
 enum {
   HETOIMASIA_TASK_COMPLETED = 0,   /* returned; the results are on the stack */
   HETOIMASIA_TASK_YIELDED = 1,     /* suspended by a yield */
-  HETOIMASIA_TASK_FAILED = 2,      /* raised an error; the task has been closed */
+  HETOIMASIA_TASK_FAILED = 2,      /* raised an error; the coroutine is dead, not yet closed */
   HETOIMASIA_TASK_UNRESUMABLE = 3, /* the slot holds nothing resumable */
   HETOIMASIA_TASK_ARITY = 4        /* returned a number of results other than expected */
 };
@@ -238,6 +238,13 @@ int hetoimasia_lua_task_resume(
   lua_State *L, lua_Integer slot, int starting, int expected,
   char *trace, size_t trace_capacity, size_t *trace_length,
   int *outcome, int *count, int *cleanup_error);
+
+/*
+** Close the coroutine in `slot` that is not suspended where the host left it,
+** running its pending to-be-closed variables, and unanchor it. See the
+** definition for what it leaves on the stack.
+*/
+int hetoimasia_lua_task_cleanup(lua_State *L, lua_Integer slot, int *present, int *errored, int *cleanup_error);
 
 /* Close the task in `slot` and unanchor it. */
 int hetoimasia_lua_task_close(lua_State *L, lua_Integer slot, int *present, int *failed);

@@ -124,6 +124,7 @@ module Hetoimasia.Scripting.Lua.Internal.Vm
   , noteTaskLive
   , noteTaskEnded
   , escapePending
+  , withCleanupEscapes
     -- * Probes
   , vmState
   , vmPhase
@@ -292,6 +293,9 @@ data Vm = Vm
   , vmLiveTasks ∷ !(IORef (Set Int))
     -- ^ The slots of the tasks whose coroutines are suspended, which the close
     -- closes before it closes the state.
+  , vmCleaning ∷ !(IORef (Maybe [ExceptionWithContext SomeException]))
+    -- ^ While a coroutine is being closed, every Haskell failure that reaches a
+    -- callback, newest first, kept apart from the operation's own pending one.
   }
 
 -- | What a scheduler operation asked for when it suspended a task.
@@ -425,7 +429,8 @@ allocateVm spec = do
   suspension ← newIORef Nothing
   taskSlots ← newIORef 0
   live ← newIORef Set.empty
-  pure (Vm state gate phase escape closing releases finished callers (specOwner spec) (specFinalizers spec) dropped identity runs ready slots context active suspension taskSlots live)
+  cleaning ← newIORef Nothing
+  pure (Vm state gate phase escape closing releases finished callers (specOwner spec) (specFinalizers spec) dropped identity runs ready slots context active suspension taskSlots live cleaning)
 
 -- | Open exactly the named standard libraries, in order, as one operation of
 -- the VM: under its gate, by its owner, restoring the stack it borrowed.
@@ -731,10 +736,22 @@ recordEscape vm captured = do
           (vmClosingEscapes vm)
           (\held → if length held >= finalizerEvidenceLimit then (held, False) else (captured : held, True))
       unless kept (atomicModifyIORef' (vmClosingDropped vm) (\count → (count + 1, ())))
-    _ →
-      atomicModifyIORef'
-        (vmEscape vm)
-        (\held → (Just (maybe captured (outranking captured) held), ()))
+    _ → do
+      -- A coroutine being closed on behalf of an operation: its callbacks' failures
+      -- are the close's, not the operation's, and each is kept (bounded).
+      kept ←
+        atomicModifyIORef'
+          (vmCleaning vm)
+          ( \held → case held of
+              Just failures
+                | length failures < finalizerEvidenceLimit → (Just (captured : failures), True)
+                | otherwise → (held, True)
+              Nothing → (Nothing, False)
+          )
+      unless kept $
+        atomicModifyIORef'
+          (vmEscape vm)
+          (\held → (Just (maybe captured (outranking captured) held), ()))
   where
     -- The first failure is the one kept, with one exception: a failure of
     -- application code outranks a refusal the boundary itself made. A script can
@@ -881,3 +898,14 @@ noteTaskEnded vm slot = atomicModifyIORef' (vmLiveTasks vm) (\held → (Set.dele
 -- | Whether a Haskell failure that reached a callback is waiting to be raised.
 escapePending ∷ Vm → IO Bool
 escapePending vm = maybe False (const True) <$> readIORef (vmEscape vm)
+
+-- | Run an action that closes a coroutine, keeping the Haskell failures its
+-- callbacks raise apart from the failure the operation has pending, and answer
+-- them in the order they happened. Each is retained, up to
+-- 'finalizerEvidenceLimit'.
+withCleanupEscapes ∷ Vm → IO a → IO (a, [ExceptionWithContext SomeException])
+withCleanupEscapes vm action = do
+  writeIORef (vmCleaning vm) (Just [])
+  result ← action `onException` writeIORef (vmCleaning vm) Nothing
+  collected ← atomicModifyIORef' (vmCleaning vm) (\held → (Nothing, held))
+  pure (result, reverse (maybe [] id collected))

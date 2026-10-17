@@ -14,8 +14,10 @@ import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar)
 import Control.Exception
   ( AsyncException (UserInterrupt)
+  , ExceptionWithContext (ExceptionWithContext)
   , IOException
   , SomeException
+  , fromException
   , try
   )
 import Control.Monad (forM, forM_, replicateM_, void)
@@ -24,7 +26,7 @@ import Data.Maybe (isJust)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Text.Encoding (encodeUtf8)
-import Hetoimasia.Foundation.Resource (cleanupFailureLabel, cleanupFailures)
+import Hetoimasia.Foundation.Resource (cleanupFailureException, cleanupFailureLabel, cleanupFailures)
 import Hetoimasia.Scripting.Lua.Internal.Module (liveModuleReferences)
 import Hetoimasia.Scripting.Lua.Internal.Owner
   ( OwnerConfig (ownerBudget, ownerGranted, ownerModules, ownerName, ownerRegistration)
@@ -88,6 +90,9 @@ taskRegistration probe =
           , stateOperation "fail" [] [] $ \_ → do
               note probe "fail"
               ioError (userError "the action failed")
+          , stateOperation "raise" [SText] [] $ \arguments → do
+              note probe ("raise " <> render arguments)
+              ioError (userError (Text.unpack (render arguments)))
           , stateOperation "poke" [] [] $ \_ → do
               found ← readIORef (probeSelf probe)
               forM_ found $ \(owned, handle, task) → do
@@ -209,6 +214,29 @@ workerSource =
     , "function steal() local ok = coroutine.resume(shared); return ok end"
     , "function poker() sched.yield(); probe.poke(); return 1 end"
     , "function heap_kb() collectgarbage(); collectgarbage(); return math.floor(collectgarbage('count')) end"
+    , "function double_failure()"
+    , "  local guard <close> = setmetatable({}, {__close = function() probe.raise('CLEANUP') end})"
+    , "  sched.yield()"
+    , "  probe.raise('PRIMARY')"
+    , "end"
+    , "function script_error_then_cleanup_failure()"
+    , "  local guard <close> = setmetatable({}, {__close = function() probe.raise('CLEANUP') end})"
+    , "  sched.yield()"
+    , "  error('the script failed')"
+    , "end"
+    , "function many_cleanup_failures()"
+    , "  local a <close> = setmetatable({}, {__close = function() probe.raise('FIRST') end})"
+    , "  local b <close> = setmetatable({}, {__close = function() probe.raise('SECOND') end})"
+    , "  sched.yield()"
+    , "  return 1"
+    , "end"
+    , "function late_failure_with_guard()"
+    , "  shared = coroutine.running()"
+    , "  local guard <close> = setmetatable({}, {__close = function() probe.note('cleanup ran'); error('the close failed') end})"
+    , "  sched.yield()"
+    , "  error('late failure')"
+    , "end"
+    , "function resume_shared() local ok = coroutine.resume(shared); return ok end"
     , "function closed_count() return closed or 0 end"
     , "function yielded_in_close_flag() return yielded_in_close == true end"
     , "function holder() sched.yield(); probe.hold(); sched.yield(); return 1 end"
@@ -296,6 +324,11 @@ workerEntries =
   , required "steal" [] [SBoolean]
   , required "poker" [] [SInteger]
   , required "heap_kb" [] [SInteger]
+  , required "double_failure" [] []
+  , required "script_error_then_cleanup_failure" [] []
+  , required "many_cleanup_failures" [] [SInteger]
+  , required "late_failure_with_guard" [] []
+  , required "resume_shared" [] [SBoolean]
   , required "closed_count" [] [SInteger]
   , required "yielded_in_close_flag" [] [SBoolean]
   , required "holder" [] [SInteger]
@@ -375,6 +408,7 @@ spec = describe "tasks" $ do
   waitSpec
   faultSpec
   precedenceSpec
+  cleanupSpec
   closingSpec
   refusalSpec
   librarySpec
@@ -612,6 +646,79 @@ precedenceSpec = describe "a failure the script caught" $ do
     withWorker probe $ \owned handle → do
       fault ← faulted (startTask owned handle "resume_refusal_then_yield" [])
       boundaryBinding fault `shouldBe` Just ("probe", "integer_only")
+
+-- | The cleanup evidence a failure carries: each label with the exception's text.
+evidenceOf ∷ SomeException → [(Text, Text)]
+evidenceOf raised =
+  [ (cleanupFailureLabel cleanup, Text.pack (show inner))
+  | cleanup ← cleanupFailures raised
+  , let ExceptionWithContext _ inner = cleanupFailureException cleanup
+  ]
+
+cleanupSpec ∷ Spec
+cleanupSpec = describe "closing the coroutine of a segment that failed" $ do
+  it "keeps a callback's failure during the close apart from the segment's own, each with its type" $ do
+    probe ← newProbe
+    withWorker probe $ \owned handle → do
+      (task, _) ← begin owned handle "double_failure" []
+      outcome ← try @SomeException (resumeTask owned task)
+      case outcome of
+        Right _ → expectationFailure "the failures were lost"
+        Left raised → do
+          fmap show (fromException raised ∷ Maybe IOException) `shouldBe` Just "user error (PRIMARY)"
+          map fst (evidenceOf raised) `shouldBe` ["lua coroutine close"]
+          map snd (evidenceOf raised) `shouldSatisfy` all (Text.isInfixOf "CLEANUP")
+      logged probe >>= (`shouldBe` ["raise PRIMARY", "raise CLEANUP"])
+      refused ← faulted (resumeTask owned task)
+      boundaryReason refused `shouldBe` TaskRefused (TaskEnded TaskFaulted)
+
+  it "reports a script's error as the failure, and a callback's failure while closing as evidence" $ do
+    probe ← newProbe
+    withWorker probe $ \owned handle → do
+      (task, _) ← begin owned handle "script_error_then_cleanup_failure" []
+      outcome ← try @SomeException (resumeTask owned task)
+      case outcome of
+        Right _ → expectationFailure "the failures were lost"
+        Left raised → do
+          case fromException raised of
+            Just fault → case boundaryReason fault of
+              ScriptFailed CallFailed (ErrorMessage message _) → message `shouldSatisfy` Text.isInfixOf "the script failed"
+              other → expectationFailure ("unexpected reason: " <> show other)
+            Nothing → expectationFailure ("not a fault: " <> show raised)
+          map snd (evidenceOf raised) `shouldSatisfy` \found → length found == 1 && all (Text.isInfixOf "CLEANUP") found
+
+  it "keeps every callback failure of a close, the first as the failure and the others beside it" $ do
+    probe ← newProbe
+    withWorker probe $ \owned handle → do
+      (task, _) ← begin owned handle "many_cleanup_failures" []
+      outcome ← try @SomeException (closeTask owned task)
+      case outcome of
+        Right _ → expectationFailure "the failures were lost"
+        Left raised → do
+          -- Lua closes the variables newest first.
+          fmap show (fromException raised ∷ Maybe IOException) `shouldBe` Just "user error (SECOND)"
+          map snd (evidenceOf raised) `shouldSatisfy` \found -> length found == 1 && all (Text.isInfixOf "FIRST") found
+      closeTask owned task
+
+  it "reports what closing ran when a script resumed the coroutine itself and it died holding a variable to close" $ do
+    probe ← newProbe
+    withWorker probe $ \owned handle → do
+      (task, step) ← begin owned handle "late_failure_with_guard" []
+      step `shouldBe` Yielded
+      callEntry owned handle "resume_shared" [] >>= (`shouldBe` Returned [VBoolean False])
+      outcome ← try @SomeException (resumeTask owned task)
+      case outcome of
+        Right _ → expectationFailure "the close was not reported"
+        Left raised → do
+          fault ← maybe (expectationFailure "not a fault" >> error "unreachable") pure (fromException raised)
+          boundaryReason fault `shouldBe` TaskRefused TaskNotSuspended
+          boundaryEffect fault `shouldBe` BindingRan
+          map fst (evidenceOf raised) `shouldBe` ["lua coroutine close"]
+      logged probe >>= (`shouldBe` ["note cleanup ran"])
+      again ← faulted (resumeTask owned task)
+      boundaryReason again `shouldBe` TaskRefused (TaskEnded TaskFaulted)
+      closeTask owned task
+      bookkeeping owned >>= \(_, _, _, tasks) → tasks `shouldBe` 0
 
 closingSpec ∷ Spec
 closingSpec = describe "closing a task" $ do

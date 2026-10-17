@@ -36,6 +36,8 @@ module Hetoimasia.Scripting.Lua.Internal.Marshal
   , resumeSegment
   , TaskClosing (..)
   , closeTaskCoroutine
+  , TaskCleanup (..)
+  , cleanupTaskCoroutine
   , taskReferences
     -- * Calling
   , callProtected
@@ -126,6 +128,9 @@ foreign import ccall safe "hetoimasia_lua_values.h hetoimasia_lua_task_resume"
 
 foreign import ccall safe "hetoimasia_lua_values.h hetoimasia_lua_task_close"
   c_task_close ∷ State → Int64 → Ptr CInt → Ptr CInt → IO StatusCode
+
+foreign import ccall safe "hetoimasia_lua_values.h hetoimasia_lua_task_cleanup"
+  c_task_cleanup ∷ State → Int64 → Ptr CInt → Ptr CInt → Ptr CInt → IO StatusCode
 
 foreign import ccall safe "hetoimasia_lua_values.h hetoimasia_lua_task_count"
   c_task_count ∷ State → Ptr CLong → IO StatusCode
@@ -570,6 +575,30 @@ closeTaskCoroutine state slot =
       here ← peek present
       bad ← peek failed
       pure (TaskClosing (here /= 0) (bad /= 0) status)
+
+-- | What closing a coroutine that is not suspended where the host left it came to.
+data TaskCleanup = TaskCleanup
+  { cleanupPresent ∷ !Bool
+  , cleanupErrored ∷ !Bool
+    -- ^ It had died with an error, so it can have held to-be-closed variables to
+    -- run. Otherwise closing it ran nothing.
+  , cleanupDifferent ∷ !Bool
+    -- ^ Closing raised an error other than the one it died with. The stack holds
+    -- the error it died with, and above it that one.
+  }
+
+-- | Close a coroutine that failed, or that a script resumed itself, running its
+-- pending to-be-closed variables, and empty its slot.
+cleanupTaskCoroutine ∷ State → Int → IO TaskCleanup
+cleanupTaskCoroutine state slot =
+  alloca $ \present →
+    alloca $ \errored →
+      alloca $ \different → do
+        _ ← c_task_cleanup state (fromIntegral slot) present errored different
+        here ← peek present
+        died ← peek errored
+        extra ← peek different
+        pure (TaskCleanup (here /= 0) (died /= 0) (extra /= 0))
 
 -- | How many tasks' coroutines the registry anchors.
 taskReferences ∷ State → IO (Either StatusCode Int)
