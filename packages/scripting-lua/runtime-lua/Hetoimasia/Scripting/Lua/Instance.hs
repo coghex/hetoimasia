@@ -325,6 +325,9 @@ module Hetoimasia.Scripting.Lua.Instance
   , InstanceControlAnswer (..)
   , InstanceControlReceipt
   , requestInstanceControl
+  , requestInstanceControlAt
+  , ControlAdmission (..)
+  , ControlSlot (..)
   , pollInstanceControl
   , waitInstanceControl
   , awaitInstanceControl
@@ -438,6 +441,19 @@ requestInstanceControl ∷ ScheduledEndpoint → InstanceId → InstanceControl 
 requestInstanceControl (ScheduledEndpoint control) identity request = case controlInstances control of
   Nothing → pure InstanceControlUnknown
   Just instances → atomically (State.requestInstanceControl instances (gateOf control) (controlOwner control) identity request)
+
+-- | Request that an instance pause, resume or stop at a place in the owner's logical input
+-- sequence. Never blocks, from any thread.
+--
+-- The owner must admit controls logically ('AdmitLogically'): the request is applied at
+-- the logical boundary of its tick, before that tick's other work, in the order of
+-- (tick, sequence). Answers 'InstanceControlLate' for a tick the owner has begun,
+-- 'InstanceControlDuplicate' for a place another request holds, and
+-- 'InstanceControlNotLogical' for an owner that admits on arrival.
+requestInstanceControlAt ∷ ScheduledEndpoint → InstanceId → InstanceControl → ControlSlot → IO InstanceControlAnswer
+requestInstanceControlAt (ScheduledEndpoint control) identity request slot = case controlInstances control of
+  Nothing → pure InstanceControlUnknown
+  Just instances → atomically (State.requestInstanceControlAt instances (gateOf control) (controlOwner control) identity request slot)
 
 -- | The settlement if there is one, without waiting. Observes it.
 pollInstanceControl ∷ InstanceControlReceipt → IO (Maybe ControlResult)

@@ -23,9 +23,12 @@
 --
 -- The kinds are those of P-4. A snapshot query and an owned state operation
 -- answer values; a command or UI intention answers acceptance or a bounded
--- rejection as data; an asynchronous native request and a lifecycle operation
--- are accepted and classified by the registration, and a call to either is
--- refused by the owner as not yet supported (decision A1). The kind that starts
+-- rejection as data; an asynchronous native request is accepted and classified by
+-- the registration, and a call to one is refused by the owner as not yet supported
+-- (decision A1). A lifecycle operation is classified too, and is refused the same
+-- way by an owner that is not granted lifecycle services; an owner that is (LUA-23)
+-- runs its action, handing it what the owner was configured with: the engine-owned
+-- 'LifecycleContext', never anything the script supplied. The kind that starts
 -- asynchronous work is never eligible to run from a finalizer (P-3).
 --
 -- A scheduler operation ('yieldOperation', 'waitOperation') is a binding that runs
@@ -57,6 +60,10 @@ module Hetoimasia.Scripting.Lua.Internal.Registration
   , commandIntention
   , asynchronousNativeRequest
   , lifecycleOperation
+  , lifecycleOperationIn
+  , LifecycleContext
+  , lifecycleContext
+  , fromLifecycleContext
   , confinedEligible
   , finalizerEligible
   , withoutDirectPath
@@ -100,6 +107,8 @@ module Hetoimasia.Scripting.Lua.Internal.Registration
 
 import Control.Monad (unless, when)
 import Data.Char (isAscii, isAsciiLower, isAsciiUpper, isDigit)
+import Data.Dynamic (Dynamic, fromDynamic, toDyn)
+import Data.Typeable (Typeable)
 import Data.List (find, nub)
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -170,6 +179,10 @@ data Action
     -- for the slice that will, and is never run: a Lua call to the binding is
     -- refused as not yet supported before anything else happens.
     ReservedAction ([Value] → IO [Value])
+  | -- | A lifecycle operation: refused as not yet supported, and never run, by an
+    -- owner configured with no 'LifecycleContext'; run, with the owner's own
+    -- context, by one that has it.
+    LifecycleAction (LifecycleContext → [Value] → IO [Value])
   | -- | A scheduler operation: no application code runs. The task's coroutine is
     -- suspended and the host is told which operation did it, with the arguments
     -- it was given.
@@ -213,11 +226,40 @@ asynchronousNativeRequest ∷ Text → [Schema] → [Schema] → ([Value] → IO
 asynchronousNativeRequest name arguments results action =
   Binding name AsynchronousNativeRequest arguments results True False False (ReservedAction action)
 
--- | A lifecycle operation: accepted and classified; a Lua call to it is refused
--- as not yet supported, and the action is never run.
+-- | A lifecycle operation: accepted and classified. A Lua call to it is refused as
+-- not yet supported, and the action never runs, from an owner that was configured
+-- with no 'LifecycleContext'; from one that was, the action runs, as a values
+-- action does. The action is shared by every owner that registers it, so it learns
+-- who is calling from 'lifecycleOperationIn' and not from anything here.
 lifecycleOperation ∷ Text → [Schema] → [Schema] → ([Value] → IO [Value]) → Binding
-lifecycleOperation name arguments results action =
-  Binding name LifecycleOperation arguments results True False False (ReservedAction action)
+lifecycleOperation name arguments results action = lifecycleOperationIn name arguments results (const action)
+
+-- | A lifecycle operation whose action is handed the 'LifecycleContext' of the owner
+-- whose script called it. The context is the owner's own, set when the owner was
+-- made and read here by the engine, never taken from a value the script supplied:
+-- one registration, shared by owners with different grants, tells them apart by
+-- it. Otherwise as 'lifecycleOperation'.
+lifecycleOperationIn ∷ Text → [Schema] → [Schema] → (LifecycleContext → [Value] → IO [Value]) → Binding
+lifecycleOperationIn name arguments results action =
+  Binding name LifecycleOperation arguments results True False False (LifecycleAction action)
+
+-- | What an owner is configured with so that its lifecycle operations are
+-- delivered: an opaque value of the application's runtime, which this host library
+-- never reads. An owner that has none refuses a lifecycle operation as not yet
+-- supported. A client of this library can read one back only as the type it was
+-- made from ('fromLifecycleContext').
+newtype LifecycleContext = LifecycleContext Dynamic
+
+instance Show LifecycleContext where
+  show _ = "<lifecycle context>"
+
+-- | A context holding this value.
+lifecycleContext ∷ Typeable a ⇒ a → LifecycleContext
+lifecycleContext = LifecycleContext . toDyn
+
+-- | The value a context holds, if it is of this type.
+fromLifecycleContext ∷ Typeable a ⇒ LifecycleContext → Maybe a
+fromLifecycleContext (LifecycleContext held) = fromDynamic held
 
 -- | A yield: control goes back to whatever resumes the task, which resumes it
 -- later. It takes no arguments and answers none.

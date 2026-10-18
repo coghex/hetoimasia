@@ -79,6 +79,10 @@ module Hetoimasia.Scripting.Lua.Registration
   , commandIntention
   , asynchronousNativeRequest
   , lifecycleOperation
+  , lifecycleOperationIn
+  , LifecycleContext
+  , lifecycleContext
+  , fromLifecycleContext
   , yieldOperation
   , waitOperation
   , WaitKind (..)

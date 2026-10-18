@@ -41,6 +41,7 @@ import qualified Data.Text as Text
 import Hetoimasia.Scripting.Lua.Internal.Fault (ErrorValue, FaultKind)
 import Hetoimasia.Scripting.Lua.Internal.Registration
   ( BindingKind
+  , LifecycleContext
   , Registration
   , capabilityNameOf
   , capabilityNumber
@@ -59,6 +60,9 @@ data Boundary = Boundary
   , boundaryVmIdentity ∷ !VmIdentity
   , boundaryRegistration ∷ Registration
   , boundaryLimits ∷ !ValueLimits
+  , boundaryLifecycle ∷ !(Maybe LifecycleContext)
+    -- ^ What the owner was configured with so that its lifecycle operations are
+    -- delivered. 'Nothing': a call to one is refused as not yet supported.
   }
 
 -- | What checking a value needs of this owner.

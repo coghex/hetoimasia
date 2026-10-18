@@ -9,6 +9,10 @@ module Hetoimasia.Scripting.Lua.Instance.State
   , admitInstance
   , deliverEvent
   , requestInstanceControl
+  , requestInstanceControlAt
+  , admitControl
+  , takeDueControls
+  , takeAllLogical
   , observeInstance
   , forgetInstance
   , observeReceipt
@@ -160,26 +164,75 @@ deliverEvent instances gate owner identity source payload = do
 -- Accepted, a request takes a reservation for its result and is applied by the
 -- owner at its next safe boundary, in the order accepted.
 requestInstanceControl ∷ Instances → Gate → OwnerId → InstanceId → InstanceControl → STM InstanceControlAnswer
-requestInstanceControl instances gate owner identity request = do
+requestInstanceControl instances gate owner identity request =
+  admitControl instances gate owner identity request Nothing >>= either pure id
+
+-- | Request that an instance pause, resume or stop at a place in a logically admitting
+-- owner's input sequence. Never blocks.
+--
+-- Accepted, the request takes a reservation for its result and waits for the logical
+-- boundary of its tick, where the owner applies it in the order of (tick, sequence)
+-- ahead of that tick's other work. One assigned a tick the owner has begun is refused
+-- as late, and one assigned a place another request holds as a duplicate; neither is
+-- ever applied at another boundary or ordered by arrival. An owner that does not admit
+-- logically refuses it.
+requestInstanceControlAt ∷ Instances → Gate → OwnerId → InstanceId → InstanceControl → ControlSlot → STM InstanceControlAnswer
+requestInstanceControlAt instances gate owner identity request slot =
+  admitControl instances gate owner identity request (Just slot) >>= either pure id
+
+-- | What a request meets, decided in one transaction: either the refusal, with nothing
+-- changed, or the step that takes the request, which the caller runs in the same
+-- transaction. The split lets a caller whose own bound must also hold take nothing
+-- unless both do, with the reason a refusal is found for in one order: the owner
+-- closed, the target unknown, the slot not logical, late or taken, and the owner's
+-- reservations all held.
+admitControl ∷ Instances → Gate → OwnerId → InstanceId → InstanceControl → Maybe ControlSlot → STM (Either InstanceControlAnswer (STM InstanceControlAnswer))
+admitControl instances gate owner identity request slot = do
   open ← gateOpen gate
   if not open
-    then pure InstanceControlClosed
+    then pure (Left InstanceControlClosed)
     else do
       found ← lookupLive instances owner identity
       case found of
-        Nothing → pure InstanceControlUnknown
+        Nothing → pure (Left InstanceControlUnknown)
         Just cell → do
           reserved ← readTVar (insControls instances)
-          if reserved >= boundInstanceControls (insBounds instances)
-            then pure InstanceControlFull
-            else do
-              settlement ← newTVar Nothing
-              forgotten ← newTVar False
-              released ← newTVar False
-              let receipt = InstanceControlReceipt settlement forgotten released (insControls instances)
-              writeTVar (insControls instances) (reserved + 1)
-              modifyTVar' (insInbox instances) (|> JobControl (icId cell) request receipt)
-              pure (InstanceControlAccepted receipt)
+          tick ← gateTick gate
+          queued ← readTVar (insLogical instances)
+          pure $ case slot of
+            Just place
+              | insAdmission instances /= AdmitLogically → Left InstanceControlNotLogical
+              | controlTick place <= tick → Left InstanceControlLate
+              | Map.member place queued → Left InstanceControlDuplicate
+            _
+              | reserved >= boundInstanceControls (insBounds instances) → Left InstanceControlFull
+              | otherwise → Right $ do
+                  settlement ← newTVar Nothing
+                  forgotten ← newTVar False
+                  released ← newTVar False
+                  let receipt = InstanceControlReceipt settlement forgotten released (insControls instances)
+                  writeTVar (insControls instances) (reserved + 1)
+                  case slot of
+                    Just place → modifyTVar' (insLogical instances) (Map.insert place (LogicalControl (icId cell) request receipt))
+                    Nothing → modifyTVar' (insInbox instances) (|> JobControl (icId cell) request receipt)
+                  pure (InstanceControlAccepted receipt)
+
+-- | The accepted requests assigned a tick the owner has reached, in the order of their
+-- places, taken: every one of them is applied at the boundary the owner is at, or is
+-- settled by the owner's exit.
+takeDueControls ∷ Instances → Word64 → STM [(ControlSlot, LogicalControl)]
+takeDueControls instances tick = do
+  queued ← readTVar (insLogical instances)
+  let (due, later) = Map.partitionWithKey (\place _ → controlTick place <= tick) queued
+  writeTVar (insLogical instances) later
+  pure (Map.toAscList due)
+
+-- | Every request still waiting for its tick, taken: what the owner's exit settles.
+takeAllLogical ∷ Instances → STM [LogicalControl]
+takeAllLogical instances = do
+  queued ← readTVar (insLogical instances)
+  writeTVar (insLogical instances) Map.empty
+  pure (Map.elems queued)
 
 -- | Give a receipt's reservation back, once.
 releaseReceipt ∷ InstanceControlReceipt → STM ()

@@ -61,6 +61,7 @@ module Test.LuaRuntime.Instance.Support
   , instanceBounds'
   , testConfig
   , tickSource
+  , instRegistration
   , instanceSpec
   , startInstances
   , startWith

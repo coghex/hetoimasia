@@ -9,6 +9,7 @@ import qualified Test.LuaRuntime.HostFailures
 import qualified Test.LuaRuntime.Identity
 import qualified Test.LuaRuntime.Independence
 import qualified Test.LuaRuntime.Instance.Spec
+import qualified Test.LuaRuntime.Lifecycle.Spec
 import qualified Test.LuaRuntime.Readiness
 import qualified Test.LuaRuntime.Scheduled.Spec
 import qualified Test.LuaRuntime.Scheduler.Spec
@@ -31,3 +32,4 @@ spec = describe "the Lua runtime adapter" $ do
   Test.LuaRuntime.Scheduler.Spec.spec
   Test.LuaRuntime.Scheduled.Spec.spec
   Test.LuaRuntime.Instance.Spec.spec
+  Test.LuaRuntime.Lifecycle.Spec.spec
