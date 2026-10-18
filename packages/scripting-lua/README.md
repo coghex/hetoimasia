@@ -2026,6 +2026,33 @@ failure and is never taken for a failure of the close, and when several instance
 is the owner's and every other is kept whole as cleanup evidence. What an ending had counted survives a failure of the
 host in its hook.
 
+### What an ending keeps
+
+An instance's ending is one record, made when it begins and kept until the instance settles: why it ends, its
+primary failure (the phase, the stage, the error and the traceback), what the ending revoked and discarded, and what
+became of `shutdown`. The hook's disposition is written once, when it is decided: not run because `init` never
+succeeded, skipped because Lua was not safe to enter, absent, started, or finished (returned, or raised a failure of the
+instance's code). A hook that was started and has not answered is recorded as started; if a failure of the host cut it
+short that is how it settles (`ShutdownRaised`, with no failure the instance can report), and coming back to the ending
+neither runs it again nor releases the instance's record in a VM that raised. Nothing is recomputed from the owner's mode
+afterwards.
+
+One function, `settleEnding`, settles an instance and tells the application of its failure, and every path that ends an
+instance reads the record through it: a stop of its own (`applyControl`, `continueStop`), an invocation that failed or a
+one-shot's `run` that completed (`invocationFailed`, `invocationCompleted`), an instance that failed at a hook
+(`failInstance`), a coroutine the scheduler closed (`instanceClosed`, ended from the owner's own code), the owner's
+retirement in order and after a failure or a cancellation (`retireInstances`, through `finishEnding`), an ending that a
+failure of the host interrupted and that retirement comes back to (`finishEnding` again, which finds the hook's record),
+and an ending that could not be carried through at all (`discardUnsettled`, which is the same function). A first failure,
+once recorded, is never replaced by anything later: not by the owner's exit, not by a hook that raised a failure of the
+host, not by the retirement. An instance with a failure in its record settles as failed, with that failure, its
+traceback and a failing `shutdown` beside it as secondary, whatever the owner's exit; one with none settles as discarded
+when the owner exited by a failure or a cancellation, or when its hook was cut short, and as stopped or completed
+otherwise. The failure of the host still ends the owner, unconverted, under its `WorkerPolicy`, and the way the owner first exited (a failure or a cancellation) is the way every instance left after it is discarded: what a later ending raises does not rewrite it. Settling an instance and deciding that the application is told of it are one step a cancellation cannot cut between, and the hook's answer is recorded in a step it cannot cut either. The application is told of
+a failed instance exactly once, by whichever path settles it (an owner that is exiting is told too: what it answers is
+not raised, because the owner's own failure is what it exits with, and what telling it raised is kept as cleanup
+evidence beside that failure).
+
 ### Control
 
 `requestInstanceControl` asks that an instance pause, resume or stop, and answers at once, from any
@@ -2082,7 +2109,9 @@ Every accepted instance settles exactly once (`InstanceSettlement`): completed, 
 discarded, with what its end revoked and released (`Termination`: the connections revoked, the unstarted
 invocations discarded, the invocations that began and were closed, and what became of `shutdown`). A
 failing `shutdown` is kept and never retried, runtime cleanup still happens, and an instance that would
-have completed or stopped is failed by it; a primary failure stays primary. Observing, abandoning and
+have completed or stopped is failed by it; a primary failure stays primary, with its traceback, on every path
+that ends an instance, including one a failure of the host interrupted (see *What an ending keeps*), and the
+disposition of `shutdown` is the one recorded when it was decided. Observing, abandoning and
 waiting work as for tasks (`pollInstance`, `waitInstance`, `awaitInstance`, `forgetInstance`), and a
 ticket nobody observes or forgets keeps its reservation, which bounds the retained results.
 `inspectInstance` and `inspectInstances` answer bounded, coherent snapshots (`InstanceSnapshot`), each
@@ -2113,7 +2142,12 @@ and the hooks that cannot suspend, a failed callback, a failed `shutdown`, the a
 host and the evidence of a failed close; events during `init`, a full queue, every refusal, and what an accepted event
 keeps; pause and the order resume restores, stop while paused, contradictory and refused requests; what each way
 of ending revokes and counts, retirement, cancellation and the instances an owner never began; every bound and a
-configuration that does not fit; and one workload run under different segment costs and service budgets. The
+configuration that does not fit; and one workload run under different segment costs and service budgets; and a matrix of what first happened
+to an instance (a Lua error in a callback, a failure of the host, nothing) by what its `shutdown` does (returns, raises, raises a
+failure of the host) by how it ends (its own stop, the owner's retirement, the owner's teardown), each cell holding the settlement, the
+owner's exception and the application's notification to one model. Every wait in these examples is for a signal the code
+under test sets (a settlement, a terminal status, the notification the escalation makes, a diagnostic that says an invocation was queued or refused, the wait a grant is for
+having been taken), never for an ordering the test assumes. The
 cancellation and shutdown windows are the kind an asynchronous-exception race can hide on one platform, so CI, which
 runs them on Linux, is the evidence for them and a local pass is not.
 
