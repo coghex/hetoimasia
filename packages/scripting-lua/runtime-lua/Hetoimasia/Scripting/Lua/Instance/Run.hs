@@ -75,6 +75,7 @@ module Hetoimasia.Scripting.Lua.Instance.Run
   , runningTask
   , recordExit
   , cleanupEndedOwner
+  , endOwner
   ) where
 
 import Control.Concurrent.STM (STM, atomically, modifyTVar', orElse, readTVar, readTVarIO, retry, swapTVar, writeTVar)
@@ -138,7 +139,11 @@ import Hetoimasia.Scripting.Lua.Runtime.Types
   , Payload (WithinBounds)
   , Progress (NotStarted, Started)
   )
-import Hetoimasia.Scripting.Lua.Scheduled.Shared (settledOrRaise, waitReport)
+import Hetoimasia.Scripting.Lua.Provider.Serve (endRequester, raiseFirst, serveTick, serviceProvider)
+import Hetoimasia.Scripting.Lua.Provider.State (anyInstanceWorkPending, pendingWorkFor, workWaiting)
+import Hetoimasia.Scripting.Lua.Provider.Types (ProviderState, Requester (RequesterInstance))
+import Hetoimasia.Scripting.Lua.Internal.Protocol.Request (CancelCause (CancelledByTaskInvalidation))
+import Hetoimasia.Scripting.Lua.Scheduled.Shared (settledOrRaise, waitReportFor)
 import Hetoimasia.Scripting.Lua.Scheduled.Types
 import Hetoimasia.Foundation.Time
   ( Duration
@@ -296,6 +301,9 @@ data InstanceHost = InstanceHost
     -- raises, the owner's exit still finds the rest, and settles their receipts.
   , ihLeases ∷ !(Maybe LeaseHost)
     -- ^ The owner's leases, when its instances hold any.
+  , ihProvider ∷ !(Maybe ProviderState)
+    -- ^ The owner's request service, when it was granted one: the requests its instances
+    -- own, which an instance's end revokes and its settlement waits for.
   , ihParked ∷ !(IORef (Set.Set Word64))
     -- ^ Instances whose ending has run its hook and released its holdings and waits
     -- for a provider's retirement before it settles.
@@ -319,8 +327,9 @@ newInstanceHost
   → IORef (Map TaskId Task)
   → IORef [(Text, ExceptionWithContext SomeException)]
   → Maybe LeaseHost
+  → Maybe ProviderState
   → IO InstanceHost
-newInstanceHost control instances escalate host owned driver handles tasks extra leases =
+newInstanceHost control instances escalate host owned driver handles tasks extra leases provider =
   InstanceHost control instances escalate owned driver handles tasks extra
     <$> newIORef Map.empty
     <*> newIORef Map.empty
@@ -331,6 +340,7 @@ newInstanceHost control instances escalate host owned driver handles tasks extra
     <*> pure host
     <*> newIORef []
     <*> pure leases
+    <*> pure provider
     <*> newIORef Set.empty
     <*> newIORef False
     <*> newIORef []
@@ -835,7 +845,7 @@ instanceSegment ih run number starting = do
             invocationCompleted ih cell stage
             pure (ReportCompleted (Finished (Returned [])))
           Owner.Yielded → pure (ReportYielded (HostedInvocation number))
-          Owner.Waiting request → pure (waitReport (HostedInvocation number) request)
+          Owner.Waiting request → waitReportFor (ihProvider ih) (RequesterInstance number) (HostedInvocation number) request
     -- Start a task and keep its coroutine where the owner's retirement finds it:
     -- acquired and published together, masked, so a cancellation lands after both.
     begin start = do
@@ -1035,12 +1045,23 @@ serveWatch ih = \case
       taken ← atomically $ do
         due ← takeDueControls (ihInstances ih) tick
         later ← readTVar (insLogical (ihInstances ih))
-        setWatch (scheduler' ih) (fst <$> Map.lookupMin (Map.mapKeys controlTick later))
+        -- The requests due at this tick are served in the same step, and the next place
+        -- either kind of input waits for is what the owner watches for next: the one watch is
+        -- shared, so neither can leave the other without it.
+        nextRequest ← maybe (pure Nothing) (`serveTick` tick) (ihProvider ih)
+        let nextControl = fst <$> Map.lookupMin (Map.mapKeys controlTick later)
+        setWatch (scheduler' ih) (earliest nextControl nextRequest)
         pure due
       modifyIORef' (ihDue ih) (<> taken)
     applyDue ih (const True)
     atomically (releaseWatch (scheduler' ih))
   _ → atomically (releaseWatch (scheduler' ih))
+
+-- | The earlier of two ticks that may not be there.
+earliest ∷ Maybe Word64 → Maybe Word64 → Maybe Word64
+earliest (Just first) (Just second) = Just (min first second)
+earliest first Nothing = first
+earliest Nothing second = second
 
 -- | Apply the controls held for this boundary, from the front, for as long as the places
 -- they were assigned satisfy the test. Each leaves the list as it begins, with the handler
@@ -1345,12 +1366,20 @@ finishEnding ih cell closed = do
 -- did.
 parkOrSettle ∷ InstanceHost → ICell → IO ()
 parkOrSettle ih cell = do
-  waiting ← case ihLeases ih of
-    Nothing → pure 0
-    Just lh → atomically (pendingFor (lhLeases lh) (icId cell))
+  waiting ← atomically (pendingOf ih (icId cell))
   if waiting > 0
     then modifyIORef' (ihParked ih) (Set.insert (icId cell))
     else settleEnding ih cell
+
+-- | What an instance's end still waits for: the retirements its leases await, and the work its
+-- requests' providers have not proved over.
+pendingOf ∷ InstanceHost → Word64 → STM Int
+pendingOf ih number = do
+  leased ← case ihLeases ih of
+    Nothing → pure 0
+    Just lh → pendingFor (lhLeases lh) number
+  requested ← maybe (pure 0) (`pendingWorkFor` RequesterInstance number) (ihProvider ih)
+  pure (leased + requested)
 
 -- | Release what an instance still holds, newest first, whatever the instance's end
 -- was and whatever its hook did. A release that fails does not stop another, is
@@ -1359,13 +1388,23 @@ parkOrSettle ih cell = do
 -- cut between: a failed slot is not drained again, so a failure that was not recorded
 -- would be lost.
 drainInstance ∷ InstanceHost → ICell → IO ()
-drainInstance ih cell = forM_ (ihLeases ih) $ \lh → mask_ $ do
-  report ← drainScope lh (icId cell)
-  forM_ (drainFailures report) $ \failure → do
-    note ← renderCaught failure
-    modifyIORef' (ihExtra ih) (<> [("lua instance lease", failure)])
-    atomically (noteScope (lhLeases lh) (icId cell) note)
-  unless (null (drainFailures report)) (endOwner ih)
+drainInstance ih cell = mask_ $ do
+  -- Its requests end first, and the providers are told: they are asked to stop before what
+  -- the instance's leases hold is released. The instance owns them, whichever invocation
+  -- made them, and nothing else ends them but its end.
+  told ← case ihProvider ih of
+    Nothing → pure []
+    Just service → endRequester service (RequesterInstance (icId cell)) CancelledByTaskInvalidation
+  forM_ (ihLeases ih) $ \lh → mask_ $ do
+    report ← drainScope lh (icId cell)
+    forM_ (drainFailures report) $ \failure → do
+      note ← renderCaught failure
+      modifyIORef' (ihExtra ih) (<> [("lua instance lease", failure)])
+      atomically (noteScope (lhLeases lh) (icId cell) note)
+    unless (null (drainFailures report)) (endOwner ih)
+  -- A provider that raised when told is a failure of the host: raised once everything has
+  -- been released, with the others kept whole.
+  raiseFirst (ihExtra ih) "lua request cancel" told
 
 -- | A cleanup failure of the leases ends the owner at once, through supervision, with
 -- the evidence it was recorded as: admission, grants and control close and the scheduler
@@ -1390,53 +1429,73 @@ cleanupEndedOwner = readIORef . ihFailed
 -- on the owner, fatal whatever the application's escalation answers, and is noted on
 -- its instance. Answers whether anything ended.
 serviceRetirementsOf ∷ InstanceHost → IO Bool
-serviceRetirementsOf ih = case ihLeases ih of
+serviceRetirementsOf ih = do
+  requested ← serviceRequestWork ih
+  leased ← maybe (pure False) (serviceLeaseRetirements ih) (ihLeases ih)
+  parked ← Set.toList <$> readIORef (ihParked ih)
+  -- Every ending that is ready settles, whatever settling another raises (the application's
+  -- escalation, a failure of the host): the first of the failures is raised once the
+  -- others have been settled.
+  settledEach ← forM parked $ \number → do
+    pending ← atomically (pendingOf ih number)
+    if pending > 0
+      then pure (False, Nothing)
+      else do
+        modifyIORef' (ihParked ih) (Set.delete number)
+        outcome ← guarded (withCell ih number (settleEnding ih))
+        pure (True, either Just (const Nothing) outcome)
+  -- None is dropped: the first is raised, and every other is cleanup evidence for the
+  -- owner's end, whole, so that supervision receives each of them.
+  case [failure | (_, Just failure) ← settledEach] of
+    failure : others → do
+      modifyIORef' (ihExtra ih) (<> [("lua instance settlement", other) | other ← others])
+      rethrowIO failure
+    [] → pure ()
+  let settled = map fst settledEach
+  pure (requested || leased || or settled)
+
+-- | Poll the providers of the requests this owner's instances made, dispose of what their work
+-- needed once it is over, and record a retirement that failed, or a disposal that raised, as
+-- cleanup evidence that ends the owner. Answers whether any failed.
+serviceRequestWork ∷ InstanceHost → IO Bool
+serviceRequestWork ih = case ihProvider ih of
   Nothing → pure False
-  Just lh → do
-    let leases = lhLeases lh
-    done ← mask_ $ do
-      (ended, disposals) ← atomically (serviceRetirements leases)
-      forM_ ended $ \finished → forM_ (endedFailure finished) $ \failure → do
+  Just service → mask_ $ do
+    -- Servicing takes a failure out of the accounts and answers it once: recording it is the
+    -- same masked step, so a cancellation cannot come between and lose it.
+    failures ← serviceProvider service
+    unless (null failures) $ do
+      modifyIORef' (ihExtra ih) (<> failures)
+      endOwner ih
+    pure (not (null failures))
+
+-- | Take away the retirements the providers of the leases finished, and dispose of what they
+-- needed. Answers whether anything ended.
+serviceLeaseRetirements ∷ InstanceHost → LeaseHost → IO Bool
+serviceLeaseRetirements ih lh = do
+  let leases = lhLeases lh
+  mask_ $ do
+    (ended, disposals) ← atomically (serviceRetirements leases)
+    forM_ ended $ \finished → forM_ (endedFailure finished) $ \failure → do
+      rendered ← renderCaught failure
+      modifyIORef' (ihExtra ih) (<> [("lua lease retirement", failure)])
+      forM_ (endedInstance finished) $ \number →
+        atomically . noteScope leases number . failureText $
+          "the provider's retirement of " <> endedLabel finished <> " failed: " <> rendered
+      endOwner ih
+    -- What the retirements needed is disposed of now that every one has completed, as a
+    -- release is: uninterruptibly, one at a time, a failure of one not stopping the rest.
+    forM_ disposals $ \Disposals {disposalsKey = key, disposalsInstance = number, disposalsActions = actions} → do
+      failures ← forM actions $ \dispose →
+        either Just (const Nothing) <$> guarded (uninterruptibleMask_ dispose)
+      forM_ [failure | Just failure ← failures] $ \failure → do
         rendered ← renderCaught failure
-        modifyIORef' (ihExtra ih) (<> [("lua lease retirement", failure)])
-        forM_ (endedInstance finished) $ \number →
-          atomically . noteScope leases number . failureText $
-            "the provider's retirement of " <> endedLabel finished <> " failed: " <> rendered
+        modifyIORef' (ihExtra ih) (<> [("lua lease dependency", failure)])
+        atomically . noteScope leases number . failureText $ "disposing what a retirement needed failed: " <> rendered
         endOwner ih
-      -- What the retirements needed is disposed of now that every one has completed, as a
-      -- release is: uninterruptibly, one at a time, a failure of one not stopping the rest.
-      forM_ disposals $ \Disposals {disposalsKey = key, disposalsInstance = number, disposalsActions = actions} → do
-        failures ← forM actions $ \dispose →
-          either Just (const Nothing) <$> guarded (uninterruptibleMask_ dispose)
-        forM_ [failure | Just failure ← failures] $ \failure → do
-          rendered ← renderCaught failure
-          modifyIORef' (ihExtra ih) (<> [("lua lease dependency", failure)])
-          atomically . noteScope leases number . failureText $ "disposing what a retirement needed failed: " <> rendered
-          endOwner ih
-        -- The lease keeps the first failure, which every later release of it answers.
-        atomically (finishDisposals leases key (case [failure | Just failure ← failures] of first : _ → Just first; [] → Nothing))
-      pure (not (null ended && null disposals))
-    parked ← Set.toList <$> readIORef (ihParked ih)
-    -- Every ending that is ready settles, whatever settling another raises (the application's
-    -- escalation, a failure of the host): the first of the failures is raised once the
-    -- others have been settled.
-    settledEach ← forM parked $ \number → do
-      pending ← atomically (pendingFor leases number)
-      if pending > 0
-        then pure (False, Nothing)
-        else do
-          modifyIORef' (ihParked ih) (Set.delete number)
-          outcome ← guarded (withCell ih number (settleEnding ih))
-          pure (True, either Just (const Nothing) outcome)
-    -- None is dropped: the first is raised, and every other is cleanup evidence for the
-    -- owner's end, whole, so that supervision receives each of them.
-    case [failure | (_, Just failure) ← settledEach] of
-      failure : others → do
-        modifyIORef' (ihExtra ih) (<> [("lua instance settlement", other) | other ← others])
-        rethrowIO failure
-      [] → pure ()
-    let settled = map fst settledEach
-    pure (done || or settled)
+      -- The lease keeps the first failure, which every later release of it answers.
+      atomically (finishDisposals leases key (case [failure | Just failure ← failures] of first : _ → Just first; [] → Nothing))
+    pure (not (null ended && null disposals))
 
 -- | Record what became of an instance's @shutdown@ in its ending.
 recordShutdown ∷ InstanceHost → ICell → ShutdownRecord → IO ()
@@ -1608,11 +1667,11 @@ retireInstances ih = do
 -- failure of the host, or the application's escalation, each of which leaves the
 -- others to settle.
 awaitRetirements ∷ InstanceHost → IO [ExceptionWithContext SomeException]
-awaitRetirements ih = case ihLeases ih of
-  Nothing → pure []
-  Just lh → uninterruptibleMask_ (loop lh [])
+awaitRetirements ih = case (ihLeases ih, ihProvider ih) of
+  (Nothing, Nothing) → pure []
+  _ → uninterruptibleMask_ (loop [])
   where
-    loop lh raised = do
+    loop raised = do
       served ← guarded (serviceRetirementsOf ih)
       let raised' = raised <> [failure | Left failure ← [served]]
       parked ← Set.toList <$> readIORef (ihParked ih)
@@ -1620,16 +1679,21 @@ awaitRetirements ih = case ihLeases ih of
       -- anything is left to wait for: the settling that raised, for the application's
       -- escalation or a failure of the host, left the others as they were, and nothing
       -- else will wake the owner for them.
-      ready ← or <$> traverse (\number → (== 0) <$> atomically (pendingFor (lhLeases lh) number)) parked
-      outstanding ← atomically (anyPending (lhLeases lh))
+      ready ← or <$> traverse (\number → (== 0) <$> atomically (pendingOf ih number)) parked
+      outstanding ← atomically $ do
+        leased ← maybe (pure False) (anyPending . lhLeases) (ihLeases ih)
+        requested ← maybe (pure False) anyInstanceWorkPending (ihProvider ih)
+        pure (leased || requested)
       if ready
-        then loop lh raised'
+        then loop raised'
         else
           if null parked && not outstanding
             then pure raised'
             else do
-              atomically (retirementsReady (lhLeases lh))
-              loop lh raised'
+              atomically $
+                maybe retry (retirementsReady . lhLeases) (ihLeases ih)
+                  `orElse` maybe retry (\service → workWaiting service >>= \found → unless found retry) (ihProvider ih)
+              loop raised'
 
 -- | Settle an instance that is still unsettled, because its end could not be carried
 -- through: from what its ending recorded, as any other ending is. What it still holds is

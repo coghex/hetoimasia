@@ -74,9 +74,10 @@ module Hetoimasia.Scripting.Lua.Internal.Value
   , conformValue
   , encodeValues
   , checkLimits
+  , valuesFootprint
   ) where
 
-import Control.Monad (foldM, foldM_)
+import Control.Monad (foldM)
 import Data.Bits (shiftL, (.|.))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
@@ -530,7 +531,12 @@ conformValue context = go []
 -- element and the bytes it would have been: the work is bounded by what is
 -- looked at, and an endless record of nil fields is refused like any other.
 checkLimits ∷ ValueLimits → [Value] → Either ValueRule ()
-checkLimits limits values = foldM_ (\acc value → walk 1 value acc) (0, 0) values
+checkLimits limits values = () <$ valuesFootprint limits values
+
+-- | The size of the copy these values would make, in bytes, if it is within the limits:
+-- what 'checkLimits' counts, and the same refusal when it is not.
+valuesFootprint ∷ ValueLimits → [Value] → Either ValueRule Int
+valuesFootprint limits values = fst <$> foldM (\acc value → walk 1 value acc) (0, 0) values
   where
     walk ∷ Int → Value → (Int, Int) → Either ValueRule (Int, Int)
     walk depth value (bytes, elements)

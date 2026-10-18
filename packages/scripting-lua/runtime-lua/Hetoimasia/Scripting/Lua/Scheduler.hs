@@ -226,6 +226,16 @@ module Hetoimasia.Scripting.Lua.Scheduler
   , taskPhase
   , TaskPhase (..)
 
+    -- * Ticks that wait for the owner
+  , holdTick
+  , releaseTick
+  , tickIsHeld
+
+    -- * Waiting for a request
+  , requestWaiting
+  , wakeRequestWaiters
+  , wakeRequestWaitersOrdered
+
     -- * Cadences
   , CadenceKey (..)
   , CadenceFault (..)
@@ -341,7 +351,7 @@ import Control.Concurrent.STM
   , writeTVar
   )
 import Control.Exception (SomeAsyncException, SomeException, catch, fromException, mask, mask_, onException, throwIO, try)
-import Control.Monad (forM_, unless, when)
+import Control.Monad (filterM, forM_, unless, when)
 import Data.Foldable (toList)
 import Data.IORef (modifyIORef', newIORef, readIORef)
 import Data.Maybe (isJust)
@@ -528,6 +538,64 @@ grantStep scheduler duration = do
   let (next, answer) = grantIn open (boundOutstandingGrants (schedBounds (schedConfig scheduler))) duration state
   writeTVar (schedState scheduler) next
   pure answer
+
+-- Ticks that wait for the owner ---------------------------------------------------
+
+-- | The owner needs one more thing complete before this tick begins. Never blocks.
+--
+-- A grant that would reach a tick with such a need outstanding is not applied: the
+-- logical tick stays where it is, nothing is woken and nothing of the tick happens, until
+-- every need has been given back with 'releaseTick'. That is how a tick waits for a
+-- provider (D-36), as it waits for nothing else; later grants wait behind it, in order.
+-- A tick already begun is unaffected, so the caller asks only for a tick after the one
+-- it read, in the transaction that read it.
+holdTick ∷ Scheduler v → Word64 → STM ()
+holdTick scheduler tick = modifyTVar' (schedState scheduler) (holdTickIn tick)
+
+-- | One need for this tick is met, or can no longer arise. Giving back more than was
+-- taken changes nothing.
+releaseTick ∷ Scheduler v → Word64 → STM ()
+releaseTick scheduler tick = modifyTVar' (schedState scheduler) (releaseTickIn tick)
+
+-- | Whether the owner needs something complete before this tick begins.
+tickIsHeld ∷ Scheduler v → Word64 → STM Bool
+tickIsHeld scheduler tick = tickHeld tick <$> readTVar (schedState scheduler)
+
+-- Waiting for a request -----------------------------------------------------------
+
+-- | Whether a task is waiting, and not paused, for a request the owner says has settled.
+-- Composed into the owner's wait for work, so an owner with nothing else to do wakes
+-- when a settlement it was waiting for arrives. Reads, and changes nothing.
+requestWaiting ∷ Scheduler v → (Word64 → STM Bool) → STM Bool
+requestWaiting scheduler settled = do
+  state ← readTVar (schedState scheduler)
+  anyM (settled . snd) (requestWaitersOf state)
+  where
+    anyM _ [] = pure False
+    anyM test (x : xs) = test x >>= \found → if found then pure True else anyM test xs
+
+-- | Wake every task whose request the owner says has settled, in the order their waits
+-- began, each behind the tasks already ready and handed nothing. Answers whether it
+-- woke any. A task paused while it waited is skipped and keeps its wait: it is woken by
+-- the first look after it is resumed. Called on the owner's thread at a safe boundary.
+wakeRequestWaiters ∷ Scheduler v → (Word64 → STM Bool) → STM Bool
+wakeRequestWaiters scheduler settled = do
+  state ← readTVar (schedState scheduler)
+  ready ← filterM (settled . snd) (requestWaitersOf state)
+  writeTVar (schedState scheduler) (foldl' (flip (wakeRequestWaiter . fst)) state ready)
+  pure (not (null ready))
+
+-- | Wake the tasks waiting for these requests, in the order the requests are named, each behind
+-- the tasks already ready. It is how a tick's settlements reach Lua in the order of their places
+-- and not of the order the waits began. Answers whether it woke any. A task paused while it
+-- waited is skipped, as for 'wakeRequestWaiters'.
+wakeRequestWaitersOrdered ∷ Scheduler v → [Word64] → STM Bool
+wakeRequestWaitersOrdered scheduler keys = do
+  state ← readTVar (schedState scheduler)
+  let waiters = requestWaitersOf state
+      chosen = [task | key ← keys, (task, found) ← waiters, found == key]
+  writeTVar (schedState scheduler) (foldl' (flip wakeRequestWaiter) state chosen)
+  pure (not (null chosen))
 
 -- Cadences -----------------------------------------------------------------------
 
@@ -1140,6 +1208,8 @@ stopScheduler scheduler host = mask_ $ do
           , ssNextGrant = ssNextGrant state
           , ssLogical = Map.empty
           , ssElapsed = Map.empty
+          , ssRequestWaiters = Map.empty
+          , ssGates = Map.empty
           , ssCadenceLogical = Map.empty
           , ssCadenceElapsed = Map.empty
           , ssFirings = Seq.empty

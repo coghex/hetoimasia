@@ -44,6 +44,8 @@ import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Sequence (Seq)
 import qualified Data.Sequence as Seq
+import Data.Set (Set)
+import qualified Data.Set as Set
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Failure (FailureReason, RecoverySafety)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Identity
   ( BehaviorId
@@ -179,6 +181,10 @@ data Session v = Session
   , sessionResults ∷ !(Map TaskId (TerminalResult v))
   , sessionReservations ∷ !Int
   , sessionRequests ∷ !(Map RequestId (RequestRecord v))
+  , sessionHolders ∷ !(Set TaskId)
+    -- ^ The holders the session issued and has not ended: identities that own
+    -- requests without being one of the session's tasks. See
+    -- 'Hetoimasia.Scripting.Lua.Internal.Protocol.Session.Requests.issueHolder'.
   , sessionSubscriptions ∷ !(Map SubscriptionId (Subscription v))
   , sessionNextOrdinal ∷ !Ordinal
   , sessionEpochFirstTask ∷ !TaskName
@@ -204,6 +210,7 @@ newSession key limits = do
       , sessionResults = Map.empty
       , sessionReservations = 0
       , sessionRequests = Map.empty
+      , sessionHolders = Set.empty
       , sessionSubscriptions = Map.empty
       , sessionNextOrdinal = firstOrdinal
       , sessionEpochFirstTask = firstTaskName

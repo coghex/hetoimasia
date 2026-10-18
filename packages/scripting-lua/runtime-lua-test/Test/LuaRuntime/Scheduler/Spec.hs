@@ -11,6 +11,7 @@ import qualified Test.LuaRuntime.Scheduler.Elapsed
 import qualified Test.LuaRuntime.Scheduler.Lifecycle
 import qualified Test.LuaRuntime.Scheduler.Logical
 import qualified Test.LuaRuntime.Scheduler.Policy
+import qualified Test.LuaRuntime.Scheduler.Requests
 import qualified Test.LuaRuntime.Scheduler.Stop
 import qualified Test.LuaRuntime.Scheduler.Structure
 import Test.Hspec (Spec, describe)
@@ -26,3 +27,4 @@ spec = describe "the Lua task scheduling machinery" $ do
   Test.LuaRuntime.Scheduler.Control.spec
   Test.LuaRuntime.Scheduler.Stop.spec
   Test.LuaRuntime.Scheduler.Lifecycle.spec
+  Test.LuaRuntime.Scheduler.Requests.spec

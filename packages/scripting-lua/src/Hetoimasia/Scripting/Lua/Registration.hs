@@ -28,7 +28,10 @@
 -- whose action never runs. A lifecycle operation is delivered, and its action runs, only
 -- for an owner configured with a 'LifecycleContext' (see 'lifecycleOperationIn'): the
 -- application's runtime hands each owner its own, so one registration shared by owners
--- with different grants tells them apart, and an owner with none keeps the fault. The
+-- with different grants tells them apart, and an owner with none keeps the fault. An
+-- asynchronous native request is delivered the same way, for an owner configured with a
+-- 'RequestContext' (see 'asynchronousNativeRequestIn'), and so is a wait for a request's
+-- settlement ('WaitSettlement'); an owner with none keeps the fault for both. The
 -- asynchronous kind can never be eligible to run from a Lua finalizer during a VM's close,
 -- and neither is a lifecycle operation delivered when a finalizer may call it.
 --
@@ -100,6 +103,10 @@ module Hetoimasia.Scripting.Lua.Registration
   , LifecycleContext
   , lifecycleContext
   , fromLifecycleContext
+  , asynchronousNativeRequestIn
+  , RequestContext
+  , requestContext
+  , fromRequestContext
   , yieldOperation
   , waitOperation
   , WaitKind (..)

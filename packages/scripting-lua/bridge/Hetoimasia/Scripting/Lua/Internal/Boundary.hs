@@ -43,6 +43,7 @@ import Hetoimasia.Scripting.Lua.Internal.Registration
   ( BindingKind
   , LifecycleContext
   , Registration
+  , RequestContext
   , capabilityNameOf
   , capabilityNumber
   )
@@ -63,6 +64,10 @@ data Boundary = Boundary
   , boundaryLifecycle ∷ !(Maybe LifecycleContext)
     -- ^ What the owner was configured with so that its lifecycle operations are
     -- delivered. 'Nothing': a call to one is refused as not yet supported.
+  , boundaryRequests ∷ !(Maybe RequestContext)
+    -- ^ What the owner was configured with so that its asynchronous requests, and a
+    -- wait for one, are delivered. 'Nothing': a call to one is refused as not yet
+    -- supported.
   }
 
 -- | What checking a value needs of this owner.

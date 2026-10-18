@@ -7,21 +7,40 @@
 -- only when both are discharged. The reply path here is the one place a
 -- rejection settles a request: an oversized reply is refused and still
 -- discharges it.
+--
+-- = Who owns a request
+--
+-- A request is owned by an identity, and 'acceptRequest' takes a live task of
+-- the session. An owner that is /not/ one of the session's tasks, an instance
+-- of a script that outlives each of its invocations, owns requests through a
+-- /holder/: an identity the session issues ('issueHolder'), that keeps its
+-- requests until its owner ends it ('endHolder') and not before, and that
+-- accepts requests ('acceptRequestFor') for exactly as long. A holder is
+-- revoked through the same path a retiring task's requests are, so the two
+-- cannot differ in what ending an owner settles, discards or leaves for the
+-- provider.
 module Hetoimasia.Scripting.Lua.Internal.Protocol.Session.Requests
   ( acceptRequest
+  , issueHolder
+  , acceptRequestFor
+  , endHolder
+  , holderLive
+  , withdrawRequest
   , applyReplyIn
   , cancelRequestIn
+  , cancelRequestWith
   , observeRequestIn
   , completeProviderWorkIn
   ) where
 
 import qualified Data.Map.Strict as Map
+import qualified Data.Set as Set
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Failure (ReasonCode (ValidationFault), failureReason)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Identity
   ( EndpointId
   , RequestId (RequestId)
   , RequestName
-  , TaskId
+  , TaskId (TaskId)
   )
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Limits
   ( Limits (maxOutstandingRequests, maxPayloadBytes)
@@ -38,7 +57,7 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Request
   , openRequest
   , requestSettled
   )
-import Hetoimasia.Scripting.Lua.Internal.Protocol.Session.Revocation (reclaim)
+import Hetoimasia.Scripting.Lua.Internal.Protocol.Session.Revocation (invalidateHoldingsOf, reclaim)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Session.State
   ( Counters (..)
   , Session (..)
@@ -50,6 +69,7 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Session.Step
   , notStopped
   , refuse
   , takeGeneration
+  , takeTaskName
   )
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Task (Task (taskState), isTerminal)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Value (Payload (payloadBytes))
@@ -65,7 +85,72 @@ acceptRequest
   → EndpointId
   → Session v
   → (Session v, Either SessionRejection RequestId)
-acceptRequest owner name endpoint session = case checks of
+acceptRequest owner name endpoint session = accepted owner name endpoint ownerLive session
+  where
+    ownerLive = case Map.lookup owner (sessionTasks session) of
+      Nothing → Left (UnknownTask owner)
+      Just task
+        | isTerminal (taskState task) → Left (UnknownTask owner)
+        | otherwise → Right ()
+
+-- | Issue a holder: an identity that can own requests and is not a task.
+--
+-- It takes the next name of the session's one counter, which is never rewound,
+-- so a holder is never mistaken for a task or for another holder. Nothing is
+-- stored beyond its being live until 'endHolder'.
+issueHolder ∷ Session v → (TaskId, Session v)
+issueHolder session =
+  let (name, named) = takeTaskName session
+      identity = TaskId (sessionKey session) name
+   in (identity, named {sessionHolders = Set.insert identity (sessionHolders named)})
+
+-- | Whether a holder is live: issued in this epoch and not ended.
+holderLive ∷ TaskId → Session v → Bool
+holderLive identity session = Set.member identity (sessionHolders session)
+
+-- | Accept a request for a live holder, reserving its bookkeeping exactly as
+-- 'acceptRequest' does for a task.
+acceptRequestFor
+  ∷ TaskId
+  → RequestName
+  → EndpointId
+  → Session v
+  → (Session v, Either SessionRejection RequestId)
+acceptRequestFor holder name endpoint session = accepted holder name endpoint holderOpen session
+  where
+    holderOpen
+      | holderLive holder session = Right ()
+      | otherwise = Left (UnknownTask holder)
+
+-- | End a holder: every request it still has an interest in is revoked, for
+-- this cause, the way a retiring task's are, and the holder accepts no more.
+--
+-- A request that had settled and was observed is untouched, and so is the
+-- accounting for provider work that has not ended: that outlives its owner,
+-- as P-7 requires. Ending a holder that is not live changes nothing.
+endHolder ∷ TaskId → CancelCause → Session v → Session v
+endHolder holder cause session
+  | holderLive holder session =
+      invalidateHoldingsOf holder cause session {sessionHolders = Set.delete holder (sessionHolders session)}
+  | otherwise = session
+
+-- | Take back a request that was accepted and never reached its provider.
+--
+-- The admission did not happen: nothing was asked of anyone, so nothing is
+-- settled, invalidated or counted, and the capacity it reserved is free again.
+-- It is for the caller whose handoff to the provider failed before the provider
+-- could have started work, and for nothing else.
+withdrawRequest ∷ RequestId → Session v → Session v
+withdrawRequest identity session = session {sessionRequests = Map.delete identity (sessionRequests session)}
+
+accepted
+  ∷ TaskId
+  → RequestName
+  → EndpointId
+  → Either SessionRejection ()
+  → Session v
+  → (Session v, Either SessionRejection RequestId)
+accepted owner name endpoint ownerOpen session = case checks of
   Left rejection → refuse session rejection
   Right () →
     let (generation, stamped) = takeGeneration session
@@ -83,11 +168,7 @@ acceptRequest owner name endpoint session = case checks of
     limits = limitsIn session
     checks = do
       notStopped session
-      case Map.lookup owner (sessionTasks session) of
-        Nothing → Left (UnknownTask owner)
-        Just task
-          | isTerminal (taskState task) → Left (UnknownTask owner)
-          | otherwise → Right ()
+      ownerOpen
       if Map.size (sessionRequests session) >= maxOutstandingRequests limits
         then Left (CapReached OutstandingRequests (maxOutstandingRequests limits))
         else Right ()
@@ -165,9 +246,18 @@ applyReplyIn identity reply session = case Map.lookup identity (sessionRequests 
 -- Settles the waiter and leaves provider accounting outstanding, so the
 -- request keeps its capacity until explicit completion evidence arrives.
 cancelRequestIn ∷ RequestId → Session v → (Session v, Either SessionRejection ())
-cancelRequestIn identity session = case Map.lookup identity (sessionRequests session) of
+cancelRequestIn = cancelRequestWith CancelledByOwner
+
+-- | Cancel a request, for this cause, with everything 'cancelRequestIn' does.
+--
+-- The settlement is kept for its owner to observe, which is what separates it
+-- from a revocation: an owner that is still there, and was cancelled for a
+-- reason that is not its own asking (a replaced epoch), is told how its
+-- request ended.
+cancelRequestWith ∷ CancelCause → RequestId → Session v → (Session v, Either SessionRejection ())
+cancelRequestWith cause identity session = case Map.lookup identity (sessionRequests session) of
   Nothing → refuse session (UnknownRequest identity)
-  Just record → case cancelLocally CancelledByOwner record of
+  Just record → case cancelLocally cause record of
     (_, Left rejection) → refuse session (ReplyRefused rejection)
     (next, Right ()) →
       (session {sessionRequests = Map.insert identity next (sessionRequests session)}, Right ())
