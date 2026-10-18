@@ -2514,7 +2514,8 @@ There is no call that controls an owner as a whole.
 A request never blocks, and every refusal is an answer, never a fault. They are decided in this order, and the order is
 the contract: `unauthorized` (the owner is outside the grant, or the grant does not permit the operation there: nothing is
 tested of the target, so an owner outside the grant, another runtime's identity and an identity never issued answer
-alike); for a target admitting logically, `unassigned` (the application is asked for the request's place once the grant
+alike; it is also the answer to a request made when no instance's code and no task's segment is running, such as an
+initial chunk's or a module's top level, which has no caller to read its answer or to abandon it); for a target admitting logically, `unassigned` (the application is asked for the request's place once the grant
 has passed it, and gave none); `full` (the caller already holds as many receipts as its grant allows); `closed` (the
 target's owner is stopping or has exited); `unknown_target` (within the authorized owner, no live instance has the
 identity: ended, stale or never issued); for a target admitting logically, `late` (the tick has begun) and `duplicate`
