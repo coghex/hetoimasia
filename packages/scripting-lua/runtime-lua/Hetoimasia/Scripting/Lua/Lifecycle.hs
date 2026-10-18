@@ -27,7 +27,10 @@
 -- 1. @unauthorized@: the target's owner is not one the grant covers, or the grant does
 --    not permit the operation there. Nothing is tested of the target, so the answer
 --    says nothing of whether it exists: an owner outside the grant, a foreign runtime's
---    identity and an identity that was never issued answer alike.
+--    identity and an identity that was never issued answer alike. It is also the answer to
+--    a request made when no instance's code and no task's segment is running (an initial
+--    chunk, a module's top level): such a request has no caller to read its answer or to
+--    abandon it, and is refused before anything is reserved.
 -- 2. For a target that admits logically, @unassigned@: the application is asked for the
 --    request's place once the grant has passed it, and gave none.
 -- 3. @full@: the caller already holds as many receipts as its grant allows.
@@ -423,6 +426,13 @@ control operation context arguments = withState context (refused Unauthorized) $
   where
     request state target local = do
       issuer ← callerOf state
+      -- A request is made by someone who can read its answer and whose end abandons it: an instance, or
+      -- a task. Lua the owner runs when neither is running (an initial chunk, a module's top level) has
+      -- no such caller, and is refused before anything is asked or reserved.
+      case issuer of
+        IssuedByNobody → pure (refused Unauthorized)
+        _ → requestAs state target local issuer
+    requestAs state target local issuer = do
       let identity = InstanceId (targetOwner target) local
           caller = case issuer of
             IssuedByInstance number → Just (InstanceId (lifeOwner state) number)

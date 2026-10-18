@@ -7,10 +7,12 @@ import Control.Monad (forM, forM_, replicateM, void)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Text (Text)
 import qualified Data.Text as Text
+import qualified Data.Text.Encoding as Text
 import Hetoimasia.Scripting.Lua.Instance
 import Hetoimasia.Scripting.Lua.Lifecycle (LifecycleGrant (grantReceiptBound))
 import Hetoimasia.Scripting.Lua.Scheduled
-import Hetoimasia.Scripting.Lua.Value (Value (VInteger))
+import Hetoimasia.Scripting.Lua.Owner (VmConfig (vmInitialChunks), chunkName)
+import Hetoimasia.Scripting.Lua.Value (Value (VInteger, VRecord))
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Lifecycle.Support
@@ -193,6 +195,34 @@ spec = describe "settlement" $ do
       -- Each task asks and ends with its result unread; the owner holds room for two.
       answers ← forM [1 ∷ Int .. 6] (const (taskLine callerFx caller "pause" [tid]))
       answers `shouldBe` map takenAs [0 .. 5]
+      reservationsAllFree targetFx owner "a"
+
+  it "refuses a request made when no instance or task is running, such as an initial chunk's, before it reserves anything" $ bounded $ do
+    targetFx ← newIFixture
+    callerFx ← newIFixture
+    withBoundary $ \_ runtime → do
+      owner ← startTarget targetFx runtime "target" [echoer] (testConfig instanceBounds')
+      _ ← admit targetFx owner "a" (moduleNamed "echoer")
+      awaitPhase targetFx owner "a" Active
+      tid ← tidValue targetFx "a"
+      let numbers = case tid of
+            VRecord [("runtime", VInteger r), ("owner", VInteger o), ("id", VInteger i)] → (r, o, i)
+            _ → (0, 0, 0)
+          (runtimeNumber, ownerNumber, localNumber) = numbers
+          chunkText =
+            Text.pack $
+              "local r = life.pause({runtime = " <> show runtimeNumber <> ", owner = " <> show ownerNumber <> ", id = " <> show localNumber <> "})\n"
+                <> "fx.record('top ' .. tostring(r.accepted) .. ' ' .. tostring(r.refusal))\n"
+          given = lifeSpec callerFx (lifeRegistration callerFx) "caller" [commander, commanderFailing, closingCommander, taskCaller] cmdConfig (Just ((target owner) {grantReceiptBound = 1}))
+      caller ← startWith callerFx runtime given {scheduledVm = (scheduledVm given) {vmInitialChunks = [(chunkName "top", Text.encodeUtf8 chunkText)]}}
+      logged callerFx >>= (`shouldBe` ["top false unauthorized"])
+      -- Nothing was reserved or held: the one receipt the grant allows is still there for a request that has a caller.
+      admitCommander callerFx caller "cmdr"
+      ask callerFx caller "cmdr" "pause" (Just tid) Nothing >>= (`shouldBe` takenAs 0)
+      taskLine callerFx caller "result" [VInteger 0] >>= (`shouldBe` "unknown_receipt")
+      -- The one request that had a caller is read, and the reservations are all free: nothing was kept for the
+      -- chunk's.
+      receiptResult callerFx caller "cmdr" 0 >>= (`shouldBe` "applied")
       reservationsAllFree targetFx owner "a"
 
   it "lets only the instance that made a request read its receipt, and a task's receipts are its owner's tasks' alone" $ bounded $ do
